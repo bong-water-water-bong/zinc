@@ -107,6 +107,19 @@ pub const DmmvSigmoidAccPushConstants = extern struct {
     gate_offset: u32,
 };
 
+/// Push constants for the fused Q8_0 pair DMMV shader. Computes two
+/// independent Q8_0 matvecs that share one F32 input vector.
+pub const DmmvQ8PairPushConstants = extern struct {
+    M0: u32,
+    M1: u32,
+    K: u32,
+    a0_offset: u32 = 0,
+    a1_offset: u32 = 0,
+    x_offset: u32 = 0,
+    y0_offset: u32 = 0,
+    y1_offset: u32 = 0,
+};
+
 /// Push constants for the quantize_q8_1 shader.
 /// `ne` = number of f32 input elements (must be a multiple of 32).
 /// `num_blocks` = ne / 32. Pass explicitly so the shader does not have to divide.
@@ -186,6 +199,22 @@ pub const DmmvDispatch = struct {
     pipeline_q5_1: ?Pipeline,
     /// Q8 0 pipeline, or null.
     pipeline_q8_0: ?Pipeline,
+    /// Q8_0 one-row-per-thread batch-style variant for very tall matrices.
+    pipeline_q8_0_batch: ?Pipeline,
+    /// Q8_0 pipeline with SPEC_BLOCKS_PER_ROW=64 (K=2048).
+    pipeline_q8_0_spec64: ?Pipeline,
+    /// Q8_0 pipeline with SPEC_BLOCKS_PER_ROW=128 (K=4096).
+    pipeline_q8_0_spec128: ?Pipeline,
+    /// Q8_0 wide-vocab LM-head variant. Same two-row workgroup shape and
+    /// binding layout as pipeline_q8_0, but shares x-vector loads across rows.
+    pipeline_q8_0_wide: ?Pipeline,
+    /// Q8_0 x Q8_1 integer-dot DMMV. Binding 1 is a quantized Q8_1 activation
+    /// buffer produced by pipeline_quantize_q8_1.
+    pipeline_q8_0_q8_1: ?Pipeline,
+    /// Fused Q8_0 pair DMMV. Five bindings: A0, A1, X, Y0, Y1. Used as an
+    /// opt-in SSM projection experiment for wqkv + z/gate, whose matrices
+    /// share the same normalized hidden vector.
+    pipeline_q8_0_fused_pair: ?Pipeline,
     /// F16 pipeline, or null.
     pipeline_f16: ?Pipeline,
     /// F32 pipeline, or null.
@@ -214,6 +243,21 @@ pub const DmmvDispatch = struct {
     /// Y_up, routing). Halves the dispatch count for the MoE gate+up phase
     /// and reads the shared input once per block.
     pipeline_q4k_fused_gate_up_moe: ?Pipeline,
+    /// Cycle 154: same shader as pipeline_q4k_fused_gate_up_moe but with
+    /// SPEC_BLOCKS_PER_ROW=8 baked in at pipeline-spec time. Used when
+    /// hidden_dim=2048 (Qwen 3.5/3.6 MoE catalog), so the inner block loop
+    /// has a compile-time bound and the SPIR-V → AMDGPU compiler can unroll
+    /// + fold the per-block index arithmetic. Falls back to the unspec'd
+    /// pipeline_q4k_fused_gate_up_moe for other K values.
+    pipeline_q4k_fused_gate_up_moe_spec8: ?Pipeline,
+    /// MoE-specific fused gate+up+SwiGLU variant (5 bindings: W_gate, W_up,
+    /// X, activatedY, routing). Writes silu(gate) * up straight into the
+    /// per-expert activation buffer so the forward path can skip the separate
+    /// MoE SwiGLU dispatch.
+    pipeline_q4k_fused_gate_up_swiglu_moe: ?Pipeline,
+    /// Same shader as pipeline_q4k_fused_gate_up_swiglu_moe with
+    /// SPEC_BLOCKS_PER_ROW=8 baked for hidden_dim=2048 Qwen A3B experts.
+    pipeline_q4k_fused_gate_up_swiglu_moe_spec8: ?Pipeline,
     /// Fused gate+up+SwiGLU Q4_K dense pipeline (4 bindings: W_gate, W_up,
     /// X, swiglu_out). Replaces the dense FFN front-end dispatch trio
     /// (gate DMMV + up DMMV + swiglu element-wise) with a single dispatch
@@ -383,6 +427,37 @@ pub const DmmvDispatch = struct {
             log.warn("Q8_0 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const q8_batch_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_batch.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_batch = pipeline_mod.createFromSpirvWithOptions(instance, q8_batch_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 batch shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_spec64 = [_]pipeline_mod.SpecConst{.{ .id = 2, .value = 64 }};
+        const pipeline_q8_0_spec64 = pipeline_mod.createFromSpirvWithOptions(instance, q8_path, 3, push_size, &q8_spec64, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 spec64 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_spec128 = [_]pipeline_mod.SpecConst{.{ .id = 2, .value = 128 }};
+        const pipeline_q8_0_spec128 = pipeline_mod.createFromSpirvWithOptions(instance, q8_path, 3, push_size, &q8_spec128, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 spec128 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_wide_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_wide.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_wide = pipeline_mod.createFromSpirvWithOptions(instance, q8_wide_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 wide shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_q81_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q8_q81_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 x Q8_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_pair_push_size = @sizeOf(DmmvQ8PairPushConstants);
+        const q8_pair_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_fused_pair.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_fused_pair = pipeline_mod.createFromSpirvWithOptions(instance, q8_pair_path, 5, q8_pair_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 fused-pair shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         const mxfp4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_mxfp4.spv", .{shader_dir}) catch unreachable;
         const pipeline_mxfp4 = pipeline_mod.createFromSpirvWithOptions(instance, mxfp4_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
@@ -491,6 +566,21 @@ pub const DmmvDispatch = struct {
         const q4k_fused_gate_up_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_moe.spv", .{shader_dir}) catch unreachable;
         const pipeline_q4k_fused_gate_up_moe = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gate_up_path, 6, moe_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("Q4_K MoE fused gate+up shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4k_fused_gate_up_spec8 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 8 }};
+        const pipeline_q4k_fused_gate_up_moe_spec8 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gate_up_path, 6, moe_push_size, &q4k_fused_gate_up_spec8, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K MoE fused gate+up spec8 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const q4k_fused_gate_up_swiglu_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_swiglu_moe.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_fused_gate_up_swiglu_moe = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gate_up_swiglu_moe_path, 5, moe_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K MoE fused gate+up+SwiGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const pipeline_q4k_fused_gate_up_swiglu_moe_spec8 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gate_up_swiglu_moe_path, 5, moe_push_size, &q4k_fused_gate_up_spec8, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K MoE fused gate+up+SwiGLU spec8 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -641,6 +731,12 @@ pub const DmmvDispatch = struct {
             .pipeline_q5k = pipeline_q5k,
             .pipeline_q6k = pipeline_q6k,
             .pipeline_q8_0 = pipeline_q8_0,
+            .pipeline_q8_0_batch = pipeline_q8_0_batch,
+            .pipeline_q8_0_spec64 = pipeline_q8_0_spec64,
+            .pipeline_q8_0_spec128 = pipeline_q8_0_spec128,
+            .pipeline_q8_0_wide = pipeline_q8_0_wide,
+            .pipeline_q8_0_q8_1 = pipeline_q8_0_q8_1,
+            .pipeline_q8_0_fused_pair = pipeline_q8_0_fused_pair,
             .pipeline_f16 = pipeline_f16,
             .pipeline_f32 = pipeline_f32,
             .pipeline_q4k_batch = pipeline_q4k_batch,
@@ -651,6 +747,9 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_moe_kpar = pipeline_q4k_moe_kpar,
             .pipeline_q4k_moe_batched = pipeline_q4k_moe_batched,
             .pipeline_q4k_fused_gate_up_moe = pipeline_q4k_fused_gate_up_moe,
+            .pipeline_q4k_fused_gate_up_moe_spec8 = pipeline_q4k_fused_gate_up_moe_spec8,
+            .pipeline_q4k_fused_gate_up_swiglu_moe = pipeline_q4k_fused_gate_up_swiglu_moe,
+            .pipeline_q4k_fused_gate_up_swiglu_moe_spec8 = pipeline_q4k_fused_gate_up_swiglu_moe_spec8,
             .pipeline_q4k_fused_gate_up_swiglu = pipeline_q4k_fused_gate_up_swiglu,
             .pipeline_q8_0_fused_gate_up_swiglu = pipeline_q8_0_fused_gate_up_swiglu,
             .pipeline_q8_0_sigmoid_acc = pipeline_q8_0_sigmoid_acc,
@@ -1102,6 +1201,12 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5k) |*p| p.deinit();
         if (self.pipeline_q6k) |*p| p.deinit();
         if (self.pipeline_q8_0) |*p| p.deinit();
+        if (self.pipeline_q8_0_batch) |*p| p.deinit();
+        if (self.pipeline_q8_0_spec64) |*p| p.deinit();
+        if (self.pipeline_q8_0_spec128) |*p| p.deinit();
+        if (self.pipeline_q8_0_wide) |*p| p.deinit();
+        if (self.pipeline_q8_0_q8_1) |*p| p.deinit();
+        if (self.pipeline_q8_0_fused_pair) |*p| p.deinit();
         if (self.pipeline_f16) |*p| p.deinit();
         if (self.pipeline_f32) |*p| p.deinit();
         if (self.pipeline_q4k_batch) |*p| p.deinit();
@@ -1112,6 +1217,9 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_moe_kpar) |*p| p.deinit();
         if (self.pipeline_q4k_moe_batched) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_moe) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_moe_spec8) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_swiglu_moe) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_swiglu_moe_spec8) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_q8_0_sigmoid_acc) |*p| p.deinit();

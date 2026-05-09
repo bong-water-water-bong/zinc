@@ -42,7 +42,7 @@ layout(push_constant) uniform PushConstants {
 
 layout(set = 0, binding = 0) readonly buffer MatrixAGate { uint8_t a_gate_data[]; };
 layout(set = 0, binding = 1) readonly buffer MatrixAUp   { uint8_t a_up_data[];   };
-layout(set = 0, binding = 2) readonly buffer VectorX     { float x_data[];        };
+layout(set = 0, binding = 2) readonly buffer VectorX     { vec4 x_data[];         };
 layout(set = 0, binding = 3) writeonly buffer Swiglu     { float swiglu[];        };
 
 const uint NUM_ROWS = 2u;
@@ -53,45 +53,33 @@ const uint Q8_0_BYTES = 34u;
 shared float s_sum_gate[4];
 shared float s_sum_up[4];
 
-float dot_q8_block_gate(const uint qs_off, const uint x_base) {
+float dot_q8_block_gate(const uint qs_off, const uint x_base_v4) {
     float block_sum = 0.0;
     for (uint i = 0u; i < 8u; i++) {
         const uint q_off = qs_off + i * 4u;
-        const uint x_off = x_base + i * 4u;
         const ivec4 qv = ivec4(
             int(int8_t(a_gate_data[q_off + 0u])),
             int(int8_t(a_gate_data[q_off + 1u])),
             int(int8_t(a_gate_data[q_off + 2u])),
             int(int8_t(a_gate_data[q_off + 3u]))
         );
-        const vec4 xv = vec4(
-            x_data[x_off + 0u],
-            x_data[x_off + 1u],
-            x_data[x_off + 2u],
-            x_data[x_off + 3u]
-        );
+        const vec4 xv = x_data[x_base_v4 + i];
         block_sum += dot(vec4(qv), xv);
     }
     return block_sum;
 }
 
-float dot_q8_block_up(const uint qs_off, const uint x_base) {
+float dot_q8_block_up(const uint qs_off, const uint x_base_v4) {
     float block_sum = 0.0;
     for (uint i = 0u; i < 8u; i++) {
         const uint q_off = qs_off + i * 4u;
-        const uint x_off = x_base + i * 4u;
         const ivec4 qv = ivec4(
             int(int8_t(a_up_data[q_off + 0u])),
             int(int8_t(a_up_data[q_off + 1u])),
             int(int8_t(a_up_data[q_off + 2u])),
             int(int8_t(a_up_data[q_off + 3u]))
         );
-        const vec4 xv = vec4(
-            x_data[x_off + 0u],
-            x_data[x_off + 1u],
-            x_data[x_off + 2u],
-            x_data[x_off + 3u]
-        );
+        const vec4 xv = x_data[x_base_v4 + i];
         block_sum += dot(vec4(qv), xv);
     }
     return block_sum;
@@ -113,30 +101,30 @@ void main() {
 
     // Strided block loop: each thread handles blocks tid, tid+64, tid+128, ...
     for (uint blk = tid; blk < blocks_per_row; blk += 64u) {
-        uint x_base = x_offset / 4u + blk * Q8_0_BLOCK_SIZE;
+        uint x_base_v4 = x_offset / 16u + blk * 8u;
 
         if (row0 < M) {
             uint byte_off_g = a_offset + row0 * blocks_per_row * Q8_0_BYTES + blk * Q8_0_BYTES;
             uint d_bits_g = uint(a_gate_data[byte_off_g]) | (uint(a_gate_data[byte_off_g + 1u]) << 8);
             float d_g = unpackHalf2x16(d_bits_g).x;
-            sum_gate0 += d_g * dot_q8_block_gate(byte_off_g + 2u, x_base);
+            sum_gate0 += d_g * dot_q8_block_gate(byte_off_g + 2u, x_base_v4);
 
             uint byte_off_u = a_offset + row0 * blocks_per_row * Q8_0_BYTES + blk * Q8_0_BYTES;
             uint d_bits_u = uint(a_up_data[byte_off_u]) | (uint(a_up_data[byte_off_u + 1u]) << 8);
             float d_u = unpackHalf2x16(d_bits_u).x;
-            sum_up0 += d_u * dot_q8_block_up(byte_off_u + 2u, x_base);
+            sum_up0 += d_u * dot_q8_block_up(byte_off_u + 2u, x_base_v4);
         }
 
         if (row1 < M) {
             uint byte_off_g = a_offset + row1 * blocks_per_row * Q8_0_BYTES + blk * Q8_0_BYTES;
             uint d_bits_g = uint(a_gate_data[byte_off_g]) | (uint(a_gate_data[byte_off_g + 1u]) << 8);
             float d_g = unpackHalf2x16(d_bits_g).x;
-            sum_gate1 += d_g * dot_q8_block_gate(byte_off_g + 2u, x_base);
+            sum_gate1 += d_g * dot_q8_block_gate(byte_off_g + 2u, x_base_v4);
 
             uint byte_off_u = a_offset + row1 * blocks_per_row * Q8_0_BYTES + blk * Q8_0_BYTES;
             uint d_bits_u = uint(a_up_data[byte_off_u]) | (uint(a_up_data[byte_off_u + 1u]) << 8);
             float d_u = unpackHalf2x16(d_bits_u).x;
-            sum_up1 += d_u * dot_q8_block_up(byte_off_u + 2u, x_base);
+            sum_up1 += d_u * dot_q8_block_up(byte_off_u + 2u, x_base_v4);
         }
     }
 

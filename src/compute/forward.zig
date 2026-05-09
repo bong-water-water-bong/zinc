@@ -20,7 +20,9 @@ const Graph = @import("graph.zig").Graph;
 const dmmv_mod = @import("dmmv.zig");
 const DmmvDispatch = dmmv_mod.DmmvDispatch;
 const DmmvPushConstants = dmmv_mod.DmmvPushConstants;
+const Q8_1_BLOCK_BYTES = dmmv_mod.Q8_1_BLOCK_BYTES;
 const DmmvSigmoidAccPushConstants = dmmv_mod.DmmvSigmoidAccPushConstants;
+const DmmvQ8PairPushConstants = dmmv_mod.DmmvQ8PairPushConstants;
 const OprojMergePushConstants = dmmv_mod.OprojMergePushConstants;
 const MoeDmmvPushConstants = dmmv_mod.MoeDmmvPushConstants;
 const MoeFusedDownAccPushConstants = dmmv_mod.MoeFusedDownAccPushConstants;
@@ -37,6 +39,7 @@ const RopeBatchedPush = elementwise_mod.RopeBatchedPush;
 const SoftmaxTopkPush = elementwise_mod.SoftmaxTopkPush;
 const MoeWeightedAccPush = elementwise_mod.MoeWeightedAccPush;
 const SsmConv1dPush = elementwise_mod.SsmConv1dPush;
+const SsmQkNormPush = elementwise_mod.SsmQkNormPush;
 const SsmDeltaNetPush = elementwise_mod.SsmDeltaNetPush;
 const SsmGatedNormPush = elementwise_mod.SsmGatedNormPush;
 const DeinterleavePush = elementwise_mod.DeinterleavePush;
@@ -144,6 +147,10 @@ const ProfilePhase = enum(u8) {
     dense_ffn_gateup,
     dense_ffn_down,
     final_tail,
+    final_norm,
+    final_lm_head,
+    final_argmax,
+    final_copy,
 
     fn label(self: @This()) []const u8 {
         return switch (self) {
@@ -172,6 +179,10 @@ const ProfilePhase = enum(u8) {
             .dense_ffn_gateup => "dense_ffn_gateup",
             .dense_ffn_down => "dense_ffn_down",
             .final_tail => "tail",
+            .final_norm => "tail_norm",
+            .final_lm_head => "tail_lm_head",
+            .final_argmax => "tail_argmax",
+            .final_copy => "tail_copy",
         };
     }
 };
@@ -863,6 +874,7 @@ pub const InferenceEngine = struct {
     hidden_buf: Buffer, // hidden state / residual stream (hidden_dim f32)
     residual_buf: Buffer, // scratch for residual ops
     norm_buf: Buffer, // RMS norm output
+    q8_1_buf: Buffer, // quantized hidden/norm scratch for Q8_1 matvec paths
     logits_buf: Buffer, // output logits (vocab_size f32)
     logits_staging: Buffer, // pre-allocated logits readback staging
     argmax_partials_buf: Buffer, // per-workgroup argmax partials
@@ -990,6 +1002,10 @@ pub const InferenceEngine = struct {
     // ZINC_MOE_FUSED_GATE_UP=0 to fall back to the two-dispatch path for
     // A/B testing.
     use_moe_fused_gate_up: bool = false,
+    // Default-on when the pipeline is loaded. Fuses the selected MoE experts'
+    // gate/up Q4_K DMMVs and SwiGLU activation into one dispatch, writing
+    // swiglu_buf directly. Disable with ZINC_MOE_FUSED_GATE_UP_SWIGLU=0.
+    use_moe_fused_gate_up_swiglu: bool = false,
     // Opt-in via ZINC_FUSE_MOE_DOWN_ACC=1. When set and the
     // dmmv_q4k_moe_fused_down_acc pipeline is loaded, the MoE down DMMV +
     // moe_weighted_acc pair are merged into a single dispatch that
@@ -1015,6 +1031,13 @@ pub const InferenceEngine = struct {
     // single dispatch (cycle-13 application of the cycle-8 fused_rms
     // pattern to a smaller M target). Disable with ZINC_FUSED_SSM_AB=0.
     use_fused_ssm_pre_norm: bool = false,
+    // Default-on when loaded. Uses a llama.cpp-style S=128 gated-delta-net
+    // shape: eight 8-lane output-row clusters per wave64.
+    use_ssm_delta_cols8: bool = false,
+    // Opt-in via ZINC_SSM_DELTA_NORMED_QK=1. Normalizes SSM Q/K once per
+    // group before delta-net, then uses a cols8 delta shader that skips the
+    // repeated per-row-block Q/K reductions.
+    use_ssm_delta_normed_qk: bool = false,
     // Effort-11 cycle-8: dense Q4_K fused gate+up+SwiGLU. Single dispatch
     // replacing the per-layer (gate DMMV → up DMMV → swiglu) trio at the
     // dense FFN front-end. Eliminates gate_buf and up_buf round-trips and
@@ -1079,6 +1102,22 @@ pub const InferenceEngine = struct {
     // impact is bounded; the win comes later when the same shader feeds
     // the per-prompt-token MoE phase via Step 2 (MUL_MAT_ID variant).
     use_mul_mm_lm_head: bool = false,
+    // Opt-in via ZINC_Q8_WIDE_LM_HEAD=1. Routes only very tall Q8_0
+    // matrices (LM head) to an alternate two-row shader that shares
+    // x-vector loads across rows.
+    use_q8_wide_lm_head: bool = false,
+    // Opt-in via ZINC_Q8_BATCH_LM_HEAD=1. Routes very tall Q8_0 LM-head
+    // matrices through a one-row-per-thread shader to reduce workgroup count.
+    use_q8_batch_lm_head: bool = false,
+    // Opt-in via ZINC_Q8_1_LM_HEAD=1. Quantizes the final norm vector to Q8_1
+    // and runs Q8_0 x Q8_1 integer-dot DMMV for Q8_0 LM heads.
+    use_q8_1_lm_head: bool = false,
+    // Opt-in via ZINC_Q8_SPEC_DMMV=1. Routes Q8_0 K=2048/4096 DMMVs through
+    // pipelines with the block count baked as a specialization constant.
+    use_q8_spec_dmmv: bool = false,
+    // Opt-in via ZINC_FUSED_SSM_QKV_Z=1. Fuses the Qwen A3B SSM wqkv and
+    // z/gate Q8_0 projections into one dispatch when both share norm_buf.
+    use_fused_ssm_qkv_z: bool = false,
     // Opt-in via ZINC_BATCH_ATTN=1. Foundation for prefill-path attention
     // batching (effort-6 Step 6 A). When set and flash_attn_batched is
     // loaded, the attention call site routes through the batched shader with
@@ -1315,6 +1354,11 @@ pub const InferenceEngine = struct {
 
         var norm_buf = try Buffer.initDeviceLocal(instance, hidden_size, buf_usage);
         errdefer norm_buf.deinit();
+
+        const q8_1_blocks = (config.hidden_dim + 31) / 32;
+        const q8_1_size = @as(vk.c.VkDeviceSize, q8_1_blocks) * Q8_1_BLOCK_BYTES;
+        var q8_1_buf = try Buffer.initDeviceLocal(instance, q8_1_size, buf_usage);
+        errdefer q8_1_buf.deinit();
 
         const logits_size = @as(vk.c.VkDeviceSize, config.vocab_size) * @sizeOf(f32);
         var logits_buf = try Buffer.initDeviceLocal(instance, logits_size, vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -1917,10 +1961,29 @@ pub const InferenceEngine = struct {
         // the shader is otherwise a proven drop-in for kpar.
         const moe_fused_gate_up_env = std.posix.getenv("ZINC_MOE_FUSED_GATE_UP");
         const moe_fused_gate_up_forced_on = moe_fused_gate_up_env != null and std.mem.eql(u8, moe_fused_gate_up_env.?, "1");
+        const moe_fused_gate_up_pipeline_loaded = dmmv.pipeline_q4k_fused_gate_up_moe != null or
+            dmmv.pipeline_q4k_fused_gate_up_moe_spec8 != null;
         const moe_fused_gate_up_enabled = moe_fused_gate_up_forced_on and
-            moe_kpar_enabled and dmmv.pipeline_q4k_fused_gate_up_moe != null;
+            moe_kpar_enabled and moe_fused_gate_up_pipeline_loaded;
         if (moe_fused_gate_up_enabled) {
             log.info("MoE Q4_K fused gate+up ENABLED via ZINC_MOE_FUSED_GATE_UP=1", .{});
+        }
+
+        // Fused MoE gate+up+SwiGLU (Q4_K): default ON when the pipeline is
+        // loaded. This is the profitable version of the older gate+up-only
+        // experiment because it removes the separate MoE SwiGLU dispatch and
+        // barrier. Disable with ZINC_MOE_FUSED_GATE_UP_SWIGLU=0 for A/B.
+        const moe_fused_gate_up_swiglu_env = std.posix.getenv("ZINC_MOE_FUSED_GATE_UP_SWIGLU");
+        const moe_fused_gate_up_swiglu_explicitly_off = moe_fused_gate_up_swiglu_env != null and
+            std.mem.eql(u8, moe_fused_gate_up_swiglu_env.?, "0");
+        const moe_fused_gate_up_swiglu_pipeline_loaded = dmmv.pipeline_q4k_fused_gate_up_swiglu_moe != null or
+            dmmv.pipeline_q4k_fused_gate_up_swiglu_moe_spec8 != null;
+        const moe_fused_gate_up_swiglu_enabled = !moe_fused_gate_up_swiglu_explicitly_off and
+            moe_kpar_enabled and moe_fused_gate_up_swiglu_pipeline_loaded;
+        if (moe_fused_gate_up_swiglu_enabled) {
+            log.info("MoE Q4_K fused gate+up+SwiGLU ENABLED (default, set ZINC_MOE_FUSED_GATE_UP_SWIGLU=0 to disable)", .{});
+        } else if (moe_fused_gate_up_swiglu_explicitly_off) {
+            log.info("MoE Q4_K fused gate+up+SwiGLU DISABLED via ZINC_MOE_FUSED_GATE_UP_SWIGLU=0", .{});
         }
 
         // Fused MoE down + weighted_acc (Q4_K + Q5_K). Default ON when
@@ -1977,6 +2040,32 @@ pub const InferenceEngine = struct {
             log.info("Fused SSM pre-norm (rms+alpha+beta) ENABLED (default, set ZINC_FUSED_SSM_AB=0 to disable)", .{});
         } else if (fused_ssm_ab_explicitly_off) {
             log.info("Fused SSM pre-norm DISABLED via ZINC_FUSED_SSM_AB=0", .{});
+        }
+
+        // SSM delta cols8: port of llama.cpp's GDN workgroup shape for
+        // S=128 (8 output rows per wave64 via subgroupClusteredAdd). Disable
+        // via ZINC_SSM_DELTA_COLS8=0 for A/B checks.
+        const ssm_delta_cols8_env = std.posix.getenv("ZINC_SSM_DELTA_COLS8");
+        const ssm_delta_cols8_explicitly_off = ssm_delta_cols8_env != null and std.mem.eql(u8, ssm_delta_cols8_env.?, "0");
+        const ssm_delta_cols8_enabled = !ssm_delta_cols8_explicitly_off and
+            elementwise.pipeline_ssm_delta_net_cols8 != null;
+        if (ssm_delta_cols8_enabled) {
+            log.info("SSM delta cols8 ENABLED (default, set ZINC_SSM_DELTA_COLS8=0 to disable)", .{});
+        } else if (ssm_delta_cols8_explicitly_off) {
+            log.info("SSM delta cols8 DISABLED via ZINC_SSM_DELTA_COLS8=0", .{});
+        }
+
+        const ssm_delta_normed_qk_env = std.posix.getenv("ZINC_SSM_DELTA_NORMED_QK");
+        const ssm_delta_normed_qk_flag = ssm_delta_normed_qk_env != null and std.mem.eql(u8, ssm_delta_normed_qk_env.?, "1");
+        const ssm_delta_normed_qk_enabled = ssm_delta_normed_qk_flag and
+            ssm_delta_cols8_enabled and
+            elementwise.pipeline_ssm_qk_norm != null and
+            elementwise.pipeline_ssm_delta_net_cols8_normed != null and
+            instance.push_descriptor_fn != null;
+        if (ssm_delta_normed_qk_enabled) {
+            log.info("SSM delta pre-normalized Q/K ENABLED via ZINC_SSM_DELTA_NORMED_QK=1", .{});
+        } else if (ssm_delta_normed_qk_flag) {
+            log.info("ZINC_SSM_DELTA_NORMED_QK=1 requested but prerequisites missing; using standard cols8 delta", .{});
         }
 
         // Fused dense gate+up+SwiGLU (effort-11 cycle 8). Default ON when
@@ -2136,6 +2225,55 @@ pub const InferenceEngine = struct {
             log.info("LM-head mul_mm_q4k path ENABLED (ZINC_MUL_MM_LM_HEAD=1)", .{});
         } else if (mul_mm_lm_head_flag) {
             log.info("ZINC_MUL_MM_LM_HEAD=1 requested but prerequisites missing (mul_mm_q4k pipeline or push descriptors); using DMMV", .{});
+        }
+
+        const q8_wide_lm_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD");
+        const q8_wide_lm_flag = q8_wide_lm_env != null and std.mem.eql(u8, q8_wide_lm_env.?, "1");
+        const q8_wide_lm_enabled = q8_wide_lm_flag and dmmv.pipeline_q8_0_wide != null;
+        if (q8_wide_lm_enabled) {
+            log.info("Q8_0 wide LM-head path ENABLED via ZINC_Q8_WIDE_LM_HEAD=1", .{});
+        } else if (q8_wide_lm_flag) {
+            log.info("ZINC_Q8_WIDE_LM_HEAD=1 requested but the Q8_0 wide pipeline is missing; using generic Q8_0 DMMV", .{});
+        }
+
+        const q8_batch_lm_env = std.posix.getenv("ZINC_Q8_BATCH_LM_HEAD");
+        const q8_batch_lm_flag = q8_batch_lm_env != null and std.mem.eql(u8, q8_batch_lm_env.?, "1");
+        const q8_batch_lm_enabled = q8_batch_lm_flag and dmmv.pipeline_q8_0_batch != null;
+        if (q8_batch_lm_enabled) {
+            log.info("Q8_0 batch LM-head path ENABLED via ZINC_Q8_BATCH_LM_HEAD=1", .{});
+        } else if (q8_batch_lm_flag) {
+            log.info("ZINC_Q8_BATCH_LM_HEAD=1 requested but the Q8_0 batch pipeline is missing; using generic Q8_0 DMMV", .{});
+        }
+
+        const q8_1_lm_env = std.posix.getenv("ZINC_Q8_1_LM_HEAD");
+        const q8_1_lm_flag = q8_1_lm_env != null and std.mem.eql(u8, q8_1_lm_env.?, "1");
+        const q8_1_lm_enabled = q8_1_lm_flag and
+            dmmv.pipeline_q8_0_q8_1 != null and
+            dmmv.pipeline_quantize_q8_1 != null and
+            instance.push_descriptor_fn != null and
+            (config.hidden_dim & 31) == 0;
+        if (q8_1_lm_enabled) {
+            log.info("Q8_0 x Q8_1 LM-head path ENABLED via ZINC_Q8_1_LM_HEAD=1", .{});
+        } else if (q8_1_lm_flag) {
+            log.info("ZINC_Q8_1_LM_HEAD=1 requested but prerequisites are missing; using generic Q8_0 DMMV", .{});
+        }
+
+        const q8_spec_env = std.posix.getenv("ZINC_Q8_SPEC_DMMV");
+        const q8_spec_enabled = q8_spec_env != null and std.mem.eql(u8, q8_spec_env.?, "1");
+        if (q8_spec_enabled) {
+            log.info("Q8_0 K-specialized DMMV path ENABLED via ZINC_Q8_SPEC_DMMV=1", .{});
+        }
+
+        const fused_ssm_qkv_z_env = std.posix.getenv("ZINC_FUSED_SSM_QKV_Z");
+        const fused_ssm_qkv_z_flag = fused_ssm_qkv_z_env != null and std.mem.eql(u8, fused_ssm_qkv_z_env.?, "1");
+        const fused_ssm_qkv_z_enabled = fused_ssm_qkv_z_flag and
+            dmmv.pipeline_q8_0_fused_pair != null and
+            instance.push_descriptor_fn != null and
+            (config.hidden_dim & 31) == 0;
+        if (fused_ssm_qkv_z_enabled) {
+            log.info("SSM fused Q8_0 wqkv+z projection ENABLED via ZINC_FUSED_SSM_QKV_Z=1", .{});
+        } else if (fused_ssm_qkv_z_flag) {
+            log.info("ZINC_FUSED_SSM_QKV_Z=1 requested but prerequisites missing; using separate SSM projections", .{});
         }
 
         // Effort-6 Step 5 prerequisite: count_experts wire-in. When
@@ -2316,9 +2454,12 @@ pub const InferenceEngine = struct {
             .use_moe_kpar = moe_kpar_enabled,
             .use_moe_q5k_kpar = moe_q5k_kpar_enabled,
             .use_moe_fused_gate_up = moe_fused_gate_up_enabled,
+            .use_moe_fused_gate_up_swiglu = moe_fused_gate_up_swiglu_enabled,
             .use_moe_fused_down_acc = moe_fused_down_acc_enabled,
             .use_fused_rms_router = fused_rms_router_enabled,
             .use_fused_ssm_pre_norm = fused_ssm_ab_enabled,
+            .use_ssm_delta_cols8 = ssm_delta_cols8_enabled,
+            .use_ssm_delta_normed_qk = ssm_delta_normed_qk_enabled,
             .use_fused_dense_ffn = fused_dense_ffn_enabled,
             .use_fused_oproj_merge = fused_oproj_merge_enabled,
             .use_fused_qk_kv = fused_qk_kv_enabled,
@@ -2334,6 +2475,11 @@ pub const InferenceEngine = struct {
             .use_batch_attn = batch_attn_enabled,
             .use_capture_routing = capture_flag and routing_capture_buf.handle != null,
             .use_mul_mm_lm_head = mul_mm_lm_head_enabled,
+            .use_q8_wide_lm_head = q8_wide_lm_enabled,
+            .use_q8_batch_lm_head = q8_batch_lm_enabled,
+            .use_q8_1_lm_head = q8_1_lm_enabled,
+            .use_q8_spec_dmmv = q8_spec_enabled,
+            .use_fused_ssm_qkv_z = fused_ssm_qkv_z_enabled,
             .use_count_experts_prefill = count_experts_enabled,
             .use_capture_ffn_input = ffn_input_capture_flag and prefill_ffn_input_capture_buf.handle != null,
             .use_a3b_validate = a3b_validate_enabled,
@@ -2363,6 +2509,7 @@ pub const InferenceEngine = struct {
             .hidden_buf = hidden_buf,
             .residual_buf = residual_buf,
             .norm_buf = norm_buf,
+            .q8_1_buf = q8_1_buf,
             .logits_buf = logits_buf,
             .logits_staging = logits_staging,
             .argmax_partials_buf = argmax_partials_buf,
@@ -3480,23 +3627,35 @@ pub const InferenceEngine = struct {
             self.pushDispatch5(
                 pip,
                 std.mem.asBytes(&push),
-                hidden_buf, hidden_size,
-                ffn_norm_w_buf, ffn_norm_w_size,
-                router_w_buf, router_w_size,
-                ffn_norm_out_buf, ffn_norm_out_size,
-                router_logits_buf, router_logits_size,
-                wg_x, 1, 1,
+                hidden_buf,
+                hidden_size,
+                ffn_norm_w_buf,
+                ffn_norm_w_size,
+                router_w_buf,
+                router_w_size,
+                ffn_norm_out_buf,
+                ffn_norm_out_size,
+                router_logits_buf,
+                router_logits_size,
+                wg_x,
+                1,
+                1,
             );
             return;
         }
         const ds = try self.allocDescSet(pip.descriptor_set_layout);
         self.writeDescSet5(
             ds,
-            hidden_buf, hidden_size,
-            ffn_norm_w_buf, ffn_norm_w_size,
-            router_w_buf, router_w_size,
-            ffn_norm_out_buf, ffn_norm_out_size,
-            router_logits_buf, router_logits_size,
+            hidden_buf,
+            hidden_size,
+            ffn_norm_w_buf,
+            ffn_norm_w_size,
+            router_w_buf,
+            router_w_size,
+            ffn_norm_out_buf,
+            ffn_norm_out_size,
+            router_logits_buf,
+            router_logits_size,
         );
         self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), wg_x, 1, 1);
     }
@@ -3537,14 +3696,23 @@ pub const InferenceEngine = struct {
         self.pushDispatch7(
             pip,
             std.mem.asBytes(&push),
-            hidden_buf, hidden_size,
-            attn_norm_w_buf, attn_norm_w_size,
-            alpha_w_buf, alpha_w_size,
-            beta_w_buf, beta_w_size,
-            norm_out_buf, norm_out_size,
-            alpha_out_buf, alpha_out_size,
-            beta_out_buf, beta_out_size,
-            wg_x, 1, 1,
+            hidden_buf,
+            hidden_size,
+            attn_norm_w_buf,
+            attn_norm_w_size,
+            alpha_w_buf,
+            alpha_w_size,
+            beta_w_buf,
+            beta_w_size,
+            norm_out_buf,
+            norm_out_size,
+            alpha_out_buf,
+            alpha_out_size,
+            beta_out_buf,
+            beta_out_size,
+            wg_x,
+            1,
+            1,
         );
     }
 
@@ -4418,11 +4586,11 @@ pub const InferenceEngine = struct {
             // amortizing the rms recompute across the alpha+beta matvec
             // (combined M=2*dt_rank, very small → trivial cache pressure).
             const use_fused_ssm_pre_norm = blk: {
-                if (!self.use_fused_ssm_pre_norm) break :blk false;  // env-gated kill switch
+                if (!self.use_fused_ssm_pre_norm) break :blk false; // env-gated kill switch
                 if (is_full_attn) break :blk false;
                 if (self.elementwise.pipeline_rms_norm_dmmv_q4k_alpha_beta == null) break :blk false;
-                if ((hidden_dim % 4) != 0) break :blk false;  // shader reads as f32 vec4
-                if (attn_norm.info.type_ != .f32) break :blk false;  // shader reads attn_norm as f32 vec4
+                if ((hidden_dim % 4) != 0) break :blk false; // shader reads as f32 vec4
+                if (attn_norm.info.type_ != .f32) break :blk false; // shader reads attn_norm as f32 vec4
                 const at = lt.ssm_alpha orelse break :blk false;
                 const bt = lt.ssm_beta orelse break :blk false;
                 // Qwen 3.6 35B-A3B Q4_K_XL ships these as f32 (see
@@ -5642,10 +5810,15 @@ pub const InferenceEngine = struct {
                         // dispatch: hidden += pan_weight * rmsnorm(o_proj_buf).
                         const pan_tensor = lt.post_attention_norm.?;
                         try self.dispatchRmsNormAdd(
-                            self.hidden_buf.handle, hidden_size,
-                            self.o_proj_buf.handle, hidden_size,
-                            pan_tensor.gpu_buffer.handle, pan_tensor.gpu_buffer.size,
-                            hidden_dim, 1, rms_norm_eps,
+                            self.hidden_buf.handle,
+                            hidden_size,
+                            self.o_proj_buf.handle,
+                            hidden_size,
+                            pan_tensor.gpu_buffer.handle,
+                            pan_tensor.gpu_buffer.size,
+                            hidden_dim,
+                            1,
+                            rms_norm_eps,
                         );
                         self.decode_cmd.computeBarrier();
                     } else {
@@ -5808,10 +5981,11 @@ pub const InferenceEngine = struct {
                     self.elementwise.pipeline_ssm_delta_net != null and
                     self.elementwise.pipeline_ssm_gated_norm != null;
                 if (state.position == 0 and layer == 0) {
-                    log.info("FASTPATH: gpu_ssm={} arch={s} ssm_shader={}", .{
+                    log.info("FASTPATH: gpu_ssm={} arch={s} ssm_shader={} delta_cols8={}", .{
                         use_gpu_ssm,
                         @tagName(config.architecture),
                         self.elementwise.pipeline_ssm_conv1d != null,
+                        self.use_ssm_delta_cols8 and self.elementwise.pipeline_ssm_delta_net_cols8 != null,
                     });
                 }
                 // Dead-tail SSM skip: at the final layer of a non-terminal
@@ -6198,24 +6372,70 @@ pub const InferenceEngine = struct {
                     const moe_gate_up_phase = self.beginProfilePhase();
                     const gate_qt = gate_exps.info.type_;
                     const up_qt = up_exps.info.type_;
+                    const fused_gate_up_pip: ?*const Pipeline = if (hidden_dim == 2048 and
+                        self.dmmv.pipeline_q4k_fused_gate_up_moe_spec8 != null)
+                        &self.dmmv.pipeline_q4k_fused_gate_up_moe_spec8.?
+                    else if (self.dmmv.pipeline_q4k_fused_gate_up_moe != null)
+                        &self.dmmv.pipeline_q4k_fused_gate_up_moe.?
+                    else
+                        null;
+                    const fused_gate_up_swiglu_pip: ?*const Pipeline = if (hidden_dim == 2048 and
+                        self.dmmv.pipeline_q4k_fused_gate_up_swiglu_moe_spec8 != null)
+                        &self.dmmv.pipeline_q4k_fused_gate_up_swiglu_moe_spec8.?
+                    else if (self.dmmv.pipeline_q4k_fused_gate_up_swiglu_moe != null)
+                        &self.dmmv.pipeline_q4k_fused_gate_up_swiglu_moe.?
+                    else
+                        null;
+                    const fused_swiglu_ready = gate_qt == .q4_k and up_qt == .q4_k and
+                        self.use_moe_kpar and
+                        self.use_moe_fused_gate_up_swiglu and
+                        fused_gate_up_swiglu_pip != null and
+                        gate_exps.info.numElements() == up_exps.info.numElements();
                     const fused_ready = gate_qt == .q4_k and up_qt == .q4_k and
                         self.use_moe_kpar and
                         self.use_moe_fused_gate_up and
-                        self.dmmv.pipeline_q4k_fused_gate_up_moe != null and
+                        fused_gate_up_pip != null and
                         gate_exps.info.numElements() == up_exps.info.numElements();
-                    if (fused_ready) {
-                        const pip = &self.dmmv.pipeline_q4k_fused_gate_up_moe.?;
+                    if (fused_swiglu_ready) {
+                        const pip = fused_gate_up_swiglu_pip.?;
+                        const push = MoeDmmvPushConstants{ .M = inter_dim, .K = hidden_dim, .expert_stride = expert_gate_row_bytes, .x_expert_stride = 0, .x_offset = 0, .y_offset = 0 };
+                        const wg_x: u32 = inter_dim;
+                        self.pushDispatch5(
+                            pip,
+                            std.mem.asBytes(&push),
+                            gate_exps.gpu_buffer.handle,
+                            gate_exps.gpu_buffer.size,
+                            up_exps.gpu_buffer.handle,
+                            up_exps.gpu_buffer.size,
+                            expert_input_buf.handle,
+                            hidden_size,
+                            self.swiglu_buf.handle,
+                            self.swiglu_buf.size,
+                            self.router_output_buf.handle,
+                            self.router_output_buf.size,
+                            wg_x,
+                            n_used,
+                            1,
+                        );
+                    } else if (fused_ready) {
+                        const pip = fused_gate_up_pip.?;
                         const push = MoeDmmvPushConstants{ .M = inter_dim, .K = hidden_dim, .expert_stride = expert_gate_row_bytes, .x_expert_stride = 0, .x_offset = 0, .y_offset = 0 };
                         const wg_x: u32 = (inter_dim + 1) / 2;
                         self.pushDispatch6(
                             pip,
                             std.mem.asBytes(&push),
-                            gate_exps.gpu_buffer.handle, gate_exps.gpu_buffer.size,
-                            up_exps.gpu_buffer.handle, up_exps.gpu_buffer.size,
-                            expert_input_buf.handle, hidden_size,
-                            self.gate_buf.handle, self.gate_buf.size,
-                            self.up_buf.handle, self.up_buf.size,
-                            self.router_output_buf.handle, self.router_output_buf.size,
+                            gate_exps.gpu_buffer.handle,
+                            gate_exps.gpu_buffer.size,
+                            up_exps.gpu_buffer.handle,
+                            up_exps.gpu_buffer.size,
+                            expert_input_buf.handle,
+                            hidden_size,
+                            self.gate_buf.handle,
+                            self.gate_buf.size,
+                            self.up_buf.handle,
+                            self.up_buf.size,
+                            self.router_output_buf.handle,
+                            self.router_output_buf.size,
                             wg_x,
                             n_used,
                             1,
@@ -6260,18 +6480,20 @@ pub const InferenceEngine = struct {
                     self.endProfilePhase(.moe_gate_up, moe_gate_up_phase);
 
                     // SwiGLU: ALL experts at once (N = n_used * inter_dim)
-                    const moe_swiglu_phase = self.beginProfilePhase();
-                    try self.dispatchFfnActivation(
-                        self.gate_buf.handle,
-                        self.gate_buf.size,
-                        self.up_buf.handle,
-                        self.up_buf.size,
-                        self.swiglu_buf.handle,
-                        self.swiglu_buf.size,
-                        n_used * inter_dim,
-                    );
-                    self.decode_cmd.computeBarrier();
-                    self.endProfilePhase(.moe_swiglu, moe_swiglu_phase);
+                    if (!fused_swiglu_ready) {
+                        const moe_swiglu_phase = self.beginProfilePhase();
+                        try self.dispatchFfnActivation(
+                            self.gate_buf.handle,
+                            self.gate_buf.size,
+                            self.up_buf.handle,
+                            self.up_buf.size,
+                            self.swiglu_buf.handle,
+                            self.swiglu_buf.size,
+                            n_used * inter_dim,
+                        );
+                        self.decode_cmd.computeBarrier();
+                        self.endProfilePhase(.moe_swiglu, moe_swiglu_phase);
+                    }
 
                     // Shared expert tensors — looked up here to interleave with MoE dispatches
                     const gate_shexp = lt.ffn_gate_shexp;
@@ -6381,11 +6603,17 @@ pub const InferenceEngine = struct {
                         self.pushDispatch4(
                             pip,
                             std.mem.asBytes(&push),
-                            down_exps.gpu_buffer.handle, down_exps.gpu_buffer.size,
-                            self.swiglu_buf.handle, self.swiglu_buf.size,
-                            self.hidden_buf.handle, hidden_size,
-                            self.router_output_buf.handle, self.router_output_buf.size,
-                            wg_x, 1, 1,
+                            down_exps.gpu_buffer.handle,
+                            down_exps.gpu_buffer.size,
+                            self.swiglu_buf.handle,
+                            self.swiglu_buf.size,
+                            self.hidden_buf.handle,
+                            hidden_size,
+                            self.router_output_buf.handle,
+                            self.router_output_buf.size,
+                            wg_x,
+                            1,
+                            1,
                         );
                     } else {
                         const qt = down_qt;
@@ -7423,10 +7651,15 @@ pub const InferenceEngine = struct {
                     self.decode_cmd.computeBarrier();
                     const pfn_tensor = lt.post_ffw_norm.?;
                     try self.dispatchRmsNormAdd(
-                        self.hidden_buf.handle, hidden_size,
-                        self.down_buf.handle, hidden_size,
-                        pfn_tensor.gpu_buffer.handle, pfn_tensor.gpu_buffer.size,
-                        hidden_dim, 1, rms_norm_eps,
+                        self.hidden_buf.handle,
+                        hidden_size,
+                        self.down_buf.handle,
+                        hidden_size,
+                        pfn_tensor.gpu_buffer.handle,
+                        pfn_tensor.gpu_buffer.size,
+                        hidden_dim,
+                        1,
+                        rms_norm_eps,
                     );
                 } else {
                     // Unfused path: needed for Gemma post-FFN norm or diagnostics
@@ -7667,6 +7900,7 @@ pub const InferenceEngine = struct {
             const final_tail_phase = self.beginProfilePhase();
 
             // Final RMS norm: hidden_buf → norm_buf
+            const final_norm_phase = self.beginProfilePhase();
             const final_norm_tensor = self.tensor_map.get("output_norm.weight") orelse return error.TensorNotFound;
             try self.dispatchRmsNorm(
                 self.hidden_buf.handle,
@@ -7680,8 +7914,10 @@ pub const InferenceEngine = struct {
                 rms_norm_eps,
             );
             self.decode_cmd.computeBarrier();
+            self.endProfilePhase(.final_norm, final_norm_phase);
 
             // LM head: output.weight × norm_buf → logits_buf
+            const final_lm_head_phase = self.beginProfilePhase();
             const lm_tensor = self.tensor_map.get("output.weight") orelse
                 self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
             // Effort-6 Step 1 wire-in (ZINC_MUL_MM_LM_HEAD=1): route the LM head
@@ -7696,25 +7932,96 @@ pub const InferenceEngine = struct {
             const use_mul_mm_path = self.use_mul_mm_lm_head and
                 lm_tensor.info.type_ == .q4_k and
                 (hidden_dim % 256) == 0;
-            if (use_mul_mm_path) {
+            const use_q8_1_lm_path = self.use_q8_1_lm_head and
+                lm_tensor.info.type_ == .q8_0 and
+                (hidden_dim & 31) == 0 and
+                self.dmmv.pipeline_q8_0_q8_1 != null and
+                self.dmmv.pipeline_quantize_q8_1 != null;
+            const use_q8_batch_lm_path = self.use_q8_batch_lm_head and
+                lm_tensor.info.type_ == .q8_0 and
+                self.dmmv.pipeline_q8_0_batch != null;
+            if (use_q8_1_lm_path) {
+                try self.dmmv.recordQuantizeQ8_1(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    self.norm_buf.handle,
+                    hidden_size,
+                    self.q8_1_buf.handle,
+                    self.q8_1_buf.size,
+                    hidden_dim,
+                );
+                self.decode_cmd.computeBarrier();
+                const q8_1_pip = &self.dmmv.pipeline_q8_0_q8_1.?;
+                const q8_1_push = DmmvPushConstants{
+                    .M = self.model.config.vocab_size,
+                    .K = hidden_dim,
+                    .a_offset = 0,
+                    .x_offset = 0,
+                    .y_offset = 0,
+                    .acc_mode = 0,
+                };
+                self.pushDispatch3(
+                    q8_1_pip,
+                    std.mem.asBytes(&q8_1_push),
+                    lm_tensor.gpu_buffer.handle,
+                    lm_tensor.gpu_buffer.size,
+                    self.q8_1_buf.handle,
+                    self.q8_1_buf.size,
+                    self.logits_buf.handle,
+                    self.logits_buf.size,
+                    (self.model.config.vocab_size + 1) / 2,
+                    1,
+                    1,
+                );
+            } else if (use_q8_batch_lm_path) {
+                const q8_batch_pip = &self.dmmv.pipeline_q8_0_batch.?;
+                const q8_batch_push = DmmvPushConstants{
+                    .M = self.model.config.vocab_size,
+                    .K = hidden_dim,
+                    .a_offset = 0,
+                    .x_offset = 0,
+                    .y_offset = 0,
+                    .acc_mode = 0,
+                };
+                self.pushDispatch3(
+                    q8_batch_pip,
+                    std.mem.asBytes(&q8_batch_push),
+                    lm_tensor.gpu_buffer.handle,
+                    lm_tensor.gpu_buffer.size,
+                    self.norm_buf.handle,
+                    hidden_size,
+                    self.logits_buf.handle,
+                    self.logits_buf.size,
+                    (self.model.config.vocab_size + 63) / 64,
+                    1,
+                    1,
+                );
+            } else if (use_mul_mm_path) {
                 try self.dmmv.recordMulMmQ4K(
                     &self.decode_cmd,
                     self.instance.push_descriptor_fn,
-                    lm_tensor.gpu_buffer.handle, lm_tensor.gpu_buffer.size,
-                    self.norm_buf.handle, hidden_size,
-                    self.logits_buf.handle, self.logits_buf.size,
+                    lm_tensor.gpu_buffer.handle,
+                    lm_tensor.gpu_buffer.size,
+                    self.norm_buf.handle,
+                    hidden_size,
+                    self.logits_buf.handle,
+                    self.logits_buf.size,
                     self.model.config.vocab_size, // M
                     1, // N
                     hidden_dim, // K
                     hidden_dim, // stride_b: per-col floats in B (one column = K elements)
                     self.model.config.vocab_size, // stride_d: per-col floats in D (one column = M elements)
-                    0, 0, 0,
+                    0,
+                    0,
+                    0,
                 );
             } else {
                 try self.dispatchDmmv(lm_tensor, self.norm_buf, hidden_size, self.logits_buf, self.model.config.vocab_size, hidden_dim);
             }
+            self.endProfilePhase(.final_lm_head, final_lm_head_phase);
 
             const use_gpu_argmax = have_gpu_argmax;
+            const final_argmax_phase = self.beginProfilePhase();
             if (use_gpu_argmax) {
                 self.decode_cmd.computeBarrier();
                 try self.argmax.record(
@@ -7724,6 +8031,7 @@ pub const InferenceEngine = struct {
                     self.argmax_phase0_workgroups,
                 );
             }
+            self.endProfilePhase(.final_argmax, final_argmax_phase);
 
             // Read back the 4-byte token id result every token, and full logits only when debugging
             // or when GPU argmax is unavailable and we must fall back to CPU greedy sampling.
@@ -7736,6 +8044,7 @@ pub const InferenceEngine = struct {
                 .srcAccessMask = vk.c.VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = vk.c.VK_ACCESS_TRANSFER_READ_BIT,
             };
+            const final_copy_phase = self.beginProfilePhase();
             vk.c.vkCmdPipelineBarrier(self.decode_cmd.handle, vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, null, 0, null);
             if (use_gpu_argmax) {
                 const token_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = @sizeOf(u32) };
@@ -7750,6 +8059,7 @@ pub const InferenceEngine = struct {
                 const hidden_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = hidden_size };
                 vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.embed_staging.handle, 1, &hidden_region);
             }
+            self.endProfilePhase(.final_copy, final_copy_phase);
             self.endProfilePhase(.final_tail, final_tail_phase);
         }
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -8312,6 +8622,49 @@ pub const InferenceEngine = struct {
         );
     }
 
+    /// Fused Q8_0 pair DMMV. Used by the SSM path to compute wqkv and z/gate
+    /// projections from the same normalized hidden vector in one dispatch.
+    fn dispatchDmmvQ8_0FusedPair(
+        self: *InferenceEngine,
+        tensor0: *const LoadedTensor,
+        tensor1: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        output0_buf: Buffer,
+        output0_size: vk.c.VkDeviceSize,
+        output1_buf: Buffer,
+        output1_size: vk.c.VkDeviceSize,
+        M0: u32,
+        M1: u32,
+        K: u32,
+    ) !void {
+        const pip = &(self.dmmv.pipeline_q8_0_fused_pair orelse return error.ShaderNotLoaded);
+        const push = DmmvQ8PairPushConstants{
+            .M0 = M0,
+            .M1 = M1,
+            .K = K,
+        };
+        const max_m = @max(M0, M1);
+        const wg_x: u32 = (max_m + 1) / 2;
+        self.pushDispatch5(
+            pip,
+            std.mem.asBytes(&push),
+            tensor0.gpu_buffer.handle,
+            tensor0.gpu_buffer.size,
+            tensor1.gpu_buffer.handle,
+            tensor1.gpu_buffer.size,
+            input_buf.handle,
+            input_size,
+            output0_buf.handle,
+            output0_size,
+            output1_buf.handle,
+            output1_size,
+            wg_x,
+            1,
+            1,
+        );
+    }
+
     /// Fused Q8_0 down DMMV + sigmoid-gated scale-accumulate.
     /// Replaces (dispatchDmmv(down_shexp) + computeBarrier +
     /// dispatchSigmoidScaleAcc + computeBarrier) on the Qwen 3.5/3.6
@@ -8448,6 +8801,74 @@ pub const InferenceEngine = struct {
         };
 
         if (pip.uses_push_descriptors) {
+            // Wide-vocab Q8_0 LM-head fast path. The Qwen 3.6 35B-A3B
+            // output.weight is Q8_0 with M=248320, K=2048. This variant keeps
+            // two rows/WG but shares each x-vector load across both rows.
+            // Keep it limited to tall overwrite DMMVs so smaller SSM/shared
+            // projections stay on the generic path.
+            if (self.use_q8_wide_lm_head and qt == .q8_0 and M >= 100_000 and acc_mode == 0 and self.dmmv.pipeline_q8_0_wide != null) {
+                const wide_pip = &self.dmmv.pipeline_q8_0_wide.?;
+                const push_wide = DmmvPushConstants{
+                    .M = M,
+                    .K = K,
+                    .a_offset = a_offset,
+                    .x_offset = x_offset,
+                    .y_offset = y_offset,
+                    .acc_mode = acc_mode,
+                };
+                self.pushDispatch3(
+                    wide_pip,
+                    std.mem.asBytes(&push_wide),
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    input_buf.handle,
+                    input_size,
+                    output_buf.handle,
+                    output_buf.size,
+                    (M + 1) / 2,
+                    1,
+                    1,
+                );
+                return;
+            }
+
+            // Q8_0 hot-shape specialization. Most Qwen 3.6 Q8 decode matvecs
+            // have K=2048 (one 64-block pass) or K=4096 (two passes). The
+            // specialized pipelines bake that block count so RADV can fold the
+            // loop shape; the generic pipeline remains the fallback for other K.
+            if (self.use_q8_spec_dmmv and qt == .q8_0 and acc_mode == 0) {
+                const q8_spec_pip: ?*const Pipeline = if (K == 2048 and self.dmmv.pipeline_q8_0_spec64 != null)
+                    &self.dmmv.pipeline_q8_0_spec64.?
+                else if (K == 4096 and self.dmmv.pipeline_q8_0_spec128 != null)
+                    &self.dmmv.pipeline_q8_0_spec128.?
+                else
+                    null;
+                if (q8_spec_pip) |spec_pip| {
+                    const push_spec = DmmvPushConstants{
+                        .M = M,
+                        .K = K,
+                        .a_offset = a_offset,
+                        .x_offset = x_offset,
+                        .y_offset = y_offset,
+                        .acc_mode = acc_mode,
+                    };
+                    self.pushDispatch3(
+                        spec_pip,
+                        std.mem.asBytes(&push_spec),
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        input_buf.handle,
+                        input_size,
+                        output_buf.handle,
+                        output_buf.size,
+                        (M + 1) / 2,
+                        1,
+                        1,
+                    );
+                    return;
+                }
+            }
+
             // Wide-vocab LM-head fast path: NUM_ROWS=8 variant (pipeline_q4k_wide)
             // for tall Q4_K matrices like Gemma 4 31B (M=262144). Same binding
             // layout as pipeline_q4k, only the shader constant differs. 4× fewer
@@ -8914,6 +9335,16 @@ pub const InferenceEngine = struct {
         const qkv_bytes = @as(vk.c.VkDeviceSize, conv_channels) * @sizeOf(f32);
         const z_bytes = @as(vk.c.VkDeviceSize, d_inner) * @sizeOf(f32);
         const ab_bytes = @as(vk.c.VkDeviceSize, dt_rank) * @sizeOf(f32);
+        const use_delta_cols8 = self.use_ssm_delta_cols8 and
+            !self.use_a3b_validate and
+            head_v_dim == 128 and
+            d_state == 128 and
+            self.elementwise.pipeline_ssm_delta_net_cols8 != null;
+        const use_delta_normed_qk = use_delta_cols8 and
+            self.use_ssm_delta_normed_qk and
+            !self.validation_diagnostics_enabled and
+            self.elementwise.pipeline_ssm_qk_norm != null and
+            self.elementwise.pipeline_ssm_delta_net_cols8_normed != null;
 
         // --- GPU: 4 DMMV projections (same as CPU path) ---
         const lt = self.layer_tensors[layer];
@@ -8934,6 +9365,13 @@ pub const InferenceEngine = struct {
             });
         }
         const ssm_proj_phase = self.beginProfilePhase();
+        const can_fuse_qkv_z = self.use_fused_ssm_qkv_z and
+            !is_dead_tail and
+            wqkv_tensor.info.type_ == .q8_0 and
+            z_tensor.info.type_ == .q8_0 and
+            self.dmmv.pipeline_q8_0_fused_pair != null and
+            self.instance.push_descriptor_fn != null and
+            (hidden_dim & 31) == 0;
 
         if (use_fused_pre_norm) {
             // Fused fast path: rms_norm + alpha DMMV + beta DMMV in one
@@ -8945,13 +9383,20 @@ pub const InferenceEngine = struct {
             // (no rms_norm → SSM proj fence) per SSM layer.
             const attn_norm = lt.attn_norm orelse return error.TensorNotFound;
             try self.dispatchRmsNormDmmvQ4kAlphaBeta(
-                self.hidden_buf.handle, hidden_size,
-                attn_norm.gpu_buffer.handle, attn_norm.gpu_buffer.size,
-                alpha_tensor.gpu_buffer.handle, alpha_tensor.gpu_buffer.size,
-                beta_tensor.gpu_buffer.handle, beta_tensor.gpu_buffer.size,
-                self.norm_buf.handle, hidden_size,
-                self.router_logits_buf.handle, ab_bytes,
-                self.down_buf.handle, ab_bytes,
+                self.hidden_buf.handle,
+                hidden_size,
+                attn_norm.gpu_buffer.handle,
+                attn_norm.gpu_buffer.size,
+                alpha_tensor.gpu_buffer.handle,
+                alpha_tensor.gpu_buffer.size,
+                beta_tensor.gpu_buffer.handle,
+                beta_tensor.gpu_buffer.size,
+                self.norm_buf.handle,
+                hidden_size,
+                self.router_logits_buf.handle,
+                ab_bytes,
+                self.down_buf.handle,
+                ab_bytes,
                 dt_rank,
                 hidden_dim,
                 self.model.config.rms_norm_eps,
@@ -8966,18 +9411,50 @@ pub const InferenceEngine = struct {
             // and trims the global s_waitcnt that a full computeBarrier
             // would emit on RDNA4. Cycle 16 narrow.
             self.decode_cmd.computeBufferBarrier(self.norm_buf.handle, hidden_size);
-            try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
-            if (!is_dead_tail) {
-                try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+            if (can_fuse_qkv_z) {
+                try self.dispatchDmmvQ8_0FusedPair(
+                    wqkv_tensor,
+                    z_tensor,
+                    self.norm_buf,
+                    hidden_size,
+                    self.attn_out_buf,
+                    qkv_bytes,
+                    self.gate_buf,
+                    z_bytes,
+                    @intCast(conv_channels),
+                    @intCast(d_inner),
+                    hidden_dim,
+                );
+            } else {
+                try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                if (!is_dead_tail) {
+                    try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                }
             }
             // alpha + beta already produced by the fused shader.
         } else {
-            try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
-            // Skip z (gate) DMMV in dead-tail: gate_buf is only consumed by
-            // gated_norm, which is also skipped below. wqkv/alpha/beta still
-            // run because conv1d/delta_net update SSM state for future tokens.
-            if (!is_dead_tail) {
-                try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+            if (can_fuse_qkv_z) {
+                try self.dispatchDmmvQ8_0FusedPair(
+                    wqkv_tensor,
+                    z_tensor,
+                    self.norm_buf,
+                    hidden_size,
+                    self.attn_out_buf,
+                    qkv_bytes,
+                    self.gate_buf,
+                    z_bytes,
+                    @intCast(conv_channels),
+                    @intCast(d_inner),
+                    hidden_dim,
+                );
+            } else {
+                try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                // Skip z (gate) DMMV in dead-tail: gate_buf is only consumed by
+                // gated_norm, which is also skipped below. wqkv/alpha/beta still
+                // run because conv1d/delta_net update SSM state for future tokens.
+                if (!is_dead_tail) {
+                    try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                }
             }
             try self.dispatchDmmv(alpha_tensor, self.norm_buf, hidden_size, self.router_logits_buf, dt_rank, hidden_dim);
             try self.dispatchDmmv(beta_tensor, self.norm_buf, hidden_size, self.down_buf, dt_rank, hidden_dim);
@@ -9057,6 +9534,16 @@ pub const InferenceEngine = struct {
             self.a3b_beta_capture != null and
             self.a3b_conv_out_capture != null and
             self.prefill_current_token_idx < self.a3b_capture_max_tokens;
+        if (use_delta_normed_qk) {
+            self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, qkv_bytes);
+            const pip = &(self.elementwise.pipeline_ssm_qk_norm orelse return error.ShaderNotLoaded);
+            const push = SsmQkNormPush{
+                .d_state = d_state,
+                .n_group = n_group,
+                .qk_dim = d_state * n_group,
+            };
+            self.pushDispatch1(pip, std.mem.asBytes(&push), self.swiglu_buf.handle, qkv_bytes, n_group, 1, 1);
+        }
         if (a3b_capture_this_layer) {
             self.decode_cmd.computeAndTransferBarrier();
         } else {
@@ -9168,7 +9655,6 @@ pub const InferenceEngine = struct {
         const ssm_a_size = if (ssm_a_tensor) |t| t.gpu_buffer.size else ab_bytes;
         const ssm_delta_phase = self.beginProfilePhase();
         {
-            const pip = &(self.elementwise.pipeline_ssm_delta_net orelse return error.ShaderNotLoaded);
             const push = SsmDeltaNetPush{
                 .d_inner = d_inner,
                 .dt_rank = dt_rank,
@@ -9188,9 +9674,14 @@ pub const InferenceEngine = struct {
                 .ab_stride_tok = dt_rank,
                 .y_stride_tok = d_inner,
             };
+            const pip = if (use_delta_normed_qk)
+                &(self.elementwise.pipeline_ssm_delta_net_cols8_normed orelse return error.ShaderNotLoaded)
+            else if (use_delta_cols8)
+                &(self.elementwise.pipeline_ssm_delta_net_cols8 orelse return error.ShaderNotLoaded)
+            else
+                &(self.elementwise.pipeline_ssm_delta_net orelse return error.ShaderNotLoaded);
             if (pip.uses_push_descriptors) {
-                // 64t×1r: one WG per (head, row) pair — see ssm_delta_net.comp
-                const row_blocks = head_v_dim;
+                const row_blocks = if (use_delta_cols8) (head_v_dim + 7) / 8 else head_v_dim;
                 self.pushDispatch7(pip, std.mem.asBytes(&push), self.swiglu_buf.handle, qkv_bytes, dt_bias_buf, dt_bias_size, self.router_logits_buf.handle, ab_bytes, self.down_buf.handle, ab_bytes, ssm_a_buf, ssm_a_size, self.gpu_ssm_states[layer_idx].handle, self.gpu_ssm_states[layer_idx].size, self.attn_out_buf.handle, z_bytes, dt_rank, row_blocks, 1);
             } else {
                 const ds = try self.allocDescSet(pip.descriptor_set_layout);
@@ -9211,7 +9702,13 @@ pub const InferenceEngine = struct {
                     self.attn_out_buf.handle,
                     z_bytes, // binding 6: output (d_inner floats)
                 );
-                try self.elementwise.recordSsmDeltaNet(&self.decode_cmd, ds, push);
+                if (use_delta_normed_qk) {
+                    try self.elementwise.recordSsmDeltaNetCols8Normed(&self.decode_cmd, ds, push);
+                } else if (use_delta_cols8) {
+                    try self.elementwise.recordSsmDeltaNetCols8(&self.decode_cmd, ds, push);
+                } else {
+                    try self.elementwise.recordSsmDeltaNet(&self.decode_cmd, ds, push);
+                }
             }
         }
         // Narrow: gated_norm only reads attn_out_buf (delta_net output, z_bytes) and
@@ -9555,11 +10052,16 @@ pub const InferenceEngine = struct {
             // populated from its own projection (or from a duplicate K projection
             // when use_k_as_v) and, for Gemma 4, unit-normed — always use scratch_v.
             try self.dispatchKvCacheWriteBatched(
-                scratch_k.handle, scratch_k.size,
-                self.kv_k_cache[layer_idx].handle, self.kv_k_cache[layer_idx].size,
-                scratch_v.handle, scratch_v.size,
-                self.kv_v_cache[layer_idx].handle, self.kv_v_cache[layer_idx].size,
-                self.page_table_buf.handle, self.page_table_buf.size,
+                scratch_k.handle,
+                scratch_k.size,
+                self.kv_k_cache[layer_idx].handle,
+                self.kv_k_cache[layer_idx].size,
+                scratch_v.handle,
+                scratch_v.size,
+                self.kv_v_cache[layer_idx].handle,
+                self.kv_v_cache[layer_idx].size,
+                self.page_table_buf.handle,
+                self.page_table_buf.size,
                 layer_kv_dim,
                 n_tokens,
                 kv_page_size_tokens,
@@ -9585,10 +10087,15 @@ pub const InferenceEngine = struct {
             if (cfg.architecture == .gemma) {
                 if (lt.post_attention_norm) |pan_t| {
                     try self.dispatchRmsNorm(
-                        scratch_down.handle, scratch_down.size,
-                        pan_t.gpu_buffer.handle, pan_t.gpu_buffer.size,
-                        scratch_down.handle, scratch_down.size,
-                        hidden_dim, n_tokens, eps,
+                        scratch_down.handle,
+                        scratch_down.size,
+                        pan_t.gpu_buffer.handle,
+                        pan_t.gpu_buffer.size,
+                        scratch_down.handle,
+                        scratch_down.size,
+                        hidden_dim,
+                        n_tokens,
+                        eps,
                     );
                     self.decode_cmd.computeBarrier();
                 }
@@ -9617,19 +10124,29 @@ pub const InferenceEngine = struct {
             if (use_fused_pfn) {
                 const pfn_t = lt.post_ffw_norm.?;
                 try self.dispatchRmsNormAdd(
-                    scratch_hidden.handle, scratch_hidden.size,
-                    scratch_down.handle, scratch_down.size,
-                    pfn_t.gpu_buffer.handle, pfn_t.gpu_buffer.size,
-                    hidden_dim, n_tokens, eps,
+                    scratch_hidden.handle,
+                    scratch_hidden.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    pfn_t.gpu_buffer.handle,
+                    pfn_t.gpu_buffer.size,
+                    hidden_dim,
+                    n_tokens,
+                    eps,
                 );
             } else {
                 if (cfg.architecture == .gemma) {
                     if (lt.post_ffw_norm) |pfn_t| {
                         try self.dispatchRmsNorm(
-                            scratch_down.handle, scratch_down.size,
-                            pfn_t.gpu_buffer.handle, pfn_t.gpu_buffer.size,
-                            scratch_down.handle, scratch_down.size,
-                            hidden_dim, n_tokens, eps,
+                            scratch_down.handle,
+                            scratch_down.size,
+                            pfn_t.gpu_buffer.handle,
+                            pfn_t.gpu_buffer.size,
+                            scratch_down.handle,
+                            scratch_down.size,
+                            hidden_dim,
+                            n_tokens,
+                            eps,
                         );
                         self.decode_cmd.computeBarrier();
                     }
@@ -10219,7 +10736,6 @@ pub const InferenceEngine = struct {
             self.resetProfilingSamples();
             self.profile_enabled = profile_was_enabled;
         }
-
     }
 
     // -----------------------------------------------------------------------
@@ -10910,6 +11426,7 @@ pub const InferenceEngine = struct {
         self.argmax_partials_buf.deinit();
         self.logits_staging.deinit();
         self.logits_buf.deinit();
+        self.q8_1_buf.deinit();
         self.norm_buf.deinit();
         self.residual_buf.deinit();
         self.hidden_buf.deinit();
@@ -11287,6 +11804,12 @@ pub fn generate(
                 engine.avgProfilePhaseMs(.dense_ffn_gateup),
                 engine.avgProfilePhaseMs(.dense_ffn_down),
             });
+            log.info("PROFILE: avg tail subphases norm={d:.2} ms lm_head={d:.2} ms argmax={d:.2} ms copy={d:.2} ms", .{
+                engine.avgProfilePhaseMs(.final_norm),
+                engine.avgProfilePhaseMs(.final_lm_head),
+                engine.avgProfilePhaseMs(.final_argmax),
+                engine.avgProfilePhaseMs(.final_copy),
+            });
             log.info("PROFILE: fallback counts cpu_ssm={d} cpu_moe={d} cpu_shared_gate={d} cpu_argmax={d}", .{
                 engine.profile_total_counters.cpu_ssm_fallbacks,
                 engine.profile_total_counters.cpu_moe_fallbacks,
@@ -11338,9 +11861,8 @@ pub fn generate(
             const total_avg_ms = @as(f64, @floatFromInt(total_ns)) /
                 @as(f64, @floatFromInt(@max(engine.fa_per_layer_count[0], 1))) / 1_000_000.0;
             log.info("FA_PROFILE_LAYER: summary min=L{d}({d:.4}ms) max=L{d}({d:.4}ms) ratio={d:.2}x total_per_token={d:.3}ms", .{
-                min_idx, min_ms, max_idx, max_ms,
-                if (min_ms > 0) max_ms / min_ms else 0.0,
-                total_avg_ms,
+                min_idx,                                  min_ms,       max_idx, max_ms,
+                if (min_ms > 0) max_ms / min_ms else 0.0, total_avg_ms,
             });
         }
     }

@@ -104,6 +104,12 @@ pub const SsmDeltaNetPush = extern struct {
     y_stride_tok: u32, // floats: d_inner
 };
 
+pub const SsmQkNormPush = extern struct {
+    d_state: u32,
+    n_group: u32,
+    qk_dim: u32,
+};
+
 /// Push constants for SSM gated norm shader.
 pub const SsmGatedNormPush = extern struct {
     d_inner: u32,
@@ -175,8 +181,8 @@ pub const RmsNormAddPush = extern struct {
 /// rms_norm_mul → router DMMV pair into a single dispatch on
 /// architectures whose router weights are f32 (Qwen 3.5/3.6 etc).
 pub const RmsNormDmmvF32Push = extern struct {
-    M: u32,        // router output rows (= n_experts)
-    K: u32,        // hidden_dim
+    M: u32, // router output rows (= n_experts)
+    K: u32, // hidden_dim
     eps_bits: u32, // RMS norm epsilon (f32 bits)
 };
 
@@ -185,8 +191,8 @@ pub const RmsNormDmmvF32Push = extern struct {
 /// per-SSM-layer (rms_norm_mul → alpha DMMV → beta DMMV) trio into a
 /// single dispatch on the qwen35moe / qwen36moe SSM proj fast path.
 pub const RmsNormDmmvQ4kAlphaBetaPush = extern struct {
-    M: u32,        // alpha rows == beta rows (= dt_rank)
-    K: u32,        // hidden_dim (must be multiple of 256 for Q4_K)
+    M: u32, // alpha rows == beta rows (= dt_rank)
+    K: u32, // hidden_dim (must be multiple of 256 for Q4_K)
     eps_bits: u32, // RMS norm epsilon (f32 bits)
 };
 
@@ -200,10 +206,10 @@ pub const QkNormRopeKvWritePush = extern struct {
     n_q_heads: u32,
     n_k_heads: u32,
     position: u32,
-    freq_base_bits: u32,   // 0 ⇒ use freq buffer
-    attn_scale_bits: u32,  // 0 ⇒ scale = 1.0
+    freq_base_bits: u32, // 0 ⇒ use freq buffer
+    attn_scale_bits: u32, // 0 ⇒ scale = 1.0
     eps_bits: u32,
-    dst_offset: u32,       // physical_token * kv_dim (in floats)
+    dst_offset: u32, // physical_token * kv_dim (in floats)
 };
 
 /// Manages element-wise fused kernel pipelines.
@@ -235,8 +241,14 @@ pub const ElementwiseDispatch = struct {
     pipeline_per_expert_scale: ?Pipeline,
     /// SSM CONV1D pipeline, or null.
     pipeline_ssm_conv1d: ?Pipeline,
+    /// In-place SSM Q/K normalization pipeline, or null.
+    pipeline_ssm_qk_norm: ?Pipeline,
     /// SSM DELTA NET pipeline, or null.
     pipeline_ssm_delta_net: ?Pipeline,
+    /// SSM DELTA NET cols8 pipeline, or null.
+    pipeline_ssm_delta_net_cols8: ?Pipeline,
+    /// SSM DELTA NET cols8 pipeline for pre-normalized Q/K, or null.
+    pipeline_ssm_delta_net_cols8_normed: ?Pipeline,
     /// SSM GATED NORM pipeline, or null.
     pipeline_ssm_gated_norm: ?Pipeline,
     /// SOFTMAX TOPK pipeline, or null.
@@ -432,10 +444,26 @@ pub const ElementwiseDispatch = struct {
             break :blk null;
         };
 
+        const qk_norm_path = std.fmt.bufPrint(&path_buf, "{s}/ssm_qk_norm.spv", .{shader_dir}) catch unreachable;
+        const pipeline_ssm_qk_norm = pipeline_mod.createFromSpirvWithOptions(instance, qk_norm_path, 1, @sizeOf(SsmQkNormPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("ssm_qk_norm shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         // SSM delta-net: 7 bindings (conv_out, dt_bias, alpha, beta, ssm_a, state, output)
         const delta_path = std.fmt.bufPrint(&path_buf, "{s}/ssm_delta_net.spv", .{shader_dir}) catch unreachable;
         const pipeline_ssm_delta_net = pipeline_mod.createFromSpirvWithOptions(instance, delta_path, 7, @sizeOf(SsmDeltaNetPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
             log.warn("ssm_delta_net shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const delta_cols8_path = std.fmt.bufPrint(&path_buf, "{s}/ssm_delta_net_cols8.spv", .{shader_dir}) catch unreachable;
+        const pipeline_ssm_delta_net_cols8 = pipeline_mod.createFromSpirvWithOptions(instance, delta_cols8_path, 7, @sizeOf(SsmDeltaNetPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("ssm_delta_net_cols8 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const delta_cols8_normed_path = std.fmt.bufPrint(&path_buf, "{s}/ssm_delta_net_cols8_normed.spv", .{shader_dir}) catch unreachable;
+        const pipeline_ssm_delta_net_cols8_normed = pipeline_mod.createFromSpirvWithOptions(instance, delta_cols8_normed_path, 7, @sizeOf(SsmDeltaNetPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("ssm_delta_net_cols8_normed shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -562,7 +590,10 @@ pub const ElementwiseDispatch = struct {
             .pipeline_mul_elementwise = pipeline_mul_elementwise,
             .pipeline_per_expert_scale = pipeline_per_expert_scale,
             .pipeline_ssm_conv1d = pipeline_ssm_conv1d,
+            .pipeline_ssm_qk_norm = pipeline_ssm_qk_norm,
             .pipeline_ssm_delta_net = pipeline_ssm_delta_net,
+            .pipeline_ssm_delta_net_cols8 = pipeline_ssm_delta_net_cols8,
+            .pipeline_ssm_delta_net_cols8_normed = pipeline_ssm_delta_net_cols8_normed,
             .pipeline_ssm_gated_norm = pipeline_ssm_gated_norm,
             .pipeline_softmax_topk = pipeline_softmax_topk,
             .pipeline_softmax_topk_v2 = pipeline_softmax_topk_v2,
@@ -845,6 +876,23 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 
+    /// Record in-place SSM Q/K normalization.
+    pub fn recordSsmQkNorm(
+        self: *const ElementwiseDispatch,
+        cmd: *CommandBuffer,
+        descriptor_set: vk.c.VkDescriptorSet,
+        d_state: u32,
+        n_group: u32,
+    ) !void {
+        const pip = if (self.pipeline_ssm_qk_norm) |*p| p else return error.ShaderNotLoaded;
+        const push = SsmQkNormPush{
+            .d_state = d_state,
+            .n_group = n_group,
+            .qk_dim = d_state * n_group,
+        };
+        cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), n_group, 1, 1);
+    }
+
     /// Record SSM delta-net state update dispatch.
     pub fn recordSsmDeltaNet(
         self: *const ElementwiseDispatch,
@@ -855,6 +903,30 @@ pub const ElementwiseDispatch = struct {
         const pip = if (self.pipeline_ssm_delta_net) |*p| p else return error.ShaderNotLoaded;
         // 64t×1r: one WG per (head, row) pair — see ssm_delta_net.comp
         const row_blocks = push.head_v_dim;
+        cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), push.dt_rank, row_blocks, 1);
+    }
+
+    /// Record SSM delta-net cols8 dispatch.
+    pub fn recordSsmDeltaNetCols8(
+        self: *const ElementwiseDispatch,
+        cmd: *CommandBuffer,
+        descriptor_set: vk.c.VkDescriptorSet,
+        push: SsmDeltaNetPush,
+    ) !void {
+        const pip = if (self.pipeline_ssm_delta_net_cols8) |*p| p else return error.ShaderNotLoaded;
+        const row_blocks = (push.head_v_dim + 7) / 8;
+        cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), push.dt_rank, row_blocks, 1);
+    }
+
+    /// Record SSM delta-net cols8 dispatch for pre-normalized Q/K.
+    pub fn recordSsmDeltaNetCols8Normed(
+        self: *const ElementwiseDispatch,
+        cmd: *CommandBuffer,
+        descriptor_set: vk.c.VkDescriptorSet,
+        push: SsmDeltaNetPush,
+    ) !void {
+        const pip = if (self.pipeline_ssm_delta_net_cols8_normed) |*p| p else return error.ShaderNotLoaded;
+        const row_blocks = (push.head_v_dim + 7) / 8;
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), push.dt_rank, row_blocks, 1);
     }
 
@@ -932,7 +1004,10 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_mul_elementwise) |*p| p.deinit();
         if (self.pipeline_per_expert_scale) |*p| p.deinit();
         if (self.pipeline_ssm_conv1d) |*p| p.deinit();
+        if (self.pipeline_ssm_qk_norm) |*p| p.deinit();
         if (self.pipeline_ssm_delta_net) |*p| p.deinit();
+        if (self.pipeline_ssm_delta_net_cols8) |*p| p.deinit();
+        if (self.pipeline_ssm_delta_net_cols8_normed) |*p| p.deinit();
         if (self.pipeline_ssm_gated_norm) |*p| p.deinit();
         if (self.pipeline_softmax_topk) |*p| p.deinit();
         if (self.pipeline_softmax_topk_v2) |*p| p.deinit();

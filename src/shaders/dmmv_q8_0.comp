@@ -12,12 +12,14 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
 
 layout(local_size_x = 64) in;
 
 // Specialization constants for compile-time dimension tuning
 layout(constant_id = 0) const uint SPEC_M = 4096;
 layout(constant_id = 1) const uint SPEC_K = 4096;
+layout(constant_id = 2) const uint SPEC_BLOCKS_PER_ROW = 0u;
 
 // Push constants for runtime parameters
 layout(push_constant) uniform PushConstants {
@@ -31,7 +33,7 @@ layout(push_constant) uniform PushConstants {
 
 // Buffer bindings
 layout(set = 0, binding = 0) readonly buffer MatrixA { uint8_t a_data[]; };
-layout(set = 0, binding = 1) readonly buffer VectorX { float x_data[];   };
+layout(set = 0, binding = 1) readonly buffer VectorX { vec4 x_data[];    };
 layout(set = 0, binding = 2) buffer VectorY { float y_data[];  };
 
 // Q8_0 block constants
@@ -42,23 +44,17 @@ const uint Q8_0_BYTES      = 34;   // bytes per block
 shared float s_sum0[4];  // max 4 subgroups for workgroup size 64 (SIMD16)
 shared float s_sum1[4];
 
-float dot_q8_block(const uint qs_off, const uint x_base) {
+float dot_q8_block(const uint qs_off, const uint x_base_v4) {
     float block_sum = 0.0;
     for (uint i = 0u; i < 8u; i++) {
         const uint q_off = qs_off + i * 4u;
-        const uint x_off = x_base + i * 4u;
         const ivec4 qv = ivec4(
             int(int8_t(a_data[q_off + 0u])),
             int(int8_t(a_data[q_off + 1u])),
             int(int8_t(a_data[q_off + 2u])),
             int(int8_t(a_data[q_off + 3u]))
         );
-        const vec4 xv = vec4(
-            x_data[x_off + 0u],
-            x_data[x_off + 1u],
-            x_data[x_off + 2u],
-            x_data[x_off + 3u]
-        );
+        const vec4 xv = x_data[x_base_v4 + i];
         block_sum += dot(vec4(qv), xv);
     }
     return block_sum;
@@ -72,15 +68,15 @@ void main() {
     uint tid = gl_LocalInvocationID.x;  // 0..63
 
     // Number of Q8_0 blocks per row
-    uint blocks_per_row = K / Q8_0_BLOCK_SIZE;
+    uint blocks_per_row = (SPEC_BLOCKS_PER_ROW != 0u) ? SPEC_BLOCKS_PER_ROW : (K / Q8_0_BLOCK_SIZE);
 
     float sum0 = 0.0;
     float sum1 = 0.0;
 
     // Each thread processes blocks in a strided pattern: tid, tid+64, tid+128, ...
-    for (uint blk = tid; blk < blocks_per_row; blk += 64u) {
+    [[unroll]] for (uint blk = tid; blk < blocks_per_row; blk += 64u) {
         // x vector elements for this block
-        uint x_base = x_offset / 4u + blk * Q8_0_BLOCK_SIZE;
+        uint x_base_v4 = x_offset / 16u + blk * 8u;
 
         // --- Row 0 ---
         if (row0 < M) {
@@ -92,7 +88,7 @@ void main() {
 
             uint qs_off = byte_off + 2u;
 
-            sum0 += d * dot_q8_block(qs_off, x_base);
+            sum0 += d * dot_q8_block(qs_off, x_base_v4);
         }
 
         // --- Row 1 ---
@@ -104,7 +100,7 @@ void main() {
 
             uint qs_off = byte_off + 2u;
 
-            sum1 += d * dot_q8_block(qs_off, x_base);
+            sum1 += d * dot_q8_block(qs_off, x_base_v4);
         }
     }
 

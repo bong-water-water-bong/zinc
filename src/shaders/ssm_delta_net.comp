@@ -37,6 +37,7 @@
 // Dispatch: dt_rank × head_v_dim × 1 workgroups
 
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
@@ -106,9 +107,6 @@ layout(push_constant) uniform PushConstants {
 // Shared memory for Q and K vectors (up to 128 elements each)
 shared float s_q[128];
 shared float s_k[128];
-// Shared scalar values broadcast from thread 0
-shared float s_gate;
-shared float s_beta_val;
 shared float s_reduce[64];
 shared float s_reduce_scalar;
 
@@ -247,8 +245,10 @@ void main() {
         }
         barrier();
 
-        // --- Step 3: Compute gate and beta_val (single thread, broadcast via shared) ---
-        if (tid == 0) {
+        // --- Step 3: Compute gate and beta_val (subgroup leader broadcast) ---
+        float gate_bcast = 0.0;
+        float beta_bcast = 0.0;
+        if (gl_SubgroupInvocationID == 0u) {
             float a = alpha[ab_base + h];
             a += dt_bias_val;
             // softplus: log(1 + exp(a))
@@ -259,15 +259,14 @@ void main() {
             } else {
                 gate_val = -sp;
             }
-            s_gate = exp(gate_val);
+            gate_bcast = exp(gate_val);
             // sigmoid(beta)
-            s_beta_val = 1.0 / (1.0 + exp(-beta[ab_base + h]));
+            beta_bcast = 1.0 / (1.0 + exp(-beta[ab_base + h]));
         }
-        barrier();
+        float g_val = subgroupBroadcastFirst(gate_bcast);
+        float b_val = subgroupBroadcastFirst(beta_bcast);
 
         // --- Steps 4-6: State update and readout (64 threads per row, 1 row per WG) ---
-        float g_val = s_gate;
-        float b_val = s_beta_val;
         float v_val = conv_out[v_offset + row];
 
         // Phase 1: Decay register state in place, accumulate sk.

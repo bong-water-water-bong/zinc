@@ -46,6 +46,10 @@ pub fn build(b: *std.Build) void {
     const shader_sources = .{
         "dmmv_q4k",
         "dmmv_q8_0",
+        "dmmv_q8_0_batch",
+        "dmmv_q8_0_wide",
+        "dmmv_q8_0_q8_1",
+        "dmmv_q8_0_fused_pair",
         "dmmv_q5k",
         "dmmv_q6k",
         "dmmv_f16",
@@ -70,7 +74,10 @@ pub fn build(b: *std.Build) void {
         "sigmoid_scale_acc",
         "argmax",
         "ssm_conv1d",
+        "ssm_qk_norm",
         "ssm_delta_net",
+        "ssm_delta_net_cols8",
+        "ssm_delta_net_cols8_normed",
         "ssm_gated_norm",
         "dmmv_mxfp4",
         "dmmv_q5_0",
@@ -78,6 +85,7 @@ pub fn build(b: *std.Build) void {
         "dmmv_q4k_moe",
         "dmmv_q4k_moe_kpar",
         "dmmv_q4k_fused_gate_up_moe",
+        "dmmv_q4k_fused_gate_up_swiglu_moe",
         "dmmv_q4k_fused_gate_up_swiglu",
         "dmmv_q8_0_fused_gate_up_swiglu",
         "dmmv_q8_0_sigmoid_acc",
@@ -342,11 +350,9 @@ pub fn build(b: *std.Build) void {
         b.addSystemCommand(&.{ "bun", "test" })
     else
         b.addSystemCommand(&.{
-            "bun", "test",
-            "loops/",
-            "tools/",
-            "site/src/",
-            "tests/chat_ui_markdown.test.ts",
+            "bun",       "test",
+            "loops/",    "tools/",
+            "site/src/", "tests/chat_ui_markdown.test.ts",
         });
     run_bun_tests.setCwd(b.path("."));
     run_bun_tests.setEnvironmentVariable("ZINC_REQUIRE_FULL_TESTS", if (full_tests) "1" else "0");
