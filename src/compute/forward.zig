@@ -9718,7 +9718,12 @@ pub const InferenceEngine = struct {
             else
                 &(self.elementwise.pipeline_ssm_delta_net orelse return error.ShaderNotLoaded);
             if (pip.uses_push_descriptors) {
-                const row_blocks = if (use_delta_cols8) (head_v_dim + 7) / 8 else head_v_dim;
+                const row_blocks = if (use_delta_normed_qk)
+                    (head_v_dim + 7) / 8
+                else if (use_delta_cols8)
+                    (head_v_dim + 3) / 4
+                else
+                    head_v_dim;
                 self.pushDispatch7(pip, std.mem.asBytes(&push), self.swiglu_buf.handle, qkv_bytes, dt_bias_buf, dt_bias_size, self.router_logits_buf.handle, ab_bytes, self.down_buf.handle, ab_bytes, ssm_a_buf, ssm_a_size, self.gpu_ssm_states[layer_idx].handle, self.gpu_ssm_states[layer_idx].size, self.attn_out_buf.handle, z_bytes, dt_rank, row_blocks, 1);
             } else {
                 const ds = try self.allocDescSet(pip.descriptor_set_layout);

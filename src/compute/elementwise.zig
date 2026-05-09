@@ -914,7 +914,8 @@ pub const ElementwiseDispatch = struct {
         push: SsmDeltaNetPush,
     ) !void {
         const pip = if (self.pipeline_ssm_delta_net_cols8) |*p| p else return error.ShaderNotLoaded;
-        const row_blocks = (push.head_v_dim + 7) / 8;
+        // ssm_delta_net_cols8 currently maps four output rows per wave64.
+        const row_blocks = (push.head_v_dim + 3) / 4;
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), push.dt_rank, row_blocks, 1);
     }
 

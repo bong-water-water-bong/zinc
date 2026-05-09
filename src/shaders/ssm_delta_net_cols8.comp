@@ -1,10 +1,10 @@
 #version 460
-// ZINC — SSM delta-net recurrent state update, 8 output rows per workgroup.
+// ZINC — SSM delta-net recurrent state update, 4 output rows per workgroup.
 //
 // Mirrors llama.cpp's GDN launch shape for S=128 on subgroup-clustered
-// hardware: one wave64 is split into eight 8-lane clusters. Each cluster owns
-// one output row and each lane keeps 16 state columns in registers. Q/K L2
-// normalization is computed once per workgroup and shared across all 8 rows.
+// hardware: one wave64 is split into four 16-lane clusters. Each cluster owns
+// one output row and each lane keeps 8 state columns in registers. Q/K L2
+// normalization is computed once per workgroup and shared across all 4 rows.
 // Host gates this shader to head_v_dim == d_state == 128.
 
 #extension GL_KHR_shader_subgroup_basic : require
@@ -67,9 +67,9 @@ layout(push_constant) uniform PushConstants {
     uint y_stride_tok;
 };
 
-const uint LANES_PER_ROW = 8u;
-const uint ROWS_PER_WG = 8u;
-const uint COLS_PER_LANE = 16u;
+const uint LANES_PER_ROW = 16u;
+const uint ROWS_PER_WG = 4u;
+const uint COLS_PER_LANE = 8u;
 
 shared float s_q[128];
 shared float s_k[128];
@@ -151,7 +151,7 @@ void main() {
             reg_state[r] *= g_val;
             sk += reg_state[r] * s_k[col];
         }
-        sk = subgroupClusteredAdd(sk, 8u);
+        sk = subgroupClusteredAdd(sk, LANES_PER_ROW);
 
         float d_val = b_val * (v_val - sk);
 
@@ -161,7 +161,7 @@ void main() {
             reg_state[r] += s_k[col] * d_val;
             o_val += reg_state[r] * s_q[col];
         }
-        o_val = subgroupClusteredAdd(o_val, 8u);
+        o_val = subgroupClusteredAdd(o_val, LANES_PER_ROW);
 
         if (lane == 0u) {
             out_data[y_base + h * head_v_dim + row] = o_val;
