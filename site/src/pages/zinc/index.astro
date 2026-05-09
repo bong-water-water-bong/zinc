@@ -141,15 +141,16 @@ const jsonLd = {
         <tr><th>GPU</th><th>Model</th><th>Path</th><th>ZINC</th><th>llama.cpp</th></tr>
       </thead>
       <tbody>
-        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen3.5-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td><strong>103.72 tok/s</strong></td><td>96.76 tok/s</td></tr>
-        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen3.6-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td>99.40 tok/s</td><td>104.48 tok/s</td></tr>
-        <tr><td><strong>AI PRO R9700</strong></td><td>Gemma 4 31B (dense)</td><td>decode</td><td><strong>44.53 tok/s</strong></td><td>32.17 tok/s</td></tr>
-        <tr><td><strong>AI PRO R9700</strong></td><td>GPT-OSS 20B</td><td>decode</td><td>83.41 tok/s</td><td>181.72 tok/s</td></tr>
-        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen 3 8B (dense)</td><td>prefill</td><td><strong>115.85 tok/s</strong></td><td>84.73 tok/s</td></tr>
+        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen3.5-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td><strong>110.87 tok/s</strong></td><td>105.85 tok/s</td></tr>
+        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen3.6-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td><strong>109.22 tok/s</strong></td><td>99.80 tok/s</td></tr>
+        <tr><td><strong>AI PRO R9700</strong></td><td>Gemma 4 26B A4B</td><td>decode</td><td>103.73 tok/s</td><td>107.42 tok/s</td></tr>
+        <tr><td><strong>AI PRO R9700</strong></td><td>Gemma 4 31B (dense)</td><td>decode</td><td><strong>44.18 tok/s</strong></td><td>32.18 tok/s</td></tr>
+        <tr><td><strong>AI PRO R9700</strong></td><td>GPT-OSS 20B</td><td>decode</td><td>86.49 tok/s</td><td>182.09 tok/s</td></tr>
+        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen 3 8B (dense)</td><td>prefill</td><td><strong>110.26 tok/s</strong></td><td>85.11 tok/s</td></tr>
       </tbody>
     </table>
 
-    <p>Median tok/s across the perf suite's runs (2026-05-02 refresh) on the RDNA4 test node with <code>zig build -Doptimize=ReleaseFast</code> and <code>RADV_PERFTEST=coop_matrix</code>. Bold rows are where ZINC currently beats llama.cpp on the same hardware. Full breakdown: <a href="/zinc/performance">/zinc/performance</a>.</p>
+    <p>Median tok/s across the perf suite's runs (2026-05-09 refresh) on the RDNA4 test node with <code>zig build -Doptimize=ReleaseFast</code> and <code>RADV_PERFTEST=coop_matrix</code>. Bold rows are where ZINC currently beats llama.cpp on the same hardware. Full breakdown: <a href="/zinc/performance">/zinc/performance</a>.</p>
 
     <h2>Performance on Apple Silicon</h2>
 
