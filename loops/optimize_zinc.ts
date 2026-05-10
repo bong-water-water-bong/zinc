@@ -29,7 +29,6 @@ import { join, resolve } from "node:path";
 import {
   isGarbageString,
   formatElapsed,
-  extractTextFromStreamJson,
 } from "./optimize_llm_tps";
 
 // ── Color & display ──────────────────────────────────────────────────
@@ -72,6 +71,8 @@ const ZINC_PORT = Number(process.env.ZINC_PORT ?? ENV.ZINC_PORT ?? "22");
 const ZINC_USER = process.env.ZINC_USER ?? ENV.ZINC_USER ?? "root";
 let REMOTE_ZINC_DIR = "/root/zinc";
 const DEFAULT_MODEL = "/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
+const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
+const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh";
 
 const BLOCKED_GIT_OPS = [
   "Bash(git checkout:*)",
@@ -604,7 +605,7 @@ function coerceDisplayText(value: unknown): string {
   }
   if (typeof value === "object") {
     const r = value as Record<string, unknown>;
-    const parts = [r.text, r.message, r.output, r.stdout, r.stderr, r.content, r.result]
+    const parts = [r.text, r.message, r.output, r.stdout, r.stderr, r.content, r.result, r.output_text]
       .map((e) => coerceDisplayText(e)).filter((e) => e.trim());
     if (parts.length > 0) return parts.join("\n");
     try { return JSON.stringify(r, null, 2); } catch { return ""; }
@@ -709,6 +710,81 @@ function buildClaudeArgs(prompt: string): string[] {
   ];
 }
 
+function buildCodexArgs(prompt: string): string[] {
+  return [
+    "exec",
+    "-c",
+    `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
+    "--skip-git-repo-check",
+    "--json",
+    "--color", "never",
+    "--sandbox", "workspace-write",
+    "--cd", REPO_ROOT,
+    "--model", CODEX_MODEL,
+    prompt,
+  ];
+}
+
+function formatCodexStreamLine(rawLine: string): string | null {
+  if (!rawLine.trim()) return null;
+  let event: Record<string, unknown>;
+  try {
+    event = JSON.parse(rawLine) as Record<string, unknown>;
+  } catch {
+    return rawLine.trim().startsWith("@@@") ? `${clr("96", rawLine.trim())}\n` : null;
+  }
+
+  const type = typeof event.type === "string" ? event.type : "";
+  if (type === "error") {
+    const text = coerceDisplayText(event.message ?? event.content);
+    return text ? `${clr("31", text)}\n` : null;
+  }
+  if (type === "item.completed") {
+    const item = event.item as Record<string, unknown> | undefined;
+    if (item?.type === "agent_message") {
+      const text = coerceDisplayText(item.text ?? item.message ?? item.output_text ?? item.content);
+      return text ? `${clr("96", text)}\n` : null;
+    }
+    if (item?.type === "reasoning") {
+      const text = coerceDisplayText(item.summary ?? item.text ?? item.message ?? item.content);
+      return text ? `${clr("2", `thinking: ${text}`)}\n` : null;
+    }
+  }
+  return null;
+}
+
+function extractAgentText(stdout: string): string {
+  const texts: string[] = [];
+  for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      const type = event.type;
+      if (type === "assistant") {
+        const content = (event.message as Record<string, unknown> | undefined)?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            const text = (block as Record<string, unknown>)?.text;
+            if (typeof text === "string" && text.trim()) texts.push(text);
+          }
+        }
+      } else if (type === "message" || type === "agent") {
+        const text = coerceDisplayText(event.content ?? event.message);
+        if (text.trim()) texts.push(text);
+      } else if (type === "item.completed") {
+        const item = event.item as Record<string, unknown> | undefined;
+        if (item?.type === "agent_message") {
+          const text = coerceDisplayText(item.text ?? item.message ?? item.output_text ?? item.content);
+          if (text.trim()) texts.push(text);
+        }
+      }
+    } catch {
+      if (line.trim().startsWith("@@@")) texts.push(line.trim());
+    }
+  }
+  return texts.join("\n");
+}
+
 async function runAgent(
   agent: AgentKind,
   prompt: string,
@@ -743,11 +819,18 @@ async function runAgent(
     sawTextDeltaInCurrentMessage: false,
   };
 
-  const result = await runCommand("claude", buildClaudeArgs(prompt), {
-    streamOutput: true,
-    timeout: 900_000, // 15 min max per agent call
-    stdoutLineFormatter: (line) => formatClaudeStreamLine(line, claudeState),
-  });
+  const result =
+    agent === "codex"
+      ? await runCommand("codex", buildCodexArgs(prompt), {
+          streamOutput: true,
+          timeout: 900_000, // 15 min max per agent call
+          stdoutLineFormatter: formatCodexStreamLine,
+        })
+      : await runCommand("claude", buildClaudeArgs(prompt), {
+          streamOutput: true,
+          timeout: 900_000, // 15 min max per agent call
+          stdoutLineFormatter: (line) => formatClaudeStreamLine(line, claudeState),
+        });
 
   clearInterval(heartbeat);
   console.log(clr("1;36", SEP));
@@ -1201,7 +1284,7 @@ async function runCycle(
   await writeFile(join(cycleDir, "agent_stderr.txt"), agentResult.stderr);
 
   // Extract agent output markers
-  const assembledText = extractTextFromStreamJson(agentResult.stdout);
+  const assembledText = extractAgentText(agentResult.stdout);
   const lastChars = assembledText.slice(-3000);
 
   const descMatch =
@@ -1502,7 +1585,7 @@ async function runCycle(
 async function main() {
   const rawArgs = process.argv.slice(2);
   let maxCycles = Infinity;
-  let agent: AgentKind = "claude";
+  let agent: AgentKind = "codex";
   let modelPath = DEFAULT_MODEL;
   let dryRun = false;
   let resumeDir: string | undefined;
@@ -1534,7 +1617,7 @@ async function main() {
             "Usage: bun loops/optimize_zinc.ts [options]",
             "",
             "Options:",
-            "  --agent <claude|codex>   Agent to use (default: claude)",
+            "  --agent <claude|codex>   Agent to use (default: codex)",
             "  --cycles N               Max cycles (default: infinite)",
             "  --model-path <path>      GGUF model path on remote node",
             "  --dry-run                Build+run only, no agent",

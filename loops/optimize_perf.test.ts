@@ -228,13 +228,15 @@ describe("run artifact cleanup", () => {
 });
 
 describe("codexExecArgs", () => {
-  test("pins the configured reasoning effort", () => {
+  test("pins the configured model and reasoning effort", () => {
     expect(codexExecArgs("optimize")).toEqual([
       "exec",
       "-c",
       'model_reasoning_effort="xhigh"',
       "--dangerously-bypass-approvals-and-sandbox",
       "--json",
+      "--model",
+      "gpt-5.5",
       "optimize",
     ]);
   });

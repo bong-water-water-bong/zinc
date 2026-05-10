@@ -47,7 +47,8 @@ const CLAUDE_EFFORT = "max";
 // 1M-context variant is the right default for these cycles. Overridable
 // via ZINC_CLAUDE_MODEL in case a future run needs Sonnet / Haiku.
 const CLAUDE_MODEL = process.env.ZINC_CLAUDE_MODEL ?? "claude-opus-4-7[1m]";
-const CODEX_REASONING_EFFORT = "xhigh";
+const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
+const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh";
 
 function loadEnv(): Record<string, string> {
   const envPath = join(REPO_ROOT, ".env");
@@ -560,7 +561,7 @@ function parseArgs() {
   let dryRun = false;
   let model = "qwen36b";
   let resume = false;
-  let agent: AgentType = "claude";
+  let agent: AgentType = "codex";
   let analyze = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -580,7 +581,7 @@ function parseArgs() {
     console.error(`  --effort <${effortKeys}>         Optimization to run (required)`);
     console.error("  --cycles N               Max cycles (default: 20)");
     console.error(`  --model NAME             Model: ${MODEL_KEYS} (default: qwen36b)`);
-    console.error("  --agent claude|codex     AI agent to use (default: claude)");
+    console.error("  --agent claude|codex     AI agent to use (default: codex)");
     console.error("  --resume                 Resume from previous run (read history from log)");
     console.error("  --analyze                Print controller analysis from saved run state");
     console.error("  --dry-run                Build+bench baseline only, skip agent");
@@ -2322,6 +2323,8 @@ export function codexExecArgs(prompt: string): string[] {
     `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
     "--dangerously-bypass-approvals-and-sandbox",
     "--json",
+    "--model",
+    CODEX_MODEL,
     prompt,
   ];
 }
@@ -2588,7 +2591,10 @@ async function main() {
   console.log(c("1;37", boxLine(`ZINC Performance Optimization Loop — Effort ${effort}`)));
   console.log(c("1;37", boxLine(effortFile)));
   console.log(c("1;37", boxLine(`Model: ${model}`)));
-  console.log(c("1;37", boxLine(`Agent: ${agent}${agent === "claude" ? ` (${CLAUDE_MODEL} effort=${CLAUDE_EFFORT})` : ""}`)));
+  const agentDetails = agent === "claude"
+    ? ` (${CLAUDE_MODEL} effort=${CLAUDE_EFFORT})`
+    : ` (${CODEX_MODEL} effort=${CODEX_REASONING_EFFORT})`;
+  console.log(c("1;37", boxLine(`Agent: ${agent}${agentDetails}`)));
   console.log(c("1;37", boxLine(`Cycles this run: ${cycles}`)));
   if (resume) console.log(c("1;37", boxLine("Resuming from previous run")));
   console.log(c("1;37", `\u255A${"═".repeat(BOX_INNER_WIDTH)}\u255D\n`));

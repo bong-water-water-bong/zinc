@@ -906,6 +906,7 @@ function buildClaudeArgs(prompt: string, model?: string): string[] {
 // `xhigh` is the top tier; override via ZINC_CODEX_REASONING_EFFORT if a cycle
 // needs something cheaper.
 const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh";
+const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
 
 function buildCodexArgs(prompt: string, model?: string): string[] {
   const args = [
@@ -918,7 +919,7 @@ function buildCodexArgs(prompt: string, model?: string): string[] {
     "--sandbox", "workspace-write",
     "--cd", REPO_ROOT,
   ];
-  if (model) args.push("--model", model);
+  args.push("--model", model ?? CODEX_MODEL);
   args.push(prompt);
   return args;
 }
@@ -1530,7 +1531,7 @@ async function main() {
   const args = process.argv.slice(2);
   let maxCycles = 999;
   let dryRun = false;
-  let agent: AgentKind = "claude";
+  let agent: AgentKind = "codex";
   let model: string | undefined;
   let resume = false;
   let effort: number | null = null;
@@ -1572,7 +1573,7 @@ async function main() {
           "Usage: bun loops/implement_metal.ts [options]",
           "",
           "Options:",
-          "  --agent <claude|codex>  Agent to use (default: claude)",
+          "  --agent <claude|codex>  Agent to use (default: codex)",
           "  --model <name>          Model override for selected agent",
           "  --cycles N              Max cycles (default: 999)",
           "  --dry-run               Build+run only, no agent",
