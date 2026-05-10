@@ -1218,20 +1218,66 @@ const jsonLd = {
   }
 
   .scenario-tabs {
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 0.35rem;
+    padding: 0.35rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 84%, #d97706 16%);
+    border-radius: 8px;
+    background: var(--bench-surface-plain);
+    box-shadow: var(--bench-shadow);
   }
 
   .target-tab,
   .scenario-tab {
     appearance: none;
+    position: relative;
     text-align: left;
     border-radius: 8px;
-    border: 1px solid color-mix(in srgb, var(--color-border) 84%, #d97706 16%);
+    border: 1px solid color-mix(in srgb, var(--color-border) 86%, transparent);
     background: var(--bench-surface-soft);
     color: var(--color-text);
     cursor: pointer;
     padding: 0.8rem 0.85rem;
     transition: transform 0.14s ease, border-color 0.14s ease, background 0.14s ease, box-shadow 0.14s ease;
+  }
+
+  .target-tab {
+    padding-right: 2.5rem;
+    border-color: color-mix(in srgb, var(--color-border) 84%, #d97706 16%);
+  }
+
+  .scenario-tab {
+    padding: 0.65rem 0.72rem 0.68rem 0.95rem;
+    border-color: transparent;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .target-tab::before,
+  .scenario-tab::before {
+    content: '';
+    position: absolute;
+    display: block;
+    pointer-events: none;
+  }
+
+  .target-tab::before {
+    top: 0.86rem;
+    right: 0.86rem;
+    width: 0.74rem;
+    height: 0.74rem;
+    border-radius: 999px;
+    border: 2px solid color-mix(in srgb, var(--color-text-muted) 58%, transparent);
+    background: var(--bench-surface-plain);
+  }
+
+  .scenario-tab::before {
+    left: 0;
+    top: 0.62rem;
+    bottom: 0.62rem;
+    width: 3px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--color-border) 70%, transparent);
   }
 
   .target-tab-head,
@@ -1241,12 +1287,31 @@ const jsonLd = {
     margin-bottom: 0.55rem;
   }
 
+  .scenario-tab-head {
+    margin-bottom: 0.45rem;
+  }
+
   .target-tab.active,
   .scenario-tab.active {
     transform: translateY(-1px);
     border-color: #d97706;
     background: var(--bench-tab-active);
     box-shadow: 0 10px 18px -18px rgba(0, 0, 0, 0.45), inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent);
+  }
+
+  .target-tab:hover,
+  .scenario-tab:hover {
+    border-color: color-mix(in srgb, #d97706 68%, var(--color-border) 32%);
+    background: color-mix(in srgb, var(--bench-tab-active) 78%, var(--bench-surface-soft) 22%);
+  }
+
+  .target-tab.active::before {
+    border-color: #d97706;
+    background: radial-gradient(circle at center, #d97706 0 42%, transparent 45%);
+  }
+
+  .scenario-tab.active::before {
+    background: #d97706;
   }
 
   .target-tab:focus-visible,
