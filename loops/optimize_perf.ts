@@ -174,6 +174,9 @@ const LONG_CONTEXT_DECODE_PROMPT = [
   "Continue the story, describing what the woman said next and how Tomas responded.",
 ].join("\n");
 
+const GEMMA_LONG_DECODE_PROMPT =
+  "Write six short bullet points explaining why local LLM benchmark reports should separate prefill throughput from decode throughput.";
+
 type MetricMode = "decode" | "prefill";
 
 type EffortSpec = {
@@ -424,6 +427,56 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       {
         path: "/Users/stepan/Workspace/zinc/src/shaders/dmmv_q4k_moe_kpar.comp",
         focus: "Wave64 K-parallel pattern reference. NOTE: the cycle-1 'K-parallel Phase 1' attempt that reduced ONE row across all 64 threads with subgroupAdd lost -44%. That is NOT the pattern this shader uses. dmmv_q4k_moe_kpar splits 64 threads as THREADS_PER_BLOCK=16 (cooperative on K dim) × NUM_ROWS=4 (parallel rows). For multi-Q-per-WG, the analog is THREADS_PER_BLOCK_PER_Q × Q_PER_WG. Read the inner loop and reduction shape.",
+      },
+    ],
+  },
+  13: {
+    doc: "MULTI_HOUR_EFFORT_13_RDNA_GEMMA_LONG_DECODE.md",
+    summary: "RDNA Gemma 4 26B MoE long-decode parity with llama.cpp (remove Gemma CPU MoE fallback)",
+    metricMode: "decode",
+    primaryMetricLabel: "Gemma 4 26B long-decode tok/s",
+    benchmarkPrompt: GEMMA_LONG_DECODE_PROMPT,
+    benchmarkMaxTokens: 32,
+    benchmarkMethod: "32-token chat decode-extended benchmark on Gemma 4 26B A4B, matching the public benchmark matrix shape; run with --model gemma412b",
+    knownFlatCategories: [
+      "Do not optimize the context-long Gemma win first. In the public data, ZINC generated only 2 tokens while llama.cpp generated 8, so it is an early-stop artifact. The primary metric is decode-extended with 32 generated tokens.",
+      "Generic DMMV micro-tuning before removing Gemma CPU MoE fallback is the wrong order. The 26B MoE model is at 52% of llama.cpp on sustained decode while dense Gemma 31B is at 86%; the architectural delta points at MoE control flow, not a 1-2% matvec detail.",
+      "Do not port llama.cpp grouped-GEMM mul_mat_id first. Decode top-k <= 8 should start with the lighter matvec-ID shape. Grouped GEMM/count_experts is for prefill or true multi-token batches.",
+      "Q8_1 activation quant is not a default fix. llama.cpp enables it conditionally, and ZINC already measured Q8_1 regressions on some Qwen decode paths. Only try it after Gemma GPU MoE is coherent and faster.",
+      "Do not skip Gemma-specific semantics to make the fast path fit. pre_ffw_norm_2, ffn_gate_inp.scale, fused ffn_gate_up_exps, ffn_down_exps.scale, post_ffw_norm_1/2, and post_ffw_norm are correctness requirements.",
+    ],
+    structuralSwingIdeas: [
+      "Step 0 profile proof. Run Gemma 26B decode-extended with --profile -n 32 --chat and record cpu_moe_fallbacks plus moe_router/moe_topk/moe_gate_up/moe_swiglu/moe_down/moe_weighted_acc/shared/final_lm_head. If MoE is not a top bucket, update the effort doc before changing code.",
+      "GPU top-k validation for Gemma. Allow dispatchSoftmaxTopk after Gemma router scaling, but do not consume it yet. Copy router_output_buf for first token/layer and compare IDs/weights against CPU topKSoftmax. Keep CPU fallback as the actual output path until this validates.",
+      "Support fused ffn_gate_up_exps. Gemma 26B uses one fused gate+up expert tensor. Either add offset-aware pushDispatch5/6 helpers so the same buffer can be bound twice with binding 1 at up_base_offset, or add a Gemma-specific fused-gate-up MoE shader with an up_base_offset push constant.",
+      "Enable GPU-routed Gemma MoE behind a flag. Preserve unit router RMS + ffn_gate_inp.scale, pre_ffw_norm_2 expert input, selected-only normalized softmax weights, ffn_down_exps.scale, and post_ffw_norm ordering. The first accepted implementation only needs to remove router readback and serial expert dispatch while staying coherent.",
+      "Collapse per-expert serial dispatch. The target dispatch shape is one all-selected gate/up dispatch, one activation dispatch, one all-selected down dispatch, and one weighted accumulation. That is ZINC's decode-time equivalent of llama.cpp mul_mat_vec_id.",
+      "After GPU MoE lands, test Q4_K x Q8_1 activation quant on exact Gemma expert shapes only. Treat it as a measured follow-up, not the first lever.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/src/llama-graph.cpp",
+        focus: "Search for build_moe_ffn. This is the graph-side reference for keeping router logits, top-k, selected weights, fused gate_up_exps, per-expert scales, and down projection in the graph.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        focus: "Search for ggml_vk_topk_moe, ggml_vk_mul_mat_id, ggml_vk_mul_mat_vec_id_q_f16, ggml_vk_use_mul_mat_vec_id, and ggml_vk_should_use_mmvq. These are the Vulkan control-flow pieces ZINC needs to mirror conceptually.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl",
+        focus: "MUL_MAT_ID shader addressing: data_ids selects expert_id; expert_id offsets the stacked expert weight tensor; expert_i0/expert_i1 select top-k slot and token/batch lane.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/topk_moe.comp",
+        focus: "Reference for fused top-k MoE softmax/normalization. ZINC already has dispatchSoftmaxTopk; use this to compare semantics and edge cases.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        focus: "Current ZINC Gemma fallback. Search for use_gpu_moe, router_staging, topKSoftmax, fused_gate_up, ffn_gate_inp_scale, ffn_down_exps_scale, and post_ffw_norm.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/shaders/dmmv_q4k_fused_gate_up_swiglu_moe.comp",
+        focus: "Existing selected-expert fused gate/up/SwiGLU shader. It assumes separate gate/up bindings today; adapt or replace for Gemma's fused ffn_gate_up_exps layout.",
       },
     ],
   },

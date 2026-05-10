@@ -61,6 +61,34 @@ After:  tail= 1.64 ms, total=207.54 ms/tok,  5.62 tok/s  (+45%)
 Other catalog models with large vocabs also picked up small decode wins
 (Qwen3-8B vocab 152k, gpt-oss 201k).
 
+## Follow-on: Gemma MoE long decode
+
+The current RDNA site matrix shows a separate sustained-decode gap on
+Gemma 4 26B A4B IT Q4K M:
+
+| scenario | ZINC decode | llama.cpp decode | ZINC / llama |
+|---|---:|---:|---:|
+| context-long | 125.60 tok/s | 105.76 tok/s | 119% |
+| decode-extended | 53.69 tok/s | 102.72 tok/s | 52% |
+
+The context-long "win" is not a reliable sustained-decode comparison:
+ZINC generated 2 tokens in that case while llama.cpp generated 8. The
+decode-extended scenario generates 32 tokens and exposes the real gap.
+
+Latest llama.cpp (`389ff61d7`, 2026-05-10) keeps MoE top-k selection and
+selected-expert matvecs on GPU through `topk_moe` and `mul_mat_id`.
+ZINC still explicitly excludes `.gemma` from the GPU MoE path and uses
+router readback + CPU `topKSoftmax` + serial selected-expert dispatch.
+That is now tracked as **Effort 13**:
+
+```bash
+bun loops/optimize_perf.ts --effort 13 --model gemma412b --cycles 999
+```
+
+Do not fold that work into this prefill effort. Effort 9 remains about
+batched prefill and the dense Gemma LM-head/tail fix. Effort 13 owns the
+decode-time Gemma MoE CPU-fallback removal.
+
 ## Measured baseline (`main` @ `a41c185`, AMD R9700 RDNA4 gfx1201)
 
 | model | path | prefill | decode |
