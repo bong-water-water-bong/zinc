@@ -1,4 +1,4 @@
-# Optimization 6: RDNA Prefill Recovery for Qwen3.5/3.6-35B-A3B
+# Optimization 6: RDNA Prefill Recovery for Qwen3.6-35B-A3B
 
 ## PIVOT 2026-05-06 — A3b INFRA IS DONE; FLIP THE PRODUCTION SWITCH
 
@@ -348,7 +348,7 @@ already exhausted; **do not re-attempt without new profiler evidence**.
 | 44 | dormant fused alpha+beta + Q8_0 X-fusion | fail | dormant path; no callers |
 | 45 | x_data register cache on Q8_0 fused_gate_up_swiglu | -0.4% | regress; cache pressure outweighs reuse |
 | 46 | fused Q8_0 rms_norm+alpha+beta SSM proj | flat | repeats c17 dead-end |
-| 47 | rms_norm_dmmv_q4k_alpha_beta register cache | flat | dead code on Qwen3.5 quant |
+| 47 | rms_norm_dmmv_q4k_alpha_beta register cache | flat | dead code on Qwen3.6 quant |
 | 48 | vec4 RMW tail-write on MoE down | -0.6 | regress |
 | 49 | rms_norm_dmmv_f32 register cache | flat | already optimal |
 | 50 | vec4 sigmoid_scale_acc / sigmoid_mul | flat | shaders bypassed by Q8_0 fused tail |
@@ -425,7 +425,7 @@ Key push-constant: `n_tok` (line 35). Dispatch shape: `gl_WorkGroupID.x
 × c_factor + subgroup` covers (head, head_offset); `gl_WorkGroupID.y =
 seq_idx`. **One dispatch per layer per prefill, not per token.**
 
-**Caveat for ZINC:** Qwen3.5/3.6 uses gated-delta-net, not classical
+**Caveat for ZINC:** Qwen3.6 uses gated-delta-net, not classical
 Mamba S6. The state recurrence body is different (delta-rule
 key-value update, not selective-scan with softplus dt). The
 *structural* pattern transfers verbatim — state-in-registers,
@@ -631,7 +631,7 @@ What's left to attempt (concrete, cycle-sized):
 
 | model                       | ZINC P  | llama P  | ZINC %  |
 |-----------------------------|--------:|---------:|--------:|
-| Qwen 3.5/3.6 35B A3B Q4_K_XL |  90.24 |   ~180   |    50% |
+| Qwen 3.6 35B A3B Q4_K_XL |  90.24 |   ~180   |    50% |
 
 Latest site benchmark (short prompt, 5 tokens): ZINC 67-69 tok/s vs
 llama.cpp 182-184 tok/s. The 154-token loop benchmark is more
@@ -766,7 +766,7 @@ inner dot uses hardware integer-dot.
 
 After #1-4 land:
 - For dense FFN (Gemma 4 31B): use `mul_mm_q4k` with N=N_tokens.
-- For MoE FFN (Qwen 3.5/3.6, Gemma 4 26B, GPT-OSS): use
+- For MoE FFN (Qwen 3.6, Gemma 4 26B, GPT-OSS): use
   `mul_mm_id_q4k` with `data_ids` from the existing
   `routing_capture_buf` (forward.zig:885) and `data_expert_count`
   from #3.
@@ -817,7 +817,7 @@ cycles on them:
 ## Validation
 
 Every change must pass `ZINC_BATCHED_PREFILL=validate` on every MoE
-catalog model (Qwen 3.5 35B, Qwen 3.6 35B, Gemma 4 26B, GPT-OSS 20B).
+catalog model (Qwen 3.6 35B, Qwen 3.6 35B, Gemma 4 26B, GPT-OSS 20B).
 Greedy-output check on a 50-token generation must match the per-token
 reference for the first 10 tokens minimum.
 
@@ -835,7 +835,7 @@ already at 79%).
 
 Target device: RDNA4 benchmark node.
 
-Target model: `qwen35-35b-a3b-q4k-xl`
+Target model: `qwen36-35b-a3b-q4k-xl`
 
 The latest checked-in benchmark artifact in `site/src/data/zinc-performance.json` shows a split story for the flagship model:
 
@@ -884,7 +884,7 @@ This effort is scored on `prefill tok/s`, not decode tok/s.
 Primary benchmark shape:
 
 - device: RDNA node
-- model: `qwen35-35b-a3b-q4k-xl`
+- model: `qwen36-35b-a3b-q4k-xl`
 - prompt: the same long-context reference packet used by `loops/optimize_perf.ts`
 - decode cap: `-n 8`
 - build mode: `zig build -Doptimize=ReleaseFast`
@@ -990,7 +990,7 @@ These code paths were added in earlier cycles and compile into the binary, but h
 
 - `DmmvDispatch.recordBatchDispatch` / `recordBatchDispatchPush` in `src/compute/dmmv.zig` — multi-column DMMV entry point supporting `num_cols > 1`. **Exactly one caller** (the LM head fallback at `forward.zig:6103`) and only with `num_cols=1`. The multi-column path has never been exercised against prompt tokens.
 - `DmmvDispatch.pipeline_q4k_batch` / `pipeline_q8_0_batch` — loaded pipelines that are only invoked today with `num_cols = 1` and only for the large LM head. Prior pair-batch attempts (see Lessons section above) showed that wiring this with `num_cols=2` on top of the current 1-thread-per-row shader is net-negative; it only becomes useful after Step 8 lands wave64 K-parallel inner loops.
-- `DmmvDispatch.recordCoopMatmul` + `pipeline_coop_matmul` (helper at `dmmv.zig:509`) — F16×F16→F32 cooperative-matrix matmul, 16×16 tiles, wave64. **Zero callers anywhere.** Important caveat: as written this consumes only **F16 weights**, but every prefill projection in Qwen3.5-35B is Q4_K/Q5_K/Q6_K/Q8_0. Wiring requires either an upfront f16 dequant pass into a scratch buffer (acceptable only when the dequant cost amortizes across many prompt tokens, e.g. SSM proj × 154) **or** porting llama.cpp's `mul_mm.comp` pattern that dequants quantized tiles into shared memory inside the matmul loop (Step 13).
+- `DmmvDispatch.recordCoopMatmul` + `pipeline_coop_matmul` (helper at `dmmv.zig:509`) — F16×F16→F32 cooperative-matrix matmul, 16×16 tiles, wave64. **Zero callers anywhere.** Important caveat: as written this consumes only **F16 weights**, but every prefill projection in Qwen3.6-35B is Q4_K/Q5_K/Q6_K/Q8_0. Wiring requires either an upfront f16 dequant pass into a scratch buffer (acceptable only when the dequant cost amortizes across many prompt tokens, e.g. SSM proj × 154) **or** porting llama.cpp's `mul_mm.comp` pattern that dequants quantized tiles into shared memory inside the matmul loop (Step 13).
 - `CommandBuffer.computeBuffersBarrier` — multi-buffer barrier helper. Useful when a cycle structurally removes a global barrier (not when it cosmetically narrows one).
 
 What is **not** in the tree, despite being mentioned in earlier commits or docs:
@@ -1039,7 +1039,7 @@ These are not parallel bets. They have a deliberate dependency order:
 
 Treat these as candidates to prove or kill with measurement:
 
-1. The Qwen35 prompt path is still processing tokens too serially, causing repeated weight reads and excessive submission overhead.
+1. The Qwen36 prompt path is still processing tokens too serially, causing repeated weight reads and excessive submission overhead.
 2. MoE prompt work is falling back to a decode-style schedule instead of doing any meaningful token grouping or batching.
 3. Attention/KV work during prefill still pays per-token barriers or command submission costs that should only exist in decode.
 4. Host-side logging and parsing are not exposing prefill timing correctly, so site and loop artifacts lose the metric even when the runtime emits useful data.
@@ -1068,7 +1068,7 @@ Tasks:
 
 Done when:
 
-- the site artifact shows a real ZINC `prefill_tps` value for RDNA `qwen35-35b-a3b-q4k-xl` `context-long`
+- the site artifact shows a real ZINC `prefill_tps` value for RDNA `qwen36-35b-a3b-q4k-xl` `context-long`
 - the loop uses that same metric as the primary keep/reject signal
 
 Do not start speculative kernel rewrites before this works.
@@ -1335,7 +1335,7 @@ Skip this step if Steps 8–11 already push us past Phase 3 (300 tok/s). It is t
 
 This effort is succeeding when all of these are true:
 
-- RDNA `qwen35-35b-a3b-q4k-xl` `context-long` has a real ZINC `prefill_tps` value in the artifact
+- RDNA `qwen36-35b-a3b-q4k-xl` `context-long` has a real ZINC `prefill_tps` value in the artifact
 - `loops/optimize_perf.ts` evaluates this effort primarily on `prefill tok/s`
 - median total latency on the flagship long-context workload falls materially below the current `13002 ms`
 - accepted changes keep all required RDNA coherence checks green
@@ -1356,7 +1356,7 @@ This effort is succeeding when all of these are true:
 
 ## Likely Files
 
-- `loops/efforts/MULTI_HOUR_EFFORT_6_RDNA_QWEN35_PREFILL.md`
+- `loops/efforts/MULTI_HOUR_EFFORT_6_RDNA_QWEN36_PREFILL.md`
 - `loops/optimize_perf.ts`
 - `tools/performance_suite.mjs`
 - `tools/print_test_summary.ts`

@@ -801,7 +801,7 @@ pub fn main() !void {
     if (args.model_path) |model_path| {
         log.info("Shape source: {s}", .{model_path});
     } else {
-        log.info("Shape source: built-in Qwen3.5-35B defaults", .{});
+        log.info("Shape source: built-in Qwen3.6-35B defaults", .{});
     }
     log.info("Working set: {d} rotating buffer sets", .{args.working_set});
 

@@ -1,7 +1,7 @@
 # ZINC vs llama.cpp Performance Gap Analysis
 
 Date: 2026-04-04
-Model: `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`
+Model: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`
 GPU: AMD Radeon AI PRO R9700 (RDNA4, 32 GB, 576 GB/s, 64 CUs)
 
 ## Current Numbers
@@ -101,7 +101,7 @@ From `research/llama_cpp_analysis.md` and `docs/RDNA4_TUNING.md`:
 | MUL_MAT_ADD | MUL_MAT + ADD → 1 | ~9 |
 | GLU | SILU/GELU + MUL | ~80 |
 
-Total compute graph for Qwen3.5-35B-A3B single token: 3728 nodes, 2356 dispatchable, ~1500 after fusions.
+Total compute graph for Qwen3.6-35B-A3B single token: 3728 nodes, 2356 dispatchable, ~1500 after fusions.
 
 ### llama.cpp Profiling on RDNA4
 

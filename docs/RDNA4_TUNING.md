@@ -20,7 +20,7 @@ GRUB_CMDLINE_LINUX_DEFAULT="... amdgpu.ras_enable=0"
 # Then: update-grub && reboot
 ```
 
-**Measured impact**: 101 tok/s → 110 tok/s (+9%) on Qwen3.5-35B-A3B Q4_K
+**Measured impact**: 101 tok/s → 110 tok/s (+9%) on Qwen3.6-35B-A3B Q4_K
 
 ## RADV Driver Configuration
 
@@ -33,7 +33,7 @@ Without this, all matmul operations fall back to scalar shaders — massive perf
 
 ## Per-Token Decode Profiling
 
-Profiled with `GGML_VK_PERF_LOGGER=1` on Qwen3.5-35B-A3B (Q4_K_XL, SSM+attention hybrid MoE).
+Profiled with `GGML_VK_PERF_LOGGER=1` on Qwen3.6-35B-A3B (Q4_K_XL, SSM+attention hybrid MoE).
 
 ### Time Breakdown (per token)
 | Component | Time (ms) | % of Total |

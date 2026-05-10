@@ -15,7 +15,7 @@ struct DmmvPush {
 // independently computes the RMSNorm factor from the raw hidden state.  Hidden
 // (8 KiB for K=2048) and norm_weight are L1-cached after the first simdgroup on
 // a core accesses them; subsequent simdgroups get L1 hits.  This removes one
-// barrier and one dispatch per SSM layer (30 per decode step on Qwen3.5-35B-A3B).
+// barrier and one dispatch per SSM layer (30 per decode step on Qwen3.6-35B-A3B).
 //
 // The inline norm adds ~64 FMAs + simd_sum + rsqrt per simdgroup — negligible
 // compared to the weight memory reads that dominate DMMV execution time.

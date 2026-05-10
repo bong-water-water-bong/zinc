@@ -14,9 +14,9 @@
  *
  * Usage:
  *   bun loops/optimize_perf.ts --effort 1                        # Push descriptors
- *   bun loops/optimize_perf.ts --effort 2 --model qwen35b       # Fused gate+up on Qwen 35B
+ *   bun loops/optimize_perf.ts --effort 2 --model qwen36b       # Fused gate+up on Qwen 35B
  *   bun loops/optimize_perf.ts --effort 3 --agent codex         # Batch prefill with Codex
- *   bun loops/optimize_perf.ts --effort 6 --model qwen35b       # RDNA prefill recovery on Qwen 35B
+ *   bun loops/optimize_perf.ts --effort 6 --model qwen36b       # RDNA prefill recovery on Qwen 35B
  *   bun loops/optimize_perf.ts --effort 1 --resume               # Resume previous run
  *   bun loops/optimize_perf.ts --effort 1 --cycles 10 --dry-run  # Baseline only
  */
@@ -85,22 +85,13 @@ function envOrDefault(name: string, fallback: string): string {
 }
 
 const MODELS: Record<string, ModelTarget> = {
-  qwen35b: {
-    key: "qwen35b",
-    name: "Qwen3.5-35B",
-    path: envOrDefault("ZINC_RDNA_QWEN35_35B_MODEL", "/root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"),
-    promptMode: "raw",
-    // Keep throughput benchmarking on the raw decode path, but run coherence
-    // prompts through ChatML so Qwen gets the expected closed-think scaffold.
-    coherencePromptMode: "chat",
-    envVar: "ZINC_RDNA_QWEN35_35B_MODEL",
-  },
   qwen36b: {
     key: "qwen36b",
     name: "Qwen3.6-35B",
     path: envOrDefault("ZINC_RDNA_QWEN36_35B_MODEL", "/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
     promptMode: "raw",
-    // Qwen3.6 inherits the same closed-think chat prompt behavior as Qwen3.5.
+    // Keep throughput benchmarking on the raw decode path, but run coherence
+    // prompts through ChatML so Qwen gets the expected closed-think scaffold.
     coherencePromptMode: "chat",
     envVar: "ZINC_RDNA_QWEN36_35B_MODEL",
   },
@@ -253,7 +244,7 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
   },
   10: {
     doc: "MULTI_HOUR_EFFORT_10_QWEN36_DECODE.md",
-    summary: "Qwen 3.5/3.6 35B-A3B decode + prefill speedups on RDNA4 (cross-token batched MoE, parallel-scan SSM, GEMM mmq)",
+    summary: "Qwen 3.6 35B-A3B decode + prefill speedups on RDNA4 (cross-token batched MoE, parallel-scan SSM, GEMM mmq)",
     metricMode: "decode",
     primaryMetricLabel: "decode tok/s",
     benchmarkPrompt: "Write a detailed essay about the history of computing, from mechanical calculators to modern artificial intelligence.",
@@ -276,8 +267,8 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       "More fused-RMS+DMMV shaders. The pattern that delivers wins on this effort: fold the RMS norm into the immediately-consuming DMMV. Cycle 8 shipped rms_norm_dmmv_f32 (+0.61 tok/s) for the f32 router. Cycle 13 shipped rms_norm_dmmv_q4k_alpha_beta (+0.57 tok/s) for the SSM proj alpha+beta pair. Concrete remaining candidates: (a) attn_norm + wqkv DMMV (the SSM proj's biggest output, M≈6144) — cycle 10 attempted this and measured small flag-on gain falling short of checkpoint due to redundant per-WG RMS reduction work; the fix is to compute the RMS reduction ONCE per workgroup via shared memory and reuse across all NUM_ROWS rows (cycle 13's shader does this correctly — read it). (b) attn_norm + ssm_z DMMV (M≈4096), same fix. (c) attn_norm + attention Q proj on the 10 attention layers (M=2048, K=2048) — single-output shape is a clean fit for the existing rms_norm_dmmv_f32 layout.",
       "Eliminate dispatches in the SSM tail. Fused ssm_out + FFN-RMS-norm shader: the SSM tail does (Q4_K ssm_out DMMV → residual add → ffn_norm RMS norm) which is structurally the same as the existing rms_norm_add shader (commit a5f1fdc, used by Gemma post_ffw_norm) but with a Q4_K DMMV in front. Eliminates 1 dispatch + 1 barrier per SSM layer × 30 layers = 30 dispatches saved per token. The hidden-buf accumulate pattern is already proven correct in rms_norm_add.comp — extend with a Q4_K weight stream.",
       "KV-cache-write fused into K-projection on attention layers. Saves 10 dispatches + 10 barriers per token. Distinct from cycle 14's failed three-way RMS+K+V (which had too much register pressure) — this fuses just the K projection's dot-product output directly into the cache page write at end-of-kernel, skipping the intermediate k_buf round-trip + the standalone kv_cache_write dispatch. The existing kv_cache_write shader's page-table indexing logic ports cleanly into a Q8_0 / Q4_K K-proj kernel's tail.",
-      "Cross-token batched MoE FFN (phase 1.1, prefill lever — won't help decode metric). Shader dmmv_q4k_moe_batched.comp landed in c36bd23 with dispatch grid (M+1)/2, n_experts_used, n_tokens. Pipeline + DmmvDispatch.recordMoeBatchedDispatch helper available. Remaining work: (1) build per-layer routing buffer for all N prompt tokens; (2) allocate [N × n_experts_used × inter] output scratch; (3) dispatch new shader for gate / up / down; (4) per-token weighted accumulation kernel that scatters n_experts_used × inter outputs per token weighted by routing probs back into hidden; (5) relax canUseBatchedPrefillRdna for qwen35moe with per-layer-type detection. Only attempt if the controller's metric mode is 'prefill' — won't move the decode benchmark.",
-      "Parallel-scan SSM prefill (also prefill-only). The 30 SSM layers in qwen35moe have token-recurrent state. Blelloch/Hillis-Steele scan over the N-token axis. Without this, even with batched MoE, Qwen 3.6 prefill caps around 35-40 tok/s (SSM stays sequential). With both, beats llama.cpp's 54.5. Reference llama.cpp mamba2 ggml_ssm_scan.",
+      "Cross-token batched MoE FFN (phase 1.1, prefill lever — won't help decode metric). Shader dmmv_q4k_moe_batched.comp landed in c36bd23 with dispatch grid (M+1)/2, n_experts_used, n_tokens. Pipeline + DmmvDispatch.recordMoeBatchedDispatch helper available. Remaining work: (1) build per-layer routing buffer for all N prompt tokens; (2) allocate [N × n_experts_used × inter] output scratch; (3) dispatch new shader for gate / up / down; (4) per-token weighted accumulation kernel that scatters n_experts_used × inter outputs per token weighted by routing probs back into hidden; (5) relax canUseBatchedPrefillRdna for the Qwen 35B MoE family with per-layer-type detection. Only attempt if the controller's metric mode is 'prefill' — won't move the decode benchmark.",
+      "Parallel-scan SSM prefill (also prefill-only). The 30 SSM layers in the Qwen 35B MoE family have token-recurrent state. Blelloch/Hillis-Steele scan over the N-token axis. Without this, even with batched MoE, Qwen 3.6 prefill caps around 35-40 tok/s (SSM stays sequential). With both, beats llama.cpp's 54.5. Reference llama.cpp mamba2 ggml_ssm_scan.",
       "GEMM-style Q4_K mmq (also prefill-only). dmmv_q4k_q8_1.comp from commit 27f0c76 is GEMV-only and proved no-op on RDNA4 GEMV. A GEMM variant where the dispatch axis includes an N-token batch makes integer-dot pay off — arithmetic intensity goes from K to N×K. Pairs with phase 1.1.",
       "VkCmdPipelineBarrier2 with explicit srcStageMask + srcAccessMask precision (vs the current PipelineBarrier1 we emit). Cycles 1/16/18 narrowed full → buffer-scoped barriers and measured flat — but they didn't change the API. PipelineBarrier2's explicit masks are different on RADV's path, and on a sync-bound benchmark like ours the API switch is worth measuring once before declaring all barrier work flat.",
     ],
@@ -293,13 +284,13 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
   },
   6: {
-    doc: "MULTI_HOUR_EFFORT_6_RDNA_QWEN35_PREFILL.md",
-    summary: "RDNA Qwen35 prefill recovery (restore flagship TTFT and prefill telemetry)",
+    doc: "MULTI_HOUR_EFFORT_6_RDNA_QWEN36_PREFILL.md",
+    summary: "RDNA Qwen36 prefill recovery (restore flagship TTFT and prefill telemetry)",
     metricMode: "prefill",
     primaryMetricLabel: "prefill tok/s",
     benchmarkPrompt: PREFILL_BENCHMARK_PROMPT,
     benchmarkMaxTokens: 8,
-    benchmarkMethod: "long-context prefill benchmark on RDNA for the Qwen3.5-35B flagship workload",
+    benchmarkMethod: "long-context prefill benchmark on RDNA for the Qwen3.6-35B flagship workload",
     knownFlatCategories: [
       "DORMANT TILED-GEMM FOUNDATIONS. Cycles 14, 16, 18, 21 ported all 4 pieces (count_experts, mul_mm_q4k, mul_mm_id_q4k, mul_mmq_q4k) as foundationKeeps. mul_mm_q4k was wired into the LM head only (N=1, the worst case for tiled GEMM) and measured FLAT (78.14 vs 78.55 noise band). The other 3 stayed dormant with zero callers. Cycle 40 reverted ~1470 LOC of dormant infra after audit. Re-porting the SAME shaders is a known dead-end; the unfinished work is the buffer-layout refactor needed to wire them into SSM proj / MoE FFN prefill, NOT another foundation port. mul_mm_q4k.comp + count_experts.comp survived; mul_mm_id_q4k and mul_mmq_q4k were deleted. See loops/efforts/MULTI_HOUR_EFFORT_6 for the full audit.",
       "GEMV-style cross-token MoE batching via dmmv_q4k_moe_batched.comp (commit c36bd23). Spent 9 wire-in cycles producing flat or negative results. Architecturally wrong for RDNA4: dispatches 1.7M workgroups (M × n_experts_used × n_tokens) where the device caps at ~1024 in flight. Pipeline + helper stay in tree as record but should not be wired. The structural answer is per-expert grouped GEMM (one WG per expert × tile, not per token × expert × row).",
@@ -321,7 +312,7 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       "WIRE EXISTING mul_mm_q4k INTO SSM PROJ PREFILL (cycle 40's deferred work). The shader exists in tree (src/shaders/mul_mm_q4k.comp, currently used only for LM head where N=1 wastes BN tile). SSM proj fires 4 DMMVs × 30 layers × 154 tokens — perfect amortization shape. Concrete: in src/compute/forward.zig prefillBatched, replace the per-token loop over recordDmmv calls for SSM wqkv/z with a single mul_mm_q4k dispatch where N=batch_size_per_chunk. Buffer layout: gather norm_buf columns into a [N × K] activation tile; output [M × N] result; scatter back via the same pattern that recordBatchDispatch already uses. Validate via ZINC_BATCHED_PREFILL=validate at tol=1e-3. Cycle 40 self-analysis flagged this as 'high-risk one-cycle refactor needed for buffer layout' — break it into 2 phases: (a) build the gather/scatter helper standalone with synthetic [M, K, N] data; (b) wire ONE projection (z is the simplest, single output M=d_inner) and measure SSM proj phase delta from ZINC_PREFILL_PROFILE=1.",
       "ATTACK THE MoE BUCKET (884 ms, 24% of prefill, untouched since cycle 40). The mul_mm_id_q4k port was deleted as dormant — re-doing it the same way is the dead-end. Three viable paths: (a) extend the cycle-50 winning pattern (wider threads-per-row, halve register footprint, double WG count) to dmmv_q4k_moe_kpar.comp and dmmv_q4k_moe_fused_down_acc.comp — these are the inner loops of the MoE FFN. The pre-cycle-50 ssm_delta was 8t×8r; analogous shape transformation should land similar gains. (b) Apply vec4 reads/writes to moe_weighted_acc.comp accumulator (cycle 42 pattern on a different shader). (c) Use the in-tree count_experts.comp to add a per-expert dispatch wrapper that culls experts with zero routed tokens — the long tail of unselected experts is wasted dispatch work even before any GEMM port.",
       "EXTEND CYCLE-50 PATTERN (wider threads-per-row + halved register footprint + doubled WG count) to remaining hot kernels. Cycle 50 found +2.76% on ssm_delta_net via 8t×8r → 16t×4r. The same shape transformation is untried on: dmmv_q4k_moe_kpar.comp (MoE expert FFN, currently NUM_ROWS=2 at expert M=1408 — try 32 threads-per-row × 1 row), dmmv_q4k_q8_1.comp (Q4_K weight × Q8_1 activation), dmmv_q4k_moe_fused_down_acc.comp (MoE down + accumulate). cycle-50 follow-up note: 32t×2r is the next step on ssm_delta itself.",
-      "PARALLEL-SCAN SSM PREFILL (the ssm_delta state recurrence). The 30 SSM layers in qwen35moe have token-recurrent state. Currently scanned token-by-token. Blelloch/Hillis-Steele scan over the N=154 token axis would parallelize this. Reference: llama.cpp mamba2 ggml_ssm_scan op + ggml-cuda/ssm-scan.cu. Risk: correctness blast radius is higher than dispatch-shape changes. Validate via ZINC_BATCHED_PREFILL=validate at tol=1e-3 against the per-token reference. This is the single largest unattacked structural lever for the SSM bucket.",
+      "PARALLEL-SCAN SSM PREFILL (the ssm_delta state recurrence). The 30 SSM layers in the Qwen 35B MoE family have token-recurrent state. Currently scanned token-by-token. Blelloch/Hillis-Steele scan over the N=154 token axis would parallelize this. Reference: llama.cpp mamba2 ggml_ssm_scan op + ggml-cuda/ssm-scan.cu. Risk: correctness blast radius is higher than dispatch-shape changes. Validate via ZINC_BATCHED_PREFILL=validate at tol=1e-3 against the per-token reference. This is the single largest unattacked structural lever for the SSM bucket.",
       "FLASH_ATTN Q PRE-LOAD INTO SHARED MEMORY (cycle 48 nextIdea). Currently Q[head_dim] is read repeatedly inside the Q.K dot loop across the K-tile axis. Pre-loading Q once per WG into shared/register memory eliminates head_dim × block_len redundant reads. Attention bucket is ~340 ms. Reference: ~/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_*.comp use the same pattern. Cycle 48 attempted vec4 alias bindings on the q.k dot and measured flat — the right intervention is the Q caching, not vec4 on the existing reads.",
       "TOPK SHADER CROSS-WG PARALLELISM (cycle 49 nextIdea). topk fires once per token at the MoE entry, currently single-WG single-pass. 117 ms bucket. Two-pass topk (find threshold per-block, gather above threshold) parallelizes across WGs. Small absolute bucket but architecturally simple compared to grouped MoE.",
     ],
@@ -521,7 +512,6 @@ const COHERENCE_CHECKS: CoherenceCheck[] = [
 // All models that must produce coherent output after every change.
 // The primary model (--model flag) is benchmarked; these are correctness-only.
 const COHERENCE_MODELS: ModelTarget[] = [
-  MODELS.qwen35b,
   MODELS.qwen36b,
   MODELS.qwen8b,
   MODELS.gemma431b,
@@ -568,7 +558,7 @@ function parseArgs() {
   let effort = 0;
   let cycles = 20;
   let dryRun = false;
-  let model = "qwen35b";
+  let model = "qwen36b";
   let resume = false;
   let agent: AgentType = "claude";
   let analyze = false;
@@ -589,7 +579,7 @@ function parseArgs() {
     console.error("Options:");
     console.error(`  --effort <${effortKeys}>         Optimization to run (required)`);
     console.error("  --cycles N               Max cycles (default: 20)");
-    console.error(`  --model NAME             Model: ${MODEL_KEYS} (default: qwen35b)`);
+    console.error(`  --model NAME             Model: ${MODEL_KEYS} (default: qwen36b)`);
     console.error("  --agent claude|codex     AI agent to use (default: claude)");
     console.error("  --resume                 Resume from previous run (read history from log)");
     console.error("  --analyze                Print controller analysis from saved run state");
@@ -1420,7 +1410,7 @@ export function buildAgentPrompt(
   if (options.mode === "pivot") {
     return buildPivotPrompt(plan, originalBaseline, currentBest, cycleNum, model, context, options);
   }
-  const modelTarget = MODELS[model] ?? MODELS.qwen35b;
+  const modelTarget = MODELS[model] ?? MODELS.qwen36b;
   const sanityCheckPrompt = coherencePromptForMode(
     COHERENCE_CHECKS[0],
     coherencePromptModeForModel(modelTarget),
@@ -1616,7 +1606,7 @@ export function buildPivotPrompt(
     referenceImplementations?: Array<{ path: string; focus: string }>;
   },
 ): string {
-  const modelTarget = MODELS[model] ?? MODELS.qwen35b;
+  const modelTarget = MODELS[model] ?? MODELS.qwen36b;
   const sanityCheckPrompt = coherencePromptForMode(
     COHERENCE_CHECKS[0],
     coherencePromptModeForModel(modelTarget),
@@ -2574,7 +2564,7 @@ async function revertAgentChanges(): Promise<void> {
 
 async function main() {
   const { effort, cycles, dryRun, model, resume, agent, analyze } = parseArgs();
-  const modelTarget = MODELS[model] ?? MODELS.qwen35b;
+  const modelTarget = MODELS[model] ?? MODELS.qwen36b;
   const effortSpec = getEffortSpec(effort);
   if (!effortSpec) {
     throw new Error(`Unknown effort: ${effort}`);

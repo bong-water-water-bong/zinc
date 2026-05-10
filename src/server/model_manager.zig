@@ -744,8 +744,8 @@ test "removeManagedModel refuses loaded active model without force" {
         },
         .engine = undefined,
         .model_path = try std.testing.allocator.dupe(u8, "/tmp/test.gguf"),
-        .managed_id = try std.testing.allocator.dupe(u8, "qwen35-35b-a3b-q4k-xl"),
-        .display_name = try std.testing.allocator.dupe(u8, "Qwen3.5 35B-A3B UD Q4_K_XL"),
+        .managed_id = try std.testing.allocator.dupe(u8, "qwen36-35b-a3b-q4k-xl"),
+        .display_name = try std.testing.allocator.dupe(u8, "Qwen3.6 35B-A3B UD Q4_K_XL"),
         .weights_bytes = 20 * 1024 * 1024 * 1024,
         .runtime_device_local_bytes = 1024 * 1024 * 1024,
         .context_reserved_bytes = 768 * 1024 * 1024,
@@ -762,6 +762,6 @@ test "removeManagedModel refuses loaded active model without force" {
         std.testing.allocator.free(fake.current.?.display_name);
     }
 
-    try std.testing.expectError(error.ModelLoadedInGpu, fake.removeManagedModel("qwen35-35b-a3b-q4k-xl", false));
+    try std.testing.expectError(error.ModelLoadedInGpu, fake.removeManagedModel("qwen36-35b-a3b-q4k-xl", false));
     try std.testing.expect(fake.current == &current);
 }

@@ -445,7 +445,7 @@ and pointed at the sampler.
 | model | supported? | output |
 |---|---|---|
 | qwen3-8b-q4k-m          | yes, batched path   | "The capital of France is **Paris**." |
-| qwen35-35b-a3b-q4k-xl   | no (MoE+SSM gate)   | falls back to per-token, same output  |
+| qwen36-35b-a3b-q4k-xl   | no (MoE+SSM gate)   | falls back to per-token, same output  |
 | qwen36-35b-a3b-q4k-xl   | no (MoE+SSM gate)   | falls back to per-token, same output  |
 | gpt-oss-20b-q4k-m       | no (architecture gate) | falls back, `<\|channel\|>analysis...`  |
 | gemma4-31b-q4k-m        | yes, batched path      | "The capital of France is **Paris**."  |

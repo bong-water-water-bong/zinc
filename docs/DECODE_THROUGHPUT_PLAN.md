@@ -1,7 +1,7 @@
 # Decode Throughput Plan
 
 Date: 2026-03-31
-Model: `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`
+Model: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`
 Target GPU: RDNA4 test node (`AMD Radeon AI PRO R9700`, `576 GB/s`, `64 CUs`)
 
 ## Goal
@@ -37,7 +37,7 @@ Clean CLI command shape:
 ```bash
 zig build -Doptimize=ReleaseFast
 RADV_PERFTEST=coop_matrix ./zig-out/bin/zinc \
-  -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+  -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   --prompt "The capital of France is"
 ```
 
@@ -433,7 +433,7 @@ source .env
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && \
   zig build -Doptimize=ReleaseFast && \
   RADV_PERFTEST=coop_matrix ./zig-out/bin/zinc \
-    -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --prompt 'The capital of France is' --max-tokens 64"
 ```
 
@@ -444,7 +444,7 @@ source .env
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && \
   zig build -Doptimize=ReleaseFast && \
   RADV_PERFTEST=coop_matrix ./zig-out/bin/zinc \
-    -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --prompt 'The capital of France is' --max-tokens 16 --profile"
 ```
 
@@ -454,7 +454,7 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && \
 source .env
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && \
   RADV_DEBUG=shaderstats RADV_PERFTEST=coop_matrix ./zig-out/bin/zinc \
-    -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --prompt 'The capital of France is' --max-tokens 4"
 ```
 
@@ -476,7 +476,7 @@ Important caveat:
 source .env
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && \
   zig build hot-bench -Doptimize=ReleaseFast -- \
-    --model /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --iterations 200 --warmup 25"
 ```
 
@@ -486,7 +486,7 @@ To inspect one hot path at a time:
 source .env
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && \
   zig build hot-bench -Doptimize=ReleaseFast -- \
-    --model /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --case q8_shared_gate_up --iterations 400 --warmup 50"
 ```
 
@@ -496,7 +496,7 @@ For compiler feedback on register pressure / LDS / occupancy:
 source .env
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && \
   RADV_DEBUG=shaderstats zig build hot-bench -Doptimize=ReleaseFast -- \
-    --model /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --case ssm_delta --iterations 200 --warmup 25"
 ```
 

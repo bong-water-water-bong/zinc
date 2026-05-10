@@ -71,7 +71,7 @@ const ZINC_HOST = process.env.ZINC_HOST ?? ENV.ZINC_HOST ?? "127.0.0.1";
 const ZINC_PORT = Number(process.env.ZINC_PORT ?? ENV.ZINC_PORT ?? "22");
 const ZINC_USER = process.env.ZINC_USER ?? ENV.ZINC_USER ?? "root";
 let REMOTE_ZINC_DIR = "/root/zinc";
-const DEFAULT_MODEL = "/root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf";
+const DEFAULT_MODEL = "/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
 
 const BLOCKED_GIT_OPS = [
   "Bash(git checkout:*)",
@@ -846,7 +846,7 @@ function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
       diagnosis.push("");
       diagnosis.push("⚠ CRITICAL: Output is GARBAGE — decoded text contains no recognizable words.");
       diagnosis.push("  The forward pass is executing but producing incorrect values.");
-      diagnosis.push("  Common causes for this Qwen3.5 hybrid (attention+SSM+MoE) model:");
+      diagnosis.push("  Common causes for this Qwen3.6 hybrid (attention+SSM+MoE) model:");
       diagnosis.push("  - Q/K/V split from fused attn_q.weight is wrong (Q includes gate, needs proper stride extraction)");
       diagnosis.push("  - RoPE freq_base or section dimensions incorrect");
       diagnosis.push("  - Flash attention shader bugs (scaling, causal mask, GQA head mapping)");
@@ -900,7 +900,7 @@ function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
   }
 
   diagnosis.push("");
-  diagnosis.push("## Forward Pass Architecture (Qwen3.5-35B-A3B = hybrid attention+SSM+MoE)");
+  diagnosis.push("## Forward Pass Architecture (Qwen3.6-35B-A3B = hybrid attention+SSM+MoE)");
   diagnosis.push("- 40 layers: every 4th (3,7,11,...,39) is full attention, rest are SSM/delta-net");
   diagnosis.push("- Full attention layers: separate attn_q/k/v + Q/K norm + IMRoPE (64/256 dims) + flash attention + sigmoid gate + output proj");
   diagnosis.push("- SSM layers: TWO PATHS available (selected at runtime by pipeline availability):");
@@ -967,7 +967,7 @@ function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
   diagnosis.push("- Enabling GPU SSM without swiglu_buf size fix — buffer overflow, wrong output (fixed)");
   diagnosis.push("");
   diagnosis.push("## REFERENCE: llama.cpp implementation");
-  diagnosis.push("On the remote node, the full Qwen3.5-MoE implementation is at:");
+  diagnosis.push("On the remote node, the full Qwen3.6-MoE implementation is at:");
   diagnosis.push("  /root/llama.cpp/src/models/qwen35moe.cpp — build_layer_attn, build_layer_attn_linear, build_layer_ffn");
   diagnosis.push("  /root/llama.cpp/src/models/delta-net-base.cpp — build_delta_net_autoregressive");
   diagnosis.push("You can read these files via SSH to understand the correct computation flow.");

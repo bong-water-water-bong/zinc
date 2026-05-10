@@ -1,10 +1,10 @@
-# Optimization 5: Local Metal Decode on M4 for Qwen3.5-35B
+# Optimization 5: Local Metal Decode on M4 for Qwen3.6-35B
 
 ## Current State (2026-04-09)
 
 Target machine: local Apple Silicon M4 Max.
 
-Target model: `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`
+Target model: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`
 
 This is a local Metal decode effort, not a Vulkan/RDNA effort.
 
@@ -45,7 +45,7 @@ Primary benchmark:
 
 ```bash
 zig build bench-metal -- \
-  -m /Users/zolotukhin/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+  -m /Users/zolotukhin/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   --warmup 1 --runs 3 -n 128
 ```
 
@@ -59,11 +59,11 @@ Useful supporting measurements:
 
 ```bash
 zig build bench-metal -- \
-  -m /Users/zolotukhin/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+  -m /Users/zolotukhin/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   --warmup 0 --runs 1 -n 32 --profile
 
 zig build bench-metal-shapes -- \
-  -m /Users/zolotukhin/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+  -m /Users/zolotukhin/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 ```
 
 The local Metal benchmark path already uses the per-GPU process lock. Do not run overlapping benchmarks on this machine.

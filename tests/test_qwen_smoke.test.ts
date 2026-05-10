@@ -13,7 +13,6 @@ const SERVER_MODEL_IDS = [
   "gpt-oss-20b-q4k-m",
 ];
 const QWEN_CHAT_MODEL_IDS = [
-  "qwen35-35b-a3b-q4k-xl",
   "qwen36-35b-a3b-q4k-xl",
 ];
 

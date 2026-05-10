@@ -45,7 +45,7 @@ const SEP = "─".repeat(64);
 const REPO_ROOT = resolve(import.meta.dir, "..");
 const EFFORTS_DIR = resolve(REPO_ROOT, "loops", "efforts");
 const RESULTS_DIR = resolve(REPO_ROOT, ".metal_optimize");
-const MODEL_ID = process.env.ZINC_MODEL_ID ?? "qwen35-35b-a3b-q4k-xl";
+const MODEL_ID = process.env.ZINC_MODEL_ID ?? "qwen36-35b-a3b-q4k-xl";
 const MODEL_PATH = process.env.ZINC_MODEL ?? null;
 const TEST_PROMPT = process.env.ZINC_TEST_PROMPT ?? "The capital of France is";
 const PROMPT_MODE = process.env.ZINC_PROMPT_MODE ?? "raw";
@@ -1128,7 +1128,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     "- Hot path bytes: attn 31.16 GiB, moe-expert 23.26 GiB, shared 14.83 GiB, lm-head 6.57 GiB.",
     "",
   ] : [
-    "## Model (Qwen3.5-35B-A3B, Q4_K, 20.7 GB)",
+    "## Model (Qwen3.6-35B-A3B, Q4_K, 20.8 GB)",
     "- 40 layers: every 4th is full attention (layers 3,7,11,...,39), rest are SSM/delta-net.",
     "- MoE FFN: 256 experts, 8 active per token, + shared expert.",
     "- head_dim=256, hidden_dim=2048, n_heads=16, n_kv_heads=2.",

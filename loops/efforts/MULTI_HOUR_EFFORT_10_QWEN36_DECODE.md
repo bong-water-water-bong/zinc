@@ -45,7 +45,7 @@ under known flat).
 | cycle | tok/s | Δ | what |
 |---|---:|---:|---|
 | 4  | 24.19 | +0.19 | Register-cache `delta_net` state across decay/dot/update/readout in `ssm_delta_net.comp`. Eliminates redundant state-buffer touches. |
-| 8  | 24.79 | +0.61 | New `rms_norm_dmmv_f32.comp` shader — fuses per-MoE-layer `rms_norm_mul → router DMMV` into one dispatch on architectures with f32 router weights (Qwen 3.5/3.6). |
+| 8  | 24.79 | +0.61 | New `rms_norm_dmmv_f32.comp` shader — fuses per-MoE-layer `rms_norm_mul → router DMMV` into one dispatch on architectures with f32 router weights (Qwen 3.6). |
 | 13 | 25.36 | +0.57 | New `rms_norm_dmmv_q4k_alpha_beta.comp` shader — fuses (RMS norm → alpha DMMV → beta DMMV) trio in the SSM proj path into one dispatch. Same pattern as cycle 8 but Q4_K weights and two outputs sharing one super-block decode. |
 
 Plus 2 foundation-keeps: cycle 16 narrowed cycle 13's post-fused-RMS

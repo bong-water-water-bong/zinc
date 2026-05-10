@@ -18,7 +18,7 @@ const DEFAULT_RDNA_WORKDIR = "/root/zinc";
 const DEFAULT_RDNA_MODEL_ROOT = "/root/models";
 const TARGET_ORDER = ["rdna", "metal"];
 const MAX_CAPTURE_CHARS = 256_000;
-const PUBLIC_BENCHMARK_EXCLUDED_MODEL_IDS = new Set();
+const PUBLIC_BENCHMARK_EXCLUDED_MODEL_IDS = new Set(["qwen35-35b-a3b-q4k-xl"]);
 
 function modelPath(root, dir) {
   return path.join(root, dir, "model.gguf");
@@ -1271,18 +1271,6 @@ export function defaultMetalCases(modelRoot) {
       notes: ["Raw decode path to avoid visible think blocks in CLI output"],
     },
     {
-      id: "qwen35-35b-a3b-q4k-xl",
-      model_id: "qwen35-35b-a3b-q4k-xl",
-      label: "Qwen 3.5 35B A3B UD Q4_K_XL",
-      family: "Qwen 3.5",
-      quant: "Q4_K_XL",
-      model_path: modelPath(modelRoot, "qwen35-35b-a3b-q4k-xl"),
-      prompt_mode: "raw",
-      prompt: defaultPromptForModelId("qwen35-35b-a3b-q4k-xl"),
-      max_tokens: defaultMaxTokensForModelId("qwen35-35b-a3b-q4k-xl"),
-      notes: ["Managed-cache local Qwen 3.5 case on Apple Silicon"],
-    },
-    {
       id: "qwen36-35b-a3b-q4k-xl",
       model_id: "qwen36-35b-a3b-q4k-xl",
       label: "Qwen 3.6 35B A3B UD Q4_K_XL",
@@ -1494,11 +1482,11 @@ async function discoverMetalCases(modelRoot) {
 function defaultRdnaCases(modelRoot) {
   return [
     {
-      id: "qwen35-35b-a3b-q4k-xl",
-      label: "Qwen 3.5 35B A3B UD Q4_K_XL",
-      family: "Qwen 3.5",
+      id: "qwen36-35b-a3b-q4k-xl",
+      label: "Qwen 3.6 35B A3B UD Q4_K_XL",
+      family: "Qwen 3.6",
       quant: "Q4_K_XL",
-      model_path: path.join(modelRoot, "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"),
+      model_path: path.join(modelRoot, "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
       prompt_mode: "raw",
       prompt: "The capital of France is",
       max_tokens: 128,

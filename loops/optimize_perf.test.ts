@@ -373,7 +373,7 @@ describe("controller helpers", () => {
       currentBest,
       2,
       "\nCycle 1: KEPT — 38.52 tok/s",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: ["descriptor plumbing variant regressed 0.2 tok/s"],
@@ -426,7 +426,7 @@ describe("controller helpers", () => {
       baseline,
       1,
       "",
-      "qwen35b",
+      "qwen36b",
       null,
       {
         primaryMetricLabel: spec?.primaryMetricLabel,
@@ -439,13 +439,13 @@ describe("controller helpers", () => {
     expect(prompt).toContain("long-context prefill benchmark");
   });
 
-  test("RDNA Qwen35 prefill effort is registered with the flagship benchmark contract", () => {
+  test("RDNA Qwen36 prefill effort is registered with the flagship benchmark contract", () => {
     const spec = getEffortSpec(6);
     expect(spec).not.toBeNull();
-    expect(spec?.doc).toBe("MULTI_HOUR_EFFORT_6_RDNA_QWEN35_PREFILL.md");
+    expect(spec?.doc).toBe("MULTI_HOUR_EFFORT_6_RDNA_QWEN36_PREFILL.md");
     expect(spec?.primaryMetricLabel).toBe("prefill tok/s");
-    expect(spec?.summary).toContain("RDNA Qwen35 prefill");
-    expect(spec?.benchmarkMethod).toContain("Qwen3.5-35B flagship workload");
+    expect(spec?.summary).toContain("RDNA Qwen36 prefill");
+    expect(spec?.benchmarkMethod).toContain("Qwen3.6-35B flagship workload");
   });
 
   test("resume compatibility rejects state from older benchmark regimes", () => {
@@ -694,9 +694,9 @@ describe("controller memory helpers", () => {
           kind: "crash" as const,
         },
         {
-          id: "Qwen3.5-35B::What is 2+2?",
-          label: "Qwen3.5-35B [What is 2+2?]",
-          model: "Qwen3.5-35B",
+          id: "Qwen3.6-35B::What is 2+2?",
+          label: "Qwen3.6-35B [What is 2+2?]",
+          model: "Qwen3.6-35B",
           prompt: "What is 2+2?",
           outputText: "five",
           kind: "mismatch" as const,
@@ -704,7 +704,7 @@ describe("controller memory helpers", () => {
       ],
       failureIds: [
         "Qwen3-8B::The capital of France is",
-        "Qwen3.5-35B::What is 2+2?",
+        "Qwen3.6-35B::What is 2+2?",
       ],
     };
 
@@ -712,7 +712,7 @@ describe("controller memory helpers", () => {
       "Qwen3-8B::The capital of France is",
     ]);
     expect(regression).toContain("New coherence failures vs accepted baseline");
-    expect(regression).toContain("Qwen3.5-35B [What is 2+2?]");
+    expect(regression).toContain("Qwen3.6-35B [What is 2+2?]");
   });
 
   test("coherence failure formatter renders crashes and mismatches", () => {
@@ -826,7 +826,6 @@ describe("config", () => {
     expect(src).toContain("ZINC_HOST");
     expect(src).toContain("ZINC_PORT");
     expect(src).toContain("ZINC_USER");
-    expect(src).toContain("ZINC_RDNA_QWEN35_35B_MODEL");
     expect(src).toContain("ZINC_RDNA_QWEN36_35B_MODEL");
     expect(src).toContain("ZINC_RDNA_QWEN3_8B_MODEL");
     expect(src).toContain("ZINC_RDNA_GEMMA4_31B_MODEL");
@@ -841,10 +840,10 @@ describe("config", () => {
     expect(src).toContain("first four planets");
   });
 
-  test("all six models are listed for coherence", async () => {
+  test("all five models are listed for coherence", async () => {
     const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
-    expect(src).toContain("Qwen3.5-35B");
     expect(src).toContain("Qwen3.6-35B");
+    expect(src).not.toContain("Qwen3.5-35B");
     expect(src).toContain("Qwen3-8B");
     expect(src).toContain("Gemma4-31B");
     expect(src).toContain("Gemma4-12B");
@@ -945,7 +944,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       25,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: [],
@@ -986,7 +985,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       26,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: ["micro barrier narrowing again"],
@@ -1017,7 +1016,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       27,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: [],
@@ -1045,7 +1044,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       1,
       "",
-      "qwen35b",
+      "qwen36b",
       null,
       {
         primaryMetricLabel: "decode tok/s",
@@ -1062,7 +1061,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       5,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: [],
@@ -1088,7 +1087,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       6,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: [],
@@ -1117,7 +1116,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       5,
       "",
-      "qwen35b",
+      "qwen36b",
       null,
       {
         primaryMetricLabel: "prefill tok/s",
@@ -1653,7 +1652,7 @@ describe("buildAgentPrompt pivot mode", () => {
       baseline,
       10,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [
           {

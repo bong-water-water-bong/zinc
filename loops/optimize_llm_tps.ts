@@ -1111,7 +1111,7 @@ function buildOptimizationPrompt(state: RunState): string {
     "",
     "## Current Setup",
     "- llama.cpp built: -DGGML_VULKAN=ON, -O3 -march=znver4",
-    "- Model: Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf (MoE 35B/3B active, 22GB)",
+    "- Model: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf (MoE 35B/3B active, 22GB)",
     "- Server flags: -ngl 99 --device Vulkan0 --parallel 4 -c 32768 -ctk q8_0 -ctv q8_0 -b 4096 -ub 1024 --mlock",
     "- Env: RADV_PERFTEST=coop_matrix",
     "- Service: /etc/systemd/system/llama-server.service",

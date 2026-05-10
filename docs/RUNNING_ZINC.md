@@ -33,7 +33,7 @@ export RADV_PERFTEST=coop_matrix
 ./zig-out/bin/zinc --check -m /path/to/model.gguf
 
 # Or check one managed model from the built-in catalog
-./zig-out/bin/zinc --check --model-id qwen35-35b-a3b-q4k-xl
+./zig-out/bin/zinc --check --model-id qwen36-35b-a3b-q4k-xl
 ```
 
 On the shared RDNA4 test node, the equivalent command is:
@@ -46,10 +46,10 @@ cd /root/zinc
 ./zig-out/bin/zinc --check
 
 # Managed model compatibility by catalog id
-./zig-out/bin/zinc --check --model-id qwen35-35b-a3b-q4k-xl
+./zig-out/bin/zinc --check --model-id qwen36-35b-a3b-q4k-xl
 
 # Exact GGUF file check
-./zig-out/bin/zinc --check -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+./zig-out/bin/zinc --check -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 ```
 
 `--check` prints its progress as numbered sections and ends with a summary and verdict. The five sections are:
@@ -100,10 +100,10 @@ Managed 35B catalog check:
 
 ```bash
 # Command
-./zig-out/bin/zinc --check --model-id qwen35-35b-a3b-q4k-xl
+./zig-out/bin/zinc --check --model-id qwen36-35b-a3b-q4k-xl
 
 # Key output
-Managed model: Qwen3.5 35B-A3B UD Q4_K_XL (qwen35-35b-a3b-q4k-xl) [OK]
+Managed model: Qwen3.6 35B-A3B UD Q4_K_XL (qwen36-35b-a3b-q4k-xl) [OK]
 VRAM fit (catalog): 21.41 / 31.86 GiB device-local (headroom 10.45 GiB) [OK]
 Summary       : 9 ok, 1 warn, 0 fail, 0 skip
 Verdict       : READY WITH WARNINGS [WARN]
@@ -113,10 +113,10 @@ Exact GGUF file check:
 
 ```bash
 # Command
-./zig-out/bin/zinc --check -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+./zig-out/bin/zinc --check -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 
 # Key output
-Model: /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf [OK]
+Model: /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf [OK]
 Tensor upload: 20.70 GiB device-local weights
 VRAM fit: 21.41 / 31.86 GiB device-local (headroom 10.45 GiB) [OK]
 Summary       : 9 ok, 1 warn, 0 fail, 0 skip

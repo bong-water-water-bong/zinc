@@ -663,7 +663,7 @@ pub const DmmvDispatch = struct {
         };
 
         // K-parallel Q5_K MoE variant: wave64 subgroupAdd reduction (targets the
-        // ~713 ms MoE down bucket in the Qwen3.5-35B flagship prefill).
+        // ~713 ms MoE down bucket in the Qwen3.6-35B flagship prefill).
         const q5k_moe_kpar_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_moe_kpar.spv", .{shader_dir}) catch unreachable;
         const pipeline_q5k_moe_kpar = pipeline_mod.createFromSpirvWithOptions(instance, q5k_moe_kpar_path, 4, moe_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q5_K MoE kpar shader not loaded: {s}", .{@errorName(err)});

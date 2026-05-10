@@ -53,7 +53,7 @@ const jsonLd = {
           name: 'What performance does ZINC achieve on RDNA4 and Apple Silicon?',
           acceptedAnswer: {
             '@type': 'Answer',
-            text: 'On the Radeon AI PRO R9700 (32GB, 576 GB/s), the current validated ZINC plain-decode number is 103.72 tok/s on Qwen3.5-35B-A3B-UD-Q4_K_XL — 1.07x llama.cpp on the same machine. On the current Apple Silicon validation box, a Mac Studio (Mac16,9) with Apple M4 Max, 40-core GPU, and 64 GB unified memory, Qwen3.5-35B-A3B-UD-Q4_K_XL measures 46.36 tok/s decode in the Metal benchmark.',
+            text: 'On the Radeon AI PRO R9700 (32GB, 576 GB/s), the current validated ZINC plain-decode number is 117.07 tok/s on Qwen3.6-35B-A3B-UD-Q4_K_XL — 1.12x llama.cpp on the same machine. On the current Apple Silicon validation box, a Mac Studio (Mac16,9) with Apple M4 Max, 40-core GPU, and 64 GB unified memory, Qwen3.6-35B-A3B-UD-Q4_K_XL measures 38.13 tok/s decode in the Metal benchmark.',
           },
         },
         {
@@ -141,8 +141,7 @@ const jsonLd = {
         <tr><th>GPU</th><th>Model</th><th>Path</th><th>ZINC</th><th>llama.cpp</th></tr>
       </thead>
       <tbody>
-        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen3.5-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td><strong>110.87 tok/s</strong></td><td>105.85 tok/s</td></tr>
-        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen3.6-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td><strong>109.22 tok/s</strong></td><td>99.80 tok/s</td></tr>
+        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen3.6-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td><strong>117.07 tok/s</strong></td><td>104.47 tok/s</td></tr>
         <tr><td><strong>AI PRO R9700</strong></td><td>Gemma 4 26B A4B</td><td>decode</td><td>103.73 tok/s</td><td>107.42 tok/s</td></tr>
         <tr><td><strong>AI PRO R9700</strong></td><td>Gemma 4 31B (dense)</td><td>decode</td><td><strong>44.18 tok/s</strong></td><td>32.18 tok/s</td></tr>
         <tr><td><strong>AI PRO R9700</strong></td><td>GPT-OSS 20B</td><td>decode</td><td>86.49 tok/s</td><td>182.09 tok/s</td></tr>
@@ -161,7 +160,6 @@ const jsonLd = {
         <tr><th>Machine</th><th>Model</th><th>Path</th><th>ZINC</th><th>llama.cpp</th></tr>
       </thead>
       <tbody>
-        <tr><td><strong>Mac Studio (M4 Max)</strong></td><td>Qwen3.5-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td>46.36 tok/s</td><td>77.70 tok/s</td></tr>
         <tr><td><strong>Mac Studio (M4 Max)</strong></td><td>Qwen3.6-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td>38.13 tok/s</td><td>79.88 tok/s</td></tr>
         <tr><td><strong>Mac Studio (M4 Max)</strong></td><td>Gemma 4 12B</td><td>decode</td><td>43.68 tok/s</td><td>92.17 tok/s</td></tr>
         <tr><td><strong>Mac Studio (M4 Max)</strong></td><td>Qwen 3 8B (dense)</td><td>decode</td><td>32.74 tok/s</td><td>83.67 tok/s</td></tr>

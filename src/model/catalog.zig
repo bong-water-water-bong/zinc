@@ -44,29 +44,6 @@ pub const apple_silicon_profile = "apple-silicon";
 /// The complete list of ZINC-validated managed models available for download.
 pub const entries = [_]CatalogEntry{
     .{
-        .id = "qwen35-35b-a3b-q4k-xl",
-        .display_name = "Qwen3.5 35B-A3B UD Q4_K_XL",
-        .release_date = "2026-02-16",
-        .family = "qwen3.5",
-        .format = "gguf",
-        .quantization = "UD-Q4_K_XL",
-        .file_name = "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
-        .homepage_url = "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF",
-        .download_url = "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf?download=true",
-        .sha256 = "1b0ac637dfa092bbba2793977db9485a40c4f8b42df5fe342f0076d61b66ae83",
-        .size_bytes = 22_241_950_336,
-        .required_vram_bytes = 22_987_514_102,
-        .default_context_length = 4096,
-        .recommended_for_chat = true,
-        .thinking_stable = true,
-        .status = .supported,
-        .tested_profiles = &.{
-            "amd-rdna4-32gb",
-            apple_silicon_profile,
-            "intel-arc",
-        },
-    },
-    .{
         .id = "qwen36-35b-a3b-q4k-xl",
         .display_name = "Qwen3.6 35B-A3B UD Q4_K_XL",
         .release_date = "2026-04-15",
@@ -394,13 +371,13 @@ test "profileForMetal returns apple silicon profile" {
 }
 
 test "fitsGpu compares against required vram" {
-    const entry = find("qwen35-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    const entry = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
     try std.testing.expect(fitsGpu(entry.*, 24 * 1024 * 1024 * 1024));
     try std.testing.expect(!fitsGpu(entry.*, 20 * 1024 * 1024 * 1024));
 }
 
 test "supportedOnCurrentGpu requires both tested profile and fit" {
-    const entry = find("qwen35-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    const entry = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
     try std.testing.expect(supportedOnCurrentGpu(entry.*, "amd-rdna4-32gb", 24 * 1024 * 1024 * 1024));
     try std.testing.expect(!supportedOnCurrentGpu(entry.*, "amd-rdna4-16gb", 24 * 1024 * 1024 * 1024));
     try std.testing.expect(!supportedOnCurrentGpu(entry.*, "amd-rdna4-32gb", 20 * 1024 * 1024 * 1024));
@@ -410,9 +387,6 @@ test "qwen thinking stability flags track validated chat behavior" {
     const qwen3 = find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
     try std.testing.expect(qwen3.recommended_for_chat);
     try std.testing.expect(qwen3.thinking_stable);
-
-    const qwen35 = find("qwen35-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
-    try std.testing.expect(qwen35.thinking_stable);
 
     const qwen36 = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
     try std.testing.expect(qwen36.thinking_stable);

@@ -73,7 +73,7 @@ Generate a chat completion from a conversation. Supports both streaming (SSE) an
   "id": "chatcmpl-abc123",
   "object": "chat.completion",
   "created": 1711500000,
-  "model": "Qwen3.5-35B-A3B-Q4_K",
+  "model": "Qwen3.6-35B-A3B-Q4_K",
   "choices": [
     {
       "index": 0,
@@ -97,11 +97,11 @@ Generate a chat completion from a conversation. Supports both streaming (SSE) an
 When `stream: true`, the server responds with `Content-Type: text/event-stream`. Each event is a JSON object:
 
 ```
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3.5-35B-A3B-Q4_K","choices":[{"index":0,"delta":{"content":"The"},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3.6-35B-A3B-Q4_K","choices":[{"index":0,"delta":{"content":"The"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3.5-35B-A3B-Q4_K","choices":[{"index":0,"delta":{"content":" capital"},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3.6-35B-A3B-Q4_K","choices":[{"index":0,"delta":{"content":" capital"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3.5-35B-A3B-Q4_K","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3.6-35B-A3B-Q4_K","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 ```
@@ -198,7 +198,7 @@ Generate a text completion from a raw prompt string. Same parameters as chat com
   "id": "cmpl-abc123",
   "object": "text_completion",
   "created": 1711500000,
-  "model": "Qwen3.5-35B-A3B-Q4_K",
+  "model": "Qwen3.6-35B-A3B-Q4_K",
   "choices": [
     {
       "index": 0,
@@ -230,19 +230,19 @@ Each managed model object now includes `release_date` as a `YYYY-MM-DD` string s
   "profile": "amd-rdna4-32gb",
   "data": [
     {
-      "id": "qwen35-35b-a3b-q4k-xl",
+      "id": "qwen36-35b-a3b-q4k-xl",
       "object": "model",
       "created": 1711500000,
       "owned_by": "zinc",
-      "display_name": "Qwen3.5 35B-A3B UD Q4_K_XL",
-      "release_date": "2026-02-16",
-      "homepage_url": "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF",
+      "display_name": "Qwen3.6 35B-A3B UD Q4_K_XL",
+      "release_date": "2026-04-15",
+      "homepage_url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF",
       "installed": false,
       "active": false,
       "managed": true,
       "supported_on_current_gpu": true,
       "fits_current_gpu": true,
-      "required_vram_bytes": 22987514102,
+      "required_vram_bytes": 23106019926,
       "fit_source": "catalog",
       "status": "supported",
       "supports_thinking_toggle": false

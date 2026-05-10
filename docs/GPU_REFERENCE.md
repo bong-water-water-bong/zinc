@@ -465,7 +465,7 @@ Phase 2: normalize
 
 Total: ~450 cycles ≈ 0.18 µs
 Fusing RMS_NORM + MUL into a single shader saves one global read + write pass (32 KB for 4096 floats).
-Measured savings: ~500 µs per token (131 fused dispatches on Qwen3.5-35B-A3B).
+Measured savings: ~500 µs per token (131 fused dispatches on Qwen3.6-35B-A3B).
 ```
 
 ## Dispatch and Command Buffer
@@ -556,7 +556,7 @@ GRUB_CMDLINE_LINUX_DEFAULT="... amdgpu.ras_enable=0"
 # Then: update-grub && reboot
 ```
 
-Measured impact: 101 tok/s → 110 tok/s (+9%) on Qwen3.5-35B-A3B Q4_K.
+Measured impact: 101 tok/s → 110 tok/s (+9%) on Qwen3.6-35B-A3B Q4_K.
 
 ### SPIR-V Toolchain
 

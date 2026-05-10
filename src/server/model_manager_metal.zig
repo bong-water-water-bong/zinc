@@ -578,8 +578,8 @@ test "collectCatalogView exposes validated qwen thinking toggles on Metal" {
         },
         .engine = undefined,
         .model_path = try std.testing.allocator.dupe(u8, "/tmp/model.gguf"),
-        .managed_id = try std.testing.allocator.dupe(u8, "qwen35-35b-a3b-q4k-xl"),
-        .display_name = try std.testing.allocator.dupe(u8, "Qwen3.5 35B-A3B UD Q4_K_XL"),
+        .managed_id = try std.testing.allocator.dupe(u8, "qwen36-35b-a3b-q4k-xl"),
+        .display_name = try std.testing.allocator.dupe(u8, "Qwen3.6 35B-A3B UD Q4_K_XL"),
         .weights_bytes = 0,
         .runtime_device_local_bytes = 0,
         .context_reserved_bytes = 0,
@@ -603,7 +603,7 @@ test "collectCatalogView exposes validated qwen thinking toggles on Metal" {
 
     var saw_active = false;
     for (view.data) |entry| {
-        if (std.mem.eql(u8, entry.id, "qwen35-35b-a3b-q4k-xl")) {
+        if (std.mem.eql(u8, entry.id, "qwen36-35b-a3b-q4k-xl")) {
             saw_active = true;
             try std.testing.expect(entry.active);
             try std.testing.expect(entry.supports_thinking_toggle);

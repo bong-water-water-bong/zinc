@@ -933,7 +933,7 @@ test "extractUpstreamArtifactMetadata reads x-linked headers from redirect respo
 }
 
 test "preflightCatalogDrift fails fast on upstream drift" {
-    const entry = catalog.find("qwen35-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    const entry = catalog.find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
     const drifted = UpstreamArtifactMetadata{
         .size_bytes = entry.size_bytes + 1,
         .sha256_hex = canonicalizeSha256Header("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").?,
@@ -949,7 +949,7 @@ test "preflightCatalogDrift fails fast on upstream drift" {
 }
 
 test "preflightCatalogDrift allows size-only drift" {
-    const entry = catalog.find("qwen35-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    const entry = catalog.find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
     const drifted = UpstreamArtifactMetadata{
         .size_bytes = entry.size_bytes + 1,
         .sha256_hex = canonicalizeSha256Header(entry.sha256).?,

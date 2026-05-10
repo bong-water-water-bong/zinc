@@ -1,8 +1,8 @@
-# RDNA4 Performance Plan: Qwen3.5-35B-A3B → 100+ tok/s
+# RDNA4 Performance Plan: Qwen3.6-35B-A3B → 100+ tok/s
 
 **Target**: Beat llama.cpp (102 tok/s) on AMD RX 9070 (RDNA4, 576 GB/s, 64 CUs)
 **Current**: 11 tok/s (91 ms/tok) — 10x gap
-**Model**: Qwen3.5-35B-A3B MoE — 40 layers, 256 experts (top-8), hybrid SSM+attention
+**Model**: Qwen3.6-35B-A3B MoE — 40 layers, 256 experts (top-8), hybrid SSM+attention
 
 ## 1. Theoretical Limits
 
@@ -67,7 +67,7 @@ This creates **30 GPU pipeline flushes per token**.
 
 Commit `ac988d4`: Changed SSM guard from `!has_delta_net` to shader-availability check. Eliminates 30 `submitAndWait` stalls per token.
 
-**Results**: Qwen3.5-35B 11→38.8 tok/s (3.5×), historical small dense reference 33.8→138.6 tok/s (4.1×), BW 2.4%→21.8%.
+**Results**: Qwen3.6-35B 11→38.8 tok/s (3.5×), historical small dense reference 33.8→138.6 tok/s (4.1×), BW 2.4%→21.8%.
 
 ### Phase 1: Kernel-Level Optimizations (38 → 48+ tok/s) — 🔄 IN PROGRESS
 

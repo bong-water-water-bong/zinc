@@ -5,13 +5,13 @@
 ## The Setup
 
 **Hardware**: AMD RX 9070 (RDNA4) — 64 CUs, 576 GB/s memory bandwidth, 16 GB VRAM
-**Model**: Qwen3.5-35B-A3B — a hybrid architecture with 40 layers, 256 MoE experts (top-8 active), delta-net SSM layers, and standard attention layers interleaved every 4th layer
+**Model**: Qwen3.6-35B-A3B — a hybrid architecture with 40 layers, 256 MoE experts (top-8 active), delta-net SSM layers, and standard attention layers interleaved every 4th layer
 **Engine**: ZINC — Zig host + GLSL compute shaders + Vulkan 1.3
 **Competitor**: llama.cpp at 102 tok/s on the same hardware
 
 ## The Starting Point: 11 tok/s
 
-When we first got the Qwen3.5-35B-A3B model producing coherent output on ZINC, the decode speed was 11 tokens per second — about 91 ms per token. That's nearly 10x slower than llama.cpp.
+When we first got the Qwen3.6-35B-A3B model producing coherent output on ZINC, the decode speed was 11 tokens per second — about 91 ms per token. That's nearly 10x slower than llama.cpp.
 
 The theoretical minimum for this model is ~2.2 ms/token (450 tok/s), based on reading ~1.28 GB of weights per token at 576 GB/s peak bandwidth. Our 91 ms meant we were achieving only 2.4% of the GPU's memory bandwidth — 97.6% of the time was wasted on something other than useful memory reads.
 
@@ -106,7 +106,7 @@ const use_gpu_ssm = pipeline_ssm_conv1d != null and
 This eliminated all 30 `submitAndWait` calls. The entire 40-layer decode now runs in a single command buffer submission.
 
 **Results:**
-- Qwen3.5-35B-A3B: 11 → 38.8 tok/s (3.5×)
+- Qwen3.6-35B-A3B: 11 → 38.8 tok/s (3.5×)
 - Historical small dense reference: 33.8 → 138.6 tok/s (4.1×)
 - Bandwidth utilization: 2.4% → 21.8%
 

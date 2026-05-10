@@ -989,7 +989,7 @@ pub const InferenceEngine = struct {
     // Gated by ZINC_MOE_Q5K_KPAR. When set (default-on) and the Q5_K MoE kpar
     // shader pipeline is available, the MoE down DMMV for Q5_K expert weights
     // uses the K-parallel subgroupAdd variant — targets the ~713 ms MoE down
-    // bucket in the Qwen3.5-35B flagship prefill.
+    // bucket in the Qwen3.6-35B flagship prefill.
     use_moe_q5k_kpar: bool = false,
     // Opt-in via ZINC_Q4K_BATCH_KPAR=1. When set and the pipeline is loaded,
     // dispatchProjectionBatched uses pipeline_q4k_batch_kpar — one WG per row
@@ -1934,7 +1934,7 @@ pub const InferenceEngine = struct {
 
         // Q4_K MoE K-parallel shader: default ON when the pipeline is loaded,
         // disabled by setting ZINC_MOE_KPAR=0. Measured on RDNA4 for the
-        // Qwen3.5-35B flagship: gate_up 855.6 → 695.4 ms (−18.7%), prefill
+        // Qwen3.6-35B flagship: gate_up 855.6 → 695.4 ms (−18.7%), prefill
         // tok/s 23.16 → 23.72 (+2.4%) with identical output tokens.
         const moe_kpar_env = std.posix.getenv("ZINC_MOE_KPAR");
         const moe_kpar_explicitly_off = moe_kpar_env != null and std.mem.eql(u8, moe_kpar_env.?, "0");
@@ -2161,7 +2161,7 @@ pub const InferenceEngine = struct {
 
         // Q5_K MoE K-parallel shader: default ON when the pipeline is loaded,
         // disabled by setting ZINC_MOE_Q5K_KPAR=0. Targets the ~713 ms MoE down
-        // bucket (Q5_K weights) on the Qwen3.5-35B flagship prefill. Mirrors the
+        // bucket (Q5_K weights) on the Qwen3.6-35B flagship prefill. Mirrors the
         // Q4_K kpar pattern (16 threads per Q5_K superblock + wave64 subgroupAdd).
         const moe_q5k_kpar_env = std.posix.getenv("ZINC_MOE_Q5K_KPAR");
         const moe_q5k_kpar_explicitly_off = moe_q5k_kpar_env != null and std.mem.eql(u8, moe_q5k_kpar_env.?, "0");

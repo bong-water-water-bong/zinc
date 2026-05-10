@@ -80,11 +80,9 @@ test("GPT-OSS uses the chat prompt path in the performance suite", () => {
   expect(defaultMaxTokensForModelId("qwen3-8b-q4k-m")).toBe(8);
 });
 
-test("default Metal cases use managed cache ids and include Qwen 3.5 and Qwen 3.6", () => {
+test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
   const cases = defaultMetalCases("/tmp/models");
-  const qwen35 = cases.find((entry) => entry.id === "qwen35-35b-a3b-q4k-xl");
-  expect(qwen35?.model_id).toBe("qwen35-35b-a3b-q4k-xl");
-  expect(qwen35?.model_path).toBe("/tmp/models/qwen35-35b-a3b-q4k-xl/model.gguf");
+  expect(cases.some((entry) => entry.id === "qwen35-35b-a3b-q4k-xl")).toBe(false);
 
   const qwen36 = cases.find((entry) => entry.id === "qwen36-35b-a3b-q4k-xl");
   expect(qwen36?.model_id).toBe("qwen36-35b-a3b-q4k-xl");
@@ -149,7 +147,7 @@ test("benchmark suite uses a multi-scenario matrix instead of a single prompt", 
 });
 
 test("benchmark suite measures all ZINC scenarios before starting baselines", () => {
-  const phases = buildMeasurementPhases("qwen35-35b-a3b-q4k-xl", "raw", "The capital of France is");
+  const phases = buildMeasurementPhases("qwen36-35b-a3b-q4k-xl", "raw", "The capital of France is");
   expect(phases.map((phase) => phase.phase)).toEqual([
     "zinc",
     "zinc",
@@ -165,10 +163,10 @@ test("benchmark suite measures all ZINC scenarios before starting baselines", ()
 });
 
 test("benchmark suite can split ZINC and baseline phases for clean reboot runs", () => {
-  const zincOnly = buildMeasurementPhases("qwen35-35b-a3b-q4k-xl", "raw", "The capital of France is", "zinc");
+  const zincOnly = buildMeasurementPhases("qwen36-35b-a3b-q4k-xl", "raw", "The capital of France is", "zinc");
   expect(zincOnly.map((phase) => phase.phase)).toEqual(["zinc", "zinc", "zinc", "zinc"]);
 
-  const baselineOnly = buildMeasurementPhases("qwen35-35b-a3b-q4k-xl", "raw", "The capital of France is", "baseline");
+  const baselineOnly = buildMeasurementPhases("qwen36-35b-a3b-q4k-xl", "raw", "The capital of France is", "baseline");
   expect(baselineOnly.map((phase) => phase.phase)).toEqual(["baseline", "baseline", "baseline", "baseline"]);
 });
 
