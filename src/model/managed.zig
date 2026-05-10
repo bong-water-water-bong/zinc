@@ -1115,3 +1115,52 @@ test "active selection roundtrip rejects non-catalog model on validate" {
     // The model is not in the catalog — this is the check that should happen at startup.
     try std.testing.expect(catalog.find(model_id) == null);
 }
+
+test "writeManifest then readInstalledManifest round-trips offloadable_vram_bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+
+    const entry = catalog.find("qwen35-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    try writeManifest(manifest_path, entry.*, 22_241_950_336, 22_987_514_102, 19_327_352_832, std.testing.allocator);
+
+    var manifest = (try readInstalledManifest(manifest_path, std.testing.allocator)) orelse return error.TestExpectedEqual;
+    defer manifest.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 22_241_950_336), manifest.size_bytes);
+    try std.testing.expectEqual(@as(?u64, 22_987_514_102), manifest.required_vram_bytes);
+    try std.testing.expectEqual(@as(?u64, 19_327_352_832), manifest.offloadable_vram_bytes);
+}
+
+test "readInstalledManifest tolerates old format without offloadable_vram_bytes" {
+    // Backward compat: manifests written before the offload field was added
+    // must still parse, with offloadable_vram_bytes = null. describeFit then
+    // falls back to the catalog estimate for that model.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+
+    {
+        const file = try std.fs.createFileAbsolute(manifest_path, .{ .truncate = true });
+        defer {
+            var close_file = file;
+            close_file.close();
+        }
+        try file.writeAll(
+            \\{"id":"qwen3-8b-q4k-m","display_name":"Qwen3 8B","installed_at_unix":1700000000,"size_bytes":5027784512,"required_vram_bytes":6442450944,"sha256":"","download_url":"local"}
+        );
+    }
+
+    var manifest = (try readInstalledManifest(manifest_path, std.testing.allocator)) orelse return error.TestExpectedEqual;
+    defer manifest.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 5_027_784_512), manifest.size_bytes);
+    try std.testing.expectEqual(@as(?u64, 6_442_450_944), manifest.required_vram_bytes);
+    try std.testing.expectEqual(@as(?u64, null), manifest.offloadable_vram_bytes);
+}

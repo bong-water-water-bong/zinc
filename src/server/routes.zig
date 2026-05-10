@@ -3673,6 +3673,55 @@ test "parseChatRequest replays assistant tool_calls as tool_call blocks" {
     }
     try std.testing.expect(found_tool_call_block);
 }
+
+// ──────────────────────────────────────────────────────────────────
+// Gate-off regression tests for ZINC_TOOL_CALLING.
+//
+// These tests pin the "default behavior is mainline-identical when
+// ZINC_TOOL_CALLING is unset" guarantee. If someone refactors the
+// gate and accidentally enables tool-calling unconditionally — or
+// disables it when it should be on — these will catch it.
+// ──────────────────────────────────────────────────────────────────
+
+test "parseChatRequest with gate off ignores request tools field" {
+    setToolCallingForTest(false);
+    defer resetToolCallingForTest();
+    const body =
+        \\{"messages":[{"role":"user","content":"go"}],"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":null}}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.tools.len);
+}
+
+test "parseChatRequest with gate off skips assistant turn that has only tool_calls" {
+    setToolCallingForTest(false);
+    defer resetToolCallingForTest();
+    // Same body as the gate-on null-content test, but the assistant turn
+    // must be dropped instead of rendered, so we expect 3 roles not 4.
+    const body =
+        \\{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"user","content":"hi"}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.roles.len);
+    try std.testing.expectEqualStrings("system", parsed.roles[0]);
+    try std.testing.expectEqualStrings("user", parsed.roles[1]);
+    try std.testing.expectEqualStrings("user", parsed.roles[2]);
+}
+
+test "parseChatRequest with gate off forces tool_choice to auto" {
+    setToolCallingForTest(false);
+    defer resetToolCallingForTest();
+    const body =
+        \\{"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":null}}],"tool_choice":"none"}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+    try std.testing.expectEqual(ToolChoice.auto, parsed.tool_choice);
+    try std.testing.expectEqual(@as(usize, 0), parsed.tools.len);
+}
+
 test "prefixThinkingEnvelope adds think prefix when enabled" {
     var buf: [128]u8 = undefined;
     const prefixed = try prefixThinkingEnvelope("17 * 24 = 408\n</think>\n408", true, &buf);

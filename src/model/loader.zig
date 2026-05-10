@@ -724,6 +724,29 @@ test "decideOffloadForLoad caches the decision into offload_state" {
     _ = decideOffloadForLoad(22 * 1024 * 1024 * 1024, 18 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024);
     try std.testing.expectEqual(@as(i8, 1), offload_state.load(.acquire));
     try std.testing.expect(offloadEnabled());
+test "shouldOffloadToHost returns true for MoE tensors when gate forced on" {
+    // Override the cache directly (same module = field access). The state is
+    // restored at end-of-test so the gate-off test above keeps working under
+    // any test order.
+    const prev = offload_state.load(.acquire);
+    defer offload_state.store(prev, .release);
+    offload_state.store(1, .release);
+
+    try std.testing.expect(shouldOffloadToHost("blk.0.ffn_gate_exps.weight"));
+    try std.testing.expect(shouldOffloadToHost("blk.5.ffn_down_exps.weight"));
+    // Dense tensors stay device-local even with gate on — the classifier
+    // is independent of the gate.
+    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_q.weight"));
+    try std.testing.expect(!shouldOffloadToHost("output.weight"));
+}
+
+test "shouldOffloadToHost returns false for MoE tensors when gate forced off" {
+    const prev = offload_state.load(.acquire);
+    defer offload_state.store(prev, .release);
+    offload_state.store(0, .release);
+
+    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_gate_exps.weight"));
+    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_q.weight"));
 }
 
 test "extractConfig defaults gemma4 attention scale to 1.0" {
