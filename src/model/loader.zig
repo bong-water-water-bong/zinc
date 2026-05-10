@@ -724,6 +724,8 @@ test "decideOffloadForLoad caches the decision into offload_state" {
     _ = decideOffloadForLoad(22 * 1024 * 1024 * 1024, 18 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024);
     try std.testing.expectEqual(@as(i8, 1), offload_state.load(.acquire));
     try std.testing.expect(offloadEnabled());
+}
+
 test "shouldOffloadToHost returns true for MoE tensors when gate forced on" {
     // Override the cache directly (same module = field access). The state is
     // restored at end-of-test so the gate-off test above keeps working under
@@ -749,7 +751,7 @@ test "shouldOffloadToHost returns false for MoE tensors when gate forced off" {
     try std.testing.expect(!shouldOffloadToHost("blk.0.attn_q.weight"));
 }
 
-test "offloadEnabled cache state machine" {
+test "offloadEnabled reflects cached state and never mutates it" {
     const prev = offload_state.load(.acquire);
     defer offload_state.store(prev, .release);
 
@@ -763,12 +765,11 @@ test "offloadEnabled cache state machine" {
     try std.testing.expect(!offloadEnabled());
     try std.testing.expectEqual(@as(i8, 0), offload_state.load(.acquire));
 
-    // Uncached → probes env (we don't control it during tests, so the result
-    // depends on whether ZINC_OFFLOAD_MOE_EXPERTS is set in the environment),
-    // but the post-call cache must be either 0 or 1, never -1.
+    // Uncached state (-1) is the safe default before any load: returns false
+    // and stays -1 until decideOffloadForLoad sets it.
     offload_state.store(-1, .release);
-    _ = offloadEnabled();
-    try std.testing.expect(offload_state.load(.acquire) >= 0);
+    try std.testing.expect(!offloadEnabled());
+    try std.testing.expectEqual(@as(i8, -1), offload_state.load(.acquire));
 }
 
 test "extractConfig defaults gemma4 attention scale to 1.0" {

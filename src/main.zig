@@ -959,7 +959,7 @@ fn printManagedModelList(config: Config, allocator: std.mem.Allocator) !void {
             .does_not_fit => "no",
         };
         const notes = if (supported_with_offload)
-            "needs ZINC_OFFLOAD_MOE_EXPERTS=1"
+            "auto: MoE experts → host RAM (slower)"
         else if (fit.exact)
             "tested + exact fit"
         else
@@ -983,8 +983,10 @@ fn printManagedModelList(config: Config, allocator: std.mem.Allocator) !void {
     }
 
     if (any_requires_offload) {
-        try stdout.interface.writeAll("\nModels marked \"supported (offload)\" fit only when MoE expert tensors are\n");
-        try stdout.interface.writeAll("offloaded to host RAM. Enable with ZINC_OFFLOAD_MOE_EXPERTS=1 (experimental).\n");
+        try stdout.interface.writeAll("\nModels marked \"supported (offload)\" exceed your VRAM budget; the loader\n");
+        try stdout.interface.writeAll("automatically routes MoE expert tensors to host RAM so they fit. Decode\n");
+        try stdout.interface.writeAll("speed drops because experts are read over PCIe. Set ZINC_OFFLOAD_MOE_EXPERTS=0\n");
+        try stdout.interface.writeAll("to opt out (the load will then OOM if the model doesn't fit otherwise).\n");
     }
 
     try stdout.interface.flush();
@@ -1362,8 +1364,8 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
             var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
             try stdout.interface.print("Active model set to {s}\n", .{model_id});
             if (fit.fit_state == .fits_with_offload) {
-                try stdout.interface.writeAll("Note: this model fits only with ZINC_OFFLOAD_MOE_EXPERTS=1.\n");
-                try stdout.interface.writeAll("Loading without it set will fail with an out-of-memory error.\n");
+                try stdout.interface.writeAll("Note: this model exceeds your VRAM budget. The loader will automatically\n");
+                try stdout.interface.writeAll("route MoE expert tensors to host RAM so it fits. Expect slower decode.\n");
             }
             try stdout.interface.flush();
         },

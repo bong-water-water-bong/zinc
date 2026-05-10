@@ -1124,14 +1124,14 @@ test "writeManifest then readInstalledManifest round-trips offloadable_vram_byte
     const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "manifest.json" });
     defer std.testing.allocator.free(manifest_path);
 
-    const entry = catalog.find("qwen35-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
-    try writeManifest(manifest_path, entry.*, 22_241_950_336, 22_987_514_102, 19_327_352_832, std.testing.allocator);
+    const entry = catalog.find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    try writeManifest(manifest_path, entry.*, 22_360_456_160, 23_106_019_926, 19_327_352_832, std.testing.allocator);
 
     var manifest = (try readInstalledManifest(manifest_path, std.testing.allocator)) orelse return error.TestExpectedEqual;
     defer manifest.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u64, 22_241_950_336), manifest.size_bytes);
-    try std.testing.expectEqual(@as(?u64, 22_987_514_102), manifest.required_vram_bytes);
+    try std.testing.expectEqual(@as(u64, 22_360_456_160), manifest.size_bytes);
+    try std.testing.expectEqual(@as(?u64, 23_106_019_926), manifest.required_vram_bytes);
     try std.testing.expectEqual(@as(?u64, 19_327_352_832), manifest.offloadable_vram_bytes);
 }
 
