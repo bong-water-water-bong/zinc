@@ -2064,7 +2064,7 @@ pub const InferenceEngine = struct {
             log.info("Qwen 3.6 MoE top-k cap disabled via ZINC_QWEN36_MOE_TOPK={s}", .{qwen36_topk_env.?});
         }
         const qwen36_prefill_topk_env = std.posix.getenv("ZINC_QWEN36_MOE_PREFILL_TOPK");
-        const qwen36_prefill_topk_default: u32 = 2;
+        const qwen36_prefill_topk_default: u32 = 1;
         const qwen36_prefill_tail_topk_limit: u32 = if (qwen36_like_f32_ssm) blk: {
             if (qwen36_prefill_topk_env) |raw| {
                 const parsed = std.fmt.parseInt(u32, raw, 10) catch qwen36_prefill_topk_default;
