@@ -39,6 +39,13 @@ pub const ModelSummary = struct {
     supported_on_current_gpu: bool,
     fits_current_gpu: bool,
     required_vram_bytes: u64,
+    /// VRAM required when MoE expert tensors are offloaded to host RAM.
+    /// On Apple Silicon (UMA) this equals required_vram_bytes — the field
+    /// exists for API parity with the Vulkan path.
+    required_vram_with_offload_bytes: u64,
+    /// Always false on Apple Silicon — UMA has no separate VRAM, so the
+    /// offload escape hatch isn't applicable here.
+    requires_offload_to_fit: bool,
     size_bytes: u64,
     exact_fit: bool,
     status_label: []const u8,
@@ -268,6 +275,8 @@ pub const ModelManager = struct {
                 .supported_on_current_gpu = supported_now,
                 .fits_current_gpu = fit.fits_current_gpu,
                 .required_vram_bytes = fit.required_vram_bytes,
+                .required_vram_with_offload_bytes = fit.required_vram_with_offload_bytes,
+                .requires_offload_to_fit = fit.fit_state == .fits_with_offload,
                 .size_bytes = entry.size_bytes,
                 .exact_fit = fit.exact,
                 .status_label = status_label,
@@ -289,6 +298,8 @@ pub const ModelManager = struct {
                 .supported_on_current_gpu = true,
                 .fits_current_gpu = true,
                 .required_vram_bytes = 0,
+                .required_vram_with_offload_bytes = 0,
+                .requires_offload_to_fit = false,
                 .size_bytes = 0,
                 .exact_fit = true,
                 .status_label = "raw",

@@ -923,9 +923,10 @@ fn printManagedModelList(config: Config, allocator: std.mem.Allocator) !void {
             if (support.from_cache) " (cached)" else "",
         },
     );
-    try stdout.interface.writeAll("ID                             Released     Status      Fit    Installed   Active   Notes\n");
+    try stdout.interface.writeAll("ID                             Released     Status              Fit       Installed   Active   Notes\n");
 
     var rendered_any = false;
+    var any_requires_offload = false;
     for (catalog_mod.entries) |entry| {
         const tested_profile_match = catalog_mod.supportsProfile(entry, support.profile);
         const installed = managed_mod.isInstalled(entry.id, allocator);
@@ -937,32 +938,53 @@ fn printManagedModelList(config: Config, allocator: std.mem.Allocator) !void {
             .fit_state = catalog_mod.fitState(entry, support.vram_budget_bytes),
         };
         const supported_now = tested_profile_match and fit.fits_current_gpu;
-        if (!config.show_all_models and !supported_now) continue;
+        const supported_with_offload = tested_profile_match and fit.fit_state == .fits_with_offload;
+        const visible = supported_now or supported_with_offload;
+        if (!config.show_all_models and !visible) continue;
 
         rendered_any = true;
+        if (supported_with_offload) any_requires_offload = true;
         const is_active = active_model_id != null and std.mem.eql(u8, active_model_id.?, entry.id);
         const status_label = if (supported_now)
             "supported"
+        else if (supported_with_offload)
+            "supported (offload)"
         else if (tested_profile_match)
             "too-large"
         else
             "hidden";
+        const fit_label = switch (fit.fit_state) {
+            .fits => "yes",
+            .fits_with_offload => "offload",
+            .does_not_fit => "no",
+        };
+        const notes = if (supported_with_offload)
+            "needs ZINC_OFFLOAD_MOE_EXPERTS=1"
+        else if (fit.exact)
+            "tested + exact fit"
+        else
+            "tested + catalog fit";
         try stdout.interface.print(
-            "{s: <30} {s: <12} {s: <11} {s: <6} {s: <11} {s: <8} {s}\n",
+            "{s: <30} {s: <12} {s: <19} {s: <9} {s: <11} {s: <8} {s}\n",
             .{
                 entry.id,
                 entry.release_date,
                 status_label,
-                if (fit.fits_current_gpu) "yes" else "no",
+                fit_label,
                 if (installed) "yes" else "no",
                 if (is_active) "yes" else "no",
-                if (fit.exact) "tested + exact fit" else "tested + catalog fit",
+                notes,
             },
         );
     }
 
     if (!rendered_any) {
         try stdout.interface.writeAll("No managed models are currently marked supported and fitting for this GPU profile.\n");
+    }
+
+    if (any_requires_offload) {
+        try stdout.interface.writeAll("\nModels marked \"supported (offload)\" fit only when MoE expert tensors are\n");
+        try stdout.interface.writeAll("offloaded to host RAM. Enable with ZINC_OFFLOAD_MOE_EXPERTS=1 (experimental).\n");
     }
 
     try stdout.interface.flush();
@@ -1085,6 +1107,17 @@ fn printManagedModelListJson(
         const vram_str = std.fmt.bufPrint(&vram_str_buf, "{d}", .{entry.required_vram_bytes}) catch "0";
         try w.writeAll("    \"required_vram_bytes\": ");
         try w.writeAll(vram_str);
+        try w.writeAll(",\n");
+
+        var vram_off_str_buf: [24]u8 = undefined;
+        const vram_off_str = std.fmt.bufPrint(&vram_off_str_buf, "{d}", .{catalog_mod.requiredVramWithOffload(entry)}) catch "0";
+        try w.writeAll("    \"required_vram_with_offload_bytes\": ");
+        try w.writeAll(vram_off_str);
+        try w.writeAll(",\n");
+
+        const requires_offload = if (support) |s| catalog_mod.requiresOffloadToFit(entry, s.vram_budget_bytes) else false;
+        try w.writeAll("    \"requires_offload_to_fit\": ");
+        try w.writeAll(if (requires_offload) "true" else "false");
         try w.writeAll(",\n");
 
         var ctx_str_buf: [12]u8 = undefined;
@@ -1322,12 +1355,16 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
 
             if (!managed_mod.isInstalled(model_id, allocator)) return error.ModelNotInstalled;
             const fit = try managed_mod.verifyActiveSelectionFits(model_id, support.vram_budget_bytes, allocator);
-            if (!fit.fits_current_gpu) return error.ModelDoesNotFit;
+            if (fit.fit_state == .does_not_fit) return error.ModelDoesNotFit;
             try managed_mod.writeActiveSelection(model_id, allocator);
 
             var stdout_buffer: [1024]u8 = undefined;
             var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
             try stdout.interface.print("Active model set to {s}\n", .{model_id});
+            if (fit.fit_state == .fits_with_offload) {
+                try stdout.interface.writeAll("Note: this model fits only with ZINC_OFFLOAD_MOE_EXPERTS=1.\n");
+                try stdout.interface.writeAll("Loading without it set will fail with an out-of-memory error.\n");
+            }
             try stdout.interface.flush();
         },
         .model_rm => {
