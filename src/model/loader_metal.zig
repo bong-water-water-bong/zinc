@@ -16,6 +16,10 @@ pub const ModelInspection = struct {
     config: ModelConfig,
     file_size: u64,
     tensor_bytes: u64,
+    /// Always 0 on Apple Silicon — unified memory architecture has no separate
+    /// VRAM, so MoE expert offloading is not applicable. Field exists for
+    /// signature compatibility with the Vulkan loader.
+    offloadable_tensor_bytes: u64 = 0,
     tensor_count: u64,
     metadata_count: usize,
 };
@@ -393,6 +397,8 @@ pub fn inspectModel(path: []const u8, allocator: std.mem.Allocator) !ModelInspec
         .config = extractConfigWithLogging(&gf, false),
         .file_size = stat.size,
         .tensor_bytes = tensor_bytes,
+        // Apple Silicon uses unified memory; offload-to-host is meaningless.
+        .offloadable_tensor_bytes = 0,
         .tensor_count = gf.tensor_count,
         .metadata_count = gf.metadata.count(),
     };

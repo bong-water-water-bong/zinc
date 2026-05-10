@@ -24,6 +24,10 @@ pub const ModelInspection = struct {
     config: ModelConfig,
     file_size: u64,
     tensor_bytes: u64,
+    /// Sum of MoE expert tensor bytes (the share that would be allocated in
+    /// host-visible memory under `ZINC_OFFLOAD_MOE_EXPERTS=1`). Zero for dense
+    /// models. Use this for exact, model-specific offload-fit accounting.
+    offloadable_tensor_bytes: u64 = 0,
     tensor_count: u64,
     metadata_count: usize,
 };
@@ -487,14 +491,18 @@ pub fn inspectModel(path: []const u8, allocator: std.mem.Allocator) !ModelInspec
     defer gf.deinit();
 
     var tensor_bytes: u64 = 0;
+    var offloadable_tensor_bytes: u64 = 0;
     for (gf.tensors.items) |tensor_info| {
-        tensor_bytes += tensor_info.sizeBytes();
+        const sz = tensor_info.sizeBytes();
+        tensor_bytes += sz;
+        if (isMoEExpertTensor(tensor_info.name)) offloadable_tensor_bytes += sz;
     }
 
     return .{
         .config = extractConfigWithLogging(&gf, false),
         .file_size = stat.size,
         .tensor_bytes = tensor_bytes,
+        .offloadable_tensor_bytes = offloadable_tensor_bytes,
         .tensor_count = gf.tensor_count,
         .metadata_count = gf.metadata.count(),
     };

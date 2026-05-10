@@ -933,6 +933,8 @@ fn printManagedModelList(config: Config, allocator: std.mem.Allocator) !void {
             .required_vram_bytes = entry.required_vram_bytes,
             .fits_current_gpu = catalog_mod.fitsGpu(entry, support.vram_budget_bytes),
             .exact = false,
+            .required_vram_with_offload_bytes = catalog_mod.requiredVramWithOffload(entry),
+            .fit_state = catalog_mod.fitState(entry, support.vram_budget_bytes),
         };
         const supported_now = tested_profile_match and fit.fits_current_gpu;
         if (!config.show_all_models and !supported_now) continue;
@@ -1033,6 +1035,8 @@ fn printManagedModelListJson(
                 .required_vram_bytes = entry.required_vram_bytes,
                 .fits_current_gpu = catalog_mod.fitsGpu(entry, s.vram_budget_bytes),
                 .exact = false,
+                .required_vram_with_offload_bytes = catalog_mod.requiredVramWithOffload(entry),
+                .fit_state = catalog_mod.fitState(entry, s.vram_budget_bytes),
             };
             break :blk fit.fits_current_gpu;
         } else null;

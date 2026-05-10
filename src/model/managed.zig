@@ -27,6 +27,13 @@ pub const ModelFit = struct {
     required_vram_bytes: u64,
     fits_current_gpu: bool,
     exact: bool,
+    /// VRAM required when MoE expert tensors are offloaded to host RAM via
+    /// `ZINC_OFFLOAD_MOE_EXPERTS=1`. Equal to `required_vram_bytes` for dense
+    /// models. For MoE models, this is meaningfully smaller and lets users
+    /// fit a model that would otherwise exceed the VRAM budget.
+    required_vram_with_offload_bytes: u64,
+    /// Tri-state offload-aware fit assessment.
+    fit_state: catalog.FitState,
 };
 
 /// The currently active managed model as persisted in the config directory.
@@ -67,6 +74,10 @@ pub const InstalledManifest = struct {
     size_bytes: u64,
     sha256: ?[]u8,
     required_vram_bytes: ?u64,
+    /// Bytes of MoE expert tensors in the installed file. Nullable because
+    /// older manifests written before the offload-aware loader existed don't
+    /// carry it; callers fall back to the catalog estimate in that case.
+    offloadable_vram_bytes: ?u64 = null,
 
     /// Frees the owned sha256 slice (if any) and invalidates the struct.
     pub fn deinit(self: *InstalledManifest, allocator: std.mem.Allocator) void {
@@ -360,34 +371,53 @@ pub fn describeFit(entry: catalog.CatalogEntry, vram_budget_bytes: u64, allocato
         const manifest_path = try resolveManifestPath(entry.id, allocator);
         defer allocator.free(manifest_path);
 
+        // Existing manifests don't carry offloadable_bytes; fall back to the
+        // catalog estimate for that field. New manifests written below carry
+        // the exact value from the GGUF inspection.
         if (try readInstalledManifest(manifest_path, allocator)) |manifest| {
             defer {
                 var owned = manifest;
                 owned.deinit(allocator);
             }
             if (manifest.required_vram_bytes) |required_vram_bytes| {
-                return .{
-                    .required_vram_bytes = required_vram_bytes,
-                    .fits_current_gpu = required_vram_bytes <= vram_budget_bytes,
-                    .exact = true,
-                };
+                const offloadable = manifest.offloadable_vram_bytes orelse entry.offloadable_vram_bytes;
+                const with_offload = if (offloadable >= required_vram_bytes) 0 else required_vram_bytes - offloadable;
+                return makeModelFit(required_vram_bytes, offloadable, with_offload, vram_budget_bytes, true);
             }
         }
 
         const inspection = try loader_mod.inspectModel(installed_path, allocator);
         const required_bytes = estimateRequiredBytes(inspection);
-        try writeManifest(manifest_path, entry, inspection.file_size, required_bytes, allocator);
-        return .{
-            .required_vram_bytes = required_bytes,
-            .fits_current_gpu = required_bytes <= vram_budget_bytes,
-            .exact = true,
-        };
+        const offloadable = inspection.offloadable_tensor_bytes;
+        const with_offload = if (offloadable >= required_bytes) 0 else required_bytes - offloadable;
+        try writeManifest(manifest_path, entry, inspection.file_size, required_bytes, offloadable, allocator);
+        return makeModelFit(required_bytes, offloadable, with_offload, vram_budget_bytes, true);
     }
 
+    // No installed file: fall back to the catalog's static estimates.
     return .{
         .required_vram_bytes = entry.required_vram_bytes,
         .fits_current_gpu = catalog.fitsGpu(entry, vram_budget_bytes),
         .exact = false,
+        .required_vram_with_offload_bytes = catalog.requiredVramWithOffload(entry),
+        .fit_state = catalog.fitState(entry, vram_budget_bytes),
+    };
+}
+
+fn makeModelFit(required: u64, offloadable: u64, with_offload: u64, budget: u64, exact: bool) ModelFit {
+    const fits = required <= budget;
+    const state: catalog.FitState = if (fits)
+        .fits
+    else if (offloadable > 0 and with_offload <= budget)
+        .fits_with_offload
+    else
+        .does_not_fit;
+    return .{
+        .required_vram_bytes = required,
+        .fits_current_gpu = fits,
+        .exact = exact,
+        .required_vram_with_offload_bytes = if (with_offload == 0) required else with_offload,
+        .fit_state = state,
     };
 }
 
@@ -547,7 +577,7 @@ pub fn pullModelWithObserver(
     std.fs.deleteFileAbsolute(final_path) catch {};
     try std.fs.renameAbsolute(partial_path, final_path);
     const inspection = try loader_mod.inspectModel(final_path, allocator);
-    try writeManifest(manifest_path, entry, stat.size, estimateRequiredBytes(inspection), allocator);
+    try writeManifest(manifest_path, entry, stat.size, estimateRequiredBytes(inspection), inspection.offloadable_tensor_bytes, allocator);
     if (observer) |obs| {
         if (obs.on_complete) |cb| cb(obs.context, stat.size);
     }
@@ -631,6 +661,7 @@ fn writeManifest(
     entry: catalog.CatalogEntry,
     size_bytes: u64,
     required_vram_bytes: u64,
+    offloadable_vram_bytes: u64,
     allocator: std.mem.Allocator,
 ) !void {
     _ = allocator;
@@ -643,13 +674,14 @@ fn writeManifest(
     var file_buffer: [2048]u8 = undefined;
     var writer = file.writerStreaming(&file_buffer);
     try writer.interface.print(
-        \\{{"id":"{s}","display_name":"{s}","installed_at_unix":{d},"size_bytes":{d},"required_vram_bytes":{d},"sha256":"{s}","download_url":"{s}"}}
+        \\{{"id":"{s}","display_name":"{s}","installed_at_unix":{d},"size_bytes":{d},"required_vram_bytes":{d},"offloadable_vram_bytes":{d},"sha256":"{s}","download_url":"{s}"}}
     , .{
         entry.id,
         entry.display_name,
         std.time.timestamp(),
         size_bytes,
         required_vram_bytes,
+        offloadable_vram_bytes,
         entry.sha256,
         entry.download_url,
     });
@@ -672,13 +704,16 @@ fn readInstalledManifest(path: []const u8, allocator: std.mem.Allocator) !?Insta
     const size_i64 = extractJsonI64Field(data, "size_bytes") orelse return error.InvalidManifest;
     const sha256_opt = extractJsonStringField(data, "sha256");
     const required_vram_i64 = extractJsonI64Field(data, "required_vram_bytes");
+    const offloadable_vram_i64 = extractJsonI64Field(data, "offloadable_vram_bytes");
     if (size_i64 < 0) return error.InvalidManifest;
     if (required_vram_i64) |v| if (v < 0) return error.InvalidManifest;
+    if (offloadable_vram_i64) |v| if (v < 0) return error.InvalidManifest;
 
     return .{
         .size_bytes = @intCast(size_i64),
         .sha256 = if (sha256_opt) |s| try allocator.dupe(u8, s) else null,
         .required_vram_bytes = if (required_vram_i64) |v| @intCast(v) else null,
+        .offloadable_vram_bytes = if (offloadable_vram_i64) |v| @intCast(v) else null,
     };
 }
 
