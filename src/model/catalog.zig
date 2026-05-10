@@ -29,6 +29,12 @@ pub const CatalogEntry = struct {
     sha256: []const u8,
     size_bytes: u64,
     required_vram_bytes: u64,
+    /// Bytes of MoE expert tensors that move to host RAM when
+    /// `ZINC_OFFLOAD_MOE_EXPERTS=1`. Zero for dense models (no benefit
+    /// from offload). For MoE entries this is a catalog estimate; the
+    /// loader/inspector will overwrite with the exact tensor sum once
+    /// the model is installed.
+    offloadable_vram_bytes: u64 = 0,
     default_context_length: u32,
     recommended_for_chat: bool,
     /// Whether the model produces stable, useful output when thinking is enabled.
@@ -36,6 +42,18 @@ pub const CatalogEntry = struct {
     thinking_stable: bool,
     status: CatalogStatus,
     tested_profiles: []const []const u8,
+};
+
+/// VRAM-fit assessment for a catalog entry against a specific GPU budget.
+pub const FitState = enum {
+    /// Model fits in VRAM with no special configuration.
+    fits,
+    /// Model fits only when `ZINC_OFFLOAD_MOE_EXPERTS=1` moves MoE expert
+    /// tensors to host RAM. Requires a recent driver and willingness to
+    /// pay PCIe latency on expert reads.
+    fits_with_offload,
+    /// Model is too large for this GPU even with offload.
+    does_not_fit,
 };
 
 /// Shared GPU profile string used for all Apple Silicon (Metal) devices.
@@ -56,6 +74,8 @@ pub const entries = [_]CatalogEntry{
         .sha256 = "",
         .size_bytes = 22_360_456_160,
         .required_vram_bytes = 23_106_019_926,
+        // 35B-A3B: same architecture as Qwen3.5; ≈ 18 GiB of offloadable experts.
+        .offloadable_vram_bytes = 18 * 1024 * 1024 * 1024,
         .default_context_length = 4096,
         .recommended_for_chat = true,
         .thinking_stable = true,
@@ -102,6 +122,8 @@ pub const entries = [_]CatalogEntry{
         .sha256 = "86a21df11afa5a40031ec1974e368ae0ab561ee3995f4d08ff432e8b2b7af9fc",
         .size_bytes = 11_673_418_816,
         .required_vram_bytes = 14 * 1024 * 1024 * 1024,
+        // GPT-OSS 20B MoE (~3.6B active, ~17B inactive experts) at Q4_K_M ≈ 8 GiB.
+        .offloadable_vram_bytes = 8 * 1024 * 1024 * 1024,
         .default_context_length = 4096,
         .recommended_for_chat = true,
         .thinking_stable = true,
@@ -171,6 +193,8 @@ pub const entries = [_]CatalogEntry{
         .sha256 = "",
         .size_bytes = 16_868_236_288,
         .required_vram_bytes = 16 * 1024 * 1024 * 1024,
+        // Gemma4 26B-A4B MoE (~4B active, ~22B inactive experts) at Q4_K_M ≈ 11 GiB.
+        .offloadable_vram_bytes = 11 * 1024 * 1024 * 1024,
         .default_context_length = 4096,
         .recommended_for_chat = true,
         .thinking_stable = true,
@@ -265,9 +289,33 @@ pub fn supportsProfile(entry: CatalogEntry, profile: []const u8) bool {
     return false;
 }
 
-/// Return whether the model's VRAM requirement fits within the given budget.
+/// Return whether the model's VRAM requirement fits within the given budget
+/// without enabling MoE offload. Strict — does not consider the offload escape
+/// hatch. Use `fitState` for the offload-aware tri-state assessment.
 pub fn fitsGpu(entry: CatalogEntry, vram_budget_bytes: u64) bool {
     return entry.required_vram_bytes <= vram_budget_bytes;
+}
+
+/// VRAM required when MoE expert tensors are offloaded to host RAM. Equal to
+/// `required_vram_bytes` for dense models (no offloadable tensors).
+pub fn requiredVramWithOffload(entry: CatalogEntry) u64 {
+    if (entry.offloadable_vram_bytes >= entry.required_vram_bytes) return 0;
+    return entry.required_vram_bytes - entry.offloadable_vram_bytes;
+}
+
+/// Tri-state fit assessment that distinguishes "fits as-is" from "fits only
+/// with `ZINC_OFFLOAD_MOE_EXPERTS=1`". Use this to surface the offload escape
+/// hatch to users when a model would otherwise look unsupported.
+pub fn fitState(entry: CatalogEntry, vram_budget_bytes: u64) FitState {
+    if (entry.required_vram_bytes <= vram_budget_bytes) return .fits;
+    if (entry.offloadable_vram_bytes > 0 and requiredVramWithOffload(entry) <= vram_budget_bytes) return .fits_with_offload;
+    return .does_not_fit;
+}
+
+/// Return true when the model needs `ZINC_OFFLOAD_MOE_EXPERTS=1` to fit
+/// (does not fit by itself but does fit with offload enabled).
+pub fn requiresOffloadToFit(entry: CatalogEntry, vram_budget_bytes: u64) bool {
+    return fitState(entry, vram_budget_bytes) == .fits_with_offload;
 }
 
 /// Return whether the model is both tested on the given profile and fits in VRAM.
@@ -417,6 +465,44 @@ test "fitsGpu compares against required vram" {
     const entry = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
     try std.testing.expect(fitsGpu(entry.*, 24 * 1024 * 1024 * 1024));
     try std.testing.expect(!fitsGpu(entry.*, 20 * 1024 * 1024 * 1024));
+}
+
+test "fitState distinguishes fits, fits_with_offload, does_not_fit" {
+    const moe = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    // 32 GiB: fits everything, no offload needed.
+    try std.testing.expectEqual(FitState.fits, fitState(moe.*, 32 * 1024 * 1024 * 1024));
+    // 16 GiB: doesn't fit straight (needs ~22 GiB) but fits with offload (~3.5 GiB).
+    try std.testing.expectEqual(FitState.fits_with_offload, fitState(moe.*, 16 * 1024 * 1024 * 1024));
+    // 2 GiB: too small even with offload.
+    try std.testing.expectEqual(FitState.does_not_fit, fitState(moe.*, 2 * 1024 * 1024 * 1024));
+}
+
+test "fitState for dense model never returns fits_with_offload" {
+    const dense = find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
+    // Fits in 8 GiB.
+    try std.testing.expectEqual(FitState.fits, fitState(dense.*, 8 * 1024 * 1024 * 1024));
+    // Doesn't fit in 4 GiB and can't be helped by offload (no expert tensors).
+    try std.testing.expectEqual(FitState.does_not_fit, fitState(dense.*, 4 * 1024 * 1024 * 1024));
+}
+
+test "requiresOffloadToFit only true when straight fit fails but offload fits" {
+    const moe = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    try std.testing.expect(!requiresOffloadToFit(moe.*, 32 * 1024 * 1024 * 1024)); // straight fit
+    try std.testing.expect(requiresOffloadToFit(moe.*, 16 * 1024 * 1024 * 1024)); // offload-only
+    try std.testing.expect(!requiresOffloadToFit(moe.*, 2 * 1024 * 1024 * 1024)); // too small either way
+}
+
+test "requiredVramWithOffload subtracts offloadable share" {
+    const moe = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    const without = moe.required_vram_bytes;
+    const with = requiredVramWithOffload(moe.*);
+    try std.testing.expect(with < without);
+    try std.testing.expectEqual(without - moe.offloadable_vram_bytes, with);
+}
+
+test "requiredVramWithOffload returns required_vram_bytes for dense models" {
+    const dense = find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(dense.required_vram_bytes, requiredVramWithOffload(dense.*));
 }
 
 test "supportedOnCurrentGpu requires both tested profile and fit" {
