@@ -1024,6 +1024,13 @@ pub const InferenceEngine = struct {
     // structural lever on the MoE prefill bucket. Override with
     // ZINC_QWEN36_MOE_TOPK=4 for the prior cap or =8 to restore exact top-8.
     moe_topk_limit: u32 = 0,
+    // Non-zero caps only non-terminal prefill MoE routing. The terminal
+    // prompt token and subsequent decode use moe_topk_limit, which keeps the
+    // accepted quality-sensitive path while reducing dead-tail prefill work.
+    moe_prefill_tail_topk_limit: u32 = 0,
+    // Number of final prompt tokens exempt from moe_prefill_tail_topk_limit.
+    // This keeps the answer-bearing suffix closer to the accepted top-k path.
+    moe_prefill_tail_topk_guard_tokens: u32 = 0,
     // Default-on when the rms_norm_dmmv_f32 pipeline is loaded. Folds
     // the per-MoE-layer (rms_norm_mul → router DMMV) pair into a
     // single dispatch on architectures whose router (`ffn_gate_inp`)
@@ -2056,6 +2063,35 @@ pub const InferenceEngine = struct {
         } else if (qwen36_like_f32_ssm and qwen36_topk_env != null) {
             log.info("Qwen 3.6 MoE top-k cap disabled via ZINC_QWEN36_MOE_TOPK={s}", .{qwen36_topk_env.?});
         }
+        const qwen36_prefill_topk_env = std.posix.getenv("ZINC_QWEN36_MOE_PREFILL_TOPK");
+        const qwen36_prefill_topk_default: u32 = 2;
+        const qwen36_prefill_tail_topk_limit: u32 = if (qwen36_like_f32_ssm) blk: {
+            if (qwen36_prefill_topk_env) |raw| {
+                const parsed = std.fmt.parseInt(u32, raw, 10) catch qwen36_prefill_topk_default;
+                if (parsed == 0 or parsed >= config.n_experts_used) break :blk 0;
+                break :blk @max(@as(u32, 1), parsed);
+            }
+            // Respect an explicit global top-k override. By default, only
+            // non-terminal prefill tokens take the more aggressive cap.
+            if (qwen36_topk_env != null) break :blk 0;
+            break :blk qwen36_prefill_topk_default;
+        } else 0;
+        const qwen36_prefill_guard_env = std.posix.getenv("ZINC_QWEN36_MOE_PREFILL_TOPK_GUARD");
+        const qwen36_prefill_guard_default: u32 = 16;
+        const qwen36_prefill_tail_topk_guard_tokens: u32 = if (qwen36_prefill_tail_topk_limit > 0) blk: {
+            if (qwen36_prefill_guard_env) |raw| {
+                break :blk std.fmt.parseInt(u32, raw, 10) catch qwen36_prefill_guard_default;
+            }
+            break :blk qwen36_prefill_guard_default;
+        } else 0;
+        if (qwen36_prefill_tail_topk_limit > 0) {
+            log.info("Qwen 3.6 non-terminal prefill MoE top-k capped at {d} before final {d} prompt tokens (set ZINC_QWEN36_MOE_PREFILL_TOPK=0 to disable)", .{
+                qwen36_prefill_tail_topk_limit,
+                qwen36_prefill_tail_topk_guard_tokens,
+            });
+        } else if (qwen36_like_f32_ssm and qwen36_prefill_topk_env != null) {
+            log.info("Qwen 3.6 non-terminal prefill MoE top-k cap disabled via ZINC_QWEN36_MOE_PREFILL_TOPK={s}", .{qwen36_prefill_topk_env.?});
+        }
 
         // Fused FFN-RMS-norm + f32 router DMMV: default ON when the
         // rms_norm_dmmv_f32 pipeline is loaded. Folds the standalone
@@ -2512,6 +2548,8 @@ pub const InferenceEngine = struct {
             .use_moe_fused_gate_up_swiglu = moe_fused_gate_up_swiglu_enabled,
             .use_moe_fused_down_acc = moe_fused_down_acc_enabled,
             .moe_topk_limit = qwen36_topk_limit,
+            .moe_prefill_tail_topk_limit = qwen36_prefill_tail_topk_limit,
+            .moe_prefill_tail_topk_guard_tokens = qwen36_prefill_tail_topk_guard_tokens,
             .use_fused_rms_router = fused_rms_router_enabled,
             .use_fused_ssm_pre_norm = fused_ssm_ab_enabled,
             .use_ssm_delta_cols8 = ssm_delta_cols8_enabled,
@@ -6329,8 +6367,16 @@ pub const InferenceEngine = struct {
                 }
                 self.endProfilePhase(.moe_router, moe_router_phase);
 
-                const n_used = if (self.moe_topk_limit > 0)
-                    @min(config.n_experts_used, self.moe_topk_limit)
+                const use_prefill_tail_topk = self.prefill_active and
+                    !collect_output and
+                    self.moe_prefill_tail_topk_limit > 0 and
+                    self.prefill_current_token_idx + self.moe_prefill_tail_topk_guard_tokens < self.prefill_embed_big_token_count;
+                const effective_moe_topk_limit = if (use_prefill_tail_topk)
+                    self.moe_prefill_tail_topk_limit
+                else
+                    self.moe_topk_limit;
+                const n_used = if (effective_moe_topk_limit > 0)
+                    @min(config.n_experts_used, effective_moe_topk_limit)
                 else
                     config.n_experts_used;
 
