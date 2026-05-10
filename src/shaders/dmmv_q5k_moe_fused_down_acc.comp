@@ -27,6 +27,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
 
 layout(local_size_x = 64) in;
 
@@ -65,6 +66,63 @@ vec4 unpack_qh_bits(uint qh_u32, uint sb) {
     );
 }
 
+float dot_q5k_block(uint row_u32, uint i, uint l0, uint q_offset_in_half, uint v_im, uint shift, vec4 by0, vec4 by1, vec4 by2, vec4 by3) {
+    uint blk_u32 = row_u32 + i * Q5K_BLOCK_U32;
+
+    uint d_dmin = a_u32[blk_u32];
+    float d_val = unpackHalf2x16(d_dmin & 0xFFFFu).x;
+    float dmin_val = unpackHalf2x16(d_dmin >> 16).x;
+
+    uint sc0 = a_u32[blk_u32 + 1u];
+    uint sc1 = a_u32[blk_u32 + 2u];
+    uint sc2 = a_u32[blk_u32 + 3u];
+
+    uint qh_u32 = a_u32[blk_u32 + 4u + l0 / 4u];
+
+    uint qs_u32_0 = a_u32[blk_u32 + 12u + q_offset_in_half / 4u];
+    uint qs_u32_1 = a_u32[blk_u32 + 12u + q_offset_in_half / 4u + 16u];
+
+    vec4 q0_lo = unpack_nibbles_lo(qs_u32_0);
+    vec4 q0_hi = unpack_nibbles_hi(qs_u32_0);
+    vec4 q1_lo = unpack_nibbles_lo(qs_u32_1);
+    vec4 q1_hi = unpack_nibbles_hi(qs_u32_1);
+
+    uint sb_a = 2u * v_im;
+    uint sb_b = 2u * v_im + 1u;
+    uint sb_c = 2u * v_im + 4u;
+    uint sb_d = 2u * v_im + 5u;
+
+    q0_lo += unpack_qh_bits(qh_u32, sb_a);
+    q0_hi += unpack_qh_bits(qh_u32, sb_b);
+    q1_lo += unpack_qh_bits(qh_u32, sb_c);
+    q1_hi += unpack_qh_bits(qh_u32, sb_d);
+
+    uint sc0_v = sc0 >> shift;
+    uint sc1_v = sc1 >> shift;
+    uint sc2_v = sc2 >> shift;
+
+    float sc_a = float(sc0_v & 0x3Fu);
+    float mn_a = float(sc1_v & 0x3Fu);
+    float sc_b = float((sc0_v >> 8u) & 0x3Fu);
+    float mn_b = float((sc1_v >> 8u) & 0x3Fu);
+    float sc_c = float((sc2_v & 0xFu) | ((sc0_v & 0xC0u) >> 2u));
+    float mn_c = float(((sc2_v & 0xF0u) >> 4u) | ((sc1_v & 0xC0u) >> 2u));
+    float sc_d = float(((sc2_v >> 8u) & 0xFu) | (((sc0_v >> 8u) & 0xC0u) >> 2u));
+    float mn_d = float((((sc2_v >> 8u) & 0xF0u) >> 4u) | (((sc1_v >> 8u) & 0xC0u) >> 2u));
+
+    float factor0 = d_val * sc_a; float bias0 = dmin_val * mn_a;
+    float factor1 = d_val * sc_b; float bias1 = dmin_val * mn_b;
+    float factor2 = d_val * sc_c; float bias2 = dmin_val * mn_c;
+    float factor3 = d_val * sc_d; float bias3 = dmin_val * mn_d;
+
+    float sum = 0.0;
+    sum += dot(vec4(factor0) * q0_lo - vec4(bias0), by0);
+    sum += dot(vec4(factor1) * q0_hi - vec4(bias1), by1);
+    sum += dot(vec4(factor2) * q1_lo - vec4(bias2), by2);
+    sum += dot(vec4(factor3) * q1_hi - vec4(bias3), by3);
+    return sum;
+}
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint wg_id_x = gl_WorkGroupID.x;
@@ -91,94 +149,52 @@ void main() {
 
     uint blocks_per_row = K / 256u;
 
-    for (uint r = 0u; r < NUM_ROWS; r++) {
-        uint row = wg_id_x * NUM_ROWS + r;
-        if (row >= M) break;
+    uint rows[NUM_ROWS];
+    float row_acc[NUM_ROWS];
+    [[unroll]] for (uint r = 0u; r < NUM_ROWS; r++) {
+        rows[r] = wg_id_x * NUM_ROWS + r;
+        row_acc[r] = 0.0;
+    }
 
-        float row_acc = 0.0;
+    for (uint e = 0u; e < n_used; e++) {
+        uint expert_id = routing_data[e];
+        float w = uintBitsToFloat(routing_data[n_used + e]);
 
-        for (uint e = 0u; e < n_used; e++) {
-            uint expert_id = routing_data[e];
-            float w = uintBitsToFloat(routing_data[n_used + e]);
+        uint a_offset_bytes = expert_id * expert_stride;
+        uint a_base_u32 = a_offset_bytes / 4u;
+        uint x_global_base_v4 = (x_offset / 16u) + (e * x_expert_stride) / 4u;
 
-            uint a_offset_bytes = expert_id * expert_stride;
-            uint a_base_u32 = a_offset_bytes / 4u;
-            uint x_global_base_v4 = (x_offset / 16u) + (e * x_expert_stride) / 4u;
-
-            uint row_u32 = a_base_u32 + row * blocks_per_row * Q5K_BLOCK_U32;
-            float sum = 0.0;
-
-            for (uint i = ix; i < blocks_per_row; i += it_size) {
-                uint blk_u32 = row_u32 + i * Q5K_BLOCK_U32;
-
-                uint d_dmin = a_u32[blk_u32];
-                float d_val = unpackHalf2x16(d_dmin & 0xFFFFu).x;
-                float dmin_val = unpackHalf2x16(d_dmin >> 16).x;
-
-                uint sc0 = a_u32[blk_u32 + 1u];
-                uint sc1 = a_u32[blk_u32 + 2u];
-                uint sc2 = a_u32[blk_u32 + 3u];
-
-                uint qh_u32 = a_u32[blk_u32 + 4u + l0 / 4u];
-
-                uint qs_u32_0 = a_u32[blk_u32 + 12u + q_offset_in_half / 4u];
-                uint qs_u32_1 = a_u32[blk_u32 + 12u + q_offset_in_half / 4u + 16u];
-
-                vec4 q0_lo = unpack_nibbles_lo(qs_u32_0);
-                vec4 q0_hi = unpack_nibbles_hi(qs_u32_0);
-                vec4 q1_lo = unpack_nibbles_lo(qs_u32_1);
-                vec4 q1_hi = unpack_nibbles_hi(qs_u32_1);
-
-                uint sb_a = 2u * v_im;
-                uint sb_b = 2u * v_im + 1u;
-                uint sb_c = 2u * v_im + 4u;
-                uint sb_d = 2u * v_im + 5u;
-
-                q0_lo += unpack_qh_bits(qh_u32, sb_a);
-                q0_hi += unpack_qh_bits(qh_u32, sb_b);
-                q1_lo += unpack_qh_bits(qh_u32, sb_c);
-                q1_hi += unpack_qh_bits(qh_u32, sb_d);
-
-                uint b_idx = (i * 256u + y_offset_local) / 4u;
-                vec4 by0 = x_v4[x_global_base_v4 + b_idx];
-                vec4 by1 = x_v4[x_global_base_v4 + b_idx + 8u];
-                uint b_idx2 = (i * 256u + y_offset_local + 128u) / 4u;
-                vec4 by2 = x_v4[x_global_base_v4 + b_idx2];
-                vec4 by3 = x_v4[x_global_base_v4 + b_idx2 + 8u];
-
-                // v_im-uniform decode: sb_a/sb_b always take lo (sb<4),
-                // sb_c/sb_d always take hi (sb>=4) for v_im ∈ {0,1}. Replaces
-                // the bytes[12] array + 4 if/else with straight shift+mask.
-                uint sc0_v = sc0 >> shift;
-                uint sc1_v = sc1 >> shift;
-                uint sc2_v = sc2 >> shift;
-
-                float sc_a = float(sc0_v & 0x3Fu);
-                float mn_a = float(sc1_v & 0x3Fu);
-                float sc_b = float((sc0_v >> 8u) & 0x3Fu);
-                float mn_b = float((sc1_v >> 8u) & 0x3Fu);
-                float sc_c = float((sc2_v & 0xFu) | ((sc0_v & 0xC0u) >> 2u));
-                float mn_c = float(((sc2_v & 0xF0u) >> 4u) | ((sc1_v & 0xC0u) >> 2u));
-                float sc_d = float(((sc2_v >> 8u) & 0xFu) | (((sc0_v >> 8u) & 0xC0u) >> 2u));
-                float mn_d = float((((sc2_v >> 8u) & 0xF0u) >> 4u) | (((sc1_v >> 8u) & 0xC0u) >> 2u));
-
-                float factor0 = d_val * sc_a; float bias0 = dmin_val * mn_a;
-                float factor1 = d_val * sc_b; float bias1 = dmin_val * mn_b;
-                float factor2 = d_val * sc_c; float bias2 = dmin_val * mn_c;
-                float factor3 = d_val * sc_d; float bias3 = dmin_val * mn_d;
-
-                sum += dot(vec4(factor0) * q0_lo - vec4(bias0), by0);
-                sum += dot(vec4(factor1) * q0_hi - vec4(bias1), by1);
-                sum += dot(vec4(factor2) * q1_lo - vec4(bias2), by2);
-                sum += dot(vec4(factor3) * q1_hi - vec4(bias3), by3);
-            }
-
-            sum = subgroupAdd(sum);
-            row_acc += w * sum;
+        float sums[NUM_ROWS];
+        [[unroll]] for (uint r = 0u; r < NUM_ROWS; r++) {
+            sums[r] = 0.0;
         }
 
-        if (tid == 0u) {
-            y_data[(y_offset / 4u) + row] += row_acc;
+        for (uint i = ix; i < blocks_per_row; i += it_size) {
+            uint b_idx = (i * 256u + y_offset_local) / 4u;
+            vec4 by0 = x_v4[x_global_base_v4 + b_idx];
+            vec4 by1 = x_v4[x_global_base_v4 + b_idx + 8u];
+            uint b_idx2 = (i * 256u + y_offset_local + 128u) / 4u;
+            vec4 by2 = x_v4[x_global_base_v4 + b_idx2];
+            vec4 by3 = x_v4[x_global_base_v4 + b_idx2 + 8u];
+
+            [[unroll]] for (uint r = 0u; r < NUM_ROWS; r++) {
+                if (rows[r] < M) {
+                    uint row_u32 = a_base_u32 + rows[r] * blocks_per_row * Q5K_BLOCK_U32;
+                    sums[r] += dot_q5k_block(row_u32, i, l0, q_offset_in_half, v_im, shift, by0, by1, by2, by3);
+                }
+            }
+        }
+
+        [[unroll]] for (uint r = 0u; r < NUM_ROWS; r++) {
+            row_acc[r] += w * subgroupAdd(sums[r]);
+        }
+    }
+
+    if (tid == 0u) {
+        [[unroll]] for (uint r = 0u; r < NUM_ROWS; r++) {
+            if (rows[r] < M) {
+                y_data[(y_offset / 4u) + rows[r]] += row_acc[r];
+            }
         }
     }
 }
