@@ -40,6 +40,8 @@ test("parseArgs reads suite options", () => {
     "/tmp/llama-cli",
     "--llama-server",
     "/tmp/llama-server",
+    "--phase",
+    "zinc",
     "--no-site-write",
   ]);
 
@@ -48,6 +50,7 @@ test("parseArgs reads suite options", () => {
   expect(args.warmupRuns).toBe(2);
   expect(args.llamaCli).toBe("/tmp/llama-cli");
   expect(args.llamaServer).toBe("/tmp/llama-server");
+  expect(args.phase).toBe("zinc");
   expect(args.writeSiteData).toBe(false);
   expect(args.models && [...args.models]).toEqual(["gemma4-12b-q4k-m", "qwen3-8b-q4k-m"]);
 });
@@ -159,6 +162,14 @@ test("benchmark suite measures all ZINC scenarios before starting baselines", ()
   ]);
   expect(phases.slice(0, 4).map((phase) => phase.scenarioDef.id)).toEqual(["core", "context-medium", "context-long", "decode-extended"]);
   expect(phases.slice(4).map((phase) => phase.scenarioDef.id)).toEqual(["core", "context-medium", "context-long", "decode-extended"]);
+});
+
+test("benchmark suite can split ZINC and baseline phases for clean reboot runs", () => {
+  const zincOnly = buildMeasurementPhases("qwen35-35b-a3b-q4k-xl", "raw", "The capital of France is", "zinc");
+  expect(zincOnly.map((phase) => phase.phase)).toEqual(["zinc", "zinc", "zinc", "zinc"]);
+
+  const baselineOnly = buildMeasurementPhases("qwen35-35b-a3b-q4k-xl", "raw", "The capital of France is", "baseline");
+  expect(baselineOnly.map((phase) => phase.phase)).toEqual(["baseline", "baseline", "baseline", "baseline"]);
 });
 
 test("parseDotEnv handles export lines and quotes", () => {
@@ -392,6 +403,63 @@ test("mergeArtifacts replaces an existing target to avoid stale model rows", () 
     zinc: { version: "zinc", commit: "zinc-commit" },
     llama_cpp: { binary: "llama-server", version: "42", commit: "xyz" },
   });
+});
+
+test("mergeArtifacts can preserve missing phase data for split benchmark runs", () => {
+  const merged = mergeArtifacts(
+    {
+      schema_version: 1,
+      generated_at: "old",
+      targets: [
+        {
+          id: "rdna",
+          label: "RDNA",
+          models: [
+            {
+              id: "qwen",
+              label: "Qwen",
+              zinc: { name: "ZINC", decode_tps: { median: 120, avg: 120 } },
+              baseline: null,
+              scenarios: [
+                {
+                  id: "core",
+                  label: "Core Prompt",
+                  zinc: { name: "ZINC", decode_tps: { median: 120, avg: 120 } },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    [
+      {
+        id: "rdna",
+        label: "RDNA",
+        models: [
+          {
+            id: "qwen",
+            label: "Qwen",
+            baseline: { name: "llama.cpp", decode_tps: { median: 100, avg: 100 } },
+            scenarios: [
+              {
+                id: "core",
+                label: "Core Prompt",
+                baseline: { name: "llama.cpp", decode_tps: { median: 100, avg: 100 } },
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    { preserveMissingPhases: true },
+  );
+
+  const model = merged.targets[0]?.models[0];
+  expect(model?.zinc?.decode_tps.median).toBe(120);
+  expect(model?.baseline?.decode_tps.median).toBe(100);
+  expect(model?.comparison?.pct_of_baseline).toBe(120);
+  expect(model?.scenarios[0]?.comparison?.pct_of_baseline).toBe(120);
 });
 
 test("buildArtifact writes only the incoming targets", () => {

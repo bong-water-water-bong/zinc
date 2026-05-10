@@ -93,6 +93,7 @@ export function parseArgs(argv) {
     writeSiteData: true,
     runs: 3,
     warmupRuns: 1,
+    phase: "all",
     timeoutMs: DEFAULT_TIMEOUT_MS,
     models: null,
     buildLocal: true,
@@ -136,6 +137,14 @@ export function parseArgs(argv) {
       case "--warmup":
         args.warmupRuns = parseInteger(argv[++i], "--warmup");
         break;
+      case "--phase": {
+        const value = argv[++i] ?? "";
+        if (!["all", "zinc", "baseline"].includes(value)) {
+          throw new Error(`Invalid --phase '${value}'. Expected all, zinc, or baseline.`);
+        }
+        args.phase = value;
+        break;
+      }
       case "--timeout-ms":
         args.timeoutMs = parseInteger(argv[++i], "--timeout-ms");
         break;
@@ -200,6 +209,7 @@ function usage() {
   --no-site-write             Do not update the site JSON artifact
   --runs <n>                  Measured runs per model (default: 3)
   --warmup <n>                Warmup runs per model (default: 1)
+  --phase <all|zinc|baseline> Measure both phases, only ZINC, or only llama.cpp (default: all)
   --timeout-ms <ms>           Per-command timeout (default: 900000)
   --models <ids>              Comma-separated model ids to benchmark
   --discover-models           Benchmark every discovered local model cache entry
@@ -378,8 +388,73 @@ export function buildComparison(zincSummary, baselineSummary) {
   };
 }
 
-export function mergeArtifacts(existing, incomingTargets) {
+function mergeScenarioForPartialRun(existingScenario, incomingScenario) {
+  if (!existingScenario) return incomingScenario;
+  if (!incomingScenario) return existingScenario;
+
+  const zinc = incomingScenario.zinc ?? existingScenario.zinc ?? null;
+  const baseline = incomingScenario.baseline ?? existingScenario.baseline ?? null;
+  return {
+    ...existingScenario,
+    ...incomingScenario,
+    zinc,
+    baseline,
+    comparison: buildComparison(zinc, baseline),
+  };
+}
+
+function mergeModelForPartialRun(existingModel, incomingModel) {
+  if (!existingModel) return incomingModel;
+  if (!incomingModel) return existingModel;
+
+  const scenarioIds = new Set([
+    ...(existingModel.scenarios ?? []).map((scenario) => scenario.id),
+    ...(incomingModel.scenarios ?? []).map((scenario) => scenario.id),
+  ]);
+  const existingScenarios = new Map((existingModel.scenarios ?? []).map((scenario) => [scenario.id, scenario]));
+  const incomingScenarios = new Map((incomingModel.scenarios ?? []).map((scenario) => [scenario.id, scenario]));
+  const scenarios = [...scenarioIds]
+    .map((id) => mergeScenarioForPartialRun(existingScenarios.get(id), incomingScenarios.get(id)))
+    .filter(Boolean);
+
+  const primary = scenarios.find((scenario) => scenario.id === "core") ?? scenarios[0];
+  const zinc = primary?.zinc ?? incomingModel.zinc ?? existingModel.zinc ?? null;
+  const baseline = primary?.baseline ?? incomingModel.baseline ?? existingModel.baseline ?? null;
+
+  return {
+    ...existingModel,
+    ...incomingModel,
+    zinc,
+    baseline,
+    comparison: buildComparison(zinc, baseline),
+    scenarios,
+  };
+}
+
+function mergeTargetForPartialRun(existingTarget, incomingTarget) {
+  if (!existingTarget) return incomingTarget;
+  if (!incomingTarget) return existingTarget;
+
+  const modelIds = new Set([
+    ...(existingTarget.models ?? []).map((model) => model.id),
+    ...(incomingTarget.models ?? []).map((model) => model.id),
+  ]);
+  const existingModels = new Map((existingTarget.models ?? []).map((model) => [model.id, model]));
+  const incomingModels = new Map((incomingTarget.models ?? []).map((model) => [model.id, model]));
+  const models = [...modelIds]
+    .map((id) => mergeModelForPartialRun(existingModels.get(id), incomingModels.get(id)))
+    .filter(Boolean);
+
+  return {
+    ...existingTarget,
+    ...incomingTarget,
+    models,
+  };
+}
+
+export function mergeArtifacts(existing, incomingTargets, options = {}) {
   const byId = new Map();
+  const preserveMissingPhases = options.preserveMissingPhases ?? false;
   const normalizeTarget = (target) => {
     const models = [...(target?.models ?? [])].sort((a, b) => a.label.localeCompare(b.label));
     return {
@@ -393,7 +468,14 @@ export function mergeArtifacts(existing, incomingTargets) {
     byId.set(target.id, normalizeTarget(target));
   }
   for (const target of incomingTargets) {
-    byId.set(target.id, normalizeTarget(target));
+    const normalizedIncoming = normalizeTarget(target);
+    const previous = byId.get(target.id);
+    byId.set(
+      target.id,
+      normalizeTarget(preserveMissingPhases && previous
+        ? mergeTargetForPartialRun(previous, normalizedIncoming)
+        : normalizedIncoming),
+    );
   }
   const targets = [...byId.values()].sort((a, b) => {
     const ia = TARGET_ORDER.indexOf(a.id);
@@ -1364,12 +1446,17 @@ export function defaultScenarioDefsForModel(modelId, promptMode, basePrompt) {
   ];
 }
 
-export function buildMeasurementPhases(modelId, promptMode, basePrompt) {
+function phaseEnabled(requestedPhase, phase) {
+  return requestedPhase === "all" || requestedPhase === phase;
+}
+
+export function buildMeasurementPhases(modelId, promptMode, basePrompt, requestedPhase = "all") {
   const scenarios = defaultScenarioDefsForModel(modelId, promptMode, basePrompt);
-  return [
+  const phases = [
     ...scenarios.map((scenarioDef) => ({ phase: "zinc", scenarioDef })),
     ...scenarios.map((scenarioDef) => ({ phase: "baseline", scenarioDef })),
   ];
+  return phases.filter((phase) => phaseEnabled(requestedPhase, phase.phase));
 }
 
 async function discoverMetalCases(modelRoot) {
@@ -1594,8 +1681,8 @@ async function runMetalTarget(args) {
 
   for (const entry of filtered) {
     console.log(`[metal] ${entry.id}`);
-    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt);
-    const scenarioDefs = phases.filter((phase) => phase.phase === "zinc").map((phase) => phase.scenarioDef);
+    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase);
+    const scenarioDefs = defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt);
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
     let launchedServer = null;
@@ -1693,17 +1780,19 @@ async function runMetalTarget(args) {
       }
     }
 
+    const includeZinc = phaseEnabled(args.phase, "zinc");
+    const includeBaseline = phaseEnabled(args.phase, "baseline");
     const scenarios = scenarioDefs.map((scenarioDef) => scenarioResultPayload(
       entry,
       scenarioDef,
-      zincByScenario.get(scenarioDef.id) ?? {
+      zincByScenario.get(scenarioDef.id) ?? (includeZinc ? {
         name: "ZINC",
         unavailable_reason: "No ZINC benchmark result was recorded for this scenario.",
-      },
-      baselineByScenario.get(scenarioDef.id) ?? {
+      } : undefined),
+      baselineByScenario.get(scenarioDef.id) ?? (includeBaseline ? {
         name: "llama.cpp",
         unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
-      },
+      } : undefined),
     ));
     models.push(primaryScenarioSummary(entry, scenarios));
   }
@@ -1778,8 +1867,8 @@ async function runRdnaTarget(args) {
 
   for (const entry of cases) {
     console.log(`[rdna] ${entry.id}`);
-    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt);
-    const scenarioDefs = phases.filter((phase) => phase.phase === "zinc").map((phase) => phase.scenarioDef);
+    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase);
+    const scenarioDefs = defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt);
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
     let launchedServer = null;
@@ -1881,17 +1970,19 @@ async function runRdnaTarget(args) {
       }
     }
 
+    const includeZinc = phaseEnabled(args.phase, "zinc");
+    const includeBaseline = phaseEnabled(args.phase, "baseline");
     const scenarios = scenarioDefs.map((scenarioDef) => scenarioResultPayload(
       entry,
       scenarioDef,
-      zincByScenario.get(scenarioDef.id) ?? {
+      zincByScenario.get(scenarioDef.id) ?? (includeZinc ? {
         name: "ZINC",
         unavailable_reason: "No ZINC benchmark result was recorded for this scenario.",
-      },
-      baselineByScenario.get(scenarioDef.id) ?? {
+      } : undefined),
+      baselineByScenario.get(scenarioDef.id) ?? (includeBaseline ? {
         name: "llama.cpp",
         unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
-      },
+      } : undefined),
     ));
     models.push(primaryScenarioSummary(entry, scenarios));
   }
@@ -1965,7 +2056,9 @@ async function main() {
   await writeJson(args.output, outputArtifact);
   if (args.writeSiteData) {
     const existing = await loadExistingArtifact(args.siteData);
-    const merged = mergeArtifacts(existing, incoming);
+    const merged = mergeArtifacts(existing, incoming, {
+      preserveMissingPhases: args.phase !== "all",
+    });
     await writeJson(args.siteData, merged);
   }
 
