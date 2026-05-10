@@ -19,7 +19,7 @@ This eliminates the multi-second wait before first token for long prompts.
 
 ### Model-specific details (Qwen3.6-35B-A3B)
 
-Per-token weight reads: ~1.28 GB (see RDNA4_PERFORMANCE_PLAN.md).
+Historical per-token weight-read estimate: ~1.28 GB.
 Bytes breakdown:
 - SSM projections (qkv+gate+alpha+beta+out, 30 layers, Q8_0): 420 MB
 - Shared expert (gate+up+down, 40 layers, Q8_0): 240 MB

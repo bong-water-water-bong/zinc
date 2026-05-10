@@ -165,15 +165,12 @@ docs/                            # Technical documentation (published to site)
 ├── APPLE_METAL_REFERENCE.md     # Metal/MSL kernel reference
 ├── APPLE_SILICON_METAL_ENABLEMENT.md # Metal port implementation notes
 ├── APPLE_SILICON_REFERENCE.md   # Apple Silicon M1–M5 reference
-├── DECODE_THROUGHPUT_PLAN.md    # Decode-performance planning notes
 ├── DEVELOPMENT.md               # Development guide (canonical dev reference)
 ├── GETTING_STARTED.md           # First run guide
 ├── GPU_REFERENCE.md             # RDNA3/RDNA4 hardware reference
 ├── HARDWARE_REQUIREMENTS.md     # GPU and host sizing guidance
 ├── METAL_PERFORMANCE_PLAN.md    # Metal performance work plan
-├── PERFORMANCE_GAP_ANALYSIS.md  # ZINC vs llama.cpp gap analysis
 ├── RDNA4_PERFORMANCE_JOURNEY.md # RDNA4 optimization log
-├── RDNA4_PERFORMANCE_PLAN.md    # RDNA4 performance work plan
 ├── RDNA4_TUNING.md              # RDNA4-specific optimizations
 ├── ROADMAP.md                   # Project roadmap
 ├── RUNNING_ZINC.md              # CLI usage and server mode

@@ -1263,6 +1263,7 @@ pub const InferenceEngine = struct {
     partial_decode_hidden_out: ?vk.c.VkBuffer = null,
     partial_decode_hidden_out_offset: vk.c.VkDeviceSize = 0,
     partial_decode_advance_position: bool = true,
+    partial_decode_allow_final_tail: bool = false,
 
     // Scratch buffers for the Vulkan/RDNA batched prefill path (lazy-init,
     // reused across prefill calls). Sized to hold all N prompt tokens at
