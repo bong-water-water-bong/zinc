@@ -36,18 +36,44 @@ pub const LoadedTensor = struct {
     gpu_buffer: Buffer,
 };
 
-/// Return true if this GGUF tensor name designates a fused MoE expert weight tensor
-/// that should be allocated in host-visible (system RAM) memory rather than VRAM.
+/// Return true if this GGUF tensor name designates a fused MoE expert weight tensor.
 /// Matches the four suffixes emitted by GGUF for sparse-MoE architectures:
 /// `ffn_gate_exps.weight`, `ffn_up_exps.weight`, `ffn_down_exps.weight`, and
 /// `ffn_down_exps_scale.weight` (Q4_K_M variants only).
 /// Dense tensors and non-expert MoE tensors (router gate, attention, embeddings, etc.)
-/// stay device-local.
-pub fn shouldOffloadToHost(name: []const u8) bool {
+/// are not matched.
+pub fn isMoEExpertTensor(name: []const u8) bool {
     return std.mem.endsWith(u8, name, "ffn_gate_exps.weight") or
         std.mem.endsWith(u8, name, "ffn_up_exps.weight") or
         std.mem.endsWith(u8, name, "ffn_down_exps.weight") or
         std.mem.endsWith(u8, name, "ffn_down_exps_scale.weight");
+}
+
+/// Cached three-state probe of `ZINC_OFFLOAD_MOE_EXPERTS`. Negative = uncached;
+/// 0 = disabled; 1 = enabled. Avoids syscalling per-tensor in `tensorBytes`.
+var offload_state: std.atomic.Value(i8) = .init(-1);
+
+/// Return true if MoE expert tensors should be allocated in host-visible (system RAM)
+/// memory rather than VRAM. Gated by `ZINC_OFFLOAD_MOE_EXPERTS=1` (experimental).
+/// Default off — preserves the existing all-VRAM behavior for users who fit.
+pub fn offloadEnabled() bool {
+    const cached = offload_state.load(.acquire);
+    if (cached >= 0) return cached == 1;
+
+    const enabled = blk: {
+        const val = std.process.getEnvVarOwned(std.heap.page_allocator, "ZINC_OFFLOAD_MOE_EXPERTS") catch break :blk false;
+        defer std.heap.page_allocator.free(val);
+        break :blk std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+    };
+    offload_state.store(if (enabled) 1 else 0, .release);
+    if (enabled) log.info("ZINC_OFFLOAD_MOE_EXPERTS=1: MoE expert tensors will be allocated in host-visible memory", .{});
+    return enabled;
+}
+
+/// Return true if this tensor should be routed to host-visible memory.
+/// Combines the MoE-expert classifier with the env-var gate.
+pub fn shouldOffloadToHost(name: []const u8) bool {
+    return offloadEnabled() and isMoEExpertTensor(name);
 }
 
 /// Runtime model state backed by a memory-mapped GGUF file and uploaded tensor buffers.
@@ -512,11 +538,18 @@ pub fn load(
         });
     }
 
-    log.info("Loaded {d} tensors | {d} MB device-local VRAM | {d} MB host-visible (system RAM)", .{
-        loaded_tensors.items.len,
-        total_vram / (1024 * 1024),
-        total_host_visible / (1024 * 1024),
-    });
+    if (total_host_visible > 0) {
+        log.info("Loaded {d} tensors | {d} MB device-local VRAM | {d} MB host-visible (system RAM)", .{
+            loaded_tensors.items.len,
+            total_vram / (1024 * 1024),
+            total_host_visible / (1024 * 1024),
+        });
+    } else {
+        log.info("Loaded {d} tensors | {d} MB VRAM", .{
+            loaded_tensors.items.len,
+            total_vram / (1024 * 1024),
+        });
+    }
 
     return Model{
         .config = config,
@@ -536,25 +569,33 @@ test "parseArchitecture" {
     try std.testing.expectEqual(Architecture.unknown, parseArchitecture("gpt2"));
 }
 
-test "shouldOffloadToHost matches MoE expert tensor suffixes" {
-    // Fused per-layer MoE expert tensors — should offload.
-    try std.testing.expect(shouldOffloadToHost("blk.0.ffn_gate_exps.weight"));
-    try std.testing.expect(shouldOffloadToHost("blk.47.ffn_up_exps.weight"));
-    try std.testing.expect(shouldOffloadToHost("blk.7.ffn_down_exps.weight"));
+test "isMoEExpertTensor matches MoE expert tensor suffixes" {
+    // Fused per-layer MoE expert tensors.
+    try std.testing.expect(isMoEExpertTensor("blk.0.ffn_gate_exps.weight"));
+    try std.testing.expect(isMoEExpertTensor("blk.47.ffn_up_exps.weight"));
+    try std.testing.expect(isMoEExpertTensor("blk.7.ffn_down_exps.weight"));
     // Q4_K_M variants emit a separate per-row scale tensor.
-    try std.testing.expect(shouldOffloadToHost("blk.3.ffn_down_exps_scale.weight"));
+    try std.testing.expect(isMoEExpertTensor("blk.3.ffn_down_exps_scale.weight"));
 
     // Non-expert tensors — must stay device-local.
-    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_q.weight"));
-    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_k.weight"));
-    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_v.weight"));
-    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_output.weight"));
-    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_gate.weight"));
-    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_up.weight"));
-    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_down.weight"));
-    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_gate_inp.weight"));
-    try std.testing.expect(!shouldOffloadToHost("output.weight"));
-    try std.testing.expect(!shouldOffloadToHost("token_embd.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.attn_q.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.attn_k.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.attn_v.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.attn_output.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.ffn_gate.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.ffn_up.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.ffn_down.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.ffn_gate_inp.weight"));
+    try std.testing.expect(!isMoEExpertTensor("output.weight"));
+    try std.testing.expect(!isMoEExpertTensor("token_embd.weight"));
+}
+
+test "shouldOffloadToHost defaults to false when env var unset" {
+    // Without ZINC_OFFLOAD_MOE_EXPERTS=1, even MoE expert tensors stay on device.
+    // This guards against silent perf regression on GPUs with abundant VRAM.
+    // We rely on test runs not setting the env var (CI doesn't, dev shells don't).
+    if (std.process.hasEnvVar(std.testing.allocator, "ZINC_OFFLOAD_MOE_EXPERTS") catch false) return;
+    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_gate_exps.weight"));
 }
 
 test "extractConfig defaults gemma4 attention scale to 1.0" {
