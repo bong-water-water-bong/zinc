@@ -452,11 +452,32 @@ function mergeTargetForPartialRun(existingTarget, incomingTarget) {
   };
 }
 
+export function normalizedModelName(model) {
+  return (model?.label ?? model?.id ?? "")
+    .toLowerCase()
+    .replace(/^openai\s+/, "")
+    .replace(/\bgpt[-_\s]*oss\b/g, "gpt oss")
+    .replace(/\bgemma4\b/g, "gemma 4")
+    .replace(/\bqwen36\b/g, "qwen 3.6")
+    .replace(/\bqwen3\b/g, "qwen 3")
+    .replace(/q4_k/g, "q4k")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function compareModelsByName(a, b) {
+  return normalizedModelName(a).localeCompare(normalizedModelName(b), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
 export function mergeArtifacts(existing, incomingTargets, options = {}) {
   const byId = new Map();
   const preserveMissingPhases = options.preserveMissingPhases ?? false;
   const normalizeTarget = (target) => {
-    const models = [...(target?.models ?? [])].sort((a, b) => a.label.localeCompare(b.label));
+    const models = [...(target?.models ?? [])].sort(compareModelsByName);
     return {
       ...target,
       models,

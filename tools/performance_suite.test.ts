@@ -5,6 +5,7 @@ import {
   buildComparison,
   buildMeasurementPhases,
   canonicalModelIdFromPath,
+  compareModelsByName,
   detectRdnaServerStartupFailure,
   DEFAULT_LOCAL_MODEL_ROOT,
   defaultMetalCases,
@@ -358,6 +359,24 @@ test("mergeArtifacts replaces matching targets and preserves others", () => {
   });
   expect(merged.targets[1].models).toEqual([]);
   expect(merged.targets[1].summary.fastest_model_id).toBeNull();
+});
+
+test("compareModelsByName normalizes published model label variants", () => {
+  const models = [
+    { id: "qwen36-35b-a3b-q4k-xl", label: "Qwen36 35B A3B Q4K XL" },
+    { id: "gpt-oss-20b-q4k-m", label: "OpenAI GPT-OSS 20B Q4_K_M" },
+    { id: "qwen3-8b-q4k-m", label: "Qwen3 8B Q4K M" },
+    { id: "gemma4-31b-q4k-m", label: "Gemma 4 31B Q4_K_M" },
+    { id: "gemma4-12b-q4k-m", label: "Gemma4 12B Q4_K_M" },
+  ];
+
+  expect(models.sort(compareModelsByName).map((model) => model.id)).toEqual([
+    "gemma4-12b-q4k-m",
+    "gemma4-31b-q4k-m",
+    "gpt-oss-20b-q4k-m",
+    "qwen3-8b-q4k-m",
+    "qwen36-35b-a3b-q4k-xl",
+  ]);
 });
 
 test("mergeArtifacts replaces an existing target to avoid stale model rows", () => {

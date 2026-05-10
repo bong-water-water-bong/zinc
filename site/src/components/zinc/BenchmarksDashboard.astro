@@ -337,27 +337,38 @@ function formatRuns(runs: number | null | undefined, warmupRuns: number | null |
   return `${runs ?? 0} measured · ${warmupRuns ?? 0} warmup`;
 }
 
-const familyOrder = ['gemma', 'gpt-oss', 'llama', 'qwen 3 ', 'qwen 3.5', 'qwen 3.6'];
-function familyRank(family: string | undefined) {
-  const f = (family ?? '').toLowerCase().trim();
-  for (let i = 0; i < familyOrder.length; i++) {
-    if (f.startsWith(familyOrder[i].trim())) return i;
-  }
-  return familyOrder.length;
+function displayModelLabel(modelOrLabel: any) {
+  const label = typeof modelOrLabel === 'string'
+    ? modelOrLabel
+    : (modelOrLabel?.label ?? modelOrLabel?.id ?? 'n/a');
+  return label
+    .replace(/^OpenAI\s+GPT-OSS\b/i, 'GPT-OSS')
+    .replace(/^GPT OSS\b/i, 'GPT-OSS')
+    .replace(/^Gemma4\b/i, 'Gemma 4')
+    .replace(/^Qwen36\b/i, 'Qwen 3.6')
+    .replace(/^Qwen3\b/i, 'Qwen 3')
+    .replace(/\bQ4_K_XL\b/g, 'Q4K XL')
+    .replace(/\bQ4_K_M\b/g, 'Q4K M');
 }
-function modelSizeBillions(id: string) {
-  const m = id.match(/(\d+)b/i);
-  return m ? Number(m[1]) : 0;
-}
-function modelOrderKey(model: any): [number, number, string] {
-  return [familyRank(model.family), modelSizeBillions(model.id ?? ''), model.id ?? ''];
+
+function normalizedModelName(model: any) {
+  return displayModelLabel(model)
+    .toLowerCase()
+    .replace(/^openai\s+/, '')
+    .replace(/\bgpt[-_\s]*oss\b/g, 'gpt oss')
+    .replace(/\bgemma4\b/g, 'gemma 4')
+    .replace(/\bqwen36\b/g, 'qwen 3.6')
+    .replace(/\bqwen3\b/g, 'qwen 3')
+    .replace(/q4_k/g, 'q4k')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 function compareModels(a: any, b: any) {
-  const ka = modelOrderKey(a);
-  const kb = modelOrderKey(b);
-  if (ka[0] !== kb[0]) return ka[0] - kb[0];
-  if (ka[1] !== kb[1]) return ka[1] - kb[1];
-  return ka[2].localeCompare(kb[2]);
+  return normalizedModelName(a).localeCompare(normalizedModelName(b), undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  });
 }
 
 function scenarioRows(target: any, scenarioId: string) {
@@ -556,7 +567,7 @@ const jsonLd = {
           <article class="summary-card">
             <span>Fastest</span>
             <strong>{formatMetric(target.summary?.fastest_decode_tps, 'tok/s')}</strong>
-            <small>{target.summary?.fastest_model_label ?? 'n/a'}</small>
+            <small>{displayModelLabel(target.summary?.fastest_model_label)}</small>
           </article>
           <article class="summary-card">
             <span>Decode</span>
@@ -602,7 +613,6 @@ const jsonLd = {
         {scenarioIds.map((scenarioId, scenarioIndex) => {
           const rows = scenarioRows(target, scenarioId);
           const summary = scenarioSummary(target, scenarioId);
-          const rankedRows = [...rows].sort((a, b) => (decodeValue(b.scenario) ?? -1) - (decodeValue(a.scenario) ?? -1));
           const promptMax = maxMetric(rows, (row) => Math.max(promptValue(row.scenario) ?? 0, baselinePromptValue(row.scenario) ?? 0));
           const decodeMax = maxMetric(rows, (row) => Math.max(decodeValue(row.scenario) ?? 0, baselineDecodeValue(row.scenario) ?? 0));
           const endToEndMax = maxMetric(rows, (row) => Math.max(endToEndValue(row.scenario) ?? 0, baselineEndToEndValue(row.scenario) ?? 0));
@@ -647,12 +657,12 @@ const jsonLd = {
                 </article>
                 <article class="readout-card">
                   <span>Fastest</span>
-                  <strong>{summary.fastestModelLabel ?? 'n/a'}</strong>
+                  <strong>{displayModelLabel(summary.fastestModelLabel)}</strong>
                   <small>{formatMetric(summary.fastestDecode, 'tok/s')}</small>
                 </article>
                 <article class="readout-card">
                   <span>Closest</span>
-                  <strong>{summary.closestModelLabel ?? 'n/a'}</strong>
+                  <strong>{displayModelLabel(summary.closestModelLabel)}</strong>
                   <small>{formatPercent(summary.closestRatio)}</small>
                 </article>
               </div>
@@ -660,7 +670,7 @@ const jsonLd = {
               <article class="board-card">
                 <header class="board-head">
                   <div>
-                    <h3>Decode</h3>
+                    <h3>Models</h3>
                   </div>
                   <div class="legend">
                     <span><i class="legend-swatch zinc"></i>ZINC</span>
@@ -668,8 +678,8 @@ const jsonLd = {
                   </div>
                 </header>
 
-                <div class="decode-rank" aria-label="Decode throughput ranking">
-                  {rankedRows.map((row, rank) => {
+                <div class="decode-rank" aria-label="Model decode comparison">
+                  {rows.map((row) => {
                     const zincDecode = decodeValue(row.scenario);
                     const baselineDecode = baselineDecodeValue(row.scenario);
                     const decodeRatio = decodeRatioValue(row.scenario);
@@ -678,9 +688,8 @@ const jsonLd = {
                     return (
                       <article class="rank-row">
                         <div class="rank-model">
-                          <span class="rank-chip">#{rank + 1}</span>
                           <div>
-                            <strong>{row.model.label}</strong>
+                            <strong>{displayModelLabel(row.model)}</strong>
                             <small>{formatNumber(promptTokensValue(row.scenario), 0)}p · {formatNumber(row.scenario.max_tokens, 0)}out · {rowStatus.label}</small>
                           </div>
                         </div>
@@ -714,7 +723,7 @@ const jsonLd = {
                     <strong>Details</strong>
                   </summary>
                   <div class="mobile-bench-list" aria-label="Detailed benchmark cards">
-                    {rankedRows.map((row) => {
+                    {rows.map((row) => {
                       const zincPrompt = promptValue(row.scenario);
                       const baselinePrompt = baselinePromptValue(row.scenario);
                       const zincDecode = decodeValue(row.scenario);
@@ -732,7 +741,7 @@ const jsonLd = {
                         <article class="mobile-model">
                           <header class="mobile-model-head">
                             <div>
-                              <strong>{row.model.label}</strong>
+                              <strong>{displayModelLabel(row.model)}</strong>
                               <small>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)}</small>
                             </div>
                             <span class:list={['status-pill', rowStatus.tone]}>{rowStatus.label}</span>
@@ -841,7 +850,7 @@ const jsonLd = {
                             <th scope="row" class="model-cell">
                               <div class="model-row">
                                 <div>
-                                  <strong>{row.model.label}</strong>
+                                  <strong>{displayModelLabel(row.model)}</strong>
                                   <small>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)} · {runCount || 0} runs</small>
                                 </div>
                               </div>
@@ -1525,8 +1534,7 @@ const jsonLd = {
 
   .rank-model {
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
-    gap: 0.58rem;
+    grid-template-columns: minmax(0, 1fr);
     align-items: start;
     min-width: 0;
   }
@@ -2782,10 +2790,6 @@ const jsonLd = {
       grid-template-columns: 1fr;
       gap: 0.48rem;
       padding: 0.74rem 0.68rem;
-    }
-
-    .rank-model {
-      grid-template-columns: auto 1fr auto;
     }
 
     .rank-model small {
