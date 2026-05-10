@@ -1,5 +1,5 @@
 ---
-title: "Why FP4 weights skip RDNA4 and what FP8 WMMA already does instead on local Qwen3"
+title: "The FP4 wave breaks at RDNA4 and FP8 WMMA already does what local Qwen3 needs"
 date: "2026-05-09"
 tags:
   - zinc
