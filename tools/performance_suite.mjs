@@ -1303,6 +1303,18 @@ export function defaultMetalCases(modelRoot) {
       max_tokens: defaultMaxTokensForModelId("qwen36-35b-a3b-q4k-xl"),
       notes: ["Managed-cache local Qwen 3.6 case on Apple Silicon"],
     },
+    {
+      id: "qwen36-27b-q4k-m",
+      model_id: "qwen36-27b-q4k-m",
+      label: "Qwen 3.6 27B Dense Q4_K_M",
+      family: "Qwen 3.6",
+      quant: "Q4_K_M",
+      model_path: modelPath(modelRoot, "qwen36-27b-q4k-m"),
+      prompt_mode: "raw",
+      prompt: defaultPromptForModelId("qwen36-27b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("qwen36-27b-q4k-m"),
+      notes: ["Dense hybrid Qwen 3.6 case on Apple Silicon"],
+    },
   ];
 }
 
@@ -1326,8 +1338,12 @@ export function canonicalModelIdFromPath(modelFile) {
     .replace(/^bartowski[_-]/, "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
+    .replace(/^qwen-qwen3-6-/, "qwen36-")
+    .replace(/^qwen-qwen-3-6-/, "qwen36-")
     .replace(/^qwen3-6-/, "qwen36-")
     .replace(/^qwen-3-6-/, "qwen36-")
+    .replace(/^qwen-qwen3-5-/, "qwen35-")
+    .replace(/^qwen-qwen-3-5-/, "qwen35-")
     .replace(/^qwen3-5-/, "qwen35-")
     .replace(/^qwen-3-5-/, "qwen35-")
     .replace(/^qwen-3-/, "qwen3-")
@@ -1513,6 +1529,17 @@ function defaultRdnaCases(modelRoot) {
       max_tokens: 128,
       notes: ["RDNA4 flagship comparison against llama.cpp server"],
     },
+    {
+      id: "qwen36-27b-q4k-m",
+      label: "Qwen 3.6 27B Dense Q4_K_M",
+      family: "Qwen 3.6",
+      quant: "Q4_K_M",
+      model_path: path.join(modelRoot, "Qwen3.6-27B-Q4_K_M.gguf"),
+      prompt_mode: "raw",
+      prompt: "The capital of France is",
+      max_tokens: 128,
+      notes: ["RDNA4 dense Qwen 3.6 comparison against llama.cpp server"],
+    },
   ];
 }
 
@@ -1544,6 +1571,15 @@ async function discoverRdnaCases(modelRoot, creds) {
         notes: ["Auto-discovered on the RDNA benchmark node"],
       };
     });
+}
+
+async function rdnaPathExists(modelFile, creds) {
+  try {
+    await runShell(rdnaRemoteCommand(`test -f ${shellQuote(modelFile)}`, creds), { cwd: ROOT, timeoutMs: 30000 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function prepareLocalBuild(args) {
@@ -1868,10 +1904,16 @@ async function runRdnaTarget(args) {
   for (const entry of [...discoveredCases, ...knownCases]) {
     mergedCases.set(entry.id, entry);
   }
-  const cases = [...mergedCases.values()].filter((entry) => {
-    if (args.models && !args.models.has(entry.id)) return false;
-    return shouldIncludeInPublishedBenchmarks(entry.id, args.models);
-  });
+  const cases = [];
+  for (const entry of mergedCases.values()) {
+    if (args.models && !args.models.has(entry.id)) continue;
+    if (!shouldIncludeInPublishedBenchmarks(entry.id, args.models)) continue;
+    if (!(await rdnaPathExists(entry.model_path, creds))) {
+      console.log(`[rdna] skipping ${entry.id}: missing GGUF at ${entry.model_path}`);
+      continue;
+    }
+    cases.push(entry);
+  }
   const models = [];
 
   for (const entry of cases) {

@@ -67,6 +67,29 @@ pub const entries = [_]CatalogEntry{
         },
     },
     .{
+        .id = "qwen36-27b-q4k-m",
+        .display_name = "Qwen3.6 27B Dense Q4_K_M",
+        .release_date = "2026-04-22",
+        .family = "qwen3.6",
+        .format = "gguf",
+        .quantization = "Q4_K_M",
+        .file_name = "Qwen3.6-27B-Q4_K_M.gguf",
+        .homepage_url = "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF",
+        .download_url = "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
+        .sha256 = "",
+        .size_bytes = 16_817_244_384,
+        .required_vram_bytes = 20 * 1024 * 1024 * 1024,
+        .default_context_length = 4096,
+        .recommended_for_chat = true,
+        .thinking_stable = true,
+        .status = .experimental,
+        .tested_profiles = &.{
+            "amd-rdna4-32gb",
+            apple_silicon_profile,
+            "intel-arc",
+        },
+    },
+    .{
         .id = "gpt-oss-20b-q4k-m",
         .display_name = "OpenAI GPT-OSS 20B Q4_K_M",
         .release_date = "2025-06-25",
@@ -322,6 +345,17 @@ test "find returns known qwen3.6 entry" {
     try std.testing.expect(entry.status == .supported);
 }
 
+test "find returns qwen3.6 27b dense entry" {
+    const entry = find("qwen36-27b-q4k-m") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Qwen3.6 27B Dense Q4_K_M", entry.display_name);
+    try std.testing.expectEqualStrings("2026-04-22", entry.release_date);
+    try std.testing.expectEqualStrings("qwen3.6", entry.family);
+    try std.testing.expectEqualStrings("Qwen3.6-27B-Q4_K_M.gguf", entry.file_name);
+    try std.testing.expect(entry.recommended_for_chat);
+    try std.testing.expect(entry.thinking_stable);
+    try std.testing.expect(entry.status == .experimental);
+}
+
 test "qwen3.6 family reuses qwen35 gguf architecture mapping" {
     try std.testing.expectEqualStrings("qwen35", ggufArchForFamily("qwen3.6") orelse return error.TestExpectedEqual);
 }
@@ -342,6 +376,15 @@ test "findForLoadedModel matches raw filename and loose display name" {
         "Qwen3.6 35B A3B UD Q4 K XL",
     ) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("qwen36-35b-a3b-q4k-xl", entry.id);
+}
+
+test "findForLoadedModel matches qwen36 27b dense filename" {
+    const entry = findForLoadedModel(
+        null,
+        "/root/models/Qwen3.6-27B-Q4_K_M.gguf",
+        "Qwen3.6 27B Q4 K M",
+    ) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("qwen36-27b-q4k-m", entry.id);
 }
 
 test "profileForGpu maps RDNA4 32 GB boards" {
@@ -390,4 +433,7 @@ test "qwen thinking stability flags track validated chat behavior" {
 
     const qwen36 = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
     try std.testing.expect(qwen36.thinking_stable);
+
+    const qwen36_dense = find("qwen36-27b-q4k-m") orelse return error.TestExpectedEqual;
+    try std.testing.expect(qwen36_dense.thinking_stable);
 }

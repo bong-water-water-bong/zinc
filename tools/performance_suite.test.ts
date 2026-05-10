@@ -88,12 +88,19 @@ test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
   const qwen36 = cases.find((entry) => entry.id === "qwen36-35b-a3b-q4k-xl");
   expect(qwen36?.model_id).toBe("qwen36-35b-a3b-q4k-xl");
   expect(qwen36?.model_path).toBe("/tmp/models/qwen36-35b-a3b-q4k-xl/model.gguf");
+
+  const qwen36Dense = cases.find((entry) => entry.id === "qwen36-27b-q4k-m");
+  expect(qwen36Dense?.model_id).toBe("qwen36-27b-q4k-m");
+  expect(qwen36Dense?.model_path).toBe("/tmp/models/qwen36-27b-q4k-m/model.gguf");
 });
 
 test("performance suite canonicalizes and labels Qwen 3.6 GGUFs", () => {
   expect(canonicalModelIdFromPath("/tmp/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")).toBe("qwen36-35b-a3b-q4k-xl");
+  expect(canonicalModelIdFromPath("/tmp/Qwen3.6-27B-Q4_K_M.gguf")).toBe("qwen36-27b-q4k-m");
+  expect(canonicalModelIdFromPath("/tmp/Qwen_Qwen3.6-27B-Q4_K_M.gguf")).toBe("qwen36-27b-q4k-m");
   expect(canonicalModelIdFromPath("/tmp/models/qwen36-35b-a3b-q4k-xl/model.gguf")).toBe("qwen36-35b-a3b-q4k-xl");
   expect(guessFamily("qwen36-35b-a3b-q4k-xl")).toBe("Qwen 3.6");
+  expect(guessFamily("qwen36-27b-q4k-m")).toBe("Qwen 3.6");
 });
 
 test("local ZINC command prefers managed model ids when using the default cache", () => {
@@ -364,6 +371,7 @@ test("mergeArtifacts replaces matching targets and preserves others", () => {
 test("compareModelsByName normalizes published model label variants", () => {
   const models = [
     { id: "qwen36-35b-a3b-q4k-xl", label: "Qwen36 35B A3B Q4K XL" },
+    { id: "qwen36-27b-q4k-m", label: "Qwen 3.6 27B Dense Q4_K_M" },
     { id: "gpt-oss-20b-q4k-m", label: "OpenAI GPT-OSS 20B Q4_K_M" },
     { id: "qwen3-8b-q4k-m", label: "Qwen3 8B Q4K M" },
     { id: "gemma4-31b-q4k-m", label: "Gemma 4 31B Q4_K_M" },
@@ -375,6 +383,7 @@ test("compareModelsByName normalizes published model label variants", () => {
     "gemma4-31b-q4k-m",
     "gpt-oss-20b-q4k-m",
     "qwen3-8b-q4k-m",
+    "qwen36-27b-q4k-m",
     "qwen36-35b-a3b-q4k-xl",
   ]);
 });
