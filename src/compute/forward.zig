@@ -894,10 +894,12 @@ pub const InferenceEngine = struct {
     //   partial O (n_heads * fa_split_k * head_dim floats)
     //   LSE (n_heads * fa_split_k * 2 floats), starting at byte offset
     //     n_heads * fa_split_k * head_dim * 4
-    // Allocated only when ZINC_FA_SPLIT_K is set; handle remains null otherwise.
+    // Allocated only when split-K pipelines are active; handle remains null otherwise.
     partial_attn_out_buf: Buffer = .{ .handle = null, .memory = null, .size = 0, .mapped = null, .device = null },
     // Number of i-axis chunks the split-K dispatch uses (1 = disabled, ≥2 = on).
     fa_split_k: u32 = 1,
+    // True when ZINC_FA_SPLIT_K explicitly requested the split-K path.
+    fa_split_k_forced: bool = false,
     o_proj_buf: Buffer, // output projection: hidden_dim f32
     ffn_norm_buf: Buffer, // FFN norm output: hidden_dim f32
     gate_buf: Buffer, // MoE expert gate output: intermediate_dim f32
@@ -2187,8 +2189,13 @@ pub const InferenceEngine = struct {
         // of pipelines (split, merge); we just mirror the active count here
         // and allocate the partial-output buffer when active.
         const fa_split_k = attention.fa_split_k_active;
+        const fa_split_k_forced = std.posix.getenv("ZINC_FA_SPLIT_K") != null;
         if (fa_split_k > 1) {
-            log.info("Flash-attn split-K ENABLED: N_I_CHUNKS={d} (default; set ZINC_FA_SPLIT_K=0 to disable)", .{fa_split_k});
+            if (fa_split_k_forced) {
+                log.info("Flash-attn split-K ENABLED: N_I_CHUNKS={d} via ZINC_FA_SPLIT_K", .{fa_split_k});
+            } else {
+                log.info("Flash-attn split-K ENABLED: N_I_CHUNKS={d} for seq_len>=128 (default; set ZINC_FA_SPLIT_K=0 to disable or =4 to force)", .{fa_split_k});
+            }
         }
         var partial_attn_out_buf = Buffer{ .handle = null, .memory = null, .size = 0, .mapped = null, .device = instance.device };
         if (fa_split_k > 1) {
@@ -2555,6 +2562,7 @@ pub const InferenceEngine = struct {
             .attn_out_buf = attn_out_buf,
             .partial_attn_out_buf = partial_attn_out_buf,
             .fa_split_k = fa_split_k,
+            .fa_split_k_forced = fa_split_k_forced,
             .o_proj_buf = o_proj_buf,
             .ffn_norm_buf = ffn_norm_buf,
             .gate_buf = gate_buf,
@@ -5193,7 +5201,10 @@ pub const InferenceEngine = struct {
                 // committing to a shader rewrite.
                 const flash_attn_kernel_phase = self.beginProfilePhase();
                 const use_batched = self.use_batch_attn and self.attention.pipeline_batched != null;
-                const use_split_k = !use_batched and self.fa_split_k > 1 and
+                const attn_seq_len = state.position + 1;
+                const split_k_min_seq_len: u32 = 128;
+                const split_k_seq_ok = self.fa_split_k_forced or attn_seq_len >= split_k_min_seq_len;
+                const use_split_k = !use_batched and split_k_seq_ok and self.fa_split_k > 1 and
                     self.attention.pipeline_split != null and
                     self.attention.pipeline_split_merge != null and
                     self.partial_attn_out_buf.handle != null;
@@ -5234,7 +5245,7 @@ pub const InferenceEngine = struct {
                             .head_dim = layer_head_dim,
                             .n_heads = config.n_heads,
                             .n_kv_heads = layer_n_kv_heads,
-                            .seq_len = state.position + 1,
+                            .seq_len = attn_seq_len,
                             .page_size = kv_page_size_tokens,
                             .attn_scale_bits = if (config.attn_scale != 0) @as(u32, @bitCast(config.attn_scale)) else 0,
                             .sink_offset = sink_offset,
@@ -5275,7 +5286,7 @@ pub const InferenceEngine = struct {
                             sink_buf.handle,
                             sink_buf.size,
                         );
-                        try self.attention.recordFlashAttnSplit(&self.decode_cmd, split_ds, layer_head_dim, config.n_heads, layer_n_kv_heads, state.position + 1, kv_page_size_tokens, config.attn_scale, sink_offset);
+                        try self.attention.recordFlashAttnSplit(&self.decode_cmd, split_ds, layer_head_dim, config.n_heads, layer_n_kv_heads, attn_seq_len, kv_page_size_tokens, config.attn_scale, sink_offset);
                     }
                     self.decode_cmd.computeBarrier();
                     if (!fused_oproj_merge_active) {
@@ -5414,7 +5425,7 @@ pub const InferenceEngine = struct {
                             sink_buf.handle,
                             sink_buf.size,
                         );
-                        try self.attention.recordFlashAttn(&self.decode_cmd, attn_ds, layer_head_dim, config.n_heads, layer_n_kv_heads, state.position + 1, kv_page_size_tokens, config.attn_scale, sink_offset);
+                        try self.attention.recordFlashAttn(&self.decode_cmd, attn_ds, layer_head_dim, config.n_heads, layer_n_kv_heads, attn_seq_len, kv_page_size_tokens, config.attn_scale, sink_offset);
                     }
                 }
                 self.decode_cmd.computeBarrier();
