@@ -59,7 +59,7 @@
               speaks the OpenAI-compatible HTTP API and supports GGUF models
               (Qwen3, Gemma3, GPT-OSS MoE, and more).
             '';
-            homepage = "https://github.com/ziglang/zinc";
+            homepage = "https://github.com/zolotukhin/zinc";
             license = licenses.mit;
             maintainers = [];
             platforms = platforms.linux ++ platforms.darwin;
