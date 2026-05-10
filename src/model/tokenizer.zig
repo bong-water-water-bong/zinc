@@ -852,6 +852,9 @@ pub const Tokenizer = struct {
         tools: []const tool_format_mod.ToolDefinition = &.{},
         /// The format renderer to use for tool definitions and tool result messages.
         tool_format: ?tool_format_mod.ToolFormat = null,
+        /// Allocator used for transient tool-rendering scratch buffers. Required
+        /// when `tool_format` is set or `tools.len > 0`; ignored otherwise.
+        tool_render_allocator: ?std.mem.Allocator = null,
     };
 
     fn appendTrimmed(dst: []u8, pos: *usize, text: []const u8) !void {
@@ -910,6 +913,16 @@ pub const Tokenizer = struct {
         const n = @min(roles.len, contents.len);
         switch (template_kind) {
             .chatml => {
+                // Tool rendering uses a caller-supplied allocator for transient
+                // scratch buffers. When neither tools nor a tool_format are set
+                // (the common path), tool_alloc is never touched, so the field
+                // is permitted to be null in that case.
+                const needs_tool_alloc = options.tool_format != null or options.tools.len > 0;
+                const tool_alloc: std.mem.Allocator = if (needs_tool_alloc)
+                    options.tool_render_allocator orelse return error.MissingToolRenderAllocator
+                else
+                    undefined;
+
                 var tools_rendered = false;
                 var i: usize = 0;
                 while (i < n) : (i += 1) {
@@ -924,8 +937,8 @@ pub const Tokenizer = struct {
                         }
 
                         var trbuf: std.ArrayList(u8) = .{};
-                        defer trbuf.deinit(std.heap.page_allocator);
-                        try options.tool_format.?.renderToolResultMessage("", contents[i], &trbuf, std.heap.page_allocator);
+                        defer trbuf.deinit(tool_alloc);
+                        try options.tool_format.?.renderToolResultMessage("", contents[i], &trbuf, tool_alloc);
                         if (pos + trbuf.items.len > buf.len) return error.BufferTooSmall;
                         @memcpy(buf[pos .. pos + trbuf.items.len], trbuf.items);
                         pos += trbuf.items.len;
@@ -947,8 +960,8 @@ pub const Tokenizer = struct {
                         (std.mem.eql(u8, roles[i], "system") or std.mem.eql(u8, roles[i], "developer")))
                     {
                         var tool_buf: std.ArrayList(u8) = .{};
-                        defer tool_buf.deinit(std.heap.page_allocator);
-                        try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, std.heap.page_allocator);
+                        defer tool_buf.deinit(tool_alloc);
+                        try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, tool_alloc);
                         if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
                         @memcpy(buf[pos .. pos + tool_buf.items.len], tool_buf.items);
                         pos += tool_buf.items.len;
@@ -963,8 +976,8 @@ pub const Tokenizer = struct {
                     const open = std.fmt.bufPrint(buf[pos..], "<|im_start|>system", .{}) catch return error.BufferTooSmall;
                     pos += open.len;
                     var tool_buf: std.ArrayList(u8) = .{};
-                    defer tool_buf.deinit(std.heap.page_allocator);
-                    try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, std.heap.page_allocator);
+                    defer tool_buf.deinit(tool_alloc);
+                    try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, tool_alloc);
                     if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
                     @memcpy(buf[pos .. pos + tool_buf.items.len], tool_buf.items);
                     pos += tool_buf.items.len;
@@ -2031,6 +2044,7 @@ test "applyChatTemplateWithOptions chatml renders tool definitions in system mes
         .add_generation_prompt = false,
         .tools = &tools,
         .tool_format = tool_format_mod_t.chatmlToolFormat(),
+        .tool_render_allocator = std.testing.allocator,
     }, &buf);
 
     // System message should contain the tool definitions header.
@@ -2062,6 +2076,7 @@ test "applyChatTemplateWithOptions chatml renders tool result messages aggregate
     const result = try tok.applyChatTemplateWithOptions(&roles, &contents, .{
         .add_generation_prompt = false,
         .tool_format = tool_format_mod_t.chatmlToolFormat(),
+        .tool_render_allocator = std.testing.allocator,
     }, &buf);
 
     // Both tool results should appear inside a single <|im_start|>user turn.

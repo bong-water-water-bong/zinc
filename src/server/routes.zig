@@ -937,7 +937,7 @@ fn estimateChatPromptBytes(roles: []const []const u8, contents: []const []const 
     return total;
 }
 
-fn buildChatPrompt(tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, skip_thinking_template: bool, tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice, buf: []u8) ![]const u8 {
+fn buildChatPrompt(allocator: std.mem.Allocator, tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, skip_thinking_template: bool, tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice, buf: []u8) ![]const u8 {
     const tf = tool_format.forTemplate(tokenizer.detectTemplateKind());
     const tools_for_template = if (tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else tools;
     return tokenizer.applyChatTemplateWithOptions(roles, contents, .{
@@ -945,6 +945,7 @@ fn buildChatPrompt(tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []c
         .skip_thinking_template = skip_thinking_template,
         .tools = tools_for_template,
         .tool_format = tf,
+        .tool_render_allocator = allocator,
     }, buf);
 }
 
@@ -964,7 +965,7 @@ fn allocChatPrompt(
         const prompt_buf = try allocator.alloc(u8, capacity);
         errdefer allocator.free(prompt_buf);
 
-        const prompt = buildChatPrompt(tokenizer, roles, contents, enable_thinking, skip_thinking_template, tools, tool_choice, prompt_buf) catch |err| {
+        const prompt = buildChatPrompt(allocator, tokenizer, roles, contents, enable_thinking, skip_thinking_template, tools, tool_choice, prompt_buf) catch |err| {
             allocator.free(prompt_buf);
             if (err == error.BufferTooSmall) {
                 capacity *= 2;
@@ -3095,7 +3096,7 @@ test "buildChatPrompt uses tokenizer chat template helper" {
     const roles = [_][]const u8{"user"};
     const contents = [_][]const u8{"hello"};
     var buf: [512]u8 = undefined;
-    const prompt = try buildChatPrompt(&tok, &roles, &contents, null, false, &.{}, .auto, &buf);
+    const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, null, false, &.{}, .auto, &buf);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>system\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not output labels like 'Thinking Process:'") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>user\nhello<|im_end|>\n") != null);
@@ -3282,7 +3283,7 @@ test "buildChatPrompt uses qwen no-thinking generation suffix when template requ
     const roles = [_][]const u8{"user"};
     const contents = [_][]const u8{"hello"};
     var buf: [512]u8 = undefined;
-    const prompt = try buildChatPrompt(&tok, &roles, &contents, null, false, &.{}, .auto, &buf);
+    const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, null, false, &.{}, .auto, &buf);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>user\nhello<|im_end|>\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
 }
@@ -3303,7 +3304,7 @@ test "buildChatPrompt enables thinking when requested" {
     const roles = [_][]const u8{"user"};
     const contents = [_][]const u8{"hello"};
     var buf: [512]u8 = undefined;
-    const prompt = try buildChatPrompt(&tok, &roles, &contents, true, false, &.{}, .auto, &buf);
+    const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, true, false, &.{}, .auto, &buf);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>user\nhello<|im_end|>\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n<think>\n"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "</think>") == null);
@@ -3362,7 +3363,7 @@ test "buildChatPrompt succeeds for large Goose-style tool prompts" {
     const prompt_buf = try std.testing.allocator.alloc(u8, estimated);
     defer std.testing.allocator.free(prompt_buf);
 
-    const prompt = buildChatPrompt(&tok, &roles, &contents, null, false, &tools, .auto, prompt_buf) catch |err| {
+    const prompt = buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, null, false, &tools, .auto, prompt_buf) catch |err| {
         if (err == error.BufferTooSmall) {
             std.debug.print("estimated={d}\n", .{estimated});
         }
