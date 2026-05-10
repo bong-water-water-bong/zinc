@@ -20,20 +20,20 @@ const log = std.log.scoped(.routes);
 /// 0 = disabled; 1 = enabled. The check happens once per process, lazily.
 var tool_calling_state: std.atomic.Value(i8) = .init(-1);
 
-/// Return true if OpenAI-compatible tool calling is enabled. Default off
-/// (experimental). Set `ZINC_TOOL_CALLING=1` to opt in.
-/// When disabled, `tools` and `tool_calls` in chat completion requests are
-/// silently ignored, so the existing chat path runs identically to mainline.
+/// Return true if OpenAI-compatible tool calling is enabled. Default on.
+/// Set `ZINC_TOOL_CALLING=0` (or `false`) to opt out — useful as a kill
+/// switch for clients that misbehave when seeing the new `tool_calls`
+/// response shape, or for debugging.
 pub fn toolCallingEnabled() bool {
     const cached = tool_calling_state.load(.acquire);
     if (cached >= 0) return cached == 1;
     const enabled = blk: {
-        const val = std.process.getEnvVarOwned(std.heap.page_allocator, "ZINC_TOOL_CALLING") catch break :blk false;
+        const val = std.process.getEnvVarOwned(std.heap.page_allocator, "ZINC_TOOL_CALLING") catch break :blk true;
         defer std.heap.page_allocator.free(val);
-        break :blk std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        break :blk !std.mem.eql(u8, val, "0") and !std.mem.eql(u8, val, "false");
     };
     tool_calling_state.store(if (enabled) 1 else 0, .release);
-    if (enabled) log.info("ZINC_TOOL_CALLING=1: OpenAI-compatible tool calling enabled (experimental)", .{});
+    if (!enabled) log.info("ZINC_TOOL_CALLING=0: OpenAI-compatible tool calling disabled", .{});
     return enabled;
 }
 
