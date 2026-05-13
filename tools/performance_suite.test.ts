@@ -8,6 +8,7 @@ import {
   compareModelsByName,
   detectRdnaServerStartupFailure,
   DEFAULT_LOCAL_MODEL_ROOT,
+  defaultIntelCases,
   defaultMetalCases,
   defaultMaxTokensForModelId,
   defaultPromptForModelId,
@@ -22,6 +23,7 @@ import {
   parseOpenAiCompletionOutput,
   parseZincCliOutput,
   prefersChatPrompt,
+  intelZincCommand,
   rdnaZincCommand,
   resolveLocalLlamaServer,
   summarizeValues,
@@ -54,6 +56,33 @@ test("parseArgs reads suite options", () => {
   expect(args.phase).toBe("zinc");
   expect(args.writeSiteData).toBe(false);
   expect(args.models && [...args.models]).toEqual(["gemma4-12b-q4k-m", "qwen3-8b-q4k-m"]);
+});
+
+test("parseArgs reads Intel suite options", () => {
+  const args = parseArgs([
+    "--target",
+    "intel",
+    "--intel-sync",
+    "--intel-build",
+    "--intel-start-llama",
+    "--intel-model-root",
+    "/home/tempuser/.cache/zinc/models/models",
+    "--intel-workdir",
+    "/home/tempuser/zinc-intel-loop",
+    "--intel-xdg-cache-home",
+    "/home/tempuser/.cache",
+    "--intel-remote-libc-conf",
+    "/workspace/zinc/.build-support/libc.conf",
+  ]);
+
+  expect(args.target).toBe("intel");
+  expect(args.intelSync).toBe(true);
+  expect(args.intelBuild).toBe(true);
+  expect(args.intelStartLlama).toBe(true);
+  expect(args.intelModelRoot).toBe("/home/tempuser/.cache/zinc/models/models");
+  expect(args.intelWorkdir).toBe("/home/tempuser/zinc-intel-loop");
+  expect(args.intelXdgCacheHome).toBe("/home/tempuser/.cache");
+  expect(args.intelRemoteLibcConf).toBe("/workspace/zinc/.build-support/libc.conf");
 });
 
 test("parseArgs enables discovery mode", () => {
@@ -94,6 +123,14 @@ test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
   expect(qwen36Dense?.model_path).toBe("/tmp/models/qwen36-27b-q4k-m/model.gguf");
 });
 
+test("default Intel cases use the remote managed cache layout", () => {
+  const cases = defaultIntelCases("/remote/cache");
+  const qwen = cases.find((entry) => entry.id === "qwen3-8b-q4k-m");
+
+  expect(qwen?.model_path).toBe("/remote/cache/qwen3-8b-q4k-m/model.gguf");
+  expect(qwen?.prompt_mode).toBe("raw");
+});
+
 test("performance suite canonicalizes and labels Qwen 3.6 GGUFs", () => {
   expect(canonicalModelIdFromPath("/tmp/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")).toBe("qwen36-35b-a3b-q4k-xl");
   expect(canonicalModelIdFromPath("/tmp/Qwen3.6-27B-Q4_K_M.gguf")).toBe("qwen36-27b-q4k-m");
@@ -131,6 +168,26 @@ test("RDNA ZINC command preserves chat prompt mode", () => {
   expect(cmd).toContain("./zig-out/bin/zinc");
   expect(cmd).toContain("--chat");
   expect(cmd).toContain("--prompt");
+});
+
+test("Intel ZINC command does not inject RDNA-specific environment", () => {
+  const cmd = intelZincCommand({
+    model_path: "/home/tempuser/.cache/zinc/models/models/qwen3-8b-q4k-m/model.gguf",
+    prompt_mode: "raw",
+    prompt: "The capital of France is",
+    max_tokens: 8,
+  }, {
+    host: "intel.local",
+    user: "tempuser",
+    port: "8888",
+    workdir: "/home/tempuser/zinc",
+    env: {},
+  });
+
+  expect(cmd).toContain("tempuser@intel.local");
+  expect(cmd).toContain("./zig-out/bin/zinc");
+  expect(cmd).not.toContain("RADV_PERFTEST");
+  expect(cmd).not.toContain("--chat");
 });
 
 test("RDNA startup failure detection spots unsupported model architecture logs", () => {

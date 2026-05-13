@@ -2,7 +2,7 @@
 
 > **Experimental software**: ZINC is under active development. The CLI path is the best-supported way to start. Server mode, model coverage, and performance tuning are still moving quickly.
 
-ZINC is a local LLM inference engine for AMD GPUs and Apple Silicon. The fastest way to check if it works on your machine:
+ZINC is a local LLM inference engine for consumer GPUs and Apple Silicon. The fastest way to check if it works on your machine:
 
 1. Install Zig.
 2. Build the binary.
@@ -15,6 +15,7 @@ If that works, move on to the [hardware requirements](/zinc/docs/hardware-requir
 ZINC currently targets:
 
 - **Linux** with AMD RDNA3/RDNA4 GPUs through Vulkan 1.3
+- **Linux** with Intel Arc Xe2 / Battlemage GPUs through Vulkan 1.3 (experimental)
 - **macOS** with Apple Silicon (M1 through M5) through Metal
 - **GGUF models** (Q4_K, Q5_K, Q6_K, Q8_0, Q5_0, MXFP4, F16, F32 quantizations)
 

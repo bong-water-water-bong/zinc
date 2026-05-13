@@ -16,7 +16,7 @@ export const DEFAULT_LOCAL_MODEL_ROOT = path.join(os.homedir(), "Library", "Cach
 const DEFAULT_DOCKER_LLAMA_SERVER = path.join(os.homedir(), ".docker", "bin", "inference", "llama-server");
 const DEFAULT_RDNA_WORKDIR = "/root/zinc";
 const DEFAULT_RDNA_MODEL_ROOT = "/root/models";
-const TARGET_ORDER = ["rdna", "metal"];
+const TARGET_ORDER = ["rdna", "intel", "metal"];
 const MAX_CAPTURE_CHARS = 256_000;
 const PUBLIC_BENCHMARK_EXCLUDED_MODEL_IDS = new Set(["qwen35-35b-a3b-q4k-xl"]);
 
@@ -100,10 +100,17 @@ export function parseArgs(argv) {
     rdnaSync: false,
     rdnaBuild: false,
     rdnaStartLlama: false,
+    intelSync: false,
+    intelBuild: false,
+    intelStartLlama: false,
     metalPullMissing: false,
     localModelRoot: DEFAULT_LOCAL_MODEL_ROOT,
     rdnaModelRoot: DEFAULT_RDNA_MODEL_ROOT,
     rdnaWorkdir: DEFAULT_RDNA_WORKDIR,
+    intelModelRoot: null,
+    intelWorkdir: null,
+    intelXdgCacheHome: null,
+    intelRemoteLibcConf: null,
     localCacheDir: DEFAULT_LOCAL_CACHE,
     llamaCli: process.env.ZINC_LLAMA_CLI ?? null,
     llamaServer: process.env.ZINC_LLAMA_SERVER ?? null,
@@ -116,8 +123,8 @@ export function parseArgs(argv) {
     switch (arg) {
       case "--target": {
         const value = argv[++i] ?? "";
-        if (!["metal", "rdna", "both"].includes(value)) {
-          throw new Error(`Invalid --target '${value}'. Expected metal, rdna, or both.`);
+        if (!["metal", "rdna", "intel", "both", "all"].includes(value)) {
+          throw new Error(`Invalid --target '${value}'. Expected metal, rdna, intel, both, or all.`);
         }
         args.target = value;
         break;
@@ -173,6 +180,15 @@ export function parseArgs(argv) {
       case "--rdna-start-llama":
         args.rdnaStartLlama = true;
         break;
+      case "--intel-sync":
+        args.intelSync = true;
+        break;
+      case "--intel-build":
+        args.intelBuild = true;
+        break;
+      case "--intel-start-llama":
+        args.intelStartLlama = true;
+        break;
       case "--metal-pull-missing":
         args.metalPullMissing = true;
         break;
@@ -184,6 +200,18 @@ export function parseArgs(argv) {
         break;
       case "--rdna-workdir":
         args.rdnaWorkdir = argv[++i] ?? args.rdnaWorkdir;
+        break;
+      case "--intel-model-root":
+        args.intelModelRoot = argv[++i] ?? args.intelModelRoot;
+        break;
+      case "--intel-workdir":
+        args.intelWorkdir = argv[++i] ?? args.intelWorkdir;
+        break;
+      case "--intel-xdg-cache-home":
+        args.intelXdgCacheHome = argv[++i] ?? args.intelXdgCacheHome;
+        break;
+      case "--intel-remote-libc-conf":
+        args.intelRemoteLibcConf = argv[++i] ?? args.intelRemoteLibcConf;
         break;
       case "--local-cache-dir":
         args.localCacheDir = argv[++i] ?? args.localCacheDir;
@@ -203,7 +231,8 @@ export function parseArgs(argv) {
 
 function usage() {
   return `Usage: bun tools/performance_suite.mjs [options]
-  --target <metal|rdna|both>  Which benchmark target(s) to run
+  --target <metal|rdna|intel|both|all>
+                              Which benchmark target(s) to run; both means rdna+metal, all includes Intel
   --output <path>             JSON artifact output path
   --site-data <path>          Site JSON data path to update
   --no-site-write             Do not update the site JSON artifact
@@ -221,9 +250,17 @@ function usage() {
   --rdna-sync                 Rsync current repo to the RDNA node before running
   --rdna-build                Build ReleaseFast on the RDNA node before running
   --rdna-start-llama          Start llama-server on the RDNA node before baseline runs
+  --intel-sync                Rsync current repo to the Intel node before running
+  --intel-build               Build ReleaseFast on the Intel node before running
+  --intel-start-llama         Stop stale llama-server processes on the Intel node before baseline runs
   --local-model-root <path>   Override local GGUF cache root
   --rdna-model-root <path>    Override remote model root
   --rdna-workdir <path>       Override remote ZINC checkout path
+  --intel-model-root <path>   Override Intel remote model root
+  --intel-workdir <path>      Override Intel remote ZINC checkout path
+  --intel-xdg-cache-home <p>  Override Intel remote XDG cache home for managed models
+  --intel-remote-libc-conf <p>
+                              Copy an existing remote libc.conf into the Intel checkout before building
   --local-cache-dir <path>    Override local Zig cache directory
   -h, --help                  Show this help
 `;
@@ -642,6 +679,12 @@ function llamaBinaryEnv(binaryPath) {
   };
 }
 
+function remoteEnvPrefix(creds) {
+  const entries = Object.entries(creds.env ?? {});
+  if (!entries.length) return "";
+  return entries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ");
+}
+
 async function captureGitProvenance(cwd = ROOT, timeoutMs = 10_000) {
   try {
     const version = await runShell("git describe --tags --always --dirty --abbrev=12", { cwd, timeoutMs });
@@ -979,9 +1022,9 @@ async function stopRdnaLlamaServer(creds, port) {
   }
 }
 
-async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs) {
+async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targetId = "rdna", lockDpm = true) {
   const port = await pickOpenPort();
-  const logPath = `/tmp/zinc-rdna-llama-${port}.log`;
+  const logPath = `/tmp/zinc-${targetId}-llama-${port}.log`;
   // Force the discrete RDNA4 GPU's DPM state to "high" before launch.
   // Without this, an idle llama-server holds the GPU but doesn't pin
   // memclk to a high level — the DPM heuristic sees "barely active"
@@ -992,17 +1035,19 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs) {
   // reboot; locking DPM to high recovers ~92 tok/s (level 4 of 5).
   // Card discovery: the discrete GPU is whichever card1/card2 has
   // amdgpu driver + a 6-level pp_dpm_mclk; we just try both.
-  const dpmLockScript = [
-    "for c in /sys/class/drm/card*/device; do",
-    "  if [ -f \"$c/pp_dpm_mclk\" ] && grep -q amdgpu \"$c/uevent\" 2>/dev/null; then",
-    "    levels=$(wc -l < \"$c/pp_dpm_mclk\")",
-    "    if [ \"$levels\" -ge 5 ]; then",
-    "      echo high > \"$c/power_dpm_force_performance_level\" 2>/dev/null || true",
-    "    fi",
-    "  fi",
-    "done",
-  ].join(" ");
-  await runShell(rdnaRemoteCommand(dpmLockScript, creds), { cwd: ROOT, timeoutMs: 30000 }).catch(() => {});
+  if (lockDpm) {
+    const dpmLockScript = [
+      "for c in /sys/class/drm/card*/device; do",
+      "  if [ -f \"$c/pp_dpm_mclk\" ] && grep -q amdgpu \"$c/uevent\" 2>/dev/null; then",
+      "    levels=$(wc -l < \"$c/pp_dpm_mclk\")",
+      "    if [ \"$levels\" -ge 5 ]; then",
+      "      echo high > \"$c/power_dpm_force_performance_level\" 2>/dev/null || true",
+      "    fi",
+      "  fi",
+      "done",
+    ].join(" ");
+    await runShell(rdnaRemoteCommand(dpmLockScript, creds), { cwd: ROOT, timeoutMs: 30000 }).catch(() => {});
+  }
 
   const cmd = [
     serverPath,
@@ -1026,7 +1071,8 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs) {
   const launchScript = [
     "import os, subprocess",
     `cmd = ${JSON.stringify(cmd)}`,
-    `env = dict(os.environ, RADV_PERFTEST="coop_matrix")`,
+    "env = dict(os.environ)",
+    `env.update(${JSON.stringify(creds.env ?? {})})`,
     `log = open(${JSON.stringify(logPath)}, "ab", buffering=0)`,
     `subprocess.Popen(cmd, cwd=${JSON.stringify(creds.workdir)}, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)`,
     'print("started")',
@@ -1101,25 +1147,33 @@ async function runRdnaOpenAiSeries({ label, warmupRuns, runs, creds, port, caseD
   return measured;
 }
 
-function rdnaRemoteCommand(remoteCommand, creds) {
+function remoteCommand(commandText, creds) {
   const sshArgs = [];
   if (process.env.ZINC_SSH_STRICT === "no") {
     sshArgs.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
   }
-  sshArgs.push("-p", creds.port, `${creds.user}@${creds.host}`, shellQuote(remoteCommand));
+  sshArgs.push("-p", creds.port, `${creds.user}@${creds.host}`, shellQuote(commandText));
   return `ssh ${sshArgs.join(" ")}`;
 }
 
-function rdnaDetachedCommand(remoteCommand, creds) {
+function rdnaRemoteCommand(commandText, creds) {
+  return remoteCommand(commandText, creds);
+}
+
+function remoteDetachedCommand(commandText, creds) {
   const sshArgs = ["-f"];
   if (process.env.ZINC_SSH_STRICT === "no") {
     sshArgs.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
   }
-  sshArgs.push("-p", creds.port, `${creds.user}@${creds.host}`, shellQuote(remoteCommand));
+  sshArgs.push("-p", creds.port, `${creds.user}@${creds.host}`, shellQuote(commandText));
   return `ssh ${sshArgs.join(" ")}`;
 }
 
-function rdnaSshTransport(creds) {
+function rdnaDetachedCommand(commandText, creds) {
+  return remoteDetachedCommand(commandText, creds);
+}
+
+function remoteSshTransport(creds) {
   const parts = ["ssh"];
   if (process.env.ZINC_SSH_STRICT === "no") {
     parts.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
@@ -1128,25 +1182,43 @@ function rdnaSshTransport(creds) {
   return parts.join(" ");
 }
 
-export function rdnaZincCommand(caseDef, creds) {
+function rdnaSshTransport(creds) {
+  return remoteSshTransport(creds);
+}
+
+export function remoteZincCommand(caseDef, creds) {
   const parts = [
     `cd ${shellQuote(creds.workdir)}`,
     "&&",
-    "RADV_PERFTEST=coop_matrix",
+  ];
+  const envPrefix = remoteEnvPrefix(creds);
+  if (envPrefix) parts.push(envPrefix);
+  parts.push(
     "./zig-out/bin/zinc",
     "-n",
     String(caseDef.max_tokens),
     "-m",
     shellQuote(caseDef.model_path),
-  ];
+  );
   if (caseDef.prompt_mode === "chat") parts.push("--chat");
   parts.push("--prompt", shellQuote(caseDef.prompt));
-  return rdnaRemoteCommand(parts.join(" "), creds);
+  return remoteCommand(parts.join(" "), creds);
 }
 
-function rdnaLlamaCommand(caseDef, creds, llamaCliPath) {
+export function rdnaZincCommand(caseDef, creds) {
+  return remoteZincCommand(caseDef, { ...creds, env: { RADV_PERFTEST: "coop_matrix", ...(creds.env ?? {}) } });
+}
+
+export function intelZincCommand(caseDef, creds) {
+  return remoteZincCommand(caseDef, creds);
+}
+
+function remoteLlamaCommand(caseDef, creds, llamaCliPath) {
   const parts = [
-    "RADV_PERFTEST=coop_matrix",
+  ];
+  const envPrefix = remoteEnvPrefix(creds);
+  if (envPrefix) parts.push(envPrefix);
+  parts.push(
     shellQuote(llamaCliPath),
     "-m",
     shellQuote(caseDef.model_path),
@@ -1166,31 +1238,45 @@ function rdnaLlamaCommand(caseDef, creds, llamaCliPath) {
     "4096",
     "-ub",
     "1024",
-  ];
+  );
   if (caseDef.prompt_mode === "chat") parts.push("-cnv");
-  return rdnaRemoteCommand(parts.join(" "), creds);
+  return remoteCommand(parts.join(" "), creds);
+}
+
+function rdnaLlamaCommand(caseDef, creds, llamaCliPath) {
+  return remoteLlamaCommand(caseDef, { ...creds, env: { RADV_PERFTEST: "coop_matrix", ...(creds.env ?? {}) } }, llamaCliPath);
+}
+
+async function detectRemoteLlamaCliPath(creds, searchRoots, override = null) {
+  if (override) return override;
+  const quotedRoots = searchRoots.map((root) => shellQuote(root)).join(" ");
+  const command = rdnaRemoteCommand(
+    `which llama-cli || command -v llama-cli || find ${quotedRoots} -name llama-cli -type f 2>/dev/null | head -n 1`,
+    creds,
+  );
+  const result = await runShell(command, { cwd: ROOT, timeoutMs: 120000 });
+  const candidate = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  return candidate || null;
+}
+
+async function detectRemoteLlamaServerPath(creds, searchRoots, override = null) {
+  if (override) return override;
+  const quotedRoots = searchRoots.map((root) => shellQuote(root)).join(" ");
+  const command = rdnaRemoteCommand(
+    `which llama-server || command -v llama-server || find ${quotedRoots} -name llama-server -type f 2>/dev/null | head -n 1`,
+    creds,
+  );
+  const result = await runShell(command, { cwd: ROOT, timeoutMs: 120000 });
+  const candidate = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  return candidate || null;
 }
 
 async function detectRdnaLlamaCliPath(creds) {
-  if (process.env.ZINC_LLAMA_CLI_REMOTE) return process.env.ZINC_LLAMA_CLI_REMOTE;
-  const command = rdnaRemoteCommand(
-    "which llama-cli || command -v llama-cli || find /root/llama.cpp /root/workspace/llama.cpp -name llama-cli -type f 2>/dev/null | head -n 1",
-    creds,
-  );
-  const result = await runShell(command, { cwd: ROOT, timeoutMs: 120000 });
-  const candidate = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-  return candidate || null;
+  return detectRemoteLlamaCliPath(creds, ["/root/llama.cpp", "/root/workspace/llama.cpp"], process.env.ZINC_LLAMA_CLI_REMOTE ?? null);
 }
 
 async function detectRdnaLlamaServerPath(creds) {
-  if (process.env.ZINC_LLAMA_SERVER_REMOTE) return process.env.ZINC_LLAMA_SERVER_REMOTE;
-  const command = rdnaRemoteCommand(
-    "which llama-server || command -v llama-server || find /root/llama.cpp /root/workspace/llama.cpp -name llama-server -type f 2>/dev/null | head -n 1",
-    creds,
-  );
-  const result = await runShell(command, { cwd: ROOT, timeoutMs: 120000 });
-  const candidate = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-  return candidate || null;
+  return detectRemoteLlamaServerPath(creds, ["/root/llama.cpp", "/root/workspace/llama.cpp"], process.env.ZINC_LLAMA_SERVER_REMOTE ?? null);
 }
 
 async function runSeries({ label, warmupRuns, runs, command, parser, cwd, timeoutMs }) {
@@ -1543,7 +1629,23 @@ function defaultRdnaCases(modelRoot) {
   ];
 }
 
-async function discoverRdnaCases(modelRoot, creds) {
+export function defaultIntelCases(modelRoot) {
+  return [
+    {
+      id: "qwen3-8b-q4k-m",
+      label: "Qwen 3 8B Q4_K_M",
+      family: "Qwen 3",
+      quant: "Q4_K_M",
+      model_path: modelPath(modelRoot, "qwen3-8b-q4k-m"),
+      prompt_mode: "raw",
+      prompt: defaultPromptForModelId("qwen3-8b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("qwen3-8b-q4k-m"),
+      notes: ["Intel Arc Vulkan comparison against llama.cpp on the same host"],
+    },
+  ];
+}
+
+async function discoverRemoteCases(modelRoot, creds, note) {
   const command = rdnaRemoteCommand(`find ${shellQuote(modelRoot)} -maxdepth 2 \\( -name '*.gguf' -o -name 'model.gguf' \\) | sort`, creds);
   let result;
   try {
@@ -1568,9 +1670,17 @@ async function discoverRdnaCases(modelRoot, creds) {
         prompt_mode: chatPrompt ? "chat" : "raw",
         prompt: defaultPromptForModelId(id),
         max_tokens: defaultMaxTokensForModelId(id),
-        notes: ["Auto-discovered on the RDNA benchmark node"],
+        notes: [note],
       };
     });
+}
+
+async function discoverRdnaCases(modelRoot, creds) {
+  return discoverRemoteCases(modelRoot, creds, "Auto-discovered on the RDNA benchmark node");
+}
+
+async function discoverIntelCases(modelRoot, creds) {
+  return discoverRemoteCases(modelRoot, creds, "Auto-discovered on the Intel benchmark node");
 }
 
 async function rdnaPathExists(modelFile, creds) {
@@ -1637,6 +1747,45 @@ async function prepareRdna(args, creds) {
     console.log("Stopping pre-existing llama-server processes on RDNA node...");
     const remote = [
       "systemctl stop llama-server 2>/dev/null || true",
+      "pkill -9 -x llama-server 2>/dev/null || true",
+      "sleep 2",
+      "echo 'cleared'",
+    ].join(" && ");
+    await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60000 });
+  }
+}
+
+async function prepareIntel(args, creds, remoteLibcConf) {
+  if (args.intelSync) {
+    console.log("Syncing current repo to Intel node...");
+    const rsyncCmd = [
+      "rsync -az --delete",
+      "--exclude '.zig-cache'",
+      "--exclude 'zig-out'",
+      "--exclude 'node_modules'",
+      "--exclude '.DS_Store'",
+      "--exclude 'site'",
+      `-e ${shellQuote(remoteSshTransport(creds))}`,
+      `${shellQuote(`${ROOT}/`)}`,
+      `${creds.user}@${creds.host}:${shellQuote(`${creds.workdir}/`)}`,
+    ].join(" ");
+    await runShell(rsyncCmd, { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
+  }
+
+  if (remoteLibcConf) {
+    const remote = `cd ${shellQuote(creds.workdir)} && mkdir -p .build-support && cp ${shellQuote(remoteLibcConf)} .build-support/libc.conf`;
+    await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 120000 });
+  }
+
+  if (args.intelBuild) {
+    console.log("Building ReleaseFast on Intel node...");
+    const remote = `cd ${shellQuote(creds.workdir)} && zig build -Doptimize=ReleaseFast`;
+    await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
+  }
+
+  if (args.intelStartLlama) {
+    console.log("Stopping pre-existing llama-server processes on Intel node...");
+    const remote = [
       "pkill -9 -x llama-server 2>/dev/null || true",
       "sleep 2",
       "echo 'cleared'",
@@ -1873,11 +2022,23 @@ async function runMetalTarget(args) {
   };
 }
 
+function envValue(dotEnv, ...keys) {
+  for (const key of keys) {
+    const value = process.env[key] ?? dotEnv[key];
+    if (value != null && value !== "") return value;
+  }
+  return null;
+}
+
+function remoteHomeForUser(user) {
+  return user === "root" ? "/root" : `/home/${user}`;
+}
+
 async function buildRdnaCreds(args) {
   const dotEnv = await readDotEnv(path.join(ROOT, ".env"));
-  const host = process.env.ZINC_HOST ?? dotEnv.ZINC_HOST;
-  const user = process.env.ZINC_USER ?? dotEnv.ZINC_USER;
-  const port = process.env.ZINC_PORT ?? dotEnv.ZINC_PORT ?? "22";
+  const host = envValue(dotEnv, "ZINC_RDNA_HOST", "ZINC_HOST");
+  const user = envValue(dotEnv, "ZINC_RDNA_USER", "ZINC_USER");
+  const port = envValue(dotEnv, "ZINC_RDNA_PORT", "ZINC_PORT") ?? "22";
   if (!host || !user) {
     throw new Error("RDNA benchmarking needs ZINC_HOST and ZINC_USER in the environment or .env");
   }
@@ -1886,6 +2047,45 @@ async function buildRdnaCreds(args) {
     user,
     port,
     workdir: args.rdnaWorkdir,
+    env: { RADV_PERFTEST: "coop_matrix" },
+  };
+}
+
+async function buildIntelConfig(args) {
+  const dotEnv = await readDotEnv(path.join(ROOT, ".env"));
+  const host = envValue(dotEnv, "ZINC_INTEL_HOST");
+  const user = envValue(dotEnv, "ZINC_INTEL_USER") ?? "tempuser";
+  const port = envValue(dotEnv, "ZINC_INTEL_PORT") ?? "22";
+  if (!host || !user) {
+    throw new Error("Intel benchmarking needs ZINC_INTEL_HOST and ZINC_INTEL_USER in the environment or .env");
+  }
+  const remoteHome = envValue(dotEnv, "ZINC_INTEL_REMOTE_HOME") ?? remoteHomeForUser(user);
+  const xdgCacheHome = args.intelXdgCacheHome
+    ?? envValue(dotEnv, "ZINC_INTEL_XDG_CACHE_HOME", "ZINC_INTEL_REMOTE_XDG_CACHE_HOME")
+    ?? `${remoteHome}/.cache`;
+  const workdir = args.intelWorkdir ?? envValue(dotEnv, "ZINC_INTEL_WORKDIR", "ZINC_INTEL_REMOTE_DIR") ?? `${remoteHome}/zinc-gpu-loop`;
+  const modelRoot = args.intelModelRoot ?? envValue(dotEnv, "ZINC_INTEL_MODEL_ROOT") ?? `${xdgCacheHome}/zinc/models/models`;
+  const remoteLibcConf = args.intelRemoteLibcConf ?? envValue(dotEnv, "ZINC_INTEL_REMOTE_LIBC_CONF");
+  const llamaSearchRoots = [
+    `${remoteHome}/llama.cpp`,
+    "/workspace/llama.cpp",
+    "/workspace",
+  ];
+  return {
+    creds: {
+      host,
+      user,
+      port,
+      workdir,
+      env: {},
+    },
+    remoteHome,
+    xdgCacheHome,
+    modelRoot,
+    remoteLibcConf,
+    llamaCliOverride: envValue(dotEnv, "ZINC_INTEL_LLAMA_CLI_REMOTE"),
+    llamaServerOverride: envValue(dotEnv, "ZINC_INTEL_LLAMA_SERVER_REMOTE"),
+    llamaSearchRoots,
   };
 }
 
@@ -2076,6 +2276,194 @@ async function runRdnaTarget(args) {
   };
 }
 
+async function runIntelTarget(args) {
+  const config = await buildIntelConfig(args);
+  const creds = config.creds;
+  await prepareIntel(args, creds, config.remoteLibcConf);
+  const intelLlamaCli = await detectRemoteLlamaCliPath(creds, config.llamaSearchRoots, config.llamaCliOverride);
+  const intelLlamaServer = await detectRemoteLlamaServerPath(creds, config.llamaSearchRoots, config.llamaServerOverride);
+  const baselineBinary = intelLlamaServer || intelLlamaCli;
+  const zincProvenance = await captureRemoteGitProvenance(creds);
+  const llamaCppProvenance = await captureRemoteLlamaCppProvenance(baselineBinary, creds);
+
+  const knownCases = defaultIntelCases(config.modelRoot);
+  const discoveredCases = args.discoverModels ? await discoverIntelCases(config.modelRoot, creds) : [];
+  const mergedCases = new Map();
+  for (const entry of [...discoveredCases, ...knownCases]) {
+    mergedCases.set(entry.id, entry);
+  }
+  const cases = [];
+  for (const entry of mergedCases.values()) {
+    if (args.models && !args.models.has(entry.id)) continue;
+    if (!shouldIncludeInPublishedBenchmarks(entry.id, args.models)) continue;
+    if (!(await rdnaPathExists(entry.model_path, creds))) {
+      console.log(`[intel] skipping ${entry.id}: missing GGUF at ${entry.model_path}`);
+      continue;
+    }
+    cases.push(entry);
+  }
+  const models = [];
+
+  for (const entry of cases) {
+    console.log(`[intel] ${entry.id}`);
+    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase);
+    const scenarioDefs = defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt);
+    const zincByScenario = new Map();
+    const baselineByScenario = new Map();
+    let launchedServer = null;
+    let triedLaunchingServer = false;
+    let serverLaunchFailure = null;
+    try {
+      for (const phase of phases) {
+        const scenarioDef = phase.scenarioDef;
+        const caseDef = buildScenarioCase(entry, scenarioDef);
+        if (phase.phase === "zinc") {
+          let zinc = null;
+          try {
+            const zincRows = await runSeries({
+              label: `zinc ${entry.id} ${scenarioDef.id}`,
+              warmupRuns: args.warmupRuns,
+              runs: args.runs,
+              command: intelZincCommand(caseDef, creds),
+              parser: parseZincCliOutput,
+              cwd: ROOT,
+              timeoutMs: args.timeoutMs,
+            });
+            zinc = createStats("ZINC", zincRows);
+          } catch (error) {
+            zinc = {
+              name: "ZINC",
+              unavailable_reason: `ZINC run failed: ${error.message.split("\n")[0]}`,
+            };
+          }
+          zincByScenario.set(scenarioDef.id, zinc);
+          continue;
+        }
+
+        if (!triedLaunchingServer && intelLlamaServer) {
+          triedLaunchingServer = true;
+          try {
+            launchedServer = await launchRdnaLlamaServer(entry, creds, intelLlamaServer, args.timeoutMs, "intel", false);
+          } catch (error) {
+            launchedServer = null;
+            serverLaunchFailure = error;
+          }
+        }
+
+        let baseline = null;
+        if (entry.baseline_enabled !== false && launchedServer) {
+          try {
+            const baselineRows = await runRdnaOpenAiSeries({
+              label: `llama.cpp ${entry.id} ${scenarioDef.id}`,
+              warmupRuns: args.warmupRuns,
+              runs: args.runs,
+              creds,
+              port: launchedServer.port,
+              caseDef,
+              timeoutMs: args.timeoutMs,
+            });
+            baseline = createStats("llama.cpp", baselineRows);
+          } catch (error) {
+            baseline = {
+              name: "llama.cpp",
+              unavailable_reason: `Intel baseline failed: ${error.message.split("\n")[0]}`,
+            };
+          }
+        } else if (entry.baseline_enabled !== false && intelLlamaCli) {
+          try {
+            const baselineRows = await runSeries({
+              label: `llama.cpp ${entry.id} ${scenarioDef.id}`,
+              warmupRuns: args.warmupRuns,
+              runs: args.runs,
+              command: remoteLlamaCommand(caseDef, creds, intelLlamaCli),
+              parser: parseLlamaCliOutput,
+              cwd: ROOT,
+              timeoutMs: args.timeoutMs,
+            });
+            baseline = createStats("llama.cpp", baselineRows);
+          } catch (error) {
+            baseline = {
+              name: "llama.cpp",
+              unavailable_reason: `Intel baseline failed: ${error.message.split("\n")[0]}`,
+            };
+          }
+        } else if (entry.baseline_enabled !== false && serverLaunchFailure) {
+          baseline = {
+            name: "llama.cpp",
+            unavailable_reason: `Intel baseline failed: ${serverLaunchFailure.message.split("\n")[0]}`,
+          };
+        } else {
+          baseline = {
+            name: "llama.cpp",
+            unavailable_reason: intelLlamaServer || intelLlamaCli
+              ? "No Intel llama.cpp baseline is defined for this case yet."
+              : "Could not locate a remote llama.cpp baseline binary on the Intel node.",
+          };
+        }
+
+        baselineByScenario.set(scenarioDef.id, baseline);
+      }
+    } finally {
+      if (launchedServer) {
+        await stopRdnaLlamaServer(creds, launchedServer.port);
+      }
+    }
+
+    const includeZinc = phaseEnabled(args.phase, "zinc");
+    const includeBaseline = phaseEnabled(args.phase, "baseline");
+    const scenarios = scenarioDefs.map((scenarioDef) => scenarioResultPayload(
+      entry,
+      scenarioDef,
+      zincByScenario.get(scenarioDef.id) ?? (includeZinc ? {
+        name: "ZINC",
+        unavailable_reason: "No ZINC benchmark result was recorded for this scenario.",
+      } : undefined),
+      baselineByScenario.get(scenarioDef.id) ?? (includeBaseline ? {
+        name: "llama.cpp",
+        unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
+      } : undefined),
+    ));
+    models.push(primaryScenarioSummary(entry, scenarios));
+  }
+
+  return {
+    id: "intel",
+    label: "Intel Arc",
+    description: "Intel Arc benchmark node results collected over SSH and compared against llama.cpp on the same hardware.",
+    generated_at: new Date().toISOString(),
+    source: "tools/performance_suite.mjs",
+    machine: {
+      label: "Intel Arc bench node",
+      machine_model: "Remote Linux host",
+      chip: "Intel Arc Pro B70 / BMG G31",
+      memory: null,
+      gpu: "Intel(R) Graphics (BMG G31)",
+      os: "Ubuntu Linux",
+    },
+    provenance: {
+      zinc: zincProvenance,
+      llama_cpp: llamaCppProvenance,
+    },
+    methodology: {
+      runner: "ZINC CLI vs llama.cpp on the same Intel Arc node",
+      benchmark_style: "Four-scenario matrix with same-file baselines",
+      notes: [
+        "Hardware: one Intel Arc Vulkan benchmark node. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
+        "ZINC path: optionally sync the current source tree to the Intel node, build with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
+        "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable or fails to start.",
+        "Scenarios: Core Prompt, Context Retrieval, Long Context Retrieval, and Long Decode. Long Decode raises the generation cap to measure sustained decode rather than only short completions.",
+        "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
+        "Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.",
+        "Run hygiene: published Intel runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.",
+      ],
+      runs: args.runs,
+      warmup_runs: args.warmupRuns,
+    },
+    summary: targetSummary(models),
+    models,
+  };
+}
+
 async function loadExistingArtifact(siteDataPath) {
   try {
     return JSON.parse(await fs.readFile(siteDataPath, "utf8"));
@@ -2097,11 +2485,14 @@ async function main() {
   }
 
   const incoming = [];
-  if (args.target === "metal" || args.target === "both") {
+  if (args.target === "metal" || args.target === "both" || args.target === "all") {
     incoming.push(await runMetalTarget(args));
   }
-  if (args.target === "rdna" || args.target === "both") {
+  if (args.target === "rdna" || args.target === "both" || args.target === "all") {
     incoming.push(await runRdnaTarget(args));
+  }
+  if (args.target === "intel" || args.target === "all") {
+    incoming.push(await runIntelTarget(args));
   }
 
   const outputArtifact = buildArtifact(incoming);

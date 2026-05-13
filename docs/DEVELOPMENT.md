@@ -185,13 +185,27 @@ bun tools/benchmark_api.mjs --base http://localhost:8080 --mode chat
 
 # Raw completions throughput
 bun tools/benchmark_api.mjs --base http://localhost:8080 --mode raw
+
+# Serving concurrency gate (expected to fail until continuous batching lands)
+bun tools/benchmark_api.mjs \
+  --base http://localhost:8080 \
+  --mode concurrency \
+  --min-c4-aggregate-scale 2.5 \
+  --max-c4-p95-latency-multiplier 2.0
 ```
+
+The concurrency gate compares each `concurrency=4` scenario against its
+matching `concurrency=1` baseline. A serialized server typically shows
+aggregate completion throughput near `1x` and p95 latency near `4x`; continuous
+batching should raise aggregate throughput materially without linear p95 growth.
 
 ### Public performance output
 
 ```bash
-# Generate the benchmark artifact that powers /zinc/performance
+# Generate the benchmark artifact that powers /zinc/performance.
+# Legacy "both" runs RDNA + Metal; use "all" to include the Intel Arc node.
 bun tools/performance_suite.mjs --target both --output /tmp/zinc-performance.json
+bun tools/performance_suite.mjs --target intel --output /tmp/zinc-intel-performance.json
 ```
 
 The generated target entries include the exact ZINC git version/commit for the machine that produced each target and the llama.cpp binary version/commit used for the baseline on that target. The public performance page renders the same provenance so benchmark rows are tied to a concrete source tree and baseline build.
@@ -215,6 +229,17 @@ For AMD GPU testing, the project uses a remote RDNA4 node. Environment setup:
 ZINC_HOST=<ip>
 ZINC_PORT=<ssh-port>
 ZINC_USER=root
+```
+
+Intel Arc benchmark nodes use separate keys so they do not override the RDNA defaults:
+
+```bash
+ZINC_INTEL_HOST=<ip>
+ZINC_INTEL_PORT=<ssh-port>
+ZINC_INTEL_USER=<ssh-user>
+ZINC_INTEL_WORKDIR=/home/<ssh-user>/zinc-gpu-loop
+ZINC_INTEL_XDG_CACHE_HOME=/home/<ssh-user>/.cache
+ZINC_INTEL_MODEL_ROOT=/home/<ssh-user>/.cache/zinc/models/models
 ```
 
 Deploy and test:

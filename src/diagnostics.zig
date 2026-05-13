@@ -203,20 +203,23 @@ pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
     try printStepHeader(stdout, styles, 1, 5, "Host Environment");
     const os_status: CheckStatus = if (builtin.os.tag == .linux) .ok else .warn;
     try printStatusLine(stdout, styles, &summary, os_status, "OS", "{s}", .{@tagName(builtin.os.tag)});
-    try printRadvPerftest(stdout, styles, &summary);
     try printStepDuration(stdout, styles, step1_start);
 
-    const step2_start = std.time.nanoTimestamp();
-    try printStepHeader(stdout, styles, 2, 5, "Linux AMD Prerequisites");
-    if (builtin.os.tag == .linux) {
-        try printCheckingLine(stdout, styles, "Mesa Vulkan driver package");
-        try printMesa(stdout, styles, &summary, allocator);
-        try printCheckingLine(stdout, styles, "GECC / RAS status");
-        try printGecc(stdout, styles, &summary, allocator);
-    } else {
-        try printStatusLine(stdout, styles, &summary, .skip, "Mesa", "Linux-only check", .{});
-        try printStatusLine(stdout, styles, &summary, .skip, "GECC (RAS)", "Linux-only check", .{});
+    var vulkan_probe: ?VulkanProbe = null;
+    var vulkan_probe_err: ?anyerror = null;
+    if (probeVulkan(allocator, opts.device_index)) |probe| {
+        vulkan_probe = probe;
+    } else |err| {
+        vulkan_probe_err = err;
     }
+    defer {
+        if (vulkan_probe) |*probe| probe.deinit();
+    }
+
+    const step2_start = std.time.nanoTimestamp();
+    const driver_vendor: ?gpu_detect.GpuVendor = if (vulkan_probe) |*probe| probe.gpu_config.vendor else null;
+    try printStepHeader(stdout, styles, 2, 5, driverStepTitle(driver_vendor));
+    try printLinuxDriverChecks(stdout, styles, &summary, allocator, if (vulkan_probe) |*probe| probe else null);
     try printStepDuration(stdout, styles, step2_start);
 
     const step3_start = std.time.nanoTimestamp();
@@ -229,12 +232,10 @@ pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
     try printStepHeader(stdout, styles, 4, 5, "Vulkan Device");
     try printCheckingLine(stdout, styles, "Vulkan loader, device enumeration, and logical device init");
     var vram_budget_bytes: ?u64 = null;
-    if (probeVulkan(allocator, opts.device_index)) |vulkan_probe_value| {
-        var vulkan_probe = vulkan_probe_value;
-        defer vulkan_probe.deinit();
-        vram_budget_bytes = vulkan_probe.instance.vramBytes();
-        try printVulkanProbe(stdout, styles, &summary, &vulkan_probe);
-    } else |err| {
+    if (vulkan_probe) |*probe| {
+        vram_budget_bytes = probe.instance.vramBytes();
+        try printVulkanProbe(stdout, styles, &summary, probe);
+    } else if (vulkan_probe_err) |err| {
         const status: CheckStatus = if (builtin.os.tag == .linux) .fail else .warn;
         try printStatusLine(stdout, styles, &summary, status, "Vulkan", "Initialization failed: {s}", .{@errorName(err)});
     }
@@ -335,6 +336,84 @@ fn printDurationValue(writer: anytype, elapsed_ns: i128) !void {
     } else {
         try writer.print("{d} ns", .{elapsed_ns});
     }
+}
+
+fn driverStepTitle(vendor: ?gpu_detect.GpuVendor) []const u8 {
+    const actual = vendor orelse return "Linux GPU Driver Checks";
+    if (isAmdVendor(actual)) return "Linux AMD Driver Checks";
+    if (isIntelVendor(actual)) return "Linux Intel Driver Checks";
+    return "Linux GPU Driver Checks";
+}
+
+fn printLinuxDriverChecks(
+    writer: anytype,
+    styles: Styles,
+    summary: *Summary,
+    allocator: std.mem.Allocator,
+    probe: ?*const VulkanProbe,
+) !void {
+    if (builtin.os.tag != .linux) {
+        try printStatusLine(writer, styles, summary, .skip, "GPU driver", "Linux-only check", .{});
+        try printStatusLine(writer, styles, summary, .skip, "RADV_PERFTEST", "Linux-only check", .{});
+        try printStatusLine(writer, styles, summary, .skip, "GECC (RAS)", "Linux-only check", .{});
+        return;
+    }
+
+    const actual = probe orelse {
+        try printStatusLine(writer, styles, summary, .skip, "GPU driver", "Skipped until Vulkan device probe completes", .{});
+        return;
+    };
+
+    if (isAmdVendor(actual.gpu_config.vendor)) {
+        try printCheckingLine(writer, styles, "Mesa Vulkan driver package");
+        try printMesa(writer, styles, summary, allocator);
+        try printCheckingLine(writer, styles, "RADV cooperative-matrix flag");
+        try printRadvPerftest(writer, styles, summary);
+        try printCheckingLine(writer, styles, "GECC / RAS status");
+        try printGecc(writer, styles, summary, allocator);
+        return;
+    }
+
+    if (isIntelVendor(actual.gpu_config.vendor)) {
+        try printStatusLine(
+            writer,
+            styles,
+            summary,
+            .ok,
+            "Intel Vulkan",
+            "ANV-compatible device detected ({s})",
+            .{actual.gpu_config.nameSlice()},
+        );
+        try printStatusLine(writer, styles, summary, .skip, "RADV_PERFTEST", "AMD RADV-only tuning flag", .{});
+        try printStatusLine(writer, styles, summary, .skip, "GECC (RAS)", "AMD-only reliability check", .{});
+        return;
+    }
+
+    try printStatusLine(
+        writer,
+        styles,
+        summary,
+        .ok,
+        "Vulkan driver",
+        "Device detected ({s})",
+        .{actual.gpu_config.nameSlice()},
+    );
+    try printStatusLine(writer, styles, summary, .skip, "RADV_PERFTEST", "AMD RADV-only tuning flag", .{});
+    try printStatusLine(writer, styles, summary, .skip, "GECC (RAS)", "AMD-only reliability check", .{});
+}
+
+fn isAmdVendor(vendor: gpu_detect.GpuVendor) bool {
+    return switch (vendor) {
+        .amd_rdna3, .amd_rdna4, .amd_rdna4_apu, .amd_other => true,
+        else => false,
+    };
+}
+
+fn isIntelVendor(vendor: gpu_detect.GpuVendor) bool {
+    return switch (vendor) {
+        .intel_arc, .intel_arc_xe2 => true,
+        else => false,
+    };
 }
 
 fn printRadvPerftest(writer: anytype, styles: Styles, summary: *Summary) !void {

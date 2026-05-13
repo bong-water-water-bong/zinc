@@ -457,14 +457,19 @@ async function remoteTest(): Promise<{ passed: boolean; output: string }> {
     ],
     { streamOutput: false, timeout: 120_000 },
   );
-  const testPassed = stdout.match(/(\d+)\/\d+ tests passed/);
+  const out = stdout + "\n" + stderr;
+  const testPassed = out.match(/(\d+)\/\d+\s+tests\s+passed/i);
+  const skipped = out.match(/(\d+)\s+skipped/i);
   if (testPassed) {
-    console.log(clr("2", `  ✅ ${testPassed[0]}`));
+    const suffix = skipped ? `; ${skipped[0]}` : "";
+    const color = exitCode === 0 ? "2" : "1;31";
+    const marker = exitCode === 0 ? "✅" : "⚠";
+    console.log(clr(color, `  ${marker} ${testPassed[0]}${suffix}`));
   }
   if (exitCode !== 0) {
     console.log(clr("1;31", "  ❌ Tests failed!"));
   }
-  return { passed: exitCode === 0, output: stdout + "\n" + stderr };
+  return { passed: exitCode === 0, output: out };
 }
 
 async function remoteRun(

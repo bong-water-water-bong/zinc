@@ -1070,6 +1070,10 @@ ${structModulePaths.map((path, idx) => `const mod${idx} = @import("../${path.rep
 
     try {
       const zigArgs = ['run', '-lc'];
+      const libcConfigPath = join(REPO_ROOT, '.build-support', 'libc.conf');
+      if (existsSync(libcConfigPath)) {
+        zigArgs.push('--libc', libcConfigPath);
+      }
       zigArgs.push('-I', join(REPO_ROOT, 'src', 'metal'));
 
       if (process.platform === 'darwin') {

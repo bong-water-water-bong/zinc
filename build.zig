@@ -36,6 +36,13 @@ pub fn build(b: *std.Build) void {
     const full_tests = b.option(bool, "full-tests", "Require integration smoke tests and fail when their environment is missing") orelse false;
     const install_hot_bench = b.option(bool, "install-hot-bench", "Install the zinc-hot-bench binary as part of the default install step") orelse false;
 
+    // Rolling Linux distros can ship CRT objects with sections Zig's bundled
+    // LLD does not understand yet. Let local builders override libc paths
+    // without baking machine-specific files into the repository.
+    if (std.fs.cwd().access(".build-support/libc.conf", .{})) |_| {
+        b.libc_file = ".build-support/libc.conf";
+    } else |_| {}
+
     const is_linux = target.result.os.tag == .linux;
     const is_macos = target.result.os.tag == .macos;
 

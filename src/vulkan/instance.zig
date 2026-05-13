@@ -25,6 +25,8 @@ pub const DeviceCapabilities = struct {
     compute_full_subgroups: bool = false,
     /// Shader stages that accept `requiredSubgroupSize`.
     required_subgroup_size_stages: vk.c.VkShaderStageFlags = 0,
+    /// Default subgroup width used when no required subgroup size is requested.
+    default_subgroup_size: u32 = 0,
     /// Minimum supported subgroup width.
     min_subgroup_size: u32 = 0,
     /// Maximum supported subgroup width.
@@ -143,7 +145,8 @@ pub const Instance = struct {
         const dev_name = std.mem.sliceTo(&device_props.deviceName, 0);
         log.debug("Selected GPU {d}: {s}", .{ dev_idx, dev_name });
         if (device_caps.subgroup_size_control) {
-            log.debug("Subgroup size control enabled: {d}-{d}", .{
+            log.debug("Subgroup size control enabled: default {d}, range {d}-{d}", .{
+                device_caps.default_subgroup_size,
                 device_caps.min_subgroup_size,
                 device_caps.max_subgroup_size,
             });
@@ -357,9 +360,17 @@ fn queryDeviceCapabilities(allocator: std.mem.Allocator, physical_device: vk.c.V
         .maxComputeWorkgroupSubgroups = 0,
         .requiredSubgroupSizeStages = 0,
     };
+    var subgroup_core_props = vk.c.VkPhysicalDeviceSubgroupProperties{
+        .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+        .pNext = &subgroup_props,
+        .subgroupSize = 0,
+        .supportedStages = 0,
+        .supportedOperations = 0,
+        .quadOperationsInAllStages = vk.c.VK_FALSE,
+    };
     var props2 = vk.c.VkPhysicalDeviceProperties2{
         .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-        .pNext = &subgroup_props,
+        .pNext = &subgroup_core_props,
         .properties = undefined,
     };
     vk.c.vkGetPhysicalDeviceProperties2(physical_device, &props2);
@@ -407,6 +418,7 @@ fn queryDeviceCapabilities(allocator: std.mem.Allocator, physical_device: vk.c.V
         .subgroup_size_control = subgroup_size_control_features.subgroupSizeControl == vk.c.VK_TRUE,
         .compute_full_subgroups = subgroup_size_control_features.computeFullSubgroups == vk.c.VK_TRUE,
         .required_subgroup_size_stages = subgroup_props.requiredSubgroupSizeStages,
+        .default_subgroup_size = subgroup_core_props.subgroupSize,
         .min_subgroup_size = subgroup_props.minSubgroupSize,
         .max_subgroup_size = subgroup_props.maxSubgroupSize,
         .storage_buffer16 = storage_16bit_features.storageBuffer16BitAccess == vk.c.VK_TRUE,

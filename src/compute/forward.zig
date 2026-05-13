@@ -773,7 +773,7 @@ const LayerTensors = struct {
     ssm_norm: ?*const LoadedTensor = null,
 };
 
-/// Gate for the Vulkan/RDNA batched-prefill path. Mirrors the narrow slice
+/// Gate for the Vulkan batched-prefill path. Mirrors the narrow slice
 /// the Metal `canUseBatchedPrefill` accepts: dense attention on every layer,
 /// dense FFN, Q4_K (or Q6_K) weights for the seven per-layer projections and
 /// the LM head, no biases, no attn gate, no post-attn / post-ffn norms, no
@@ -784,10 +784,11 @@ const LayerTensors = struct {
 /// or fall back to `prefillBatch`. Until the batched body lands this just
 /// guards the env flag so enabling it on an unsupported model is a no-op.
 fn canUseBatchedPrefillRdna(engine: *const InferenceEngine) bool {
-    // Batched prefill is validated on RDNA3/4 only. Intel Xe2 and other
-    // non-AMD vendors fall back to per-token prefill.
+    // Batched prefill uses portable Q4_K/Q6_K batch shaders on Intel Arc, and
+    // the wave64 kpar variant is gated separately at init.
     const vendor = engine.gpu_config.vendor;
-    if (vendor != .amd_rdna3 and vendor != .amd_rdna4 and vendor != .amd_rdna4_apu) return false;
+    if (vendor != .amd_rdna3 and vendor != .amd_rdna4 and vendor != .amd_rdna4_apu and
+        vendor != .intel_arc_xe2 and vendor != .intel_arc) return false;
     const cfg = engine.model.config;
     if (cfg.n_experts > 0) return false;
     if (cfg.ssm_d_inner > 0) return false;
@@ -1977,7 +1978,7 @@ pub const InferenceEngine = struct {
         // R9700). Disable via ZINC_Q4K_BATCH_KPAR=0 to run the serial shader.
         const q4k_batch_kpar_env = std.posix.getenv("ZINC_Q4K_BATCH_KPAR");
         const q4k_batch_kpar_explicitly_off = q4k_batch_kpar_env != null and std.mem.eql(u8, q4k_batch_kpar_env.?, "0");
-        const q4k_batch_kpar_enabled = !q4k_batch_kpar_explicitly_off and dmmv.pipeline_q4k_batch_kpar != null;
+        const q4k_batch_kpar_enabled = gpu_config.wave_size == 64 and !q4k_batch_kpar_explicitly_off and dmmv.pipeline_q4k_batch_kpar != null;
         if (q4k_batch_kpar_enabled) {
             log.info("Q4_K batched projection kpar variant ENABLED (default, set ZINC_Q4K_BATCH_KPAR=0 to disable)", .{});
         } else if (q4k_batch_kpar_explicitly_off) {

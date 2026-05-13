@@ -98,12 +98,14 @@ pub fn detect(instance: *const Instance) GpuConfig {
     const props = instance.device_props;
     const name_slice = std.mem.sliceTo(&props.deviceName, 0);
 
-    // Use Vulkan-reported subgroup size when available, otherwise fall back to 32
-    // (the most common subgroup width across vendors).
-    const subgroup_size: u32 = if (instance.caps.min_subgroup_size > 0)
-        instance.caps.min_subgroup_size
-    else
-        32;
+    // Use the Vulkan default subgroup size. Subgroup size control exposes a
+    // min/max range, but the minimum is not the size used by ordinary compute
+    // pipelines. Intel Battlemage, for example, reports 16..32 while running
+    // unrequested compute shaders at subgroupSize=32.
+    const subgroup_size: u32 = chooseDefaultSubgroupSize(
+        instance.caps.default_subgroup_size,
+        instance.caps.min_subgroup_size,
+    );
 
     var config = GpuConfig{
         .vendor = .unknown,
@@ -286,6 +288,12 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn chooseDefaultSubgroupSize(default_subgroup_size: u32, min_subgroup_size: u32) u32 {
+    if (default_subgroup_size > 0) return default_subgroup_size;
+    if (min_subgroup_size > 0) return min_subgroup_size;
+    return 32;
+}
+
 test "containsIgnoreCase" {
     try std.testing.expect(containsIgnoreCase("AMD Radeon RX 9070 XT", "9070"));
     try std.testing.expect(containsIgnoreCase("RADV GFX1201", "gfx1201"));
@@ -349,11 +357,18 @@ test "wave_size fallback and DMMV derivation" {
         try std.testing.expectEqual(@as(u32, 16), wg);
         try std.testing.expectEqual(@as(u32, 1), rows);
     }
-    // Fallback when min_subgroup_size is 0 → defaults to 32
+    // Intel Battlemage commonly reports min=16/max=32 while the default
+    // subgroup width used by ordinary pipelines is 32.
     {
-        const min_subgroup_size: u32 = 0;
-        const subgroup_size: u32 = if (min_subgroup_size > 0) min_subgroup_size else 32;
-        try std.testing.expectEqual(@as(u32, 32), subgroup_size);
+        try std.testing.expectEqual(@as(u32, 32), chooseDefaultSubgroupSize(32, 16));
+    }
+    // Fallback when default subgroup is unavailable but min_subgroup_size is set.
+    {
+        try std.testing.expectEqual(@as(u32, 16), chooseDefaultSubgroupSize(0, 16));
+    }
+    // Final fallback when neither field is available.
+    {
+        try std.testing.expectEqual(@as(u32, 32), chooseDefaultSubgroupSize(0, 0));
     }
 }
 

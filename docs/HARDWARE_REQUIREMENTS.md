@@ -1,6 +1,6 @@
 # ZINC hardware requirements
 
-ZINC runs on AMD GPUs (Linux, Vulkan) and Apple Silicon (macOS, Metal). This page covers what hardware and OS setup you need for each platform.
+ZINC runs on consumer GPUs (Linux, Vulkan) and Apple Silicon (macOS, Metal). This page covers what hardware and OS setup you need for each platform.
 
 ## Supported platforms
 
@@ -8,6 +8,7 @@ ZINC runs on AMD GPUs (Linux, Vulkan) and Apple Silicon (macOS, Metal). This pag
 |----------|-----|---------|--------|
 | **Linux** | AMD RDNA4 | Vulkan 1.3 | Primary tuning target |
 | **Linux** | AMD RDNA3 | Vulkan 1.3 | Supported, less tuned |
+| **Linux** | Intel Arc Xe2 / Battlemage | Vulkan 1.3 | Experimental bring-up |
 | **macOS** | Apple Silicon M1 through M5 | Metal | Supported, native MSL shaders |
 
 ## AMD GPUs (Linux)
@@ -50,7 +51,7 @@ Exact fit depends on architecture, quantization, and context length. `--check -m
 
 | Family | Status |
 | --- | --- |
-| Intel Arc | Possible through Vulkan, not a primary target |
+| Intel Arc | Experimental Vulkan bring-up |
 | NVIDIA via Vulkan | Vulkan works, not primary target |
 
 ## Apple Silicon (macOS)

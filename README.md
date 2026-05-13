@@ -23,7 +23,7 @@
   </a>
 </p>
 
-> Local LLM inference on AMD GPUs and Apple Silicon — no ROCm, no MLX, one binary.
+> Local LLM inference on consumer GPUs and Apple Silicon — no ROCm, no MLX, one binary.
 
 <p align="center">
   <img src="assets/zinc-chat-demo.gif" alt="ZINC Chat Demo — streaming inference on AMD RDNA4" width="720">
@@ -37,6 +37,7 @@
 |----------|-----|---------|--------|
 | **Linux** | AMD RDNA4 (RX 9070, AI PRO R9700) | Vulkan | Primary — hand-tuned shaders |
 | **Linux** | AMD RDNA3 (RX 7900 XTX, etc.) | Vulkan | Supported |
+| **Linux** | Intel Arc Xe2 / Battlemage | Vulkan | Experimental bring-up |
 | **macOS** | Apple Silicon (M1, M2, M3, M4, M5) | Metal | Supported — native MSL shaders |
 
 ## Start Here

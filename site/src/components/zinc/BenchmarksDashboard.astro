@@ -302,7 +302,7 @@ function scenarioIdsForTarget(target: any) {
   return scenarioOrder.filter((id) => ids.has(id));
 }
 
-const targetOrder = ['rdna', 'metal'];
+const targetOrder = ['rdna', 'intel', 'metal'];
 const targets = [...benchmarkData.targets]
   .sort((a, b) => targetOrder.indexOf(a.id) - targetOrder.indexOf(b.id))
   .map(normalizeTarget);
@@ -414,7 +414,7 @@ const jsonLd = {
     {
       '@type': 'CollectionPage',
       name: 'ZINC Benchmarks vs llama.cpp',
-      description: 'ZINC benchmark dashboard for AMD RDNA and Apple Silicon, including prompt throughput, prefill latency, decode throughput, total latency, and same-machine comparison against llama.cpp.',
+      description: 'ZINC benchmark dashboard for AMD RDNA, Intel Arc, and Apple Silicon, including prompt throughput, prefill latency, decode throughput, total latency, and same-machine comparison against llama.cpp.',
       url: pageUrl,
       about: {
         '@type': 'SoftwareApplication',
@@ -423,12 +423,12 @@ const jsonLd = {
         operatingSystem: 'Linux, macOS',
         codeRepository: 'https://github.com/zolotukhin/zinc',
       },
-      keywords: 'ZINC benchmarks, llama.cpp comparison, Apple Silicon Metal benchmark, AMD RDNA benchmark, local LLM benchmark, prefill throughput, decode throughput, latency benchmark',
+      keywords: 'ZINC benchmarks, llama.cpp comparison, Apple Silicon Metal benchmark, AMD RDNA benchmark, Intel Arc benchmark, local LLM benchmark, prefill throughput, decode throughput, latency benchmark',
     },
     {
       '@type': 'Dataset',
       name: 'ZINC benchmark artifact',
-      description: 'Structured benchmark artifact used to render the public ZINC benchmarks dashboard across RDNA and Metal targets.',
+      description: 'Structured benchmark artifact used to render the public ZINC benchmarks dashboard across RDNA, Intel Arc, and Metal targets.',
       dateModified: benchmarkData.generated_at,
       distribution: {
         '@type': 'DataDownload',
@@ -443,8 +443,8 @@ const jsonLd = {
 
 <BaseLayout
   title="ZINC Benchmarks vs llama.cpp"
-  description="ZINC benchmark dashboard for AMD RDNA and Apple Silicon, with scenario-based prompt throughput, prefill latency, decode throughput, end-to-end throughput, and same-machine comparison against llama.cpp."
-  keywords="ZINC benchmarks, llama.cpp comparison, Apple Silicon Metal benchmark, AMD RDNA benchmark, local LLM benchmark, prefill throughput, decode throughput, latency benchmark"
+  description="ZINC benchmark dashboard for AMD RDNA, Intel Arc, and Apple Silicon, with scenario-based prompt throughput, prefill latency, decode throughput, end-to-end throughput, and same-machine comparison against llama.cpp."
+  keywords="ZINC benchmarks, llama.cpp comparison, Apple Silicon Metal benchmark, AMD RDNA benchmark, Intel Arc benchmark, local LLM benchmark, prefill throughput, decode throughput, latency benchmark"
   canonicalUrl={canonicalUrl}
   jsonLd={jsonLd}
 >

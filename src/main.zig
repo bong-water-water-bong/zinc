@@ -400,7 +400,7 @@ const ResolvedCheckTarget = struct {
 };
 
 const banner =
-    \\ZINC — Zig INferenCe Engine for AMD GPUs
+    \\ZINC — Zig INferenCe Engine for consumer GPUs and Apple Silicon
     \\
     \\Usage:
     \\  zinc -m <model.gguf> --prompt "Hello"
@@ -443,7 +443,7 @@ const banner =
 ;
 
 const banner_full =
-    \\ZINC — Zig INferenCe Engine for AMD GPUs
+    \\ZINC — Zig INferenCe Engine for consumer GPUs and Apple Silicon
     \\
     \\Usage:
     \\  zinc -m <model.gguf> --prompt "Hello"
