@@ -282,10 +282,36 @@ kernel void main0(
         const float4 sc_neg_u0 = float4(sc8_u0[2], sc8_u0[3], sc8_u0[6], sc8_u0[7]);
         const float4 sc_neg_g1 = float4(sc8_g1[2], sc8_g1[3], sc8_g1[6], sc8_g1[7]);
         const float4 sc_neg_u1 = float4(sc8_u1[2], sc8_u1[3], sc8_u1[6], sc8_u1[7]);
-        gate_sum[0] += dh_g0[0] * dot(head_pair_g0, sc_pos_g0) - dh_g0[1] * dot(sumy, sc_neg_g0);
-        up_sum[0]   += dh_u0[0] * dot(head_pair_u0, sc_pos_u0) - dh_u0[1] * dot(sumy, sc_neg_u0);
-        gate_sum[1] += dh_g1[0] * dot(head_pair_g1, sc_pos_g1) - dh_g1[1] * dot(sumy, sc_neg_g1);
-        up_sum[1]   += dh_u1[0] * dot(head_pair_u1, sc_pos_u1) - dh_u1[1] * dot(sumy, sc_neg_u1);
+        // Cycle 60: vectorize the cross-(gate,up) × cross-row final reduction.
+        // The 4 independent per-block updates here (gate0, up0, gate1, up1)
+        // each compute `dh[0] * dot(head, sc_pos) - dh[1] * dot(sumy, sc_neg)`
+        // — 4 scalar `a*b - c*d` chains in lane-by-lane form. Pack the 4
+        // (dh_d, dh_dmin, head_dot, tail_dot) tuples into float4s and fold
+        // the 4 reductions into one vector mul + one vector fnma. Mirrors
+        // cycle 51-53's "vectorize the per-ib reduction" pattern, but
+        // applied at the outer (row × projection) axis instead of the
+        // inner head/tail axis. Apple7 ALU is 4-wide; the indexed scalar
+        // form was 4 separate scalar mul + 4 scalar mul + 4 scalar sub per
+        // ib (12 scalar ops); the new form is 1 vec mul + 1 vec fnma + 4
+        // scalar accumulator adds (~6 ops). This is the hottest Q4_K shader
+        // (~50% of Q4_K bytes/token = ffn_gate+ffn_up on Qwen3-8B dense).
+        const float4 dh_d = float4(float(dh_g0[0]), float(dh_u0[0]), float(dh_g1[0]), float(dh_u1[0]));
+        const float4 dh_dmin = float4(float(dh_g0[1]), float(dh_u0[1]), float(dh_g1[1]), float(dh_u1[1]));
+        const float4 head_dots = float4(
+            dot(head_pair_g0, sc_pos_g0),
+            dot(head_pair_u0, sc_pos_u0),
+            dot(head_pair_g1, sc_pos_g1),
+            dot(head_pair_u1, sc_pos_u1));
+        const float4 tail_dots = float4(
+            dot(sumy, sc_neg_g0),
+            dot(sumy, sc_neg_u0),
+            dot(sumy, sc_neg_g1),
+            dot(sumy, sc_neg_u1));
+        const float4 delta = dh_d * head_dots - dh_dmin * tail_dots;
+        gate_sum[0] += delta[0];
+        up_sum[0]   += delta[1];
+        gate_sum[1] += delta[2];
+        up_sum[1]   += delta[3];
 
         y4 += 4 * QK_K;
     }
