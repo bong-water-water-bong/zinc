@@ -218,11 +218,31 @@ kernel void main0(
             float4(c1.zw, d1.zw),
         };
 
-        const float4 ones = float4(1.0f);
-        sumy[0] = dot(a0, ones) + dot(a1, ones);
-        sumy[1] = dot(b0, ones) + dot(b1, ones);
-        sumy[2] = dot(c0, ones) + dot(c1, ones);
-        sumy[3] = dot(d0, ones) + dot(d1, ones);
+        // Cycle 89: derive `sumy` from the `yl4_arr` / `yh4_arr` register
+        // vectors built above instead of as a parallel second consumer of
+        // the original a0/a1/b0/b1/c0/c1/d0/d1 float4 loads. The legacy
+        // `sumy[k] = dot(a*, ones) + dot(a1, ones)` per slice forced the
+        // compiler to keep all 8 raw load vectors live until both the
+        // sumy reduction and the yl4_arr/yh4_arr build had completed; by
+        // reducing through yl4_arr/yh4_arr (the same vectors the FMA loop
+        // already consumes) a0..d1 can die immediately after the lane
+        // shuffle, freeing ~128B of register file before the q1v/q2v
+        // ushort4 loads + 32-FMA inner chain. Lane mapping (per yl4_arr
+        // build above): yl4_arr[i].xy = a-family, yl4_arr[i].zw =
+        // b-family; same with yh4_arr for c/d. Summing all 4 yl4_arr
+        // gives yl_tot where (yl_tot.x+yl_tot.y) = sum(a0)+sum(a1) =
+        // sumy[0] and (yl_tot.z+yl_tot.w) = sumy[1]; analogous for
+        // yh_tot → sumy[2..3]. Cost equivalent (~28 effective adds
+        // either way); pure register-pressure optimization. Mirrors
+        // cycle 87 (swiglu) and cycle 88 (dmmv_q4k.metal). qk_dual serves
+        // Qwen3-8B attn_qkv Q+K paired (~18.5% of decode bytes/token via
+        // the 25.08 GiB attn path; Q4_K = 71.6% of decode bytes/token).
+        const float4 yl_tot = (yl4_arr[0] + yl4_arr[1]) + (yl4_arr[2] + yl4_arr[3]);
+        const float4 yh_tot = (yh4_arr[0] + yh4_arr[1]) + (yh4_arr[2] + yh4_arr[3]);
+        sumy[0] = yl_tot.x + yl_tot.y;
+        sumy[1] = yl_tot.z + yl_tot.w;
+        sumy[2] = yh_tot.x + yh_tot.y;
+        sumy[3] = yh_tot.z + yh_tot.w;
 
         // Cycle 64: cross-row 2-wide reduction. Call the parts helper for
         // both rows so head_dot/tail_dot/d/dmin from both rows are in scope
