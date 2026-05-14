@@ -130,15 +130,31 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Cycle 92: keep per-thread scores in a register array across the
+    // QK→softmax pipeline. The two strided loops below visit the same
+    // per-thread indices {tid, tid+64, …}; the legacy form wrote each
+    // `score` into `scores[token_offset]` (TG memory) at end-of-QK and
+    // re-read it as `scores[token_offset]` at top-of-softmax — a pure
+    // intra-thread roundtrip through TG memory. With FLASH_BLOCK_TOKENS=256
+    // and FLASH_TG_SIZE=64, every thread owns at most 4 tokens per block,
+    // so a stack-resident `float local_scores[4]` fits comfortably (16B).
+    // The softmax write of `weight` back to `scores[]` is preserved
+    // because the V loop reads weights cross-thread (guarded by the
+    // existing barrier after softmax). Net: 1 TG-write + 1 TG-read removed
+    // per (token,thread) per block per (head×layer). Mirrors the philosophy
+    // of cycle 91's "kill dead-after-use threadgroup roundtrips" cleanups.
+    float local_scores[FLASH_BLOCK_TOKENS / FLASH_TG_SIZE];
+
     for (uint block_start = 0u; block_start < p.seq_len; block_start += FLASH_BLOCK_TOKENS) {
         const uint block_tokens = min(FLASH_BLOCK_TOKENS, p.seq_len - block_start);
         const uint block_base = (block_start * token_stride) + kv_head * kv_head_stride;
         float local_max = -INFINITY;
 
+        uint local_idx = 0u;
         for (uint token_offset = tid; token_offset < block_tokens; token_offset += FLASH_TG_SIZE) {
             const uint token_idx = block_start + token_offset;
             if (use_sliding_window && token_idx < sliding_start) {
-                scores[token_offset] = -INFINITY;
+                local_scores[local_idx++] = -INFINITY;
                 continue;
             }
             const uint kv_base = contiguous_kv
@@ -171,7 +187,7 @@ kernel void main0(
             }
             float score = dot(score4, float4(1.0f));
             score *= scale;
-            scores[token_offset] = score;
+            local_scores[local_idx++] = score;
             local_max = fast::max(local_max, score);
         }
         // No threadgroup barrier here: scores writes above are at per-thread
@@ -186,8 +202,9 @@ kernel void main0(
         const float next_max = fast::max(running_max, block_max);
 
         float local_sum = 0.0f;
+        local_idx = 0u;
         for (uint token_offset = tid; token_offset < block_tokens; token_offset += FLASH_TG_SIZE) {
-            const float weight = fast::exp(scores[token_offset] - next_max);
+            const float weight = fast::exp(local_scores[local_idx++] - next_max);
             scores[token_offset] = weight;
             local_sum += weight;
         }
