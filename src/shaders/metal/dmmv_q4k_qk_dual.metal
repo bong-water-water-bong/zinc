@@ -36,7 +36,13 @@ struct QKDualPush {
 #define BLOCK_SIZE 144
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
-inline float q4k_block_dot(
+// Cycle 64: return per-row partials (head_dot, tail_dot, d, dmin) instead
+// of a final scalar so the caller can fold the 2 cross-row
+// `d*head - dmin*tail` chains into a single vec2 fma + vec2 mul. Mirrors
+// cycle 61's 2-wide cross-row pattern on dmmv_q4k.metal — the qk_dual
+// kernel's helper was hiding the cross-row vectorization opportunity by
+// finalizing each row's reduction to scalar inside the helper.
+inline float4 q4k_block_dot_parts(
     device const uchar* block,
     thread const float* yl,
     thread const float* yh,
@@ -60,11 +66,6 @@ inline float q4k_block_dot(
     sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
     sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
 
-    // Block layout note: `block` is row-aligned (row stride = nb*144 bytes),
-    // so `block + 16 + (16*iq + 4*ir)*2` is always 8-byte aligned (iq∈{0,1},
-    // ir∈{0..3} → byte offsets 16,20,24,28,32,36,40,44 from block; with
-    // block 8-byte aligned all of these are 8-byte aligned). Safe to load
-    // q1/q2 as ushort4.
     const ushort4 q1v = *((device const ushort4*)q1);
     const ushort4 q2v = *((device const ushort4*)(q1 + 32));
 
@@ -72,14 +73,6 @@ inline float q4k_block_dot(
     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
     FOR_UNROLL (short i = 0; i < 4; ++i) {
-        // Cycle 47: port the cycle 45 explicit-float4-fma pattern from
-        // dmmv_q4k.metal to this Q+K dual helper. Replace 8 indexed scalar
-        // `accX[k] += y* * (q* & mask)` writes per `i` iteration with 2
-        // explicit `float4 fma(y4, q4, acc4)` calls. Packs the shared yl/yh
-        // lanes once into yl4/yh4 and each matrix's masked quants into
-        // float4s so the Apple7 compiler emits quad FMAs directly instead
-        // of lifting lane-by-lane indexed writes. Covers Qwen3-8B attn_qkv
-        // when this kernel fires (Q+K paired into one dispatch).
         const float4 yl4 = float4(yl[2 * i + 0], yl[2 * i + 1], yl[2 * i + 8], yl[2 * i + 9]);
         const float4 yh4 = float4(yh[2 * i + 0], yh[2 * i + 1], yh[2 * i + 8], yh[2 * i + 9]);
         const ushort q1i = q1v[i];
@@ -90,17 +83,6 @@ inline float q4k_block_dot(
         acc2 = fma(yh4, q2m, acc2);
     }
 
-    // Cycle 53: vectorize the per-ib reduction. Replace the 4-term scalar
-    // head sum `(acc[even] + 1/256*acc[odd]) * sc8[*]` with a single
-    // `dot(head_pair, sc_pos4)` after building head_pair via one vector
-    // `fma`, and the 4-term scalar tail `sumy[k]*sc8[*]` with
-    // `dot(sumy, sc_neg4)`. Mirrors cycles 51/52 — completes the
-    // "vectorized per-ib reduction" pattern across the Q4_K kernel
-    // family. dmmv_q4k_qk_dual.metal serves Qwen3-8B attn_qkv (Q+K
-    // paired) when M_q is divisible by NSG*NR0=4 — M_q=4096 always
-    // qualifies for Qwen3-8B dense. Per ib iteration: ~22 scalar ops
-    // (4 FMAs + 4 muls + 3 adds head; 4 muls + 3 adds tail) → ~6
-    // vector ops (1 vec fma + 2 dot4), matching Apple7's 4-wide ALU.
     const float4 head_pair = fma(
         float4(acc1[1], acc1[3], acc2[1], acc2[3]),
         float4(1.f / 256.f),
@@ -111,7 +93,7 @@ inline float q4k_block_dot(
         float(sc8[4]),
         float(sc8[5]) * (1.f / 16.f));
     const float4 sc_neg = float4(sc8[2], sc8[3], sc8[6], sc8[7]);
-    return dh[0] * dot(head_pair, sc_pos) - dh[1] * dot(sumy, sc_neg);
+    return float4(dot(head_pair, sc_pos), dot(sumy, sc_neg), float(dh[0]), float(dh[1]));
 }
 
 kernel void main0(
@@ -187,13 +169,35 @@ kernel void main0(
         sumy[2] = dot(c0, ones) + dot(c1, ones);
         sumy[3] = dot(d0, ones) + dot(d1, ones);
 
-        FOR_UNROLL (short row = 0; row < NR0; ++row) {
-            const int dst_row = dst_row_base + row;
-            if (dst_row < M) {
-                const ulong row_off = ulong(dst_row) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
-                sumf[row] += q4k_block_dot(src + row_off, yl, yh, sumy, iq, ir);
-            }
-        }
+        // Cycle 64: cross-row 2-wide reduction. Call the parts helper for
+        // both rows so head_dot/tail_dot/d/dmin from both rows are in scope
+        // together, then fold the 2 scalar `d*head - dmin*tail` chains into
+        // one vec2 fma + one vec2 mul producing a float2 `delta` of the 2
+        // per-row increments. Mirrors cycle 61's pattern on dmmv_q4k.metal.
+        // dmmv_q4k_qk_dual.metal serves Qwen3-8B attn_qkv (Q+K paired into
+        // one dispatch). Dispatcher guarantees M_q % (NSG*NR0)==0, and for
+        // Qwen3-8B both M_q=4096 and M_k=1024 are divisible by NSG*NR0=4
+        // so both rows are always valid when this kernel fires; the per-
+        // row `dst_row < M` guard is preserved by zeroing the parts when
+        // a row is past M so the cross-row fold contributes 0 to sumf for
+        // that row, matching the original per-row skip.
+        const int dst_row_0 = dst_row_base + 0;
+        const int dst_row_1 = dst_row_base + 1;
+        const ulong row_off_0 = ulong(dst_row_0) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
+        const ulong row_off_1 = ulong(dst_row_1) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
+        const float4 parts_0 = (dst_row_0 < M)
+            ? q4k_block_dot_parts(src + row_off_0, yl, yh, sumy, iq, ir)
+            : float4(0.0f);
+        const float4 parts_1 = (dst_row_1 < M)
+            ? q4k_block_dot_parts(src + row_off_1, yl, yh, sumy, iq, ir)
+            : float4(0.0f);
+        const float2 dh_d = float2(parts_0[2], parts_1[2]);
+        const float2 dh_dmin = float2(parts_0[3], parts_1[3]);
+        const float2 head_dots = float2(parts_0[0], parts_1[0]);
+        const float2 tail_dots = float2(parts_0[1], parts_1[1]);
+        const float2 delta = fma(dh_d, head_dots, -dh_dmin * tail_dots);
+        sumf[0] += delta[0];
+        sumf[1] += delta[1];
 
         y4 += 4 * QK_K;
     }
