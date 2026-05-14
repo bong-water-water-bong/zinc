@@ -70,52 +70,75 @@ kernel void main0(
             yl[4u * l + 3u] = y[l + 96u];
         }
 
-        for (ushort row = 0u; row < NR0; ++row) {
-            const uint dst_row = first_row + uint(row);
-            if (dst_row >= p.M) {
-                continue;
-            }
+        // Cycle 36: interleave NR0=2 row0/row1 — load both rows' q1v4/q2v4/qhv4/
+        // sc/d up front, then run a single FOR_UNROLL l=0..3 that updates both
+        // rows' sums alternately. Removes the per-row serialization chain (row 1's
+        // loads previously waited on row 0's accumulator chain). Mirrors cycle 33's
+        // row-interleave pattern that landed in dmmv_q4k.metal (+0.3 tok/s on dense
+        // Q4_K). Bounds check moved to output simd_sum loop (matches dmmv_q4k.metal
+        // pattern); dispatched M for ffn_down (4096) and lm_head (151936) on
+        // Qwen3-8B are both divisible by NSG*NR0=4.
+        device const uchar* block0 = src0 + ulong(first_row) * ulong(row_bytes) + ulong(bi) * BLOCK_SIZE;
+        device const uchar* block1 = block0 + row_bytes;
 
-            device const uchar* block = src0 + ulong(dst_row) * ulong(row_bytes) + ulong(bi) * BLOCK_SIZE;
-            device const uchar* q1 = block + q_offset_l;
-            device const uchar* q2 = q1 + 32u;
-            device const uchar* qh = block + 128u + q_offset_h;
-            device const uchar* sc = block + 192u + uint(is);
-            const float d = fp16_to_fp32(uint(block[208]) | (uint(block[209]) << 8u));
+        const uchar4 q1v4_0 = *((device const uchar4*)(block0 + q_offset_l));
+        const uchar4 q2v4_0 = *((device const uchar4*)(block0 + q_offset_l + 32u));
+        const uchar4 qhv4_0 = *((device const uchar4*)(block0 + 128u + q_offset_h));
+        device const uchar* sc_0 = block0 + 192u + uint(is);
+        const float d_0 = fp16_to_fp32(uint(block0[208]) | (uint(block0[209]) << 8u));
 
-            // Cycle 35: batch the 12 scalar byte reads (q1[0..3], q2[0..3], qh[0..3])
-            // into 3 uchar4 vector loads. Pointers are 4-byte aligned by construction
-            // (q_offset_l = 64*ip + 4*il, q_offset_h = 32*ip + 4*il; both 4-aligned),
-            // so the vector loads are safe. Mirrors cycle 28's ushort4 batching applied
-            // to dmmv_q4k.metal, but on the Q6_K side — covers ffn_down on Qwen3-8B
-            // (27.3% of all DMMV bytes/token, the entire Q6_K slice).
-            const uchar4 q1v4 = *((device const uchar4*)q1);
-            const uchar4 q2v4 = *((device const uchar4*)q2);
-            const uchar4 qhv4 = *((device const uchar4*)qh);
+        const uchar4 q1v4_1 = *((device const uchar4*)(block1 + q_offset_l));
+        const uchar4 q2v4_1 = *((device const uchar4*)(block1 + q_offset_l + 32u));
+        const uchar4 qhv4_1 = *((device const uchar4*)(block1 + 128u + q_offset_h));
+        device const uchar* sc_1 = block1 + 192u + uint(is);
+        const float d_1 = fp16_to_fp32(uint(block1[208]) | (uint(block1[209]) << 8u));
 
-            float4 sums = float4(0.0f);
-            for (ushort l = 0u; l < 4u; ++l) {
-                const uint h = uint(qhv4[l]);
-                const uint q1b = uint(q1v4[l]);
-                const uint q2b = uint(q2v4[l]);
-                const float q0 = float(int((q1b & 0x0Fu) | ((h & kmask1) << 4u)) - 32);
-                const float q1v = float(int((q2b & 0x0Fu) | ((h & kmask2) << 2u)) - 32);
-                const float q2v = float(int((q1b >> 4u) | ((h & kmask3) << 0u)) - 32);
-                const float q3 = float(int((q2b >> 4u) | ((h & kmask4) >> 2u)) - 32);
+        float4 sums_0 = float4(0.0f);
+        float4 sums_1 = float4(0.0f);
+        for (ushort l = 0u; l < 4u; ++l) {
+            const uint h0 = uint(qhv4_0[l]);
+            const uint q1b0 = uint(q1v4_0[l]);
+            const uint q2b0 = uint(q2v4_0[l]);
+            const float q00 = float(int((q1b0 & 0x0Fu) | ((h0 & kmask1) << 4u)) - 32);
+            const float q10 = float(int((q2b0 & 0x0Fu) | ((h0 & kmask2) << 2u)) - 32);
+            const float q20 = float(int((q1b0 >> 4u) | ((h0 & kmask3) << 0u)) - 32);
+            const float q30 = float(int((q2b0 >> 4u) | ((h0 & kmask4) >> 2u)) - 32);
 
-                sums[0] += yl[4u * l + 0u] * q0;
-                sums[1] += yl[4u * l + 1u] * q1v;
-                sums[2] += yl[4u * l + 2u] * q2v;
-                sums[3] += yl[4u * l + 3u] * q3;
-            }
+            const uint h1 = uint(qhv4_1[l]);
+            const uint q1b1 = uint(q1v4_1[l]);
+            const uint q2b1 = uint(q2v4_1[l]);
+            const float q01 = float(int((q1b1 & 0x0Fu) | ((h1 & kmask1) << 4u)) - 32);
+            const float q11 = float(int((q2b1 & 0x0Fu) | ((h1 & kmask2) << 2u)) - 32);
+            const float q21 = float(int((q1b1 >> 4u) | ((h1 & kmask3) << 0u)) - 32);
+            const float q31 = float(int((q2b1 >> 4u) | ((h1 & kmask4) >> 2u)) - 32);
 
-            sumf[row] += d * (
-                sums[0] * s8_to_f32(uint(sc[0])) +
-                sums[1] * s8_to_f32(uint(sc[2])) +
-                sums[2] * s8_to_f32(uint(sc[4])) +
-                sums[3] * s8_to_f32(uint(sc[6]))
-            );
+            const float ylv0 = yl[4u * l + 0u];
+            const float ylv1 = yl[4u * l + 1u];
+            const float ylv2 = yl[4u * l + 2u];
+            const float ylv3 = yl[4u * l + 3u];
+
+            sums_0[0] += ylv0 * q00;
+            sums_1[0] += ylv0 * q01;
+            sums_0[1] += ylv1 * q10;
+            sums_1[1] += ylv1 * q11;
+            sums_0[2] += ylv2 * q20;
+            sums_1[2] += ylv2 * q21;
+            sums_0[3] += ylv3 * q30;
+            sums_1[3] += ylv3 * q31;
         }
+
+        sumf[0] += d_0 * (
+            sums_0[0] * s8_to_f32(uint(sc_0[0])) +
+            sums_0[1] * s8_to_f32(uint(sc_0[2])) +
+            sums_0[2] * s8_to_f32(uint(sc_0[4])) +
+            sums_0[3] * s8_to_f32(uint(sc_0[6]))
+        );
+        sumf[1] += d_1 * (
+            sums_1[0] * s8_to_f32(uint(sc_1[0])) +
+            sums_1[1] * s8_to_f32(uint(sc_1[2])) +
+            sums_1[2] * s8_to_f32(uint(sc_1[4])) +
+            sums_1[3] * s8_to_f32(uint(sc_1[6]))
+        );
     }
 
     device float* out = Y + (p.y_offset / 4u);
