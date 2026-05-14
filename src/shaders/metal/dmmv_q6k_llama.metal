@@ -163,39 +163,22 @@ kernel void main0(
             sums_1 = fma(yl4, q4_1, sums_1);
         }
 
-        const float sc00 = float(sc_0[0]);
-        const float sc02 = float(sc_0[2]);
-        const float sc04 = float(sc_0[4]);
-        const float sc06 = float(sc_0[6]);
-        const float sc10 = float(sc_1[0]);
-        const float sc12 = float(sc_1[2]);
-        const float sc14 = float(sc_1[4]);
-        const float sc16 = float(sc_1[6]);
-
-        sumf[0] += d_0 * (
-            sums_0[0] * sc00 +
-            sums_0[1] * sc02 +
-            sums_0[2] * sc04 +
-            sums_0[3] * sc06 -
-            32.0f * (
-                yl_sum_0 * sc00 +
-                yl_sum_1 * sc02 +
-                yl_sum_2 * sc04 +
-                yl_sum_3 * sc06
-            )
-        );
-        sumf[1] += d_1 * (
-            sums_1[0] * sc10 +
-            sums_1[1] * sc12 +
-            sums_1[2] * sc14 +
-            sums_1[3] * sc16 -
-            32.0f * (
-                yl_sum_0 * sc10 +
-                yl_sum_1 * sc12 +
-                yl_sum_2 * sc14 +
-                yl_sum_3 * sc16
-            )
-        );
+        // Cycle 56: port cycle 51's vectorized per-block reduction from
+        // dmmv_q4k.metal to this Q6_K kernel. Replace the two scalar 4-term
+        // (sums·sc) head sums and 4-term (yl_sum·sc) tail sums per row with
+        // one `fma(-32, dot(yl_sum,sc4), dot(sums,sc4))` per row. Per ib
+        // iteration: ~16 scalar muls + 14 scalar adds → 4 vector dot4 + 2
+        // vector fma. Mirrors the same change that landed in dmmv_q4k.metal
+        // (cycle 51), dmmv_q4k_dense_gate_up_swiglu.metal (cycle 52), and
+        // dmmv_q4k_qk_dual.metal (cycle 53). Q6_K is 28.4% of decode bytes/
+        // token on Qwen3-8B Q4_K_M (38.46 GiB/step) — this kernel covers
+        // ffn_down. Apple7 ALU is naturally 4-wide; the indexed scalar form
+        // leaves the compiler emitting narrower lane-by-lane FMAs.
+        const float4 sc4_0 = float4(float(sc_0[0]), float(sc_0[2]), float(sc_0[4]), float(sc_0[6]));
+        const float4 sc4_1 = float4(float(sc_1[0]), float(sc_1[2]), float(sc_1[4]), float(sc_1[6]));
+        const float4 yl_sum4 = float4(yl_sum_0, yl_sum_1, yl_sum_2, yl_sum_3);
+        sumf[0] += d_0 * fma(-32.0f, dot(yl_sum4, sc4_0), dot(sums_0, sc4_0));
+        sumf[1] += d_1 * fma(-32.0f, dot(yl_sum4, sc4_1), dot(sums_1, sc4_1));
     }
 
     device float* out = Y + (p.y_offset / 4u);
