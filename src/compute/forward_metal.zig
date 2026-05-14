@@ -5567,7 +5567,14 @@ fn dispatchFlashAttnOnCmd(
         &engine.attn_sinks_buf,
     };
     const pipe = if (engine.kv_cache_q8) &engine.flash_attn_q8_pipe else &engine.flash_attn_pipe;
-    cmd.dispatchV2(pipe, .{ n_heads, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
+    // Cycle 99: flash_attn.metal FLASH_TG_SIZE halved 64 → 32 (single
+    // simdgroup) to unblock V-loop utilization at Qwen3-8B vec4_dim=32 and
+    // collapse all threadgroup reductions to bare simd_max/simd_sum. The
+    // dispatch threads-per-TG MUST match FLASH_TG_SIZE — mismatched dispatch
+    // breaks the reduction merge contract (subgroup_size < FLASH_TG_SIZE
+    // branch). flash_attn_q8 still uses 64 (unchanged).
+    const tg_threads: u32 = if (engine.kv_cache_q8) 64 else 32;
+    cmd.dispatchV2(pipe, .{ n_heads, 1, 1 }, .{ tg_threads, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
 }
 
 fn dispatchKvCacheWriteOnCmd(
@@ -14032,7 +14039,7 @@ test "flash_attn shader handles contiguous Metal KV cache fast path" {
     const bufs = [_]*const MetalBuffer{ &page_table_buf, &q_buf, &k_cache_buf, &v_cache_buf, &out_buf, &sinks_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ n_heads, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
+    cmd.dispatchV2(&pipe, .{ n_heads, 1, 1 }, .{ 32, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
     cmd.commitAndWait();
 
     var expected: [4]f32 = undefined;
@@ -14121,7 +14128,7 @@ test "flash_attn shader respects sliding window mask" {
     const bufs = [_]*const MetalBuffer{ &page_table_buf, &q_buf, &k_cache_buf, &v_cache_buf, &out_buf, &sinks_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ n_heads, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
+    cmd.dispatchV2(&pipe, .{ n_heads, 1, 1 }, .{ 32, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
     cmd.commitAndWait();
 
     const out_ptr: [*]const f32 = @ptrCast(@alignCast(out_buf.cpu_ptr.?));

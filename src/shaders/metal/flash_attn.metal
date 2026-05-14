@@ -13,7 +13,24 @@ struct FlashAttnPush {
     uint kv_token_stride_bytes;
 };
 
-constant uint FLASH_TG_SIZE = 64;
+// Cycle 99: halve FLASH_TG_SIZE from 64 to 32 (= 1 simdgroup on Apple7/Apple9).
+// For Qwen3-8B head_dim=128 → vec4_dim=32, the V loop `for (vi = tid; vi < 32;
+// vi += FLASH_TG_SIZE)` previously launched only threads with tid<32 — half the
+// threadgroup (tid 32..63) idled through the entire V accumulator pass. At
+// FLASH_TG_SIZE=32 all 32 threads work the V loop. Additionally, since the
+// threadgroup is now a single simdgroup (Apple's wave width = 32), both
+// `reduceThreadgroupMax` and the inline post-softmax sum collapse to bare
+// `simd_max` / `simd_sum`: the `subgroup_size < FLASH_TG_SIZE` branch becomes
+// statically false, eliminating the TG-write of `reduce[simd_group]`, the
+// threadgroup barrier guarding it, and the cross-simdgroup merge loop. QK
+// pass does 2× per-thread work (8 vs 4 tokens at block_tokens=256, TG_SIZE=32)
+// but the existing 4-chain FMA split (cycle 96) keeps the chain depth at the
+// 4-cycle FMA latency hiding regime, so the doubling is throughput-amortized
+// rather than latency-amortized. Net effect: V-loop utilization 50% → 100%,
+// scores barrier remains (cross-thread V reads), all other reductions go
+// barrier-free. Gemma head_dim=512 (vec4_dim=128) still works correctly —
+// each thread does 4 V iters instead of 2, fully utilized either way.
+constant uint FLASH_TG_SIZE = 32;
 constant uint FLASH_BLOCK_TOKENS = 256;
 // Max head_dim supported. Gemma 4 global attention layers use head_dim=512;
 // SWA layers use 256. Sized for the larger value so a single shader handles both.
