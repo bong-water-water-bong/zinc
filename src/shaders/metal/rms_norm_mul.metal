@@ -25,11 +25,6 @@ kernel void main0(
 ) {
     threadgroup float shmem[32]; // one slot per simdgroup
 
-    if (simd_lane == 0) {
-        shmem[simd_group] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     const uint base = group_id * p.n;
 
     float sum_sq = 0.0f;
@@ -47,24 +42,16 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Final reduction in simdgroup 0
-    float total = 0.0f;
-    if (simd_group == 0) {
-        const uint n_groups = (tg_size + subgroup_size - 1) / subgroup_size;
-        total = (simd_lane < n_groups) ? shmem[simd_lane] : 0.0f;
-        total = simd_sum(total);
-    }
-
-    // Broadcast rms_inv to all threads. fast::rsqrt + fast::divide (Apple HW
-    // reciprocal-sqrt + reciprocal-mul, same pattern as residual_rms_norm.metal
-    // cycle 13). Only thread 0 computes, so ~144 RMS dispatches/token on
-    // Qwen3-8B each save one transcendental.
-    threadgroup float shared_rms_inv;
-    if (tid == 0) {
-        shared_rms_inv = fast::rsqrt(fast::divide(total, float(p.n)) + p.eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float rms_inv = shared_rms_inv;
+    // Every simdgroup does the final reduction + rms_inv independently.
+    // Avoids the rms_inv broadcast barrier (used to be: thread 0 computes
+    // rsqrt, writes to threadgroup mem, barrier, all 1024 threads read).
+    // Work is duplicated 32× but Apple7 issues the same fast::rsqrt in
+    // parallel across simdgroups; the saved barrier — ~144 dispatches/token
+    // on Qwen3-8B — is net positive.
+    const uint n_groups = (tg_size + subgroup_size - 1) / subgroup_size;
+    float total = (simd_lane < n_groups) ? shmem[simd_lane] : 0.0f;
+    total = simd_sum(total);
+    const float rms_inv = fast::rsqrt(fast::divide(total, float(p.n)) + p.eps);
 
     for (uint i = tid; i < p.n; i += tg_size) {
         output[base + i] = weights[i] * (input[base + i] * rms_inv);
