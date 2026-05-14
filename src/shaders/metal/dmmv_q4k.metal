@@ -220,8 +220,25 @@ kernel void main0(
             float(sc8_1[5]) * (1.f / 16.f));
         const float4 sc_neg_0 = float4(sc8_0[2], sc8_0[3], sc8_0[6], sc8_0[7]);
         const float4 sc_neg_1 = float4(sc8_1[2], sc8_1[3], sc8_1[6], sc8_1[7]);
-        sumf[0] += dh_0[0] * dot(head_pair_0, sc_pos_0) - dh_0[1] * dot(sumy, sc_neg_0);
-        sumf[1] += dh_1[0] * dot(head_pair_1, sc_pos_1) - dh_1[1] * dot(sumy, sc_neg_1);
+        // Cycle 61: port cycle 60's cross-row reduction vectorization. The two
+        // independent `dh[0]*dot(head,sc_pos) - dh[1]*dot(sumy,sc_neg)` chains
+        // (row 0, row 1) form a natural 2-wide ALU shape: pack the (d, dmin)
+        // halves across both rows into float2s, the (head_dot, tail_dot) per
+        // row into float2s, and fold the 2 scalar `a*b - c*d` chains into one
+        // vec2 mul + one vec2 fma producing a float2 `delta` of the 2 per-row
+        // increments. Mirrors cycle 60's 4-wide pattern in
+        // dmmv_q4k_dense_gate_up_swiglu.metal, applied here at the cross-row
+        // axis only (no gate/up pairing in the plain matvec). dmmv_q4k.metal
+        // serves attn_qkv / attn_o / ffn_down on Qwen3-8B dense (Q4_K =
+        // 71.6% of decode bytes/token, this kernel covers the ~53% slice
+        // complementing the swiglu kernel's ffn_gate+ffn_up).
+        const float2 dh_d = float2(float(dh_0[0]), float(dh_1[0]));
+        const float2 dh_dmin = float2(float(dh_0[1]), float(dh_1[1]));
+        const float2 head_dots = float2(dot(head_pair_0, sc_pos_0), dot(head_pair_1, sc_pos_1));
+        const float2 tail_dots = float2(dot(sumy, sc_neg_0), dot(sumy, sc_neg_1));
+        const float2 delta = fma(dh_d, head_dots, -dh_dmin * tail_dots);
+        sumf[0] += delta[0];
+        sumf[1] += delta[1];
 
         y4 += 4 * QK_K;
     }
