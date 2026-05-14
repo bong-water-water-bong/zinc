@@ -20,6 +20,11 @@ constant uint FLASH_BLOCK_TOKENS = 256;
 constant uint FLASH_MAX_HEAD_DIM = 512;
 constant uint FLASH_MAX_HEAD_VEC4 = FLASH_MAX_HEAD_DIM / 4;
 
+// Simdgroup-redundant-reduction pattern: each simdgroup lane-0 writes its
+// wave-reduced partial into scratch, then after a single threadgroup barrier
+// every thread re-reads all partials and merges them locally. Saves the
+// second broadcast barrier vs the prior "tid==0 merges, barrier, all read"
+// idiom. Same pattern that won in cycles 15/16/17 for the rms_norm shaders.
 inline float reduceThreadgroupMax(
     float local_value,
     threadgroup float* scratch,
@@ -34,16 +39,12 @@ inline float reduceThreadgroupMax(
             scratch[simd_group] = wave_max;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0u) {
-            const uint n_groups = (FLASH_TG_SIZE + subgroup_size - 1u) / subgroup_size;
-            float merged = -INFINITY;
-            for (uint sg = 0u; sg < n_groups; ++sg) {
-                merged = fast::max(merged, scratch[sg]);
-            }
-            scratch[0] = merged;
+        const uint n_groups = (FLASH_TG_SIZE + subgroup_size - 1u) / subgroup_size;
+        float merged = -INFINITY;
+        for (uint sg = 0u; sg < n_groups; ++sg) {
+            merged = fast::max(merged, scratch[sg]);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        return scratch[0];
+        return merged;
     }
     return wave_max;
 }
@@ -62,16 +63,12 @@ inline float reduceThreadgroupSum(
             scratch[simd_group] = wave_sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0u) {
-            const uint n_groups = (FLASH_TG_SIZE + subgroup_size - 1u) / subgroup_size;
-            float merged = 0.0f;
-            for (uint sg = 0u; sg < n_groups; ++sg) {
-                merged += scratch[sg];
-            }
-            scratch[0] = merged;
+        const uint n_groups = (FLASH_TG_SIZE + subgroup_size - 1u) / subgroup_size;
+        float merged = 0.0f;
+        for (uint sg = 0u; sg < n_groups; ++sg) {
+            merged += scratch[sg];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        return scratch[0];
+        return merged;
     }
     return wave_sum;
 }
