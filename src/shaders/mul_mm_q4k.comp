@@ -6,10 +6,12 @@
 // per-token Q4_K DMMV. Pipeline registers at startup; no production
 // callers in this cycle.
 //
-// Tile shape: BM=32 rows × BN=16 cols × BK=32 K-elements per outer step.
+// Tile shape: BM=32 rows × BN=32 cols × BK=32 K-elements per outer step.
 // Each WG produces a BM × BN output tile. WG = 64 threads (one wave64
-// subgroup, RDNA4-friendly). Each thread accumulates a TM × TN = 4 × 2
+// subgroup, RDNA4-friendly). Each thread accumulates a TM × TN = 4 × 4
 // register sub-tile; threads-per-row × threads-per-col = 8 × 8 = 64.
+// BN widened from 16 to 32 to halve the A-weight re-reads in prefill:
+// for an N=105 prompt, N-tiles drop from 7 to 4 (-43% A bandwidth).
 //
 // Memory layout:
 //   A: M × K Q4_K. Row stride (in bytes) = (K/256) × 144. As u32 = (K/256) × 36.
@@ -37,10 +39,10 @@
 #extension GL_EXT_control_flow_attributes : require
 
 const uint BM = 32u;
-const uint BN = 16u;
+const uint BN = 32u;
 const uint BK = 32u;
 const uint TM = 4u;
-const uint TN = 2u;
+const uint TN = 4u;
 const uint WG_SIZE = 64u;
 const uint TPR_M = BM / TM;          // threads-per-row-axis = 8
 const uint TPR_N = BN / TN;          // threads-per-col-axis = 8
@@ -69,7 +71,7 @@ layout(set = 0, binding = 1) readonly buffer MatB { float b_data[]; };
 layout(set = 0, binding = 2) writeonly buffer MatD { float d_data[]; };
 
 shared float buf_a[BM * STRIDE_A];   // 32 * 33 = 1056 floats = 4.125 KB
-shared float buf_b[BN * STRIDE_B];   // 16 * 33 =  528 floats = 2.06  KB
+shared float buf_b[BN * STRIDE_B];   // 32 * 33 = 1056 floats = 4.125 KB
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
@@ -185,18 +187,18 @@ void main() {
             }
         }
 
-        // ---- Load B tile (BN × BK = 16 × 32 = 512 floats) ----
-        // 64 threads × 8 floats each. Thread t covers col (t/4),
-        // K offset (t%4)*8, length 8.
+        // ---- Load B tile (BN × BK = 32 × 32 = 1024 floats) ----
+        // 64 threads × 16 floats each. Thread t covers col (t/2),
+        // K offset (t%2)*16, length 16. Mirrors the A-tile load pattern.
         {
-            const uint col_local = tid / 4u;
-            const uint k_in_tile_b = (tid & 3u) * 8u;
+            const uint col_local = tid / 2u;
+            const uint k_in_tile_b = (tid & 1u) * 16u;
             const uint col_global = ic * BN + col_local;
             const bool col_ok = col_global < N;
             const uint b_col_base = b_offset + col_global * stride_b;
             const uint base_b = col_local * STRIDE_B + k_in_tile_b;
 
-            [[unroll]] for (uint i = 0u; i < 8u; i++) {
+            [[unroll]] for (uint i = 0u; i < 16u; i++) {
                 float v = 0.0;
                 if (col_ok) {
                     const uint k_global = k_outer + k_in_tile_b + i;

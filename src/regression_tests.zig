@@ -131,9 +131,12 @@ test "Vulkan batched prefill keeps RDNA default and Intel opt-in" {
 test "Vulkan batched projection chunk size matches selected shader family" {
     const src = @embedFile("compute/forward.zig");
     const fn_marker = "fn dispatchProjectionBatched(";
-    try expectContainsNear(src, fn_marker, "const SERIAL_MAX_COLS: u32 = 32;", 1600);
-    try expectContainsNear(src, fn_marker, "const KPAR_MAX_COLS: u32 = 40;", 1600);
-    try expectContainsNear(src, fn_marker, "if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS", 2400);
+    // Window widened by the mul_mm_q4k fast-path block prepended in
+    // effort-6 Step 5; the SERIAL_MAX_COLS/KPAR_MAX_COLS constants stay
+    // co-located with the kpar/serial chunk loop further down.
+    try expectContainsNear(src, fn_marker, "const SERIAL_MAX_COLS: u32 = 32;", 3200);
+    try expectContainsNear(src, fn_marker, "const KPAR_MAX_COLS: u32 = 40;", 3200);
+    try expectContainsNear(src, fn_marker, "if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS", 4000);
 }
 
 test "Vulkan batched projection kpar is allowed on Intel wave32" {

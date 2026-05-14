@@ -1188,9 +1188,9 @@ pub const DmmvDispatch = struct {
             .{ .buffer = b_buf, .offset = 0, .range = b_size },
             .{ .buffer = d_buf, .offset = 0, .range = d_size },
         };
-        // BM=32, BN=16 in the shader; keep these in sync.
+        // BM=32, BN=32 in the shader; keep these in sync.
         const wg_x = (M + 31) / 32;
-        const wg_y = (N + 15) / 16;
+        const wg_y = (N + 31) / 32;
         cmd.pushDescAndDispatch(
             pip,
             push_desc_fn,

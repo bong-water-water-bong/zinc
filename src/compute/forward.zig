@@ -1139,6 +1139,15 @@ pub const InferenceEngine = struct {
     // impact is bounded; the win comes later when the same shader feeds
     // the per-prompt-token MoE phase via Step 2 (MUL_MAT_ID variant).
     use_mul_mm_lm_head: bool = false,
+    // Effort-6 Step 5 wire-in (deferred from cycle 40, called out in
+    // loops/optimize_perf.ts structuralSwingIdeas as the mul_mm_q4k
+    // projection prefill amortization). Default ON when the
+    // mul_mm_q4k pipeline is loaded and push descriptors are available;
+    // opt out via ZINC_MUL_MM_PROJ=0. Routes Q4_K projection batches
+    // (Q/K/V/O/gate/up/down) through the tiled 32×16 GEMM when
+    // n_tokens >= 16 — the BN=16 tile is saturated and the same A-tile
+    // is reused across N, which the chunked kpar shader cannot do.
+    use_mul_mm_proj: bool = false,
     // Opt-in via ZINC_Q8_WIDE_LM_HEAD=1. Routes only very tall Q8_0
     // matrices (LM head) to an alternate two-row shader that shares
     // x-vector loads across rows.
@@ -2338,6 +2347,26 @@ pub const InferenceEngine = struct {
             log.info("ZINC_MUL_MM_LM_HEAD=1 requested but prerequisites missing (mul_mm_q4k pipeline or push descriptors); using DMMV", .{});
         }
 
+        // Effort-6 Step 5 wire-in: route Q4_K prefill projections through the
+        // tiled mul_mm_q4k pipeline when n_tokens >= 16. Default ON because
+        // (a) the pipeline is already loaded and validated against per-token
+        // DMMV via the LM-head path, (b) the chunked kpar shader re-reads the
+        // full weight tensor once per MAX_COLS=40 chunk while mul_mm reuses an
+        // M-tile across all N-tiles, and (c) decode (n_tokens=1) and Q6_K
+        // tensors are unaffected because dispatchProjectionBatched gates on
+        // tensor type + token count and falls back to the existing path
+        // otherwise. Opt out via ZINC_MUL_MM_PROJ=0.
+        const mul_mm_proj_env = std.posix.getenv("ZINC_MUL_MM_PROJ");
+        const mul_mm_proj_explicitly_off = mul_mm_proj_env != null and std.mem.eql(u8, mul_mm_proj_env.?, "0");
+        const mul_mm_proj_enabled = !mul_mm_proj_explicitly_off and
+            dmmv.pipeline_mul_mm_q4k != null and
+            instance.push_descriptor_fn != null;
+        if (mul_mm_proj_enabled) {
+            log.info("Q4_K projection mul_mm path ENABLED (default; set ZINC_MUL_MM_PROJ=0 to disable)", .{});
+        } else if (mul_mm_proj_explicitly_off) {
+            log.info("Q4_K projection mul_mm path DISABLED via ZINC_MUL_MM_PROJ=0; using kpar/serial batch shaders", .{});
+        }
+
         const q8_wide_lm_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD");
         const q8_wide_lm_flag = q8_wide_lm_env != null and std.mem.eql(u8, q8_wide_lm_env.?, "1");
         const q8_wide_lm_enabled = q8_wide_lm_flag and dmmv.pipeline_q8_0_wide != null;
@@ -2589,6 +2618,7 @@ pub const InferenceEngine = struct {
             .use_batch_attn = batch_attn_enabled,
             .use_capture_routing = capture_flag and routing_capture_buf.handle != null,
             .use_mul_mm_lm_head = mul_mm_lm_head_enabled,
+            .use_mul_mm_proj = mul_mm_proj_enabled,
             .use_q8_wide_lm_head = q8_wide_lm_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
@@ -8645,6 +8675,42 @@ pub const InferenceEngine = struct {
         K: u32,
         n_tokens: u32,
     ) !void {
+        // Fast path (effort-6 Step 5): route Q4_K projections with N >= 16 through
+        // the tiled mul_mm_q4k pipeline. The kpar shader reads the M × K weight
+        // tensor once per MAX_COLS=40 chunk (3× for an N=105 prefill), whereas
+        // the tiled GEMM keeps each 32-row weight tile resident in shared memory
+        // and walks K once per N-tile. Layout-compatible with the kpar X/Y
+        // buffers: column-major X[col][k] at offset col*K floats, column-major
+        // Y[col][row] at offset col*M floats. Falls through to the kpar/serial
+        // path for Q6_K tensors, for N < 16, when the pipeline failed to load,
+        // or when push descriptors aren't available. K is guaranteed to be a
+        // multiple of 256 for Q4_K (super-block size) — defensive check anyway.
+        if (self.use_mul_mm_proj and
+            tensor.info.type_ == .q4_k and
+            n_tokens >= 16 and
+            (K & 255) == 0 and
+            self.dmmv.pipeline_mul_mm_q4k != null)
+        {
+            try self.dmmv.recordMulMmQ4K(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                tensor.gpu_buffer.handle,
+                tensor.gpu_buffer.size,
+                x_buf.handle,
+                x_buf.size,
+                y_buf.handle,
+                y_buf.size,
+                M,
+                n_tokens,
+                K,
+                K, // stride_b: per-col floats in B (one column = K elements)
+                M, // stride_d: per-col floats in D (one column = M elements)
+                0, // a_offset (bytes)
+                0, // b_offset (floats)
+                0, // d_offset (floats)
+            );
+            return;
+        }
         // Keep these in sync with the GLSL arrays:
         // - dmmv_q{4,6}k_batch.comp:       MAX_COLS = 32
         // - dmmv_q{4,6}k_batch_kpar.comp:  MAX_COLS = 40
