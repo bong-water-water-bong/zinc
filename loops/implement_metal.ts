@@ -1859,7 +1859,17 @@ async function main() {
     // best upward by accumulated noise (Effort 12 cycles 1-24). Below the
     // floor the hardcoded values still apply, so the behavior is
     // unchanged on the 12B effort where prevTps was 30+ tok/s.
-    const improveBand = Math.max(0.5, prevTps * 0.05);
+    //
+    // Effort 14 2026-05-14: dropped improveBand from 5% to 2% because
+    // the new 7-sample 2-trim harness regularly produces sample ranges
+    // of 0.3-1.0 tok/s — tighter than the old 1-3 tok/s spreads. At a
+    // best of 44.25 the 5% threshold was 2.21 tok/s, which never fired
+    // even when cycles repeatedly measured 46.0+. Best stayed stuck at
+    // the Cycle 2 number across 30+ cycles while the actual tree state
+    // was clearly faster. The 2% threshold (0.89 tok/s at 44.25) is
+    // still well above the typical trimmed range so it can't ratchet
+    // on noise, but real wins of 1-2% can promote.
+    const improveBand = Math.max(0.3, prevTps * 0.02);
     const noiseBand = Math.max(0.3, prevTps * 0.03);
 
     if (verify.buildExitCode !== 0 || verify.testExitCode !== 0) {
