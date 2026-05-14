@@ -214,23 +214,29 @@ kernel void main0(
         const float rescale = running_sum > 0.0f ? fast::exp(running_max - next_max) : 0.0f;
 
         // Strided loop over head_dim slices when vec4_dim > FLASH_TG_SIZE.
-        // Cycle 91: port cycle 90's 4-wide-accumulator pattern from the QK
-        // reduction to the V accumulator. The legacy form
-        // `acc += V_t * scores[t]` is a serial scalar-dep chain of length
-        // `block_tokens` on the single `acc` float4 register (up to ~133 for
-        // Qwen3-8B decode at n=128). Split into 4 independent accumulators
-        // `acc0..acc3` over staggered tokens t,t+1,t+2,t+3 to build 4
-        // independent FMA chains, cut critical-path depth to ~block_tokens/4,
-        // then collapse with `(acc0+acc1)+(acc2+acc3)` after the loop. Same
-        // associativity argument as cycle 90: sum-of-(v*s) = sum-of-sums by
-        // reassociation; the per-lane add order differs but fast::math
-        // tolerance already accepted by this kernel covers it. Tail handles
-        // the residual <4 tokens scalar-style on acc0.
+        // Cycle 93: extend cycle 91's 4-wide V accumulator to 8-wide
+        // (acc0..acc7 over 8 staggered tokens). With ~133 V·scores FMAs per
+        // (vi, block) for Qwen3-8B decode at n=128, the 4-wide form had 4
+        // serial chains of depth ~33 FMAs each; the 8-wide form has 8 chains
+        // of depth ~17 — halving the critical-path FMA latency if the loop
+        // is latency-bound (which it is at chain-depth ~33 × FMA latency
+        // ≫ throughput-limit). 8 float4 accumulators + 8 transient float4
+        // V loads = 64 32-bit regs of pressure, well within Apple GPU per-
+        // thread register budget. Tail at 4-wide → 1-wide preserves
+        // correctness for residual tokens. Same associativity argument as
+        // cycles 90/91: sum-of-(v*s) = sum-of-sums by reassociation, within
+        // existing fast::math tolerance. Collapse with a balanced 3-level
+        // tree `((a0+a1)+(a2+a3)) + ((a4+a5)+(a6+a7))` to keep the final
+        // reduction depth at log2(8)=3 instead of serial.
         for (uint vi = tid; vi < vec4_dim; vi += FLASH_TG_SIZE) {
             float4 acc0 = acc_cache4[vi] * rescale;
             float4 acc1 = float4(0.0f);
             float4 acc2 = float4(0.0f);
             float4 acc3 = float4(0.0f);
+            float4 acc4 = float4(0.0f);
+            float4 acc5 = float4(0.0f);
+            float4 acc6 = float4(0.0f);
+            float4 acc7 = float4(0.0f);
             const uint dim_base = vi << 2;
 
             if (contiguous_kv) {
@@ -238,7 +244,30 @@ kernel void main0(
                 const uint stride2 = token_stride << 1;
                 const uint stride3 = stride2 + token_stride;
                 const uint stride4 = token_stride << 2;
+                const uint stride5 = stride4 + token_stride;
+                const uint stride6 = stride4 + stride2;
+                const uint stride7 = stride4 + stride3;
+                const uint stride8 = token_stride << 3;
                 uint t = 0;
+                for (; t + 8u <= block_tokens; t += 8u) {
+                    const float4 v0 = *(device const float4*)(v_cache + kv_base);
+                    const float4 v1 = *(device const float4*)(v_cache + kv_base + token_stride);
+                    const float4 v2 = *(device const float4*)(v_cache + kv_base + stride2);
+                    const float4 v3 = *(device const float4*)(v_cache + kv_base + stride3);
+                    const float4 v4 = *(device const float4*)(v_cache + kv_base + stride4);
+                    const float4 v5 = *(device const float4*)(v_cache + kv_base + stride5);
+                    const float4 v6 = *(device const float4*)(v_cache + kv_base + stride6);
+                    const float4 v7 = *(device const float4*)(v_cache + kv_base + stride7);
+                    acc0 += v0 * scores[t + 0u];
+                    acc1 += v1 * scores[t + 1u];
+                    acc2 += v2 * scores[t + 2u];
+                    acc3 += v3 * scores[t + 3u];
+                    acc4 += v4 * scores[t + 4u];
+                    acc5 += v5 * scores[t + 5u];
+                    acc6 += v6 * scores[t + 6u];
+                    acc7 += v7 * scores[t + 7u];
+                    kv_base += stride8;
+                }
                 for (; t + 4u <= block_tokens; t += 4u) {
                     const float4 v0 = *(device const float4*)(v_cache + kv_base);
                     const float4 v1 = *(device const float4*)(v_cache + kv_base + token_stride);
@@ -256,6 +285,24 @@ kernel void main0(
                 }
             } else {
                 uint t = 0;
+                for (; t + 8u <= block_tokens; t += 8u) {
+                    const uint kb0 = kvBaseForToken(page_table, p, kv_head, block_start + t + 0u);
+                    const uint kb1 = kvBaseForToken(page_table, p, kv_head, block_start + t + 1u);
+                    const uint kb2 = kvBaseForToken(page_table, p, kv_head, block_start + t + 2u);
+                    const uint kb3 = kvBaseForToken(page_table, p, kv_head, block_start + t + 3u);
+                    const uint kb4 = kvBaseForToken(page_table, p, kv_head, block_start + t + 4u);
+                    const uint kb5 = kvBaseForToken(page_table, p, kv_head, block_start + t + 5u);
+                    const uint kb6 = kvBaseForToken(page_table, p, kv_head, block_start + t + 6u);
+                    const uint kb7 = kvBaseForToken(page_table, p, kv_head, block_start + t + 7u);
+                    acc0 += *(device const float4*)(v_cache + kb0 + dim_base) * scores[t + 0u];
+                    acc1 += *(device const float4*)(v_cache + kb1 + dim_base) * scores[t + 1u];
+                    acc2 += *(device const float4*)(v_cache + kb2 + dim_base) * scores[t + 2u];
+                    acc3 += *(device const float4*)(v_cache + kb3 + dim_base) * scores[t + 3u];
+                    acc4 += *(device const float4*)(v_cache + kb4 + dim_base) * scores[t + 4u];
+                    acc5 += *(device const float4*)(v_cache + kb5 + dim_base) * scores[t + 5u];
+                    acc6 += *(device const float4*)(v_cache + kb6 + dim_base) * scores[t + 6u];
+                    acc7 += *(device const float4*)(v_cache + kb7 + dim_base) * scores[t + 7u];
+                }
                 for (; t + 4u <= block_tokens; t += 4u) {
                     const uint kb0 = kvBaseForToken(page_table, p, kv_head, block_start + t + 0u);
                     const uint kb1 = kvBaseForToken(page_table, p, kv_head, block_start + t + 1u);
@@ -272,7 +319,7 @@ kernel void main0(
                 }
             }
 
-            acc_cache4[vi] = (acc0 + acc1) + (acc2 + acc3);
+            acc_cache4[vi] = ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7));
         }
         // No threadgroup_barrier here: acc_cache4 is accessed exclusively via
         // per-thread strided indexing (vi = tid; vi += FLASH_TG_SIZE), so each
