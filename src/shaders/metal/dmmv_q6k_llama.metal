@@ -132,21 +132,33 @@ kernel void main0(
         float4 sums_0 = float4(0.0f);
         float4 sums_1 = float4(0.0f);
         FOR_UNROLL (ushort l = 0u; l < 4u; ++l) {
-            const uint h0 = uint(qhv4_0[l]);
-            const uint q1b0 = uint(q1v4_0[l]);
-            const uint q2b0 = uint(q2v4_0[l]);
-            const float q00 = float((q1b0 & 0x0Fu) | ((h0 & kmask1) << 4u));
-            const float q10 = float((q2b0 & 0x0Fu) | ((h0 & kmask2) << 2u));
-            const float q20 = float((q1b0 >> 4u)    | ((h0 & kmask3) << 0u));
-            const float q30 = float((q2b0 >> 4u)    | ((h0 & kmask4) >> 2u));
+            // Cycle 58: vectorize the per-lane bit-twiddling of Q6_K dequant.
+            // The four output lanes [q00, q10, q20, q30] each take a 2-bit
+            // window from `h` and OR it into the high bits of a 4-bit nibble
+            // from q1b/q2b. The 2-bit windows are at positions 0..1, 2..3,
+            // 4..5, 6..7 of h, all placed at output bit positions 4..5 —
+            // i.e. a sliding-window extraction with stride 2. That collapses
+            // to `(ushort4(h, h>>2, h>>4, h>>6) & 0x03) << 4`, a vector
+            // right-shift splat + uniform AND + uniform left-shift. The
+            // nibble part decomposes symmetrically: ushort4(q1b, q2b, q1b,
+            // q2b) split into low/high via one ushort2 AND and one ushort2
+            // shift. Replaces 16 scalar bit ops per row (8 ANDs + 4 shifts +
+            // 4 ORs) with ~6 vector ops per row; same compiler-hint pattern
+            // as cycles 44-50 on Q4_K. Q6_K covers ffn_down on Qwen3-8B
+            // (28.4% of decode bytes/token).
+            const ushort h0 = ushort(qhv4_0[l]);
+            const ushort q1b0 = ushort(q1v4_0[l]);
+            const ushort q2b0 = ushort(q2v4_0[l]);
+            const ushort2 q12_0 = ushort2(q1b0, q2b0);
+            const ushort4 q_base_0 = ushort4(q12_0 & ushort2(0x0F), q12_0 >> ushort2(4));
+            const ushort4 h_part_0 = (ushort4(h0, h0 >> 2, h0 >> 4, h0 >> 6) & ushort4(0x03)) << ushort4(4);
 
-            const uint h1 = uint(qhv4_1[l]);
-            const uint q1b1 = uint(q1v4_1[l]);
-            const uint q2b1 = uint(q2v4_1[l]);
-            const float q01 = float((q1b1 & 0x0Fu) | ((h1 & kmask1) << 4u));
-            const float q11 = float((q2b1 & 0x0Fu) | ((h1 & kmask2) << 2u));
-            const float q21 = float((q1b1 >> 4u)    | ((h1 & kmask3) << 0u));
-            const float q31 = float((q2b1 >> 4u)    | ((h1 & kmask4) >> 2u));
+            const ushort h1 = ushort(qhv4_1[l]);
+            const ushort q1b1 = ushort(q1v4_1[l]);
+            const ushort q2b1 = ushort(q2v4_1[l]);
+            const ushort2 q12_1 = ushort2(q1b1, q2b1);
+            const ushort4 q_base_1 = ushort4(q12_1 & ushort2(0x0F), q12_1 >> ushort2(4));
+            const ushort4 h_part_1 = (ushort4(h1, h1 >> 2, h1 >> 4, h1 >> 6) & ushort4(0x03)) << ushort4(4);
 
             // Cycle 44: replace 16 indexed scalar `sums_X[k] += ylv * q` writes
             // (8 per row × 2 rows) with 2 explicit `float4` `fma(yl4, q4_X, sums_X)`
@@ -157,8 +169,8 @@ kernel void main0(
             // 4-wide; the indexed scalar form sometimes leaves the compiler
             // emitting 4 narrower FMAs back-to-back instead of a single quad FMA.
             const float4 yl4 = float4(yl[4u * l + 0u], yl[4u * l + 1u], yl[4u * l + 2u], yl[4u * l + 3u]);
-            const float4 q4_0 = float4(q00, q10, q20, q30);
-            const float4 q4_1 = float4(q01, q11, q21, q31);
+            const float4 q4_0 = float4(q_base_0 | h_part_0);
+            const float4 q4_1 = float4(q_base_1 | h_part_1);
             sums_0 = fma(yl4, q4_0, sums_0);
             sums_1 = fma(yl4, q4_1, sums_1);
         }
