@@ -59,7 +59,15 @@ inline float4 q4k_block_dot_parts(
 
     device const ushort* sc = (device const ushort*)(block + 4) + iq;
     device const ushort* q1 = (device const ushort*)(block + 16) + 16 * iq + 4 * ir;
-    device const half* dh = (device const half*)block;
+    // Cycle 68: port cycles 66/67's half2 dh-load pattern to qk_dual.
+    // Block layout starts with `[d (half), dmin (half)]` at byte offsets
+    // 0..3, exactly a half2 pair matching 4-byte block alignment. Replaces
+    // 2 scalar half reads (dh[0] = d, dh[1] = dmin) with one packed half2
+    // load + .x/.y swizzles. The helper is called twice per ib (once per
+    // row), so per-ib this folds 4 scalar half loads → 2 half2 loads.
+    // dmmv_q4k_qk_dual.metal handles Qwen3-8B attn_qkv Q+K paired
+    // (~18.5% of decode bytes/token via the 25.08 GiB attn path).
+    const half2 dh = *((device const half2*)block);
 
     sc16[0] = sc[0] & kmask1;
     sc16[1] = sc[2] & kmask1;
@@ -93,7 +101,7 @@ inline float4 q4k_block_dot_parts(
         float(sc8[4]),
         float(sc8[5]) * (1.f / 16.f));
     const float4 sc_neg = float4(sc8[2], sc8[3], sc8[6], sc8[7]);
-    return float4(dot(head_pair, sc_pos), dot(sumy, sc_neg), float(dh[0]), float(dh[1]));
+    return float4(dot(head_pair, sc_pos), dot(sumy, sc_neg), float(dh.x), float(dh.y));
 }
 
 kernel void main0(
