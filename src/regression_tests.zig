@@ -110,10 +110,11 @@ test "Metal prefillBatched supports prefix reuse by extending KV at state.positi
 
 test "Vulkan prefillBatched gates on env flag + canUseBatchedPrefillRdna" {
     const src = @embedFile("compute/forward.zig");
+    const fn_marker = "fn prefillBatchedImpl(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {";
     try expectContains(src, "ZINC_BATCHED_PREFILL");
     try expectContains(src, "fn canUseBatchedPrefillRdna(engine: *const InferenceEngine) bool {");
-    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "canUseBatchedPrefillRdna(self)", 2000);
-    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "ensureBatchedScratchCapacity", 2000);
+    try expectContainsNear(src, fn_marker, "canUseBatchedPrefillRdna(self)", 2000);
+    try expectContainsNear(src, fn_marker, "ensureBatchedScratchCapacity", 2000);
 }
 
 test "Vulkan batched prefill keeps RDNA default and Intel opt-in" {
@@ -122,14 +123,29 @@ test "Vulkan batched prefill keeps RDNA default and Intel opt-in" {
     try expectContainsNear(src, fn_marker, "vendor == .amd_rdna3", 900);
     try expectContainsNear(src, fn_marker, "vendor == .amd_rdna4", 900);
     try expectContainsNear(src, fn_marker, "vendor == .amd_rdna4_apu", 900);
-    try expectContainsNear(src, fn_marker, "vendor == .intel_arc_xe2", 900);
+    try expectContainsNear(src, "fn isIntelGpuVendor", "vendor == .intel_arc_xe2", 200);
     try expectContainsNear(src, fn_marker, "ZINC_INTEL_BATCHED_PREFILL", 1200);
     try expectContainsNear(src, "if (is_intel) {", "return false;", 400);
 }
 
+test "Vulkan batched projection chunk size matches selected shader family" {
+    const src = @embedFile("compute/forward.zig");
+    const fn_marker = "fn dispatchProjectionBatched(";
+    try expectContainsNear(src, fn_marker, "const SERIAL_MAX_COLS: u32 = 32;", 1600);
+    try expectContainsNear(src, fn_marker, "const KPAR_MAX_COLS: u32 = 40;", 1600);
+    try expectContainsNear(src, fn_marker, "if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS", 2400);
+}
+
+test "Vulkan Intel batched prefill chunks the monolithic graph by default" {
+    const src = @embedFile("compute/forward.zig");
+    try expectContains(src, "ZINC_INTEL_BATCHED_PREFILL_CHUNK");
+    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine", "intelBatchedPrefillChunkLimit", 1200);
+    try expectContainsNear(src, "Intel batched prefill chunking ENABLED", "prefillBatchedImpl(state, prompt_tokens[offset..end])", 1200);
+}
+
 test "Vulkan prefillBatched uses all batched primitives in the per-layer loop" {
     const src = @embedFile("compute/forward.zig");
-    const fn_marker = "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {";
+    const fn_marker = "fn prefillBatchedImpl(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {";
     try expectContainsNear(src, fn_marker, "dispatchProjectionBatched", 24000);
     try expectContainsNear(src, fn_marker, "dispatchRopeBatched", 24000);
     try expectContainsNear(src, fn_marker, "dispatchKvCacheWriteBatched", 24000);
@@ -141,7 +157,7 @@ test "Vulkan prefillBatched uses all batched primitives in the per-layer loop" {
 
 test "Vulkan prefillBatched threads base_token through RoPE, KV write, flash attn" {
     const src = @embedFile("compute/forward.zig");
-    const fn_marker = "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {";
+    const fn_marker = "fn prefillBatchedImpl(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {";
     try expectContainsNear(src, fn_marker, "const base_token: u32 = state.position;", 6000);
     try expectContainsNear(src, fn_marker, "state.position = base_token + n_tokens;", 24000);
 }

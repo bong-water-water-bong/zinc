@@ -11,6 +11,7 @@ const CommandPool = @import("../vulkan/command.zig").CommandPool;
 const CommandBuffer = @import("../vulkan/command.zig").CommandBuffer;
 const Pipeline = @import("../vulkan/pipeline.zig").Pipeline;
 const GpuConfig = @import("../vulkan/gpu_detect.zig").GpuConfig;
+const GpuVendor = @import("../vulkan/gpu_detect.zig").GpuVendor;
 const loader = @import("../model/loader.zig");
 const Model = loader.Model;
 const ModelConfig = loader.ModelConfig;
@@ -789,7 +790,7 @@ fn canUseBatchedPrefillRdna(engine: *const InferenceEngine) bool {
     // opt-in until the Intel batched path is validated end-to-end.
     const vendor = engine.gpu_config.vendor;
     const is_amd = vendor == .amd_rdna3 or vendor == .amd_rdna4 or vendor == .amd_rdna4_apu;
-    const is_intel = vendor == .intel_arc_xe2 or vendor == .intel_arc;
+    const is_intel = isIntelGpuVendor(vendor);
     if (!is_amd and !is_intel) return false;
     if (is_intel) {
         const intel_batched_env = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL");
@@ -855,6 +856,17 @@ fn canUseBatchedPrefillRdna(engine: *const InferenceEngine) bool {
         if (q_rows == q_dim * 2) return false;
     }
     return true;
+}
+
+fn isIntelGpuVendor(vendor: GpuVendor) bool {
+    return vendor == .intel_arc_xe2 or vendor == .intel_arc;
+}
+
+fn intelBatchedPrefillChunkLimit(vendor: GpuVendor) u32 {
+    if (!isIntelGpuVendor(vendor)) return 0;
+    const raw = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL_CHUNK") orelse return 16;
+    if (std.mem.eql(u8, raw, "0")) return 0;
+    return std.fmt.parseInt(u32, raw, 10) catch 16;
 }
 
 // ---------------------------------------------------------------------------
@@ -8633,8 +8645,15 @@ pub const InferenceEngine = struct {
         K: u32,
         n_tokens: u32,
     ) !void {
-        // Keep in sync with dmmv_q{4,6}k_batch_kpar.comp's `const uint MAX_COLS`.
-        const MAX_COLS: u32 = 40;
+        // Keep these in sync with the GLSL arrays:
+        // - dmmv_q{4,6}k_batch.comp:       MAX_COLS = 32
+        // - dmmv_q{4,6}k_batch_kpar.comp:  MAX_COLS = 40
+        //
+        // Intel currently uses the serial batch shaders, not the wave64 kpar
+        // variants. Sending 40 columns to the serial shader overruns its
+        // 32-element register array and can end in FenceWaitFailed.
+        const SERIAL_MAX_COLS: u32 = 32;
+        const KPAR_MAX_COLS: u32 = 40;
         const f32_bytes: u32 = @sizeOf(f32);
         var chunk_start: u32 = 0;
         const kpar_pipeline: ?*const Pipeline = blk: {
@@ -8645,8 +8664,9 @@ pub const InferenceEngine = struct {
                 else => break :blk null,
             }
         };
+        const max_cols: u32 = if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS;
         while (chunk_start < n_tokens) {
-            const chunk: u32 = @min(MAX_COLS, n_tokens - chunk_start);
+            const chunk: u32 = @min(max_cols, n_tokens - chunk_start);
             const x_offset: u32 = chunk_start * K * f32_bytes;
             const y_offset: u32 = chunk_start * M * f32_bytes;
             if (kpar_pipeline) |pip| {
@@ -10024,6 +10044,30 @@ pub const InferenceEngine = struct {
     /// callers can migrate to the new name ahead of time — matching the Metal
     /// path where `generateWithMetrics` already routes through `prefillBatched`.
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        const mode = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse "";
+        const intel_batched_env = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL");
+        const intel_batched_requested = isIntelGpuVendor(self.gpu_config.vendor) and
+            intel_batched_env != null and std.mem.eql(u8, intel_batched_env.?, "1");
+        const chunk_limit = intelBatchedPrefillChunkLimit(self.gpu_config.vendor);
+        if (intel_batched_requested and
+            chunk_limit > 0 and
+            prompt_tokens.len > chunk_limit and
+            !std.mem.eql(u8, mode, "0") and
+            !std.mem.eql(u8, mode, "validate"))
+        {
+            log.info("Intel batched prefill chunking ENABLED: chunk={d} tokens (set ZINC_INTEL_BATCHED_PREFILL_CHUNK=0 to force monolithic)", .{chunk_limit});
+            var offset: usize = 0;
+            while (offset < prompt_tokens.len) {
+                const end = @min(offset + chunk_limit, prompt_tokens.len);
+                try self.prefillBatchedImpl(state, prompt_tokens[offset..end]);
+                offset = end;
+            }
+            return;
+        }
+        return self.prefillBatchedImpl(state, prompt_tokens);
+    }
+
+    fn prefillBatchedImpl(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         // Default ON for models that pass `canUseBatchedPrefillRdna` — the gate
         // already rejects anything the batched body doesn't handle. Set
         // `ZINC_BATCHED_PREFILL=0` to force the per-token fallback (escape
