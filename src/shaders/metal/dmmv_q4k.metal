@@ -149,30 +149,32 @@ kernel void main0(
         float4 acc2_1 = {0.f, 0.f, 0.f, 0.f};
 
         FOR_UNROLL (short i = 0; i < 4; ++i) {
-            const float yl0 = yl[2 * i + 0];
-            const float yl1 = yl[2 * i + 1];
-            const float yl8 = yl[2 * i + 8];
-            const float yl9 = yl[2 * i + 9];
-            const float yh0 = yh[2 * i + 0];
-            const float yh1 = yh[2 * i + 1];
-            const float yh8 = yh[2 * i + 8];
-            const float yh9 = yh[2 * i + 9];
-            acc1_0[0] += yl0 * (q1v_0[i] & 0x000F);
-            acc1_1[0] += yl0 * (q1v_1[i] & 0x000F);
-            acc1_0[1] += yl1 * (q1v_0[i] & 0x0F00);
-            acc1_1[1] += yl1 * (q1v_1[i] & 0x0F00);
-            acc1_0[2] += yl8 * (q1v_0[i] & 0x00F0);
-            acc1_1[2] += yl8 * (q1v_1[i] & 0x00F0);
-            acc1_0[3] += yl9 * (q1v_0[i] & 0xF000);
-            acc1_1[3] += yl9 * (q1v_1[i] & 0xF000);
-            acc2_0[0] += yh0 * (q2v_0[i] & 0x000F);
-            acc2_1[0] += yh0 * (q2v_1[i] & 0x000F);
-            acc2_0[1] += yh1 * (q2v_0[i] & 0x0F00);
-            acc2_1[1] += yh1 * (q2v_1[i] & 0x0F00);
-            acc2_0[2] += yh8 * (q2v_0[i] & 0x00F0);
-            acc2_1[2] += yh8 * (q2v_1[i] & 0x00F0);
-            acc2_0[3] += yh9 * (q2v_0[i] & 0xF000);
-            acc2_1[3] += yh9 * (q2v_1[i] & 0xF000);
+            // Cycle 45: replace 16 indexed scalar `accX_Y[k] += y* * (q* & mask)`
+            // writes (4 acc-slots × 4 accumulators) per `i` iteration with 4
+            // explicit float4 `fma(y4, q4, acc4)` calls. yl0..yl9 are shared
+            // across NR0=2 rows, so packing them once into `yl4`/`yh4` and
+            // pairing with per-row masked-quant float4s exposes the 4-wide
+            // SIMD operation directly to the metal compiler instead of
+            // relying on it to lift 4 lane-by-lane indexed writes into a
+            // single vector FMA. Apple7 ALU is naturally 4-wide; the indexed
+            // scalar form sometimes leaves the compiler emitting 4 narrower
+            // FMAs back-to-back instead of a single quad FMA. Mirrors cycle
+            // 44 (the same change to dmmv_q6k_llama.metal). Q4_K is 71.6% of
+            // decode bytes/token vs Q6_K's 28.4%, so ~2.5× the impact area.
+            const float4 yl4 = float4(yl[2 * i + 0], yl[2 * i + 1], yl[2 * i + 8], yl[2 * i + 9]);
+            const float4 yh4 = float4(yh[2 * i + 0], yh[2 * i + 1], yh[2 * i + 8], yh[2 * i + 9]);
+            const ushort q1_0i = q1v_0[i];
+            const ushort q1_1i = q1v_1[i];
+            const ushort q2_0i = q2v_0[i];
+            const ushort q2_1i = q2v_1[i];
+            const float4 q1m_0 = float4(q1_0i & 0x000F, q1_0i & 0x0F00, q1_0i & 0x00F0, q1_0i & 0xF000);
+            const float4 q1m_1 = float4(q1_1i & 0x000F, q1_1i & 0x0F00, q1_1i & 0x00F0, q1_1i & 0xF000);
+            const float4 q2m_0 = float4(q2_0i & 0x000F, q2_0i & 0x0F00, q2_0i & 0x00F0, q2_0i & 0xF000);
+            const float4 q2m_1 = float4(q2_1i & 0x000F, q2_1i & 0x0F00, q2_1i & 0x00F0, q2_1i & 0xF000);
+            acc1_0 = fma(yl4, q1m_0, acc1_0);
+            acc1_1 = fma(yl4, q1m_1, acc1_1);
+            acc2_0 = fma(yh4, q2m_0, acc2_0);
+            acc2_1 = fma(yh4, q2m_1, acc2_1);
         }
 
         sumf[0] += dh_0[0] * ((acc1_0[0] + 1.f / 256.f * acc1_0[1]) * sc8_0[0] +
