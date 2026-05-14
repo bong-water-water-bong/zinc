@@ -248,9 +248,41 @@ kernel void main0(
             scores[token_offset] = weight;
             local_sum += weight;
         }
+
+        // Cycle 98: fuse the post-softmax `scores[]` barrier with the
+        // block_sum reduce-write barrier so a single threadgroup_barrier
+        // covers both writes. The legacy form did:
+        //   barrier (for scores[])
+        //   reduceThreadgroupSum (= simd_sum, write reduce[], barrier, merge)
+        // — two barriers per block_start iter. We now hoist the simd_sum +
+        // reduce[] write *before* the barrier, so one barrier covers both
+        // scores[] and reduce[] writes. Inline the merge so we don't have
+        // to revisit reduceThreadgroupSum's internal barrier. Saves ~1152
+        // barriers/token on Qwen3-8B decode (36 layers × 32 Q-heads × 1
+        // block iter at avg ctx ≤256). Same "kill dead-after-use threadgroup
+        // roundtrips" philosophy as cycles 92-94, applied to the softmax-
+        // to-reduce handoff. Note: the wave_sum→reduce[simd_group] write
+        // races with no other writer (each simdgroup's lane-0 owns one slot
+        // of reduce[]); the merge after the barrier reads all reduce[]
+        // entries. The legacy reduceThreadgroupSum is preserved for callers
+        // (none after this point in this kernel) and unchanged.
+        const float wave_sum = simd_sum(local_sum);
+        if (subgroup_size < FLASH_TG_SIZE && simd_lane == 0u) {
+            reduce[simd_group] = wave_sum;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const float block_sum = reduceThreadgroupSum(local_sum, reduce, tid, subgroup_size, simd_lane, simd_group);
+        float block_sum;
+        if (subgroup_size < FLASH_TG_SIZE) {
+            const uint n_groups = (FLASH_TG_SIZE + subgroup_size - 1u) / subgroup_size;
+            float merged = 0.0f;
+            for (uint sg = 0u; sg < n_groups; ++sg) {
+                merged += reduce[sg];
+            }
+            block_sum = merged;
+        } else {
+            block_sum = wave_sum;
+        }
         const float rescale = running_sum > 0.0f ? fast::exp(running_max - next_max) : 0.0f;
 
         // Strided loop over head_dim slices when vec4_dim > FLASH_TG_SIZE.
