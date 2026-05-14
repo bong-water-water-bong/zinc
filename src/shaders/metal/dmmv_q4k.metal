@@ -188,16 +188,40 @@ kernel void main0(
             acc2_1 = fma(yh4, q2m_1, acc2_1);
         }
 
-        sumf[0] += dh_0[0] * ((acc1_0[0] + 1.f / 256.f * acc1_0[1]) * sc8_0[0] +
-                (acc1_0[2] + 1.f / 256.f * acc1_0[3]) * sc8_0[1] * 1.f / 16.f +
-                (acc2_0[0] + 1.f / 256.f * acc2_0[1]) * sc8_0[4] +
-                (acc2_0[2] + 1.f / 256.f * acc2_0[3]) * sc8_0[5] * 1.f / 16.f) -
-            dh_0[1] * (sumy[0] * sc8_0[2] + sumy[1] * sc8_0[3] + sumy[2] * sc8_0[6] + sumy[3] * sc8_0[7]);
-        sumf[1] += dh_1[0] * ((acc1_1[0] + 1.f / 256.f * acc1_1[1]) * sc8_1[0] +
-                (acc1_1[2] + 1.f / 256.f * acc1_1[3]) * sc8_1[1] * 1.f / 16.f +
-                (acc2_1[0] + 1.f / 256.f * acc2_1[1]) * sc8_1[4] +
-                (acc2_1[2] + 1.f / 256.f * acc2_1[3]) * sc8_1[5] * 1.f / 16.f) -
-            dh_1[1] * (sumy[0] * sc8_1[2] + sumy[1] * sc8_1[3] + sumy[2] * sc8_1[6] + sumy[3] * sc8_1[7]);
+        // Cycle 51: vectorize the per-ib reduction. Replace the 4-term
+        // sum-of-(pair * sc) head expression with `dot(pair4, sc_pos4)` and
+        // the 4-term `sumy[k]*sc8[*]` tail with `dot(sumy, sc_neg4)`, after
+        // fusing the `acc*[even] + 1/256 * acc*[odd]` pair-builder into a
+        // single vector `fma`. Mirrors cycles 44-50's "expose the SIMD shape
+        // explicitly" philosophy — the indexed scalar form here was 4 scalar
+        // FMAs + 4 muls + 3 adds (head) + 4 muls + 3 adds (tail) per row;
+        // the new form is 1 vector FMA + 2 dot4 per row, the natural shape
+        // for Apple7's 4-wide ALU. Two rows means we save ~22 scalar ops
+        // per ib in favor of ~6 vector ops per ib. dmmv_q4k.metal serves
+        // attn_qkv / attn_o / ffn_down on Qwen3-8B (Q4_K = 71.6% of
+        // decode bytes/token).
+        const float4 head_pair_0 = fma(
+            float4(acc1_0[1], acc1_0[3], acc2_0[1], acc2_0[3]),
+            float4(1.f / 256.f),
+            float4(acc1_0[0], acc1_0[2], acc2_0[0], acc2_0[2]));
+        const float4 head_pair_1 = fma(
+            float4(acc1_1[1], acc1_1[3], acc2_1[1], acc2_1[3]),
+            float4(1.f / 256.f),
+            float4(acc1_1[0], acc1_1[2], acc2_1[0], acc2_1[2]));
+        const float4 sc_pos_0 = float4(
+            float(sc8_0[0]),
+            float(sc8_0[1]) * (1.f / 16.f),
+            float(sc8_0[4]),
+            float(sc8_0[5]) * (1.f / 16.f));
+        const float4 sc_pos_1 = float4(
+            float(sc8_1[0]),
+            float(sc8_1[1]) * (1.f / 16.f),
+            float(sc8_1[4]),
+            float(sc8_1[5]) * (1.f / 16.f));
+        const float4 sc_neg_0 = float4(sc8_0[2], sc8_0[3], sc8_0[6], sc8_0[7]);
+        const float4 sc_neg_1 = float4(sc8_1[2], sc8_1[3], sc8_1[6], sc8_1[7]);
+        sumf[0] += dh_0[0] * dot(head_pair_0, sc_pos_0) - dh_0[1] * dot(sumy, sc_neg_0);
+        sumf[1] += dh_1[0] * dot(head_pair_1, sc_pos_1) - dh_1[1] * dot(sumy, sc_neg_1);
 
         y4 += 4 * QK_K;
     }
