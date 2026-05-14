@@ -130,37 +130,31 @@ kernel void main0(
         device const uchar* block_g1 = gate_src + row_off_1;
         device const uchar* block_u1 = up_src + row_off_1;
 
-        // Cycle 74: collapse the 4 scalar `sc_X[0/2/4]` strided ushort reads
-        // per row site into one `packed_uint3` load per row site. The Q4_K
-        // block's 12-byte packed-scales field sits at byte offsets 4..15 of
-        // the block — contiguous and 4-byte aligned — matching packed_uint3
-        // (12 bytes, 4-byte alignment). The previous form used a `+ iq`
-        // ushort-pointer offset (iq ∈ {0,1}, so the base could be 4-byte or
-        // 2-byte aligned), which made the compiler treat each sc_X[k] as
-        // an independent indexed ushort load that it had to prove
-        // contiguous via alias analysis before it could coalesce them.
-        // Replacing with packed_uint3 + a runtime `sc_shift = iq*16` to
-        // select the lower or upper ushort lane of each uint guarantees
-        // one 12-byte coalesced load per row site per ib. Mirrors cycle 73
-        // (same change in dmmv_q4k.metal, 2 row sites); this shader has 4
-        // row sites (g0, u0, g1, u1) so the impact area is ~2×. Per ib:
-        // 12 strided ushort loads → 4 packed_uint3 loads + 12 shift/mask
-        // extractions out of registers. dmmv_q4k_dense_gate_up_swiglu is
-        // the hottest Q4_K shader (~50% of Q4_K bytes/token = ffn_gate +
-        // ffn_up on Qwen3-8B dense; Q4_K = 71.6% of decode bytes/token).
-        device const packed_uint3* sc_u3_g0 = (device const packed_uint3*)(block_g0 + 4);
-        device const packed_uint3* sc_u3_u0 = (device const packed_uint3*)(block_u0 + 4);
-        device const packed_uint3* sc_u3_g1 = (device const packed_uint3*)(block_g1 + 4);
-        device const packed_uint3* sc_u3_u1 = (device const packed_uint3*)(block_u1 + 4);
+        // Cycle 80: fuse the half2 dh-load (block+0..3) and packed_uint3 sc_u
+        // load (block+4..15) per row site into one `packed_uint4` 16-byte
+        // block-header load. Q4_K block layout places [d (half), dmin (half),
+        // sc_u (12 bytes)] contiguously at offsets 0..15 with 4-byte alignment
+        // — exactly the natural shape for packed_uint4 (16 bytes, 4-byte
+        // aligned). Per ib × 4 row sites (g0, u0, g1, u1): collapses 8 device
+        // loads (4 half2 + 4 packed_uint3) → 4 packed_uint4 loads. Builds on
+        // cycle 66 (half2 dh) + cycle 74 (packed_uint3 sc_u) by collapsing
+        // them into the natural single-block-header read shape, mirroring
+        // cycle 78's win on dmmv_q4k_qk_dual.metal (+0.6 tok/s) and cycle 79's
+        // port to dmmv_q4k.metal. This shader handles ffn_gate + ffn_up on
+        // Qwen3-8B dense (~50% of Q4_K bytes/token, the hottest Q4_K kernel).
+        const packed_uint4 hdr_g0 = *((device const packed_uint4*)block_g0);
+        const packed_uint4 hdr_u0 = *((device const packed_uint4*)block_u0);
+        const packed_uint4 hdr_g1 = *((device const packed_uint4*)block_g1);
+        const packed_uint4 hdr_u1 = *((device const packed_uint4*)block_u1);
         const uint sc_shift = uint(iq) * 16u;
         device const ushort* q1_g0 = (device const ushort*)(block_g0 + 16) + 16 * iq + 4 * ir;
         device const ushort* q1_u0 = (device const ushort*)(block_u0 + 16) + 16 * iq + 4 * ir;
         device const ushort* q1_g1 = (device const ushort*)(block_g1 + 16) + 16 * iq + 4 * ir;
         device const ushort* q1_u1 = (device const ushort*)(block_u1 + 16) + 16 * iq + 4 * ir;
-        device const half* dh_g0 = (device const half*)block_g0;
-        device const half* dh_u0 = (device const half*)block_u0;
-        device const half* dh_g1 = (device const half*)block_g1;
-        device const half* dh_u1 = (device const half*)block_u1;
+        const half2 dh_g0_h2 = as_type<half2>(hdr_g0.x);
+        const half2 dh_u0_h2 = as_type<half2>(hdr_u0.x);
+        const half2 dh_g1_h2 = as_type<half2>(hdr_g1.x);
+        const half2 dh_u1_h2 = as_type<half2>(hdr_u1.x);
 
         // Cycle 70: store sc16 as `ushort4` register vectors instead of
         // stack-allocated `ushort[4]` arrays accessed via `(uchar*)` byte
@@ -176,7 +170,7 @@ kernel void main0(
         // dmmv_q4k_dense_gate_up_swiglu.metal is the hottest Q4_K
         // shader (~50% of Q4_K bytes/token = ffn_gate+ffn_up on
         // Qwen3-8B dense; Q4_K = 71.6% of decode bytes/token).
-        const uint3 sc_u3v_g0 = uint3(*sc_u3_g0);
+        const uint3 sc_u3v_g0 = uint3(hdr_g0.y, hdr_g0.z, hdr_g0.w);
         const ushort sc_0_g0 = ushort((sc_u3v_g0.x >> sc_shift) & 0xFFFFu);
         const ushort sc_2_g0 = ushort((sc_u3v_g0.y >> sc_shift) & 0xFFFFu);
         const ushort sc_4_g0 = ushort((sc_u3v_g0.z >> sc_shift) & 0xFFFFu);
@@ -186,7 +180,7 @@ kernel void main0(
             ((sc_4_g0 >> 0) & kmask2) | ((sc_0_g0 & kmask3) >> 2),
             ((sc_4_g0 >> 4) & kmask2) | ((sc_2_g0 & kmask3) >> 2));
 
-        const uint3 sc_u3v_u0 = uint3(*sc_u3_u0);
+        const uint3 sc_u3v_u0 = uint3(hdr_u0.y, hdr_u0.z, hdr_u0.w);
         const ushort sc_0_u0 = ushort((sc_u3v_u0.x >> sc_shift) & 0xFFFFu);
         const ushort sc_2_u0 = ushort((sc_u3v_u0.y >> sc_shift) & 0xFFFFu);
         const ushort sc_4_u0 = ushort((sc_u3v_u0.z >> sc_shift) & 0xFFFFu);
@@ -196,7 +190,7 @@ kernel void main0(
             ((sc_4_u0 >> 0) & kmask2) | ((sc_0_u0 & kmask3) >> 2),
             ((sc_4_u0 >> 4) & kmask2) | ((sc_2_u0 & kmask3) >> 2));
 
-        const uint3 sc_u3v_g1 = uint3(*sc_u3_g1);
+        const uint3 sc_u3v_g1 = uint3(hdr_g1.y, hdr_g1.z, hdr_g1.w);
         const ushort sc_0_g1 = ushort((sc_u3v_g1.x >> sc_shift) & 0xFFFFu);
         const ushort sc_2_g1 = ushort((sc_u3v_g1.y >> sc_shift) & 0xFFFFu);
         const ushort sc_4_g1 = ushort((sc_u3v_g1.z >> sc_shift) & 0xFFFFu);
@@ -206,7 +200,7 @@ kernel void main0(
             ((sc_4_g1 >> 0) & kmask2) | ((sc_0_g1 & kmask3) >> 2),
             ((sc_4_g1 >> 4) & kmask2) | ((sc_2_g1 & kmask3) >> 2));
 
-        const uint3 sc_u3v_u1 = uint3(*sc_u3_u1);
+        const uint3 sc_u3v_u1 = uint3(hdr_u1.y, hdr_u1.z, hdr_u1.w);
         const ushort sc_0_u1 = ushort((sc_u3v_u1.x >> sc_shift) & 0xFFFFu);
         const ushort sc_2_u1 = ushort((sc_u3v_u1.y >> sc_shift) & 0xFFFFu);
         const ushort sc_4_u1 = ushort((sc_u3v_u1.z >> sc_shift) & 0xFFFFu);
@@ -338,22 +332,8 @@ kernel void main0(
         // scalar accumulator adds (~6 ops). This is the hottest Q4_K shader
         // (~50% of Q4_K bytes/token = ffn_gate+ffn_up on Qwen3-8B dense).
         //
-        // Cycle 66: replace 8 scalar half loads (dh_X[0], dh_X[1] × 4 rows)
-        // with 4 explicit half2 loads. Q4_K's block layout starts with
-        // [d (half), dmin (half)] at offsets 0..3 — exactly a half2 pair
-        // — so a half2 load matches the natural alignment and tells the
-        // compiler the pair is intended to be read together. Subsequent
-        // `float(h2.x)` / `float(h2.y)` lowers to a single half2→float2
-        // widen per row instead of 2 scalar half→float casts. Same
-        // compiler-hint philosophy as cycles 38 (single-half Q6_K load),
-        // 49/50 (nibble-mask vectorize), 51-53 (per-ib reduction), and
-        // 60-62 (cross-row reduction): tell the compiler the SIMD shape
-        // explicitly. 8 scalar half loads → 4 half2 loads per ib, × 64
-        // threads/TG × 3072 TGs per layer × 36 layers per token.
-        const half2 dh_g0_h2 = *((device const half2*)dh_g0);
-        const half2 dh_u0_h2 = *((device const half2*)dh_u0);
-        const half2 dh_g1_h2 = *((device const half2*)dh_g1);
-        const half2 dh_u1_h2 = *((device const half2*)dh_u1);
+        // Cycles 66/80: dh half2 pairs come from the fused packed_uint4
+        // block-header load up top (see cycle 80 comment near hdr_*).
         const float4 dh_d = float4(float(dh_g0_h2.x), float(dh_u0_h2.x), float(dh_g1_h2.x), float(dh_u1_h2.x));
         const float4 dh_dmin = float4(float(dh_g0_h2.y), float(dh_u0_h2.y), float(dh_g1_h2.y), float(dh_u1_h2.y));
         const float4 head_dots = float4(
