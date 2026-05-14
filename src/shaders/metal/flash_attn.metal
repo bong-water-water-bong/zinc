@@ -197,11 +197,13 @@ kernel void main0(
 
             acc_cache4[vi] = acc;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Every thread maintains the identical running state in registers — no
-        // broadcast needed because rescale/block_sum/next_max are all derived
-        // from full-threadgroup reductions executed above.
+        // No threadgroup_barrier here: acc_cache4 is accessed exclusively via
+        // per-thread strided indexing (vi = tid; vi += FLASH_TG_SIZE), so each
+        // thread reads back only what it wrote — pure intra-thread dependency.
+        // The next iteration's first cross-thread threadgroup-memory read is
+        // scores[token_offset] in the V loop, which is protected by the
+        // softmax barrier. Saves ~1152 barriers/token on Qwen3-8B decode
+        // (32 Q-heads × 36 layers × 1 block_start iter at avg ctx ≤256).
         running_sum = running_sum * rescale + block_sum;
         running_max = next_max;
     }
