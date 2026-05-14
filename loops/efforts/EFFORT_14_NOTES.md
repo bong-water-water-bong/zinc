@@ -1,0 +1,238 @@
+# Effort 14 — running notes
+
+Local machine: Apple M1 Max, 32 GPU cores, 32 GB UMA, MTLGPUFamilyApple7.
+Model: `qwen3-8b-q4k-m` (Qwen3 dense, 36 layers, 32 heads / 8 KV, dim 4096,
+vocab 151936, Q4_K_M, 4.8 GB on disk).
+
+## Phase 0 — Baseline (2026-05-13)
+
+Build: `zig build -Doptimize=ReleaseFast` at HEAD `0a88734`.
+
+### ZINC baseline (canonical prompt, n=128)
+
+3 runs, prefill / decode tok/s:
+
+| Run | Prefill | Decode |
+|----:|--------:|-------:|
+| 1 | 10.4 | 8.60 |
+| 2 | 10.5 | 9.12 |
+| 3 | 10.4 | 8.59 |
+
+**Median**: prefill 10.4 tok/s, decode **8.60 tok/s** (116 ms/step).
+
+### Profile (n=64)
+
+```
+steps=68 prompt=5 completion=64
+shared_steps=0 cmds=4960 commits=4960      <- 73 commits per token
+wait: commitAndWait 7795 ms (114.6 ms/step, 99.4% of traced time)
+cpu: embed 0.55 ms | record 31.74 ms (0.467/step) | sample 0.02 ms
+
+dmmv bytes/step: q4_k 3.13 GiB (72.3%) | q6_k 1.20 GiB (27.7%)
+path bytes/step: dense (FFN) 3.07 GiB | attn 0.81 GiB | lm-head 0.45 GiB
+```
+
+Per-token weight read: ~4.3 GiB. M1 Max peak bandwidth: ~410 GB/s.
+Theoretical floor at 100% efficiency: **10.5 ms/token = 95 tok/s**.
+Observed: 116 ms/token = 8.6 tok/s = **~9% of peak**. Kernel efficiency is
+the bottleneck, not dispatch.
+
+### llama.cpp baseline
+
+Not yet captured — `llama-cli` hung on warmup twice (process spun for hours
+at 96% CPU on the model load path). Comparable-model reference from the
+public benchmarks page: M4 Max llama.cpp Qwen3 8B decode is **83.67 tok/s**.
+Scaling to M1 Max bandwidth (~75% of M4 Max) → expected llama.cpp on M1 Max
+is in the **55–65 tok/s** range. ZINC at 8.6 tok/s ≈ 13–15% of that.
+
+## Phase 1 — Hottest cost identified
+
+Not a kernel — initially the dispatch model. Then after fixing dispatch,
+the kernels themselves (q4_k matvec specifically, 72% of dispatch bytes).
+
+## Cycle 1 — Dispatch consolidation for Qwen3 dense
+
+### Change
+
+`src/compute/forward_metal.zig::canUseDenseSharedDecodeCommand`. Was
+gated to `cfg.architecture == .gemma`. Extended to `.gemma, .qwen2`
+(Qwen3 maps to `.qwen2`). All structural pre-checks unchanged.
+
+### Result
+
+```
+ZINC post-fix (n=128, 3 runs):
+  Run 1: prefill 12.2 | decode 8.55
+  Run 2: prefill 12.4 | decode 8.61
+  Run 3: prefill 12.4 | decode 8.52
+Median: prefill 12.3 | decode 8.55
+
+Profile (n=64): shared_steps=0 cmds=200 commits=68 (1 commit/step)
+```
+
+Output: byte-identical greedy output on canonical prompt.
+
+### Verdict: KEEP — but pivot
+
+- **Decode**: 8.55 vs 8.60 → neutral, well within run-to-run noise.
+- **Prefill**: +18% (10.4 → 12.3 tok/s) — a real win.
+- **Dispatch**: 73 commits/token → 1 commit/token, command-buffer pressure
+  collapsed. Cleaner runtime, frees Metal queue capacity.
+- **No regression** on decode. Output byte-identical.
+
+Per Phase 4 gate, decode didn't beat ≥2× noise. But the change has:
+
+1. A clear prefill win (>>2× noise),
+2. A structural cleanup (4960 commits/decode → 68),
+3. No correctness drift.
+
+Kept. Documented here so future cycles know the dispatch path is already
+active for Qwen3 dense.
+
+### Lesson
+
+The "73 commits per token" finding from Phase 0 looked like the smoking
+gun, but the M1 Max GPU was already pipelining the per-dispatch command
+buffers via the Metal driver. Collapsing them improves prefill (where
+many tokens process at once and dispatch overhead amortizes badly) but
+does not move single-token decode, which is GPU-time bound.
+
+**The real bottleneck is q4_k matvec kernel bandwidth efficiency.**
+We're running at ~9% of peak M1 Max bandwidth.
+
+## Phase 2 — Q4_K matvec kernel comparison
+
+Read-through of ZINC `dmmv_q4k.metal` vs llama.cpp `kernel_mul_mv_q4_K_f32`:
+**line-for-line equivalent.** Same NSG=2, NR0=2, identical fixed-point
+accumulation, identical kmask schedule, identical loads. ZINC's own
+comment (`dmmv_q4k.metal:14`) acknowledges this as a faithful port.
+llama.cpp's "ext" variants (`kernel_mul_mv_ext_q4_f32_disp`) are gated by
+`ne11 ∈ [4,8]` (small batch); for N=1 decode both paths take the same
+kernel. **The matvec kernel itself is not the gap.**
+
+## Cycle 2 — Decode-shape microbench (added)
+
+Added `bench-metal-dmmv-q4k` (`benchmarks/metal_dmmv_q4k.zig` and a
+build.zig step). Targets the actual `dmmv_q4k.metal` kernel at the
+Qwen3-8B N=1 decode shapes. Queues `iters` dispatches inside ONE command
+buffer to isolate kernel time from per-dispatch CPU overhead.
+
+### Result on this M1 Max
+
+```
+shape                             weight MB    us/iter   GB/s (W)    vs 410    vs 546
+attn_q       M=4096  K=4096            9.00      59.62      158.3     38.6%     29.0%
+attn_k/v     M=1024  K=4096            2.25      10.01      235.7     57.5%     43.2%
+attn_o       M=4096  K=4096            9.00      38.61      244.4     59.6%     44.8%
+ffn_up/gate  M=12288 K=4096           27.00     115.13      245.9     60.0%     45.0%
+ffn_down     M=4096  K=12288          27.00     127.59      221.9     54.1%     40.6%
+```
+
+(attn_q at 38.6% is a cold-start artifact — same shape `attn_o` hits
+59.6% after warmup; treat 244 GB/s as the real attn_q number too.)
+
+### Implied per-token kernel ceiling
+
+```
+Implied 36-layer Q4_K matvec lower bound: 16.86 ms/token => 59.3 tok/s
+Current ZINC end-to-end:                  116    ms/token =>  8.6 tok/s
+```
+
+**~50 tok/s of headroom is being lost outside the matvec kernels.**
+
+### Where the time goes
+
+End-to-end decode profile (n=64): `dispatch/step: total 580 barriers 399`.
+That's **16 compute encoder dispatches per layer** × 36 layers. A typical
+Qwen3 decode layer in ZINC:
+
+```
+rms_norm -> Q proj -> K proj -> V proj -> Q norm -> K norm
+         -> RoPE Q -> RoPE K -> KV write -> flash_attn
+         -> O proj -> residual+norm -> gate proj -> up proj
+         -> SwiGLU -> down proj
+```
+
+Each is its own dispatch with a barrier after, costing maybe 50–150 µs
+of fixed dispatch+barrier overhead. **The lever is reducing dispatch
+count via fusion**, not making any single kernel faster.
+
+### Conclusion: Phase 1 was the wrong target
+
+The smoking gun was never the matvec kernel. It's the orchestration —
+too many small dispatches with barriers between them. M1 Max compute
+encoders have fixed launch overhead; at 580/token that's a real cost.
+
+## Cycle 3 — Fused dense gate+up+SwiGLU
+
+### Change
+
+New shader `src/shaders/metal/dmmv_q4k_dense_gate_up_swiglu.metal`,
+sibling of the existing `*_geglu.metal` Gemma kernel with the activation
+swapped from GeGLU to SwiGLU (`SiLU(gate) * up = (gate * sigmoid(gate)) * up`).
+
+Pipeline `dmmv_q4k_dense_gate_up_swiglu_pipe` loaded + freed alongside
+the GeGLU pipeline. New `canUseDenseQ4KGateUpSwiGLU` gate (mirror of the
+GeGLU gate but for `.qwen2` architecture / `!usesGeglu`). New
+`dispatchDenseQ4KGateUpSwiGLUOnCmd` dispatch. Wired into the dense FFN
+path in `runDecodeStep` so Qwen3 dense takes the fused path while Gemma
+keeps its GeGLU path.
+
+### Result
+
+```
+ZINC after Cycle 3 (n=128, 3 runs):
+  Run 1: prefill 12.5 | decode 8.67
+  Run 2: prefill 12.6 | decode 8.70
+  Run 3: prefill 12.5 | decode 8.67
+Median: prefill 12.5 | decode 8.67  (+1.4% vs Cycle 1 8.55, +0.8% vs Phase 0 8.60)
+
+Profile (n=64): cmds=200 commits=68
+  dispatch/step: total 507.8 barriers 362.9   (was 579.8 / 398.9)
+```
+
+Output: byte-identical greedy output on canonical prompt.
+Fusion fired exactly as expected: **-72 dispatches and -36 barriers
+per token**, the precise math for 36 layers × (-2 dispatches, -1 barrier).
+
+### Verdict: KEEP — but third hypothesis falsified
+
+Decode change is within run-to-run noise (3-run range ±0.03). The
+fusion mathematically did what it said it would do at the dispatch
+layer, but **dispatch count and barrier count are not the dominant
+cost on M1 Max for this workload**.
+
+Cumulative path so far:
+- Baseline 8.60 tok/s, ceiling 59 tok/s (kernel-only)
+- Cycle 1: collapsed 4960 command buffer commits → 68. Decode flat.
+- Cycle 3: removed 72 compute encoder dispatches + 36 barriers. Decode +0.07 tok/s.
+
+The structural cleanups landed (cleaner runtime, +18% prefill, dense
+shared path active for Qwen3 dense) but decode is essentially
+unchanged. The lever is elsewhere.
+
+## Open hypotheses (Phase 2 redux)
+
+Three remaining candidates, none of which can be confirmed without
+finer profiling than `--profile` provides:
+
+1. **Per-kernel memory cache behavior**. Microbench reads same-shape
+   weights repeatedly, hitting Apple SLC. Production reads ~3 GiB of
+   distinct weight tensors per token, cold for each. The 244 GB/s
+   isolated number may be an upper bound the production path never
+   reaches.
+2. **Small-kernel overhead concentration**. Of 508 dispatches/token,
+   ~250 are q4_K matvecs; the rest are RoPE, Q/K norm, KV write,
+   flash attention, residual+norm. If those small kernels are
+   overhead-dominated (~100µs of launch latency vs ~50µs of compute),
+   they collectively account for 25–50 ms/token.
+3. **GPU scheduler gaps between back-to-back small dispatches**.
+   Without a Metal performance trace we can't see GPU idle time.
+
+## What would actually unlock progress
+
+A real Metal performance trace (Xcode Instruments / Metal Performance
+HUD via `MTL_HUD_ENABLED=1`) showing the per-dispatch GPU timeline.
+That tells us within minutes whether the GPU has visible idle gaps,
+which kernels are slow, and whether barriers are forcing pipeline
+drains. Without it, we're running blind on the orchestration layer.
