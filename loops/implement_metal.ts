@@ -52,7 +52,21 @@ const PROMPT_MODE = process.env.ZINC_PROMPT_MODE ?? "raw";
 const MAX_TOKENS = parsePositiveIntEnv("ZINC_MAX_TOKENS", 64); // Enough tokens for stable decode throughput measurement
 const REFERENCE_TEXT = "Paris"; // Expected in correct output
 const TARGET_TOK_PER_SEC = parsePositiveFloatEnv("ZINC_TARGET_TOK_PER_SEC", 50);
-const BENCHMARK_RUNS = parsePositiveIntEnv("ZINC_BENCHMARK_RUNS", 3); // Median of N inference runs for noise reduction
+const BENCHMARK_RUNS = parsePositiveIntEnv("ZINC_BENCHMARK_RUNS", 3); // Number of TIMED inference runs (median across them)
+// Pre-rolls discarded before any timed sample. Each fresh ZINC invocation
+// resets Metal residency + GPU clocks, so the FIRST few samples in a series
+// land cold-GPU while later samples land warm. On M1 Max for Qwen3-8B that
+// shows up as ~8.6 cold vs ~10.6 warm — a ~20% spread that masks real
+// regressions. Setting BENCHMARK_WARMUPS≥1 runs throwaway inferences first
+// so timed samples are more likely to start with a warm-ish GPU baseline.
+// Note: a process boundary still resets some state; for fully stable
+// numbers, also raise BENCHMARK_RUNS so the median rejects outliers.
+const BENCHMARK_WARMUPS = parsePositiveIntEnv("ZINC_BENCHMARK_WARMUPS", 1);
+// Trim the high and low samples before taking the median. Only fires when
+// BENCHMARK_RUNS ≥ 5, since trimming 3 samples down to 1 just picks the
+// middle anyway. Mitigates the cold/warm process-boundary noise pattern
+// without requiring zinc itself to support multi-prompt batched runs.
+const BENCHMARK_TRIM = parseBoolEnv("ZINC_BENCHMARK_TRIM", true);
 const PROFILE_EVERY = parsePositiveIntEnv("ZINC_PROFILE_EVERY", 5); // Run with --profile every N cycles
 const STALL_THRESHOLD = 5; // Cycles without tok/s improvement before studying references
 const TEST_TIMEOUT_MS = parsePositiveIntEnv("ZINC_TEST_TIMEOUT_MS", 120_000);
@@ -551,12 +565,37 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
     };
   }
 
-  console.log(clr("1;33", `  🚀 Running inference (${maxTokens} tokens, ${BENCHMARK_RUNS} samples, ${PROMPT_MODE} prompt)...`));
+  const warmupLabel = BENCHMARK_WARMUPS > 0 ? `${BENCHMARK_WARMUPS} warmup + ` : "";
+  console.log(clr("1;33", `  🚀 Running inference (${maxTokens} tokens, ${warmupLabel}${BENCHMARK_RUNS} samples, ${PROMPT_MODE} prompt)...`));
   const tokPerSecSamples: number[] = [];
   let lastRun: RunResult = { exitCode: -1, stdout: "", stderr: "" };
   let lastCombined = "";
 
-  for (let sample = 0; sample < BENCHMARK_RUNS; sample++) {
+  // Pre-roll throwaway runs to prime caches (file mmap, Metal pipeline,
+  // OS page cache) before the timed samples. These do NOT preserve GPU
+  // clock state across process boundaries — that's a deeper limitation —
+  // but they at least surface model-load failures here instead of mid-
+  // measurement, and warm the OS file cache so timing starts from a
+  // consistent state.
+  for (let warmup = 0; warmup < BENCHMARK_WARMUPS; warmup++) {
+    const run = await runCommand(
+      "./zig-out/bin/zinc",
+      [...zincModelArgs(), ...zincPromptArgs(), "-n", String(maxTokens)],
+      { timeout: RUN_TIMEOUT_MS },
+    );
+    lastRun = run;
+    lastCombined = run.stderr + run.stdout;
+    if (run.exitCode !== 0) break; // crash — surface immediately, don't pretend to measure
+    const tps = parseTokPerSec(lastCombined);
+    if (tps != null) {
+      console.log(clr("2", `    warmup ${warmup + 1}/${BENCHMARK_WARMUPS}: ${tps.toFixed(2)} tok/s (discarded)`));
+    }
+  }
+
+  // If a warmup crashed, skip the timed loop and surface the failure below.
+  const warmupCrashed = BENCHMARK_WARMUPS > 0 && lastRun.exitCode !== 0;
+
+  for (let sample = 0; !warmupCrashed && sample < BENCHMARK_RUNS; sample++) {
     const run = await runCommand(
       "./zig-out/bin/zinc",
       [...zincModelArgs(), ...zincPromptArgs(), "-n", String(maxTokens)],
@@ -574,16 +613,27 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
     }
   }
 
-  // Use median of samples for noise-resistant measurement
+  // Aggregate samples. Default is median of all timed samples. When
+  // BENCHMARK_TRIM is on and there are ≥5 samples, drop one high and
+  // one low before taking the median so a single cold-GPU outlier
+  // can't poison the verdict (and the symmetric trim guards against
+  // a too-warm outlier in the other direction).
   const sorted = [...tokPerSecSamples].sort((a, b) => a - b);
-  const tokPerSec = sorted.length > 0 ? sorted[Math.floor(sorted.length / 2)] : null;
+  let kept: number[] = sorted;
+  let trimmed = false;
+  if (BENCHMARK_TRIM && sorted.length >= 5) {
+    kept = sorted.slice(1, sorted.length - 1);
+    trimmed = true;
+  }
+  const tokPerSec = kept.length > 0 ? kept[Math.floor(kept.length / 2)] : null;
   const tokensGenerated = parseTokensGenerated(lastCombined);
   const outputText = parseOutputText(lastCombined);
   const evaluation = evaluateOutputText(outputText);
 
   if (tokPerSec != null && sorted.length > 1) {
     const range = sorted[sorted.length - 1] - sorted[0];
-    console.log(clr("1;36", `    median: ${tokPerSec.toFixed(2)} tok/s [${tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] range=${range.toFixed(1)}`));
+    const aggLabel = trimmed ? `trimmed median (drop 1 high + 1 low)` : "median";
+    console.log(clr("1;36", `    ${aggLabel}: ${tokPerSec.toFixed(2)} tok/s [${tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] range=${range.toFixed(1)}`));
   }
 
   const result: BuildRunResult = {
