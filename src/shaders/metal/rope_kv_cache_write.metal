@@ -66,7 +66,6 @@ kernel void main0(
         const uint base = head * stride;
 
         threadgroup float q_shmem[2];
-        threadgroup float q_shared_rms_inv;
         float q_rms_inv = 1.0f;
 
         if (p.apply_qk_norm != 0u) {
@@ -80,12 +79,11 @@ kernel void main0(
                 q_shmem[simd_group] = sum_sq;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0) {
-                const float total = q_shmem[0] + q_shmem[1];
-                q_shared_rms_inv = rsqrt((total / float(stride)) + p.eps);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            q_rms_inv = q_shared_rms_inv;
+            // Each simdgroup computes rms_inv independently from the 2 partials
+            // (work duplicated 2×, eliminates the broadcast barrier — same pattern
+            // as rms_norm_mul / residual_rms_norm cycles 15-16).
+            const float total = q_shmem[0] + q_shmem[1];
+            q_rms_inv = fast::rsqrt(fast::divide(total, float(stride)) + p.eps);
         }
 
         for (uint i = tid; i < half_rot; i += 64) {
@@ -116,7 +114,6 @@ kernel void main0(
     const uint dst_base = p.dst_offset + base;
 
     threadgroup float k_shmem[2];
-    threadgroup float k_shared_rms_inv;
     float k_rms_inv = 1.0f;
 
     if (p.apply_qk_norm != 0u) {
@@ -130,12 +127,10 @@ kernel void main0(
             k_shmem[simd_group] = sum_sq;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {
-            const float total = k_shmem[0] + k_shmem[1];
-            k_shared_rms_inv = rsqrt((total / float(stride)) + p.eps);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        k_rms_inv = k_shared_rms_inv;
+        // Each simdgroup computes rms_inv independently from the 2 partials
+        // (work duplicated 2×, eliminates the broadcast barrier).
+        const float total = k_shmem[0] + k_shmem[1];
+        k_rms_inv = fast::rsqrt(fast::divide(total, float(stride)) + p.eps);
     }
 
     // K rotary: apply RoPE pair (i, i+half_rot) and write to cache.
