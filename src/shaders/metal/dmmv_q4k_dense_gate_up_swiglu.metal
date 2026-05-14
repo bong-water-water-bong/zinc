@@ -130,10 +130,29 @@ kernel void main0(
         device const uchar* block_g1 = gate_src + row_off_1;
         device const uchar* block_u1 = up_src + row_off_1;
 
-        device const ushort* sc_g0 = (device const ushort*)(block_g0 + 4) + iq;
-        device const ushort* sc_u0 = (device const ushort*)(block_u0 + 4) + iq;
-        device const ushort* sc_g1 = (device const ushort*)(block_g1 + 4) + iq;
-        device const ushort* sc_u1 = (device const ushort*)(block_u1 + 4) + iq;
+        // Cycle 74: collapse the 4 scalar `sc_X[0/2/4]` strided ushort reads
+        // per row site into one `packed_uint3` load per row site. The Q4_K
+        // block's 12-byte packed-scales field sits at byte offsets 4..15 of
+        // the block — contiguous and 4-byte aligned — matching packed_uint3
+        // (12 bytes, 4-byte alignment). The previous form used a `+ iq`
+        // ushort-pointer offset (iq ∈ {0,1}, so the base could be 4-byte or
+        // 2-byte aligned), which made the compiler treat each sc_X[k] as
+        // an independent indexed ushort load that it had to prove
+        // contiguous via alias analysis before it could coalesce them.
+        // Replacing with packed_uint3 + a runtime `sc_shift = iq*16` to
+        // select the lower or upper ushort lane of each uint guarantees
+        // one 12-byte coalesced load per row site per ib. Mirrors cycle 73
+        // (same change in dmmv_q4k.metal, 2 row sites); this shader has 4
+        // row sites (g0, u0, g1, u1) so the impact area is ~2×. Per ib:
+        // 12 strided ushort loads → 4 packed_uint3 loads + 12 shift/mask
+        // extractions out of registers. dmmv_q4k_dense_gate_up_swiglu is
+        // the hottest Q4_K shader (~50% of Q4_K bytes/token = ffn_gate +
+        // ffn_up on Qwen3-8B dense; Q4_K = 71.6% of decode bytes/token).
+        device const packed_uint3* sc_u3_g0 = (device const packed_uint3*)(block_g0 + 4);
+        device const packed_uint3* sc_u3_u0 = (device const packed_uint3*)(block_u0 + 4);
+        device const packed_uint3* sc_u3_g1 = (device const packed_uint3*)(block_g1 + 4);
+        device const packed_uint3* sc_u3_u1 = (device const packed_uint3*)(block_u1 + 4);
+        const uint sc_shift = uint(iq) * 16u;
         device const ushort* q1_g0 = (device const ushort*)(block_g0 + 16) + 16 * iq + 4 * ir;
         device const ushort* q1_u0 = (device const ushort*)(block_u0 + 16) + 16 * iq + 4 * ir;
         device const ushort* q1_g1 = (device const ushort*)(block_g1 + 16) + 16 * iq + 4 * ir;
@@ -157,29 +176,45 @@ kernel void main0(
         // dmmv_q4k_dense_gate_up_swiglu.metal is the hottest Q4_K
         // shader (~50% of Q4_K bytes/token = ffn_gate+ffn_up on
         // Qwen3-8B dense; Q4_K = 71.6% of decode bytes/token).
+        const uint3 sc_u3v_g0 = uint3(*sc_u3_g0);
+        const ushort sc_0_g0 = ushort((sc_u3v_g0.x >> sc_shift) & 0xFFFFu);
+        const ushort sc_2_g0 = ushort((sc_u3v_g0.y >> sc_shift) & 0xFFFFu);
+        const ushort sc_4_g0 = ushort((sc_u3v_g0.z >> sc_shift) & 0xFFFFu);
         const ushort4 sc16_g0 = ushort4(
-            sc_g0[0] & kmask1,
-            sc_g0[2] & kmask1,
-            ((sc_g0[4] >> 0) & kmask2) | ((sc_g0[0] & kmask3) >> 2),
-            ((sc_g0[4] >> 4) & kmask2) | ((sc_g0[2] & kmask3) >> 2));
+            sc_0_g0 & kmask1,
+            sc_2_g0 & kmask1,
+            ((sc_4_g0 >> 0) & kmask2) | ((sc_0_g0 & kmask3) >> 2),
+            ((sc_4_g0 >> 4) & kmask2) | ((sc_2_g0 & kmask3) >> 2));
 
+        const uint3 sc_u3v_u0 = uint3(*sc_u3_u0);
+        const ushort sc_0_u0 = ushort((sc_u3v_u0.x >> sc_shift) & 0xFFFFu);
+        const ushort sc_2_u0 = ushort((sc_u3v_u0.y >> sc_shift) & 0xFFFFu);
+        const ushort sc_4_u0 = ushort((sc_u3v_u0.z >> sc_shift) & 0xFFFFu);
         const ushort4 sc16_u0 = ushort4(
-            sc_u0[0] & kmask1,
-            sc_u0[2] & kmask1,
-            ((sc_u0[4] >> 0) & kmask2) | ((sc_u0[0] & kmask3) >> 2),
-            ((sc_u0[4] >> 4) & kmask2) | ((sc_u0[2] & kmask3) >> 2));
+            sc_0_u0 & kmask1,
+            sc_2_u0 & kmask1,
+            ((sc_4_u0 >> 0) & kmask2) | ((sc_0_u0 & kmask3) >> 2),
+            ((sc_4_u0 >> 4) & kmask2) | ((sc_2_u0 & kmask3) >> 2));
 
+        const uint3 sc_u3v_g1 = uint3(*sc_u3_g1);
+        const ushort sc_0_g1 = ushort((sc_u3v_g1.x >> sc_shift) & 0xFFFFu);
+        const ushort sc_2_g1 = ushort((sc_u3v_g1.y >> sc_shift) & 0xFFFFu);
+        const ushort sc_4_g1 = ushort((sc_u3v_g1.z >> sc_shift) & 0xFFFFu);
         const ushort4 sc16_g1 = ushort4(
-            sc_g1[0] & kmask1,
-            sc_g1[2] & kmask1,
-            ((sc_g1[4] >> 0) & kmask2) | ((sc_g1[0] & kmask3) >> 2),
-            ((sc_g1[4] >> 4) & kmask2) | ((sc_g1[2] & kmask3) >> 2));
+            sc_0_g1 & kmask1,
+            sc_2_g1 & kmask1,
+            ((sc_4_g1 >> 0) & kmask2) | ((sc_0_g1 & kmask3) >> 2),
+            ((sc_4_g1 >> 4) & kmask2) | ((sc_2_g1 & kmask3) >> 2));
 
+        const uint3 sc_u3v_u1 = uint3(*sc_u3_u1);
+        const ushort sc_0_u1 = ushort((sc_u3v_u1.x >> sc_shift) & 0xFFFFu);
+        const ushort sc_2_u1 = ushort((sc_u3v_u1.y >> sc_shift) & 0xFFFFu);
+        const ushort sc_4_u1 = ushort((sc_u3v_u1.z >> sc_shift) & 0xFFFFu);
         const ushort4 sc16_u1 = ushort4(
-            sc_u1[0] & kmask1,
-            sc_u1[2] & kmask1,
-            ((sc_u1[4] >> 0) & kmask2) | ((sc_u1[0] & kmask3) >> 2),
-            ((sc_u1[4] >> 4) & kmask2) | ((sc_u1[2] & kmask3) >> 2));
+            sc_0_u1 & kmask1,
+            sc_2_u1 & kmask1,
+            ((sc_4_u1 >> 0) & kmask2) | ((sc_0_u1 & kmask3) >> 2),
+            ((sc_4_u1 >> 4) & kmask2) | ((sc_2_u1 & kmask3) >> 2));
 
         const ushort4 q1v_g0 = *((device const ushort4*)q1_g0);
         const ushort4 q2v_g0 = *((device const ushort4*)(q1_g0 + 32));
