@@ -104,18 +104,25 @@ kernel void main0(
         sumy[2] = dot(c0, ones) + dot(c1, ones);
         sumy[3] = dot(d0, ones) + dot(d1, ones);
 
-        // Pointer to scales for this block, offset by iq (uint16 stride)
-        device const ushort* sc = (device const ushort*)(x_base + (uint64_t)ib * BLOCK_SIZE + 4) + iq;
+        // Pointer to scales for this block, as uint (4-byte aligned: block is
+        // 144-aligned, nb01 is 4-aligned, +4 byte scales offset preserves
+        // 4-byte alignment). Each uint covers 2 ushorts; iq selects low (iq=0)
+        // or high (iq=1) ushort via shift, avoiding 3 scalar 16-bit loads.
+        device const uint* sc_u = (device const uint*)(x_base + (uint64_t)ib * BLOCK_SIZE + 4);
+        const uint sc_shift = uint(iq) * 16u;
         // Pointer to quants for this block
         device const ushort* q1 = (device const ushort*)(x_base + (uint64_t)ib * BLOCK_SIZE + 16) + 16 * iq + 4 * ir;
         // Pointer to d/dmin halves for this block
         device const half* dh = (device const half*)(x_base + (uint64_t)ib * BLOCK_SIZE);
 
         FOR_UNROLL (short row = 0; row < NR0; row++) {
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            const ushort sc_0 = ushort((sc_u[0] >> sc_shift) & 0xFFFFu);
+            const ushort sc_2 = ushort((sc_u[1] >> sc_shift) & 0xFFFFu);
+            const ushort sc_4 = ushort((sc_u[2] >> sc_shift) & 0xFFFFu);
+            sc16[0] = sc_0 & kmask1;
+            sc16[1] = sc_2 & kmask1;
+            sc16[2] = ((sc_4 >> 0) & kmask2) | ((sc_0 & kmask3) >> 2);
+            sc16[3] = ((sc_4 >> 4) & kmask2) | ((sc_2 & kmask3) >> 2);
 
             device const ushort* q2 = q1 + 32;
 
@@ -148,9 +155,9 @@ kernel void main0(
                     (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
                 dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
-            // Advance to next row: nb01/2 is stride in uint16 units
+            // Advance to next row: nb01/2 is stride in uint16 units, nb01/4 in uint32 units
             q1 += nb01 / 2;
-            sc += nb01 / 2;
+            sc_u += nb01 / 4;
             dh += nb01 / 2;
         }
 
