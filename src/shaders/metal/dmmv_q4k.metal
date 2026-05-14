@@ -62,9 +62,6 @@ kernel void main0(
     device const uchar* x_base = src0 + (uint64_t)first_row * nb01;
     device const float* y = src1;
 
-    float yl[16];
-    float yh[16];
-
     float sumf[NR0] = {0.f, 0.f};
 
     device const float* y4 = y + ix * QK_K + 64 * iq + 8 * ir;
@@ -86,14 +83,36 @@ kernel void main0(
         const float4 c0 = y4v[32];  const float4 c1 = y4v[33];
         const float4 d0 = y4v[40];  const float4 d1 = y4v[41];
 
-        yl[ 0] = a0[0]; yl[ 1] = a0[1]; yl[ 2] = a0[2]; yl[ 3] = a0[3];
-        yl[ 4] = a1[0]; yl[ 5] = a1[1]; yl[ 6] = a1[2]; yl[ 7] = a1[3];
-        yl[ 8] = b0[0]; yl[ 9] = b0[1]; yl[10] = b0[2]; yl[11] = b0[3];
-        yl[12] = b1[0]; yl[13] = b1[1]; yl[14] = b1[2]; yl[15] = b1[3];
-        yh[ 0] = c0[0]; yh[ 1] = c0[1]; yh[ 2] = c0[2]; yh[ 3] = c0[3];
-        yh[ 4] = c1[0]; yh[ 5] = c1[1]; yh[ 6] = c1[2]; yh[ 7] = c1[3];
-        yh[ 8] = d0[0]; yh[ 9] = d0[1]; yh[10] = d0[2]; yh[11] = d0[3];
-        yh[12] = d1[0]; yh[13] = d1[1]; yh[14] = d1[2]; yh[15] = d1[3];
+        // Cycle 85: store the per-i y-gather directly as `float4 yl4_arr[4]`
+        // / `float4 yh4_arr[4]` register-vector arrays instead of the legacy
+        // `float yl[16]` / `float yh[16]` scalar layout. The inner FMA loop
+        // consumes exactly one float4 per i from each side — yl4_arr[i] =
+        // (yl[2i], yl[2i+1], yl[2i+8], yl[2i+9]) — which under the old
+        // layout was reconstructed each iteration via a 4-lane indexed
+        // gather `float4(yl[2*i + 0], yl[2*i + 1], yl[2*i + 8], yl[2*i + 9])`
+        // off 16-wide flat stack arrays filled via 32 scalar lane writes.
+        // Eliminates 32 scalar stack writes and 8 4-lane gather
+        // reconstructions per ib, keeping all y data in SSA-eligible vector
+        // registers. The lane mapping is yl4_arr[i] = (a*.xy, b*.xy) for
+        // i∈{0,2} and (a*.zw, b*.zw) for i∈{1,3} where a*/b* picks between
+        // (a0,b0)/(a1,b1) based on i/2. Mirrors cycle 84's port to
+        // dmmv_q4k_dense_gate_up_swiglu.metal (hottest Q4_K shader,
+        // ffn_gate+ffn_up) and cycle 83's original in dmmv_q6k_llama.metal.
+        // dmmv_q4k.metal serves attn_qkv V + attn_o + ffn_down on Qwen3-8B
+        // dense (~53% of Q4_K bytes/token slice, complementing the swiglu
+        // kernel's ffn_gate+ffn_up share; Q4_K = 71.6% of decode bytes/token).
+        const float4 yl4_arr[4] = {
+            float4(a0.xy, b0.xy),
+            float4(a0.zw, b0.zw),
+            float4(a1.xy, b1.xy),
+            float4(a1.zw, b1.zw),
+        };
+        const float4 yh4_arr[4] = {
+            float4(c0.xy, d0.xy),
+            float4(c0.zw, d0.zw),
+            float4(c1.xy, d1.xy),
+            float4(c1.zw, d1.zw),
+        };
 
         const float4 ones = float4(1.0f);
         sumy[0] = dot(a0, ones) + dot(a1, ones);
@@ -195,8 +214,8 @@ kernel void main0(
             // FMAs back-to-back instead of a single quad FMA. Mirrors cycle
             // 44 (the same change to dmmv_q6k_llama.metal). Q4_K is 71.6% of
             // decode bytes/token vs Q6_K's 28.4%, so ~2.5× the impact area.
-            const float4 yl4 = float4(yl[2 * i + 0], yl[2 * i + 1], yl[2 * i + 8], yl[2 * i + 9]);
-            const float4 yh4 = float4(yh[2 * i + 0], yh[2 * i + 1], yh[2 * i + 8], yh[2 * i + 9]);
+            const float4 yl4 = yl4_arr[i];
+            const float4 yh4 = yh4_arr[i];
             const ushort q1_0i = q1v_0[i];
             const ushort q1_1i = q1v_1[i];
             const ushort q2_0i = q2v_0[i];
