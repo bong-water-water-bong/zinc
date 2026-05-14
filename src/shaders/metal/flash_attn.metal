@@ -177,28 +177,41 @@ kernel void main0(
                 ? (block_base + token_offset * token_stride)
                 : kvBaseForToken(page_table, p, kv_head, token_idx);
 
-            // Cycle 95: split cycle 90's single `score4` accumulator into two
-            // independent chains (score4a, score4b) over even/odd i. The
-            // 4-lane parallelism inside one `score4` only gives 4-wide ILP;
-            // the iteration-to-iteration dep `score4 = fma(qv, kv, score4)`
-            // still serializes on a single FMA chain vec4_dim-deep
-            // (32 FMAs for Qwen3-8B head_dim=128). With Apple GPU FMA latency
-            // ~4 cycles and 1 FMA/cycle issue, a 32-deep chain costs ~128
-            // cycles latency-bound. Splitting to 2 chains lets the compiler
-            // interleave: chain A FMA at cycle 0, chain B at cycle 1, A at 4
-            // (resp dep), B at 5 — saturates issue at 2/4 = 0.5 FMA/cycle
-            // (~64 cycles for the same 32 multiplies). Same compiler-hint
-            // philosophy as cycle 93's V 4→8-wide split, applied to the QK
-            // reduction in the same kernel. vec4_dim=32 is even on Qwen3-8B
-            // so the tail is dead code; head_dim=512 (Gemma) → vec4_dim=128
-            // also even. Sum-of-products = sum-of-sums (within fast:: math
-            // tolerance already accepted in this kernel). Final collapse
-            // `score4a + score4b` keeps reduction depth at 1 extra add
-            // before the dot-with-ones. flash_attn fires ~1152×/token on
-            // Qwen3-8B decode (32 Q-heads × 36 layers).
+            // Cycle 96: extend cycle 95's 2-chain QK split to 4 independent
+            // chains (score4a/b/c/d) over i%4. With Apple GPU FMA latency
+            // ~4 cycles and 1 FMA/cycle issue, 4 chains saturate issue at
+            // 4/4 = 1 FMA/cycle (the hardware throughput limit). For
+            // vec4_dim=32 (Qwen3-8B head_dim=128), the per-chain depth
+            // drops from 16 to 8 FMAs, ~32 cycles latency-bound per chain
+            // vs ~64 in cycle 95. For vec4_dim=128 (Gemma head_dim=512),
+            // depth drops from 64 to 32. Both vec4_dim values are divisible
+            // by 4 so the tail is dead code. Same compiler-hint philosophy
+            // as cycle 93's V accumulator 4→8-wide split: more independent
+            // chains let the compiler issue FMAs back-to-back instead of
+            // stalling on the prior result. Final collapse uses a balanced
+            // tree `(a+b)+(c+d)` so the reduction adds only 2 extra ops.
+            // flash_attn fires ~1152×/token on Qwen3-8B decode (32 Q-heads
+            // × 36 layers); QK reduction dominates the kernel's critical
+            // path at short context (block_tokens ≪ FLASH_BLOCK_TOKENS).
             float4 score4a = float4(0.0f);
             float4 score4b = float4(0.0f);
+            float4 score4c = float4(0.0f);
+            float4 score4d = float4(0.0f);
             uint i = 0u;
+            for (; i + 4u <= vec4_dim; i += 4u) {
+                const float4 qv0 = q_cache4[i];
+                const float4 kv0 = *(device const float4*)(k_cache + kv_base + (i << 2));
+                const float4 qv1 = q_cache4[i + 1u];
+                const float4 kv1 = *(device const float4*)(k_cache + kv_base + ((i + 1u) << 2));
+                const float4 qv2 = q_cache4[i + 2u];
+                const float4 kv2 = *(device const float4*)(k_cache + kv_base + ((i + 2u) << 2));
+                const float4 qv3 = q_cache4[i + 3u];
+                const float4 kv3 = *(device const float4*)(k_cache + kv_base + ((i + 3u) << 2));
+                score4a = fma(qv0, kv0, score4a);
+                score4b = fma(qv1, kv1, score4b);
+                score4c = fma(qv2, kv2, score4c);
+                score4d = fma(qv3, kv3, score4d);
+            }
             for (; i + 2u <= vec4_dim; i += 2u) {
                 const float4 qv0 = q_cache4[i];
                 const float4 kv0 = *(device const float4*)(k_cache + kv_base + (i << 2));
@@ -212,7 +225,7 @@ kernel void main0(
                 const float4 kv = *(device const float4*)(k_cache + kv_base + (i << 2));
                 score4a = fma(qv, kv, score4a);
             }
-            float score = dot(score4a + score4b, float4(1.0f));
+            float score = dot((score4a + score4b) + (score4c + score4d), float4(1.0f));
             score *= scale;
             local_scores[local_idx++] = score;
             local_max = fast::max(local_max, score);
