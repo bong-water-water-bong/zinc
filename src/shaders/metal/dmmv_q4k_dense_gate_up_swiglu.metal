@@ -187,20 +187,23 @@ kernel void main0(
         float4 acc1_u1 = {0.f, 0.f, 0.f, 0.f};
         float4 acc2_u1 = {0.f, 0.f, 0.f, 0.f};
 
+        constexpr ushort4 nibble_mask = ushort4(0x000F, 0x0F00, 0x00F0, 0xF000);
+
         FOR_UNROLL (short i = 0; i < 4; ++i) {
-            // Cycle 46: port Cycle 45's explicit-float4-fma pattern from
-            // dmmv_q4k.metal to this swiglu variant. Replaces 32 indexed
-            // scalar `accX_Y[k] += y* * (q* & mask)` writes per `i` iteration
-            // (8 accumulators × 4 lanes = 32) with 8 explicit float4 fma
-            // calls. yl0..yl9/yh0..yh9 are shared across all 4 matrix×row
-            // accumulators (gate0/up0/gate1/up1), so packing them once into
-            // yl4/yh4 and pairing with per-matrix masked-quant float4s
-            // exposes the 4-wide SIMD operation directly to the compiler
-            // instead of relying on it to lift 4 lane-by-lane indexed writes
-            // into a single vector FMA. Apple7 ALU is naturally 4-wide;
-            // indexed scalar form sometimes leaves the compiler emitting 4
-            // narrower FMAs back-to-back. This shader is the hottest Q4_K
-            // bucket (~50% of Q4_K bytes/token = ffn_gate+ffn_up on Qwen3-8B).
+            // Cycle 49: vectorize the per-quant nibble-mask expansion. Cycle 46
+            // already packed the FMAs into explicit float4 form, but each
+            // `float4 q1m_X = float4(qi & 0x000F, qi & 0x0F00, qi & 0x00F0, qi & 0xF000)`
+            // still expressed 4 scalar AND ops + 4 scalar int→float conversions
+            // per nibble-set. Replace with `float4(ushort4(qi) & nibble_mask)` —
+            // explicit broadcast-then-vector-AND-then-vector-convert. Each
+            // ushort4(qi) is a register splat, the AND lowers to a single 4-wide
+            // vector AND against the constexpr mask, and the float4(ushort4)
+            // conversion is a single vector instruction on Apple7 instead of 4
+            // separate lane converts. 8 mask expansions × 4 unrolled i iterations
+            // = 32 expansions per ib iteration in this hottest Q4_K shader
+            // (~50% of Q4_K bytes/token = ffn_gate+ffn_up on Qwen3-8B). Mirrors
+            // the cycle 44-48 philosophy of telling the compiler the SIMD shape
+            // explicitly instead of relying on it to lift lane-by-lane forms.
             const float4 yl4 = float4(yl[2 * i + 0], yl[2 * i + 1], yl[2 * i + 8], yl[2 * i + 9]);
             const float4 yh4 = float4(yh[2 * i + 0], yh[2 * i + 1], yh[2 * i + 8], yh[2 * i + 9]);
             const ushort q1_g0i = q1v_g0[i];
@@ -211,14 +214,14 @@ kernel void main0(
             const ushort q2_u0i = q2v_u0[i];
             const ushort q2_g1i = q2v_g1[i];
             const ushort q2_u1i = q2v_u1[i];
-            const float4 q1m_g0 = float4(q1_g0i & 0x000F, q1_g0i & 0x0F00, q1_g0i & 0x00F0, q1_g0i & 0xF000);
-            const float4 q1m_u0 = float4(q1_u0i & 0x000F, q1_u0i & 0x0F00, q1_u0i & 0x00F0, q1_u0i & 0xF000);
-            const float4 q1m_g1 = float4(q1_g1i & 0x000F, q1_g1i & 0x0F00, q1_g1i & 0x00F0, q1_g1i & 0xF000);
-            const float4 q1m_u1 = float4(q1_u1i & 0x000F, q1_u1i & 0x0F00, q1_u1i & 0x00F0, q1_u1i & 0xF000);
-            const float4 q2m_g0 = float4(q2_g0i & 0x000F, q2_g0i & 0x0F00, q2_g0i & 0x00F0, q2_g0i & 0xF000);
-            const float4 q2m_u0 = float4(q2_u0i & 0x000F, q2_u0i & 0x0F00, q2_u0i & 0x00F0, q2_u0i & 0xF000);
-            const float4 q2m_g1 = float4(q2_g1i & 0x000F, q2_g1i & 0x0F00, q2_g1i & 0x00F0, q2_g1i & 0xF000);
-            const float4 q2m_u1 = float4(q2_u1i & 0x000F, q2_u1i & 0x0F00, q2_u1i & 0x00F0, q2_u1i & 0xF000);
+            const float4 q1m_g0 = float4(ushort4(q1_g0i) & nibble_mask);
+            const float4 q1m_u0 = float4(ushort4(q1_u0i) & nibble_mask);
+            const float4 q1m_g1 = float4(ushort4(q1_g1i) & nibble_mask);
+            const float4 q1m_u1 = float4(ushort4(q1_u1i) & nibble_mask);
+            const float4 q2m_g0 = float4(ushort4(q2_g0i) & nibble_mask);
+            const float4 q2m_u0 = float4(ushort4(q2_u0i) & nibble_mask);
+            const float4 q2m_g1 = float4(ushort4(q2_g1i) & nibble_mask);
+            const float4 q2m_u1 = float4(ushort4(q2_u1i) & nibble_mask);
             acc1_g0 = fma(yl4, q1m_g0, acc1_g0);
             acc1_u0 = fma(yl4, q1m_u0, acc1_u0);
             acc1_g1 = fma(yl4, q1m_g1, acc1_g1);
