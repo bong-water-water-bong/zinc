@@ -188,46 +188,45 @@ kernel void main0(
         float4 acc2_u1 = {0.f, 0.f, 0.f, 0.f};
 
         FOR_UNROLL (short i = 0; i < 4; ++i) {
-            const float yl0 = yl[2 * i + 0];
-            const float yl1 = yl[2 * i + 1];
-            const float yl8 = yl[2 * i + 8];
-            const float yl9 = yl[2 * i + 9];
-            const float yh0 = yh[2 * i + 0];
-            const float yh1 = yh[2 * i + 1];
-            const float yh8 = yh[2 * i + 8];
-            const float yh9 = yh[2 * i + 9];
-            acc1_g0[0] += yl0 * (q1v_g0[i] & 0x000F);
-            acc1_u0[0] += yl0 * (q1v_u0[i] & 0x000F);
-            acc1_g1[0] += yl0 * (q1v_g1[i] & 0x000F);
-            acc1_u1[0] += yl0 * (q1v_u1[i] & 0x000F);
-            acc1_g0[1] += yl1 * (q1v_g0[i] & 0x0F00);
-            acc1_u0[1] += yl1 * (q1v_u0[i] & 0x0F00);
-            acc1_g1[1] += yl1 * (q1v_g1[i] & 0x0F00);
-            acc1_u1[1] += yl1 * (q1v_u1[i] & 0x0F00);
-            acc1_g0[2] += yl8 * (q1v_g0[i] & 0x00F0);
-            acc1_u0[2] += yl8 * (q1v_u0[i] & 0x00F0);
-            acc1_g1[2] += yl8 * (q1v_g1[i] & 0x00F0);
-            acc1_u1[2] += yl8 * (q1v_u1[i] & 0x00F0);
-            acc1_g0[3] += yl9 * (q1v_g0[i] & 0xF000);
-            acc1_u0[3] += yl9 * (q1v_u0[i] & 0xF000);
-            acc1_g1[3] += yl9 * (q1v_g1[i] & 0xF000);
-            acc1_u1[3] += yl9 * (q1v_u1[i] & 0xF000);
-            acc2_g0[0] += yh0 * (q2v_g0[i] & 0x000F);
-            acc2_u0[0] += yh0 * (q2v_u0[i] & 0x000F);
-            acc2_g1[0] += yh0 * (q2v_g1[i] & 0x000F);
-            acc2_u1[0] += yh0 * (q2v_u1[i] & 0x000F);
-            acc2_g0[1] += yh1 * (q2v_g0[i] & 0x0F00);
-            acc2_u0[1] += yh1 * (q2v_u0[i] & 0x0F00);
-            acc2_g1[1] += yh1 * (q2v_g1[i] & 0x0F00);
-            acc2_u1[1] += yh1 * (q2v_u1[i] & 0x0F00);
-            acc2_g0[2] += yh8 * (q2v_g0[i] & 0x00F0);
-            acc2_u0[2] += yh8 * (q2v_u0[i] & 0x00F0);
-            acc2_g1[2] += yh8 * (q2v_g1[i] & 0x00F0);
-            acc2_u1[2] += yh8 * (q2v_u1[i] & 0x00F0);
-            acc2_g0[3] += yh9 * (q2v_g0[i] & 0xF000);
-            acc2_u0[3] += yh9 * (q2v_u0[i] & 0xF000);
-            acc2_g1[3] += yh9 * (q2v_g1[i] & 0xF000);
-            acc2_u1[3] += yh9 * (q2v_u1[i] & 0xF000);
+            // Cycle 46: port Cycle 45's explicit-float4-fma pattern from
+            // dmmv_q4k.metal to this swiglu variant. Replaces 32 indexed
+            // scalar `accX_Y[k] += y* * (q* & mask)` writes per `i` iteration
+            // (8 accumulators × 4 lanes = 32) with 8 explicit float4 fma
+            // calls. yl0..yl9/yh0..yh9 are shared across all 4 matrix×row
+            // accumulators (gate0/up0/gate1/up1), so packing them once into
+            // yl4/yh4 and pairing with per-matrix masked-quant float4s
+            // exposes the 4-wide SIMD operation directly to the compiler
+            // instead of relying on it to lift 4 lane-by-lane indexed writes
+            // into a single vector FMA. Apple7 ALU is naturally 4-wide;
+            // indexed scalar form sometimes leaves the compiler emitting 4
+            // narrower FMAs back-to-back. This shader is the hottest Q4_K
+            // bucket (~50% of Q4_K bytes/token = ffn_gate+ffn_up on Qwen3-8B).
+            const float4 yl4 = float4(yl[2 * i + 0], yl[2 * i + 1], yl[2 * i + 8], yl[2 * i + 9]);
+            const float4 yh4 = float4(yh[2 * i + 0], yh[2 * i + 1], yh[2 * i + 8], yh[2 * i + 9]);
+            const ushort q1_g0i = q1v_g0[i];
+            const ushort q1_u0i = q1v_u0[i];
+            const ushort q1_g1i = q1v_g1[i];
+            const ushort q1_u1i = q1v_u1[i];
+            const ushort q2_g0i = q2v_g0[i];
+            const ushort q2_u0i = q2v_u0[i];
+            const ushort q2_g1i = q2v_g1[i];
+            const ushort q2_u1i = q2v_u1[i];
+            const float4 q1m_g0 = float4(q1_g0i & 0x000F, q1_g0i & 0x0F00, q1_g0i & 0x00F0, q1_g0i & 0xF000);
+            const float4 q1m_u0 = float4(q1_u0i & 0x000F, q1_u0i & 0x0F00, q1_u0i & 0x00F0, q1_u0i & 0xF000);
+            const float4 q1m_g1 = float4(q1_g1i & 0x000F, q1_g1i & 0x0F00, q1_g1i & 0x00F0, q1_g1i & 0xF000);
+            const float4 q1m_u1 = float4(q1_u1i & 0x000F, q1_u1i & 0x0F00, q1_u1i & 0x00F0, q1_u1i & 0xF000);
+            const float4 q2m_g0 = float4(q2_g0i & 0x000F, q2_g0i & 0x0F00, q2_g0i & 0x00F0, q2_g0i & 0xF000);
+            const float4 q2m_u0 = float4(q2_u0i & 0x000F, q2_u0i & 0x0F00, q2_u0i & 0x00F0, q2_u0i & 0xF000);
+            const float4 q2m_g1 = float4(q2_g1i & 0x000F, q2_g1i & 0x0F00, q2_g1i & 0x00F0, q2_g1i & 0xF000);
+            const float4 q2m_u1 = float4(q2_u1i & 0x000F, q2_u1i & 0x0F00, q2_u1i & 0x00F0, q2_u1i & 0xF000);
+            acc1_g0 = fma(yl4, q1m_g0, acc1_g0);
+            acc1_u0 = fma(yl4, q1m_u0, acc1_u0);
+            acc1_g1 = fma(yl4, q1m_g1, acc1_g1);
+            acc1_u1 = fma(yl4, q1m_u1, acc1_u1);
+            acc2_g0 = fma(yh4, q2m_g0, acc2_g0);
+            acc2_u0 = fma(yh4, q2m_u0, acc2_u0);
+            acc2_g1 = fma(yh4, q2m_g1, acc2_g1);
+            acc2_u1 = fma(yh4, q2m_u1, acc2_u1);
         }
 
         gate_sum[0] += dh_g0[0] * ((acc1_g0[0] + 1.f / 256.f * acc1_g0[1]) * sc8_g0[0] +
