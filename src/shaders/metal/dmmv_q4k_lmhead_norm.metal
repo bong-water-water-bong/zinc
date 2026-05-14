@@ -86,9 +86,6 @@ kernel void main0(
     device const float* y4 = y + x_lane_off;
     device const float* nw4 = nw + x_lane_off;
 
-    ushort sc16[4];
-    thread const uchar* sc8 = (thread const uchar*)sc16;
-
     for (int ib = ix; ib < nb; ib += 4) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
 
@@ -104,10 +101,31 @@ kernel void main0(
         device const half* dh = (device const half*)(x_base + (uint64_t)ib * BLOCK_SIZE);
 
         FOR_UNROLL (short row = 0; row < NR0; row++) {
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            // Cycle 72: port cycle 69's ushort4-sc16 register-vector pattern.
+            // Replace `ushort sc16[4]` stack array + `(thread const uchar*)`
+            // byte alias with a `ushort4` SSA-eligible register vector plus
+            // precomputed lo/hi byte vectors via vector AND + vector shift.
+            // The previous form forced the compiler to materialize sc16 in
+            // thread-private memory so the byte alias could read individual
+            // lanes; the new form keeps the four packed scales in registers
+            // and lowers the 8 scalar uchar reads in the reduction body to
+            // two vector byte-extractions. Same compiler-hint philosophy as
+            // cycles 69 (dmmv_q4k.metal), 70 (swiglu), and 71 (qk_dual).
+            // This kernel covers the fused final-norm + lm-head dispatch on
+            // Qwen3-8B (vocab=151936, hidden_dim=4096, lm-head = 15.21 GiB/
+            // step = ~11% of decode bytes/token). The cycle 54 attempt to
+            // vectorize the full per-ib reduction here was reverted due to
+            // register pressure from the per-simdgroup RMS prologue, so we
+            // keep the scalar reduction shape — this change only touches
+            // storage, not the reduction arithmetic.
+            const ushort4 sc16 = ushort4(
+                sc[0] & kmask1,
+                sc[2] & kmask1,
+                ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2),
+                ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2));
+            constexpr ushort4 lo_mask = ushort4(0x00FFu);
+            const ushort4 sc8_lo = sc16 & lo_mask;
+            const ushort4 sc8_hi = (sc16 >> 8) & lo_mask;
 
             // Cycle 48: port cycle 45's explicit-float4-fma pattern from
             // dmmv_q4k.metal to this lmhead_norm variant. Replace 8 indexed
@@ -152,11 +170,11 @@ kernel void main0(
                 acc2 = fma(yh4, q2m, acc2);
             }
 
-            sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
-                    (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
-                    (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
-                    (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
-                dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8_lo.x +
+                    (acc1[2] + 1.f / 256.f * acc1[3]) * sc8_hi.x * 1.f / 16.f +
+                    (acc2[0] + 1.f / 256.f * acc2[1]) * sc8_lo.z +
+                    (acc2[2] + 1.f / 256.f * acc2[3]) * sc8_hi.z * 1.f / 16.f) -
+                dh[1] * (sumy[0] * sc8_lo.y + sumy[1] * sc8_hi.y + sumy[2] * sc8_lo.w + sumy[3] * sc8_hi.w);
 
             q1 += nb01 / 2;
             sc += nb01 / 2;
