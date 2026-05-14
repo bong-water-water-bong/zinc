@@ -73,14 +73,36 @@ kernel void main0(
     thread const uchar* sc8 = (thread const uchar*)sc16;
 
     for (int ib = ix; ib < nb; ib += 4) {
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        float4 sumy;
 
-        FOR_UNROLL (short i = 0; i < 8; ++i) {
-            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
-            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
-            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
-            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
-        }
+        // Explicit float4 loads of the four 8-float slices (offsets 0,32,128,160
+        // from y4 — all 32-byte aligned by construction of ix,iq,ir). Forces
+        // 8×16-byte coalesced loads instead of 32 scalar `y4[i]` reads, and folds
+        // the sumy partials into 4 fused dot(v,1) chains. Mirrors the cycle 23
+        // pattern that landed in dmmv_q4k_dense_gate_up_swiglu.metal; this kernel
+        // handles attn_qkv/attn_o/ffn_down on the Qwen3 dense path (~53% of all
+        // Q4_K bytes/token, complementing the ~50% FFN gate/up traffic already
+        // covered by the swiglu variant).
+        const device float4* y4v = (const device float4*)y4;
+        const float4 a0 = y4v[0];   const float4 a1 = y4v[1];
+        const float4 b0 = y4v[8];   const float4 b1 = y4v[9];
+        const float4 c0 = y4v[32];  const float4 c1 = y4v[33];
+        const float4 d0 = y4v[40];  const float4 d1 = y4v[41];
+
+        yl[ 0] = a0[0]; yl[ 1] = a0[1]; yl[ 2] = a0[2]; yl[ 3] = a0[3];
+        yl[ 4] = a1[0]; yl[ 5] = a1[1]; yl[ 6] = a1[2]; yl[ 7] = a1[3];
+        yl[ 8] = b0[0]; yl[ 9] = b0[1]; yl[10] = b0[2]; yl[11] = b0[3];
+        yl[12] = b1[0]; yl[13] = b1[1]; yl[14] = b1[2]; yl[15] = b1[3];
+        yh[ 0] = c0[0]; yh[ 1] = c0[1]; yh[ 2] = c0[2]; yh[ 3] = c0[3];
+        yh[ 4] = c1[0]; yh[ 5] = c1[1]; yh[ 6] = c1[2]; yh[ 7] = c1[3];
+        yh[ 8] = d0[0]; yh[ 9] = d0[1]; yh[10] = d0[2]; yh[11] = d0[3];
+        yh[12] = d1[0]; yh[13] = d1[1]; yh[14] = d1[2]; yh[15] = d1[3];
+
+        const float4 ones = float4(1.0f);
+        sumy[0] = dot(a0, ones) + dot(a1, ones);
+        sumy[1] = dot(b0, ones) + dot(b1, ones);
+        sumy[2] = dot(c0, ones) + dot(c1, ones);
+        sumy[3] = dot(d0, ones) + dot(d1, ones);
 
         // Pointer to scales for this block, offset by iq (uint16 stride)
         device const ushort* sc = (device const ushort*)(x_base + (uint64_t)ib * BLOCK_SIZE + 4) + iq;
