@@ -11,6 +11,15 @@ struct Params {
 // Multi-simdgroup RMS norm with threadgroup memory reduction.
 // Uses up to 1024 threads (32 simdgroups) for better float32 precision
 // when accumulating sum-of-squares over large vectors with wide value ranges.
+//
+// Pass 1 caches the input values it just read into a per-thread register
+// array so pass 2 normalizes from registers instead of re-reading `input`
+// from device memory. Mirrors the residual_rms_norm pattern. For Qwen3-8B
+// the hot shapes are (n=4096,tg=1024) and (n=128,tg=32) — both yield 4
+// iterations/thread, well within MAX_PER_THREAD=16. Models exceeding the
+// cache size fall back to the device re-read for the overflow tail.
+#define MAX_PER_THREAD 16
+
 kernel void main0(
     constant Params& p [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -27,10 +36,16 @@ kernel void main0(
 
     const uint base = group_id * p.n;
 
+    float vals[MAX_PER_THREAD];
+    uint cached = 0;
     float sum_sq = 0.0f;
     for (uint i = tid; i < p.n; i += tg_size) {
         const float v = input[base + i];
         sum_sq += v * v;
+        if (cached < MAX_PER_THREAD) {
+            vals[cached] = v;
+            cached++;
+        }
     }
 
     // Reduce within simdgroup
@@ -53,7 +68,10 @@ kernel void main0(
     total = simd_sum(total);
     const float rms_inv = fast::rsqrt(fast::divide(total, float(p.n)) + p.eps);
 
+    uint c = 0;
     for (uint i = tid; i < p.n; i += tg_size) {
-        output[base + i] = weights[i] * (input[base + i] * rms_inv);
+        const float v = (c < MAX_PER_THREAD) ? vals[c] : input[base + i];
+        output[base + i] = weights[i] * (v * rms_inv);
+        c++;
     }
 }
