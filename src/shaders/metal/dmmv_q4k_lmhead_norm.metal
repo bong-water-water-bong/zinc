@@ -141,6 +141,30 @@ kernel void main0(
             const ushort4 q1v = *((device const ushort4*)q1);
             const ushort4 q2v = *((device const ushort4*)(q1 + 32));
 
+            // Cycle 77: port cycles 66/67/68's half2 dh-load pattern.
+            // Q4_K block layout starts with `[d (half), dmin (half)]` at
+            // byte offsets 0..3, exactly a half2 pair matching the natural
+            // 4-byte block alignment. Replace the 2 scalar half reads
+            // (`dh[0]` = d, `dh[1]` = dmin) in the reduction below with
+            // a single packed half2 load + .x/.y swizzles that lower to
+            // one half2→float2 widen per row instead of 2 scalar half→
+            // float casts. Mirrors cycle 67 (dmmv_q4k.metal, 4→2 loads
+            // per ib) and cycle 68 (dmmv_q4k_qk_dual.metal). The
+            // lmhead_norm kernel keeps the scalar reduction shape (cycle
+            // 54's full per-ib vectorization regressed here due to
+            // register pressure from the per-simdgroup RMS prologue),
+            // but a half2 load on its own does not add register pressure
+            // — it just fuses the existing pair of scalar half loads
+            // into one 4-byte aligned packed read. Unlike cycle 76's
+            // packed_uint3 attempt (3 new uint registers per row), this
+            // change keeps the same 2 float values (d, dmin) in scope.
+            // Used by the fused final-norm + lm-head dispatch on
+            // Qwen3-8B (vocab=151936, hidden_dim=4096, lm-head =
+            // 15.21 GiB/step = ~11% of decode bytes/token).
+            const half2 dh_pair = *((device const half2*)dh);
+            const float d_val = float(dh_pair.x);
+            const float dmin_val = float(dh_pair.y);
+
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
@@ -170,11 +194,11 @@ kernel void main0(
                 acc2 = fma(yh4, q2m, acc2);
             }
 
-            sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8_lo.x +
+            sumf[row] += d_val * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8_lo.x +
                     (acc1[2] + 1.f / 256.f * acc1[3]) * sc8_hi.x * 1.f / 16.f +
                     (acc2[0] + 1.f / 256.f * acc2[1]) * sc8_lo.z +
                     (acc2[2] + 1.f / 256.f * acc2[3]) * sc8_hi.z * 1.f / 16.f) -
-                dh[1] * (sumy[0] * sc8_lo.y + sumy[1] * sc8_hi.y + sumy[2] * sc8_lo.w + sumy[3] * sc8_hi.w);
+                dmin_val * (sumy[0] * sc8_lo.y + sumy[1] * sc8_hi.y + sumy[2] * sc8_lo.w + sumy[3] * sc8_hi.w);
 
             q1 += nb01 / 2;
             sc += nb01 / 2;
