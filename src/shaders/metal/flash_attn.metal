@@ -197,24 +197,65 @@ kernel void main0(
         const float rescale = running_sum > 0.0f ? fast::exp(running_max - next_max) : 0.0f;
 
         // Strided loop over head_dim slices when vec4_dim > FLASH_TG_SIZE.
+        // Cycle 91: port cycle 90's 4-wide-accumulator pattern from the QK
+        // reduction to the V accumulator. The legacy form
+        // `acc += V_t * scores[t]` is a serial scalar-dep chain of length
+        // `block_tokens` on the single `acc` float4 register (up to ~133 for
+        // Qwen3-8B decode at n=128). Split into 4 independent accumulators
+        // `acc0..acc3` over staggered tokens t,t+1,t+2,t+3 to build 4
+        // independent FMA chains, cut critical-path depth to ~block_tokens/4,
+        // then collapse with `(acc0+acc1)+(acc2+acc3)` after the loop. Same
+        // associativity argument as cycle 90: sum-of-(v*s) = sum-of-sums by
+        // reassociation; the per-lane add order differs but fast::math
+        // tolerance already accepted by this kernel covers it. Tail handles
+        // the residual <4 tokens scalar-style on acc0.
         for (uint vi = tid; vi < vec4_dim; vi += FLASH_TG_SIZE) {
-            float4 acc = acc_cache4[vi] * rescale;
+            float4 acc0 = acc_cache4[vi] * rescale;
+            float4 acc1 = float4(0.0f);
+            float4 acc2 = float4(0.0f);
+            float4 acc3 = float4(0.0f);
             const uint dim_base = vi << 2;
 
             if (contiguous_kv) {
                 uint kv_base = block_base + dim_base;
-                for (uint token_offset = 0; token_offset < block_tokens; token_offset++) {
-                    acc += *(device const float4*)(v_cache + kv_base) * scores[token_offset];
+                const uint stride2 = token_stride << 1;
+                const uint stride3 = stride2 + token_stride;
+                const uint stride4 = token_stride << 2;
+                uint t = 0;
+                for (; t + 4u <= block_tokens; t += 4u) {
+                    const float4 v0 = *(device const float4*)(v_cache + kv_base);
+                    const float4 v1 = *(device const float4*)(v_cache + kv_base + token_stride);
+                    const float4 v2 = *(device const float4*)(v_cache + kv_base + stride2);
+                    const float4 v3 = *(device const float4*)(v_cache + kv_base + stride3);
+                    acc0 += v0 * scores[t + 0u];
+                    acc1 += v1 * scores[t + 1u];
+                    acc2 += v2 * scores[t + 2u];
+                    acc3 += v3 * scores[t + 3u];
+                    kv_base += stride4;
+                }
+                for (; t < block_tokens; t++) {
+                    acc0 += *(device const float4*)(v_cache + kv_base) * scores[t];
                     kv_base += token_stride;
                 }
             } else {
-                for (uint token_offset = 0; token_offset < block_tokens; token_offset++) {
-                    const uint kv_base = kvBaseForToken(page_table, p, kv_head, block_start + token_offset);
-                    acc += *(device const float4*)(v_cache + kv_base + dim_base) * scores[token_offset];
+                uint t = 0;
+                for (; t + 4u <= block_tokens; t += 4u) {
+                    const uint kb0 = kvBaseForToken(page_table, p, kv_head, block_start + t + 0u);
+                    const uint kb1 = kvBaseForToken(page_table, p, kv_head, block_start + t + 1u);
+                    const uint kb2 = kvBaseForToken(page_table, p, kv_head, block_start + t + 2u);
+                    const uint kb3 = kvBaseForToken(page_table, p, kv_head, block_start + t + 3u);
+                    acc0 += *(device const float4*)(v_cache + kb0 + dim_base) * scores[t + 0u];
+                    acc1 += *(device const float4*)(v_cache + kb1 + dim_base) * scores[t + 1u];
+                    acc2 += *(device const float4*)(v_cache + kb2 + dim_base) * scores[t + 2u];
+                    acc3 += *(device const float4*)(v_cache + kb3 + dim_base) * scores[t + 3u];
+                }
+                for (; t < block_tokens; t++) {
+                    const uint kv_base = kvBaseForToken(page_table, p, kv_head, block_start + t);
+                    acc0 += *(device const float4*)(v_cache + kv_base + dim_base) * scores[t];
                 }
             }
 
-            acc_cache4[vi] = acc;
+            acc_cache4[vi] = (acc0 + acc1) + (acc2 + acc3);
         }
         // No threadgroup_barrier here: acc_cache4 is accessed exclusively via
         // per-thread strided indexing (vi = tid; vi += FLASH_TG_SIZE), so each
