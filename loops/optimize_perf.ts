@@ -480,6 +480,51 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       },
     ],
   },
+  14: {
+    doc: "MULTI_HOUR_EFFORT_14_METAL_QWEN3_8B_M1.md",
+    summary: "Apple M1 Max Qwen3-8B decode parity with llama.cpp (close 9x decode gap)",
+    metricMode: "decode",
+    primaryMetricLabel: "Qwen3-8B decode tok/s",
+    benchmarkPrompt: "The capital of France is",
+    benchmarkMaxTokens: 128,
+    benchmarkMethod: "128-token decode benchmark on Qwen3-8B Q4_K_M on local M1 Max via Metal; 3-run median",
+    knownFlatCategories: [
+      "Command-buffer commit reduction (Cycle 1, kept). Extended canUseDenseSharedDecodeCommand to .qwen2 dense and collapsed 4960 → 68 commits per 64-token decode. Prefill +18% (10.4 → 12.3 tok/s). Decode FLAT (8.55 vs 8.60 baseline). Confirms commit count is not the M1 Max decode bottleneck.",
+      "Compute-encoder dispatch reduction via gate+up+SwiGLU fusion (Cycle 3, kept). New dmmv_q4k_dense_gate_up_swiglu.metal mirrors the Gemma GeGLU fusion. Removed 72 dispatches + 36 barriers per token (580 → 508, 399 → 363). Decode FLAT (8.67 vs 8.55, well within noise). Confirms dispatch count and barrier count are not the M1 Max decode bottleneck.",
+      "Q4_K matvec kernel rewrites (ruled out by reading). ZINC's dmmv_q4k.metal is a faithful line-for-line port of llama.cpp's kernel_mul_mv_q4_K_f32 (same NSG=2, NR0=2, identical fixed-point accumulation). For N=1 decode llama.cpp picks the same kernel — its mul_mv_ext_q4*_disp dispatchers gate on ne11 ∈ [4,8] (small batch only). Do not waste cycles rewriting the matvec at the algorithmic level.",
+      "Broad threadgroup-size sweeps without exact-shape microbench evidence. Cycle-3 of Effort 5 logged the same lesson on a different model: --q8-tg overrides chosen from microbench did not move whole-model decode. Use bench-metal-dmmv-q4k for shape-level proof first.",
+    ],
+    structuralSwingIdeas: [
+      "Quantize KV cache to q8_0. llama.cpp's local Metal run reports K/V stored as q8_0 (-ctk q8_0 -ctv q8_0). At long contexts this halves KV bandwidth on the attention path; at short contexts it cuts KV cache memory footprint. ZINC has --kv-q8 flag for the bench-metal harness but the default decode path uses f16. Verify what Qwen3 8B decode uses and switch to q8_0 if not already.",
+      "Fuse rms_norm + Q projection on attention layers. ZINC's rms_norm_dmmv_q4k_alpha_beta and rms_norm_dmmv_f32 are the proven Vulkan template (Effort 10 cycles 8 and 13, +0.61 and +0.57 tok/s on RDNA4). Equivalent fused-RMS+matvec Metal kernel does not yet exist for the dense Qwen3 attention prologue. Saves 1 dispatch + 1 barrier per layer × 36 = 72 dispatches/token.",
+      "Fuse RoPE into KV cache write (the qk_norm_rope_kv_write pattern). Vulkan has src/shaders/qk_norm_rope_kv_write.comp; Metal has rope_kv_cache_write.metal. Verify what fires for Qwen3 dense on Metal — if the K-rope and KV write are still separate dispatches per layer, fusing saves 1 dispatch + 1 barrier per attention layer.",
+      "Single-kernel Q+K+V projection. Q/K/V projections read the same input (norm_buf) and produce three independent outputs. A single kernel that writes all three (analog of the dmmv_q4k_dense_gate_up_swiglu template, generalized to three outputs) avoids re-reading norm_buf twice and saves 2 dispatches + 2 barriers per attention layer.",
+      "Cycle 0 microbench result (kept): dmmv_q4k on this M1 Max runs at 220-246 GB/s on Qwen3-8B hot shapes (54-60% of 410 GB/s peak), giving a kernel-only ceiling of ~59 tok/s. Production end-to-end at 8.6 tok/s is 7x below ceiling. Three hypotheses for the gap remain UNCONFIRMED without a Metal Performance HUD / Instruments trace: (a) per-kernel weight-cache cold misses across distinct tensors, (b) small-kernel launch-overhead concentration on RoPE/norm/KV-write/attention, (c) GPU scheduler gaps between back-to-back dispatches. A trace would close the diagnostic question before more code changes.",
+      "GPU-side greedy argmax for the LM head step. Currently the logits vector is copied to CPU and scanned by sampleGreedy. Not a primary lever but a real tail-cost saver at high tok/s; revisit only after the main wall-time work lands.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal",
+        focus: "kernel_mul_mv_q4_K_f32 (the same kernel ZINC ported), kernel_flash_attn_ext_vec (decode-side flash attention), kernel_rope_norm + kernel_rope_neox (RoPE variants), kernel_rms_norm_fuse_impl (fused norm). The line-for-line baseline that ZINC's dmmv_q4k.metal mirrors.",
+      },
+      {
+        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp",
+        focus: "Graph-op → kernel selection. Search for q4_K and flash_attn_ext to see when each kernel variant fires. Useful for confirming which kernel llama.cpp actually picks for the Qwen3-8B shapes we care about.",
+      },
+      {
+        path: "/Users/stepan/Workspace/zinc/src/shaders/metal/dmmv_q4k_dense_gate_up_swiglu.metal",
+        focus: "The Cycle 3 fused gate+up+SwiGLU kernel. Use this as the template for a single-kernel Q+K+V projection (analog with three output streams instead of two) and for fused rms_norm + matvec variants.",
+      },
+      {
+        path: "/Users/stepan/Workspace/zinc/benchmarks/metal_dmmv_q4k.zig",
+        focus: "Decode-shape microbench added in Effort 14. Use it to validate any new q4_K kernel variant on the Qwen3-8B hot shapes before whole-model rollout. Build target: `zig build bench-metal-dmmv-q4k`.",
+      },
+      {
+        path: "/Users/stepan/Workspace/zinc/loops/efforts/EFFORT_14_NOTES.md",
+        focus: "Running notes for this effort. Always read before proposing a change — it lists the three already-falsified hypotheses (command-buffer count, encoder-dispatch count, barrier count) and what is still open.",
+      },
+    ],
+  },
 };
 
 export function getEffortSpec(effort: number): EffortSpec | null {
