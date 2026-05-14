@@ -55,10 +55,13 @@ kernel void main0(
         total = simd_sum(total);
     }
 
-    // Broadcast rms_inv to all threads
+    // Broadcast rms_inv to all threads. fast::rsqrt + fast::divide (Apple HW
+    // reciprocal-sqrt + reciprocal-mul, same pattern as residual_rms_norm.metal
+    // cycle 13). Only thread 0 computes, so ~144 RMS dispatches/token on
+    // Qwen3-8B each save one transcendental.
     threadgroup float shared_rms_inv;
     if (tid == 0) {
-        shared_rms_inv = rsqrt((total / float(p.n)) + p.eps);
+        shared_rms_inv = fast::rsqrt(fast::divide(total, float(p.n)) + p.eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float rms_inv = shared_rms_inv;
