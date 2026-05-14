@@ -63,18 +63,26 @@ kernel void main0(
     for (uint bi = ix; bi < nb; bi += 2u) {
         device const float* y = src1 + bi * QK_K + y_offset;
 
-        // Cycle 39: explicit FOR_UNROLL on the yl-fill loop. Mirrors cycle 37's
-        // pragma added to the inner 32-FMA loop. Without unroll the yl[]
-        // register array is indexed by a runtime loop variable, which can
-        // force the compiler to spill yl[] to stack instead of promoting to
-        // registers. Unrolling makes all 16 indices compile-time constants so
-        // yl can live in SSA values for the duration of the FMA loop.
-        float yl[16];
+        // Cycle 83: store the per-l y-gather directly as a `float4 yl4_arr[4]`
+        // array instead of the previous `float yl[16]` scalar layout. The
+        // inner FMA loop and the per-block yl_sum4 reduction both consume
+        // exactly one float4 per l (the four lanes are y[l], y[l+32],
+        // y[l+64], y[l+96]); under the old layout each consumer constructed
+        // its float4 via a 4-lane indexed gather over yl[4l..4l+3] (twice
+        // per ib: once at yl_sum4 construction time, four times inside the
+        // FOR_UNROLL). The compiler usually folds those gathers into
+        // register moves when FOR_UNROLL exposes all indices as compile-time
+        // constants — but only when it keeps yl[] fully in SSA registers,
+        // which is not guaranteed for a 16-float-wide flat array (it can
+        // demote to thread-private stack on register pressure). Pre-storing
+        // as float4 yl4_arr[4] makes the natural data shape explicit:
+        // 4 vector registers, no gather, and yl_sum4 collapses to a tree of
+        // 3 vector adds. Same FOR_UNROLL on the fill loop preserved.
+        // dmmv_q6k_llama.metal handles lm_head on Qwen3-8B Q4_K_M (Q6_K =
+        // 28.4% of decode bytes/token = 38.46 GiB/step).
+        float4 yl4_arr[4];
         FOR_UNROLL (ushort l = 0u; l < 4u; ++l) {
-            yl[4u * l + 0u] = y[l + 0u];
-            yl[4u * l + 1u] = y[l + 32u];
-            yl[4u * l + 2u] = y[l + 64u];
-            yl[4u * l + 3u] = y[l + 96u];
+            yl4_arr[l] = float4(y[l + 0u], y[l + 32u], y[l + 64u], y[l + 96u]);
         }
 
         // Cycle 43: hoist the -32 zero-point subtraction out of the inner FMA loop.
@@ -100,11 +108,7 @@ kernel void main0(
         // infer it from indexed lane writes that may schedule as narrower
         // FMAs. Q6_K covers ffn_down on Qwen3-8B (28.4% of decode bytes/
         // token = 38.46 GiB/step).
-        const float4 yl_sum4 =
-            (float4(yl[ 0], yl[ 1], yl[ 2], yl[ 3]) +
-             float4(yl[ 4], yl[ 5], yl[ 6], yl[ 7])) +
-            (float4(yl[ 8], yl[ 9], yl[10], yl[11]) +
-             float4(yl[12], yl[13], yl[14], yl[15]));
+        const float4 yl_sum4 = (yl4_arr[0] + yl4_arr[1]) + (yl4_arr[2] + yl4_arr[3]);
 
         // Cycle 36: interleave NR0=2 row0/row1 — load both rows' q1v4/q2v4/qhv4/
         // sc/d up front, then run a single FOR_UNROLL l=0..3 that updates both
@@ -180,7 +184,7 @@ kernel void main0(
             // per-lane writes into a single vector op. Apple7 ALU is naturally
             // 4-wide; the indexed scalar form sometimes leaves the compiler
             // emitting 4 narrower FMAs back-to-back instead of a single quad FMA.
-            const float4 yl4 = float4(yl[4u * l + 0u], yl[4u * l + 1u], yl[4u * l + 2u], yl[4u * l + 3u]);
+            const float4 yl4 = yl4_arr[l];
             const float4 q4_0 = float4(q_base_0 | h_part_0);
             const float4 q4_1 = float4(q_base_1 | h_part_1);
             sums_0 = fma(yl4, q4_0, sums_0);
