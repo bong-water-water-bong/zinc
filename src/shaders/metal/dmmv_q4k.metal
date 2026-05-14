@@ -148,6 +148,8 @@ kernel void main0(
         float4 acc1_1 = {0.f, 0.f, 0.f, 0.f};
         float4 acc2_1 = {0.f, 0.f, 0.f, 0.f};
 
+        constexpr ushort4 nibble_mask = ushort4(0x000F, 0x0F00, 0x00F0, 0xF000);
+
         FOR_UNROLL (short i = 0; i < 4; ++i) {
             // Cycle 45: replace 16 indexed scalar `accX_Y[k] += y* * (q* & mask)`
             // writes (4 acc-slots × 4 accumulators) per `i` iteration with 4
@@ -167,10 +169,19 @@ kernel void main0(
             const ushort q1_1i = q1v_1[i];
             const ushort q2_0i = q2v_0[i];
             const ushort q2_1i = q2v_1[i];
-            const float4 q1m_0 = float4(q1_0i & 0x000F, q1_0i & 0x0F00, q1_0i & 0x00F0, q1_0i & 0xF000);
-            const float4 q1m_1 = float4(q1_1i & 0x000F, q1_1i & 0x0F00, q1_1i & 0x00F0, q1_1i & 0xF000);
-            const float4 q2m_0 = float4(q2_0i & 0x000F, q2_0i & 0x0F00, q2_0i & 0x00F0, q2_0i & 0xF000);
-            const float4 q2m_1 = float4(q2_1i & 0x000F, q2_1i & 0x0F00, q2_1i & 0x00F0, q2_1i & 0xF000);
+            // Cycle 50: vectorize 4-lane nibble-mask expansion. Replace
+            // `float4(qi & 0x000F, qi & 0x0F00, qi & 0x00F0, qi & 0xF000)` —
+            // 4 scalar ANDs + 4 scalar int→float casts per `qi` — with
+            // `float4(ushort4(qi) & nibble_mask)`, which lowers to 1
+            // ushort4 splat, 1 ushort4 AND vs a constexpr mask, then 1
+            // ushort4→float4 widen. Mirrors cycle 49 (same change to
+            // dmmv_q4k_dense_gate_up_swiglu.metal). dmmv_q4k.metal is the
+            // generic Q4_K matvec used for attn_qkv / attn_o on Qwen3-8B,
+            // a meaningful slice of the Q4_K 71.6% bytes/token share.
+            const float4 q1m_0 = float4(ushort4(q1_0i) & nibble_mask);
+            const float4 q1m_1 = float4(ushort4(q1_1i) & nibble_mask);
+            const float4 q2m_0 = float4(ushort4(q2_0i) & nibble_mask);
+            const float4 q2m_1 = float4(ushort4(q2_1i) & nibble_mask);
             acc1_0 = fma(yl4, q1m_0, acc1_0);
             acc1_1 = fma(yl4, q1m_1, acc1_1);
             acc2_0 = fma(yh4, q2m_0, acc2_0);
