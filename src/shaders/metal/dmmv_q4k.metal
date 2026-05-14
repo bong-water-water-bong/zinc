@@ -69,9 +69,6 @@ kernel void main0(
 
     device const float* y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
-    ushort sc16[4];
-    thread const uchar* sc8 = (thread const uchar*)sc16;
-
     for (int ib = ix; ib < nb; ib += 4) {
         float4 sumy;
 
@@ -104,62 +101,90 @@ kernel void main0(
         sumy[2] = dot(c0, ones) + dot(c1, ones);
         sumy[3] = dot(d0, ones) + dot(d1, ones);
 
-        // Pointer to scales for this block, as uint (4-byte aligned: block is
-        // 144-aligned, nb01 is 4-aligned, +4 byte scales offset preserves
-        // 4-byte alignment). Each uint covers 2 ushorts; iq selects low (iq=0)
-        // or high (iq=1) ushort via shift, avoiding 3 scalar 16-bit loads.
-        device const uint* sc_u = (device const uint*)(x_base + (uint64_t)ib * BLOCK_SIZE + 4);
+        // Cycle 33: interleave row0/row1 of NR0=2. Load both rows' sc_u/q1/q2/dh
+        // up front and run a single FOR_UNROLL i=0..3 that updates both rows'
+        // acc1/acc2 alternately. Same algorithm as the sequential row loop, but
+        // removes the per-row serialization chain (sumf[0] depends on row-0
+        // accumulator completion before row-1's loads start in the original).
+        // Mirrors cycle 32's interleaved gate+up pattern from the swiglu helper,
+        // applied here across row0/row1 of the same matrix instead of across
+        // gate/up matrices. Covers attn_qkv/attn_o/ffn_down on Qwen3 dense.
+        device const uint* sc_u_0 = (device const uint*)(x_base + (uint64_t)ib * BLOCK_SIZE + 4);
+        device const uint* sc_u_1 = sc_u_0 + nb01 / 4;
         const uint sc_shift = uint(iq) * 16u;
-        // Pointer to quants for this block
-        device const ushort* q1 = (device const ushort*)(x_base + (uint64_t)ib * BLOCK_SIZE + 16) + 16 * iq + 4 * ir;
-        // Pointer to d/dmin halves for this block
-        device const half* dh = (device const half*)(x_base + (uint64_t)ib * BLOCK_SIZE);
+        device const ushort* q1_0 = (device const ushort*)(x_base + (uint64_t)ib * BLOCK_SIZE + 16) + 16 * iq + 4 * ir;
+        device const ushort* q1_1 = q1_0 + nb01 / 2;
+        device const half* dh_0 = (device const half*)(x_base + (uint64_t)ib * BLOCK_SIZE);
+        device const half* dh_1 = dh_0 + nb01 / 2;
 
-        FOR_UNROLL (short row = 0; row < NR0; row++) {
-            const ushort sc_0 = ushort((sc_u[0] >> sc_shift) & 0xFFFFu);
-            const ushort sc_2 = ushort((sc_u[1] >> sc_shift) & 0xFFFFu);
-            const ushort sc_4 = ushort((sc_u[2] >> sc_shift) & 0xFFFFu);
-            sc16[0] = sc_0 & kmask1;
-            sc16[1] = sc_2 & kmask1;
-            sc16[2] = ((sc_4 >> 0) & kmask2) | ((sc_0 & kmask3) >> 2);
-            sc16[3] = ((sc_4 >> 4) & kmask2) | ((sc_2 & kmask3) >> 2);
+        ushort sc16_0[4];
+        ushort sc16_1[4];
+        thread const uchar* sc8_0 = (thread const uchar*)sc16_0;
+        thread const uchar* sc8_1 = (thread const uchar*)sc16_1;
 
-            device const ushort* q2 = q1 + 32;
+        const ushort sc_0_0 = ushort((sc_u_0[0] >> sc_shift) & 0xFFFFu);
+        const ushort sc_2_0 = ushort((sc_u_0[1] >> sc_shift) & 0xFFFFu);
+        const ushort sc_4_0 = ushort((sc_u_0[2] >> sc_shift) & 0xFFFFu);
+        sc16_0[0] = sc_0_0 & kmask1;
+        sc16_0[1] = sc_2_0 & kmask1;
+        sc16_0[2] = ((sc_4_0 >> 0) & kmask2) | ((sc_0_0 & kmask3) >> 2);
+        sc16_0[3] = ((sc_4_0 >> 4) & kmask2) | ((sc_2_0 & kmask3) >> 2);
 
-            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+        const ushort sc_0_1 = ushort((sc_u_1[0] >> sc_shift) & 0xFFFFu);
+        const ushort sc_2_1 = ushort((sc_u_1[1] >> sc_shift) & 0xFFFFu);
+        const ushort sc_4_1 = ushort((sc_u_1[2] >> sc_shift) & 0xFFFFu);
+        sc16_1[0] = sc_0_1 & kmask1;
+        sc16_1[1] = sc_2_1 & kmask1;
+        sc16_1[2] = ((sc_4_1 >> 0) & kmask2) | ((sc_0_1 & kmask3) >> 2);
+        sc16_1[3] = ((sc_4_1 >> 4) & kmask2) | ((sc_2_1 & kmask3) >> 2);
 
-            // ushort4 vectorized loads of the 8 q-quant ushorts: q1[0..3] and
-            // q2[0..3]. Pointers are 8-byte aligned by construction (block
-            // base is 144-byte stride, +16 byte qs offset, +16*iq + 4*ir
-            // ushort offsets all preserve 8B alignment; q2 = q1 + 64 bytes).
-            // Replaces 8 scalar ushort loads with 2 ushort4 loads — same
-            // coalescing pattern that cycle 25 applied to the y4[] floats.
-            const ushort4 q1v = *((device const ushort4*)q1);
-            const ushort4 q2v = *((device const ushort4*)q2);
+        const ushort4 q1v_0 = *((device const ushort4*)q1_0);
+        const ushort4 q2v_0 = *((device const ushort4*)(q1_0 + 32));
+        const ushort4 q1v_1 = *((device const ushort4*)q1_1);
+        const ushort4 q2v_1 = *((device const ushort4*)(q1_1 + 32));
 
-            FOR_UNROLL (short i = 0; i < 4; ++i) {
-                acc1[0] += yl[2 * i + 0] * (q1v[i] & 0x000F);
-                acc1[1] += yl[2 * i + 1] * (q1v[i] & 0x0F00);
-                acc1[2] += yl[2 * i + 8] * (q1v[i] & 0x00F0);
-                acc1[3] += yl[2 * i + 9] * (q1v[i] & 0xF000);
-                acc2[0] += yh[2 * i + 0] * (q2v[i] & 0x000F);
-                acc2[1] += yh[2 * i + 1] * (q2v[i] & 0x0F00);
-                acc2[2] += yh[2 * i + 8] * (q2v[i] & 0x00F0);
-                acc2[3] += yh[2 * i + 9] * (q2v[i] & 0xF000);
-            }
+        float4 acc1_0 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc2_0 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc1_1 = {0.f, 0.f, 0.f, 0.f};
+        float4 acc2_1 = {0.f, 0.f, 0.f, 0.f};
 
-            sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
-                    (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
-                    (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
-                    (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
-                dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
-
-            // Advance to next row: nb01/2 is stride in uint16 units, nb01/4 in uint32 units
-            q1 += nb01 / 2;
-            sc_u += nb01 / 4;
-            dh += nb01 / 2;
+        FOR_UNROLL (short i = 0; i < 4; ++i) {
+            const float yl0 = yl[2 * i + 0];
+            const float yl1 = yl[2 * i + 1];
+            const float yl8 = yl[2 * i + 8];
+            const float yl9 = yl[2 * i + 9];
+            const float yh0 = yh[2 * i + 0];
+            const float yh1 = yh[2 * i + 1];
+            const float yh8 = yh[2 * i + 8];
+            const float yh9 = yh[2 * i + 9];
+            acc1_0[0] += yl0 * (q1v_0[i] & 0x000F);
+            acc1_1[0] += yl0 * (q1v_1[i] & 0x000F);
+            acc1_0[1] += yl1 * (q1v_0[i] & 0x0F00);
+            acc1_1[1] += yl1 * (q1v_1[i] & 0x0F00);
+            acc1_0[2] += yl8 * (q1v_0[i] & 0x00F0);
+            acc1_1[2] += yl8 * (q1v_1[i] & 0x00F0);
+            acc1_0[3] += yl9 * (q1v_0[i] & 0xF000);
+            acc1_1[3] += yl9 * (q1v_1[i] & 0xF000);
+            acc2_0[0] += yh0 * (q2v_0[i] & 0x000F);
+            acc2_1[0] += yh0 * (q2v_1[i] & 0x000F);
+            acc2_0[1] += yh1 * (q2v_0[i] & 0x0F00);
+            acc2_1[1] += yh1 * (q2v_1[i] & 0x0F00);
+            acc2_0[2] += yh8 * (q2v_0[i] & 0x00F0);
+            acc2_1[2] += yh8 * (q2v_1[i] & 0x00F0);
+            acc2_0[3] += yh9 * (q2v_0[i] & 0xF000);
+            acc2_1[3] += yh9 * (q2v_1[i] & 0xF000);
         }
+
+        sumf[0] += dh_0[0] * ((acc1_0[0] + 1.f / 256.f * acc1_0[1]) * sc8_0[0] +
+                (acc1_0[2] + 1.f / 256.f * acc1_0[3]) * sc8_0[1] * 1.f / 16.f +
+                (acc2_0[0] + 1.f / 256.f * acc2_0[1]) * sc8_0[4] +
+                (acc2_0[2] + 1.f / 256.f * acc2_0[3]) * sc8_0[5] * 1.f / 16.f) -
+            dh_0[1] * (sumy[0] * sc8_0[2] + sumy[1] * sc8_0[3] + sumy[2] * sc8_0[6] + sumy[3] * sc8_0[7]);
+        sumf[1] += dh_1[0] * ((acc1_1[0] + 1.f / 256.f * acc1_1[1]) * sc8_1[0] +
+                (acc1_1[2] + 1.f / 256.f * acc1_1[3]) * sc8_1[1] * 1.f / 16.f +
+                (acc2_1[0] + 1.f / 256.f * acc2_1[1]) * sc8_1[4] +
+                (acc2_1[2] + 1.f / 256.f * acc2_1[3]) * sc8_1[5] * 1.f / 16.f) -
+            dh_1[1] * (sumy[0] * sc8_1[2] + sumy[1] * sc8_1[3] + sumy[2] * sc8_1[6] + sumy[3] * sc8_1[7]);
 
         y4 += 4 * QK_K;
     }
