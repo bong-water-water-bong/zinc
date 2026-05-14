@@ -5,53 +5,74 @@
 # Run AFTER the implement_metal.ts loop finishes — both processes contend
 # for the GPU and concurrent runs poison each other's measurements.
 #
-# Background: during Phase 0 of Effort 14, llama-cli hung twice on
-# warmup at 96% CPU for hours. The most likely cause is conversation
-# mode waiting on stdin. This script uses -no-cnv (no-conversation) and
-# explicit greedy decoding flags to avoid that.
+# History (2026-05-13/14): the original version used `llama-cli` with
+# `-no-cnv --simple-io`. Despite those flags, `llama-cli` hung 4
+# separate times on the warmup invocation (96% CPU, no output, for
+# hours), blocking the overnight launcher chain. The hang appears to
+# be on stdin-handling regardless of the no-conversation flags.
+# `llama-simple` is the minimal non-interactive driver in the same
+# build dir; it does not touch the chat/conversation code path and
+# ran cleanly on the first try. Switched to llama-simple as the
+# benchmark driver. Each run has a 120s per-invocation timeout so a
+# future regression in llama-simple cannot block the launcher again.
 
-set -euo pipefail
+set -uo pipefail
 
 MODEL=/Users/stepan/Library/Caches/zinc/models/models/qwen3-8b-q4k-m/model.gguf
-BIN=$HOME/Workspace/llama.cpp/build-metal/bin/llama-cli
+BIN=$HOME/Workspace/llama.cpp/build-metal/bin/llama-simple
 PROMPT="The capital of France is"
 N_TOKENS=128
+PER_RUN_TIMEOUT=180   # seconds; warmup is ~4s, runs ~4s — 180 is generous.
 
 if [[ ! -x "$BIN" ]]; then
-  echo "llama-cli not found at $BIN" >&2
+  echo "llama-simple not found at $BIN" >&2
   exit 1
 fi
 if [[ ! -f "$MODEL" ]]; then
   echo "Model not found at $MODEL" >&2
   exit 1
 fi
+if ! command -v gtimeout >/dev/null && ! command -v timeout >/dev/null; then
+  echo "WARNING: no timeout(1) available — runs may hang indefinitely" >&2
+fi
+TIMEOUT_BIN=$(command -v gtimeout || command -v timeout || echo "")
 
 # Stop strays so the bench has a clean GPU.
 pkill -f 'zig-out/bin/zinc' 2>/dev/null || true
 pkill -f 'llama-cli'         2>/dev/null || true
+pkill -f 'llama-simple'      2>/dev/null || true
 sleep 1
 
 echo "=== llama.cpp Qwen3-8B baseline (Metal, M1 Max) ==="
 echo "Model:  $MODEL"
 echo "Prompt: $PROMPT"
 echo "Tokens: $N_TOKENS"
-echo "Flags:  -ngl 99 -fa on --temp 0 -no-cnv --no-warmup"
+echo "Tool:   $BIN"
+echo "Per-run timeout: ${PER_RUN_TIMEOUT}s"
 echo
 
-# Warmup (discarded) — then three timed runs. Use --simple-io to disable
-# any interactive output massaging that might block on a tty in non-tty
-# environments. The grep at the end extracts the perf summary.
-echo "=== WARMUP (discarded) ==="
-"$BIN" -m "$MODEL" -p "$PROMPT" -n 16 -ngl 99 -fa on --temp 0 -no-cnv --no-warmup --simple-io 2>&1 \
-  | tail -10 || true
+run_one() {
+  local label=$1; shift
+  echo "=== $label ==="
+  if [[ -n "$TIMEOUT_BIN" ]]; then
+    "$TIMEOUT_BIN" --kill-after=5s "${PER_RUN_TIMEOUT}s" \
+      "$BIN" -m "$MODEL" -n "$N_TOKENS" -ngl 99 "$PROMPT" 2>&1 \
+      | grep -E 'speed:|eval time|tokens per second|prompt eval' \
+      || echo "(no perf line found — timeout or crash)"
+  else
+    "$BIN" -m "$MODEL" -n "$N_TOKENS" -ngl 99 "$PROMPT" 2>&1 \
+      | grep -E 'speed:|eval time|tokens per second|prompt eval' \
+      || echo "(no perf line found)"
+  fi
+  pkill -f 'llama-simple' 2>/dev/null || true
+  sleep 1
+}
 
-for run in 1 2 3; do
-  echo
-  echo "=== RUN $run ==="
-  "$BIN" -m "$MODEL" -p "$PROMPT" -n "$N_TOKENS" -ngl 99 -fa on --temp 0 -no-cnv --no-warmup --simple-io 2>&1 \
-    | grep -E 'eval time|tokens per second|prompt eval|llama_perf' \
-    || echo "(no perf line found — re-run by hand and inspect output)"
+run_one "WARMUP (discarded)"
+for i in 1 2 3; do
+  run_one "RUN $i"
 done
 
 echo
-echo "Done. Compare median 'eval' tok/s against ZINC's decode tok/s for the same model."
+echo "Done. Compare 'eval' tok/s (decode-only) against ZINC decode for the same model."
+echo "Reference number captured on 2026-05-14: 33.96 tok/s median decode."

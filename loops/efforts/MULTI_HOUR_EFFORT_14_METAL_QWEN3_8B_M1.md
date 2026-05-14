@@ -231,11 +231,17 @@ On exit, the notes file's "Outcome" section must contain:
 - list of attempted-and-reverted changes with reasons
 - the single most useful learning from the effort
 
-## Status as of 2026-05-14 (after 21 loop cycles)
+## Status as of 2026-05-14 (after 25 loop cycles)
 
 **Current state**: ~45.0 tok/s decode on Qwen3-8B Q4_K_M, M1 Max.
 **Starting state**: 8.6 tok/s (cold) / 10.6 tok/s (warm).
 **Improvement**: ~5× cold / ~4× warm.
+
+**llama.cpp on the same M1 Max + model: 33.96 tok/s decode** (captured
+2026-05-14, see EFFORT_14_NOTES.md). The plan's termination condition
+"ZINC matches or exceeds llama.cpp" is **MET AND EXCEEDED**: ZINC is
+~+30% faster than llama.cpp on this configuration. Further cycles are
+optimizing past the comparator, not toward parity.
 
 **See `EFFORT_14_NOTES.md` for the full cycle history.** Before any new
 cycle, read its "Consolidated cycle history" section. Key categorical

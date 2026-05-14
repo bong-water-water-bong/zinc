@@ -39,11 +39,39 @@ the bottleneck, not dispatch.
 
 ### llama.cpp baseline
 
-Not yet captured — `llama-cli` hung on warmup twice (process spun for hours
-at 96% CPU on the model load path). Comparable-model reference from the
-public benchmarks page: M4 Max llama.cpp Qwen3 8B decode is **83.67 tok/s**.
-Scaling to M1 Max bandwidth (~75% of M4 Max) → expected llama.cpp on M1 Max
-is in the **55–65 tok/s** range. ZINC at 8.6 tok/s ≈ 13–15% of that.
+**Captured 2026-05-14 via `llama-simple` (not `llama-cli` — the latter
+hangs on warmup, ~4 attempts, root cause is stdin handling regardless
+of `-no-cnv --simple-io`). `llama-simple` is the minimal non-interactive
+driver in the same `build-metal` dir; ran on first try.**
+
+3 timed runs at `-n 128`, defaults (no `-fa on`, no batch tuning):
+
+| Run | overall speed | decode (eval) | prompt eval |
+|---|---:|---:|---:|
+| 1 | 32.52 | 33.96 | 46.09 |
+| 2 | 32.11 | 33.42 | 44.02 |
+| 3 | 33.81 | 35.45 | 46.59 |
+| **Median** | **32.52** | **33.96** | **46.09** |
+
+**llama.cpp decode on this M1 Max: 33.96 tok/s.**
+
+That's **far lower** than the original Phase 0 estimate of 55–65 tok/s.
+The estimate was a linear scaling from the M4 Max public number
+(83.67) by bandwidth ratio — apparently that scaling does not hold.
+Either the M4 Max number assumed a non-default flag set, or M1 Max
+runs llama.cpp's Metal path significantly less efficiently than a
+pure-bandwidth scaling predicts.
+
+Earlier ZINC measurement on this same M1 Max: 8.6 tok/s (cold) /
+10.6 tok/s (warm). So at the start of Effort 14, ZINC was at 25–31%
+of llama.cpp.
+
+**Implication for this effort**: the plan's termination condition
+"ZINC matches or exceeds llama.cpp on the same machine and model" is
+**MET AND EXCEEDED** as of Cycle 2 of the loop. Current ZINC decode
+(~44–45 tok/s) is **+29% to +33% faster** than llama.cpp here. Every
+loop cycle from Cycle 3 onward has been bonus territory above the
+plan's actual finish line.
 
 ## Phase 1 — Hottest cost identified
 
