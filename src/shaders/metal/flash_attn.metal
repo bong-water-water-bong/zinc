@@ -216,7 +216,12 @@ kernel void main0(
         }
     }
 
-    const float inv_sum = final_sum > 0.0f ? 1.0f / final_sum : 0.0f;
+    // fast::divide maps to Apple GPU hardware reciprocal+mul (vs precise IEEE
+    // division), saving ~10 cycles per call. Fires once per Q head per layer
+    // (~1152 calls/token on Qwen3-8B: 32 heads × 36 layers). Companion to the
+    // fast::exp uses above in the running softmax; precision stays within the
+    // already-accepted FA approximation budget.
+    const float inv_sum = final_sum > 0.0f ? fast::divide(1.0f, final_sum) : 0.0f;
     for (uint vi = tid; vi < vec4_dim; vi += FLASH_TG_SIZE) {
         *(device float4*)(out + q_base + (vi << 2)) = acc_cache4[vi] * inv_sum;
     }
