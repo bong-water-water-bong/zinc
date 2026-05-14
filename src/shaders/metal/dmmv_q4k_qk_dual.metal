@@ -90,11 +90,28 @@ inline float q4k_block_dot(
         acc2 = fma(yh4, q2m, acc2);
     }
 
-    return dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
-            (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
-            (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
-            (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
-        dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+    // Cycle 53: vectorize the per-ib reduction. Replace the 4-term scalar
+    // head sum `(acc[even] + 1/256*acc[odd]) * sc8[*]` with a single
+    // `dot(head_pair, sc_pos4)` after building head_pair via one vector
+    // `fma`, and the 4-term scalar tail `sumy[k]*sc8[*]` with
+    // `dot(sumy, sc_neg4)`. Mirrors cycles 51/52 — completes the
+    // "vectorized per-ib reduction" pattern across the Q4_K kernel
+    // family. dmmv_q4k_qk_dual.metal serves Qwen3-8B attn_qkv (Q+K
+    // paired) when M_q is divisible by NSG*NR0=4 — M_q=4096 always
+    // qualifies for Qwen3-8B dense. Per ib iteration: ~22 scalar ops
+    // (4 FMAs + 4 muls + 3 adds head; 4 muls + 3 adds tail) → ~6
+    // vector ops (1 vec fma + 2 dot4), matching Apple7's 4-wide ALU.
+    const float4 head_pair = fma(
+        float4(acc1[1], acc1[3], acc2[1], acc2[3]),
+        float4(1.f / 256.f),
+        float4(acc1[0], acc1[2], acc2[0], acc2[2]));
+    const float4 sc_pos = float4(
+        float(sc8[0]),
+        float(sc8[1]) * (1.f / 16.f),
+        float(sc8[4]),
+        float(sc8[5]) * (1.f / 16.f));
+    const float4 sc_neg = float4(sc8[2], sc8[3], sc8[6], sc8[7]);
+    return dh[0] * dot(head_pair, sc_pos) - dh[1] * dot(sumy, sc_neg);
 }
 
 kernel void main0(
