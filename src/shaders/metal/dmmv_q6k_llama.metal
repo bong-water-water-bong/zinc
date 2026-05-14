@@ -24,6 +24,7 @@ inline float s8_to_f32(uint x) {
 #define NR0 2
 #define QK_K 256
 #define BLOCK_SIZE 210
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
 kernel void main0(
     device const uchar* W [[buffer(0)]],
@@ -95,7 +96,7 @@ kernel void main0(
 
         float4 sums_0 = float4(0.0f);
         float4 sums_1 = float4(0.0f);
-        for (ushort l = 0u; l < 4u; ++l) {
+        FOR_UNROLL (ushort l = 0u; l < 4u; ++l) {
             const uint h0 = uint(qhv4_0[l]);
             const uint q1b0 = uint(q1v4_0[l]);
             const uint q2b0 = uint(q2v4_0[l]);
