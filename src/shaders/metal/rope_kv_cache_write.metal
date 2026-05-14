@@ -65,25 +65,24 @@ kernel void main0(
         // kernel's behavior).
         const uint base = head * stride;
 
-        threadgroup float q_shmem[2];
         float q_rms_inv = 1.0f;
 
         if (p.apply_qk_norm != 0u) {
+            // Each simdgroup independently sums the FULL stride (head_dim=128
+            // for Qwen3-8B → 4 elements/lane), then simd_sum gives the complete
+            // sum-of-squares per simdgroup. No threadgroup memory, no barrier.
+            // Work is duplicated 2× across simdgroups but each only reads ~512 B
+            // (L1-resident) so cost is negligible; eliminates 1 threadgroup
+            // barrier per Q-head dispatch (32 heads × 36 layers = 1152
+            // dispatches/token on Qwen3-8B). Extends the cycle 17 broadcast-
+            // barrier elimination to also eliminate the partial-reduction one.
             float sum_sq = 0.0f;
-            for (uint i = tid; i < stride; i += 64) {
+            for (uint i = simd_lane; i < stride; i += 32u) {
                 const float v = q_inout[base + i];
                 sum_sq += v * v;
             }
             sum_sq = simd_sum(sum_sq);
-            if (simd_lane == 0) {
-                q_shmem[simd_group] = sum_sq;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            // Each simdgroup computes rms_inv independently from the 2 partials
-            // (work duplicated 2×, eliminates the broadcast barrier — same pattern
-            // as rms_norm_mul / residual_rms_norm cycles 15-16).
-            const float total = q_shmem[0] + q_shmem[1];
-            q_rms_inv = fast::rsqrt(fast::divide(total, float(stride)) + p.eps);
+            q_rms_inv = fast::rsqrt(fast::divide(sum_sq, float(stride)) + p.eps);
         }
 
         for (uint i = tid; i < half_rot; i += 64) {
@@ -113,24 +112,19 @@ kernel void main0(
     const uint base = kv_head * stride;
     const uint dst_base = p.dst_offset + base;
 
-    threadgroup float k_shmem[2];
     float k_rms_inv = 1.0f;
 
     if (p.apply_qk_norm != 0u) {
+        // Same per-simdgroup-redundant pattern as the Q-norm branch above:
+        // each simdgroup independently sums the full stride and computes its
+        // own rms_inv, eliminating shmem + threadgroup barrier entirely.
         float sum_sq = 0.0f;
-        for (uint i = tid; i < stride; i += 64) {
+        for (uint i = simd_lane; i < stride; i += 32u) {
             const float v = k_in[base + i];
             sum_sq += v * v;
         }
         sum_sq = simd_sum(sum_sq);
-        if (simd_lane == 0) {
-            k_shmem[simd_group] = sum_sq;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Each simdgroup computes rms_inv independently from the 2 partials
-        // (work duplicated 2×, eliminates the broadcast barrier).
-        const float total = k_shmem[0] + k_shmem[1];
-        k_rms_inv = fast::rsqrt(fast::divide(total, float(stride)) + p.eps);
+        k_rms_inv = fast::rsqrt(fast::divide(sum_sq, float(stride)) + p.eps);
     }
 
     // K rotary: apply RoPE pair (i, i+half_rot) and write to cache.
