@@ -77,6 +77,23 @@ kernel void main0(
             yl[4u * l + 3u] = y[l + 96u];
         }
 
+        // Cycle 43: hoist the -32 zero-point subtraction out of the inner FMA loop.
+        // Q6_K dequant is d * scale * (raw_q - 32) where raw_q ∈ [0,63]. Rewriting
+        // d * Σ_k sc[2k] · Σ_l yl[4l+k] · (q_lk - 32) as
+        // d * (Σ_k sc[2k] · raw_sum[k] - 32 · Σ_k sc[2k] · yl_sum[k])
+        // lets the inner-loop quant production drop from
+        //   float(int((q1b & 0x0F) | ((h & m) << 4)) - 32)
+        // to
+        //   float((q1b & 0x0F) | ((h & m) << 4))
+        // saving 1 int-sub per quant (8/i × 4 = 32 ops per block per row, ×2 rows = 64).
+        // yl_sum is shared across NR0=2 rows; the per-row tail correction adds
+        // 4 fmas + 1 fnma per row. Mirrors the Q4_K dh_min · sumy correction
+        // pattern that already lives in dmmv_q4k.metal's tail.
+        const float yl_sum_0 = yl[ 0] + yl[ 4] + yl[ 8] + yl[12];
+        const float yl_sum_1 = yl[ 1] + yl[ 5] + yl[ 9] + yl[13];
+        const float yl_sum_2 = yl[ 2] + yl[ 6] + yl[10] + yl[14];
+        const float yl_sum_3 = yl[ 3] + yl[ 7] + yl[11] + yl[15];
+
         // Cycle 36: interleave NR0=2 row0/row1 — load both rows' q1v4/q2v4/qhv4/
         // sc/d up front, then run a single FOR_UNROLL l=0..3 that updates both
         // rows' sums alternately. Removes the per-row serialization chain (row 1's
@@ -118,18 +135,18 @@ kernel void main0(
             const uint h0 = uint(qhv4_0[l]);
             const uint q1b0 = uint(q1v4_0[l]);
             const uint q2b0 = uint(q2v4_0[l]);
-            const float q00 = float(int((q1b0 & 0x0Fu) | ((h0 & kmask1) << 4u)) - 32);
-            const float q10 = float(int((q2b0 & 0x0Fu) | ((h0 & kmask2) << 2u)) - 32);
-            const float q20 = float(int((q1b0 >> 4u) | ((h0 & kmask3) << 0u)) - 32);
-            const float q30 = float(int((q2b0 >> 4u) | ((h0 & kmask4) >> 2u)) - 32);
+            const float q00 = float((q1b0 & 0x0Fu) | ((h0 & kmask1) << 4u));
+            const float q10 = float((q2b0 & 0x0Fu) | ((h0 & kmask2) << 2u));
+            const float q20 = float((q1b0 >> 4u)    | ((h0 & kmask3) << 0u));
+            const float q30 = float((q2b0 >> 4u)    | ((h0 & kmask4) >> 2u));
 
             const uint h1 = uint(qhv4_1[l]);
             const uint q1b1 = uint(q1v4_1[l]);
             const uint q2b1 = uint(q2v4_1[l]);
-            const float q01 = float(int((q1b1 & 0x0Fu) | ((h1 & kmask1) << 4u)) - 32);
-            const float q11 = float(int((q2b1 & 0x0Fu) | ((h1 & kmask2) << 2u)) - 32);
-            const float q21 = float(int((q1b1 >> 4u) | ((h1 & kmask3) << 0u)) - 32);
-            const float q31 = float(int((q2b1 >> 4u) | ((h1 & kmask4) >> 2u)) - 32);
+            const float q01 = float((q1b1 & 0x0Fu) | ((h1 & kmask1) << 4u));
+            const float q11 = float((q2b1 & 0x0Fu) | ((h1 & kmask2) << 2u));
+            const float q21 = float((q1b1 >> 4u)    | ((h1 & kmask3) << 0u));
+            const float q31 = float((q2b1 >> 4u)    | ((h1 & kmask4) >> 2u));
 
             const float ylv0 = yl[4u * l + 0u];
             const float ylv1 = yl[4u * l + 1u];
@@ -146,17 +163,38 @@ kernel void main0(
             sums_1[3] += ylv3 * q31;
         }
 
+        const float sc00 = float(sc_0[0]);
+        const float sc02 = float(sc_0[2]);
+        const float sc04 = float(sc_0[4]);
+        const float sc06 = float(sc_0[6]);
+        const float sc10 = float(sc_1[0]);
+        const float sc12 = float(sc_1[2]);
+        const float sc14 = float(sc_1[4]);
+        const float sc16 = float(sc_1[6]);
+
         sumf[0] += d_0 * (
-            sums_0[0] * float(sc_0[0]) +
-            sums_0[1] * float(sc_0[2]) +
-            sums_0[2] * float(sc_0[4]) +
-            sums_0[3] * float(sc_0[6])
+            sums_0[0] * sc00 +
+            sums_0[1] * sc02 +
+            sums_0[2] * sc04 +
+            sums_0[3] * sc06 -
+            32.0f * (
+                yl_sum_0 * sc00 +
+                yl_sum_1 * sc02 +
+                yl_sum_2 * sc04 +
+                yl_sum_3 * sc06
+            )
         );
         sumf[1] += d_1 * (
-            sums_1[0] * float(sc_1[0]) +
-            sums_1[1] * float(sc_1[2]) +
-            sums_1[2] * float(sc_1[4]) +
-            sums_1[3] * float(sc_1[6])
+            sums_1[0] * sc10 +
+            sums_1[1] * sc12 +
+            sums_1[2] * sc14 +
+            sums_1[3] * sc16 -
+            32.0f * (
+                yl_sum_0 * sc10 +
+                yl_sum_1 * sc12 +
+                yl_sum_2 * sc14 +
+                yl_sum_3 * sc16
+            )
         );
     }
 
