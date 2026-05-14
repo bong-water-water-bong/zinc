@@ -232,8 +232,22 @@ kernel void main0(
         // serves attn_qkv / attn_o / ffn_down on Qwen3-8B dense (Q4_K =
         // 71.6% of decode bytes/token, this kernel covers the ~53% slice
         // complementing the swiglu kernel's ffn_gate+ffn_up).
-        const float2 dh_d = float2(float(dh_0[0]), float(dh_1[0]));
-        const float2 dh_dmin = float2(float(dh_0[1]), float(dh_1[1]));
+        // Cycle 67: vectorize the 4 scalar dh half-loads. Replace
+        // `dh_X[0]`/`dh_X[1]` pairs (2 rows × 2 scalar half reads = 4 loads
+        // per ib) with `*(device const half2*)dh_X` (2 packed half2 loads per
+        // ib), then build the cross-row `dh_d`/`dh_dmin` float2s via `.x`/`.y`
+        // swizzles that lower to a single half2→float2 widen per row instead
+        // of 2 scalar half→float casts. Q4_K block layout starts with
+        // `[d (half), dmin (half)]` at byte offsets 0..3 — exactly a half2
+        // pair, matching the natural 4-byte block alignment. Mirrors cycle 66
+        // (same change to dmmv_q4k_dense_gate_up_swiglu.metal, 8 → 4 loads
+        // there); this kernel covers attn_qkv / attn_o / ffn_down on Qwen3-8B
+        // (the ~53% Q4_K slice complementing the swiglu kernel's ffn_gate+
+        // ffn_up share).
+        const half2 dh_pair_0 = *((device const half2*)dh_0);
+        const half2 dh_pair_1 = *((device const half2*)dh_1);
+        const float2 dh_d = float2(float(dh_pair_0.x), float(dh_pair_1.x));
+        const float2 dh_dmin = float2(float(dh_pair_0.y), float(dh_pair_1.y));
         const float2 head_dots = float2(dot(head_pair_0, sc_pos_0), dot(head_pair_1, sc_pos_1));
         const float2 tail_dots = float2(dot(sumy, sc_neg_0), dot(sumy, sc_neg_1));
         const float2 delta = fma(dh_d, head_dots, -dh_dmin * tail_dots);
