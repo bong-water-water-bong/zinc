@@ -109,14 +109,28 @@ kernel void main0(
         // Mirrors cycle 32's interleaved gate+up pattern from the swiglu helper,
         // applied here across row0/row1 of the same matrix instead of across
         // gate/up matrices. Covers attn_qkv/attn_o/ffn_down on Qwen3 dense.
-        device const uint* sc_u_0 = (device const uint*)(x_base + (uint64_t)ib * BLOCK_SIZE + 4);
-        device const uint* sc_u_1 = sc_u_0 + nb01 / 4;
+        device const packed_uint3* sc_u3_0 = (device const packed_uint3*)(x_base + (uint64_t)ib * BLOCK_SIZE + 4);
+        device const packed_uint3* sc_u3_1 = (device const packed_uint3*)((device const uchar*)sc_u3_0 + nb01);
         const uint sc_shift = uint(iq) * 16u;
         device const ushort* q1_0 = (device const ushort*)(x_base + (uint64_t)ib * BLOCK_SIZE + 16) + 16 * iq + 4 * ir;
         device const ushort* q1_1 = q1_0 + nb01 / 2;
         device const half* dh_0 = (device const half*)(x_base + (uint64_t)ib * BLOCK_SIZE);
         device const half* dh_1 = dh_0 + nb01 / 2;
 
+        // Cycle 73: collapse the 3 scalar `sc_u_X[0/1/2]` uint reads into a
+        // single `packed_uint3` load per row. The Q4_K block's 12-byte
+        // packed-scales field sits at byte offsets 4..15 of the block —
+        // contiguous and 4-byte aligned — which is exactly the natural
+        // shape for `packed_uint3` (12 bytes, 4-byte alignment). The
+        // previous form was 3 independent `*sc_u_0` indexed loads that
+        // the compiler had to prove contiguous via alias analysis before
+        // it could coalesce them. Explicit `packed_uint3` removes the
+        // proof obligation and guarantees one 12-byte coalesced load
+        // per row per ib. Mirrors cycles 66/67/68's "packed loads via
+        // typed pointer aliasing" wins (half2 dh loads on the same Q4_K
+        // shaders). dmmv_q4k.metal serves attn_qkv V + attn_o + ffn_down
+        // on Qwen3-8B dense — the ~53% Q4_K slice complementing the
+        // swiglu kernel's ffn_gate+ffn_up share.
         // Cycle 69: store sc16 as `ushort4` register vectors instead of
         // stack-allocated `ushort[4]` arrays accessed via `(uchar*)` byte
         // alias. The previous form forced the compiler to materialize
@@ -127,18 +141,20 @@ kernel void main0(
         // 8 scalar uchar loads from spilled stack memory. Same compiler-
         // hint philosophy as cycles 49/50 (nibble-mask vectorize), 51
         // (per-ib reduction), and 61 (cross-row reduction).
-        const ushort sc_0_0 = ushort((sc_u_0[0] >> sc_shift) & 0xFFFFu);
-        const ushort sc_2_0 = ushort((sc_u_0[1] >> sc_shift) & 0xFFFFu);
-        const ushort sc_4_0 = ushort((sc_u_0[2] >> sc_shift) & 0xFFFFu);
+        const uint3 sc_u3v_0 = uint3(*sc_u3_0);
+        const ushort sc_0_0 = ushort((sc_u3v_0.x >> sc_shift) & 0xFFFFu);
+        const ushort sc_2_0 = ushort((sc_u3v_0.y >> sc_shift) & 0xFFFFu);
+        const ushort sc_4_0 = ushort((sc_u3v_0.z >> sc_shift) & 0xFFFFu);
         const ushort4 sc16_0 = ushort4(
             sc_0_0 & kmask1,
             sc_2_0 & kmask1,
             ((sc_4_0 >> 0) & kmask2) | ((sc_0_0 & kmask3) >> 2),
             ((sc_4_0 >> 4) & kmask2) | ((sc_2_0 & kmask3) >> 2));
 
-        const ushort sc_0_1 = ushort((sc_u_1[0] >> sc_shift) & 0xFFFFu);
-        const ushort sc_2_1 = ushort((sc_u_1[1] >> sc_shift) & 0xFFFFu);
-        const ushort sc_4_1 = ushort((sc_u_1[2] >> sc_shift) & 0xFFFFu);
+        const uint3 sc_u3v_1 = uint3(*sc_u3_1);
+        const ushort sc_0_1 = ushort((sc_u3v_1.x >> sc_shift) & 0xFFFFu);
+        const ushort sc_2_1 = ushort((sc_u3v_1.y >> sc_shift) & 0xFFFFu);
+        const ushort sc_4_1 = ushort((sc_u3v_1.z >> sc_shift) & 0xFFFFu);
         const ushort4 sc16_1 = ushort4(
             sc_0_1 & kmask1,
             sc_2_1 & kmask1,
