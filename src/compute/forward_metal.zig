@@ -8211,6 +8211,18 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
     // the per-chunk layer count from 8 to 30 — the older single-chunk (60)
     // attempt broke correctness, so 30 is a conservative step toward
     // llama.cpp's n_cb=2 target while staying clear of the prior cliff.
+    //
+    // For Qwen3-8B (36 dense layers, qwen2 arch) tried bumping to 36 so all
+    // dense layers fit in ONE chunk. Profile confirmed cmds/step dropped 2.89
+    // → 1.89 and greedy output stayed byte-identical, so the prior
+    // "single-chunk broke correctness" cliff (observed at 60 layers on Gemma
+    // 31B) is safely above 36. But measured 3-run median decode was 43.87
+    // tok/s vs 44.32 baseline — flat within noise, no win. The
+    // inter-chunk clock-ramp hypothesis the comment above identifies as the
+    // remaining cost does not appear to fire on M1 Max for this 36-layer model
+    // with 30+6 chunks already tightly back-to-back. Reverted; do not
+    // re-attempt for Qwen3-8B without a different lever (e.g. holding GPU
+    // clocks via residency-set warm-loop) — see EFFORT_14_NOTES.md.
     const dense_cmd_group_layers: usize = 30;
     const use_single_gpu_cmd = !engine.debug_validation_enabled and !engine.gemma_moe_validation_enabled and is_moe and blk: {
         for (engine.layer_tensors) |lt| {
