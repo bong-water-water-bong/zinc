@@ -53,16 +53,19 @@ kernel void main0(
     if (lane == 0) partial_sums[sg_idx] = sg_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // First simdgroup reduces the partial sums.
-    float total_sq;
+    // First simdgroup reduces the partial sums, then thread 0 computes rms_inv
+    // once and broadcasts via threadgroup memory (saves 255 redundant rsqrt+div
+    // per dispatch, ~72 dispatches/token on Qwen3-8B).
     if (sg_idx == 0) {
         float v = (lane < N_SIMDGROUPS) ? partial_sums[lane] : 0.0f;
-        total_sq = simd_sum(v);
-        if (lane == 0) partial_sums[0] = total_sq;
+        const float total_sq = simd_sum(v);
+        if (lane == 0) {
+            partial_sums[0] = fast::rsqrt(fast::divide(total_sq, float(p.n)) + p.eps);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float rms_inv = rsqrt((partial_sums[0] / float(p.n)) + p.eps);
+    const float rms_inv = partial_sums[0];
 
     // Pass 2: normalize from registers (avoids re-reading hidden_buf).
     count = 0;
