@@ -86,13 +86,18 @@ kernel void main0(
         const uchar4 q2v4_0 = *((device const uchar4*)(block0 + q_offset_l + 32u));
         const uchar4 qhv4_0 = *((device const uchar4*)(block0 + 128u + q_offset_h));
         device const uchar* sc_0 = block0 + 192u + uint(is);
-        const float d_0 = fp16_to_fp32(uint(block0[208]) | (uint(block0[209]) << 8u));
+        // Cycle 38: replace 2 scalar uchar reads + bit-shift + as_type<half> with a
+        // single 2-byte aligned half load. block+208 is 2-byte aligned (BLOCK_SIZE=210
+        // is even, row_bytes = nb*210 is even, base buffer is ≥16-byte aligned by Metal
+        // convention). Saves the uint construction (block[208] | (block[209] << 8))
+        // and the ushort→half bit-cast, leaving a direct half→float promotion.
+        const float d_0 = float(*((device const half*)(block0 + 208)));
 
         const uchar4 q1v4_1 = *((device const uchar4*)(block1 + q_offset_l));
         const uchar4 q2v4_1 = *((device const uchar4*)(block1 + q_offset_l + 32u));
         const uchar4 qhv4_1 = *((device const uchar4*)(block1 + 128u + q_offset_h));
         device const uchar* sc_1 = block1 + 192u + uint(is);
-        const float d_1 = fp16_to_fp32(uint(block1[208]) | (uint(block1[209]) << 8u));
+        const float d_1 = float(*((device const half*)(block1 + 208)));
 
         float4 sums_0 = float4(0.0f);
         float4 sums_1 = float4(0.0f);
