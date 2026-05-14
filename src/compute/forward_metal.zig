@@ -3504,7 +3504,12 @@ pub const InferenceEngine = struct {
             .mxfp4 => .{ .pipe = &self.dmmv_mxfp4_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 },
             .q5_k => .{ .pipe = &self.dmmv_q5k_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 },
             .q6_k => blk: {
-                if (self.config.architecture == .gemma and
+                // dmmv_q6k_llama is a faithful llama.cpp port (N_SG=2, N_R0=2,
+                // simdgroup-parallel). The legacy dmmv_q6k_pipe is a SPIRV-Cross
+                // single-thread-per-row Vulkan port. For dense Q6_K matvec at
+                // K%256==0 (Gemma final norm, Qwen3 lm_head) the llama variant
+                // is strictly better.
+                if ((self.config.architecture == .gemma or self.config.architecture == .qwen2) and
                     self.config.n_experts == 0 and
                     K % 256 == 0 and
                     self.dmmv_q6k_llama_pipe.handle != null)
