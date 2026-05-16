@@ -73,6 +73,7 @@ describe("optimize_gpu args and model resolution", () => {
       ".gpu_optimize/old-run",
       "--model-id", "qwen3-8b-q4k-m",
       "--metric", "prefill",
+      "--context", "4096",
       "--cycles", "7",
       "--max-stall-cycles", "12",
       "--skip-llama",
@@ -83,6 +84,7 @@ describe("optimize_gpu args and model resolution", () => {
     expect(opts.resumeDir).toBe(".gpu_optimize/old-run");
     expect(opts.modelId).toBe("qwen3-8b-q4k-m");
     expect(opts.metric).toBe("prefill");
+    expect(opts.contextTokens).toBe(4096);
     expect(opts.cycles).toBe(7);
     expect(opts.maxStallCycles).toBe(12);
     expect(opts.skipLlama).toBe(true);
@@ -145,7 +147,7 @@ describe("optimize_gpu args and model resolution", () => {
 
 describe("optimize_gpu remote commands", () => {
   test("builds a managed ZINC command with model-id and raw mode", () => {
-    const opts = parseArgsFrom(["--model", "qwen3-8b-q4k-m", "--remote-env", "ZINC_DEBUG=1"], env);
+    const opts = parseArgsFrom(["--model", "qwen3-8b-q4k-m", "--remote-env", "ZINC_DEBUG=1", "--context", "4096"], env);
     const target = resolveModelTarget(opts);
     const command = buildRemoteZincCommand(opts, target);
 
@@ -155,6 +157,7 @@ describe("optimize_gpu remote commands", () => {
     expect(command).toContain("--model-id 'qwen3-8b-q4k-m'");
     expect(command).toContain("--raw");
     expect(command).toContain("-n 128");
+    expect(command).toContain("-c 4096");
   });
 
   test("builds llama-bench against the same resolved model file", () => {
@@ -169,7 +172,7 @@ describe("optimize_gpu remote commands", () => {
   });
 
   test("builds same-prompt llama.cpp command by default", () => {
-    const opts = parseArgsFrom(["--model", "qwen3-8b-q4k-m"], env);
+    const opts = parseArgsFrom(["--model", "qwen3-8b-q4k-m", "--context", "4096"], env);
     const target = resolveModelTarget(opts);
     const command = buildRemoteLlamaCliCommand(opts, target);
 
@@ -182,7 +185,7 @@ describe("optimize_gpu remote commands", () => {
     expect(command).toContain("--device Vulkan0");
     expect(command).toContain("-st");
     expect(command).toContain("-fa 1");
-    expect(command).toContain("-c 1024");
+    expect(command).toContain("-c 4096");
     expect(command).toContain("-b 256");
     expect(command).toContain("-ub 128");
     expect(command).toContain("timeout 300s");

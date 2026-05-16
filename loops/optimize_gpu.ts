@@ -164,6 +164,7 @@ export type LoopOptions = {
   prompt: string | null;
   promptMode: PromptMode | null;
   maxTokens: number | null;
+  contextTokens: number | null;
   metric: MetricKind;
   targetTps: number | null;
   samples: number;
@@ -310,6 +311,7 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
     prompt: null,
     promptMode: null,
     maxTokens: null,
+    contextTokens: Number(envMap.ZINC_GPU_CONTEXT ?? fileEnv.ZINC_GPU_CONTEXT ?? envMap.ZINC_INTEL_CONTEXT ?? fileEnv.ZINC_INTEL_CONTEXT ?? envMap.ZINC_CONTEXT ?? fileEnv.ZINC_CONTEXT ?? "0") || null,
     metric: "decode",
     targetTps: null,
     samples: 3,
@@ -353,6 +355,7 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
     else if (arg === "--chat") opts.promptMode = "chat";
     else if (arg === "--raw") opts.promptMode = "raw";
     else if (arg === "--max-tokens" && argv[i + 1]) opts.maxTokens = Number(argv[++i]);
+    else if (arg === "--context" && argv[i + 1]) opts.contextTokens = Number(argv[++i]);
     else if (arg === "--metric" && argv[i + 1]) opts.metric = argv[++i] as MetricKind;
     else if (arg === "--target" && argv[i + 1]) opts.targetTps = Number(argv[++i]);
     else if (arg === "--samples" && argv[i + 1]) opts.samples = Number(argv[++i]);
@@ -377,6 +380,7 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
   if (opts.agent !== "codex" && opts.agent !== "claude") throw new Error("--agent must be codex or claude");
   if (opts.metric !== "decode" && opts.metric !== "prefill") throw new Error("--metric must be decode or prefill");
   if (!Number.isFinite(opts.cycles) || opts.cycles < 0) throw new Error("--cycles must be >= 0");
+  if (opts.contextTokens != null && (!Number.isFinite(opts.contextTokens) || opts.contextTokens < 1)) throw new Error("--context must be >= 1");
   if (!Number.isFinite(opts.maxStallCycles) || opts.maxStallCycles < 0) throw new Error("--max-stall-cycles must be >= 0");
   if (!Number.isFinite(opts.samples) || opts.samples < 1) throw new Error("--samples must be >= 1");
   if (!remoteHomeExplicit) opts.remoteHome = defaultHomeForUser(opts.user);
@@ -394,6 +398,7 @@ function printUsage(): void {
   console.log(`                            Defaults to ${DEFAULT_MODEL} (${defaultModel?.label ?? "selected model"})`);
   console.log("  --model-id <id>           Managed model id from ZINC catalog");
   console.log("  --model-path <path>       Remote GGUF path");
+  console.log("  --context <tokens>        Context length passed to ZINC and llama.cpp baselines");
   console.log("  --agent codex|claude      Agent for optimization cycles");
   console.log("  --resume [run-dir]        Resume latest or specified .gpu_optimize run");
   console.log("  --host/--port/--user      Remote SSH target (defaults from ZINC_GPU_*, then ZINC_INTEL_*, then ZINC_*)");
@@ -441,9 +446,10 @@ export function buildRemoteZincCommand(opts: LoopOptions, target: ModelTarget): 
     ? `--model-id ${q(target.modelId)}`
     : `--model ${q(target.modelPath)}`;
   const modeArg = target.promptMode === "chat" ? "--chat" : "--raw";
+  const contextArg = opts.contextTokens != null ? ` -c ${opts.contextTokens}` : "";
   return [
     `cd ${q(opts.remoteDir)}`,
-    `${remoteEnvPrefix(opts)} ./zig-out/bin/zinc ${modelArg} --prompt ${q(target.prompt)} ${modeArg} -n ${target.maxTokens}`,
+    `${remoteEnvPrefix(opts)} ./zig-out/bin/zinc ${modelArg} --prompt ${q(target.prompt)} ${modeArg} -n ${target.maxTokens}${contextArg}`,
   ].join(" && ");
 }
 
@@ -458,7 +464,7 @@ export function buildRemoteLlamaBenchCommand(opts: LoopOptions, target: ModelTar
 export function buildRemoteLlamaCliCommand(opts: LoopOptions, target: ModelTarget): string {
   const cli = `${opts.llamaDir}/build/bin/llama-cli`;
   const completion = `${opts.llamaDir}/build/bin/llama-completion`;
-  const contextTokens = Math.max(1024, target.maxTokens + 256);
+  const contextTokens = opts.contextTokens ?? Math.max(1024, target.maxTokens + 256);
   return [
     `llama_completion=${q(completion)}`,
     `llama_cli=${q(cli)}`,
