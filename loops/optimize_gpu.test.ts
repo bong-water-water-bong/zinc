@@ -13,6 +13,7 @@ import {
   parseLlamaCliMetrics,
   parseZincMetrics,
   resolveModelTarget,
+  stateTargetMismatchReason,
   type LoopOptions,
 } from "./optimize_gpu";
 
@@ -26,6 +27,45 @@ const env = {
 };
 
 describe("optimize_gpu args and model resolution", () => {
+  test("defaults to the smaller Gemma 4 preset", () => {
+    const opts = parseArgsFrom([], env);
+    const target = resolveModelTarget(opts);
+
+    expect(opts.model).toBe("gemma4-12b-q4k-m");
+    expect(target.label).toBe("Gemma 4 12B Q4_K_M");
+    expect(target.modelId).toBe("gemma4-12b-q4k-m");
+    expect(target.promptMode).toBe("chat");
+  });
+
+  test("allows env to choose the default model preset", () => {
+    const opts = parseArgsFrom([], {
+      ...env,
+      ZINC_GPU_MODEL: "qwen3-8b-q4k-m",
+    });
+    const target = resolveModelTarget(opts);
+
+    expect(opts.model).toBe("qwen3-8b-q4k-m");
+    expect(target.label).toBe("Qwen3 8B Q4_K_M");
+  });
+
+  test("rejects reusing a run id with a different model target", () => {
+    const opts = parseArgsFrom([], env);
+    const target = resolveModelTarget(opts);
+    const previous = {
+      options: {
+        modelKey: "qwen3-8b-q4k-m",
+        modelPath: "/home/tempuser/.cache/zinc/models/models/qwen3-8b-q4k-m/model.gguf",
+        metric: "decode",
+        host: "gpu.local",
+        user: "tempuser",
+        port: 8888,
+        remoteDir: "/home/tempuser/zinc-loop",
+      },
+    };
+
+    expect(stateTargetMismatchReason(previous, target, opts)).toContain("run was created for qwen3-8b-q4k-m");
+  });
+
   test("supports agent, resume, and model selection", () => {
     const opts = parseArgsFrom([
       "--agent", "claude",

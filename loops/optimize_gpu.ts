@@ -8,6 +8,7 @@
  * same GGUF, then lets one agent cycle make a bounded local source change.
  *
  * Examples:
+ *   bun loops/optimize_gpu.ts --agent codex --cycles 20
  *   bun loops/optimize_gpu.ts --model qwen3-8b-q4k-m --agent codex --cycles 20
  *   bun loops/optimize_gpu.ts --model-id qwen36-27b-q4k-m --metric prefill --resume
  *   bun loops/optimize_gpu.ts --model-path /models/foo.gguf --skip-llama --dry-run
@@ -129,6 +130,8 @@ const MODEL_PRESETS: Record<string, ModelPreset> = {
   },
 };
 
+const DEFAULT_MODEL = "gemma4-12b-q4k-m";
+
 type ModelTarget = {
   key: string;
   label: string;
@@ -236,6 +239,21 @@ type RunState = {
   failedApproaches: string[];
 };
 
+export function stateTargetMismatchReason(
+  state: Pick<RunState, "options"> | null,
+  target: Pick<ModelTarget, "key">,
+  opts: Pick<LoopOptions, "metric">,
+): string | null {
+  if (!state) return null;
+  if (state.options.modelKey !== target.key) {
+    return `run state target mismatch: run was created for ${state.options.modelKey}, but selected target is ${target.key}. Use --model ${state.options.modelKey} to resume that run, or choose a new --run-id for ${target.key}.`;
+  }
+  if (state.options.metric !== opts.metric) {
+    return `run state metric mismatch: run was created for ${state.options.metric}, but selected metric is ${opts.metric}. Use --metric ${state.options.metric} to resume that run, or choose a new --run-id.`;
+  }
+  return null;
+}
+
 function loadEnv(): Record<string, string> {
   const envPath = join(REPO_ROOT, ".env");
   const vars: Record<string, string> = {};
@@ -286,7 +304,7 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
     xdgCacheHome: envXdgCacheHome ?? `${remoteHome}/.cache`,
     remoteEnv: envMap.ZINC_REMOTE_ENV ?? fileEnv.ZINC_REMOTE_ENV ?? "",
     remoteLibcConf: envMap.ZINC_GPU_REMOTE_LIBC_CONF ?? fileEnv.ZINC_GPU_REMOTE_LIBC_CONF ?? envMap.ZINC_INTEL_REMOTE_LIBC_CONF ?? fileEnv.ZINC_INTEL_REMOTE_LIBC_CONF ?? envMap.ZINC_REMOTE_LIBC_CONF ?? fileEnv.ZINC_REMOTE_LIBC_CONF ?? null,
-    model: "qwen3-8b-q4k-m",
+    model: envMap.ZINC_GPU_MODEL ?? fileEnv.ZINC_GPU_MODEL ?? envMap.ZINC_INTEL_MODEL ?? fileEnv.ZINC_INTEL_MODEL ?? envMap.ZINC_MODEL ?? fileEnv.ZINC_MODEL ?? DEFAULT_MODEL,
     modelId: null,
     modelPath: null,
     prompt: null,
@@ -370,9 +388,10 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
 
 function printUsage(): void {
   const models = Object.keys(MODEL_PRESETS).join(", ");
+  const defaultModel = MODEL_PRESETS[DEFAULT_MODEL];
   console.log(`Usage: bun loops/optimize_gpu.ts [options]\n`);
   console.log(`  --model <preset>          Managed preset (${models})`);
-  console.log("                            Defaults to qwen3-8b-q4k-m with a raw 128-token decode/prefill comparison prompt");
+  console.log(`                            Defaults to ${DEFAULT_MODEL} (${defaultModel?.label ?? "selected model"})`);
   console.log("  --model-id <id>           Managed model id from ZINC catalog");
   console.log("  --model-path <path>       Remote GGUF path");
   console.log("  --agent codex|claude      Agent for optimization cycles");
@@ -762,11 +781,11 @@ function formatMetricComparison(summary: BenchmarkSummary | null, llama: LlamaSu
   return `${metric}: ZINC ${zinc.toFixed(2)} vs llama.cpp ${baseline.toFixed(2)} tok/s (${ratio.toFixed(1)}%, ${status}, delta ${delta >= 0 ? "+" : ""}${delta.toFixed(2)})`;
 }
 
-function formatLlamaGoal(summary: BenchmarkSummary | null, llama: LlamaSummary | null): string {
+function formatLlamaGoal(summary: BenchmarkSummary | null, llama: LlamaSummary | null, targetLabel = "selected model"): string {
   if (!llama) return "llama.cpp comparison unavailable; optimize the selected ZINC metric without regressing correctness.";
   const focus = weakestLlamaGapMetric(summary, llama);
   const lines = [
-    "Objective: beat llama.cpp on both sustained decode and prompt prefill for Qwen3 8B Q4_K_M.",
+    `Objective: beat llama.cpp on both sustained decode and prompt prefill for ${targetLabel}.`,
     formatMetricComparison(summary, llama, "decode"),
     formatMetricComparison(summary, llama, "prefill"),
   ];
@@ -977,7 +996,7 @@ export function buildAgentPrompt(state: RunState, opts: LoopOptions, target: Mod
   const llamaLine = llama
     ? `llama.cpp ${llamaSource}same-prompt baseline: decode=${llama.decodeTokPerSec?.toFixed(2) ?? "?"} tok/s, prefill=${llama.prefillTokPerSec?.toFixed(2) ?? "?"} tok/s`
     : "llama.cpp baseline unavailable or skipped";
-  const goal = formatLlamaGoal(baseline, llama);
+  const goal = formatLlamaGoal(baseline, llama, target.label);
   return `
 You are optimizing ZINC on a remote consumer GPU target. Make exactly one bounded source change, then stop.
 
@@ -1072,10 +1091,13 @@ async function main(): Promise<void> {
   console.log(`  metric: ${opts.metric}`);
   console.log(`  run: ${runDir}`);
 
+  let state = await loadState(runDir);
+  const mismatch = stateTargetMismatchReason(state, target, opts);
+  if (mismatch) throw new Error(mismatch);
+
   console.log("\nPreparing remote...");
   await prepareRemote(opts, target);
 
-  let state = await loadState(runDir);
   if (!state) {
     console.log("\nBaseline...");
     const baseline = await benchmarkZinc(opts, target);
@@ -1108,7 +1130,7 @@ async function main(): Promise<void> {
     if (state.llamaBaseline) {
       const source = state.llamaBaseline.source ? ` ${state.llamaBaseline.source}` : "";
       console.log(`llama.cpp${source}: decode=${state.llamaBaseline.decodeTokPerSec?.toFixed(2) ?? "?"} prefill=${state.llamaBaseline.prefillTokPerSec?.toFixed(2) ?? "?"}`);
-      console.log(formatLlamaGoal(state.best, state.llamaBaseline));
+      console.log(formatLlamaGoal(state.best, state.llamaBaseline, target.label));
     }
     return;
   }
@@ -1151,7 +1173,7 @@ async function main(): Promise<void> {
         const focus = weakestLlamaGapMetric(before, state.llamaBaseline) ?? opts.metric;
         reason = improved
           ? `improved ${focus} against llama.cpp gap; ${formatMetricComparison(after, state.llamaBaseline, focus)}`
-          : `no improvement on llama.cpp focus metric or coherence failure (${summarizeBench(after)}; ${formatLlamaGoal(after, state.llamaBaseline).replace(/\n/g, " | ")})`;
+          : `no improvement on llama.cpp focus metric or coherence failure (${summarizeBench(after)}; ${formatLlamaGoal(after, state.llamaBaseline, target.label).replace(/\n/g, " | ")})`;
       } catch (error) {
         reason = `remote build or benchmark failed: ${summarizeError(error)}`;
       }
