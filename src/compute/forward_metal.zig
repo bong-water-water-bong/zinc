@@ -706,6 +706,45 @@ const MoeAccBatchedPush = extern struct {
     w_sh: f32,
 };
 
+/// Push constants for GPT-OSS batched expert accumulate with per-expert down bias.
+const MoeAccBatchedBiasPush = extern struct {
+    n: u32,
+    expert_stride: u32,
+    expert_count: u32,
+    bias_offset: u32,
+    w0: f32,
+    w1: f32,
+    w2: f32,
+    w3: f32,
+    w4: f32,
+    w5: f32,
+    w6: f32,
+    w7: f32,
+    w_sh: f32,
+};
+
+/// Push constants for GPT-OSS OAI SwiGLU across a contiguous [expert][dim] batch.
+const OaiSwiGLUBatchedBiasPush = extern struct {
+    n: u32,
+    gate_bias_offset: u32,
+    up_bias_offset: u32,
+};
+
+/// Push constants for fused GPT-OSS MXFP4 gate/up projection + OAI SwiGLU.
+const MoeGateUpOaiPush = extern struct {
+    M: u32,
+    K: u32,
+    gate_offset: u32,
+    up_offset: u32,
+    gate_expert_stride: u32,
+    up_expert_stride: u32,
+    x_expert_stride: u32,
+    x_offset: u32,
+    y_offset: u32,
+    gate_bias_offset: u32,
+    up_bias_offset: u32,
+};
+
 /// Push constants for GPU softmax + top-k routing.
 const SoftmaxTopkPush = extern struct {
     n_experts: u32,
@@ -1669,6 +1708,9 @@ pub const InferenceEngine = struct {
     dmmv_q5_0_pipe: MetalPipeline,
     dmmv_q5_1_pipe: MetalPipeline,
     dmmv_mxfp4_pipe: MetalPipeline,
+    dmmv_mxfp4_moe_pipe: MetalPipeline,
+    dmmv_mxfp4_moe_gate_up_oai_pipe: MetalPipeline,
+    dmmv_q8_0_lmhead_pipe: MetalPipeline,
     dmmv_q8_0_k2048_pipe: MetalPipeline,
     dmmv_q8_0_dual_pipe: MetalPipeline,
     dmmv_q8_0_pair_pipe: MetalPipeline,
@@ -1704,12 +1746,14 @@ pub const InferenceEngine = struct {
     geglu_batched_pipe: MetalPipeline,
     swiglu_pipe: MetalPipeline,
     swiglu_batched_pipe: MetalPipeline,
+    swiglu_oai_batched_bias_pipe: MetalPipeline,
     scale_acc_pipe: MetalPipeline,
     scale_in_place_pipe: MetalPipeline,
     rms_norm_pipe: MetalPipeline,
     rms_norm_offset_pipe: MetalPipeline,
     moe_acc_pipe: MetalPipeline,
     moe_acc_batched_pipe: MetalPipeline,
+    moe_acc_batched_bias_pipe: MetalPipeline,
     softmax_topk_pipe: MetalPipeline,
     softmax_topk_scaled_pipe: MetalPipeline,
     softmax_topk_batched_pipe: MetalPipeline,
@@ -2035,6 +2079,9 @@ pub const InferenceEngine = struct {
         self.dmmv_q5_0_pipe = try loadShaderPipeline(ctx, "dmmv_q5_0");
         self.dmmv_q5_1_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1");
         self.dmmv_mxfp4_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4");
+        self.dmmv_mxfp4_moe_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe");
+        self.dmmv_mxfp4_moe_gate_up_oai_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe_gate_up_oai");
+        self.dmmv_q8_0_lmhead_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_lmhead");
         self.dmmv_q8_0_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048");
         self.dmmv_q8_0_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual");
         self.dmmv_q8_0_pair_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair");
@@ -2070,12 +2117,14 @@ pub const InferenceEngine = struct {
         self.geglu_batched_pipe = try loadShaderPipeline(ctx, "geglu_batched");
         self.swiglu_pipe = try loadShaderPipeline(ctx, "swiglu");
         self.swiglu_batched_pipe = try loadShaderPipeline(ctx, "swiglu_batched");
+        self.swiglu_oai_batched_bias_pipe = try loadShaderPipeline(ctx, "swiglu_oai_batched_bias");
         self.scale_acc_pipe = try loadShaderPipeline(ctx, "scale_accumulate");
         self.scale_in_place_pipe = try loadShaderPipeline(ctx, "scale_in_place");
         self.rms_norm_pipe = try loadShaderPipeline(ctx, "rms_norm_mul");
         self.rms_norm_offset_pipe = try loadShaderPipeline(ctx, "rms_norm_mul_offset");
         self.moe_acc_pipe = try loadShaderPipeline(ctx, "moe_accumulate");
         self.moe_acc_batched_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched");
+        self.moe_acc_batched_bias_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched_bias");
         self.softmax_topk_pipe = try loadShaderPipeline(ctx, "softmax_topk");
         self.softmax_topk_scaled_pipe = try loadShaderPipeline(ctx, "softmax_topk_scaled");
         self.softmax_topk_batched_pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
@@ -2743,6 +2792,9 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q5_0_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_pipe);
         metal_pipeline.freePipeline(&self.dmmv_mxfp4_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_mxfp4_moe_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_mxfp4_moe_gate_up_oai_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_lmhead_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_pair_pipe);
@@ -2776,12 +2828,14 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.geglu_batched_pipe);
         metal_pipeline.freePipeline(&self.swiglu_pipe);
         metal_pipeline.freePipeline(&self.swiglu_batched_pipe);
+        metal_pipeline.freePipeline(&self.swiglu_oai_batched_bias_pipe);
         metal_pipeline.freePipeline(&self.scale_acc_pipe);
         metal_pipeline.freePipeline(&self.scale_in_place_pipe);
         metal_pipeline.freePipeline(&self.rms_norm_pipe);
         metal_pipeline.freePipeline(&self.rms_norm_offset_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_batched_pipe);
+        metal_pipeline.freePipeline(&self.moe_acc_batched_bias_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_scaled_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_batched_pipe);
@@ -3534,6 +3588,12 @@ pub const InferenceEngine = struct {
             .q8_0 => blk: {
                 const simd_width = if (self.dmmv_q8_0_pipe.thread_execution_width > 0) self.dmmv_q8_0_pipe.thread_execution_width else @as(u32, 32);
                 if (self.device.chip == .apple9 and simd_width == 32) {
+                    if (self.config.architecture == .gpt_oss and tensor == self.lm_head and K <= 4096 and M >= 65536 and
+                        self.dmmv_q8_0_lmhead_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_lmhead_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        break :blk .{ .pipe = &self.dmmv_q8_0_lmhead_pipe, .push_idx = 0, .rows_per_wg = 32, .block_size = 512 };
+                    }
                     if (preferApple9Q8K2048Path(tensor, M, K) and
                         self.dmmv_q8_0_k2048_pipe.thread_execution_width == 32 and
                         self.dmmv_q8_0_k2048_pipe.max_threads_per_threadgroup >= 512)
@@ -4997,6 +5057,88 @@ fn dispatchDmmvMoeQ6kOnCmd(
     cmd.dispatchV2(&engine.dmmv_q6k_moe_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
 }
 
+fn dispatchDmmvMoeMxfp4OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    x_expert_stride: u32,
+    extra_byte_offset: u32,
+) !void {
+    if (tensor.info.type_ != .mxfp4) return error.UnsupportedQuantType;
+    if (K > 4096) return error.UnsupportedQuantType;
+    if (engine.dmmv_mxfp4_moe_pipe.handle == null) return error.UnsupportedQuantType;
+
+    const push = MoeDmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
+        .expert_stride = expert_stride,
+        .x_expert_stride = x_expert_stride,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
+    const rows_per_wg: u32 = 64;
+    const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+    cmd.dispatchV2(&engine.dmmv_mxfp4_moe_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+}
+
+fn dispatchDmmvMoeGateUpOaiMxfp4OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate_tensor: *const metal_loader.LoadedTensor,
+    up_tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    gate_bias: *const metal_loader.LoadedTensor,
+    up_bias: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+    gate_expert_stride: u32,
+    up_expert_stride: u32,
+    gate_base_offset: u32,
+    up_base_offset: u32,
+) !void {
+    if (gate_tensor.info.type_ != .mxfp4 or up_tensor.info.type_ != .mxfp4) return error.UnsupportedQuantType;
+    if (K > 4096) return error.UnsupportedQuantType;
+    if (engine.dmmv_mxfp4_moe_gate_up_oai_pipe.handle == null) return error.UnsupportedQuantType;
+
+    recordMoeDmmvProfile(engine, gate_tensor.info.type_, M, K, engine.config.n_experts_used * 2);
+
+    const push = MoeGateUpOaiPush{
+        .M = M,
+        .K = K,
+        .gate_offset = tensorPageOffset(engine.model, gate_tensor) + gate_base_offset,
+        .up_offset = tensorPageOffset(engine.model, up_tensor) + up_base_offset,
+        .gate_expert_stride = gate_expert_stride,
+        .up_expert_stride = up_expert_stride,
+        .x_expert_stride = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+        .gate_bias_offset = tensorPageOffset(engine.model, gate_bias),
+        .up_bias_offset = tensorPageOffset(engine.model, up_bias),
+    };
+    const bufs = [_]*const MetalBuffer{
+        &gate_tensor.gpu_buffer,
+        &up_tensor.gpu_buffer,
+        input_buf,
+        output_buf,
+        routing_buf,
+        &gate_bias.gpu_buffer,
+        &up_bias.gpu_buffer,
+    };
+    const rows_per_wg: u32 = 64;
+    const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+    cmd.dispatchV2(&engine.dmmv_mxfp4_moe_gate_up_oai_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeGateUpOaiPush), 0);
+}
+
 fn dispatchDmmvMoeOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -5017,6 +5159,7 @@ fn dispatchDmmvMoeOnCmd(
         .q5_1 => dispatchDmmvMoeQ5_1OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
         .q5_k => dispatchDmmvMoeQ5kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
         .q6_k => dispatchDmmvMoeQ6kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
+        .mxfp4 => try dispatchDmmvMoeMxfp4OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
         else => return error.UnsupportedQuantType,
     }
 }
@@ -5704,6 +5847,62 @@ fn dispatchFfnActivationOnCmd(
     const bufs = [_]*const MetalBuffer{ gate, output, up };
     const pipe = if (usesGeglu(engine.config)) &engine.geglu_pipe else &engine.swiglu_pipe;
     cmd.dispatchV2(pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+}
+
+fn dispatchOaiSwiGLUBatchedBiasOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate: *const MetalBuffer,
+    output: *const MetalBuffer,
+    up: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    gate_bias: *const metal_loader.LoadedTensor,
+    up_bias: *const metal_loader.LoadedTensor,
+    n: u32,
+) void {
+    const push = OaiSwiGLUBatchedBiasPush{
+        .n = n,
+        .gate_bias_offset = tensorPageOffset(engine.model, gate_bias),
+        .up_bias_offset = tensorPageOffset(engine.model, up_bias),
+    };
+    const bufs = [_]*const MetalBuffer{ gate, output, up, routing, &gate_bias.gpu_buffer, &up_bias.gpu_buffer };
+    cmd.dispatchV2(&engine.swiglu_oai_batched_bias_pipe, .{ (n + 63) / 64, engine.config.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(OaiSwiGLUBatchedBiasPush), 0);
+}
+
+fn weightOrZero(weights: []const f32, idx: usize) f32 {
+    return if (idx < weights.len) weights[idx] else 0.0;
+}
+
+fn dispatchMoeAccBatchedBiasOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    dst: *const MetalBuffer,
+    experts: *const MetalBuffer,
+    shared: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    down_bias: *const metal_loader.LoadedTensor,
+    n: u32,
+    expert_stride: u32,
+    weights: []const f32,
+    shared_weight: f32,
+) void {
+    const push = MoeAccBatchedBiasPush{
+        .n = n,
+        .expert_stride = expert_stride,
+        .expert_count = @intCast(weights.len),
+        .bias_offset = tensorPageOffset(engine.model, down_bias),
+        .w0 = weightOrZero(weights, 0),
+        .w1 = weightOrZero(weights, 1),
+        .w2 = weightOrZero(weights, 2),
+        .w3 = weightOrZero(weights, 3),
+        .w4 = weightOrZero(weights, 4),
+        .w5 = weightOrZero(weights, 5),
+        .w6 = weightOrZero(weights, 6),
+        .w7 = weightOrZero(weights, 7),
+        .w_sh = shared_weight,
+    };
+    const bufs = [_]*const MetalBuffer{ dst, experts, shared, routing, &down_bias.gpu_buffer };
+    cmd.dispatchV2(&engine.moe_acc_batched_bias_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeAccBatchedBiasPush), 0);
 }
 
 fn fillRopeInvFreqs(dst: []f32, rope_dim: u32, freq_base: f32, freq_factors: ?[]const f32) void {
@@ -7119,6 +7318,34 @@ fn expertSliceBytes(quant_type: GGMLType, rows: u32, cols: u32) u32 {
 
 fn canUseBatchedQ4kMoe(engine: *const InferenceEngine, gate_quant: GGMLType, down_quant: GGMLType) bool {
     return engine.config.n_experts_used == 8 and gate_quant == .q4_k and down_quant == .q4_k;
+}
+
+fn canUseBatchedMxfp4GptOssMoe(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+    gate_quant: GGMLType,
+    up_quant: GGMLType,
+    down_quant: GGMLType,
+    hidden_dim: u32,
+    inter_dim: u32,
+) bool {
+    const cfg = engine.config;
+    if (cfg.architecture != .gpt_oss) return false;
+    if (cfg.n_experts_used == 0 or cfg.n_experts_used > 8) return false;
+    if (hidden_dim > 4096 or inter_dim > 4096) return false;
+    if (gate_quant != .mxfp4 or up_quant != .mxfp4 or down_quant != .mxfp4) return false;
+    if (lt.ffn_gate_up_exps != null or lt.ffn_down_exps_scale != null) return false;
+    if (lt.ffn_gate_shexp != null or lt.ffn_up_shexp != null or lt.ffn_down_shexp != null) return false;
+
+    const gate_bias = lt.ffn_gate_exps_bias orelse return false;
+    const up_bias = lt.ffn_up_exps_bias orelse return false;
+    const down_bias = lt.ffn_down_exps_bias orelse return false;
+    if (gate_bias.info.type_ != .f32 or up_bias.info.type_ != .f32 or down_bias.info.type_ != .f32) return false;
+
+    return engine.dmmv_mxfp4_moe_pipe.handle != null and
+        engine.dmmv_mxfp4_moe_gate_up_oai_pipe.handle != null and
+        engine.swiglu_oai_batched_bias_pipe.handle != null and
+        engine.moe_acc_batched_bias_pipe.handle != null;
 }
 
 fn canUseGpuRoutedMoeDown(engine: *const InferenceEngine, down_quant: GGMLType) bool {
@@ -8689,10 +8916,12 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                 const up_exps = gate_up_layout.up_tensor;
                 const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
                 const gate_quant = gate_exps.info.type_;
+                const up_quant = up_exps.info.type_;
                 const down_quant = down_exps.info.type_;
                 const expert_gate_bytes = gate_up_layout.gate_expert_stride;
                 const expert_down_bytes = expertSliceBytes(down_quant, hidden_dim, inter_dim);
                 const use_batched_q4k_moe = canUseBatchedQ4kMoe(engine, gate_quant, down_quant) and !usesGeglu(cfg) and lt.ffn_gate_up_exps == null;
+                const use_batched_mxfp4_moe = canUseBatchedMxfp4GptOssMoe(engine, lt, gate_quant, up_quant, down_quant, hidden_dim, inter_dim);
 
                 {
                     const expert_ids_ptr: [*]u32 = @ptrCast(@alignCast(engine.expert_ids_buf.cpu_ptr.?));
@@ -8762,6 +8991,45 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                             &engine.down_buf,
                         };
                         cmd.dispatchV2(&engine.moe_acc_batched_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &moe_bufs, &moe_push, @sizeOf(MoeAccBatchedPush), 3);
+                        profileBarrier(&cmd, profile, .fallback_moe);
+                    } else if (use_batched_mxfp4_moe) {
+                        // GPT-OSS MXFP4 experts: keep all selected experts in
+                        // contiguous batched buffers and apply OAI biases on GPU.
+                        try dispatchDmmvMoeGateUpOaiMxfp4OnCmd(
+                            engine,
+                            &cmd,
+                            gate_exps,
+                            up_exps,
+                            &engine.norm_buf,
+                            &engine.expert_swiglu_batch_buf,
+                            &engine.expert_ids_buf,
+                            lt.ffn_gate_exps_bias.?,
+                            lt.ffn_up_exps_bias.?,
+                            inter_dim,
+                            hidden_dim,
+                            expert_gate_bytes,
+                            gate_up_layout.up_expert_stride,
+                            gate_up_layout.gate_base_offset,
+                            gate_up_layout.up_base_offset,
+                        );
+                        profileBarrier(&cmd, profile, .fallback_moe);
+
+                        try dispatchDmmvMoeOnCmd(engine, &cmd, down_exps, &engine.expert_swiglu_batch_buf, &engine.expert_down_batch_buf, &engine.expert_ids_buf, hidden_dim, inter_dim, expert_down_bytes, inter_dim, 0);
+                        profileBarrier(&cmd, profile, .fallback_moe);
+
+                        dispatchMoeAccBatchedBiasOnCmd(
+                            engine,
+                            &cmd,
+                            moe_accum_buf,
+                            &engine.expert_down_batch_buf,
+                            &engine.down_buf,
+                            &engine.expert_ids_buf,
+                            lt.ffn_down_exps_bias.?,
+                            hidden_dim,
+                            hidden_dim,
+                            expert_weights[0..cfg.n_experts_used],
+                            0.0,
+                        );
                         profileBarrier(&cmd, profile, .fallback_moe);
                     } else {
                         // Phase 1: All expert gate+up DMMVs in parallel (+ shared expert)
