@@ -125,6 +125,9 @@ pub const SsmGatedNormPush = extern struct {
 pub const SoftmaxTopkPush = extern struct {
     n_experts: u32,
     k: u32,
+    /// Optional positive scale applied to selected logits before softmax.
+    /// Use floatBitsToInt(1.0) for the normal unscaled path.
+    scale_bits: u32 = @bitCast(@as(f32, 1.0)),
 };
 
 /// Push constants for batched MoE weighted accumulate shader.
@@ -212,6 +215,7 @@ pub const QkNormRopeKvWritePush = extern struct {
     attn_scale_bits: u32, // 0 ⇒ scale = 1.0
     eps_bits: u32,
     dst_offset: u32, // physical_token * kv_dim (in floats)
+    v_norm: u32 = 0, // 1 ⇒ unit-RMS-normalize V while writing kv_v
 };
 
 /// Manages element-wise fused kernel pipelines.

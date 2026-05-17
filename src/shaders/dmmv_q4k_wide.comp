@@ -1,17 +1,17 @@
 #version 460
 // ZINC — Q4_K DMMV for tall matrices (wide-vocab LM heads).
-// Identical algorithm to dmmv_q4k.comp but with NUM_ROWS=8 instead of 2.
+// Identical algorithm to dmmv_q4k.comp but with NUM_ROWS=32 instead of 2.
 //
 // Gemma 4 31B LM head (M=262144, K=5376) was running at ~17 GB/s with
 // NUM_ROWS=2 — 131072 workgroups × tiny per-workgroup work, each reading
-// the same 5376-float hidden vector. Raising NUM_ROWS to 8 cuts workgroup
-// count 4× (to 32768) and amortizes the hidden-vector cache traffic
-// across 8 output rows, which turns the LM head from the per-token
+// the same 5376-float hidden vector. Raising NUM_ROWS to 32 cuts workgroup
+// count 16× (to 8192) and amortizes the hidden-vector cache traffic
+// across 32 output rows, which turns the LM head from the per-token
 // decode bottleneck into a small fraction of it.
 //
 // Safe to use for any tall weight matrix where M / NUM_ROWS is still
 // large enough to saturate the device (≥ ~4096 workgroups on R9700 = M
-// ≥ 32768). The caller in forward.zig gates on M ≥ 100_000.
+// ≥ 131072). The caller in forward.zig gates on M ≥ 100_000.
 //
 // Q4_K block (256 elements, 144 bytes = 36 uint32):
 //   [0..3]    d(f16) + dmin(f16)      — u32[0]
@@ -37,7 +37,7 @@ layout(set = 0, binding = 0) readonly buffer MatrixA { uint a_u32[]; };
 layout(set = 0, binding = 1) readonly buffer VectorX { vec4 x_v4[]; };
 layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
 
-const uint NUM_ROWS = 8u;
+const uint NUM_ROWS = 32u;
 const uint Q4K_BLOCK_U32 = 36u;
 
 vec4 unpack_nibbles_lo(uint v) {

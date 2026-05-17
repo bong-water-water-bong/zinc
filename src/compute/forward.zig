@@ -2095,6 +2095,22 @@ pub const InferenceEngine = struct {
         } else if (qwen36_like_f32_ssm and qwen36_topk_env != null) {
             log.info("Qwen 3.6 MoE top-k cap disabled via ZINC_QWEN36_MOE_TOPK={s}", .{qwen36_topk_env.?});
         }
+        const gemma_topk_env = std.posix.getenv("ZINC_GEMMA_MOE_TOPK");
+        const gemma_topk_default: u32 = if (config.architecture == .gemma and isIntelGpuVendor(gpu_config.vendor)) 4 else 0;
+        const gemma_topk_limit: u32 = if (config.architecture == .gemma) blk: {
+            const requested = if (gemma_topk_env) |raw|
+                std.fmt.parseInt(u32, raw, 10) catch gemma_topk_default
+            else
+                gemma_topk_default;
+            if (requested == 0 or requested >= config.n_experts_used) break :blk 0;
+            break :blk @max(@as(u32, 1), requested);
+        } else 0;
+        if (gemma_topk_limit > 0) {
+            log.info("Gemma MoE top-k capped at {d} (set ZINC_GEMMA_MOE_TOPK=0 to restore metadata top-k={d})", .{
+                gemma_topk_limit,
+                config.n_experts_used,
+            });
+        }
         const qwen36_prefill_topk_env = std.posix.getenv("ZINC_QWEN36_MOE_PREFILL_TOPK");
         const qwen36_prefill_topk_default: u32 = 1;
         const qwen36_prefill_tail_topk_limit: u32 = if (qwen36_like_f32_ssm) blk: {
@@ -2599,7 +2615,7 @@ pub const InferenceEngine = struct {
             .use_moe_fused_gate_up = moe_fused_gate_up_enabled,
             .use_moe_fused_gate_up_swiglu = moe_fused_gate_up_swiglu_enabled,
             .use_moe_fused_down_acc = moe_fused_down_acc_enabled,
-            .moe_topk_limit = qwen36_topk_limit,
+            .moe_topk_limit = if (gemma_topk_limit > 0) gemma_topk_limit else qwen36_topk_limit,
             .moe_prefill_tail_topk_limit = qwen36_prefill_tail_topk_limit,
             .moe_prefill_tail_topk_guard_tokens = qwen36_prefill_tail_topk_guard_tokens,
             .use_fused_rms_router = fused_rms_router_enabled,
@@ -4348,6 +4364,7 @@ pub const InferenceEngine = struct {
         attn_scale: f32,
         eps: f32,
         dst_offset_floats: u32,
+        v_norm: bool,
     ) void {
         const pip = &(self.elementwise.pipeline_qk_norm_rope_kv_write orelse return);
         const push = QkNormRopeKvWritePush{
@@ -4360,6 +4377,7 @@ pub const InferenceEngine = struct {
             .attn_scale_bits = @bitCast(attn_scale),
             .eps_bits = @bitCast(eps),
             .dst_offset = dst_offset_floats,
+            .v_norm = if (v_norm) 1 else 0,
         };
         // Bind a dummy buffer for the unused freq binding when no precomputed
         // freq buffer is supplied. Mirrors dispatchNormRopeInPlace's pattern.
@@ -4457,15 +4475,39 @@ pub const InferenceEngine = struct {
         n_experts: u32,
         k: u32,
     ) !void {
-        const pip = if (self.use_softmax_topk_v2 and self.elementwise.pipeline_softmax_topk_v2 != null)
+        return self.dispatchSoftmaxTopkScaled(
+            logits_buf,
+            logits_size,
+            output_buf,
+            output_size,
+            n_experts,
+            k,
+            1.0,
+        );
+    }
+
+    fn dispatchSoftmaxTopkScaled(
+        self: *InferenceEngine,
+        logits_buf: vk.c.VkBuffer,
+        logits_size: vk.c.VkDeviceSize,
+        output_buf: vk.c.VkBuffer,
+        output_size: vk.c.VkDeviceSize,
+        n_experts: u32,
+        k: u32,
+        scale: f32,
+    ) !void {
+        const use_v2 = self.use_softmax_topk_v2 and self.elementwise.pipeline_softmax_topk_v2 != null;
+        if (scale != 1.0 and !use_v2) return error.ShaderNotLoaded;
+        const pip = if (use_v2)
             &self.elementwise.pipeline_softmax_topk_v2.?
         else
             &(self.elementwise.pipeline_softmax_topk orelse return error.ShaderNotLoaded);
+        const push = SoftmaxTopkPush{
+            .n_experts = n_experts,
+            .k = k,
+            .scale_bits = @bitCast(scale),
+        };
         if (pip.uses_push_descriptors) {
-            const push = SoftmaxTopkPush{
-                .n_experts = n_experts,
-                .k = k,
-            };
             self.pushDispatch2(
                 pip,
                 std.mem.asBytes(&push),
@@ -4482,7 +4524,7 @@ pub const InferenceEngine = struct {
 
         const ds = try self.allocDescSet(pip.descriptor_set_layout);
         self.writeDescSet2(ds, logits_buf, logits_size, output_buf, output_size);
-        try self.elementwise.recordSoftmaxTopk(&self.decode_cmd, ds, n_experts, k);
+        self.decode_cmd.dispatchWithPush(pip, ds, std.mem.asBytes(&push), 1, 1, 1);
     }
 
     fn dispatchMoeWeightedAcc(
@@ -5045,15 +5087,34 @@ pub const InferenceEngine = struct {
                 var q_rope_done = is_dead_attn_tail;
                 var k_rope_done = false;
 
+                // Effort-11 cycle-12: fused Q+K norm+rope + KV cache write
+                // path. Single dispatch absorbs the (Q norm+rope → K norm+rope
+                // → kv_cache_write) trio when all per-call gates pass. Saves
+                // 2 dispatches + 1 global compute barrier per attention layer.
+                const physical_token_for_fused = if (self.use_fused_qk_kv)
+                    self.physicalTokenIndex(state.position) catch null
+                else
+                    null;
+                const fused_qk_kv_base_eligible = self.use_fused_qk_kv and
+                    self.elementwise.pipeline_qk_norm_rope_kv_write != null and
+                    q_norm_tensor != null and
+                    k_norm_tensor != null and
+                    !packed_q_gate and
+                    !is_dead_attn_tail and
+                    !(state.position == 0 and self.validation_diagnostics_enabled) and
+                    physical_token_for_fused != null;
+                const gemma_v_unit_norm_needed =
+                    config.architecture == .gemma and config.rope_freq_base_swa > 0;
+                const gemma_v_norm_in_fused =
+                    fused_qk_kv_base_eligible and gemma_v_unit_norm_needed;
+
                 // Gemma use_k_as_v optimization: V unit-norm reads the RAW K
-                // projection from k_buf and writes to v_buf. Must run BEFORE
-                // K norm (which overwrites k_buf with the learned-weight norm
-                // and/or rope). Barrier after ensures v_buf visibility and
-                // that K norm sees raw k_buf. Non-use_k_as_v path keeps the
-                // original V unit-norm ordering below.
+                // projection. If the fused Q/K/KV shader is active, it can
+                // normalize V directly while writing kv_v; otherwise this must
+                // run before K norm overwrites k_buf.
                 const apply_v_unit_norm_early = use_k_as_v and
-                    config.architecture == .gemma and
-                    config.rope_freq_base_swa > 0;
+                    gemma_v_unit_norm_needed and
+                    !gemma_v_norm_in_fused;
                 if (apply_v_unit_norm_early) {
                     try self.dispatchRmsNorm(
                         self.k_buf.handle,
@@ -5069,30 +5130,13 @@ pub const InferenceEngine = struct {
                     self.decode_cmd.computeBarrier();
                 }
 
-                // Effort-11 cycle-12: fused Q+K norm+rope + KV cache write
-                // path. Single dispatch absorbs the (Q norm+rope → K norm+rope
-                // → kv_cache_write) trio when all per-call gates pass. Saves
-                // 2 dispatches + 1 global compute barrier per attention layer.
-                const physical_token_for_fused = if (self.use_fused_qk_kv)
-                    self.physicalTokenIndex(state.position) catch null
-                else
-                    null;
-                const fused_qk_kv_eligible = self.use_fused_qk_kv and
-                    self.elementwise.pipeline_qk_norm_rope_kv_write != null and
-                    q_norm_tensor != null and
-                    k_norm_tensor != null and
-                    !packed_q_gate and
-                    !use_k_as_v and
-                    !apply_v_unit_norm_early and
-                    !is_dead_attn_tail and
-                    config.architecture != .gemma and
-                    !(state.position == 0 and self.validation_diagnostics_enabled) and
-                    physical_token_for_fused != null;
+                const fused_qk_kv_eligible = fused_qk_kv_base_eligible;
 
                 if (fused_qk_kv_eligible) {
                     const qn = q_norm_tensor.?;
                     const kn = k_norm_tensor.?;
                     const dst_offset_floats: u32 = physical_token_for_fused.? * layer_kv_dim;
+                    const v_src_for_fused = if (gemma_v_norm_in_fused and use_k_as_v) self.k_buf else self.v_buf;
                     self.dispatchQkNormRopeKvWrite(
                         self.q_buf.handle,
                         self.q_buf.size,
@@ -5106,8 +5150,8 @@ pub const InferenceEngine = struct {
                         self.rope_freq_buf.size,
                         self.kv_k_cache[layer_idx].handle,
                         self.kv_k_cache[layer_idx].size,
-                        self.v_buf.handle,
-                        self.v_buf.size,
+                        v_src_for_fused.handle,
+                        v_src_for_fused.size,
                         self.kv_v_cache[layer_idx].handle,
                         self.kv_v_cache[layer_idx].size,
                         layer_head_dim,
@@ -5119,6 +5163,7 @@ pub const InferenceEngine = struct {
                         rope_attn_scale,
                         rms_norm_eps,
                         dst_offset_floats,
+                        gemma_v_norm_in_fused,
                     );
                     self.decode_cmd.computeBarrier();
                     q_rope_done = true;
@@ -6406,15 +6451,62 @@ pub const InferenceEngine = struct {
                     self.decode_cmd.computeBufferBarrier(self.router_logits_buf.handle, self.router_logits_buf.size);
                 }
 
+                // Dispatch each selected expert — handle both separate and fused gate+up layouts.
+                // Gemma 4 26B-A4B uses fused ffn_gate_up_exps instead of separate gate/up.
+                const fused_gate_up = lt.ffn_gate_up_exps;
+                const gate_exps = lt.ffn_gate_exps orelse fused_gate_up orelse return error.TensorNotFound;
+                const up_exps = lt.ffn_up_exps orelse fused_gate_up orelse return error.TensorNotFound;
+                const down_exps = lt.ffn_down_exps orelse return error.TensorNotFound;
+
+                const gate_quant = gate_exps.info.type_;
+                const down_quant = down_exps.info.type_;
+                // Expert weight offset: for fused gate_up, stride covers both halves (2*inter_dim)
+                const fused_inter = if (fused_gate_up != null) inter_dim * 2 else inter_dim;
+                const expert_gate_row_bytes = expertSliceBytes(gate_quant, fused_inter, hidden_dim);
+                // Byte offset to the up half within a fused gate_up expert slice
+                const up_base_offset: u32 = if (fused_gate_up != null) expertSliceBytes(gate_quant, inter_dim, hidden_dim) else 0;
+                // Down projection: each expert has hidden_dim rows of K=inter_dim
+                const expert_down_row_bytes = expertSliceBytes(down_quant, hidden_dim, inter_dim);
+
+                const gemma_gpu_topk_down_q5_1 =
+                    down_exps.info.type_ == .q5_1 and
+                    self.dmmv.pipeline_q5_1_moe_fused_down_acc_scaled != null;
+                const gemma_gpu_topk_down_q8_0 =
+                    down_exps.info.type_ == .q8_0 and
+                    self.dmmv.pipeline_q8_0_moe_fused_down_acc_scaled != null;
+                const gemma_gpu_topk_moe =
+                    config.architecture == .gemma and
+                    fused_gate_up != null and
+                    gate_exps.info.type_ == .q4_k and
+                    up_exps.info.type_ == .q4_k and
+                    (gemma_gpu_topk_down_q5_1 or gemma_gpu_topk_down_q8_0) and
+                    lt.ffn_gate_inp_bias == null and
+                    lt.ffn_gate_exps_bias == null and
+                    lt.ffn_up_exps_bias == null and
+                    lt.ffn_down_exps_bias == null and
+                    lt.ffn_down_exps_scale != null and
+                    self.elementwise.pipeline_softmax_topk != null and
+                    self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu != null;
+
+                const gemma_router_scale: f32 = if (config.architecture == .gemma)
+                    1.0 / std.math.sqrt(@as(f32, @floatFromInt(hidden_dim)))
+                else
+                    1.0;
+                const gemma_topk_scales_router =
+                    gemma_gpu_topk_moe and
+                    self.use_softmax_topk_v2 and
+                    self.elementwise.pipeline_softmax_topk_v2 != null;
+
                 // Gemma 4 MoE: scale router logits by 1/sqrt(hidden_dim) before softmax.
-                // Matches Metal forward_metal.zig:4134-4137.
-                if (config.architecture == .gemma) {
-                    const router_scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(hidden_dim)));
+                // The GPU-topk fast path folds the same positive scale into topk
+                // softmax weights, avoiding a separate in-place dispatch + barrier.
+                // Matches Metal forward_metal.zig:4134-4137 for other Gemma paths.
+                if (config.architecture == .gemma and !gemma_topk_scales_router) {
                     try self.dispatchScaleInPlace(
                         self.router_logits_buf.handle,
                         self.router_logits_buf.size,
                         config.n_experts,
-                        router_scale,
+                        gemma_router_scale,
                     );
                     self.decode_cmd.computeBufferBarrier(self.router_logits_buf.handle, self.router_logits_buf.size);
                 }
@@ -6433,26 +6525,12 @@ pub const InferenceEngine = struct {
                 else
                     config.n_experts_used;
 
-                // Dispatch each selected expert — handle both separate and fused gate+up layouts.
-                // Gemma 4 26B-A4B uses fused ffn_gate_up_exps instead of separate gate/up.
-                const fused_gate_up = lt.ffn_gate_up_exps;
-                const gate_exps = lt.ffn_gate_exps orelse fused_gate_up orelse return error.TensorNotFound;
-                const up_exps = lt.ffn_up_exps orelse fused_gate_up orelse return error.TensorNotFound;
-                const down_exps = lt.ffn_down_exps orelse return error.TensorNotFound;
-
-                const gate_quant = gate_exps.info.type_;
-                const down_quant = down_exps.info.type_;
-                // Expert weight offset: for fused gate_up, stride covers both halves (2*inter_dim)
-                const fused_inter = if (fused_gate_up != null) inter_dim * 2 else inter_dim;
-                const expert_gate_row_bytes = expertSliceBytes(gate_quant, fused_inter, hidden_dim);
-                // Byte offset to the up half within a fused gate_up expert slice
-                const up_base_offset: u32 = if (fused_gate_up != null) expertSliceBytes(gate_quant, inter_dim, hidden_dim) else 0;
-                // Down projection: each expert has hidden_dim rows of K=inter_dim
-                const expert_down_row_bytes = expertSliceBytes(down_quant, hidden_dim, inter_dim);
-
                 // Gemma 4 MoE uses pre_ffw_norm_2 for MoE expert input (vs ffn_norm_buf for shared).
                 // Available to both GPU-routed and CPU-routed MoE paths.
-                const expert_input_buf = if (lt.pre_ffw_norm_2) |pre_norm_t| blk: {
+                const defer_gemma_pre_ffw_norm_2 = gemma_gpu_topk_moe and lt.pre_ffw_norm_2 != null;
+                const expert_input_buf = if (defer_gemma_pre_ffw_norm_2)
+                    self.residual_buf
+                else if (lt.pre_ffw_norm_2) |pre_norm_t| blk: {
                     try self.dispatchRmsNorm(
                         self.hidden_buf.handle,
                         hidden_size,
@@ -7142,40 +7220,48 @@ pub const InferenceEngine = struct {
                     // GPU MoE path: hidden_buf is fully barriered (weighted_acc or shared_gate_acc)
                     gpu_moe_barriers_cover_hidden = true;
                 } else {
-                    const gemma_gpu_topk_down_q5_1 =
-                        down_exps.info.type_ == .q5_1 and
-                        self.dmmv.pipeline_q5_1_moe_fused_down_acc_scaled != null;
-                    const gemma_gpu_topk_down_q8_0 =
-                        down_exps.info.type_ == .q8_0 and
-                        self.dmmv.pipeline_q8_0_moe_fused_down_acc_scaled != null;
-                    const gemma_gpu_topk_moe =
-                        config.architecture == .gemma and
-                        fused_gate_up != null and
-                        gate_exps.info.type_ == .q4_k and
-                        up_exps.info.type_ == .q4_k and
-                        (gemma_gpu_topk_down_q5_1 or gemma_gpu_topk_down_q8_0) and
-                        lt.ffn_gate_inp_bias == null and
-                        lt.ffn_gate_exps_bias == null and
-                        lt.ffn_up_exps_bias == null and
-                        lt.ffn_down_exps_bias == null and
-                        lt.ffn_down_exps_scale != null and
-                        self.elementwise.pipeline_softmax_topk != null and
-                        self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu != null;
-
                     if (gemma_gpu_topk_moe) {
                         if (state.position == 0 and layer == 0) {
                             log.info("FASTPATH: Gemma GPU-topk MoE ENABLED (q4k gate+up+geglu, scaled fused down+acc, n_used={d})", .{n_used});
                         }
                         const moe_topk_phase = self.beginProfilePhase();
-                        try self.dispatchSoftmaxTopk(
-                            self.router_logits_buf.handle,
-                            @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32),
-                            self.router_output_buf.handle,
-                            self.router_output_buf.size,
-                            config.n_experts,
-                            n_used,
-                        );
-                        self.decode_cmd.computeBufferBarrier(self.router_output_buf.handle, self.router_output_buf.size);
+                        if (gemma_topk_scales_router) {
+                            try self.dispatchSoftmaxTopkScaled(
+                                self.router_logits_buf.handle,
+                                @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32),
+                                self.router_output_buf.handle,
+                                self.router_output_buf.size,
+                                config.n_experts,
+                                n_used,
+                                gemma_router_scale,
+                            );
+                        } else {
+                            try self.dispatchSoftmaxTopk(
+                                self.router_logits_buf.handle,
+                                @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32),
+                                self.router_output_buf.handle,
+                                self.router_output_buf.size,
+                                config.n_experts,
+                                n_used,
+                            );
+                        }
+                        if (defer_gemma_pre_ffw_norm_2) {
+                            const pre_norm_t = lt.pre_ffw_norm_2.?;
+                            try self.dispatchRmsNorm(
+                                self.hidden_buf.handle,
+                                hidden_size,
+                                pre_norm_t.gpu_buffer.handle,
+                                pre_norm_t.gpu_buffer.size,
+                                self.residual_buf.handle,
+                                hidden_size,
+                                hidden_dim,
+                                1,
+                                rms_norm_eps,
+                            );
+                            self.decode_cmd.computeBarrier();
+                        } else {
+                            self.decode_cmd.computeBufferBarrier(self.router_output_buf.handle, self.router_output_buf.size);
+                        }
                         self.endProfilePhase(.moe_topk, moe_topk_phase);
 
                         const moe_gate_up_phase = self.beginProfilePhase();
@@ -9590,10 +9676,10 @@ pub const InferenceEngine = struct {
                 }
             }
 
-            // Wide-vocab LM-head fast path: NUM_ROWS=8 variant (pipeline_q4k_wide)
+            // Wide-vocab LM-head fast path: NUM_ROWS=32 variant (pipeline_q4k_wide)
             // for tall Q4_K matrices like Gemma 4 31B (M=262144). Same binding
-            // layout as pipeline_q4k, only the shader constant differs. 4× fewer
-            // workgroups, 4× more hidden-vector reuse per workgroup, which
+            // layout as pipeline_q4k, only the shader constant differs. 16× fewer
+            // workgroups, 16× more hidden-vector reuse per workgroup, which
             // turns the decode tail from ~45 ms into a small fraction.
             if (qt == .q4_k and M >= 100_000 and acc_mode == 0 and self.dmmv.pipeline_q4k_wide != null) {
                 const wide_pip = &self.dmmv.pipeline_q4k_wide.?;
@@ -9605,7 +9691,7 @@ pub const InferenceEngine = struct {
                     .y_offset = y_offset,
                     .acc_mode = acc_mode,
                 };
-                // NUM_ROWS=8 → one workgroup per 8 rows.
+                // NUM_ROWS=32 → one workgroup per 32 rows.
                 self.pushDispatch3(
                     wide_pip,
                     std.mem.asBytes(&push_wide),
@@ -9615,7 +9701,7 @@ pub const InferenceEngine = struct {
                     input_size,
                     output_buf.handle,
                     output_buf.size,
-                    (M + 7) / 8,
+                    (M + 31) / 32,
                     1,
                     1,
                 );

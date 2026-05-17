@@ -41,6 +41,7 @@ layout(set = 0, binding = 1) buffer RouterOutput {
 layout(push_constant) uniform PushConstants {
     uint n_experts;
     uint k;
+    uint scale_bits;
 };
 
 const uint MAX_PER_THREAD = 4u;  // covers n_experts up to 64 * 4 = 256
@@ -68,6 +69,7 @@ float unsortable_hi(uint s) {
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
+    float logit_scale = uintBitsToFloat(scale_bits);
 
     // --- Step 1: Load logits into registers (strided for coalescing) ---
     float vals[MAX_PER_THREAD];
@@ -127,7 +129,7 @@ void main() {
 
         if (tid == 0u) {
             output_data[ki] = winner_idx;
-            if (ki < MAX_K) s_topk_logits[ki] = winner_val;
+            if (ki < MAX_K) s_topk_logits[ki] = winner_val * logit_scale;
         }
     }
 

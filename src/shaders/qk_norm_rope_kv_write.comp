@@ -35,7 +35,7 @@
 // Push:
 //   head_dim, rope_dim, n_q_heads, n_k_heads,
 //   position, freq_base_bits, attn_scale_bits, eps_bits,
-//   dst_offset (physical_token * kv_dim, in floats)
+//   dst_offset (physical_token * kv_dim, in floats), v_norm flag
 
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
@@ -60,9 +60,11 @@ layout(push_constant) uniform PushConstants {
     uint  attn_scale_bits;  // 0 ⇒ scale = 1.0
     uint  eps_bits;
     uint  dst_offset;       // physical_token * kv_dim (floats)
+    uint  v_norm;           // 1 ⇒ unit-RMS-normalize V while writing kv_v
 };
 
 shared float s_partial[64];
+shared float s_partial_v[64];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -79,6 +81,7 @@ void main() {
 
     // ── Pass 1: sum-of-squares for per-head RMS norm.
     float sum_sq = 0.0;
+    float v_sum_sq = 0.0;
     if (is_q) {
         for (uint i = tid; i < head_dim; i += 64u) {
             float val = q_data[base + i];
@@ -88,29 +91,40 @@ void main() {
         for (uint i = tid; i < head_dim; i += 64u) {
             float val = k_src[base + i];
             sum_sq += val * val;
+            if (v_norm != 0u) {
+                float v = v_src[base + i];
+                v_sum_sq += v * v;
+            }
         }
     }
 
     sum_sq = subgroupAdd(sum_sq);
+    v_sum_sq = subgroupAdd(v_sum_sq);
 
     // Cross-subgroup reduction fallback (matches norm_rope.comp; rare on
     // wave64 RDNA but devices like Intel Xe2 SIMD16 need this).
     if (gl_SubgroupSize < 64u) {
         s_partial[tid] = sum_sq;
+        s_partial_v[tid] = v_sum_sq;
         barrier();
         if (tid == 0u) {
             float total = 0.0;
+            float total_v = 0.0;
             uint num_sg = (64u + gl_SubgroupSize - 1u) / gl_SubgroupSize;
             for (uint s = 0u; s < num_sg; s++) {
                 total += s_partial[s * gl_SubgroupSize];
+                total_v += s_partial_v[s * gl_SubgroupSize];
             }
             s_partial[0] = total;
+            s_partial_v[0] = total_v;
         }
         barrier();
         sum_sq = s_partial[0];
+        v_sum_sq = s_partial_v[0];
     }
 
     float rms_inv = inversesqrt(sum_sq / float(head_dim) + eps);
+    float v_rms_inv = inversesqrt(v_sum_sq / float(head_dim) + eps);
 
     // ── Pass 2: normalize + RoPE (rotated dims), write to destination.
     float freq_base = uintBitsToFloat(freq_base_bits);
@@ -161,11 +175,12 @@ void main() {
     }
 
     // ── K-WGs additionally copy V for their head into kv_v_cache.
-    // V has no per-head norm or RoPE on the standard path (this fused
-    // dispatch is gated off for Gemma's V unit-norm and use_k_as_v).
+    // Standard path copies V. Gemma sets v_norm=1 to fold its plain
+    // per-head unit RMS norm into the cache write.
     if (!is_q) {
         for (uint i = tid; i < head_dim; i += 64u) {
-            kv_v[k_dst_base + i] = v_src[base + i];
+            float v = v_src[base + i];
+            kv_v[k_dst_base + i] = (v_norm != 0u) ? (v * v_rms_inv) : v;
         }
     }
 }
