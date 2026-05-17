@@ -696,6 +696,8 @@ const cli_harmony_stop_strs = [_][]const u8{
 };
 const cli_chat_stop_strs = [_][]const u8{
     "<|im_end|>",
+    "<turn|>",
+    "<end_of_turn>",
     "<|endoftext|>",
     "<|return|>",
 };
@@ -2394,6 +2396,8 @@ test "shouldAutoChatCliPrompt leaves non-gemma templates raw" {
 
 test "trimCliOutputText strips chat terminator only in chat mode" {
     try std.testing.expectEqualStrings("Paris", trimCliOutputText("Paris<|im_end|>", true));
+    try std.testing.expectEqualStrings("Paris", trimCliOutputText("Paris<turn|>", true));
+    try std.testing.expectEqualStrings("Paris", trimCliOutputText("Paris<end_of_turn>", true));
     try std.testing.expectEqualStrings("Paris<|im_end|>", trimCliOutputText("Paris<|im_end|>", false));
     try std.testing.expectEqualStrings("Paris", trimCliOutputText("Paris", true));
 }

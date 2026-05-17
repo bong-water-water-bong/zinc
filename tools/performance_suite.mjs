@@ -1619,7 +1619,7 @@ async function discoverMetalCases(modelRoot) {
   return discovered;
 }
 
-function defaultRdnaCases(modelRoot) {
+export function defaultRdnaCases(modelRoot) {
   return [
     {
       id: "qwen36-35b-a3b-q4k-xl",

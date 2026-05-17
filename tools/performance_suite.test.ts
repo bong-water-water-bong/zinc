@@ -13,6 +13,7 @@ import {
   defaultMetalCases,
   defaultMaxTokensForModelId,
   defaultPromptForModelId,
+  defaultRdnaCases,
   defaultScenarioDefsForModel,
   guessFamily,
   localZincCommand,
@@ -122,6 +123,15 @@ test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
   const qwen36Dense = cases.find((entry) => entry.id === "qwen36-27b-q4k-m");
   expect(qwen36Dense?.model_id).toBe("qwen36-27b-q4k-m");
   expect(qwen36Dense?.model_path).toBe("/tmp/models/qwen36-27b-q4k-m/model.gguf");
+});
+
+test("default RDNA cases include Qwen 3.6 27B dense", () => {
+  const cases = defaultRdnaCases("/root/models");
+  const qwen36Dense = cases.find((entry) => entry.id === "qwen36-27b-q4k-m");
+
+  expect(qwen36Dense?.model_path).toBe("/root/models/Qwen3.6-27B-Q4_K_M.gguf");
+  expect(qwen36Dense?.prompt_mode).toBe("raw");
+  expect(qwen36Dense?.max_tokens).toBe(128);
 });
 
 test("default Intel cases use the remote managed cache layout", () => {

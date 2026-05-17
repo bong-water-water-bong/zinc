@@ -43,7 +43,7 @@ If that command does not show your AMD GPU, ZINC will not work.
 | VRAM | What fits |
 | --- | --- |
 | 16 GB | 2B to 8B class models comfortably |
-| 32 GB | 35B MoE models like Qwen3.6-35B-A3B Q4_K_XL |
+| 32 GB | 27B dense models and 35B MoE models like Qwen3.6-35B-A3B Q4_K_XL |
 
 Exact fit depends on architecture, quantization, and context length. `--check -m <model>` prints a practical fit estimate.
 
@@ -115,7 +115,7 @@ Apple Silicon uses unified memory shared between CPU and GPU. There is no separa
 | 8 GB | Too tight for most models |
 | 16 GB | 2B models comfortably |
 | 24 GB | 2B with headroom, 35B might be tight |
-| 32+ GB | 35B MoE models like Qwen3.6-35B-A3B Q4_K_XL |
+| 32+ GB | 27B dense and 35B MoE models like Qwen3.6-35B-A3B Q4_K_XL |
 | 64+ GB (Pro/Max/Ultra) | Large models with generous context |
 
 ZINC uses zero-copy model loading on Metal, so a 1.2 GB model file does not require an additional 1.2 GB of GPU memory. The model weights stay in place and the GPU reads from the mmap'd pages directly.
