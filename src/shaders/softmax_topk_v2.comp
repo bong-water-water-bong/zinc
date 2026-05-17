@@ -12,7 +12,8 @@
 //        sortable() maps float → uint such that subgroupMax(uint) returns
 //        the encoded max float. The "255 - idx" tiebreak in the low byte
 //        means lower expert id wins on tied vals (n_experts ≤ 256).
-//      - subgroupMax over the packed key → winner.
+//      - subgroupMax over the packed key, then cross-subgroup reduce when a
+//        64-thread workgroup is split into wave32/SIMD16 subgroups.
 //      - Decode winner_idx and winner_val (24-bit mantissa precision —
 //        relative loss ~1e-7, far below softmax noise).
 //      - Each thread invalidates any local slot whose idx matches winner.
@@ -47,6 +48,8 @@ const uint MAX_K = 16u;
 
 // Holds the topk logits (with hi24 mantissa precision) for parallel softmax.
 shared float s_topk_logits[MAX_K];
+shared uint s_subgroup_winner[4];
+shared uint s_global_winner;
 
 // Map float → uint such that subgroupMax(uint) returns max float in
 // signed-IEEE order. Positive: flip MSB so they compare > negatives.
@@ -96,7 +99,22 @@ void main() {
         // both selects the largest val AND breaks ties by lowest idx.
         uint packed = (sortable(best_val) & 0xFFFFFF00u)
                     | (255u - (best_idx & 0xFFu));
-        uint winner = subgroupMax(packed);
+        uint subgroup_winner = subgroupMax(packed);
+        if (subgroupElect()) {
+            s_subgroup_winner[gl_SubgroupID] = subgroup_winner;
+        }
+        barrier();
+
+        if (tid == 0u) {
+            uint winner_scan = s_subgroup_winner[0];
+            for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                winner_scan = max(winner_scan, s_subgroup_winner[sg]);
+            }
+            s_global_winner = winner_scan;
+        }
+        barrier();
+
+        uint winner = s_global_winner;
         uint winner_idx = 255u - (winner & 0xFFu);
         float winner_val = unsortable_hi(winner & 0xFFFFFF00u);
 

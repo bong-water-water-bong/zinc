@@ -7142,166 +7142,43 @@ pub const InferenceEngine = struct {
                     // GPU MoE path: hidden_buf is fully barriered (weighted_acc or shared_gate_acc)
                     gpu_moe_barriers_cover_hidden = true;
                 } else {
-                    if (self.profile_enabled) self.profile_token_counters.cpu_moe_fallbacks += 1;
-                    if (self.profile_enabled and !self.profile_logged_cpu_moe_fallback) {
-                        self.profile_logged_cpu_moe_fallback = true;
-                        log.info("PROFILE_FALLBACK: cpu_moe pos={d} layer={d} gate={s} up={s} down={s} q4k_moe={} q5k_moe={} softmax_topk={} weighted_acc={}", .{
-                            state.position,
-                            layer,
-                            @tagName(gate_quant),
-                            @tagName(up_exps.info.type_),
-                            @tagName(down_quant),
-                            self.dmmv.moePipelineForType(gate_quant) != null,
-                            self.dmmv.moePipelineForType(down_quant) != null,
-                            self.elementwise.pipeline_softmax_topk != null,
-                            self.elementwise.pipeline_moe_weighted_acc != null,
-                        });
-                    }
-                    // === CPU fallback: readback router logits, CPU softmax+topk ===
-                    var expert_ids: [16]u32 = undefined;
-                    var expert_weights: [16]f32 = undefined;
-                    const diag_router_check = self.validation_diagnostics_enabled and config.architecture == .gpt_oss and collect_output and state.generated_tokens.items.len == 0 and hidden_dim <= 8192;
-                    {
-                        const barrier = vk.c.VkMemoryBarrier{
-                            .sType = vk.c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                            .pNext = null,
-                            .srcAccessMask = vk.c.VK_ACCESS_SHADER_WRITE_BIT,
-                            .dstAccessMask = vk.c.VK_ACCESS_TRANSFER_READ_BIT,
-                        };
-                        vk.c.vkCmdPipelineBarrier(self.decode_cmd.handle, vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, null, 0, null);
-                        const router_size = @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32);
-                        const region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = router_size };
-                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.router_logits_buf.handle, self.router_staging.handle, 1, &region);
-                        if (diag_router_check) {
-                            const input_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = hidden_size };
-                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, router_input_buf.handle, self.embed_staging.handle, 1, &input_region);
-                        }
-                    }
-                    try self.decode_cmd.end();
-                    try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-                    const router_ptr: [*]f32 = @ptrCast(@alignCast(self.router_staging.mapped.?));
-                    const router_logits = router_ptr[0..config.n_experts];
-                    if (lt.ffn_gate_inp_bias) |bias| {
-                        addBiasFromTensor(self, router_ptr, bias, config.n_experts);
-                    }
-                    if (diag_router_check) {
-                        const input_ptr: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
-                        const router_input = input_ptr[0..hidden_dim];
-                        const mmap = self.model.mmap_data orelse return error.NoMmapData;
-                        const router_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + router_tensor.info.offset);
-                        var cpu_row_buf: [8192]f32 = undefined;
-                        const cpu_router = try self.allocator.alloc(f32, config.n_experts);
-                        defer self.allocator.free(cpu_router);
-                        var router_max_diff: f32 = 0;
-                        var router_max_idx: usize = 0;
-                        var gpu_top_idx: usize = 0;
-                        var cpu_top_idx: usize = 0;
-                        var gpu_top_val: f32 = -std.math.inf(f32);
-                        var cpu_top_val: f32 = -std.math.inf(f32);
-
-                        for (0..config.n_experts) |row| {
-                            dequantRow(mmap[router_off..], @intCast(row), hidden_dim, router_tensor.info.type_, cpu_row_buf[0..hidden_dim]);
-                            var dot: f64 = 0;
-                            for (0..hidden_dim) |i| dot += @as(f64, cpu_row_buf[i]) * @as(f64, router_input[i]);
-                            cpu_router[row] = @floatCast(dot);
-                        }
-                        if (lt.ffn_gate_inp_bias) |bias| {
-                            addBiasFromTensor(self, cpu_router.ptr, bias, config.n_experts);
-                        }
-                        for (0..config.n_experts) |i| {
-                            const gpu_val = router_logits[i];
-                            const cpu_val = cpu_router[i];
-                            const diff = @abs(gpu_val - cpu_val);
-                            if (diff > router_max_diff) {
-                                router_max_diff = diff;
-                                router_max_idx = i;
-                            }
-                            if (gpu_val > gpu_top_val) {
-                                gpu_top_val = gpu_val;
-                                gpu_top_idx = i;
-                            }
-                            if (cpu_val > cpu_top_val) {
-                                cpu_top_val = cpu_val;
-                                cpu_top_idx = i;
-                            }
-                        }
-                        log.info("ROUTER_CHECK L{d} pos={d}: type={s} max_diff={d:.6} idx={d} gpu_top={d}({d:.6}) cpu_top={d}({d:.6})", .{
-                            layer,
-                            state.position,
-                            @tagName(router_tensor.info.type_),
-                            router_max_diff,
-                            router_max_idx,
-                            gpu_top_idx,
-                            gpu_top_val,
-                            cpu_top_idx,
-                            cpu_top_val,
-                        });
-                    }
-                    if (config.architecture == .gpt_oss) {
-                        topKSoftmaxWeight(router_logits, n_used, expert_ids[0..n_used], expert_weights[0..n_used]);
-                    } else {
-                        topKSoftmax(router_logits, n_used, expert_ids[0..n_used], expert_weights[0..n_used]);
-                    }
-
-                    // New command buffer for expert FFN dispatch
-                    if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-                    try self.decode_cmd.reset();
-                    try self.decode_cmd.begin();
-
-                    var cpu_moe_accum_opt: ?[]f32 = null;
-                    defer if (cpu_moe_accum_opt) |buf| self.allocator.free(buf);
-                    const diag_moe_detail = self.validation_diagnostics_enabled and config.architecture == .gpt_oss and collect_output and state.generated_tokens.items.len == 0;
-                    if (diag_moe_detail) {
-                        cpu_moe_accum_opt = try self.allocator.alloc(f32, hidden_dim);
-                        @memset(cpu_moe_accum_opt.?, 0);
-                    }
-
-                    const gemma_batched_cpu_moe =
+                    const gemma_gpu_topk_down_q5_1 =
+                        down_exps.info.type_ == .q5_1 and
+                        self.dmmv.pipeline_q5_1_moe_fused_down_acc_scaled != null;
+                    const gemma_gpu_topk_down_q8_0 =
+                        down_exps.info.type_ == .q8_0 and
+                        self.dmmv.pipeline_q8_0_moe_fused_down_acc_scaled != null;
+                    const gemma_gpu_topk_moe =
                         config.architecture == .gemma and
                         fused_gate_up != null and
                         gate_exps.info.type_ == .q4_k and
                         up_exps.info.type_ == .q4_k and
-                        down_exps.info.type_ == .q5_1 and
+                        (gemma_gpu_topk_down_q5_1 or gemma_gpu_topk_down_q8_0) and
+                        lt.ffn_gate_inp_bias == null and
                         lt.ffn_gate_exps_bias == null and
                         lt.ffn_up_exps_bias == null and
                         lt.ffn_down_exps_bias == null and
-                        cpu_moe_accum_opt == null and
-                        !diag_moe_detail and
-                        self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu != null and
-                        self.dmmv.pipeline_q5_1_moe_fused_down_acc != null;
-                    if (state.position == 0 and layer == 0 and gemma_batched_cpu_moe) {
-                        log.info("FASTPATH: Gemma batched CPU-topk MoE ENABLED (q4k gate+up+geglu, q5_1 fused down+acc, n_used={d})", .{n_used});
-                    }
+                        lt.ffn_down_exps_scale != null and
+                        self.elementwise.pipeline_softmax_topk != null and
+                        self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu != null;
 
-                    if (gemma_batched_cpu_moe) {
-                        const routing_u32: [*]u32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
-                        for (0..n_used) |ei| {
-                            routing_u32[ei] = expert_ids[ei];
-                            var weight = expert_weights[ei];
-                            if (lt.ffn_down_exps_scale) |scale_t| {
-                                if (self.model.mmap_data) |mmap| {
-                                    const off = self.model.gguf_file.tensor_data_offset + scale_t.info.offset + @as(u64, expert_ids[ei]) * @sizeOf(f32);
-                                    if (off + @sizeOf(f32) <= mmap.len) {
-                                        const s_ptr: *const f32 = @ptrCast(@alignCast(mmap.ptr + off));
-                                        weight *= s_ptr.*;
-                                    }
-                                }
-                            }
-                            routing_u32[n_used + ei] = @bitCast(weight);
+                    if (gemma_gpu_topk_moe) {
+                        if (state.position == 0 and layer == 0) {
+                            log.info("FASTPATH: Gemma GPU-topk MoE ENABLED (q4k gate+up+geglu, scaled fused down+acc, n_used={d})", .{n_used});
                         }
-                        vk.c.vkCmdCopyBuffer(
-                            self.decode_cmd.handle,
-                            self.embed_staging.handle,
+                        const moe_topk_phase = self.beginProfilePhase();
+                        try self.dispatchSoftmaxTopk(
+                            self.router_logits_buf.handle,
+                            @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32),
                             self.router_output_buf.handle,
-                            1,
-                            &vk.c.VkBufferCopy{
-                                .srcOffset = 0,
-                                .dstOffset = 0,
-                                .size = @as(vk.c.VkDeviceSize, n_used) * 2 * @sizeOf(u32),
-                            },
+                            self.router_output_buf.size,
+                            config.n_experts,
+                            n_used,
                         );
-                        self.decode_cmd.transferToComputeBarrier();
+                        self.decode_cmd.computeBufferBarrier(self.router_output_buf.handle, self.router_output_buf.size);
+                        self.endProfilePhase(.moe_topk, moe_topk_phase);
 
+                        const moe_gate_up_phase = self.beginProfilePhase();
                         try self.dispatchDmmvMoeFusedGateUpGeglu(
                             gate_exps,
                             expert_input_buf,
@@ -7314,248 +7191,334 @@ pub const InferenceEngine = struct {
                             n_used,
                         );
                         self.decode_cmd.computeBarrier();
+                        self.endProfilePhase(.moe_gate_up, moe_gate_up_phase);
 
-                        try self.dispatchDmmvQ5_1MoeFusedDownAcc(
-                            down_exps,
-                            self.swiglu_buf,
-                            self.swiglu_buf.size,
-                            self.moe_out_buf,
-                            hidden_dim,
-                            inter_dim,
-                            expert_down_row_bytes,
-                            n_used,
-                        );
+                        const moe_down_phase = self.beginProfilePhase();
+                        if (down_exps.info.type_ == .q8_0) {
+                            try self.dispatchDmmvQ8_0MoeFusedDownAccScaled(
+                                down_exps,
+                                self.swiglu_buf,
+                                self.swiglu_buf.size,
+                                self.moe_out_buf,
+                                lt.ffn_down_exps_scale.?,
+                                hidden_dim,
+                                inter_dim,
+                                expert_down_row_bytes,
+                                n_used,
+                            );
+                        } else {
+                            try self.dispatchDmmvQ5_1MoeFusedDownAccScaled(
+                                down_exps,
+                                self.swiglu_buf,
+                                self.swiglu_buf.size,
+                                self.moe_out_buf,
+                                lt.ffn_down_exps_scale.?,
+                                hidden_dim,
+                                inter_dim,
+                                expert_down_row_bytes,
+                                n_used,
+                            );
+                        }
                         self.decode_cmd.computeBarrier();
+                        self.endProfilePhase(.moe_down, moe_down_phase);
                     } else {
-                        // Zero moe_out_buf via fill for the sequential per-expert path.
-                        vk.c.vkCmdFillBuffer(self.decode_cmd.handle, self.moe_out_buf.handle, 0, hidden_size, 0);
-                        self.decode_cmd.transferToComputeBarrier();
-
-                        for (0..n_used) |ei| {
-                            const eid = expert_ids[ei];
-                            var weight = expert_weights[ei];
-                            const gate_offset = eid * expert_gate_row_bytes;
-                            const up_offset = eid * expert_gate_row_bytes + up_base_offset;
-                            const down_offset = eid * expert_down_row_bytes;
-
-                            const gemma_fused_gate_up_geglu =
-                                config.architecture == .gemma and
-                                fused_gate_up != null and
-                                gate_exps.info.type_ == .q4_k and
-                                up_exps.info.type_ == .q4_k and
-                                lt.ffn_gate_exps_bias == null and
-                                lt.ffn_up_exps_bias == null and
-                                self.dmmv.pipeline_q4k_fused_gate_up_geglu != null;
-
-                            // Expert gate/up reads pre_ffw_norm_2 output (Gemma 4) or ffn_norm_buf.
-                            if (gemma_fused_gate_up_geglu) {
-                                try self.dispatchDmmvFusedGateUpGegluOffset(
-                                    gate_exps,
-                                    expert_input_buf,
-                                    hidden_size,
-                                    self.swiglu_buf,
-                                    inter_dim,
-                                    hidden_dim,
-                                    gate_offset,
-                                    up_offset,
-                                );
-                                self.decode_cmd.computeBarrier();
-                            } else {
-                                try self.dispatchDmmvWithOffset(gate_exps, expert_input_buf, hidden_size, self.gate_buf, inter_dim, hidden_dim, gate_offset);
-                                try self.dispatchDmmvWithOffset(up_exps, expert_input_buf, hidden_size, self.up_buf, inter_dim, hidden_dim, up_offset);
-                                if (lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null) {
-                                    self.decode_cmd.computeBarrier();
-                                }
-                                if (lt.ffn_gate_exps_bias) |bias| {
-                                    try self.dispatchBiasAddSlice(self.gate_buf.handle, self.gate_buf.size, bias, eid * inter_dim, inter_dim);
-                                }
-                                if (lt.ffn_up_exps_bias) |bias| {
-                                    try self.dispatchBiasAddSlice(self.up_buf.handle, self.up_buf.size, bias, eid * inter_dim, inter_dim);
-                                }
-                                self.decode_cmd.computeBarrier();
-
-                                try self.dispatchFfnActivation(
-                                    self.gate_buf.handle,
-                                    self.gate_buf.size,
-                                    self.up_buf.handle,
-                                    self.up_buf.size,
-                                    self.swiglu_buf.handle,
-                                    self.swiglu_buf.size,
-                                    inter_dim,
-                                );
-                                self.decode_cmd.computeBarrier();
+                        if (self.profile_enabled) self.profile_token_counters.cpu_moe_fallbacks += 1;
+                        if (self.profile_enabled and !self.profile_logged_cpu_moe_fallback) {
+                            self.profile_logged_cpu_moe_fallback = true;
+                            log.info("PROFILE_FALLBACK: cpu_moe pos={d} layer={d} gate={s} up={s} down={s} q4k_moe={} q5k_moe={} softmax_topk={} weighted_acc={}", .{
+                                state.position,
+                                layer,
+                                @tagName(gate_quant),
+                                @tagName(up_exps.info.type_),
+                                @tagName(down_quant),
+                                self.dmmv.moePipelineForType(gate_quant) != null,
+                                self.dmmv.moePipelineForType(down_quant) != null,
+                                self.elementwise.pipeline_softmax_topk != null,
+                                self.elementwise.pipeline_moe_weighted_acc != null,
+                            });
+                        }
+                        // === CPU fallback: readback router logits, CPU softmax+topk ===
+                        var expert_ids: [16]u32 = undefined;
+                        var expert_weights: [16]f32 = undefined;
+                        const diag_router_check = self.validation_diagnostics_enabled and config.architecture == .gpt_oss and collect_output and state.generated_tokens.items.len == 0 and hidden_dim <= 8192;
+                        {
+                            const barrier = vk.c.VkMemoryBarrier{
+                                .sType = vk.c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                .pNext = null,
+                                .srcAccessMask = vk.c.VK_ACCESS_SHADER_WRITE_BIT,
+                                .dstAccessMask = vk.c.VK_ACCESS_TRANSFER_READ_BIT,
+                            };
+                            vk.c.vkCmdPipelineBarrier(self.decode_cmd.handle, vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, null, 0, null);
+                            const router_size = @as(vk.c.VkDeviceSize, config.n_experts) * @sizeOf(f32);
+                            const region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = router_size };
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.router_logits_buf.handle, self.router_staging.handle, 1, &region);
+                            if (diag_router_check) {
+                                const input_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = hidden_size };
+                                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, router_input_buf.handle, self.embed_staging.handle, 1, &input_region);
                             }
+                        }
+                        try self.decode_cmd.end();
+                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+                        const router_ptr: [*]f32 = @ptrCast(@alignCast(self.router_staging.mapped.?));
+                        const router_logits = router_ptr[0..config.n_experts];
+                        if (lt.ffn_gate_inp_bias) |bias| {
+                            addBiasFromTensor(self, router_ptr, bias, config.n_experts);
+                        }
+                        if (diag_router_check) {
+                            const input_ptr: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
+                            const router_input = input_ptr[0..hidden_dim];
+                            const mmap = self.model.mmap_data orelse return error.NoMmapData;
+                            const router_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + router_tensor.info.offset);
+                            var cpu_row_buf: [8192]f32 = undefined;
+                            const cpu_router = try self.allocator.alloc(f32, config.n_experts);
+                            defer self.allocator.free(cpu_router);
+                            var router_max_diff: f32 = 0;
+                            var router_max_idx: usize = 0;
+                            var gpu_top_idx: usize = 0;
+                            var cpu_top_idx: usize = 0;
+                            var gpu_top_val: f32 = -std.math.inf(f32);
+                            var cpu_top_val: f32 = -std.math.inf(f32);
 
-                            if (diag_moe_detail and ei == 0) {
-                                const inter_bytes = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
-                                const up_off = inter_bytes;
-                                const swiglu_off = up_off + inter_bytes;
-
-                                try self.decode_cmd.end();
-                                try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                                try self.decode_cmd.reset();
-                                try self.decode_cmd.begin();
-                                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.gate_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                                    .srcOffset = 0,
-                                    .dstOffset = 0,
-                                    .size = inter_bytes,
-                                });
-                                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.up_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                                    .srcOffset = 0,
-                                    .dstOffset = up_off,
-                                    .size = inter_bytes,
-                                });
-                                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                                    .srcOffset = 0,
-                                    .dstOffset = swiglu_off,
-                                    .size = inter_bytes,
-                                });
-                                try self.decode_cmd.end();
-                                try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                                const dbg_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
-                                const gate_vals = dbg_ptr[0..inter_dim];
-                                const up_vals = dbg_ptr[@intCast(up_off / @sizeOf(f32))..][0..inter_dim];
-                                const gpu_swiglu = dbg_ptr[@intCast(swiglu_off / @sizeOf(f32))..][0..inter_dim];
-                                const cpu_swiglu = try self.allocator.alloc(f32, inter_dim);
-                                defer self.allocator.free(cpu_swiglu);
-                                cpuSwiGLUOai(gate_vals, up_vals, cpu_swiglu);
-
-                                var swiglu_max_diff: f32 = 0;
-                                for (0..inter_dim) |i| {
-                                    const diff = @abs(gpu_swiglu[i] - cpu_swiglu[i]);
-                                    if (diff > swiglu_max_diff) swiglu_max_diff = diff;
-                                }
-                                log.info("SWIGLU_OAI_CHECK L{d} E{d}: max_diff={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
-                                    layer,
-                                    eid,
-                                    swiglu_max_diff,
-                                    gpu_swiglu[0],
-                                    gpu_swiglu[1],
-                                    gpu_swiglu[2],
-                                    gpu_swiglu[3],
-                                    cpu_swiglu[0],
-                                    cpu_swiglu[1],
-                                    cpu_swiglu[2],
-                                    cpu_swiglu[3],
-                                });
-
-                                if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-                                try self.decode_cmd.reset();
-                                try self.decode_cmd.begin();
+                            for (0..config.n_experts) |row| {
+                                dequantRow(mmap[router_off..], @intCast(row), hidden_dim, router_tensor.info.type_, cpu_row_buf[0..hidden_dim]);
+                                var dot: f64 = 0;
+                                for (0..hidden_dim) |i| dot += @as(f64, cpu_row_buf[i]) * @as(f64, router_input[i]);
+                                cpu_router[row] = @floatCast(dot);
                             }
+                            if (lt.ffn_gate_inp_bias) |bias| {
+                                addBiasFromTensor(self, cpu_router.ptr, bias, config.n_experts);
+                            }
+                            for (0..config.n_experts) |i| {
+                                const gpu_val = router_logits[i];
+                                const cpu_val = cpu_router[i];
+                                const diff = @abs(gpu_val - cpu_val);
+                                if (diff > router_max_diff) {
+                                    router_max_diff = diff;
+                                    router_max_idx = i;
+                                }
+                                if (gpu_val > gpu_top_val) {
+                                    gpu_top_val = gpu_val;
+                                    gpu_top_idx = i;
+                                }
+                                if (cpu_val > cpu_top_val) {
+                                    cpu_top_val = cpu_val;
+                                    cpu_top_idx = i;
+                                }
+                            }
+                            log.info("ROUTER_CHECK L{d} pos={d}: type={s} max_diff={d:.6} idx={d} gpu_top={d}({d:.6}) cpu_top={d}({d:.6})", .{
+                                layer,
+                                state.position,
+                                @tagName(router_tensor.info.type_),
+                                router_max_diff,
+                                router_max_idx,
+                                gpu_top_idx,
+                                gpu_top_val,
+                                cpu_top_idx,
+                                cpu_top_val,
+                            });
+                        }
+                        if (config.architecture == .gpt_oss) {
+                            topKSoftmaxWeight(router_logits, n_used, expert_ids[0..n_used], expert_weights[0..n_used]);
+                        } else {
+                            topKSoftmax(router_logits, n_used, expert_ids[0..n_used], expert_weights[0..n_used]);
+                        }
 
-                            // Gemma 4 MoE: fold per-expert ffn_down_exps.scale into the accumulation weight.
-                            // down[i] *= scales[eid] then weight*down == (weight*scales[eid]) * down.
-                            if (lt.ffn_down_exps_scale) |scale_t| {
-                                // Read the scalar for this expert from CPU-mapped mmap if available.
-                                if (self.model.mmap_data) |mmap| {
-                                    const off = self.model.gguf_file.tensor_data_offset + scale_t.info.offset + @as(u64, eid) * @sizeOf(f32);
-                                    if (off + @sizeOf(f32) <= mmap.len) {
-                                        const s_ptr: *const f32 = @ptrCast(@alignCast(mmap.ptr + off));
-                                        weight *= s_ptr.*;
+                        // New command buffer for expert FFN dispatch
+                        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+                        try self.decode_cmd.reset();
+                        try self.decode_cmd.begin();
+
+                        var cpu_moe_accum_opt: ?[]f32 = null;
+                        defer if (cpu_moe_accum_opt) |buf| self.allocator.free(buf);
+                        const diag_moe_detail = self.validation_diagnostics_enabled and config.architecture == .gpt_oss and collect_output and state.generated_tokens.items.len == 0;
+                        if (diag_moe_detail) {
+                            cpu_moe_accum_opt = try self.allocator.alloc(f32, hidden_dim);
+                            @memset(cpu_moe_accum_opt.?, 0);
+                        }
+
+                        const gemma_batched_cpu_moe =
+                            config.architecture == .gemma and
+                            fused_gate_up != null and
+                            gate_exps.info.type_ == .q4_k and
+                            up_exps.info.type_ == .q4_k and
+                            down_exps.info.type_ == .q5_1 and
+                            lt.ffn_gate_exps_bias == null and
+                            lt.ffn_up_exps_bias == null and
+                            lt.ffn_down_exps_bias == null and
+                            cpu_moe_accum_opt == null and
+                            !diag_moe_detail and
+                            self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu != null and
+                            self.dmmv.pipeline_q5_1_moe_fused_down_acc != null;
+                        if (state.position == 0 and layer == 0 and gemma_batched_cpu_moe) {
+                            log.info("FASTPATH: Gemma batched CPU-topk MoE ENABLED (q4k gate+up+geglu, q5_1 fused down+acc, n_used={d})", .{n_used});
+                        }
+
+                        if (gemma_batched_cpu_moe) {
+                            const routing_u32: [*]u32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
+                            for (0..n_used) |ei| {
+                                routing_u32[ei] = expert_ids[ei];
+                                var weight = expert_weights[ei];
+                                if (lt.ffn_down_exps_scale) |scale_t| {
+                                    if (self.model.mmap_data) |mmap| {
+                                        const off = self.model.gguf_file.tensor_data_offset + scale_t.info.offset + @as(u64, expert_ids[ei]) * @sizeOf(f32);
+                                        if (off + @sizeOf(f32) <= mmap.len) {
+                                            const s_ptr: *const f32 = @ptrCast(@alignCast(mmap.ptr + off));
+                                            weight *= s_ptr.*;
+                                        }
                                     }
                                 }
+                                routing_u32[n_used + ei] = @bitCast(weight);
                             }
+                            vk.c.vkCmdCopyBuffer(
+                                self.decode_cmd.handle,
+                                self.embed_staging.handle,
+                                self.router_output_buf.handle,
+                                1,
+                                &vk.c.VkBufferCopy{
+                                    .srcOffset = 0,
+                                    .dstOffset = 0,
+                                    .size = @as(vk.c.VkDeviceSize, n_used) * 2 * @sizeOf(u32),
+                                },
+                            );
+                            self.decode_cmd.transferToComputeBarrier();
 
-                            const gemma_fused_down_acc =
-                                config.architecture == .gemma and
-                                down_exps.info.type_ == .q5_1 and
-                                lt.ffn_down_exps_bias == null and
-                                cpu_moe_accum_opt == null and
-                                !diag_moe_detail and
-                                self.dmmv.pipeline_q5_1_acc != null;
+                            try self.dispatchDmmvMoeFusedGateUpGeglu(
+                                gate_exps,
+                                expert_input_buf,
+                                hidden_size,
+                                self.swiglu_buf,
+                                inter_dim,
+                                hidden_dim,
+                                expert_gate_row_bytes,
+                                up_base_offset,
+                                n_used,
+                            );
+                            self.decode_cmd.computeBarrier();
 
-                            if (gemma_fused_down_acc) {
-                                try self.dispatchDmmvQ5_1AccOffset(
-                                    down_exps,
-                                    self.swiglu_buf,
-                                    self.swiglu_buf.size,
-                                    self.moe_out_buf,
-                                    hidden_dim,
-                                    inter_dim,
-                                    down_offset,
-                                    weight,
-                                );
-                                self.decode_cmd.computeBarrier();
-                            } else {
-                                try self.dispatchDmmvWithOffset(down_exps, self.swiglu_buf, self.swiglu_buf.size, self.down_buf, hidden_dim, inter_dim, down_offset);
-                                if (lt.ffn_down_exps_bias) |bias| {
+                            try self.dispatchDmmvQ5_1MoeFusedDownAcc(
+                                down_exps,
+                                self.swiglu_buf,
+                                self.swiglu_buf.size,
+                                self.moe_out_buf,
+                                hidden_dim,
+                                inter_dim,
+                                expert_down_row_bytes,
+                                n_used,
+                            );
+                            self.decode_cmd.computeBarrier();
+                        } else {
+                            // Zero moe_out_buf via fill for the sequential per-expert path.
+                            vk.c.vkCmdFillBuffer(self.decode_cmd.handle, self.moe_out_buf.handle, 0, hidden_size, 0);
+                            self.decode_cmd.transferToComputeBarrier();
+
+                            for (0..n_used) |ei| {
+                                const eid = expert_ids[ei];
+                                var weight = expert_weights[ei];
+                                const gate_offset = eid * expert_gate_row_bytes;
+                                const up_offset = eid * expert_gate_row_bytes + up_base_offset;
+                                const down_offset = eid * expert_down_row_bytes;
+
+                                const gemma_fused_gate_up_geglu =
+                                    config.architecture == .gemma and
+                                    fused_gate_up != null and
+                                    gate_exps.info.type_ == .q4_k and
+                                    up_exps.info.type_ == .q4_k and
+                                    lt.ffn_gate_exps_bias == null and
+                                    lt.ffn_up_exps_bias == null and
+                                    self.dmmv.pipeline_q4k_fused_gate_up_geglu != null;
+
+                                // Expert gate/up reads pre_ffw_norm_2 output (Gemma 4) or ffn_norm_buf.
+                                if (gemma_fused_gate_up_geglu) {
+                                    try self.dispatchDmmvFusedGateUpGegluOffset(
+                                        gate_exps,
+                                        expert_input_buf,
+                                        hidden_size,
+                                        self.swiglu_buf,
+                                        inter_dim,
+                                        hidden_dim,
+                                        gate_offset,
+                                        up_offset,
+                                    );
                                     self.decode_cmd.computeBarrier();
-                                    try self.dispatchBiasAddSlice(self.down_buf.handle, hidden_size, bias, eid * hidden_dim, hidden_dim);
+                                } else {
+                                    try self.dispatchDmmvWithOffset(gate_exps, expert_input_buf, hidden_size, self.gate_buf, inter_dim, hidden_dim, gate_offset);
+                                    try self.dispatchDmmvWithOffset(up_exps, expert_input_buf, hidden_size, self.up_buf, inter_dim, hidden_dim, up_offset);
+                                    if (lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null) {
+                                        self.decode_cmd.computeBarrier();
+                                    }
+                                    if (lt.ffn_gate_exps_bias) |bias| {
+                                        try self.dispatchBiasAddSlice(self.gate_buf.handle, self.gate_buf.size, bias, eid * inter_dim, inter_dim);
+                                    }
+                                    if (lt.ffn_up_exps_bias) |bias| {
+                                        try self.dispatchBiasAddSlice(self.up_buf.handle, self.up_buf.size, bias, eid * inter_dim, inter_dim);
+                                    }
+                                    self.decode_cmd.computeBarrier();
+
+                                    try self.dispatchFfnActivation(
+                                        self.gate_buf.handle,
+                                        self.gate_buf.size,
+                                        self.up_buf.handle,
+                                        self.up_buf.size,
+                                        self.swiglu_buf.handle,
+                                        self.swiglu_buf.size,
+                                        inter_dim,
+                                    );
+                                    self.decode_cmd.computeBarrier();
                                 }
-                                self.decode_cmd.computeBarrier();
 
                                 if (diag_moe_detail and ei == 0) {
                                     const inter_bytes = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
-                                    const hidden_bytes = @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
-                                    const down_off = inter_bytes;
+                                    const up_off = inter_bytes;
+                                    const swiglu_off = up_off + inter_bytes;
 
                                     try self.decode_cmd.end();
                                     try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
                                     try self.decode_cmd.reset();
                                     try self.decode_cmd.begin();
-                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.gate_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
                                         .srcOffset = 0,
                                         .dstOffset = 0,
                                         .size = inter_bytes,
                                     });
-                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.up_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
                                         .srcOffset = 0,
-                                        .dstOffset = down_off,
-                                        .size = hidden_bytes,
+                                        .dstOffset = up_off,
+                                        .size = inter_bytes,
+                                    });
+                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                        .srcOffset = 0,
+                                        .dstOffset = swiglu_off,
+                                        .size = inter_bytes,
                                     });
                                     try self.decode_cmd.end();
                                     try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
                                     const dbg_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
-                                    const swiglu_vals = dbg_ptr[0..inter_dim];
-                                    const gpu_down = dbg_ptr[@intCast(down_off / @sizeOf(f32))..][0..hidden_dim];
-                                    const mmap = self.model.mmap_data orelse return error.NoMmapData;
-                                    const down_base_off: usize = @as(usize, @intCast(self.model.gguf_file.tensor_data_offset + down_exps.info.offset));
-                                    const down_data_off = down_base_off + @as(usize, down_offset);
-                                    const cpu_row_buf = try self.allocator.alloc(f32, inter_dim);
-                                    defer self.allocator.free(cpu_row_buf);
-                                    const cpu_down = try self.allocator.alloc(f32, hidden_dim);
-                                    defer self.allocator.free(cpu_down);
+                                    const gate_vals = dbg_ptr[0..inter_dim];
+                                    const up_vals = dbg_ptr[@intCast(up_off / @sizeOf(f32))..][0..inter_dim];
+                                    const gpu_swiglu = dbg_ptr[@intCast(swiglu_off / @sizeOf(f32))..][0..inter_dim];
+                                    const cpu_swiglu = try self.allocator.alloc(f32, inter_dim);
+                                    defer self.allocator.free(cpu_swiglu);
+                                    cpuSwiGLUOai(gate_vals, up_vals, cpu_swiglu);
 
-                                    for (0..hidden_dim) |row| {
-                                        dequantRow(mmap[down_data_off..], @intCast(row), inter_dim, down_exps.info.type_, cpu_row_buf);
-                                        var dot: f64 = 0;
-                                        for (0..inter_dim) |i| dot += @as(f64, cpu_row_buf[i]) * @as(f64, swiglu_vals[i]);
-                                        cpu_down[row] = @floatCast(dot);
+                                    var swiglu_max_diff: f32 = 0;
+                                    for (0..inter_dim) |i| {
+                                        const diff = @abs(gpu_swiglu[i] - cpu_swiglu[i]);
+                                        if (diff > swiglu_max_diff) swiglu_max_diff = diff;
                                     }
-                                    if (lt.ffn_down_exps_bias) |bias| {
-                                        addBiasFromTensorSlice(self, cpu_down.ptr, bias, eid * hidden_dim, hidden_dim);
-                                    }
-
-                                    var down_max_diff: f32 = 0;
-                                    var down_max_idx: usize = 0;
-                                    for (0..hidden_dim) |i| {
-                                        const diff = @abs(gpu_down[i] - cpu_down[i]);
-                                        if (diff > down_max_diff) {
-                                            down_max_diff = diff;
-                                            down_max_idx = i;
-                                        }
-                                    }
-                                    log.info("DOWN_EXPERT_CHECK L{d} E{d}: max_diff={d:.6} idx={d} gpu_max={d:.6} cpu_max={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] type={s}", .{
+                                    log.info("SWIGLU_OAI_CHECK L{d} E{d}: max_diff={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
                                         layer,
                                         eid,
-                                        down_max_diff,
-                                        down_max_idx,
-                                        gpu_down[down_max_idx],
-                                        cpu_down[down_max_idx],
-                                        gpu_down[0],
-                                        gpu_down[1],
-                                        gpu_down[2],
-                                        gpu_down[3],
-                                        cpu_down[0],
-                                        cpu_down[1],
-                                        cpu_down[2],
-                                        cpu_down[3],
-                                        @tagName(down_exps.info.type_),
+                                        swiglu_max_diff,
+                                        gpu_swiglu[0],
+                                        gpu_swiglu[1],
+                                        gpu_swiglu[2],
+                                        gpu_swiglu[3],
+                                        cpu_swiglu[0],
+                                        cpu_swiglu[1],
+                                        cpu_swiglu[2],
+                                        cpu_swiglu[3],
                                     });
 
                                     if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
@@ -7563,84 +7526,202 @@ pub const InferenceEngine = struct {
                                     try self.decode_cmd.begin();
                                 }
 
-                                if (cpu_moe_accum_opt) |cpu_moe_accum| {
-                                    try self.decode_cmd.end();
-                                    try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                                    try self.decode_cmd.reset();
-                                    try self.decode_cmd.begin();
-                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{
-                                        .srcOffset = 0,
-                                        .dstOffset = 0,
-                                        .size = hidden_size,
-                                    });
-                                    try self.decode_cmd.end();
-                                    try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                                    const down_ptr: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
-                                    for (0..hidden_dim) |i| cpu_moe_accum[i] += weight * down_ptr[i];
-
-                                    if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-                                    try self.decode_cmd.reset();
-                                    try self.decode_cmd.begin();
+                                // Gemma 4 MoE: fold per-expert ffn_down_exps.scale into the accumulation weight.
+                                // down[i] *= scales[eid] then weight*down == (weight*scales[eid]) * down.
+                                if (lt.ffn_down_exps_scale) |scale_t| {
+                                    // Read the scalar for this expert from CPU-mapped mmap if available.
+                                    if (self.model.mmap_data) |mmap| {
+                                        const off = self.model.gguf_file.tensor_data_offset + scale_t.info.offset + @as(u64, eid) * @sizeOf(f32);
+                                        if (off + @sizeOf(f32) <= mmap.len) {
+                                            const s_ptr: *const f32 = @ptrCast(@alignCast(mmap.ptr + off));
+                                            weight *= s_ptr.*;
+                                        }
+                                    }
                                 }
 
-                                try self.dispatchScaleAcc(
-                                    self.moe_out_buf.handle,
-                                    hidden_size,
-                                    self.down_buf.handle,
-                                    hidden_size,
-                                    hidden_dim,
-                                    weight,
-                                );
-                                self.decode_cmd.computeBarrier();
+                                const gemma_fused_down_acc =
+                                    config.architecture == .gemma and
+                                    down_exps.info.type_ == .q5_1 and
+                                    lt.ffn_down_exps_bias == null and
+                                    cpu_moe_accum_opt == null and
+                                    !diag_moe_detail and
+                                    self.dmmv.pipeline_q5_1_acc != null;
+
+                                if (gemma_fused_down_acc) {
+                                    try self.dispatchDmmvQ5_1AccOffset(
+                                        down_exps,
+                                        self.swiglu_buf,
+                                        self.swiglu_buf.size,
+                                        self.moe_out_buf,
+                                        hidden_dim,
+                                        inter_dim,
+                                        down_offset,
+                                        weight,
+                                    );
+                                    self.decode_cmd.computeBarrier();
+                                } else {
+                                    try self.dispatchDmmvWithOffset(down_exps, self.swiglu_buf, self.swiglu_buf.size, self.down_buf, hidden_dim, inter_dim, down_offset);
+                                    if (lt.ffn_down_exps_bias) |bias| {
+                                        self.decode_cmd.computeBarrier();
+                                        try self.dispatchBiasAddSlice(self.down_buf.handle, hidden_size, bias, eid * hidden_dim, hidden_dim);
+                                    }
+                                    self.decode_cmd.computeBarrier();
+
+                                    if (diag_moe_detail and ei == 0) {
+                                        const inter_bytes = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
+                                        const hidden_bytes = @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
+                                        const down_off = inter_bytes;
+
+                                        try self.decode_cmd.end();
+                                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                                        try self.decode_cmd.reset();
+                                        try self.decode_cmd.begin();
+                                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                            .srcOffset = 0,
+                                            .dstOffset = 0,
+                                            .size = inter_bytes,
+                                        });
+                                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                            .srcOffset = 0,
+                                            .dstOffset = down_off,
+                                            .size = hidden_bytes,
+                                        });
+                                        try self.decode_cmd.end();
+                                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                                        const dbg_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+                                        const swiglu_vals = dbg_ptr[0..inter_dim];
+                                        const gpu_down = dbg_ptr[@intCast(down_off / @sizeOf(f32))..][0..hidden_dim];
+                                        const mmap = self.model.mmap_data orelse return error.NoMmapData;
+                                        const down_base_off: usize = @as(usize, @intCast(self.model.gguf_file.tensor_data_offset + down_exps.info.offset));
+                                        const down_data_off = down_base_off + @as(usize, down_offset);
+                                        const cpu_row_buf = try self.allocator.alloc(f32, inter_dim);
+                                        defer self.allocator.free(cpu_row_buf);
+                                        const cpu_down = try self.allocator.alloc(f32, hidden_dim);
+                                        defer self.allocator.free(cpu_down);
+
+                                        for (0..hidden_dim) |row| {
+                                            dequantRow(mmap[down_data_off..], @intCast(row), inter_dim, down_exps.info.type_, cpu_row_buf);
+                                            var dot: f64 = 0;
+                                            for (0..inter_dim) |i| dot += @as(f64, cpu_row_buf[i]) * @as(f64, swiglu_vals[i]);
+                                            cpu_down[row] = @floatCast(dot);
+                                        }
+                                        if (lt.ffn_down_exps_bias) |bias| {
+                                            addBiasFromTensorSlice(self, cpu_down.ptr, bias, eid * hidden_dim, hidden_dim);
+                                        }
+
+                                        var down_max_diff: f32 = 0;
+                                        var down_max_idx: usize = 0;
+                                        for (0..hidden_dim) |i| {
+                                            const diff = @abs(gpu_down[i] - cpu_down[i]);
+                                            if (diff > down_max_diff) {
+                                                down_max_diff = diff;
+                                                down_max_idx = i;
+                                            }
+                                        }
+                                        log.info("DOWN_EXPERT_CHECK L{d} E{d}: max_diff={d:.6} idx={d} gpu_max={d:.6} cpu_max={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] type={s}", .{
+                                            layer,
+                                            eid,
+                                            down_max_diff,
+                                            down_max_idx,
+                                            gpu_down[down_max_idx],
+                                            cpu_down[down_max_idx],
+                                            gpu_down[0],
+                                            gpu_down[1],
+                                            gpu_down[2],
+                                            gpu_down[3],
+                                            cpu_down[0],
+                                            cpu_down[1],
+                                            cpu_down[2],
+                                            cpu_down[3],
+                                            @tagName(down_exps.info.type_),
+                                        });
+
+                                        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+                                        try self.decode_cmd.reset();
+                                        try self.decode_cmd.begin();
+                                    }
+
+                                    if (cpu_moe_accum_opt) |cpu_moe_accum| {
+                                        try self.decode_cmd.end();
+                                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                                        try self.decode_cmd.reset();
+                                        try self.decode_cmd.begin();
+                                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{
+                                            .srcOffset = 0,
+                                            .dstOffset = 0,
+                                            .size = hidden_size,
+                                        });
+                                        try self.decode_cmd.end();
+                                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                                        const down_ptr: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
+                                        for (0..hidden_dim) |i| cpu_moe_accum[i] += weight * down_ptr[i];
+
+                                        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+                                        try self.decode_cmd.reset();
+                                        try self.decode_cmd.begin();
+                                    }
+
+                                    try self.dispatchScaleAcc(
+                                        self.moe_out_buf.handle,
+                                        hidden_size,
+                                        self.down_buf.handle,
+                                        hidden_size,
+                                        hidden_dim,
+                                        weight,
+                                    );
+                                    self.decode_cmd.computeBarrier();
+                                }
                             }
                         }
-                    }
 
-                    if (cpu_moe_accum_opt) |cpu_moe_accum| {
-                        try self.decode_cmd.end();
-                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+                        if (cpu_moe_accum_opt) |cpu_moe_accum| {
+                            try self.decode_cmd.end();
+                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
-                        try self.decode_cmd.reset();
-                        try self.decode_cmd.begin();
-                        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.moe_out_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{
-                            .srcOffset = 0,
-                            .dstOffset = 0,
-                            .size = hidden_size,
-                        });
-                        try self.decode_cmd.end();
-                        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+                            try self.decode_cmd.reset();
+                            try self.decode_cmd.begin();
+                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.moe_out_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{
+                                .srcOffset = 0,
+                                .dstOffset = 0,
+                                .size = hidden_size,
+                            });
+                            try self.decode_cmd.end();
+                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
-                        const gpu_moe_ptr: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
-                        var moe_max_diff: f32 = 0;
-                        var moe_max_idx: usize = 0;
-                        for (0..hidden_dim) |i| {
-                            const diff = @abs(gpu_moe_ptr[i] - cpu_moe_accum[i]);
-                            if (diff > moe_max_diff) {
-                                moe_max_diff = diff;
-                                moe_max_idx = i;
+                            const gpu_moe_ptr: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
+                            var moe_max_diff: f32 = 0;
+                            var moe_max_idx: usize = 0;
+                            for (0..hidden_dim) |i| {
+                                const diff = @abs(gpu_moe_ptr[i] - cpu_moe_accum[i]);
+                                if (diff > moe_max_diff) {
+                                    moe_max_diff = diff;
+                                    moe_max_idx = i;
+                                }
                             }
-                        }
-                        log.info("MOE_ACC_CHECK L{d}: max_diff={d:.6} idx={d} gpu_max={d:.6} cpu_max={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
-                            layer,
-                            moe_max_diff,
-                            moe_max_idx,
-                            gpu_moe_ptr[moe_max_idx],
-                            cpu_moe_accum[moe_max_idx],
-                            gpu_moe_ptr[0],
-                            gpu_moe_ptr[1],
-                            gpu_moe_ptr[2],
-                            gpu_moe_ptr[3],
-                            cpu_moe_accum[0],
-                            cpu_moe_accum[1],
-                            cpu_moe_accum[2],
-                            cpu_moe_accum[3],
-                        });
+                            log.info("MOE_ACC_CHECK L{d}: max_diff={d:.6} idx={d} gpu_max={d:.6} cpu_max={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}]", .{
+                                layer,
+                                moe_max_diff,
+                                moe_max_idx,
+                                gpu_moe_ptr[moe_max_idx],
+                                cpu_moe_accum[moe_max_idx],
+                                gpu_moe_ptr[0],
+                                gpu_moe_ptr[1],
+                                gpu_moe_ptr[2],
+                                gpu_moe_ptr[3],
+                                cpu_moe_accum[0],
+                                cpu_moe_accum[1],
+                                cpu_moe_accum[2],
+                                cpu_moe_accum[3],
+                            });
 
-                        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-                        try self.decode_cmd.reset();
-                        try self.decode_cmd.begin();
+                            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+                            try self.decode_cmd.reset();
+                            try self.decode_cmd.begin();
+                        }
                     }
                 }
                 self.endProfilePhase(.moe_routed, moe_phase);
@@ -9106,6 +9187,92 @@ pub const InferenceEngine = struct {
             output_buf.size,
             self.router_output_buf.handle,
             self.router_output_buf.size,
+            (M + 1) / 2,
+            1,
+            1,
+        );
+    }
+
+    /// Gemma GPU-topk MoE tail with ffn_down_exps.scale applied inside the
+    /// fused down+acc shader.
+    fn dispatchDmmvQ5_1MoeFusedDownAccScaled(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        output_buf: Buffer,
+        scale_tensor: *const LoadedTensor,
+        M: u32,
+        K: u32,
+        expert_stride: u32,
+        n_used: u32,
+    ) !void {
+        const pip = &(self.dmmv.pipeline_q5_1_moe_fused_down_acc_scaled orelse return error.ShaderNotLoaded);
+        const push = MoeFusedDownAccPushConstants{
+            .M = M,
+            .K = K,
+            .expert_stride = expert_stride,
+            .x_expert_stride = K,
+            .x_offset = 0,
+            .y_offset = 0,
+            .n_used = n_used,
+        };
+        self.pushDispatch5(
+            pip,
+            std.mem.asBytes(&push),
+            tensor.gpu_buffer.handle,
+            tensor.gpu_buffer.size,
+            input_buf.handle,
+            input_size,
+            output_buf.handle,
+            output_buf.size,
+            self.router_output_buf.handle,
+            self.router_output_buf.size,
+            scale_tensor.gpu_buffer.handle,
+            scale_tensor.gpu_buffer.size,
+            (M + 1) / 2,
+            1,
+            1,
+        );
+    }
+
+    /// Gemma GPU-topk MoE tail for Q8_0 down experts with ffn_down_exps.scale
+    /// applied inside the fused down+acc shader.
+    fn dispatchDmmvQ8_0MoeFusedDownAccScaled(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        output_buf: Buffer,
+        scale_tensor: *const LoadedTensor,
+        M: u32,
+        K: u32,
+        expert_stride: u32,
+        n_used: u32,
+    ) !void {
+        const pip = &(self.dmmv.pipeline_q8_0_moe_fused_down_acc_scaled orelse return error.ShaderNotLoaded);
+        const push = MoeFusedDownAccPushConstants{
+            .M = M,
+            .K = K,
+            .expert_stride = expert_stride,
+            .x_expert_stride = K,
+            .x_offset = 0,
+            .y_offset = 0,
+            .n_used = n_used,
+        };
+        self.pushDispatch5(
+            pip,
+            std.mem.asBytes(&push),
+            tensor.gpu_buffer.handle,
+            tensor.gpu_buffer.size,
+            input_buf.handle,
+            input_size,
+            output_buf.handle,
+            output_buf.size,
+            self.router_output_buf.handle,
+            self.router_output_buf.size,
+            scale_tensor.gpu_buffer.handle,
+            scale_tensor.gpu_buffer.size,
             (M + 1) / 2,
             1,
             1,

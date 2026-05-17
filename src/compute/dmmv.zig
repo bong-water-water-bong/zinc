@@ -362,6 +362,13 @@ pub const DmmvDispatch = struct {
     /// Reads ids/weights from the routing buffer and writes the accumulated
     /// hidden vector directly, replacing per-expert down+acc dispatches.
     pipeline_q5_1_moe_fused_down_acc: ?Pipeline,
+    /// Same as pipeline_q5_1_moe_fused_down_acc, but also reads
+    /// ffn_down_exps.scale on-GPU. This lets Gemma use GPU top-k without
+    /// CPU-side routing weight patch-up.
+    pipeline_q5_1_moe_fused_down_acc_scaled: ?Pipeline,
+    /// Q8_0 sibling of pipeline_q5_1_moe_fused_down_acc_scaled for Gemma
+    /// layers whose down experts are stored as Q8_0.
+    pipeline_q8_0_moe_fused_down_acc_scaled: ?Pipeline,
     /// MoE Q6K pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_q6k_moe: ?Pipeline,
     /// Foundation for future mul_mmq work: quantize an F32 activation into
@@ -729,6 +736,16 @@ pub const DmmvDispatch = struct {
             log.warn("Q5_1 Gemma MoE fused down+acc shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const q5_1_fused_down_acc_scaled_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1_moe_fused_down_acc_scaled.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5_1_moe_fused_down_acc_scaled = pipeline_mod.createFromSpirvWithOptions(instance, q5_1_fused_down_acc_scaled_path, 5, fused_down_acc_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_1 Gemma MoE scaled fused down+acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_0_fused_down_acc_scaled_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_moe_fused_down_acc_scaled.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_moe_fused_down_acc_scaled = pipeline_mod.createFromSpirvWithOptions(instance, q8_0_fused_down_acc_scaled_path, 5, fused_down_acc_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 Gemma MoE scaled fused down+acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         const q5k_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_moe.spv", .{shader_dir}) catch unreachable;
         const pipeline_q5k_moe = pipeline_mod.createFromSpirvWithOptions(instance, q5k_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
@@ -846,6 +863,8 @@ pub const DmmvDispatch = struct {
             .pipeline_q5_1_moe = pipeline_q5_1_moe,
             .pipeline_q5_1_acc = pipeline_q5_1_acc,
             .pipeline_q5_1_moe_fused_down_acc = pipeline_q5_1_moe_fused_down_acc,
+            .pipeline_q5_1_moe_fused_down_acc_scaled = pipeline_q5_1_moe_fused_down_acc_scaled,
+            .pipeline_q8_0_moe_fused_down_acc_scaled = pipeline_q8_0_moe_fused_down_acc_scaled,
             .pipeline_q5k_moe = pipeline_q5k_moe,
             .pipeline_q5k_moe_kpar = pipeline_q5k_moe_kpar,
             .pipeline_q6k_moe = pipeline_q6k_moe,
@@ -1321,6 +1340,8 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5k_moe_kpar) |*p| p.deinit();
         if (self.pipeline_q5_1_acc) |*p| p.deinit();
         if (self.pipeline_q5_1_moe_fused_down_acc) |*p| p.deinit();
+        if (self.pipeline_q5_1_moe_fused_down_acc_scaled) |*p| p.deinit();
+        if (self.pipeline_q8_0_moe_fused_down_acc_scaled) |*p| p.deinit();
         if (self.pipeline_q6k_moe) |*p| p.deinit();
         if (self.pipeline_quantize_q8_1) |*p| p.deinit();
         if (self.pipeline_count_experts) |*p| p.deinit();

@@ -287,7 +287,8 @@ test "Q5_0 and Q5_1 DMMV launch with 2 rows per workgroup" {
 test "GPT-OSS routing keeps SOFTMAX_WEIGHT expert selection path" {
     const src = @embedFile("compute/forward.zig");
     try expectContains(src, "GPT-OSS uses this SOFTMAX_WEIGHT routing rule instead of softmax-over-all-experts.");
-    try expectContains(src, "if (config.architecture == .gpt_oss) {\n                        topKSoftmaxWeight(router_logits, n_used, expert_ids[0..n_used], expert_weights[0..n_used]);\n                    } else {");
+    try expectContains(src, "topKSoftmaxWeight(router_logits, n_used, expert_ids[0..n_used], expert_weights[0..n_used]);");
+    try expectContains(src, "topKSoftmax(router_logits, n_used, expert_ids[0..n_used], expert_weights[0..n_used]);");
 }
 
 test "GPT-OSS FFN keeps OAI SwiGLU and bias-add dispatches" {
