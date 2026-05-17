@@ -1360,7 +1360,7 @@ fn canUseDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
 }
 
 fn defaultCommandEncoderMode(cfg: ModelConfig) CommandEncoderMode {
-    if (cfg.architecture == .gpt_oss) return .serial;
+    _ = cfg;
     // Apple9 power-management traps: with `MTLDispatchTypeSerial`, the GPU
     // appears to drain the in-flight warps and let the cores idle between
     // every dispatch, even when the next dispatch is data-independent. The
