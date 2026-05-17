@@ -101,17 +101,17 @@ pub const InitOptions = struct {
 };
 
 fn tensorBytes(model: *const metal_loader.Model) u64 {
-    var total: u64 = 0;
-    for (model.gguf_file.tensors.items) |tensor_info| {
-        total += tensor_info.sizeBytes();
-    }
-    return total;
+    return metal_loader.residentWeightBytes(model);
 }
 
 fn memoryBudget(device: *const metal_device.MetalDevice) u64 {
     const working_set = device.recommendedMaxWorkingSetSize();
     if (working_set > 0) return working_set;
     return device.totalMemory();
+}
+
+fn memoryPlanningBudget(device: *const metal_device.MetalDevice) u64 {
+    return @divTrunc(memoryBudget(device) * 85, 100);
 }
 
 fn tokenSeen(history: []const u32, token: u32) bool {
@@ -1829,11 +1829,12 @@ pub const InferenceEngine = struct {
         const requested_ctx = memory_plan.requestedContextTokens(cfg, null, runtime_context_cap);
         const max_ctx = runtime_profile.maxContextTokensForUnifiedBudget(
             weights_bytes,
-            memoryBudget(device),
+            memoryPlanningBudget(device),
             requested_ctx,
         );
         if (max_ctx == 0) {
-            log.err("No decode context fits within {d:.2} GiB Metal working-set budget", .{
+            log.err("No decode context fits within {d:.2} GiB Metal planning budget ({d:.2} GiB reported working set)", .{
+                @as(f64, @floatFromInt(memoryPlanningBudget(device))) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(memoryBudget(device))) / (1024.0 * 1024.0 * 1024.0),
             });
             return error.ContextLengthDoesNotFit;

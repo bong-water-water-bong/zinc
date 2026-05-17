@@ -5,6 +5,7 @@ const std = @import("std");
 const gguf = @import("gguf.zig");
 const config_mod = @import("config.zig");
 const ModelConfig = config_mod.ModelConfig;
+const memory_plan = @import("../gpu/memory_plan.zig");
 const shim = @import("../metal/c.zig").shim;
 const metal_buffer = @import("../metal/buffer.zig");
 const MetalBuffer = metal_buffer.MetalBuffer;
@@ -74,6 +75,25 @@ pub const Model = struct {
         self.* = undefined;
     }
 };
+
+/// Bytes of model weights resident as Metal resources. Copied tensor arenas
+/// replace their mmap-backed tensors in the GPU-visible working set, so this
+/// intentionally does not double-count aliases into those arenas.
+pub fn residentWeightBytes(model: *const Model) u64 {
+    var total: u64 = 0;
+    for (model.tensor_arenas.items) |arena| {
+        total += @intCast(arena.size);
+    }
+    for (model.tensors.items) |tensor| {
+        if (!tensor.gpu_buffer.owns_handle) continue;
+        if (tensor.gpu_buffer.is_mmap_wrapped) {
+            total += tensor.info.sizeBytes();
+        } else {
+            total += @intCast(tensor.gpu_buffer.size);
+        }
+    }
+    return total;
+}
 
 /// Extract model configuration from GGUF metadata (platform-independent).
 fn extractConfigWithLogging(gf: *const gguf.GGUFFile, log_metadata: bool) ModelConfig {
@@ -301,6 +321,74 @@ fn shouldPackCopiedTensorArenas(config: ModelConfig) bool {
     return config.architecture == .gemma and config.n_experts == 0 and config.hidden_dim >= 5000;
 }
 
+fn readBoolEnv(env_name: [:0]const u8) ?bool {
+    const raw = std.posix.getenv(env_name) orelse return null;
+    if (std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
+    if (std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "no")) return false;
+    return null;
+}
+
+fn tensorPayloadBytes(gf: *const gguf.GGUFFile) u64 {
+    var total: u64 = 0;
+    for (gf.tensors.items) |tensor_info| {
+        total += tensor_info.sizeBytes();
+    }
+    return total;
+}
+
+fn arenaPayloadBytes(arena_sizes: []const usize) u64 {
+    var total: u64 = 0;
+    for (arena_sizes) |size| total += @intCast(size);
+    return total;
+}
+
+fn metalWorkingSetBudget(metal_ctx: ?*shim.MetalCtx) u64 {
+    const working_set = shim.mtl_recommended_max_working_set_size(metal_ctx);
+    if (working_set > 0) return working_set;
+    return shim.mtl_total_memory(metal_ctx);
+}
+
+const copied_tensor_budget_utilization_num: u64 = 85;
+const copied_tensor_budget_utilization_den: u64 = 100;
+const copied_tensor_min_context_tokens: u32 = 4096;
+
+fn copiedTensorArenasFitBudget(config: ModelConfig, tensor_bytes: u64, copied_arena_bytes: u64, working_set_budget: u64) bool {
+    if (copied_arena_bytes == 0 or working_set_budget == 0) return false;
+    const min_context = @min(config.context_length, copied_tensor_min_context_tokens);
+    const min_runtime = memory_plan.profile(config).runtimeUnifiedBytes(min_context);
+    const required = tensor_bytes + copied_arena_bytes + min_runtime;
+    const usable_budget = @divTrunc(working_set_budget * copied_tensor_budget_utilization_num, copied_tensor_budget_utilization_den);
+    return required <= usable_budget;
+}
+
+fn shouldEnableCopiedTensorArenas(
+    gf: *const gguf.GGUFFile,
+    config: ModelConfig,
+    metal_ctx: ?*shim.MetalCtx,
+    arena_sizes: []const usize,
+) bool {
+    if (!shouldPackCopiedTensorArenas(config) or arena_sizes.len == 0) return false;
+    if (readBoolEnv("ZINC_METAL_COPY_DENSE_GEMMA_WEIGHTS")) |enabled| {
+        if (!enabled) {
+            log.info("Metal loader: dense Gemma copied weight arenas disabled by ZINC_METAL_COPY_DENSE_GEMMA_WEIGHTS=0", .{});
+        }
+        return enabled;
+    }
+
+    const tensor_bytes = tensorPayloadBytes(gf);
+    const copied_arena_bytes = arenaPayloadBytes(arena_sizes);
+    const budget = metalWorkingSetBudget(metal_ctx);
+    if (copiedTensorArenasFitBudget(config, tensor_bytes, copied_arena_bytes, budget)) return true;
+
+    log.warn("Metal loader: dense Gemma copied weight arenas disabled to avoid UMA pressure ({d:.2} GiB weights + {d:.2} GiB copies would exceed safe budget {d:.2} GiB before runtime headroom)", .{
+        @as(f64, @floatFromInt(tensor_bytes)) / (1024.0 * 1024.0 * 1024.0),
+        @as(f64, @floatFromInt(copied_arena_bytes)) / (1024.0 * 1024.0 * 1024.0),
+        @as(f64, @floatFromInt(@divTrunc(budget * copied_tensor_budget_utilization_num, copied_tensor_budget_utilization_den))) / (1024.0 * 1024.0 * 1024.0),
+    });
+    log.warn("Metal loader: set ZINC_METAL_COPY_DENSE_GEMMA_WEIGHTS=1 to force the faster copied-weight path on high-memory systems", .{});
+    return false;
+}
+
 fn planCopiedTensorArenas(
     gf: *const gguf.GGUFFile,
     config: ModelConfig,
@@ -458,6 +546,8 @@ pub fn load(
 
     var arena_sizes = try planCopiedTensorArenas(&gf, config, allocator);
     defer arena_sizes.deinit(allocator);
+    const copy_tensors_out_of_mmap = shouldEnableCopiedTensorArenas(&gf, config, metal_ctx, arena_sizes.items);
+    if (!copy_tensors_out_of_mmap) arena_sizes.clearRetainingCapacity();
     for (arena_sizes.items) |arena_size| {
         try tensor_arenas.append(allocator, try metal_buffer.createBuffer(metal_ctx, arena_size));
     }
@@ -471,7 +561,7 @@ pub fn load(
         const tensor_size = tensor_info.sizeBytes();
         const data_offset = gf.tensor_data_offset + tensor_info.offset;
 
-        const copy_out = shouldCopyOutOfMmap(config, tensor_info, data_offset);
+        const copy_out = copy_tensors_out_of_mmap and shouldCopyOutOfMmap(config, tensor_info, data_offset);
         const gpu_buf, const buffer_offset = if (copy_out and tensor_arenas.items.len > 0) blk: {
             const tensor_bytes: usize = @intCast(tensor_size);
             const aligned_size = alignForwardPow2(tensor_bytes, copied_tensor_arena_alignment);
@@ -734,4 +824,95 @@ test "shouldCopyOutOfMmap selects dense gemma 31b q4/q6 hot weights" {
     moe_gemma.n_experts = 128;
     moe_gemma.n_experts_used = 8;
     try std.testing.expect(!shouldCopyOutOfMmap(moe_gemma, q4_weight, 4096));
+}
+
+test "copiedTensorArenasFitBudget rejects dense gemma copies on tight UMA budget" {
+    const cfg = ModelConfig{
+        .architecture = .gemma,
+        .n_layers = 60,
+        .n_heads = 32,
+        .n_kv_heads = 16,
+        .head_dim = 256,
+        .hidden_dim = 5376,
+        .intermediate_dim = 21504,
+        .vocab_size = 262144,
+        .context_length = 262144,
+        .rope_freq_base = 1_000_000.0,
+        .rope_freq_base_swa = 10_000.0,
+        .n_experts = 0,
+        .n_experts_used = 0,
+        .rope_dim = 64,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 0,
+    };
+
+    const gib: u64 = 1024 * 1024 * 1024;
+    try std.testing.expect(!copiedTensorArenasFitBudget(cfg, 20 * gib, 17 * gib, 48 * gib));
+    try std.testing.expect(copiedTensorArenasFitBudget(cfg, 20 * gib, 17 * gib, 128 * gib));
+}
+
+test "residentWeightBytes counts copied arenas without double-counting aliases" {
+    const allocator = std.testing.allocator;
+    var tensors: std.ArrayList(LoadedTensor) = .{};
+    defer tensors.deinit(allocator);
+    var arenas: std.ArrayList(MetalBuffer) = .{};
+    defer arenas.deinit(allocator);
+
+    const mmap_info = gguf.TensorInfo{
+        .name = "mmap.weight",
+        .n_dims = 1,
+        .dims = .{ 10, 1, 1, 1 },
+        .type_ = .f32,
+        .offset = 0,
+    };
+    const alias_info = gguf.TensorInfo{
+        .name = "alias.weight",
+        .n_dims = 1,
+        .dims = .{ 20, 1, 1, 1 },
+        .type_ = .f32,
+        .offset = 0,
+    };
+    const standalone_info = gguf.TensorInfo{
+        .name = "standalone.weight",
+        .n_dims = 1,
+        .dims = .{ 30, 1, 1, 1 },
+        .type_ = .f32,
+        .offset = 0,
+    };
+
+    try arenas.append(allocator, .{
+        .handle = null,
+        .size = 128,
+        .cpu_ptr = null,
+        .is_mmap_wrapped = false,
+    });
+    try tensors.append(allocator, .{
+        .info = mmap_info,
+        .gpu_buffer = .{ .handle = null, .size = 64, .cpu_ptr = null, .is_mmap_wrapped = true },
+    });
+    try tensors.append(allocator, .{
+        .info = alias_info,
+        .gpu_buffer = .{ .handle = null, .size = 80, .cpu_ptr = null, .is_mmap_wrapped = false, .owns_handle = false },
+    });
+    try tensors.append(allocator, .{
+        .info = standalone_info,
+        .gpu_buffer = .{ .handle = null, .size = 96, .cpu_ptr = null, .is_mmap_wrapped = false },
+    });
+
+    const model = Model{
+        .config = undefined,
+        .gguf_file = undefined,
+        .tensors = tensors,
+        .tensor_arenas = arenas,
+        .mmap_data = null,
+        .mmap_file = null,
+        .allocator = allocator,
+    };
+
+    try std.testing.expectEqual(@as(u64, 128 + 40 + 96), residentWeightBytes(&model));
 }

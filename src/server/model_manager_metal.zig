@@ -467,11 +467,7 @@ fn loadResourcesInto(
 }
 
 fn tensorBytes(model: *const loader_mod.Model) u64 {
-    var total: u64 = 0;
-    for (model.gguf_file.tensors.items) |tensor_info| {
-        total += tensor_info.sizeBytes();
-    }
-    return total;
+    return loader_mod.residentWeightBytes(model);
 }
 
 fn memoryBudget(device: *const MetalDevice) u64 {

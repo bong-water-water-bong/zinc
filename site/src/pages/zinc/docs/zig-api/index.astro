@@ -1,5 +1,6 @@
 ---
 import DocLayout from '../../../../layouts/DocLayout.astro';
+import DocsSearch from '../../../../components/DocsSearch.astro';
 import { loadZigApi } from '../../../../lib/zig-api-loader';
 
 const zigApi = await loadZigApi();
@@ -49,6 +50,11 @@ const description = 'Generated reference for the ZINC Zig codebase, grouped by r
 const keywords = 'ZINC Zig API, generated docs, Zig reference, Vulkan runtime, inference runtime, GGUF parser, AMD GPU';
 const zigCodeLines = zigApi.codeLineCount.toLocaleString('en-US');
 const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
+const apiSearchSuggestions = ['InferenceEngine', 'DmmvDispatch', 'GGUFFile', 'Tokenizer', 'ServerState', 'ModelConfig'];
+const entryModuleSlugs = ['forward', 'forward-metal', 'graph', 'gguf', 'tokenizer', 'dmmv', 'elementwise', 'routes'];
+const entryModules = entryModuleSlugs
+  .map(slug => zigApi.modules.find(module => module.slug === slug))
+  .filter(module => module !== undefined);
 ---
 
 <DocLayout title="Zig API" description={description} keywords={keywords} lastmod={zigApi.lastmod}>
@@ -96,7 +102,42 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
     </div>
   </section>
 
-  <section class="supplemental">
+  <section id="api-search" class="api-search-panel">
+    <div class="section-header">
+      <div>
+        <p class="eyebrow">Find Code</p>
+        <h2>Search modules, symbols, and methods</h2>
+      </div>
+    </div>
+    <DocsSearch
+      placeholder="Search the Zig API by symbol, method, module, or source path"
+      scope="zig-api"
+      suggestions={apiSearchSuggestions}
+      maxResults={12}
+    />
+  </section>
+
+  {entryModules.length > 0 && (
+    <section id="entry-points" class="entry-points">
+      <div class="section-header">
+        <div>
+          <p class="eyebrow">Developer Entry Points</p>
+          <h2>Start with the hot paths</h2>
+        </div>
+      </div>
+      <div class="entry-grid">
+        {entryModules.map(module => (
+          <a href={module.href} class="entry-link">
+            <span class="entry-source">{module.sourcePath}</span>
+            <strong>{module.title}</strong>
+            <span>{module.summary}</span>
+          </a>
+        ))}
+      </div>
+    </section>
+  )}
+
+  <section id="machine-readable" class="supplemental">
     <div class="section-header">
       <div>
         <p class="eyebrow">Agent Access</p>
@@ -177,6 +218,9 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   <aside class="api-nav">
     <p class="nav-title">On This Page</p>
     <ul>
+      <li><a href="#api-search">Search</a></li>
+      {entryModules.length > 0 && <li><a href="#entry-points">Entry Points</a></li>}
+      <li><a href="#machine-readable">Machine-Readable</a></li>
       <li><a href="#sections">API Sections</a></li>
       {zigApi.sections.map(section => (
         <li class="nav-section">
@@ -281,10 +325,8 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   .hero {
     padding: var(--space-xl);
     border: 1px solid var(--color-border);
-    border-radius: 16px;
-    background:
-      radial-gradient(circle at top right, rgba(211, 84, 0, 0.14), transparent 30%),
-      linear-gradient(180deg, var(--color-bg-alt), var(--color-bg));
+    border-radius: 8px;
+    background: linear-gradient(180deg, var(--color-bg-alt), var(--color-bg));
     margin-bottom: var(--space-xl);
   }
 
@@ -392,7 +434,7 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
 
   .stat-card {
     border: 1px solid var(--color-border);
-    border-radius: 12px;
+    border-radius: 8px;
     background: var(--color-bg);
     padding: var(--space-md);
   }
@@ -413,12 +455,62 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
     gap: var(--space-lg);
   }
 
+  .api-search-panel,
+  .entry-points,
   .section-card,
   .supplemental {
     border: 1px solid var(--color-border);
-    border-radius: 16px;
+    border-radius: 8px;
     padding: var(--space-lg);
     background: var(--color-bg);
+  }
+
+  .api-search-panel {
+    margin-bottom: var(--space-xl);
+  }
+
+  .entry-points {
+    margin-bottom: var(--space-xl);
+  }
+
+  .entry-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(235px, 1fr));
+    gap: var(--space-sm);
+    margin-top: var(--space-md);
+  }
+
+  .entry-link {
+    display: grid;
+    gap: 0.25rem;
+    min-width: 0;
+    padding: var(--space-md);
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    background: var(--color-bg-alt);
+    color: var(--color-text);
+  }
+
+  .entry-link:hover {
+    border-color: var(--color-accent);
+    text-decoration: none;
+  }
+
+  .entry-link strong {
+    font-size: 0.98rem;
+  }
+
+  .entry-link span:last-child {
+    color: var(--color-text-muted);
+    font-size: 0.86rem;
+    line-height: 1.45;
+  }
+
+  .entry-source {
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    overflow-wrap: anywhere;
   }
 
   .section-header {
@@ -454,7 +546,7 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   .module-card {
     display: block;
     border: 1px solid var(--color-border);
-    border-radius: 14px;
+    border-radius: 8px;
     padding: var(--space-md);
     color: var(--color-text);
     background: var(--color-bg);
@@ -512,6 +604,11 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
     margin-top: var(--space-xl);
   }
 
+  #machine-readable {
+    margin-top: 0;
+    margin-bottom: var(--space-xl);
+  }
+
   .supplemental-grid {
     margin-top: var(--space-md);
   }
@@ -522,6 +619,8 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
 
   @media (max-width: 700px) {
     .hero,
+    .api-search-panel,
+    .entry-points,
     .section-card,
     .supplemental {
       padding: var(--space-md);

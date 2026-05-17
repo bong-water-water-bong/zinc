@@ -1673,7 +1673,21 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer model.deinit();
-            memory_plan.applyRequestedContextLimit(&model.config, config.context_length);
+            if (config.context_length) |requested_context| {
+                memory_plan.applyRequestedContextLimit(&model.config, requested_context);
+            } else {
+                const metal_budget = blk: {
+                    const working_set = device.recommendedMaxWorkingSetSize();
+                    break :blk if (working_set > 0) working_set else device.totalMemory();
+                };
+                const auto_context = memory_plan.autoContextTokensForDeviceBudget(
+                    memory_plan.profile(model.config),
+                    metal_loader.residentWeightBytes(&model),
+                    metal_budget,
+                    model.config.context_length,
+                );
+                memory_plan.applyRequestedContextLimit(&model.config, auto_context);
+            }
 
             log.info("Prompt: {s}", .{prompt});
 
