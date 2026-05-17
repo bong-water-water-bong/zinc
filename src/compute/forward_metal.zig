@@ -1713,6 +1713,7 @@ pub const InferenceEngine = struct {
     dmmv_q5_1_pipe: MetalPipeline,
     dmmv_mxfp4_pipe: MetalPipeline,
     dmmv_mxfp4_moe_pipe: MetalPipeline,
+    dmmv_mxfp4_moe_sg_pipe: MetalPipeline,
     dmmv_q8_0_lmhead_pipe: MetalPipeline,
     dmmv_q8_0_k2048_pipe: MetalPipeline,
     dmmv_q8_0_dual_pipe: MetalPipeline,
@@ -2086,6 +2087,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q5_1_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1");
         self.dmmv_mxfp4_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4");
         self.dmmv_mxfp4_moe_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe");
+        self.dmmv_mxfp4_moe_sg_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe_sg");
         self.dmmv_q8_0_lmhead_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_lmhead");
         self.dmmv_q8_0_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048");
         self.dmmv_q8_0_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual");
@@ -2801,6 +2803,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q5_1_pipe);
         metal_pipeline.freePipeline(&self.dmmv_mxfp4_pipe);
         metal_pipeline.freePipeline(&self.dmmv_mxfp4_moe_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_mxfp4_moe_sg_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_lmhead_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_pipe);
@@ -5094,9 +5097,18 @@ fn dispatchDmmvMoeMxfp4OnCmd(
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
-    const rows_per_wg: u32 = 64;
-    const wgs = (M + rows_per_wg - 1) / rows_per_wg;
-    cmd.dispatchV2(&engine.dmmv_mxfp4_moe_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    if (engine.dmmv_mxfp4_moe_sg_pipe.handle != null and K <= 4096 and
+        engine.dmmv_mxfp4_moe_sg_pipe.thread_execution_width == 32 and
+        engine.dmmv_mxfp4_moe_sg_pipe.max_threads_per_threadgroup >= 512)
+    {
+        const rows_per_wg: u32 = 16;
+        const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+        cmd.dispatchV2(&engine.dmmv_mxfp4_moe_sg_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    } else {
+        const rows_per_wg: u32 = 64;
+        const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+        cmd.dispatchV2(&engine.dmmv_mxfp4_moe_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    }
 }
 
 fn dispatchDmmvMoeOnCmd(
@@ -14838,6 +14850,102 @@ test "dmmv_mxfp4 shader matches CPU reference" {
     const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     for (0..M) |row| {
         try std.testing.expectApproxEqAbs(expected[row], output_ptr[row], 0.01);
+    }
+}
+
+test "dmmv_mxfp4_moe_sg shader matches CPU reference across selected experts" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe_sg");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 37;
+    const K: usize = 96;
+    const n_used: usize = 3;
+    const n_experts: usize = 5;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 17;
+    const expert_stride: usize = M * row_bytes;
+    const a_offset: usize = 13;
+    const x_pad: usize = 5;
+    const y_pad: usize = 7;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, a_offset + n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, (x_pad + n_used * K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, (y_pad + n_used * M) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(routing_buf.cpu_ptr.?[0..routing_buf.size], 0);
+
+    const raw = weight_buf.cpu_ptr.?[a_offset..];
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 17;
+                raw[base] = @intCast(124 + ((expert + row + blk) % 5));
+                for (0..16) |j| {
+                    const lo: u8 = @intCast((expert * 7 + row * 5 + blk * 3 + j) & 0x0F);
+                    const hi: u8 = @intCast((expert * 11 + row * 13 + blk * 17 + j * 3) & 0x0F);
+                    raw[base + 1 + j] = lo | (hi << 4);
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        for (0..K) |i| {
+            const raw_val: i32 = @intCast((slot * 31 + i * 17 + 9) % 25);
+            input_ptr[x_pad + slot * K + i] = 0.03125 * @as(f32, @floatFromInt(raw_val - 12));
+        }
+    }
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 4;
+    routing_ptr[1] = 1;
+    routing_ptr[2] = 3;
+
+    const push = MoeDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = @intCast(a_offset),
+        .expert_stride = @intCast(expert_stride),
+        .x_expert_stride = @intCast(K),
+        .x_offset = @intCast(x_pad * @sizeOf(f32)),
+        .y_offset = @intCast(y_pad * @sizeOf(f32)),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &routing_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 15) / 16), @intCast(n_used), 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        const expert_id = routing_ptr[slot];
+        const matrix_raw = raw[@as(usize, expert_id) * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[x_pad + slot * K .. x_pad + (slot + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .mxfp4, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            try std.testing.expectApproxEqAbs(expected, output_ptr[y_pad + slot * M + row], 0.05);
+        }
     }
 }
 
