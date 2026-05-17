@@ -18,7 +18,6 @@ const DEFAULT_RDNA_WORKDIR = "/root/zinc";
 const DEFAULT_RDNA_MODEL_ROOT = "/root/models";
 const TARGET_ORDER = ["rdna", "intel", "metal"];
 const MAX_CAPTURE_CHARS = 256_000;
-const PUBLIC_BENCHMARK_EXCLUDED_MODEL_IDS = new Set(["qwen35-35b-a3b-q4k-xl"]);
 
 function modelPath(root, dir) {
   return path.join(root, dir, "model.gguf");
@@ -26,10 +25,6 @@ function modelPath(root, dir) {
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
-
-function shouldIncludeInPublishedBenchmarks(modelId, requestedModels = null) {
-  return requestedModels?.has(modelId) || !PUBLIC_BENCHMARK_EXCLUDED_MODEL_IDS.has(modelId);
 }
 
 function parseInteger(arg, flag) {
@@ -1850,7 +1845,6 @@ async function runMetalTarget(args) {
   const filtered = [];
   for (const entry of cases) {
     if (args.models && !args.models.has(entry.id)) continue;
-    if (!shouldIncludeInPublishedBenchmarks(entry.id, args.models)) continue;
     if (await pathExists(entry.model_path)) {
       filtered.push(entry);
       continue;
@@ -2107,7 +2101,6 @@ async function runRdnaTarget(args) {
   const cases = [];
   for (const entry of mergedCases.values()) {
     if (args.models && !args.models.has(entry.id)) continue;
-    if (!shouldIncludeInPublishedBenchmarks(entry.id, args.models)) continue;
     if (!(await rdnaPathExists(entry.model_path, creds))) {
       console.log(`[rdna] skipping ${entry.id}: missing GGUF at ${entry.model_path}`);
       continue;
@@ -2295,7 +2288,6 @@ async function runIntelTarget(args) {
   const cases = [];
   for (const entry of mergedCases.values()) {
     if (args.models && !args.models.has(entry.id)) continue;
-    if (!shouldIncludeInPublishedBenchmarks(entry.id, args.models)) continue;
     if (!(await rdnaPathExists(entry.model_path, creds))) {
       console.log(`[intel] skipping ${entry.id}: missing GGUF at ${entry.model_path}`);
       continue;

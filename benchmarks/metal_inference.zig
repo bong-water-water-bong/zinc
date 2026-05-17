@@ -65,7 +65,7 @@ fn helpText() []const u8 {
     \\  -h, --help               Show this help text
     \\
     \\Example:
-    \\  zig build bench-metal -- -m /Users/zolotukhin/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+    \\  zig build bench-metal -- -m /Users/zolotukhin/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
     \\
     ;
 }

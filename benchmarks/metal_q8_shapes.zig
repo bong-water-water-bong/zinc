@@ -195,7 +195,7 @@ fn helpText() []const u8 {
     \\  -h, --help                 Show this help text
     \\
     \\Examples:
-    \\  zig build bench-metal-shapes -- -m /Users/zolotukhin/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+    \\  zig build bench-metal-shapes -- -m /Users/zolotukhin/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
     \\  zig build bench-metal-shapes -- -m model.gguf --case lm_head --pipeline both
     \\
     ;

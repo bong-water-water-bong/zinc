@@ -522,7 +522,6 @@ describe("buildPrompt", () => {
     const prompt = buildPrompt(state, result);
     expect(prompt).toContain("Model (Gemma 4 12B Q4_K_M)");
     expect(prompt).toContain("hidden_dim=2816");
-    expect(prompt).not.toContain("Model (Qwen3.5-35B");
   });
 
   test("includes pre-stall warning at 3 cycles", () => {

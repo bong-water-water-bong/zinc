@@ -329,7 +329,6 @@ pub fn supportedOnCurrentGpu(entry: CatalogEntry, profile: []const u8, vram_budg
 pub fn ggufArchForFamily(family: []const u8) ?[]const u8 {
     const families = .{
         .{ "qwen3.6", "qwen35" },
-        .{ "qwen3.5", "qwen35" },
         .{ "qwen3", "qwen3" },
         .{ "qwen2.5", "qwen2" },
         .{ "qwen2", "qwen2" },

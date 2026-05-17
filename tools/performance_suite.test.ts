@@ -112,7 +112,6 @@ test("GPT-OSS uses the chat prompt path in the performance suite", () => {
 
 test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
   const cases = defaultMetalCases("/tmp/models");
-  expect(cases.some((entry) => entry.id === "qwen35-35b-a3b-q4k-xl")).toBe(false);
 
   const qwen36 = cases.find((entry) => entry.id === "qwen36-35b-a3b-q4k-xl");
   expect(qwen36?.model_id).toBe("qwen36-35b-a3b-q4k-xl");

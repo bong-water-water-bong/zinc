@@ -2,12 +2,12 @@
 
 How to reproduce the canonical RDNA4 baseline, measure ZINC, and run the per-kernel hot-bench. Apple Silicon notes at the bottom.
 
-## llama.cpp baseline — 107 tok/s (2026-03-26)
+## llama.cpp baseline
 
 The reference baseline is llama.cpp server on the RDNA4 test node with this exact configuration. All ZINC numbers are compared against this.
 
-**Model**: `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf` (20.7 GiB, MoE 35B/3B active)
-**Result**: 107 tok/s decode (with reasoning), 223 tok/s prefill
+**Model**: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (22.4 GiB, MoE 35B/3B active)
+**Current numbers**: published at [zolotukhin.ai/zinc/performance](https://zolotukhin.ai/zinc/performance).
 
 ### Test node setup (critical for reproducing the baseline)
 
@@ -70,7 +70,7 @@ rsync -az --delete --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_mo
 # Build and run
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && zig build -Doptimize=ReleaseFast && \
   RADV_PERFTEST=coop_matrix ./zig-out/bin/zinc \
-  -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+  -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   --prompt 'The capital of France is'"
 
 # Key output lines:
@@ -108,7 +108,7 @@ rsync -az --delete --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_mo
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
   cd /root/zinc && zig build -Doptimize=ReleaseFast && \
   nohup env RADV_PERFTEST=coop_matrix ./zig-out/bin/zinc \
-    -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --port 9090 >/tmp/zinc_9090.log 2>&1 < /dev/null &"
 
 # 3. Wait for health.
@@ -142,7 +142,6 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
 ## Latest single-stream reference
 
 **AMD RDNA4** (Radeon AI PRO R9700, 32 GB):
-- Qwen3.5-35B-A3B-UD-Q4_K_XL — 37.95 tok/s, 26.3 ms/tok (2026-03-31, baseline)
 - Qwen3.6-35B-A3B-UD-Q4_K_XL — see `loops/efforts/MULTI_HOUR_EFFORT_10_QWEN36_DECODE.md`
 
 **Apple Silicon** (M1 Max 32 GB, 2026-04-02):
@@ -162,7 +161,7 @@ source .env
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
   cd /root/zinc && \
   zig build hot-bench -Doptimize=ReleaseFast -- \
-    --model /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --iterations 200 --warmup 25"
 ```
 
@@ -172,7 +171,7 @@ Single case + shader stats:
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
   cd /root/zinc && \
   RADV_DEBUG=shaderstats zig build hot-bench -Doptimize=ReleaseFast -- \
-    --model /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --case ssm_delta"
 ```
 

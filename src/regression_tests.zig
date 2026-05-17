@@ -496,7 +496,6 @@ test "chat UI derives the model link from the reported model name" {
     try expectContains(src, "fetch(base+'/models/activate'");
     try expectContains(src, "m.managed&&m.installed&&m.supported_on_current_gpu&&m.fits_current_gpu");
     try expectNotContains(src, "setCurrentModel(selectedModel());");
-    try expectNotContains(src, "href=\"https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF\"");
 }
 
 test "Metal flash_attn supports head_dim=512 for Gemma 4 global attention layers" {
