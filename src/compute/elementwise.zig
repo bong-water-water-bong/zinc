@@ -967,7 +967,7 @@ pub const ElementwiseDispatch = struct {
         const pip = if (self.pipeline_sigmoid_scale_acc) |*p| p else return error.ShaderNotLoaded;
         // Push constant only needs N (uses same layout as ScaleAccPush but only N is read)
         const push = ScaleAccPush{ .N = n_elements, .scale_bits = 0 };
-        const workgroups = (n_elements + 63) / 64;
+        const workgroups = (n_elements + 255) / 256;
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 

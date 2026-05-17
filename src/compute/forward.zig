@@ -23,6 +23,8 @@ const DmmvDispatch = dmmv_mod.DmmvDispatch;
 const DmmvPushConstants = dmmv_mod.DmmvPushConstants;
 const Q8_1_BLOCK_BYTES = dmmv_mod.Q8_1_BLOCK_BYTES;
 const DmmvSigmoidAccPushConstants = dmmv_mod.DmmvSigmoidAccPushConstants;
+const DmmvGateUpGegluPushConstants = dmmv_mod.DmmvGateUpGegluPushConstants;
+const DmmvScaleAccPushConstants = dmmv_mod.DmmvScaleAccPushConstants;
 const DmmvQ8PairPushConstants = dmmv_mod.DmmvQ8PairPushConstants;
 const OprojMergePushConstants = dmmv_mod.OprojMergePushConstants;
 const MoeDmmvPushConstants = dmmv_mod.MoeDmmvPushConstants;
@@ -4547,7 +4549,7 @@ pub const InferenceEngine = struct {
                 src_size,
                 gate_buf,
                 gate_size,
-                (n_elements + 63) / 64,
+                (n_elements + 255) / 256,
                 1,
                 1,
             );
@@ -7264,30 +7266,53 @@ pub const InferenceEngine = struct {
                         const up_offset = eid * expert_gate_row_bytes + up_base_offset;
                         const down_offset = eid * expert_down_row_bytes;
 
-                        // Expert gate/up reads pre_ffw_norm_2 output (Gemma 4) or ffn_norm_buf
-                        try self.dispatchDmmvWithOffset(gate_exps, expert_input_buf, hidden_size, self.gate_buf, inter_dim, hidden_dim, gate_offset);
-                        try self.dispatchDmmvWithOffset(up_exps, expert_input_buf, hidden_size, self.up_buf, inter_dim, hidden_dim, up_offset);
-                        if (lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null) {
+                        const gemma_fused_gate_up_geglu =
+                            config.architecture == .gemma and
+                            fused_gate_up != null and
+                            gate_exps.info.type_ == .q4_k and
+                            up_exps.info.type_ == .q4_k and
+                            lt.ffn_gate_exps_bias == null and
+                            lt.ffn_up_exps_bias == null and
+                            self.dmmv.pipeline_q4k_fused_gate_up_geglu != null;
+
+                        // Expert gate/up reads pre_ffw_norm_2 output (Gemma 4) or ffn_norm_buf.
+                        if (gemma_fused_gate_up_geglu) {
+                            try self.dispatchDmmvFusedGateUpGegluOffset(
+                                gate_exps,
+                                expert_input_buf,
+                                hidden_size,
+                                self.swiglu_buf,
+                                inter_dim,
+                                hidden_dim,
+                                gate_offset,
+                                up_offset,
+                            );
+                            self.decode_cmd.computeBarrier();
+                        } else {
+                            try self.dispatchDmmvWithOffset(gate_exps, expert_input_buf, hidden_size, self.gate_buf, inter_dim, hidden_dim, gate_offset);
+                            try self.dispatchDmmvWithOffset(up_exps, expert_input_buf, hidden_size, self.up_buf, inter_dim, hidden_dim, up_offset);
+                            if (lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null) {
+                                self.decode_cmd.computeBarrier();
+                            }
+                            if (lt.ffn_gate_exps_bias) |bias| {
+                                try self.dispatchBiasAddSlice(self.gate_buf.handle, self.gate_buf.size, bias, eid * inter_dim, inter_dim);
+                            }
+                            if (lt.ffn_up_exps_bias) |bias| {
+                                try self.dispatchBiasAddSlice(self.up_buf.handle, self.up_buf.size, bias, eid * inter_dim, inter_dim);
+                            }
+                            self.decode_cmd.computeBarrier();
+
+                            try self.dispatchFfnActivation(
+                                self.gate_buf.handle,
+                                self.gate_buf.size,
+                                self.up_buf.handle,
+                                self.up_buf.size,
+                                self.swiglu_buf.handle,
+                                self.swiglu_buf.size,
+                                inter_dim,
+                            );
                             self.decode_cmd.computeBarrier();
                         }
-                        if (lt.ffn_gate_exps_bias) |bias| {
-                            try self.dispatchBiasAddSlice(self.gate_buf.handle, self.gate_buf.size, bias, eid * inter_dim, inter_dim);
-                        }
-                        if (lt.ffn_up_exps_bias) |bias| {
-                            try self.dispatchBiasAddSlice(self.up_buf.handle, self.up_buf.size, bias, eid * inter_dim, inter_dim);
-                        }
-                        self.decode_cmd.computeBarrier();
-
-                        try self.dispatchFfnActivation(
-                            self.gate_buf.handle,
-                            self.gate_buf.size,
-                            self.up_buf.handle,
-                            self.up_buf.size,
-                            self.swiglu_buf.handle,
-                            self.swiglu_buf.size,
-                            inter_dim,
-                        );
-                        self.decode_cmd.computeBarrier();
 
                         if (diag_moe_detail and ei == 0) {
                             const inter_bytes = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
@@ -7349,89 +7374,6 @@ pub const InferenceEngine = struct {
                             try self.decode_cmd.begin();
                         }
 
-                        try self.dispatchDmmvWithOffset(down_exps, self.swiglu_buf, self.swiglu_buf.size, self.down_buf, hidden_dim, inter_dim, down_offset);
-                        if (lt.ffn_down_exps_bias) |bias| {
-                            self.decode_cmd.computeBarrier();
-                            try self.dispatchBiasAddSlice(self.down_buf.handle, hidden_size, bias, eid * hidden_dim, hidden_dim);
-                        }
-                        self.decode_cmd.computeBarrier();
-
-                        if (diag_moe_detail and ei == 0) {
-                            const inter_bytes = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
-                            const hidden_bytes = @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
-                            const down_off = inter_bytes;
-
-                            try self.decode_cmd.end();
-                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                            try self.decode_cmd.reset();
-                            try self.decode_cmd.begin();
-                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                                .srcOffset = 0,
-                                .dstOffset = 0,
-                                .size = inter_bytes,
-                            });
-                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
-                                .srcOffset = 0,
-                                .dstOffset = down_off,
-                                .size = hidden_bytes,
-                            });
-                            try self.decode_cmd.end();
-                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-
-                            const dbg_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
-                            const swiglu_vals = dbg_ptr[0..inter_dim];
-                            const gpu_down = dbg_ptr[@intCast(down_off / @sizeOf(f32))..][0..hidden_dim];
-                            const mmap = self.model.mmap_data orelse return error.NoMmapData;
-                            const down_base_off: usize = @as(usize, @intCast(self.model.gguf_file.tensor_data_offset + down_exps.info.offset));
-                            const down_data_off = down_base_off + @as(usize, down_offset);
-                            const cpu_row_buf = try self.allocator.alloc(f32, inter_dim);
-                            defer self.allocator.free(cpu_row_buf);
-                            const cpu_down = try self.allocator.alloc(f32, hidden_dim);
-                            defer self.allocator.free(cpu_down);
-
-                            for (0..hidden_dim) |row| {
-                                dequantRow(mmap[down_data_off..], @intCast(row), inter_dim, down_exps.info.type_, cpu_row_buf);
-                                var dot: f64 = 0;
-                                for (0..inter_dim) |i| dot += @as(f64, cpu_row_buf[i]) * @as(f64, swiglu_vals[i]);
-                                cpu_down[row] = @floatCast(dot);
-                            }
-                            if (lt.ffn_down_exps_bias) |bias| {
-                                addBiasFromTensorSlice(self, cpu_down.ptr, bias, eid * hidden_dim, hidden_dim);
-                            }
-
-                            var down_max_diff: f32 = 0;
-                            var down_max_idx: usize = 0;
-                            for (0..hidden_dim) |i| {
-                                const diff = @abs(gpu_down[i] - cpu_down[i]);
-                                if (diff > down_max_diff) {
-                                    down_max_diff = diff;
-                                    down_max_idx = i;
-                                }
-                            }
-                            log.info("DOWN_EXPERT_CHECK L{d} E{d}: max_diff={d:.6} idx={d} gpu_max={d:.6} cpu_max={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] type={s}", .{
-                                layer,
-                                eid,
-                                down_max_diff,
-                                down_max_idx,
-                                gpu_down[down_max_idx],
-                                cpu_down[down_max_idx],
-                                gpu_down[0],
-                                gpu_down[1],
-                                gpu_down[2],
-                                gpu_down[3],
-                                cpu_down[0],
-                                cpu_down[1],
-                                cpu_down[2],
-                                cpu_down[3],
-                                @tagName(down_exps.info.type_),
-                            });
-
-                            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-                            try self.decode_cmd.reset();
-                            try self.decode_cmd.begin();
-                        }
-
                         // Gemma 4 MoE: fold per-expert ffn_down_exps.scale into the accumulation weight.
                         // down[i] *= scales[eid] then weight*down == (weight*scales[eid]) * down.
                         if (lt.ffn_down_exps_scale) |scale_t| {
@@ -7445,37 +7387,142 @@ pub const InferenceEngine = struct {
                             }
                         }
 
-                        if (cpu_moe_accum_opt) |cpu_moe_accum| {
-                            try self.decode_cmd.end();
-                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+                        const gemma_fused_down_acc =
+                            config.architecture == .gemma and
+                            down_exps.info.type_ == .q5_1 and
+                            lt.ffn_down_exps_bias == null and
+                            cpu_moe_accum_opt == null and
+                            !diag_moe_detail and
+                            self.dmmv.pipeline_q5_1_acc != null;
 
-                            try self.decode_cmd.reset();
-                            try self.decode_cmd.begin();
-                            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{
-                                .srcOffset = 0,
-                                .dstOffset = 0,
-                                .size = hidden_size,
-                            });
-                            try self.decode_cmd.end();
-                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+                        if (gemma_fused_down_acc) {
+                            try self.dispatchDmmvQ5_1AccOffset(
+                                down_exps,
+                                self.swiglu_buf,
+                                self.swiglu_buf.size,
+                                self.moe_out_buf,
+                                hidden_dim,
+                                inter_dim,
+                                down_offset,
+                                weight,
+                            );
+                            self.decode_cmd.computeBarrier();
+                        } else {
+                            try self.dispatchDmmvWithOffset(down_exps, self.swiglu_buf, self.swiglu_buf.size, self.down_buf, hidden_dim, inter_dim, down_offset);
+                            if (lt.ffn_down_exps_bias) |bias| {
+                                self.decode_cmd.computeBarrier();
+                                try self.dispatchBiasAddSlice(self.down_buf.handle, hidden_size, bias, eid * hidden_dim, hidden_dim);
+                            }
+                            self.decode_cmd.computeBarrier();
 
-                            const down_ptr: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
-                            for (0..hidden_dim) |i| cpu_moe_accum[i] += weight * down_ptr[i];
+                            if (diag_moe_detail and ei == 0) {
+                                const inter_bytes = @as(vk.c.VkDeviceSize, inter_dim) * @sizeOf(f32);
+                                const hidden_bytes = @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
+                                const down_off = inter_bytes;
 
-                            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-                            try self.decode_cmd.reset();
-                            try self.decode_cmd.begin();
+                                try self.decode_cmd.end();
+                                try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                                try self.decode_cmd.reset();
+                                try self.decode_cmd.begin();
+                                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                    .srcOffset = 0,
+                                    .dstOffset = 0,
+                                    .size = inter_bytes,
+                                });
+                                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                                    .srcOffset = 0,
+                                    .dstOffset = down_off,
+                                    .size = hidden_bytes,
+                                });
+                                try self.decode_cmd.end();
+                                try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                                const dbg_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+                                const swiglu_vals = dbg_ptr[0..inter_dim];
+                                const gpu_down = dbg_ptr[@intCast(down_off / @sizeOf(f32))..][0..hidden_dim];
+                                const mmap = self.model.mmap_data orelse return error.NoMmapData;
+                                const down_base_off: usize = @as(usize, @intCast(self.model.gguf_file.tensor_data_offset + down_exps.info.offset));
+                                const down_data_off = down_base_off + @as(usize, down_offset);
+                                const cpu_row_buf = try self.allocator.alloc(f32, inter_dim);
+                                defer self.allocator.free(cpu_row_buf);
+                                const cpu_down = try self.allocator.alloc(f32, hidden_dim);
+                                defer self.allocator.free(cpu_down);
+
+                                for (0..hidden_dim) |row| {
+                                    dequantRow(mmap[down_data_off..], @intCast(row), inter_dim, down_exps.info.type_, cpu_row_buf);
+                                    var dot: f64 = 0;
+                                    for (0..inter_dim) |i| dot += @as(f64, cpu_row_buf[i]) * @as(f64, swiglu_vals[i]);
+                                    cpu_down[row] = @floatCast(dot);
+                                }
+                                if (lt.ffn_down_exps_bias) |bias| {
+                                    addBiasFromTensorSlice(self, cpu_down.ptr, bias, eid * hidden_dim, hidden_dim);
+                                }
+
+                                var down_max_diff: f32 = 0;
+                                var down_max_idx: usize = 0;
+                                for (0..hidden_dim) |i| {
+                                    const diff = @abs(gpu_down[i] - cpu_down[i]);
+                                    if (diff > down_max_diff) {
+                                        down_max_diff = diff;
+                                        down_max_idx = i;
+                                    }
+                                }
+                                log.info("DOWN_EXPERT_CHECK L{d} E{d}: max_diff={d:.6} idx={d} gpu_max={d:.6} cpu_max={d:.6} gpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] cpu[0..3]=[{d:.6},{d:.6},{d:.6},{d:.6}] type={s}", .{
+                                    layer,
+                                    eid,
+                                    down_max_diff,
+                                    down_max_idx,
+                                    gpu_down[down_max_idx],
+                                    cpu_down[down_max_idx],
+                                    gpu_down[0],
+                                    gpu_down[1],
+                                    gpu_down[2],
+                                    gpu_down[3],
+                                    cpu_down[0],
+                                    cpu_down[1],
+                                    cpu_down[2],
+                                    cpu_down[3],
+                                    @tagName(down_exps.info.type_),
+                                });
+
+                                if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+                                try self.decode_cmd.reset();
+                                try self.decode_cmd.begin();
+                            }
+
+                            if (cpu_moe_accum_opt) |cpu_moe_accum| {
+                                try self.decode_cmd.end();
+                                try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                                try self.decode_cmd.reset();
+                                try self.decode_cmd.begin();
+                                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.embed_staging.handle, 1, &vk.c.VkBufferCopy{
+                                    .srcOffset = 0,
+                                    .dstOffset = 0,
+                                    .size = hidden_size,
+                                });
+                                try self.decode_cmd.end();
+                                try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                                const down_ptr: [*]const f32 = @ptrCast(@alignCast(self.embed_staging.mapped.?));
+                                for (0..hidden_dim) |i| cpu_moe_accum[i] += weight * down_ptr[i];
+
+                                if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+                                try self.decode_cmd.reset();
+                                try self.decode_cmd.begin();
+                            }
+
+                            try self.dispatchScaleAcc(
+                                self.moe_out_buf.handle,
+                                hidden_size,
+                                self.down_buf.handle,
+                                hidden_size,
+                                hidden_dim,
+                                weight,
+                            );
+                            self.decode_cmd.computeBarrier();
                         }
-
-                        try self.dispatchScaleAcc(
-                            self.moe_out_buf.handle,
-                            hidden_size,
-                            self.down_buf.handle,
-                            hidden_size,
-                            hidden_dim,
-                            weight,
-                        );
-                        self.decode_cmd.computeBarrier();
                     }
 
                     if (cpu_moe_accum_opt) |cpu_moe_accum| {
@@ -8833,6 +8880,80 @@ pub const InferenceEngine = struct {
             swiglu_buf.handle,
             swiglu_buf.size,
             wg_x,
+            1,
+            1,
+        );
+    }
+
+    /// Gemma CPU-MoE expert fusion for the packed Q4_K gate/up tensor:
+    /// computes GEGLU(W_gate·x, W_up·x) directly into swiglu_buf.
+    fn dispatchDmmvFusedGateUpGegluOffset(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        swiglu_buf: Buffer,
+        M: u32,
+        K: u32,
+        gate_offset: u32,
+        up_offset: u32,
+    ) !void {
+        const pip = &(self.dmmv.pipeline_q4k_fused_gate_up_geglu orelse return error.ShaderNotLoaded);
+        const push = DmmvGateUpGegluPushConstants{
+            .M = M,
+            .K = K,
+            .gate_offset = gate_offset,
+            .up_offset = up_offset,
+            .x_offset = 0,
+            .y_offset = 0,
+        };
+        const wg_x: u32 = (M + 1) / 2;
+        self.pushDispatch3(
+            pip,
+            std.mem.asBytes(&push),
+            tensor.gpu_buffer.handle,
+            tensor.gpu_buffer.size,
+            input_buf.handle,
+            input_size,
+            swiglu_buf.handle,
+            swiglu_buf.size,
+            wg_x,
+            1,
+            1,
+        );
+    }
+
+    /// Q5_1 expert down projection fused with `moe_out += weight * down`.
+    fn dispatchDmmvQ5_1AccOffset(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        output_buf: Buffer,
+        M: u32,
+        K: u32,
+        a_offset: u32,
+        scale: f32,
+    ) !void {
+        const pip = &(self.dmmv.pipeline_q5_1_acc orelse return error.ShaderNotLoaded);
+        const push = DmmvScaleAccPushConstants{
+            .M = M,
+            .K = K,
+            .a_offset = a_offset,
+            .x_offset = 0,
+            .y_offset = 0,
+            .scale_bits = @bitCast(scale),
+        };
+        self.pushDispatch3(
+            pip,
+            std.mem.asBytes(&push),
+            tensor.gpu_buffer.handle,
+            tensor.gpu_buffer.size,
+            input_buf.handle,
+            input_size,
+            output_buf.handle,
+            output_buf.size,
+            (M + 1) / 2,
             1,
             1,
         );

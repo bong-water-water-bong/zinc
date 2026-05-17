@@ -107,6 +107,28 @@ pub const DmmvSigmoidAccPushConstants = extern struct {
     gate_offset: u32,
 };
 
+/// Push constants for the Gemma CPU-MoE fused gate+up+GEGLU shader.
+/// Gate/up offsets are byte offsets into the same packed Q4_K expert tensor;
+/// x/y offsets follow the standard DMMV byte convention.
+pub const DmmvGateUpGegluPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    gate_offset: u32,
+    up_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+};
+
+/// Push constants for quantized DMMV fused with `y += scale * dot(W, x)`.
+pub const DmmvScaleAccPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+    scale_bits: u32,
+};
+
 /// Push constants for the fused Q8_0 pair DMMV shader. Computes two
 /// independent Q8_0 matvecs that share one F32 input vector.
 pub const DmmvQ8PairPushConstants = extern struct {
@@ -266,6 +288,10 @@ pub const DmmvDispatch = struct {
     /// barrier per layer (gate+up → swiglu), and reads the shared input
     /// once per block. Same DmmvPushConstants layout as pipeline_q4k.
     pipeline_q4k_fused_gate_up_swiglu: ?Pipeline,
+    /// Gemma CPU-routed MoE expert front-end fusion. Gemma packs expert
+    /// gate/up rows into one Q4_K tensor, so this takes independent byte
+    /// offsets into that tensor and writes GEGLU(gate, up) directly.
+    pipeline_q4k_fused_gate_up_geglu: ?Pipeline,
     /// Q8_0 sibling of pipeline_q4k_fused_gate_up_swiglu. Targets the
     /// shared expert in Qwen 3.5 / 3.6 MoE packs where shared FFN
     /// weights ship as Q8_0 (rather than Q4_K). Same 4-binding layout
@@ -313,6 +339,9 @@ pub const DmmvDispatch = struct {
     pipeline_mxfp4_moe: ?Pipeline,
     /// MoE Q5_1 pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_q5_1_moe: ?Pipeline,
+    /// Q5_1 DMMV fused with scaled accumulation. Used by Gemma CPU-routed
+    /// MoE to fold down projection + weighted accumulation into one dispatch.
+    pipeline_q5_1_acc: ?Pipeline,
     /// MoE Q6K pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_q6k_moe: ?Pipeline,
     /// Foundation for future mul_mmq work: quantize an F32 activation into
@@ -480,6 +509,12 @@ pub const DmmvDispatch = struct {
             log.warn("Q5_1 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const q5_1_acc_push_size = @sizeOf(DmmvScaleAccPushConstants);
+        const q5_1_acc_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1_acc.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5_1_acc = pipeline_mod.createFromSpirvWithOptions(instance, q5_1_acc_path, 3, q5_1_acc_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_1 scaled-acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         const q5k_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k.spv", .{shader_dir}) catch unreachable;
         // Q5_K K-parallel shader: cross-subgroup shared-memory reduction handles
@@ -595,6 +630,13 @@ pub const DmmvDispatch = struct {
         const q4k_fused_gate_up_swiglu_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_swiglu.spv", .{shader_dir}) catch unreachable;
         const pipeline_q4k_fused_gate_up_swiglu = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gate_up_swiglu_path, 4, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("Q4_K dense fused gate+up+SwiGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const q4k_fused_gate_up_geglu_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_geglu.spv", .{shader_dir}) catch unreachable;
+        const gate_up_geglu_push_size = @sizeOf(DmmvGateUpGegluPushConstants);
+        const pipeline_q4k_fused_gate_up_geglu = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gate_up_geglu_path, 3, gate_up_geglu_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K Gemma fused gate+up+GEGLU shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -760,6 +802,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_fused_gate_up_swiglu_moe = pipeline_q4k_fused_gate_up_swiglu_moe,
             .pipeline_q4k_fused_gate_up_swiglu_moe_spec8 = pipeline_q4k_fused_gate_up_swiglu_moe_spec8,
             .pipeline_q4k_fused_gate_up_swiglu = pipeline_q4k_fused_gate_up_swiglu,
+            .pipeline_q4k_fused_gate_up_geglu = pipeline_q4k_fused_gate_up_geglu,
             .pipeline_q8_0_fused_gate_up_swiglu = pipeline_q8_0_fused_gate_up_swiglu,
             .pipeline_q8_0_fused_gate_up_swiglu_gate = pipeline_q8_0_fused_gate_up_swiglu_gate,
             .pipeline_q8_0_sigmoid_acc = pipeline_q8_0_sigmoid_acc,
@@ -768,6 +811,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q5k_moe_fused_down_acc = pipeline_q5k_moe_fused_down_acc,
             .pipeline_mxfp4_moe = pipeline_mxfp4_moe,
             .pipeline_q5_1_moe = pipeline_q5_1_moe,
+            .pipeline_q5_1_acc = pipeline_q5_1_acc,
             .pipeline_q5k_moe = pipeline_q5k_moe,
             .pipeline_q5k_moe_kpar = pipeline_q5k_moe_kpar,
             .pipeline_q6k_moe = pipeline_q6k_moe,
@@ -1231,6 +1275,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_fused_gate_up_swiglu_moe) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_swiglu_moe_spec8) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_swiglu) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_geglu) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu_gate) |*p| p.deinit();
         if (self.pipeline_q8_0_sigmoid_acc) |*p| p.deinit();
@@ -1239,6 +1284,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5k_moe_fused_down_acc) |*p| p.deinit();
         if (self.pipeline_q5k_moe) |*p| p.deinit();
         if (self.pipeline_q5k_moe_kpar) |*p| p.deinit();
+        if (self.pipeline_q5_1_acc) |*p| p.deinit();
         if (self.pipeline_q6k_moe) |*p| p.deinit();
         if (self.pipeline_quantize_q8_1) |*p| p.deinit();
         if (self.pipeline_count_experts) |*p| p.deinit();
