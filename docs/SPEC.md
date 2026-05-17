@@ -583,3 +583,4 @@ Those are active engineering directions, not hidden features.
 - [Apple Silicon Metal Enablement](/zinc/docs/apple-silicon-metal-enablement) for the full Metal port narrative
 - [TurboQuant Spec](/zinc/docs/turboquant-spec) for the forward-looking KV compression design
 - [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning) for AMD-specific performance work
+- [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for Arc B-series hardware, memory-bandwidth, and opcode notes

@@ -160,4 +160,5 @@ Then open `http://localhost:8080/` in your browser.
 - [Serving HTTP API](/zinc/docs/api) for the full endpoint reference
 - [Development Guide](/zinc/docs/development) for building, testing, and contributing
 - [RDNA4 tuning](/zinc/docs/rdna4-tuning) for AMD performance work
+- [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for Arc B-series hardware details
 - [Apple Silicon Reference](/zinc/docs/apple-silicon-reference) for M1 through M5 platform details

@@ -8,7 +8,7 @@ ZINC runs on consumer GPUs (Linux, Vulkan) and Apple Silicon (macOS, Metal). Thi
 |----------|-----|---------|--------|
 | **Linux** | AMD RDNA4 | Vulkan 1.3 | Primary tuning target |
 | **Linux** | AMD RDNA3 | Vulkan 1.3 | Supported, less tuned |
-| **Linux** | Intel Arc Xe2 / Battlemage | Vulkan 1.3 | Experimental bring-up |
+| **Linux** | Intel Arc Xe2 / Battlemage | Vulkan 1.3+ | Experimental bring-up |
 | **macOS** | Apple Silicon M1 through M5 | Metal | Supported, native MSL shaders |
 
 ## AMD GPUs (Linux)
@@ -47,11 +47,45 @@ If that command does not show your AMD GPU, ZINC will not work.
 
 Exact fit depends on architecture, quantization, and context length. `--check -m <model>` prints a practical fit estimate.
 
-### Future AMD directions
+## Intel Arc GPUs (Linux)
+
+Intel Arc support is an experimental Vulkan bring-up path. The current target is the Arc B-series / Battlemage line:
+
+| Family | Examples | Notes |
+| --- | --- | --- |
+| Arc B-series desktop | Arc B580, Arc B570 | Best fit for 7B/8B models; B580 is the stronger consumer target |
+| Arc Pro B-series | Arc Pro B70, B65, B60, B50 | Larger VRAM options for local AI; B70/B65 are the 32 GB targets |
+
+### Intel requirements
+
+- **OS**: Linux
+- **API**: Vulkan 1.3 or newer, depending on card and driver
+- **Driver**: Intel ANV / Mesa Vulkan driver
+- **Platform**: UEFI with Resizable BAR enabled for benchmark-quality results
+
+Verify the Vulkan stack:
+
+```bash
+vulkaninfo --summary
+```
+
+If that command does not show your Intel Arc GPU, ZINC will not use it.
+
+### Intel VRAM guide
+
+| VRAM | B-series cards | What fits |
+| --- | --- | --- |
+| 10-12 GB | B570, B580 | 7B/8B class models |
+| 16 GB | B50 | 8B with more context; some 12B experiments |
+| 24 GB | B60 | 20B class and tight larger-model experiments |
+| 32 GB | B65, B70 | 27B dense and 35B MoE targets |
+
+See [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for the full B-series card table, device IDs, memory bandwidth, Xe2 opcode notes, and ZINC tuning guidance.
+
+## Other Vulkan GPUs
 
 | Family | Status |
 | --- | --- |
-| Intel Arc | Experimental Vulkan bring-up |
 | NVIDIA via Vulkan | Vulkan works, not primary target |
 
 ## Apple Silicon (macOS)
@@ -140,6 +174,14 @@ vulkaninfo --summary
 ./zig-out/bin/zinc --check
 ```
 
+### Linux (Intel Arc)
+
+```bash
+lspci | grep -i "vga\|display\|intel\|arc"
+vulkaninfo --summary
+./zig-out/bin/zinc --check
+```
+
 ### macOS (Apple Silicon)
 
 ```bash
@@ -160,6 +202,17 @@ zig build -Doptimize=ReleaseFast
 ```
 
 Then see [RDNA4 Tuning](/zinc/docs/rdna4-tuning) for performance work.
+
+### On Linux with an Intel Arc GPU
+
+```bash
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/zinc --check
+./zig-out/bin/zinc model pull qwen3-8b-q4k-m
+./zig-out/bin/zinc chat
+```
+
+Then see [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for Arc B-series hardware details and current tuning notes.
 
 ### On macOS with Apple Silicon
 
