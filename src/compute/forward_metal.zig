@@ -1360,7 +1360,7 @@ fn canUseDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
 }
 
 fn defaultCommandEncoderMode(cfg: ModelConfig) CommandEncoderMode {
-    _ = cfg;
+    if (cfg.architecture == .gpt_oss) return .serial;
     // Apple9 power-management traps: with `MTLDispatchTypeSerial`, the GPU
     // appears to drain the in-flight warps and let the cores idle between
     // every dispatch, even when the next dispatch is data-independent. The
@@ -8598,14 +8598,17 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
     // clocks via residency-set warm-loop) — see EFFORT_14_NOTES.md.
     const dense_cmd_group_layers: usize = 30;
     const use_single_gpu_cmd = !engine.debug_validation_enabled and !engine.gemma_moe_validation_enabled and is_moe and blk: {
-        for (engine.layer_tensors) |lt| {
-            if (!canUseGpuRoutedBatchedMoe(engine, lt)) break :blk false;
+        for (engine.layer_tensors, 0..) |lt, layer_idx| {
+            if (canUseGpuRoutedBatchedMoe(engine, lt)) continue;
+            if (canUseGpuRoutedGptOssMoe(engine, lt, layer_idx, hidden_dim, inter_dim)) continue;
+            break :blk false;
         }
         break :blk true;
     };
     if (engine.profile_enabled and engine.position == 0 and is_moe and !use_single_gpu_cmd) {
         for (engine.layer_tensors, 0..) |lt, layer_idx| {
             if (canUseGpuRoutedBatchedMoe(engine, lt)) continue;
+            if (canUseGpuRoutedGptOssMoe(engine, lt, layer_idx, hidden_dim, inter_dim)) continue;
             log.info("Metal profile: shared token command disabled by layer {d} (gate_exps={s} up_exps={s} down_exps={s})", .{
                 layer_idx,
                 if (lt.ffn_gate_exps) |t| @tagName(t.info.type_) else "-",

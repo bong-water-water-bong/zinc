@@ -8103,11 +8103,15 @@ pub const InferenceEngine = struct {
                 const dense_ffn_gateup_phase = self.beginProfilePhase();
                 if (fused_dense_ffn_eligible) {
                     try self.dispatchDmmvFusedGateUpSwiglu(gate_tensor, up_tensor, self.ffn_norm_buf, hidden_size, self.swiglu_buf, inter_dim, hidden_dim);
-                    self.decode_cmd.computeBarrier();
+                    self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
                 } else {
                     try self.dispatchDmmv(gate_tensor, self.ffn_norm_buf, hidden_size, self.gate_buf, inter_dim, hidden_dim);
                     try self.dispatchDmmv(up_tensor, self.ffn_norm_buf, hidden_size, self.up_buf, inter_dim, hidden_dim);
-                    self.decode_cmd.computeBarrier();
+                    const dense_gateup_ranges = [_]CommandBuffer.BufferRange{
+                        .{ .buffer = self.gate_buf.handle, .size = self.gate_buf.size },
+                        .{ .buffer = self.up_buf.handle, .size = self.up_buf.size },
+                    };
+                    self.decode_cmd.computeBuffersBarrier(&dense_gateup_ranges);
 
                     try self.dispatchFfnActivation(
                         self.gate_buf.handle,
@@ -8118,7 +8122,7 @@ pub const InferenceEngine = struct {
                         self.swiglu_buf.size,
                         inter_dim,
                     );
-                    self.decode_cmd.computeBarrier();
+                    self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
                 }
                 self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
 
@@ -8261,7 +8265,7 @@ pub const InferenceEngine = struct {
             // The next layer immediately reads hidden_buf as its input.
             // GPU MoE path already barriered hidden_buf after weighted_acc/shared_gate_acc.
             if (!gpu_moe_barriers_cover_hidden) {
-                self.decode_cmd.computeBarrier();
+                self.decode_cmd.computeBufferBarrier(self.hidden_buf.handle, hidden_size);
             }
 
             // Command buffer stays open across layers (Phase 3c batching).
@@ -9708,6 +9712,37 @@ pub const InferenceEngine = struct {
                 return;
             }
 
+            // Wide-vocab Q6_K LM-head fast path. Qwen3.6 27B stores
+            // output.weight as Q6_K with M=248320, so the generic two-row
+            // kernel launches ~124k workgroups and reloads the same normalized
+            // hidden vector for every row pair. The wide variant computes 8 rows
+            // per workgroup and reuses each X tile across those rows.
+            if (qt == .q6_k and M >= 100_000 and acc_mode == 0 and self.dmmv.pipeline_q6k_wide != null) {
+                const wide_pip = &self.dmmv.pipeline_q6k_wide.?;
+                const push_wide = DmmvPushConstants{
+                    .M = M,
+                    .K = K,
+                    .a_offset = a_offset,
+                    .x_offset = x_offset,
+                    .y_offset = y_offset,
+                    .acc_mode = acc_mode,
+                };
+                self.pushDispatch3(
+                    wide_pip,
+                    std.mem.asBytes(&push_wide),
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    input_buf.handle,
+                    input_size,
+                    output_buf.handle,
+                    output_buf.size,
+                    (M + 7) / 8,
+                    1,
+                    1,
+                );
+                return;
+            }
+
             // For Q4K large M (LM head), use batch shader for better parallelism.
             if (qt == .q4_k and M > 65536 and self.dmmv.pipeline_q4k_batch != null) {
                 try self.dmmv.recordBatchDispatchPush(
@@ -10601,14 +10636,14 @@ pub const InferenceEngine = struct {
                 try self.elementwise.recordSsmGatedNorm(&self.decode_cmd, ds, push);
             }
         }
-        self.decode_cmd.computeBarrier();
+        self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, z_bytes);
         self.endProfilePhase(.ssm_gated_norm, ssm_gated_norm_phase);
 
         // --- GPU: ssm_out DMMV + residual (fused: accumulate directly into hidden_buf) ---
         const ssm_out_tensor = lt.ssm_out orelse return;
         const ssm_out_phase = self.beginProfilePhase();
         try self.dispatchDmmvAcc(ssm_out_tensor, self.swiglu_buf, z_bytes, self.hidden_buf, hidden_dim, @intCast(d_inner));
-        self.decode_cmd.computeBarrier();
+        self.decode_cmd.computeBufferBarrier(self.hidden_buf.handle, hidden_size);
         self.endProfilePhase(.ssm_out, ssm_out_phase);
     }
 

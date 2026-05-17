@@ -225,6 +225,8 @@ pub const DmmvDispatch = struct {
     pipeline_q5k: ?Pipeline,
     /// Q6K pipeline, or null.
     pipeline_q6k: ?Pipeline,
+    /// Q6K wide-vocab variant (NUM_ROWS=8) for tall LM heads.
+    pipeline_q6k_wide: ?Pipeline,
     /// MXFP4 pipeline, or null.
     pipeline_mxfp4: ?Pipeline,
     /// Q5_0 pipeline, or null.
@@ -493,12 +495,14 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         const q8_spec64 = [_]pipeline_mod.SpecConst{.{ .id = 2, .value = 64 }};
-        const pipeline_q8_0_spec64 = pipeline_mod.createFromSpirvWithOptions(instance, q8_path, 3, push_size, &q8_spec64, effective_wave64_options, allocator) catch |err| blk: {
+        const q8_spec64_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_spec64 = pipeline_mod.createFromSpirvWithOptions(instance, q8_spec64_path, 3, push_size, &q8_spec64, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q8_0 spec64 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
         const q8_spec128 = [_]pipeline_mod.SpecConst{.{ .id = 2, .value = 128 }};
-        const pipeline_q8_0_spec128 = pipeline_mod.createFromSpirvWithOptions(instance, q8_path, 3, push_size, &q8_spec128, effective_wave64_options, allocator) catch |err| blk: {
+        const q8_spec128_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_spec128 = pipeline_mod.createFromSpirvWithOptions(instance, q8_spec128_path, 3, push_size, &q8_spec128, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q8_0 spec128 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -554,6 +558,11 @@ pub const DmmvDispatch = struct {
         const q6k_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k.spv", .{shader_dir}) catch unreachable;
         const pipeline_q6k = pipeline_mod.createFromSpirvWithOptions(instance, q6k_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q6_K shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q6k_wide_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_wide.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_wide = pipeline_mod.createFromSpirvWithOptions(instance, q6k_wide_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("Q6_K wide shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -830,6 +839,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q5_1 = pipeline_q5_1,
             .pipeline_q5k = pipeline_q5k,
             .pipeline_q6k = pipeline_q6k,
+            .pipeline_q6k_wide = pipeline_q6k_wide,
             .pipeline_q8_0 = pipeline_q8_0,
             .pipeline_q8_0_batch = pipeline_q8_0_batch,
             .pipeline_q8_0_spec64 = pipeline_q8_0_spec64,
@@ -1307,6 +1317,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5_1) |*p| p.deinit();
         if (self.pipeline_q5k) |*p| p.deinit();
         if (self.pipeline_q6k) |*p| p.deinit();
+        if (self.pipeline_q6k_wide) |*p| p.deinit();
         if (self.pipeline_q8_0) |*p| p.deinit();
         if (self.pipeline_q8_0_batch) |*p| p.deinit();
         if (self.pipeline_q8_0_spec64) |*p| p.deinit();
