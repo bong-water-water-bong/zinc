@@ -35,6 +35,8 @@ bun loops/optimize_zinc.ts          # rsync → build → run → agent → keep
 bun loops/optimize_llm_tps.ts --agent claude "..."  # iterate on llama.cpp throughput
 bun loops/optimize_perf.ts --effort N               # execute loops/efforts/MULTI_HOUR_EFFORT_N.md
 bun loops/implement_metal.ts        # iteratively build out the Metal backend
+bun loops/zinc_rt_autopilot.ts      # overnight A/B: legacy_vulkan vs ZINC_RT on RDNA4
+                                    # see docs/ZINC_RT_DESIGN.md for the project this drives
 ```
 
 ### Managed models and cache
@@ -158,7 +160,8 @@ loops/                           # Self-improving optimization loops
 ├── optimize_perf.ts             # Performance optimization loop
 ├── optimize_perf.test.ts        # Tests for optimize_perf
 ├── optimize_zinc.ts             # ZINC loop: rsync → build → run → agent → keep/revert
-└── optimize_zinc.test.ts        # Tests for optimize_zinc
+├── optimize_zinc.test.ts        # Tests for optimize_zinc
+└── zinc_rt_autopilot.ts         # Overnight A/B vs legacy_vulkan; drives docs/ZINC_RT_DESIGN.md
 
 docs/                            # Technical documentation (published to site)
 ├── API.md                       # OpenAI-compatible API spec
@@ -175,7 +178,8 @@ docs/                            # Technical documentation (published to site)
 ├── ROADMAP.md                   # Project roadmap
 ├── RUNNING_ZINC.md              # CLI usage and server mode
 ├── SPEC.md                      # Architecture overview
-└── TURBOQUANT_SPEC.md           # TurboQuant KV cache compression spec
+├── TURBOQUANT_SPEC.md           # TurboQuant KV cache compression spec
+└── ZINC_RT_DESIGN.md            # ZINC's own GPU runtime — replaces Vulkan; design + milestone plan
 
 site/                            # Astro website + docs frontend (zolotukhin.ai)
 ├── src/components/              # Shared Astro UI components

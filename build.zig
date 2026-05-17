@@ -1,5 +1,12 @@
 const std = @import("std");
 
+const Backend = enum {
+    auto,
+    vulkan,
+    metal,
+    zinc_rt,
+};
+
 fn configureVulkanModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -27,8 +34,31 @@ fn configureVulkanModule(
     }
 }
 
+fn resolveBunExe(b: *std.Build) []const u8 {
+    if (b.graph.env_map.get("BUN_EXE")) |bun_exe| return bun_exe;
+    if (std.fs.accessAbsolute("/root/.bun/bin/bun", .{})) |_| return "/root/.bun/bin/bun" else |_| {}
+    return "bun";
+}
+
+fn addBunDirToPath(b: *std.Build, run: *std.Build.Step.Run, bun_exe: []const u8) void {
+    if (!std.fs.path.isAbsolute(bun_exe)) return;
+    const bun_dir = std.fs.path.dirname(bun_exe) orelse return;
+    const old_path = b.graph.env_map.get("PATH") orelse "";
+    const path = if (old_path.len == 0)
+        bun_dir
+    else
+        b.fmt("{s}:{s}", .{ bun_dir, old_path });
+    run.setEnvironmentVariable("PATH", path);
+}
+
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const requested_backend = b.option(Backend, "backend", "Select inference backend: auto, vulkan, metal, zinc_rt") orelse .auto;
+    const target = b.standardTargetOptions(.{
+        .default_target = if (requested_backend == .zinc_rt)
+            .{ .cpu_model = .native }
+        else
+            .{},
+    });
     var optimize = b.standardOptimizeOption(.{});
     if (b.option(bool, "release", "Deprecated compatibility flag; prefer -Doptimize")) |release| {
         optimize = if (release) .ReleaseFast else .Debug;
@@ -45,6 +75,36 @@ pub fn build(b: *std.Build) void {
 
     const is_linux = target.result.os.tag == .linux;
     const is_macos = target.result.os.tag == .macos;
+    const selected_backend: Backend = switch (requested_backend) {
+        .auto => if (is_macos) .metal else .vulkan,
+        else => requested_backend,
+    };
+
+    if (selected_backend == .metal and !is_macos) {
+        @panic("-Dbackend=metal currently requires a macOS target");
+    }
+    if (selected_backend == .vulkan and !is_linux) {
+        @panic("-Dbackend=vulkan currently requires a Linux target");
+    }
+
+    const zinc_rt_gguf_mod = b.createModule(.{
+        .root_source_file = b.path("src/model/gguf.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const zinc_rt_lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/zinc_rt/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zinc_rt_lib_mod.addImport("gguf", zinc_rt_gguf_mod);
+    const forward_zinc_rt_mod = b.createModule(.{
+        .root_source_file = b.path("src/compute/forward_zinc_rt.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    forward_zinc_rt_mod.addImport("gguf", zinc_rt_gguf_mod);
+    forward_zinc_rt_mod.addImport("zinc_rt", zinc_rt_lib_mod);
 
     // --- Shader compilation: GLSL .comp → SPIR-V .spv ---
     // Only compiled when glslc is available (Linux build node).
@@ -162,13 +222,19 @@ pub fn build(b: *std.Build) void {
 
     // --- Main executable ---
     const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path(if (selected_backend == .zinc_rt) "src/zinc_rt/main.zig" else "src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
 
-    if (is_macos) {
+    if (selected_backend == .zinc_rt) {
+        // M0 T-CPU scaffold is pure Zig. GPU tier linking starts when
+        // forward_zinc_rt is wired to a concrete direct-submission tier.
+        exe_mod.addImport("gguf", zinc_rt_gguf_mod);
+        exe_mod.addImport("zinc_rt", zinc_rt_lib_mod);
+        exe_mod.addImport("forward_zinc_rt", forward_zinc_rt_mod);
+    } else if (is_macos) {
         exe_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
             .flags = &.{ "-fobjc-arc", "-fmodules" },
@@ -358,12 +424,17 @@ pub fn build(b: *std.Build) void {
 
     // --- Unit tests ---
     const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path(if (selected_backend == .zinc_rt) "src/zinc_rt/test_root.zig" else "src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    if (is_macos) {
+    if (selected_backend == .zinc_rt) {
+        // Pure Zig T-CPU tests; no platform GPU runtime linked.
+        test_mod.addImport("gguf", zinc_rt_gguf_mod);
+        test_mod.addImport("zinc_rt", zinc_rt_lib_mod);
+        test_mod.addImport("forward_zinc_rt", forward_zinc_rt_mod);
+    } else if (is_macos) {
         test_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
             .flags = &.{ "-fobjc-arc", "-fmodules" },
@@ -379,6 +450,20 @@ pub fn build(b: *std.Build) void {
         .root_module = test_mod,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    const zinc_rt_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/zinc_rt/test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zinc_rt_test_mod.addImport("gguf", zinc_rt_gguf_mod);
+    zinc_rt_test_mod.addImport("zinc_rt", zinc_rt_lib_mod);
+    zinc_rt_test_mod.addImport("forward_zinc_rt", forward_zinc_rt_mod);
+    const zinc_rt_unit_tests = b.addTest(.{
+        .name = "zinc-rt-ir-smoke",
+        .root_module = zinc_rt_test_mod,
+    });
+    const run_zinc_rt_unit_tests = b.addRunArtifact(zinc_rt_unit_tests);
     // In partial mode (`full_tests = false`) restrict `bun test` to the
     // fast unit-test files. The slow `tests/test_qwen_smoke.test.ts`
     // file launches multiple managed servers and loads three GGUFs
@@ -390,15 +475,17 @@ pub fn build(b: *std.Build) void {
     // Full mode still runs every test file so the user's local
     // `zig build test --full-tests` (or whatever flag wires
     // `full_tests = true`) is unchanged.
+    const bun_exe = resolveBunExe(b);
     const run_bun_tests = if (full_tests)
-        b.addSystemCommand(&.{ "bun", "test" })
+        b.addSystemCommand(&.{ bun_exe, "test" })
     else
         b.addSystemCommand(&.{
-            "bun",       "test",
+            bun_exe,     "test",
             "loops/",    "tools/",
             "site/src/", "tests/chat_ui_markdown.test.ts",
         });
     run_bun_tests.setCwd(b.path("."));
+    addBunDirToPath(b, run_bun_tests, bun_exe);
     run_bun_tests.setEnvironmentVariable("ZINC_REQUIRE_FULL_TESTS", if (full_tests) "1" else "0");
     // Pin ZINC_TARGET_TOK_PER_SEC to the implement_metal.ts default (50)
     // so the harness's parent-process value (e.g. 26) does not leak into
@@ -410,10 +497,12 @@ pub fn build(b: *std.Build) void {
     // "TARGET REACHED" prompt instead.
     run_bun_tests.setEnvironmentVariable("ZINC_TARGET_TOK_PER_SEC", "50");
 
-    const print_summary = b.addSystemCommand(&.{ "bun", "tools/print_test_summary.ts" });
+    const print_summary = b.addSystemCommand(&.{ bun_exe, "tools/print_test_summary.ts" });
     print_summary.setCwd(b.path("."));
+    addBunDirToPath(b, print_summary, bun_exe);
     print_summary.setEnvironmentVariable("ZINC_REQUIRE_FULL_TESTS", if (full_tests) "1" else "0");
     print_summary.step.dependOn(&run_unit_tests.step);
+    print_summary.step.dependOn(&run_zinc_rt_unit_tests.step);
     print_summary.step.dependOn(&run_bun_tests.step);
 
     const test_step = b.step("test", "Run unit tests");

@@ -3,6 +3,8 @@ zig-cache/
 zig-out/
 .zig-cache/
 .zig-cache-local/
+.zig-cache-global/
+.zinc_rt_autopilot/
 .zig-global-cache-local/
 .zig-global-cache/
 .zig-api-cache/
