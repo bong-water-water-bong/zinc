@@ -12981,11 +12981,13 @@ pub fn generate(
             var moe_ns: u64 = 0;
             var shared_ns: u64 = 0;
             var ssm_ns: u64 = 0;
+            var dense_ffn_ns: u64 = 0;
             var tail_ns: u64 = 0;
             var embed_ns: u64 = 0;
             // `.ssm` wraps all ssm_* sub-phases and `.moe_routed` wraps all moe_*
-            // sub-phases, so summing every enum value double-counts. Bucket with
-            // the wrappers only; shared_* and tail/attn/embed have no wrapper.
+            // sub-phases. `.dense_ffn` likewise wraps dense_ffn_* sub-phases.
+            // Bucket with the wrappers only; shared_* and tail/attn/embed have
+            // no wrapper.
             inline for (@typeInfo(ProfilePhase).@"enum".fields) |f| {
                 const phase_val: ProfilePhase = @enumFromInt(f.value);
                 const v = engine.prefill_gpu_phase_ns[f.value];
@@ -12994,6 +12996,7 @@ pub fn generate(
                     .moe_routed => moe_ns += v,
                     .shared_expert, .shared_proj, .shared_swiglu, .shared_down, .shared_gate_acc => shared_ns += v,
                     .ssm => ssm_ns += v,
+                    .dense_ffn => dense_ffn_ns += v,
                     .final_tail => tail_ns += v,
                     .embed_upload => embed_ns += v,
                     else => {},
@@ -13008,21 +13011,24 @@ pub fn generate(
             const moe_avg = to_ms(moe_ns) / samples_f;
             const shared_avg = to_ms(shared_ns) / samples_f;
             const ssm_avg = to_ms(ssm_ns) / samples_f;
+            const dense_ffn_avg = to_ms(dense_ffn_ns) / samples_f;
             const tail_avg = to_ms(tail_ns) / samples_f;
             const embed_avg = to_ms(embed_ns) / samples_f;
             log.info(
-                "Prefill GPU phases: per-tok attn={d:.2} ms moe={d:.2} ms shared={d:.2} ms ssm={d:.2} ms tail={d:.2} ms embed={d:.3} ms | totals attn={d:.1} moe={d:.1} shared={d:.1} ssm={d:.1} tail={d:.1} embed={d:.1}",
+                "Prefill GPU phases: per-tok attn={d:.2} ms moe={d:.2} ms shared={d:.2} ms ssm={d:.2} ms dense_ffn={d:.2} ms tail={d:.2} ms embed={d:.3} ms | totals attn={d:.1} moe={d:.1} shared={d:.1} ssm={d:.1} dense_ffn={d:.1} tail={d:.1} embed={d:.1}",
                 .{
                     attn_avg,
                     moe_avg,
                     shared_avg,
                     ssm_avg,
+                    dense_ffn_avg,
                     tail_avg,
                     embed_avg,
                     to_ms(attn_ns),
                     to_ms(moe_ns),
                     to_ms(shared_ns),
                     to_ms(ssm_ns),
+                    to_ms(dense_ffn_ns),
                     to_ms(tail_ns),
                     to_ms(embed_ns),
                 },
@@ -13059,6 +13065,15 @@ pub fn generate(
                     to_ms(ssm_delta_ns),
                     to_ms(ssm_gnorm_ns),
                     to_ms(ssm_out_ns),
+                },
+            );
+            const dense_gateup_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup)];
+            const dense_down_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down)];
+            log.info(
+                "Prefill dense_ffn subphases totals: gateup={d:.1} down={d:.1} ms",
+                .{
+                    to_ms(dense_gateup_ns),
+                    to_ms(dense_down_ns),
                 },
             );
         }
