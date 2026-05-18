@@ -1084,8 +1084,8 @@ pub const Tokenizer = struct {
                     pos += written.len;
                 }
                 if (options.add_generation_prompt) {
-                    // Match llama.cpp: omit <|message|> — model generates it
-                    const suffix = std.fmt.bufPrint(buf[pos..], "<|start|>assistant", .{}) catch return error.BufferTooSmall;
+                    const channel = if (options.enable_thinking orelse false) "analysis" else "final";
+                    const suffix = std.fmt.bufPrint(buf[pos..], "<|start|>assistant<|channel|>{s}<|message|>", .{channel}) catch return error.BufferTooSmall;
                     pos += suffix.len;
                 }
             },
@@ -1515,6 +1515,56 @@ test "applyChatTemplate with im_start template uses ChatML" {
     try std.testing.expect(std.mem.indexOf(u8, result, "system") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "You help.") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Hi") != null);
+}
+
+test "applyChatTemplate openai_moe defaults generation to final channel" {
+    var tok = Tokenizer{
+        .vocab = &.{},
+        .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 200002,
+        .prepend_bos = false,
+        .chat_template = "<|start|>{{ role }}<|message|>{{ content }}<|end|>",
+        .allocator = std.testing.allocator,
+    };
+    defer tok.token_to_id.deinit();
+
+    var buf: [256]u8 = undefined;
+    const roles = [_][]const u8{"user"};
+    const contents = [_][]const u8{"Hello"};
+    const result = try tok.applyChatTemplate(&roles, &contents, &buf);
+
+    try std.testing.expectEqualStrings(
+        "<|start|>user<|message|>Hello<|end|><|start|>assistant<|channel|>final<|message|>",
+        result,
+    );
+}
+
+test "applyChatTemplate openai_moe can request analysis channel" {
+    var tok = Tokenizer{
+        .vocab = &.{},
+        .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 200002,
+        .prepend_bos = false,
+        .chat_template = "<|start|>{{ role }}<|message|>{{ content }}<|end|>",
+        .allocator = std.testing.allocator,
+    };
+    defer tok.token_to_id.deinit();
+
+    var buf: [256]u8 = undefined;
+    const roles = [_][]const u8{"user"};
+    const contents = [_][]const u8{"Hello"};
+    const result = try tok.applyChatTemplateWithOptions(&roles, &contents, .{ .enable_thinking = true }, &buf);
+
+    try std.testing.expectEqualStrings(
+        "<|start|>user<|message|>Hello<|end|><|start|>assistant<|channel|>analysis<|message|>",
+        result,
+    );
 }
 
 test "applyChatTemplate gemma4 defaults to closed thought channel prompt" {
