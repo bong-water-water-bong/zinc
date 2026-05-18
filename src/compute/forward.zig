@@ -4956,7 +4956,7 @@ pub const InferenceEngine = struct {
                         const q_size = @as(vk.c.VkDeviceSize, q_dim) * @sizeOf(f32);
                         if (pip.uses_push_descriptors) {
                             const push = DeinterleavePush{
-                                .head_dim = config.head_dim,
+                                .head_dim = layer_head_dim,
                                 .n_heads = config.n_heads,
                             };
                             self.pushDispatch3(
