@@ -119,6 +119,7 @@ pub fn build(b: *std.Build) void {
         "dmmv_q8_0_fused_pair",
         "dmmv_q5k",
         "dmmv_q6k",
+        "dmmv_q6k_wide",
         "dmmv_f16",
         "dmmv_f32",
         "rms_norm_mul",

@@ -696,6 +696,8 @@ const cli_harmony_stop_strs = [_][]const u8{
 };
 const cli_chat_stop_strs = [_][]const u8{
     "<|im_end|>",
+    "<turn|>",
+    "<end_of_turn>",
     "<|endoftext|>",
     "<|return|>",
 };
@@ -1671,7 +1673,21 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer model.deinit();
-            memory_plan.applyRequestedContextLimit(&model.config, config.context_length);
+            if (config.context_length) |requested_context| {
+                memory_plan.applyRequestedContextLimit(&model.config, requested_context);
+            } else {
+                const metal_budget = blk: {
+                    const working_set = device.recommendedMaxWorkingSetSize();
+                    break :blk if (working_set > 0) working_set else device.totalMemory();
+                };
+                const auto_context = memory_plan.autoContextTokensForDeviceBudget(
+                    memory_plan.profile(model.config),
+                    metal_loader.residentWeightBytes(&model),
+                    metal_budget,
+                    model.config.context_length,
+                );
+                memory_plan.applyRequestedContextLimit(&model.config, auto_context);
+            }
 
             log.info("Prompt: {s}", .{prompt});
 
@@ -2394,6 +2410,8 @@ test "shouldAutoChatCliPrompt leaves non-gemma templates raw" {
 
 test "trimCliOutputText strips chat terminator only in chat mode" {
     try std.testing.expectEqualStrings("Paris", trimCliOutputText("Paris<|im_end|>", true));
+    try std.testing.expectEqualStrings("Paris", trimCliOutputText("Paris<turn|>", true));
+    try std.testing.expectEqualStrings("Paris", trimCliOutputText("Paris<end_of_turn>", true));
     try std.testing.expectEqualStrings("Paris<|im_end|>", trimCliOutputText("Paris<|im_end|>", false));
     try std.testing.expectEqualStrings("Paris", trimCliOutputText("Paris", true));
 }

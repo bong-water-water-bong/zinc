@@ -616,6 +616,23 @@ function createStats(name, rows) {
   };
 }
 
+export function benchmarkFailureReason(prefix, error) {
+  const lines = String(error?.message ?? error ?? "unknown error")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const firstLine = lines[0] ?? "unknown error";
+  const commandFailure = firstLine.match(/^Command failed \(([^)]+)\):/);
+  if (commandFailure) {
+    const diagnostic = lines
+      .slice(1)
+      .find((line) => /^(err\(|error:|.*\b(?:ENOMEM|QueueSubmitFailed|ShaderFileNotFound|FileNotFound)\b)/i.test(line));
+    if (diagnostic) return `${prefix}: ${diagnostic}`;
+    return `${prefix}: command exited unsuccessfully (${commandFailure[1]}).`;
+  }
+  return `${prefix}: ${firstLine}`;
+}
+
 async function pathExists(filepath) {
   try {
     await fs.access(filepath);
@@ -1597,7 +1614,7 @@ async function discoverMetalCases(modelRoot) {
   return discovered;
 }
 
-function defaultRdnaCases(modelRoot) {
+export function defaultRdnaCases(modelRoot) {
   return [
     {
       id: "qwen36-35b-a3b-q4k-xl",
@@ -1896,7 +1913,7 @@ async function runMetalTarget(args) {
           } catch (error) {
             zinc = {
               name: "ZINC",
-              unavailable_reason: `ZINC run failed: ${error.message.split("\n")[0]}`,
+              unavailable_reason: benchmarkFailureReason("ZINC run failed", error),
             };
           }
           zincByScenario.set(scenarioDef.id, zinc);
@@ -1927,7 +1944,7 @@ async function runMetalTarget(args) {
           } catch (error) {
             baseline = {
               name: "llama.cpp",
-              unavailable_reason: `Local baseline failed: ${error.message.split("\n")[0]}`,
+              unavailable_reason: benchmarkFailureReason("Local baseline failed", error),
             };
           }
         } else if (llamaCli) {
@@ -1945,13 +1962,13 @@ async function runMetalTarget(args) {
           } catch (error) {
             baseline = {
               name: "llama.cpp",
-              unavailable_reason: `Local baseline failed: ${error.message.split("\n")[0]}`,
+              unavailable_reason: benchmarkFailureReason("Local baseline failed", error),
             };
           }
         } else if (serverLaunchError) {
           baseline = {
             name: "llama.cpp",
-            unavailable_reason: `Local baseline failed: ${serverLaunchError.message.split("\n")[0]}`,
+            unavailable_reason: benchmarkFailureReason("Local baseline failed", serverLaunchError),
           };
         } else {
           baseline = {
@@ -2138,7 +2155,7 @@ async function runRdnaTarget(args) {
           } catch (error) {
             zinc = {
               name: "ZINC",
-              unavailable_reason: `ZINC run failed: ${error.message.split("\n")[0]}`,
+              unavailable_reason: benchmarkFailureReason("ZINC run failed", error),
             };
           }
           zincByScenario.set(scenarioDef.id, zinc);
@@ -2171,13 +2188,13 @@ async function runRdnaTarget(args) {
           } catch (error) {
             baseline = {
               name: "llama.cpp",
-              unavailable_reason: `RDNA baseline failed: ${error.message.split("\n")[0]}`,
+              unavailable_reason: benchmarkFailureReason("RDNA baseline failed", error),
             };
           }
         } else if (entry.baseline_enabled !== false && serverLaunchFailure) {
           baseline = {
             name: "llama.cpp",
-            unavailable_reason: `RDNA baseline failed: ${serverLaunchFailure.message.split("\n")[0]}`,
+            unavailable_reason: benchmarkFailureReason("RDNA baseline failed", serverLaunchFailure),
           };
         } else if (entry.baseline_enabled !== false && rdnaLlamaCli) {
           try {
@@ -2194,7 +2211,7 @@ async function runRdnaTarget(args) {
           } catch (error) {
             baseline = {
               name: "llama.cpp",
-              unavailable_reason: `RDNA baseline failed: ${error.message.split("\n")[0]}`,
+              unavailable_reason: benchmarkFailureReason("RDNA baseline failed", error),
             };
           }
         } else {
@@ -2325,7 +2342,7 @@ async function runIntelTarget(args) {
           } catch (error) {
             zinc = {
               name: "ZINC",
-              unavailable_reason: `ZINC run failed: ${error.message.split("\n")[0]}`,
+              unavailable_reason: benchmarkFailureReason("ZINC run failed", error),
             };
           }
           zincByScenario.set(scenarioDef.id, zinc);
@@ -2358,7 +2375,7 @@ async function runIntelTarget(args) {
           } catch (error) {
             baseline = {
               name: "llama.cpp",
-              unavailable_reason: `Intel baseline failed: ${error.message.split("\n")[0]}`,
+              unavailable_reason: benchmarkFailureReason("Intel baseline failed", error),
             };
           }
         } else if (entry.baseline_enabled !== false && intelLlamaCli) {
@@ -2376,13 +2393,13 @@ async function runIntelTarget(args) {
           } catch (error) {
             baseline = {
               name: "llama.cpp",
-              unavailable_reason: `Intel baseline failed: ${error.message.split("\n")[0]}`,
+              unavailable_reason: benchmarkFailureReason("Intel baseline failed", error),
             };
           }
         } else if (entry.baseline_enabled !== false && serverLaunchFailure) {
           baseline = {
             name: "llama.cpp",
-            unavailable_reason: `Intel baseline failed: ${serverLaunchFailure.message.split("\n")[0]}`,
+            unavailable_reason: benchmarkFailureReason("Intel baseline failed", serverLaunchFailure),
           };
         } else {
           baseline = {

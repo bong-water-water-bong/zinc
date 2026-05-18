@@ -4,6 +4,7 @@ import {
   buildArtifact,
   buildComparison,
   buildMeasurementPhases,
+  benchmarkFailureReason,
   canonicalModelIdFromPath,
   compareModelsByName,
   detectRdnaServerStartupFailure,
@@ -12,6 +13,7 @@ import {
   defaultMetalCases,
   defaultMaxTokensForModelId,
   defaultPromptForModelId,
+  defaultRdnaCases,
   defaultScenarioDefsForModel,
   guessFamily,
   localZincCommand,
@@ -122,6 +124,15 @@ test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
   expect(qwen36Dense?.model_path).toBe("/tmp/models/qwen36-27b-q4k-m/model.gguf");
 });
 
+test("default RDNA cases include Qwen 3.6 27B dense", () => {
+  const cases = defaultRdnaCases("/root/models");
+  const qwen36Dense = cases.find((entry) => entry.id === "qwen36-27b-q4k-m");
+
+  expect(qwen36Dense?.model_path).toBe("/root/models/Qwen3.6-27B-Q4_K_M.gguf");
+  expect(qwen36Dense?.prompt_mode).toBe("raw");
+  expect(qwen36Dense?.max_tokens).toBe(128);
+});
+
 test("default Intel cases use the remote managed cache layout", () => {
   const cases = defaultIntelCases("/remote/cache");
   const qwen = cases.find((entry) => entry.id === "qwen3-8b-q4k-m");
@@ -198,6 +209,14 @@ main: exiting due to model loading error
 
   expect(failure).toBe("unknown model architecture: 'gemma4'");
   expect(detectRdnaServerStartupFailure("server ready")).toBeNull();
+});
+
+test("benchmark failure reasons do not publish shell commands", () => {
+  const error = new Error("Command failed (1): remote benchmark command with private args\nprivate details");
+  expect(benchmarkFailureReason("ZINC run failed", error)).toBe("ZINC run failed: command exited unsuccessfully (1).");
+  const diagnostic = new Error("Command failed (1): remote benchmark command with private args\nerr(zinc): Failed to init inference engine: QueueSubmitFailed");
+  expect(benchmarkFailureReason("ZINC run failed", diagnostic)).toBe("ZINC run failed: err(zinc): Failed to init inference engine: QueueSubmitFailed");
+  expect(benchmarkFailureReason("Intel baseline failed", new Error("Remote server failed to start"))).toBe("Intel baseline failed: Remote server failed to start");
 });
 
 test("benchmark suite uses a multi-scenario matrix instead of a single prompt", () => {

@@ -107,46 +107,146 @@ kv_bytes = layers * kv_heads * head_dim * 2 * bytes_per_scalar * context_tokens
 
 The `2` is for K and V. GQA/MLA/MoE details change `kv_heads` and `head_dim`; KV quantization changes `bytes_per_scalar`. For B570/B580, the KV budget usually decides the maximum useful context before raw compute does.
 
-## Xe2-HPG Architecture Notes
+## Compute Unit Architecture
 
-Intel's oneAPI guide lists Arc B580 as Xe2-HPG / Battlemage and gives the useful programming-level shape:
+### Xe2 Xe-core Layout (B70)
 
-| Property | Xe2-HPG B580 reference value | Inference consequence |
+The Xe core is the Battlemage scaling unit and the Intel counterpart to the AMD RDNA Compute Unit. On B70, 32 Xe cores are grouped into 8 render slices of 4 Xe cores each.
+
+Each Xe2-HPG Xe core contains:
+
+- **8 vector engines** (XVE) — SIMD execution units
+- **8 XMX engines** — systolic matrix arrays, one paired with each vector engine
+- **256 KB L1 cache** — shared across all vector engines in the Xe core
+- **128 KB SLM** (Shared Local Memory) — workgroup-managed scratchpad
+
+Each vector engine has:
+
+- **8 hardware threads** — used to hide send/memory latency
+- **128 GRF registers per thread** in regular mode, or **256 GRFs** in large-GRF mode at the cost of halved thread count
+- **512-bit register width** — wider than Alchemist's 256-bit Xe-HPG entry in the oneAPI table
+- Native **SIMD16 and SIMD32** execution at the same compute width
+
+B70 totals at 2280 MHz graphics clock:
+
+| Property | B70 value | Inference consequence |
 | --- | ---: | --- |
-| Xe cores | 20 | Main scaling unit for B-series cards |
-| Vector engines per Xe core | 8 | One Xe core exposes 8 SIMD vector engines |
-| Hardware threads per vector engine | 8 | Occupancy hides send/memory latency |
-| Supported subgroup sizes | 16, 32 | Do not use RDNA-style wave64 assumptions |
-| GRF per thread | 128 / 256 regular / large mode | Register pressure can force spills and reduce occupancy |
-| Register width | 512 bits | Wider than Alchemist's 256-bit entry in the oneAPI table |
-| L1 cache per Xe core | 256 KB | Shared by vector engines in the Xe core |
-| SLM per Xe core | 128 KB | Workgroup-managed local memory |
-| Max SLM per workgroup | 128 KB | Useful for tiled attention/prefill, but can reduce residency |
-| L3 cache | 18 MB on B580 | Shared last-level GPU cache before GDDR6 |
-| Max workgroup size | 1024 | API ceiling, not automatically the fastest local size |
+| Xe cores | 32 | Main scaling unit; render-slice grouped (8 × 4) |
+| Vector engines | 256 | 32 Xe cores × 8 XVE per core |
+| XMX engines | 256 | 32 Xe cores × 8 XMX per core, one per XVE |
+| Hardware threads | 2048 | 256 XVE × 8 threads — drives latency hiding |
+| Supported subgroup sizes | 16, 32 | Do not assume RDNA-style wave64 |
+| GRF per thread | 128 / 256 (regular / large) | Register pressure drives spills and occupancy |
+| Register width | 512 bits | One GRF is 64 bytes |
+| L1 per Xe core | 256 KB | Per-Xe-core, shared by vector engines |
+| SLM per Xe core | 128 KB | Workgroup-scoped scratchpad |
+| Max SLM per workgroup | 128 KB | Cap reduces residency to one workgroup per Xe core |
+| Max workgroup size | 1024 | API ceiling, not the optimal local size |
 
-The important mental model shift from RDNA is that an Intel subgroup is a compiler-vectorized SIMD thread, commonly 16 or 32 work-items wide. A 64-thread workgroup on Intel is usually two or four subgroups, not one wave64. Ported shaders should treat subgroup size as a specialization input, not as a compile-time constant inherited from RDNA.
+The important mental-model shift from RDNA is that an Intel subgroup is a compiler-vectorized SIMD thread, commonly 16 or 32 work-items wide. A 64-thread workgroup on Intel is usually two or four subgroups, not one wave64. Ported shaders should treat subgroup size as a specialization input, not as a compile-time constant inherited from RDNA.
+
+### Subgroup Execution Model
+
+A subgroup is the fundamental Intel execution unit. Lanes within a subgroup execute the same instruction simultaneously, predicated by an execution mask.
+
+| Property | SIMD16 | SIMD32 |
+|---|---|---|
+| Work-items per subgroup | 16 | 32 |
+| Lane width per scalar | 32 bits | 32 bits |
+| Register footprint per SIMD value | 1 GRF (64 B) | 2 GRFs (128 B) |
+| Threads/XVE at regular GRF | up to 8 | up to 8 (compiler dependent) |
+| Best for | Small kernels, high occupancy | DMMV, reductions, XMX/DPAS |
+| RDNA analogue | half of wave32 | wave32, single-cycle issue |
+
+**For ZINC's DMMV and dequant on B70:** SIMD32 is the default starting point. Memory bandwidth saturates more easily with wider subgroups, and SIMD32 lines up with most public Xe2 cooperative-matrix tile shapes.
+
+**For XMX/DPAS:** subgroup size is dictated by the cooperative-matrix tile reported by the driver. Query at runtime; do not assume a fixed value.
+
+**Divergence:** branching within a subgroup is predicated. Divergent control flow does not change the instruction stream but does increase dynamic work — minimize branches in the hot path.
+
+### Register File (GRF)
+
+Each vector engine on Xe2-HPG has a banked GRF shared across all 8 hardware threads:
+
+- Per thread (regular mode): 128 GRFs × 64 bytes = **8 KB**
+- Per thread (large GRF mode): 256 GRFs × 64 bytes = **16 KB**, with hardware threads per XVE halved to 4
+- Per Xe core (regular mode): 8 XVE × 8 threads × 8 KB ≈ **512 KB** of GRF
+- Per Xe core (large GRF): 8 XVE × 4 threads × 16 KB ≈ **512 KB**, with half the latency-hiding headroom
+
+| GRF mode | Threads/XVE | GRFs/thread | Use case |
+|---|---:|---:|---|
+| Regular | 8 | 128 | DMMV, dequant, decode-path reductions |
+| Large | 4 | 256 | Cooperative-matrix tile loops, fused attention with big tiles |
+
+GRF pressure is the primary Intel occupancy lever:
+
+- Exceeding the per-thread GRF budget spills to scratch memory (private memory in VRAM). Spills are slow.
+- IGC reports spill counts ahead of time. `unitrace` reports post-JIT private-memory bytes for live shaders.
+- Large GRF helps register-heavy kernels but worsens latency hiding because there are half as many resident threads per XVE.
+
+For B70, prefer regular GRF for DMMV and quant unpack. Reach for large GRF only when XMX tile sizes or fused attention pipelines force more than 128 GRFs per thread.
+
+There is no separate scalar register file. Constants, descriptors, and uniform values live in the same GRF and are kept uniform across the subgroup by the compiler.
 
 ### Memory Hierarchy
 
-For compute kernels, the useful hierarchy is:
+For compute kernels on B70:
 
 ```text
-GRF registers
-  -> SLM / shared local memory, per Xe core, explicit workgroup-managed cache
-  -> L1 cache, per Xe core
-  -> L3 cache, shared across the GPU
-  -> GDDR6 VRAM
+Thread → GRF registers (8 KB regular / 16 KB large per thread)
+  ↓
+Subgroup → SLM (128 KB/Xe core, workgroup-managed scratchpad)
+  ↓
+Xe core → L1 cache (256 KB)
+  ↓
+GPU → L3 cache (shared last-level GPU cache)
+  ↓
+GPU → GDDR6 VRAM (32 GB, 256-bit, 608 GB/s)
+  ↓
+Host → PCIe 5.0 x16 (~64 GB/s per direction)
 ```
 
-SLM is not automatically coherent with global memory. Treat it as a scratchpad: load from global, synchronize within the workgroup, compute, write back. The oneAPI guide describes SLM as higher-bandwidth/lower-latency memory local to a Xe core and scoped to the workgroup scheduled there.
+**Notes for ZINC kernels:**
 
-For DMMV and attention:
+- SLM is not coherent with global memory. Treat it as a load–barrier–compute–store scratchpad scoped to the workgroup.
+- L1 is per Xe core. Two workgroups on different Xe cores do not share L1 state even when accessing the same weights.
+- L3 is shared GPU-wide. Working sets that fit in L3 amplify effective bandwidth above the 608 GB/s VRAM spec.
+- Memory operations are message-based (`send` / `sendc` / `sendsc` / `sends`). A load is a routed request with coalescing, cache, and response behavior; latency is hidden by hardware-thread occupancy, not ILP alone.
+- Block messages (`load_block2d`, `store_block2d`) carry more bytes per send and reduce instruction pressure on tiled kernels.
+- Resizable BAR is effectively mandatory for B-series benchmark nodes; without it, host-visible VRAM uploads stall.
 
-- Use contiguous subgroup-lane memory access. Intel's docs emphasize that memory access shape across the subgroup controls SIMD lane and memory efficiency.
-- Prefer block-like loads/stores for tiled work. The compiler may lower structured access into more efficient send messages.
+**For DMMV and attention:**
+
+- Use contiguous subgroup-lane access. Memory access shape across the subgroup controls SIMD lane and memory efficiency.
+- Prefer block-like loads/stores for tiled work; the compiler may lower structured access into more efficient send messages.
 - Avoid atomics, fences, and cross-workgroup coordination in the token hot path.
-- Watch register spills. IGC reports ahead-of-time spill warnings, and `unitrace` can report spill/private-memory bytes for JIT paths.
+- Watch register spills. IGC reports ahead-of-time spill warnings; `unitrace` covers JIT paths.
+
+### SLM (Shared Local Memory)
+
+- **128 KB per Xe core**, scoped to the workgroup scheduled on that Xe core
+- **Max SLM per workgroup: 128 KB** — at the maximum, only one workgroup can reside per Xe core
+- Bank conflicts apply on power-of-two strided access; broadcast (multiple lanes reading the same address) is free
+- Latency is lower than L1 but higher than GRF; cross-subgroup reductions through SLM cost a barrier
+- Used for tiled attention, multi-stage reductions across subgroups, and dequant scale/min metadata staging
+
+For decode-path reductions, prefer subgroup reductions first; spill into SLM only when reducing across more than one subgroup.
+
+### XMX Matrix Engines (B70)
+
+B70 exposes **256 XMX engines** — 8 per Xe core × 32 Xe cores — paired one-to-one with vector engines. They execute DPAS (Dot Product Accumulate Systolic) at subgroup granularity.
+
+| Property | B70 |
+|---|---|
+| XMX engines | 256 (32 Xe cores × 8) |
+| Subgroup width for DPAS | SIMD16 or SIMD32 (tile-dependent) |
+| Native low-precision paths | INT8, FP16, BF16 |
+| INT8 peak | **367 TOPS** |
+| FP32 (vector path, no XMX) | 22.94 TFLOPS |
+| Vulkan entry | `VK_KHR_cooperative_matrix` when properties are usable |
+| SYCL / Level Zero entry | `joint_matrix_mad` |
+
+For ZINC, XMX is a prefill and batched-matmul lever, not a decode lever. Query `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` at runtime for tile shapes — do not hard-code RDNA4's 16×16×16. Plan for an unpack step between Q4_K/Q5_K weights and the matrix tile inputs; the systolic path does not consume packed GGUF blocks directly.
 
 ## Opcode And ISA Surface
 
