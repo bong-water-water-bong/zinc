@@ -1294,6 +1294,14 @@ pub const InferenceEngine = struct {
     dense_prefill_validate_pre_hidden_ref: ?Buffer = null,
     dense_prefill_validate_post_hidden_ref: ?Buffer = null,
     dense_prefill_validate_staging: ?Buffer = null,
+    use_qwen36_ssm_prefill_validate: bool = false,
+    ssm_prefill_validate_captured_tokens: u32 = 0,
+    ssm_prefill_validate_norm_ref: ?Buffer = null,
+    ssm_prefill_validate_qkv_ref: ?Buffer = null,
+    ssm_prefill_validate_z_ref: ?Buffer = null,
+    ssm_prefill_validate_alpha_ref: ?Buffer = null,
+    ssm_prefill_validate_beta_ref: ?Buffer = null,
+    ssm_prefill_validate_staging: ?Buffer = null,
 
     // A3b production enablement: layer-major prefill needs to replay one
     // layer at a time over all prompt tokens while reading/writing each
@@ -2686,6 +2694,87 @@ pub const InferenceEngine = struct {
             log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1 requested but prerequisites missing (requires dense SSM model with nonzero hidden/intermediate dims); skipping", .{});
         }
 
+        var ssm_prefill_validate_enabled = false;
+        var ssm_prefill_validate_norm_ref: ?Buffer = null;
+        var ssm_prefill_validate_qkv_ref: ?Buffer = null;
+        var ssm_prefill_validate_z_ref: ?Buffer = null;
+        var ssm_prefill_validate_alpha_ref: ?Buffer = null;
+        var ssm_prefill_validate_beta_ref: ?Buffer = null;
+        var ssm_prefill_validate_staging: ?Buffer = null;
+        if (dense_prefill_validate_enabled and config.ssm_d_inner > 0 and config.ssm_dt_rank > 0) {
+            const full_attn_interval_v: u32 = if (config.full_attn_interval > 0) config.full_attn_interval else 1;
+            const validate_layer_is_ssm = ((dense_prefill_validate_layer + 1) % full_attn_interval_v) != 0;
+            const lt_validate = layer_tensors[dense_prefill_validate_layer];
+            if (validate_layer_is_ssm and
+                lt_validate.attn_qkv != null and
+                lt_validate.attn_gate != null and
+                lt_validate.ssm_alpha != null and
+                lt_validate.ssm_beta != null)
+            {
+                const conv_channels_validate = config.ssm_d_inner + 2 * config.ssm_n_group * config.ssm_d_state;
+                const hidden_capture_bytes: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, dense_prefill_validate_max_tokens) *
+                    @as(vk.c.VkDeviceSize, config.hidden_dim) *
+                    @sizeOf(f32);
+                const qkv_capture_bytes: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, dense_prefill_validate_max_tokens) *
+                    @as(vk.c.VkDeviceSize, conv_channels_validate) *
+                    @sizeOf(f32);
+                const z_capture_bytes: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, dense_prefill_validate_max_tokens) *
+                    @as(vk.c.VkDeviceSize, config.ssm_d_inner) *
+                    @sizeOf(f32);
+                const ab_capture_bytes: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, dense_prefill_validate_max_tokens) *
+                    @as(vk.c.VkDeviceSize, config.ssm_dt_rank) *
+                    @sizeOf(f32);
+                const usage_ref = vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                    vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                ssm_prefill_validate_norm_ref = try Buffer.initDeviceLocal(instance, hidden_capture_bytes, usage_ref);
+                errdefer if (ssm_prefill_validate_norm_ref) |*b| b.deinit();
+                ssm_prefill_validate_qkv_ref = try Buffer.initDeviceLocal(instance, qkv_capture_bytes, usage_ref);
+                errdefer if (ssm_prefill_validate_qkv_ref) |*b| b.deinit();
+                ssm_prefill_validate_z_ref = try Buffer.initDeviceLocal(instance, z_capture_bytes, usage_ref);
+                errdefer if (ssm_prefill_validate_z_ref) |*b| b.deinit();
+                ssm_prefill_validate_alpha_ref = try Buffer.initDeviceLocal(instance, ab_capture_bytes, usage_ref);
+                errdefer if (ssm_prefill_validate_alpha_ref) |*b| b.deinit();
+                ssm_prefill_validate_beta_ref = try Buffer.initDeviceLocal(instance, ab_capture_bytes, usage_ref);
+                errdefer if (ssm_prefill_validate_beta_ref) |*b| b.deinit();
+
+                const staging_bytes = 2 * (qkv_capture_bytes + z_capture_bytes + 2 * ab_capture_bytes);
+                ssm_prefill_validate_staging = try Buffer.init(
+                    instance,
+                    staging_bytes,
+                    vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    vk.c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                );
+                errdefer if (ssm_prefill_validate_staging) |*b| b.deinit();
+                {
+                    var map_ptr: ?*anyopaque = null;
+                    if (ssm_prefill_validate_staging) |*staging_buf| {
+                        const mr = vk.c.vkMapMemory(instance.device, staging_buf.memory, 0, staging_bytes, 0, &map_ptr);
+                        if (mr != vk.c.VK_SUCCESS) return error.MapMemoryFailed;
+                        staging_buf.mapped = @ptrCast(map_ptr);
+                    }
+                }
+                ssm_prefill_validate_enabled = true;
+                log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: SSM proj validator layer={d} tokens={d} hidden={d} conv_ch={d} d_inner={d} dt_rank={d} staging={d} B", .{
+                    dense_prefill_validate_layer,
+                    dense_prefill_validate_max_tokens,
+                    config.hidden_dim,
+                    conv_channels_validate,
+                    config.ssm_d_inner,
+                    config.ssm_dt_rank,
+                    staging_bytes,
+                });
+            } else {
+                log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE=1: SSM proj validator skipped for layer={d} (not an SSM layer or missing SSM projection tensors)", .{
+                    dense_prefill_validate_layer,
+                });
+            }
+        }
+
         return InferenceEngine{
             .model = model,
             .gpu_config = gpu_config,
@@ -2742,6 +2831,13 @@ pub const InferenceEngine = struct {
             .dense_prefill_validate_pre_hidden_ref = dense_prefill_validate_pre_hidden_ref,
             .dense_prefill_validate_post_hidden_ref = dense_prefill_validate_post_hidden_ref,
             .dense_prefill_validate_staging = dense_prefill_validate_staging,
+            .use_qwen36_ssm_prefill_validate = ssm_prefill_validate_enabled,
+            .ssm_prefill_validate_norm_ref = ssm_prefill_validate_norm_ref,
+            .ssm_prefill_validate_qkv_ref = ssm_prefill_validate_qkv_ref,
+            .ssm_prefill_validate_z_ref = ssm_prefill_validate_z_ref,
+            .ssm_prefill_validate_alpha_ref = ssm_prefill_validate_alpha_ref,
+            .ssm_prefill_validate_beta_ref = ssm_prefill_validate_beta_ref,
+            .ssm_prefill_validate_staging = ssm_prefill_validate_staging,
             .routing_capture_buf = routing_capture_buf,
             .routing_capture_slot_bytes = routing_capture_slot_bytes,
             .routing_capture_max_tokens = routing_capture_max_tokens,
@@ -9275,6 +9371,180 @@ pub const InferenceEngine = struct {
         });
     }
 
+    fn validateSsmPrefillProjectionChunk(self: *InferenceEngine, n_tokens: u32) !void {
+        if (!self.use_qwen36_ssm_prefill_validate or n_tokens == 0) return;
+        const cfg = self.model.config;
+        if (self.dense_prefill_validate_layer >= cfg.n_layers) return;
+        if (cfg.ssm_d_inner == 0 or cfg.ssm_dt_rank == 0) return;
+
+        const norm_ref = self.ssm_prefill_validate_norm_ref orelse return;
+        const qkv_ref = self.ssm_prefill_validate_qkv_ref orelse return;
+        const z_ref = self.ssm_prefill_validate_z_ref orelse return;
+        const alpha_ref = self.ssm_prefill_validate_alpha_ref orelse return;
+        const beta_ref = self.ssm_prefill_validate_beta_ref orelse return;
+        const staging = self.ssm_prefill_validate_staging orelse return;
+        const lt = self.layer_tensors[self.dense_prefill_validate_layer];
+        const wqkv_t = lt.attn_qkv orelse return error.TensorNotFound;
+        const z_t = lt.attn_gate orelse return error.TensorNotFound;
+        const alpha_t = lt.ssm_alpha orelse return error.TensorNotFound;
+        const beta_t = lt.ssm_beta orelse return error.TensorNotFound;
+
+        const hidden_dim = cfg.hidden_dim;
+        const d_inner = cfg.ssm_d_inner;
+        const dt_rank = cfg.ssm_dt_rank;
+        const conv_channels = d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
+        const hidden_capture_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        const qkv_total_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, conv_channels) *
+            @sizeOf(f32);
+        const z_total_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, d_inner) *
+            @sizeOf(f32);
+        const ab_total_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, dt_rank) *
+            @sizeOf(f32);
+        const staging_needed = hidden_capture_bytes + qkv_total_bytes + z_total_bytes + 2 * ab_total_bytes;
+        if (staging_needed > staging.size) return error.BufferTooSmall;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.decode_cmd.transferToTransferBarrier();
+        const norm_ref_off: vk.c.VkDeviceSize = 0;
+        const qkv_ref_off = norm_ref_off + hidden_capture_bytes;
+        const z_ref_off = qkv_ref_off + qkv_total_bytes;
+        const alpha_ref_off = z_ref_off + z_total_bytes;
+        const beta_ref_off = alpha_ref_off + ab_total_bytes;
+        const copies = [_]vk.c.VkBufferCopy{
+            .{ .srcOffset = 0, .dstOffset = norm_ref_off, .size = hidden_capture_bytes },
+            .{ .srcOffset = 0, .dstOffset = qkv_ref_off, .size = qkv_total_bytes },
+            .{ .srcOffset = 0, .dstOffset = z_ref_off, .size = z_total_bytes },
+            .{ .srcOffset = 0, .dstOffset = alpha_ref_off, .size = ab_total_bytes },
+            .{ .srcOffset = 0, .dstOffset = beta_ref_off, .size = ab_total_bytes },
+        };
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, norm_ref.handle, staging.handle, 1, &copies[0]);
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, qkv_ref.handle, staging.handle, 1, &copies[1]);
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, z_ref.handle, staging.handle, 1, &copies[2]);
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, alpha_ref.handle, staging.handle, 1, &copies[3]);
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, beta_ref.handle, staging.handle, 1, &copies[4]);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+        const DiffStats = struct {
+            max_abs: f32 = 0,
+            max_idx: usize = 0,
+
+            fn compute(ref_vals: []const f32, got_vals: []const f32) @This() {
+                var out: @This() = .{};
+                for (ref_vals, got_vals, 0..) |r, g, i| {
+                    const diff = @abs(r - g);
+                    if (diff > out.max_abs) {
+                        out.max_abs = diff;
+                        out.max_idx = i;
+                    }
+                }
+                return out;
+            }
+        };
+
+        const base: [*]const f32 = @ptrCast(@alignCast(staging.mapped.?));
+        const norm_ref_f = base[@intCast(norm_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(hidden_capture_bytes / @sizeOf(f32)))];
+        const qkv_ref_f = base[@intCast(qkv_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(qkv_total_bytes / @sizeOf(f32)))];
+        const z_ref_f = base[@intCast(z_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(z_total_bytes / @sizeOf(f32)))];
+        const alpha_ref_f = base[@intCast(alpha_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(ab_total_bytes / @sizeOf(f32)))];
+        const beta_ref_f = base[@intCast(beta_ref_off / @sizeOf(f32))..][0..@as(usize, @intCast(ab_total_bytes / @sizeOf(f32)))];
+
+        const mmap = self.model.mmap_data orelse return error.NoMmapData;
+        const row_buf = try self.allocator.alloc(f32, hidden_dim);
+        defer self.allocator.free(row_buf);
+
+        const SampleRows = struct {
+            fn includes(row: u32, rows: u32) bool {
+                return row == 0 or
+                    row == 1 or
+                    row == rows / 2 or
+                    row + 2 == rows or
+                    row + 1 == rows;
+            }
+        };
+        const UpdateDiff = struct {
+            fn run(stats: *DiffStats, idx: usize, expected: f32, actual: f32) void {
+                const diff = @abs(expected - actual);
+                if (diff > stats.max_abs) {
+                    stats.max_abs = diff;
+                    stats.max_idx = idx;
+                }
+            }
+        };
+
+        var qkv_diff: DiffStats = .{};
+        var z_diff: DiffStats = .{};
+        var alpha_diff: DiffStats = .{};
+        var beta_diff: DiffStats = .{};
+        const qkv_data: usize = @intCast(self.model.gguf_file.tensor_data_offset + wqkv_t.info.offset);
+        const z_data: usize = @intCast(self.model.gguf_file.tensor_data_offset + z_t.info.offset);
+        const alpha_data: usize = @intCast(self.model.gguf_file.tensor_data_offset + alpha_t.info.offset);
+        const beta_data: usize = @intCast(self.model.gguf_file.tensor_data_offset + beta_t.info.offset);
+        var tok_idx: u32 = 0;
+        while (tok_idx < n_tokens) : (tok_idx += 1) {
+            const norm_slice = norm_ref_f[@as(usize, tok_idx) * hidden_dim ..][0..hidden_dim];
+            var row: u32 = 0;
+            while (row < conv_channels) : (row += 1) {
+                if (!SampleRows.includes(row, conv_channels)) continue;
+                dequantRow(mmap[qkv_data..], row, hidden_dim, wqkv_t.info.type_, row_buf);
+                var dot: f64 = 0.0;
+                for (row_buf, norm_slice) |w, x| dot += @as(f64, w) * @as(f64, x);
+                const idx: usize = @as(usize, tok_idx) * conv_channels + row;
+                UpdateDiff.run(&qkv_diff, idx, @floatCast(dot), qkv_ref_f[idx]);
+            }
+            row = 0;
+            while (row < d_inner) : (row += 1) {
+                if (!SampleRows.includes(row, d_inner)) continue;
+                dequantRow(mmap[z_data..], row, hidden_dim, z_t.info.type_, row_buf);
+                var dot: f64 = 0.0;
+                for (row_buf, norm_slice) |w, x| dot += @as(f64, w) * @as(f64, x);
+                const idx: usize = @as(usize, tok_idx) * d_inner + row;
+                UpdateDiff.run(&z_diff, idx, @floatCast(dot), z_ref_f[idx]);
+            }
+            row = 0;
+            while (row < dt_rank) : (row += 1) {
+                dequantRow(mmap[alpha_data..], row, hidden_dim, alpha_t.info.type_, row_buf);
+                var dot: f64 = 0.0;
+                for (row_buf, norm_slice) |w, x| dot += @as(f64, w) * @as(f64, x);
+                const idx: usize = @as(usize, tok_idx) * dt_rank + row;
+                UpdateDiff.run(&alpha_diff, idx, @floatCast(dot), alpha_ref_f[idx]);
+
+                dequantRow(mmap[beta_data..], row, hidden_dim, beta_t.info.type_, row_buf);
+                dot = 0.0;
+                for (row_buf, norm_slice) |w, x| dot += @as(f64, w) * @as(f64, x);
+                UpdateDiff.run(&beta_diff, idx, @floatCast(dot), beta_ref_f[idx]);
+            }
+        }
+        const max_abs = @max(@max(qkv_diff.max_abs, z_diff.max_abs), @max(alpha_diff.max_abs, beta_diff.max_abs));
+        const tol: f32 = 3e-3;
+        const verdict: []const u8 = if (max_abs <= tol) "PASS" else "FAIL";
+        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE: ssm_proj sampled_cpu layer={d} tokens={d} verdict={s} max_abs qkv={e:.6}@{d} z={e:.6}@{d} alpha={e:.6}@{d} beta={e:.6}@{d} tol={e:.3}", .{
+            self.dense_prefill_validate_layer,
+            n_tokens,
+            verdict,
+            qkv_diff.max_abs,
+            qkv_diff.max_idx,
+            z_diff.max_abs,
+            z_diff.max_idx,
+            alpha_diff.max_abs,
+            alpha_diff.max_idx,
+            beta_diff.max_abs,
+            beta_diff.max_idx,
+            tol,
+        });
+    }
+
     /// Dispatch a DMMV with accumulation: output_buf += weight × input_buf.
     fn dispatchDmmvAcc(
         self: *InferenceEngine,
@@ -10509,10 +10779,40 @@ pub const InferenceEngine = struct {
             // loops/efforts/MULTI_HOUR_EFFORT_10_QWEN36_DECODE.md for the
             // bigger Qwen 3.6 levers (Q4_K × Q8_1 mmq, batched MoE prefill).
         }
-        // The immediate next dispatch (ssm_conv1d) only reads attn_out_buf.
-        // Writes to gate_buf/router_logits_buf/down_buf are picked up by the
-        // subsequent global computeBarrier() before delta-net consumes them.
-        self.decode_cmd.computeBufferBarrier(self.attn_out_buf.handle, qkv_bytes);
+        const ssm_prefill_validate_capture = self.use_qwen36_ssm_prefill_validate and
+            self.prefill_active and
+            !is_dead_tail and
+            layer == self.dense_prefill_validate_layer and
+            self.prefill_current_token_idx < self.dense_prefill_validate_max_tokens and
+            self.ssm_prefill_validate_norm_ref != null and
+            self.ssm_prefill_validate_qkv_ref != null and
+            self.ssm_prefill_validate_z_ref != null and
+            self.ssm_prefill_validate_alpha_ref != null and
+            self.ssm_prefill_validate_beta_ref != null;
+        if (ssm_prefill_validate_capture) {
+            self.decode_cmd.computeAndTransferBarrier();
+            const tok_idx = self.prefill_current_token_idx;
+            const norm_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+            const qkv_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * qkv_bytes;
+            const z_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+            const ab_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * ab_bytes;
+            const r_norm = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = norm_dst_off, .size = hidden_size };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.norm_buf.handle, self.ssm_prefill_validate_norm_ref.?.handle, 1, &r_norm);
+            const r_qkv = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = qkv_dst_off, .size = qkv_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.attn_out_buf.handle, self.ssm_prefill_validate_qkv_ref.?.handle, 1, &r_qkv);
+            const r_z = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = z_dst_off, .size = z_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.gate_buf.handle, self.ssm_prefill_validate_z_ref.?.handle, 1, &r_z);
+            const r_alpha = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = ab_dst_off, .size = ab_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.router_logits_buf.handle, self.ssm_prefill_validate_alpha_ref.?.handle, 1, &r_alpha);
+            const r_beta = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = ab_dst_off, .size = ab_bytes };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.ssm_prefill_validate_beta_ref.?.handle, 1, &r_beta);
+            self.ssm_prefill_validate_captured_tokens = @max(self.ssm_prefill_validate_captured_tokens, tok_idx + 1);
+        } else {
+            // The immediate next dispatch (ssm_conv1d) only reads attn_out_buf.
+            // Writes to gate_buf/router_logits_buf/down_buf are picked up by the
+            // subsequent global computeBarrier() before delta-net consumes them.
+            self.decode_cmd.computeBufferBarrier(self.attn_out_buf.handle, qkv_bytes);
+        }
         self.endProfilePhase(.ssm_proj, ssm_proj_phase);
 
         // --- GPU: conv1d + SiLU ---
@@ -11352,6 +11652,9 @@ pub const InferenceEngine = struct {
         if (self.use_qwen36_dense_prefill_validate) {
             self.dense_prefill_validate_captured_tokens = 0;
         }
+        if (self.use_qwen36_ssm_prefill_validate) {
+            self.ssm_prefill_validate_captured_tokens = 0;
+        }
         defer self.prefill_active = false;
 
         // Dequantize every prompt-token embedding row upfront into a single
@@ -11552,6 +11855,12 @@ pub const InferenceEngine = struct {
             const n_validate = @min(self.dense_prefill_validate_captured_tokens, self.dense_prefill_validate_max_tokens);
             self.validateDensePrefillFfnChunk(n_validate) catch |err| {
                 log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: dense FFN replay skipped: {s}", .{@errorName(err)});
+            };
+        }
+        if (self.use_qwen36_ssm_prefill_validate and self.ssm_prefill_validate_captured_tokens > 0) {
+            const n_validate = @min(self.ssm_prefill_validate_captured_tokens, self.dense_prefill_validate_max_tokens);
+            self.validateSsmPrefillProjectionChunk(n_validate) catch |err| {
+                log.warn("ZINC_QWEN36_27B_PREFILL_VALIDATE: SSM projection replay skipped: {s}", .{@errorName(err)});
             };
         }
 
@@ -12480,6 +12789,12 @@ pub const InferenceEngine = struct {
         if (self.dense_prefill_validate_pre_hidden_ref) |*b| b.deinit();
         if (self.dense_prefill_validate_post_hidden_ref) |*b| b.deinit();
         if (self.dense_prefill_validate_staging) |*b| b.deinit();
+        if (self.ssm_prefill_validate_norm_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_qkv_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_z_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_alpha_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_beta_ref) |*b| b.deinit();
+        if (self.ssm_prefill_validate_staging) |*b| b.deinit();
         // KV cache + page table
         self.freeActiveKvPages();
         self.kv_page_pool.deinit();
