@@ -2272,6 +2272,7 @@ pub const InferenceEngine = struct {
     qwen_ssm_proj_validate_alpha_ref_buf: MetalBuffer,
     qwen_ssm_proj_validate_beta_ref_buf: MetalBuffer,
     qwen_moe_route_validate_captured_tokens: u32,
+    qwen_moe_route_validate_layer_input_ref_buf: MetalBuffer,
     qwen_moe_route_validate_norm_buf: MetalBuffer,
     qwen_moe_route_validate_routing_buf: MetalBuffer,
     qwen_moe_route_validate_gate_ref_buf: MetalBuffer,
@@ -2416,6 +2417,7 @@ pub const InferenceEngine = struct {
         self.qwen_ssm_proj_validate_alpha_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_proj_validate_beta_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_captured_tokens = 0;
+        self.qwen_moe_route_validate_layer_input_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_routing_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_gate_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
@@ -3268,6 +3270,7 @@ pub const InferenceEngine = struct {
         metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_z_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_alpha_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_beta_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_layer_input_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_norm_buf);
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_routing_buf);
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_gate_ref_buf);
@@ -10338,6 +10341,28 @@ fn shouldValidateQwenPrefillMoe(engine: *const InferenceEngine, layer_idx: usize
         layer_idx == qwenMoeRoutePackValidateLayer(engine);
 }
 
+fn shouldCaptureQwenRoutePackedLayerInput(engine: *const InferenceEngine, layer_idx: usize, using_local_cmd: bool) bool {
+    const cfg = engine.config;
+    return engine.qwen_prefill_validation_enabled and
+        using_local_cmd and
+        cfg.architecture == .qwen2_moe and
+        cfg.n_experts > 0 and
+        cfg.ssm_d_inner > 0 and
+        engine.position < qwenMoeRoutePackValidateTokens() and
+        layer_idx == qwenMoeRoutePackValidateLayer(engine);
+}
+
+fn captureQwenRoutePackedLayerInput(engine: *InferenceEngine, hidden_dim: u32) !void {
+    const n: usize = @intCast(qwenMoeRoutePackValidateTokens());
+    const h: usize = @intCast(hidden_dim);
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_layer_input_ref_buf, n * h * @sizeOf(f32));
+
+    const token_idx: usize = @intCast(engine.position);
+    const src: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+    const dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_layer_input_ref_buf.cpu_ptr.?));
+    @memcpy(dst[token_idx * h .. token_idx * h + h], src[0..h]);
+}
+
 fn shouldValidateQwenSsmProjection(
     engine: *const InferenceEngine,
     layer_idx: usize,
@@ -10534,6 +10559,7 @@ fn ensureQwenMoeRoutePackValidationBuffers(
     const sh: usize = @intCast(shexp_inter_dim);
     const k_usize: usize = @intCast(k);
     const route_slots = n * k_usize;
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_layer_input_ref_buf, n * h * @sizeOf(f32));
     try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_norm_buf, n * h * @sizeOf(f32));
     try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_routing_buf, n * k_usize * 2 * @sizeOf(u32));
     try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_gate_ref_buf, route_slots * m * @sizeOf(f32));
@@ -11264,10 +11290,10 @@ fn validateQwenMoeRoutePackChunk(
         }
     }
 
-    try validateQwenRoutePackedSsmLayer0Prefix(engine, profile, layer_idx, hidden_dim, inter_dim);
+    try validateQwenRoutePackedSsmPrefix(engine, profile, layer_idx, hidden_dim, inter_dim);
 }
 
-fn validateQwenRoutePackedSsmLayer0Prefix(
+fn validateQwenRoutePackedSsmPrefix(
     engine: *InferenceEngine,
     profile: ?*RuntimeProfile,
     layer_idx: usize,
@@ -11275,9 +11301,14 @@ fn validateQwenRoutePackedSsmLayer0Prefix(
     inter_dim: u32,
 ) !void {
     const cfg = engine.config;
-    if (!engine.qwen_prefill_validation_enabled or layer_idx != 0) return;
+    if (!engine.qwen_prefill_validation_enabled or layer_idx != qwenMoeRoutePackValidateLayer(engine)) return;
     if (cfg.architecture != .qwen2_moe or cfg.ssm_d_inner == 0) return;
     if (!canUseQwenSsmBatchedProjectionLayer(engine, layer_idx)) return;
+    if (engine.qwen_moe_route_validate_layer_input_ref_buf.handle == null or
+        engine.qwen_moe_route_validate_layer_input_ref_buf.cpu_ptr == null)
+    {
+        return;
+    }
     if (engine.ssm_conv1d_prefill_pipe.handle == null or
         engine.ssm_delta_net_prefill_pipe.handle == null or
         engine.ssm_gated_norm_pipe.handle == null)
@@ -11320,7 +11351,7 @@ fn validateQwenRoutePackedSsmLayer0Prefix(
     @memset(ssm_state_tmp.cpu_ptr.?[0..ssm_state_tmp.size], 0);
 
     var cmd = try beginProfiledCommand(engine, profile);
-    dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.prefill_embed_buf, &scratch.hidden, n * hidden_dim, 0, 0);
+    dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.qwen_moe_route_validate_layer_input_ref_buf, &scratch.hidden, n * hidden_dim, 0, 0);
     profileBarrier(&cmd, profile, .embed);
 
     // Validation-only replay of llama.cpp/vLLM's grouped prompt shape: keep
@@ -13162,6 +13193,10 @@ fn runDecodeStep(
                 &z_t.gpu_buffer;
             const wqkv_offset: u32 = if (wqkv_buf == &wqkv_t.gpu_buffer) tensorPageOffset(engine.model, wqkv_t) else 0;
             const z_offset: u32 = if (z_buf == &z_t.gpu_buffer) tensorPageOffset(engine.model, z_t) else 0;
+
+            if (shouldCaptureQwenRoutePackedLayerInput(engine, layer_idx, using_local_cmd)) {
+                try captureQwenRoutePackedLayerInput(engine, hidden_dim);
+            }
 
             const use_prefill_projection_chunk = shouldUseQwenSsmPrefillProjectionChunk(engine, layer_idx);
             if (use_prefill_projection_chunk) {
