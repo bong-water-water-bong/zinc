@@ -333,6 +333,14 @@ fn qwenMoeRoutePackValidateTokens() u32 {
     return @min(@max(requested, 1), qwen_ssm_projection_prefill_max_tokens);
 }
 
+fn qwenMoeRoutePackValidateLayer(engine: *const InferenceEngine) usize {
+    const requested =
+        readU32Env("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_LAYER") orelse
+        readU32Env("ZINC_QWEN36_ROUTE_PACK_VALIDATE_LAYER") orelse
+        engine.qwen_ssm_proj_validate_layer;
+    return @intCast(requested);
+}
+
 fn defaultQwen36SsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
     return cfg.architecture == .qwen2_moe and
         cfg.hidden_dim == 2048 and
@@ -10327,7 +10335,7 @@ fn shouldValidateQwenPrefillMoe(engine: *const InferenceEngine, layer_idx: usize
         cfg.n_experts > 0 and
         cfg.ssm_d_inner > 0 and
         engine.position < qwenMoeRoutePackValidateTokens() and
-        layer_idx == 0;
+        layer_idx == qwenMoeRoutePackValidateLayer(engine);
 }
 
 fn shouldValidateQwenSsmProjection(
@@ -10618,7 +10626,7 @@ fn validateQwenMoeRoutePackChunk(
         cfg.n_experts == 0 or
         cfg.ssm_d_inner == 0 or
         cfg.n_experts_used == 0 or
-        layer_idx != 0)
+        layer_idx != qwenMoeRoutePackValidateLayer(engine))
     {
         return;
     }
