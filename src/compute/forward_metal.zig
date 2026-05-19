@@ -357,11 +357,25 @@ pub const RuntimeProfile = struct {
     dmmv_f32_bytes: u64 = 0,
     lm_head_bytes: u64 = 0,
     ssm_bytes: u64 = 0,
+    ssm_projection_bytes: u64 = 0,
+    ssm_out_bytes: u64 = 0,
     full_attn_bytes: u64 = 0,
+    full_attn_projection_bytes: u64 = 0,
+    full_attn_output_bytes: u64 = 0,
     router_bytes: u64 = 0,
+    router_topk_calls: u32 = 0,
     shared_expert_bytes: u64 = 0,
+    shared_expert_gate_up_bytes: u64 = 0,
+    shared_expert_down_bytes: u64 = 0,
     dense_ffn_bytes: u64 = 0,
     moe_expert_bytes: u64 = 0,
+    moe_expert_gate_up_bytes: u64 = 0,
+    moe_expert_down_bytes: u64 = 0,
+    full_attn_flash_calls: u32 = 0,
+    full_attn_kv_write_calls: u32 = 0,
+    ssm_conv_calls: u32 = 0,
+    ssm_delta_calls: u32 = 0,
+    ssm_gated_norm_calls: u32 = 0,
     q8_shape_stats: [16]Q8ShapeStat = [_]Q8ShapeStat{.{}} ** 16,
 
     fn reset(self: *RuntimeProfile) void {
@@ -455,6 +469,41 @@ fn pctOf(total_ns: u64, part_ns: u64) f64 {
 
 fn bytesToGiB(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0;
+}
+
+fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
+    if (profile.decode_steps == 0 and profile.dmmv_total_bytes == 0) return;
+
+    log.info("  {s} buckets: embed {d:.2} ms | attn proj {d:.2} GiB out {d:.2} GiB flash {d} kv-write {d} | final {d:.2} ms lm-head {d:.2} GiB", .{
+        label,
+        nsToMs(profile.embedding_ns),
+        bytesToGiB(profile.full_attn_projection_bytes),
+        bytesToGiB(profile.full_attn_output_bytes),
+        profile.full_attn_flash_calls,
+        profile.full_attn_kv_write_calls,
+        nsToMs(profile.final_record_ns),
+        bytesToGiB(profile.lm_head_bytes),
+    });
+    log.info("  {s} buckets: ssm proj {d:.2} GiB recurrent conv/delta/gated {d}/{d}/{d} out {d:.2} GiB | router {d:.2} GiB topk {d} cpu {d:.2} ms", .{
+        label,
+        bytesToGiB(profile.ssm_projection_bytes),
+        profile.ssm_conv_calls,
+        profile.ssm_delta_calls,
+        profile.ssm_gated_norm_calls,
+        bytesToGiB(profile.ssm_out_bytes),
+        bytesToGiB(profile.router_bytes),
+        profile.router_topk_calls,
+        nsToMs(profile.router_cpu_ns),
+    });
+    log.info("  {s} buckets: moe gate/up {d:.2} GiB down {d:.2} GiB | shared gate/up {d:.2} GiB down {d:.2} GiB | waits {d} commits {d:.2} ms", .{
+        label,
+        bytesToGiB(profile.moe_expert_gate_up_bytes),
+        bytesToGiB(profile.moe_expert_down_bytes),
+        bytesToGiB(profile.shared_expert_gate_up_bytes),
+        bytesToGiB(profile.shared_expert_down_bytes),
+        profile.commit_waits,
+        nsToMs(profile.gpu_completion_wait_ns),
+    });
 }
 
 fn dmmvPathLabel(path: DmmvPathClass) []const u8 {
@@ -1876,6 +1925,7 @@ pub const InferenceEngine = struct {
     q8_tg_override: ?u32,
     q8_dual_tg_override: ?u32,
     request_profile: RuntimeProfile,
+    prefill_profile: RuntimeProfile,
     /// Residency set covering all engine-owned scratch + KV-cache + per-layer
     /// norm buffers, mirroring the model loader's weight residency set.
     /// `commandBufferWithUnretainedReferences` skips Metal's auto-residency
@@ -1980,6 +2030,7 @@ pub const InferenceEngine = struct {
         self.q8_tg_override = null;
         self.q8_dual_tg_override = null;
         self.request_profile = .{};
+        self.prefill_profile = .{};
         self.scratch_rset = null;
         self.private_ssm_qkv_bufs = null;
         self.private_ssm_gate_bufs = null;
@@ -3024,6 +3075,7 @@ pub const InferenceEngine = struct {
         _ = self.normalizeRequestedContext(requested_context_tokens, 1);
         self.position = 0;
         self.request_profile.reset();
+        self.prefill_profile.reset();
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -3389,6 +3441,7 @@ pub const InferenceEngine = struct {
     pub fn enableProfiling(self: *InferenceEngine) !void {
         self.profile_enabled = true;
         self.request_profile.reset();
+        self.prefill_profile.reset();
     }
 
     /// Log the collected Metal profiling summary for the current request.
@@ -3481,6 +3534,11 @@ pub const InferenceEngine = struct {
                 bytesToGiB(profile.lm_head_bytes),
                 bytesToGiB(profile.router_bytes),
             });
+            if (self.prefill_profile.decode_steps > 0) {
+                logDetailedProfileBuckets("prefill", self.prefill_profile);
+            } else {
+                logDetailedProfileBuckets(label, profile);
+            }
             if (profile.dmmv_q8_0_bytes > 0) {
                 var top_idxs: [4]?usize = .{ null, null, null, null };
                 for (profile.q8_shape_stats, 0..) |slot, idx| {
@@ -3797,6 +3855,65 @@ fn dmmvWeightBytes(quant_type: GGMLType, rows: u32, cols: u32) u64 {
     return @as(u64, rows) * @as(u64, blocks_per_row) * @as(u64, bpb);
 }
 
+fn tensorNameContains(name: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, name, needle) != null;
+}
+
+fn isMoeGateUpExpertTensor(name: []const u8) bool {
+    return tensorNameContains(name, "ffn_gate_exps") or
+        tensorNameContains(name, "ffn_up_exps") or
+        tensorNameContains(name, "ffn_gate_up_exps");
+}
+
+fn isMoeDownExpertTensor(name: []const u8) bool {
+    return tensorNameContains(name, "ffn_down_exps");
+}
+
+fn isSharedGateUpTensor(name: []const u8) bool {
+    return tensorNameContains(name, "ffn_gate_shexp") or
+        tensorNameContains(name, "ffn_gate_inp_shexp") or
+        tensorNameContains(name, "ffn_up_shexp") or
+        tensorNameContains(name, "ffn_gate_up_shexp");
+}
+
+fn isSharedDownTensor(name: []const u8) bool {
+    return tensorNameContains(name, "ffn_down_shexp");
+}
+
+fn recordDetailedDmmvBytes(profile: *RuntimeProfile, path: DmmvPathClass, name: []const u8, bytes: u64) void {
+    switch (path) {
+        .full_attn => {
+            if (std.mem.endsWith(u8, name, "attn_output.weight")) {
+                profile.full_attn_output_bytes += bytes;
+            } else {
+                profile.full_attn_projection_bytes += bytes;
+            }
+        },
+        .ssm => {
+            if (std.mem.endsWith(u8, name, "ssm_out.weight")) {
+                profile.ssm_out_bytes += bytes;
+            } else {
+                profile.ssm_projection_bytes += bytes;
+            }
+        },
+        .shared_expert => {
+            if (isSharedDownTensor(name)) {
+                profile.shared_expert_down_bytes += bytes;
+            } else if (isSharedGateUpTensor(name)) {
+                profile.shared_expert_gate_up_bytes += bytes;
+            }
+        },
+        .moe_expert => {
+            if (isMoeDownExpertTensor(name)) {
+                profile.moe_expert_down_bytes += bytes;
+            } else if (isMoeGateUpExpertTensor(name)) {
+                profile.moe_expert_gate_up_bytes += bytes;
+            }
+        },
+        else => {},
+    }
+}
+
 fn recordDispatchQuantBytes(profile: *RuntimeProfile, quant_type: GGMLType, bytes: u64) void {
     profile.dmmv_total_bytes += bytes;
     switch (quant_type) {
@@ -3839,6 +3956,7 @@ fn classifyDmmvPath(engine: *InferenceEngine, tensor: *const metal_loader.Loaded
         if (engine.config.architecture == .gemma and engine.config.n_experts > 0) return .shared_expert;
         return .dense_ffn;
     }
+    if (isMoeGateUpExpertTensor(name) or isMoeDownExpertTensor(name)) return .moe_expert;
     return .other;
 }
 
@@ -3889,8 +4007,10 @@ fn recordDmmvProfile(
         .ssm => profile.ssm_bytes += bytes,
         .full_attn => profile.full_attn_bytes += bytes,
         .dense_ffn => profile.dense_ffn_bytes += bytes,
+        .moe_expert => profile.moe_expert_bytes += bytes,
         else => {},
     }
+    recordDetailedDmmvBytes(profile, path, tensor.info.name, bytes);
     if (tensor.info.type_ == .q8_0) {
         recordQ8ShapeProfile(profile, path, rows, cols, bytes);
     }
@@ -3898,17 +4018,18 @@ fn recordDmmvProfile(
 
 fn recordMoeDmmvProfile(
     engine: *InferenceEngine,
-    quant_type: GGMLType,
+    tensor: *const metal_loader.LoadedTensor,
     rows: u32,
     cols: u32,
     expert_count: u32,
 ) void {
     if (!engine.profile_enabled) return;
 
-    const bytes = @as(u64, expert_count) * dmmvWeightBytes(quant_type, rows, cols);
+    const bytes = @as(u64, expert_count) * dmmvWeightBytes(tensor.info.type_, rows, cols);
     var profile = &engine.request_profile;
-    recordDispatchQuantBytes(profile, quant_type, bytes);
+    recordDispatchQuantBytes(profile, tensor.info.type_, bytes);
     profile.moe_expert_bytes += bytes;
+    recordDetailedDmmvBytes(profile, .moe_expert, tensor.info.name, bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -5156,7 +5277,7 @@ fn dispatchDmmvMoeOnCmd(
     x_expert_stride: u32,
     extra_byte_offset: u32,
 ) !void {
-    recordMoeDmmvProfile(engine, tensor.info.type_, M, K, engine.config.n_experts_used);
+    recordMoeDmmvProfile(engine, tensor, M, K, engine.config.n_experts_used);
 
     switch (tensor.info.type_) {
         .q4_k => dispatchDmmvMoeQ4kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
@@ -5187,7 +5308,7 @@ fn dispatchDmmvMoeGateUpQ4kOnCmd(
     if (tensor.info.type_ != .q4_k) return error.UnsupportedQuantType;
     if (engine.dmmv_q4k_moe_gate_up_pipe.handle == null) return error.UnsupportedQuantType;
 
-    recordMoeDmmvProfile(engine, tensor.info.type_, M, K, engine.config.n_experts_used * 2);
+    recordMoeDmmvProfile(engine, tensor, M, K, engine.config.n_experts_used * 2);
 
     const push = MoeGateUpDmmvPush{
         .M = M,
@@ -5231,7 +5352,7 @@ fn dispatchDmmvMoeRoutesOnCmd(
     x_expert_stride: u32,
     extra_byte_offset: u32,
 ) !void {
-    recordMoeDmmvProfile(engine, tensor.info.type_, M, K, route_slots);
+    recordMoeDmmvProfile(engine, tensor, M, K, route_slots);
 
     const push = MoeDmmvPush{
         .M = M,
@@ -5295,7 +5416,7 @@ fn dispatchDmmvMoeColsOnCmd(
     max_count: u32,
 ) !void {
     const route_blocks = @max(max_count, 1);
-    recordMoeDmmvProfile(engine, tensor.info.type_, M, K, route_blocks);
+    recordMoeDmmvProfile(engine, tensor, M, K, route_blocks);
 
     const pipe: *const MetalPipeline = switch (tensor.info.type_) {
         .q4_k => &engine.dmmv_q4k_moe_cols_pipe,
@@ -5998,6 +6119,7 @@ fn dispatchSoftmaxTopkWeightBiasOnCmd(
         .bias_offset = tensorPageOffset(engine.model, bias),
     };
     const bufs = [_]*const MetalBuffer{ logits, output, &bias.gpu_buffer };
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
     cmd.dispatchV2(&engine.softmax_topk_weight_bias_pipe, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkWeightBiasPush), 0);
 }
 
@@ -6105,6 +6227,7 @@ fn dispatchSoftmaxTopkOnCmd(
         .k = k,
     };
     const bufs = [_]*const MetalBuffer{ logits, output };
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
     cmd.dispatchV2(&engine.softmax_topk_pipe, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkPush), 0);
 }
 
@@ -6123,6 +6246,7 @@ fn dispatchSoftmaxTopkScaledOnCmd(
         .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
     };
     const bufs = [_]*const MetalBuffer{ logits, output };
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
     cmd.dispatchV2(&engine.softmax_topk_scaled_pipe, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkScaledPush), 0);
 }
 
@@ -6142,6 +6266,7 @@ fn dispatchSoftmaxTopkBatchedOnCmd(
         .output_stride = k * 2,
     };
     const bufs = [_]*const MetalBuffer{ logits, output };
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += n_tokens;
     cmd.dispatchV2(&engine.softmax_topk_batched_pipe, .{ n_tokens, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkBatchedPush), 0);
 }
 
@@ -6765,6 +6890,7 @@ fn dispatchFullAttnPrepOnCmd(
             fuse_v_unit_norm_into_rope_kv,
             fuse_qk_norm_into_rope_kv,
         );
+        if (profile) |p| p.full_attn_kv_write_calls += 1;
     } else {
         // Slow path: separate Q-rope, K-rope, and KV cache write dispatches.
         dispatchRopeOnCmd(engine, cmd, &engine.q_buf, &engine.q_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
@@ -6779,6 +6905,7 @@ fn dispatchFullAttnPrepOnCmd(
             engine.position * attn.kv_dim,
             @intCast(@as(u64, engine.position) * attn.kv_cache_bytes_per_token),
         );
+        if (profile) |p| p.full_attn_kv_write_calls += 1;
     }
     return gate_mode.apply_attn_gate;
 }
@@ -8850,6 +8977,7 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                 attn.kv_cache_head_stride_bytes,
                 attn.kv_cache_bytes_per_token,
             );
+            if (profile) |p| p.full_attn_flash_calls += 1;
             if (apply_attn_gate) {
                 profileBarrier(cmd, profile, .full_attn); // attn_out_buf visible before sigmoid_mul
                 dispatchSigmoidMulOnCmd(engine, cmd, &engine.gate_buf, &engine.attn_out_buf, attn.q_dim);
@@ -9002,6 +9130,7 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     d_conv,
                     false,
                 );
+                if (profile) |p| p.ssm_conv_calls += 1;
             }
             profileBarrier(cmd, profile, .ssm);
 
@@ -9029,6 +9158,7 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                 // for row tiling. grid.y must be 1 to avoid duplicate workgroups
                 // racing on the same SSM state memory. (All unit tests already use y=1.)
                 cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
+                if (profile) |p| p.ssm_delta_calls += 1;
             }
             profileBarrier(cmd, profile, .ssm);
             const should_debug_ssm_compare = engine.debug_validation_enabled and engine.position == 0 and layer_idx == 6 and using_local_cmd;
@@ -9072,6 +9202,7 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     d_state,
                     engine.ssm_norm_per_head.?[layer_idx],
                 );
+                if (profile) |p| p.ssm_gated_norm_calls += 1;
             }
             profileBarrier(cmd, profile, .ssm);
 
@@ -9187,6 +9318,7 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                 } else {
                     topKSoftmax(@as([*]const f32, router_ptr)[0..cfg.n_experts], cfg.n_experts_used, expert_ids[0..cfg.n_experts_used], expert_weights[0..cfg.n_experts_used]);
                 }
+                if (profile) |p| p.router_topk_calls += 1;
                 const should_debug_moe_compare = engine.debug_validation_enabled and engine.position == 0 and layer_idx == 6;
                 const hidden_before_snapshot: ?[]f32 = if (should_debug_moe_compare) blk: {
                     const snap = try engine.allocator.alloc(f32, hidden_dim);
@@ -10765,6 +10897,9 @@ pub fn generateWithMetrics(
     }
     const prefill_end = std.time.nanoTimestamp();
     const prefill_ns: u64 = @intCast(prefill_end - prefill_start);
+    if (engine.profile_enabled) {
+        engine.prefill_profile = engine.request_profile;
+    }
     const prefill_tps = if (prompt_tokens.len > 0 and prefill_ns > 0)
         @as(f64, @floatFromInt(prompt_tokens.len)) * 1_000_000_000.0 / @as(f64, @floatFromInt(prefill_ns))
     else
