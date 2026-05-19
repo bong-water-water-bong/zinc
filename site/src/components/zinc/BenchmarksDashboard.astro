@@ -17,6 +17,7 @@ const {
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin.ai';
 const canonicalUrl = `${siteUrl}${canonicalPath}`;
 const pageUrl = `${siteUrl}${pagePath}`;
+const githubRepoUrl = 'https://github.com/zolotukhin/zinc';
 const breadcrumbItems = [
   { name: 'Home', href: '/' },
   { name: 'ZINC', href: '/zinc' },
@@ -139,6 +140,24 @@ function ensureScenarios(model: any) {
 
 function scenarioForModel(model: any, scenarioId: string) {
   return ensureScenarios(model).find((scenario: any) => scenario.id === scenarioId) ?? null;
+}
+
+function scenarioDisplayForTarget(target: any, scenarioId: string) {
+  for (const model of target.models ?? []) {
+    const scenario = scenarioForModel(model, scenarioId);
+    if (scenario) {
+      return {
+        label: scenario.label ?? scenarioMeta[scenarioId]?.label ?? scenarioId,
+        short: scenario.short_label ?? scenarioMeta[scenarioId]?.short ?? scenarioId,
+        description: scenario.notes?.[0] ?? scenarioMeta[scenarioId]?.description ?? '',
+      };
+    }
+  }
+  return {
+    label: scenarioMeta[scenarioId]?.label ?? scenarioId,
+    short: scenarioMeta[scenarioId]?.short ?? scenarioId,
+    description: scenarioMeta[scenarioId]?.description ?? '',
+  };
 }
 
 function decodeValue(scenario: any) {
@@ -393,13 +412,17 @@ function scenarioIdsForTarget(target: any) {
   return scenarioOrder.filter((id) => ids.has(id));
 }
 
-const targetOrder = ['rdna', 'intel', 'metal'];
+const targetOrder = ['rdna', 'metal', 'intel'];
+function targetRank(id: string) {
+  const index = targetOrder.indexOf(id);
+  return index === -1 ? targetOrder.length : index;
+}
+
 const targets = [...benchmarkData.targets]
-  .sort((a, b) => targetOrder.indexOf(a.id) - targetOrder.indexOf(b.id))
+  .sort((a, b) => targetRank(a.id) - targetRank(b.id))
   .map(normalizeTarget);
 
-const totalBenchmarkedModels = targets.reduce((sum, target) => sum + (target.summary?.benchmarked_models ?? target.models.length ?? 0), 0);
-const totalSuccessfulModels = targets.reduce((sum, target) => sum + (target.summary?.successful_models ?? 0), 0);
+const totalUniqueModels = new Set(targets.flatMap((target) => target.models.map((model: any) => model.id))).size;
 const totalComparedModels = targets.reduce((sum, target) => sum + (target.summary?.compared_models ?? 0), 0);
 
 function benchmarkedCount(target: any) {
@@ -426,6 +449,16 @@ function formatLatencyDelta(value: number | null | undefined) {
 function formatRuns(runs: number | null | undefined, warmupRuns: number | null | undefined) {
   if (runs == null && warmupRuns == null) return 'n/a';
   return `${runs ?? 0} measured · ${warmupRuns ?? 0} warmup`;
+}
+
+function githubBlobUrl(ref: string | null | undefined, filePath: string, startLine?: number, endLine?: number) {
+  const revision = ref || 'main';
+  const lineAnchor = startLine == null
+    ? ''
+    : endLine == null || endLine === startLine
+      ? `#L${startLine}`
+      : `#L${startLine}-L${endLine}`;
+  return `${githubRepoUrl}/blob/${revision}/${filePath}${lineAnchor}`;
 }
 
 function displayModelLabel(modelOrLabel: any) {
@@ -555,17 +588,36 @@ const jsonLd = {
         <strong>{targets.length}</strong>
       </article>
       <article class="stat-card">
-        <span>Models</span>
-        <strong>{totalBenchmarkedModels}</strong>
+        <span>Unique Models</span>
+        <strong>{totalUniqueModels}</strong>
       </article>
       <article class="stat-card">
-        <span>Compared</span>
+        <span>Comparisons</span>
         <strong>{totalComparedModels}</strong>
       </article>
       <article class="stat-card">
         <span>Updated</span>
         <strong>{formatShortDate(benchmarkData.generated_at)}</strong>
       </article>
+    </div>
+  </section>
+
+  <section class="coverage-panel" aria-label="Benchmark coverage">
+    <div>
+      <p class="eyebrow">Coverage</p>
+      <h2>All compared model rows are grouped by hardware target.</h2>
+      <p>
+        RDNA stays first because it is the default target. The full published dataset has six unique models; Metal has the six-model local comparison set, while RDNA and Intel show the canonical models that were available and valid on those nodes for this run.
+      </p>
+    </div>
+    <div class="coverage-grid">
+      {targets.map((target) => (
+        <a href={`#${target.id}`} class="coverage-card" data-bench-coverage-target={target.id}>
+          <span>{target.label}</span>
+          <strong>{target.summary?.compared_models ?? 0}</strong>
+          <small>compared model rows · {formatShortDate(target.generated_at)}</small>
+        </a>
+      ))}
     </div>
   </section>
 
@@ -608,6 +660,11 @@ const jsonLd = {
     const provenance = target.provenance ?? {};
     const zincProvenance = provenance.zinc ?? {};
     const llamaCppProvenance = provenance.llama_cpp ?? {};
+    const sourceRef = zincProvenance.commit ?? 'main';
+    const suiteSourceHref = githubBlobUrl(sourceRef, 'tools/performance_suite.mjs');
+    const promptSourceHref = githubBlobUrl(sourceRef, 'tools/performance_suite.mjs', 1502, 1640);
+    const promptTestHref = githubBlobUrl(sourceRef, 'tools/performance_suite.test.ts', 223, 238);
+    const dataSourceHref = githubBlobUrl('main', 'site/src/data/zinc-performance.json');
 
     return (
       <section
@@ -646,11 +703,15 @@ const jsonLd = {
               </div>
               <div>
                 <dt>ZINC</dt>
-                <dd title={zincProvenance.commit ?? 'n/a'}>{formatCommit(zincProvenance.commit)}</dd>
+                <dd title={zincProvenance.version ?? zincProvenance.commit ?? 'n/a'}>
+                  {zincProvenance.version ?? formatCommit(zincProvenance.commit)}
+                </dd>
               </div>
               <div>
                 <dt>llama.cpp</dt>
-                <dd title={llamaCppProvenance.commit ?? 'n/a'}>{formatCommit(llamaCppProvenance.commit)}</dd>
+                <dd title={llamaCppProvenance.version ?? llamaCppProvenance.commit ?? 'n/a'}>
+                  {llamaCppProvenance.version ?? formatCommit(llamaCppProvenance.commit)}
+                </dd>
               </div>
             </dl>
           </details>
@@ -677,6 +738,7 @@ const jsonLd = {
         <nav class="scenario-tabs" aria-label={`${target.label} scenarios`}>
           {scenarioIds.map((scenarioId, scenarioIndex) => {
             const summary = scenarioSummary(target, scenarioId);
+            const scenarioDisplay = scenarioDisplayForTarget(target, scenarioId);
             return (
               <button
                 type="button"
@@ -686,7 +748,7 @@ const jsonLd = {
                 aria-pressed={scenarioIndex === 0 ? 'true' : 'false'}
               >
                 <div class="scenario-tab-head">
-                  <span>{scenarioMeta[scenarioId]?.short ?? scenarioId}</span>
+                  <span>{scenarioDisplay.short}</span>
                 </div>
                 <div class="scenario-tab-stats">
                   <div>
@@ -710,6 +772,7 @@ const jsonLd = {
         {scenarioIds.map((scenarioId, scenarioIndex) => {
           const rows = scenarioRows(target, scenarioId);
           const summary = scenarioSummary(target, scenarioId);
+          const scenarioDisplay = scenarioDisplayForTarget(target, scenarioId);
           const promptMax = maxMetric(rows, (row) => Math.max(promptValue(row.scenario) ?? 0, baselinePromptValue(row.scenario) ?? 0));
           const decodeMax = maxMetric(rows, (row) => Math.max(decodeValue(row.scenario) ?? 0, baselineDecodeValue(row.scenario) ?? 0));
           const overallMax = maxMetric(rows, (row) => Math.max(overallValue(row.scenario) ?? 0, baselineOverallValue(row.scenario) ?? 0));
@@ -723,7 +786,7 @@ const jsonLd = {
             >
               <article class="scenario-banner">
                 <div>
-                  <h3>{scenarioMeta[scenarioId]?.label ?? scenarioId}</h3>
+                  <h3>{scenarioDisplay.label}</h3>
                 </div>
                 <div class="scenario-highlights">
                   <span class="info-chip">
@@ -745,7 +808,7 @@ const jsonLd = {
                 </div>
               </article>
 
-              <div class="scenario-readout" aria-label={`${scenarioMeta[scenarioId]?.label ?? scenarioId} summary`}>
+              <div class="scenario-readout" aria-label={`${scenarioDisplay.label} summary`}>
                 <article class="readout-card">
                   <span>Decode</span>
                   <strong>{formatMetric(summary.avgDecode, 'tok/s')}</strong>
@@ -1115,6 +1178,12 @@ const jsonLd = {
             </div>
             <span>{formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</span>
           </summary>
+          <div class="method-links">
+            <a href={suiteSourceHref} target="_blank" rel="noreferrer">Benchmark runner</a>
+            <a href={promptSourceHref} target="_blank" rel="noreferrer">Exact prompts and token caps</a>
+            <a href={promptTestHref} target="_blank" rel="noreferrer">Prompt matrix test</a>
+            <a href={dataSourceHref} target="_blank" rel="noreferrer">Published JSON</a>
+          </div>
           <ul class="method-list">
             {target.methodology.notes.map((note) => <li>{note}</li>)}
           </ul>
@@ -1126,6 +1195,7 @@ const jsonLd = {
   <script is:inline>
     function initBenchmarksDashboard() {
       const targetTabs = Array.from(document.querySelectorAll('[data-bench-target-tab]'));
+      const coverageLinks = Array.from(document.querySelectorAll('[data-bench-coverage-target]'));
       const targetPanels = Array.from(document.querySelectorAll('[data-bench-target-panel]'));
       const scenarioTabs = Array.from(document.querySelectorAll('[data-bench-scenario-target]'));
       const scenarioPanels = Array.from(document.querySelectorAll('[data-bench-scenario-panel]'));
@@ -1163,7 +1233,16 @@ const jsonLd = {
 
       for (const tab of targetTabs) {
         tab.addEventListener('click', () => {
-          const targetId = tab.dataset.benchTargetTab || targetTabs[0]?.dataset.benchTargetTab || 'metal';
+          const targetId = tab.dataset.benchTargetTab || targetTabs[0]?.dataset.benchTargetTab || 'rdna';
+          setActiveTarget(targetId);
+          history.replaceState(null, '', `#${targetId}`);
+        });
+      }
+
+      for (const link of coverageLinks) {
+        link.addEventListener('click', (event) => {
+          event.preventDefault();
+          const targetId = link.dataset.benchCoverageTarget || targetTabs[0]?.dataset.benchTargetTab || 'rdna';
           setActiveTarget(targetId);
           history.replaceState(null, '', `#${targetId}`);
         });
@@ -1171,7 +1250,7 @@ const jsonLd = {
 
       for (const tab of scenarioTabs) {
         tab.addEventListener('click', () => {
-          const targetId = tab.dataset.benchScenarioTarget || targetTabs[0]?.dataset.benchTargetTab || 'metal';
+          const targetId = tab.dataset.benchScenarioTarget || targetTabs[0]?.dataset.benchTargetTab || 'rdna';
           const scenarioId = tab.dataset.benchScenario || 'core';
           setActiveScenario(targetId, scenarioId);
         });
@@ -1181,7 +1260,7 @@ const jsonLd = {
       const hashedTarget = location.hash ? location.hash.slice(1) : null;
       const initialTarget = hashedTarget && knownTargets.has(hashedTarget)
         ? hashedTarget
-        : (targetTabs[0]?.dataset.benchTargetTab || 'metal');
+        : (targetTabs[0]?.dataset.benchTargetTab || 'rdna');
       setActiveTarget(initialTarget);
     }
 
@@ -1276,6 +1355,8 @@ const jsonLd = {
   }
 
   .hero-stats,
+  .coverage-panel,
+  .coverage-grid,
   .summary-grid,
   .panel-header,
   .target-panel,
@@ -1285,6 +1366,7 @@ const jsonLd = {
   }
 
   .stat-card,
+  .coverage-card,
   .summary-card,
   .board-card,
   .method-card,
@@ -1298,6 +1380,7 @@ const jsonLd = {
   }
 
   .stat-card,
+  .coverage-card,
   .summary-card,
   .board-card,
   .scenario-banner,
@@ -1307,6 +1390,8 @@ const jsonLd = {
   }
 
   .stat-card span,
+  .coverage-card span,
+  .coverage-card small,
   .summary-card span,
   .machine-card dt,
   .method-list,
@@ -1317,9 +1402,48 @@ const jsonLd = {
   }
 
   .stat-card strong,
+  .coverage-card strong,
   .summary-card strong {
     display: block;
     margin-top: 0.18rem;
+  }
+
+  .coverage-panel {
+    grid-template-columns: minmax(0, 0.95fr) minmax(420px, 1.25fr);
+    gap: 0.85rem;
+    align-items: stretch;
+    margin: 0.2rem 0 0.9rem;
+    padding: 0.9rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 82%, #d97706 18%);
+    border-radius: 8px;
+    background: var(--bench-surface-plain);
+    box-shadow: var(--bench-shadow);
+  }
+
+  .coverage-panel h2 {
+    margin: 0 0 0.35rem;
+    font-size: clamp(1.2rem, 2vw, 1.55rem);
+    letter-spacing: -0.02em;
+  }
+
+  .coverage-panel p {
+    margin: 0;
+    color: var(--color-text-muted);
+  }
+
+  .coverage-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.55rem;
+  }
+
+  .coverage-card {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .coverage-card strong {
+    font-size: 1.8rem;
+    line-height: 1;
   }
 
   .target-tabs,
@@ -2206,6 +2330,32 @@ const jsonLd = {
     border-bottom: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
   }
 
+  .method-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    padding: 0.75rem 0.95rem 0;
+  }
+
+  .method-links a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 2rem;
+    padding: 0.28rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--color-border) 80%, #d97706 20%);
+    color: var(--color-text);
+    text-decoration: none;
+    font-size: 0.78rem;
+    font-weight: 700;
+    background: color-mix(in srgb, var(--bench-surface-soft) 88%, var(--color-bg) 12%);
+  }
+
+  .method-links a:hover {
+    border-color: color-mix(in srgb, #d97706 68%, var(--color-border) 32%);
+    color: #b45309;
+  }
+
   .method-list {
     margin: 0;
     padding: 0.85rem 0.95rem 0.95rem 2rem;
@@ -2215,9 +2365,14 @@ const jsonLd = {
 
   @media (max-width: 1100px) {
     .hero,
+    .coverage-panel,
     .panel-header,
     .scenario-banner {
       grid-template-columns: 1fr;
+    }
+
+    .coverage-grid {
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     }
 
     .scenario-readout {
