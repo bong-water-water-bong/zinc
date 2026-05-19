@@ -1,10 +1,12 @@
 # ZINC_RT — The ZINC Runtime
 
-**Status:** Design proposal, not yet implemented
+**Status:** Design proposal; M0 scaffolding in tree (`src/zinc_rt/`, `forward_zinc_rt.zig`, T1 KFD probe wired into the benchmark autopilot)
 **Audience:** AI coding agents executing on this design; senior contributors reviewing it
-**Last updated:** 2026-05-10
+**Last updated:** 2026-05-18
 **Owner:** ZINC core
 **Primary target:** AMD RDNA4 (Radeon AI PRO R9700, RX 9070 family). Portable path to RDNA3 first, Intel Arc Xe2 and NVIDIA later. **Apple Silicon Metal is folded in as a tier.**
+
+**Defining feature beyond raw single-stream tok/s:** ZINC_RT is the runtime that lets one consumer RDNA4 box serve *multiple tenants* concurrently — vLLM-class continuous batching plus first-class isolation, quotas, and QoS — without the per-submit, per-slot, per-re-record taxes the Vulkan stack imposes. See §18 for the multitenant + batching architecture, which is the substantive reason ZINC_RT exists at all.
 
 > Vulkan is a graphics API that grew a compute mode. It was designed to keep a game running at 144 Hz on a thermal budget while also juggling a swapchain, ray tracing, and a thousand draw calls. We are doing none of that. We run one shape of compute, on one queue, for one workload — LLM inference — and we pay the full graphics-era tax for the privilege.
 >
@@ -35,8 +37,8 @@ This document is long on purpose. It is meant to be executable by a coding agent
 | 15 | T-CPU Reference Backend | Bring-up, validation oracle, laptop development |
 | 16 | T-Metal Tier | Folding the existing Metal work into ZINC_RT |
 | 17 | WMMA on RDNA4 | Why we keep wave64 *and* add a wave32 WMMA path |
-| 18 | Continuous Batching | The vLLM-class scheduler, built in |
-| 19 | Paged KV v2 | What the new cache looks like under ZINC_RT |
+| 18 | Multitenant Continuous Batching | **The centerpiece.** Tenants, slots, admission, QoS, quotas, preemption, mixed prefill+decode batching, streaming |
+| 19 | Paged KV v2 | The new cache layout, per-tenant reservations, prefix sharing |
 | 20 | Speculative Decoding | Hooks (not a 1.0 feature, but designed in) |
 | 21 | The Megakernel | The end-state where decode is one GPU launch |
 | 22 | Portability Plan | Intel and NVIDIA |
@@ -174,12 +176,16 @@ M5's 240 tok/s = 66 % bandwidth utilization. This is below the 73 % H100 megaker
 
 ### 3.2 Continuous-batching aggregate throughput
 
+Aggregate decode tok/s across all concurrent slots, mixed tenants, R9700, Qwen 3.6 35B-A3B Q4_K_XL. "Today" = current Vulkan backend with no continuous batching (concurrent slots block on each other). "OOM" = KV cache cannot fit at this slot count without paged-KV v2.
+
 | Concurrent slots | Today | M3 | M5 |
 |---|---:|---:|---:|
 | 1 | 117 | 195 | 240 |
 | 4 | 432 (linear) | 760 | 960 |
 | 16 | OOM | 2 100 | 2 800 |
 | 64 | OOM | 5 800 | 7 800 |
+
+Per-tenant fairness target at 16 concurrent slots: p99 decode-interval latency for an `interactive` tenant ≤ 1.3× the p50 — i.e. the presence of `batch` tenants in the same engine costs the interactive user less than 30% of their latency budget. See §18.5.
 
 ### 3.3 Prefill
 
@@ -1080,100 +1086,364 @@ For Q4_K weights we dequantize into LDS at the inner loop start, then run WMMA o
 
 ---
 
-## 18. Continuous Batching Architecture
+## 18. Multitenant Continuous Batching — The Centerpiece
 
-This is what the user explicitly asked for. The design must beat vLLM on a single RDNA4 node.
+This is the section the rest of the document exists to support. The single-stream tok/s targets in §3.1 are necessary but not sufficient: the reason to own the runtime, the reason to walk away from Vulkan, is to serve **multiple concurrent tenants** at near-bandwidth-saturating aggregate throughput on a single consumer GPU. Continuous batching is how that throughput is unlocked; multitenancy is the policy layer that decides whose token gets generated next, with isolation strong enough to host independent users.
 
-### 18.1 Definitions
+The design target: **outperform vLLM and SGLang on a single RDNA4 node**, while running as one Zig binary with no Python, no ROCm, no Triton, and a fallback to the Vulkan backend if anything regresses.
 
-* **Slot** — one active request.
-* **Batch** — a set of (slot, op) pairs the engine submits together.
-* **Step** — one engine cycle.
-* **Admission** — moving a request from queued → active.
-* **Preemption** — moving an active slot back to queued.
+### 18.1 Why multitenancy is a first-class concern
 
-### 18.2 The scheduling loop (megakernel-aware)
+Most inference engines treat continuous batching as a throughput optimization: pack as many requests as possible into one decode step. That suffices for a single-user workload. For ZINC's actual deployment shape — chat UI + OpenAI-compatible server + draft-model spec decoding + agentic clients — the engine simultaneously hosts requests that differ in:
+
+* **Latency budget.** An interactive chat keystroke must respond in < 100 ms. An overnight summarization batch can wait minutes.
+* **Tenant identity.** A self-hosted box may host several users, an agent's tool-use traffic, and a developer's benchmark suite — all in one process.
+* **Sampling shape.** Greedy decode, temperature/top-p, beam, speculative drafting (different K).
+* **Prefix structure.** Chat conversations share a long system prompt; coding agents share file context; standalone API calls share nothing.
+* **Cost model.** Some tenants count tokens against a quota; others are unmetered.
+
+A continuous-batching scheduler that only optimizes for aggregate throughput will starve the interactive tenant whenever a 100k-token batch job arrives. A scheduler that just round-robins will leave throughput on the floor. ZINC_RT's scheduler is built to handle both — **the IR is stage-aware (§9.1), the slot table is tenant-aware (§18.13), and the scheduling loop runs per-tenant admission control before forming each batch**.
+
+The cost of doing this on top of Vulkan was the original motivation: every joining/leaving request would force a command-buffer re-record (~80 µs per 1500-node graph), every concurrent decode would multiply fence traffic, and per-tenant isolation would have to live entirely in host-side Zig because the GPU side could not see slot metadata without yet more descriptor binds. **ZINC_RT closes all three** because the IR runs unchanged across slot populations, the host writes the slot table directly into BAR-mapped VRAM (no descriptor update), and the megakernel reads slot/tenant metadata at every layer boundary as ordinary global loads.
+
+### 18.2 The hierarchy: Tenant → Session → Request → Slot
 
 ```
-loop {
-  pending = drain_request_queue()
+Tenant       e.g. "user-alice"             quotas, KV reservation, priority class
+  └─ Session  e.g. one chat thread          system prompt, KV pages refcounted on the prefix tree
+       └─ Request  one user turn             prompt, sampling params, stop conditions
+            └─ Slot  GPU-side execution      assigned at admission, released at termination
+```
+
+* **Tenant.** A long-lived identity. Carries the policy: max concurrent slots, KV-page reservation, priority class, rate limit, accounting ledger. Tenants do not share KV pages by default — see §18.14 for the controlled exception (per-tenant prefix trees).
+* **Session.** A multi-turn conversation. Sessions share their KV cache across turns via the prefix-cache refcount table. A session is bound to exactly one tenant.
+* **Request.** One generation. Lives in a queue until admitted to a slot. Carries the sampling parameters, the stop strings, the SSE/JSON output sink, and the cancellation handle.
+* **Slot.** A GPU-resident execution context. Holds the live position, KV page list, RNG state, and pointer back to the request. Number of slots is bounded by `max_concurrent_slots` (engine-wide, default 16 on R9700; per-tenant slot cap enforced before admission).
+
+This four-level model is deliberate. Conflating tenant and session (the OpenAI API does this implicitly) makes per-tenant quotas impossible without an out-of-band proxy. Conflating session and request (vLLM 0.x did this) makes prefix caching across turns require client-side prompt assembly. ZINC_RT models all four because the runtime has the metadata anyway and the cost is a few extra u32 fields in the slot table.
+
+### 18.3 Isolation guarantees
+
+ZINC_RT's tenants are not a security boundary against malicious tenants in the threat-model sense — they are a *correctness, fairness, and failure-isolation* boundary. The runtime is designed so that:
+
+| Guarantee | Mechanism | Tier of strength |
+|---|---|---|
+| **Logit independence** — tenant A's logits never depend on tenant B's slot state | Slot table is read-only from the kernel's POV after step start; each slot's KV pages are listed explicitly | Hard (verified by `zinc-rt-validate`) |
+| **RNG independence** — tenant A's sampling seed is never reused for tenant B | Per-slot `sampling_seed` field, advanced per-token; never derived from another slot | Hard |
+| **KV isolation** — tenant A cannot read tenant B's KV pages | Page IDs are per-slot; refcounted prefix pages are read-only and content-addressed | Hard (KV pages are integers in a slot's `page_ids[]`; a slot literally cannot reference a page it doesn't own) |
+| **Throughput fairness** — no tenant starves another | Per-tenant slot quotas + DRF-style admission (§18.5) | Soft (best effort under load) |
+| **Latency fairness within QoS class** — interactive tenants don't get blocked by batch tenants | Priority classes, batch preemption at step boundary (§18.9) | Soft (best effort) |
+| **Failure isolation** — one tenant's bad input doesn't kill the process | Per-request validation before admission; runtime errors map to a single slot's stream and don't roll the engine | Hard |
+| **Cancellation locality** — cancelling tenant A's request doesn't disturb tenant B | Cancel flag is per-slot (§12.4) | Hard |
+
+ZINC_RT is **not** a hypervisor. It does not protect against malicious code execution by a tenant (tenants don't execute code, only submit prompts), and it does not partition GPU memory cryptographically. For untrusted multi-tenancy at the security-isolation level, run separate processes with the existing `/tmp/zinc-gpu.lock` mechanism. **For trusted-multi-tenant deployments — the common case for self-hosted teams, internal LLM platforms, agent-runtime hosts — the isolation guarantees above are exactly what's needed.**
+
+### 18.4 The scheduling loop
+
+```
+loop {                                            # one engine "step"
+  // ── Step 1: drain incoming requests ──
+  pending = request_queue.drain()
   for r in pending:
-    if can_admit(r):
-      admit(r, alloc_kv_pages(r))
-    else:
-      queue_or_preempt(r)
+    tenant = tenants[r.tenant_id]
+    if !tenant_admits(tenant, r):                  # quota/rate-limit check
+      r.reject(reason=quota_exhausted)
+      continue
+    if !engine_admits(r):                          # global slot pool full?
+      if can_preempt(r, tenant):                   # higher-priority tenant?
+        evict_lowest_priority_slot()
+        continue (retry r)
+      else:
+        wait_queues[tenant.qos].push(r)
+        continue
+    slot = slot_pool.take()
+    bind(slot, r, alloc_kv_pages_with_prefix_match(r))
+    tenant.active_slots += 1
 
-  decoding = [s for s in slots if s.state == DECODE]
-  prefilling = [s for s in slots if s.state == PREFILL]
-
+  // ── Step 2: classify active slots for this step ──
+  decoding   = [s for s in active_slots if s.state == DECODE]
+  prefilling = [s for s in active_slots if s.state == PREFILL]
   if decoding.is_empty() and prefilling.is_empty():
-    park()
+    park()                                          # epoll/futex on request_queue
     continue
 
-  prefill_chunk = min(remaining_prefill_tokens, CHUNK_CAP)
+  // ── Step 3: build the batch under chunk-cap and latency budget ──
+  chunk_budget  = ZINC_RT_CHUNK_CAP                # default 8192 on R9700
+  latency_budget = quickest_decode_slot_budget_ms() # determined by highest-priority decode slot
+  step_input    = batch_planner.plan(
+      decoding, prefilling,
+      chunk_budget,
+      latency_budget,
+  )
+  // step_input.decode_slot_ids[] — slots that emit one token this step
+  // step_input.prefill_chunks[]   — (slot_id, start_pos, n_tokens) tuples
+  // step_input.total_query_tokens — <= CHUNK_CAP
+  // Invariant: decode_slot_ids is always present in full; chunked prefill yields to decode latency
 
-  step_input = {
-    decode_slots: decoding,
-    prefill_slots: prefilling,
-    prefill_chunk_per_slot: ...,
-  }
-
-  // No submit — write to input ring (M5).
-  // Or submit once (M3) if megakernel hasn't shipped.
+  // ── Step 4: dispatch ──
+  // M1–M3: one PM4 packet stream per step (one ring submit).
+  // M5: ring write to the megakernel's input ring; the megakernel reads it and steps itself.
   input_ring.push(step_input)
 
-  for evt in output_ring.drain():
+  // ── Step 5: drain output ──
+  for evt in output_ring.drain():                   # non-blocking
     slot = slots[evt.slot_id]
     slot.append_token(evt.token)
-    if slot.should_stop():
-      stream_close(slot)
-      release(slot)
+    tenant = tenants[slot.tenant_id]
+    tenant.tokens_generated += 1
+    tenant.bytes_streamed   += evt.token_bytes
+    sink_write(slot.request.sink, evt)
+    if slot.should_stop(evt):
+      sink_close(slot.request.sink)
+      release_kv_pages(slot)                        # refcount drops; pages returned to free list
+      tenant.active_slots -= 1
+      slot_pool.give_back(slot)
+      maybe_admit_from_wait_queue(tenant.qos)
 }
 ```
 
 Differences from vLLM:
 
-* **No re-record.** The IR graph is constructed once for (model, max_batch_size). Slots populate buffers; the graph runs unchanged.
-* **No driver dispatch per slot.** vLLM submits one CUDA Graph replay per (num_tokens, num_reqs) bucket. ZINC_RT submits one packet stream (M3) or zero (M5).
-* **Lock-free CPU↔GPU communication.** SPSC rings, BAR-backed.
-* **No Python.** ZINC_RT's scheduler is Zig.
-* **One process.** No IPC overhead.
+* **No re-record.** The IR graph is constructed once for `(model, max_concurrent_slots)`. Slots populate buffers, not the graph topology. vLLM rebuilds CUDA Graphs whenever batch shape changes.
+* **No driver dispatch per slot.** vLLM submits one CUDA Graph replay per `(num_tokens, num_reqs)` bucket. ZINC_RT submits one packet stream per step (M3) or zero per step (M5, megakernel).
+* **Stage-aware fused dispatch.** Decode and prefill share the same IR graph; the graph contains both `FLASH_ATTN` (decode, M=1) and `FLASH_ATTN_BATCHED` (prefill, M≥16, possibly using `MATMUL_WMMA`) as separately-callable subgraphs, dispatched from one packet stream. vLLM bucketizes; ZINC_RT mixes in one step.
+* **Lock-free CPU↔GPU control plane.** Input ring + output ring + slot table are BAR-mapped VRAM; the CPU writes them with plain stores. No `vkUpdateDescriptorSets`, no `vkQueueSubmit`, no synchronous ioctl on the hot path.
+* **Tenant-aware admission inside the engine.** vLLM/SGLang push tenant policy to a sidecar proxy. ZINC_RT runs it inside the scheduler step because the data is already there.
+* **One process.** Tokenizer, scheduler, request queue, GPU dispatch, sink writes are all in one Zig process. No gRPC, no shared memory, no IPC.
 
-### 18.3 The slot table
+### 18.5 Admission control and QoS classes
 
-A flat structure in VRAM the megakernel reads at each step boundary:
+Three QoS classes, configurable per-tenant:
+
+| Class | Intended use | Latency budget | Pre-emptible? | Slot weight |
+|---|---|---|---|---|
+| `interactive` | Chat UI, agent step | TTFT < 100 ms, decode jitter < 30 ms | Never preempted | 1.0× |
+| `standard` | OpenAI API default | TTFT < 500 ms | Preempted only by `interactive` | 1.0× |
+| `batch` | Summarization, bulk eval | TTFT untracked | Preempted by anything | 0.25× (admitted last, preempted first) |
+
+Admission policy combines **per-tenant quotas** with a **DRF-inspired step planner** (Dominant Resource Fairness, where the dominant resource is whichever of {slot count, KV pages, attention-token budget} the tenant is using most heavily relative to its share).
+
+Concretely, at each step:
+
+1. Compute each active tenant's *dominant share* = max(slots_used / slot_quota, kv_pages_used / kv_quota, decode_tokens_this_window / rate_limit_tokens_per_s).
+2. When the slot pool is full and a new request arrives, **the tenant with the lowest dominant share gets the slot.** Ties broken by FIFO arrival.
+3. When preempting (interactive request arrives, slot pool is full of batch slots), evict the slot belonging to the tenant with the *highest* dominant share. Its KV pages are kept (refcounted on the prefix tree); the slot returns to the wait queue and resumes mid-decode when re-admitted.
+
+This is not novel — it's what SGLang's `OracleScheduler` does, what Triton's Inference Server does for ensembles, and what every load-balancer-fronted vLLM cluster ends up emulating with an external proxy. The contribution is doing it *inside* the engine, on the hot path, with zero IPC.
+
+### 18.6 Per-tenant quotas
+
+Quotas are declared at tenant-create time and enforced at admission:
+
+```zig
+pub const TenantQuota = struct {
+    max_concurrent_slots: u32 = 4,        // hard cap; new requests queue
+    max_kv_pages:         u32 = 4096,     // hard cap; new requests queue
+    decode_tokens_per_s:  u32 = 1000,     // soft cap; smoothed over 5s window
+    prefill_tokens_per_s: u32 = 100_000,  // soft cap; smoothed
+    qos_class:            QosClass = .standard,
+    max_context_tokens:   u32 = 128_000,  // per-request, enforced at admission
+    isolation_group:      ?u32 = null,    // optional; slots in the same group can share prefix pages
+};
+```
+
+The defaults are conservative; a single-tenant deployment sets `max_concurrent_slots = engine.total_slots` and `max_kv_pages = engine.total_pages` and the policy collapses to plain continuous batching with no overhead.
+
+The `isolation_group` is the controlled exception to per-tenant KV isolation: tenants in the same group can share prefix pages (and therefore prefix-cache hits) via the refcounted prefix tree. The intended use: a small team's tenants share the same system-prompt prefix without each user paying its KV cost. Defaults to `null` (no sharing).
+
+### 18.7 Mixed prefill + decode batching
+
+Each step processes up to `ZINC_RT_CHUNK_CAP` query tokens (default 8192 on R9700; 4096 on 16-GB cards), split between:
+
+* **Decode slots:** one query token per slot, always packed first (latency-critical).
+* **Prefill chunks:** drawn from prefilling slots until the chunk cap is hit.
+
+The batch planner's invariants:
+
+* All active decode slots are included in every step (no decode slot is delayed in favor of prefill).
+* Prefill is dynamically chunked. A 128k-token prompt becomes ~16 chunks of 8k tokens. The first chunk admits the request; subsequent chunks are scheduled like decode tokens (interleaved with decoding tenants).
+* **No padding.** The query-token dimension is a flat list of `(slot_id, position)` pairs. The flash-attention kernel reads the slot/position list per query — no zero-padded rows.
+* **Variable-length K/V per query.** Each query token attends to a different KV history length; the kernel uses the slot's `position` field to bound its attention loop. This is FlashAttn-v2 style "variable-length packing"; it's why we don't bucketize.
+
+This single-batch mixed prefill+decode mode (`FLASH_ATTN_BATCHED` with per-query `seq_len[]`) is what lets ZINC_RT both prefill an incoming 32k-token prompt and produce 16 decode tokens for already-active slots in the same step. vLLM v0.5+ does this too, but pays a CUDA-Graph rebuild whenever the prefill-chunk count changes. ZINC_RT does not — the IR shape is fixed at `CHUNK_CAP`, the slot/position list is data.
+
+### 18.8 Preemption
+
+Preemption happens at **step boundaries only** (never mid-step — the GPU kernel runs to completion). When the planner decides to evict a slot:
+
+1. Its slot index is cleared from the live decode/prefill list.
+2. Its KV pages stay refcounted on the prefix tree; pages owned only by this slot are returned to the free list.
+3. The corresponding request goes back to the wait queue with its position preserved (it resumes mid-decode when re-admitted).
+4. If the request is interactive and was forcibly preempted, the sink emits a `preempted` SSE event so the client can reconnect/retry.
+
+Preemption is rare in steady state. It triggers when:
+
+* An `interactive` tenant arrives and the slot pool is full of `batch` slots.
+* A `batch` tenant blows past its KV-page quota and a `standard` tenant is waiting.
+* The engine is shutting down or swapping models.
+
+### 18.9 Streaming
+
+Output tokens land in the host-mapped output ring with this entry shape:
+
+```c
+struct OutputEvent {
+  u32 slot_id;          // identifies the slot
+  u32 tenant_id;        // identifies the tenant (cached from slot table for fast routing)
+  u32 token_id;
+  u32 generated_pos;    // position in the slot's generation
+  u8  eot_flag;         // 1 = end-of-text
+  u8  preempted_flag;   // 1 = forcibly evicted
+  u16 logprob_count;    // 0 if logprobs not requested
+  // optional: f32 logprobs[K] when logprob_count > 0
+};
+```
+
+A single drainer thread parks on a futex; one cache-line read per token in steady state. The drainer fans events out to the per-request sink:
+
+* HTTP SSE: ASCII tokens written to the response stream with TLS+chunk-encoding handled by ZINC's existing server.
+* WebSocket / chat UI: binary frames.
+* Internal Zig consumer (eval harness): direct callback.
+
+The sink is determined at request-admission time and lives on the host (not on the GPU). The GPU just appends to the ring; the host routes.
+
+**One output ring for all tenants, not one per tenant.** Per-tenant rings would multiply BAR pages, complicate the megakernel's append logic, and offer no real benefit — the SPSC ring is already lock-free, and per-request demultiplexing on the host is one indexed lookup.
+
+### 18.10 Backpressure
+
+Two distinct backpressure paths:
+
+1. **Output-ring saturation.** If the host is slow to drain (a stalled HTTP client, a TLS buffer full), the output ring fills. The slot table has a `output_backpressure` bit per slot; when set, the kernel skips that slot's `STREAM_OUT` for one step and keeps the token in a per-slot one-deep buffer. If set for >N steps, the slot's request is cancelled with a `client_too_slow` error.
+2. **Request-queue saturation.** If admission can't keep up with arrival, the request queue grows. At a configurable depth (default 1024), new requests get a 503 with a `Retry-After`. This is policy at the HTTP layer, not the engine.
+
+### 18.11 Per-tenant accounting and observability
+
+The runtime exposes a per-tenant ledger:
+
+```zig
+pub const TenantLedger = struct {
+    tokens_prompted:     u64,
+    tokens_generated:    u64,
+    slots_admitted:      u64,
+    slots_preempted:     u64,
+    requests_rejected:   u64,    // quota/rate-limit denials
+    p50_ttft_ms:         f64,
+    p99_ttft_ms:         f64,
+    p50_decode_ms:       f64,
+    p99_decode_ms:       f64,
+    kv_pages_peak:       u32,
+    prefix_hit_rate:     f64,    // moving average
+};
+```
+
+`tenant_ledger.tokens_generated * model.price_per_token` is the natural input to a billing system. The HTTP server exposes `/v1/tenants/{id}/usage` returning this ledger.
+
+The `zinc-rt-trace` tool emits a Chrome-trace-format timeline of step boundaries, per-slot states, per-tenant admission events — viewable in `chrome://tracing`. Long-tail TTFT bugs become obvious here.
+
+### 18.12 Multi-model serving
+
+A single ZINC_RT engine can host multiple models, each with its own IR graph, weight residency, and slot pool. The selection key is `(tenant_id, model_id)`:
+
+* Default: one model loaded at engine start; all tenants use it.
+* Multi-model: a tenant can pin to a specific model. The engine maintains one IR graph per loaded model; a step batches only slots using the same model (different models cannot share a batch — the GPU cannot run two different weight sets in one matmul).
+
+For deployments with a small fast draft model and a larger target model, the *same* engine hosts both as separate model entries; the speculative-decoding flow (§20) ties them together at the IR level.
+
+VRAM accounting per model is reported by `/v1/models`. When a model's last referencing tenant disconnects, the model can be evicted from VRAM (configurable; default keeps the last-used model in place).
+
+### 18.13 Slot table layout (extended)
+
+The slot table is a flat array in BAR-mapped VRAM, read by the megakernel at every layer boundary. Per-slot fields:
 
 ```c
 struct Slot {
-  u32  state;
-  u32  position;
-  u32  page_count;
-  u32  page_ids[MAX_PAGES_PER_SLOT];
-  u32  prompt_len;
-  u32  generated_len;
-  u32  speculative_len;
-  u32  active_expert_ids[K];
-  u32  sampling_seed;
-  f32  temperature, top_p, repetition_penalty;
-  u64  client_handle;
-}
+  // ─── identity ───
+  u32 state;               // FREE | ADMITTED | PREFILL | DECODE | PREEMPTED | DONE
+  u32 tenant_id;
+  u32 session_id;
+  u64 request_handle;      // host-side pointer for sink routing (opaque to GPU)
+  u32 model_id;
+
+  // ─── execution position ───
+  u32 prompt_len;
+  u32 generated_len;
+  u32 position;            // = prompt_len + generated_len; advanced each token
+  u32 speculative_len;     // >0 when spec-decoding (M6)
+
+  // ─── KV cache ───
+  u32 page_count;
+  u32 page_ids[MAX_PAGES_PER_SLOT];   // MAX_PAGES_PER_SLOT = ceil(max_ctx / page_size)
+  u32 prefix_match_pages;             // first N pages refcounted on prefix tree
+
+  // ─── attention shape ───
+  u32 active_expert_ids[K];           // MoE: top-k expert IDs for this token
+  f32 active_expert_weights[K];
+
+  // ─── sampling ───
+  u32 sampling_seed;
+  f32 temperature;
+  f32 top_p;
+  f32 repetition_penalty;
+  u32 top_k;
+  u32 stop_token_count;
+  u32 stop_token_ids[8];
+
+  // ─── flags ───
+  u32 output_backpressure;            // host sets this if its sink is full
+  u32 cancel_flag;                    // host sets this to cancel
+  u32 priority;                       // 0=interactive, 1=standard, 2=batch (lower = higher priority)
+};
 ```
 
-Updated by the host via BAR.
+Updates are CPU writes to BAR-mapped memory; the kernel reads them at each layer boundary. There is no API call between "host updates slot table" and "kernel sees the update" — it's a cache-coherent memory store, with a fence at step boundary.
 
-### 18.4 Chunked prefill
+For 64 max slots × ~512 bytes/slot = 32 KB total. Fits in L2 cache, BAR-resident, costs nothing to update.
 
-Each step processes up to `ZINC_RT_CHUNK_CAP` input tokens (default 8192 on R9700, 4096 on 16-GB cards), distributed across decode and prefill slots. Prefill chunks are split across steps when prompts are larger than the cap.
+### 18.14 Prefix caching, scoped
 
-### 18.5 Prefix caching (RadixAttention-lite)
+Two scopes for the prefix tree:
 
-The host maintains `hash(prompt_prefix_tokens) → list[page_id]`. New requests look up each 16-token prefix page; hits go to refcount instead of copy.
+1. **Per-tenant (default).** Each tenant has its own RadixAttention-style tree mapping `hash(prefix_tokens) → list[page_id]`. Hits are within-tenant only; pages are refcounted; pages drop to the free list when refcount hits zero.
+2. **Per-isolation-group.** Tenants sharing an `isolation_group` share a tree. Hits cross tenant boundaries within the group; refcounts cross tenants; eviction follows the group's combined LRU.
 
-Hit rate on chat workloads is documented at 30–60% by SGLang.
+The prefix tree is a host-side data structure. The GPU never sees the tree itself — only the resulting page-ID list per slot.
 
-### 18.6 Streaming
+Hash function: SipHash-2-4 over 16-token chunks (default page size). Collision resistance is sufficient at the working-set sizes we expect (≤ 10⁶ pages); a collision would mean a wrong-prefix hit, manifesting as a logits divergence caught by §18.3's hard logit-independence guarantee at validation time.
 
-Output tokens land in the host-mapped output ring with `(slot_id, token, eot_flag, logprobs?)`. A drainer thread parks on a futex; one cache-line read per token. No syscall.
+Expected hit rate on chat workloads: 30–60% (per SGLang's measurements). On agent workloads with consistent tool prompts: 60–85%. On standalone API: ~0% — the prefix cache costs nothing when it misses.
+
+### 18.15 Comparison to other engines
+
+| Engine | Multitenant | Continuous batching | Mixed prefill+decode | Prefix cache | Megakernel | Single-binary | RDNA |
+|---|---|---|---|---|---|---|---|
+| **vLLM** | sidecar proxy | yes | yes (v0.5+) | RadixAttention | no | no (Python+CUDA) | poor (Vulkan via llama.cpp instead) |
+| **SGLang** | yes (OracleScheduler) | yes | yes | yes (the original) | partial (compile mode) | no (Python) | poor |
+| **TensorRT-LLM** | external | yes | yes | yes | no | no (TRT graphs) | not supported |
+| **llama.cpp** | no (single user) | partial (parallel) | no | no | no | yes (C++) | yes (Vulkan/RDNA) |
+| **Mirage / Hazy megakernel** | no | no | no | no | yes | research | no (NVIDIA) |
+| **ZINC + Vulkan today** | no | no | no | no | no | yes (Zig) | yes |
+| **ZINC_RT (M3)** | yes | yes | yes | yes | no | yes (Zig) | yes (T1/T2) |
+| **ZINC_RT (M5)** | yes | yes | yes | yes | yes | yes (Zig) | yes (T1/T2) |
+
+ZINC_RT's bet: combine SGLang's scheduling sophistication with Hazy Research's megakernel execution model, on RDNA4, in one Zig binary.
+
+### 18.16 What ZINC_RT specifically gains over Vulkan for this
+
+For each of §18's features, what blocks it on the Vulkan backend and how ZINC_RT clears the block:
+
+| Feature | Vulkan block | ZINC_RT mechanism |
+|---|---|---|
+| Mixed prefill+decode in one step | Re-record cost on every shape change (~80 µs/1500 nodes) | IR is shape-static; slot/position list is data |
+| Per-slot KV page list at dispatch time | `vkUpdateDescriptorSets` cost per slot | Slot table is BAR-mapped VRAM; kernel reads at layer boundary |
+| Preempt at step boundary | No mid-frame cancel in Vulkan compute | `cancel_flag` per slot in the slot table |
+| Mixed batch with varying seqlens | Padding (wasted FLOPs) or bucket (re-record) | Flat `(slot_id, position)` query list, FlashAttn-v2 variable-length kernel |
+| Tenant-aware admission | Must live in a Python sidecar | Native Zig in the scheduler step |
+| < 200 ns submit latency | ~33 µs `vkQueueSubmit` + fence | Ring-buffer write + doorbell |
+| Megakernel decode | Vulkan compute can't host a persistent kernel that polls host memory | T1/T2 long-running compute queue with BAR-mapped input ring |
+| Per-tenant accounting on hot path | Allocations, JSON, locks | Counter increments on flat structs |
+| Speculative decoding | Two CUDA Graphs + custom verify glue | Two IRs + `VERIFY_K` opcode (M6) |
+
+Every row here is a "could we do this on Vulkan with enough effort" — yes, possibly, with non-trivial wrapping. The point is not that Vulkan is incapable. The point is that **the design center of Vulkan punishes the things this section relies on**, and at the volume we'd be doing them — every token, every slot, every tenant — those punishments compound.
 
 ---
 
@@ -1196,6 +1466,46 @@ page bytes = 10 * 256 * 2 * 4 * 16 = 320 KB per page (F32)
 ```
 
 R9700 has 32 GB. After model (21 GB) and scratch (~2 GB), ~9 GB free for KV. At 320 KB/page that's ~28 000 pages or ~450 000 tokens of context. At Q8_0 KV, ~1.8M tokens.
+
+### 19.2 Per-tenant reservation
+
+The page pool is partitioned at engine init:
+
+```
+total_pages = free_vram / page_size                # e.g. 28 000
+
+reserved_pages    = Σ tenant.max_kv_pages          # hard-reserved per tenant
+prefix_pool_pages = total_pages × 0.20             # shared across tenants in same isolation group
+floating_pages    = total_pages − reserved_pages − prefix_pool_pages
+```
+
+Admission policy:
+* A tenant's slot consumes from its **reserved pool** first.
+* If reserved is exhausted, it may use **floating pages** if available (subject to DRF tiebreak when contested).
+* Prefix-cache hits consume from the **prefix pool** (refcounted). Misses fall through to reserved/floating.
+
+This keeps a heavy-spending tenant from starving a light-spending one's KV cache, while still letting the heavy tenant burst into floating capacity when it's idle elsewhere.
+
+### 19.3 Page metadata layout
+
+A small VRAM table mirrors host-side bookkeeping for the kernel:
+
+```c
+struct PageMeta {
+  u32 ref_count;          // 0 = free; written by host only
+  u32 owner_slot_id;      // for debugging; 0xFFFFFFFF if prefix-shared
+  u32 tenant_id;          // for KV-isolation audit
+  u32 token_count;        // 1..16
+};
+```
+
+The kernel reads `token_count` to bound its attention loop on the last (possibly partial) page. Everything else is host-only.
+
+### 19.4 Eviction
+
+When the prefix pool fills, pages are LRU-evicted; refcounted pages can't be evicted (someone is using them). When the floating pool fills, the scheduler triggers preemption of the lowest-priority tenant's slot to free pages.
+
+Eviction is host-side only — pages don't move in VRAM, they just return to the free list. Slot KV stays in place until the slot is released.
 
 ---
 
@@ -1605,8 +1915,10 @@ Status: M = milestone the opcode becomes mandatory.
 
 ZINC_RT is the ZINC Runtime — ZINC's own userspace GPU layer, in the same OS-level category as the CUDA Runtime or HSA Runtime, scoped to inference and owned end-to-end. It exists because Vulkan is the wrong shape of API for ZINC's hot path. ZINC_RT is not a "thin Vulkan-alike"; it is a workload-specific submission and execution stack designed around LLM inference on RDNA-first GPUs, with first-class tiers for Apple Silicon, Intel Arc, and NVIDIA.
 
-**The Vulkan backend is not going away.** It remains a peer of ZINC_RT, selected via `-Dbackend=vulkan`, tested in CI on every PR, and shipped to every user. ZINC ships *two* GPU paths long-term: ZINC_RT for the lowest-overhead route to peak performance, Vulkan as the broadly compatible, well-trodden fallback that every Linux GPU user has worked with for a decade. The two share GGUF parsing, tokenizer, server, scheduler, model catalog — only the GPU dispatch and kernels differ. The cost of keeping both is modest; the benefit (always a working fallback when ZINC_RT regresses or hits new hardware) is permanent.
+The single feature that justifies all this work is the multitenant continuous-batching architecture in §18: one engine, one process, one GPU, hosting an interactive chat client, an OpenAI-compatible API tenant, an agent runtime, and a batch eval job — concurrently, fairly, with per-tenant quotas and prefix-shared KV, at near-bandwidth-saturating aggregate throughput. The single-stream decode tok/s targets are the easy part; the hard part is the policy and isolation layer, and the reason it lives in ZINC_RT rather than in a Python sidecar is that every part of the policy reads state the GPU is already touching — slot table, KV pages, sampling RNGs — and pushing that state across a process boundary defeats the point.
 
-The current ZINC + Vulkan stack peaks at 117 tok/s decode and 31 % bandwidth utilization on R9700. ZINC_RT, fully realized, targets 240 tok/s decode and 65 % bandwidth utilization, with continuous-batching aggregate throughput approaching 1 000 tok/s on 4 concurrent slots — outperforming vLLM on this hardware class while running in a single Zig binary with no Python and no ROCm.
+**The Vulkan backend is not going away.** It remains a peer of ZINC_RT, selected via `-Dbackend=vulkan`, tested in CI on every PR, and shipped to every user. ZINC ships *two* GPU paths long-term: ZINC_RT for the lowest-overhead route to peak single-tenant performance *and* the multi-tenant scheduler; Vulkan as the broadly compatible, well-trodden single-tenant fallback that every Linux GPU user has worked with for a decade. The two share GGUF parsing, tokenizer, server, model catalog — only the GPU dispatch, kernels, and scheduler differ. The cost of keeping both is modest; the benefit (always a working fallback when ZINC_RT regresses or hits new hardware) is permanent.
+
+The current ZINC + Vulkan stack peaks at 117 tok/s decode and 31 % bandwidth utilization on R9700, with no multitenant batching. ZINC_RT, fully realized, targets 240 tok/s decode and 65 % bandwidth utilization at the single-stream level, with continuous-batching aggregate throughput approaching 1 000 tok/s on 4 concurrent slots and ~2 800 tok/s on 16 — outperforming vLLM on this hardware class while running in a single Zig binary with no Python and no ROCm.
 
 This document is the contract. The agent should follow §25 milestone-by-milestone, annotating this file as each gate is cleared. Open questions in §27 are decisions the agent should escalate, not invent. **A milestone is not "complete" unless both `-Dbackend=zinc_rt` AND `-Dbackend=vulkan` build cleanly and pass CI.**
