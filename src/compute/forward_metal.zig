@@ -1081,6 +1081,14 @@ const MoeWeightedAccSharedPush = extern struct {
     has_gate: u32,
 };
 
+/// Push constants for fused MoE weighted acc + shared expert with F32 gate dot.
+const MoeWeightedAccSharedGateF32Push = extern struct {
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+    gate_weight_offset: u32,
+};
+
 /// Push constants for sigmoid multiply dispatch (matches sigmoid_mul.metal: buffer(0)).
 const SigmoidMulPush = extern struct {
     n: u32,
@@ -1945,6 +1953,13 @@ fn canUseQwenSharedGateInputBatched(engine: *const InferenceEngine, tensor: *con
         canUseQwenSharedGateInputF32(engine, tensor, hidden_dim);
 }
 
+fn canUseQwenTokenSharedGateF32Acc(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, hidden_dim: u32) bool {
+    return engine.config.architecture == .qwen2_moe and
+        tensor.info.type_ == .f32 and
+        tensor.info.numElements() == hidden_dim and
+        engine.moe_weighted_acc_shared_gate_f32_pipe.handle != null;
+}
+
 fn canUseQwenSsmProjectionTailF32Batched(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, rows: u32, cols: u32) bool {
     return tensor.info.type_ == .f32 and
         rows > 0 and
@@ -2152,6 +2167,7 @@ pub const InferenceEngine = struct {
     residual_rms_norm_pipe: MetalPipeline,
     post_norm_residual_rms_norm_pipe: MetalPipeline,
     moe_weighted_acc_shared_pipe: MetalPipeline,
+    moe_weighted_acc_shared_gate_f32_pipe: MetalPipeline,
     copy_u32_pipe: MetalPipeline,
     copy_f32_pipe: MetalPipeline,
     zero_f32_pipe: MetalPipeline,
@@ -2615,6 +2631,7 @@ pub const InferenceEngine = struct {
         self.residual_rms_norm_pipe = try loadShaderPipeline(ctx, "residual_rms_norm");
         self.post_norm_residual_rms_norm_pipe = try loadShaderPipeline(ctx, "post_norm_residual_rms_norm");
         self.moe_weighted_acc_shared_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared");
+        self.moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
         self.copy_u32_pipe = try loadShaderPipeline(ctx, "copy_u32");
         self.copy_f32_pipe = try loadShaderPipeline(ctx, "copy_f32");
         self.zero_f32_pipe = try loadShaderPipeline(ctx, "zero_f32");
@@ -3373,6 +3390,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.residual_rms_norm_pipe);
         metal_pipeline.freePipeline(&self.post_norm_residual_rms_norm_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_pipe);
+        metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_pipe);
         metal_pipeline.freePipeline(&self.copy_u32_pipe);
         metal_pipeline.freePipeline(&self.copy_f32_pipe);
         metal_pipeline.freePipeline(&self.zero_f32_pipe);
@@ -9157,6 +9175,29 @@ fn dispatchMoeWeightedAccSharedOnCmd(
     cmd.dispatchV2(&engine.moe_weighted_acc_shared_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedPush), 3);
 }
 
+fn dispatchMoeWeightedAccSharedGateF32OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    accum: *const MetalBuffer,
+    src: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    shared_src: *const MetalBuffer,
+    norm_src: *const MetalBuffer,
+    gate_weight: *const metal_loader.LoadedTensor,
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+) void {
+    const push = MoeWeightedAccSharedGateF32Push{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = src_stride,
+        .gate_weight_offset = tensorPageOffset(engine.model, gate_weight),
+    };
+    const bufs = [_]*const MetalBuffer{ accum, src, routing, shared_src, norm_src, &gate_weight.gpu_buffer };
+    cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_pipe, .{ (n + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+}
+
 /// Returns true if the attention gate (sigmoid gating) should be applied after flash attn.
 fn dispatchFullAttnPrepOnCmd(
     engine: *InferenceEngine,
@@ -12491,6 +12532,9 @@ fn recordGpuRoutedBatchedMoeOnCmd(
         gate_exps.info.type_ == .q4_k and
         up_exps.info.type_ == .q4_k and
         engine.dmmv_q4k_moe_gate_up_dual_pipe.handle != null;
+    const use_f32_shared_gate_acc =
+        gate_inp_shexp != null and
+        canUseQwenTokenSharedGateF32Acc(engine, gate_inp_shexp.?, hidden_dim);
 
     if (!router_output_ready) {
         dispatchSoftmaxTopkOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used);
@@ -12536,7 +12580,9 @@ fn recordGpuRoutedBatchedMoeOnCmd(
             dispatchDmmvOnCmd(engine, cmd, up_shexp.?, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
         }
         if (gate_inp_shexp) |tensor| {
-            dispatchDmmvOnCmd(engine, cmd, tensor, &engine.norm_buf, &engine.router_logits_buf, 1, hidden_dim, 0);
+            if (!use_f32_shared_gate_acc) {
+                dispatchDmmvOnCmd(engine, cmd, tensor, &engine.norm_buf, &engine.router_logits_buf, 1, hidden_dim, 0);
+            }
         }
     }
     profileBarrier(cmd, profile, .gpu_routed_moe); // gate/up outputs visible before SwiGLU
@@ -12563,8 +12609,16 @@ fn recordGpuRoutedBatchedMoeOnCmd(
 
     // Phase E: weighted accumulate + shared expert into hidden_buf (fused — saves one barrier per layer).
     if (has_shexp) {
-        const gate_buf = if (gate_inp_shexp != null) &engine.router_logits_buf else &engine.down_buf;
-        dispatchMoeWeightedAccSharedOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, gate_buf, hidden_dim, cfg.n_experts_used, hidden_dim, gate_inp_shexp != null);
+        if (use_f32_shared_gate_acc) {
+            // Adapt vLLM's top-k weight+reduce finalization and llama.cpp's
+            // Metal fusion discipline: for Qwen3.6's one-row F32 shared gate,
+            // fold the gate dot product into the MoE combine kernel instead
+            // of launching a separate 1xhidden DMMV before reduce.
+            dispatchMoeWeightedAccSharedGateF32OnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, &engine.norm_buf, gate_inp_shexp.?, hidden_dim, cfg.n_experts_used, hidden_dim);
+        } else {
+            const gate_buf = if (gate_inp_shexp != null) &engine.router_logits_buf else &engine.down_buf;
+            dispatchMoeWeightedAccSharedOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, gate_buf, hidden_dim, cfg.n_experts_used, hidden_dim, gate_inp_shexp != null);
+        }
     } else {
         dispatchMoeWeightedAccOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, hidden_dim, cfg.n_experts_used, hidden_dim);
     }
@@ -18869,6 +18923,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&moe_weighted_acc_pipe);
     var moe_weighted_acc_scaled_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_scaled");
     defer metal_pipeline.freePipeline(&moe_weighted_acc_scaled_pipe);
+    var moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
+    defer metal_pipeline.freePipeline(&moe_weighted_acc_shared_gate_f32_pipe);
     var ssm_delta_net_prefill_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
     defer metal_pipeline.freePipeline(&ssm_delta_net_prefill_pipe);
 
@@ -18917,6 +18973,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(sigmoid_scale_acc_batched_pipe.handle != null);
     try std.testing.expect(moe_weighted_acc_pipe.handle != null);
     try std.testing.expect(moe_weighted_acc_scaled_pipe.handle != null);
+    try std.testing.expect(moe_weighted_acc_shared_gate_f32_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_prefill_pipe.handle != null);
 }
 
@@ -20225,6 +20282,84 @@ test "moe_weighted_acc shader adds weighted experts into destination" {
     try std.testing.expectApproxEqAbs(@as(f32, 25.0), accum_ptr[1], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 36.0), accum_ptr[2], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 47.0), accum_ptr[3], 0.001);
+}
+
+test "moe_weighted_acc_shared_gate_f32 computes gate dot and reduce" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n: u32 = 8;
+    const n_used: u32 = 3;
+    const n_usize: usize = @intCast(n);
+    const n_used_usize: usize = @intCast(n_used);
+
+    var accum_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&accum_buf);
+    var src_buf = try metal_buffer.createBuffer(ctx, n_used_usize * n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used_usize * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var shared_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var gate_weight_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_weight_buf);
+
+    const accum_ptr: [*]f32 = @ptrCast(@alignCast(accum_buf.cpu_ptr.?));
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    const shared_ptr: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
+    const norm_ptr: [*]f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    const gate_weight_ptr: [*]f32 = @ptrCast(@alignCast(gate_weight_buf.cpu_ptr.?));
+
+    for (0..n_usize) |i| {
+        accum_ptr[i] = @floatFromInt(i);
+        shared_ptr[i] = 0.5 * @as(f32, @floatFromInt(i + 1));
+        norm_ptr[i] = 0.125 * @as(f32, @floatFromInt(i + 1));
+        gate_weight_ptr[i] = if ((i % 2) == 0) 0.25 else -0.125;
+    }
+    for (0..n_used_usize) |expert| {
+        for (0..n_usize) |i| {
+            src_ptr[expert * n_usize + i] = @as(f32, @floatFromInt((expert + 1) * 10 + i));
+        }
+    }
+    routing_ptr[0] = 3;
+    routing_ptr[1] = 7;
+    routing_ptr[2] = 11;
+    routing_ptr[3] = @bitCast(@as(f32, 0.2));
+    routing_ptr[4] = @bitCast(@as(f32, 0.3));
+    routing_ptr[5] = @bitCast(@as(f32, 0.5));
+
+    const push = MoeWeightedAccSharedGateF32Push{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = n,
+        .gate_weight_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &accum_buf, &src_buf, &routing_buf, &shared_buf, &norm_buf, &gate_weight_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+    cmd.commitAndWait();
+
+    var dot: f32 = 0.0;
+    for (0..n_usize) |i| dot += norm_ptr[i] * gate_weight_ptr[i];
+    const gate = 1.0 / (1.0 + @exp(-dot));
+
+    for (0..n_usize) |i| {
+        const expected =
+            @as(f32, @floatFromInt(i)) +
+            0.2 * src_ptr[i] +
+            0.3 * src_ptr[n_usize + i] +
+            0.5 * src_ptr[2 * n_usize + i] +
+            gate * shared_ptr[i];
+        try std.testing.expectApproxEqAbs(expected, accum_ptr[i], 0.001);
+    }
 }
 
 test "router_f32_topk_bias shader matches CPU top-k softmax reference" {
