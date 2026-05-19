@@ -10844,6 +10844,8 @@ fn validateQwenMoeRoutePackChunk(
     defer metal_buffer.freeBuffer(&shared_acc_gate_candidate_buf);
     var combined_delta_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
     defer metal_buffer.freeBuffer(&combined_delta_candidate_buf);
+    var active_combined_delta_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_combined_delta_candidate_buf);
     if (can_validate_active_blocks) {
         active_counts_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(@as(usize, cfg.n_experts) * @sizeOf(u32), 4));
         active_packed_ids_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(@as(usize, cfg.n_experts) * n_usize * @sizeOf(u32), 4));
@@ -10865,6 +10867,9 @@ fn validateQwenMoeRoutePackChunk(
         combined_delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
         if (gate_inp_shexp != null and !f32_shared_gate) {
             shared_acc_gate_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * @sizeOf(f32), 4));
+        }
+        if (can_validate_active_blocks and f32_shared_gate) {
+            active_combined_delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
         }
     }
 
@@ -11108,6 +11113,24 @@ fn validateQwenMoeRoutePackChunk(
                         cfg.n_experts,
                         k,
                     );
+                    if (can_validate_active_blocks) {
+                        dispatchZeroF32OnCmd(engine, &cmd, &active_combined_delta_candidate_buf, n * hidden_dim);
+                        cmd.barrier();
+                        dispatchMoeRouteScatterSharedResidualGateF32OnCmd(
+                            engine,
+                            &cmd,
+                            &engine.qwen_moe_route_validate_routing_buf,
+                            &active_down_candidate_buf,
+                            &shared_down_candidate_buf,
+                            &engine.qwen_moe_route_validate_norm_buf,
+                            gate_inp_shexp.?,
+                            &active_combined_delta_candidate_buf,
+                            n,
+                            hidden_dim,
+                            cfg.n_experts,
+                            k,
+                        );
+                    }
                 } else {
                     dispatchCopyF32OnCmd(engine, &cmd, &delta_candidate_buf, &combined_delta_candidate_buf, n * hidden_dim);
                     cmd.barrier();
@@ -11298,6 +11321,14 @@ fn validateQwenMoeRoutePackChunk(
                 "moe_delta_grouped_shared";
             logQwenMoeRoutePackValidationDiff(layer_idx, combined_tensor_name, combined_ref[0..delta_total], combined_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
 
+            const active_combined_candidate: ?[*]const f32 = if (can_validate_active_blocks and f32_shared_gate)
+                @ptrCast(@alignCast(active_combined_delta_candidate_buf.cpu_ptr.?))
+            else
+                null;
+            if (active_combined_candidate) |active_combined| {
+                logQwenMoeRoutePackValidationDiff(layer_idx, "moe_delta_active_shared_gate_f32", combined_ref[0..delta_total], active_combined[0..delta_total], hidden_dim, 1, n, 5e-2);
+            }
+
             const post_candidate = try allocator.alloc(f32, delta_total);
             defer allocator.free(post_candidate);
             const hidden_before_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_hidden_before_ref_buf.cpu_ptr.?));
@@ -11310,6 +11341,13 @@ fn validateQwenMoeRoutePackChunk(
             else
                 "post_hidden_grouped_shared";
             logQwenMoeRoutePackValidationDiff(layer_idx, post_tensor_name, post_hidden_ref[0..delta_total], post_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+
+            if (active_combined_candidate) |active_combined| {
+                for (0..delta_total) |i| {
+                    post_candidate[i] = hidden_before_ref[i] + active_combined[i];
+                }
+                logQwenMoeRoutePackValidationDiff(layer_idx, "post_hidden_active_shared_gate_f32", post_hidden_ref[0..delta_total], post_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+            }
         }
     }
 
