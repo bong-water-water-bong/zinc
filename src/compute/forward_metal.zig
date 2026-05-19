@@ -36,7 +36,7 @@ const qwen_moe_route_pack_validate_tokens: u32 = 4;
 // grouped-MoE prefill shape through layer 15 while preserving the per-layer
 // support checks before each layer is recorded.
 const qwen_route_packed_prefix_layer_limit: usize = 16;
-const moe_route_block_cols: u32 = 4;
+const moe_route_block_cols: u32 = 8;
 
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
@@ -17697,7 +17697,7 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
     const active_blocks_ptr: [*]const u32 = @ptrCast(@alignCast(active_blocks_buf.cpu_ptr.?));
 
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5, 2, 2 }, counts_ptr[0..n_experts]);
-    try std.testing.expectEqual(@as(u32, 7), active_count_ptr[0]);
+    try std.testing.expectEqual(@as(u32, 6), active_count_ptr[0]);
 
     var seen_routes = [_]bool{false} ** route_slots;
     for (0..n_experts) |expert| {
@@ -18324,8 +18324,8 @@ test "maxPackedMoeRouteBlocks bounds active route block grid" {
     try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(16, 0));
     try std.testing.expectEqual(@as(u32, 8), maxPackedMoeRouteBlocks(8, 256));
     try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(257, 256));
-    try std.testing.expectEqual(@as(u32, 257), maxPackedMoeRouteBlocks(260, 256));
-    try std.testing.expectEqual(@as(u32, 460), maxPackedMoeRouteBlocks(134 * 8, 256));
+    try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(260, 256));
+    try std.testing.expectEqual(@as(u32, 358), maxPackedMoeRouteBlocks(134 * 8, 256));
 }
 
 test "kv_cache_write shader writes K and V slices at token offset" {

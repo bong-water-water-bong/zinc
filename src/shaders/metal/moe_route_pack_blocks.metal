@@ -10,7 +10,7 @@ struct Params {
     uint ids_stride;
 };
 
-#define NUM_COLS 4u
+#define NUM_COLS 8u
 
 kernel void main0(
     constant Params& p [[buffer(0)]],
