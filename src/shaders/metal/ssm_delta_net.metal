@@ -57,6 +57,7 @@ struct _21
     uint _m8;
     uint _m9;
     uint _m10;
+    uint _m11;
 };
 
 struct _105
@@ -348,7 +349,7 @@ kernel void main0(constant _21& _23 [[buffer(0)]], device _105& _107 [[buffer(1)
                 _606++;
                 continue;
             }
-            _564._m0[_613] = _609;
+            _564._m0[_23._m11 + _613] = _609;
         }
         break;
     } while(false);

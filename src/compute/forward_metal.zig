@@ -1125,6 +1125,7 @@ const SsmDeltaNetPush = extern struct {
     has_ssm_a: u32,
     alpha_offset: u32,
     beta_offset: u32,
+    output_offset: u32,
 };
 
 /// Push constants for SSM gated norm dispatch (SPIRV-Cross: buffer(0)).
@@ -1136,6 +1137,7 @@ const SsmGatedNormPush = extern struct {
     norm_per_head: u32,
     z_offset: u32,
     output_offset: u32,
+    delta_offset: u32,
 };
 
 const GGMLType = gguf.GGMLType;
@@ -3683,6 +3685,7 @@ pub const InferenceEngine = struct {
                     .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
                     .alpha_offset = if (alpha_batched) token_dt_offset else 0,
                     .beta_offset = if (beta_batched) token_dt_offset else 0,
+                    .output_offset = 0,
                 };
                 const dn_bufs = [_]*const MetalBuffer{
                     &self.swiglu_buf,                    alpha_buf,
@@ -7221,6 +7224,26 @@ fn dispatchSsmGatedNormOffsetsWithPipe(
     z_offset: u32,
     output_offset: u32,
 ) void {
+    dispatchSsmGatedNormBatchedOffsetsWithPipe(cmd, pipe, delta_net_output, norm_weight, z_gate, output, d_inner, dt_rank, head_v_dim, d_state, norm_per_head, 0, z_offset, output_offset, 1);
+}
+
+fn dispatchSsmGatedNormBatchedOffsetsWithPipe(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    delta_net_output: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    z_gate: *const MetalBuffer,
+    output: *const MetalBuffer,
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    norm_per_head: bool,
+    delta_offset: u32,
+    z_offset: u32,
+    output_offset: u32,
+    n_tokens: u32,
+) void {
     const push = SsmGatedNormPush{
         .d_inner = d_inner,
         .dt_rank = dt_rank,
@@ -7229,9 +7252,10 @@ fn dispatchSsmGatedNormOffsetsWithPipe(
         .norm_per_head = if (norm_per_head) 1 else 0,
         .z_offset = z_offset,
         .output_offset = output_offset,
+        .delta_offset = delta_offset,
     };
     const bufs = [_]*const MetalBuffer{ delta_net_output, norm_weight, z_gate, output };
-    cmd.dispatchV2(pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmGatedNormPush), 0);
+    cmd.dispatchV2(pipe, .{ dt_rank, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmGatedNormPush), 0);
 }
 
 fn dispatchSoftmaxTopkOnCmd(
@@ -8131,36 +8155,38 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
                 .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
                 .alpha_offset = if (alpha_batched) token_dt_offset else 0,
                 .beta_offset = if (beta_batched) token_dt_offset else 0,
+                .output_offset = token_ssm_offset,
             };
             const dn_bufs = [_]*const MetalBuffer{
                 &engine.swiglu_buf,                    alpha_buf,
                 &engine.ssm_dt_bias_bufs.?[layer_idx], &engine.ssm_a_bufs.?[layer_idx],
                 beta_buf,                              &engine.ssm_state_bufs.?[layer_idx],
-                &engine.attn_out_buf,
+                &scratch.attn_out,
             };
             cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
             if (profile) |p| p.ssm_delta_calls += 1;
         }
         profileBarrier(cmd, profile, .ssm);
-
-        dispatchSsmGatedNormOffsetsWithPipe(
-            cmd,
-            &engine.ssm_gated_norm_pipe,
-            &engine.attn_out_buf,
-            &engine.ssm_norm_weight_bufs.?[layer_idx],
-            &engine.qwen_ssm_prefill_proj_z_buf,
-            &scratch.swiglu,
-            d_inner,
-            dt_rank,
-            head_v_dim,
-            d_state,
-            engine.ssm_norm_per_head.?[layer_idx],
-            token_ssm_offset,
-            token_ssm_offset,
-        );
-        if (profile) |p| p.ssm_gated_norm_calls += 1;
-        profileBarrier(cmd, profile, .ssm);
     }
+
+    dispatchSsmGatedNormBatchedOffsetsWithPipe(
+        cmd,
+        &engine.ssm_gated_norm_pipe,
+        &scratch.attn_out,
+        &engine.ssm_norm_weight_bufs.?[layer_idx],
+        &engine.qwen_ssm_prefill_proj_z_buf,
+        &scratch.swiglu,
+        d_inner,
+        dt_rank,
+        head_v_dim,
+        d_state,
+        engine.ssm_norm_per_head.?[layer_idx],
+        0,
+        0,
+        0,
+        n_tokens,
+    );
+    if (profile) |p| p.ssm_gated_norm_calls += 1;
     profileBarrier(cmd, profile, .ssm);
 
     dispatchGemmQ8_0OnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &scratch.swiglu, &scratch.down, hidden_dim, d_inner, n_tokens);
@@ -12117,6 +12143,7 @@ fn runDecodeStep(
                     .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
                     .alpha_offset = 0,
                     .beta_offset = 0,
+                    .output_offset = 0,
                 };
                 const dn_bufs = [_]*const MetalBuffer{
                     &engine.swiglu_buf,                    &engine.router_logits_buf,
@@ -14686,6 +14713,7 @@ test "ssm_delta_net shader matches CPU reference" {
         .has_ssm_a = 1,
         .alpha_offset = 0,
         .beta_offset = 0,
+        .output_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{
         &conv_buf,
@@ -15019,6 +15047,7 @@ test "ssm_delta_net shader matches CPU reference at realistic head width" {
         .has_ssm_a = 1,
         .alpha_offset = 0,
         .beta_offset = 0,
+        .output_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{
         &conv_buf,
@@ -15132,6 +15161,7 @@ test "ssm_delta_net shader matches CPU reference at model-like dimensions" {
         .has_ssm_a = 1,
         .alpha_offset = 0,
         .beta_offset = 0,
+        .output_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{
         &conv_buf,
