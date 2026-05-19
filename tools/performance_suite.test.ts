@@ -105,11 +105,11 @@ test("resolveLocalLlamaServer prefers explicit path, then PATH, then docker fall
 
 test("GPT-OSS uses the chat prompt path in the performance suite", () => {
   expect(prefersChatPrompt("gpt-oss-20b-q4k-m")).toBe(true);
-  expect(defaultPromptForModelId("gpt-oss-20b-q4k-m")).toBe("What is the capital of France? Answer in one word.");
-  expect(defaultMaxTokensForModelId("gpt-oss-20b-q4k-m")).toBe(48);
+  expect(defaultPromptForModelId("gpt-oss-20b-q4k-m")).toContain("benchmark screenshots");
+  expect(defaultMaxTokensForModelId("gpt-oss-20b-q4k-m")).toBe(128);
   expect(prefersChatPrompt("qwen3-8b-q4k-m")).toBe(false);
-  expect(defaultPromptForModelId("qwen3-8b-q4k-m")).toBe("The capital of France is");
-  expect(defaultMaxTokensForModelId("qwen3-8b-q4k-m")).toBe(8);
+  expect(defaultPromptForModelId("qwen3-8b-q4k-m")).toContain("Developer question");
+  expect(defaultMaxTokensForModelId("qwen3-8b-q4k-m")).toBe(96);
 });
 
 test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
@@ -130,7 +130,8 @@ test("default RDNA cases include Qwen 3.6 27B dense", () => {
 
   expect(qwen36Dense?.model_path).toBe("/root/models/Qwen3.6-27B-Q4_K_M.gguf");
   expect(qwen36Dense?.prompt_mode).toBe("raw");
-  expect(qwen36Dense?.max_tokens).toBe(128);
+  expect(qwen36Dense?.prompt).toContain("Developer question");
+  expect(qwen36Dense?.max_tokens).toBe(96);
 });
 
 test("default Intel cases use the remote managed cache layout", () => {
@@ -220,13 +221,20 @@ test("benchmark failure reasons do not publish shell commands", () => {
 });
 
 test("benchmark suite uses a multi-scenario matrix instead of a single prompt", () => {
-  const qwen = defaultScenarioDefsForModel("qwen3-8b-q4k-m", "raw", "The capital of France is");
+  const qwen = defaultScenarioDefsForModel("qwen3-8b-q4k-m", "raw", defaultPromptForModelId("qwen3-8b-q4k-m"));
   expect(qwen.map((scenario) => scenario.id)).toEqual(["core", "context-medium", "context-long", "decode-extended"]);
+  expect(qwen.map((scenario) => scenario.label)).toEqual(["Quick Chat", "Coding Review", "Incident Context", "Long Coding Draft"]);
   expect(qwen[1]?.prompt).not.toBe(qwen[0]?.prompt);
-  expect(qwen[3]?.max_tokens).toBe(32);
+  expect(qwen[1]?.prompt).toContain("src/cache.ts");
+  expect(qwen[1]?.max_tokens).toBe(160);
+  expect(qwen[2]?.prompt).toContain("Incident notes");
+  expect(qwen[2]?.max_tokens).toBe(128);
+  expect(qwen[3]?.prompt).toContain("stable benchmark preset");
+  expect(qwen[3]?.max_tokens).toBe(256);
 
-  const gptoss = defaultScenarioDefsForModel("gpt-oss-20b-q4k-m", "chat", "What is the capital of France? Answer in one word.");
-  expect(gptoss[3]?.max_tokens).toBe(96);
+  const gptoss = defaultScenarioDefsForModel("gpt-oss-20b-q4k-m", "chat", defaultPromptForModelId("gpt-oss-20b-q4k-m"));
+  expect(gptoss[0]?.max_tokens).toBe(128);
+  expect(gptoss[3]?.max_tokens).toBe(256);
 });
 
 test("benchmark suite measures all ZINC scenarios before starting baselines", () => {
