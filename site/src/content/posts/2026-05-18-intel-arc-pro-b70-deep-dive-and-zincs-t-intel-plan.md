@@ -103,6 +103,11 @@ faqs:
 
 The Intel Arc Pro B70 puts 32 gigabytes of ECC GDDR6 on a 256-bit bus, 608 GB per second of memory bandwidth, 256 XMX matrix engines pushing 367 INT8 TOPS, 230 watts of board power, and PCIe 5.0 x16 onto a single workstation-class GPU at a price that sits much closer to the consumer-flagship band than to the traditional workstation band.
 
+<figure class="diagram-card diagram-wide">
+  <img src="/blog/2026-05-18-intel-arc-pro-b70.jpg" alt="An Intel-published product render of the Arc Pro B70 graphics card on a white background. The card is a low-profile single-slot workstation GPU in a blue anodized shroud with the wordmark 'intel ARC PRO B70' across the top face, a side label 'intel ARC PRO', and a small 'B70' tag near the back. A blower-style exhaust vent sits over the GPU die, the PCIe gold fingers and a small auxiliary connector header are visible along the top edge, and the PCB bracket on the left exposes a slotted rear airflow grille." loading="lazy" />
+  <figcaption>The Intel Arc Pro B70: 32 GB ECC GDDR6, 608 GB/s on a 256-bit bus, 256 XMX engines, 230 W in a single-slot blower form factor. The full local-LLM spec triplet on one card at workstation MSRP.</figcaption>
+</figure>
+
 That spec sheet on a single card is what makes the Intel Arc Pro B70 worth a long technical look for anyone shipping local LLM inference. The 32 GB ECC tier of GPUs has historically meant NVIDIA RTX 5000 Ada at one price point or AMD Radeon AI PRO R9700 at another, both in the workstation price band that consumer buyers do not touch. The Intel Arc Pro B70 lands in the same VRAM and memory-bandwidth class as those cards while sitting much closer to consumer-flagship pricing, and that is the change that matters for local inference on 27B and 35B-parameter MoE models.
 
 This post is the deep technical version of why the Intel Arc Pro B70 is the local LLM inference card to pay attention to right now. It covers what the Xe2 architecture inside the Intel Arc Pro B70 actually looks like, what DPAS does on the B70's XMX engines and how it compares to AMD's WMMA and NVIDIA's tensor cores, how the Arc Pro B70 fits into the full Intel Arc B-series lineup, what the bandwidth math says about peak achievable decode tok/s on Qwen3.6 35B-A3B running on the B70, and what ZINC's M7 T-Intel backend has to build to take advantage of the Intel Arc Pro B70.
