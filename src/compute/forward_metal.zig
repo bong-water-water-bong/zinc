@@ -3220,7 +3220,7 @@ pub const InferenceEngine = struct {
 
         for (prompt_tokens, 0..) |token_id, i| {
             try self.loadTokenEmbedding(token_id);
-            try runDecodeStep(self, i + 1 == prompt_tokens.len, null, 0, null);
+            try runDecodeStep(self, i + 1 == prompt_tokens.len, null, 0, null, null);
         }
         state.position = self.position;
     }
@@ -3247,6 +3247,10 @@ pub const InferenceEngine = struct {
         // final prompt token. SSM recurrence and MoE routing stay on the existing
         // per-token path; Qwen3.6 can additionally precompute layer-0 SSM
         // projections over the queued prompt embeddings.
+        if (self.canUseSingleCommandQueuedTokenMajorPrefill(prompt_tokens.len)) {
+            return self.prefillBatchQueuedTokenMajorSingleCommand(state, prompt_tokens);
+        }
+
         const hidden_dim = self.config.hidden_dim;
         const hidden_dim_usize: usize = @intCast(hidden_dim);
         for (prompt_tokens, 0..) |token_id, i| {
@@ -3273,12 +3277,54 @@ pub const InferenceEngine = struct {
 
         for (prompt_tokens[0..pending_token_count], 0..) |_, i| {
             const embed_offset: u32 = @intCast(i * hidden_dim_usize);
-            try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, &pending[pending_count]);
+            try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, &pending[pending_count], null);
             pending_count += 1;
         }
 
         const final_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
-        try runDecodeStep(self, true, &self.prefill_embed_buf, final_offset, null);
+        try runDecodeStep(self, true, &self.prefill_embed_buf, final_offset, null, null);
+        state.position = self.position;
+    }
+
+    fn canUseSingleCommandQueuedTokenMajorPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
+        if (!self.canUseQueuedTokenMajorPrefill(prompt_len)) return false;
+        if (!defaultQwen36SsmPrefillProjectionEnabled(self.config)) return false;
+        if (shouldCpuLmHeadFallback(self)) return false;
+        return true;
+    }
+
+    fn prefillBatchQueuedTokenMajorSingleCommand(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        // For Qwen3.6 hybrid prefill there are no CPU routing reads in the hot
+        // path, so the whole token-major prompt can live in one ordered command
+        // buffer. This keeps exact token order while avoiding one command-buffer
+        // submission per prompt token.
+        const hidden_dim = self.config.hidden_dim;
+        const hidden_dim_usize: usize = @intCast(hidden_dim);
+        for (prompt_tokens, 0..) |token_id, i| {
+            try self.loadTokenEmbeddingInto(token_id, &self.prefill_embed_buf, i * hidden_dim_usize);
+        }
+
+        var precompute_cmd = MetalCommand{
+            .handle = null,
+            .dispatch_count = 0,
+            .barrier_count = 0,
+            .barrier_enabled = false,
+        };
+        defer if (precompute_cmd.handle != null) precompute_cmd.wait();
+        _ = try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &precompute_cmd);
+
+        var prompt_cmd = try beginProfiledCommand(self, if (self.profile_enabled) &self.request_profile else null);
+        errdefer if (prompt_cmd.handle != null) prompt_cmd.wait();
+
+        const pending_token_count = prompt_tokens.len - 1;
+        for (prompt_tokens[0..pending_token_count], 0..) |_, i| {
+            const embed_offset: u32 = @intCast(i * hidden_dim_usize);
+            try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, null, &prompt_cmd);
+        }
+
+        const final_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
+        try runDecodeStep(self, true, &self.prefill_embed_buf, final_offset, null, &prompt_cmd);
+        commitAndWaitProfiled(&prompt_cmd, if (self.profile_enabled) &self.request_profile else null);
         state.position = self.position;
     }
 
@@ -3588,7 +3634,7 @@ pub const InferenceEngine = struct {
             state.position + 1;
         if (next_token_target > self.max_context_tokens) return error.ContextLengthExceeded;
         try self.loadTokenEmbedding(token_id);
-        try runDecodeStep(self, true, null, 0, null);
+        try runDecodeStep(self, true, null, 0, null, null);
         state.position = self.position;
     }
 
@@ -9585,6 +9631,7 @@ fn runDecodeStep(
     embed_src_override: ?*const MetalBuffer,
     embed_src_offset: u32,
     async_out: ?*MetalCommand,
+    external_shared_cmd: ?*MetalCommand,
 ) !void {
     const step_start = profileStart(engine.profile_enabled);
     defer if (engine.profile_enabled) {
@@ -9606,6 +9653,7 @@ fn runDecodeStep(
     const n_group: u32 = cfg.ssm_n_group;
     const dt_rank: u32 = cfg.ssm_dt_rank;
     const conv_channels: u32 = if (d_inner > 0) d_inner + 2 * n_group * d_state else 0;
+    if (external_shared_cmd != null and async_out != null) return error.InvalidPrefillCommandMode;
 
     const head_v_dim: u32 = if (d_inner > 0) d_inner / @max(dt_rank, 1) else 0;
     const d_conv: u32 = cfg.ssm_d_conv;
@@ -9664,10 +9712,13 @@ fn runDecodeStep(
     const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
     if (profile) |p| {
         p.decode_steps += 1;
-        if (use_single_gpu_cmd) p.shared_cmd_steps += 1;
+        if (use_single_gpu_cmd or external_shared_cmd != null) p.shared_cmd_steps += 1;
     }
     var shared_cmd_storage: MetalCommand = undefined;
-    const shared_cmd: ?*MetalCommand = if (use_single_gpu_cmd) blk: {
+    const using_external_shared_cmd = external_shared_cmd != null;
+    const shared_cmd: ?*MetalCommand = if (external_shared_cmd) |cmd|
+        cmd
+    else if (use_single_gpu_cmd) blk: {
         shared_cmd_storage = try beginProfiledCommand(engine, profile);
         break :blk &shared_cmd_storage;
     } else null;
@@ -10613,7 +10664,9 @@ fn runDecodeStep(
 
     if (!emit_logits) {
         if (shared_cmd) |cmd| {
-            if (async_out) |out| {
+            if (using_external_shared_cmd) {
+                // The caller owns submission for a larger prompt command.
+            } else if (async_out) |out| {
                 commitAsyncProfiled(cmd, profile);
                 out.* = cmd.*;
                 cmd.* = .{
@@ -10640,6 +10693,7 @@ fn runDecodeStep(
     // barrier from the final phase per decode step.
     const final_record_start = profileStart(profile != null);
     const cpu_lm_head = shouldCpuLmHeadFallback(engine);
+    if (cpu_lm_head and using_external_shared_cmd) return error.InvalidPrefillCommandMode;
     const fuse_final_norm = !cpu_lm_head and canUseLmHeadFusedNorm(engine, hidden_dim);
     if (shared_cmd) |cmd| {
         if (cpu_lm_head) {
@@ -10655,7 +10709,7 @@ fn runDecodeStep(
             profileBarrier(cmd, profile, .final);
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(cmd, profile);
+            if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         } else {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(cmd, profile, .final);
@@ -10663,7 +10717,7 @@ fn runDecodeStep(
             profileBarrier(cmd, profile, .final);
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(cmd, profile);
+            if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         }
     } else {
         var cmd = try beginProfiledCommand(engine, profile);
