@@ -369,6 +369,14 @@ fn defaultQwen36SsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
         cfg.ssm_n_group == 16;
 }
 
+fn defaultFusedSsmNormEnabled(cfg: ModelConfig) bool {
+    // llama.cpp keeps norm as a separate graph op before the Metal matmul
+    // kernels. For the Qwen3.6 35B SSM shape, fusing RMSNorm into per-row Q8
+    // DMMV repeats the 2048-wide norm reduction across thousands of rows.
+    if (defaultQwen36SsmPrefillProjectionEnabled(cfg)) return false;
+    return true;
+}
+
 const DmmvPathClass = enum(u8) {
     other,
     ssm,
@@ -2409,7 +2417,7 @@ pub const InferenceEngine = struct {
             readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_LAYER") orelse
             readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_LAYER") orelse
             0;
-        self.fused_ssm_norm_enabled = readBoolEnv("ZINC_METAL_FUSED_SSM_NORM") orelse true;
+        self.fused_ssm_norm_enabled = readBoolEnv("ZINC_METAL_FUSED_SSM_NORM") orelse defaultFusedSsmNormEnabled(cfg);
         self.private_decode_buffers = if (options.debug_validation_enabled or
             self.gemma_moe_validation_enabled or
             self.qwen_prefill_validation_enabled)
