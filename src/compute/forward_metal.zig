@@ -924,6 +924,17 @@ const MoeRouteScatterPush = extern struct {
     debug: u32,
 };
 
+/// Push constants for fused route scatter + shared expert + residual add.
+/// Source is route-slot indexed; hidden is token-major `[token][hidden_dim]`.
+const MoeRouteScatterSharedResidualPush = extern struct {
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    has_gate: u32,
+};
+
 /// Push constants for scattering grouped MoE route outputs with Gemma's
 /// per-expert down projection scale folded into the route weight.
 const MoeRouteScatterScaledPush = extern struct {
@@ -1977,6 +1988,7 @@ pub const InferenceEngine = struct {
     moe_route_gather_pipe: MetalPipeline,
     moe_route_scatter_pipe: MetalPipeline,
     moe_route_scatter_set_pipe: MetalPipeline,
+    moe_route_scatter_shared_residual_pipe: MetalPipeline,
     moe_route_scatter_scaled_pipe: MetalPipeline,
     moe_route_scatter_direct_scaled_pipe: MetalPipeline,
     sigmoid_scale_acc_pipe: MetalPipeline,
@@ -2429,6 +2441,7 @@ pub const InferenceEngine = struct {
         self.moe_route_gather_pipe = try loadShaderPipeline(ctx, "moe_route_gather");
         self.moe_route_scatter_pipe = try loadShaderPipeline(ctx, "moe_route_scatter");
         self.moe_route_scatter_set_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_set");
+        self.moe_route_scatter_shared_residual_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_shared_residual");
         self.moe_route_scatter_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_scaled");
         self.moe_route_scatter_direct_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_direct_scaled");
         self.sigmoid_scale_acc_pipe = try loadShaderPipeline(ctx, "sigmoid_scale_acc");
@@ -3177,6 +3190,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.moe_route_gather_pipe);
         metal_pipeline.freePipeline(&self.moe_route_scatter_pipe);
         metal_pipeline.freePipeline(&self.moe_route_scatter_set_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_scatter_shared_residual_pipe);
         metal_pipeline.freePipeline(&self.moe_route_scatter_scaled_pipe);
         metal_pipeline.freePipeline(&self.moe_route_scatter_direct_scaled_pipe);
         metal_pipeline.freePipeline(&self.sigmoid_scale_acc_pipe);
@@ -7285,6 +7299,33 @@ fn dispatchMoeRouteScatterSetOnCmd(
     cmd.dispatchV2(&engine.moe_route_scatter_set_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterPush), 0);
 }
 
+fn dispatchMoeRouteScatterSharedResidualOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    routing: *const MetalBuffer,
+    routed_src: *const MetalBuffer,
+    shared_src: *const MetalBuffer,
+    shared_gate: *const MetalBuffer,
+    hidden: *const MetalBuffer,
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    has_gate: bool,
+) void {
+    const push = MoeRouteScatterSharedResidualPush{
+        .n_tokens = n_tokens,
+        .hidden_dim = hidden_dim,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .has_gate = if (has_gate) 1 else 0,
+    };
+    const total = n_tokens * hidden_dim;
+    const bufs = [_]*const MetalBuffer{ routing, routed_src, shared_src, shared_gate, hidden };
+    cmd.dispatchV2(&engine.moe_route_scatter_shared_residual_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterSharedResidualPush), 0);
+}
+
 fn dispatchMoeRouteScatterScaledOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -8180,10 +8221,14 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
             n_tokens,
         );
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe);
 
-    dispatchMoeRouteScatterSetOnCmd(engine, cmd, &scratch.moe_expert_counts, &scratch.moe_packed_ids, &scratch.moe_routing, &scratch.moe_expert_down, &scratch.down, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
-    profileBarrier(cmd, profile, .gpu_routed_moe);
+    const can_fuse_shared_residual =
+        lt.ffn_gate_shexp != null and engine.moe_route_scatter_shared_residual_pipe.handle != null;
+    if (!can_fuse_shared_residual) {
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+        dispatchMoeRouteScatterSetOnCmd(engine, cmd, &scratch.moe_expert_counts, &scratch.moe_packed_ids, &scratch.moe_routing, &scratch.moe_expert_down, &scratch.down, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+    }
 
     if (lt.ffn_gate_shexp) |gate_shexp| {
         const up_shexp = lt.ffn_up_shexp orelse return error.MissingTensor;
@@ -8204,6 +8249,24 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
 
         try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, down_shexp, &scratch.swiglu, &scratch.moe_route_input, hidden_dim, shexp_inter_dim, n_tokens);
         profileBarrier(cmd, profile, .gpu_routed_moe);
+        if (can_fuse_shared_residual) {
+            dispatchMoeRouteScatterSharedResidualOnCmd(
+                engine,
+                cmd,
+                &scratch.moe_routing,
+                &scratch.moe_expert_down,
+                &scratch.moe_route_input,
+                &scratch.attn_out,
+                &scratch.hidden,
+                n_tokens,
+                hidden_dim,
+                cfg.n_experts,
+                cfg.n_experts_used,
+                lt.ffn_gate_inp_shexp != null,
+            );
+            profileBarrier(cmd, profile, .gpu_routed_moe);
+            return;
+        }
         if (lt.ffn_gate_inp_shexp != null) {
             dispatchSigmoidScaleAccBatchedOnCmd(engine, cmd, &scratch.down, &scratch.moe_route_input, &scratch.attn_out, n_tokens, hidden_dim);
         } else {
@@ -17033,6 +17096,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&route_scatter_pipe);
     var route_scatter_set_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_set");
     defer metal_pipeline.freePipeline(&route_scatter_set_pipe);
+    var route_scatter_shared_residual_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_shared_residual");
+    defer metal_pipeline.freePipeline(&route_scatter_shared_residual_pipe);
     var route_scatter_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_scaled");
     defer metal_pipeline.freePipeline(&route_scatter_scaled_pipe);
     var route_scatter_direct_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_direct_scaled");
@@ -17082,6 +17147,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(route_gather_pipe.handle != null);
     try std.testing.expect(route_scatter_pipe.handle != null);
     try std.testing.expect(route_scatter_set_pipe.handle != null);
+    try std.testing.expect(route_scatter_shared_residual_pipe.handle != null);
     try std.testing.expect(route_scatter_scaled_pipe.handle != null);
     try std.testing.expect(route_scatter_direct_scaled_pipe.handle != null);
     try std.testing.expect(sigmoid_scale_acc_pipe.handle != null);
@@ -17632,6 +17698,103 @@ test "moe_route_scatter shader accumulates packed batched routes by token" {
 
     for (0..expected.len) |i| {
         try std.testing.expectApproxEqAbs(expected[i], dst_ptr[i], 0.001);
+    }
+}
+
+test "moe_route_scatter_shared_residual fuses route shared and residual" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_scatter_shared_residual");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: usize = 2;
+    const n_experts: usize = 4;
+    const k: usize = 3;
+    const hidden_dim: usize = 4;
+    const routing_stride: usize = k * 2;
+    const route_slots: usize = n_tokens * k;
+
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var routed_buf = try metal_buffer.createBuffer(ctx, route_slots * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&routed_buf);
+    var shared_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_buf);
+    var gate_buf = try metal_buffer.createBuffer(ctx, n_tokens * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_buf);
+    var hidden_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&hidden_buf);
+
+    const w025: u32 = @bitCast(@as(f32, 0.25));
+    const w050: u32 = @bitCast(@as(f32, 0.50));
+    const w060: u32 = @bitCast(@as(f32, 0.60));
+    const w030: u32 = @bitCast(@as(f32, 0.30));
+    const w010: u32 = @bitCast(@as(f32, 0.10));
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
+        2, 1, 3, w025, w050, w025,
+        1, 2, 0, w060, w030, w010,
+    });
+
+    const routed_ptr: [*]f32 = @ptrCast(@alignCast(routed_buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        for (0..hidden_dim) |dim| {
+            routed_ptr[route * hidden_dim + dim] = @as(f32, @floatFromInt(route * 10 + dim + 1));
+        }
+    }
+
+    const shared_ptr: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
+    for (0..n_tokens * hidden_dim) |i| {
+        shared_ptr[i] = 0.125 * @as(f32, @floatFromInt(i + 1));
+    }
+
+    const gate_ptr: [*]f32 = @ptrCast(@alignCast(gate_buf.cpu_ptr.?));
+    @memcpy(gate_ptr[0..n_tokens], &[_]f32{ -0.5, 0.75 });
+
+    const hidden_ptr: [*]f32 = @ptrCast(@alignCast(hidden_buf.cpu_ptr.?));
+    @memcpy(hidden_ptr[0 .. n_tokens * hidden_dim], &[_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    });
+
+    const push = MoeRouteScatterSharedResidualPush{
+        .n_tokens = @intCast(n_tokens),
+        .hidden_dim = @intCast(hidden_dim),
+        .n_experts = @intCast(n_experts),
+        .k = @intCast(k),
+        .routing_stride = @intCast(routing_stride),
+        .has_gate = 1,
+    };
+    const bufs = [_]*const MetalBuffer{ &routing_buf, &routed_buf, &shared_buf, &gate_buf, &hidden_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((n_tokens * hidden_dim + 63) / 64), 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterSharedResidualPush), 0);
+    cmd.commitAndWait();
+
+    var expected = [_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    };
+    for (0..n_tokens) |token| {
+        const row = token * routing_stride;
+        for (0..k) |slot| {
+            const route = token * k + slot;
+            const weight: f32 = @bitCast(routing_ptr[row + k + slot]);
+            for (0..hidden_dim) |dim| {
+                expected[token * hidden_dim + dim] += weight * routed_ptr[route * hidden_dim + dim];
+            }
+        }
+        const gate = 1.0 / (1.0 + @exp(-gate_ptr[token]));
+        for (0..hidden_dim) |dim| {
+            expected[token * hidden_dim + dim] += gate * shared_ptr[token * hidden_dim + dim];
+        }
+    }
+
+    for (0..expected.len) |i| {
+        try std.testing.expectApproxEqAbs(expected[i], hidden_ptr[i], 0.001);
     }
 }
 
