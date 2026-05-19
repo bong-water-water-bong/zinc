@@ -2185,6 +2185,8 @@ pub const InferenceEngine = struct {
     qwen_moe_route_validate_gate_ref_buf: MetalBuffer,
     qwen_moe_route_validate_up_ref_buf: MetalBuffer,
     qwen_moe_route_validate_down_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_hidden_before_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_post_hidden_ref_buf: MetalBuffer,
     qwen_moe_route_validate_shared_gate_ref_buf: MetalBuffer,
     qwen_moe_route_validate_shared_up_ref_buf: MetalBuffer,
     qwen_moe_route_validate_shared_down_ref_buf: MetalBuffer,
@@ -2327,6 +2329,8 @@ pub const InferenceEngine = struct {
         self.qwen_moe_route_validate_gate_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_up_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_down_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_hidden_before_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_post_hidden_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_shared_gate_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_shared_up_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_shared_down_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
@@ -3175,6 +3179,8 @@ pub const InferenceEngine = struct {
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_gate_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_up_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_down_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_hidden_before_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_post_hidden_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_shared_gate_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_shared_up_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_shared_down_ref_buf);
@@ -10401,6 +10407,8 @@ fn ensureQwenMoeRoutePackValidationBuffers(
     try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_gate_ref_buf, route_slots * m * @sizeOf(f32));
     try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_up_ref_buf, route_slots * m * @sizeOf(f32));
     try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_down_ref_buf, route_slots * h * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_hidden_before_ref_buf, n * h * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_post_hidden_ref_buf, n * h * @sizeOf(f32));
     if (validate_shared) {
         try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_shared_gate_ref_buf, n * sh * @sizeOf(f32));
         try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_shared_up_ref_buf, n * sh * @sizeOf(f32));
@@ -10475,6 +10483,8 @@ fn validateQwenMoeRoutePackChunk(
     profile: ?*RuntimeProfile,
     layer_idx: usize,
     lt: LayerTensors,
+    validation: *const QwenPrefillMoeValidationRef,
+    hidden_after: []const f32,
     hidden_dim: u32,
     inter_dim: u32,
 ) !void {
@@ -10555,6 +10565,8 @@ fn validateQwenMoeRoutePackChunk(
     const gate_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_gate_ref_buf.cpu_ptr.?));
     const up_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_up_ref_buf.cpu_ptr.?));
     const down_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_down_ref_buf.cpu_ptr.?));
+    const hidden_before_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_hidden_before_ref_buf.cpu_ptr.?));
+    const post_hidden_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_post_hidden_ref_buf.cpu_ptr.?));
     const route_ref_offset = token_idx * route_slots_per_token * inter_n;
     const route_ref_len = route_slots_per_token * inter_n;
     @memcpy(gate_ref_dst[route_ref_offset .. route_ref_offset + route_ref_len], gate_ref_src[0..route_ref_len]);
@@ -10562,6 +10574,14 @@ fn validateQwenMoeRoutePackChunk(
     const down_ref_offset = token_idx * route_slots_per_token * hidden_n;
     const down_ref_len = route_slots_per_token * hidden_n;
     @memcpy(down_ref_dst[down_ref_offset .. down_ref_offset + down_ref_len], down_ref_src[0..down_ref_len]);
+    @memcpy(
+        hidden_before_dst[token_idx * hidden_n .. token_idx * hidden_n + hidden_n],
+        validation.hidden_before[0..hidden_n],
+    );
+    @memcpy(
+        post_hidden_dst[token_idx * hidden_n .. token_idx * hidden_n + hidden_n],
+        hidden_after[0..hidden_n],
+    );
 
     if (can_validate_shared) {
         const shared_gate_ref_src: [*]const f32 = @ptrCast(@alignCast(engine.gate_buf.cpu_ptr.?));
@@ -10884,6 +10904,19 @@ fn validateQwenMoeRoutePackChunk(
             else
                 "moe_delta_grouped_shared";
             logQwenMoeRoutePackValidationDiff(layer_idx, combined_tensor_name, combined_ref[0..delta_total], combined_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+
+            const post_candidate = try allocator.alloc(f32, delta_total);
+            defer allocator.free(post_candidate);
+            const hidden_before_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_hidden_before_ref_buf.cpu_ptr.?));
+            const post_hidden_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_post_hidden_ref_buf.cpu_ptr.?));
+            for (0..delta_total) |i| {
+                post_candidate[i] = hidden_before_ref[i] + combined_candidate[i];
+            }
+            const post_tensor_name: []const u8 = if (f32_shared_gate)
+                "post_hidden_grouped_shared_gate_f32"
+            else
+                "post_hidden_grouped_shared";
+            logQwenMoeRoutePackValidationDiff(layer_idx, post_tensor_name, post_hidden_ref[0..delta_total], post_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
         }
     }
 }
@@ -11133,7 +11166,7 @@ fn finishQwenPrefillMoeValidation(
         5e-2,
     );
 
-    try validateQwenMoeRoutePackChunk(engine, profile, layer_idx, lt, hidden_dim, inter_dim);
+    try validateQwenMoeRoutePackChunk(engine, profile, layer_idx, lt, validation, hidden_after[0..hidden_dim], hidden_dim, inter_dim);
 }
 
 fn validateGemmaMoePostVector(
