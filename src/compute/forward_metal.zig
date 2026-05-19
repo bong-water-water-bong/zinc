@@ -9433,8 +9433,23 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
 
             if (use_fused_norm) {
                 dispatchFusedNormDualQ8DmmvOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
-                dispatchFusedNormQ8DmmvOnCmd(engine, cmd, alpha_t, &alpha_t.gpu_buffer, tensorPageOffset(engine.model, alpha_t), &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.router_logits_buf, dt_rank, hidden_dim);
-                dispatchFusedNormQ8DmmvOnCmd(engine, cmd, beta_t, &beta_t.gpu_buffer, tensorPageOffset(engine.model, beta_t), &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.down_buf, dt_rank, hidden_dim);
+                dispatchFusedNormDualQ8DmmvOnCmd(
+                    engine,
+                    cmd,
+                    alpha_t,
+                    beta_t,
+                    &alpha_t.gpu_buffer,
+                    &beta_t.gpu_buffer,
+                    tensorPageOffset(engine.model, alpha_t),
+                    tensorPageOffset(engine.model, beta_t),
+                    &engine.hidden_buf,
+                    &engine.attn_norm_bufs[layer_idx],
+                    &engine.router_logits_buf,
+                    &engine.down_buf,
+                    dt_rank,
+                    dt_rank,
+                    hidden_dim,
+                );
             } else {
                 // Fallback: separate RMSNorm + barrier + DMMVs
                 dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
