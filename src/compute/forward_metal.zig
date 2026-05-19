@@ -3675,6 +3675,48 @@ pub const InferenceEngine = struct {
         };
         defer if (layer0_pending.handle != null) layer0_pending.wait();
 
+        if (route_packed_start_layer >= self.layer_tensors.len) {
+            // llama.cpp's Metal graph keeps prompt-sized work layer-major and
+            // materializes only requested graph outputs. Once the Qwen prefix
+            // reaches model_end, every prompt token's KV/SSM state and final
+            // hidden row already exist in scratch.hidden; avoid replaying
+            // token-major no-op decode steps just to advance position.
+            const tail_start = profileStart(profile != null);
+            if (profile) |p| {
+                p.decode_steps += n_tokens;
+                p.shared_cmd_steps += n_tokens;
+            }
+
+            var final_cmd = try beginProfiledCommand(self, profile);
+            errdefer if (final_cmd.handle != null) final_cmd.wait();
+
+            const final_record_start = profileStart(profile != null);
+            dispatchRmsNormOnCmd(self, &final_cmd, &scratch.hidden, &scratch.norm, &self.final_norm_gpu, hidden_dim, n_tokens);
+            profileBarrier(&final_cmd, profile, .final);
+
+            const final_base = @as(usize, prompt_tokens.len - 1) * hidden_dim_usize;
+            if (shouldCpuLmHeadFallback(self)) {
+                commitAndWaitProfiled(&final_cmd, profile);
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.norm.cpu_ptr.?));
+                const out_ptr: [*]f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
+                try cpuLmHeadFallbackWithArgmax(self, norm_ptr + final_base, out_ptr);
+                if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
+            } else {
+                const x_offset_bytes: u32 = @intCast(final_base * @sizeOf(f32));
+                dispatchLmHeadWithInputOffset(self, &final_cmd, &scratch.norm, &self.logits_buf, hidden_dim, cfg.vocab_size, x_offset_bytes);
+                profileBarrier(&final_cmd, profile, .final);
+                dispatchArgmaxOnCmd(self, &final_cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size);
+                if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
+                commitAndWaitProfiled(&final_cmd, profile);
+            }
+
+            waitCommandProfiled(&layer0_pending, profile);
+            self.position = @intCast(prompt_tokens.len);
+            state.position = self.position;
+            if (profile) |p| p.total_step_ns += profileElapsedNs(tail_start);
+            return;
+        }
+
         self.position = 0;
         const pending_token_count = prompt_tokens.len - 1;
         const split_token: usize = if (prompt_tokens.len >= 64) prompt_tokens.len / 2 else 0;
