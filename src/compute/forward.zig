@@ -9721,11 +9721,15 @@ pub const InferenceEngine = struct {
             @as(vk.c.VkDeviceSize, head_v_dim) *
             @as(vk.c.VkDeviceSize, head_v_dim) *
             @sizeOf(f32);
+        const use_delta_cols8_replay = self.use_ssm_delta_cols8 and
+            head_v_dim == 128 and
+            cfg.ssm_d_state == 128 and
+            self.elementwise.pipeline_ssm_delta_net_cols8 != null;
         const delta_replay_ready = conv_ref != null and
             delta_ref != null and
             delta_replay != null and
             state_backup != null and
-            self.elementwise.pipeline_ssm_delta_net != null and
+            (self.elementwise.pipeline_ssm_delta_net != null or use_delta_cols8_replay) and
             self.instance.push_descriptor_fn != null and
             self.dense_prefill_validate_layer < self.gpu_ssm_states.len and
             self.gpu_ssm_states[self.dense_prefill_validate_layer].handle != null and
@@ -9799,7 +9803,14 @@ pub const InferenceEngine = struct {
                 .ab_stride_tok = dt_rank,
                 .y_stride_tok = d_inner,
             };
-            const pip = &(self.elementwise.pipeline_ssm_delta_net.?);
+            const pip = if (use_delta_cols8_replay)
+                &(self.elementwise.pipeline_ssm_delta_net_cols8.?)
+            else
+                &(self.elementwise.pipeline_ssm_delta_net orelse return error.ShaderNotLoaded);
+            const row_blocks = if (use_delta_cols8_replay)
+                (head_v_dim + 3) / 4
+            else
+                head_v_dim;
             self.pushDispatch7(
                 pip,
                 std.mem.asBytes(&push),
@@ -9818,7 +9829,7 @@ pub const InferenceEngine = struct {
                 delta_replay.?.handle,
                 z_total_bytes,
                 dt_rank,
-                head_v_dim,
+                row_blocks,
                 1,
             );
         }
@@ -10090,12 +10101,13 @@ pub const InferenceEngine = struct {
         const delta_ok = !delta_replay_ready or delta_diff.max_abs <= delta_tol;
         const output_ok = !output_replay_ready or output_max_abs <= output_tol;
         const verdict: []const u8 = if (proj_max_abs <= proj_tol and delta_ok and output_ok) "PASS" else "FAIL";
-        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE: ssm layer={d} tokens={d} verdict={s} proj_max={e:.6} delta_replay={} delta_max={e:.6}@{d} output_replay={} output_max={e:.6} max_abs batch_qkv={e:.6}@{d} batch_z={e:.6}@{d} sampled_cpu qkv={e:.6}@{d} z={e:.6}@{d} alpha={e:.6}@{d} beta={e:.6}@{d} gnorm={e:.6}@{d} ssm_out={e:.6}@{d} post_hidden={e:.6}@{d} proj_tol={e:.3} delta_tol={e:.3} output_tol={e:.3}", .{
+        log.info("ZINC_QWEN36_27B_PREFILL_VALIDATE: ssm layer={d} tokens={d} verdict={s} proj_max={e:.6} delta_replay={} delta_variant={s} delta_max={e:.6}@{d} output_replay={} output_max={e:.6} max_abs batch_qkv={e:.6}@{d} batch_z={e:.6}@{d} sampled_cpu qkv={e:.6}@{d} z={e:.6}@{d} alpha={e:.6}@{d} beta={e:.6}@{d} gnorm={e:.6}@{d} ssm_out={e:.6}@{d} post_hidden={e:.6}@{d} proj_tol={e:.3} delta_tol={e:.3} output_tol={e:.3}", .{
             self.dense_prefill_validate_layer,
             n_tokens,
             verdict,
             proj_max_abs,
             delta_replay_ready,
+            if (use_delta_cols8_replay) "cols8" else "generic",
             delta_diff.max_abs,
             delta_diff.max_idx,
             output_replay_ready,
