@@ -6137,12 +6137,12 @@ fn dispatchDmmvMoeColsOnCmd(
         .x_route_divisor = @max(x_route_divisor, 1),
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, counts_buf, packed_ids_buf };
-    const rows_per_wg: u32 = 2;
+    const rows_per_wg: u32 = 8;
     const cols_per_wg: u32 = 4;
     cmd.dispatchV2(
         pipe,
         .{ (M + rows_per_wg - 1) / rows_per_wg, n_experts, (route_blocks + cols_per_wg - 1) / cols_per_wg },
-        .{ 64, 1, 1 },
+        .{ 256, 1, 1 },
         &bufs,
         &push,
         @sizeOf(MoeColsDmmvPush),
@@ -15414,7 +15414,7 @@ test "dmmv_q4k_moe_cols shader matches per-route CPU reference" {
     const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ @intCast((M + 1) / 2), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
     cmd.commitAndWait();
 
     const allocator = std.testing.allocator;
@@ -15730,7 +15730,7 @@ test "dmmv_q5_1_moe_cols shader matches per-route CPU reference" {
     const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ @intCast((M + 1) / 2), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
     cmd.commitAndWait();
 
     const allocator = std.testing.allocator;
@@ -15845,7 +15845,7 @@ test "dmmv_q5k_moe_cols shader matches per-route CPU reference" {
     const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ @intCast((M + 1) / 2), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
     cmd.commitAndWait();
 
     const allocator = std.testing.allocator;
@@ -15955,7 +15955,7 @@ test "dmmv_q6k_moe_cols shader matches per-route CPU reference" {
     const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ @intCast((M + 1) / 2), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
     cmd.commitAndWait();
 
     const allocator = std.testing.allocator;

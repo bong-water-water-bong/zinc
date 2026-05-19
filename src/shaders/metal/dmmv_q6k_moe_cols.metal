@@ -28,6 +28,7 @@ inline float s8_to_f32(uint x) {
 }
 
 #define NUM_COLS 4u
+#define ROWS_PER_TG 8u
 
 kernel void main0(
     device const uchar* W                     [[buffer(0)]],
@@ -41,7 +42,7 @@ kernel void main0(
     uint sgid                                 [[simdgroup_index_in_threadgroup]]
 ) {
     const uint expert_id = tg_pos.y;
-    const uint row = tg_pos.x * 2u + sgid;
+    const uint row = tg_pos.x * ROWS_PER_TG + sgid;
     if (row >= p.M) {
         return;
     }
