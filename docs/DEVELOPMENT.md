@@ -71,9 +71,15 @@ The test suite covers:
 | `--debug` | Enable verbose logging (same as `ZINC_DEBUG=1`) |
 | `--profile` | Enable per-dispatch GPU profiling (Vulkan only) |
 | `ZINC_DEBUG=1` | Environment variable alternative to `--debug` |
+| `ZINC_PREFILL_PROFILE=1` | Per-phase prefill timing (dense FFN, SSM, attention, projections) |
+| `ZINC_BATCHED_PREFILL=0` | Disable RDNA batched prefill; useful for isolating regressions |
+| `ZINC_FA_SPLIT_K=<n>` | Override the scalar flash-attention split-K count |
+| `ZINC_TOOL_CALLING=0` | Disable OpenAI-compatible tool calling on `/v1/chat/completions` |
 | `RADV_PERFTEST=coop_matrix` | Enable cooperative matrix on RDNA4 (recommended) |
 | `RADV_DEBUG=shaders` | Dump compiled Vulkan shaders |
 | `RADV_DEBUG=shaderstats` | Show VGPR/occupancy/spill stats |
+
+For the full set of `ZINC_*` knobs (fusion gates, per-architecture experiments), grep the codebase: `rg 'getEnvVar.*ZINC_' src/`.
 
 Example debug run:
 
@@ -107,11 +113,14 @@ src/
 │   ├── routes.zig               # OpenAI-compatible API, streaming, stop detection
 │   ├── chat.html                # Built-in chat UI (embedded at compile time)
 │   ├── http.zig                 # HTTP server and connection handling
+│   ├── http.zig                 # HTTP server base (request parsing, response writing)
+│   ├── routes.zig               # OpenAI-compatible request handlers and streaming
 │   ├── model_manager.zig        # Hot model switching and catalog view
 │   ├── model_manager_metal.zig  # Metal-specific model manager extensions
 │   ├── model_manager_runtime.zig # Runtime abstraction for model manager
 │   ├── runtime.zig              # Backend runtime dispatch (Vulkan vs Metal)
-│   └── session.zig              # Chat session state
+│   ├── tool_format.zig          # OpenAI tool-calling output formatting
+│   └── chat.html                # Static chat UI served from /chat
 ├── vulkan/
 │   ├── instance.zig             # Vulkan instance and device init
 │   ├── pipeline.zig             # Compute pipeline and shader loading
@@ -137,8 +146,8 @@ src/
 ├── diagnostics_metal.zig        # --check system diagnostics (Metal)
 ├── regression_tests.zig         # Regression test fixtures
 ├── shaders/
-│   ├── *.comp                   # GLSL compute shaders (Vulkan/SPIR-V) — 24 shaders
-│   └── metal/*.metal            # MSL compute shaders (Apple Silicon) — 31 shaders
+│   ├── *.comp                   # GLSL compute shaders (Vulkan/SPIR-V)
+│   └── metal/*.metal            # MSL compute shaders (Apple Silicon)
 site/                            # zolotukhin.ai Astro site
 docs/                            # Technical documentation (published to site)
 tools/                           # API benchmark, standalone utilities
@@ -229,6 +238,12 @@ For AMD GPU testing, the project uses a remote RDNA4 node. Environment setup:
 ZINC_HOST=<ip>
 ZINC_PORT=<ssh-port>
 ZINC_USER=root
+
+# Optional overrides consumed by scripts/deploy_rdna4_server.sh
+ZINC_REMOTE_DIR=/root/zinc                 # remote checkout path
+ZINC_REMOTE_MODEL=/root/models/<file>.gguf # model file the deployed server loads
+ZINC_SERVER_PORT=9090                      # remote server port
+ZINC_REMOTE_LOG=/tmp/zinc_<port>.log       # remote log file
 ```
 
 Intel Arc benchmark nodes use separate keys so they do not override the RDNA defaults:
