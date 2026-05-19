@@ -1109,6 +1109,7 @@ const SsmConv1dPush = extern struct {
     conv_channels: u32,
     d_conv: u32,
     kernel_is_f16: u32,
+    input_offset: u32,
 };
 
 /// Push constants for SSM delta-net state update dispatch (SPIRV-Cross: buffer(0)).
@@ -1122,6 +1123,8 @@ const SsmDeltaNetPush = extern struct {
     dt_bias_is_f16: u32,
     has_dt_bias: u32,
     has_ssm_a: u32,
+    alpha_offset: u32,
+    beta_offset: u32,
 };
 
 /// Push constants for SSM gated norm dispatch (SPIRV-Cross: buffer(0)).
@@ -1131,6 +1134,7 @@ const SsmGatedNormPush = extern struct {
     head_v_dim: u32,
     d_state: u32,
     norm_per_head: u32,
+    z_offset: u32,
 };
 
 const GGMLType = gguf.GGMLType;
@@ -3620,23 +3624,28 @@ pub const InferenceEngine = struct {
         for (0..prompt_tokens.len) |i| {
             const token_hidden_offset: u32 = @intCast(i * hidden_dim_usize);
             const token_routing_offset: u32 = @intCast(i * @as(usize, cfg.n_experts_used) * 2);
+            const token_conv_offset: u32 = @intCast(i * @as(usize, conv_channels));
+            const token_d_inner_offset: u32 = @intCast(i * @as(usize, d_inner));
+            const token_dt_offset: u32 = @intCast(i * @as(usize, dt_rank));
             self.position = @intCast(i);
 
             dispatchCopyF32OffsetOnCmd(self, &layer0_cmd, &self.prefill_embed_buf, &self.hidden_buf, hidden_dim, token_hidden_offset, 0);
             profileBarrier(&layer0_cmd, profile, .embed);
 
-            dispatchQwenSsmPrefillProjectionChunkCopies(self, &layer0_cmd, conv_channels, d_inner, dt_rank);
-            profileBarrier(&layer0_cmd, profile, .ssm);
-            dispatchSsmConv1dWithPipe(
+            // Borrow llama.cpp/vLLM's indexed-source pattern: keep the batched
+            // projection outputs in token-major form and let recurrent kernels
+            // read the current token slice by offset instead of staging copies.
+            dispatchSsmConv1dOffsetWithPipe(
                 &layer0_cmd,
                 &self.ssm_conv1d_pipe,
                 &self.ssm_conv_kernel_bufs.?[layer_idx],
                 &self.ssm_conv_state_bufs.?[layer_idx],
-                &self.attn_out_buf,
+                &self.qwen_ssm_prefill_proj_qkv_buf,
                 &self.swiglu_buf,
                 conv_channels,
                 d_conv,
                 false,
+                token_conv_offset,
             );
             if (profile) |p| p.ssm_conv_calls += 1;
             profileBarrier(&layer0_cmd, profile, .ssm);
@@ -3652,11 +3661,13 @@ pub const InferenceEngine = struct {
                     .dt_bias_is_f16 = 0,
                     .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
                     .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+                    .alpha_offset = token_dt_offset,
+                    .beta_offset = token_dt_offset,
                 };
                 const dn_bufs = [_]*const MetalBuffer{
-                    &self.swiglu_buf,                    &self.router_logits_buf,
-                    &self.ssm_dt_bias_bufs.?[layer_idx], &self.ssm_a_bufs.?[layer_idx],
-                    &self.down_buf,                      &self.ssm_state_bufs.?[layer_idx],
+                    &self.swiglu_buf,                     &self.qwen_ssm_prefill_proj_alpha_buf,
+                    &self.ssm_dt_bias_bufs.?[layer_idx],  &self.ssm_a_bufs.?[layer_idx],
+                    &self.qwen_ssm_prefill_proj_beta_buf, &self.ssm_state_bufs.?[layer_idx],
                     &self.attn_out_buf,
                 };
                 layer0_cmd.dispatchV2(&self.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
@@ -3664,18 +3675,19 @@ pub const InferenceEngine = struct {
             }
             profileBarrier(&layer0_cmd, profile, .ssm);
 
-            dispatchSsmGatedNormWithPipe(
+            dispatchSsmGatedNormOffsetWithPipe(
                 &layer0_cmd,
                 &self.ssm_gated_norm_pipe,
                 &self.attn_out_buf,
                 &self.ssm_norm_weight_bufs.?[layer_idx],
-                &self.gate_buf,
+                &self.qwen_ssm_prefill_proj_z_buf,
                 &self.swiglu_buf,
                 d_inner,
                 dt_rank,
                 head_v_dim,
                 d_state,
                 self.ssm_norm_per_head.?[layer_idx],
+                token_d_inner_offset,
             );
             if (profile) |p| p.ssm_gated_norm_calls += 1;
             profileBarrier(&layer0_cmd, profile, .ssm);
@@ -7092,10 +7104,26 @@ fn dispatchSsmConv1dWithPipe(
     d_conv: u32,
     kernel_is_f16: bool,
 ) void {
+    dispatchSsmConv1dOffsetWithPipe(cmd, pipe, kernel, state, current_input, output, conv_channels, d_conv, kernel_is_f16, 0);
+}
+
+fn dispatchSsmConv1dOffsetWithPipe(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    kernel: *const MetalBuffer,
+    state: *const MetalBuffer,
+    current_input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: bool,
+    input_offset: u32,
+) void {
     const push = SsmConv1dPush{
         .conv_channels = conv_channels,
         .d_conv = d_conv,
         .kernel_is_f16 = if (kernel_is_f16) 1 else 0,
+        .input_offset = input_offset,
     };
     const bufs = [_]*const MetalBuffer{ kernel, state, current_input, output };
     cmd.dispatchV2(pipe, .{ (conv_channels + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmConv1dPush), 0);
@@ -7114,12 +7142,30 @@ fn dispatchSsmGatedNormWithPipe(
     d_state: u32,
     norm_per_head: bool,
 ) void {
+    dispatchSsmGatedNormOffsetWithPipe(cmd, pipe, delta_net_output, norm_weight, z_gate, output, d_inner, dt_rank, head_v_dim, d_state, norm_per_head, 0);
+}
+
+fn dispatchSsmGatedNormOffsetWithPipe(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    delta_net_output: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    z_gate: *const MetalBuffer,
+    output: *const MetalBuffer,
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    norm_per_head: bool,
+    z_offset: u32,
+) void {
     const push = SsmGatedNormPush{
         .d_inner = d_inner,
         .dt_rank = dt_rank,
         .head_v_dim = head_v_dim,
         .d_state = d_state,
         .norm_per_head = if (norm_per_head) 1 else 0,
+        .z_offset = z_offset,
     };
     const bufs = [_]*const MetalBuffer{ delta_net_output, norm_weight, z_gate, output };
     cmd.dispatchV2(pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmGatedNormPush), 0);
@@ -7946,25 +7992,29 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
 
     const hidden_dim_usize: usize = @intCast(hidden_dim);
     const d_inner_usize: usize = @intCast(d_inner);
+    const conv_channels_usize: usize = @intCast(conv_channels);
+    const dt_rank_usize: usize = @intCast(dt_rank);
     const token_count: usize = @intCast(n_tokens);
     for (0..token_count) |i| {
         const token_index: u32 = @intCast(i);
         const token_ssm_offset: u32 = @intCast(i * d_inner_usize);
+        const token_conv_offset: u32 = @intCast(i * conv_channels_usize);
+        const token_dt_offset: u32 = @intCast(i * dt_rank_usize);
         engine.position = token_index;
 
-        dispatchQwenSsmPrefillProjectionChunkCopies(engine, cmd, conv_channels, d_inner, dt_rank);
-        profileBarrier(cmd, profile, .ssm);
-
-        dispatchSsmConv1dWithPipe(
+        // Keep Qwen's SSM recurrence token ordered while reading the batched
+        // projection rows directly, avoiding per-token qkv/z/alpha/beta copies.
+        dispatchSsmConv1dOffsetWithPipe(
             cmd,
             &engine.ssm_conv1d_pipe,
             &engine.ssm_conv_kernel_bufs.?[layer_idx],
             &engine.ssm_conv_state_bufs.?[layer_idx],
-            &engine.attn_out_buf,
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
             &engine.swiglu_buf,
             conv_channels,
             d_conv,
             false,
+            token_conv_offset,
         );
         if (profile) |p| p.ssm_conv_calls += 1;
         profileBarrier(cmd, profile, .ssm);
@@ -7980,11 +8030,13 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
                 .dt_bias_is_f16 = 0,
                 .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
                 .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+                .alpha_offset = token_dt_offset,
+                .beta_offset = token_dt_offset,
             };
             const dn_bufs = [_]*const MetalBuffer{
-                &engine.swiglu_buf,                    &engine.router_logits_buf,
-                &engine.ssm_dt_bias_bufs.?[layer_idx], &engine.ssm_a_bufs.?[layer_idx],
-                &engine.down_buf,                      &engine.ssm_state_bufs.?[layer_idx],
+                &engine.swiglu_buf,                     &engine.qwen_ssm_prefill_proj_alpha_buf,
+                &engine.ssm_dt_bias_bufs.?[layer_idx],  &engine.ssm_a_bufs.?[layer_idx],
+                &engine.qwen_ssm_prefill_proj_beta_buf, &engine.ssm_state_bufs.?[layer_idx],
                 &engine.attn_out_buf,
             };
             cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
@@ -7992,18 +8044,19 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
         }
         profileBarrier(cmd, profile, .ssm);
 
-        dispatchSsmGatedNormWithPipe(
+        dispatchSsmGatedNormOffsetWithPipe(
             cmd,
             &engine.ssm_gated_norm_pipe,
             &engine.attn_out_buf,
             &engine.ssm_norm_weight_bufs.?[layer_idx],
-            &engine.gate_buf,
+            &engine.qwen_ssm_prefill_proj_z_buf,
             &engine.swiglu_buf,
             d_inner,
             dt_rank,
             head_v_dim,
             d_state,
             engine.ssm_norm_per_head.?[layer_idx],
+            token_ssm_offset,
         );
         if (profile) |p| p.ssm_gated_norm_calls += 1;
         profileBarrier(cmd, profile, .ssm);
@@ -11937,6 +11990,8 @@ fn runDecodeStep(
                     .dt_bias_is_f16 = 0,
                     .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
                     .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+                    .alpha_offset = 0,
+                    .beta_offset = 0,
                 };
                 const dn_bufs = [_]*const MetalBuffer{
                     &engine.swiglu_buf,                    &engine.router_logits_buf,
@@ -14504,6 +14559,8 @@ test "ssm_delta_net shader matches CPU reference" {
         .dt_bias_is_f16 = 0,
         .has_dt_bias = 1,
         .has_ssm_a = 1,
+        .alpha_offset = 0,
+        .beta_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{
         &conv_buf,
@@ -14835,6 +14892,8 @@ test "ssm_delta_net shader matches CPU reference at realistic head width" {
         .dt_bias_is_f16 = 0,
         .has_dt_bias = 1,
         .has_ssm_a = 1,
+        .alpha_offset = 0,
+        .beta_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{
         &conv_buf,
@@ -14946,6 +15005,8 @@ test "ssm_delta_net shader matches CPU reference at model-like dimensions" {
         .dt_bias_is_f16 = 0,
         .has_dt_bias = 1,
         .has_ssm_a = 1,
+        .alpha_offset = 0,
+        .beta_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{
         &conv_buf,
