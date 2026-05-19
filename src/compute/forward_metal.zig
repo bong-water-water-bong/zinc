@@ -1897,6 +1897,7 @@ fn canUseQwenSharedBatchedGemm(engine: *const InferenceEngine, quant_type: GGMLT
     return switch (quant_type) {
         .q8_0 => engine.gemm_q8_0_pipe.handle != null,
         .q4_k => engine.gemm_q4k_pipe.handle != null,
+        .q5_k => engine.gemm_q5k_pipe.handle != null,
         .q6_k => engine.gemm_q6k_pipe.handle != null,
         else => false,
     };
@@ -1914,6 +1915,7 @@ fn dispatchQwenSharedBatchedGemmOnCmd(
 ) !void {
     switch (weight.info.type_) {
         .q8_0 => dispatchGemmQ8_0OnCmd(engine, cmd, weight, input, output, M, K, N),
+        .q5_k => dispatchGemmQ5KOnCmd(engine, cmd, weight, input, output, M, K, N),
         .q4_k, .q6_k => dispatchGemmBatchedOnCmd(engine, cmd, weight, input, output, M, K, N),
         else => return error.UnsupportedQwenSharedBatchedGemm,
     }
@@ -2068,6 +2070,7 @@ pub const InferenceEngine = struct {
     // Batched GEMM pipelines for prefill (process N tokens per dispatch).
     // Q8_0 is currently wired only into the Qwen36 SSM projection validator.
     gemm_q4k_pipe: MetalPipeline,
+    gemm_q5k_pipe: MetalPipeline,
     gemm_q6k_pipe: MetalPipeline,
     gemm_q8_0_pipe: MetalPipeline,
     // Batched flash attention for prefill — handles N queries with causal masking.
@@ -2522,6 +2525,7 @@ pub const InferenceEngine = struct {
         self.zero_f32_pipe = try loadShaderPipeline(ctx, "zero_f32");
         self.argmax_pipe = try loadShaderPipeline(ctx, "argmax");
         self.gemm_q4k_pipe = try loadShaderPipeline(ctx, "gemm_q4k");
+        self.gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
         self.gemm_q6k_pipe = try loadShaderPipeline(ctx, "gemm_q6k");
         self.gemm_q8_0_pipe = try loadShaderPipeline(ctx, "gemm_q8_0");
         self.flash_attn_batched_pipe = try loadShaderPipeline(ctx, "flash_attn_batched");
@@ -3275,6 +3279,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.zero_f32_pipe);
         metal_pipeline.freePipeline(&self.argmax_pipe);
         metal_pipeline.freePipeline(&self.gemm_q4k_pipe);
+        metal_pipeline.freePipeline(&self.gemm_q5k_pipe);
         metal_pipeline.freePipeline(&self.gemm_q6k_pipe);
         metal_pipeline.freePipeline(&self.gemm_q8_0_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_batched_pipe);
@@ -6529,6 +6534,38 @@ fn dispatchGemmQ4KOnCmd(
     const bufs = [_]*const MetalBuffer{ &weight.gpu_buffer, input, output };
     const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
     cmd.dispatchV2WithTgMem(&engine.gemm_q4k_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
+}
+
+/// Dispatch a Q5_K × f32 batched matmul. Same llama.cpp simdgroup-MM tile
+/// shape as Q4_K/Q6_K, with Q5_K's 176-byte blocks.
+fn dispatchGemmQ5KOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    std.debug.assert(K % 256 == 0);
+    recordDmmvProfile(engine, weight, M, K);
+    const push = GemmPush{
+        .ne00 = @intCast(K),
+        .ne02 = 1,
+        .nb01 = @as(u64, K / 256) * 176,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = @as(u64, K) * 4,
+        .nb12 = 0,
+        .ne0 = @intCast(M),
+        .ne1 = @intCast(N),
+        .src0_off = tensorPageOffset(engine.model, weight),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight.gpu_buffer, input, output };
+    const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
+    cmd.dispatchV2WithTgMem(&engine.gemm_q5k_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
 }
 
 /// Dispatch a Q6_K × f32 batched matmul. Same tile layout as gemm_q4k.
@@ -17392,6 +17429,97 @@ test "gemm_q8_0 shader matches CPU reference for batched tokens" {
     }
 }
 
+test "gemm_q5k shader matches CPU reference for batched tokens" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "gemm_q5k");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 70;
+    const K: usize = 512;
+    const N: usize = 5;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 176;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, N * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, N * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 176;
+            const d_mag = 0.015625 * @as(f32, @floatFromInt(1 + (row % 5) + blk));
+            const dmin_mag = 0.00390625 * @as(f32, @floatFromInt(1 + ((row + blk) % 7)));
+            const d_bits = @as(u16, @bitCast(@as(f16, @floatCast(d_mag))));
+            const dmin_bits = @as(u16, @bitCast(@as(f16, @floatCast(dmin_mag))));
+            weight_buf.cpu_ptr.?[base] = @truncate(d_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(d_bits >> 8);
+            weight_buf.cpu_ptr.?[base + 2] = @truncate(dmin_bits);
+            weight_buf.cpu_ptr.?[base + 3] = @truncate(dmin_bits >> 8);
+            for (0..12) |i| {
+                weight_buf.cpu_ptr.?[base + 4 + i] = @intCast((i * 17 + row * 3 + blk * 11) & 0xFF);
+            }
+            for (0..32) |i| {
+                weight_buf.cpu_ptr.?[base + 16 + i] = @intCast((i * 9 + row * 5 + blk * 13) & 0xFF);
+            }
+            for (0..128) |i| {
+                const lo: u8 = @intCast((i + row * 7 + blk * 3) & 0x0F);
+                const hi: u8 = @intCast((15 - ((i * 5 + row + blk) & 0x0F)) & 0x0F);
+                weight_buf.cpu_ptr.?[base + 48 + i] = lo | (hi << 4);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..N * K) |i| {
+        const raw: i32 = @intCast((i * 17 + 9) % 31);
+        input_ptr[i] = 0.03125 * @as(f32, @floatFromInt(raw - 15));
+    }
+
+    const push = GemmPush{
+        .ne00 = @intCast(K),
+        .ne02 = 1,
+        .nb01 = row_bytes,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = K * @sizeOf(f32),
+        .nb12 = 0,
+        .ne0 = @intCast(M),
+        .ne1 = @intCast(N),
+        .src0_off = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2WithTgMem(&pipe, .{ @intCast((N + 31) / 32), @intCast((M + 63) / 64), 1 }, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..N) |token| {
+        const token_input = input_ptr[token * K .. (token + 1) * K];
+        for (0..M) |row| {
+            dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), K, .q5_k, ref_row);
+            var expected: f32 = 0;
+            for (0..K) |i| expected += ref_row[i] * token_input[i];
+            try std.testing.expectApproxEqAbs(expected, output_ptr[token * M + row], 0.75);
+        }
+    }
+}
+
 test "global q8 override skips gemma shared expert q8 tensors" {
     try std.testing.expect(!shouldUseGlobalQ8Override(.gemma, "blk.0.ffn_down.weight"));
     try std.testing.expect(!shouldUseGlobalQ8Override(.gemma, "blk.0.ffn_up.weight"));
@@ -17748,6 +17876,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q6k_moe_pipe);
     var dmmv_q6k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe_cols");
     defer metal_pipeline.freePipeline(&dmmv_q6k_moe_cols_pipe);
+    var gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
+    defer metal_pipeline.freePipeline(&gemm_q5k_pipe);
 
     var dmmv_pipe_k2048 = try loadShaderPipeline(ctx, "dmmv_q4k_k2048");
     defer metal_pipeline.freePipeline(&dmmv_pipe_k2048);
@@ -17825,6 +17955,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q5k_moe_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_moe_cols_pipe.handle != null);
+    try std.testing.expect(gemm_q5k_pipe.handle != null);
     try std.testing.expect(dmmv_pipe_k2048.handle != null);
     try std.testing.expect(dmmv_q4k_dual_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dual_llama_pipe.handle != null);
