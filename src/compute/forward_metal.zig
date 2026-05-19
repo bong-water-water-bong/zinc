@@ -1928,6 +1928,12 @@ pub const InferenceEngine = struct {
     q8_dual_tg_override: ?u32,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
+    qwen_ssm_proj_validate_captured_tokens: u32,
+    qwen_ssm_proj_validate_norm_buf: MetalBuffer,
+    qwen_ssm_proj_validate_qkv_ref_buf: MetalBuffer,
+    qwen_ssm_proj_validate_z_ref_buf: MetalBuffer,
+    qwen_ssm_proj_validate_alpha_ref_buf: MetalBuffer,
+    qwen_ssm_proj_validate_beta_ref_buf: MetalBuffer,
     /// Residency set covering all engine-owned scratch + KV-cache + per-layer
     /// norm buffers, mirroring the model loader's weight residency set.
     /// `commandBufferWithUnretainedReferences` skips Metal's auto-residency
@@ -2039,6 +2045,12 @@ pub const InferenceEngine = struct {
         self.q8_dual_tg_override = null;
         self.request_profile = .{};
         self.prefill_profile = .{};
+        self.qwen_ssm_proj_validate_captured_tokens = 0;
+        self.qwen_ssm_proj_validate_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_proj_validate_qkv_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_proj_validate_z_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_proj_validate_alpha_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_proj_validate_beta_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.scratch_rset = null;
         self.private_ssm_qkv_bufs = null;
         self.private_ssm_gate_bufs = null;
@@ -2843,6 +2855,11 @@ pub const InferenceEngine = struct {
         metal_buffer.freeBuffer(&self.expert_up_batch_buf);
         metal_buffer.freeBuffer(&self.expert_swiglu_batch_buf);
         metal_buffer.freeBuffer(&self.expert_down_batch_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_norm_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_qkv_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_z_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_alpha_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_beta_ref_buf);
 
         for (0..self.expert_gate_bufs.len) |i| {
             metal_buffer.freeBuffer(&self.expert_gate_bufs[i]);
@@ -3086,6 +3103,7 @@ pub const InferenceEngine = struct {
         self.position = 0;
         self.request_profile.reset();
         self.prefill_profile.reset();
+        self.qwen_ssm_proj_validate_captured_tokens = 0;
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -7823,6 +7841,8 @@ fn shouldValidateQwenSsmProjection(
     using_local_cmd: bool,
     wqkv_t: *const metal_loader.LoadedTensor,
     z_t: *const metal_loader.LoadedTensor,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
 ) bool {
     const cfg = engine.config;
     return engine.qwen_prefill_validation_enabled and
@@ -7830,44 +7850,79 @@ fn shouldValidateQwenSsmProjection(
         cfg.architecture == .qwen2_moe and
         cfg.n_experts > 0 and
         cfg.ssm_d_inner > 0 and
-        engine.position < 4 and
+        engine.position < qwen_ssm_projection_validate_tokens and
         layer_idx == 0 and
         wqkv_t.info.type_ == .q8_0 and
         z_t.info.type_ == .q8_0 and
+        alpha_t.info.type_ == .q8_0 and
+        beta_t.info.type_ == .q8_0 and
         engine.gemm_q8_0_pipe.handle != null;
 }
 
-fn logQwenSsmProjectionValidationDiff(
-    engine: *const InferenceEngine,
+const qwen_ssm_projection_validate_tokens: u32 = 4;
+
+fn ensureValidationBuffer(engine: *InferenceEngine, buf: *MetalBuffer, required_bytes: usize) !void {
+    const size = @max(required_bytes, 4);
+    if (buf.handle != null and buf.cpu_ptr != null and buf.size >= size) return;
+    const next = try metal_buffer.createBuffer(engine.device.ctx, size);
+    metal_buffer.freeBuffer(buf);
+    buf.* = next;
+}
+
+fn ensureQwenSsmProjectionValidationBuffers(
+    engine: *InferenceEngine,
+    conv_channels: u32,
+    d_inner: u32,
+    dt_rank: u32,
+    hidden_dim: u32,
+) !void {
+    const n: usize = @intCast(qwen_ssm_projection_validate_tokens);
+    try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_norm_buf, n * @as(usize, hidden_dim) * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_qkv_ref_buf, n * @as(usize, conv_channels) * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_z_ref_buf, n * @as(usize, d_inner) * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_alpha_ref_buf, n * @as(usize, dt_rank) * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_beta_ref_buf, n * @as(usize, dt_rank) * @sizeOf(f32));
+}
+
+fn logQwenSsmProjectionChunkValidationDiff(
     layer_idx: usize,
     tensor_name: []const u8,
-    diff: SliceDiff,
-    ref_value: f32,
-    candidate_value: f32,
+    expected: []const f32,
+    actual: []const f32,
+    width: u32,
+    n_tokens: u32,
     tol: f32,
 ) void {
+    const diff = diffF32Slices(expected, actual);
+    const width_usize: usize = @intCast(@max(width, 1));
+    const worst_token = diff.max_idx / width_usize;
+    const worst_idx = diff.max_idx % width_usize;
+    const ref_value = if (expected.len > 0) expected[diff.max_idx] else 0;
+    const candidate_value = if (actual.len > 0) actual[diff.max_idx] else 0;
     const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
     if (diff.max_abs <= tol) {
-        log.info("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor={s} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+        log.info("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: chunk_ssm_proj layer={d} tensor={s} tokens={d} token={d} worst_idx={d} max_abs_diff={d:.6} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
             verdict,
-            engine.position,
             layer_idx,
             tensor_name,
+            n_tokens,
+            worst_token,
+            worst_idx,
             diff.max_abs,
-            diff.max_idx,
             ref_value,
             candidate_value,
             diff.rms,
             tol,
         });
     } else {
-        log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor={s} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+        log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: chunk_ssm_proj layer={d} tensor={s} tokens={d} token={d} worst_idx={d} max_abs_diff={d:.6} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
             verdict,
-            engine.position,
             layer_idx,
             tensor_name,
+            n_tokens,
+            worst_token,
+            worst_idx,
             diff.max_abs,
-            diff.max_idx,
             ref_value,
             candidate_value,
             diff.rms,
@@ -7882,40 +7937,76 @@ fn validateQwenSsmProjectionBatchKernel(
     layer_idx: usize,
     wqkv_t: *const metal_loader.LoadedTensor,
     z_t: *const metal_loader.LoadedTensor,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
     conv_channels: u32,
     d_inner: u32,
+    dt_rank: u32,
     hidden_dim: u32,
 ) !void {
+    try ensureQwenSsmProjectionValidationBuffers(engine, conv_channels, d_inner, dt_rank, hidden_dim);
+
+    if (engine.position == 0) {
+        engine.qwen_ssm_proj_validate_captured_tokens = 0;
+    }
+    const token_idx = engine.position;
+    if (token_idx >= qwen_ssm_projection_validate_tokens) return;
+
+    const norm_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_norm_buf.cpu_ptr.?));
+    const hidden_src: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+    const norm_weight: [*]const f32 = @ptrCast(@alignCast(engine.attn_norm_bufs[layer_idx].cpu_ptr.?));
+    const norm_off = @as(usize, token_idx) * @as(usize, hidden_dim);
+    cpuRmsNormMul(hidden_src, norm_weight[0..hidden_dim], norm_dst + norm_off, hidden_dim, 1, engine.config.rms_norm_eps);
+
+    const qkv_src: [*]const f32 = @ptrCast(@alignCast(engine.attn_out_buf.cpu_ptr.?));
+    const z_src: [*]const f32 = @ptrCast(@alignCast(engine.gate_buf.cpu_ptr.?));
+    const alpha_src: [*]const f32 = @ptrCast(@alignCast(engine.router_logits_buf.cpu_ptr.?));
+    const beta_src: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
+    const qkv_ref: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_qkv_ref_buf.cpu_ptr.?));
+    const z_ref: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_z_ref_buf.cpu_ptr.?));
+    const alpha_ref: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_alpha_ref_buf.cpu_ptr.?));
+    const beta_ref: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_beta_ref_buf.cpu_ptr.?));
+    const qkv_off = @as(usize, token_idx) * @as(usize, conv_channels);
+    const z_off = @as(usize, token_idx) * @as(usize, d_inner);
+    const ab_off = @as(usize, token_idx) * @as(usize, dt_rank);
+    @memcpy(qkv_ref[qkv_off .. qkv_off + @as(usize, conv_channels)], qkv_src[0..conv_channels]);
+    @memcpy(z_ref[z_off .. z_off + @as(usize, d_inner)], z_src[0..d_inner]);
+    @memcpy(alpha_ref[ab_off .. ab_off + @as(usize, dt_rank)], alpha_src[0..dt_rank]);
+    @memcpy(beta_ref[ab_off .. ab_off + @as(usize, dt_rank)], beta_src[0..dt_rank]);
+
+    engine.qwen_ssm_proj_validate_captured_tokens = @max(engine.qwen_ssm_proj_validate_captured_tokens, token_idx + 1);
+    if (engine.qwen_ssm_proj_validate_captured_tokens < qwen_ssm_projection_validate_tokens) return;
+
+    const qkv_bytes = @as(usize, qwen_ssm_projection_validate_tokens) * @as(usize, conv_channels) * @sizeOf(f32);
+    const z_bytes = @as(usize, qwen_ssm_projection_validate_tokens) * @as(usize, d_inner) * @sizeOf(f32);
+    const ab_bytes = @as(usize, qwen_ssm_projection_validate_tokens) * @as(usize, dt_rank) * @sizeOf(f32);
+    var qkv_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(qkv_bytes, 4));
+    defer metal_buffer.freeBuffer(&qkv_candidate);
+    var z_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(z_bytes, 4));
+    defer metal_buffer.freeBuffer(&z_candidate);
+    var alpha_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(ab_bytes, 4));
+    defer metal_buffer.freeBuffer(&alpha_candidate);
+    var beta_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(ab_bytes, 4));
+    defer metal_buffer.freeBuffer(&beta_candidate);
+
     var cmd = try beginProfiledCommand(engine, profile);
-    dispatchGemmQ8_0OnCmd(engine, &cmd, wqkv_t, &engine.norm_buf, &engine.swiglu_buf, conv_channels, hidden_dim, 1);
-    dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.norm_buf, &engine.expert_gate_batch_buf, d_inner, hidden_dim, 1);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, wqkv_t, &engine.qwen_ssm_proj_validate_norm_buf, &qkv_candidate, conv_channels, hidden_dim, qwen_ssm_projection_validate_tokens);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_proj_validate_norm_buf, &z_candidate, d_inner, hidden_dim, qwen_ssm_projection_validate_tokens);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, alpha_t, &engine.qwen_ssm_proj_validate_norm_buf, &alpha_candidate, dt_rank, hidden_dim, qwen_ssm_projection_validate_tokens);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, beta_t, &engine.qwen_ssm_proj_validate_norm_buf, &beta_candidate, dt_rank, hidden_dim, qwen_ssm_projection_validate_tokens);
     commitAndWaitProfiled(&cmd, profile);
 
-    const ref_wqkv: [*]const f32 = @ptrCast(@alignCast(engine.attn_out_buf.cpu_ptr.?));
-    const got_wqkv: [*]const f32 = @ptrCast(@alignCast(engine.swiglu_buf.cpu_ptr.?));
-    const wqkv_diff = diffF32Slices(ref_wqkv[0..conv_channels], got_wqkv[0..conv_channels]);
-    logQwenSsmProjectionValidationDiff(
-        engine,
-        layer_idx,
-        "ssm_qkv_gemm_q8_0",
-        wqkv_diff,
-        ref_wqkv[wqkv_diff.max_idx],
-        got_wqkv[wqkv_diff.max_idx],
-        2.0,
-    );
+    const n = qwen_ssm_projection_validate_tokens;
+    const qkv_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(qkv_candidate.cpu_ptr.?));
+    const z_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(z_candidate.cpu_ptr.?));
+    const alpha_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(alpha_candidate.cpu_ptr.?));
+    const beta_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(beta_candidate.cpu_ptr.?));
 
-    const ref_z: [*]const f32 = @ptrCast(@alignCast(engine.gate_buf.cpu_ptr.?));
-    const got_z: [*]const f32 = @ptrCast(@alignCast(engine.expert_gate_batch_buf.cpu_ptr.?));
-    const z_diff = diffF32Slices(ref_z[0..d_inner], got_z[0..d_inner]);
-    logQwenSsmProjectionValidationDiff(
-        engine,
-        layer_idx,
-        "ssm_z_gemm_q8_0",
-        z_diff,
-        ref_z[z_diff.max_idx],
-        got_z[z_diff.max_idx],
-        2.0,
-    );
+    const n_usize: usize = @intCast(n);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_qkv_gemm_q8_0", qkv_ref[0 .. n_usize * @as(usize, conv_channels)], qkv_candidate_ptr[0 .. n_usize * @as(usize, conv_channels)], conv_channels, n, 2.0);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_z_gemm_q8_0", z_ref[0 .. n_usize * @as(usize, d_inner)], z_candidate_ptr[0 .. n_usize * @as(usize, d_inner)], d_inner, n, 2.0);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_alpha_gemm_q8_0", alpha_ref[0 .. n_usize * @as(usize, dt_rank)], alpha_candidate_ptr[0 .. n_usize * @as(usize, dt_rank)], dt_rank, n, 2.0);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_beta_gemm_q8_0", beta_ref[0 .. n_usize * @as(usize, dt_rank)], beta_candidate_ptr[0 .. n_usize * @as(usize, dt_rank)], dt_rank, n, 2.0);
 }
 
 fn logQwenPrefillValidationDiff(
@@ -9601,10 +9692,10 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                 dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
             }
             profileBarrier(cmd, profile, .ssm);
-            if (shouldValidateQwenSsmProjection(engine, layer_idx, using_local_cmd, wqkv_t, z_t)) {
+            if (shouldValidateQwenSsmProjection(engine, layer_idx, using_local_cmd, wqkv_t, z_t, alpha_t, beta_t)) {
                 commitAndWaitProfiled(cmd, profile);
                 const validation_start = profileStart(profile != null);
-                try validateQwenSsmProjectionBatchKernel(engine, profile, layer_idx, wqkv_t, z_t, conv_channels, d_inner, hidden_dim);
+                try validateQwenSsmProjectionBatchKernel(engine, profile, layer_idx, wqkv_t, z_t, alpha_t, beta_t, conv_channels, d_inner, dt_rank, hidden_dim);
                 if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
                 local_cmd_storage = try beginProfiledCommand(engine, profile);
                 cmd = &local_cmd_storage;
