@@ -31,10 +31,11 @@ const queued_prefill_embed_tokens: usize = 256;
 const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
 const qwen_ssm_projection_validate_tokens: u32 = 4;
 const qwen_moe_route_pack_validate_tokens: u32 = 4;
-// Extend the Qwen3.6 llama.cpp-style graph batching / vLLM route-packed MoE
-// prefix by one more full-attention interval. Per-layer support checks still
-// gate every recorded layer, so unsupported shapes stop before production use.
-const qwen_route_packed_prefix_layer_limit: usize = 20;
+// Let the Qwen3.6 llama.cpp-style graph batching / vLLM route-packed MoE
+// prefix run until the model ends or a per-layer support guard fails. This
+// keeps the layer-major prompt path from falling back to token-major decode at
+// an arbitrary layer cap.
+const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
 const moe_route_block_cols: u32 = 8;
 
 /// Runtime state for the decode loop.
