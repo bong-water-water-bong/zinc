@@ -76,6 +76,7 @@ const TEST_TIMEOUT_MS = parsePositiveIntEnv("ZINC_TEST_TIMEOUT_MS", 120_000);
 const RUN_TIMEOUT_MS = parsePositiveIntEnv("ZINC_RUN_TIMEOUT_MS", 300_000);
 const STOP_ON_TARGET = parseBoolEnv("ZINC_STOP_ON_TARGET", true);
 const BUILD_OPTIMIZE = process.env.ZINC_BUILD_OPTIMIZE ?? "ReleaseFast";
+const LOOP_COMMIT_PATHS = ["src/", "benchmarks/", "build.zig", "build.zig.zon"];
 
 const BLOCKED_GIT_OPS = [
   "Bash(git checkout:*)",
@@ -1848,7 +1849,7 @@ async function main() {
     }
 
     // Step 2: Git snapshot
-    await runCommand("git", ["add", "-A", "src/", "build.zig"]).catch(() => {});
+    await runCommand("git", ["add", "-A", ...LOOP_COMMIT_PATHS]).catch(() => {});
     await runCommand("git", ["commit", "--allow-empty", "-m", `metal-loop: pre-cycle-${cycle}`]).catch(() => {});
     const preCommit = await runCommand("git", ["rev-parse", "HEAD"]);
     const preHash = preCommit.stdout.trim();
@@ -1949,7 +1950,7 @@ async function main() {
         tokPerSec: verify.tokPerSec,
         containsReference: verify.containsReference,
       };
-      await runCommand("git", ["add", "-A", "src/", "build.zig"]).catch(() => {});
+      await runCommand("git", ["add", "-A", ...LOOP_COMMIT_PATHS]).catch(() => {});
       await runCommand("git", ["commit", "-m", `metal-loop: cycle-${cycle} ${description} (${verifyTps.toFixed(1)} ${METRIC_LABEL})`]).catch(() => {});
     }
 

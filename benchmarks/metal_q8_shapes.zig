@@ -726,7 +726,7 @@ fn selectFusedDualPipeline(ctx: ?*shim.MetalCtx, cols: u32, threadgroup_override
         .variant_label = "fused",
         .pipe = pipe,
         .push_idx = 0,
-        .rows_per_wg = block_size / simd_width,
+        .rows_per_wg = (block_size / simd_width) * 2,
         .block_size = block_size,
     };
 }
