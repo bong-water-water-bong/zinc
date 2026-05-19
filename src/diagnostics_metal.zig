@@ -157,6 +157,7 @@ const required_shader_files = [_][]const u8{
     "dmmv_q5k_moe.metal",
     "dmmv_q6k.metal",
     "dmmv_q6k_moe.metal",
+    "dmmv_q6k_moe_cols.metal",
     "dmmv_q8_0.metal",
     "dmmv_f16.metal",
     "dmmv_f32.metal",
