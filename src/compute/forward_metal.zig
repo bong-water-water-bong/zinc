@@ -4716,6 +4716,26 @@ fn canUsePairedQ8Dmmv(
         engine.dmmv_q8_0_pair_pipe.max_threads_per_threadgroup >= block_size;
 }
 
+fn canUseQwen36FullAttnQ8Pair(
+    engine: *const InferenceEngine,
+    tensor0: *const metal_loader.LoadedTensor,
+    tensor1: *const metal_loader.LoadedTensor,
+    M0: u32,
+    M1: u32,
+    K: u32,
+) bool {
+    const cfg = engine.config;
+    // llama.cpp's `kernel_mul_mv_q8_0_f32_impl` amortizes X-vector loads across
+    // adjacent row work. Use ZINC's paired-Q8 variant only for the measured
+    // Qwen3.6 hybrid shape so unrelated Q8 attention paths stay unchanged.
+    return cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        canUsePairedQ8Dmmv(engine, tensor0, tensor1, M0, M1, K);
+}
+
 fn canUseDenseQ4KGateUpDual(
     engine: *const InferenceEngine,
     gate: *const metal_loader.LoadedTensor,
@@ -7249,12 +7269,18 @@ fn dispatchFullAttnPrepOnCmd(
     // Separate: attn_q has q_dim rows, gate is in a separate attn_gate tensor — Qwen3.5 MoE style.
     const q_rows: u32 = @intCast(q_tensor.info.numElements() / hidden_dim);
     const gate_mode = classifyFullAttnGate(q_rows, attn.q_dim, lt.attn_gate != null);
+    const can_pair_attn_kv = !attn.use_k_as_v and
+        ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) or
+            canUseQwen36FullAttnQ8Pair(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim));
+    const can_pair_attn_q_gate = gate_mode.separate_attn_gate and
+        ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, q_tensor, lt.attn_gate.?, attn.q_dim, attn.q_dim, hidden_dim)) or
+            canUseQwen36FullAttnQ8Pair(engine, q_tensor, lt.attn_gate.?, attn.q_dim, attn.q_dim, hidden_dim));
 
     if (gate_mode.packed_q_gate) {
         // Packed: project full Q+gate into attn_out_buf, then deinterleave.
         const q_full_dim = attn.q_dim * 2;
         dispatchDmmvOnCmd(engine, cmd, q_tensor, &engine.norm_buf, &engine.attn_out_buf, q_full_dim, hidden_dim, 0);
-        if (cfg.architecture == .gemma and !attn.use_k_as_v and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) {
+        if (can_pair_attn_kv) {
             dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim);
         } else {
             dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
@@ -7276,12 +7302,9 @@ fn dispatchFullAttnPrepOnCmd(
         if (can_dual_qk) {
             dispatchDenseQ4KQKDualOnCmd(engine, cmd, q_tensor, k_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, attn.q_dim, attn.kv_dim, hidden_dim);
             dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
-        } else if (gate_mode.separate_attn_gate and
-            cfg.architecture == .gemma and
-            canUsePairedQ8Dmmv(engine, q_tensor, lt.attn_gate.?, attn.q_dim, attn.q_dim, hidden_dim))
-        {
+        } else if (can_pair_attn_q_gate) {
             dispatchPairedQ8DmmvOnCmd(engine, cmd, q_tensor, lt.attn_gate.?, &engine.norm_buf, &engine.q_buf, &engine.gate_buf, attn.q_dim, hidden_dim);
-            if (cfg.architecture == .gemma and !attn.use_k_as_v and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) {
+            if (can_pair_attn_kv) {
                 dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim);
             } else {
                 dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
@@ -7292,7 +7315,7 @@ fn dispatchFullAttnPrepOnCmd(
             if (gate_mode.separate_attn_gate) {
                 dispatchDmmvOnCmd(engine, cmd, lt.attn_gate.?, &engine.norm_buf, &engine.gate_buf, attn.q_dim, hidden_dim, 0);
             }
-            if (cfg.architecture == .gemma and !attn.use_k_as_v and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) {
+            if (can_pair_attn_kv) {
                 dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim);
             } else {
                 dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
