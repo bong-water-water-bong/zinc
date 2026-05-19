@@ -3596,6 +3596,115 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    fn logQwenLayer0RoutePackedPrefillBlocker(self: *const InferenceEngine, prompt_len: usize) void {
+        if (!self.profile_enabled) return;
+
+        if (std.posix.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw| {
+            if (std.mem.eql(u8, raw, "0")) {
+                log.info("Metal profile: Qwen route-packed prefill disabled: ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=0", .{});
+                return;
+            }
+        }
+        if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: prompt_len={d} outside [32,{d}]", .{ prompt_len, queued_prefill_embed_tokens });
+            return;
+        }
+        if (!self.canUseSingleCommandQueuedTokenMajorPrefill(prompt_len)) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: single-command token-major guard failed", .{});
+            return;
+        }
+        if (self.config.architecture != .qwen2_moe or
+            self.config.hidden_dim != 2048 or
+            self.config.ssm_d_inner != 4096 or
+            self.config.n_experts != 256 or
+            self.config.n_experts_used != 8)
+        {
+            log.info("Metal profile: Qwen route-packed prefill disabled: model shape arch={s} hidden={d} ssm_d_inner={d} experts={d} used={d}", .{
+                @tagName(self.config.architecture),
+                self.config.hidden_dim,
+                self.config.ssm_d_inner,
+                self.config.n_experts,
+                self.config.n_experts_used,
+            });
+            return;
+        }
+        if (self.layer_tensors.len == 0 or isFullAttentionLayer(self.config, 0)) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 is unavailable or full-attention", .{});
+            return;
+        }
+
+        const lt = self.layer_tensors[0];
+        const inter_dim: u32 = if (self.config.intermediate_dim > 0) self.config.intermediate_dim else self.config.hidden_dim * 4;
+        const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, self.config.hidden_dim) catch {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 MoE gate/up tensors missing", .{});
+            return;
+        };
+        const down_exps = lt.ffn_down_exps orelse {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 ffn_down_exps missing", .{});
+            return;
+        };
+        if (!supportsQwenMoeRoutePackCols(self, gate_up_layout.gate_tensor.info.type_) or
+            !supportsQwenMoeRoutePackCols(self, gate_up_layout.up_tensor.info.type_) or
+            !supportsQwenMoeRoutePackCols(self, down_exps.info.type_))
+        {
+            log.info("Metal profile: Qwen route-packed prefill disabled: route-pack cols unsupported gate={s} up={s} down={s}", .{
+                @tagName(gate_up_layout.gate_tensor.info.type_),
+                @tagName(gate_up_layout.up_tensor.info.type_),
+                @tagName(down_exps.info.type_),
+            });
+            return;
+        }
+        if (lt.ffn_gate_shexp) |gate| {
+            const up = lt.ffn_up_shexp orelse {
+                log.info("Metal profile: Qwen route-packed prefill disabled: shared up expert missing", .{});
+                return;
+            };
+            const down = lt.ffn_down_shexp orelse {
+                log.info("Metal profile: Qwen route-packed prefill disabled: shared down expert missing", .{});
+                return;
+            };
+            if (!canUseQwenSharedBatchedGemm(self, gate.info.type_) or
+                !canUseQwenSharedBatchedGemm(self, up.info.type_) or
+                !canUseQwenSharedBatchedGemm(self, down.info.type_))
+            {
+                log.info("Metal profile: Qwen route-packed prefill disabled: shared expert batched GEMM unsupported gate={s} up={s} down={s}", .{
+                    @tagName(gate.info.type_),
+                    @tagName(up.info.type_),
+                    @tagName(down.info.type_),
+                });
+                return;
+            }
+            if (lt.ffn_gate_inp_shexp) |gate_inp| {
+                if (!canUseQwenSharedBatchedGemm(self, gate_inp.info.type_)) {
+                    log.info("Metal profile: Qwen route-packed prefill disabled: shared gate input batched GEMM unsupported type={s} dims=({d},{d},{d},{d})", .{
+                        @tagName(gate_inp.info.type_),
+                        gate_inp.info.dims[0],
+                        gate_inp.info.dims[1],
+                        gate_inp.info.dims[2],
+                        gate_inp.info.dims[3],
+                    });
+                    return;
+                }
+            }
+        }
+        if (!canUseQwenSsmPrefillProjectionChunk(self, prompt_len)) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 SSM projection chunk guard failed", .{});
+            return;
+        }
+        if (!canUseQwenRoutePackedPrefixRouter(self, lt.ffn_gate_inp orelse {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 router tensor missing", .{});
+            return;
+        }, prompt_len)) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 router batched top-k unsupported", .{});
+            return;
+        }
+        if (!canUseQwenRoutePackedPrefixSsmLayer(self, 0, prompt_len)) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 route-packed SSM layer guard failed", .{});
+            return;
+        }
+        log.info("Metal profile: Qwen route-packed prefill disabled: unknown guard mismatch", .{});
+    }
+
     fn prefillBatchQueuedTokenMajorSingleCommand(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         // For Qwen3.6 hybrid prefill there are no CPU routing reads in the hot
         // path, so long prompt graphs can be queued in a small number of ordered
@@ -3611,6 +3720,7 @@ pub const InferenceEngine = struct {
         if (self.canUseQwenLayer0RoutePackedPrefill(prompt_tokens.len)) {
             return self.prefillBatchQwenLayer0RoutePacked(state, prompt_tokens);
         }
+        self.logQwenLayer0RoutePackedPrefillBlocker(prompt_tokens.len);
 
         var precompute_cmd = MetalCommand{
             .handle = null,
