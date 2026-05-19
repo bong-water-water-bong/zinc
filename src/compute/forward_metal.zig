@@ -10285,7 +10285,7 @@ fn shouldValidateQwenPrefillMoe(engine: *const InferenceEngine, layer_idx: usize
         cfg.architecture != .gpt_oss and
         cfg.n_experts > 0 and
         cfg.ssm_d_inner > 0 and
-        engine.position < 4 and
+        engine.position < qwenMoeRoutePackValidateTokens() and
         layer_idx == 0;
 }
 
@@ -10555,7 +10555,7 @@ fn logQwenMoeRoutePackValidationDiff(
 }
 
 /// Default-off safety rail for the vLLM/llama.cpp expert-grouped MoE shape.
-/// Captures the first few Qwen3.6 layer-0 token routes from the current
+/// Captures a configured Qwen3.6 layer-0 prompt chunk from the current
 /// token-major path, then replays the grouped route-pack gate/up, activation,
 /// down projection, and weighted unpermute. This mirrors vLLM's
 /// `moe_permute`/`moe_unpermute` flow and llama.cpp's `mul_mm_id` split
