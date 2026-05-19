@@ -7990,7 +7990,6 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
     // SSM-out projection, and route-packed MoE over the full prompt slice.
     try recordQwenSsmProjectionChunkOnCmd(engine, cmd, profile, layer_idx, &scratch.hidden, hidden_dim, d_inner, dt_rank, conv_channels, n_tokens);
 
-    const hidden_dim_usize: usize = @intCast(hidden_dim);
     const d_inner_usize: usize = @intCast(d_inner);
     const conv_channels_usize: usize = @intCast(conv_channels);
     const dt_rank_usize: usize = @intCast(dt_rank);
@@ -8068,24 +8067,21 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
     dispatchGemmQ8_0OnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &scratch.swiglu, &scratch.down, hidden_dim, d_inner, n_tokens);
     profileBarrier(cmd, profile, .ssm);
 
-    for (0..token_count) |i| {
-        const token_index: u32 = @intCast(i);
-        const token_hidden_offset: u32 = @intCast(i * hidden_dim_usize);
-        const token_routing_offset: u32 = @intCast(i * @as(usize, cfg.n_experts_used) * 2);
-        engine.position = token_index;
-
-        dispatchCopyF32OffsetOnCmd(engine, cmd, &scratch.hidden, &engine.hidden_buf, hidden_dim, token_hidden_offset, 0);
-        dispatchCopyF32OffsetOnCmd(engine, cmd, &scratch.down, &engine.down_buf, hidden_dim, token_hidden_offset, 0);
-        profileBarrier(cmd, profile, .ssm);
-        dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
-        profileBarrier(cmd, profile, .router);
-        dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, &engine.norm_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim);
-        profileBarrier(cmd, profile, .router);
-
-        dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.hidden_buf, &scratch.hidden, hidden_dim, 0, token_hidden_offset);
-        dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.norm_buf, &scratch.norm, hidden_dim, 0, token_hidden_offset);
-        dispatchCopyU32OnCmd(engine, cmd, &engine.router_output_buf, &scratch.moe_routing, cfg.n_experts_used * 2, 0, token_routing_offset);
+    // Adapt llama.cpp `ggml_metal_op_concurrency_reset` and vLLM
+    // `grouped_topk`: after the token-ordered SSM recurrence and batched
+    // ssm_out projection, the residual/FFN-router tail is row-independent.
+    // Keep it layer-major over the prompt slice instead of staging each token
+    // through the single-token scratch buffers.
+    {
+        const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0 };
+        const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &engine.ffn_norm_bufs[layer_idx] };
+        cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
     }
+    profileBarrier(cmd, profile, .router);
+
+    dispatchGemmQ8_0OnCmd(engine, cmd, router_t, &scratch.norm, &scratch.gate, cfg.n_experts, hidden_dim, n_tokens);
+    profileBarrier(cmd, profile, .router);
+    dispatchSoftmaxTopkBatchedOnCmd(engine, cmd, &scratch.gate, &scratch.moe_routing, n_tokens, cfg.n_experts, cfg.n_experts_used);
     profileBarrier(cmd, profile, .gpu_routed_moe);
 
     const moe_record_start = profileStart(profile != null);
