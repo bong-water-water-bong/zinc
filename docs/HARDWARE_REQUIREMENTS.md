@@ -6,7 +6,8 @@ ZINC runs on consumer GPUs (Linux, Vulkan) and Apple Silicon (macOS, Metal). Thi
 
 | Platform | GPU | Backend | Status |
 |----------|-----|---------|--------|
-| **Linux** | AMD RDNA4 | Vulkan 1.3 | Primary tuning target |
+| **Linux** | AMD RDNA4 discrete (Navi 48 / Navi 44) | Vulkan 1.3 | Primary tuning target |
+| **Linux** | AMD RDNA4 APU (Strix Halo / gfx1151) | Vulkan 1.3 | Supported with APU-specific bandwidth tuning |
 | **Linux** | AMD RDNA3 | Vulkan 1.3 | Supported, less tuned |
 | **Linux** | Intel Arc Xe2 / Battlemage | Vulkan 1.3+ | Experimental bring-up |
 | **macOS** | Apple Silicon M1 through M5 | Metal | Supported, native MSL shaders |
@@ -17,7 +18,9 @@ ZINC targets AMD consumer and workstation GPUs that the ROCm stack does not supp
 
 | Family | Examples | Notes |
 | --- | --- | --- |
-| RDNA4 | RX 9070, RX 9070 XT, Radeon AI PRO R9700 | Primary tuning target, hand-tuned shaders |
+| RDNA4 discrete (Navi 48 / gfx1201) | RX 9070, RX 9070 XT, RX 9070 GRE, Radeon AI PRO R9700 | Primary tuning target, hand-tuned shaders |
+| RDNA4 discrete (Navi 44 / gfx1200) | RX 9060, RX 9060 XT | Same RDNA4 ISA as Navi 48, smaller die, narrower bus |
+| RDNA4 APU (gfx1151) | Strix Halo: Radeon 8060S, Radeon 8050S | Unified-memory iGPU; ZINC selects an APU bandwidth profile (~256 GB/s) distinct from the discrete 576–640 GB/s default |
 | RDNA3 | RX 7900 XTX, RX 7900 XT, RX 7800 XT, RX 7700 XT, RX 7600 | Supported, less tuned than RDNA4 |
 
 Any AMD GPU with Vulkan 1.3 and a working RADV or AMDVLK driver should work.
