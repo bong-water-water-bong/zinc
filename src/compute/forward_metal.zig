@@ -3625,7 +3625,7 @@ pub const InferenceEngine = struct {
             .q8_0 => blk: {
                 const simd_width = if (self.dmmv_q8_0_pipe.thread_execution_width > 0) self.dmmv_q8_0_pipe.thread_execution_width else @as(u32, 32);
                 if (self.device.chip == .apple9 and simd_width == 32) {
-                    if ((self.config.architecture == .gpt_oss or self.config.architecture == .gemma) and
+                    if (self.config.architecture == .gpt_oss and
                         tensor == self.lm_head and K <= 4096 and M >= 65536 and M % 2 == 0 and
                         self.dmmv_q8_0_lmhead_pipe.thread_execution_width == 32 and
                         self.dmmv_q8_0_lmhead_pipe.max_threads_per_threadgroup >= 512)
@@ -4199,6 +4199,11 @@ fn canUsePairedQ8Dmmv(
     M1: u32,
     K: u32,
 ) bool {
+    // On Apple9/M4, the paired Q8 shader does more per-dispatch work but loses
+    // enough occupancy that separate Q8 matvecs are faster for Gemma 12B's
+    // K=2816 attention and shared-expert shapes.
+    if (engine.device.chip == .apple9 and engine.config.architecture == .gemma) return false;
+
     const block_size = pairedQ8DmmvBlockSize(engine, tensor0, tensor1);
     return tensor0.info.type_ == .q8_0 and
         tensor1.info.type_ == .q8_0 and
