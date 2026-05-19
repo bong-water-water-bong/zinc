@@ -19764,7 +19764,7 @@ test "moe_route_scatter_shared_residual_gate_f32 computes shared gate dot" {
     const n_tokens: usize = 2;
     const n_experts: usize = 4;
     const k: usize = 3;
-    const hidden_dim: usize = 4;
+    const hidden_dim: usize = 320;
     const routing_stride: usize = k * 2;
     const route_slots: usize = n_tokens * k;
 
@@ -19781,42 +19781,61 @@ test "moe_route_scatter_shared_residual_gate_f32 computes shared gate dot" {
     var hidden_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&hidden_buf);
 
-    const w025: u32 = @bitCast(@as(f32, 0.25));
-    const w050: u32 = @bitCast(@as(f32, 0.50));
-    const w060: u32 = @bitCast(@as(f32, 0.60));
-    const w030: u32 = @bitCast(@as(f32, 0.30));
-    const w010: u32 = @bitCast(@as(f32, 0.10));
-
     const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
-    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
-        2, 1, 3, w025, w050, w025,
-        1, 2, 0, w060, w030, w010,
-    });
+    const route_ids = [_][k]u32{
+        .{ 2, 1, 3 },
+        .{ 1, 2, 0 },
+    };
+    const route_weights = [_][k]f32{
+        .{ 0.25, 0.50, 0.25 },
+        .{ 0.60, 0.30, 0.10 },
+    };
+    for (0..n_tokens) |token| {
+        const row = token * routing_stride;
+        for (0..k) |slot| {
+            routing_ptr[row + slot] = route_ids[token][slot];
+            routing_ptr[row + k + slot] = @bitCast(route_weights[token][slot]);
+        }
+    }
 
     const routed_ptr: [*]f32 = @ptrCast(@alignCast(routed_buf.cpu_ptr.?));
     for (0..route_slots) |route| {
         for (0..hidden_dim) |dim| {
-            routed_ptr[route * hidden_dim + dim] = @as(f32, @floatFromInt(route * 10 + dim + 1));
+            const raw: i32 = @intCast((route * 17 + dim * 5 + 3) % 31);
+            routed_ptr[route * hidden_dim + dim] = 0.03125 * @as(f32, @floatFromInt(raw - 15));
         }
     }
 
     const shared_ptr: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
-    for (0..n_tokens * hidden_dim) |i| shared_ptr[i] = 0.125 * @as(f32, @floatFromInt(i + 1));
+    for (0..n_tokens * hidden_dim) |i| {
+        const raw: i32 = @intCast((i * 7 + 11) % 29);
+        shared_ptr[i] = 0.0078125 * @as(f32, @floatFromInt(raw - 14));
+    }
 
     const norm_ptr: [*]f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
-    @memcpy(norm_ptr[0 .. n_tokens * hidden_dim], &[_]f32{
-        0.25,  -0.50, 0.75,  1.00,
-        -0.25, 0.50,  -0.75, 1.25,
-    });
+    for (0..n_tokens) |token| {
+        for (0..hidden_dim) |dim| {
+            const raw: i32 = @intCast((token * 13 + dim * 3 + 5) % 37);
+            norm_ptr[token * hidden_dim + dim] = 0.002 * @as(f32, @floatFromInt(raw - 18));
+        }
+    }
 
     const gate_weight_ptr: [*]f32 = @ptrCast(@alignCast(gate_weight_buf.cpu_ptr.?));
-    @memcpy(gate_weight_ptr[0..hidden_dim], &[_]f32{ 0.50, -0.25, 0.75, -1.00 });
+    for (0..hidden_dim) |dim| {
+        const raw: i32 = @intCast((dim * 11 + 7) % 41);
+        gate_weight_ptr[dim] = 0.003 * @as(f32, @floatFromInt(raw - 20));
+    }
 
     const hidden_ptr: [*]f32 = @ptrCast(@alignCast(hidden_buf.cpu_ptr.?));
-    @memcpy(hidden_ptr[0 .. n_tokens * hidden_dim], &[_]f32{
-        1.0, 1.0, 1.0, 1.0,
-        2.0, 2.0, 2.0, 2.0,
-    });
+    var expected = try std.testing.allocator.alloc(f32, n_tokens * hidden_dim);
+    defer std.testing.allocator.free(expected);
+    for (0..n_tokens) |token| {
+        for (0..hidden_dim) |dim| {
+            const i = token * hidden_dim + dim;
+            hidden_ptr[i] = @as(f32, @floatFromInt(token + 1)) + 0.0005 * @as(f32, @floatFromInt(dim % 17));
+            expected[i] = hidden_ptr[i];
+        }
+    }
 
     const push = MoeRouteScatterSharedResidualGateF32Push{
         .n_tokens = @intCast(n_tokens),
@@ -19832,10 +19851,6 @@ test "moe_route_scatter_shared_residual_gate_f32 computes shared gate dot" {
     cmd.dispatchV2(&pipe, .{ @intCast(n_tokens), 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterSharedResidualGateF32Push), 0);
     cmd.commitAndWait();
 
-    var expected = [_]f32{
-        1.0, 1.0, 1.0, 1.0,
-        2.0, 2.0, 2.0, 2.0,
-    };
     for (0..n_tokens) |token| {
         const row = token * routing_stride;
         for (0..k) |slot| {
@@ -19852,7 +19867,7 @@ test "moe_route_scatter_shared_residual_gate_f32 computes shared gate dot" {
     }
 
     for (0..expected.len) |i| {
-        try std.testing.expectApproxEqAbs(expected[i], hidden_ptr[i], 0.001);
+        try std.testing.expectApproxEqAbs(expected[i], hidden_ptr[i], 0.002);
     }
 }
 
