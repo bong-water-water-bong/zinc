@@ -4996,7 +4996,6 @@ pub const InferenceEngine = struct {
             const use_fused_ssm_pre_norm = blk: {
                 if (!self.use_fused_ssm_pre_norm) break :blk false; // env-gated kill switch
                 if (is_full_attn) break :blk false;
-                if (self.partialSsmPreprojActiveFor(layer)) break :blk false;
                 if (self.elementwise.pipeline_rms_norm_dmmv_q4k_alpha_beta == null) break :blk false;
                 if ((hidden_dim % 4) != 0) break :blk false; // shader reads as f32 vec4
                 if (attn_norm.info.type_ != .f32) break :blk false; // shader reads attn_norm as f32 vec4
@@ -10777,8 +10776,42 @@ pub const InferenceEngine = struct {
             // (~256 bytes per layer) overlap with the wqkv/z dispatches
             // and trims the global s_waitcnt that a full computeBarrier
             // would emit on RDNA4. Cycle 16 narrow.
-            self.decode_cmd.computeBufferBarrier(self.norm_buf.handle, hidden_size);
-            if (can_fuse_qkv_z) {
+            if (use_prebatched_ssm_proj) {
+                const tok_idx = self.partial_ssm_preproj_token_idx;
+                const use_prebatched_qkv = self.partial_ssm_preproj_qkv != null and self.partial_ssm_preproj_qkv_stride > 0;
+                const use_prebatched_z = self.partial_ssm_preproj_z != null and self.partial_ssm_preproj_z_stride > 0;
+                self.decode_cmd.computeAndTransferBarrier();
+                if (use_prebatched_qkv) {
+                    const qkv_src_off: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, tok_idx) * self.partial_ssm_preproj_qkv_stride;
+                    if (qkv_src_off + qkv_bytes > self.partial_ssm_preproj_qkv_size) return error.BufferTooSmall;
+                    const qkv_copy = vk.c.VkBufferCopy{
+                        .srcOffset = qkv_src_off,
+                        .dstOffset = 0,
+                        .size = qkv_bytes,
+                    };
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_qkv.?, self.attn_out_buf.handle, 1, &qkv_copy);
+                }
+                if (use_prebatched_z and !is_dead_tail) {
+                    const z_src_off: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, tok_idx) * self.partial_ssm_preproj_z_stride;
+                    if (z_src_off + z_bytes > self.partial_ssm_preproj_z_size) return error.BufferTooSmall;
+                    const z_copy = vk.c.VkBufferCopy{
+                        .srcOffset = z_src_off,
+                        .dstOffset = 0,
+                        .size = z_bytes,
+                    };
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_z.?, self.gate_buf.handle, 1, &z_copy);
+                }
+                self.decode_cmd.transferToComputeBarrier();
+                if (!use_prebatched_qkv) {
+                    try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                }
+                if (!is_dead_tail and !use_prebatched_z) {
+                    try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                }
+            } else if (can_fuse_qkv_z) {
+                self.decode_cmd.computeBufferBarrier(self.norm_buf.handle, hidden_size);
                 try self.dispatchDmmvQ8_0FusedPair(
                     wqkv_tensor,
                     z_tensor,
@@ -10793,6 +10826,7 @@ pub const InferenceEngine = struct {
                     hidden_dim,
                 );
             } else {
+                self.decode_cmd.computeBufferBarrier(self.norm_buf.handle, hidden_size);
                 try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
                 if (!is_dead_tail) {
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
@@ -10802,21 +10836,25 @@ pub const InferenceEngine = struct {
         } else {
             if (use_prebatched_ssm_proj) {
                 const tok_idx = self.partial_ssm_preproj_token_idx;
-                const qkv_src_off: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, tok_idx) * self.partial_ssm_preproj_qkv_stride;
-                const z_src_off: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, tok_idx) * self.partial_ssm_preproj_z_stride;
-                if (qkv_src_off + qkv_bytes > self.partial_ssm_preproj_qkv_size) return error.BufferTooSmall;
-                if (!is_dead_tail and z_src_off + z_bytes > self.partial_ssm_preproj_z_size) return error.BufferTooSmall;
+                const use_prebatched_qkv = self.partial_ssm_preproj_qkv != null and self.partial_ssm_preproj_qkv_stride > 0;
+                const use_prebatched_z = self.partial_ssm_preproj_z != null and self.partial_ssm_preproj_z_stride > 0;
 
                 self.decode_cmd.computeToTransferBarrier();
-                const qkv_copy = vk.c.VkBufferCopy{
-                    .srcOffset = qkv_src_off,
-                    .dstOffset = 0,
-                    .size = qkv_bytes,
-                };
-                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_qkv.?, self.attn_out_buf.handle, 1, &qkv_copy);
-                if (!is_dead_tail) {
+                if (use_prebatched_qkv) {
+                    const qkv_src_off: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, tok_idx) * self.partial_ssm_preproj_qkv_stride;
+                    if (qkv_src_off + qkv_bytes > self.partial_ssm_preproj_qkv_size) return error.BufferTooSmall;
+                    const qkv_copy = vk.c.VkBufferCopy{
+                        .srcOffset = qkv_src_off,
+                        .dstOffset = 0,
+                        .size = qkv_bytes,
+                    };
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_qkv.?, self.attn_out_buf.handle, 1, &qkv_copy);
+                }
+                if (use_prebatched_z and !is_dead_tail) {
+                    const z_src_off: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, tok_idx) * self.partial_ssm_preproj_z_stride;
+                    if (z_src_off + z_bytes > self.partial_ssm_preproj_z_size) return error.BufferTooSmall;
                     const z_copy = vk.c.VkBufferCopy{
                         .srcOffset = z_src_off,
                         .dstOffset = 0,
@@ -10825,6 +10863,12 @@ pub const InferenceEngine = struct {
                     vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_z.?, self.gate_buf.handle, 1, &z_copy);
                 }
                 self.decode_cmd.transferToComputeBarrier();
+                if (!use_prebatched_qkv) {
+                    try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                }
+                if (!is_dead_tail and !use_prebatched_z) {
+                    try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                }
             } else if (can_fuse_qkv_z) {
                 try self.dispatchDmmvQ8_0FusedPair(
                     wqkv_tensor,
@@ -11257,15 +11301,17 @@ pub const InferenceEngine = struct {
         if (!self.isQwen36DenseHybrid27B()) return false;
         if (!self.isAmdRdna()) return false;
         const mode = std.posix.getenv("ZINC_QWEN36_27B_SSM_PREFILL_PROJ") orelse return false;
-        return std.mem.eql(u8, mode, "1");
+        return std.mem.eql(u8, mode, "1") or
+            std.mem.eql(u8, mode, "both") or
+            std.mem.eql(u8, mode, "qkv") or
+            std.mem.eql(u8, mode, "z");
     }
 
     fn partialSsmPreprojActiveFor(self: *const InferenceEngine, layer: u32) bool {
-        return self.partial_ssm_preproj_layer == layer and
-            self.partial_ssm_preproj_qkv != null and
-            self.partial_ssm_preproj_z != null and
-            self.partial_ssm_preproj_qkv_stride > 0 and
-            self.partial_ssm_preproj_z_stride > 0;
+        if (self.partial_ssm_preproj_layer != layer) return false;
+        const has_qkv = self.partial_ssm_preproj_qkv != null and self.partial_ssm_preproj_qkv_stride > 0;
+        const has_z = self.partial_ssm_preproj_z != null and self.partial_ssm_preproj_z_stride > 0;
+        return has_qkv or has_z;
     }
 
     fn qwen36DensePrefillPrefixLayers(self: *const InferenceEngine, prompt_len: usize) u32 {
@@ -11281,7 +11327,10 @@ pub const InferenceEngine = struct {
         if (!self.isQwen36DenseHybrid27B()) return 0;
         if (mode == null and !is_amd) return 0;
 
-        var layers: u32 = 1;
+        // The deeper prefix only wins for tiny prompts where the fixed
+        // layer-major setup cost is small; context prompts stay on the
+        // one-layer default because L2+ regressed the coding-review matrix.
+        var layers: u32 = if (mode == null and prompt_len <= 8) 8 else 1;
         if (mode) |raw| {
             if (!std.mem.eql(u8, raw, "1")) {
                 layers = std.fmt.parseInt(u32, raw, 10) catch layers;
@@ -11361,6 +11410,13 @@ pub const InferenceEngine = struct {
         const scratch_swiglu = self.batched_scratch_swiglu.?;
         const scratch_down = self.batched_scratch_down.?;
         const use_ssm_preproj = self.qwen36DensePrefillSsmPreprojEnabled();
+        const ssm_preproj_mode = std.posix.getenv("ZINC_QWEN36_27B_SSM_PREFILL_PROJ") orelse "";
+        const prebatch_ssm_qkv = std.mem.eql(u8, ssm_preproj_mode, "1") or
+            std.mem.eql(u8, ssm_preproj_mode, "both") or
+            std.mem.eql(u8, ssm_preproj_mode, "qkv");
+        const prebatch_ssm_z = std.mem.eql(u8, ssm_preproj_mode, "1") or
+            std.mem.eql(u8, ssm_preproj_mode, "both") or
+            std.mem.eql(u8, ssm_preproj_mode, "z");
         var embeddings_copied_to_scratch = false;
         if (use_ssm_preproj) {
             if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
@@ -11451,7 +11507,9 @@ pub const InferenceEngine = struct {
                 const z_stride: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, d_inner) * @sizeOf(f32);
                 const qkv_total = qkv_stride * @as(vk.c.VkDeviceSize, n_tokens);
                 const z_total = z_stride * @as(vk.c.VkDeviceSize, n_tokens);
-                if (qkv_total <= scratch_gate.size and z_total <= scratch_up.size) {
+                const can_prebatch_qkv = prebatch_ssm_qkv and qkv_total <= scratch_gate.size;
+                const can_prebatch_z = prebatch_ssm_z and z_total <= scratch_up.size;
+                if (can_prebatch_qkv or can_prebatch_z) {
                     if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
                     try self.decode_cmd.reset();
                     try self.decode_cmd.beginOneTime();
@@ -11472,18 +11530,27 @@ pub const InferenceEngine = struct {
                         cfg.rms_norm_eps,
                     );
                     self.decode_cmd.computeBarrier();
-                    try self.dispatchProjectionBatched(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
-                    try self.dispatchProjectionBatched(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens);
+                    if (can_prebatch_qkv) {
+                        try self.dispatchProjectionBatched(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
+                    }
+                    if (can_prebatch_z) {
+                        try self.dispatchProjectionBatched(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens);
+                    }
+                    self.decode_cmd.computeToTransferBarrier();
                     try self.decode_cmd.end();
                     try self.decode_cmd.submitAndWait(self.instance.compute_queue);
 
                     self.partial_ssm_preproj_layer = layer;
-                    self.partial_ssm_preproj_qkv = scratch_gate.handle;
-                    self.partial_ssm_preproj_qkv_size = scratch_gate.size;
-                    self.partial_ssm_preproj_qkv_stride = qkv_stride;
-                    self.partial_ssm_preproj_z = scratch_up.handle;
-                    self.partial_ssm_preproj_z_size = scratch_up.size;
-                    self.partial_ssm_preproj_z_stride = z_stride;
+                    if (can_prebatch_qkv) {
+                        self.partial_ssm_preproj_qkv = scratch_gate.handle;
+                        self.partial_ssm_preproj_qkv_size = scratch_gate.size;
+                        self.partial_ssm_preproj_qkv_stride = qkv_stride;
+                    }
+                    if (can_prebatch_z) {
+                        self.partial_ssm_preproj_z = scratch_up.handle;
+                        self.partial_ssm_preproj_z_size = scratch_up.size;
+                        self.partial_ssm_preproj_z_stride = z_stride;
+                    }
                 }
             }
 

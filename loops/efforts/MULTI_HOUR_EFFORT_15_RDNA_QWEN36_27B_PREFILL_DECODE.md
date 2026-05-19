@@ -229,6 +229,8 @@ reason the prior failure mode no longer applies.
 | Widened fused attention o-proj merge to `hidden_dim=5120` | severe long-context regression, attention exploded | rejected |
 | `ZINC_SSM_DELTA_NORMED_QK=1` | regressed | rejected |
 | Full SSM batched prefill gate flip | GPU hard resets / `QueueSubmitFailed`; dependency bug in hidden evolution | hard ban |
+| Prefix SSM projection replay (`ZINC_QWEN36_27B_SSM_PREFILL_PROJ=z/qkv/both`) | coherent after keeping fused RMS+alpha+beta, but context-medium regressed from ~29.24 tok/s to 29.09-29.17 tok/s at L1 and 27.91-28.97 tok/s at L2/L4/L8 | default-off diagnostic only |
+| Forcing separate SSM alpha/beta path (`ZINC_FUSED_SSM_AB=0`) | immediate `QueueSubmitFailed` on Qwen 3.6 27B | do not use as a prerequisite for 27B prefill work |
 
 Rejected matrix details:
 
@@ -242,6 +244,20 @@ Rejected matrix details:
 | wide rejected | 16.49 / 22.70 | 23.53 / 30.05 | 25.74 / 28.89 | 18.16 / 26.40 |
 
 Each cell is `prefill tok/s / decode tok/s`.
+
+2026-05-18 follow-up:
+
+- Default dense-FFN prefix depth remains one layer for context prompts.
+  The real coding-review prompt measured ~29.23-29.24 tok/s prefill at
+  L1; L2/L4/L8 with SSM projection replay were all slower.
+- Very short prompts are the one safe exception. The 5-token raw smoke
+  prompt improved from roughly 18-20 tok/s at L1 to ~23.9-24.1 tok/s at
+  L8 with identical output tokens. Production now chooses L8 only when
+  `prompt_len <= 8`; longer prompts keep L1.
+- The SSM qkv/z replay path is left behind
+  `ZINC_QWEN36_27B_SSM_PREFILL_PROJ={qkv,z,both}` for diagnostics. It is
+  not a fix for the context prefill gap because the replay setup/copy
+  overhead cancels the saved projection work.
 
 ## Measurement contract
 
