@@ -30,7 +30,11 @@ pub const runtime_context_cap: u32 = 262144;
 const queued_prefill_embed_tokens: usize = 256;
 const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
 const qwen_ssm_projection_validate_tokens: u32 = 4;
-const qwen_moe_route_pack_validate_tokens: u32 = 4;
+// llama.cpp's Metal `ggml_metal_op_mul_mat_id` switches from the small
+// matrix-vector path to the expert-grouped matrix path at 32 prompt rows.
+// Validate the Qwen route-pack candidate at that same batch size so vLLM-style
+// expert block packing is exercised in the production-shaped regime.
+const qwen_moe_route_pack_validate_tokens: u32 = 32;
 // Let the Qwen3.6 llama.cpp-style graph batching / vLLM route-packed MoE
 // prefix run until the model ends or a per-layer support guard fails. This
 // keeps the layer-major prompt path from falling back to token-major decode at
