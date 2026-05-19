@@ -28,7 +28,8 @@ const log = std.log.scoped(.forward);
 /// see this as a soft safety net rather than the primary limit.
 pub const runtime_context_cap: u32 = 262144;
 const queued_prefill_embed_tokens: usize = 256;
-const qwen_ssm_projection_chunk_tokens: u32 = 4;
+const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
+const qwen_ssm_projection_validate_tokens: u32 = 4;
 
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
@@ -289,6 +290,18 @@ fn readBoolEnv(env_name: [:0]const u8) ?bool {
 fn readU32Env(env_name: [:0]const u8) ?u32 {
     const raw = std.posix.getenv(env_name) orelse return null;
     return std.fmt.parseUnsigned(u32, raw, 10) catch null;
+}
+
+fn defaultQwen36SsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
+    return cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.n_layers == 40 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.ssm_d_state == 128 and
+        cfg.ssm_dt_rank == 32 and
+        cfg.ssm_n_group == 16;
 }
 
 const DmmvPathClass = enum(u8) {
@@ -2047,8 +2060,9 @@ pub const InferenceEngine = struct {
             (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
             (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
         self.qwen_ssm_prefill_proj_enabled =
-            (readBoolEnv("ZINC_QWEN36_35B_SSM_PREFILL_PROJ") orelse false) or
-            (readBoolEnv("ZINC_QWEN36_SSM_PREFILL_PROJ") orelse false);
+            readBoolEnv("ZINC_QWEN36_35B_SSM_PREFILL_PROJ") orelse
+            readBoolEnv("ZINC_QWEN36_SSM_PREFILL_PROJ") orelse
+            defaultQwen36SsmPrefillProjectionEnabled(cfg);
         self.qwen_ssm_proj_validate_layer =
             readU32Env("ZINC_QWEN36_35B_SSM_PROJ_VALIDATE_LAYER") orelse
             readU32Env("ZINC_QWEN36_SSM_PROJ_VALIDATE_LAYER") orelse
@@ -2111,11 +2125,11 @@ pub const InferenceEngine = struct {
         self.argmax_buf = try metal_buffer.createBuffer(ctx, 2 * @sizeOf(u32));
         self.embed_staging = try metal_buffer.createBuffer(ctx, hidden_size);
         self.prefill_embed_buf = try metal_buffer.createBuffer(ctx, hidden_size * queued_prefill_embed_tokens);
-        self.qwen_ssm_prefill_proj_norm_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_chunk_tokens) * hidden_size, 4));
-        self.qwen_ssm_prefill_proj_qkv_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_chunk_tokens) * @as(usize, conv_channels) * @sizeOf(f32), 4));
-        self.qwen_ssm_prefill_proj_z_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_chunk_tokens) * @as(usize, d_inner) * @sizeOf(f32), 4));
-        self.qwen_ssm_prefill_proj_alpha_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_chunk_tokens) * @as(usize, cfg.ssm_dt_rank) * @sizeOf(f32), 4));
-        self.qwen_ssm_prefill_proj_beta_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_chunk_tokens) * @as(usize, cfg.ssm_dt_rank) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_proj_norm_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * hidden_size, 4));
+        self.qwen_ssm_prefill_proj_qkv_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * @as(usize, conv_channels) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_proj_z_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * @as(usize, d_inner) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_proj_alpha_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * @as(usize, cfg.ssm_dt_rank) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_proj_beta_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * @as(usize, cfg.ssm_dt_rank) * @sizeOf(f32), 4));
         self.lm_head_private_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.expert_ids_buf = try metal_buffer.createBuffer(ctx, expert_ids_size);
         {
@@ -3230,8 +3244,9 @@ pub const InferenceEngine = struct {
     fn prefillBatchQueuedTokenMajor(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         // Mirror llama.cpp's Metal graph submission style: encode/commit the
         // token-major prompt graph ahead of the CPU and synchronize only at the
-        // final prompt token. SSM recurrence and MoE routing stay byte-for-byte
-        // on the existing per-token path; only the per-token wait is removed.
+        // final prompt token. SSM recurrence and MoE routing stay on the existing
+        // per-token path; Qwen3.6 can additionally precompute layer-0 SSM
+        // projections over the queued prompt embeddings.
         const hidden_dim = self.config.hidden_dim;
         const hidden_dim_usize: usize = @intCast(hidden_dim);
         for (prompt_tokens, 0..) |token_id, i| {
@@ -7954,7 +7969,8 @@ const QwenPrefillMoeValidationRef = struct {
 
 fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_len: usize) bool {
     if (!engine.qwen_ssm_prefill_proj_enabled) return false;
-    if (prompt_len < qwen_ssm_projection_chunk_tokens) return false;
+    if (prompt_len < qwen_ssm_projection_validate_tokens) return false;
+    if (prompt_len > queued_prefill_embed_tokens) return false;
     if (engine.position != 0) return false;
     if (!engine.private_decode_buffers) return false;
     if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
@@ -7985,7 +8001,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     const d_inner = cfg.ssm_d_inner;
     const dt_rank = cfg.ssm_dt_rank;
     const conv_channels = d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
-    const n_tokens: u32 = @min(qwen_ssm_projection_chunk_tokens, @as(u32, @intCast(prompt_len)));
+    const n_tokens: u32 = @min(qwen_ssm_projection_prefill_max_tokens, @as(u32, @intCast(prompt_len)));
     const lt = engine.layer_tensors[0];
     const wqkv_t = lt.attn_qkv orelse return error.MissingTensor;
     const z_t = lt.attn_gate orelse return error.MissingTensor;
@@ -8075,8 +8091,6 @@ fn shouldValidateQwenSsmProjection(
         beta_t.info.type_ == .q8_0 and
         engine.gemm_q8_0_pipe.handle != null;
 }
-
-const qwen_ssm_projection_validate_tokens: u32 = qwen_ssm_projection_chunk_tokens;
 
 fn ensureValidationBuffer(engine: *InferenceEngine, buf: *MetalBuffer, required_bytes: usize) !void {
     const size = @max(required_bytes, 4);
