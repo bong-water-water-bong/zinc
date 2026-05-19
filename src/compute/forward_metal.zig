@@ -10634,6 +10634,14 @@ fn validateQwenMoeRoutePackChunk(
     defer metal_buffer.freeBuffer(&gate_candidate_buf);
     var active_gate_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
     defer metal_buffer.freeBuffer(&active_gate_candidate_buf);
+    var active_up_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_up_candidate_buf);
+    var active_swiglu_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_swiglu_candidate_buf);
+    var active_down_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_down_candidate_buf);
+    var active_delta_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_delta_candidate_buf);
     var up_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
     defer metal_buffer.freeBuffer(&up_candidate_buf);
     var swiglu_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
@@ -10660,6 +10668,10 @@ fn validateQwenMoeRoutePackChunk(
         active_block_count_buf = try metal_buffer.createBuffer(engine.device.ctx, @sizeOf(u32));
         active_blocks_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(active_block_upper_bound_usize * @sizeOf(u32), 4));
         active_gate_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
+        active_up_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
+        active_swiglu_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
+        active_down_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * hidden_n * @sizeOf(f32), 4));
+        active_delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
     }
     if (can_validate_shared) {
         shared_gate_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * shexp_inter_n * @sizeOf(f32), 4));
@@ -10762,10 +10774,37 @@ fn validateQwenMoeRoutePackChunk(
         cfg.n_experts,
         n,
     );
+    if (can_validate_active_blocks) {
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            &cmd,
+            gate_up_layout.up_tensor,
+            &engine.qwen_moe_route_validate_norm_buf,
+            &active_up_candidate_buf,
+            &active_counts_buf,
+            &active_packed_ids_buf,
+            &active_blocks_buf,
+            &active_block_count_buf,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.up_expert_stride,
+            gate_up_layout.up_base_offset,
+            0,
+            0,
+            n,
+            k,
+            active_block_upper_bound,
+        );
+    }
     cmd.barrier();
     {
         const swiglu_push = SwiGLUPush{ .n = inter_dim };
         const sw_bufs = [_]*const MetalBuffer{ &gate_candidate_buf, &swiglu_candidate_buf, &up_candidate_buf };
+        cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, route_slots_u32, 1 }, .{ 64, 1, 1 }, &sw_bufs, &swiglu_push, @sizeOf(SwiGLUPush), 0);
+    }
+    if (can_validate_active_blocks) {
+        const swiglu_push = SwiGLUPush{ .n = inter_dim };
+        const sw_bufs = [_]*const MetalBuffer{ &active_gate_candidate_buf, &active_swiglu_candidate_buf, &active_up_candidate_buf };
         cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, route_slots_u32, 1 }, .{ 64, 1, 1 }, &sw_bufs, &swiglu_push, @sizeOf(SwiGLUPush), 0);
     }
     cmd.barrier();
@@ -10788,8 +10827,33 @@ fn validateQwenMoeRoutePackChunk(
         cfg.n_experts,
         n,
     );
+    if (can_validate_active_blocks) {
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            &cmd,
+            down_exps,
+            &active_swiglu_candidate_buf,
+            &active_down_candidate_buf,
+            &active_counts_buf,
+            &active_packed_ids_buf,
+            &active_blocks_buf,
+            &active_block_count_buf,
+            hidden_dim,
+            inter_dim,
+            expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+            0,
+            0,
+            0,
+            n,
+            1,
+            active_block_upper_bound,
+        );
+    }
     cmd.barrier();
     dispatchZeroF32OnCmd(engine, &cmd, &delta_candidate_buf, n * hidden_dim);
+    if (can_validate_active_blocks) {
+        dispatchZeroF32OnCmd(engine, &cmd, &active_delta_candidate_buf, n * hidden_dim);
+    }
     cmd.barrier();
     dispatchMoeRouteScatterOnCmd(
         engine,
@@ -10805,6 +10869,22 @@ fn validateQwenMoeRoutePackChunk(
         k,
         false,
     );
+    if (can_validate_active_blocks) {
+        dispatchMoeRouteScatterOnCmd(
+            engine,
+            &cmd,
+            &active_counts_buf,
+            &active_packed_ids_buf,
+            &engine.qwen_moe_route_validate_routing_buf,
+            &active_down_candidate_buf,
+            &active_delta_candidate_buf,
+            n,
+            hidden_dim,
+            cfg.n_experts,
+            k,
+            false,
+        );
+    }
     if (can_validate_shared) {
         try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, gate_shexp.?, &engine.qwen_moe_route_validate_norm_buf, &shared_gate_candidate_buf, shexp_inter_dim, hidden_dim, n);
         try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, up_shexp.?, &engine.qwen_moe_route_validate_norm_buf, &shared_up_candidate_buf, shexp_inter_dim, hidden_dim, n);
@@ -10930,6 +11010,10 @@ fn validateQwenMoeRoutePackChunk(
         }
     }
     logQwenMoeRoutePackValidationDiff(layer_idx, "moe_up_grouped_cols", up_ref[0..total], up_candidate[0..total], inter_dim, k, n, 5e-2);
+    if (can_validate_active_blocks) {
+        const active_up_candidate: [*]const f32 = @ptrCast(@alignCast(active_up_candidate_buf.cpu_ptr.?));
+        logQwenMoeRoutePackValidationDiff(layer_idx, "moe_up_active_blocks", up_candidate[0..total], active_up_candidate[0..total], inter_dim, k, n, 5e-2);
+    }
 
     const allocator = engine.allocator;
     const swiglu_ref = try allocator.alloc(f32, total);
@@ -10940,7 +11024,15 @@ fn validateQwenMoeRoutePackChunk(
         cpuSwiGLU(gate_ref + off, up_ref + off, swiglu_ref.ptr + off, inter_dim);
     }
     logQwenMoeRoutePackValidationDiff(layer_idx, "moe_swiglu_grouped_cols", swiglu_ref[0..total], swiglu_candidate[0..total], inter_dim, k, n, 5e-2);
+    if (can_validate_active_blocks) {
+        const active_swiglu_candidate: [*]const f32 = @ptrCast(@alignCast(active_swiglu_candidate_buf.cpu_ptr.?));
+        logQwenMoeRoutePackValidationDiff(layer_idx, "moe_swiglu_active_blocks", swiglu_candidate[0..total], active_swiglu_candidate[0..total], inter_dim, k, n, 5e-2);
+    }
     logQwenMoeRoutePackValidationDiff(layer_idx, "moe_down_grouped_cols", down_ref[0..down_total], down_candidate[0..down_total], hidden_dim, k, n, 5e-2);
+    if (can_validate_active_blocks) {
+        const active_down_candidate: [*]const f32 = @ptrCast(@alignCast(active_down_candidate_buf.cpu_ptr.?));
+        logQwenMoeRoutePackValidationDiff(layer_idx, "moe_down_active_blocks", down_candidate[0..down_total], active_down_candidate[0..down_total], hidden_dim, k, n, 5e-2);
+    }
 
     const delta_ref = try allocator.alloc(f32, delta_total);
     defer allocator.free(delta_ref);
@@ -10959,6 +11051,10 @@ fn validateQwenMoeRoutePackChunk(
         }
     }
     logQwenMoeRoutePackValidationDiff(layer_idx, "moe_delta_grouped_scatter", delta_ref[0..delta_total], delta_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+    if (can_validate_active_blocks) {
+        const active_delta_candidate: [*]const f32 = @ptrCast(@alignCast(active_delta_candidate_buf.cpu_ptr.?));
+        logQwenMoeRoutePackValidationDiff(layer_idx, "moe_delta_active_blocks", delta_candidate[0..delta_total], active_delta_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+    }
 
     if (can_validate_shared) {
         const shared_total = n_usize * shexp_inter_n;
