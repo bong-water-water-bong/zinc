@@ -33,7 +33,7 @@ describe("detectZincRtExecutionMode", () => {
   test("detects direct execution only from explicit direct compute evidence", () => {
     const output = [
       "info(zinc_rt): runtime initialized execution_tier=t1_pm4",
-      "info(zinc_rt): ZINC_RT M1 model_execution=direct execution_tier=t1_pm4 direct_compute_ops=1 direct_compute_kind=argmax",
+      "info(zinc_rt): ZINC_RT M1 model_execution=direct execution_tier=t1_pm4 direct_compute_ops=1 direct_compute_kind=lm_head_row_range consumed_gpu_model_value=1",
     ].join("\n");
 
     expect(detectZincRtExecutionMode(output)).toBe("direct");
