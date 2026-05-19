@@ -1972,6 +1972,7 @@ pub const InferenceEngine = struct {
     moe_route_ids_pipe: MetalPipeline,
     moe_route_gather_pipe: MetalPipeline,
     moe_route_scatter_pipe: MetalPipeline,
+    moe_route_scatter_set_pipe: MetalPipeline,
     moe_route_scatter_scaled_pipe: MetalPipeline,
     moe_route_scatter_direct_scaled_pipe: MetalPipeline,
     sigmoid_scale_acc_pipe: MetalPipeline,
@@ -2423,6 +2424,7 @@ pub const InferenceEngine = struct {
         self.moe_route_ids_pipe = try loadShaderPipeline(ctx, "moe_route_ids");
         self.moe_route_gather_pipe = try loadShaderPipeline(ctx, "moe_route_gather");
         self.moe_route_scatter_pipe = try loadShaderPipeline(ctx, "moe_route_scatter");
+        self.moe_route_scatter_set_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_set");
         self.moe_route_scatter_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_scaled");
         self.moe_route_scatter_direct_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_direct_scaled");
         self.sigmoid_scale_acc_pipe = try loadShaderPipeline(ctx, "sigmoid_scale_acc");
@@ -3170,6 +3172,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.moe_route_ids_pipe);
         metal_pipeline.freePipeline(&self.moe_route_gather_pipe);
         metal_pipeline.freePipeline(&self.moe_route_scatter_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_scatter_set_pipe);
         metal_pipeline.freePipeline(&self.moe_route_scatter_scaled_pipe);
         metal_pipeline.freePipeline(&self.moe_route_scatter_direct_scaled_pipe);
         metal_pipeline.freePipeline(&self.sigmoid_scale_acc_pipe);
@@ -3473,6 +3476,7 @@ pub const InferenceEngine = struct {
         if (self.moe_route_pack_pipe.handle == null or
             self.moe_route_gather_pipe.handle == null or
             self.moe_route_scatter_pipe.handle == null or
+            self.moe_route_scatter_set_pipe.handle == null or
             self.swiglu_batched_pipe.handle == null or
             self.scale_acc_pipe.handle == null)
         {
@@ -7234,6 +7238,34 @@ fn dispatchMoeRouteScatterOnCmd(
     cmd.dispatchV2(&engine.moe_route_scatter_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterPush), 0);
 }
 
+fn dispatchMoeRouteScatterSetOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    counts: *const MetalBuffer,
+    ids: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    src: *const MetalBuffer,
+    dst: *const MetalBuffer,
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    debug: bool,
+) void {
+    const push = MoeRouteScatterPush{
+        .n_tokens = n_tokens,
+        .hidden_dim = hidden_dim,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .ids_stride = n_tokens,
+        .debug = if (debug) 1 else 0,
+    };
+    const total = n_tokens * hidden_dim;
+    const bufs = [_]*const MetalBuffer{ counts, ids, routing, src, dst };
+    cmd.dispatchV2(&engine.moe_route_scatter_set_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterPush), 0);
+}
+
 fn dispatchMoeRouteScatterScaledOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -7569,6 +7601,7 @@ fn canUseQwenRoutePackedPrefixMoeLayer(engine: *const InferenceEngine, lt: Layer
     if (engine.moe_route_pack_pipe.handle == null or
         engine.moe_route_gather_pipe.handle == null or
         engine.moe_route_scatter_pipe.handle == null or
+        engine.moe_route_scatter_set_pipe.handle == null or
         engine.swiglu_batched_pipe.handle == null or
         engine.scale_acc_pipe.handle == null)
     {
@@ -8115,9 +8148,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
     }
     profileBarrier(cmd, profile, .gpu_routed_moe);
 
-    dispatchZeroF32OnCmd(engine, cmd, &scratch.down, total_hidden);
-    profileBarrier(cmd, profile, .gpu_routed_moe);
-    dispatchMoeRouteScatterOnCmd(engine, cmd, &scratch.moe_expert_counts, &scratch.moe_packed_ids, &scratch.moe_routing, &scratch.moe_expert_down, &scratch.down, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
+    dispatchMoeRouteScatterSetOnCmd(engine, cmd, &scratch.moe_expert_counts, &scratch.moe_packed_ids, &scratch.moe_routing, &scratch.moe_expert_down, &scratch.down, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
     profileBarrier(cmd, profile, .gpu_routed_moe);
 
     if (lt.ffn_gate_shexp) |gate_shexp| {
@@ -16966,6 +16997,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&route_gather_pipe);
     var route_scatter_pipe = try loadShaderPipeline(ctx, "moe_route_scatter");
     defer metal_pipeline.freePipeline(&route_scatter_pipe);
+    var route_scatter_set_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_set");
+    defer metal_pipeline.freePipeline(&route_scatter_set_pipe);
     var route_scatter_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_scaled");
     defer metal_pipeline.freePipeline(&route_scatter_scaled_pipe);
     var route_scatter_direct_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_direct_scaled");
@@ -17014,6 +17047,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(route_ids_pipe.handle != null);
     try std.testing.expect(route_gather_pipe.handle != null);
     try std.testing.expect(route_scatter_pipe.handle != null);
+    try std.testing.expect(route_scatter_set_pipe.handle != null);
     try std.testing.expect(route_scatter_scaled_pipe.handle != null);
     try std.testing.expect(route_scatter_direct_scaled_pipe.handle != null);
     try std.testing.expect(sigmoid_scale_acc_pipe.handle != null);
