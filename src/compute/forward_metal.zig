@@ -3614,10 +3614,10 @@ pub const InferenceEngine = struct {
                 return false;
             }
             if (lt.ffn_gate_inp_shexp) |gate_inp| {
-                if (!canUseQwenSharedBatchedGemm(self, gate_inp.info.type_)) return false;
+                if (!canUseQwenSharedGateInputBatched(self, gate_inp, self.config.hidden_dim)) return false;
             }
         }
-        return true;
+        return canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(self, 0, prompt_len, true);
     }
 
     fn logQwenLayer0RoutePackedPrefillBlocker(self: *const InferenceEngine, prompt_len: usize) void {
@@ -3699,8 +3699,8 @@ pub const InferenceEngine = struct {
                 return;
             }
             if (lt.ffn_gate_inp_shexp) |gate_inp| {
-                if (!canUseQwenSharedBatchedGemm(self, gate_inp.info.type_)) {
-                    log.info("Metal profile: Qwen route-packed prefill disabled: shared gate input batched GEMM unsupported type={s} dims=({d},{d},{d},{d})", .{
+                if (!canUseQwenSharedGateInputBatched(self, gate_inp, self.config.hidden_dim)) {
+                    log.info("Metal profile: Qwen route-packed prefill disabled: shared gate input fused/batched unsupported type={s} dims=({d},{d},{d},{d})", .{
                         @tagName(gate_inp.info.type_),
                         gate_inp.info.dims[0],
                         gate_inp.info.dims[1],
@@ -8071,7 +8071,13 @@ fn qwenFirstPrefixAttentionDims(engine: *const InferenceEngine) ?BatchedPrefillA
     return null;
 }
 
-fn canUseQwenRoutePackedPrefixMoeLayer(engine: *const InferenceEngine, lt: LayerTensors, hidden_dim: u32, inter_dim: u32) bool {
+fn canUseQwenRoutePackedPrefixMoeLayerWithSharedGateMode(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+    hidden_dim: u32,
+    inter_dim: u32,
+    allow_f32_shared_gate_input: bool,
+) bool {
     if (!canUseGpuRoutedBatchedMoe(engine, lt)) return false;
 
     const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, hidden_dim) catch return false;
@@ -8101,10 +8107,18 @@ fn canUseQwenRoutePackedPrefixMoeLayer(engine: *const InferenceEngine, lt: Layer
             return false;
         }
         if (lt.ffn_gate_inp_shexp) |gate_inp| {
-            if (!canUseQwenSharedBatchedGemm(engine, gate_inp.info.type_)) return false;
+            const gate_supported = if (allow_f32_shared_gate_input)
+                canUseQwenSharedGateInputBatched(engine, gate_inp, hidden_dim)
+            else
+                canUseQwenSharedBatchedGemm(engine, gate_inp.info.type_);
+            if (!gate_supported) return false;
         }
     }
     return true;
+}
+
+fn canUseQwenRoutePackedPrefixMoeLayer(engine: *const InferenceEngine, lt: LayerTensors, hidden_dim: u32, inter_dim: u32) bool {
+    return canUseQwenRoutePackedPrefixMoeLayerWithSharedGateMode(engine, lt, hidden_dim, inter_dim, false);
 }
 
 fn canUseQwenRoutePackedPrefixRouter(engine: *const InferenceEngine, router_t: *const metal_loader.LoadedTensor, prompt_len: usize) bool {
@@ -8191,7 +8205,12 @@ fn canUseQwenRoutePackedPrefixAttentionLayer(engine: *const InferenceEngine, lay
     return canUseQwenRoutePackedPrefixRouter(engine, router_t, prompt_len);
 }
 
-fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx: usize, prompt_len: usize) bool {
+fn canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    prompt_len: usize,
+    allow_f32_shared_gate_input: bool,
+) bool {
     if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) return false;
     if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
     if (engine.config.architecture != .qwen2_moe or
@@ -8219,7 +8238,11 @@ fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx
     const ssm_out_t = lt.ssm_out orelse return false;
     if (ssm_out_t.info.type_ != .q8_0) return false;
     if (!canUseQwenRoutePackedPrefixRouter(engine, router_t, prompt_len)) return false;
-    return canUseQwenRoutePackedPrefixMoeLayer(engine, lt, engine.config.hidden_dim, inter_dim);
+    return canUseQwenRoutePackedPrefixMoeLayerWithSharedGateMode(engine, lt, engine.config.hidden_dim, inter_dim, allow_f32_shared_gate_input);
+}
+
+fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx: usize, prompt_len: usize) bool {
+    return canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(engine, layer_idx, prompt_len, false);
 }
 
 fn recordQwenSsmProjectionChunkOnCmd(
