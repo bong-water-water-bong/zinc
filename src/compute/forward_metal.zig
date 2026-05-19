@@ -2013,6 +2013,7 @@ pub const InferenceEngine = struct {
     qwen_moe_route_validate_routing_buf: MetalBuffer,
     qwen_moe_route_validate_gate_ref_buf: MetalBuffer,
     qwen_moe_route_validate_up_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_down_ref_buf: MetalBuffer,
     qwen_ssm_prefill_proj_norm_buf: MetalBuffer,
     qwen_ssm_prefill_proj_qkv_buf: MetalBuffer,
     qwen_ssm_prefill_proj_z_buf: MetalBuffer,
@@ -2151,6 +2152,7 @@ pub const InferenceEngine = struct {
         self.qwen_moe_route_validate_routing_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_gate_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_up_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_down_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_prefill_proj_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_prefill_proj_qkv_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_prefill_proj_z_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
@@ -2986,6 +2988,7 @@ pub const InferenceEngine = struct {
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_routing_buf);
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_gate_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_moe_route_validate_up_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_down_ref_buf);
         metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_norm_buf);
         metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_qkv_buf);
         metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_z_buf);
@@ -8496,6 +8499,7 @@ fn ensureQwenMoeRoutePackValidationBuffers(
     try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_routing_buf, n * k_usize * 2 * @sizeOf(u32));
     try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_gate_ref_buf, route_slots * m * @sizeOf(f32));
     try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_up_ref_buf, route_slots * m * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_down_ref_buf, route_slots * h * @sizeOf(f32));
 }
 
 fn logQwenMoeRoutePackValidationDiff(
@@ -8555,7 +8559,11 @@ fn logQwenMoeRoutePackValidationDiff(
 
 /// Default-off safety rail for the vLLM/llama.cpp expert-grouped MoE shape.
 /// Captures the first few Qwen3.6 layer-0 token routes from the current
-/// token-major path, then replays only the grouped route-pack gate/up DMMVs.
+/// token-major path, then replays the grouped route-pack gate/up, activation,
+/// down projection, and weighted unpermute. This mirrors vLLM's
+/// `moe_permute`/`moe_unpermute` flow and llama.cpp's `mul_mm_id` split
+/// between ID map creation and expert-major matrix work, but stays validation
+/// only until a real layer-major Qwen prefill path can feed multiple tokens.
 fn validateQwenMoeRoutePackChunk(
     engine: *InferenceEngine,
     profile: ?*RuntimeProfile,
@@ -8576,10 +8584,14 @@ fn validateQwenMoeRoutePackChunk(
     }
 
     const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
+    const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
     if (!supportsQwenMoeRoutePackCols(engine, gate_up_layout.gate_tensor.info.type_) or
         !supportsQwenMoeRoutePackCols(engine, gate_up_layout.up_tensor.info.type_) or
+        !supportsQwenMoeRoutePackCols(engine, down_exps.info.type_) or
         engine.moe_route_pack_pipe.handle == null or
-        engine.moe_route_gather_pipe.handle == null)
+        engine.moe_route_gather_pipe.handle == null or
+        engine.moe_route_scatter_pipe.handle == null or
+        engine.swiglu_batched_pipe.handle == null)
     {
         return;
     }
@@ -8615,12 +8627,17 @@ fn validateQwenMoeRoutePackChunk(
 
     const gate_ref_src: [*]const f32 = @ptrCast(@alignCast(engine.expert_gate_batch_buf.cpu_ptr.?));
     const up_ref_src: [*]const f32 = @ptrCast(@alignCast(engine.expert_up_batch_buf.cpu_ptr.?));
+    const down_ref_src: [*]const f32 = @ptrCast(@alignCast(engine.expert_down_batch_buf.cpu_ptr.?));
     const gate_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_gate_ref_buf.cpu_ptr.?));
     const up_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_up_ref_buf.cpu_ptr.?));
+    const down_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_down_ref_buf.cpu_ptr.?));
     const route_ref_offset = token_idx * route_slots_per_token * inter_n;
     const route_ref_len = route_slots_per_token * inter_n;
     @memcpy(gate_ref_dst[route_ref_offset .. route_ref_offset + route_ref_len], gate_ref_src[0..route_ref_len]);
     @memcpy(up_ref_dst[route_ref_offset .. route_ref_offset + route_ref_len], up_ref_src[0..route_ref_len]);
+    const down_ref_offset = token_idx * route_slots_per_token * hidden_n;
+    const down_ref_len = route_slots_per_token * hidden_n;
+    @memcpy(down_ref_dst[down_ref_offset .. down_ref_offset + down_ref_len], down_ref_src[0..down_ref_len]);
 
     engine.qwen_moe_route_validate_captured_tokens = @max(engine.qwen_moe_route_validate_captured_tokens, token_idx_u32 + 1);
     if (engine.qwen_moe_route_validate_captured_tokens < qwen_moe_route_pack_validate_tokens) return;
@@ -8640,6 +8657,12 @@ fn validateQwenMoeRoutePackChunk(
     defer metal_buffer.freeBuffer(&gate_candidate_buf);
     var up_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
     defer metal_buffer.freeBuffer(&up_candidate_buf);
+    var swiglu_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
+    defer metal_buffer.freeBuffer(&swiglu_candidate_buf);
+    var down_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * hidden_n * @sizeOf(f32), 4));
+    defer metal_buffer.freeBuffer(&down_candidate_buf);
+    var delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
+    defer metal_buffer.freeBuffer(&delta_candidate_buf);
 
     var cmd = try beginProfiledCommand(engine, profile);
     dispatchMoeRoutePackOnCmd(
@@ -8701,15 +8724,92 @@ fn validateQwenMoeRoutePackChunk(
         cfg.n_experts,
         n,
     );
+    cmd.barrier();
+    {
+        const swiglu_push = SwiGLUPush{ .n = inter_dim };
+        const sw_bufs = [_]*const MetalBuffer{ &gate_candidate_buf, &swiglu_candidate_buf, &up_candidate_buf };
+        cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, route_slots_u32, 1 }, .{ 64, 1, 1 }, &sw_bufs, &swiglu_push, @sizeOf(SwiGLUPush), 0);
+    }
+    cmd.barrier();
+    try dispatchDmmvMoeColsOnCmd(
+        engine,
+        &cmd,
+        down_exps,
+        &swiglu_candidate_buf,
+        &down_candidate_buf,
+        &counts_buf,
+        &packed_ids_buf,
+        hidden_dim,
+        inter_dim,
+        expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+        0,
+        0,
+        0,
+        n,
+        cfg.n_experts,
+        n,
+    );
+    cmd.barrier();
+    dispatchZeroF32OnCmd(engine, &cmd, &delta_candidate_buf, n * hidden_dim);
+    cmd.barrier();
+    dispatchMoeRouteScatterOnCmd(
+        engine,
+        &cmd,
+        &counts_buf,
+        &packed_ids_buf,
+        &engine.qwen_moe_route_validate_routing_buf,
+        &down_candidate_buf,
+        &delta_candidate_buf,
+        n,
+        hidden_dim,
+        cfg.n_experts,
+        k,
+        false,
+    );
     commitAndWaitProfiled(&cmd, profile);
 
     const total = route_slots * inter_n;
+    const down_total = route_slots * hidden_n;
+    const delta_total = n_usize * hidden_n;
     const gate_candidate: [*]const f32 = @ptrCast(@alignCast(gate_candidate_buf.cpu_ptr.?));
     const up_candidate: [*]const f32 = @ptrCast(@alignCast(up_candidate_buf.cpu_ptr.?));
+    const swiglu_candidate: [*]const f32 = @ptrCast(@alignCast(swiglu_candidate_buf.cpu_ptr.?));
+    const down_candidate: [*]const f32 = @ptrCast(@alignCast(down_candidate_buf.cpu_ptr.?));
+    const delta_candidate: [*]const f32 = @ptrCast(@alignCast(delta_candidate_buf.cpu_ptr.?));
     const gate_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_gate_ref_buf.cpu_ptr.?));
     const up_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_up_ref_buf.cpu_ptr.?));
+    const down_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_down_ref_buf.cpu_ptr.?));
     logQwenMoeRoutePackValidationDiff(layer_idx, "moe_gate_grouped_cols", gate_ref[0..total], gate_candidate[0..total], inter_dim, k, n, 5e-2);
     logQwenMoeRoutePackValidationDiff(layer_idx, "moe_up_grouped_cols", up_ref[0..total], up_candidate[0..total], inter_dim, k, n, 5e-2);
+
+    const allocator = engine.allocator;
+    const swiglu_ref = try allocator.alloc(f32, total);
+    defer allocator.free(swiglu_ref);
+    var route: usize = 0;
+    while (route < route_slots) : (route += 1) {
+        const off = route * inter_n;
+        cpuSwiGLU(gate_ref + off, up_ref + off, swiglu_ref.ptr + off, inter_dim);
+    }
+    logQwenMoeRoutePackValidationDiff(layer_idx, "moe_swiglu_grouped_cols", swiglu_ref[0..total], swiglu_candidate[0..total], inter_dim, k, n, 5e-2);
+    logQwenMoeRoutePackValidationDiff(layer_idx, "moe_down_grouped_cols", down_ref[0..down_total], down_candidate[0..down_total], hidden_dim, k, n, 5e-2);
+
+    const delta_ref = try allocator.alloc(f32, delta_total);
+    defer allocator.free(delta_ref);
+    @memset(delta_ref, 0);
+    const routing: [*]const u32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_routing_buf.cpu_ptr.?));
+    for (0..n_usize) |token| {
+        const row = routing[token * k_usize * 2 .. token * k_usize * 2 + k_usize * 2];
+        for (0..k_usize) |slot| {
+            const weight: f32 = @bitCast(row[k_usize + slot]);
+            const route_id = token * k_usize + slot;
+            const src = down_ref[route_id * hidden_n .. route_id * hidden_n + hidden_n];
+            const dst = delta_ref[token * hidden_n .. token * hidden_n + hidden_n];
+            for (0..hidden_n) |dim| {
+                dst[dim] += weight * src[dim];
+            }
+        }
+    }
+    logQwenMoeRoutePackValidationDiff(layer_idx, "moe_delta_grouped_scatter", delta_ref[0..delta_total], delta_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
 }
 
 fn logQwenPrefillValidationDiff(
