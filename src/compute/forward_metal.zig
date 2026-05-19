@@ -27,6 +27,7 @@ const log = std.log.scoped(.forward);
 /// from the device budget (see `memory_plan.autoContextTokensForDeviceBudget`)
 /// see this as a soft safety net rather than the primary limit.
 pub const runtime_context_cap: u32 = 262144;
+const queued_prefill_embed_tokens: usize = 256;
 
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
@@ -574,6 +575,8 @@ const CopyU32Push = extern struct {
 
 const CopyF32Push = extern struct {
     n: u32,
+    src_offset: u32,
+    dst_offset: u32,
 };
 
 const ZeroF32Push = extern struct {
@@ -1740,6 +1743,7 @@ pub const InferenceEngine = struct {
     logits_readback_buf: MetalBuffer,
     argmax_buf: MetalBuffer,
     embed_staging: MetalBuffer,
+    prefill_embed_buf: MetalBuffer,
     lm_head_private_buf: MetalBuffer,
     expert_ids_buf: MetalBuffer,
 
@@ -2077,6 +2081,7 @@ pub const InferenceEngine = struct {
             .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.argmax_buf = try metal_buffer.createBuffer(ctx, 2 * @sizeOf(u32));
         self.embed_staging = try metal_buffer.createBuffer(ctx, hidden_size);
+        self.prefill_embed_buf = try metal_buffer.createBuffer(ctx, hidden_size * queued_prefill_embed_tokens);
         self.lm_head_private_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.expert_ids_buf = try metal_buffer.createBuffer(ctx, expert_ids_size);
         {
@@ -2781,6 +2786,7 @@ pub const InferenceEngine = struct {
         add(rs, &self.logits_readback_buf);
         add(rs, &self.argmax_buf);
         add(rs, &self.embed_staging);
+        add(rs, &self.prefill_embed_buf);
         add(rs, &self.lm_head_private_buf);
         add(rs, &self.expert_ids_buf);
         add(rs, &self.expert_gate_batch_buf);
@@ -2849,6 +2855,7 @@ pub const InferenceEngine = struct {
         metal_buffer.freeBuffer(&self.logits_readback_buf);
         metal_buffer.freeBuffer(&self.argmax_buf);
         metal_buffer.freeBuffer(&self.embed_staging);
+        metal_buffer.freeBuffer(&self.prefill_embed_buf);
         metal_buffer.freeBuffer(&self.lm_head_private_buf);
         metal_buffer.freeBuffer(&self.expert_ids_buf);
         metal_buffer.freeBuffer(&self.expert_gate_batch_buf);
@@ -3148,10 +3155,64 @@ pub const InferenceEngine = struct {
             return error.KvStateNotAvailable;
         }
 
+        if (self.canUseQueuedTokenMajorPrefill(prompt_tokens.len)) {
+            return self.prefillBatchQueuedTokenMajor(state, prompt_tokens);
+        }
+
         for (prompt_tokens, 0..) |token_id, i| {
             try self.loadTokenEmbedding(token_id);
-            try runDecodeStep(self, i + 1 == prompt_tokens.len);
+            try runDecodeStep(self, i + 1 == prompt_tokens.len, null, 0, null);
         }
+        state.position = self.position;
+    }
+
+    fn canUseQueuedTokenMajorPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
+        if (prompt_len <= 1 or prompt_len > queued_prefill_embed_tokens) return false;
+        if (!self.private_decode_buffers) return false;
+        if (self.debug_validation_enabled or self.gemma_moe_validation_enabled or self.qwen_prefill_validation_enabled) return false;
+        if (self.config.n_experts == 0) return false;
+
+        const hidden_dim = self.config.hidden_dim;
+        const inter_dim: u32 = if (self.config.intermediate_dim > 0) self.config.intermediate_dim else hidden_dim * 4;
+        for (self.layer_tensors, 0..) |lt, layer_idx| {
+            if (canUseGpuRoutedBatchedMoe(self, lt)) continue;
+            if (canUseGpuRoutedGptOssMoe(self, lt, layer_idx, hidden_dim, inter_dim)) continue;
+            return false;
+        }
+        return true;
+    }
+
+    fn prefillBatchQueuedTokenMajor(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        // Mirror llama.cpp's Metal graph submission style: encode/commit the
+        // token-major prompt graph ahead of the CPU and synchronize only at the
+        // final prompt token. SSM recurrence and MoE routing stay byte-for-byte
+        // on the existing per-token path; only the per-token wait is removed.
+        const hidden_dim = self.config.hidden_dim;
+        const hidden_dim_usize: usize = @intCast(hidden_dim);
+        for (prompt_tokens, 0..) |token_id, i| {
+            try self.loadTokenEmbeddingInto(token_id, &self.prefill_embed_buf, i * hidden_dim_usize);
+        }
+
+        const pending_count = prompt_tokens.len - 1;
+        var pending = try self.allocator.alloc(MetalCommand, pending_count);
+        defer self.allocator.free(pending);
+        for (pending) |*cmd| {
+            cmd.* = .{
+                .handle = null,
+                .dispatch_count = 0,
+                .barrier_count = 0,
+                .barrier_enabled = false,
+            };
+        }
+        defer releaseCommands(pending);
+
+        for (prompt_tokens[0..pending_count], 0..) |_, i| {
+            const embed_offset: u32 = @intCast(i * hidden_dim_usize);
+            try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, &pending[i]);
+        }
+
+        const final_offset: u32 = @intCast(pending_count * hidden_dim_usize);
+        try runDecodeStep(self, true, &self.prefill_embed_buf, final_offset, null);
         state.position = self.position;
     }
 
@@ -3461,7 +3522,7 @@ pub const InferenceEngine = struct {
             state.position + 1;
         if (next_token_target > self.max_context_tokens) return error.ContextLengthExceeded;
         try self.loadTokenEmbedding(token_id);
-        try runDecodeStep(self, true);
+        try runDecodeStep(self, true, null, 0, null);
         state.position = self.position;
     }
 
@@ -3619,7 +3680,7 @@ pub const InferenceEngine = struct {
         }
     }
 
-    fn loadTokenEmbedding(self: *InferenceEngine, token_id: u32) !void {
+    fn loadTokenEmbeddingInto(self: *InferenceEngine, token_id: u32, dst_buf: *const MetalBuffer, dst_offset_f32: usize) !void {
         const embed_start = profileStart(self.profile_enabled);
         defer if (self.profile_enabled) {
             self.request_profile.embedding_ns += profileElapsedNs(embed_start);
@@ -3628,15 +3689,21 @@ pub const InferenceEngine = struct {
         const mmap = self.model.mmap_data orelse return error.NoMmapData;
         const embed_data_offset = self.model.gguf_file.tensor_data_offset + self.token_embed.info.offset;
         const embed_raw = mmap[embed_data_offset..];
-        const dst_buf = if (self.private_decode_buffers) &self.embed_staging else &self.hidden_buf;
         const hidden_ptr: [*]f32 = @ptrCast(@alignCast(dst_buf.cpu_ptr.?));
-        dequantRow(embed_raw, token_id, self.config.hidden_dim, self.token_embed.info.type_, hidden_ptr[0..self.config.hidden_dim]);
+        const hidden_dim_usize: usize = @intCast(self.config.hidden_dim);
+        const dst = hidden_ptr[dst_offset_f32 .. dst_offset_f32 + hidden_dim_usize];
+        dequantRow(embed_raw, token_id, self.config.hidden_dim, self.token_embed.info.type_, dst);
         // Gemma models scale embeddings by sqrt(hidden_dim). Keep parity when
         // config.architecture == .gemma.
         if (self.config.architecture == .gemma) {
             const scale = @as(f32, @floatCast(@sqrt(@as(f64, @floatFromInt(self.config.hidden_dim)))));
-            for (hidden_ptr[0..self.config.hidden_dim]) |*value| value.* *= scale;
+            for (dst) |*value| value.* *= scale;
         }
+    }
+
+    fn loadTokenEmbedding(self: *InferenceEngine, token_id: u32) !void {
+        const dst_buf = if (self.private_decode_buffers) &self.embed_staging else &self.hidden_buf;
+        try self.loadTokenEmbeddingInto(token_id, dst_buf, 0);
     }
 
     /// Get the DMMV pipeline, push constant buffer index, rows-per-workgroup, and block size.
@@ -4071,8 +4138,20 @@ fn dispatchCopyF32OnCmd(
     dst_buf: *const MetalBuffer,
     n: u32,
 ) void {
+    dispatchCopyF32OffsetOnCmd(engine, cmd, src_buf, dst_buf, n, 0, 0);
+}
+
+fn dispatchCopyF32OffsetOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    src_buf: *const MetalBuffer,
+    dst_buf: *const MetalBuffer,
+    n: u32,
+    src_offset: u32,
+    dst_offset: u32,
+) void {
     if (n == 0) return;
-    const push = CopyF32Push{ .n = n };
+    const push = CopyF32Push{ .n = n, .src_offset = src_offset, .dst_offset = dst_offset };
     const bufs = [_]*const MetalBuffer{ src_buf, dst_buf };
     cmd.dispatchV2(&engine.copy_f32_pipe, .{ (n + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(CopyF32Push), 2);
 }
@@ -9348,7 +9427,13 @@ fn submitPendingDenseCommand(
 // Decode step — runs all layers plus optional final norm + LM head.
 // ---------------------------------------------------------------------------
 
-fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
+fn runDecodeStep(
+    engine: *InferenceEngine,
+    emit_logits: bool,
+    embed_src_override: ?*const MetalBuffer,
+    embed_src_offset: u32,
+    async_out: ?*MetalCommand,
+) !void {
     const step_start = profileStart(engine.profile_enabled);
     defer if (engine.profile_enabled) {
         engine.request_profile.total_step_ns += profileElapsedNs(step_start);
@@ -9436,7 +9521,8 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
     } else null;
     if (engine.private_decode_buffers) {
         const cmd = shared_cmd orelse return error.PrivateDecodeFastPathRequiresSharedCommand;
-        dispatchCopyF32OnCmd(engine, cmd, &engine.embed_staging, &engine.hidden_buf, hidden_dim);
+        const embed_src = embed_src_override orelse &engine.embed_staging;
+        dispatchCopyF32OffsetOnCmd(engine, cmd, embed_src, &engine.hidden_buf, hidden_dim, embed_src_offset, 0);
         profileBarrier(cmd, profile, .embed);
     }
 
@@ -10374,7 +10460,20 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
 
     if (!emit_logits) {
         if (shared_cmd) |cmd| {
-            commitAndWaitProfiled(cmd, profile);
+            if (async_out) |out| {
+                commitAsyncProfiled(cmd, profile);
+                out.* = cmd.*;
+                cmd.* = .{
+                    .handle = null,
+                    .dispatch_count = 0,
+                    .barrier_count = 0,
+                    .barrier_enabled = false,
+                };
+            } else {
+                commitAndWaitProfiled(cmd, profile);
+            }
+        } else if (async_out != null) {
+            return error.QueuedPrefillRequiresSharedCommand;
         }
         waitPendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count, profile);
         engine.position += 1;
