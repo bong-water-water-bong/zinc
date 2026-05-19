@@ -38,7 +38,7 @@ PROMPT='Read the following engineering context and answer the final fragment wit
 
 ZINC_MODEL_ID=qwen36-35b-a3b-q4k-xl \
 ZINC_METRIC_MODE=prefill \
-ZINC_PROMPT_MODE=raw \
+ZINC_PROMPT_MODE=chat \
 ZINC_TEST_PROMPT="$PROMPT" \
 ZINC_MAX_TOKENS=16 \
 ZINC_TARGET_TOK_PER_SEC=120 \
@@ -59,6 +59,7 @@ For one-shot baseline only:
 ```bash
 ZINC_MODEL_ID=qwen36-35b-a3b-q4k-xl \
 ZINC_METRIC_MODE=prefill \
+ZINC_PROMPT_MODE=chat \
 ZINC_TEST_PROMPT="$PROMPT" \
 ZINC_MAX_TOKENS=16 \
 ZINC_BENCHMARK_RUNS=5 \
@@ -132,12 +133,14 @@ Stretch:
 This effort is scored on prefill throughput:
 
 - `ZINC_METRIC_MODE=prefill` is required.
-- Prompt should be at least 96 tokens.
+- Prompt should be at least 96 tokens after the chat template is applied.
 - `ZINC_MAX_TOKENS` should stay small, usually 8-16, because the measured
   work is prompt ingestion.
 - Use 5 timed samples with one warmup once the baseline is stable.
 - Do not accept a change based only on a single lucky sample.
-- Correctness gate remains the raw France prompt output containing `Paris`.
+- Correctness gate remains the France prompt output containing `Paris`. Use
+  chat mode so Qwen's template emits a closed think scaffold instead of making
+  the first 16 output tokens only a thinking marker.
 
 Keep rules:
 
