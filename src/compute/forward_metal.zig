@@ -3237,10 +3237,9 @@ pub const InferenceEngine = struct {
         for (prompt_tokens, 0..) |token_id, i| {
             try self.loadTokenEmbeddingInto(token_id, &self.prefill_embed_buf, i * hidden_dim_usize);
         }
-        try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len);
-
-        const pending_count = prompt_tokens.len - 1;
-        var pending = try self.allocator.alloc(MetalCommand, pending_count);
+        const pending_token_count = prompt_tokens.len - 1;
+        const pending_capacity = pending_token_count + 1;
+        var pending = try self.allocator.alloc(MetalCommand, pending_capacity);
         defer self.allocator.free(pending);
         for (pending) |*cmd| {
             cmd.* = .{
@@ -3252,12 +3251,18 @@ pub const InferenceEngine = struct {
         }
         defer releaseCommands(pending);
 
-        for (prompt_tokens[0..pending_count], 0..) |_, i| {
-            const embed_offset: u32 = @intCast(i * hidden_dim_usize);
-            try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, &pending[i]);
+        var pending_count: usize = 0;
+        if (try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &pending[pending_count])) {
+            pending_count += 1;
         }
 
-        const final_offset: u32 = @intCast(pending_count * hidden_dim_usize);
+        for (prompt_tokens[0..pending_token_count], 0..) |_, i| {
+            const embed_offset: u32 = @intCast(i * hidden_dim_usize);
+            try runDecodeStep(self, false, &self.prefill_embed_buf, embed_offset, &pending[pending_count]);
+            pending_count += 1;
+        }
+
+        const final_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
         try runDecodeStep(self, true, &self.prefill_embed_buf, final_offset, null);
         state.position = self.position;
     }
@@ -7971,9 +7976,9 @@ fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_le
         beta_t.info.type_ == .q8_0;
 }
 
-fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: usize) !void {
+fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: usize, async_out: ?*MetalCommand) !bool {
     engine.qwen_ssm_prefill_proj_active_tokens = 0;
-    if (!canUseQwenSsmPrefillProjectionChunk(engine, prompt_len)) return;
+    if (!canUseQwenSsmPrefillProjectionChunk(engine, prompt_len)) return false;
 
     const cfg = engine.config;
     const hidden_dim = cfg.hidden_dim;
@@ -7996,12 +8001,24 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     dispatchGemmQ8_0OnCmd(engine, &cmd, alpha_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_alpha_buf, dt_rank, hidden_dim, n_tokens);
     dispatchGemmQ8_0OnCmd(engine, &cmd, beta_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_beta_buf, dt_rank, hidden_dim, n_tokens);
     profileBarrier(&cmd, profile, .ssm);
-    commitAndWaitProfiled(&cmd, profile);
+    if (async_out) |out| {
+        commitAsyncProfiled(&cmd, profile);
+        out.* = cmd;
+        cmd = .{
+            .handle = null,
+            .dispatch_count = 0,
+            .barrier_count = 0,
+            .barrier_enabled = false,
+        };
+    } else {
+        commitAndWaitProfiled(&cmd, profile);
+    }
 
     engine.qwen_ssm_prefill_proj_active_tokens = n_tokens;
     if (engine.profile_enabled) {
-        log.info("Metal profile: Qwen SSM prefill projection chunk active layer=0 tokens={d}", .{n_tokens});
+        log.info("Metal profile: Qwen SSM prefill projection chunk active layer=0 tokens={d} async={}", .{ n_tokens, async_out != null });
     }
+    return true;
 }
 
 fn shouldUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, layer_idx: usize) bool {
