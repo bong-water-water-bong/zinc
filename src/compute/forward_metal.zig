@@ -1121,6 +1121,16 @@ const SsmConv1dPush = extern struct {
     input_offset: u32,
 };
 
+/// Push constants for layer-major prompt SSM conv1d.
+const SsmConv1dPrefillPush = extern struct {
+    conv_channels: u32,
+    d_conv: u32,
+    n_tokens: u32,
+    input_stride: u32,
+    input_offset: u32,
+    output_offset: u32,
+};
+
 /// Push constants for SSM delta-net state update dispatch (SPIRV-Cross: buffer(0)).
 const SsmDeltaNetPush = extern struct {
     d_inner: u32,
@@ -1135,6 +1145,21 @@ const SsmDeltaNetPush = extern struct {
     alpha_offset: u32,
     beta_offset: u32,
     output_offset: u32,
+};
+
+/// Push constants for SSM delta-net with an explicit conv-output row offset.
+const SsmDeltaNetOffsetPush = extern struct {
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    has_dt_bias: u32,
+    has_ssm_a: u32,
+    alpha_offset: u32,
+    beta_offset: u32,
+    output_offset: u32,
+    conv_offset: u32,
 };
 
 /// Push constants for SSM gated norm dispatch (SPIRV-Cross: buffer(0)).
@@ -2055,7 +2080,9 @@ pub const InferenceEngine = struct {
 
     // SSM GPU pipelines (cross-compiled from GLSL via SPIRV-Cross)
     ssm_conv1d_pipe: MetalPipeline,
+    ssm_conv1d_prefill_pipe: MetalPipeline,
     ssm_delta_net_pipe: MetalPipeline,
+    ssm_delta_net_offset_pipe: MetalPipeline,
     ssm_gated_norm_pipe: MetalPipeline,
 
     // SSM state (Metal buffers — GPU-resident, persistent across tokens)
@@ -2612,7 +2639,9 @@ pub const InferenceEngine = struct {
 
         // SSM GPU pipelines
         self.ssm_conv1d_pipe = try loadShaderPipeline(ctx, "ssm_conv1d");
+        self.ssm_conv1d_prefill_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill");
         self.ssm_delta_net_pipe = try loadShaderPipeline(ctx, "ssm_delta_net");
+        self.ssm_delta_net_offset_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_offset");
         self.ssm_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_gated_norm");
 
         // SSM state + constants as Metal buffers (GPU-resident via UMA)
@@ -3257,7 +3286,9 @@ pub const InferenceEngine = struct {
         self.allocator.free(self.layer_tensors);
 
         metal_pipeline.freePipeline(&self.ssm_conv1d_pipe);
+        metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_pipe);
+        metal_pipeline.freePipeline(&self.ssm_delta_net_offset_pipe);
         metal_pipeline.freePipeline(&self.ssm_gated_norm_pipe);
 
         if (self.ssm_conv_state_bufs) |bufs| {
@@ -7147,6 +7178,32 @@ fn dispatchSsmConv1dOffsetWithPipe(
     cmd.dispatchV2(pipe, .{ (conv_channels + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmConv1dPush), 0);
 }
 
+fn dispatchSsmConv1dPrefillOnCmd(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    kernel: *const MetalBuffer,
+    state: *const MetalBuffer,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    conv_channels: u32,
+    d_conv: u32,
+    n_tokens: u32,
+    input_stride: u32,
+    input_offset: u32,
+    output_offset: u32,
+) void {
+    const push = SsmConv1dPrefillPush{
+        .conv_channels = conv_channels,
+        .d_conv = d_conv,
+        .n_tokens = n_tokens,
+        .input_stride = input_stride,
+        .input_offset = input_offset,
+        .output_offset = output_offset,
+    };
+    const bufs = [_]*const MetalBuffer{ kernel, state, input, output };
+    cmd.dispatchV2(pipe, .{ (conv_channels + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmConv1dPrefillPush), 0);
+}
+
 fn dispatchSsmGatedNormWithPipe(
     cmd: *MetalCommand,
     pipe: *const MetalPipeline,
@@ -7896,6 +7953,14 @@ fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx
         return false;
     }
     if (!canUseQwenSsmBatchedProjectionLayer(engine, layer_idx)) return false;
+    if (engine.ssm_conv1d_prefill_pipe.handle == null or
+        engine.ssm_delta_net_offset_pipe.handle == null or
+        engine.config.ssm_d_conv > 8 or
+        engine.config.ssm_d_state > 128 or
+        engine.config.ssm_d_inner / @max(engine.config.ssm_dt_rank, 1) > 128)
+    {
+        return false;
+    }
 
     const lt = engine.layer_tensors[layer_idx];
     const inter_dim: u32 = if (engine.config.intermediate_dim > 0) engine.config.intermediate_dim else engine.config.hidden_dim * 4;
@@ -8110,6 +8175,22 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
     // recurrence token-ordered, but batch this layer's Q8 input projections,
     // SSM-out projection, and route-packed MoE over the full prompt slice.
     try recordQwenSsmProjectionChunkOnCmd(engine, cmd, profile, layer_idx, &scratch.hidden, hidden_dim, d_inner, dt_rank, conv_channels, n_tokens);
+    dispatchSsmConv1dPrefillOnCmd(
+        cmd,
+        &engine.ssm_conv1d_prefill_pipe,
+        &engine.ssm_conv_kernel_bufs.?[layer_idx],
+        &engine.ssm_conv_state_bufs.?[layer_idx],
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        conv_channels,
+        d_conv,
+        n_tokens,
+        conv_channels,
+        0,
+        0,
+    );
+    if (profile) |p| p.ssm_conv_calls += n_tokens;
+    profileBarrier(cmd, profile, .ssm);
 
     const d_inner_usize: usize = @intCast(d_inner);
     const conv_channels_usize: usize = @intCast(conv_channels);
@@ -8122,23 +8203,6 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
         const token_conv_offset: u32 = @intCast(i * conv_channels_usize);
         const token_dt_offset: u32 = @intCast(i * dt_rank_usize);
         engine.position = token_index;
-
-        // Keep Qwen's SSM recurrence token ordered while reading the batched
-        // projection rows directly, avoiding per-token qkv/z/alpha/beta copies.
-        dispatchSsmConv1dOffsetWithPipe(
-            cmd,
-            &engine.ssm_conv1d_pipe,
-            &engine.ssm_conv_kernel_bufs.?[layer_idx],
-            &engine.ssm_conv_state_bufs.?[layer_idx],
-            &engine.qwen_ssm_prefill_proj_qkv_buf,
-            &engine.swiglu_buf,
-            conv_channels,
-            d_conv,
-            false,
-            token_conv_offset,
-        );
-        if (profile) |p| p.ssm_conv_calls += 1;
-        profileBarrier(cmd, profile, .ssm);
 
         if (!alpha_batched or !beta_batched) {
             const token_hidden_offset: u32 = @intCast(i * hidden_dim_usize);
@@ -8156,38 +8220,36 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
         {
             const alpha_buf: *const MetalBuffer = if (alpha_batched) &engine.qwen_ssm_prefill_proj_alpha_buf else &engine.router_logits_buf;
             const beta_buf: *const MetalBuffer = if (beta_batched) &engine.qwen_ssm_prefill_proj_beta_buf else &engine.down_buf;
-            const push = SsmDeltaNetPush{
+            const push = SsmDeltaNetOffsetPush{
                 .d_inner = d_inner,
                 .dt_rank = dt_rank,
                 .head_v_dim = head_v_dim,
                 .d_state = d_state,
                 .n_group = n_group,
-                .ssm_a_is_f16 = 0,
-                .dt_bias_is_f16 = 0,
                 .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
                 .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
                 .alpha_offset = if (alpha_batched) token_dt_offset else 0,
                 .beta_offset = if (beta_batched) token_dt_offset else 0,
                 .output_offset = token_ssm_offset,
+                .conv_offset = token_conv_offset,
             };
             const dn_bufs = [_]*const MetalBuffer{
-                &engine.swiglu_buf,                    alpha_buf,
+                &engine.qwen_ssm_prefill_proj_qkv_buf, alpha_buf,
                 &engine.ssm_dt_bias_bufs.?[layer_idx], &engine.ssm_a_bufs.?[layer_idx],
                 beta_buf,                              &engine.ssm_state_bufs.?[layer_idx],
                 &scratch.attn_out,
             };
-            cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
+            cmd.dispatchV2(&engine.ssm_delta_net_offset_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetOffsetPush), 0);
             if (profile) |p| p.ssm_delta_calls += 1;
         }
+        profileBarrier(cmd, profile, .ssm);
     }
 
     // Adapt llama.cpp's Metal encoder barrier discipline
     // (`ggml_metal_encoder_memory_barrier`): the token-ordered delta kernels
     // write independent rows in scratch.attn_out, but nothing reads those rows
-    // until the batched gated norm below. The per-token conv barrier before
-    // each following delta is enough to make the recurrent SSM state visible,
-    // so one barrier here replaces N post-delta barriers for this prefix layer.
-    profileBarrier(cmd, profile, .ssm);
+    // until the batched gated norm below. The delta barrier in the token loop
+    // is for the recurrent SSM state; the final iteration also orders this read.
 
     dispatchSsmGatedNormBatchedOffsetsWithPipe(
         cmd,
@@ -14755,6 +14817,118 @@ test "ssm_delta_net shader matches CPU reference" {
     }
 }
 
+test "ssm_delta_net_offset shader matches CPU reference with row offsets" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_delta_net_offset");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const dt_rank: u32 = 2;
+    const head_v_dim: u32 = 4;
+    const d_state: u32 = 2;
+    const n_group: u32 = 1;
+    const d_inner: u32 = dt_rank * head_v_dim;
+    const qk_dim: u32 = d_state * n_group;
+    const conv_len: u32 = 2 * qk_dim + d_inner;
+    const state_len: u32 = dt_rank * head_v_dim * head_v_dim;
+
+    var conv_buf = try metal_buffer.createBuffer(ctx, 2 * conv_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&conv_buf);
+    var alpha_buf = try metal_buffer.createBuffer(ctx, 2 * dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&alpha_buf);
+    var dt_bias_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dt_bias_buf);
+    var ssm_a_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&ssm_a_buf);
+    var beta_buf = try metal_buffer.createBuffer(ctx, 2 * dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&beta_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, 2 * d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const conv_ptr: [*]f32 = @ptrCast(@alignCast(conv_buf.cpu_ptr.?));
+    const alpha_ptr: [*]f32 = @ptrCast(@alignCast(alpha_buf.cpu_ptr.?));
+    const dt_bias_ptr: [*]f32 = @ptrCast(@alignCast(dt_bias_buf.cpu_ptr.?));
+    const ssm_a_ptr: [*]f32 = @ptrCast(@alignCast(ssm_a_buf.cpu_ptr.?));
+    const beta_ptr: [*]f32 = @ptrCast(@alignCast(beta_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    @memset(conv_ptr[0 .. 2 * conv_len], 0.125);
+    const conv_init = [_]f32{ 3.0, 4.0, 4.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.5, -1.0, 2.0, -2.0 };
+    @memcpy(conv_ptr[conv_len .. 2 * conv_len], conv_init[0..conv_len]);
+    alpha_ptr[0] = 9.0;
+    alpha_ptr[1] = 9.0;
+    alpha_ptr[2] = 0.1;
+    alpha_ptr[3] = -0.2;
+    dt_bias_ptr[0] = 0.3;
+    dt_bias_ptr[1] = -0.1;
+    ssm_a_ptr[0] = 0.5;
+    ssm_a_ptr[1] = -0.75;
+    beta_ptr[0] = 9.0;
+    beta_ptr[1] = 9.0;
+    beta_ptr[2] = 0.25;
+    beta_ptr[3] = -0.5;
+    for (0..state_len) |i| {
+        state_ptr[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.1;
+    }
+    @memset(output_ptr[0 .. 2 * d_inner], 0);
+
+    var ref_state: [32]f32 = undefined;
+    var ref_output: [8]f32 = [_]f32{0} ** 8;
+    @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
+    refRunSsmDeltaNet(
+        conv_ptr[conv_len .. 2 * conv_len],
+        alpha_ptr[dt_rank .. 2 * dt_rank],
+        dt_bias_ptr[0..dt_rank],
+        beta_ptr[dt_rank .. 2 * dt_rank],
+        ssm_a_ptr[0..dt_rank],
+        ref_state[0..state_len],
+        ref_output[0..d_inner],
+        dt_rank,
+        head_v_dim,
+        d_state,
+        n_group,
+    );
+
+    const push = SsmDeltaNetOffsetPush{
+        .d_inner = d_inner,
+        .dt_rank = dt_rank,
+        .head_v_dim = head_v_dim,
+        .d_state = d_state,
+        .n_group = n_group,
+        .has_dt_bias = 1,
+        .has_ssm_a = 1,
+        .alpha_offset = dt_rank,
+        .beta_offset = dt_rank,
+        .output_offset = d_inner,
+        .conv_offset = conv_len,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &conv_buf,
+        &alpha_buf,
+        &dt_bias_buf,
+        &ssm_a_buf,
+        &beta_buf,
+        &state_buf,
+        &output_buf,
+    };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetOffsetPush), 0);
+    cmd.commitAndWait();
+
+    for (0..d_inner) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[d_inner + i], 0.0005);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.0005);
+    }
+}
+
 test "ssm_conv1d shader matches CPU reference" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -14828,6 +15002,96 @@ test "ssm_conv1d shader matches CPU reference" {
     cmd.commitAndWait();
 
     for (0..conv_channels) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.0005);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.0005);
+    }
+}
+
+test "ssm_conv1d_prefill shader matches repeated CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const conv_channels: usize = 5;
+    const d_conv: usize = 4;
+    const n_tokens: usize = 3;
+    const state_len: usize = (d_conv - 1) * conv_channels;
+    const kernel_len: usize = conv_channels * d_conv;
+
+    var kernel_buf = try metal_buffer.createBuffer(ctx, kernel_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&kernel_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_tokens * conv_channels * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_tokens * conv_channels * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const kernel_ptr: [*]f32 = @ptrCast(@alignCast(kernel_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    const kernel_init = [_]f32{
+        0.25,  -0.50, 0.75,  1.00,
+        -1.25, 0.50,  -0.25, 0.80,
+        0.10,  0.20,  0.30,  0.40,
+        -0.60, 0.90,  -1.10, 0.70,
+        1.20,  -0.70, 0.50,  -0.30,
+    };
+    const state_init = [_]f32{
+        -0.40, 0.25,  1.10, -0.75, 0.60,
+        0.50,  -0.20, 0.35, 0.90,  -1.25,
+        1.40,  -0.80, 0.15, -0.45, 0.95,
+    };
+    const input_init = [_]f32{
+        0.80,  -1.50, 0.45,  1.25,  -0.65,
+        0.20,  0.30,  -0.70, 0.55,  1.10,
+        -0.40, 1.20,  0.90,  -1.30, 0.15,
+    };
+
+    @memcpy(kernel_ptr[0..kernel_len], kernel_init[0..kernel_len]);
+    @memcpy(state_ptr[0..state_len], state_init[0..state_len]);
+    @memcpy(input_ptr[0 .. n_tokens * conv_channels], input_init[0 .. n_tokens * conv_channels]);
+    @memset(output_ptr[0 .. n_tokens * conv_channels], 0);
+
+    var ref_state: [state_len]f32 = undefined;
+    var ref_output: [n_tokens * conv_channels]f32 = [_]f32{0} ** (n_tokens * conv_channels);
+    @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
+    for (0..n_tokens) |t| {
+        refRunSsmConv1d(
+            input_ptr[t * conv_channels .. (t + 1) * conv_channels],
+            kernel_ptr[0..kernel_len],
+            ref_state[0..state_len],
+            ref_output[t * conv_channels .. (t + 1) * conv_channels],
+            conv_channels,
+            d_conv,
+        );
+    }
+
+    var cmd = try metal_command.beginCommand(ctx);
+    dispatchSsmConv1dPrefillOnCmd(
+        &cmd,
+        &pipe,
+        &kernel_buf,
+        &state_buf,
+        &input_buf,
+        &output_buf,
+        @intCast(conv_channels),
+        @intCast(d_conv),
+        @intCast(n_tokens),
+        @intCast(conv_channels),
+        0,
+        0,
+    );
+    cmd.commitAndWait();
+
+    for (0..n_tokens * conv_channels) |i| {
         try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.0005);
     }
     for (0..state_len) |i| {
