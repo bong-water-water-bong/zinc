@@ -416,7 +416,7 @@ Resizable BAR is worth treating as mandatory for benchmark nodes. Intel's suppor
 | DMMV Q4_K/Q5_K/Q6_K/Q8_0 | Specialize for subgroup 32 first. Compare local sizes 32, 64, and 128. Keep one output row per subgroup until profiling says otherwise. |
 | Dequant/unpack | Use vectorized packed loads and bitfield ops. Keep scale/min metadata contiguous. Avoid scattered per-lane byte reads. |
 | RMS norm / reductions | Use subgroup reductions for the first reduction stage; spill to SLM only when reducing across multiple subgroups. |
-| Flash attention | Use 16/32 subgroup reductions and SLM tiles. Tune tile width against SLM residency and L3 hit rate. |
+| Flash attention | Use 16/32 subgroup reductions and SLM tiles. Tune tile width against SLM residency and L2 hit rate. |
 | MoE routing | Router logits are small; avoid global atomics. CPU top-k may be acceptable until GPU routing is measured. |
 | Batched prefill | Prototype cooperative matrix only after scalar/subgroup path is coherent. Query matrix tile shapes instead of assuming RDNA's 16x16x16 path. |
 | KV cache | Align pages and rows to cache-friendly boundaries. For B570/B580, cap context before temp buffers push the card into memory pressure. |
@@ -435,7 +435,7 @@ For B65/B70 specifically, compare:
 
 1. 8B decode, to validate DMMV against B580/B60-class cards.
 2. 27B/35B fit and decode, to prove the 32 GB cards are buying usable capacity.
-3. long-context attention, to see whether L3/SLM tuning or KV bandwidth dominates.
+3. long-context attention, to see whether L2/SLM tuning or KV bandwidth dominates.
 4. batched prefill with and without cooperative matrix, if the driver exposes it.
 
 ## Card-By-Card Engineering Summary
