@@ -117,6 +117,12 @@ const ProfilePhase = enum(u8) {
     flash_attn_kernel,
     ssm,
     ssm_proj,
+    ssm_proj_norm_ab,
+    ssm_proj_qkv,
+    ssm_proj_z,
+    ssm_proj_alpha,
+    ssm_proj_beta,
+    ssm_proj_qkv_z,
     ssm_conv,
     ssm_delta,
     ssm_gated_norm,
@@ -163,6 +169,12 @@ const ProfilePhase = enum(u8) {
             .flash_attn_kernel => "flash_attn",
             .ssm => "ssm",
             .ssm_proj => "ssm_proj",
+            .ssm_proj_norm_ab => "ssm_proj_norm_ab",
+            .ssm_proj_qkv => "ssm_proj_qkv",
+            .ssm_proj_z => "ssm_proj_z",
+            .ssm_proj_alpha => "ssm_proj_alpha",
+            .ssm_proj_beta => "ssm_proj_beta",
+            .ssm_proj_qkv_z => "ssm_proj_qkv_z",
             .ssm_conv => "ssm_conv",
             .ssm_delta => "ssm_delta",
             .ssm_gated_norm => "ssm_gnorm",
@@ -10897,6 +10909,7 @@ pub const InferenceEngine = struct {
             // merged) +1 dispatch (no standalone rms_norm) +1 barrier
             // (no rms_norm → SSM proj fence) per SSM layer.
             const attn_norm = lt.attn_norm orelse return error.TensorNotFound;
+            const ssm_proj_norm_ab_phase = self.beginProfilePhase();
             try self.dispatchRmsNormDmmvQ4kAlphaBeta(
                 self.hidden_buf.handle,
                 hidden_size,
@@ -10916,6 +10929,7 @@ pub const InferenceEngine = struct {
                 hidden_dim,
                 self.model.config.rms_norm_eps,
             );
+            self.endProfilePhase(.ssm_proj_norm_ab, ssm_proj_norm_ab_phase);
             // Barrier: wqkv/z DMMVs only read norm_buf (the fused shader's
             // single-writer WG-0 output). The alpha/beta outputs go to
             // router_logits_buf / down_buf, which are explicitly resynced
@@ -10939,7 +10953,9 @@ pub const InferenceEngine = struct {
                         .dstOffset = 0,
                         .size = qkv_bytes,
                     };
+                    const ssm_proj_qkv_phase = self.beginProfilePhase();
                     vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_qkv.?, self.attn_out_buf.handle, 1, &qkv_copy);
+                    self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 }
                 if (use_prebatched_z and !is_dead_tail) {
                     const z_src_off: vk.c.VkDeviceSize =
@@ -10950,17 +10966,24 @@ pub const InferenceEngine = struct {
                         .dstOffset = 0,
                         .size = z_bytes,
                     };
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_z.?, self.gate_buf.handle, 1, &z_copy);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
                 self.decode_cmd.transferToComputeBarrier();
                 if (!use_prebatched_qkv) {
+                    const ssm_proj_qkv_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 }
                 if (!is_dead_tail and !use_prebatched_z) {
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
             } else if (can_fuse_qkv_z) {
                 self.decode_cmd.computeBufferBarrier(self.norm_buf.handle, hidden_size);
+                const ssm_proj_qkv_z_phase = self.beginProfilePhase();
                 try self.dispatchDmmvQ8_0FusedPair(
                     wqkv_tensor,
                     z_tensor,
@@ -10974,11 +10997,16 @@ pub const InferenceEngine = struct {
                     @intCast(d_inner),
                     hidden_dim,
                 );
+                self.endProfilePhase(.ssm_proj_qkv_z, ssm_proj_qkv_z_phase);
             } else {
                 self.decode_cmd.computeBufferBarrier(self.norm_buf.handle, hidden_size);
+                const ssm_proj_qkv_phase = self.beginProfilePhase();
                 try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 if (!is_dead_tail) {
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
             }
             // alpha + beta already produced by the fused shader.
@@ -10998,7 +11026,9 @@ pub const InferenceEngine = struct {
                         .dstOffset = 0,
                         .size = qkv_bytes,
                     };
+                    const ssm_proj_qkv_phase = self.beginProfilePhase();
                     vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_qkv.?, self.attn_out_buf.handle, 1, &qkv_copy);
+                    self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 }
                 if (use_prebatched_z and !is_dead_tail) {
                     const z_src_off: vk.c.VkDeviceSize =
@@ -11009,16 +11039,23 @@ pub const InferenceEngine = struct {
                         .dstOffset = 0,
                         .size = z_bytes,
                     };
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.partial_ssm_preproj_z.?, self.gate_buf.handle, 1, &z_copy);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
                 self.decode_cmd.transferToComputeBarrier();
                 if (!use_prebatched_qkv) {
+                    const ssm_proj_qkv_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 }
                 if (!is_dead_tail and !use_prebatched_z) {
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
             } else if (can_fuse_qkv_z) {
+                const ssm_proj_qkv_z_phase = self.beginProfilePhase();
                 try self.dispatchDmmvQ8_0FusedPair(
                     wqkv_tensor,
                     z_tensor,
@@ -11032,17 +11069,26 @@ pub const InferenceEngine = struct {
                     @intCast(d_inner),
                     hidden_dim,
                 );
+                self.endProfilePhase(.ssm_proj_qkv_z, ssm_proj_qkv_z_phase);
             } else {
+                const ssm_proj_qkv_phase = self.beginProfilePhase();
                 try self.dispatchDmmv(wqkv_tensor, self.norm_buf, hidden_size, self.attn_out_buf, @intCast(conv_channels), hidden_dim);
+                self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
                 // Skip z (gate) DMMV in dead-tail: gate_buf is only consumed by
                 // gated_norm, which is also skipped below. wqkv/alpha/beta still
                 // run because conv1d/delta_net update SSM state for future tokens.
                 if (!is_dead_tail) {
+                    const ssm_proj_z_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(z_tensor, self.norm_buf, hidden_size, self.gate_buf, @intCast(d_inner), hidden_dim);
+                    self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
                 }
             }
+            const ssm_proj_alpha_phase = self.beginProfilePhase();
             try self.dispatchDmmv(alpha_tensor, self.norm_buf, hidden_size, self.router_logits_buf, dt_rank, hidden_dim);
+            self.endProfilePhase(.ssm_proj_alpha, ssm_proj_alpha_phase);
+            const ssm_proj_beta_phase = self.beginProfilePhase();
             try self.dispatchDmmv(beta_tensor, self.norm_buf, hidden_size, self.down_buf, dt_rank, hidden_dim);
+            self.endProfilePhase(.ssm_proj_beta, ssm_proj_beta_phase);
             // Note: tried fusing alpha+beta into one fused-gate-up dispatch
             // (commit considered but reverted) — no measurable change because
             // the four SSM proj DMMVs already overlap on RDNA4. See
@@ -11600,6 +11646,21 @@ pub const InferenceEngine = struct {
         self.prefill_submit_wait_ns = 0;
         self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
         self.prefill_gpu_total_ns = 0;
+        const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
+        const want_gpu_phases = profile_env != null and profile_env.?.len > 0 and !std.mem.eql(u8, profile_env.?, "0");
+        const profile_was_enabled = self.profile_enabled;
+        const enable_gpu_phase_timing = self.timestamp_query_pool != null and want_gpu_phases;
+        if (enable_gpu_phase_timing) self.profile_enabled = true;
+        defer {
+            if (enable_gpu_phase_timing) {
+                for (0..profile_phase_count) |p| {
+                    self.prefill_gpu_phase_ns[p] = self.profile_total_counters.gpu_phase_ns[p];
+                }
+                self.prefill_gpu_total_ns = @intFromFloat(@max(self.profile_total_gpu_ms * 1_000_000.0, 0.0));
+                self.resetProfilingSamples();
+                self.profile_enabled = profile_was_enabled;
+            }
+        }
         self.prefill_active = true;
         defer self.prefill_active = false;
 
@@ -11743,7 +11804,11 @@ pub const InferenceEngine = struct {
             if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
             try self.decode_cmd.reset();
             try self.decode_cmd.beginOneTime();
+            self.resetTimestamps();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
             self.decode_cmd.transferToComputeBarrier();
+            const dense_ffn_phase = self.beginProfilePhase();
+            const dense_ffn_gateup_phase = self.beginProfilePhase();
             try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
             try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
             self.decode_cmd.computeBarrier();
@@ -11757,6 +11822,8 @@ pub const InferenceEngine = struct {
                 n_tokens * inter_dim,
             );
             self.decode_cmd.computeBarrier();
+            self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
+            const dense_ffn_down_phase = self.beginProfilePhase();
             try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
             self.decode_cmd.computeBarrier();
             try self.dispatchScaleAcc(
@@ -11767,6 +11834,8 @@ pub const InferenceEngine = struct {
                 n_tokens * hidden_dim,
                 1.0,
             );
+            self.endProfilePhase(.dense_ffn_down, dense_ffn_down_phase);
+            self.endProfilePhase(.dense_ffn, dense_ffn_phase);
             const layer_output_scale = self.layer_output_scales[layer];
             if (layer_output_scale != 1.0) {
                 self.decode_cmd.computeBarrier();
@@ -11778,8 +11847,10 @@ pub const InferenceEngine = struct {
                 );
             }
             self.decode_cmd.computeToTransferBarrier();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
             try self.decode_cmd.end();
             try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+            self.recordProfilingSample();
         }
 
         self.partial_decode_stop_after_ffn_norm = false;
@@ -13705,14 +13776,26 @@ pub fn generate(
                 },
             );
             const ssm_proj_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj)];
+            const ssm_proj_norm_ab_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_norm_ab)];
+            const ssm_proj_qkv_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_qkv)];
+            const ssm_proj_z_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_z)];
+            const ssm_proj_alpha_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_alpha)];
+            const ssm_proj_beta_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_beta)];
+            const ssm_proj_qkv_z_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_qkv_z)];
             const ssm_conv_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_conv)];
             const ssm_delta_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_delta)];
             const ssm_gnorm_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_gated_norm)];
             const ssm_out_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_out)];
             log.info(
-                "Prefill SSM subphases totals: proj={d:.1} conv={d:.1} delta={d:.1} gnorm={d:.1} out={d:.1} ms",
+                "Prefill SSM subphases totals: proj={d:.1} norm_ab={d:.1} qkv={d:.1} z={d:.1} alpha={d:.1} beta={d:.1} qkv_z={d:.1} conv={d:.1} delta={d:.1} gnorm={d:.1} out={d:.1} ms",
                 .{
                     to_ms(ssm_proj_ns),
+                    to_ms(ssm_proj_norm_ab_ns),
+                    to_ms(ssm_proj_qkv_ns),
+                    to_ms(ssm_proj_z_ns),
+                    to_ms(ssm_proj_alpha_ns),
+                    to_ms(ssm_proj_beta_ns),
+                    to_ms(ssm_proj_qkv_z_ns),
                     to_ms(ssm_conv_ns),
                     to_ms(ssm_delta_ns),
                     to_ms(ssm_gnorm_ns),
@@ -13849,8 +13932,14 @@ pub fn generate(
                 avg_dense_ffn_phase_ms,
                 avg_tail_phase_ms,
             });
-            log.info("PROFILE: avg SSM subphases proj={d:.2} ms conv={d:.2} ms delta={d:.2} ms gnorm={d:.2} ms out={d:.2} ms", .{
+            log.info("PROFILE: avg SSM subphases proj={d:.2} ms norm_ab={d:.2} ms qkv={d:.2} ms z={d:.2} ms alpha={d:.2} ms beta={d:.2} ms qkv_z={d:.2} ms conv={d:.2} ms delta={d:.2} ms gnorm={d:.2} ms out={d:.2} ms", .{
                 engine.avgProfilePhaseMs(.ssm_proj),
+                engine.avgProfilePhaseMs(.ssm_proj_norm_ab),
+                engine.avgProfilePhaseMs(.ssm_proj_qkv),
+                engine.avgProfilePhaseMs(.ssm_proj_z),
+                engine.avgProfilePhaseMs(.ssm_proj_alpha),
+                engine.avgProfilePhaseMs(.ssm_proj_beta),
+                engine.avgProfilePhaseMs(.ssm_proj_qkv_z),
                 engine.avgProfilePhaseMs(.ssm_conv),
                 engine.avgProfilePhaseMs(.ssm_delta),
                 engine.avgProfilePhaseMs(.ssm_gated_norm),
