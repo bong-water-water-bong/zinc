@@ -3,6 +3,7 @@ import BaseLayout from '../../layouts/BaseLayout.astro';
 import Breadcrumbs from '../../components/Breadcrumbs.astro';
 import TerminalWindow from '../../components/TerminalWindow.astro';
 import { buildBreadcrumbList } from '../../lib/structured-data';
+import benchmarkData from '../../data/zinc-performance.json';
 
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin.ai';
 const breadcrumbItems = [
@@ -11,13 +12,111 @@ const breadcrumbItems = [
 ];
 const discordUrl = 'https://discord.gg/QRUgWH2aGV';
 
+function metricMedian(summary: any) {
+  return summary?.median ?? summary?.avg ?? null;
+}
+
+function formatTokNumber(value: number | null | undefined, digits = 2) {
+  if (value == null || Number.isNaN(value)) return 'n/a';
+  return value.toFixed(digits);
+}
+
+function formatTok(value: number | null | undefined, digits = 2) {
+  const formatted = formatTokNumber(value, digits);
+  return formatted === 'n/a' ? formatted : `${formatted} tok/s`;
+}
+
+function formatMultiplier(zinc: number | null | undefined, baseline: number | null | undefined) {
+  if (zinc == null || baseline == null || Number.isNaN(zinc) || Number.isNaN(baseline) || baseline <= 0) return 'n/a';
+  return `${(zinc / baseline).toFixed(2)}x`;
+}
+
+function formatRefreshDate(iso: string | null | undefined) {
+  return iso?.slice(0, 10) ?? 'latest';
+}
+
+function targetById(id: string) {
+  return benchmarkData.targets.find((target: any) => target.id === id) ?? null;
+}
+
+function modelById(target: any, id: string) {
+  return target?.models?.find((model: any) => model.id === id) ?? null;
+}
+
+function beatsBaseline(row: { zinc: number | null | undefined; baseline: number | null | undefined }) {
+  return row.zinc != null && row.baseline != null && row.zinc > row.baseline;
+}
+
+function displayModelLabel(label: string) {
+  return label
+    .replace(/^OpenAI\s+GPT-OSS\b/i, 'GPT-OSS')
+    .replace(/\bQ4_K_XL\b/g, 'Q4K XL')
+    .replace(/\bQ4_K_M\b/g, 'Q4K M');
+}
+
+const rdnaTarget = targetById('rdna');
+const metalTarget = targetById('metal');
+const rdna35 = modelById(rdnaTarget, 'qwen36-35b-a3b-q4k-xl');
+const rdna27 = modelById(rdnaTarget, 'qwen36-27b-q4k-m');
+const metal35 = modelById(metalTarget, 'qwen36-35b-a3b-q4k-xl');
+
+const rdna35Decode = metricMedian(rdna35?.zinc?.decode_tps);
+const rdna35BaselineDecode = metricMedian(rdna35?.baseline?.decode_tps);
+const metal35Decode = metricMedian(metal35?.zinc?.decode_tps);
+
+const homeDescription = `ZINC is a local LLM inference engine for consumer GPUs and Apple Silicon. ${formatTokNumber(rdna35Decode)} tok/s on RDNA4 and ${formatTokNumber(metal35Decode)} tok/s on Apple M4 Max for the 35B model, with hand-tuned Vulkan and Metal backends.`;
+const appDescription = `LLM inference engine for consumer GPUs and Apple Silicon, built with Zig, Vulkan compute shaders, and Metal. ${formatTokNumber(rdna35Decode)} tok/s on RDNA4 and ${formatTokNumber(metal35Decode)} tok/s on Apple M4 Max for the 35B model.`;
+const performanceAnswer = `On the Radeon AI PRO R9700 (32GB, 576 GB/s), the current validated ZINC plain-decode number is ${formatTokNumber(rdna35Decode)} tok/s on Qwen3.6-35B-A3B-UD-Q4_K_XL - ${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp on the same machine. On the current Apple Silicon validation box, a Mac Studio (Mac16,9) with Apple M4 Max, 40-core GPU, and 64 GB unified memory, Qwen3.6-35B-A3B-UD-Q4_K_XL measures ${formatTokNumber(metal35Decode)} tok/s decode in the Metal benchmark.`;
+
+const rdnaRows = [
+  {
+    model: 'Qwen3.6-35B-A3B-UD-Q4_K_XL',
+    path: 'decode',
+    zinc: metricMedian(rdna35?.zinc?.decode_tps),
+    baseline: metricMedian(rdna35?.baseline?.decode_tps),
+  },
+  {
+    model: 'Qwen3.6-35B-A3B-UD-Q4_K_XL',
+    path: 'prefill',
+    zinc: metricMedian(rdna35?.zinc?.prefill_tps),
+    baseline: metricMedian(rdna35?.baseline?.prefill_tps),
+  },
+  {
+    model: 'Qwen3.6-27B Dense Q4_K_M',
+    path: 'decode',
+    zinc: metricMedian(rdna27?.zinc?.decode_tps),
+    baseline: metricMedian(rdna27?.baseline?.decode_tps),
+  },
+  {
+    model: 'Qwen3.6-27B Dense Q4_K_M',
+    path: 'prefill',
+    zinc: metricMedian(rdna27?.zinc?.prefill_tps),
+    baseline: metricMedian(rdna27?.baseline?.prefill_tps),
+  },
+].filter((row) => row.zinc != null || row.baseline != null);
+
+const metalRows = [
+  'qwen36-35b-a3b-q4k-xl',
+  'gemma4-12b-q4k-m',
+  'qwen3-8b-q4k-m',
+  'gpt-oss-20b-q4k-m',
+]
+  .map((id) => modelById(metalTarget, id))
+  .filter(Boolean)
+  .map((model: any) => ({
+    model: displayModelLabel(model.label ?? model.id),
+    path: 'decode',
+    zinc: metricMedian(model.zinc?.decode_tps),
+    baseline: metricMedian(model.baseline?.decode_tps),
+  }));
+
 const jsonLd = {
   '@context': 'https://schema.org',
   '@graph': [
     {
       '@type': 'SoftwareApplication',
       name: 'ZINC',
-      description: 'LLM inference engine for consumer GPUs and Apple Silicon, built with Zig, Vulkan compute shaders, and Metal. 103.72 tok/s on RDNA4 and 46.36 tok/s on Apple M4 Max for the 35B model.',
+      description: appDescription,
       applicationCategory: 'DeveloperApplication',
       operatingSystem: 'Linux, macOS',
       url: `${siteUrl}/zinc`,
@@ -53,7 +152,7 @@ const jsonLd = {
           name: 'What performance does ZINC achieve on RDNA4 and Apple Silicon?',
           acceptedAnswer: {
             '@type': 'Answer',
-            text: 'On the Radeon AI PRO R9700 (32GB, 576 GB/s), the current validated ZINC plain-decode number is 117.07 tok/s on Qwen3.6-35B-A3B-UD-Q4_K_XL — 1.12x llama.cpp on the same machine. On the current Apple Silicon validation box, a Mac Studio (Mac16,9) with Apple M4 Max, 40-core GPU, and 64 GB unified memory, Qwen3.6-35B-A3B-UD-Q4_K_XL measures 38.13 tok/s decode in the Metal benchmark.',
+            text: performanceAnswer,
           },
         },
         {
@@ -73,7 +172,7 @@ const jsonLd = {
 
 <BaseLayout
   title="ZINC — LLM Inference Engine"
-  description="ZINC is a local LLM inference engine for consumer GPUs and Apple Silicon. 103.72 tok/s on RDNA4 and 46.36 tok/s on Apple M4 Max for the 35B model, with hand-tuned Vulkan and Metal backends."
+  description={homeDescription}
   keywords="ZINC, LLM inference engine, AMD GPU, RDNA4, RDNA3, RX 9070 XT, RX 7900 XTX, Radeon AI PRO R9700, Vulkan compute, Zig, TurboQuant, KV cache compression, vLLM alternative, llama.cpp alternative, ROCm alternative, OpenAI compatible API, local AI, continuous batching, paged KV cache, GGUF, LLaMA, Qwen, Mistral, Mamba"
   jsonLd={jsonLd}
 >
@@ -141,15 +240,19 @@ const jsonLd = {
         <tr><th>GPU</th><th>Model</th><th>Path</th><th>ZINC</th><th>llama.cpp</th></tr>
       </thead>
       <tbody>
-        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen3.6-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td><strong>117.07 tok/s</strong></td><td>104.47 tok/s</td></tr>
-        <tr><td><strong>AI PRO R9700</strong></td><td>Gemma 4 26B A4B</td><td>decode</td><td>103.73 tok/s</td><td>107.42 tok/s</td></tr>
-        <tr><td><strong>AI PRO R9700</strong></td><td>Gemma 4 31B (dense)</td><td>decode</td><td><strong>44.18 tok/s</strong></td><td>32.18 tok/s</td></tr>
-        <tr><td><strong>AI PRO R9700</strong></td><td>GPT-OSS 20B</td><td>decode</td><td>86.49 tok/s</td><td>182.09 tok/s</td></tr>
-        <tr><td><strong>AI PRO R9700</strong></td><td>Qwen 3 8B (dense)</td><td>prefill</td><td><strong>110.26 tok/s</strong></td><td>85.11 tok/s</td></tr>
+        {rdnaRows.map((row) => (
+          <tr>
+            <td><strong>AI PRO R9700</strong></td>
+            <td>{row.model}</td>
+            <td>{row.path}</td>
+            <td>{beatsBaseline(row) ? <strong>{formatTok(row.zinc)}</strong> : formatTok(row.zinc)}</td>
+            <td>{formatTok(row.baseline)}</td>
+          </tr>
+        ))}
       </tbody>
     </table>
 
-    <p>Median tok/s across the perf suite's runs (2026-05-09 refresh) on the RDNA4 test node with <code>zig build -Doptimize=ReleaseFast</code> and <code>RADV_PERFTEST=coop_matrix</code>. Bold rows are where ZINC currently beats llama.cpp on the same hardware. Full breakdown: <a href="/zinc/performance">/zinc/performance</a>.</p>
+    <p>Median tok/s across the RDNA perf suite's runs ({formatRefreshDate(rdnaTarget?.generated_at)} refresh) on the RDNA4 test node with <code>zig build -Doptimize=ReleaseFast</code> and <code>RADV_PERFTEST=coop_matrix</code>. Bold rows are where ZINC currently beats llama.cpp on the same hardware. Full breakdown: <a href="/zinc/performance">/zinc/performance</a>.</p>
 
     <h2>Performance on Apple Silicon</h2>
 
@@ -160,14 +263,19 @@ const jsonLd = {
         <tr><th>Machine</th><th>Model</th><th>Path</th><th>ZINC</th><th>llama.cpp</th></tr>
       </thead>
       <tbody>
-        <tr><td><strong>Mac Studio (M4 Max)</strong></td><td>Qwen3.6-35B-A3B-UD-Q4_K_XL</td><td>decode</td><td>38.13 tok/s</td><td>79.88 tok/s</td></tr>
-        <tr><td><strong>Mac Studio (M4 Max)</strong></td><td>Gemma 4 12B</td><td>decode</td><td>43.68 tok/s</td><td>92.17 tok/s</td></tr>
-        <tr><td><strong>Mac Studio (M4 Max)</strong></td><td>Qwen 3 8B (dense)</td><td>decode</td><td>32.74 tok/s</td><td>83.67 tok/s</td></tr>
-        <tr><td><strong>Mac Studio (M4 Max)</strong></td><td>GPT-OSS 20B</td><td>decode</td><td>25.98 tok/s</td><td>119.85 tok/s</td></tr>
+        {metalRows.map((row) => (
+          <tr>
+            <td><strong>Mac Studio (M4 Max)</strong></td>
+            <td>{row.model}</td>
+            <td>{row.path}</td>
+            <td>{beatsBaseline(row) ? <strong>{formatTok(row.zinc)}</strong> : formatTok(row.zinc)}</td>
+            <td>{formatTok(row.baseline)}</td>
+          </tr>
+        ))}
       </tbody>
     </table>
 
-    <p>Those Apple numbers are for the exact machine above (2026-05-02 refresh), not a generic "Apple Silicon" average. Metal decode is closing the gap on the larger A3B models; the Gemma 4 31B path is the active optimization target. Full breakdown including prefill: <a href="/zinc/performance">/zinc/performance</a>.</p>
+    <p>Those Apple numbers are for the exact machine above ({formatRefreshDate(metalTarget?.generated_at)} refresh), not a generic "Apple Silicon" average. Metal decode is closing the gap on the larger A3B models; the Gemma 4 31B path is the active optimization target. Full breakdown including prefill: <a href="/zinc/performance">/zinc/performance</a>.</p>
 
     <h2>What ZINC does</h2>
 
