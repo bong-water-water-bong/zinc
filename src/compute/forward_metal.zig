@@ -257,6 +257,25 @@ fn preferApple9Q8WidePath(tensor: *const metal_loader.LoadedTensor, M: u32, K: u
     return false;
 }
 
+fn preferLlamaQ8SmallThreadgroupForQwenSsm(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const name = tensor.info.name;
+
+    // llama.cpp's ggml-metal.metal keeps Q8_0 mul_mv at N_SG_Q8_0=4
+    // (128 threads, 8 rows/threadgroup).  The Qwen3.6 SSM projections are the
+    // largest Apple9 Q8 prefill bucket, so try that exact shape there instead
+    // of the broader 512-thread Apple9 default.
+    if (K == 2048 and M >= 4096 and
+        (std.mem.endsWith(u8, name, "attn_qkv.weight") or
+            std.mem.endsWith(u8, name, "attn_gate.weight")))
+    {
+        return true;
+    }
+    if (K == 4096 and M >= 2048 and std.mem.endsWith(u8, name, "ssm_out.weight")) {
+        return true;
+    }
+    return false;
+}
+
 fn shouldUseGlobalQ8Override(arch: config_mod.Architecture, tensor_name: []const u8) bool {
     if (arch != .gemma) return true;
 
@@ -3951,6 +3970,14 @@ pub const InferenceEngine = struct {
                     {
                         // nr=2: each SG processes 2 rows
                         break :blk .{ .pipe = &self.dmmv_q8_0_k2048_pipe, .push_idx = 0, .rows_per_wg = 32, .block_size = 512 };
+                    }
+                    if (self.config.architecture == .qwen2_moe and
+                        self.config.ssm_d_inner > 0 and
+                        std.posix.getenv("ZINC_METAL_Q8_TG_SIZE") == null and
+                        preferLlamaQ8SmallThreadgroupForQwenSsm(tensor, M, K) and
+                        self.dmmv_q8_0_pipe.max_threads_per_threadgroup >= 128)
+                    {
+                        break :blk .{ .pipe = &self.dmmv_q8_0_pipe, .push_idx = 0, .rows_per_wg = 8, .block_size = 128 };
                     }
                     if (preferApple9Q8WidePath(tensor, M, K) and self.dmmv_q8_0_pipe.max_threads_per_threadgroup >= 512) {
                         break :blk .{ .pipe = &self.dmmv_q8_0_pipe, .push_idx = 0, .rows_per_wg = 32, .block_size = 512 };
