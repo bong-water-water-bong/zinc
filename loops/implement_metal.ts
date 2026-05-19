@@ -49,7 +49,10 @@ const MODEL_ID = process.env.ZINC_MODEL_ID ?? "qwen36-35b-a3b-q4k-xl";
 const MODEL_PATH = process.env.ZINC_MODEL ?? null;
 const TEST_PROMPT = process.env.ZINC_TEST_PROMPT ?? "The capital of France is";
 const PROMPT_MODE = process.env.ZINC_PROMPT_MODE ?? "raw";
-const MAX_TOKENS = parsePositiveIntEnv("ZINC_MAX_TOKENS", 64); // Enough tokens for stable decode throughput measurement
+export type MetricMode = "decode" | "prefill";
+const METRIC_MODE = parseMetricModeEnv("ZINC_METRIC_MODE", "decode");
+const METRIC_LABEL = METRIC_MODE === "prefill" ? "prefill tok/s" : "decode tok/s";
+const MAX_TOKENS = parsePositiveIntEnv("ZINC_MAX_TOKENS", 64); // Enough tokens for stable throughput measurement
 const REFERENCE_TEXT = "Paris"; // Expected in correct output
 const TARGET_TOK_PER_SEC = parsePositiveFloatEnv("ZINC_TARGET_TOK_PER_SEC", 50);
 const BENCHMARK_RUNS = parsePositiveIntEnv("ZINC_BENCHMARK_RUNS", 3); // Number of TIMED inference runs (median across them)
@@ -110,6 +113,14 @@ function parseBoolEnv(name: string, fallback: boolean): boolean {
   const normalized = raw.trim().toLowerCase();
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function parseMetricModeEnv(name: string, fallback: MetricMode): MetricMode {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "decode" || normalized === "prefill") return normalized;
   return fallback;
 }
 
@@ -198,7 +209,22 @@ type KeepDecision = {
   reason: string;
 };
 
-function parseTokPerSec(output: string): number | null {
+export function parseTokPerSec(output: string, mode: MetricMode = "decode"): number | null {
+  if (mode === "prefill") {
+    const prefillRate = output.match(/Prefill(?:\s+complete)?:\s+\d+\s+tokens\s+in\s+\d+\.?\d*\s*(?:ms|s)\s*\(\s*(\d+\.?\d*)\s*tok\/s\s*\)/i);
+    if (prefillRate) return parseFloat(prefillRate[1]);
+
+    const prefillTime = output.match(/Prefill(?:\s+complete)?:\s+(\d+)\s+tokens\s+in\s+(\d+\.?\d*)\s*(ms|s)/i);
+    if (prefillTime) {
+      const tokens = parseInt(prefillTime[1], 10);
+      let seconds = parseFloat(prefillTime[2]);
+      if (prefillTime[3].toLowerCase() === "ms") seconds /= 1000;
+      if (seconds > 0) return tokens / seconds;
+    }
+
+    return null;
+  }
+
   const m = output.match(/Generated\s+(\d+)\s+tokens\s+in\s+(\d+\.?\d*)\s*(ms|s)/i);
   if (m) {
     const tokens = parseInt(m[1], 10);
@@ -586,9 +612,9 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
     lastRun = run;
     lastCombined = run.stderr + run.stdout;
     if (run.exitCode !== 0) break; // crash — surface immediately, don't pretend to measure
-    const tps = parseTokPerSec(lastCombined);
+    const tps = parseTokPerSec(lastCombined, METRIC_MODE);
     if (tps != null) {
-      console.log(clr("2", `    warmup ${warmup + 1}/${BENCHMARK_WARMUPS}: ${tps.toFixed(2)} tok/s (discarded)`));
+      console.log(clr("2", `    warmup ${warmup + 1}/${BENCHMARK_WARMUPS}: ${tps.toFixed(2)} ${METRIC_LABEL} (discarded)`));
     }
   }
 
@@ -606,10 +632,10 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
 
     if (run.exitCode !== 0) break; // crash — no point running more samples
 
-    const tps = parseTokPerSec(lastCombined);
+    const tps = parseTokPerSec(lastCombined, METRIC_MODE);
     if (tps != null) {
       tokPerSecSamples.push(tps);
-      console.log(clr("2", `    sample ${sample + 1}/${BENCHMARK_RUNS}: ${tps.toFixed(2)} tok/s`));
+      console.log(clr("2", `    sample ${sample + 1}/${BENCHMARK_RUNS}: ${tps.toFixed(2)} ${METRIC_LABEL}`));
     }
   }
 
@@ -656,7 +682,7 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
     const hasHigh = sorted.some(s => s >= med + 0.75);
     const bimodal = range > 1.5 && hasLow && hasHigh;
     const flag = bimodal ? " ⚠ THERMAL" : "";
-    console.log(clr("1;36", `    ${aggLabel}: ${tokPerSec.toFixed(2)} tok/s [${tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] range=${range.toFixed(1)}${flag}`));
+    console.log(clr("1;36", `    ${aggLabel}: ${tokPerSec.toFixed(2)} ${METRIC_LABEL} [${tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] range=${range.toFixed(1)}${flag}`));
   }
 
   const result: BuildRunResult = {
@@ -1095,11 +1121,11 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     const current = lastResult.tokPerSec;
     const gap = TARGET_TOK_PER_SEC - current;
     const pctNeeded = ((gap / current) * 100).toFixed(0);
-    diagnosis.push(`## Status: CORRECT OUTPUT — ${current.toFixed(2)} tok/s → target ≥${TARGET_TOK_PER_SEC}`);
-    diagnosis.push(`Gap: ${gap.toFixed(1)} tok/s (need ${pctNeeded}% improvement)`);
+    diagnosis.push(`## Status: CORRECT OUTPUT — ${current.toFixed(2)} ${METRIC_LABEL} → target ≥${TARGET_TOK_PER_SEC}`);
+    diagnosis.push(`Gap: ${gap.toFixed(1)} ${METRIC_LABEL} (need ${pctNeeded}% improvement)`);
     diagnosis.push(`Output: "${trunc(lastResult.outputText, 80)}"`);
     if (lastResult.tokPerSecSamples.length > 1) {
-      diagnosis.push(`Benchmark samples: [${lastResult.tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] tok/s`);
+      diagnosis.push(`Benchmark samples: [${lastResult.tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] ${METRIC_LABEL}`);
       const sampleMin = Math.min(...lastResult.tokPerSecSamples);
       const sampleMax = Math.max(...lastResult.tokPerSecSamples);
       const sampleRange = sampleMax - sampleMin;
@@ -1108,7 +1134,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
       }
     }
   } else {
-    diagnosis.push(`## Status: TARGET REACHED — ${lastResult.tokPerSec?.toFixed(1)} tok/s ≥${TARGET_TOK_PER_SEC}`);
+    diagnosis.push(`## Status: TARGET REACHED — ${lastResult.tokPerSec?.toFixed(1)} ${METRIC_LABEL} ≥${TARGET_TOK_PER_SEC}`);
     diagnosis.push("Performance target met!");
   }
 
@@ -1240,8 +1266,8 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
       "",
       "## Baseline Reference",
       gemmaRun ? "- Current accepted ZINC best: 37.79 tok/s; target is 50 tok/s before chasing larger redesigns." : "- llama.cpp Metal on this machine: 72.93 tok/s decode (tg128)",
-      `- ZINC target: ≥${TARGET_TOK_PER_SEC} tok/s`,
-      `- ZINC current: ${lastResult.tokPerSec?.toFixed(1)} tok/s`,
+      `- ZINC target: ≥${TARGET_TOK_PER_SEC} ${METRIC_LABEL}`,
+      `- ZINC current: ${lastResult.tokPerSec?.toFixed(1)} ${METRIC_LABEL}`,
       "",
       "## Optimization Targets (pick ONE per cycle)",
       "",
@@ -1726,11 +1752,11 @@ async function main() {
     startCycle = state.cycles.length + 1;
     console.log(clr("1;36", "╔══════════════════════════════════════════════════════════════╗"));
     console.log(clr("1;36", "║  ZINC Metal Optimization Loop — RESUMING                     ║"));
-    console.log(clr("1;36", `║  Target: ≥${TARGET_TOK_PER_SEC} tok/s  |  Model: ${displayModelLabel().slice(0, 35)}  ║`));
+    console.log(clr("1;36", `║  Target: ≥${TARGET_TOK_PER_SEC} ${METRIC_LABEL}  |  Model: ${displayModelLabel().slice(0, 35)}  ║`));
     console.log(clr("1;36", `║  Run: ${runId}  |  Resuming from cycle ${startCycle}            ║`));
     console.log(clr("1;36", "╚══════════════════════════════════════════════════════════════╝"));
     console.log(`  Agent: ${clr("1", agentLabel)}${model ? ` (${model})` : ""}`);
-    console.log(`  Previous cycles: ${state.cycles.length}, best: ${state.bestTokPerSec.toFixed(2)} tok/s`);
+    console.log(`  Previous cycles: ${state.cycles.length}, best: ${state.bestTokPerSec.toFixed(2)} ${METRIC_LABEL}`);
     console.log(`  Results: ${clr("2", runDir)}`);
     if (state.effortFile) {
       console.log(`  Effort: ${clr("1;36", `#${state.effortId}`)} → ${state.effortFile}`);
@@ -1760,7 +1786,7 @@ async function main() {
     };
     console.log(clr("1;36", "╔══════════════════════════════════════════════════════════════╗"));
     console.log(clr("1;36", "║  ZINC Metal Optimization Loop                                ║"));
-    console.log(clr("1;36", `║  Target: ≥${TARGET_TOK_PER_SEC} tok/s  |  Model: ${displayModelLabel().slice(0, 35)}  ║`));
+    console.log(clr("1;36", `║  Target: ≥${TARGET_TOK_PER_SEC} ${METRIC_LABEL}  |  Model: ${displayModelLabel().slice(0, 35)}  ║`));
     console.log(clr("1;36", `║  Run: ${runId}  |  Max cycles: ${maxCycles}               ║`));
     console.log(clr("1;36", "╚══════════════════════════════════════════════════════════════╝"));
     console.log(`  Agent: ${clr("1", agentLabel)}${model ? ` (${model})` : ""}`);
@@ -1811,7 +1837,7 @@ async function main() {
       console.log(clr("1;31", `  ❌ CRASH (exit ${result.runExitCode})`));
     } else {
       const refTag = result.containsReference ? clr("1;32", " ✅CORRECT") : clr("1;33", " ❌WRONG");
-      const tpsTag = result.tokPerSec ? ` ${result.tokPerSec.toFixed(1)} tok/s` : "";
+      const tpsTag = result.tokPerSec ? ` ${result.tokPerSec.toFixed(1)} ${METRIC_LABEL}` : "";
       console.log(clr("1;32", `  ✅ ${result.tokensGenerated} tokens${tpsTag}`) + refTag);
       if (result.outputText) console.log(clr("2", `  Output: "${result.outputText.slice(0, 80)}"`));
     }
@@ -1895,7 +1921,7 @@ async function main() {
       kept = true;
       state.bestTokPerSec = verifyTps;
       state.stalledCycles = 0;
-      console.log(clr("1;32", `  ✅ KEPT — ${verifyTps.toFixed(2)} tok/s (was ${prevTps.toFixed(2)}, +${(verifyTps - prevTps).toFixed(2)}; band ±${improveBand.toFixed(2)})`));
+      console.log(clr("1;32", `  ✅ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (was ${prevTps.toFixed(2)}, +${(verifyTps - prevTps).toFixed(2)}; band ±${improveBand.toFixed(2)})`));
     } else if (verify.containsReference && verifyTps >= prevTps - noiseBand) {
       // Within noise band, correct output — keep the change but DO NOT
       // advance bestTokPerSec. Advancing on noise creates a one-way
@@ -1903,18 +1929,18 @@ async function main() {
       // (Effort 12 cycles 1-24 went 0.21 → 0.30 this way, all noise).
       kept = true;
       state.stalledCycles++;
-      console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} tok/s (within ${noiseBand.toFixed(2)} of ${prevTps.toFixed(2)}; best unchanged)`));
+      console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (within ${noiseBand.toFixed(2)} of ${prevTps.toFixed(2)}; best unchanged)`));
     } else if (verify.containsReference && !state.currentBest?.containsReference) {
       // Gained correctness for the first time
       kept = true;
       state.bestTokPerSec = verifyTps;
       state.stalledCycles = 0;
-      console.log(clr("1;32", `  ✅ KEPT — gained correct output! ${verifyTps.toFixed(2)} tok/s`));
+      console.log(clr("1;32", `  ✅ KEPT — gained correct output! ${verifyTps.toFixed(2)} ${METRIC_LABEL}`));
     } else {
       // Regressed speed or no correctness
-      console.log(clr("1;31", `  ↩ REVERTING — ${verifyTps.toFixed(2)} tok/s < ${prevTps.toFixed(2)} (regressed ${(prevTps - verifyTps).toFixed(2)} tok/s; band -${noiseBand.toFixed(2)})`));
+      console.log(clr("1;31", `  ↩ REVERTING — ${verifyTps.toFixed(2)} ${METRIC_LABEL} < ${prevTps.toFixed(2)} (regressed ${(prevTps - verifyTps).toFixed(2)}; band -${noiseBand.toFixed(2)})`));
       await runCommand("git", ["reset", "--hard", preHash]);
-      state.failedApproaches.push(`${description} — regressed from ${prevTps.toFixed(1)} to ${verifyTps.toFixed(1)} tok/s`);
+      state.failedApproaches.push(`${description} — regressed from ${prevTps.toFixed(1)} to ${verifyTps.toFixed(1)} ${METRIC_LABEL}`);
       state.stalledCycles++;
     }
 
@@ -1924,7 +1950,7 @@ async function main() {
         containsReference: verify.containsReference,
       };
       await runCommand("git", ["add", "-A", "src/", "build.zig"]).catch(() => {});
-      await runCommand("git", ["commit", "-m", `metal-loop: cycle-${cycle} ${description} (${verifyTps.toFixed(1)} tok/s)`]).catch(() => {});
+      await runCommand("git", ["commit", "-m", `metal-loop: cycle-${cycle} ${description} (${verifyTps.toFixed(1)} ${METRIC_LABEL})`]).catch(() => {});
     }
 
     // Periodic profiling run (after verify, so we profile the current accepted state)
@@ -1973,12 +1999,12 @@ async function main() {
     await saveState(runDir, state);
 
     // Status summary
-    console.log(clr("2", `  stall=${state.stalledCycles} best=${state.bestTokPerSec.toFixed(2)} target=${TARGET_TOK_PER_SEC}`));
+    console.log(clr("2", `  stall=${state.stalledCycles} best=${state.bestTokPerSec.toFixed(2)} ${METRIC_LABEL} target=${TARGET_TOK_PER_SEC}`));
 
     // Check if we're done
     if (STOP_ON_TARGET && verify.containsReference && verify.tokPerSec != null && verify.tokPerSec >= TARGET_TOK_PER_SEC) {
       console.log(clr("1;32", "\n" + "=".repeat(64)));
-      console.log(clr("1;32", `  TARGET REACHED: ${verify.tokPerSec.toFixed(1)} tok/s >= ${TARGET_TOK_PER_SEC} with correct output!`));
+      console.log(clr("1;32", `  TARGET REACHED: ${verify.tokPerSec.toFixed(1)} ${METRIC_LABEL} >= ${TARGET_TOK_PER_SEC} with correct output!`));
       console.log(clr("1;32", "=".repeat(64)));
       break;
     }
@@ -1987,7 +2013,7 @@ async function main() {
   console.log(clr("1;36", `\nLoop complete. Results: ${runDir}`));
   console.log(clr("1;36", `Total cycles: ${state.cycles.length}`));
   console.log(clr("1;36", `Kept: ${state.cycles.filter(c => c.kept).length}`));
-  console.log(clr("1;36", `Best: ${state.bestTokPerSec.toFixed(2)} tok/s (target: ${TARGET_TOK_PER_SEC}), correct=${state.currentBest?.containsReference ?? false}`));
+  console.log(clr("1;36", `Best: ${state.bestTokPerSec.toFixed(2)} ${METRIC_LABEL} (target: ${TARGET_TOK_PER_SEC}), correct=${state.currentBest?.containsReference ?? false}`));
 }
 
 if (import.meta.main) {

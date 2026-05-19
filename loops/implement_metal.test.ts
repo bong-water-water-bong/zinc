@@ -7,6 +7,7 @@ import {
   detectPhase,
   evaluateOutputText,
   mergeUniqueEntries,
+  parseTokPerSec,
   snapshotFromResult,
 } from "./implement_metal";
 import type { BuildRunResult, ControllerState, CycleResult, RunState } from "./implement_metal";
@@ -100,6 +101,31 @@ describe("evaluateOutputText", () => {
     const result = evaluateOutputText("Paris is the capital");
     expect(result.containsReference).toBe(true);
     expect(result.strongAnswer).toBe(true);
+  });
+});
+
+// ── parseTokPerSec ──────────────────────────────────────────────────
+
+describe("parseTokPerSec", () => {
+  test("prefers generated throughput in decode mode", () => {
+    const output = [
+      "info(forward_metal): Prefill: 122 tokens in 610.0 ms (200.0 tok/s)",
+      "info(forward_metal): Generated 64 tokens in 1280.0 ms - 50.0 tok/s",
+    ].join("\n");
+    expect(parseTokPerSec(output, "decode")).toBe(50);
+  });
+
+  test("parses prefill throughput in prefill mode", () => {
+    const output = [
+      "info(forward_metal): Prefill: 122 tokens in 610.0 ms (200.0 tok/s)",
+      "info(forward_metal): Generated 64 tokens in 1280.0 ms - 50.0 tok/s",
+    ].join("\n");
+    expect(parseTokPerSec(output, "prefill")).toBe(200);
+  });
+
+  test("computes prefill throughput when rate is not printed", () => {
+    const output = "info(forward): Prefill complete: 50 tokens in 250 ms";
+    expect(parseTokPerSec(output, "prefill")).toBe(200);
   });
 });
 
