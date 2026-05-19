@@ -7847,8 +7847,6 @@ fn canUseQwenRoutePackedPrefixAttentionLayer(engine: *const InferenceEngine, lay
     } else {
         if (engine.kv_cache_write_pipe.handle == null or engine.flash_attn_batched_pipe.handle == null) return false;
     }
-    if (engine.attn_q_norm_present[layer_idx] or engine.attn_k_norm_present[layer_idx]) return false;
-
     const hidden_dim = engine.config.hidden_dim;
     const inter_dim: u32 = if (engine.config.intermediate_dim > 0) engine.config.intermediate_dim else hidden_dim * 4;
     const lt = engine.layer_tensors[layer_idx];
@@ -7972,6 +7970,20 @@ fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
         try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, gate_t, &scratch.norm, &scratch.gate, attn.q_dim, hidden_dim, n_tokens);
     }
     profileBarrier(cmd, profile, .full_attn);
+
+    // Keep llama.cpp's layer-major graph shape through Q/K-norm attention
+    // layers instead of falling back to token-major decode. The layout matches
+    // generic batched prefill: q/k are token-major, and each head is a
+    // contiguous head_dim slice, so RMSNorm can run over N*heads slices.
+    if (engine.attn_q_norm_present[layer_idx]) {
+        dispatchRmsNormOnCmd(engine, cmd, &scratch.q, &scratch.q, &engine.attn_q_norm_bufs[layer_idx], attn.head_dim, cfg.n_heads * n_tokens);
+    }
+    if (engine.attn_k_norm_present[layer_idx]) {
+        dispatchRmsNormOnCmd(engine, cmd, &scratch.k, &scratch.k, &engine.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads * n_tokens);
+    }
+    if (engine.attn_q_norm_present[layer_idx] or engine.attn_k_norm_present[layer_idx]) {
+        profileBarrier(cmd, profile, .full_attn);
+    }
 
     const rope_freq_buf = selectRopeFreqBuffer(engine, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
     dispatchRopeBatchedOnCmd(engine, cmd, &scratch.q, &scratch.q, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
