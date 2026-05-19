@@ -134,7 +134,7 @@ Each vector engine has:
 
 ### RDNA CU ↔ Xe core Mapping
 
-For a reader already familiar with the [RDNA reference](/zinc/docs/gpu-reference/), this table maps the core concepts:
+For a reader already familiar with the [RDNA reference](/zinc/docs/amd-gpu-reference/), this table maps the core concepts:
 
 | RDNA term | Intel Xe2 term | Notes |
 | --- | --- | --- |

@@ -218,7 +218,7 @@ zig build hot-bench -Doptimize=ReleaseFast
 ./zig-out/bin/zinc-hot-bench --shader-dir zig-out/share/zinc/shaders
 ```
 
-For detailed tuning guidance, see [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning), the [AMD GPU Reference](/zinc/docs/gpu-reference), and the [Intel GPU Reference](/zinc/docs/intel-gpu-reference).
+For detailed tuning guidance, see [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning), the [AMD GPU Reference](/zinc/docs/amd-gpu-reference), and the [Intel GPU Reference](/zinc/docs/intel-gpu-reference).
 
 ## RDNA4 Test Node
 
@@ -277,7 +277,7 @@ See [Code of Conduct](https://github.com/zolotukhin/zinc/blob/main/CODE_OF_CONDU
 - [API Reference](/zinc/docs/api) — OpenAI-compatible HTTP endpoints
 - [Technical Specification](/zinc/docs/spec) — architecture, kernels, scheduler
 - [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning) — performance profiling and optimization
-- [AMD GPU Reference](/zinc/docs/gpu-reference) — RDNA3/RDNA4 hardware details
+- [AMD GPU Reference](/zinc/docs/amd-gpu-reference) — RDNA3/RDNA4 hardware details
 - [Intel GPU Reference](/zinc/docs/intel-gpu-reference) — Arc B-series hardware, memory bandwidth, and Xe2 opcode notes
 - [Apple Silicon Reference](/zinc/docs/apple-silicon-reference) — M1–M5 capabilities
 - [Apple Metal Reference](/zinc/docs/apple-metal-reference) — MSL kernel optimization

@@ -170,7 +170,7 @@ docs/                            # Technical documentation (published to site)
 ├── APPLE_SILICON_REFERENCE.md   # Apple Silicon M1–M5 reference
 ├── DEVELOPMENT.md               # Development guide (canonical dev reference)
 ├── GETTING_STARTED.md           # First run guide
-├── GPU_REFERENCE.md             # RDNA3/RDNA4 hardware reference
+├── AMD_GPU_REFERENCE.md         # RDNA3/RDNA4 hardware reference
 ├── HARDWARE_REQUIREMENTS.md     # GPU and host sizing guidance
 ├── METAL_PERFORMANCE_PLAN.md    # Metal performance work plan
 ├── RDNA4_PERFORMANCE_JOURNEY.md # RDNA4 optimization log
