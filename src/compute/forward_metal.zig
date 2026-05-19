@@ -756,6 +756,15 @@ const SoftmaxTopkWeightBiasPush = extern struct {
     bias_offset: u32,
 };
 
+const RouterF32TopkBiasPush = extern struct {
+    n_experts: u32,
+    K: u32,
+    k: u32,
+    a_offset: u32,
+    x_offset: u32,
+    bias_offset: u32,
+};
+
 const AddBiasPush = extern struct {
     n: u32,
     bias_offset: u32,
@@ -1763,6 +1772,7 @@ pub const InferenceEngine = struct {
     softmax_topk_pipe: MetalPipeline,
     softmax_topk_scaled_pipe: MetalPipeline,
     softmax_topk_weight_bias_pipe: MetalPipeline,
+    router_f32_topk_bias_pipe: MetalPipeline,
     softmax_topk_batched_pipe: MetalPipeline,
     moe_route_pack_pipe: MetalPipeline,
     moe_route_ids_pipe: MetalPipeline,
@@ -2137,6 +2147,7 @@ pub const InferenceEngine = struct {
         self.softmax_topk_pipe = try loadShaderPipeline(ctx, "softmax_topk");
         self.softmax_topk_scaled_pipe = try loadShaderPipeline(ctx, "softmax_topk_scaled");
         self.softmax_topk_weight_bias_pipe = try loadShaderPipeline(ctx, "softmax_topk_weight_bias");
+        self.router_f32_topk_bias_pipe = try loadShaderPipeline(ctx, "router_f32_topk_bias");
         self.softmax_topk_batched_pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
         self.moe_route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
         self.moe_route_ids_pipe = try loadShaderPipeline(ctx, "moe_route_ids");
@@ -2851,6 +2862,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.softmax_topk_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_scaled_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_weight_bias_pipe);
+        metal_pipeline.freePipeline(&self.router_f32_topk_bias_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_batched_pipe);
         metal_pipeline.freePipeline(&self.moe_route_pack_pipe);
         metal_pipeline.freePipeline(&self.moe_route_ids_pipe);
@@ -3601,7 +3613,8 @@ pub const InferenceEngine = struct {
             .q8_0 => blk: {
                 const simd_width = if (self.dmmv_q8_0_pipe.thread_execution_width > 0) self.dmmv_q8_0_pipe.thread_execution_width else @as(u32, 32);
                 if (self.device.chip == .apple9 and simd_width == 32) {
-                    if (self.config.architecture == .gpt_oss and tensor == self.lm_head and K <= 4096 and M >= 65536 and
+                    if ((self.config.architecture == .gpt_oss or self.config.architecture == .gemma) and
+                        tensor == self.lm_head and K <= 4096 and M >= 65536 and M % 2 == 0 and
                         self.dmmv_q8_0_lmhead_pipe.thread_execution_width == 32 and
                         self.dmmv_q8_0_lmhead_pipe.max_threads_per_threadgroup >= 512)
                     {
@@ -4747,7 +4760,9 @@ fn dispatchLmHeadWithInputOffset(
 }
 
 fn shouldCpuLmHeadFallbackForType(arch: config_mod.Architecture, quant_type: GGMLType) bool {
-    return arch == .gemma and quant_type == .q8_0;
+    _ = arch;
+    _ = quant_type;
+    return false;
 }
 
 fn shouldCpuLmHeadFallback(engine: *const InferenceEngine) bool {
@@ -5929,6 +5944,43 @@ fn dispatchSoftmaxTopkWeightBiasOnCmd(
     };
     const bufs = [_]*const MetalBuffer{ logits, output, &bias.gpu_buffer };
     cmd.dispatchV2(&engine.softmax_topk_weight_bias_pipe, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkWeightBiasPush), 0);
+}
+
+fn canUseRouterF32TopkBias(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, bias: *const metal_loader.LoadedTensor, n_experts: u32, k: u32, hidden_dim: u32) bool {
+    return engine.config.architecture == .gpt_oss and
+        tensor.info.type_ == .f32 and
+        bias.info.type_ == .f32 and
+        n_experts <= 32 and
+        k <= 16 and
+        hidden_dim <= 4096 and
+        hidden_dim % 4 == 0 and
+        engine.router_f32_topk_bias_pipe.handle != null and
+        engine.router_f32_topk_bias_pipe.thread_execution_width == 32 and
+        engine.router_f32_topk_bias_pipe.max_threads_per_threadgroup >= 512;
+}
+
+fn dispatchRouterF32TopkBiasOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    bias: *const metal_loader.LoadedTensor,
+    n_experts: u32,
+    k: u32,
+    hidden_dim: u32,
+) void {
+    recordDmmvProfile(engine, tensor, n_experts, hidden_dim);
+    const push = RouterF32TopkBiasPush{
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .a_offset = tensorPageOffset(engine.model, tensor),
+        .x_offset = 0,
+        .bias_offset = tensorPageOffset(engine.model, bias),
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input, output, &bias.gpu_buffer };
+    cmd.dispatchV2(&engine.router_f32_topk_bias_pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBiasPush), 1);
 }
 
 fn fillRopeInvFreqs(dst: []f32, rope_dim: u32, freq_base: f32, freq_factors: ?[]const f32) void {
@@ -8350,6 +8402,7 @@ fn recordGpuRoutedGptOssMoeOnCmd(
     lt: LayerTensors,
     hidden_dim: u32,
     inter_dim: u32,
+    router_output_ready: bool,
 ) !void {
     const cfg = engine.config;
     const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
@@ -8362,8 +8415,10 @@ fn recordGpuRoutedGptOssMoeOnCmd(
     const down_bias = lt.ffn_down_exps_bias orelse return error.MissingTensor;
     const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
 
-    dispatchSoftmaxTopkWeightBiasOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used);
-    profileBarrier(cmd, profile, .gpu_routed_moe);
+    if (!router_output_ready) {
+        dispatchSoftmaxTopkWeightBiasOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used);
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+    }
 
     try dispatchDmmvMoeOnCmd(
         engine,
@@ -8782,8 +8837,18 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     }
                     break :blk &engine.norm_buf;
                 };
-                dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
-                profileBarrier(cmd, profile, .router); // router_logits_buf visible before MoE
+                const use_fused_gptoss_router = blk: {
+                    if (!use_gpt_oss_gpu_routed_moe) break :blk false;
+                    const router_bias = lt.ffn_gate_inp_bias orelse break :blk false;
+                    break :blk canUseRouterF32TopkBias(engine, router_t, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                };
+                if (use_fused_gptoss_router) {
+                    const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
+                    dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                } else {
+                    dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
+                }
+                profileBarrier(cmd, profile, .router); // router output/logits visible before MoE
                 if (use_gpu_routed_moe) {
                     if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
@@ -8791,7 +8856,7 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     if (use_standard_gpu_routed_moe) {
                         try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
                     } else {
-                        try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim);
+                        try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, use_fused_gptoss_router);
                     }
                     if (profile) |p| p.gpu_routed_moe_record_ns += profileElapsedNs(moe_record_start);
                 } else if (profile) |p| {
@@ -8985,8 +9050,18 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     }
                     break :blk &engine.norm_buf;
                 };
-                dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
-                profileBarrier(cmd, profile, .router); // router_logits_buf visible before MoE
+                const use_fused_gptoss_router = blk: {
+                    if (!use_gpt_oss_gpu_routed_moe) break :blk false;
+                    const router_bias = lt.ffn_gate_inp_bias orelse break :blk false;
+                    break :blk canUseRouterF32TopkBias(engine, router_t, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                };
+                if (use_fused_gptoss_router) {
+                    const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
+                    dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                } else {
+                    dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
+                }
+                profileBarrier(cmd, profile, .router); // router output/logits visible before MoE
                 if (use_gpu_routed_moe) {
                     if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
@@ -8994,7 +9069,7 @@ fn runDecodeStep(engine: *InferenceEngine, emit_logits: bool) !void {
                     if (use_standard_gpu_routed_moe) {
                         try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
                     } else {
-                        try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim);
+                        try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, use_fused_gptoss_router);
                     }
                     if (profile) |p| p.gpu_routed_moe_record_ns += profileElapsedNs(moe_record_start);
                 } else if (profile) |p| {
@@ -13187,8 +13262,8 @@ test "gemma shared down q8 tensors stay GPU eligible" {
     try std.testing.expect(!shouldCpuQ8Fallback(.qwen35, "blk.0.ffn_down.weight"));
 }
 
-test "gemma q8 lm head uses CPU fallback" {
-    try std.testing.expect(shouldCpuLmHeadFallbackForType(.gemma, .q8_0));
+test "q8 lm head stays on GPU" {
+    try std.testing.expect(!shouldCpuLmHeadFallbackForType(.gemma, .q8_0));
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.gemma, .q4_k));
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.qwen35, .q8_0));
 }
@@ -14616,6 +14691,105 @@ test "moe_weighted_acc shader adds weighted experts into destination" {
     try std.testing.expectApproxEqAbs(@as(f32, 47.0), accum_ptr[3], 0.001);
 }
 
+test "router_f32_topk_bias shader matches CPU top-k softmax reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "router_f32_topk_bias");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_experts: usize = 32;
+    const K: usize = 96;
+    const k: usize = 4;
+    const a_pad: usize = 3;
+    const x_pad: usize = 5;
+    const bias_pad: usize = 2;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, (a_pad + n_experts * K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, (x_pad + K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, k * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var bias_buf = try metal_buffer.createBuffer(ctx, (bias_pad + n_experts) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&bias_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(bias_buf.cpu_ptr.?[0..bias_buf.size], 0);
+
+    const weight_ptr: [*]f32 = @ptrCast(@alignCast(weight_buf.cpu_ptr.?));
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    const bias_ptr: [*]f32 = @ptrCast(@alignCast(bias_buf.cpu_ptr.?));
+
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 7 + 3) % 23);
+        input_ptr[x_pad + i] = 0.0625 * @as(f32, @floatFromInt(raw - 11));
+    }
+    for (0..n_experts) |expert| {
+        bias_ptr[bias_pad + expert] = 0.01 * @as(f32, @floatFromInt(@as(i32, @intCast(expert)) - 15));
+        for (0..K) |i| {
+            const raw: i32 = @intCast((expert * 13 + i * 17 + 5) % 31);
+            weight_ptr[a_pad + expert * K + i] = 0.03125 * @as(f32, @floatFromInt(raw - 15));
+        }
+    }
+
+    var logits: [n_experts]f32 = undefined;
+    for (0..n_experts) |expert| {
+        var dot: f32 = bias_ptr[bias_pad + expert];
+        for (0..K) |i| dot += weight_ptr[a_pad + expert * K + i] * input_ptr[x_pad + i];
+        logits[expert] = dot;
+    }
+
+    var expected_ids: [k]u32 = undefined;
+    var selected_vals: [k]f32 = undefined;
+    for (0..k) |slot| {
+        var best_val = -std.math.inf(f32);
+        var best_idx: usize = 0;
+        for (0..n_experts) |expert| {
+            if (logits[expert] > best_val) {
+                best_val = logits[expert];
+                best_idx = expert;
+            }
+        }
+        expected_ids[slot] = @intCast(best_idx);
+        selected_vals[slot] = best_val;
+        logits[best_idx] = -std.math.inf(f32);
+    }
+    var max_sel = -std.math.inf(f32);
+    for (selected_vals) |v| max_sel = @max(max_sel, v);
+    var sum: f32 = 0.0;
+    var expected_weights: [k]f32 = undefined;
+    for (0..k) |slot| {
+        expected_weights[slot] = @exp(selected_vals[slot] - max_sel);
+        sum += expected_weights[slot];
+    }
+    for (&expected_weights) |*w| w.* /= sum;
+
+    const push = RouterF32TopkBiasPush{
+        .n_experts = @intCast(n_experts),
+        .K = @intCast(K),
+        .k = @intCast(k),
+        .a_offset = @intCast(a_pad * @sizeOf(f32)),
+        .x_offset = @intCast(x_pad * @sizeOf(f32)),
+        .bias_offset = @intCast(bias_pad * @sizeOf(f32)),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &bias_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBiasPush), 1);
+    cmd.commitAndWait();
+
+    const output_ptr: [*]const u32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..k) |slot| {
+        try std.testing.expectEqual(expected_ids[slot], output_ptr[slot]);
+        const actual_weight: f32 = @bitCast(output_ptr[k + slot]);
+        try std.testing.expectApproxEqAbs(expected_weights[slot], actual_weight, 0.0001);
+    }
+}
+
 test "dmmv_q5_0 shader matches CPU reference with qh bits and nonzero offset" {
     // Regression test for the Q5_0 unaligned-uint32 qh read bug.
     // The Q5_0 block stores qh at byte offset 2 within a 22-byte block.
@@ -15106,6 +15280,78 @@ test "dmmv_q8_0_k2048 shader matches CPU reference (nr=2)" {
     const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     for (0..M) |row| {
         dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), K, .q8_0, &ref_row);
+        var expected: f32 = 0;
+        for (0..K) |i| expected += ref_row[i] * input_ptr[i];
+        try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
+    }
+}
+
+test "dmmv_q8_0_lmhead shader matches Gemma 12B K2816 shape" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_lmhead");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 64;
+    const K: usize = 2816;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale_mag = 0.03125 * @as(f32, @floatFromInt(1 + (row % 5) + (blk % 7)));
+            const scale = @as(f16, @floatCast(scale_mag));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 11 + blk * 7 + e * 5) % 63);
+                const q: i8 = @intCast(raw_q - 31);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 13 + 7) % 29);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 14));
+    }
+
+    const push = DmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 31) / 32), 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
         var expected: f32 = 0;
         for (0..K) |i| expected += ref_row[i] * input_ptr[i];
         try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
