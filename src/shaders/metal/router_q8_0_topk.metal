@@ -77,6 +77,45 @@ kernel void main0(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (local_id == 0u) {
+        if (p.n_experts == 256u && p.k == 8u) {
+            #pragma unroll
+            for (uint slot = 0u; slot < 8u; slot++) {
+                float best_val = -INFINITY;
+                uint best_idx = 0u;
+                for (uint expert = 0u; expert < 256u; expert++) {
+                    const float v = values[expert];
+                    if (v > best_val) {
+                        best_val = v;
+                        best_idx = expert;
+                    }
+                }
+                output_data[slot] = best_idx;
+                selected_val[slot] = best_val;
+                values[best_idx] = -INFINITY;
+            }
+
+            float max_sel = -INFINITY;
+            #pragma unroll
+            for (uint slot = 0u; slot < 8u; slot++) {
+                max_sel = max(max_sel, selected_val[slot]);
+            }
+
+            float sum = 0.0f;
+            #pragma unroll
+            for (uint slot = 0u; slot < 8u; slot++) {
+                const float e = exp(selected_val[slot] - max_sel);
+                selected_val[slot] = e;
+                sum += e;
+            }
+
+            const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+            #pragma unroll
+            for (uint slot = 0u; slot < 8u; slot++) {
+                output_data[8u + slot] = as_type<uint>(selected_val[slot] * inv_sum);
+            }
+            return;
+        }
+
         const uint k = min(p.k, uint(MAX_K_USED));
         for (uint slot = 0u; slot < k; slot++) {
             float best_val = -INFINITY;
