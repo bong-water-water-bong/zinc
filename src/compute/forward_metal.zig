@@ -1136,6 +1136,7 @@ const MoeWeightedAccSharedGateF32Push = extern struct {
     n_used: u32,
     src_stride: u32,
     gate_weight_offset: u32,
+    norm_offset: u32,
 };
 
 /// Push constants for sigmoid multiply dispatch (matches sigmoid_mul.metal: buffer(0)).
@@ -5767,6 +5768,7 @@ fn dispatchPairedQ8DmmvOnCmd(
     output1_buf: *const MetalBuffer,
     M: u32,
     K: u32,
+    x_byte_offset: u32,
 ) void {
     recordDmmvProfile(engine, tensor0, M, K);
     recordDmmvProfile(engine, tensor1, M, K);
@@ -5777,7 +5779,7 @@ fn dispatchPairedQ8DmmvOnCmd(
         .K = K,
         .a0_offset = tensorPageOffset(engine.model, tensor0),
         .a1_offset = tensorPageOffset(engine.model, tensor1),
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
         .y0_offset = 0,
         .y1_offset = 0,
     };
@@ -6169,6 +6171,7 @@ fn dispatchDmmvMoeQ4kOnCmd(
     expert_stride: u32,
     x_expert_stride: u32,
     extra_byte_offset: u32,
+    x_byte_offset: u32,
 ) void {
     if (tensor.info.type_ != .q4_k) {
         log.err("Batched MoE DMMV only supports Q4_K (tensor {s})", .{tensor.info.name});
@@ -6181,7 +6184,7 @@ fn dispatchDmmvMoeQ4kOnCmd(
         .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
         .expert_stride = expert_stride,
         .x_expert_stride = x_expert_stride,
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
@@ -6216,6 +6219,7 @@ fn dispatchDmmvMoeQ5kOnCmd(
     expert_stride: u32,
     x_expert_stride: u32,
     extra_byte_offset: u32,
+    x_byte_offset: u32,
 ) void {
     if (tensor.info.type_ != .q5_k) {
         log.err("Batched MoE DMMV only supports Q5_K (tensor {s})", .{tensor.info.name});
@@ -6232,7 +6236,7 @@ fn dispatchDmmvMoeQ5kOnCmd(
         .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
         .expert_stride = expert_stride,
         .x_expert_stride = x_expert_stride,
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
@@ -6259,6 +6263,7 @@ fn dispatchDmmvMoeQ5_1OnCmd(
     expert_stride: u32,
     x_expert_stride: u32,
     extra_byte_offset: u32,
+    x_byte_offset: u32,
 ) void {
     if (tensor.info.type_ != .q5_1) {
         log.err("Batched Q5_1 MoE DMMV called with wrong type (tensor {s})", .{tensor.info.name});
@@ -6270,7 +6275,7 @@ fn dispatchDmmvMoeQ5_1OnCmd(
         .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
         .expert_stride = expert_stride,
         .x_expert_stride = x_expert_stride,
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
@@ -6362,6 +6367,7 @@ fn dispatchDmmvMoeQ6kOnCmd(
     expert_stride: u32,
     x_expert_stride: u32,
     extra_byte_offset: u32,
+    x_byte_offset: u32,
 ) void {
     if (tensor.info.type_ != .q6_k) {
         log.err("Batched MoE DMMV only supports Q6_K (tensor {s})", .{tensor.info.name});
@@ -6378,7 +6384,7 @@ fn dispatchDmmvMoeQ6kOnCmd(
         .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
         .expert_stride = expert_stride,
         .x_expert_stride = x_expert_stride,
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
@@ -6400,6 +6406,7 @@ fn dispatchDmmvMoeMxfp4OnCmd(
     expert_stride: u32,
     x_expert_stride: u32,
     extra_byte_offset: u32,
+    x_byte_offset: u32,
 ) !void {
     if (tensor.info.type_ != .mxfp4) return error.UnsupportedQuantType;
     if (K > 4096) return error.UnsupportedQuantType;
@@ -6411,7 +6418,7 @@ fn dispatchDmmvMoeMxfp4OnCmd(
         .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
         .expert_stride = expert_stride,
         .x_expert_stride = x_expert_stride,
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
@@ -6442,14 +6449,31 @@ fn dispatchDmmvMoeOnCmd(
     x_expert_stride: u32,
     extra_byte_offset: u32,
 ) !void {
+    try dispatchDmmvMoeOnCmdWithInputOffset(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, 0);
+}
+
+fn dispatchDmmvMoeOnCmdWithInputOffset(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    x_expert_stride: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+) !void {
     recordMoeDmmvProfile(engine, tensor, M, K, engine.config.n_experts_used);
 
     switch (tensor.info.type_) {
-        .q4_k => dispatchDmmvMoeQ4kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
-        .q5_1 => dispatchDmmvMoeQ5_1OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
-        .q5_k => dispatchDmmvMoeQ5kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
-        .q6_k => dispatchDmmvMoeQ6kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
-        .mxfp4 => try dispatchDmmvMoeMxfp4OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
+        .q4_k => dispatchDmmvMoeQ4kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
+        .q5_1 => dispatchDmmvMoeQ5_1OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
+        .q5_k => dispatchDmmvMoeQ5kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
+        .q6_k => dispatchDmmvMoeQ6kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
+        .mxfp4 => try dispatchDmmvMoeMxfp4OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
         else => return error.UnsupportedQuantType,
     }
 }
@@ -7603,6 +7627,7 @@ fn dispatchRouterQ8TopkOnCmd(
     n_experts: u32,
     k: u32,
     hidden_dim: u32,
+    x_byte_offset: u32,
 ) void {
     recordDmmvProfile(engine, tensor, n_experts, hidden_dim);
     if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
@@ -7611,7 +7636,7 @@ fn dispatchRouterQ8TopkOnCmd(
         .K = hidden_dim,
         .k = k,
         .a_offset = tensorPageOffset(engine.model, tensor),
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input, output };
     cmd.dispatchV2(&engine.router_q8_0_topk_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(RouterQ8TopkPush), 0);
@@ -9383,12 +9408,14 @@ fn dispatchMoeWeightedAccSharedGateF32OnCmd(
     n: u32,
     n_used: u32,
     src_stride: u32,
+    norm_byte_offset: u32,
 ) void {
     const push = MoeWeightedAccSharedGateF32Push{
         .n = n,
         .n_used = n_used,
         .src_stride = src_stride,
         .gate_weight_offset = tensorPageOffset(engine.model, gate_weight),
+        .norm_offset = norm_byte_offset,
     };
     const bufs = [_]*const MetalBuffer{ accum, src, routing, shared_src, norm_src, &gate_weight.gpu_buffer };
     cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_pipe, .{ (n + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
@@ -9426,7 +9453,7 @@ fn dispatchFullAttnPrepOnCmd(
         const q_full_dim = attn.q_dim * 2;
         dispatchDmmvOnCmd(engine, cmd, q_tensor, &engine.norm_buf, &engine.attn_out_buf, q_full_dim, hidden_dim, 0);
         if (can_pair_attn_kv) {
-            dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim);
+            dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
         } else {
             dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
             dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
@@ -9448,9 +9475,9 @@ fn dispatchFullAttnPrepOnCmd(
             dispatchDenseQ4KQKDualOnCmd(engine, cmd, q_tensor, k_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, attn.q_dim, attn.kv_dim, hidden_dim);
             dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
         } else if (can_pair_attn_q_gate) {
-            dispatchPairedQ8DmmvOnCmd(engine, cmd, q_tensor, lt.attn_gate.?, &engine.norm_buf, &engine.q_buf, &engine.gate_buf, attn.q_dim, hidden_dim);
+            dispatchPairedQ8DmmvOnCmd(engine, cmd, q_tensor, lt.attn_gate.?, &engine.norm_buf, &engine.q_buf, &engine.gate_buf, attn.q_dim, hidden_dim, 0);
             if (can_pair_attn_kv) {
-                dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim);
+                dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
             } else {
                 dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
                 dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
@@ -9461,7 +9488,7 @@ fn dispatchFullAttnPrepOnCmd(
                 dispatchDmmvOnCmd(engine, cmd, lt.attn_gate.?, &engine.norm_buf, &engine.gate_buf, attn.q_dim, hidden_dim, 0);
             }
             if (can_pair_attn_kv) {
-                dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim);
+                dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
             } else {
                 dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
                 dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
@@ -9597,7 +9624,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
         ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) or
             canUseQwen36FullAttnQ8Pair(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim));
     if (can_pair_attn_kv) {
-        dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim);
+        dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
     } else {
         dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
         dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
@@ -12866,7 +12893,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         );
     }
     if (canUsePairedQ8Dmmv(engine, gate_shexp, up_shexp, shexp_inter_dim, shexp_inter_dim, hidden_dim)) {
-        dispatchPairedQ8DmmvOnCmd(engine, cmd, gate_shexp, up_shexp, &engine.norm_buf, &engine.gate_buf, &engine.up_buf, shexp_inter_dim, hidden_dim);
+        dispatchPairedQ8DmmvOnCmd(engine, cmd, gate_shexp, up_shexp, &engine.norm_buf, &engine.gate_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
     } else {
         dispatchDmmvOnCmd(engine, cmd, gate_shexp, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
         dispatchDmmvOnCmd(engine, cmd, up_shexp, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
@@ -13010,6 +13037,8 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     inter_dim: u32,
     shexp_inter_dim: u32,
     router_output_ready: bool,
+    norm_input_buf: *const MetalBuffer,
+    norm_input_byte_offset: u32,
 ) !void {
     const cfg = engine.config;
     if (cfg.architecture == .gemma) {
@@ -13051,7 +13080,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
             cmd,
             gate_exps,
             up_exps,
-            &engine.norm_buf,
+            norm_input_buf,
             &engine.expert_gate_batch_buf,
             &engine.expert_up_batch_buf,
             &engine.router_output_buf,
@@ -13060,11 +13089,11 @@ fn recordGpuRoutedBatchedMoeOnCmd(
             expert_gate_bytes,
             expert_up_bytes,
             0,
-            0,
+            norm_input_byte_offset,
         );
     } else {
-        try dispatchDmmvMoeOnCmd(engine, cmd, gate_exps, &engine.norm_buf, &engine.expert_gate_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
-        try dispatchDmmvMoeOnCmd(engine, cmd, up_exps, &engine.norm_buf, &engine.expert_up_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_up_bytes, 0, 0);
+        try dispatchDmmvMoeOnCmdWithInputOffset(engine, cmd, gate_exps, norm_input_buf, &engine.expert_gate_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0, norm_input_byte_offset);
+        try dispatchDmmvMoeOnCmdWithInputOffset(engine, cmd, up_exps, norm_input_buf, &engine.expert_up_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_up_bytes, 0, 0, norm_input_byte_offset);
     }
     if (has_shexp) {
         // Qwen3.6 shared expert gate/up are equal-shape Q8_0 projections. Use
@@ -13072,14 +13101,14 @@ fn recordGpuRoutedBatchedMoeOnCmd(
         // X-vector loads) for the production path now that the Qwen shared
         // batched validator covers gate/up/down diffs.
         if (canUsePairedQ8Dmmv(engine, gate_shexp.?, up_shexp.?, shexp_inter_dim, shexp_inter_dim, hidden_dim)) {
-            dispatchPairedQ8DmmvOnCmd(engine, cmd, gate_shexp.?, up_shexp.?, &engine.norm_buf, &engine.gate_buf, &engine.up_buf, shexp_inter_dim, hidden_dim);
+            dispatchPairedQ8DmmvOnCmd(engine, cmd, gate_shexp.?, up_shexp.?, norm_input_buf, &engine.gate_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, norm_input_byte_offset);
         } else {
-            dispatchDmmvOnCmd(engine, cmd, gate_shexp.?, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
-            dispatchDmmvOnCmd(engine, cmd, up_shexp.?, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
+            dispatchDmmvOnCmdWithInputOffset(engine, cmd, gate_shexp.?, norm_input_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0, norm_input_byte_offset);
+            dispatchDmmvOnCmdWithInputOffset(engine, cmd, up_shexp.?, norm_input_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0, norm_input_byte_offset);
         }
         if (gate_inp_shexp) |tensor| {
             if (!use_f32_shared_gate_acc) {
-                dispatchDmmvOnCmd(engine, cmd, tensor, &engine.norm_buf, &engine.router_logits_buf, 1, hidden_dim, 0);
+                dispatchDmmvOnCmdWithInputOffset(engine, cmd, tensor, norm_input_buf, &engine.router_logits_buf, 1, hidden_dim, 0, norm_input_byte_offset);
             }
         }
     }
@@ -13112,7 +13141,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
             // Metal fusion discipline: for Qwen3.6's one-row F32 shared gate,
             // fold the gate dot product into the MoE combine kernel instead
             // of launching a separate 1xhidden DMMV before reduce.
-            dispatchMoeWeightedAccSharedGateF32OnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, &engine.norm_buf, gate_inp_shexp.?, hidden_dim, cfg.n_experts_used, hidden_dim);
+            dispatchMoeWeightedAccSharedGateF32OnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, norm_input_buf, gate_inp_shexp.?, hidden_dim, cfg.n_experts_used, hidden_dim, norm_input_byte_offset);
         } else {
             const gate_buf = if (gate_inp_shexp != null) &engine.router_logits_buf else &engine.down_buf;
             dispatchMoeWeightedAccSharedOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, gate_buf, hidden_dim, cfg.n_experts_used, hidden_dim, gate_inp_shexp != null);
@@ -13618,7 +13647,7 @@ fn runDecodeStep(
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
                     dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
                 } else if (use_fused_q8_router) {
-                    dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                    dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 0);
                 } else {
                     dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
                 }
@@ -13634,7 +13663,7 @@ fn runDecodeStep(
                         cmd = &local_cmd_storage;
                     }
                     if (use_standard_gpu_routed_moe) {
-                        try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, use_fused_q8_router);
+                        try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, use_fused_q8_router, &engine.norm_buf, 0);
                     } else {
                         try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, use_fused_gptoss_router);
                     }
@@ -13680,15 +13709,28 @@ fn runDecodeStep(
             }
 
             const use_prefill_branch_norm = shouldUseQwenSsmPrefillBranchNormChunk(engine, layer_idx);
+            const use_direct_prefill_branch_norm =
+                use_prefill_branch_norm and
+                !engine.debug_validation_enabled and
+                !engine.qwen_prefill_validation_enabled;
+            var ffn_norm_input_buf: *const MetalBuffer = &engine.norm_buf;
+            var ffn_norm_input_byte_offset: u32 = 0;
             var ssm_residual_buf: *const MetalBuffer = &engine.down_buf;
             var ssm_residual_offset: u32 = 0;
             if (use_prefill_branch_norm) {
                 // `prepareQwenSsmPrefillProjectionChunk` already materialized
                 // hidden += layer0_ssm_out and the FFN norm for this token.
-                // The step-level hidden copy reads the precomputed hidden row;
-                // copy only the matching norm row into the single-token buffer
-                // before the validated token-major router/MoE path.
-                dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.norm_buf, hidden_dim, engine.position * hidden_dim, 0);
+                // In production, consume the precomputed norm row directly through
+                // input offsets, matching llama.cpp/vLLM's avoid-materializing
+                // discipline for intermediate MoE inputs. Validation/debug keeps
+                // the older single-token buffer so CPU-side comparators see the
+                // same state as before.
+                if (use_direct_prefill_branch_norm) {
+                    ffn_norm_input_buf = &engine.qwen_ssm_prefill_proj_norm_buf;
+                    ffn_norm_input_byte_offset = @intCast(engine.position * hidden_dim * @sizeOf(f32));
+                } else {
+                    dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.norm_buf, hidden_dim, engine.position * hidden_dim, 0);
+                }
             } else if (shouldUseQwenSsmPrefillBranchChunk(engine, layer_idx)) {
                 // Adapt llama.cpp's `ggml_metal_op_concurrency_check` discipline:
                 // the layer-0 precompute command buffer already materialized this
@@ -13975,8 +14017,9 @@ fn runDecodeStep(
                         profileBarrier(cmd, profile, .router);
                         break :blk &engine.residual_buf;
                     }
-                    break :blk &engine.norm_buf;
+                    break :blk ffn_norm_input_buf;
                 };
+                const router_in_byte_offset: u32 = if (cfg.architecture == .gemma) 0 else ffn_norm_input_byte_offset;
                 const use_fused_gptoss_router = blk: {
                     if (!use_gpt_oss_gpu_routed_moe) break :blk false;
                     const router_bias = lt.ffn_gate_inp_bias orelse break :blk false;
@@ -13989,9 +14032,9 @@ fn runDecodeStep(
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
                     dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
                 } else if (use_fused_q8_router) {
-                    dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                    dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, router_in_byte_offset);
                 } else {
-                    dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
+                    dispatchDmmvOnCmdWithInputOffset(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0, router_in_byte_offset);
                 }
                 profileBarrier(cmd, profile, .router); // router output/logits visible before MoE
                 if (use_gpu_routed_moe) {
@@ -14005,7 +14048,7 @@ fn runDecodeStep(
                         cmd = &local_cmd_storage;
                     }
                     if (use_standard_gpu_routed_moe) {
-                        try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, use_fused_q8_router);
+                        try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, use_fused_q8_router, ffn_norm_input_buf, ffn_norm_input_byte_offset);
                     } else {
                         try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, use_fused_gptoss_router);
                     }
@@ -14111,8 +14154,8 @@ fn runDecodeStep(
 
                     if (use_batched_q4k_moe) {
                         // Phase 1: Batched gate+up expert projections (+ shared expert)
-                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, gate_exps, &engine.norm_buf, &engine.expert_gate_batch_buf, &engine.expert_ids_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
-                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, up_exps, &engine.norm_buf, &engine.expert_up_batch_buf, &engine.expert_ids_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
+                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, gate_exps, &engine.norm_buf, &engine.expert_gate_batch_buf, &engine.expert_ids_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0, 0);
+                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, up_exps, &engine.norm_buf, &engine.expert_up_batch_buf, &engine.expert_ids_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0, 0);
                         if (has_shexp) {
                             dispatchDmmvOnCmd(engine, &cmd, gate_shexp.?, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
                             dispatchDmmvOnCmd(engine, &cmd, up_shexp.?, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
@@ -14133,7 +14176,7 @@ fn runDecodeStep(
                         profileBarrier(&cmd, profile, .fallback_moe);
 
                         // Phase 3: Batched down expert projection (+ shared expert)
-                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, down_exps, &engine.expert_swiglu_batch_buf, &engine.expert_down_batch_buf, &engine.expert_ids_buf, hidden_dim, inter_dim, expert_down_bytes, inter_dim, 0);
+                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, down_exps, &engine.expert_swiglu_batch_buf, &engine.expert_down_batch_buf, &engine.expert_ids_buf, hidden_dim, inter_dim, expert_down_bytes, inter_dim, 0, 0);
                         if (down_shexp != null) {
                             dispatchDmmvOnCmd(engine, &cmd, down_shexp.?, &engine.swiglu_buf, &engine.down_buf, hidden_dim, shexp_inter_dim, 0);
                         }
@@ -20965,6 +21008,7 @@ test "moe_weighted_acc_shared_gate_f32 computes gate dot and reduce" {
         .n_used = n_used,
         .src_stride = n,
         .gate_weight_offset = 0,
+        .norm_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &accum_buf, &src_buf, &routing_buf, &shared_buf, &norm_buf, &gate_weight_buf };
 

@@ -6,6 +6,7 @@ struct Params {
     uint n_used;
     uint src_stride;
     uint gate_weight_offset;
+    uint norm_offset;
 };
 
 // Token-major Qwen MoE finalize with one-row F32 shared gate.
@@ -34,10 +35,11 @@ kernel void main0(
     threadgroup float gate_value;
 
     device const float* gate_weight = (device const float*)(gate_weight_bytes + p.gate_weight_offset);
+    device const float* norm = norm_src + (p.norm_offset >> 2);
 
     float dot = 0.0f;
     for (uint dim = tid; dim < p.n; dim += 256u) {
-        dot = fma(gate_weight[dim], norm_src[dim], dot);
+        dot = fma(gate_weight[dim], norm[dim], dot);
     }
 
     const float simd_sum_dot = simd_sum(dot);
