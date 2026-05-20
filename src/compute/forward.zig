@@ -1359,6 +1359,9 @@ pub const InferenceEngine = struct {
     partial_decode_stop_after_ffn_norm: bool = false,
     partial_decode_ffn_norm_out: ?vk.c.VkBuffer = null,
     partial_decode_ffn_norm_out_offset: vk.c.VkDeviceSize = 0,
+    partial_decode_stop_after_ssm_gnorm: bool = false,
+    partial_decode_ssm_gnorm_out: ?vk.c.VkBuffer = null,
+    partial_decode_ssm_gnorm_out_offset: vk.c.VkDeviceSize = 0,
     partial_ssm_preproj_layer: u32 = std.math.maxInt(u32),
     partial_ssm_preproj_token_idx: u32 = 0,
     partial_ssm_preproj_qkv: ?vk.c.VkBuffer = null,
@@ -6599,6 +6602,9 @@ pub const InferenceEngine = struct {
                     try self.runSsmLayerCpu(state, layer, layer_idx);
                 }
                 self.endProfilePhase(.ssm, ssm_phase);
+                if (self.partial_decode_stop_after_ssm_gnorm) {
+                    break;
+                }
             }
 
             // Prefill last-layer shortcut: at the final layer of a non-terminal prefill
@@ -11906,19 +11912,33 @@ pub const InferenceEngine = struct {
                 try self.elementwise.recordSsmGatedNorm(&self.decode_cmd, ds, push);
             }
         }
-        if (ssm_prefill_validate_output_capture) {
+        const stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm and
+            self.prefill_active and
+            self.partial_decode_ssm_gnorm_out != null;
+        if (ssm_prefill_validate_output_capture or stop_after_ssm_gnorm) {
             const tok_idx = self.prefill_current_token_idx;
             const z_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
             const hidden_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
             self.decode_cmd.computeAndTransferBarrier();
-            const r_gnorm = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = z_dst_off, .size = z_bytes };
-            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.ssm_prefill_validate_gnorm_ref.?.handle, 1, &r_gnorm);
-            const r_pre_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = hidden_dst_off, .size = hidden_size };
-            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.ssm_prefill_validate_pre_hidden_ref.?.handle, 1, &r_pre_hidden);
+            if (ssm_prefill_validate_output_capture) {
+                const r_gnorm = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = z_dst_off, .size = z_bytes };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.ssm_prefill_validate_gnorm_ref.?.handle, 1, &r_gnorm);
+                const r_pre_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = hidden_dst_off, .size = hidden_size };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.ssm_prefill_validate_pre_hidden_ref.?.handle, 1, &r_pre_hidden);
+            }
+            if (stop_after_ssm_gnorm) {
+                const gnorm_copy = vk.c.VkBufferCopy{
+                    .srcOffset = 0,
+                    .dstOffset = self.partial_decode_ssm_gnorm_out_offset,
+                    .size = z_bytes,
+                };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.partial_decode_ssm_gnorm_out.?, 1, &gnorm_copy);
+            }
         } else {
             self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, z_bytes);
         }
         self.endProfilePhase(.ssm_gated_norm, ssm_gated_norm_phase);
+        if (stop_after_ssm_gnorm) return;
 
         // --- GPU: ssm_out DMMV + residual (fused: accumulate directly into hidden_buf) ---
         const ssm_out_tensor = lt.ssm_out orelse return;
@@ -12175,6 +12195,145 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn prefillQwen36RunSsmLayerToFfnNorm(
+        self: *InferenceEngine,
+        state: *DecodeState,
+        prompt_tokens: []const u32,
+        base_token: u32,
+        n_tokens: u32,
+        hidden_dim: u32,
+        d_inner: u32,
+        hidden_size: vk.c.VkDeviceSize,
+        layer: u32,
+        scratch_hidden: Buffer,
+        scratch_swiglu: Buffer,
+        scratch_norm: Buffer,
+        pipeline_enabled: bool,
+    ) !void {
+        if (n_tokens == 0) return;
+        const lt = self.layer_tensors[layer];
+        const ssm_out_t = lt.ssm_out orelse return error.TensorNotFound;
+        const ffn_norm_t = lt.ffn_norm orelse
+            lt.post_attention_norm orelse return error.TensorNotFound;
+        const z_bytes = @as(vk.c.VkDeviceSize, d_inner) * @sizeOf(f32);
+
+        const saved_stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm;
+        const saved_ssm_gnorm_out = self.partial_decode_ssm_gnorm_out;
+        const saved_ssm_gnorm_out_offset = self.partial_decode_ssm_gnorm_out_offset;
+        defer {
+            self.partial_decode_stop_after_ssm_gnorm = saved_stop_after_ssm_gnorm;
+            self.partial_decode_ssm_gnorm_out = saved_ssm_gnorm_out;
+            self.partial_decode_ssm_gnorm_out_offset = saved_ssm_gnorm_out_offset;
+        }
+
+        var primary_pending: bool = false;
+        var alt_pending: bool = false;
+        var tok_idx: u32 = 0;
+        while (tok_idx < n_tokens) : (tok_idx += 1) {
+            const pipeline_this = pipeline_enabled;
+            if (pipeline_this) {
+                std.mem.swap(CommandBuffer, &self.decode_cmd, &self.prefill_cmd_alt);
+                std.mem.swap(bool, &primary_pending, &alt_pending);
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = true;
+            } else {
+                if (alt_pending) {
+                    try self.prefill_cmd_alt.waitForCompletion();
+                    alt_pending = false;
+                }
+                if (primary_pending) {
+                    try self.decode_cmd.waitForCompletion();
+                    primary_pending = false;
+                }
+                self.prefill_pipeline_mode = false;
+            }
+
+            const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+            self.prefill_current_token_idx = tok_idx;
+            state.position = base_token + tok_idx;
+            self.partial_decode_start_layer = layer;
+            self.partial_decode_end_layer = layer + 1;
+            self.partial_decode_hidden_in = scratch_hidden.handle;
+            self.partial_decode_hidden_in_offset = hidden_offset;
+            self.partial_decode_hidden_out = null;
+            self.partial_decode_hidden_out_offset = 0;
+            self.partial_decode_advance_position = false;
+            self.partial_decode_allow_final_tail = false;
+            self.partial_decode_stop_after_ffn_norm = false;
+            self.partial_decode_ffn_norm_out = null;
+            self.partial_decode_ffn_norm_out_offset = 0;
+            self.partial_decode_stop_after_ssm_gnorm = true;
+            self.partial_decode_ssm_gnorm_out = scratch_swiglu.handle;
+            self.partial_decode_ssm_gnorm_out_offset = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+
+            try self.decodeStep(state, prompt_tokens[tok_idx], false);
+            if (pipeline_this) {
+                primary_pending = true;
+            }
+        }
+
+        self.prefill_pipeline_mode = false;
+        if (alt_pending) {
+            try self.prefill_cmd_alt.waitForCompletion();
+        }
+        if (primary_pending) {
+            try self.decode_cmd.waitForCompletion();
+        }
+
+        self.partial_decode_stop_after_ssm_gnorm = false;
+        self.partial_decode_ssm_gnorm_out = null;
+        self.partial_decode_ssm_gnorm_out_offset = 0;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.resetTimestamps();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        self.decode_cmd.transferToComputeBarrier();
+
+        const ssm_phase = self.beginProfilePhase();
+        const ssm_out_phase = self.beginProfilePhase();
+        var out_tok: u32 = 0;
+        while (out_tok < n_tokens) : (out_tok += 1) {
+            const x_offset = out_tok * d_inner * @sizeOf(f32);
+            const y_offset = out_tok * hidden_dim * @sizeOf(f32);
+            try self.dispatchDmmvInner(
+                ssm_out_t,
+                scratch_swiglu,
+                scratch_swiglu.size,
+                scratch_hidden,
+                hidden_dim,
+                d_inner,
+                0,
+                x_offset,
+                y_offset,
+                1,
+            );
+        }
+        self.endProfilePhase(.ssm_out, ssm_out_phase);
+        self.endProfilePhase(.ssm, ssm_phase);
+        self.decode_cmd.computeBarrier();
+        try self.dispatchRmsNorm(
+            scratch_hidden.handle,
+            scratch_hidden.size,
+            ffn_norm_t.gpu_buffer.handle,
+            ffn_norm_t.gpu_buffer.size,
+            scratch_norm.handle,
+            scratch_norm.size,
+            hidden_dim,
+            n_tokens,
+            self.model.config.rms_norm_eps,
+        );
+        self.decode_cmd.computeToTransferBarrier();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        self.recordProfilingSample();
+    }
+
     fn prefillQwen36RunBatchedDenseFfnLayer(
         self: *InferenceEngine,
         layer: u32,
@@ -12404,6 +12563,9 @@ pub const InferenceEngine = struct {
         const saved_stop_after_norm = self.partial_decode_stop_after_ffn_norm;
         const saved_norm_out = self.partial_decode_ffn_norm_out;
         const saved_norm_out_offset = self.partial_decode_ffn_norm_out_offset;
+        const saved_stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm;
+        const saved_ssm_gnorm_out = self.partial_decode_ssm_gnorm_out;
+        const saved_ssm_gnorm_out_offset = self.partial_decode_ssm_gnorm_out_offset;
         const saved_ssm_preproj_layer = self.partial_ssm_preproj_layer;
         const saved_ssm_preproj_token_idx = self.partial_ssm_preproj_token_idx;
         const saved_ssm_preproj_qkv = self.partial_ssm_preproj_qkv;
@@ -12424,6 +12586,9 @@ pub const InferenceEngine = struct {
             self.partial_decode_stop_after_ffn_norm = saved_stop_after_norm;
             self.partial_decode_ffn_norm_out = saved_norm_out;
             self.partial_decode_ffn_norm_out_offset = saved_norm_out_offset;
+            self.partial_decode_stop_after_ssm_gnorm = saved_stop_after_ssm_gnorm;
+            self.partial_decode_ssm_gnorm_out = saved_ssm_gnorm_out;
+            self.partial_decode_ssm_gnorm_out_offset = saved_ssm_gnorm_out_offset;
             self.partial_ssm_preproj_layer = saved_ssm_preproj_layer;
             self.partial_ssm_preproj_token_idx = saved_ssm_preproj_token_idx;
             self.partial_ssm_preproj_qkv = saved_ssm_preproj_qkv;
@@ -12505,24 +12670,41 @@ pub const InferenceEngine = struct {
                 }
             }
 
-            var tok_idx: u32 = 0;
-            while (tok_idx < n_tokens) : (tok_idx += 1) {
-                const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
-                self.prefill_current_token_idx = tok_idx;
-                self.partial_ssm_preproj_token_idx = tok_idx;
-                state.position = base_token + tok_idx;
-                self.partial_decode_start_layer = layer;
-                self.partial_decode_end_layer = layer + 1;
-                self.partial_decode_hidden_in = scratch_hidden.handle;
-                self.partial_decode_hidden_in_offset = hidden_offset;
-                self.partial_decode_hidden_out = scratch_hidden.handle;
-                self.partial_decode_hidden_out_offset = hidden_offset;
-                self.partial_decode_advance_position = false;
-                self.partial_decode_allow_final_tail = false;
-                self.partial_decode_stop_after_ffn_norm = true;
-                self.partial_decode_ffn_norm_out = scratch_norm.handle;
-                self.partial_decode_ffn_norm_out_offset = hidden_offset;
-                try self.decodeStep(state, prompt_tokens[tok_idx], false);
+            if (!is_full_attn and !use_ssm_preproj) {
+                try self.prefillQwen36RunSsmLayerToFfnNorm(
+                    state,
+                    prompt_tokens,
+                    base_token,
+                    n_tokens,
+                    hidden_dim,
+                    cfg.ssm_d_inner,
+                    hidden_size,
+                    layer,
+                    scratch_hidden,
+                    scratch_swiglu,
+                    scratch_norm,
+                    false,
+                );
+            } else {
+                var tok_idx: u32 = 0;
+                while (tok_idx < n_tokens) : (tok_idx += 1) {
+                    const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+                    self.prefill_current_token_idx = tok_idx;
+                    self.partial_ssm_preproj_token_idx = tok_idx;
+                    state.position = base_token + tok_idx;
+                    self.partial_decode_start_layer = layer;
+                    self.partial_decode_end_layer = layer + 1;
+                    self.partial_decode_hidden_in = scratch_hidden.handle;
+                    self.partial_decode_hidden_in_offset = hidden_offset;
+                    self.partial_decode_hidden_out = scratch_hidden.handle;
+                    self.partial_decode_hidden_out_offset = hidden_offset;
+                    self.partial_decode_advance_position = false;
+                    self.partial_decode_allow_final_tail = false;
+                    self.partial_decode_stop_after_ffn_norm = true;
+                    self.partial_decode_ffn_norm_out = scratch_norm.handle;
+                    self.partial_decode_ffn_norm_out_offset = hidden_offset;
+                    try self.decodeStep(state, prompt_tokens[tok_idx], false);
+                }
             }
 
             try self.prefillQwen36RunBatchedDenseFfnLayer(
@@ -12567,22 +12749,40 @@ pub const InferenceEngine = struct {
                     pipeline_tail,
                 );
             }
-            try self.prefillQwen36RunPartialTokenLoop(
-                state,
-                prompt_tokens,
-                base_token,
-                n_tokens,
-                hidden_size,
-                segment_layer,
-                segment_layer + 1,
-                scratch_hidden,
-                scratch_norm,
-                true,
-                true,
-                false,
-                false,
-                pipeline_tail,
-            );
+            const segment_is_full_attn = ((segment_layer + 1) % full_attn_interval) == 0;
+            if (!segment_is_full_attn) {
+                try self.prefillQwen36RunSsmLayerToFfnNorm(
+                    state,
+                    prompt_tokens,
+                    base_token,
+                    n_tokens,
+                    hidden_dim,
+                    cfg.ssm_d_inner,
+                    hidden_size,
+                    segment_layer,
+                    scratch_hidden,
+                    scratch_swiglu,
+                    scratch_norm,
+                    pipeline_tail,
+                );
+            } else {
+                try self.prefillQwen36RunPartialTokenLoop(
+                    state,
+                    prompt_tokens,
+                    base_token,
+                    n_tokens,
+                    hidden_size,
+                    segment_layer,
+                    segment_layer + 1,
+                    scratch_hidden,
+                    scratch_norm,
+                    true,
+                    true,
+                    false,
+                    false,
+                    pipeline_tail,
+                );
+            }
             try self.prefillQwen36RunBatchedDenseFfnLayer(
                 segment_layer,
                 n_tokens,
