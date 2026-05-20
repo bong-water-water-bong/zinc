@@ -12052,6 +12052,15 @@ pub const InferenceEngine = struct {
         }
 
         const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
+        if (full_attn_interval == 4 and cfg.n_layers > 52) {
+            // Measured on the 27B Coding Review prefill: mid-model SSM FFN
+            // segments beat spending the final slots on late attention layers.
+            const tuned_layers = [_]u32{ 3, 7, 11, 14, 15, 18, 19, 20, 23, 27, 31, 35, 39, 43, 47, 51 };
+            for (tuned_layers) |segment_layer| {
+                self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
+            }
+            return count;
+        }
         var segment_layer: u32 = full_attn_interval - 1;
         while (segment_layer + 1 < cfg.n_layers and count < out.len) : (segment_layer += full_attn_interval) {
             self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
