@@ -96,11 +96,11 @@ kernel void main0(
     float beta_lane = 0.0f;
     if (simd_lane == 0u) {
         const float alpha_raw = alpha[p.alpha_offset + head] + dt_bias[head];
-        const float softplus_alpha = log(1.0f + exp(alpha_raw));
+        const float softplus_alpha = log(1.0f + fast::exp(alpha_raw));
         q_scale_lane = rsqrt(fast::max(q_norm_sq, 1.0e-13f)) * inv_sqrt_d_state;
         k_scale_lane = rsqrt(fast::max(k_norm_sq, 1.0e-13f));
-        decay_lane = exp(softplus_alpha * ssm_a[head]);
-        beta_lane = 1.0f / (1.0f + exp(-beta[p.beta_offset + head]));
+        decay_lane = fast::exp(softplus_alpha * ssm_a[head]);
+        beta_lane = fast::divide(1.0f, 1.0f + fast::exp(-beta[p.beta_offset + head]));
     }
 
     const float q_scale = simd_broadcast(q_scale_lane, 0u);
