@@ -12055,10 +12055,11 @@ pub const InferenceEngine = struct {
 
         const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
         if (full_attn_interval == 4 and cfg.n_layers > 52) {
-            // Measured on the 27B Coding Review prefill: the extra mid-model SSM
+            // Measured on the 27B Coding Review prefill: mid/late SSM
             // segments keep more dense FFN work layer-major without repeating
-            // the rejected SSM projection replay path.
-            const tuned_layers = [_]u32{ 3, 7, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 27, 28, 29, 30, 31, 35, 39, 43, 47 };
+            // the rejected SSM projection replay path. The earliest segments
+            // cost more orchestration than they save on this prompt shape.
+            const tuned_layers = [_]u32{ 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 27, 28, 29, 30, 31, 35, 39, 43, 47, 51, 55 };
             for (tuned_layers) |segment_layer| {
                 self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
             }
