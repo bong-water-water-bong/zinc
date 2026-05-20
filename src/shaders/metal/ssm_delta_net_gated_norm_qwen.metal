@@ -52,7 +52,6 @@ kernel void main0(
     threadgroup float partial_q[4];
     threadgroup float partial_k[4];
     threadgroup float partial_sq[4];
-    threadgroup float head_scalars[4]; // q_scale, k_scale, decay, beta
 
     const uint tg_threads = simd_width * simdgroups_per_tg;
     const uint simd_lane = tid & 31u;
@@ -81,26 +80,33 @@ kernel void main0(
         partial_k[simd_idx] = k_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        float q_norm_sq = 0.0f;
-        float k_norm_sq = 0.0f;
-        for (uint i = 0u; i < simdgroups_per_tg; ++i) {
-            q_norm_sq += partial_q[i];
-            k_norm_sq += partial_k[i];
-        }
+
+    // Every simdgroup folds the tiny cross-simdgroup partial arrays itself,
+    // mirroring the final RMS reduction below. Lane 0 computes the scalar
+    // setup once per simdgroup and broadcasts within the simdgroup, avoiding a
+    // second threadgroup barrier before the 128 row workers enter the state loop.
+    const float q_partial = (simd_lane < simdgroups_per_tg) ? partial_q[simd_lane] : 0.0f;
+    const float k_partial = (simd_lane < simdgroups_per_tg) ? partial_k[simd_lane] : 0.0f;
+    const float q_norm_sq = simd_sum(q_partial);
+    const float k_norm_sq = simd_sum(k_partial);
+
+    float q_scale_lane = 0.0f;
+    float k_scale_lane = 0.0f;
+    float decay_lane = 0.0f;
+    float beta_lane = 0.0f;
+    if (simd_lane == 0u) {
         const float alpha_raw = alpha[p.alpha_offset + head] + dt_bias[head];
         const float softplus_alpha = log(1.0f + exp(alpha_raw));
-        head_scalars[0] = rsqrt(fast::max(q_norm_sq, 1.0e-13f)) * inv_sqrt_d_state;
-        head_scalars[1] = rsqrt(fast::max(k_norm_sq, 1.0e-13f));
-        head_scalars[2] = exp(softplus_alpha * ssm_a[head]);
-        head_scalars[3] = 1.0f / (1.0f + exp(-beta[p.beta_offset + head]));
+        q_scale_lane = rsqrt(fast::max(q_norm_sq, 1.0e-13f)) * inv_sqrt_d_state;
+        k_scale_lane = rsqrt(fast::max(k_norm_sq, 1.0e-13f));
+        decay_lane = exp(softplus_alpha * ssm_a[head]);
+        beta_lane = 1.0f / (1.0f + exp(-beta[p.beta_offset + head]));
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float q_scale = head_scalars[0];
-    const float k_scale = head_scalars[1];
-    const float decay = head_scalars[2];
-    const float beta_val = head_scalars[3];
+    const float q_scale = simd_broadcast(q_scale_lane, 0u);
+    const float k_scale = simd_broadcast(k_scale_lane, 0u);
+    const float decay = simd_broadcast(decay_lane, 0u);
+    const float beta_val = simd_broadcast(beta_lane, 0u);
 
     float local_sq = 0.0f;
     for (uint row = tid; row < head_v_dim; row += tg_threads) {
