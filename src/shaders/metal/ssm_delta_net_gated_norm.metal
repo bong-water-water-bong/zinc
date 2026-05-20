@@ -130,13 +130,11 @@ kernel void main0(
 
         const float v = conv_out[v_base + row];
         const float delta = beta_val * (v - sk);
-        for (uint col = 0u; col < k_len; ++col) {
-            state[row_base + col] = fma(k[col], delta, state[row_base + col]);
-        }
-
         float out_v = 0.0f;
         for (uint col = 0u; col < k_len; ++col) {
-            out_v = fma(state[row_base + col], q[col], out_v);
+            const float updated = fma(k[col], delta, state[row_base + col]);
+            state[row_base + col] = updated;
+            out_v = fma(updated, q[col], out_v);
         }
         delta_out[row] = out_v;
         local_sq = fma(out_v, out_v, local_sq);

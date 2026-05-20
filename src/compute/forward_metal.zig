@@ -18411,6 +18411,138 @@ test "ssm_delta_net shader matches CPU reference at model-like dimensions" {
     }
 }
 
+test "ssm_delta_net_gated_norm shader matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const dt_rank: usize = 2;
+    const head_v_dim: usize = 4;
+    const d_state: usize = 2;
+    const n_group: usize = 1;
+    const d_inner: usize = dt_rank * head_v_dim;
+    const qk_dim: usize = d_state * n_group;
+    const conv_len: usize = 2 * qk_dim + d_inner;
+    const state_len: usize = dt_rank * head_v_dim * head_v_dim;
+
+    var conv_buf = try metal_buffer.createBuffer(ctx, conv_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&conv_buf);
+    var alpha_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&alpha_buf);
+    var dt_bias_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dt_bias_buf);
+    var ssm_a_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&ssm_a_buf);
+    var beta_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&beta_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var z_buf = try metal_buffer.createBuffer(ctx, d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&z_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const conv_ptr: [*]f32 = @ptrCast(@alignCast(conv_buf.cpu_ptr.?));
+    const alpha_ptr: [*]f32 = @ptrCast(@alignCast(alpha_buf.cpu_ptr.?));
+    const dt_bias_ptr: [*]f32 = @ptrCast(@alignCast(dt_bias_buf.cpu_ptr.?));
+    const ssm_a_ptr: [*]f32 = @ptrCast(@alignCast(ssm_a_buf.cpu_ptr.?));
+    const beta_ptr: [*]f32 = @ptrCast(@alignCast(beta_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const z_ptr: [*]f32 = @ptrCast(@alignCast(z_buf.cpu_ptr.?));
+    const norm_ptr: [*]f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    for (0..conv_len) |i| {
+        const pattern: i32 = @intCast((i * 7) % 19);
+        conv_ptr[i] = @as(f32, @floatFromInt(pattern - 9)) * 0.09;
+    }
+    for (0..dt_rank) |i| {
+        const value: f32 = @floatFromInt(i);
+        alpha_ptr[i] = 0.13 * value - 0.08;
+        beta_ptr[i] = 0.21 - 0.17 * value;
+        dt_bias_ptr[i] = 0.05 * value - 0.02;
+        ssm_a_ptr[i] = -0.6 - 0.1 * value;
+    }
+    for (0..state_len) |i| {
+        const pattern: i32 = @intCast((i * 5) % 23);
+        state_ptr[i] = @as(f32, @floatFromInt(pattern - 11)) * 0.035;
+    }
+    for (0..d_inner) |i| {
+        const pattern: i32 = @intCast((i * 3) % 13);
+        z_ptr[i] = @as(f32, @floatFromInt(pattern - 6)) * 0.11;
+        norm_ptr[i] = 0.75 + @as(f32, @floatFromInt(i % 5)) * 0.07;
+    }
+    @memset(output_ptr[0..d_inner], 0);
+
+    var ref_state: [state_len]f32 = undefined;
+    var ref_delta: [d_inner]f32 = [_]f32{0} ** d_inner;
+    var ref_output: [d_inner]f32 = [_]f32{0} ** d_inner;
+    @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
+    refRunSsmDeltaNet(
+        conv_ptr[0..conv_len],
+        alpha_ptr[0..dt_rank],
+        dt_bias_ptr[0..dt_rank],
+        beta_ptr[0..dt_rank],
+        ssm_a_ptr[0..dt_rank],
+        ref_state[0..state_len],
+        ref_delta[0..d_inner],
+        dt_rank,
+        head_v_dim,
+        d_state,
+        n_group,
+    );
+    refRunSsmGatedNorm(
+        ref_delta[0..d_inner],
+        z_ptr[0..d_inner],
+        norm_ptr[0..d_inner],
+        ref_output[0..d_inner],
+        dt_rank,
+        head_v_dim,
+        d_state,
+        true,
+    );
+
+    var cmd = try metal_command.beginCommand(ctx);
+    dispatchSsmDeltaNetGatedNormOnCmd(
+        &cmd,
+        &pipe,
+        &conv_buf,
+        &alpha_buf,
+        &dt_bias_buf,
+        &ssm_a_buf,
+        &beta_buf,
+        &state_buf,
+        &z_buf,
+        &norm_buf,
+        &output_buf,
+        @intCast(d_inner),
+        @intCast(dt_rank),
+        @intCast(head_v_dim),
+        @intCast(d_state),
+        @intCast(n_group),
+        true,
+        true,
+        0,
+        0,
+        0,
+        0,
+        true,
+    );
+    cmd.commitAndWait();
+
+    for (0..d_inner) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.001);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.001);
+    }
+}
+
 test "topKSoftmax with uniform logits returns equal weights" {
     var ids: [3]u32 = undefined;
     var weights: [3]f32 = undefined;
