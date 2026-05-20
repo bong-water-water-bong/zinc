@@ -53,7 +53,13 @@ kernel void main0(
     threadgroup float q[128];
     threadgroup float k[128];
     threadgroup float delta_out[128];
-    threadgroup float partial[4];
+    // Keep each cross-simdgroup reduction in its own scratch lane. This mirrors
+    // llama.cpp's Metal matvec reducers, where reduction scratch is not reused
+    // until the dependent value is fully consumed; here it lets the RMS pass
+    // start without an extra barrier after the state update.
+    threadgroup float partial_q[4];
+    threadgroup float partial_k[4];
+    threadgroup float partial_sq[4];
 
     const uint qk_dim = p.d_state * p.n_group;
     const uint group = (p.n_group == p.dt_rank) ? head : (head % p.n_group);
@@ -76,38 +82,38 @@ kernel void main0(
 
     float q_sum = simd_sum(q_ss);
     if ((tid % simd_width) == 0u) {
-        partial[tid / simd_width] = q_sum;
+        partial_q[tid / simd_width] = q_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
         float total = 0.0f;
         const uint n_sg = simdgroups_per_tg;
         for (uint i = 0u; i < n_sg; ++i) {
-            total += partial[i];
+            total += partial_q[i];
         }
-        partial[0] = total;
+        partial_q[0] = total;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float q_scale = rsqrt(fast::max(partial[0], 1.0e-13f)) / sqrt(float(p.d_state));
+    const float q_scale = rsqrt(fast::max(partial_q[0], 1.0e-13f)) / sqrt(float(p.d_state));
     for (uint i = tid; i < k_len; i += tg_threads) {
         q[i] *= q_scale;
     }
 
     float k_sum = simd_sum(k_ss);
     if ((tid % simd_width) == 0u) {
-        partial[tid / simd_width] = k_sum;
+        partial_k[tid / simd_width] = k_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
         float total = 0.0f;
         const uint n_sg = simdgroups_per_tg;
         for (uint i = 0u; i < n_sg; ++i) {
-            total += partial[i];
+            total += partial_k[i];
         }
-        partial[0] = total;
+        partial_k[0] = total;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float k_scale = rsqrt(fast::max(partial[0], 1.0e-13f));
+    const float k_scale = rsqrt(fast::max(partial_k[0], 1.0e-13f));
     for (uint i = tid; i < k_len; i += tg_threads) {
         k[i] *= k_scale;
     }
@@ -147,23 +153,21 @@ kernel void main0(
         delta_out[row] = out_v;
         local_sq = fma(out_v, out_v, local_sq);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     float sq_sum = simd_sum(local_sq);
     if ((tid % simd_width) == 0u) {
-        partial[tid / simd_width] = sq_sum;
+        partial_sq[tid / simd_width] = sq_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
         float total = 0.0f;
         const uint n_sg = simdgroups_per_tg;
         for (uint i = 0u; i < n_sg; ++i) {
-            total += partial[i];
+            total += partial_sq[i];
         }
-        partial[0] = total;
+        partial_sq[0] = total;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float rms = rsqrt((partial[0] / float(p.head_v_dim)) + 1.0e-6f);
+    const float rms = rsqrt((partial_sq[0] / float(p.head_v_dim)) + 1.0e-6f);
 
     for (uint row = tid; row < p.head_v_dim; row += tg_threads) {
         const uint head_base = head * p.head_v_dim;
