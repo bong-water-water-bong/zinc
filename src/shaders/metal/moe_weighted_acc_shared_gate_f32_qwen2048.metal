@@ -13,8 +13,8 @@ struct Params {
 //
 // The generic kernel splits the hidden row into 512-wide tiles, so it
 // recomputes sigmoid(dot(norm, shared_gate_weight)) once per tile. This variant
-// runs one 1024-thread group, computes the gate dot once, and lets each thread
-// update two hidden dimensions.
+// runs one 1024-thread group, reduces the gate dot once through simdgroup
+// partials, and lets each thread update two hidden dimensions.
 kernel void main0(
     device float* accum [[buffer(0)]],
     device const float* src [[buffer(1)]],
@@ -33,8 +33,6 @@ kernel void main0(
     }
 
     threadgroup float partials[32];
-    threadgroup float gate_value;
-
     device const float* gate_weight = (device const float*)(gate_weight_bytes + p.gate_weight_offset);
     device const float* norm = norm_src + (p.norm_offset >> 2);
     const uint threads_per_tg = simdgroups_per_tg * 32u;
@@ -50,14 +48,9 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (simdgroup == 0u) {
-        const float part = (lane < simdgroups_per_tg) ? partials[lane] : 0.0f;
-        const float group_sum = simd_sum(part);
-        if (lane == 0u) {
-            gate_value = fast::divide(1.0f, 1.0f + fast::exp(-group_sum));
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float part = (lane < simdgroups_per_tg) ? partials[lane] : 0.0f;
+    const float group_sum = simd_sum(part);
+    const float gate = fast::divide(1.0f, 1.0f + fast::exp(-group_sum));
 
     for (uint id = tid; id < p.n; id += threads_per_tg) {
         float sum = 0.0f;
@@ -65,6 +58,6 @@ kernel void main0(
             const float weight = as_type<float>(routing[p.n_used + expert]);
             sum += weight * src[expert * p.src_stride + id];
         }
-        accum[id] += sum + gate_value * shared_src[id];
+        accum[id] += sum + gate * shared_src[id];
     }
 }
