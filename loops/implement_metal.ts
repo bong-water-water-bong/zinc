@@ -73,6 +73,7 @@ const BENCHMARK_WARMUPS = parsePositiveIntEnv("ZINC_BENCHMARK_WARMUPS", 1);
 const BENCHMARK_TRIM = parseBoolEnv("ZINC_BENCHMARK_TRIM", true);
 const PROFILE_EVERY = parsePositiveIntEnv("ZINC_PROFILE_EVERY", 5); // Run with --profile every N cycles
 const STALL_THRESHOLD = 5; // Cycles without tok/s improvement before studying references
+const RECENT_PROGRESS_WINDOW = 10;
 const TEST_TIMEOUT_MS = parsePositiveIntEnv("ZINC_TEST_TIMEOUT_MS", 120_000);
 const RUN_TIMEOUT_MS = parsePositiveIntEnv("ZINC_RUN_TIMEOUT_MS", 300_000);
 const STOP_ON_TARGET = parseBoolEnv("ZINC_STOP_ON_TARGET", true);
@@ -190,6 +191,10 @@ function bestAcceptedTokPerSec(state: RunState, lastResult: BuildRunResult): num
   return candidates.length > 0 ? Math.max(...candidates) : null;
 }
 
+function smallAcceptedProgressBand(anchorTokPerSec: number): number {
+  return Math.max(0.15, anchorTokPerSec * 0.003);
+}
+
 export function bestKeptCorrectTokPerSec(
   state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest">,
 ): number {
@@ -212,13 +217,19 @@ export function bestKeptCorrectTokPerSec(
   return candidates.length > 0 ? Math.max(...candidates) : 0;
 }
 
-function currentAcceptedTokPerSec(state: Pick<RunState, "currentBest" | "bestTokPerSec">): number {
+export function currentAcceptedTokPerSec(state: Pick<RunState, "cycles" | "currentBest" | "bestTokPerSec">): number {
   if (
     state.currentBest?.containsReference &&
     state.currentBest.tokPerSec != null &&
     state.currentBest.tokPerSec > 0
   ) {
     return state.currentBest.tokPerSec;
+  }
+  for (let idx = state.cycles.length - 1; idx >= 0; idx--) {
+    const cycle = state.cycles[idx];
+    if (cycle.kept && cycle.containsReference && cycle.tokPerSec != null && cycle.tokPerSec > 0) {
+      return cycle.tokPerSec;
+    }
   }
   return Number.isFinite(state.bestTokPerSec) && state.bestTokPerSec > 0 ? state.bestTokPerSec : 0;
 }
@@ -239,6 +250,37 @@ export function keepBaselinesForCycle(
 
 function normalizeStateBestTokPerSec(state: RunState): void {
   state.bestTokPerSec = Math.max(state.bestTokPerSec, bestKeptCorrectTokPerSec(state));
+}
+
+export function recentAcceptedProgress(
+  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest">,
+  window = RECENT_PROGRESS_WINDOW,
+): { start: number; end: number; delta: number; threshold: number; hasProgress: boolean } {
+  const recent = state.cycles.slice(-window);
+  if (recent.length === 0) {
+    const current = currentAcceptedTokPerSec(state);
+    const threshold = smallAcceptedProgressBand(current);
+    return { start: current, end: current, delta: 0, threshold, hasProgress: false };
+  }
+
+  const priorKept = state.cycles
+    .slice(0, -recent.length)
+    .filter(c => c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0)
+    .map(c => c.tokPerSec!);
+  const recentKept = recent
+    .filter(c => c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0)
+    .map(c => c.tokPerSec!);
+
+  const start = priorKept.length > 0
+    ? Math.max(...priorKept)
+    : (recentKept.length > 0 ? recentKept[0] : currentAcceptedTokPerSec(state));
+  const endCandidates = [...recentKept];
+  const current = currentAcceptedTokPerSec(state);
+  if (current > 0) endCandidates.push(current);
+  const end = endCandidates.length > 0 ? Math.max(start, ...endCandidates) : start;
+  const delta = end - start;
+  const threshold = smallAcceptedProgressBand(start > 0 ? start : end);
+  return { start, end, delta, threshold, hasProgress: delta >= threshold };
 }
 
 function highestMatchingCycle(
@@ -264,6 +306,8 @@ function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): s
   if (!isQwen36PrefillRun(state)) return [];
 
   const best = bestAcceptedTokPerSec(state, lastResult);
+  const currentAccepted = Math.max(currentAcceptedTokPerSec(state), correctResultTokPerSec(lastResult));
+  const recentProgress = recentAcceptedProgress(state);
   const tokenMajorWin = highestMatchingCycle(
     state.cycles,
     (c) => c.kept && c.containsReference && /token-major|shared-gate|topk_weight_and_reduce/i.test(c.description),
@@ -281,6 +325,12 @@ function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): s
     return !c.kept && !c.containsReference && /dual.?q8|two-row|qkv\+z|attn_qkv\+attn_gate/.test(text);
   });
   const bangOnlyFailures = state.cycles.filter((c) => !c.kept && /^!+$/.test(c.outputText.trim()));
+  const routePackDensityLine = state.lastProfileOutput
+    ?.split("\n")
+    .find(line => /route-pack candidate blocks/i.test(line));
+  const lastKept = [...state.cycles].reverse().find(c => c.kept && c.containsReference);
+  const lastKeptWasVisibilityOnly = lastKept != null &&
+    /profile|validator|diff|density|visibility|counter/i.test(lastKept.description);
 
   const lines: string[] = [
     "## Qwen3.6 35B Prefill 50 tok/s Focus",
@@ -293,6 +343,12 @@ function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): s
       lines.push(`- Accepted best is ${best.toFixed(1)} prefill tok/s; the next milestone is ${QWEN36_PREFILL_INTERMEDIATE_TARGET.toFixed(1)} prefill tok/s, a +${gap.toFixed(1)} tok/s (${pct}%) gap.`);
     } else {
       lines.push(`- Accepted best is ${best.toFixed(1)} prefill tok/s; keep pushing past the 50 tok/s milestone with correctness intact.`);
+    }
+    if (currentAccepted > 0 && Math.abs(currentAccepted - best) > 0.05) {
+      lines.push(`- Current accepted tree is measuring ${currentAccepted.toFixed(1)} prefill tok/s; compare new work to this current-tree baseline, not only the promoted-best checkpoint.`);
+    }
+    if (recentProgress.hasProgress) {
+      lines.push(`- Recent accepted movement: ${recentProgress.start.toFixed(1)} → ${recentProgress.end.toFixed(1)} prefill tok/s over the last ${RECENT_PROGRESS_WINDOW} cycles. Treat this as small real progress, not a total stall.`);
     }
   } else {
     lines.push(`- No accepted prefill baseline is known yet; establish one before chasing the ${QWEN36_PREFILL_INTERMEDIATE_TARGET.toFixed(1)} tok/s milestone.`);
@@ -317,6 +373,12 @@ function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): s
   }
   if (traps.length > 0) {
     lines.push(`- Measured-dead traps: ${traps.join(", ")}. Treat their tok/s as invalid until the output contains Paris.`);
+  }
+  if (routePackDensityLine) {
+    lines.push(`- Latest route-pack profile: ${routePackDensityLine.trim()}. This says the active route-pack path is worth validating; do not add another passive counter before using the existing validator/diff output.`);
+  }
+  if (lastKeptWasVisibilityOnly) {
+    lines.push(`- The last kept cycle added measurement or validation visibility (${cycleSummary(lastKept)}). The next cycle should consume that evidence to promote, fix, or abandon a default-off path.`);
   }
 
   lines.push(
@@ -1304,8 +1366,16 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     const current = lastResult.tokPerSec;
     const gap = TARGET_TOK_PER_SEC - current;
     const pctNeeded = ((gap / current) * 100).toFixed(0);
+    const currentAccepted = Math.max(currentAcceptedTokPerSec(state), correctResultTokPerSec(lastResult));
+    const bestKept = Math.max(bestKeptCorrectTokPerSec(state), correctResultTokPerSec(lastResult));
     diagnosis.push(`## Status: CORRECT OUTPUT — ${current.toFixed(2)} ${METRIC_LABEL} → target ≥${TARGET_TOK_PER_SEC}`);
     diagnosis.push(`Gap: ${gap.toFixed(1)} ${METRIC_LABEL} (need ${pctNeeded}% improvement)`);
+    if (currentAccepted > 0 || bestKept > 0) {
+      diagnosis.push(`Accepted baseline: current tree ${currentAccepted.toFixed(2)} ${METRIC_LABEL}; highest kept-correct ${bestKept.toFixed(2)} ${METRIC_LABEL}.`);
+    }
+    if (state.bestTokPerSec > 0 && bestKept > state.bestTokPerSec + 0.05) {
+      diagnosis.push(`Note: saved promoted-best checkpoint is ${state.bestTokPerSec.toFixed(2)} ${METRIC_LABEL}; use the kept-correct/current-tree baseline above for comparisons.`);
+    }
     diagnosis.push(`Output: "${trunc(lastResult.outputText, 80)}"`);
     if (lastResult.tokPerSecSamples.length > 1) {
       diagnosis.push(`Benchmark samples: [${lastResult.tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] ${METRIC_LABEL}`);
@@ -1322,7 +1392,15 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
   }
 
   // Stall warning
-  if (state.stalledCycles >= STALL_THRESHOLD) {
+  const recentProgress = recentAcceptedProgress(state);
+  if (state.stalledCycles >= STALL_THRESHOLD && recentProgress.hasProgress) {
+    diagnosis.push("");
+    diagnosis.push(`## Limited Progress — accepted baseline moved ${recentProgress.start.toFixed(2)} → ${recentProgress.end.toFixed(2)} ${METRIC_LABEL} recently`);
+    diagnosis.push("");
+    diagnosis.push("Do not treat this as a clean stall, but the gain is still too small for the target gap.");
+    diagnosis.push("Use the latest profile/validator evidence to convert the current default-off or measurement-only path into a default-on correctness-preserving speedup.");
+    diagnosis.push("Avoid adding another passive probe unless it answers the exact blocker exposed by the previous one.");
+  } else if (state.stalledCycles >= STALL_THRESHOLD) {
     diagnosis.push("");
     diagnosis.push(`## ⚠ STALL — ${state.stalledCycles} cycles without meaningful improvement. STUDY THE REFERENCES.`);
     diagnosis.push("");
@@ -1365,7 +1443,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     diagnosis.push("then implement it. Cite which file/function you're adapting from in @@@DESCRIPTION.");
     diagnosis.push("Do NOT repeat variations of previously failed approaches.");
     diagnosis.push("If the local Codex subprocess cannot initialize Metal, do not spend the cycle retrying direct `./zig-out/bin/zinc` or Metal microbenchmarks; the outer harness owns the Metal measurement gate.");
-  } else if (state.stalledCycles >= 3) {
+  } else if (state.stalledCycles >= 3 && !recentProgress.hasProgress) {
     diagnosis.push("");
     diagnosis.push(`## Note: ${state.stalledCycles}/${STALL_THRESHOLD} cycles without improvement — will switch to reference study soon`);
   }
@@ -1699,6 +1777,7 @@ export function buildSelfReview(state: RunState): string {
     ? Math.max(acceptedStart, ...tpsValues)
     : acceptedStart;
   const acceptedDelta = acceptedEnd - acceptedStart;
+  const smallProgressThreshold = smallAcceptedProgressBand(acceptedStart);
 
   // Categorize approaches by keywords
   const categories: Record<string, { kept: number; reverted: number }> = {};
@@ -1744,11 +1823,13 @@ export function buildSelfReview(state: RunState): string {
     lines.push("- Do NOT treat faster reverted candidates as progress");
     lines.push("- Stop doubling down on categories with 0 kept changes");
     lines.push("- Build missing measurement/microbench coverage before another kernel retune");
-  } else if (acceptedDelta < 1) {
+  } else if (acceptedDelta < smallProgressThreshold) {
     lines.push("### ⚠ Low progress in accepted changes — strategic pivot recommended:");
     lines.push("- STOP trying small variations of what already failed");
     lines.push("- Focus on categories with >50% success rate above");
     lines.push("- If no category is working, the bottleneck is elsewhere — profile first");
+  } else if (acceptedDelta < 1) {
+    lines.push(`### Small accepted progress (+${acceptedDelta.toFixed(1)} tok/s). Use the evidence from kept measurement/validator cycles before adding another probe.`);
   } else {
     lines.push(`### Progress is positive in accepted changes (+${acceptedDelta.toFixed(1)} tok/s). Double down only on kept categories.`);
   }
@@ -1949,7 +2030,7 @@ async function main() {
     console.log(clr("1;36", `║  Run: ${runId}  |  Resuming from cycle ${startCycle}            ║`));
     console.log(clr("1;36", "╚══════════════════════════════════════════════════════════════╝"));
     console.log(`  Agent: ${clr("1", agentLabel)}${model ? ` (${model})` : ""}`);
-    console.log(`  Previous cycles: ${state.cycles.length}, best: ${state.bestTokPerSec.toFixed(2)} ${METRIC_LABEL}`);
+    console.log(`  Previous cycles: ${state.cycles.length}, best kept-correct: ${bestKeptCorrectTokPerSec(state).toFixed(2)} ${METRIC_LABEL}, current accepted: ${currentAcceptedTokPerSec(state).toFixed(2)} ${METRIC_LABEL}`);
     console.log(`  Results: ${clr("2", runDir)}`);
     if (state.effortFile) {
       console.log(`  Effort: ${clr("1;36", `#${state.effortId}`)} → ${state.effortFile}`);
@@ -2086,6 +2167,7 @@ async function main() {
     // it materially slows the current tree.
     const improveBand = Math.max(0.3, bestTps * 0.02);
     const noiseBand = Math.max(0.25, acceptedTps * 0.01);
+    const currentProgressBand = smallAcceptedProgressBand(acceptedTps);
 
     if (verify.buildExitCode !== 0 || verify.testExitCode !== 0) {
       // Build or test broken → revert
@@ -2117,8 +2199,13 @@ async function main() {
       // ratchet that pretends throughput improved when it did not
       // (Effort 12 cycles 1-24 went 0.21 → 0.30 this way, all noise).
       kept = true;
-      state.stalledCycles++;
-      console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (within ${noiseBand.toFixed(2)} of current ${acceptedTps.toFixed(2)}; best ${bestTps.toFixed(2)} unchanged)`));
+      if (verifyTps >= acceptedTps + currentProgressBand) {
+        state.stalledCycles = 0;
+        console.log(clr("1;32", `  ↑ KEPT — current accepted improved ${acceptedTps.toFixed(2)} → ${verifyTps.toFixed(2)} ${METRIC_LABEL} (below promotion band +${improveBand.toFixed(2)})`));
+      } else {
+        state.stalledCycles++;
+        console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (within ${noiseBand.toFixed(2)} of current ${acceptedTps.toFixed(2)}; best ${bestTps.toFixed(2)} unchanged)`));
+      }
     } else if (verify.containsReference && !state.currentBest?.containsReference) {
       // Gained correctness for the first time
       kept = true;
@@ -2188,7 +2275,7 @@ async function main() {
     await saveState(runDir, state);
 
     // Status summary
-    console.log(clr("2", `  stall=${state.stalledCycles} best=${state.bestTokPerSec.toFixed(2)} ${METRIC_LABEL} target=${TARGET_TOK_PER_SEC}`));
+    console.log(clr("2", `  stall=${state.stalledCycles} best-kept=${bestKeptCorrectTokPerSec(state).toFixed(2)} ${METRIC_LABEL} current=${currentAcceptedTokPerSec(state).toFixed(2)} target=${TARGET_TOK_PER_SEC}`));
 
     // Check if we're done
     if (STOP_ON_TARGET && verify.containsReference && verify.tokPerSec != null && verify.tokPerSec >= TARGET_TOK_PER_SEC) {
@@ -2202,7 +2289,7 @@ async function main() {
   console.log(clr("1;36", `\nLoop complete. Results: ${runDir}`));
   console.log(clr("1;36", `Total cycles: ${state.cycles.length}`));
   console.log(clr("1;36", `Kept: ${state.cycles.filter(c => c.kept).length}`));
-  console.log(clr("1;36", `Best: ${state.bestTokPerSec.toFixed(2)} ${METRIC_LABEL} (target: ${TARGET_TOK_PER_SEC}), correct=${state.currentBest?.containsReference ?? false}`));
+  console.log(clr("1;36", `Best kept-correct: ${bestKeptCorrectTokPerSec(state).toFixed(2)} ${METRIC_LABEL}; current accepted: ${currentAcceptedTokPerSec(state).toFixed(2)} ${METRIC_LABEL} (target: ${TARGET_TOK_PER_SEC}), correct=${state.currentBest?.containsReference ?? false}`));
 }
 
 if (import.meta.main) {

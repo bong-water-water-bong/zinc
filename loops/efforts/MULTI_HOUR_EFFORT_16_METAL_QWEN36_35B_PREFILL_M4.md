@@ -70,11 +70,13 @@ bun loops/implement_metal.ts --effort 16 --dry-run
 
 ## Current standing
 
-Updated after cycle 120 of the follow-up run:
+Updated after cycle 125 of the follow-up run:
 
-- Accepted best is `44.8 prefill tok/s` on the Effort 16 chat prompt.
+- Current accepted tree is measuring about `45.0-45.1 prefill tok/s` on the
+  Effort 16 chat prompt. Treat `45.0 prefill tok/s` as the comparison baseline
+  for the next cycle unless the harness reports a colder fresh baseline.
 - The original measured baseline was about `34.1 prefill tok/s`, so the loop
-  banked roughly +31% accepted throughput.
+  banked roughly +32% accepted throughput.
 - The largest accepted jump was cycle 89: token-major Qwen F32 shared-gate MoE
   combine, adapted from vLLM top-k weighted reduce and llama.cpp `mul_mat_id`
   discipline. That moved the accepted best from about `36.4` to `43.4`.
@@ -82,10 +84,15 @@ Updated after cycle 120 of the follow-up run:
   prompt graph commit. Cycles 108-120 moved the accepted tree to `44.8`
   with final-layer prompt tail skipping, layer-0 SSM branch precompute, and
   smaller barrier/materialization cleanups.
-- The last 10-cycle self-review at cycle 120 showed no accepted movement above
-  `44.8`. Treat this as a stall. Do not spend more cycles on small variants of
-  early prompt split, terminal-only barriers, or layer-0 materialization unless
-  a fresh profile proves the named bucket moved.
+- Cycle 125 added route-pack active-block-density profile counters and measured
+  `45.1 prefill tok/s` with correct `Paris` output. The important profile line:
+  `active_block_upper=358` versus `dense_dispatch_blocks=8704`,
+  `upper/dense=4.1%`. This says expert-major route packing still has large
+  launch-reduction potential if the F32 shared-gate correctness blocker is
+  fixed.
+- Do not spend more cycles on small variants of early prompt split,
+  terminal-only barriers, layer-0 materialization, or additional passive
+  route-pack counters unless a fresh profile proves the named bucket moved.
 - Repeated fast-looking route-packed/F32 shared-gate promotions produced
   bang-only output (`!!!!!!!!!!!!!!!!`) despite measuring around `36.8-44.5`.
   Do not count these as progress and do not enable them by default without
@@ -104,16 +111,19 @@ Updated after cycle 120 of the follow-up run:
 
 Best next directions for 50+:
 
-1. Use the route-pack validators to find the exact tensor/layer where F32
+1. Use the route-pack validators and the existing `shared_gate_f32_batched`
+   scalar diff to find the exact tensor/layer where F32
    shared-gate route packing diverges. A promotion needs layer, prompt-token
    count, max abs diff, flag-on command, and a `Paris` run.
-2. Attack remaining SSM projection/conv/delta launch overhead with exact-shape
+2. If the route-pack validator localizes a fixable F32 shared-gate issue,
+   repair and validate that path before adding another default-off probe.
+3. Attack remaining SSM projection/conv/delta launch overhead with exact-shape
    validators or microbenchmarks before default-on changes.
-3. Explore layer-major work beyond layer 0 only when the dependency is explicit:
+4. Explore layer-major work beyond layer 0 only when the dependency is explicit:
    hidden for layer N depends on all prior layer MoE outputs. A safe candidate
    must prove the candidate input equals the token-major input before replacing
    production work.
-4. Add profiling or validation that explains the remaining `ssm 132.98 GiB`,
+5. Add profiling or validation that explains the remaining `ssm 132.98 GiB`,
    `moe-expert 75.84 GiB`, and `barriers/step 504.4` buckets. A neutral keep is
    only useful if it directly unlocks a default-on structural change.
 

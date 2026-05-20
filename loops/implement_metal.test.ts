@@ -4,12 +4,14 @@ import {
   buildPrompt,
   buildReflectionSummary,
   buildSelfReview,
+  currentAcceptedTokPerSec,
   decideKeep,
   detectPhase,
   evaluateOutputText,
   keepBaselinesForCycle,
   mergeUniqueEntries,
   parseTokPerSec,
+  recentAcceptedProgress,
   snapshotFromResult,
 } from "./implement_metal";
 import type { BuildRunResult, ControllerState, CycleResult, RunState } from "./implement_metal";
@@ -352,6 +354,37 @@ describe("keep baseline helpers", () => {
     expect(baselines.bestTokPerSec).toBe(44.0);
     expect(baselines.acceptedTokPerSec).toBe(44.0);
   });
+
+  test("falls back to latest kept correct cycle for current accepted baseline", () => {
+    const state = makeState({
+      bestTokPerSec: 43.8,
+      currentBest: null,
+      cycles: [
+        makeCycle({ cycle: 124, kept: true, containsReference: true, tokPerSec: 44.7 }),
+        makeCycle({ cycle: 125, kept: true, containsReference: true, tokPerSec: 45.1 }),
+      ],
+    });
+    expect(currentAcceptedTokPerSec(state)).toBe(45.1);
+  });
+
+  test("detects small recent accepted progress separately from a stall", () => {
+    const state = makeState({
+      bestTokPerSec: 44.8,
+      currentBest: { tokPerSec: 45.1, containsReference: true },
+      cycles: [
+        makeCycle({ cycle: 115, kept: true, containsReference: true, tokPerSec: 44.8 }),
+        ...Array.from({ length: 8 }, (_, idx) =>
+          makeCycle({ cycle: 116 + idx, kept: true, containsReference: true, tokPerSec: 44.7 }),
+        ),
+        makeCycle({ cycle: 124, kept: true, containsReference: true, tokPerSec: 44.7 }),
+        makeCycle({ cycle: 125, kept: true, containsReference: true, tokPerSec: 45.1 }),
+      ],
+    });
+    const progress = recentAcceptedProgress(state);
+    expect(progress.hasProgress).toBe(true);
+    expect(progress.start).toBe(44.8);
+    expect(progress.end).toBe(45.1);
+  });
 });
 
 // ── buildReflectionSummary ──────────────────────────────────────────
@@ -450,12 +483,27 @@ describe("buildSelfReview", () => {
       cycle: i + 1,
       description: "Try random tweak",
       kept: i % 3 === 0,
-      tokPerSec: 36 + (i % 3 === 0 ? 0.1 : -0.2),
+      tokPerSec: 36 + (i % 3 === 0 ? 0.02 : -0.2),
     }));
     const state = makeState({ cycles });
     const review = buildSelfReview(state);
     expect(review).toContain("Low progress");
     expect(review).toContain("strategic pivot");
+  });
+
+  test("labels sub-1 tok/s accepted movement as small progress", () => {
+    const state = makeState({
+      cycles: [
+        makeCycle({ cycle: 1, kept: true, containsReference: true, tokPerSec: 44.8 }),
+        ...Array.from({ length: 8 }, (_, idx) =>
+          makeCycle({ cycle: 2 + idx, kept: true, containsReference: true, tokPerSec: 44.7 }),
+        ),
+        makeCycle({ cycle: 10, kept: true, containsReference: true, tokPerSec: 45.1 }),
+      ],
+    });
+    const review = buildSelfReview(state);
+    expect(review).toContain("Small accepted progress");
+    expect(review).not.toContain("Low progress");
   });
 
   test("does not count reverted-cycle movement as accepted progress", () => {
@@ -570,6 +618,61 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("llama.cpp");
     expect(prompt).toContain("vllm");
     expect(prompt).toContain("ggml-metal");
+  });
+
+  test("suppresses hard stall warning when accepted baseline moved recently", () => {
+    const state = makeState({
+      stalledCycles: 12,
+      currentBest: { tokPerSec: 45.1, containsReference: true },
+      cycles: [
+        makeCycle({ cycle: 115, kept: true, containsReference: true, tokPerSec: 44.8 }),
+        ...Array.from({ length: 9 }, (_, idx) =>
+          makeCycle({ cycle: 116 + idx, kept: true, containsReference: true, tokPerSec: 44.7 }),
+        ),
+        makeCycle({ cycle: 125, kept: true, containsReference: true, tokPerSec: 45.1 }),
+      ],
+    });
+    const result = makeResult({
+      tokPerSec: 45.0,
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "Paris",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("Limited Progress");
+    expect(prompt).toContain("44.80 → 45.10");
+    expect(prompt).not.toContain("STUDY THE REFERENCES");
+  });
+
+  test("Qwen effort prompt tells the next cycle to use route-pack density evidence", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      currentBest: { tokPerSec: 45.1, containsReference: true },
+      lastProfileOutput: "Metal profile: Qwen route-pack candidate blocks prompt_tokens=134 route_slots=1072 active_block_upper=358 dense_dispatch_blocks=8704 upper/dense=4.1%",
+      cycles: [
+        makeCycle({
+          cycle: 125,
+          kept: true,
+          containsReference: true,
+          tokPerSec: 45.1,
+          description: "Added Qwen route-pack active-block-density profile counters and candidate blocker logging.",
+        }),
+      ],
+    });
+    const result = makeResult({
+      tokPerSec: 45.0,
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "Paris",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("route-pack candidate blocks");
+    expect(prompt).toContain("do not add another passive counter");
+    expect(prompt).toContain("consume that evidence");
   });
 
   test("Gemma effort prompt uses Gemma model facts instead of Qwen facts", () => {
