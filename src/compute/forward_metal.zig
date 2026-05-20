@@ -6439,7 +6439,7 @@ fn dispatchFusedNormDualQ8DmmvOnCmd(
     const total_rows = M0 + M1;
     const block_size = engine.q8_dual_tg_override orelse 1024;
     const simd_width = if (engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width > 0) engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width else @as(u32, 32);
-    const rows_per_wg: u32 = (block_size / simd_width) * 2;
+    const rows_per_wg: u32 = (block_size / simd_width) * 4;
     cmd.dispatchV2(&engine.dmmv_q8_0_dual_fused_norm_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
 }
 
@@ -24769,7 +24769,7 @@ test "dmmv_q8_0_dual_fused_norm shader matches CPU reference" {
     const bufs = [_]*const MetalBuffer{ &weight0_buf, &weight1_buf, &hidden_buf, &output0_buf, &output1_buf, &norm_weight_buf };
     const total_rows = M0 + M1;
     const block_size: u32 = 256;
-    const rows_per_wg = block_size / 32;
+    const rows_per_wg = (block_size / 32) * 4;
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
     cmd.commitAndWait();
