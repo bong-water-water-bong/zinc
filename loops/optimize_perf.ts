@@ -139,6 +139,15 @@ const MODELS: Record<string, ModelTarget> = {
 const MODEL_KEYS = Object.keys(MODELS).join(", ");
 
 const REMOTE_ZINC_ENV = "RADV_PERFTEST=coop_matrix";
+const REMOTE_VULKAN_DEVICE_INDEX = (() => {
+  const raw = process.env.ZINC_RDNA_DEVICE_INDEX
+    ?? ENV.ZINC_RDNA_DEVICE_INDEX
+    ?? process.env.ZINC_VULKAN_DEVICE_INDEX
+    ?? ENV.ZINC_VULKAN_DEVICE_INDEX
+    ?? "1";
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 1;
+})();
 const LONG_CONTEXT_BENCH_SENTENCE =
   "Benchmark context only. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu.";
 
@@ -1989,9 +1998,9 @@ function coherenceMaxTokensForModel(modelTarget: ModelTarget): number {
   return modelTarget.coherenceMaxTokens ?? 30;
 }
 
-function zincCliArgs(modelTarget: ModelTarget, prompt: string, maxTokens: number, promptMode = modelTarget.promptMode): string {
+export function zincCliArgs(modelTarget: Pick<ModelTarget, "path" | "promptMode">, prompt: string, maxTokens: number, promptMode = modelTarget.promptMode): string {
   const chatFlag = promptMode === "chat" ? " --chat" : "";
-  return `-m ${shellQuote(modelTarget.path)}${chatFlag} --prompt ${shellQuote(prompt)} -n ${maxTokens}`;
+  return `-m ${shellQuote(modelTarget.path)} -d ${REMOTE_VULKAN_DEVICE_INDEX}${chatFlag} --prompt ${shellQuote(prompt)} -n ${maxTokens}`;
 }
 
 function zincRemoteCommand(modelTarget: ModelTarget, prompt: string, maxTokens: number, promptMode = modelTarget.promptMode): string {

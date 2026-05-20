@@ -37,9 +37,27 @@ import {
   shouldRunPivotCycle,
   summarizeCoherenceRegression,
   type ClaudeStreamState,
+  zincCliArgs,
 } from "./optimize_perf";
 
 // -- Codex stream formatter ---------------------------------------------------
+
+describe("zincCliArgs", () => {
+  test("pins RDNA benchmark runs to the discrete Vulkan device by default", () => {
+    const args = zincCliArgs({ path: "/root/models/model.gguf", promptMode: "raw" }, "hello", 8);
+
+    expect(args).toContain("-m '/root/models/model.gguf'");
+    expect(args).toContain("-d 1");
+    expect(args).toContain("--prompt 'hello'");
+    expect(args).toContain("-n 8");
+  });
+
+  test("keeps chat mode alongside the explicit device selection", () => {
+    const args = zincCliArgs({ path: "/root/models/model.gguf", promptMode: "chat" }, "hello", 8);
+
+    expect(args).toContain("-d 1 --chat");
+  });
+});
 
 describe("formatCodexStreamLine", () => {
   test("formats shell command", () => {
