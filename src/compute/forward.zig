@@ -6570,7 +6570,7 @@ pub const InferenceEngine = struct {
                     self.elementwise.pipeline_ssm_delta_net != null and
                     self.elementwise.pipeline_ssm_gated_norm != null;
                 if (state.position == 0 and layer == 0) {
-                    log.info("FASTPATH: gpu_ssm={} arch={s} ssm_shader={} delta_cols8={}", .{
+                    log.debug("FASTPATH: gpu_ssm={} arch={s} ssm_shader={} delta_cols8={}", .{
                         use_gpu_ssm,
                         @tagName(config.architecture),
                         self.elementwise.pipeline_ssm_conv1d != null,
@@ -11307,7 +11307,7 @@ pub const InferenceEngine = struct {
         if (state.position == 0 and layer == 0) {
             const conv_tensor = lt.ssm_conv1d orelse return;
             const ssm_out_tensor = lt.ssm_out orelse return;
-            log.info("FASTPATH: ssm qkv={s} gate={s} alpha={s} beta={s} conv={s} out={s}", .{
+            log.debug("FASTPATH: ssm qkv={s} gate={s} alpha={s} beta={s} conv={s} out={s}", .{
                 @tagName(wqkv_tensor.info.type_),
                 @tagName(z_tensor.info.type_),
                 @tagName(alpha_tensor.info.type_),
@@ -12539,7 +12539,7 @@ pub const InferenceEngine = struct {
         const n_segment_layers = self.qwen36DensePrefillSegmentLayers(prompt_tokens.len, prefix_layers, &segment_layers);
         for (segment_layers[0..n_segment_layers]) |segment_layer| {
             if (segment_layer < tail_start_layer) continue;
-            log.info("Qwen3.6-27B dense prefill segment ENABLED at layer {d} after tail_start_layer={d} (set ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT=0 to disable)", .{
+            log.debug("Qwen3.6-27B dense prefill segment ENABLED at layer {d} after tail_start_layer={d} (set ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT=0 to disable)", .{
                 segment_layer,
                 tail_start_layer,
             });
