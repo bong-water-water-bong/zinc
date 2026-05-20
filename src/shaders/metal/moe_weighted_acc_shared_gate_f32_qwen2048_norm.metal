@@ -34,7 +34,8 @@ kernel void main0(
         return;
     }
 
-    threadgroup float partials[32];
+    threadgroup float gate_partials[32];
+    threadgroup float norm_partials[32];
     device const float* gate_weight = (device const float*)(gate_weight_bytes + p.gate_weight_offset);
     device const float* norm = norm_src + (p.norm_offset >> 2);
     const uint threads_per_tg = simdgroups_per_tg * 32u;
@@ -46,13 +47,12 @@ kernel void main0(
 
     float sg_sum = simd_sum(gate_dot);
     if (lane == 0u) {
-        partials[simdgroup] = sg_sum;
+        gate_partials[simdgroup] = sg_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float part = (lane < simdgroups_per_tg) ? partials[lane] : 0.0f;
+    float part = (lane < simdgroups_per_tg) ? gate_partials[lane] : 0.0f;
     const float gate = fast::divide(1.0f, 1.0f + fast::exp(-simd_sum(part)));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float h_vals[2];
     uint h_idxs[2];
@@ -75,11 +75,11 @@ kernel void main0(
 
     sg_sum = simd_sum(hidden_sq);
     if (lane == 0u) {
-        partials[simdgroup] = sg_sum;
+        norm_partials[simdgroup] = sg_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    part = (lane < simdgroups_per_tg) ? partials[lane] : 0.0f;
+    part = (lane < simdgroups_per_tg) ? norm_partials[lane] : 0.0f;
     const float rms_inv = fast::rsqrt(fast::divide(simd_sum(part), float(p.n)) + p.eps);
 
     for (uint i = 0u; i < h_count; i++) {
