@@ -1097,6 +1097,7 @@ const ResidualRmsNormPush = extern struct {
     n: u32,
     eps: f32,
     scale: f32,
+    residual_offset: u32,
 };
 
 /// Push constants for triple-fused residual_norm + residual_add + output_norm
@@ -4343,7 +4344,7 @@ pub const InferenceEngine = struct {
             }
 
             {
-                const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0 };
+                const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
                 const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &self.ffn_norm_bufs[layer_idx] };
                 cmd.dispatchV2(&self.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
             }
@@ -6823,7 +6824,21 @@ fn dispatchResidualRmsNormOnCmd(
     n: u32,
     scale: f32,
 ) void {
-    const push = ResidualRmsNormPush{ .n = n, .eps = engine.config.rms_norm_eps, .scale = scale };
+    dispatchResidualRmsNormOffsetOnCmd(engine, cmd, hidden, residual, norm_out, weights, n, scale, 0);
+}
+
+fn dispatchResidualRmsNormOffsetOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    hidden: *const MetalBuffer,
+    residual: *const MetalBuffer,
+    norm_out: *const MetalBuffer,
+    weights: *const MetalBuffer,
+    n: u32,
+    scale: f32,
+    residual_offset: u32,
+) void {
+    const push = ResidualRmsNormPush{ .n = n, .eps = engine.config.rms_norm_eps, .scale = scale, .residual_offset = residual_offset };
     const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, weights };
     cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
 }
@@ -8770,7 +8785,7 @@ fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
     profileBarrier(cmd, profile, .full_attn);
 
     {
-        const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0 };
+        const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
         const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &engine.ffn_norm_bufs[layer_idx] };
         cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
     }
@@ -8952,7 +8967,7 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
     // Keep it layer-major over the prompt slice instead of staging each token
     // through the single-token scratch buffers.
     {
-        const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0 };
+        const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
         const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &engine.ffn_norm_bufs[layer_idx] };
         cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
     }
@@ -11860,7 +11875,7 @@ fn validateQwenRoutePackedSsmPrefix(
     profileBarrier(&cmd, profile, .ssm);
 
     {
-        const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0 };
+        const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
         const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &engine.ffn_norm_bufs[layer_idx] };
         cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ n, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
     }
@@ -13608,9 +13623,15 @@ fn runDecodeStep(
                 try captureQwenRoutePackedLayerInput(engine, hidden_dim);
             }
 
+            var ssm_residual_buf: *const MetalBuffer = &engine.down_buf;
+            var ssm_residual_offset: u32 = 0;
             if (shouldUseQwenSsmPrefillBranchChunk(engine, layer_idx)) {
-                dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.down_buf, hidden_dim, engine.position * hidden_dim, 0);
-                profileBarrier(cmd, profile, .ssm);
+                // Adapt llama.cpp's `ggml_metal_op_concurrency_check` discipline:
+                // the layer-0 precompute command buffer already materialized this
+                // branch output, so read the token slice directly instead of
+                // inserting a copy dispatch plus in-encoder memory barrier.
+                ssm_residual_buf = &engine.qwen_ssm_prefill_proj_norm_buf;
+                ssm_residual_offset = @intCast(engine.position * hidden_dim);
             } else {
                 const use_prefill_projection_chunk = shouldUseQwenSsmPrefillProjectionChunk(engine, layer_idx);
                 var use_direct_prefill_projection_chunk = false;
@@ -13874,7 +13895,7 @@ fn runDecodeStep(
 
             // Fused residual-add + RMS norm: hidden += down; norm_buf = normalize(hidden) * weights.
             // Eliminates one barrier vs separate scale_acc + barrier + rms_norm.
-            dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
+            dispatchResidualRmsNormOffsetOnCmd(engine, cmd, &engine.hidden_buf, ssm_residual_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0, ssm_residual_offset);
             if (!is_moe and layer_shared_cmd != null) {
                 profileBarrier(cmd, profile, .dense_ffn);
             }

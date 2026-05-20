@@ -7,6 +7,7 @@ struct Params {
     uint n;
     float eps;
     float scale;
+    uint residual_offset;
 };
 
 // Fused residual-add + RMS norm: hidden += scale * residual; norm = weights * normalize(hidden)
@@ -42,7 +43,7 @@ kernel void main0(
     float sum_sq = 0.0f;
     uint count = 0;
     for (uint i = tid; i < p.n; i += TG_SIZE) {
-        const float h = fma(scale, residual[base + i], hidden[base + i]);
+        const float h = fma(scale, residual[p.residual_offset + base + i], hidden[base + i]);
         hidden[base + i] = h;
         vals[count++] = h;
         sum_sq += h * h;
