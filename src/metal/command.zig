@@ -146,10 +146,14 @@ pub const MetalCommand = struct {
         if (self.last_barrier_dispatch_count == self.dispatch_count) return;
         if (self.handle) |h| {
             if (bufs.len == 1) {
-                if (bufs[0].handle) |handle| {
+                if (bufs[0].handle != null) {
                     self.barrier_count += 1;
                     self.last_barrier_dispatch_count = self.dispatch_count;
-                    shim.mtl_barrier_buffer(h, handle);
+                    // Match llama.cpp's `ggml_metal_op_concurrency_reset`: at
+                    // hot dependency edges, a scope barrier is cheaper to encode
+                    // than constructing a one-resource barrier while preserving
+                    // the same dispatch ordering guarantee.
+                    shim.mtl_barrier(h);
                 }
                 return;
             }
