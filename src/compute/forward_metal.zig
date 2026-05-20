@@ -2293,6 +2293,7 @@ pub const InferenceEngine = struct {
     dmmv_q8_0_k2048_pipe: MetalPipeline,
     dmmv_q8_0_dual_pipe: MetalPipeline,
     dmmv_q8_0_pair_pipe: MetalPipeline,
+    dmmv_q8_0_pair_swiglu_pipe: MetalPipeline,
     dmmv_q8_0_k2048_fused_norm_pipe: MetalPipeline,
     dmmv_q8_0_dual_fused_norm_pipe: MetalPipeline,
     dmmv_q8_0_repacked_pipe: MetalPipeline,
@@ -2780,6 +2781,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q8_0_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048");
         self.dmmv_q8_0_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual");
         self.dmmv_q8_0_pair_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair");
+        self.dmmv_q8_0_pair_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
         self.dmmv_q8_0_k2048_fused_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048_fused_norm");
         self.dmmv_q8_0_dual_fused_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual_fused_norm");
         self.dmmv_q8_0_repacked_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked");
@@ -3553,6 +3555,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_pair_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_pair_swiglu_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_fused_norm_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_fused_norm_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_pipe);
@@ -5702,6 +5705,30 @@ fn canUsePairedQ8Dmmv(
         engine.dmmv_q8_0_pair_pipe.max_threads_per_threadgroup >= block_size;
 }
 
+fn canUseQwenSharedQ8SwiGLU(
+    engine: *const InferenceEngine,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    const cfg = engine.config;
+    const block_size = pairedQ8DmmvBlockSize(engine, gate, up);
+    return cfg.architecture == .qwen2_moe and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        M == 512 and
+        K == 2048 and
+        gate.info.type_ == .q8_0 and
+        up.info.type_ == .q8_0 and
+        !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.dmmv_q8_0_pair_swiglu_pipe.thread_execution_width == 32 and
+        engine.dmmv_q8_0_pair_swiglu_pipe.max_threads_per_threadgroup >= block_size;
+}
+
 fn canUseQwen36FullAttnQ8Pair(
     engine: *const InferenceEngine,
     tensor0: *const metal_loader.LoadedTensor,
@@ -6039,6 +6066,45 @@ fn dispatchPairedQ8DmmvOnCmd(
     const simd_width = if (engine.dmmv_q8_0_pair_pipe.thread_execution_width > 0) engine.dmmv_q8_0_pair_pipe.thread_execution_width else @as(u32, 32);
     const rows_per_wg: u32 = (block_size / simd_width) * 2;
     cmd.dispatchV2(&engine.dmmv_q8_0_pair_pipe, .{ (M + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
+}
+
+fn dispatchPairedQ8SwiGLUOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    x_byte_offset: u32,
+) void {
+    recordDmmvProfile(engine, gate, M, K);
+    recordDmmvProfile(engine, up, M, K);
+
+    const push = DualQ8DmmvPush{
+        .M0 = M,
+        .M1 = M,
+        .K = K,
+        .a0_offset = tensorPageOffset(engine.model, gate),
+        .a1_offset = tensorPageOffset(engine.model, up),
+        .x_offset = x_byte_offset,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate.gpu_buffer, &up.gpu_buffer, input_buf, output_buf };
+    const block_size = pairedQ8DmmvBlockSize(engine, gate, up);
+    const simd_width = if (engine.dmmv_q8_0_pair_swiglu_pipe.thread_execution_width > 0) engine.dmmv_q8_0_pair_swiglu_pipe.thread_execution_width else @as(u32, 32);
+    const rows_per_wg: u32 = (block_size / simd_width) * 2;
+    cmd.dispatchV2(
+        &engine.dmmv_q8_0_pair_swiglu_pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, 1, 1 },
+        .{ block_size, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(DualQ8DmmvPush),
+        0,
+    );
 }
 
 /// Fused RMSNorm + Dual Q8_0 DMMV: reads raw hidden state, computes norm inline,
@@ -13437,6 +13503,9 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     const use_f32_shared_gate_acc =
         gate_inp_shexp != null and
         canUseQwenTokenSharedGateF32Acc(engine, gate_inp_shexp.?, hidden_dim);
+    const use_fused_shared_q8_swiglu =
+        has_shexp and
+        canUseQwenSharedQ8SwiGLU(engine, gate_shexp.?, up_shexp.?, shexp_inter_dim, hidden_dim);
 
     if (!router_output_ready) {
         dispatchSoftmaxTopkOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used);
@@ -13494,7 +13563,9 @@ fn recordGpuRoutedBatchedMoeOnCmd(
         // the paired Q8 row kernel (llama.cpp-style rowwise mul_mv with shared
         // X-vector loads) for the production path now that the Qwen shared
         // batched validator covers gate/up/down diffs.
-        if (canUsePairedQ8Dmmv(engine, gate_shexp.?, up_shexp.?, shexp_inter_dim, shexp_inter_dim, hidden_dim)) {
+        if (use_fused_shared_q8_swiglu) {
+            dispatchPairedQ8SwiGLUOnCmd(engine, cmd, gate_shexp.?, up_shexp.?, norm_input_buf, &engine.swiglu_buf, shexp_inter_dim, hidden_dim, norm_input_byte_offset);
+        } else if (canUsePairedQ8Dmmv(engine, gate_shexp.?, up_shexp.?, shexp_inter_dim, shexp_inter_dim, hidden_dim)) {
             dispatchPairedQ8DmmvOnCmd(engine, cmd, gate_shexp.?, up_shexp.?, norm_input_buf, &engine.gate_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, norm_input_byte_offset);
         } else {
             dispatchDmmvOnCmdWithInputOffset(engine, cmd, gate_shexp.?, norm_input_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0, norm_input_byte_offset);
@@ -13515,9 +13586,11 @@ fn recordGpuRoutedBatchedMoeOnCmd(
         cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, cfg.n_experts_used, 1 }, .{ 64, 1, 1 }, &sw_bufs, &swiglu_push, @sizeOf(SwiGLUPush), 0);
     }
     if (has_shexp) {
-        const sw_push = SwiGLUPush{ .n = shexp_inter_dim };
-        const sw_bufs = [_]*const MetalBuffer{ &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf };
-        cmd.dispatchV2(&engine.swiglu_pipe, .{ (shexp_inter_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &sw_bufs, &sw_push, @sizeOf(SwiGLUPush), 0);
+        if (!use_fused_shared_q8_swiglu) {
+            const sw_push = SwiGLUPush{ .n = shexp_inter_dim };
+            const sw_bufs = [_]*const MetalBuffer{ &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf };
+            cmd.dispatchV2(&engine.swiglu_pipe, .{ (shexp_inter_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &sw_bufs, &sw_push, @sizeOf(SwiGLUPush), 0);
+        }
     }
     profileBarrier(cmd, profile, .gpu_routed_moe); // SwiGLU outputs visible before down DMMVs
 
@@ -20056,6 +20129,92 @@ test "dmmv_q8_0_pair shader matches CPU reference for equal-shape outputs" {
     }
 }
 
+test "dmmv_q8_0_pair_swiglu shader matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 65;
+    const K: usize = 256;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var gate_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&gate_buf);
+    var up_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&up_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(gate_buf.cpu_ptr.?[0..gate_buf.size], 0);
+    @memset(up_buf.cpu_ptr.?[0..up_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const gate_scale = @as(f16, @floatCast(0.02734375 * @as(f32, @floatFromInt(1 + (row % 7) + (blk % 3)))));
+            const up_scale = @as(f16, @floatCast(0.03515625 * @as(f32, @floatFromInt(1 + (row % 5) + (blk % 5)))));
+            const gate_bits = @as(u16, @bitCast(gate_scale));
+            const up_bits = @as(u16, @bitCast(up_scale));
+            gate_buf.cpu_ptr.?[base] = @truncate(gate_bits);
+            gate_buf.cpu_ptr.?[base + 1] = @truncate(gate_bits >> 8);
+            up_buf.cpu_ptr.?[base] = @truncate(up_bits);
+            up_buf.cpu_ptr.?[base + 1] = @truncate(up_bits >> 8);
+            for (0..32) |e| {
+                const gate_raw: i32 = @intCast((row * 17 + blk * 11 + e * 3) % 41);
+                const up_raw: i32 = @intCast((row * 19 + blk * 5 + e * 7) % 43);
+                gate_buf.cpu_ptr.?[base + 2 + e] = @bitCast(@as(i8, @intCast(gate_raw - 20)));
+                up_buf.cpu_ptr.?[base + 2 + e] = @bitCast(@as(i8, @intCast(up_raw - 21)));
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 5 + 3) % 23);
+        input_ptr[i] = 0.0625 * @as(f32, @floatFromInt(raw - 11));
+    }
+
+    const push = DualQ8DmmvPush{
+        .M0 = @intCast(M),
+        .M1 = @intCast(M),
+        .K = @intCast(K),
+        .a0_offset = 0,
+        .a1_offset = 0,
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate_buf, &up_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 31) / 32), 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        var gate_expected: f32 = 0;
+        var up_expected: f32 = 0;
+        dequantRow(gate_buf.cpu_ptr.?[0..gate_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+        for (0..K) |i| gate_expected += ref_row[i] * input_ptr[i];
+        dequantRow(up_buf.cpu_ptr.?[0..up_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+        for (0..K) |i| up_expected += ref_row[i] * input_ptr[i];
+        const expected = (gate_expected / (1.0 + @exp(-gate_expected))) * up_expected;
+        try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
+    }
+}
+
 test "dmmv_q4k_k2048 shader matches CPU reference" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -20149,6 +20308,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_dual_k2048_pipe);
     var dmmv_q4k_moe_gate_up_swiglu_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_swiglu_k2048");
     defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_swiglu_k2048_pipe);
+    var dmmv_q8_0_pair_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_pair_swiglu_pipe);
     var dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
     defer metal_pipeline.freePipeline(&dmmv_q4k_dense_gate_up_geglu_pipe);
     var dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
@@ -20251,6 +20412,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q4k_moe_gate_up_dual_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_gate_up_dual_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_gate_up_swiglu_k2048_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_pair_swiglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5_1_moe_pipe.handle != null);
