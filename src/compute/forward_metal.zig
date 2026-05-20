@@ -496,7 +496,7 @@ fn canUseQwenSsmDeltaGatedNormExact(
     if (dt_rank != 32 or head_v_dim != 128 or d_state != 128 or n_group != 16) return false;
     if (engine.ssm_delta_net_gated_norm_qwen_pipe.handle == null) return false;
     return engine.ssm_delta_net_gated_norm_qwen_pipe.thread_execution_width == 32 and
-        engine.ssm_delta_net_gated_norm_qwen_pipe.max_threads_per_threadgroup >= 128;
+        engine.ssm_delta_net_gated_norm_qwen_pipe.max_threads_per_threadgroup >= 64;
 }
 
 fn ssmDeltaGatedNormThreadgroupSize(
@@ -511,9 +511,9 @@ fn ssmDeltaGatedNormThreadgroupSize(
         d_state == 128 and
         n_group == 16 and
         pipe.thread_execution_width == 32 and
-        pipe.max_threads_per_threadgroup >= 128)
+        pipe.max_threads_per_threadgroup >= 64)
     {
-        return 128;
+        return 64;
     }
     return 64;
 }
@@ -17818,6 +17818,20 @@ test "qwen ssm delta prefill threadgroup helper uses exact model shape" {
     try std.testing.expectEqual(@as(u32, 64), ssmDeltaNetPrefillThreadgroupSize(&pipe, 16, 128, 128, 16));
     try std.testing.expectEqual(@as(u32, 64), ssmDeltaNetPrefillThreadgroupSize(&pipe, 32, 64, 128, 16));
     try std.testing.expectEqual(@as(u32, 64), ssmDeltaNetPrefillThreadgroupSize(&pipe, 32, 128, 64, 16));
+}
+
+test "qwen ssm delta gated norm threadgroup helper uses tg64 exact model shape" {
+    const pipe = MetalPipeline{
+        .handle = null,
+        .max_threads_per_threadgroup = 128,
+        .thread_execution_width = 32,
+        .static_threadgroup_memory_length = 0,
+    };
+
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 128, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 16, 128, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 64, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 128, 64, 16));
 }
 
 test "ssm_conv1d shader matches CPU reference" {
