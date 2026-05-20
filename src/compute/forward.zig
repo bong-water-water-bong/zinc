@@ -12097,10 +12097,10 @@ pub const InferenceEngine = struct {
 
         const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
         if (full_attn_interval == 4 and cfg.n_layers > 52) {
-            // Measured on the 27B Coding Review prefill: layers 5-62 keep
+            // Measured on the 27B Coding Review prefill: layers 4-62 keep
             // dense FFN work layer-major without repeating the rejected SSM
-            // projection replay path. Layers 3-4 added setup overhead.
-            var segment_layer: u32 = 5;
+            // projection replay path. Layer 3 still adds setup overhead.
+            var segment_layer: u32 = 4;
             while (segment_layer <= 62) : (segment_layer += 1) {
                 self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
             }
