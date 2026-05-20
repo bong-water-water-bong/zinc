@@ -13605,19 +13605,24 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     profileBarrier(cmd, profile, .gpu_routed_moe); // gate/up outputs visible before SwiGLU
 
     // Phase C: SwiGLU — batched experts + shared expert overlap.
+    var phase_c_dispatched = false;
     if (!use_fused_q4k_gate_up_swiglu) {
         const swiglu_push = SwiGLUPush{ .n = inter_dim };
         const sw_bufs = [_]*const MetalBuffer{ &engine.expert_gate_batch_buf, &engine.expert_swiglu_batch_buf, &engine.expert_up_batch_buf };
         cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, cfg.n_experts_used, 1 }, .{ 64, 1, 1 }, &sw_bufs, &swiglu_push, @sizeOf(SwiGLUPush), 0);
+        phase_c_dispatched = true;
     }
     if (has_shexp) {
         if (!use_fused_shared_q8_swiglu) {
             const sw_push = SwiGLUPush{ .n = shexp_inter_dim };
             const sw_bufs = [_]*const MetalBuffer{ &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf };
             cmd.dispatchV2(&engine.swiglu_pipe, .{ (shexp_inter_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &sw_bufs, &sw_push, @sizeOf(SwiGLUPush), 0);
+            phase_c_dispatched = true;
         }
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe); // SwiGLU outputs visible before down DMMVs
+    if (phase_c_dispatched) {
+        profileBarrier(cmd, profile, .gpu_routed_moe); // SwiGLU outputs visible before down DMMVs
+    }
 
     // Phase D: down expert DMMVs + shared down — overlap.
     try dispatchDmmvMoeOnCmd(engine, cmd, down_exps, &engine.expert_swiglu_batch_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, hidden_dim, inter_dim, expert_down_bytes, inter_dim, 0);
