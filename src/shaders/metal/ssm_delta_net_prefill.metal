@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <simd/simd.h>
 
 using namespace metal;
 
@@ -40,6 +41,8 @@ kernel void main0(
     }
 
     const uint tg_threads = simd_width * simdgroups_per_tg;
+    const uint simd_lane = tid % simd_width;
+    const uint simd_idx = tid / simd_width;
     threadgroup float q[128];
     threadgroup float k[128];
     threadgroup float partial_q[4];
@@ -67,64 +70,67 @@ kernel void main0(
             k_ss = fma(kv, kv, k_ss);
         }
 
-        const uint n_sg = simdgroups_per_tg;
         float q_sum = simd_sum(q_ss);
         float k_sum = simd_sum(k_ss);
-        if ((tid % simd_width) == 0u) {
-            partial_q[tid / simd_width] = q_sum;
-            partial_k[tid / simd_width] = k_sum;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0u) {
-            float q_total = 0.0f;
-            float k_total = 0.0f;
-            for (uint i = 0u; i < n_sg; ++i) {
-                q_total += partial_q[i];
-                k_total += partial_k[i];
-            }
-            partial_q[0] = q_total;
-            partial_k[0] = k_total;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float q_scale = rsqrt(fast::max(partial_q[0], 1.0e-13f)) / sqrt(float(p.d_state));
-        const float k_scale = rsqrt(fast::max(partial_k[0], 1.0e-13f));
-        for (uint i = tid; i < k_len; i += tg_threads) {
-            q[i] *= q_scale;
-            k[i] *= k_scale;
+        if (simd_lane == 0u) {
+            partial_q[simd_idx] = q_sum;
+            partial_k[simd_idx] = k_sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        const float q_partial = (simd_lane < simdgroups_per_tg) ? partial_q[simd_lane] : 0.0f;
+        const float k_partial = (simd_lane < simdgroups_per_tg) ? partial_k[simd_lane] : 0.0f;
+        const float q_total = simd_sum(q_partial);
+        const float k_total = simd_sum(k_partial);
+
         const uint dt_index = head;
-        const float alpha_raw = alpha[p.alpha_offset + token * p.alpha_stride + dt_index] +
-            ((p.has_dt_bias != 0u) ? dt_bias[head] : 0.0f);
-        const float softplus_alpha = log(1.0f + exp(alpha_raw));
-        const float decay_arg = (p.has_ssm_a != 0u) ? (softplus_alpha * ssm_a[head]) : (-softplus_alpha);
-        const float decay = exp(decay_arg);
-        const float beta_val = 1.0f / (1.0f + exp(-beta[p.beta_offset + token * p.beta_stride + dt_index]));
+        float q_scale_lane = 0.0f;
+        float k_scale_lane = 0.0f;
+        float decay_lane = 0.0f;
+        float beta_lane = 0.0f;
+        if (simd_lane == 0u) {
+            const float alpha_raw = alpha[p.alpha_offset + token * p.alpha_stride + dt_index] +
+                ((p.has_dt_bias != 0u) ? dt_bias[head] : 0.0f);
+            const float softplus_alpha = log(1.0f + fast::exp(alpha_raw));
+            const float decay_arg = (p.has_ssm_a != 0u) ? (softplus_alpha * ssm_a[head]) : (-softplus_alpha);
+            q_scale_lane = rsqrt(fast::max(q_total, 1.0e-13f)) / sqrt(float(p.d_state));
+            k_scale_lane = rsqrt(fast::max(k_total, 1.0e-13f));
+            decay_lane = fast::exp(decay_arg);
+            beta_lane = fast::divide(1.0f, 1.0f + fast::exp(-beta[p.beta_offset + token * p.beta_stride + dt_index]));
+        }
+
+        const float q_scale = simd_broadcast(q_scale_lane, 0u);
+        const float k_scale = simd_broadcast(k_scale_lane, 0u);
+        const float decay = simd_broadcast(decay_lane, 0u);
+        const float beta_val = simd_broadcast(beta_lane, 0u);
         const uint head_out_base = p.output_offset + token * p.output_stride + head * p.head_v_dim;
 
         for (uint row = tid; row < p.head_v_dim; row += tg_threads) {
             const uint row_base = head_state_base + row * p.head_v_dim;
-            for (uint col = 0u; col < p.head_v_dim; ++col) {
+            float sk_raw = 0.0f;
+            for (uint col = 0u; col < k_len; ++col) {
+                const uint state_idx = row_base + col;
+                const float decayed = state[state_idx] * decay;
+                state[state_idx] = decayed;
+                sk_raw = fma(decayed, k[col], sk_raw);
+            }
+            for (uint col = k_len; col < p.head_v_dim; ++col) {
                 state[row_base + col] *= decay;
             }
 
-            float sk = 0.0f;
-            for (uint col = 0u; col < k_len; ++col) {
-                sk = fma(state[row_base + col], k[col], sk);
-            }
-
             const float v = conv_out[v_base + row];
+            const float sk = sk_raw * k_scale;
             const float delta = beta_val * (v - sk);
+            const float scaled_delta = delta * k_scale;
             for (uint col = 0u; col < k_len; ++col) {
-                state[row_base + col] = fma(k[col], delta, state[row_base + col]);
+                state[row_base + col] = fma(k[col], scaled_delta, state[row_base + col]);
             }
 
             float out_v = 0.0f;
             for (uint col = 0u; col < k_len; ++col) {
                 out_v = fma(state[row_base + col], q[col], out_v);
             }
-            output[head_out_base + row] = out_v;
+            output[head_out_base + row] = out_v * q_scale;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
