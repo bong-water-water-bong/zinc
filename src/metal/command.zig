@@ -145,6 +145,14 @@ pub const MetalCommand = struct {
         if (self.dispatch_count == 0) return;
         if (self.last_barrier_dispatch_count == self.dispatch_count) return;
         if (self.handle) |h| {
+            if (bufs.len == 1) {
+                if (bufs[0].handle) |handle| {
+                    self.barrier_count += 1;
+                    self.last_barrier_dispatch_count = self.dispatch_count;
+                    shim.mtl_barrier_buffer(h, handle);
+                }
+                return;
+            }
             var c_bufs: [32]?*shim.MetalBuf = .{null} ** 32;
             var n_bufs: u32 = 0;
             for (bufs) |b| {

@@ -452,6 +452,13 @@ void mtl_barrier(MetalCmd* cmd) {
     [cmd->encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
+void mtl_barrier_buffer(MetalCmd* cmd, MetalBuf* buf) {
+    if (!cmd || !buf || !buf->buffer) return;
+
+    id<MTLResource> resource = buf->buffer;
+    [cmd->encoder memoryBarrierWithResources:&resource count:1];
+}
+
 void mtl_barrier_buffers(MetalCmd* cmd, MetalBuf** bufs, uint32_t n_bufs) {
     if (!cmd || !bufs || n_bufs == 0) return;
 
