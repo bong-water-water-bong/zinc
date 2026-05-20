@@ -14596,7 +14596,7 @@ fn runDecodeStep(
                 } else {
                     // Fallback: separate RMSNorm + barrier + DMMVs
                     dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
-                    profileBarrier(cmd, profile, .ssm);
+                    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.norm_buf});
                     if (false and canUseDualQ8Dmmv(engine, wqkv_t, z_t, conv_channels, d_inner, hidden_dim)) {
                         dispatchDualQ8DmmvOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
                     } else {
@@ -14607,7 +14607,16 @@ fn runDecodeStep(
                     dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
                 }
                 if (!use_direct_prefill_projection_chunk) {
-                    profileBarrier(cmd, profile, .ssm);
+                    // llama.cpp's `ggml_metal_op_concurrency_check/reset`
+                    // serializes at range conflicts. The SSM body only reads
+                    // these projection outputs, so avoid flushing unrelated
+                    // scratch/weight buffers on every prompt SSM layer.
+                    profileBarrierBuffers(cmd, profile, .ssm, &.{
+                        &engine.attn_out_buf,
+                        &engine.gate_buf,
+                        &engine.router_logits_buf,
+                        &engine.down_buf,
+                    });
                 }
                 if (shouldValidateQwenSsmProjection(engine, layer_idx, using_local_cmd, wqkv_t, z_t, alpha_t, beta_t)) {
                     commitAndWaitProfiled(cmd, profile);
