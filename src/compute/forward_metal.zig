@@ -311,6 +311,11 @@ fn preferApple9QwenSsmRepackedQ8QuadPath(cfg: ModelConfig, tensor: *const metal_
     return readBoolEnv("ZINC_METAL_QWEN_SSM_REPACKED_Q8_QUAD") orelse true;
 }
 
+fn preferApple9QwenSsmPrivateRepackedQ8(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    if (!preferApple9QwenSsmRepackedQ8QuadPath(cfg, tensor, M, K)) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_SSM_REPACKED_Q8_PRIVATE") orelse true;
+}
+
 fn preferApple9QwenFullAttnQ8K2048QuadPath(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
     const is_shape = cfg.architecture == .qwen2_moe and
         cfg.hidden_dim == 2048 and
@@ -2696,6 +2701,33 @@ pub const InferenceEngine = struct {
     /// runs, just unprotected).
     scratch_rset: ?*shim.MetalRSet = null,
 
+    /// Repack a Q8_0 tensor through a CPU-visible staging buffer, then upload
+    /// the coalesced layout into GPU-private storage for hot SSM reads.
+    fn createPrivateRepackedQ8Buffer(
+        self: *InferenceEngine,
+        tensor: *const metal_loader.LoadedTensor,
+        size_bytes: usize,
+        rows: u32,
+        cols: u32,
+    ) !MetalBuffer {
+        if (size_bytes % @sizeOf(u32) != 0) return error.InvalidQ8RepackSize;
+
+        var staging = try metal_buffer.createBuffer(self.device.ctx, size_bytes);
+        defer metal_buffer.freeBuffer(&staging);
+
+        const src_ptr = tensor.gpu_buffer.cpu_ptr orelse return error.MetalBufferNotMapped;
+        repackQ8_0Blocks(src_ptr + tensorPageOffset(self.model, tensor), staging.cpu_ptr.?, rows, cols);
+
+        var dst = try metal_buffer.createPrivateBuffer(self.device.ctx, size_bytes);
+        errdefer metal_buffer.freeBuffer(&dst);
+        dst.is_repacked_q8 = true;
+
+        var cmd = try metal_command.beginCommand(self.device.ctx);
+        dispatchCopyU32OnCmd(self, &cmd, &staging, &dst, @intCast(size_bytes / @sizeOf(u32)), 0, 0);
+        cmd.commitAndWait();
+        return dst;
+    }
+
     /// Initialize the Metal inference engine, allocating GPU buffers and compiling pipelines.
     pub fn init(
         model: *const metal_loader.Model,
@@ -3425,16 +3457,24 @@ pub const InferenceEngine = struct {
             const has_repacked = self.dmmv_q8_0_repacked_pipe.handle != null;
             var need_gpu_copy = false;
             var cmd: MetalCommand = undefined;
+            var private_repacked_count: u32 = 0;
+            var private_repacked_bytes: usize = 0;
             for (0..cfg.n_layers) |i| {
                 if (self.layer_tensors[i].attn_qkv) |tensor| {
                     const size_bytes: usize = @intCast(tensor.info.sizeBytes());
                     const t_K: u32 = @intCast(tensor.info.dims[0]);
                     if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
-                        var buf = try metal_buffer.createBuffer(ctx, size_bytes);
-                        buf.is_repacked_q8 = true;
                         const t_M: u32 = @intCast(tensor.info.dims[1]);
-                        repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
-                        self.private_ssm_qkv_bufs.?[i] = buf;
+                        if (preferApple9QwenSsmPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_ssm_qkv_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_repacked_count += 1;
+                            private_repacked_bytes += size_bytes;
+                        } else {
+                            var buf = try metal_buffer.createBuffer(ctx, size_bytes);
+                            buf.is_repacked_q8 = true;
+                            repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
+                            self.private_ssm_qkv_bufs.?[i] = buf;
+                        }
                     } else if (tensor.info.type_ == .q8_0 and size_bytes % @sizeOf(u32) == 0) {
                         if (!need_gpu_copy) {
                             cmd = try metal_command.beginCommand(ctx);
@@ -3448,11 +3488,17 @@ pub const InferenceEngine = struct {
                     const size_bytes: usize = @intCast(tensor.info.sizeBytes());
                     const t_K: u32 = @intCast(tensor.info.dims[0]);
                     if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
-                        var buf = try metal_buffer.createBuffer(ctx, size_bytes);
-                        buf.is_repacked_q8 = true;
                         const t_M: u32 = @intCast(tensor.info.dims[1]);
-                        repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
-                        self.private_ssm_gate_bufs.?[i] = buf;
+                        if (preferApple9QwenSsmPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_ssm_gate_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_repacked_count += 1;
+                            private_repacked_bytes += size_bytes;
+                        } else {
+                            var buf = try metal_buffer.createBuffer(ctx, size_bytes);
+                            buf.is_repacked_q8 = true;
+                            repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
+                            self.private_ssm_gate_bufs.?[i] = buf;
+                        }
                     } else if (tensor.info.type_ == .q8_0 and size_bytes % @sizeOf(u32) == 0) {
                         if (!need_gpu_copy) {
                             cmd = try metal_command.beginCommand(ctx);
@@ -3466,11 +3512,17 @@ pub const InferenceEngine = struct {
                     const size_bytes: usize = @intCast(tensor.info.sizeBytes());
                     const t_K: u32 = @intCast(tensor.info.dims[0]);
                     if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
-                        var buf = try metal_buffer.createBuffer(ctx, size_bytes);
-                        buf.is_repacked_q8 = true;
                         const t_M: u32 = @intCast(tensor.info.dims[1]);
-                        repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
-                        self.private_ssm_out_bufs.?[i] = buf;
+                        if (preferApple9QwenSsmPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_ssm_out_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_repacked_count += 1;
+                            private_repacked_bytes += size_bytes;
+                        } else {
+                            var buf = try metal_buffer.createBuffer(ctx, size_bytes);
+                            buf.is_repacked_q8 = true;
+                            repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
+                            self.private_ssm_out_bufs.?[i] = buf;
+                        }
                     } else if (tensor.info.type_ == .q8_0 and size_bytes % @sizeOf(u32) == 0) {
                         if (!need_gpu_copy) {
                             cmd = try metal_command.beginCommand(ctx);
@@ -3482,6 +3534,12 @@ pub const InferenceEngine = struct {
                 }
             }
             if (need_gpu_copy) cmd.commitAndWait();
+            if (private_repacked_count > 0) {
+                log.info("Metal: private-repacked {d} Qwen SSM Q8_0 tensors ({d:.2} GiB) for coalesced access", .{
+                    private_repacked_count,
+                    @as(f64, @floatFromInt(private_repacked_bytes)) / (1024.0 * 1024.0 * 1024.0),
+                });
+            }
         }
 
         log.debug("Metal inference engine initialized: {d} layers, {d}x{d} heads, dim={d}", .{
