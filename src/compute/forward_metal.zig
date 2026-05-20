@@ -2486,6 +2486,7 @@ pub const InferenceEngine = struct {
     dmmv_q8_0_dual_fused_norm_pipe: MetalPipeline,
     dmmv_q8_0_repacked_pipe: MetalPipeline,
     dmmv_q8_0_repacked_quad_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k2048_quad_pipe: MetalPipeline,
     dmmv_f16_pipe: MetalPipeline,
     dmmv_f32_pipe: MetalPipeline,
     dmmv_q4k_moe_pipe: MetalPipeline,
@@ -2990,6 +2991,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q8_0_dual_fused_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual_fused_norm");
         self.dmmv_q8_0_repacked_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked");
         self.dmmv_q8_0_repacked_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_quad");
+        self.dmmv_q8_0_repacked_k2048_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_quad");
         self.dmmv_f16_pipe = try loadShaderPipeline(ctx, "dmmv_f16");
         self.dmmv_f32_pipe = try loadShaderPipeline(ctx, "dmmv_f32");
         self.dmmv_q4k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe");
@@ -3776,6 +3778,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_fused_norm_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_quad_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f16_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f32_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_pipe);
@@ -6497,6 +6500,20 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             .y_offset = 0,
         };
         const bufs = [_]*const MetalBuffer{ weight_buf, input_buf, output_buf };
+        if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
+            K == 2048 and
+            engine.dmmv_q8_0_repacked_k2048_quad_pipe.thread_execution_width == 32 and
+            engine.dmmv_q8_0_repacked_k2048_quad_pipe.max_threads_per_threadgroup >= 512)
+        {
+            // Same adjacent-row matvec discipline as llama.cpp's
+            // kernel_mul_mv_q8_0_f32_impl, but with ZINC's repacked row
+            // stride and the Qwen3.6 SSM K=2048 shape baked into the shader.
+            const block_size: u32 = 512;
+            const rows_per_wg: u32 = (block_size / 32) * 4;
+            const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_quad_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            return;
+        }
         if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
             engine.dmmv_q8_0_repacked_quad_pipe.thread_execution_width == 32 and
             engine.dmmv_q8_0_repacked_quad_pipe.max_threads_per_threadgroup >= 512)
@@ -21627,6 +21644,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q8_0_k512_quad_pipe);
     var dmmv_q8_0_repacked_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_quad");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_quad_pipe);
+    var dmmv_q8_0_repacked_k2048_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_quad_pipe);
     var dmmv_q8_0_pair_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_pair_swiglu_pipe);
     var dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
@@ -21747,6 +21766,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q8_0_k4096_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_k512_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k2048_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_pair_swiglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
@@ -24470,6 +24490,8 @@ test "repacked Q8_0 quad shader matches CPU reference with tail rows" {
 
     var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_quad");
     defer metal_pipeline.freePipeline(&pipe);
+    var k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_quad");
+    defer metal_pipeline.freePipeline(&k2048_pipe);
 
     const M: u32 = 9;
     const K: u32 = 2048;
@@ -24543,6 +24565,26 @@ test "repacked Q8_0 quad shader matches CPU reference with tail rows" {
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
     cmd.commitAndWait();
+
+    for (0..M) |row| {
+        try std.testing.expectApproxEqAbs(expected[row], output_ptr[row], 0.5);
+    }
+    try std.testing.expectApproxEqAbs(-991.0, output_ptr[M], 0.0);
+    try std.testing.expectApproxEqAbs(-992.0, output_ptr[M + 1], 0.0);
+    try std.testing.expectApproxEqAbs(-993.0, output_ptr[M + 2], 0.0);
+
+    @memset(output_ptr[0 .. M + 3], 0);
+    output_ptr[M] = -991.0;
+    output_ptr[M + 1] = -992.0;
+    output_ptr[M + 2] = -993.0;
+
+    const k2048_block_size: u32 = @min(512, k2048_pipe.max_threads_per_threadgroup);
+    const k2048_rows_per_wg: u32 = (k2048_block_size / 32) * 4;
+    const k2048_wgs = (M + k2048_rows_per_wg - 1) / k2048_rows_per_wg;
+
+    var k2048_cmd = try metal_command.beginCommand(ctx);
+    k2048_cmd.dispatchV2(&k2048_pipe, .{ k2048_wgs, 1, 1 }, .{ k2048_block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    k2048_cmd.commitAndWait();
 
     for (0..M) |row| {
         try std.testing.expectApproxEqAbs(expected[row], output_ptr[row], 0.5);
