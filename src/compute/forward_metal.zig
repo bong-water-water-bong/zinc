@@ -14298,6 +14298,7 @@ fn runDecodeStep(
                 local_cmd_storage = try beginProfiledCommand(engine, profile);
                 cmd = &local_cmd_storage;
             }
+            var residual_router_output_ready = false;
             if (can_fuse_post_attn_norm) {
                 dispatchPostNormResidualRmsNormOnCmd(
                     engine,
@@ -14310,6 +14311,32 @@ fn runDecodeStep(
                     hidden_dim,
                     1.0,
                 );
+            } else if (is_moe and !skip_pre_ffn_router and use_standard_gpu_routed_moe) {
+                const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
+                if (canUseQwenResidualRmsNormRouterQ8Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used, 0)) {
+                    // Adapt llama.cpp's single-token Q8 `kernel_mul_mv_id`
+                    // routed matvec shape at the attention MoE boundary too:
+                    // hidden += attn_out, materialize the exact ffn_norm row,
+                    // and produce compact top-k ids/weights in one dispatch.
+                    dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
+                        engine,
+                        cmd,
+                        &engine.hidden_buf,
+                        &engine.down_buf,
+                        &engine.norm_buf,
+                        &engine.ffn_norm_bufs[layer_idx],
+                        router_t,
+                        &engine.router_output_buf,
+                        hidden_dim,
+                        cfg.n_experts,
+                        cfg.n_experts_used,
+                        1.0,
+                        0,
+                    );
+                    residual_router_output_ready = true;
+                } else {
+                    dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
+                }
             } else {
                 // Fused residual-add + RMS norm: hidden += down; norm_buf = normalize(hidden) * weights.
                 // Eliminates one barrier vs separate scale_acc + barrier + rms_norm.
@@ -14319,7 +14346,9 @@ fn runDecodeStep(
                 profileBarrier(cmd, profile, .dense_ffn);
             }
             if (is_moe and !skip_pre_ffn_router) {
-                profileBarrier(cmd, profile, .router); // norm_buf visible before router DMMV
+                if (!residual_router_output_ready) {
+                    profileBarrier(cmd, profile, .router); // norm_buf visible before router DMMV
+                }
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const router_in_buf: *const MetalBuffer = blk: {
                     if (cfg.architecture == .gemma) {
@@ -14336,11 +14365,14 @@ fn runDecodeStep(
                     break :blk canUseRouterF32TopkBias(engine, router_t, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
                 };
                 const use_fused_q8_router =
+                    !residual_router_output_ready and
                     use_standard_gpu_routed_moe and
                     canUseRouterQ8Topk(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim);
                 if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
                     dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                } else if (residual_router_output_ready) {
+                    // Fused residual+router dispatch already wrote router_output_buf.
                 } else if (use_fused_q8_router) {
                     dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 0);
                 } else {
@@ -14358,7 +14390,7 @@ fn runDecodeStep(
                         cmd = &local_cmd_storage;
                     }
                     if (use_standard_gpu_routed_moe) {
-                        try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, use_fused_q8_router, &engine.norm_buf, 0);
+                        try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router, &engine.norm_buf, 0);
                     } else {
                         try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, use_fused_gptoss_router);
                     }
