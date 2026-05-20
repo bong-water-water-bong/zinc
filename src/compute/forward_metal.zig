@@ -9572,18 +9572,45 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
         profileBarrier(cmd, profile, .full_attn);
     }
 
+    const can_fuse_rope_kv_write =
+        !engine.kv_cache_q8 and
+        !attn.use_k_as_v and
+        (attn.rope_dim % 2) == 0;
     const need_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
-    var did_norm_dispatch = false;
-    if (engine.attn_k_norm_present[layer_idx]) {
+    const fuse_v_unit_norm_into_rope_kv = can_fuse_rope_kv_write and need_v_unit_norm;
+    const fuse_qk_norm_into_rope_kv =
+        can_fuse_rope_kv_write and
+        engine.attn_q_norm_present[layer_idx] and
+        engine.attn_k_norm_present[layer_idx];
+    const did_qk_norm_dispatch =
+        !fuse_qk_norm_into_rope_kv and engine.attn_k_norm_present[layer_idx];
+    if (did_qk_norm_dispatch) {
         dispatchRmsNormOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, &engine.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads);
-        did_norm_dispatch = true;
     }
-    if (need_v_unit_norm) {
+    const did_v_norm_dispatch = need_v_unit_norm and !fuse_v_unit_norm_into_rope_kv;
+    if (did_v_norm_dispatch) {
         dispatchRmsNormOnCmd(engine, cmd, &engine.v_buf, &engine.v_buf, &engine.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads);
-        did_norm_dispatch = true;
     }
-    if (did_norm_dispatch) {
+    if (did_qk_norm_dispatch or did_v_norm_dispatch) {
         profileBarrier(cmd, profile, .full_attn);
+    }
+
+    if (can_fuse_rope_kv_write) {
+        // K/V-only variant of the llama.cpp-style RoPE materialization path:
+        // final non-terminal prompt tokens write rotated K/V directly to cache.
+        dispatchFusedRopeKvCacheWriteOnCmd(
+            engine,
+            cmd,
+            layer_idx,
+            attn,
+            0,
+            engine.position,
+            engine.position * attn.kv_dim,
+            fuse_v_unit_norm_into_rope_kv,
+            fuse_qk_norm_into_rope_kv,
+        );
+        if (profile) |p| p.full_attn_kv_write_calls += 1;
+        return;
     }
 
     dispatchRopeOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
