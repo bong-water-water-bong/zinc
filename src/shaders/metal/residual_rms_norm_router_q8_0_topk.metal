@@ -125,12 +125,24 @@ kernel void main0(
         if (sg_idx == 0u) {
             // Exact Qwen3.6 route shape: let one simdgroup scan the 256 router
             // logits instead of serializing all top-k selection on one lane.
+            // Keep selected ids/scores in registers, following vLLM's
+            // topk->weight finalization discipline, instead of mutating
+            // threadgroup logits and paying a simdgroup barrier per slot.
+            float selected_score[8];
+            uint selected_mask = 0u;
+            #pragma unroll
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                selected_score[slot] = -INFINITY;
+            }
+
             #pragma unroll
             for (uint slot = 0u; slot < 8u; ++slot) {
                 float lane_best = -INFINITY;
                 uint lane_best_idx = 0xffffffffu;
-                for (uint expert = lane; expert < 256u; expert += SIMD_WIDTH) {
-                    const float score = values[expert];
+                #pragma unroll
+                for (uint lane_row = 0u; lane_row < 8u; ++lane_row) {
+                    const uint expert = lane + (lane_row << 5);
+                    const float score = ((selected_mask & (1u << lane_row)) == 0u) ? values[expert] : -INFINITY;
                     if (score > lane_best) {
                         lane_best = score;
                         lane_best_idx = expert;
@@ -138,18 +150,19 @@ kernel void main0(
                 }
                 const float best_val = simd_max(lane_best);
                 const uint best_idx = simd_min((lane_best == best_val) ? lane_best_idx : 0xffffffffu);
+                selected_score[slot] = best_val;
+                if ((best_idx & 31u) == lane) {
+                    selected_mask |= 1u << (best_idx >> 5);
+                }
                 if (lane == 0u) {
                     output_data[slot] = best_idx;
-                    selected_val[slot] = best_val;
-                    values[best_idx] = -INFINITY;
                 }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
             }
 
             const bool weight_lane = lane < 8u;
-            const float selected_score = weight_lane ? selected_val[lane] : -INFINITY;
-            const float max_sel = simd_max(selected_score);
-            const float exp_score = weight_lane ? fast::exp(selected_score - max_sel) : 0.0f;
+            const float score = weight_lane ? selected_score[lane] : -INFINITY;
+            const float max_sel = simd_max(score);
+            const float exp_score = weight_lane ? fast::exp(score - max_sel) : 0.0f;
             const float sum = simd_sum(exp_score);
             const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
             if (weight_lane) {
