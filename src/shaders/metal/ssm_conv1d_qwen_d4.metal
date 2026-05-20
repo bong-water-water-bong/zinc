@@ -34,7 +34,7 @@ kernel void main0(
     sum += kernel_w[k + 2u] * x2;
     sum += kernel_w[k + 3u] * x3;
 
-    output[ch] = sum / (1.0f + exp(-sum));
+    output[ch] = sum * fast::divide(1.0f, 1.0f + fast::exp(-sum));
     state[ch] = x1;
     state[c + ch] = x2;
     state[2u * c + ch] = x3;

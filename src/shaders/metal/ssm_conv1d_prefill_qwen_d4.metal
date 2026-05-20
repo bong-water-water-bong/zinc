@@ -38,7 +38,7 @@ kernel void main0(
         const uint token_base = token * p.input_stride + ch;
         const float x3 = input[p.input_offset + token_base];
         const float sum = fma(w3, x3, fma(w2, x2, fma(w1, x1, w0 * x0)));
-        output[p.output_offset + token_base] = sum / (1.0f + exp(-sum));
+        output[p.output_offset + token_base] = sum * fast::divide(1.0f, 1.0f + fast::exp(-sum));
         x0 = x1;
         x1 = x2;
         x2 = x3;

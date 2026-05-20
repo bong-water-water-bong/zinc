@@ -149,7 +149,7 @@ kernel void main0(
         const uint idx = head * head_v_dim + row;
         const uint weight_idx = (p.norm_per_head != 0u) ? idx : row;
         const float z = z_gate[p.z_offset + idx];
-        const float silu_z = z / (1.0f + exp(-z));
+        const float silu_z = z * fast::divide(1.0f, 1.0f + fast::exp(-z));
         output[p.output_offset + idx] = delta_out[row] * rms * norm_weight[weight_idx] * silu_z;
     }
 }
