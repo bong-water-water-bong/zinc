@@ -611,9 +611,9 @@ fn profileElapsedNs(start_ns: i128) u64 {
 }
 
 fn profileBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: BarrierClass) void {
-    const encoded = cmd.barrier_enabled;
+    const before_count = cmd.barrier_count;
     cmd.barrier();
-    if (!encoded) return;
+    if (cmd.barrier_count == before_count) return;
     if (profile) |p| switch (class) {
         .embed => p.embed_barrier_calls += 1,
         .full_attn => p.full_attn_barrier_calls += 1,

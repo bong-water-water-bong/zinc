@@ -22,6 +22,7 @@ pub const MetalCommand = struct {
     dispatch_count: u32,
     barrier_count: u32,
     barrier_enabled: bool,
+    last_barrier_dispatch_count: u32 = 0,
 
     /// Encode a compute dispatch binding buffers, push constants, grid, and block sizes.
     pub fn dispatch(
@@ -104,6 +105,7 @@ pub const MetalCommand = struct {
         tg_mem_size: u32,
     ) void {
         if (self.handle == null or pipe.handle == null) return;
+        self.dispatch_count += 1;
 
         var c_bufs: [32]?*shim.MetalBuf = .{null} ** 32;
         const n_bufs: u32 = @intCast(@min(bufs.len, 32));
@@ -128,8 +130,11 @@ pub const MetalCommand = struct {
     /// Insert a memory barrier ensuring all prior dispatches complete before subsequent ones.
     pub fn barrier(self: *MetalCommand) void {
         if (!self.barrier_enabled) return;
+        if (self.dispatch_count == 0) return;
+        if (self.last_barrier_dispatch_count == self.dispatch_count) return;
         if (self.handle) |h| {
             self.barrier_count += 1;
+            self.last_barrier_dispatch_count = self.dispatch_count;
             shim.mtl_barrier(h);
         }
     }
@@ -173,6 +178,7 @@ pub fn beginCommandWithMode(ctx: ?*shim.MetalCtx, mode: CommandEncoderMode) !Met
         .dispatch_count = 0,
         .barrier_count = 0,
         .barrier_enabled = mode == .concurrent,
+        .last_barrier_dispatch_count = 0,
     };
 }
 
