@@ -6603,7 +6603,7 @@ fn dispatchDmmvMoeQ5kOnCmd(
         !use_k512 and
         k2048_or_less and
         engine.dmmv_q5k_moe_k2048_pipe.max_threads_per_threadgroup >= 512;
-    const rows_per_wg: u32 = if (use_k512 or use_k2048) 16 else 8;
+    const rows_per_wg: u32 = if (use_k512) 32 else if (use_k2048) 16 else 8;
     const block_size: u32 = if (use_k512 or use_k2048) 512 else 256;
     const wgs = (M + rows_per_wg - 1) / rows_per_wg;
     const pipe = if (use_k512) &engine.dmmv_q5k_moe_k512_pipe else if (use_k2048) &engine.dmmv_q5k_moe_k2048_pipe else &engine.dmmv_q5k_moe_pipe;
@@ -18929,6 +18929,109 @@ test "dmmv_q5k_moe shader matches CPU reference across selected experts" {
 
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_used), 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        const expert_id = routing_ptr[slot];
+        const matrix_raw = weight_buf.cpu_ptr.?[@as(usize, expert_id) * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[slot * K .. (slot + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .q5_k, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            try std.testing.expectApproxEqAbs(expected, output_ptr[slot * M + row], 0.05);
+        }
+    }
+}
+
+test "dmmv_q5k_moe_k512 shader matches CPU reference across paired rows" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 67;
+    const K: usize = 512;
+    const n_used: usize = 3;
+    const n_experts: usize = 4;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 176;
+    const expert_stride: usize = M * row_bytes;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_used * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(routing_buf.cpu_ptr.?[0..routing_buf.size], 0);
+
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 176;
+                const d = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + expert + (row % 7) + blk))));
+                const dmin = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + ((expert + row + blk) % 5)))));
+                const d_bits = @as(u16, @bitCast(d));
+                const dmin_bits = @as(u16, @bitCast(dmin));
+                weight_buf.cpu_ptr.?[base] = @truncate(d_bits);
+                weight_buf.cpu_ptr.?[base + 1] = @truncate(d_bits >> 8);
+                weight_buf.cpu_ptr.?[base + 2] = @truncate(dmin_bits);
+                weight_buf.cpu_ptr.?[base + 3] = @truncate(dmin_bits >> 8);
+                for (0..12) |i| {
+                    weight_buf.cpu_ptr.?[base + 4 + i] = @intCast((expert * 37 + row * 11 + blk * 5 + i * 3) & 0xFF);
+                }
+                for (0..32) |i| {
+                    weight_buf.cpu_ptr.?[base + 16 + i] = @intCast((expert * 19 + row * 7 + blk * 13 + i * 5) & 0xFF);
+                }
+                for (0..128) |i| {
+                    weight_buf.cpu_ptr.?[base + 48 + i] = @intCast((expert * 23 + row * 17 + blk * 19 + i * 7) & 0xFF);
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((slot * 29 + i * 17 + 3) % 23);
+            input_ptr[slot * K + i] = 0.125 * @as(f32, @floatFromInt(raw - 11));
+        }
+    }
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 3;
+    routing_ptr[1] = 0;
+    routing_ptr[2] = 2;
+
+    const push = MoeDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .expert_stride = @intCast(expert_stride),
+        .x_expert_stride = @intCast(K),
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &routing_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 31) / 32), @intCast(n_used), 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
     cmd.commitAndWait();
 
     const allocator = std.testing.allocator;
