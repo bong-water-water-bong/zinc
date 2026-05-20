@@ -13240,6 +13240,22 @@ fn runDecodeStep(
             }
             const apply_attn_gate = try dispatchFullAttnPrepOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim);
             profileBarrier(cmd, profile, .full_attn); // KV cache + q_buf visible before flash attn
+            if (using_external_shared_cmd and
+                !emit_logits and
+                layer_idx + 1 == layer_count and
+                cfg.architecture == .qwen2_moe and
+                cfg.ssm_d_inner != 0)
+            {
+                // Non-terminal prompt tokens only need the final layer's K/V
+                // state for future tokens. Adapt llama.cpp's Metal graph
+                // materialization discipline: after the dependency barrier
+                // publishes the K/V write, skip the logits-only final
+                // flash/out/MoE tail for this prompt token.
+                if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
+                releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
+                engine.position += 1;
+                return;
+            }
             dispatchFlashAttnOnCmd(
                 engine,
                 cmd,
