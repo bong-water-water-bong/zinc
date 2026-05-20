@@ -132,16 +132,13 @@ kernel void main0(
         partial_sq[simd_idx] = sq_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        float total_sq = 0.0f;
-        for (uint i = 0u; i < simdgroups_per_tg; ++i) {
-            total_sq += partial_sq[i];
-        }
-        partial_sq[0] = total_sq;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float rms = rsqrt((partial_sq[0] / float(head_v_dim)) + 1.0e-6f);
+    // Mirror rms_norm_mul.metal: each simdgroup redundantly folds the tiny
+    // partial array, avoiding a second threadgroup barrier just to broadcast
+    // the final RMS scalar.
+    const float partial = (simd_lane < simdgroups_per_tg) ? partial_sq[simd_lane] : 0.0f;
+    const float total_sq = simd_sum(partial);
+    const float rms = rsqrt((total_sq / float(head_v_dim)) + 1.0e-6f);
     for (uint row = tid; row < head_v_dim; row += tg_threads) {
         const uint idx = head * head_v_dim + row;
         const uint weight_idx = (p.norm_per_head != 0u) ? idx : row;
