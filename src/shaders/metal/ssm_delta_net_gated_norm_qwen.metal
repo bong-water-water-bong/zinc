@@ -118,7 +118,6 @@ kernel void main0(
         #pragma unroll
         for (uint col4 = 0u; col4 < 32u; ++col4) {
             const float4 decayed = state_vec[col4] * decay;
-            state_vec[col4] = decayed;
             const float4 kv = k_vec[col4];
             sk_raw = fma(decayed.x, kv.x, sk_raw);
             sk_raw = fma(decayed.y, kv.y, sk_raw);
@@ -134,7 +133,7 @@ kernel void main0(
         for (uint col4 = 0u; col4 < 32u; ++col4) {
             const float4 kv = k_vec[col4];
             const float4 qv = q_vec[col4];
-            const float4 updated = fma(kv, scaled_delta, state_vec[col4]);
+            const float4 updated = fma(kv, scaled_delta, state_vec[col4] * decay);
             state_vec[col4] = updated;
             out_v = fma(updated.x, qv.x, out_v);
             out_v = fma(updated.y, qv.y, out_v);
