@@ -357,6 +357,14 @@ fn qwenMoeRoutePackValidateLayer(engine: *const InferenceEngine) usize {
     return @intCast(requested);
 }
 
+fn qwenRoutePackedPrefixLayerLimit() usize {
+    const requested =
+        readU32Env("ZINC_QWEN36_35B_ROUTE_PACK_PREFIX_LAYERS") orelse
+        readU32Env("ZINC_QWEN36_ROUTE_PACK_PREFIX_LAYERS") orelse
+        return qwen_route_packed_prefix_layer_limit;
+    return @intCast(@max(requested, 1));
+}
+
 fn defaultQwen36SsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
     return cfg.architecture == .qwen2_moe and
         cfg.hidden_dim == 2048 and
@@ -4017,7 +4025,8 @@ pub const InferenceEngine = struct {
         var route_packed_start_layer: usize = 1;
         var route_packed_prefix_ssm_layers: u32 = 1;
         var route_packed_prefix_attn_layers: u32 = 0;
-        while (route_packed_start_layer < qwen_route_packed_prefix_layer_limit) {
+        const route_packed_prefix_layer_limit = qwenRoutePackedPrefixLayerLimit();
+        while (route_packed_start_layer < route_packed_prefix_layer_limit) {
             if (canUseQwenRoutePackedPrefixSsmLayer(self, route_packed_start_layer, prompt_tokens.len)) {
                 try recordQwenRoutePackedPrefixSsmLayerOnCmd(self, &layer0_cmd, profile, route_packed_start_layer, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
                 route_packed_start_layer += 1;
@@ -4035,20 +4044,21 @@ pub const InferenceEngine = struct {
         if (profile != null) {
             const stop_reason: []const u8 = if (route_packed_start_layer >= self.layer_tensors.len)
                 "model_end"
-            else if (route_packed_start_layer >= qwen_route_packed_prefix_layer_limit)
+            else if (route_packed_start_layer >= route_packed_prefix_layer_limit)
                 "limit"
             else if (isFullAttentionLayer(cfg, route_packed_start_layer))
                 "attention_guard"
             else
                 "ssm_guard";
             const prefix_last_layer = if (route_packed_start_layer == 0) 0 else route_packed_start_layer - 1;
-            log.info("Metal profile: Qwen route-packed prefill prefix active layers=0..{d} total={d} ssm={d} attn={d} prompt_tokens={d} stop_layer={d} stop={s}", .{
+            log.info("Metal profile: Qwen route-packed prefill prefix active layers=0..{d} total={d} ssm={d} attn={d} prompt_tokens={d} stop_layer={d} limit={d} stop={s}", .{
                 prefix_last_layer,
                 route_packed_start_layer,
                 route_packed_prefix_ssm_layers,
                 route_packed_prefix_attn_layers,
                 n_tokens,
                 route_packed_start_layer,
+                route_packed_prefix_layer_limit,
                 stop_reason,
             });
             if (route_packed_start_layer < self.layer_tensors.len and !isFullAttentionLayer(cfg, route_packed_start_layer)) {
