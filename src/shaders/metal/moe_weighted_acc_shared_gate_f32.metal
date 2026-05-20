@@ -7,6 +7,7 @@ struct Params {
     uint src_stride;
     uint gate_weight_offset;
     uint norm_offset;
+    float hidden_scale;
 };
 
 // Token-major Qwen MoE finalize with one-row F32 shared gate.
@@ -73,5 +74,5 @@ kernel void main0(
         sum += weight * src[expert * p.src_stride + id];
     }
 
-    accum[id] += sum + gate_value * shared_src[id];
+    accum[id] = (accum[id] + sum + gate_value * shared_src[id]) * p.hidden_scale;
 }

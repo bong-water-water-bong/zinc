@@ -1388,6 +1388,7 @@ const MoeWeightedAccSharedGateF32Push = extern struct {
     src_stride: u32,
     gate_weight_offset: u32,
     norm_offset: u32,
+    hidden_scale: f32,
 };
 
 /// Push constants for Qwen MoE weighted acc + F32 shared gate + next RMSNorm.
@@ -2321,6 +2322,20 @@ fn canUseQwenTokenSharedGateF32Acc(engine: *const InferenceEngine, tensor: *cons
         tensor.info.type_ == .f32 and
         tensor.info.numElements() == hidden_dim and
         engine.moe_weighted_acc_shared_gate_f32_pipe.handle != null;
+}
+
+fn canFoldQwenGpuMoeLayerOutputScale(engine: *const InferenceEngine, lt: LayerTensors, hidden_dim: u32) bool {
+    const gate_inp_shexp = lt.ffn_gate_inp_shexp orelse return false;
+    return engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        hidden_dim == 2048 and
+        lt.ffn_gate_shexp != null and
+        lt.ffn_up_shexp != null and
+        lt.ffn_down_shexp != null and
+        !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        canUseQwenTokenSharedGateF32Acc(engine, gate_inp_shexp, hidden_dim);
 }
 
 fn canUseQwenSsmProjectionTailF32Batched(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, rows: u32, cols: u32) bool {
@@ -10165,6 +10180,7 @@ fn dispatchMoeWeightedAccSharedGateF32OnCmd(
     n_used: u32,
     src_stride: u32,
     norm_byte_offset: u32,
+    hidden_scale: f32,
 ) void {
     const push = MoeWeightedAccSharedGateF32Push{
         .n = n,
@@ -10172,6 +10188,7 @@ fn dispatchMoeWeightedAccSharedGateF32OnCmd(
         .src_stride = src_stride,
         .gate_weight_offset = tensorPageOffset(engine.model, gate_weight),
         .norm_offset = norm_byte_offset,
+        .hidden_scale = hidden_scale,
     };
     const bufs = [_]*const MetalBuffer{ accum, src, routing, shared_src, norm_src, &gate_weight.gpu_buffer };
     const use_qwen2048 =
@@ -13943,6 +13960,7 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     norm_input_buf: *const MetalBuffer,
     norm_input_byte_offset: u32,
     next_attn_norm: ?*const MetalBuffer,
+    hidden_scale: f32,
 ) !bool {
     const cfg = engine.config;
     if (cfg.architecture == .gemma) {
@@ -14143,9 +14161,9 @@ fn recordGpuRoutedBatchedMoeOnCmd(
         } else if (use_f32_shared_gate_acc) {
             // Adapt vLLM's top-k weight+reduce finalization and llama.cpp's
             // Metal fusion discipline: for Qwen3.6's one-row F32 shared gate,
-            // fold the gate dot product into the MoE combine kernel instead
-            // of launching a separate 1xhidden DMMV before reduce.
-            dispatchMoeWeightedAccSharedGateF32OnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, norm_input_buf, gate_inp_shexp.?, hidden_dim, cfg.n_experts_used, hidden_dim, norm_input_byte_offset);
+            // fold the gate dot product and any layer output scale into the MoE
+            // combine kernel instead of launching separate tail kernels.
+            dispatchMoeWeightedAccSharedGateF32OnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, norm_input_buf, gate_inp_shexp.?, hidden_dim, cfg.n_experts_used, hidden_dim, norm_input_byte_offset, hidden_scale);
         } else {
             const gate_buf = if (gate_inp_shexp != null) &engine.router_logits_buf else &engine.down_buf;
             dispatchMoeWeightedAccSharedOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, gate_buf, hidden_dim, cfg.n_experts_used, hidden_dim, gate_inp_shexp != null);
@@ -14721,8 +14739,12 @@ fn runDecodeStep(
                     }
                     if (use_standard_gpu_routed_moe) {
                         const next_attn_norm = qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count, layer_output_scale);
-                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router, &engine.norm_buf, 0, next_attn_norm);
+                        const fold_moe_layer_scale = layer_output_scale != 1.0 and
+                            canFoldQwenGpuMoeLayerOutputScale(engine, lt, hidden_dim);
+                        const moe_hidden_scale: f32 = if (fold_moe_layer_scale) layer_output_scale else 1.0;
+                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router, &engine.norm_buf, 0, next_attn_norm, moe_hidden_scale);
                         if (wrote_next_norm) prev_fused_attn_norm = true;
+                        if (fold_moe_layer_scale) layer_output_scale_fused_into_post_norm = true;
                     } else {
                         try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, use_fused_gptoss_router);
                     }
@@ -15197,8 +15219,12 @@ fn runDecodeStep(
                     }
                     if (use_standard_gpu_routed_moe) {
                         const next_attn_norm = qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count, layer_output_scale);
-                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router, ffn_norm_input_buf, ffn_norm_input_byte_offset, next_attn_norm);
+                        const fold_moe_layer_scale = layer_output_scale != 1.0 and
+                            canFoldQwenGpuMoeLayerOutputScale(engine, lt, hidden_dim);
+                        const moe_hidden_scale: f32 = if (fold_moe_layer_scale) layer_output_scale else 1.0;
+                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router, ffn_norm_input_buf, ffn_norm_input_byte_offset, next_attn_norm, moe_hidden_scale);
                         if (wrote_next_norm) prev_fused_attn_norm = true;
+                        if (fold_moe_layer_scale) layer_output_scale_fused_into_post_norm = true;
                     } else {
                         try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, use_fused_gptoss_router);
                     }
@@ -23133,6 +23159,7 @@ test "moe_weighted_acc_shared_gate_f32 computes gate dot and reduce" {
         .src_stride = n,
         .gate_weight_offset = 0,
         .norm_offset = 0,
+        .hidden_scale = 0.75,
     };
     const bufs = [_]*const MetalBuffer{ &accum_buf, &src_buf, &routing_buf, &shared_buf, &norm_buf, &gate_weight_buf };
 
@@ -23147,11 +23174,11 @@ test "moe_weighted_acc_shared_gate_f32 computes gate dot and reduce" {
 
     for (0..n_usize) |i| {
         const expected =
-            @as(f32, @floatFromInt(i)) +
-            0.2 * src_ptr[i] +
-            0.3 * src_ptr[n_usize + i] +
-            0.5 * src_ptr[2 * n_usize + i] +
-            gate * shared_ptr[i];
+            (@as(f32, @floatFromInt(i)) +
+                0.2 * src_ptr[i] +
+                0.3 * src_ptr[n_usize + i] +
+                0.5 * src_ptr[2 * n_usize + i] +
+                gate * shared_ptr[i]) * 0.75;
         try std.testing.expectApproxEqAbs(expected, accum_ptr[i], 0.001);
     }
 }
@@ -23213,6 +23240,7 @@ test "moe_weighted_acc_shared_gate_f32_qwen2048 computes one-tile gate dot and r
         .src_stride = n,
         .gate_weight_offset = 0,
         .norm_offset = 0,
+        .hidden_scale = 0.5,
     };
     const bufs = [_]*const MetalBuffer{ &accum_buf, &src_buf, &routing_buf, &shared_buf, &norm_buf, &gate_weight_buf };
 
@@ -23231,7 +23259,7 @@ test "moe_weighted_acc_shared_gate_f32_qwen2048 computes one-tile gate dot and r
             expert_sum += weight * src_ptr[expert * n_usize + i];
         }
         const initial = 0.01 * @as(f32, @floatFromInt(i % 17));
-        const expected = initial + expert_sum + gate * shared_ptr[i];
+        const expected = (initial + expert_sum + gate * shared_ptr[i]) * 0.5;
         try std.testing.expectApproxEqAbs(expected, accum_ptr[i], 0.001);
     }
 }

@@ -7,6 +7,7 @@ struct Params {
     uint src_stride;
     uint gate_weight_offset;
     uint norm_offset;
+    float hidden_scale;
 };
 
 // Exact Qwen3.6 token-major MoE finalize for hidden_dim=2048.
@@ -65,6 +66,6 @@ kernel void main0(
         sum = fma(route_weights[5], src[10240u + id], sum);
         sum = fma(route_weights[6], src[12288u + id], sum);
         sum = fma(route_weights[7], src[14336u + id], sum);
-        accum[id] += sum + gate * shared_src[id];
+        accum[id] = (accum[id] + sum + gate * shared_src[id]) * p.hidden_scale;
     }
 }
