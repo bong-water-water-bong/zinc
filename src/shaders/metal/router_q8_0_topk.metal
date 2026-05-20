@@ -19,6 +19,7 @@ struct RouterQ8TopkPush {
 
 #define MAX_EXPERTS 256
 #define MAX_K_USED 16
+#define SIMD_WIDTH 32
 
 kernel void main0(
     constant RouterQ8TopkPush& p [[buffer(0)]],
@@ -76,46 +77,57 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (local_id == 0u) {
-        if (p.n_experts == 256u && p.k == 8u) {
+    if (p.n_experts == 256u && p.k == 8u) {
+        if (sg_idx == 0u) {
+            // Exact Qwen3.6 route shape: let one simdgroup scan the 256 router
+            // logits instead of serializing all top-k selection on one lane.
             #pragma unroll
-            for (uint slot = 0u; slot < 8u; slot++) {
-                float best_val = -INFINITY;
-                uint best_idx = 0u;
-                for (uint expert = 0u; expert < 256u; expert++) {
-                    const float v = values[expert];
-                    if (v > best_val) {
-                        best_val = v;
-                        best_idx = expert;
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                float lane_best = -INFINITY;
+                uint lane_best_idx = 0xffffffffu;
+                for (uint expert = lane; expert < 256u; expert += SIMD_WIDTH) {
+                    const float score = values[expert];
+                    if (score > lane_best) {
+                        lane_best = score;
+                        lane_best_idx = expert;
                     }
                 }
-                output_data[slot] = best_idx;
-                selected_val[slot] = best_val;
-                values[best_idx] = -INFINITY;
+                const float best_val = simd_max(lane_best);
+                const uint best_idx = simd_min((lane_best == best_val) ? lane_best_idx : 0xffffffffu);
+                if (lane == 0u) {
+                    output_data[slot] = best_idx;
+                    selected_val[slot] = best_val;
+                    values[best_idx] = -INFINITY;
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
             }
 
-            float max_sel = -INFINITY;
-            #pragma unroll
-            for (uint slot = 0u; slot < 8u; slot++) {
-                max_sel = max(max_sel, selected_val[slot]);
-            }
+            if (lane == 0u) {
+                float max_sel = -INFINITY;
+                #pragma unroll
+                for (uint slot = 0u; slot < 8u; ++slot) {
+                    max_sel = max(max_sel, selected_val[slot]);
+                }
 
-            float sum = 0.0f;
-            #pragma unroll
-            for (uint slot = 0u; slot < 8u; slot++) {
-                const float e = fast::exp(selected_val[slot] - max_sel);
-                selected_val[slot] = e;
-                sum += e;
-            }
+                float sum = 0.0f;
+                #pragma unroll
+                for (uint slot = 0u; slot < 8u; ++slot) {
+                    const float e = fast::exp(selected_val[slot] - max_sel);
+                    selected_val[slot] = e;
+                    sum += e;
+                }
 
-            const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
-            #pragma unroll
-            for (uint slot = 0u; slot < 8u; slot++) {
-                output_data[8u + slot] = as_type<uint>(selected_val[slot] * inv_sum);
+                const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+                #pragma unroll
+                for (uint slot = 0u; slot < 8u; ++slot) {
+                    output_data[8u + slot] = as_type<uint>(selected_val[slot] * inv_sum);
+                }
             }
-            return;
         }
+        return;
+    }
 
+    if (local_id == 0u) {
         const uint k = min(p.k, uint(MAX_K_USED));
         for (uint slot = 0u; slot < k; slot++) {
             float best_val = -INFINITY;
