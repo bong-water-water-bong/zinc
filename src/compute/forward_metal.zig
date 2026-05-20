@@ -14928,6 +14928,12 @@ fn runDecodeStep(
             } else {
                 const use_prefill_projection_chunk = shouldUseQwenSsmPrefillProjectionChunk(engine, layer_idx);
                 var use_direct_prefill_projection_chunk = false;
+                const TailProjectionMode = enum {
+                    none,
+                    z_alpha_beta_from_norm,
+                    alpha_beta_fused_norm,
+                };
+                var tail_projection_mode: TailProjectionMode = .none;
                 if (use_prefill_projection_chunk) {
                     const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
                     const beta_batched = canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
@@ -14949,9 +14955,7 @@ fn runDecodeStep(
                     // RMSNorm dispatch/barrier before the SSM projections.
                     prev_fused_attn_norm = false;
                     dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
-                    dispatchDmmvOnCmdWithWeightBuf(engine, cmd, z_t, z_buf, z_offset, &engine.norm_buf, &engine.gate_buf, d_inner, hidden_dim, 0);
-                    dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
-                    dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
+                    tail_projection_mode = .z_alpha_beta_from_norm;
                 } else if (canUseQwenSsmFusedNormProjections(
                     engine,
                     wqkv_t,
@@ -14968,55 +14972,24 @@ fn runDecodeStep(
                     // separate RMSNorm dispatch/barrier while preserving token-serial
                     // conv/delta recurrence.
                     dispatchFusedNormDualQ8DmmvOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
-                    dispatchFusedNormDualQ8DmmvOnCmd(
-                        engine,
-                        cmd,
-                        alpha_t,
-                        beta_t,
-                        &alpha_t.gpu_buffer,
-                        &beta_t.gpu_buffer,
-                        tensorPageOffset(engine.model, alpha_t),
-                        tensorPageOffset(engine.model, beta_t),
-                        &engine.hidden_buf,
-                        &engine.attn_norm_bufs[layer_idx],
-                        &engine.router_logits_buf,
-                        &engine.down_buf,
-                        dt_rank,
-                        dt_rank,
-                        hidden_dim,
-                    );
+                    tail_projection_mode = .alpha_beta_fused_norm;
                 } else {
                     // Fallback: separate RMSNorm + barrier + DMMVs
                     dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
                     profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.norm_buf});
-                    if (false and canUseDualQ8Dmmv(engine, wqkv_t, z_t, conv_channels, d_inner, hidden_dim)) {
-                        dispatchDualQ8DmmvOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
-                    } else {
-                        dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
-                        dispatchDmmvOnCmdWithWeightBuf(engine, cmd, z_t, z_buf, z_offset, &engine.norm_buf, &engine.gate_buf, d_inner, hidden_dim, 0);
-                    }
-                    dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
-                    dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
+                    dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
+                    tail_projection_mode = .z_alpha_beta_from_norm;
                 }
                 if (!use_direct_prefill_projection_chunk) {
-                    // llama.cpp's `ggml_metal_op_concurrency_check/reset`
-                    // serializes at range conflicts. The SSM body only reads
-                    // these projection outputs, so avoid flushing unrelated
-                    // scratch/weight buffers on every prompt SSM layer.
-                    profileBarrierBuffers(cmd, profile, .ssm, &.{
-                        &engine.attn_out_buf,
-                        &engine.gate_buf,
-                        &engine.router_logits_buf,
-                        &engine.down_buf,
-                    });
-                }
-                if (shouldValidateQwenSsmProjection(engine, layer_idx, using_local_cmd, wqkv_t, z_t, alpha_t, beta_t)) {
-                    commitAndWaitProfiled(cmd, profile);
-                    const validation_start = profileStart(profile != null);
-                    try validateQwenSsmProjectionBatchKernel(engine, profile, layer_idx, wqkv_t, z_t, alpha_t, beta_t, conv_channels, d_inner, dt_rank, hidden_dim);
-                    if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
-                    local_cmd_storage = try beginProfiledCommand(engine, profile);
-                    cmd = &local_cmd_storage;
+                    switch (tail_projection_mode) {
+                        .none => profileBarrierBuffers(cmd, profile, .ssm, &.{
+                            &engine.attn_out_buf,
+                            &engine.gate_buf,
+                            &engine.router_logits_buf,
+                            &engine.down_buf,
+                        }),
+                        else => profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.attn_out_buf}),
+                    }
                 }
 
                 // Conv1d: attn_out_buf → swiglu_buf
@@ -15047,10 +15020,57 @@ fn runDecodeStep(
                     );
                     if (profile) |p| p.ssm_conv_calls += 1;
                 }
-                // Adapt llama.cpp's `ggml_metal_op_concurrency_reset` idea at
-                // the true dependency edge only: delta-net consumes the conv
-                // output buffer, so avoid a command-wide buffer barrier here.
-                profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.swiglu_buf});
+                switch (tail_projection_mode) {
+                    .none => profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.swiglu_buf}),
+                    .z_alpha_beta_from_norm => {
+                        // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`:
+                        // conv only depends on qkv, so record the z/alpha/beta
+                        // tail after conv and let the concurrent encoder overlap
+                        // it with the recurrent conv dispatch.
+                        dispatchDmmvOnCmdWithWeightBuf(engine, cmd, z_t, z_buf, z_offset, &engine.norm_buf, &engine.gate_buf, d_inner, hidden_dim, 0);
+                        dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
+                        dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
+                        profileBarrierBuffers(cmd, profile, .ssm, &.{
+                            &engine.swiglu_buf,
+                            &engine.gate_buf,
+                            &engine.router_logits_buf,
+                            &engine.down_buf,
+                        });
+                    },
+                    .alpha_beta_fused_norm => {
+                        dispatchFusedNormDualQ8DmmvOnCmd(
+                            engine,
+                            cmd,
+                            alpha_t,
+                            beta_t,
+                            &alpha_t.gpu_buffer,
+                            &beta_t.gpu_buffer,
+                            tensorPageOffset(engine.model, alpha_t),
+                            tensorPageOffset(engine.model, beta_t),
+                            &engine.hidden_buf,
+                            &engine.attn_norm_bufs[layer_idx],
+                            &engine.router_logits_buf,
+                            &engine.down_buf,
+                            dt_rank,
+                            dt_rank,
+                            hidden_dim,
+                        );
+                        profileBarrierBuffers(cmd, profile, .ssm, &.{
+                            &engine.swiglu_buf,
+                            &engine.gate_buf,
+                            &engine.router_logits_buf,
+                            &engine.down_buf,
+                        });
+                    },
+                }
+                if (shouldValidateQwenSsmProjection(engine, layer_idx, using_local_cmd, wqkv_t, z_t, alpha_t, beta_t)) {
+                    commitAndWaitProfiled(cmd, profile);
+                    const validation_start = profileStart(profile != null);
+                    try validateQwenSsmProjectionBatchKernel(engine, profile, layer_idx, wqkv_t, z_t, alpha_t, beta_t, conv_channels, d_inner, dt_rank, hidden_dim);
+                    if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
+                    local_cmd_storage = try beginProfiledCommand(engine, profile);
+                    cmd = &local_cmd_storage;
+                }
 
                 const should_debug_ssm_compare = engine.debug_validation_enabled and engine.position == 0 and layer_idx == 6 and using_local_cmd;
                 const alpha_buf = if (use_direct_prefill_projection_chunk)
