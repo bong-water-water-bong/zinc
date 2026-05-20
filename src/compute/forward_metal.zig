@@ -3795,10 +3795,16 @@ pub const InferenceEngine = struct {
 
     fn queuedTokenMajorEarlyCommitTokens(prompt_len: usize) usize {
         if (prompt_len < 64) return 0;
-        // Match llama.cpp's ggml-metal-context.m graph submission heuristic:
-        // commit a small leading slice, roughly 10% of the graph, so the GPU
-        // starts while the CPU records the remaining command buffer.
-        const graph_fraction = @max(@as(usize, 8), prompt_len / 10);
+        if (readU32Env("ZINC_QWEN36_PREFILL_EARLY_TOKENS")) |requested| {
+            return @min(prompt_len / 2, @as(usize, @intCast(requested)));
+        }
+
+        // Adapt llama.cpp `ggml-metal-context.m::ggml_metal_graph_compute`:
+        // commit a small leading graph slice so the GPU starts while the CPU
+        // records the remaining command buffer. The Effort 16 prompt is only
+        // 134 tokens; a 10% token split under-feeds the first CB, while 16
+        // tokens gives enough queued work without becoming a third large wait.
+        const graph_fraction = @max(@as(usize, 16), prompt_len / 10);
         return @min(prompt_len / 2, @min(graph_fraction, 32));
     }
 
