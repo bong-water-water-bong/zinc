@@ -256,6 +256,19 @@ fn preferApple9Q8K2048Path(tensor: *const metal_loader.LoadedTensor, M: u32, K: 
     return false;
 }
 
+fn preferApple9QwenSharedDownQ8QuadPath(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        M == 2048 and
+        K == 512 and
+        std.mem.endsWith(u8, tensor.info.name, "ffn_down_shexp.weight");
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_SHARED_DOWN_Q8_QUAD") orelse true;
+}
+
 fn preferApple9Q8WidePath(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
     const name = tensor.info.name;
     if (K <= 2048 and M >= 4096 and
@@ -2291,6 +2304,7 @@ pub const InferenceEngine = struct {
     dmmv_mxfp4_moe_sg_pipe: MetalPipeline,
     dmmv_q8_0_lmhead_pipe: MetalPipeline,
     dmmv_q8_0_k2048_pipe: MetalPipeline,
+    dmmv_q8_0_quad_pipe: MetalPipeline,
     dmmv_q8_0_dual_pipe: MetalPipeline,
     dmmv_q8_0_pair_pipe: MetalPipeline,
     dmmv_q8_0_pair_swiglu_pipe: MetalPipeline,
@@ -2779,6 +2793,7 @@ pub const InferenceEngine = struct {
         self.dmmv_mxfp4_moe_sg_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe_sg");
         self.dmmv_q8_0_lmhead_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_lmhead");
         self.dmmv_q8_0_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048");
+        self.dmmv_q8_0_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_quad");
         self.dmmv_q8_0_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual");
         self.dmmv_q8_0_pair_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair");
         self.dmmv_q8_0_pair_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
@@ -3553,6 +3568,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_mxfp4_moe_sg_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_lmhead_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_pair_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_pair_swiglu_pipe);
@@ -5015,6 +5031,15 @@ pub const InferenceEngine = struct {
                         self.dmmv_q8_0_lmhead_pipe.max_threads_per_threadgroup >= 512)
                     {
                         break :blk .{ .pipe = &self.dmmv_q8_0_lmhead_pipe, .push_idx = 0, .rows_per_wg = 32, .block_size = 512 };
+                    }
+                    if (preferApple9QwenSharedDownQ8QuadPath(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Qwen3.6 shared down is a narrow K=512 projection.
+                        // Four rows per simdgroup halves workgroups versus
+                        // the K<=2048 nr=2 path while preserving per-row math.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
                     }
                     if (preferApple9Q8K2048Path(tensor, M, K) and
                         self.dmmv_q8_0_k2048_pipe.thread_execution_width == 32 and
@@ -20308,6 +20333,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_dual_k2048_pipe);
     var dmmv_q4k_moe_gate_up_swiglu_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_swiglu_k2048");
     defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_swiglu_k2048_pipe);
+    var dmmv_q8_0_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_quad_pipe);
     var dmmv_q8_0_pair_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_pair_swiglu_pipe);
     var dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
@@ -20412,6 +20439,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q4k_moe_gate_up_dual_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_gate_up_dual_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_gate_up_swiglu_k2048_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_pair_swiglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
