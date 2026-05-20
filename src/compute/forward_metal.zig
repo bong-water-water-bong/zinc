@@ -695,6 +695,36 @@ fn profileBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: B
     };
 }
 
+fn profileFullAttnQkvBarrier(
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    include_q: bool,
+    include_k: bool,
+    include_v: bool,
+    include_gate: bool,
+    engine: *const InferenceEngine,
+) void {
+    var bufs: [4]*const MetalBuffer = undefined;
+    var count: usize = 0;
+    if (include_q) {
+        bufs[count] = &engine.q_buf;
+        count += 1;
+    }
+    if (include_k) {
+        bufs[count] = &engine.k_buf;
+        count += 1;
+    }
+    if (include_v) {
+        bufs[count] = &engine.v_buf;
+        count += 1;
+    }
+    if (include_gate) {
+        bufs[count] = &engine.gate_buf;
+        count += 1;
+    }
+    profileBarrierBuffers(cmd, profile, .full_attn, bufs[0..count]);
+}
+
 fn fullAttentionInterval(cfg: ModelConfig) u32 {
     return if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
 }
@@ -10127,9 +10157,9 @@ fn dispatchFullAttnPrepOnCmd(
             dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
             dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
         }
-        profileBarrier(cmd, profile, .full_attn);
+        profileBarrierBuffers(cmd, profile, .full_attn, &.{ &engine.attn_out_buf, &engine.k_buf, &engine.v_buf });
         dispatchDeinterleaveOnCmd(engine, cmd, &engine.attn_out_buf, &engine.q_buf, &engine.gate_buf, attn.head_dim, cfg.n_heads);
-        profileBarrier(cmd, profile, .full_attn);
+        profileFullAttnQkvBarrier(cmd, profile, true, false, false, true, engine);
     } else {
         // Separate: project Q directly to q_buf, gate (if present) to gate_buf.
         // Q+K Q4_K dual path: when there is no separate attn_gate and Q/K
@@ -10163,7 +10193,7 @@ fn dispatchFullAttnPrepOnCmd(
                 dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
             }
         }
-        profileBarrier(cmd, profile, .full_attn);
+        profileFullAttnQkvBarrier(cmd, profile, true, true, true, gate_mode.apply_attn_gate, engine);
     }
 
     // Apply Q/K/V biases if present (gpt-oss)
@@ -10173,7 +10203,7 @@ fn dispatchFullAttnPrepOnCmd(
         if (!attn.use_k_as_v) {
             if (lt.attn_v_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.v_buf, b, attn.kv_dim);
         }
-        profileBarrier(cmd, profile, .full_attn);
+        profileFullAttnQkvBarrier(cmd, profile, lt.attn_q_bias != null, lt.attn_k_bias != null, !attn.use_k_as_v and lt.attn_v_bias != null, false, engine);
     }
 
     if (engine.debug_validation_enabled and shouldDebugAttentionValidation(cfg, engine.position, layer_idx)) {
@@ -10236,7 +10266,15 @@ fn dispatchFullAttnPrepOnCmd(
     // (Q/K norm + V unit norm both folded into the fused rope+kv-write), this
     // drops 60 redundant barriers/token from the dense full-attn hot path.
     if (did_qk_norm_dispatch or did_v_norm_dispatch) {
-        profileBarrier(cmd, profile, .full_attn); // norm outputs visible before rope
+        profileFullAttnQkvBarrier(
+            cmd,
+            profile,
+            did_qk_norm_dispatch and engine.attn_q_norm_present[layer_idx],
+            did_qk_norm_dispatch and engine.attn_k_norm_present[layer_idx],
+            did_v_norm_dispatch,
+            false,
+            engine,
+        ); // norm outputs visible before rope
     }
 
     if (can_fuse_rope_kv_write) {
@@ -10261,7 +10299,7 @@ fn dispatchFullAttnPrepOnCmd(
         // Slow path: separate Q-rope, K-rope, and KV cache write dispatches.
         dispatchRopeOnCmd(engine, cmd, &engine.q_buf, &engine.q_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
         dispatchRopeOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
-        profileBarrier(cmd, profile, .full_attn); // rope outputs visible before KV cache write
+        profileFullAttnQkvBarrier(cmd, profile, true, true, false, false, engine); // rope outputs visible before KV cache write
 
         dispatchKvCacheWriteOnCmd(
             engine,
@@ -10298,14 +10336,14 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
         dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
         dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
     }
-    profileBarrier(cmd, profile, .full_attn);
+    profileFullAttnQkvBarrier(cmd, profile, false, true, true, false, engine);
 
     if (lt.attn_k_bias != null or lt.attn_v_bias != null) {
         if (lt.attn_k_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.k_buf, b, attn.kv_dim);
         if (!attn.use_k_as_v) {
             if (lt.attn_v_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.v_buf, b, attn.kv_dim);
         }
-        profileBarrier(cmd, profile, .full_attn);
+        profileFullAttnQkvBarrier(cmd, profile, false, lt.attn_k_bias != null, !attn.use_k_as_v and lt.attn_v_bias != null, false, engine);
     }
 
     const can_fuse_rope_kv_write =
@@ -10328,7 +10366,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
         dispatchRmsNormOnCmd(engine, cmd, &engine.v_buf, &engine.v_buf, &engine.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads);
     }
     if (did_qk_norm_dispatch or did_v_norm_dispatch) {
-        profileBarrier(cmd, profile, .full_attn);
+        profileFullAttnQkvBarrier(cmd, profile, false, did_qk_norm_dispatch, did_v_norm_dispatch, false, engine);
     }
 
     if (can_fuse_rope_kv_write) {
@@ -10350,7 +10388,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
     }
 
     dispatchRopeOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
-    profileBarrier(cmd, profile, .full_attn);
+    profileFullAttnQkvBarrier(cmd, profile, false, true, false, false, engine);
 
     dispatchKvCacheWriteOnCmd(
         engine,
@@ -14358,7 +14396,7 @@ fn runDecodeStep(
                 return;
             }
             const apply_attn_gate = try dispatchFullAttnPrepOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim);
-            profileBarrier(cmd, profile, .full_attn); // KV cache + q_buf visible before flash attn
+            profileBarrierBuffers(cmd, profile, .full_attn, &.{ &engine.q_buf, &engine.kv_k_cache[layer_idx], &engine.kv_v_cache[layer_idx] }); // KV cache + q_buf visible before flash attn
             dispatchFlashAttnOnCmd(
                 engine,
                 cmd,
@@ -14373,17 +14411,17 @@ fn runDecodeStep(
             );
             if (profile) |p| p.full_attn_flash_calls += 1;
             if (apply_attn_gate) {
-                profileBarrier(cmd, profile, .full_attn); // attn_out_buf visible before sigmoid_mul
+                profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.attn_out_buf}); // attn_out_buf visible before sigmoid_mul
                 dispatchSigmoidMulOnCmd(engine, cmd, &engine.gate_buf, &engine.attn_out_buf, attn.q_dim);
             }
-            profileBarrier(cmd, profile, .full_attn); // attn_out_buf visible before output DMMV
+            profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.attn_out_buf}); // attn_out_buf visible before output DMMV
             const o_tensor = lt.attn_output orelse return error.MissingTensor;
             dispatchDmmvOnCmd(engine, cmd, o_tensor, &engine.attn_out_buf, &engine.down_buf, hidden_dim, attn.q_dim, 0);
-            profileBarrier(cmd, profile, .full_attn);
+            profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
             // Apply O projection bias if present (gpt-oss)
             if (lt.attn_output_bias) |b| {
                 dispatchAddBiasOnCmd(engine, cmd, &engine.down_buf, b, hidden_dim);
-                profileBarrier(cmd, profile, .full_attn);
+                profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
             }
             const should_debug_attn_compare = engine.debug_validation_enabled and using_local_cmd and
                 shouldDebugAttentionValidation(cfg, engine.position, layer_idx);
@@ -14395,7 +14433,7 @@ fn runDecodeStep(
             const can_fuse_post_attn_norm = engine.post_attn_norm_present[layer_idx] and !should_debug_attn_compare;
             if (engine.post_attn_norm_present[layer_idx] and !can_fuse_post_attn_norm) {
                 dispatchRmsNormOnCmd(engine, cmd, &engine.down_buf, &engine.down_buf, &engine.post_attn_norm_bufs[layer_idx], hidden_dim, 1);
-                profileBarrier(cmd, profile, .full_attn);
+                profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
             }
             if (should_debug_attn_compare) {
                 commitAndWaitProfiled(cmd, profile);
