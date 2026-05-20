@@ -42,6 +42,7 @@ const qwen_moe_route_pack_validate_tokens: u32 = 128;
 // an arbitrary layer cap.
 const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
 const moe_route_block_cols: u32 = 8;
+const moe_cols_dense_dispatch_cols: u32 = 4;
 
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
@@ -479,6 +480,10 @@ pub const RuntimeProfile = struct {
     full_attn_output_bytes: u64 = 0,
     router_bytes: u64 = 0,
     router_topk_calls: u32 = 0,
+    route_pack_layers: u32 = 0,
+    route_pack_slots: u64 = 0,
+    route_pack_active_block_upper_bound: u64 = 0,
+    route_pack_dense_dispatch_blocks: u64 = 0,
     shared_expert_bytes: u64 = 0,
     shared_expert_gate_up_bytes: u64 = 0,
     shared_expert_down_bytes: u64 = 0,
@@ -1565,6 +1570,40 @@ fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
     const first_blocks = @min(route_slots, n_experts);
     const remaining_routes = route_slots - first_blocks;
     return first_blocks + remaining_routes / moe_route_block_cols;
+}
+
+fn denseMoeColsDispatchBlocks(n_tokens: u32, n_experts: u32) u32 {
+    if (n_tokens == 0 or n_experts == 0) return 0;
+    const blocks_per_expert = (n_tokens + moe_cols_dense_dispatch_cols - 1) / moe_cols_dense_dispatch_cols;
+    return n_experts * blocks_per_expert;
+}
+
+fn recordRoutePackProfile(
+    profile: ?*RuntimeProfile,
+    n_tokens: u32,
+    n_experts: u32,
+    n_experts_used: u32,
+    active_block_upper_bound: u32,
+) void {
+    const p = profile orelse return;
+    const route_slots = n_tokens * n_experts_used;
+    p.route_pack_layers += 1;
+    p.route_pack_slots += route_slots;
+    p.route_pack_active_block_upper_bound += active_block_upper_bound;
+    p.route_pack_dense_dispatch_blocks += denseMoeColsDispatchBlocks(n_tokens, n_experts);
+}
+
+fn logRoutePackCandidateBlocks(n_tokens: u32, n_experts: u32, n_experts_used: u32) void {
+    const route_slots = n_tokens * n_experts_used;
+    const active_block_upper_bound = maxPackedMoeRouteBlocks(route_slots, n_experts);
+    const dense_blocks = denseMoeColsDispatchBlocks(n_tokens, n_experts);
+    log.info("Metal profile: Qwen route-pack candidate blocks prompt_tokens={d} route_slots={d} active_block_upper={d} dense_dispatch_blocks={d} upper/dense={d:.1}%", .{
+        n_tokens,
+        route_slots,
+        active_block_upper_bound,
+        dense_blocks,
+        pctOf(dense_blocks, active_block_upper_bound),
+    });
 }
 
 fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
@@ -4050,6 +4089,7 @@ pub const InferenceEngine = struct {
             logQwenRoutePackedPrefixSsmLayerBlocker(self, 0, prompt_len, false);
             if (canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(self, 0, prompt_len, true)) {
                 log.info("Metal profile: Qwen route-packed prefill candidate available behind ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1 (F32 shared-gate path)", .{});
+                logRoutePackCandidateBlocks(@intCast(prompt_len), self.config.n_experts, self.config.n_experts_used);
             }
             return;
         }
@@ -4700,6 +4740,15 @@ pub const InferenceEngine = struct {
                 logDetailedProfileBuckets("prefill", self.prefill_profile);
             } else {
                 logDetailedProfileBuckets(label, profile);
+            }
+            if (profile.route_pack_layers > 0) {
+                log.info("  route-pack: layers {d} route_slots {d} active_block_upper {d} dense_dispatch_blocks {d} upper/dense {d:.1}%", .{
+                    profile.route_pack_layers,
+                    profile.route_pack_slots,
+                    profile.route_pack_active_block_upper_bound,
+                    profile.route_pack_dense_dispatch_blocks,
+                    pctOf(profile.route_pack_dense_dispatch_blocks, profile.route_pack_active_block_upper_bound),
+                });
             }
             if (profile.dmmv_q8_0_bytes > 0) {
                 var top_idxs: [4]?usize = .{ null, null, null, null };
@@ -9159,6 +9208,7 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
     const route_slots = n_tokens * cfg.n_experts_used;
     const use_active_blocks = engine.moe_route_pack_blocks_pipe.handle != null;
     const active_block_upper_bound = maxPackedMoeRouteBlocks(route_slots, cfg.n_experts);
+    recordRoutePackProfile(profile, n_tokens, cfg.n_experts, cfg.n_experts_used, active_block_upper_bound);
 
     if (use_active_blocks) {
         dispatchMoeRoutePackBlocksOnCmd(
