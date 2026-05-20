@@ -302,12 +302,30 @@ function cycleSummary(cycle: CycleResult): string {
   return `cycle ${cycle.cycle}: ${promptTrunc(cycle.description, 118)}${rate}`;
 }
 
+function isRoutePackOrSharedGateWork(cycle: CycleResult): boolean {
+  const text = [
+    cycle.description,
+    cycle.selfAnalysis,
+    cycle.outputText,
+    ...cycle.nextIdeas,
+  ].join("\n").toLowerCase();
+  return /route.?pack|shared.?gate|f32 shared|materialized.*gate|validator.*logit/.test(text);
+}
+
+function recentRoutePackCooldown(state: RunState): { active: boolean; count: number; window: number } {
+  const window = 8;
+  const recent = state.cycles.slice(-window);
+  const count = recent.filter(c => !c.kept && isRoutePackOrSharedGateWork(c)).length;
+  return { active: count >= 2, count, window };
+}
+
 function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): string[] {
   if (!isQwen36PrefillRun(state)) return [];
 
   const best = bestAcceptedTokPerSec(state, lastResult);
   const currentAccepted = Math.max(currentAcceptedTokPerSec(state), correctResultTokPerSec(lastResult));
   const recentProgress = recentAcceptedProgress(state);
+  const routeCooldown = recentRoutePackCooldown(state);
   const tokenMajorWin = highestMatchingCycle(
     state.cycles,
     (c) => c.kept && c.containsReference && /token-major|shared-gate|topk_weight_and_reduce/i.test(c.description),
@@ -374,8 +392,15 @@ function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): s
   if (traps.length > 0) {
     lines.push(`- Measured-dead traps: ${traps.join(", ")}. Treat their tok/s as invalid until the output contains Paris.`);
   }
+  if (routeCooldown.active) {
+    lines.push(`- ROUTE-PACK COOLDOWN: ${routeCooldown.count} route-pack/shared-gate attempts reverted in the last ${routeCooldown.window} cycles. For the next cycle, do not edit route-pack/shared-gate validators, guards, or kernels; choose an SSM, attention, command-buffer, or exact-shape Q8 path instead.`);
+  }
   if (routePackDensityLine) {
-    lines.push(`- Latest route-pack profile: ${routePackDensityLine.trim()}. This says the active route-pack path is worth validating; do not add another passive counter before using the existing validator/diff output.`);
+    if (routeCooldown.active) {
+      lines.push(`- Latest route-pack profile: ${routePackDensityLine.trim()}. This remains useful evidence, but the cooldown above takes precedence until a real outer-harness validator log identifies a specific tensor/layer fix.`);
+    } else {
+      lines.push(`- Latest route-pack profile: ${routePackDensityLine.trim()}. This says the active route-pack path is worth validating; do not add another passive counter before using the existing validator/diff output.`);
+    }
   }
   if (lastKeptWasVisibilityOnly) {
     lines.push(`- The last kept cycle added measurement or validation visibility (${cycleSummary(lastKept)}). The next cycle should consume that evidence to promote, fix, or abandon a default-off path.`);
@@ -383,6 +408,7 @@ function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): s
 
   lines.push(
     "- Validation gate for risky paths: `ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1`, F32 shared-gate route-pack, active-block route-pack, and dual-Q8 SSM variants must stay default-off until a full active-prompt validation run keeps `Paris` and beats the accepted median.",
+    "- Codex subprocesses in this harness must not run local Metal model commands such as `./zig-out/bin/zinc --model-id qwen36-35b-a3b-q4k-xl` or `ZINC_QWEN36_* ./zig-out/bin/zinc`; they fail with `Metal device not available`. Use `zig build`/`zig build test`; the outer harness owns all Metal measurement and validation runs.",
     "- Next high-leverage moves for 50+: extend the accepted token-major F32 shared-gate combine safely, reduce remaining SSM projection/conv/delta launch overhead, and A/B early prompt commit chunk sizes with the same 5-sample prefill contract.",
     "- If adding a validator or microbench, make it report the exact layer, prompt-token count, max abs diff, and flag-on command so the next cycle can decide whether to promote or abandon it.",
     "",

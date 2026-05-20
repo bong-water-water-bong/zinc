@@ -70,13 +70,13 @@ bun loops/implement_metal.ts --effort 16 --dry-run
 
 ## Current standing
 
-Updated after cycle 125 of the follow-up run:
+Updated after cycle 132 of the follow-up run:
 
-- Current accepted tree is measuring about `45.0-45.1 prefill tok/s` on the
-  Effort 16 chat prompt. Treat `45.0 prefill tok/s` as the comparison baseline
-  for the next cycle unless the harness reports a colder fresh baseline.
+- Current accepted tree is measuring `45.8 prefill tok/s` on the Effort 16
+  chat prompt. Treat `45.8 prefill tok/s` as the comparison baseline for the
+  next cycle unless the harness reports a colder fresh baseline.
 - The original measured baseline was about `34.1 prefill tok/s`, so the loop
-  banked roughly +32% accepted throughput.
+  banked roughly +34% accepted throughput.
 - The largest accepted jump was cycle 89: token-major Qwen F32 shared-gate MoE
   combine, adapted from vLLM top-k weighted reduce and llama.cpp `mul_mat_id`
   discipline. That moved the accepted best from about `36.4` to `43.4`.
@@ -90,6 +90,16 @@ Updated after cycle 125 of the follow-up run:
   `upper/dense=4.1%`. This says expert-major route packing still has large
   launch-reduction potential if the F32 shared-gate correctness blocker is
   fixed.
+- Cycle 126 added the current accepted best, `45.8 prefill tok/s`, by making
+  the route-pack validator compare materialized scalar-gate combine vs fused
+  scatter. This was kept because it did not affect correctness and measured
+  above the current baseline.
+- Cycles 127-132 repeatedly tried route-pack/shared-gate promotion or
+  validation-adjacent changes plus a few layer-0/Q8 variants; every one
+  reverted. Put route-pack/shared-gate work on cooldown for the next several
+  cycles. Do not edit route-pack/shared-gate validators, guards, or kernels
+  again until the outer harness has a real Metal validator log that identifies
+  a specific tensor/layer fix.
 - Do not spend more cycles on small variants of early prompt split,
   terminal-only barriers, layer-0 materialization, or additional passive
   route-pack counters unless a fresh profile proves the named bucket moved.
@@ -102,23 +112,28 @@ Updated after cycle 125 of the follow-up run:
 - The token-major F32 shared-gate reducer rewrite was tried twice and measured
   slower (`44.1` in cycle 117 after the repaired neutral-keep guard). Do not
   retry one-threadgroup-per-token shared-gate reduction without new evidence.
-- Codex subprocesses in this harness may fail direct Metal runs with
-  `Metal device not available`; the outer loop's benchmark gate still has the
-  real Metal measurement. Do not burn cycles retrying in-agent Metal smokes.
+- Codex subprocesses in this harness cannot run local Metal model commands;
+  they fail with `Metal device not available`. Do not run
+  `./zig-out/bin/zinc --model-id qwen36-35b-a3b-q4k-xl` or
+  `ZINC_QWEN36_* ./zig-out/bin/zinc` inside the agent. Use `zig build` and
+  `zig build test`; the outer loop owns all Metal measurement and validation.
 - The local llama.cpp checkout no longer has `ggml-metal.m`. Use
   `ggml-metal-context.m`, `ggml-metal-ops.cpp`, and `ggml-metal.metal` directly
   when the stalled prompt requests reference study.
 
-Best next directions for 50+:
+Best next directions for 50+ after the cooldown:
 
-1. Use the route-pack validators and the existing `shared_gate_f32_batched`
+1. Attack remaining SSM projection/conv/delta launch overhead with exact-shape
+   CPU-visible validators or non-Metal microbench plumbing before default-on
+   changes.
+2. Use profile buckets from the outer harness to remove command-buffer,
+   encoder, barrier, or redundant-copy work that does not alter route-pack or
+   F32 shared-gate semantics.
+3. Use the route-pack validators and the existing `shared_gate_f32_batched`
    scalar diff to find the exact tensor/layer where F32
    shared-gate route packing diverges. A promotion needs layer, prompt-token
-   count, max abs diff, flag-on command, and a `Paris` run.
-2. If the route-pack validator localizes a fixable F32 shared-gate issue,
-   repair and validate that path before adding another default-off probe.
-3. Attack remaining SSM projection/conv/delta launch overhead with exact-shape
-   validators or microbenchmarks before default-on changes.
+   count, max abs diff, flag-on command, and a `Paris` run. Do this only after
+   the cooldown or after the outer harness provides a real validator log.
 4. Explore layer-major work beyond layer 0 only when the dependency is explicit:
    hidden for layer N depends on all prior layer MoE outputs. A safe candidate
    must prove the candidate input equals the token-major input before replacing

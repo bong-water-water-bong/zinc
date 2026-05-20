@@ -675,6 +675,43 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("consume that evidence");
   });
 
+  test("Qwen effort prompt puts repeated route-pack reverts on cooldown", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      currentBest: { tokPerSec: 45.8, containsReference: true },
+      cycles: [
+        makeCycle({
+          cycle: 127,
+          kept: false,
+          containsReference: false,
+          tokPerSec: 45.6,
+          description: "Default layer-0 Qwen route-packed prefill materialized the F32 shared-gate scalar.",
+          outputText: "!!!!!!!!!!!!!!!!",
+        }),
+        makeCycle({
+          cycle: 128,
+          kept: false,
+          containsReference: true,
+          tokPerSec: 44.7,
+          description: "Added active-block materialized F32 shared-gate route-pack validation.",
+        }),
+      ],
+    });
+    const result = makeResult({
+      tokPerSec: 44.8,
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "Paris",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("ROUTE-PACK COOLDOWN");
+    expect(prompt).toContain("do not edit route-pack/shared-gate validators");
+    expect(prompt).toContain("must not run local Metal model commands");
+  });
+
   test("Gemma effort prompt uses Gemma model facts instead of Qwen facts", () => {
     const state = makeState({ effortId: 11 });
     const result = makeResult({
