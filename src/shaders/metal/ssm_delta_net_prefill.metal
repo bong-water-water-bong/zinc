@@ -32,12 +32,14 @@ kernel void main0(
     device float* output [[buffer(7)]],
     uint head [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
-    uint simd_width [[thread_execution_width]]
+    uint simd_width [[thread_execution_width]],
+    uint simdgroups_per_tg [[simdgroups_per_threadgroup]]
 ) {
     if (head >= p.dt_rank || p.head_v_dim > 128u || p.d_state > 128u) {
         return;
     }
 
+    const uint tg_threads = simd_width * simdgroups_per_tg;
     threadgroup float q[128];
     threadgroup float k[128];
     threadgroup float partial[4];
@@ -55,7 +57,7 @@ kernel void main0(
 
         float q_ss = 0.0f;
         float k_ss = 0.0f;
-        for (uint i = tid; i < k_len; i += 64u) {
+        for (uint i = tid; i < k_len; i += tg_threads) {
             const float qv = conv_out[q_base + i];
             const float kv = conv_out[k_base + i];
             q[i] = qv;
@@ -71,7 +73,7 @@ kernel void main0(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0u) {
             float total = 0.0f;
-            const uint n_sg = (64u + simd_width - 1u) / simd_width;
+            const uint n_sg = simdgroups_per_tg;
             for (uint i = 0u; i < n_sg; ++i) {
                 total += partial[i];
             }
@@ -79,7 +81,7 @@ kernel void main0(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float q_scale = rsqrt(fast::max(partial[0], 1.0e-13f)) / sqrt(float(p.d_state));
-        for (uint i = tid; i < k_len; i += 64u) {
+        for (uint i = tid; i < k_len; i += tg_threads) {
             q[i] *= q_scale;
         }
 
@@ -90,7 +92,7 @@ kernel void main0(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0u) {
             float total = 0.0f;
-            const uint n_sg = (64u + simd_width - 1u) / simd_width;
+            const uint n_sg = simdgroups_per_tg;
             for (uint i = 0u; i < n_sg; ++i) {
                 total += partial[i];
             }
@@ -98,7 +100,7 @@ kernel void main0(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float k_scale = rsqrt(fast::max(partial[0], 1.0e-13f));
-        for (uint i = tid; i < k_len; i += 64u) {
+        for (uint i = tid; i < k_len; i += tg_threads) {
             k[i] *= k_scale;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -112,7 +114,7 @@ kernel void main0(
         const float beta_val = 1.0f / (1.0f + exp(-beta[p.beta_offset + token * p.beta_stride + dt_index]));
         const uint head_out_base = p.output_offset + token * p.output_stride + head * p.head_v_dim;
 
-        for (uint row = tid; row < p.head_v_dim; row += 64u) {
+        for (uint row = tid; row < p.head_v_dim; row += tg_threads) {
             const uint row_base = head_state_base + row * p.head_v_dim;
             for (uint col = 0u; col < p.head_v_dim; ++col) {
                 state[row_base + col] *= decay;

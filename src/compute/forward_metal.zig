@@ -419,6 +419,25 @@ fn ssmDeltaGatedNormThreadgroupSize(
     return 64;
 }
 
+fn ssmDeltaNetPrefillThreadgroupSize(
+    pipe: *const MetalPipeline,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+) u32 {
+    if (dt_rank == 32 and
+        head_v_dim == 128 and
+        d_state == 128 and
+        n_group == 16 and
+        pipe.thread_execution_width == 32 and
+        pipe.max_threads_per_threadgroup >= 128)
+    {
+        return 128;
+    }
+    return 64;
+}
+
 fn canUseQwenSsmConvD4FastPath(
     engine: *const InferenceEngine,
     conv_channels: u32,
@@ -10875,7 +10894,8 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
                 &engine.ssm_state_bufs.?[0],
                 &engine.qwen_ssm_prefill_branch_buf,
             };
-            cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+            const tg_size = ssmDeltaNetPrefillThreadgroupSize(&engine.ssm_delta_net_prefill_pipe, dt_rank, head_v_dim, d_state, n_group);
+            cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
             if (profile) |p| p.ssm_delta_calls += 1;
         }
         profileBarrier(&cmd, profile, .ssm);
@@ -16955,9 +16975,11 @@ test "ssm_delta_net_prefill shader matches CPU reference across token chunk" {
     }
     @memset(output_ptr[0 .. n_tokens * d_inner], 0);
 
+    var initial_state: [32]f32 = undefined;
+    @memcpy(initial_state[0..state_len], state_ptr[0..state_len]);
     var ref_state: [32]f32 = undefined;
     var ref_output: [24]f32 = [_]f32{0} ** 24;
-    @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
+    @memcpy(ref_state[0..state_len], initial_state[0..state_len]);
     for (0..token_count) |t| {
         const conv_base = t * conv_len_usize;
         const dt_base = t * dt_rank_usize;
@@ -17015,6 +17037,22 @@ test "ssm_delta_net_prefill shader matches CPU reference across token chunk" {
     for (0..state_len) |i| {
         try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.001);
     }
+
+    if (pipe.max_threads_per_threadgroup >= 128) {
+        @memcpy(state_ptr[0..state_len], initial_state[0..state_len]);
+        @memset(output_ptr[0 .. n_tokens * d_inner], 0);
+
+        var cmd_128 = try metal_command.beginCommand(ctx);
+        cmd_128.dispatchV2(&pipe, .{ dt_rank, 1, 1 }, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+        cmd_128.commitAndWait();
+
+        for (0..token_count * d_inner_usize) |i| {
+            try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.001);
+        }
+        for (0..state_len) |i| {
+            try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.001);
+        }
+    }
 }
 
 test "qwen ssm conv d4 threadgroup helper uses exact model shape" {
@@ -17029,6 +17067,20 @@ test "qwen ssm conv d4 threadgroup helper uses exact model shape" {
     try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 8192, 3, false));
     try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 4096, 4, false));
     try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 8192, 4, true));
+}
+
+test "qwen ssm delta prefill threadgroup helper uses exact model shape" {
+    const pipe = MetalPipeline{
+        .handle = null,
+        .max_threads_per_threadgroup = 128,
+        .thread_execution_width = 32,
+        .static_threadgroup_memory_length = 0,
+    };
+
+    try std.testing.expectEqual(@as(u32, 128), ssmDeltaNetPrefillThreadgroupSize(&pipe, 32, 128, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaNetPrefillThreadgroupSize(&pipe, 16, 128, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaNetPrefillThreadgroupSize(&pipe, 32, 64, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaNetPrefillThreadgroupSize(&pipe, 32, 128, 64, 16));
 }
 
 test "ssm_conv1d shader matches CPU reference" {
