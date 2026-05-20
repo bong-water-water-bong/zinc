@@ -1172,6 +1172,9 @@ pub const InferenceEngine = struct {
     // n_tokens >= 16 — the BN=16 tile is saturated and the same A-tile
     // is reused across N, which the chunked kpar shader cannot do.
     use_mul_mm_proj: bool = false,
+    // Default-on for Qwen3.6-27B layer-major dense prefill when loaded. Uses a
+    // tiled Q4_K gate+up+SwiGLU GEMM to avoid gate/up scratch writes.
+    use_qwen36_batched_fused_gateup: bool = false,
     // Opt-in via ZINC_Q8_WIDE_LM_HEAD=1. Routes only very tall Q8_0
     // matrices (LM head) to an alternate two-row shader that shares
     // x-vector loads across rows.
@@ -2466,6 +2469,18 @@ pub const InferenceEngine = struct {
             log.info("Q4_K projection mul_mm path DISABLED via ZINC_MUL_MM_PROJ=0; using kpar/serial batch shaders", .{});
         }
 
+        const qwen36_batched_gateup_env = std.posix.getenv("ZINC_QWEN36_27B_BATCH_FUSED_GATEUP");
+        const qwen36_batched_gateup_explicitly_off = qwen36_batched_gateup_env != null and
+            std.mem.eql(u8, qwen36_batched_gateup_env.?, "0");
+        const qwen36_batched_gateup_enabled = !qwen36_batched_gateup_explicitly_off and
+            dmmv.pipeline_mul_mm_q4k_gate_up_swiglu != null and
+            instance.push_descriptor_fn != null;
+        if (qwen36_batched_gateup_enabled) {
+            log.info("Qwen3.6-27B batched dense gate+up+SwiGLU path ENABLED (default, set ZINC_QWEN36_27B_BATCH_FUSED_GATEUP=0 to disable)", .{});
+        } else if (qwen36_batched_gateup_explicitly_off) {
+            log.info("Qwen3.6-27B batched dense gate+up+SwiGLU path DISABLED via ZINC_QWEN36_27B_BATCH_FUSED_GATEUP=0", .{});
+        }
+
         const q8_wide_lm_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD");
         const q8_wide_lm_flag = q8_wide_lm_env != null and std.mem.eql(u8, q8_wide_lm_env.?, "1");
         const q8_wide_lm_enabled = q8_wide_lm_flag and dmmv.pipeline_q8_0_wide != null;
@@ -2929,6 +2944,7 @@ pub const InferenceEngine = struct {
             .use_capture_routing = capture_flag and routing_capture_buf.handle != null,
             .use_mul_mm_lm_head = mul_mm_lm_head_enabled,
             .use_mul_mm_proj = mul_mm_proj_enabled,
+            .use_qwen36_batched_fused_gateup = qwen36_batched_gateup_enabled,
             .use_q8_wide_lm_head = q8_wide_lm_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
@@ -12184,22 +12200,52 @@ pub const InferenceEngine = struct {
         }
         const dense_ffn_phase = self.beginProfilePhase();
         const dense_ffn_gateup_phase = self.beginProfilePhase();
-        const dense_ffn_gate_phase = self.beginProfilePhase();
-        try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
-        self.endProfilePhase(.dense_ffn_gate, dense_ffn_gate_phase);
-        const dense_ffn_up_phase = self.beginProfilePhase();
-        try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
-        self.endProfilePhase(.dense_ffn_up, dense_ffn_up_phase);
-        self.decode_cmd.computeBarrier();
-        try self.dispatchFfnActivation(
-            scratch_gate.handle,
-            scratch_gate.size,
-            scratch_up.handle,
-            scratch_up.size,
-            scratch_swiglu.handle,
-            scratch_swiglu.size,
-            n_tokens * inter_dim,
-        );
+        const use_fused_gateup = self.use_qwen36_batched_fused_gateup and
+            self.isQwen36DenseHybrid27B() and
+            gate_t.info.type_ == .q4_k and
+            up_t.info.type_ == .q4_k and
+            n_tokens >= 16 and
+            (hidden_dim & 255) == 0 and
+            self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu != null;
+        if (use_fused_gateup) {
+            try self.dmmv.recordMulMmQ4KGateUpSwiglu(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                gate_t.gpu_buffer.handle,
+                gate_t.gpu_buffer.size,
+                up_t.gpu_buffer.handle,
+                up_t.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                inter_dim,
+                n_tokens,
+                hidden_dim,
+                hidden_dim,
+                inter_dim,
+                0,
+                0,
+                0,
+            );
+        } else {
+            const dense_ffn_gate_phase = self.beginProfilePhase();
+            try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
+            self.endProfilePhase(.dense_ffn_gate, dense_ffn_gate_phase);
+            const dense_ffn_up_phase = self.beginProfilePhase();
+            try self.dispatchProjectionBatched(up_t, scratch_norm, scratch_up, inter_dim, hidden_dim, n_tokens);
+            self.endProfilePhase(.dense_ffn_up, dense_ffn_up_phase);
+            self.decode_cmd.computeBarrier();
+            try self.dispatchFfnActivation(
+                scratch_gate.handle,
+                scratch_gate.size,
+                scratch_up.handle,
+                scratch_up.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                n_tokens * inter_dim,
+            );
+        }
         self.decode_cmd.computeBarrier();
         self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
         const dense_ffn_down_phase = self.beginProfilePhase();
