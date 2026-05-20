@@ -50,6 +50,7 @@ kernel void main0(
     threadgroup float partial_q[4];
     threadgroup float partial_k[4];
     threadgroup float partial_sq[4];
+    threadgroup float head_scalars[4]; // q_scale, k_scale, decay, beta
 
     const uint simd_lane = tid & 31u;
     const uint simd_idx = tid >> 5u;
@@ -72,17 +73,21 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
-        partial_q[0] = partial_q[0] + partial_q[1] + partial_q[2] + partial_q[3];
-        partial_k[0] = partial_k[0] + partial_k[1] + partial_k[2] + partial_k[3];
+        const float q_norm_sq = partial_q[0] + partial_q[1] + partial_q[2] + partial_q[3];
+        const float k_norm_sq = partial_k[0] + partial_k[1] + partial_k[2] + partial_k[3];
+        const float alpha_raw = alpha[p.alpha_offset + head] + dt_bias[head];
+        const float softplus_alpha = log(1.0f + exp(alpha_raw));
+        head_scalars[0] = rsqrt(fast::max(q_norm_sq, 1.0e-13f)) * inv_sqrt_d_state;
+        head_scalars[1] = rsqrt(fast::max(k_norm_sq, 1.0e-13f));
+        head_scalars[2] = exp(softplus_alpha * ssm_a[head]);
+        head_scalars[3] = 1.0f / (1.0f + exp(-beta[p.beta_offset + head]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float q_scale = rsqrt(fast::max(partial_q[0], 1.0e-13f)) * inv_sqrt_d_state;
-    const float k_scale = rsqrt(fast::max(partial_k[0], 1.0e-13f));
-    const float alpha_raw = alpha[p.alpha_offset + head] + dt_bias[head];
-    const float softplus_alpha = log(1.0f + exp(alpha_raw));
-    const float decay = exp(softplus_alpha * ssm_a[head]);
-    const float beta_val = 1.0f / (1.0f + exp(-beta[p.beta_offset + head]));
+    const float q_scale = head_scalars[0];
+    const float k_scale = head_scalars[1];
+    const float decay = head_scalars[2];
+    const float beta_val = head_scalars[3];
 
     const uint row_base = head_state_base + tid * head_v_dim;
     float sk_raw = 0.0f;
