@@ -400,6 +400,25 @@ fn fusedSsmDeltaGatedNormEnabled(engine: *const InferenceEngine, head_v_dim: u32
     return true;
 }
 
+fn ssmDeltaGatedNormThreadgroupSize(
+    pipe: *const MetalPipeline,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+) u32 {
+    if (dt_rank == 32 and
+        head_v_dim == 128 and
+        d_state == 128 and
+        n_group == 16 and
+        pipe.thread_execution_width == 32 and
+        pipe.max_threads_per_threadgroup >= 128)
+    {
+        return 128;
+    }
+    return 64;
+}
+
 const DmmvPathClass = enum(u8) {
     other,
     ssm,
@@ -7988,7 +8007,8 @@ fn dispatchSsmDeltaNetGatedNormOnCmd(
         .norm_per_head = if (norm_per_head) 1 else 0,
     };
     const bufs = [_]*const MetalBuffer{ conv_out, alpha, dt_bias, ssm_a, beta, state, z_gate, norm_weight, output };
-    cmd.dispatchV2(pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetGatedNormPush), 0);
+    const block_size = ssmDeltaGatedNormThreadgroupSize(pipe, dt_rank, head_v_dim, d_state, n_group);
+    cmd.dispatchV2(pipe, .{ dt_rank, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetGatedNormPush), 0);
 }
 
 fn dispatchSoftmaxTopkOnCmd(
