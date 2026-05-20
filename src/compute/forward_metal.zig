@@ -366,6 +366,11 @@ fn qwenRoutePackedPrefixLayerLimit() usize {
     return @intCast(@max(requested, 1));
 }
 
+fn qwenRoutePackedFullValidationEnabled() bool {
+    return (readBoolEnv("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL") orelse false) or
+        (readBoolEnv("ZINC_QWEN36_ROUTE_PACK_VALIDATE_FULL") orelse false);
+}
+
 fn defaultQwen36SsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
     return cfg.architecture == .qwen2_moe and
         cfg.hidden_dim == 2048 and
@@ -3656,6 +3661,92 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn prefillBatchTokenMajorReference(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, target_context_tokens: u32) !void {
+        try self.resetRequestState(target_context_tokens);
+        state.position = 0;
+        state.generated_tokens.clearRetainingCapacity();
+
+        for (prompt_tokens, 0..) |token_id, i| {
+            try self.loadTokenEmbedding(token_id);
+            try runDecodeStep(self, i + 1 == prompt_tokens.len, null, 0, null, null, 0);
+        }
+        state.position = self.position;
+    }
+
+    fn prefillBatchQwenRoutePackedFullValidate(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, target_context_tokens: u32) !void {
+        // Validation-only replay of the production idea from llama.cpp
+        // `ggml_metal_op_mul_mat_id` and vLLM `moe_align_block_size`: run the
+        // layer-major route-packed candidate over the active prompt, then
+        // restore the token-major result so generation remains authoritative.
+        if (!self.canUseQwenLayer0RoutePackedPrefillWithSharedGateMode(prompt_tokens.len, true)) {
+            log.warn("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL[skipped]: route-packed candidate guard failed prompt_tokens={d}; running token-major reference only", .{prompt_tokens.len});
+            return self.prefillBatchTokenMajorReference(state, prompt_tokens, target_context_tokens);
+        }
+
+        try self.resetRequestState(target_context_tokens);
+        state.position = 0;
+        state.generated_tokens.clearRetainingCapacity();
+
+        self.prefillBatchQwenLayer0RoutePacked(state, prompt_tokens) catch |err| {
+            log.warn("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL[failed]: candidate error={s}; running token-major reference only", .{@errorName(err)});
+            return self.prefillBatchTokenMajorReference(state, prompt_tokens, target_context_tokens);
+        };
+
+        const vocab: usize = @intCast(self.config.vocab_size);
+        const candidate_logits = try self.allocator.alloc(f32, vocab);
+        defer self.allocator.free(candidate_logits);
+        const logits_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
+        @memcpy(candidate_logits, logits_ptr[0..vocab]);
+        const candidate_token = self.sampleGreedy();
+
+        try self.prefillBatchTokenMajorReference(state, prompt_tokens, target_context_tokens);
+
+        const ref_logits: [*]const f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
+        var max_abs: f32 = 0.0;
+        var max_idx: usize = 0;
+        var sum_sq: f64 = 0.0;
+        for (0..vocab) |i| {
+            const diff = ref_logits[i] - candidate_logits[i];
+            const abs_diff = @abs(diff);
+            if (abs_diff > max_abs) {
+                max_abs = abs_diff;
+                max_idx = i;
+            }
+            sum_sq += @as(f64, diff) * @as(f64, diff);
+        }
+        const rms: f32 = @floatCast(@sqrt(sum_sq / @as(f64, @floatFromInt(vocab))));
+        const ref_token = self.sampleGreedy();
+        const tol: f32 = 5e-2;
+        const verdict: []const u8 = if (max_abs <= tol) "ok" else "failed";
+        if (max_abs <= tol) {
+            log.info("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL[{s}]: prompt_tokens={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} ref_token={d} candidate_token={d} flag_on=ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1 require_output=Paris", .{
+                verdict,
+                prompt_tokens.len,
+                max_abs,
+                max_idx,
+                ref_logits[max_idx],
+                candidate_logits[max_idx],
+                rms,
+                tol,
+                ref_token,
+                candidate_token,
+            });
+        } else {
+            log.warn("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL[{s}]: prompt_tokens={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} ref_token={d} candidate_token={d} flag_on=ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1 require_output=Paris", .{
+                verdict,
+                prompt_tokens.len,
+                max_abs,
+                max_idx,
+                ref_logits[max_idx],
+                candidate_logits[max_idx],
+                rms,
+                tol,
+                ref_token,
+                candidate_token,
+            });
+        }
+    }
+
     /// Run prompt prefill by replaying the decode path for each prompt token.
     pub fn prefillBatch(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
@@ -3673,6 +3764,13 @@ pub const InferenceEngine = struct {
             state.generated_tokens.clearRetainingCapacity();
         } else if (state.position != self.position) {
             return error.KvStateNotAvailable;
+        }
+        if (qwenRoutePackedFullValidationEnabled() and
+            state.position == 0 and
+            state.generated_tokens.items.len == 0 and
+            !self.qwen_prefill_validation_enabled)
+        {
+            return self.prefillBatchQwenRoutePackedFullValidate(state, prompt_tokens, target_context_tokens);
         }
         self.qwen_moe_route_validate_target_tokens = if (self.qwen_prefill_validation_enabled)
             qwenMoeRoutePackValidateTokensForPrompt(prompt_tokens.len)
@@ -3766,14 +3864,7 @@ pub const InferenceEngine = struct {
         return true;
     }
 
-    fn canUseQwenLayer0RoutePackedPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
-        const force_f32_shared_gate = if (std.posix.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw|
-            std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")
-        else
-            false;
-        if (std.posix.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw| {
-            if (std.mem.eql(u8, raw, "0")) return false;
-        }
+    fn canUseQwenLayer0RoutePackedPrefillWithSharedGateMode(self: *const InferenceEngine, prompt_len: usize, force_f32_shared_gate: bool) bool {
         if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) return false;
         if (!self.canUseSingleCommandQueuedTokenMajorPrefill(prompt_len)) return false;
         if (self.config.architecture != .qwen2_moe or
@@ -3824,6 +3915,17 @@ pub const InferenceEngine = struct {
             }
         }
         return true;
+    }
+
+    fn canUseQwenLayer0RoutePackedPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
+        const force_f32_shared_gate = if (std.posix.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw|
+            std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")
+        else
+            false;
+        if (std.posix.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw| {
+            if (std.mem.eql(u8, raw, "0")) return false;
+        }
+        return self.canUseQwenLayer0RoutePackedPrefillWithSharedGateMode(prompt_len, force_f32_shared_gate);
     }
 
     fn queuedTokenMajorEarlyCommitTokens(prompt_len: usize) usize {
