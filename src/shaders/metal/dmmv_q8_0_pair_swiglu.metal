@@ -75,14 +75,14 @@ kernel void main0(
     const float gate_sum0 = simd_sum(gate0);
     const float up_sum0 = simd_sum(up0);
     if (lane == 0u) {
-        output[base_row] = (gate_sum0 / (1.0f + exp(-gate_sum0))) * up_sum0;
+        output[base_row] = gate_sum0 * fast::divide(1.0f, 1.0f + fast::exp(-gate_sum0)) * up_sum0;
     }
 
     if (has_next) {
         const float gate_sum1 = simd_sum(gate1);
         const float up_sum1 = simd_sum(up1);
         if (lane == 0u) {
-            output[base_row + 1u] = (gate_sum1 / (1.0f + exp(-gate_sum1))) * up_sum1;
+            output[base_row + 1u] = gate_sum1 * fast::divide(1.0f, 1.0f + fast::exp(-gate_sum1)) * up_sum1;
         }
     }
 }

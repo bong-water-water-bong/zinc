@@ -54,7 +54,7 @@ kernel void main0(
         const float part = (lane < simdgroups_per_tg) ? partials[lane] : 0.0f;
         const float group_sum = simd_sum(part);
         if (lane == 0u) {
-            gate_value = 1.0f / (1.0f + exp(-group_sum));
+            gate_value = fast::divide(1.0f, 1.0f + fast::exp(-group_sum));
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
