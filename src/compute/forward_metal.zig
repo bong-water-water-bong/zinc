@@ -476,9 +476,27 @@ fn defaultFusedSsmNormEnabled(cfg: ModelConfig) bool {
 fn fusedSsmDeltaGatedNormEnabled(engine: *const InferenceEngine, head_v_dim: u32, d_state: u32) bool {
     if (!engine.fused_ssm_delta_gated_norm_enabled) return false;
     if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
-    if (engine.ssm_delta_net_gated_norm_pipe.handle == null) return false;
+    if (engine.ssm_delta_net_gated_norm_pipe.handle == null and engine.ssm_delta_net_gated_norm_qwen_pipe.handle == null) return false;
     if (head_v_dim == 0 or head_v_dim > 128 or d_state == 0 or d_state > 128) return false;
     return true;
+}
+
+fn canUseQwenSsmDeltaGatedNormExact(
+    engine: *const InferenceEngine,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    has_dt_bias: bool,
+    has_ssm_a: bool,
+) bool {
+    if (!engine.qwen_ssm_delta_gated_norm_exact_enabled) return false;
+    if (!defaultQwen36SsmPrefillProjectionEnabled(engine.config)) return false;
+    if (!has_dt_bias or !has_ssm_a) return false;
+    if (dt_rank != 32 or head_v_dim != 128 or d_state != 128 or n_group != 16) return false;
+    if (engine.ssm_delta_net_gated_norm_qwen_pipe.handle == null) return false;
+    return engine.ssm_delta_net_gated_norm_qwen_pipe.thread_execution_width == 32 and
+        engine.ssm_delta_net_gated_norm_qwen_pipe.max_threads_per_threadgroup >= 128;
 }
 
 fn ssmDeltaGatedNormThreadgroupSize(
@@ -2565,6 +2583,7 @@ pub const InferenceEngine = struct {
     ssm_delta_net_offset_pipe: MetalPipeline,
     ssm_delta_net_prefill_pipe: MetalPipeline,
     ssm_delta_net_gated_norm_pipe: MetalPipeline,
+    ssm_delta_net_gated_norm_qwen_pipe: MetalPipeline,
     ssm_gated_norm_pipe: MetalPipeline,
 
     // SSM state (Metal buffers — GPU-resident, persistent across tokens)
@@ -2599,6 +2618,7 @@ pub const InferenceEngine = struct {
     qwen_ssm_prefill_proj_enabled: bool,
     fused_ssm_norm_enabled: bool,
     fused_ssm_delta_gated_norm_enabled: bool,
+    qwen_ssm_delta_gated_norm_exact_enabled: bool,
     private_decode_buffers: bool,
     command_encoder_mode: CommandEncoderMode,
     kv_cache_q8: bool,
@@ -2745,6 +2765,9 @@ pub const InferenceEngine = struct {
         self.fused_ssm_norm_enabled = readBoolEnv("ZINC_METAL_FUSED_SSM_NORM") orelse defaultFusedSsmNormEnabled(cfg);
         self.fused_ssm_delta_gated_norm_enabled =
             readBoolEnv("ZINC_METAL_FUSED_SSM_DELTA_GATED_NORM") orelse
+            defaultQwen36SsmPrefillProjectionEnabled(cfg);
+        self.qwen_ssm_delta_gated_norm_exact_enabled =
+            readBoolEnv("ZINC_METAL_QWEN_SSM_DELTA_GATED_NORM_EXACT") orelse
             defaultQwen36SsmPrefillProjectionEnabled(cfg);
         self.private_decode_buffers = if (options.debug_validation_enabled or
             self.gemma_moe_validation_enabled or
@@ -3167,6 +3190,7 @@ pub const InferenceEngine = struct {
         self.ssm_delta_net_offset_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_offset");
         self.ssm_delta_net_prefill_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
         self.ssm_delta_net_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm");
+        self.ssm_delta_net_gated_norm_qwen_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm_qwen");
         self.ssm_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_gated_norm");
 
         // SSM state + constants as Metal buffers (GPU-resident via UMA)
@@ -3844,6 +3868,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.ssm_delta_net_offset_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_prefill_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_gated_norm_pipe);
+        metal_pipeline.freePipeline(&self.ssm_delta_net_gated_norm_qwen_pipe);
         metal_pipeline.freePipeline(&self.ssm_gated_norm_pipe);
 
         if (self.ssm_conv_state_bufs) |bufs| {
@@ -14804,9 +14829,14 @@ fn runDecodeStep(
                 const z_gate_offset = if (use_direct_prefill_projection_chunk) engine.position * d_inner else 0;
                 const use_fused_delta_gated_norm = fusedSsmDeltaGatedNormEnabled(engine, head_v_dim, d_state) and !should_debug_ssm_compare;
                 if (use_fused_delta_gated_norm) {
+                    const delta_gated_norm_pipe =
+                        if (canUseQwenSsmDeltaGatedNormExact(engine, dt_rank, head_v_dim, d_state, n_group, lt.ssm_dt_bias != null, lt.ssm_a != null))
+                            &engine.ssm_delta_net_gated_norm_qwen_pipe
+                        else
+                            &engine.ssm_delta_net_gated_norm_pipe;
                     dispatchSsmDeltaNetGatedNormOnCmd(
                         cmd,
-                        &engine.ssm_delta_net_gated_norm_pipe,
+                        delta_gated_norm_pipe,
                         &engine.swiglu_buf,
                         alpha_buf,
                         &engine.ssm_dt_bias_bufs.?[layer_idx],
@@ -21385,6 +21415,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&ssm_delta_net_prefill_pipe);
     var ssm_delta_net_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm");
     defer metal_pipeline.freePipeline(&ssm_delta_net_gated_norm_pipe);
+    var ssm_delta_net_gated_norm_qwen_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm_qwen");
+    defer metal_pipeline.freePipeline(&ssm_delta_net_gated_norm_qwen_pipe);
     var ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
     defer metal_pipeline.freePipeline(&ssm_conv1d_qwen_d4_pipe);
     var ssm_conv1d_prefill_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
@@ -21451,6 +21483,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(moe_weighted_acc_shared_gate_f32_qwen2048_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_prefill_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_gated_norm_pipe.handle != null);
+    try std.testing.expect(ssm_delta_net_gated_norm_qwen_pipe.handle != null);
     try std.testing.expect(ssm_conv1d_qwen_d4_pipe.handle != null);
     try std.testing.expect(ssm_conv1d_prefill_qwen_d4_pipe.handle != null);
 }
