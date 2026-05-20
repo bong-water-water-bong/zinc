@@ -377,6 +377,14 @@ fn defaultFusedSsmNormEnabled(cfg: ModelConfig) bool {
     return true;
 }
 
+fn fusedSsmDeltaGatedNormEnabled(engine: *const InferenceEngine, head_v_dim: u32, d_state: u32) bool {
+    if (!engine.fused_ssm_delta_gated_norm_enabled) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (engine.ssm_delta_net_gated_norm_pipe.handle == null) return false;
+    if (head_v_dim == 0 or head_v_dim > 128 or d_state == 0 or d_state > 128) return false;
+    return true;
+}
+
 const DmmvPathClass = enum(u8) {
     other,
     ssm,
@@ -1263,6 +1271,24 @@ const SsmGatedNormPush = extern struct {
     z_offset: u32,
     output_offset: u32,
     delta_offset: u32,
+};
+
+/// Push constants for fused token-major SSM delta-net + gated norm.
+const SsmDeltaNetGatedNormPush = extern struct {
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    ssm_a_is_f16: u32,
+    dt_bias_is_f16: u32,
+    has_dt_bias: u32,
+    has_ssm_a: u32,
+    alpha_offset: u32,
+    beta_offset: u32,
+    z_offset: u32,
+    output_offset: u32,
+    norm_per_head: u32,
 };
 
 const GGMLType = gguf.GGMLType;
@@ -2245,6 +2271,7 @@ pub const InferenceEngine = struct {
     ssm_delta_net_pipe: MetalPipeline,
     ssm_delta_net_offset_pipe: MetalPipeline,
     ssm_delta_net_prefill_pipe: MetalPipeline,
+    ssm_delta_net_gated_norm_pipe: MetalPipeline,
     ssm_gated_norm_pipe: MetalPipeline,
 
     // SSM state (Metal buffers — GPU-resident, persistent across tokens)
@@ -2278,6 +2305,7 @@ pub const InferenceEngine = struct {
     qwen_prefill_validation_enabled: bool,
     qwen_ssm_prefill_proj_enabled: bool,
     fused_ssm_norm_enabled: bool,
+    fused_ssm_delta_gated_norm_enabled: bool,
     private_decode_buffers: bool,
     command_encoder_mode: CommandEncoderMode,
     kv_cache_q8: bool,
@@ -2418,6 +2446,9 @@ pub const InferenceEngine = struct {
             readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_LAYER") orelse
             0;
         self.fused_ssm_norm_enabled = readBoolEnv("ZINC_METAL_FUSED_SSM_NORM") orelse defaultFusedSsmNormEnabled(cfg);
+        self.fused_ssm_delta_gated_norm_enabled =
+            readBoolEnv("ZINC_METAL_FUSED_SSM_DELTA_GATED_NORM") orelse
+            defaultQwen36SsmPrefillProjectionEnabled(cfg);
         self.private_decode_buffers = if (options.debug_validation_enabled or
             self.gemma_moe_validation_enabled or
             self.qwen_prefill_validation_enabled)
@@ -2817,6 +2848,7 @@ pub const InferenceEngine = struct {
         self.ssm_delta_net_pipe = try loadShaderPipeline(ctx, "ssm_delta_net");
         self.ssm_delta_net_offset_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_offset");
         self.ssm_delta_net_prefill_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
+        self.ssm_delta_net_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm");
         self.ssm_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_gated_norm");
 
         // SSM state + constants as Metal buffers (GPU-resident via UMA)
@@ -3472,6 +3504,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.ssm_delta_net_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_offset_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_prefill_pipe);
+        metal_pipeline.freePipeline(&self.ssm_delta_net_gated_norm_pipe);
         metal_pipeline.freePipeline(&self.ssm_gated_norm_pipe);
 
         if (self.ssm_conv_state_bufs) |bufs| {
@@ -7665,6 +7698,51 @@ fn dispatchSsmGatedNormBatchedOffsetsWithPipe(
     };
     const bufs = [_]*const MetalBuffer{ delta_net_output, norm_weight, z_gate, output };
     cmd.dispatchV2(pipe, .{ dt_rank, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmGatedNormPush), 0);
+}
+
+fn dispatchSsmDeltaNetGatedNormOnCmd(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    conv_out: *const MetalBuffer,
+    alpha: *const MetalBuffer,
+    dt_bias: *const MetalBuffer,
+    ssm_a: *const MetalBuffer,
+    beta: *const MetalBuffer,
+    state: *const MetalBuffer,
+    z_gate: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    output: *const MetalBuffer,
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    has_dt_bias: bool,
+    has_ssm_a: bool,
+    alpha_offset: u32,
+    beta_offset: u32,
+    z_offset: u32,
+    output_offset: u32,
+    norm_per_head: bool,
+) void {
+    const push = SsmDeltaNetGatedNormPush{
+        .d_inner = d_inner,
+        .dt_rank = dt_rank,
+        .head_v_dim = head_v_dim,
+        .d_state = d_state,
+        .n_group = n_group,
+        .ssm_a_is_f16 = 0,
+        .dt_bias_is_f16 = 0,
+        .has_dt_bias = if (has_dt_bias) 1 else 0,
+        .has_ssm_a = if (has_ssm_a) 1 else 0,
+        .alpha_offset = alpha_offset,
+        .beta_offset = beta_offset,
+        .z_offset = z_offset,
+        .output_offset = output_offset,
+        .norm_per_head = if (norm_per_head) 1 else 0,
+    };
+    const bufs = [_]*const MetalBuffer{ conv_out, alpha, dt_bias, ssm_a, beta, state, z_gate, norm_weight, output };
+    cmd.dispatchV2(pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetGatedNormPush), 0);
 }
 
 fn dispatchSoftmaxTopkOnCmd(
@@ -13372,80 +13450,111 @@ fn runDecodeStep(
             }
             profileBarrier(cmd, profile, .ssm);
 
-            // Delta-net: swiglu_buf → attn_out_buf
-            {
-                const push = SsmDeltaNetPush{
-                    .d_inner = d_inner,
-                    .dt_rank = dt_rank,
-                    .head_v_dim = head_v_dim,
-                    .d_state = d_state,
-                    .n_group = n_group,
-                    .ssm_a_is_f16 = 0,
-                    .dt_bias_is_f16 = 0,
-                    .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
-                    .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
-                    .alpha_offset = if (use_direct_prefill_projection_chunk) engine.position * dt_rank else 0,
-                    .beta_offset = if (use_direct_prefill_projection_chunk) engine.position * dt_rank else 0,
-                    .output_offset = 0,
-                };
-                const alpha_buf = if (use_direct_prefill_projection_chunk)
-                    &engine.qwen_ssm_prefill_proj_alpha_buf
-                else
-                    &engine.router_logits_buf;
-                const beta_buf = if (use_direct_prefill_projection_chunk)
-                    &engine.qwen_ssm_prefill_proj_beta_buf
-                else
-                    &engine.down_buf;
-                const dn_bufs = [_]*const MetalBuffer{
-                    &engine.swiglu_buf,                    alpha_buf,
-                    &engine.ssm_dt_bias_bufs.?[layer_idx], &engine.ssm_a_bufs.?[layer_idx],
-                    beta_buf,                              &engine.ssm_state_bufs.?[layer_idx],
-                    &engine.attn_out_buf,
-                };
-                // SPIRV-Cross Metal shader loops over all head_v_dim rows internally
-                // (stride-64), unlike the GLSL original which uses gl_WorkGroupID.y
-                // for row tiling. grid.y must be 1 to avoid duplicate workgroups
-                // racing on the same SSM state memory. (All unit tests already use y=1.)
-                cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
-                if (profile) |p| p.ssm_delta_calls += 1;
-            }
-            profileBarrier(cmd, profile, .ssm);
             const should_debug_ssm_compare = engine.debug_validation_enabled and engine.position == 0 and layer_idx == 6 and using_local_cmd;
-            if (should_debug_ssm_compare) {
-                commitAndWaitProfiled(cmd, profile);
-                const debug_start = profileStart(profile != null);
-                try debugCompareSsmPreGatedNorm(
-                    engine,
-                    layer,
-                    layer_idx,
-                    wqkv_t,
-                    z_t,
-                    alpha_t,
-                    beta_t,
-                    hidden_dim,
-                    conv_channels,
+            const alpha_buf = if (use_direct_prefill_projection_chunk)
+                &engine.qwen_ssm_prefill_proj_alpha_buf
+            else
+                &engine.router_logits_buf;
+            const beta_buf = if (use_direct_prefill_projection_chunk)
+                &engine.qwen_ssm_prefill_proj_beta_buf
+            else
+                &engine.down_buf;
+            const z_gate_buf = if (use_direct_prefill_projection_chunk)
+                &engine.qwen_ssm_prefill_proj_z_buf
+            else
+                &engine.gate_buf;
+            const alpha_offset = if (use_direct_prefill_projection_chunk) engine.position * dt_rank else 0;
+            const beta_offset = if (use_direct_prefill_projection_chunk) engine.position * dt_rank else 0;
+            const z_gate_offset = if (use_direct_prefill_projection_chunk) engine.position * d_inner else 0;
+            const use_fused_delta_gated_norm = fusedSsmDeltaGatedNormEnabled(engine, head_v_dim, d_state) and !should_debug_ssm_compare;
+            if (use_fused_delta_gated_norm) {
+                dispatchSsmDeltaNetGatedNormOnCmd(
+                    cmd,
+                    &engine.ssm_delta_net_gated_norm_pipe,
+                    &engine.swiglu_buf,
+                    alpha_buf,
+                    &engine.ssm_dt_bias_bufs.?[layer_idx],
+                    &engine.ssm_a_bufs.?[layer_idx],
+                    beta_buf,
+                    &engine.ssm_state_bufs.?[layer_idx],
+                    z_gate_buf,
+                    &engine.ssm_norm_weight_bufs.?[layer_idx],
+                    &engine.attn_out_buf,
                     d_inner,
-                    d_conv,
-                    d_state,
-                    n_group,
                     dt_rank,
                     head_v_dim,
+                    d_state,
+                    n_group,
+                    lt.ssm_dt_bias != null,
+                    lt.ssm_a != null,
+                    alpha_offset,
+                    beta_offset,
+                    z_gate_offset,
+                    0,
+                    engine.ssm_norm_per_head.?[layer_idx],
                 );
-                if (profile) |p| p.debug_validation_ns += profileElapsedNs(debug_start);
-                local_cmd_storage = try beginProfiledCommand(engine, profile);
-                cmd = &local_cmd_storage;
-            }
+                if (profile) |p| {
+                    p.ssm_delta_calls += 1;
+                    p.ssm_gated_norm_calls += 1;
+                }
+                profileBarrier(cmd, profile, .ssm);
+            } else {
+                // Delta-net: swiglu_buf → attn_out_buf
+                {
+                    const push = SsmDeltaNetPush{
+                        .d_inner = d_inner,
+                        .dt_rank = dt_rank,
+                        .head_v_dim = head_v_dim,
+                        .d_state = d_state,
+                        .n_group = n_group,
+                        .ssm_a_is_f16 = 0,
+                        .dt_bias_is_f16 = 0,
+                        .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
+                        .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+                        .alpha_offset = alpha_offset,
+                        .beta_offset = beta_offset,
+                        .output_offset = 0,
+                    };
+                    const dn_bufs = [_]*const MetalBuffer{
+                        &engine.swiglu_buf,                    alpha_buf,
+                        &engine.ssm_dt_bias_bufs.?[layer_idx], &engine.ssm_a_bufs.?[layer_idx],
+                        beta_buf,                              &engine.ssm_state_bufs.?[layer_idx],
+                        &engine.attn_out_buf,
+                    };
+                    // SPIRV-Cross Metal shader loops over all head_v_dim rows internally
+                    // (stride-64), unlike the GLSL original which uses gl_WorkGroupID.y
+                    // for row tiling. grid.y must be 1 to avoid duplicate workgroups
+                    // racing on the same SSM state memory. (All unit tests already use y=1.)
+                    cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
+                    if (profile) |p| p.ssm_delta_calls += 1;
+                }
+                profileBarrier(cmd, profile, .ssm);
+                if (should_debug_ssm_compare) {
+                    commitAndWaitProfiled(cmd, profile);
+                    const debug_start = profileStart(profile != null);
+                    try debugCompareSsmPreGatedNorm(
+                        engine,
+                        layer,
+                        layer_idx,
+                        wqkv_t,
+                        z_t,
+                        alpha_t,
+                        beta_t,
+                        hidden_dim,
+                        conv_channels,
+                        d_inner,
+                        d_conv,
+                        d_state,
+                        n_group,
+                        dt_rank,
+                        head_v_dim,
+                    );
+                    if (profile) |p| p.debug_validation_ns += profileElapsedNs(debug_start);
+                    local_cmd_storage = try beginProfiledCommand(engine, profile);
+                    cmd = &local_cmd_storage;
+                }
 
-            // Gated norm: attn_out_buf → swiglu_buf
-            {
-                const z_gate_buf = if (use_direct_prefill_projection_chunk)
-                    &engine.qwen_ssm_prefill_proj_z_buf
-                else
-                    &engine.gate_buf;
-                const z_gate_offset = if (use_direct_prefill_projection_chunk)
-                    engine.position * d_inner
-                else
-                    0;
+                // Gated norm: attn_out_buf → swiglu_buf
                 dispatchSsmGatedNormOffsetWithPipe(
                     cmd,
                     &engine.ssm_gated_norm_pipe,
@@ -13461,17 +13570,18 @@ fn runDecodeStep(
                     z_gate_offset,
                 );
                 if (profile) |p| p.ssm_gated_norm_calls += 1;
+                profileBarrier(cmd, profile, .ssm);
             }
-            profileBarrier(cmd, profile, .ssm);
 
-            // SSM out DMMV: swiglu_buf → down_buf
+            // SSM out DMMV: gated SSM activation → down_buf
             const ssm_out_t = lt.ssm_out orelse return error.MissingTensor;
             const ssm_out_buf: *const MetalBuffer = if (engine.private_ssm_out_bufs) |bufs|
                 (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &ssm_out_t.gpu_buffer)
             else
                 &ssm_out_t.gpu_buffer;
             const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
-            dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &engine.swiglu_buf, &engine.down_buf, hidden_dim, d_inner, 0);
+            const ssm_activation_buf: *const MetalBuffer = if (use_fused_delta_gated_norm) &engine.attn_out_buf else &engine.swiglu_buf;
+            dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, ssm_activation_buf, &engine.down_buf, hidden_dim, d_inner, 0);
             profileBarrier(cmd, profile, .ssm);
             if (should_debug_ssm_compare) {
                 commitAndWaitProfiled(cmd, profile);
@@ -19074,6 +19184,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&moe_weighted_acc_shared_gate_f32_pipe);
     var ssm_delta_net_prefill_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
     defer metal_pipeline.freePipeline(&ssm_delta_net_prefill_pipe);
+    var ssm_delta_net_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm");
+    defer metal_pipeline.freePipeline(&ssm_delta_net_gated_norm_pipe);
 
     try std.testing.expect(deinterleave_pipe.handle != null);
     try std.testing.expect(flash_attn_pipe.handle != null);
@@ -19122,6 +19234,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(moe_weighted_acc_scaled_pipe.handle != null);
     try std.testing.expect(moe_weighted_acc_shared_gate_f32_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_prefill_pipe.handle != null);
+    try std.testing.expect(ssm_delta_net_gated_norm_pipe.handle != null);
 }
 
 test "deinterleave shader splits block-interleaved Q and gate" {
