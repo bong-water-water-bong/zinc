@@ -111,22 +111,35 @@ kernel void main0(
     float local_sq = 0.0f;
     for (uint row = tid; row < head_v_dim; row += tg_threads) {
         const uint row_base = head_state_base + row * head_v_dim;
+        device float4* state_vec = (device float4*)(state + row_base);
+        threadgroup const float4* k_vec = (threadgroup const float4*)k;
+        threadgroup const float4* q_vec = (threadgroup const float4*)q;
         float sk_raw = 0.0f;
-        for (uint col = 0u; col < head_v_dim; ++col) {
-            const uint state_idx = row_base + col;
-            const float decayed = state[state_idx] * decay;
-            state[state_idx] = decayed;
-            sk_raw = fma(decayed, k[col], sk_raw);
+        #pragma unroll
+        for (uint col4 = 0u; col4 < 32u; ++col4) {
+            const float4 decayed = state_vec[col4] * decay;
+            state_vec[col4] = decayed;
+            const float4 kv = k_vec[col4];
+            sk_raw = fma(decayed.x, kv.x, sk_raw);
+            sk_raw = fma(decayed.y, kv.y, sk_raw);
+            sk_raw = fma(decayed.z, kv.z, sk_raw);
+            sk_raw = fma(decayed.w, kv.w, sk_raw);
         }
 
         const float v = conv_out[v_base + row];
         const float delta = beta_val * (v - sk_raw * k_scale);
         const float scaled_delta = delta * k_scale;
         float out_v = 0.0f;
-        for (uint col = 0u; col < head_v_dim; ++col) {
-            const float updated = fma(k[col], scaled_delta, state[row_base + col]);
-            state[row_base + col] = updated;
-            out_v = fma(updated, q[col], out_v);
+        #pragma unroll
+        for (uint col4 = 0u; col4 < 32u; ++col4) {
+            const float4 kv = k_vec[col4];
+            const float4 qv = q_vec[col4];
+            const float4 updated = fma(kv, scaled_delta, state_vec[col4]);
+            state_vec[col4] = updated;
+            out_v = fma(updated.x, qv.x, out_v);
+            out_v = fma(updated.y, qv.y, out_v);
+            out_v = fma(updated.z, qv.z, out_v);
+            out_v = fma(updated.w, qv.w, out_v);
         }
         out_v *= q_scale;
         delta_out[row] = out_v;
