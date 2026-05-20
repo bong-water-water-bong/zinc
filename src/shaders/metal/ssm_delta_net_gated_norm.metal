@@ -101,12 +101,8 @@ kernel void main0(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float q_scale = rsqrt(fast::max(partial_q[0], 1.0e-13f)) / sqrt(float(p.d_state));
     const float k_scale = rsqrt(fast::max(partial_k[0], 1.0e-13f));
-    for (uint i = tid; i < k_len; i += tg_threads) {
-        q[i] *= q_scale;
-        k[i] *= k_scale;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+    // Keep q/k unscaled in threadgroup memory and fold scales into the row
+    // recurrence. This removes a second per-head threadgroup barrier.
     const float alpha_raw = alpha[p.alpha_offset + head] +
         ((p.has_dt_bias != 0u) ? load_f32_or_f16(dt_bias, head, p.dt_bias_is_f16 != 0u) : 0.0f);
     const float softplus_alpha = log(1.0f + exp(alpha_raw));
@@ -119,25 +115,28 @@ kernel void main0(
     float local_sq = 0.0f;
     for (uint row = tid; row < p.head_v_dim; row += tg_threads) {
         const uint row_base = head_state_base + row * p.head_v_dim;
-        float sk = 0.0f;
+        float sk_raw = 0.0f;
         for (uint col = 0u; col < k_len; ++col) {
             const uint state_idx = row_base + col;
             const float decayed = state[state_idx] * decay;
             state[state_idx] = decayed;
-            sk = fma(decayed, k[col], sk);
+            sk_raw = fma(decayed, k[col], sk_raw);
         }
         for (uint col = k_len; col < p.head_v_dim; ++col) {
             state[row_base + col] *= decay;
         }
 
         const float v = conv_out[v_base + row];
+        const float sk = sk_raw * k_scale;
         const float delta = beta_val * (v - sk);
+        const float scaled_delta = delta * k_scale;
         float out_v = 0.0f;
         for (uint col = 0u; col < k_len; ++col) {
-            const float updated = fma(k[col], delta, state[row_base + col]);
+            const float updated = fma(k[col], scaled_delta, state[row_base + col]);
             state[row_base + col] = updated;
             out_v = fma(updated, q[col], out_v);
         }
+        out_v *= q_scale;
         delta_out[row] = out_v;
         local_sq = fma(out_v, out_v, local_sq);
     }
