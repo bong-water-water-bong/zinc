@@ -2325,6 +2325,7 @@ pub const InferenceEngine = struct {
     qwen_ssm_proj_validate_beta_ref_buf: MetalBuffer,
     qwen_moe_route_validate_captured_tokens: u32,
     qwen_moe_route_validate_target_tokens: u32,
+    qwen_moe_route_validate_failure_hint_emitted: bool,
     qwen_moe_route_validate_layer_input_ref_buf: MetalBuffer,
     qwen_moe_route_validate_norm_buf: MetalBuffer,
     qwen_moe_route_validate_routing_buf: MetalBuffer,
@@ -2474,6 +2475,7 @@ pub const InferenceEngine = struct {
         self.qwen_ssm_proj_validate_beta_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_captured_tokens = 0;
         self.qwen_moe_route_validate_target_tokens = 0;
+        self.qwen_moe_route_validate_failure_hint_emitted = false;
         self.qwen_moe_route_validate_layer_input_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_moe_route_validate_routing_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
@@ -3606,6 +3608,7 @@ pub const InferenceEngine = struct {
         self.qwen_ssm_proj_validate_captured_tokens = 0;
         self.qwen_ssm_prefill_proj_active_tokens = 0;
         self.qwen_moe_route_validate_target_tokens = 0;
+        self.qwen_moe_route_validate_failure_hint_emitted = false;
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -10699,6 +10702,7 @@ fn ensureQwenMoeRoutePackValidationBuffers(
 }
 
 fn logQwenMoeRoutePackValidationDiff(
+    engine: *InferenceEngine,
     layer_idx: usize,
     tensor_name: []const u8,
     expected: []const f32,
@@ -10735,6 +10739,23 @@ fn logQwenMoeRoutePackValidationDiff(
             tol,
         });
     } else {
+        if (!engine.qwen_moe_route_validate_failure_hint_emitted) {
+            engine.qwen_moe_route_validate_failure_hint_emitted = true;
+            log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[first_failure]: moe_route_pack layer={d} tensor={s} tokens={d} route={d} token={d} slot={d} worst_idx={d} max_abs_diff={d:.6} rms_diff={d:.6} tol={d:.6} ref={d:.6} candidate={d:.6} flag_on=ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1 require_output=Paris", .{
+                layer_idx,
+                tensor_name,
+                n_tokens,
+                route,
+                worst_token,
+                worst_slot,
+                worst_idx,
+                diff.max_abs,
+                diff.rms,
+                tol,
+                ref_value,
+                candidate_value,
+            });
+        }
         log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: moe_route_pack layer={d} tensor={s} tokens={d} route={d} token={d} slot={d} worst_idx={d} max_abs_diff={d:.6} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
             verdict,
             layer_idx,
@@ -11260,10 +11281,10 @@ fn validateQwenMoeRoutePackChunk(
     const gate_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_gate_ref_buf.cpu_ptr.?));
     const up_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_up_ref_buf.cpu_ptr.?));
     const down_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_down_ref_buf.cpu_ptr.?));
-    logQwenMoeRoutePackValidationDiff(layer_idx, "moe_gate_grouped_cols", gate_ref[0..total], gate_candidate[0..total], inter_dim, k, n, 5e-2);
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_gate_grouped_cols", gate_ref[0..total], gate_candidate[0..total], inter_dim, k, n, 5e-2);
     if (can_validate_active_blocks) {
         const active_gate_candidate: [*]const f32 = @ptrCast(@alignCast(active_gate_candidate_buf.cpu_ptr.?));
-        logQwenMoeRoutePackValidationDiff(layer_idx, "moe_gate_active_blocks", gate_candidate[0..total], active_gate_candidate[0..total], inter_dim, k, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_gate_active_blocks", gate_candidate[0..total], active_gate_candidate[0..total], inter_dim, k, n, 5e-2);
 
         const grouped_counts: [*]const u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
         const active_counts: [*]const u32 = @ptrCast(@alignCast(active_counts_buf.cpu_ptr.?));
@@ -11315,10 +11336,10 @@ fn validateQwenMoeRoutePackChunk(
             });
         }
     }
-    logQwenMoeRoutePackValidationDiff(layer_idx, "moe_up_grouped_cols", up_ref[0..total], up_candidate[0..total], inter_dim, k, n, 5e-2);
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_up_grouped_cols", up_ref[0..total], up_candidate[0..total], inter_dim, k, n, 5e-2);
     if (can_validate_active_blocks) {
         const active_up_candidate: [*]const f32 = @ptrCast(@alignCast(active_up_candidate_buf.cpu_ptr.?));
-        logQwenMoeRoutePackValidationDiff(layer_idx, "moe_up_active_blocks", up_candidate[0..total], active_up_candidate[0..total], inter_dim, k, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_up_active_blocks", up_candidate[0..total], active_up_candidate[0..total], inter_dim, k, n, 5e-2);
     }
 
     const allocator = engine.allocator;
@@ -11329,15 +11350,15 @@ fn validateQwenMoeRoutePackChunk(
         const off = route * inter_n;
         cpuSwiGLU(gate_ref + off, up_ref + off, swiglu_ref.ptr + off, inter_dim);
     }
-    logQwenMoeRoutePackValidationDiff(layer_idx, "moe_swiglu_grouped_cols", swiglu_ref[0..total], swiglu_candidate[0..total], inter_dim, k, n, 5e-2);
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_swiglu_grouped_cols", swiglu_ref[0..total], swiglu_candidate[0..total], inter_dim, k, n, 5e-2);
     if (can_validate_active_blocks) {
         const active_swiglu_candidate: [*]const f32 = @ptrCast(@alignCast(active_swiglu_candidate_buf.cpu_ptr.?));
-        logQwenMoeRoutePackValidationDiff(layer_idx, "moe_swiglu_active_blocks", swiglu_candidate[0..total], active_swiglu_candidate[0..total], inter_dim, k, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_swiglu_active_blocks", swiglu_candidate[0..total], active_swiglu_candidate[0..total], inter_dim, k, n, 5e-2);
     }
-    logQwenMoeRoutePackValidationDiff(layer_idx, "moe_down_grouped_cols", down_ref[0..down_total], down_candidate[0..down_total], hidden_dim, k, n, 5e-2);
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_down_grouped_cols", down_ref[0..down_total], down_candidate[0..down_total], hidden_dim, k, n, 5e-2);
     if (can_validate_active_blocks) {
         const active_down_candidate: [*]const f32 = @ptrCast(@alignCast(active_down_candidate_buf.cpu_ptr.?));
-        logQwenMoeRoutePackValidationDiff(layer_idx, "moe_down_active_blocks", down_candidate[0..down_total], active_down_candidate[0..down_total], hidden_dim, k, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_down_active_blocks", down_candidate[0..down_total], active_down_candidate[0..down_total], hidden_dim, k, n, 5e-2);
     }
 
     const delta_ref = try allocator.alloc(f32, delta_total);
@@ -11356,10 +11377,10 @@ fn validateQwenMoeRoutePackChunk(
             }
         }
     }
-    logQwenMoeRoutePackValidationDiff(layer_idx, "moe_delta_grouped_scatter", delta_ref[0..delta_total], delta_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_delta_grouped_scatter", delta_ref[0..delta_total], delta_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
     if (can_validate_active_blocks) {
         const active_delta_candidate: [*]const f32 = @ptrCast(@alignCast(active_delta_candidate_buf.cpu_ptr.?));
-        logQwenMoeRoutePackValidationDiff(layer_idx, "moe_delta_active_blocks", delta_candidate[0..delta_total], active_delta_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_delta_active_blocks", delta_candidate[0..delta_total], active_delta_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
     }
 
     if (can_validate_shared) {
@@ -11373,8 +11394,8 @@ fn validateQwenMoeRoutePackChunk(
         const shared_swiglu_candidate: [*]const f32 = @ptrCast(@alignCast(shared_swiglu_candidate_buf.cpu_ptr.?));
         const shared_down_candidate: [*]const f32 = @ptrCast(@alignCast(shared_down_candidate_buf.cpu_ptr.?));
 
-        logQwenMoeRoutePackValidationDiff(layer_idx, "shared_gate_batched", shared_gate_ref[0..shared_total], shared_gate_candidate[0..shared_total], shexp_inter_dim, 1, n, 5e-2);
-        logQwenMoeRoutePackValidationDiff(layer_idx, "shared_up_batched", shared_up_ref[0..shared_total], shared_up_candidate[0..shared_total], shexp_inter_dim, 1, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "shared_gate_batched", shared_gate_ref[0..shared_total], shared_gate_candidate[0..shared_total], shexp_inter_dim, 1, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "shared_up_batched", shared_up_ref[0..shared_total], shared_up_candidate[0..shared_total], shexp_inter_dim, 1, n, 5e-2);
 
         const shared_swiglu_ref = try allocator.alloc(f32, shared_total);
         defer allocator.free(shared_swiglu_ref);
@@ -11383,8 +11404,8 @@ fn validateQwenMoeRoutePackChunk(
             const off = token * shexp_inter_n;
             cpuSwiGLU(shared_gate_ref + off, shared_up_ref + off, shared_swiglu_ref.ptr + off, shexp_inter_dim);
         }
-        logQwenMoeRoutePackValidationDiff(layer_idx, "shared_swiglu_batched", shared_swiglu_ref[0..shared_total], shared_swiglu_candidate[0..shared_total], shexp_inter_dim, 1, n, 5e-2);
-        logQwenMoeRoutePackValidationDiff(layer_idx, "shared_down_batched", shared_down_ref[0..shared_down_total], shared_down_candidate[0..shared_down_total], hidden_dim, 1, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "shared_swiglu_batched", shared_swiglu_ref[0..shared_total], shared_swiglu_candidate[0..shared_total], shexp_inter_dim, 1, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "shared_down_batched", shared_down_ref[0..shared_down_total], shared_down_candidate[0..shared_down_total], hidden_dim, 1, n, 5e-2);
 
         if (can_validate_shared_acc) {
             const combined_ref = try allocator.alloc(f32, delta_total);
@@ -11420,14 +11441,14 @@ fn validateQwenMoeRoutePackChunk(
                 "moe_delta_grouped_shared_gate_f32"
             else
                 "moe_delta_grouped_shared";
-            logQwenMoeRoutePackValidationDiff(layer_idx, combined_tensor_name, combined_ref[0..delta_total], combined_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+            logQwenMoeRoutePackValidationDiff(engine, layer_idx, combined_tensor_name, combined_ref[0..delta_total], combined_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
 
             const active_combined_candidate: ?[*]const f32 = if (can_validate_active_blocks and f32_shared_gate)
                 @ptrCast(@alignCast(active_combined_delta_candidate_buf.cpu_ptr.?))
             else
                 null;
             if (active_combined_candidate) |active_combined| {
-                logQwenMoeRoutePackValidationDiff(layer_idx, "moe_delta_active_shared_gate_f32", combined_ref[0..delta_total], active_combined[0..delta_total], hidden_dim, 1, n, 5e-2);
+                logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_delta_active_shared_gate_f32", combined_ref[0..delta_total], active_combined[0..delta_total], hidden_dim, 1, n, 5e-2);
             }
 
             const post_candidate = try allocator.alloc(f32, delta_total);
@@ -11441,13 +11462,13 @@ fn validateQwenMoeRoutePackChunk(
                 "post_hidden_grouped_shared_gate_f32"
             else
                 "post_hidden_grouped_shared";
-            logQwenMoeRoutePackValidationDiff(layer_idx, post_tensor_name, post_hidden_ref[0..delta_total], post_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+            logQwenMoeRoutePackValidationDiff(engine, layer_idx, post_tensor_name, post_hidden_ref[0..delta_total], post_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
 
             if (active_combined_candidate) |active_combined| {
                 for (0..delta_total) |i| {
                     post_candidate[i] = hidden_before_ref[i] + active_combined[i];
                 }
-                logQwenMoeRoutePackValidationDiff(layer_idx, "post_hidden_active_shared_gate_f32", post_hidden_ref[0..delta_total], post_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+                logQwenMoeRoutePackValidationDiff(engine, layer_idx, "post_hidden_active_shared_gate_f32", post_hidden_ref[0..delta_total], post_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
             }
         }
     }
@@ -11642,8 +11663,8 @@ fn validateQwenRoutePackedSsmPrefix(
     const ref_hidden: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_hidden_before_ref_buf.cpu_ptr.?));
     const ref_norm: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_norm_buf.cpu_ptr.?));
     const total = n_usize * hidden_n;
-    logQwenMoeRoutePackValidationDiff(layer_idx, "ssm_prefix_hidden_before_moe", ref_hidden[0..total], candidate_hidden[0..total], hidden_dim, 1, n, 5e-2);
-    logQwenMoeRoutePackValidationDiff(layer_idx, "ssm_prefix_ffn_norm", ref_norm[0..total], candidate_norm[0..total], hidden_dim, 1, n, 5e-2);
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "ssm_prefix_hidden_before_moe", ref_hidden[0..total], candidate_hidden[0..total], hidden_dim, 1, n, 5e-2);
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "ssm_prefix_ffn_norm", ref_norm[0..total], candidate_norm[0..total], hidden_dim, 1, n, 5e-2);
 }
 
 fn logQwenPrefillValidationDiff(
