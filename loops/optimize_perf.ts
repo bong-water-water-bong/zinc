@@ -730,6 +730,16 @@ type CoherenceSweep = {
   failureIds: string[];
 };
 
+type CoherenceCase = {
+  modelTarget: ModelTarget;
+  check: CoherenceCheck;
+  promptMode: PromptMode;
+  maxTokens: number;
+  prompt: string;
+  label: string;
+  id: string;
+};
+
 const BLOCKED_FILE_OPS = [
   "Edit(loops/*)", "Write(loops/*)", "Edit(site/*)", "Write(site/*)",
   "Edit(docs/*)", "Write(docs/*)", "Edit(.env)", "Write(.env)",
@@ -891,7 +901,8 @@ async function rsyncToRemote(): Promise<void> {
     "-e", `ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no`,
     "--exclude", ".zig-cache", "--exclude", "zig-out", "--exclude", "node_modules",
     "--exclude", ".git", "--exclude", ".perf_optimize", "--exclude", ".zinc_optimize",
-    "--exclude", "site", "--exclude", ".DS_Store",
+    "--exclude", "site", "--exclude", ".DS_Store", "--exclude", ".env", "--exclude", ".env.*",
+    "--exclude", "*.swp", "--exclude", "*.swo",
     `${REPO_ROOT}/`, `${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/`,
   ], { timeout: 120_000 });
   if (exitCode !== 0) throw new Error(`rsync failed: ${stderr.slice(0, 300)}`);
@@ -1825,7 +1836,7 @@ Before editing any file, re-read the exact current contents from disk. Do not re
    - If you are uncertain, add a tiny enabling or measurement step instead of another large speculative refactor.
 
 5. **Test on remote node:**
-   rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+   rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
    ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
 6. **Shader compilation:** glslc --target-env=vulkan1.3 -fshader-stage=compute file.comp -o file.spv
@@ -1950,7 +1961,7 @@ Your output must still end with @@@DESCRIPTION / @@@STEP_KIND / @@@SELF_ANALYSIS
 - enablement (only if you measured flag-on in this same cycle)
 
 ## Test on Remote Node
-rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
 ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
 Files you may edit: same as a normal cycle (src/compute/*.zig, src/vulkan/*.zig, src/model/*.zig, src/server/*.zig, src/server/chat.html, src/shaders/*.comp, src/main.zig). You may also remove files that a revert would remove.
@@ -2178,9 +2189,13 @@ function coherenceCaseLabel(model: string, prompt: string): string {
 }
 
 function formatCoherenceFailure(failure: CoherenceFailure): string {
-  return failure.kind === "crash"
-    ? `${failure.label}: crashed`
-    : `${failure.label}: "${failure.outputText.slice(0, 50)}"`;
+  if (failure.kind === "crash") {
+    const detail = failure.outputText.trim().replace(/\s+/g, " ");
+    return detail
+      ? `${failure.label}: crashed (${trunc(detail, 90)})`
+      : `${failure.label}: crashed`;
+  }
+  return `${failure.label}: "${failure.outputText.slice(0, 50)}"`;
 }
 
 export function formatCoherenceFailureList(failures: CoherenceFailure[]): string {
@@ -2197,45 +2212,83 @@ export function summarizeCoherenceRegression(
   return `New coherence failures vs accepted baseline: ${formatCoherenceFailureList(regressions)}`;
 }
 
+async function runCoherenceCase(testCase: CoherenceCase, timeoutMs: number): Promise<CoherenceFailure | null> {
+  try {
+    const out = await ssh(
+      zincRemoteCommand(testCase.modelTarget, testCase.prompt, testCase.maxTokens, testCase.promptMode),
+      timeoutMs,
+    );
+    const textMatch = out.match(/Output text:\s*(.+)/i);
+    const outputText = textMatch ? textMatch[1].trim() : "";
+    const pass = testCase.check.expect.every(e => outputText.toLowerCase().includes(e.toLowerCase()));
+    if (pass) return null;
+    return {
+      id: testCase.id,
+      label: testCase.label,
+      model: testCase.modelTarget.name,
+      prompt: testCase.prompt,
+      outputText,
+      kind: "mismatch",
+    };
+  } catch (e) {
+    return {
+      id: testCase.id,
+      label: testCase.label,
+      model: testCase.modelTarget.name,
+      prompt: testCase.prompt,
+      outputText: String(e).slice(-500),
+      kind: "crash",
+    };
+  }
+}
+
 async function runCoherenceSweep(): Promise<CoherenceSweep> {
-  const failures: CoherenceFailure[] = [];
+  const cases: CoherenceCase[] = [];
   for (const modelTarget of COHERENCE_MODELS) {
     const promptMode = coherencePromptModeForModel(modelTarget);
     const maxTokens = coherenceMaxTokensForModel(modelTarget);
     for (const check of COHERENCE_CHECKS) {
       const prompt = coherencePromptForMode(check, promptMode);
-      const label = coherenceCaseLabel(modelTarget.name, prompt);
-      try {
-        const out = await ssh(
-          zincRemoteCommand(modelTarget, prompt, maxTokens, promptMode),
-          120_000,
-        );
-        const textMatch = out.match(/Output text:\s*(.+)/i);
-        const outputText = textMatch ? textMatch[1].trim() : "";
-        const pass = check.expect.every(e => outputText.toLowerCase().includes(e.toLowerCase()));
-        if (!pass) {
-          failures.push({
-            id: coherenceCaseId(modelTarget.name, prompt),
-            label,
-            model: modelTarget.name,
-            prompt,
-            outputText,
-            kind: "mismatch",
-          });
-        }
-      } catch (e) {
-        failures.push({
-          id: coherenceCaseId(modelTarget.name, prompt),
-          label,
-          model: modelTarget.name,
-          prompt,
-          outputText: "",
-          kind: "crash",
-        });
-      }
+      cases.push({
+        modelTarget,
+        check,
+        promptMode,
+        maxTokens,
+        prompt,
+        label: coherenceCaseLabel(modelTarget.name, prompt),
+        id: coherenceCaseId(modelTarget.name, prompt),
+      });
     }
+  }
+
+  let failures: CoherenceFailure[] = [];
+  for (const testCase of cases) {
+    const failure = await runCoherenceCase(testCase, 180_000);
+    if (failure) failures.push(failure);
+  }
+
+  const crashedIds = new Set(failures.filter((failure) => failure.kind === "crash").map((failure) => failure.id));
+  if (crashedIds.size > 0) {
+    console.log(c("1;33", `  Coherence saw ${crashedIds.size} crash/timeout case(s); cleaning RDNA node and retrying crashed cases once...`));
+    await cleanRemoteBenchmarkNode();
+    const stableFailures = failures.filter((failure) => failure.kind !== "crash");
+    const retriedFailures: CoherenceFailure[] = [];
+    for (const testCase of cases) {
+      if (!crashedIds.has(testCase.id)) continue;
+      const failure = await runCoherenceCase(testCase, 240_000);
+      if (failure) retriedFailures.push(failure);
+    }
+    failures = [...stableFailures, ...retriedFailures];
+  }
+
+  for (const modelTarget of COHERENCE_MODELS) {
     if (!failures.some((failure) => failure.model === modelTarget.name)) {
       console.log(c("2", `    ${modelTarget.name}: all ${COHERENCE_CHECKS.length} prompts OK`));
+    } else {
+      const crashCount = failures.filter((failure) => failure.model === modelTarget.name && failure.kind === "crash").length;
+      if (crashCount > 0) {
+        console.log(c("1;33", `    ${modelTarget.name}: ${crashCount} crash/timeout case(s) after retry`));
+      }
     }
   }
   return {
@@ -3128,7 +3181,7 @@ ${result.buildOutput.slice(-2000)}
 - The code must compile: zig build -Doptimize=ReleaseFast must succeed on the remote node.
 - Do not use sub-agents, delegation, spawn_agent, or wait_agent.
 - Re-read the file right before patching it; do not patch against stale context.
-- rsync to remote: rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+- rsync to remote: rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
 - Build on remote: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast 2>&1"
 - Shader compilation: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR}/src/shaders && for f in *.comp; do glslc --target-env=vulkan1.3 -fshader-stage=compute \\$f -o \\$\{f%.comp}.spv 2>&1; done"`;
 

@@ -790,7 +790,7 @@ describe("controller memory helpers", () => {
         label: "Qwen3-8B [The capital of France is]",
         model: "Qwen3-8B",
         prompt: "The capital of France is",
-        outputText: "",
+        outputText: "run failed: timeout after 120000ms",
         kind: "crash" as const,
       },
       {
@@ -804,6 +804,7 @@ describe("controller memory helpers", () => {
     ]);
 
     expect(formatted).toContain("Qwen3-8B [The capital of France is]: crashed");
+    expect(formatted).toContain("timeout after 120000ms");
     expect(formatted).toContain('Gemma4-12B [What is 2+2?]: "What is 5-3?"');
   });
 
@@ -923,7 +924,7 @@ describe("config", () => {
     const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
     expect(src).toContain("coherenceMaxTokens: 96");
     expect(src).toContain("coherenceMaxTokensForModel");
-    expect(src).toContain("zincRemoteCommand(modelTarget, prompt, maxTokens, promptMode)");
+    expect(src).toContain("zincRemoteCommand(testCase.modelTarget, testCase.prompt, testCase.maxTokens, testCase.promptMode)");
   });
 
   test("Qwen coherence sweep uses chat prompts without changing benchmark mode", async () => {
@@ -931,6 +932,14 @@ describe("config", () => {
     expect(src).toContain('promptMode: "raw"');
     expect(src).toContain('coherencePromptMode: "chat"');
     expect(src).toContain("coherencePromptModeForModel");
+  });
+
+  test("coherence crashes are retried with diagnostic details", async () => {
+    const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
+    expect(src).toContain("runCoherenceCase");
+    expect(src).toContain("cleaning RDNA node and retrying crashed cases once");
+    expect(src).toContain("String(e).slice(-500)");
+    expect(src).toContain("240_000");
   });
 
   test("codex uses exec with sandbox bypass and json", async () => {
@@ -957,6 +966,14 @@ describe("config", () => {
     expect(src).toContain("ZINC_SKIP_REMOTE_CLEAN");
     expect(src).toContain("pkill -f '[z]ig-out/bin/zinc'");
     expect(src).toContain("pkill -f '[l]lama-server'");
+  });
+
+  test("remote rsync excludes local env and editor swap files", async () => {
+    const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
+    expect(src).toContain('"--exclude", ".env"');
+    expect(src).toContain('"--exclude", ".env.*"');
+    expect(src).toContain('"--exclude", "*.swp"');
+    expect(src).toContain("--exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo'");
   });
 
   test("claude invocations pin the 1M-context Opus model and max effort", async () => {
