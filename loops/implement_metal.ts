@@ -1294,6 +1294,14 @@ function buildCodexArgs(prompt: string, model?: string): string[] {
   return args;
 }
 
+async function resetCycleToPreHash(preHash: string): Promise<void> {
+  await runCommand("git", ["reset", "--hard", preHash]);
+  // `git reset --hard` leaves untracked files behind. Agents often add new
+  // shaders/benchmarks while exploring; if a cycle is reverted, those files
+  // must not leak into the next pre-cycle checkpoint and become "accepted".
+  await runCommand("git", ["clean", "-fd", "--", ...LOOP_COMMIT_PATHS]).catch(() => {});
+}
+
 async function runAgent(agent: AgentKind, prompt: string, model?: string): Promise<RunResult> {
   const label = agent === "codex" ? "Codex" : "Claude";
   console.log(clr("1;34", SEP));
@@ -2198,19 +2206,19 @@ async function main() {
     if (verify.buildExitCode !== 0 || verify.testExitCode !== 0) {
       // Build or test broken → revert
       console.log(clr("1;31", `  ↩ REVERTING — ${verify.buildExitCode !== 0 ? "build" : "tests"} broken`));
-      await runCommand("git", ["reset", "--hard", preHash]);
+      await resetCycleToPreHash(preHash);
       state.failedApproaches.push(`${description} — broke ${verify.buildExitCode !== 0 ? "build" : "tests"}`);
       state.stalledCycles++;
     } else if (verify.runExitCode !== 0 && verify.runExitCode !== null) {
       // Crash → revert
       console.log(clr("1;31", `  ↩ REVERTING — runtime crash`));
-      await runCommand("git", ["reset", "--hard", preHash]);
+      await resetCycleToPreHash(preHash);
       state.failedApproaches.push(`${description} — runtime crash`);
       state.stalledCycles++;
     } else if (!verify.containsReference && state.currentBest?.containsReference) {
       // Lost correctness → always revert
       console.log(clr("1;31", `  ↩ REVERTING — lost correctness (output: "${verify.outputText.slice(0, 60)}")`));
-      await runCommand("git", ["reset", "--hard", preHash]);
+      await resetCycleToPreHash(preHash);
       state.failedApproaches.push(`${description} — broke correctness`);
       state.stalledCycles++;
     } else if (verify.containsReference && verifyTps > bestTps + improveBand) {
@@ -2241,7 +2249,7 @@ async function main() {
     } else {
       // Regressed speed or no correctness
       console.log(clr("1;31", `  ↩ REVERTING — ${verifyTps.toFixed(2)} ${METRIC_LABEL} < current ${acceptedTps.toFixed(2)} (regressed ${(acceptedTps - verifyTps).toFixed(2)}; band -${noiseBand.toFixed(2)})`));
-      await runCommand("git", ["reset", "--hard", preHash]);
+      await resetCycleToPreHash(preHash);
       state.failedApproaches.push(`${description} — regressed from current ${acceptedTps.toFixed(1)} to ${verifyTps.toFixed(1)} ${METRIC_LABEL}`);
       state.stalledCycles++;
     }
