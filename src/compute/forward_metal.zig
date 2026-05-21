@@ -6998,33 +6998,32 @@ fn dispatchDmmvMoeQ5kOnCmd(
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
-    const use_k512_tri =
+    const qwen_q5k_down_k512 =
         K == 512 and
         M >= 1024 and
         engine.config.architecture == .qwen2_moe and
         engine.config.ssm_d_inner == 4096 and
         engine.config.n_experts_used == 8 and
-        std.mem.endsWith(u8, tensor.info.name, "ffn_down_exps.weight") and
-        engine.dmmv_q5k_moe_k512_tri_pipe.max_threads_per_threadgroup >= 512;
+        std.mem.endsWith(u8, tensor.info.name, "ffn_down_exps.weight");
+    // Mirrors llama.cpp's routed matvec row grouping: reuse one selected expert input
+    // vector across more adjacent output rows before falling back to narrower groups.
     const use_k512_quad =
-        !use_k512_tri and
-        K == 512 and
-        M >= 1024 and
-        engine.config.architecture == .qwen2_moe and
-        engine.config.ssm_d_inner == 4096 and
-        engine.config.n_experts_used == 8 and
-        std.mem.endsWith(u8, tensor.info.name, "ffn_down_exps.weight") and
+        qwen_q5k_down_k512 and
         (readBoolEnv("ZINC_METAL_QWEN_Q5K_DOWN_K512_QUAD") orelse true) and
         engine.dmmv_q5k_moe_k512_quad_pipe.max_threads_per_threadgroup >= 512;
+    const use_k512_tri =
+        !use_k512_quad and
+        qwen_q5k_down_k512 and
+        (readBoolEnv("ZINC_METAL_QWEN_Q5K_DOWN_K512_TRI") orelse true) and
+        engine.dmmv_q5k_moe_k512_tri_pipe.max_threads_per_threadgroup >= 512;
     const use_k512 =
         !use_k512_tri and
         !use_k512_quad and
-        K == 512 and
-        M >= 1024 and
-        std.mem.endsWith(u8, tensor.info.name, "ffn_down_exps.weight") and
+        qwen_q5k_down_k512 and
         engine.dmmv_q5k_moe_k512_pipe.max_threads_per_threadgroup >= 512;
     const k2048_or_less = K <= 2048;
     const use_k2048 =
+        !use_k512_tri and
         !use_k512_quad and
         !use_k512 and
         k2048_or_less and
