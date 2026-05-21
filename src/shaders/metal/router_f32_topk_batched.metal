@@ -13,6 +13,7 @@ struct RouterF32TopkBatchedPush {
     uint K;
     uint k;
     uint a_offset;
+    uint input_offset;
     uint input_stride;
     uint output_stride;
 };
@@ -47,7 +48,7 @@ kernel void main0(
         values[local_id] = -INFINITY;
     }
 
-    device const float* input = X + token_idx * p.input_stride;
+    device const float* input = X + (p.input_offset >> 2) + token_idx * p.input_stride;
     const uint k_vec4 = p.K >> 2;
     for (uint i = local_id; i < k_vec4; i += TG_SIZE) {
         x_cache4[i] = *(device const float4*)(input + (i << 2));
@@ -83,6 +84,55 @@ kernel void main0(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (p.n_experts == 256u && p.k == 8u) {
+        if (sg_idx == 0u) {
+            // Match router_q8_0_topk.metal's vLLM-shaped top-k finalization:
+            // one simdgroup scans the 256-router row instead of doing the
+            // selection serially on lane 0 after the F32 matvec.
+            float selected_score[8];
+            uint selected_mask = 0u;
+            #pragma unroll
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                selected_score[slot] = -INFINITY;
+            }
+
+            #pragma unroll
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                float lane_best = -INFINITY;
+                uint lane_best_idx = 0xffffffffu;
+                #pragma unroll
+                for (uint lane_row = 0u; lane_row < 8u; ++lane_row) {
+                    const uint expert = lane + (lane_row << 5);
+                    const float score = ((selected_mask & (1u << lane_row)) == 0u) ? values[expert] : -INFINITY;
+                    if (score > lane_best) {
+                        lane_best = score;
+                        lane_best_idx = expert;
+                    }
+                }
+                const float best_val = simd_max(lane_best);
+                const uint best_idx = simd_min((lane_best == best_val) ? lane_best_idx : 0xffffffffu);
+                selected_score[slot] = best_val;
+                if ((best_idx & 31u) == lane) {
+                    selected_mask |= 1u << (best_idx >> 5);
+                }
+                if (lane == 0u) {
+                    output_data[token_idx * p.output_stride + slot] = best_idx;
+                }
+            }
+
+            const bool weight_lane = lane < 8u;
+            const float score = weight_lane ? selected_score[lane] : -INFINITY;
+            const float max_sel = simd_max(score);
+            const float exp_score = weight_lane ? fast::exp(score - max_sel) : 0.0f;
+            const float sum = simd_sum(exp_score);
+            const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+            if (weight_lane) {
+                output_data[token_idx * p.output_stride + 8u + lane] = as_type<uint>(exp_score * inv_sum);
+            }
+        }
+        return;
+    }
 
     if (local_id == 0u) {
         const uint k = min(p.k, uint(MAX_K_USED));

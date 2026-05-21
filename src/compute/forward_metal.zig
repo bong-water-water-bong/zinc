@@ -1216,6 +1216,7 @@ const RouterF32TopkBatchedPush = extern struct {
     K: u32,
     k: u32,
     a_offset: u32,
+    input_offset: u32,
     input_stride: u32,
     output_stride: u32,
 };
@@ -8665,6 +8666,7 @@ fn dispatchRouterF32TopkBatchedOnCmd(
     k: u32,
     hidden_dim: u32,
     n_tokens: u32,
+    input_byte_offset: u32,
 ) void {
     recordDmmvProfile(engine, tensor, n_experts, hidden_dim);
     if (engine.profile_enabled) engine.request_profile.router_topk_calls += n_tokens;
@@ -8673,6 +8675,7 @@ fn dispatchRouterF32TopkBatchedOnCmd(
         .K = hidden_dim,
         .k = k,
         .a_offset = tensorPageOffset(engine.model, tensor),
+        .input_offset = input_byte_offset,
         .input_stride = hidden_dim,
         .output_stride = k * 2,
     };
@@ -9572,7 +9575,7 @@ fn recordQwenRoutePackedRouterOnCmd(
     n_tokens: u32,
 ) !void {
     if (canUseRouterF32TopkBatched(engine, router_t, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim, n_tokens)) {
-        dispatchRouterF32TopkBatchedOnCmd(engine, cmd, router_t, input, routing_output, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim, n_tokens);
+        dispatchRouterF32TopkBatchedOnCmd(engine, cmd, router_t, input, routing_output, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim, n_tokens, 0);
         return;
     }
     if (router_t.info.type_ == .q8_0 and engine.gemm_q8_0_pipe.handle != null) {
@@ -14821,6 +14824,7 @@ fn runDecodeStep(
     const head_v_dim: u32 = if (d_inner > 0) d_inner / @max(dt_rank, 1) else 0;
     const d_conv: u32 = cfg.ssm_d_conv;
     const use_dense_layer_cmd = canUseDenseSharedDecodeCommand(engine);
+    const allow_prefill_f32_router_fusion = external_shared_cmd != null or !emit_logits;
     // Dense Gemma follows llama.cpp's graph submission pattern: enqueue larger
     // ordered chunks asynchronously and wait once at the token boundary.
     // llama.cpp's `ggml-metal-context.m::ggml_metal_set_n_cb` warns "optimal
@@ -15107,6 +15111,12 @@ fn runDecodeStep(
                     !residual_router_output_ready and
                     use_standard_gpu_routed_moe and
                     canUseRouterQ8Topk(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                const use_fused_f32_router =
+                    allow_prefill_f32_router_fusion and
+                    !residual_router_output_ready and
+                    !use_fused_q8_router and
+                    use_standard_gpu_routed_moe and
+                    canUseRouterF32TopkBatched(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
                 const router_ref = routerWeightRef(engine, layer_idx, router_t);
                 if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
@@ -15115,13 +15125,18 @@ fn runDecodeStep(
                     // Fused residual+router dispatch already wrote router_output_buf.
                 } else if (use_fused_q8_router) {
                     dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_ref.buffer, router_ref.offset, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 0);
+                } else if (use_fused_f32_router) {
+                    // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
+                    // and vLLM top-k finalization: collapse Qwen's F32 router
+                    // matvec + top-k into one command for the token-major path.
+                    dispatchRouterF32TopkBatchedOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1, 0);
                 } else {
                     dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
                 }
                 {
                     var router_barrier_bufs: [2]*const MetalBuffer = undefined;
                     var router_barrier_count: usize = 1;
-                    router_barrier_bufs[0] = if (residual_router_output_ready or use_fused_gptoss_router or use_fused_q8_router)
+                    router_barrier_bufs[0] = if (residual_router_output_ready or use_fused_gptoss_router or use_fused_q8_router or use_fused_f32_router)
                         &engine.router_output_buf
                     else
                         &engine.router_logits_buf;
@@ -15149,7 +15164,7 @@ fn runDecodeStep(
                             qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count)
                         else
                             null;
-                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router, &engine.norm_buf, 0, next_attn_norm, moe_hidden_scale);
+                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router or use_fused_f32_router, &engine.norm_buf, 0, next_attn_norm, moe_hidden_scale);
                         if (wrote_next_norm) prev_fused_attn_norm = true;
                         if (fold_moe_layer_scale) layer_output_scale_fused_into_post_norm = true;
                     } else {
@@ -15614,6 +15629,12 @@ fn runDecodeStep(
                     !residual_router_output_ready and
                     use_standard_gpu_routed_moe and
                     canUseRouterQ8Topk(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                const use_fused_f32_router =
+                    allow_prefill_f32_router_fusion and
+                    !residual_router_output_ready and
+                    !use_fused_q8_router and
+                    use_standard_gpu_routed_moe and
+                    canUseRouterF32TopkBatched(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
                 const router_ref = routerWeightRef(engine, layer_idx, router_t);
                 if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
@@ -15622,13 +15643,18 @@ fn runDecodeStep(
                     // Fused residual+router dispatch already wrote router_output_buf.
                 } else if (use_fused_q8_router) {
                     dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_ref.buffer, router_ref.offset, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, router_in_byte_offset);
+                } else if (use_fused_f32_router) {
+                    // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
+                    // and vLLM top-k finalization: collapse Qwen's F32 router
+                    // matvec + top-k into one command for the token-major path.
+                    dispatchRouterF32TopkBatchedOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1, router_in_byte_offset);
                 } else {
                     dispatchDmmvOnCmdWithInputOffset(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0, router_in_byte_offset);
                 }
                 {
                     var router_barrier_bufs: [2]*const MetalBuffer = undefined;
                     var router_barrier_count: usize = 1;
-                    router_barrier_bufs[0] = if (residual_router_output_ready or use_fused_gptoss_router or use_fused_q8_router)
+                    router_barrier_bufs[0] = if (residual_router_output_ready or use_fused_gptoss_router or use_fused_q8_router or use_fused_f32_router)
                         &engine.router_output_buf
                     else
                         &engine.router_logits_buf;
@@ -15656,7 +15682,7 @@ fn runDecodeStep(
                             qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count)
                         else
                             null;
-                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router, ffn_norm_input_buf, ffn_norm_input_byte_offset, next_attn_norm, moe_hidden_scale);
+                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router or use_fused_f32_router, ffn_norm_input_buf, ffn_norm_input_byte_offset, next_attn_norm, moe_hidden_scale);
                         if (wrote_next_norm) prev_fused_attn_norm = true;
                         if (fold_moe_layer_scale) layer_output_scale_fused_into_post_norm = true;
                     } else {
@@ -23965,6 +23991,7 @@ test "router_f32_topk_batched shader routes each prompt token" {
         .K = @intCast(K),
         .k = @intCast(k),
         .a_offset = 0,
+        .input_offset = 0,
         .input_stride = @intCast(K),
         .output_stride = @intCast(k * 2),
     };
