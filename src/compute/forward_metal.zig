@@ -12136,9 +12136,9 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         if (profile) |p| p.ssm_conv_calls += 1;
 
         // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`: conv only
-        // consumes QKV, so record the independent Z/alpha/beta tail after the
-        // conv dispatch and join them at the delta-net dependency edge.
-        dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
+        // consumes QKV, and delta-net only needs QKV/alpha/beta. Keep the Z
+        // projection out of the delta dependency barrier so it can be recorded
+        // next to delta and join only at the gated-norm edge.
         try dispatchQwenSsmProjectionTailPairBatchedOnCmd(
             engine,
             &cmd,
@@ -12189,6 +12189,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
             cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
             if (profile) |p| p.ssm_delta_calls += 1;
         }
+        dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
         profileBarrierBuffers(&cmd, profile, .ssm, &.{
             &engine.qwen_ssm_prefill_branch_buf,
             &engine.qwen_ssm_prefill_proj_z_buf,
