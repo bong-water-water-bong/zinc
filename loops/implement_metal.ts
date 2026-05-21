@@ -55,7 +55,7 @@ const METRIC_LABEL = METRIC_MODE === "prefill" ? "prefill tok/s" : "decode tok/s
 const MAX_TOKENS = parsePositiveIntEnv("ZINC_MAX_TOKENS", 64); // Enough tokens for stable throughput measurement
 const REFERENCE_TEXT = "Paris"; // Expected in correct output
 const TARGET_TOK_PER_SEC = parsePositiveFloatEnv("ZINC_TARGET_TOK_PER_SEC", 50);
-const QWEN36_PREFILL_INTERMEDIATE_TARGET = 50;
+const QWEN36_PREFILL_INTERMEDIATE_TARGET = Math.max(50, TARGET_TOK_PER_SEC);
 const BENCHMARK_RUNS = parsePositiveIntEnv("ZINC_BENCHMARK_RUNS", 3); // Number of TIMED inference runs (median across them)
 // Pre-rolls discarded before any timed sample. Each fresh ZINC invocation
 // resets Metal residency + GPU clocks, so the FIRST few samples in a series
