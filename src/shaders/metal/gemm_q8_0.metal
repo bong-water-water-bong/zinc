@@ -46,6 +46,7 @@ kernel void main0(
 
     const short nr0 = min(args.ne0 - r0, NR0);
     const short nr1 = min(args.ne1 - r1, NR1);
+    const bool simd_cols_valid = (16 * (sgitg >> 1)) < nr1;
 
     const short lr0 = min((short)(tiitg / NL0), (short)(nr0 - 1));
     const short lr1 = min((short)(tiitg / NL1), (short)(nr1 - 1));
@@ -95,30 +96,32 @@ kernel void main0(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup const half * lsma = (sa + 4 * 64 * (sgitg % 2));
-        threadgroup const half * lsmb = (sb + 2 * 64 * (sgitg / 2));
+        if (simd_cols_valid) {
+            threadgroup const half * lsma = (sa + 4 * 64 * (sgitg % 2));
+            threadgroup const half * lsmb = (sb + 2 * 64 * (sgitg / 2));
 
-        FOR_UNROLL (short ik = 0; ik < NK / 8; ik++) {
-            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (short ik = 0; ik < NK / 8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
 
-            FOR_UNROLL (short i = 0; i < 4; i++) {
-                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+                FOR_UNROLL (short i = 0; i < 4; i++) {
+                    simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 8; i++) {
+                    simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+                }
+
+                lsma += 8 * 64;
+                lsmb += 4 * 64;
             }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 2; i++) {
-                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
-            }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 8; i++) {
-                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
-            }
-
-            lsma += 8 * 64;
-            lsmb += 4 * 64;
         }
     }
 
@@ -135,8 +138,10 @@ kernel void main0(
 
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
 
-        FOR_UNROLL (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
+        if (simd_cols_valid) {
+            FOR_UNROLL (short i = 0; i < 8; i++) {
+                simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
