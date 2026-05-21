@@ -2482,7 +2482,8 @@ fn canUseQwenSsmF32AlphaBetaDual(
         !engine.debug_validation_enabled and
         !engine.qwen_prefill_validation_enabled and
         engine.dmmv_f32_dual_small_pipe.handle != null and
-        engine.dmmv_f32_dual_small_pipe.max_threads_per_threadgroup >= 64;
+        engine.dmmv_f32_dual_small_pipe.thread_execution_width == 32 and
+        engine.dmmv_f32_dual_small_pipe.max_threads_per_threadgroup >= 1024;
 }
 
 fn dispatchQwenSsmF32AlphaBetaDualOnCmd(
@@ -2512,10 +2513,16 @@ fn dispatchQwenSsmF32AlphaBetaDualOnCmd(
         .y1_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &alpha_t.gpu_buffer, &beta_t.gpu_buffer, input_buf, alpha_output_buf, beta_output_buf };
+    const simd_width = if (engine.dmmv_f32_dual_small_pipe.thread_execution_width > 0)
+        engine.dmmv_f32_dual_small_pipe.thread_execution_width
+    else
+        @as(u32, 32);
+    const block_size: u32 = 1024;
+    const rows_per_wg: u32 = block_size / simd_width;
     cmd.dispatchV2(
         &engine.dmmv_f32_dual_small_pipe,
-        .{ (rows + 63) / 64, 2, n_tokens },
-        .{ 64, 1, 1 },
+        .{ (rows + rows_per_wg - 1) / rows_per_wg, 2, n_tokens },
+        .{ block_size, 1, 1 },
         &bufs,
         &push,
         @sizeOf(DualQ8DmmvPush),
@@ -21930,7 +21937,7 @@ test "dmmv_f32_dual_small shader matches batched alpha beta CPU references" {
     const bufs = [_]*const MetalBuffer{ &weight0_buf, &weight1_buf, &input_buf, &output0_buf, &output1_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ @intCast((M + 63) / 64), 2, @intCast(N) }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 31) / 32), 2, @intCast(N) }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
     cmd.commitAndWait();
 
     const out0: [*]const f32 = @ptrCast(@alignCast(output0_buf.cpu_ptr.?));
