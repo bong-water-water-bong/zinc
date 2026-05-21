@@ -6136,6 +6136,22 @@ fn canUseQwen36FullAttnQ8Pair(
         canUsePairedQ8Dmmv(engine, tensor0, tensor1, M0, M1, K);
 }
 
+fn canUseQwen36FinalTailKvFusedNorm(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+    attn: LayerAttentionParams,
+    hidden_dim: u32,
+) bool {
+    if ((readBoolEnv("ZINC_METAL_QWEN_FINAL_TAIL_KV_FUSED_NORM") orelse true) == false) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (!defaultQwen36SsmPrefillProjectionEnabled(engine.config)) return false;
+    if (attn.use_k_as_v or attn.kv_dim == 0 or hidden_dim == 0) return false;
+
+    const k_tensor = lt.attn_k orelse return false;
+    const v_tensor = lt.attn_v orelse return false;
+    return canUseFusedNormDualQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim);
+}
+
 fn canUseDenseQ4KGateUpDual(
     engine: *const InferenceEngine,
     gate: *const metal_loader.LoadedTensor,
@@ -10632,6 +10648,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
     lt: LayerTensors,
     attn: LayerAttentionParams,
     hidden_dim: u32,
+    fuse_attn_norm: bool,
 ) !void {
     const cfg = engine.config;
     const k_tensor = lt.attn_k orelse return error.MissingTensor;
@@ -10640,7 +10657,30 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
     const can_pair_attn_kv = !attn.use_k_as_v and
         ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) or
             canUseQwen36FullAttnQ8Pair(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim));
-    if (can_pair_attn_kv) {
+    if (fuse_attn_norm and canUseQwen36FinalTailKvFusedNorm(engine, lt, attn, hidden_dim)) {
+        // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl` adjacent-row Q8
+        // matvec discipline to the output-only prompt tail: compute the
+        // final-layer K/V projections directly from hidden with inline
+        // attn_norm, avoiding a standalone RMSNorm dispatch and barrier for
+        // non-terminal prompt tokens.
+        dispatchFusedNormDualQ8DmmvOnCmd(
+            engine,
+            cmd,
+            k_tensor,
+            v_tensor,
+            &k_tensor.gpu_buffer,
+            &v_tensor.gpu_buffer,
+            tensorPageOffset(engine.model, k_tensor),
+            tensorPageOffset(engine.model, v_tensor),
+            &engine.hidden_buf,
+            &engine.attn_norm_bufs[layer_idx],
+            &engine.k_buf,
+            &engine.v_buf,
+            attn.kv_dim,
+            attn.kv_dim,
+            hidden_dim,
+        );
+    } else if (can_pair_attn_kv) {
         dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
     } else {
         dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
@@ -14714,28 +14754,32 @@ fn runDecodeStep(
             const layer_record_start = profileStart(profile != null);
             var qwen_moe_validation_ref: ?QwenPrefillMoeValidationRef = null;
             defer if (qwen_moe_validation_ref) |*validation| validation.deinit(engine.allocator);
+            const skip_final_prompt_tail = using_external_shared_cmd and
+                !emit_logits and
+                layer_idx + 1 == layer_count and
+                cfg.architecture == .qwen2_moe and
+                cfg.ssm_d_inner != 0;
+            const fuse_final_tail_attn_norm =
+                skip_final_prompt_tail and
+                !prev_fused_attn_norm and
+                canUseQwen36FinalTailKvFusedNorm(engine, lt, attn, hidden_dim);
             if (prev_fused_attn_norm) {
                 // Previous layer's residual_rms_norm already wrote norm_buf using
                 // attn_norm_bufs[layer_idx]; its trailing barrier (or the implicit
                 // cross-command-buffer ordering at chunk boundaries) makes it
                 // visible before the QKV dispatches read norm_buf.
                 prev_fused_attn_norm = false;
-            } else {
+            } else if (!fuse_final_tail_attn_norm) {
                 dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
                 profileBarrier(cmd, profile, .full_attn); // norm_buf visible before attn prep reads it
             }
-            const skip_final_prompt_tail = using_external_shared_cmd and
-                !emit_logits and
-                layer_idx + 1 == layer_count and
-                cfg.architecture == .qwen2_moe and
-                cfg.ssm_d_inner != 0;
             if (skip_final_prompt_tail) {
                 // Non-terminal prompt tokens only need the final layer's K/V
                 // state for future tokens. Adapt llama.cpp's Metal graph
                 // materialization discipline (`ggml_metal_graph_compute`
                 // encodes only requested graph outputs): skip Q/gate and
                 // flash/output/MoE materialization for this prompt token.
-                try dispatchFullAttnKvCacheOnlyOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim);
+                try dispatchFullAttnKvCacheOnlyOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim, fuse_final_tail_attn_norm);
                 // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`:
                 // this tail write has no immediate in-encoder consumer. The
                 // later layer-local flash-attention read is ordered by the next
