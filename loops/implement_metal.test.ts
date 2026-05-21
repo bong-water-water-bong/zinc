@@ -3,6 +3,7 @@ import {
   bestKeptCorrectTokPerSec,
   buildPrompt,
   buildQwen36PrefillPlateauAnalysis,
+  buildQwen36PrefillPostBreakthroughAnalysis,
   buildReflectionSummary,
   buildSelfReview,
   currentAcceptedTokPerSec,
@@ -771,6 +772,38 @@ describe("buildPrompt", () => {
     expect(analysis).toContain("Required pivot");
   });
 
+  test("Qwen post-breakthrough focus pivots from router to profile-dominant SSM", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      bestTokPerSec: 69.9,
+      currentBest: { tokPerSec: 69.9, containsReference: true },
+      lastProfileCycle: 231,
+      lastProfileOutput: [
+        "info(forward):   barriers/step: embed 1.0 attn 75.1 ssm 116.1 router 77.1 gpu-moe 118.7 fallback-moe 0.0 dense 0.0 final 0.0",
+        "info(forward):   path bytes: ssm 132.98 GiB attn 33.38 GiB dense 0.00 GiB moe-expert 75.84 GiB shared 16.52 GiB lm-head 1.51 GiB router 10.37 GiB",
+        "info(forward):   prefill buckets: ssm proj 98.69 GiB recurrent conv/delta/gated 3887/3887/3887 out 32.27 GiB | router 10.21 GiB topk 5227 cpu 0.00 ms",
+      ].join("\n"),
+      cycles: [
+        makeCycle({
+          cycle: 231,
+          kept: true,
+          containsReference: true,
+          tokPerSec: 69.9,
+          description: "Routed Qwen3.6 prompt F32 routers through fused router_f32_topk_batched with input-offset support.",
+        }),
+      ],
+    });
+
+    const analysis = buildQwen36PrefillPostBreakthroughAnalysis(state).join("\n");
+    expect(analysis).toContain("Post-60 Prefill Jump Focus");
+    expect(analysis).toContain("cycle 231");
+    expect(analysis).toContain("ssm=132.98 GiB");
+    expect(analysis).toContain("After the fused F32 router/top-k win, SSM is larger than router");
+    expect(analysis).toContain("gpu-moe=118.70/step");
+  });
+
   test("Qwen plateau mode rejects neutral optimization churn but allows analysis", () => {
     const state = makeState({
       effortId: 16,
@@ -876,7 +909,7 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("shader: 3/5 kept");
   });
 
-  test("Effort 16 prompt includes 50 tok/s Qwen prefill focus and fast-wrong traps", () => {
+  test("Effort 16 prompt includes Qwen prefill target focus and fast-wrong traps", () => {
     const state = makeState({
       effortId: 16,
       effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
@@ -923,7 +956,7 @@ describe("buildPrompt", () => {
       outputText: "Paris",
     });
     const prompt = buildPrompt(state, result);
-    expect(prompt).toContain("Qwen3.6 35B Prefill 50 tok/s Focus");
+    expect(prompt).toContain("Qwen3.6 35B Prefill Target Focus");
     expect(prompt).toContain("50.0 prefill tok/s");
     expect(prompt).toContain("token-major Qwen F32 shared-gate");
     expect(prompt).toContain("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1");

@@ -304,6 +304,39 @@ function cycleSummary(cycle: CycleResult): string {
   return `cycle ${cycle.cycle}: ${promptTrunc(cycle.description, 118)}${rate}`;
 }
 
+type ProfileEntry = { name: string; value: number };
+
+function profileSection(line: string, marker: string): string | null {
+  const idx = line.toLowerCase().indexOf(marker.toLowerCase());
+  if (idx < 0) return null;
+  return line.slice(idx + marker.length);
+}
+
+function parseGibEntries(section: string): ProfileEntry[] {
+  const entries: ProfileEntry[] = [];
+  const re = /\b([A-Za-z][A-Za-z0-9_-]*)\s+([0-9]+(?:\.[0-9]+)?)\s+GiB\b/g;
+  for (const match of section.matchAll(re)) {
+    entries.push({ name: match[1], value: Number.parseFloat(match[2]) });
+  }
+  return entries.sort((a, b) => b.value - a.value);
+}
+
+function parseNumericEntries(section: string): ProfileEntry[] {
+  const entries: ProfileEntry[] = [];
+  const re = /\b([A-Za-z][A-Za-z0-9_-]*)\s+([0-9]+(?:\.[0-9]+)?)\b/g;
+  for (const match of section.matchAll(re)) {
+    entries.push({ name: match[1], value: Number.parseFloat(match[2]) });
+  }
+  return entries.sort((a, b) => b.value - a.value);
+}
+
+function formatProfileEntries(entries: ProfileEntry[], unit: string, max = 5): string {
+  return entries
+    .slice(0, max)
+    .map(e => `${e.name}=${e.value.toFixed(2)}${unit}`)
+    .join(", ");
+}
+
 function cycleTags(cycle: Pick<CycleResult, "description" | "selfAnalysis" | "nextIdeas">): string[] {
   const text = [
     cycle.description,
@@ -419,6 +452,76 @@ export function buildQwen36PrefillPlateauAnalysis(state: RunState): string[] {
   return lines;
 }
 
+export function buildQwen36PrefillPostBreakthroughAnalysis(state: RunState): string[] {
+  if (!isQwen36PrefillRun(state)) return [];
+
+  const best = bestKeptCorrectTokPerSec(state);
+  if (best < 60) return [];
+
+  const breakthrough = highestMatchingCycle(
+    state.cycles,
+    (c) => c.kept && c.containsReference && (c.tokPerSec ?? 0) >= 60 &&
+      /router_f32_topk_batched|f32 router|top-?k|topk/i.test(c.description),
+  ) ?? highestMatchingCycle(
+    state.cycles,
+    (c) => c.kept && c.containsReference && (c.tokPerSec ?? 0) >= 60,
+  );
+
+  const profile = state.lastProfileOutput ?? "";
+  const pathLine = profile.split("\n").find(line => /path bytes:/i.test(line));
+  const pathEntries = pathLine
+    ? parseGibEntries(profileSection(pathLine, "path bytes:") ?? pathLine)
+    : [];
+  const barrierLine = profile.split("\n").find(line => /barriers\/step:/i.test(line));
+  const barrierEntries = barrierLine
+    ? parseNumericEntries(profileSection(barrierLine, "barriers/step:") ?? barrierLine)
+    : [];
+  const ssmBucketLine = profile.split("\n").find(line => /prefill buckets: ssm/i.test(line));
+
+  const recent = state.cycles.slice(-12);
+  const q8Retunes = recent.filter(c =>
+    /q8|repack|fixed.?k|k=2048|k=4096|tg128|threadgroup/i.test(`${c.description}\n${c.selfAnalysis}`)
+  );
+
+  const lines = [
+    "## Qwen3.6 35B Post-60 Prefill Jump Focus",
+  ];
+
+  if (breakthrough) {
+    lines.push(`- Banked breakthrough: ${cycleSummary(breakthrough)}. Treat this as the new floor; do not optimize from pre-cycle-231 assumptions.`);
+  } else {
+    lines.push(`- Banked breakthrough: accepted best is ${best.toFixed(1)} prefill tok/s. Treat this as the new floor; do not optimize from pre-60 assumptions.`);
+  }
+
+  if (pathEntries.length > 0) {
+    const top = pathEntries[0];
+    lines.push(`- Latest profile dominant path bytes: ${formatProfileEntries(pathEntries, " GiB")}. The next change should target \`${top.name}\` unless a fresh profile proves another bucket moved above it.`);
+    if (top.name === "ssm") {
+      lines.push("- After the fused F32 router/top-k win, SSM is larger than router. Do not make router/top-k the default next target unless the profile moves it back on top.");
+    }
+  } else {
+    lines.push("- No accepted post-breakthrough profile is available. First action in the next run should be a profile-backed analysis or microbench, not a speculative kernel rewrite.");
+  }
+
+  if (barrierEntries.length > 0) {
+    lines.push(`- Latest barrier pressure: ${formatProfileEntries(barrierEntries, "/step")}. Pick one barrier-heavy bucket and remove real command/barrier work; do not add passive counters.`);
+  }
+  if (ssmBucketLine) {
+    lines.push(`- SSM detail from latest profile: ${ssmBucketLine.trim()}. Use this to split projection work from recurrent conv/delta/gated work before editing.`);
+  }
+  if (q8Retunes.length >= 4) {
+    lines.push(`- Cooldown remains active for narrow Q8/repacked/fixed-K/TG128 retunes (${q8Retunes.length}/${recent.length} recent cycles). A small retune needs exact-shape evidence and same-cycle A/B medians.`);
+  }
+
+  lines.push(
+    "- Good next swings: SSM projection/branch reuse that preserves short-prompt coherence, SSM recurrent dispatch/barrier reduction, MoE expert launch/buffer fusion, or a prefill-only exact-shape microbench tied to the current top bucket.",
+    "- If touching `router_f32_topk_batched`, keep it prefill-only and cite OFF/ON medians; router work should be a narrow follow-up to cycle 231, not another broad route-pack validator pass.",
+    "",
+  );
+
+  return lines;
+}
+
 function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): string[] {
   if (!isQwen36PrefillRun(state)) return [];
 
@@ -451,7 +554,7 @@ function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): s
     /profile|validator|diff|density|visibility|counter/i.test(lastKept.description);
 
   const lines: string[] = [
-    "## Qwen3.6 35B Prefill 50 tok/s Focus",
+    "## Qwen3.6 35B Prefill Target Focus",
   ];
 
   if (best != null) {
@@ -506,12 +609,13 @@ function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): s
     lines.push(`- The last kept cycle added measurement or validation visibility (${cycleSummary(lastKept)}). The next cycle should consume that evidence to promote, fix, or abandon a default-off path.`);
   }
 
+  lines.push(...buildQwen36PrefillPostBreakthroughAnalysis(state));
   lines.push(...buildQwen36PrefillPlateauAnalysis(state));
 
   lines.push(
     "- Validation gate for risky paths: `ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1`, F32 shared-gate route-pack, active-block route-pack, and dual-Q8 SSM variants must stay default-off until a full active-prompt validation run keeps `Paris` and beats the accepted median.",
     "- Codex subprocesses in this harness must not run local Metal model commands such as `./zig-out/bin/zinc --model-id qwen36-35b-a3b-q4k-xl` or `ZINC_QWEN36_* ./zig-out/bin/zinc`; they fail with `Metal device not available`. Use `zig build`/`zig build test`; the outer harness owns all Metal measurement and validation runs.",
-    "- Next high-leverage moves for 50+: extend the accepted token-major F32 shared-gate combine safely, reduce remaining SSM projection/conv/delta launch overhead, and A/B early prompt commit chunk sizes with the same 5-sample prefill contract.",
+    "- Next high-leverage moves after 69.9: profile-first SSM projection/recurrent/barrier work, MoE expert launch/buffer fusion, and exact-shape router follow-ups only when the profile still names router/top-k as the blocker.",
     "- If adding a validator or microbench, make it report the exact layer, prompt-token count, max abs diff, and flag-on command so the next cycle can decide whether to promote or abandon it.",
     "",
   );

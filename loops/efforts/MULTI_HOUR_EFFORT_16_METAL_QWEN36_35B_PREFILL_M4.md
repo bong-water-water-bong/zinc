@@ -41,7 +41,7 @@ ZINC_METRIC_MODE=prefill \
 ZINC_PROMPT_MODE=chat \
 ZINC_TEST_PROMPT="$PROMPT" \
 ZINC_MAX_TOKENS=16 \
-ZINC_TARGET_TOK_PER_SEC=120 \
+ZINC_TARGET_TOK_PER_SEC=90 \
 ZINC_BENCHMARK_RUNS=5 \
 ZINC_BENCHMARK_WARMUPS=1 \
 ZINC_PROFILE_EVERY=1 \
@@ -70,48 +70,30 @@ bun loops/implement_metal.ts --effort 16 --dry-run
 
 ## Current standing
 
-Updated after cycle 132 of the follow-up run:
+Updated after cycle 231 of the follow-up run:
 
-- Current accepted tree is measuring `45.8 prefill tok/s` on the Effort 16
-  chat prompt. Treat `45.8 prefill tok/s` as the comparison baseline for the
+- Current accepted tree is measuring `69.9 prefill tok/s` on the Effort 16
+  chat prompt. Treat `69.9 prefill tok/s` as the comparison baseline for the
   next cycle unless the harness reports a colder fresh baseline.
 - The original measured baseline was about `34.1 prefill tok/s`, so the loop
-  banked roughly +34% accepted throughput.
-- The largest accepted jump was cycle 89: token-major Qwen F32 shared-gate MoE
-  combine, adapted from vLLM top-k weighted reduce and llama.cpp `mul_mat_id`
-  discipline. That moved the accepted best from about `36.4` to `43.4`.
-- Cycle 100 added the current best `43.8 prefill tok/s` via a 16-token early
-  prompt graph commit. Cycles 108-120 moved the accepted tree to `44.8`
-  with final-layer prompt tail skipping, layer-0 SSM branch precompute, and
-  smaller barrier/materialization cleanups.
-- Cycle 125 added route-pack active-block-density profile counters and measured
-  `45.1 prefill tok/s` with correct `Paris` output. The important profile line:
-  `active_block_upper=358` versus `dense_dispatch_blocks=8704`,
-  `upper/dense=4.1%`. This says expert-major route packing still has large
-  launch-reduction potential if the F32 shared-gate correctness blocker is
-  fixed.
-- Cycle 126 added the current accepted best, `45.8 prefill tok/s`, by making
-  the route-pack validator compare materialized scalar-gate combine vs fused
-  scatter. This was kept because it did not affect correctness and measured
-  above the current baseline.
-- Cycles 127-132 repeatedly tried route-pack/shared-gate promotion or
-  validation-adjacent changes plus a few layer-0/Q8 variants; every one
-  reverted. Put route-pack/shared-gate work on cooldown for the next several
-  cycles. Do not edit route-pack/shared-gate validators, guards, or kernels
-  again until the outer harness has a real Metal validator log that identifies
-  a specific tensor/layer fix.
-- Do not spend more cycles on small variants of early prompt split,
-  terminal-only barriers, layer-0 materialization, or additional passive
-  route-pack counters unless a fresh profile proves the named bucket moved.
-- Repeated fast-looking route-packed/F32 shared-gate promotions produced
-  bang-only output (`!!!!!!!!!!!!!!!!`) despite measuring around `36.8-44.5`.
-  Do not count these as progress and do not enable them by default without
-  full active-prompt validation and a `Paris` output.
-- Dual-Q8 SSM projection grouping also produced bang-only output around
-  `43.5`; keep that family behind validators until the tensor diff is known.
-- The token-major F32 shared-gate reducer rewrite was tried twice and measured
-  slower (`44.1` in cycle 117 after the repaired neutral-keep guard). Do not
-  retry one-threadgroup-per-token shared-gate reduction without new evidence.
+  has banked about `2.05x` accepted throughput on the same prompt.
+- Cycle 231 is the new reference point. It routed Qwen3.6 prompt F32 routers
+  through fused `router_f32_topk_batched` with input-offset support, leaving
+  decode on the older path. The official verifier reported five samples:
+  `69.90, 69.90, 69.90, 70.00, 69.90 prefill tok/s` and output `Paris.`
+- The cycle-231 jump was `+18.3 prefill tok/s` over the prior best
+  (`51.6 -> 69.9`). Do not optimize from pre-cycle-231 router assumptions.
+- Cycles 199-230 plateaued around `51.0-51.6 prefill tok/s`. Most narrow
+  Q8/repacked/fixed-K/TG128 retunes measured neutral or were reverted. Do not
+  continue that family without exact-shape evidence and a same-cycle A/B.
+- Earlier wins remain useful history: cycle 89 token-major F32 shared-gate MoE
+  combine moved the tree from roughly `36.4` to `43.4`; cycle 100 early prompt
+  graph commit and follow-up SSM/terminal cleanup moved the tree into the
+  mid-40s; cycle 199 reduced SSM delta barriers and moved the tree to `51.6`.
+- The short raw prompt `The capital of France is` regressed to repeated `is`
+  when the Qwen SSM prefill projection chunk ran on very short prompts. The
+  production gate now requires at least 32 prompt tokens for that path. Preserve
+  that short-prompt coherence guard.
 - Codex subprocesses in this harness cannot run local Metal model commands;
   they fail with `Metal device not available`. Do not run
   `./zig-out/bin/zinc --model-id qwen36-35b-a3b-q4k-xl` or
@@ -121,26 +103,48 @@ Updated after cycle 132 of the follow-up run:
   `ggml-metal-context.m`, `ggml-metal-ops.cpp`, and `ggml-metal.metal` directly
   when the stalled prompt requests reference study.
 
-Best next directions for 50+ after the cooldown:
+Cycle-231 accepted profile snapshot:
 
-1. Attack remaining SSM projection/conv/delta launch overhead with exact-shape
-   CPU-visible validators or non-Metal microbench plumbing before default-on
-   changes.
-2. Use profile buckets from the outer harness to remove command-buffer,
-   encoder, barrier, or redundant-copy work that does not alter route-pack or
-   F32 shared-gate semantics.
-3. Use the route-pack validators and the existing `shared_gate_f32_batched`
-   scalar diff to find the exact tensor/layer where F32
-   shared-gate route packing diverges. A promotion needs layer, prompt-token
-   count, max abs diff, flag-on command, and a `Paris` run. Do this only after
-   the cooldown or after the outer harness provides a real validator log.
-4. Explore layer-major work beyond layer 0 only when the dependency is explicit:
+```text
+Prefill: 134 tokens in 1918.2 ms (69.9 tok/s)
+Metal profile (request): steps=136 prompt=134 completion=2 shared_steps=136 cmds=5 commits=3
+dispatch/step: total 582.2 barriers 388.0
+barriers/step: embed 1.0 attn 75.1 ssm 116.1 router 77.1 gpu-moe 118.7 fallback-moe 0.0 dense 0.0 final 0.0
+dmmv bytes: q8_0 182.46 GiB (67.4%) q4_k 45.45 GiB (16.8%) q5_1 0.00 GiB (0.0%) q5_k 27.76 GiB (10.3%) q6_k 2.63 GiB (1.0%)
+path bytes: ssm 132.98 GiB attn 33.38 GiB dense 0.00 GiB moe-expert 75.84 GiB shared 16.52 GiB lm-head 1.51 GiB router 10.37 GiB
+prefill buckets: ssm proj 98.69 GiB recurrent conv/delta/gated 3887/3887/3887 out 32.27 GiB | router 10.21 GiB topk 5227 cpu 0.00 ms
+prefill buckets: moe gate/up 46.20 GiB down 28.49 GiB | shared gate/up 10.85 GiB down 5.42 GiB | waits 1 commits 1847.98 ms
+q8 hot #1: ssm M=8192 K=2048 bytes=65.53 GiB calls=3947
+q8 hot #2: ssm M=4096 K=2048 bytes=32.76 GiB calls=3947
+q8 hot #3: ssm M=2048 K=4096 bytes=32.76 GiB calls=3947
+q8 hot #4: attn M=8192 K=2048 bytes=20.37 GiB calls=1227
+```
+
+Best next directions for 90+:
+
+1. Profile first. After cycle 231, `ssm` is the largest path-byte bucket
+   (`132.98 GiB`) and `gpu-moe`/`ssm` are the largest barrier buckets. Do not
+   make router/top-k the default next target unless a fresh profile moves it
+   back on top.
+2. Attack SSM projection/branch reuse that preserves the 32-token short-prompt
+   guard and exact token-order recurrence. The profile says SSM projection is
+   `98.69 GiB` and SSM out is `32.27 GiB`; split those before editing.
+3. Attack MoE expert launch/buffer fusion, not broad route-pack validation.
+   The expert path is still `75.84 GiB`, while router is now only `10.37 GiB`.
+4. Remove real command/encoder/barrier work in the hot buckets. The current
+   profile has `388.0` barriers/step, led by `gpu-moe 118.7`, `ssm 116.1`,
+   and `router 77.1`.
+5. If continuing cycle 231 directly, limit it to prefill-only
+   `router_f32_topk_batched` threadgroup/input-offset variants with OFF/ON
+   medians in the same cycle. Do not turn this into another route-pack or
+   shared-gate validator pass.
+6. Explore layer-major work beyond layer 0 only when the dependency is explicit:
    hidden for layer N depends on all prior layer MoE outputs. A safe candidate
    must prove the candidate input equals the token-major input before replacing
    production work.
-5. Add profiling or validation that explains the remaining `ssm 132.98 GiB`,
-   `moe-expert 75.84 GiB`, and `barriers/step 504.4` buckets. A neutral keep is
-   only useful if it directly unlocks a default-on structural change.
+7. After another default-on prefill jump, re-run the installed-model coherence
+   sweep for Qwen 8B, Qwen 35B, Qwen 27B, Gemma 12B/31B, and GPT-OSS 20B.
+   The loop's Paris gate is necessary but not sufficient for all-model safety.
 
 Known facts before the first Effort 16 baseline:
 
