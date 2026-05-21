@@ -624,6 +624,13 @@ const Q8ShapeStat = struct {
     calls: u32 = 0,
 };
 
+const Q8RepackedKernel = enum(u8) {
+    tg128,
+    exact_qwen,
+    quad,
+    generic,
+};
+
 const BarrierClass = enum(u8) {
     embed,
     full_attn,
@@ -705,6 +712,14 @@ pub const RuntimeProfile = struct {
     ssm_delta_calls: u32 = 0,
     ssm_gated_norm_calls: u32 = 0,
     q8_shape_stats: [16]Q8ShapeStat = [_]Q8ShapeStat{.{}} ** 16,
+    q8_repacked_tg128_bytes: u64 = 0,
+    q8_repacked_exact_qwen_bytes: u64 = 0,
+    q8_repacked_quad_bytes: u64 = 0,
+    q8_repacked_generic_bytes: u64 = 0,
+    q8_repacked_tg128_calls: u32 = 0,
+    q8_repacked_exact_qwen_calls: u32 = 0,
+    q8_repacked_quad_calls: u32 = 0,
+    q8_repacked_generic_calls: u32 = 0,
 
     fn reset(self: *RuntimeProfile) void {
         self.* = .{};
@@ -5249,6 +5264,23 @@ pub const InferenceEngine = struct {
                 });
             }
             if (profile.dmmv_q8_0_bytes > 0) {
+                const q8_repacked_calls =
+                    profile.q8_repacked_tg128_calls +
+                    profile.q8_repacked_exact_qwen_calls +
+                    profile.q8_repacked_quad_calls +
+                    profile.q8_repacked_generic_calls;
+                if (q8_repacked_calls > 0) {
+                    log.info("  q8 repacked kernels: tg128 {d:.2} GiB/{d} exact-qwen {d:.2} GiB/{d} quad {d:.2} GiB/{d} generic {d:.2} GiB/{d}", .{
+                        bytesToGiB(profile.q8_repacked_tg128_bytes),
+                        profile.q8_repacked_tg128_calls,
+                        bytesToGiB(profile.q8_repacked_exact_qwen_bytes),
+                        profile.q8_repacked_exact_qwen_calls,
+                        bytesToGiB(profile.q8_repacked_quad_bytes),
+                        profile.q8_repacked_quad_calls,
+                        bytesToGiB(profile.q8_repacked_generic_bytes),
+                        profile.q8_repacked_generic_calls,
+                    });
+                }
                 var top_idxs: [4]?usize = .{ null, null, null, null };
                 for (profile.q8_shape_stats, 0..) |slot, idx| {
                     if (slot.calls == 0) continue;
@@ -5796,6 +5828,37 @@ fn recordQ8ShapeProfile(
             };
             return;
         }
+    }
+}
+
+fn recordQ8RepackedKernelProfile(
+    engine: *InferenceEngine,
+    tensor: *const metal_loader.LoadedTensor,
+    rows: u32,
+    cols: u32,
+    kernel: Q8RepackedKernel,
+) void {
+    if (!engine.profile_enabled or tensor.info.type_ != .q8_0) return;
+
+    const bytes = dmmvWeightBytes(.q8_0, rows, cols);
+    var profile = &engine.request_profile;
+    switch (kernel) {
+        .tg128 => {
+            profile.q8_repacked_tg128_bytes += bytes;
+            profile.q8_repacked_tg128_calls += 1;
+        },
+        .exact_qwen => {
+            profile.q8_repacked_exact_qwen_bytes += bytes;
+            profile.q8_repacked_exact_qwen_calls += 1;
+        },
+        .quad => {
+            profile.q8_repacked_quad_bytes += bytes;
+            profile.q8_repacked_quad_calls += 1;
+        },
+        .generic => {
+            profile.q8_repacked_generic_bytes += bytes;
+            profile.q8_repacked_generic_calls += 1;
+        },
     }
 }
 
@@ -6710,6 +6773,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
                 engine.dmmv_q8_0_repacked_k2048_pipe.thread_execution_width == 32 and
                 engine.dmmv_q8_0_repacked_k2048_pipe.max_threads_per_threadgroup >= block_size)
             {
+                recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
                 cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
                 return;
             }
@@ -6717,9 +6781,11 @@ fn dispatchDmmvOnCmdWithWeightBuf(
                 engine.dmmv_q8_0_repacked_k4096_pipe.thread_execution_width == 32 and
                 engine.dmmv_q8_0_repacked_k4096_pipe.max_threads_per_threadgroup >= block_size)
             {
+                recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
                 cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k4096_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
                 return;
             }
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
             cmd.dispatchV2(&engine.dmmv_q8_0_repacked_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
             return;
         }
@@ -6736,6 +6802,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             const block_size: u32 = 512;
             const rows_per_wg: u32 = (block_size / 32) * 4;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .exact_qwen);
             cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
             return;
         }
@@ -6750,6 +6817,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             const block_size: u32 = 512;
             const rows_per_wg: u32 = (block_size / 32) * 4;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .quad);
             cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_quad_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
             return;
         }
@@ -6764,6 +6832,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             const block_size: u32 = 512;
             const rows_per_wg: u32 = (block_size / 32) * 4;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .exact_qwen);
             cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k4096_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
             return;
         }
@@ -6777,6 +6846,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             const block_size: u32 = 512;
             const rows_per_wg: u32 = (block_size / 32) * 4;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .quad);
             cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k4096_quad_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
             return;
         }
@@ -6787,6 +6857,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             const block_size: u32 = 512;
             const rows_per_wg: u32 = (block_size / 32) * 4;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .quad);
             cmd.dispatchV2(&engine.dmmv_q8_0_repacked_quad_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
             return;
         }
@@ -6797,6 +6868,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
         const block_size: u32 = @min(512, engine.dmmv_q8_0_repacked_pipe.max_threads_per_threadgroup);
         const rows_per_wg: u32 = block_size / simd_w * 2; // nr=2
         const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+        recordQ8RepackedKernelProfile(engine, tensor, M, K, .generic);
         cmd.dispatchV2(&engine.dmmv_q8_0_repacked_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
         return;
     }
