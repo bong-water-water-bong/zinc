@@ -2500,6 +2500,8 @@ pub const InferenceEngine = struct {
     dmmv_q8_0_repacked_quad_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k2048_quad_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k4096_quad_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k2048_qwen_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k4096_qwen_pipe: MetalPipeline,
     dmmv_f16_pipe: MetalPipeline,
     dmmv_f32_pipe: MetalPipeline,
     dmmv_q4k_moe_pipe: MetalPipeline,
@@ -3037,6 +3039,8 @@ pub const InferenceEngine = struct {
         self.dmmv_q8_0_repacked_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_quad");
         self.dmmv_q8_0_repacked_k2048_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_quad");
         self.dmmv_q8_0_repacked_k4096_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_quad");
+        self.dmmv_q8_0_repacked_k2048_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_qwen");
+        self.dmmv_q8_0_repacked_k4096_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_qwen");
         self.dmmv_f16_pipe = try loadShaderPipeline(ctx, "dmmv_f16");
         self.dmmv_f32_pipe = try loadShaderPipeline(ctx, "dmmv_f32");
         self.dmmv_q4k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe");
@@ -3877,6 +3881,8 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_quad_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_qwen_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_qwen_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f16_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f32_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_pipe);
@@ -6648,6 +6654,22 @@ fn dispatchDmmvOnCmdWithWeightBuf(
         }
         if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
             K == 2048 and
+            M % 4 == 0 and
+            engine.dmmv_q8_0_repacked_k2048_qwen_pipe.thread_execution_width == 32 and
+            engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 512)
+        {
+            // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s fixed row-group
+            // discipline to Qwen3.6's exact SSM/full-attn Q8 shapes: all
+            // production rows are multiples of four, so avoid the generic
+            // tail predicates in the hottest repacked K=2048 path.
+            const block_size: u32 = 512;
+            const rows_per_wg: u32 = (block_size / 32) * 4;
+            const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            return;
+        }
+        if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
+            K == 2048 and
             engine.dmmv_q8_0_repacked_k2048_quad_pipe.thread_execution_width == 32 and
             engine.dmmv_q8_0_repacked_k2048_quad_pipe.max_threads_per_threadgroup >= 512)
         {
@@ -6658,6 +6680,20 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             const rows_per_wg: u32 = (block_size / 32) * 4;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
             cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_quad_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            return;
+        }
+        if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
+            K == 4096 and
+            M % 4 == 0 and
+            engine.dmmv_q8_0_repacked_k4096_qwen_pipe.thread_execution_width == 32 and
+            engine.dmmv_q8_0_repacked_k4096_qwen_pipe.max_threads_per_threadgroup >= 512)
+        {
+            // Same exact-row specialization for Qwen3.6 SSM out and
+            // full-attention output projections with K=4096.
+            const block_size: u32 = 512;
+            const rows_per_wg: u32 = (block_size / 32) * 4;
+            const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k4096_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
             return;
         }
         if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
@@ -21916,6 +21952,10 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_quad_pipe);
     var dmmv_q8_0_repacked_k4096_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_quad");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k4096_quad_pipe);
+    var dmmv_q8_0_repacked_k2048_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_qwen");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_qwen_pipe);
+    var dmmv_q8_0_repacked_k4096_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_qwen");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k4096_qwen_pipe);
     var dmmv_q8_0_pair_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_pair_swiglu_pipe);
     var dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
@@ -22040,6 +22080,8 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q8_0_repacked_k4096_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k2048_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_repacked_k4096_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k2048_qwen_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k4096_qwen_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_pair_swiglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
