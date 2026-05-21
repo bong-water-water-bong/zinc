@@ -1366,6 +1366,15 @@ pub const InferenceEngine = struct {
     partial_decode_stop_after_ssm_gnorm: bool = false,
     partial_decode_ssm_gnorm_out: ?vk.c.VkBuffer = null,
     partial_decode_ssm_gnorm_out_offset: vk.c.VkDeviceSize = 0,
+    partial_decode_stop_after_ssm_conv: bool = false,
+    partial_decode_ssm_conv_out: ?vk.c.VkBuffer = null,
+    partial_decode_ssm_conv_out_offset: vk.c.VkDeviceSize = 0,
+    partial_decode_ssm_z_out: ?vk.c.VkBuffer = null,
+    partial_decode_ssm_z_out_offset: vk.c.VkDeviceSize = 0,
+    partial_decode_ssm_alpha_out: ?vk.c.VkBuffer = null,
+    partial_decode_ssm_alpha_out_offset: vk.c.VkDeviceSize = 0,
+    partial_decode_ssm_beta_out: ?vk.c.VkBuffer = null,
+    partial_decode_ssm_beta_out_offset: vk.c.VkDeviceSize = 0,
     partial_ssm_preproj_layer: u32 = std.math.maxInt(u32),
     partial_ssm_preproj_token_idx: u32 = 0,
     partial_ssm_preproj_qkv: ?vk.c.VkBuffer = null,
@@ -6619,7 +6628,7 @@ pub const InferenceEngine = struct {
                     try self.runSsmLayerCpu(state, layer, layer_idx);
                 }
                 self.endProfilePhase(.ssm, ssm_phase);
-                if (self.partial_decode_stop_after_ssm_gnorm) {
+                if (self.partial_decode_stop_after_ssm_gnorm or self.partial_decode_stop_after_ssm_conv) {
                     break;
                 }
             }
@@ -11720,6 +11729,13 @@ pub const InferenceEngine = struct {
             self.a3b_beta_capture != null and
             self.a3b_conv_out_capture != null and
             self.prefill_current_token_idx < self.a3b_capture_max_tokens;
+        const stop_after_ssm_conv = self.partial_decode_stop_after_ssm_conv and
+            self.prefill_active and
+            !is_dead_tail and
+            self.partial_decode_ssm_conv_out != null and
+            self.partial_decode_ssm_z_out != null and
+            self.partial_decode_ssm_alpha_out != null and
+            self.partial_decode_ssm_beta_out != null;
         if (use_delta_normed_qk) {
             self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, qkv_bytes);
             const pip = &(self.elementwise.pipeline_ssm_qk_norm orelse return error.ShaderNotLoaded);
@@ -11730,7 +11746,7 @@ pub const InferenceEngine = struct {
             };
             self.pushDispatch1(pip, std.mem.asBytes(&push), self.swiglu_buf.handle, qkv_bytes, n_group, 1, 1);
         }
-        if (a3b_capture_this_layer or ssm_prefill_validate_delta_capture) {
+        if (a3b_capture_this_layer or ssm_prefill_validate_delta_capture or stop_after_ssm_conv) {
             self.decode_cmd.computeAndTransferBarrier();
         } else {
             const conv_to_delta_ranges = [_]CommandBuffer.BufferRange{
@@ -11780,6 +11796,33 @@ pub const InferenceEngine = struct {
             const conv_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * qkv_bytes;
             const r_conv = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = conv_dst_off, .size = qkv_bytes };
             vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.ssm_prefill_validate_conv_ref.?.handle, 1, &r_conv);
+        }
+        if (stop_after_ssm_conv) {
+            const conv_copy = vk.c.VkBufferCopy{
+                .srcOffset = 0,
+                .dstOffset = self.partial_decode_ssm_conv_out_offset,
+                .size = qkv_bytes,
+            };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.partial_decode_ssm_conv_out.?, 1, &conv_copy);
+            const z_copy = vk.c.VkBufferCopy{
+                .srcOffset = 0,
+                .dstOffset = self.partial_decode_ssm_z_out_offset,
+                .size = z_bytes,
+            };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.gate_buf.handle, self.partial_decode_ssm_z_out.?, 1, &z_copy);
+            const alpha_copy = vk.c.VkBufferCopy{
+                .srcOffset = 0,
+                .dstOffset = self.partial_decode_ssm_alpha_out_offset,
+                .size = ab_bytes,
+            };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.router_logits_buf.handle, self.partial_decode_ssm_alpha_out.?, 1, &alpha_copy);
+            const beta_copy = vk.c.VkBufferCopy{
+                .srcOffset = 0,
+                .dstOffset = self.partial_decode_ssm_beta_out_offset,
+                .size = ab_bytes,
+            };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.down_buf.handle, self.partial_decode_ssm_beta_out.?, 1, &beta_copy);
+            return;
         }
 
         // --- GPU SSM diagnostic: readback conv1d output at layer 0 for comparison with CPU SSM_DBG ---
@@ -12109,6 +12152,22 @@ pub const InferenceEngine = struct {
             self.elementwise.pipeline_ssm_gated_norm != null;
     }
 
+    fn qwen36DensePrefillSsmBatchedDeltaEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (n_tokens < 16) return false;
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (self.use_ssm_delta_normed_qk) return false;
+        if (self.elementwise.pipeline_ssm_delta_net == null and self.elementwise.pipeline_ssm_delta_net_cols8 == null) return false;
+        if (self.elementwise.pipeline_ssm_gated_norm == null) return false;
+        if (std.posix.getenv("ZINC_QWEN36_27B_SSM_BATCHED_DELTA")) |mode| {
+            return mode.len > 0 and !std.mem.eql(u8, mode, "0");
+        }
+        return true;
+    }
+
     fn partialSsmPreprojActiveFor(self: *const InferenceEngine, layer: u32) bool {
         if (self.partial_ssm_preproj_layer != layer) return false;
         const has_qkv = self.partial_ssm_preproj_qkv != null and self.partial_ssm_preproj_qkv_stride > 0;
@@ -12315,6 +12374,11 @@ pub const InferenceEngine = struct {
         hidden_size: vk.c.VkDeviceSize,
         layer: u32,
         scratch_hidden: Buffer,
+        scratch_gate: Buffer,
+        scratch_up: Buffer,
+        scratch_q: Buffer,
+        scratch_k: Buffer,
+        scratch_attn_out: Buffer,
         scratch_swiglu: Buffer,
         scratch_norm: Buffer,
         scratch_down: Buffer,
@@ -12326,14 +12390,282 @@ pub const InferenceEngine = struct {
         const ffn_norm_t = lt.ffn_norm orelse
             lt.post_attention_norm orelse return error.TensorNotFound;
         const z_bytes = @as(vk.c.VkDeviceSize, d_inner) * @sizeOf(f32);
+        const cfg = self.model.config;
+        const dt_rank = cfg.ssm_dt_rank;
+        const head_v_dim: u32 = d_inner / dt_rank;
+        const conv_channels: u32 = d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
+        const qkv_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, conv_channels) * @sizeOf(f32);
+        const ab_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, dt_rank) * @sizeOf(f32);
+        const qkv_total_bytes: vk.c.VkDeviceSize = qkv_bytes * @as(vk.c.VkDeviceSize, n_tokens);
+        const z_total_bytes: vk.c.VkDeviceSize = z_bytes * @as(vk.c.VkDeviceSize, n_tokens);
+        const ab_total_bytes: vk.c.VkDeviceSize = ab_bytes * @as(vk.c.VkDeviceSize, n_tokens);
 
         const saved_stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm;
         const saved_ssm_gnorm_out = self.partial_decode_ssm_gnorm_out;
         const saved_ssm_gnorm_out_offset = self.partial_decode_ssm_gnorm_out_offset;
+        const saved_stop_after_ssm_conv = self.partial_decode_stop_after_ssm_conv;
+        const saved_ssm_conv_out = self.partial_decode_ssm_conv_out;
+        const saved_ssm_conv_out_offset = self.partial_decode_ssm_conv_out_offset;
+        const saved_ssm_z_out = self.partial_decode_ssm_z_out;
+        const saved_ssm_z_out_offset = self.partial_decode_ssm_z_out_offset;
+        const saved_ssm_alpha_out = self.partial_decode_ssm_alpha_out;
+        const saved_ssm_alpha_out_offset = self.partial_decode_ssm_alpha_out_offset;
+        const saved_ssm_beta_out = self.partial_decode_ssm_beta_out;
+        const saved_ssm_beta_out_offset = self.partial_decode_ssm_beta_out_offset;
         defer {
             self.partial_decode_stop_after_ssm_gnorm = saved_stop_after_ssm_gnorm;
             self.partial_decode_ssm_gnorm_out = saved_ssm_gnorm_out;
             self.partial_decode_ssm_gnorm_out_offset = saved_ssm_gnorm_out_offset;
+            self.partial_decode_stop_after_ssm_conv = saved_stop_after_ssm_conv;
+            self.partial_decode_ssm_conv_out = saved_ssm_conv_out;
+            self.partial_decode_ssm_conv_out_offset = saved_ssm_conv_out_offset;
+            self.partial_decode_ssm_z_out = saved_ssm_z_out;
+            self.partial_decode_ssm_z_out_offset = saved_ssm_z_out_offset;
+            self.partial_decode_ssm_alpha_out = saved_ssm_alpha_out;
+            self.partial_decode_ssm_alpha_out_offset = saved_ssm_alpha_out_offset;
+            self.partial_decode_ssm_beta_out = saved_ssm_beta_out;
+            self.partial_decode_ssm_beta_out_offset = saved_ssm_beta_out_offset;
+        }
+
+        const use_batched_delta = self.qwen36DensePrefillSsmBatchedDeltaEnabled(n_tokens) and
+            dt_rank > 0 and
+            head_v_dim > 0 and
+            qkv_total_bytes <= scratch_gate.size and
+            z_total_bytes <= scratch_up.size and
+            ab_total_bytes <= scratch_q.size and
+            ab_total_bytes <= scratch_k.size and
+            z_total_bytes <= scratch_attn_out.size and
+            z_total_bytes <= scratch_swiglu.size and
+            @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32) <= scratch_down.size;
+
+        if (use_batched_delta) {
+            var primary_pending: bool = false;
+            var alt_pending: bool = false;
+            var tok_idx: u32 = 0;
+            while (tok_idx < n_tokens) : (tok_idx += 1) {
+                const pipeline_this = pipeline_enabled;
+                if (pipeline_this) {
+                    std.mem.swap(CommandBuffer, &self.decode_cmd, &self.prefill_cmd_alt);
+                    std.mem.swap(bool, &primary_pending, &alt_pending);
+                    if (primary_pending) {
+                        try self.decode_cmd.waitForCompletion();
+                        primary_pending = false;
+                    }
+                    self.prefill_pipeline_mode = true;
+                } else {
+                    if (alt_pending) {
+                        try self.prefill_cmd_alt.waitForCompletion();
+                        alt_pending = false;
+                    }
+                    if (primary_pending) {
+                        try self.decode_cmd.waitForCompletion();
+                        primary_pending = false;
+                    }
+                    self.prefill_pipeline_mode = false;
+                }
+
+                const hidden_offset: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
+                self.prefill_current_token_idx = tok_idx;
+                state.position = base_token + tok_idx;
+                self.partial_decode_start_layer = layer;
+                self.partial_decode_end_layer = layer + 1;
+                self.partial_decode_hidden_in = scratch_hidden.handle;
+                self.partial_decode_hidden_in_offset = hidden_offset;
+                self.partial_decode_hidden_out = null;
+                self.partial_decode_hidden_out_offset = 0;
+                self.partial_decode_advance_position = false;
+                self.partial_decode_allow_final_tail = false;
+                self.partial_decode_stop_after_ffn_norm = false;
+                self.partial_decode_ffn_norm_out = null;
+                self.partial_decode_ffn_norm_out_offset = 0;
+                self.partial_decode_stop_after_ssm_gnorm = false;
+                self.partial_decode_ssm_gnorm_out = null;
+                self.partial_decode_ssm_gnorm_out_offset = 0;
+                self.partial_decode_stop_after_ssm_conv = true;
+                self.partial_decode_ssm_conv_out = scratch_gate.handle;
+                self.partial_decode_ssm_conv_out_offset = @as(vk.c.VkDeviceSize, tok_idx) * qkv_bytes;
+                self.partial_decode_ssm_z_out = scratch_up.handle;
+                self.partial_decode_ssm_z_out_offset = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+                self.partial_decode_ssm_alpha_out = scratch_q.handle;
+                self.partial_decode_ssm_alpha_out_offset = @as(vk.c.VkDeviceSize, tok_idx) * ab_bytes;
+                self.partial_decode_ssm_beta_out = scratch_k.handle;
+                self.partial_decode_ssm_beta_out_offset = @as(vk.c.VkDeviceSize, tok_idx) * ab_bytes;
+
+                try self.decodeStep(state, prompt_tokens[tok_idx], false);
+                if (pipeline_this) {
+                    primary_pending = true;
+                }
+            }
+
+            self.prefill_pipeline_mode = false;
+            if (alt_pending) {
+                try self.prefill_cmd_alt.waitForCompletion();
+            }
+            if (primary_pending) {
+                try self.decode_cmd.waitForCompletion();
+            }
+
+            self.partial_decode_stop_after_ssm_conv = false;
+            self.partial_decode_ssm_conv_out = null;
+            self.partial_decode_ssm_z_out = null;
+            self.partial_decode_ssm_alpha_out = null;
+            self.partial_decode_ssm_beta_out = null;
+
+            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+            try self.decode_cmd.reset();
+            try self.decode_cmd.beginOneTime();
+            self.resetTimestamps();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            self.decode_cmd.transferToComputeBarrier();
+
+            const ssm_phase = self.beginProfilePhase();
+            const ssm_delta_phase = self.beginProfilePhase();
+            const dt_bias_t = lt.ssm_dt_bias;
+            const ssm_a_t = lt.ssm_a;
+            const dt_bias_buf = if (dt_bias_t) |t| t.gpu_buffer.handle else self.down_buf.handle;
+            const dt_bias_size = if (dt_bias_t) |t| t.gpu_buffer.size else ab_bytes;
+            const ssm_a_buf = if (ssm_a_t) |t| t.gpu_buffer.handle else self.down_buf.handle;
+            const ssm_a_size = if (ssm_a_t) |t| t.gpu_buffer.size else ab_bytes;
+            const use_delta_cols8 = self.use_ssm_delta_cols8 and
+                !self.use_ssm_delta_normed_qk and
+                head_v_dim == 128 and
+                cfg.ssm_d_state == 128 and
+                self.elementwise.pipeline_ssm_delta_net_cols8 != null;
+            const delta_pip = if (use_delta_cols8)
+                &(self.elementwise.pipeline_ssm_delta_net_cols8.?)
+            else
+                &(self.elementwise.pipeline_ssm_delta_net orelse return error.ShaderNotLoaded);
+            const delta_push = SsmDeltaNetPush{
+                .d_inner = d_inner,
+                .dt_rank = dt_rank,
+                .head_v_dim = head_v_dim,
+                .d_state = cfg.ssm_d_state,
+                .n_group = cfg.ssm_n_group,
+                .ssm_a_is_f16 = if (ssm_a_t) |t| (if (t.info.type_ == .f16) @as(u32, 1) else 0) else 0,
+                .dt_bias_is_f16 = if (dt_bias_t) |t| (if (t.info.type_ == .f16) @as(u32, 1) else 0) else 0,
+                .has_dt_bias = if (dt_bias_t != null) 1 else 0,
+                .has_ssm_a = if (ssm_a_t != null) 1 else 0,
+                .n_tok = n_tokens,
+                .conv_stride_tok = conv_channels,
+                .ab_stride_tok = dt_rank,
+                .y_stride_tok = d_inner,
+            };
+            const row_blocks = if (use_delta_cols8) (head_v_dim + 3) / 4 else head_v_dim;
+            self.pushDispatch7(
+                delta_pip,
+                std.mem.asBytes(&delta_push),
+                scratch_gate.handle,
+                scratch_gate.size,
+                dt_bias_buf,
+                dt_bias_size,
+                scratch_q.handle,
+                scratch_q.size,
+                scratch_k.handle,
+                scratch_k.size,
+                ssm_a_buf,
+                ssm_a_size,
+                self.gpu_ssm_states[@intCast(layer)].handle,
+                self.gpu_ssm_states[@intCast(layer)].size,
+                scratch_attn_out.handle,
+                scratch_attn_out.size,
+                dt_rank,
+                row_blocks,
+                1,
+            );
+            self.endProfilePhase(.ssm_delta, ssm_delta_phase);
+
+            const ssm_gnorm_phase = self.beginProfilePhase();
+            self.decode_cmd.computeBufferBarrier(scratch_attn_out.handle, z_total_bytes);
+            const norm_tensor = lt.ssm_norm;
+            const norm_elems: u32 = if (norm_tensor) |t| @intCast(t.info.numElements()) else 0;
+            const norm_per_head = norm_elems >= d_inner;
+            const norm_buf_handle = if (norm_tensor) |t| t.gpu_buffer.handle else self.down_buf.handle;
+            const norm_buf_size = if (norm_tensor) |t| t.gpu_buffer.size else ab_total_bytes;
+            const gnorm_pip = &(self.elementwise.pipeline_ssm_gated_norm orelse return error.ShaderNotLoaded);
+            const gnorm_push = SsmGatedNormPush{
+                .d_inner = d_inner,
+                .dt_rank = dt_rank,
+                .head_v_dim = head_v_dim,
+                .d_state = cfg.ssm_d_state,
+                .norm_per_head = if (norm_per_head) 1 else 0,
+            };
+            tok_idx = 0;
+            while (tok_idx < n_tokens) : (tok_idx += 1) {
+                const z_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+                const infos = [4]vk.c.VkDescriptorBufferInfo{
+                    .{ .buffer = scratch_attn_out.handle, .offset = z_off, .range = z_bytes },
+                    .{ .buffer = scratch_up.handle, .offset = z_off, .range = z_bytes },
+                    .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
+                    .{ .buffer = scratch_swiglu.handle, .offset = z_off, .range = z_bytes },
+                };
+                self.decode_cmd.pushDescAndDispatch(
+                    gnorm_pip,
+                    self.instance.push_descriptor_fn,
+                    infos[0..],
+                    std.mem.asBytes(&gnorm_push),
+                    dt_rank,
+                    1,
+                    1,
+                );
+            }
+            self.endProfilePhase(.ssm_gated_norm, ssm_gnorm_phase);
+
+            self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, z_total_bytes);
+            const ssm_out_phase = self.beginProfilePhase();
+            const use_batched_q5k_ssm_out = ssm_out_t.info.type_ == .q5_k and
+                self.use_q4k_batch_kpar and
+                self.dmmv.pipeline_q5k != null and
+                n_tokens >= 2;
+            if (use_batched_q5k_ssm_out) {
+                try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                self.decode_cmd.computeBarrier();
+                try self.dispatchScaleAcc(
+                    scratch_hidden.handle,
+                    scratch_hidden.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    n_tokens * hidden_dim,
+                    1.0,
+                );
+            } else {
+                tok_idx = 0;
+                while (tok_idx < n_tokens) : (tok_idx += 1) {
+                    const x_offset = tok_idx * d_inner * @sizeOf(f32);
+                    const y_offset = tok_idx * hidden_dim * @sizeOf(f32);
+                    try self.dispatchDmmvInner(
+                        ssm_out_t,
+                        scratch_swiglu,
+                        scratch_swiglu.size,
+                        scratch_hidden,
+                        hidden_dim,
+                        d_inner,
+                        0,
+                        x_offset,
+                        y_offset,
+                        1,
+                    );
+                }
+            }
+            self.endProfilePhase(.ssm_out, ssm_out_phase);
+            self.endProfilePhase(.ssm, ssm_phase);
+            self.decode_cmd.computeBarrier();
+            try self.dispatchRmsNorm(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                ffn_norm_t.gpu_buffer.handle,
+                ffn_norm_t.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                hidden_dim,
+                n_tokens,
+                self.model.config.rms_norm_eps,
+            );
+            self.decode_cmd.computeToTransferBarrier();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            try self.decode_cmd.end();
+            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+            self.recordProfilingSample();
+            return;
         }
 
         var primary_pending: bool = false;
@@ -12700,6 +13032,15 @@ pub const InferenceEngine = struct {
         const saved_stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm;
         const saved_ssm_gnorm_out = self.partial_decode_ssm_gnorm_out;
         const saved_ssm_gnorm_out_offset = self.partial_decode_ssm_gnorm_out_offset;
+        const saved_stop_after_ssm_conv = self.partial_decode_stop_after_ssm_conv;
+        const saved_ssm_conv_out = self.partial_decode_ssm_conv_out;
+        const saved_ssm_conv_out_offset = self.partial_decode_ssm_conv_out_offset;
+        const saved_ssm_z_out = self.partial_decode_ssm_z_out;
+        const saved_ssm_z_out_offset = self.partial_decode_ssm_z_out_offset;
+        const saved_ssm_alpha_out = self.partial_decode_ssm_alpha_out;
+        const saved_ssm_alpha_out_offset = self.partial_decode_ssm_alpha_out_offset;
+        const saved_ssm_beta_out = self.partial_decode_ssm_beta_out;
+        const saved_ssm_beta_out_offset = self.partial_decode_ssm_beta_out_offset;
         const saved_ssm_preproj_layer = self.partial_ssm_preproj_layer;
         const saved_ssm_preproj_token_idx = self.partial_ssm_preproj_token_idx;
         const saved_ssm_preproj_qkv = self.partial_ssm_preproj_qkv;
@@ -12723,6 +13064,15 @@ pub const InferenceEngine = struct {
             self.partial_decode_stop_after_ssm_gnorm = saved_stop_after_ssm_gnorm;
             self.partial_decode_ssm_gnorm_out = saved_ssm_gnorm_out;
             self.partial_decode_ssm_gnorm_out_offset = saved_ssm_gnorm_out_offset;
+            self.partial_decode_stop_after_ssm_conv = saved_stop_after_ssm_conv;
+            self.partial_decode_ssm_conv_out = saved_ssm_conv_out;
+            self.partial_decode_ssm_conv_out_offset = saved_ssm_conv_out_offset;
+            self.partial_decode_ssm_z_out = saved_ssm_z_out;
+            self.partial_decode_ssm_z_out_offset = saved_ssm_z_out_offset;
+            self.partial_decode_ssm_alpha_out = saved_ssm_alpha_out;
+            self.partial_decode_ssm_alpha_out_offset = saved_ssm_alpha_out_offset;
+            self.partial_decode_ssm_beta_out = saved_ssm_beta_out;
+            self.partial_decode_ssm_beta_out_offset = saved_ssm_beta_out_offset;
             self.partial_ssm_preproj_layer = saved_ssm_preproj_layer;
             self.partial_ssm_preproj_token_idx = saved_ssm_preproj_token_idx;
             self.partial_ssm_preproj_qkv = saved_ssm_preproj_qkv;
@@ -12815,6 +13165,11 @@ pub const InferenceEngine = struct {
                     hidden_size,
                     layer,
                     scratch_hidden,
+                    scratch_gate,
+                    scratch_up,
+                    self.batched_scratch_q.?,
+                    self.batched_scratch_k.?,
+                    self.batched_scratch_attn_out.?,
                     scratch_swiglu,
                     scratch_norm,
                     scratch_down,
@@ -12896,6 +13251,11 @@ pub const InferenceEngine = struct {
                     hidden_size,
                     segment_layer,
                     scratch_hidden,
+                    scratch_gate,
+                    scratch_up,
+                    self.batched_scratch_q.?,
+                    self.batched_scratch_k.?,
+                    self.batched_scratch_attn_out.?,
                     scratch_swiglu,
                     scratch_norm,
                     scratch_down,
