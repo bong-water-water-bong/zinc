@@ -11884,7 +11884,13 @@ pub const InferenceEngine = struct {
         const norm_per_head = norm_elems >= d_inner;
         const norm_buf_handle = if (norm_tensor) |t| t.gpu_buffer.handle else self.down_buf.handle;
         const norm_buf_size = if (norm_tensor) |t| t.gpu_buffer.size else ab_bytes;
+        const stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm and
+            self.prefill_active and
+            self.partial_decode_ssm_gnorm_out != null;
         const ssm_gated_norm_phase = self.beginProfilePhase();
+        const direct_ssm_gnorm_store = stop_after_ssm_gnorm and
+            !ssm_prefill_validate_output_capture and
+            self.qwen36DensePrefillSsmGnormDirectStoreEnabled();
         {
             const pip = &(self.elementwise.pipeline_ssm_gated_norm orelse return error.ShaderNotLoaded);
             const push = SsmGatedNormPush{
@@ -11895,7 +11901,25 @@ pub const InferenceEngine = struct {
                 .norm_per_head = if (norm_per_head) 1 else 0,
             };
             if (pip.uses_push_descriptors) {
-                self.pushDispatch4(pip, std.mem.asBytes(&push), self.attn_out_buf.handle, z_bytes, self.gate_buf.handle, z_bytes, norm_buf_handle, norm_buf_size, self.swiglu_buf.handle, z_bytes, dt_rank, 1, 1);
+                if (direct_ssm_gnorm_store) {
+                    const infos = [4]vk.c.VkDescriptorBufferInfo{
+                        .{ .buffer = self.attn_out_buf.handle, .offset = 0, .range = z_bytes },
+                        .{ .buffer = self.gate_buf.handle, .offset = 0, .range = z_bytes },
+                        .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
+                        .{ .buffer = self.partial_decode_ssm_gnorm_out.?, .offset = self.partial_decode_ssm_gnorm_out_offset, .range = z_bytes },
+                    };
+                    self.decode_cmd.pushDescAndDispatch(
+                        pip,
+                        self.instance.push_descriptor_fn,
+                        infos[0..],
+                        std.mem.asBytes(&push),
+                        dt_rank,
+                        1,
+                        1,
+                    );
+                } else {
+                    self.pushDispatch4(pip, std.mem.asBytes(&push), self.attn_out_buf.handle, z_bytes, self.gate_buf.handle, z_bytes, norm_buf_handle, norm_buf_size, self.swiglu_buf.handle, z_bytes, dt_rank, 1, 1);
+                }
             } else {
                 const ds = try self.allocDescSet(pip.descriptor_set_layout);
                 self.writeDescSet4(
@@ -11912,10 +11936,7 @@ pub const InferenceEngine = struct {
                 try self.elementwise.recordSsmGatedNorm(&self.decode_cmd, ds, push);
             }
         }
-        const stop_after_ssm_gnorm = self.partial_decode_stop_after_ssm_gnorm and
-            self.prefill_active and
-            self.partial_decode_ssm_gnorm_out != null;
-        if (ssm_prefill_validate_output_capture or stop_after_ssm_gnorm) {
+        if (ssm_prefill_validate_output_capture or (stop_after_ssm_gnorm and !direct_ssm_gnorm_store)) {
             const tok_idx = self.prefill_current_token_idx;
             const z_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
             const hidden_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
@@ -11934,7 +11955,7 @@ pub const InferenceEngine = struct {
                 };
                 vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.partial_decode_ssm_gnorm_out.?, 1, &gnorm_copy);
             }
-        } else {
+        } else if (!direct_ssm_gnorm_store) {
             self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, z_bytes);
         }
         self.endProfilePhase(.ssm_gated_norm, ssm_gated_norm_phase);
@@ -11998,6 +12019,14 @@ pub const InferenceEngine = struct {
         if (!self.isAmdRdna()) return false;
         return self.instance.push_descriptor_fn != null and
             self.elementwise.pipeline_rms_norm_store_hidden != null;
+    }
+
+    fn qwen36DensePrefillSsmGnormDirectStoreEnabled(self: *const InferenceEngine) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isQwen36DenseHybrid27B()) return false;
+        if (!self.isAmdRdna()) return false;
+        return self.instance.push_descriptor_fn != null and
+            self.elementwise.pipeline_ssm_gated_norm != null;
     }
 
     fn partialSsmPreprojActiveFor(self: *const InferenceEngine, layer: u32) bool {
@@ -12292,7 +12321,14 @@ pub const InferenceEngine = struct {
         try self.decode_cmd.beginOneTime();
         self.resetTimestamps();
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-        self.decode_cmd.transferToComputeBarrier();
+        if (self.qwen36DensePrefillSsmGnormDirectStoreEnabled()) {
+            self.decode_cmd.computeBufferBarrier(
+                scratch_swiglu.handle,
+                @as(vk.c.VkDeviceSize, n_tokens) * z_bytes,
+            );
+        } else {
+            self.decode_cmd.transferToComputeBarrier();
+        }
 
         const ssm_phase = self.beginProfilePhase();
         const ssm_out_phase = self.beginProfilePhase();
