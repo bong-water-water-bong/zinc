@@ -321,6 +321,19 @@ fn preferApple9QwenSsmPrivateRepackedQ8(cfg: ModelConfig, tensor: *const metal_l
     return readBoolEnv("ZINC_METAL_QWEN_SSM_REPACKED_Q8_PRIVATE") orelse true;
 }
 
+fn preferApple9QwenRouterPrivateRepackedQ8(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        M == 256 and
+        K == 2048 and
+        std.mem.endsWith(u8, tensor.info.name, "ffn_gate_inp.weight");
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_ROUTER_REPACKED_Q8_PRIVATE") orelse true;
+}
+
 fn preferApple9QwenFullAttnQ8K2048QuadPath(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
     const is_shape = cfg.architecture == .qwen2_moe and
         cfg.hidden_dim == 2048 and
@@ -2557,6 +2570,7 @@ pub const InferenceEngine = struct {
     router_f32_topk_batched_pipe: MetalPipeline,
     router_q8_0_topk_pipe: MetalPipeline,
     router_q8_0_topk_k2048_pipe: MetalPipeline,
+    router_q8_0_topk_repacked_k2048_pipe: MetalPipeline,
     softmax_topk_batched_pipe: MetalPipeline,
     moe_route_pack_pipe: MetalPipeline,
     moe_route_pack_blocks_pipe: MetalPipeline,
@@ -2575,6 +2589,7 @@ pub const InferenceEngine = struct {
     residual_rms_norm_pipe: MetalPipeline,
     residual_rms_norm_router_q8_0_topk_pipe: MetalPipeline,
     residual_rms_norm_router_q8_0_topk_k2048_pipe: MetalPipeline,
+    residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe: MetalPipeline,
     post_norm_residual_rms_norm_pipe: MetalPipeline,
     moe_weighted_acc_shared_pipe: MetalPipeline,
     moe_weighted_acc_shared_gate_f32_pipe: MetalPipeline,
@@ -2647,6 +2662,7 @@ pub const InferenceEngine = struct {
 
     // Cached per-layer tensor pointers (init-time, eliminates per-token O(733) scans)
     layer_tensors: []LayerTensors,
+    private_router_bufs: ?[]MetalBuffer,
     private_ssm_qkv_bufs: ?[]MetalBuffer,
     private_ssm_gate_bufs: ?[]MetalBuffer,
     private_ssm_out_bufs: ?[]MetalBuffer,
@@ -2887,6 +2903,7 @@ pub const InferenceEngine = struct {
         self.qwen_ssm_prefill_proj_beta_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_prefill_branch_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.scratch_rset = null;
+        self.private_router_bufs = null;
         self.private_ssm_qkv_bufs = null;
         self.private_ssm_gate_bufs = null;
         self.private_ssm_out_bufs = null;
@@ -3096,6 +3113,7 @@ pub const InferenceEngine = struct {
         self.router_f32_topk_batched_pipe = try loadShaderPipeline(ctx, "router_f32_topk_batched");
         self.router_q8_0_topk_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk");
         self.router_q8_0_topk_k2048_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk_k2048");
+        self.router_q8_0_topk_repacked_k2048_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk_repacked_k2048");
         self.softmax_topk_batched_pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
         self.moe_route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
         self.moe_route_pack_blocks_pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
@@ -3114,6 +3132,7 @@ pub const InferenceEngine = struct {
         self.residual_rms_norm_pipe = try loadShaderPipeline(ctx, "residual_rms_norm");
         self.residual_rms_norm_router_q8_0_topk_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk");
         self.residual_rms_norm_router_q8_0_topk_k2048_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_k2048");
+        self.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_repacked_k2048");
         self.post_norm_residual_rms_norm_pipe = try loadShaderPipeline(ctx, "post_norm_residual_rms_norm");
         self.moe_weighted_acc_shared_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared");
         self.moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
@@ -3464,10 +3483,12 @@ pub const InferenceEngine = struct {
             }
         }
         if (self.private_decode_buffers) {
+            self.private_router_bufs = try allocator.alloc(MetalBuffer, cfg.n_layers);
             self.private_ssm_qkv_bufs = try allocator.alloc(MetalBuffer, cfg.n_layers);
             self.private_ssm_gate_bufs = try allocator.alloc(MetalBuffer, cfg.n_layers);
             self.private_ssm_out_bufs = try allocator.alloc(MetalBuffer, cfg.n_layers);
             for (0..cfg.n_layers) |i| {
+                self.private_router_bufs.?[i] = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
                 self.private_ssm_qkv_bufs.?[i] = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
                 self.private_ssm_gate_bufs.?[i] = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
                 self.private_ssm_out_bufs.?[i] = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
@@ -3478,7 +3499,28 @@ pub const InferenceEngine = struct {
             var cmd: MetalCommand = undefined;
             var private_repacked_count: u32 = 0;
             var private_repacked_bytes: usize = 0;
+            var private_router_repacked_count: u32 = 0;
+            var private_router_repacked_bytes: usize = 0;
             for (0..cfg.n_layers) |i| {
+                if (self.layer_tensors[i].ffn_gate_inp) |tensor| {
+                    const size_bytes: usize = @intCast(tensor.info.sizeBytes());
+                    const t_K: u32 = @intCast(tensor.info.dims[0]);
+                    if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
+                        const t_M: u32 = @intCast(tensor.info.dims[1]);
+                        if (preferApple9QwenRouterPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_router_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_router_repacked_count += 1;
+                            private_router_repacked_bytes += size_bytes;
+                        }
+                    } else if (tensor.info.type_ == .q8_0 and size_bytes % @sizeOf(u32) == 0) {
+                        if (!need_gpu_copy) {
+                            cmd = try metal_command.beginCommand(ctx);
+                            need_gpu_copy = true;
+                        }
+                        self.private_router_bufs.?[i] = try metal_buffer.createPrivateBuffer(ctx, size_bytes);
+                        dispatchCopyU32OnCmd(&self, &cmd, &tensor.gpu_buffer, &self.private_router_bufs.?[i], @intCast(size_bytes / @sizeOf(u32)), @intCast(tensorPageOffset(model, tensor) / @sizeOf(u32)), 0);
+                    }
+                }
                 if (self.layer_tensors[i].attn_qkv) |tensor| {
                     const size_bytes: usize = @intCast(tensor.info.sizeBytes());
                     const t_K: u32 = @intCast(tensor.info.dims[0]);
@@ -3575,6 +3617,12 @@ pub const InferenceEngine = struct {
                 }
             }
             if (need_gpu_copy) cmd.commitAndWait();
+            if (private_router_repacked_count > 0) {
+                log.info("Metal: private-repacked {d} Qwen router Q8_0 tensors ({d:.2} MiB) for coalesced top-k", .{
+                    private_router_repacked_count,
+                    @as(f64, @floatFromInt(private_router_repacked_bytes)) / (1024.0 * 1024.0),
+                });
+            }
             if (private_repacked_count > 0) {
                 log.info("Metal: private-repacked {d} Qwen SSM/full-attn Q8_0 tensors ({d:.2} GiB) for coalesced access", .{
                     private_repacked_count,
@@ -3758,6 +3806,7 @@ pub const InferenceEngine = struct {
         if (self.ssm_a_bufs) |bufs| for (bufs) |*b| add(rs, b);
         if (self.ssm_norm_weight_bufs) |bufs| for (bufs) |*b| add(rs, b);
 
+        if (self.private_router_bufs) |bufs| for (bufs) |*b| add(rs, b);
         if (self.private_ssm_qkv_bufs) |bufs| for (bufs) |*b| add(rs, b);
         if (self.private_ssm_gate_bufs) |bufs| for (bufs) |*b| add(rs, b);
         if (self.private_ssm_out_bufs) |bufs| for (bufs) |*b| add(rs, b);
@@ -3936,6 +3985,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.router_f32_topk_batched_pipe);
         metal_pipeline.freePipeline(&self.router_q8_0_topk_pipe);
         metal_pipeline.freePipeline(&self.router_q8_0_topk_k2048_pipe);
+        metal_pipeline.freePipeline(&self.router_q8_0_topk_repacked_k2048_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_batched_pipe);
         metal_pipeline.freePipeline(&self.moe_route_pack_pipe);
         metal_pipeline.freePipeline(&self.moe_route_pack_blocks_pipe);
@@ -3954,6 +4004,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.residual_rms_norm_pipe);
         metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_pipe);
         metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_k2048_pipe);
+        metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe);
         metal_pipeline.freePipeline(&self.post_norm_residual_rms_norm_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_pipe);
@@ -4037,6 +4088,10 @@ pub const InferenceEngine = struct {
         if (self.shexp_gate_weights) |arr| {
             for (arr) |s| self.allocator.free(s);
             self.allocator.free(arr);
+        }
+        if (self.private_router_bufs) |bufs| {
+            for (bufs) |*buf| metal_buffer.freeBuffer(buf);
+            self.allocator.free(bufs);
         }
         if (self.private_ssm_qkv_bufs) |bufs| {
             for (bufs) |*buf| metal_buffer.freeBuffer(buf);
@@ -7850,6 +7905,20 @@ fn canUseQwenRouterQ8K2048Exact(
         router.info.type_ == .q8_0;
 }
 
+const RouterWeightRef = struct {
+    buffer: *const MetalBuffer,
+    offset: u32,
+};
+
+fn routerWeightRef(engine: *const InferenceEngine, layer_idx: usize, router: *const metal_loader.LoadedTensor) RouterWeightRef {
+    if (engine.private_router_bufs) |bufs| {
+        if (layer_idx < bufs.len and bufs[layer_idx].handle != null) {
+            return .{ .buffer = &bufs[layer_idx], .offset = 0 };
+        }
+    }
+    return .{ .buffer = &router.gpu_buffer, .offset = tensorPageOffset(engine.model, router) };
+}
+
 fn dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -7858,6 +7927,8 @@ fn dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
     norm_out: *const MetalBuffer,
     norm_weight: *const MetalBuffer,
     router: *const metal_loader.LoadedTensor,
+    router_buf: *const MetalBuffer,
+    router_offset: u32,
     output: *const MetalBuffer,
     hidden_dim: u32,
     n_experts: u32,
@@ -7875,9 +7946,18 @@ fn dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
         .n_experts = n_experts,
         .K = hidden_dim,
         .k = k,
-        .a_offset = tensorPageOffset(engine.model, router),
+        .a_offset = router_offset,
     };
-    const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, norm_weight, &router.gpu_buffer, output };
+    const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, norm_weight, router_buf, output };
+    if (router_buf.is_repacked_q8 and
+        canUseQwenRouterQ8K2048Exact(engine, router, hidden_dim, n_experts, k) and
+        engine.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe.handle != null and
+        engine.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe.thread_execution_width == 32 and
+        engine.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe.max_threads_per_threadgroup >= 1024)
+    {
+        cmd.dispatchV2(&engine.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterQ8TopkPush), 0);
+        return;
+    }
     if (canUseQwenRouterQ8K2048Exact(engine, router, hidden_dim, n_experts, k) and
         engine.residual_rms_norm_router_q8_0_topk_k2048_pipe.handle != null and
         engine.residual_rms_norm_router_q8_0_topk_k2048_pipe.thread_execution_width == 32 and
@@ -8619,6 +8699,8 @@ fn dispatchRouterQ8TopkOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
     tensor: *const metal_loader.LoadedTensor,
+    weight_buf: *const MetalBuffer,
+    weight_offset: u32,
     input: *const MetalBuffer,
     output: *const MetalBuffer,
     n_experts: u32,
@@ -8632,10 +8714,19 @@ fn dispatchRouterQ8TopkOnCmd(
         .n_experts = n_experts,
         .K = hidden_dim,
         .k = k,
-        .a_offset = tensorPageOffset(engine.model, tensor),
+        .a_offset = weight_offset,
         .x_offset = x_byte_offset,
     };
-    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input, output };
+    const bufs = [_]*const MetalBuffer{ weight_buf, input, output };
+    if (weight_buf.is_repacked_q8 and
+        canUseQwenRouterQ8K2048Exact(engine, tensor, hidden_dim, n_experts, k) and
+        engine.router_q8_0_topk_repacked_k2048_pipe.handle != null and
+        engine.router_q8_0_topk_repacked_k2048_pipe.thread_execution_width == 32 and
+        engine.router_q8_0_topk_repacked_k2048_pipe.max_threads_per_threadgroup >= 1024)
+    {
+        cmd.dispatchV2(&engine.router_q8_0_topk_repacked_k2048_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(RouterQ8TopkPush), 0);
+        return;
+    }
     if (canUseQwenRouterQ8K2048Exact(engine, tensor, hidden_dim, n_experts, k) and
         engine.router_q8_0_topk_k2048_pipe.handle != null and
         engine.router_q8_0_topk_k2048_pipe.thread_execution_width == 32 and
@@ -14955,6 +15046,7 @@ fn runDecodeStep(
             } else if (is_moe and !skip_pre_ffn_router and use_standard_gpu_routed_moe) {
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 if (canUseQwenResidualRmsNormRouterQ8Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used, 0)) {
+                    const router_ref = routerWeightRef(engine, layer_idx, router_t);
                     // Adapt llama.cpp's single-token Q8 `kernel_mul_mv_id`
                     // routed matvec shape at the attention MoE boundary too:
                     // hidden += attn_out, materialize the exact ffn_norm row,
@@ -14967,6 +15059,8 @@ fn runDecodeStep(
                         &engine.norm_buf,
                         &engine.ffn_norm_bufs[layer_idx],
                         router_t,
+                        router_ref.buffer,
+                        router_ref.offset,
                         &engine.router_output_buf,
                         hidden_dim,
                         cfg.n_experts,
@@ -15013,13 +15107,14 @@ fn runDecodeStep(
                     !residual_router_output_ready and
                     use_standard_gpu_routed_moe and
                     canUseRouterQ8Topk(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                const router_ref = routerWeightRef(engine, layer_idx, router_t);
                 if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
                     dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
                 } else if (residual_router_output_ready) {
                     // Fused residual+router dispatch already wrote router_output_buf.
                 } else if (use_fused_q8_router) {
-                    dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 0);
+                    dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_ref.buffer, router_ref.offset, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 0);
                 } else {
                     dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
                 }
@@ -15455,6 +15550,7 @@ fn runDecodeStep(
                 {
                     const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                     if (canUseQwenResidualRmsNormRouterQ8Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used, ssm_residual_offset)) {
+                        const router_ref = routerWeightRef(engine, layer_idx, router_t);
                         // Adapt llama.cpp's single-token Q8 `kernel_mul_mv_id`
                         // router discipline and vLLM's compact top-k finalize:
                         // materialize the exact token-major norm row and route
@@ -15467,6 +15563,8 @@ fn runDecodeStep(
                             &engine.norm_buf,
                             &engine.ffn_norm_bufs[layer_idx],
                             router_t,
+                            router_ref.buffer,
+                            router_ref.offset,
                             &engine.router_output_buf,
                             hidden_dim,
                             cfg.n_experts,
@@ -15516,13 +15614,14 @@ fn runDecodeStep(
                     !residual_router_output_ready and
                     use_standard_gpu_routed_moe and
                     canUseRouterQ8Topk(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                const router_ref = routerWeightRef(engine, layer_idx, router_t);
                 if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
                     dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
                 } else if (residual_router_output_ready) {
                     // Fused residual+router dispatch already wrote router_output_buf.
                 } else if (use_fused_q8_router) {
-                    dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, router_in_byte_offset);
+                    dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_ref.buffer, router_ref.offset, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, router_in_byte_offset);
                 } else {
                     dispatchDmmvOnCmdWithInputOffset(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0, router_in_byte_offset);
                 }
@@ -22015,6 +22114,10 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&topk_scaled_pipe);
     var topk_batched_pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
     defer metal_pipeline.freePipeline(&topk_batched_pipe);
+    var router_q8_repacked_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk_repacked_k2048");
+    defer metal_pipeline.freePipeline(&router_q8_repacked_pipe);
+    var residual_router_q8_repacked_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_repacked_k2048");
+    defer metal_pipeline.freePipeline(&residual_router_q8_repacked_pipe);
     var route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
     defer metal_pipeline.freePipeline(&route_pack_pipe);
     var route_pack_blocks_pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
@@ -22109,6 +22212,8 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(topk_pipe.handle != null);
     try std.testing.expect(topk_scaled_pipe.handle != null);
     try std.testing.expect(topk_batched_pipe.handle != null);
+    try std.testing.expect(router_q8_repacked_pipe.handle != null);
+    try std.testing.expect(residual_router_q8_repacked_pipe.handle != null);
     try std.testing.expect(route_pack_pipe.handle != null);
     try std.testing.expect(route_pack_blocks_pipe.handle != null);
     try std.testing.expect(route_ids_pipe.handle != null);
