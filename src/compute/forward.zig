@@ -13248,26 +13248,72 @@ pub const InferenceEngine = struct {
             (hidden_dim & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu != null;
         if (use_fused_gateup) {
-            try self.dmmv.recordMulMmQ4KGateUpSwiglu(
-                &self.decode_cmd,
-                self.instance.push_descriptor_fn,
-                gate_t.gpu_buffer.handle,
-                gate_t.gpu_buffer.size,
-                up_t.gpu_buffer.handle,
-                up_t.gpu_buffer.size,
-                scratch_norm.handle,
-                scratch_norm.size,
-                scratch_swiglu.handle,
-                scratch_swiglu.size,
-                inter_dim,
-                n_tokens,
-                hidden_dim,
-                hidden_dim,
-                inter_dim,
-                0,
-                0,
-                0,
-            );
+            const full_cols = n_tokens & ~@as(u32, 31);
+            if (full_cols > 0 and (inter_dim & 31) == 0 and self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full != null) {
+                try self.dmmv.recordMulMmQ4KGateUpSwigluFull(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_t.gpu_buffer.handle,
+                    gate_t.gpu_buffer.size,
+                    up_t.gpu_buffer.handle,
+                    up_t.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    scratch_swiglu.handle,
+                    scratch_swiglu.size,
+                    inter_dim,
+                    full_cols,
+                    hidden_dim,
+                    hidden_dim,
+                    inter_dim,
+                    0,
+                    0,
+                    0,
+                );
+                if (full_cols < n_tokens) {
+                    try self.dmmv.recordMulMmQ4KGateUpSwiglu(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        gate_t.gpu_buffer.handle,
+                        gate_t.gpu_buffer.size,
+                        up_t.gpu_buffer.handle,
+                        up_t.gpu_buffer.size,
+                        scratch_norm.handle,
+                        scratch_norm.size,
+                        scratch_swiglu.handle,
+                        scratch_swiglu.size,
+                        inter_dim,
+                        n_tokens - full_cols,
+                        hidden_dim,
+                        hidden_dim,
+                        inter_dim,
+                        0,
+                        full_cols * hidden_dim,
+                        full_cols * inter_dim,
+                    );
+                }
+            } else {
+                try self.dmmv.recordMulMmQ4KGateUpSwiglu(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_t.gpu_buffer.handle,
+                    gate_t.gpu_buffer.size,
+                    up_t.gpu_buffer.handle,
+                    up_t.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    scratch_swiglu.handle,
+                    scratch_swiglu.size,
+                    inter_dim,
+                    n_tokens,
+                    hidden_dim,
+                    hidden_dim,
+                    inter_dim,
+                    0,
+                    0,
+                    0,
+                );
+            }
         } else {
             const dense_ffn_gate_phase = self.beginProfilePhase();
             try self.dispatchProjectionBatched(gate_t, scratch_norm, scratch_gate, inter_dim, hidden_dim, n_tokens);
