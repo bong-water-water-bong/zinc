@@ -12619,12 +12619,18 @@ pub const InferenceEngine = struct {
             if (use_batched_q5k_ssm_out) {
                 try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
                 self.decode_cmd.computeBarrier();
-                try self.dispatchScaleAcc(
+                try self.dispatchResidualRmsNorm(
                     scratch_hidden.handle,
                     scratch_hidden.size,
                     scratch_down.handle,
                     scratch_down.size,
-                    n_tokens * hidden_dim,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    ffn_norm_t.gpu_buffer.handle,
+                    ffn_norm_t.gpu_buffer.size,
+                    hidden_dim,
+                    n_tokens,
+                    self.model.config.rms_norm_eps,
                     1.0,
                 );
             } else {
@@ -12648,18 +12654,20 @@ pub const InferenceEngine = struct {
             }
             self.endProfilePhase(.ssm_out, ssm_out_phase);
             self.endProfilePhase(.ssm, ssm_phase);
-            self.decode_cmd.computeBarrier();
-            try self.dispatchRmsNorm(
-                scratch_hidden.handle,
-                scratch_hidden.size,
-                ffn_norm_t.gpu_buffer.handle,
-                ffn_norm_t.gpu_buffer.size,
-                scratch_norm.handle,
-                scratch_norm.size,
-                hidden_dim,
-                n_tokens,
-                self.model.config.rms_norm_eps,
-            );
+            if (!use_batched_q5k_ssm_out) {
+                self.decode_cmd.computeBarrier();
+                try self.dispatchRmsNorm(
+                    scratch_hidden.handle,
+                    scratch_hidden.size,
+                    ffn_norm_t.gpu_buffer.handle,
+                    ffn_norm_t.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    hidden_dim,
+                    n_tokens,
+                    self.model.config.rms_norm_eps,
+                );
+            }
             self.decode_cmd.computeToTransferBarrier();
             _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
             try self.decode_cmd.end();
@@ -12752,12 +12760,18 @@ pub const InferenceEngine = struct {
         if (use_batched_q5k_ssm_out) {
             try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
             self.decode_cmd.computeBarrier();
-            try self.dispatchScaleAcc(
+            try self.dispatchResidualRmsNorm(
                 scratch_hidden.handle,
                 scratch_hidden.size,
                 scratch_down.handle,
                 scratch_down.size,
-                n_tokens * hidden_dim,
+                scratch_norm.handle,
+                scratch_norm.size,
+                ffn_norm_t.gpu_buffer.handle,
+                ffn_norm_t.gpu_buffer.size,
+                hidden_dim,
+                n_tokens,
+                self.model.config.rms_norm_eps,
                 1.0,
             );
         } else {
@@ -12781,18 +12795,20 @@ pub const InferenceEngine = struct {
         }
         self.endProfilePhase(.ssm_out, ssm_out_phase);
         self.endProfilePhase(.ssm, ssm_phase);
-        self.decode_cmd.computeBarrier();
-        try self.dispatchRmsNorm(
-            scratch_hidden.handle,
-            scratch_hidden.size,
-            ffn_norm_t.gpu_buffer.handle,
-            ffn_norm_t.gpu_buffer.size,
-            scratch_norm.handle,
-            scratch_norm.size,
-            hidden_dim,
-            n_tokens,
-            self.model.config.rms_norm_eps,
-        );
+        if (!use_batched_q5k_ssm_out) {
+            self.decode_cmd.computeBarrier();
+            try self.dispatchRmsNorm(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                ffn_norm_t.gpu_buffer.handle,
+                ffn_norm_t.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                hidden_dim,
+                n_tokens,
+                self.model.config.rms_norm_eps,
+            );
+        }
         self.decode_cmd.computeToTransferBarrier();
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
         try self.decode_cmd.end();
