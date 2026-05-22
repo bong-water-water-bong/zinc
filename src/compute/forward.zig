@@ -43,9 +43,11 @@ const RopeBatchedPush = elementwise_mod.RopeBatchedPush;
 const SoftmaxTopkPush = elementwise_mod.SoftmaxTopkPush;
 const MoeWeightedAccPush = elementwise_mod.MoeWeightedAccPush;
 const SsmConv1dPush = elementwise_mod.SsmConv1dPush;
+const SsmConv1dBatchedPush = elementwise_mod.SsmConv1dBatchedPush;
 const SsmQkNormPush = elementwise_mod.SsmQkNormPush;
 const SsmDeltaNetPush = elementwise_mod.SsmDeltaNetPush;
 const SsmGatedNormPush = elementwise_mod.SsmGatedNormPush;
+const F32DualBatchPush = elementwise_mod.F32DualBatchPush;
 const DeinterleavePush = elementwise_mod.DeinterleavePush;
 const KvCacheWritePush = elementwise_mod.KvCacheWritePush;
 const KvCacheWriteBatchedPush = elementwise_mod.KvCacheWriteBatchedPush;
@@ -9657,6 +9659,81 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn dispatchF32DualBatched(
+        self: *InferenceEngine,
+        alpha_tensor: *const LoadedTensor,
+        beta_tensor: *const LoadedTensor,
+        x_buf: Buffer,
+        alpha_out: Buffer,
+        beta_out: Buffer,
+        m: u32,
+        k: u32,
+        n_tokens: u32,
+    ) !void {
+        const pip = &(self.elementwise.pipeline_dmmv_f32_dual_batch orelse return error.ShaderNotLoaded);
+        if (!pip.uses_push_descriptors) return error.ShaderNotLoaded;
+        if (alpha_tensor.info.type_ != .f32 or beta_tensor.info.type_ != .f32) return error.UnsupportedQuantType;
+        if ((k & 3) != 0 or m == 0 or n_tokens == 0) return error.InvalidArgument;
+        const push = F32DualBatchPush{
+            .M = m,
+            .K = k,
+            .stride_x = k,
+            .stride_y = m,
+        };
+        self.pushDispatch5(
+            pip,
+            std.mem.asBytes(&push),
+            alpha_tensor.gpu_buffer.handle,
+            alpha_tensor.gpu_buffer.size,
+            beta_tensor.gpu_buffer.handle,
+            beta_tensor.gpu_buffer.size,
+            x_buf.handle,
+            x_buf.size,
+            alpha_out.handle,
+            alpha_out.size,
+            beta_out.handle,
+            beta_out.size,
+            m,
+            n_tokens,
+            1,
+        );
+    }
+
+    fn dispatchSsmConv1dBatchedInPlace(
+        self: *InferenceEngine,
+        qkv_buf: Buffer,
+        qkv_size: vk.c.VkDeviceSize,
+        conv_tensor: *const LoadedTensor,
+        state_buf: Buffer,
+        conv_channels: u32,
+        d_conv: u32,
+        state_offset: u32,
+        n_tokens: u32,
+    ) !void {
+        const pip = &(self.elementwise.pipeline_ssm_conv1d_batched orelse return error.ShaderNotLoaded);
+        if (!pip.uses_push_descriptors) return error.ShaderNotLoaded;
+        const push = SsmConv1dBatchedPush{
+            .conv_channels = conv_channels,
+            .d_conv = d_conv,
+            .kernel_is_f16 = if (conv_tensor.info.type_ == .f16) 1 else 0,
+            .state_offset = state_offset,
+            .n_tokens = n_tokens,
+        };
+        self.pushDispatch3(
+            pip,
+            std.mem.asBytes(&push),
+            qkv_buf.handle,
+            qkv_size,
+            conv_tensor.gpu_buffer.handle,
+            conv_tensor.gpu_buffer.size,
+            state_buf.handle,
+            state_buf.size,
+            (conv_channels + 63) / 64,
+            1,
+            1,
+        );
+    }
+
     fn validateDensePrefillFfnChunk(self: *InferenceEngine, n_tokens: u32) !void {
         if (!self.use_qwen36_dense_prefill_validate or n_tokens == 0) return;
         const cfg = self.model.config;
@@ -12168,6 +12245,13 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    fn qwen36DensePrefillSsmLayerMajorProjEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (!self.qwen36DensePrefillSsmBatchedDeltaEnabled(n_tokens)) return false;
+        if (self.elementwise.pipeline_ssm_conv1d_batched == null) return false;
+        if (self.elementwise.pipeline_dmmv_f32_dual_batch == null) return false;
+        return true;
+    }
+
     fn partialSsmPreprojActiveFor(self: *const InferenceEngine, layer: u32) bool {
         if (self.partial_ssm_preproj_layer != layer) return false;
         const has_qkv = self.partial_ssm_preproj_qkv != null and self.partial_ssm_preproj_qkv_stride > 0;
@@ -12437,6 +12521,262 @@ pub const InferenceEngine = struct {
             z_total_bytes <= scratch_attn_out.size and
             z_total_bytes <= scratch_swiglu.size and
             @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32) <= scratch_down.size;
+
+        const use_layer_major_ssm_proj = use_batched_delta and
+            self.qwen36DensePrefillSsmLayerMajorProjEnabled(n_tokens) and
+            qkv_total_bytes <= scratch_gate.size and
+            z_total_bytes <= scratch_up.size and
+            ab_total_bytes <= scratch_q.size and
+            ab_total_bytes <= scratch_k.size and
+            lt.attn_norm != null and
+            lt.attn_qkv != null and
+            lt.attn_gate != null and
+            lt.ssm_alpha != null and
+            lt.ssm_beta != null and
+            lt.ssm_conv1d != null and
+            lt.ssm_alpha.?.info.type_ == .f32 and
+            lt.ssm_beta.?.info.type_ == .f32;
+
+        if (use_layer_major_ssm_proj) {
+            const attn_norm_t = lt.attn_norm.?;
+            const wqkv_t = lt.attn_qkv.?;
+            const z_t = lt.attn_gate.?;
+            const alpha_t = lt.ssm_alpha.?;
+            const beta_t = lt.ssm_beta.?;
+            const conv_t = lt.ssm_conv1d.?;
+            const hidden_total_bytes: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
+
+            if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+            try self.decode_cmd.reset();
+            try self.decode_cmd.beginOneTime();
+            self.resetTimestamps();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            self.decode_cmd.transferToComputeBarrier();
+
+            const ssm_phase = self.beginProfilePhase();
+            const ssm_proj_phase = self.beginProfilePhase();
+            const ssm_proj_norm_ab_phase = self.beginProfilePhase();
+            try self.dispatchRmsNorm(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                attn_norm_t.gpu_buffer.handle,
+                attn_norm_t.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                hidden_dim,
+                n_tokens,
+                self.model.config.rms_norm_eps,
+            );
+            self.decode_cmd.computeBufferBarrier(scratch_norm.handle, hidden_total_bytes);
+            try self.dispatchF32DualBatched(
+                alpha_t,
+                beta_t,
+                scratch_norm,
+                scratch_q,
+                scratch_k,
+                dt_rank,
+                hidden_dim,
+                n_tokens,
+            );
+            self.endProfilePhase(.ssm_proj_norm_ab, ssm_proj_norm_ab_phase);
+
+            const ssm_proj_qkv_phase = self.beginProfilePhase();
+            try self.dispatchProjectionBatched(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
+            self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
+
+            const ssm_proj_z_phase = self.beginProfilePhase();
+            try self.dispatchProjectionBatched(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens);
+            self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
+            self.endProfilePhase(.ssm_proj, ssm_proj_phase);
+
+            const ssm_conv_phase = self.beginProfilePhase();
+            self.decode_cmd.computeBufferBarrier(scratch_gate.handle, qkv_total_bytes);
+            const d_conv_1: u32 = if (cfg.ssm_d_conv > 1) cfg.ssm_d_conv - 1 else 1;
+            const layer_idx_usize: usize = @intCast(layer);
+            const cur_offset = self.ssm_conv_state_offsets[layer_idx_usize];
+            self.ssm_conv_state_offsets[layer_idx_usize] =
+                (cur_offset + (n_tokens % d_conv_1)) % d_conv_1;
+            try self.dispatchSsmConv1dBatchedInPlace(
+                scratch_gate,
+                qkv_total_bytes,
+                conv_t,
+                self.gpu_ssm_conv_states[layer_idx_usize],
+                conv_channels,
+                cfg.ssm_d_conv,
+                cur_offset,
+                n_tokens,
+            );
+            self.endProfilePhase(.ssm_conv, ssm_conv_phase);
+
+            const delta_inputs = [_]CommandBuffer.BufferRange{
+                .{ .buffer = scratch_gate.handle, .size = qkv_total_bytes },
+                .{ .buffer = scratch_q.handle, .size = ab_total_bytes },
+                .{ .buffer = scratch_k.handle, .size = ab_total_bytes },
+            };
+            self.decode_cmd.computeBuffersBarrier(&delta_inputs);
+
+            const ssm_delta_phase = self.beginProfilePhase();
+            const dt_bias_t = lt.ssm_dt_bias;
+            const ssm_a_t = lt.ssm_a;
+            const dt_bias_buf = if (dt_bias_t) |t| t.gpu_buffer.handle else self.down_buf.handle;
+            const dt_bias_size = if (dt_bias_t) |t| t.gpu_buffer.size else ab_bytes;
+            const ssm_a_buf = if (ssm_a_t) |t| t.gpu_buffer.handle else self.down_buf.handle;
+            const ssm_a_size = if (ssm_a_t) |t| t.gpu_buffer.size else ab_bytes;
+            const use_delta_cols8 = self.use_ssm_delta_cols8 and
+                !self.use_ssm_delta_normed_qk and
+                head_v_dim == 128 and
+                cfg.ssm_d_state == 128 and
+                self.elementwise.pipeline_ssm_delta_net_cols8 != null;
+            const delta_pip = if (use_delta_cols8)
+                &(self.elementwise.pipeline_ssm_delta_net_cols8.?)
+            else
+                &(self.elementwise.pipeline_ssm_delta_net orelse return error.ShaderNotLoaded);
+            const delta_push = SsmDeltaNetPush{
+                .d_inner = d_inner,
+                .dt_rank = dt_rank,
+                .head_v_dim = head_v_dim,
+                .d_state = cfg.ssm_d_state,
+                .n_group = cfg.ssm_n_group,
+                .ssm_a_is_f16 = if (ssm_a_t) |t| (if (t.info.type_ == .f16) @as(u32, 1) else 0) else 0,
+                .dt_bias_is_f16 = if (dt_bias_t) |t| (if (t.info.type_ == .f16) @as(u32, 1) else 0) else 0,
+                .has_dt_bias = if (dt_bias_t != null) 1 else 0,
+                .has_ssm_a = if (ssm_a_t != null) 1 else 0,
+                .n_tok = n_tokens,
+                .conv_stride_tok = conv_channels,
+                .ab_stride_tok = dt_rank,
+                .y_stride_tok = d_inner,
+            };
+            const row_blocks = if (use_delta_cols8) (head_v_dim + 3) / 4 else head_v_dim;
+            self.pushDispatch7(
+                delta_pip,
+                std.mem.asBytes(&delta_push),
+                scratch_gate.handle,
+                scratch_gate.size,
+                dt_bias_buf,
+                dt_bias_size,
+                scratch_q.handle,
+                scratch_q.size,
+                scratch_k.handle,
+                scratch_k.size,
+                ssm_a_buf,
+                ssm_a_size,
+                self.gpu_ssm_states[layer_idx_usize].handle,
+                self.gpu_ssm_states[layer_idx_usize].size,
+                scratch_attn_out.handle,
+                scratch_attn_out.size,
+                dt_rank,
+                row_blocks,
+                1,
+            );
+            self.endProfilePhase(.ssm_delta, ssm_delta_phase);
+
+            const ssm_gnorm_phase = self.beginProfilePhase();
+            const gnorm_inputs = [_]CommandBuffer.BufferRange{
+                .{ .buffer = scratch_attn_out.handle, .size = z_total_bytes },
+                .{ .buffer = scratch_up.handle, .size = z_total_bytes },
+            };
+            self.decode_cmd.computeBuffersBarrier(&gnorm_inputs);
+            const norm_tensor = lt.ssm_norm;
+            const norm_elems: u32 = if (norm_tensor) |t| @intCast(t.info.numElements()) else 0;
+            const norm_per_head = norm_elems >= d_inner;
+            const norm_buf_handle = if (norm_tensor) |t| t.gpu_buffer.handle else self.down_buf.handle;
+            const norm_buf_size = if (norm_tensor) |t| t.gpu_buffer.size else ab_total_bytes;
+            const gnorm_pip = &(self.elementwise.pipeline_ssm_gated_norm orelse return error.ShaderNotLoaded);
+            const gnorm_push = SsmGatedNormPush{
+                .d_inner = d_inner,
+                .dt_rank = dt_rank,
+                .head_v_dim = head_v_dim,
+                .d_state = cfg.ssm_d_state,
+                .norm_per_head = if (norm_per_head) 1 else 0,
+            };
+            var tok_idx: u32 = 0;
+            while (tok_idx < n_tokens) : (tok_idx += 1) {
+                const z_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
+                const infos = [4]vk.c.VkDescriptorBufferInfo{
+                    .{ .buffer = scratch_attn_out.handle, .offset = z_off, .range = z_bytes },
+                    .{ .buffer = scratch_up.handle, .offset = z_off, .range = z_bytes },
+                    .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
+                    .{ .buffer = scratch_swiglu.handle, .offset = z_off, .range = z_bytes },
+                };
+                self.decode_cmd.pushDescAndDispatch(
+                    gnorm_pip,
+                    self.instance.push_descriptor_fn,
+                    infos[0..],
+                    std.mem.asBytes(&gnorm_push),
+                    dt_rank,
+                    1,
+                    1,
+                );
+            }
+            self.endProfilePhase(.ssm_gated_norm, ssm_gnorm_phase);
+
+            self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, z_total_bytes);
+            const ssm_out_phase = self.beginProfilePhase();
+            const use_batched_q5k_ssm_out = ssm_out_t.info.type_ == .q5_k and
+                self.use_q4k_batch_kpar and
+                self.dmmv.pipeline_q5k != null and
+                n_tokens >= 2;
+            if (use_batched_q5k_ssm_out) {
+                try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                self.decode_cmd.computeBarrier();
+                try self.dispatchResidualRmsNorm(
+                    scratch_hidden.handle,
+                    scratch_hidden.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    ffn_norm_t.gpu_buffer.handle,
+                    ffn_norm_t.gpu_buffer.size,
+                    hidden_dim,
+                    n_tokens,
+                    self.model.config.rms_norm_eps,
+                    1.0,
+                );
+            } else {
+                tok_idx = 0;
+                while (tok_idx < n_tokens) : (tok_idx += 1) {
+                    const x_offset = tok_idx * d_inner * @sizeOf(f32);
+                    const y_offset = tok_idx * hidden_dim * @sizeOf(f32);
+                    try self.dispatchDmmvInner(
+                        ssm_out_t,
+                        scratch_swiglu,
+                        scratch_swiglu.size,
+                        scratch_hidden,
+                        hidden_dim,
+                        d_inner,
+                        0,
+                        x_offset,
+                        y_offset,
+                        1,
+                    );
+                }
+            }
+            self.endProfilePhase(.ssm_out, ssm_out_phase);
+            self.endProfilePhase(.ssm, ssm_phase);
+            if (!use_batched_q5k_ssm_out) {
+                self.decode_cmd.computeBarrier();
+                try self.dispatchRmsNorm(
+                    scratch_hidden.handle,
+                    scratch_hidden.size,
+                    ffn_norm_t.gpu_buffer.handle,
+                    ffn_norm_t.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    hidden_dim,
+                    n_tokens,
+                    self.model.config.rms_norm_eps,
+                );
+            }
+            self.decode_cmd.computeToTransferBarrier();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            try self.decode_cmd.end();
+            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+            self.recordProfilingSample();
+            state.position = base_token + n_tokens - 1;
+            return;
+        }
 
         if (use_batched_delta) {
             var primary_pending: bool = false;

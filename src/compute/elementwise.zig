@@ -83,6 +83,23 @@ pub const SsmConv1dPush = extern struct {
     state_offset: u32,
 };
 
+/// Push constants for the batched SSM conv1d shader.
+pub const SsmConv1dBatchedPush = extern struct {
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: u32,
+    state_offset: u32,
+    n_tokens: u32,
+};
+
+/// Push constants for batched f32 dual DMMV (SSM alpha/beta).
+pub const F32DualBatchPush = extern struct {
+    M: u32,
+    K: u32,
+    stride_x: u32,
+    stride_y: u32,
+};
+
 /// Push constants for SSM delta-net state update shader.
 pub const SsmDeltaNetPush = extern struct {
     d_inner: u32,
@@ -249,6 +266,10 @@ pub const ElementwiseDispatch = struct {
     pipeline_per_expert_scale: ?Pipeline,
     /// SSM CONV1D pipeline, or null.
     pipeline_ssm_conv1d: ?Pipeline,
+    /// Batched SSM CONV1D pipeline, or null.
+    pipeline_ssm_conv1d_batched: ?Pipeline,
+    /// Batched f32 alpha/beta SSM projection pipeline, or null.
+    pipeline_dmmv_f32_dual_batch: ?Pipeline,
     /// In-place SSM Q/K normalization pipeline, or null.
     pipeline_ssm_qk_norm: ?Pipeline,
     /// SSM DELTA NET pipeline, or null.
@@ -458,6 +479,17 @@ pub const ElementwiseDispatch = struct {
             log.warn("ssm_conv1d shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const conv1d_batched_path = std.fmt.bufPrint(&path_buf, "{s}/ssm_conv1d_batched.spv", .{shader_dir}) catch unreachable;
+        const pipeline_ssm_conv1d_batched = pipeline_mod.createFromSpirvWithOptions(instance, conv1d_batched_path, 3, @sizeOf(SsmConv1dBatchedPush), &.{}, push_options, allocator) catch |err| blk: {
+            log.warn("ssm_conv1d_batched shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const f32_dual_batch_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_f32_dual_batch.spv", .{shader_dir}) catch unreachable;
+        const pipeline_dmmv_f32_dual_batch = pipeline_mod.createFromSpirvWithOptions(instance, f32_dual_batch_path, 5, @sizeOf(F32DualBatchPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("dmmv_f32_dual_batch shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         const qk_norm_path = std.fmt.bufPrint(&path_buf, "{s}/ssm_qk_norm.spv", .{shader_dir}) catch unreachable;
         const pipeline_ssm_qk_norm = pipeline_mod.createFromSpirvWithOptions(instance, qk_norm_path, 1, @sizeOf(SsmQkNormPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
@@ -606,6 +638,8 @@ pub const ElementwiseDispatch = struct {
             .pipeline_mul_elementwise = pipeline_mul_elementwise,
             .pipeline_per_expert_scale = pipeline_per_expert_scale,
             .pipeline_ssm_conv1d = pipeline_ssm_conv1d,
+            .pipeline_ssm_conv1d_batched = pipeline_ssm_conv1d_batched,
+            .pipeline_dmmv_f32_dual_batch = pipeline_dmmv_f32_dual_batch,
             .pipeline_ssm_qk_norm = pipeline_ssm_qk_norm,
             .pipeline_ssm_delta_net = pipeline_ssm_delta_net,
             .pipeline_ssm_delta_net_cols8 = pipeline_ssm_delta_net_cols8,
@@ -1022,6 +1056,8 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_mul_elementwise) |*p| p.deinit();
         if (self.pipeline_per_expert_scale) |*p| p.deinit();
         if (self.pipeline_ssm_conv1d) |*p| p.deinit();
+        if (self.pipeline_ssm_conv1d_batched) |*p| p.deinit();
+        if (self.pipeline_dmmv_f32_dual_batch) |*p| p.deinit();
         if (self.pipeline_ssm_qk_norm) |*p| p.deinit();
         if (self.pipeline_ssm_delta_net) |*p| p.deinit();
         if (self.pipeline_ssm_delta_net_cols8) |*p| p.deinit();
