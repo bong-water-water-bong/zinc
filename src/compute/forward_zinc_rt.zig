@@ -600,6 +600,10 @@ const CpuModelConfig = struct {
     rms_norm_eps: f32,
     is_gemma: bool,
     rope_freq_base_swa: f32,
+    /// Overrides the standard 1/sqrt(head_dim) attention softmax scale. Zero
+    /// means use the default; Gemma 4 uses 1.0 even when the GGUF omits an
+    /// explicit `attention.scale` key.
+    attn_scale: f32,
 };
 
 const LayerTensors = struct {
@@ -684,6 +688,14 @@ fn extractCpuModelConfig(gf: *const gguf.GGUFFile, arch: []const u8, hidden_dim:
         .rms_norm_eps = rmsNormEps(gf),
         .is_gemma = std.mem.startsWith(u8, arch, "gemma"),
         .rope_freq_base_swa = archF32(gf, arch, "rope.freq_base_swa", 0),
+        .attn_scale = blk: {
+            const explicit = archF32(gf, arch, "attention.scale", 0);
+            if (explicit > 0) break :blk explicit;
+            // Gemma 4 fixes the softmax scale at 1.0 (no 1/sqrt(head_dim));
+            // see model loader_metal for the reference.
+            if (std.mem.eql(u8, arch, "gemma4")) break :blk @as(f32, 1.0);
+            break :blk 0.0;
+        },
     };
 }
 
@@ -1743,7 +1755,11 @@ fn runDenseFfnLayer(
         .{ .info = up_t, .rows = inter, .out = state.up[0..inter] },
     }, state.ffn_norm, state.row_scratch);
 
-    swiglu(state.gate[0..inter], state.up[0..inter], state.swiglu[0..inter]);
+    if (cfg.is_gemma) {
+        geluGate(state.gate[0..inter], state.up[0..inter], state.swiglu[0..inter]);
+    } else {
+        swiglu(state.gate[0..inter], state.up[0..inter], state.swiglu[0..inter]);
+    }
 
     // down: project intermediate back to hidden and add to the layer residual.
     try matvecTensor(state.pool, model, down_t, state.swiglu[0..inter], cfg.hidden_dim, state.row_scratch, state.down);
@@ -2912,7 +2928,12 @@ fn runMoeLayer(
     direct_compute_tracking: ?DirectComputeTracking,
 ) !void {
     const cfg = model.config;
-    const ffn_norm = lt.ffn_norm orelse lt.post_attention_norm orelse return error.TensorNotFound;
+    // Gemma 4 MoE routes the expert input through pre_ffw_norm_2 instead of
+    // the standard ffn_norm. Vulkan path mirrors this at forward.zig:6975.
+    const ffn_norm = if (cfg.is_gemma and lt.pre_ffw_norm_2 != null)
+        lt.pre_ffw_norm_2.?
+    else
+        lt.ffn_norm orelse lt.post_attention_norm orelse return error.TensorNotFound;
     try rmsNormTensor(model, ffn_norm, state.hidden, state.ffn_norm, state.row_scratch);
     const n_used = state.moe_topk_active;
     const route_experts = n_used > 0;
@@ -5073,7 +5094,10 @@ fn flashAttentionCpu(
 ) !void {
     const cfg = model.config;
     const q_per_kv = @max(n_q_heads / @max(n_kv_heads, 1), 1);
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const scale: f32 = if (cfg.attn_scale > 0)
+        cfg.attn_scale
+    else
+        1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     for (0..n_q_heads) |h| {
         const kv_head = h / q_per_kv;
         const q_head = state.q[h * head_dim ..][0..head_dim];
@@ -5169,6 +5193,22 @@ fn swiglu(gate: []const f32, up: []const f32, output: []f32) void {
     while (i < output.len) : (i += 1) {
         const g = gate[i];
         output[i] = (g * sigmoid(g)) * up[i];
+    }
+}
+
+/// Gemma 4 uses gelu(gate) * up (tanh-approx GELU matches GGML's gelu_quick).
+/// Matches llama.cpp build_ffn with LLM_FFN_GELU + LLM_FFN_PAR.
+fn geluGate(gate: []const f32, up: []const f32, output: []f32) void {
+    // tanh-approx GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    const k_sqrt_2_over_pi: f32 = 0.7978845608028654;
+    const k_cubic: f32 = 0.044715;
+    var i: usize = 0;
+    while (i < output.len) : (i += 1) {
+        const g = gate[i];
+        const inner = k_sqrt_2_over_pi * (g + k_cubic * g * g * g);
+        const t = std.math.tanh(inner);
+        const gel = 0.5 * g * (1.0 + t);
+        output[i] = gel * up[i];
     }
 }
 
