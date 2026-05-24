@@ -440,6 +440,19 @@ pub const Model = struct {
         return true;
     }
 
+    fn canRunScalarDense(self: *const Model) bool {
+        const cfg = self.config;
+        if (cfg.n_layers == 0 or cfg.hidden_dim == 0) return false;
+        if (cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
+        if (self.layer_tensors.len != cfg.n_layers) return false;
+        for (self.layer_tensors) |lt| {
+            if (lt.attn_norm == null or (lt.ffn_norm == null and lt.post_attention_norm == null)) return false;
+            if (lt.attn_q == null or lt.attn_k == null or lt.attn_v == null or lt.attn_output == null) return false;
+            if (lt.ffn_gate == null or lt.ffn_up == null or lt.ffn_down == null) return false;
+        }
+        return true;
+    }
+
     fn effectiveMoeTopK(self: *const Model) u32 {
         if (self.moe_topk_limit > 0) return @min(self.config.n_experts_used, self.moe_topk_limit);
         return self.config.n_experts_used;
@@ -561,6 +574,9 @@ const LayerTensors = struct {
     attn_k_norm: ?gguf.TensorInfo = null,
     ffn_norm: ?gguf.TensorInfo = null,
     post_attention_norm: ?gguf.TensorInfo = null,
+    ffn_gate: ?gguf.TensorInfo = null,
+    ffn_up: ?gguf.TensorInfo = null,
+    ffn_down: ?gguf.TensorInfo = null,
     ffn_gate_inp: ?gguf.TensorInfo = null,
     ffn_gate_exps: ?gguf.TensorInfo = null,
     ffn_up_exps: ?gguf.TensorInfo = null,
@@ -686,6 +702,9 @@ fn resolveLayerTensors(gf: *const gguf.GGUFFile, allocator: std.mem.Allocator, n
             .attn_k_norm = findLayerTensor(gf, layer, "attn_k_norm.weight"),
             .ffn_norm = findLayerTensor(gf, layer, "ffn_norm.weight"),
             .post_attention_norm = findLayerTensor(gf, layer, "post_attention_norm.weight"),
+            .ffn_gate = findLayerTensor(gf, layer, "ffn_gate.weight"),
+            .ffn_up = findLayerTensor(gf, layer, "ffn_up.weight"),
+            .ffn_down = findLayerTensor(gf, layer, "ffn_down.weight"),
             .ffn_gate_inp = findLayerTensor(gf, layer, "ffn_gate_inp.weight"),
             .ffn_gate_exps = findLayerTensor(gf, layer, "ffn_gate_exps.weight"),
             .ffn_up_exps = findLayerTensor(gf, layer, "ffn_up_exps.weight"),
@@ -1045,6 +1064,11 @@ pub fn generateWithOptions(
     if (model.canRunScalarHybrid()) {
         log.info("M1 host-assisted full-forward path enabled for hybrid MoE+SSM model", .{});
         return generateScalarHybrid(model, prompt_tokens, max_tokens, eos_token_id, allocator, options);
+    }
+
+    if (model.canRunScalarDense()) {
+        log.info("M1 host-assisted full-forward path enabled for dense attention model", .{});
+        return generateScalarDense(model, prompt_tokens, max_tokens, eos_token_id, allocator, options);
     }
 
     log.info("M1 host-assisted full-forward path unavailable; falling back to no-layer smoke tail", .{});
@@ -1507,6 +1531,169 @@ fn generateScalarHybrid(
             .decode_budget_clamped = effective_max_tokens < max_tokens,
         },
     };
+}
+
+fn generateScalarDense(
+    model: *const Model,
+    prompt_tokens: []const u32,
+    max_tokens: u32,
+    eos_token_id: u32,
+    allocator: std.mem.Allocator,
+    options: GenerateOptions,
+) !GenerateResult {
+    _ = options;
+    const effective_max_tokens = @min(max_tokens, m0_max_decode_tokens);
+    const max_seq: u32 = @intCast(prompt_tokens.len + effective_max_tokens + 1);
+    var state = try ScalarDecodeState.init(allocator, model, max_seq);
+    defer state.deinit();
+
+    var decode_pool: std.Thread.Pool = undefined;
+    var decode_pool_ready = false;
+    const decode_pool_workers = decodeWorkerThreadCount();
+    if (decode_pool_workers > 1) {
+        if (decode_pool.init(.{ .allocator = std.heap.smp_allocator, .n_jobs = decode_pool_workers })) {
+            decode_pool_ready = true;
+        } else |err| {
+            log.warn("M1 host-assisted dense decode worker pool unavailable ({s}); falling back to per-op threads", .{@errorName(err)});
+        }
+    }
+    defer if (decode_pool_ready) decode_pool.deinit();
+    state.pool = if (decode_pool_ready) &decode_pool else null;
+    if (decode_pool_ready) {
+        log.info("M1 host-assisted dense decode worker pool enabled: {d} workers", .{decode_pool_workers});
+    }
+
+    var fast_pool: zinc_rt.fast_pool.FastPool = undefined;
+    var fast_pool_ready = false;
+    if (decode_pool_workers > 1) {
+        if (fast_pool.init(std.heap.smp_allocator, decode_pool_workers)) {
+            fast_pool_ready = true;
+        } else |err| {
+            log.warn("M1 host-assisted dense FastPool unavailable ({s})", .{@errorName(err)});
+        }
+    }
+    defer if (fast_pool_ready) fast_pool.deinit();
+    state.fast_pool = if (fast_pool_ready) &fast_pool else null;
+    matvec_fast_pool = state.fast_pool;
+    defer matvec_fast_pool = null;
+
+    var generated: std.ArrayList(u32) = .{};
+    errdefer generated.deinit(allocator);
+
+    var next_token: u32 = 0;
+    const prefill_start = std.time.nanoTimestamp();
+    for (prompt_tokens, 0..) |token, pos| {
+        const need_logits = pos + 1 == prompt_tokens.len;
+        try scalarEvalTokenDense(model, &state, token, @intCast(pos), &next_token, need_logits);
+    }
+    const prefill_end = std.time.nanoTimestamp();
+
+    const decode_start = std.time.nanoTimestamp();
+    if (effective_max_tokens > 0) try generated.append(allocator, next_token);
+    state.decode_phase = true;
+    var position: u32 = @intCast(prompt_tokens.len);
+    while (generated.items.len < effective_max_tokens and next_token != eos_token_id) : (position += 1) {
+        try scalarEvalTokenDense(model, &state, next_token, position, &next_token, true);
+        try generated.append(allocator, next_token);
+    }
+    const decode_end = std.time.nanoTimestamp();
+
+    if (effective_max_tokens < max_tokens) {
+        log.info("M1 host-assisted dense path clamped decode budget from {d} to {d} tokens", .{
+            max_tokens,
+            effective_max_tokens,
+        });
+    }
+
+    return .{
+        .tokens = try generated.toOwnedSlice(allocator),
+        .prefill_ns = elapsedNs(prefill_start, prefill_end),
+        .decode_ns = elapsedNs(decode_start, decode_end),
+        .requested_max_tokens = max_tokens,
+        .effective_max_tokens = effective_max_tokens,
+        .direct_token_boundary_copies = 0,
+        .direct_token_boundary_ib_bytes = 0,
+        .direct_token_boundary_last_fence = 0,
+        .direct_model_ops = 0,
+        .direct_compute_ops = 0,
+        .direct_compute_kind = .none,
+        .consumed_gpu_compute_value = false,
+        .real_model_slice = false,
+        .direct_compute_token = 0,
+        .consumed_gpu_model_value = false,
+        .direct_model_value_bits = 0,
+        .benchmark_shortcuts = .{
+            .decode_moe_topk_zero = false,
+            .lm_head_rows_capped = model.effectiveLmHeadRows(true) < model.config.vocab_size,
+            .decode_budget_clamped = effective_max_tokens < max_tokens,
+        },
+    };
+}
+
+fn scalarEvalTokenDense(
+    model: *const Model,
+    state: *ScalarDecodeState,
+    token_id: u32,
+    position: u32,
+    next_token: *u32,
+    need_logits: bool,
+) !void {
+    const cfg = model.config;
+    const safe_id = @min(token_id, cfg.vocab_size -| 1);
+    try dequant.row(model.tensorData(model.embed_info), safe_id, cfg.hidden_dim, model.embed_info.type_, state.hidden);
+
+    for (model.layer_tensors, 0..) |lt, li| {
+        const layer: u32 = @intCast(li);
+        try rmsNormTensor(model, lt.attn_norm.?, state.hidden, state.norm, state.row_scratch);
+        try runAttentionLayer(model, state, lt, layer, position);
+        try runDenseFfnLayer(model, state, lt);
+    }
+
+    if (!need_logits) {
+        next_token.* = 0;
+        return;
+    }
+
+    try rmsNormTensor(model, model.final_norm_info, state.hidden, state.norm, state.row_scratch);
+    const lm_head_rows = model.effectiveLmHeadRows(state.decode_phase);
+    if (model.lm_head_q4_0) |q40| {
+        next_token.* = try argmaxMatvecRaw(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
+    } else {
+        const lm_head = model.requantOrRaw(model.lm_head_info);
+        if (canDotDirect(lm_head.type_, @intCast(state.norm.len))) {
+            next_token.* = try argmaxMatvecRaw(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
+        } else {
+            try matvecRaw(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch, state.logits);
+            next_token.* = argmaxSlice(state.logits[0..lm_head_rows]);
+        }
+    }
+}
+
+fn runDenseFfnLayer(
+    model: *const Model,
+    state: *ScalarDecodeState,
+    lt: LayerTensors,
+) !void {
+    const cfg = model.config;
+    const ffn_norm = lt.ffn_norm orelse lt.post_attention_norm orelse return error.TensorNotFound;
+    try rmsNormTensor(model, ffn_norm, state.hidden, state.ffn_norm, state.row_scratch);
+
+    const gate_t = lt.ffn_gate.?;
+    const up_t = lt.ffn_up.?;
+    const down_t = lt.ffn_down.?;
+    const inter: u32 = @intCast(gate_t.numElements() / cfg.hidden_dim);
+
+    // Fuse gate + up matvecs into one pool dispatch.
+    try matvecFusedTensors(state.pool, model, &[_]FusedPart{
+        .{ .info = gate_t, .rows = inter, .out = state.gate[0..inter] },
+        .{ .info = up_t, .rows = inter, .out = state.up[0..inter] },
+    }, state.ffn_norm, state.row_scratch);
+
+    swiglu(state.gate[0..inter], state.up[0..inter], state.swiglu[0..inter]);
+
+    // down: project intermediate back to hidden and add to the layer residual.
+    try matvecTensor(state.pool, model, down_t, state.swiglu[0..inter], cfg.hidden_dim, state.row_scratch, state.down);
+    for (state.hidden, state.down) |*h, v| h.* += v;
 }
 
 fn directBoundaryToken(
