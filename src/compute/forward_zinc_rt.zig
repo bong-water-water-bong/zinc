@@ -730,8 +730,14 @@ fn extractCpuModelConfig(gf: *const gguf.GGUFFile, arch: []const u8, hidden_dim:
             const explicit = archF32(gf, arch, "attention.scale", 0);
             if (explicit > 0) break :blk explicit;
             // Gemma 4 fixes the softmax scale at 1.0 (no 1/sqrt(head_dim));
-            // see model loader_metal for the reference.
-            if (std.mem.eql(u8, arch, "gemma4")) break :blk @as(f32, 1.0);
+            // see model loader_metal for the reference. Override with
+            // ZINC_GEMMA4_ATTN_SCALE_DEFAULT to A/B test (0 = use default 1/sqrt).
+            if (std.mem.eql(u8, arch, "gemma4")) {
+                if (std.posix.getenv("ZINC_GEMMA4_ATTN_SCALE_DEFAULT")) |_| {
+                    break :blk 0.0;
+                }
+                break :blk @as(f32, 1.0);
+            }
             break :blk 0.0;
         },
     };
