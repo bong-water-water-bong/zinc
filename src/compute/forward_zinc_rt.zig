@@ -39,6 +39,9 @@ pub const Model = struct {
     config: CpuModelConfig,
     layer_tensors: []LayerTensors,
     rope_inv_freq: []f32,
+    /// Parallel inv_freq table built from rope_freq_base_swa for Gemma SWA
+    /// layers. Null when the model doesn't carry a SWA base.
+    rope_inv_freq_swa: ?[]f32,
     attn_sinks: []f32,
     ssm_conv1d_kernels: []?[]f32,
     embed_info: gguf.TensorInfo,
@@ -163,8 +166,28 @@ pub const Model = struct {
                 effective_vocab,
             });
         }
-        const rope_inv_freq = try buildRopeInvFreqs(&gf, allocator, arch, config);
+        const rope_inv_freq = try buildRopeInvFreqs(&gf, allocator, arch, config, config.rope_freq_base, 0);
         errdefer allocator.free(rope_inv_freq);
+        // Gemma 4 SWA layers carry a smaller per-layer head_dim than the model
+        // metadata's `attention.key_length`; the SWA RoPE table must use that
+        // smaller head_dim for the exponent normalization.
+        const rope_inv_freq_swa: ?[]f32 = if (config.is_gemma and config.rope_freq_base_swa > 0) blk: {
+            var swa_rope_dim: u32 = 0;
+            for (layer_tensors) |lt| {
+                // SWA layers carry attn_v; global layers drop it.
+                if (lt.attn_v == null) continue;
+                if (lt.attn_q_norm) |qn| {
+                    swa_rope_dim = @intCast(qn.numElements());
+                    break;
+                }
+                if (lt.attn_k_norm) |kn| {
+                    swa_rope_dim = @intCast(kn.numElements());
+                    break;
+                }
+            }
+            break :blk try buildRopeInvFreqs(&gf, allocator, arch, config, config.rope_freq_base_swa, swa_rope_dim);
+        } else null;
+        errdefer if (rope_inv_freq_swa) |s| allocator.free(s);
         const attn_sinks = try buildAttentionSinks(mmap_data, &gf, allocator, layer_tensors, config);
         errdefer allocator.free(attn_sinks);
         const ssm_conv1d_kernels = try buildSsmConv1dKernelCache(mmap_data, &gf, allocator, layer_tensors, config);
@@ -305,6 +328,7 @@ pub const Model = struct {
             .config = config,
             .layer_tensors = layer_tensors,
             .rope_inv_freq = rope_inv_freq,
+            .rope_inv_freq_swa = rope_inv_freq_swa,
             .attn_sinks = attn_sinks,
             .ssm_conv1d_kernels = ssm_conv1d_kernels,
             .embed_info = embed_info,
@@ -352,6 +376,7 @@ pub const Model = struct {
         self.allocator.free(self.attn_sinks);
         freeLayerF32Cache(self.allocator, self.ssm_conv1d_kernels);
         self.allocator.free(self.rope_inv_freq);
+        if (self.rope_inv_freq_swa) |swa| self.allocator.free(swa);
         self.allocator.free(self.layer_tensors);
         self.allocator.free(self.final_norm_weight);
         self.gguf_file.deinit();
@@ -420,21 +445,30 @@ pub const Model = struct {
     fn canRunScalarHybrid(self: *const Model) bool {
         const cfg = self.config;
         if (cfg.n_layers == 0 or cfg.hidden_dim == 0) return false;
-        if (cfg.n_experts == 0 or cfg.n_experts_used == 0) return false;
-        if (cfg.ssm_d_inner == 0 or cfg.ssm_dt_rank == 0 or cfg.ssm_d_state == 0) return false;
         if (self.layer_tensors.len != cfg.n_layers) return false;
+
+        const has_any_moe = cfg.n_experts > 0 and cfg.n_experts_used > 0;
+        const has_any_ssm = cfg.ssm_d_inner > 0 and cfg.ssm_dt_rank > 0 and cfg.ssm_d_state > 0;
+        // Pure-dense models are routed via canRunScalarDense.
+        if (!has_any_moe and !has_any_ssm) return false;
 
         for (self.layer_tensors, 0..) |lt, li| {
             if (lt.attn_norm == null or (lt.ffn_norm == null and lt.post_attention_norm == null)) return false;
-            if (lt.ffn_gate_inp == null or lt.ffn_gate_exps == null or
-                lt.ffn_up_exps == null or lt.ffn_down_exps == null) return false;
+
+            // FFN: accept either MoE or dense tensors (route per layer at eval time).
+            const has_moe_layer = lt.ffn_gate_inp != null and lt.ffn_gate_exps != null and
+                lt.ffn_up_exps != null and lt.ffn_down_exps != null;
+            const has_dense_layer = lt.ffn_gate != null and lt.ffn_up != null and lt.ffn_down != null;
+            if (!has_moe_layer and !has_dense_layer) return false;
 
             const layer: u32 = @intCast(li);
-            if (isFullAttentionLayer(cfg, layer)) {
-                if (lt.attn_q == null or lt.attn_k == null or lt.attn_v == null or lt.attn_output == null) return false;
-            } else {
+            const ssm_eligible_layer = has_any_ssm and !isFullAttentionLayer(cfg, layer);
+            if (ssm_eligible_layer) {
                 if (lt.attn_qkv == null or lt.attn_gate == null or lt.ssm_alpha == null or
                     lt.ssm_beta == null or lt.ssm_conv1d == null or lt.ssm_out == null) return false;
+            } else {
+                if (lt.attn_q == null or lt.attn_k == null or lt.attn_output == null) return false;
+                if (lt.attn_v == null and !cfg.is_gemma) return false;
             }
         }
         return true;
@@ -447,7 +481,10 @@ pub const Model = struct {
         if (self.layer_tensors.len != cfg.n_layers) return false;
         for (self.layer_tensors) |lt| {
             if (lt.attn_norm == null or (lt.ffn_norm == null and lt.post_attention_norm == null)) return false;
-            if (lt.attn_q == null or lt.attn_k == null or lt.attn_v == null or lt.attn_output == null) return false;
+            if (lt.attn_q == null or lt.attn_k == null or lt.attn_output == null) return false;
+            // Gemma global-attention layers omit attn_v (K reused as V); allow it
+            // only on Gemma where runAttentionLayer falls back to a K-as-V copy.
+            if (lt.attn_v == null and !cfg.is_gemma) return false;
             if (lt.ffn_gate == null or lt.ffn_up == null or lt.ffn_down == null) return false;
         }
         return true;
@@ -561,6 +598,8 @@ const CpuModelConfig = struct {
     ssm_dt_rank: u32,
     ssm_n_group: u32,
     rms_norm_eps: f32,
+    is_gemma: bool,
+    rope_freq_base_swa: f32,
 };
 
 const LayerTensors = struct {
@@ -577,6 +616,8 @@ const LayerTensors = struct {
     ffn_gate: ?gguf.TensorInfo = null,
     ffn_up: ?gguf.TensorInfo = null,
     ffn_down: ?gguf.TensorInfo = null,
+    post_ffw_norm: ?gguf.TensorInfo = null,
+    pre_ffw_norm_2: ?gguf.TensorInfo = null,
     ffn_gate_inp: ?gguf.TensorInfo = null,
     ffn_gate_exps: ?gguf.TensorInfo = null,
     ffn_up_exps: ?gguf.TensorInfo = null,
@@ -641,6 +682,8 @@ fn extractCpuModelConfig(gf: *const gguf.GGUFFile, arch: []const u8, hidden_dim:
         .ssm_dt_rank = archU32(gf, arch, "ssm.time_step_rank", 0),
         .ssm_n_group = archU32(gf, arch, "ssm.group_count", 0),
         .rms_norm_eps = rmsNormEps(gf),
+        .is_gemma = std.mem.startsWith(u8, arch, "gemma"),
+        .rope_freq_base_swa = archF32(gf, arch, "rope.freq_base_swa", 0),
     };
 }
 
@@ -705,6 +748,8 @@ fn resolveLayerTensors(gf: *const gguf.GGUFFile, allocator: std.mem.Allocator, n
             .ffn_gate = findLayerTensor(gf, layer, "ffn_gate.weight"),
             .ffn_up = findLayerTensor(gf, layer, "ffn_up.weight"),
             .ffn_down = findLayerTensor(gf, layer, "ffn_down.weight"),
+            .post_ffw_norm = findLayerTensor(gf, layer, "post_ffw_norm.weight"),
+            .pre_ffw_norm_2 = findLayerTensor(gf, layer, "pre_ffw_norm_2.weight"),
             .ffn_gate_inp = findLayerTensor(gf, layer, "ffn_gate_inp.weight"),
             .ffn_gate_exps = findLayerTensor(gf, layer, "ffn_gate_exps.weight"),
             .ffn_up_exps = findLayerTensor(gf, layer, "ffn_up_exps.weight"),
@@ -738,8 +783,11 @@ fn buildRopeInvFreqs(
     allocator: std.mem.Allocator,
     arch: []const u8,
     cfg: CpuModelConfig,
+    freq_base: f32,
+    rope_dim_override: u32,
 ) ![]f32 {
-    const half_rot: usize = @intCast(@max(cfg.rope_dim, 2) / 2);
+    const rope_dim = if (rope_dim_override > 0) rope_dim_override else cfg.rope_dim;
+    const half_rot: usize = @intCast(@max(rope_dim, 2) / 2);
     const freqs = try allocator.alloc(f32, half_rot);
     errdefer allocator.free(freqs);
 
@@ -757,11 +805,11 @@ fn buildRopeInvFreqs(
     const rope_full_dim: f32 = if (section_pairs > 0)
         @floatFromInt(section_pairs * 2)
     else
-        @floatFromInt(cfg.rope_dim);
+        @floatFromInt(rope_dim);
 
     for (freqs, 0..) |*freq, i| {
         const exponent = @as(f32, @floatFromInt(2 * i)) / rope_full_dim;
-        freq.* = 1.0 / std.math.pow(f32, cfg.rope_freq_base, exponent);
+        freq.* = 1.0 / std.math.pow(f32, freq_base, exponent);
     }
     return freqs;
 }
@@ -1641,6 +1689,10 @@ fn scalarEvalTokenDense(
     const cfg = model.config;
     const safe_id = @min(token_id, cfg.vocab_size -| 1);
     try dequant.row(model.tensorData(model.embed_info), safe_id, cfg.hidden_dim, model.embed_info.type_, state.hidden);
+    if (cfg.is_gemma) {
+        const scale: f32 = @floatCast(@sqrt(@as(f64, @floatFromInt(cfg.hidden_dim))));
+        for (state.hidden) |*v| v.* *= scale;
+    }
 
     for (model.layer_tensors, 0..) |lt, li| {
         const layer: u32 = @intCast(li);
@@ -1693,6 +1745,13 @@ fn runDenseFfnLayer(
 
     // down: project intermediate back to hidden and add to the layer residual.
     try matvecTensor(state.pool, model, down_t, state.swiglu[0..inter], cfg.hidden_dim, state.row_scratch, state.down);
+    // Gemma applies post_ffw_norm to the FFN output before merging into the
+    // residual stream.
+    if (cfg.is_gemma) {
+        if (lt.post_ffw_norm) |pfn| {
+            try rmsNormTensor(model, pfn, state.down, state.down, state.row_scratch);
+        }
+    }
     for (state.hidden, state.down) |*h, v| h.* += v;
 }
 
@@ -1779,16 +1838,31 @@ fn scalarEvalToken(
     const cfg = model.config;
     const safe_id = @min(token_id, cfg.vocab_size -| 1);
     try dequant.row(model.tensorData(model.embed_info), safe_id, cfg.hidden_dim, model.embed_info.type_, state.hidden);
+    // Gemma scales embeddings by sqrt(hidden_dim) so per-layer norm scales line
+    // up with how the weights were trained.
+    if (cfg.is_gemma) {
+        const scale: f32 = @floatCast(@sqrt(@as(f64, @floatFromInt(cfg.hidden_dim))));
+        for (state.hidden) |*v| v.* *= scale;
+    }
 
     for (model.layer_tensors, 0..) |lt, li| {
         const layer: u32 = @intCast(li);
         try rmsNormTensor(model, lt.attn_norm.?, state.hidden, state.norm, state.row_scratch);
-        if (isFullAttentionLayer(cfg, layer)) {
-            try runAttentionLayer(model, state, lt, layer, position);
-        } else {
+        // SSM blocks only fire when the model actually carries SSM tensors AND
+        // this layer isn't slotted as full-attention by the hybrid interval.
+        const is_ssm_layer = cfg.ssm_d_inner > 0 and !isFullAttentionLayer(cfg, layer);
+        if (is_ssm_layer) {
             try runSsmLayer(model, state, lt, layer);
+        } else {
+            try runAttentionLayer(model, state, lt, layer, position);
         }
-        try runMoeLayer(model, state, lt, direct_compute_tracking);
+        // FFN: dispatch MoE block when expert tensors are present on this layer,
+        // otherwise fall through to the dense gate/up/down path.
+        if (lt.ffn_gate_exps != null) {
+            try runMoeLayer(model, state, lt, direct_compute_tracking);
+        } else {
+            try runDenseFfnLayer(model, state, lt);
+        }
     }
 
     // During prompt ingestion only the final prompt token's logits are consumed
@@ -1858,12 +1932,24 @@ fn runAttentionLayer(
     const cfg = model.config;
     const q_rows: u32 = @intCast(lt.attn_q.?.numElements() / cfg.hidden_dim);
     const k_rows: u32 = @intCast(lt.attn_k.?.numElements() / cfg.hidden_dim);
-    const v_rows: u32 = @intCast(lt.attn_v.?.numElements() / cfg.hidden_dim);
-    const layer_head_dim = cfg.head_dim;
+    const has_v = lt.attn_v != null;
+    const v_rows: u32 = if (has_v) @intCast(lt.attn_v.?.numElements() / cfg.hidden_dim) else k_rows;
+    // Gemma layers mix per-layer head_dim (SWA vs global). The norm tensors
+    // carry the layer's actual head_dim — use it when present so rmsNormHeads
+    // and RoPE see consistent sizes.
+    const layer_head_dim: u32 = if (lt.attn_q_norm) |qn|
+        @intCast(qn.numElements())
+    else if (lt.attn_k_norm) |kn|
+        @intCast(kn.numElements())
+    else
+        cfg.head_dim;
     const layer_rope_dim = @min(if (cfg.rope_dim > 0) cfg.rope_dim else layer_head_dim, layer_head_dim);
     const layer_n_kv_heads = if (layer_head_dim > 0) k_rows / layer_head_dim else cfg.n_kv_heads;
     const packed_q_gate = q_rows == cfg.q_dim * 2;
     const active_q_rows = if (packed_q_gate) q_rows / 2 else q_rows;
+    // Gemma SWA vs global have different n_q_heads even within the same model;
+    // recover it from the Q row count so rmsNormHeads/applyRope use the right stride.
+    const layer_n_heads: u32 = if (layer_head_dim > 0) active_q_rows / layer_head_dim else cfg.n_heads;
 
     // q/(gate)/k/v all project `attn_norm` — fuse into one pool dispatch so the
     // attention layer takes one barrier instead of one + two main-thread serial
@@ -1884,24 +1970,42 @@ fn runAttentionLayer(
         }
         parts[n] = .{ .info = lt.attn_k.?, .rows = k_rows, .out = state.k[0..k_rows] };
         n += 1;
-        parts[n] = .{ .info = lt.attn_v.?, .rows = v_rows, .out = state.v[0..v_rows] };
-        n += 1;
+        if (has_v) {
+            parts[n] = .{ .info = lt.attn_v.?, .rows = v_rows, .out = state.v[0..v_rows] };
+            n += 1;
+        }
         try matvecFusedTensors(state.pool, model, parts[0..n], state.norm, state.row_scratch);
     }
+    // Gemma global-attention layers omit attn_v entirely; the original projection
+    // reused K as V. Mirror that by snapshotting pre-RoPE K into the V buffer.
+    if (!has_v) @memcpy(state.v[0..v_rows], state.k[0..k_rows]);
     if (packed_q_gate) {
-        deinterleaveQGate(state.q_full[0..q_rows], state.q[0..active_q_rows], state.gate[0..active_q_rows], layer_head_dim, cfg.n_heads);
+        deinterleaveQGate(state.q_full[0..q_rows], state.q[0..active_q_rows], state.gate[0..active_q_rows], layer_head_dim, layer_n_heads);
     }
 
-    if (lt.attn_q_norm) |q_norm| try rmsNormHeads(model, q_norm, state.q[0..active_q_rows], layer_head_dim, cfg.n_heads);
+    // Gemma 4 unit-norms V per head before storing into the KV cache. When
+    // attn_v is missing (global layer), V was just snapshotted from raw K above;
+    // when present, V already lives in state.v from its own projection.
+    if (cfg.is_gemma and cfg.rope_freq_base_swa > 0) {
+        applyVUnitNormPerHead(state.v[0..v_rows], layer_head_dim, layer_n_kv_heads, cfg.rms_norm_eps);
+    }
+
+    if (lt.attn_q_norm) |q_norm| try rmsNormHeads(model, q_norm, state.q[0..active_q_rows], layer_head_dim, layer_n_heads);
     if (lt.attn_k_norm) |k_norm| try rmsNormHeads(model, k_norm, state.k[0..k_rows], layer_head_dim, layer_n_kv_heads);
-    applyRope(state.q[0..active_q_rows], layer_head_dim, layer_rope_dim, cfg.n_heads, position, model.rope_inv_freq);
-    applyRope(state.k[0..k_rows], layer_head_dim, layer_rope_dim, layer_n_kv_heads, position, model.rope_inv_freq);
+    // Gemma SWA layers (layer_head_dim < cfg.head_dim) use a separate RoPE
+    // freq base; global layers use the standard base.
+    const inv_freq_for_layer: []const f32 = if (cfg.is_gemma and model.rope_inv_freq_swa != null and layer_head_dim < cfg.head_dim)
+        model.rope_inv_freq_swa.?
+    else
+        model.rope_inv_freq;
+    applyRope(state.q[0..active_q_rows], layer_head_dim, layer_rope_dim, layer_n_heads, position, inv_freq_for_layer);
+    applyRope(state.k[0..k_rows], layer_head_dim, layer_rope_dim, layer_n_kv_heads, position, inv_freq_for_layer);
 
     const kv_off = state.kvOffset(cfg, layer, position);
     @memcpy(state.kv_k[kv_off..][0..k_rows], state.k[0..k_rows]);
     @memcpy(state.kv_v[kv_off..][0..v_rows], state.v[0..v_rows]);
 
-    try flashAttentionCpu(model, state, layer, position, layer_head_dim, layer_n_kv_heads);
+    try flashAttentionCpu(model, state, layer, position, layer_head_dim, layer_n_kv_heads, layer_n_heads);
     if (packed_q_gate or lt.attn_gate != null) {
         for (state.attn_out[0..active_q_rows], state.gate[0..active_q_rows]) |*out, gate| {
             out.* *= sigmoid(gate);
@@ -1909,6 +2013,13 @@ fn runAttentionLayer(
     }
 
     try matvecTensor(state.pool, model, lt.attn_output.?, state.attn_out[0..active_q_rows], cfg.hidden_dim, state.row_scratch, state.branch);
+    // Gemma applies post_attention_norm to the projected attention output
+    // before merging it into the residual stream.
+    if (cfg.is_gemma) {
+        if (lt.post_attention_norm) |pan| {
+            try rmsNormTensor(model, pan, state.branch, state.branch, state.row_scratch);
+        }
+    }
     for (state.hidden, state.branch) |*h, b| h.* += b;
 }
 
@@ -4833,6 +4944,34 @@ fn readTensorFlat(raw: []const u8, tensor_type: gguf.GGMLType, output: []f32) !v
     try dequant.row(raw, 0, @intCast(output.len), tensor_type, output);
 }
 
+/// Gemma 4 normalizes V vectors per head with unit weights (no learned scale)
+/// before they enter the KV cache. Equivalent to `x / rms(x)` per head.
+fn applyVUnitNormPerHead(data: []f32, head_dim: u32, n_heads: u32, eps: f32) void {
+    const head_dim_usize: usize = @intCast(head_dim);
+    for (0..n_heads) |h| {
+        const head = data[h * head_dim_usize ..][0..head_dim_usize];
+        const inv = rmsNormInvRms(head, eps);
+        const Vec16f = @Vector(16, f32);
+        const inv_v: Vec16f = @splat(inv);
+        var i: usize = 0;
+        while (i + 64 <= head.len) : (i += 64) {
+            const x0: Vec16f = head[i..][0..16].*;
+            const x1: Vec16f = head[i + 16 ..][0..16].*;
+            const x2: Vec16f = head[i + 32 ..][0..16].*;
+            const x3: Vec16f = head[i + 48 ..][0..16].*;
+            head[i..][0..16].* = x0 * inv_v;
+            head[i + 16 ..][0..16].* = x1 * inv_v;
+            head[i + 32 ..][0..16].* = x2 * inv_v;
+            head[i + 48 ..][0..16].* = x3 * inv_v;
+        }
+        while (i + 16 <= head.len) : (i += 16) {
+            const x: Vec16f = head[i..][0..16].*;
+            head[i..][0..16].* = x * inv_v;
+        }
+        while (i < head.len) : (i += 1) head[i] = head[i] * inv;
+    }
+}
+
 fn deinterleaveQGate(src: []const f32, q: []f32, gate: []f32, head_dim: u32, n_heads: u32) void {
     for (0..n_heads) |h| {
         const src_head = src[h * head_dim * 2 ..][0 .. head_dim * 2];
@@ -4927,11 +5066,12 @@ fn flashAttentionCpu(
     position: u32,
     head_dim: u32,
     n_kv_heads: u32,
+    n_q_heads: u32,
 ) !void {
     const cfg = model.config;
-    const q_per_kv = @max(cfg.n_heads / @max(n_kv_heads, 1), 1);
+    const q_per_kv = @max(n_q_heads / @max(n_kv_heads, 1), 1);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-    for (0..cfg.n_heads) |h| {
+    for (0..n_q_heads) |h| {
         const kv_head = h / q_per_kv;
         const q_head = state.q[h * head_dim ..][0..head_dim];
         var max_score: f32 = -std.math.inf(f32);
