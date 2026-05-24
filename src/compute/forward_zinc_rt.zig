@@ -42,6 +42,10 @@ pub const Model = struct {
     /// Parallel inv_freq table built from rope_freq_base_swa for Gemma SWA
     /// layers. Null when the model doesn't carry a SWA base.
     rope_inv_freq_swa: ?[]f32,
+    /// Per-layer scalar applied to the layer output before the next layer
+    /// reads it. Gemma 4 carries `blk.N.layer_output_scale.weight` (size 1).
+    /// Null when the model doesn't ship them; treat as 1.0 in that case.
+    layer_output_scales: ?[]f32,
     attn_sinks: []f32,
     ssm_conv1d_kernels: []?[]f32,
     embed_info: gguf.TensorInfo,
@@ -168,6 +172,38 @@ pub const Model = struct {
         }
         const rope_inv_freq = try buildRopeInvFreqs(&gf, allocator, arch, config, config.rope_freq_base, 0);
         errdefer allocator.free(rope_inv_freq);
+        // Gemma 4 global layers consume the proportional rope_freqs.weight
+        // divisor. Applied only to the global table; SWA layers keep raw inv_freq.
+        if (config.is_gemma) applyRopeFreqFactors(mmap_data, &gf, rope_inv_freq);
+
+        // Per-layer output scales for Gemma 4 (`blk.N.layer_output_scale.weight`).
+        // Default to 1.0 when absent; only allocate when at least one is non-trivial.
+        const layer_output_scales: ?[]f32 = if (config.is_gemma) blk: {
+            const scales = try allocator.alloc(f32, config.n_layers);
+            errdefer allocator.free(scales);
+            var any_nontrivial = false;
+            for (0..config.n_layers) |li| {
+                scales[li] = 1.0;
+                var name_buf: [128]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "blk.{d}.layer_output_scale.weight", .{li}) catch continue;
+                for (gf.tensors.items) |ti| {
+                    if (!std.mem.eql(u8, ti.name, name)) continue;
+                    if (ti.type_ != .f32) break;
+                    const off = gf.tensor_data_offset + ti.offset;
+                    if (off + @sizeOf(f32) > mmap_data.len) break;
+                    const ptr: *const f32 = @ptrCast(@alignCast(mmap_data.ptr + off));
+                    scales[li] = ptr.*;
+                    if (scales[li] != 1.0) any_nontrivial = true;
+                    break;
+                }
+            }
+            if (!any_nontrivial) {
+                allocator.free(scales);
+                break :blk null;
+            }
+            break :blk scales;
+        } else null;
+        errdefer if (layer_output_scales) |s| allocator.free(s);
         // Gemma 4 SWA layers carry a smaller per-layer head_dim than the model
         // metadata's `attention.key_length`; the SWA RoPE table must use that
         // smaller head_dim for the exponent normalization.
@@ -329,6 +365,7 @@ pub const Model = struct {
             .layer_tensors = layer_tensors,
             .rope_inv_freq = rope_inv_freq,
             .rope_inv_freq_swa = rope_inv_freq_swa,
+            .layer_output_scales = layer_output_scales,
             .attn_sinks = attn_sinks,
             .ssm_conv1d_kernels = ssm_conv1d_kernels,
             .embed_info = embed_info,
@@ -377,6 +414,7 @@ pub const Model = struct {
         freeLayerF32Cache(self.allocator, self.ssm_conv1d_kernels);
         self.allocator.free(self.rope_inv_freq);
         if (self.rope_inv_freq_swa) |swa| self.allocator.free(swa);
+        if (self.layer_output_scales) |s| self.allocator.free(s);
         self.allocator.free(self.layer_tensors);
         self.allocator.free(self.final_norm_weight);
         self.gguf_file.deinit();
@@ -824,6 +862,31 @@ fn buildRopeInvFreqs(
         freq.* = 1.0 / std.math.pow(f32, freq_base, exponent);
     }
     return freqs;
+}
+
+/// Gemma 4 global-attention layers carry a `rope_freqs.weight` tensor that
+/// proportionally rescales each inv_freq entry (long-context positional
+/// stretching). Vulkan applies the same divisor at forward.zig:1707. The
+/// SWA inv_freq table is left untouched.
+fn applyRopeFreqFactors(
+    mmap_data: []align(std.heap.page_size_min) const u8,
+    gf: *const gguf.GGUFFile,
+    freqs: []f32,
+) void {
+    for (gf.tensors.items) |ti| {
+        if (!std.mem.eql(u8, ti.name, "rope_freqs.weight")) continue;
+        if (ti.type_ != .f32) return;
+        const off = gf.tensor_data_offset + ti.offset;
+        const n_factors = @min(@as(usize, @intCast(ti.numElements())), freqs.len);
+        for (0..n_factors) |k| {
+            const factor_off = off + k * @sizeOf(f32);
+            if (factor_off + @sizeOf(f32) > mmap_data.len) break;
+            const factor: f32 = @as(*const f32, @ptrCast(@alignCast(mmap_data.ptr + factor_off))).*;
+            if (factor != 0.0) freqs[k] /= factor;
+        }
+        log.info("Gemma 4 RoPE freq factors applied to global table ({d} entries)", .{n_factors});
+        return;
+    }
 }
 
 fn buildAttentionSinks(
@@ -1713,6 +1776,12 @@ fn scalarEvalTokenDense(
         try rmsNormTensor(model, lt.attn_norm.?, state.hidden, state.norm, state.row_scratch);
         try runAttentionLayer(model, state, lt, layer, position);
         try runDenseFfnLayer(model, state, lt);
+        if (model.layer_output_scales) |scales| {
+            const scale = scales[li];
+            if (scale != 1.0) {
+                for (state.hidden) |*v| v.* *= scale;
+            }
+        }
     }
 
     if (!need_logits) {
@@ -1880,6 +1949,13 @@ fn scalarEvalToken(
             try runMoeLayer(model, state, lt, direct_compute_tracking);
         } else {
             try runDenseFfnLayer(model, state, lt);
+        }
+        // Gemma 4 layer_output_scale: hidden *= scalar before the next layer.
+        if (model.layer_output_scales) |scales| {
+            const scale = scales[li];
+            if (scale != 1.0) {
+                for (state.hidden) |*v| v.* *= scale;
+            }
         }
     }
 
