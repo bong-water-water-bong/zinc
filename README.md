@@ -108,9 +108,9 @@ ZINC builds an inference engine tuned for the hardware you actually have.
 
 The list below matches the current managed model catalog, not a broader wishlist.
 
+- [Qwen 3.5 9B Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) — supported on AMD RDNA4 16/32 GB, Apple Silicon, and Intel Arc
 - [Qwen3.6 35B-A3B UD Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 - [Qwen3.6 27B Dense Q4_K_M](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) — experimental on AMD RDNA4 32 GB and Apple Silicon
-- [Qwen 3.5 9B Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 - [Gemma 4 31B Q4_K_M](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 - [Gemma 4 26B-A4B MoE Q4_K_M](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 
