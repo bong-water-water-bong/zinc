@@ -1,8 +1,8 @@
 # ZINC_RT — The ZINC Runtime
 
-**Status:** Design proposal; M0 scaffolding in tree (`src/zinc_rt/`, `forward_zinc_rt.zig`, T1 KFD probe wired into the benchmark autopilot)
+**Status:** M0 shipped; M1 in progress — host-assisted scalar decode landing on R9700 at ~80 tok/s (vs Vulkan 115 tok/s) with two PM4 validation probes on the hot-path edge. Effort 15 is frozen at the scalar plateau pending a real direct DMMV row-range kernel (see §1.A and §25.3 below).
 **Audience:** AI coding agents executing on this design; senior contributors reviewing it
-**Last updated:** 2026-05-18
+**Last updated:** 2026-05-24
 **Owner:** ZINC core
 **Primary target:** AMD RDNA4 (Radeon AI PRO R9700, RX 9070 family). Portable path to RDNA3 first, Intel Arc Xe2 and NVIDIA later. **Apple Silicon Metal is folded in as a tier.**
 
@@ -21,6 +21,7 @@ This document is long on purpose. It is meant to be executable by a coding agent
 | § | Title | What it answers |
 |---|---|---|
 | 1 | Executive Summary | One page — what ZINC_RT is and why |
+| 1.A | **Implementation Snapshot (2026-05-24)** | **What is actually in tree today: shipped, scaffolded, missing** |
 | 2 | The Problem | Why Vulkan is the wrong abstraction for ZINC's hot path |
 | 3 | Performance Targets | Concrete, falsifiable numbers we commit to |
 | 4 | Non-Goals | What ZINC_RT is **not** trying to be |
@@ -81,12 +82,69 @@ The expected final state for Qwen 3.6 35B-A3B on R9700, decode steady state with
 | State | Decode tok/s (per slot) | Aggregate tok/s | BW utilization |
 |---|---:|---:|---:|
 | Today (Vulkan) | 117 | ~432 | 31 % |
-| ZINC_RT M1 (single-submit, T2 UMQ) | 145 | 580 | 39 % |
-| ZINC_RT M3 (CB scheduler + paged KV v2) | 195 | 780 | 52 % |
-| ZINC_RT M5 (full megakernel) | 240 | **960** | 65 % |
+| **Today (ZINC_RT scalar M1, 2026-05-24, *host-assisted shortcut*)** | **80** | n/a (single-tenant only) | ~22 % |
+| ZINC_RT M1 (single-submit, T2 UMQ) — target | 145 | 580 | 39 % |
+| ZINC_RT M3 (CB scheduler + paged KV v2) — target | 195 | 780 | 52 % |
+| ZINC_RT M5 (full megakernel) — target | 240 | **960** | 65 % |
 | Theoretical bandwidth ceiling | 365 | 1460 | 100 % |
 
+> The 80 tok/s ZINC_RT scalar number is **not** a like-for-like comparison with Vulkan: it caps LM-head to 4096/248320 rows, clamps MoE top-k to 0 after prefill, and the per-step decode budget is bounded at 8 tokens by default (`ZINC_RT_MAX_DECODE_TOKENS` overrides). It establishes that the host-assisted path is functional and emits coherent text on Qwen 3.6 / Qwen 3 / Gemma 4 — it does not yet justify the M1 exit criterion. See §1.A and `loops/efforts/MULTI_HOUR_EFFORT_15_ZINC_RT_DIRECT_DECODE_120TPS.md`.
+
 ZINC_RT is RDNA-first, but its IR is hardware-vendor-neutral. M7 brings up Intel Arc as a direct-submission tier. M8 brings up NVIDIA via the CUDA Driver API + CUDA Graphs. The Vulkan backend remains the supported fallback for anything ZINC_RT doesn't yet have a direct tier for, and remains a first-class CI target indefinitely.
+
+---
+
+## 1.A Implementation Snapshot — 2026-05-24
+
+This section is the ground truth of what is in tree *today*, ahead of every aspirational statement in the rest of the doc. The phased milestones in §25 describe the plan; this section describes what has shipped.
+
+### 1.A.1 What is in tree and exercised on every run
+
+* **`src/zinc_rt/lib.zig`** — public surface: `Engine`, `Tier`, ring backends, IR, kernels, kmd, `FastPool`. Stable enough that the Zig docgen audit passes with zero outstanding issues (commit `398671f`).
+* **`src/zinc_rt/engine.zig`** — `Engine.autoTier()` probes T2 UMQ → T1 KFD → T-CPU. Non-Linux always returns `.t_cpu`. `ZINC_RT_TIER` env var forces a tier.
+* **`src/zinc_rt/main.zig`** — standalone CLI entrypoint (`zig build run-zinc-rt -- --prompt ...`) supporting `--model`, `--max-tokens`, `--chat`, `--probe-tier`. Drives both the scalar smoke path and `forward_zinc_rt` model loading.
+* **`src/zinc_rt/ir/{op,graph,verify}.zig`** — 28 stable opcodes (full table in Appendix B), flat DAG builder, immutable after construction, max 8 bindings per node.
+* **`src/zinc_rt/ring/cpu.zig`** — T-CPU reference backend (M0 done). Executes packets synchronously through pure Zig kernels. This is the validation oracle for every GPU tier.
+* **`src/zinc_rt/isa/cpu_zig/`** — 14 CPU kernels: `embed`, `rms_norm`, `residual_rms_norm`, `rope`, `flash_attn`, `swiglu`, `sigmoid_mul`, `vadd`, `moe_gate_topk`, `lm_head`, `argmax`, `dequant` (shared GGML row + Q4_0/Q8_0 dot loops), `matvec`, plus the `mod.zig` glue.
+* **`src/zinc_rt/fast_pool.zig`** — persistent worker pool for decode matvec fan-out. Atomic-only dispatch, no heap/mutex traffic. Measured worth ~2–5 tok/s vs `std.Thread.Pool` on the scalar path; `ZINC_RT_FAST_POOL=0` disables.
+* **`src/compute/forward_zinc_rt.zig`** — ~5 600 lines. Bridges `forward.zig`'s model loading and tokenizer into ZINC_RT. **First-class models today:** Qwen 3.6 35B-A3B (MoE + F32 SSM hybrid), Qwen 3.6 27B (dense), Qwen 3 8B / 14B / 32B (dense), Gemma 4 (MoE + GELU activation, per-layer output scales, SWA RoPE).
+
+### 1.A.2 What is scaffolded but not on the model-value hot path
+
+* **`src/zinc_rt/ring/kfd.zig` (T1)** — full KFD UAPI: queue create/destroy, GEM, VA, doorbell alloc. Smoke-tested on R9700 RDNA4 with two tiny gfx1201 kernels (`argmax_top2_gfx1201`, `rms_norm_elem0_gfx1201`) reachable via `src/zinc_rt/ring/cs.zig`. These dispatches prove PM4 packets, SGPR user data, memory visibility, and fence ordering. They do **not** touch model weights — see `loops/efforts/MULTI_HOUR_EFFORT_15_*.md` §"GPU Opcode Verdict".
+* **`src/zinc_rt/ring/umq.zig` (T2)** — full AMDGPU `USERQ_CREATE/FREE` and GEM/VA UAPI. The bench node (R9700, Linux 6.17) returns `compute_userq_slots_missing` at admission, so T1 KFD is the active GPU-side path until UMQ exposes compute slots. Kernel version alone is not sufficient.
+* **`src/zinc_rt/ring/{cs,packet,packet_list}.zig`** — PM4 packet builders (`NOP`, `DISPATCH_DIRECT`, `COPY_DATA`, fences). Used by the smoke probes; ready for the first real model-slice kernel.
+* **`src/zinc_rt/kmd.zig`** — AMDGPU capability queries (`queryComputeUserq`) and PM4 constants. Linux-only.
+
+### 1.A.3 What is in the design doc but has zero code yet
+
+* **Direct GPU model decode.** No `dmmv_q4k.s`, no `flash_attn.s`, no router kernel, no megakernel. The next concrete step is a Q4_0/Q8_0 DMMV row-range kernel reachable via T1 that consumes a value the prompt actually uses (effort 15, recommended-next-moves #1).
+* **Continuous-batching scheduler (§18).** Design section is fully written; no `src/zinc_rt/sched/` directory exists. Aggregate-throughput numbers in §3.2 are forecasts only.
+* **Paged KV v2 (§19).** Design section is written; no `src/zinc_rt/mem/pagetable.zig` exists.
+* **T-Metal tier (§16).** Apple Silicon still ships via the standalone `src/metal/` + `src/compute/forward_metal.zig` path. The fold-in to ZINC_RT has not started. The standalone Metal backend remains a first-class build target via `-Dbackend=metal`.
+* **T-Intel (§22, M7) and T-CUDA (§22, M8).** Planning posts exist (`site/src/content/posts/2026-05-18-intel-arc-pro-b70-deep-dive-and-zincs-t-intel-plan.md`); no `src/zinc_rt/ring/i915.zig`, `src/zinc_rt/ring/cuda.zig`, or `src/zinc_rt/isa/{xe2hpg,sm_90}/` exist.
+* **`forward.zig`-to-IR lowering** (§9.5). `forward_zinc_rt.zig` exists but does not yet emit IR packets across the full graph — it largely calls into the host-assisted runtime and CPU kernels directly. A real `IrBuilder` walk that produces a per-token `PacketBatch` consumed by `RingBackend.submit` is the structural prerequisite for M1's "one submit per token."
+
+### 1.A.4 Recent changes worth knowing about (since 2026-05-18)
+
+* **Gemma 4 MoE enablement (`aac5ded`, `dc9f758`, `5049157`, `7c06b65`).** GELU activation plumbed through `runMoeLayer`, `runMoeExpert`, `runSharedExpertOnly`, `runMoeExpertsParallel`, `MoeExpertWorker`, `runMoeExpertsParallelPhased`. `cfg.is_gemma` carries the flag; non-Gemma archs continue to use SwiGLU. Per-layer `layer_output_scale`, `rope_freqs.weight` proportional RoPE, `ZINC_GEMMA4_ATTN_SCALE_DEFAULT` escape hatch. BOS handling and `encodeGemmaChat` chat templating (`<start_of_turn>`/`<end_of_turn>` for Gemma 2/3, `<|turn>`/`<turn|>` for Gemma 4).
+* **Qwen 3.6 27B dense (`28ca228`).** Dense (non-MoE) variant landed alongside the hybrid MoE+SSM 35B-A3B path.
+* **Decode-budget escape hatch.** `m0_max_decode_tokens` now reads `ZINC_RT_MAX_DECODE_TOKENS`. Default remains 8 so existing perf A/B comparisons stay valid; coherence smoke runs can request the full prompt budget.
+* **API docs (`398671f`).** Every public top-level symbol and method across `src/zinc_rt/` + the `src/compute/forward_zinc_rt.zig` bridge now carries Zig docgen comment blocks under `@section "Inference Runtime"` / `"CLI & Entrypoints"`. Used by the `zig-docgen` skill / `tools/` to produce HTML/JSON/text/llms exports.
+
+### 1.A.5 Operational knobs that exist today
+
+| Env var | Default | Effect |
+|---|---|---|
+| `ZINC_RT_TIER` | `auto` | Force `t1`, `t2`, `t_cpu` (no `t_metal` yet) |
+| `ZINC_RT_CPU_WORKERS` | 4 | Worker count for `FastPool`; 2 is too few, 4–6 is the sweet spot on Zen 4 |
+| `ZINC_RT_FAST_POOL` | 1 | Set `0` to fall back to `std.Thread.Pool` (~2–5 tok/s worse) |
+| `ZINC_RT_LM_HEAD_ROWS` | 4096 | Cap LM-head rows scanned per step; 0 = full 248 320 vocab (~3.5–4.3 ms/token cost) |
+| `ZINC_RT_MAX_DECODE_TOKENS` | 8 | Per-step decode-token clamp; raise to 256+ for real coherence runs |
+| `ZINC_QWEN36_DECODE_TOPK` | metadata | Override MoE top-k after prefill; 0 is the current shortcut |
+| `ZINC_GEMMA4_ATTN_SCALE_DEFAULT` | model-dependent | Per-Gemma 4 attention scale override |
+
+Honest reporting in any benchmark run must surface `model_execution`, `direct_compute_ops`, `direct_compute_kind`, and whether the decode budget was clamped — a clamped 8-token result is M1 validation, not M2 performance.
 
 ---
 
@@ -989,20 +1047,29 @@ T-CPU is the first tier delivered (M0) and the most important one nobody runs in
 
 ### 15.1 Implementation
 
-`src/zinc_rt/ring/cpu.zig` walks the packet stream and executes each dispatch on the CPU. Each IR opcode has a hand-written Zig function in `src/zinc_rt/isa/cpu_zig/`:
+`src/zinc_rt/ring/cpu.zig` walks the packet stream and executes each dispatch on the CPU. Each IR opcode has a hand-written Zig function in `src/zinc_rt/isa/cpu_zig/`.
+
+**As of 2026-05-24, the following 14 kernels are in tree:**
 
 ```
 src/zinc_rt/isa/cpu_zig/
-├── rms_norm.zig
-├── rms_norm_fused_qkv.zig
-├── rope.zig
-├── flash_attn.zig
-├── moe_gate_topk.zig
-├── moe_gate_up.zig
-├── ssm_delta_net.zig
-├── lm_head.zig
-└── ...
+├── argmax.zig                  # deterministic top-1
+├── dequant.zig                 # shared GGML row + Q4_0/Q8_0 dot loops
+├── embed.zig                   # token embedding dequant
+├── flash_attn.zig              # decode flash attention
+├── lm_head.zig                 # final projection
+├── matvec.zig                  # scalar matvec
+├── mod.zig                     # glue
+├── moe_gate_topk.zig           # router softmax + top-k
+├── residual_rms_norm.zig       # fused residual add + RMS norm
+├── rms_norm.zig                # plain RMS norm
+├── rope.zig                    # RoPE rotation
+├── sigmoid_mul.zig             # σ(x) * y elementwise
+├── swiglu.zig                  # SiLU(gate) * up
+└── vadd.zig                    # vector add
 ```
+
+Notable absentees that the §25 milestone table and Appendix B promise but are not yet written: `rms_norm_fused_qkv.zig`, `rms_norm_fused_mlp_gate_up.zig`, `rms_norm_fused_rope_kv_write.zig`, `flash_attn_batched.zig`, `moe_gate_up.zig`, `moe_swiglu.zig` (currently inline in `swiglu.zig`), `moe_down_acc.zig`, `shared_expert.zig`, `ssm_conv1d.zig`, `ssm_delta_net.zig`, `ssm_gated_norm.zig`, `kv_write_batched.zig`, `sample.zig`. Today, `src/compute/forward_zinc_rt.zig` calls into the surviving CPU primitives directly (via the host-assisted decode shape) rather than emitting IR opcodes for the missing ones — these gaps are tracked as M1/M2 work in §25.3.
 
 These are written for clarity, not speed. They use plain f32 (no SIMD intrinsics, no threading). A 35B-A3B decode token on T-CPU takes ~30 seconds on a laptop. That's fine — T-CPU is not a performance target.
 
@@ -1021,6 +1088,8 @@ T-CPU is never deleted. It is the foundation. Every IR change starts with a T-CP
 ---
 
 ## 16. T-Metal Tier
+
+> **Status (2026-05-24):** Not started. Apple Silicon production today still goes through the standalone Metal backend (`-Dbackend=metal`, `src/metal/`, `src/compute/forward_metal.zig`, `src/shaders/metal/*.metal`). This section describes the design for the M2 fold-in. The standalone Metal backend remains a permanent first-class build target — see §16.3 below and §24 (Coexistence).
 
 Apple Silicon support is folded into ZINC_RT rather than left as a parallel stack. The current `src/metal/`, `src/compute/forward_metal.zig`, and `src/shaders/metal/` infrastructure becomes the implementation of T-Metal.
 
@@ -1692,17 +1761,17 @@ For each IR opcode:
 
 Each milestone has: scope, exit criteria, expected calendar weeks for one focused engineer, and risk level.
 
-| Milestone | Scope | Exit criterion (Qwen 3.6 35B-A3B, R9700) | Eng-weeks | Risk |
-|---|---|---|---:|---|
-| **M0** | `src/zinc_rt/` scaffolding; IR opcode table; verify pass; **T-CPU tier complete**; `ZINC_RT_TIER=t_cpu` runs end-to-end on a laptop | T-CPU output matches `forward.zig` token-for-token on test suite. Laptop dev workflow works. | 5 | Low |
-| **M1** | T2 UMQ backend; PM4 packet builder; one-submit-per-decode-token; default-on for RDNA + kernel 6.16+ | ≥ 140 tok/s decode, output bit-identical to T-CPU. | 5 | Med |
-| **M2** | T1 KFD-PM4 backend; **T-Metal tier** (folds in existing Metal work); IR-lowering of all decode ops; BAR-backed output ring; chunked prefill | ≥ 165 tok/s decode RDNA; ≥ 250 tok/s prefill (closes hybrid-MoE+SSM gap). Apple Silicon: metal parity. | 7 | Med |
-| **M3** | Continuous-batching scheduler (16 concurrent slots); paged KV v2; prefix caching | ≥ 195 tok/s single-slot, ≥ 760 tok/s aggregate at 4 slots, ≥ 30% prefix hit rate on chat replays. | 5 | Med |
-| **M4** | Hand-written ISA kernels for top-10 ops; WMMA on prefill path; cross-layer prefill fusion | Decode ≥ 220 tok/s; prefill ≥ 350 tok/s. WMMA path activates on RDNA4. | 8 | High |
-| **M5** | Megakernel for decode; persistent input/output rings; zero-submit decode | Decode ≥ 240 tok/s; idle-to-streaming latency < 20 µs. Megakernel survives 100k tokens with no host intervention. | 10 | High |
-| **M6** | Speculative decoding (EAGLE-3 draft); RadixAttention prefix tree; quantized KV via TurboQuant | 1.5× decode speedup on aligned prompts; KV memory −60% at iso-accuracy. | 8 | Med |
-| **M7** | **T-Intel** backend (Xe2); IR vendor-neutral validation; Intel users get a direct-submission tier (Vulkan stays as their fallback) | Qwen 3 8B runs on Intel Arc B770 at ≥ 50 tok/s decode via T-Intel; same model via `-Dbackend=vulkan` keeps working with no regression. | 8 | High |
-| **M8** | **T-CUDA** backend; NVIDIA users get a CUDA Driver API tier (Vulkan stays as their fallback) | NVIDIA path works on at least one consumer card via T-CUDA; `-Dbackend=vulkan` build still passes CI on NVIDIA. | 6 | Med |
+| Milestone | Status (2026-05-24) | Scope | Exit criterion (Qwen 3.6 35B-A3B, R9700) | Eng-weeks | Risk |
+|---|---|---|---|---:|---|
+| **M0** | ✅ Shipped | `src/zinc_rt/` scaffolding; IR opcode table; verify pass; **T-CPU tier complete**; `ZINC_RT_TIER=t_cpu` runs end-to-end on a laptop | T-CPU output matches `forward.zig` token-for-token on test suite. Laptop dev workflow works. | 5 | Low |
+| **M1** | ⚠️ In progress — scalar plateau at ~80 tok/s, gap of 6.4 ms/token to target. Blocking on direct DMMV row-range. See §25.3. | T2 UMQ backend; PM4 packet builder; one-submit-per-decode-token; default-on for RDNA + kernel 6.16+ | ≥ 140 tok/s decode, output bit-identical to T-CPU. | 5 | Med |
+| **M2** | ⏳ Not started | T1 KFD-PM4 backend; **T-Metal tier** (folds in existing Metal work); IR-lowering of all decode ops; BAR-backed output ring; chunked prefill | ≥ 165 tok/s decode RDNA; ≥ 250 tok/s prefill (closes hybrid-MoE+SSM gap). Apple Silicon: metal parity. | 7 | Med |
+| **M3** | ⏳ Not started | Continuous-batching scheduler (16 concurrent slots); paged KV v2; prefix caching | ≥ 195 tok/s single-slot, ≥ 760 tok/s aggregate at 4 slots, ≥ 30% prefix hit rate on chat replays. | 5 | Med |
+| **M4** | ⏳ Not started | Hand-written ISA kernels for top-10 ops; WMMA on prefill path; cross-layer prefill fusion | Decode ≥ 220 tok/s; prefill ≥ 350 tok/s. WMMA path activates on RDNA4. | 8 | High |
+| **M5** | ⏳ Not started | Megakernel for decode; persistent input/output rings; zero-submit decode | Decode ≥ 240 tok/s; idle-to-streaming latency < 20 µs. Megakernel survives 100k tokens with no host intervention. | 10 | High |
+| **M6** | ⏳ Not started | Speculative decoding (EAGLE-3 draft); RadixAttention prefix tree; quantized KV via TurboQuant | 1.5× decode speedup on aligned prompts; KV memory −60% at iso-accuracy. | 8 | Med |
+| **M7** | ⏳ Not started (planning post 2026-05-18) | **T-Intel** backend (Xe2); IR vendor-neutral validation; Intel users get a direct-submission tier (Vulkan stays as their fallback) | Qwen 3 8B runs on Intel Arc B770 at ≥ 50 tok/s decode via T-Intel; same model via `-Dbackend=vulkan` keeps working with no regression. | 8 | High |
+| **M8** | ⏳ Not started | **T-CUDA** backend; NVIDIA users get a CUDA Driver API tier (Vulkan stays as their fallback) | NVIDIA path works on at least one consumer card via T-CUDA; `-Dbackend=vulkan` build still passes CI on NVIDIA. | 6 | Med |
 
 Total: ~62 engineer-weeks to M8. M0–M3 is ~22 weeks and lands the user-facing win. **The Vulkan backend is never removed** — it remains in `src/vulkan/`, `src/compute/forward.zig`, and `src/shaders/*.comp` as a peer of ZINC_RT, kept in CI indefinitely.
 
@@ -1750,6 +1819,30 @@ This is the first PR. It declares the namespace and locks the design.
 * Docs update — this file annotated with achieved numbers
 * Blog post in `writing/` cadence
 
+### 25.3 Where M1 is stuck and what unblocks it
+
+(This subsection is the operational corollary to §1.A and replaces "M1 — predicted 145 tok/s" as the current source of truth for the engineer continuing this work.)
+
+**Symptom.** Cycle 64 of the `loops/zinc_rt_autopilot.ts` overnight A/B reached `vulkan 115.0 tok/s / zinc_rt 80.2 tok/s` (69.7 % parity) and stopped advancing. Decode-only `perf record` shows ~78 % of cycles in `forward_zinc_rt.matvecRawDirectSerial`, i.e. CPU matvec. The two gfx1201 kernels currently reachable from `src/zinc_rt/ring/cs.zig` (`argmax_top2_gfx1201`, `rms_norm_elem0_gfx1201`) prove the PM4 → CP path is wire-correct but touch zero model weights.
+
+**Why scalar tuning is exhausted.** Worker count, FastPool, LM-head row cap, Q4_0 dot unroll, MoE top-k clamp, shared-expert skip, fused worker matvec, and `-Dcpu=znver4` were each measured on R9700 and either regressed median tok/s or broke output coherence. The detailed dead-ends are in `research/ZINC_RT_M1_STALL_2026-05-15.md`. The conclusion is that closing the 2.4× gap to Vulkan requires moving a real model slice off the CPU.
+
+**Recommended next moves (from the effort 15 brief, in order):**
+
+1. **A minimal direct DMMV row-range kernel** on the re-encoded Q4_0 path, lowered via the existing `cs.zig` ABI (SGPR user data for I/O pointers and shape, `DISPATCH_DIRECT`, explicit signal write, CPU compare). First version may compute 1–8 rows; it **must consume the result in the live prompt path**, not as a side-channel probe.
+2. **Prefer an LM-head row-range or router row-range as the first consumed slice.** Router is small and easy to validate but has limited perf upside. LM-head row-range has direct quality/perf significance — full-vocab CPU LM head is the 3.5–4.3 ms/token tax visible at `ZINC_RT_LM_HEAD_ROWS=0`.
+3. **Remove benchmark shortcuts before claiming an M1 win.** A real M1 result must survive `ZINC_RT_LM_HEAD_ROWS=0`, a nonzero `ZINC_QWEN36_DECODE_TOPK`, generated tokens ≥ 128, and at minimum 80 % of the Vulkan decode tok/s on the same node.
+4. **If T2 UMQ is revisited**, it must first prove `USERQ_CREATE` actually returns compute slots on the bench node. Kernel version 6.16+ is necessary but not sufficient: R9700 + Linux 6.17 reports `compute_userq_slots_missing` despite the kernel claiming support.
+5. **If direct DMMV cannot advance**, write a measured-dead report with the exact UAPI/hardware blocker (failed ioctl, invalid PM4 packet, memory visibility failure, shader fault, missing address space, unsupported queue feature). Do not spend another cycle on admission markers without a consumed model value.
+
+The autopilot loop should keep the state as MIGRATE / M1 until **both** conditions hold: the run is shortcut-free enough for quality comparison, and at least one GPU-produced model value is consumed by token generation. tok/s remains visible for monitoring but does not advance the milestone gate.
+
+### 25.4 Currently shippable beyond R9700 / RDNA4
+
+* **Multi-model support.** Qwen 3 (8B, 14B, 32B dense), Qwen 3.6 (27B dense, 35B-A3B hybrid MoE+SSM), Gemma 4 (MoE with GELU, per-layer output scales, SWA RoPE) all run through `forward_zinc_rt.zig` on the host-assisted path. Gemma 4 chat templating (`encodeGemmaChat`) handles both Gemma 2/3 and Gemma 4 instruction-tuned scaffolds.
+* **Apple Silicon dev path.** T-CPU runs on macOS / aarch64 today, slow but functional. The Apple production path is still the standalone Metal backend in `src/metal/` — T-Metal fold-in (§16) is M2 work and has not started.
+* **CLI surface.** `zig build -Dbackend=zinc_rt run -- --prompt "..." --model path/to.gguf [--max-tokens N] [--chat] [--probe-tier]` is the canonical entrypoint for dev and bring-up; it builds `src/zinc_rt/main.zig` and exercises the same code path the autopilot uses.
+
 ---
 
 ## 26. Risks
@@ -1774,13 +1867,14 @@ This is the first PR. It declares the namespace and locks the design.
 
 ## 27. Open Questions
 
-1. **Should T1 or T2 be the steady-state default on M2 ship?** Decide at M2 close based on kernel-version adoption.
+1. **Should T1 or T2 be the steady-state default on M2 ship?** *(Updated 2026-05-24.)* T2 UMQ on R9700 / Linux 6.17 currently fails admission with `compute_userq_slots_missing`, so T1 KFD is the only viable GPU path on the bench node today. Decision is forced toward T1 for the M1/M2 window; revisit when a kernel rev exposes compute slots.
 2. **Q4_K-on-the-fly dequant into WMMA tiles vs pre-dequant to a staging buffer?** Measure.
 3. **Per-slot vs shared MoE expert dispatch in the megakernel?** Profile.
 4. **Should the IR be exposed as a public C ABI?** Defer to M6.
 5. **Default chunk-cap for prefill?** 8192 is a guess; runtime knob with per-(model, GPU) defaults.
 6. **TurboQuant integration timing.** Wired into ZINC_RT's KV path at M6.
 7. **Should the standalone Metal backend keep its build flag indefinitely, or fold into T-Metal completely at some point?** Default: keep `-Dbackend=metal` indefinitely as a peer of `-Dbackend=vulkan`. Revisit at M5 close — if T-Metal has zero regressions for two months, we *can* deprecate the standalone flag, but we don't have to.
+8. **Should `forward_zinc_rt.zig` keep its host-assisted shortcuts after M2?** *(New 2026-05-24.)* The current bridge calls CPU kernels directly rather than emitting a full IR `PacketBatch`. The intent is to flip this once enough opcodes have GPU lowerings to make a full IR walk produce model-correct tokens at the M1 target tok/s. Until then, the shortcuts stay behind env-var knobs (`ZINC_RT_LM_HEAD_ROWS`, `ZINC_QWEN36_DECODE_TOPK`, `ZINC_RT_MAX_DECODE_TOKENS`) and any benchmark must report which were active.
 
 ---
 
