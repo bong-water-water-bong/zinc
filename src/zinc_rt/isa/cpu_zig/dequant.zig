@@ -98,6 +98,38 @@ pub fn row(raw_data: []const u8, row_index: u32, cols: u32, tensor_type: GGMLTyp
                 out_i += 32;
             }
         },
+        .q5_1 => {
+            // Block layout: 2B delta (f16) + 2B min (f16) + 4B qh (1 bit/elt) +
+            // 16B qs (nibbles); 32 5-bit unsigned quants per block.
+            //   y[l]    = (qs[l] & 0xF | xh_0) * d + m
+            //   y[l+16] = (qs[l] >> 4   | xh_1) * d + m
+            // where xh_0 = bit l of qh shifted to bit 4, xh_1 = bit (l+16).
+            if (cols % 32 != 0) return error.UnsupportedShape;
+            const bpb: usize = 24;
+            const bpr = @as(usize, cols) / 32;
+            const row_off = @as(usize, row_index) * bpr * bpb;
+            if (row_off + bpr * bpb > raw_data.len) return error.InputTooSmall;
+
+            var out_i: usize = 0;
+            for (0..bpr) |b| {
+                const bo = row_off + b * bpb;
+                const d_bits = std.mem.readInt(u16, raw_data[bo..][0..2], .little);
+                const d: f32 = @floatCast(@as(f16, @bitCast(d_bits)));
+                const m_bits = std.mem.readInt(u16, raw_data[bo + 2 ..][0..2], .little);
+                const m: f32 = @floatCast(@as(f16, @bitCast(m_bits)));
+                const qh: u32 = std.mem.readInt(u32, raw_data[bo + 4 ..][0..4], .little);
+                const qs = raw_data[bo + 8 .. bo + 24];
+                for (0..16) |l| {
+                    const xh_0: u8 = @intCast(((qh >> @intCast(l)) & 1) << 4);
+                    const xh_1: u8 = @intCast(((qh >> @intCast(l + 16)) & 1) << 4);
+                    const x0: u8 = (qs[l] & 0x0F) | xh_0;
+                    const x1: u8 = (qs[l] >> 4) | xh_1;
+                    output[out_i + l] = @as(f32, @floatFromInt(x0)) * d + m;
+                    output[out_i + l + 16] = @as(f32, @floatFromInt(x1)) * d + m;
+                }
+                out_i += 32;
+            }
+        },
         .q4_k => {
             if (cols % 256 != 0) return error.UnsupportedShape;
             const bpb: usize = 144;

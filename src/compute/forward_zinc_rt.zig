@@ -503,8 +503,11 @@ pub const Model = struct {
             if (lt.attn_norm == null or (lt.ffn_norm == null and lt.post_attention_norm == null)) return false;
 
             // FFN: accept either MoE or dense tensors (route per layer at eval time).
-            const has_moe_layer = lt.ffn_gate_inp != null and lt.ffn_gate_exps != null and
-                lt.ffn_up_exps != null and lt.ffn_down_exps != null;
+            // Gemma 4 MoE uses a fused `ffn_gate_up_exps` tensor instead of
+            // separate gate/up; treat that as a valid MoE shape too.
+            const has_moe_layer = lt.ffn_gate_inp != null and
+                ((lt.ffn_gate_exps != null and lt.ffn_up_exps != null and lt.ffn_down_exps != null) or
+                    (lt.ffn_gate_up_exps != null and lt.ffn_down_exps != null));
             const has_dense_layer = lt.ffn_gate != null and lt.ffn_up != null and lt.ffn_down != null;
             if (!has_moe_layer and !has_dense_layer) return false;
 
@@ -677,6 +680,11 @@ const LayerTensors = struct {
     ffn_up_shexp: ?gguf.TensorInfo = null,
     ffn_down_shexp: ?gguf.TensorInfo = null,
     ffn_gate_inp_shexp: ?gguf.TensorInfo = null,
+    // Gemma 4 MoE: parallel shared MLP + routed experts.
+    ffn_gate_up_exps: ?gguf.TensorInfo = null,
+    ffn_post_norm_1: ?gguf.TensorInfo = null,
+    ffn_post_norm_2: ?gguf.TensorInfo = null,
+    ffn_gate_inp_scale: ?gguf.TensorInfo = null,
     attn_qkv: ?gguf.TensorInfo = null,
     ssm_alpha: ?gguf.TensorInfo = null,
     ssm_beta: ?gguf.TensorInfo = null,
@@ -824,6 +832,10 @@ fn resolveLayerTensors(gf: *const gguf.GGUFFile, allocator: std.mem.Allocator, n
             .ffn_up_shexp = findLayerTensor(gf, layer, "ffn_up_shexp.weight"),
             .ffn_down_shexp = findLayerTensor(gf, layer, "ffn_down_shexp.weight"),
             .ffn_gate_inp_shexp = findLayerTensor(gf, layer, "ffn_gate_inp_shexp.weight"),
+            .ffn_gate_up_exps = findLayerTensor(gf, layer, "ffn_gate_up_exps.weight"),
+            .ffn_post_norm_1 = findLayerTensor(gf, layer, "post_ffw_norm_1.weight"),
+            .ffn_post_norm_2 = findLayerTensor(gf, layer, "post_ffw_norm_2.weight"),
+            .ffn_gate_inp_scale = findLayerTensor(gf, layer, "ffn_gate_inp.scale"),
             .attn_qkv = findLayerTensor(gf, layer, "attn_qkv.weight"),
             .ssm_alpha = findLayerTensor(gf, layer, "ssm_alpha.weight"),
             .ssm_beta = findLayerTensor(gf, layer, "ssm_beta.weight"),
@@ -1021,6 +1033,9 @@ fn buildSmallTensorF32Cache(
             lt.post_attention_norm,
             lt.post_ffw_norm,
             lt.pre_ffw_norm_2,
+            lt.ffn_post_norm_1,
+            lt.ffn_post_norm_2,
+            lt.ffn_gate_inp_scale,
             lt.ssm_norm,
             lt.ssm_dt_bias,
             lt.ssm_a,
@@ -1301,6 +1316,9 @@ const ScalarDecodeState = struct {
     up: []f32,
     swiglu: []f32,
     down: []f32,
+    /// Gemma 4 MoE scratch: holds the shared-MLP output while the routed
+    /// experts overwrite gate/up/swiglu/down. Sized hidden_dim.
+    mlp_save: []f32,
     moe_worker_scratch: []f32,
     moe_worker_gate: []f32,
     moe_worker_up: []f32,
@@ -1365,6 +1383,7 @@ const ScalarDecodeState = struct {
             .up = try allocator.alloc(f32, max_work),
             .swiglu = try allocator.alloc(f32, max_work),
             .down = try allocator.alloc(f32, cfg.hidden_dim),
+            .mlp_save = try allocator.alloc(f32, cfg.hidden_dim),
             .moe_worker_scratch = try allocator.alloc(f32, moe_worker_slots * moe_worker_scratch_stride),
             .moe_worker_gate = try allocator.alloc(f32, moe_worker_slots * moe_worker_inter_stride),
             .moe_worker_up = try allocator.alloc(f32, moe_worker_slots * moe_worker_inter_stride),
@@ -1407,6 +1426,7 @@ const ScalarDecodeState = struct {
         a.free(self.moe_worker_up);
         a.free(self.moe_worker_gate);
         a.free(self.moe_worker_scratch);
+        a.free(self.mlp_save);
         a.free(self.down);
         a.free(self.swiglu);
         a.free(self.up);
@@ -1959,9 +1979,13 @@ fn scalarEvalToken(
         } else {
             try runAttentionLayer(model, state, lt, layer, position);
         }
-        // FFN: dispatch MoE block when expert tensors are present on this layer,
-        // otherwise fall through to the dense gate/up/down path.
-        if (lt.ffn_gate_exps != null) {
+        // FFN: dispatch the right block per layer. Gemma 4 MoE (fused
+        // `ffn_gate_up_exps`) wants the parallel shared-MLP + routed-experts
+        // path; the Qwen-style separate `ffn_gate_exps`/`ffn_up_exps` shape
+        // goes through `runMoeLayer`; everything else is plain dense.
+        if (lt.ffn_gate_up_exps != null and cfg.is_gemma) {
+            try runGemma4MoeLayer(model, state, lt);
+        } else if (lt.ffn_gate_exps != null) {
             try runMoeLayer(model, state, lt, direct_compute_tracking);
         } else {
             try runDenseFfnLayer(model, state, lt);
@@ -3203,6 +3227,109 @@ fn runMoeLayer(
         );
         for (state.hidden, state.down) |*h, v| h.* += sp.scale * v;
     }
+}
+
+/// Gemma 4 MoE forward path. Each layer runs two parallel branches over the
+/// post-attention residual stream: a shared dense MLP (`ffn_gate`/`ffn_up`/
+/// `ffn_down` with GELU, normalized by `post_ffw_norm_1`) and a routed expert
+/// branch (input normalized by `pre_ffw_norm_2`, weights live in fused
+/// `ffn_gate_up_exps` plus `ffn_down_exps`, output normalized by
+/// `post_ffw_norm_2`). The router input is a custom pipeline:
+/// `rms_norm_no_weight(attn_out) * (1/sqrt(hidden_dim)) * ffn_gate_inp.scale`,
+/// then matmul with `ffn_gate_inp` and a top-k softmax. The combined branch
+/// output runs through `post_ffw_norm` and is added back to the saved
+/// `attn_out` residual.
+fn runGemma4MoeLayer(
+    model: *const Model,
+    state: *ScalarDecodeState,
+    lt: LayerTensors,
+) !void {
+    const cfg = model.config;
+    const hidden_dim: u32 = @intCast(cfg.hidden_dim);
+    const shared_inter: u32 = @intCast(cfg.shared_expert_intermediate_dim);
+    const expert_inter: u32 = @intCast(cfg.intermediate_dim);
+
+    const ffn_norm_t = lt.ffn_norm orelse return error.TensorNotFound;
+    const pre_ffw_norm_2_t = lt.pre_ffw_norm_2 orelse return error.TensorNotFound;
+    const post_ffw_norm_1_t = lt.ffn_post_norm_1 orelse return error.TensorNotFound;
+    const post_ffw_norm_2_t = lt.ffn_post_norm_2 orelse return error.TensorNotFound;
+    const post_ffw_norm_t = lt.post_ffw_norm orelse return error.TensorNotFound;
+    const ffn_gate_t = lt.ffn_gate orelse return error.TensorNotFound;
+    const ffn_up_t = lt.ffn_up orelse return error.TensorNotFound;
+    const ffn_down_t = lt.ffn_down orelse return error.TensorNotFound;
+    const ffn_gate_inp_t = lt.ffn_gate_inp orelse return error.TensorNotFound;
+    const ffn_gate_inp_scale_t = lt.ffn_gate_inp_scale orelse return error.TensorNotFound;
+    const ffn_gate_up_exps_t = lt.ffn_gate_up_exps orelse return error.TensorNotFound;
+    const ffn_down_exps_t = lt.ffn_down_exps orelse return error.TensorNotFound;
+
+    // Save attn_out into state.branch (free after the attention block).
+    @memcpy(state.branch, state.hidden);
+
+    // ============ Path A: shared dense MLP ============
+    try rmsNormTensor(model, ffn_norm_t, state.branch, state.ffn_norm, state.row_scratch);
+    try matvecFusedTensors(state.pool, model, &[_]FusedPart{
+        .{ .info = ffn_gate_t, .rows = shared_inter, .out = state.gate[0..shared_inter] },
+        .{ .info = ffn_up_t, .rows = shared_inter, .out = state.up[0..shared_inter] },
+    }, state.ffn_norm, state.row_scratch);
+    geluGate(state.gate[0..shared_inter], state.up[0..shared_inter], state.swiglu[0..shared_inter]);
+    try matvecTensor(state.pool, model, ffn_down_t, state.swiglu[0..shared_inter], hidden_dim, state.row_scratch, state.down);
+    try rmsNormTensor(model, post_ffw_norm_1_t, state.down, state.down, state.row_scratch);
+    @memcpy(state.mlp_save, state.down);
+
+    // ============ Path B: routed MoE ============
+    // Input to the experts: pre_ffw_norm_2(attn_out).
+    try rmsNormTensor(model, pre_ffw_norm_2_t, state.branch, state.ffn_norm, state.row_scratch);
+
+    // Router input pipeline.
+    const router_input = state.norm; // hidden_dim scratch — state.norm is unused until next layer's attn_norm runs.
+    const inv_rms = rmsNormInvRms(state.branch, cfg.rms_norm_eps);
+    const inv_sqrt_n: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)));
+    const gate_inp_scale = model.cachedF32(ffn_gate_inp_scale_t) orelse return error.TensorNotFound;
+    if (gate_inp_scale.len < hidden_dim) return error.ShapeMismatch;
+    for (router_input, state.branch, gate_inp_scale[0..hidden_dim]) |*ri, src, s| {
+        ri.* = src * inv_rms * inv_sqrt_n * s;
+    }
+
+    try matvecTensor(state.pool, model, ffn_gate_inp_t, router_input, cfg.n_experts, state.row_scratch, state.router_logits);
+    const n_used = cfg.n_experts_used;
+    topKSoftmaxCpu(state.router_logits, n_used, state.expert_ids, state.expert_weights);
+
+    // Expert dispatch — per-expert byte strides on the fused gate+up tensor and
+    // the separate down tensor. Each expert's fused slice contains
+    // `expert_inter` gate rows followed by `expert_inter` up rows, both
+    // hidden_dim columns; we matvec each half separately into state.gate /
+    // state.up rather than allocating a 2*inter scratch.
+    const fused_raw = model.tensorData(ffn_gate_up_exps_t);
+    const fused_type = ffn_gate_up_exps_t.type_;
+    const fused_expert_stride = expertSliceBytes(fused_type, 2 * expert_inter, hidden_dim);
+    const fused_gate_half_bytes = expertSliceBytes(fused_type, expert_inter, hidden_dim);
+    const down_raw = model.tensorData(ffn_down_exps_t);
+    const down_type = ffn_down_exps_t.type_;
+    const down_expert_stride = expertSliceBytes(down_type, hidden_dim, expert_inter);
+
+    @memset(state.down, 0);
+    const expert_out = router_input; // reuse router_input scratch (hidden_dim).
+    for (0..n_used) |ei| {
+        const expert_id = state.expert_ids[ei];
+        const w = state.expert_weights[ei];
+        const fused_off: usize = @as(usize, expert_id) * @as(usize, fused_expert_stride);
+        const gate_slice = fused_raw[fused_off..];
+        try matvecRaw(state.pool, gate_slice, fused_type, state.ffn_norm, expert_inter, state.row_scratch, state.gate[0..expert_inter]);
+        const up_slice = fused_raw[fused_off + fused_gate_half_bytes ..];
+        try matvecRaw(state.pool, up_slice, fused_type, state.ffn_norm, expert_inter, state.row_scratch, state.up[0..expert_inter]);
+        geluGate(state.gate[0..expert_inter], state.up[0..expert_inter], state.swiglu[0..expert_inter]);
+        const down_off: usize = @as(usize, expert_id) * @as(usize, down_expert_stride);
+        try matvecRaw(state.pool, down_raw[down_off..], down_type, state.swiglu[0..expert_inter], hidden_dim, state.row_scratch, expert_out);
+        for (state.down, expert_out) |*acc, v| acc.* += w * v;
+    }
+    try rmsNormTensor(model, post_ffw_norm_2_t, state.down, state.down, state.row_scratch);
+
+    // ============ Combine branches and final post-FFN norm ============
+    for (state.down, state.mlp_save) |*acc, mlp| acc.* += mlp;
+    try rmsNormTensor(model, post_ffw_norm_t, state.down, state.down, state.row_scratch);
+
+    // Residual add — state.hidden = saved attn_out + combined branch output.
+    for (state.hidden, state.branch, state.down) |*h, attn, ffn| h.* = attn + ffn;
 }
 
 const direct_router_row_range_max_rows: u32 = 128;
