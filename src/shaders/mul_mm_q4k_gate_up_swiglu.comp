@@ -44,8 +44,13 @@ layout(set = 0, binding = 1) readonly buffer UpA   { uint up_u32[];   };
 layout(set = 0, binding = 2) readonly buffer MatB  { float b_data[];  };
 layout(set = 0, binding = 3) writeonly buffer MatD { float d_data[];  };
 
-shared float buf_gate[BM * STRIDE_A];
-shared float buf_up[BM * STRIDE_A];
+// Stage the dequantized gate/up weight tiles as f16 in LDS to cut this
+// kernel's LDS-limited occupancy (6 subgroups/SIMD at 12800 bytes). Halving the
+// two A tiles brings total LDS ~12672 -> ~8448 bytes. Weights are 4-bit
+// quantized so f16 is well within quantization error; activations (buf_b) and
+// the accumulator stay f32, and the f16->f32 convert folds into v_fma_mix_f32.
+shared float16_t buf_gate[BM * STRIDE_A];
+shared float16_t buf_up[BM * STRIDE_A];
 shared float buf_b[BN * STRIDE_B];
 
 void main() {
@@ -191,8 +196,8 @@ void main() {
 
             const uint base_a = row_local * STRIDE_A + k_in_tile;
             [[unroll]] for (uint i = 0u; i < 16u; i++) {
-                buf_gate[base_a + i] = vals_gate[i];
-                buf_up[base_a + i] = vals_up[i];
+                buf_gate[base_a + i] = float16_t(vals_gate[i]);
+                buf_up[base_a + i] = float16_t(vals_up[i]);
             }
         }
 
@@ -218,8 +223,8 @@ void main() {
         barrier();
 
         [[unroll]] for (uint k = 0u; k < BK; k++) {
-            float gate_reg[TM];
-            float up_reg[TM];
+            float16_t gate_reg[TM];
+            float16_t up_reg[TM];
             [[unroll]] for (uint m = 0u; m < TM; m++) {
                 const uint a_idx = (tiwr * TM + m) * STRIDE_A + k;
                 gate_reg[m] = buf_gate[a_idx];
@@ -229,10 +234,12 @@ void main() {
             [[unroll]] for (uint n = 0u; n < TN; n++) {
                 b_reg[n] = buf_b[(tiwc * TN + n) * STRIDE_B + k];
             }
+            // float(...) on the f16 weight folds into v_fma_mix_f32, so the
+            // accumulator and activations stay full f32 with no extra VALU.
             [[unroll]] for (uint m = 0u; m < TM; m++) {
                 [[unroll]] for (uint n = 0u; n < TN; n++) {
-                    sums_gate[m][n] = fma(gate_reg[m], b_reg[n], sums_gate[m][n]);
-                    sums_up[m][n] = fma(up_reg[m], b_reg[n], sums_up[m][n]);
+                    sums_gate[m][n] = fma(float(gate_reg[m]), b_reg[n], sums_gate[m][n]);
+                    sums_up[m][n] = fma(float(up_reg[m]), b_reg[n], sums_up[m][n]);
                 }
             }
         }
