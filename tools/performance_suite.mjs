@@ -95,6 +95,10 @@ export function parseArgs(argv) {
     rdnaSync: false,
     rdnaBuild: false,
     rdnaStartLlama: false,
+    rdnaVkDevice: process.env.ZINC_RDNA_VK_DEVICE != null
+      ? parseInteger(process.env.ZINC_RDNA_VK_DEVICE, "ZINC_RDNA_VK_DEVICE")
+      : 0,
+    requireRdnaDeviceSubstring: process.env.ZINC_RDNA_REQUIRE_DEVICE_SUBSTRING ?? null,
     intelSync: false,
     intelBuild: false,
     intelStartLlama: false,
@@ -196,6 +200,12 @@ export function parseArgs(argv) {
       case "--rdna-workdir":
         args.rdnaWorkdir = argv[++i] ?? args.rdnaWorkdir;
         break;
+      case "--rdna-vk-device":
+        args.rdnaVkDevice = parseInteger(argv[++i], "--rdna-vk-device");
+        break;
+      case "--require-rdna-device-substring":
+        args.requireRdnaDeviceSubstring = argv[++i] ?? args.requireRdnaDeviceSubstring;
+        break;
       case "--intel-model-root":
         args.intelModelRoot = argv[++i] ?? args.intelModelRoot;
         break;
@@ -251,6 +261,11 @@ function usage() {
   --local-model-root <path>   Override local GGUF cache root
   --rdna-model-root <path>    Override remote model root
   --rdna-workdir <path>       Override remote ZINC checkout path
+  --rdna-vk-device <n>        Vulkan device index on the RDNA node (default 0; env: ZINC_RDNA_VK_DEVICE).
+                              Use 'vulkaninfo --summary' on the node to pick the discrete GPU.
+  --require-rdna-device-substring <s>
+                              Refuse to run if the selected Vulkan device name does not contain <s>
+                              (env: ZINC_RDNA_REQUIRE_DEVICE_SUBSTRING). E.g. 'GFX1201' for R9700.
   --intel-model-root <path>   Override Intel remote model root
   --intel-workdir <path>      Override Intel remote ZINC checkout path
   --intel-xdg-cache-home <p>  Override Intel remote XDG cache home for managed models
@@ -1095,7 +1110,7 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targ
     "--host", "127.0.0.1",
     "--port", String(port),
     "-m", caseDef.model_path,
-    "--device", "Vulkan0",
+    "--device", `Vulkan${creds.vkDevice ?? 0}`,
     "-ngl", "999",
     "--metrics",
     "--ctx-size", "4096",
@@ -1241,6 +1256,7 @@ export function remoteZincCommand(caseDef, creds) {
     "-m",
     shellQuote(caseDef.model_path),
   );
+  if (creds.vkDevice != null) parts.push("-d", String(creds.vkDevice));
   if (caseDef.prompt_mode === "chat") parts.push("--chat");
   parts.push("--prompt", shellQuote(caseDef.prompt));
   return remoteCommand(parts.join(" "), creds);
@@ -1272,7 +1288,7 @@ function remoteLlamaCommand(caseDef, creds, llamaCliPath) {
     "-ngl",
     "999",
     "--device",
-    "Vulkan0",
+    `Vulkan${creds.vkDevice ?? 0}`,
     "--flash-attn",
     "on",
     "-b",
@@ -2069,7 +2085,10 @@ async function runMetalTarget(args) {
         unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
       } : undefined),
     ));
-    models.push(primaryScenarioSummary(entry, scenarios));
+    const summary = primaryScenarioSummary(entry, scenarios);
+    models.push(summary);
+    logModelSummary("metal", summary);
+    await writePartialSnapshot(args, "metal", "Metal", models);
   }
 
   return {
@@ -2129,6 +2148,7 @@ async function buildRdnaCreds(args) {
     port,
     workdir: args.rdnaWorkdir,
     env: { RADV_PERFTEST: "coop_matrix" },
+    vkDevice: args.rdnaVkDevice ?? 0,
   };
 }
 
@@ -2170,9 +2190,46 @@ async function buildIntelConfig(args) {
   };
 }
 
+async function verifyRemoteVulkanDevice(creds, requireSubstring) {
+  const cmd = remoteCommand("vulkaninfo --summary 2>/dev/null || true", creds);
+  const { stdout } = await runShell(cmd, { cwd: ROOT, timeoutMs: 30000 });
+  const blocks = stdout.split(/^GPU(\d+):/m);
+  const devices = [];
+  for (let i = 1; i < blocks.length; i += 2) {
+    const idx = Number(blocks[i]);
+    const body = blocks[i + 1] ?? "";
+    const name = (body.match(/deviceName\s*=\s*(.+)/) ?? [])[1]?.trim() ?? "";
+    const type = (body.match(/deviceType\s*=\s*(\S+)/) ?? [])[1]?.trim() ?? "";
+    devices.push({ idx, name, type });
+  }
+  if (devices.length === 0) {
+    throw new Error("Could not parse vulkaninfo --summary on RDNA node; cannot verify selected device.");
+  }
+  const selected = devices.find((d) => d.idx === creds.vkDevice);
+  const summary = devices.map((d) => `  GPU${d.idx}: ${d.type} ${d.name}`).join("\n");
+  if (!selected) {
+    throw new Error(`Selected Vulkan device index ${creds.vkDevice} not present on RDNA node.\nDetected:\n${summary}`);
+  }
+  if (selected.type !== "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU") {
+    throw new Error(
+      `Refusing to run: Vulkan device ${creds.vkDevice} is ${selected.type} (${selected.name}), not a discrete GPU.\n` +
+      `Detected:\n${summary}\n` +
+      `Pick the discrete GPU with --rdna-vk-device <n> or ZINC_RDNA_VK_DEVICE=<n>.`,
+    );
+  }
+  if (requireSubstring && !selected.name.includes(requireSubstring)) {
+    throw new Error(
+      `Refusing to run: Vulkan device ${creds.vkDevice} name '${selected.name}' does not include required substring '${requireSubstring}'.\n` +
+      `Detected:\n${summary}`,
+    );
+  }
+  process.stdout.write(`[rdna] Vulkan device ${creds.vkDevice}: ${selected.name} (${selected.type})\n`);
+}
+
 async function runRdnaTarget(args) {
   const creds = await buildRdnaCreds(args);
   await prepareRdna(args, creds);
+  await verifyRemoteVulkanDevice(creds, args.requireRdnaDeviceSubstring);
   const rdnaLlamaCli = await detectRdnaLlamaCliPath(creds);
   const rdnaLlamaServer = await detectRdnaLlamaServerPath(creds);
   const baselineBinary = rdnaLlamaServer || rdnaLlamaCli;
@@ -2315,7 +2372,10 @@ async function runRdnaTarget(args) {
         unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
       } : undefined),
     ));
-    models.push(primaryScenarioSummary(entry, scenarios));
+    const summary = primaryScenarioSummary(entry, scenarios);
+    models.push(summary);
+    logModelSummary("rdna", summary);
+    await writePartialSnapshot(args, "rdna", "RDNA", models);
   }
 
   return {
@@ -2502,7 +2562,10 @@ async function runIntelTarget(args) {
         unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
       } : undefined),
     ));
-    models.push(primaryScenarioSummary(entry, scenarios));
+    const summary = primaryScenarioSummary(entry, scenarios);
+    models.push(summary);
+    logModelSummary("intel", summary);
+    await writePartialSnapshot(args, "intel", "Intel Arc", models);
   }
 
   return {
@@ -2556,6 +2619,46 @@ async function writeJson(filepath, data) {
   await fs.writeFile(filepath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
 }
 
+function partialSnapshotPath(outputPath) {
+  return `${outputPath}.partial.json`;
+}
+
+async function writePartialSnapshot(args, targetId, label, models) {
+  if (!args?.output) return;
+  const snapshot = {
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    in_progress: { target: targetId, label, completed_models: models.length },
+    models,
+  };
+  try {
+    await writeJson(partialSnapshotPath(args.output), snapshot);
+  } catch (error) {
+    process.stderr.write(`  (partial snapshot write failed: ${error.message})\n`);
+  }
+}
+
+function fmtTps(value) {
+  return value == null ? "  n/a " : value.toFixed(1).padStart(6);
+}
+
+function logModelSummary(targetId, modelSummary) {
+  const primary = modelSummary.scenarios?.find((s) => s.id === "core") ?? modelSummary.scenarios?.[0];
+  const cmp = primary?.comparison ?? modelSummary.comparison ?? {};
+  const zincPrefill = cmp.zinc_prompt_tps ?? primary?.zinc?.prefill_tps?.median ?? primary?.zinc?.prefill_tps?.avg ?? null;
+  const zincDecode = cmp.zinc_decode_tps ?? primary?.zinc?.decode_tps?.median ?? primary?.zinc?.decode_tps?.avg ?? null;
+  const blPrefill = cmp.baseline_prompt_tps ?? primary?.baseline?.prefill_tps?.median ?? primary?.baseline?.prefill_tps?.avg ?? null;
+  const blDecode = cmp.baseline_decode_tps ?? primary?.baseline?.decode_tps?.median ?? primary?.baseline?.decode_tps?.avg ?? null;
+  const overallPct = cmp.overall_pct_of_baseline ?? cmp.pct_of_baseline ?? null;
+  const overall = overallPct == null ? "  n/a" : `${overallPct.toFixed(1)}%`;
+  process.stdout.write(
+    `  [${targetId}] DONE ${modelSummary.id}: ` +
+    `zinc prefill ${fmtTps(zincPrefill)} / decode ${fmtTps(zincDecode)} | ` +
+    `llama prefill ${fmtTps(blPrefill)} / decode ${fmtTps(blDecode)} | ` +
+    `overall ${overall}\n`,
+  );
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -2591,6 +2694,8 @@ async function main() {
   for (const target of incoming) {
     console.log(`${target.label}: ${target.models.length} model(s), fastest ${(target.summary.fastest_decode_tps ?? 0).toFixed(2)} tok/s`);
   }
+
+  await fs.rm(partialSnapshotPath(args.output), { force: true }).catch(() => {});
 }
 
 if (process.argv[1] === TOOL_PATH) {

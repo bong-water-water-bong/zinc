@@ -27,7 +27,7 @@ const hasQwenSmoke = qwen8bReady && qwen36bReady;
 
 const apiServerReady = managedExists("qwen3-8b-q4k-m")
   || managedExists("gemma4-12b-q4k-m")
-  || managedExists("gpt-oss-20b-q4k-m");
+  || managedExists("gemma4-31b-q4k-m");
 const hasApiSmoke = hasEnv("ZINC_API_BASE_URL") || apiServerReady;
 
 function qwenDetail(): string {
