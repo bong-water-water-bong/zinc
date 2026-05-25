@@ -110,31 +110,6 @@ pub const entries = [_]CatalogEntry{
         },
     },
     .{
-        .id = "gpt-oss-20b-q4k-m",
-        .display_name = "OpenAI GPT-OSS 20B Q4_K_M",
-        .release_date = "2025-06-25",
-        .family = "gpt-oss",
-        .format = "gguf",
-        .quantization = "Q4_K_M",
-        .file_name = "openai_gpt-oss-20b-Q4_K_M.gguf",
-        .homepage_url = "https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF",
-        .download_url = "https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF/resolve/main/openai_gpt-oss-20b-Q4_K_M.gguf?download=true",
-        .sha256 = "86a21df11afa5a40031ec1974e368ae0ab561ee3995f4d08ff432e8b2b7af9fc",
-        .size_bytes = 11_673_418_816,
-        .required_vram_bytes = 14 * 1024 * 1024 * 1024,
-        // GPT-OSS 20B MoE (~3.6B active, ~17B inactive experts) at Q4_K_M ≈ 8 GiB.
-        .offloadable_vram_bytes = 8 * 1024 * 1024 * 1024,
-        .default_context_length = 4096,
-        .recommended_for_chat = true,
-        .thinking_stable = true,
-        .status = .supported,
-        .tested_profiles = &.{
-            "amd-rdna4-32gb",
-            apple_silicon_profile,
-            "intel-arc",
-        },
-    },
-    .{
         .id = "qwen3-8b-q4k-m",
         .display_name = "Qwen3 8B Q4_K_M",
         .release_date = "2025-04-29",
@@ -183,7 +158,7 @@ pub const entries = [_]CatalogEntry{
     },
     .{
         .id = "gemma4-12b-q4k-m",
-        .display_name = "Gemma 4 12B (26B-A4B MoE) Q4_K_M",
+        .display_name = "Gemma 4 26B-A4B MoE Q4_K_M",
         .release_date = "2026-04-02",
         .family = "gemma4",
         .format = "gguf",
@@ -199,7 +174,7 @@ pub const entries = [_]CatalogEntry{
         .default_context_length = 4096,
         .recommended_for_chat = true,
         .thinking_stable = true,
-        .status = .experimental,
+        .status = .supported,
         .tested_profiles = &.{
             "amd-rdna4-32gb",
             apple_silicon_profile,
@@ -339,7 +314,6 @@ pub fn ggufArchForFamily(family: []const u8) ?[]const u8 {
         .{ "gemma", "gemma" },
         .{ "mamba", "mamba" },
         .{ "jamba", "jamba" },
-        .{ "gpt-oss", "gpt-oss" },
     };
     inline for (families) |pair| {
         if (std.mem.eql(u8, family, pair[0])) return pair[1];

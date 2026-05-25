@@ -110,10 +110,9 @@ The list below matches the current managed model catalog, not a broader wishlist
 
 - [Qwen3.6 35B-A3B UD Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 - [Qwen3.6 27B Dense Q4_K_M](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) — experimental on AMD RDNA4 32 GB and Apple Silicon
-- [OpenAI GPT-OSS 20B Q4_K_M](https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF) — supported on Apple Silicon
 - [Qwen3 8B Q4_K_M](https://huggingface.co/unsloth/Qwen3-8B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 - [Gemma 4 31B Q4_K_M](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
-- [Gemma 4 12B (26B-A4B MoE) Q4_K_M](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) — experimental on AMD RDNA4 32 GB and Apple Silicon
+- [Gemma 4 26B-A4B MoE Q4_K_M](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 
 - Use `zinc model list --json` for machine-readable model metadata
 - Current throughput and latency numbers live on the public benchmarks page: [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks)
