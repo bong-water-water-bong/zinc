@@ -25,7 +25,7 @@ This list is intentionally narrow. It shows the exact GGUFs that have been valid
 
 | Model | Model ID (`zinc model pull <id>`) | Exact GGUF | Fits on | Status |
 |------|------|------------|---------|--------|
-| **Qwen3 8B** | `qwen3-8b-q4k-m` | [Qwen3-8B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3-8B-GGUF) | 16+ GB VRAM or unified | supported |
+| **Qwen 3.5 9B** | `qwen35-9b-q4k-m` | [Qwen3.5-9B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | 8+ GB VRAM or unified | supported |
 | **Gemma 4 26B-A4B MoE** | `gemma4-26b-a4b-q4k-m` | [gemma-4-26B-A4B-it-UD-Q4_K_M.gguf](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) | 16+ GB VRAM or unified | supported |
 | **Gemma 4 31B** | `gemma4-31b-q4k-m` | [gemma-4-31B-it-Q4_K_M.gguf](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF) | 24+ GB VRAM or unified | supported |
 | **Qwen3.6 27B Dense** | `qwen36-27b-q4k-m` | [Qwen3.6-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) | 24+ GB VRAM or unified | experimental |
@@ -93,7 +93,7 @@ The catalog auto-detects your GPU profile (`amd-rdna4-32gb`, `apple-silicon`, et
 ## Download a model
 
 ```bash
-./zig-out/bin/zinc model pull qwen3-8b-q4k-m
+./zig-out/bin/zinc model pull qwen35-9b-q4k-m
 ```
 
 This downloads the model into a local cache and verifies the SHA-256 hash.
@@ -103,7 +103,7 @@ This downloads the model into a local cache and verifies the SHA-256 hash.
 The `--chat` flag wraps your prompt in the model's chat template (system prompt, role tags, etc.), which is required for instruct-tuned models to produce proper answers.
 
 ```bash
-./zig-out/bin/zinc --model-id qwen3-8b-q4k-m --prompt "What is the capital of France?" --chat
+./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "What is the capital of France?" --chat
 ```
 
 Without `--chat`, the model treats the input as raw text completion, which still works but produces less focused output.
@@ -112,7 +112,7 @@ On RDNA4 Linux, remember to set the environment variable:
 
 ```bash
 export RADV_PERFTEST=coop_matrix
-./zig-out/bin/zinc --model-id qwen3-8b-q4k-m --prompt "What is the capital of France?" --chat
+./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "What is the capital of France?" --chat
 ```
 
 Good first-run signals in the logs:
@@ -137,7 +137,7 @@ This starts the server (default port 9090) and opens the built-in chat UI in you
 You can also start the server manually:
 
 ```bash
-./zig-out/bin/zinc --model-id qwen3-8b-q4k-m -p 8080
+./zig-out/bin/zinc --model-id qwen35-9b-q4k-m -p 8080
 ```
 
 Then open `http://localhost:8080/` in your browser.
@@ -146,13 +146,13 @@ Then open `http://localhost:8080/` in your browser.
 
 ```bash
 # Set a default model for future runs
-./zig-out/bin/zinc model use qwen3-8b-q4k-m
+./zig-out/bin/zinc model use qwen35-9b-q4k-m
 
 # Check the active default
 ./zig-out/bin/zinc model active
 
 # Remove a cached model
-./zig-out/bin/zinc model rm qwen3-8b-q4k-m
+./zig-out/bin/zinc model rm qwen35-9b-q4k-m
 ```
 
 ## What to read next

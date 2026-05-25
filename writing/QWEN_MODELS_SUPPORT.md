@@ -574,7 +574,7 @@ ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" \
 Bun smoke suite:
 
 ```bash
-ZINC_QWEN3_8B_MODEL=/root/models/Qwen3-8B-Q4_K_M.gguf \
+ZINC_QWEN3_8B_MODEL=/root/models/Qwen3.5-9B-Q4_K_M.gguf \
 ZINC_QWEN35_35B_MODEL=/root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
 bun test tests/test_qwen_smoke.test.ts
 ```

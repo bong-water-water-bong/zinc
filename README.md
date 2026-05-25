@@ -59,10 +59,10 @@ export RADV_PERFTEST=coop_matrix  # skip on macOS
 ./zig-out/bin/zinc model list
 
 # Download a model
-./zig-out/bin/zinc model pull qwen3-8b-q4k-m
+./zig-out/bin/zinc model pull qwen35-9b-q4k-m
 
 # Run a prompt (--chat applies the model's chat template for instruct models)
-./zig-out/bin/zinc --model-id qwen3-8b-q4k-m --prompt "Hello" --chat
+./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "Hello" --chat
 
 # Or open the chat UI in your browser
 ./zig-out/bin/zinc chat
@@ -110,7 +110,7 @@ The list below matches the current managed model catalog, not a broader wishlist
 
 - [Qwen3.6 35B-A3B UD Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 - [Qwen3.6 27B Dense Q4_K_M](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) — experimental on AMD RDNA4 32 GB and Apple Silicon
-- [Qwen3 8B Q4_K_M](https://huggingface.co/unsloth/Qwen3-8B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
+- [Qwen 3.5 9B Q4_K_M](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 - [Gemma 4 31B Q4_K_M](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 - [Gemma 4 26B-A4B MoE Q4_K_M](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 

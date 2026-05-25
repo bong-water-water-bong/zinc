@@ -152,7 +152,7 @@ Example `./zig-out/bin/zinc model list` output on Apple Silicon:
 Detected GPU profile: apple-silicon
 
 ID                             Released     Status        Fit    Installed   Active   Notes
-qwen3-8b-q4k-m                 2025-04-29   supported     yes    yes         yes      tested + exact fit
+qwen35-9b-q4k-m                2026-02-28   supported     yes    yes         yes      tested + exact fit
 qwen36-35b-a3b-q4k-xl          2026-04-15   supported     yes    no          no       tested + exact fit
 qwen36-27b-q4k-m               2026-04-22   experimental  yes    no          no       tested + catalog fit
 gemma4-31b-q4k-m               2026-04-02   supported     yes    no          no       tested + catalog fit
@@ -169,19 +169,19 @@ If you want ZINC to manage downloads and the default startup model for you:
 
 ```bash
 # Download one managed model into the local cache
-./zig-out/bin/zinc model pull qwen3-8b-q4k-m
+./zig-out/bin/zinc model pull qwen35-9b-q4k-m
 
 # Mark it as the default managed model for future runs
-./zig-out/bin/zinc model use qwen3-8b-q4k-m
+./zig-out/bin/zinc model use qwen35-9b-q4k-m
 
 # Inspect the current managed default
 ./zig-out/bin/zinc model active
 
 # Remove a cached managed model
-./zig-out/bin/zinc model rm qwen3-8b-q4k-m
+./zig-out/bin/zinc model rm qwen35-9b-q4k-m
 
 # Force-unload it from the local server first if it is still active there
-./zig-out/bin/zinc model rm --force qwen3-8b-q4k-m
+./zig-out/bin/zinc model rm --force qwen35-9b-q4k-m
 ```
 
 `model rm` is conservative by default: if the local ZINC server still has that model loaded in GPU memory, the command refuses and leaves the cache untouched. Use `--force` to have the local server unload it first. If your server uses a non-default port, add `--port <port>` before `model rm`.
@@ -324,7 +324,7 @@ curl http://localhost:8080/v1/models
 curl http://localhost:8080/v1/models/activate \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-8b-q4k-m"
+    "model": "qwen35-9b-q4k-m"
   }'
 ```
 
@@ -335,14 +335,14 @@ curl http://localhost:8080/v1/models/activate \
 curl http://localhost:8080/v1/models/remove \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-8b-q4k-m"
+    "model": "qwen35-9b-q4k-m"
   }'
 
 # Force the server to unload it first if it is still active
 curl http://localhost:8080/v1/models/remove \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-8b-q4k-m",
+    "model": "qwen35-9b-q4k-m",
     "force": true
   }'
 ```

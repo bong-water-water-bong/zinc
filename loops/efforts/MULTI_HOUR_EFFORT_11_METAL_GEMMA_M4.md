@@ -181,7 +181,7 @@ Target milestone:
 
 Stretch milestone:
 
-- Gemma 4 12B chat feels interactive for short prompts: first answer token
+- Gemma 4 26B-A4B MoE chat feels interactive for short prompts: first answer token
   in under 5 seconds for the France prompt and decode above `70 tok/s`.
 
 ## Execution order

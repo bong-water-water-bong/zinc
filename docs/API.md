@@ -5,7 +5,7 @@ the server by changing the base URL.
 
 ```bash
 # Start the server. Plain server mode defaults to port 8080.
-./zig-out/bin/zinc --model-id qwen3-8b-q4k-m -p 8080
+./zig-out/bin/zinc --model-id qwen35-9b-q4k-m -p 8080
 
 export OPENAI_BASE_URL=http://localhost:8080/v1
 ```
@@ -55,7 +55,7 @@ Generate a chat completion from a message list.
 
 ```json
 {
-  "model": "qwen3-8b-q4k-m",
+  "model": "qwen35-9b-q4k-m",
   "session_id": "chat-123",
   "messages": [
     {"role": "system", "content": "You are a helpful assistant."},
@@ -96,7 +96,7 @@ Supported message roles:
 Tool calling is enabled by default and can be disabled with:
 
 ```bash
-ZINC_TOOL_CALLING=0 ./zig-out/bin/zinc --model-id qwen3-8b-q4k-m
+ZINC_TOOL_CALLING=0 ./zig-out/bin/zinc --model-id qwen35-9b-q4k-m
 ```
 
 ZINC never executes tools. It only renders tool definitions into the prompt,
@@ -108,7 +108,7 @@ Example request:
 
 ```json
 {
-  "model": "qwen3-8b-q4k-m",
+  "model": "qwen35-9b-q4k-m",
   "messages": [{"role": "user", "content": "What time is it in UTC?"}],
   "tools": [
     {
@@ -137,7 +137,7 @@ Non-streaming tool-call response shape:
   "id": "chatcmpl-abc123",
   "object": "chat.completion",
   "created": 1711500000,
-  "model": "Qwen3 8B Q4_K_M",
+  "model": "Qwen 3.5 9B Q4_K_M",
   "choices": [
     {
       "index": 0,
@@ -175,7 +175,7 @@ Non-streaming responses use the OpenAI chat-completion shape:
   "id": "chatcmpl-abc123",
   "object": "chat.completion",
   "created": 1711500000,
-  "model": "Qwen3 8B Q4_K_M",
+  "model": "Qwen 3.5 9B Q4_K_M",
   "choices": [
     {
       "index": 0,
@@ -199,11 +199,11 @@ text/event-stream`. The first chunk includes the assistant role, content chunks
 follow, and the final chunk carries `finish_reason`.
 
 ```text
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3 8B Q4_K_M","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen 3.5 9B Q4_K_M","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3 8B Q4_K_M","choices":[{"index":0,"delta":{"content":"Paris"},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen 3.5 9B Q4_K_M","choices":[{"index":0,"delta":{"content":"Paris"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3 8B Q4_K_M","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen 3.5 9B Q4_K_M","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 ```
@@ -217,7 +217,7 @@ Streaming tool calls are emitted atomically as `delta.tool_calls` chunks, with
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-8b-q4k-m",
+    "model": "qwen35-9b-q4k-m",
     "messages": [{"role": "user", "content": "What is 2+2?"}],
     "max_tokens": 64
   }'
@@ -225,7 +225,7 @@ curl http://localhost:8080/v1/chat/completions \
 curl -N http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-8b-q4k-m",
+    "model": "qwen35-9b-q4k-m",
     "messages": [{"role": "user", "content": "Explain gravity briefly."}],
     "max_tokens": 128,
     "stream": true
@@ -242,7 +242,7 @@ Generate from a raw text prompt without applying a chat template.
 
 ```json
 {
-  "model": "qwen3-8b-q4k-m",
+  "model": "qwen35-9b-q4k-m",
   "prompt": "The capital of France is",
   "max_tokens": 64
 }
@@ -263,7 +263,7 @@ Generate from a raw text prompt without applying a chat template.
   "id": "cmpl-abc123",
   "object": "text_completion",
   "created": 1711500000,
-  "model": "Qwen3 8B Q4_K_M",
+  "model": "Qwen 3.5 9B Q4_K_M",
   "choices": [
     {
       "index": 0,
@@ -346,7 +346,7 @@ background thread; poll `GET /v1/models` for progress.
 
 ```json
 {
-  "model": "qwen3-8b-q4k-m"
+  "model": "qwen35-9b-q4k-m"
 }
 ```
 
@@ -357,7 +357,7 @@ Already installed:
 ```json
 {
   "object": "model.pull",
-  "id": "qwen3-8b-q4k-m",
+  "id": "qwen35-9b-q4k-m",
   "state": "installed"
 }
 ```
@@ -367,7 +367,7 @@ Started download:
 ```json
 {
   "object": "model.pull",
-  "id": "qwen3-8b-q4k-m",
+  "id": "qwen35-9b-q4k-m",
   "state": "downloading",
   "downloaded_bytes": 0,
   "download_total_bytes": 0
@@ -388,7 +388,7 @@ the local managed cache and fit the current GPU budget.
 
 ```json
 {
-  "model": "qwen3-8b-q4k-m"
+  "model": "qwen35-9b-q4k-m"
 }
 ```
 
@@ -397,7 +397,7 @@ the local managed cache and fit the current GPU budget.
 ```json
 {
   "object": "model.activation",
-  "id": "qwen3-8b-q4k-m",
+  "id": "qwen35-9b-q4k-m",
   "active": true
 }
 ```
@@ -414,7 +414,7 @@ first and then remove the cached files.
 
 ```json
 {
-  "model": "qwen3-8b-q4k-m",
+  "model": "qwen35-9b-q4k-m",
   "force": false
 }
 ```
@@ -424,7 +424,7 @@ first and then remove the cached files.
 ```json
 {
   "object": "model.remove",
-  "id": "qwen3-8b-q4k-m",
+  "id": "qwen35-9b-q4k-m",
   "removed": true,
   "unloaded_from_gpu": false,
   "cleared_active_selection": true,
@@ -450,7 +450,7 @@ Server health check for monitoring and local UI state.
 ```json
 {
   "status": "ok",
-  "model": "Qwen3 8B Q4_K_M",
+  "model": "Qwen 3.5 9B Q4_K_M",
   "active_requests": 1,
   "queued_requests": 0,
   "uptime_seconds": 3600,

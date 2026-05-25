@@ -1,8 +1,8 @@
-# Effort 15 — Apple M1 Max Gemma 4 12B decode: close gap to llama.cpp
+# Effort 15 — Apple M1 Max Gemma 4 26B-A4B MoE decode: close gap to llama.cpp
 
 ## Objective
 
-Move local Gemma 4 12B (`gemma4-26b-a4b-q4k-m`, the 26B-A4B MoE) decode tok/s on
+Move local Gemma 4 26B-A4B MoE (`gemma4-26b-a4b-q4k-m`) decode tok/s on
 this M1 Max as close to local llama.cpp on the same machine and model as
 possible, without regressing correctness or any other platform target.
 
@@ -203,7 +203,7 @@ ZINC kernel.
     ~/Workspace/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal
   ```
 
-#### ZINC ↔ llama.cpp kernel map for Gemma 4 12B MoE decode
+#### ZINC ↔ llama.cpp kernel map for Gemma 4 26B-A4B MoE decode
 
 | Op (decode, N=1) | ZINC shader (`src/shaders/metal/`) | llama.cpp kernel (`ggml-metal.metal`) |
 |---|---|---|
@@ -259,7 +259,7 @@ Why this should help on M1 Max (Apple7) specifically:
 - Land it as a new kernel variant or a shape-routed branch. Do **not**
   replace the working kernel until the new one is proven.
 - Microbench the new path on the exact hot shape using `bench-metal-shapes`.
-  Extend that target with the Gemma 4 12B MoE hot shapes if they are not
+  Extend that target with the Gemma 4 26B-A4B MoE hot shapes if they are not
   present:
   ```bash
   zig build bench-metal-shapes -- \

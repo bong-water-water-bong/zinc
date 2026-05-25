@@ -200,7 +200,7 @@ system_profiler SPDisplaysDataType | head -20
 export RADV_PERFTEST=coop_matrix
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/zinc --check
-./zig-out/bin/zinc model pull qwen3-8b-q4k-m
+./zig-out/bin/zinc model pull qwen35-9b-q4k-m
 ./zig-out/bin/zinc chat
 ```
 
@@ -211,7 +211,7 @@ Then see [RDNA4 Tuning](/zinc/docs/rdna4-tuning) for performance work.
 ```bash
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/zinc --check
-./zig-out/bin/zinc model pull qwen3-8b-q4k-m
+./zig-out/bin/zinc model pull qwen35-9b-q4k-m
 ./zig-out/bin/zinc chat
 ```
 
@@ -222,7 +222,7 @@ Then see [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for Arc B-series 
 ```bash
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/zinc --check
-./zig-out/bin/zinc model pull qwen3-8b-q4k-m
+./zig-out/bin/zinc model pull qwen35-9b-q4k-m
 ./zig-out/bin/zinc chat
 ```
 

@@ -259,7 +259,7 @@ After each step, `ZINC_BATCHED_PREFILL=validate` on gemma4-31b-q4k-m should land
 
 ## Not in scope
 
-- **Gemma 4 12B MoE**: `n_experts > 0` first, then MoE routing. Same scope as Qwen3.6 MoE port (Effort 8 follow-on).
+- **Gemma 4 26B-A4B MoE**: `n_experts > 0` first, then MoE routing. Same scope as Qwen3.6 MoE port (Effort 8 follow-on).
 - **LM head speedup**: Gemma's 262144-vocab LM head eats 45 ms/decode-token. Tangentially useful but not the prefill story.
 - **Row-major X layout** (the "cache thrashing per column loop" rewrite). Would push Qwen3-8B past 200 tok/s on short prompts but is independent of Gemma.
 

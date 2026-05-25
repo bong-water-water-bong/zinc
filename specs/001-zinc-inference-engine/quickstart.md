@@ -8,7 +8,7 @@
 - GPU ECC disabled: `amdgpu.ras_enable=0` in kernel cmdline (recommended)
 - Zig 0.15.2+ installed
 - System glslc (shaderc 2023.8 from Ubuntu 24.04 packages)
-- A GGUF model file (e.g., Qwen3-8B-Q4_K.gguf)
+- A GGUF model file (e.g., Qwen3.5-9B-Q4_K.gguf)
 
 ## Validation Scenario 1: Single-Request Inference (US1)
 
@@ -17,7 +17,7 @@
 zig build
 
 # Run single inference
-./zig-out/bin/zinc -m Qwen3-8B-Q4_K.gguf --prompt "The capital of France is"
+./zig-out/bin/zinc -m Qwen3.5-9B-Q4_K.gguf --prompt "The capital of France is"
 
 # Expected: Coherent text generation at 120+ tok/s (RX 9070 XT) or 110+ tok/s (AI PRO R9700)
 # Verify: Check stderr for bandwidth utilization stats (should show 67-93% on large matmuls)
@@ -33,7 +33,7 @@ zig build
 
 ```bash
 # Start server
-./zig-out/bin/zinc -m Qwen3-8B-Q4_K.gguf -p 8080
+./zig-out/bin/zinc -m Qwen3.5-9B-Q4_K.gguf -p 8080
 
 # In another terminal, send 4 concurrent requests
 for i in 1 2 3 4; do
@@ -57,7 +57,7 @@ curl http://localhost:8080/health
 
 ```bash
 # Run with TQ-3bit
-./zig-out/bin/zinc -m Qwen3-8B-Q4_K.gguf -p 8080 --kv-quant 3
+./zig-out/bin/zinc -m Qwen3.5-9B-Q4_K.gguf -p 8080 --kv-quant 3
 
 # Send 8 concurrent 8K-context requests (should fit in 16GB VRAM)
 # Compare output quality against --kv-quant 0 (FP16)

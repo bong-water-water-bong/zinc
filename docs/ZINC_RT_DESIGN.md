@@ -1667,7 +1667,7 @@ Correctness must hold across every backend tier and every milestone. **The oracl
 ### 23.2 The harness
 
 ```
-zinc-rt-validate --model qwen3-8b-q4k-m --prompt "Hello" \
+zinc-rt-validate --model qwen35-9b-q4k-m --prompt "Hello" \
   --tiers t1,t2,t_cpu --layers all
 ```
 

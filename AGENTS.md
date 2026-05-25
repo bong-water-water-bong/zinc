@@ -10,7 +10,7 @@ zig build -Doptimize=ReleaseFast
 
 # Run inference
 ZINC_DEBUG=1 ./zig-out/bin/zinc -m model.gguf --prompt "Hello" [-d device_id] [--kv-quant 3] [--debug]
-./zig-out/bin/zinc --model-id qwen3-8b-q4k-m --prompt "Hello" [--chat]
+./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "Hello" [--chat]
 
 # Run unit tests
 zig build test
@@ -49,10 +49,10 @@ For local Apple Silicon work, always prefer ZINC's managed model cache over ad h
 ./zig-out/bin/zinc model list --all
 
 # Pull a managed model into the default local cache
-./zig-out/bin/zinc model pull qwen3-8b-q4k-m
+./zig-out/bin/zinc model pull qwen35-9b-q4k-m
 
 # Run via the managed model id instead of a handwritten GGUF path
-./zig-out/bin/zinc --model-id qwen3-8b-q4k-m --prompt "What is the capital of France?" --chat
+./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "What is the capital of France?" --chat
 ```
 
 Default local managed cache layout:
