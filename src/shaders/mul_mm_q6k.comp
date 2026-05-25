@@ -45,7 +45,16 @@ layout(set = 0, binding = 0) readonly buffer MatA { uint8_t a_data[]; };
 layout(set = 0, binding = 1) readonly buffer MatB { float b_data[]; };
 layout(set = 0, binding = 2) writeonly buffer MatD { float d_data[]; };
 
-shared float buf_a[BM * STRIDE_A];
+// Stage the dequantized Q6_K weight tile as f16 in LDS to cut this kernel's
+// LDS-limited occupancy. With buf_a/buf_b both f32 the tile costs 8704 bytes
+// (RADV-rounded), which caps residency at floor(64KiB/8704)=7 wave64
+// workgroups/WGP even though VGPRs (120) leave room for ~24. Halving buf_a to
+// f16 drops LDS to 6656 bytes -> 9 workgroups/WGP. Weights are 6-bit quantized
+// (value = scale*q, q in [-32,31], no bias subtraction) so f16 is well within
+// quantization error; activations (buf_b) and the accumulator stay f32, and
+// the f16->f32 convert folds into v_fma_mix_f32. Mirrors the cycle-17 Q4_K
+// gate/up f16-LDS staging that won +2.5%.
+shared float16_t buf_a[BM * STRIDE_A];
 shared float buf_b[BN * STRIDE_B];
 
 int signed_i8(uint b) {
@@ -127,7 +136,7 @@ void main() {
 
             const uint base_a = row_local * STRIDE_A + k_in_tile;
             [[unroll]] for (uint i = 0u; i < 16u; i++) {
-                buf_a[base_a + i] = vals[i];
+                buf_a[base_a + i] = float16_t(vals[i]);
             }
         }
 
@@ -153,7 +162,7 @@ void main() {
         barrier();
 
         [[unroll]] for (uint k = 0u; k < BK; k++) {
-            float a_reg[TM];
+            float16_t a_reg[TM];
             [[unroll]] for (uint m = 0u; m < TM; m++) {
                 a_reg[m] = buf_a[(tiwr * TM + m) * STRIDE_A + k];
             }
@@ -161,9 +170,11 @@ void main() {
             [[unroll]] for (uint n = 0u; n < TN; n++) {
                 b_reg[n] = buf_b[(tiwc * TN + n) * STRIDE_B + k];
             }
+            // float(...) on the f16 weight folds into v_fma_mix_f32, so the
+            // accumulator and activations stay full f32 with no extra VALU.
             [[unroll]] for (uint m = 0u; m < TM; m++) {
                 [[unroll]] for (uint n = 0u; n < TN; n++) {
-                    sums[m][n] = fma(a_reg[m], b_reg[n], sums[m][n]);
+                    sums[m][n] = fma(float(a_reg[m]), b_reg[n], sums[m][n]);
                 }
             }
         }
