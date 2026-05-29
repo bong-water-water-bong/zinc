@@ -37,6 +37,7 @@ import {
   shouldKeepFoundationStep,
   shouldRunPivotCycle,
   summarizeCoherenceRegression,
+  type BenchResult,
   type ClaudeStreamState,
   zincCliArgs,
 } from "./optimize_perf";
@@ -1883,6 +1884,44 @@ describe("buildAgentPrompt pivot mode", () => {
     expect(prompt).toContain("20c0ea8f");
     expect(prompt).toContain("llama.cpp");
     expect(prompt).toContain("barrier narrowing is flat");
+  });
+});
+
+describe("improvementThreshold stall-aware halving", () => {
+  test("non-stalled uses the standard 1% / 0.2 tps floor", () => {
+    // At 103 tok/s, 1% = 1.03 — well above the 0.2 floor.
+    expect(improvementThreshold(103, 0)).toBeCloseTo(1.03, 4);
+    // At 5 tok/s, 1% = 0.05 — clamped to the 0.2 floor.
+    expect(improvementThreshold(5, 0)).toBe(0.2);
+  });
+
+  test("stalled past the warning threshold halves the bar (floor preserved)", () => {
+    // Stall above STALL_WARNING_THRESHOLD (=4) should halve the bar:
+    // 103 → 1.03 / 2 = 0.515.
+    expect(improvementThreshold(103, 5)).toBeCloseTo(0.515, 4);
+    // Floor of 0.2 is also halved to 0.1 — so a 5 tok/s baseline now
+    // bars at 0.1 instead of 0.2, letting tiny-but-clear wins pass.
+    expect(improvementThreshold(5, 5)).toBe(0.1);
+  });
+
+  test("just-below-threshold stall does not halve", () => {
+    // Exactly at warning threshold (4) does halve; just below (3) does not.
+    expect(improvementThreshold(103, 3)).toBeCloseTo(1.03, 4);
+    expect(improvementThreshold(103, 4)).toBeCloseTo(0.515, 4);
+  });
+
+  test("isMaterialImprovement uses stalled bar when stalled", () => {
+    const best: BenchResult = {
+      buildOk: true, buildOutput: "", tokPerSec: 103, tokPerSecSamples: [103, 103, 103],
+      correct: true, outputText: "", bandwidthUtil: null, bandwidthSamples: [], error: null,
+    };
+    // +0.6 tok/s gain with realistic noise (stdev ~1.5) so the 3-sigma
+    // noise override does NOT fire (0.6 < 3*1.5 = 4.5). Then only the
+    // flat threshold path matters: 0.6 is below the 1.03 normal bar but
+    // above the 0.515 stalled bar.
+    const candidate: BenchResult = { ...best, tokPerSec: 103.6, tokPerSecSamples: [103.6, 102.0, 105.0] };
+    expect(isMaterialImprovement(candidate, best, 0)).toBe(false);
+    expect(isMaterialImprovement(candidate, best, 5)).toBe(true);
   });
 });
 

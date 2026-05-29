@@ -551,6 +551,7 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       "Do not repeat fusing the partial hidden scratch copy with the first attention-layer RMS norm at full-attention segment handoff. Measured with ZINC_QWEN36_27B_PARTIAL_ATTN_NORM_STORE: OFF median 49.96 tok/s [51.32, 49.82, 49.96] vs ON median 49.53 tok/s [49.53, 49.42, 49.62]; reverted. It also moved attention RMS work outside the normal phase timer, making profiles less trustworthy.",
     ],
     structuralSwingIdeas: [
+      "[TOP PRIORITY — UNSPENT STRUCTURAL LEVER, prefer this when stalled in the 100-105 tok/s band] The DP4a fusion neighborhood is saturated: cycle-23 (Q6_K dense-down DP4a + per-32-block activation quantizer) and run-2 cycle-2 (Q4_K dense gate+up+SwiGLU DP4a) landed wins; subsequent run-2 cycles 3-10 produced 8 reverts at 101.5-102.9 trying further fusions (residual fold-in, fuse_q8 dense+down chain, Q5_K SSM out DP4a). The unspent structural lever is the effort doc's Tracks 1-3 — a default-off ZINC_QWEN36_27B_PREFILL_VALIDATE harness that captures per-layer reference tensors against the per-token path, then ONE layer's batched dense FFN in chunks (4/8/16, validated, then production-on), then SSM projection batching (wqkv/z/alpha/beta) with exact token-order recurrence preserved. Expect the validator to be its own cycle (foundation keep); subsequent cycles wire one layer/chunk at a time. Do NOT propose another DP4a/quantize-activation/fuse-residual variant on the dense FFN unless paired RADV_DEBUG=shaderstats proves a specific VGPR/SGPR/occupancy/LDS/spill problem in the accepted path. The phase budget at run-2 baseline 97.83 was dense_ffn ~1309 ms with down ~766 ms — the wall-time win path is now structural batching across tokens, not more single-shader cleverness.",
       "At the current 64.87 tok/s checkpoint, the profile is balanced rather than single-hot: dense_ffn ~=1848 ms, ssm ~=1498 ms, dense gateup ~=934 ms, dense down ~=916 ms, and SSM proj ~=1095 ms. A next jump probably needs a structural change that moves a whole bucket by multiple percent, not another sub-1% tile/barrier variant.",
       "Before more dense kernel rewrites, collect paired RADV_DEBUG=shaderstats for the accepted fused Q4_K gate/up/SwiGLU path and Q6_K tiled dense-down path. Only edit the shader if shaderstats shows a concrete VGPR/SGPR, occupancy, LDS, spill, or memory-instruction problem that maps to the currently largest dense subphase.",
       "Treat the current Qwen3.6-27B layer-major segment and barrier schedule as provisionally settled. Segment or barrier work now requires a paired old-vs-new control in the same cycle and a profile-backed reason; otherwise switch buckets.",
@@ -615,7 +616,11 @@ const MIN_IMPROVEMENT_PCT = 0.01;
 // above this absolute minimum. Cycle 16 produced samples [28.06, 28.06,
 // 28.05] — stdev 0.005, gap 0.30 tok/s = 60× noise, an unambiguous win
 // that the old threshold rejected.
-const NOISE_OVERRIDE_ABS_MIN_TPS = 0.15;
+// Lowered 0.15 → 0.10 after effort-15 run-2 cycle-2's 103.00 plateau:
+// the agent kept landing 102.5-102.9 (below best, so correctly rejected),
+// but the tightened floor makes future small-clear wins above best easier
+// to accept when the loop is searching out of a saturated neighborhood.
+const NOISE_OVERRIDE_ABS_MIN_TPS = 0.1;
 const NOISE_OVERRIDE_STDEV_MULTIPLIER = 3;
 // How often to refresh the prefill phase budget even without a perf keep.
 // Previously we only refreshed after perf keeps; a stalled run would stare
@@ -1514,9 +1519,23 @@ export function buildAnalysisReport(state: LoopState): string {
   ].join("\n");
 }
 
-export function improvementThreshold(currentTokPerSec: number | null): number {
-  if (currentTokPerSec == null || currentTokPerSec <= 0) return MIN_IMPROVEMENT_ABS_TPS;
-  return Math.max(MIN_IMPROVEMENT_ABS_TPS, currentTokPerSec * MIN_IMPROVEMENT_PCT);
+export function improvementThreshold(
+  currentTokPerSec: number | null,
+  stalledCycles: number = 0,
+): number {
+  const base = currentTokPerSec == null || currentTokPerSec <= 0
+    ? MIN_IMPROVEMENT_ABS_TPS
+    : Math.max(MIN_IMPROVEMENT_ABS_TPS, currentTokPerSec * MIN_IMPROVEMENT_PCT);
+  // Adaptive plateau-escape: when stalled past the warning threshold,
+  // halve the bar (with the absolute floor preserved) so a small but
+  // clear positive measurement can break out instead of being rejected
+  // by a too-strict 1%-of-best threshold that's tuned for early-game
+  // climbs. The noise-aware override remains the primary defense
+  // against accepting jitter — this only relaxes the flat bar.
+  if (stalledCycles >= STALL_WARNING_THRESHOLD) {
+    return Math.max(MIN_IMPROVEMENT_ABS_TPS / 2, base / 2);
+  }
+  return base;
 }
 
 export function sampleStdev(samples: number[]): number {
@@ -1640,9 +1659,13 @@ export function shouldRunPivotCycle(cycleNum: number, context: PromptContext | n
   return context.stalledCycles >= PIVOT_STALL_THRESHOLD;
 }
 
-export function isMaterialImprovement(candidate: BenchResult, currentBest: BenchResult): boolean {
+export function isMaterialImprovement(
+  candidate: BenchResult,
+  currentBest: BenchResult,
+  stalledCycles: number = 0,
+): boolean {
   if (candidate.tokPerSec == null) return false;
-  const threshold = improvementThreshold(currentBest.tokPerSec);
+  const threshold = improvementThreshold(currentBest.tokPerSec, stalledCycles);
   const current = currentBest.tokPerSec ?? 0;
   if (candidate.tokPerSec > current + threshold) return true;
   // Below the normal threshold — fall back to the noise-aware override so
@@ -3345,7 +3368,7 @@ ${result.buildOutput.slice(-2000)}
 
     changedFiles = await listChangedFiles();
     const categoryTags = classifyApproachTags(agentReport.description, changedFiles);
-    const improved = isMaterialImprovement(result, bestPerf);
+    const improved = isMaterialImprovement(result, bestPerf, state.stalledCycles);
     const foundationCandidate = shouldKeepFoundationStep(
       result,
       bestPerf,
@@ -3372,7 +3395,7 @@ ${result.buildOutput.slice(-2000)}
 
     const correct = result.correct && coherenceError == null;
     const broken = !result.buildOk || !correct;
-    const threshold = improvementThreshold(bestPerf.tokPerSec);
+    const threshold = improvementThreshold(bestPerf.tokPerSec, state.stalledCycles);
 
     const deltaVsBest = result.tokPerSec != null && (bestPerf.tokPerSec ?? 0) > 0
       ? ((result.tokPerSec - (bestPerf.tokPerSec ?? 0)) / (bestPerf.tokPerSec ?? 1) * 100).toFixed(2)
