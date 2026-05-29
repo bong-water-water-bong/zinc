@@ -14,9 +14,12 @@ struct DualQ8DmmvPush {
 
 // Exact Qwen3.6 SSM dual Q8_0 repacked DMMV for K=2048.
 //
-// This keeps the accepted llama.cpp-style TG128/two-row geometry from
+// This keeps the accepted llama.cpp-style two-row Q8 geometry from
 // dmmv_q8_0_repacked_k2048_nr2_qwen.metal, but lets sibling SSM QKV and gate
-// projections sharing the same norm row run as one encoder dispatch.
+// projections sharing the same norm row run as one encoder dispatch. The
+// simdgroup count is now taken from the dispatcher (matches the K=2048 quad
+// and Qwen-specific repacked kernels) so the dispatch may pick a larger
+// threadgroup when occupancy per workgroup would otherwise be too low.
 kernel void main0(
     constant DualQ8DmmvPush& p [[buffer(0)]],
     device const uchar* W0 [[buffer(1)]],
@@ -26,9 +29,10 @@ kernel void main0(
     device float* Y1 [[buffer(5)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroups_per_tg [[simdgroups_per_threadgroup]]
 ) {
-    const uint base_pair = tg_id * 4u + sg_idx;
+    const uint base_pair = tg_id * simdgroups_per_tg + sg_idx;
     const uint base_row = base_pair * 2u;
     const uint total_rows = p.M0 + p.M1;
     if (base_row >= total_rows) {
