@@ -12683,10 +12683,23 @@ pub const InferenceEngine = struct {
         if (!self.isQwen36DenseHybrid27B()) return 0;
         if (mode == null and !is_amd) return 0;
 
-        // The deeper prefix only wins for tiny prompts where the fixed
-        // layer-major setup cost is small; context prompts stay on the
-        // one-layer default because L2+ regressed the coding-review matrix.
-        var layers: u32 = if (mode == null and prompt_len <= 8) 8 else 1;
+        // Tiny prompts (<=8 tok) use a deep prefix because the layer-major
+        // setup cost is amortized over a tiny work envelope.
+        //
+        // Context prompts: the prior 2026-05-18 L2/L4/L8 regression test
+        // ran against the per-token SSM-prefill-replay path that existed
+        // before the layer-major SSM batched proj path (cycle 9 of the
+        // earlier effort-15 run added dmmv_f32_dual_batch + ssm_conv1d_batched)
+        // and before the cycle-2 DP4a dense gate+up+SwiGLU keep. With
+        // qwen36DensePrefillSsmLayerMajorProjEnabled() now true and DP4a
+        // active, prefix=3 routes layers 0..2 (all SSM under full_attn_interval=4)
+        // through the layer-major batched SSM + batched dense-FFN prefix
+        // path, instead of leaving layers 1..2 running per-token in the
+        // segment-loop partial_token_loop between the old prefix=1 and
+        // segment_layer=4. The previously-blocking SSM projection replay
+        // is bypassed because use_ssm_preproj is default-off.
+        // Override with ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS=1 to revert.
+        var layers: u32 = if (mode != null) 1 else if (prompt_len <= 8) 8 else 3;
         if (mode) |raw| {
             if (!std.mem.eql(u8, raw, "1")) {
                 layers = std.fmt.parseInt(u32, raw, 10) catch layers;
