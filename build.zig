@@ -228,6 +228,7 @@ pub fn build(b: *std.Build) void {
         "mul_mm_q6k_full_dp4a",
         "quantize_act_q8",
         "mul_mm_q4k_gate_up_swiglu_full_dp4a",
+        "mul_mm_q4k_gate_up_swiglu_full_dp4a_q8",
         "quantize_act_q8_1",
     };
 
