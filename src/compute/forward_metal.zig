@@ -7660,7 +7660,7 @@ fn selectQ8RepackedDispatchKindUncached(
         K == 4096 and
         M % 4 == 0 and
         engine.dmmv_q8_0_repacked_k4096_qwen_pipe.thread_execution_width == 32 and
-        engine.dmmv_q8_0_repacked_k4096_qwen_pipe.max_threads_per_threadgroup >= 512)
+        engine.dmmv_q8_0_repacked_k4096_qwen_pipe.max_threads_per_threadgroup >= 256)
     {
         return .exact_qwen_k4096;
     }
@@ -7791,7 +7791,13 @@ fn dispatchQ8RepackedDmmvOnCmd(
             cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_quad_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
         },
         .exact_qwen_k4096 => {
-            const block_size: u32 = 512;
+            // Qwen3.6 SSM-out / full-attn-out are M=2048 K=4096. At the prior
+            // block=512 / 64-rows-per-WG geometry that left only 32 WGs across
+            // the M4 Max 40-core GPU (0.8 WGs/core, undersubscribed). Halving
+            // the threadgroup to 256 / 32-rows-per-WG doubles to 64 WGs
+            // (1.6/core) while the shader's simdgroups_per_threadgroup support
+            // keeps per-row work identical.
+            const block_size: u32 = 256;
             const rows_per_wg: u32 = (block_size / 32) * 4;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
             recordQ8RepackedKernelProfile(engine, tensor, M, K, .exact_qwen);
@@ -7958,11 +7964,13 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             K == 4096 and
             M % 4 == 0 and
             engine.dmmv_q8_0_repacked_k4096_qwen_pipe.thread_execution_width == 32 and
-            engine.dmmv_q8_0_repacked_k4096_qwen_pipe.max_threads_per_threadgroup >= 512)
+            engine.dmmv_q8_0_repacked_k4096_qwen_pipe.max_threads_per_threadgroup >= 256)
         {
             // Same exact-row specialization for Qwen3.6 SSM out and
-            // full-attention output projections with K=4096.
-            const block_size: u32 = 512;
+            // full-attention output projections with K=4096. Block=256 keeps
+            // the 40-core M4 Max GPU subscribed at M=2048 (mirrors the cached
+            // .exact_qwen_k4096 dispatch in dispatchQ8RepackedDmmvOnCmd).
+            const block_size: u32 = 256;
             const rows_per_wg: u32 = (block_size / 32) * 4;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
             recordQ8RepackedKernelProfile(engine, tensor, M, K, .exact_qwen);
