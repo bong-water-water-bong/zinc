@@ -736,6 +736,11 @@ const BLOCKED_GIT_OPS = [
 // baselines.
 const REVERTABLE_PATHS = ["build.zig", "src/"];
 
+// Rate-limit backoff knobs. Run-scoped; no persistence across runs.
+const RATE_LIMIT_MAX_RETRIES = 3;
+const RATE_LIMIT_MAX_WAIT_MS = 6 * 60 * 60 * 1000; // never sleep longer than 6 h
+const rateLimitRetriesPerCycle = new Map<number, number>();
+
 function isPrefillMetricLabel(label: string | undefined): boolean {
   return /\bprefill\b/i.test(label ?? "");
 }
@@ -2855,6 +2860,62 @@ export function isMeasuredDeadRevert(report: AgentReport): boolean {
   return mentionsRevert && mentionsDead && citesNumber;
 }
 
+/**
+ * Detect agent rate-limit responses in stdout/stderr and return when the limit
+ * resets, so the cycle loop can sleep through it instead of burning a no-op.
+ * The prior 50-cycle run lost 36/50 cycles (72%) to claude session-limit
+ * rejections that masqueraded as no-ops, polluting the stall counter and
+ * triggering false pivots. Detection is layered for robustness:
+ *   1. Claude API `rate_limit_event` JSON with `resetsAt` (most reliable).
+ *   2. Claude plain-text "session limit · resets HH:MM(am|pm)" fallback.
+ *   3. Codex plain-text "try again at <Month Day, Year HH:MM AM/PM>".
+ *   4. Generic phrase match → +60 min fallback so we never silently no-op
+ *      on an unrecognized rate-limit string.
+ * Returns null when no rate-limit signature is present (real no-op).
+ */
+export function detectAgentRateLimit(
+  stdout: string,
+  stderr: string = "",
+  nowMs: number = Date.now(),
+): { resetsAtMs: number; source: string } | null {
+  const combined = `${stdout}\n${stderr}`;
+  // 1. Claude API: {"type":"rate_limit_event",..."resetsAt":<unix-seconds>,...}
+  const apiMatch = combined.match(/"rate_limit_event"[\s\S]{0,400}?"resetsAt":\s*(\d{9,12})/);
+  if (apiMatch) {
+    const seconds = parseInt(apiMatch[1], 10);
+    if (Number.isFinite(seconds) && seconds > 1_700_000_000) {
+      return { resetsAtMs: seconds * 1000, source: "claude api" };
+    }
+  }
+  // 2. Claude text: "session limit · resets 7:40pm (TZ)"
+  const claudeText = combined.match(/session limit[^\n]*?resets\s+(\d{1,2}):(\d{2})\s*(am|pm)/i);
+  if (claudeText) {
+    const hh12 = parseInt(claudeText[1], 10);
+    const mm = parseInt(claudeText[2], 10);
+    const isPm = claudeText[3].toLowerCase() === "pm";
+    const hh = (hh12 % 12) + (isPm ? 12 : 0);
+    const target = new Date(nowMs);
+    target.setHours(hh, mm, 0, 0);
+    if (target.getTime() <= nowMs) target.setDate(target.getDate() + 1);
+    return { resetsAtMs: target.getTime(), source: "claude text" };
+  }
+  // 3. Codex text: "try again at May 26th, 2026 11:33 AM"
+  const codexText = combined.match(
+    /try again at ([A-Z][a-z]+\s+\d+)(?:st|nd|rd|th)?,?\s+(\d{4})\s+(\d{1,2}:\d{2}\s*(?:AM|PM))/i,
+  );
+  if (codexText) {
+    const parsed = Date.parse(`${codexText[1]}, ${codexText[2]} ${codexText[3]}`);
+    if (Number.isFinite(parsed) && parsed > nowMs) {
+      return { resetsAtMs: parsed, source: "codex text" };
+    }
+  }
+  // 4. Generic fallback: clear rate-limit phrase but unparseable timing.
+  if (/(session limit|usage limit|\brate_limit\b|api_error_status":\s*429)/i.test(combined)) {
+    return { resetsAtMs: nowMs + 60 * 60 * 1000, source: "fallback (+60m)" };
+  }
+  return null;
+}
+
 export function shouldKeepFoundationStep(
   candidate: BenchResult,
   bestPerf: BenchResult,
@@ -3121,6 +3182,29 @@ async function main() {
 
     let changedFiles = await listChangedFiles();
     if (changedFiles.length === 0) {
+      // Rate-limit backoff. If the agent was rejected by its quota/session
+      // limit (rather than genuinely choosing to make no changes), sleep
+      // until the reset time and retry the same cycle number. Without this
+      // the prior 50-cycle run burned 36 cycles as no-ops on claude session
+      // limits, polluted the stall counter, and triggered false pivots.
+      const rl = detectAgentRateLimit(agentRun.stdout, agentRun.stderr);
+      if (rl) {
+        const tries = (rateLimitRetriesPerCycle.get(cycle) ?? 0) + 1;
+        if (tries <= RATE_LIMIT_MAX_RETRIES) {
+          rateLimitRetriesPerCycle.set(cycle, tries);
+          const waitMs = Math.min(
+            RATE_LIMIT_MAX_WAIT_MS,
+            Math.max(60_000, rl.resetsAtMs - Date.now() + 60_000),
+          );
+          const eta = new Date(Date.now() + waitMs).toLocaleString();
+          const mins = Math.ceil(waitMs / 60_000);
+          console.log(c("1;33", `  ⏸ AGENT RATE LIMIT (${rl.source}) — sleeping ${mins} min until ~${eta}, then retrying cycle ${cycle} (attempt ${tries}/${RATE_LIMIT_MAX_RETRIES})`));
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          cycle--; // for-loop will ++ back to the same number
+          continue;
+        }
+        console.log(c("1;31", `  ⚠ Rate-limit retries exhausted for cycle ${cycle}; falling through as no-op`));
+      }
       const measuredDead = isMeasuredDeadRevert(agentReport);
       const decisionReason = measuredDead
         ? "measured-dead: agent explored, measured, and reverted after finding the path non-positive"

@@ -10,6 +10,7 @@ import {
   cleanupPreviousRunArtifacts,
   classifyApproachTags,
   codexExecArgs,
+  detectAgentRateLimit,
   effortArtifactPaths,
   formatCodexStreamLine,
   formatCoherenceFailureList,
@@ -1882,5 +1883,49 @@ describe("buildAgentPrompt pivot mode", () => {
     expect(prompt).toContain("20c0ea8f");
     expect(prompt).toContain("llama.cpp");
     expect(prompt).toContain("barrier narrowing is flat");
+  });
+});
+
+describe("detectAgentRateLimit", () => {
+  const NOW = Date.UTC(2026, 4, 28, 18, 0, 0); // 2026-05-28 18:00 UTC
+
+  test("parses claude api rate_limit_event resetsAt", () => {
+    const stdout =
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1779763200,"rateLimitType":"five_hour"}}';
+    const hit = detectAgentRateLimit(stdout, "", NOW);
+    expect(hit).not.toBeNull();
+    expect(hit?.source).toBe("claude api");
+    expect(hit?.resetsAtMs).toBe(1779763200 * 1000);
+  });
+
+  test("parses claude plain-text 'session limit · resets HH:MMpm'", () => {
+    const stdout = "You've hit your session limit · resets 7:40pm (America/Los_Angeles)";
+    const hit = detectAgentRateLimit(stdout, "", NOW);
+    expect(hit).not.toBeNull();
+    expect(hit?.source).toBe("claude text");
+    // future-or-same-day; never in the past
+    expect(hit!.resetsAtMs).toBeGreaterThan(NOW);
+  });
+
+  test("parses codex 'try again at <Month Day, Year HH:MM AM>'", () => {
+    const stdout =
+      "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at May 30th, 2026 11:33 AM.";
+    const hit = detectAgentRateLimit(stdout, "", NOW);
+    expect(hit).not.toBeNull();
+    expect(hit?.source).toBe("codex text");
+    expect(hit!.resetsAtMs).toBeGreaterThan(NOW);
+  });
+
+  test("falls back to +60 min on an unrecognized 429 timing", () => {
+    const stdout = '{"error":"rate_limit","api_error_status": 429,"resetsAt": "tomorrow"}';
+    const hit = detectAgentRateLimit(stdout, "", NOW);
+    expect(hit).not.toBeNull();
+    expect(hit?.source).toBe("fallback (+60m)");
+    expect(hit!.resetsAtMs).toBe(NOW + 60 * 60 * 1000);
+  });
+
+  test("returns null on a genuine no-op (agent ran fine, no changes)", () => {
+    const stdout = "Read 12 files\nGrep ...\n(no edits)";
+    expect(detectAgentRateLimit(stdout, "", NOW)).toBeNull();
   });
 });
