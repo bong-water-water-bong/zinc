@@ -44,10 +44,6 @@ kernel void main0(
         return;
     }
 
-    if (local_id < MAX_EXPERTS) {
-        values[local_id] = -INFINITY;
-    }
-
     device const float* input = X + (p.input_offset >> 2) + token_idx * p.input_stride;
     const uint k_vec4 = p.K >> 2;
     for (uint i = local_id; i < k_vec4; i += TG_SIZE) {

@@ -33,8 +33,8 @@ kernel void main0(
     device float* output [[buffer(9)]],
     uint head [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
-    uint simd_width [[thread_execution_width]],
-    uint simdgroups_per_tg [[simdgroups_per_threadgroup]]
+    ushort simd_lane [[thread_index_in_simdgroup]],
+    ushort simd_idx [[simdgroup_index_in_threadgroup]]
 ) {
     if (head >= 32u) {
         return;
@@ -48,30 +48,22 @@ kernel void main0(
 
     threadgroup float q[128];
     threadgroup float k[128];
-    threadgroup float delta_out[128];
     threadgroup float partial_q[4];
     threadgroup float partial_k[4];
     threadgroup float partial_sq[4];
 
-    const uint tg_threads = simd_width * simdgroups_per_tg;
-    const uint simd_lane = tid & 31u;
-    const uint simd_idx = tid >> 5u;
     const uint group = head & 15u;
     const uint q_base = group * d_state;
     const uint k_base = qk_dim + group * d_state;
     const uint v_base = v_base0 + head * head_v_dim;
     const uint head_state_base = head * head_v_dim * head_v_dim;
 
-    float q_ss = 0.0f;
-    float k_ss = 0.0f;
-    for (uint i = tid; i < head_v_dim; i += tg_threads) {
-        const float qv = conv_out[q_base + i];
-        const float kv = conv_out[k_base + i];
-        q[i] = qv;
-        k[i] = kv;
-        q_ss = fma(qv, qv, q_ss);
-        k_ss = fma(kv, kv, k_ss);
-    }
+    const float qv = conv_out[q_base + tid];
+    const float kv = conv_out[k_base + tid];
+    q[tid] = qv;
+    k[tid] = kv;
+    const float q_ss = qv * qv;
+    const float k_ss = kv * kv;
 
     const float q_sum = simd_sum(q_ss);
     const float k_sum = simd_sum(k_ss);
@@ -85,8 +77,8 @@ kernel void main0(
     // mirroring the final RMS reduction below. Lane 0 computes the scalar
     // setup once per simdgroup and broadcasts within the simdgroup, avoiding a
     // second threadgroup barrier before the 128 row workers enter the state loop.
-    const float q_partial = (simd_lane < simdgroups_per_tg) ? partial_q[simd_lane] : 0.0f;
-    const float k_partial = (simd_lane < simdgroups_per_tg) ? partial_k[simd_lane] : 0.0f;
+    const float q_partial = (simd_lane < 4u) ? partial_q[simd_lane] : 0.0f;
+    const float k_partial = (simd_lane < 4u) ? partial_k[simd_lane] : 0.0f;
     const float q_norm_sq = simd_sum(q_partial);
     const float k_norm_sq = simd_sum(k_partial);
 
@@ -96,7 +88,7 @@ kernel void main0(
     float beta_lane = 0.0f;
     if (simd_lane == 0u) {
         const float alpha_raw = alpha[p.alpha_offset + head] + dt_bias[head];
-        const float softplus_alpha = log(1.0f + fast::exp(alpha_raw));
+        const float softplus_alpha = fast::log(1.0f + fast::exp(alpha_raw));
         q_scale_lane = fast::rsqrt(fast::max(q_norm_sq, 1.0e-13f)) * inv_sqrt_d_state;
         k_scale_lane = fast::rsqrt(fast::max(k_norm_sq, 1.0e-13f));
         decay_lane = fast::exp(softplus_alpha * ssm_a[head]);
@@ -109,42 +101,40 @@ kernel void main0(
     const float beta_val = simd_broadcast(beta_lane, 0u);
 
     float local_sq = 0.0f;
-    for (uint row = tid; row < head_v_dim; row += tg_threads) {
-        const uint row_base = head_state_base + row * head_v_dim;
-        device float4* state_vec = (device float4*)(state + row_base);
-        threadgroup const float4* k_vec = (threadgroup const float4*)k;
-        threadgroup const float4* q_vec = (threadgroup const float4*)q;
-        float sk_raw = 0.0f;
-        #pragma unroll
-        for (uint col4 = 0u; col4 < 32u; ++col4) {
-            const float4 old_state = state_vec[col4];
-            const float4 kv = k_vec[col4];
-            sk_raw = fma(old_state.x, kv.x, sk_raw);
-            sk_raw = fma(old_state.y, kv.y, sk_raw);
-            sk_raw = fma(old_state.z, kv.z, sk_raw);
-            sk_raw = fma(old_state.w, kv.w, sk_raw);
-        }
-        sk_raw *= decay;
-
-        const float v = conv_out[v_base + row];
-        const float delta = beta_val * (v - sk_raw * k_scale);
-        const float scaled_delta = delta * k_scale;
-        float out_v = 0.0f;
-        #pragma unroll
-        for (uint col4 = 0u; col4 < 32u; ++col4) {
-            const float4 kv = k_vec[col4];
-            const float4 qv = q_vec[col4];
-            const float4 updated = fma(kv, scaled_delta, state_vec[col4] * decay);
-            state_vec[col4] = updated;
-            out_v = fma(updated.x, qv.x, out_v);
-            out_v = fma(updated.y, qv.y, out_v);
-            out_v = fma(updated.z, qv.z, out_v);
-            out_v = fma(updated.w, qv.w, out_v);
-        }
-        out_v *= q_scale;
-        delta_out[row] = out_v;
-        local_sq = fma(out_v, out_v, local_sq);
+    const uint row = tid;
+    const uint row_base = head_state_base + row * head_v_dim;
+    device float4* state_vec = (device float4*)(state + row_base);
+    threadgroup const float4* k_vec = (threadgroup const float4*)k;
+    threadgroup const float4* q_vec = (threadgroup const float4*)q;
+    float sk_raw = 0.0f;
+    #pragma unroll
+    for (uint col4 = 0u; col4 < 32u; ++col4) {
+        const float4 old_state = state_vec[col4];
+        const float4 kv4 = k_vec[col4];
+        sk_raw = fma(old_state.x, kv4.x, sk_raw);
+        sk_raw = fma(old_state.y, kv4.y, sk_raw);
+        sk_raw = fma(old_state.z, kv4.z, sk_raw);
+        sk_raw = fma(old_state.w, kv4.w, sk_raw);
     }
+    sk_raw *= decay;
+
+    const float v = conv_out[v_base + row];
+    const float delta = beta_val * (v - sk_raw * k_scale);
+    const float scaled_delta = delta * k_scale;
+    float out_v = 0.0f;
+    #pragma unroll
+    for (uint col4 = 0u; col4 < 32u; ++col4) {
+        const float4 kv4 = k_vec[col4];
+        const float4 qv4 = q_vec[col4];
+        const float4 updated = fma(kv4, scaled_delta, state_vec[col4] * decay);
+        state_vec[col4] = updated;
+        out_v = fma(updated.x, qv4.x, out_v);
+        out_v = fma(updated.y, qv4.y, out_v);
+        out_v = fma(updated.z, qv4.z, out_v);
+        out_v = fma(updated.w, qv4.w, out_v);
+    }
+    out_v *= q_scale;
+    local_sq = out_v * out_v;
 
     const float sq_sum = simd_sum(local_sq);
     if (simd_lane == 0u) {
@@ -155,14 +145,12 @@ kernel void main0(
     // Mirror rms_norm_mul.metal: each simdgroup redundantly folds the tiny
     // partial array, avoiding a second threadgroup barrier just to broadcast
     // the final RMS scalar.
-    const float partial = (simd_lane < simdgroups_per_tg) ? partial_sq[simd_lane] : 0.0f;
+    const float partial = (simd_lane < 4u) ? partial_sq[simd_lane] : 0.0f;
     const float total_sq = simd_sum(partial);
     const float rms = fast::rsqrt(fast::divide(total_sq, float(head_v_dim)) + 1.0e-6f);
-    for (uint row = tid; row < head_v_dim; row += tg_threads) {
-        const uint idx = head * head_v_dim + row;
-        const uint weight_idx = (p.norm_per_head != 0u) ? idx : row;
-        const float z = z_gate[p.z_offset + idx];
-        const float silu_z = z * fast::divide(1.0f, 1.0f + fast::exp(-z));
-        output[p.output_offset + idx] = delta_out[row] * rms * norm_weight[weight_idx] * silu_z;
-    }
+    const uint idx = head * head_v_dim + row;
+    const uint weight_idx = (p.norm_per_head != 0u) ? idx : row;
+    const float z = z_gate[p.z_offset + idx];
+    const float silu_z = z * fast::divide(1.0f, 1.0f + fast::exp(-z));
+    output[p.output_offset + idx] = out_v * rms * norm_weight[weight_idx] * silu_z;
 }

@@ -72,6 +72,15 @@ const MoeRoutePackPush = extern struct {
     ids_stride: u32,
 };
 
+const moe_route_block_cols: u32 = 8;
+
+fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
+    if (route_slots == 0 or n_experts == 0) return 0;
+    const first_blocks = @min(route_slots, n_experts);
+    const remaining_routes = route_slots - first_blocks;
+    return first_blocks + remaining_routes / moe_route_block_cols;
+}
+
 const CaseId = enum {
     all,
     lm_head,
@@ -794,7 +803,10 @@ fn selectFusedDualPipeline(ctx: ?*shim.MetalCtx, cols: u32, threadgroup_override
         .variant_label = "fused",
         .pipe = pipe,
         .push_idx = 0,
-        .rows_per_wg = (block_size / simd_width) * 2,
+        // Match production `dispatchFusedNormDualQ8DmmvOnCmd`: the fused
+        // kernel maps one simdgroup to four output rows, so benchmark the same
+        // llama.cpp-style adjacent-row geometry before retuning hot Qwen shapes.
+        .rows_per_wg = (block_size / simd_width) * 4,
         .block_size = block_size,
     };
 }
@@ -1061,6 +1073,88 @@ fn runMoeColsDispatchBatch(
         cmd.dispatchV2(
             &selection.pipe,
             .{ (rows + selection.rows_per_wg - 1) / selection.rows_per_wg, n_experts, (n_tokens + cols_per_wg - 1) / cols_per_wg },
+            .{ selection.block_size, 1, 1 },
+            &dmmv_bufs,
+            &dmmv_push,
+            @sizeOf(MoeColsDmmvPush),
+            selection.push_idx,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn runMoeColsActiveBlocksDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    route_pack_blocks_pipe: *const MetalPipeline,
+    selection: *const PipelineSelection,
+    tensor: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    counts_buf: *const MetalBuffer,
+    packed_ids_buf: *const MetalBuffer,
+    active_block_count_buf: *const MetalBuffer,
+    active_blocks_buf: *const MetalBuffer,
+    rows: u32,
+    cols: u32,
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+    active_block_upper_bound: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0 or active_block_upper_bound == 0) return;
+    const route_push = MoeRoutePackPush{
+        .n_tokens = n_tokens,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .ids_stride = n_tokens,
+    };
+    const dmmv_push = MoeColsDmmvPush{
+        .M = rows,
+        .K = cols,
+        .a_offset = tensorPageOffset(model, tensor),
+        .expert_stride = @intCast(weightBytesPerIter(tensor.info.type_, rows, cols)),
+        .x_offset = 0,
+        .y_offset = 0,
+        .ids_stride = n_tokens,
+        .x_route_divisor = 1,
+        .use_active_blocks = 1,
+    };
+    const route_bufs = [_]*const MetalBuffer{
+        routing_buf,
+        counts_buf,
+        packed_ids_buf,
+        active_block_count_buf,
+        active_blocks_buf,
+    };
+    const dmmv_bufs = [_]*const MetalBuffer{
+        &tensor.gpu_buffer,
+        input_buf,
+        output_buf,
+        counts_buf,
+        packed_ids_buf,
+        active_blocks_buf,
+        active_block_count_buf,
+    };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            route_pack_blocks_pipe,
+            .{ 1, 1, 1 },
+            .{ 256, 1, 1 },
+            &route_bufs,
+            &route_push,
+            @sizeOf(MoeRoutePackPush),
+            0,
+        );
+        cmd.barrier();
+        cmd.dispatchV2(
+            &selection.pipe,
+            .{ (rows + selection.rows_per_wg - 1) / selection.rows_per_wg, active_block_upper_bound, 1 },
             .{ selection.block_size, 1, 1 },
             &dmmv_bufs,
             &dmmv_push,
@@ -1520,6 +1614,90 @@ fn benchmarkMoeColsVariant(
     };
 }
 
+fn benchmarkMoeColsActiveBlocksVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    route_tokens: u32,
+    warmup_iterations: u32,
+    iterations: u32,
+) !BenchResult {
+    if (!hot_case.isMoe()) return error.ExpectedMoeCase;
+    if (model.config.n_experts == 0 or model.config.n_experts_used == 0) return error.ExpectedMoeCase;
+
+    var route_pack_blocks_pipe = try loadShaderPipeline(device.ctx, "moe_route_pack_blocks");
+    defer metal_pipeline.freePipeline(&route_pack_blocks_pipe);
+    var selection = try selectMoeColsPipeline(device.ctx, hot_case.tensor0.info.type_);
+    defer metal_pipeline.freePipeline(&selection.pipe);
+
+    const n_experts = model.config.n_experts;
+    const k = model.config.n_experts_used;
+    const route_slots = route_tokens * k;
+    const routing_stride = k * 2;
+    const active_block_upper_bound = maxPackedMoeRouteBlocks(route_slots, n_experts);
+    const input_elems = @as(usize, route_slots) * @as(usize, hot_case.cols);
+    const output_elems = @as(usize, route_slots) * @as(usize, hot_case.rows0);
+
+    var input_buf = try metal_buffer.createBuffer(device.ctx, input_elems * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(device.ctx, output_elems * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, route_tokens) * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var counts_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, n_experts) * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var packed_ids_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, n_experts) * @as(usize, route_tokens) * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&packed_ids_buf);
+    var active_block_count_buf = try metal_buffer.createBuffer(device.ctx, @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&active_block_count_buf);
+    var active_blocks_buf = try metal_buffer.createBuffer(device.ctx, @max(@as(usize, active_block_upper_bound) * @sizeOf(u32), 4));
+    defer metal_buffer.freeBuffer(&active_blocks_buf);
+
+    fillRouteColsInputBuffer(&input_buf, hot_case.cols, route_slots);
+    fillRoutePackRoutingBuffer(&routing_buf, route_tokens, n_experts, k);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(counts_buf.cpu_ptr.?[0..counts_buf.size], 0);
+    @memset(packed_ids_buf.cpu_ptr.?[0..packed_ids_buf.size], 0);
+    @memset(active_block_count_buf.cpu_ptr.?[0..active_block_count_buf.size], 0);
+    @memset(active_blocks_buf.cpu_ptr.?[0..active_blocks_buf.size], 0);
+
+    try runMoeColsActiveBlocksDispatchBatch(device.ctx, &route_pack_blocks_pipe, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, &active_block_count_buf, &active_blocks_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, active_block_upper_bound, warmup_iterations);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runMoeColsActiveBlocksDispatchBatch(device.ctx, &route_pack_blocks_pipe, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, &active_block_count_buf, &active_blocks_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, active_block_upper_bound, iterations);
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    const weight_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols) * active_block_upper_bound;
+    const total_bytes = weight_bytes * iterations;
+    const output_copy = try copyOutput(allocator, &output_buf, @intCast(output_elems));
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = "route-cols-active",
+        .shader_name = selection.shader_name,
+        .tensor_name = hot_case.tensor0.info.name,
+        .rows = hot_case.rows0,
+        .cols = hot_case.cols,
+        .expert_slots = route_slots,
+        .x_expert_stride = 0,
+        .iterations = iterations,
+        .block_size = selection.block_size,
+        .rows_per_wg = selection.rows_per_wg,
+        .thread_execution_width = selection.pipe.thread_execution_width,
+        .static_threadgroup_memory_length = selection.pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(output_copy),
+        .output = output_copy,
+    };
+}
+
 fn benchmarkSeparateDualVariant(
     allocator: std.mem.Allocator,
     device: *const metal_device.MetalDevice,
@@ -1918,6 +2096,8 @@ pub fn main() !void {
 
             var route_cols_result: ?BenchResult = null;
             defer if (route_cols_result) |*result| allocator.free(result.output);
+            var route_cols_active_result: ?BenchResult = null;
+            defer if (route_cols_active_result) |*result| allocator.free(result.output);
 
             route_cols_result = try benchmarkMoeColsVariant(
                 allocator,
@@ -1929,6 +2109,17 @@ pub fn main() !void {
                 config.iterations,
             );
             try printBenchResult(&stdout, route_cols_result.?);
+
+            route_cols_active_result = try benchmarkMoeColsActiveBlocksVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.route_tokens,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, route_cols_active_result.?);
         } else if (hot_case.isDual()) {
             const tensor1 = hot_case.tensor1.?;
             try stdout.interface.print(

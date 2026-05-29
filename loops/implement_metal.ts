@@ -71,6 +71,19 @@ const BENCHMARK_WARMUPS = parsePositiveIntEnv("ZINC_BENCHMARK_WARMUPS", 1);
 // middle anyway. Mitigates the cold/warm process-boundary noise pattern
 // without requiring zinc itself to support multi-prompt batched runs.
 const BENCHMARK_TRIM = parseBoolEnv("ZINC_BENCHMARK_TRIM", true);
+// Confirmation re-run: when a candidate lands in the noise zone around the
+// promotion boundary (or its samples were flagged bimodal/THERMAL), collect
+// this many EXTRA timed samples and re-aggregate over the combined set before
+// deciding keep/revert. This rescues real ~1-2% wins that a 3-5 sample median
+// cannot distinguish from M-series thermal jitter, without paying the extra
+// runtime on every cycle. Set to 0 to disable.
+const BENCHMARK_CONFIRM_RUNS = parsePositiveIntEnv("ZINC_BENCHMARK_CONFIRM_RUNS", 6);
+// A fast-but-incorrect result is tracked as a "near-miss" optimization target
+// only when it beats the current accepted baseline by at least this percent.
+// The route-packed F32 shared-gate path repeatedly hit ~109 tok/s (+6.5%) but
+// broke output to "!!!!"; recording it lets the prompt redirect the agent at
+// localizing the divergent layer instead of rediscovering the same dead end.
+const NEAR_MISS_MIN_GAIN_PCT = parsePositiveFloatEnv("ZINC_NEAR_MISS_MIN_GAIN_PCT", 2);
 const PROFILE_EVERY = parsePositiveIntEnv("ZINC_PROFILE_EVERY", 5); // Run with --profile every N cycles
 const STALL_THRESHOLD = 5; // Cycles without tok/s improvement before studying references
 const RECENT_PROGRESS_WINDOW = 10;
@@ -95,6 +108,27 @@ const BLOCKED_GIT_OPS = [
   "Bash(git stash:*)",
   "Bash(git clean:*)",
 ];
+
+// ZINC reserves the Metal GPU exclusively — only one zinc process may own it.
+// On the host (e.g. the Claude agent, unlike sandboxed Codex) an agent CAN run
+// the model binary, which then holds the GPU and collides with the harness's
+// own exclusive measurement run, crashing the cycle with "GPU metal:0 is
+// already reserved". The harness owns ALL Metal measurement, so hard-block the
+// agent from launching the model binary or any GPU-reserving build step. Plain
+// `zig build` and `zig build test` stay allowed (they don't reserve the GPU).
+const BLOCKED_MODEL_RUN_OPS = [
+  "Bash(./zig-out/bin/zinc:*)",
+  "Bash(zig-out/bin/zinc:*)",
+  "Bash(zig build run:*)",
+  "Bash(zig build bench:*)",
+  "Bash(zig build bench-metal:*)",
+  "Bash(zig build bench-metal-shapes:*)",
+  "Bash(zig build bench-metal-gemm-q4k:*)",
+  "Bash(zig build bench-metal-dmmv-q4k:*)",
+  "Bash(zig build hot-bench:*)",
+];
+
+const BLOCKED_AGENT_OPS = [...BLOCKED_GIT_OPS, ...BLOCKED_MODEL_RUN_OPS];
 
 type AgentKind = "claude" | "codex";
 
@@ -990,7 +1024,112 @@ async function runCommand(
   });
 }
 
+// ── Sample collection + aggregation ──────────────────────────────────
+
+export type SampleAggregate = {
+  tokPerSec: number | null;
+  trimmed: boolean;
+  trimCount: number;
+  range: number;
+  bimodal: boolean;
+};
+
+/**
+ * Aggregate raw timed tok/s samples into a single representative number.
+ * Default is the median; with `trim` enabled the symmetric high+low extremes
+ * are dropped first (1 each for 5-6 samples, 2 each for 7+). Also reports
+ * whether the spread looks bimodal/thermal — the loop's accept band is tighter
+ * than a >1.5 tok/s straddle, so a "kept" verdict at that noise level is
+ * suspect and is what triggers a confirmation re-run.
+ */
+export function aggregateTimedSamples(samples: number[], trim: boolean = BENCHMARK_TRIM): SampleAggregate {
+  const sorted = [...samples].sort((a, b) => a - b);
+  let kept: number[] = sorted;
+  let trimmed = false;
+  let trimCount = 0;
+  if (trim && sorted.length >= 7) {
+    trimCount = 2;
+    kept = sorted.slice(2, sorted.length - 2);
+    trimmed = true;
+  } else if (trim && sorted.length >= 5) {
+    trimCount = 1;
+    kept = sorted.slice(1, sorted.length - 1);
+    trimmed = true;
+  }
+  const tokPerSec = kept.length > 0 ? kept[Math.floor(kept.length / 2)] : null;
+  const range = sorted.length > 1 ? sorted[sorted.length - 1] - sorted[0] : 0;
+  let bimodal = false;
+  if (tokPerSec != null && sorted.length > 1) {
+    const med = tokPerSec;
+    const hasLow = sorted.some((s) => s <= med - 0.75);
+    const hasHigh = sorted.some((s) => s >= med + 0.75);
+    bimodal = range > 1.5 && hasLow && hasHigh;
+  }
+  return { tokPerSec, trimmed, trimCount, range, bimodal };
+}
+
+/**
+ * Decide whether a candidate cycle's measurement is too close to the promotion
+ * boundary (or too noisy) to trust, and therefore warrants extra samples before
+ * the keep/revert verdict. Confirmation only ever helps when the change built,
+ * tested, ran, and produced correct output — broken output is reverted outright
+ * regardless of speed, so re-measuring it is wasted runtime.
+ */
+export function shouldConfirmCandidate(args: {
+  containsReference: boolean;
+  ranOk: boolean;
+  verifyTps: number;
+  bestTps: number;
+  improveBand: number;
+  bimodal: boolean;
+  sampleCount: number;
+  confirmRuns: number;
+}): boolean {
+  if (args.confirmRuns <= 0) return false;
+  if (!args.containsReference || !args.ranOk) return false;
+  if (args.verifyTps <= 0) return false;
+  // Already have a robust sample count — no extra confidence to gain.
+  if (args.sampleCount >= 9) return false;
+  // Bimodal/thermal spread: the median picked one cluster; verify it.
+  if (args.bimodal) return true;
+  // Within one band of the promotion line — extra samples can flip the verdict
+  // in either direction (rescue a real win just below, reject noise just above).
+  const promotionLine = args.bestTps + args.improveBand;
+  return Math.abs(args.verifyTps - promotionLine) <= args.improveBand;
+}
+
 // ── Build, test, and run ─────────────────────────────────────────────
+
+/**
+ * Run the built binary `runs` times and collect parsed tok/s samples. Used for
+ * both the in-cycle benchmark and the optional confirmation re-run. Does not
+ * build or test — the caller guarantees `./zig-out/bin/zinc` is current.
+ */
+async function collectTimedSamples(
+  maxTokens: number,
+  runs: number,
+  label: string,
+): Promise<{ samples: number[]; lastRun: RunResult; lastCombined: string }> {
+  const samples: number[] = [];
+  let lastRun: RunResult = { exitCode: -1, stdout: "", stderr: "" };
+  let lastCombined = "";
+  for (let sample = 0; sample < runs; sample++) {
+    const run = await runCommand(
+      "./zig-out/bin/zinc",
+      [...zincModelArgs(), ...zincPromptArgs(), "-n", String(maxTokens)],
+      { timeout: RUN_TIMEOUT_MS },
+    );
+    lastRun = run;
+    lastCombined = run.stderr + run.stdout;
+    if (run.exitCode !== 0) break; // crash — no point running more samples
+    const tps = parseTokPerSec(lastCombined, METRIC_MODE);
+    if (tps != null) {
+      samples.push(tps);
+      console.log(clr("2", `    ${label} ${sample + 1}/${runs}: ${tps.toFixed(2)} ${METRIC_LABEL}`));
+    }
+  }
+  return { samples, lastRun, lastCombined };
+}
 
 async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
   const buildArgs = zigBuildArgs();
@@ -1099,24 +1238,6 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
   // If a warmup crashed, skip the timed loop and surface the failure below.
   const warmupCrashed = BENCHMARK_WARMUPS > 0 && lastRun.exitCode !== 0;
 
-  for (let sample = 0; !warmupCrashed && sample < BENCHMARK_RUNS; sample++) {
-    const run = await runCommand(
-      "./zig-out/bin/zinc",
-      [...zincModelArgs(), ...zincPromptArgs(), "-n", String(maxTokens)],
-      { timeout: RUN_TIMEOUT_MS },
-    );
-    lastRun = run;
-    lastCombined = run.stderr + run.stdout;
-
-    if (run.exitCode !== 0) break; // crash — no point running more samples
-
-    const tps = parseTokPerSec(lastCombined, METRIC_MODE);
-    if (tps != null) {
-      tokPerSecSamples.push(tps);
-      console.log(clr("2", `    sample ${sample + 1}/${BENCHMARK_RUNS}: ${tps.toFixed(2)} ${METRIC_LABEL}`));
-    }
-  }
-
   // Aggregate samples. Default is median of all timed samples. With
   // BENCHMARK_TRIM, drop symmetric high+low extremes before taking the
   // median:
@@ -1127,40 +1248,25 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
   // sets where a single-trim still picked the wrong cluster. Symmetric
   // 2-trim from 7 samples leaves the middle 3, which is robust to the
   // cold-GPU outlier and the occasional too-warm outlier together.
-  const sorted = [...tokPerSecSamples].sort((a, b) => a - b);
-  let kept: number[] = sorted;
-  let trimmed = false;
-  let trimCount = 0;
-  if (BENCHMARK_TRIM && sorted.length >= 7) {
-    trimCount = 2;
-    kept = sorted.slice(2, sorted.length - 2);
-    trimmed = true;
-  } else if (BENCHMARK_TRIM && sorted.length >= 5) {
-    trimCount = 1;
-    kept = sorted.slice(1, sorted.length - 1);
-    trimmed = true;
+  if (!warmupCrashed) {
+    const timed = await collectTimedSamples(maxTokens, BENCHMARK_RUNS, "sample");
+    tokPerSecSamples.push(...timed.samples);
+    lastRun = timed.lastRun;
+    lastCombined = timed.lastCombined;
   }
-  const tokPerSec = kept.length > 0 ? kept[Math.floor(kept.length / 2)] : null;
+
+  const agg = aggregateTimedSamples(tokPerSecSamples);
+  const tokPerSec = agg.tokPerSec;
   const tokensGenerated = parseTokensGenerated(lastCombined);
   const outputText = parseOutputText(lastCombined);
   const evaluation = evaluateOutputText(outputText);
 
-  if (tokPerSec != null && sorted.length > 1) {
-    const range = sorted[sorted.length - 1] - sorted[0];
-    const aggLabel = trimmed
-      ? `trimmed median (drop ${trimCount} high + ${trimCount} low)`
+  if (tokPerSec != null && tokPerSecSamples.length > 1) {
+    const aggLabel = agg.trimmed
+      ? `trimmed median (drop ${agg.trimCount} high + ${agg.trimCount} low)`
       : "median";
-    // Bimodal heuristic: if range > 1.5 AND samples straddle a ~1.5
-    // tok/s gap (low cluster ≤ median−0.75 and high cluster ≥
-    // median+0.75 both present), flag THERMAL — the loop's accept
-    // band is tighter than this spread, so a "kept" verdict at this
-    // noise level should be read with suspicion.
-    const med = tokPerSec;
-    const hasLow = sorted.some(s => s <= med - 0.75);
-    const hasHigh = sorted.some(s => s >= med + 0.75);
-    const bimodal = range > 1.5 && hasLow && hasHigh;
-    const flag = bimodal ? " ⚠ THERMAL" : "";
-    console.log(clr("1;36", `    ${aggLabel}: ${tokPerSec.toFixed(2)} ${METRIC_LABEL} [${tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] range=${range.toFixed(1)}${flag}`));
+    const flag = agg.bimodal ? " ⚠ THERMAL" : "";
+    console.log(clr("1;36", `    ${aggLabel}: ${tokPerSec.toFixed(2)} ${METRIC_LABEL} [${tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] range=${agg.range.toFixed(1)}${flag}`));
   }
 
   const result: BuildRunResult = {
@@ -1464,15 +1570,20 @@ function formatCodexStderrLine(rawLine: string): string | null {
 
 // ── Agent invocation ─────────────────────────────────────────────────
 
+// Reasoning-effort knob for the Claude agent. The CLI accepts
+// low|medium|high|xhigh|max; default high. Override via ZINC_CLAUDE_EFFORT
+// (set ZINC_CLAUDE_EFFORT=max for the top tier).
+const CLAUDE_EFFORT = process.env.ZINC_CLAUDE_EFFORT ?? "high";
+
 function buildClaudeArgs(prompt: string, model?: string): string[] {
   const args = [
     "-p",
     "--verbose",
     "--output-format", "stream-json",
     "--include-partial-messages",
-    `--disallowed-tools=${BLOCKED_GIT_OPS.join(",")}`,
+    `--disallowed-tools=${BLOCKED_AGENT_OPS.join(",")}`,
     "--permission-mode", "bypassPermissions",
-    "--effort", "high",
+    "--effort", CLAUDE_EFFORT,
   ];
   if (model) args.push("--model", model);
   args.push(prompt);
@@ -1560,12 +1671,185 @@ async function runAgent(agent: AgentKind, prompt: string, model?: string): Promi
   return result;
 }
 
+// ── Near-miss tracking + correctness-debug directive ─────────────────
+
+/**
+ * Record a fast-but-incorrect measurement as the standing near-miss target if
+ * it is faster than the one already tracked. Only candidates that built,
+ * tested, and RAN (no crash) but produced wrong output qualify — a crash or a
+ * slower-than-accepted result is not a speedup worth chasing. Returns true if
+ * `state.bestIncorrect` was updated.
+ */
+export function recordNearMiss(
+  state: RunState,
+  candidate: {
+    cycle: number;
+    tokPerSec: number | null;
+    ranOk: boolean;
+    containsReference: boolean;
+    acceptedTps: number;
+    description: string;
+    selfAnalysis: string;
+    outputText: string;
+  },
+): boolean {
+  if (candidate.containsReference) return false; // correct output isn't a near-miss
+  if (!candidate.ranOk) return false; // crash/build/test failures aren't speedups
+  const tps = candidate.tokPerSec ?? 0;
+  if (tps <= 0 || candidate.acceptedTps <= 0) return false;
+  const gainPct = ((tps - candidate.acceptedTps) / candidate.acceptedTps) * 100;
+  if (gainPct < NEAR_MISS_MIN_GAIN_PCT) return false; // not meaningfully faster
+  if (state.bestIncorrect && state.bestIncorrect.tokPerSec >= tps) return false;
+  state.bestIncorrect = {
+    cycle: candidate.cycle,
+    tokPerSec: tps,
+    gainPctOverAccepted: gainPct,
+    description: candidate.description,
+    selfAnalysis: candidate.selfAnalysis,
+    outputText: candidate.outputText.slice(0, 80),
+  };
+  return true;
+}
+
+/**
+ * One-time migration for resumed runs whose state.json predates
+ * `bestIncorrect`. Scans cycle history for the fastest cycle that built,
+ * tested, and ran but was reverted for wrong output, and seeds the near-miss
+ * target from it so the redirect kicks in on the very next cycle. Gain is
+ * measured against the best kept-correct throughput in the same history. No-op
+ * if a near-miss is already recorded.
+ */
+export function backfillNearMiss(state: RunState): boolean {
+  if (state.bestIncorrect) return false;
+  const acceptedTps = bestKeptCorrectTokPerSec(state);
+  if (acceptedTps <= 0) return false;
+  let best: CycleResult | null = null;
+  for (const c of state.cycles) {
+    if (c.kept) continue;
+    if (c.containsReference) continue;
+    if (c.buildExitCode !== 0 || c.testExitCode !== 0) continue;
+    if (c.runExitCode !== 0) continue; // skip crashes/skipped runs
+    if (c.tokPerSec == null) continue;
+    const gainPct = ((c.tokPerSec - acceptedTps) / acceptedTps) * 100;
+    if (gainPct < NEAR_MISS_MIN_GAIN_PCT) continue;
+    if (!best || (c.tokPerSec ?? 0) > (best.tokPerSec ?? 0)) best = c;
+  }
+  if (!best || best.tokPerSec == null) return false;
+  state.bestIncorrect = {
+    cycle: best.cycle,
+    tokPerSec: best.tokPerSec,
+    gainPctOverAccepted: ((best.tokPerSec - acceptedTps) / acceptedTps) * 100,
+    description: best.description,
+    selfAnalysis: best.selfAnalysis ?? "",
+    outputText: (best.outputText ?? "").slice(0, 80),
+  };
+  return true;
+}
+
+/**
+ * Build the CORRECTNESS-DEBUG section that redirects the agent at a recorded
+ * near-miss: a change that proved a speedup is reachable but broke output. The
+ * directive is forceful — it tells the agent to STOP guessing new speed ideas
+ * and instead localize the divergent layer with the bisection/validation env
+ * flags the model already supports. The wording escalates once the run has
+ * stalled, which doubles as the active plateau-escape redirect.
+ */
+/** Regex that flags a cycle as a "route-pack family" attempt — the family
+ * the near-miss belongs to. Used to count how many cycles have already tried
+ * to chase the same near-miss without making it correct, so the directive can
+ * escalate from "go bisect" to "STOP guessing, run the validator". */
+const NEAR_MISS_ROUTE_PACK_RE = /\b(route[- ]?pack(ed|ing)?|shared[- ]?gate|moe[- ]?route|prefix[- ]?layers?)\b/i;
+
+/** Cycles since `bestIncorrect` was recorded that attempted the same family
+ * but reverted with broken output (so they discovered nothing new and the
+ * agent should change tactic). */
+export function countNearMissFamilyReverts(state: RunState): number {
+  const nm = state.bestIncorrect;
+  if (!nm) return 0;
+  let count = 0;
+  for (const c of state.cycles) {
+    if (c.cycle < nm.cycle) continue; // only count attempts AT OR AFTER the near-miss
+    if (c.kept) continue;
+    if (c.containsReference) continue;
+    if (c.tokPerSec == null) continue;
+    const text = `${c.description} ${c.selfAnalysis ?? ""}`;
+    if (NEAR_MISS_ROUTE_PACK_RE.test(text)) count++;
+  }
+  return count;
+}
+
+export function buildNearMissDirective(
+  state: RunState,
+  acceptedBestTps: number,
+  stalled: boolean,
+): string[] {
+  const nm = state.bestIncorrect;
+  if (!nm) return [];
+  // Only surface while the near-miss is still meaningfully ahead of where the
+  // accepted tree already is — once a correct change matches/exceeds it, the
+  // target is moot.
+  if (nm.tokPerSec <= acceptedBestTps + Math.max(0.3, acceptedBestTps * 0.005)) return [];
+
+  const familyReverts = countNearMissFamilyReverts(state);
+  const escalate = familyReverts >= 5; // agent has already tried this family ≥5 times
+
+  const lines: string[] = [];
+  lines.push(
+    escalate
+      ? `## ★★★★ NEAR-MISS DEADLOCK — ${familyReverts} cycles attempted the ${nm.tokPerSec.toFixed(1)} ${METRIC_LABEL} family with NO correctness fix. STOP guessing variants. Localize the divergence FIRST.`
+      : stalled
+        ? `## ★★★ PLATEAU REDIRECT — chase the proven ${nm.tokPerSec.toFixed(1)} ${METRIC_LABEL} near-miss`
+        : `## ★ KNOWN NEAR-MISS — a proven +${nm.gainPctOverAccepted.toFixed(1)}% speedup is correctness-blocked`,
+  );
+  lines.push(
+    `Cycle ${nm.cycle} reached **${nm.tokPerSec.toFixed(1)} ${METRIC_LABEL}** (current accepted ≈ ${acceptedBestTps.toFixed(1)}, +${nm.gainPctOverAccepted.toFixed(1)}%) but was REVERTED because output broke to "${nm.outputText}".`,
+  );
+  lines.push(`That change: ${trunc(nm.description, 200)}`);
+  // Carry the original agent's rationale forward verbatim (longer trunc).
+  // Cycle 9 of the previous run captured the full bisection plan and named
+  // the suspected divergence site in its own self-analysis — that evidence is
+  // far more useful to the next agent than the directive alone.
+  if (nm.selfAnalysis) {
+    lines.push("");
+    lines.push("Prior reasoning recorded with this near-miss (the agent who made it explained its plan):");
+    lines.push(`> ${trunc(nm.selfAnalysis, 900).replace(/\n+/g, " ")}`);
+  }
+  lines.push("");
+  lines.push(
+    "This is the single highest-value lever in the run. The speedup is REAL and reachable — the only blocker is a numerical divergence somewhere in the route-pack / F32 shared-gate scatter family. Do NOT re-attempt blind variants of the same idea; that has already failed repeatedly.",
+  );
+  lines.push("");
+  lines.push("**Validator infrastructure already exists in the tree** (built by prior cycles). Use these env flags — they are real and parsed by `src/compute/forward_metal.zig` / `forward.zig`:");
+  lines.push("- `ZINC_QWEN36_35B_ROUTE_PACK_PREFIX_LAYERS=<N>` — cap how many leading SSM/attention layers use the fast path (bisection knob).");
+  lines.push("- `ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL=1` and `ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL_BISECT=1` — run the route-pack path AND the reference per token; emit per-layer/per-tensor max-abs/L2 diffs.");
+  lines.push("- `ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_LAYER=<L>` — pin the validator to one layer for a focused report.");
+  lines.push("- `ZINC_QWEN36_35B_PREFILL_VALIDATE=1` + `ZINC_QWEN36_35B_PREFILL_VALIDATE_LAYER=<L>` + `ZINC_QWEN36_35B_PREFILL_VALIDATE_TOKENS=<N>` — broader per-layer logits/intermediate diff.");
+  lines.push("- `ZINC_QWEN36_35B_SSM_PREFILL_PROJ` / `ZINC_QWEN36_35B_SSM_PROJ_VALIDATE_LAYER=<L>` — SSM-projection-specific validator.");
+  lines.push("");
+  if (escalate) {
+    lines.push("**You are in DEADLOCK MODE.** Do not propose another route-pack variant. The single useful action this cycle is one of:");
+    lines.push("(a) **Strengthen the validator** so it prints the first diverging *tensor name* and *layer index* in a single line you can grep for (today the validator reports diffs but the loop can't pin the failure to one tensor without you reading the output). Default-off; this is a foundation keep allowed at 0 % impact per Rule 4 of the effort.");
+    lines.push("(b) **Read the most recent profile output and prior cycles' self-analyses below** and write down the smallest hypothesis that explains why the route-pack F32 shared-gate scatter produces `!!!!` — name the candidate tensor (e.g. `moe_route_scatter_shared_residual_gate_f32` scalar inputs, `router_f32_topk_batched_shared_gate` output, or the SSM-out → MoE handoff at non-zero start-layer) and the ONE small numerical fix you'd try.");
+    lines.push("(c) If you have already done (a) and (b) in past cycles and the validator reports a specific divergent tensor, **fix that tensor's numerics this cycle** (e.g. match the slow-path reduction order, replace f32 accumulation with f64, fix a quant scale mismatch). One source change, one tensor.");
+    lines.push("");
+    lines.push("Pick exactly one of (a), (b), (c). Do NOT also retune kernel threadgroups or refactor unrelated paths in the same cycle — those have measured neutral across the recent stall window.");
+  } else {
+    lines.push("Plan for THIS cycle (pick one):");
+    lines.push("1. Reproduce the fast path under a capped prefix (`ZINC_QWEN36_35B_ROUTE_PACK_PREFIX_LAYERS=<N>`) and binary-search the largest N where output still contains \"Paris\". The first layer beyond that N is where the fast path diverges. Report the cap value + Paris/no-Paris in `@@@SELF_ANALYSIS`.");
+    lines.push("2. Run the existing validator at the suspect layer (`ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL_BISECT=1 ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_LAYER=<L>`) and report the first diverging tensor name and max-abs diff. (The OUTER HARNESS runs the model — describe the change as wiring the validator into the prefill path and leave the actual run to the harness.)");
+    lines.push("3. Fix the divergence at its source (match the validated slow-path scalar / reduction order) and KEEP the cap-based partial enablement if full enablement still drifts — partial is still a real win.");
+  }
+  lines.push("");
+  lines.push("Report which layer/tensor diverged (or which env knob isolated it) in `@@@SELF_ANALYSIS` even if you don't fully fix it this cycle — that evidence is what unblocks the next cycle.");
+  return lines;
+}
+
 // ── Prompt builder ───────────────────────────────────────────────────
+
+const trunc = (s: string, max: number) => (s.length > max ? s.slice(0, max) + "…" : s);
 
 export function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
   const { cycles, failedApproaches, phase } = state;
-
-  const trunc = (s: string, max: number) => s.length > max ? s.slice(0, max) + "…" : s;
 
   const historyBlock = cycles.length > 0
     ? cycles.slice(-15).map(h => {
@@ -1597,7 +1881,13 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     diagnosis.push("Fix the failing test. All 27+ Metal tests must pass before any perf work.");
   } else if (lastResult.runExitCode !== 0 && lastResult.runExitCode !== null) {
     diagnosis.push(`## Status: RUNTIME CRASH (exit code ${lastResult.runExitCode})`);
-    diagnosis.push("Build and tests pass but ZINC crashes during inference. Fix the crash first.");
+    if (/already reserved|reserved by another zinc/i.test(lastResult.runOutput)) {
+      // Environmental, not a code bug: another zinc process holds the GPU.
+      diagnosis.push("This is NOT a code bug. The Metal GPU is exclusively reserved by another zinc process (a stale/leftover instance, or an agent that ran the model itself). The model loaded fine; nothing in the source caused this.");
+      diagnosis.push("DO NOT edit code to 'fix' this and DO NOT run the model yourself. Make NO source change this cycle — emit @@@STEP_KIND: analysis and explain that the GPU was occupied. The operator must free the GPU (kill the stray zinc) before the harness can measure. The harness will re-measure next cycle once the GPU is free.");
+    } else {
+      diagnosis.push("Build and tests pass but ZINC crashes during inference. Fix the crash first.");
+    }
   } else if (!lastResult.containsReference) {
     diagnosis.push(`## Status: CORRECTNESS REGRESSION — output doesn't contain "Paris"`);
     diagnosis.push(`Output text: "${lastResult.outputText}"`);
@@ -1630,6 +1920,24 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
   } else {
     diagnosis.push(`## Status: TARGET REACHED — ${lastResult.tokPerSec?.toFixed(1)} ${METRIC_LABEL} ≥${TARGET_TOK_PER_SEC}`);
     diagnosis.push("Performance target met!");
+  }
+
+  // Known near-miss redirect. When a prior change proved a speedup is reachable
+  // but broke output, point the agent at localizing the divergent layer instead
+  // of rediscovering the dead end. Only surface while currently correct (we're
+  // optimizing, not fixing) and the near-miss still leads the accepted tree.
+  const stalledNow = state.stalledCycles >= STALL_THRESHOLD;
+  if (lastResult.containsReference) {
+    const acceptedForNearMiss = Math.max(
+      currentAcceptedTokPerSec(state),
+      bestKeptCorrectTokPerSec(state),
+      correctResultTokPerSec(lastResult),
+    );
+    const nearMissLines = buildNearMissDirective(state, acceptedForNearMiss, stalledNow);
+    if (nearMissLines.length > 0) {
+      diagnosis.push("");
+      diagnosis.push(...nearMissLines);
+    }
   }
 
   // Stall warning
@@ -1901,6 +2209,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     "10. UMA advantage: all buffers are SharedMode — cpu_ptr gives direct CPU access to GPU data.",
     "11. Read the profile output and run output BEFORE deciding what to optimize.",
     "12. Prefer changes to forward_metal.zig and shaders. Avoid refactoring infrastructure.",
+    "13. NEVER run the model yourself: not `./zig-out/bin/zinc ...`, not `zig build run/bench/bench-metal*/hot-bench`, not any command that loads the model on the GPU. ZINC reserves the Metal GPU exclusively, so your run would collide with the harness's own measurement and crash the cycle (\"GPU metal:0 is already reserved\"). The OUTER HARNESS owns all measurement, profiling, and validation runs. You may ONLY run `zig build` and `zig build test`. A \"RUNTIME CRASH\" reported below is the harness's measurement, not something you reproduce or fix by running the model.",
     "",
     "## Output Format",
     "After making your change, print these 4 lines:",
@@ -1934,6 +2243,22 @@ export type CycleResult = {
   nextIdeas: string[];
 };
 
+/**
+ * The fastest measurement the loop has ever seen that built, tested, ran, and
+ * was REVERTED purely because the output was wrong. This is a standing
+ * optimization target: it proves a speedup is reachable, so the prompt redirects
+ * the agent at localizing the divergent layer rather than re-deriving the same
+ * correctness-breaking idea from scratch (the route-packed ~109 tok/s dead end).
+ */
+export type NearMiss = {
+  cycle: number;
+  tokPerSec: number;
+  gainPctOverAccepted: number;
+  description: string;
+  selfAnalysis: string;
+  outputText: string;
+};
+
 export type RunState = {
   runId: string;
   cycles: CycleResult[];
@@ -1943,6 +2268,8 @@ export type RunState = {
   currentBest: { tokPerSec: number | null; containsReference: boolean } | null;
   stalledCycles: number;
   bestTokPerSec: number;
+  /// Fastest reverted-for-correctness measurement; see {@link NearMiss}.
+  bestIncorrect?: NearMiss | null;
   lastProfileOutput: string | null;
   lastProfileCycle: number | null;
   reviewSummaries: string[];
@@ -2274,7 +2601,12 @@ async function main() {
     state.effortPlan ??= null;
     state.effortId ??= null;
     state.effortFile ??= null;
+    state.bestIncorrect ??= null;
     normalizeStateBestTokPerSec(state);
+    // Seed the near-miss target from history for runs predating bestIncorrect.
+    if (backfillNearMiss(state) && state.bestIncorrect) {
+      console.log(clr("1;35", `  ◎ Backfilled near-miss from cycle ${state.bestIncorrect.cycle}: ${state.bestIncorrect.tokPerSec.toFixed(1)} ${METRIC_LABEL} (+${state.bestIncorrect.gainPctOverAccepted.toFixed(1)}% over best kept-correct, output broke to "${state.bestIncorrect.outputText}")`));
+    }
     // Re-read the effort doc from disk every resume so an edited plan
     // reaches the next agent invocation without losing saved history.
     if (effortBundle) {
@@ -2423,7 +2755,6 @@ async function main() {
     const baselines = keepBaselinesForCycle(state, result);
     const bestTps = baselines.bestTokPerSec;
     const acceptedTps = baselines.acceptedTokPerSec;
-    const verifyTps = verify.tokPerSec ?? 0;
     // Proportional bands scale with real accepted performance, but use
     // two different anchors: promotion compares with the best kept
     // correct result, while neutral keeps compare with the current
@@ -2437,6 +2768,42 @@ async function main() {
     const improveBand = Math.max(0.3, bestTps * 0.02);
     const noiseBand = Math.max(0.25, acceptedTps * 0.01);
     const currentProgressBand = smallAcceptedProgressBand(acceptedTps);
+
+    // Confirmation re-run: when a correct candidate sits in the noise zone
+    // around the promotion boundary (or its samples were bimodal/THERMAL),
+    // collect extra timed samples and re-aggregate over the combined set
+    // before the verdict. This rescues real ~1-2% wins from M-series thermal
+    // jitter without paying the cost on clearly-keep or clearly-revert cycles.
+    // The tree is unchanged here, so no rebuild/retest is needed. Only the
+    // throughput estimate is refined — the correctness verdict from the cycle
+    // run stands.
+    const preConfirmAgg = aggregateTimedSamples(verify.tokPerSecSamples);
+    if (
+      shouldConfirmCandidate({
+        containsReference: verify.containsReference,
+        ranOk: verify.runExitCode === 0,
+        verifyTps: verify.tokPerSec ?? 0,
+        bestTps,
+        improveBand,
+        bimodal: preConfirmAgg.bimodal,
+        sampleCount: verify.tokPerSecSamples.length,
+        confirmRuns: BENCHMARK_CONFIRM_RUNS,
+      })
+    ) {
+      console.log(clr("1;33", `  🔁 Confirmation re-run (${BENCHMARK_CONFIRM_RUNS} extra samples; candidate ${(verify.tokPerSec ?? 0).toFixed(2)} near promotion line ${(bestTps + improveBand).toFixed(2)}${preConfirmAgg.bimodal ? ", bimodal" : ""})...`));
+      const confirm = await collectTimedSamples(currentMaxTokens, BENCHMARK_CONFIRM_RUNS, "confirm");
+      if (confirm.samples.length > 0) {
+        verify.tokPerSecSamples = [...verify.tokPerSecSamples, ...confirm.samples];
+        const merged = aggregateTimedSamples(verify.tokPerSecSamples);
+        if (merged.tokPerSec != null) {
+          const flag = merged.bimodal ? " ⚠ STILL BIMODAL" : "";
+          console.log(clr("1;36", `    confirmed: ${(verify.tokPerSec ?? 0).toFixed(2)} → ${merged.tokPerSec.toFixed(2)} ${METRIC_LABEL} over ${verify.tokPerSecSamples.length} samples [${verify.tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}]${flag}`));
+          verify.tokPerSec = merged.tokPerSec;
+          await writeFile(join(cycleDir, "verify.log"), JSON.stringify(verify, null, 2));
+        }
+      }
+    }
+    const verifyTps = verify.tokPerSec ?? 0;
 
     if (verify.buildExitCode !== 0 || verify.testExitCode !== 0) {
       // Build or test broken → revert
@@ -2502,6 +2869,25 @@ async function main() {
       await resetCycleToPreHash(preHash);
       state.failedApproaches.push(`${description} — regressed from current ${acceptedTps.toFixed(1)} to ${verifyTps.toFixed(1)} ${METRIC_LABEL}`);
       state.stalledCycles++;
+    }
+
+    // Track a fast-but-incorrect revert as the standing near-miss target so
+    // the next prompt redirects the agent at localizing the divergent layer
+    // rather than rediscovering the same correctness-breaking idea. No-op for
+    // correct or slower-than-accepted results.
+    if (
+      recordNearMiss(state, {
+        cycle,
+        tokPerSec: verify.tokPerSec,
+        ranOk: verify.runExitCode === 0,
+        containsReference: verify.containsReference,
+        acceptedTps,
+        description,
+        selfAnalysis,
+        outputText: verify.outputText,
+      })
+    ) {
+      console.log(clr("1;35", `  ◎ NEAR-MISS recorded — ${(verify.tokPerSec ?? 0).toFixed(1)} ${METRIC_LABEL} (+${state.bestIncorrect!.gainPctOverAccepted.toFixed(1)}% over accepted) but output broke; will redirect future cycles to localize the divergent layer.`));
     }
 
     if (kept) {

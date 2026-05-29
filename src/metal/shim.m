@@ -6,11 +6,16 @@
 #include "shim.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <mach/mach.h>
 
 #ifndef MTLGPUFamilyApple10
 #define MTLGPUFamilyApple10 ((MTLGPUFamily)1010)
 #endif
+
+#define ZINC_METAL_BINDING_SLOTS 64
+#define ZINC_METAL_TGMEM_SLOTS 8
+#define ZINC_METAL_CACHED_BYTES_MAX 128
 
 // --- Opaque struct definitions ---
 
@@ -33,7 +38,11 @@ struct MetalCmd {
     id<MTLCommandBuffer> cmd_buf;
     id<MTLComputeCommandEncoder> encoder;
     id<MTLComputePipelineState> current_pipeline;
-    void* current_buffers[64];
+    void* current_buffers[ZINC_METAL_BINDING_SLOTS];
+    uint32_t current_tgmem_lengths[ZINC_METAL_TGMEM_SLOTS];
+    uint8_t current_bytes_valid[ZINC_METAL_BINDING_SLOTS];
+    size_t current_bytes_size[ZINC_METAL_BINDING_SLOTS];
+    uint8_t current_bytes[ZINC_METAL_BINDING_SLOTS][ZINC_METAL_CACHED_BYTES_MAX];
     uint8_t is_concurrent;
 };
 
@@ -377,19 +386,50 @@ static inline void mtl_set_buffer_if_needed(MetalCmd* cmd, MetalBuf* buf, uint32
     if (!buf || !buf->buffer) return;
 
     void* current = (__bridge void*)buf->buffer;
-    if (idx < 64 && cmd->current_buffers[idx] == current) {
+    if (idx < ZINC_METAL_BINDING_SLOTS && cmd->current_buffers[idx] == current) {
         return;
     }
 
     [cmd->encoder setBuffer:buf->buffer offset:0 atIndex:idx];
-    if (idx < 64) {
+    if (idx < ZINC_METAL_BINDING_SLOTS) {
         cmd->current_buffers[idx] = current;
+        cmd->current_bytes_valid[idx] = 0;
     }
 }
 
-static inline void mtl_mark_bytes_binding(MetalCmd* cmd, uint32_t idx) {
-    if (idx < 64) {
+static inline void mtl_set_bytes_if_needed(MetalCmd* cmd, const void* bytes, size_t size, uint32_t idx) {
+    if (!bytes || size == 0) return;
+
+    if (idx < ZINC_METAL_BINDING_SLOTS && size <= ZINC_METAL_CACHED_BYTES_MAX) {
+        if (cmd->current_bytes_valid[idx] &&
+            cmd->current_bytes_size[idx] == size &&
+            memcmp(cmd->current_bytes[idx], bytes, size) == 0) {
+            return;
+        }
+
+        [cmd->encoder setBytes:bytes length:size atIndex:idx];
         cmd->current_buffers[idx] = NULL;
+        cmd->current_bytes_valid[idx] = 1;
+        cmd->current_bytes_size[idx] = size;
+        memcpy(cmd->current_bytes[idx], bytes, size);
+        return;
+    }
+
+    [cmd->encoder setBytes:bytes length:size atIndex:idx];
+    if (idx < ZINC_METAL_BINDING_SLOTS) {
+        cmd->current_buffers[idx] = NULL;
+        cmd->current_bytes_valid[idx] = 0;
+    }
+}
+
+static inline void mtl_set_threadgroup_memory_if_needed(MetalCmd* cmd, uint32_t length, uint32_t idx) {
+    if (idx < ZINC_METAL_TGMEM_SLOTS && cmd->current_tgmem_lengths[idx] == length) {
+        return;
+    }
+
+    [cmd->encoder setThreadgroupMemoryLength:length atIndex:idx];
+    if (idx < ZINC_METAL_TGMEM_SLOTS) {
+        cmd->current_tgmem_lengths[idx] = length;
     }
 }
 
@@ -410,8 +450,7 @@ void mtl_dispatch(MetalCmd* cmd, MetalPipe* pipe,
 
     // Bind push constants as a buffer at index n_bufs (equivalent to Vulkan push constants)
     if (push_data && push_size > 0) {
-        [cmd->encoder setBytes:push_data length:push_size atIndex:n_bufs];
-        mtl_mark_bytes_binding(cmd, n_bufs);
+        mtl_set_bytes_if_needed(cmd, push_data, push_size, n_bufs);
     }
 
     MTLSize threadgroups = MTLSizeMake(grid[0], grid[1], grid[2]);
@@ -438,8 +477,7 @@ void mtl_dispatch_v2(MetalCmd* cmd, MetalPipe* pipe,
 
     // Bind push constants at push_idx via setBytes (inlined into command buffer)
     if (push_data && push_size > 0) {
-        [cmd->encoder setBytes:push_data length:push_size atIndex:push_idx];
-        mtl_mark_bytes_binding(cmd, push_idx);
+        mtl_set_bytes_if_needed(cmd, push_data, push_size, push_idx);
     }
 
     MTLSize threadgroups = MTLSizeMake(grid[0], grid[1], grid[2]);
@@ -464,12 +502,11 @@ void mtl_dispatch_v2_tgmem(MetalCmd* cmd, MetalPipe* pipe,
     }
 
     if (push_data && push_size > 0) {
-        [cmd->encoder setBytes:push_data length:push_size atIndex:push_idx];
-        mtl_mark_bytes_binding(cmd, push_idx);
+        mtl_set_bytes_if_needed(cmd, push_data, push_size, push_idx);
     }
 
     if (tg_mem_size > 0) {
-        [cmd->encoder setThreadgroupMemoryLength:tg_mem_size atIndex:0];
+        mtl_set_threadgroup_memory_if_needed(cmd, tg_mem_size, 0);
     }
 
     MTLSize threadgroups = MTLSizeMake(grid[0], grid[1], grid[2]);

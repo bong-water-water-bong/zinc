@@ -24,7 +24,6 @@ kernel void main0(
     uint lane [[thread_index_in_simdgroup]]
 ) {
     const uint base_row = (tg_id * 4u + sg_idx) * 2u;
-    if (base_row >= p.M) return;
 
     device const float* input = X + (p.x_offset >> 2);
     device float* output = Y + (p.y_offset >> 2);

@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+  aggregateTimedSamples,
+  backfillNearMiss,
   bestKeptCorrectTokPerSec,
+  buildNearMissDirective,
+  countNearMissFamilyReverts,
   buildPrompt,
   buildQwen36PrefillPlateauAnalysis,
   buildQwen36PrefillPostBreakthroughAnalysis,
@@ -14,6 +18,8 @@ import {
   mergeUniqueEntries,
   parseTokPerSec,
   recentAcceptedProgress,
+  recordNearMiss,
+  shouldConfirmCandidate,
   shouldRejectQwen36PlateauNeutralKeep,
   snapshotFromResult,
 } from "./implement_metal";
@@ -1021,5 +1027,275 @@ describe("buildPrompt", () => {
     const prompt = buildPrompt(state, result);
     expect(prompt).toContain("Benchmark variance warning");
     expect(prompt).toContain("too wide for reliable direction");
+  });
+});
+
+// ── aggregateTimedSamples ───────────────────────────────────────────
+
+describe("aggregateTimedSamples", () => {
+  test("takes plain median without trimming below 5 samples", () => {
+    const agg = aggregateTimedSamples([100, 102, 101], true);
+    expect(agg.tokPerSec).toBe(101);
+    expect(agg.trimmed).toBe(false);
+    expect(agg.trimCount).toBe(0);
+  });
+
+  test("drops 1 high + 1 low for 5-6 samples", () => {
+    const agg = aggregateTimedSamples([90, 100, 101, 102, 110], true);
+    expect(agg.trimmed).toBe(true);
+    expect(agg.trimCount).toBe(1);
+    // After dropping 90 and 110 → median of [100,101,102] = 101
+    expect(agg.tokPerSec).toBe(101);
+  });
+
+  test("drops 2 high + 2 low for 7+ samples", () => {
+    const agg = aggregateTimedSamples([80, 90, 100, 101, 102, 110, 120], true);
+    expect(agg.trimmed).toBe(true);
+    expect(agg.trimCount).toBe(2);
+    expect(agg.tokPerSec).toBe(101);
+  });
+
+  test("flags a bimodal/thermal straddle", () => {
+    // median 101 with a low (98 ≤ 100.25) and high (104 ≥ 101.75) cluster
+    const agg = aggregateTimedSamples([98, 101, 104], false);
+    expect(agg.bimodal).toBe(true);
+    expect(agg.range).toBeCloseTo(6, 5);
+  });
+
+  test("does not flag a tight cluster as bimodal", () => {
+    const agg = aggregateTimedSamples([101, 101.2, 101.4], false);
+    expect(agg.bimodal).toBe(false);
+  });
+
+  test("handles empty samples", () => {
+    const agg = aggregateTimedSamples([], true);
+    expect(agg.tokPerSec).toBeNull();
+  });
+});
+
+// ── shouldConfirmCandidate ──────────────────────────────────────────
+
+describe("shouldConfirmCandidate", () => {
+  const base = {
+    containsReference: true,
+    ranOk: true,
+    verifyTps: 102,
+    bestTps: 100,
+    improveBand: 2,
+    bimodal: false,
+    sampleCount: 5,
+    confirmRuns: 6,
+  };
+
+  test("confirms a candidate sitting right on the promotion line", () => {
+    // promotion line = 100 + 2 = 102; candidate at 102 is exactly borderline
+    expect(shouldConfirmCandidate(base)).toBe(true);
+  });
+
+  test("confirms a clear win that is still within one band of the line", () => {
+    expect(shouldConfirmCandidate({ ...base, verifyTps: 103.5 })).toBe(true);
+  });
+
+  test("does not confirm a candidate far above the promotion line", () => {
+    expect(shouldConfirmCandidate({ ...base, verifyTps: 110 })).toBe(false);
+  });
+
+  test("does not confirm a clear regression far below the line", () => {
+    expect(shouldConfirmCandidate({ ...base, verifyTps: 95 })).toBe(false);
+  });
+
+  test("always confirms when samples are bimodal, even far from the line", () => {
+    expect(shouldConfirmCandidate({ ...base, verifyTps: 110, bimodal: true })).toBe(true);
+  });
+
+  test("never confirms incorrect output (reverted regardless of speed)", () => {
+    expect(shouldConfirmCandidate({ ...base, containsReference: false })).toBe(false);
+  });
+
+  test("never confirms a crashed run", () => {
+    expect(shouldConfirmCandidate({ ...base, ranOk: false })).toBe(false);
+  });
+
+  test("skips confirmation when already richly sampled", () => {
+    expect(shouldConfirmCandidate({ ...base, sampleCount: 9 })).toBe(false);
+  });
+
+  test("disabled when confirmRuns is 0", () => {
+    expect(shouldConfirmCandidate({ ...base, confirmRuns: 0 })).toBe(false);
+  });
+});
+
+// ── recordNearMiss + buildNearMissDirective ─────────────────────────
+
+describe("recordNearMiss", () => {
+  const cand = {
+    cycle: 296,
+    tokPerSec: 109,
+    ranOk: true,
+    containsReference: false,
+    acceptedTps: 102,
+    description: "route-packed F32 shared-gate reuse",
+    selfAnalysis: "expected +5-20 tok/s if correctness holds",
+    outputText: "!!!!!!!!!!!!!!!!",
+  };
+
+  test("records a fast-but-incorrect result as a near-miss", () => {
+    const state = makeState();
+    expect(recordNearMiss(state, cand)).toBe(true);
+    expect(state.bestIncorrect?.tokPerSec).toBe(109);
+    expect(state.bestIncorrect?.cycle).toBe(296);
+    expect(state.bestIncorrect?.gainPctOverAccepted).toBeCloseTo((7 / 102) * 100, 4);
+  });
+
+  test("ignores correct output", () => {
+    const state = makeState();
+    expect(recordNearMiss(state, { ...cand, containsReference: true })).toBe(false);
+    expect(state.bestIncorrect).toBeUndefined();
+  });
+
+  test("ignores crashed runs", () => {
+    const state = makeState();
+    expect(recordNearMiss(state, { ...cand, ranOk: false })).toBe(false);
+  });
+
+  test("ignores results that are not meaningfully faster than accepted", () => {
+    const state = makeState();
+    // +1% < default 2% near-miss threshold
+    expect(recordNearMiss(state, { ...cand, tokPerSec: 103, acceptedTps: 102 })).toBe(false);
+  });
+
+  test("only updates when strictly faster than the existing near-miss", () => {
+    const state = makeState({ bestIncorrect: { cycle: 296, tokPerSec: 109, gainPctOverAccepted: 6.8, description: "x", selfAnalysis: "", outputText: "!!!!" } });
+    expect(recordNearMiss(state, { ...cand, cycle: 319, tokPerSec: 108 })).toBe(false);
+    expect(state.bestIncorrect?.cycle).toBe(296);
+    expect(recordNearMiss(state, { ...cand, cycle: 322, tokPerSec: 111 })).toBe(true);
+    expect(state.bestIncorrect?.cycle).toBe(322);
+    expect(state.bestIncorrect?.tokPerSec).toBe(111);
+  });
+});
+
+describe("buildNearMissDirective", () => {
+  const state = makeState({
+    bestIncorrect: {
+      cycle: 296,
+      tokPerSec: 109,
+      gainPctOverAccepted: 6.5,
+      description: "route-packed F32 shared-gate reuse",
+      selfAnalysis: "expected +5-20 tok/s if correctness holds",
+      outputText: "!!!!!!!!!!!!!!!!",
+    },
+  });
+
+  test("emits a bisection directive with the real 35B layer-cap/validation flags the source actually parses", () => {
+    const lines = buildNearMissDirective(state, 102, false).join("\n");
+    expect(lines).toContain("KNOWN NEAR-MISS");
+    expect(lines).toContain("109.0"); // matches fixture tokPerSec=109
+    expect(lines).toContain("ZINC_QWEN36_35B_ROUTE_PACK_PREFIX_LAYERS");
+    expect(lines).toContain("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL_BISECT");
+    expect(lines).toContain("ZINC_QWEN36_35B_PREFILL_VALIDATE");
+    expect(lines).toContain("BISECT");
+  });
+
+  test("escalates wording to a plateau redirect when stalled but family-revert count is low", () => {
+    const lines = buildNearMissDirective(state, 102, true).join("\n");
+    expect(lines).toContain("PLATEAU REDIRECT");
+  });
+
+  test("carries the original agent's selfAnalysis verbatim so the next cycle sees the plan", () => {
+    const lines = buildNearMissDirective(state, 102, false).join("\n");
+    expect(lines).toContain("Prior reasoning recorded with this near-miss");
+    expect(lines).toContain("expected +5-20 tok/s"); // verbatim slice from the fixture's selfAnalysis
+  });
+
+  test("escalates to DEADLOCK mode after ≥5 route-pack family cycles all reverted", () => {
+    const s = makeState({
+      bestIncorrect: {
+        cycle: 9,
+        tokPerSec: 106.4,
+        gainPctOverAccepted: 4.6,
+        description: "Default-on route-pack capped at layers 0,1,2",
+        selfAnalysis: "Bisect: layer 3 attention may be where F32 shared-gate diverges",
+        outputText: "!!!!!!!!!!!!!!!!",
+      },
+      cycles: [
+        makeCycle({ cycle: 10, kept: false, tokPerSec: 106.0, containsReference: false, description: "Cap route-pack at layer 0 only" }),
+        makeCycle({ cycle: 11, kept: false, tokPerSec: 105.9, containsReference: false, description: "Route-pack with shared-gate scalar replay" }),
+        makeCycle({ cycle: 12, kept: false, tokPerSec: 106.2, containsReference: false, description: "Route-pack prefix layers 0..1 only" }),
+        makeCycle({ cycle: 13, kept: false, tokPerSec: 106.1, containsReference: false, description: "Route-pack with moe-route scatter rewrite" }),
+        makeCycle({ cycle: 14, kept: false, tokPerSec: 105.8, containsReference: false, description: "Shared-gate fused materialization variant" }),
+      ],
+    });
+    expect(countNearMissFamilyReverts(s)).toBe(5);
+    const lines = buildNearMissDirective(s, 102, true).join("\n");
+    expect(lines).toContain("DEADLOCK");
+    expect(lines).toContain("STOP guessing");
+    expect(lines).toContain("Strengthen the validator");
+  });
+
+  test("countNearMissFamilyReverts ignores cycles before the near-miss and kept/correct cycles", () => {
+    const s = makeState({
+      bestIncorrect: {
+        cycle: 9,
+        tokPerSec: 106,
+        gainPctOverAccepted: 4,
+        description: "route-pack",
+        selfAnalysis: "",
+        outputText: "!",
+      },
+      cycles: [
+        makeCycle({ cycle: 5, kept: false, tokPerSec: 100, containsReference: false, description: "route-pack early experiment" }),
+        makeCycle({ cycle: 10, kept: true, tokPerSec: 101, containsReference: true, description: "route-pack neutral keep" }),
+        makeCycle({ cycle: 11, kept: false, tokPerSec: 101, containsReference: false, description: "unrelated kernel retune" }),
+        makeCycle({ cycle: 12, kept: false, tokPerSec: 106, containsReference: false, description: "shared-gate variant" }),
+      ],
+    });
+    expect(countNearMissFamilyReverts(s)).toBe(1); // only cycle 12 qualifies
+  });
+
+  test("is silent when no near-miss is recorded", () => {
+    expect(buildNearMissDirective(makeState(), 102, false)).toEqual([]);
+  });
+
+  test("is silent once the accepted tree catches up to the near-miss", () => {
+    expect(buildNearMissDirective(state, 109, false)).toEqual([]);
+  });
+
+  test("backfillNearMiss seeds the fastest reverted-incorrect cycle from history", () => {
+    const s = makeState({
+      bestTokPerSec: 102,
+      cycles: [
+        makeCycle({ cycle: 285, kept: true, tokPerSec: 102, containsReference: true, outputText: "Paris" }),
+        makeCycle({ cycle: 296, kept: false, tokPerSec: 109.1, containsReference: false, outputText: "!!!!!!!!!!!!!!!!", description: "route-pack F32 shared-gate" }),
+        makeCycle({ cycle: 319, kept: false, tokPerSec: 109.0, containsReference: false, outputText: "!!!!" }),
+        // a crash should be ignored even if "fast"
+        makeCycle({ cycle: 300, kept: false, tokPerSec: 120, containsReference: false, runExitCode: 139, outputText: "" }),
+      ],
+    });
+    expect(backfillNearMiss(s)).toBe(true);
+    expect(s.bestIncorrect?.cycle).toBe(296);
+    expect(s.bestIncorrect?.tokPerSec).toBe(109.1);
+  });
+
+  test("backfillNearMiss is a no-op when one is already recorded", () => {
+    const s = makeState({ bestIncorrect: { cycle: 1, tokPerSec: 109, gainPctOverAccepted: 6, description: "x", selfAnalysis: "", outputText: "!" } });
+    expect(backfillNearMiss(s)).toBe(false);
+    expect(s.bestIncorrect?.cycle).toBe(1);
+  });
+
+  test("backfillNearMiss ignores history with no qualifying revert", () => {
+    const s = makeState({ bestTokPerSec: 102, cycles: [makeCycle({ cycle: 1, kept: true, tokPerSec: 102, containsReference: true })] });
+    expect(backfillNearMiss(s)).toBe(false);
+  });
+
+  test("buildPrompt surfaces the near-miss directive in the optimize phase", () => {
+    const result = makeResult({
+      tokPerSec: 102,
+      containsReference: true,
+      strongAnswer: true,
+      outputText: "The capital of France is Paris.",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("KNOWN NEAR-MISS");
+    expect(prompt).toContain("ZINC_QWEN36_35B_ROUTE_PACK_PREFIX_LAYERS");
   });
 });

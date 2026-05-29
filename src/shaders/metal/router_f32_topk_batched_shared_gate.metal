@@ -2,108 +2,70 @@
 #include <simd/simd.h>
 using namespace metal;
 
-// Qwen3.6 F32-router MoE boundary fusion.
-//
-// Fuses residual_rms_norm.metal with router_f32_topk_batched.metal for the
-// single-token prefill path: hidden += residual, materialize ffn_norm for the
-// expert DMMVs, then route the F32 router weights from the cached normalized
-// vector in the same dispatch. Also emits the one-row F32 shared-gate dot so
-// the following MoE finalizer can consume compact metadata instead of
-// re-reading the normalized row.
+// Batched Qwen3.6 F32 router top-k plus the one-row F32 shared-gate dot.
+// Layer-0 prefill already needs both values from the same normalized rows; this
+// keeps the router output shape unchanged and writes one shared-gate scalar per
+// token for the existing token-major MoE finalizer.
 
-struct Params {
-    uint n;
-    float eps;
-    float scale;
-    uint residual_offset;
+struct RouterF32TopkBatchedSharedGatePush {
     uint n_experts;
     uint K;
     uint k;
-    uint a_offset;
+    uint router_offset;
     uint shared_gate_offset;
+    uint input_offset;
+    uint input_stride;
+    uint output_stride;
 };
 
 #define TG_SIZE 512
-#define SIMD_WIDTH 32
-#define N_SIMDGROUPS (TG_SIZE / SIMD_WIDTH)
-#define ROWS_PER_TG (N_SIMDGROUPS * 2)
+#define SG_PER_TG (TG_SIZE / 32)
+#define ROWS_PER_TG ((TG_SIZE / 32) * 2)
 #define MAX_EXPERTS 256
 #define MAX_K_USED 16
 #define MAX_K_VEC4 1024
 
 kernel void main0(
-    constant Params& p [[buffer(0)]],
-    device float* hidden [[buffer(1)]],
-    device const float* residual [[buffer(2)]],
-    device float* norm_out [[buffer(3)]],
-    device const float* norm_weight [[buffer(4)]],
-    device const float* W [[buffer(5)]],
-    device uint* output_data [[buffer(6)]],
-    device const float* W_shared_gate [[buffer(7)]],
-    device float* shared_gate_out [[buffer(8)]],
+    device const float* W_router [[buffer(0)]],
+    constant RouterF32TopkBatchedSharedGatePush& p [[buffer(1)]],
+    device const float* X [[buffer(2)]],
+    device uint* output_data [[buffer(3)]],
+    device const float* W_shared_gate [[buffer(4)]],
+    device float* shared_gate_out [[buffer(5)]],
+    uint token_idx [[threadgroup_position_in_grid]],
     uint local_id [[thread_position_in_threadgroup]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    if (p.n == 0u || p.K != p.n || (p.K & 3u) != 0u ||
-        (p.K >> 2) > MAX_K_VEC4 ||
-        p.n_experts == 0u || p.n_experts > MAX_EXPERTS ||
-        p.k == 0u || p.k > MAX_K_USED) {
+    threadgroup float4 x_cache4[MAX_K_VEC4];
+    threadgroup float values[MAX_EXPERTS];
+    threadgroup float selected_val[MAX_K_USED];
+    threadgroup float shared_partials[SG_PER_TG];
+
+    if (p.n_experts == 0u || p.n_experts > MAX_EXPERTS ||
+        p.k == 0u || p.k > MAX_K_USED ||
+        (p.K & 3u) != 0u || (p.K >> 2) > MAX_K_VEC4) {
         return;
     }
 
-    threadgroup float4 x_cache4[MAX_K_VEC4];
-    threadgroup float partial_sums[N_SIMDGROUPS];
-    threadgroup float values[MAX_EXPERTS];
-    threadgroup float selected_val[MAX_K_USED];
-    threadgroup float shared_partials[N_SIMDGROUPS];
-
+    device const float* input = X + (p.input_offset >> 2) + token_idx * p.input_stride;
     const uint k_vec4 = p.K >> 2;
-    float sum_sq = 0.0f;
-    for (uint vi = local_id; vi < k_vec4; vi += TG_SIZE) {
-        const uint idx = vi << 2;
-        const float4 h = *(device const float4*)(hidden + idx);
-        const float4 r = *(device const float4*)(residual + p.residual_offset + idx);
-        const float4 updated = fma(float4(p.scale), r, h);
-        *(device float4*)(hidden + idx) = updated;
-        x_cache4[vi] = updated;
-        sum_sq += dot(updated, updated);
-    }
-
-    const float sg_sum = simd_sum(sum_sq);
-    if (lane == 0u) {
-        partial_sums[sg_idx] = sg_sum;
+    for (uint i = local_id; i < k_vec4; i += TG_SIZE) {
+        x_cache4[i] = *(device const float4*)(input + (i << 2));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float partial = (lane < N_SIMDGROUPS) ? partial_sums[lane] : 0.0f;
-    const float total_sq = simd_sum(partial);
-    const float rms_inv = fast::rsqrt(fast::divide(total_sq, float(p.n)) + p.eps);
-
-    for (uint vi = local_id; vi < k_vec4; vi += TG_SIZE) {
-        const uint idx = vi << 2;
-        const float4 w = *(device const float4*)(norm_weight + idx);
-        const float4 nval = w * (x_cache4[vi] * rms_inv);
-        x_cache4[vi] = nval;
-        *(device float4*)(norm_out + idx) = nval;
-    }
-
-    if (local_id < MAX_EXPERTS) {
-        values[local_id] = -INFINITY;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint weight_base = p.a_offset >> 2;
+    const uint router_base = p.router_offset >> 2;
     for (uint row_block = 0u; row_block < p.n_experts; row_block += ROWS_PER_TG) {
         const uint base_row = row_block + sg_idx * 2u;
         float acc0 = 0.0f;
         float acc1 = 0.0f;
 
         if (base_row < p.n_experts) {
-            device const float* row0 = W + weight_base + base_row * p.K;
+            device const float* row0 = W_router + router_base + base_row * p.K;
             device const float* row1 = row0 + p.K;
 
-            for (uint vi = lane; vi < k_vec4; vi += SIMD_WIDTH) {
+            for (uint vi = lane; vi < k_vec4; vi += 32u) {
                 const float4 x = x_cache4[vi];
                 acc0 += dot(*(device const float4*)(row0 + (vi << 2)), x);
                 if (base_row + 1u < p.n_experts) {
@@ -131,15 +93,15 @@ kernel void main0(
     if (lane == 0u) {
         shared_partials[sg_idx] = shared_sum;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (local_id == 0u) {
         float shared_total = 0.0f;
         #pragma unroll
-        for (uint i = 0u; i < N_SIMDGROUPS; ++i) {
+        for (uint i = 0u; i < SG_PER_TG; ++i) {
             shared_total += shared_partials[i];
         }
-        shared_gate_out[0] = shared_total;
+        shared_gate_out[token_idx] = shared_total;
     }
 
     if (p.n_experts == 256u && p.k == 8u) {
@@ -171,7 +133,7 @@ kernel void main0(
                     selected_mask |= 1u << (best_idx >> 5);
                 }
                 if (lane == 0u) {
-                    output_data[slot] = best_idx;
+                    output_data[token_idx * p.output_stride + slot] = best_idx;
                 }
             }
 
@@ -182,7 +144,7 @@ kernel void main0(
             const float sum = simd_sum(exp_score);
             const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
             if (weight_lane) {
-                output_data[8u + lane] = as_type<uint>(exp_score * inv_sum);
+                output_data[token_idx * p.output_stride + 8u + lane] = as_type<uint>(exp_score * inv_sum);
             }
         }
         return;
@@ -190,36 +152,36 @@ kernel void main0(
 
     if (local_id == 0u) {
         const uint k = min(p.k, uint(MAX_K_USED));
-        for (uint slot = 0u; slot < k; ++slot) {
+        for (uint slot = 0u; slot < k; slot++) {
             float best_val = -INFINITY;
             uint best_idx = 0u;
-            for (uint expert = 0u; expert < p.n_experts; ++expert) {
-                const float score = values[expert];
-                if (score > best_val) {
-                    best_val = score;
+            for (uint expert = 0u; expert < p.n_experts; expert++) {
+                const float v = values[expert];
+                if (v > best_val) {
+                    best_val = v;
                     best_idx = expert;
                 }
             }
-            output_data[slot] = best_idx;
+            output_data[token_idx * p.output_stride + slot] = best_idx;
             selected_val[slot] = best_val;
             values[best_idx] = -INFINITY;
         }
 
         float max_sel = -INFINITY;
-        for (uint slot = 0u; slot < k; ++slot) {
+        for (uint slot = 0u; slot < k; slot++) {
             max_sel = max(max_sel, selected_val[slot]);
         }
 
         float sum = 0.0f;
-        for (uint slot = 0u; slot < k; ++slot) {
-            const float e = fast::exp(selected_val[slot] - max_sel);
+        for (uint slot = 0u; slot < k; slot++) {
+            const float e = exp(selected_val[slot] - max_sel);
             selected_val[slot] = e;
             sum += e;
         }
 
         const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
-        for (uint slot = 0u; slot < k; ++slot) {
-            output_data[p.k + slot] = as_type<uint>(selected_val[slot] * inv_sum);
+        for (uint slot = 0u; slot < k; slot++) {
+            output_data[token_idx * p.output_stride + p.k + slot] = as_type<uint>(selected_val[slot] * inv_sum);
         }
     }
 }

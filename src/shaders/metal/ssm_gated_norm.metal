@@ -76,9 +76,15 @@ struct _193
     float _m0[1];
 };
 
-kernel void main0(constant _22& _24 [[buffer(0)]], device _49& _51 [[buffer(1)]], device _166& _168 [[buffer(2)]], device _176& _178 [[buffer(3)]], device _193& _195 [[buffer(4)]], uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]], uint gl_SubgroupSize [[thread_execution_width]])
+kernel void main0(constant _22& _24 [[buffer(0)]], device _49& _51 [[buffer(1)]], device _166& _168 [[buffer(2)]], device _176& _178 [[buffer(3)]], device _193& _195 [[buffer(4)]], uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]], uint gl_SubgroupSize [[thread_execution_width]], uint3 gl_NumThreads [[threads_per_threadgroup]])
 {
-    threadgroup spvUnsafeArray<float, 64> _77;
+    // Parameterized over the dispatched threadgroup size (gl_NumThreads.x)
+    // instead of the SPIRV-Cross-baked local_size_x=64. The host picks 128
+    // for the exact Qwen3.6 head_v_dim=128 SSM shape (one row per thread,
+    // halving the sum/normalize loop trip count) and keeps 64 elsewhere.
+    // Reduction scratch is sized for the largest supported threadgroup.
+    const uint _tg = gl_NumThreads.x;
+    threadgroup spvUnsafeArray<float, 256> _77;
     uint _head_base = gl_WorkGroupID.x * _24._m2;
     uint _token_base = gl_WorkGroupID.y * _24._m0;
     uint _30 = _token_base + _head_base;
@@ -88,18 +94,18 @@ kernel void main0(constant _22& _24 [[buffer(0)]], device _49& _51 [[buffer(1)]]
     {
         uint _55 = _30 + _206;
         _207 += (_51._m0[_24._m7 + _55] * _51._m0[_24._m7 + _55]);
-        _206 += 64u;
+        _206 += _tg;
         continue;
     }
     float _69 = simd_sum(_207);
     float _210;
-    if (gl_SubgroupSize < 64u)
+    if (gl_SubgroupSize < _tg)
     {
         _77[gl_LocalInvocationID.x] = _69;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (gl_LocalInvocationID.x == 0u)
         {
-            uint _95 = (gl_SubgroupSize + 63u) / gl_SubgroupSize;
+            uint _95 = (_tg + gl_SubgroupSize - 1u) / gl_SubgroupSize;
             float _209;
             _209 = 0.0;
             for (uint _208 = 0u; _208 < _95; )
@@ -118,7 +124,7 @@ kernel void main0(constant _22& _24 [[buffer(0)]], device _49& _51 [[buffer(1)]]
         _210 = _69;
     }
     float _127 = rsqrt((_210 / float(_24._m2)) + 9.9999999747524270787835121154785e-07);
-    for (uint _211 = gl_LocalInvocationID.x; _211 < _24._m2; _211 += 64u)
+    for (uint _211 = gl_LocalInvocationID.x; _211 < _24._m2; _211 += _tg)
     {
         uint _142 = _30 + _211;
         uint _212;

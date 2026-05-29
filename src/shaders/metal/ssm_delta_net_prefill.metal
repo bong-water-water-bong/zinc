@@ -149,7 +149,9 @@ kernel void main0(
                 output[head_out_base + row] = out_v * q_scale;
             }
 
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (token + 1u < p.n_tokens) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
         return;
     }
@@ -239,6 +241,8 @@ kernel void main0(
             output[head_out_base + row] = out_v * q_scale;
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (token + 1u < p.n_tokens) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 }

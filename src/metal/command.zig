@@ -38,7 +38,7 @@ pub const MetalCommand = struct {
         self.dispatch_count += 1;
 
         // Build array of MetalBuf pointers for the C shim
-        var c_bufs: [32]?*shim.MetalBuf = .{null} ** 32;
+        var c_bufs: [32]?*shim.MetalBuf = undefined;
         const n_bufs: u32 = @intCast(@min(bufs.len, 32));
         for (bufs[0..n_bufs], 0..n_bufs) |b, i| {
             c_bufs[i] = b.handle;
@@ -73,7 +73,7 @@ pub const MetalCommand = struct {
         if (self.handle == null or pipe.handle == null) return;
         self.dispatch_count += 1;
 
-        var c_bufs: [32]?*shim.MetalBuf = .{null} ** 32;
+        var c_bufs: [32]?*shim.MetalBuf = undefined;
         const n_bufs: u32 = @intCast(@min(bufs.len, 32));
         for (bufs[0..n_bufs], 0..n_bufs) |b, i| {
             c_bufs[i] = b.handle;
@@ -107,7 +107,7 @@ pub const MetalCommand = struct {
         if (self.handle == null or pipe.handle == null) return;
         self.dispatch_count += 1;
 
-        var c_bufs: [32]?*shim.MetalBuf = .{null} ** 32;
+        var c_bufs: [32]?*shim.MetalBuf = undefined;
         const n_bufs: u32 = @intCast(@min(bufs.len, 32));
         for (bufs[0..n_bufs], 0..n_bufs) |b, i| {
             c_bufs[i] = b.handle;
@@ -149,34 +149,66 @@ pub const MetalCommand = struct {
                 if (bufs[0].handle != null) {
                     self.barrier_count += 1;
                     self.last_barrier_dispatch_count = self.dispatch_count;
-                    // Match llama.cpp's `ggml_metal_op_concurrency_reset`: at
-                    // hot dependency edges, a scope barrier is cheaper to encode
-                    // than constructing a one-resource barrier while preserving
-                    // the same dispatch ordering guarantee.
+                    // Match llama.cpp's `ggml_metal_encoder_memory_barrier`:
+                    // hot Qwen prefill has thousands of single-buffer barriers,
+                    // and the scope barrier avoids per-resource ObjC setup while
+                    // preserving stronger-than-requested ordering.
                     shim.mtl_barrier(h);
                 }
                 return;
             }
-            var c_bufs: [32]?*shim.MetalBuf = .{null} ** 32;
-            var n_bufs: u32 = 0;
+
+            // llama.cpp's Metal backend orders dependency groups with a plain
+            // `memoryBarrierWithScope:MTLBarrierScopeBuffers` in
+            // `ggml_metal_encoder_memory_barrier`. For hot Qwen prefill we hit
+            // tens of thousands of multi-buffer barriers per request; using the
+            // same scope barrier avoids building Objective-C resource arrays
+            // while preserving stronger-than-requested ordering.
+            var has_resource = false;
             for (bufs) |b| {
-                if (@as(usize, n_bufs) == c_bufs.len) break;
-                if (b.handle) |handle| {
-                    c_bufs[@intCast(n_bufs)] = handle;
-                    n_bufs += 1;
+                if (b.handle != null) {
+                    has_resource = true;
+                    break;
                 }
             }
-            if (n_bufs == 0) return;
+            if (!has_resource) return;
             self.barrier_count += 1;
             self.last_barrier_dispatch_count = self.dispatch_count;
-            if (n_bufs >= 2) {
-                // Match llama.cpp's dependency-reset discipline at phase
-                // boundaries: a scoped in-encoder barrier avoids the hot
-                // Objective-C resource-list call while preserving ordering.
-                shim.mtl_barrier(h);
-            } else {
-                shim.mtl_barrier_buffers(h, @ptrCast(&c_bufs), n_bufs);
+            shim.mtl_barrier(h);
+        }
+    }
+
+    /// Insert a true resource-scoped barrier. Use only when later work depends
+    /// on the listed buffers and independent prior dispatches should stay free
+    /// to overlap on a concurrent encoder.
+    pub fn barrierResourceBuffers(self: *MetalCommand, bufs: []const *const MetalBuffer) void {
+        if (!self.barrier_enabled) return;
+        if (self.dispatch_count == 0) return;
+        if (self.last_barrier_dispatch_count == self.dispatch_count) return;
+        if (self.handle) |h| {
+            if (bufs.len == 1) {
+                if (bufs[0].handle != null) {
+                    self.barrier_count += 1;
+                    self.last_barrier_dispatch_count = self.dispatch_count;
+                    shim.mtl_barrier_buffer(h, bufs[0].handle);
+                }
+                return;
             }
+
+            var c_bufs: [32]?*shim.MetalBuf = undefined;
+            var count: u32 = 0;
+            for (bufs) |b| {
+                if (count >= c_bufs.len) break;
+                if (b.handle) |handle| {
+                    c_bufs[count] = handle;
+                    count += 1;
+                }
+            }
+            if (count == 0) return;
+
+            self.barrier_count += 1;
+            self.last_barrier_dispatch_count = self.dispatch_count;
+            shim.mtl_barrier_buffers(h, @ptrCast(&c_bufs), count);
         }
     }
 
