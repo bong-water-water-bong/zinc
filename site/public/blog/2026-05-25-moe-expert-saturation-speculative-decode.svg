@@ -1,0 +1,94 @@
+<svg viewBox="0 0 980 600" xmlns="http://www.w3.org/2000/svg" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif">
+<rect x="0" y="0" width="980" height="600" fill="#2a0f17"/>
+<text x="34" y="40" fill="#f3e7d7" font-size="23" font-weight="700">A free, fully accepted draft still loses on a sparse MoE</text>
+<text x="34" y="64" fill="#c9a896" font-size="14">Qwen3.6-35B-A3B routes 8 of 256 experts per token. Verifying K drafted tokens reads the union of their experts.</text>
+<rect x="30" y="84" width="466" height="480" rx="10" fill="#371520" stroke="#4d1f2c" stroke-width="1"/>
+<text x="48" y="112" fill="#f3e7d7" font-size="14.5" font-weight="600">The verify step is not free on a sparse MoE</text>
+<text x="48" y="132" fill="#c9a896" font-size="11.5">distinct experts loaded to verify K tokens, of 256</text>
+<line x1="96.0" y1="476.0" x2="476.0" y2="476.0" stroke="#4a2230" stroke-width="0.8"/>
+<text x="88.0" y="480.0" fill="#c9a896" font-size="10.5" text-anchor="end">0</text>
+<line x1="96.0" y1="394.0" x2="476.0" y2="394.0" stroke="#4a2230" stroke-width="0.8"/>
+<text x="88.0" y="398.0" fill="#c9a896" font-size="10.5" text-anchor="end">64</text>
+<line x1="96.0" y1="312.0" x2="476.0" y2="312.0" stroke="#4a2230" stroke-width="0.8"/>
+<text x="88.0" y="316.0" fill="#c9a896" font-size="10.5" text-anchor="end">128</text>
+<line x1="96.0" y1="230.0" x2="476.0" y2="230.0" stroke="#4a2230" stroke-width="0.8"/>
+<text x="88.0" y="234.0" fill="#c9a896" font-size="10.5" text-anchor="end">192</text>
+<line x1="96.0" y1="148.0" x2="476.0" y2="148.0" stroke="#4a2230" stroke-width="0.8"/>
+<text x="88.0" y="152.0" fill="#c9a896" font-size="10.5" text-anchor="end">256</text>
+<line x1="99.0" y1="476.0" x2="99.0" y2="481.0" stroke="#c9a896" stroke-width="0.8"/>
+<text x="99.0" y="494.0" fill="#c9a896" font-size="10" text-anchor="middle">1</text>
+<line x1="119.8" y1="476.0" x2="119.8" y2="481.0" stroke="#c9a896" stroke-width="0.8"/>
+<text x="119.8" y="494.0" fill="#c9a896" font-size="10" text-anchor="middle">8</text>
+<line x1="143.5" y1="476.0" x2="143.5" y2="481.0" stroke="#c9a896" stroke-width="0.8"/>
+<text x="143.5" y="494.0" fill="#c9a896" font-size="10" text-anchor="middle">16</text>
+<line x1="191.0" y1="476.0" x2="191.0" y2="481.0" stroke="#c9a896" stroke-width="0.8"/>
+<text x="191.0" y="494.0" fill="#c9a896" font-size="10" text-anchor="middle">32</text>
+<line x1="286.0" y1="476.0" x2="286.0" y2="481.0" stroke="#c9a896" stroke-width="0.8"/>
+<text x="286.0" y="494.0" fill="#c9a896" font-size="10" text-anchor="middle">64</text>
+<line x1="375.1" y1="476.0" x2="375.1" y2="481.0" stroke="#c9a896" stroke-width="0.8"/>
+<text x="375.1" y="494.0" fill="#c9a896" font-size="10" text-anchor="middle">94</text>
+<line x1="476.0" y1="476.0" x2="476.0" y2="481.0" stroke="#c9a896" stroke-width="0.8"/>
+<text x="476.0" y="494.0" fill="#c9a896" font-size="10" text-anchor="middle">128</text>
+<text x="286.0" y="512.0" fill="#c9a896" font-size="11" text-anchor="middle">draft width K (tokens verified in one forward pass)</text>
+<rect x="101.9" y="148.0" width="41.6" height="328.0" fill="#d8703a" opacity="0.16"/>
+<text x="122.7" y="164.0" fill="#d8703a" font-size="9.6" text-anchor="middle">real draft</text>
+<text x="122.7" y="176.0" fill="#d8703a" font-size="9.6" text-anchor="middle">widths</text>
+<line x1="96.0" y1="465.8" x2="476.0" y2="465.8" stroke="#b89684" stroke-width="1.6" stroke-dasharray="2 4"/>
+<text x="476.0" y="458.8" fill="#b89684" font-size="10" text-anchor="end">dense-model assumption: verify cost flat in K</text>
+<line x1="375.1" y1="148.0" x2="375.1" y2="476.0" stroke="#f3e7d7" stroke-width="1.2" stroke-dasharray="5 4" opacity="0.8"/>
+<text x="369.1" y="162.0" fill="#f3e7d7" font-size="10" text-anchor="end">expert-saturation</text>
+<text x="369.1" y="175.0" fill="#f3e7d7" font-size="10" text-anchor="end">threshold &#8776; 94</text>
+<path d="M 96.0,476.0 L 96.0,476.0 L 99.0,465.8 L 101.9,455.8 L 104.9,446.2 L 107.9,436.9 L 110.8,427.9 L 113.8,419.1 L 116.8,410.6 L 119.8,402.4 L 122.7,394.5 L 125.7,386.8 L 128.7,379.3 L 131.6,372.1 L 134.6,365.1 L 137.6,358.3 L 140.5,351.7 L 143.5,345.4 L 146.5,339.2 L 149.4,333.2 L 152.4,327.4 L 155.4,321.8 L 158.3,316.4 L 161.3,311.1 L 164.3,306.0 L 167.2,301.1 L 170.2,296.3 L 173.2,291.7 L 176.2,287.2 L 179.1,282.8 L 182.1,278.6 L 185.1,274.5 L 188.0,270.6 L 191.0,266.8 L 194.0,263.0 L 196.9,259.4 L 199.9,256.0 L 202.9,252.6 L 205.8,249.3 L 208.8,246.2 L 211.8,243.1 L 214.8,240.1 L 217.7,237.2 L 220.7,234.5 L 223.7,231.7 L 226.6,229.1 L 229.6,226.6 L 232.6,224.1 L 235.5,221.8 L 238.5,219.5 L 241.5,217.2 L 244.4,215.1 L 247.4,213.0 L 250.4,210.9 L 253.3,209.0 L 256.3,207.1 L 259.3,205.2 L 262.2,203.4 L 265.2,201.7 L 268.2,200.0 L 271.2,198.4 L 274.1,196.8 L 277.1,195.3 L 280.1,193.8 L 283.0,192.4 L 286.0,191.0 L 289.0,189.7 L 291.9,188.4 L 294.9,187.1 L 297.9,185.9 L 300.8,184.7 L 303.8,183.5 L 306.8,182.4 L 309.8,181.4 L 312.7,180.3 L 315.7,179.3 L 318.7,178.3 L 321.6,177.4 L 324.6,176.5 L 327.6,175.6 L 330.5,174.7 L 333.5,173.9 L 336.5,173.1 L 339.4,172.3 L 342.4,171.5 L 345.4,170.8 L 348.3,170.1 L 351.3,169.4 L 354.3,168.7 L 357.2,168.1 L 360.2,167.4 L 363.2,166.8 L 366.2,166.2 L 369.1,165.7 L 372.1,165.1 L 375.1,164.6 L 378.0,164.1 L 381.0,163.6 L 384.0,163.1 L 386.9,162.6 L 389.9,162.2 L 392.9,161.7 L 395.8,161.3 L 398.8,160.9 L 401.8,160.5 L 404.8,160.1 L 407.7,159.7 L 410.7,159.3 L 413.7,159.0 L 416.6,158.6 L 419.6,158.3 L 422.6,158.0 L 425.5,157.7 L 428.5,157.4 L 431.5,157.1 L 434.4,156.8 L 437.4,156.5 L 440.4,156.2 L 443.3,156.0 L 446.3,155.7 L 449.3,155.5 L 452.2,155.3 L 455.2,155.0 L 458.2,154.8 L 461.2,154.6 L 464.1,154.4 L 467.1,154.2 L 470.1,154.0 L 473.0,153.8 L 476.0,153.6 L 476.0,476.0 Z" fill="#e3a93c" opacity="0.12"/>
+<path d="M 96.0,476.0 99.0,465.8 101.9,455.8 104.9,446.2 107.9,436.9 110.8,427.9 113.8,419.1 116.8,410.6 119.8,402.4 122.7,394.5 125.7,386.8 128.7,379.3 131.6,372.1 134.6,365.1 137.6,358.3 140.5,351.7 143.5,345.4 146.5,339.2 149.4,333.2 152.4,327.4 155.4,321.8 158.3,316.4 161.3,311.1 164.3,306.0 167.2,301.1 170.2,296.3 173.2,291.7 176.2,287.2 179.1,282.8 182.1,278.6 185.1,274.5 188.0,270.6 191.0,266.8 194.0,263.0 196.9,259.4 199.9,256.0 202.9,252.6 205.8,249.3 208.8,246.2 211.8,243.1 214.8,240.1 217.7,237.2 220.7,234.5 223.7,231.7 226.6,229.1 229.6,226.6 232.6,224.1 235.5,221.8 238.5,219.5 241.5,217.2 244.4,215.1 247.4,213.0 250.4,210.9 253.3,209.0 256.3,207.1 259.3,205.2 262.2,203.4 265.2,201.7 268.2,200.0 271.2,198.4 274.1,196.8 277.1,195.3 280.1,193.8 283.0,192.4 286.0,191.0 289.0,189.7 291.9,188.4 294.9,187.1 297.9,185.9 300.8,184.7 303.8,183.5 306.8,182.4 309.8,181.4 312.7,180.3 315.7,179.3 318.7,178.3 321.6,177.4 324.6,176.5 327.6,175.6 330.5,174.7 333.5,173.9 336.5,173.1 339.4,172.3 342.4,171.5 345.4,170.8 348.3,170.1 351.3,169.4 354.3,168.7 357.2,168.1 360.2,167.4 363.2,166.8 366.2,166.2 369.1,165.7 372.1,165.1 375.1,164.6 378.0,164.1 381.0,163.6 384.0,163.1 386.9,162.6 389.9,162.2 392.9,161.7 395.8,161.3 398.8,160.9 401.8,160.5 404.8,160.1 407.7,159.7 410.7,159.3 413.7,159.0 416.6,158.6 419.6,158.3 422.6,158.0 425.5,157.7 428.5,157.4 431.5,157.1 434.4,156.8 437.4,156.5 440.4,156.2 443.3,156.0 446.3,155.7 449.3,155.5 452.2,155.3 455.2,155.0 458.2,154.8 461.2,154.6 464.1,154.4 467.1,154.2 470.1,154.0 473.0,153.8 476.0,153.6" fill="none" stroke="#e3a93c" stroke-width="2.6"/>
+<circle cx="119.8" cy="402.4" r="3.2" fill="#e3a93c"/>
+<circle cx="143.5" cy="345.4" r="3.2" fill="#e3a93c"/>
+<circle cx="375.1" cy="164.6" r="3.2" fill="#e3a93c"/>
+<text x="125.8" y="406.4" fill="#e3a93c" font-size="10">K=8 &#8594; ~57 experts</text>
+<text x="149.5" y="339.4" fill="#e3a93c" font-size="10">K=16 &#8594; ~102</text>
+<text x="381.1" y="156.6" fill="#f3e7d7" font-size="10">~95% of experts</text>
+<rect x="512" y="84" width="438" height="480" rx="10" fill="#371520" stroke="#4d1f2c" stroke-width="1"/>
+<text x="530" y="112" fill="#f3e7d7" font-size="14.5" font-weight="600">What the RTX 3090 benchmark measured</text>
+<text x="530" y="132" fill="#c9a896" font-size="11.5">single-request decode, tok/s, greedy</text>
+<line x1="534.0" y1="154.0" x2="534.0" y2="424.0" stroke="#4a2230" stroke-width="0.8"/>
+<text x="534.0" y="440.0" fill="#c9a896" font-size="10" text-anchor="middle">0</text>
+<line x1="650.7" y1="154.0" x2="650.7" y2="424.0" stroke="#4a2230" stroke-width="0.8"/>
+<text x="650.7" y="440.0" fill="#c9a896" font-size="10" text-anchor="middle">50</text>
+<line x1="767.3" y1="154.0" x2="767.3" y2="424.0" stroke="#4a2230" stroke-width="0.8"/>
+<text x="767.3" y="440.0" fill="#c9a896" font-size="10" text-anchor="middle">100</text>
+<line x1="884.0" y1="154.0" x2="884.0" y2="424.0" stroke="#4a2230" stroke-width="0.8"/>
+<text x="884.0" y="440.0" fill="#c9a896" font-size="10" text-anchor="middle">150</text>
+<text x="709.0" y="456.0" fill="#c9a896" font-size="11" text-anchor="middle">tokens / second</text>
+<line x1="850.6" y1="158.0" x2="850.6" y2="424.0" stroke="#86b9a0" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="855.6" y="170.0" fill="#86b9a0" font-size="10">baseline 135.7</text>
+<text x="534.0" y="178.0" fill="#f3e7d7" font-size="11">Baseline, no speculation</text>
+<rect x="534.0" y="184.0" width="316.6" height="26" rx="3" fill="#e3a93c" opacity="0.92"/>
+<text x="856.6" y="201.0" fill="#f3e7d7" font-size="11" font-weight="600">135.7</text>
+<text x="534.0" y="238.0" fill="#f3e7d7" font-size="11">n-gram cache draft</text>
+<rect x="534.0" y="244.0" width="277.9" height="26" rx="3" fill="#f3e7d7" opacity="0.92"/>
+<text x="817.9" y="261.0" fill="#f3e7d7" font-size="11" font-weight="600">119.1</text>
+<line x1="686.4" y1="257.0" x2="811.9" y2="257.0" stroke="#d8703a" stroke-width="2"/>
+<line x1="686.4" y1="248.0" x2="686.4" y2="266.0" stroke="#d8703a" stroke-width="2.4"/>
+<text x="681.4" y="261.0" fill="#d8703a" font-size="10" text-anchor="end">worst 65.3</text>
+<text x="538.0" y="261.0" fill="#3a0f17" font-size="9.5" font-weight="700">100% accept</text>
+<text x="534.0" y="298.0" fill="#f3e7d7" font-size="11">0.8B draft, K=8</text>
+<rect x="534.0" y="304.0" width="282.6" height="26" rx="3" fill="#f3e7d7" opacity="0.92"/>
+<text x="822.6" y="321.0" fill="#f3e7d7" font-size="11" font-weight="600">121.1</text>
+<line x1="672.1" y1="317.0" x2="816.6" y2="317.0" stroke="#d8703a" stroke-width="2"/>
+<line x1="672.1" y1="308.0" x2="672.1" y2="326.0" stroke="#d8703a" stroke-width="2.4"/>
+<text x="667.1" y="321.0" fill="#d8703a" font-size="10" text-anchor="end">worst 59.2</text>
+<text x="538.0" y="321.0" fill="#3a0f17" font-size="9.5" font-weight="700">100% accept</text>
+<text x="534.0" y="358.0" fill="#f3e7d7" font-size="11">0.8B draft, K=32</text>
+<rect x="534.0" y="364.0" width="280.7" height="26" rx="3" fill="#f3e7d7" opacity="0.92"/>
+<text x="820.7" y="381.0" fill="#f3e7d7" font-size="11" font-weight="600">120.3</text>
+<line x1="672.8" y1="377.0" x2="814.7" y2="377.0" stroke="#d8703a" stroke-width="2"/>
+<line x1="672.8" y1="368.0" x2="672.8" y2="386.0" stroke="#d8703a" stroke-width="2.4"/>
+<text x="667.8" y="381.0" fill="#d8703a" font-size="10" text-anchor="end">worst 59.5</text>
+<text x="538.0" y="381.0" fill="#3a0f17" font-size="9.5" font-weight="700">100% accept</text>
+<rect x="530" y="440.0" width="402" height="46" rx="7" fill="#4a1d2a" stroke="#d8703a" stroke-width="1"/>
+<text x="542" y="459.0" fill="#f3e7d7" font-size="11">Textbook: 100% acceptance, &#947;=8, free draft &#8594; up to <tspan fill="#e3a93c" font-weight="700">9&#215; faster</tspan>.</text>
+<text x="542" y="476.0" fill="#f3e7d7" font-size="11">Measured on A3B: <tspan fill="#d8703a" font-weight="700">slower</tspan> on every configuration.</text>
+<rect x="530" y="496.0" width="402" height="40" rx="7" fill="#33321a" stroke="#86b9a0" stroke-width="1"/>
+<text x="542" y="513.0" fill="#f3e7d7" font-size="11">Same drafts on Qwen3.5-122B-<tspan fill="#86b9a0" font-weight="700">A10B</tspan>: +15 to 45%.</text>
+<text x="542" y="529.0" fill="#c9a896" font-size="10">a 10B active footprint sits past the saturation threshold.</text>
+<text x="34" y="588" fill="#b89684" font-size="10">Expert curve = uniform-routing expectation 256&#183;(1&#8722;0.96875^K), illustrative of the MoESD saturation mechanism. Decode numbers measured on one RTX 3090 (thc1006 benchmark).</text>
+</svg>

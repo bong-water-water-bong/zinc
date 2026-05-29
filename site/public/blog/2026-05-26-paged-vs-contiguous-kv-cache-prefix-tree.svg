@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 660" role="img" aria-labelledby="title desc">
+<title id="title">Paged KV cache removes a concurrency waste a single-user local engine does not have, until the prefix tree branches</title>
+<desc id="desc">A memory-layout schematic on a deep forest-green background. The top band, titled what paging was built to remove, KV waste under concurrent serving, shows two horizontal memory bars. The upper bar, reserve every request to its max length, is mostly a hatched copper region marked reserved and fragmented, with only a small gold segment at the left marked actual tokens, labeled only 20.4 to 38.2 percent holds real tokens, vLLM Figure 2. The lower bar, PagedAttention, fixed blocks committed on demand, is a dense row of small gold blocks with thin gaps and a tiny stub at the end, labeled near-zero waste under 4 percent and 2 to 4 times serving throughput, the kernel walks a block table each step. A small legend shows gold equals active tokens, hatch equals reserved or wasted, mint equals shared prefix. The bottom band, titled the local case, batch of one and the prefix tree that breaks it, has two halves. The left half, one sequence and one contiguous arena, is a single gold bar filled about sixty percent with an arrow grows as decode extends, labeled no inter-request fragmentation to fight, attention reads contiguous KV, zinc sizes this from vLLM block-budget math at 0.85 utilization. The right half, a branching conversation with RadixAttention, is a small tree: a mint shared root prompt node and a mint shared chain that splits into three gold leaf branches, labeled siblings must share the parent KV, storing each branch contiguously would duplicate the shared prefix so block-granular sharing returns. A footer notes the waste and throughput figures are from the vLLM PagedAttention paper, Kwon and coauthors SOSP 2023, the kernel-overhead framing is from vAttention, Prabhu and coauthors 2024, and proportions are illustrative.</desc>
+<style>
+ .ink{fill:#e9f2ea} .soft{fill:#a6c2b2} .fnt{fill:#7d9a8a}
+ .t{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+ .m{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ .title{font-size:18px;font-weight:600}
+ .sub{font-size:12.5px}
+ .ptitle{font-size:14px;font-weight:600}
+ .lab{font-size:12px} .labs{font-size:11px} .labf{font-size:10px}
+ .bold{font-weight:600}
+</style>
+<defs>
+ <pattern id="hatch" width="8" height="8" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+   <rect width="8" height="8" fill="#7a3f28"/>
+   <line x1="0" y1="0" x2="0" y2="8" stroke="#c0744a" stroke-width="3"/>
+ </pattern>
+ <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+   <path d="M0,0 L9,4.5 L0,9 z" fill="#a6c2b2"/>
+ </marker>
+</defs>
+<rect width="980" height="660" fill="#112620"/>
+
+<text class="t title ink" x="40" y="42">Paging removes a waste a single-user decode does not have</text>
+<text class="t sub soft" x="40" y="64">KV cache memory management on a 32 GB Radeon AI PRO R9700, single-user decode versus high-concurrency serving.</text>
+
+<line x1="40" y1="80" x2="940" y2="80" stroke="#284338" stroke-width="1"/>
+
+<!-- BAND 1: serving -->
+<text class="t ptitle ink" x="40" y="110">What paging was built to remove: KV waste under concurrent serving</text>
+
+<!-- Bar A: reserve to max -->
+<text class="t lab soft" x="60" y="140">Reserve every request to its max length (serving, pre-paging)</text>
+<rect x="60" y="150" width="820" height="30" rx="3" fill="url(#hatch)" stroke="#3a5446" stroke-width="1"/>
+<rect x="60" y="150" width="226" height="30" rx="3" fill="#e3b54a"/>
+<text class="t labs" x="173" y="170" text-anchor="middle" fill="#3a2a12">actual tokens</text>
+<text class="t labs" x="583" y="170" text-anchor="middle" fill="#f0d9c7">reserved + internal fragmentation</text>
+<text class="t labf fnt" x="60" y="200">Only 20.4 to 38.2 percent holds real tokens; the rest is reservation and fragmentation.</text>
+
+<!-- Bar B: paged -->
+<text class="t lab soft" x="60" y="234">PagedAttention: fixed blocks committed on demand</text>
+<g>
+ <rect x="60" y="244" width="50" height="30" rx="2" fill="#e3b54a"/>
+ <rect x="114" y="244" width="50" height="30" rx="2" fill="#d7ab44"/>
+ <rect x="168" y="244" width="50" height="30" rx="2" fill="#e3b54a"/>
+ <rect x="222" y="244" width="50" height="30" rx="2" fill="#d7ab44"/>
+ <rect x="276" y="244" width="50" height="30" rx="2" fill="#e3b54a"/>
+ <rect x="330" y="244" width="50" height="30" rx="2" fill="#d7ab44"/>
+ <rect x="384" y="244" width="50" height="30" rx="2" fill="#e3b54a"/>
+ <rect x="438" y="244" width="50" height="30" rx="2" fill="#d7ab44"/>
+ <rect x="492" y="244" width="50" height="30" rx="2" fill="#e3b54a"/>
+ <rect x="546" y="244" width="50" height="30" rx="2" fill="#d7ab44"/>
+ <rect x="600" y="244" width="50" height="30" rx="2" fill="#e3b54a"/>
+ <rect x="654" y="244" width="50" height="30" rx="2" fill="#d7ab44"/>
+ <rect x="708" y="244" width="50" height="30" rx="2" fill="#e3b54a"/>
+ <rect x="762" y="244" width="50" height="30" rx="2" fill="#d7ab44"/>
+ <rect x="816" y="244" width="22" height="30" rx="2" fill="#e3b54a"/>
+ <rect x="842" y="244" width="38" height="30" rx="2" fill="url(#hatch)" stroke="#3a5446" stroke-width="1"/>
+</g>
+<text class="t labf fnt" x="60" y="294">Near-zero waste (under 4%) and 2 to 4 times serving throughput, paid for by a block-table lookup in the attention kernel each step.</text>
+
+<line x1="40" y1="320" x2="940" y2="320" stroke="#284338" stroke-width="1"/>
+
+<!-- BAND 2: local -->
+<text class="t ptitle ink" x="40" y="352">The local case: batch of one, and the prefix tree that brings the problem back</text>
+<line x1="490" y1="372" x2="490" y2="612" stroke="#284338" stroke-width="1"/>
+
+<!-- Left: contiguous arena -->
+<text class="t lab soft" x="60" y="392">One sequence, one contiguous arena</text>
+<rect x="60" y="404" width="380" height="34" rx="3" fill="none" stroke="#3a5446" stroke-width="1.5"/>
+<rect x="60" y="404" width="232" height="34" rx="3" fill="#e3b54a"/>
+<line x1="296" y1="421" x2="420" y2="421" stroke="#a6c2b2" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text class="t labf" x="176" y="425" text-anchor="middle" fill="#3a2a12">tokens so far</text>
+<text class="t labf fnt" x="300" y="400">grows as</text>
+<text class="t labf fnt" x="300" y="412">decode extends</text>
+<text class="t labf soft" x="60" y="470">No inter-request fragmentation to fight, and the</text>
+<text class="t labf soft" x="60" y="486">attention kernel reads one contiguous KV buffer.</text>
+<text class="t labf fnt" x="60" y="510">zinc default: vLLM's block-budget math, allocated as a</text>
+<text class="t labf fnt" x="60" y="524">contiguous arena at 0.85 device-memory utilization.</text>
+
+<!-- Right: prefix tree -->
+<text class="t lab soft" x="516" y="392">A branching conversation (RadixAttention)</text>
+<!-- shared root + chain -->
+<rect x="690" y="404" width="120" height="22" rx="3" fill="#74cda0"/>
+<text class="t labf" x="750" y="419" text-anchor="middle" fill="#0f231b">shared system prompt</text>
+<rect x="690" y="432" width="120" height="22" rx="3" fill="#74cda0"/>
+<text class="t labf" x="750" y="447" text-anchor="middle" fill="#0f231b">shared chat prefix</text>
+<line x1="750" y1="454" x2="750" y2="470" stroke="#5a8f74" stroke-width="1.4"/>
+<!-- split lines -->
+<line x1="750" y1="470" x2="600" y2="486" stroke="#5a8f74" stroke-width="1.4"/>
+<line x1="750" y1="470" x2="750" y2="486" stroke="#5a8f74" stroke-width="1.4"/>
+<line x1="750" y1="470" x2="900" y2="486" stroke="#5a8f74" stroke-width="1.4"/>
+<!-- leaves -->
+<rect x="552" y="486" width="96" height="22" rx="3" fill="#e3b54a"/>
+<text class="t labf" x="600" y="501" text-anchor="middle" fill="#3a2a12">branch A</text>
+<rect x="702" y="486" width="96" height="22" rx="3" fill="#e3b54a"/>
+<text class="t labf" x="750" y="501" text-anchor="middle" fill="#3a2a12">branch B</text>
+<rect x="852" y="486" width="80" height="22" rx="3" fill="#e3b54a"/>
+<text class="t labf" x="892" y="501" text-anchor="middle" fill="#3a2a12">branch C</text>
+<text class="t labf soft" x="516" y="528">Siblings must share the parent's KV. Storing each branch</text>
+<text class="t labf soft" x="516" y="544">contiguously would duplicate the shared prefix, so</text>
+<text class="t labf soft" x="516" y="560">block-granular sharing is back on the table.</text>
+
+<line x1="40" y1="600" x2="940" y2="600" stroke="#284338" stroke-width="1"/>
+<text class="t labf fnt" x="40" y="624">Waste and throughput figures from the vLLM PagedAttention paper (Kwon et al., SOSP 2023). Kernel-overhead framing from vAttention</text>
+<text class="t labf fnt" x="40" y="640">(Prabhu et al., 2024). Bar and tree proportions are schematic and illustrate the allocation mechanism, not a measured layout.</text>
+</svg>

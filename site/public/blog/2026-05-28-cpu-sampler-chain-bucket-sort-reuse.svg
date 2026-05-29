@@ -1,0 +1,118 @@
+<svg viewBox="0 0 960 706" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 Z" fill="#e6a04a" />
+    </marker>
+    <marker id="arrowGold" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 Z" fill="#f5c14a" />
+    </marker>
+  </defs>
+
+  <!-- gunmetal background -->
+  <rect x="0" y="0" width="960" height="706" fill="#2f3640" />
+  <rect x="10" y="10" width="940" height="686" rx="16" fill="none" stroke="#1c2127" stroke-width="1.5" />
+
+  <!-- title -->
+  <text x="44" y="54" font-size="25" font-weight="700" fill="#ecf0f1">Five passes over 151,936 logits, or one histogram and four bucket walks</text>
+  <text x="44" y="82" font-size="14.5" fill="#aab2bd">Default llama.cpp chain: penalties; dry; top_n_sigma; top_k; typ_p; top_p; min_p; xtc; temperature. Qwen3 vocab size: 151,936.</text>
+
+  <!-- ============ BAND A: Naive ============ -->
+  <rect x="44" y="104" width="872" height="246" rx="14" fill="#3a4250" stroke="#1c2127" stroke-width="1.5" />
+  <text x="66" y="136" font-size="16" font-weight="700" fill="#e6a04a">Path 1 · naive sampler chain, no bucket sharing</text>
+  <text x="66" y="156" font-size="12" fill="#aab2bd">Each truncation sampler walks the full logit array. Five full V-sized passes per decode step.</text>
+
+  <!-- Logit strip naive -->
+  <g>
+    <rect x="66" y="180" width="828" height="46" rx="6" fill="#48515f" stroke="#1c2127" stroke-width="1.2" />
+    <text x="80" y="208" font-size="12" fill="#aab2bd" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">V = 151,936 floats  ·  ~608 KB / pass  ·  cold for the CPU L2</text>
+    <text x="822" y="208" font-size="11" fill="#7d8898" text-anchor="end">logit[0 .. V-1]</text>
+  </g>
+
+  <!-- 5 passes as arcs -->
+  <g fill="none" stroke="#e6a04a" stroke-width="1.6">
+    <path d="M 96 232 Q 175 280 254 232" />
+    <path d="M 246 232 Q 325 280 404 232" />
+    <path d="M 396 232 Q 475 280 554 232" />
+    <path d="M 546 232 Q 625 280 704 232" />
+    <path d="M 696 232 Q 775 280 854 232" />
+  </g>
+  <g font-size="10.5" fill="#f0c98a" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+    <text x="175" y="296">penalties</text>
+    <text x="175" y="310">O(V) scan</text>
+    <text x="325" y="296">DRY</text>
+    <text x="325" y="310">O(V) + ngram</text>
+    <text x="475" y="296">top-p sort</text>
+    <text x="475" y="310">O(V log V)</text>
+    <text x="625" y="296">min-p</text>
+    <text x="625" y="310">O(V) compare</text>
+    <text x="775" y="296">top-n-sigma</text>
+    <text x="775" y="310">O(V) sweep</text>
+  </g>
+
+  <!-- naive cost note -->
+  <rect x="66" y="320" width="828" height="22" rx="5" fill="#2a313b" stroke="#5a6470" stroke-width="0.8" stroke-dasharray="3 3" />
+  <text x="478" y="336" font-size="11.5" fill="#e6a04a" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">naive cost on a single core: ~0.5 to 2 ms per decode token at V = 151,936</text>
+
+  <!-- ============ BAND B: Bucket sort reuse ============ -->
+  <rect x="44" y="370" width="872" height="306" rx="14" fill="#3a4250" stroke="#1c2127" stroke-width="1.5" />
+  <text x="66" y="402" font-size="16" font-weight="700" fill="#f5c14a">Path 2 · llama.cpp PR #15665 · bucket sort reused across samplers</text>
+  <text x="66" y="422" font-size="12" fill="#aab2bd">One pass builds a 128-bucket histogram of logits. The rest of the chain walks only the surviving top buckets.</text>
+
+  <!-- Histogram strip: 128 buckets, simplified to 16 visible cells -->
+  <g>
+    <rect x="66" y="448" width="828" height="64" rx="6" fill="#48515f" stroke="#1c2127" stroke-width="1.2" />
+    <!-- 16 vertical bins to schematize 128 buckets -->
+    <g>
+      <line x1="118" y1="450" x2="118" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="170" y1="450" x2="170" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="222" y1="450" x2="222" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="274" y1="450" x2="274" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="326" y1="450" x2="326" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="378" y1="450" x2="378" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="430" y1="450" x2="430" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="482" y1="450" x2="482" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="534" y1="450" x2="534" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="586" y1="450" x2="586" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="638" y1="450" x2="638" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="690" y1="450" x2="690" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="742" y1="450" x2="742" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="794" y1="450" x2="794" y2="510" stroke="#1c2127" stroke-width="0.6" />
+      <line x1="846" y1="450" x2="846" y2="510" stroke="#1c2127" stroke-width="0.6" />
+    </g>
+    <!-- low-mass region (left) - dim -->
+    <rect x="66" y="492" width="572" height="18" fill="#5a6470" opacity="0.55" />
+    <!-- medium activity ramp -->
+    <rect x="638" y="480" width="52" height="30" fill="#7d8898" opacity="0.7" />
+    <rect x="690" y="470" width="52" height="40" fill="#a08358" opacity="0.85" />
+    <!-- top buckets: gold -->
+    <rect x="742" y="458" width="52" height="52" fill="#f5c14a" />
+    <rect x="794" y="464" width="52" height="46" fill="#f5c14a" />
+    <rect x="846" y="468" width="48" height="42" fill="#f5c14a" />
+
+    <text x="80" y="468" font-size="12" fill="#ecf0f1" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">128-bucket histogram of logits  ·  one O(V) pass</text>
+    <text x="332" y="528" font-size="11" fill="#7d8898" text-anchor="middle">low-probability tail · touched once, never resorted</text>
+    <text x="818" y="528" font-size="11" fill="#f5c14a" text-anchor="middle" font-weight="700">survivors above the top-k cutoff</text>
+  </g>
+
+  <!-- 4 sampler arrows targeting only the top buckets -->
+  <g fill="none" stroke="#f5c14a" stroke-width="1.6">
+    <path d="M 750 548 L 760 542" marker-end="url(#arrowGold)" />
+    <path d="M 800 562 L 805 548" marker-end="url(#arrowGold)" />
+    <path d="M 850 562 L 855 548" marker-end="url(#arrowGold)" />
+    <path d="M 870 575 L 870 548" marker-end="url(#arrowGold)" />
+  </g>
+  <g font-size="11" fill="#f0c98a" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+    <text x="100" y="554">After the histogram, the truncation chain walks only the highest non-empty buckets:</text>
+    <text x="100" y="578">  top-k       sort the survivor buckets, O(k log k)</text>
+    <text x="100" y="594">  top-p       accumulate probability mass over top buckets only</text>
+    <text x="100" y="610">  min-p       compare bucket maxima against the top-token threshold</text>
+    <text x="100" y="626">  top-n-sigma sweep top buckets to find the σ cutoff</text>
+  </g>
+
+  <!-- post-bucket cost note -->
+  <rect x="66" y="640" width="828" height="22" rx="5" fill="#2a313b" stroke="#5a6470" stroke-width="0.8" stroke-dasharray="3 3" />
+  <text x="478" y="656" font-size="11.5" fill="#f5c14a" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">post-bucket cost: a few hundred microseconds per decode token, dominated by penalties and DRY</text>
+
+  <!-- footer -->
+  <text x="44" y="690" font-size="10.5" fill="#7d8898">Bucket sort: ikawrakow PR #5109. Reused across samplers: ggerganov PR #15665. Crossover at k = 128; 2.9× speedup at k = 8000 (Yongkyun, Code Pointer). Proportions schematic.</text>
+</svg>
