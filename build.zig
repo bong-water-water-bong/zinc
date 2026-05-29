@@ -217,6 +217,16 @@ pub fn build(b: *std.Build) void {
         // Vulkan port of the Metal MoE route-pack kernel; the .comp was added
         // without registering it here, so the parity guard flagged it.
         "moe_route_pack",
+        // Run-1 cycle-13 (Q5_K dense projection) and cycle-23 (DP4a Q6_K
+        // dense-down GEMM + per-32-block activation quantizer): each cycle
+        // committed its .comp via `git add src/` but the matching
+        // shader_sources update was uncommitted — a subsequent rejected
+        // cycle's `git checkout -- build.zig` wiped the registration, so
+        // the parity guard flagged them on the next baseline. The loop's
+        // commit now also stages build.zig to prevent recurrence.
+        "mul_mm_q5k",
+        "mul_mm_q6k_full_dp4a",
+        "quantize_act_q8",
     };
 
     const compile_shaders = b.option(bool, "shaders", "Compile GLSL shaders to SPIR-V (requires glslc)") orelse is_linux;

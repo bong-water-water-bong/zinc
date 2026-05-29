@@ -3407,7 +3407,7 @@ ${result.buildOutput.slice(-2000)}
       state.consecutiveFoundationKeeps = 0;
       decisionReason = `improved by ${deltaVsBest}% vs best checkpoint`;
 
-      await runCommand("git", ["add", "src/"], { cwd: REPO_ROOT });
+      await runCommand("git", ["add", "src/", "build.zig"], { cwd: REPO_ROOT });
       await runCommand("git", ["commit", "-m", `perf(effort-${effort}): cycle ${cycle} \u2014 ${result.tokPerSec?.toFixed(2)} ${effortSpec.primaryMetricLabel} (+${deltaVsBest}%)`], { cwd: REPO_ROOT });
       commitHash = (await runCommand("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT })).stdout.trim() || headCommit;
       state.bestTokPerSec = bestTokPerSec;
@@ -3440,7 +3440,7 @@ ${result.buildOutput.slice(-2000)}
       state.consecutiveFoundationKeeps++;
       decisionReason = `kept enablement step within ${FOUNDATION_KEEP_MAX_DROP_TPS.toFixed(2)} tok/s of best checkpoint`;
       console.log(c("1;36", `  \u2248 FOUNDATION KEEP: ${summarizeBenchMetric(result.tokPerSec, result.tokPerSecSamples, "tok/s")} (${effortSpec.primaryMetricLabel}, ${deltaVsBest}% vs best checkpoint)`));
-      await runCommand("git", ["add", "src/"], { cwd: REPO_ROOT });
+      await runCommand("git", ["add", "src/", "build.zig"], { cwd: REPO_ROOT });
       await runCommand("git", ["commit", "-m", `perf(effort-${effort}): cycle ${cycle} foundation \u2014 ${trunc(agentReport.description, 72)}`], { cwd: REPO_ROOT });
       commitHash = (await runCommand("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT })).stdout.trim() || headCommit;
       console.log(c("2", "  Committed foundation step."));
