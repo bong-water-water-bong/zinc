@@ -84,6 +84,21 @@ const ResidualRmsNormRouterF32TopkPush = extern struct {
     shared_gate_offset: u32,
 };
 
+/// Mirrors `MoeGateUpDualDmmvPush` in `forward_metal.zig` for the fused
+/// Q4_K SwiGLU dual MoE DMMV path (`dispatchDmmvMoeGateUpSwiGLUQ4kOnCmd`).
+const MoeGateUpDualDmmvPush = extern struct {
+    M: u32,
+    K: u32,
+    gate_a_offset: u32,
+    up_a_offset: u32,
+    gate_expert_stride: u32,
+    up_expert_stride: u32,
+    x_expert_stride: u32,
+    x_offset: u32,
+    gate_y_offset: u32,
+    up_y_offset: u32,
+};
+
 const moe_route_block_cols: u32 = 8;
 
 fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
@@ -116,6 +131,7 @@ const CaseId = enum {
     moe_gate_cols,
     moe_up_cols,
     moe_down_cols,
+    moe_gate_up_swiglu,
 };
 
 const PipelineMode = enum {
@@ -149,9 +165,10 @@ const HotCase = struct {
     expert_slots: u32 = 1,
     x_expert_stride: u32 = 0,
     is_router_fused: bool = false,
+    is_moe_swiglu_fused: bool = false,
 
     fn isDual(self: @This()) bool {
-        return self.tensor1 != null and !self.is_router_fused;
+        return self.tensor1 != null and !self.is_router_fused and !self.is_moe_swiglu_fused;
     }
 
     fn isMoe(self: @This()) bool {
@@ -238,6 +255,7 @@ fn helpText() []const u8 {
     \\                            | shared_gate | shared_up | shared_down | shared_dual
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
+    \\                            | moe_gate_up_swiglu
     \\  --pipeline <mode>          runtime | k2048 | both (default: both)
     \\  --route-tokens <n>         Prompt tokens for route-packed MoE cols cases (default: 64)
     \\  --iterations <n>           Timed dispatches per case (default: 200)
@@ -279,6 +297,7 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "moe_gate_cols")) return .moe_gate_cols;
     if (std.mem.eql(u8, arg, "moe_up_cols")) return .moe_up_cols;
     if (std.mem.eql(u8, arg, "moe_down_cols")) return .moe_down_cols;
+    if (std.mem.eql(u8, arg, "moe_gate_up_swiglu")) return .moe_gate_up_swiglu;
     return error.InvalidCase;
 }
 
@@ -689,6 +708,32 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .cols = inter_dim,
                 .expert_slots = model.config.n_experts_used,
                 .x_expert_stride = inter_dim,
+            };
+        },
+        .moe_gate_up_swiglu => blk: {
+            // Match production `dispatchDmmvMoeGateUpSwiGLUQ4kOnCmd`
+            // (forward_metal.zig:9157): the Q4_K MoE gate+up dual DMMV path
+            // that fuses SwiGLU into a single per-expert output. Only the
+            // hidden_dim=2048 / intermediate_dim=512 shape is exercised in
+            // production because the kernel bakes the K=2048 block count
+            // into its hot loop.
+            const inter_dim = model.config.intermediate_dim;
+            const hidden_dim = model.config.hidden_dim;
+            if (hidden_dim != 2048) return error.SwigluFusedRequiresK2048;
+            const gate = findTensorBySuffixAndShape(model, "ffn_gate_exps.weight", .q4_k, inter_dim, hidden_dim) orelse
+                return error.MissingMoeGateTensor;
+            const up = findTensorBySuffixAndShape(model, "ffn_up_exps.weight", .q4_k, inter_dim, hidden_dim) orelse
+                return error.MissingMoeUpTensor;
+            break :blk .{
+                .key = "moe_gate_up_swiglu",
+                .label = "MoE gate+up Q4_K SwiGLU fused k2048",
+                .tensor0 = gate,
+                .tensor1 = up,
+                .rows0 = inter_dim,
+                .rows1 = inter_dim,
+                .cols = hidden_dim,
+                .expert_slots = model.config.n_experts_used,
+                .is_moe_swiglu_fused = true,
             };
         },
         .all => error.InvalidCase,
@@ -1608,6 +1653,147 @@ fn benchmarkRouterF32FusedVariant(
     };
 }
 
+fn runMoeGateUpSwigluDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    pipe: *const MetalPipeline,
+    gate_tensor: *const metal_loader.LoadedTensor,
+    up_tensor: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    rows: u32,
+    cols: u32,
+    expert_slots: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0) return;
+    const gate_stride: u32 = @intCast(weightBytesPerIter(gate_tensor.info.type_, rows, cols));
+    const up_stride: u32 = @intCast(weightBytesPerIter(up_tensor.info.type_, rows, cols));
+    const push = MoeGateUpDualDmmvPush{
+        .M = rows,
+        .K = cols,
+        .gate_a_offset = tensorPageOffset(model, gate_tensor),
+        .up_a_offset = tensorPageOffset(model, up_tensor),
+        .gate_expert_stride = gate_stride,
+        .up_expert_stride = up_stride,
+        .x_expert_stride = 0,
+        .x_offset = 0,
+        .gate_y_offset = 0,
+        .up_y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate_tensor.gpu_buffer, &up_tensor.gpu_buffer, input_buf, output_buf, routing_buf };
+    const rows_per_wg: u32 = 16;
+    const workgroups = (rows + rows_per_wg - 1) / rows_per_wg;
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            pipe,
+            .{ workgroups, expert_slots, 1 },
+            .{ 512, 1, 1 },
+            &bufs,
+            &push,
+            @sizeOf(MoeGateUpDualDmmvPush),
+            1,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn benchmarkMoeGateUpSwigluVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    warmup_iterations: u32,
+    iterations: u32,
+) !BenchResult {
+    const up_tensor = hot_case.tensor1 orelse return error.ExpectedDualCase;
+    if (hot_case.tensor0.info.type_ != .q4_k or up_tensor.info.type_ != .q4_k)
+        return error.ExpectedExpertQuantTensor;
+
+    var pipe = try loadShaderPipeline(device.ctx, "dmmv_q4k_moe_gate_up_swiglu_k2048");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.rows0) * hot_case.expert_slots * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(device.ctx, @max(@as(usize, hot_case.expert_slots) * @sizeOf(u32), 4));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    fillInputBuffer(&input_buf, hot_case.cols);
+    fillRoutingBuffer(&routing_buf, model.config.n_experts, hot_case.expert_slots);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    try runMoeGateUpSwigluDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        up_tensor,
+        model,
+        &input_buf,
+        &output_buf,
+        &routing_buf,
+        hot_case.rows0,
+        hot_case.cols,
+        hot_case.expert_slots,
+        warmup_iterations,
+    );
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runMoeGateUpSwigluDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        up_tensor,
+        model,
+        &input_buf,
+        &output_buf,
+        &routing_buf,
+        hot_case.rows0,
+        hot_case.cols,
+        hot_case.expert_slots,
+        iterations,
+    );
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    // Streamed weight bytes per iter: gate Q4_K + up Q4_K, one row-slab per
+    // expert × expert_slots active. Matches the bytes that
+    // `dispatchDmmvMoeGateUpSwiGLUQ4kOnCmd` pulls through L1/L2 on every
+    // routed MoE layer in decode.
+    const per_expert_bytes = weightBytesPerIter(.q4_k, hot_case.rows0, hot_case.cols);
+    const weight_bytes: u64 = per_expert_bytes * 2 * @as(u64, hot_case.expert_slots);
+    const total_bytes = weight_bytes * iterations;
+    const output_copy = try copyOutput(allocator, &output_buf, hot_case.rows0 * hot_case.expert_slots);
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = "fused",
+        .shader_name = "dmmv_q4k_moe_gate_up_swiglu_k2048",
+        .tensor_name = hot_case.tensor0.info.name,
+        .rows = hot_case.rows0,
+        .cols = hot_case.cols,
+        .expert_slots = hot_case.expert_slots,
+        .x_expert_stride = 0,
+        .iterations = iterations,
+        .block_size = 512,
+        .rows_per_wg = 16,
+        .thread_execution_width = pipe.thread_execution_width,
+        .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(output_copy),
+        .output = output_copy,
+    };
+}
+
 fn copyOutput(allocator: std.mem.Allocator, output_buf: *const MetalBuffer, rows: u32) ![]f32 {
     const ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     return try allocator.dupe(f32, ptr[0..rows]);
@@ -2278,7 +2464,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_dual, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols };
+    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_dual, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_swiglu };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -2334,6 +2520,37 @@ pub fn main() !void {
                 config.iterations,
             );
             try printBenchResult(&stdout, fused_result.?);
+        } else if (case_id == .moe_gate_up_swiglu) {
+            const up_tensor = hot_case.tensor1.?;
+            const per_expert_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols);
+            try stdout.interface.print(
+                "Case {s}: {s} | tensors={s} + {s} | quant={s} + {s} | M={d} K={d} | experts={d} | weight {d:.2} MiB/iter\n",
+                .{
+                    hot_case.key,
+                    hot_case.label,
+                    hot_case.tensor0.info.name,
+                    up_tensor.info.name,
+                    @tagName(hot_case.tensor0.info.type_),
+                    @tagName(up_tensor.info.type_),
+                    hot_case.rows0,
+                    hot_case.cols,
+                    hot_case.expert_slots,
+                    @as(f64, @floatFromInt(per_expert_bytes * 2 * @as(u64, hot_case.expert_slots))) / (1024.0 * 1024.0),
+                },
+            );
+
+            var swiglu_result: ?BenchResult = null;
+            defer if (swiglu_result) |*result| allocator.free(result.output);
+
+            swiglu_result = try benchmarkMoeGateUpSwigluVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, swiglu_result.?);
         } else if (isMoeColsCase(case_id)) {
             const k = model.config.n_experts_used;
             const route_slots = config.route_tokens * k;
