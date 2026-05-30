@@ -35,30 +35,24 @@ inline float2 get_scale_min_k4(uint j, device const uchar* sc) {
     );
 }
 
-inline void accumulate_q4k_direct(
-    device const uchar* block,
+// Paired gate+up Q4_K accumulation: the gate and up blocks at index `bi`
+// dequantize against the SAME X half-blocks. Compute col_lo/col_hi and the
+// two float4 X loads once, then fold them into both accumulators. Sharing
+// the X loads explicitly avoids relying on the inliner to CSE across device
+// pointer function calls — mirrors the X-reuse discipline in the Q8_0
+// dmmv_q8_0_pair_swiglu fused kernel.
+inline void accumulate_q4k_pair_direct(
+    device const uchar* gate_block,
+    device const uchar* up_block,
     device const float* input,
     uint bi,
     uint lane,
-    thread float& acc
+    thread float& gate_acc,
+    thread float& up_acc
 ) {
-    const float d = float(as_type<half>(*(device const ushort*)(block)));
-    const float dmin = float(as_type<half>(*(device const ushort*)(block + 2u)));
-    device const uchar* scales = block + 4u;
-    device const uchar* quants = block + 16u;
-
     const uint byte_off = lane * 4u;
     const uint j = byte_off / 32u;
     const uint local_off = byte_off % 32u;
-
-    const uchar4 qbytes = *(device const uchar4*)(quants + byte_off);
-    const float2 sm_lo = get_scale_min_k4(j * 2u, scales);
-    const float2 sm_hi = get_scale_min_k4(j * 2u + 1u, scales);
-
-    const float d_sc_lo = d * sm_lo.x;
-    const float d_m_lo = dmin * sm_lo.y;
-    const float d_sc_hi = d * sm_hi.x;
-    const float d_m_hi = dmin * sm_hi.y;
 
     const uint col_lo = bi * 256u + j * 64u + local_off;
     const uint col_hi = col_lo + 32u;
@@ -66,23 +60,73 @@ inline void accumulate_q4k_direct(
     const float4 x_lo = *(device const float4*)(input + col_lo);
     const float4 x_hi = *(device const float4*)(input + col_hi);
 
-    const uchar4 q_lo = uchar4(
-        qbytes.x & 0x0F,
-        qbytes.y & 0x0F,
-        qbytes.z & 0x0F,
-        qbytes.w & 0x0F
-    );
-    const uchar4 q_hi = uchar4(
-        qbytes.x >> 4,
-        qbytes.y >> 4,
-        qbytes.z >> 4,
-        qbytes.w >> 4
-    );
+    {
+        const float d = float(as_type<half>(*(device const ushort*)(gate_block)));
+        const float dmin = float(as_type<half>(*(device const ushort*)(gate_block + 2u)));
+        device const uchar* scales = gate_block + 4u;
+        device const uchar* quants = gate_block + 16u;
 
-    const float4 lo_vals = fma(float4(q_lo), float4(d_sc_lo), float4(-d_m_lo));
-    const float4 hi_vals = fma(float4(q_hi), float4(d_sc_hi), float4(-d_m_hi));
+        const uchar4 qbytes = *(device const uchar4*)(quants + byte_off);
+        const float2 sm_lo = get_scale_min_k4(j * 2u, scales);
+        const float2 sm_hi = get_scale_min_k4(j * 2u + 1u, scales);
 
-    acc += dot(lo_vals, x_lo) + dot(hi_vals, x_hi);
+        const float d_sc_lo = d * sm_lo.x;
+        const float d_m_lo = dmin * sm_lo.y;
+        const float d_sc_hi = d * sm_hi.x;
+        const float d_m_hi = dmin * sm_hi.y;
+
+        const uchar4 q_lo = uchar4(
+            qbytes.x & 0x0F,
+            qbytes.y & 0x0F,
+            qbytes.z & 0x0F,
+            qbytes.w & 0x0F
+        );
+        const uchar4 q_hi = uchar4(
+            qbytes.x >> 4,
+            qbytes.y >> 4,
+            qbytes.z >> 4,
+            qbytes.w >> 4
+        );
+
+        const float4 lo_vals = fma(float4(q_lo), float4(d_sc_lo), float4(-d_m_lo));
+        const float4 hi_vals = fma(float4(q_hi), float4(d_sc_hi), float4(-d_m_hi));
+
+        gate_acc += dot(lo_vals, x_lo) + dot(hi_vals, x_hi);
+    }
+
+    {
+        const float d = float(as_type<half>(*(device const ushort*)(up_block)));
+        const float dmin = float(as_type<half>(*(device const ushort*)(up_block + 2u)));
+        device const uchar* scales = up_block + 4u;
+        device const uchar* quants = up_block + 16u;
+
+        const uchar4 qbytes = *(device const uchar4*)(quants + byte_off);
+        const float2 sm_lo = get_scale_min_k4(j * 2u, scales);
+        const float2 sm_hi = get_scale_min_k4(j * 2u + 1u, scales);
+
+        const float d_sc_lo = d * sm_lo.x;
+        const float d_m_lo = dmin * sm_lo.y;
+        const float d_sc_hi = d * sm_hi.x;
+        const float d_m_hi = dmin * sm_hi.y;
+
+        const uchar4 q_lo = uchar4(
+            qbytes.x & 0x0F,
+            qbytes.y & 0x0F,
+            qbytes.z & 0x0F,
+            qbytes.w & 0x0F
+        );
+        const uchar4 q_hi = uchar4(
+            qbytes.x >> 4,
+            qbytes.y >> 4,
+            qbytes.z >> 4,
+            qbytes.w >> 4
+        );
+
+        const float4 lo_vals = fma(float4(q_lo), float4(d_sc_lo), float4(-d_m_lo));
+        const float4 hi_vals = fma(float4(q_hi), float4(d_sc_hi), float4(-d_m_hi));
+
+        up_acc += dot(lo_vals, x_lo) + dot(hi_vals, x_hi);
+    }
 }
 
 #define TG_SIZE 512
@@ -120,8 +164,10 @@ kernel void main0(
 
     #pragma unroll
     for (uint bi = 0u; bi < blocks_per_row; bi++) {
-        accumulate_q4k_direct(gate_row + ulong(bi) * 144ul, input, bi, uint(lane), gate_acc);
-        accumulate_q4k_direct(up_row + ulong(bi) * 144ul, input, bi, uint(lane), up_acc);
+        accumulate_q4k_pair_direct(
+            gate_row + ulong(bi) * 144ul,
+            up_row + ulong(bi) * 144ul,
+            input, bi, uint(lane), gate_acc, up_acc);
     }
 
     const float gate_sum = simd_sum(gate_acc);
