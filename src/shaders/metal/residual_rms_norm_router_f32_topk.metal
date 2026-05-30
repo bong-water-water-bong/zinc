@@ -126,11 +126,25 @@ kernel void main0(
 
             const float sum0 = simd_sum(acc0);
             const float sum1 = simd_sum(acc1);
-            if (lane == 0u) {
-                values[base_row] = sum0;
-                if (base_row + 1u < p.n_experts) {
-                    values[base_row + 1u] = sum1;
-                }
+            // Cycle-52: lane-parallel 2-row writeback of router GEMM partials
+            // into threadgroup `values[]`. After simd_sum, both `sum0` and
+            // `sum1` are present on every lane; lanes 0 and 1 each issue one
+            // store to consecutive `values[base_row..base_row+1]` slots in a
+            // single SIMD scatter instead of lane 0 doing two serial stores.
+            // This fires 4 row_blocks × 32 simdgroups = 128 writeback blocks
+            // per kernel invocation, on the hottest timed kernel (#1, 337.50
+            // ms/req across 1436 calls, 23% of timed kernel time, single-TG
+            // `{1,1,1}` × `{1024,1,1}` dispatch per
+            // `dispatchQwenResidualRmsNormRouterF32TopkOnCmd`). The
+            // `store_row < p.n_experts` predicate preserves the
+            // generic-validation tail (n_experts < ROWS_PER_TG cases).
+            // Extends cycle-43/45/47/49/50 lane-parallel writeback discipline
+            // from global memory to threadgroup memory; the barrier at
+            // line 147 still serializes against the next-phase top-k reader.
+            const uint store_row = base_row + lane;
+            if (lane < 2u && store_row < p.n_experts) {
+                const float val = (lane == 0u) ? sum0 : sum1;
+                values[store_row] = val;
             }
         }
     }
