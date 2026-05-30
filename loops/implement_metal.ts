@@ -78,6 +78,15 @@ const BENCHMARK_TRIM = parseBoolEnv("ZINC_BENCHMARK_TRIM", true);
 // improves the keep-gate's signal-to-noise ratio. Default 0 = off; set to 3000–5000 ms
 // for thermal-bound benches like 35B decode.
 const BENCHMARK_COOLDOWN_MS = parsePositiveIntEnv("ZINC_BENCHMARK_COOLDOWN_MS", 0);
+// Reject samples that generated fewer than this many tokens before aggregating
+// the median. Decode benchmarks at MAX_TOKENS=128 that EOS after a single
+// token (e.g., a chat-mode "Paris" answer) report tok/s computed from a single
+// generation — too noisy and not comparable to llama.cpp's `tg128` reference.
+// Effort 5 cycle 27 measured 74.63 tok/s on 1-token samples; the floor of the
+// sample range was 61.3, so the trimmed median was upward-biased by ~10 tok/s.
+// Default 0 = off (backward-compatible); set to e.g. 16 for decode runs so
+// throughput is measured over a sustained generation window.
+const MIN_DECODE_TOKENS = parsePositiveIntEnv("ZINC_MIN_DECODE_TOKENS", 0);
 // Confirmation re-run: when a candidate lands in the noise zone around the
 // promotion boundary (or its samples were flagged bimodal/THERMAL), collect
 // this many EXTRA timed samples and re-aggregate over the combined set before
@@ -1136,10 +1145,11 @@ async function collectTimedSamples(
   maxTokens: number,
   runs: number,
   label: string,
-): Promise<{ samples: number[]; lastRun: RunResult; lastCombined: string }> {
+): Promise<{ samples: number[]; lastRun: RunResult; lastCombined: string; droppedShort: number }> {
   const samples: number[] = [];
   let lastRun: RunResult = { exitCode: -1, stdout: "", stderr: "" };
   let lastCombined = "";
+  let droppedShort = 0;
   for (let sample = 0; sample < runs; sample++) {
     if (sample > 0 && BENCHMARK_COOLDOWN_MS > 0) {
       // Inter-sample cool-down: let GPU clocks settle before the next timed run
@@ -1155,12 +1165,28 @@ async function collectTimedSamples(
     lastCombined = run.stderr + run.stdout;
     if (run.exitCode !== 0) break; // crash — no point running more samples
     const tps = parseTokPerSec(lastCombined, METRIC_MODE);
+    const tokens = parseTokensGenerated(lastCombined);
+    // Reject samples that didn't generate enough tokens to give a stable
+    // throughput estimate. A model that EOS'd after 1 token reports a
+    // single-iteration tok/s (noisy + not comparable to llama.cpp tg128).
+    // Only applies in decode mode — prefill is timed off prompt ingest, not
+    // generation length.
+    if (
+      METRIC_MODE === "decode" &&
+      MIN_DECODE_TOKENS > 0 &&
+      tps != null &&
+      tokens < MIN_DECODE_TOKENS
+    ) {
+      droppedShort++;
+      console.log(clr("1;33", `    ${label} ${sample + 1}/${runs}: ${tps.toFixed(2)} ${METRIC_LABEL} DROPPED (generated only ${tokens} tokens; min ${MIN_DECODE_TOKENS})`));
+      continue;
+    }
     if (tps != null) {
       samples.push(tps);
-      console.log(clr("2", `    ${label} ${sample + 1}/${runs}: ${tps.toFixed(2)} ${METRIC_LABEL}`));
+      console.log(clr("2", `    ${label} ${sample + 1}/${runs}: ${tps.toFixed(2)} ${METRIC_LABEL}${tokens > 0 ? ` (${tokens} tok)` : ""}`));
     }
   }
-  return { samples, lastRun, lastCombined };
+  return { samples, lastRun, lastCombined, droppedShort };
 }
 
 /**
@@ -1303,11 +1329,16 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
   // sets where a single-trim still picked the wrong cluster. Symmetric
   // 2-trim from 7 samples leaves the middle 3, which is robust to the
   // cold-GPU outlier and the occasional too-warm outlier together.
+  let droppedShortSamples = 0;
   if (!warmupCrashed) {
     const timed = await collectTimedSamples(maxTokens, BENCHMARK_RUNS, "sample");
     tokPerSecSamples.push(...timed.samples);
     lastRun = timed.lastRun;
     lastCombined = timed.lastCombined;
+    droppedShortSamples += timed.droppedShort;
+  }
+  if (droppedShortSamples > 0) {
+    console.log(clr("1;33", `    ⚠ Dropped ${droppedShortSamples} sample(s) with fewer than ZINC_MIN_DECODE_TOKENS=${MIN_DECODE_TOKENS} generated tokens — measurement floor for sustained decode`));
   }
 
   const agg = aggregateTimedSamples(tokPerSecSamples);
