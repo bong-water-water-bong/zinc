@@ -17077,7 +17077,13 @@ fn runDecodeStep(
         if (qwen_branch_hidden_seed == null) {
             const embed_src = embed_src_override orelse &engine.embed_staging;
             dispatchCopyF32OffsetOnCmd(engine, cmd, embed_src, &engine.hidden_buf, hidden_dim, embed_src_offset, 0);
-            profileBarrier(cmd, profile, .embed);
+            // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
+            // (ggml-metal-common.cpp `ggml_mem_ranges_check_dst`): the only
+            // downstream consumer in this command buffer is layer 0's
+            // attn/ssm RMSNorm reading `hidden_buf`. Scope the barrier to
+            // that resource instead of fencing every prior buffer write
+            // (LM head/argmax tails from the SHARED command buffer).
+            profileBarrierBuffers(cmd, profile, .embed, &.{&engine.hidden_buf});
         }
     }
 
@@ -18656,9 +18662,13 @@ fn runDecodeStep(
             if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         } else {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
-            profileBarrier(cmd, profile, .final);
+            // Adapt llama.cpp `ggml_mem_ranges_check_dst`: LM head reads
+            // only the normalized row, so order norm_buf instead of fencing
+            // unrelated buffer writes still draining in the concurrent encoder.
+            profileBarrierBuffers(cmd, profile, .final, &.{&engine.norm_buf});
             dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
-            profileBarrier(cmd, profile, .final);
+            // Argmax reads only the logits row.
+            profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
