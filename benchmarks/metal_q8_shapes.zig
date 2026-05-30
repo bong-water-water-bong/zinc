@@ -72,6 +72,18 @@ const MoeRoutePackPush = extern struct {
     ids_stride: u32,
 };
 
+const ResidualRmsNormRouterF32TopkPush = extern struct {
+    n: u32,
+    eps: f32,
+    scale: f32,
+    residual_offset: u32,
+    n_experts: u32,
+    K: u32,
+    k: u32,
+    a_offset: u32,
+    shared_gate_offset: u32,
+};
+
 const moe_route_block_cols: u32 = 8;
 
 fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
@@ -93,6 +105,7 @@ const CaseId = enum {
     ssm_dual,
     ssm_out,
     router,
+    router_f32_fused,
     shared_gate,
     shared_up,
     shared_down,
@@ -129,18 +142,20 @@ const HotCase = struct {
     tensor0: *const metal_loader.LoadedTensor,
     tensor1: ?*const metal_loader.LoadedTensor = null,
     norm_tensor: ?*const metal_loader.LoadedTensor = null,
+    shared_gate_tensor: ?*const metal_loader.LoadedTensor = null,
     rows0: u32,
     rows1: u32 = 0,
     cols: u32,
     expert_slots: u32 = 1,
     x_expert_stride: u32 = 0,
+    is_router_fused: bool = false,
 
     fn isDual(self: @This()) bool {
-        return self.tensor1 != null;
+        return self.tensor1 != null and !self.is_router_fused;
     }
 
     fn isMoe(self: @This()) bool {
-        return self.expert_slots > 1 and self.tensor1 == null;
+        return self.expert_slots > 1 and self.tensor1 == null and !self.is_router_fused;
     }
 
     fn totalRows(self: @This()) u32 {
@@ -219,7 +234,8 @@ fn helpText() []const u8 {
     \\  -d, --device <index>       Metal device index (default: 0)
     \\  --case <name>              all | lm_head | attn_q | attn_k | attn_v | attn_out
     \\                            | ssm_qkv | ssm_gate | ssm_dual | ssm_out
-    \\                            | router | shared_gate | shared_up | shared_down | shared_dual
+    \\                            | router | router_f32_fused
+    \\                            | shared_gate | shared_up | shared_down | shared_dual
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
     \\  --pipeline <mode>          runtime | k2048 | both (default: both)
@@ -252,6 +268,7 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "ssm_dual")) return .ssm_dual;
     if (std.mem.eql(u8, arg, "ssm_out")) return .ssm_out;
     if (std.mem.eql(u8, arg, "router")) return .router;
+    if (std.mem.eql(u8, arg, "router_f32_fused")) return .router_f32_fused;
     if (std.mem.eql(u8, arg, "shared_gate")) return .shared_gate;
     if (std.mem.eql(u8, arg, "shared_up")) return .shared_up;
     if (std.mem.eql(u8, arg, "shared_down")) return .shared_down;
@@ -515,6 +532,48 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .tensor0 = tensor,
                 .rows0 = rows,
                 .cols = cols,
+            };
+        },
+        .router_f32_fused => blk: {
+            // Match production `canUseQwenResidualRmsNormRouterF32Topk`: F32 router
+            // M=n_experts × K=hidden_dim plus the F32 shared-expert gate scalar
+            // (1D, numElements==hidden_dim). Walks layers 0..n-1 to find the first
+            // MoE layer carrying both tensors at the right type.
+            var picked_router: ?*const metal_loader.LoadedTensor = null;
+            var picked_shared: ?*const metal_loader.LoadedTensor = null;
+            var picked_norm: ?*const metal_loader.LoadedTensor = null;
+            var layer_idx: u32 = 0;
+            while (layer_idx < model.config.n_layers) : (layer_idx += 1) {
+                const router_t = findLayerTensor(model, layer_idx, "ffn_gate_inp.weight") orelse continue;
+                const shared_t = findLayerTensor(model, layer_idx, "ffn_gate_inp_shexp.weight") orelse continue;
+                const norm_t = findLayerTensor(model, layer_idx, "ffn_norm.weight") orelse continue;
+                if (router_t.info.type_ != .f32) continue;
+                if (shared_t.info.type_ != .f32) continue;
+                if (shared_t.info.numElements() != model.config.hidden_dim) continue;
+                picked_router = router_t;
+                picked_shared = shared_t;
+                picked_norm = norm_t;
+                break;
+            }
+            const router_t = picked_router orelse return error.MissingRouterF32FusedTensors;
+            const shared_t = picked_shared orelse return error.MissingRouterF32FusedTensors;
+            const norm_t = picked_norm orelse return error.MissingRouterF32FusedTensors;
+            const rows = try tensorRows(router_t);
+            const cols = try tensorCols(router_t);
+            const k = model.config.n_experts_used;
+            if (k == 0) return error.InvalidTopK;
+            break :blk .{
+                .key = "router_f32_fused",
+                .label = "Fused residual+RMS+router_f32+topk+shared_gate",
+                .tensor0 = router_t,
+                .tensor1 = shared_t,
+                .norm_tensor = norm_t,
+                .shared_gate_tensor = shared_t,
+                .rows0 = rows,
+                .rows1 = 1,
+                .cols = cols,
+                .expert_slots = k,
+                .is_router_fused = true,
             };
         },
         .shared_gate => blk: {
@@ -1374,6 +1433,181 @@ fn runFusedDualDispatchBatch(
     cmd.commitAndWait();
 }
 
+fn runRouterF32TopkDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    pipe: *const MetalPipeline,
+    router: *const metal_loader.LoadedTensor,
+    shared_gate: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    hidden_buf: *const MetalBuffer,
+    residual_buf: *const MetalBuffer,
+    norm_out_buf: *const MetalBuffer,
+    norm_weight_buf: *const MetalBuffer,
+    output_topk_buf: *const MetalBuffer,
+    shared_gate_out_buf: *const MetalBuffer,
+    cols: u32,
+    n_experts: u32,
+    k: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0) return;
+    const push = ResidualRmsNormRouterF32TopkPush{
+        .n = cols,
+        .eps = 1e-6,
+        .scale = 1.0,
+        .residual_offset = 0,
+        .n_experts = n_experts,
+        .K = cols,
+        .k = k,
+        .a_offset = tensorPageOffset(model, router),
+        .shared_gate_offset = tensorPageOffset(model, shared_gate),
+    };
+    const bufs = [_]*const MetalBuffer{
+        hidden_buf,
+        residual_buf,
+        norm_out_buf,
+        norm_weight_buf,
+        &router.gpu_buffer,
+        output_topk_buf,
+        &shared_gate.gpu_buffer,
+        shared_gate_out_buf,
+    };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            pipe,
+            .{ 1, 1, 1 },
+            .{ 1024, 1, 1 },
+            &bufs,
+            &push,
+            @sizeOf(ResidualRmsNormRouterF32TopkPush),
+            0,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn benchmarkRouterF32FusedVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    warmup_iterations: u32,
+    iterations: u32,
+) !BenchResult {
+    const shared_gate = hot_case.shared_gate_tensor orelse return error.MissingSharedGateTensor;
+    const norm_tensor = hot_case.norm_tensor orelse return error.MissingNormTensor;
+
+    var pipe = try loadShaderPipeline(device.ctx, "residual_rms_norm_router_f32_topk");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    var hidden_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&hidden_buf);
+    var residual_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&residual_buf);
+    var norm_out_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_out_buf);
+    var norm_weight_buf = try loadNormWeightsBuffer(device.ctx, model, norm_tensor, hot_case.cols);
+    defer metal_buffer.freeBuffer(&norm_weight_buf);
+    // output_topk packed as `k` pairs of (uint id, float weight) = 2 dwords each.
+    var output_topk_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.expert_slots) * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&output_topk_buf);
+    var shared_gate_out_buf = try metal_buffer.createBuffer(device.ctx, @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_gate_out_buf);
+
+    fillInputBuffer(&hidden_buf, hot_case.cols);
+    fillInputBuffer(&residual_buf, hot_case.cols);
+    @memset(norm_out_buf.cpu_ptr.?[0..norm_out_buf.size], 0);
+    @memset(output_topk_buf.cpu_ptr.?[0..output_topk_buf.size], 0);
+    @memset(shared_gate_out_buf.cpu_ptr.?[0..shared_gate_out_buf.size], 0);
+
+    try runRouterF32TopkDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        shared_gate,
+        model,
+        &hidden_buf,
+        &residual_buf,
+        &norm_out_buf,
+        &norm_weight_buf,
+        &output_topk_buf,
+        &shared_gate_out_buf,
+        hot_case.cols,
+        hot_case.rows0,
+        hot_case.expert_slots,
+        warmup_iterations,
+    );
+    fillInputBuffer(&hidden_buf, hot_case.cols);
+    @memset(output_topk_buf.cpu_ptr.?[0..output_topk_buf.size], 0);
+    @memset(shared_gate_out_buf.cpu_ptr.?[0..shared_gate_out_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runRouterF32TopkDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        shared_gate,
+        model,
+        &hidden_buf,
+        &residual_buf,
+        &norm_out_buf,
+        &norm_weight_buf,
+        &output_topk_buf,
+        &shared_gate_out_buf,
+        hot_case.cols,
+        hot_case.rows0,
+        hot_case.expert_slots,
+        iterations,
+    );
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    // Weight bytes streamed per iter: router F32 (rows0×cols×4) + shared_gate F32 (cols×4) +
+    // norm_weight F32 (cols×4) + residual F32 (cols×4). Ignores hidden+norm_out r/w since
+    // they're small relative to the router GEMM (the dominant cost).
+    const router_bytes: u64 = @as(u64, hot_case.rows0) * @as(u64, hot_case.cols) * @sizeOf(f32);
+    const shared_bytes: u64 = @as(u64, hot_case.cols) * @sizeOf(f32);
+    const norm_bytes: u64 = @as(u64, hot_case.cols) * @sizeOf(f32);
+    const residual_bytes: u64 = @as(u64, hot_case.cols) * @sizeOf(f32);
+    const weight_bytes: u64 = router_bytes + shared_bytes + norm_bytes + residual_bytes;
+    const total_bytes = weight_bytes * iterations;
+    // Checksum: dump topk weights (the float halves of the id/weight pairs) and shared gate.
+    const topk_ptr: [*]const f32 = @ptrCast(@alignCast(output_topk_buf.cpu_ptr.?));
+    const shared_ptr: [*]const f32 = @ptrCast(@alignCast(shared_gate_out_buf.cpu_ptr.?));
+    var checksum_buf = try allocator.alloc(f32, hot_case.expert_slots + 1);
+    for (0..hot_case.expert_slots) |i| {
+        // Pair layout: even slots are uint id (treated as f32 bit-pattern in checksum),
+        // odd slots are f32 routing weights. Read odd lanes only for a meaningful sum.
+        checksum_buf[i] = topk_ptr[i * 2 + 1];
+    }
+    checksum_buf[hot_case.expert_slots] = shared_ptr[0];
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = "fused",
+        .shader_name = "residual_rms_norm_router_f32_topk",
+        .tensor_name = hot_case.tensor0.info.name,
+        .rows = hot_case.rows0,
+        .cols = hot_case.cols,
+        .expert_slots = hot_case.expert_slots,
+        .x_expert_stride = 0,
+        .iterations = iterations,
+        .block_size = 1024,
+        .rows_per_wg = hot_case.rows0,
+        .thread_execution_width = pipe.thread_execution_width,
+        .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(checksum_buf),
+        .output = checksum_buf,
+    };
+}
+
 fn copyOutput(allocator: std.mem.Allocator, output_buf: *const MetalBuffer, rows: u32) ![]f32 {
     const ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     return try allocator.dupe(f32, ptr[0..rows]);
@@ -2044,7 +2278,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .shared_gate, .shared_up, .shared_down, .shared_dual, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols };
+    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_dual, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -2072,7 +2306,35 @@ pub fn main() !void {
         if (config.case_id != .all and case_id != config.case_id) continue;
 
         const hot_case = try resolveHotCase(&model, case_id);
-        if (isMoeColsCase(case_id)) {
+        if (case_id == .router_f32_fused) {
+            try stdout.interface.print(
+                "Case {s}: {s} | tensors={s} + {s} (shared_gate) + {s} (ffn_norm) | quant=F32 | M={d} K={d} | topk={d} | weight {d:.2} MiB/iter\n",
+                .{
+                    hot_case.key,
+                    hot_case.label,
+                    hot_case.tensor0.info.name,
+                    hot_case.shared_gate_tensor.?.info.name,
+                    hot_case.norm_tensor.?.info.name,
+                    hot_case.rows0,
+                    hot_case.cols,
+                    hot_case.expert_slots,
+                    @as(f64, @floatFromInt(@as(u64, hot_case.rows0) * @as(u64, hot_case.cols) * @sizeOf(f32))) / (1024.0 * 1024.0),
+                },
+            );
+
+            var fused_result: ?BenchResult = null;
+            defer if (fused_result) |*result| allocator.free(result.output);
+
+            fused_result = try benchmarkRouterF32FusedVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, fused_result.?);
+        } else if (isMoeColsCase(case_id)) {
             const k = model.config.n_experts_used;
             const route_slots = config.route_tokens * k;
             const active_experts = @min(model.config.n_experts, route_slots);
