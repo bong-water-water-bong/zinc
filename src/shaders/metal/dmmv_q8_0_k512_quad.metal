@@ -113,14 +113,29 @@ kernel void main0(
     const float sum5 = simd_sum(acc5);
     const float sum6 = simd_sum(acc6);
     const float sum7 = simd_sum(acc7);
-    if (lane == 0u) {
-        output[base_row] = sum0;
-        if (has1) output[base_row + 1u] = sum1;
-        if (has2) output[base_row + 2u] = sum2;
-        if (has3) output[base_row + 3u] = sum3;
-        if (has4) output[base_row + 4u] = sum4;
-        if (has5) output[base_row + 5u] = sum5;
-        if (has6) output[base_row + 6u] = sum6;
-        if (has7) output[base_row + 7u] = sum7;
+    // Parallelize the 8-row writeback across lanes 0..7 (lane 0 serial 8
+    // stores → lanes 0..7 coalesced 32-byte store). After simd_sum all
+    // eight sums are broadcast to every lane in registers; base_row+0..+7
+    // are eight contiguous floats so the production Qwen3.6-35B shared-down
+    // case (M=2048, M%8==0 ⇒ every simdgroup writes a full eight rows)
+    // issues a single coalesced 32-byte store instead of eight serial
+    // lane-0 stores. The `base_row + lane < p.M` predicate (previously
+    // expressed as has1..has7) handles the generic-validation tail (M=19
+    // in the in-tree shader test). Mirrors cycle-27/32/38/39/40/41/43/45
+    // lane-parallel writeback discipline across the Q8/Q5_K family; this
+    // is the widest (8-row) still-serial writeback hot kernel — profile
+    // hot #5 (217.47ms/req, 1436 calls, avg 151us, ~40 calls/decode token
+    // × 256 WGs ≈ 10K TGs/token) covering the Qwen3.6 shared-expert down
+    // projection.
+    if (lane < 8u && base_row + lane < p.M) {
+        const float local_sum = (lane == 0u) ? sum0
+                              : (lane == 1u) ? sum1
+                              : (lane == 2u) ? sum2
+                              : (lane == 3u) ? sum3
+                              : (lane == 4u) ? sum4
+                              : (lane == 5u) ? sum5
+                              : (lane == 6u) ? sum6
+                              : sum7;
+        output[base_row + lane] = local_sum;
     }
 }
