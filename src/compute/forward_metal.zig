@@ -7567,17 +7567,19 @@ fn dispatchFusedNormDualQ8DmmvOnCmd(
     // layers where the previous MoE finalizer did not write next-attn-norm
     // (layer 0, and any layer transition where prev_fused_attn_norm stays
     // false) AND by the dt_rank=32 alpha+beta tail every SSM layer (total
-    // rows = 64). Cycle-6 halved 1024→512 (96→192 WGs / 2.4→4.8 WG/core for
-    // the 12288-row qkv+z case) toward the 38/core sweet spot the sibling
-    // non-fused dual at block=128 hits (cycle-5). Continue the halving:
-    // 512→256 (rows_per_wg 64→32) — qkv+z lands at 384 WGs (9.6/core), and
-    // the tiny alpha+beta dual (64 rows total) doubles from 1 WG to 2 WGs
-    // total, improving GPU pickup of an otherwise wasted dispatch. This
-    // mirrors llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s N_SG=4 / block=128
-    // default direction one more step. The shader reads
-    // `simdgroups_per_threadgroup`, so per-row math is unchanged. Keep the
+    // rows = 64). Cycle-6 halved 1024→512 (2.4→4.8 WG/core); cycle-7 went
+    // 512→256 (4.8→9.6 WG/core) for the 12288-row qkv+z case. Land on
+    // llama.cpp's exact N_SG_Q8_0=4 / block=128 default (ggml-metal-impl.h
+    // line 39-40) by halving once more 256→128: rows_per_wg 32→16 ⇒ qkv+z
+    // hits 768 WGs (19.2/core), matching the sibling non-fused dual which
+    // cycle-5 settled at block=128 / 38 WG/core. The tiny alpha+beta dual
+    // (64 rows total) doubles 2→4 WGs (0.1/core; still under-subscribed,
+    // but each extra WG picks up an otherwise-idle core). Cited from
+    // ggml-metal.metal `kernel_mul_mv_q8_0_f32_impl` template instantiated
+    // at lines 3646/3656 with N_R0_Q8_0=2 / N_SG_Q8_0=4. The shader reads
+    // `simdgroups_per_threadgroup` so per-row math is unchanged. Keep the
     // env override so prefill or future shapes can override if needed.
-    const block_size = engine.q8_dual_tg_override orelse 256;
+    const block_size = engine.q8_dual_tg_override orelse 128;
     const simd_width = if (engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width > 0) engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width else @as(u32, 32);
     const rows_per_wg: u32 = (block_size / simd_width) * 4;
     cmd.dispatchV2(&engine.dmmv_q8_0_dual_fused_norm_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
