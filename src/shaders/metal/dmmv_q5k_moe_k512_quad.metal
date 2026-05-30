@@ -145,11 +145,28 @@ kernel void main0(
     const float total1 = simd_sum(sum1);
     const float total2 = simd_sum(sum2);
     const float total3 = simd_sum(sum3);
-    if (lane == 0u) {
-        device float* output = Y + (p.y_offset / 4u) + expert_slot * p.M;
-        output[row0] = total0;
-        if (has_row1) output[row1] = total1;
-        if (has_row2) output[row2] = total2;
-        if (has_row3) output[row3] = total3;
+    // Parallelize the 4-row writeback across lanes 0..3.
+    // After simd_sum all four totals are present on every lane; output[row0..row3]
+    // are four contiguous floats so the Qwen3.6-35B production MoE-down case
+    // (M=2048, M%4==0 ⇒ every simdgroup writes a full quad) issues a single
+    // coalesced 16-byte store instead of four serial lane-0 stores. The
+    // has_row1/2/3 predicates remain to handle the generic-validation tail
+    // (the in-tree shader test uses M=69). Mirrors cycle-27/32/38/39/40
+    // lane-parallel writeback discipline across the Q8 family and extends it
+    // to the hottest Q5_K MoE-down kernel (~271ms/req of kernel timing, hot
+    // kernel #3, ~7.7K TGs/decode token across 30 SSM layers × 8 experts).
+    if (lane < 4u) {
+        const bool has = (lane == 0u) ? true
+                       : (lane == 1u) ? has_row1
+                       : (lane == 2u) ? has_row2
+                       : has_row3;
+        if (has) {
+            device float* output = Y + (p.y_offset / 4u) + expert_slot * p.M;
+            const float local_sum = (lane == 0u) ? total0
+                                  : (lane == 1u) ? total1
+                                  : (lane == 2u) ? total2
+                                  : total3;
+            output[row0 + lane] = local_sum;
+        }
     }
 }
