@@ -7460,12 +7460,25 @@ fn dispatchPairedQ8DmmvOnCmd(
     // default block=512 yields only ceil(512/32)=16 WGs → 0.4 WG/core on the
     // M4 Max's 40 cores — the same under-subscription anti-pattern cycles
     // 5-8/11/13 hit on the single-tensor Q8 paths. Drop to block=64 when M is
-    // small so the K+V pair runs 128 WGs (3.2 WG/core) without touching the
-    // Q+attn_gate pair at M=4096 (already 3.2 WG/core at block=512). Matches
+    // small so the K+V pair runs 128 WGs (3.2 WG/core). Adapted from
     // llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s N_SG=2 default for short rows.
+    //
+    // Cycle-15: Qwen3.6 full-attn Q+attn_gate paired (M=4096 K=2048, 10/token
+    // — one per full-attn layer × 10 layers) at block=512 gives wgs=128 →
+    // 3.2 WG/core, the same under-subscription point cycle-4 hit on the
+    // single-tensor exact_qwen_k2048 M=4096 SSM-gate path. Cycle-4 dropped
+    // 256→128 for single-tensor (M=4096/16 rows_per_wg = 256 WGs → 6.4/core)
+    // and KEPT (+0.1 tok/s). Apply the same density to the paired Q8 path:
+    // block=256 → rows_per_wg=16 → 256 WGs → 6.4/core. Per-row math unchanged
+    // (kernel reads simdgroups_per_threadgroup, K-cache shared across the TG
+    // so same 8 KiB input load). Matches the cycle-1..14 pattern of dropping
+    // to 6.4 WG/core whenever a hot M=4096 K=2048 shape sits at 3.2/core.
     const block_size: u32 = if (M <= 512 and base_block > 64 and
         engine.dmmv_q8_0_pair_pipe.max_threads_per_threadgroup >= 64)
         64
+    else if (M == 4096 and base_block > 256 and
+        engine.dmmv_q8_0_pair_pipe.max_threads_per_threadgroup >= 256)
+        256
     else
         base_block;
     const simd_width = if (engine.dmmv_q8_0_pair_pipe.thread_execution_width > 0) engine.dmmv_q8_0_pair_pipe.thread_execution_width else @as(u32, 32);
