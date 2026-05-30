@@ -18194,15 +18194,15 @@ fn runDecodeStep(
                         // Adapt llama.cpp `ggml_metal_op_concurrency_reset`:
                         // once QKV conv plus Z/alpha/beta tail projections have
                         // all been queued, the fused delta/gated kernel consumes
-                        // every producer. A scope barrier is cheaper than
-                        // building a per-resource barrier list and does not
-                        // remove any useful overlap at this join point. When
-                        // conv1d was fused into qkv, the `.qkv` barrier was
-                        // elided and attn_out_buf joins the list so the next
-                        // delta-net write of attn_out_buf is fenced against
-                        // the qkv-conv1d dispatch's write of attn_out_buf.
+                        // every producer. Use the true resource-scoped barrier
+                        // (matches the sibling `.alpha_beta_fused_norm` branch
+                        // below) so the Metal concurrent encoder tracks each
+                        // dependency precisely instead of hitting `barrierBuffers`'s
+                        // 5+ scope fallback when conv1d is fused into qkv and
+                        // attn_out_buf joins the list — cycle-18 confirmed
+                        // scope→resource conversion holds in this SSM tail.
                         if (conv1d_fused_into_qkv) {
-                            profileSsmBarrierBuffers(cmd, profile, .conv, &.{
+                            profileSsmResourceBarrierBuffers(cmd, profile, .conv, &.{
                                 &engine.swiglu_buf,
                                 &engine.gate_buf,
                                 &engine.router_logits_buf,
@@ -18210,7 +18210,7 @@ fn runDecodeStep(
                                 &engine.attn_out_buf,
                             });
                         } else {
-                            profileSsmBarrierBuffers(cmd, profile, .conv, &.{
+                            profileSsmResourceBarrierBuffers(cmd, profile, .conv, &.{
                                 &engine.swiglu_buf,
                                 &engine.gate_buf,
                                 &engine.router_logits_buf,
