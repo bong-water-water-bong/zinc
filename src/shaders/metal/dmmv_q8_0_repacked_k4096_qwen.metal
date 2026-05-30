@@ -75,10 +75,23 @@ kernel void main0(
     const float sum1 = simd_sum(acc1);
     const float sum2 = simd_sum(acc2);
     const float sum3 = simd_sum(acc3);
-    if (lane == 0u) {
-        output[base_row] = sum0;
-        output[base_row + 1u] = sum1;
-        output[base_row + 2u] = sum2;
-        output[base_row + 3u] = sum3;
+    // Parallelize the 4-row writeback across lanes 0..3 (cycle-39 sibling of
+    // cycle-38's K=2048 lane-parallel writeback). After simd_sum all four sums
+    // are present on every lane; base_row+0..+3 are four contiguous floats so
+    // lanes 0..3 of this simdgroup issue a single coalesced 16-byte store
+    // instead of four serial lane-0 stores. The dispatch route
+    // `.exact_qwen_k4096` gates on `M % 4 == 0` (forward_metal.zig:8043), and
+    // the `base_row >= p.M` early-return at the top means all four rows owned
+    // by this simdgroup are always valid (no per-row `has` check). Production
+    // hot user: SSM out projection (M=2048, K=4096, 30/token × 256 WGs ≈ 7.7K
+    // TGs/token, hot kernel #4 by total bytes streamed). Same lane-parallel
+    // pattern as cycle-32 (`dmmv_q8_0_dual_fused_norm_conv1d.metal`) and
+    // cycle-38 (`dmmv_q8_0_repacked_k2048_qwen.metal`).
+    if (lane < 4u) {
+        const float local_sum = (lane == 0u) ? sum0
+                              : (lane == 1u) ? sum1
+                              : (lane == 2u) ? sum2
+                              : sum3;
+        output[base_row + lane] = local_sum;
     }
 }
