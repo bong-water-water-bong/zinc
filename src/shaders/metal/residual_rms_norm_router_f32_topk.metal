@@ -146,13 +146,24 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (local_id == 0u) {
-        float shared_total = 0.0f;
-        #pragma unroll
-        for (uint i = 0u; i < N_SIMDGROUPS; ++i) {
-            shared_total += shared_partials[i];
+    // Cycle-51: replace the lane-0-serial 32-add reduction of `shared_partials`
+    // with `simd_sum` on simdgroup 0. With TG_SIZE=1024, N_SIMDGROUPS == 32 ==
+    // SIMD_WIDTH, so all 32 lanes of sg 0 read `shared_partials[lane]` in
+    // parallel and the simdgroup-hardware reduction collapses 32→1 in ~5-10
+    // cycles instead of the ~32 sequential threadgroup-memory loads + adds
+    // the old code paid on lane 0 only. This sits on the critical path through
+    // sg_idx==0, which immediately proceeds into the 8-slot top-k loop below
+    // (the long tail that single-handedly drives kernel exit). The hottest
+    // timed kernel #1 (345.00 ms/req across 1436 calls, 23% of timed kernel
+    // time, single-TG `{1,1,1}` × `{1024,1,1}` dispatch per
+    // `dispatchQwenResidualRmsNormRouterF32TopkOnCmd`) writes the same
+    // mathematical result. Same simdgroup-reduction discipline already used
+    // for the RMS sum_sq reduction at lines 86-93 above.
+    if (sg_idx == 0u) {
+        const float shared_total = simd_sum(shared_partials[lane]);
+        if (lane == 0u) {
+            shared_gate_out[0] = shared_total;
         }
-        shared_gate_out[0] = shared_total;
     }
 
     if (p.n_experts == 256u && p.k == 8u) {
