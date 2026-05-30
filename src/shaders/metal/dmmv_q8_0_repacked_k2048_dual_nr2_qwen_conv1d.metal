@@ -53,14 +53,45 @@ kernel void main0(
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroups_per_tg [[simdgroups_per_threadgroup]]
 ) {
+    // Cycle ~59: cooperative X-cache (8 KB threadgroup memory) for hot kernel
+    // #5 (SSM in-projection qkv+z dual matvec fused with conv1d postlude,
+    // 218 ms/req across 1044 calls, 15% of timed kernel time, ≈29 calls per
+    // decode token via the `prev_fused_attn_norm` path). All 8 simdgroups in
+    // this TG read the SAME 2048-float X (a single SSM in-projection input —
+    // `x_offset` is uniform, no per-expert stride — dispatched from
+    // `dispatchQwenSsmDualRepackedQ8K2048Conv1dOnCmd` at forward_metal.zig:7714
+    // with `{wgs,1,1}` grid × `{block_size,1,1}` TG, block_size=256 in
+    // production). Previously each simdgroup re-issued ~16 device float4 loads
+    // against the same 8 KB X buffer (8 SGs × 32 lanes × 16 vi-reads each →
+    // 4096 device-side float4 loads per TG; the second-and-onward SGs hit L1
+    // but pay ~10-cycle L1 latency per access). Stage X into 8 KB of
+    // threadgroup memory once (256 threads × 2 float4 each via the generic
+    // stride loop below — perfect DRAM coalescing on the first access, then
+    // 7× redundant device-side traffic eliminated), then read the 4-float
+    // slice from TG mem inside the matvec (1-2 cycle latency on Apple9). Also
+    // frees L1 capacity for the 64 KB of W reads per TG (8 SGs × 2 rows ×
+    // 2176 B = 34816 B + the per-lane scale loads). Same x_cache discipline
+    // as cycle ~56 (#2 swiglu_k2048) and cycle ~57 (#3 q5k_moe_k512_quad).
+    // The load loop is generic over simdgroups_per_tg so the block_size=128
+    // fallback (`max_block < 256` at forward_metal.zig:7710) still loads the
+    // full 2048 floats — 128 threads × 4 float4 each. Load happens BEFORE the
+    // early-return check so partial-TG tails still satisfy barrier liveness,
+    // though production M0+M1=10240 with rows_per_wg=16 never early-returns.
+    threadgroup float x_cache[2048];
+    device const float* input_dev = X + (p.x_offset >> 2);
+    const uint local_id = sg_idx * 32u + lane;
+    const uint local_count = simdgroups_per_tg * 32u;
+    for (uint vi = local_id; vi < 512u; vi += local_count) {
+        *(threadgroup float4*)(&x_cache[vi * 4u]) = *(device const float4*)(input_dev + vi * 4u);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     const uint base_pair = tg_id * simdgroups_per_tg + sg_idx;
     const uint base_row = base_pair * 2u;
     const uint total_rows = p.M0 + p.M1;
     if (base_row >= total_rows) {
         return;
     }
-
-    device const float* input = X + (p.x_offset >> 2);
 
     constexpr ulong group_bytes = 1088ul;
     constexpr ulong row_bytes = 2176ul;
@@ -91,7 +122,7 @@ kernel void main0(
             const uint qo = 64u + vi * 128u + lane * 4u;
             const char4 q0 = as_type<char4>(*(device const int*)(g0 + qo));
             const char4 q1 = as_type<char4>(*(device const int*)(g1 + qo));
-            const float4 x = *(device const float4*)(input + x_base + (vi << 2));
+            const float4 x = *(threadgroup const float4*)(&x_cache[x_base + (vi << 2)]);
 
             acc0 = fma(s0, dot(float4(q0), x), acc0);
             acc1 = fma(s1, dot(float4(q1), x), acc1);
