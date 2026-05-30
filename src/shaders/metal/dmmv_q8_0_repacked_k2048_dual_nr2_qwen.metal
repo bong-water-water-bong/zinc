@@ -79,8 +79,20 @@ kernel void main0(
 
     const float sum0 = simd_sum(acc0);
     const float sum1 = simd_sum(acc1);
-    if (lane == 0u) {
-        output[row] = sum0;
-        output[row + 1u] = sum1;
+    // Parallelize the 2-row writeback across lanes 0 and 1 — non-conv1d sibling
+    // of cycle-27's `dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d.metal`
+    // pattern, completing the lane-parallel writeback across both dual K=2048
+    // nr2 Qwen shaders. After simd_sum both sum0/sum1 are broadcast on every
+    // lane; `row` and `row + 1` are two contiguous floats in `output` (the
+    // production Qwen3.6 SSM dispatch passes M0=8192 (conv_channels) and
+    // M1=4096 (d_inner), both even, so `base_row = base_pair * 2u` keeps every
+    // pair inside one weight's output buffer), so lanes 0/1 issue a single
+    // coalesced 8-byte store instead of two serial lane-0 stores. Same
+    // discipline as cycles 27/32/38/39/40/41/43/45/46/47/48. Production hot
+    // user: the SSM qkv+gate dual projection when conv1d fusion isn't applied
+    // (canUseQwenSsmDualRepackedQ8K2048 fallback path, forward_metal.zig:18101).
+    if (lane < 2u) {
+        const float local_sum = (lane == 0u) ? sum0 : sum1;
+        output[row + lane] = local_sum;
     }
 }
