@@ -16837,7 +16837,16 @@ fn runDecodeStep(
     const head_v_dim: u32 = if (d_inner > 0) d_inner / @max(dt_rank, 1) else 0;
     const d_conv: u32 = cfg.ssm_d_conv;
     const use_dense_layer_cmd = canUseDenseSharedDecodeCommand(engine);
-    const allow_prefill_f32_router_fusion = external_shared_cmd != null or !emit_logits;
+    // Adapted from llama.cpp `ggml_metal_op_concurrency_check/reset` graph-tail
+    // fusion: the residual+RMS-norm+F32-router(+shared-gate) megakernel operates
+    // on per-layer per-token state (hidden, norm_buf, router_output_buf,
+    // router_logits_buf) and never touches the final logits buffer that
+    // `emit_logits` toggles. Open the gate for standalone decode so each Qwen
+    // SSM/attention boundary skips a separate softmax_topk + shared_gate dot,
+    // mirroring how prefill (external_shared_cmd != null) already used the
+    // fused path. The earlier `!emit_logits` restriction was historical from
+    // when this fusion was developed for batched prompt processing only.
+    const allow_prefill_f32_router_fusion = true;
     // Dense Gemma follows llama.cpp's graph submission pattern: enqueue larger
     // ordered chunks asynchronously and wait once at the token boundary.
     // llama.cpp's `ggml-metal-context.m::ggml_metal_set_n_cb` warns "optimal
