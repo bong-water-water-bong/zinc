@@ -77,10 +77,24 @@ kernel void main0(
     const float sum1 = simd_sum(acc1);
     const float sum2 = simd_sum(acc2);
     const float sum3 = simd_sum(acc3);
-    if (lane == 0u) {
-        output[base_row] = sum0;
-        output[base_row + 1u] = sum1;
-        output[base_row + 2u] = sum2;
-        output[base_row + 3u] = sum3;
+    // Parallelize the 4-row writeback across lanes 0..3.
+    // After simd_sum all four sums are present on every lane; base_row+0..+3
+    // are four contiguous floats so lanes 0..3 of this simdgroup issue a
+    // single coalesced 16-byte store instead of four serial lane-0 stores.
+    // Mirrors cycle-27 (`dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d.metal`,
+    // 2-lane variant) and cycle-32 (`dmmv_q8_0_dual_fused_norm_conv1d.metal`,
+    // 4-lane variant); the M%4==0 invariant guaranteed by the dispatch site
+    // (`prefer_qwen_repacked_q8_quad` requires `M % 4 == 0` for this path)
+    // plus the `base_row >= p.M` early-return at the top means all four rows
+    // owned by this simdgroup are always valid (no per-row `has` check).
+    // Production hot users: SSM `attn_gate` (M=4096, K=2048, 30/token × 512
+    // WGs ≈ 15K TGs/token) and full-attn-out (M=2048, K=2048, 10/token ×
+    // 256 WGs ≈ 2.5K TGs/token).
+    if (lane < 4u) {
+        const float local_sum = (lane == 0u) ? sum0
+                              : (lane == 1u) ? sum1
+                              : (lane == 2u) ? sum2
+                              : sum3;
+        output[base_row + lane] = local_sum;
     }
 }
