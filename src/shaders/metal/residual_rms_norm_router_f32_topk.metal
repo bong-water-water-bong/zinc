@@ -71,16 +71,36 @@ kernel void main0(
     threadgroup float selected_val[MAX_K_USED];
     threadgroup float shared_partials[N_SIMDGROUPS];
 
+    // Cycle ~60: keep the per-thread `updated` float4 in REGISTERS across the
+    // sum_sq → rms_inv reduction barrier, eliminating one TG mem write (Phase 1)
+    // and one TG mem read (Phase 2) per active thread on the #1 hot decode-token
+    // kernel (339 ms/req across 1436 calls, 23% of timed kernel time, single-TG
+    // dispatch per `dispatchQwenResidualRmsNormRouterF32TopkOnCmd`). The
+    // validation guards at lines 61-66 ensure `(p.K >> 2) <= MAX_K_VEC4 = 1024`
+    // and TG_SIZE=1024, so the TG_SIZE-stride loop body executes AT MOST ONCE
+    // per thread (each thread's `vi = local_id`; the next iter `vi += TG_SIZE`
+    // is always ≥ k_vec4). Same-thread Phase-1→Phase-2 dataflow (each thread
+    // reads x_cache4[local_id] that it itself wrote) goes through registers
+    // instead of TG mem; cross-thread x_cache4 visibility for the SUBSEQUENT
+    // router-GEMM and shared-gate phases is preserved by Phase 2's
+    // `x_cache4[vi] = nval` write and the line-107 barrier. Adapts llama.cpp's
+    // `kernel_mul_mv_q4_K_f32_impl` (ggml-metal.metal:7763-7811) pattern that
+    // keeps `yl[16]/yh[16]` in registers across the per-row reduction loop —
+    // here applied across the inter-phase RMS reduction barrier. The
+    // `threadgroup_barrier` at line 90 still serializes partial_sums writes;
+    // the line-107 barrier still serializes nval visibility for downstream.
     const uint k_vec4 = p.K >> 2;
+    const uint vi = local_id;
+    const bool active = vi < k_vec4;
     float sum_sq = 0.0f;
-    for (uint vi = local_id; vi < k_vec4; vi += TG_SIZE) {
+    float4 updated = float4(0.0f);
+    if (active) {
         const uint idx = vi << 2;
         const float4 h = *(device const float4*)(hidden + idx);
         const float4 r = *(device const float4*)(residual + p.residual_offset + idx);
-        const float4 updated = fma(float4(p.scale), r, h);
+        updated = fma(float4(p.scale), r, h);
         *(device float4*)(hidden + idx) = updated;
-        x_cache4[vi] = updated;
-        sum_sq += dot(updated, updated);
+        sum_sq = dot(updated, updated);
     }
 
     const float sg_sum = simd_sum(sum_sq);
@@ -93,10 +113,10 @@ kernel void main0(
     const float total_sq = simd_sum(partial);
     const float rms_inv = fast::rsqrt(fast::divide(total_sq, float(p.n)) + p.eps);
 
-    for (uint vi = local_id; vi < k_vec4; vi += TG_SIZE) {
+    if (active) {
         const uint idx = vi << 2;
         const float4 w = *(device const float4*)(norm_weight + idx);
-        const float4 nval = w * (x_cache4[vi] * rms_inv);
+        const float4 nval = w * (updated * rms_inv);
         x_cache4[vi] = nval;
         *(device float4*)(norm_out + idx) = nval;
     }
