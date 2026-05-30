@@ -1157,6 +1157,19 @@ const DualQ8DmmvPush = extern struct {
     y1_offset: u32,
 };
 
+const DualQ8DmmvConv1dPush = extern struct {
+    M0: u32,
+    M1: u32,
+    K: u32,
+    a0_offset: u32,
+    a1_offset: u32,
+    x_offset: u32,
+    y0_offset: u32,
+    y1_offset: u32,
+    conv_channels: u32,
+    d_conv: u32,
+};
+
 /// Push for `dmmv_q4k_qk_dual.metal` — dense Gemma single-token Q+K dual
 /// matvec. Matches `QKDualPush` in the kernel.
 const QKDualPush = extern struct {
@@ -2947,6 +2960,8 @@ pub const InferenceEngine = struct {
     dmmv_q8_0_pair_swiglu_pipe: MetalPipeline,
     dmmv_q8_0_k2048_fused_norm_pipe: MetalPipeline,
     dmmv_q8_0_dual_fused_norm_pipe: MetalPipeline,
+    dmmv_q8_0_dual_fused_norm_conv1d_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d_pipe: MetalPipeline,
     dmmv_q8_0_repacked_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k2048_pipe: MetalPipeline,
     dmmv_q8_0_repacked_k4096_pipe: MetalPipeline,
@@ -3577,6 +3592,8 @@ pub const InferenceEngine = struct {
         self.dmmv_q8_0_pair_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
         self.dmmv_q8_0_k2048_fused_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048_fused_norm");
         self.dmmv_q8_0_dual_fused_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual_fused_norm");
+        self.dmmv_q8_0_dual_fused_norm_conv1d_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual_fused_norm_conv1d");
+        self.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d");
         self.dmmv_q8_0_repacked_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked");
         self.dmmv_q8_0_repacked_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048");
         self.dmmv_q8_0_repacked_k4096_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096");
@@ -4512,6 +4529,8 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q8_0_pair_swiglu_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_fused_norm_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_fused_norm_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_fused_norm_conv1d_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_pipe);
@@ -7597,6 +7616,81 @@ fn dispatchQwenSsmDualRepackedQ8K2048OnCmd(
     cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
 }
 
+/// Repacked dual Q8_0 K=2048 SSM projection + conv1d postlude.
+///
+/// Identical dispatch geometry to `dispatchQwenSsmDualRepackedQ8K2048OnCmd`
+/// but routes through the conv1d-fused variant kernel; eliminates the
+/// standalone `ssm_conv1d_qwen_d4` dispatch and the qkv→conv barrier for
+/// SSM layers reached via the `prev_fused_attn_norm` path.
+fn dispatchQwenSsmDualRepackedQ8K2048Conv1dOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor0: *const metal_loader.LoadedTensor,
+    tensor1: *const metal_loader.LoadedTensor,
+    weight0_buf: *const MetalBuffer,
+    weight1_buf: *const MetalBuffer,
+    weight0_offset: u32,
+    weight1_offset: u32,
+    input_buf: *const MetalBuffer,
+    output0_buf: *const MetalBuffer,
+    output1_buf: *const MetalBuffer,
+    conv_kernel_buf: *const MetalBuffer,
+    conv_state_buf: *const MetalBuffer,
+    conv_out_buf: *const MetalBuffer,
+    M0: u32,
+    M1: u32,
+    K: u32,
+    conv_channels: u32,
+    d_conv: u32,
+) void {
+    recordDmmvProfile(engine, tensor0, M0, K);
+    recordDmmvProfile(engine, tensor1, M1, K);
+    recordQ8RepackedKernelProfile(engine, tensor0, M0, K, .tg128);
+    recordQ8RepackedKernelProfile(engine, tensor1, M1, K, .tg128);
+
+    const push = DualQ8DmmvConv1dPush{
+        .M0 = M0,
+        .M1 = M1,
+        .K = K,
+        .a0_offset = weight0_offset,
+        .a1_offset = weight1_offset,
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+        .conv_channels = conv_channels,
+        .d_conv = d_conv,
+    };
+    const bufs = [_]*const MetalBuffer{
+        weight0_buf, weight1_buf, input_buf, output0_buf, output1_buf,
+        conv_kernel_buf, conv_state_buf, conv_out_buf,
+    };
+    const block_size: u32 = 128;
+    const rows_per_wg: u32 = (block_size / 32) * 2;
+    const total_rows = M0 + M1;
+    const wgs = (total_rows + rows_per_wg - 1) / rows_per_wg;
+    cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvConv1dPush), 0);
+}
+
+fn canUseQwenSsmDualRepackedQ8K2048Conv1d(
+    engine: *const InferenceEngine,
+    wqkv_t: *const metal_loader.LoadedTensor,
+    z_t: *const metal_loader.LoadedTensor,
+    wqkv_buf: *const MetalBuffer,
+    z_buf: *const MetalBuffer,
+    conv_channels: u32,
+    d_inner: u32,
+    hidden_dim: u32,
+    d_conv: u32,
+    kernel_is_f16: bool,
+) bool {
+    if (!canUseQwenSsmDualRepackedQ8K2048(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) return false;
+    if (!canUseQwenSsmConvD4FastPath(engine, conv_channels, d_conv, kernel_is_f16)) return false;
+    if (conv_channels != 8192) return false;
+    if ((conv_channels % 2) != 0) return false;
+    return engine.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d_pipe.handle != null and
+        engine.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d_pipe.thread_execution_width == 32;
+}
+
 fn dispatchPairedQ8SwiGLUOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -7719,6 +7813,94 @@ fn dispatchFusedNormDualQ8DmmvOnCmd(
     const simd_width = if (engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width > 0) engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width else @as(u32, 32);
     const rows_per_wg: u32 = (block_size / simd_width) * 4;
     cmd.dispatchV2(&engine.dmmv_q8_0_dual_fused_norm_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
+}
+
+/// Fused RMSNorm + dual Q8_0 DMMV + SSM conv1d postlude.
+///
+/// Identical to `dispatchFusedNormDualQ8DmmvOnCmd` but extends the kernel
+/// with the per-channel conv1d for rows that land in `output0_buf` (the qkv
+/// slice of the SSM projection). Eliminates the standalone
+/// `ssm_conv1d_qwen_d4` dispatch and the qkv→conv barrier on Qwen3.6-35B
+/// decode tokens — ~30 fewer dispatches + 30 fewer barriers per token.
+fn dispatchFusedNormDualQ8DmmvConv1dOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor0: *const metal_loader.LoadedTensor,
+    tensor1: *const metal_loader.LoadedTensor,
+    weight0_buf: *const MetalBuffer,
+    weight1_buf: *const MetalBuffer,
+    weight0_offset: u32,
+    weight1_offset: u32,
+    hidden_buf: *const MetalBuffer,
+    norm_weight_buf: *const MetalBuffer,
+    output0_buf: *const MetalBuffer,
+    output1_buf: *const MetalBuffer,
+    conv_kernel_buf: *const MetalBuffer,
+    conv_state_buf: *const MetalBuffer,
+    conv_out_buf: *const MetalBuffer,
+    M0: u32,
+    M1: u32,
+    K: u32,
+    conv_channels: u32,
+    d_conv: u32,
+) void {
+    recordDmmvProfile(engine, tensor0, M0, K);
+    recordDmmvProfile(engine, tensor1, M1, K);
+
+    const push = DualQ8DmmvConv1dPush{
+        .M0 = M0,
+        .M1 = M1,
+        .K = K,
+        .a0_offset = weight0_offset,
+        .a1_offset = weight1_offset,
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+        .conv_channels = conv_channels,
+        .d_conv = d_conv,
+    };
+    const bufs = [_]*const MetalBuffer{
+        weight0_buf, weight1_buf, hidden_buf, output0_buf, output1_buf, norm_weight_buf,
+        conv_kernel_buf, conv_state_buf, conv_out_buf,
+    };
+    const total_rows = M0 + M1;
+    // Same block_size discipline as the non-conv1d sibling. The conv1d
+    // postlude is only fired for rows < M0, and the dispatch site gates on
+    // M0 % (simdgroups_per_tg * 4) == 0 so each simdgroup is uniformly
+    // qkv-or-z (no boundary split inside a simdgroup) — block_size=128 with
+    // simd_width=32 gives 4 simdgroups/TG × 4 rows/simdgroup = 16 rows/TG,
+    // and 8192 % 16 == 0.
+    const block_size: u32 = if (engine.q8_dual_tg_override) |override| override else @as(u32, 128);
+    const simd_width = if (engine.dmmv_q8_0_dual_fused_norm_conv1d_pipe.thread_execution_width > 0) engine.dmmv_q8_0_dual_fused_norm_conv1d_pipe.thread_execution_width else @as(u32, 32);
+    const rows_per_wg: u32 = (block_size / simd_width) * 4;
+    cmd.dispatchV2(&engine.dmmv_q8_0_dual_fused_norm_conv1d_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvConv1dPush), 0);
+}
+
+fn canUseQwenSsmFusedNormProjectionsWithConv1d(
+    engine: *const InferenceEngine,
+    wqkv_t: *const metal_loader.LoadedTensor,
+    z_t: *const metal_loader.LoadedTensor,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+    conv_channels: u32,
+    d_inner: u32,
+    dt_rank: u32,
+    hidden_dim: u32,
+    d_conv: u32,
+    kernel_is_f16: bool,
+) bool {
+    if (!canUseQwenSsmFusedNormProjections(engine, wqkv_t, z_t, alpha_t, beta_t, conv_channels, d_inner, dt_rank, hidden_dim)) return false;
+    if (!canUseQwenSsmConvD4FastPath(engine, conv_channels, d_conv, kernel_is_f16)) return false;
+    // The kernel writes the qkv slice into output0_buf and conv1d treats
+    // every row < M0 as a conv channel — requires M0 == conv_channels so the
+    // row index doubles as the channel index. The dispatch is gated to the
+    // exact Qwen3.6 SSM shape (8192 == 8192), so this is always true here.
+    if (conv_channels != 8192) return false;
+    // Each simdgroup processes 4 contiguous rows; require M0 divisibility so
+    // the qkv→z boundary never splits a simdgroup (`first0` is uniform).
+    if ((conv_channels % 4) != 0) return false;
+    return engine.dmmv_q8_0_dual_fused_norm_conv1d_pipe.handle != null and
+        engine.dmmv_q8_0_dual_fused_norm_conv1d_pipe.thread_execution_width == 32;
 }
 
 /// Fused RMSNorm + Q8_0 DMMV (K <= 2048): reads raw hidden state, computes norm inline.
@@ -17829,6 +18011,13 @@ fn runDecodeStep(
                 };
                 var tail_projection_mode: TailProjectionMode = .none;
                 var z_projection_queued_before_conv = false;
+                // Set when the qkv dispatch also runs the per-channel conv1d
+                // postlude inline (writes attn_out_buf, gate_buf, swiglu_buf,
+                // and shifts the per-layer conv state in one kernel). The
+                // standalone conv1d dispatch and its `.qkv` barrier are then
+                // skipped, and the `.conv` barrier picks up attn_out_buf to
+                // fence the write-after-write hazard with delta-net.
+                var conv1d_fused_into_qkv = false;
                 if (use_prefill_projection_chunk) {
                     const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
                     const beta_batched = canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
@@ -17849,7 +18038,17 @@ fn runDecodeStep(
                     // llama.cpp's graph-tail fusion, and skip the standalone
                     // RMSNorm dispatch/barrier before the SSM projections.
                     prev_fused_attn_norm = false;
-                    if (canUseQwenSsmDualRepackedQ8K2048(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
+                    if (canUseQwenSsmDualRepackedQ8K2048Conv1d(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim, d_conv, false)) {
+                        // Same llama.cpp `kernel_mul_mv_q8_0_f32_impl` two-row Q8
+                        // geometry as the non-conv1d sibling, but the qkv slice
+                        // also runs the per-channel `ssm_conv1d_qwen_d4` postlude
+                        // inline — saves one dispatch + one `.qkv` barrier per
+                        // SSM layer for the prev_fused_attn_norm path (the
+                        // common case once any MoE finalizer has run).
+                        dispatchQwenSsmDualRepackedQ8K2048Conv1dOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, &engine.ssm_conv_kernel_bufs.?[layer_idx], &engine.ssm_conv_state_bufs.?[layer_idx], &engine.swiglu_buf, conv_channels, d_inner, hidden_dim, conv_channels, d_conv);
+                        z_projection_queued_before_conv = true;
+                        conv1d_fused_into_qkv = true;
+                    } else if (canUseQwenSsmDualRepackedQ8K2048(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
                         // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s fixed
                         // two-row Q8 geometry to the sibling Qwen SSM projections:
                         // QKV and gate share the same normalized row, so keep their
@@ -17860,6 +18059,29 @@ fn runDecodeStep(
                         dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
                     }
                     tail_projection_mode = .z_alpha_beta_from_norm;
+                } else if (canUseQwenSsmFusedNormProjectionsWithConv1d(
+                    engine,
+                    wqkv_t,
+                    z_t,
+                    alpha_t,
+                    beta_t,
+                    conv_channels,
+                    d_inner,
+                    dt_rank,
+                    hidden_dim,
+                    d_conv,
+                    false,
+                )) {
+                    // Fused RMSNorm + DMMV + conv1d postlude: extends the
+                    // non-conv1d fused-norm path by also running the
+                    // `ssm_conv1d_qwen_d4` work inline for the qkv slice. Saves
+                    // one dispatch + one `.qkv` barrier per SSM layer per
+                    // decode token; mirrors llama.cpp's single-consumer fusion
+                    // discipline (ggml-metal-ops.cpp:159, 175) across the qkv
+                    // → conv1d edge.
+                    dispatchFusedNormDualQ8DmmvConv1dOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.attn_out_buf, &engine.gate_buf, &engine.ssm_conv_kernel_bufs.?[layer_idx], &engine.ssm_conv_state_bufs.?[layer_idx], &engine.swiglu_buf, conv_channels, d_inner, hidden_dim, conv_channels, d_conv);
+                    tail_projection_mode = .alpha_beta_fused_norm;
+                    conv1d_fused_into_qkv = true;
                 } else if (canUseQwenSsmFusedNormProjections(
                     engine,
                     wqkv_t,
@@ -17905,7 +18127,7 @@ fn runDecodeStep(
                         dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
                     }
                 }
-                if (!use_direct_prefill_projection_chunk) {
+                if (!use_direct_prefill_projection_chunk and !conv1d_fused_into_qkv) {
                     switch (tail_projection_mode) {
                         .none => profileSsmBarrierBuffers(cmd, profile, .tail, &.{
                             &engine.attn_out_buf,
@@ -17917,8 +18139,15 @@ fn runDecodeStep(
                     }
                 }
 
-                // Conv1d: attn_out_buf → swiglu_buf
-                {
+                if (conv1d_fused_into_qkv) {
+                    // The qkv dispatch already ran the per-channel conv1d
+                    // postlude inline (silu(dot(w, [s0,s1,s2,new])) → swiglu_buf
+                    // plus the 3-element state shift). Skip the standalone
+                    // dispatch but keep the profile counter parity so
+                    // ssm_conv_calls still equals the logical conv1d ops/req.
+                    if (profile) |p| p.ssm_conv_calls += 1;
+                } else {
+                    // Conv1d: attn_out_buf → swiglu_buf
                     const conv_input_buf = if (use_direct_prefill_projection_chunk)
                         &engine.qwen_ssm_prefill_proj_qkv_buf
                     else
@@ -17967,13 +18196,27 @@ fn runDecodeStep(
                         // all been queued, the fused delta/gated kernel consumes
                         // every producer. A scope barrier is cheaper than
                         // building a per-resource barrier list and does not
-                        // remove any useful overlap at this join point.
-                        profileSsmBarrierBuffers(cmd, profile, .conv, &.{
-                            &engine.swiglu_buf,
-                            &engine.gate_buf,
-                            &engine.router_logits_buf,
-                            &engine.down_buf,
-                        });
+                        // remove any useful overlap at this join point. When
+                        // conv1d was fused into qkv, the `.qkv` barrier was
+                        // elided and attn_out_buf joins the list so the next
+                        // delta-net write of attn_out_buf is fenced against
+                        // the qkv-conv1d dispatch's write of attn_out_buf.
+                        if (conv1d_fused_into_qkv) {
+                            profileSsmBarrierBuffers(cmd, profile, .conv, &.{
+                                &engine.swiglu_buf,
+                                &engine.gate_buf,
+                                &engine.router_logits_buf,
+                                &engine.down_buf,
+                                &engine.attn_out_buf,
+                            });
+                        } else {
+                            profileSsmBarrierBuffers(cmd, profile, .conv, &.{
+                                &engine.swiglu_buf,
+                                &engine.gate_buf,
+                                &engine.router_logits_buf,
+                                &engine.down_buf,
+                            });
+                        }
                     },
                     .alpha_beta_fused_norm => {
                         dispatchFusedNormDualQ8DmmvOnCmd(
@@ -17993,12 +18236,26 @@ fn runDecodeStep(
                             dt_rank,
                             hidden_dim,
                         );
-                        profileSsmResourceBarrierBuffers(cmd, profile, .conv, &.{
-                            &engine.swiglu_buf,
-                            &engine.gate_buf,
-                            &engine.router_logits_buf,
-                            &engine.down_buf,
-                        });
+                        // See note on the `.z_alpha_beta_from_norm` branch:
+                        // include attn_out_buf when conv1d was fused so its
+                        // qkv-side write is fenced against the delta-net write
+                        // that overwrites it next.
+                        if (conv1d_fused_into_qkv) {
+                            profileSsmResourceBarrierBuffers(cmd, profile, .conv, &.{
+                                &engine.swiglu_buf,
+                                &engine.gate_buf,
+                                &engine.router_logits_buf,
+                                &engine.down_buf,
+                                &engine.attn_out_buf,
+                            });
+                        } else {
+                            profileSsmResourceBarrierBuffers(cmd, profile, .conv, &.{
+                                &engine.swiglu_buf,
+                                &engine.gate_buf,
+                                &engine.router_logits_buf,
+                                &engine.down_buf,
+                            });
+                        }
                     },
                 }
                 if (shouldValidateQwenSsmProjection(engine, layer_idx, using_local_cmd, wqkv_t, z_t, alpha_t, beta_t)) {
