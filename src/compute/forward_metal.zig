@@ -7567,9 +7567,20 @@ fn dispatchPairedQ8SwiGLUOnCmd(
         K == 2048 and
         std.mem.endsWith(u8, gate.info.name, "ffn_gate_shexp.weight") and
         std.mem.endsWith(u8, up.info.name, "ffn_up_shexp.weight");
+    // Cycle-16: same shape-conditional cliff as cycle-14 (paired K+V at M=512,
+    // K=2048) — the Qwen3.6 shared expert gate+up SwiGLU at M=512 K=2048 under
+    // block=128 yields ceil(512/8)=64 WGs → 1.6 WG/core on the M4 Max's 40
+    // cores. The shared-expert path fires once per MoE layer (40/token),
+    // ~4× more frequent than full-attn K+V (~10/token), so the same
+    // undersubscription fix pays off proportionally more. Drop to block=64
+    // (rows_per_wg=4, 128 WGs → 3.2 WG/core), matching cycle-14's KEPT
+    // pattern. Kernel reads `simdgroups_per_threadgroup` for stride so per-row
+    // SwiGLU math is unchanged. Adapted from llama.cpp `kernel_mul_mv_q8_0_f32_impl`
+    // (ggml-metal.metal) N_SG=2 default for short rows: small M shapes prefer
+    // more workgroups over wider per-WG simdgroup counts.
     const block_size: u32 = if (is_qwen_shared_gate_up and
-        engine.dmmv_q8_0_pair_swiglu_pipe.max_threads_per_threadgroup >= 128)
-        128
+        engine.dmmv_q8_0_pair_swiglu_pipe.max_threads_per_threadgroup >= 64)
+        64
     else
         pairedQ8DmmvBlockSize(engine, gate, up);
     const simd_width = if (engine.dmmv_q8_0_pair_swiglu_pipe.thread_execution_width > 0) engine.dmmv_q8_0_pair_swiglu_pipe.thread_execution_width else @as(u32, 32);
