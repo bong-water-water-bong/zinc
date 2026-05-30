@@ -3403,9 +3403,15 @@ pub const InferenceEngine = struct {
         self.qwen_layer0_shared_down_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_DOWN_PREFILL") orelse true;
         self.qwen_layer0_shared_gate_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_GATE_PREFILL") orelse true;
         // Per-kernel timing probe — default off, distorts decode tok/s when on (each
-        // dispatch becomes a commit+wait sync). Use only with `--profile` runs to
-        // surface µs/dispatch evidence for the next optimization cycle.
-        if (readBoolEnv("ZINC_METAL_KERNEL_TIMING") orelse false) {
+        // dispatch becomes a commit+wait sync). Auto-enable on `--profile` runs so
+        // both `./zig-out/bin/zinc --profile` (used by the harness profile pass)
+        // and `zinc-bench-metal --profile` surface top-5 µs/dispatch evidence;
+        // cycle-31 wired this to `zinc-bench-metal` only, but the loop's profile
+        // pass actually shells out to the main `zinc` binary. Engine-level wiring
+        // covers both entry points and is idempotent with the bench's pre-init
+        // `kernel_timing.enable()` call. Main keep-gate runs do not pass
+        // `--profile`, so per-decode tok/s is unaffected.
+        if (self.profile_enabled or (readBoolEnv("ZINC_METAL_KERNEL_TIMING") orelse false)) {
             kernel_timing.enable();
         }
         self.request_profile = .{};
