@@ -32,7 +32,7 @@ inline void accumulate_q5k_block_quad(
     device const uchar* block1,
     device const uchar* block2,
     device const uchar* block3,
-    device const float* input,
+    threadgroup const float* input,
     uint col_base,
     uint lane,
     thread float& sum0,
@@ -118,6 +118,25 @@ kernel void main0(
 ) {
     const uint expert_slot = tg_pos.y;
     const uint expert_id = expert_ids[expert_slot];
+
+    // Cooperative X cache: all 16 simdgroups in this TG share the same
+    // `expert_slot = tg_pos.y` and therefore the same 512-float input vector
+    // (the SwiGLU output for one active expert). Previously each simdgroup
+    // re-read the same 512 floats from L1, 16×512=8192 redundant reads per TG.
+    // Stage once into TG memory: TG_SIZE=512 threads ⇒ 1:1 mapping, each
+    // thread loads exactly one float from contiguous DRAM offsets (perfect
+    // coalescing). Same x_cache discipline as cycle ~56 in
+    // `dmmv_q4k_moe_gate_up_swiglu_k2048.metal` (hot kernel #2). Load+barrier
+    // happen BEFORE the `row0 >= p.M` early-return so partial-TG tails
+    // (test M=69 ⇒ second TG has 59 idle rows) still satisfy barrier liveness.
+    threadgroup float x_cache[512];
+    {
+        device const float* input_src = X + (p.x_offset / 4u) + expert_slot * p.x_expert_stride;
+        const uint local_id = simdgroup * 32u + lane;
+        x_cache[local_id] = input_src[local_id];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     const uint row0 = tg_pos.x * ROWS_PER_TG + simdgroup * 4u;
     if (row0 >= p.M) return;
     const uint row1 = row0 + 1u;
@@ -127,7 +146,6 @@ kernel void main0(
     const bool has_row2 = row2 < p.M;
     const bool has_row3 = row3 < p.M;
 
-    device const float* input = X + (p.x_offset / 4u) + expert_slot * p.x_expert_stride;
     const ulong expert_base = ulong(p.a_offset) + ulong(expert_id) * ulong(p.expert_stride);
     device const uchar* row0_ptr = W + expert_base + ulong(row0) * 352ul;
     device const uchar* row1_ptr = has_row1 ? (row0_ptr + 352ul) : row0_ptr;
@@ -138,8 +156,8 @@ kernel void main0(
     float sum1 = 0.0f;
     float sum2 = 0.0f;
     float sum3 = 0.0f;
-    accumulate_q5k_block_quad(row0_ptr, row1_ptr, row2_ptr, row3_ptr, input, 0u, lane, sum0, sum1, sum2, sum3);
-    accumulate_q5k_block_quad(row0_ptr + 176u, row1_ptr + 176u, row2_ptr + 176u, row3_ptr + 176u, input, 256u, lane, sum0, sum1, sum2, sum3);
+    accumulate_q5k_block_quad(row0_ptr, row1_ptr, row2_ptr, row3_ptr, x_cache, 0u, lane, sum0, sum1, sum2, sum3);
+    accumulate_q5k_block_quad(row0_ptr + 176u, row1_ptr + 176u, row2_ptr + 176u, row3_ptr + 176u, x_cache, 256u, lane, sum0, sum1, sum2, sum3);
 
     const float total0 = simd_sum(sum0);
     const float total1 = simd_sum(sum1);
