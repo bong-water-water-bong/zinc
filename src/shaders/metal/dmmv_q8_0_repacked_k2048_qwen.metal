@@ -73,28 +73,37 @@ kernel void main0(
         }
     }
 
-    const float sum0 = simd_sum(acc0);
-    const float sum1 = simd_sum(acc1);
-    const float sum2 = simd_sum(acc2);
-    const float sum3 = simd_sum(acc3);
-    // Parallelize the 4-row writeback across lanes 0..3.
-    // After simd_sum all four sums are present on every lane; base_row+0..+3
-    // are four contiguous floats so lanes 0..3 of this simdgroup issue a
-    // single coalesced 16-byte store instead of four serial lane-0 stores.
-    // Mirrors cycle-27 (`dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d.metal`,
-    // 2-lane variant) and cycle-32 (`dmmv_q8_0_dual_fused_norm_conv1d.metal`,
-    // 4-lane variant); the M%4==0 invariant guaranteed by the dispatch site
-    // (`prefer_qwen_repacked_q8_quad` requires `M % 4 == 0` for this path)
-    // plus the `base_row >= p.M` early-return at the top means all four rows
-    // owned by this simdgroup are always valid (no per-row `has` check).
-    // Production hot users: SSM `attn_gate` (M=4096, K=2048, 30/token × 512
-    // WGs ≈ 15K TGs/token) and full-attn-out (M=2048, K=2048, 10/token ×
-    // 256 WGs ≈ 2.5K TGs/token).
+    // Cycle ~73: pack the four final-reduction `simd_sum` calls into one
+    // `simd_sum(float4)` — Apple9 lowers vector `simd_sum` to a single
+    // log2(32)=5-level butterfly that transfers 128-bit packed lanes per
+    // shuffle_xor instead of four independent 32-bit trees, cutting cross-lane
+    // shuffle traffic ~4× on the per-simdgroup tail of the Qwen3.6 SSM gate
+    // projection (M=4096, K=2048) and full-attn output projection (M=2048,
+    // K=2048) — both share this Qwen exact-repacked Q8 K=2048 quad-row path.
+    // Per profile: SSM gate ≈ 15K TGs/token × 32 decode tokens ≈ 480K
+    // simdgroup-tail reductions per request + full-attn-out ≈ 80K/req. Same
+    // proven pattern as cycle ~62 (`dmmv_q5k_moe_k512_quad`), cycle ~64
+    // (`dmmv_q8_0_pair_swiglu`), cycle ~70 (`dmmv_q8_0_k512_quad` — 8-row
+    // variant via two float4 packs), cycle ~71 (`dmmv_q8_0_k4096_quad` —
+    // the K=4096 sibling of this kernel). Downstream lane<4 writeback
+    // consumes the four sums as simdgroup-uniform scalars, so picking
+    // float4 components by lane is bit-equivalent. The M%4==0 invariant
+    // guaranteed by the dispatch site (`prefer_qwen_repacked_q8_quad`
+    // requires `M % 4 == 0`) plus the `base_row >= p.M` early-return at
+    // the top means all four rows owned by this simdgroup are always
+    // valid — no aliasing safety dance needed (unlike the generic quad
+    // siblings).
+    const float4 sums = simd_sum(float4(acc0, acc1, acc2, acc3));
+    // Parallelize the 4-row writeback across lanes 0..3 (already kept).
+    // After the packed simd_sum all four components are broadcast on every
+    // lane; base_row+0..+3 are four contiguous floats so lanes 0..3 of this
+    // simdgroup issue a single coalesced 16-byte store. Mirrors cycle-27/
+    // 32/38/39/40/41/43/45/62/64/70/71 lane-parallel writeback discipline.
     if (lane < 4u) {
-        const float local_sum = (lane == 0u) ? sum0
-                              : (lane == 1u) ? sum1
-                              : (lane == 2u) ? sum2
-                              : sum3;
+        const float local_sum = (lane == 0u) ? sums.x
+                              : (lane == 1u) ? sums.y
+                              : (lane == 2u) ? sums.z
+                              : sums.w;
         output[base_row + lane] = local_sum;
     }
 }
