@@ -7455,7 +7455,19 @@ fn dispatchPairedQ8DmmvOnCmd(
         .y1_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor0.gpu_buffer, &tensor1.gpu_buffer, input_buf, output0_buf, output1_buf };
-    const block_size = pairedQ8DmmvBlockSize(engine, tensor0, tensor1);
+    const base_block = pairedQ8DmmvBlockSize(engine, tensor0, tensor1);
+    // Shape-conditional: Qwen3.6 full-attn K+V paired at M=512 K=2048 with the
+    // default block=512 yields only ceil(512/32)=16 WGs → 0.4 WG/core on the
+    // M4 Max's 40 cores — the same under-subscription anti-pattern cycles
+    // 5-8/11/13 hit on the single-tensor Q8 paths. Drop to block=64 when M is
+    // small so the K+V pair runs 128 WGs (3.2 WG/core) without touching the
+    // Q+attn_gate pair at M=4096 (already 3.2 WG/core at block=512). Matches
+    // llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s N_SG=2 default for short rows.
+    const block_size: u32 = if (M <= 512 and base_block > 64 and
+        engine.dmmv_q8_0_pair_pipe.max_threads_per_threadgroup >= 64)
+        64
+    else
+        base_block;
     const simd_width = if (engine.dmmv_q8_0_pair_pipe.thread_execution_width > 0) engine.dmmv_q8_0_pair_pipe.thread_execution_width else @as(u32, 32);
     const rows_per_wg: u32 = (block_size / simd_width) * 2;
     cmd.dispatchV2(&engine.dmmv_q8_0_pair_pipe, .{ (M + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
