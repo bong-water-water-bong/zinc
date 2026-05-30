@@ -100,37 +100,30 @@ kernel void main0(
 
     const float sum0 = simd_sum(acc0);
     const float sum1 = simd_sum(acc1);
-    if (lane == 0u) {
-        output[row] = sum0;
-        output[row + 1u] = sum1;
+    // Distribute the two row writes + conv1d postludes across lanes 0 and 1.
+    // After simd_sum both sum0/sum1 are present on every lane, and row/row+1
+    // are disjoint conv channels owned by this simdgroup, so the two lanes
+    // touch non-overlapping output/state addresses. Lanes 0 and 1 reading
+    // conv_state[row..row+1] (also c+row..c+row+1, 2c+row..2c+row+1) issue
+    // each pair as a coalesced 8-byte transaction instead of the previous
+    // two serial lane-0 loads — halves the postlude latency on the 29 SSM
+    // layers per decode token that take the `prev_fused_attn_norm` path.
+    if (lane < 2u) {
+        const uint local_row = row + lane;
+        const float local_sum = (lane == 0u) ? sum0 : sum1;
+        output[local_row] = local_sum;
 
-        // Conv1d postlude: identical math to ssm_conv1d_qwen_d4.metal, run
-        // by the same lane that just produced the conv1d input for this row.
-        // Each conv channel is owned by exactly one simdgroup (row/row+1 are
-        // unique across the dispatch), so state[] writes do not race.
         if (first) {
             const uint c = p.conv_channels;
-            const uint r0 = row;
-            const uint r1 = row + 1u;
-            const float a0 = conv_state[r0];
-            const float a1 = conv_state[c + r0];
-            const float a2 = conv_state[2u * c + r0];
-            const float4 w0 = *(device const float4*)(conv_kernel + r0 * 4u);
-            const float ss0 = dot(w0, float4(a0, a1, a2, sum0));
-            conv_out[r0] = ss0 * fast::divide(1.0f, 1.0f + fast::exp(-ss0));
-            conv_state[r0] = a1;
-            conv_state[c + r0] = a2;
-            conv_state[2u * c + r0] = sum0;
-
-            const float b0 = conv_state[r1];
-            const float b1 = conv_state[c + r1];
-            const float b2 = conv_state[2u * c + r1];
-            const float4 w1 = *(device const float4*)(conv_kernel + r1 * 4u);
-            const float ss1 = dot(w1, float4(b0, b1, b2, sum1));
-            conv_out[r1] = ss1 * fast::divide(1.0f, 1.0f + fast::exp(-ss1));
-            conv_state[r1] = b1;
-            conv_state[c + r1] = b2;
-            conv_state[2u * c + r1] = sum1;
+            const float s0 = conv_state[local_row];
+            const float s1 = conv_state[c + local_row];
+            const float s2 = conv_state[2u * c + local_row];
+            const float4 w = *(device const float4*)(conv_kernel + local_row * 4u);
+            const float ss = dot(w, float4(s0, s1, s2, local_sum));
+            conv_out[local_row] = ss * fast::divide(1.0f, 1.0f + fast::exp(-ss));
+            conv_state[local_row] = s1;
+            conv_state[c + local_row] = s2;
+            conv_state[2u * c + local_row] = local_sum;
         }
     }
 }
