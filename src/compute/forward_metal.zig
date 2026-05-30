@@ -1801,6 +1801,20 @@ const RopeQkNormInplacePush = extern struct {
     eps: f32,
 };
 
+/// Push constants for `rope_qk_norm_kv_q8.metal` — extends `rope_qk_norm_inplace`
+/// to also Q8-quantize K and V directly into the per-layer KV cache, folding
+/// the follow-up `kv_cache_write_q8` dispatch + its barrier into one kernel
+/// on the Qwen3.6 Q8 KV decode path.
+const RopeQkNormKvQ8Push = extern struct {
+    stride: u32,
+    rope_dim: u32,
+    n_q_heads: u32,
+    n_kv_heads: u32,
+    position: u32,
+    dst_offset_bytes: u32,
+    eps: f32,
+};
+
 /// Push constants for flash attention dispatch (matches flash_attn.metal: buffer(0)).
 const FlashAttnPush = extern struct {
     head_dim: u32,
@@ -2979,6 +2993,7 @@ pub const InferenceEngine = struct {
     rope_native_pipe: MetalPipeline,
     rope_kv_cache_write_pipe: MetalPipeline,
     rope_qk_norm_inplace_pipe: MetalPipeline,
+    rope_qk_norm_kv_q8_pipe: MetalPipeline,
     sigmoid_mul_pipe: MetalPipeline,
     geglu_pipe: MetalPipeline,
     geglu_batched_pipe: MetalPipeline,
@@ -3608,6 +3623,7 @@ pub const InferenceEngine = struct {
         self.rope_native_pipe = try loadShaderPipeline(ctx, "rope_native");
         self.rope_kv_cache_write_pipe = try loadShaderPipeline(ctx, "rope_kv_cache_write");
         self.rope_qk_norm_inplace_pipe = try loadShaderPipeline(ctx, "rope_qk_norm_inplace");
+        self.rope_qk_norm_kv_q8_pipe = try loadShaderPipeline(ctx, "rope_qk_norm_kv_q8");
         self.sigmoid_mul_pipe = try loadShaderPipeline(ctx, "sigmoid_mul");
         self.geglu_pipe = try loadShaderPipeline(ctx, "geglu");
         self.geglu_batched_pipe = try loadShaderPipeline(ctx, "geglu_batched");
@@ -4540,6 +4556,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.rope_native_pipe);
         metal_pipeline.freePipeline(&self.rope_kv_cache_write_pipe);
         metal_pipeline.freePipeline(&self.rope_qk_norm_inplace_pipe);
+        metal_pipeline.freePipeline(&self.rope_qk_norm_kv_q8_pipe);
         metal_pipeline.freePipeline(&self.sigmoid_mul_pipe);
         metal_pipeline.freePipeline(&self.geglu_pipe);
         metal_pipeline.freePipeline(&self.geglu_batched_pipe);
@@ -12761,6 +12778,19 @@ fn dispatchFullAttnPrepOnCmd(
         engine.attn_q_norm_present[layer_idx] and
         engine.attn_k_norm_present[layer_idx] and
         engine.rope_qk_norm_inplace_pipe.handle != null;
+    // Further extension of cycle-22's inplace fusion: also fold the follow-up
+    // Q8 KV cache write into the same dispatch, eliminating one dispatch and
+    // one rope→write barrier per dense full-attn layer (≈10/decode token on
+    // Qwen3.6-35B). Requires head_dim % 64 == 0 so each K/V head splits evenly
+    // across the 64-thread TG's two simdgroups in 32-element Q8_0 blocks. The
+    // pre-flash-attention barrier (which already covers kv_k_cache/kv_v_cache)
+    // serves as the visibility fence; no per-layer write barrier is needed.
+    const fuse_qk_norm_into_rope_kv_q8 =
+        fuse_qk_norm_into_rope_inplace and
+        engine.kv_cache_q8 and
+        (attn.head_dim % 64) == 0 and
+        attn.head_dim >= 64 and
+        engine.rope_qk_norm_kv_q8_pipe.handle != null;
     // Q/K norms are independent — concurrent dispatch overlaps them when
     // not fused into the rope+kv-write kernel.
     const did_qk_norm_dispatch =
@@ -12813,6 +12843,24 @@ fn dispatchFullAttnPrepOnCmd(
             engine.position * attn.kv_dim,
             fuse_v_unit_norm_into_rope_kv,
             fuse_qk_norm_into_rope_kv,
+        );
+        if (profile) |p| p.full_attn_kv_write_calls += 1;
+    } else if (fuse_qk_norm_into_rope_kv_q8) {
+        // Q8 KV decode hot path (extends cycle-22): fuse (Q-norm, K-norm,
+        // Q-rope, K-rope, K-Q8-write, V-Q8-write) into a single dispatch.
+        // Drops cycle-22's standalone Q8 KV write dispatch + its barrier on
+        // top of the norm/rope fusion (≈10 dispatches + 10 barriers / decode
+        // token on Qwen3.6-35B). The pre-flash-attention barrier already
+        // covers kv_k_cache/kv_v_cache so no per-layer write barrier is
+        // needed here.
+        dispatchRopeQkNormKvQ8OnCmd(
+            engine,
+            cmd,
+            layer_idx,
+            attn,
+            cfg.n_heads,
+            engine.position,
+            @intCast(@as(u64, engine.position) * attn.kv_cache_bytes_per_token),
         );
         if (profile) |p| p.full_attn_kv_write_calls += 1;
     } else if (fuse_qk_norm_into_rope_inplace) {
@@ -13058,6 +13106,52 @@ fn dispatchRopeQkNormInplaceOnCmd(
         &engine.attn_k_norm_bufs[layer_idx],
     };
     cmd.dispatchV2(&engine.rope_qk_norm_inplace_pipe, .{ n_q_heads + attn.n_kv_heads, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(RopeQkNormInplacePush), 0);
+}
+
+/// Extension of `dispatchRopeQkNormInplaceOnCmd` for the Q8 KV decode path:
+/// folds the immediately-following `kv_cache_write_q8` dispatch (and its
+/// barrier) into the same kernel. Saves 1 dispatch + 1 barrier per dense
+/// full-attn layer (≈10/decode token on Qwen3.6-35B). The grid carries one
+/// TG per Q head, per K head (norm+rope+quantize), and per V head (quantize
+/// only). The pre-flash-attention barrier already covers kv_k_cache/kv_v_cache.
+fn dispatchRopeQkNormKvQ8OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    layer_idx: usize,
+    attn: LayerAttentionParams,
+    n_q_heads: u32,
+    position: u32,
+    dst_offset_bytes: u32,
+) void {
+    const freq_buf = selectRopeFreqBuffer(engine, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
+    const push = RopeQkNormKvQ8Push{
+        .stride = attn.head_dim,
+        .rope_dim = attn.rope_dim,
+        .n_q_heads = n_q_heads,
+        .n_kv_heads = attn.n_kv_heads,
+        .position = position,
+        .dst_offset_bytes = dst_offset_bytes,
+        .eps = engine.config.rms_norm_eps,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &engine.q_buf,
+        &engine.k_buf,
+        &engine.v_buf,
+        freq_buf,
+        &engine.attn_q_norm_bufs[layer_idx],
+        &engine.attn_k_norm_bufs[layer_idx],
+        &engine.kv_k_cache[layer_idx],
+        &engine.kv_v_cache[layer_idx],
+    };
+    cmd.dispatchV2(
+        &engine.rope_qk_norm_kv_q8_pipe,
+        .{ n_q_heads + 2 * attn.n_kv_heads, 1, 1 },
+        .{ 64, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(RopeQkNormKvQ8Push),
+        0,
+    );
 }
 
 /// CPU fallback DMMV for K > shared memory limit (4096).
