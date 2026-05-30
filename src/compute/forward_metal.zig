@@ -7874,15 +7874,18 @@ fn dispatchQ8RepackedDmmvOnCmd(
             // core on M4 Max's 40 cores) by halving to block=256 / 64 WGs
             // (1.6/core). Cycle-2 then established that 3.2 WGs/core is the
             // sweet spot for K=2048 SSM gate / attn_q (matching SSM-qkv's
-            // M=8192 subscription density). Apply the same one more halving
-            // step here: block=128 / 16-rows-per-WG → 128 WGs (3.2/core).
-            // Per-row thread count stays at 8 (256 simdgroups_per_tg=8 with 32
-            // rows = 8 threads/row; 128 simdgroups_per_tg=4 with 16 rows also
-            // = 8 threads/row), so per-row arithmetic is unchanged — only the
-            // dispatch granularity improves.
+            // M=8192 subscription density), and cycle-4 found that K=2048 SSM
+            // gate / full-attn gate at 6.4 WGs/core (block=128 / 16-rows-per-WG)
+            // wins over 3.2 — smaller per-row register footprint lets more TGs
+            // run in flight. Continue the halving pattern here: block=64 /
+            // 8-rows-per-WG → 256 WGs (6.4/core) for K=4096 SSM-out. Per-row
+            // thread count stays at 8 (block=128 simdgroups_per_tg=4 with 16
+            // rows = 8 threads/row; block=64 simdgroups_per_tg=2 with 8 rows
+            // also = 8 threads/row), so per-row arithmetic is unchanged —
+            // only the dispatch granularity improves.
             const block_size: u32 = if (M >= 2048 and
-                engine.dmmv_q8_0_repacked_k4096_qwen_pipe.max_threads_per_threadgroup >= 128)
-                128
+                engine.dmmv_q8_0_repacked_k4096_qwen_pipe.max_threads_per_threadgroup >= 64)
+                64
             else
                 256;
             const rows_per_wg: u32 = (block_size / 32) * 4;
