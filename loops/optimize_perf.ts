@@ -632,6 +632,16 @@ const PHASE_BUDGET_REFRESH_STALL_THRESHOLD = 3;
 // different bucket.
 const ECHO_CHAMBER_WINDOW = 8;
 const ECHO_CHAMBER_RATIO = 0.7;
+// Correctness-failure streak: when N of the last M cycles failed the
+// coherence check (correct=false), surface a warning urging the agent
+// to DIAGNOSE the failing path before landing more optimizations. The
+// run-2 cycles 11-15 wasted 5 cycles trying new wiring on a path that
+// was silently broken by a pre-existing fuse_q8+Q4_K-down crash on
+// prompts ≥128 tokens; cycle 16 finally found and fixed it, unlocking
+// +5.10%. This detector would have triggered earlier and pointed the
+// agent at the buggy path 2-3 cycles sooner.
+const CORRECTNESS_STREAK_WINDOW = 6;
+const CORRECTNESS_STREAK_THRESHOLD = 3;
 const HISTORY_LINES_IN_PROMPT = 20;
 const RECENT_CYCLES_IN_PROMPT = 12;
 const FAILED_APPROACH_LIMIT = 30;
@@ -1623,6 +1633,51 @@ export function detectEchoChamber(cycles: CycleRecord[], referencePaths: string[
   };
 }
 
+/**
+ * Correctness-failure streak warning: when several recent cycles failed
+ * coherence (correct=false), the most likely root cause is a pre-existing
+ * latent bug in the path the optimizations target, not bad ideas. Surface
+ * a hint to DIAGNOSE the failing path with file overlap from the failed
+ * cycles as a starting point.
+ */
+export type CorrectnessStreakWarning = {
+  failedCount: number;
+  windowSize: number;
+  recentFailedCycles: number[];
+  sharedFiles: string[];
+};
+
+export function detectCorrectnessStreak(cycles: CycleRecord[]): CorrectnessStreakWarning | null {
+  if (cycles.length < CORRECTNESS_STREAK_THRESHOLD) return null;
+  const recent = cycles.slice(-CORRECTNESS_STREAK_WINDOW);
+  const failed = recent.filter((c) => !c.correct);
+  if (failed.length < CORRECTNESS_STREAK_THRESHOLD) return null;
+  // Files touched by 2+ failed cycles are the most likely buggy-path hints.
+  const fileCounts = new Map<string, number>();
+  for (const c of failed) {
+    for (const f of c.changedFiles) {
+      fileCounts.set(f, (fileCounts.get(f) ?? 0) + 1);
+    }
+  }
+  const sharedFiles = [...fileCounts.entries()]
+    .filter(([, count]) => count >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .map(([f]) => f);
+  return {
+    failedCount: failed.length,
+    windowSize: recent.length,
+    recentFailedCycles: failed.map((c) => c.cycle),
+    sharedFiles,
+  };
+}
+
+export function formatCorrectnessStreakWarning(w: CorrectnessStreakWarning): string {
+  const filesHint = w.sharedFiles.length
+    ? ` Files touched by multiple failed cycles (most likely buggy path): ${w.sharedFiles.slice(0, 5).join(", ")}.`
+    : "";
+  return `Correctness regression streak: ${w.failedCount}/${w.windowSize} recent cycles (cycles ${w.recentFailedCycles.join(", ")}) failed the coherence check. Before landing another optimization, DIAGNOSE the failing path — several "rejected" cycles in a row are usually not bad ideas but a pre-existing latent crash or correctness regression in the path the optimizations target (edge cases: prompt length, batch size, layer index, segment boundary, fuse interaction). Run the failing prompt locally, narrow to the specific layer/operator, and propose a defensive fix. A correct fix that unblocks the failing class can deliver wins the original cycles could not measure — this is exactly how effort-15 run-2 cycle 16 (+5.10% from 103 to 108.25) emerged after run-2 cycles 11-15 had been silently blocked by the fuse_q8+Q4_K-down crash on prompts ≥128 tokens.${filesHint}`;
+}
+
 export function formatEchoChamberWarning(warning: EchoChamberWarning): string {
   const other = warning.perfKeepsFromOtherBuckets > 0
     ? ` ${warning.perfKeepsFromOtherBuckets} perf keep(s) in this window came from a *different* bucket.`
@@ -1731,6 +1786,11 @@ export function buildAgentPrompt(
     : null;
   const echoBlock = echoWarning ? formatEchoChamberWarning(echoWarning) : null;
 
+  const correctnessStreak = context ? detectCorrectnessStreak(context.cycles) : null;
+  const correctnessStreakBlock = correctnessStreak
+    ? formatCorrectnessStreakWarning(correctnessStreak)
+    : null;
+
   const knownFlatBlock = options.knownFlatCategories?.length
     ? options.knownFlatCategories.map((entry, i) => `${i + 1}. ${entry}`).join("\n")
     : null;
@@ -1789,7 +1849,7 @@ ${currentVsBestNote}
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(originalBaseline.tokPerSec, originalBaseline.tokPerSecSamples, "tok/s")}
 - bandwidth utilization: ${summarizeBenchMetric(originalBaseline.bandwidthUtil, originalBaseline.bandwidthSamples, "%", 1)}
 - output: "${originalBaseline.outputText}"
-${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
+${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${correctnessStreakBlock ? `\n## ⚠ Correctness Regression Streak\n${correctnessStreakBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
 ## Controller State
 - mode: ${controllerMode}
 - stalled cycles without a new best checkpoint: ${context?.stalledCycles ?? 0}

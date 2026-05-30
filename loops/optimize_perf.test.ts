@@ -11,9 +11,11 @@ import {
   classifyApproachTags,
   codexExecArgs,
   detectAgentRateLimit,
+  detectCorrectnessStreak,
   effortArtifactPaths,
   formatCodexStreamLine,
   formatCoherenceFailureList,
+  formatCorrectnessStreakWarning,
   formatPhaseBudget,
   formatToolInput,
   formatClaudeStreamLine,
@@ -39,6 +41,7 @@ import {
   summarizeCoherenceRegression,
   type BenchResult,
   type ClaudeStreamState,
+  type CycleRecord,
   zincCliArgs,
 } from "./optimize_perf";
 
@@ -1884,6 +1887,63 @@ describe("buildAgentPrompt pivot mode", () => {
     expect(prompt).toContain("20c0ea8f");
     expect(prompt).toContain("llama.cpp");
     expect(prompt).toContain("barrier narrowing is flat");
+  });
+});
+
+describe("detectCorrectnessStreak", () => {
+  function rec(cycle: number, correct: boolean, files: string[] = []): CycleRecord {
+    return {
+      cycle,
+      timestamp: new Date(2026, 4, 29, 10, cycle).toISOString(),
+      description: "", selfAnalysis: "", nextIdeas: [], stepKind: "optimization",
+      changedFiles: files, categoryTags: [],
+      tokPerSec: correct ? 100 : 0, tokPerSecSamples: [], bandwidthUtil: null, bandwidthSamples: [],
+      correct, improved: false, broken: false, kept: false, foundationKeep: false,
+      decisionReason: "", outputText: "", commitHash: null,
+    };
+  }
+
+  test("returns null when fewer than 3 cycles overall", () => {
+    expect(detectCorrectnessStreak([rec(1, false), rec(2, false)])).toBeNull();
+  });
+
+  test("returns null when failures are sparse in the window", () => {
+    // 2 of last 6 failed (below threshold 3).
+    const cycles = [rec(1, false), rec(2, true), rec(3, true), rec(4, true), rec(5, false), rec(6, true)];
+    expect(detectCorrectnessStreak(cycles)).toBeNull();
+  });
+
+  test("fires when 3+ of the last 6 cycles failed correctness", () => {
+    // Exactly the effort-15 run-2 cycles 11-15 pattern.
+    const cycles = [
+      rec(10, true),
+      rec(11, false, ["src/compute/forward.zig"]),
+      rec(12, false, ["src/compute/forward.zig"]),
+      rec(13, false, ["src/compute/forward.zig"]),
+      rec(14, false, ["build.zig", "src/compute/dmmv.zig"]),
+      rec(15, false, ["build.zig", "src/compute/dmmv.zig", "src/compute/forward.zig"]),
+    ];
+    const w = detectCorrectnessStreak(cycles);
+    expect(w).not.toBeNull();
+    expect(w!.failedCount).toBe(5);
+    expect(w!.windowSize).toBe(6);
+    expect(w!.recentFailedCycles).toEqual([11, 12, 13, 14, 15]);
+    // Files touched by 2+ failed cycles, sorted by frequency.
+    expect(w!.sharedFiles).toContain("src/compute/forward.zig");
+    expect(w!.sharedFiles).toContain("build.zig");
+    expect(w!.sharedFiles).toContain("src/compute/dmmv.zig");
+  });
+
+  test("formatted warning calls out the cycle-16 unlock and the files hint", () => {
+    const w = {
+      failedCount: 4, windowSize: 6, recentFailedCycles: [11, 12, 13, 15],
+      sharedFiles: ["src/compute/forward.zig"],
+    };
+    const out = formatCorrectnessStreakWarning(w);
+    expect(out).toContain("4/6 recent cycles");
+    expect(out).toContain("DIAGNOSE the failing path");
+    expect(out).toContain("src/compute/forward.zig");
+    expect(out).toContain("cycle 16"); // narrative anchor
   });
 });
 
