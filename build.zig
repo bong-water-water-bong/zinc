@@ -226,6 +226,7 @@ pub fn build(b: *std.Build) void {
         // commit now also stages build.zig to prevent recurrence.
         "mul_mm_q5k",
         "mul_mm_q6k_full_dp4a",
+        "mul_mm_q6k_full_dp4a_q8_1",
         "quantize_act_q8",
         "mul_mm_q4k_gate_up_swiglu_full_dp4a",
         "mul_mm_q4k_gate_up_swiglu_full_dp4a_q8",

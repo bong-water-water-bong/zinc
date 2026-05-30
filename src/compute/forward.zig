@@ -12784,12 +12784,29 @@ pub const InferenceEngine = struct {
         conv_channels: u32,
         hidden_dim: u32,
         n_tokens: u32,
+        // Effort-15 run-3 cycle 3: when true, the caller has already produced
+        // a shared Q8_1 quantize of scratch_norm into hidden_i8 + hidden_sd
+        // (also consumed by the Q4_K z DP4a path). This dispatch then skips
+        // its standalone Q8_0 quantize + barrier and routes the Q6_K GEMM
+        // through the Q8_1-input shader variant (`.x` of vec2 scale_dsum).
+        input_pre_quantized_q8_1: bool,
     ) !bool {
         // Threshold 128 matches the dense-down/gate-up DP4a path: under ~128
         // tokens the one-shot quantize pre-pass + extra dispatch/barrier outweighs
         // the savings from a single 32-col GEMM block. context-medium prompts on
         // the controller workload land at ~277 tokens, so the path engages.
-        const dp4a_ok = self.qwen36Dp4aDownEnabled() and
+        const dp4a_ok_shared = input_pre_quantized_q8_1 and
+            self.qwen36Dp4aDownEnabled() and
+            wqkv_t.info.type_ == .q6_k and
+            n_tokens >= 128 and
+            (hidden_dim & 255) == 0 and
+            (conv_channels & 31) == 0 and
+            self.dmmv.pipeline_mul_mm_q6k_full_dp4a_q8_1 != null and
+            self.dmmv.pipeline_mul_mm_q6k != null and
+            self.batched_scratch_hidden_i8 != null and
+            self.batched_scratch_hidden_scale_dsum != null;
+        const dp4a_ok_standalone = !input_pre_quantized_q8_1 and
+            self.qwen36Dp4aDownEnabled() and
             wqkv_t.info.type_ == .q6_k and
             n_tokens >= 128 and
             (hidden_dim & 255) == 0 and
@@ -12799,49 +12816,75 @@ pub const InferenceEngine = struct {
             self.dmmv.pipeline_mul_mm_q6k != null and
             self.batched_scratch_norm_q8 != null and
             self.batched_scratch_norm_q8_scale != null;
-        if (!dp4a_ok) return false;
+        if (!dp4a_ok_shared and !dp4a_ok_standalone) return false;
         const full_cols = n_tokens & ~@as(u32, 31);
         if (full_cols == 0) return false;
-        const norm_i8 = self.batched_scratch_norm_q8.?;
-        const norm_scale = self.batched_scratch_norm_q8_scale.?;
         const push_fn = self.instance.push_descriptor_fn;
-        // One-shot Q8_0 quantize of the f32 RMS-normed hidden (full cols).
-        // Per-32-block scale matches the BK=32 GEMM tile and stays robust to
-        // RMS-norm outliers (block-local absmax, not a single per-token scale).
-        try self.dmmv.recordQuantizeActQ8(
-            &self.decode_cmd,
-            push_fn,
-            scratch_norm.handle,
-            scratch_norm.size,
-            norm_i8.handle,
-            norm_i8.size,
-            norm_scale.handle,
-            norm_scale.size,
-            full_cols,
-            hidden_dim,
-        );
-        const i8_ranges = [_]CommandBuffer.BufferRange{
-            .{ .buffer = norm_i8.handle, .size = norm_i8.size },
-            .{ .buffer = norm_scale.handle, .size = norm_scale.size },
-        };
-        self.decode_cmd.computeBuffersBarrier(&i8_ranges);
-        try self.dmmv.recordMulMmQ6KFullDp4a(
-            &self.decode_cmd,
-            push_fn,
-            wqkv_t.gpu_buffer.handle,
-            wqkv_t.gpu_buffer.size,
-            norm_i8.handle,
-            norm_i8.size,
-            norm_scale.handle,
-            norm_scale.size,
-            scratch_qkv.handle,
-            scratch_qkv.size,
-            conv_channels,
-            full_cols,
-            hidden_dim,
-            0,
-            0,
-        );
+        if (dp4a_ok_shared) {
+            // Shared Q8_1 path: the caller already wrote hidden_i8 +
+            // hidden_scale_dsum (used by both wqkv Q6_K and z Q4_K). Route
+            // wqkv through the Q8_1-input Q6_K kernel — it ignores .y of the
+            // vec2 since Q6_K has no per-block bias correction.
+            const norm_i8 = self.batched_scratch_hidden_i8.?;
+            const norm_sd = self.batched_scratch_hidden_scale_dsum.?;
+            try self.dmmv.recordMulMmQ6KFullDp4aQ8_1(
+                &self.decode_cmd,
+                push_fn,
+                wqkv_t.gpu_buffer.handle,
+                wqkv_t.gpu_buffer.size,
+                norm_i8.handle,
+                norm_i8.size,
+                norm_sd.handle,
+                norm_sd.size,
+                scratch_qkv.handle,
+                scratch_qkv.size,
+                conv_channels,
+                full_cols,
+                hidden_dim,
+                0,
+                0,
+            );
+        } else {
+            const norm_i8 = self.batched_scratch_norm_q8.?;
+            const norm_scale = self.batched_scratch_norm_q8_scale.?;
+            // One-shot Q8_0 quantize of the f32 RMS-normed hidden (full cols).
+            // Per-32-block scale matches the BK=32 GEMM tile and stays robust to
+            // RMS-norm outliers (block-local absmax, not a single per-token scale).
+            try self.dmmv.recordQuantizeActQ8(
+                &self.decode_cmd,
+                push_fn,
+                scratch_norm.handle,
+                scratch_norm.size,
+                norm_i8.handle,
+                norm_i8.size,
+                norm_scale.handle,
+                norm_scale.size,
+                full_cols,
+                hidden_dim,
+            );
+            const i8_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = norm_i8.handle, .size = norm_i8.size },
+                .{ .buffer = norm_scale.handle, .size = norm_scale.size },
+            };
+            self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+            try self.dmmv.recordMulMmQ6KFullDp4a(
+                &self.decode_cmd,
+                push_fn,
+                wqkv_t.gpu_buffer.handle,
+                wqkv_t.gpu_buffer.size,
+                norm_i8.handle,
+                norm_i8.size,
+                norm_scale.handle,
+                norm_scale.size,
+                scratch_qkv.handle,
+                scratch_qkv.size,
+                conv_channels,
+                full_cols,
+                hidden_dim,
+                0,
+                0,
+            );
+        }
         if (full_cols < n_tokens) {
             // Ragged tail: f32 Q6_K row-parallel path on the untouched scratch_norm.
             try self.dmmv.recordMulMmQ6K(
@@ -12887,6 +12930,11 @@ pub const InferenceEngine = struct {
         d_inner: u32,
         hidden_dim: u32,
         n_tokens: u32,
+        // Effort-15 run-3 cycle 3: when true, the caller has already produced
+        // a Q8_1 quantize of scratch_norm into hidden_i8 + hidden_sd (also
+        // consumed by the Q6_K wqkv DP4a path). Skip the standalone Q8_1
+        // quantize + barrier; the GEMM stays the same.
+        input_pre_quantized_q8_1: bool,
     ) !bool {
         // Threshold 128 matches the dense-down/gate-up/wqkv DP4a paths: under
         // ~128 tokens the one-shot quantize pre-pass + extra dispatch/barrier
@@ -12898,7 +12946,7 @@ pub const InferenceEngine = struct {
             (hidden_dim & 255) == 0 and
             (d_inner & 31) == 0 and
             self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and
-            self.dmmv.pipeline_quantize_act_q8_1 != null and
+            (input_pre_quantized_q8_1 or self.dmmv.pipeline_quantize_act_q8_1 != null) and
             self.dmmv.pipeline_mul_mm_q4k != null and
             self.batched_scratch_hidden_i8 != null and
             self.batched_scratch_hidden_scale_dsum != null;
@@ -12908,26 +12956,28 @@ pub const InferenceEngine = struct {
         const norm_i8 = self.batched_scratch_hidden_i8.?;
         const norm_sd = self.batched_scratch_hidden_scale_dsum.?;
         const push_fn = self.instance.push_descriptor_fn;
-        // Q8_1 (scale + dsum) quantize of the f32 RMS-normed hidden (full cols).
-        // Q4_K requires the dsum bias-correction term, so Q8_0 (scale only) is
-        // insufficient — this is the difference vs the wqkv (Q6_K) DP4a path.
-        try self.dmmv.recordQuantizeActQ8_1(
-            &self.decode_cmd,
-            push_fn,
-            scratch_norm.handle,
-            scratch_norm.size,
-            norm_i8.handle,
-            norm_i8.size,
-            norm_sd.handle,
-            norm_sd.size,
-            full_cols,
-            hidden_dim,
-        );
-        const i8_ranges = [_]CommandBuffer.BufferRange{
-            .{ .buffer = norm_i8.handle, .size = norm_i8.size },
-            .{ .buffer = norm_sd.handle, .size = norm_sd.size },
-        };
-        self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+        if (!input_pre_quantized_q8_1) {
+            // Q8_1 (scale + dsum) quantize of the f32 RMS-normed hidden (full cols).
+            // Q4_K requires the dsum bias-correction term, so Q8_0 (scale only) is
+            // insufficient — this is the difference vs the wqkv (Q6_K) DP4a path.
+            try self.dmmv.recordQuantizeActQ8_1(
+                &self.decode_cmd,
+                push_fn,
+                scratch_norm.handle,
+                scratch_norm.size,
+                norm_i8.handle,
+                norm_i8.size,
+                norm_sd.handle,
+                norm_sd.size,
+                full_cols,
+                hidden_dim,
+            );
+            const i8_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = norm_i8.handle, .size = norm_i8.size },
+                .{ .buffer = norm_sd.handle, .size = norm_sd.size },
+            };
+            self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+        }
         try self.dmmv.recordMulMmQ4KFullDp4a(
             &self.decode_cmd,
             push_fn,
@@ -13342,15 +13392,60 @@ pub const InferenceEngine = struct {
             );
             self.endProfilePhase(.ssm_proj_norm_ab, ssm_proj_norm_ab_phase);
 
+            // Effort-15 run-3 cycle 3: when both wqkv (Q6_K) and z (Q4_K) DP4a
+            // paths will fire, share a single Q8_1 quantize of scratch_norm
+            // instead of doing two separate quantize passes (Q8_0 for wqkv,
+            // Q8_1 for z). Q6_K reads .x of vec2 scale_dsum and ignores dsum
+            // (no per-block bias term), so the Q8_1 buffer is a valid input
+            // for both kernels. Saves one quantize_act dispatch + one barrier
+            // per SSM layer (~32 SSM layers in Qwen3.6-27B).
+            const shared_q8_1_full_cols = n_tokens & ~@as(u32, 31);
+            const shared_q8_1_ok = self.qwen36Dp4aDownEnabled() and
+                wqkv_t.info.type_ == .q6_k and
+                z_t.info.type_ == .q4_k and
+                n_tokens >= 128 and
+                shared_q8_1_full_cols > 0 and
+                (hidden_dim & 255) == 0 and
+                (conv_channels & 31) == 0 and
+                (d_inner & 31) == 0 and
+                self.dmmv.pipeline_mul_mm_q6k_full_dp4a_q8_1 != null and
+                self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and
+                self.dmmv.pipeline_quantize_act_q8_1 != null and
+                self.dmmv.pipeline_mul_mm_q6k != null and
+                self.dmmv.pipeline_mul_mm_q4k != null and
+                self.batched_scratch_hidden_i8 != null and
+                self.batched_scratch_hidden_scale_dsum != null;
+            if (shared_q8_1_ok) {
+                const norm_i8 = self.batched_scratch_hidden_i8.?;
+                const norm_sd = self.batched_scratch_hidden_scale_dsum.?;
+                try self.dmmv.recordQuantizeActQ8_1(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    norm_i8.handle,
+                    norm_i8.size,
+                    norm_sd.handle,
+                    norm_sd.size,
+                    shared_q8_1_full_cols,
+                    hidden_dim,
+                );
+                const i8_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = norm_i8.handle, .size = norm_i8.size },
+                    .{ .buffer = norm_sd.handle, .size = norm_sd.size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+            }
+
             const ssm_proj_qkv_phase = self.beginProfilePhase();
-            const wqkv_dp4a = try self.dispatchQwen36SsmQkvDp4a(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
+            const wqkv_dp4a = try self.dispatchQwen36SsmQkvDp4a(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens, shared_q8_1_ok);
             if (!wqkv_dp4a) {
                 try self.dispatchProjectionBatched(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
             }
             self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
 
             const ssm_proj_z_phase = self.beginProfilePhase();
-            const z_dp4a = try self.dispatchQwen36SsmZDp4a(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens);
+            const z_dp4a = try self.dispatchQwen36SsmZDp4a(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens, shared_q8_1_ok);
             if (!z_dp4a) {
                 try self.dispatchProjectionBatched(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens);
             }

@@ -465,6 +465,12 @@ pub const DmmvDispatch = struct {
     pipeline_mul_mm_q5k: ?Pipeline,
     /// int8 DP4a full-tile Q6_K dense-down GEMM (Qwen3.6-27B prefill).
     pipeline_mul_mm_q6k_full_dp4a: ?Pipeline,
+    /// int8 DP4a full-tile Q6_K GEMM that reads a Q8_1 activation layout
+    /// (vec2 scale_dsum per 32-block, dsum unused). Used by the Qwen3.6-27B
+    /// SSM wqkv prefill projection so it can share the Q8_1 quantize_act
+    /// pass with the Q4_K z projection — saves one quantize+barrier per SSM
+    /// layer compared to dispatching a separate Q8_0 quantize for wqkv.
+    pipeline_mul_mm_q6k_full_dp4a_q8_1: ?Pipeline,
     /// One-shot per-32-block activation int8 quantizer for the DP4a down path.
     pipeline_quantize_act_q8: ?Pipeline,
     /// int8 DP4a full-tile Q4_K gate+up+SwiGLU GEMM (Qwen3.6-27B prefill).
@@ -971,6 +977,20 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q6k_full_dp4a != null) {
             log.info("mul_mm_q6k_full_dp4a pipeline loaded (int8 DP4a Qwen3.6-27B dense-down prefill)", .{});
         }
+        // Q8_1-input variant of the Q6_K DP4a GEMM (vec2 scale_dsum, dsum
+        // unused). Lets the Qwen3.6-27B SSM wqkv projection share a single
+        // Q8_1 quantize of scratch_norm with the Q4_K z projection, saving one
+        // quantize_act + barrier per SSM layer. Same 4-binding layout and push
+        // constants as the Q8_0-input variant; the only difference is the SclB
+        // binding type.
+        const mul_mm_q6k_full_dp4a_q8_1_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q6k_full_dp4a_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q6k_full_dp4a_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_q8_1_path, 4, @sizeOf(MulMmQ6KDp4aPush), &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q6k_full_dp4a_q8_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q6k_full_dp4a_q8_1 != null) {
+            log.info("mul_mm_q6k_full_dp4a_q8_1 pipeline loaded (int8 DP4a Qwen3.6-27B SSM wqkv prefill, Q8_1 input)", .{});
+        }
         const quantize_act_q8_path = std.fmt.bufPrint(&path_buf, "{s}/quantize_act_q8.spv", .{shader_dir}) catch unreachable;
         const pipeline_quantize_act_q8 = pipeline_mod.createFromSpirvWithOptions(instance, quantize_act_q8_path, 3, @sizeOf(QuantizeActPush), &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("quantize_act_q8 shader not loaded: {s}", .{@errorName(err)});
@@ -1079,6 +1099,7 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q6k = pipeline_mul_mm_q6k,
             .pipeline_mul_mm_q6k_full = pipeline_mul_mm_q6k_full,
             .pipeline_mul_mm_q6k_full_dp4a = pipeline_mul_mm_q6k_full_dp4a,
+            .pipeline_mul_mm_q6k_full_dp4a_q8_1 = pipeline_mul_mm_q6k_full_dp4a_q8_1,
             .pipeline_quantize_act_q8 = pipeline_quantize_act_q8,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8,
@@ -1871,6 +1892,62 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Q8_1-input variant: same Q6_K DP4a GEMM but the activation scale
+    /// buffer is `vec2 b_scale_dsum[]` per 32-block (Q4_K-style layout). The
+    /// shader reads `.x` only — `.y` (dsum) is unused since Q6_K weights have
+    /// no per-block bias term. Used by the Qwen3.6-27B SSM wqkv projection so
+    /// it can share a single Q8_1 quantize of scratch_norm with the Q4_K z
+    /// projection. Push constant stride_b_scale = K/32 (number of vec2 entries
+    /// per token), same numeric value as the Q8_0 variant since the indexing
+    /// is in typed-element units.
+    pub fn recordMulMmQ6KFullDp4aQ8_1(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_packed_buf: vk.c.VkBuffer,
+        b_packed_size: vk.c.VkDeviceSize,
+        b_scale_dsum_buf: vk.c.VkBuffer,
+        b_scale_dsum_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        a_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q6k_full_dp4a_q8_1) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0 or (M & 31) != 0 or (N & 31) != 0) return error.InvalidArgument;
+        const push = MulMmQ6KDp4aPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b_packed = K / 4,
+            .stride_b_scale = K / 32,
+            .stride_d = M,
+            .a_offset = a_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_packed_buf, .offset = 0, .range = b_packed_size },
+            .{ .buffer = b_scale_dsum_buf, .offset = 0, .range = b_scale_dsum_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            M / 32,
+            N / 32,
+            1,
+        );
+    }
+
     /// Q8_1-style activation quantize: packed int8 + per-32-block (scale, dsum)
     /// for the DP4a Q4_K gate+up GEMM bias-correction term.
     pub fn recordQuantizeActQ8_1(
@@ -2137,6 +2214,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q6k_full) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q6k_full_dp4a_q8_1) |*p| p.deinit();
         if (self.pipeline_quantize_act_q8) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8) |*p| p.deinit();
