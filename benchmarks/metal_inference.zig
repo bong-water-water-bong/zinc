@@ -4,6 +4,7 @@ const metal_device = support.metal_device;
 const metal_loader = support.metal_loader;
 const tokenizer_mod = support.tokenizer_mod;
 const forward_metal = support.forward_metal;
+const kernel_timing = support.kernel_timing;
 
 pub const std_options = std.Options{
     .log_level = .warn,
@@ -376,6 +377,15 @@ pub fn main() !void {
 
     var device = try metal_device.MetalDevice.init(allocator, config.device_index);
     defer device.deinit();
+
+    // `--profile` is a side run owned by the harness's profile-every-N cadence;
+    // its tok/s does not feed the keep gate. Enable the per-kernel timing probe
+    // here so the captured profile output surfaces top-5 µs/dispatch evidence
+    // for the next optimization cycle. The probe wraps every dispatch in
+    // commit+wait+restart (intentionally destructive to this side run's tok/s)
+    // but the main `bench-metal` measurement runs without `--profile` and is
+    // unaffected.
+    if (config.profile) kernel_timing.enable();
 
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();

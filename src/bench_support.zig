@@ -14,6 +14,8 @@ pub const metal_loader = @import("model/loader_metal.zig");
 pub const metal_buffer = @import("metal/buffer.zig");
 /// Metal command helper re-export used by benchmark binaries.
 pub const metal_command = @import("metal/command.zig");
+/// Per-kernel Metal dispatch timing probe re-export used by benchmark binaries.
+pub const kernel_timing = @import("metal/kernel_timing.zig");
 /// Metal pipeline helper re-export used by benchmark binaries.
 pub const metal_pipeline = @import("metal/pipeline.zig");
 /// Raw Metal shim re-export used by benchmark binaries.
