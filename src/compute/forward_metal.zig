@@ -7777,7 +7777,22 @@ fn dispatchQ8RepackedDmmvOnCmd(
             cmd.dispatchV2(&engine.dmmv_q8_0_repacked_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
         },
         .exact_qwen_k2048 => {
-            const block_size: u32 = 512;
+            // Qwen3.6 LM head is M=248320. At block=512 / rows_per_wg=64 the
+            // dispatch covers 3880 WGs (~97 WGs/core on M4 Max's 40 cores) —
+            // heavily oversubscribed. Doubling the threadgroup to 1024 / 128
+            // rows_per_wg halves the WG count to 1940 (~48 WGs/core, still
+            // well-subscribed) so the GPU command processor spends less time
+            // on per-WG launch bookkeeping. Smaller M (SSM attn_gate M=4096
+            // and attn_q M=2048+) stays on block=512 — at block=1024 those
+            // would drop to 32 and 16 WGs respectively (under 1 WG/core, the
+            // same undersubscription cycle-9 fixed for ssm_out by halving its
+            // threadgroup). The kernel reads `simdgroups_per_threadgroup` so
+            // per-row math is unchanged at either threadgroup size.
+            const block_size: u32 = if (M >= 65536 and
+                engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 1024)
+                1024
+            else
+                512;
             const rows_per_wg: u32 = (block_size / 32) * 4;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
             recordQ8RepackedKernelProfile(engine, tensor, M, K, .exact_qwen);
