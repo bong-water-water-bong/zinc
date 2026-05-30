@@ -13418,7 +13418,11 @@ pub const InferenceEngine = struct {
     fn appendQwen36DensePrefillSegment(self: *const InferenceEngine, out: *[qwen36_dense_prefill_max_segments]u32, count: *usize, layer: u32, prefix_layers: u32) void {
         const cfg = self.model.config;
         if (count.* >= out.len) return;
-        if (layer <= prefix_layers) return;
+        // Prefix loop runs layers 0..prefix_layers-1; segments start at
+        // prefix_layers (the layer right after the prefix ends). The previous
+        // `<=` filter excluded layer == prefix_layers, leaving a gap layer that
+        // ran token-major via prefillQwen36RunPartialTokenLoop.
+        if (layer < prefix_layers) return;
         if (layer + 1 >= cfg.n_layers) return;
         for (out[0..count.*]) |existing| {
             if (existing == layer) return;
@@ -13461,10 +13465,23 @@ pub const InferenceEngine = struct {
 
         const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
         if (full_attn_interval == 4 and cfg.n_layers > 52) {
-            // Measured on the 27B Coding Review prefill: layers 4-62 keep
-            // dense FFN work layer-major without repeating the rejected SSM
-            // projection replay path. Layer 3 still adds setup overhead.
-            var segment_layer: u32 = 4;
+            // Effort-15 run-3 cycle 4: extend the segment lower bound from
+            // hardcoded 4 down to prefix_layers (= 3 for context prompts).
+            // Layer 3 is the first full-attn layer ((3+1)%4 == 0) and was
+            // previously stuck in prefillQwen36RunPartialTokenLoop, i.e.
+            // ~348 sequential token-major decodeStep iterations through the
+            // single layer. Cycle 13 (run-3) added the layer-major batched
+            // full-attn path (prefillQwen36RunFullAttnLayerToFfnNorm) and
+            // cycle 14 (run-3) fused its FFN-entry rms+quant; both fire for
+            // any segment layer with segment_is_full_attn=true. Starting the
+            // segment range at prefix_layers lets layer 3 ride that same
+            // batched path: ~14/64 layers' Q/K/V/O weight reads were already
+            // amortized; this adds one more such full-attn layer and drops
+            // the partial-token-loop dispatches for layer 3.
+            //
+            // The previous "Layer 3 still adds setup overhead" comment was
+            // written before the cycle-13 full-attn batched path existed.
+            var segment_layer: u32 = prefix_layers;
             while (segment_layer <= 62) : (segment_layer += 1) {
                 self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
             }
