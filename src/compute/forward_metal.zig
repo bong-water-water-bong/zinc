@@ -7685,7 +7685,29 @@ fn dispatchQwenSsmDualRepackedQ8K2048Conv1dOnCmd(
         weight0_buf, weight1_buf, input_buf, output0_buf, output1_buf,
         conv_kernel_buf, conv_state_buf, conv_out_buf,
     };
-    const block_size: u32 = 128;
+    // Cycle-36: double block_size 128 → 256 (4 → 8 simdgroups per TG) so the
+    // total WG count halves from 1536 (M0+M1=12288, 8 rows/TG) to 768 (16
+    // rows/TG) — matching the cycle-8/32 layer-0 fused-norm-conv1d sibling
+    // density of 19.2 WG/core on the M4 Max's 40 cores (down from 38.4
+    // WG/core, the heaviest oversubscription left in the hot SSM Q8 fleet).
+    // Per-row math is unchanged: the kernel reads simdgroups_per_threadgroup
+    // and each simdgroup still owns 2 contiguous rows via
+    // `base_row = (tg_id * simdgroups_per_tg + sg_idx) * 2`, so the qkv→z
+    // boundary (M0=8192, M0%2==0) still falls between simdgroups, not
+    // inside one, keeping `first` uniform per SG. The conv1d postlude
+    // (lanes 0/1) and 2-row writeback remain unchanged.
+    //
+    // Mirrors cycle-32's layer-0 nr=4 path: that kernel uses block=128 ×
+    // 4 SGs × 4 rows = 16 rows/TG; this path now uses block=256 × 8 SGs ×
+    // 2 rows = 16 rows/TG — same row density, same TG count, just achieved
+    // via more SGs per TG instead of more rows per SG (avoiding the
+    // register-pressure cliff cycle-34 hit when pushing nr beyond 2 in the
+    // F32 router). This SSM qkv+conv1d fused kernel is hot #5 in the
+    // cycle-35 profile (209us avg × 1044 calls ≈ 218 ms / req) and fires
+    // ≈29× per decode token on Qwen3.6-35B (the prev_fused_attn_norm path,
+    // the common case after layer 0).
+    const max_block: u32 = engine.dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d_pipe.max_threads_per_threadgroup;
+    const block_size: u32 = if (max_block >= 256) 256 else 128;
     const rows_per_wg: u32 = (block_size / 32) * 2;
     const total_rows = M0 + M1;
     const wgs = (total_rows + rows_per_wg - 1) / rows_per_wg;
