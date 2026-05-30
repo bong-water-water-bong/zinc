@@ -7815,13 +7815,22 @@ fn dispatchQ8RepackedDmmvOnCmd(
             cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_quad_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
         },
         .exact_qwen_k4096 => {
-            // Qwen3.6 SSM-out / full-attn-out are M=2048 K=4096. At the prior
-            // block=512 / 64-rows-per-WG geometry that left only 32 WGs across
-            // the M4 Max 40-core GPU (0.8 WGs/core, undersubscribed). Halving
-            // the threadgroup to 256 / 32-rows-per-WG doubles to 64 WGs
-            // (1.6/core) while the shader's simdgroups_per_threadgroup support
-            // keeps per-row work identical.
-            const block_size: u32 = 256;
+            // Qwen3.6 SSM-out / full-attn-out are M=2048 K=4096. Cycle-9 fixed
+            // the worst undersubscription cliff (block=512 → 32 WGs / 0.8 per
+            // core on M4 Max's 40 cores) by halving to block=256 / 64 WGs
+            // (1.6/core). Cycle-2 then established that 3.2 WGs/core is the
+            // sweet spot for K=2048 SSM gate / attn_q (matching SSM-qkv's
+            // M=8192 subscription density). Apply the same one more halving
+            // step here: block=128 / 16-rows-per-WG → 128 WGs (3.2/core).
+            // Per-row thread count stays at 8 (256 simdgroups_per_tg=8 with 32
+            // rows = 8 threads/row; 128 simdgroups_per_tg=4 with 16 rows also
+            // = 8 threads/row), so per-row arithmetic is unchanged — only the
+            // dispatch granularity improves.
+            const block_size: u32 = if (M >= 2048 and
+                engine.dmmv_q8_0_repacked_k4096_qwen_pipe.max_threads_per_threadgroup >= 128)
+                128
+            else
+                256;
             const rows_per_wg: u32 = (block_size / 32) * 4;
             const wgs = (M + rows_per_wg - 1) / rows_per_wg;
             recordQ8RepackedKernelProfile(engine, tensor, M, K, .exact_qwen);
