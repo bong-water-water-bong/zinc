@@ -184,12 +184,41 @@ pub const MetalCommand = struct {
                 return;
             }
 
+            // Extend cycle-10's single-buffer resource-scoping to the small
+            // multi-buffer case (2-4 bufs). The hot decode-side multi-buf
+            // barriers — SSM conv 4-buf join @ 1080/req, full-attn QKV 3-buf
+            // @ 320/req, MoE down 2-buf @ ~1400/req — all fall in this range
+            // and the ObjC stack-array setup for 4 pointer writes is
+            // negligible (a few cycles) vs the scope-only call. Mirroring
+            // llama.cpp `ggml_mem_ranges_check`, listing exact resources
+            // lets the Metal concurrent encoder track per-resource readiness
+            // instead of waiting on every prior buffer write — even when the
+            // immediate next dispatch reads all listed resources, the GPU
+            // scheduler still benefits from precise dependency info while
+            // upstream work drains. Keep the scope fallback for 5+ buffers
+            // so route-packed Qwen prefill (which can build long resource
+            // lists) avoids per-call ObjC array growth.
+            if (bufs.len <= 4) {
+                var stack_bufs: [4]?*shim.MetalBuf = undefined;
+                var count: u32 = 0;
+                for (bufs) |b| {
+                    if (b.handle) |handle| {
+                        stack_bufs[count] = handle;
+                        count += 1;
+                    }
+                }
+                if (count == 0) return;
+                self.barrier_count += 1;
+                self.last_barrier_dispatch_count = self.dispatch_count;
+                shim.mtl_barrier_buffers(h, @ptrCast(&stack_bufs), count);
+                return;
+            }
+
             // llama.cpp's Metal backend orders dependency groups with a plain
             // `memoryBarrierWithScope:MTLBarrierScopeBuffers` in
-            // `ggml_metal_encoder_memory_barrier`. For hot Qwen prefill we hit
-            // tens of thousands of multi-buffer barriers per request; using the
-            // same scope barrier avoids building Objective-C resource arrays
-            // while preserving stronger-than-requested ordering.
+            // `ggml_metal_encoder_memory_barrier`. For high-count multi-buffer
+            // joins (route-packed Qwen prefill), keep the same scope barrier
+            // to avoid building large Objective-C resource arrays.
             var has_resource = false;
             for (bufs) |b| {
                 if (b.handle != null) {
