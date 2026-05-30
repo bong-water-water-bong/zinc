@@ -105,14 +105,19 @@ kernel void main0(
         acc7 = fma(s7, dot(float4(char4(q7[vi])), x), acc7);
     }
 
-    const float sum0 = simd_sum(acc0);
-    const float sum1 = simd_sum(acc1);
-    const float sum2 = simd_sum(acc2);
-    const float sum3 = simd_sum(acc3);
-    const float sum4 = simd_sum(acc4);
-    const float sum5 = simd_sum(acc5);
-    const float sum6 = simd_sum(acc6);
-    const float sum7 = simd_sum(acc7);
+    // Cycle ~70: pack the eight final-reduction `simd_sum` calls into two
+    // `simd_sum(float4)` calls — Apple9 lowers vector `simd_sum` to a single
+    // log2(32)=5-level butterfly that transfers 128-bit packed lanes per
+    // shuffle_xor instead of eight independent 32-bit trees, cutting cross-lane
+    // shuffle traffic ~4× on the per-simdgroup tail of hot kernel #5 (224 ms/req
+    // across 1436 calls, 15% of timed kernel time — the Qwen3.6 shared-expert
+    // down projection M=2048, K=512). The downstream lane<8 writeback consumes
+    // all eight sums as simdgroup-uniform scalars, so picking float4 components
+    // by lane is bit-equivalent. Same proven pattern as cycle ~62/64/68/69
+    // (which packed four sums via float4) — this is the first 8-row packing,
+    // bisecting into a low/high pair to keep each reduction at float4 width.
+    const float4 sums_lo = simd_sum(float4(acc0, acc1, acc2, acc3));
+    const float4 sums_hi = simd_sum(float4(acc4, acc5, acc6, acc7));
     // Parallelize the 8-row writeback across lanes 0..7 (lane 0 serial 8
     // stores → lanes 0..7 coalesced 32-byte store). After simd_sum all
     // eight sums are broadcast to every lane in registers; base_row+0..+7
@@ -128,14 +133,14 @@ kernel void main0(
     // × 256 WGs ≈ 10K TGs/token) covering the Qwen3.6 shared-expert down
     // projection.
     if (lane < 8u && base_row + lane < p.M) {
-        const float local_sum = (lane == 0u) ? sum0
-                              : (lane == 1u) ? sum1
-                              : (lane == 2u) ? sum2
-                              : (lane == 3u) ? sum3
-                              : (lane == 4u) ? sum4
-                              : (lane == 5u) ? sum5
-                              : (lane == 6u) ? sum6
-                              : sum7;
+        const float local_sum = (lane == 0u) ? sums_lo.x
+                              : (lane == 1u) ? sums_lo.y
+                              : (lane == 2u) ? sums_lo.z
+                              : (lane == 3u) ? sums_lo.w
+                              : (lane == 4u) ? sums_hi.x
+                              : (lane == 5u) ? sums_hi.y
+                              : (lane == 6u) ? sums_hi.z
+                              : sums_hi.w;
         output[base_row + lane] = local_sum;
     }
 }
