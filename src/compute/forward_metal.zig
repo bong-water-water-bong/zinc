@@ -7787,19 +7787,24 @@ fn dispatchQ8RepackedDmmvOnCmd(
             // Conversely, SSM attn_gate (M=4096) and full-attn attn_q (M=4096)
             // at block=512 sit at only 64 WGs (1.6/core on the 40-core M4 Max)
             // — the same undersubscription cliff cycle-9 fixed for ssm_out by
-            // halving block_size 512→256. Apply the same fix: M in [4096,
-            // 8192) drops to block=256 (32 rows_per_wg → 128 WGs, 3.2/core),
-            // matching the SSM qkv (M=8192) subscription density. M=8192
-            // (SSM qkv) stays at 512 because it's already at 3.2/core. M<4096
-            // stays at 512 (lower bound; smaller M like attn_kv 256-row gets
-            // no benefit from further-fragmented WGs). Kernel reads
+            // halving block_size 512→256. Cycle-2 dropped M in [4096, 8192) to
+            // block=256 (32 rows_per_wg → 128 WGs, 3.2/core). This cycle tests
+            // the next halving: block=128 (16 rows_per_wg → 256 WGs, 6.4/core)
+            // for M in [4096, 8192). The LM head (M=248320) is best at LOW
+            // subscription (48/core), while SSM-out post-cycle-3 sits at 3.2/core;
+            // small M may want HIGHER subscription than large M because the
+            // smaller per-row register footprint lets more TGs run in flight
+            // per SM. M=8192 (SSM qkv) stays at 512 — historical experiment
+            // routing it through this path at 3.2/core regressed. M<4096 stays
+            // at 512 (lower bound; smaller M like attn_kv 256-row gets no
+            // benefit from further-fragmented WGs). Kernel reads
             // simdgroups_per_threadgroup so per-row math is unchanged.
             const block_size: u32 = if (M >= 65536 and
                 engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 1024)
                 1024
             else if (M >= 4096 and M < 8192 and
-                engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 256)
-                256
+                engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 128)
+                128
             else
                 512;
             const rows_per_wg: u32 = (block_size / 32) * 4;
