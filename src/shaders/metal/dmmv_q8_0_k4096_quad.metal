@@ -74,14 +74,45 @@ kernel void main0(
         }
     }
 
-    const float sum0 = simd_sum(acc0);
-    const float sum1 = simd_sum(acc1);
-    const float sum2 = simd_sum(acc2);
-    const float sum3 = simd_sum(acc3);
-    if (lane == 0u) {
-        output[base_row] = sum0;
-        if (has1) output[base_row + 1u] = sum1;
-        if (has2) output[base_row + 2u] = sum2;
-        if (has3) output[base_row + 3u] = sum3;
+    // Cycle ~71: pack the four final-reduction `simd_sum` calls into one
+    // `simd_sum(float4)` — Apple9 lowers vector `simd_sum` to a single
+    // log2(32)=5-level butterfly that transfers 128-bit packed lanes per
+    // shuffle_xor instead of four independent 32-bit trees, cutting cross-lane
+    // shuffle traffic ~4× on the per-simdgroup tail of the Qwen3.6 SSM out
+    // projection (M=2048, K=4096) and full-attention output projection (same
+    // shape) — both share this quad-row Q8 K=4096 path. Per profile: 1080
+    // SSM-out calls/req × 32 TGs × 16 SGs = ~552K simdgroup-tail reductions
+    // per request, plus the full-attn out path. Same proven pattern as
+    // cycle ~62 (`dmmv_q5k_moe_k512_quad`), cycle ~64 (`dmmv_q8_0_pair_swiglu`),
+    // and cycle ~70 (`dmmv_q8_0_k512_quad` — 8-row variant via two float4
+    // packs). Downstream lane<4 writeback consumes the four sums as
+    // simdgroup-uniform scalars, so picking float4 components by lane is
+    // bit-equivalent. When has1/has2/has3 are false (M%4 != 0 tail), row1/2/3
+    // alias row0 so acc1/2/3 equal acc0 — pre-pack simd_sums were already
+    // executed unconditionally and discarded by the has gates, so the pack
+    // preserves identical semantics.
+    const float4 sums = simd_sum(float4(acc0, acc1, acc2, acc3));
+    // Parallelize the 4-row writeback across lanes 0..3 (lane 0 serial 4
+    // stores → lanes 0..3 coalesced 16-byte store). After simd_sum all four
+    // sums are broadcast to every lane in registers; base_row+0..+3 are four
+    // contiguous floats so the Qwen3.6-35B production SSM/attn out case
+    // (M=2048, M%4==0 ⇒ every simdgroup writes a full quad) issues a single
+    // coalesced 16-byte store instead of four serial lane-0 stores. The
+    // has1/has2/has3 predicates handle the generic-validation tail (test
+    // M=21 ⇒ last simdgroup has only row 20 valid). Mirrors cycle-27/32/38/
+    // 39/40/41/43/45/62/64/70 lane-parallel writeback discipline across the
+    // Q8/Q5_K family.
+    if (lane < 4u) {
+        const bool has = (lane == 0u) ? true
+                       : (lane == 1u) ? has1
+                       : (lane == 2u) ? has2
+                       : has3;
+        if (has) {
+            const float local_sum = (lane == 0u) ? sums.x
+                                  : (lane == 1u) ? sums.y
+                                  : (lane == 2u) ? sums.z
+                                  : sums.w;
+            output[base_row + lane] = local_sum;
+        }
     }
 }
