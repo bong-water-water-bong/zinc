@@ -153,10 +153,20 @@ kernel void main0(
         }
     }
 
-    const float sum0 = simd_sum(acc0);
-    const float sum1 = simd_sum(acc1);
-    const float sum2 = simd_sum(acc2);
-    const float sum3 = simd_sum(acc3);
+    // Cycle ~69: pack the four final-reduction `simd_sum` calls into one
+    // `simd_sum(float4)` — Apple9 lowers vector `simd_sum` to a single
+    // log2(32)=5-level butterfly that transfers 128-bit packed lanes per
+    // shuffle_xor instead of four independent 32-bit trees, cutting per-
+    // simdgroup tail shuffle traffic ~4×. Same proven pattern as cycle ~68
+    // (the non-conv1d fused-norm dual sibling `dmmv_q8_0_dual_fused_norm.metal`)
+    // applied symmetrically to this conv1d-fused variant. Production hot use:
+    // SSM qkv+z fused-norm+conv1d path (M0=8192 M1=4096, ≈30 SSM layers ×
+    // every decode token via the layer-0 SSM and the layer-N `prev_fused_attn_norm`
+    // path that selects this fused-conv1d kernel when conv_channels==8192). The
+    // downstream lane<4 paired writeback + conv1d postlude consume the four
+    // sums as simdgroup-uniform scalars, so picking float4 components by lane
+    // is bit-equivalent to the prior four independent `simd_sum` calls.
+    const float4 sums = simd_sum(float4(acc0, acc1, acc2, acc3));
     // Parallelize the 4-row writeback + conv1d postlude across lanes 0..3.
     // After simd_sum all four sums are present on every lane, and row0..row3
     // are disjoint conv channels owned by this simdgroup, so the lanes touch
@@ -180,10 +190,10 @@ kernel void main0(
                              : (lane == 1u) ? row1
                              : (lane == 2u) ? row2
                              : row3;
-        const float local_sum = (lane == 0u) ? sum0
-                              : (lane == 1u) ? sum1
-                              : (lane == 2u) ? sum2
-                              : sum3;
+        const float local_sum = (lane == 0u) ? sums.x
+                              : (lane == 1u) ? sums.y
+                              : (lane == 2u) ? sums.z
+                              : sums.w;
         device float* local_output = (lane == 0u) ? output0
                                    : (lane == 1u) ? output1
                                    : (lane == 2u) ? output2
