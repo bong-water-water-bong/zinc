@@ -159,10 +159,19 @@ kernel void main0(
     accumulate_q5k_block_quad(row0_ptr, row1_ptr, row2_ptr, row3_ptr, x_cache, 0u, lane, sum0, sum1, sum2, sum3);
     accumulate_q5k_block_quad(row0_ptr + 176u, row1_ptr + 176u, row2_ptr + 176u, row3_ptr + 176u, x_cache, 256u, lane, sum0, sum1, sum2, sum3);
 
-    const float total0 = simd_sum(sum0);
-    const float total1 = simd_sum(sum1);
-    const float total2 = simd_sum(sum2);
-    const float total3 = simd_sum(sum3);
+    // Cycle ~62: pack four scalar simd_sums into one float4 simd_sum. Metal's
+    // simd_sum is overloaded for vector types on Apple9 (M4) — a float4
+    // reduction emits one log2(32)=5-level shuffle_xor tree that transfers
+    // 128-bit packed lanes per shuffle instead of four independent 32-bit
+    // trees. Cuts the per-simdgroup reduction shuffle count ~4× on the hot
+    // kernel #3 critical path (270 ms/req across 1296 dispatches, 16
+    // simdgroups/TG × 1024 TGs/dispatch ⇒ ~21M simd_sums replaced per req).
+    // The downstream lane<4 quad writeback already consumed total0/1/2/3 as
+    // simdgroup-uniform scalars, so picking from the float4 components is
+    // bit-equivalent. Mirrors cycle-43/45/47/52 lane-parallel-writeback
+    // discipline and extends the cycle-51 simd_sum reduction pattern to the
+    // simultaneous-multi-row case.
+    const float4 totals = simd_sum(float4(sum0, sum1, sum2, sum3));
     // Parallelize the 4-row writeback across lanes 0..3.
     // After simd_sum all four totals are present on every lane; output[row0..row3]
     // are four contiguous floats so the Qwen3.6-35B production MoE-down case
@@ -180,10 +189,10 @@ kernel void main0(
                        : has_row3;
         if (has) {
             device float* output = Y + (p.y_offset / 4u) + expert_slot * p.M;
-            const float local_sum = (lane == 0u) ? total0
-                                  : (lane == 1u) ? total1
-                                  : (lane == 2u) ? total2
-                                  : total3;
+            const float local_sum = (lane == 0u) ? totals.x
+                                  : (lane == 1u) ? totals.y
+                                  : (lane == 2u) ? totals.z
+                                  : totals.w;
             output[row0 + lane] = local_sum;
         }
     }
