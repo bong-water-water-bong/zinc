@@ -7540,9 +7540,9 @@ fn dispatchPairedQ8DmmvOnCmd(
     // Shape-conditional: Qwen3.6 full-attn K+V paired at M=512 K=2048 with the
     // default block=512 yields only ceil(512/32)=16 WGs → 0.4 WG/core on the
     // M4 Max's 40 cores — the same under-subscription anti-pattern cycles
-    // 5-8/11/13 hit on the single-tensor Q8 paths. Drop to block=64 when M is
-    // small so the K+V pair runs 128 WGs (3.2 WG/core). Adapted from
-    // llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s N_SG=2 default for short rows.
+    // 5-8/11/13 hit on the single-tensor Q8 paths. Cycle-14 dropped to
+    // block=64 (128 WGs / 3.2 WG/core). Adapted from llama.cpp
+    // `kernel_mul_mv_q8_0_f32_impl`'s N_SG=2 default for short rows.
     //
     // Cycle-15: Qwen3.6 full-attn Q+attn_gate paired (M=4096 K=2048, 10/token
     // — one per full-attn layer × 10 layers) at block=512 gives wgs=128 →
@@ -7554,9 +7554,24 @@ fn dispatchPairedQ8DmmvOnCmd(
     // (kernel reads simdgroups_per_threadgroup, K-cache shared across the TG
     // so same 8 KiB input load). Matches the cycle-1..14 pattern of dropping
     // to 6.4 WG/core whenever a hot M=4096 K=2048 shape sits at 3.2/core.
-    const block_size: u32 = if (M <= 512 and base_block > 64 and
-        engine.dmmv_q8_0_pair_pipe.max_threads_per_threadgroup >= 64)
-        64
+    //
+    // Cycle-30: extend cycle-14's M<=512 halving (block=64 → 3.2 WG/core) one
+    // step further to block=32 / rows_per_wg=2 → 256 WGs → 6.4 WG/core on the
+    // M4 Max's 40 cores, matching the established sweet spot of cycle-4
+    // (K=2048 SSM-gate, +0.1 KEPT), cycle-15 (M=4096 paired, +0.x KEPT), and
+    // cycle-29 (M=512 K=2048 shared expert SwiGLU paired, +0.x KEPT) — all at
+    // 6.4/core density. With block=32, simdgroups_per_threadgroup reads as 1
+    // (one simdgroup per TG processing 2 rows via `base_row = (tg_id *
+    // simdgroups_per_tg + sg_idx) * 2`), so per-row simd_sum math is unchanged
+    // and the kernel uses only simd_sum (no threadgroup barriers) — single-
+    // simdgroup TGs are bit-identical to llama.cpp's
+    // `kernel_mul_mv_q8_0_f32_impl` short-row branch. Fires for Qwen3.6
+    // full-attn K+V at M=kv_dim=512 (10 attn layers × ~32 decode tokens = 320
+    // calls/req); cycle-29's sibling change at the SwiGLU-fused variant
+    // confirms the same shape benefits from the 6.4/core density.
+    const block_size: u32 = if (M <= 512 and base_block > 32 and
+        engine.dmmv_q8_0_pair_pipe.max_threads_per_threadgroup >= 32)
+        32
     else if (M == 4096 and base_block > 256 and
         engine.dmmv_q8_0_pair_pipe.max_threads_per_threadgroup >= 256)
         256
