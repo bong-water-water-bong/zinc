@@ -7782,15 +7782,24 @@ fn dispatchQ8RepackedDmmvOnCmd(
             // heavily oversubscribed. Doubling the threadgroup to 1024 / 128
             // rows_per_wg halves the WG count to 1940 (~48 WGs/core, still
             // well-subscribed) so the GPU command processor spends less time
-            // on per-WG launch bookkeeping. Smaller M (SSM attn_gate M=4096
-            // and attn_q M=2048+) stays on block=512 — at block=1024 those
-            // would drop to 32 and 16 WGs respectively (under 1 WG/core, the
-            // same undersubscription cycle-9 fixed for ssm_out by halving its
-            // threadgroup). The kernel reads `simdgroups_per_threadgroup` so
-            // per-row math is unchanged at either threadgroup size.
+            // on per-WG launch bookkeeping.
+            //
+            // Conversely, SSM attn_gate (M=4096) and full-attn attn_q (M=4096)
+            // at block=512 sit at only 64 WGs (1.6/core on the 40-core M4 Max)
+            // — the same undersubscription cliff cycle-9 fixed for ssm_out by
+            // halving block_size 512→256. Apply the same fix: M in [4096,
+            // 8192) drops to block=256 (32 rows_per_wg → 128 WGs, 3.2/core),
+            // matching the SSM qkv (M=8192) subscription density. M=8192
+            // (SSM qkv) stays at 512 because it's already at 3.2/core. M<4096
+            // stays at 512 (lower bound; smaller M like attn_kv 256-row gets
+            // no benefit from further-fragmented WGs). Kernel reads
+            // simdgroups_per_threadgroup so per-row math is unchanged.
             const block_size: u32 = if (M >= 65536 and
                 engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 1024)
                 1024
+            else if (M >= 4096 and M < 8192 and
+                engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 256)
+                256
             else
                 512;
             const rows_per_wg: u32 = (block_size / 32) * 4;
