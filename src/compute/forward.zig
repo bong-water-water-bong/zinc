@@ -1419,6 +1419,11 @@ pub const InferenceEngine = struct {
     // mul_mm_q4k_gate_up_swiglu_full_dp4a.comp).
     batched_scratch_hidden_i8: ?Buffer = null,
     batched_scratch_hidden_scale_dsum: ?Buffer = null,
+    // int8 DP4a SSM wqkv prefill: Q8_0-style (scale only) packed activations of
+    // the post-RMS-norm hidden vector. Q6_K weights are symmetric (q-32), so the
+    // GEMM only needs the per-32-block scale, no dsum bias-correction term.
+    batched_scratch_norm_q8: ?Buffer = null,
+    batched_scratch_norm_q8_scale: ?Buffer = null,
     batched_scratch_capacity_tokens: u32 = 0,
     modeled_decode_bytes_per_token: u64 = 0,
     // Diagnostic summary stored during BOS processing, printed after generation
@@ -3295,6 +3300,12 @@ pub const InferenceEngine = struct {
             const hidden_scale_dsum_bytes = n * (hidden_dim / 32) * 2 * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_hidden_i8, hidden_i8_bytes, storage_xfer);
             try growSlot(self.instance, &self.batched_scratch_hidden_scale_dsum, hidden_scale_dsum_bytes, storage_xfer);
+            // Q8_0 norm scratch for the SSM wqkv DP4a path (Q6_K weights, scale-only).
+            // Packed int8 layout is identical to hidden_i8 (hidden_dim/4 uints/token);
+            // scale layout is Q8_0 (hidden_dim/32 f32/token, half the size of Q8_1).
+            const norm_scale_bytes = n * (hidden_dim / 32) * f32_sz;
+            try growSlot(self.instance, &self.batched_scratch_norm_q8, hidden_i8_bytes, storage_xfer);
+            try growSlot(self.instance, &self.batched_scratch_norm_q8_scale, norm_scale_bytes, storage_xfer);
         }
 
         self.batched_scratch_capacity_tokens = n_tokens;
@@ -12758,6 +12769,103 @@ pub const InferenceEngine = struct {
         try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
     }
 
+    /// SSM wqkv projection (Q6_K, K=hidden_dim, M=conv_channels) for Qwen3.6-27B
+    /// prefill. Uses int8 DP4a (one-shot Q8_0 per-32-block activation quant of
+    /// scratch_norm + hardware dot4 GEMM) when enabled and the shape qualifies;
+    /// otherwise falls through to the f32 Q6_K batched projection. The ragged
+    /// token tail (n_tokens & 31 ≠ 0) stays on the f32 path reading the untouched
+    /// f32 scratch_norm, so output layout is identical regardless of which path
+    /// runs. Returns true if the DP4a path was emitted (caller skips f32 fallback).
+    fn dispatchQwen36SsmQkvDp4a(
+        self: *InferenceEngine,
+        wqkv_t: *const LoadedTensor,
+        scratch_norm: Buffer,
+        scratch_qkv: Buffer,
+        conv_channels: u32,
+        hidden_dim: u32,
+        n_tokens: u32,
+    ) !bool {
+        // Threshold 128 matches the dense-down/gate-up DP4a path: under ~128
+        // tokens the one-shot quantize pre-pass + extra dispatch/barrier outweighs
+        // the savings from a single 32-col GEMM block. context-medium prompts on
+        // the controller workload land at ~277 tokens, so the path engages.
+        const dp4a_ok = self.qwen36Dp4aDownEnabled() and
+            wqkv_t.info.type_ == .q6_k and
+            n_tokens >= 128 and
+            (hidden_dim & 255) == 0 and
+            (conv_channels & 31) == 0 and
+            self.dmmv.pipeline_mul_mm_q6k_full_dp4a != null and
+            self.dmmv.pipeline_quantize_act_q8 != null and
+            self.dmmv.pipeline_mul_mm_q6k != null and
+            self.batched_scratch_norm_q8 != null and
+            self.batched_scratch_norm_q8_scale != null;
+        if (!dp4a_ok) return false;
+        const full_cols = n_tokens & ~@as(u32, 31);
+        if (full_cols == 0) return false;
+        const norm_i8 = self.batched_scratch_norm_q8.?;
+        const norm_scale = self.batched_scratch_norm_q8_scale.?;
+        const push_fn = self.instance.push_descriptor_fn;
+        // One-shot Q8_0 quantize of the f32 RMS-normed hidden (full cols).
+        // Per-32-block scale matches the BK=32 GEMM tile and stays robust to
+        // RMS-norm outliers (block-local absmax, not a single per-token scale).
+        try self.dmmv.recordQuantizeActQ8(
+            &self.decode_cmd,
+            push_fn,
+            scratch_norm.handle,
+            scratch_norm.size,
+            norm_i8.handle,
+            norm_i8.size,
+            norm_scale.handle,
+            norm_scale.size,
+            full_cols,
+            hidden_dim,
+        );
+        const i8_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = norm_i8.handle, .size = norm_i8.size },
+            .{ .buffer = norm_scale.handle, .size = norm_scale.size },
+        };
+        self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+        try self.dmmv.recordMulMmQ6KFullDp4a(
+            &self.decode_cmd,
+            push_fn,
+            wqkv_t.gpu_buffer.handle,
+            wqkv_t.gpu_buffer.size,
+            norm_i8.handle,
+            norm_i8.size,
+            norm_scale.handle,
+            norm_scale.size,
+            scratch_qkv.handle,
+            scratch_qkv.size,
+            conv_channels,
+            full_cols,
+            hidden_dim,
+            0,
+            0,
+        );
+        if (full_cols < n_tokens) {
+            // Ragged tail: f32 Q6_K row-parallel path on the untouched scratch_norm.
+            try self.dmmv.recordMulMmQ6K(
+                &self.decode_cmd,
+                push_fn,
+                wqkv_t.gpu_buffer.handle,
+                wqkv_t.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                scratch_qkv.handle,
+                scratch_qkv.size,
+                conv_channels,
+                n_tokens - full_cols,
+                hidden_dim,
+                hidden_dim,
+                conv_channels,
+                0,
+                full_cols * hidden_dim,
+                full_cols * conv_channels,
+            );
+        }
+        return true;
+    }
+
     fn qwen36DensePrefillSsmGnormDirectStoreEnabled(self: *const InferenceEngine) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwen36DenseHybrid27B()) return false;
@@ -13132,7 +13240,10 @@ pub const InferenceEngine = struct {
             self.endProfilePhase(.ssm_proj_norm_ab, ssm_proj_norm_ab_phase);
 
             const ssm_proj_qkv_phase = self.beginProfilePhase();
-            try self.dispatchProjectionBatched(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
+            const wqkv_dp4a = try self.dispatchQwen36SsmQkvDp4a(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
+            if (!wqkv_dp4a) {
+                try self.dispatchProjectionBatched(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
+            }
             self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
 
             const ssm_proj_z_phase = self.beginProfilePhase();
@@ -16147,6 +16258,8 @@ pub const InferenceEngine = struct {
         if (self.batched_scratch_swiglu_scale) |*b| b.deinit();
         if (self.batched_scratch_hidden_i8) |*b| b.deinit();
         if (self.batched_scratch_hidden_scale_dsum) |*b| b.deinit();
+        if (self.batched_scratch_norm_q8) |*b| b.deinit();
+        if (self.batched_scratch_norm_q8_scale) |*b| b.deinit();
         self.cmd_pool.deinit();
         self.* = undefined;
     }
