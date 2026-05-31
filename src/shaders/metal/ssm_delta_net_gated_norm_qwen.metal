@@ -65,11 +65,22 @@ kernel void main0(
     const float q_ss = qv * qv;
     const float k_ss = kv * kv;
 
-    const float q_sum = simd_sum(q_ss);
-    const float k_sum = simd_sum(k_ss);
+    // Pack the two per-simdgroup RMS reductions for Q and K into a single
+    // `simd_sum(float2)` — Apple9's vector `simd_sum` lowers to one
+    // log2(32)=5-level butterfly that transfers 64-bit packed lanes per
+    // `shuffle_xor` instead of two independent 32-bit trees, cutting
+    // cross-lane shuffle traffic ~2× on the per-simdgroup tail of the fused
+    // delta-net + gated-norm SSM kernel that fires every SSM layer per decode
+    // token (1080 calls/req across 30 SSM layers × 32 head TGs × 4 SGs each ≈
+    // 138K SG-tail reductions per request). Same proven pattern as cycles
+    // ~67 (q8_0_pair/conv1d_dual), ~73 (repacked_k2048_qwen), and ~75
+    // (repacked_k2048_nr2_qwen). Both per-row simd_sums operate on
+    // independent values with identical reduction trees, so the pack is
+    // bit-equivalent to the unpacked scalar form.
+    const float2 qk_sum = simd_sum(float2(q_ss, k_ss));
     if (simd_lane == 0u) {
-        partial_q[simd_idx] = q_sum;
-        partial_k[simd_idx] = k_sum;
+        partial_q[simd_idx] = qk_sum.x;
+        partial_k[simd_idx] = qk_sum.y;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -77,10 +88,15 @@ kernel void main0(
     // mirroring the final RMS reduction below. Lane 0 computes the scalar
     // setup once per simdgroup and broadcasts within the simdgroup, avoiding a
     // second threadgroup barrier before the 128 row workers enter the state loop.
+    // Pack the Q+K cross-simdgroup folds (4-element reductions across simd
+    // lanes 0..3 with lanes 4..31 holding the zero identity) into a single
+    // `simd_sum(float2)` — same Apple9 butterfly-packing rationale as the
+    // Phase-1 pack above.
     const float q_partial = (simd_lane < 4u) ? partial_q[simd_lane] : 0.0f;
     const float k_partial = (simd_lane < 4u) ? partial_k[simd_lane] : 0.0f;
-    const float q_norm_sq = simd_sum(q_partial);
-    const float k_norm_sq = simd_sum(k_partial);
+    const float2 qk_norm_sq = simd_sum(float2(q_partial, k_partial));
+    const float q_norm_sq = qk_norm_sq.x;
+    const float k_norm_sq = qk_norm_sq.y;
 
     float q_scale_lane = 0.0f;
     float k_scale_lane = 0.0f;
