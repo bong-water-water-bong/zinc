@@ -12598,6 +12598,190 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    fn qwen36ProjectionDp4aSupported(self: *const InferenceEngine, tensor: *const LoadedTensor, M: u32, K: u32, n_tokens: u32) bool {
+        if (!self.qwen36Dp4aDownEnabled()) return false;
+        if (n_tokens < 128) return false;
+        if (M == 0 or K == 0 or (M & 31) != 0 or (K & 255) != 0) return false;
+        if (self.dmmv.pipeline_quantize_act_q8_1 == null) return false;
+        if (self.batched_scratch_hidden_i8 == null) return false;
+        if (self.batched_scratch_hidden_scale_dsum == null) return false;
+        return switch (tensor.info.type_) {
+            .q4_k => self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and self.dmmv.pipeline_mul_mm_q4k != null,
+            .q6_k => self.dmmv.pipeline_mul_mm_q6k_full_dp4a_q8_1 != null and self.dmmv.pipeline_mul_mm_q6k != null,
+            else => false,
+        };
+    }
+
+    fn qwen36PrepareProjectionQ8_1(self: *InferenceEngine, src: Buffer, K: u32, n_tokens: u32) !u32 {
+        if (!self.qwen36Dp4aDownEnabled()) return 0;
+        if (n_tokens < 128 or K == 0 or (K & 255) != 0) return 0;
+        if (self.dmmv.pipeline_quantize_act_q8_1 == null) return 0;
+        const packed_i8 = self.batched_scratch_hidden_i8 orelse return 0;
+        const scale_dsum = self.batched_scratch_hidden_scale_dsum orelse return 0;
+
+        var full_cols = n_tokens & ~@as(u32, 31);
+        if (full_cols == 0) return 0;
+        const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+        if (padded_cols > full_cols) {
+            const need_input: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, K) *
+                @sizeOf(f32);
+            const need_i8: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, K / 4) *
+                @sizeOf(u32);
+            const need_sd: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, K / 32) *
+                2 *
+                @sizeOf(f32);
+            if (src.size >= need_input and packed_i8.size >= need_i8 and scale_dsum.size >= need_sd) {
+                full_cols = padded_cols;
+            }
+        }
+
+        const need_input: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K) *
+            @sizeOf(f32);
+        const need_i8: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K / 4) *
+            @sizeOf(u32);
+        const need_sd: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K / 32) *
+            2 *
+            @sizeOf(f32);
+        if (src.size < need_input or packed_i8.size < need_i8 or scale_dsum.size < need_sd) return 0;
+
+        try self.dmmv.recordQuantizeActQ8_1(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            src.handle,
+            src.size,
+            packed_i8.handle,
+            packed_i8.size,
+            scale_dsum.handle,
+            scale_dsum.size,
+            full_cols,
+            K,
+        );
+        const q8_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = packed_i8.handle, .size = packed_i8.size },
+            .{ .buffer = scale_dsum.handle, .size = scale_dsum.size },
+        };
+        self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+        return full_cols;
+    }
+
+    fn dispatchQwen36ProjectionBatchedDp4aQ8_1(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        src_f32: Buffer,
+        dst: Buffer,
+        M: u32,
+        K: u32,
+        n_tokens: u32,
+        pre_quantized_cols: u32,
+    ) !bool {
+        if (pre_quantized_cols == 0) return false;
+        if (!self.qwen36ProjectionDp4aSupported(tensor, M, K, n_tokens)) return false;
+        const packed_i8 = self.batched_scratch_hidden_i8.?;
+        const scale_dsum = self.batched_scratch_hidden_scale_dsum.?;
+        const need_output: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, pre_quantized_cols) *
+            @as(vk.c.VkDeviceSize, M) *
+            @sizeOf(f32);
+        if (dst.size < need_output) return false;
+
+        const push_fn = self.instance.push_descriptor_fn;
+        switch (tensor.info.type_) {
+            .q4_k => {
+                try self.dmmv.recordMulMmQ4KFullDp4a(
+                    &self.decode_cmd,
+                    push_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    packed_i8.handle,
+                    packed_i8.size,
+                    scale_dsum.handle,
+                    scale_dsum.size,
+                    dst.handle,
+                    dst.size,
+                    M,
+                    pre_quantized_cols,
+                    K,
+                    0,
+                    0,
+                );
+                if (pre_quantized_cols < n_tokens) {
+                    try self.dmmv.recordMulMmQ4K(
+                        &self.decode_cmd,
+                        push_fn,
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        src_f32.handle,
+                        src_f32.size,
+                        dst.handle,
+                        dst.size,
+                        M,
+                        n_tokens - pre_quantized_cols,
+                        K,
+                        K,
+                        M,
+                        0,
+                        pre_quantized_cols * K,
+                        pre_quantized_cols * M,
+                    );
+                }
+                return true;
+            },
+            .q6_k => {
+                try self.dmmv.recordMulMmQ6KFullDp4aQ8_1(
+                    &self.decode_cmd,
+                    push_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    packed_i8.handle,
+                    packed_i8.size,
+                    scale_dsum.handle,
+                    scale_dsum.size,
+                    dst.handle,
+                    dst.size,
+                    M,
+                    pre_quantized_cols,
+                    K,
+                    0,
+                    0,
+                );
+                if (pre_quantized_cols < n_tokens) {
+                    try self.dmmv.recordMulMmQ6K(
+                        &self.decode_cmd,
+                        push_fn,
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        src_f32.handle,
+                        src_f32.size,
+                        dst.handle,
+                        dst.size,
+                        M,
+                        n_tokens - pre_quantized_cols,
+                        K,
+                        K,
+                        M,
+                        0,
+                        pre_quantized_cols * K,
+                        pre_quantized_cols * M,
+                    );
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     /// Dense gate+up+SwiGLU prefill projection for Qwen3.6-27B. Uses int8 DP4a
     /// (one-shot Q8_1-style activation quant + hardware dot4 GEMM with Q4_K
     /// bias correction) when enabled and the shape qualifies. The ragged token
@@ -14983,16 +15167,58 @@ pub const InferenceEngine = struct {
         self.decode_cmd.computeBarrier();
 
         // Batched Q (or packed Q+gate) / K / V / (separate attn_gate)
-        // projections — each weight tensor is read once per chunk.
+        // projections — each weight tensor is read once per chunk. On the
+        // Qwen3.6-27B RDNA path, reuse the dense/SSM DP4a projection kernels
+        // here: one Q8_1 quantize of attn_norm feeds all eligible Q4_K/Q6_K
+        // attention projections for this layer.
+        const attn_proj_dp4a_wanted =
+            self.qwen36ProjectionDp4aSupported(q_t, q_rows, hidden_dim, n_tokens) or
+            self.qwen36ProjectionDp4aSupported(k_t, layer_kv_dim, hidden_dim, n_tokens) or
+            self.qwen36ProjectionDp4aSupported(v_t, layer_kv_dim, hidden_dim, n_tokens) or
+            (use_separate_gate and self.qwen36ProjectionDp4aSupported(attn_gate_t_opt.?, layer_q_dim, hidden_dim, n_tokens));
+        const attn_proj_dp4a_cols: u32 = if (attn_proj_dp4a_wanted)
+            try self.qwen36PrepareProjectionQ8_1(scratch_norm, hidden_dim, n_tokens)
+        else
+            0;
         if (use_packed_gate) {
-            try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_packed_qgate, q_rows, hidden_dim, n_tokens);
+            var q_done = false;
+            if (attn_proj_dp4a_cols > 0) {
+                q_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(q_t, scratch_norm, scratch_packed_qgate, q_rows, hidden_dim, n_tokens, attn_proj_dp4a_cols);
+            }
+            if (!q_done) {
+                try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_packed_qgate, q_rows, hidden_dim, n_tokens);
+            }
         } else {
-            try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens);
+            var q_done = false;
+            if (attn_proj_dp4a_cols > 0) {
+                q_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens, attn_proj_dp4a_cols);
+            }
+            if (!q_done) {
+                try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens);
+            }
         }
-        try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
-        try self.dispatchProjectionBatched(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens);
+        var k_done = false;
+        if (attn_proj_dp4a_cols > 0) {
+            k_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens, attn_proj_dp4a_cols);
+        }
+        if (!k_done) {
+            try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
+        }
+        var v_done = false;
+        if (attn_proj_dp4a_cols > 0) {
+            v_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens, attn_proj_dp4a_cols);
+        }
+        if (!v_done) {
+            try self.dispatchProjectionBatched(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens);
+        }
         if (use_separate_gate) {
-            try self.dispatchProjectionBatched(attn_gate_t_opt.?, scratch_norm, scratch_gate_attn, layer_q_dim, hidden_dim, n_tokens);
+            var gate_done = false;
+            if (attn_proj_dp4a_cols > 0) {
+                gate_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(attn_gate_t_opt.?, scratch_norm, scratch_gate_attn, layer_q_dim, hidden_dim, n_tokens, attn_proj_dp4a_cols);
+            }
+            if (!gate_done) {
+                try self.dispatchProjectionBatched(attn_gate_t_opt.?, scratch_norm, scratch_gate_attn, layer_q_dim, hidden_dim, n_tokens);
+            }
         }
         self.decode_cmd.computeBarrier();
 
@@ -15159,7 +15385,18 @@ pub const InferenceEngine = struct {
         }
 
         // O projection batched: scratch_attn_out → scratch_down (residual src).
-        try self.dispatchProjectionBatched(o_t, scratch_attn_out, scratch_down, hidden_dim, o_cols, n_tokens);
+        // Quantize the post-attention activation separately; it has K=o_cols,
+        // not hidden_dim like the Q/K/V/gate inputs above.
+        var o_done = false;
+        if (self.qwen36ProjectionDp4aSupported(o_t, hidden_dim, o_cols, n_tokens)) {
+            const o_dp4a_cols = try self.qwen36PrepareProjectionQ8_1(scratch_attn_out, o_cols, n_tokens);
+            if (o_dp4a_cols > 0) {
+                o_done = try self.dispatchQwen36ProjectionBatchedDp4aQ8_1(o_t, scratch_attn_out, scratch_down, hidden_dim, o_cols, n_tokens, o_dp4a_cols);
+            }
+        }
+        if (!o_done) {
+            try self.dispatchProjectionBatched(o_t, scratch_attn_out, scratch_down, hidden_dim, o_cols, n_tokens);
+        }
         self.decode_cmd.computeBarrier();
 
         self.endProfilePhase(.attention, attention_phase);
