@@ -77,22 +77,39 @@ kernel void main0(
         }
     }
 
-    const float sum0 = simd_sum(acc0);
-    const float sum1 = simd_sum(acc1);
+    // Cycle ~82: pack the two final-reduction `simd_sum` calls into one
+    // `simd_sum(float2)` — Apple9 lowers vector `simd_sum` to a single
+    // log2(32)=5-level butterfly that transfers 64-bit packed lanes per
+    // `shuffle_xor` instead of two independent 32-bit trees, cutting
+    // cross-lane shuffle traffic ~2× on the per-simdgroup tail of the
+    // non-conv1d sibling of cycle-67's
+    // `dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d.metal`. Production hot
+    // user: the SSM qkv+gate dual projection when conv1d fusion isn't applied
+    // (canUseQwenSsmDualRepackedQ8K2048 fallback path,
+    // forward_metal.zig:18192/18247) — the same dual-matvec geometry as the
+    // conv1d sibling, so the pack carries the same bit-equivalence: both
+    // acc0/acc1 share an identical 5-level reduction tree, the downstream
+    // lane<2 paired writeback consumes the two sums as simdgroup-uniform
+    // scalars, and the existing M0=8192 (conv_channels) / M1=4096 (d_inner)
+    // invariant keeps `row` and `row+1` inside one weight's output buffer.
+    // Same proven pattern as cycles ~67 (conv1d dual sibling),
+    // ~73/74/76/81 across the q8_0 hot kernel family.
+    const float2 sums = simd_sum(float2(acc0, acc1));
     // Parallelize the 2-row writeback across lanes 0 and 1 — non-conv1d sibling
     // of cycle-27's `dmmv_q8_0_repacked_k2048_dual_nr2_qwen_conv1d.metal`
     // pattern, completing the lane-parallel writeback across both dual K=2048
-    // nr2 Qwen shaders. After simd_sum both sum0/sum1 are broadcast on every
-    // lane; `row` and `row + 1` are two contiguous floats in `output` (the
-    // production Qwen3.6 SSM dispatch passes M0=8192 (conv_channels) and
-    // M1=4096 (d_inner), both even, so `base_row = base_pair * 2u` keeps every
-    // pair inside one weight's output buffer), so lanes 0/1 issue a single
-    // coalesced 8-byte store instead of two serial lane-0 stores. Same
-    // discipline as cycles 27/32/38/39/40/41/43/45/46/47/48. Production hot
-    // user: the SSM qkv+gate dual projection when conv1d fusion isn't applied
+    // nr2 Qwen shaders. After the packed simd_sum both float2 components are
+    // broadcast on every lane; `row` and `row + 1` are two contiguous floats
+    // in `output` (the production Qwen3.6 SSM dispatch passes M0=8192
+    // (conv_channels) and M1=4096 (d_inner), both even, so `base_row =
+    // base_pair * 2u` keeps every pair inside one weight's output buffer),
+    // so lanes 0/1 issue a single coalesced 8-byte store instead of two
+    // serial lane-0 stores. Same discipline as cycles
+    // 27/32/38/39/40/41/43/45/46/47/48. Production hot user: the SSM qkv+gate
+    // dual projection when conv1d fusion isn't applied
     // (canUseQwenSsmDualRepackedQ8K2048 fallback path, forward_metal.zig:18101).
     if (lane < 2u) {
-        const float local_sum = (lane == 0u) ? sum0 : sum1;
+        const float local_sum = (lane == 0u) ? sums.x : sums.y;
         output[row + lane] = local_sum;
     }
 }
