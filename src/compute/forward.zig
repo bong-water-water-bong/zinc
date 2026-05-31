@@ -12476,6 +12476,13 @@ pub const InferenceEngine = struct {
         return false;
     }
 
+    fn qwen36DensePrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
+        if (!self.isQwen36DenseHybrid27B()) return n_tokens;
+        if (!self.isAmdRdna()) return n_tokens;
+        if (n_tokens < 128) return n_tokens;
+        return (n_tokens + 31) & ~@as(u32, 31);
+    }
+
     /// int8 DP4a dense-down prefill GEMM (Qwen3.6-27B). Default-on when the
     /// device exposes shaderIntegerDotProduct; disable with
     /// ZINC_QWEN36_27B_DP4A_DOWN=0. The Q6_K f32-FMA down GEMM is a tuned local
@@ -12531,7 +12538,9 @@ pub const InferenceEngine = struct {
         // recordQuantizeActQ8_1 + barrier so this dispatch becomes
         // GEMM-only.
         input_pre_quantized: bool,
+        dp4a_cols_out: *u32,
     ) !DenseGateUpDp4aResult {
+        dp4a_cols_out.* = 0;
         // Threshold 128 matches the Q6_K dense-down DP4a path: under ~128 tokens
         // the one-shot quantize pre-pass + extra dispatch/barrier outweigh the
         // savings from a single 32-col GEMM block. The 5-token "core" scenario
@@ -12549,34 +12558,11 @@ pub const InferenceEngine = struct {
             self.batched_scratch_hidden_i8 != null and
             self.batched_scratch_hidden_scale_dsum != null;
         if (!dp4a_ok) return .not_handled;
-        const full_cols = n_tokens & ~@as(u32, 31);
-        if (full_cols == 0) return .not_handled;
+        const floor_cols = n_tokens & ~@as(u32, 31);
+        if (floor_cols == 0) return .not_handled;
         const hidden_i8 = self.batched_scratch_hidden_i8.?;
         const hidden_sd = self.batched_scratch_hidden_scale_dsum.?;
         const push_fn = self.instance.push_descriptor_fn;
-        if (!input_pre_quantized) {
-            // One-shot quantize of the f32 RMS-normed hidden (full cols only).
-            // Skipped when the upstream SSM segment ran the fused
-            // residual_rms_norm_quant_q8_1 shader, which already produced
-            // packed_i8 + scale_dsum as part of the previous submit.
-            try self.dmmv.recordQuantizeActQ8_1(
-                &self.decode_cmd,
-                push_fn,
-                scratch_norm.handle,
-                scratch_norm.size,
-                hidden_i8.handle,
-                hidden_i8.size,
-                hidden_sd.handle,
-                hidden_sd.size,
-                full_cols,
-                hidden_dim,
-            );
-            const i8_ranges = [_]CommandBuffer.BufferRange{
-                .{ .buffer = hidden_i8.handle, .size = hidden_i8.size },
-                .{ .buffer = hidden_sd.handle, .size = hidden_sd.size },
-            };
-            self.decode_cmd.computeBuffersBarrier(&i8_ranges);
-        }
         // Pick the fused Q8 output variant when the downstream dense-down DP4a
         // path will consume it AND it's not a validation/diagnostic run. This
         // is the structural lever: BM=32 in the producer maps 1:1 to the
@@ -12631,6 +12617,87 @@ pub const InferenceEngine = struct {
             self.dmmv.pipeline_mul_mm_q4k != null and
             self.batched_scratch_swiglu_i8 != null and
             self.batched_scratch_swiglu_scale_dsum != null;
+        var full_cols = floor_cols;
+        const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+        if (padded_cols > floor_cols) {
+            const padded_hidden_f32_bytes: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, hidden_dim) *
+                @sizeOf(f32);
+            const padded_hidden_i8_bytes: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, hidden_dim / 4) *
+                @sizeOf(u32);
+            const padded_hidden_sd_bytes: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, hidden_dim / 32) *
+                2 *
+                @sizeOf(f32);
+            const can_pad_input =
+                hidden_i8.size >= padded_hidden_i8_bytes and
+                hidden_sd.size >= padded_hidden_sd_bytes and
+                (input_pre_quantized or scratch_norm.size >= padded_hidden_f32_bytes);
+
+            const padded_inter_f32_bytes: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, inter_dim) *
+                @sizeOf(f32);
+            const can_pad_output = if (fuse_q8) blk: {
+                const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+                const swiglu_scale = self.batched_scratch_swiglu_scale.?;
+                const need_i8: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, inter_dim / 4) *
+                    @sizeOf(u32);
+                const need_scale: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, inter_dim / 32) *
+                    @sizeOf(f32);
+                break :blk swiglu_i8.size >= need_i8 and swiglu_scale.size >= need_scale;
+            } else if (fuse_q8_1) blk: {
+                const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+                const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
+                const need_i8: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, inter_dim / 4) *
+                    @sizeOf(u32);
+                const need_sd: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, padded_cols) *
+                    @as(vk.c.VkDeviceSize, inter_dim / 32) *
+                    2 *
+                    @sizeOf(f32);
+                break :blk swiglu_i8.size >= need_i8 and swiglu_sd.size >= need_sd;
+            } else scratch_swiglu.size >= padded_inter_f32_bytes;
+
+            if (can_pad_input and can_pad_output) {
+                full_cols = padded_cols;
+            }
+        }
+        dp4a_cols_out.* = full_cols;
+        if (!input_pre_quantized) {
+            // One-shot quantize of the f32 RMS-normed hidden. For long Qwen3.6
+            // prompts, scratch is over-allocated to a 32-token multiple so the
+            // full-tile DP4a GEMM can cover the ragged real-token tail and
+            // avoid an extra f32 tail GEMM per dense layer. Dummy padded columns
+            // are never accumulated back into scratch_hidden.
+            try self.dmmv.recordQuantizeActQ8_1(
+                &self.decode_cmd,
+                push_fn,
+                scratch_norm.handle,
+                scratch_norm.size,
+                hidden_i8.handle,
+                hidden_i8.size,
+                hidden_sd.handle,
+                hidden_sd.size,
+                full_cols,
+                hidden_dim,
+            );
+            const i8_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = hidden_i8.handle, .size = hidden_i8.size },
+                .{ .buffer = hidden_sd.handle, .size = hidden_sd.size },
+            };
+            self.decode_cmd.computeBuffersBarrier(&i8_ranges);
+        }
         if (fuse_q8) {
             const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
             const swiglu_scale = self.batched_scratch_swiglu_scale.?;
@@ -12761,6 +12828,7 @@ pub const InferenceEngine = struct {
         // barrier. Mutually exclusive with swiglu_already_q8 (the producer
         // picks Q8_0 for Q6_K-down or Q8_1 for Q4_K-down, never both).
         swiglu_already_q8_1: bool,
+        gateup_dp4a_cols: u32,
     ) !void {
         // Threshold 128: int8 DP4a regresses on tiny prompts (the one-shot
         // quantize pre-pass + extra dispatch/barrier outweigh a single 32-col
@@ -12784,7 +12852,39 @@ pub const InferenceEngine = struct {
         // must run, or the fallback would consume undefined memory.
         if (swiglu_already_q8 and !dp4a_ok) return error.UnsupportedConfiguration;
         if (dp4a_ok) {
-            const full_cols = n_tokens & ~@as(u32, 31);
+            var full_cols = n_tokens & ~@as(u32, 31);
+            if (swiglu_already_q8 and gateup_dp4a_cols > full_cols) {
+                full_cols = gateup_dp4a_cols;
+            } else if (!swiglu_already_q8) {
+                const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+                if (padded_cols > full_cols) {
+                    const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+                    const swiglu_scale = self.batched_scratch_swiglu_scale.?;
+                    const need_input: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, inter_dim) *
+                        @sizeOf(f32);
+                    const need_i8: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, inter_dim / 4) *
+                        @sizeOf(u32);
+                    const need_scale: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, inter_dim / 32) *
+                        @sizeOf(f32);
+                    const need_output: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, hidden_dim) *
+                        @sizeOf(f32);
+                    if (scratch_swiglu.size >= need_input and
+                        swiglu_i8.size >= need_i8 and
+                        swiglu_scale.size >= need_scale and
+                        scratch_down.size >= need_output)
+                    {
+                        full_cols = padded_cols;
+                    }
+                }
+            }
             if (full_cols > 0) {
                 const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                 const swiglu_scale = self.batched_scratch_swiglu_scale.?;
@@ -12872,7 +12972,40 @@ pub const InferenceEngine = struct {
         // the fallback would consume undefined scratch_swiglu memory.
         if (swiglu_already_q8_1 and !dp4a_ok_q4k) return error.UnsupportedConfiguration;
         if (dp4a_ok_q4k) {
-            const full_cols = n_tokens & ~@as(u32, 31);
+            var full_cols = n_tokens & ~@as(u32, 31);
+            if (swiglu_already_q8_1 and gateup_dp4a_cols > full_cols) {
+                full_cols = gateup_dp4a_cols;
+            } else if (!swiglu_already_q8_1) {
+                const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+                if (padded_cols > full_cols) {
+                    const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+                    const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
+                    const need_input: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, inter_dim) *
+                        @sizeOf(f32);
+                    const need_i8: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, inter_dim / 4) *
+                        @sizeOf(u32);
+                    const need_sd: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, inter_dim / 32) *
+                        2 *
+                        @sizeOf(f32);
+                    const need_output: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, padded_cols) *
+                        @as(vk.c.VkDeviceSize, hidden_dim) *
+                        @sizeOf(f32);
+                    if (scratch_swiglu.size >= need_input and
+                        swiglu_i8.size >= need_i8 and
+                        swiglu_sd.size >= need_sd and
+                        scratch_down.size >= need_output)
+                    {
+                        full_cols = padded_cols;
+                    }
+                }
+            }
             if (full_cols > 0) {
                 const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                 const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
@@ -15115,8 +15248,9 @@ pub const InferenceEngine = struct {
         // int8 DP4a gate+up+SwiGLU short-circuits the f32 path when eligible.
         // .q8_swiglu means the SwiGLU activation was pre-quantized into
         // swiglu_i8 / swiglu_scale; dense-down then skips its own quantize step.
+        var dp4a_gateup_cols: u32 = 0;
         const dp4a_result: DenseGateUpDp4aResult = if (use_fused_gateup)
-            try self.dispatchQwen36DenseGateUpDp4a(gate_t, up_t, down_t, scratch_norm, scratch_swiglu, hidden_dim, inter_dim, n_tokens, input_pre_quantized)
+            try self.dispatchQwen36DenseGateUpDp4a(gate_t, up_t, down_t, scratch_norm, scratch_swiglu, hidden_dim, inter_dim, n_tokens, input_pre_quantized, &dp4a_gateup_cols)
         else
             .not_handled;
         const dp4a_done = dp4a_result != .not_handled;
@@ -15213,11 +15347,10 @@ pub const InferenceEngine = struct {
             );
         }
         // Barrier between gate+up and dense-down. For .q8_swiglu the producer
-        // wrote swiglu_i8 + swiglu_scale (full cols) and scratch_swiglu (tail
-        // only); for .q8_1_swiglu (effort-15 cycle 21) the producer wrote
-        // swiglu_i8 + swiglu_scale_dsum (full cols) and scratch_swiglu (tail
-        // only); for .f32_swiglu / fallback the producer wrote scratch_swiglu
-        // for all tokens.
+        // wrote swiglu_i8 + swiglu_scale for dp4a_gateup_cols and may skip the
+        // f32 tail when those cols cover a padded 32-token multiple. The
+        // .q8_1_swiglu path is the same contract with scale_dsum. For
+        // .f32_swiglu / fallback, scratch_swiglu holds the real token range.
         if (dp4a_result == .q8_swiglu) {
             const swiglu_i8_buf = self.batched_scratch_swiglu_i8.?;
             const swiglu_scale_buf = self.batched_scratch_swiglu_scale.?;
@@ -15241,7 +15374,7 @@ pub const InferenceEngine = struct {
         }
         self.endProfilePhase(.dense_ffn_gateup, dense_ffn_gateup_phase);
         const dense_ffn_down_phase = self.beginProfilePhase();
-        try self.dispatchQwen36DenseDown(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens, dp4a_result == .q8_swiglu, dp4a_result == .q8_1_swiglu);
+        try self.dispatchQwen36DenseDown(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens, dp4a_result == .q8_swiglu, dp4a_result == .q8_1_swiglu, dp4a_gateup_cols);
         self.decode_cmd.computeBufferBarrier(scratch_down.handle, hidden_batch_bytes);
         try self.dispatchScaleAcc(
             scratch_hidden.handle,
@@ -15302,7 +15435,7 @@ pub const InferenceEngine = struct {
             try self.ensureKvPagesForContext(target_context_tokens);
         }
 
-        try self.ensureBatchedScratchCapacity(n_tokens);
+        try self.ensureBatchedScratchCapacity(self.qwen36DensePrefillPaddedTokenCount(n_tokens));
         if (self.prefill_embed_big == null or self.prefill_embed_big_capacity_bytes < total_embed_bytes) {
             if (self.prefill_embed_big) |*b| b.deinit();
             self.prefill_embed_big = try Buffer.initStaging(self.instance, total_embed_bytes);
