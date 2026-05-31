@@ -74,37 +74,45 @@ kernel void main0(
         }
     }
 
-    // Cycle ~83: pack the four final-reduction `simd_sum` calls into two
-    // `simd_sum(float2)` calls — Apple9's vector `simd_sum` lowers to one
-    // log2(32)=5-level butterfly that transfers 64-bit packed lanes per
-    // `shuffle_xor` instead of two independent 32-bit trees, cutting cross-
-    // lane shuffle traffic ~2× on each per-simdgroup tail. Same proven pattern
-    // as cycle ~64 (`dmmv_q8_0_pair_swiglu`'s float4 sibling pack), cycle ~67
-    // (conv1d-fused dual_nr2_qwen pair pack), and cycle ~82
-    // (`dmmv_q8_0_repacked_k2048_dual_nr2_qwen` pair pack).
+    // Cycle ~85: pack the two `simd_sum(float2)` calls (cycle 83's intermediate
+    // form) into a single `simd_sum(float4)` — Apple9 lowers vector `simd_sum`
+    // to one log2(32)=5-level butterfly that transfers 128-bit packed lanes per
+    // `shuffle_xor` instead of two parallel 64-bit trees. Same proven pattern
+    // as cycle ~64 (sibling `dmmv_q8_0_pair_swiglu`'s float4 pack), cycle ~71
+    // (`dmmv_q8_0_k4096_quad` 4→1 float4), and cycle ~76
+    // (`dmmv_q8_0_repacked_k4096_qwen_gated` 4→1 float4). The per-row reduction
+    // tree stays identical (5-level butterfly on each accumulator) — only the
+    // packing density across lane width changes, so the pack is bit-equivalent.
     //
-    // Hot uses on Qwen3.6: (a) full-attn K+V paired projection (M=kv_dim=512,
-    // K=2048, ~10 attn layers × per-token = ~360 calls/req via the cycle-30
-    // block=32 small-row geometry — 1 simdgroup per TG × 256 TGs = 256
-    // simdgroup tails per call); (b) full-attn Q+attn_gate paired (M=4096,
-    // K=2048, ~10 layers × per-token = ~360 calls/req via cycle-15 block=256);
-    // (c) shared expert gate/up fallback when use_fused_shared_q8_swiglu is
-    // unavailable. The downstream lane==0 writeback consumes the four sums
-    // as simdgroup-uniform scalars, so picking float2 components is bit-
-    // equivalent. The has_next predicate stays — it's uniform within the
-    // simdgroup (depends only on base_row from tg_id/sg_idx/simdgroups_per_tg),
-    // so the conditional simd_sum is safe.
-    const float2 sums0 = simd_sum(float2(acc00, acc10));
-    if (lane == 0u) {
-        output0[base_row] = sums0.x;
-        output1[base_row] = sums0.y;
-    }
-
-    if (has_next) {
-        const float2 sums1 = simd_sum(float2(acc01, acc11));
-        if (lane == 0u) {
-            output0[base_row + 1u] = sums1.x;
-            output1[base_row + 1u] = sums1.y;
+    // Combined with lane-parallel 4-row writeback (lanes 0..3 each write one
+    // output instead of lane 0 serializing all 4 stores) the per-simdgroup tail
+    // collapses to ONE store-instruction issue cycle from FOUR. Hot uses on
+    // Qwen3.6: (a) full-attn K+V paired projection (M=kv_dim=512, K=2048,
+    // ~360 calls/req via cycle-30 block=32 → 1 SG/TG × 256 TGs = 256 SG tails
+    // per call ⇒ ~92K SG tails/req); (b) full-attn Q+attn_gate paired (M=4096
+    // K=2048 via cycle-15 block=256); (c) shared expert gate/up fallback.
+    // has_next is uniform within the simdgroup (depends only on base_row from
+    // tg_id/sg_idx/simdgroups_per_tg), so picking sub_row/buf_select by lane
+    // index is uniform-safe. When !has_next, acc01/acc11 alias acc00/acc10
+    // (the loop reads row01==row00, row11==row10), so sums.z/w equal sums.x/y
+    // — gated writes for lanes 2..3 still preserve correctness.
+    //
+    // Float4 component → output mapping:
+    //   sums.x = Σacc00 → output0[base_row]       (lane 0)
+    //   sums.y = Σacc10 → output1[base_row]       (lane 1)
+    //   sums.z = Σacc01 → output0[base_row + 1]   (lane 2, gated by has_next)
+    //   sums.w = Σacc11 → output1[base_row + 1]   (lane 3, gated by has_next)
+    const float4 sums = simd_sum(float4(acc00, acc10, acc01, acc11));
+    if (lane < 4u) {
+        const uint sub_row = lane >> 1;
+        const bool active = (sub_row == 0u) || has_next;
+        if (active) {
+            device float* out = ((lane & 1u) == 0u) ? output0 : output1;
+            const float val = (lane == 0u) ? sums.x
+                            : (lane == 1u) ? sums.y
+                            : (lane == 2u) ? sums.z
+                            :                sums.w;
+            out[base_row + sub_row] = val;
         }
     }
 }
