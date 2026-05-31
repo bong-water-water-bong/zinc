@@ -684,6 +684,24 @@ const Q8RepackedDispatchKind = enum(u8) {
     generic,
 };
 
+/// Per-shape × per-dispatch-kind aggregate of Q8 repacked DMMV calls.
+///
+/// The coarse `q8_repacked_*_bytes/_calls` fields on `RuntimeProfile` group
+/// dispatches by the 4-bucket `Q8RepackedKernel` (tg128/exact_qwen/quad/
+/// generic) and the per-shape `q8_shape_stats` is keyed only by
+/// `DmmvPathClass` (lm_head/router/ssm/full_attn/etc.) — so a `q8 hot #N`
+/// line tells you a shape moves 17.93 GiB but NOT which of the 11 sibling
+/// shaders served it. This slot table fills that gap by keying on
+/// `(kind, rows, cols)` for the actual production dispatch path. Default-off
+/// alongside the rest of the runtime profile.
+const Q8RepackedDispatchStat = struct {
+    kind: Q8RepackedDispatchKind = .unknown,
+    rows: u32 = 0,
+    cols: u32 = 0,
+    bytes: u64 = 0,
+    calls: u32 = 0,
+};
+
 const BarrierClass = enum(u8) {
     embed,
     full_attn,
@@ -822,6 +840,7 @@ pub const RuntimeProfile = struct {
     q8_repacked_exact_qwen_calls: u32 = 0,
     q8_repacked_quad_calls: u32 = 0,
     q8_repacked_generic_calls: u32 = 0,
+    q8_repacked_dispatch_stats: [16]Q8RepackedDispatchStat = [_]Q8RepackedDispatchStat{.{}} ** 16,
 
     fn reset(self: *RuntimeProfile) void {
         self.* = .{};
@@ -6109,6 +6128,42 @@ pub const InferenceEngine = struct {
                         });
                     }
                 }
+                var dispatch_top: [5]?usize = .{ null, null, null, null, null };
+                for (profile.q8_repacked_dispatch_stats, 0..) |slot, idx| {
+                    if (slot.calls == 0) continue;
+                    var insert_pos: ?usize = null;
+                    for (dispatch_top, 0..) |maybe_top_idx, rank| {
+                        if (maybe_top_idx) |top_idx| {
+                            if (slot.bytes > profile.q8_repacked_dispatch_stats[top_idx].bytes) {
+                                insert_pos = rank;
+                                break;
+                            }
+                        } else {
+                            insert_pos = rank;
+                            break;
+                        }
+                    }
+                    if (insert_pos) |rank| {
+                        var shift: usize = dispatch_top.len - 1;
+                        while (shift > rank) : (shift -= 1) {
+                            dispatch_top[shift] = dispatch_top[shift - 1];
+                        }
+                        dispatch_top[rank] = idx;
+                    }
+                }
+                for (dispatch_top, 0..) |maybe_idx, rank| {
+                    if (maybe_idx) |idx| {
+                        const slot = profile.q8_repacked_dispatch_stats[idx];
+                        log.info("  q8 dispatch #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
+                            rank + 1,
+                            q8RepackedDispatchKindLabel(slot.kind),
+                            slot.rows,
+                            slot.cols,
+                            bytesToGiB(slot.bytes),
+                            slot.calls,
+                        });
+                    }
+                }
             }
         }
         if (profile.gpu_routed_moe_layers == 0 and profile.fallback_moe_layers > 0 and self.layer_tensors.len > 0) {
@@ -6806,6 +6861,56 @@ fn recordQ8RepackedKernelProfile(
             profile.q8_repacked_generic_bytes += bytes;
             profile.q8_repacked_generic_calls += 1;
         },
+    }
+}
+
+fn q8RepackedDispatchKindLabel(kind: Q8RepackedDispatchKind) []const u8 {
+    return switch (kind) {
+        .unknown => "unknown",
+        .tg128_k2048_qwen => "tg128_k2048_qwen",
+        .tg128_k4096_qwen => "tg128_k4096_qwen",
+        .tg128_k2048 => "tg128_k2048",
+        .tg128_k4096 => "tg128_k4096",
+        .tg128_generic => "tg128_generic",
+        .exact_qwen_k2048 => "exact_qwen_k2048",
+        .quad_k2048 => "quad_k2048",
+        .exact_qwen_k4096 => "exact_qwen_k4096",
+        .quad_k4096 => "quad_k4096",
+        .quad_generic => "quad_generic",
+        .generic => "generic",
+    };
+}
+
+fn recordQ8RepackedDispatchProfile(
+    engine: *InferenceEngine,
+    tensor: *const metal_loader.LoadedTensor,
+    rows: u32,
+    cols: u32,
+    kind: Q8RepackedDispatchKind,
+) void {
+    if (!engine.profile_enabled or tensor.info.type_ != .q8_0) return;
+    if (kind == .unknown) return;
+
+    const bytes = dmmvWeightBytes(.q8_0, rows, cols);
+    var profile = &engine.request_profile;
+    for (&profile.q8_repacked_dispatch_stats) |*slot| {
+        if (slot.calls != 0 and slot.kind == kind and slot.rows == rows and slot.cols == cols) {
+            slot.bytes += bytes;
+            slot.calls += 1;
+            return;
+        }
+    }
+    for (&profile.q8_repacked_dispatch_stats) |*slot| {
+        if (slot.calls == 0) {
+            slot.* = .{
+                .kind = kind,
+                .rows = rows,
+                .cols = cols,
+                .bytes = bytes,
+                .calls = 1,
+            };
+            return;
+        }
     }
 }
 
@@ -8156,6 +8261,12 @@ fn dispatchQ8RepackedDmmvOnCmd(
     extra_byte_offset: u32,
     kind: Q8RepackedDispatchKind,
 ) bool {
+    // Per-shape × per-dispatch-kind aggregation lets future profile output
+    // attribute hot Q8 shapes to specific sibling shaders (e.g. tell apart
+    // which kernel served `ssm M=8192 K=2048` so a future cycle can pack the
+    // correct simd_sum sibling instead of an unused one). Cheap: bounded
+    // 16-slot linear-probe table, skipped entirely when profile_enabled=false.
+    recordQ8RepackedDispatchProfile(engine, tensor, M, K, kind);
     const push = DmmvPush{
         .M = M,
         .K = K,
