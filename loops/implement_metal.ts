@@ -2591,8 +2591,13 @@ export function buildCrossEffortStatus(state: Pick<RunState, "crossEffortBaselin
   const base = state.crossEffortBaseline;
   if (!last || !base) return [];
   const lines: string[] = [];
-  const severe = last.deltaPct <= -5;
-  const moderate = last.deltaPct <= -2 && !severe;
+  // Thresholds tightened to match the Effort 5/16 docs' explicit "no cross-
+  // effort regression >3%" rule. Decode v4 had drift at -3 to -4% for 6 cycles
+  // but the agent never acknowledged it in selfAnalysis — DRIFT at -2% was
+  // too soft. REGRESSION at -3% now triggers forceful "gate the suspect fusion"
+  // guidance instead of just "watch for further drift."
+  const severe = last.deltaPct <= -3;
+  const moderate = last.deltaPct <= -1.5 && !severe;
   const tag = severe
     ? "## ⚠⚠ CROSS-EFFORT REGRESSION — your changes are HURTING the other metric"
     : moderate
@@ -3286,8 +3291,8 @@ async function main() {
           const baseline = state.crossEffortBaseline.tokPerSec;
           const deltaPct = ((xtps - baseline) / baseline) * 100;
           state.lastCrossEffort = { cycle, metric: CROSS_EFFORT_METRIC, tokPerSec: xtps, deltaPct };
-          const flag = deltaPct <= -5 ? " ⚠⚠ REGRESSION" : deltaPct <= -2 ? " ⚠ drift" : "";
-          console.log(clr(deltaPct <= -5 ? "1;31" : deltaPct <= -2 ? "1;33" : "1;36", `  ◎ Cross-effort ${CROSS_EFFORT_METRIC}: ${xtps.toFixed(2)} tok/s (baseline ${baseline.toFixed(2)}, Δ ${deltaPct >= 0 ? "+" : ""}${deltaPct.toFixed(1)}%)${flag}`));
+          const flag = deltaPct <= -3 ? " ⚠⚠ REGRESSION" : deltaPct <= -1.5 ? " ⚠ drift" : "";
+          console.log(clr(deltaPct <= -3 ? "1;31" : deltaPct <= -1.5 ? "1;33" : "1;36", `  ◎ Cross-effort ${CROSS_EFFORT_METRIC}: ${xtps.toFixed(2)} tok/s (baseline ${baseline.toFixed(2)}, Δ ${deltaPct >= 0 ? "+" : ""}${deltaPct.toFixed(1)}%)${flag}`));
         }
       } catch {
         console.log(clr("1;33", "  ⚠ Cross-effort check failed, continuing"));

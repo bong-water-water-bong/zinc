@@ -1443,7 +1443,7 @@ describe("buildCrossEffortStatus", () => {
     ).toEqual([]);
   });
 
-  test("plain status when other metric is stable (Δ > -2%)", () => {
+  test("plain status when other metric is stable (Δ > -1.5%)", () => {
     const lines = buildCrossEffortStatus({
       crossEffortBaseline: { metric: "prefill", tokPerSec: 100, cycle: 1 },
       lastCrossEffort: { metric: "prefill", tokPerSec: 99.5, cycle: 5, deltaPct: -0.5 },
@@ -1453,23 +1453,32 @@ describe("buildCrossEffortStatus", () => {
     expect(lines).not.toContain("DRIFT");
   });
 
-  test("DRIFT warning at -2% to -5%", () => {
+  test("DRIFT warning at -1.5% to -3% (tightened from prior -2%/-5%)", () => {
     const lines = buildCrossEffortStatus({
       crossEffortBaseline: { metric: "prefill", tokPerSec: 100, cycle: 1 },
-      lastCrossEffort: { metric: "prefill", tokPerSec: 97, cycle: 10, deltaPct: -3 },
+      lastCrossEffort: { metric: "prefill", tokPerSec: 98, cycle: 10, deltaPct: -2 },
     }).join("\n");
     expect(lines).toContain("CROSS-EFFORT DRIFT");
     expect(lines).toContain("Watch for further drift");
   });
 
-  test("REGRESSION warning at <= -5% with concrete remediation guidance", () => {
+  test("REGRESSION warning at <= -3% (matches Effort docs' 3% prohibition)", () => {
     const lines = buildCrossEffortStatus({
       crossEffortBaseline: { metric: "prefill", tokPerSec: 100, cycle: 1 },
-      lastCrossEffort: { metric: "prefill", tokPerSec: 90, cycle: 15, deltaPct: -10 },
+      lastCrossEffort: { metric: "prefill", tokPerSec: 96.5, cycle: 15, deltaPct: -3.5 },
     }).join("\n");
     expect(lines).toContain("CROSS-EFFORT REGRESSION");
     expect(lines).toContain("HURTING the other metric");
     expect(lines).toContain("GATE it behind an env flag");
-    expect(lines).toContain("10.0%");
+    expect(lines).toContain("3.5%");
+  });
+
+  test("decode-v4-style -3.1% drift now triggers REGRESSION (was only DRIFT before)", () => {
+    // This is the exact pattern the agent ignored across cycles 70-76 of v4.
+    const lines = buildCrossEffortStatus({
+      crossEffortBaseline: { metric: "prefill", tokPerSec: 93.9, cycle: 30 },
+      lastCrossEffort: { metric: "prefill", tokPerSec: 91, cycle: 75, deltaPct: -3.1 },
+    }).join("\n");
+    expect(lines).toContain("CROSS-EFFORT REGRESSION");
   });
 });

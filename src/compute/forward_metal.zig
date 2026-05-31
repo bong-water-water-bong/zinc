@@ -3402,16 +3402,18 @@ pub const InferenceEngine = struct {
         self.qwen_final_tail_kv_fused_norm_enabled = readBoolEnv("ZINC_METAL_QWEN_FINAL_TAIL_KV_FUSED_NORM") orelse true;
         self.qwen_layer0_shared_down_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_DOWN_PREFILL") orelse true;
         self.qwen_layer0_shared_gate_prefill_enabled = readBoolEnv("ZINC_METAL_QWEN_LAYER0_SHARED_GATE_PREFILL") orelse true;
-        // Per-kernel timing probe — default off, distorts decode tok/s when on (each
-        // dispatch becomes a commit+wait sync). Auto-enable on `--profile` runs so
-        // both `./zig-out/bin/zinc --profile` (used by the harness profile pass)
-        // and `zinc-bench-metal --profile` surface top-5 µs/dispatch evidence;
-        // cycle-31 wired this to `zinc-bench-metal` only, but the loop's profile
-        // pass actually shells out to the main `zinc` binary. Engine-level wiring
-        // covers both entry points and is idempotent with the bench's pre-init
-        // `kernel_timing.enable()` call. Main keep-gate runs do not pass
-        // `--profile`, so per-decode tok/s is unaffected.
-        if (self.profile_enabled or (readBoolEnv("ZINC_METAL_KERNEL_TIMING") orelse false)) {
+        // Per-kernel timing probe — default off, distorts decode tok/s when on
+        // (each dispatch becomes a commit+wait+restart sync). The cycle-33 auto-
+        // enable on `--profile` runs was reverted: the probe's per-dispatch
+        // commits bypass the normal `commitAndWait` accounting and zero-fill the
+        // `barriers/step`, `gpu-moe barriers/request`, and `wait:` totals in the
+        // profile output, making `--profile` 6× slower AND eliminating the
+        // structural evidence (barrier counts per phase) the loop relies on for
+        // next-cycle direction. The agent then optimized against zero'd profile
+        // counters for ~45 cycles before self-diagnosing it. Per-kernel µs
+        // evidence is still available via `ZINC_METAL_KERNEL_TIMING=1` for an
+        // explicit out-of-band pass.
+        if (readBoolEnv("ZINC_METAL_KERNEL_TIMING") orelse false) {
             kernel_timing.enable();
         }
         self.request_profile = .{};
