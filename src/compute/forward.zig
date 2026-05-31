@@ -9397,6 +9397,7 @@ pub const InferenceEngine = struct {
         n_tokens: u32,
         eps: f32,
         scale: f32,
+        write_norm_out: bool,
     ) !void {
         const pip = &(self.elementwise.pipeline_residual_rms_norm_quant_q8_1 orelse return error.ShaderNotLoaded);
         if ((hidden_dim & 255) != 0) return error.InvalidArgument;
@@ -9406,6 +9407,7 @@ pub const InferenceEngine = struct {
             .scale_bits = @bitCast(scale),
             .blocks_per_token = hidden_dim / 32,
             .stride_packed = hidden_dim / 4,
+            .write_norm_out = if (write_norm_out) 1 else 0,
         };
         if (pip.uses_push_descriptors) {
             self.pushDispatch6(
@@ -9471,6 +9473,103 @@ pub const InferenceEngine = struct {
             if (std.mem.eql(u8, v, "0")) return false;
         }
         return true;
+    }
+
+    fn qwen36DensePrefillCanSkipFfnNormOut(
+        self: *const InferenceEngine,
+        layer: u32,
+        n_tokens: u32,
+        hidden_dim: u32,
+        scratch_swiglu: Buffer,
+    ) bool {
+        if (!self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) return false;
+        if (!self.use_qwen36_batched_fused_gateup) return false;
+        const layer_idx: usize = @intCast(layer);
+        if (layer_idx >= self.layer_tensors.len) return false;
+        if ((hidden_dim & 255) != 0) return false;
+        if (n_tokens < 128) return false;
+
+        const cfg = self.model.config;
+        const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
+        if ((inter_dim & 31) != 0) return false;
+
+        const lt = self.layer_tensors[layer_idx];
+        const gate_t = lt.ffn_gate orelse return false;
+        const up_t = lt.ffn_up orelse return false;
+        const down_t = lt.ffn_down orelse return false;
+        if (gate_t.info.type_ != .q4_k or up_t.info.type_ != .q4_k) return false;
+
+        if (self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a == null) return false;
+        if (self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu == null) return false;
+        const hidden_i8 = self.batched_scratch_hidden_i8 orelse return false;
+        const hidden_sd = self.batched_scratch_hidden_scale_dsum orelse return false;
+
+        const floor_cols = n_tokens & ~@as(u32, 31);
+        if (floor_cols == 0) return false;
+        const required_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+        if (required_cols < n_tokens) return false;
+
+        const hidden_i8_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, required_cols) *
+            @as(vk.c.VkDeviceSize, hidden_dim / 4) *
+            @sizeOf(u32);
+        const hidden_sd_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, required_cols) *
+            @as(vk.c.VkDeviceSize, hidden_dim / 32) *
+            2 *
+            @sizeOf(f32);
+        if (hidden_i8.size < hidden_i8_bytes or hidden_sd.size < hidden_sd_bytes) return false;
+
+        const fuse_q8 = down_t.info.type_ == .q6_k and
+            (inter_dim & 255) == 0 and
+            (hidden_dim & 31) == 0 and
+            self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 != null and
+            self.dmmv.pipeline_mul_mm_q6k_full_dp4a != null and
+            self.dmmv.pipeline_mul_mm_q6k != null and
+            self.batched_scratch_swiglu_i8 != null and
+            self.batched_scratch_swiglu_scale != null;
+        if (fuse_q8) {
+            const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+            const swiglu_scale = self.batched_scratch_swiglu_scale.?;
+            const need_i8: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, required_cols) *
+                @as(vk.c.VkDeviceSize, inter_dim / 4) *
+                @sizeOf(u32);
+            const need_scale: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, required_cols) *
+                @as(vk.c.VkDeviceSize, inter_dim / 32) *
+                @sizeOf(f32);
+            return swiglu_i8.size >= need_i8 and swiglu_scale.size >= need_scale;
+        }
+
+        const fuse_q8_1 = down_t.info.type_ == .q4_k and
+            (inter_dim & 255) == 0 and
+            (hidden_dim & 31) == 0 and
+            self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 != null and
+            self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and
+            self.dmmv.pipeline_mul_mm_q4k != null and
+            self.batched_scratch_swiglu_i8 != null and
+            self.batched_scratch_swiglu_scale_dsum != null;
+        if (fuse_q8_1) {
+            const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
+            const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
+            const need_i8: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, required_cols) *
+                @as(vk.c.VkDeviceSize, inter_dim / 4) *
+                @sizeOf(u32);
+            const need_sd: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, required_cols) *
+                @as(vk.c.VkDeviceSize, inter_dim / 32) *
+                2 *
+                @sizeOf(f32);
+            return swiglu_i8.size >= need_i8 and swiglu_sd.size >= need_sd;
+        }
+
+        const swiglu_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, required_cols) *
+            @as(vk.c.VkDeviceSize, inter_dim) *
+            @sizeOf(f32);
+        return scratch_swiglu.size >= swiglu_bytes;
     }
 
     /// Batched KV-cache write — stores N tokens' K/V into the paged cache in
@@ -14211,6 +14310,7 @@ pub const InferenceEngine = struct {
                 if (self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) {
                     const h_i8 = self.batched_scratch_hidden_i8.?;
                     const h_sd = self.batched_scratch_hidden_scale_dsum.?;
+                    const write_norm_out = !self.qwen36DensePrefillCanSkipFfnNormOut(layer, n_tokens, hidden_dim, scratch_swiglu);
                     try self.dispatchResidualRmsNormQuantQ8_1(
                         scratch_hidden.handle,
                         scratch_hidden.size,
@@ -14228,6 +14328,7 @@ pub const InferenceEngine = struct {
                         n_tokens,
                         self.model.config.rms_norm_eps,
                         1.0,
+                        write_norm_out,
                     );
                 } else {
                     try self.dispatchResidualRmsNorm(
@@ -14516,6 +14617,7 @@ pub const InferenceEngine = struct {
                 if (self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) {
                     const h_i8 = self.batched_scratch_hidden_i8.?;
                     const h_sd = self.batched_scratch_hidden_scale_dsum.?;
+                    const write_norm_out = !self.qwen36DensePrefillCanSkipFfnNormOut(layer, n_tokens, hidden_dim, scratch_swiglu);
                     try self.dispatchResidualRmsNormQuantQ8_1(
                         scratch_hidden.handle,
                         scratch_hidden.size,
@@ -14533,6 +14635,7 @@ pub const InferenceEngine = struct {
                         n_tokens,
                         self.model.config.rms_norm_eps,
                         1.0,
+                        write_norm_out,
                     );
                 } else {
                     try self.dispatchResidualRmsNorm(
@@ -15076,6 +15179,7 @@ pub const InferenceEngine = struct {
         if (self.qwen36DenseFuseRmsQuantEnabled(n_tokens)) {
             const h_i8 = self.batched_scratch_hidden_i8.?;
             const h_sd = self.batched_scratch_hidden_scale_dsum.?;
+            const write_norm_out = !self.qwen36DensePrefillCanSkipFfnNormOut(layer, n_tokens, hidden_dim, scratch_packed_qgate);
             try self.dispatchResidualRmsNormQuantQ8_1(
                 scratch_hidden.handle,
                 scratch_hidden.size,
@@ -15093,6 +15197,7 @@ pub const InferenceEngine = struct {
                 n_tokens,
                 eps,
                 1.0,
+                write_norm_out,
             );
         } else {
             try self.dispatchResidualRmsNorm(

@@ -190,6 +190,7 @@ pub const ResidualRmsNormQuantQ8_1Push = extern struct {
     scale_bits: u32,
     blocks_per_token: u32,
     stride_packed: u32,
+    write_norm_out: u32,
 };
 
 /// Push constants for fused RMS norm + RoPE shader.

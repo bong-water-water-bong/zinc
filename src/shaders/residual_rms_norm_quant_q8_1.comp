@@ -37,6 +37,7 @@ layout(push_constant) uniform PushConstants {
     float scale;
     uint  blocks_per_token;   // n/32
     uint  stride_packed;      // n/4 (uints per token in packed_i8)
+    uint  write_norm_out;     // 0 when the next DP4a GEMM consumes only packed_i8
 };
 
 layout(set = 0, binding = 0)          buffer Hidden    { float hidden[]; };
@@ -94,7 +95,9 @@ void main() {
     for (uint iter = 0u; iter < iters; iter++) {
         const uint idx = iter * WG + tid;
         const float v = weights[idx] * hidden[base + idx] * rms_inv;
-        norm_out[base + idx] = v;
+        if (write_norm_out != 0u) {
+            norm_out[base + idx] = v;
+        }
 
         const float local_amax = abs(v);
         const float block_amax = subgroupClusteredMax(local_amax, 32u);
