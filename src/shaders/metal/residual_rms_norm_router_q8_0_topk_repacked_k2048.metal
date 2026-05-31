@@ -103,11 +103,29 @@ kernel void main0(
             }
         }
 
-        const float sum0 = simd_sum(acc0);
-        const float sum1 = simd_sum(acc1);
-        if (lane == 0u) {
-            values[base_row] = sum0;
-            values[base_row + 1u] = sum1;
+        // Pack the two final-reduction `simd_sum` calls into one
+        // `simd_sum(float2)` + lane-parallel 2-row writeback. Apple9's
+        // vector `simd_sum` lowers to a single log2(32)=5-level butterfly
+        // that transfers 64-bit packed lanes per `shuffle_xor` instead of
+        // two independent 32-bit trees, cutting cross-lane shuffle traffic
+        // ~2× on the per-simdgroup tail of the hot fused
+        // residual+RMSNorm+router+top-k kernel (1436 calls/req across 30
+        // MoE-routed SSM layers × 36 steps; 128 row_pairs/call distributed
+        // across `simdgroups_per_tg` SGs ⇒ ~184K simdgroup-tail reductions
+        // per request). The downstream lane-uniform writeback into
+        // threadgroup `values[]` consumes both sums as simdgroup-broadcast
+        // scalars (sums.x / sums.y), so picking float2 components by lane
+        // is bit-equivalent to the prior two scalar `simd_sum` calls. Same
+        // proven pattern as cycle ~86 (`dmmv_q5k_moe_k512.metal`) and the
+        // dual-row Q8 family across cycles 75/82/83. Lane 0 / lane 1 write
+        // to adjacent threadgroup slots `values[base_row]` /
+        // `values[base_row + 1u]`; each pair iteration owns disjoint
+        // base_row positions (pair stride = simdgroups_per_tg, pair << 1)
+        // so no cross-SG TG-mem races.
+        const float2 sums = simd_sum(float2(acc0, acc1));
+        if (lane < 2u) {
+            const float local_sum = (lane == 0u) ? sums.x : sums.y;
+            values[base_row + lane] = local_sum;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
