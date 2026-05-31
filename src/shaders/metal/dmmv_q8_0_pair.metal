@@ -74,19 +74,37 @@ kernel void main0(
         }
     }
 
-    const float sum00 = simd_sum(acc00);
-    const float sum10 = simd_sum(acc10);
+    // Cycle ~83: pack the four final-reduction `simd_sum` calls into two
+    // `simd_sum(float2)` calls — Apple9's vector `simd_sum` lowers to one
+    // log2(32)=5-level butterfly that transfers 64-bit packed lanes per
+    // `shuffle_xor` instead of two independent 32-bit trees, cutting cross-
+    // lane shuffle traffic ~2× on each per-simdgroup tail. Same proven pattern
+    // as cycle ~64 (`dmmv_q8_0_pair_swiglu`'s float4 sibling pack), cycle ~67
+    // (conv1d-fused dual_nr2_qwen pair pack), and cycle ~82
+    // (`dmmv_q8_0_repacked_k2048_dual_nr2_qwen` pair pack).
+    //
+    // Hot uses on Qwen3.6: (a) full-attn K+V paired projection (M=kv_dim=512,
+    // K=2048, ~10 attn layers × per-token = ~360 calls/req via the cycle-30
+    // block=32 small-row geometry — 1 simdgroup per TG × 256 TGs = 256
+    // simdgroup tails per call); (b) full-attn Q+attn_gate paired (M=4096,
+    // K=2048, ~10 layers × per-token = ~360 calls/req via cycle-15 block=256);
+    // (c) shared expert gate/up fallback when use_fused_shared_q8_swiglu is
+    // unavailable. The downstream lane==0 writeback consumes the four sums
+    // as simdgroup-uniform scalars, so picking float2 components is bit-
+    // equivalent. The has_next predicate stays — it's uniform within the
+    // simdgroup (depends only on base_row from tg_id/sg_idx/simdgroups_per_tg),
+    // so the conditional simd_sum is safe.
+    const float2 sums0 = simd_sum(float2(acc00, acc10));
     if (lane == 0u) {
-        output0[base_row] = sum00;
-        output1[base_row] = sum10;
+        output0[base_row] = sums0.x;
+        output1[base_row] = sums0.y;
     }
 
     if (has_next) {
-        const float sum01 = simd_sum(acc01);
-        const float sum11 = simd_sum(acc11);
+        const float2 sums1 = simd_sum(float2(acc01, acc11));
         if (lane == 0u) {
-            output0[base_row + 1u] = sum01;
-            output1[base_row + 1u] = sum11;
+            output0[base_row + 1u] = sums1.x;
+            output1[base_row + 1u] = sums1.y;
         }
     }
 }
