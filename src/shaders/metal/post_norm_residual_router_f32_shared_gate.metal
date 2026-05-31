@@ -162,13 +162,25 @@ kernel void main0(
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (local_id == 0u) {
-        float shared_total = 0.0f;
-        #pragma unroll
-        for (uint i = 0u; i < SG_PER_TG; ++i) {
-            shared_total += shared_partials[i];
+    // Cycle-58 sibling treatment: move `shared_partials` reduction +
+    // `shared_gate_out` store from `local_id == 0` to sg 1 so sg 0 can begin
+    // the 8-slot top-k loop IMMEDIATELY after the barrier. Mirrors the proven
+    // pattern from the SSM-boundary sibling `residual_rms_norm_router_f32_topk.metal`
+    // (lines 231-236, cycle 58). Two wins combined: (a) replaces the 16-iter
+    // scalar `for` sum (~15 cycles) with one `simd_sum` (5 shuffle_xor steps),
+    // and (b) parallelizes the shared_total store with sg 0's ~400-cycle top-k
+    // loop — the two are data-independent (top-k reads `values[]`, this reads
+    // `shared_partials[]` and writes `shared_gate_out[0]`, distinct buffers).
+    // Lane mask `(lane < SG_PER_TG)` is needed because SG_PER_TG=16 here (vs
+    // 32 in the TG_SIZE=1024 sibling); sg 1 always exists with TG_SIZE=512.
+    // Hot user: every Qwen3.6 full-attention decode-token boundary (10 attn
+    // layers × per-step ≈ 360 calls/req).
+    if (sg_idx == 1u) {
+        const float part = (lane < SG_PER_TG) ? shared_partials[lane] : 0.0f;
+        const float shared_total = simd_sum(part);
+        if (lane == 0u) {
+            shared_gate_out[0] = shared_total;
         }
-        shared_gate_out[0] = shared_total;
     }
 
     if (p.n_experts == 256u && p.k == 8u) {
