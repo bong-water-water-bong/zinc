@@ -13418,12 +13418,15 @@ pub const InferenceEngine = struct {
     fn appendQwen36DensePrefillSegment(self: *const InferenceEngine, out: *[qwen36_dense_prefill_max_segments]u32, count: *usize, layer: u32, prefix_layers: u32) void {
         const cfg = self.model.config;
         if (count.* >= out.len) return;
+        if (layer >= cfg.n_layers) return;
         // Prefix loop runs layers 0..prefix_layers-1; segments start at
         // prefix_layers (the layer right after the prefix ends). The previous
         // `<=` filter excluded layer == prefix_layers, leaving a gap layer that
         // ran token-major via prefillQwen36RunPartialTokenLoop.
         if (layer < prefix_layers) return;
-        if (layer + 1 >= cfg.n_layers) return;
+        const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
+        const is_final_layer = layer + 1 == cfg.n_layers;
+        if (is_final_layer and ((layer + 1) % full_attn_interval) != 0) return;
         for (out[0..count.*]) |existing| {
             if (existing == layer) return;
         }
@@ -13482,7 +13485,8 @@ pub const InferenceEngine = struct {
             // The previous "Layer 3 still adds setup overhead" comment was
             // written before the cycle-13 full-attn batched path existed.
             var segment_layer: u32 = prefix_layers;
-            while (segment_layer <= 62) : (segment_layer += 1) {
+            const last_segment_layer = cfg.n_layers - 1;
+            while (segment_layer <= last_segment_layer) : (segment_layer += 1) {
                 self.appendQwen36DensePrefillSegment(out, &count, segment_layer, prefix_layers);
             }
             return count;
@@ -15527,6 +15531,18 @@ pub const InferenceEngine = struct {
         self.partial_decode_hidden_in = scratch_hidden.handle;
         self.partial_decode_hidden_out = null;
         self.partial_decode_advance_position = true;
+
+        if (tail_start_layer >= cfg.n_layers) {
+            const last_idx = n_tokens - 1;
+            self.prefill_current_token_idx = last_idx;
+            state.position = base_token + last_idx;
+            self.partial_decode_hidden_in_offset = @as(vk.c.VkDeviceSize, last_idx) * hidden_size;
+            self.partial_decode_allow_final_tail = true;
+            self.prefill_pipeline_mode = false;
+            try self.decodeStep(state, prompt_tokens[last_idx], true);
+            self.prefill_token_samples = @max(self.prefill_token_samples, n_tokens);
+            return;
+        }
 
         // The prefix path runs the first layer(s) layer-major, then returns to
         // token-major decode for the remainder. Reuse prefillBatch's two-slot
