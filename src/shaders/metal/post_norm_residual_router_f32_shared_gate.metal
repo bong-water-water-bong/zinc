@@ -119,14 +119,36 @@ kernel void main0(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint router_base = p.router_offset >> 2;
-    for (uint row_block = 0u; row_block < p.n_experts; row_block += SG_PER_TG * 2u) {
-        const uint base_row = row_block + sg_idx * 2u;
+    // Cycle ~93 follow-up to cycle 92's TG_SIZE 512→1024 bump: with SG_PER_TG
+    // now 32, promote ROWS_PER_SG 2→4 so each row_block covers SG_PER_TG*4=128
+    // rows. For the Qwen3.6 256-expert router this collapses the outer loop
+    // from 4 iterations to 2, AND packs the four per-row `simd_sum` tails into
+    // a single `simd_sum(float4)` — Apple9's vec simd_sum lowers to one
+    // log2(32)=5-level butterfly that shuffles 128-bit packed lanes per
+    // `shuffle_xor` instead of four independent 32-bit trees, cutting
+    // cross-lane shuffle traffic ~4× on each per-simdgroup tail (vs. the
+    // 2-row cycle-91 baseline). Also halves outer-loop / barrier overhead and
+    // doubles `x_cache4[vi]` LDS reuse (one load feeds 4 row dots instead of
+    // 2). Hot user: every Qwen3.6 full-attention decode-token boundary (10
+    // attn layers × per-step ≈ 360 calls/req); previous 32 sg × 4 iter × 2
+    // tails ≈ 256 reduction tails / call drops to 32 sg × 2 iter × 1 tail =
+    // 64 tails / call. The `base_row + N < p.n_experts` predicates stay
+    // uniform within the simdgroup (depend only on row_block + sg_idx, not
+    // lane) so no divergence. Register pressure: 4 accumulators per lane is
+    // well within Apple9's per-thread register file (~256 32-bit regs). Same
+    // proven pattern as cycles 83/85/91 across the dual/quad simd_sum family.
+    for (uint row_block = 0u; row_block < p.n_experts; row_block += SG_PER_TG * 4u) {
+        const uint base_row = row_block + sg_idx * 4u;
         float acc0 = 0.0f;
         float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        float acc3 = 0.0f;
 
         if (base_row < p.n_experts) {
             device const float* row0 = W_router + router_base + base_row * p.K;
             device const float* row1 = row0 + p.K;
+            device const float* row2 = row1 + p.K;
+            device const float* row3 = row2 + p.K;
 
             for (uint vi = lane; vi < k_vec4; vi += 32u) {
                 const float4 x = x_cache4[vi];
@@ -134,31 +156,21 @@ kernel void main0(
                 if (base_row + 1u < p.n_experts) {
                     acc1 += dot(*(device const float4*)(row1 + (vi << 2)), x);
                 }
+                if (base_row + 2u < p.n_experts) {
+                    acc2 += dot(*(device const float4*)(row2 + (vi << 2)), x);
+                }
+                if (base_row + 3u < p.n_experts) {
+                    acc3 += dot(*(device const float4*)(row3 + (vi << 2)), x);
+                }
             }
 
-            // Pack the two router-GEMM final-reduction `simd_sum` calls into
-            // a single `simd_sum(float2)` + lane-parallel 2-row writeback —
-            // Apple9's vector `simd_sum` lowers to one log2(32)=5-level
-            // butterfly that transfers 64-bit packed lanes per `shuffle_xor`
-            // instead of two independent 32-bit trees, cutting cross-lane
-            // shuffle traffic ~2× on the per-simdgroup tail. Same proven
-            // pattern as cycle ~65 on the SSM-boundary sibling
-            // `residual_rms_norm_router_f32_topk.metal` (lines 177-193) and
-            // cycles 75/82/83/86/87/88 across the Q8 dual/quad family. This
-            // kernel fires on every Qwen3.6 full-attention decode-token
-            // boundary (10 attn layers × per-step ≈ 360 calls/req); with
-            // TG_SIZE=512/SG_PER_TG=16 and 256 experts → 8 row_blocks × 16
-            // simdgroups ≈ 128 reduction tails per call ≈ 46K per request.
-            // acc1 stays semantic even when `base_row + 1u >= p.n_experts`
-            // (always zero — the inner accumulate predicate gated the dot
-            // product); the `store_row < p.n_experts` predicate below still
-            // gates the write. Lane-parallel writeback issues two coalesced
-            // stores at consecutive TG-mem slots in a single SIMD scatter
-            // instead of lane 0 doing two serial stores.
-            const float2 sums = simd_sum(float2(acc0, acc1));
+            const float4 sums = simd_sum(float4(acc0, acc1, acc2, acc3));
             const uint store_row = base_row + lane;
-            if (lane < 2u && store_row < p.n_experts) {
-                const float val = (lane == 0u) ? sums.x : sums.y;
+            if (lane < 4u && store_row < p.n_experts) {
+                const float val = (lane == 0u) ? sums.x
+                                : (lane == 1u) ? sums.y
+                                : (lane == 2u) ? sums.z
+                                               : sums.w;
                 values[store_row] = val;
             }
         }
