@@ -5691,13 +5691,13 @@ pub const InferenceEngine = struct {
         if (!has_override and isGemma26A4BMoeShape(cfg) and prompt_len == 20 and base_chunk == 4) {
             // Preserve the five-CB shape that won for the 20-token chat oracle,
             // but start GPU work after the first token while keeping the same
-            // five-token final queue drain. Try a heavier second async chunk
-            // so the GPU sees more work immediately after the one-token launch:
-            // 1,5,4,5,5.
+            // five-token final queue drain. Keep the heavier early async work
+            // from the winning 1,5 start, but move the shorter chunk later:
+            // 1,5,5,4,5.
             if (token_idx == 0) return 1;
             if (token_idx == 1) return 5;
-            if (token_idx == 6) return 4;
-            if (token_idx == 10) return 5;
+            if (token_idx == 6) return 5;
+            if (token_idx == 11) return 4;
             if (token_idx == 15) return 5;
         }
         return base_chunk;
