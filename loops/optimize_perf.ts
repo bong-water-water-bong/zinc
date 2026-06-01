@@ -74,6 +74,8 @@ function envValue(...keys: string[]): string | undefined {
   return undefined;
 }
 
+const SELECTED_RDNA_NODE = envValue("ZINC_RDNA_NODE", "ZINC_NODE");
+
 function rdnaNodeEnvKey(node: string | undefined, suffix: string): string | null {
   const normalized = (node ?? "")
     .trim()
@@ -84,15 +86,14 @@ function rdnaNodeEnvKey(node: string | undefined, suffix: string): string | null
 }
 
 function rdnaEnvValue(suffix: string, ...fallbackKeys: string[]): string | undefined {
-  const node = envValue("ZINC_RDNA_NODE", "ZINC_NODE");
-  const nodeKey = rdnaNodeEnvKey(node, suffix);
+  const nodeKey = rdnaNodeEnvKey(SELECTED_RDNA_NODE, suffix);
   return envValue(...(nodeKey ? [nodeKey] : []), ...fallbackKeys);
 }
 
 const ZINC_HOST = rdnaEnvValue("HOST", "ZINC_RDNA_HOST", "ZINC_HOST") ?? "127.0.0.1";
 const ZINC_PORT = Number(rdnaEnvValue("PORT", "ZINC_RDNA_PORT", "ZINC_PORT") ?? "22");
 const ZINC_USER = rdnaEnvValue("USER", "ZINC_RDNA_USER", "ZINC_USER") ?? "root";
-const REMOTE_DIR = "/root/zinc";
+const REMOTE_DIR = rdnaEnvValue("REMOTE_DIR", "ZINC_RDNA_REMOTE_DIR", "ZINC_REMOTE_DIR") ?? "/root/zinc";
 
 type PromptMode = "raw" | "chat";
 
@@ -107,7 +108,10 @@ type ModelTarget = {
 };
 
 function envOrDefault(name: string, fallback: string): string {
-  return process.env[name] ?? ENV[name] ?? fallback;
+  const rdnaPrefix = "ZINC_RDNA_";
+  const suffix = name.startsWith(rdnaPrefix) ? name.slice(rdnaPrefix.length) : name;
+  const nodeKey = rdnaNodeEnvKey(SELECTED_RDNA_NODE, suffix);
+  return envValue(...(nodeKey ? [nodeKey] : []), name) ?? fallback;
 }
 
 const MODELS: Record<string, ModelTarget> = {
@@ -3529,6 +3533,7 @@ async function main() {
   console.log(c("1;37", boxLine(`ZINC Performance Optimization Loop — Effort ${effort}`)));
   console.log(c("1;37", boxLine(effortFile)));
   console.log(c("1;37", boxLine(`Model: ${model}`)));
+  console.log(c("1;37", boxLine(`RDNA node: ${SELECTED_RDNA_NODE ?? "(default)"}`)));
   const agentDetails = agent === "claude"
     ? ` (${CLAUDE_MODEL} effort=${CLAUDE_EFFORT})`
     : ` (${CODEX_MODEL} effort=${CODEX_REASONING_EFFORT})`;
