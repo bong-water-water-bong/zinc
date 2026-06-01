@@ -184,6 +184,23 @@ function generatedTokensValue(scenario: any) {
   return scenario?.zinc?.generated_tokens ?? scenario?.baseline?.generated_tokens ?? scenario?.max_tokens ?? null;
 }
 
+function tokenShapeText(scenario: any, compact = false) {
+  const promptTokens = promptTokensValue(scenario);
+  const generatedTokens = generatedTokensValue(scenario);
+  const capTokens = scenario?.max_tokens ?? null;
+  const promptLabel = compact ? `${formatNumber(promptTokens, 0)}p` : formatMetric(promptTokens, 'tok prompt', 0);
+  const outputLabel = compact ? `${formatNumber(generatedTokens, 0)}out` : formatMetric(generatedTokens, 'tok output', 0);
+
+  if (hasValue(generatedTokens) && hasValue(capTokens) && generatedTokens !== capTokens) {
+    const capLabel = compact ? `${formatNumber(capTokens, 0)}cap` : formatMetric(capTokens, 'tok cap', 0);
+    return `${promptLabel} · ${outputLabel}/${capLabel}`;
+  }
+
+  if (hasValue(generatedTokens)) return `${promptLabel} · ${outputLabel}`;
+  if (hasValue(capTokens)) return `${promptLabel} · ${compact ? `${formatNumber(capTokens, 0)}cap` : formatMetric(capTokens, 'tok cap', 0)}`;
+  return promptLabel;
+}
+
 function prefillMsValue(scenario: any) {
   return metricValue(scenario?.zinc?.prefill_ms);
 }
@@ -377,6 +394,10 @@ function outputQualityStatus(scenario: any) {
   };
 }
 
+function isReviewOutputScenario(scenario: any) {
+  return outputQualityStatus(scenario).tone === 'caution';
+}
+
 function scenarioStatus(scenario: any) {
   const zincOk = promptValue(scenario) != null || decodeValue(scenario) != null || endToEndValue(scenario) != null;
   const baselineOk = baselinePromptValue(scenario) != null || baselineDecodeValue(scenario) != null;
@@ -424,7 +445,8 @@ function normalizeTarget(target: any) {
 
   const successful = visibleModels.filter((model: any) => model?.zinc?.decode_tps);
   const allScenarios = visibleModels.flatMap((model: any) => ensureScenarios(model));
-  const compared = visibleModels.filter((model: any) => ensureScenarios(model).some((scenario: any) => overallRatioValue(scenario) != null));
+  const summaryScenarios = allScenarios.filter((scenario: any) => !isReviewOutputScenario(scenario));
+  const compared = visibleModels.filter((model: any) => ensureScenarios(model).some((scenario: any) => !isReviewOutputScenario(scenario) && overallRatioValue(scenario) != null));
   const fastest = successful.length > 0
     ? [...successful].sort((a, b) => (b.zinc.decode_tps.median ?? b.zinc.decode_tps.avg ?? 0) - (a.zinc.decode_tps.median ?? a.zinc.decode_tps.avg ?? 0))[0]
     : null;
@@ -442,7 +464,7 @@ function normalizeTarget(target: any) {
       compared_models: compared.length,
       average_decode_tps: mean(successful.map((model: any) => model.zinc.decode_tps.median ?? model.zinc.decode_tps.avg ?? null)),
       average_prompt_tps: mean(successful.map((model: any) => model.zinc.prefill_tps?.median ?? model.zinc.prefill_tps?.avg ?? null)),
-      average_pct_of_llama: mean(allScenarios.map((scenario: any) => overallRatioValue(scenario))),
+      average_pct_of_llama: mean(summaryScenarios.map((scenario: any) => overallRatioValue(scenario))),
     },
   };
 }
@@ -470,6 +492,18 @@ const totalComparedModels = targets.reduce((sum, target) => sum + (target.summar
 
 function benchmarkedCount(target: any) {
   return target.summary?.benchmarked_models ?? target.models.length ?? 0;
+}
+
+function successfulCount(target: any) {
+  return target.summary?.successful_models ?? 0;
+}
+
+function failedCount(target: any) {
+  return Math.max(0, benchmarkedCount(target) - successfulCount(target));
+}
+
+function isPartialTarget(target: any) {
+  return failedCount(target) > 0;
 }
 
 function sampleCount(summary: any) {
@@ -546,9 +580,10 @@ function scenarioRows(target: any, scenarioId: string) {
 
 function scenarioSummary(target: any, scenarioId: string) {
   const rows = scenarioRows(target, scenarioId);
-  const comparedRows = rows.filter((row) => overallRatioValue(row.scenario) != null);
-  const fastestRow = rows.length > 0
-    ? [...rows].sort((a, b) => (decodeValue(b.scenario) ?? -1) - (decodeValue(a.scenario) ?? -1))[0]
+  const summaryRows = rows.filter((row) => !isReviewOutputScenario(row.scenario));
+  const comparedRows = summaryRows.filter((row) => overallRatioValue(row.scenario) != null);
+  const fastestRow = summaryRows.length > 0
+    ? [...summaryRows].sort((a, b) => (decodeValue(b.scenario) ?? -1) - (decodeValue(a.scenario) ?? -1))[0]
     : null;
   const closestRow = comparedRows.length > 0
     ? [...comparedRows].sort((a, b) => (overallRatioValue(b.scenario) ?? 0) - (overallRatioValue(a.scenario) ?? 0))[0]
@@ -556,17 +591,17 @@ function scenarioSummary(target: any, scenarioId: string) {
   return {
     count: rows.length,
     comparedCount: comparedRows.length,
-    avgPrompt: mean(rows.map((row) => promptValue(row.scenario))),
-    avgDecode: mean(rows.map((row) => decodeValue(row.scenario))),
-    avgEndToEnd: mean(rows.map((row) => endToEndValue(row.scenario))),
-    avgLatency: mean(rows.map((row) => totalLatencyValue(row.scenario))),
-    avgPromptTokens: mean(rows.map((row) => promptTokensValue(row.scenario))),
-    avgPrefillMs: mean(rows.map((row) => prefillMsValue(row.scenario))),
-    avgPromptGap: mean(rows.map((row) => promptRatioValue(row.scenario))),
-    avgDecodeGap: mean(rows.map((row) => decodeRatioValue(row.scenario))),
-    avgOverall: mean(rows.map((row) => overallValue(row.scenario))),
-    avgOverallGap: mean(rows.map((row) => overallRatioValue(row.scenario))),
-    reviewCount: rows.filter((row) => outputQualityStatus(row.scenario).tone === 'caution').length,
+    avgPrompt: mean(summaryRows.map((row) => promptValue(row.scenario))),
+    avgDecode: mean(summaryRows.map((row) => decodeValue(row.scenario))),
+    avgEndToEnd: mean(summaryRows.map((row) => endToEndValue(row.scenario))),
+    avgLatency: mean(summaryRows.map((row) => totalLatencyValue(row.scenario))),
+    avgPromptTokens: mean(summaryRows.map((row) => promptTokensValue(row.scenario))),
+    avgPrefillMs: mean(summaryRows.map((row) => prefillMsValue(row.scenario))),
+    avgPromptGap: mean(summaryRows.map((row) => promptRatioValue(row.scenario))),
+    avgDecodeGap: mean(summaryRows.map((row) => decodeRatioValue(row.scenario))),
+    avgOverall: mean(summaryRows.map((row) => overallValue(row.scenario))),
+    avgOverallGap: mean(summaryRows.map((row) => overallRatioValue(row.scenario))),
+    reviewCount: rows.filter((row) => isReviewOutputScenario(row.scenario)).length,
     fastestModelLabel: fastestRow?.model?.label ?? null,
     fastestDecode: fastestRow ? decodeValue(fastestRow.scenario) : null,
     closestModelLabel: closestRow?.model?.label ?? null,
@@ -652,10 +687,18 @@ const jsonLd = {
     </div>
     <div class="coverage-grid">
       {targets.map((target) => (
-        <a href={`#${target.id}`} class="coverage-card" data-bench-coverage-target={target.id}>
-          <span>{target.label}</span>
+        <a href={`#${target.id}`} class:list={['coverage-card', { partial: isPartialTarget(target) }]} data-bench-coverage-target={target.id}>
+          <span>
+            {target.label}
+            {isPartialTarget(target) && <em>partial</em>}
+          </span>
           <strong>{target.summary?.compared_models ?? 0}</strong>
-          <small>compared model rows · {formatShortDate(target.generated_at)}</small>
+          <small>
+            {successfulCount(target)}/{benchmarkedCount(target)} complete
+            {isPartialTarget(target) && ` · ${failedCount(target)} failed`}
+            {' · '}
+            {formatShortDate(target.generated_at)}
+          </small>
         </a>
       ))}
     </div>
@@ -673,7 +716,10 @@ const jsonLd = {
         data-bench-target-tab={target.id}
       >
         <div class="target-tab-head">
-          <span>{target.label}</span>
+          <span>
+            {target.label}
+            {isPartialTarget(target) && <em>partial</em>}
+          </span>
           <small>{target.machine.gpu}</small>
         </div>
         <div class="target-tab-stats">
@@ -686,8 +732,8 @@ const jsonLd = {
             <small>overall</small>
           </div>
           <div>
-            <strong>{benchmarkedCount(target)}</strong>
-            <small>rows</small>
+            <strong>{successfulCount(target)}/{benchmarkedCount(target)}</strong>
+            <small>complete</small>
           </div>
         </div>
       </button>
@@ -908,7 +954,7 @@ const jsonLd = {
                         <div class="rank-model">
                           <div>
                             <strong>{displayModelLabel(row.model)}</strong>
-                            <small title={rowStatus.note}>{formatNumber(promptTokensValue(row.scenario), 0)}p · {formatNumber(row.scenario.max_tokens, 0)}out · {rowStatus.label}</small>
+                            <small title={rowStatus.note}>{tokenShapeText(row.scenario, true)}</small>
                             <span class:list={['status-pill', 'rank-status', rowStatus.tone]} title={rowStatus.note}>{rowStatus.label}</span>
                           </div>
                         </div>
@@ -987,7 +1033,7 @@ const jsonLd = {
                           <header class="mobile-model-head">
                             <div>
                               <strong>{displayModelLabel(row.model)}</strong>
-                              <small>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)}</small>
+                              <small>{tokenShapeText(row.scenario)}</small>
                             </div>
                             <span class:list={['status-pill', rowStatus.tone]} title={rowStatus.note}>{rowStatus.label}</span>
                           </header>
@@ -1097,7 +1143,7 @@ const jsonLd = {
                               <div class="model-row">
                                 <div>
                                   <strong>{displayModelLabel(row.model)}</strong>
-                                  <small title={rowStatus.note}>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)} · {runCount || 0} runs · {rowStatus.label}</small>
+                                  <small title={rowStatus.note}>{tokenShapeText(row.scenario)} · {runCount || 0} runs · {rowStatus.label}</small>
                                 </div>
                               </div>
                             </th>
@@ -1512,6 +1558,34 @@ const jsonLd = {
   .coverage-card {
     color: inherit;
     text-decoration: none;
+  }
+
+  .coverage-card.partial {
+    border-color: color-mix(in srgb, #d97706 36%, var(--color-border) 64%);
+    background: color-mix(in srgb, #d97706 7%, var(--bench-surface) 93%);
+  }
+
+  .coverage-card span,
+  .target-tab-head span {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.38rem;
+  }
+
+  .coverage-card em,
+  .target-tab-head em {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.08rem 0.34rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, #d97706 16%, transparent);
+    color: #b45309;
+    font-size: 0.62rem;
+    font-style: normal;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
   }
 
   .coverage-card strong {
