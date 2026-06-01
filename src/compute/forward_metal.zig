@@ -5690,9 +5690,10 @@ pub const InferenceEngine = struct {
     fn queuedTokenMajorAsyncChunkLen(cfg: ModelConfig, prompt_len: usize, token_idx: usize, base_chunk: usize, has_override: bool) usize {
         if (!has_override and isGemma26A4BMoeShape(cfg) and prompt_len == 20 and base_chunk == 4) {
             // Preserve the five-CB shape that won for the 20-token chat oracle,
-            // but move the first commit another token earlier without growing
-            // the final queue drain: 2,4,4,5,5.
-            if (token_idx == 0) return 2;
+            // but start GPU work after the first token while keeping the same
+            // five-token final queue drain: 1,4,5,5,5.
+            if (token_idx == 0) return 1;
+            if (token_idx == 5) return 5;
             if (token_idx == 10) return 5;
             if (token_idx == 15) return 5;
         }
