@@ -5505,6 +5505,10 @@ pub const InferenceEngine = struct {
     fn defaultGemma26QueuedTokenMajorAsyncChunkTokens(cfg: ModelConfig, prompt_len: usize) usize {
         if (!isGemma26A4BMoeShape(cfg)) return 1;
         if (prompt_len < 4) return 1;
+        // The 20-token Gemma chat verifier currently lands on five 4-token
+        // command buffers. Try one fewer queue submission for the exact short
+        // chat shape without reopening the known-bad 8-token basin.
+        if (prompt_len >= 17 and prompt_len <= 20) return 5;
         return 4;
     }
 
