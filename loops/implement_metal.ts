@@ -137,6 +137,14 @@ const STALL_THRESHOLD = 5; // Cycles without tok/s improvement before studying r
 const RECENT_PROGRESS_WINDOW = 10;
 const QWEN36_PLATEAU_STALL_CYCLES = 20;
 const QWEN36_PLATEAU_WINDOW = 32;
+const AUTO_STOP_PLATEAU = parseBoolEnv("ZINC_AUTO_STOP_PLATEAU", true);
+const AUTO_STOP_REVERT_STREAK = parsePositiveIntEnv("ZINC_AUTO_STOP_REVERT_STREAK", 18);
+const AUTO_STOP_NO_BEST_CYCLES = parsePositiveIntEnv("ZINC_AUTO_STOP_NO_BEST_CYCLES", 20);
+const STRUCTURAL_PIVOT_REVERT_STREAK = parsePositiveIntEnv("ZINC_STRUCTURAL_PIVOT_REVERT_STREAK", 8);
+const STRUCTURAL_PIVOT_NO_BEST_CYCLES = parsePositiveIntEnv("ZINC_STRUCTURAL_PIVOT_NO_BEST_CYCLES", 12);
+const FAMILY_COOLDOWN_WINDOW = parsePositiveIntEnv("ZINC_FAMILY_COOLDOWN_WINDOW", 12);
+const FAMILY_COOLDOWN_THRESHOLD = parsePositiveIntEnv("ZINC_FAMILY_COOLDOWN_THRESHOLD", 3);
+const FINALIZE_BEST_TREE = parseBoolEnv("ZINC_FINALIZE_BEST_TREE", true);
 const TEST_TIMEOUT_MS = parsePositiveIntEnv("ZINC_TEST_TIMEOUT_MS", 120_000);
 const RUN_TIMEOUT_MS = parsePositiveIntEnv("ZINC_RUN_TIMEOUT_MS", 300_000);
 const STOP_ON_TARGET = parseBoolEnv("ZINC_STOP_ON_TARGET", true);
@@ -236,6 +244,20 @@ function isGemmaRun(state?: Pick<RunState, "effortId" | "effortFile" | "effortPl
 function isQwen36PrefillRun(
   state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan">,
 ): boolean {
+  if (!isQwen36LargeMoeRun(state)) return false;
+  const effortText = [
+    state?.effortFile ?? "",
+    state?.effortPlan ?? "",
+  ].join("\n").toLowerCase();
+  const prefill = METRIC_MODE === "prefill" ||
+    state?.effortId === 16 ||
+    effortText.includes("prefill");
+  return prefill;
+}
+
+function isQwen36LargeMoeRun(
+  state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan">,
+): boolean {
   const model = displayModelLabel().toLowerCase();
   const effortText = [
     state?.effortFile ?? "",
@@ -249,10 +271,7 @@ function isQwen36PrefillRun(
   const largeMoe = model.includes("35b") ||
     effortText.includes("35b") ||
     effortText.includes("35b-a3b");
-  const prefill = METRIC_MODE === "prefill" ||
-    state?.effortId === 16 ||
-    effortText.includes("prefill");
-  return qwen36 && largeMoe && prefill && !isGemmaRun(state);
+  return qwen36 && largeMoe && !isGemmaRun(state);
 }
 
 function promptTrunc(s: string, max: number): string {
@@ -469,6 +488,156 @@ function recentRoutePackCooldown(state: RunState): { active: boolean; count: num
   const recent = state.cycles.slice(-window);
   const count = recent.filter(c => !c.kept && isRoutePackOrSharedGateWork(c)).length;
   return { active: count >= 2, count, window };
+}
+
+function bestKeptCorrectCycle(state: Pick<RunState, "cycles">): CycleResult | null {
+  let best: CycleResult | null = null;
+  for (const cycle of state.cycles) {
+    if (!cycle.kept || !cycle.containsReference || cycle.tokPerSec == null) continue;
+    if (best == null || cycle.tokPerSec > (best.tokPerSec ?? 0)) {
+      best = cycle;
+    }
+  }
+  return best;
+}
+
+function consecutiveReverts(cycles: CycleResult[]): number {
+  let count = 0;
+  for (let i = cycles.length - 1; i >= 0; i--) {
+    if (cycles[i].kept) break;
+    count++;
+  }
+  return count;
+}
+
+export type PlateauStopDecision = {
+  stop: boolean;
+  reason: string;
+  consecutiveReverts: number;
+  cyclesSinceBest: number;
+  bestCycle: number | null;
+};
+
+export function detectAutoStopForPlateau(
+  state: Pick<RunState, "cycles">,
+  opts: { revertStreak?: number; noBestCycles?: number } = {},
+): PlateauStopDecision {
+  const revertStreak = opts.revertStreak ?? AUTO_STOP_REVERT_STREAK;
+  const noBestCycles = opts.noBestCycles ?? AUTO_STOP_NO_BEST_CYCLES;
+  const best = bestKeptCorrectCycle(state);
+  const last = state.cycles[state.cycles.length - 1];
+  const revertCount = consecutiveReverts(state.cycles);
+  const cyclesSinceBest = best && last ? Math.max(0, last.cycle - best.cycle) : 0;
+
+  if (revertCount >= revertStreak) {
+    return {
+      stop: true,
+      reason: `${revertCount} consecutive reverted cycles`,
+      consecutiveReverts: revertCount,
+      cyclesSinceBest,
+      bestCycle: best?.cycle ?? null,
+    };
+  }
+
+  if (best && cyclesSinceBest >= noBestCycles) {
+    return {
+      stop: true,
+      reason: `${cyclesSinceBest} cycles since promoted-best cycle ${best.cycle}`,
+      consecutiveReverts: revertCount,
+      cyclesSinceBest,
+      bestCycle: best.cycle,
+    };
+  }
+
+  return {
+    stop: false,
+    reason: "",
+    consecutiveReverts: revertCount,
+    cyclesSinceBest,
+    bestCycle: best?.cycle ?? null,
+  };
+}
+
+export function classifyAttemptFamilies(cycle: CycleResult): string[] {
+  const text = [
+    cycle.description,
+    cycle.selfAnalysis,
+    cycle.outputText,
+    ...cycle.nextIdeas,
+  ].join("\n").toLowerCase();
+  const families: string[] = [];
+  if (/simd_sum|shuffle|lane[- ]parallel|float[248]|writeback/.test(text)) families.push("simd_sum/reduction packing");
+  if (/q8|repack|fixed[- ]?k|tg128|k=2048|k=4096/.test(text)) families.push("Q8/repacked shape retune");
+  if (/router|topk|top-?k|shared[- ]?gate|route[- ]?pack|moe[- ]?route/.test(text)) families.push("router/shared-gate");
+  if (/ssm|delta|conv1?d|gated[-_ ]?norm/.test(text)) families.push("SSM recurrent/projection");
+  if (/barrier|encoder|command|commit|wait|dispatch|batch/.test(text)) families.push("command/barrier scheduling");
+  if (/lm[- ]?head|argmax|logits/.test(text)) families.push("final/logits tail");
+  if (families.length === 0) families.push("uncategorized");
+  return [...new Set(families)];
+}
+
+export function buildFamilyCooldownDirective(
+  state: Pick<RunState, "cycles">,
+  windowSize: number = FAMILY_COOLDOWN_WINDOW,
+  threshold: number = FAMILY_COOLDOWN_THRESHOLD,
+): string[] {
+  const recent = state.cycles.slice(-windowSize);
+  if (recent.length < threshold) return [];
+
+  const stats = new Map<string, { kept: number; reverted: number }>();
+  for (const cycle of recent) {
+    for (const family of classifyAttemptFamilies(cycle)) {
+      const entry = stats.get(family) ?? { kept: 0, reverted: 0 };
+      if (cycle.kept) entry.kept++;
+      else entry.reverted++;
+      stats.set(family, entry);
+    }
+  }
+
+  const active = [...stats.entries()]
+    .filter(([, s]) => s.reverted >= threshold && s.kept === 0)
+    .sort((a, b) => b[1].reverted - a[1].reverted);
+  if (active.length === 0) return [];
+
+  const lines: string[] = [];
+  lines.push(`## ⚠ FAMILY COOLDOWN — repeated reverted variants need fresh evidence`);
+  lines.push(
+    `In the last ${recent.length} cycles, these families reverted repeatedly with no kept win: ` +
+      active.map(([family, s]) => `${family}=${s.reverted} reverted/0 kept`).join(", ") + ".",
+  );
+  lines.push("- Do not try another member of a cooled-down family unless the cycle first adds or cites fresh profile/microbench/validator evidence naming the exact shader, shape, or barrier bucket.");
+  lines.push("- A valid next cycle can be `@@@STEP_KIND: analysis` or `@@@STEP_KIND: enablement` if it builds the missing evidence; a same-family optimization without new evidence should be reverted by the harness.");
+  return lines;
+}
+
+export function buildStructuralPivotDirective(state: RunState): string[] {
+  if (state.cycles.length === 0) return [];
+  const stopLike = detectAutoStopForPlateau(state, {
+    revertStreak: STRUCTURAL_PIVOT_REVERT_STREAK,
+    noBestCycles: STRUCTURAL_PIVOT_NO_BEST_CYCLES,
+  });
+  if (!stopLike.stop && state.stalledCycles < QWEN36_PLATEAU_STALL_CYCLES) return [];
+
+  const best = bestKeptCorrectCycle(state);
+  const current = currentAcceptedTokPerSec(state);
+  const lines: string[] = [];
+  lines.push("## ⚠ HARD PIVOT MODE — local retunes are exhausted");
+  if (best) {
+    lines.push(
+      `Best kept result is cycle ${best.cycle} at ${(best.tokPerSec ?? 0).toFixed(2)} ${METRIC_LABEL}; current accepted tree is ${current.toFixed(2)} ${METRIC_LABEL}; ${stopLike.cyclesSinceBest} cycles have passed without a new promoted best.`,
+    );
+  }
+  if (stopLike.consecutiveReverts > 0) {
+    lines.push(`Current tail: ${stopLike.consecutiveReverts} consecutive reverted cycles.`);
+  }
+  if (isQwen36LargeMoeRun(state)) {
+    lines.push("- For Qwen3.6 35B, stop spending cycles on another `simd_sum`, lane-writeback, threadgroup-size, or narrow Q8 sibling variant unless a fresh profile names that exact kernel as the top remaining cost.");
+    lines.push("- Pick one structural lever: MoE finalizer/barrier fusion, per-token command-buffer batching, expert dispatch/buffer fusion, or a measurement foundation that directly quantifies one of those buckets.");
+  } else {
+    lines.push("- Stop spending cycles on local arithmetic cleanup. Pick a scheduler/fusion/measurement change that can alter a named hot bucket, or explicitly mark the step as analysis.");
+  }
+  lines.push("- If the next change is not expected to move at least the promotion band, label it `@@@STEP_KIND: analysis` or `@@@STEP_KIND: enablement` and state the exact speed path it unlocks.");
+  return lines;
 }
 
 export function buildQwen36PrefillPlateauAnalysis(state: RunState): string[] {
@@ -2105,6 +2274,18 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     diagnosis.push(...diversityLines);
   }
 
+  const familyCooldownLines = buildFamilyCooldownDirective(state);
+  if (familyCooldownLines.length > 0) {
+    diagnosis.push("");
+    diagnosis.push(...familyCooldownLines);
+  }
+
+  const structuralPivotLines = buildStructuralPivotDirective(state);
+  if (structuralPivotLines.length > 0) {
+    diagnosis.push("");
+    diagnosis.push(...structuralPivotLines);
+  }
+
   // Cross-effort guard status. When a baseline exists, surface the latest
   // measurement so the agent sees whether their changes are quietly regressing
   // the other metric. Escalated wording when regression ≥ 5%.
@@ -2415,6 +2596,18 @@ export type CycleResult = {
   stepKind?: StepKind;
   selfAnalysis: string;
   nextIdeas: string[];
+  /// Accepted git commit after this cycle's keep commit. Null/absent for
+  /// reverted cycles and older state files.
+  commitHash?: string | null;
+  /// True when this kept cycle promoted the all-time best throughput, not just
+  /// a neutral/foundation keep.
+  promotedBest?: boolean;
+};
+
+export type BestTree = {
+  cycle: number;
+  tokPerSec: number;
+  commitHash: string;
 };
 
 /**
@@ -2442,6 +2635,9 @@ export type RunState = {
   currentBest: { tokPerSec: number | null; containsReference: boolean } | null;
   stalledCycles: number;
   bestTokPerSec: number;
+  /// Git commit for the fastest promoted-best tree. Used at loop end to restore
+  /// the worktree if later neutral keeps left HEAD slower than the peak.
+  bestTree?: BestTree | null;
   /// Fastest reverted-for-correctness measurement; see {@link NearMiss}.
   bestIncorrect?: NearMiss | null;
   lastProfileOutput: string | null;
@@ -2498,6 +2694,62 @@ async function loadEffortPlan(effort: number): Promise<{ file: string; plan: str
 
 async function saveState(runDir: string, state: RunState): Promise<void> {
   await writeFile(join(runDir, "state.json"), JSON.stringify(state, null, 2));
+}
+
+export function shouldFinalizeBestTree(
+  state: Pick<RunState, "bestTree" | "currentBest">,
+  currentHead: string,
+): { finalize: boolean; reason: string } {
+  const bestTree = state.bestTree;
+  if (!bestTree || !bestTree.commitHash) return { finalize: false, reason: "no promoted-best commit recorded" };
+  if (currentHead.trim() === bestTree.commitHash.trim()) return { finalize: false, reason: "already at promoted-best commit" };
+  const currentTps = state.currentBest?.containsReference ? (state.currentBest.tokPerSec ?? 0) : 0;
+  if (currentTps >= bestTree.tokPerSec - 0.05) {
+    return { finalize: false, reason: "current tree is within 0.05 tok/s of promoted best" };
+  }
+  return {
+    finalize: true,
+    reason: `current tree ${currentTps.toFixed(2)} is below promoted-best cycle ${bestTree.cycle} at ${bestTree.tokPerSec.toFixed(2)}`,
+  };
+}
+
+async function backfillBestTreeCommitFromGit(state: RunState): Promise<void> {
+  if (state.bestTree?.commitHash) return;
+  const best = bestKeptCorrectCycle(state);
+  if (!best || best.tokPerSec == null) return;
+  if (best.commitHash) {
+    state.bestTree = { cycle: best.cycle, tokPerSec: best.tokPerSec, commitHash: best.commitHash };
+    return;
+  }
+  const grep = `metal-loop: cycle-${best.cycle} `;
+  const found = await runCommand("git", ["log", "--format=%H", "--grep", grep, "-1"]).catch(() => null);
+  const commitHash = found?.stdout.trim();
+  if (commitHash) {
+    state.bestTree = { cycle: best.cycle, tokPerSec: best.tokPerSec, commitHash };
+  }
+}
+
+async function finalizeBestTreeIfNeeded(runDir: string, state: RunState): Promise<void> {
+  if (!FINALIZE_BEST_TREE) return;
+  if (!state.bestTree?.commitHash) return;
+  const head = await runCommand("git", ["rev-parse", "HEAD"]).catch(() => null);
+  const currentHead = head?.stdout.trim() ?? "";
+  const decision = shouldFinalizeBestTree(state, currentHead);
+  if (!decision.finalize) {
+    console.log(clr("2", `  best-tree finalize skipped: ${decision.reason}`));
+    return;
+  }
+
+  const best = state.bestTree;
+  console.log(clr("1;35", `  ↩ Restoring promoted-best tree from cycle ${best.cycle} (${best.tokPerSec.toFixed(2)} ${METRIC_LABEL})...`));
+  await runCommand("git", ["restore", "--source", best.commitHash, "--staged", "--worktree", "--", ...LOOP_COMMIT_PATHS]);
+  const status = await runCommand("git", ["status", "--porcelain", "--", ...LOOP_COMMIT_PATHS]);
+  if (status.stdout.trim().length > 0) {
+    await runCommand("git", ["add", "-A", ...LOOP_COMMIT_PATHS]).catch(() => {});
+    await runCommand("git", ["commit", "-m", `metal-loop: finalize best tree from cycle ${best.cycle} (${best.tokPerSec.toFixed(1)} ${METRIC_LABEL})`]).catch(() => {});
+  }
+  state.currentBest = { tokPerSec: best.tokPerSec, containsReference: true };
+  await saveState(runDir, state);
 }
 
 async function runProfileBenchmark(): Promise<string> {
@@ -2921,11 +3173,13 @@ async function main() {
     state.effortPlan ??= null;
     state.effortId ??= null;
     state.effortFile ??= null;
+    state.bestTree ??= null;
     state.bestIncorrect ??= null;
     state.lastNearMissDiagnostic ??= null;
     state.crossEffortBaseline ??= null;
     state.lastCrossEffort ??= null;
     normalizeStateBestTokPerSec(state);
+    await backfillBestTreeCommitFromGit(state);
     // Seed the near-miss target from history for runs predating bestIncorrect.
     if (backfillNearMiss(state) && state.bestIncorrect) {
       console.log(clr("1;35", `  ◎ Backfilled near-miss from cycle ${state.bestIncorrect.cycle}: ${state.bestIncorrect.tokPerSec.toFixed(1)} ${METRIC_LABEL} (+${state.bestIncorrect.gainPctOverAccepted.toFixed(1)}% over best kept-correct, output broke to "${state.bestIncorrect.outputText}")`));
@@ -2973,6 +3227,7 @@ async function main() {
       currentBest: null,
       stalledCycles: 0,
       bestTokPerSec: 0,
+      bestTree: null,
       lastProfileOutput: null,
       lastProfileCycle: null,
       lastNearMissDiagnostic: null,
@@ -3078,6 +3333,8 @@ async function main() {
 
     // Keep/revert decision — tight for optimization
     let kept = false;
+    let promotedBest = false;
+    let acceptedCommitHash: string | null = null;
     const baselines = keepBaselinesForCycle(state, result);
     const bestTps = baselines.bestTokPerSec;
     const acceptedTps = baselines.acceptedTokPerSec;
@@ -3159,6 +3416,7 @@ async function main() {
     } else if (verify.containsReference && verifyTps > bestTps + improveBand) {
       // Meaningful speed improvement with correct output
       kept = true;
+      promotedBest = true;
       state.bestTokPerSec = verifyTps;
       state.stalledCycles = 0;
       console.log(clr("1;32", `  ✅ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (best was ${bestTps.toFixed(2)}, +${(verifyTps - bestTps).toFixed(2)}; band +${improveBand.toFixed(2)})`));
@@ -3193,6 +3451,7 @@ async function main() {
     } else if (verify.containsReference && !state.currentBest?.containsReference) {
       // Gained correctness for the first time
       kept = true;
+      promotedBest = true;
       state.bestTokPerSec = verifyTps;
       state.stalledCycles = 0;
       console.log(clr("1;32", `  ✅ KEPT — gained correct output! ${verifyTps.toFixed(2)} ${METRIC_LABEL}`));
@@ -3230,6 +3489,15 @@ async function main() {
       };
       await runCommand("git", ["add", "-A", ...LOOP_COMMIT_PATHS]).catch(() => {});
       await runCommand("git", ["commit", "-m", `metal-loop: cycle-${cycle} ${description} (${verifyTps.toFixed(1)} ${METRIC_LABEL})`]).catch(() => {});
+      const acceptedHead = await runCommand("git", ["rev-parse", "HEAD"]).catch(() => null);
+      acceptedCommitHash = acceptedHead?.stdout.trim() ?? null;
+      if (promotedBest && acceptedCommitHash && verify.tokPerSec != null) {
+        state.bestTree = {
+          cycle,
+          tokPerSec: verify.tokPerSec,
+          commitHash: acceptedCommitHash,
+        };
+      }
     }
 
     // Periodic profiling run (after verify, so we profile the current accepted state)
@@ -3316,6 +3584,8 @@ async function main() {
       selfAnalysis,
       stepKind,
       nextIdeas: newIdeas,
+      commitHash: acceptedCommitHash,
+      promotedBest,
     };
 
     state.cycles.push(cycleResult);
@@ -3344,7 +3614,22 @@ async function main() {
       console.log(clr("1;32", "=".repeat(64)));
       break;
     }
+
+    if (AUTO_STOP_PLATEAU) {
+      const plateauStop = detectAutoStopForPlateau(state);
+      if (plateauStop.stop) {
+        console.log(clr("1;35", "\n" + "=".repeat(64)));
+        console.log(clr("1;35", `  PLATEAU AUTO-STOP: ${plateauStop.reason}`));
+        if (plateauStop.bestCycle != null) {
+          console.log(clr("1;35", `  Best promoted cycle: ${plateauStop.bestCycle}; cycles since best: ${plateauStop.cyclesSinceBest}; consecutive reverts: ${plateauStop.consecutiveReverts}`));
+        }
+        console.log(clr("1;35", "=".repeat(64)));
+        break;
+      }
+    }
   }
+
+  await finalizeBestTreeIfNeeded(runDir, state);
 
   console.log(clr("1;36", `\nLoop complete. Results: ${runDir}`));
   console.log(clr("1;36", `Total cycles: ${state.cycles.length}`));

@@ -4,9 +4,13 @@ import {
   backfillNearMiss,
   bestKeptCorrectTokPerSec,
   buildCrossEffortStatus,
+  buildFamilyCooldownDirective,
   buildNearMissDirective,
   buildStepKindDiversityNudge,
+  buildStructuralPivotDirective,
+  classifyAttemptFamilies,
   countNearMissFamilyReverts,
+  detectAutoStopForPlateau,
   noiseAwareImproveBand,
   parseDiagnosticEnv,
   buildPrompt,
@@ -24,6 +28,7 @@ import {
   recentAcceptedProgress,
   recordNearMiss,
   shouldConfirmCandidate,
+  shouldFinalizeBestTree,
   shouldRejectQwen36PlateauNeutralKeep,
   snapshotFromResult,
 } from "./implement_metal";
@@ -1424,6 +1429,115 @@ describe("buildStepKindDiversityNudge", () => {
     ];
     const lines = buildStepKindDiversityNudge({ cycles });
     expect(lines.length).toBeGreaterThan(0); // fires: 9 opt + 1 fix (not analysis)
+  });
+});
+
+// ── plateau stop / cooldown / finalization ─────────────────────────
+
+describe("plateau controls", () => {
+  test("auto-stop fires after a long consecutive revert streak", () => {
+    const cycles = [
+      makeCycle({ cycle: 83, kept: true, containsReference: true, tokPerSec: 82.1 }),
+      ...Array.from({ length: 18 }, (_, idx) =>
+        makeCycle({ cycle: 84 + idx, kept: false, containsReference: true, tokPerSec: 79.8 }),
+      ),
+    ];
+    const decision = detectAutoStopForPlateau({ cycles }, { revertStreak: 18, noBestCycles: 40 });
+    expect(decision.stop).toBe(true);
+    expect(decision.reason).toContain("18 consecutive");
+    expect(decision.bestCycle).toBe(83);
+  });
+
+  test("auto-stop fires when no promoted best appears for the configured window", () => {
+    const cycles = [
+      makeCycle({ cycle: 83, kept: true, containsReference: true, tokPerSec: 82.1 }),
+      ...Array.from({ length: 20 }, (_, idx) =>
+        makeCycle({
+          cycle: 84 + idx,
+          kept: idx < 5,
+          containsReference: true,
+          tokPerSec: idx < 5 ? 81.4 : 79.8,
+        }),
+      ),
+    ];
+    const decision = detectAutoStopForPlateau({ cycles }, { revertStreak: 99, noBestCycles: 20 });
+    expect(decision.stop).toBe(true);
+    expect(decision.reason).toContain("20 cycles since promoted-best");
+  });
+
+  test("classifies simd_sum and Q8 repacked families", () => {
+    const families = classifyAttemptFamilies(makeCycle({
+      description: "Pack two simd_sum reductions in dmmv_q8_0_repacked_k2048_nr2_qwen.metal",
+    }));
+    expect(families).toContain("simd_sum/reduction packing");
+    expect(families).toContain("Q8/repacked shape retune");
+  });
+
+  test("family cooldown blocks repeated reverted variants without a kept win", () => {
+    const state = makeState({
+      cycles: Array.from({ length: 4 }, (_, idx) =>
+        makeCycle({
+          cycle: 100 + idx,
+          kept: false,
+          containsReference: true,
+          tokPerSec: 79.8,
+          description: "Another simd_sum(float2) pack in a Q8 repacked sibling",
+        }),
+      ),
+    });
+    const lines = buildFamilyCooldownDirective(state, 4, 3).join("\n");
+    expect(lines).toContain("FAMILY COOLDOWN");
+    expect(lines).toContain("simd_sum/reduction packing");
+    expect(lines).toContain("fresh profile");
+  });
+
+  test("structural pivot directive appears for Qwen36 decode plateau", () => {
+    const state = makeState({
+      effortId: 5,
+      effortFile: "MULTI_HOUR_EFFORT_5_METAL_QWEN36_LOCAL_DECODE.md",
+      effortPlan: "# Effort 5\nQwen3.6 35B local Metal decode",
+      currentBest: { tokPerSec: 81.1, containsReference: true },
+      stalledCycles: 18,
+      cycles: [
+        makeCycle({ cycle: 83, kept: true, containsReference: true, tokPerSec: 82.1 }),
+        ...Array.from({ length: 12 }, (_, idx) =>
+          makeCycle({
+            cycle: 84 + idx,
+            kept: false,
+            containsReference: true,
+            tokPerSec: 79.8,
+            description: "Agent made another simd_sum Q8 shader variant",
+          }),
+        ),
+      ],
+    });
+    const lines = buildStructuralPivotDirective(state).join("\n");
+    expect(lines).toContain("HARD PIVOT MODE");
+    expect(lines).toContain("MoE finalizer/barrier fusion");
+    expect(lines).toContain("command-buffer batching");
+  });
+
+  test("best-tree finalization restores when current accepted tree is below promoted best", () => {
+    const decision = shouldFinalizeBestTree(
+      {
+        bestTree: { cycle: 83, tokPerSec: 82.1, commitHash: "best" },
+        currentBest: { tokPerSec: 81.1, containsReference: true },
+      },
+      "head",
+    );
+    expect(decision.finalize).toBe(true);
+    expect(decision.reason).toContain("cycle 83");
+  });
+
+  test("best-tree finalization skips when already at the promoted commit", () => {
+    const decision = shouldFinalizeBestTree(
+      {
+        bestTree: { cycle: 83, tokPerSec: 82.1, commitHash: "best" },
+        currentBest: { tokPerSec: 81.1, containsReference: true },
+      },
+      "best",
+    );
+    expect(decision.finalize).toBe(false);
   });
 });
 
