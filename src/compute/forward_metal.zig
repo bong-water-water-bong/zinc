@@ -5691,14 +5691,14 @@ pub const InferenceEngine = struct {
 
     fn queuedTokenMajorAsyncChunkLen(cfg: ModelConfig, prompt_len: usize, token_idx: usize, base_chunk: usize, has_override: bool) usize {
         if (!has_override and isGemma26A4BMoeShape(cfg) and prompt_len == 20 and base_chunk == 4) {
-            // Keep the GPU starting after one token, but test a four-CB tail now
-            // that the fused F32 router reduced per-token command-record pressure.
-            // The previous accepted five-CB shape was 1,5,5,5,4; this keeps the
-            // same early-start point while trimming one command-buffer boundary.
+            // Keep the GPU starting after one token, then slightly front-load the
+            // first async tail chunk. The current profile is final-wait dominated,
+            // so this tests whether a larger second command gives the GPU more
+            // useful work before the final chunk blocks.
             if (token_idx == 0) return 1;
-            if (token_idx == 1) return 6;
-            if (token_idx == 7) return 6;
-            if (token_idx == 13) return 7;
+            if (token_idx == 1) return 7;
+            if (token_idx == 8) return 6;
+            if (token_idx == 14) return 6;
         }
         return base_chunk;
     }
@@ -26112,7 +26112,7 @@ test "gemma26 exact 20 token prefill keeps accepted queued split" {
     const base_chunk = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 20, null);
     try std.testing.expectEqual(@as(usize, 4), base_chunk);
 
-    const expected = [_]usize{ 1, 6, 6, 7 };
+    const expected = [_]usize{ 1, 7, 6, 6 };
     var token_idx: usize = 0;
     for (expected) |chunk_len| {
         const actual = InferenceEngine.queuedTokenMajorAsyncChunkLen(gemma_cfg, 20, token_idx, base_chunk, false);
