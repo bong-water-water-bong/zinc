@@ -18627,6 +18627,25 @@ fn submitPendingDenseCommand(
     };
 }
 
+fn shouldSkipFinalPromptTail(
+    cfg: ModelConfig,
+    using_external_shared_cmd: bool,
+    emit_logits: bool,
+    layer_idx: usize,
+    layer_count: usize,
+) bool {
+    if (!using_external_shared_cmd or emit_logits or layer_idx + 1 != layer_count) return false;
+
+    // Adapt llama.cpp's graph materialization discipline: non-terminal prompt
+    // tokens only need the last layer's K/V cache rows, not the final hidden
+    // state or logits. Qwen SSM already used this path; Gemma26 MoE has all
+    // layers in full-attention form, so the same final-layer K/V-only tail is
+    // valid for queued prefill while leaving decode untouched.
+    if (cfg.architecture == .qwen2_moe and cfg.ssm_d_inner != 0) return true;
+    if (isGemma26A4BMoeShape(cfg)) return true;
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Decode step — runs all layers plus optional final norm + LM head.
 // ---------------------------------------------------------------------------
@@ -18815,11 +18834,7 @@ fn runDecodeStep(
             const layer_record_start = profileStart(profile != null);
             var qwen_moe_validation_ref: ?QwenPrefillMoeValidationRef = null;
             defer if (qwen_moe_validation_ref) |*validation| validation.deinit(engine.allocator);
-            const skip_final_prompt_tail = using_external_shared_cmd and
-                !emit_logits and
-                layer_idx + 1 == layer_count and
-                cfg.architecture == .qwen2_moe and
-                cfg.ssm_d_inner != 0;
+            const skip_final_prompt_tail = shouldSkipFinalPromptTail(cfg, using_external_shared_cmd, emit_logits, layer_idx, layer_count);
             const fuse_final_tail_attn_norm =
                 skip_final_prompt_tail and
                 !prev_fused_attn_norm and
@@ -26331,6 +26346,37 @@ test "gemma26 exact 20 token prefill keeps accepted queued split" {
         token_idx += actual;
     }
     try std.testing.expectEqual(@as(usize, 20), token_idx);
+}
+
+test "gemma26 queued prefill can skip nonterminal final layer tail" {
+    const gemma_cfg = ModelConfig{
+        .architecture = .gemma,
+        .n_layers = 30,
+        .n_heads = 16,
+        .n_kv_heads = 8,
+        .head_dim = 512,
+        .hidden_dim = 2816,
+        .intermediate_dim = 704,
+        .vocab_size = 0,
+        .context_length = 0,
+        .rope_freq_base = 1_000_000.0,
+        .rope_freq_base_swa = 10_000.0,
+        .n_experts = 128,
+        .n_experts_used = 8,
+        .rope_dim = 512,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 2112,
+    };
+
+    try std.testing.expect(shouldSkipFinalPromptTail(gemma_cfg, true, false, 29, 30));
+    try std.testing.expect(!shouldSkipFinalPromptTail(gemma_cfg, true, true, 29, 30));
+    try std.testing.expect(!shouldSkipFinalPromptTail(gemma_cfg, true, false, 28, 30));
+    try std.testing.expect(!shouldSkipFinalPromptTail(gemma_cfg, false, false, 29, 30));
 }
 
 test "gemma26 q8 explicit moe layer can break shared command at fallback boundary" {
