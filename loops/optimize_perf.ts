@@ -222,8 +222,13 @@ const LONG_CONTEXT_DECODE_PROMPT = [
 const GEMMA_LONG_DECODE_PROMPT =
   "Write six short bullet points explaining why local LLM benchmark reports should separate prefill throughput from decode throughput.";
 
+const LONG_CODING_PLAN_PROMPT =
+  "Write an implementation plan for adding a stable benchmark preset to a local LLM CLI. Include the command shape, warmup policy, metrics to collect, failure handling, llama.cpp comparison, and how the site should display prefill, decode, latency, and overall prompt+decode throughput.";
+
+const GEMMA_LONG_DRAFT_PREFILL_PROMPT = LONG_CODING_PLAN_PROMPT;
+
 const QWEN35_9B_LONG_DRAFT_PREFILL_PROMPT =
-  "Write an implementation plan for adding a stable benchmark preset to a local LLM CLI. Include the command shape, warmup policy, metrics to collect, failure handling, llama.cpp comparison, and how the site should display prefill, decode, latency, and overall prompt+decode throughput.\n\nPlan:\n1.";
+  `${LONG_CODING_PLAN_PROMPT}\n\nPlan:\n1.`;
 
 type MetricMode = "decode" | "prefill";
 
@@ -664,6 +669,110 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       { scenario: "decode-extended",   prefillTokPerSec: 855.82, decodeTokPerSec: 84.96, isPrimary: true },
     ],
     llamaCppSuccessRule: "Project success rule (from MULTI_HOUR_EFFORT_17_RDNA_QWEN35_9B_PREFILL.md): close the Qwen3.5-9B RDNA prefill gap without giving back ZINC's decode lead. Primary target is decode-extended prefill, where llama.cpp is 855.82 tok/s and ZINC is 105.91 tok/s in the published artifact. A keep must preserve coherent output and should be checked against core/context-medium/context-long before being treated as public progress.",
+  },
+  18: {
+    doc: "MULTI_HOUR_EFFORT_18_RDNA_GEMMA26_PREFILL.md",
+    summary: "RDNA4 Gemma 4 26B-A4B MoE prefill parity with llama.cpp",
+    metricMode: "prefill",
+    primaryMetricLabel: "Gemma 4 26B-A4B long-draft prefill tok/s",
+    defaultModel: "gemma426ba4b",
+    benchmarkPrompt: GEMMA_LONG_DRAFT_PREFILL_PROMPT,
+    benchmarkMaxTokens: 8,
+    benchmarkMethod: "site-aligned decode-extended Long Coding Draft prefill benchmark on RDNA for Gemma 4 26B-A4B MoE Q4_K_M; run with --model gemma426ba4b",
+    minHealthyTokPerSec: 40,
+    knownFlatCategories: [
+      "Do not chase decode first. Gemma 26B decode is still below llama.cpp, but this effort exists for the larger prefill gap: 92.68 tok/s ZINC vs 647.16 tok/s llama.cpp on the published long-draft scenario.",
+      "Do not repeat generic single-token DMMV micro-tuning as the first lever. A 7x long-draft prefill gap on an MoE model is an expert grouping / batching problem, not a 1-2% matvec cleanup problem.",
+      "Do not treat Effort 13's decode-time Gemma MoE plan as sufficient. Decode top-k <= 8 can use matvec-ID; prefill needs token-grouped expert work across N prompt tokens, with selected-token compaction and scatter/accumulate back to each token.",
+      "Do not bypass Gemma semantics to make the fast path fit. pre_ffw_norm_2, ffn_gate_inp.scale, fused ffn_gate_up_exps, ffn_down_exps.scale, post_ffw_norm_1/2, and post_ffw_norm are correctness requirements.",
+      "Do not spend cycles re-opening the old Effort 9 Gemma attention validate bugs unless a fresh validator points there. The remaining published gap is after Gemma batched prefill was enabled; the MoE bucket is the likely untreated structural cost.",
+    ],
+    structuralSwingIdeas: [
+      "First prove the active buckets. Run Gemma 26B long-draft prefill with ZINC_PREFILL_PROFILE=1 and record prefill_moe/router/topk/gate_up/swiglu/down/weighted_acc/shared buckets plus cpu_moe_fallbacks. If MoE is not a top bucket, update this effort before changing kernels.",
+      "Build a Gemma MoE prefill validator before enabling production. Capture token-major reference outputs for one MoE layer over a short prompt, then compare GPU top-k IDs/weights, fused gate/up outputs, down outputs, per-token weighted accumulation, post norms, and final logits.",
+      "Move router/top-k fully on GPU for all prompt tokens. Reuse dispatchSoftmaxTopk only if it matches Gemma's scaled router semantics and selected-only normalization. Keep the CPU fallback as the actual output path until IDs and weights match.",
+      "Group prompt tokens by selected expert. The target dataflow is count_experts -> prefix offsets -> compact (token, topk_slot, weight) pairs by expert -> one batched gate/up operation per active expert group -> activation -> one batched down operation -> scatter weighted outputs back to the original token rows.",
+      "Support fused ffn_gate_up_exps in the grouped path. Either bind the same expert tensor with an up-base descriptor offset or write a Gemma-specific batched fused-gate-up shader with an up_base_offset push constant. Do not split/copy the 26B expert weights.",
+      "After correctness, choose between a lighter matvec-ID-style grouped path and a tiled GEMM path based on token count. Core has ~49 ZINC prompt tokens and long-draft has ~70; context-medium/context-long have ~192/346. A single threshold is probably wrong.",
+      "Only after grouped MoE is coherent, test Q4_K x Q8_1 activation quant on the exact Gemma expert shapes. It is a measured follow-up, not the first lever.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/src/llama-graph.cpp",
+        focus: "Search for build_moe_ffn. This is the graph-side reference for Gemma router scaling, top-k, fused gate_up_exps, selected weights, and per-expert scales.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        focus: "Search for ggml_vk_topk_moe, ggml_vk_mul_mat_id, count_experts, and grouped MoE dispatch selection. Decode matvec-ID is useful background, but this effort needs the prefill/batched-token shape.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_13_RDNA_GEMMA_LONG_DECODE.md",
+        focus: "Gemma MoE semantic checklist. Reuse the correctness requirements, but do not stop at decode-time matvec-ID.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_9_RDNA_GEMMA_BATCHED_PREFILL.md",
+        focus: "Historical Gemma batched prefill correctness bugs: V RMS norm, use_k_as_v, asymmetric head dims, post norms, and SWA handling.",
+      },
+    ],
+    llamaCppBaselines: [
+      { scenario: "core",              prefillTokPerSec: 497.08, decodeTokPerSec: 102.00 },
+      { scenario: "context-medium",    prefillTokPerSec: 186.67, decodeTokPerSec: 100.84 },
+      { scenario: "context-long",      prefillTokPerSec: 169.18, decodeTokPerSec: 100.40 },
+      { scenario: "decode-extended",   prefillTokPerSec: 647.16, decodeTokPerSec: 101.05, isPrimary: true },
+    ],
+    llamaCppSuccessRule: "Project success rule (from MULTI_HOUR_EFFORT_18_RDNA_GEMMA26_PREFILL.md): close the Gemma 4 26B-A4B RDNA prefill gap on all four public scenarios while preserving Gemma-specific correctness. Primary target is decode-extended prefill, where llama.cpp is 647.16 tok/s and ZINC is 92.68 tok/s in the published artifact. Core prefill is also a major target at 497.08 tok/s llama.cpp vs 89.10 tok/s ZINC.",
+  },
+  19: {
+    doc: "MULTI_HOUR_EFFORT_19_RDNA_GEMMA31_PREFILL.md",
+    summary: "RDNA4 Gemma 4 31B dense prefill parity with llama.cpp",
+    metricMode: "prefill",
+    primaryMetricLabel: "Gemma 4 31B long-draft prefill tok/s",
+    defaultModel: "gemma431b",
+    benchmarkPrompt: GEMMA_LONG_DRAFT_PREFILL_PROMPT,
+    benchmarkMaxTokens: 8,
+    benchmarkMethod: "site-aligned decode-extended Long Coding Draft prefill benchmark on RDNA for Gemma 4 31B dense Q4_K_M; run with --model gemma431b",
+    minHealthyTokPerSec: 20,
+    knownFlatCategories: [
+      "Do not optimize Gemma 26B MoE work inside this effort. Gemma 31B is dense; the prefill gap is dense projection batching, attention, and fixed overhead, not expert routing.",
+      "Do not chase context-medium/context-long first. ZINC already beats llama.cpp on those prefill scenarios in the published matrix. The exposed gaps are core (41.64 vs 201.97) and long-draft (49.24 vs 242.37).",
+      "Do not assume Effort 9 fully solved Gemma dense prefill. It opened the batched path and fixed major correctness bugs, but the current published short/long-draft rows remain about 5x behind llama.cpp.",
+      "Do not port Qwen shape constants or Qwen-only flags. Gemma has per-layer attention head-dim variance, post attention/FFN norms, SWA layers, and use_k_as_v behavior that the validator must preserve.",
+      "Do not micro-tune decode or LM-head work as the first move. The controller metric is prompt prefill with max_tokens=8.",
+    ],
+    structuralSwingIdeas: [
+      "First prove the current path and buckets. Run Gemma 31B long-draft and core prefill with ZINC_PREFILL_PROFILE=1. Confirm batched prefill is active, record dense_ffn/attention/qkv/o_proj/post_norm/submit overhead, and explain why 70-token long-draft remains only 49.24 tok/s.",
+      "Add or reuse a Gemma dense prefill validator that can stop after one layer and compare token-major vs batched tensors. Keep final-logit validation, but add intermediate checks for full-attn layers, SWA layers, post_attention_norm, post_ffw_norm, and use_k_as_v.",
+      "Replace per-token-shaped batched DMMV in the hot dense projections with a true tiled Q4_K GEMM/MMQ path over prompt tokens. Priority order should follow profile evidence, likely FFN gate/up/down first, then attention Q/K/V/O.",
+      "Attack small-prompt overhead separately from long-context throughput. Core has ~49 prompt tokens and long-draft has ~70, where setup cost can dominate. Context-medium/context-long already win, so tune chunk thresholds and command-buffer construction for short prompt batches instead of only chasing 300+ token throughput.",
+      "Audit batched flash attention for Gemma's actual shapes. Full-attn layers use asymmetric Q/KV head dims while SWA layers use smaller symmetric dims. If attention is hot, prefer a shape-specific batched flash-attn path over generic shader cleanups.",
+      "Measure every production change against both long-draft and core before keeping it. A change that only helps 192/346-token prompts does not close the public gaps this effort owns.",
+      "Once a true GEMM path lands, test Q8_1 activation quant only on the profiled Gemma 31B projection shapes. Treat Q8_1 as a follow-up to structural batching, not a substitute.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_9_RDNA_GEMMA_BATCHED_PREFILL.md",
+        focus: "Historical Gemma 31B batched prefill work and correctness traps. Read before touching full-attn/SWA/post-norm handling.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        focus: "Read canUseBatchedPrefillRdna, prefillBatchedImpl, Gemma post norm branches, dispatchProjectionBatched, dispatchFlashAttnBatched, and any Gemma-specific validate paths.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/shaders/mul_mm_q4k.comp",
+        focus: "Existing tiled Q4_K GEMM reference. It is the right structural direction for prompt-token batches if profiles show DMMV-style weight rereads dominate.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan",
+        focus: "Vulkan Q4_K matmul/MMQ and Gemma graph lowering. Compare when llama.cpp chooses MMQ/GEMM vs matvec paths on small prompt-token batches.",
+      },
+    ],
+    llamaCppBaselines: [
+      { scenario: "core",              prefillTokPerSec: 201.97, decodeTokPerSec: 28.55 },
+      { scenario: "context-medium",    prefillTokPerSec: 50.01,  decodeTokPerSec: 28.19 },
+      { scenario: "context-long",      prefillTokPerSec: 46.82,  decodeTokPerSec: 28.09 },
+      { scenario: "decode-extended",   prefillTokPerSec: 242.37, decodeTokPerSec: 28.21, isPrimary: true },
+    ],
+    llamaCppSuccessRule: "Project success rule (from MULTI_HOUR_EFFORT_19_RDNA_GEMMA31_PREFILL.md): close the Gemma 4 31B RDNA prefill gaps without regressing the context-medium/context-long rows where ZINC already beats llama.cpp. Primary target is decode-extended prefill, where llama.cpp is 242.37 tok/s and ZINC is 49.24 tok/s in the published artifact. Core prefill must also move toward 201.97 tok/s.",
   },
 };
 

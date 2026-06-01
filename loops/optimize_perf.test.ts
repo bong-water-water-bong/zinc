@@ -531,6 +531,34 @@ describe("controller helpers", () => {
     expect(spec?.structuralSwingIdeas?.join("\n")).toContain("Qwen3.5-9B");
   });
 
+  test("RDNA Gemma 26B MoE effort targets grouped prefill MoE", () => {
+    const spec = getEffortSpec(18);
+    expect(spec).not.toBeNull();
+    expect(spec?.doc).toBe("MULTI_HOUR_EFFORT_18_RDNA_GEMMA26_PREFILL.md");
+    expect(spec?.primaryMetricLabel).toBe("Gemma 4 26B-A4B long-draft prefill tok/s");
+    expect(spec?.defaultModel).toBe("gemma426ba4b");
+    expect(spec?.benchmarkMethod).toContain("decode-extended Long Coding Draft");
+    expect(spec?.benchmarkPrompt).toContain("stable benchmark preset");
+    expect(spec?.benchmarkPrompt).not.toContain("Plan:\n1.");
+    expect(spec?.llamaCppBaselines?.find((b) => b.isPrimary)?.prefillTokPerSec).toBe(647.16);
+    expect(spec?.knownFlatCategories?.join("\n")).toContain("decode-time Gemma MoE");
+    expect(spec?.structuralSwingIdeas?.join("\n")).toContain("Group prompt tokens by selected expert");
+  });
+
+  test("RDNA Gemma 31B dense effort targets short-prompt dense prefill gaps", () => {
+    const spec = getEffortSpec(19);
+    expect(spec).not.toBeNull();
+    expect(spec?.doc).toBe("MULTI_HOUR_EFFORT_19_RDNA_GEMMA31_PREFILL.md");
+    expect(spec?.primaryMetricLabel).toBe("Gemma 4 31B long-draft prefill tok/s");
+    expect(spec?.defaultModel).toBe("gemma431b");
+    expect(spec?.benchmarkMethod).toContain("decode-extended Long Coding Draft");
+    expect(spec?.benchmarkPrompt).toContain("stable benchmark preset");
+    expect(spec?.benchmarkPrompt).not.toContain("Plan:\n1.");
+    expect(spec?.llamaCppBaselines?.find((b) => b.isPrimary)?.prefillTokPerSec).toBe(242.37);
+    expect(spec?.knownFlatCategories?.join("\n")).toContain("Gemma 26B MoE");
+    expect(spec?.structuralSwingIdeas?.join("\n")).toContain("true tiled Q4_K GEMM/MMQ");
+  });
+
   test("resume compatibility rejects state from older benchmark regimes", () => {
     const spec = getEffortSpec(3);
     expect(spec).not.toBeNull();
