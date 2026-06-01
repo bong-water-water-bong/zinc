@@ -128,6 +128,8 @@ void main() {
 
     const uint k_limit = (SPEC_K != 0u) ? SPEC_K : K;
     const uint blocks_per_row = k_limit / Q6K_BLOCK_SIZE;
+    const uint b_stride_packed = (SPEC_K != 0u) ? (SPEC_K / 4u) : stride_b_packed;
+    const uint b_stride_scale = (SPEC_K != 0u) ? (SPEC_K / 32u) : stride_b_scale;
 
     for (uint k_outer = 0u; k_outer < k_limit; k_outer += BK) {
         // ---- load + dequant weight half-tile (one 16-wide sub-block) ----
@@ -158,11 +160,11 @@ void main() {
             const uint sub = tid & 1u;
             const uint k_in_tile = sub * 16u;
             const uint col_global = ic * BN + col_local;
-            const uint src = col_global * stride_b_packed + ((k_outer + k_in_tile) >> 2);
+            const uint src = col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
             const uint base_b = col_local * SPACK + sub * 4u;
             [[unroll]] for (uint p = 0u; p < 4u; p++) buf_b[base_b + p] = b_packed[src + p];
             if (sub == 0u) {
-                buf_bs[col_local] = b_scale[col_global * stride_b_scale + (k_outer >> 5)];
+                buf_bs[col_local] = b_scale[col_global * b_stride_scale + (k_outer >> 5)];
             }
         }
 

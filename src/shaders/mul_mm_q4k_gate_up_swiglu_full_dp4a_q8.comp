@@ -121,6 +121,8 @@ void main() {
     const uint k_limit = (SPEC_K != 0u) ? SPEC_K : K;
     const uint a_base_u32 = a_offset / 4u;
     const uint blocks_per_row = k_limit / 256u;
+    const uint b_stride_packed = (SPEC_K != 0u) ? (SPEC_K / 4u) : stride_b_packed;
+    const uint b_stride_scale = (SPEC_K != 0u) ? (SPEC_K / 32u) : stride_b_scale;
 
     for (uint k_outer = 0u; k_outer < k_limit; k_outer += BK) {
         const uint super_block = k_outer / 256u;
@@ -191,11 +193,11 @@ void main() {
             [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
                 const uint col_local = cbase + tid / 2u;
                 const uint col_global = ic * BN + col_local;
-                const uint src = col_global * stride_b_packed + ((k_outer + k_in_tile) >> 2);
+                const uint src = col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
                 const uint base_b = col_local * SPACK + tile_half * 4u;
                 [[unroll]] for (uint w = 0u; w < 4u; w++) buf_b[base_b + w] = b_packed[src + w];
                 if (tile_half == 0u) {
-                    buf_b_sd[col_local] = b_scale_dsum[col_global * stride_b_scale + (k_outer >> 5)];
+                    buf_b_sd[col_local] = b_scale_dsum[col_global * b_stride_scale + (k_outer >> 5)];
                 }
             }
         }
