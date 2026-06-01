@@ -14014,7 +14014,7 @@ pub const InferenceEngine = struct {
     fn qwen36DensePrefillSsmLayerMajorProjEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (!self.qwen36DensePrefillSsmBatchedDeltaEnabled(n_tokens)) return false;
         if (self.elementwise.pipeline_ssm_conv1d_batched == null) return false;
-        if (self.elementwise.pipeline_dmmv_f32_dual_batch == null) return false;
+        if (self.elementwise.pipeline_dmmv_f32_dual_batch == null and self.dmmv.pipeline_q8_0 == null) return false;
         return true;
     }
 
@@ -14339,8 +14339,12 @@ pub const InferenceEngine = struct {
             lt.ssm_alpha != null and
             lt.ssm_beta != null and
             lt.ssm_conv1d != null and
-            lt.ssm_alpha.?.info.type_ == .f32 and
-            lt.ssm_beta.?.info.type_ == .f32;
+            ((lt.ssm_alpha.?.info.type_ == .f32 and
+                lt.ssm_beta.?.info.type_ == .f32 and
+                self.elementwise.pipeline_dmmv_f32_dual_batch != null) or
+                (lt.ssm_alpha.?.info.type_ == .q8_0 and
+                    lt.ssm_beta.?.info.type_ == .q8_0 and
+                    self.dmmv.pipeline_q8_0 != null));
 
         if (use_layer_major_ssm_proj) {
             const attn_norm_t = lt.attn_norm.?;
@@ -14351,6 +14355,7 @@ pub const InferenceEngine = struct {
             const conv_t = lt.ssm_conv1d.?;
             const hidden_total_bytes: vk.c.VkDeviceSize =
                 @as(vk.c.VkDeviceSize, n_tokens) * @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
+            const alpha_beta_q8 = alpha_t.info.type_ == .q8_0 and beta_t.info.type_ == .q8_0;
 
             if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
             try self.decode_cmd.reset();
@@ -14374,17 +14379,60 @@ pub const InferenceEngine = struct {
                 self.model.config.rms_norm_eps,
             );
             self.decode_cmd.computeBufferBarrier(scratch_norm.handle, hidden_total_bytes);
-            try self.dispatchF32DualBatched(
-                alpha_t,
-                beta_t,
-                scratch_norm,
-                scratch_q,
-                scratch_k,
-                dt_rank,
-                hidden_dim,
-                n_tokens,
-            );
-            self.endProfilePhase(.ssm_proj_norm_ab, ssm_proj_norm_ab_phase);
+            if (alpha_beta_q8) {
+                self.endProfilePhase(.ssm_proj_norm_ab, ssm_proj_norm_ab_phase);
+                const ssm_proj_alpha_phase = self.beginProfilePhase();
+                var ab_tok: u32 = 0;
+                while (ab_tok < n_tokens) : (ab_tok += 1) {
+                    const x_offset: u32 = @intCast(ab_tok * hidden_dim * @sizeOf(f32));
+                    const y_offset: u32 = @intCast(ab_tok * dt_rank * @sizeOf(f32));
+                    try self.dispatchDmmvInner(
+                        alpha_t,
+                        scratch_norm,
+                        scratch_norm.size,
+                        scratch_q,
+                        dt_rank,
+                        hidden_dim,
+                        0,
+                        x_offset,
+                        y_offset,
+                        0,
+                    );
+                }
+                self.endProfilePhase(.ssm_proj_alpha, ssm_proj_alpha_phase);
+
+                const ssm_proj_beta_phase = self.beginProfilePhase();
+                ab_tok = 0;
+                while (ab_tok < n_tokens) : (ab_tok += 1) {
+                    const x_offset: u32 = @intCast(ab_tok * hidden_dim * @sizeOf(f32));
+                    const y_offset: u32 = @intCast(ab_tok * dt_rank * @sizeOf(f32));
+                    try self.dispatchDmmvInner(
+                        beta_t,
+                        scratch_norm,
+                        scratch_norm.size,
+                        scratch_k,
+                        dt_rank,
+                        hidden_dim,
+                        0,
+                        x_offset,
+                        y_offset,
+                        0,
+                    );
+                }
+                self.endProfilePhase(.ssm_proj_beta, ssm_proj_beta_phase);
+            } else {
+                try self.dispatchF32DualBatched(
+                    alpha_t,
+                    beta_t,
+                    scratch_norm,
+                    scratch_q,
+                    scratch_k,
+                    dt_rank,
+                    hidden_dim,
+                    n_tokens,
+                );
+                self.endProfilePhase(.ssm_proj_norm_ab, ssm_proj_norm_ab_phase);
+            }
 
             // Effort-15 run-3 cycle 3: when both wqkv (Q6_K) and z (Q4_K) DP4a
             // paths will fire, share a single Q8_1 quantize of scratch_norm
