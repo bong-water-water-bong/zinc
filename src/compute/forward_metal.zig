@@ -5380,8 +5380,9 @@ pub const InferenceEngine = struct {
         } else {
             const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
             var token_idx: usize = 0;
-            while (token_idx < pending_token_count) {
-                const chunk_end = @min(pending_token_count, token_idx + async_chunk_tokens);
+            while (token_idx < prompt_tokens.len) {
+                const chunk_end = @min(prompt_tokens.len, token_idx + async_chunk_tokens);
+                const is_final_chunk = chunk_end == prompt_tokens.len;
                 var chunk_cmd = try beginProfiledCommand(self, profile);
                 errdefer if (chunk_cmd.handle != null) chunk_cmd.wait();
                 for (prompt_tokens[token_idx..chunk_end], token_idx..) |_, i| {
@@ -5390,7 +5391,13 @@ pub const InferenceEngine = struct {
                         &self.qwen_ssm_prefill_branch_buf
                     else
                         &self.prefill_embed_buf;
-                    try runDecodeStep(self, false, embed_src, embed_offset, null, &chunk_cmd, 0);
+                    try runDecodeStep(self, i + 1 == prompt_tokens.len, embed_src, embed_offset, null, &chunk_cmd, 0);
+                }
+                if (is_final_chunk) {
+                    commitAndWaitProfiled(&chunk_cmd, profile);
+                    pending_completed_by_final_wait = true;
+                    state.position = self.position;
+                    return;
                 }
                 commitAsyncProfiled(&chunk_cmd, profile);
                 pending[pending_count] = chunk_cmd;
