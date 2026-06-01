@@ -86,6 +86,12 @@ uint q4k_scale_byte(uint sc0, uint sc1, uint sc2, uint idx) {
     return (word >> ((idx & 3u) * 8u)) & 0xFFu;
 }
 
+float fast_silu(float x) {
+    if (x > 8.0) return x;
+    if (x < -8.0) return 0.0;
+    return x / (1.0 + exp(-x));
+}
+
 void q4k_scale_min(uint sb, uint sc0, uint sc1, uint sc2, out float sc_val, out float mn_val) {
     if (sb < 4u) {
         const uint b0 = q4k_scale_byte(sc0, sc1, sc2, sb);
@@ -253,7 +259,7 @@ void main() {
         [[unroll]] for (uint m = 0u; m < TM; m++) {
             const float gate = sums_gate[m][n];
             const float up = sums_up[m][n];
-            const float silu_gate = gate / (1.0 + exp(-gate));
+            const float silu_gate = fast_silu(gate);
             const float v = silu_gate * up;
             swiglu_vals[m] = v;
             local_max = max(local_max, abs(v));
