@@ -137,6 +137,7 @@ const CaseId = enum {
 
 const PipelineMode = enum {
     runtime,
+    production,
     k2048,
     both,
 };
@@ -259,7 +260,7 @@ fn helpText() []const u8 {
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
     \\                            | moe_gate_up_swiglu
-    \\  --pipeline <mode>          runtime | k2048 | both (default: both)
+    \\  --pipeline <mode>          runtime | production | k2048 | both (default: both)
     \\  --route-tokens <n>         Prompt tokens for route-packed MoE cols cases (default: 64)
     \\  --iterations <n>           Timed dispatches per case (default: 200)
     \\  --warmup <n>               Warmup dispatches per case (default: 25)
@@ -269,6 +270,7 @@ fn helpText() []const u8 {
     \\Examples:
     \\  zig build bench-metal-shapes -- -m /Users/zolotukhin/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
     \\  zig build bench-metal-shapes -- -m model.gguf --case lm_head --pipeline both
+    \\  zig build bench-metal-shapes -- -m model.gguf --case attn_q --pipeline production
     \\
     ;
 }
@@ -314,6 +316,7 @@ fn isMoeColsCase(case_id: CaseId) bool {
 
 fn parsePipelineMode(arg: []const u8) !PipelineMode {
     if (std.mem.eql(u8, arg, "runtime")) return .runtime;
+    if (std.mem.eql(u8, arg, "production")) return .production;
     if (std.mem.eql(u8, arg, "k2048")) return .k2048;
     if (std.mem.eql(u8, arg, "both")) return .both;
     return error.InvalidPipelineMode;
@@ -868,10 +871,58 @@ fn chooseBlockSize(pipe: *const MetalPipeline, cols: u32, override: ?u32) !u32 {
     return 64;
 }
 
-fn selectPipeline(ctx: ?*shim.MetalCtx, variant: PipelineMode, cols: u32, threadgroup_override: ?u32) !PipelineSelection {
+fn q8Nr2RowsPerWorkgroup(block_size: u32, simd_width: u32) u32 {
+    return (block_size / simd_width) * 2;
+}
+
+fn gemmaQ8UsesGlobalThreadgroupOverride(tensor_name: []const u8) bool {
+    return !(std.mem.endsWith(u8, tensor_name, "ffn_gate.weight") or
+        std.mem.endsWith(u8, tensor_name, "ffn_up.weight") or
+        std.mem.endsWith(u8, tensor_name, "ffn_down.weight") or
+        std.mem.endsWith(u8, tensor_name, "attn_output.weight") or
+        std.mem.endsWith(u8, tensor_name, "ffn_gate_shexp.weight") or
+        std.mem.endsWith(u8, tensor_name, "ffn_up_shexp.weight") or
+        std.mem.endsWith(u8, tensor_name, "ffn_down_shexp.weight"));
+}
+
+fn chooseProductionQ8BlockSize(
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    tensor: *const metal_loader.LoadedTensor,
+    pipe: *const MetalPipeline,
+    cols: u32,
+    override: ?u32,
+) !u32 {
+    const simd_width = if (pipe.thread_execution_width > 0) pipe.thread_execution_width else @as(u32, 32);
+    if (override) |tg| {
+        if (tg == 0 or tg > pipe.max_threads_per_threadgroup) return error.InvalidThreadgroupSize;
+        if (tg % simd_width != 0) return error.InvalidThreadgroupSize;
+        return tg;
+    }
+
+    if (device.chip == .apple9 and simd_width == 32 and pipe.max_threads_per_threadgroup >= 512) {
+        const uses_global_override = model.config.architecture != .gemma or
+            gemmaQ8UsesGlobalThreadgroupOverride(tensor.info.name);
+        if (uses_global_override) return 512;
+    }
+
+    if (cols <= 4096 and pipe.thread_execution_width == 32 and pipe.max_threads_per_threadgroup >= 256) {
+        return 256;
+    }
+    return 64;
+}
+
+fn selectPipeline(
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    tensor: *const metal_loader.LoadedTensor,
+    variant: PipelineMode,
+    cols: u32,
+    threadgroup_override: ?u32,
+) !PipelineSelection {
     return switch (variant) {
         .runtime => blk: {
-            var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0");
+            var pipe = try loadShaderPipeline(device.ctx, "dmmv_q8_0");
             const block_size = try chooseBlockSize(&pipe, cols, threadgroup_override);
             const simd_width = if (pipe.thread_execution_width > 0) pipe.thread_execution_width else @as(u32, 32);
             break :blk .{
@@ -879,13 +930,31 @@ fn selectPipeline(ctx: ?*shim.MetalCtx, variant: PipelineMode, cols: u32, thread
                 .variant_label = "runtime",
                 .pipe = pipe,
                 .push_idx = 0,
-                .rows_per_wg = block_size / simd_width,
+                .rows_per_wg = q8Nr2RowsPerWorkgroup(block_size, simd_width),
+                .block_size = block_size,
+            };
+        },
+        .production => blk: {
+            // Mirror the production generic Q8_0 selection used by
+            // `dmmvPipelineForType` for the current Gemma 26B hot profile:
+            // attn_q/attn_k/lm_head take the Apple9 512-thread override,
+            // while Gemma shared expert and attn_output tensors are explicitly
+            // left on the 256-thread K<=4096 path.
+            var pipe = try loadShaderPipeline(device.ctx, "dmmv_q8_0");
+            const block_size = try chooseProductionQ8BlockSize(device, model, tensor, &pipe, cols, threadgroup_override);
+            const simd_width = if (pipe.thread_execution_width > 0) pipe.thread_execution_width else @as(u32, 32);
+            break :blk .{
+                .shader_name = "dmmv_q8_0",
+                .variant_label = "production",
+                .pipe = pipe,
+                .push_idx = 0,
+                .rows_per_wg = q8Nr2RowsPerWorkgroup(block_size, simd_width),
                 .block_size = block_size,
             };
         },
         .k2048 => blk: {
             if (cols > 2048) return error.K2048OnlySupportsK2048OrLess;
-            var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048");
+            var pipe = try loadShaderPipeline(device.ctx, "dmmv_q8_0_k2048");
             const block_size = try chooseBlockSize(&pipe, cols, threadgroup_override);
             const simd_width = if (pipe.thread_execution_width > 0) pipe.thread_execution_width else @as(u32, 32);
             break :blk .{
@@ -893,7 +962,7 @@ fn selectPipeline(ctx: ?*shim.MetalCtx, variant: PipelineMode, cols: u32, thread
                 .variant_label = "k2048",
                 .pipe = pipe,
                 .push_idx = 0,
-                .rows_per_wg = block_size / simd_width,
+                .rows_per_wg = q8Nr2RowsPerWorkgroup(block_size, simd_width),
                 .block_size = block_size,
             };
         },
@@ -957,23 +1026,23 @@ fn selectMoePipeline(
 ) !PipelineSelection {
     return switch (quant_type) {
         .q4_k => switch (variant) {
-            .runtime => if (cols <= 2048 and chip.isM5Class() and x_expert_stride != 0 and rows >= 1024) .{
+            .runtime, .production => if (cols <= 2048 and chip.isM5Class() and x_expert_stride != 0 and rows >= 1024) .{
                 .shader_name = "dmmv_q4k_moe_k2048_1024",
-                .variant_label = "runtime",
+                .variant_label = if (variant == .production) "production" else "runtime",
                 .pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_k2048_1024"),
                 .push_idx = 1,
                 .rows_per_wg = 32,
                 .block_size = 1024,
             } else if (cols <= 2048) .{
                 .shader_name = "dmmv_q4k_moe_k2048",
-                .variant_label = "runtime",
+                .variant_label = if (variant == .production) "production" else "runtime",
                 .pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_k2048"),
                 .push_idx = 1,
                 .rows_per_wg = 16,
                 .block_size = 512,
             } else .{
                 .shader_name = "dmmv_q4k_moe",
-                .variant_label = "runtime",
+                .variant_label = if (variant == .production) "production" else "runtime",
                 .pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe"),
                 .push_idx = 1,
                 .rows_per_wg = 8,
@@ -1004,23 +1073,23 @@ fn selectMoePipeline(
             },
         },
         .q5_k => switch (variant) {
-            .runtime => if (cols == 512 and rows >= 1024) .{
+            .runtime, .production => if (cols == 512 and rows >= 1024) .{
                 .shader_name = "dmmv_q5k_moe_k512",
-                .variant_label = "runtime",
+                .variant_label = if (variant == .production) "production" else "runtime",
                 .pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512"),
                 .push_idx = 1,
                 .rows_per_wg = 16,
                 .block_size = 512,
             } else if (cols <= 2048) .{
                 .shader_name = "dmmv_q5k_moe_k2048",
-                .variant_label = "runtime",
+                .variant_label = if (variant == .production) "production" else "runtime",
                 .pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k2048"),
                 .push_idx = 1,
                 .rows_per_wg = 16,
                 .block_size = 512,
             } else .{
                 .shader_name = "dmmv_q5k_moe",
-                .variant_label = "runtime",
+                .variant_label = if (variant == .production) "production" else "runtime",
                 .pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe"),
                 .push_idx = 1,
                 .rows_per_wg = 8,
@@ -1045,7 +1114,7 @@ fn selectMoePipeline(
         },
         .q6_k => .{
             .shader_name = "dmmv_q6k_moe",
-            .variant_label = if (variant == .runtime) "runtime" else "base",
+            .variant_label = if (variant == .production) "production" else if (variant == .runtime) "runtime" else "base",
             .pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe"),
             .push_idx = 1,
             .rows_per_wg = 8,
@@ -2009,7 +2078,7 @@ fn benchmarkVariant(
 ) !BenchResult {
     if (hot_case.isDual()) return error.DualCaseRequiresDualBenchmark;
     if (hot_case.isMoe()) return error.MoeCaseRequiresMoeBenchmark;
-    var selection = try selectPipeline(device.ctx, variant, hot_case.cols, threadgroup_override);
+    var selection = try selectPipeline(device, model, hot_case.tensor0, variant, hot_case.cols, threadgroup_override);
     defer metal_pipeline.freePipeline(&selection.pipe);
 
     var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
@@ -2300,7 +2369,7 @@ fn benchmarkSeparateDualVariant(
     threadgroup_override: ?u32,
 ) !DualBenchResult {
     const tensor1 = hot_case.tensor1 orelse return error.ExpectedDualCase;
-    var selection = try selectPipeline(device.ctx, .runtime, hot_case.cols, threadgroup_override);
+    var selection = try selectPipeline(device, model, hot_case.tensor0, .runtime, hot_case.cols, threadgroup_override);
     defer metal_pipeline.freePipeline(&selection.pipe);
 
     var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
@@ -2936,6 +3005,7 @@ pub fn main() !void {
             var alt_result: ?BenchResult = null;
             defer if (alt_result) |*result| allocator.free(result.output);
 
+            const moe_primary_mode: PipelineMode = if (config.pipeline_mode == .production) .production else .runtime;
             runtime_result = try benchmarkMoeVariant(
                 allocator,
                 &device,
@@ -2943,7 +3013,7 @@ pub fn main() !void {
                 hot_case,
                 config.warmup_iterations,
                 config.iterations,
-                .runtime,
+                moe_primary_mode,
             );
             try printBenchResult(&stdout, runtime_result.?);
 
@@ -3012,6 +3082,8 @@ pub fn main() !void {
 
             var runtime_result: ?BenchResult = null;
             defer if (runtime_result) |*result| allocator.free(result.output);
+            var production_result: ?BenchResult = null;
+            defer if (production_result) |*result| allocator.free(result.output);
             var k2048_result: ?BenchResult = null;
             defer if (k2048_result) |*result| allocator.free(result.output);
 
@@ -3027,6 +3099,20 @@ pub fn main() !void {
                     config.threadgroup_size,
                 );
                 try printBenchResult(&stdout, runtime_result.?);
+            }
+
+            if (config.pipeline_mode == .production) {
+                production_result = try benchmarkVariant(
+                    allocator,
+                    &device,
+                    &model,
+                    hot_case,
+                    config.warmup_iterations,
+                    config.iterations,
+                    .production,
+                    config.threadgroup_size,
+                );
+                try printBenchResult(&stdout, production_result.?);
             }
 
             if (config.pipeline_mode == .k2048 or config.pipeline_mode == .both) {
