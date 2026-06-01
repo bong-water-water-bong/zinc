@@ -70,6 +70,7 @@ void mtl_barrier_buffers(MetalCmd* cmd, MetalBuf** bufs, uint32_t n_bufs);
 void mtl_commit_and_wait(MetalCmd* cmd);
 void mtl_commit_async(MetalCmd* cmd);
 void mtl_wait(MetalCmd* cmd);
+void mtl_release_completed(MetalCmd* cmd);
 
 // Commit current command buffer, wait for GPU completion, then start a fresh
 // command buffer + encoder on the same MetalCmd handle and reset all binding

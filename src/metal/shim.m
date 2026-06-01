@@ -586,6 +586,26 @@ void mtl_wait(MetalCmd* cmd) {
     free(cmd);
 }
 
+void mtl_release_completed(MetalCmd* cmd) {
+    if (!cmd) return;
+
+    MTLCommandBufferStatus status = [cmd->cmd_buf status];
+    if (status != MTLCommandBufferStatusCompleted &&
+        status != MTLCommandBufferStatusError) {
+        [cmd->cmd_buf waitUntilCompleted];
+        status = [cmd->cmd_buf status];
+    }
+
+    if (status == MTLCommandBufferStatusError) {
+        fprintf(stderr, "Error: Metal command buffer failed: %s\n",
+                [[cmd->cmd_buf.error localizedDescription] UTF8String]);
+    }
+
+    cmd->cmd_buf = nil;
+    cmd->queue = nil;
+    free(cmd);
+}
+
 void mtl_commit_wait_restart(MetalCmd* cmd) {
     if (!cmd || !cmd->cmd_buf || !cmd->queue) return;
 

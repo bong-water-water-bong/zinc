@@ -290,6 +290,15 @@ pub const MetalCommand = struct {
             self.handle = null;
         }
     }
+
+    /// Release an async command buffer that is known to be completed by a later
+    /// queue-ordered wait. The shim falls back to waiting if it is still pending.
+    pub fn releaseCompleted(self: *MetalCommand) void {
+        if (self.handle) |h| {
+            shim.mtl_release_completed(h);
+            self.handle = null;
+        }
+    }
 };
 
 /// Allocate a new command buffer from the given Metal context.

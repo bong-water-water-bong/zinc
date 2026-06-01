@@ -5352,7 +5352,14 @@ pub const InferenceEngine = struct {
                 .barrier_enabled = false,
             };
         }
-        defer releaseCommands(pending);
+        var pending_completed_by_final_wait = false;
+        defer {
+            if (pending_completed_by_final_wait) {
+                releaseCompletedCommands(pending);
+            } else {
+                releaseCommands(pending);
+            }
+        }
 
         var pending_count: usize = 0;
         if (try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &pending[pending_count])) {
@@ -5375,6 +5382,7 @@ pub const InferenceEngine = struct {
         else
             &self.prefill_embed_buf;
         try runDecodeStep(self, true, final_src, final_offset, null, null, 0);
+        pending_completed_by_final_wait = true;
         state.position = self.position;
     }
 
@@ -18012,6 +18020,12 @@ fn waitCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
 fn releaseCommands(cmds: []MetalCommand) void {
     for (cmds) |*cmd| {
         if (cmd.handle != null) cmd.wait();
+    }
+}
+
+fn releaseCompletedCommands(cmds: []MetalCommand) void {
+    for (cmds) |*cmd| {
+        if (cmd.handle != null) cmd.releaseCompleted();
     }
 }
 
