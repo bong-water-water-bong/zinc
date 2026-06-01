@@ -1764,6 +1764,10 @@ const RmsNormRouterF32TopkBatchedPush = extern struct {
     input_stride: u32,
     output_stride: u32,
     norm_weight_offset: u32,
+    shared_gate_offset: u32,
+    shared_input_offset: u32,
+    shared_input_stride: u32,
+    has_shared_gate: u32,
     logit_scale_bits: u32,
     eps: f32,
 };
@@ -11595,6 +11599,21 @@ fn canUseGemmaRmsNormRouterF32TopkBatched(
         engine.rms_norm_router_f32_topk_batched_pipe.max_threads_per_threadgroup >= 512;
 }
 
+fn canUseGemmaRmsNormRouterF32TopkSharedGateBatched(
+    engine: *const InferenceEngine,
+    router: *const metal_loader.LoadedTensor,
+    norm_weight: *const metal_loader.LoadedTensor,
+    shared_gate: *const metal_loader.LoadedTensor,
+    n_experts: u32,
+    k: u32,
+    hidden_dim: u32,
+    n_tokens: u32,
+) bool {
+    return canUseGemmaRmsNormRouterF32TopkBatched(engine, router, norm_weight, n_experts, k, hidden_dim, n_tokens) and
+        shared_gate.info.type_ == .f32 and
+        shared_gate.info.numElements() == hidden_dim;
+}
+
 fn dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -11620,10 +11639,55 @@ fn dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
         .input_stride = hidden_dim,
         .output_stride = k * 2,
         .norm_weight_offset = tensorPageOffset(engine.model, norm_weight),
+        .shared_gate_offset = 0,
+        .shared_input_offset = 0,
+        .shared_input_stride = hidden_dim,
+        .has_shared_gate = 0,
         .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
         .eps = engine.config.rms_norm_eps,
     };
-    const bufs = [_]*const MetalBuffer{ &router.gpu_buffer, input, &norm_weight.gpu_buffer, output };
+    const bufs = [_]*const MetalBuffer{ &router.gpu_buffer, input, &norm_weight.gpu_buffer, output, input, &router.gpu_buffer, output };
+    cmd.dispatchV2(&engine.rms_norm_router_f32_topk_batched_pipe, .{ n_tokens, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RmsNormRouterF32TopkBatchedPush), 1);
+}
+
+fn dispatchGemmaRmsNormRouterF32TopkSharedGateBatchedScaledOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    router: *const metal_loader.LoadedTensor,
+    norm_weight: *const metal_loader.LoadedTensor,
+    shared_gate: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    shared_input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    shared_gate_output: *const MetalBuffer,
+    n_experts: u32,
+    k: u32,
+    hidden_dim: u32,
+    n_tokens: u32,
+    input_byte_offset: u32,
+    shared_input_byte_offset: u32,
+    logit_scale: f32,
+) void {
+    recordDmmvProfile(engine, router, n_experts, hidden_dim);
+    recordDmmvProfile(engine, shared_gate, 1, hidden_dim);
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += n_tokens;
+    const push = RmsNormRouterF32TopkBatchedPush{
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .router_offset = tensorPageOffset(engine.model, router),
+        .input_offset = input_byte_offset,
+        .input_stride = hidden_dim,
+        .output_stride = k * 2,
+        .norm_weight_offset = tensorPageOffset(engine.model, norm_weight),
+        .shared_gate_offset = tensorPageOffset(engine.model, shared_gate),
+        .shared_input_offset = shared_input_byte_offset,
+        .shared_input_stride = hidden_dim,
+        .has_shared_gate = 1,
+        .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
+        .eps = engine.config.rms_norm_eps,
+    };
+    const bufs = [_]*const MetalBuffer{ &router.gpu_buffer, input, &norm_weight.gpu_buffer, output, shared_input, &shared_gate.gpu_buffer, shared_gate_output };
     cmd.dispatchV2(&engine.rms_norm_router_f32_topk_batched_pipe, .{ n_tokens, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RmsNormRouterF32TopkBatchedPush), 1);
 }
 
@@ -19051,13 +19115,6 @@ fn runDecodeStep(
                 profileBarrier(cmd, profile, .dense_ffn);
             }
             if (is_moe and !skip_pre_ffn_router) {
-                if (!residual_router_output_ready) {
-                    const router_input_barrier_buf: *const MetalBuffer = if (cfg.architecture == .gemma)
-                        &engine.hidden_buf
-                    else
-                        &engine.norm_buf;
-                    profileBarrierBuffers(cmd, profile, .router, &.{router_input_barrier_buf});
-                }
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const gemma_router_scale = if (cfg.architecture == .gemma) lt.ffn_gate_inp_scale else null;
                 const router_logit_scale: f32 = if (cfg.architecture == .gemma)
@@ -19070,6 +19127,23 @@ fn runDecodeStep(
                     use_standard_gpu_routed_moe and
                     gemma_router_scale != null and
                     canUseGemmaRmsNormRouterF32TopkBatched(engine, router_t, gemma_router_scale.?, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
+                const use_fused_gemma_rms_f32_router_shared_gate =
+                    use_fused_gemma_rms_f32_router and
+                    lt.ffn_gate_inp_shexp != null and
+                    canUseGemmaRmsNormRouterF32TopkSharedGateBatched(engine, router_t, gemma_router_scale.?, lt.ffn_gate_inp_shexp.?, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
+                if (!residual_router_output_ready) {
+                    var router_input_barrier_bufs: [2]*const MetalBuffer = undefined;
+                    var router_input_barrier_count: usize = 1;
+                    router_input_barrier_bufs[0] = if (cfg.architecture == .gemma)
+                        &engine.hidden_buf
+                    else
+                        &engine.norm_buf;
+                    if (use_fused_gemma_rms_f32_router_shared_gate) {
+                        router_input_barrier_bufs[router_input_barrier_count] = &engine.norm_buf;
+                        router_input_barrier_count += 1;
+                    }
+                    profileBarrierBuffers(cmd, profile, .router, router_input_barrier_bufs[0..router_input_barrier_count]);
+                }
                 const router_in_buf: *const MetalBuffer = blk: {
                     if (cfg.architecture == .gemma) {
                         if (use_fused_gemma_rms_f32_router) break :blk &engine.hidden_buf;
@@ -19103,20 +19177,46 @@ fn runDecodeStep(
                     canUseRouterF32TopkBatchedSharedGate(engine, router_t, fused_f32_router_shared_gate.?, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
                 const router_ref = routerWeightRef(engine, layer_idx, router_t);
                 if (use_fused_gemma_rms_f32_router) {
-                    dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
-                        engine,
-                        cmd,
-                        router_t,
-                        gemma_router_scale.?,
-                        &engine.hidden_buf,
-                        &engine.router_output_buf,
-                        cfg.n_experts,
-                        cfg.n_experts_used,
-                        hidden_dim,
-                        1,
-                        0,
-                        router_logit_scale,
-                    );
+                    if (use_fused_gemma_rms_f32_router_shared_gate) {
+                        // Adapt vLLM's fused top-k/shared-gate materialization
+                        // to Gemma's RMS-scaled router row: top-k reads the
+                        // router-normalized hidden row, while the shared gate
+                        // consumes the already-materialized FFN norm row.
+                        dispatchGemmaRmsNormRouterF32TopkSharedGateBatchedScaledOnCmd(
+                            engine,
+                            cmd,
+                            router_t,
+                            gemma_router_scale.?,
+                            lt.ffn_gate_inp_shexp.?,
+                            &engine.hidden_buf,
+                            &engine.norm_buf,
+                            &engine.router_output_buf,
+                            &engine.router_logits_buf,
+                            cfg.n_experts,
+                            cfg.n_experts_used,
+                            hidden_dim,
+                            1,
+                            0,
+                            0,
+                            router_logit_scale,
+                        );
+                        precomputed_shared_gate = .{ .buf = &engine.router_logits_buf, .byte_offset = 0 };
+                    } else {
+                        dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
+                            engine,
+                            cmd,
+                            router_t,
+                            gemma_router_scale.?,
+                            &engine.hidden_buf,
+                            &engine.router_output_buf,
+                            cfg.n_experts,
+                            cfg.n_experts_used,
+                            hidden_dim,
+                            1,
+                            0,
+                            router_logit_scale,
+                        );
+                    }
                 } else if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
                     dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
@@ -19783,16 +19883,6 @@ fn runDecodeStep(
                 profileBarrier(cmd, profile, .dense_ffn);
             }
             if (is_moe and !skip_pre_ffn_router) {
-                // The direct branch-norm row was produced by the earlier
-                // precompute command buffer, so queue ordering is the
-                // dependency; there is no current-encoder write to flush.
-                if (!use_direct_prefill_branch_norm and !residual_router_output_ready) {
-                    const router_input_barrier_buf: *const MetalBuffer = if (cfg.architecture == .gemma)
-                        &engine.hidden_buf
-                    else
-                        ffn_norm_input_buf;
-                    profileBarrierBuffers(cmd, profile, .router, &.{router_input_barrier_buf});
-                }
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const use_prefill_router = shouldUseQwenLayer0PrefillRouter(engine, layer_idx);
                 const gemma_router_scale = if (cfg.architecture == .gemma) lt.ffn_gate_inp_scale else null;
@@ -19807,6 +19897,26 @@ fn runDecodeStep(
                     use_standard_gpu_routed_moe and
                     gemma_router_scale != null and
                     canUseGemmaRmsNormRouterF32TopkBatched(engine, router_t, gemma_router_scale.?, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
+                const use_fused_gemma_rms_f32_router_shared_gate =
+                    use_fused_gemma_rms_f32_router and
+                    lt.ffn_gate_inp_shexp != null and
+                    canUseGemmaRmsNormRouterF32TopkSharedGateBatched(engine, router_t, gemma_router_scale.?, lt.ffn_gate_inp_shexp.?, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
+                // The direct branch-norm row was produced by the earlier
+                // precompute command buffer, so queue ordering is the
+                // dependency; there is no current-encoder write to flush.
+                if (!use_direct_prefill_branch_norm and !residual_router_output_ready) {
+                    var router_input_barrier_bufs: [2]*const MetalBuffer = undefined;
+                    var router_input_barrier_count: usize = 1;
+                    router_input_barrier_bufs[0] = if (cfg.architecture == .gemma)
+                        &engine.hidden_buf
+                    else
+                        ffn_norm_input_buf;
+                    if (use_fused_gemma_rms_f32_router_shared_gate) {
+                        router_input_barrier_bufs[router_input_barrier_count] = &engine.norm_buf;
+                        router_input_barrier_count += 1;
+                    }
+                    profileBarrierBuffers(cmd, profile, .router, router_input_barrier_bufs[0..router_input_barrier_count]);
+                }
                 const router_in_buf: *const MetalBuffer = blk: {
                     if (cfg.architecture == .gemma) {
                         if (use_fused_gemma_rms_f32_router) break :blk &engine.hidden_buf;
@@ -19854,20 +19964,42 @@ fn runDecodeStep(
                         0,
                     );
                 } else if (use_fused_gemma_rms_f32_router) {
-                    dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
-                        engine,
-                        cmd,
-                        router_t,
-                        gemma_router_scale.?,
-                        &engine.hidden_buf,
-                        &engine.router_output_buf,
-                        cfg.n_experts,
-                        cfg.n_experts_used,
-                        hidden_dim,
-                        1,
-                        router_in_byte_offset,
-                        router_logit_scale,
-                    );
+                    if (use_fused_gemma_rms_f32_router_shared_gate) {
+                        dispatchGemmaRmsNormRouterF32TopkSharedGateBatchedScaledOnCmd(
+                            engine,
+                            cmd,
+                            router_t,
+                            gemma_router_scale.?,
+                            lt.ffn_gate_inp_shexp.?,
+                            &engine.hidden_buf,
+                            &engine.norm_buf,
+                            &engine.router_output_buf,
+                            &engine.router_logits_buf,
+                            cfg.n_experts,
+                            cfg.n_experts_used,
+                            hidden_dim,
+                            1,
+                            router_in_byte_offset,
+                            0,
+                            router_logit_scale,
+                        );
+                        precomputed_shared_gate = .{ .buf = &engine.router_logits_buf, .byte_offset = 0 };
+                    } else {
+                        dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
+                            engine,
+                            cmd,
+                            router_t,
+                            gemma_router_scale.?,
+                            &engine.hidden_buf,
+                            &engine.router_output_buf,
+                            cfg.n_experts,
+                            cfg.n_experts_used,
+                            hidden_dim,
+                            1,
+                            router_in_byte_offset,
+                            router_logit_scale,
+                        );
+                    }
                 } else if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
                     dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
@@ -29222,11 +29354,17 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
     defer metal_buffer.freeBuffer(&norm_weight_buf);
     var output_buf = try metal_buffer.createBuffer(ctx, n_tokens * k * 2 * @sizeOf(u32));
     defer metal_buffer.freeBuffer(&output_buf);
+    var shared_gate_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_gate_buf);
+    var shared_out_buf = try metal_buffer.createBuffer(ctx, n_tokens * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_out_buf);
 
     const weight_ptr: [*]f32 = @ptrCast(@alignCast(weight_buf.cpu_ptr.?));
     const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
     const norm_weight_ptr: [*]f32 = @ptrCast(@alignCast(norm_weight_buf.cpu_ptr.?));
+    const shared_gate_ptr: [*]f32 = @ptrCast(@alignCast(shared_gate_buf.cpu_ptr.?));
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(shared_out_buf.cpu_ptr.?[0..shared_out_buf.size], 0);
 
     for (0..n_tokens) |token| {
         for (0..K) |i| {
@@ -29237,6 +29375,8 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
     for (0..K) |i| {
         const raw: i32 = @intCast((i * 11 + 5) % 19);
         norm_weight_ptr[i] = 0.75 + 0.01 * @as(f32, @floatFromInt(raw));
+        const gate_raw: i32 = @intCast((i * 5 + 2) % 23);
+        shared_gate_ptr[i] = 0.02 * @as(f32, @floatFromInt(gate_raw - 11));
     }
     for (0..n_experts) |expert| {
         for (0..K) |i| {
@@ -29254,16 +29394,21 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
         .input_stride = @intCast(K),
         .output_stride = @intCast(k * 2),
         .norm_weight_offset = 0,
+        .shared_gate_offset = 0,
+        .shared_input_offset = 0,
+        .shared_input_stride = @intCast(K),
+        .has_shared_gate = 1,
         .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
         .eps = eps,
     };
-    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &norm_weight_buf, &output_buf };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &norm_weight_buf, &output_buf, &input_buf, &shared_gate_buf, &shared_out_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ @intCast(n_tokens), 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RmsNormRouterF32TopkBatchedPush), 1);
     cmd.commitAndWait();
 
     const output_ptr: [*]const u32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    const shared_out_ptr: [*]const f32 = @ptrCast(@alignCast(shared_out_buf.cpu_ptr.?));
     for (0..n_tokens) |token| {
         var sum_sq: f64 = 0.0;
         for (0..K) |i| {
@@ -29273,6 +29418,7 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
         const rms_inv: f32 = @floatCast(1.0 / @sqrt(sum_sq / @as(f64, @floatFromInt(K)) + eps));
 
         var logits: [n_experts]f32 = undefined;
+        var expected_shared_gate: f32 = 0.0;
         for (0..n_experts) |expert| {
             var dot: f32 = 0.0;
             for (0..K) |i| {
@@ -29281,6 +29427,10 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
             }
             logits[expert] = dot;
         }
+        for (0..K) |i| {
+            expected_shared_gate += shared_gate_ptr[i] * input_ptr[token * K + i];
+        }
+        try std.testing.expectApproxEqAbs(expected_shared_gate, shared_out_ptr[token], 0.0001);
 
         var expected_ids: [k]u32 = undefined;
         var selected_vals: [k]f32 = undefined;

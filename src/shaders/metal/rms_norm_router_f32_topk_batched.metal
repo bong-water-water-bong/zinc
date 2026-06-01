@@ -14,6 +14,10 @@ struct RmsNormRouterF32TopkBatchedPush {
     uint input_stride;
     uint output_stride;
     uint norm_weight_offset;
+    uint shared_gate_offset;
+    uint shared_input_offset;
+    uint shared_input_stride;
+    uint has_shared_gate;
     uint logit_scale_bits;
     float eps;
 };
@@ -32,6 +36,9 @@ kernel void main0(
     device const float* X [[buffer(2)]],
     device const float* norm_weight [[buffer(3)]],
     device uint* output_data [[buffer(4)]],
+    device const float* shared_input_buf [[buffer(5)]],
+    device const float* W_shared_gate [[buffer(6)]],
+    device float* shared_gate_out [[buffer(7)]],
     uint token_idx [[threadgroup_position_in_grid]],
     uint local_id [[thread_position_in_threadgroup]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
@@ -39,6 +46,7 @@ kernel void main0(
 ) {
     threadgroup float4 x_cache4[MAX_K_VEC4];
     threadgroup float partial_sums[N_SIMDGROUPS];
+    threadgroup float shared_partials[N_SIMDGROUPS];
     threadgroup float values[MAX_EXPERTS];
     threadgroup float selected_val[MAX_K_USED];
     const float logit_scale = as_type<float>(p.logit_scale_bits);
@@ -106,6 +114,30 @@ kernel void main0(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Adapt vLLM's fused top-k/shared-gate materialization to Gemma's scaled
+    // router: shared-gate uses the FFN norm row, not the router-scaled row.
+    float shared_acc = 0.0f;
+    if (p.has_shared_gate != 0u) {
+        device const float* shared_input = shared_input_buf + (p.shared_input_offset >> 2) + token_idx * p.shared_input_stride;
+        device const float* shared_row = W_shared_gate + (p.shared_gate_offset >> 2);
+        for (uint vi = local_id; vi < k_vec4; vi += TG_SIZE) {
+            shared_acc += dot(*(device const float4*)(shared_row + (vi << 2)), *(device const float4*)(shared_input + (vi << 2)));
+        }
+    }
+    const float shared_sum = simd_sum(shared_acc);
+    if (lane == 0u) {
+        shared_partials[sg_idx] = shared_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (p.has_shared_gate != 0u && local_id == 0u) {
+        float shared_total = 0.0f;
+        #pragma unroll
+        for (uint i = 0u; i < N_SIMDGROUPS; ++i) {
+            shared_total += shared_partials[i];
+        }
+        shared_gate_out[token_idx] = shared_total;
+    }
 
     if (p.n_experts == 128u && p.k == 8u) {
         if (sg_idx == 0u) {
