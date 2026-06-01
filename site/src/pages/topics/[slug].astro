@@ -84,6 +84,18 @@ const jsonLd = {
       <p class="section-note">{hub.bestUse}</p>
     </section>
 
+    <section aria-labelledby="status-snapshot">
+      <h2 id="status-snapshot">Status Snapshot</h2>
+      <dl class="detail-list">
+        {hub.status.map((item) => (
+          <div>
+            <dt>{item.label}</dt>
+            <dd>{item.detail}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+
     <section aria-labelledby="action-plan">
       <h2 id="action-plan">Action Plan</h2>
       <ol class="brief-list">
@@ -96,6 +108,18 @@ const jsonLd = {
       </ol>
     </section>
 
+    <section aria-labelledby="operator-checklist">
+      <h2 id="operator-checklist">Operator Checklist</h2>
+      <ul class="brief-list plain">
+        {hub.checklist.map((item) => (
+          <li>
+            <strong>{item.label}</strong>
+            <span>{item.detail}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+
     <section aria-labelledby="what-matters">
       <h2 id="what-matters">What Matters</h2>
       <ul class="clean-list">
@@ -103,10 +127,34 @@ const jsonLd = {
       </ul>
     </section>
 
+    <section aria-labelledby="measurements">
+      <h2 id="measurements">What To Measure</h2>
+      <dl class="detail-list">
+        {hub.measurements.map((item) => (
+          <div>
+            <dt>{item.label}</dt>
+            <dd>{item.detail}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+
     <section aria-labelledby="pitfalls">
       <h2 id="pitfalls">Common Traps</h2>
       <ul class="brief-list plain">
         {hub.pitfalls.map((item) => (
+          <li>
+            <strong>{item.label}</strong>
+            <span>{item.detail}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+
+    <section aria-labelledby="future-posts">
+      <h2 id="future-posts">Useful Next Posts</h2>
+      <ul class="brief-list plain">
+        {hub.articleIdeas.map((item) => (
           <li>
             <strong>{item.label}</strong>
             <span>{item.detail}</span>
@@ -208,6 +256,36 @@ const jsonLd = {
   .section-note {
     max-width: 48rem;
     color: var(--color-text-muted);
+  }
+
+  .detail-list {
+    display: grid;
+    gap: 0;
+    max-width: 58rem;
+    margin: 0;
+  }
+
+  .detail-list div {
+    display: grid;
+    grid-template-columns: minmax(9rem, 13rem) minmax(0, 1fr);
+    gap: var(--space-md);
+    padding: var(--space-sm) 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .detail-list div:last-child {
+    border-bottom: none;
+  }
+
+  .detail-list dt {
+    font-weight: 800;
+  }
+
+  .detail-list dd {
+    margin: 0;
+    color: var(--color-text-muted);
+    font-size: 0.94rem;
+    line-height: 1.55;
   }
 
   .clean-list {
@@ -333,5 +411,12 @@ const jsonLd = {
   .related-topics a:hover {
     border-color: var(--color-accent);
     color: var(--color-accent);
+  }
+
+  @media (max-width: 640px) {
+    .detail-list div {
+      grid-template-columns: 1fr;
+      gap: 0.2rem;
+    }
   }
 </style>

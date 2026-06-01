@@ -23,7 +23,11 @@ export type TopicHub = {
   summary: string;
   practicalAnswer: string;
   bestUse: string;
+  status: TopicHubBriefItem[];
   actionPlan: TopicHubBriefItem[];
+  checklist: TopicHubBriefItem[];
+  measurements: TopicHubBriefItem[];
+  articleIdeas: TopicHubBriefItem[];
   pitfalls: TopicHubBriefItem[];
   whatMatters: string[];
   readNext: TopicHubLink[];
@@ -42,6 +46,20 @@ export const topicHubs: TopicHub[] = [
     summary: 'Gemma 4 is a useful local inference target because it stresses the parts of an engine that simple Llama-shaped models do not: sliding-window attention, asymmetric grouped-query attention, Gemma-specific normalization, and MoE routing on the A4B variant.',
     practicalAnswer: 'If you want to run Gemma locally, treat Gemma 4 as an architecture port, not just another GGUF file. Dense Gemma 4 is mostly a memory and attention-shape problem. Gemma 4 26B-A4B adds sparse routing and Gemma-specific FFN behavior. On ZINC, the practical path is to use the managed Gemma model ids, verify the benchmark dashboard for the current backend, and expect the RDNA4 and Metal paths to improve as the Gemma prefill work lands.',
     bestUse: 'Use this page when you are deciding whether Gemma is a model-family port, a benchmark target, or a writing cluster. The useful reader intent is specific: what breaks differently from Qwen, what fits locally, and what an AMD or Metal engine has to optimize next.',
+    status: [
+      {
+        label: 'Best current answer',
+        detail: 'Gemma is the right second pillar for ZINC coverage because it proves the engine is not only tuned for Qwen-shaped models.',
+      },
+      {
+        label: 'Reader problem',
+        detail: 'People landing here need to know which Gemma variant fits, why it is architecturally different, and what performance number is credible on their GPU.',
+      },
+      {
+        label: 'Main bottleneck',
+        detail: 'For larger Gemma runs, time-to-first-token is the risk area: sliding-window attention, asymmetric Q/KV dimensions, and command submission overhead show up before decode looks bad.',
+      },
+    ],
     actionPlan: [
       {
         label: 'Start from the model shape',
@@ -58,6 +76,56 @@ export const topicHubs: TopicHub[] = [
       {
         label: 'Link back to benchmarks',
         detail: 'Readers landing from search need the current ZINC result, the llama.cpp baseline if available, and the exact hardware class.',
+      },
+    ],
+    checklist: [
+      {
+        label: 'Name the checkpoint',
+        detail: 'Use the exact model id, quantization, and whether it is dense or A4B MoE before making any claim.',
+      },
+      {
+        label: 'Confirm backend support',
+        detail: 'Check whether the run is using the batched Gemma path or a fallback path; the difference changes the conclusion.',
+      },
+      {
+        label: 'Capture fit and context',
+        detail: 'Record VRAM budget, reserved KV cache, active context, and whether any experts or tensors are offloaded.',
+      },
+      {
+        label: 'Compare user-visible latency',
+        detail: 'Report TTFT and prompt throughput before decode tokens per second. Gemma pain is often visible before generation starts.',
+      },
+    ],
+    measurements: [
+      {
+        label: 'TTFT',
+        detail: 'The first metric for Gemma posts should be time-to-first-token on a fixed prompt length.',
+      },
+      {
+        label: 'Prompt tok/s',
+        detail: 'Prefill throughput tells whether the sliding-window and full-attention layers are batched correctly.',
+      },
+      {
+        label: 'Decode tok/s',
+        detail: 'Decode still matters, but it should be paired with model size, active parameters, and context length.',
+      },
+      {
+        label: 'Memory shape',
+        detail: 'Show weights, runtime buffers, reserved KV cache, and any offload mode separately.',
+      },
+    ],
+    articleIdeas: [
+      {
+        label: 'Gemma 4 on 16 GB vs 32 GB RDNA4',
+        detail: 'A practical fit guide for RX 9070 XT-class cards versus R9700-class cards.',
+      },
+      {
+        label: 'Sliding-window attention in local inference',
+        detail: 'Explain what Gemma saves, what it does not save, and where full-attention layers still dominate.',
+      },
+      {
+        label: 'Gemma A4B MoE versus Qwen A3B MoE',
+        detail: 'A direct comparison of routing, active parameters, memory residency, and prefill behavior.',
       },
     ],
     pitfalls: [
@@ -144,6 +212,20 @@ export const topicHubs: TopicHub[] = [
     summary: 'Qwen3.6 is the core search cluster for ZINC because it combines model-architecture curiosity with practical local inference intent. Readers want to know what the model is, whether it exists as GGUF, and what an engine has to do to run it well.',
     practicalAnswer: 'For local Qwen3.6 inference, the important distinction is between model availability and engine readiness. ZINC already supports managed Qwen3.6 GGUF targets, but the fastest path depends on the variant. Dense Qwen3.6 is a batched-prefill and attention problem. A3B-style Qwen3.6 is a hybrid MoE plus SSM problem, where router scheduling, recurrent state, MTP, and KV memory all matter.',
     bestUse: 'Use this page as the entry point for people searching "can I run Qwen3.6 locally" or "what does Qwen3.6 require from an inference engine." It should turn model-name curiosity into exact local-running guidance.',
+    status: [
+      {
+        label: 'Best current answer',
+        detail: 'Qwen3.6 is a fit-and-engine-readiness question, not only a download question. The right answer depends on dense versus A3B-style sparse variants.',
+      },
+      {
+        label: 'Reader problem',
+        detail: 'Searchers need a practical path from model name to local run: GGUF availability, managed model id, hardware class, and which backend path is mature.',
+      },
+      {
+        label: 'Main bottleneck',
+        detail: 'For sparse Qwen, the hard surface is MoE routing plus recurrent or SSM state in prefill; for dense Qwen, batched attention and LM head cost dominate.',
+      },
+    ],
     actionPlan: [
       {
         label: 'Identify the variant',
@@ -160,6 +242,56 @@ export const topicHubs: TopicHub[] = [
       {
         label: 'Treat MTP as the speculation path',
         detail: 'Generic draft-model speculation is fragile on sparse MoE. Target-attached MTP is the more credible story for Qwen A3B models.',
+      },
+    ],
+    checklist: [
+      {
+        label: 'Verify metadata',
+        detail: 'Confirm architecture string, layer count, attention layout, expert count, active expert count, vocab size, and context target.',
+      },
+      {
+        label: 'Pick the right hardware bucket',
+        detail: 'Separate 16 GB, 32 GB, and Apple Silicon runs. A model that technically loads may still reserve too little context to be useful.',
+      },
+      {
+        label: 'Run the baseline',
+        detail: 'Use llama.cpp on the same machine when possible, with the same quantization and prompt policy.',
+      },
+      {
+        label: 'State the readiness gap',
+        detail: 'Call out whether the limiting work is model loading, prefill batching, SSM state, MoE routing, sampling, or KV memory.',
+      },
+    ],
+    measurements: [
+      {
+        label: 'Prompt tok/s and TTFT',
+        detail: 'Qwen posts should show whether the engine can turn long prompts into the first token quickly.',
+      },
+      {
+        label: 'Decode tok/s',
+        detail: 'Report steady-state generation separately from chat endpoint latency and early-stop behavior.',
+      },
+      {
+        label: 'VRAM residency',
+        detail: 'Show weight bytes, runtime bytes, reserved KV cache, offload status, and context capacity.',
+      },
+      {
+        label: 'Speculation cost',
+        detail: 'For MTP or draft-model posts, include acceptance rate, verifier cost, and state rewind cost.',
+      },
+    ],
+    articleIdeas: [
+      {
+        label: 'Which Qwen3.6 variant should local users run?',
+        detail: 'A practical dense versus A3B fit guide by GPU memory class.',
+      },
+      {
+        label: 'Why MTP is the Qwen speculation path',
+        detail: 'Turn the prior speculative-decoding analysis into a concise implementation guide.',
+      },
+      {
+        label: 'Qwen long-context budget on 16 GB and 32 GB',
+        detail: 'Tie model fit, KV memory, sampling overhead, and useful context into one decision page.',
       },
     ],
     pitfalls: [
@@ -251,6 +383,20 @@ export const topicHubs: TopicHub[] = [
     summary: 'RDNA4 is the default hardware story for ZINC: useful consumer and workstation AMD GPUs, strong memory bandwidth, Vulkan support, and no dependence on ROCm for local LLM inference.',
     practicalAnswer: 'If you want local LLM inference on AMD RDNA4, use Vulkan-first software and treat ROCm as optional rather than required. ZINC targets Radeon AI PRO R9700 and RX 9070-class hardware directly with Vulkan compute. The important performance split is decode versus prefill: decode is mostly memory and scheduling; prefill needs batched kernels, command-buffer discipline, and model-aware routing.',
     bestUse: 'Use this page for readers choosing AMD hardware or validating whether Vulkan local inference is real on RDNA4. The page should answer the hardware, driver, benchmark, and baseline questions before sending them to deep posts.',
+    status: [
+      {
+        label: 'Best current answer',
+        detail: 'RDNA4 local inference is real through Vulkan. The practical question is not "can AMD run LLMs" but which memory class and driver setup make the run useful.',
+      },
+      {
+        label: 'Reader problem',
+        detail: 'Readers need hardware fit, driver caveats, reproducible benchmark method, and a clear llama.cpp comparison before they trust the result.',
+      },
+      {
+        label: 'Main bottleneck',
+        detail: 'Decode is usually weight and scheduling bound. Prefill is a different workload and often needs batched kernels plus fewer host-side submits.',
+      },
+    ],
     actionPlan: [
       {
         label: 'Pick the memory budget first',
@@ -267,6 +413,56 @@ export const topicHubs: TopicHub[] = [
       {
         label: 'Report prefill and decode separately',
         detail: 'RDNA4 decode can look strong while prefill remains the user-visible latency limiter. A good post shows both phases.',
+      },
+    ],
+    checklist: [
+      {
+        label: 'Record the exact GPU',
+        detail: 'Name the card, VRAM, driver, Mesa version, and Vulkan device. RDNA4 is not a single performance number.',
+      },
+      {
+        label: 'Clean the node',
+        detail: 'Stop stale zinc, llama.cpp, and benchmark processes before publishing a comparison.',
+      },
+      {
+        label: 'Lock the run shape',
+        detail: 'Use the same model file, quantization, prompt, max tokens, context, warmup, and endpoint across engines.',
+      },
+      {
+        label: 'Separate CLI from server',
+        detail: 'CLI decode, raw HTTP completion, and chat completion measure different parts of the stack.',
+      },
+    ],
+    measurements: [
+      {
+        label: 'Prompt tok/s',
+        detail: 'Shows whether prefill kernels and command submission are healthy.',
+      },
+      {
+        label: 'Decode tok/s',
+        detail: 'The headline number, but only meaningful with model, quantization, and context attached.',
+      },
+      {
+        label: 'Latency distribution',
+        detail: 'For server mode, include TTFT plus p50 and p95 request latency under the stated concurrency.',
+      },
+      {
+        label: 'Platform state',
+        detail: 'Record driver version, GECC, cooperative matrix flag, ASPM policy, and thermal throttling clues.',
+      },
+    ],
+    articleIdeas: [
+      {
+        label: 'RX 9070 XT local LLM guide',
+        detail: 'A 16 GB practical guide for what fits, what needs offload, and what ZINC runs well today.',
+      },
+      {
+        label: 'R9700 versus RX 9070 XT',
+        detail: 'A memory-class comparison using the same Qwen and Gemma prompts.',
+      },
+      {
+        label: 'RDNA4 benchmark hygiene checklist',
+        detail: 'A reproducibility post covering drivers, stale processes, endpoint choice, and prompt shape.',
       },
     ],
     pitfalls: [
@@ -363,6 +559,20 @@ export const topicHubs: TopicHub[] = [
     summary: 'KV cache quantization is the long-context memory lever. Once a model fits, the prompt length and concurrent sessions are usually limited by K/V bytes per token, not by the static weight file.',
     practicalAnswer: 'For local long-context inference, FP16 KV cache is a debug-friendly default, not the right long-term default. INT8 K/V, asymmetric Q4 K plus higher-precision V, and TurboQuant-style compression all attack the same bottleneck: K/V memory grows linearly with tokens. On 16 GB and 32 GB GPUs, that growth decides whether 128k context is real or just a model-card number.',
     bestUse: 'Use this page for readers trying to understand why a model that fits in VRAM still fails at long context. The search intent is practical memory math: bytes per token, which precision is safe, and what an engine must implement.',
+    status: [
+      {
+        label: 'Best current answer',
+        detail: 'KV cache precision is the lever that turns model-card context into usable local context after the weights already fit.',
+      },
+      {
+        label: 'Reader problem',
+        detail: 'Readers need to compute bytes per token, choose a precision strategy, and understand the quality and bandwidth tradeoff.',
+      },
+      {
+        label: 'Main bottleneck',
+        detail: 'At long context, attention reads can become the dominant decode traffic. A smaller cache only helps when kernels read the compressed layout directly.',
+      },
+    ],
     actionPlan: [
       {
         label: 'Compute bytes per token',
@@ -379,6 +589,56 @@ export const topicHubs: TopicHub[] = [
       {
         label: 'Validate at long context',
         detail: 'Short prompts rarely reveal KV quantization regressions. Test perplexity, retrieval, and decode throughput at 16k, 32k, and beyond.',
+      },
+    ],
+    checklist: [
+      {
+        label: 'Write the formula down',
+        detail: 'Use layers times KV heads times head dimension times K/V precision times token count, then compare it with the actual VRAM budget.',
+      },
+      {
+        label: 'Choose K and V separately',
+        detail: 'Do not assume symmetric quantization. K and V often have different error tolerance and bandwidth value.',
+      },
+      {
+        label: 'Include allocator behavior',
+        detail: 'Paging, contiguous arenas, prefix reuse, and fragmentation determine whether the theoretical saving is usable.',
+      },
+      {
+        label: 'Test retrieval, not only perplexity',
+        detail: 'Long-context failures often show up as missed facts or degraded attention over distant tokens.',
+      },
+    ],
+    measurements: [
+      {
+        label: 'Bytes per token',
+        detail: 'The most useful KV number because it directly predicts maximum context and session capacity.',
+      },
+      {
+        label: 'Attention bandwidth',
+        detail: 'Measure whether the compressed format actually reduces memory traffic in decode.',
+      },
+      {
+        label: 'Quality delta',
+        detail: 'Compare retrieval, perplexity, and answer stability at the target context length.',
+      },
+      {
+        label: 'Cache residency',
+        detail: 'Show reserved versus active KV bytes and whether pages are shared, evicted, or compacted.',
+      },
+    ],
+    articleIdeas: [
+      {
+        label: 'Long-context budgets by GPU memory',
+        detail: 'A table for 16 GB, 24 GB, 32 GB, and Apple Silicon using common Qwen and Gemma shapes.',
+      },
+      {
+        label: 'FP8 versus Q4 KV cache',
+        detail: 'A practical comparison of decode bandwidth, implementation complexity, and quality risk.',
+      },
+      {
+        label: 'Prefix cache plus KV quantization',
+        detail: 'Explain where prompt caching changes memory pressure and where it only moves the cost.',
       },
     ],
     pitfalls: [
