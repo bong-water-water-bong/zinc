@@ -235,34 +235,34 @@ See also: [CONTRIBUTING.md](./CONTRIBUTING.md) · [Code of Conduct](./CODE_OF_CO
 
 ## Benchmarks
 
-The tables below are pulled directly from the latest published artifact at [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks). Latest refresh: 2026-05-10 (both targets). Numbers are median tok/s across the suite's runs on a fresh boot, ZINC and llama.cpp on the same hardware, weights, and prompt.
+The tables below are pulled directly from the latest published artifact at [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks). Latest refresh: 2026-06-01 UTC for RDNA4 and 2026-05-19 UTC for Metal. Numbers are median tok/s across the suite's runs on a fresh boot, ZINC and llama.cpp on the same hardware, weights, and prompt.
 
 ### AMD RDNA4 — Radeon AI PRO R9700 (Vulkan)
 
 | Model | ZINC prefill | llama.cpp prefill | ZINC % | ZINC decode | llama.cpp decode | ZINC % |
 |---|---:|---:|---:|---:|---:|---:|
-| Qwen 3 8B (dense) | **114.64** | 84.01 | **136%** | 59.72 | 108.86 | 55% |
-| Qwen 3.6 35B A3B (MoE+SSM) | 88.08 | 181.95 | 48% | **117.07** | 104.47 | **112%** |
-| Gemma 4 26B A4B (MoE) | 56.21 | 331.65 | 17% | 103.24 | 106.28 | 97% |
-| Gemma 4 31B (dense) | 44.40 | 139.14 | 32% | **44.52** | 32.23 | **138%** |
-
-Qwen 3.6 27B dense is now available in the managed catalog as an experimental target. A single-run RDNA4 ZINC-only validation measured 20.27 tok/s prefill and 22.57 tok/s decode; it is omitted from the comparison table until a same-machine llama.cpp baseline is published.
+| Qwen 3.6 35B A3B UD Q4_K_XL | 154.27 | 398.82 | 39% | **127.90** | 108.52 | **118%** |
+| Qwen 3.5 9B Q4_K_M | 100.79 | 548.94 | 18% | **95.39** | 85.51 | **112%** |
+| Gemma 4 26B-A4B MoE Q4_K_M | 89.10 | 497.08 | 18% | 89.73 | 102.00 | 88% |
+| Qwen 3.6 27B Dense Q4_K_M | 49.00 | 185.14 | 26% | 28.47 | 30.65 | 93% |
+| Gemma 4 31B Q4_K_M | 41.64 | 201.97 | 21% | 24.65 | 28.55 | 86% |
 
 ### Apple Silicon M4 Max (Metal)
 
-| Model | ZINC prefill | llama.cpp prefill | ZINC decode | llama.cpp decode | ZINC % decode |
-|---|---:|---:|---:|---:|---:|
-| Qwen 3.6 35B A3B (MoE+SSM) | 25.2 | 130.32 | 38.13 | 79.88 | 48% |
-| Gemma 4 26B A4B (MoE) | 27.4 | 279.51 | 43.68 | 92.17 | 47% |
-| Qwen 3 8B (dense) | 24.7 | 74.67 | 32.74 | 83.67 | 39% |
-| Gemma 4 31B (dense) | 19.5 | 73.28 | 5.16 | 25.14 | 21% |
+| Model | ZINC prefill | llama.cpp prefill | ZINC % | ZINC decode | llama.cpp decode | ZINC % |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen 3 8B Q4_K_M | **381.60** | 79.87 | **478%** | 73.93 | 83.06 | 89% |
+| Gemma 4 31B Q4_K_M | **131.40** | 103.16 | **127%** | 21.90 | 23.50 | 93% |
+| Gemma 4 26B-A4B MoE Q4_K_M | 53.20 | 410.72 | 13% | 48.18 | 83.50 | 58% |
+| Qwen 3.6 35B A3B UD Q4_K_XL | 34.80 | 320.33 | 11% | 33.86 | 66.31 | 51% |
+| Qwen 3.6 27B Dense Q4_K_M | 8.50 | 104.28 | 8% | 8.87 | 22.08 | 40% |
 
 ### Where we stand vs llama.cpp
 
-- **Ahead of llama.cpp**: Qwen 3 8B prefill on RDNA4 (1.36x), Qwen 3.6 35B-A3B decode on RDNA4 (1.12x), Gemma 4 31B dense decode on RDNA4 (1.38x).
-- **Within striking distance (>=90% of llama.cpp)**: Gemma 4 26B A4B decode on RDNA4 (97%).
-- **Active gap**: Qwen 3.6 35B-A3B prefill on RDNA4 sits at ~48% of llama.cpp because the entire batched prefill path is gated off for any model with `n_experts > 0` or `ssm_d_inner > 0`. The wire-up that closes this is documented in the [cycle-50 field report](https://zolotukhin.ai/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4).
-- **In flight**: Metal prefill is uniformly bottlenecked (20-30 tok/s) because the per-token Metal path doesn't amortize weight reads across prompt tokens. The Gemma 4 31B decode floor at 5.16 tok/s is the active optimization target.
+- **Ahead of llama.cpp**: RDNA4 decode for Qwen 3.6 35B-A3B (1.18x) and Qwen 3.5 9B (1.12x); Metal prefill for Qwen 3 8B (4.78x) and Gemma 4 31B (1.27x).
+- **Within striking distance (>=90% of llama.cpp)**: RDNA4 decode for Qwen 3.6 27B dense (93%); Metal decode for Gemma 4 31B (93%) and Qwen 3 8B (89%, just below the cutoff).
+- **Active gap**: RDNA4 prefill is still the primary gap on the larger models. Qwen 3.6 35B-A3B now reaches 154.27 tok/s, but llama.cpp is 398.82 tok/s on the same box, so the structural batched-prefill work remains the main unlock.
+- **In flight**: Metal prefill is no longer uniformly slow, but coverage is uneven. Qwen 3 8B and Gemma 4 31B are ahead of llama.cpp on prefill, while Qwen 3.6 27B/35B and Gemma 4 26B still need the batched path generalized across the catalog.
 
 For local benchmark commands, harnesses, and methodology, see:
 
@@ -279,9 +279,9 @@ For local benchmark commands, harnesses, and methodology, see:
 | Native BPE tokenizer (from GGUF) | Done |
 | GLSL compute shaders (16) | Done |
 | Compute graph + architecture builders | Done |
-| Forward pass (decode loop) | Working — 117.07 tok/s on RDNA4 and 38.13 tok/s on Apple M4 Max for Qwen 3.6 35B-A3B |
-| Forward pass (prefill loop) | Working — 88.08 tok/s on RDNA4 short-context for Qwen 3.6 35B-A3B; Metal prefill in flight |
-| GPU SSM shaders + cmd batching | Done — RDNA decode is 117.07 tok/s on Qwen 3.6 35B |
+| Forward pass (decode loop) | Working — 127.90 tok/s on RDNA4 and 33.86 tok/s on Apple M4 Max for Qwen 3.6 35B-A3B |
+| Forward pass (prefill loop) | Working — 154.27 tok/s on RDNA4 short-context for Qwen 3.6 35B-A3B; Metal prefill is fast on Qwen 3 8B and Gemma 4 31B but uneven across the catalog |
+| GPU SSM shaders + cmd batching | Done — RDNA decode is 127.90 tok/s on Qwen 3.6 35B |
 | HTTP server + OpenAI API | Done — Qwen 35B-A3B raw API ~100 tok/s on RDNA4 and Metal server path in progress |
 | Continuous batching | Phase 4 |
 | TurboQuant KV compression | Phase 5 |
@@ -296,7 +296,7 @@ The next push is closing the prefill gap to llama.cpp on hybrid MoE-plus-SSM mod
 2. **Port the `gated_delta_net.cu` block-resident state pattern** — today every prompt token re-reads and re-writes the full 2 MB SSM state per layer. Loading state once per workgroup and walking all tokens inside the kernel collapses 18 GB of state DRAM traffic per prefill to 4 MB.
 3. **Open `canUseBatchedPrefillRdna` for MoE+SSM hybrids** — the entire batched prefill body (`flash_attn_batched`, `rope_batched`, `dmmv_q4k_batch_kpar`) is gated off when `n_experts > 0` or `ssm_d_inner > 0`. Once items 1 and 2 land, dropping the gate activates Br-row attention batching on the same workload.
 4. **Land the cycle-50 micro-restructure pattern on MoE inner loops** — wider threads-per-row plus halved per-thread register slabs lifted ssm_delta_net by 2.7%. The same shape change is untried on `dmmv_q4k_moe_kpar` and `dmmv_q4k_moe_fused_down_acc`.
-5. **Ship batched Metal prefill across the catalog** — the Gemma path landed; Qwen 3.5/3.6 still route through the per-token Metal path that produces the 0.2–10 tok/s prefill numbers above.
+5. **Ship batched Metal prefill across the catalog** — Qwen 3 8B and Gemma 4 31B now show the fast path, but Qwen 3.6 27B/35B and Gemma 4 26B still need the same treatment.
 
 The full plan and 50-cycle field report is in the [cycle-50 blog post](https://zolotukhin.ai/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4).
 
