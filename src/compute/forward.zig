@@ -3308,9 +3308,10 @@ pub const InferenceEngine = struct {
         try growSlot(self.instance, &self.batched_scratch_up, inter_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_swiglu, inter_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_down, hidden_bytes, storage_xfer);
-        // int8 DP4a dense-down scratch: packed int8 acts = inter_dim/4 uints/token,
-        // scales = inter_dim/32 f32/token. Only allocated when the path is enabled.
-        if (self.qwen36Dp4aDownEnabled()) {
+        // int8 DP4a dense-FFN scratch: packed int8 acts = inter_dim/4 uints/token,
+        // scales = inter_dim/32 f32/token. Only allocated when a dense-hybrid
+        // prefill shape can use the path.
+        if (self.qwen36Dp4aDownEnabled() or self.qwenDenseFfnDp4aEnabled(n_tokens)) {
             const inter_i8_bytes = n * (inter_dim / 4) * @sizeOf(u32);
             const inter_scale_bytes = n * (inter_dim / 32) * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_swiglu_i8, inter_i8_bytes, storage_xfer);
@@ -12742,6 +12743,25 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    fn qwenDenseFfnDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+        if (std.posix.getenv("ZINC_QWEN_DENSE_FFN_DP4A")) |v| {
+            if (std.mem.eql(u8, v, "0")) return false;
+        }
+
+        if (self.isQwen35DenseHybrid9B()) {
+            // Qwen3.5 9B has smaller FFN matrices than the 27B dense hybrid,
+            // so the DP4a crossover is worth testing at the 64-token public
+            // long-draft prompt instead of inheriting the 27B 128-token floor.
+            return n_tokens >= 64;
+        }
+
+        return self.qwen36Dp4aDownEnabled() and n_tokens >= 128;
+    }
+
     fn qwen36ProjectionDp4aSupported(self: *const InferenceEngine, tensor: *const LoadedTensor, M: u32, K: u32, n_tokens: u32) bool {
         if (!self.qwen36Dp4aDownEnabled()) return false;
         if (n_tokens < 128) return false;
@@ -12968,15 +12988,12 @@ pub const InferenceEngine = struct {
         dp4a_cols_out: *u32,
     ) !DenseGateUpDp4aResult {
         dp4a_cols_out.* = 0;
-        // Threshold 128 matches the Q6_K dense-down DP4a path: under ~128 tokens
-        // the one-shot quantize pre-pass + extra dispatch/barrier outweigh the
-        // savings from a single 32-col GEMM block. The 5-token "core" scenario
-        // falls back via full_cols==0; this guards the 32..127-token band where
-        // the existing fused f32 gate+up shader is already efficient.
-        const dp4a_ok = self.qwen36Dp4aDownEnabled() and
+        // Threshold comes from qwenDenseFfnDp4aEnabled(): 128 tokens for the
+        // 27B dense hybrid, 64 tokens for Qwen3.5 9B so the public long-draft
+        // prompt can exercise the dense-FFN DP4a path.
+        const dp4a_ok = self.qwenDenseFfnDp4aEnabled(n_tokens) and
             gate_t.info.type_ == .q4_k and
             up_t.info.type_ == .q4_k and
-            n_tokens >= 128 and
             (hidden_dim & 255) == 0 and
             (inter_dim & 31) == 0 and
             self.dmmv.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a != null and
@@ -13046,7 +13063,7 @@ pub const InferenceEngine = struct {
             self.batched_scratch_swiglu_scale_dsum != null;
         var full_cols = floor_cols;
         const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
-        if (padded_cols > floor_cols) {
+        if (padded_cols > floor_cols and (padded_cols & 31) == 0) {
             const padded_hidden_f32_bytes: vk.c.VkDeviceSize =
                 @as(vk.c.VkDeviceSize, padded_cols) *
                 @as(vk.c.VkDeviceSize, hidden_dim) *
@@ -13257,15 +13274,12 @@ pub const InferenceEngine = struct {
         swiglu_already_q8_1: bool,
         gateup_dp4a_cols: u32,
     ) !void {
-        // Threshold 128: int8 DP4a regresses on tiny prompts (the one-shot
-        // quantize pre-pass + extra dispatch/barrier outweigh a single 32-col
-        // GEMM block) and only crosses over to a win past ~114 tokens, after
-        // which the per-column dot4 speedup compounds. The 5-token "core"
-        // scenario already falls back via full_cols==0; this guards the
-        // 32..127-token band. The context-medium benchmark is ~277 tokens.
-        const dp4a_ok = self.qwen36Dp4aDownEnabled() and
+        // Threshold comes from qwenDenseFfnDp4aEnabled(): the 27B path keeps
+        // its measured 128-token floor, while Qwen3.5 9B is allowed at the
+        // 64-token long-draft shape. Tiny prompts still fall back via
+        // full_cols==0 or the helper's threshold.
+        const dp4a_ok = self.qwenDenseFfnDp4aEnabled(n_tokens) and
             down_t.info.type_ == .q6_k and
-            n_tokens >= 128 and
             (inter_dim & 255) == 0 and
             (hidden_dim & 31) == 0 and
             self.dmmv.pipeline_mul_mm_q6k_full_dp4a != null and
@@ -13284,7 +13298,7 @@ pub const InferenceEngine = struct {
                 full_cols = gateup_dp4a_cols;
             } else if (!swiglu_already_q8) {
                 const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
-                if (padded_cols > full_cols) {
+                if (padded_cols > full_cols and (padded_cols & 31) == 0) {
                     const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                     const swiglu_scale = self.batched_scratch_swiglu_scale.?;
                     const need_input: vk.c.VkDeviceSize =
@@ -13384,9 +13398,8 @@ pub const InferenceEngine = struct {
         // unless swiglu_already_q8_1 is true (effort-15 cycle 21: fused producer
         // wrote Q8_1 packed + scale_dsum into batched_scratch_swiglu_{i8,scale_dsum}).
         const dp4a_ok_q4k = !swiglu_already_q8 and
-            self.qwen36Dp4aDownEnabled() and
+            self.qwenDenseFfnDp4aEnabled(n_tokens) and
             down_t.info.type_ == .q4_k and
-            n_tokens >= 128 and
             (inter_dim & 255) == 0 and
             (hidden_dim & 31) == 0 and
             self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and
@@ -13404,7 +13417,7 @@ pub const InferenceEngine = struct {
                 full_cols = gateup_dp4a_cols;
             } else if (!swiglu_already_q8_1) {
                 const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
-                if (padded_cols > full_cols) {
+                if (padded_cols > full_cols and (padded_cols & 31) == 0) {
                     const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                     const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
                     const need_input: vk.c.VkDeviceSize =
