@@ -1768,6 +1768,10 @@ const RmsNormRouterF32TopkBatchedPush = extern struct {
     shared_input_offset: u32,
     shared_input_stride: u32,
     has_shared_gate: u32,
+    moe_norm_weight_offset: u32,
+    moe_norm_output_offset: u32,
+    moe_norm_output_stride: u32,
+    has_moe_norm: u32,
     logit_scale_bits: u32,
     eps: f32,
 };
@@ -11619,8 +11623,10 @@ fn dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
     cmd: *MetalCommand,
     router: *const metal_loader.LoadedTensor,
     norm_weight: *const metal_loader.LoadedTensor,
+    moe_norm_weight: ?*const metal_loader.LoadedTensor,
     input: *const MetalBuffer,
     output: *const MetalBuffer,
+    moe_norm_output: ?*const MetalBuffer,
     n_experts: u32,
     k: u32,
     hidden_dim: u32,
@@ -11643,10 +11649,16 @@ fn dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
         .shared_input_offset = 0,
         .shared_input_stride = hidden_dim,
         .has_shared_gate = 0,
+        .moe_norm_weight_offset = if (moe_norm_weight) |weights| tensorPageOffset(engine.model, weights) else 0,
+        .moe_norm_output_offset = 0,
+        .moe_norm_output_stride = hidden_dim,
+        .has_moe_norm = if (moe_norm_weight != null and moe_norm_output != null) 1 else 0,
         .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
         .eps = engine.config.rms_norm_eps,
     };
-    const bufs = [_]*const MetalBuffer{ &router.gpu_buffer, input, &norm_weight.gpu_buffer, output, input, &router.gpu_buffer, output };
+    const moe_weight_buf = if (moe_norm_weight) |weights| &weights.gpu_buffer else &norm_weight.gpu_buffer;
+    const moe_output_buf = moe_norm_output orelse output;
+    const bufs = [_]*const MetalBuffer{ &router.gpu_buffer, input, &norm_weight.gpu_buffer, output, input, &router.gpu_buffer, output, moe_weight_buf, moe_output_buf };
     cmd.dispatchV2(&engine.rms_norm_router_f32_topk_batched_pipe, .{ n_tokens, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RmsNormRouterF32TopkBatchedPush), 1);
 }
 
@@ -11656,10 +11668,12 @@ fn dispatchGemmaRmsNormRouterF32TopkSharedGateBatchedScaledOnCmd(
     router: *const metal_loader.LoadedTensor,
     norm_weight: *const metal_loader.LoadedTensor,
     shared_gate: *const metal_loader.LoadedTensor,
+    moe_norm_weight: ?*const metal_loader.LoadedTensor,
     input: *const MetalBuffer,
     shared_input: *const MetalBuffer,
     output: *const MetalBuffer,
     shared_gate_output: *const MetalBuffer,
+    moe_norm_output: ?*const MetalBuffer,
     n_experts: u32,
     k: u32,
     hidden_dim: u32,
@@ -11684,10 +11698,16 @@ fn dispatchGemmaRmsNormRouterF32TopkSharedGateBatchedScaledOnCmd(
         .shared_input_offset = shared_input_byte_offset,
         .shared_input_stride = hidden_dim,
         .has_shared_gate = 1,
+        .moe_norm_weight_offset = if (moe_norm_weight) |weights| tensorPageOffset(engine.model, weights) else 0,
+        .moe_norm_output_offset = 0,
+        .moe_norm_output_stride = hidden_dim,
+        .has_moe_norm = if (moe_norm_weight != null and moe_norm_output != null) 1 else 0,
         .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
         .eps = engine.config.rms_norm_eps,
     };
-    const bufs = [_]*const MetalBuffer{ &router.gpu_buffer, input, &norm_weight.gpu_buffer, output, shared_input, &shared_gate.gpu_buffer, shared_gate_output };
+    const moe_weight_buf = if (moe_norm_weight) |weights| &weights.gpu_buffer else &norm_weight.gpu_buffer;
+    const moe_output_buf = moe_norm_output orelse output;
+    const bufs = [_]*const MetalBuffer{ &router.gpu_buffer, input, &norm_weight.gpu_buffer, output, shared_input, &shared_gate.gpu_buffer, shared_gate_output, moe_weight_buf, moe_output_buf };
     cmd.dispatchV2(&engine.rms_norm_router_f32_topk_batched_pipe, .{ n_tokens, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RmsNormRouterF32TopkBatchedPush), 1);
 }
 
@@ -17892,6 +17912,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     shexp_inter_dim: u32,
     router_output_ready: bool,
     precomputed_shared_gate: ?QwenSharedGateScalar,
+    precomputed_moe_norm: bool,
 ) !void {
     const cfg = engine.config;
     const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
@@ -17920,8 +17941,10 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     // into mul_mat_id. For Gemma decode N=1, router_output_buf is that compact
     // selected_experts+weights row; the DMMV MoE kernels consume the expert ids
     // directly and the accumulate kernel consumes the weights.
-    dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.hidden_buf, &engine.residual_buf, pre_ffw_norm_2, hidden_dim, 1);
-    profileBarrier(cmd, profile, .gpu_routed_moe); // routes and expert input visible
+    if (!precomputed_moe_norm) {
+        dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.hidden_buf, &engine.residual_buf, pre_ffw_norm_2, hidden_dim, 1);
+        profileBarrier(cmd, profile, .gpu_routed_moe); // routes and expert input visible
+    }
 
     const use_fused_gate_up =
         gate_exps == up_exps and
@@ -18181,10 +18204,11 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     hidden_scale: f32,
     hidden_seed: ?QwenMoeHiddenSeed,
     precomputed_shared_gate: ?QwenSharedGateScalar,
+    precomputed_gemma_moe_norm: bool,
 ) !bool {
     const cfg = engine.config;
     if (cfg.architecture == .gemma) {
-        try recordGemmaGpuRoutedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, router_output_ready, precomputed_shared_gate);
+        try recordGemmaGpuRoutedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, router_output_ready, precomputed_shared_gate, precomputed_gemma_moe_norm);
         return false;
     }
     const gate_exps = lt.ffn_gate_exps orelse return error.MissingTensor;
@@ -19117,10 +19141,12 @@ fn runDecodeStep(
             if (is_moe and !skip_pre_ffn_router) {
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const gemma_router_scale = if (cfg.architecture == .gemma) lt.ffn_gate_inp_scale else null;
+                const gemma_moe_norm_weight = if (cfg.architecture == .gemma) lt.pre_ffw_norm_2 else null;
                 const router_logit_scale: f32 = if (cfg.architecture == .gemma)
                     1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)))
                 else
                     1.0;
+                var gemma_moe_norm_ready = false;
                 const use_fused_gemma_rms_f32_router =
                     cfg.architecture == .gemma and
                     !residual_router_output_ready and
@@ -19188,10 +19214,12 @@ fn runDecodeStep(
                             router_t,
                             gemma_router_scale.?,
                             lt.ffn_gate_inp_shexp.?,
+                            gemma_moe_norm_weight,
                             &engine.hidden_buf,
                             &engine.norm_buf,
                             &engine.router_output_buf,
                             &engine.router_logits_buf,
+                            &engine.residual_buf,
                             cfg.n_experts,
                             cfg.n_experts_used,
                             hidden_dim,
@@ -19201,14 +19229,17 @@ fn runDecodeStep(
                             router_logit_scale,
                         );
                         precomputed_shared_gate = .{ .buf = &engine.router_logits_buf, .byte_offset = 0 };
+                        gemma_moe_norm_ready = gemma_moe_norm_weight != null;
                     } else {
                         dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
                             engine,
                             cmd,
                             router_t,
                             gemma_router_scale.?,
+                            gemma_moe_norm_weight,
                             &engine.hidden_buf,
                             &engine.router_output_buf,
+                            &engine.residual_buf,
                             cfg.n_experts,
                             cfg.n_experts_used,
                             hidden_dim,
@@ -19216,6 +19247,7 @@ fn runDecodeStep(
                             0,
                             router_logit_scale,
                         );
+                        gemma_moe_norm_ready = gemma_moe_norm_weight != null;
                     }
                 } else if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
@@ -19254,7 +19286,7 @@ fn runDecodeStep(
                     dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
                 }
                 {
-                    var router_barrier_bufs: [3]*const MetalBuffer = undefined;
+                    var router_barrier_bufs: [4]*const MetalBuffer = undefined;
                     var router_barrier_count: usize = 1;
                     router_barrier_bufs[0] = if (residual_router_output_ready or use_fused_gemma_rms_f32_router or use_fused_gptoss_router or use_fused_q8_router or use_fused_f32_router)
                         &engine.router_output_buf
@@ -19266,6 +19298,10 @@ fn runDecodeStep(
                     }
                     if (precomputed_shared_gate != null) {
                         router_barrier_bufs[router_barrier_count] = &engine.router_logits_buf;
+                        router_barrier_count += 1;
+                    }
+                    if (gemma_moe_norm_ready) {
+                        router_barrier_bufs[router_barrier_count] = &engine.residual_buf;
                         router_barrier_count += 1;
                     }
                     // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: after
@@ -19293,7 +19329,7 @@ fn runDecodeStep(
                             qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count)
                         else
                             null;
-                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_gemma_rms_f32_router or use_fused_q8_router or use_fused_f32_router, &engine.norm_buf, 0, next_attn_norm, moe_hidden_scale, null, precomputed_shared_gate);
+                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_gemma_rms_f32_router or use_fused_q8_router or use_fused_f32_router, &engine.norm_buf, 0, next_attn_norm, moe_hidden_scale, null, precomputed_shared_gate, gemma_moe_norm_ready);
                         if (wrote_next_norm) prev_fused_attn_norm = true;
                         if (fold_moe_layer_scale) layer_output_scale_fused_into_post_norm = true;
                     } else {
@@ -19886,10 +19922,12 @@ fn runDecodeStep(
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const use_prefill_router = shouldUseQwenLayer0PrefillRouter(engine, layer_idx);
                 const gemma_router_scale = if (cfg.architecture == .gemma) lt.ffn_gate_inp_scale else null;
+                const gemma_moe_norm_weight = if (cfg.architecture == .gemma) lt.pre_ffw_norm_2 else null;
                 const router_logit_scale: f32 = if (cfg.architecture == .gemma)
                     1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)))
                 else
                     1.0;
+                var gemma_moe_norm_ready = false;
                 const use_fused_gemma_rms_f32_router =
                     cfg.architecture == .gemma and
                     !use_prefill_router and
@@ -19971,10 +20009,12 @@ fn runDecodeStep(
                             router_t,
                             gemma_router_scale.?,
                             lt.ffn_gate_inp_shexp.?,
+                            gemma_moe_norm_weight,
                             &engine.hidden_buf,
                             &engine.norm_buf,
                             &engine.router_output_buf,
                             &engine.router_logits_buf,
+                            &engine.residual_buf,
                             cfg.n_experts,
                             cfg.n_experts_used,
                             hidden_dim,
@@ -19984,14 +20024,17 @@ fn runDecodeStep(
                             router_logit_scale,
                         );
                         precomputed_shared_gate = .{ .buf = &engine.router_logits_buf, .byte_offset = 0 };
+                        gemma_moe_norm_ready = gemma_moe_norm_weight != null;
                     } else {
                         dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
                             engine,
                             cmd,
                             router_t,
                             gemma_router_scale.?,
+                            gemma_moe_norm_weight,
                             &engine.hidden_buf,
                             &engine.router_output_buf,
+                            &engine.residual_buf,
                             cfg.n_experts,
                             cfg.n_experts_used,
                             hidden_dim,
@@ -19999,6 +20042,7 @@ fn runDecodeStep(
                             router_in_byte_offset,
                             router_logit_scale,
                         );
+                        gemma_moe_norm_ready = gemma_moe_norm_weight != null;
                     }
                 } else if (use_fused_gptoss_router) {
                     const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
@@ -20037,7 +20081,7 @@ fn runDecodeStep(
                     dispatchDmmvOnCmdWithInputOffset(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0, router_in_byte_offset);
                 }
                 {
-                    var router_barrier_bufs: [3]*const MetalBuffer = undefined;
+                    var router_barrier_bufs: [4]*const MetalBuffer = undefined;
                     var router_barrier_count: usize = 1;
                     router_barrier_bufs[0] = if (use_prefill_router or residual_router_output_ready or use_fused_gemma_rms_f32_router or use_fused_gptoss_router or use_fused_q8_router or use_fused_f32_router)
                         &engine.router_output_buf
@@ -20049,6 +20093,10 @@ fn runDecodeStep(
                     }
                     if (precomputed_shared_gate != null) {
                         router_barrier_bufs[router_barrier_count] = &engine.router_logits_buf;
+                        router_barrier_count += 1;
+                    }
+                    if (gemma_moe_norm_ready) {
+                        router_barrier_bufs[router_barrier_count] = &engine.residual_buf;
                         router_barrier_count += 1;
                     }
                     // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: after
@@ -20077,7 +20125,7 @@ fn runDecodeStep(
                         else
                             null;
                         const moe_hidden_seed = if (use_prefill_branch_norm and layer_idx == 0) qwen_branch_hidden_seed else null;
-                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, use_prefill_router or residual_router_output_ready or use_fused_gemma_rms_f32_router or use_fused_q8_router or use_fused_f32_router, ffn_norm_input_buf, ffn_norm_input_byte_offset, next_attn_norm, moe_hidden_scale, moe_hidden_seed, precomputed_shared_gate);
+                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, use_prefill_router or residual_router_output_ready or use_fused_gemma_rms_f32_router or use_fused_q8_router or use_fused_f32_router, ffn_norm_input_buf, ffn_norm_input_byte_offset, next_attn_norm, moe_hidden_scale, moe_hidden_seed, precomputed_shared_gate, gemma_moe_norm_ready);
                         if (wrote_next_norm) prev_fused_attn_norm = true;
                         if (fold_moe_layer_scale) layer_output_scale_fused_into_post_norm = true;
                     } else {
@@ -29352,6 +29400,10 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
     defer metal_buffer.freeBuffer(&input_buf);
     var norm_weight_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&norm_weight_buf);
+    var moe_norm_weight_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&moe_norm_weight_buf);
+    var moe_norm_out_buf = try metal_buffer.createBuffer(ctx, n_tokens * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&moe_norm_out_buf);
     var output_buf = try metal_buffer.createBuffer(ctx, n_tokens * k * 2 * @sizeOf(u32));
     defer metal_buffer.freeBuffer(&output_buf);
     var shared_gate_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
@@ -29362,9 +29414,11 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
     const weight_ptr: [*]f32 = @ptrCast(@alignCast(weight_buf.cpu_ptr.?));
     const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
     const norm_weight_ptr: [*]f32 = @ptrCast(@alignCast(norm_weight_buf.cpu_ptr.?));
+    const moe_norm_weight_ptr: [*]f32 = @ptrCast(@alignCast(moe_norm_weight_buf.cpu_ptr.?));
     const shared_gate_ptr: [*]f32 = @ptrCast(@alignCast(shared_gate_buf.cpu_ptr.?));
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
     @memset(shared_out_buf.cpu_ptr.?[0..shared_out_buf.size], 0);
+    @memset(moe_norm_out_buf.cpu_ptr.?[0..moe_norm_out_buf.size], 0);
 
     for (0..n_tokens) |token| {
         for (0..K) |i| {
@@ -29375,6 +29429,7 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
     for (0..K) |i| {
         const raw: i32 = @intCast((i * 11 + 5) % 19);
         norm_weight_ptr[i] = 0.75 + 0.01 * @as(f32, @floatFromInt(raw));
+        moe_norm_weight_ptr[i] = 0.625 + 0.015625 * @as(f32, @floatFromInt(i % 13));
         const gate_raw: i32 = @intCast((i * 5 + 2) % 23);
         shared_gate_ptr[i] = 0.02 * @as(f32, @floatFromInt(gate_raw - 11));
     }
@@ -29398,10 +29453,14 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
         .shared_input_offset = 0,
         .shared_input_stride = @intCast(K),
         .has_shared_gate = 1,
+        .moe_norm_weight_offset = 0,
+        .moe_norm_output_offset = 0,
+        .moe_norm_output_stride = @intCast(K),
+        .has_moe_norm = 1,
         .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
         .eps = eps,
     };
-    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &norm_weight_buf, &output_buf, &input_buf, &shared_gate_buf, &shared_out_buf };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &norm_weight_buf, &output_buf, &input_buf, &shared_gate_buf, &shared_out_buf, &moe_norm_weight_buf, &moe_norm_out_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ @intCast(n_tokens), 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RmsNormRouterF32TopkBatchedPush), 1);
@@ -29409,6 +29468,7 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
 
     const output_ptr: [*]const u32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     const shared_out_ptr: [*]const f32 = @ptrCast(@alignCast(shared_out_buf.cpu_ptr.?));
+    const moe_norm_out_ptr: [*]const f32 = @ptrCast(@alignCast(moe_norm_out_buf.cpu_ptr.?));
     for (0..n_tokens) |token| {
         var sum_sq: f64 = 0.0;
         for (0..K) |i| {
@@ -29416,6 +29476,10 @@ test "rms_norm_router_f32_topk_batched shader normalizes Gemma router input" {
             sum_sq += @as(f64, x) * @as(f64, x);
         }
         const rms_inv: f32 = @floatCast(1.0 / @sqrt(sum_sq / @as(f64, @floatFromInt(K)) + eps));
+        for (0..K) |i| {
+            const expected_moe_norm = input_ptr[token * K + i] * rms_inv * moe_norm_weight_ptr[i];
+            try std.testing.expectApproxEqAbs(expected_moe_norm, moe_norm_out_ptr[token * K + i], 0.00005);
+        }
 
         var logits: [n_experts]f32 = undefined;
         var expected_shared_gate: f32 = 0.0;

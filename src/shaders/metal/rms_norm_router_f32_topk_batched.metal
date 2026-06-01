@@ -18,6 +18,10 @@ struct RmsNormRouterF32TopkBatchedPush {
     uint shared_input_offset;
     uint shared_input_stride;
     uint has_shared_gate;
+    uint moe_norm_weight_offset;
+    uint moe_norm_output_offset;
+    uint moe_norm_output_stride;
+    uint has_moe_norm;
     uint logit_scale_bits;
     float eps;
 };
@@ -39,6 +43,8 @@ kernel void main0(
     device const float* shared_input_buf [[buffer(5)]],
     device const float* W_shared_gate [[buffer(6)]],
     device float* shared_gate_out [[buffer(7)]],
+    device const float* moe_norm_weight [[buffer(8)]],
+    device float* moe_norm_out [[buffer(9)]],
     uint token_idx [[threadgroup_position_in_grid]],
     uint local_id [[thread_position_in_threadgroup]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
@@ -78,9 +84,16 @@ kernel void main0(
     const float total_sq = simd_sum(partial);
     const float rms_inv = fast::rsqrt(fast::divide(total_sq, float(p.K)) + p.eps);
 
+    device const float* moe_scale = moe_norm_weight + (p.moe_norm_weight_offset >> 2);
+    device float* moe_out = moe_norm_out + (p.moe_norm_output_offset >> 2) + token_idx * p.moe_norm_output_stride;
     for (uint i = local_id; i < k_vec4; i += TG_SIZE) {
+        const float4 raw_x = x_cache4[i];
+        if (p.has_moe_norm != 0u) {
+            const float4 moe_w = *(device const float4*)(moe_scale + (i << 2));
+            *(device float4*)(moe_out + (i << 2)) = raw_x * rms_inv * moe_w;
+        }
         const float4 w = *(device const float4*)(scale + (i << 2));
-        x_cache4[i] = x_cache4[i] * rms_inv * w;
+        x_cache4[i] = raw_x * rms_inv * w;
     }
 
     if (local_id < MAX_EXPERTS) {
