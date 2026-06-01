@@ -48,6 +48,8 @@ const uint TPR_N = BN / TN;  // 8
 const uint Q4K_BLOCK_U32 = 36u;
 const uint SPACK = 9u;
 
+layout(constant_id = 0) const uint SPEC_K = 0u;
+
 layout(local_size_x = WG_SIZE) in;
 
 layout(push_constant) uniform PushConstants {
@@ -94,10 +96,11 @@ void main() {
         }
     }
 
+    const uint k_limit = (SPEC_K != 0u) ? SPEC_K : K;
     const uint a_base_u32 = a_offset / 4u;
-    const uint blocks_per_row = K / 256u;
+    const uint blocks_per_row = k_limit / 256u;
 
-    for (uint k_outer = 0u; k_outer < K; k_outer += BK) {
+    for (uint k_outer = 0u; k_outer < k_limit; k_outer += BK) {
         const uint super_block = k_outer / 256u;
         const uint sb_offset = k_outer & 0xFFu;
         const uint sb = sb_offset >> 5;
