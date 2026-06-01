@@ -374,7 +374,7 @@ function outputQualityStatus(scenario: any) {
   if (/^<\|(?:im_end|endoftext|end)\|>$/.test(preview) || (generatedTokens != null && generatedTokens <= 4 && preview.includes('<|im_end|>'))) {
     return {
       tone: 'caution',
-      label: 'Review Output',
+      label: 'Preview flagged',
       note: 'ZINC completed numerically, but the preview is only a stop token.',
     };
   }
@@ -382,7 +382,7 @@ function outputQualityStatus(scenario: any) {
   if (/(?:^|[\s:])(?:\d+\.){12,}/.test(preview)) {
     return {
       tone: 'caution',
-      label: 'Review Output',
+      label: 'Preview flagged',
       note: 'ZINC completed numerically, but the preview shows a repeated numeric pattern.',
     };
   }
@@ -402,17 +402,8 @@ function scenarioStatus(scenario: any) {
   const zincOk = promptValue(scenario) != null || decodeValue(scenario) != null || endToEndValue(scenario) != null;
   const baselineOk = baselinePromptValue(scenario) != null || baselineDecodeValue(scenario) != null;
   const reason = compactReason(warningText(scenario));
-  const quality = outputQualityStatus(scenario);
 
   if (zincOk && baselineOk) {
-    if (quality.tone === 'caution') {
-      return {
-        tone: 'caution',
-        label: quality.label,
-        note: quality.note,
-      };
-    }
-
     return {
       tone: 'positive',
       label: 'Compared',
@@ -896,10 +887,6 @@ const jsonLd = {
                   <span class="info-chip">
                     <strong>{formatPercent(summary.avgOverallGap)}</strong>
                     overall
-                  </span>
-                  <span class:list={['info-chip', summary.reviewCount > 0 ? 'caution' : 'positive']}>
-                    <strong>{summary.reviewCount}</strong>
-                    output review
                   </span>
                 </div>
               </article>
