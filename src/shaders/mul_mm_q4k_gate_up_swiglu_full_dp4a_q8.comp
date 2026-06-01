@@ -81,6 +81,26 @@ shared vec2  buf_up_fb[BM];
 shared uint  buf_b[BN * SPACK];
 shared vec2  buf_b_sd[BN];
 
+uint q4k_scale_byte(uint sc0, uint sc1, uint sc2, uint idx) {
+    uint word = (idx < 4u) ? sc0 : ((idx < 8u) ? sc1 : sc2);
+    return (word >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+void q4k_scale_min(uint sb, uint sc0, uint sc1, uint sc2, out float sc_val, out float mn_val) {
+    if (sb < 4u) {
+        const uint b0 = q4k_scale_byte(sc0, sc1, sc2, sb);
+        const uint b4 = q4k_scale_byte(sc0, sc1, sc2, sb + 4u);
+        sc_val = float(b0 & 63u);
+        mn_val = float(b4 & 63u);
+    } else {
+        const uint b = q4k_scale_byte(sc0, sc1, sc2, sb);
+        const uint b4 = q4k_scale_byte(sc0, sc1, sc2, sb + 4u);
+        const uint bm4 = q4k_scale_byte(sc0, sc1, sc2, sb - 4u);
+        sc_val = float((b4 & 0xFu) | ((bm4 >> 6) << 4));
+        mn_val = float(((b4 >> 4) & 0xFu) | ((b >> 6) << 4));
+    }
+}
+
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint ir = gl_WorkGroupID.x;
@@ -125,27 +145,8 @@ void main() {
             uint sc0 = gate_u32[blk_u32 + 1u];
             uint sc1 = gate_u32[blk_u32 + 2u];
             uint sc2 = gate_u32[blk_u32 + 3u];
-            uint bytes[12];
-            bytes[0]  = sc0 & 0xFFu;
-            bytes[1]  = (sc0 >> 8) & 0xFFu;
-            bytes[2]  = (sc0 >> 16) & 0xFFu;
-            bytes[3]  = (sc0 >> 24) & 0xFFu;
-            bytes[4]  = sc1 & 0xFFu;
-            bytes[5]  = (sc1 >> 8) & 0xFFu;
-            bytes[6]  = (sc1 >> 16) & 0xFFu;
-            bytes[7]  = (sc1 >> 24) & 0xFFu;
-            bytes[8]  = sc2 & 0xFFu;
-            bytes[9]  = (sc2 >> 8) & 0xFFu;
-            bytes[10] = (sc2 >> 16) & 0xFFu;
-            bytes[11] = (sc2 >> 24) & 0xFFu;
             float sc_val, mn_val;
-            if (sb < 4u) {
-                sc_val = float(bytes[sb] & 63u);
-                mn_val = float(bytes[sb + 4u] & 63u);
-            } else {
-                sc_val = float((bytes[sb + 4u] & 0xFu) | ((bytes[sb - 4u] >> 6) << 4));
-                mn_val = float(((bytes[sb + 4u] >> 4) & 0xFu) | ((bytes[sb] >> 6) << 4));
-            }
+            q4k_scale_min(sb, sc0, sc1, sc2, sc_val, mn_val);
             const float gate_factor = d_val * sc_val;
             const float gate_bias = dmin_val * mn_val;
 
@@ -166,25 +167,7 @@ void main() {
             sc0 = up_u32[blk_u32 + 1u];
             sc1 = up_u32[blk_u32 + 2u];
             sc2 = up_u32[blk_u32 + 3u];
-            bytes[0]  = sc0 & 0xFFu;
-            bytes[1]  = (sc0 >> 8) & 0xFFu;
-            bytes[2]  = (sc0 >> 16) & 0xFFu;
-            bytes[3]  = (sc0 >> 24) & 0xFFu;
-            bytes[4]  = sc1 & 0xFFu;
-            bytes[5]  = (sc1 >> 8) & 0xFFu;
-            bytes[6]  = (sc1 >> 16) & 0xFFu;
-            bytes[7]  = (sc1 >> 24) & 0xFFu;
-            bytes[8]  = sc2 & 0xFFu;
-            bytes[9]  = (sc2 >> 8) & 0xFFu;
-            bytes[10] = (sc2 >> 16) & 0xFFu;
-            bytes[11] = (sc2 >> 24) & 0xFFu;
-            if (sb < 4u) {
-                sc_val = float(bytes[sb] & 63u);
-                mn_val = float(bytes[sb + 4u] & 63u);
-            } else {
-                sc_val = float((bytes[sb + 4u] & 0xFu) | ((bytes[sb - 4u] >> 6) << 4));
-                mn_val = float(((bytes[sb + 4u] >> 4) & 0xFu) | ((bytes[sb] >> 6) << 4));
-            }
+            q4k_scale_min(sb, sc0, sc1, sc2, sc_val, mn_val);
             const float up_factor = d_val * sc_val;
             const float up_bias = dmin_val * mn_val;
 
