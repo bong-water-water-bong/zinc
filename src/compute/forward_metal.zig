@@ -5690,14 +5690,13 @@ pub const InferenceEngine = struct {
     fn queuedTokenMajorAsyncChunkLen(cfg: ModelConfig, prompt_len: usize, token_idx: usize, base_chunk: usize, has_override: bool) usize {
         if (!has_override and isGemma26A4BMoeShape(cfg) and prompt_len == 20 and base_chunk == 4) {
             // Preserve the five-CB shape for the 20-token chat oracle and keep
-            // the GPU starting after one token. Hold the 4-token final drain
-            // that beat the 3-token variant, but bias one more token into the
-            // first substantial async command to test earlier queue occupancy:
-            // 1,6,5,4,4.
+            // the GPU starting after one token. The latest accepted sweep found
+            // 1,5,5,5,4 ahead of the later 1,6,5,4,4 probe, while still
+            // retaining the 4-token final drain that beat the 3-token variant.
             if (token_idx == 0) return 1;
-            if (token_idx == 1) return 6;
-            if (token_idx == 7) return 5;
-            if (token_idx == 12) return 4;
+            if (token_idx == 1) return 5;
+            if (token_idx == 6) return 5;
+            if (token_idx == 11) return 5;
             if (token_idx == 16) return 4;
         }
         return base_chunk;
@@ -26013,6 +26012,44 @@ test "gemma q8 routed moe decode default gates Gemma 26B shape" {
     try std.testing.expect(!gemmaQ8RoutedMoeAllowed(.gemma, false, false));
     try std.testing.expect(gemmaQ8RoutedMoeAllowed(.gemma, false, true));
     try std.testing.expect(gemmaQ8RoutedMoeAllowed(.qwen35, false, false));
+}
+
+test "gemma26 exact 20 token prefill keeps accepted queued split" {
+    const gemma_cfg = ModelConfig{
+        .architecture = .gemma,
+        .n_layers = 30,
+        .n_heads = 16,
+        .n_kv_heads = 8,
+        .head_dim = 512,
+        .hidden_dim = 2816,
+        .intermediate_dim = 704,
+        .vocab_size = 0,
+        .context_length = 0,
+        .rope_freq_base = 1_000_000.0,
+        .rope_freq_base_swa = 10_000.0,
+        .n_experts = 128,
+        .n_experts_used = 8,
+        .rope_dim = 512,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 2112,
+    };
+
+    const base_chunk = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 20, null);
+    try std.testing.expectEqual(@as(usize, 4), base_chunk);
+
+    const expected = [_]usize{ 1, 5, 5, 5, 4 };
+    var token_idx: usize = 0;
+    for (expected) |chunk_len| {
+        const actual = InferenceEngine.queuedTokenMajorAsyncChunkLen(gemma_cfg, 20, token_idx, base_chunk, false);
+        try std.testing.expectEqual(chunk_len, actual);
+        token_idx += actual;
+    }
+    try std.testing.expectEqual(@as(usize, 20), token_idx);
 }
 
 test "gemma26 q8 explicit moe layer can break shared command at fallback boundary" {
