@@ -14,6 +14,7 @@ import {
   noiseAwareImproveBand,
   parseDiagnosticEnv,
   buildPrompt,
+  buildGemmaPrefillPostBreakthroughAnalysis,
   buildQwen36PrefillPlateauAnalysis,
   buildQwen36PrefillPostBreakthroughAnalysis,
   buildReflectionSummary,
@@ -27,6 +28,7 @@ import {
   parseTokPerSec,
   recentAcceptedProgress,
   recordNearMiss,
+  shouldRejectPlateauNeutralKeep,
   shouldConfirmCandidate,
   shouldFinalizeBestTree,
   shouldRejectQwen36PlateauNeutralKeep,
@@ -85,11 +87,14 @@ function makeState(overrides: Partial<RunState> = {}): RunState {
     failedApproaches: [],
     ideas: [],
     phase: "optimize",
+    metricMode: "decode",
     currentBest: null,
     stalledCycles: 0,
     bestTokPerSec: 36,
     lastProfileOutput: null,
     lastProfileCycle: null,
+    lastMetalShapesOutput: null,
+    lastMetalShapesCycle: null,
     reviewSummaries: [],
     ...overrides,
   };
@@ -847,6 +852,126 @@ describe("buildPrompt", () => {
       acceptedTokPerSec: 51.1,
       currentProgressBand: 0.15,
     })).toBe(false);
+  });
+
+  test("Gemma post-80 focus surfaces current profile and plateau rules", () => {
+    const state = makeState({
+      effortId: 11,
+      effortFile: "MULTI_HOUR_EFFORT_11_METAL_GEMMA_M4.md",
+      effortPlan: "# Effort 11\nGemma 4 26B-A4B MoE",
+      metricMode: "prefill",
+      bestTokPerSec: 88.3,
+      currentBest: { tokPerSec: 88.3, containsReference: true },
+      stalledCycles: 8,
+      lastProfileCycle: 98,
+      lastProfileOutput: [
+        "info(forward):   path bytes: ssm 0.00 GiB attn 30.29 GiB dense 0.00 GiB moe-expert 22.78 GiB shared 14.50 GiB lm-head 6.57 GiB router 1.09 GiB",
+        "info(forward):   prefill buckets: moe gate/up 9.65 GiB down 6.44 GiB | shared gate/up 6.84 GiB down 3.42 GiB | waits 1 commits 211.81 ms",
+        "info(forward):   prefill queued prefill: requests 1 prompt_tokens 20 chunks 4 async 3 first_chunks [1,5,7,7,0,0,0,0]",
+        "info(forward):   q8 hot #1: shared M=2112 K=2816 bytes=9.66 GiB calls=1642",
+      ].join("\n"),
+      cycles: [
+        makeCycle({
+          cycle: 98,
+          kept: true,
+          containsReference: true,
+          tokPerSec: 88.3,
+          description: "Collapsed Gemma26 exact-20 queued prefill tail from [1,5,7,6,1] to [1,5,7,7].",
+        }),
+        ...Array.from({ length: 6 }, (_, idx) => makeCycle({
+          cycle: 99 + idx,
+          kept: false,
+          containsReference: true,
+          tokPerSec: 86.0,
+          description: "Retune weighted finalizer sigmoid path",
+        })),
+      ],
+    });
+
+    const analysis = buildGemmaPrefillPostBreakthroughAnalysis(state).join("\n");
+    expect(analysis).toContain("Gemma26 M4 Prefill Post-80 Focus");
+    expect(analysis).toContain("Accepted best is 88.3");
+    expect(analysis).toContain("shared M=2112 K=2816");
+    expect(analysis).toContain("PLATEAU RULE");
+    expect(analysis).toContain("gemma26_prefill_hot");
+  });
+
+  test("Gemma plateau rejects neutral optimization churn but allows evidence work", () => {
+    const state = makeState({
+      effortId: 11,
+      effortFile: "MULTI_HOUR_EFFORT_11_METAL_GEMMA_M4.md",
+      effortPlan: "# Effort 11\nGemma 4 26B-A4B MoE",
+      metricMode: "prefill",
+      bestTokPerSec: 88.3,
+      currentBest: { tokPerSec: 86.1, containsReference: true },
+      stalledCycles: 6,
+      cycles: [
+        makeCycle({ cycle: 98, kept: true, containsReference: true, tokPerSec: 88.3 }),
+        ...Array.from({ length: 6 }, (_, idx) => makeCycle({
+          cycle: 99 + idx,
+          kept: false,
+          containsReference: true,
+          tokPerSec: 86.0,
+        })),
+      ],
+    });
+
+    expect(shouldRejectPlateauNeutralKeep({
+      state,
+      stepKind: "optimization",
+      description: "Retune weighted finalizer sigmoid cache",
+      selfAnalysis: "Should be neutral to slightly faster.",
+      verifyTokPerSec: 86.1,
+      acceptedTokPerSec: 86.1,
+      currentProgressBand: 0.25,
+    })).toBe(true);
+
+    expect(shouldRejectPlateauNeutralKeep({
+      state,
+      stepKind: "optimization",
+      description: "Consume bench-metal-shapes gemma26_prefill_hot evidence before the next retune",
+      selfAnalysis: "Adds exact-shape evidence for shared_gate_gemm.",
+      verifyTokPerSec: 86.1,
+      acceptedTokPerSec: 86.1,
+      currentProgressBand: 0.25,
+    })).toBe(false);
+
+    expect(shouldRejectPlateauNeutralKeep({
+      state,
+      stepKind: "enablement",
+      description: "Add validator guard reason for full batched prefill",
+      selfAnalysis: "Unlocks the next structural fix.",
+      verifyTokPerSec: 86.1,
+      acceptedTokPerSec: 86.1,
+      currentProgressBand: 0.25,
+    })).toBe(false);
+  });
+
+  test("structural pivot directive appears for Gemma prefill plateau", () => {
+    const state = makeState({
+      effortId: 11,
+      effortFile: "MULTI_HOUR_EFFORT_11_METAL_GEMMA_M4.md",
+      effortPlan: "# Effort 11\nGemma 4 26B-A4B MoE prefill",
+      metricMode: "prefill",
+      bestTokPerSec: 88.3,
+      currentBest: { tokPerSec: 86.1, containsReference: true },
+      stalledCycles: 6,
+      cycles: [
+        makeCycle({ cycle: 98, kept: true, containsReference: true, tokPerSec: 88.3 }),
+        ...Array.from({ length: 6 }, (_, idx) => makeCycle({
+          cycle: 99 + idx,
+          kept: false,
+          containsReference: true,
+          tokPerSec: 86.0,
+          description: "Retune weighted finalizer sigmoid path",
+        })),
+      ],
+    });
+
+    const lines = buildStructuralPivotDirective(state).join("\n");
+    expect(lines).toContain("HARD PIVOT MODE");
+    expect(lines).toContain("Gemma26 M4 prefill");
+    expect(lines).toContain("queued-prefill schedule");
   });
 
   test("Gemma effort prompt uses Gemma model facts instead of Qwen facts", () => {

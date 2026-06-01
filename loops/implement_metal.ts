@@ -137,6 +137,18 @@ const STALL_THRESHOLD = 5; // Cycles without tok/s improvement before studying r
 const RECENT_PROGRESS_WINDOW = 10;
 const QWEN36_PLATEAU_STALL_CYCLES = 20;
 const QWEN36_PLATEAU_WINDOW = 32;
+const GEMMA_PLATEAU_STALL_CYCLES = parsePositiveIntEnv("ZINC_GEMMA_PLATEAU_STALL_CYCLES", 6);
+const GEMMA_PLATEAU_WINDOW = parsePositiveIntEnv("ZINC_GEMMA_PLATEAU_WINDOW", 18);
+const GEMMA_POST_BREAKTHROUGH_FLOOR = parsePositiveFloatEnv("ZINC_GEMMA_POST_BREAKTHROUGH_FLOOR", 80);
+// Optional outer-harness exact-shape Metal evidence pass. Agents are blocked
+// from running `bench-metal-shapes` because it reserves the Metal GPU; the
+// harness can safely run it between cycles and splice the output into the next
+// prompt. Disabled by default for existing efforts. For Gemma26 prefill plateau
+// work, use:
+//   ZINC_METAL_SHAPES_EVERY=3
+//   ZINC_METAL_SHAPES_ARGS="--case gemma26_prefill_hot --pipeline production --route-tokens 20 --iterations 80 --warmup 10"
+const METAL_SHAPES_EVERY = parsePositiveIntEnv("ZINC_METAL_SHAPES_EVERY", 0);
+const METAL_SHAPES_ARGS_RAW = process.env.ZINC_METAL_SHAPES_ARGS ?? "";
 const AUTO_STOP_PLATEAU = parseBoolEnv("ZINC_AUTO_STOP_PLATEAU", true);
 const AUTO_STOP_REVERT_STREAK = parsePositiveIntEnv("ZINC_AUTO_STOP_REVERT_STREAK", 18);
 const AUTO_STOP_NO_BEST_CYCLES = parsePositiveIntEnv("ZINC_AUTO_STOP_NO_BEST_CYCLES", 20);
@@ -221,6 +233,12 @@ function parseMetricModeEnv(name: string, fallback: MetricMode): MetricMode {
 
 function zincModelArgs(): string[] {
   return MODEL_PATH ? ["-m", MODEL_PATH] : ["--model-id", MODEL_ID];
+}
+
+function managedModelPathForBenchmark(): string {
+  if (MODEL_PATH) return MODEL_PATH;
+  const home = process.env.HOME ?? "";
+  return join(home, "Library", "Caches", "zinc", "models", "models", MODEL_ID, "model.gguf");
 }
 
 function zincPromptArgs(): string[] {
@@ -619,7 +637,10 @@ export function buildStructuralPivotDirective(state: RunState): string[] {
     revertStreak: STRUCTURAL_PIVOT_REVERT_STREAK,
     noBestCycles: STRUCTURAL_PIVOT_NO_BEST_CYCLES,
   });
-  if (!stopLike.stop && state.stalledCycles < QWEN36_PLATEAU_STALL_CYCLES) return [];
+  const stallThreshold = isGemmaRun(state) && (state.metricMode ?? METRIC_MODE) === "prefill"
+    ? GEMMA_PLATEAU_STALL_CYCLES
+    : QWEN36_PLATEAU_STALL_CYCLES;
+  if (!stopLike.stop && state.stalledCycles < stallThreshold) return [];
 
   const best = bestKeptCorrectCycle(state);
   const current = currentAcceptedTokPerSec(state);
@@ -636,10 +657,87 @@ export function buildStructuralPivotDirective(state: RunState): string[] {
   if (isQwen36LargeMoeRun(state)) {
     lines.push("- For Qwen3.6 35B, stop spending cycles on another `simd_sum`, lane-writeback, threadgroup-size, or narrow Q8 sibling variant unless a fresh profile names that exact kernel as the top remaining cost.");
     lines.push("- Pick one structural lever: MoE finalizer/barrier fusion, per-token command-buffer batching, expert dispatch/buffer fusion, or a measurement foundation that directly quantifies one of those buckets.");
+  } else if (isGemmaRun(state) && (state.metricMode ?? METRIC_MODE) === "prefill") {
+    lines.push("- For Gemma26 M4 prefill, stop spending cycles on another weighted-finalizer or narrow Q8 threadgroup retune unless the latest profile or `bench-metal-shapes` evidence names that exact shape as underperforming.");
+    lines.push("- Productive directions so far are queued-prefill schedule changes and router/RMS fusion. Prefer consuming exact-shape evidence, auditing full batched-prefill guard blockers, or validating public-suite prompt lengths.");
   } else {
     lines.push("- Stop spending cycles on local arithmetic cleanup. Pick a scheduler/fusion/measurement change that can alter a named hot bucket, or explicitly mark the step as analysis.");
   }
   lines.push("- If the next change is not expected to move at least the promotion band, label it `@@@STEP_KIND: analysis` or `@@@STEP_KIND: enablement` and state the exact speed path it unlocks.");
+  return lines;
+}
+
+function isGemmaPrefillPostBreakthrough(state: RunState): boolean {
+  return isGemmaRun(state) &&
+    (state.metricMode ?? METRIC_MODE) === "prefill" &&
+    bestKeptCorrectTokPerSec(state) >= GEMMA_POST_BREAKTHROUGH_FLOOR;
+}
+
+function cyclesSinceBestKept(state: RunState): number {
+  const best = bestKeptCorrectCycle(state);
+  const last = state.cycles[state.cycles.length - 1];
+  if (!best || !last) return 0;
+  return Math.max(0, last.cycle - best.cycle);
+}
+
+export function buildGemmaPrefillPostBreakthroughAnalysis(state: RunState): string[] {
+  if (!isGemmaPrefillPostBreakthrough(state)) return [];
+
+  const best = bestKeptCorrectTokPerSec(state);
+  const current = currentAcceptedTokPerSec(state);
+  const cyclesSinceBest = cyclesSinceBestKept(state);
+  const recent = state.cycles.slice(-GEMMA_PLATEAU_WINDOW);
+  const recentKept = recent.filter(c => c.kept && c.containsReference);
+  const recentReverted = recent.filter(c => !c.kept);
+  const q8Retunes = recent.filter(c =>
+    /q8|threadgroup|tg128|tg64|paired|repack|finalizer|sigmoid|fast::exp/i.test(`${c.description}\n${c.selfAnalysis}`)
+  );
+  const scheduleWins = recent.filter(c =>
+    c.kept && /queued prefill|split|schedule|\[[0-9, ]+\]|tail/i.test(c.description)
+  );
+  const profile = state.lastProfileOutput ?? "";
+  const pathLine = profile.split("\n").find(line => /path bytes:/i.test(line));
+  const prefillMoeLine = profile.split("\n").find(line => /prefill buckets: moe/i.test(line));
+  const queuedLine = profile.split("\n").find(line => /prefill queued prefill:/i.test(line));
+  const queueLine = profile.split("\n").find(line => /prefill queued prefill queue:/i.test(line));
+  const q8Hot = profile.split("\n").filter(line => /q8 hot #/i.test(line)).slice(0, 4);
+  const evidence = state.lastMetalShapesOutput ?? "";
+
+  const lines = [
+    "## Gemma26 M4 Prefill Post-80 Focus",
+    `- Accepted best is ${best.toFixed(1)} prefill tok/s; current tree is ${current.toFixed(1)}; target is ${TARGET_TOK_PER_SEC.toFixed(1)}. Remaining gap is ${(TARGET_TOK_PER_SEC - best).toFixed(1)} tok/s (${(((TARGET_TOK_PER_SEC - best) / best) * 100).toFixed(1)}%).`,
+    `- Recent window: ${recentKept.length}/${recent.length} kept, ${recentReverted.length} reverted, ${cyclesSinceBest} cycles since best. Do not optimize from pre-80 or cycle-49 assumptions.`,
+  ];
+
+  if (pathLine) lines.push(`- Latest path mix: ${pathLine.trim()}`);
+  if (prefillMoeLine) lines.push(`- Latest MoE/shared buckets: ${prefillMoeLine.trim()}`);
+  if (queuedLine) lines.push(`- Latest queued schedule: ${queuedLine.trim()}`);
+  if (queueLine) lines.push(`- Latest queued waits: ${queueLine.trim()}`);
+  if (q8Hot.length > 0) {
+    lines.push(`- Latest Q8 hot shapes: ${q8Hot.map(line => line.trim().replace(/^info\(forward\):\s*/, "")).join(" | ")}`);
+  }
+  if (scheduleWins.length > 0) {
+    const topSchedule = [...scheduleWins]
+      .sort((a, b) => (b.tokPerSec ?? 0) - (a.tokPerSec ?? 0))[0];
+    lines.push(`- Banked schedule win: ${cycleSummary(topSchedule)}. A new split must beat this, not merely recover an older slower split.`);
+  }
+  if (q8Retunes.length >= 5) {
+    lines.push(`- Cooldown: ${q8Retunes.length}/${recent.length} recent cycles touched Q8/finalizer/threadgroup-style retunes. The next such optimization needs exact-shape microbench or profile evidence showing the candidate can save at least 1 tok/s.`);
+  }
+  if (evidence.trim().length > 0) {
+    lines.push(`- Latest Metal-shapes evidence is available from cycle ${state.lastMetalShapesCycle ?? "?"}. Consume it before adding another microbench or shader retune.`);
+  } else {
+    lines.push("- No Metal-shapes evidence has been captured by the outer harness yet. If targeting shared Q8, first enable `ZINC_METAL_SHAPES_EVERY` or add a default-off exact-shape case and let the harness run it.");
+  }
+  if (state.stalledCycles >= GEMMA_PLATEAU_STALL_CYCLES || cyclesSinceBest >= GEMMA_PLATEAU_STALL_CYCLES) {
+    lines.push("- PLATEAU RULE: neutral `optimization` keeps are churn here. A speed-neutral cycle should be `analysis`/`enablement` and produce evidence the next cycle can consume.");
+  }
+  lines.push(
+    "- Best next moves: consume `gemma26_prefill_hot` evidence; audit why the full Gemma batched-prefill path is still not the public-suite default; or test public-suite prompt lengths before another exact-20 schedule tweak.",
+    "- Avoid: weighted-finalizer sigmoid/cache/threadgroup micro-retunes, broad Q8 repacks, and route-pack semantic changes without validation-on logits parity.",
+    "",
+  );
+
   return lines;
 }
 
@@ -2546,6 +2644,17 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     );
   }
 
+  if (state.lastMetalShapesOutput) {
+    sections.push(
+      `## Metal Shapes Evidence (cycle ${state.lastMetalShapesCycle})`,
+      "Outer-harness exact-shape benchmark output. Agents must consume this before proposing another same-shape shader retune.",
+      "```",
+      state.lastMetalShapesOutput.slice(-3000),
+      "```",
+      "",
+    );
+  }
+
   // Build/test/run output
   if (lastResult.buildOutput) {
     sections.push("## Build Output (last 2000 chars)", "```", buildOut, "```", "");
@@ -2571,6 +2680,11 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
   const qwen36PrefillFocus = buildQwen36PrefillFocus(state, lastResult);
   if (qwen36PrefillFocus.length > 0) {
     sections.push(...qwen36PrefillFocus);
+  }
+
+  const gemmaPrefillFocus = buildGemmaPrefillPostBreakthroughAnalysis(state);
+  if (gemmaPrefillFocus.length > 0) {
+    sections.push(...gemmaPrefillFocus);
   }
 
   sections.push(
@@ -2664,6 +2778,7 @@ export type RunState = {
   failedApproaches: string[];
   ideas: string[];
   phase: Phase;
+  metricMode?: MetricMode | null;
   currentBest: { tokPerSec: number | null; containsReference: boolean } | null;
   stalledCycles: number;
   bestTokPerSec: number;
@@ -2674,6 +2789,12 @@ export type RunState = {
   bestIncorrect?: NearMiss | null;
   lastProfileOutput: string | null;
   lastProfileCycle: number | null;
+  /// Optional outer-harness exact-shape Metal benchmark output. This is
+  /// separate from `lastProfileOutput`: profile measures whole-model request
+  /// behavior, while Metal-shapes isolates hot kernels the agent is blocked
+  /// from benchmarking directly.
+  lastMetalShapesOutput?: string | null;
+  lastMetalShapesCycle?: number | null;
   /// Most recent near-miss diagnostic run (see ZINC_NEAR_MISS_DIAGNOSTIC_ENV).
   /// Captured AFTER the keep verdict, runs the binary with extra env applied so
   /// validators / probes that the kept tree leaves default-off still fire and
@@ -2794,6 +2915,66 @@ async function runProfileBenchmark(): Promise<string> {
   const combined = (run.stderr + run.stdout).slice(-4000);
   console.log(clr("2", "    profile captured"));
   return combined;
+}
+
+function splitShellWords(raw: string): string[] {
+  return raw.trim().split(/\s+/).filter((s) => s.length > 0);
+}
+
+async function runMetalShapesBenchmark(): Promise<string> {
+  const modelPath = managedModelPathForBenchmark();
+  if (!existsSync(modelPath)) {
+    throw new Error(`managed model path for bench-metal-shapes not found: ${modelPath}`);
+  }
+
+  const extraArgs = METAL_SHAPES_ARGS_RAW.trim().length > 0
+    ? splitShellWords(METAL_SHAPES_ARGS_RAW)
+    : [
+        "--case", "gemma26_prefill_hot",
+        "--pipeline", "production",
+        "--route-tokens", String(Math.max(1, MAX_TOKENS + 4)),
+        "--iterations", "80",
+        "--warmup", "10",
+      ];
+
+  console.log(clr("1;35", `  🔬 Metal-shapes evidence run (${extraArgs.join(" ")})...`));
+  const run = await runCommand(
+    "zig",
+    ["build", "bench-metal-shapes", "--", "-m", modelPath, ...extraArgs],
+    { timeout: RUN_TIMEOUT_MS },
+  );
+  const combined = (run.stderr + run.stdout).slice(-6000);
+  if (run.exitCode !== 0) {
+    throw new Error(combined);
+  }
+  console.log(clr("2", `    metal-shapes captured (${combined.length} bytes)`));
+  return combined;
+}
+
+function shouldRunMetalShapesEvidence(args: {
+  state: RunState;
+  cycle: number;
+  kept: boolean;
+  containsReference: boolean;
+  stepKind: StepKind;
+  description: string;
+  selfAnalysis: string;
+  ideas: string[];
+}): boolean {
+  if (METAL_SHAPES_EVERY <= 0) return false;
+  if (!args.kept || !args.containsReference) return false;
+  if (args.cycle % METAL_SHAPES_EVERY === 0) return true;
+
+  const text = [
+    args.description,
+    args.selfAnalysis,
+    ...args.ideas,
+  ].join("\n").toLowerCase();
+
+  return isGemmaPrefillPostBreakthrough(args.state) &&
+    (args.state.stalledCycles >= GEMMA_PLATEAU_STALL_CYCLES ||
+      cyclesSinceBestKept(args.state) >= GEMMA_PLATEAU_STALL_CYCLES ||
+      /\b(bench-metal-shapes|metal-shapes|gemma26_prefill_hot|microbench|shared_gate_gemm|exact-shape)\b/.test(text));
 }
 
 /**
@@ -3028,6 +3209,35 @@ function parseStepKind(raw: string | undefined, description: string, selfAnalysi
   return inferStepKind(description, selfAnalysis);
 }
 
+export function shouldRejectPlateauNeutralKeep(args: {
+  state: RunState;
+  stepKind: StepKind;
+  description: string;
+  selfAnalysis: string;
+  verifyTokPerSec: number;
+  acceptedTokPerSec: number;
+  currentProgressBand: number;
+}): boolean {
+  if (args.verifyTokPerSec >= args.acceptedTokPerSec + args.currentProgressBand) return false;
+  if (args.stepKind !== "optimization") return false;
+
+  const text = `${args.description}\n${args.selfAnalysis}`.toLowerCase();
+  if (/\b(profile|measure|microbench|counter|diagnos|validator|validate|diff|instrument|coherence|harness|bench-metal-shapes|metal-shapes|exact-shape)\b/.test(text)) {
+    return false;
+  }
+
+  if (isQwen36PrefillRun(args.state)) {
+    return args.state.stalledCycles >= QWEN36_PLATEAU_STALL_CYCLES;
+  }
+
+  if (isGemmaPrefillPostBreakthrough(args.state)) {
+    return args.state.stalledCycles >= GEMMA_PLATEAU_STALL_CYCLES ||
+      cyclesSinceBestKept(args.state) >= GEMMA_PLATEAU_STALL_CYCLES;
+  }
+
+  return false;
+}
+
 export function shouldRejectQwen36PlateauNeutralKeep(args: {
   state: RunState;
   stepKind: StepKind;
@@ -3037,16 +3247,15 @@ export function shouldRejectQwen36PlateauNeutralKeep(args: {
   acceptedTokPerSec: number;
   currentProgressBand: number;
 }): boolean {
-  if (!isQwen36PrefillRun(args.state)) return false;
-  if (args.state.stalledCycles < QWEN36_PLATEAU_STALL_CYCLES) return false;
-  if (args.verifyTokPerSec >= args.acceptedTokPerSec + args.currentProgressBand) return false;
-  if (args.stepKind !== "optimization") return false;
+  return shouldRejectPlateauNeutralKeep(args);
+}
 
-  const text = `${args.description}\n${args.selfAnalysis}`.toLowerCase();
-  if (/\b(profile|measure|microbench|counter|diagnos|validator|validate|diff|instrument|coherence|harness)\b/.test(text)) {
-    return false;
-  }
-  return true;
+function shouldPreservePromotedBestStallPressure(
+  state: RunState,
+  verifyTokPerSec: number,
+  bestTokPerSec: number,
+): boolean {
+  return isGemmaPrefillPostBreakthrough(state) && verifyTokPerSec < bestTokPerSec;
 }
 
 // ── Main loop ────────────────────────────────────────────────────────
@@ -3198,10 +3407,13 @@ async function main() {
     state = loaded;
     // Backfill fields that may not exist in older state files
     state.reviewSummaries ??= [];
+    state.metricMode ??= METRIC_MODE;
     state.stalledCycles ??= 0;
     state.bestTokPerSec ??= 0;
     state.lastProfileOutput ??= null;
     state.lastProfileCycle ??= null;
+    state.lastMetalShapesOutput ??= null;
+    state.lastMetalShapesCycle ??= null;
     state.effortPlan ??= null;
     state.effortId ??= null;
     state.effortFile ??= null;
@@ -3256,12 +3468,15 @@ async function main() {
       failedApproaches: [],
       ideas: [],
       phase: "optimize",
+      metricMode: METRIC_MODE,
       currentBest: null,
       stalledCycles: 0,
       bestTokPerSec: 0,
       bestTree: null,
       lastProfileOutput: null,
       lastProfileCycle: null,
+      lastMetalShapesOutput: null,
+      lastMetalShapesCycle: null,
       lastNearMissDiagnostic: null,
       crossEffortBaseline: null,
       lastCrossEffort: null,
@@ -3459,7 +3674,7 @@ async function main() {
       // advance bestTokPerSec. Advancing on noise creates a one-way
       // ratchet that pretends throughput improved when it did not
       // (Effort 12 cycles 1-24 went 0.21 → 0.30 this way, all noise).
-      if (shouldRejectQwen36PlateauNeutralKeep({
+      if (shouldRejectPlateauNeutralKeep({
         state,
         stepKind,
         description,
@@ -3468,15 +3683,20 @@ async function main() {
         acceptedTokPerSec: acceptedTps,
         currentProgressBand,
       })) {
-        console.log(clr("1;31", `  ↩ REVERTING — Qwen36 plateau mode rejects neutral ${stepKind} keep at ${verifyTps.toFixed(2)} ${METRIC_LABEL}; current ${acceptedTps.toFixed(2)}`));
+        console.log(clr("1;31", `  ↩ REVERTING — plateau mode rejects neutral ${stepKind} keep at ${verifyTps.toFixed(2)} ${METRIC_LABEL}; current ${acceptedTps.toFixed(2)}`));
         await resetCycleToPreHash(preHash);
         state.failedApproaches.push(`${description} — plateau-neutral ${stepKind} did not beat current ${acceptedTps.toFixed(1)} ${METRIC_LABEL}`);
         state.stalledCycles++;
       } else {
         kept = true;
         if (verifyTps >= acceptedTps + currentProgressBand) {
-          state.stalledCycles = 0;
-          console.log(clr("1;32", `  ↑ KEPT — current accepted improved ${acceptedTps.toFixed(2)} → ${verifyTps.toFixed(2)} ${METRIC_LABEL} (below promotion band +${improveBand.toFixed(2)})`));
+          if (shouldPreservePromotedBestStallPressure(state, verifyTps, bestTps)) {
+            state.stalledCycles++;
+            console.log(clr("1;32", `  ↑ KEPT — current accepted improved ${acceptedTps.toFixed(2)} → ${verifyTps.toFixed(2)} ${METRIC_LABEL}, but remains below promoted best ${bestTps.toFixed(2)}; plateau pressure preserved`));
+          } else {
+            state.stalledCycles = 0;
+            console.log(clr("1;32", `  ↑ KEPT — current accepted improved ${acceptedTps.toFixed(2)} → ${verifyTps.toFixed(2)} ${METRIC_LABEL} (below promotion band +${improveBand.toFixed(2)})`));
+          }
         } else {
           state.stalledCycles++;
           console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (within ${noiseBand.toFixed(2)} of current ${acceptedTps.toFixed(2)}; best ${bestTps.toFixed(2)} unchanged)`));
@@ -3543,6 +3763,26 @@ async function main() {
         await writeFile(join(cycleDir, "profile.log"), state.lastProfileOutput);
       } catch {
         console.log(clr("1;33", "  ⚠ Profile run failed, continuing"));
+      }
+    }
+
+    if (shouldRunMetalShapesEvidence({
+      state,
+      cycle,
+      kept,
+      containsReference: verify.containsReference,
+      stepKind,
+      description,
+      selfAnalysis,
+      ideas: newIdeas,
+    })) {
+      try {
+        state.lastMetalShapesOutput = await runMetalShapesBenchmark();
+        state.lastMetalShapesCycle = cycle;
+        await writeFile(join(cycleDir, "metal_shapes.log"), state.lastMetalShapesOutput);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message.slice(-500) : String(err);
+        console.log(clr("1;33", `  ⚠ Metal-shapes evidence run failed, continuing: ${msg}`));
       }
     }
 

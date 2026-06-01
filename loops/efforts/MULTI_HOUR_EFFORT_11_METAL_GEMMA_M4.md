@@ -49,6 +49,49 @@ Diagnosis:
   obsolete. Gemma has a GPU-routed path now; the next work is coverage proof,
   grouped expert execution, and profile-grounded decode isolation.
 
+## Current controller result - 2026-06-01 local M4 prefill loop
+
+The first 100-cycle prefill controller run improved the Paris chat harness from
+about 36 tok/s to a promoted best of **88.30 prefill tok/s**. The 100 tok/s
+target was not reached. The best tree is cycle 98:
+
+```text
+cycle 98: Collapsed Gemma26 exact-20 queued prefill tail from [1,5,7,6,1] to [1,5,7,7].
+```
+
+Cross-effort decode was not the problem in that run. The latest decode guard
+reported about **70.6 tok/s**, roughly +99% above the guard baseline.
+
+What actually moved prefill:
+
+- Cycle 11/12 class: dispatch collapse and routed-MoE expert-down cleanup.
+- Cycle 25: queued prefill scheduling.
+- Cycle 54: fused F32 router/top-k path.
+- Cycle 59: fused gate-scale RMS + router path.
+- Cycle 98: exact-20 queued-prefill tail schedule `[1,5,7,7]`.
+
+Latest useful profile evidence near cycle 98:
+
+```text
+prefill wait: ~211.81 ms
+dmmv prefill bytes: ~49.25 GiB
+path bytes: attn 30.29 GiB, moe-expert 22.78 GiB, shared 14.50 GiB, lm-head 6.57 GiB, router 1.09 GiB
+q8 hot #1: shared M=2112 K=2816 bytes=9.66 GiB calls=1642
+queued prefill: prompt_tokens 20, chunks 4, first_chunks [1,5,7,7]
+```
+
+Interpretation:
+
+- The post-80 run is no longer about entering the Gemma routed path; it is about
+  extracting the remaining 11.7 tok/s from queued-prefill scheduling, shared
+  expert Q8 shapes, and the guard blockers that keep the full batched-prefill
+  path from being a public-suite default.
+- Neutral same-family optimization keeps are now churn. After six cycles
+  without a promoted best, a speed-neutral `optimization` should be reverted
+  unless it adds or consumes exact-shape evidence.
+- Do not optimize from pre-cycle-59 or cycle-49 numbers. Treat 88.30 tok/s as
+  the current floor and cycle 98 as the schedule baseline.
+
 ## Loop recipes
 
 Use the Paris chat prompt for `implement_metal.ts` because the harness still
@@ -102,6 +145,9 @@ ZINC_CROSS_EFFORT_METRIC=decode \
 ZINC_CROSS_EFFORT_PROMPT_MODE=chat \
 ZINC_CROSS_EFFORT_MAX_TOKENS=96 \
 ZINC_CROSS_EFFORT_EVERY=3 \
+ZINC_GEMMA_PLATEAU_STALL_CYCLES=6 \
+ZINC_METAL_SHAPES_EVERY=3 \
+ZINC_METAL_SHAPES_ARGS="--case gemma26_prefill_hot --pipeline production --route-tokens 20 --iterations 80 --warmup 10" \
 ZINC_CODEX_REASONING_EFFORT=xhigh \
 bun loops/implement_metal.ts --resume --effort 11 --agent codex --model gpt-5.5 --cycles 100
 ```
@@ -396,8 +442,22 @@ surrounding path has changed substantially:
   shader.
 - Default-on Gemma batched prefill without validation-on logits parity regressed
   cycle 69.
+- Post-cycle-90 weighted-finalizer, sigmoid/cache, and narrow Q8 finalizer
+  retunes did not beat the cycle-98 promoted best.
+- Queued-prefill schedule `[1,6,7,6]` regressed versus `[1,5,7,7]` on the
+  exact-20 Paris harness.
+- Overlapping expert-down/shared GeGLU attempts regressed in the post-80 window.
 - No-code study cycles are not useful unless they land measurement coverage or
   update this effort file with a concrete, current no-code conclusion.
+
+## Next best targets after cycle 98
+
+1. Consume `bench-metal-shapes --case gemma26_prefill_hot --pipeline production
+   --route-tokens 20` evidence before another shared-Q8 or finalizer retune.
+2. Audit the exact guard blockers preventing the full Gemma batched-prefill path
+   from becoming default-on under public-suite prompt lengths.
+3. Validate the cycle-98 tree on the public performance suite before publishing
+   site numbers or optimizing only the 20-token Paris shape further.
 
 ## Measurement gates
 
