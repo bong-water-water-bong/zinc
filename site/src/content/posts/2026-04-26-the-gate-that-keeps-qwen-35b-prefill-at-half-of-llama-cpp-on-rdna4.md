@@ -39,7 +39,11 @@ faqs:
   - question: "What is the single change that would close the most ground?"
     answer: "Loading the SSM token-recurrent state once per workgroup and walking all 154 prompt tokens inside the kernel, the way llama.cpp's gated_delta_net.cu kernel does on CUDA. Today every token re-reads and re-writes 2 MB of state per SSM layer, which is roughly 18 GB of read traffic and 18 GB of write traffic per prefill. Block-resident state collapses that to 4 MB total per layer and keeps the state vector in registers across the token loop. The expected bucket reduction is ssm_delta from 449 ms to about 150 ms, which is roughly 15 to 20 percent of end-to-end prefill."
 excerpt: "ZINC's per-token prefill on Qwen 3.5/3.6 35B-A3B runs at 90.24 tok/s on a Radeon AI PRO R9700. llama.cpp on the same card hits 180 tok/s on the same prompt and weights. The remaining 2x gap is not a kernel-by-kernel gap. It is a single early return in canUseBatchedPrefillRdna that locks every Mixture-of-Experts plus state-space hybrid model onto a per-token decode loop, dispatching 45,000 workgroups per prompt where llama.cpp dispatches 288. Here is what 50 autonomous-loop cycles found, what is still left, and which two changes close most of the remaining ground."
+seoTitle: "Qwen 35B Prefill on RDNA4"
+seoDescription: "Why Qwen 3.5/3.6 35B-A3B prefill on AMD RDNA4 trails llama.cpp, and how SSM, MoE, and batched kernels close the gap."
 ---
+
+For Qwen 35B prefill on RDNA4, the short answer is that ZINC is not mainly shader-limited. The remaining gap to llama.cpp comes from running a hybrid MoE plus SSM model through a per-token schedule instead of a batched prefill path. The fix is to batch the SSM and MoE work, not keep polishing isolated decode-shaped kernels.
 
 A 154-token prompt on Qwen 3.6 35B-A3B at Q4_K_XL runs through ZINC's RDNA4 path at **90.24 tok/s**. The same prompt and weights through [llama.cpp's Vulkan backend](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-vulkan/ggml-vulkan.cpp) on the same Radeon AI PRO R9700 lands at roughly **180 tok/s**. We started this effort at 78.11 tok/s and have run 50 autonomous-loop optimization cycles to reach 90.24. The remaining 2x is the part that is not going to come from one more shader rewrite.
 

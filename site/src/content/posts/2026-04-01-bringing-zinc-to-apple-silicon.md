@@ -24,7 +24,11 @@ keywords:
   - MoE Metal kernels
   - Vulkan to Metal port
 excerpt: "ZINC now runs natively on Apple Silicon through a Metal backend built from scratch. Not a Vulkan translation layer. Not MLX. Hand-tuned MSL shaders, zero-copy model loading, and the same OpenAI-compatible API. This is the story of how we got there."
+seoTitle: "Apple Silicon LLM Inference with Metal"
+seoDescription: "How ZINC runs local LLM inference on Apple Silicon with native Metal kernels, unified memory, zero-copy loading, and OpenAI-compatible serving."
 ---
+
+For Apple Silicon local LLM inference, ZINC uses Metal directly rather than a Vulkan translation layer. That keeps model weights in unified memory with zero-copy loading, lets the engine use native MSL kernels, and preserves the same tokenizer, GGUF loader, and OpenAI-compatible API as the AMD Vulkan backend.
 
 Twenty-one thousand command buffer commits per decode run. That was the number staring back at us from the Metal profiler when we first got a 35B model running on Apple Silicon. The GPU kernels were fast. The engine was spending most of its time asking the GPU to please start working.
 

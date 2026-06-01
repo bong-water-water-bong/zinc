@@ -26,7 +26,11 @@ keywords:
   - chunked prefill single user local
   - Radeon AI PRO R9700 prefill chunking
 excerpt: "On a long local Qwen3 prompt the first decode token does not appear until prefill finishes. The size of the prefill chunk is the knob that decides how long that wait is, how much activation memory the engine reserves, and whether a second chat slot gets to make progress at the same time. The default is 512 tokens because it is safe, not because it is fast."
+seoTitle: "Chunked Prefill and TTFT for Qwen3"
+seoDescription: "How chunk size, ubatch, and activation memory set first-token latency for long Qwen3 prompts on local AMD RDNA4 inference."
 ---
+
+Chunked prefill is the main local LLM knob for first-token latency on long Qwen3 prompts. Bigger chunks usually improve TTFT until activation memory or model-specific allocator limits push back; smaller chunks are safer but can leave RDNA4 matrix hardware underfed. The right setting depends on model, context length, and free GPU memory.
 
 On a local 16k-token prompt, the wait the user actually feels is prefill. The first decode step cannot start until the model has finished chewing through the prompt, and everything downstream of that, the sampler, the tokenizer round trip, the streaming, sits behind that single fence.
 

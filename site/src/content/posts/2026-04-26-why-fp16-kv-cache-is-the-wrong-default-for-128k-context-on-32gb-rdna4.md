@@ -24,7 +24,11 @@ keywords:
   - Vulkan KV cache layout RDNA4
   - long context local LLM consumer GPU
 excerpt: "On a 32 GB Radeon AI PRO R9700 the model weights are not the binding constraint at long context. The KV cache is. At 128k tokens on Qwen3.5-35B-A3B a default FP16 KV cache is 15.4 GiB, which together with the Q4_K_M weights walks straight off the 32 GB ceiling. Quantizing the KV cache is not a polish step. It is the only way the long-context local prompt fits at all."
+seoTitle: "KV Cache Quantization on RDNA4"
+seoDescription: "Why 128k local LLM context on 32 GB AMD RDNA4 needs KV cache quantization instead of FP16 K/V storage."
 ---
+
+For long-context local LLM inference on a 32 GB AMD RDNA4 card, KV cache quantization is the difference between fitting the prompt and running out of VRAM. FP16 K/V storage is easy to implement, but at 128k context it consumes enough memory to crowd out the model itself. INT8 or asymmetric K/V quantization should be treated as the practical default for serious long-context work.
 
 The first time a long prompt runs out of memory on a 32 GB Radeon AI PRO R9700, the instinct is to blame the model. Twenty gigabytes of weights, eight gigabytes of "miscellaneous", and the OS holding the rest, the story goes. The story is wrong. On Qwen3.5-35B-A3B at Q4_K_M the weights are 20.0 GiB, the working memory the engine uses for projections and reductions is well under one gigabyte, and the thing that actually moves with the prompt length is the KV cache. At 128k tokens it is fifteen and a half gigabytes on its own, and on a 32 GB card that is the difference between a useful long prompt and a hard out-of-memory.
 

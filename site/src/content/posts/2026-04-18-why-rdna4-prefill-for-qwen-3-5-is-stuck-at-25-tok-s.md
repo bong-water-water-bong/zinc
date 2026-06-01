@@ -38,7 +38,11 @@ faqs:
   - question: "What is the planned architectural fix for ZINC RDNA4 prefill?"
     answer: "Route the four SSM projections for a prompt chunk through one cooperative matrix matmul instead of 154 single-token DMMVs, batch the MoE router the same way, and add a Q8_1 activation quantization step plus a mul_mmq path for the largest DMMVs, following the pattern in llama.cpp's Vulkan backend."
 excerpt: "Prefill on Qwen3.5-35B on AMD RDNA4 in ZINC is stuck at 25.67 tok/s while decode runs at 73. After 24 optimization cycles, only three moved the number. Here is what the measurements said about why, and what they say about how local inference engines should actually be tuned on consumer AMD."
+seoTitle: "RDNA4 Prefill Bottlenecks for Qwen"
+seoDescription: "Why Qwen3.5 35B prefill on AMD RDNA4 is schedule-limited: decode-shaped loops, SSM projections, MoE routing, and llama.cpp gaps."
 ---
+
+AMD RDNA4 prefill for Qwen3.5 35B is bottlenecked by schedule shape more than raw shader throughput. If an engine ingests a prompt by replaying decode one token at a time, it re-reads the same weights hundreds of times and loses the advantage that batched prefill is supposed to create. The fix is model-aware batched kernels for SSM, MoE, and attention.
 
 We ran 24 optimization cycles on RDNA4 prefill for the Qwen3.5-35B-A3B flagship inside ZINC. Three of them moved the number. The other 21 measured flat or negative.
 

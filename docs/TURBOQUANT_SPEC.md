@@ -2,6 +2,18 @@
 
 > This is a forward-looking implementation spec. Capacity and concurrency examples in this document describe the intended effect of TurboQuant, not the current public ZINC throughput baseline.
 
+Quick answer: TurboQuant is the candidate path for making long-context local LLM inference fit on 16 GB and 32 GB GPUs without leaving the KV cache in FP16. It compresses K/V pages to roughly 2-4 bits per coordinate, keeps attention inner products unbiased with QJL correction, and is most relevant when context length or concurrent sessions make KV memory the limiting factor.
+
+## Fast Read
+
+| Question | Short answer |
+| --- | --- |
+| What problem does this solve? | KV cache memory growth at long context and under concurrent local serving. |
+| Where does it fit in ZINC? | As a compressed paged-KV cache representation read by attention kernels. |
+| Why not just FP16 KV? | FP16 is simple but dominates VRAM at long context on 16 GB and 32 GB cards. |
+| Why not just naive Q4/Q8? | Attention needs low-bias inner products; TurboQuant adds QJL correction for keys. |
+| Current status | Implementation spec and design target, not the current public runtime default. |
+
 ## Overview
 
 TurboQuant (ICLR 2026) is a two-stage vector quantization algorithm that compresses LLM key-value caches to 2-4 bits per coordinate with minimal impact on attention accuracy. At 3-bit, a 289 MB KV cache (8K context, 36-layer model) shrinks to 58 MB — a 5x reduction that directly translates to longer contexts or more concurrent requests on the same GPU.

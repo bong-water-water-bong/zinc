@@ -5,15 +5,57 @@ import { getCollection } from 'astro:content';
 
 const posts = (await getCollection('posts', ({ data }) => !data.draft))
   .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf());
+
+const topicLinks = [
+  {
+    label: 'Qwen3.6 architecture',
+    href: '/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc',
+    detail: 'Hybrid attention, sparse MoE, GGUF status, and local inference constraints.',
+  },
+  {
+    label: 'Gemma 4 local inference',
+    href: '/blog/2026-04-24-the-single-push-constant-blocking-gemma-4-prefill-on-rdna4',
+    detail: 'Sliding-window attention, asymmetric GQA, Vulkan prefill, and RDNA4 limits.',
+  },
+  {
+    label: 'MoE inference',
+    href: '/blog/2026-04-04-how-moe-models-work-in-zinc',
+    detail: 'Router top-k, shared experts, Qwen, Gemma, and GPU execution costs.',
+  },
+  {
+    label: 'RDNA4 performance',
+    href: '/blog/2026-04-18-why-rdna4-prefill-for-qwen-3-5-is-stuck-at-25-tok-s',
+    detail: 'R9700, Vulkan kernels, llama.cpp comparisons, prefill, and decode.',
+  },
+  {
+    label: 'KV cache and quantization',
+    href: '/blog/2026-04-26-why-fp16-kv-cache-is-the-wrong-default-for-128k-context-on-32gb-rdna4',
+    detail: 'Long context memory, FP8/INT8 KV, TurboQuant, and 32 GB GPU budgets.',
+  },
+  {
+    label: 'Apple Silicon Metal',
+    href: '/zinc/docs/apple-silicon-reference',
+    detail: 'Local LLM inference on M-series chips, Metal, unified memory, and ZINC.',
+  },
+];
 ---
 
 <BaseLayout
-  title="Blog"
-  description="Writing about building ZINC, local LLM inference on AMD GPUs, Vulkan compute, Zig systems programming, TurboQuant KV compression, and GPU performance engineering."
-  keywords="ZINC blog, LLM inference, AMD GPU, RDNA4, Vulkan compute, Zig programming, TurboQuant, GPU optimization, local AI, systems engineering"
+  title="Local LLM Inference Blog"
+  description="Technical posts on ZINC, Qwen3.6, Gemma 4, AMD RDNA4, Vulkan and Metal local LLM inference, KV cache quantization, and GPU performance."
+  keywords="ZINC blog, local LLM inference, Qwen3.6, Gemma 4, AMD GPU, RDNA4, Vulkan compute, Metal inference, TurboQuant, GPU optimization, local AI, systems engineering"
 >
-  <h1>Blog</h1>
-  <p class="intro">Notes on building ZINC, GPU programming, and making local AI work on hardware people actually own.</p>
+  <h1>Local LLM Inference Blog</h1>
+  <p class="intro">Technical notes on building ZINC, GPU programming, and making local AI work on hardware people actually own.</p>
+
+  <nav class="topic-router" aria-label="Blog topic guides">
+    {topicLinks.map(topic => (
+      <a href={topic.href}>
+        <strong>{topic.label}</strong>
+        <span>{topic.detail}</span>
+      </a>
+    ))}
+  </nav>
 
   <section>
     {posts.map(post => (
@@ -32,6 +74,40 @@ const posts = (await getCollection('posts', ({ data }) => !data.draft))
   .intro {
     color: var(--color-text-muted);
     padding-bottom: var(--space-lg);
+  }
+
+  .topic-router {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+    gap: var(--space-sm);
+    padding: var(--space-md) 0 var(--space-xl);
+    border-top: 1px solid var(--color-border);
     border-bottom: 1px solid var(--color-border);
+  }
+
+  .topic-router a {
+    display: grid;
+    gap: 0.25rem;
+    min-height: 5.75rem;
+    padding: 0.85rem;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    color: var(--color-text);
+    text-decoration: none;
+  }
+
+  .topic-router a:hover {
+    border-color: var(--color-accent);
+  }
+
+  .topic-router strong {
+    font-size: 0.95rem;
+    line-height: 1.25;
+  }
+
+  .topic-router span {
+    color: var(--color-text-muted);
+    font-size: 0.82rem;
+    line-height: 1.45;
   }
 </style>

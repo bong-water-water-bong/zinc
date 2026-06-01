@@ -96,9 +96,9 @@ export async function getStaticPaths() {
       keywords: 'ZINC spec, GPU kernel, DMMV, matmul, flash attention, paged KV cache, continuous batching, GGUF, Vulkan compute, RDNA4, RDNA3, RX 9070, Radeon AI PRO R9700, OpenAI API, Zig, GLSL, SPIR-V, cooperative matrix, LLaMA, Qwen, Mamba, MoE',
     },
     'turboquant-spec': {
-      title: 'TurboQuant KV Cache Compression',
-      description: 'Two-stage vector quantization for LLM KV cache — Lloyd-Max codebooks, QJL residual correction, 5x compression at 3-bit with unbiased attention on Vulkan compute.',
-      keywords: 'TurboQuant, KV cache compression, vector quantization, Lloyd-Max, QJL, quantized attention, LLM memory optimization, Vulkan compute, RDNA4, 3-bit quantization, paged attention, VRAM optimization, RX 9070 XT, inference memory, ICLR 2026',
+      title: 'TurboQuant KV Cache Compression for Local LLMs',
+      description: 'TurboQuant design notes for compressing LLM KV cache on AMD GPUs: 3-bit pages, QJL correction, long context, and VRAM savings.',
+      keywords: 'TurboQuant, KV cache compression, local LLM KV cache, vector quantization, Lloyd-Max, QJL, quantized attention, LLM memory optimization, Vulkan compute, RDNA4, 3-bit quantization, paged attention, VRAM optimization, RX 9070 XT, inference memory, ICLR 2026',
     },
     'rdna4-tuning': {
       title: 'RDNA4 GPU Tuning Guide for LLM Inference: Vulkan, ZINC_RT, and Driver Settings',
