@@ -2423,9 +2423,9 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
       "## Bandwidth Analysis",
       "- Memory BW: 546 GB/s theoretical, ~480 GB/s achievable",
       ...(gemmaRun ? [
-        "- Gemma cycle-49 Q8 attention microbenchmarks already hit ~370-510 GB/s on accepted hot shapes.",
+        "- Gemma 26B current public-suite baseline is about 30 tok/s decode and 32-34 tok/s prefill on M4.",
         "- Treat broad Q8 threadgroup/repack work as low-probability unless an exact-shape benchmark proves the candidate wins first.",
-        "- Decode target ≥50 tok/s means about ≤20 ms/token; current accepted best 37.79 tok/s is about 26.5 ms/token.",
+        "- The highest-leverage work is Gemma MoE route coverage, grouped expert execution, and prefill/decode isolation per Effort 11.",
       ] : [
         "- Working set per token: ~1.7 GB (only active experts + attention layers)",
         "- Theoretical BW-limited decode: ~280 tok/s (480 / 1.7)",
@@ -2434,7 +2434,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
       ]),
       "",
       "## Baseline Reference",
-      gemmaRun ? "- Current accepted ZINC best: 37.79 tok/s; target is 50 tok/s before chasing larger redesigns." : "- llama.cpp Metal on this machine: 72.93 tok/s decode (tg128)",
+      gemmaRun ? "- Use the loaded Effort 11 baseline and public-suite numbers; do not cite obsolete cycle-49 numbers as the current Gemma target." : "- llama.cpp Metal on this machine: 72.93 tok/s decode (tg128)",
       `- ZINC target: ≥${TARGET_TOK_PER_SEC} ${METRIC_LABEL}`,
       `- ZINC current: ${lastResult.tokPerSec?.toFixed(1)} ${METRIC_LABEL}`,
       "",
