@@ -421,6 +421,31 @@ fn shouldUseGlobalQ8Override(arch: config_mod.Architecture, tensor_name: []const
         std.mem.endsWith(u8, tensor_name, "ffn_down_shexp.weight"));
 }
 
+fn preferGemma26PrefillSharedQ8Tg128(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    if (!isGemma26A4BMoeShape(cfg)) return false;
+
+    const shexp_inter_dim = cfg.shared_expert_intermediate_dim;
+    if (shexp_inter_dim == 0) return false;
+
+    const is_shared_gate_up =
+        (std.mem.endsWith(u8, tensor_name, "ffn_gate_shexp.weight") or
+            std.mem.endsWith(u8, tensor_name, "ffn_up_shexp.weight") or
+            std.mem.endsWith(u8, tensor_name, "ffn_gate.weight") or
+            std.mem.endsWith(u8, tensor_name, "ffn_up.weight")) and
+        M == shexp_inter_dim and
+        K == cfg.hidden_dim;
+    const is_shared_down =
+        (std.mem.endsWith(u8, tensor_name, "ffn_down_shexp.weight") or
+            std.mem.endsWith(u8, tensor_name, "ffn_down.weight")) and
+        M == cfg.hidden_dim and
+        K == shexp_inter_dim;
+    return is_shared_gate_up or is_shared_down;
+}
+
+fn dmmvPipelineChoiceDependsOnPrefillPhase(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return preferGemma26PrefillSharedQ8Tg128(cfg, tensor_name, M, K);
+}
+
 fn shouldCpuQ8Fallback(arch: config_mod.Architecture, tensor_name: []const u8) bool {
     _ = arch;
     _ = tensor_name;
@@ -6956,6 +6981,19 @@ pub const InferenceEngine = struct {
                 }
                 if (self.q8_tg_override) |block_size| {
                     if (!shouldUseGlobalQ8Override(self.config.architecture, tensor.info.name)) {
+                        if (!self.q8_tg_size_env_present and
+                            self.in_prefill_phase and
+                            preferGemma26PrefillSharedQ8Tg128(self.config, tensor.info.name, M, K) and
+                            self.dmmv_q8_0_pipe.max_threads_per_threadgroup >= 128)
+                        {
+                            const small_block_size: u32 = 128;
+                            break :blk .{
+                                .pipe = &self.dmmv_q8_0_pipe,
+                                .push_idx = 0,
+                                .rows_per_wg = small_block_size / simd_width * 2,
+                                .block_size = small_block_size,
+                            };
+                        }
                         break :blk .{ .pipe = &self.dmmv_q8_0_pipe, .push_idx = 0, .rows_per_wg = 16, .block_size = 256 };
                     }
                     // nr=2: double the rows per workgroup
@@ -7003,6 +7041,10 @@ pub const InferenceEngine = struct {
         M: u32,
         K: u32,
     ) ?DmmvPipelineChoice {
+        if (dmmvPipelineChoiceDependsOnPrefillPhase(self.config, tensor.info.name, M, K)) {
+            return self.dmmvPipelineForType(tensor, M, K);
+        }
+
         // Adapt llama.cpp `ggml_metal_op_encode_impl`: hot graph recording
         // keeps per-node dispatch metadata instead of re-deriving it for every
         // encoded op. Qwen3.6 prompt prefill records thousands of identical
@@ -26142,6 +26184,44 @@ test "global q8 override skips gemma shared expert q8 tensors" {
     try std.testing.expect(!shouldUseGlobalQ8Override(.gemma, "blk.0.ffn_gate.weight"));
     try std.testing.expect(shouldUseGlobalQ8Override(.gemma, "blk.0.attn_q.weight"));
     try std.testing.expect(shouldUseGlobalQ8Override(.qwen35, "blk.0.ffn_down.weight"));
+}
+
+test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
+    const gemma_cfg = ModelConfig{
+        .architecture = .gemma,
+        .n_layers = 30,
+        .n_heads = 16,
+        .n_kv_heads = 8,
+        .head_dim = 512,
+        .hidden_dim = 2816,
+        .intermediate_dim = 704,
+        .vocab_size = 0,
+        .context_length = 0,
+        .rope_freq_base = 1_000_000.0,
+        .rope_freq_base_swa = 10_000.0,
+        .n_experts = 128,
+        .n_experts_used = 8,
+        .rope_dim = 512,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 2112,
+    };
+
+    try std.testing.expect(preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.ffn_gate.weight", 2112, 2816));
+    try std.testing.expect(preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.ffn_up_shexp.weight", 2112, 2816));
+    try std.testing.expect(preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.ffn_down.weight", 2816, 2112));
+    try std.testing.expect(dmmvPipelineChoiceDependsOnPrefillPhase(gemma_cfg, "blk.0.ffn_down_shexp.weight", 2816, 2112));
+
+    try std.testing.expect(!preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.attn_output.weight", 2816, 4096));
+    try std.testing.expect(!preferGemma26PrefillSharedQ8Tg128(gemma_cfg, "blk.0.ffn_gate.weight", 2112, 2048));
+
+    var qwen_cfg = gemma_cfg;
+    qwen_cfg.architecture = .qwen35;
+    try std.testing.expect(!preferGemma26PrefillSharedQ8Tg128(qwen_cfg, "blk.0.ffn_gate.weight", 2112, 2816));
 }
 
 test "gemma shared down q8 tensors stay GPU eligible" {
