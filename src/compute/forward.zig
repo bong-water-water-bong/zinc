@@ -16137,21 +16137,37 @@ pub const InferenceEngine = struct {
         if (dp4a_result == .q8_swiglu) {
             const swiglu_i8_buf = self.batched_scratch_swiglu_i8.?;
             const swiglu_scale_buf = self.batched_scratch_swiglu_scale.?;
-            const post_gateup_ranges = [_]CommandBuffer.BufferRange{
-                .{ .buffer = swiglu_i8_buf.handle, .size = swiglu_i8_buf.size },
-                .{ .buffer = swiglu_scale_buf.handle, .size = swiglu_scale_buf.size },
-                .{ .buffer = scratch_swiglu.handle, .size = swiglu_bytes },
-            };
-            self.decode_cmd.computeBuffersBarrier(&post_gateup_ranges);
+            if (dp4a_gateup_cols >= n_tokens) {
+                const post_gateup_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = swiglu_i8_buf.handle, .size = swiglu_i8_buf.size },
+                    .{ .buffer = swiglu_scale_buf.handle, .size = swiglu_scale_buf.size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&post_gateup_ranges);
+            } else {
+                const post_gateup_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = swiglu_i8_buf.handle, .size = swiglu_i8_buf.size },
+                    .{ .buffer = swiglu_scale_buf.handle, .size = swiglu_scale_buf.size },
+                    .{ .buffer = scratch_swiglu.handle, .size = swiglu_bytes },
+                };
+                self.decode_cmd.computeBuffersBarrier(&post_gateup_ranges);
+            }
         } else if (dp4a_result == .q8_1_swiglu) {
             const swiglu_i8_buf = self.batched_scratch_swiglu_i8.?;
             const swiglu_sd_buf = self.batched_scratch_swiglu_scale_dsum.?;
-            const post_gateup_ranges = [_]CommandBuffer.BufferRange{
-                .{ .buffer = swiglu_i8_buf.handle, .size = swiglu_i8_buf.size },
-                .{ .buffer = swiglu_sd_buf.handle, .size = swiglu_sd_buf.size },
-                .{ .buffer = scratch_swiglu.handle, .size = swiglu_bytes },
-            };
-            self.decode_cmd.computeBuffersBarrier(&post_gateup_ranges);
+            if (dp4a_gateup_cols >= n_tokens) {
+                const post_gateup_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = swiglu_i8_buf.handle, .size = swiglu_i8_buf.size },
+                    .{ .buffer = swiglu_sd_buf.handle, .size = swiglu_sd_buf.size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&post_gateup_ranges);
+            } else {
+                const post_gateup_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = swiglu_i8_buf.handle, .size = swiglu_i8_buf.size },
+                    .{ .buffer = swiglu_sd_buf.handle, .size = swiglu_sd_buf.size },
+                    .{ .buffer = scratch_swiglu.handle, .size = swiglu_bytes },
+                };
+                self.decode_cmd.computeBuffersBarrier(&post_gateup_ranges);
+            }
         } else {
             self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, swiglu_bytes);
         }
