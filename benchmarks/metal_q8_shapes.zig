@@ -37,6 +37,21 @@ const DualQ8DmmvPush = extern struct {
     y1_offset: u32,
 };
 
+const GemmPush = extern struct {
+    ne00: i32,
+    ne02: i32,
+    nb01: u64,
+    nb02: u64,
+    ne12: i32,
+    _pad0: u32 = 0,
+    nb10: u64,
+    nb11: u64,
+    nb12: u64,
+    ne0: i32,
+    ne1: i32,
+    src0_off: u32,
+};
+
 const RmsNormPush = extern struct {
     n: u32,
     eps: f32,
@@ -137,6 +152,9 @@ const CaseId = enum {
     shared_gate,
     shared_up,
     shared_down,
+    shared_gate_gemm,
+    shared_up_gemm,
+    shared_down_gemm,
     shared_dual,
     shared_pair_swiglu,
     moe_gate,
@@ -184,6 +202,7 @@ const HotCase = struct {
     is_router_fused: bool = false,
     is_moe_swiglu_fused: bool = false,
     is_shared_pair_swiglu: bool = false,
+    is_batched_gemm: bool = false,
 
     fn isDual(self: @This()) bool {
         return self.tensor1 != null and !self.is_router_fused and !self.is_moe_swiglu_fused and !self.is_shared_pair_swiglu;
@@ -271,6 +290,7 @@ fn helpText() []const u8 {
     \\                            | ssm_qkv | ssm_gate | ssm_dual | ssm_out
     \\                            | router | router_f32_fused
     \\                            | shared_gate | shared_up | shared_down | shared_dual
+    \\                            | shared_gate_gemm | shared_up_gemm | shared_down_gemm
     \\                            | shared_pair_swiglu
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
@@ -312,6 +332,9 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "shared_gate")) return .shared_gate;
     if (std.mem.eql(u8, arg, "shared_up")) return .shared_up;
     if (std.mem.eql(u8, arg, "shared_down")) return .shared_down;
+    if (std.mem.eql(u8, arg, "shared_gate_gemm")) return .shared_gate_gemm;
+    if (std.mem.eql(u8, arg, "shared_up_gemm")) return .shared_up_gemm;
+    if (std.mem.eql(u8, arg, "shared_down_gemm")) return .shared_down_gemm;
     if (std.mem.eql(u8, arg, "shared_dual")) return .shared_dual;
     if (std.mem.eql(u8, arg, "shared_pair_swiglu")) return .shared_pair_swiglu;
     if (std.mem.eql(u8, arg, "moe_gate")) return .moe_gate;
@@ -328,7 +351,14 @@ fn parseCaseId(arg: []const u8) !CaseId {
 
 fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
     return switch (selection) {
-        .all => case_id != .moe_gate_up_geglu,
+        .all => switch (case_id) {
+            .moe_gate_up_geglu,
+            .shared_gate_gemm,
+            .shared_up_gemm,
+            .shared_down_gemm,
+            => false,
+            else => true,
+        },
         .gemma26_prefill_hot => switch (case_id) {
             .router_f32_fused,
             .attn_q,
@@ -337,9 +367,9 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             .attn_out,
             .moe_gate_up_geglu,
             .moe_down_cols,
-            .shared_gate,
-            .shared_up,
-            .shared_down,
+            .shared_gate_gemm,
+            .shared_up_gemm,
+            .shared_down_gemm,
             .lm_head,
             => true,
             else => false,
@@ -695,6 +725,51 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .tensor0 = tensor,
                 .rows0 = hidden_dim,
                 .cols = inter_dim,
+            };
+        },
+        .shared_gate_gemm => blk: {
+            const inter_dim = model.config.shared_expert_intermediate_dim;
+            const hidden_dim = model.config.hidden_dim;
+            const tensor = findTensorBySuffixAndShape(model, "ffn_gate_shexp.weight", .q8_0, inter_dim, hidden_dim) orelse
+                findTensorBySuffixAndShape(model, "ffn_gate.weight", .q8_0, inter_dim, hidden_dim) orelse
+                return error.MissingSharedGateTensor;
+            break :blk .{
+                .key = "shared_gate_gemm",
+                .label = "Shared expert gate batched GEMM",
+                .tensor0 = tensor,
+                .rows0 = inter_dim,
+                .cols = hidden_dim,
+                .is_batched_gemm = true,
+            };
+        },
+        .shared_up_gemm => blk: {
+            const inter_dim = model.config.shared_expert_intermediate_dim;
+            const hidden_dim = model.config.hidden_dim;
+            const tensor = findTensorBySuffixAndShape(model, "ffn_up_shexp.weight", .q8_0, inter_dim, hidden_dim) orelse
+                findTensorBySuffixAndShape(model, "ffn_up.weight", .q8_0, inter_dim, hidden_dim) orelse
+                return error.MissingSharedUpTensor;
+            break :blk .{
+                .key = "shared_up_gemm",
+                .label = "Shared expert up batched GEMM",
+                .tensor0 = tensor,
+                .rows0 = inter_dim,
+                .cols = hidden_dim,
+                .is_batched_gemm = true,
+            };
+        },
+        .shared_down_gemm => blk: {
+            const inter_dim = model.config.shared_expert_intermediate_dim;
+            const hidden_dim = model.config.hidden_dim;
+            const tensor = findTensorBySuffixAndShape(model, "ffn_down_shexp.weight", .q8_0, hidden_dim, inter_dim) orelse
+                findTensorBySuffixAndShape(model, "ffn_down.weight", .q8_0, hidden_dim, inter_dim) orelse
+                return error.MissingSharedDownTensor;
+            break :blk .{
+                .key = "shared_down_gemm",
+                .label = "Shared expert down batched GEMM",
+                .tensor0 = tensor,
+                .rows0 = hidden_dim,
+                .cols = inter_dim,
+                .is_batched_gemm = true,
             };
         },
         .shared_dual => blk: {
@@ -1247,6 +1322,52 @@ fn runDispatchBatch(
             &push,
             @sizeOf(DmmvPush),
             selection.push_idx,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn runGemmQ8BatchedDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    pipe: *const MetalPipeline,
+    tensor: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    rows: u32,
+    cols: u32,
+    tokens: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0) return;
+    const row_bytes = @as(u64, cols / 32) * 34;
+    const push = GemmPush{
+        .ne00 = @intCast(cols),
+        .ne02 = 1,
+        .nb01 = row_bytes,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = @sizeOf(f32),
+        .nb11 = @as(u64, cols) * @sizeOf(f32),
+        .nb12 = 0,
+        .ne0 = @intCast(rows),
+        .ne1 = @intCast(tokens),
+        .src0_off = tensorPageOffset(model, tensor),
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
+    const grid = [_]u32{ (tokens + 31) / 32, (rows + 63) / 64, 1 };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2WithTgMem(
+            pipe,
+            grid,
+            .{ 128, 1, 1 },
+            &bufs,
+            &push,
+            @sizeOf(GemmPush),
+            0,
+            8192,
         );
     }
     cmd.commitAndWait();
@@ -2330,6 +2451,66 @@ fn benchmarkVariant(
     };
 }
 
+fn benchmarkGemmQ8BatchedVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    route_tokens: u32,
+    warmup_iterations: u32,
+    iterations: u32,
+) !BenchResult {
+    if (hot_case.tensor0.info.type_ != .q8_0) return error.ExpectedQ8Tensor;
+    if (hot_case.cols % 32 != 0) return error.InvalidTensorShape;
+
+    var pipe = try loadShaderPipeline(device.ctx, "gemm_q8_0");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, route_tokens) * @as(usize, hot_case.cols) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, route_tokens) * @as(usize, hot_case.rows0) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    fillInputBuffer(&input_buf, route_tokens * hot_case.cols);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    try runGemmQ8BatchedDispatchBatch(device.ctx, &pipe, hot_case.tensor0, model, &input_buf, &output_buf, hot_case.rows0, hot_case.cols, route_tokens, warmup_iterations);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runGemmQ8BatchedDispatchBatch(device.ctx, &pipe, hot_case.tensor0, model, &input_buf, &output_buf, hot_case.rows0, hot_case.cols, route_tokens, iterations);
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    const token_tiles = (route_tokens + 31) / 32;
+    const weight_bytes = weightBytesPerIter(.q8_0, hot_case.rows0, hot_case.cols) * token_tiles;
+    const total_bytes = weight_bytes * iterations;
+    const output_copy = try copyOutput(allocator, &output_buf, route_tokens * hot_case.rows0);
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = "batched-gemm",
+        .shader_name = "gemm_q8_0",
+        .tensor_name = hot_case.tensor0.info.name,
+        .rows = hot_case.rows0,
+        .cols = hot_case.cols,
+        .expert_slots = route_tokens,
+        .x_expert_stride = hot_case.cols,
+        .iterations = iterations,
+        .block_size = 128,
+        .rows_per_wg = 64,
+        .thread_execution_width = pipe.thread_execution_width,
+        .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(output_copy),
+        .output = output_copy,
+    };
+}
+
 fn benchmarkMoeVariant(
     allocator: std.mem.Allocator,
     device: *const metal_device.MetalDevice,
@@ -2910,7 +3091,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_dual, .shared_pair_swiglu, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_swiglu };
+    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_swiglu };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -2938,7 +3119,35 @@ pub fn main() !void {
         if (!caseMatchesSelection(config.case_id, case_id)) continue;
 
         const hot_case = try resolveHotCase(&model, case_id);
-        if (case_id == .router_f32_fused) {
+        if (hot_case.is_batched_gemm) {
+            try stdout.interface.print(
+                "Case {s}: {s} | tensor={s} | quant={s} | M={d} K={d} N={d} | weight {d:.2} MiB/iter\n",
+                .{
+                    hot_case.key,
+                    hot_case.label,
+                    hot_case.tensor0.info.name,
+                    @tagName(hot_case.tensor0.info.type_),
+                    hot_case.rows0,
+                    hot_case.cols,
+                    config.route_tokens,
+                    @as(f64, @floatFromInt(weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols) * ((config.route_tokens + 31) / 32))) / (1024.0 * 1024.0),
+                },
+            );
+
+            var gemm_result: ?BenchResult = null;
+            defer if (gemm_result) |*result| allocator.free(result.output);
+
+            gemm_result = try benchmarkGemmQ8BatchedVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.route_tokens,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, gemm_result.?);
+        } else if (case_id == .router_f32_fused) {
             try stdout.interface.print(
                 "Case {s}: {s} | tensors={s} + {s} (shared_gate) + {s} (ffn_norm) | quant=F32 | M={d} K={d} | topk={d} | weight {d:.2} MiB/iter\n",
                 .{
