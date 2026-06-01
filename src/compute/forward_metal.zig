@@ -16886,6 +16886,11 @@ fn runGemmaExplicitMoeFallback(
     const use_batched_q8_down =
         engine.gemma_q8_moe_fallback_down_enabled and
         down_exps.info.type_ == .q8_0 and
+        gemmaQ8RoutedMoeAllowed(
+            engine.config.architecture,
+            engine.in_prefill_phase,
+            engine.gemma_q8_moe_decode_enabled,
+        ) and
         engine.dmmv_q8_0_moe_pipe.handle != null;
     const use_batched_down =
         use_batched_moe_dispatch and
