@@ -18674,7 +18674,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     // directly and the accumulate kernel consumes the weights.
     if (!precomputed_moe_norm) {
         dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.hidden_buf, &engine.residual_buf, pre_ffw_norm_2, hidden_dim, 1);
-        profileBarrier(cmd, profile, .gpu_routed_moe); // routes and expert input visible
+        profileGpuMoeBarrier(cmd, profile, .router); // routes and expert input visible
     }
 
     const use_fused_gate_up =
@@ -18762,7 +18762,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
             dispatchDmmvOnCmd(engine, cmd, gate_tensor, &engine.norm_buf, &engine.router_logits_buf, 1, hidden_dim, 0);
         }
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe); // gate/up/shared projections visible before GeGLU
+    profileGpuMoeBarrier(cmd, profile, .gate_up); // gate/up/shared projections visible before GeGLU
 
     if (!use_fused_gate_up_geglu) {
         const push = SwiGLUPush{ .n = inter_dim };
@@ -18770,7 +18770,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         cmd.dispatchV2(&engine.geglu_batched_pipe, .{ (inter_dim + 63) / 64, cfg.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
     }
     dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, shexp_inter_dim);
-    profileBarrier(cmd, profile, .gpu_routed_moe); // activations visible before down projections
+    profileGpuMoeBarrier(cmd, profile, .activation); // activations visible before down projections
 
     try dispatchDmmvMoeOnCmd(
         engine,
@@ -18786,7 +18786,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         0,
     );
     dispatchDmmvOnCmd(engine, cmd, down_shexp, &engine.swiglu_buf, &engine.down_buf, hidden_dim, shexp_inter_dim, 0);
-    profileBarrier(cmd, profile, .gpu_routed_moe); // down outputs visible before accumulate
+    profileGpuMoeBarrier(cmd, profile, .down); // down outputs visible before accumulate
 
     const validate_moe = shouldValidateGemmaMoe(engine, layer_idx);
     const use_fused_post_norm_residual =
@@ -18821,7 +18821,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
             lt.ffn_gate_inp_shexp != null,
             engine.post_ffn_norm_present[layer_idx],
         );
-        profileBarrier(cmd, profile, .gpu_routed_moe); // hidden_buf visible to next layer
+        profileGpuMoeBarrier(cmd, profile, .finalizer); // hidden_buf visible to next layer
         return;
     }
 
@@ -18836,7 +18836,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         cfg.n_experts_used,
         hidden_dim,
     );
-    profileBarrier(cmd, profile, .gpu_routed_moe); // expert contribution visible before post expert norm
+    profileGpuMoeBarrier(cmd, profile, .finalizer); // expert contribution visible before post expert norm
 
     if (use_fused_post_norm_residual) {
         dispatchGemmaMoePostNormResidualOnCmd(
@@ -18853,13 +18853,13 @@ fn recordGemmaGpuRoutedMoeOnCmd(
             lt.ffn_gate_inp_shexp != null,
             engine.post_ffn_norm_present[layer_idx],
         );
-        profileBarrier(cmd, profile, .gpu_routed_moe); // hidden_buf visible to next layer
+        profileGpuMoeBarrier(cmd, profile, .finalizer); // hidden_buf visible to next layer
         return;
     }
 
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.moe_out_buf, &engine.moe_out_buf, post_ffw_norm_2, hidden_dim, 1);
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.down_buf, &engine.down_buf, post_ffw_norm_1, hidden_dim, 1);
-    profileBarrier(cmd, profile, .gpu_routed_moe); // post expert/shared norms visible before shared add
+    profileGpuMoeBarrier(cmd, profile, .finalizer); // post expert/shared norms visible before shared add
 
     if (lt.ffn_gate_inp_shexp != null) {
         dispatchSigmoidScaleAccOnCmd(engine, cmd, &engine.moe_out_buf, &engine.down_buf, &engine.router_logits_buf, hidden_dim);
@@ -18868,11 +18868,11 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         const acc_bufs = [_]*const MetalBuffer{ &engine.moe_out_buf, &engine.down_buf };
         cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe); // combined MoE contribution visible before final post-FFN norm
+    profileGpuMoeBarrier(cmd, profile, .finalizer); // combined MoE contribution visible before final post-FFN norm
 
     if (engine.post_ffn_norm_present[layer_idx]) {
         dispatchRmsNormOnCmd(engine, cmd, &engine.moe_out_buf, &engine.moe_out_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
-        profileBarrier(cmd, profile, .gpu_routed_moe);
+        profileGpuMoeBarrier(cmd, profile, .finalizer);
     }
 
     if (validate_moe) {
@@ -18917,7 +18917,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     const res_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
     const res_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.moe_out_buf };
     cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &res_bufs, &res_push, @sizeOf(ScaleAccPush), 0);
-    profileBarrier(cmd, profile, .gpu_routed_moe); // hidden_buf visible to next layer
+    profileGpuMoeBarrier(cmd, profile, .finalizer); // hidden_buf visible to next layer
 }
 
 fn recordGpuRoutedBatchedMoeOnCmd(
