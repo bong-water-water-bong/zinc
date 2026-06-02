@@ -6257,7 +6257,16 @@ pub const InferenceEngine = struct {
         }
         if (!has_override and isGemma26A4BMoeShape(cfg) and prompt_len >= 64 and prompt_len <= 96 and base_chunk == 7) {
             if (token_idx == 0) return 1;
-            if (token_idx == 1) return 5;
+            if (token_idx == 1) {
+                // Keep the early GPU start from the accepted [1,5,7,...]
+                // schedule, but borrow llama.cpp's graph-command discipline:
+                // avoid an extra command buffer when the public prompt band can
+                // be tiled exactly with <=7-token chunks.
+                const residue = (prompt_len - 1) % base_chunk;
+                if (residue == 0) return base_chunk;
+                if (residue >= 5) return residue;
+                return 5;
+            }
 
             const remaining = prompt_len - token_idx;
             if (remaining <= base_chunk) return remaining;
@@ -27533,7 +27542,7 @@ test "gemma26 public prompt prefill uses wide queued split without tiny tail" {
     const base_chunk = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 70, null);
     try std.testing.expectEqual(@as(usize, 7), base_chunk);
 
-    const expected = [_]usize{ 1, 5, 7, 7, 7, 7, 7, 7, 7, 7, 4, 4 };
+    const expected = [_]usize{ 1, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
     var token_idx: usize = 0;
     for (expected) |chunk_len| {
         const actual = InferenceEngine.queuedTokenMajorAsyncChunkLen(gemma_cfg, 70, token_idx, base_chunk, false);
@@ -27544,13 +27553,23 @@ test "gemma26 public prompt prefill uses wide queued split without tiny tail" {
 
     const nearby_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 64, null);
     try std.testing.expectEqual(@as(usize, 7), nearby_base);
+    const nearby_expected = [_]usize{ 1, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
     token_idx = 0;
-    while (token_idx < 64) {
-        const chunk_len = InferenceEngine.queuedTokenMajorAsyncChunkLen(gemma_cfg, 64, token_idx, nearby_base, false);
-        try std.testing.expect(chunk_len >= 4 or token_idx == 0);
-        token_idx += chunk_len;
+    for (nearby_expected) |chunk_len| {
+        const actual = InferenceEngine.queuedTokenMajorAsyncChunkLen(gemma_cfg, 64, token_idx, nearby_base, false);
+        try std.testing.expectEqual(chunk_len, actual);
+        token_idx += actual;
     }
     try std.testing.expectEqual(@as(usize, 64), token_idx);
+
+    const seventy_one_expected = [_]usize{ 1, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
+    token_idx = 0;
+    for (seventy_one_expected) |chunk_len| {
+        const actual = InferenceEngine.queuedTokenMajorAsyncChunkLen(gemma_cfg, 71, token_idx, nearby_base, false);
+        try std.testing.expectEqual(chunk_len, actual);
+        token_idx += actual;
+    }
+    try std.testing.expectEqual(@as(usize, 71), token_idx);
 }
 
 test "gemma26 queued prefill can skip nonterminal final layer tail" {
