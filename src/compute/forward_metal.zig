@@ -5995,7 +5995,12 @@ pub const InferenceEngine = struct {
     fn canUseSingleCommandQueuedTokenMajorPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
         if (!self.canUseQueuedTokenMajorPrefill(prompt_len)) return false;
         if (isGemma26A4BMoeShape(self.config) and prompt_len >= 64 and prompt_len <= 96) {
-            return true;
+            // llama.cpp's `ggml_metal_graph_compute` works well with a small
+            // leading command because the long tail is encoded asynchronously.
+            // This path records the tail serially; on the 70-token public
+            // prompt it collapsed to [8,62] and made the final wait dominate.
+            // Keep Gemma26 on the existing vLLM-style block-sized queue split.
+            return false;
         }
         if (!defaultQwen36SsmPrefillProjectionEnabled(self.config)) return false;
         if (shouldCpuLmHeadFallback(self)) return false;
