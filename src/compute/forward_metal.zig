@@ -28527,6 +28527,18 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
             try std.testing.expect(seen_blocks[expert][block_idx]);
         }
     }
+
+    var active_index: usize = 0;
+    for (0..n_experts) |expert| {
+        const expected_blocks = (counts_ptr[expert] + moe_route_block_cols - 1) / moe_route_block_cols;
+        for (0..@as(usize, @intCast(expected_blocks))) |block_idx| {
+            const entry = active_blocks_ptr[active_index];
+            try std.testing.expectEqual(@as(u32, @intCast(expert)), entry & 0xFFFF);
+            try std.testing.expectEqual(@as(u32, @intCast(block_idx)), entry >> 16);
+            active_index += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, @intCast(active_count_ptr[0])), active_index);
 }
 
 test "moe_route_ids shader flattens batched routing in route order" {

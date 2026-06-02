@@ -11,6 +11,7 @@ struct Params {
 };
 
 #define NUM_COLS 8u
+#define MAX_EXPERTS 256u
 
 kernel void main0(
     constant Params& p [[buffer(0)]],
@@ -21,38 +22,57 @@ kernel void main0(
     device uint* active_blocks [[buffer(5)]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
+    threadgroup uint block_counts[MAX_EXPERTS];
+
     if (tid == 0u) {
         atomic_store_explicit(active_block_count, 0u, memory_order_relaxed);
     }
     if (tid < p.n_experts) {
         atomic_store_explicit(counts + tid, 0u, memory_order_relaxed);
+        block_counts[tid] = 0u;
     }
-    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     const uint expert_id = tid;
-    if (expert_id >= p.n_experts) {
-        return;
-    }
-
     const uint total_routes = p.n_tokens * p.k;
     uint count = 0u;
-    for (uint route = 0u; route < total_routes; route++) {
-        const uint token = route / p.k;
-        const uint slot = route - token * p.k;
-        const uint route_expert = routing[token * p.routing_stride + slot];
-        if (route_expert != expert_id) {
-            continue;
+    if (expert_id < p.n_experts) {
+        for (uint route = 0u; route < total_routes; route++) {
+            const uint token = route / p.k;
+            const uint slot = route - token * p.k;
+            const uint route_expert = routing[token * p.routing_stride + slot];
+            if (route_expert != expert_id) {
+                continue;
+            }
+
+            if (count < p.ids_stride) {
+                ids[expert_id * p.ids_stride + count] = route;
+            }
+            count++;
         }
 
-        if (count < p.ids_stride) {
-            ids[expert_id * p.ids_stride + count] = route;
-            if ((count % NUM_COLS) == 0u) {
-                const uint block_id = atomic_fetch_add_explicit(active_block_count, 1u, memory_order_relaxed);
-                active_blocks[block_id] = expert_id | ((count / NUM_COLS) << 16u);
-            }
+        atomic_store_explicit(counts + expert_id, count, memory_order_relaxed);
+        const uint stored_count = min(count, p.ids_stride);
+        block_counts[expert_id] = (stored_count + NUM_COLS - 1u) / NUM_COLS;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    if (tid == 0u) {
+        uint total_blocks = 0u;
+        for (uint expert = 0u; expert < p.n_experts; expert++) {
+            total_blocks += block_counts[expert];
         }
-        count++;
+        atomic_store_explicit(active_block_count, total_blocks, memory_order_relaxed);
     }
 
-    atomic_store_explicit(counts + expert_id, count, memory_order_relaxed);
+    if (expert_id < p.n_experts) {
+        const uint block_count = block_counts[expert_id];
+        uint block_offset = 0u;
+        for (uint expert = 0u; expert < expert_id; expert++) {
+            block_offset += block_counts[expert];
+        }
+        for (uint block = 0u; block < block_count; block++) {
+            active_blocks[block_offset + block] = expert_id | (block << 16u);
+        }
+    }
 }
