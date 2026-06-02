@@ -1297,26 +1297,6 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.route_pack_tail_blocks_actual = total.route_pack_tail_blocks_actual -| prefix.route_pack_tail_blocks_actual;
     delta.route_pack_single_tail_blocks_actual = total.route_pack_single_tail_blocks_actual -| prefix.route_pack_single_tail_blocks_actual;
     delta.route_pack_padding_slots_actual = total.route_pack_padding_slots_actual -| prefix.route_pack_padding_slots_actual;
-    delta.queued_prefill_requests = total.queued_prefill_requests -| prefix.queued_prefill_requests;
-    delta.queued_prefill_prompt_tokens = total.queued_prefill_prompt_tokens -| prefix.queued_prefill_prompt_tokens;
-    delta.queued_prefill_requested_chunk_tokens = total.queued_prefill_requested_chunk_tokens;
-    delta.queued_prefill_base_chunk_tokens = total.queued_prefill_base_chunk_tokens;
-    delta.queued_prefill_chunks = total.queued_prefill_chunks -| prefix.queued_prefill_chunks;
-    delta.queued_prefill_async_chunks = total.queued_prefill_async_chunks -| prefix.queued_prefill_async_chunks;
-    delta.queued_prefill_final_chunk_tokens = if (delta.queued_prefill_requests > 0) total.queued_prefill_final_chunk_tokens else 0;
-    delta.queued_prefill_min_chunk_tokens = if (delta.queued_prefill_requests > 0) total.queued_prefill_min_chunk_tokens else 0;
-    delta.queued_prefill_max_chunk_tokens = if (delta.queued_prefill_requests > 0) total.queued_prefill_max_chunk_tokens else 0;
-    delta.queued_prefill_schedule_len = if (delta.queued_prefill_requests > 0) total.queued_prefill_schedule_len else 0;
-    delta.queued_prefill_schedule = if (delta.queued_prefill_requests > 0) total.queued_prefill_schedule else [_]u8{0} ** 8;
-    delta.queued_prefill_async_dispatch_calls = total.queued_prefill_async_dispatch_calls -| prefix.queued_prefill_async_dispatch_calls;
-    delta.queued_prefill_final_dispatch_calls = total.queued_prefill_final_dispatch_calls -| prefix.queued_prefill_final_dispatch_calls;
-    delta.queued_prefill_async_barrier_calls = total.queued_prefill_async_barrier_calls -| prefix.queued_prefill_async_barrier_calls;
-    delta.queued_prefill_final_barrier_calls = total.queued_prefill_final_barrier_calls -| prefix.queued_prefill_final_barrier_calls;
-    delta.queued_prefill_async_record_ns = total.queued_prefill_async_record_ns -| prefix.queued_prefill_async_record_ns;
-    delta.queued_prefill_final_record_ns = total.queued_prefill_final_record_ns -| prefix.queued_prefill_final_record_ns;
-    delta.queued_prefill_async_submit_count = total.queued_prefill_async_submit_count -| prefix.queued_prefill_async_submit_count;
-    delta.queued_prefill_async_to_final_wait_ns = total.queued_prefill_async_to_final_wait_ns -| prefix.queued_prefill_async_to_final_wait_ns;
-    delta.queued_prefill_final_wait_ns = total.queued_prefill_final_wait_ns -| prefix.queued_prefill_final_wait_ns;
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -3214,28 +3194,6 @@ fn shouldDefaultGemmaMoeBatchedPrefillForPrompt(cfg: ModelConfig, prompt_len: us
     // guards and unrelated Gemma MoE prompts continue using the accepted queued
     // token-major path unless explicitly opted in.
     return prompt_len >= 64 and prompt_len <= 96;
-}
-
-fn resolveGemmaMoeBatchedPrefillMode(
-    cfg: ModelConfig,
-    prompt_len: usize,
-    requested_mode: BatchedPrefillMode,
-    generic_env_present: bool,
-    gemma_env_present: bool,
-    explicit_gemma_mode: BatchedPrefillMode,
-) BatchedPrefillMode {
-    if (cfg.architecture != .gemma or cfg.n_experts == 0) return .off;
-    if (gemma_env_present) return explicit_gemma_mode;
-    if (explicit_gemma_mode != .off) return explicit_gemma_mode;
-    if (requested_mode != .off) return requested_mode;
-
-    // Some harnesses pin generic dense prefill off with ZINC_BATCHED_PREFILL=0.
-    // Do not let that broad switch shadow the Gemma26 public-prompt route-pack
-    // default; ZINC_GEMMA_BATCHED_PREFILL=0 remains the explicit Gemma kill
-    // switch.
-    _ = generic_env_present;
-    if (shouldDefaultGemmaMoeBatchedPrefillForPrompt(cfg, prompt_len)) return .on;
-    return .off;
 }
 
 fn shouldDefaultDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
@@ -6703,23 +6661,25 @@ pub const InferenceEngine = struct {
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
         const requested_mode = batchedPrefillMode();
-        const generic_env_present = batchedPrefillEnvPresent();
         const is_gemma_moe_prefill = self.config.architecture == .gemma and self.config.n_experts > 0;
         const gemma_env_present = gemmaBatchedPrefillEnvPresent();
-        const gemma_mode = resolveGemmaMoeBatchedPrefillMode(
-            self.config,
-            prompt_tokens.len,
-            requested_mode,
-            generic_env_present,
-            gemma_env_present,
-            gemmaBatchedPrefillMode(),
-        );
+        const gemma_mode: BatchedPrefillMode = if (self.config.architecture == .gemma and self.config.n_experts > 0) blk: {
+            const explicit_mode = gemmaBatchedPrefillMode();
+            if (explicit_mode != .off or gemma_env_present) break :blk explicit_mode;
+            if (requested_mode == .off and
+                !batchedPrefillEnvPresent() and
+                shouldDefaultGemmaMoeBatchedPrefillForPrompt(self.config, prompt_tokens.len))
+            {
+                break :blk .on;
+            }
+            break :blk .off;
+        } else .off;
         const mode: BatchedPrefillMode = if (is_gemma_moe_prefill and gemma_env_present and gemma_mode == .off)
             .off
         else if (gemma_mode != .off)
             gemma_mode
         else if (requested_mode == .off and
-            !generic_env_present and
+            !batchedPrefillEnvPresent() and
             shouldDefaultDenseGemmaBatchedPrefill(self))
             .on
         else
@@ -6993,7 +6953,6 @@ pub const InferenceEngine = struct {
         state.position = self.position;
 
         if (mode == .validate) {
-            const tol: f32 = 1e-3;
             // Snapshot batched-path logits, then re-run the per-token path on
             // a fresh state and diff. The per-token result becomes authoritative
             // so any subsequent decode steps continue from the trusted state.
@@ -7011,10 +6970,7 @@ pub const InferenceEngine = struct {
             state.position = 0;
             state.generated_tokens.clearRetainingCapacity();
             try self.prefillBatch(state, prompt_tokens);
-            const replay_profile = if (self.profile_enabled)
-                profileDeltaForSplit(self.request_profile, candidate_profile)
-            else
-                self.request_profile;
+            const replay_profile = self.request_profile;
 
             const ref_logits: [*]const f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
             var max_abs: f32 = 0;
@@ -7026,6 +6982,7 @@ pub const InferenceEngine = struct {
                     max_idx = i;
                 }
             }
+            const tol: f32 = 1e-3;
             const level: enum { ok, exceeded } = if (max_abs > tol) .exceeded else .ok;
             log.warn("prefillBatched validate[{s}]: last-token logits max_abs_diff={d:.6} at idx={d} (ref={d:.4} batched={d:.4}) tol={d:.6} n_tokens={d}", .{
                 @tagName(level), max_abs, max_idx, ref_logits[max_idx], batched_snapshot[max_idx], tol, n_tokens,
@@ -27569,22 +27526,6 @@ test "gemma26 public prompt prefill uses wide queued split without tiny tail" {
     try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 70));
     try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 96));
     try std.testing.expect(!shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 97));
-    try std.testing.expectEqual(
-        BatchedPrefillMode.on,
-        resolveGemmaMoeBatchedPrefillMode(gemma_cfg, 70, .off, true, false, .off),
-    );
-    try std.testing.expectEqual(
-        BatchedPrefillMode.off,
-        resolveGemmaMoeBatchedPrefillMode(gemma_cfg, 70, .off, false, true, .off),
-    );
-    try std.testing.expectEqual(
-        BatchedPrefillMode.validate,
-        resolveGemmaMoeBatchedPrefillMode(gemma_cfg, 70, .validate, true, false, .off),
-    );
-    try std.testing.expectEqual(
-        BatchedPrefillMode.off,
-        resolveGemmaMoeBatchedPrefillMode(gemma_cfg, 20, .off, true, false, .off),
-    );
 
     const base_chunk = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 70, null);
     try std.testing.expectEqual(@as(usize, 7), base_chunk);
@@ -29545,34 +29486,6 @@ test "gemma moe prefill path name exposes mixed validation replay" {
 
     profile.queued_prefill_requests = 0;
     try std.testing.expectEqualStrings("batched-route-pack", gemmaMoePrefillPathName(profile));
-}
-
-test "gemma validate replay profile delta isolates queued replay" {
-    var candidate = RuntimeProfile{};
-    candidate.decode_steps = 70;
-    candidate.command_buffers = 1;
-    candidate.commit_waits = 1;
-    candidate.gpu_completion_wait_ns = 100;
-    candidate.dmmv_total_bytes = 1000;
-    candidate.route_pack_layers = 30;
-    candidate.route_pack_slots = 560;
-
-    var total = candidate;
-    total.decode_steps += 70;
-    total.command_buffers += 12;
-    total.commit_waits += 12;
-    total.gpu_completion_wait_ns += 700;
-    total.dmmv_total_bytes += 9000;
-    total.queued_prefill_requests = 1;
-    total.queued_prefill_chunks = 12;
-
-    const replay = profileDeltaForSplit(total, candidate);
-    try std.testing.expectEqualStrings("queued-token-major", gemmaMoePrefillPathName(replay));
-    try std.testing.expectEqual(@as(u32, 0), replay.route_pack_layers);
-    try std.testing.expectEqual(@as(u32, 1), replay.queued_prefill_requests);
-    try std.testing.expectEqual(@as(u32, 12), replay.queued_prefill_chunks);
-    try std.testing.expectEqual(@as(u64, 700), replay.gpu_completion_wait_ns);
-    try std.testing.expectEqual(@as(u64, 9000), replay.dmmv_total_bytes);
 }
 
 test "kv_cache_write shader writes K and V slices at token offset" {
