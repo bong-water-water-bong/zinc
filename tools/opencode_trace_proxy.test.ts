@@ -12,6 +12,7 @@ import {
   repairArgumentsJson,
   repairOpenAiToolCalls,
   repairSseEvent,
+  sendProxyErrorResponse,
   stripToolBoundaryTail,
 } from "./opencode_trace_proxy.mjs";
 
@@ -143,6 +144,15 @@ describe("tool argument repair", () => {
     expect(JSON.parse(repaired.text).filePath).toBe("/private/tmp/zinc-opencode-smoke4/src/cart.mjs");
   });
 
+  test("repairs whitespace inserted around path punctuation", () => {
+    const repaired = repairArgumentsJson(
+      JSON.stringify({ filePath: "/private/tmp/zinc-opencode-smoke4/src/cart. mjs" }),
+      body,
+      "read",
+    );
+    expect(JSON.parse(repaired.text).filePath).toBe("/private/tmp/zinc-opencode-smoke4/src/cart.mjs");
+  });
+
   test("repairs bad private path to preferred editable source for edit/write", () => {
     const repaired = repairArgumentsJson(JSON.stringify({ filePath: "/private/" }), body, "edit");
     expect(JSON.parse(repaired.text).filePath).toBe("/private/tmp/zinc-opencode-smoke4/src/cart.mjs");
@@ -216,5 +226,28 @@ describe("tool argument repair", () => {
     expect(args.path).toBe("/private/tmp/zinc-opencode-smoke4");
     expect(args.pattern).toBe("test/**/*");
     expect(repaired.event).not.toContain("<//parameter>");
+  });
+});
+
+describe("proxy error handling", () => {
+  test("does not write headers again after a streaming response started", () => {
+    const calls = [];
+    const res = {
+      destroyed: false,
+      writableEnded: false,
+      headersSent: true,
+      writeHead() {
+        calls.push("writeHead");
+      },
+      end() {
+        calls.push("end");
+        this.writableEnded = true;
+      },
+    };
+
+    sendProxyErrorResponse(res, 502, "stream closed");
+
+    expect(calls).toEqual(["end"]);
+    expect(res.writableEnded).toBe(true);
   });
 });

@@ -124,6 +124,8 @@ function cleanPathCandidate(raw) {
   let s = stripToolBoundaryTail(raw);
   s = s.replace(/<\/?(?:path|file|parameter|entry)>/g, "");
   s = s.replace(/[),;\]]+$/g, "");
+  s = s.replace(/\s+\//g, "/").replace(/\/\s+/g, "/");
+  s = s.replace(/\s+\./g, ".").replace(/\.\s+/g, ".");
   if ((s.endsWith(".") || s.endsWith(":")) && !/\.[A-Za-z0-9]+[.:]$/.test(s)) {
     s = s.slice(0, -1);
   }
@@ -435,6 +437,16 @@ async function writeTrace(traceDir, trace) {
   return file;
 }
 
+export function sendProxyErrorResponse(res, status, message, type = "proxy_error") {
+  if (res.destroyed || res.writableEnded) return;
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify({ error: { message, type } }));
+}
+
 async function handleProxyRequest(req, res, opts) {
   const rawBody = await readRequestBody(req);
   let requestBody = rawBody;
@@ -507,8 +519,7 @@ async function handleProxyRequest(req, res, opts) {
     }
   } catch (err) {
     trace.error = { message: err?.message ?? String(err), stack: err?.stack };
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: { message: trace.error.message, type: "proxy_error" } }));
+    sendProxyErrorResponse(res, 502, trace.error.message);
   } finally {
     try {
       trace.trace_file = await writeTrace(opts.traceDir, trace);
@@ -521,8 +532,7 @@ async function handleProxyRequest(req, res, opts) {
 export function startProxy(opts) {
   const server = http.createServer((req, res) => {
     handleProxyRequest(req, res, opts).catch((err) => {
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { message: err?.message ?? String(err), type: "proxy_error" } }));
+      sendProxyErrorResponse(res, 500, err?.message ?? String(err));
     });
   });
   server.listen(opts.listen, "127.0.0.1", () => {
