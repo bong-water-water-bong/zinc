@@ -2698,7 +2698,17 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
 
         if (!hasExplicitGemmaMoeTensors(cfg, lt)) return false;
         const gate_inp = lt.ffn_gate_inp orelse return false;
-        if (!supportsBatchedGemmQuant(engine, gate_inp.info.type_)) return false;
+        const gate_scale = lt.ffn_gate_inp_scale orelse return false;
+        const f32_router_supported = canUseGemmaRmsNormRouterF32TopkBatched(
+            engine,
+            gate_inp,
+            gate_scale,
+            cfg.n_experts,
+            cfg.n_experts_used,
+            cfg.hidden_dim,
+            1,
+        );
+        if (!supportsBatchedGemmQuant(engine, gate_inp.info.type_) and !f32_router_supported) return false;
         if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_exps_bias != null or
             lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) return false;
 
@@ -2714,7 +2724,18 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
             !supportsBatchedGemmQuant(engine, up_shexp.info.type_) or
             !supportsBatchedGemmQuant(engine, down_shexp.info.type_)) return false;
         if (lt.ffn_gate_inp_shexp) |gate| {
-            if (!supportsBatchedGemmQuant(engine, gate.info.type_)) return false;
+            const f32_shared_gate_supported =
+                canUseGemmaRmsNormRouterF32TopkSharedGateBatched(
+                    engine,
+                    gate_inp,
+                    gate_scale,
+                    gate,
+                    cfg.n_experts,
+                    cfg.n_experts_used,
+                    cfg.hidden_dim,
+                    1,
+                ) or canUseQwenSsmProjectionTailF32Batched(engine, gate, 1, cfg.hidden_dim);
+            if (!supportsBatchedGemmQuant(engine, gate.info.type_) and !f32_shared_gate_supported) return false;
         }
 
         if (!isF32Tensor(lt.ffn_gate_inp_scale) or !isF32Tensor(lt.pre_ffw_norm_2) or
@@ -12497,13 +12518,76 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         recordRoutePackProfile(profile, n_tokens, cfg.n_experts, cfg.n_experts_used, active_block_upper_bound);
     }
 
-    dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, gate_scale, hidden_dim, n_tokens);
-    cmd.barrier();
-    dispatchGemmBatchedOnCmd(engine, cmd, router_t, &scratch.down, &scratch.gate, cfg.n_experts, hidden_dim, n_tokens);
-    cmd.barrier();
+    const router_logit_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)));
+    const use_fused_f32_router =
+        canUseGemmaRmsNormRouterF32TopkBatched(engine, router_t, gate_scale, cfg.n_experts, cfg.n_experts_used, hidden_dim, n_tokens);
+    const use_fused_f32_router_shared_gate =
+        use_fused_f32_router and
+        lt.ffn_gate_inp_shexp != null and
+        canUseGemmaRmsNormRouterF32TopkSharedGateBatched(
+            engine,
+            router_t,
+            gate_scale,
+            lt.ffn_gate_inp_shexp.?,
+            cfg.n_experts,
+            cfg.n_experts_used,
+            hidden_dim,
+            n_tokens,
+        );
+    var pre_ffw_norm_2_ready = false;
+    var shared_gate_ready = false;
+    if (use_fused_f32_router_shared_gate) {
+        dispatchGemmaRmsNormRouterF32TopkSharedGateBatchedScaledOnCmd(
+            engine,
+            cmd,
+            router_t,
+            gate_scale,
+            lt.ffn_gate_inp_shexp.?,
+            pre_ffw_norm_2,
+            &scratch.hidden,
+            &scratch.norm,
+            &scratch.moe_routing,
+            &scratch.attn_out,
+            &scratch.down,
+            cfg.n_experts,
+            cfg.n_experts_used,
+            hidden_dim,
+            n_tokens,
+            0,
+            0,
+            router_logit_scale,
+        );
+        pre_ffw_norm_2_ready = true;
+        shared_gate_ready = true;
+        cmd.barrier();
+    } else if (use_fused_f32_router) {
+        dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
+            engine,
+            cmd,
+            router_t,
+            gate_scale,
+            pre_ffw_norm_2,
+            &scratch.hidden,
+            &scratch.moe_routing,
+            &scratch.down,
+            cfg.n_experts,
+            cfg.n_experts_used,
+            hidden_dim,
+            n_tokens,
+            0,
+            router_logit_scale,
+        );
+        pre_ffw_norm_2_ready = true;
+        cmd.barrier();
+    } else {
+        dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, gate_scale, hidden_dim, n_tokens);
+        cmd.barrier();
+        dispatchGemmBatchedOnCmd(engine, cmd, router_t, &scratch.down, &scratch.gate, cfg.n_experts, hidden_dim, n_tokens);
+        cmd.barrier();
 
-    dispatchSoftmaxTopkBatchedOnCmd(engine, cmd, &scratch.gate, &scratch.moe_routing, n_tokens, cfg.n_experts, cfg.n_experts_used);
-    cmd.barrier();
+        dispatchSoftmaxTopkBatchedOnCmd(engine, cmd, &scratch.gate, &scratch.moe_routing, n_tokens, cfg.n_experts, cfg.n_experts_used);
+        cmd.barrier();
+    }
     if (use_route_slot_moe) {
         dispatchMoeRouteIdsOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_packed_ids, n_tokens, cfg.n_experts_used);
     } else if (use_active_blocks) {
@@ -12524,8 +12608,10 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     }
     cmd.barrier();
 
-    dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, pre_ffw_norm_2, hidden_dim, n_tokens);
-    cmd.barrier();
+    if (!pre_ffw_norm_2_ready) {
+        dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, pre_ffw_norm_2, hidden_dim, n_tokens);
+        cmd.barrier();
+    }
     dispatchMoeRouteGatherOnCmd(engine, cmd, &scratch.moe_routing, &scratch.down, &scratch.moe_route_input, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
     cmd.barrier();
 
@@ -12731,9 +12817,18 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     cmd.barrier();
 
     if (lt.ffn_gate_inp_shexp) |gate_t| {
-        dispatchGemmBatchedOnCmd(engine, cmd, gate_t, &scratch.norm, &scratch.gate, 1, hidden_dim, n_tokens);
-        cmd.barrier();
-        dispatchSigmoidScaleAccBatchedOnCmd(engine, cmd, &scratch.down, &scratch.moe_route_input, &scratch.gate, n_tokens, hidden_dim);
+        const shared_gate_buf: *const MetalBuffer = if (shared_gate_ready) blk: {
+            break :blk &scratch.attn_out;
+        } else blk: {
+            if (canUseQwenSsmProjectionTailF32Batched(engine, gate_t, 1, hidden_dim)) {
+                dispatchGemmF32SmallOnCmd(engine, cmd, gate_t, &scratch.norm, &scratch.gate, 1, hidden_dim, n_tokens);
+            } else {
+                dispatchGemmBatchedOnCmd(engine, cmd, gate_t, &scratch.norm, &scratch.gate, 1, hidden_dim, n_tokens);
+            }
+            cmd.barrier();
+            break :blk &scratch.gate;
+        };
+        dispatchSigmoidScaleAccBatchedOnCmd(engine, cmd, &scratch.down, &scratch.moe_route_input, shared_gate_buf, n_tokens, hidden_dim);
     } else {
         const push = ScaleAccPush{ .n = total_hidden, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
         const bufs = [_]*const MetalBuffer{ &scratch.down, &scratch.moe_route_input };
