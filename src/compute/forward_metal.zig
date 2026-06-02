@@ -501,6 +501,11 @@ fn defaultGemmaMoePostNormResidualDecodeEnabled(cfg: ModelConfig) bool {
     return cfg.architecture == .gemma and cfg.n_experts > 0;
 }
 
+fn defaultGemmaDecodeScopedMoeBarriersEnabled(cfg: ModelConfig) bool {
+    if (isGemma26A4BMoeShape(cfg)) return false;
+    return cfg.architecture == .gemma and cfg.n_experts > 0;
+}
+
 fn isGemma26Q8ExplicitMoeFallbackLayer(cfg: ModelConfig, lt: LayerTensors) bool {
     if (!isGemma26A4BMoeShape(cfg)) return false;
     if (!hasExplicitGemmaMoeTensors(cfg, lt)) return false;
@@ -1082,6 +1087,23 @@ fn profileGpuMoeResourceBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimePro
     cmd.barrierResourceBuffers(bufs);
     if (cmd.barrier_count == before_count) return;
     recordGpuMoeBarrierPhase(profile, phase);
+}
+
+fn profileGemmaMoeBarrierBuffers(
+    engine: *const InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    phase: GpuMoeBarrierPhase,
+    bufs: []const *const MetalBuffer,
+) void {
+    // Gemma26 decode regressed after exact resource-scoped MoE barriers were
+    // kept for prefill. Preserve them for prefill, but default decode back to
+    // llama.cpp-style MTLBarrierScopeBuffers unless an env probe opts in.
+    if (!engine.in_prefill_phase and !engine.gemma_decode_scoped_moe_barriers_enabled) {
+        profileGpuMoeBarrier(cmd, profile, phase);
+        return;
+    }
+    profileGpuMoeBarrierBuffers(cmd, profile, phase, bufs);
 }
 
 fn profileFullAttnQkvBarrier(
@@ -4097,6 +4119,7 @@ pub const InferenceEngine = struct {
     gemma_q8_moe_decode_enabled: bool,
     gemma_q8_moe_fallback_down_enabled: bool,
     gemma_moe_post_norm_residual_decode_enabled: bool,
+    gemma_decode_scoped_moe_barriers_enabled: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     qwen_ssm_proj_validate_captured_tokens: u32,
@@ -4313,6 +4336,7 @@ pub const InferenceEngine = struct {
         self.gemma_q8_moe_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_DECODE") orelse defaultGemmaQ8MoeDecodeEnabled(cfg);
         self.gemma_q8_moe_fallback_down_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_FALLBACK_DOWN") orelse defaultGemmaQ8MoeFallbackDownEnabled(cfg);
         self.gemma_moe_post_norm_residual_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_MOE_POST_NORM_DECODE") orelse defaultGemmaMoePostNormResidualDecodeEnabled(cfg);
+        self.gemma_decode_scoped_moe_barriers_enabled = readBoolEnv("ZINC_METAL_GEMMA_DECODE_SCOPED_MOE_BARRIERS") orelse defaultGemmaDecodeScopedMoeBarriersEnabled(cfg);
         // Per-kernel timing probe — default off, distorts decode tok/s when on
         // (each dispatch becomes a commit+wait+restart sync). The cycle-33 auto-
         // enable on `--profile` runs was reverted: the probe's per-dispatch
@@ -19014,7 +19038,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
             barrier_bufs[barrier_count] = &engine.router_logits_buf;
             barrier_count += 1;
         }
-        profileGpuMoeBarrierBuffers(cmd, profile, .gate_up, barrier_bufs[0..barrier_count]);
+        profileGemmaMoeBarrierBuffers(engine, cmd, profile, .gate_up, barrier_bufs[0..barrier_count]);
     }
 
     if (!use_fused_gate_up_geglu) {
@@ -19023,7 +19047,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         cmd.dispatchV2(&engine.geglu_batched_pipe, .{ (inter_dim + 63) / 64, cfg.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
     }
     dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, shexp_inter_dim);
-    profileGpuMoeBarrierBuffers(cmd, profile, .activation, &.{ &engine.expert_swiglu_batch_buf, &engine.swiglu_buf }); // activations visible before down projections
+    profileGemmaMoeBarrierBuffers(engine, cmd, profile, .activation, &.{ &engine.expert_swiglu_batch_buf, &engine.swiglu_buf }); // activations visible before down projections
 
     try dispatchDmmvMoeOnCmd(
         engine,
@@ -19089,7 +19113,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         cfg.n_experts_used,
         hidden_dim,
     );
-    profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{&engine.moe_out_buf}); // expert contribution visible before post expert norm
+    profileGemmaMoeBarrierBuffers(engine, cmd, profile, .finalizer, &.{&engine.moe_out_buf}); // expert contribution visible before post expert norm
 
     if (use_fused_post_norm_residual) {
         dispatchGemmaMoePostNormResidualOnCmd(
@@ -19112,7 +19136,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
 
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.moe_out_buf, &engine.moe_out_buf, post_ffw_norm_2, hidden_dim, 1);
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.down_buf, &engine.down_buf, post_ffw_norm_1, hidden_dim, 1);
-    profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{ &engine.moe_out_buf, &engine.down_buf }); // post expert/shared norms visible before shared add
+    profileGemmaMoeBarrierBuffers(engine, cmd, profile, .finalizer, &.{ &engine.moe_out_buf, &engine.down_buf }); // post expert/shared norms visible before shared add
 
     if (lt.ffn_gate_inp_shexp != null) {
         dispatchSigmoidScaleAccOnCmd(engine, cmd, &engine.moe_out_buf, &engine.down_buf, &engine.router_logits_buf, hidden_dim);
@@ -19121,11 +19145,11 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         const acc_bufs = [_]*const MetalBuffer{ &engine.moe_out_buf, &engine.down_buf };
         cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
     }
-    profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{&engine.moe_out_buf}); // combined MoE contribution visible before final post-FFN norm
+    profileGemmaMoeBarrierBuffers(engine, cmd, profile, .finalizer, &.{&engine.moe_out_buf}); // combined MoE contribution visible before final post-FFN norm
 
     if (engine.post_ffn_norm_present[layer_idx]) {
         dispatchRmsNormOnCmd(engine, cmd, &engine.moe_out_buf, &engine.moe_out_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
-        profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{&engine.moe_out_buf});
+        profileGemmaMoeBarrierBuffers(engine, cmd, profile, .finalizer, &.{&engine.moe_out_buf});
     }
 
     if (validate_moe) {
@@ -19170,7 +19194,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     const res_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
     const res_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.moe_out_buf };
     cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &res_bufs, &res_push, @sizeOf(ScaleAccPush), 0);
-    profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{&engine.hidden_buf}); // hidden_buf visible to next layer
+    profileGemmaMoeBarrierBuffers(engine, cmd, profile, .finalizer, &.{&engine.hidden_buf}); // hidden_buf visible to next layer
 }
 
 fn recordGpuRoutedBatchedMoeOnCmd(
@@ -27493,16 +27517,19 @@ test "gemma q8 routed moe decode default gates Gemma 26B shape" {
     try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
     try std.testing.expect(defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
     try std.testing.expect(!defaultGemmaMoePostNormResidualDecodeEnabled(gemma_cfg));
+    try std.testing.expect(!defaultGemmaDecodeScopedMoeBarriersEnabled(gemma_cfg));
     try std.testing.expect(isGemma26A4BMoeShape(gemma_cfg));
     gemma_cfg.hidden_dim = 4096;
     try std.testing.expect(defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
     try std.testing.expect(!defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
     try std.testing.expect(defaultGemmaMoePostNormResidualDecodeEnabled(gemma_cfg));
+    try std.testing.expect(defaultGemmaDecodeScopedMoeBarriersEnabled(gemma_cfg));
     try std.testing.expect(!isGemma26A4BMoeShape(gemma_cfg));
     gemma_cfg.n_experts = 0;
     try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
     try std.testing.expect(!defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
     try std.testing.expect(!defaultGemmaMoePostNormResidualDecodeEnabled(gemma_cfg));
+    try std.testing.expect(!defaultGemmaDecodeScopedMoeBarriersEnabled(gemma_cfg));
     gemma_cfg.architecture = .qwen35;
     gemma_cfg.n_experts = 128;
     try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
