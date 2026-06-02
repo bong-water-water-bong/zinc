@@ -3,6 +3,7 @@ import {
   aggregateTimedSamples,
   backfillNearMiss,
   bestKeptCorrectTokPerSec,
+  bestTreeCandidateCycle,
   buildCrossEffortStatus,
   buildFamilyCooldownDirective,
   buildNearMissDirective,
@@ -23,6 +24,7 @@ import {
   decideKeep,
   detectPhase,
   evaluateOutputText,
+  gemmaPrefillActualPathIsQueuedOffPath,
   keepBaselinesForCycle,
   mergeUniqueEntries,
   parseRestorePathList,
@@ -909,6 +911,46 @@ describe("buildPrompt", () => {
     expect(analysis).toContain("gemma26_prefill_hot");
   });
 
+  test("Gemma post-80 focus blocks off-path route-pack churn when structural batching is disabled", () => {
+    const profile = [
+      "info(forward):   prefill actual path: queued-token-major default_batched=yes structural_batched=no route_layers=0 queued_chunks=12",
+      "info(forward):   prefill queued prefill: requests 1 prompt_tokens 70 chunks 12 async 11 chunk_base 7 final 4 first_chunks [1,5,7,7,7,7,7,7]",
+      "info(forward):   prefill queued prefill queue: async_submits 11 final_wait 728.4 ms",
+      "info(forward):   q8 hot #1: shared M=2112 K=2816 bytes=34.85 GiB calls=5922",
+    ].join("\n");
+    const state = makeState({
+      effortId: 11,
+      effortFile: "MULTI_HOUR_EFFORT_11_METAL_GEMMA_M4.md",
+      effortPlan: "# Effort 11\nGemma 4 26B-A4B MoE",
+      metricMode: "prefill",
+      bestTokPerSec: 90.8,
+      currentBest: { tokPerSec: 90.6, containsReference: true },
+      stalledCycles: 8,
+      lastProfileOutput: profile,
+      lastMetalShapesCycle: 28,
+      lastMetalShapesOk: true,
+      lastMetalShapesOutput: "Case moe_down_cols route-cols active-block: 1.64 ms",
+      cycles: [
+        makeCycle({ cycle: 10, kept: true, containsReference: true, tokPerSec: 90.8 }),
+        ...Array.from({ length: 8 }, (_, idx) => makeCycle({
+          cycle: 21 + idx,
+          kept: idx % 2 === 0,
+          containsReference: true,
+          tokPerSec: idx % 2 === 0 ? 90.6 : 89.4,
+          description: "Retune active-block route-pack gather barriers",
+        })),
+      ],
+    });
+
+    expect(gemmaPrefillActualPathIsQueuedOffPath(profile)).toBe(true);
+    const analysis = buildGemmaPrefillPostBreakthroughAnalysis(state).join("\n");
+    expect(analysis).toContain("Latest actual prefill path");
+    expect(analysis).toContain("full batched route-pack is not executing");
+    expect(analysis).toContain("structural_batched=yes");
+    expect(analysis).toContain("route-pack/active-block cases as off-path");
+    expect(analysis).toContain("audit the exact guard blocker");
+  });
+
   test("Gemma plateau rejects neutral optimization churn but allows evidence work", () => {
     const state = makeState({
       effortId: 11,
@@ -1679,6 +1721,20 @@ describe("plateau controls", () => {
     );
     expect(decision.finalize).toBe(true);
     expect(decision.reason).toContain("cycle 83");
+  });
+
+  test("best-tree candidate prefers the latest same-band kept-correct cycle", () => {
+    const candidate = bestTreeCandidateCycle({
+      bestTokPerSec: 90.8,
+      cycles: [
+        makeCycle({ cycle: 10, kept: true, containsReference: true, tokPerSec: 90.8, commitHash: "cycle-10" }),
+        makeCycle({ cycle: 20, kept: true, containsReference: true, tokPerSec: 90.75, commitHash: "cycle-20" }),
+        makeCycle({ cycle: 26, kept: true, containsReference: true, tokPerSec: 90.8, commitHash: "cycle-26" }),
+        makeCycle({ cycle: 28, kept: true, containsReference: true, tokPerSec: 90.6, commitHash: "cycle-28" }),
+      ],
+    });
+    expect(candidate?.cycle).toBe(26);
+    expect(candidate?.commitHash).toBe("cycle-26");
   });
 
   test("best-tree finalization skips when already at the promoted commit", () => {

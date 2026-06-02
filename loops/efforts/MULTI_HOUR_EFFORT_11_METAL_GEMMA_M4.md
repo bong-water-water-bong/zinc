@@ -92,6 +92,49 @@ Interpretation:
 - Do not optimize from pre-cycle-59 or cycle-49 numbers. Treat 88.30 tok/s as
   the current floor and cycle 98 as the schedule baseline.
 
+## Public-prompt controller result - 2026-06-02 local M4 prefill loop
+
+The first public-prompt prefill run used the benchmark-plan prompt from this
+file: 70 prompt tokens, chat template, reference text `benchmark`, and decode
+cross-effort guard on the Paris prompt.
+
+Outcome:
+
+- Best kept-correct public-prompt prefill: **90.80 tok/s**.
+- Latest accepted tree before harness finalization: **90.60 tok/s**.
+- Cross-effort decode stayed healthy: about **69.9 tok/s**, only -0.2% from
+  baseline.
+- The loop plateau-stopped after 20 cycles without a new promoted best.
+
+Important harness finding:
+
+- The run did have several 90.8 tok/s kept-correct commits, but `bestTree` was
+  not populated because the fresh run never had a strict `promotedBest=true`
+  cycle. The harness now backfills the best-tree candidate from git and prefers
+  the latest same-band kept-correct cycle so plateau finalization restores the
+  best source tree instead of leaving the last neutral enablement tree accepted.
+
+Production-profile finding:
+
+```text
+prefill actual path: queued-token-major default_batched=yes structural_batched=no route_layers=0 queued_chunks=12
+prefill queued prefill: prompt_tokens 70 chunks 12 async 11 chunk_base 7 final 4 first_chunks [1,5,7,7,7,7,7,7]
+prefill queued prefill queue: async_submits 11 ... final_wait ~728 ms
+mix/step: attn 30.0 gpu-moe 29.0 fallback-moe 0.3
+q8 hot #1: shared M=2112 K=2816 bytes=34.85 GiB calls=5922
+```
+
+Interpretation:
+
+- Full batched route-pack/active-block work was off-path in the public-prompt
+  production profile: `structural_batched=no` and `route_layers=0`.
+- Repeated `bench-metal-shapes gemma26_prefill_hot` runs showed stable route
+  kernels, but those route-pack cases are not production evidence until the
+  outer profile flips to `structural_batched=yes` with nonzero route layers.
+- The next valid speed path is either the exact guard blocker for
+  `structural_batched=no`, or the queued-token-major chunk/wait schedule that
+  is actually running.
+
 ## Loop recipes
 
 The default correctness oracle is still the Paris chat prompt. For public-suite
@@ -181,11 +224,16 @@ ZINC_CROSS_EFFORT_PROMPT_MODE=chat \
 ZINC_CROSS_EFFORT_MAX_TOKENS=96 \
 ZINC_CROSS_EFFORT_EVERY=3 \
 ZINC_GEMMA_PLATEAU_STALL_CYCLES=6 \
-ZINC_METAL_SHAPES_EVERY=3 \
+ZINC_METAL_SHAPES_EVERY=0 \
 ZINC_METAL_SHAPES_ARGS="--case gemma26_prefill_hot --pipeline production --route-tokens 70 --iterations 80 --warmup 10" \
 ZINC_CODEX_REASONING_EFFORT=xhigh \
-bun loops/implement_metal.ts --effort 11 --agent codex --model gpt-5.5 --cycles 60
+bun loops/implement_metal.ts --resume --effort 11 --agent codex --model gpt-5.5 --cycles 100
 ```
+
+Use `ZINC_METAL_SHAPES_EVERY=3` only after the profile shows
+`structural_batched=yes` and `route_layers>0`, or when the cycle explicitly
+adds measurement coverage. The last public-prompt run already captured enough
+off-path route-pack evidence.
 
 ### Public-suite validation
 
@@ -485,16 +533,17 @@ surrounding path has changed substantially:
 - No-code study cycles are not useful unless they land measurement coverage or
   update this effort file with a concrete, current no-code conclusion.
 
-## Next best targets after cycle 98
+## Next best targets after public-prompt cycle 30
 
-1. Consume `bench-metal-shapes --case gemma26_prefill_hot --pipeline production`
-   evidence before another shared-Q8 or finalizer retune. Use `--route-tokens
-   20` for Paris-only reproduction and `--route-tokens 70` for the public
-   coding-plan prompt.
-2. Audit the exact guard blockers preventing the full Gemma batched-prefill path
-   from becoming default-on under public-suite prompt lengths.
-3. Validate the cycle-98 tree on the public performance suite before publishing
-   site numbers or optimizing only the 20-token Paris shape further.
+1. Audit and print the exact guard blocker that leaves the public-prompt profile
+   at `structural_batched=no route_layers=0`.
+2. If the structural path cannot be enabled cleanly, optimize the
+   queued-token-major path that is actually running: chunk sizing, async/final
+   split, or wait placement.
+3. Do not spend another cycle retuning active-block route-pack/gather/barrier
+   kernels unless a production profile first shows that path is executing.
+4. After a meaningful kept source change, validate on the public performance
+   suite before publishing site numbers.
 
 ## Measurement gates
 
