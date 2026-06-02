@@ -1077,6 +1077,13 @@ fn profileGpuMoeBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, ph
     recordGpuMoeBarrierPhase(profile, phase);
 }
 
+fn profileGpuMoeResourceBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: GpuMoeBarrierPhase, bufs: []const *const MetalBuffer) void {
+    const before_count = cmd.barrier_count;
+    cmd.barrierResourceBuffers(bufs);
+    if (cmd.barrier_count == before_count) return;
+    recordGpuMoeBarrierPhase(profile, phase);
+}
+
 fn profileFullAttnQkvBarrier(
     cmd: *MetalCommand,
     profile: ?*RuntimeProfile,
@@ -13253,14 +13260,38 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     } else {
         dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
     }
-    profileGpuMoeBarrier(cmd, profile, .router);
 
     if (!pre_ffw_norm_2_ready) {
         dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, pre_ffw_norm_2, hidden_dim, n_tokens);
         profileGpuMoeBarrier(cmd, profile, .gate_up);
     }
     dispatchMoeRouteGatherOnCmd(engine, cmd, &scratch.moe_routing, &scratch.down, &scratch.moe_route_input, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
-    profileGpuMoeBarrier(cmd, profile, .gate_up);
+    {
+        // Route pack writes are first consumed by the grouped expert DMMVs, not
+        // by the token gather. Join route-pack and gather at that edge so the
+        // gather can overlap with pack work, while still ordering every buffer
+        // the DMMV kernels read.
+        var gate_up_barrier_bufs: [5]*const MetalBuffer = undefined;
+        var gate_up_barrier_count: usize = 0;
+        gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_route_input;
+        gate_up_barrier_count += 1;
+        if (use_route_slot_moe) {
+            gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_packed_ids;
+            gate_up_barrier_count += 1;
+        } else {
+            gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_expert_counts;
+            gate_up_barrier_count += 1;
+            gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_packed_ids;
+            gate_up_barrier_count += 1;
+            if (use_active_blocks) {
+                gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_active_blocks;
+                gate_up_barrier_count += 1;
+                gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_active_block_count;
+                gate_up_barrier_count += 1;
+            }
+        }
+        profileGpuMoeResourceBarrierBuffers(cmd, profile, .gate_up, gate_up_barrier_bufs[0..gate_up_barrier_count]);
+    }
 
     if (use_route_slot_moe) {
         if (use_fused_gate_up_geglu_routes) {
