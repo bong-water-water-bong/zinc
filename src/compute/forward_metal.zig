@@ -2971,13 +2971,7 @@ fn logGemmaBatchedPrefillDecision(
 
     for (0..cfg.n_layers) |i| {
         if (engine.layer_output_scales[i] != 1.0) {
-            const lt = engine.layer_tensors[i];
-            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} output_scale={d:.6} next_after_scale={s} attn_gate={s}", .{
-                i,
-                engine.layer_output_scales[i],
-                if (lt.attn_gate != null) "attn_gate" else "unknown",
-                optionalTensorTypeName(lt.attn_gate),
-            });
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} output_scale={d:.6}", .{ i, engine.layer_output_scales[i] });
             return;
         }
 
