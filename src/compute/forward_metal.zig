@@ -13211,15 +13211,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         );
         pre_ffw_norm_2_ready = true;
         shared_gate_ready = true;
-        // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset` to the
-        // vLLM-style packed MoE handoff: route-pack only needs the compact
-        // routing row immediately, while grouped expert gather also needs the
-        // pre-FFW norm row and the final shared gate consumes the scalar later.
-        profileGpuMoeResourceBarrierBuffers(cmd, profile, .router, &.{
-            &scratch.moe_routing,
-            &scratch.down,
-            &scratch.attn_out,
-        });
+        profileGpuMoeBarrier(cmd, profile, .router);
     } else if (use_fused_f32_router) {
         dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
             engine,
@@ -13238,11 +13230,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             router_logit_scale,
         );
         pre_ffw_norm_2_ready = true;
-        // Same fused-router producer, without the shared-gate side output.
-        profileGpuMoeResourceBarrierBuffers(cmd, profile, .router, &.{
-            &scratch.moe_routing,
-            &scratch.down,
-        });
+        profileGpuMoeBarrier(cmd, profile, .router);
     } else {
         dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, gate_scale, hidden_dim, n_tokens);
         profileGpuMoeBarrier(cmd, profile, .router);
