@@ -6956,6 +6956,7 @@ pub const InferenceEngine = struct {
             // Snapshot batched-path logits, then re-run the per-token path on
             // a fresh state and diff. The per-token result becomes authoritative
             // so any subsequent decode steps continue from the trusted state.
+            const candidate_profile = self.request_profile;
             const vocab = cfg.vocab_size;
             const batched_snapshot = try self.allocator.alloc(f32, vocab);
             defer self.allocator.free(batched_snapshot);
@@ -6969,6 +6970,7 @@ pub const InferenceEngine = struct {
             state.position = 0;
             state.generated_tokens.clearRetainingCapacity();
             try self.prefillBatch(state, prompt_tokens);
+            const replay_profile = self.request_profile;
 
             const ref_logits: [*]const f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
             var max_abs: f32 = 0;
@@ -6985,6 +6987,27 @@ pub const InferenceEngine = struct {
             log.warn("prefillBatched validate[{s}]: last-token logits max_abs_diff={d:.6} at idx={d} (ref={d:.4} batched={d:.4}) tol={d:.6} n_tokens={d}", .{
                 @tagName(level), max_abs, max_idx, ref_logits[max_idx], batched_snapshot[max_idx], tol, n_tokens,
             });
+            if (self.profile_enabled and cfg.architecture == .gemma and cfg.n_experts > 0) {
+                log.info("prefillBatched validate_profile: candidate_path={s} replay_path={s} candidate_wait={d:.2}ms replay_wait={d:.2}ms candidate_dmmv={d:.2}GiB replay_dmmv={d:.2}GiB candidate_cmds={d} replay_cmds={d} candidate_commits={d} replay_commits={d}", .{
+                    gemmaMoePrefillPathName(candidate_profile),
+                    gemmaMoePrefillPathName(replay_profile),
+                    nsToMs(candidate_profile.gpu_completion_wait_ns),
+                    nsToMs(replay_profile.gpu_completion_wait_ns),
+                    bytesToGiB(candidate_profile.dmmv_total_bytes),
+                    bytesToGiB(replay_profile.dmmv_total_bytes),
+                    candidate_profile.command_buffers,
+                    replay_profile.command_buffers,
+                    candidate_profile.commit_waits,
+                    replay_profile.commit_waits,
+                });
+                log.info("prefillBatched validate_route_pack: candidate_layers={d} candidate_active_blocks={d} candidate_active_upper={d} replay_queued_chunks={d} replay_async_submits={d}", .{
+                    candidate_profile.route_pack_layers,
+                    candidate_profile.route_pack_active_blocks_actual,
+                    candidate_profile.route_pack_active_block_upper_bound,
+                    replay_profile.queued_prefill_chunks,
+                    replay_profile.queued_prefill_async_submit_count,
+                });
+            }
         }
     }
 
