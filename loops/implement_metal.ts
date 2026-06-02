@@ -2867,16 +2867,18 @@ export function shouldFinalizeBestTree(
 }
 
 async function backfillBestTreeCommitFromGit(state: RunState): Promise<void> {
-  if (state.bestTree?.commitHash) return;
   const best = bestKeptCorrectCycle(state);
   if (!best || best.tokPerSec == null) return;
-  if (best.commitHash) {
-    state.bestTree = { cycle: best.cycle, tokPerSec: best.tokPerSec, commitHash: best.commitHash };
+  if (
+    state.bestTree?.commitHash &&
+    state.bestTree.cycle === best.cycle &&
+    state.bestTree.tokPerSec >= best.tokPerSec - 0.05
+  ) {
     return;
   }
   const grep = `metal-loop: cycle-${best.cycle} `;
   const found = await runCommand("git", ["log", "--format=%H", "--grep", grep, "-1"]).catch(() => null);
-  const commitHash = found?.stdout.trim();
+  const commitHash = found?.stdout.trim() || best.commitHash;
   if (commitHash) {
     state.bestTree = { cycle: best.cycle, tokPerSec: best.tokPerSec, commitHash };
   }
