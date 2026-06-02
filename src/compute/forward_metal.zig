@@ -2675,6 +2675,265 @@ fn gemmaBatchedPrefillRouteMode(engine: *const InferenceEngine, n_tokens: u32) [
     );
 }
 
+const GemmaBatchedPrefillKnownBypassBlocker = enum(u8) {
+    none,
+    not_gemma_moe,
+    ssm,
+    private_cpu_lm_head,
+    full_attention_interval,
+    lm_head_quant,
+    scale_in_place_pipeline,
+    sigmoid_mul_pipeline,
+    attn_bias,
+    attention_params,
+    attn_missing,
+    attn_quant,
+    fused_q_gate_layout,
+    moe_tensors,
+    router_missing,
+    router_unsupported,
+    moe_bias,
+    gate_up_layout,
+    gate_up_quant,
+    down_experts_missing,
+    down_cols_unsupported,
+    shared_missing,
+    shared_quant,
+    shared_gate_input,
+    f32_metadata,
+    softmax_topk_pipeline,
+    route_pack_pipeline,
+    route_ids_pipeline,
+    route_gather_pipeline,
+    scatter_scaled_pipeline,
+    scatter_direct_scaled_pipeline,
+    geglu_pipeline,
+    sigmoid_scale_acc_pipeline,
+    zero_f32_pipeline,
+    scale_acc_pipeline,
+};
+
+const GemmaBatchedPrefillKnownBypassAudit = struct {
+    blocker: GemmaBatchedPrefillKnownBypassBlocker = .none,
+    blocker_layer: u32 = 0,
+    output_scale_layers: u32 = 0,
+    attn_gate_layers: u32 = 0,
+};
+
+fn gemmaBatchedPrefillKnownBypassBlocked(
+    audit: *GemmaBatchedPrefillKnownBypassAudit,
+    blocker: GemmaBatchedPrefillKnownBypassBlocker,
+    layer: usize,
+) bool {
+    audit.blocker = blocker;
+    audit.blocker_layer = @intCast(@min(layer, @as(usize, std.math.maxInt(u32))));
+    return true;
+}
+
+fn gemmaBatchedPrefillKnownBypassAudit(engine: *const InferenceEngine) GemmaBatchedPrefillKnownBypassAudit {
+    // Measurement-only audit adapted from llama.cpp `ggml_metal_op_mul_mat_id`
+    // and vLLM `moe_align_block_size`: grouped expert execution needs a full
+    // structural-admission pass, not one first-failing guard. Count the two
+    // known Gemma26 blockers that post-best cycles already tried to bypass, then
+    // report the next blocker without changing runtime semantics.
+    var audit = GemmaBatchedPrefillKnownBypassAudit{};
+    const cfg = engine.config;
+    const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else cfg.hidden_dim * 4;
+    if (cfg.architecture != .gemma or cfg.n_experts == 0) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .not_gemma_moe, 0);
+        return audit;
+    }
+    if (cfg.ssm_d_inner > 0) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .ssm, 0);
+        return audit;
+    }
+    if (engine.private_decode_buffers and shouldCpuLmHeadFallback(engine)) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .private_cpu_lm_head, 0);
+        return audit;
+    }
+    if (fullAttentionInterval(cfg) != 1) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .full_attention_interval, 0);
+        return audit;
+    }
+    if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .lm_head_quant, 0);
+        return audit;
+    }
+
+    for (0..cfg.n_layers) |i| {
+        if (engine.layer_output_scales[i] != 1.0) audit.output_scale_layers += 1;
+
+        const lt = engine.layer_tensors[i];
+        if (lt.attn_gate != null) audit.attn_gate_layers += 1;
+        if (lt.attn_q_bias != null or lt.attn_k_bias != null or
+            lt.attn_v_bias != null or lt.attn_output_bias != null)
+        {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .attn_bias, i);
+            return audit;
+        }
+
+        const attn = resolveLayerAttentionParams(cfg, lt, cfg.hidden_dim, engine.kv_cache_q8) catch {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .attention_params, i);
+            return audit;
+        };
+        const q = lt.attn_q orelse {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .attn_missing, i);
+            return audit;
+        };
+        const k = lt.attn_k orelse {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .attn_missing, i);
+            return audit;
+        };
+        const o = lt.attn_output orelse {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .attn_missing, i);
+            return audit;
+        };
+        if (!supportsBatchedGemmQuant(engine, q.info.type_) or !supportsBatchedGemmQuant(engine, k.info.type_) or
+            !supportsBatchedGemmQuant(engine, o.info.type_))
+        {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .attn_quant, i);
+            return audit;
+        }
+        if (!attn.use_k_as_v) {
+            const v = lt.attn_v orelse {
+                _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .attn_missing, i);
+                return audit;
+            };
+            if (!supportsBatchedGemmQuant(engine, v.info.type_)) {
+                _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .attn_quant, i);
+                return audit;
+            }
+        }
+
+        const q_rows: u32 = @intCast(q.info.numElements() / cfg.hidden_dim);
+        if (q_rows >= attn.q_dim * 2) {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .fused_q_gate_layout, i);
+            return audit;
+        }
+
+        if (!hasExplicitGemmaMoeTensors(cfg, lt)) {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .moe_tensors, i);
+            return audit;
+        }
+        const gate_inp = lt.ffn_gate_inp orelse {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .router_missing, i);
+            return audit;
+        };
+        const gate_scale = lt.ffn_gate_inp_scale orelse {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .router_missing, i);
+            return audit;
+        };
+        const f32_router_supported = canUseGemmaRmsNormRouterF32TopkBatched(
+            engine,
+            gate_inp,
+            gate_scale,
+            cfg.n_experts,
+            cfg.n_experts_used,
+            cfg.hidden_dim,
+            1,
+        );
+        if (!supportsBatchedGemmQuant(engine, gate_inp.info.type_) and !f32_router_supported) {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .router_unsupported, i);
+            return audit;
+        }
+        if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_exps_bias != null or
+            lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null)
+        {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .moe_bias, i);
+            return audit;
+        }
+
+        const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, cfg.hidden_dim) catch {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .gate_up_layout, i);
+            return audit;
+        };
+        if (gate_up_layout.gate_tensor.info.type_ != .q4_k or gate_up_layout.up_tensor.info.type_ != .q4_k) {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .gate_up_quant, i);
+            return audit;
+        }
+        const down_exps = lt.ffn_down_exps orelse {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .down_experts_missing, i);
+            return audit;
+        };
+        if (!supportsGroupedGemmaMoeCols(engine, down_exps.info.type_)) {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .down_cols_unsupported, i);
+            return audit;
+        }
+
+        const gate_shexp = lt.ffn_gate_shexp orelse {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .shared_missing, i);
+            return audit;
+        };
+        const up_shexp = lt.ffn_up_shexp orelse {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .shared_missing, i);
+            return audit;
+        };
+        const down_shexp = lt.ffn_down_shexp orelse {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .shared_missing, i);
+            return audit;
+        };
+        if (!supportsBatchedGemmQuant(engine, gate_shexp.info.type_) or
+            !supportsBatchedGemmQuant(engine, up_shexp.info.type_) or
+            !supportsBatchedGemmQuant(engine, down_shexp.info.type_))
+        {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .shared_quant, i);
+            return audit;
+        }
+        if (lt.ffn_gate_inp_shexp) |gate| {
+            const f32_shared_gate_supported =
+                canUseGemmaRmsNormRouterF32TopkSharedGateBatched(
+                    engine,
+                    gate_inp,
+                    gate_scale,
+                    gate,
+                    cfg.n_experts,
+                    cfg.n_experts_used,
+                    cfg.hidden_dim,
+                    1,
+                ) or canUseQwenSsmProjectionTailF32Batched(engine, gate, 1, cfg.hidden_dim);
+            if (!supportsBatchedGemmQuant(engine, gate.info.type_) and !f32_shared_gate_supported) {
+                _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .shared_gate_input, i);
+                return audit;
+            }
+        }
+
+        if (!isF32Tensor(lt.ffn_gate_inp_scale) or !isF32Tensor(lt.pre_ffw_norm_2) or
+            !isF32Tensor(lt.post_ffw_norm_1) or !isF32Tensor(lt.post_ffw_norm_2) or
+            !isF32Tensor(lt.ffn_down_exps_scale))
+        {
+            _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .f32_metadata, i);
+            return audit;
+        }
+    }
+
+    if (audit.output_scale_layers > 0 and engine.scale_in_place_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .scale_in_place_pipeline, 0);
+    } else if (audit.attn_gate_layers > 0 and engine.sigmoid_mul_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .sigmoid_mul_pipeline, 0);
+    } else if (engine.softmax_topk_batched_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .softmax_topk_pipeline, 0);
+    } else if (engine.moe_route_pack_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .route_pack_pipeline, 0);
+    } else if (engine.moe_route_ids_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .route_ids_pipeline, 0);
+    } else if (engine.moe_route_gather_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .route_gather_pipeline, 0);
+    } else if (engine.moe_route_scatter_scaled_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .scatter_scaled_pipeline, 0);
+    } else if (engine.moe_route_scatter_direct_scaled_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .scatter_direct_scaled_pipeline, 0);
+    } else if (engine.geglu_batched_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .geglu_pipeline, 0);
+    } else if (engine.sigmoid_scale_acc_batched_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .sigmoid_scale_acc_pipeline, 0);
+    } else if (engine.zero_f32_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .zero_f32_pipeline, 0);
+    } else if (engine.scale_acc_pipe.handle == null) {
+        _ = gemmaBatchedPrefillKnownBypassBlocked(&audit, .scale_acc_pipeline, 0);
+    }
+    return audit;
+}
+
 fn recordRoutePackProfile(
     profile: ?*RuntimeProfile,
     n_tokens: u32,
@@ -7083,12 +7342,17 @@ pub const InferenceEngine = struct {
                 bytesToGiB(decode_profile.dmmv_total_bytes),
             });
             if (self.config.architecture == .gemma and self.config.n_experts > 0) {
-                log.info("  prefill actual path: {s} default_batched={s} structural_batched={s} route_layers={d} queued_chunks={d}", .{
+                const structural_audit = gemmaBatchedPrefillKnownBypassAudit(self);
+                log.info("  prefill actual path: {s} default_batched={s} structural_batched={s} route_layers={d} queued_chunks={d} structural_known_scale_layers={d} structural_known_attn_gate_layers={d} structural_next_after_known={s} structural_next_layer={d}", .{
                     gemmaMoePrefillPathName(self.prefill_profile),
                     if (shouldDefaultGemmaMoeBatchedPrefillForPrompt(self.config, prompt_tokens)) "yes" else "no",
                     if (canUseBatchedPrefill(self)) "yes" else "no",
                     self.prefill_profile.route_pack_layers,
                     self.prefill_profile.queued_prefill_chunks,
+                    structural_audit.output_scale_layers,
+                    structural_audit.attn_gate_layers,
+                    @tagName(structural_audit.blocker),
+                    structural_audit.blocker_layer,
                 });
             }
         }
