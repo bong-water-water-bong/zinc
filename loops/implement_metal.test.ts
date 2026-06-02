@@ -1132,6 +1132,20 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("restore correct output");
   });
 
+  test("correctness prompt uses the active reference text", () => {
+    const state = makeState();
+    const result = makeResult({
+      tokPerSec: 36,
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "contains the configured reference",
+    });
+    const reference = process.env.ZINC_REFERENCE_TEXT ?? "Paris";
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain(`Output MUST contain "${reference}"`);
+  });
+
   test("target reached status", () => {
     const state = makeState();
     const result = makeResult({

@@ -2335,6 +2335,9 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
 
   // Build diagnosis based on phase
   const diagnosis: string[] = [];
+  const correctnessReference = REFERENCE_TEXT.trim().length > 0
+    ? REFERENCE_TEXT.trim()
+    : "non-empty coherent output";
 
   if (lastResult.buildExitCode !== 0) {
     diagnosis.push("## Status: BUILD FAILURE");
@@ -2352,7 +2355,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
       diagnosis.push("Build and tests pass but ZINC crashes during inference. Fix the crash first.");
     }
   } else if (!lastResult.containsReference) {
-    diagnosis.push(`## Status: CORRECTNESS REGRESSION — output doesn't contain "Paris"`);
+    diagnosis.push(`## Status: CORRECTNESS REGRESSION — output doesn't contain "${correctnessReference}"`);
     diagnosis.push(`Output text: "${lastResult.outputText}"`);
     diagnosis.push("The previous optimization broke correctness. You MUST restore correct output first.");
     diagnosis.push("Read the git diff to see what changed and revert the problematic part.");
@@ -2715,7 +2718,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     "",
     "## Rules",
     "1. Make ONE focused change per cycle. Measure, don't guess.",
-    "2. CORRECTNESS IS SACRED. Output MUST contain 'Paris'. Speed without correctness = instant revert.",
+    `2. CORRECTNESS IS SACRED. Output MUST contain "${correctnessReference}". Speed without correctness = instant revert.`,
     "3. All 27+ tests must continue passing.",
     "4. Do NOT modify src/vulkan/, loops/, or .env.",
     "5. Do NOT run git push, git pull, git fetch, git merge, git rebase, git reset, git checkout, or git restore. The harness owns git commits/reverts.",
