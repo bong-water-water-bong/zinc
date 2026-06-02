@@ -66,7 +66,7 @@ test "Metal prefillBatched gates on env flag and supported architecture" {
     try expectContains(src, "ZINC_BATCHED_PREFILL");
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "batchedPrefillMode()", 600);
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "canUseBatchedPrefill(self)", 1800);
-    try expectContainsNear(src, "if (mode == .off or !canUseBatchedPrefill(self)) {", "return self.prefillBatch(state, prompt_tokens);", 200);
+    try expectContainsNear(src, "if (mode == .off or !can_batched_prefill) {", "return self.prefillBatch(state, prompt_tokens);", 200);
 }
 
 test "Metal prefillBatched validate path diffs last-token logits within 1e-3" {

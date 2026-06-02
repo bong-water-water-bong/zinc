@@ -2824,9 +2824,10 @@ fn logGemmaBatchedPrefillDecision(
     if (cfg.architecture != .gemma or cfg.n_experts == 0) return;
 
     if (mode == .off) {
-        log.info("Metal profile: Gemma batched prefill disabled: mode=off prompt_len={d} default_candidate={s} gemma_env_present={s} generic_env_present={s}", .{
+        log.info("Metal profile: Gemma batched prefill disabled: mode=off prompt_len={d} default_candidate={s} structural_candidate={s} gemma_env_present={s} generic_env_present={s}", .{
             prompt_len,
             if (shouldDefaultGemmaMoeBatchedPrefillForPrompt(cfg, prompt_len)) "yes" else "no",
+            if (can_batched_prefill) "yes" else "no",
             if (gemmaBatchedPrefillEnvPresent()) "yes" else "no",
             if (batchedPrefillEnvPresent()) "yes" else "no",
         });
@@ -6585,8 +6586,13 @@ pub const InferenceEngine = struct {
             .on
         else
             requested_mode;
-        if (mode == .off or !canUseBatchedPrefill(self)) {
-            logGemmaBatchedPrefillDecision(self, prompt_tokens.len, mode, false);
+        const probe_batched_guard_for_profile = self.profile_enabled and is_gemma_moe_prefill;
+        const can_batched_prefill = if (mode != .off or probe_batched_guard_for_profile)
+            canUseBatchedPrefill(self)
+        else
+            false;
+        if (mode == .off or !can_batched_prefill) {
+            logGemmaBatchedPrefillDecision(self, prompt_tokens.len, mode, can_batched_prefill);
             return self.prefillBatch(state, prompt_tokens);
         }
         logGemmaBatchedPrefillDecision(self, prompt_tokens.len, mode, true);
