@@ -3196,6 +3196,28 @@ fn shouldDefaultGemmaMoeBatchedPrefillForPrompt(cfg: ModelConfig, prompt_len: us
     return prompt_len >= 64 and prompt_len <= 96;
 }
 
+fn resolveGemmaMoeBatchedPrefillMode(
+    cfg: ModelConfig,
+    prompt_len: usize,
+    requested_mode: BatchedPrefillMode,
+    generic_env_present: bool,
+    gemma_env_present: bool,
+    explicit_gemma_mode: BatchedPrefillMode,
+) BatchedPrefillMode {
+    if (cfg.architecture != .gemma or cfg.n_experts == 0) return .off;
+    if (gemma_env_present) return explicit_gemma_mode;
+    if (explicit_gemma_mode != .off) return explicit_gemma_mode;
+    if (requested_mode != .off) return requested_mode;
+
+    // Some harnesses pin generic dense prefill off with ZINC_BATCHED_PREFILL=0.
+    // Do not let that broad switch shadow the Gemma26 public-prompt route-pack
+    // default; ZINC_GEMMA_BATCHED_PREFILL=0 remains the explicit Gemma kill
+    // switch.
+    _ = generic_env_present;
+    if (shouldDefaultGemmaMoeBatchedPrefillForPrompt(cfg, prompt_len)) return .on;
+    return .off;
+}
+
 fn shouldDefaultDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     const cfg = engine.config;
     // Auto-enable for dense Gemma (original case) and dense Qwen3 (Effort 14
@@ -6661,25 +6683,23 @@ pub const InferenceEngine = struct {
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
         const requested_mode = batchedPrefillMode();
+        const generic_env_present = batchedPrefillEnvPresent();
         const is_gemma_moe_prefill = self.config.architecture == .gemma and self.config.n_experts > 0;
         const gemma_env_present = gemmaBatchedPrefillEnvPresent();
-        const gemma_mode: BatchedPrefillMode = if (self.config.architecture == .gemma and self.config.n_experts > 0) blk: {
-            const explicit_mode = gemmaBatchedPrefillMode();
-            if (explicit_mode != .off or gemma_env_present) break :blk explicit_mode;
-            if (requested_mode == .off and
-                !batchedPrefillEnvPresent() and
-                shouldDefaultGemmaMoeBatchedPrefillForPrompt(self.config, prompt_tokens.len))
-            {
-                break :blk .on;
-            }
-            break :blk .off;
-        } else .off;
+        const gemma_mode = resolveGemmaMoeBatchedPrefillMode(
+            self.config,
+            prompt_tokens.len,
+            requested_mode,
+            generic_env_present,
+            gemma_env_present,
+            gemmaBatchedPrefillMode(),
+        );
         const mode: BatchedPrefillMode = if (is_gemma_moe_prefill and gemma_env_present and gemma_mode == .off)
             .off
         else if (gemma_mode != .off)
             gemma_mode
         else if (requested_mode == .off and
-            !batchedPrefillEnvPresent() and
+            !generic_env_present and
             shouldDefaultDenseGemmaBatchedPrefill(self))
             .on
         else
@@ -27526,6 +27546,22 @@ test "gemma26 public prompt prefill uses wide queued split without tiny tail" {
     try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 70));
     try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 96));
     try std.testing.expect(!shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 97));
+    try std.testing.expectEqual(
+        BatchedPrefillMode.on,
+        resolveGemmaMoeBatchedPrefillMode(gemma_cfg, 70, .off, true, false, .off),
+    );
+    try std.testing.expectEqual(
+        BatchedPrefillMode.off,
+        resolveGemmaMoeBatchedPrefillMode(gemma_cfg, 70, .off, false, true, .off),
+    );
+    try std.testing.expectEqual(
+        BatchedPrefillMode.validate,
+        resolveGemmaMoeBatchedPrefillMode(gemma_cfg, 70, .validate, true, false, .off),
+    );
+    try std.testing.expectEqual(
+        BatchedPrefillMode.off,
+        resolveGemmaMoeBatchedPrefillMode(gemma_cfg, 20, .off, true, false, .off),
+    );
 
     const base_chunk = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(gemma_cfg, 70, null);
     try std.testing.expectEqual(@as(usize, 7), base_chunk);
