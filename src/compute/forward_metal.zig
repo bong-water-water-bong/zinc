@@ -2688,6 +2688,14 @@ fn denseMoeColsDispatchBlocks(n_tokens: u32, n_experts: u32) u32 {
     return n_experts * blocks_per_expert;
 }
 
+fn batchedPrefillMoeRouteInputSlots(n_tokens: u32, n_experts: u32, n_experts_used: u32) usize {
+    if (n_tokens == 0 or n_experts == 0 or n_experts_used == 0) return 0;
+
+    const n: usize = n_tokens;
+    if (n_tokens < 32) return n * @as(usize, n_experts_used);
+    return n;
+}
+
 fn gemmaBatchedPrefillRouteModeForShape(
     n_tokens: u32,
     has_route_slot_ids: bool,
@@ -3422,6 +3430,11 @@ const BatchedPrefillScratch = struct {
         const n_experts: usize = engine.config.n_experts;
         const k_used: usize = engine.config.n_experts_used;
         const route_slots = n * k_used;
+        const route_input_slots = batchedPrefillMoeRouteInputSlots(
+            n_tokens,
+            engine.config.n_experts,
+            engine.config.n_experts_used,
+        );
         const h = try metal_buffer.createBuffer(ctx, n * hidden_dim * f32_sz);
         errdefer {
             var mut = h;
@@ -3501,7 +3514,7 @@ const BatchedPrefillScratch = struct {
         if (active_block_count.cpu_ptr) |bytes| {
             @memset(bytes[0..active_block_count.size], 0);
         }
-        const moe_input = try metal_buffer.createBuffer(ctx, @max(route_slots * hidden_n * f32_sz, 4));
+        const moe_input = try metal_buffer.createBuffer(ctx, @max(route_input_slots * hidden_n * f32_sz, 4));
         errdefer {
             var mut = moe_input;
             metal_buffer.freeBuffer(&mut);
@@ -29541,6 +29554,48 @@ test "BatchedPrefillScratch allocates Gemma MoE route scratch" {
     try std.testing.expectEqual(@as(usize, route_slots * inter_dim * @sizeOf(f32)), scratch.moe_expert_gate.size);
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_up.size);
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_swiglu.size);
+    try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_expert_down.size);
+}
+
+test "BatchedPrefillScratch sizes active-block shared output scratch by token" {
+    var device = try metal_device.MetalDevice.init(std.testing.allocator, 0);
+    defer device.deinit();
+
+    var engine: InferenceEngine = undefined;
+    engine.device = &device;
+    engine.config = .{
+        .architecture = .gemma,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_heads = 1,
+        .head_dim = 16,
+        .hidden_dim = 32,
+        .intermediate_dim = 16,
+        .vocab_size = 64,
+        .context_length = 128,
+        .rope_freq_base = 10000.0,
+        .n_experts = 6,
+        .n_experts_used = 3,
+        .rope_dim = 16,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 48,
+    };
+
+    const n_tokens: u32 = 70;
+    const q_dim: u32 = 32;
+    const kv_dim: u32 = 16;
+    const inter_dim: u32 = 16;
+    var scratch = try BatchedPrefillScratch.init(&engine, n_tokens, q_dim, kv_dim, inter_dim);
+    defer scratch.deinit();
+
+    const route_slots = n_tokens * engine.config.n_experts_used;
+    try std.testing.expectEqual(route_slots, scratch.moe_route_slots);
+    try std.testing.expectEqual(@as(usize, n_tokens * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_route_input.size);
     try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_expert_down.size);
 }
 
