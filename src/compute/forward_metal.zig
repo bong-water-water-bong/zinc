@@ -1459,6 +1459,7 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
 }
 
 fn gemmaMoePrefillPathName(profile: RuntimeProfile) []const u8 {
+    if (profile.route_pack_layers > 0 and profile.queued_prefill_requests > 0) return "batched-route-pack+queued-replay";
     if (profile.route_pack_layers > 0) return "batched-route-pack";
     if (profile.queued_prefill_requests > 0) return "queued-token-major";
     if (profile.decode_steps > 0) return "per-token";
@@ -29445,6 +29446,23 @@ test "gemma batched prefill route mode names active-block selection" {
     try std.testing.expectEqualStrings("route-slots", gemmaBatchedPrefillRouteModeForShape(20, true, true, true));
     try std.testing.expectEqualStrings("active-blocks", gemmaBatchedPrefillRouteModeForShape(70, true, true, true));
     try std.testing.expectEqualStrings("dense-expert", gemmaBatchedPrefillRouteModeForShape(70, true, true, false));
+}
+
+test "gemma moe prefill path name exposes mixed validation replay" {
+    var profile = RuntimeProfile{};
+    try std.testing.expectEqualStrings("none", gemmaMoePrefillPathName(profile));
+
+    profile.decode_steps = 70;
+    try std.testing.expectEqualStrings("per-token", gemmaMoePrefillPathName(profile));
+
+    profile.queued_prefill_requests = 1;
+    try std.testing.expectEqualStrings("queued-token-major", gemmaMoePrefillPathName(profile));
+
+    profile.route_pack_layers = 30;
+    try std.testing.expectEqualStrings("batched-route-pack+queued-replay", gemmaMoePrefillPathName(profile));
+
+    profile.queued_prefill_requests = 0;
+    try std.testing.expectEqualStrings("batched-route-pack", gemmaMoePrefillPathName(profile));
 }
 
 test "kv_cache_write shader writes K and V slices at token offset" {
