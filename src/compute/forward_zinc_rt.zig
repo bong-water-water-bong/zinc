@@ -1116,6 +1116,18 @@ pub const DirectComputeKind = enum {
     dmmv_row_range,
 };
 
+const DirectComputePhase = enum {
+    prefill,
+    decode,
+};
+
+fn directComputePhaseName(phase: DirectComputePhase) []const u8 {
+    return switch (phase) {
+        .prefill => "prefill",
+        .decode => "decode",
+    };
+}
+
 /// Flags marking which benchmark-only fast-paths influenced the run. The
 /// performance suite consults these to decide whether a number is comparable
 /// to the reference scalar path or whether a measurement-only shortcut was in
@@ -1152,6 +1164,7 @@ pub const GenerateResult = struct {
     direct_compute_kind: DirectComputeKind = .none,
     consumed_gpu_compute_value: bool = false,
     real_model_slice: bool = false,
+    direct_decode_model_slices: u32 = 0,
     direct_compute_token: u32 = 0,
     consumed_gpu_model_value: bool = false,
     direct_model_value_bits: u32 = 0,
@@ -1496,6 +1509,8 @@ const DirectComputeTracking = struct {
     kind: *DirectComputeKind,
     consumed: *bool,
     real_model_slice: *bool,
+    phase: DirectComputePhase = .prefill,
+    decode_model_slices: ?*u32 = null,
 };
 
 fn generateScalarHybrid(
@@ -1599,6 +1614,7 @@ fn generateScalarHybrid(
     var direct_compute_kind: DirectComputeKind = .none;
     var consumed_gpu_compute_value = false;
     var real_model_slice = false;
+    var direct_decode_model_slices: u32 = 0;
     var direct_compute_token: u32 = 0;
 
     var generated: std.ArrayList(u32) = .{};
@@ -1617,6 +1633,8 @@ fn generateScalarHybrid(
                 .kind = &direct_compute_kind,
                 .consumed = &consumed_gpu_compute_value,
                 .real_model_slice = &real_model_slice,
+                .phase = .prefill,
+                .decode_model_slices = null,
             }
         else
             null;
@@ -1670,7 +1688,19 @@ fn generateScalarHybrid(
     }
     var position: u32 = @intCast(prompt_tokens.len);
     while (generated.items.len < effective_max_tokens and next_token != eos_token_id) : (position += 1) {
-        try scalarEvalToken(model, &state, next_token, position, &next_token, direct_final_norm_weight0, &consumed_gpu_model_value, null, null);
+        const direct_decode_tracking: ?DirectComputeTracking = if (generated.items.len == 1 and token_boundary != null)
+            .{
+                .boundary = token_boundary.?,
+                .ops = &direct_compute_ops,
+                .kind = &direct_compute_kind,
+                .consumed = &consumed_gpu_compute_value,
+                .real_model_slice = &real_model_slice,
+                .phase = .decode,
+                .decode_model_slices = &direct_decode_model_slices,
+            }
+        else
+            null;
+        try scalarEvalToken(model, &state, next_token, position, &next_token, direct_final_norm_weight0, &consumed_gpu_model_value, null, direct_decode_tracking);
         try generated.append(allocator, next_token);
     }
     const decode_end = std.time.nanoTimestamp();
@@ -1696,6 +1726,7 @@ fn generateScalarHybrid(
         .direct_compute_kind = direct_compute_kind,
         .consumed_gpu_compute_value = consumed_gpu_compute_value,
         .real_model_slice = real_model_slice,
+        .direct_decode_model_slices = direct_decode_model_slices,
         .direct_compute_token = direct_compute_token,
         .consumed_gpu_model_value = consumed_gpu_model_value,
         .direct_model_value_bits = direct_model_value_bits,
@@ -1780,6 +1811,7 @@ fn generateScalarDense(
     var direct_compute_kind: DirectComputeKind = .none;
     var consumed_gpu_compute_value = false;
     var real_model_slice = false;
+    var direct_decode_model_slices: u32 = 0;
 
     var generated: std.ArrayList(u32) = .{};
     errdefer generated.deinit(allocator);
@@ -1796,6 +1828,8 @@ fn generateScalarDense(
                 .kind = &direct_compute_kind,
                 .consumed = &consumed_gpu_compute_value,
                 .real_model_slice = &real_model_slice,
+                .phase = .prefill,
+                .decode_model_slices = null,
             }
         else
             null;
@@ -1818,6 +1852,18 @@ fn generateScalarDense(
     state.decode_phase = true;
     var position: u32 = @intCast(prompt_tokens.len);
     while (generated.items.len < effective_max_tokens and next_token != eos_token_id) : (position += 1) {
+        const direct_decode_tracking: ?DirectComputeTracking = if (generated.items.len == 1 and token_boundary != null)
+            .{
+                .boundary = token_boundary.?,
+                .ops = &direct_compute_ops,
+                .kind = &direct_compute_kind,
+                .consumed = &consumed_gpu_compute_value,
+                .real_model_slice = &real_model_slice,
+                .phase = .decode,
+                .decode_model_slices = &direct_decode_model_slices,
+            }
+        else
+            null;
         try scalarEvalTokenDense(
             model,
             &state,
@@ -1827,7 +1873,7 @@ fn generateScalarDense(
             true,
             direct_final_norm_weight0,
             &consumed_gpu_model_value,
-            null,
+            direct_decode_tracking,
         );
         try generated.append(allocator, next_token);
     }
@@ -1854,6 +1900,7 @@ fn generateScalarDense(
         .direct_compute_kind = direct_compute_kind,
         .consumed_gpu_compute_value = consumed_gpu_compute_value,
         .real_model_slice = real_model_slice,
+        .direct_decode_model_slices = direct_decode_model_slices,
         .direct_compute_token = 0,
         .consumed_gpu_model_value = consumed_gpu_model_value,
         .direct_model_value_bits = direct_model_value_bits,
@@ -2067,8 +2114,12 @@ fn consumeDirectLmHeadQ4_0BestRow(
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
     tracking.real_model_slice.* = true;
-    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_best_row row={d} cols={d} cpu={d:.6} gpu={d:.6} abs_delta={d:.6}", .{
+    if (tracking.phase == .decode) {
+        if (tracking.decode_model_slices) |slices| slices.* += 1;
+    }
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_best_row phase={s} row={d} cols={d} cpu={d:.6} gpu={d:.6} abs_delta={d:.6}", .{
         tracking.ops.*,
+        directComputePhaseName(tracking.phase),
         best.index,
         cols,
         best.value,
@@ -2189,6 +2240,10 @@ fn scalarEvalToken(
             selection = try argmaxMatvecRawTop2(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
             consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, q40, lm_head_rows, selection.best);
             next_token.* = selection.best.index;
+        } else if (direct_compute_tracking != null) {
+            const best = try argmaxMatvecRawBest(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
+            consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, q40, lm_head_rows, best);
+            next_token.* = best.index;
         } else {
             next_token.* = try argmaxMatvecRaw(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
         }
@@ -2201,6 +2256,10 @@ fn scalarEvalToken(
                     consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, lm_head.raw, lm_head_rows, selection.best);
                 }
                 next_token.* = selection.best.index;
+            } else if (direct_compute_tracking != null and lm_head.type_ == .q4_0) {
+                const best = try argmaxMatvecRawBest(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
+                consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, lm_head.raw, lm_head_rows, best);
+                next_token.* = best.index;
             } else {
                 next_token.* = try argmaxMatvecRaw(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
             }
@@ -3562,8 +3621,12 @@ fn consumeDirectRouterRowRange(
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
     tracking.real_model_slice.* = true;
-    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=router_f32_row_range rows={d} cols={d} max_abs_delta={d:.6} max_row={d}", .{
+    if (tracking.phase == .decode) {
+        if (tracking.decode_model_slices) |slices| slices.* += 1;
+    }
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=router_f32_row_range phase={s} rows={d} cols={d} max_abs_delta={d:.6} max_row={d}", .{
         tracking.ops.*,
+        directComputePhaseName(tracking.phase),
         rows,
         cols,
         max_abs_delta,

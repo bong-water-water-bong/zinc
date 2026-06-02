@@ -200,6 +200,8 @@ const ABS_TPS_IMPROVEMENT_KEEP = 0.5; // or +0.5 tok/s, whichever is larger
 const MIGRATE_REL_TPS_IMPROVEMENT_KEEP = 0.02; // M0 accepts smaller real gains
 const MIGRATE_MIN_ABS_TPS_IMPROVEMENT_KEEP = 0.15;
 const FOUNDATION_MAX_TPS_REGRESSION = 0.03; // validation keeps may be flat, not slower
+const DECODE_MODEL_SLICE_MAX_TPS_REGRESSION = 0.10;
+const SHORTCUT_FREE_MAX_TPS_REGRESSION = 0.20;
 const HARD_PIVOT_STALL_CYCLES = 8;
 const AGENT_TIMEOUT_MS = 3_600_000; // 1h — M0 layer-lowering cycles can be substantial
 const VERIFICATION_REPAIR_ATTEMPTS = 1;
@@ -1269,15 +1271,63 @@ function hasDirectComputeEvidence(output: string): boolean {
   return hasDirectModelSliceEvidence(output);
 }
 
-function hasDirectModelSliceEvidence(output: string): boolean {
-  const match = output.match(/\bdirect_compute_kind\s*=\s*([a-z0-9_:-]+)/i);
-  if (match == null) return false;
-  const kind = match[1].toLowerCase();
+function isUsefulModelSliceKind(kind: string): boolean {
   if (/^(argmax|rms_norm_elem0|argmax_rms_norm_elem0)$/.test(kind)) return false;
   if (!/(router|dmmv|matvec|lm_head|moe|expert|ssm|qkv|ffn)/.test(kind)) return false;
+  return true;
+}
+
+function hasPositiveCounter(output: string, names: string[]): boolean {
+  const pattern = new RegExp(`\\b(?:${names.join("|")})\\s*=\\s*(\\d+)\\b`, "ig");
+  for (const match of output.matchAll(pattern)) {
+    if (Number(match[1]) > 0) return true;
+  }
+  return false;
+}
+
+function hasUsefulModelSliceKind(output: string): boolean {
+  const pattern = /\b(?:direct_compute_kind|op)\s*=\s*([a-z0-9_:-]+)/ig;
+  for (const match of output.matchAll(pattern)) {
+    if (isUsefulModelSliceKind(match[1].toLowerCase())) return true;
+  }
+  return false;
+}
+
+function hasConsumedGpuModelValue(output: string): boolean {
   return (
     /\bconsumed_gpu_compute_value\s*=\s*1\b/i.test(output) ||
     /\bconsumed_gpu_model_value\s*=\s*1\b/i.test(output)
+  );
+}
+
+function hasDirectModelSliceEvidence(output: string): boolean {
+  return (
+    hasPositiveCounter(output, ["direct_model_slices", "direct_model_ops"]) ||
+    (hasUsefulModelSliceKind(output) && hasConsumedGpuModelValue(output))
+  );
+}
+
+export function hasDirectDecodeModelSliceEvidence(output: string): boolean {
+  if (hasPositiveCounter(output, ["direct_decode_model_slices", "direct_decode_model_ops"])) {
+    return true;
+  }
+
+  return output.split(/\r?\n/).some((line) =>
+    /\bphase\s*=\s*decode\b/i.test(line) &&
+    hasUsefulModelSliceKind(line) &&
+    (
+      hasConsumedGpuModelValue(line) ||
+      hasPositiveCounter(line, ["direct_compute_ops", "direct_model_ops"])
+    )
+  );
+}
+
+export function isShortcutFreeZincRtOutput(output: string): boolean {
+  if (!output.trim()) return false;
+  if (isZincRtBenchmarkShortcut(output)) return false;
+  return (
+    /\bshortcut_free\s*=\s*1\b/i.test(output) ||
+    /\bbenchmark_shortcuts\s*=\s*none\b/i.test(output)
   );
 }
 
@@ -1378,6 +1428,10 @@ function hasNewDirectModelSliceSignal(before: ABBenchmark, after: ABBenchmark): 
   return !hasDirectModelSliceEvidence(before.zinc_rt.runOutput) && hasDirectModelSliceEvidence(after.zinc_rt.runOutput);
 }
 
+function hasNewDirectDecodeModelSliceSignal(before: ABBenchmark, after: ABBenchmark): boolean {
+  return !hasDirectDecodeModelSliceEvidence(before.zinc_rt.runOutput) && hasDirectDecodeModelSliceEvidence(after.zinc_rt.runOutput);
+}
+
 function foundationPerformanceEnvelopeOk(before: ABBenchmark, after: ABBenchmark): boolean {
   if (after.zinc_rt.runExitCode !== 0 || !after.zinc_rt.coherentText) return false;
   if (before.vulkan.coherentText && !after.vulkan.coherentText) return false;
@@ -1385,6 +1439,119 @@ function foundationPerformanceEnvelopeOk(before: ABBenchmark, after: ABBenchmark
   const afterRt = after.zinc_rt.decodeTps;
   if (beforeRt == null || afterRt == null) return true;
   return afterRt >= beforeRt * (1 - FOUNDATION_MAX_TPS_REGRESSION);
+}
+
+function migrationEvidenceEnvelopeOk(before: ABBenchmark, after: ABBenchmark, maxRegression: number): boolean {
+  if (after.zinc_rt.buildExitCode !== 0 || after.zinc_rt.runExitCode !== 0) return false;
+  if (after.zinc_rt.garbageOutput) return false;
+  if (before.vulkan.coherentText && !after.vulkan.coherentText) return false;
+  if (before.zinc_rt.coherentText && !after.zinc_rt.coherentText) return false;
+
+  const beforeRt = before.zinc_rt.decodeTps;
+  const afterRt = after.zinc_rt.decodeTps;
+  if (beforeRt == null || afterRt == null) return true;
+  return afterRt >= beforeRt * (1 - maxRegression);
+}
+
+function hasShortcutFreeMeasurementProgress(before: ABBenchmark, after: ABBenchmark): boolean {
+  if (!isZincRtBenchmarkShortcut(before.zinc_rt.runOutput)) return false;
+  if (!isShortcutFreeZincRtOutput(after.zinc_rt.runOutput)) return false;
+  if (!migrationEvidenceEnvelopeOk(before, after, SHORTCUT_FREE_MAX_TPS_REGRESSION)) return false;
+  return after.zinc_rt.tokensGenerated >= before.zinc_rt.tokensGenerated;
+}
+
+export type KeepDecision = {
+  keep: boolean;
+  reason: string;
+};
+
+export function decideMigrateKeep(before: ABBenchmark, after: ABBenchmark, migrateBestRt: number | null): KeepDecision {
+  const beforeCpuExecuted = isZincRtCpuExecuted(before.zinc_rt);
+
+  if (!before.zinc_rt.backendFlagRecognized && after.zinc_rt.backendFlagRecognized) {
+    return { keep: true, reason: "build flag now recognized" };
+  }
+  if (before.zinc_rt.buildExitCode !== 0 && after.zinc_rt.buildExitCode === 0) {
+    return { keep: true, reason: "zinc_rt build now passes" };
+  }
+  if (
+    after.zinc_rt.buildExitCode === 0 &&
+    (before.zinc_rt.runExitCode !== 0 && before.zinc_rt.runExitCode !== null) &&
+    after.zinc_rt.runExitCode === 0
+  ) {
+    return { keep: true, reason: "zinc_rt runtime now succeeds" };
+  }
+  if (!before.zinc_rt.coherentText && after.zinc_rt.coherentText) {
+    return { keep: true, reason: "zinc_rt output now coherent" };
+  }
+  if (before.ratio == null && after.ratio != null) {
+    return { keep: true, reason: "zinc_rt now produces tok/s metric" };
+  }
+  if (
+    hasNewM1ValidationSignal(before, after) &&
+    foundationPerformanceEnvelopeOk(before, after)
+  ) {
+    return { keep: true, reason: "new benchmark-visible M1 validation signal" };
+  }
+  if (
+    hasNewDirectDecodeModelSliceSignal(before, after) &&
+    migrationEvidenceEnvelopeOk(before, after, DECODE_MODEL_SLICE_MAX_TPS_REGRESSION)
+  ) {
+    return { keep: true, reason: "new consumed decode-phase direct model-slice signal" };
+  }
+  if (
+    hasNewDirectModelSliceSignal(before, after) &&
+    migrationEvidenceEnvelopeOk(before, after, DECODE_MODEL_SLICE_MAX_TPS_REGRESSION)
+  ) {
+    return { keep: true, reason: "new consumed direct model-slice signal" };
+  }
+  if (hasShortcutFreeMeasurementProgress(before, after)) {
+    return { keep: true, reason: "zinc_rt benchmark is now shortcut-free" };
+  }
+  if (
+    hasNewDirectExecutionSignal(before, after) &&
+    after.zinc_rt.coherentText
+  ) {
+    return { keep: true, reason: "zinc_rt now executes through a direct runtime tier" };
+  }
+  if (
+    !beforeCpuExecuted &&
+    before.ratio != null && after.ratio != null &&
+    after.ratio >= before.ratio + RATIO_IMPROVEMENT_KEEP &&
+    after.zinc_rt.coherentText
+  ) {
+    return { keep: true, reason: `ratio improved ${before.ratio.toFixed(3)} → ${after.ratio.toFixed(3)}` };
+  }
+  if (
+    !beforeCpuExecuted &&
+    after.zinc_rt.coherentText &&
+    after.zinc_rt.decodeTps != null && before.zinc_rt.decodeTps != null &&
+    after.zinc_rt.decodeTps >= before.zinc_rt.decodeTps + ABS_TPS_IMPROVEMENT_KEEP
+  ) {
+    return { keep: true, reason: `zinc_rt tok/s improved ${before.zinc_rt.decodeTps.toFixed(1)} → ${after.zinc_rt.decodeTps.toFixed(1)}` };
+  }
+  if (
+    after.zinc_rt.coherentText &&
+    after.zinc_rt.decodeTps != null && before.zinc_rt.decodeTps != null &&
+    after.zinc_rt.decodeTps >= Math.max(
+      before.zinc_rt.decodeTps,
+      beforeCpuExecuted ? (migrateBestRt ?? before.zinc_rt.decodeTps) : before.zinc_rt.decodeTps,
+    ) + Math.max(
+      beforeCpuExecuted ? 1.0 : MIGRATE_MIN_ABS_TPS_IMPROVEMENT_KEEP,
+      Math.max(
+        before.zinc_rt.decodeTps,
+        beforeCpuExecuted ? (migrateBestRt ?? before.zinc_rt.decodeTps) : before.zinc_rt.decodeTps,
+      ) * MIGRATE_REL_TPS_IMPROVEMENT_KEEP,
+    )
+  ) {
+    const baseline = Math.max(
+      before.zinc_rt.decodeTps,
+      beforeCpuExecuted ? (migrateBestRt ?? before.zinc_rt.decodeTps) : before.zinc_rt.decodeTps,
+    );
+    return { keep: true, reason: `migrate tok/s improved past ${baseline.toFixed(2)} → ${after.zinc_rt.decodeTps.toFixed(2)}` };
+  }
+
+  return { keep: false, reason: "" };
 }
 
 function revertReason(cycle: CycleResult): string {
@@ -2123,86 +2290,10 @@ async function runCycle(
     keepReason = `verification error: ${verificationError}`;
     keep = false;
   } else if (state.phase === "migrate") {
-    const beforeCpuExecuted = isZincRtCpuExecuted(before.zinc_rt);
     const migrateBestRt = bestZincRtTpsOfState(state);
-    // MIGRATE: keep if we made meaningful progress
-    if (!before.zinc_rt.backendFlagRecognized && after.zinc_rt.backendFlagRecognized) {
-      keep = true;
-      keepReason = "build flag now recognized";
-    } else if (before.zinc_rt.buildExitCode !== 0 && after.zinc_rt.buildExitCode === 0) {
-      keep = true;
-      keepReason = "zinc_rt build now passes";
-    } else if (
-      after.zinc_rt.buildExitCode === 0 &&
-      (before.zinc_rt.runExitCode !== 0 && before.zinc_rt.runExitCode !== null) &&
-      after.zinc_rt.runExitCode === 0
-    ) {
-      keep = true;
-      keepReason = "zinc_rt runtime now succeeds";
-    } else if (!before.zinc_rt.coherentText && after.zinc_rt.coherentText) {
-      keep = true;
-      keepReason = "zinc_rt output now coherent";
-    } else if (
-      before.ratio == null && after.ratio != null
-    ) {
-      keep = true;
-      keepReason = "zinc_rt now produces tok/s metric";
-    } else if (
-      hasNewM1ValidationSignal(before, after) &&
-      foundationPerformanceEnvelopeOk(before, after)
-    ) {
-      keep = true;
-      keepReason = "new benchmark-visible M1 validation signal";
-    } else if (
-      hasNewDirectModelSliceSignal(before, after) &&
-      after.zinc_rt.runExitCode === 0 &&
-      after.zinc_rt.coherentText
-    ) {
-      keep = true;
-      keepReason = "new consumed direct model-slice signal";
-    } else if (
-      hasNewDirectExecutionSignal(before, after) &&
-      after.zinc_rt.coherentText
-    ) {
-      keep = true;
-      keepReason = "zinc_rt now executes through a direct runtime tier";
-    } else if (
-      !beforeCpuExecuted &&
-      before.ratio != null && after.ratio != null &&
-      after.ratio >= before.ratio + RATIO_IMPROVEMENT_KEEP &&
-      after.zinc_rt.coherentText
-    ) {
-      keep = true;
-      keepReason = `ratio improved ${before.ratio.toFixed(3)} → ${after.ratio.toFixed(3)}`;
-    } else if (
-      !beforeCpuExecuted &&
-      after.zinc_rt.coherentText &&
-      after.zinc_rt.decodeTps != null && before.zinc_rt.decodeTps != null &&
-      after.zinc_rt.decodeTps >= before.zinc_rt.decodeTps + ABS_TPS_IMPROVEMENT_KEEP
-    ) {
-      keep = true;
-      keepReason = `zinc_rt tok/s improved ${before.zinc_rt.decodeTps.toFixed(1)} → ${after.zinc_rt.decodeTps.toFixed(1)}`;
-    } else if (
-      after.zinc_rt.coherentText &&
-      after.zinc_rt.decodeTps != null && before.zinc_rt.decodeTps != null &&
-      after.zinc_rt.decodeTps >= Math.max(
-        before.zinc_rt.decodeTps,
-        beforeCpuExecuted ? (migrateBestRt ?? before.zinc_rt.decodeTps) : before.zinc_rt.decodeTps,
-      ) + Math.max(
-        beforeCpuExecuted ? 1.0 : MIGRATE_MIN_ABS_TPS_IMPROVEMENT_KEEP,
-        Math.max(
-          before.zinc_rt.decodeTps,
-          beforeCpuExecuted ? (migrateBestRt ?? before.zinc_rt.decodeTps) : before.zinc_rt.decodeTps,
-        ) * MIGRATE_REL_TPS_IMPROVEMENT_KEEP,
-      )
-    ) {
-      keep = true;
-      const baseline = Math.max(
-        before.zinc_rt.decodeTps,
-        beforeCpuExecuted ? (migrateBestRt ?? before.zinc_rt.decodeTps) : before.zinc_rt.decodeTps,
-      );
-      keepReason = `migrate tok/s improved past ${baseline.toFixed(2)} → ${after.zinc_rt.decodeTps.toFixed(2)}`;
-    }
+    const decision = decideMigrateKeep(before, after, migrateBestRt);
+    keep = decision.keep;
+    keepReason = decision.reason;
 
     // Quality gate
     if (keep && before.zinc_rt.coherentText && !after.zinc_rt.coherentText) {

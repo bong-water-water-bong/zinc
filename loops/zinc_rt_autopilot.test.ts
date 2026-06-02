@@ -1,7 +1,47 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-import { detectZincRtExecutionMode, parseArgs, parseLlamaCliTimings } from "./zinc_rt_autopilot";
+import {
+  decideMigrateKeep,
+  detectZincRtExecutionMode,
+  hasDirectDecodeModelSliceEvidence,
+  isShortcutFreeZincRtOutput,
+  parseArgs,
+  parseLlamaCliTimings,
+  type ABBenchmark,
+  type BenchmarkResult,
+} from "./zinc_rt_autopilot";
+
+function benchmarkResult(overrides: Partial<BenchmarkResult> = {}): BenchmarkResult {
+  return {
+    decodeTps: 3.8,
+    prefillTps: 3.4,
+    decodeSamples: [3.8],
+    prefillSamples: [3.4],
+    buildExitCode: 0,
+    buildOutput: "",
+    runOutput: "",
+    runExitCode: 0,
+    coherentText: false,
+    garbageOutput: false,
+    tokensGenerated: 8,
+    bandwidthUtil: null,
+    effectiveBW: null,
+    error: null,
+    backendFlagRecognized: true,
+    ...overrides,
+  };
+}
+
+function abBenchmark(zincRt: BenchmarkResult, baseline: BenchmarkResult = benchmarkResult({ decodeTps: 77, coherentText: true })): ABBenchmark {
+  return {
+    comparisonTarget: "llama",
+    vulkan: baseline,
+    zinc_rt: zincRt,
+    ratio: zincRt.decodeTps != null && baseline.decodeTps != null ? zincRt.decodeTps / baseline.decodeTps : null,
+    prefillRatio: zincRt.prefillTps != null && baseline.prefillTps != null ? zincRt.prefillTps / baseline.prefillTps : null,
+  };
+}
 
 describe("detectZincRtExecutionMode", () => {
   test("treats direct admission plus T-CPU forward as CPU fallback after admission", () => {
@@ -38,6 +78,53 @@ describe("detectZincRtExecutionMode", () => {
     ].join("\n");
 
     expect(detectZincRtExecutionMode(output)).toBe("direct");
+  });
+});
+
+describe("M1 migration keep signals", () => {
+  test("recognizes decode-phase direct model slice evidence", () => {
+    expect(hasDirectDecodeModelSliceEvidence([
+      "info(zinc_rt_forward): M1 AMDGPU CS direct compute consumed: direct_compute_ops=2 direct_compute_kind=dmmv_row_range op=lm_head_q4_0_best_row phase=decode consumed_gpu_model_value=1",
+    ].join("\n"))).toBe(true);
+
+    expect(hasDirectDecodeModelSliceEvidence([
+      "info(zinc_rt_forward): M1 AMDGPU CS direct compute consumed: direct_compute_ops=2 direct_compute_kind=dmmv_row_range op=lm_head_q4_0_best_row phase=prefill consumed_gpu_model_value=1",
+    ].join("\n"))).toBe(false);
+
+    expect(hasDirectDecodeModelSliceEvidence("direct_decode_model_slices=1")).toBe(true);
+  });
+
+  test("keeps new decode-phase model-slice evidence with bounded slowdown", () => {
+    const before = abBenchmark(benchmarkResult({
+      decodeTps: 3.82,
+      runOutput: "model_execution=host_assisted benchmark_shortcuts=decode_budget shortcut_free=0",
+    }));
+    const after = abBenchmark(benchmarkResult({
+      decodeTps: 3.75,
+      runOutput: "model_execution=host_assisted direct_compute_kind=dmmv_row_range op=lm_head_q4_0_best_row phase=decode consumed_gpu_model_value=1 direct_decode_model_slices=1 benchmark_shortcuts=decode_budget shortcut_free=0",
+    }));
+
+    const decision = decideMigrateKeep(before, after, null);
+    expect(decision.keep).toBe(true);
+    expect(decision.reason).toContain("decode-phase");
+  });
+
+  test("keeps shortcut-free M1 measurement cleanup despite scalar slowdown", () => {
+    const before = abBenchmark(benchmarkResult({
+      decodeTps: 3.81,
+      tokensGenerated: 8,
+      runOutput: "model_execution=host_assisted direct_compute_kind=dmmv_row_range consumed_gpu_model_value=1 benchmark_shortcuts=decode_budget shortcut_free=0 path clamped decode budget",
+    }));
+    const after = abBenchmark(benchmarkResult({
+      decodeTps: 3.36,
+      tokensGenerated: 96,
+      runOutput: "model_execution=host_assisted_model_slice real_model_slice=1 direct_compute_kind=dmmv_row_range consumed_gpu_model_value=1 benchmark_shortcuts=none shortcut_free=1",
+    }));
+
+    expect(isShortcutFreeZincRtOutput(after.zinc_rt.runOutput)).toBe(true);
+    const decision = decideMigrateKeep(before, after, null);
+    expect(decision.keep).toBe(true);
+    expect(decision.reason).toContain("shortcut-free");
   });
 });
 

@@ -287,7 +287,7 @@ fn runForwardPrompt(tier: engine.Tier, model_path: []const u8, prompt: []const u
     });
     if (result.direct_token_boundary_copies > 0) {
         try stdout.interface.print(
-            "info(zinc_rt): ZINC_RT M1 model_execution={s} execution_tier={s} driver=amdgpu_cs vulkan=0 direct_token_boundary=amdgpu_cs_copy_data copies={d} ib_bytes={d} last_fence={d} direct_model_ops={d} direct_compute_ops={d} direct_compute_kind={s} consumed_gpu_compute_value={d} direct_compute_token={d} consumed_gpu_model_value={d} direct_model_value_bits=0x{x} real_model_slice={d} shortcut_free={d} benchmark_shortcuts={s}\n",
+            "info(zinc_rt): ZINC_RT M1 model_execution={s} execution_tier={s} driver=amdgpu_cs vulkan=0 direct_token_boundary=amdgpu_cs_copy_data copies={d} ib_bytes={d} last_fence={d} direct_model_ops={d} direct_compute_ops={d} direct_compute_kind={s} consumed_gpu_compute_value={d} direct_decode_model_slices={d} direct_compute_token={d} consumed_gpu_model_value={d} direct_model_value_bits=0x{x} real_model_slice={d} shortcut_free={d} benchmark_shortcuts={s}\n",
             .{
                 modelExecutionName(result),
                 executionTierName(tier),
@@ -298,6 +298,7 @@ fn runForwardPrompt(tier: engine.Tier, model_path: []const u8, prompt: []const u
                 result.direct_compute_ops,
                 directComputeKindName(result.direct_compute_kind),
                 @intFromBool(result.consumed_gpu_compute_value),
+                result.direct_decode_model_slices,
                 result.direct_compute_token,
                 @intFromBool(result.consumed_gpu_model_value),
                 result.direct_model_value_bits,
@@ -308,13 +309,14 @@ fn runForwardPrompt(tier: engine.Tier, model_path: []const u8, prompt: []const u
         );
     } else {
         try stdout.interface.print(
-            "info(zinc_rt): ZINC_RT M1 model_execution={s} execution_tier=t_cpu driver=cpu vulkan=0 direct_token_boundary=unavailable direct_model_ops={d} direct_compute_ops={d} direct_compute_kind={s} consumed_gpu_compute_value={d} consumed_gpu_model_value={d} real_model_slice={d} shortcut_free={d} benchmark_shortcuts={s}\n",
+            "info(zinc_rt): ZINC_RT M1 model_execution={s} execution_tier=t_cpu driver=cpu vulkan=0 direct_token_boundary=unavailable direct_model_ops={d} direct_compute_ops={d} direct_compute_kind={s} consumed_gpu_compute_value={d} direct_decode_model_slices={d} consumed_gpu_model_value={d} real_model_slice={d} shortcut_free={d} benchmark_shortcuts={s}\n",
             .{
                 modelExecutionName(result),
                 result.direct_model_ops,
                 result.direct_compute_ops,
                 directComputeKindName(result.direct_compute_kind),
                 @intFromBool(result.consumed_gpu_compute_value),
+                result.direct_decode_model_slices,
                 @intFromBool(result.consumed_gpu_model_value),
                 @intFromBool(result.real_model_slice),
                 @intFromBool(!result.benchmark_shortcuts.any()),
