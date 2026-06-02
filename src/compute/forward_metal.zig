@@ -28814,21 +28814,18 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
         const block_idx = entry >> 16;
         try std.testing.expect(expert < @as(u32, @intCast(n_experts)));
         try std.testing.expect(block_idx < 4);
+        try std.testing.expect(!seen_blocks[@intCast(expert)][@intCast(block_idx)]);
         seen_blocks[@intCast(expert)][@intCast(block_idx)] = true;
     }
+    var expected_active_blocks: usize = 0;
     for (0..n_experts) |expert| {
         const expected_blocks = (counts_ptr[expert] + moe_route_block_cols - 1) / moe_route_block_cols;
+        expected_active_blocks += @intCast(expected_blocks);
         for (0..@as(usize, @intCast(expected_blocks))) |block_idx| {
             try std.testing.expect(seen_blocks[expert][block_idx]);
         }
     }
-
-    var expected_total_blocks: usize = 0;
-    for (0..n_experts) |expert| {
-        const expected_blocks = (counts_ptr[expert] + moe_route_block_cols - 1) / moe_route_block_cols;
-        expected_total_blocks += @intCast(expected_blocks);
-    }
-    try std.testing.expectEqual(@as(usize, @intCast(active_count_ptr[0])), expected_total_blocks);
+    try std.testing.expectEqual(expected_active_blocks, @as(usize, @intCast(active_count_ptr[0])));
 }
 
 test "moe_route_ids shader flattens batched routing in route order" {

@@ -83,7 +83,6 @@ kernel void main0(
                 }
             }
         }
-        atomic_store_explicit(active_block_count, total_blocks, memory_order_relaxed);
         if (p.profile_index < p.profile_slots) {
             atomic_store_explicit(active_block_count + 1u + p.profile_index, total_blocks, memory_order_relaxed);
             device atomic_uint* layer_stats = active_block_count + 1u + p.profile_slots + p.profile_index * PROFILE_STATS_PER_LAYER;
@@ -96,10 +95,10 @@ kernel void main0(
 
     if (expert_id < p.n_experts) {
         const uint block_count = block_counts[expert_id];
-        uint block_offset = 0u;
-        for (uint expert = 0u; expert < expert_id; expert++) {
-            block_offset += block_counts[expert];
-        }
+        // Consumers read expert_id/block_idx from each entry, so stable
+        // expert-major ordering is unnecessary. Reserve the output span
+        // atomically instead of doing a per-expert prefix loop.
+        const uint block_offset = atomic_fetch_add_explicit(active_block_count, block_count, memory_order_relaxed);
         for (uint block = 0u; block < block_count; block++) {
             active_blocks[block_offset + block] = expert_id | (block << 16u);
         }
