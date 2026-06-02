@@ -1251,7 +1251,7 @@ fn generateNoLayer(
     eos_token_id: u32,
     allocator: std.mem.Allocator,
 ) !GenerateResult {
-    const effective_max_tokens = fullForwardMaxDecodeTokens(max_tokens);
+    const effective_max_tokens = @min(max_tokens, m0MaxDecodeTokens());
     var generated: std.ArrayList(u32) = .{};
     errdefer generated.deinit(allocator);
 
@@ -1715,7 +1715,7 @@ fn generateScalarDense(
     allocator: std.mem.Allocator,
     options: GenerateOptions,
 ) !GenerateResult {
-    const effective_max_tokens = @min(max_tokens, m0MaxDecodeTokens());
+    const effective_max_tokens = fullForwardMaxDecodeTokens(max_tokens);
     const max_seq: u32 = @intCast(prompt_tokens.len + effective_max_tokens + 1);
     var state = try ScalarDecodeState.init(allocator, model, max_seq);
     defer state.deinit();
