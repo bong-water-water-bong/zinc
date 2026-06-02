@@ -1046,6 +1046,13 @@ fn recordGpuMoeFinalizerKind(profile: ?*RuntimeProfile, kind: GpuMoeFinalizerKin
     };
 }
 
+fn profileGpuMoeBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: GpuMoeBarrierPhase) void {
+    const before_count = cmd.barrier_count;
+    cmd.barrier();
+    if (cmd.barrier_count == before_count) return;
+    recordGpuMoeBarrierPhase(profile, phase);
+}
+
 fn profileGpuMoeBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: GpuMoeBarrierPhase, bufs: []const *const MetalBuffer) void {
     const before_count = cmd.barrier_count;
     cmd.barrierBuffers(bufs);
@@ -12961,6 +12968,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     const up_shexp = lt.ffn_up_shexp orelse return error.MissingTensor;
     const down_shexp = lt.ffn_down_shexp orelse return error.MissingTensor;
 
+    const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
     const total_hidden = n_tokens * hidden_dim;
     const route_slots = n_tokens * cfg.n_experts_used;
     const use_route_slot_moe =
@@ -12985,7 +12993,6 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         use_fused_q4k_gate_up_layout and
         engine.dmmv_q4k_moe_cols_geglu_pipe.handle != null;
     if (!use_route_slot_moe) {
-        const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
         recordRoutePackProfile(profile, n_tokens, cfg.n_experts, cfg.n_experts_used, active_block_upper_bound);
     }
 
@@ -13030,7 +13037,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         );
         pre_ffw_norm_2_ready = true;
         shared_gate_ready = true;
-        cmd.barrier();
+        profileGpuMoeBarrier(cmd, profile, .router);
     } else if (use_fused_f32_router) {
         dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
             engine,
@@ -13049,15 +13056,15 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             router_logit_scale,
         );
         pre_ffw_norm_2_ready = true;
-        cmd.barrier();
+        profileGpuMoeBarrier(cmd, profile, .router);
     } else {
         dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, gate_scale, hidden_dim, n_tokens);
-        cmd.barrier();
+        profileGpuMoeBarrier(cmd, profile, .router);
         dispatchGemmBatchedOnCmd(engine, cmd, router_t, &scratch.down, &scratch.gate, cfg.n_experts, hidden_dim, n_tokens);
-        cmd.barrier();
+        profileGpuMoeBarrier(cmd, profile, .router);
 
         dispatchSoftmaxTopkBatchedOnCmd(engine, cmd, &scratch.gate, &scratch.moe_routing, n_tokens, cfg.n_experts, cfg.n_experts_used);
-        cmd.barrier();
+        profileGpuMoeBarrier(cmd, profile, .router);
     }
     if (use_route_slot_moe) {
         dispatchMoeRouteIdsOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_packed_ids, n_tokens, cfg.n_experts_used);
@@ -13077,14 +13084,14 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     } else {
         dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
     }
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .router);
 
     if (!pre_ffw_norm_2_ready) {
         dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, pre_ffw_norm_2, hidden_dim, n_tokens);
-        cmd.barrier();
+        profileGpuMoeBarrier(cmd, profile, .gate_up);
     }
     dispatchMoeRouteGatherOnCmd(engine, cmd, &scratch.moe_routing, &scratch.down, &scratch.moe_route_input, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .gate_up);
 
     if (use_route_slot_moe) {
         if (use_fused_gate_up_geglu_routes) {
@@ -13239,13 +13246,13 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             n_tokens,
         );
     }
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, if (use_fused_gate_up_geglu_routes or use_fused_gate_up_geglu_cols) .activation else .gate_up);
 
     if (!use_fused_gate_up_geglu_routes and !use_fused_gate_up_geglu_cols) {
         const push = SwiGLUPush{ .n = inter_dim };
         const bufs = [_]*const MetalBuffer{ &scratch.moe_expert_gate, &scratch.moe_expert_swiglu, &scratch.moe_expert_up };
         cmd.dispatchV2(&engine.geglu_batched_pipe, .{ (inter_dim + 63) / 64, route_slots, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
-        cmd.barrier();
+        profileGpuMoeBarrier(cmd, profile, .activation);
     }
 
     dispatchZeroF32OnCmd(engine, cmd, &scratch.down, total_hidden);
@@ -13306,29 +13313,29 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             n_tokens,
         );
     }
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .down);
     if (use_route_slot_moe) {
         dispatchMoeRouteScatterDirectScaledOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_down, &scratch.down, down_scales, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
     } else {
         dispatchMoeRouteScatterScaledOnCmd(engine, cmd, &scratch.moe_expert_counts, &scratch.moe_packed_ids, &scratch.moe_routing, &scratch.moe_expert_down, &scratch.down, down_scales, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
     }
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .finalizer);
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.down, &scratch.down, post_ffw_norm_2, hidden_dim, n_tokens);
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .finalizer);
 
     dispatchGemmBatchedOnCmd(engine, cmd, gate_shexp, &scratch.norm, &scratch.gate, shexp_inter_dim, hidden_dim, n_tokens);
     dispatchGemmBatchedOnCmd(engine, cmd, up_shexp, &scratch.norm, &scratch.up, shexp_inter_dim, hidden_dim, n_tokens);
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .gate_up);
     {
         const push = SwiGLUPush{ .n = shexp_inter_dim };
         const bufs = [_]*const MetalBuffer{ &scratch.gate, &scratch.swiglu, &scratch.up };
         cmd.dispatchV2(&engine.geglu_batched_pipe, .{ (shexp_inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
     }
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .activation);
     dispatchGemmBatchedOnCmd(engine, cmd, down_shexp, &scratch.swiglu, &scratch.moe_route_input, hidden_dim, shexp_inter_dim, n_tokens);
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .down);
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.moe_route_input, &scratch.moe_route_input, post_ffw_norm_1, hidden_dim, n_tokens);
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .finalizer);
 
     if (lt.ffn_gate_inp_shexp) |gate_t| {
         const shared_gate_buf: *const MetalBuffer = if (shared_gate_ready) blk: {
@@ -13339,7 +13346,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             } else {
                 dispatchGemmBatchedOnCmd(engine, cmd, gate_t, &scratch.norm, &scratch.gate, 1, hidden_dim, n_tokens);
             }
-            cmd.barrier();
+            profileGpuMoeBarrier(cmd, profile, .finalizer);
             break :blk &scratch.gate;
         };
         dispatchSigmoidScaleAccBatchedOnCmd(engine, cmd, &scratch.down, &scratch.moe_route_input, shared_gate_buf, n_tokens, hidden_dim);
@@ -13348,17 +13355,17 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         const bufs = [_]*const MetalBuffer{ &scratch.down, &scratch.moe_route_input };
         cmd.dispatchV2(&engine.scale_acc_pipe, .{ (total_hidden + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
     }
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .finalizer);
 
     if (engine.post_ffn_norm_present[layer_idx]) {
         dispatchRmsNormOnCmd(engine, cmd, &scratch.down, &scratch.down, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-        cmd.barrier();
+        profileGpuMoeBarrier(cmd, profile, .finalizer);
     }
 
     const res_push = ScaleAccPush{ .n = total_hidden, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
     const res_bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down };
     cmd.dispatchV2(&engine.scale_acc_pipe, .{ (total_hidden + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &res_bufs, &res_push, @sizeOf(ScaleAccPush), 0);
-    cmd.barrier();
+    profileGpuMoeBarrier(cmd, profile, .finalizer);
 }
 
 fn canUseQwenSsmBatchedProjectionLayer(engine: *const InferenceEngine, layer_idx: usize) bool {
