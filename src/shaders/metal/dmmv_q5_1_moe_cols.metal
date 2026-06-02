@@ -272,6 +272,72 @@ kernel void main0(
         return;
     }
 
+    const bool five_col_tail = packed_base + 5u >= count;
+    if (five_col_tail) {
+        float acc4 = 0.0f;
+        for (uint b = tid; b < nb; b += 32u) {
+            device const uchar* block = src + b * bpb;
+
+            const float d = float(*((device const half*)block));
+            const float m = float(*((device const half*)(block + 2)));
+            const uint qh = uint(block[4]) | (uint(block[5]) << 8)
+                          | (uint(block[6]) << 16) | (uint(block[7]) << 24);
+            device const uchar* qs = block + 8;
+            const uint base = b * 32u;
+
+            float4 sum_qx0 = float4(0.0f);
+            float4 sum_x0 = float4(0.0f);
+            float sum_qx4 = 0.0f;
+            float sum_x4 = 0.0f;
+            for (uint j = 0u; j < 16u; j++) {
+                const uchar q_byte = qs[j];
+                const uint lo = q_byte & 0x0F;
+                const uint hi = q_byte >> 4;
+                const uint q0 = lo | (((qh >> j) & 1u) << 4);
+                const uint q1 = hi | (((qh >> (j + 16u)) & 1u) << 4);
+
+                const float4 x_lo0 = float4(
+                    x0[base + j],
+                    x1[base + j],
+                    x2[base + j],
+                    x3[base + j]
+                );
+                const float4 x_hi0 = float4(
+                    x0[base + 16u + j],
+                    x1[base + 16u + j],
+                    x2[base + 16u + j],
+                    x3[base + 16u + j]
+                );
+                const float x_lo4 = x4[base + j];
+                const float x_hi4 = x4[base + 16u + j];
+
+                sum_qx0 += float(q0) * x_lo0 + float(q1) * x_hi0;
+                sum_x0 += x_lo0 + x_hi0;
+                sum_qx4 += float(q0) * x_lo4 + float(q1) * x_hi4;
+                sum_x4 += x_lo4 + x_hi4;
+            }
+
+            acc0 += d * sum_qx0 + m * sum_x0;
+            acc4 += d * sum_qx4 + m * sum_x4;
+        }
+
+        const float out0 = simd_sum(acc0.x);
+        const float out1 = simd_sum(acc0.y);
+        const float out2 = simd_sum(acc0.z);
+        const float out3 = simd_sum(acc0.w);
+        const float out4 = simd_sum(acc4);
+
+        device float* y_base = Y + (p.y_offset / 4u);
+        if (tid == 0u) {
+            y_base[route0 * p.M + row] = out0;
+            y_base[route1 * p.M + row] = out1;
+            y_base[route2 * p.M + row] = out2;
+            y_base[route3 * p.M + row] = out3;
+            y_base[route4 * p.M + row] = out4;
+        }
+        return;
+    }
+
     float4 acc1 = float4(0.0f);
 
     for (uint b = tid; b < nb; b += 32u) {
