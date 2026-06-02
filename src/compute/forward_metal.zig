@@ -2823,9 +2823,10 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     if (fullAttentionInterval(cfg) != 1) return false;
     if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) return false;
 
+    // The Gemma batched-prefill body applies `layer_output_scale` at each
+    // layer tail, matching the token-major path, so non-unit scales are not a
+    // structural blocker for route-packed prefill.
     for (0..cfg.n_layers) |i| {
-        if (engine.layer_output_scales[i] != 1.0) return false;
-
         const lt = engine.layer_tensors[i];
         if (lt.attn_gate != null) return false;
         if (lt.attn_q_bias != null or lt.attn_k_bias != null or
@@ -2970,11 +2971,6 @@ fn logGemmaBatchedPrefillDecision(
     }
 
     for (0..cfg.n_layers) |i| {
-        if (engine.layer_output_scales[i] != 1.0) {
-            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} output_scale={d:.6}", .{ i, engine.layer_output_scales[i] });
-            return;
-        }
-
         const lt = engine.layer_tensors[i];
         if (lt.attn_gate != null) {
             log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_gate present", .{i});
