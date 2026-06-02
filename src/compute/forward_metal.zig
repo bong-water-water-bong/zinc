@@ -2629,6 +2629,7 @@ fn supportsGroupedGemmaMoeCols(engine: *const InferenceEngine, t: GGMLType) bool
     return switch (t) {
         .q4_k => engine.dmmv_q4k_moe_cols_pipe.handle != null,
         .q5_1 => engine.dmmv_q5_1_moe_cols_pipe.handle != null,
+        .q8_0 => engine.dmmv_q8_0_moe_cols_pipe.handle != null,
         .q5_k => engine.dmmv_q5k_moe_cols_pipe.handle != null,
         .q6_k => engine.dmmv_q6k_moe_cols_pipe.handle != null,
         else => false,
@@ -2824,8 +2825,6 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) return false;
 
     for (0..cfg.n_layers) |i| {
-        if (engine.layer_output_scales[i] != 1.0) return false;
-
         const lt = engine.layer_tensors[i];
         if (lt.attn_gate != null) return false;
         if (lt.attn_q_bias != null or lt.attn_k_bias != null or
@@ -2970,11 +2969,6 @@ fn logGemmaBatchedPrefillDecision(
     }
 
     for (0..cfg.n_layers) |i| {
-        if (engine.layer_output_scales[i] != 1.0) {
-            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} output_scale={d:.6}", .{ i, engine.layer_output_scales[i] });
-            return;
-        }
-
         const lt = engine.layer_tensors[i];
         if (lt.attn_gate != null) {
             log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_gate present", .{i});
@@ -3877,6 +3871,7 @@ pub const InferenceEngine = struct {
     dmmv_q5_1_moe_pipe: MetalPipeline,
     dmmv_q5_1_moe_cols_pipe: MetalPipeline,
     dmmv_q8_0_moe_pipe: MetalPipeline,
+    dmmv_q8_0_moe_cols_pipe: MetalPipeline,
     dmmv_q5k_moe_pipe: MetalPipeline,
     dmmv_q5k_moe_cols_pipe: MetalPipeline,
     dmmv_q5k_moe_k512_pipe: MetalPipeline,
@@ -4539,6 +4534,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q5_1_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe");
         self.dmmv_q5_1_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
         self.dmmv_q8_0_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe");
+        self.dmmv_q8_0_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe_cols");
         self.dmmv_q5k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe");
         self.dmmv_q5k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
         self.dmmv_q5k_moe_k512_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512");
@@ -5485,6 +5481,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_moe_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_k512_pipe);
@@ -10783,6 +10780,7 @@ fn dispatchDmmvMoeColsOnCmd(
     const pipe: *const MetalPipeline = switch (tensor.info.type_) {
         .q4_k => &engine.dmmv_q4k_moe_cols_pipe,
         .q5_1 => &engine.dmmv_q5_1_moe_cols_pipe,
+        .q8_0 => &engine.dmmv_q8_0_moe_cols_pipe,
         .q5_k => &engine.dmmv_q5k_moe_cols_pipe,
         .q6_k => &engine.dmmv_q6k_moe_cols_pipe,
         else => return error.UnsupportedQuantType,
@@ -10840,6 +10838,7 @@ fn dispatchDmmvMoeColsActiveBlocksOnCmd(
     const pipe: *const MetalPipeline = switch (tensor.info.type_) {
         .q4_k => &engine.dmmv_q4k_moe_cols_pipe,
         .q5_1 => &engine.dmmv_q5_1_moe_cols_pipe,
+        .q8_0 => &engine.dmmv_q8_0_moe_cols_pipe,
         .q5_k => &engine.dmmv_q5k_moe_cols_pipe,
         .q6_k => &engine.dmmv_q6k_moe_cols_pipe,
         else => return error.UnsupportedQuantType,
@@ -16913,6 +16912,7 @@ fn supportsQwenMoeRoutePackCols(engine: *const InferenceEngine, quant_type: GGML
     return switch (quant_type) {
         .q4_k => engine.dmmv_q4k_moe_cols_pipe.handle != null,
         .q5_1 => engine.dmmv_q5_1_moe_cols_pipe.handle != null,
+        .q8_0 => engine.dmmv_q8_0_moe_cols_pipe.handle != null,
         .q5_k => engine.dmmv_q5k_moe_cols_pipe.handle != null,
         .q6_k => engine.dmmv_q6k_moe_cols_pipe.handle != null,
         else => false,
@@ -28115,6 +28115,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q5_1_moe_cols_pipe);
     var dmmv_q8_0_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_moe_pipe);
+    var dmmv_q8_0_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe_cols");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_moe_cols_pipe);
     var dmmv_q5k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe");
     defer metal_pipeline.freePipeline(&dmmv_q5k_moe_pipe);
     var dmmv_q5k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
@@ -28269,6 +28271,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q5_1_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q5_1_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_moe_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_k512_pipe.handle != null);
