@@ -1458,6 +1458,13 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
     }
 }
 
+fn gemmaMoePrefillPathName(profile: RuntimeProfile) []const u8 {
+    if (profile.route_pack_layers > 0) return "batched-route-pack";
+    if (profile.queued_prefill_requests > 0) return "queued-token-major";
+    if (profile.decode_steps > 0) return "per-token";
+    return "none";
+}
+
 fn dmmvPathLabel(path: DmmvPathClass) []const u8 {
     return switch (path) {
         .other => "other",
@@ -7050,6 +7057,15 @@ pub const InferenceEngine = struct {
                 bytesToGiB(self.prefill_profile.dmmv_total_bytes),
                 bytesToGiB(decode_profile.dmmv_total_bytes),
             });
+            if (self.config.architecture == .gemma and self.config.n_experts > 0) {
+                log.info("  prefill actual path: {s} default_batched={s} structural_batched={s} route_layers={d} queued_chunks={d}", .{
+                    gemmaMoePrefillPathName(self.prefill_profile),
+                    if (shouldDefaultGemmaMoeBatchedPrefillForPrompt(self.config, prompt_tokens)) "yes" else "no",
+                    if (canUseBatchedPrefill(self)) "yes" else "no",
+                    self.prefill_profile.route_pack_layers,
+                    self.prefill_profile.queued_prefill_chunks,
+                });
+            }
         }
         log.info("  cpu: embed {d:.2} ms ({d:.3} ms/step) | record {d:.2} ms ({d:.3} ms/step) | router {d:.2} ms | sample {d:.2} ms ({d:.3} ms/sample)", .{
             nsToMs(profile.embedding_ns),
