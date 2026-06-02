@@ -1345,6 +1345,18 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.gpu_moe_finalizer_shared_calls,
         profile.gpu_moe_finalizer_routed_only_calls,
     });
+    if (profile.route_pack_layers > 0) {
+        const layers_f = @as(f64, @floatFromInt(profile.route_pack_layers));
+        log.info("  {s} route pack: layers {d} slots {d} avg_slots/layer {d:.1} active_block_upper {d} dense_dispatch_blocks {d} active/dense {d:.1}%", .{
+            label,
+            profile.route_pack_layers,
+            profile.route_pack_slots,
+            @as(f64, @floatFromInt(profile.route_pack_slots)) / layers_f,
+            profile.route_pack_active_block_upper_bound,
+            profile.route_pack_dense_dispatch_blocks,
+            pctOf(profile.route_pack_dense_dispatch_blocks, profile.route_pack_active_block_upper_bound),
+        });
+    }
     if (profile.queued_prefill_requests > 0) {
         log.info("  {s} queued prefill: requests {d} prompt_tokens {d} chunks {d} async {d} chunk_base {d} requested {d} min {d} max {d} final {d} first_chunks [{d},{d},{d},{d},{d},{d},{d},{d}] total_listed {d}", .{
             label,
@@ -2756,6 +2768,276 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
         engine.sigmoid_scale_acc_batched_pipe.handle != null and
         engine.zero_f32_pipe.handle != null and
         engine.scale_acc_pipe.handle != null;
+}
+
+fn logGemmaBatchedPrefillDecision(
+    engine: *const InferenceEngine,
+    prompt_len: usize,
+    mode: BatchedPrefillMode,
+    can_batched_prefill: bool,
+) void {
+    if (!engine.profile_enabled) return;
+
+    const cfg = engine.config;
+    if (cfg.architecture != .gemma or cfg.n_experts == 0) return;
+
+    if (mode == .off) {
+        log.info("Metal profile: Gemma batched prefill disabled: mode=off prompt_len={d} default_candidate={s} gemma_env_present={s} generic_env_present={s}", .{
+            prompt_len,
+            if (shouldDefaultGemmaMoeBatchedPrefillForPrompt(cfg, prompt_len)) "yes" else "no",
+            if (gemmaBatchedPrefillEnvPresent()) "yes" else "no",
+            if (batchedPrefillEnvPresent()) "yes" else "no",
+        });
+        return;
+    }
+
+    if (can_batched_prefill) {
+        log.info("Metal profile: Gemma batched prefill enabled: mode={s} prompt_len={d}", .{
+            @tagName(mode),
+            prompt_len,
+        });
+        return;
+    }
+
+    const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else cfg.hidden_dim * 4;
+    if (cfg.ssm_d_inner > 0) {
+        log.info("Metal profile: Gemma batched prefill guard failed: ssm_d_inner={d}", .{cfg.ssm_d_inner});
+        return;
+    }
+    if (engine.private_decode_buffers) {
+        log.info("Metal profile: Gemma batched prefill guard failed: private_decode_buffers enabled", .{});
+        return;
+    }
+    if (fullAttentionInterval(cfg) != 1) {
+        log.info("Metal profile: Gemma batched prefill guard failed: full_attention_interval={d}", .{fullAttentionInterval(cfg)});
+        return;
+    }
+    if (engine.attn_sink_values != null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: attention sink values present", .{});
+        return;
+    }
+    if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) {
+        log.info("Metal profile: Gemma batched prefill guard failed: lm_head batched GEMM unsupported type={s}", .{@tagName(engine.lm_head.info.type_)});
+        return;
+    }
+
+    for (0..cfg.n_layers) |i| {
+        if (engine.layer_output_scales[i] != 1.0) {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} output_scale={d:.6}", .{ i, engine.layer_output_scales[i] });
+            return;
+        }
+
+        const lt = engine.layer_tensors[i];
+        if (lt.attn_gate != null) {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_gate present", .{i});
+            return;
+        }
+        if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null or lt.attn_output_bias != null) {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attention bias present q={s} k={s} v={s} o={s}", .{
+                i,
+                optionalTensorTypeName(lt.attn_q_bias),
+                optionalTensorTypeName(lt.attn_k_bias),
+                optionalTensorTypeName(lt.attn_v_bias),
+                optionalTensorTypeName(lt.attn_output_bias),
+            });
+            return;
+        }
+
+        const attn = resolveLayerAttentionParams(cfg, lt, cfg.hidden_dim, engine.kv_cache_q8) catch {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attention params unresolved", .{i});
+            return;
+        };
+        const q = lt.attn_q orelse {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_q missing", .{i});
+            return;
+        };
+        const k = lt.attn_k orelse {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_k missing", .{i});
+            return;
+        };
+        const o = lt.attn_output orelse {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_output missing", .{i});
+            return;
+        };
+        if (!supportsBatchedGemmQuant(engine, q.info.type_) or !supportsBatchedGemmQuant(engine, k.info.type_) or
+            !supportsBatchedGemmQuant(engine, o.info.type_))
+        {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn batched GEMM unsupported q={s} k={s} o={s}", .{
+                i,
+                @tagName(q.info.type_),
+                @tagName(k.info.type_),
+                @tagName(o.info.type_),
+            });
+            return;
+        }
+        if (!attn.use_k_as_v) {
+            const v = lt.attn_v orelse {
+                log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_v missing", .{i});
+                return;
+            };
+            if (!supportsBatchedGemmQuant(engine, v.info.type_)) {
+                log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_v batched GEMM unsupported type={s}", .{ i, @tagName(v.info.type_) });
+                return;
+            }
+        }
+
+        const q_rows: u32 = @intCast(q.info.numElements() / cfg.hidden_dim);
+        if (q_rows >= attn.q_dim * 2) {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} q_rows={d} q_dim={d}", .{ i, q_rows, attn.q_dim });
+            return;
+        }
+
+        if (!hasExplicitGemmaMoeTensors(cfg, lt)) {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} explicit Gemma MoE tensors missing gate_up={s} down={s} gate_shexp={s} up_shexp={s} down_shexp={s}", .{
+                i,
+                optionalTensorTypeName(lt.ffn_gate_up_exps),
+                optionalTensorTypeName(lt.ffn_down_exps),
+                optionalTensorTypeName(lt.ffn_gate_shexp),
+                optionalTensorTypeName(lt.ffn_up_shexp),
+                optionalTensorTypeName(lt.ffn_down_shexp),
+            });
+            return;
+        }
+        const gate_inp = lt.ffn_gate_inp orelse {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} router tensor missing", .{i});
+            return;
+        };
+        const gate_scale = lt.ffn_gate_inp_scale orelse {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} router scale missing", .{i});
+            return;
+        };
+        const f32_router_supported = canUseGemmaRmsNormRouterF32TopkBatched(
+            engine,
+            gate_inp,
+            gate_scale,
+            cfg.n_experts,
+            cfg.n_experts_used,
+            cfg.hidden_dim,
+            1,
+        );
+        if (!supportsBatchedGemmQuant(engine, gate_inp.info.type_) and !f32_router_supported) {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} router unsupported type={s} scale={s}", .{
+                i,
+                @tagName(gate_inp.info.type_),
+                @tagName(gate_scale.info.type_),
+            });
+            return;
+        }
+        if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_exps_bias != null or
+            lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null)
+        {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} MoE bias present gate_inp={s} gate={s} up={s} down={s}", .{
+                i,
+                optionalTensorTypeName(lt.ffn_gate_inp_bias),
+                optionalTensorTypeName(lt.ffn_gate_exps_bias),
+                optionalTensorTypeName(lt.ffn_up_exps_bias),
+                optionalTensorTypeName(lt.ffn_down_exps_bias),
+            });
+            return;
+        }
+
+        const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, cfg.hidden_dim) catch {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} gate/up layout unresolved", .{i});
+            return;
+        };
+        if (gate_up_layout.gate_tensor.info.type_ != .q4_k or gate_up_layout.up_tensor.info.type_ != .q4_k) {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} gate/up quant unsupported gate={s} up={s}", .{
+                i,
+                @tagName(gate_up_layout.gate_tensor.info.type_),
+                @tagName(gate_up_layout.up_tensor.info.type_),
+            });
+            return;
+        }
+        const down_exps = lt.ffn_down_exps orelse {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} down experts missing", .{i});
+            return;
+        };
+        if (!supportsGroupedGemmaMoeCols(engine, down_exps.info.type_)) {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} down expert grouped-cols unsupported type={s}", .{ i, @tagName(down_exps.info.type_) });
+            return;
+        }
+
+        const gate_shexp = lt.ffn_gate_shexp orelse {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} shared gate missing", .{i});
+            return;
+        };
+        const up_shexp = lt.ffn_up_shexp orelse {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} shared up missing", .{i});
+            return;
+        };
+        const down_shexp = lt.ffn_down_shexp orelse {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} shared down missing", .{i});
+            return;
+        };
+        if (!supportsBatchedGemmQuant(engine, gate_shexp.info.type_) or
+            !supportsBatchedGemmQuant(engine, up_shexp.info.type_) or
+            !supportsBatchedGemmQuant(engine, down_shexp.info.type_))
+        {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} shared batched GEMM unsupported gate={s} up={s} down={s}", .{
+                i,
+                @tagName(gate_shexp.info.type_),
+                @tagName(up_shexp.info.type_),
+                @tagName(down_shexp.info.type_),
+            });
+            return;
+        }
+        if (lt.ffn_gate_inp_shexp) |gate| {
+            const f32_shared_gate_supported =
+                canUseGemmaRmsNormRouterF32TopkSharedGateBatched(
+                    engine,
+                    gate_inp,
+                    gate_scale,
+                    gate,
+                    cfg.n_experts,
+                    cfg.n_experts_used,
+                    cfg.hidden_dim,
+                    1,
+                ) or canUseQwenSsmProjectionTailF32Batched(engine, gate, 1, cfg.hidden_dim);
+            if (!supportsBatchedGemmQuant(engine, gate.info.type_) and !f32_shared_gate_supported) {
+                log.info("Metal profile: Gemma batched prefill guard failed: layer {d} shared gate input unsupported type={s}", .{ i, @tagName(gate.info.type_) });
+                return;
+            }
+        }
+
+        if (!isF32Tensor(lt.ffn_gate_inp_scale) or !isF32Tensor(lt.pre_ffw_norm_2) or
+            !isF32Tensor(lt.post_ffw_norm_1) or !isF32Tensor(lt.post_ffw_norm_2) or
+            !isF32Tensor(lt.ffn_down_exps_scale))
+        {
+            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} f32 metadata unsupported gate_scale={s} pre2={s} post1={s} post2={s} down_scale={s}", .{
+                i,
+                optionalTensorTypeName(lt.ffn_gate_inp_scale),
+                optionalTensorTypeName(lt.pre_ffw_norm_2),
+                optionalTensorTypeName(lt.post_ffw_norm_1),
+                optionalTensorTypeName(lt.post_ffw_norm_2),
+                optionalTensorTypeName(lt.ffn_down_exps_scale),
+            });
+            return;
+        }
+    }
+
+    if (engine.softmax_topk_batched_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: softmax_topk_batched pipeline missing", .{});
+    } else if (engine.moe_route_pack_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: moe_route_pack pipeline missing", .{});
+    } else if (engine.moe_route_ids_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: moe_route_ids pipeline missing", .{});
+    } else if (engine.moe_route_gather_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: moe_route_gather pipeline missing", .{});
+    } else if (engine.moe_route_scatter_scaled_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: moe_route_scatter_scaled pipeline missing", .{});
+    } else if (engine.moe_route_scatter_direct_scaled_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: moe_route_scatter_direct_scaled pipeline missing", .{});
+    } else if (engine.geglu_batched_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: geglu_batched pipeline missing", .{});
+    } else if (engine.sigmoid_scale_acc_batched_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: sigmoid_scale_acc_batched pipeline missing", .{});
+    } else if (engine.zero_f32_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: zero_f32 pipeline missing", .{});
+    } else if (engine.scale_acc_pipe.handle == null) {
+        log.info("Metal profile: Gemma batched prefill guard failed: scale_acc pipeline missing", .{});
+    } else {
+        log.info("Metal profile: Gemma batched prefill guard failed: unknown mismatch after structural pass", .{});
+    }
 }
 
 fn shouldDefaultGemmaMoeBatchedPrefillForPrompt(cfg: ModelConfig, prompt_len: usize) bool {
@@ -6220,8 +6502,10 @@ pub const InferenceEngine = struct {
         else
             requested_mode;
         if (mode == .off or !canUseBatchedPrefill(self)) {
+            logGemmaBatchedPrefillDecision(self, prompt_tokens.len, mode, false);
             return self.prefillBatch(state, prompt_tokens);
         }
+        logGemmaBatchedPrefillDecision(self, prompt_tokens.len, mode, true);
         if (state.position != 0 and state.position != self.position) {
             return error.KvStateNotAvailable;
         }
@@ -15454,6 +15738,10 @@ fn gemmaQ8RoutedMoeAllowed(arch: config_mod.Architecture, in_prefill_phase: bool
 
 fn isF32Tensor(tensor: ?*const metal_loader.LoadedTensor) bool {
     return if (tensor) |t| t.info.type_ == .f32 else false;
+}
+
+fn optionalTensorTypeName(tensor: ?*const metal_loader.LoadedTensor) []const u8 {
+    return if (tensor) |t| @tagName(t.info.type_) else "-";
 }
 
 fn canUseGpuRoutedBatchedMoe(engine: *const InferenceEngine, lt: LayerTensors) bool {
