@@ -18658,9 +18658,10 @@ fn runGemmaExplicitMoeFallback(
     // keep appending dispatches to the same CB for a single commit per layer.
     if (needs_mid_commit) {
         cmd = try beginProfiledCommand(engine, profile);
-    } else {
-        profileBarrier(&cmd, profile, .fallback_moe);
     }
+    // The zero-fill writes moe_out_buf and is independent of the down
+    // projections above. Let the following barrier join both producer sets
+    // before the weighted accumulate instead of serializing zero after down.
     dispatchZeroF32OnCmd(engine, &cmd, &engine.moe_out_buf, hidden_dim);
     profileBarrier(&cmd, profile, .fallback_moe);
     if (cfg.n_experts_used == 8) {
