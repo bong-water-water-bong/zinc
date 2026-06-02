@@ -1511,7 +1511,29 @@ const DirectComputeTracking = struct {
     real_model_slice: *bool,
     phase: DirectComputePhase = .prefill,
     decode_model_slices: ?*u32 = null,
+    selected_token: ?*u32 = null,
 };
+
+const direct_decode_model_slice_cadence_default: u32 = 8;
+
+fn directDecodeModelSliceCadenceForEnv(raw_override: ?[]const u8) u32 {
+    const raw = raw_override orelse return direct_decode_model_slice_cadence_default;
+    if (std.fmt.parseInt(u32, raw, 10) catch null) |parsed| {
+        if (parsed > 0) return parsed;
+    }
+    return direct_decode_model_slice_cadence_default;
+}
+
+fn directDecodeModelSliceCadence() u32 {
+    return directDecodeModelSliceCadenceForEnv(std.posix.getenv("ZINC_RT_DIRECT_DECODE_SLICE_CADENCE"));
+}
+
+fn shouldTrackDirectDecodeModelSlice(generated_len: usize, cadence: u32) bool {
+    if (generated_len == 0) return false;
+    if (generated_len == 1) return true;
+    if (cadence == 0) return false;
+    return generated_len % cadence == 0;
+}
 
 fn generateScalarHybrid(
     model: *const Model,
@@ -1616,6 +1638,10 @@ fn generateScalarHybrid(
     var real_model_slice = false;
     var direct_decode_model_slices: u32 = 0;
     var direct_compute_token: u32 = 0;
+    const direct_decode_slice_cadence = directDecodeModelSliceCadence();
+    if (token_boundary != null) {
+        log.info("M1 AMDGPU CS direct decode model-slice cadence: every {d} generated tokens", .{direct_decode_slice_cadence});
+    }
 
     var generated: std.ArrayList(u32) = .{};
     errdefer generated.deinit(allocator);
@@ -1635,6 +1661,7 @@ fn generateScalarHybrid(
                 .real_model_slice = &real_model_slice,
                 .phase = .prefill,
                 .decode_model_slices = null,
+                .selected_token = &direct_compute_token,
             }
         else
             null;
@@ -1688,7 +1715,7 @@ fn generateScalarHybrid(
     }
     var position: u32 = @intCast(prompt_tokens.len);
     while (generated.items.len < effective_max_tokens and next_token != eos_token_id) : (position += 1) {
-        const direct_decode_tracking: ?DirectComputeTracking = if (generated.items.len == 1 and token_boundary != null)
+        const direct_decode_tracking: ?DirectComputeTracking = if (shouldTrackDirectDecodeModelSlice(generated.items.len, direct_decode_slice_cadence) and token_boundary != null)
             .{
                 .boundary = token_boundary.?,
                 .ops = &direct_compute_ops,
@@ -1697,6 +1724,7 @@ fn generateScalarHybrid(
                 .real_model_slice = &real_model_slice,
                 .phase = .decode,
                 .decode_model_slices = &direct_decode_model_slices,
+                .selected_token = &direct_compute_token,
             }
         else
             null;
@@ -1812,6 +1840,11 @@ fn generateScalarDense(
     var consumed_gpu_compute_value = false;
     var real_model_slice = false;
     var direct_decode_model_slices: u32 = 0;
+    var direct_compute_token: u32 = 0;
+    const direct_decode_slice_cadence = directDecodeModelSliceCadence();
+    if (token_boundary != null) {
+        log.info("M1 AMDGPU CS dense direct decode model-slice cadence: every {d} generated tokens", .{direct_decode_slice_cadence});
+    }
 
     var generated: std.ArrayList(u32) = .{};
     errdefer generated.deinit(allocator);
@@ -1830,6 +1863,7 @@ fn generateScalarDense(
                 .real_model_slice = &real_model_slice,
                 .phase = .prefill,
                 .decode_model_slices = null,
+                .selected_token = &direct_compute_token,
             }
         else
             null;
@@ -1852,7 +1886,7 @@ fn generateScalarDense(
     state.decode_phase = true;
     var position: u32 = @intCast(prompt_tokens.len);
     while (generated.items.len < effective_max_tokens and next_token != eos_token_id) : (position += 1) {
-        const direct_decode_tracking: ?DirectComputeTracking = if (generated.items.len == 1 and token_boundary != null)
+        const direct_decode_tracking: ?DirectComputeTracking = if (shouldTrackDirectDecodeModelSlice(generated.items.len, direct_decode_slice_cadence) and token_boundary != null)
             .{
                 .boundary = token_boundary.?,
                 .ops = &direct_compute_ops,
@@ -1861,6 +1895,7 @@ fn generateScalarDense(
                 .real_model_slice = &real_model_slice,
                 .phase = .decode,
                 .decode_model_slices = &direct_decode_model_slices,
+                .selected_token = &direct_compute_token,
             }
         else
             null;
@@ -1901,7 +1936,7 @@ fn generateScalarDense(
         .consumed_gpu_compute_value = consumed_gpu_compute_value,
         .real_model_slice = real_model_slice,
         .direct_decode_model_slices = direct_decode_model_slices,
-        .direct_compute_token = 0,
+        .direct_compute_token = direct_compute_token,
         .consumed_gpu_model_value = consumed_gpu_model_value,
         .direct_model_value_bits = direct_model_value_bits,
         .benchmark_shortcuts = .{
@@ -2157,6 +2192,7 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     if (tracking.phase == .decode) {
         if (tracking.decode_model_slices) |slices| slices.* += 1;
     }
+    if (tracking.selected_token) |token| token.* = selection.best.index;
     log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_argmax_prefix phase={s} gpu_rows={d} cols={d} selected_source={s} token={d} score={d:.6} gpu_prefix_best=({d},{d:.6}) abs_delta={d:.6}", .{
         tracking.ops.*,
         directComputePhaseName(tracking.phase),
@@ -6832,4 +6868,14 @@ test "emitDecodeGraphForShape treats dense models as all attention" {
     try std.testing.expectEqual(@as(u32, 4), summary.attention_layers);
     try std.testing.expectEqual(@as(u32, 0), summary.ssm_layers);
     try std.testing.expectEqual(@as(u32, 0), summary.moe_layers);
+}
+
+test "direct decode model slice cadence always covers first decode step" {
+    try std.testing.expectEqual(@as(u32, 8), directDecodeModelSliceCadenceForEnv(null));
+    try std.testing.expectEqual(@as(u32, 3), directDecodeModelSliceCadenceForEnv("3"));
+    try std.testing.expectEqual(@as(u32, 8), directDecodeModelSliceCadenceForEnv("0"));
+    try std.testing.expect(!shouldTrackDirectDecodeModelSlice(0, 8));
+    try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 8));
+    try std.testing.expect(!shouldTrackDirectDecodeModelSlice(7, 8));
+    try std.testing.expect(shouldTrackDirectDecodeModelSlice(8, 8));
 }
