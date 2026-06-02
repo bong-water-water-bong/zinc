@@ -780,18 +780,6 @@ const BarrierClass = enum(u8) {
     final,
 };
 
-const CommitWaitClass = enum(u8) {
-    other,
-    full_attn,
-    ssm,
-    gpu_routed_moe,
-    fallback_moe,
-    dense_ffn,
-    final,
-};
-
-const commit_wait_class_count = @typeInfo(CommitWaitClass).@"enum".fields.len;
-
 const SsmBarrierPhase = enum(u8) {
     proj_norm,
     qkv,
@@ -827,8 +815,6 @@ pub const RuntimeProfile = struct {
     shared_cmd_steps: u32 = 0,
     command_buffers: u32 = 0,
     commit_waits: u32 = 0,
-    commit_wait_class_counts: [commit_wait_class_count]u32 = [_]u32{0} ** commit_wait_class_count,
-    commit_wait_class_ns: [commit_wait_class_count]u64 = [_]u64{0} ** commit_wait_class_count,
     dispatch_calls: u32 = 0,
     barrier_calls: u32 = 0,
     embed_barrier_calls: u32 = 0,
@@ -965,22 +951,6 @@ fn profileElapsedNs(start_ns: i128) u64 {
     const end_ns = std.time.nanoTimestamp();
     if (end_ns <= start_ns) return 0;
     return @intCast(end_ns - start_ns);
-}
-
-fn recordCommitWaitProfile(p: *RuntimeProfile, class: CommitWaitClass, elapsed_ns: u64) void {
-    const idx = @intFromEnum(class);
-    p.commit_waits += 1;
-    p.gpu_completion_wait_ns += elapsed_ns;
-    p.commit_wait_class_counts[idx] += 1;
-    p.commit_wait_class_ns[idx] += elapsed_ns;
-}
-
-fn commitWaitCount(profile: RuntimeProfile, class: CommitWaitClass) u32 {
-    return profile.commit_wait_class_counts[@intFromEnum(class)];
-}
-
-fn commitWaitMs(profile: RuntimeProfile, class: CommitWaitClass) f64 {
-    return nsToMs(profile.commit_wait_class_ns[@intFromEnum(class)]);
 }
 
 fn profileBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: BarrierClass) void {
@@ -1273,10 +1243,6 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.shared_cmd_steps = total.shared_cmd_steps -| prefix.shared_cmd_steps;
     delta.command_buffers = total.command_buffers -| prefix.command_buffers;
     delta.commit_waits = total.commit_waits -| prefix.commit_waits;
-    for (0..commit_wait_class_count) |i| {
-        delta.commit_wait_class_counts[i] = total.commit_wait_class_counts[i] -| prefix.commit_wait_class_counts[i];
-        delta.commit_wait_class_ns[i] = total.commit_wait_class_ns[i] -| prefix.commit_wait_class_ns[i];
-    }
     delta.dispatch_calls = total.dispatch_calls -| prefix.dispatch_calls;
     delta.barrier_calls = total.barrier_calls -| prefix.barrier_calls;
     delta.embed_barrier_calls = total.embed_barrier_calls -| prefix.embed_barrier_calls;
@@ -1410,25 +1376,6 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.commit_waits,
         nsToMs(profile.gpu_completion_wait_ns),
     });
-    if (profile.commit_waits > 0) {
-        log.info("  {s} waits by phase: attn {d}/{d:.2} ms ssm {d}/{d:.2} ms gpu-moe {d}/{d:.2} ms fallback-moe {d}/{d:.2} ms dense {d}/{d:.2} ms final {d}/{d:.2} ms other {d}/{d:.2} ms", .{
-            label,
-            commitWaitCount(profile, .full_attn),
-            commitWaitMs(profile, .full_attn),
-            commitWaitCount(profile, .ssm),
-            commitWaitMs(profile, .ssm),
-            commitWaitCount(profile, .gpu_routed_moe),
-            commitWaitMs(profile, .gpu_routed_moe),
-            commitWaitCount(profile, .fallback_moe),
-            commitWaitMs(profile, .fallback_moe),
-            commitWaitCount(profile, .dense_ffn),
-            commitWaitMs(profile, .dense_ffn),
-            commitWaitCount(profile, .final),
-            commitWaitMs(profile, .final),
-            commitWaitCount(profile, .other),
-            commitWaitMs(profile, .other),
-        });
-    }
     log.info("  {s} moe finalizers: scalar+norm {d} scalar {d} f32+seed+norm {d} f32+norm {d} f32 {d} shared {d} routed {d}", .{
         label,
         profile.gpu_moe_finalizer_scalar_seed_norm_calls,
@@ -18657,7 +18604,7 @@ fn runGemmaExplicitMoeFallback(
         !down_supported or
         lt.ffn_down_exps_bias != null;
     if (needs_mid_commit) {
-        commitAndWaitProfiledClass(&cmd, profile, .fallback_moe);
+        commitAndWaitProfiled(&cmd, profile);
     }
 
     if (engine.debug_validation_enabled and engine.position == 0 and layer_idx == 0 and cfg.n_experts_used > 0) {
@@ -18795,7 +18742,7 @@ fn runGemmaExplicitMoeFallback(
             profileBarrier(&cmd, profile, .fallback_moe);
         }
     }
-    commitAndWaitProfiledClass(&cmd, profile, .fallback_moe);
+    commitAndWaitProfiled(&cmd, profile);
 
     if (lt.post_ffw_norm_2) |post_norm_2_t| {
         const post_norm_2 = try tensorF32Slice(engine, post_norm_2_t, hidden_dim);
@@ -19671,7 +19618,7 @@ fn beginProfiledCommand(engine: *InferenceEngine, profile: ?*RuntimeProfile) !Me
     return cmd;
 }
 
-fn commitAndWaitProfiledClass(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: CommitWaitClass) void {
+fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     if (profile) |p| {
         p.dispatch_calls += cmd.dispatch_count;
         p.barrier_calls += cmd.barrier_count;
@@ -19679,13 +19626,10 @@ fn commitAndWaitProfiledClass(cmd: *MetalCommand, profile: ?*RuntimeProfile, cla
     const commit_start = profileStart(profile != null);
     cmd.commitAndWait();
     if (profile) |p| {
+        p.commit_waits += 1;
         // This wall time is the full command-buffer completion wait, not just CPU submit overhead.
-        recordCommitWaitProfile(p, class, profileElapsedNs(commit_start));
+        p.gpu_completion_wait_ns += profileElapsedNs(commit_start);
     }
-}
-
-fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
-    commitAndWaitProfiledClass(cmd, profile, .other);
 }
 
 fn commitAsyncProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
@@ -19696,16 +19640,13 @@ fn commitAsyncProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     cmd.commitAsync();
 }
 
-fn waitCommandProfiledClass(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: CommitWaitClass) void {
+fn waitCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     const wait_start = profileStart(profile != null);
     cmd.wait();
     if (profile) |p| {
-        recordCommitWaitProfile(p, class, profileElapsedNs(wait_start));
+        p.commit_waits += 1;
+        p.gpu_completion_wait_ns += profileElapsedNs(wait_start);
     }
-}
-
-fn waitCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
-    waitCommandProfiledClass(cmd, profile, .other);
 }
 
 fn releaseCommands(cmds: []MetalCommand) void {
@@ -19727,7 +19668,7 @@ fn waitPendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*Runt
     // Metal command queues execute command buffers in commit order. Mirroring
     // llama.cpp's graph submission pattern, wait on the last dense chunk to
     // synchronize the token, then release the already-completed earlier chunks.
-    waitCommandProfiledClass(&cmds[n - 1], profile, .dense_ffn);
+    waitCommandProfiled(&cmds[n - 1], profile);
     releaseCommands(cmds[0 .. n - 1]);
     count.* = 0;
 }
@@ -20100,7 +20041,7 @@ fn runDecodeStep(
                 profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
             }
             if (should_debug_attn_compare) {
-                commitAndWaitProfiledClass(cmd, profile, .full_attn);
+                commitAndWaitProfiled(cmd, profile);
                 const debug_start = profileStart(profile != null);
                 try debugCompareAttentionLayer(engine, layer, layer_idx, lt, hidden_dim, q_dim, kv_dim);
                 if (profile) |p| p.debug_validation_ns += profileElapsedNs(debug_start);
@@ -20400,7 +20341,7 @@ fn runDecodeStep(
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
                     const moe_record_start = profileStart(profile != null);
                     if (shouldValidateQwenPrefillMoe(engine, layer_idx, use_standard_gpu_routed_moe, using_local_cmd)) {
-                        commitAndWaitProfiledClass(cmd, profile, .gpu_routed_moe);
+                        commitAndWaitProfiled(cmd, profile);
                         qwen_moe_validation_ref = try prepareQwenPrefillMoeValidation(engine, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
                         local_cmd_storage = try beginProfiledCommand(engine, profile);
                         cmd = &local_cmd_storage;
@@ -20426,7 +20367,7 @@ fn runDecodeStep(
             } else if (profile) |p| {
                 p.layer_record_ns += profileElapsedNs(layer_record_start);
             }
-            if (using_local_cmd) commitAndWaitProfiledClass(cmd, profile, if (use_gpu_routed_moe) .gpu_routed_moe else .full_attn);
+            if (using_local_cmd) commitAndWaitProfiled(cmd, profile);
             if (qwen_moe_validation_ref) |*validation| {
                 const validation_start = profileStart(profile != null);
                 try finishQwenPrefillMoeValidation(engine, profile, layer_idx, lt, validation, hidden_dim, inter_dim);
@@ -20748,7 +20689,7 @@ fn runDecodeStep(
                     },
                 }
                 if (shouldValidateQwenSsmProjection(engine, layer_idx, using_local_cmd, wqkv_t, z_t, alpha_t, beta_t)) {
-                    commitAndWaitProfiledClass(cmd, profile, .ssm);
+                    commitAndWaitProfiled(cmd, profile);
                     const validation_start = profileStart(profile != null);
                     try validateQwenSsmProjectionBatchKernel(engine, profile, layer_idx, wqkv_t, z_t, alpha_t, beta_t, conv_channels, d_inner, dt_rank, hidden_dim);
                     if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
@@ -20845,7 +20786,7 @@ fn runDecodeStep(
                     }
                     profileSsmBarrierBuffers(cmd, profile, .delta, &.{&engine.attn_out_buf});
                     if (should_debug_ssm_compare) {
-                        commitAndWaitProfiledClass(cmd, profile, .ssm);
+                        commitAndWaitProfiled(cmd, profile);
                         const debug_start = profileStart(profile != null);
                         try debugCompareSsmPreGatedNorm(
                             engine,
@@ -20902,7 +20843,7 @@ fn runDecodeStep(
                 // row, and no unrelated SSM work remains queued at this edge.
                 profileSsmBarrierBuffers(cmd, profile, .out, &.{&engine.down_buf});
                 if (should_debug_ssm_compare) {
-                    commitAndWaitProfiledClass(cmd, profile, .ssm);
+                    commitAndWaitProfiled(cmd, profile);
                     const debug_start = profileStart(profile != null);
                     try debugCompareSsmPostProjection(
                         engine,
@@ -21195,7 +21136,7 @@ fn runDecodeStep(
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
                     const moe_record_start = profileStart(profile != null);
                     if (shouldValidateQwenPrefillMoe(engine, layer_idx, use_standard_gpu_routed_moe, using_local_cmd)) {
-                        commitAndWaitProfiledClass(cmd, profile, .gpu_routed_moe);
+                        commitAndWaitProfiled(cmd, profile);
                         qwen_moe_validation_ref = try prepareQwenPrefillMoeValidation(engine, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
                         local_cmd_storage = try beginProfiledCommand(engine, profile);
                         cmd = &local_cmd_storage;
@@ -21222,7 +21163,7 @@ fn runDecodeStep(
             } else if (profile) |p| {
                 p.layer_record_ns += profileElapsedNs(layer_record_start);
             }
-            if (using_local_cmd) commitAndWaitProfiledClass(cmd, profile, if (use_gpu_routed_moe) .gpu_routed_moe else .ssm);
+            if (using_local_cmd) commitAndWaitProfiled(cmd, profile);
             if (qwen_moe_validation_ref) |*validation| {
                 const validation_start = profileStart(profile != null);
                 try finishQwenPrefillMoeValidation(engine, profile, layer_idx, lt, validation, hidden_dim, inter_dim);
@@ -21240,7 +21181,7 @@ fn runDecodeStep(
             if (hasExplicitGemmaMoeTensors(cfg, lt)) {
                 if (shared_cmd) |cmd| {
                     if (using_external_shared_cmd) return error.InvalidPrefillCommandMode;
-                    commitAndWaitProfiledClass(cmd, profile, .fallback_moe);
+                    commitAndWaitProfiled(cmd, profile);
                     shared_cmd = null;
                 }
                 try runGemmaExplicitMoeFallback(engine, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
@@ -21477,7 +21418,7 @@ fn runDecodeStep(
                             }
                             profileBarrier(&cmd, profile, .fallback_moe);
                         } else {
-                            commitAndWaitProfiledClass(&cmd, profile, .fallback_moe);
+                            commitAndWaitProfiled(&cmd, profile);
                             const mmap = engine.model.mmap_data orelse return error.NoMmapData;
                             const tdo = engine.model.gguf_file.tensor_data_offset;
                             for (0..cfg.n_experts_used) |ei| {
@@ -21552,7 +21493,7 @@ fn runDecodeStep(
                     }
 
                     if (profile) |p| p.fallback_moe_record_ns += profileElapsedNs(moe_record_start);
-                    commitAndWaitProfiledClass(&cmd, profile, .fallback_moe);
+                    commitAndWaitProfiled(&cmd, profile);
                     if (engine.post_ffn_norm_present[layer_idx]) {
                         var residual_cmd = try beginProfiledCommand(engine, profile);
                         dispatchRmsNormOnCmd(engine, &residual_cmd, &engine.moe_out_buf, &engine.moe_out_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
@@ -21560,7 +21501,7 @@ fn runDecodeStep(
                         const res_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
                         const res_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.moe_out_buf };
                         residual_cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &res_bufs, &res_push, @sizeOf(ScaleAccPush), 0);
-                        commitAndWaitProfiledClass(&residual_cmd, profile, .fallback_moe);
+                        commitAndWaitProfiled(&residual_cmd, profile);
                     }
                     if (hidden_before_snapshot) |snap| {
                         const debug_start = profileStart(profile != null);
@@ -21687,7 +21628,7 @@ fn runDecodeStep(
                 }
                 if (profile) |p| p.dense_ffn_record_ns += profileElapsedNs(dense_record_start);
                 if (using_local_cmd) {
-                    commitAndWaitProfiledClass(cmd, profile, .dense_ffn);
+                    commitAndWaitProfiled(cmd, profile);
 
                     const hidden_ptr: [*]f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
                     const down_ptr: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
@@ -21707,12 +21648,7 @@ fn runDecodeStep(
             } else {
                 var scale_cmd = try beginProfiledCommand(engine, profile);
                 dispatchScaleInPlaceOnCmd(engine, &scale_cmd, &engine.hidden_buf, &engine.residual_buf, hidden_dim, layer_output_scale, profile, scale_barrier_class);
-                commitAndWaitProfiledClass(&scale_cmd, profile, switch (scale_barrier_class) {
-                    .gpu_routed_moe => .gpu_routed_moe,
-                    .fallback_moe => .fallback_moe,
-                    .dense_ffn => .dense_ffn,
-                    else => .other,
-                });
+                commitAndWaitProfiled(&scale_cmd, profile);
             }
         }
 
@@ -21764,7 +21700,7 @@ fn runDecodeStep(
         if (cpu_lm_head) {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(cmd, profile, .final);
-            commitAndWaitProfiledClass(cmd, profile, .final);
+            commitAndWaitProfiled(cmd, profile);
             const in_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
             const out_ptr: [*]f32 = @ptrCast(@alignCast(engine.logits_buf.cpu_ptr.?));
             try cpuLmHeadFallbackWithArgmax(engine, in_ptr, out_ptr);
@@ -21774,7 +21710,7 @@ fn runDecodeStep(
             profileBarrier(cmd, profile, .final);
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            if (!using_external_shared_cmd) commitAndWaitProfiledClass(cmd, profile, .final);
+            if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         } else {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             // Adapt llama.cpp `ggml_mem_ranges_check_dst`: LM head reads
@@ -21786,14 +21722,14 @@ fn runDecodeStep(
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            if (!using_external_shared_cmd) commitAndWaitProfiledClass(cmd, profile, .final);
+            if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         }
     } else {
         var cmd = try beginProfiledCommand(engine, profile);
         if (cpu_lm_head) {
             dispatchRmsNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(&cmd, profile, .final);
-            commitAndWaitProfiledClass(&cmd, profile, .final);
+            commitAndWaitProfiled(&cmd, profile);
             const in_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
             const out_ptr: [*]f32 = @ptrCast(@alignCast(engine.logits_buf.cpu_ptr.?));
             try cpuLmHeadFallbackWithArgmax(engine, in_ptr, out_ptr);
@@ -21803,7 +21739,7 @@ fn runDecodeStep(
             profileBarrier(&cmd, profile, .final);
             dispatchArgmaxOnCmd(engine, &cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiledClass(&cmd, profile, .final);
+            commitAndWaitProfiled(&cmd, profile);
         } else {
             dispatchRmsNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(&cmd, profile, .final);
@@ -21811,7 +21747,7 @@ fn runDecodeStep(
             profileBarrier(&cmd, profile, .final);
             dispatchArgmaxOnCmd(engine, &cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiledClass(&cmd, profile, .final);
+            commitAndWaitProfiled(&cmd, profile);
         }
     }
     releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
