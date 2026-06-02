@@ -2675,6 +2675,13 @@ fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
     return first_blocks + remaining_routes / moe_route_block_cols;
 }
 
+fn moeRoutePackThreadgroupSize(n_experts: u32) u32 {
+    if (n_experts <= 32) return 32;
+    if (n_experts <= 64) return 64;
+    if (n_experts <= 128) return 128;
+    return 256;
+}
+
 fn denseMoeColsDispatchBlocks(n_tokens: u32, n_experts: u32) u32 {
     if (n_tokens == 0 or n_experts == 0) return 0;
     const blocks_per_expert = (n_tokens + moe_cols_dense_dispatch_cols - 1) / moe_cols_dense_dispatch_cols;
@@ -12896,7 +12903,7 @@ fn dispatchMoeRoutePackOnCmd(
         .reserved = 0,
     };
     const bufs = [_]*const MetalBuffer{ routing, counts, ids };
-    cmd.dispatchV2(&engine.moe_route_pack_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
+    cmd.dispatchV2(&engine.moe_route_pack_pipe, .{ 1, 1, 1 }, .{ moeRoutePackThreadgroupSize(n_experts), 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
 }
 
 fn dispatchMoeRoutePackBlocksOnCmd(
@@ -12924,7 +12931,7 @@ fn dispatchMoeRoutePackBlocksOnCmd(
         .reserved = 0,
     };
     const bufs = [_]*const MetalBuffer{ routing, counts, ids, active_block_count, active_blocks };
-    cmd.dispatchV2(&engine.moe_route_pack_blocks_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
+    cmd.dispatchV2(&engine.moe_route_pack_blocks_pipe, .{ 1, 1, 1 }, .{ moeRoutePackThreadgroupSize(n_experts), 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
 }
 
 fn dispatchMoeRouteIdsOnCmd(
@@ -29550,6 +29557,14 @@ test "gemma batched prefill route mode names active-block selection" {
     try std.testing.expectEqualStrings("route-slots", gemmaBatchedPrefillRouteModeForShape(20, true, true, true));
     try std.testing.expectEqualStrings("active-blocks", gemmaBatchedPrefillRouteModeForShape(70, true, true, true));
     try std.testing.expectEqualStrings("dense-expert", gemmaBatchedPrefillRouteModeForShape(70, true, true, false));
+}
+
+test "moe route pack threadgroup size matches expert buckets" {
+    try std.testing.expectEqual(@as(u32, 32), moeRoutePackThreadgroupSize(4));
+    try std.testing.expectEqual(@as(u32, 32), moeRoutePackThreadgroupSize(32));
+    try std.testing.expectEqual(@as(u32, 64), moeRoutePackThreadgroupSize(33));
+    try std.testing.expectEqual(@as(u32, 128), moeRoutePackThreadgroupSize(128));
+    try std.testing.expectEqual(@as(u32, 256), moeRoutePackThreadgroupSize(256));
 }
 
 test "gemma moe prefill path name exposes mixed validation replay" {
