@@ -2901,6 +2901,29 @@ export function shouldRestorePromotedBestDuringPlateau(
   return { restore: false, reason: `plateau restore not active; ${finalize.reason}` };
 }
 
+export function parseRestorePathList(raw: string): string[] {
+  return [...new Set(
+    raw
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line.length > 0),
+  )];
+}
+
+async function loopCyclePathsChangedSince(commitHash: string): Promise<string[]> {
+  const out = await runCommand("git", [
+    "log",
+    "--format=",
+    "--name-only",
+    "--grep",
+    "^metal-loop: cycle-",
+    `${commitHash}..HEAD`,
+    "--",
+    ...LOOP_COMMIT_PATHS,
+  ]).catch(() => null);
+  return parseRestorePathList(out?.stdout ?? "");
+}
+
 async function backfillBestTreeCommitFromGit(state: RunState): Promise<void> {
   const best = bestKeptCorrectCycle(state);
   if (!best || best.tokPerSec == null) return;
@@ -2924,10 +2947,18 @@ async function restoreBestTree(runDir: string, state: RunState, reason: string):
 
   const best = state.bestTree;
   console.log(clr("1;35", `  ↩ Restoring promoted-best tree from cycle ${best.cycle} (${best.tokPerSec.toFixed(2)} ${METRIC_LABEL}): ${reason}`));
-  await runCommand("git", ["restore", "--source", best.commitHash, "--staged", "--worktree", "--", ...LOOP_COMMIT_PATHS]);
-  const status = await runCommand("git", ["status", "--porcelain", "--", ...LOOP_COMMIT_PATHS]);
+  const restorePaths = await loopCyclePathsChangedSince(best.commitHash);
+  if (restorePaths.length === 0) {
+    console.log(clr("2", "  best-tree restore skipped: no post-best loop cycle paths changed"));
+    state.currentBest = { tokPerSec: best.tokPerSec, containsReference: true };
+    await saveState(runDir, state);
+    return;
+  }
+  console.log(clr("2", `  restoring ${restorePaths.length} loop-touched path(s): ${restorePaths.join(", ")}`));
+  await runCommand("git", ["restore", "--source", best.commitHash, "--staged", "--worktree", "--", ...restorePaths]);
+  const status = await runCommand("git", ["status", "--porcelain", "--", ...restorePaths]);
   if (status.stdout.trim().length > 0) {
-    await runCommand("git", ["add", "-A", ...LOOP_COMMIT_PATHS]).catch(() => {});
+    await runCommand("git", ["add", "-A", ...restorePaths]).catch(() => {});
     await runCommand("git", ["commit", "-m", `metal-loop: finalize best tree from cycle ${best.cycle} (${best.tokPerSec.toFixed(1)} ${METRIC_LABEL})`]).catch(() => {});
   }
   state.currentBest = { tokPerSec: best.tokPerSec, containsReference: true };

@@ -25,6 +25,7 @@ import {
   evaluateOutputText,
   keepBaselinesForCycle,
   mergeUniqueEntries,
+  parseRestorePathList,
   parseTokPerSec,
   recentAcceptedProgress,
   recordNearMiss,
@@ -1710,6 +1711,13 @@ describe("plateau controls", () => {
     const decision = shouldRestorePromotedBestDuringPlateau(state, "current-head");
     expect(decision.restore).toBe(false);
     expect(decision.reason).toContain("within 0.05");
+  });
+
+  test("best-tree restore path parser dedupes git log name-only output", () => {
+    expect(parseRestorePathList("\nsrc/compute/forward_metal.zig\n\nsrc/compute/forward_metal.zig\nsrc/shaders/metal/a.metal\n")).toEqual([
+      "src/compute/forward_metal.zig",
+      "src/shaders/metal/a.metal",
+    ]);
   });
 });
 
