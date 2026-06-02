@@ -877,6 +877,10 @@ pub const RuntimeProfile = struct {
     route_pack_slots: u64 = 0,
     route_pack_active_block_upper_bound: u64 = 0,
     route_pack_dense_dispatch_blocks: u64 = 0,
+    route_pack_active_blocks_actual: u64 = 0,
+    route_pack_active_block_samples: u32 = 0,
+    route_pack_active_block_min: u32 = 0,
+    route_pack_active_block_max: u32 = 0,
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1270,6 +1274,12 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.route_pack_slots = total.route_pack_slots -| prefix.route_pack_slots;
     delta.route_pack_active_block_upper_bound = total.route_pack_active_block_upper_bound -| prefix.route_pack_active_block_upper_bound;
     delta.route_pack_dense_dispatch_blocks = total.route_pack_dense_dispatch_blocks -| prefix.route_pack_dense_dispatch_blocks;
+    delta.route_pack_active_blocks_actual = total.route_pack_active_blocks_actual -| prefix.route_pack_active_blocks_actual;
+    delta.route_pack_active_block_samples = total.route_pack_active_block_samples -| prefix.route_pack_active_block_samples;
+    if (delta.route_pack_active_block_samples > 0) {
+        delta.route_pack_active_block_min = total.route_pack_active_block_min;
+        delta.route_pack_active_block_max = total.route_pack_active_block_max;
+    }
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1363,6 +1373,19 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             profile.route_pack_dense_dispatch_blocks,
             pctOf(profile.route_pack_dense_dispatch_blocks, profile.route_pack_active_block_upper_bound),
         });
+        if (profile.route_pack_active_block_samples > 0) {
+            const samples_f = @as(f64, @floatFromInt(profile.route_pack_active_block_samples));
+            log.info("  {s} route pack actual: samples {d} active_blocks {d} avg/layer {d:.1} min {d} max {d} actual/upper {d:.1}% saved_vs_upper {d:.1}%", .{
+                label,
+                profile.route_pack_active_block_samples,
+                profile.route_pack_active_blocks_actual,
+                @as(f64, @floatFromInt(profile.route_pack_active_blocks_actual)) / samples_f,
+                profile.route_pack_active_block_min,
+                profile.route_pack_active_block_max,
+                pctOf(profile.route_pack_active_block_upper_bound, profile.route_pack_active_blocks_actual),
+                100.0 - pctOf(profile.route_pack_active_block_upper_bound, profile.route_pack_active_blocks_actual),
+            });
+        }
     }
     if (profile.queued_prefill_requests > 0) {
         log.info("  {s} queued prefill: requests {d} prompt_tokens {d} chunks {d} async {d} chunk_base {d} requested {d} min {d} max {d} final {d} first_chunks [{d},{d},{d},{d},{d},{d},{d},{d}] total_listed {d}", .{
@@ -1853,6 +1876,8 @@ const MoeRoutePackPush = extern struct {
     k: u32,
     routing_stride: u32,
     ids_stride: u32,
+    profile_index: u32,
+    profile_slots: u32,
 };
 
 /// Push constants for scattering grouped MoE route outputs back to token order.
@@ -2626,6 +2651,28 @@ fn recordRoutePackProfile(
     p.route_pack_dense_dispatch_blocks += denseMoeColsDispatchBlocks(n_tokens, n_experts);
 }
 
+fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, scratch: *const BatchedPrefillScratch, n_layers: usize) void {
+    const p = profile orelse return;
+    if (scratch.moe_active_block_count.cpu_ptr == null) return;
+
+    const words = scratch.moe_active_block_count.size / @sizeOf(u32);
+    if (words <= 1) return;
+    const sample_count = @min(n_layers, words - 1);
+    const counts: [*]const u32 = @ptrCast(@alignCast(scratch.moe_active_block_count.cpu_ptr.?));
+    for (0..sample_count) |i| {
+        const active_blocks = counts[1 + i];
+        if (active_blocks == 0) continue;
+        p.route_pack_active_blocks_actual += active_blocks;
+        p.route_pack_active_block_samples += 1;
+        if (p.route_pack_active_block_min == 0 or active_blocks < p.route_pack_active_block_min) {
+            p.route_pack_active_block_min = active_blocks;
+        }
+        if (active_blocks > p.route_pack_active_block_max) {
+            p.route_pack_active_block_max = active_blocks;
+        }
+    }
+}
+
 fn recordQueuedPrefillStart(
     profile: ?*RuntimeProfile,
     prompt_len: usize,
@@ -3371,10 +3418,14 @@ const BatchedPrefillScratch = struct {
             var mut = active_blocks;
             metal_buffer.freeBuffer(&mut);
         }
-        const active_block_count = try metal_buffer.createBuffer(ctx, u32_sz);
+        const active_block_count_words: usize = 1 + @as(usize, @intCast(engine.config.n_layers));
+        const active_block_count = try metal_buffer.createBuffer(ctx, active_block_count_words * u32_sz);
         errdefer {
             var mut = active_block_count;
             metal_buffer.freeBuffer(&mut);
+        }
+        if (active_block_count.cpu_ptr) |bytes| {
+            @memset(bytes[0..active_block_count.size], 0);
         }
         const moe_input = try metal_buffer.createBuffer(ctx, @max(route_slots * hidden_n * f32_sz, 4));
         errdefer {
@@ -6824,6 +6875,7 @@ pub const InferenceEngine = struct {
 
         if (shouldCpuLmHeadFallback(self)) {
             commitAndWaitProfiled(&cmd, profile);
+            recordRoutePackActualProfile(profile, &scratch, @as(usize, @intCast(cfg.n_layers)));
             if (self.private_decode_buffers) return error.PrivateBatchedPrefillCpuLmHeadUnsupported;
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
@@ -6841,6 +6893,7 @@ pub const InferenceEngine = struct {
                 dispatchCopyF32OnCmd(self, &cmd, &self.logits_buf, &self.logits_readback_buf, cfg.vocab_size);
             }
             commitAndWaitProfiled(&cmd, profile);
+            recordRoutePackActualProfile(profile, &scratch, @as(usize, @intCast(cfg.n_layers)));
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             if (self.hidden_buf.cpu_ptr) |dst_bytes| {
                 const src_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
@@ -7086,6 +7139,15 @@ pub const InferenceEngine = struct {
                     profile.route_pack_dense_dispatch_blocks,
                     pctOf(profile.route_pack_dense_dispatch_blocks, profile.route_pack_active_block_upper_bound),
                 });
+                if (profile.route_pack_active_block_samples > 0) {
+                    log.info("  route-pack actual: samples {d} active_blocks {d} min {d} max {d} actual/upper {d:.1}%", .{
+                        profile.route_pack_active_block_samples,
+                        profile.route_pack_active_blocks_actual,
+                        profile.route_pack_active_block_min,
+                        profile.route_pack_active_block_max,
+                        pctOf(profile.route_pack_active_block_upper_bound, profile.route_pack_active_blocks_actual),
+                    });
+                }
             }
             if (profile.dmmv_q8_0_bytes > 0) {
                 const q8_repacked_calls =
@@ -12713,6 +12775,8 @@ fn dispatchMoeRoutePackOnCmd(
         .k = k,
         .routing_stride = k * 2,
         .ids_stride = n_tokens,
+        .profile_index = std.math.maxInt(u32),
+        .profile_slots = 0,
     };
     const bufs = [_]*const MetalBuffer{ routing, counts, ids };
     cmd.dispatchV2(&engine.moe_route_pack_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
@@ -12729,6 +12793,8 @@ fn dispatchMoeRoutePackBlocksOnCmd(
     n_tokens: u32,
     n_experts: u32,
     k: u32,
+    profile_index: u32,
+    profile_slots: u32,
 ) void {
     const push = MoeRoutePackPush{
         .n_tokens = n_tokens,
@@ -12736,6 +12802,8 @@ fn dispatchMoeRoutePackBlocksOnCmd(
         .k = k,
         .routing_stride = k * 2,
         .ids_stride = n_tokens,
+        .profile_index = profile_index,
+        .profile_slots = profile_slots,
     };
     const bufs = [_]*const MetalBuffer{ routing, counts, ids, active_block_count, active_blocks };
     cmd.dispatchV2(&engine.moe_route_pack_blocks_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
@@ -13086,6 +13154,8 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             n_tokens,
             cfg.n_experts,
             cfg.n_experts_used,
+            @intCast(layer_idx),
+            @intCast(cfg.n_layers),
         );
     } else {
         dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
@@ -14117,6 +14187,8 @@ fn recordQwenRoutePackedLayerMoeOnCmd(
             n_tokens,
             cfg.n_experts,
             cfg.n_experts_used,
+            std.math.maxInt(u32),
+            0,
         );
     } else {
         dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
@@ -17104,6 +17176,8 @@ fn validateQwenMoeRoutePackChunk(
             n,
             cfg.n_experts,
             k,
+            std.math.maxInt(u32),
+            0,
         );
     }
     cmd.barrier();
@@ -28441,6 +28515,8 @@ test "moe_route_pack shader groups batched routing by expert" {
         .k = k,
         .routing_stride = routing_stride,
         .ids_stride = ids_stride,
+        .profile_index = std.math.maxInt(u32),
+        .profile_slots = 0,
     };
     const bufs = [_]*const MetalBuffer{ &routing_buf, &counts_buf, &ids_buf };
 
@@ -28488,7 +28564,9 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
     defer metal_buffer.freeBuffer(&counts_buf);
     var ids_buf = try metal_buffer.createBuffer(ctx, n_experts * ids_stride * @sizeOf(u32));
     defer metal_buffer.freeBuffer(&ids_buf);
-    var active_count_buf = try metal_buffer.createBuffer(ctx, @sizeOf(u32));
+    const profile_slots: usize = 4;
+    const profile_index: usize = 2;
+    var active_count_buf = try metal_buffer.createBuffer(ctx, (1 + profile_slots) * @sizeOf(u32));
     defer metal_buffer.freeBuffer(&active_count_buf);
     var active_blocks_buf = try metal_buffer.createBuffer(ctx, route_slots * @sizeOf(u32));
     defer metal_buffer.freeBuffer(&active_blocks_buf);
@@ -28512,6 +28590,8 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
         .k = @intCast(k),
         .routing_stride = @intCast(routing_stride),
         .ids_stride = @intCast(ids_stride),
+        .profile_index = @intCast(profile_index),
+        .profile_slots = @intCast(profile_slots),
     };
     const bufs = [_]*const MetalBuffer{ &routing_buf, &counts_buf, &ids_buf, &active_count_buf, &active_blocks_buf };
 
@@ -28526,6 +28606,7 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
 
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5, 2, 2 }, counts_ptr[0..n_experts]);
     try std.testing.expectEqual(@as(u32, 6), active_count_ptr[0]);
+    try std.testing.expectEqual(@as(u32, 6), active_count_ptr[1 + profile_index]);
 
     var seen_routes = [_]bool{false} ** route_slots;
     for (0..n_experts) |expert| {
@@ -29269,7 +29350,7 @@ test "BatchedPrefillScratch allocates Gemma MoE route scratch" {
     try std.testing.expectEqual(@as(usize, engine.config.n_experts * @sizeOf(u32)), scratch.moe_expert_counts.size);
     try std.testing.expectEqual(@as(usize, engine.config.n_experts * n_tokens * @sizeOf(u32)), scratch.moe_packed_ids.size);
     try std.testing.expectEqual(@as(usize, route_slots * @sizeOf(u32)), scratch.moe_active_blocks.size);
-    try std.testing.expectEqual(@as(usize, @sizeOf(u32)), scratch.moe_active_block_count.size);
+    try std.testing.expectEqual((1 + @as(usize, @intCast(engine.config.n_layers))) * @sizeOf(u32), scratch.moe_active_block_count.size);
     try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_route_input.size);
     try std.testing.expectEqual(@as(usize, route_slots * inter_dim * @sizeOf(f32)), scratch.moe_expert_gate.size);
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_up.size);

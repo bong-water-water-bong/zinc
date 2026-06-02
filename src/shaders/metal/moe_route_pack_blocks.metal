@@ -8,6 +8,8 @@ struct Params {
     uint k;
     uint routing_stride;
     uint ids_stride;
+    uint profile_index;
+    uint profile_slots;
 };
 
 #define NUM_COLS 8u
@@ -63,6 +65,9 @@ kernel void main0(
             total_blocks += block_counts[expert];
         }
         atomic_store_explicit(active_block_count, total_blocks, memory_order_relaxed);
+        if (p.profile_index < p.profile_slots) {
+            atomic_store_explicit(active_block_count + 1u + p.profile_index, total_blocks, memory_order_relaxed);
+        }
     }
 
     if (expert_id < p.n_experts) {
