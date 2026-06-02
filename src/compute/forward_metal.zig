@@ -13521,7 +13521,9 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     }
     profileGpuMoeBarrier(cmd, profile, .finalizer);
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.down, &scratch.down, post_ffw_norm_2, hidden_dim, n_tokens);
-    profileGpuMoeBarrier(cmd, profile, .finalizer);
+    // The shared expert gate/up path reads scratch.norm, so only publish the
+    // routed expert contribution here; the final add is the first consumer.
+    profileGpuMoeResourceBarrierBuffers(cmd, profile, .finalizer, &.{&scratch.down});
 
     dispatchGemmBatchedOnCmd(engine, cmd, gate_shexp, &scratch.norm, &scratch.gate, shexp_inter_dim, hidden_dim, n_tokens);
     dispatchGemmBatchedOnCmd(engine, cmd, up_shexp, &scratch.norm, &scratch.up, shexp_inter_dim, hidden_dim, n_tokens);
