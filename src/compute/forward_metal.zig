@@ -6602,7 +6602,10 @@ pub const InferenceEngine = struct {
             }
         }
 
-        var cmd = try metal_command.beginCommandWithMode(self.device.ctx, self.command_encoder_mode);
+        const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
+        if (profile) |p| p.decode_steps += n_tokens;
+
+        var cmd = try beginProfiledCommand(self, profile);
 
         for (0..cfg.n_layers) |layer_idx| {
             const lt = self.layer_tensors[layer_idx];
@@ -6747,6 +6750,15 @@ pub const InferenceEngine = struct {
                 cmd.barrier();
             }
 
+            if (profile) |p| {
+                p.full_attn_layers += n_tokens;
+                if (is_gemma_moe) {
+                    p.gpu_routed_moe_layers += n_tokens;
+                } else {
+                    p.dense_ffn_layers += n_tokens;
+                }
+            }
+
             const layer_output_scale = self.layer_output_scales[layer_idx];
             if (layer_output_scale != 1.0) {
                 dispatchScaleInPlaceOnCmd(self, &cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, null, .dense_ffn);
@@ -6756,8 +6768,8 @@ pub const InferenceEngine = struct {
             if (chunk_dense_gemma_prefill and
                 (next_layer % dense_gemma_prefill_chunk_layers == 0 or next_layer == @as(usize, @intCast(cfg.n_layers))))
             {
-                cmd.commitAndWait();
-                cmd = try metal_command.beginCommandWithMode(self.device.ctx, self.command_encoder_mode);
+                commitAndWaitProfiled(&cmd, profile);
+                cmd = try beginProfiledCommand(self, profile);
             }
         }
 
@@ -6765,7 +6777,7 @@ pub const InferenceEngine = struct {
         cmd.barrier();
 
         if (shouldCpuLmHeadFallback(self)) {
-            cmd.commitAndWait();
+            commitAndWaitProfiled(&cmd, profile);
             if (self.private_decode_buffers) return error.PrivateBatchedPrefillCpuLmHeadUnsupported;
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
@@ -6782,7 +6794,7 @@ pub const InferenceEngine = struct {
             if (mode == .validate and self.private_decode_buffers) {
                 dispatchCopyF32OnCmd(self, &cmd, &self.logits_buf, &self.logits_readback_buf, cfg.vocab_size);
             }
-            cmd.commitAndWait();
+            commitAndWaitProfiled(&cmd, profile);
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             if (self.hidden_buf.cpu_ptr) |dst_bytes| {
                 const src_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
