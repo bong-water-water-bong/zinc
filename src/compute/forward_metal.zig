@@ -1651,6 +1651,22 @@ const MoeColsDmmvPush = extern struct {
     use_active_blocks: u32,
 };
 
+/// Push constants for grouped Gemma fused gate/up Q4_K MoE columns. This
+/// consumes a fused ffn_gate_up_exps tensor and writes GeGLU-activated routes.
+const MoeColsGateUpDmmvPush = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    expert_stride: u32,
+    gate_base_offset: u32,
+    up_base_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+    ids_stride: u32,
+    x_route_divisor: u32,
+    use_active_blocks: u32,
+};
+
 fn createMetalBufferForMode(ctx: ?*shim.MetalCtx, size: usize, use_private: bool) !MetalBuffer {
     return if (use_private)
         metal_buffer.createPrivateBuffer(ctx, size)
@@ -3721,6 +3737,7 @@ pub const InferenceEngine = struct {
     dmmv_q4k_dense_gate_up_geglu_pipe: MetalPipeline,
     dmmv_q4k_dense_gate_up_swiglu_pipe: MetalPipeline,
     dmmv_q4k_moe_cols_pipe: MetalPipeline,
+    dmmv_q4k_moe_cols_geglu_pipe: MetalPipeline,
     dmmv_q5_1_moe_pipe: MetalPipeline,
     dmmv_q5_1_moe_cols_pipe: MetalPipeline,
     dmmv_q8_0_moe_pipe: MetalPipeline,
@@ -4382,6 +4399,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
         self.dmmv_q4k_dense_gate_up_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_swiglu");
         self.dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
+        self.dmmv_q4k_moe_cols_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols_geglu");
         self.dmmv_q5_1_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe");
         self.dmmv_q5_1_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
         self.dmmv_q8_0_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe");
@@ -5327,6 +5345,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_dense_gate_up_geglu_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dense_gate_up_swiglu_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_cols_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_moe_cols_geglu_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_moe_pipe);
@@ -7469,7 +7488,15 @@ fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
     const path = std.fs.path.join(allocator, &.{ shader_dir, file_name }) catch return error.OutOfMemory;
     defer allocator.free(path);
 
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| blk: {
+        if (err == error.FileNotFound and std.posix.getenv("ZINC_SHADER_DIR") == null and !std.mem.eql(u8, shader_dir, "src/shaders/metal")) {
+            const source_path = std.fs.path.join(allocator, &.{ "src/shaders/metal", file_name }) catch return error.OutOfMemory;
+            defer allocator.free(source_path);
+            break :blk std.fs.cwd().openFile(source_path, .{}) catch |source_err| {
+                log.err("Failed to open shader '{s}' from resolved dir and source fallback: {s}", .{ name, @errorName(source_err) });
+                return error.ShaderNotFound;
+            };
+        }
         log.err("Failed to open shader '{s}': {s}", .{ name, @errorName(err) });
         return error.ShaderNotFound;
     };
@@ -10278,6 +10305,7 @@ fn dispatchDmmvMoeGateUpGeGLUQ4kOnCmd(
     input_buf: *const MetalBuffer,
     output_buf: *const MetalBuffer,
     routing_buf: *const MetalBuffer,
+    route_slots: u32,
     M: u32,
     K: u32,
     expert_stride: u32,
@@ -10289,7 +10317,7 @@ fn dispatchDmmvMoeGateUpGeGLUQ4kOnCmd(
     if (tensor.info.type_ != .q4_k) return error.UnsupportedQuantType;
     if (engine.dmmv_q4k_moe_gate_up_geglu_pipe.handle == null) return error.UnsupportedQuantType;
 
-    recordMoeDmmvProfile(engine, tensor, M, K, engine.config.n_experts_used * 2);
+    recordMoeDmmvProfile(engine, tensor, M, K, route_slots * 2);
 
     const push = MoeGateUpDmmvPush{
         .M = M,
@@ -10307,7 +10335,7 @@ fn dispatchDmmvMoeGateUpGeGLUQ4kOnCmd(
     const rows_per_wg: u32 = 16;
     cmd.dispatchV2(
         &engine.dmmv_q4k_moe_gate_up_geglu_pipe,
-        .{ (M + rows_per_wg - 1) / rows_per_wg, engine.config.n_experts_used, 1 },
+        .{ (M + rows_per_wg - 1) / rows_per_wg, route_slots, 1 },
         .{ 256, 1, 1 },
         &bufs,
         &push,
@@ -10598,6 +10626,67 @@ fn dispatchDmmvMoeColsActiveBlocksOnCmd(
         &bufs,
         &push,
         @sizeOf(MoeColsDmmvPush),
+        1,
+    );
+}
+
+fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    counts_buf: *const MetalBuffer,
+    packed_ids_buf: *const MetalBuffer,
+    active_blocks_buf: *const MetalBuffer,
+    active_block_count_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    gate_base_offset: u32,
+    up_base_offset: u32,
+    x_byte_offset: u32,
+    y_byte_offset: u32,
+    ids_stride: u32,
+    x_route_divisor: u32,
+    active_block_upper_bound: u32,
+) !void {
+    if (tensor.info.type_ != .q4_k) return error.UnsupportedQuantType;
+    if (engine.dmmv_q4k_moe_cols_geglu_pipe.handle == null) return error.UnsupportedQuantType;
+
+    const route_blocks = @max(active_block_upper_bound, 1);
+    recordMoeDmmvProfile(engine, tensor, M, K, route_blocks * 2);
+
+    const push = MoeColsGateUpDmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor),
+        .expert_stride = expert_stride,
+        .gate_base_offset = gate_base_offset,
+        .up_base_offset = up_base_offset,
+        .x_offset = x_byte_offset,
+        .y_offset = y_byte_offset,
+        .ids_stride = ids_stride,
+        .x_route_divisor = @max(x_route_divisor, 1),
+        .use_active_blocks = 1,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &tensor.gpu_buffer,
+        input_buf,
+        output_buf,
+        counts_buf,
+        packed_ids_buf,
+        active_blocks_buf,
+        active_block_count_buf,
+    };
+    const rows_per_wg: u32 = 8;
+    cmd.dispatchV2(
+        &engine.dmmv_q4k_moe_cols_geglu_pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, route_blocks, 1 },
+        .{ 256, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(MoeColsGateUpDmmvPush),
         1,
     );
 }
@@ -12797,6 +12886,18 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         maxPackedMoeRouteBlocks(route_slots, cfg.n_experts)
     else
         0;
+    const use_fused_q4k_gate_up_layout =
+        gate_up_layout.gate_tensor == gate_up_layout.up_tensor and
+        gate_up_layout.gate_tensor.info.type_ == .q4_k and
+        gate_up_layout.gate_expert_stride == gate_up_layout.up_expert_stride;
+    const use_fused_gate_up_geglu_routes =
+        use_route_slot_moe and
+        use_fused_q4k_gate_up_layout and
+        engine.dmmv_q4k_moe_gate_up_geglu_pipe.handle != null;
+    const use_fused_gate_up_geglu_cols =
+        use_active_blocks and
+        use_fused_q4k_gate_up_layout and
+        engine.dmmv_q4k_moe_cols_geglu_pipe.handle != null;
     if (!use_route_slot_moe) {
         const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
         recordRoutePackProfile(profile, n_tokens, cfg.n_experts, cfg.n_experts_used, active_block_upper_bound);
@@ -12900,75 +13001,118 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     cmd.barrier();
 
     if (use_route_slot_moe) {
-        try dispatchDmmvMoeRoutesOnCmd(
-            engine,
-            cmd,
-            gate_up_layout.gate_tensor,
-            &scratch.moe_route_input,
-            &scratch.moe_expert_gate,
-            &scratch.moe_packed_ids,
-            route_slots,
-            inter_dim,
-            hidden_dim,
-            gate_up_layout.gate_expert_stride,
-            hidden_dim,
-            gate_up_layout.gate_base_offset,
-        );
-        try dispatchDmmvMoeRoutesOnCmd(
-            engine,
-            cmd,
-            gate_up_layout.up_tensor,
-            &scratch.moe_route_input,
-            &scratch.moe_expert_up,
-            &scratch.moe_packed_ids,
-            route_slots,
-            inter_dim,
-            hidden_dim,
-            gate_up_layout.up_expert_stride,
-            hidden_dim,
-            gate_up_layout.up_base_offset,
-        );
+        if (use_fused_gate_up_geglu_routes) {
+            try dispatchDmmvMoeGateUpGeGLUQ4kOnCmd(
+                engine,
+                cmd,
+                gate_up_layout.gate_tensor,
+                &scratch.moe_route_input,
+                &scratch.moe_expert_swiglu,
+                &scratch.moe_packed_ids,
+                route_slots,
+                inter_dim,
+                hidden_dim,
+                gate_up_layout.gate_expert_stride,
+                gate_up_layout.gate_base_offset,
+                gate_up_layout.up_base_offset,
+                hidden_dim,
+                0,
+            );
+        } else {
+            try dispatchDmmvMoeRoutesOnCmd(
+                engine,
+                cmd,
+                gate_up_layout.gate_tensor,
+                &scratch.moe_route_input,
+                &scratch.moe_expert_gate,
+                &scratch.moe_packed_ids,
+                route_slots,
+                inter_dim,
+                hidden_dim,
+                gate_up_layout.gate_expert_stride,
+                hidden_dim,
+                gate_up_layout.gate_base_offset,
+            );
+            try dispatchDmmvMoeRoutesOnCmd(
+                engine,
+                cmd,
+                gate_up_layout.up_tensor,
+                &scratch.moe_route_input,
+                &scratch.moe_expert_up,
+                &scratch.moe_packed_ids,
+                route_slots,
+                inter_dim,
+                hidden_dim,
+                gate_up_layout.up_expert_stride,
+                hidden_dim,
+                gate_up_layout.up_base_offset,
+            );
+        }
     } else if (use_active_blocks) {
-        try dispatchDmmvMoeColsActiveBlocksOnCmd(
-            engine,
-            cmd,
-            gate_up_layout.gate_tensor,
-            &scratch.moe_route_input,
-            &scratch.moe_expert_gate,
-            &scratch.moe_expert_counts,
-            &scratch.moe_packed_ids,
-            &scratch.moe_active_blocks,
-            &scratch.moe_active_block_count,
-            inter_dim,
-            hidden_dim,
-            gate_up_layout.gate_expert_stride,
-            gate_up_layout.gate_base_offset,
-            0,
-            0,
-            n_tokens,
-            1,
-            active_block_upper_bound,
-        );
-        try dispatchDmmvMoeColsActiveBlocksOnCmd(
-            engine,
-            cmd,
-            gate_up_layout.up_tensor,
-            &scratch.moe_route_input,
-            &scratch.moe_expert_up,
-            &scratch.moe_expert_counts,
-            &scratch.moe_packed_ids,
-            &scratch.moe_active_blocks,
-            &scratch.moe_active_block_count,
-            inter_dim,
-            hidden_dim,
-            gate_up_layout.up_expert_stride,
-            gate_up_layout.up_base_offset,
-            0,
-            0,
-            n_tokens,
-            1,
-            active_block_upper_bound,
-        );
+        if (use_fused_gate_up_geglu_cols) {
+            try dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
+                engine,
+                cmd,
+                gate_up_layout.gate_tensor,
+                &scratch.moe_route_input,
+                &scratch.moe_expert_swiglu,
+                &scratch.moe_expert_counts,
+                &scratch.moe_packed_ids,
+                &scratch.moe_active_blocks,
+                &scratch.moe_active_block_count,
+                inter_dim,
+                hidden_dim,
+                gate_up_layout.gate_expert_stride,
+                gate_up_layout.gate_base_offset,
+                gate_up_layout.up_base_offset,
+                0,
+                0,
+                n_tokens,
+                1,
+                active_block_upper_bound,
+            );
+        } else {
+            try dispatchDmmvMoeColsActiveBlocksOnCmd(
+                engine,
+                cmd,
+                gate_up_layout.gate_tensor,
+                &scratch.moe_route_input,
+                &scratch.moe_expert_gate,
+                &scratch.moe_expert_counts,
+                &scratch.moe_packed_ids,
+                &scratch.moe_active_blocks,
+                &scratch.moe_active_block_count,
+                inter_dim,
+                hidden_dim,
+                gate_up_layout.gate_expert_stride,
+                gate_up_layout.gate_base_offset,
+                0,
+                0,
+                n_tokens,
+                1,
+                active_block_upper_bound,
+            );
+            try dispatchDmmvMoeColsActiveBlocksOnCmd(
+                engine,
+                cmd,
+                gate_up_layout.up_tensor,
+                &scratch.moe_route_input,
+                &scratch.moe_expert_up,
+                &scratch.moe_expert_counts,
+                &scratch.moe_packed_ids,
+                &scratch.moe_active_blocks,
+                &scratch.moe_active_block_count,
+                inter_dim,
+                hidden_dim,
+                gate_up_layout.up_expert_stride,
+                gate_up_layout.up_base_offset,
+                0,
+                0,
+                n_tokens,
+                1,
+                active_block_upper_bound,
+            );
+        }
     } else {
         try dispatchDmmvMoeColsOnCmd(
             engine,
@@ -13011,12 +13155,12 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     }
     cmd.barrier();
 
-    {
+    if (!use_fused_gate_up_geglu_routes and !use_fused_gate_up_geglu_cols) {
         const push = SwiGLUPush{ .n = inter_dim };
         const bufs = [_]*const MetalBuffer{ &scratch.moe_expert_gate, &scratch.moe_expert_swiglu, &scratch.moe_expert_up };
         cmd.dispatchV2(&engine.geglu_batched_pipe, .{ (inter_dim + 63) / 64, route_slots, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+        cmd.barrier();
     }
-    cmd.barrier();
 
     dispatchZeroF32OnCmd(engine, cmd, &scratch.down, total_hidden);
     if (use_route_slot_moe) {
@@ -18458,6 +18602,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
             &engine.residual_buf,
             &engine.expert_swiglu_batch_buf,
             &engine.router_output_buf,
+            cfg.n_experts_used,
             inter_dim,
             hidden_dim,
             gate_up_layout.gate_expert_stride,
@@ -27668,6 +27813,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q4k_dense_gate_up_geglu_pipe);
     var dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
     defer metal_pipeline.freePipeline(&dmmv_q4k_moe_cols_pipe);
+    var dmmv_q4k_moe_cols_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols_geglu");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_moe_cols_geglu_pipe);
     var dmmv_q5_1_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe");
     defer metal_pipeline.freePipeline(&dmmv_q5_1_moe_pipe);
     var dmmv_q5_1_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
@@ -27824,6 +27971,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q8_0_pair_swiglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_moe_cols_geglu_pipe.handle != null);
     try std.testing.expect(dmmv_q5_1_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q5_1_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_moe_pipe.handle != null);
