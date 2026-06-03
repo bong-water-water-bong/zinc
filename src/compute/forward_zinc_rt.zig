@@ -2355,7 +2355,7 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     }
 
     const selected_from_gpu_prefix = selection.best.index < gpu_rows;
-    var selected_source: []const u8 = if (selected_from_gpu_prefix)
+    const selected_source: []const u8 = if (selected_from_gpu_prefix)
         "gpu_prefix"
     else
         "cpu_rows";
@@ -2380,20 +2380,7 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         gpu_best_delta,
     });
 
-    const selected_window_consumed = consumeDirectLmHeadQ4_0SelectedWindow(
-        state,
-        tracking,
-        q4_0_raw,
-        lm_head_rows,
-        cols,
-        max_rows_by_input,
-        scratch_rows,
-        selected_source,
-        &selection.best,
-    );
-    if (selected_window_consumed) {
-        selected_source = "gpu_selected_window";
-    } else if (directLmHeadQ4_0SelectedSourceHasGpuScore(selected_source)) {
+    if (directLmHeadQ4_0SelectedSourceHasGpuScore(selected_source)) {
         log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_reused phase={s} source={s} row={d} cols={d} gpu={d:.6} consumed_gpu_model_value=1", .{
             tracking.ops.*,
             directComputePhaseName(tracking.phase),
@@ -2403,15 +2390,28 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
             selection.best.value,
         });
     } else {
-        consumeDirectLmHeadQ4_0SelectedRow(
+        const selected_window_consumed = consumeDirectLmHeadQ4_0SelectedWindow(
             state,
             tracking,
             q4_0_raw,
             lm_head_rows,
             cols,
+            max_rows_by_input,
+            scratch_rows,
             selected_source,
             &selection.best,
         );
+        if (!selected_window_consumed) {
+            consumeDirectLmHeadQ4_0SelectedRow(
+                state,
+                tracking,
+                q4_0_raw,
+                lm_head_rows,
+                cols,
+                selected_source,
+                &selection.best,
+            );
+        }
     }
     return selection;
 }
