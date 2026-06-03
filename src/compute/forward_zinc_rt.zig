@@ -2581,6 +2581,15 @@ fn consumeDirectLmHeadQ4_0Top2Rows(
             best_delta,
             second_delta,
         });
+        consumeDirectLmHeadQ4_0SelectedWindowAfterTop2(
+            state,
+            tracking,
+            q4_0_raw,
+            lm_head_rows,
+            cols,
+            row_bytes,
+            &gpu_selection.best,
+        );
         return gpu_selection;
     }
 
@@ -2640,7 +2649,41 @@ fn consumeDirectLmHeadQ4_0Top2Rows(
         gpu_best.delta,
         if (checked_second) second_delta else 0.0,
     });
+    consumeDirectLmHeadQ4_0SelectedWindowAfterTop2(
+        state,
+        tracking,
+        q4_0_raw,
+        lm_head_rows,
+        cols,
+        row_bytes,
+        &gpu_selection.best,
+    );
     return gpu_selection;
+}
+
+fn consumeDirectLmHeadQ4_0SelectedWindowAfterTop2(
+    state: *ScalarDecodeState,
+    tracking: DirectComputeTracking,
+    q4_0_raw: []const u8,
+    lm_head_rows: u32,
+    cols: u32,
+    row_bytes: usize,
+    selected: *ScoredToken,
+) void {
+    if (row_bytes == 0) return;
+    const max_rows_by_input: u32 = @intCast(direct_lm_head_q4_0_argmax_max_weight_bytes / row_bytes);
+    const scratch_rows: u32 = @intCast(@min(state.row_scratch.len, @as(usize, std.math.maxInt(u32))));
+    _ = consumeDirectLmHeadQ4_0SelectedWindow(
+        state,
+        tracking,
+        q4_0_raw,
+        lm_head_rows,
+        cols,
+        max_rows_by_input,
+        scratch_rows,
+        "gpu_top2_rows",
+        selected,
+    );
 }
 
 fn consumeDirectLmHeadQ4_0SelectedWindow(
