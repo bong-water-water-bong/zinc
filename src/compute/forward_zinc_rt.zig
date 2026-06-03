@@ -1364,6 +1364,7 @@ const ScalarDecodeState = struct {
     moe_topk_active: u32,
     decode_phase: bool = false,
     direct_router_row_range_done: bool = false,
+    direct_ssm_alpha_q8_row_range_done: bool = false,
     pool: ?*std.Thread.Pool = null,
     fast_pool: ?*zinc_rt.fast_pool.FastPool = null,
 
@@ -2326,7 +2327,7 @@ fn scalarEvalToken(
         // this layer isn't slotted as full-attention by the hybrid interval.
         const is_ssm_layer = cfg.ssm_d_inner > 0 and !isFullAttentionLayer(cfg, layer);
         if (is_ssm_layer) {
-            try runSsmLayer(model, state, lt, layer);
+            try runSsmLayer(model, state, lt, layer, direct_compute_tracking);
         } else {
             try runAttentionLayer(model, state, lt, layer, position);
         }
@@ -2534,7 +2535,13 @@ fn runAttentionLayer(
     for (state.hidden, state.branch) |*h, b| h.* += b;
 }
 
-fn runSsmLayer(model: *const Model, state: *ScalarDecodeState, lt: LayerTensors, layer: u32) !void {
+fn runSsmLayer(
+    model: *const Model,
+    state: *ScalarDecodeState,
+    lt: LayerTensors,
+    layer: u32,
+    direct_compute_tracking: ?DirectComputeTracking,
+) !void {
     const cfg = model.config;
     const d_inner = cfg.ssm_d_inner;
     const d_conv = cfg.ssm_d_conv;
@@ -2556,6 +2563,7 @@ fn runSsmLayer(model: *const Model, state: *ScalarDecodeState, lt: LayerTensors,
         .{ .info = lt.ssm_alpha.?, .rows = dt_rank, .out = state.alpha[0..dt_rank] },
         .{ .info = lt.ssm_beta.?, .rows = dt_rank, .out = state.beta[0..dt_rank] },
     }, state.norm, state.row_scratch);
+    consumeDirectSsmAlphaQ8_0Row0(model, state, lt, layer, direct_compute_tracking);
 
     const conv_state = state.convStateForLayer(cfg, layer);
     const d_conv_1 = d_conv - 1;
@@ -2696,6 +2704,75 @@ fn runSsmLayer(model: *const Model, state: *ScalarDecodeState, lt: LayerTensors,
         try matvecTensor(state.pool, model, lt.ssm_out.?, state.ssm_out[0..d_inner], cfg.hidden_dim, state.row_scratch, state.branch);
     }
     for (state.hidden, state.branch) |*h, b| h.* += b;
+}
+
+const direct_ssm_alpha_q8_0_row0_tolerance: f32 = 0.02;
+
+fn consumeDirectSsmAlphaQ8_0Row0(
+    model: *const Model,
+    state: *ScalarDecodeState,
+    lt: LayerTensors,
+    layer: u32,
+    maybe_tracking: ?DirectComputeTracking,
+) void {
+    const tracking = maybe_tracking orelse return;
+    if (tracking.phase != .decode) return;
+    if (state.direct_ssm_alpha_q8_row_range_done) return;
+    const alpha_info = lt.ssm_alpha orelse return;
+    if (alpha_info.type_ != .q8_0) return;
+    const cols: u32 = @intCast(state.norm.len);
+    if (cols == 0 or cols % 32 != 0 or state.alpha.len == 0 or state.row_scratch.len == 0) return;
+
+    const alpha_raw = model.tensorData(alpha_info);
+    const row_bytes = rowBytesForType(.q8_0, cols);
+    if (alpha_raw.len < row_bytes) return;
+
+    const cpu_value = dotDirectRaw(alpha_raw, .q8_0, 0, cols, state.norm, null) catch {
+        return;
+    };
+    const gpu_out = state.row_scratch[0..1];
+    tracking.boundary.dmmvQ8_0RowRange(
+        state.norm,
+        alpha_raw[0..row_bytes],
+        1,
+        cols,
+        gpu_out,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct SSM alpha Q8_0 row unavailable ({s}); alpha remains host-computed", .{@errorName(err)});
+        return;
+    };
+
+    const gpu_value = gpu_out[0];
+    if (!std.math.isFinite(gpu_value)) {
+        log.warn("M1 AMDGPU CS direct SSM alpha Q8_0 row produced non-finite value; alpha remains host-computed", .{});
+        return;
+    }
+    const delta = @abs(gpu_value - cpu_value);
+    if (delta > direct_ssm_alpha_q8_0_row0_tolerance) {
+        log.warn("M1 AMDGPU CS direct SSM alpha Q8_0 row mismatch: layer={d} cpu={d:.6} gpu={d:.6} abs_delta={d:.6}; alpha remains host-computed", .{
+            layer,
+            cpu_value,
+            gpu_value,
+            delta,
+        });
+        return;
+    }
+
+    state.alpha[0] = gpu_value;
+    state.direct_ssm_alpha_q8_row_range_done = true;
+    tracking.ops.* += 1;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += 1;
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=ssm_alpha_q8_0_row0 phase=decode layer={d} row=0 cols={d} cpu={d:.6} gpu={d:.6} abs_delta={d:.6}", .{
+        tracking.ops.*,
+        layer,
+        cols,
+        cpu_value,
+        gpu_value,
+        delta,
+    });
 }
 
 const ssm_head_parallel_max_workers: usize = 16;
