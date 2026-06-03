@@ -1515,12 +1515,12 @@ const DirectComputeTracking = struct {
     selected_token: ?*u32 = null,
 };
 
-const direct_decode_model_slice_cadence_default: u32 = 8;
+const direct_decode_model_slice_cadence_default: u32 = 0;
 
 fn directDecodeModelSliceCadenceForEnv(raw_override: ?[]const u8) u32 {
     const raw = raw_override orelse return direct_decode_model_slice_cadence_default;
     if (std.fmt.parseInt(u32, raw, 10) catch null) |parsed| {
-        if (parsed > 0) return parsed;
+        return parsed;
     }
     return direct_decode_model_slice_cadence_default;
 }
@@ -1641,7 +1641,11 @@ fn generateScalarHybrid(
     var direct_compute_token: u32 = 0;
     const direct_decode_slice_cadence = directDecodeModelSliceCadence();
     if (token_boundary != null) {
-        log.info("M1 AMDGPU CS direct decode model-slice cadence: every {d} generated tokens", .{direct_decode_slice_cadence});
+        if (direct_decode_slice_cadence == 0) {
+            log.info("M1 AMDGPU CS direct decode model-slice cadence: first generated token only", .{});
+        } else {
+            log.info("M1 AMDGPU CS direct decode model-slice cadence: first generated token and every {d} generated tokens", .{direct_decode_slice_cadence});
+        }
     }
 
     var generated: std.ArrayList(u32) = .{};
@@ -1844,7 +1848,11 @@ fn generateScalarDense(
     var direct_compute_token: u32 = 0;
     const direct_decode_slice_cadence = directDecodeModelSliceCadence();
     if (token_boundary != null) {
-        log.info("M1 AMDGPU CS dense direct decode model-slice cadence: every {d} generated tokens", .{direct_decode_slice_cadence});
+        if (direct_decode_slice_cadence == 0) {
+            log.info("M1 AMDGPU CS dense direct decode model-slice cadence: first generated token only", .{});
+        } else {
+            log.info("M1 AMDGPU CS dense direct decode model-slice cadence: first generated token and every {d} generated tokens", .{direct_decode_slice_cadence});
+        }
     }
 
     var generated: std.ArrayList(u32) = .{};
@@ -6948,11 +6956,14 @@ test "emitDecodeGraphForShape treats dense models as all attention" {
 }
 
 test "direct decode model slice cadence always covers first decode step" {
-    try std.testing.expectEqual(@as(u32, 8), directDecodeModelSliceCadenceForEnv(null));
+    try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv(null));
     try std.testing.expectEqual(@as(u32, 3), directDecodeModelSliceCadenceForEnv("3"));
-    try std.testing.expectEqual(@as(u32, 8), directDecodeModelSliceCadenceForEnv("0"));
+    try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv("0"));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(0, 8));
     try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 8));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(7, 8));
     try std.testing.expect(shouldTrackDirectDecodeModelSlice(8, 8));
+    try std.testing.expect(!shouldTrackDirectDecodeModelSlice(0, 0));
+    try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 0));
+    try std.testing.expect(!shouldTrackDirectDecodeModelSlice(8, 0));
 }
