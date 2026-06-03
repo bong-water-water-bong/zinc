@@ -13676,7 +13676,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     }
     profileGpuMoeBarrierBuffers(cmd, profile, .activation, &.{&scratch.swiglu});
     dispatchGemmBatchedOnCmd(engine, cmd, down_shexp, &scratch.swiglu, &scratch.moe_route_input, hidden_dim, shexp_inter_dim, n_tokens);
-    profileGpuMoeBarrier(cmd, profile, .down);
+    profileGpuMoeResourceBarrierBuffers(cmd, profile, .down, &.{&scratch.moe_route_input});
     if (use_batched_weighted_post_norm) {
         var shared_gate_buf: *const MetalBuffer = &scratch.gate;
         if (lt.ffn_gate_inp_shexp) |gate_t| {
