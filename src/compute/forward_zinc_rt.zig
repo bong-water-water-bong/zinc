@@ -1362,10 +1362,15 @@ const ScalarDecodeState = struct {
     ssm_states: []f32,
     moe_expert_workers: usize,
     moe_topk_active: u32,
+    direct_ssm_q8_row_range_max_successes: u32,
     decode_phase: bool = false,
     direct_router_row_range_done: bool = false,
-    direct_ssm_alpha_q8_row_range_done: bool = false,
-    direct_ssm_beta_q8_row_range_done: bool = false,
+    direct_ssm_alpha_q8_row_range_done_mask: u128 = 0,
+    direct_ssm_alpha_q8_row_range_failed_mask: u128 = 0,
+    direct_ssm_alpha_q8_row_range_successes: u32 = 0,
+    direct_ssm_beta_q8_row_range_done_mask: u128 = 0,
+    direct_ssm_beta_q8_row_range_failed_mask: u128 = 0,
+    direct_ssm_beta_q8_row_range_successes: u32 = 0,
     pool: ?*std.Thread.Pool = null,
     fast_pool: ?*zinc_rt.fast_pool.FastPool = null,
 
@@ -1429,6 +1434,7 @@ const ScalarDecodeState = struct {
             .ssm_states = try allocator.alloc(f32, ssm_state_elems),
             .moe_expert_workers = moeExpertWorkerCount(model.effectiveMoeTopK(), std.Thread.getCpuCount() catch 1),
             .moe_topk_active = model.effectiveMoeTopK(),
+            .direct_ssm_q8_row_range_max_successes = directSsmQ8_0RowRangeMaxSuccesses(),
         };
         @memset(state.kv_k, 0);
         @memset(state.kv_v, 0);
@@ -1517,6 +1523,7 @@ const DirectComputeTracking = struct {
 };
 
 const direct_decode_model_slice_cadence_default: u32 = 0;
+const direct_ssm_q8_0_row_range_max_successes_default: u32 = 2;
 
 fn directDecodeModelSliceCadenceForEnv(raw_override: ?[]const u8) u32 {
     const raw = raw_override orelse return direct_decode_model_slice_cadence_default;
@@ -1535,6 +1542,25 @@ fn shouldTrackDirectDecodeModelSlice(generated_len: usize, cadence: u32) bool {
     if (generated_len == 1) return true;
     if (cadence == 0) return false;
     return generated_len % cadence == 0;
+}
+
+fn directSsmQ8_0RowRangeMaxSuccessesForEnv(raw_override: ?[]const u8) u32 {
+    const raw = raw_override orelse return direct_ssm_q8_0_row_range_max_successes_default;
+    return std.fmt.parseInt(u32, raw, 10) catch direct_ssm_q8_0_row_range_max_successes_default;
+}
+
+fn directSsmQ8_0RowRangeMaxSuccesses() u32 {
+    return directSsmQ8_0RowRangeMaxSuccessesForEnv(std.posix.getenv("ZINC_RT_DIRECT_SSM_Q8_ROW_RANGE_MAX_SUCCESSES"));
+}
+
+fn directSsmLayerBit(layer: u32) u128 {
+    if (layer >= 128) return 0;
+    return @as(u128, 1) << @intCast(layer);
+}
+
+fn directSsmLayerMaskContains(mask: u128, layer: u32) bool {
+    const bit = directSsmLayerBit(layer);
+    return bit != 0 and (mask & bit) != 0;
 }
 
 fn generateScalarHybrid(
@@ -1647,6 +1673,7 @@ fn generateScalarHybrid(
         } else {
             log.info("M1 AMDGPU CS direct decode model-slice cadence: first generated token and every {d} generated tokens", .{direct_decode_slice_cadence});
         }
+        log.info("M1 AMDGPU CS direct SSM Q8_0 row-range budget: {d} successes per alpha/beta kind", .{state.direct_ssm_q8_row_range_max_successes});
     }
 
     var generated: std.ArrayList(u32) = .{};
@@ -2567,8 +2594,8 @@ fn runSsmLayer(
     // matvec and fill them from CS row-range kernels instead; CPU values are
     // still computed as oracles inside the direct consumers but no longer feed
     // generation.
-    const direct_alpha = canAttemptDirectSsmAlphaQ8_0RowRange(model, state, lt, direct_compute_tracking);
-    const direct_beta = canAttemptDirectSsmBetaQ8_0RowRange(model, state, lt, direct_compute_tracking);
+    const direct_alpha = canAttemptDirectSsmAlphaQ8_0RowRange(model, state, lt, layer, direct_compute_tracking);
+    const direct_beta = canAttemptDirectSsmBetaQ8_0RowRange(model, state, lt, layer, direct_compute_tracking);
     if (direct_alpha or direct_beta) {
         var parts_buf: [4]FusedPart = undefined;
         var part_count: usize = 0;
@@ -2760,11 +2787,15 @@ fn canAttemptDirectSsmAlphaQ8_0RowRange(
     model: *const Model,
     state: *const ScalarDecodeState,
     lt: LayerTensors,
+    layer: u32,
     maybe_tracking: ?DirectComputeTracking,
 ) bool {
     const tracking = maybe_tracking orelse return false;
     if (tracking.phase != .decode) return false;
-    if (state.direct_ssm_alpha_q8_row_range_done) return false;
+    if (state.direct_ssm_q8_row_range_max_successes == 0) return false;
+    if (state.direct_ssm_alpha_q8_row_range_successes >= state.direct_ssm_q8_row_range_max_successes) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_alpha_q8_row_range_done_mask, layer)) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_alpha_q8_row_range_failed_mask, layer)) return false;
     const alpha_info = lt.ssm_alpha orelse return false;
     const rows = directSsmAlphaQ8_0RowRangeRows(model.config, state, alpha_info);
     if (rows == 0) return false;
@@ -2782,7 +2813,10 @@ fn consumeDirectSsmAlphaQ8_0RowRange(
 ) bool {
     const tracking = maybe_tracking orelse return false;
     if (tracking.phase != .decode) return false;
-    if (state.direct_ssm_alpha_q8_row_range_done) return false;
+    if (state.direct_ssm_q8_row_range_max_successes == 0) return false;
+    if (state.direct_ssm_alpha_q8_row_range_successes >= state.direct_ssm_q8_row_range_max_successes) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_alpha_q8_row_range_done_mask, layer)) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_alpha_q8_row_range_failed_mask, layer)) return false;
     const alpha_info = lt.ssm_alpha orelse return false;
     const rows = directSsmAlphaQ8_0RowRangeRows(model.config, state, alpha_info);
     if (rows == 0) return false;
@@ -2815,6 +2849,7 @@ fn consumeDirectSsmAlphaQ8_0RowRange(
     for (gpu_out, 0..) |gpu_value, i| {
         if (!std.math.isFinite(gpu_value)) {
             log.warn("M1 AMDGPU CS direct SSM alpha Q8_0 row-range produced non-finite row {d}; alpha remains host-computed", .{i});
+            state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer);
             return false;
         }
         const delta = @abs(gpu_value - cpu_out[i]);
@@ -2830,11 +2865,13 @@ fn consumeDirectSsmAlphaQ8_0RowRange(
             max_abs_delta,
             max_row,
         });
+        state.direct_ssm_alpha_q8_row_range_failed_mask |= directSsmLayerBit(layer);
         return false;
     }
 
     @memcpy(state.alpha[0..rows_usize], gpu_out);
-    state.direct_ssm_alpha_q8_row_range_done = true;
+    state.direct_ssm_alpha_q8_row_range_done_mask |= directSsmLayerBit(layer);
+    state.direct_ssm_alpha_q8_row_range_successes += 1;
     tracking.ops.* += 1;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
@@ -2870,11 +2907,15 @@ fn canAttemptDirectSsmBetaQ8_0RowRange(
     model: *const Model,
     state: *const ScalarDecodeState,
     lt: LayerTensors,
+    layer: u32,
     maybe_tracking: ?DirectComputeTracking,
 ) bool {
     const tracking = maybe_tracking orelse return false;
     if (tracking.phase != .decode) return false;
-    if (state.direct_ssm_beta_q8_row_range_done) return false;
+    if (state.direct_ssm_q8_row_range_max_successes == 0) return false;
+    if (state.direct_ssm_beta_q8_row_range_successes >= state.direct_ssm_q8_row_range_max_successes) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_beta_q8_row_range_done_mask, layer)) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_beta_q8_row_range_failed_mask, layer)) return false;
     const beta_info = lt.ssm_beta orelse return false;
     const rows = directSsmBetaQ8_0RowRangeRows(model.config, state, beta_info);
     if (rows == 0) return false;
@@ -2892,7 +2933,10 @@ fn consumeDirectSsmBetaQ8_0RowRange(
 ) bool {
     const tracking = maybe_tracking orelse return false;
     if (tracking.phase != .decode) return false;
-    if (state.direct_ssm_beta_q8_row_range_done) return false;
+    if (state.direct_ssm_q8_row_range_max_successes == 0) return false;
+    if (state.direct_ssm_beta_q8_row_range_successes >= state.direct_ssm_q8_row_range_max_successes) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_beta_q8_row_range_done_mask, layer)) return false;
+    if (directSsmLayerMaskContains(state.direct_ssm_beta_q8_row_range_failed_mask, layer)) return false;
     const beta_info = lt.ssm_beta orelse return false;
     const rows = directSsmBetaQ8_0RowRangeRows(model.config, state, beta_info);
     if (rows == 0) return false;
@@ -2925,6 +2969,7 @@ fn consumeDirectSsmBetaQ8_0RowRange(
     for (gpu_out, 0..) |gpu_value, i| {
         if (!std.math.isFinite(gpu_value)) {
             log.warn("M1 AMDGPU CS direct SSM beta Q8_0 row-range produced non-finite row {d}; beta remains host-computed", .{i});
+            state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer);
             return false;
         }
         const delta = @abs(gpu_value - cpu_out[i]);
@@ -2940,11 +2985,13 @@ fn consumeDirectSsmBetaQ8_0RowRange(
             max_abs_delta,
             max_row,
         });
+        state.direct_ssm_beta_q8_row_range_failed_mask |= directSsmLayerBit(layer);
         return false;
     }
 
     @memcpy(state.beta[0..rows_usize], gpu_out);
-    state.direct_ssm_beta_q8_row_range_done = true;
+    state.direct_ssm_beta_q8_row_range_done_mask |= directSsmLayerBit(layer);
+    state.direct_ssm_beta_q8_row_range_successes += 1;
     tracking.ops.* += 1;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
@@ -7144,4 +7191,21 @@ test "direct decode model slice cadence always covers first decode step" {
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(0, 0));
     try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 0));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(8, 0));
+}
+
+test "direct SSM Q8 row-range budget and masks are bounded" {
+    try std.testing.expectEqual(@as(u32, 2), directSsmQ8_0RowRangeMaxSuccessesForEnv(null));
+    try std.testing.expectEqual(@as(u32, 0), directSsmQ8_0RowRangeMaxSuccessesForEnv("0"));
+    try std.testing.expectEqual(@as(u32, 5), directSsmQ8_0RowRangeMaxSuccessesForEnv("5"));
+    try std.testing.expectEqual(@as(u32, 2), directSsmQ8_0RowRangeMaxSuccessesForEnv("bad"));
+
+    var mask: u128 = 0;
+    mask |= directSsmLayerBit(0);
+    mask |= directSsmLayerBit(63);
+    mask |= directSsmLayerBit(127);
+    try std.testing.expect(directSsmLayerMaskContains(mask, 0));
+    try std.testing.expect(directSsmLayerMaskContains(mask, 63));
+    try std.testing.expect(directSsmLayerMaskContains(mask, 127));
+    try std.testing.expect(!directSsmLayerMaskContains(mask, 64));
+    try std.testing.expect(!directSsmLayerMaskContains(mask, 128));
 }
