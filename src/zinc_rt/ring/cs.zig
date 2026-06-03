@@ -17,9 +17,9 @@
 //! This module brings the CS path's first retired PM4 batch up as a
 //! benchmark-visible gate: open the render node, query the compute HW IP,
 //! allocate an amdgpu context, create a persistent BO list for a GTT
-//! indirect-buffer BO plus a signal BO, map them into the GPU VM at low VAs,
-//! submit two PM4 `WRITE_DATA` streams through `DRM_IOCTL_AMDGPU_CS` using the
-//! same context/BO list, and wait for the returned fences with
+//! indirect-buffer BO plus data/signal/shader BOs, map them into the GPU VM at
+//! low VAs, submit PM4 streams through `DRM_IOCTL_AMDGPU_CS` using the same
+//! context/BO list, and wait for the returned fences with
 //! `DRM_IOCTL_AMDGPU_WAIT_CS`.
 //!
 //! This is not the final T1/T2 ring from the design; it is the kernel-managed
@@ -212,7 +212,8 @@ const shader_offset_argmax_top2: usize = 0x000;
 const shader_offset_rms_norm_elem0: usize = 0x100;
 const shader_offset_dmmv_f32_row_range: usize = 0x200;
 const shader_offset_dmmv_q4_0_row_range: usize = 0x300;
-const shader_offset_dmmv_q8_0_row_range: usize = 0x400;
+const shader_offset_dmmv_q8_0_row_range: usize = 0x500;
+const shader_page_bytes: usize = 4096;
 
 // gfx1201 one-wave kernel assembled with:
 //   llvm-mc-20 -triple=amdgcn-amd-amdhsa -mcpu=gfx1201 -filetype=obj
@@ -456,6 +457,14 @@ const dmmv_q8_0_row_range_gfx1201 = [_]u32{
     0xbfb00000,
 };
 
+comptime {
+    std.debug.assert(shader_offset_argmax_top2 + argmax_top2_gfx1201.len * @sizeOf(u32) <= shader_offset_rms_norm_elem0);
+    std.debug.assert(shader_offset_rms_norm_elem0 + rms_norm_elem0_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_f32_row_range);
+    std.debug.assert(shader_offset_dmmv_f32_row_range + dmmv_f32_row_range_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_row_range);
+    std.debug.assert(shader_offset_dmmv_q4_0_row_range + dmmv_q4_0_row_range_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q8_0_row_range);
+    std.debug.assert(shader_offset_dmmv_q8_0_row_range + dmmv_q8_0_row_range_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
+}
+
 /// Outcome classification for the CS bring-up smoke gate.
 /// Each variant maps to a specific failure point in the open → submit → wait
 /// pipeline, so the benchmark UI can attribute a regression to render-node
@@ -550,7 +559,7 @@ pub const TokenBoundary = struct {
     /// Allocates an amdgpu context, creates GTT-backed BOs for the indirect
     /// buffer, input scratch (~2 MiB), output, signal and shader pages, maps
     /// each into a fixed low GPU VA so the kernel does not need to re-bind
-    /// them per submission, uploads the three gfx1201 PM4 kernels into the
+    /// them per submission, uploads the gfx1201 PM4 kernels into the
     /// shader page, and creates a persistent BO list referencing all five BOs.
     /// @param render_node Absolute path to the amdgpu DRM render node (e.g. `/dev/dri/renderD128`).
     /// @returns A ready `TokenBoundary` on success; the relevant `error.*Failed` variant otherwise.
