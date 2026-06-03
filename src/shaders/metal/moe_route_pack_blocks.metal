@@ -33,28 +33,37 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
-    const uint expert_id = tid;
     const uint total_routes = p.n_tokens * p.k;
-    uint count = 0u;
-    if (expert_id < p.n_experts) {
-        for (uint route = 0u; route < total_routes; route++) {
+
+    if (tid < p.n_experts) {
+        atomic_store_explicit(counts + tid, 0u, memory_order_relaxed);
+        route_counts[tid] = 0u;
+        block_counts[tid] = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    if (tid < p.n_experts) {
+        for (uint route = tid; route < total_routes; route += p.n_experts) {
             const uint token = route / p.k;
             const uint slot = route - token * p.k;
-            const uint route_expert = routing[token * p.routing_stride + slot];
-            if (route_expert != expert_id) {
+            const uint expert_id = routing[token * p.routing_stride + slot];
+            if (expert_id >= p.n_experts) {
                 continue;
             }
 
-            if (count < p.ids_stride) {
-                ids[expert_id * p.ids_stride + count] = route;
+            const uint index = atomic_fetch_add_explicit(counts + expert_id, 1u, memory_order_relaxed);
+            if (index < p.ids_stride) {
+                ids[expert_id * p.ids_stride + index] = route;
             }
-            count++;
         }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
-        atomic_store_explicit(counts + expert_id, count, memory_order_relaxed);
+    if (tid < p.n_experts) {
+        const uint count = atomic_load_explicit(counts + tid, memory_order_relaxed);
         const uint stored_count = min(count, p.ids_stride);
-        route_counts[expert_id] = stored_count;
-        block_counts[expert_id] = (stored_count + NUM_COLS - 1u) / NUM_COLS;
+        route_counts[tid] = stored_count;
+        block_counts[tid] = (stored_count + NUM_COLS - 1u) / NUM_COLS;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -90,14 +99,14 @@ kernel void main0(
         }
     }
 
-    if (expert_id < p.n_experts) {
-        const uint block_count = block_counts[expert_id];
+    if (tid < p.n_experts) {
+        const uint block_count = block_counts[tid];
         // Consumers read expert_id/block_idx from each entry, so stable
         // expert-major ordering is unnecessary. Reserve the output span
         // atomically instead of doing a per-expert prefix loop.
         const uint block_offset = atomic_fetch_add_explicit(active_block_count, block_count, memory_order_relaxed);
         for (uint block = 0u; block < block_count; block++) {
-            active_blocks[block_offset + block] = expert_id | (block << 16u);
+            active_blocks[block_offset + block] = tid | (block << 16u);
         }
     }
 }
