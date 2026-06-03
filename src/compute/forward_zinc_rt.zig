@@ -2064,23 +2064,13 @@ fn scalarEvalTokenDense(
     }
     const lm_head_rows = model.effectiveLmHeadRows(state.decode_phase);
     if (model.lm_head_q4_0) |q40| {
-        var selection = try argmaxMatvecRawTop2(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
-        if (consumeDirectLmHeadQ4_0Top2Rows(state, direct_compute_tracking, q40, lm_head_rows, selection)) |direct_selection| {
-            selection = direct_selection;
-        } else {
-            consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, q40, lm_head_rows, selection.best);
-        }
+        const selection = try selectLmHeadQ4_0TrackedTop2(state, direct_compute_tracking, q40, lm_head_rows);
         next_token.* = selection.best.index;
     } else {
         const lm_head = model.requantOrRaw(model.lm_head_info);
         if (canDotDirect(lm_head.type_, @intCast(state.norm.len))) {
             if (lm_head.type_ == .q4_0) {
-                var selection = try argmaxMatvecRawTop2(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
-                if (consumeDirectLmHeadQ4_0Top2Rows(state, direct_compute_tracking, lm_head.raw, lm_head_rows, selection)) |direct_selection| {
-                    selection = direct_selection;
-                } else {
-                    consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, lm_head.raw, lm_head_rows, selection.best);
-                }
+                const selection = try selectLmHeadQ4_0TrackedTop2(state, direct_compute_tracking, lm_head.raw, lm_head_rows);
                 next_token.* = selection.best.index;
             } else {
                 const best = try argmaxMatvecRawBest(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
@@ -2420,6 +2410,29 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
 fn directLmHeadQ4_0SelectedSourceHasGpuScore(selected_source: []const u8) bool {
     return std.mem.eql(u8, selected_source, "gpu_prefix") or
         std.mem.eql(u8, selected_source, "gpu_selected_window");
+}
+
+fn selectLmHeadQ4_0TrackedTop2(
+    state: *ScalarDecodeState,
+    maybe_tracking: ?DirectComputeTracking,
+    q4_0_raw: []const u8,
+    lm_head_rows: u32,
+) !ArgmaxTop2Result {
+    if (maybe_tracking != null) {
+        if (try consumeDirectLmHeadQ4_0ArgmaxPrefix(state, maybe_tracking, q4_0_raw, lm_head_rows)) |selection| {
+            return selection;
+        }
+    }
+
+    var selection = try argmaxMatvecRawTop2(state.pool, q4_0_raw, .q4_0, state.norm, lm_head_rows, state.row_scratch);
+    if (maybe_tracking != null) {
+        if (consumeDirectLmHeadQ4_0Top2Rows(state, maybe_tracking, q4_0_raw, lm_head_rows, selection)) |direct_selection| {
+            selection = direct_selection;
+        } else {
+            consumeDirectLmHeadQ4_0BestRow(state, maybe_tracking, q4_0_raw, lm_head_rows, selection.best);
+        }
+    }
+    return selection;
 }
 
 const DirectLmHeadGpuRow = struct {
@@ -2869,12 +2882,7 @@ fn scalarEvalToken(
     var selection: ArgmaxTop2Result = .{};
     if (model.lm_head_q4_0) |q40| {
         if (direct_compute_tracking != null) {
-            selection = try argmaxMatvecRawTop2(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
-            if (consumeDirectLmHeadQ4_0Top2Rows(state, direct_compute_tracking, q40, lm_head_rows, selection)) |direct_selection| {
-                selection = direct_selection;
-            } else {
-                consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, q40, lm_head_rows, selection.best);
-            }
+            selection = try selectLmHeadQ4_0TrackedTop2(state, direct_compute_tracking, q40, lm_head_rows);
             next_token.* = selection.best.index;
         } else if (need_top2) {
             selection = try argmaxMatvecRawTop2(state.pool, q40, .q4_0, state.norm, lm_head_rows, state.row_scratch);
@@ -2886,12 +2894,7 @@ fn scalarEvalToken(
         const lm_head = model.requantOrRaw(model.lm_head_info);
         if (canDotDirect(lm_head.type_, @intCast(state.norm.len))) {
             if (direct_compute_tracking != null and lm_head.type_ == .q4_0) {
-                selection = try argmaxMatvecRawTop2(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
-                if (consumeDirectLmHeadQ4_0Top2Rows(state, direct_compute_tracking, lm_head.raw, lm_head_rows, selection)) |direct_selection| {
-                    selection = direct_selection;
-                } else {
-                    consumeDirectLmHeadQ4_0BestRow(state, direct_compute_tracking, lm_head.raw, lm_head_rows, selection.best);
-                }
+                selection = try selectLmHeadQ4_0TrackedTop2(state, direct_compute_tracking, lm_head.raw, lm_head_rows);
                 next_token.* = selection.best.index;
             } else if (need_top2) {
                 selection = try argmaxMatvecRawTop2(state.pool, lm_head.raw, lm_head.type_, state.norm, lm_head_rows, state.row_scratch);
