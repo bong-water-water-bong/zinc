@@ -13336,7 +13336,6 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         );
         pre_ffw_norm_2_ready = true;
         shared_gate_ready = true;
-        profileGpuMoeBarrier(cmd, profile, .router);
     } else if (use_fused_f32_router) {
         dispatchGemmaRmsNormRouterF32TopkBatchedScaledOnCmd(
             engine,
@@ -13355,7 +13354,6 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             router_logit_scale,
         );
         pre_ffw_norm_2_ready = true;
-        profileGpuMoeBarrier(cmd, profile, .router);
     } else {
         dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, gate_scale, hidden_dim, n_tokens);
         profileGpuMoeBarrier(cmd, profile, .router);
@@ -13363,7 +13361,17 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
         profileGpuMoeBarrier(cmd, profile, .router);
 
         dispatchSoftmaxTopkBatchedOnCmd(engine, cmd, &scratch.gate, &scratch.moe_routing, n_tokens, cfg.n_experts, cfg.n_experts_used);
-        profileGpuMoeBarrier(cmd, profile, .router);
+    }
+    {
+        var router_barrier_bufs: [2]*const MetalBuffer = undefined;
+        var router_barrier_count: usize = 0;
+        router_barrier_bufs[router_barrier_count] = &scratch.moe_routing;
+        router_barrier_count += 1;
+        if (use_route_slot_moe and pre_ffw_norm_2_ready) {
+            router_barrier_bufs[router_barrier_count] = &scratch.down;
+            router_barrier_count += 1;
+        }
+        profileGpuMoeResourceBarrierBuffers(cmd, profile, .router, router_barrier_bufs[0..router_barrier_count]);
     }
     if (use_route_slot_moe) {
         dispatchMoeRouteIdsOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_packed_ids, n_tokens, cfg.n_experts_used);
