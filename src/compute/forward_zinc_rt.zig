@@ -1524,7 +1524,7 @@ const DirectComputeTracking = struct {
     selected_token: ?*u32 = null,
 };
 
-const direct_decode_model_slice_cadence_default: u32 = 0;
+const direct_decode_model_slice_cadence_default: u32 = 16;
 const direct_ssm_q8_0_row_range_max_successes_default: u32 = 2;
 const direct_ssm_q8_0_trust_after_successes_default: u32 = 1;
 
@@ -7688,9 +7688,10 @@ test "emitDecodeGraphForShape treats dense models as all attention" {
 }
 
 test "direct decode model slice cadence always covers first decode step" {
-    try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv(null));
+    try std.testing.expectEqual(@as(u32, 16), directDecodeModelSliceCadenceForEnv(null));
     try std.testing.expectEqual(@as(u32, 3), directDecodeModelSliceCadenceForEnv("3"));
     try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv("0"));
+    try std.testing.expectEqual(@as(u32, 16), directDecodeModelSliceCadenceForEnv("bad"));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(0, 8));
     try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 8));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(7, 8));
@@ -7698,6 +7699,8 @@ test "direct decode model slice cadence always covers first decode step" {
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(0, 0));
     try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 0));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(8, 0));
+    try std.testing.expect(!shouldTrackDirectDecodeModelSlice(15, direct_decode_model_slice_cadence_default));
+    try std.testing.expect(shouldTrackDirectDecodeModelSlice(16, direct_decode_model_slice_cadence_default));
 }
 
 test "direct LM-head Q4_0 selected window covers sampled row" {
