@@ -25,14 +25,11 @@ kernel void main0(
     device uint* active_blocks [[buffer(5)]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
+    threadgroup uint route_counts[MAX_EXPERTS];
     threadgroup uint block_counts[MAX_EXPERTS];
 
     if (tid == 0u) {
         atomic_store_explicit(active_block_count, 0u, memory_order_relaxed);
-    }
-    if (tid < p.n_experts) {
-        atomic_store_explicit(counts + tid, 0u, memory_order_relaxed);
-        block_counts[tid] = 0u;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
@@ -56,9 +53,10 @@ kernel void main0(
 
         atomic_store_explicit(counts + expert_id, count, memory_order_relaxed);
         const uint stored_count = min(count, p.ids_stride);
+        route_counts[expert_id] = stored_count;
         block_counts[expert_id] = (stored_count + NUM_COLS - 1u) / NUM_COLS;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0u) {
         uint total_blocks = 0u;
@@ -68,7 +66,7 @@ kernel void main0(
         uint padding_slots = 0u;
         for (uint expert = 0u; expert < p.n_experts; expert++) {
             total_blocks += block_counts[expert];
-            const uint stored_count = min(atomic_load_explicit(counts + expert, memory_order_relaxed), p.ids_stride);
+            const uint stored_count = route_counts[expert];
             if (stored_count == 0u) {
                 continue;
             }
