@@ -11,6 +11,7 @@ import {
   injectSessionId,
   isBenignPartialStreamClose,
   parseArgs,
+  parseXmlToolCallContent,
   preferredEditablePath,
   repairArgumentsJson,
   repairOpenAiToolCalls,
@@ -136,6 +137,8 @@ describe("request shaping", () => {
     expect(guard).toContain("Package and test files are read-only");
     const continuation = buildCodingContinuationGuardMessage(body);
     expect(continuation).toContain("fix all known source bugs in one edit");
+    expect(continuation).toContain("**/*.{js,mjs,cjs,ts,tsx,json}");
+    expect(continuation).toContain("Batch independent file discovery and reads");
     expect(continuation).toContain("do not give the final response until the tests pass");
   });
 
@@ -269,6 +272,44 @@ describe("tool argument repair", () => {
     expect(args.path).toBe("/private/tmp/zinc-opencode-smoke4");
     expect(args.pattern).toBe("test/**/*");
     expect(repaired.event).not.toContain("<//parameter>");
+  });
+
+  test("converts complete XML tool-call content into an OpenAI tool call", () => {
+    const content =
+      '<tool_call>\n{"name":"read","arguments":{"filePath":"/private/tmp/zinc-opencode-smoke4/src/cart.mjs"}}\n</tool_call>';
+    const call = parseXmlToolCallContent(content);
+    expect(call?.function.name).toBe("read");
+    expect(JSON.parse(call?.function.arguments ?? "{}")).toEqual({
+      filePath: "/private/tmp/zinc-opencode-smoke4/src/cart.mjs",
+    });
+
+    const state = {};
+    const event =
+      `data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { content }, finish_reason: null }],
+      })}\n\n`;
+    const repaired = repairSseEvent(event, body, state);
+    expect(repaired.changed).toBe(true);
+    expect(state.sawSyntheticToolCall).toBe(true);
+
+    const payload = JSON.parse(repaired.event.slice("data: ".length));
+    expect(payload.choices[0].delta.content).toBeUndefined();
+    expect(payload.choices[0].delta.tool_calls[0].function.name).toBe("read");
+    expect(JSON.parse(payload.choices[0].delta.tool_calls[0].function.arguments).filePath).toBe(
+      "/private/tmp/zinc-opencode-smoke4/src/cart.mjs",
+    );
+  });
+
+  test("rewrites stop finish reason after synthetic tool call", () => {
+    const state = { sawSyntheticToolCall: true };
+    const event =
+      `data: ${JSON.stringify({
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      })}\n\n`;
+    const repaired = repairSseEvent(event, body, state);
+    const payload = JSON.parse(repaired.event.slice("data: ".length));
+    expect(repaired.changed).toBe(true);
+    expect(payload.choices[0].finish_reason).toBe("tool_calls");
   });
 });
 

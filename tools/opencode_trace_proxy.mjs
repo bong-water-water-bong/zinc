@@ -7,6 +7,7 @@ import path from "node:path";
 const DEFAULT_LISTEN = 9091;
 const DEFAULT_UPSTREAM = "http://127.0.0.1:9090/v1";
 const DEFAULT_TRACE_DIR = "/tmp/zinc-opencode-traces";
+const TRACE_PREVIEW_LIMIT = 64 * 1024;
 
 const numericArgKeys = new Set([
   "offset",
@@ -263,7 +264,10 @@ export function buildCodingContinuationGuardMessage(body) {
   return [
     "OpenCode continuation guard: Continue the coding task with tool calls.",
     "Do not summarize instead of acting when tests are still failing.",
+    "For JavaScript projects, search **/*.{js,mjs,cjs,ts,tsx,json} first; .mjs and .cjs are source files.",
+    "Batch independent file discovery and reads in one assistant turn when paths are obvious.",
     "If you have identified multiple source bugs, fix all known source bugs in one edit before yielding.",
+    "Do not split one obvious same-file fix across multiple edit turns when the failing tests already identify the cases.",
     "Never call edit or write on package.json or files under /test/ unless the user explicitly asks to change tests.",
     `${source} Run the project tests after source edits, and do not give the final response until the tests pass.`,
   ].join("\n");
@@ -399,9 +403,46 @@ function repairToolCall(call, requestBody) {
   return repaired.changed;
 }
 
-export function repairOpenAiToolCalls(payload, requestBody) {
+export function parseXmlToolCallContent(content) {
+  if (typeof content !== "string") return null;
+  const match = content.trim().match(/^<tool_call>\s*([\s\S]*?)\s*<\/tool_call>$/);
+  if (!match) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+
+  const name = parsed?.name ?? parsed?.function?.name;
+  const rawArgs = parsed?.arguments ?? parsed?.function?.arguments ?? {};
+  if (typeof name !== "string" || name.length === 0) return null;
+  const args = typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs);
+  return {
+    index: 0,
+    id: `call_repaired_${createHash("sha256").update(match[1]).digest("hex").slice(0, 8)}`,
+    type: "function",
+    function: { name, arguments: args },
+  };
+}
+
+export function repairOpenAiToolCalls(payload, requestBody, state = {}) {
   let changed = false;
   for (const choice of payload.choices ?? []) {
+    const xmlCall = parseXmlToolCallContent(choice.delta?.content);
+    if (xmlCall) {
+      repairToolCall(xmlCall, requestBody);
+      choice.delta = { ...choice.delta };
+      delete choice.delta.content;
+      choice.delta.tool_calls = [xmlCall];
+      state.sawSyntheticToolCall = true;
+      changed = true;
+    }
+    if (state.sawSyntheticToolCall && choice.finish_reason === "stop") {
+      choice.finish_reason = "tool_calls";
+      changed = true;
+    }
     for (const call of choice.delta?.tool_calls ?? []) {
       changed = repairToolCall(call, requestBody) || changed;
     }
@@ -412,7 +453,7 @@ export function repairOpenAiToolCalls(payload, requestBody) {
   return changed;
 }
 
-export function repairSseEvent(event, requestBody) {
+export function repairSseEvent(event, requestBody, state = {}) {
   const lines = event.split(/\n/);
   let changed = false;
   const out = lines.map((line) => {
@@ -421,7 +462,7 @@ export function repairSseEvent(event, requestBody) {
     if (!data.trim() || data.trim() === "[DONE]") return line;
     try {
       const payload = JSON.parse(data);
-      if (repairOpenAiToolCalls(payload, requestBody)) changed = true;
+      if (repairOpenAiToolCalls(payload, requestBody, state)) changed = true;
       return `data: ${JSON.stringify(payload)}`;
     } catch {
       return line;
@@ -525,6 +566,7 @@ async function handleProxyRequest(req, res, opts) {
 
     if (contentType.includes("text/event-stream") && upstreamResponse.body) {
       const decoder = new TextDecoder();
+      const repairState = {};
       let pending = "";
       for await (const chunk of upstreamResponse.body) {
         pending += decoder.decode(chunk, { stream: true });
@@ -532,10 +574,12 @@ async function handleProxyRequest(req, res, opts) {
         while ((idx = pending.indexOf("\n\n")) >= 0) {
           const event = pending.slice(0, idx + 2);
           pending = pending.slice(idx + 2);
-          const repaired = opts.repairToolPaths && parsedBody ? repairSseEvent(event, parsedBody) : { event, changed: false };
+          const repaired = opts.repairToolPaths && parsedBody ? repairSseEvent(event, parsedBody, repairState) : { event, changed: false };
           if (repaired.changed) trace.response_metrics.repaired_events += 1;
           trace.response_metrics.bytes += Buffer.byteLength(repaired.event);
-          if (trace.response_preview.length < 4096) trace.response_preview += repaired.event.slice(0, 4096 - trace.response_preview.length);
+          if (trace.response_preview.length < TRACE_PREVIEW_LIMIT) {
+            trace.response_preview += repaired.event.slice(0, TRACE_PREVIEW_LIMIT - trace.response_preview.length);
+          }
           res.write(repaired.event);
         }
       }
@@ -551,7 +595,7 @@ async function handleProxyRequest(req, res, opts) {
         }
       }
       trace.response_metrics.bytes = Buffer.byteLength(text);
-      trace.response_preview = text.slice(0, 4096);
+      trace.response_preview = text.slice(0, TRACE_PREVIEW_LIMIT);
       res.end(text);
     }
   } catch (err) {
