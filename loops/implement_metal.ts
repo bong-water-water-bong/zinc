@@ -140,6 +140,7 @@ const QWEN36_PLATEAU_WINDOW = 32;
 const GEMMA_PLATEAU_STALL_CYCLES = parsePositiveIntEnv("ZINC_GEMMA_PLATEAU_STALL_CYCLES", 6);
 const GEMMA_PLATEAU_WINDOW = parsePositiveIntEnv("ZINC_GEMMA_PLATEAU_WINDOW", 18);
 const GEMMA_POST_BREAKTHROUGH_FLOOR = parsePositiveFloatEnv("ZINC_GEMMA_POST_BREAKTHROUGH_FLOOR", 80);
+const GEMMA_POST_ROUTEPACK_PLATEAU_FLOOR = parsePositiveFloatEnv("ZINC_GEMMA_POST_ROUTEPACK_PLATEAU_FLOOR", 380);
 // Optional outer-harness exact-shape Metal evidence pass. Agents are blocked
 // from running `bench-metal-shapes` because it reserves the Metal GPU; the
 // harness can safely run it between cycles and splice the output into the next
@@ -607,6 +608,9 @@ export function classifyAttemptFamilies(cycle: CycleResult): string[] {
   const families: string[] = [];
   if (/simd_sum|shuffle|lane[- ]parallel|float[248]|writeback/.test(text)) families.push("simd_sum/reduction packing");
   if (/q8|repack|fixed[- ]?k|tg128|k=2048|k=4096/.test(text)) families.push("Q8/repacked shape retune");
+  if (/(q4[_-]?k|geglu|gate[\/ -]?up).*(tail|route[- ]?pack|active[- ]?block|input[- ]row|singleton|exact [1-7][ -]?route|route\s*\/\s*8|route\s*>>\s*3)|(?:tail|route[- ]?pack|active[- ]?block|input[- ]row).*(q4[_-]?k|geglu|gate[\/ -]?up)/.test(text)) families.push("Q4_K route-tail/GeGLU micro-variants");
+  if (/(q5[_-]?(?:1|k)|moe[- ]?down|expert[- ]?down|down).*(tail|route[- ]?pack|active[- ]?block|exact [1-7][ -]?route)|(?:tail|route[- ]?pack|active[- ]?block).*(q5[_-]?(?:1|k)|moe[- ]?down|expert[- ]?down)/.test(text)) families.push("Q5 down/tail variants");
+  if (/indirect.*dispatch|dispatch.*indirect|active[- ]?block.*(metadata|route[- ]?count|counts)|route[- ]?count|count metadata|tail[- ]?shape|tail histogram|occupancy stats|tiled expert scans/.test(text)) families.push("active-block metadata/indirect dispatch");
   if (/router|topk|top-?k|shared[- ]?gate|route[- ]?pack|moe[- ]?route/.test(text)) families.push("router/shared-gate");
   if (/ssm|delta|conv1?d|gated[-_ ]?norm/.test(text)) families.push("SSM recurrent/projection");
   if (/barrier|encoder|command|commit|wait|dispatch|batch/.test(text)) families.push("command/barrier scheduling");
@@ -681,7 +685,12 @@ export function buildStructuralPivotDirective(state: RunState): string[] {
       lines.push("- Productive directions are the exact `structural_batched=no` guard blocker, queued-prefill chunk/wait scheduling, or a measurement counter that names why the structural path is disabled.");
     } else if (gemmaPrefillActualPathIsStructuralRoutePack(state.lastProfileOutput)) {
       lines.push("- For Gemma26 M4 prefill, the structural route-packed path is live (`structural_batched=yes`, nonzero `route_layers`). Stop auditing old structural guards or queued-token-major scheduling unless the profile falls back.");
-      lines.push("- Productive directions are now on-path route-pack occupancy, q5_1/q4_k active-block tail kernels with fresh evidence, LM-head/Q8 hot shapes, or public-suite validation.");
+      if (isGemmaPrefillPostRoutePackPlateau(state)) {
+        lines.push("- The post-383 route-pack/tail/metadata family is exhausted. Do not spend another cycle on Q4_K/Q5_1 route-tail kernels, active-block route-count metadata, indirect dispatch, or passive tail histograms without new evidence naming an exact >1 tok/s bucket.");
+        lines.push("- Productive directions are Q8 LM-head/shared/attention exact-shape work, gpu-moe finalizer/barrier-count reduction, or public-suite validation to select the next bottleneck.");
+      } else {
+        lines.push("- Productive directions are now on-path route-pack occupancy, q5_1/q4_k active-block tail kernels with fresh evidence, LM-head/Q8 hot shapes, or public-suite validation.");
+      }
     } else {
       lines.push("- For Gemma26 M4 prefill, stop spending cycles on another weighted-finalizer or narrow Q8 threadgroup retune unless the latest profile or `bench-metal-shapes` evidence names that exact shape as underperforming.");
       lines.push("- Productive directions so far are queued-prefill schedule changes and router/RMS fusion. Prefer consuming exact-shape evidence, auditing full batched-prefill guard blockers, or validating public-suite prompt lengths.");
@@ -706,10 +715,49 @@ function cyclesSinceBestKept(state: RunState): number {
   return Math.max(0, last.cycle - best.cycle);
 }
 
+function isGemmaPrefillPostRoutePackPlateau(state: RunState): boolean {
+  return isGemmaPrefillPostBreakthrough(state) &&
+    bestKeptCorrectTokPerSec(state) >= GEMMA_POST_ROUTEPACK_PLATEAU_FLOOR &&
+    (state.stalledCycles >= GEMMA_PLATEAU_STALL_CYCLES ||
+      cyclesSinceBestKept(state) >= GEMMA_PLATEAU_STALL_CYCLES ||
+      consecutiveReverts(state.cycles) >= STRUCTURAL_PIVOT_REVERT_STREAK);
+}
+
 function latestGemmaPrefillActualPathLine(profile: string | null | undefined): string | null {
   if (!profile) return null;
   const matches = profile.split("\n").filter(line => /prefill actual path:/i.test(line));
   return matches.length > 0 ? matches[matches.length - 1].trim() : null;
+}
+
+export function inferGemmaRouteTokensForMetalShapes(profile: string | null | undefined): number | null {
+  if (!profile) return null;
+
+  const promptTokens = /\bprompt_tokens\s+(\d+)\b/i.exec(profile);
+  if (promptTokens) {
+    const parsed = Number.parseInt(promptTokens[1], 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+
+  const avgSlots = /\bavg_slots\/layer\s+([0-9]+(?:\.[0-9]+)?)\b/i.exec(profile);
+  if (avgSlots) {
+    const parsed = Number.parseFloat(avgSlots[1]);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      const routeTokens = Math.round(parsed / 8);
+      if (routeTokens > 0) return routeTokens;
+    }
+  }
+
+  const slots = /\blayers\s+(\d+)\s+slots\s+(\d+)\b/i.exec(profile);
+  if (slots) {
+    const layers = Number.parseInt(slots[1], 10);
+    const totalSlots = Number.parseInt(slots[2], 10);
+    if (Number.isFinite(layers) && layers > 0 && Number.isFinite(totalSlots) && totalSlots > 0) {
+      const routeTokens = Math.round(totalSlots / layers / 8);
+      if (routeTokens > 0) return routeTokens;
+    }
+  }
+
+  return null;
 }
 
 export function gemmaPrefillActualPathIsQueuedOffPath(profile: string | null | undefined): boolean {
@@ -749,6 +797,7 @@ export function buildGemmaPrefillPostBreakthroughAnalysis(state: RunState): stri
   const actualPathLine = latestGemmaPrefillActualPathLine(profile);
   const routePackOffPath = gemmaPrefillActualPathIsQueuedOffPath(profile);
   const routePackStructural = gemmaPrefillActualPathIsStructuralRoutePack(profile);
+  const postRoutePackPlateau = isGemmaPrefillPostRoutePackPlateau(state);
   const pathLine = profile.split("\n").find(line => /path bytes:/i.test(line));
   const prefillMoeLine = profile.split("\n").find(line => /prefill buckets: moe/i.test(line));
   const queuedLine = profile.split("\n").find(line => /prefill queued prefill:/i.test(line));
@@ -792,7 +841,12 @@ export function buildGemmaPrefillPostBreakthroughAnalysis(state: RunState): stri
     lines.push("- Valid next speed paths: emit the exact guard reason for `structural_batched=no` and fix it, or optimize the queued-token-major schedule/wait path that is actually running.");
   } else if (routePackStructural) {
     lines.push("- HARD PATH FACT: structural Gemma route-pack is live. The old `structural_batched=no` blocker is solved; do not spend another cycle on guard-audit, queued-token-major scheduling, or default-enable plumbing unless the latest profile falls back.");
-    lines.push("- Current on-path waste is route-pack occupancy/tails and hot Q8/LM-head traffic. Any tail-kernel change must cite the exact tail size and avoid known regressions: q5_1 exact-6, q4_k exact-4, and alt4 block-width/profile edits.");
+    if (postRoutePackPlateau) {
+      lines.push("- POST-383 PLATEAU FACT: the useful route-pack work has already been harvested. The post-best tail was dominated by reverted Q4_K GeGLU/gate-up tail variants, Q5 down/tail variants, active-block metadata/count rewrites, indirect dispatch, and passive tail histograms.");
+      lines.push("- Required pivot: do not reattempt Q4_K/Q5_1 route-tail or active-block metadata/indirect-dispatch work unless fresh profile or Metal-shapes evidence names an exact non-dead bucket and a >1 tok/s budget. Prefer Q8 LM-head/shared/attention exact-shape work, gpu-moe finalizer barrier reduction, or public-suite validation.");
+    } else {
+      lines.push("- Current on-path waste is route-pack occupancy/tails and hot Q8/LM-head traffic. Any tail-kernel change must cite the exact tail size and avoid known regressions: q5_1 exact-6, q4_k exact-4, and alt4 block-width/profile edits.");
+    }
   }
   if (evidence.trim().length > 0 && state.lastMetalShapesOk === false) {
     lines.push(`- Latest Metal-shapes evidence run failed at cycle ${state.lastMetalShapesCycle ?? "?"}. Fix that evidence path or choose a non-shape retune; do not keep adding benchmark-output changes that the harness cannot capture.`);
@@ -815,11 +869,19 @@ export function buildGemmaPrefillPostBreakthroughAnalysis(state: RunState): stri
       "",
     );
   } else if (routePackStructural) {
-    lines.push(
-      "- Best next moves: measure/optimize the active `batched-route-pack` path only; focus on route-pack occupancy, q5_1/q4_k tail sizes not already reverted, LM-head/Q8 hot shapes, or public-suite validation.",
-      "- Avoid: old structural guard work, queued-token-major schedule changes, q5_1 exact-6 tails, q4_k exact-4 tails, alt4 block-width changes, and broad finalizer/barrier retunes without a named profile bucket.",
-      "",
-    );
+    if (postRoutePackPlateau) {
+      lines.push(
+        "- Best next moves: Q8 LM-head/shared/attention exact-shape measurement or optimization; gpu-moe finalizer/barrier-count reduction backed by the profile bucket; or full public-suite validation before narrowing the next code target.",
+        "- Avoid: Q4_K/Q5_1 route-tail micro-specializations, route-count metadata rewrites, active-block indirect dispatch, passive route-tail histograms, old structural guard work, and queued-token-major schedule changes.",
+        "",
+      );
+    } else {
+      lines.push(
+        "- Best next moves: measure/optimize the active `batched-route-pack` path only; focus on route-pack occupancy, q5_1/q4_k tail sizes not already reverted, LM-head/Q8 hot shapes, or public-suite validation.",
+        "- Avoid: old structural guard work, queued-token-major schedule changes, q5_1 exact-6 tails, q4_k exact-4 tails, alt4 block-width changes, and broad finalizer/barrier retunes without a named profile bucket.",
+        "",
+      );
+    }
   } else {
     lines.push(
       "- Best next moves: consume `gemma26_prefill_hot` evidence; audit why the full Gemma batched-prefill path is still not the public-suite default; or test public-suite prompt lengths before another exact-20 schedule tweak.",
@@ -3121,18 +3183,19 @@ function splitShellWords(raw: string): string[] {
   return raw.trim().split(/\s+/).filter((s) => s.length > 0);
 }
 
-async function runMetalShapesBenchmark(): Promise<string> {
+async function runMetalShapesBenchmark(state?: RunState): Promise<string> {
   const modelPath = managedModelPathForBenchmark();
   if (!existsSync(modelPath)) {
     throw new Error(`managed model path for bench-metal-shapes not found: ${modelPath}`);
   }
 
+  const inferredRouteTokens = inferGemmaRouteTokensForMetalShapes(state?.lastProfileOutput);
   const extraArgs = METAL_SHAPES_ARGS_RAW.trim().length > 0
     ? splitShellWords(METAL_SHAPES_ARGS_RAW)
     : [
         "--case", "gemma26_prefill_hot",
         "--pipeline", "production",
-        "--route-tokens", String(Math.max(1, MAX_TOKENS + 4)),
+        "--route-tokens", String(inferredRouteTokens ?? Math.max(1, MAX_TOKENS + 4)),
         "--iterations", "80",
         "--warmup", "10",
       ];
@@ -3991,7 +4054,7 @@ async function main() {
       ideas: newIdeas,
     })) {
       try {
-        state.lastMetalShapesOutput = await runMetalShapesBenchmark();
+        state.lastMetalShapesOutput = await runMetalShapesBenchmark(state);
         state.lastMetalShapesCycle = cycle;
         state.lastMetalShapesOk = true;
         await writeFile(join(cycleDir, "metal_shapes.log"), state.lastMetalShapesOutput);

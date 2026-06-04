@@ -27,6 +27,7 @@ import {
   evaluateOutputText,
   gemmaPrefillActualPathIsStructuralRoutePack,
   gemmaPrefillActualPathIsQueuedOffPath,
+  inferGemmaRouteTokensForMetalShapes,
   keepBaselinesForCycle,
   mergeUniqueEntries,
   parseRestorePathList,
@@ -989,6 +990,56 @@ describe("buildPrompt", () => {
     expect(analysis).toContain("old structural guard work");
   });
 
+  test("Gemma post-383 plateau pivots away from exhausted tail and metadata churn", () => {
+    const profile = [
+      "info(forward):   prefill actual path: batched-route-pack default_batched=yes structural_batched=yes route_layers=30 queued_chunks=0",
+      "info(forward):   path bytes: ssm 0.00 GiB attn 35.60 GiB dense 0.00 GiB moe-expert 44.91 GiB shared 16.95 GiB lm-head 23.38 GiB router 1.29 GiB",
+      "info(forward):   gpu-moe barriers/request: router 30 gate-up 990 activation 990 down 990 finalizer 4680 other 930",
+      "info(forward):   prefill route pack: layers 30 slots 16800 avg_slots/layer 560.0 active_block_upper 5460 dense_dispatch_blocks 34560 active/dense 15.8%",
+      "info(forward):   prefill route pack occupancy: full 1356 tail 2044 singleton_tail 656 padding_slots 10400 util 61.8% tail_blocks 60.1% singleton_tail 32.1%",
+      "info(forward):   q8 hot #1: lm-head M=262144 K=2816 bytes=23.38 GiB calls=32",
+      "info(forward):   q8 hot #2: shared M=2112 K=2816 bytes=11.30 GiB calls=1920",
+    ].join("\n");
+    const state = makeState({
+      effortId: 11,
+      effortFile: "MULTI_HOUR_EFFORT_11_METAL_GEMMA_M4.md",
+      effortPlan: "# Effort 11\nGemma 4 26B-A4B MoE",
+      metricMode: "prefill",
+      bestTokPerSec: 383.6,
+      currentBest: { tokPerSec: 383.6, containsReference: true },
+      stalledCycles: 23,
+      lastProfileOutput: profile,
+      cycles: [
+        makeCycle({ cycle: 124, kept: true, containsReference: true, tokPerSec: 383.6, description: "Bench coverage for production route-pack Q4_K GeGLU" }),
+        makeCycle({ cycle: 141, kept: false, containsReference: true, tokPerSec: 363.3, description: "Added Gemma active-block MoE indirect Metal dispatch" }),
+        makeCycle({ cycle: 142, kept: false, containsReference: true, tokPerSec: 360.4, description: "Reworked active route-pack block mapping with tiled expert scans" }),
+        makeCycle({ cycle: 143, kept: false, containsReference: true, tokPerSec: 353.3, description: "Encoded active-block route counts into metadata and consumed them in kernels" }),
+        makeCycle({ cycle: 145, kept: false, containsReference: true, tokPerSec: 371.0, description: "Added default-off route-pack tail histogram evidence" }),
+        makeCycle({ cycle: 146, kept: false, containsReference: true, tokPerSec: 371.9, description: "Specialized Q4_K GeGLU input-row decode route / 8 -> route >> 3" }),
+      ],
+    });
+
+    const analysis = buildGemmaPrefillPostBreakthroughAnalysis(state).join("\n");
+    expect(analysis).toContain("POST-383 PLATEAU FACT");
+    expect(analysis).toContain("do not reattempt Q4_K/Q5_1 route-tail");
+    expect(analysis).toContain("Q8 LM-head/shared/attention");
+    expect(analysis).toContain("gpu-moe finalizer/barrier-count");
+
+    const pivot = buildStructuralPivotDirective(state).join("\n");
+    expect(pivot).toContain("post-383 route-pack/tail/metadata family is exhausted");
+    expect(pivot).toContain("public-suite validation");
+  });
+
+  test("Gemma metal-shapes route-token inference uses production prompt tokens", () => {
+    expect(inferGemmaRouteTokensForMetalShapes(
+      "info(forward):   prefill queued prefill: requests 1 prompt_tokens 70 chunks 12",
+    )).toBe(70);
+
+    expect(inferGemmaRouteTokensForMetalShapes(
+      "info(forward):   prefill route pack: layers 30 slots 16800 avg_slots/layer 560.0 active_block_upper 5460",
+    )).toBe(70);
+  });
+
   test("Gemma plateau rejects neutral optimization churn but allows evidence work", () => {
     const state = makeState({
       effortId: 11,
@@ -1703,6 +1754,20 @@ describe("plateau controls", () => {
     }));
     expect(families).toContain("simd_sum/reduction packing");
     expect(families).toContain("Q8/repacked shape retune");
+  });
+
+  test("classifies exhausted Gemma route-tail and metadata families", () => {
+    expect(classifyAttemptFamilies(makeCycle({
+      description: "Specialized Q4_K GeGLU input-row decode route / 8 -> route >> 3",
+    }))).toContain("Q4_K route-tail/GeGLU micro-variants");
+
+    expect(classifyAttemptFamilies(makeCycle({
+      description: "Added exact 7-route Q5_1 active-block MoE-down tail",
+    }))).toContain("Q5 down/tail variants");
+
+    expect(classifyAttemptFamilies(makeCycle({
+      description: "Added Gemma active-block MoE indirect Metal dispatch",
+    }))).toContain("active-block metadata/indirect dispatch");
   });
 
   test("family cooldown blocks repeated reverted variants without a kept win", () => {
