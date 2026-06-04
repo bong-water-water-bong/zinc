@@ -1451,6 +1451,12 @@ pub const InferenceEngine = struct {
     // GEMM only needs the per-32-block scale, no dsum bias-correction term.
     batched_scratch_norm_q8: ?Buffer = null,
     batched_scratch_norm_q8_scale: ?Buffer = null,
+    // Grouped top-1 MoE prefill scratch: route-pack counts, expert-major ids,
+    // active block list, and active block count.
+    batched_scratch_moe_counts: ?Buffer = null,
+    batched_scratch_moe_ids: ?Buffer = null,
+    batched_scratch_moe_active_blocks: ?Buffer = null,
+    batched_scratch_moe_active_count: ?Buffer = null,
     batched_scratch_capacity_tokens: u32 = 0,
     modeled_decode_bytes_per_token: u64 = 0,
     // Diagnostic summary stored during BOS processing, printed after generation
@@ -3348,6 +3354,14 @@ pub const InferenceEngine = struct {
         try growSlot(self.instance, &self.batched_scratch_up, up_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_swiglu, swiglu_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_down, hidden_bytes, storage_xfer);
+        if (cfg.architecture == .qwen2_moe and cfg.n_experts > 0 and cfg.n_experts_used > 0) {
+            const route_slots = n * @as(u64, cfg.n_experts_used);
+            const expert_major_ids = n * @as(u64, cfg.n_experts);
+            try growSlot(self.instance, &self.batched_scratch_moe_counts, @as(u64, cfg.n_experts) * @sizeOf(u32), storage_xfer);
+            try growSlot(self.instance, &self.batched_scratch_moe_ids, expert_major_ids * @sizeOf(u32), storage_xfer);
+            try growSlot(self.instance, &self.batched_scratch_moe_active_blocks, route_slots * @sizeOf(u32), storage_xfer);
+            try growSlot(self.instance, &self.batched_scratch_moe_active_count, @sizeOf(u32), storage_xfer);
+        }
         // int8 DP4a dense-FFN scratch: packed int8 acts = inter_dim/4 uints/token,
         // scales = inter_dim/32 f32/token. Only allocated when a dense-hybrid
         // prefill shape can use the path.
@@ -14998,6 +15012,250 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    fn prefillRunTop1MoePrefixGrouped(
+        self: *InferenceEngine,
+        state: *DecodeState,
+        base_token: u32,
+        n_tokens: u32,
+        hidden_size: vk.c.VkDeviceSize,
+        layer: u32,
+        scratch_hidden: Buffer,
+        scratch_norm: Buffer,
+        scratch_gate: Buffer,
+        scratch_up: Buffer,
+        scratch_swiglu: Buffer,
+        scratch_down: Buffer,
+        scratch_router_output: Buffer,
+        route_slot_bytes: vk.c.VkDeviceSize,
+        route_cache_active: bool,
+    ) !u32 {
+        if (!route_cache_active) return 0;
+        if (self.moe_prefill_tail_topk_limit != 1) return 0;
+        if (self.moe_prefill_tail_topk_guard_tokens >= n_tokens) return 0;
+        if (self.instance.push_descriptor_fn == null) return 0;
+        if (self.dmmv.pipeline_moe_route_pack == null) return 0;
+        if (self.dmmv.pipeline_q4k_moe_cols == null) return 0;
+
+        const cfg = self.model.config;
+        if (cfg.architecture != .qwen2_moe) return 0;
+        if (cfg.n_experts == 0 or cfg.n_experts > 65535) return 0;
+        if (cfg.n_experts_used == 0 or cfg.hidden_dim == 0 or cfg.intermediate_dim == 0) return 0;
+        if ((route_slot_bytes % @sizeOf(u32)) != 0) return 0;
+
+        const prefix_tokens = n_tokens - self.moe_prefill_tail_topk_guard_tokens;
+        if (prefix_tokens == 0) return 0;
+        const hidden_dim = cfg.hidden_dim;
+        const inter_dim = cfg.intermediate_dim;
+        const prefix_hidden_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        const prefix_inter_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, inter_dim) *
+            @sizeOf(f32);
+        if (scratch_hidden.size < prefix_hidden_bytes) return 0;
+        if (scratch_norm.size < prefix_hidden_bytes) return 0;
+        if (scratch_gate.size < prefix_inter_bytes) return 0;
+        if (scratch_up.size < prefix_inter_bytes) return 0;
+        if (scratch_swiglu.size < prefix_inter_bytes) return 0;
+        if (scratch_down.size < prefix_hidden_bytes) return 0;
+
+        const lt = self.layer_tensors[layer];
+        if (lt.ffn_gate_up_exps != null) return 0;
+        if (lt.pre_ffw_norm_2 != null or lt.post_ffw_norm != null or lt.post_ffw_norm_1 != null or lt.post_ffw_norm_2 != null) return 0;
+        if (lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) return 0;
+        if (lt.ffn_down_exps_scale != null) return 0;
+        const gate_exps = lt.ffn_gate_exps orelse return 0;
+        const up_exps = lt.ffn_up_exps orelse return 0;
+        const down_exps = lt.ffn_down_exps orelse return 0;
+        if (gate_exps.info.type_ != .q4_k or up_exps.info.type_ != .q4_k) return 0;
+        if (down_exps.info.type_ != .q5_k and down_exps.info.type_ != .q4_k) return 0;
+        if (down_exps.info.type_ == .q5_k and self.dmmv.pipeline_q5k_moe_cols == null) return 0;
+        if (down_exps.info.type_ == .q4_k and self.dmmv.pipeline_q4k_moe_cols == null) return 0;
+
+        const counts = self.batched_scratch_moe_counts orelse return 0;
+        const ids = self.batched_scratch_moe_ids orelse return 0;
+        const active_blocks = self.batched_scratch_moe_active_blocks orelse return 0;
+        const active_count = self.batched_scratch_moe_active_count orelse return 0;
+        const ids_stride = prefix_tokens;
+        const max_route_blocks = prefix_tokens;
+        const counts_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, cfg.n_experts) * @sizeOf(u32);
+        const ids_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, ids_stride) * @as(vk.c.VkDeviceSize, cfg.n_experts) * @sizeOf(u32);
+        const active_blocks_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, max_route_blocks) * @sizeOf(u32);
+        if (counts.size < counts_bytes) return 0;
+        if (ids.size < ids_bytes) return 0;
+        if (active_blocks.size < active_blocks_bytes) return 0;
+        if (active_count.size < @sizeOf(u32)) return 0;
+
+        const route_stride_u32: u32 = @intCast(route_slot_bytes / @sizeOf(u32));
+        const gate_stride = expertSliceBytes(gate_exps.info.type_, inter_dim, hidden_dim);
+        const up_stride = expertSliceBytes(up_exps.info.type_, inter_dim, hidden_dim);
+        const down_stride = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+        if (gate_stride != up_stride) return 0;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.resetTimestamps();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        self.decode_cmd.computeBarrier();
+
+        const moe_phase = self.beginProfilePhase();
+
+        try self.dmmv.recordMoeRoutePack(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            scratch_router_output.handle,
+            scratch_router_output.size,
+            counts.handle,
+            counts_bytes,
+            ids.handle,
+            ids_bytes,
+            active_count.handle,
+            @sizeOf(u32),
+            active_blocks.handle,
+            active_blocks_bytes,
+            prefix_tokens,
+            cfg.n_experts,
+            1,
+            route_stride_u32,
+            ids_stride,
+        );
+        const route_pack_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = counts.handle, .size = counts_bytes },
+            .{ .buffer = ids.handle, .size = ids_bytes },
+            .{ .buffer = active_blocks.handle, .size = active_blocks_bytes },
+        };
+        self.decode_cmd.computeBuffersBarrier(&route_pack_ranges);
+
+        const gate_up_phase = self.beginProfilePhase();
+        try self.dmmv.recordMoeColsDispatch(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            .q4_k,
+            gate_exps.gpu_buffer.handle,
+            gate_exps.gpu_buffer.size,
+            scratch_norm.handle,
+            scratch_norm.size,
+            scratch_gate.handle,
+            prefix_inter_bytes,
+            counts.handle,
+            counts_bytes,
+            ids.handle,
+            ids_bytes,
+            active_blocks.handle,
+            active_blocks_bytes,
+            inter_dim,
+            hidden_dim,
+            gate_stride,
+            max_route_blocks,
+            ids_stride,
+            1,
+            0,
+            0,
+            0,
+        );
+        try self.dmmv.recordMoeColsDispatch(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            .q4_k,
+            up_exps.gpu_buffer.handle,
+            up_exps.gpu_buffer.size,
+            scratch_norm.handle,
+            scratch_norm.size,
+            scratch_up.handle,
+            prefix_inter_bytes,
+            counts.handle,
+            counts_bytes,
+            ids.handle,
+            ids_bytes,
+            active_blocks.handle,
+            active_blocks_bytes,
+            inter_dim,
+            hidden_dim,
+            up_stride,
+            max_route_blocks,
+            ids_stride,
+            1,
+            0,
+            0,
+            0,
+        );
+        self.endProfilePhase(.moe_gate_up, gate_up_phase);
+
+        const gate_up_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = scratch_gate.handle, .size = prefix_inter_bytes },
+            .{ .buffer = scratch_up.handle, .size = prefix_inter_bytes },
+        };
+        self.decode_cmd.computeBuffersBarrier(&gate_up_ranges);
+        const swiglu_phase = self.beginProfilePhase();
+        try self.dispatchFfnActivation(
+            scratch_gate.handle,
+            scratch_gate.size,
+            scratch_up.handle,
+            scratch_up.size,
+            scratch_swiglu.handle,
+            scratch_swiglu.size,
+            prefix_tokens * inter_dim,
+        );
+        self.endProfilePhase(.moe_swiglu, swiglu_phase);
+
+        self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, prefix_inter_bytes);
+        const down_phase = self.beginProfilePhase();
+        try self.dmmv.recordMoeColsDispatch(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            down_exps.info.type_,
+            down_exps.gpu_buffer.handle,
+            down_exps.gpu_buffer.size,
+            scratch_swiglu.handle,
+            scratch_swiglu.size,
+            scratch_down.handle,
+            prefix_hidden_bytes,
+            counts.handle,
+            counts_bytes,
+            ids.handle,
+            ids_bytes,
+            active_blocks.handle,
+            active_blocks_bytes,
+            hidden_dim,
+            inter_dim,
+            down_stride,
+            max_route_blocks,
+            ids_stride,
+            1,
+            0,
+            0,
+            0,
+        );
+        self.endProfilePhase(.moe_down, down_phase);
+
+        self.decode_cmd.computeBufferBarrier(scratch_down.handle, prefix_hidden_bytes);
+        const acc_phase = self.beginProfilePhase();
+        try self.dispatchScaleAcc(
+            scratch_hidden.handle,
+            scratch_hidden.size,
+            scratch_down.handle,
+            scratch_down.size,
+            prefix_tokens * hidden_dim,
+            1.0,
+        );
+        self.endProfilePhase(.moe_weighted_acc, acc_phase);
+        self.endProfilePhase(.moe_routed, moe_phase);
+
+        self.decode_cmd.computeToTransferBarrier();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        self.recordProfilingSample();
+
+        self.prefill_current_token_idx = prefix_tokens - 1;
+        state.position = base_token + prefix_tokens - 1;
+        _ = hidden_size;
+        return prefix_tokens;
+    }
+
     fn prefillRunLayerFromFfnNorm(
         self: *InferenceEngine,
         state: *DecodeState,
@@ -15010,6 +15268,9 @@ pub const InferenceEngine = struct {
         scratch_norm: Buffer,
         scratch_router_logits: Buffer,
         scratch_router_output: Buffer,
+        scratch_expert_up: Buffer,
+        scratch_swiglu: Buffer,
+        scratch_down: Buffer,
         pipeline_enabled: bool,
     ) !void {
         if (n_tokens == 0) return;
@@ -15064,9 +15325,26 @@ pub const InferenceEngine = struct {
             route_slot_bytes,
         );
 
+        const grouped_prefix_tokens = try self.prefillRunTop1MoePrefixGrouped(
+            state,
+            base_token,
+            n_tokens,
+            hidden_size,
+            layer,
+            scratch_hidden,
+            scratch_norm,
+            scratch_router_logits,
+            scratch_expert_up,
+            scratch_swiglu,
+            scratch_down,
+            scratch_router_output,
+            route_slot_bytes,
+            route_cache_active,
+        );
+
         var primary_pending: bool = false;
         var alt_pending: bool = false;
-        var tok_idx: u32 = 0;
+        var tok_idx: u32 = grouped_prefix_tokens;
         while (tok_idx < n_tokens) : (tok_idx += 1) {
             const pipeline_this = pipeline_enabled;
             if (pipeline_this) {
@@ -17355,6 +17633,9 @@ pub const InferenceEngine = struct {
                 scratch_norm,
                 scratch_gate,
                 scratch_up,
+                self.batched_scratch_attn_out.?,
+                scratch_swiglu,
+                scratch_down,
                 pipeline_tail,
             );
         }
@@ -19634,6 +19915,10 @@ pub const InferenceEngine = struct {
         if (self.batched_scratch_hidden_scale_dsum) |*b| b.deinit();
         if (self.batched_scratch_norm_q8) |*b| b.deinit();
         if (self.batched_scratch_norm_q8_scale) |*b| b.deinit();
+        if (self.batched_scratch_moe_counts) |*b| b.deinit();
+        if (self.batched_scratch_moe_ids) |*b| b.deinit();
+        if (self.batched_scratch_moe_active_blocks) |*b| b.deinit();
+        if (self.batched_scratch_moe_active_count) |*b| b.deinit();
         self.cmd_pool.deinit();
         self.* = undefined;
     }

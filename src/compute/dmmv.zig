@@ -61,6 +61,18 @@ pub const MoeBatchedDmmvPushConstants = extern struct {
     y_token_stride: u32,
 };
 
+/// Push constants for grouped route-column MoE DMMV shaders.
+pub const MoeColsDmmvPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    expert_stride: u32,
+    x_offset: u32,
+    y_offset: u32,
+    ids_stride: u32,
+    x_route_divisor: u32,
+};
+
 /// Push constants for the fused MoE down + weighted_acc shader
 /// (src/shaders/dmmv_q4k_moe_fused_down_acc.comp). Same layout as
 /// MoeDmmvPushConstants plus n_used (the expert loop is internal to
@@ -181,6 +193,14 @@ pub const CountExpertsPush = extern struct {
     nb00: u32,
     nb01: u32,
     a_offset: u32,
+};
+
+pub const MoeRoutePackPush = extern struct {
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    ids_stride: u32,
 };
 
 /// Push constants for `mul_mm_q4k.comp` (effort-6 Step 1 of 5 foundation:
@@ -325,6 +345,8 @@ pub const DmmvDispatch = struct {
     pipeline_q4k_moe: ?Pipeline,
     /// Experimental K-parallel Q4K MoE pipeline (same 4 bindings, wave64 subgroupAdd).
     pipeline_q4k_moe_kpar: ?Pipeline,
+    /// Grouped top-1 prefill Q4_K MoE DMMV over route-packed token columns.
+    pipeline_q4k_moe_cols: ?Pipeline,
     /// Fused gate+up Q4_K MoE pipeline (6 bindings: W_gate, W_up, X, Y_gate,
     /// Y_up, routing). Halves the dispatch count for the MoE gate+up phase
     /// and reads the shared input once per block.
@@ -408,6 +430,8 @@ pub const DmmvDispatch = struct {
     pipeline_q5k_moe: ?Pipeline,
     /// Experimental K-parallel Q5K MoE pipeline (same 4 bindings, wave64 subgroupAdd).
     pipeline_q5k_moe_kpar: ?Pipeline,
+    /// Grouped top-1 prefill Q5_K MoE DMMV over route-packed token columns.
+    pipeline_q5k_moe_cols: ?Pipeline,
     /// MoE MXFP4 pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_mxfp4_moe: ?Pipeline,
     /// MoE Q5_1 pipeline (4 bindings: A, x, y, routing), or null.
@@ -442,6 +466,8 @@ pub const DmmvDispatch = struct {
     /// callers until the tiled GEMM (Steps 1+2) lands. 2 bindings (A routing
     /// in, D counts out), push = CountExpertsPush.
     pipeline_count_experts: ?Pipeline,
+    /// Packs a token-major route cache into expert-major active blocks.
+    pipeline_moe_route_pack: ?Pipeline,
     /// Effort-6 Step 1 of 5 foundation: tiled Q4_K dense GEMM. First port
     /// of llama.cpp's mul_mm.comp #ifndef COOPMAT branch adapted to ZINC's
     /// wave64 / Q4_K conventions. WG produces a 32×16 output tile with 64
@@ -742,6 +768,16 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
 
+        const moe_cols_push_size = @sizeOf(MoeColsDmmvPushConstants);
+        const q4k_moe_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_moe_cols = pipeline_mod.createFromSpirvWithOptions(instance, q4k_moe_cols_path, 6, moe_cols_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K grouped MoE cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_q4k_moe_cols != null) {
+            log.info("dmmv_q4k_moe_cols pipeline loaded (grouped top-1 MoE prefill)", .{});
+        }
+
         // Cross-token batched MoE Q4_K DMMV. Same 4-binding shape as kpar
         // (A, X, Y, routing) but with the larger MoeBatchedDmmvPushConstants
         // struct that adds n_experts_used / x_token_stride / y_token_stride.
@@ -896,6 +932,15 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
 
+        const q5k_moe_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_moe_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5k_moe_cols = pipeline_mod.createFromSpirvWithOptions(instance, q5k_moe_cols_path, 6, moe_cols_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_K grouped MoE cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_q5k_moe_cols != null) {
+            log.info("dmmv_q5k_moe_cols pipeline loaded (grouped top-1 MoE prefill)", .{});
+        }
+
         const mxfp4_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_mxfp4_moe.spv", .{shader_dir}) catch unreachable;
         const pipeline_mxfp4_moe = pipeline_mod.createFromSpirvWithOptions(instance, mxfp4_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
             log.warn("MXFP4 MoE shader not loaded: {s}", .{@errorName(err)});
@@ -941,6 +986,16 @@ pub const DmmvDispatch = struct {
         };
         if (pipeline_count_experts != null) {
             log.info("count_experts pipeline loaded (MUL_MAT_ID GEMM foundation; not yet wired)", .{});
+        }
+
+        const moe_route_pack_push_size = @sizeOf(MoeRoutePackPush);
+        const moe_route_pack_path = std.fmt.bufPrint(&path_buf, "{s}/moe_route_pack.spv", .{shader_dir}) catch unreachable;
+        const pipeline_moe_route_pack = pipeline_mod.createFromSpirvWithOptions(instance, moe_route_pack_path, 5, moe_route_pack_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("moe_route_pack shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_moe_route_pack != null) {
+            log.info("moe_route_pack pipeline loaded (grouped top-1 MoE prefill route blocks)", .{});
         }
 
         // Effort-6 Step 1 of 5: tiled Q4_K dense GEMM foundation. Single
@@ -1177,6 +1232,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q6k_batch_kpar = pipeline_q6k_batch_kpar,
             .pipeline_q4k_moe = pipeline_q4k_moe,
             .pipeline_q4k_moe_kpar = pipeline_q4k_moe_kpar,
+            .pipeline_q4k_moe_cols = pipeline_q4k_moe_cols,
             .pipeline_q4k_moe_batched = pipeline_q4k_moe_batched,
             .pipeline_q4k_fused_gate_up_moe = pipeline_q4k_fused_gate_up_moe,
             .pipeline_q4k_fused_gate_up_moe_spec8 = pipeline_q4k_fused_gate_up_moe_spec8,
@@ -1200,9 +1256,11 @@ pub const DmmvDispatch = struct {
             .pipeline_q8_0_moe_fused_down_acc_scaled = pipeline_q8_0_moe_fused_down_acc_scaled,
             .pipeline_q5k_moe = pipeline_q5k_moe,
             .pipeline_q5k_moe_kpar = pipeline_q5k_moe_kpar,
+            .pipeline_q5k_moe_cols = pipeline_q5k_moe_cols,
             .pipeline_q6k_moe = pipeline_q6k_moe,
             .pipeline_quantize_q8_1 = pipeline_quantize_q8_1,
             .pipeline_count_experts = pipeline_count_experts,
+            .pipeline_moe_route_pack = pipeline_moe_route_pack,
             .pipeline_mul_mm_q4k = pipeline_mul_mm_q4k,
             .pipeline_mul_mm_q4k_gate_up_swiglu = pipeline_mul_mm_q4k_gate_up_swiglu,
             .pipeline_mul_mm_q4k_gate_up_swiglu_full = pipeline_mul_mm_q4k_gate_up_swiglu_full,
@@ -1348,6 +1406,116 @@ pub const DmmvDispatch = struct {
             wg_x,
             n_experts_used,
             n_tokens,
+        );
+    }
+
+    pub fn recordMoeRoutePack(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        routing_buf: vk.c.VkBuffer,
+        routing_size: vk.c.VkDeviceSize,
+        counts_buf: vk.c.VkBuffer,
+        counts_size: vk.c.VkDeviceSize,
+        ids_buf: vk.c.VkBuffer,
+        ids_size: vk.c.VkDeviceSize,
+        active_count_buf: vk.c.VkBuffer,
+        active_count_size: vk.c.VkDeviceSize,
+        active_blocks_buf: vk.c.VkBuffer,
+        active_blocks_size: vk.c.VkDeviceSize,
+        n_tokens: u32,
+        n_experts: u32,
+        k: u32,
+        routing_stride: u32,
+        ids_stride: u32,
+    ) !void {
+        const pip = if (self.pipeline_moe_route_pack) |*p| p else return error.PipelineNotLoaded;
+        if (n_tokens == 0 or n_experts == 0 or k == 0 or ids_stride == 0) return error.InvalidArgument;
+        const push = MoeRoutePackPush{
+            .n_tokens = n_tokens,
+            .n_experts = n_experts,
+            .k = k,
+            .routing_stride = routing_stride,
+            .ids_stride = ids_stride,
+        };
+        const infos = [5]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = routing_buf, .offset = 0, .range = routing_size },
+            .{ .buffer = counts_buf, .offset = 0, .range = counts_size },
+            .{ .buffer = ids_buf, .offset = 0, .range = ids_size },
+            .{ .buffer = active_count_buf, .offset = 0, .range = active_count_size },
+            .{ .buffer = active_blocks_buf, .offset = 0, .range = active_blocks_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            1,
+            1,
+            1,
+        );
+    }
+
+    pub fn recordMoeColsDispatch(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        quant_type: GGMLType,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        x_buf: vk.c.VkBuffer,
+        x_size: vk.c.VkDeviceSize,
+        y_buf: vk.c.VkBuffer,
+        y_size: vk.c.VkDeviceSize,
+        counts_buf: vk.c.VkBuffer,
+        counts_size: vk.c.VkDeviceSize,
+        ids_buf: vk.c.VkBuffer,
+        ids_size: vk.c.VkDeviceSize,
+        active_blocks_buf: vk.c.VkBuffer,
+        active_blocks_size: vk.c.VkDeviceSize,
+        M: u32,
+        K: u32,
+        expert_stride: u32,
+        active_block_count: u32,
+        ids_stride: u32,
+        x_route_divisor: u32,
+        a_offset: u32,
+        x_offset: u32,
+        y_offset: u32,
+    ) !void {
+        const pip = switch (quant_type) {
+            .q4_k => if (self.pipeline_q4k_moe_cols) |*p| p else return error.UnsupportedQuantType,
+            .q5_k => if (self.pipeline_q5k_moe_cols) |*p| p else return error.UnsupportedQuantType,
+            else => return error.UnsupportedQuantType,
+        };
+        if (M == 0 or K == 0 or active_block_count == 0 or ids_stride == 0) return error.InvalidArgument;
+        if ((K & 255) != 0) return error.InvalidArgument;
+        const push = MoeColsDmmvPushConstants{
+            .M = M,
+            .K = K,
+            .a_offset = a_offset,
+            .expert_stride = expert_stride,
+            .x_offset = x_offset,
+            .y_offset = y_offset,
+            .ids_stride = ids_stride,
+            .x_route_divisor = @max(x_route_divisor, 1),
+        };
+        const infos = [6]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = x_buf, .offset = 0, .range = x_size },
+            .{ .buffer = y_buf, .offset = 0, .range = y_size },
+            .{ .buffer = counts_buf, .offset = 0, .range = counts_size },
+            .{ .buffer = ids_buf, .offset = 0, .range = ids_size },
+            .{ .buffer = active_blocks_buf, .offset = 0, .range = active_blocks_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            (M + 3) / 4,
+            active_block_count,
+            1,
         );
     }
 
@@ -2500,6 +2668,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q6k_batch_kpar) |*p| p.deinit();
         if (self.pipeline_q4k_moe) |*p| p.deinit();
         if (self.pipeline_q4k_moe_kpar) |*p| p.deinit();
+        if (self.pipeline_q4k_moe_cols) |*p| p.deinit();
         if (self.pipeline_q4k_moe_batched) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_moe) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_moe_spec8) |*p| p.deinit();
@@ -2517,6 +2686,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5k_moe_fused_down_acc) |*p| p.deinit();
         if (self.pipeline_q5k_moe) |*p| p.deinit();
         if (self.pipeline_q5k_moe_kpar) |*p| p.deinit();
+        if (self.pipeline_q5k_moe_cols) |*p| p.deinit();
         if (self.pipeline_q5_1_acc) |*p| p.deinit();
         if (self.pipeline_q5_1_moe_fused_down_acc) |*p| p.deinit();
         if (self.pipeline_q5_1_moe_fused_down_acc_scaled) |*p| p.deinit();
@@ -2524,6 +2694,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q6k_moe) |*p| p.deinit();
         if (self.pipeline_quantize_q8_1) |*p| p.deinit();
         if (self.pipeline_count_experts) |*p| p.deinit();
+        if (self.pipeline_moe_route_pack) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full) |*p| p.deinit();
