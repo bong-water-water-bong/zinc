@@ -1374,6 +1374,7 @@ const ScalarDecodeState = struct {
     direct_ssm_beta_q8_row_range_failed_mask: u128 = 0,
     direct_ssm_beta_q8_row_range_successes: u32 = 0,
     direct_ssm_beta_q8_row_range_slice_successes: u32 = 0,
+    direct_moe_gate_up_row_range_done: bool = false,
     pool: ?*std.Thread.Pool = null,
     fast_pool: ?*zinc_rt.fast_pool.FastPool = null,
 
@@ -4676,6 +4677,7 @@ fn runMoeLayer(
         down_type,
         effective_down_stride,
         shared_params,
+        direct_compute_tracking,
     );
 
     if (ran_parallel) {
@@ -4938,6 +4940,8 @@ const MoeExpertWorker = struct {
     down: []f32,
     // Gemma 4 experts run with gelu(gate) * up instead of silu(gate) * up.
     use_gelu: bool = false,
+    expert_id: u32 = 0,
+    is_shared: bool = false,
     failed: bool = false,
 };
 
@@ -4954,6 +4958,8 @@ const MoeSharedParams = struct {
     scale: f32,
 };
 
+const direct_moe_gate_up_q4_0_tolerance: f32 = 0.05;
+
 fn runMoeExpertsParallel(
     state: *ScalarDecodeState,
     cfg: CpuModelConfig,
@@ -4968,6 +4974,7 @@ fn runMoeExpertsParallel(
     down_type: gguf.GGMLType,
     down_stride: u32,
     shared: ?MoeSharedParams,
+    direct_compute_tracking: ?DirectComputeTracking,
 ) bool {
     const worker_count = state.moe_expert_workers;
     if (worker_count != n_used) return false;
@@ -5011,6 +5018,7 @@ fn runMoeExpertsParallel(
             .swiglu_out = slotSlice(state.moe_worker_swiglu, i, inter_stride, inter_len),
             .down = slotSlice(state.moe_worker_down, i, down_stride_f32, down_stride_f32),
             .use_gelu = cfg.is_gemma,
+            .expert_id = eid,
         };
     }
     if (shared) |sp| {
@@ -5031,10 +5039,11 @@ fn runMoeExpertsParallel(
             .swiglu_out = slotSlice(state.moe_worker_swiglu, i, inter_stride, shared_inter),
             .down = slotSlice(state.moe_worker_down, i, down_stride_f32, down_stride_f32),
             .use_gelu = cfg.is_gemma,
+            .is_shared = true,
         };
     }
 
-    const ran_phased = state.decode_phase and runMoeExpertsParallelPhased(state, params[0..task_count]);
+    const ran_phased = state.decode_phase and runMoeExpertsParallelPhased(state, params[0..task_count], direct_compute_tracking);
     if (!ran_phased and state.pool != null) {
         const pool = state.pool.?;
         var wg: std.Thread.WaitGroup = .{};
@@ -5087,6 +5096,77 @@ fn runMoeExpertsParallel(
         }
     }
     return true;
+}
+
+fn consumeDirectMoeGateUpQ4_0Rows(
+    state: *ScalarDecodeState,
+    maybe_tracking: ?DirectComputeTracking,
+    param: *MoeExpertWorker,
+    expert_slot: usize,
+) void {
+    const tracking = maybe_tracking orelse return;
+    if (tracking.phase != .decode) return;
+    if (state.direct_moe_gate_up_row_range_done) return;
+    if (param.is_shared) return;
+    if (param.gate_type != .q4_0 or param.up_type != .q4_0) return;
+    if (param.intermediate_dim == 0 or param.gate.len == 0 or param.up.len == 0) return;
+
+    const cols: u32 = @intCast(param.ffn_norm.len);
+    if (cols == 0 or cols % 32 != 0) return;
+    if (param.ffn_norm.len < cols or state.row_scratch.len < 2) return;
+
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    if (row_bytes == 0 or param.gate_raw.len < row_bytes or param.up_raw.len < row_bytes) return;
+
+    const gpu_rows = state.row_scratch[0..2];
+    tracking.boundary.dmmvQ4_0TwoRows(
+        param.ffn_norm,
+        param.gate_raw[0..row_bytes],
+        param.up_raw[0..row_bytes],
+        cols,
+        gpu_rows,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct MoE expert gate/up Q4_0 rows unavailable ({s}); expert activations remain host-computed", .{@errorName(err)});
+        return;
+    };
+
+    const gpu_gate = gpu_rows[0];
+    const gpu_up = gpu_rows[1];
+    if (!std.math.isFinite(gpu_gate) or !std.math.isFinite(gpu_up)) {
+        log.warn("M1 AMDGPU CS direct MoE expert gate/up Q4_0 rows produced non-finite values; expert activations remain host-computed", .{});
+        return;
+    }
+
+    const gate_delta = @abs(gpu_gate - param.gate[0]);
+    const up_delta = @abs(gpu_up - param.up[0]);
+    if (gate_delta > direct_moe_gate_up_q4_0_tolerance or up_delta > direct_moe_gate_up_q4_0_tolerance) {
+        log.warn("M1 AMDGPU CS direct MoE expert gate/up Q4_0 rows mismatch: expert_slot={d} expert_id={d} gate_delta={d:.6} up_delta={d:.6}; expert activations remain host-computed", .{
+            expert_slot,
+            param.expert_id,
+            gate_delta,
+            up_delta,
+        });
+        return;
+    }
+
+    param.gate[0] = gpu_gate;
+    param.up[0] = gpu_up;
+    state.direct_moe_gate_up_row_range_done = true;
+    tracking.ops.* += 2;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += 2;
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_expert_gate_up_q4_0_rows phase=decode expert_slot={d} expert_id={d} rows=2 cols={d} gate_gpu={d:.6} up_gpu={d:.6} gate_abs_delta={d:.6} up_abs_delta={d:.6} consumed_gpu_model_value=1", .{
+        tracking.ops.*,
+        expert_slot,
+        param.expert_id,
+        cols,
+        gpu_gate,
+        gpu_up,
+        gate_delta,
+        up_delta,
+    });
 }
 
 fn moeExpertWorkerCount(n_used: u32, cpu_count: usize) usize {
@@ -5154,7 +5234,7 @@ fn runSharedExpertOnly(state: *ScalarDecodeState, cfg: CpuModelConfig, sp: MoeSh
     for (state.hidden, state.down) |*h, v| h.* += sp.scale * v;
 }
 
-fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWorker) bool {
+fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWorker, direct_compute_tracking: ?DirectComputeTracking) bool {
     const pool = state.pool orelse return false;
     if (params.len < 2 or params.len > moe_expert_parallel_max_workers) return false;
 
@@ -5180,6 +5260,7 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
         break :sums null;
     };
     matvecFused(pool, gate_up[0 .. params.len * 2], ffn_norm, input_sum32) catch return false;
+    consumeDirectMoeGateUpQ4_0Rows(state, direct_compute_tracking, &params[0], 0);
 
     var down: [moe_expert_parallel_max_workers]MultiInputFusedSegment = undefined;
     for (params, 0..) |*param, i| {
