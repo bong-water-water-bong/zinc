@@ -201,6 +201,8 @@ pub const MoeRoutePackPush = extern struct {
     k: u32,
     routing_stride: u32,
     ids_stride: u32,
+    gate_up_workgroups_x: u32,
+    down_workgroups_x: u32,
 };
 
 /// Push constants for `mul_mm_q4k.comp` (effort-6 Step 1 of 5 foundation:
@@ -990,7 +992,7 @@ pub const DmmvDispatch = struct {
 
         const moe_route_pack_push_size = @sizeOf(MoeRoutePackPush);
         const moe_route_pack_path = std.fmt.bufPrint(&path_buf, "{s}/moe_route_pack.spv", .{shader_dir}) catch unreachable;
-        const pipeline_moe_route_pack = pipeline_mod.createFromSpirvWithOptions(instance, moe_route_pack_path, 5, moe_route_pack_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_moe_route_pack = pipeline_mod.createFromSpirvWithOptions(instance, moe_route_pack_path, 6, moe_route_pack_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
             log.warn("moe_route_pack shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -1423,27 +1425,35 @@ pub const DmmvDispatch = struct {
         active_count_size: vk.c.VkDeviceSize,
         active_blocks_buf: vk.c.VkBuffer,
         active_blocks_size: vk.c.VkDeviceSize,
+        dispatch_args_buf: vk.c.VkBuffer,
+        dispatch_args_size: vk.c.VkDeviceSize,
         n_tokens: u32,
         n_experts: u32,
         k: u32,
         routing_stride: u32,
         ids_stride: u32,
+        gate_up_workgroups_x: u32,
+        down_workgroups_x: u32,
     ) !void {
         const pip = if (self.pipeline_moe_route_pack) |*p| p else return error.PipelineNotLoaded;
         if (n_tokens == 0 or n_experts == 0 or k == 0 or ids_stride == 0) return error.InvalidArgument;
+        if (gate_up_workgroups_x == 0 or down_workgroups_x == 0) return error.InvalidArgument;
         const push = MoeRoutePackPush{
             .n_tokens = n_tokens,
             .n_experts = n_experts,
             .k = k,
             .routing_stride = routing_stride,
             .ids_stride = ids_stride,
+            .gate_up_workgroups_x = gate_up_workgroups_x,
+            .down_workgroups_x = down_workgroups_x,
         };
-        const infos = [5]vk.c.VkDescriptorBufferInfo{
+        const infos = [6]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = routing_buf, .offset = 0, .range = routing_size },
             .{ .buffer = counts_buf, .offset = 0, .range = counts_size },
             .{ .buffer = ids_buf, .offset = 0, .range = ids_size },
             .{ .buffer = active_count_buf, .offset = 0, .range = active_count_size },
             .{ .buffer = active_blocks_buf, .offset = 0, .range = active_blocks_size },
+            .{ .buffer = dispatch_args_buf, .offset = 0, .range = dispatch_args_size },
         };
         cmd.pushDescAndDispatch(
             pip,
@@ -1453,6 +1463,69 @@ pub const DmmvDispatch = struct {
             1,
             1,
             1,
+        );
+    }
+
+    pub fn recordMoeColsDispatchIndirect(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        quant_type: GGMLType,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        x_buf: vk.c.VkBuffer,
+        x_size: vk.c.VkDeviceSize,
+        y_buf: vk.c.VkBuffer,
+        y_size: vk.c.VkDeviceSize,
+        counts_buf: vk.c.VkBuffer,
+        counts_size: vk.c.VkDeviceSize,
+        ids_buf: vk.c.VkBuffer,
+        ids_size: vk.c.VkDeviceSize,
+        active_blocks_buf: vk.c.VkBuffer,
+        active_blocks_size: vk.c.VkDeviceSize,
+        indirect_buf: vk.c.VkBuffer,
+        indirect_offset: vk.c.VkDeviceSize,
+        M: u32,
+        K: u32,
+        expert_stride: u32,
+        ids_stride: u32,
+        x_route_divisor: u32,
+        a_offset: u32,
+        x_offset: u32,
+        y_offset: u32,
+    ) !void {
+        const pip = switch (quant_type) {
+            .q4_k => if (self.pipeline_q4k_moe_cols) |*p| p else return error.UnsupportedQuantType,
+            .q5_k => if (self.pipeline_q5k_moe_cols) |*p| p else return error.UnsupportedQuantType,
+            else => return error.UnsupportedQuantType,
+        };
+        if (M == 0 or K == 0 or ids_stride == 0) return error.InvalidArgument;
+        if ((K & 255) != 0) return error.InvalidArgument;
+        const push = MoeColsDmmvPushConstants{
+            .M = M,
+            .K = K,
+            .a_offset = a_offset,
+            .expert_stride = expert_stride,
+            .x_offset = x_offset,
+            .y_offset = y_offset,
+            .ids_stride = ids_stride,
+            .x_route_divisor = @max(x_route_divisor, 1),
+        };
+        const infos = [6]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = x_buf, .offset = 0, .range = x_size },
+            .{ .buffer = y_buf, .offset = 0, .range = y_size },
+            .{ .buffer = counts_buf, .offset = 0, .range = counts_size },
+            .{ .buffer = ids_buf, .offset = 0, .range = ids_size },
+            .{ .buffer = active_blocks_buf, .offset = 0, .range = active_blocks_size },
+        };
+        cmd.pushDescAndDispatchIndirect(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            indirect_buf,
+            indirect_offset,
         );
     }
 

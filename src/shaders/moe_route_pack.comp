@@ -17,6 +17,8 @@ layout(push_constant) uniform PushConstants {
     uint k;
     uint routing_stride;
     uint ids_stride;
+    uint gate_up_workgroups_x;
+    uint down_workgroups_x;
 } pc;
 
 layout(set = 0, binding = 0) readonly buffer Routing {
@@ -37,6 +39,10 @@ layout(set = 0, binding = 3) buffer ActiveBlockCount {
 
 layout(set = 0, binding = 4) buffer ActiveBlocks {
     uint active_blocks[];
+};
+
+layout(set = 0, binding = 5) buffer DispatchArgs {
+    uint dispatch_args[];
 };
 
 const uint NUM_COLS = 8u;
@@ -85,6 +91,12 @@ void main() {
 
     if (tid == 0u) {
         const uint used_blocks = active_block_count[0];
+        dispatch_args[0] = pc.gate_up_workgroups_x;
+        dispatch_args[1] = used_blocks;
+        dispatch_args[2] = 1u;
+        dispatch_args[3] = pc.down_workgroups_x;
+        dispatch_args[4] = used_blocks;
+        dispatch_args[5] = 1u;
         const uint max_blocks = total_routes;
         for (uint i = used_blocks; i < max_blocks; i++) {
             active_blocks[i] = 0xFFFFFFFFu;

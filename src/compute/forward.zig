@@ -1457,6 +1457,7 @@ pub const InferenceEngine = struct {
     batched_scratch_moe_ids: ?Buffer = null,
     batched_scratch_moe_active_blocks: ?Buffer = null,
     batched_scratch_moe_active_count: ?Buffer = null,
+    batched_scratch_moe_dispatch_args: ?Buffer = null,
     batched_scratch_capacity_tokens: u32 = 0,
     modeled_decode_bytes_per_token: u64 = 0,
     // Diagnostic summary stored during BOS processing, printed after generation
@@ -3357,10 +3358,12 @@ pub const InferenceEngine = struct {
         if (cfg.architecture == .qwen2_moe and cfg.n_experts > 0 and cfg.n_experts_used > 0) {
             const route_slots = n * @as(u64, cfg.n_experts_used);
             const expert_major_ids = n * @as(u64, cfg.n_experts);
+            const indirect_storage_xfer = storage_xfer | vk.c.VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
             try growSlot(self.instance, &self.batched_scratch_moe_counts, @as(u64, cfg.n_experts) * @sizeOf(u32), storage_xfer);
             try growSlot(self.instance, &self.batched_scratch_moe_ids, expert_major_ids * @sizeOf(u32), storage_xfer);
             try growSlot(self.instance, &self.batched_scratch_moe_active_blocks, route_slots * @sizeOf(u32), storage_xfer);
             try growSlot(self.instance, &self.batched_scratch_moe_active_count, @sizeOf(u32), storage_xfer);
+            try growSlot(self.instance, &self.batched_scratch_moe_dispatch_args, 6 * @sizeOf(u32), indirect_storage_xfer);
         }
         // int8 DP4a dense-FFN scratch: packed int8 acts = inter_dim/4 uints/token,
         // scales = inter_dim/32 f32/token. Only allocated when a dense-hybrid
@@ -15038,7 +15041,7 @@ pub const InferenceEngine = struct {
 
         const cfg = self.model.config;
         if (cfg.architecture != .qwen2_moe) return 0;
-        if (cfg.n_experts == 0 or cfg.n_experts > 65535) return 0;
+        if (cfg.n_experts == 0 or cfg.n_experts > 256) return 0;
         if (cfg.n_experts_used == 0 or cfg.hidden_dim == 0 or cfg.intermediate_dim == 0) return 0;
         if ((route_slot_bytes % @sizeOf(u32)) != 0) return 0;
 
@@ -15078,15 +15081,18 @@ pub const InferenceEngine = struct {
         const ids = self.batched_scratch_moe_ids orelse return 0;
         const active_blocks = self.batched_scratch_moe_active_blocks orelse return 0;
         const active_count = self.batched_scratch_moe_active_count orelse return 0;
+        const dispatch_args = self.batched_scratch_moe_dispatch_args orelse return 0;
         const ids_stride = prefix_tokens;
         const max_route_blocks = prefix_tokens;
         const counts_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, cfg.n_experts) * @sizeOf(u32);
         const ids_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, ids_stride) * @as(vk.c.VkDeviceSize, cfg.n_experts) * @sizeOf(u32);
         const active_blocks_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, max_route_blocks) * @sizeOf(u32);
+        const dispatch_args_bytes: vk.c.VkDeviceSize = 6 * @sizeOf(u32);
         if (counts.size < counts_bytes) return 0;
         if (ids.size < ids_bytes) return 0;
         if (active_blocks.size < active_blocks_bytes) return 0;
         if (active_count.size < @sizeOf(u32)) return 0;
+        if (dispatch_args.size < dispatch_args_bytes) return 0;
 
         const route_stride_u32: u32 = @intCast(route_slot_bytes / @sizeOf(u32));
         const gate_stride = expertSliceBytes(gate_exps.info.type_, inter_dim, hidden_dim);
@@ -15116,11 +15122,15 @@ pub const InferenceEngine = struct {
             @sizeOf(u32),
             active_blocks.handle,
             active_blocks_bytes,
+            dispatch_args.handle,
+            dispatch_args_bytes,
             prefix_tokens,
             cfg.n_experts,
             1,
             route_stride_u32,
             ids_stride,
+            (inter_dim + 3) / 4,
+            (hidden_dim + 3) / 4,
         );
         const route_pack_ranges = [_]CommandBuffer.BufferRange{
             .{ .buffer = counts.handle, .size = counts_bytes },
@@ -15128,9 +15138,10 @@ pub const InferenceEngine = struct {
             .{ .buffer = active_blocks.handle, .size = active_blocks_bytes },
         };
         self.decode_cmd.computeBuffersBarrier(&route_pack_ranges);
+        self.decode_cmd.computeToIndirectBufferBarrier(dispatch_args.handle, dispatch_args_bytes);
 
         const gate_up_phase = self.beginProfilePhase();
-        try self.dmmv.recordMoeColsDispatch(
+        try self.dmmv.recordMoeColsDispatchIndirect(
             &self.decode_cmd,
             self.instance.push_descriptor_fn,
             .q4_k,
@@ -15146,17 +15157,18 @@ pub const InferenceEngine = struct {
             ids_bytes,
             active_blocks.handle,
             active_blocks_bytes,
+            dispatch_args.handle,
+            0,
             inter_dim,
             hidden_dim,
             gate_stride,
-            max_route_blocks,
             ids_stride,
             1,
             0,
             0,
             0,
         );
-        try self.dmmv.recordMoeColsDispatch(
+        try self.dmmv.recordMoeColsDispatchIndirect(
             &self.decode_cmd,
             self.instance.push_descriptor_fn,
             .q4_k,
@@ -15172,10 +15184,11 @@ pub const InferenceEngine = struct {
             ids_bytes,
             active_blocks.handle,
             active_blocks_bytes,
+            dispatch_args.handle,
+            0,
             inter_dim,
             hidden_dim,
             up_stride,
-            max_route_blocks,
             ids_stride,
             1,
             0,
@@ -15203,7 +15216,7 @@ pub const InferenceEngine = struct {
 
         self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, prefix_inter_bytes);
         const down_phase = self.beginProfilePhase();
-        try self.dmmv.recordMoeColsDispatch(
+        try self.dmmv.recordMoeColsDispatchIndirect(
             &self.decode_cmd,
             self.instance.push_descriptor_fn,
             down_exps.info.type_,
@@ -15219,10 +15232,11 @@ pub const InferenceEngine = struct {
             ids_bytes,
             active_blocks.handle,
             active_blocks_bytes,
+            dispatch_args.handle,
+            3 * @sizeOf(u32),
             hidden_dim,
             inter_dim,
             down_stride,
-            max_route_blocks,
             ids_stride,
             1,
             0,
@@ -19919,6 +19933,7 @@ pub const InferenceEngine = struct {
         if (self.batched_scratch_moe_ids) |*b| b.deinit();
         if (self.batched_scratch_moe_active_blocks) |*b| b.deinit();
         if (self.batched_scratch_moe_active_count) |*b| b.deinit();
+        if (self.batched_scratch_moe_dispatch_args) |*b| b.deinit();
         self.cmd_pool.deinit();
         self.* = undefined;
     }

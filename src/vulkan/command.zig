@@ -319,6 +319,62 @@ pub const CommandBuffer = struct {
         vk.c.vkCmdDispatch(self.handle, group_count_x, group_count_y, group_count_z);
     }
 
+    /// Record a push-descriptor compute dispatch whose group counts are read
+    /// from a device buffer containing a VkDispatchIndirectCommand.
+    pub fn pushDescAndDispatchIndirect(
+        self: *CommandBuffer,
+        pipeline: *const Pipeline,
+        push_desc_fn: ?PushDescriptorFn,
+        buffer_infos: []const vk.c.VkDescriptorBufferInfo,
+        push_data: []const u8,
+        indirect_buffer: vk.c.VkBuffer,
+        indirect_offset: vk.c.VkDeviceSize,
+    ) void {
+        std.debug.assert(push_desc_fn != null);
+        std.debug.assert(buffer_infos.len <= 8);
+
+        if (self.last_bound_pipeline != pipeline.pipeline) {
+            vk.c.vkCmdBindPipeline(self.handle, vk.c.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+            self.last_bound_pipeline = pipeline.pipeline;
+        }
+        if (push_data.len > 0) {
+            vk.c.vkCmdPushConstants(
+                self.handle,
+                pipeline.pipeline_layout,
+                vk.c.VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                @intCast(push_data.len),
+                push_data.ptr,
+            );
+        }
+
+        var writes: [8]vk.c.VkWriteDescriptorSet = undefined;
+        for (buffer_infos, 0..) |*buffer_info, i| {
+            writes[i] = .{
+                .sType = vk.c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = null,
+                .dstSet = null,
+                .dstBinding = @intCast(i),
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk.c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = null,
+                .pBufferInfo = buffer_info,
+                .pTexelBufferView = null,
+            };
+        }
+
+        push_desc_fn.?(
+            self.handle,
+            vk.c.VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipeline_layout,
+            0,
+            @intCast(buffer_infos.len),
+            &writes,
+        );
+        vk.c.vkCmdDispatchIndirect(self.handle, indirect_buffer, indirect_offset);
+    }
+
     fn recordMemoryBarrier(self: *const CommandBuffer, spec: MemoryBarrierSpec) void {
         const barrier = vk.c.VkMemoryBarrier{
             .sType = vk.c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -358,6 +414,35 @@ pub const CommandBuffer = struct {
             self.handle,
             vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0,
+            null,
+            1,
+            &buf_barrier,
+            0,
+            null,
+        );
+    }
+
+    /// Insert a compute-shader-write to indirect-command-read barrier.
+    /// Needed when a shader writes VkDispatchIndirectCommand records consumed
+    /// by vkCmdDispatchIndirect later in the same command buffer.
+    pub fn computeToIndirectBufferBarrier(self: *const CommandBuffer, buffer: vk.c.VkBuffer, size: vk.c.VkDeviceSize) void {
+        const buf_barrier = vk.c.VkBufferMemoryBarrier{
+            .sType = vk.c.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .pNext = null,
+            .srcAccessMask = vk.c.VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = vk.c.VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+            .srcQueueFamilyIndex = vk.c.VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = vk.c.VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer,
+            .offset = 0,
+            .size = size,
+        };
+        vk.c.vkCmdPipelineBarrier(
+            self.handle,
+            vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.c.VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
             0,
             0,
             null,
