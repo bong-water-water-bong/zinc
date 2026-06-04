@@ -1410,6 +1410,11 @@ pub const InferenceEngine = struct {
     partial_decode_ssm_alpha_out_offset: vk.c.VkDeviceSize = 0,
     partial_decode_ssm_beta_out: ?vk.c.VkBuffer = null,
     partial_decode_ssm_beta_out_offset: vk.c.VkDeviceSize = 0,
+    // Final full-attn prefill helper: the preceding KV-only layer-major pass
+    // has already projected, normalized, roped, and cached K/V for the last
+    // prompt token. The single-token fallback still needs Q/flash/O/logits but
+    // can skip duplicate K/V work for that one terminal layer.
+    partial_decode_full_attn_kv_preloaded: bool = false,
     partial_ssm_preproj_layer: u32 = std.math.maxInt(u32),
     partial_ssm_preproj_token_idx: u32 = 0,
     partial_ssm_preproj_qkv: ?vk.c.VkBuffer = null,
@@ -5780,6 +5785,12 @@ pub const InferenceEngine = struct {
                     // flag; K/V projection + K norm/RoPE + KV write still run so the next
                     // token's attention sees coherent KV state.
                     const is_dead_attn_tail = self.prefill_active and !collect_output and layer + 1 == config.n_layers;
+                    const final_attn_kv_preloaded = self.partial_decode_full_attn_kv_preloaded and
+                        self.prefill_active and
+                        collect_output and
+                        layer + 1 == config.n_layers and
+                        layer_start == layer and
+                        layer_end == layer + 1;
 
                     const q_tensor = lt.attn_q orelse return error.TensorNotFound;
                     const k_tensor = lt.attn_k orelse return error.TensorNotFound;
@@ -5852,7 +5863,9 @@ pub const InferenceEngine = struct {
                             }
                         }
                     }
-                    try self.dispatchDmmv(k_tensor, self.norm_buf, hidden_size, self.k_buf, k_rows, hidden_dim);
+                    if (!final_attn_kv_preloaded) {
+                        try self.dispatchDmmv(k_tensor, self.norm_buf, hidden_size, self.k_buf, k_rows, hidden_dim);
+                    }
                     // Gemma full-attn layers (use_k_as_v) have v_tensor == k_tensor; the
                     // V projection would be a second DMMV reading the same Q4_K weights
                     // from DRAM. Skip it and let the Gemma V unit-norm below read from
@@ -5871,7 +5884,7 @@ pub const InferenceEngine = struct {
                     // and the norm_buf re-read amortizes through L2. Avoid
                     // re-attempting K+V fusion on this model class without
                     // first changing one of those three premises.
-                    if (!use_k_as_v) {
+                    if (!use_k_as_v and !final_attn_kv_preloaded) {
                         try self.dispatchDmmv(v_tensor, self.norm_buf, hidden_size, self.v_buf, v_rows, hidden_dim);
                     }
                     if (packed_q_gate) {
@@ -5922,10 +5935,12 @@ pub const InferenceEngine = struct {
                                 try self.dispatchBiasAdd(self.q_buf.handle, self.q_buf.size, bias, q_dim);
                             }
                         }
-                        if (lt.attn_k_bias) |bias| {
-                            try self.dispatchBiasAdd(self.k_buf.handle, self.k_buf.size, bias, kv_dim);
+                        if (!final_attn_kv_preloaded) {
+                            if (lt.attn_k_bias) |bias| {
+                                try self.dispatchBiasAdd(self.k_buf.handle, self.k_buf.size, bias, kv_dim);
+                            }
                         }
-                        if (!use_k_as_v) {
+                        if (!use_k_as_v and !final_attn_kv_preloaded) {
                             if (lt.attn_v_bias) |bias| {
                                 try self.dispatchBiasAdd(self.v_buf.handle, self.v_buf.size, bias, kv_dim);
                             }
@@ -6022,7 +6037,7 @@ pub const InferenceEngine = struct {
                     // path. Single dispatch absorbs the (Q norm+rope → K norm+rope
                     // → kv_cache_write) trio when all per-call gates pass. Saves
                     // 2 dispatches + 1 global compute barrier per attention layer.
-                    const physical_token_for_fused = if (self.use_fused_qk_kv)
+                    const physical_token_for_fused = if (self.use_fused_qk_kv and !final_attn_kv_preloaded)
                         self.physicalTokenIndex(state.position) catch null
                     else
                         null;
@@ -6137,7 +6152,24 @@ pub const InferenceEngine = struct {
                             );
                         }
                     }
-                    if (!fused_qk_kv_eligible) {
+                    if (final_attn_kv_preloaded) {
+                        if (!q_rope_done) {
+                            self.decode_cmd.computeBarrier();
+                            try self.dispatchRopeInPlace(
+                                self.q_buf.handle,
+                                self.q_buf.size,
+                                freq_buf_handle,
+                                self.rope_freq_buf.size,
+                                layer_head_dim,
+                                layer_rope_dim,
+                                config.n_heads,
+                                state.position,
+                                rope_freq,
+                                rope_attn_scale,
+                            );
+                        }
+                        self.decode_cmd.computeBarrier();
+                    } else if (!fused_qk_kv_eligible) {
                         if (k_norm_tensor) |kn| {
                             if (use_fused_norm_rope) {
                                 // Fused K norm + K RoPE in a single dispatch
@@ -17848,7 +17880,12 @@ pub const InferenceEngine = struct {
 
         const saved_pipeline_mode = self.prefill_pipeline_mode;
         self.prefill_pipeline_mode = true;
-        defer self.prefill_pipeline_mode = saved_pipeline_mode;
+        const saved_kv_preloaded = self.partial_decode_full_attn_kv_preloaded;
+        self.partial_decode_full_attn_kv_preloaded = true;
+        defer {
+            self.prefill_pipeline_mode = saved_pipeline_mode;
+            self.partial_decode_full_attn_kv_preloaded = saved_kv_preloaded;
+        }
         try self.decodeStep(state, prompt_tokens[last_idx], true);
         try self.decode_cmd.waitForCompletion();
     }
