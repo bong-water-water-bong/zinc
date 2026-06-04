@@ -190,16 +190,34 @@ export async function writeFixtureProject(fixture, projectDir) {
   return dir;
 }
 
-export function buildPrompt(fixture, projectDir) {
+function truncateForPrompt(value, limit = 6000) {
+  const text = String(value ?? "").trim();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n... [truncated ${text.length - limit} chars]`;
+}
+
+export function buildPrompt(fixture, projectDir, baselineOutput = "") {
   const files = fixture.requestedFiles.map((file) => path.posix.join(projectDir, file).replace(/\\/g, "/"));
-  return [
+  const lines = [
     fixture.prompt,
     "",
     `Working directory: ${projectDir}`,
     `Read these files before editing: ${files.join(", ")}`,
     "Change only source files. Do not edit package.json, docs, fixtures, or tests unless the task explicitly asks for it.",
     `Run ${fixture.testCommand} after edits. Continue until all tests pass, then stop.`,
-  ].join("\n");
+  ];
+  const trimmedBaseline = truncateForPrompt(baselineOutput);
+  if (trimmedBaseline) {
+    lines.push(
+      "",
+      "Initial failing test output from this exact project:",
+      "```",
+      trimmedBaseline,
+      "```",
+      "Use the failure lines above to decide the source edit; do not spend turns rereading files already shown.",
+    );
+  }
+  return lines.join("\n");
 }
 
 export async function snapshotReadOnlyFiles(projectDir, fixture) {
@@ -223,7 +241,7 @@ export async function runCommand(command, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS,
   return runProcess("sh", ["-lc", command], { cwd, timeoutMs, env, outputFile });
 }
 
-export function buildOpenCodeArgs(provider, fixture, projectDir, opts) {
+export function buildOpenCodeArgs(provider, fixture, projectDir, opts, baselineOutput = "") {
   return [
     "run",
     "--model",
@@ -235,7 +253,7 @@ export function buildOpenCodeArgs(provider, fixture, projectDir, opts) {
     `${provider}-${fixture.id}`,
     "--dir",
     projectDir,
-    buildPrompt(fixture, projectDir),
+    buildPrompt(fixture, projectDir, baselineOutput),
   ];
 }
 
@@ -501,7 +519,6 @@ export async function runFixture(provider, fixture, opts, providerDir) {
   const projectDir = await realpath(rawProjectDir);
 
   const beforeReadOnly = await snapshotReadOnlyFiles(projectDir, fixture);
-  const prompt = buildPrompt(fixture, projectDir);
   const baseline = opts.runBaseline
     ? await runCommand(fixture.testCommand, {
         cwd: projectDir,
@@ -509,6 +526,7 @@ export async function runFixture(provider, fixture, opts, providerDir) {
         outputFile: path.join(projectDir, "baseline-test.log"),
       })
     : null;
+  const prompt = buildPrompt(fixture, projectDir, baseline?.output ?? "");
 
   let opencode = null;
   let traceFiles = [];
@@ -517,7 +535,7 @@ export async function runFixture(provider, fixture, opts, providerDir) {
     const outputFile = path.join(projectDir, "opencode.jsonl");
     opencode = await runProcess(
       opts.opencodeBin,
-      buildOpenCodeArgs(provider, fixture, projectDir, opts),
+      buildOpenCodeArgs(provider, fixture, projectDir, opts, baseline?.output ?? ""),
       {
         cwd: projectDir,
         timeoutMs: opts.timeoutMs,

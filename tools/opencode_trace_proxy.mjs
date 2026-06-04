@@ -274,9 +274,13 @@ function hasToolResultMessages(body) {
 }
 
 function hasReadTool(body) {
+  return hasToolNamed(body, "read");
+}
+
+function hasToolNamed(body, expectedName) {
   return (body?.tools ?? []).some((tool) => {
     const name = tool?.function?.name ?? tool?.name ?? "";
-    return name === "read";
+    return name === expectedName;
   });
 }
 
@@ -402,7 +406,7 @@ export function buildCodingContinuationGuardMessage(body) {
   const source = editable ? ` Edit/write ${editable} for source fixes.` : "";
   return [
     "OpenCode continuation guard: Continue the coding task with tool calls.",
-    "Until tests pass, assistant turns should be tool calls only; do not emit visible prose before or after tool calls.",
+    "Until tests pass, assistant turns must include tool calls; keep any visible prose short and directly tied to the next tool action.",
     "Do not summarize instead of acting when tests are still failing.",
     "For JavaScript projects, search **/*.{js,mjs,cjs,ts,tsx,json} first; .mjs and .cjs are source files.",
     "When the user names exact files, read every named file in the same assistant turn before analysis; do not read only a subset.",
@@ -412,6 +416,8 @@ export function buildCodingContinuationGuardMessage(body) {
     "For source files under about 120 lines, prefer write with the complete corrected file when replacing methods/classes or fixing multiple lines.",
     "Use edit only when oldString is copied exactly from the latest read output; never invent spacing such as '< =' or '> ='.",
     "If a source read shows duplicate method definitions or both old and new implementations, immediately rewrite the whole source file.",
+    "Do not reread a source file you just read unless a tool result says it changed; if source and tests are already visible, edit/write source or run tests.",
+    "Never invent adjacent filenames after reading the requested files; use the exact known file paths from tool results.",
     "Never call edit or write on package.json or files under /test/ unless the user explicitly asks to change tests.",
     `${source} Run the project tests after source edits, and do not give the final response until the tests pass.`,
   ].join("\n");
@@ -495,6 +501,77 @@ function editFilePathArg(args) {
   return args?.filePath ?? args?.file_path ?? args?.path ?? "";
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function decodeOpenCodeLineNumberedContent(raw) {
+  const lines = [];
+  for (const line of String(raw ?? "").split(/\r?\n/)) {
+    if (/^\(End of file\b/.test(line)) break;
+    const match = line.match(/^\d+:\s?(.*)$/);
+    if (match) {
+      lines.push(match[1]);
+    } else if (line.trim() === "") {
+      lines.push("");
+    }
+  }
+  return lines.join("\n");
+}
+
+function normalizeFileContentForCompare(value) {
+  return String(value ?? "").replace(/\r\n/g, "\n").replace(/\n+$/g, "");
+}
+
+function extractReadFileSnapshots(body) {
+  const snapshots = new Map();
+  for (const message of body?.messages ?? []) {
+    if (message?.role !== "tool") continue;
+    const content = messageText(message);
+    const re = /<path>([^<]+)<\/path>\s*<type>file<\/type>\s*<content>\n([\s\S]*?)\n<\/content>/g;
+    for (const match of content.matchAll(re)) {
+      const filePath = cleanPathCandidate(match[1]);
+      if (!filePath || !looksLikeFilePath(filePath)) continue;
+      snapshots.set(filePath, decodeOpenCodeLineNumberedContent(match[2]));
+    }
+  }
+  return snapshots;
+}
+
+function inferTestCommand(body) {
+  const text = collectStrings(body).join("\n");
+  const match = text.match(/Run\s+([^\n]+?)\s+after edits/i);
+  return match?.[1]?.trim() || "the project tests";
+}
+
+function shouldRewriteRepeatedRead(args, requestBody) {
+  const filePath = cleanPathCandidate(editFilePathArg(args));
+  if (!filePath || !editableKnownFilePaths(requestBody).includes(filePath)) return false;
+
+  const snapshot = extractReadFileSnapshots(requestBody).get(filePath);
+  if (snapshot === undefined) return false;
+
+  try {
+    const current = readFileSync(filePath, "utf8");
+    return normalizeFileContentForCompare(current) === normalizeFileContentForCompare(snapshot);
+  } catch {
+    return true;
+  }
+}
+
+function repeatedReadGuardCommand(filePath, requestBody) {
+  const editable = editableKnownFilePaths(requestBody);
+  const sourceList = editable.length > 0 ? editable.join(", ") : filePath;
+  const testCommand = inferTestCommand(requestBody);
+  const message = [
+    "OpenCode repeated-read guard:",
+    `${filePath} was already read and is unchanged.`,
+    "Do not call read for it again.",
+    `Use write/edit on source files (${sourceList}) to apply the diagnosed fix, then run ${testCommand}.`,
+  ].join(" ");
+  return `printf '%s\n' ${shellQuote(message)} >&2; exit 2`;
+}
+
 export function repairEditOldStringArgs(args) {
   const filePath = editFilePathArg(args);
   if (!filePath || typeof filePath !== "string" || typeof args?.oldString !== "string") {
@@ -529,6 +606,48 @@ export function repairEditOldStringArgs(args) {
   };
 }
 
+function normalizedStem(value) {
+  const parsed = path.posix.parse(cleanPathCandidate(value));
+  return parsed.name.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function commonPrefixLength(a, b) {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[i] === b[i]) i += 1;
+  return i;
+}
+
+function bestFuzzyKnownPath(value, body, toolName) {
+  const known = extractKnownFilePaths(body);
+  if (known.length === 0) return "";
+  const requestedStem = normalizedStem(value);
+  if (!requestedStem) return "";
+  const requestedDir = path.posix.dirname(value);
+  const lowerToolName = (toolName ?? "").toLowerCase();
+  const editable = editableKnownFilePaths(body);
+  const candidates = lowerToolName === "read" && editable.length > 0 ? editable : known;
+
+  let best = "";
+  let bestScore = -Infinity;
+  for (const candidate of candidates) {
+    const candidateStem = normalizedStem(candidate);
+    if (!candidateStem) continue;
+    let score = 0;
+    if (path.posix.dirname(candidate) === requestedDir) score += 30;
+    if (candidate.includes("/src/")) score += 8;
+    if (candidateStem === requestedStem) score += 100;
+    if (candidateStem.startsWith(requestedStem) || requestedStem.startsWith(candidateStem)) score += 20;
+    score += commonPrefixLength(requestedStem, candidateStem) * 3;
+    score -= Math.abs(candidateStem.length - requestedStem.length);
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return bestScore >= 18 ? best : "";
+}
+
 function nearestKnownPath(raw, body, toolName) {
   const value = cleanPathCandidate(raw);
   const known = extractKnownFilePaths(body);
@@ -552,6 +671,10 @@ function nearestKnownPath(raw, body, toolName) {
   if (base) {
     const byBase = known.find((p) => path.posix.basename(p) === base || path.posix.basename(p).startsWith(base));
     if (byBase) return byBase;
+  }
+  if (toolName?.toLowerCase() === "read") {
+    const fuzzy = bestFuzzyKnownPath(value, body, toolName);
+    if (fuzzy) return fuzzy;
   }
 
   const didYouMean = collectStrings(body).join("\n").match(/Did you mean\s+([^?\n]+)\?/i);
@@ -614,6 +737,23 @@ function repairToolCall(call, requestBody) {
   const repaired = repairArgumentsJson(call.function.arguments, requestBody, name);
   call.function.arguments = repaired.text;
   let changed = repaired.changed;
+
+  if (name.toLowerCase() === "read" && hasToolNamed(requestBody, "bash")) {
+    try {
+      const args = JSON.parse(call.function.arguments || "{}");
+      if (shouldRewriteRepeatedRead(args, requestBody)) {
+        const filePath = cleanPathCandidate(editFilePathArg(args));
+        call.function.name = "bash";
+        call.function.arguments = JSON.stringify({
+          command: repeatedReadGuardCommand(filePath, requestBody),
+          description: "Block repeated read of unchanged source file",
+        });
+        return true;
+      }
+    } catch {
+      return changed;
+    }
+  }
 
   if (name.toLowerCase() === "edit") {
     try {
@@ -739,17 +879,6 @@ export function repairSseEvent(event, requestBody, state = {}) {
             suppressedContentEvents += 1;
             changed = true;
           }
-          if (typeof choice.delta?.content === "string" && choice.delta.content.length > 0) {
-            state.suppressedContentChars = (state.suppressedContentChars ?? 0) + choice.delta.content.length;
-            const preview = state.suppressedContentPreview ?? "";
-            if (preview.length < 4096) {
-              state.suppressedContentPreview = preview + choice.delta.content.slice(0, 4096 - preview.length);
-            }
-            choice.delta = { ...choice.delta };
-            delete choice.delta.content;
-            suppressedContentEvents += 1;
-            changed = true;
-          }
           if (typeof choice.message?.reasoning_content === "string" && choice.message.reasoning_content.length > 0) {
             state.suppressedContentChars = (state.suppressedContentChars ?? 0) + choice.message.reasoning_content.length;
             const preview = state.suppressedContentPreview ?? "";
@@ -758,16 +887,6 @@ export function repairSseEvent(event, requestBody, state = {}) {
             }
             choice.message = { ...choice.message };
             delete choice.message.reasoning_content;
-            suppressedContentEvents += 1;
-            changed = true;
-          }
-          if (typeof choice.message?.content === "string" && choice.message.content.length > 0 && choice.message.tool_calls?.length > 0) {
-            state.suppressedContentChars = (state.suppressedContentChars ?? 0) + choice.message.content.length;
-            const preview = state.suppressedContentPreview ?? "";
-            if (preview.length < 4096) {
-              state.suppressedContentPreview = preview + choice.message.content.slice(0, 4096 - preview.length);
-            }
-            choice.message = { ...choice.message, content: "" };
             suppressedContentEvents += 1;
             changed = true;
           }

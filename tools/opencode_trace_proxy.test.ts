@@ -269,7 +269,7 @@ describe("request shaping", () => {
     expect(guard).toContain("src/cart.mjs");
     expect(guard).toContain("Package and test files are read-only");
     const continuation = buildCodingContinuationGuardMessage(body);
-    expect(continuation).toContain("tool calls only");
+    expect(continuation).toContain("must include tool calls");
     expect(continuation).toContain("read every named file in the same assistant turn");
     expect(continuation).toContain("fix all known source bugs in one edit");
     expect(continuation).toContain("prefer write with the complete corrected file");
@@ -468,6 +468,104 @@ describe("tool argument repair", () => {
     expect(JSON.parse(repaired.text).filePath).toBe("/private/tmp/zinc-opencode-smoke4/test/cart.test.mjs");
   });
 
+  test("repairs guessed adjacent read paths to the closest known source file", () => {
+    const repaired = repairArgumentsJson(
+      JSON.stringify({ filePath: "/private/tmp/zinc-opencode-smoke6/src/price.astro" }),
+      multiFileBody,
+      "read",
+    );
+    expect(JSON.parse(repaired.text).filePath).toBe("/private/tmp/zinc-opencode-smoke6/src/pricing.mjs");
+  });
+
+  test("rewrites repeated unchanged source reads to a bash guard", () => {
+    withTempProject({ "src/pricing.mjs": "export const price = 1;\n" }, (dir) => {
+      const filePath = `${dir}/src/pricing.mjs`;
+      const request = {
+        tools: [
+          { type: "function", function: { name: "bash" } },
+          { type: "function", function: { name: "read" } },
+          { type: "function", function: { name: "write" } },
+        ],
+        messages: [
+          { role: "user", content: `Working directory: ${dir}\nRun npm test 2>&1 after edits.` },
+          {
+            role: "tool",
+            content:
+              `<path>${filePath}</path>\n<type>file</type>\n<content>\n` +
+              "1: export const price = 1;\n" +
+              "\n(End of file - total 1 lines)\n</content>",
+          },
+        ],
+      };
+      const payload = {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    name: "read",
+                    arguments: JSON.stringify({ filePath }),
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      expect(repairOpenAiToolCalls(payload, request)).toBe(true);
+      const call = payload.choices[0].delta.tool_calls[0];
+      expect(call.function.name).toBe("bash");
+      const args = JSON.parse(call.function.arguments);
+      expect(args.command).toContain("OpenCode repeated-read guard");
+      expect(args.command).toContain("npm test 2>&1");
+    });
+  });
+
+  test("allows repeated source reads after the file changed on disk", () => {
+    withTempProject({ "src/pricing.mjs": "export const price = 2;\n" }, (dir) => {
+      const filePath = `${dir}/src/pricing.mjs`;
+      const request = {
+        tools: [
+          { type: "function", function: { name: "bash" } },
+          { type: "function", function: { name: "read" } },
+        ],
+        messages: [
+          { role: "user", content: `Working directory: ${dir}` },
+          {
+            role: "tool",
+            content:
+              `<path>${filePath}</path>\n<type>file</type>\n<content>\n` +
+              "1: export const price = 1;\n" +
+              "\n(End of file - total 1 lines)\n</content>",
+          },
+        ],
+      };
+      const payload = {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  function: {
+                    name: "read",
+                    arguments: JSON.stringify({ filePath }),
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      expect(repairOpenAiToolCalls(payload, request)).toBe(false);
+      expect(payload.choices[0].delta.tool_calls[0].function.name).toBe("read");
+    });
+  });
+
   test("repairs OpenAI SSE tool call chunks", () => {
     const payload = {
       choices: [
@@ -620,7 +718,7 @@ describe("tool argument repair", () => {
     expect(repairedFragments.join("")).toBe("{\"command\":\"npm test 2>&1");
   });
 
-  test("suppresses visible assistant prose during OpenCode tool-call turns", () => {
+  test("preserves visible assistant prose during OpenCode tool-call turns", () => {
     const request = applyRequestOverrides(
       {
         model: "zinc/qwen",
@@ -639,10 +737,10 @@ describe("tool argument repair", () => {
         choices: [{ index: 0, delta: { content: "I can see the issue." }, finish_reason: null }],
       })}\n\n`;
     const repaired = repairSseEvent(event, request);
-    expect(repaired.changed).toBe(true);
-    expect(repaired.suppressedContentEvents).toBe(1);
+    expect(repaired.changed).toBe(false);
+    expect(repaired.suppressedContentEvents).toBe(0);
     const payload = JSON.parse(repaired.event.slice("data: ".length));
-    expect(payload.choices[0].delta.content).toBeUndefined();
+    expect(payload.choices[0].delta.content).toBe("I can see the issue.");
   });
 
   test("suppresses llama.cpp reasoning_content during OpenCode tool-call turns", () => {
@@ -672,7 +770,7 @@ describe("tool argument repair", () => {
     expect(payload.choices[0].delta.reasoning_content).toBeUndefined();
   });
 
-  test("records suppressed assistant prose for trace diagnostics", () => {
+  test("does not record normal assistant content as suppressed diagnostics", () => {
     const request = applyRequestOverrides(
       {
         model: "zinc/qwen",
@@ -692,9 +790,9 @@ describe("tool argument repair", () => {
 
     const repaired = repairSseEvent(event, request, state);
 
-    expect(repaired.changed).toBe(true);
-    expect(state.suppressedContentChars).toBe("I should inspect the code first.".length);
-    expect(state.suppressedContentPreview).toBe("I should inspect the code first.");
+    expect(repaired.changed).toBe(false);
+    expect(state.suppressedContentChars).toBeUndefined();
+    expect(state.suppressedContentPreview).toBeUndefined();
   });
 
   test("converts complete XML tool-call content into an OpenAI tool call", () => {

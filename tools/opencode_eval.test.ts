@@ -69,6 +69,16 @@ describe("fixture projects", () => {
     expect(prompt).toContain("npm test 2>&1");
   });
 
+  test("includes baseline failing test output when supplied", async () => {
+    const fixture = fixtureById("multi-run-duration")!;
+    const dir = await tempDir();
+    const prompt = buildPrompt(fixture, dir, "1 pass\n2 fail\nExpected: 180000\nReceived: 3000");
+
+    expect(prompt).toContain("Initial failing test output");
+    expect(prompt).toContain("Expected: 180000");
+    expect(prompt).toContain("do not spend turns rereading files already shown");
+  });
+
   test("builds OpenCode args with fixture directory as workspace", async () => {
     const fixture = fixtureById("rate-limiter-single")!;
     const dir = await tempDir();
