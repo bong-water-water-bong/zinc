@@ -11607,7 +11607,7 @@ pub const InferenceEngine = struct {
 
     /// Fused Q8_0 pair DMMV. Used by the SSM path to compute wqkv and z/gate
     /// projections from the same normalized hidden vector in one dispatch.
-    fn dispatchDmmvQ8_0FusedPair(
+    fn dispatchDmmvQ8_0FusedPairAt(
         self: *InferenceEngine,
         tensor0: *const LoadedTensor,
         tensor1: *const LoadedTensor,
@@ -11620,12 +11620,18 @@ pub const InferenceEngine = struct {
         M0: u32,
         M1: u32,
         K: u32,
+        x_offset: u32,
+        y0_offset: u32,
+        y1_offset: u32,
     ) !void {
         const pip = &(self.dmmv.pipeline_q8_0_fused_pair orelse return error.ShaderNotLoaded);
         const push = DmmvQ8PairPushConstants{
             .M0 = M0,
             .M1 = M1,
             .K = K,
+            .x_offset = x_offset,
+            .y0_offset = y0_offset,
+            .y1_offset = y1_offset,
         };
         const max_m = @max(M0, M1);
         const wg_x: u32 = (max_m + 1) / 2;
@@ -11646,6 +11652,74 @@ pub const InferenceEngine = struct {
             1,
             1,
         );
+    }
+
+    fn dispatchDmmvQ8_0FusedPair(
+        self: *InferenceEngine,
+        tensor0: *const LoadedTensor,
+        tensor1: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        output0_buf: Buffer,
+        output0_size: vk.c.VkDeviceSize,
+        output1_buf: Buffer,
+        output1_size: vk.c.VkDeviceSize,
+        M0: u32,
+        M1: u32,
+        K: u32,
+    ) !void {
+        try self.dispatchDmmvQ8_0FusedPairAt(
+            tensor0,
+            tensor1,
+            input_buf,
+            input_size,
+            output0_buf,
+            output0_size,
+            output1_buf,
+            output1_size,
+            M0,
+            M1,
+            K,
+            0,
+            0,
+            0,
+        );
+    }
+
+    fn dispatchDmmvQ8_0FusedPairBatched(
+        self: *InferenceEngine,
+        tensor0: *const LoadedTensor,
+        tensor1: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        output0_buf: Buffer,
+        output0_size: vk.c.VkDeviceSize,
+        output1_buf: Buffer,
+        output1_size: vk.c.VkDeviceSize,
+        M0: u32,
+        M1: u32,
+        K: u32,
+        n_tokens: u32,
+    ) !void {
+        var tok: u32 = 0;
+        while (tok < n_tokens) : (tok += 1) {
+            try self.dispatchDmmvQ8_0FusedPairAt(
+                tensor0,
+                tensor1,
+                input_buf,
+                input_size,
+                output0_buf,
+                output0_size,
+                output1_buf,
+                output1_size,
+                M0,
+                M1,
+                K,
+                tok * K * @sizeOf(f32),
+                tok * M0 * @sizeOf(f32),
+                tok * M1 * @sizeOf(f32),
+            );
+        }
     }
 
     /// Fused Q8_0 down DMMV + sigmoid-gated scale-accumulate.
@@ -15290,19 +15364,43 @@ pub const InferenceEngine = struct {
                 self.decode_cmd.computeBuffersBarrier(&i8_ranges);
             }
 
-            const ssm_proj_qkv_phase = self.beginProfilePhase();
-            const wqkv_dp4a = try self.dispatchQwen36SsmQkvDp4a(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens, shared_q8_1_ok, shared_q8_1_cols);
-            if (!wqkv_dp4a) {
-                try self.dispatchProjectionBatched(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
-            }
-            self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
+            const can_fuse_q8_qkv_z = wqkv_t.info.type_ == .q8_0 and
+                z_t.info.type_ == .q8_0 and
+                self.dmmv.pipeline_q8_0_fused_pair != null and
+                self.instance.push_descriptor_fn != null and
+                (hidden_dim & 31) == 0;
+            if (can_fuse_q8_qkv_z) {
+                const ssm_proj_qkv_z_phase = self.beginProfilePhase();
+                try self.dispatchDmmvQ8_0FusedPairBatched(
+                    wqkv_t,
+                    z_t,
+                    scratch_norm,
+                    scratch_norm.size,
+                    scratch_gate,
+                    qkv_total_bytes,
+                    scratch_up,
+                    z_total_bytes,
+                    conv_channels,
+                    d_inner,
+                    hidden_dim,
+                    n_tokens,
+                );
+                self.endProfilePhase(.ssm_proj_qkv_z, ssm_proj_qkv_z_phase);
+            } else {
+                const ssm_proj_qkv_phase = self.beginProfilePhase();
+                const wqkv_dp4a = try self.dispatchQwen36SsmQkvDp4a(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens, shared_q8_1_ok, shared_q8_1_cols);
+                if (!wqkv_dp4a) {
+                    try self.dispatchProjectionBatched(wqkv_t, scratch_norm, scratch_gate, conv_channels, hidden_dim, n_tokens);
+                }
+                self.endProfilePhase(.ssm_proj_qkv, ssm_proj_qkv_phase);
 
-            const ssm_proj_z_phase = self.beginProfilePhase();
-            const z_dp4a = try self.dispatchQwen36SsmZDp4a(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens, shared_q8_1_ok, shared_q8_1_cols);
-            if (!z_dp4a) {
-                try self.dispatchProjectionBatched(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens);
+                const ssm_proj_z_phase = self.beginProfilePhase();
+                const z_dp4a = try self.dispatchQwen36SsmZDp4a(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens, shared_q8_1_ok, shared_q8_1_cols);
+                if (!z_dp4a) {
+                    try self.dispatchProjectionBatched(z_t, scratch_norm, scratch_up, d_inner, hidden_dim, n_tokens);
+                }
+                self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
             }
-            self.endProfilePhase(.ssm_proj_z, ssm_proj_z_phase);
             self.endProfilePhase(.ssm_proj, ssm_proj_phase);
 
             const ssm_conv_phase = self.beginProfilePhase();
