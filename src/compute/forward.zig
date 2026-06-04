@@ -15015,6 +15015,11 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    const MoePrefixGroupedResult = struct {
+        grouped_tokens: u32,
+        route_cache_active: bool,
+    };
+
     fn prefillRunTop1MoePrefixGrouped(
         self: *InferenceEngine,
         state: *DecodeState,
@@ -15031,22 +15036,22 @@ pub const InferenceEngine = struct {
         scratch_router_output: Buffer,
         route_slot_bytes: vk.c.VkDeviceSize,
         route_cache_active: bool,
-    ) !u32 {
-        if (!route_cache_active) return 0;
-        if (self.moe_prefill_tail_topk_limit != 1) return 0;
-        if (self.moe_prefill_tail_topk_guard_tokens >= n_tokens) return 0;
-        if (self.instance.push_descriptor_fn == null) return 0;
-        if (self.dmmv.pipeline_moe_route_pack == null) return 0;
-        if (self.dmmv.pipeline_q4k_moe_cols == null) return 0;
+    ) !MoePrefixGroupedResult {
+        const inactive = MoePrefixGroupedResult{ .grouped_tokens = 0, .route_cache_active = route_cache_active };
+        if (self.moe_prefill_tail_topk_limit != 1) return inactive;
+        if (self.moe_prefill_tail_topk_guard_tokens >= n_tokens) return inactive;
+        if (self.instance.push_descriptor_fn == null) return inactive;
+        if (self.dmmv.pipeline_moe_route_pack == null) return inactive;
+        if (self.dmmv.pipeline_q4k_moe_cols == null) return inactive;
 
         const cfg = self.model.config;
-        if (cfg.architecture != .qwen2_moe) return 0;
-        if (cfg.n_experts == 0 or cfg.n_experts > 256) return 0;
-        if (cfg.n_experts_used == 0 or cfg.hidden_dim == 0 or cfg.intermediate_dim == 0) return 0;
-        if ((route_slot_bytes % @sizeOf(u32)) != 0) return 0;
+        if (cfg.architecture != .qwen2_moe) return inactive;
+        if (cfg.n_experts == 0 or cfg.n_experts > 256) return inactive;
+        if (cfg.n_experts_used == 0 or cfg.hidden_dim == 0 or cfg.intermediate_dim == 0) return inactive;
+        if ((route_slot_bytes % @sizeOf(u32)) != 0) return inactive;
 
         const prefix_tokens = n_tokens - self.moe_prefill_tail_topk_guard_tokens;
-        if (prefix_tokens == 0) return 0;
+        if (prefix_tokens == 0) return inactive;
         const hidden_dim = cfg.hidden_dim;
         const inter_dim = cfg.intermediate_dim;
         const prefix_hidden_bytes: vk.c.VkDeviceSize =
@@ -15057,48 +15062,75 @@ pub const InferenceEngine = struct {
             @as(vk.c.VkDeviceSize, prefix_tokens) *
             @as(vk.c.VkDeviceSize, inter_dim) *
             @sizeOf(f32);
-        if (scratch_hidden.size < prefix_hidden_bytes) return 0;
-        if (scratch_norm.size < prefix_hidden_bytes) return 0;
-        if (scratch_gate.size < prefix_inter_bytes) return 0;
-        if (scratch_up.size < prefix_inter_bytes) return 0;
-        if (scratch_swiglu.size < prefix_inter_bytes) return 0;
-        if (scratch_down.size < prefix_hidden_bytes) return 0;
+        if (scratch_hidden.size < prefix_hidden_bytes) return inactive;
+        if (scratch_norm.size < prefix_hidden_bytes) return inactive;
+        if (scratch_gate.size < prefix_inter_bytes) return inactive;
+        if (scratch_up.size < prefix_inter_bytes) return inactive;
+        if (scratch_swiglu.size < prefix_inter_bytes) return inactive;
+        if (scratch_down.size < prefix_hidden_bytes) return inactive;
 
         const lt = self.layer_tensors[layer];
-        if (lt.ffn_gate_up_exps != null) return 0;
-        if (lt.pre_ffw_norm_2 != null or lt.post_ffw_norm != null or lt.post_ffw_norm_1 != null or lt.post_ffw_norm_2 != null) return 0;
-        if (lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) return 0;
-        if (lt.ffn_down_exps_scale != null) return 0;
-        const gate_exps = lt.ffn_gate_exps orelse return 0;
-        const up_exps = lt.ffn_up_exps orelse return 0;
-        const down_exps = lt.ffn_down_exps orelse return 0;
-        if (gate_exps.info.type_ != .q4_k or up_exps.info.type_ != .q4_k) return 0;
-        if (down_exps.info.type_ != .q5_k and down_exps.info.type_ != .q4_k) return 0;
-        if (down_exps.info.type_ == .q5_k and self.dmmv.pipeline_q5k_moe_cols == null) return 0;
-        if (down_exps.info.type_ == .q4_k and self.dmmv.pipeline_q4k_moe_cols == null) return 0;
+        if (lt.ffn_gate_up_exps != null) return inactive;
+        if (lt.pre_ffw_norm_2 != null or lt.post_ffw_norm != null or lt.post_ffw_norm_1 != null or lt.post_ffw_norm_2 != null) return inactive;
+        if (lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) return inactive;
+        if (lt.ffn_down_exps_scale != null) return inactive;
+        const gate_exps = lt.ffn_gate_exps orelse return inactive;
+        const up_exps = lt.ffn_up_exps orelse return inactive;
+        const down_exps = lt.ffn_down_exps orelse return inactive;
+        if (gate_exps.info.type_ != .q4_k or up_exps.info.type_ != .q4_k) return inactive;
+        if (down_exps.info.type_ != .q5_k and down_exps.info.type_ != .q4_k) return inactive;
+        if (down_exps.info.type_ == .q5_k and self.dmmv.pipeline_q5k_moe_cols == null) return inactive;
+        if (down_exps.info.type_ == .q4_k and self.dmmv.pipeline_q4k_moe_cols == null) return inactive;
 
-        const counts = self.batched_scratch_moe_counts orelse return 0;
-        const ids = self.batched_scratch_moe_ids orelse return 0;
-        const active_blocks = self.batched_scratch_moe_active_blocks orelse return 0;
-        const active_count = self.batched_scratch_moe_active_count orelse return 0;
-        const dispatch_args = self.batched_scratch_moe_dispatch_args orelse return 0;
+        const counts = self.batched_scratch_moe_counts orelse return inactive;
+        const ids = self.batched_scratch_moe_ids orelse return inactive;
+        const active_blocks = self.batched_scratch_moe_active_blocks orelse return inactive;
+        const active_count = self.batched_scratch_moe_active_count orelse return inactive;
+        const dispatch_args = self.batched_scratch_moe_dispatch_args orelse return inactive;
         const ids_stride = prefix_tokens;
         const max_route_blocks = prefix_tokens;
         const counts_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, cfg.n_experts) * @sizeOf(u32);
         const ids_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, ids_stride) * @as(vk.c.VkDeviceSize, cfg.n_experts) * @sizeOf(u32);
         const active_blocks_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, max_route_blocks) * @sizeOf(u32);
         const dispatch_args_bytes: vk.c.VkDeviceSize = 6 * @sizeOf(u32);
-        if (counts.size < counts_bytes) return 0;
-        if (ids.size < ids_bytes) return 0;
-        if (active_blocks.size < active_blocks_bytes) return 0;
-        if (active_count.size < @sizeOf(u32)) return 0;
-        if (dispatch_args.size < dispatch_args_bytes) return 0;
+        if (counts.size < counts_bytes) return inactive;
+        if (ids.size < ids_bytes) return inactive;
+        if (active_blocks.size < active_blocks_bytes) return inactive;
+        if (active_count.size < @sizeOf(u32)) return inactive;
+        if (dispatch_args.size < dispatch_args_bytes) return inactive;
 
         const route_stride_u32: u32 = @intCast(route_slot_bytes / @sizeOf(u32));
         const gate_stride = expertSliceBytes(gate_exps.info.type_, inter_dim, hidden_dim);
         const up_stride = expertSliceBytes(up_exps.info.type_, inter_dim, hidden_dim);
         const down_stride = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
-        if (gate_stride != up_stride) return 0;
+        if (gate_stride != up_stride) return inactive;
+
+        const need_precompute = !route_cache_active;
+        if (need_precompute) {
+            if (self.validation_diagnostics_enabled) return inactive;
+            if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return inactive;
+            if (self.use_capture_routing or self.use_capture_ffn_input or self.use_count_experts_prefill) return inactive;
+            if (self.elementwise.pipeline_router_f32_batch == null) return inactive;
+            if (self.elementwise.pipeline_softmax_topk_batch == null) return inactive;
+            if ((hidden_dim & 3) != 0) return inactive;
+            const router_t = lt.ffn_gate_inp orelse return inactive;
+            if (router_t.info.type_ != .f32) return inactive;
+            if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_inp_scale != null) return inactive;
+            if (self.dmmv.moePipelineForType(gate_exps.info.type_) == null) return inactive;
+            if (self.dmmv.moePipelineForType(up_exps.info.type_) == null) return inactive;
+            if (self.dmmv.moePipelineForType(down_exps.info.type_) == null) return inactive;
+            if (self.elementwise.pipeline_moe_weighted_acc == null) return inactive;
+
+            const logits_bytes =
+                @as(vk.c.VkDeviceSize, n_tokens) *
+                @as(vk.c.VkDeviceSize, cfg.n_experts) *
+                @sizeOf(f32);
+            const route_bytes =
+                @as(vk.c.VkDeviceSize, n_tokens) *
+                route_slot_bytes;
+            if (scratch_gate.size < logits_bytes) return inactive;
+            if (scratch_router_output.size < route_bytes) return inactive;
+        }
 
         if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
         try self.decode_cmd.reset();
@@ -15108,6 +15140,67 @@ pub const InferenceEngine = struct {
         self.decode_cmd.computeBarrier();
 
         const moe_phase = self.beginProfilePhase();
+
+        if (need_precompute) {
+            const router_t = lt.ffn_gate_inp.?;
+            const suffix_limit = self.moe_topk_limit;
+            const suffix_k = if (suffix_limit > 0)
+                @min(cfg.n_experts_used, suffix_limit)
+            else
+                cfg.n_experts_used;
+            const prefix_k: u32 = 1;
+            const suffix_tokens = n_tokens - prefix_tokens;
+
+            const router_phase = self.beginProfilePhase();
+            try self.dispatchRouterF32Batch(
+                scratch_norm.handle,
+                scratch_norm.size,
+                router_t.gpu_buffer.handle,
+                router_t.gpu_buffer.size,
+                scratch_gate.handle,
+                scratch_gate.size,
+                cfg.n_experts,
+                hidden_dim,
+                n_tokens,
+            );
+            const logits_bytes =
+                @as(vk.c.VkDeviceSize, n_tokens) *
+                @as(vk.c.VkDeviceSize, cfg.n_experts) *
+                @sizeOf(f32);
+            self.decode_cmd.computeBufferBarrier(scratch_gate.handle, logits_bytes);
+            self.endProfilePhase(.moe_router, router_phase);
+
+            const topk_phase = self.beginProfilePhase();
+            try self.dispatchSoftmaxTopkBatch(
+                scratch_gate.handle,
+                scratch_gate.size,
+                scratch_router_output.handle,
+                scratch_router_output.size,
+                cfg.n_experts,
+                prefix_k,
+                0,
+                prefix_tokens,
+                route_stride_u32,
+            );
+            if (suffix_tokens > 0 and suffix_k > 0) {
+                try self.dispatchSoftmaxTopkBatch(
+                    scratch_gate.handle,
+                    scratch_gate.size,
+                    scratch_router_output.handle,
+                    scratch_router_output.size,
+                    cfg.n_experts,
+                    suffix_k,
+                    prefix_tokens,
+                    suffix_tokens,
+                    route_stride_u32,
+                );
+            }
+            self.endProfilePhase(.moe_topk, topk_phase);
+            const route_bytes =
+                @as(vk.c.VkDeviceSize, n_tokens) *
+                route_slot_bytes;
+            self.decode_cmd.computeBufferBarrier(scratch_router_output.handle, route_bytes);
+        }
 
         try self.dmmv.recordMoeRoutePack(
             &self.decode_cmd,
@@ -15267,7 +15360,7 @@ pub const InferenceEngine = struct {
         self.prefill_current_token_idx = prefix_tokens - 1;
         state.position = base_token + prefix_tokens - 1;
         _ = hidden_size;
-        return prefix_tokens;
+        return .{ .grouped_tokens = prefix_tokens, .route_cache_active = true };
     }
 
     fn prefillRunLayerFromFfnNorm(
@@ -15330,16 +15423,7 @@ pub const InferenceEngine = struct {
             @as(vk.c.VkDeviceSize, 2) *
             @as(vk.c.VkDeviceSize, self.model.config.n_experts_used) *
             @sizeOf(u32);
-        const route_cache_active = try self.prefillPrecomputeMoeRoutingFromFfnNorm(
-            n_tokens,
-            layer,
-            scratch_norm,
-            scratch_router_logits,
-            scratch_router_output,
-            route_slot_bytes,
-        );
-
-        const grouped_prefix_tokens = try self.prefillRunTop1MoePrefixGrouped(
+        var grouped_result = try self.prefillRunTop1MoePrefixGrouped(
             state,
             base_token,
             n_tokens,
@@ -15353,8 +15437,39 @@ pub const InferenceEngine = struct {
             scratch_down,
             scratch_router_output,
             route_slot_bytes,
-            route_cache_active,
+            false,
         );
+        var route_cache_active = grouped_result.route_cache_active;
+        var grouped_prefix_tokens = grouped_result.grouped_tokens;
+        if (!route_cache_active) {
+            route_cache_active = try self.prefillPrecomputeMoeRoutingFromFfnNorm(
+                n_tokens,
+                layer,
+                scratch_norm,
+                scratch_router_logits,
+                scratch_router_output,
+                route_slot_bytes,
+            );
+
+            grouped_result = try self.prefillRunTop1MoePrefixGrouped(
+                state,
+                base_token,
+                n_tokens,
+                hidden_size,
+                layer,
+                scratch_hidden,
+                scratch_norm,
+                scratch_router_logits,
+                scratch_expert_up,
+                scratch_swiglu,
+                scratch_down,
+                scratch_router_output,
+                route_slot_bytes,
+                route_cache_active,
+            );
+            route_cache_active = grouped_result.route_cache_active;
+            grouped_prefix_tokens = grouped_result.grouped_tokens;
+        }
 
         var primary_pending: bool = false;
         var alt_pending: bool = false;
