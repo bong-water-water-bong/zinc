@@ -17826,6 +17826,7 @@ pub const InferenceEngine = struct {
         hidden_size: vk.c.VkDeviceSize,
         layer: u32,
         scratch_hidden: Buffer,
+        allow_final_tail: bool,
     ) !void {
         if (n_tokens == 0) return;
 
@@ -17840,7 +17841,7 @@ pub const InferenceEngine = struct {
         self.partial_decode_hidden_out = scratch_hidden.handle;
         self.partial_decode_hidden_out_offset = hidden_offset;
         self.partial_decode_advance_position = false;
-        self.partial_decode_allow_final_tail = false;
+        self.partial_decode_allow_final_tail = allow_final_tail;
         self.partial_decode_stop_after_ffn_norm = false;
         self.partial_decode_ffn_norm_out = null;
         self.partial_decode_ffn_norm_out_offset = 0;
@@ -17850,6 +17851,50 @@ pub const InferenceEngine = struct {
         defer self.prefill_pipeline_mode = saved_pipeline_mode;
         try self.decodeStep(state, prompt_tokens[last_idx], true);
         try self.decode_cmd.waitForCompletion();
+    }
+
+    fn a3bProductionFinalFullAttnKvOnlyEligible(
+        self: *const InferenceEngine,
+        n_tokens: u32,
+        hidden_dim: u32,
+        layer: u32,
+    ) bool {
+        if (n_tokens < 16) return false;
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+        if (!self.isQwen36A3bMoePrefillModel()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (self.elementwise.pipeline_rope_batched == null) return false;
+        if (self.elementwise.pipeline_kv_cache_write_batched == null) return false;
+
+        const cfg = self.model.config;
+        const lt = self.layer_tensors[layer];
+        _ = lt.attn_norm orelse return false;
+        const k_t = lt.attn_k orelse return false;
+        const v_t = lt.attn_v orelse return false;
+        if (lt.attn_k_bias != null or lt.attn_v_bias != null) return false;
+        if ((k_t.info.numElements() % hidden_dim) != 0) return false;
+        if ((v_t.info.numElements() % hidden_dim) != 0) return false;
+
+        const k_rows: u32 = @intCast(k_t.info.numElements() / hidden_dim);
+        const v_rows: u32 = @intCast(v_t.info.numElements() / hidden_dim);
+        if (k_rows == 0 or v_rows != k_rows) return false;
+        const layer_head_dim: u32 = if (lt.attn_q_norm) |qn|
+            @intCast(qn.info.numElements())
+        else if (lt.attn_k_norm) |kn|
+            @intCast(kn.info.numElements())
+        else
+            cfg.head_dim;
+        if (layer_head_dim == 0 or (k_rows % layer_head_dim) != 0) return false;
+
+        const kv_total_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, k_rows) *
+            @sizeOf(f32);
+        const scratch_k = self.batched_scratch_k orelse return false;
+        const scratch_v = self.batched_scratch_v orelse return false;
+        return scratch_k.size >= kv_total_bytes and scratch_v.size >= kv_total_bytes;
     }
 
     /// Effort-15 cycle 13 gate: when true, the segment loop replaces the
@@ -18337,28 +18382,52 @@ pub const InferenceEngine = struct {
         var layer: u32 = 0;
         while (layer < cfg.n_layers) : (layer += 1) {
             const is_final_layer = layer + 1 == cfg.n_layers;
+            const is_full_attn = ((layer + 1) % full_attn_interval) == 0;
             if (is_final_layer) {
-                try self.prefillQwen36RunPartialTokenLoop(
-                    state,
-                    prompt_tokens,
-                    base_token,
-                    n_tokens,
-                    hidden_size,
-                    layer,
-                    layer + 1,
-                    scratch_hidden,
-                    null,
-                    false,
-                    false,
-                    true,
-                    true,
-                    pipeline_tail,
-                );
+                if (is_full_attn and self.a3bProductionFinalFullAttnKvOnlyEligible(n_tokens, hidden_dim, layer)) {
+                    try self.prefillQwen36RunFinalFullAttnKvOnly(
+                        state,
+                        base_token,
+                        n_tokens,
+                        hidden_dim,
+                        layer,
+                        scratch_hidden,
+                        scratch_norm,
+                        self.batched_scratch_k.?,
+                        self.batched_scratch_v.?,
+                    );
+                    try self.prefillQwen36RunFinalLayerLastToken(
+                        state,
+                        prompt_tokens,
+                        base_token,
+                        n_tokens,
+                        hidden_size,
+                        layer,
+                        scratch_hidden,
+                        true,
+                    );
+                } else {
+                    try self.prefillQwen36RunPartialTokenLoop(
+                        state,
+                        prompt_tokens,
+                        base_token,
+                        n_tokens,
+                        hidden_size,
+                        layer,
+                        layer + 1,
+                        scratch_hidden,
+                        null,
+                        false,
+                        false,
+                        true,
+                        true,
+                        pipeline_tail,
+                    );
+                }
                 self.prefill_token_samples = n_tokens;
                 return;
             }
 
-            const is_full_attn = ((layer + 1) % full_attn_interval) == 0;
             if (is_full_attn) {
                 if (self.a3bProductionFullAttnBatchedEligible(n_tokens, hidden_dim, layer, scratch_gate, scratch_swiglu)) {
                     try self.prefillQwen36RunFullAttnLayerToFfnNorm(
@@ -18826,6 +18895,7 @@ pub const InferenceEngine = struct {
                     hidden_size,
                     segment_layer,
                     scratch_hidden,
+                    false,
                 );
                 tail_start_layer = segment_layer + 1;
                 continue;
