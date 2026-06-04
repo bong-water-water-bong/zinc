@@ -3368,7 +3368,7 @@ pub const InferenceEngine = struct {
         // int8 DP4a dense-FFN scratch: packed int8 acts = inter_dim/4 uints/token,
         // scales = inter_dim/32 f32/token. Only allocated when a dense-hybrid
         // prefill shape can use the path.
-        if (self.qwen36Dp4aDownEnabled() or self.qwenDenseFfnDp4aEnabled(n_tokens)) {
+        if (self.qwen36Dp4aDownEnabled() or self.qwenDenseFfnDp4aEnabled(n_tokens) or self.qwenA3bSsmQ8Dp4aEnabled(n_tokens)) {
             const inter_i8_bytes = n * (inter_dim / 4) * @sizeOf(u32);
             const inter_scale_bytes = n * (inter_dim / 32) * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_swiglu_i8, inter_i8_bytes, storage_xfer);
@@ -13270,6 +13270,19 @@ pub const InferenceEngine = struct {
         return (n_tokens + 31) & ~@as(u32, 31);
     }
 
+    fn qwenA3bSsmQ8Dp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+        if (!self.isQwen36A3bMoePrefillModel()) return false;
+        if (!self.isAmdRdna()) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        if (n_tokens < 128) return false;
+        return self.dmmv.pipeline_mul_mm_q8_0_full_dp4a != null and
+            self.dmmv.pipeline_quantize_act_q8 != null and
+            self.dmmv.pipeline_mul_mm_q8_0 != null;
+    }
+
     /// int8 DP4a dense-down prefill GEMM (Qwen3.6-27B). Default-on when the
     /// device exposes shaderIntegerDotProduct; disable with
     /// ZINC_QWEN36_27B_DP4A_DOWN=0. The Q6_K f32-FMA down GEMM is a tuned local
@@ -13530,6 +13543,117 @@ pub const InferenceEngine = struct {
             },
             else => return false,
         }
+    }
+
+    fn qwenA3bPrepareProjectionQ8(
+        self: *InferenceEngine,
+        src: Buffer,
+        K: u32,
+        n_tokens: u32,
+    ) !u32 {
+        if (!self.qwenA3bSsmQ8Dp4aEnabled(n_tokens)) return 0;
+        if (K == 0 or (K & 31) != 0) return 0;
+        const packed_i8 = self.batched_scratch_norm_q8 orelse return 0;
+        const scale = self.batched_scratch_norm_q8_scale orelse return 0;
+
+        const full_cols = n_tokens & ~@as(u32, 31);
+        if (full_cols == 0) return 0;
+        const need_input: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K) *
+            @sizeOf(f32);
+        const need_i8: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K / 4) *
+            @sizeOf(u32);
+        const need_scale: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K / 32) *
+            @sizeOf(f32);
+        if (src.size < need_input or packed_i8.size < need_i8 or scale.size < need_scale) return 0;
+
+        try self.dmmv.recordQuantizeActQ8(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            src.handle,
+            src.size,
+            packed_i8.handle,
+            packed_i8.size,
+            scale.handle,
+            scale.size,
+            full_cols,
+            K,
+        );
+        const q8_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = packed_i8.handle, .size = packed_i8.size },
+            .{ .buffer = scale.handle, .size = scale.size },
+        };
+        self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+        return full_cols;
+    }
+
+    fn dispatchQwenA3bQ8ProjectionDp4a(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        src_f32: Buffer,
+        dst: Buffer,
+        M: u32,
+        K: u32,
+        n_tokens: u32,
+        pre_quantized_cols: u32,
+    ) !bool {
+        if (pre_quantized_cols == 0) return false;
+        if (!self.qwenA3bSsmQ8Dp4aEnabled(n_tokens)) return false;
+        if (tensor.info.type_ != .q8_0) return false;
+        if (M == 0 or K == 0 or (M & 31) != 0 or (K & 31) != 0) return false;
+        const packed_i8 = self.batched_scratch_norm_q8 orelse return false;
+        const scale = self.batched_scratch_norm_q8_scale orelse return false;
+
+        const need_output: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, pre_quantized_cols) *
+            @as(vk.c.VkDeviceSize, M) *
+            @sizeOf(f32);
+        if (dst.size < need_output) return false;
+
+        const push_fn = self.instance.push_descriptor_fn;
+        try self.dmmv.recordMulMmQ8_0FullDp4a(
+            &self.decode_cmd,
+            push_fn,
+            tensor.gpu_buffer.handle,
+            tensor.gpu_buffer.size,
+            packed_i8.handle,
+            packed_i8.size,
+            scale.handle,
+            scale.size,
+            dst.handle,
+            dst.size,
+            M,
+            pre_quantized_cols,
+            K,
+            0,
+            0,
+        );
+        if (pre_quantized_cols < n_tokens) {
+            try self.dmmv.recordMulMmQ8_0(
+                &self.decode_cmd,
+                push_fn,
+                tensor.gpu_buffer.handle,
+                tensor.gpu_buffer.size,
+                src_f32.handle,
+                src_f32.size,
+                dst.handle,
+                dst.size,
+                M,
+                n_tokens - pre_quantized_cols,
+                K,
+                K,
+                M,
+                0,
+                pre_quantized_cols * K,
+                pre_quantized_cols * M,
+            );
+        }
+        return true;
     }
 
     /// Dense gate+up+SwiGLU prefill projection for Qwen3.6-27B. Uses int8 DP4a
@@ -15810,13 +15934,79 @@ pub const InferenceEngine = struct {
                 (hidden_dim & 31) == 0 and
                 (conv_channels & 31) == 0 and
                 (d_inner & 31) == 0;
+            const can_dp4a_q8_qkv_z = can_mul_mm_q8_qkv_z and
+                self.qwenA3bSsmQ8Dp4aEnabled(n_tokens) and
+                self.dmmv.pipeline_mul_mm_q8_0_full_dp4a != null and
+                self.dmmv.pipeline_quantize_act_q8 != null;
             const can_fuse_q8_qkv_z = self.use_fused_ssm_qkv_z and
                 wqkv_t.info.type_ == .q8_0 and
                 z_t.info.type_ == .q8_0 and
                 self.dmmv.pipeline_q8_0_fused_pair != null and
                 self.instance.push_descriptor_fn != null and
                 (hidden_dim & 31) == 0;
-            if (can_mul_mm_q8_qkv_z) {
+            if (can_dp4a_q8_qkv_z) {
+                const ssm_proj_qkv_z_phase = self.beginProfilePhase();
+                const q8_cols = try self.qwenA3bPrepareProjectionQ8(scratch_norm, hidden_dim, n_tokens);
+                if (q8_cols > 0) {
+                    const qkv_done = try self.dispatchQwenA3bQ8ProjectionDp4a(
+                        wqkv_t,
+                        scratch_norm,
+                        scratch_gate,
+                        conv_channels,
+                        hidden_dim,
+                        n_tokens,
+                        q8_cols,
+                    );
+                    const z_done = try self.dispatchQwenA3bQ8ProjectionDp4a(
+                        z_t,
+                        scratch_norm,
+                        scratch_up,
+                        d_inner,
+                        hidden_dim,
+                        n_tokens,
+                        q8_cols,
+                    );
+                    if (!qkv_done or !z_done) return error.UnsupportedConfiguration;
+                } else {
+                    try self.dmmv.recordMulMmQ8_0(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        wqkv_t.gpu_buffer.handle,
+                        wqkv_t.gpu_buffer.size,
+                        scratch_norm.handle,
+                        scratch_norm.size,
+                        scratch_gate.handle,
+                        qkv_total_bytes,
+                        conv_channels,
+                        n_tokens,
+                        hidden_dim,
+                        hidden_dim,
+                        conv_channels,
+                        0,
+                        0,
+                        0,
+                    );
+                    try self.dmmv.recordMulMmQ8_0(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        z_t.gpu_buffer.handle,
+                        z_t.gpu_buffer.size,
+                        scratch_norm.handle,
+                        scratch_norm.size,
+                        scratch_up.handle,
+                        z_total_bytes,
+                        d_inner,
+                        n_tokens,
+                        hidden_dim,
+                        hidden_dim,
+                        d_inner,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+                self.endProfilePhase(.ssm_proj_qkv_z, ssm_proj_qkv_z_phase);
+            } else if (can_mul_mm_q8_qkv_z) {
                 const ssm_proj_qkv_z_phase = self.beginProfilePhase();
                 try self.dmmv.recordMulMmQ8_0(
                     &self.decode_cmd,

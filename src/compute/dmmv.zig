@@ -493,6 +493,8 @@ pub const DmmvDispatch = struct {
     pipeline_mul_mm_q5k: ?Pipeline,
     /// Tiled Q8_0 dense GEMM for Qwen3.6 A3B batched SSM out projection prefill.
     pipeline_mul_mm_q8_0: ?Pipeline,
+    /// int8 DP4a full-tile Q8_0 GEMM over Q8_0-style pre-quantized activations.
+    pipeline_mul_mm_q8_0_full_dp4a: ?Pipeline,
     /// int8 DP4a full-tile Q6_K dense-down GEMM (Qwen3.6-27B prefill).
     pipeline_mul_mm_q6k_full_dp4a: ?Pipeline,
     /// Same Q6_K DP4a dense-down shader with K=12288 specialized for
@@ -1064,6 +1066,14 @@ pub const DmmvDispatch = struct {
         // int8 DP4a dense-down: 4-binding GEMM (weights/packed-acts/scales/out) and
         // the 3-binding activation quantizer. Both only succeed when the device
         // enabled shaderIntegerDotProduct; otherwise the host path falls back to f32.
+        const mul_mm_q8_0_full_dp4a_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q8_0_full_dp4a.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q8_0_full_dp4a = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q8_0_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q8_0_full_dp4a shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q8_0_full_dp4a != null) {
+            log.info("mul_mm_q8_0_full_dp4a pipeline loaded (int8 DP4a Q8_0 prefill GEMM)", .{});
+        }
         const mul_mm_q6k_full_dp4a_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q6k_full_dp4a.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q6k_full_dp4a = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q6k_full_dp4a shader not loaded: {s}", .{@errorName(err)});
@@ -1285,6 +1295,7 @@ pub const DmmvDispatch = struct {
             .pipeline_quantize_act_q8_1 = pipeline_quantize_act_q8_1,
             .pipeline_mul_mm_q5k = pipeline_mul_mm_q5k,
             .pipeline_mul_mm_q8_0 = pipeline_mul_mm_q8_0,
+            .pipeline_mul_mm_q8_0_full_dp4a = pipeline_mul_mm_q8_0_full_dp4a,
             .descriptor_pool = descriptor_pool,
             .device = instance.device,
         };
@@ -2158,6 +2169,57 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Record an int8 DP4a full-tile Q8_0 GEMM. The activation must already
+    /// be quantized with recordQuantizeActQ8. Ragged token tails stay on the
+    /// f32 recordMulMmQ8_0 path at the call site.
+    pub fn recordMulMmQ8_0FullDp4a(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_packed_buf: vk.c.VkBuffer,
+        b_packed_size: vk.c.VkDeviceSize,
+        b_scale_buf: vk.c.VkBuffer,
+        b_scale_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        a_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q8_0_full_dp4a) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 31) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0 or (M & 31) != 0 or (N & 31) != 0) return error.InvalidArgument;
+        const push = MulMmQ6KDp4aPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b_packed = K / 4,
+            .stride_b_scale = K / 32,
+            .stride_d = M,
+            .a_offset = a_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_packed_buf, .offset = 0, .range = b_packed_size },
+            .{ .buffer = b_scale_buf, .offset = 0, .range = b_scale_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            M / 32,
+            N / 32,
+            1,
+        );
+    }
+
     /// Branchless full-tile Q6_K GEMM. Requires M and N to be multiples of 32.
     pub fn recordMulMmQ6KFull(
         self: *const DmmvDispatch,
@@ -2775,6 +2837,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q6k_full) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k) |*p| p.deinit();
         if (self.pipeline_mul_mm_q8_0) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q8_0_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k12288) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_q8_1) |*p| p.deinit();
