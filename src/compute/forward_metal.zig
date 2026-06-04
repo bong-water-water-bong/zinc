@@ -488,7 +488,10 @@ fn isGemma26A4BMoeShape(cfg: ModelConfig) bool {
 }
 
 fn defaultGemmaQ8MoeDecodeEnabled(cfg: ModelConfig) bool {
-    if (isGemma26A4BMoeShape(cfg)) return false;
+    // Keep Gemma26 Q8-down MoE on the routed device path by default. The
+    // explicit fallback path has to break the shared decode command so CPU
+    // routing/post-vector work can observe intermediate buffers; llama.cpp's
+    // `ggml_metal_op_mul_mat_id` keeps the selected-expert path device-side.
     return cfg.architecture == .gemma and cfg.n_experts > 0;
 }
 
@@ -807,6 +810,9 @@ const GpuMoeFinalizerKind = enum(u8) {
     f32,
     shared,
     routed_only,
+    gemma_weighted_post_norm,
+    gemma_post_norm,
+    gemma_staged,
 };
 
 /// Per-request profiling counters for dispatch, barrier, and timing breakdown.
@@ -842,6 +848,9 @@ pub const RuntimeProfile = struct {
     gpu_moe_finalizer_f32_calls: u32 = 0,
     gpu_moe_finalizer_shared_calls: u32 = 0,
     gpu_moe_finalizer_routed_only_calls: u32 = 0,
+    gpu_moe_finalizer_gemma_weighted_post_norm_calls: u32 = 0,
+    gpu_moe_finalizer_gemma_post_norm_calls: u32 = 0,
+    gpu_moe_finalizer_gemma_staged_calls: u32 = 0,
     fallback_moe_barrier_calls: u32 = 0,
     dense_ffn_barrier_calls: u32 = 0,
     final_barrier_calls: u32 = 0,
@@ -1060,6 +1069,9 @@ fn recordGpuMoeFinalizerKind(profile: ?*RuntimeProfile, kind: GpuMoeFinalizerKin
         .f32 => p.gpu_moe_finalizer_f32_calls += 1,
         .shared => p.gpu_moe_finalizer_shared_calls += 1,
         .routed_only => p.gpu_moe_finalizer_routed_only_calls += 1,
+        .gemma_weighted_post_norm => p.gpu_moe_finalizer_gemma_weighted_post_norm_calls += 1,
+        .gemma_post_norm => p.gpu_moe_finalizer_gemma_post_norm_calls += 1,
+        .gemma_staged => p.gpu_moe_finalizer_gemma_staged_calls += 1,
     };
 }
 
@@ -1073,6 +1085,13 @@ fn profileGpuMoeBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: Gp
 fn profileGpuMoeBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: GpuMoeBarrierPhase, bufs: []const *const MetalBuffer) void {
     const before_count = cmd.barrier_count;
     cmd.barrierBuffers(bufs);
+    if (cmd.barrier_count == before_count) return;
+    recordGpuMoeBarrierPhase(profile, phase);
+}
+
+fn profileGpuMoeResourceBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: GpuMoeBarrierPhase, bufs: []const *const MetalBuffer) void {
+    const before_count = cmd.barrier_count;
+    cmd.barrierResourceBuffers(bufs);
     if (cmd.barrier_count == before_count) return;
     recordGpuMoeBarrierPhase(profile, phase);
 }
@@ -1316,6 +1335,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.gpu_moe_finalizer_f32_calls = total.gpu_moe_finalizer_f32_calls -| prefix.gpu_moe_finalizer_f32_calls;
     delta.gpu_moe_finalizer_shared_calls = total.gpu_moe_finalizer_shared_calls -| prefix.gpu_moe_finalizer_shared_calls;
     delta.gpu_moe_finalizer_routed_only_calls = total.gpu_moe_finalizer_routed_only_calls -| prefix.gpu_moe_finalizer_routed_only_calls;
+    delta.gpu_moe_finalizer_gemma_weighted_post_norm_calls = total.gpu_moe_finalizer_gemma_weighted_post_norm_calls -| prefix.gpu_moe_finalizer_gemma_weighted_post_norm_calls;
+    delta.gpu_moe_finalizer_gemma_post_norm_calls = total.gpu_moe_finalizer_gemma_post_norm_calls -| prefix.gpu_moe_finalizer_gemma_post_norm_calls;
+    delta.gpu_moe_finalizer_gemma_staged_calls = total.gpu_moe_finalizer_gemma_staged_calls -| prefix.gpu_moe_finalizer_gemma_staged_calls;
     delta.q8_repacked_tg128_bytes = total.q8_repacked_tg128_bytes -| prefix.q8_repacked_tg128_bytes;
     delta.q8_repacked_exact_qwen_bytes = total.q8_repacked_exact_qwen_bytes -| prefix.q8_repacked_exact_qwen_bytes;
     delta.q8_repacked_quad_bytes = total.q8_repacked_quad_bytes -| prefix.q8_repacked_quad_bytes;
@@ -1369,7 +1391,7 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.commit_waits,
         nsToMs(profile.gpu_completion_wait_ns),
     });
-    log.info("  {s} moe finalizers: scalar+norm {d} scalar {d} f32+seed+norm {d} f32+norm {d} f32 {d} shared {d} routed {d}", .{
+    log.info("  {s} moe finalizers: scalar+norm {d} scalar {d} f32+seed+norm {d} f32+norm {d} f32 {d} shared {d} routed {d} | gemma weighted+post {d} post {d} staged {d}", .{
         label,
         profile.gpu_moe_finalizer_scalar_seed_norm_calls,
         profile.gpu_moe_finalizer_scalar_calls,
@@ -1378,6 +1400,9 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.gpu_moe_finalizer_f32_calls,
         profile.gpu_moe_finalizer_shared_calls,
         profile.gpu_moe_finalizer_routed_only_calls,
+        profile.gpu_moe_finalizer_gemma_weighted_post_norm_calls,
+        profile.gpu_moe_finalizer_gemma_post_norm_calls,
+        profile.gpu_moe_finalizer_gemma_staged_calls,
     });
     if (profile.route_pack_layers > 0) {
         const layers_f = @as(f64, @floatFromInt(profile.route_pack_layers));
@@ -2629,6 +2654,7 @@ fn supportsGroupedGemmaMoeCols(engine: *const InferenceEngine, t: GGMLType) bool
     return switch (t) {
         .q4_k => engine.dmmv_q4k_moe_cols_pipe.handle != null,
         .q5_1 => engine.dmmv_q5_1_moe_cols_pipe.handle != null,
+        .q8_0 => engine.dmmv_q8_0_moe_cols_pipe.handle != null,
         .q5_k => engine.dmmv_q5k_moe_cols_pipe.handle != null,
         .q6_k => engine.dmmv_q6k_moe_cols_pipe.handle != null,
         else => false,
@@ -2649,10 +2675,25 @@ fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
     return first_blocks + remaining_routes / moe_route_block_cols;
 }
 
+fn moeRoutePackThreadgroupSize(n_experts: u32) u32 {
+    if (n_experts <= 32) return 32;
+    if (n_experts <= 64) return 64;
+    if (n_experts <= 128) return 128;
+    return 256;
+}
+
 fn denseMoeColsDispatchBlocks(n_tokens: u32, n_experts: u32) u32 {
     if (n_tokens == 0 or n_experts == 0) return 0;
     const blocks_per_expert = (n_tokens + moe_cols_dense_dispatch_cols - 1) / moe_cols_dense_dispatch_cols;
     return n_experts * blocks_per_expert;
+}
+
+fn batchedPrefillMoeRouteInputSlots(n_tokens: u32, n_experts: u32, n_experts_used: u32) usize {
+    if (n_tokens == 0 or n_experts == 0 or n_experts_used == 0) return 0;
+
+    const n: usize = n_tokens;
+    if (n_tokens < 32) return n * @as(usize, n_experts_used);
+    return n;
 }
 
 fn gemmaBatchedPrefillRouteModeForShape(
@@ -2824,8 +2865,6 @@ fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine, engine.lm_head.info.type_)) return false;
 
     for (0..cfg.n_layers) |i| {
-        if (engine.layer_output_scales[i] != 1.0) return false;
-
         const lt = engine.layer_tensors[i];
         if (lt.attn_gate != null) return false;
         if (lt.attn_q_bias != null or lt.attn_k_bias != null or
@@ -2970,11 +3009,6 @@ fn logGemmaBatchedPrefillDecision(
     }
 
     for (0..cfg.n_layers) |i| {
-        if (engine.layer_output_scales[i] != 1.0) {
-            log.info("Metal profile: Gemma batched prefill guard failed: layer {d} output_scale={d:.6}", .{ i, engine.layer_output_scales[i] });
-            return;
-        }
-
         const lt = engine.layer_tensors[i];
         if (lt.attn_gate != null) {
             log.info("Metal profile: Gemma batched prefill guard failed: layer {d} attn_gate present", .{i});
@@ -3396,6 +3430,11 @@ const BatchedPrefillScratch = struct {
         const n_experts: usize = engine.config.n_experts;
         const k_used: usize = engine.config.n_experts_used;
         const route_slots = n * k_used;
+        const route_input_slots = batchedPrefillMoeRouteInputSlots(
+            n_tokens,
+            engine.config.n_experts,
+            engine.config.n_experts_used,
+        );
         const h = try metal_buffer.createBuffer(ctx, n * hidden_dim * f32_sz);
         errdefer {
             var mut = h;
@@ -3475,7 +3514,7 @@ const BatchedPrefillScratch = struct {
         if (active_block_count.cpu_ptr) |bytes| {
             @memset(bytes[0..active_block_count.size], 0);
         }
-        const moe_input = try metal_buffer.createBuffer(ctx, @max(route_slots * hidden_n * f32_sz, 4));
+        const moe_input = try metal_buffer.createBuffer(ctx, @max(route_input_slots * hidden_n * f32_sz, 4));
         errdefer {
             var mut = moe_input;
             metal_buffer.freeBuffer(&mut);
@@ -3877,6 +3916,7 @@ pub const InferenceEngine = struct {
     dmmv_q5_1_moe_pipe: MetalPipeline,
     dmmv_q5_1_moe_cols_pipe: MetalPipeline,
     dmmv_q8_0_moe_pipe: MetalPipeline,
+    dmmv_q8_0_moe_cols_pipe: MetalPipeline,
     dmmv_q5k_moe_pipe: MetalPipeline,
     dmmv_q5k_moe_cols_pipe: MetalPipeline,
     dmmv_q5k_moe_k512_pipe: MetalPipeline,
@@ -4539,6 +4579,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q5_1_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe");
         self.dmmv_q5_1_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
         self.dmmv_q8_0_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe");
+        self.dmmv_q8_0_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe_cols");
         self.dmmv_q5k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe");
         self.dmmv_q5k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
         self.dmmv_q5k_moe_k512_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512");
@@ -5485,6 +5526,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_moe_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_k512_pipe);
@@ -6762,25 +6804,25 @@ pub const InferenceEngine = struct {
             const is_gemma_moe = cfg.architecture == .gemma and hasExplicitGemmaMoeTensors(cfg, lt);
 
             dispatchRmsNormOnCmd(self, &cmd, &scratch.hidden, &scratch.norm, &self.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             dispatchGemmBatchedOnCmd(self, &cmd, q_t, &scratch.norm, &scratch.q, attn.q_dim, hidden_dim, n_tokens);
             dispatchGemmBatchedOnCmd(self, &cmd, k_t, &scratch.norm, &scratch.k, attn.kv_dim, hidden_dim, n_tokens);
             if (!attn.use_k_as_v) {
                 dispatchGemmBatchedOnCmd(self, &cmd, v_t, &scratch.norm, &scratch.v, attn.kv_dim, hidden_dim, n_tokens);
             }
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             const apply_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
             if (apply_v_unit_norm) {
                 const v_src = if (attn.use_k_as_v) &scratch.k else &scratch.v;
                 dispatchRmsNormOnCmd(self, &cmd, v_src, &scratch.v, &self.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads * n_tokens);
                 if (attn.use_k_as_v) {
-                    cmd.barrier();
+                    profileBarrier(&cmd, profile, .full_attn);
                 }
             } else if (attn.use_k_as_v) {
                 dispatchCopyF32OnCmd(self, &cmd, &scratch.k, &scratch.v, n_tokens * attn.kv_dim);
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .full_attn);
             }
             if (self.attn_q_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.q, &scratch.q, &self.attn_q_norm_bufs[layer_idx], attn.head_dim, cfg.n_heads * n_tokens);
@@ -6789,13 +6831,13 @@ pub const InferenceEngine = struct {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.k, &scratch.k, &self.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads * n_tokens);
             }
             if (self.attn_q_norm_present[layer_idx] or self.attn_k_norm_present[layer_idx] or apply_v_unit_norm) {
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .full_attn);
             }
 
             const rope_freq_buf = selectRopeFreqBuffer(self, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
             dispatchRopeBatchedOnCmd(self, &cmd, &scratch.q, &scratch.q, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, position_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
             dispatchRopeBatchedOnCmd(self, &cmd, &scratch.k, &scratch.k, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, position_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             const kv_len = position_base + n_tokens;
             if (self.kv_cache_q8) {
@@ -6806,7 +6848,7 @@ pub const InferenceEngine = struct {
                 const dst_elements = position_base * attn.kv_dim;
                 dispatchKvCacheWriteBatchedOnCmd(self, &cmd, layer_idx, &scratch.k, &scratch.v, dst_elements, n_tokens * attn.kv_dim);
             }
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             if (self.kv_cache_q8) {
                 dispatchFlashAttnBatchedQ8OnCmd(
@@ -6845,13 +6887,13 @@ pub const InferenceEngine = struct {
                     attn.sliding_window_size,
                 );
             }
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             dispatchGemmBatchedOnCmd(self, &cmd, o_t, &scratch.attn_out, &scratch.down, hidden_dim, attn.q_dim, n_tokens);
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
             if (self.post_attn_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.down, &scratch.down, &self.post_attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .full_attn);
             }
 
             {
@@ -6859,7 +6901,7 @@ pub const InferenceEngine = struct {
                 const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &self.ffn_norm_bufs[layer_idx] };
                 cmd.dispatchV2(&self.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
             }
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .full_attn);
 
             if (is_gemma_moe) {
                 try recordGemmaBatchedPrefillMoeOnCmd(self, &cmd, layer_idx, lt, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
@@ -6869,7 +6911,7 @@ pub const InferenceEngine = struct {
                 const down_t = lt.ffn_down.?;
                 dispatchGemmBatchedOnCmd(self, &cmd, gate_t, &scratch.norm, &scratch.gate, inter_dim, hidden_dim, n_tokens);
                 dispatchGemmBatchedOnCmd(self, &cmd, up_t, &scratch.norm, &scratch.up, inter_dim, hidden_dim, n_tokens);
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .dense_ffn);
 
                 {
                     const push = SwiGLUPush{ .n = inter_dim };
@@ -6877,13 +6919,13 @@ pub const InferenceEngine = struct {
                     const pipe = if (usesGeglu(cfg)) &self.geglu_batched_pipe else &self.swiglu_batched_pipe;
                     cmd.dispatchV2(pipe, .{ (inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
                 }
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .dense_ffn);
 
                 dispatchGemmBatchedOnCmd(self, &cmd, down_t, &scratch.swiglu, &scratch.down, hidden_dim, inter_dim, n_tokens);
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .dense_ffn);
                 if (self.post_ffn_norm_present[layer_idx]) {
                     dispatchRmsNormOnCmd(self, &cmd, &scratch.down, &scratch.down, &self.post_ffn_norm_bufs[layer_idx], hidden_dim, n_tokens);
-                    cmd.barrier();
+                    profileBarrier(&cmd, profile, .dense_ffn);
                 }
 
                 {
@@ -6892,7 +6934,7 @@ pub const InferenceEngine = struct {
                     const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down };
                     cmd.dispatchV2(&self.scale_acc_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
                 }
-                cmd.barrier();
+                profileBarrier(&cmd, profile, .dense_ffn);
             }
 
             if (profile) |p| {
@@ -6919,7 +6961,7 @@ pub const InferenceEngine = struct {
         }
 
         dispatchRmsNormOnCmd(self, &cmd, &scratch.hidden, &scratch.norm, &self.final_norm_gpu, hidden_dim, n_tokens);
-        cmd.barrier();
+        profileBarrier(&cmd, profile, .final);
 
         if (shouldCpuLmHeadFallback(self)) {
             commitAndWaitProfiled(&cmd, profile);
@@ -6935,7 +6977,7 @@ pub const InferenceEngine = struct {
         } else {
             const x_offset_bytes: u32 = (n_tokens - 1) * hidden_dim * @sizeOf(f32);
             dispatchLmHeadWithInputOffset(self, &cmd, &scratch.norm, &self.logits_buf, hidden_dim, cfg.vocab_size, x_offset_bytes);
-            cmd.barrier();
+            profileBarrier(&cmd, profile, .final);
             dispatchArgmaxOnCmd(self, &cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size);
             if (mode == .validate and self.private_decode_buffers) {
                 dispatchCopyF32OnCmd(self, &cmd, &self.logits_buf, &self.logits_readback_buf, cfg.vocab_size);
@@ -10783,6 +10825,7 @@ fn dispatchDmmvMoeColsOnCmd(
     const pipe: *const MetalPipeline = switch (tensor.info.type_) {
         .q4_k => &engine.dmmv_q4k_moe_cols_pipe,
         .q5_1 => &engine.dmmv_q5_1_moe_cols_pipe,
+        .q8_0 => &engine.dmmv_q8_0_moe_cols_pipe,
         .q5_k => &engine.dmmv_q5k_moe_cols_pipe,
         .q6_k => &engine.dmmv_q6k_moe_cols_pipe,
         else => return error.UnsupportedQuantType,
@@ -10840,6 +10883,7 @@ fn dispatchDmmvMoeColsActiveBlocksOnCmd(
     const pipe: *const MetalPipeline = switch (tensor.info.type_) {
         .q4_k => &engine.dmmv_q4k_moe_cols_pipe,
         .q5_1 => &engine.dmmv_q5_1_moe_cols_pipe,
+        .q8_0 => &engine.dmmv_q8_0_moe_cols_pipe,
         .q5_k => &engine.dmmv_q5k_moe_cols_pipe,
         .q6_k => &engine.dmmv_q6k_moe_cols_pipe,
         else => return error.UnsupportedQuantType,
@@ -12872,7 +12916,7 @@ fn dispatchMoeRoutePackOnCmd(
         .reserved = 0,
     };
     const bufs = [_]*const MetalBuffer{ routing, counts, ids };
-    cmd.dispatchV2(&engine.moe_route_pack_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
+    cmd.dispatchV2(&engine.moe_route_pack_pipe, .{ 1, 1, 1 }, .{ moeRoutePackThreadgroupSize(n_experts), 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
 }
 
 fn dispatchMoeRoutePackBlocksOnCmd(
@@ -12900,7 +12944,7 @@ fn dispatchMoeRoutePackBlocksOnCmd(
         .reserved = 0,
     };
     const bufs = [_]*const MetalBuffer{ routing, counts, ids, active_block_count, active_blocks };
-    cmd.dispatchV2(&engine.moe_route_pack_blocks_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
+    cmd.dispatchV2(&engine.moe_route_pack_blocks_pipe, .{ 1, 1, 1 }, .{ moeRoutePackThreadgroupSize(n_experts), 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
 }
 
 fn dispatchMoeRouteIdsOnCmd(
@@ -13254,14 +13298,42 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     } else {
         dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
     }
-    profileGpuMoeBarrier(cmd, profile, .router);
 
     if (!pre_ffw_norm_2_ready) {
         dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, pre_ffw_norm_2, hidden_dim, n_tokens);
         profileGpuMoeBarrier(cmd, profile, .gate_up);
     }
-    dispatchMoeRouteGatherOnCmd(engine, cmd, &scratch.moe_routing, &scratch.down, &scratch.moe_route_input, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
-    profileGpuMoeBarrier(cmd, profile, .gate_up);
+    const expert_input_buf: *const MetalBuffer = if (use_route_slot_moe) &scratch.moe_route_input else &scratch.down;
+    const expert_x_route_divisor: u32 = if (use_route_slot_moe) 1 else cfg.n_experts_used;
+    if (use_route_slot_moe) {
+        dispatchMoeRouteGatherOnCmd(engine, cmd, &scratch.moe_routing, &scratch.down, &scratch.moe_route_input, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
+    }
+    {
+        // llama.cpp `mul_mat_id` and Qwen's route-packed prefix path consume
+        // packed IDs by indexing token rows as `route / k`. Gemma's grouped
+        // route path can do the same, so only the short route-slot path still
+        // materializes duplicated route input.
+        var gate_up_barrier_bufs: [5]*const MetalBuffer = undefined;
+        var gate_up_barrier_count: usize = 0;
+        gate_up_barrier_bufs[gate_up_barrier_count] = expert_input_buf;
+        gate_up_barrier_count += 1;
+        if (use_route_slot_moe) {
+            gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_packed_ids;
+            gate_up_barrier_count += 1;
+        } else {
+            gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_expert_counts;
+            gate_up_barrier_count += 1;
+            gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_packed_ids;
+            gate_up_barrier_count += 1;
+            if (use_active_blocks) {
+                gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_active_blocks;
+                gate_up_barrier_count += 1;
+                gate_up_barrier_bufs[gate_up_barrier_count] = &scratch.moe_active_block_count;
+                gate_up_barrier_count += 1;
+            }
+        }
+        profileGpuMoeResourceBarrierBuffers(cmd, profile, .gate_up, gate_up_barrier_bufs[0..gate_up_barrier_count]);
+    }
 
     if (use_route_slot_moe) {
         if (use_fused_gate_up_geglu_routes) {
@@ -13317,7 +13389,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
                 engine,
                 cmd,
                 gate_up_layout.gate_tensor,
-                &scratch.moe_route_input,
+                expert_input_buf,
                 &scratch.moe_expert_swiglu,
                 &scratch.moe_expert_counts,
                 &scratch.moe_packed_ids,
@@ -13331,7 +13403,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
                 0,
                 0,
                 n_tokens,
-                1,
+                expert_x_route_divisor,
                 active_block_upper_bound,
             );
         } else {
@@ -13339,7 +13411,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
                 engine,
                 cmd,
                 gate_up_layout.gate_tensor,
-                &scratch.moe_route_input,
+                expert_input_buf,
                 &scratch.moe_expert_gate,
                 &scratch.moe_expert_counts,
                 &scratch.moe_packed_ids,
@@ -13352,14 +13424,14 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
                 0,
                 0,
                 n_tokens,
-                1,
+                expert_x_route_divisor,
                 active_block_upper_bound,
             );
             try dispatchDmmvMoeColsActiveBlocksOnCmd(
                 engine,
                 cmd,
                 gate_up_layout.up_tensor,
-                &scratch.moe_route_input,
+                expert_input_buf,
                 &scratch.moe_expert_up,
                 &scratch.moe_expert_counts,
                 &scratch.moe_packed_ids,
@@ -13372,7 +13444,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
                 0,
                 0,
                 n_tokens,
-                1,
+                expert_x_route_divisor,
                 active_block_upper_bound,
             );
         }
@@ -13381,7 +13453,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             engine,
             cmd,
             gate_up_layout.gate_tensor,
-            &scratch.moe_route_input,
+            expert_input_buf,
             &scratch.moe_expert_gate,
             &scratch.moe_expert_counts,
             &scratch.moe_packed_ids,
@@ -13392,7 +13464,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             0,
             0,
             n_tokens,
-            1,
+            expert_x_route_divisor,
             cfg.n_experts,
             n_tokens,
         );
@@ -13400,7 +13472,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             engine,
             cmd,
             gate_up_layout.up_tensor,
-            &scratch.moe_route_input,
+            expert_input_buf,
             &scratch.moe_expert_up,
             &scratch.moe_expert_counts,
             &scratch.moe_packed_ids,
@@ -13411,7 +13483,7 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
             0,
             0,
             n_tokens,
-            1,
+            expert_x_route_divisor,
             cfg.n_experts,
             n_tokens,
         );
@@ -13491,11 +13563,13 @@ fn recordGemmaBatchedPrefillMoeOnCmd(
     }
     profileGpuMoeBarrier(cmd, profile, .finalizer);
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.down, &scratch.down, post_ffw_norm_2, hidden_dim, n_tokens);
-    profileGpuMoeBarrier(cmd, profile, .finalizer);
+    // The shared expert gate/up path reads scratch.norm, so only publish the
+    // routed expert contribution here; the final add is the first consumer.
+    profileGpuMoeResourceBarrierBuffers(cmd, profile, .finalizer, &.{&scratch.down});
 
     dispatchGemmBatchedOnCmd(engine, cmd, gate_shexp, &scratch.norm, &scratch.gate, shexp_inter_dim, hidden_dim, n_tokens);
     dispatchGemmBatchedOnCmd(engine, cmd, up_shexp, &scratch.norm, &scratch.up, shexp_inter_dim, hidden_dim, n_tokens);
-    profileGpuMoeBarrier(cmd, profile, .gate_up);
+    profileGpuMoeBarrierBuffers(cmd, profile, .gate_up, &.{ &scratch.gate, &scratch.up });
     {
         const push = SwiGLUPush{ .n = shexp_inter_dim };
         const bufs = [_]*const MetalBuffer{ &scratch.gate, &scratch.swiglu, &scratch.up };
@@ -16913,6 +16987,7 @@ fn supportsQwenMoeRoutePackCols(engine: *const InferenceEngine, quant_type: GGML
     return switch (quant_type) {
         .q4_k => engine.dmmv_q4k_moe_cols_pipe.handle != null,
         .q5_1 => engine.dmmv_q5_1_moe_cols_pipe.handle != null,
+        .q8_0 => engine.dmmv_q8_0_moe_cols_pipe.handle != null,
         .q5_k => engine.dmmv_q5k_moe_cols_pipe.handle != null,
         .q6_k => engine.dmmv_q6k_moe_cols_pipe.handle != null,
         else => false,
@@ -18469,7 +18544,15 @@ fn runGemmaExplicitMoeFallback(
         dispatchDmmvOnCmd(engine, &cmd, gate_shexp.?, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
         dispatchDmmvOnCmd(engine, &cmd, up_shexp.?, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
     }
-    profileBarrier(&cmd, profile, .fallback_moe);
+    if (use_batched_moe_dispatch) {
+        if (has_shexp) {
+            profileBarrierBuffers(&cmd, profile, .fallback_moe, &.{ &engine.expert_gate_batch_buf, &engine.expert_up_batch_buf, &engine.gate_buf, &engine.up_buf });
+        } else {
+            profileBarrierBuffers(&cmd, profile, .fallback_moe, &.{ &engine.expert_gate_batch_buf, &engine.expert_up_batch_buf });
+        }
+    } else {
+        profileBarrier(&cmd, profile, .fallback_moe);
+    }
 
     if (use_batched_moe_dispatch) {
         // Batched GeGLU across all n_experts_used experts in one dispatch.
@@ -18484,7 +18567,15 @@ fn runGemmaExplicitMoeFallback(
     if (has_shexp) {
         dispatchFfnActivationOnCmd(engine, &cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, shexp_inter_dim);
     }
-    profileBarrier(&cmd, profile, .fallback_moe);
+    if (use_batched_moe_dispatch) {
+        if (has_shexp) {
+            profileBarrierBuffers(&cmd, profile, .fallback_moe, &.{ &engine.expert_swiglu_batch_buf, &engine.swiglu_buf });
+        } else {
+            profileBarrierBuffers(&cmd, profile, .fallback_moe, &.{&engine.expert_swiglu_batch_buf});
+        }
+    } else {
+        profileBarrier(&cmd, profile, .fallback_moe);
+    }
 
     const down_supported = engine.dmmvPipelineForType(down_exps, hidden_dim, inter_dim) != null;
     const use_batched_q8_down =
@@ -18627,11 +18718,16 @@ fn runGemmaExplicitMoeFallback(
     // keep appending dispatches to the same CB for a single commit per layer.
     if (needs_mid_commit) {
         cmd = try beginProfiledCommand(engine, profile);
+    }
+    // The zero-fill writes moe_out_buf and is independent of the down
+    // projections above. Let the following barrier join both producer sets
+    // before the weighted accumulate instead of serializing zero after down.
+    dispatchZeroF32OnCmd(engine, &cmd, &engine.moe_out_buf, hidden_dim);
+    if (use_batched_down) {
+        profileBarrierBuffers(&cmd, profile, .fallback_moe, &.{ &engine.moe_out_buf, &engine.expert_down_batch_buf, &engine.down_buf });
     } else {
         profileBarrier(&cmd, profile, .fallback_moe);
     }
-    dispatchZeroF32OnCmd(engine, &cmd, &engine.moe_out_buf, hidden_dim);
-    profileBarrier(&cmd, profile, .fallback_moe);
     if (cfg.n_experts_used == 8) {
         if (use_batched_down) {
             const moe_push = MoeAccBatchedPush{
@@ -19002,6 +19098,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         // tail. This removes the standalone moe_weighted_acc_scaled dispatch and
         // its dependency barrier on the token-major prefill path while preserving
         // the same ffn_down_exps_scale folding.
+        recordGpuMoeFinalizerKind(profile, .gemma_weighted_post_norm);
         dispatchGemmaMoeWeightedPostNormResidualOnCmd(
             engine,
             cmd,
@@ -19035,9 +19132,10 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         cfg.n_experts_used,
         hidden_dim,
     );
-    profileGpuMoeBarrier(cmd, profile, .finalizer); // expert contribution visible before post expert norm
+    profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{&engine.moe_out_buf}); // expert contribution visible before post expert norm
 
     if (use_fused_post_norm_residual) {
+        recordGpuMoeFinalizerKind(profile, .gemma_post_norm);
         dispatchGemmaMoePostNormResidualOnCmd(
             engine,
             cmd,
@@ -19056,9 +19154,10 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         return;
     }
 
+    recordGpuMoeFinalizerKind(profile, .gemma_staged);
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.moe_out_buf, &engine.moe_out_buf, post_ffw_norm_2, hidden_dim, 1);
     dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.down_buf, &engine.down_buf, post_ffw_norm_1, hidden_dim, 1);
-    profileGpuMoeBarrier(cmd, profile, .finalizer); // post expert/shared norms visible before shared add
+    profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{ &engine.moe_out_buf, &engine.down_buf }); // post expert/shared norms visible before shared add
 
     if (lt.ffn_gate_inp_shexp != null) {
         dispatchSigmoidScaleAccOnCmd(engine, cmd, &engine.moe_out_buf, &engine.down_buf, &engine.router_logits_buf, hidden_dim);
@@ -19067,11 +19166,11 @@ fn recordGemmaGpuRoutedMoeOnCmd(
         const acc_bufs = [_]*const MetalBuffer{ &engine.moe_out_buf, &engine.down_buf };
         cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
     }
-    profileGpuMoeBarrier(cmd, profile, .finalizer); // combined MoE contribution visible before final post-FFN norm
+    profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{&engine.moe_out_buf}); // combined MoE contribution visible before final post-FFN norm
 
     if (engine.post_ffn_norm_present[layer_idx]) {
         dispatchRmsNormOnCmd(engine, cmd, &engine.moe_out_buf, &engine.moe_out_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
-        profileGpuMoeBarrier(cmd, profile, .finalizer);
+        profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{&engine.moe_out_buf});
     }
 
     if (validate_moe) {
@@ -19116,7 +19215,7 @@ fn recordGemmaGpuRoutedMoeOnCmd(
     const res_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
     const res_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.moe_out_buf };
     cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &res_bufs, &res_push, @sizeOf(ScaleAccPush), 0);
-    profileGpuMoeBarrier(cmd, profile, .finalizer); // hidden_buf visible to next layer
+    profileGpuMoeBarrierBuffers(cmd, profile, .finalizer, &.{&engine.hidden_buf}); // hidden_buf visible to next layer
 }
 
 fn recordGpuRoutedBatchedMoeOnCmd(
@@ -27436,7 +27535,7 @@ test "gemma q8 routed moe decode default gates Gemma 26B shape" {
         .full_attn_interval = 0,
         .shared_expert_intermediate_dim = 0,
     };
-    try std.testing.expect(!defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
+    try std.testing.expect(defaultGemmaQ8MoeDecodeEnabled(gemma_cfg));
     try std.testing.expect(defaultGemmaQ8MoeFallbackDownEnabled(gemma_cfg));
     try std.testing.expect(!defaultGemmaMoePostNormResidualDecodeEnabled(gemma_cfg));
     try std.testing.expect(isGemma26A4BMoeShape(gemma_cfg));
@@ -28115,6 +28214,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q5_1_moe_cols_pipe);
     var dmmv_q8_0_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe");
     defer metal_pipeline.freePipeline(&dmmv_q8_0_moe_pipe);
+    var dmmv_q8_0_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe_cols");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_moe_cols_pipe);
     var dmmv_q5k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe");
     defer metal_pipeline.freePipeline(&dmmv_q5k_moe_pipe);
     var dmmv_q5k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
@@ -28269,6 +28370,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q5_1_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q5_1_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_moe_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_k512_pipe.handle != null);
@@ -28736,21 +28838,18 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
         const block_idx = entry >> 16;
         try std.testing.expect(expert < @as(u32, @intCast(n_experts)));
         try std.testing.expect(block_idx < 4);
+        try std.testing.expect(!seen_blocks[@intCast(expert)][@intCast(block_idx)]);
         seen_blocks[@intCast(expert)][@intCast(block_idx)] = true;
     }
+    var expected_active_blocks: usize = 0;
     for (0..n_experts) |expert| {
         const expected_blocks = (counts_ptr[expert] + moe_route_block_cols - 1) / moe_route_block_cols;
+        expected_active_blocks += @intCast(expected_blocks);
         for (0..@as(usize, @intCast(expected_blocks))) |block_idx| {
             try std.testing.expect(seen_blocks[expert][block_idx]);
         }
     }
-
-    var expected_total_blocks: usize = 0;
-    for (0..n_experts) |expert| {
-        const expected_blocks = (counts_ptr[expert] + moe_route_block_cols - 1) / moe_route_block_cols;
-        expected_total_blocks += @intCast(expected_blocks);
-    }
-    try std.testing.expectEqual(@as(usize, @intCast(active_count_ptr[0])), expected_total_blocks);
+    try std.testing.expectEqual(expected_active_blocks, @as(usize, @intCast(active_count_ptr[0])));
 }
 
 test "moe_route_ids shader flattens batched routing in route order" {
@@ -29458,6 +29557,48 @@ test "BatchedPrefillScratch allocates Gemma MoE route scratch" {
     try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_expert_down.size);
 }
 
+test "BatchedPrefillScratch sizes active-block shared output scratch by token" {
+    var device = try metal_device.MetalDevice.init(std.testing.allocator, 0);
+    defer device.deinit();
+
+    var engine: InferenceEngine = undefined;
+    engine.device = &device;
+    engine.config = .{
+        .architecture = .gemma,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_heads = 1,
+        .head_dim = 16,
+        .hidden_dim = 32,
+        .intermediate_dim = 16,
+        .vocab_size = 64,
+        .context_length = 128,
+        .rope_freq_base = 10000.0,
+        .n_experts = 6,
+        .n_experts_used = 3,
+        .rope_dim = 16,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 48,
+    };
+
+    const n_tokens: u32 = 70;
+    const q_dim: u32 = 32;
+    const kv_dim: u32 = 16;
+    const inter_dim: u32 = 16;
+    var scratch = try BatchedPrefillScratch.init(&engine, n_tokens, q_dim, kv_dim, inter_dim);
+    defer scratch.deinit();
+
+    const route_slots = n_tokens * engine.config.n_experts_used;
+    try std.testing.expectEqual(route_slots, scratch.moe_route_slots);
+    try std.testing.expectEqual(@as(usize, n_tokens * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_route_input.size);
+    try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_expert_down.size);
+}
+
 test "maxPackedMoeRouteBlocks bounds active route block grid" {
     try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(0, 256));
     try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(16, 0));
@@ -29471,6 +29612,14 @@ test "gemma batched prefill route mode names active-block selection" {
     try std.testing.expectEqualStrings("route-slots", gemmaBatchedPrefillRouteModeForShape(20, true, true, true));
     try std.testing.expectEqualStrings("active-blocks", gemmaBatchedPrefillRouteModeForShape(70, true, true, true));
     try std.testing.expectEqualStrings("dense-expert", gemmaBatchedPrefillRouteModeForShape(70, true, true, false));
+}
+
+test "moe route pack threadgroup size matches expert buckets" {
+    try std.testing.expectEqual(@as(u32, 32), moeRoutePackThreadgroupSize(4));
+    try std.testing.expectEqual(@as(u32, 32), moeRoutePackThreadgroupSize(32));
+    try std.testing.expectEqual(@as(u32, 64), moeRoutePackThreadgroupSize(33));
+    try std.testing.expectEqual(@as(u32, 128), moeRoutePackThreadgroupSize(128));
+    try std.testing.expectEqual(@as(u32, 256), moeRoutePackThreadgroupSize(256));
 }
 
 test "gemma moe prefill path name exposes mixed validation replay" {

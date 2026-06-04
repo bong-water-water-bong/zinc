@@ -6,6 +6,7 @@
   "scripts": {
     "graph:render": "bun tools/render_graph_report.ts",
     "bench:api": "bun tools/benchmark_api.mjs",
+    "eval:opencode": "bun tools/opencode_eval.mjs",
     "seo:ga4-snapshot": "node tools/analyze_ga4_snapshot.mjs",
     "seo:analyze": "node tools/analyze_seo_exports.mjs",
     "test": "bun test",
