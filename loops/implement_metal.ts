@@ -3223,9 +3223,9 @@ export function shouldRunMetalShapesEvidence(args: {
   description: string;
   selfAnalysis: string;
   ideas: string[];
-}): boolean {
-  if (METAL_SHAPES_EVERY <= 0) return false;
-  if (!args.kept || !args.containsReference) return false;
+}, metalShapesEvery: number = METAL_SHAPES_EVERY): boolean {
+  if (metalShapesEvery <= 0) return false;
+  if (!args.containsReference) return false;
 
   const text = [
     args.description,
@@ -3235,6 +3235,9 @@ export function shouldRunMetalShapesEvidence(args: {
   const explicitShapesRequest =
     /\b(bench-metal-shapes|metal-shapes|gemma26_prefill_hot|microbench|shared_gate_gemm|exact-shape)\b/.test(text);
 
+  const evidenceStep = args.stepKind === "analysis" || args.stepKind === "enablement" || explicitShapesRequest;
+  if (!args.kept && !evidenceStep) return false;
+
   if (
     gemmaPrefillActualPathIsQueuedOffPath(args.state.lastProfileOutput) &&
     (args.state.lastMetalShapesOutput ?? "").trim().length > 0 &&
@@ -3243,7 +3246,9 @@ export function shouldRunMetalShapesEvidence(args: {
     return false;
   }
 
-  if (args.cycle % METAL_SHAPES_EVERY === 0) return true;
+  if (args.cycle % metalShapesEvery === 0) {
+    return args.kept || evidenceStep;
+  }
 
   return isGemmaPrefillPostBreakthrough(args.state) &&
     (args.state.stalledCycles >= GEMMA_PLATEAU_STALL_CYCLES ||

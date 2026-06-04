@@ -37,6 +37,7 @@ import {
   shouldRejectPlateauNeutralKeep,
   shouldConfirmCandidate,
   shouldFinalizeBestTree,
+  shouldRunMetalShapesEvidence,
   shouldRestorePromotedBestDuringPlateau,
   shouldRejectQwen36PlateauNeutralKeep,
   snapshotFromResult,
@@ -1038,6 +1039,48 @@ describe("buildPrompt", () => {
     expect(inferGemmaRouteTokensForMetalShapes(
       "info(forward):   prefill route pack: layers 30 slots 16800 avg_slots/layer 560.0 active_block_upper 5460",
     )).toBe(70);
+  });
+
+  test("Gemma plateau can refresh Metal-shapes after reverted analysis evidence", () => {
+    const state = makeState({
+      effortId: 11,
+      effortFile: "MULTI_HOUR_EFFORT_11_METAL_GEMMA_M4.md",
+      effortPlan: "# Effort 11\nGemma 4 26B-A4B MoE",
+      metricMode: "prefill",
+      bestTokPerSec: 383.6,
+      currentBest: { tokPerSec: 383.6, containsReference: true },
+      stalledCycles: 35,
+      lastProfileOutput: "info(forward):   prefill actual path: batched-route-pack default_batched=yes structural_batched=yes route_layers=30 queued_chunks=0",
+      lastMetalShapesCycle: 28,
+      lastMetalShapesOk: true,
+      lastMetalShapesOutput: "stale cycle-28 evidence",
+      cycles: [
+        makeCycle({ cycle: 124, kept: true, containsReference: true, tokPerSec: 383.6 }),
+        makeCycle({ cycle: 158, kept: false, containsReference: true, tokPerSec: 362.1, stepKind: "analysis" }),
+      ],
+    });
+
+    expect(shouldRunMetalShapesEvidence({
+      state,
+      cycle: 159,
+      kept: false,
+      containsReference: true,
+      stepKind: "analysis",
+      description: "Add exact-shape evidence for Gemma Q8 shared",
+      selfAnalysis: "Analysis-only evidence; speed gate may revert this source change.",
+      ideas: [],
+    }, 1)).toBe(true);
+
+    expect(shouldRunMetalShapesEvidence({
+      state,
+      cycle: 159,
+      kept: false,
+      containsReference: true,
+      stepKind: "optimization",
+      description: "Retune Q8 shared kernel",
+      selfAnalysis: "No evidence step.",
+      ideas: [],
+    }, 1)).toBe(false);
   });
 
   test("Gemma plateau rejects neutral optimization churn but allows evidence work", () => {
