@@ -22,6 +22,7 @@ import {
   repairArgumentsJson,
   repairEditOldStringArgs,
   repairOpenAiToolCalls,
+  repairSseText,
   repairSseEvent,
   sendProxyErrorResponse,
   shouldSuppressAssistantContent,
@@ -29,6 +30,7 @@ import {
   stripToolBoundaryTail,
   syntheticCompletionForRequest,
   syntheticDiscoveredSourceReadCalls,
+  syntheticPostEditTestCall,
   syntheticPrefetchReadCalls,
   syntheticResponseText,
   syntheticToolCallResponseText,
@@ -468,6 +470,155 @@ describe("synthetic OpenCode responses", () => {
       },
     );
   });
+
+  test("runs the requested test command after successful source writes", () => {
+    const request = {
+      model: "zinc/qwen",
+      stream: true,
+      tools: [
+        { type: "function", function: { name: "bash" } },
+        { type: "function", function: { name: "write" } },
+      ],
+      messages: [
+        {
+          role: "user",
+          content:
+            "Working directory: /tmp/project\nRun npm test 2>&1 after edits. Continue until all tests pass, then stop.",
+        },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "call_write_1",
+              type: "function",
+              function: {
+                name: "write",
+                arguments: JSON.stringify({
+                  filePath: "/tmp/project/src/index.mjs",
+                  content: "export const ok = true;\n",
+                }),
+              },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_write_1", content: "Wrote file successfully." },
+      ],
+    };
+
+    const call = syntheticPostEditTestCall(request);
+    expect(call?.function.name).toBe("bash");
+    expect(JSON.parse(call.function.arguments)).toEqual({
+      command: "npm test 2>&1",
+      description: "Run tests after source edits",
+    });
+    expect(syntheticCompletionForRequest(request)).toEqual({
+      kind: "post_edit_test",
+      toolCalls: [call],
+    });
+  });
+
+  test("does not rerun the requested test command after a post-edit test result", () => {
+    const request = {
+      model: "zinc/qwen",
+      stream: true,
+      tools: [
+        { type: "function", function: { name: "bash" } },
+        { type: "function", function: { name: "edit" } },
+      ],
+      messages: [
+        {
+          role: "user",
+          content:
+            "Working directory: /tmp/project\nRun npm test2>&1 after edits. Continue until all tests pass, then stop.",
+        },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "call_edit_1",
+              type: "function",
+              function: {
+                name: "edit",
+                arguments: JSON.stringify({
+                  filePath: "/tmp/project/src/index.mjs",
+                  oldString: "false",
+                  newString: "true",
+                }),
+              },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_edit_1", content: "Edit applied successfully." },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "call_test_1",
+              type: "function",
+              function: {
+                name: "bash",
+                arguments: JSON.stringify({ command: "npm test 2>&1" }),
+              },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_test_1", content: "1 pass\n1 fail\n" },
+      ],
+    };
+
+    expect(syntheticPostEditTestCall(request)).toBe(null);
+    expect(syntheticCompletionForRequest(request)).toBe(null);
+  });
+
+  test("keeps the final success shortcut ahead of post-edit test synthesis", () => {
+    const request = {
+      ...successfulFinalBody,
+      tools: [
+        { type: "function", function: { name: "bash" } },
+        { type: "function", function: { name: "write" } },
+      ],
+      messages: [
+        {
+          role: "user",
+          content:
+            "Fix the failing tests and stop after all tests pass. Run npm test 2>&1 after edits.",
+        },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "call_write_1",
+              type: "function",
+              function: { name: "write", arguments: JSON.stringify({ filePath: "/tmp/project/src/index.mjs" }) },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_write_1", content: "Wrote file successfully." },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "call_test_1",
+              type: "function",
+              function: { name: "bash", arguments: JSON.stringify({ command: "npm test 2>&1" }) },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_test_1", content: "\n 2 pass\n 0 fail\n" },
+      ],
+    };
+
+    expect(syntheticPostEditTestCall(request)).toBe(null);
+    expect(syntheticCompletionForRequest(request)).toEqual({
+      kind: "tests_passed",
+      content: "Done. All tests pass.",
+    });
+  });
 });
 
 describe("tool argument repair", () => {
@@ -740,6 +891,57 @@ describe("tool argument repair", () => {
     expect(args.path).toBe("/private/tmp/zinc-opencode-smoke4");
     expect(args.pattern).toBe("test/**/*");
     expect(repaired.event).not.toContain("<//parameter>");
+  });
+
+  test("repairs complete SSE text even when the upstream response is not typed as event-stream", () => {
+    withTempProject({ "src/pricing.mjs": "export const price = 1;\n" }, (dir) => {
+      const filePath = `${dir}/src/pricing.mjs`;
+      const request = {
+        tools: [
+          { type: "function", function: { name: "bash" } },
+          { type: "function", function: { name: "read" } },
+          { type: "function", function: { name: "write" } },
+        ],
+        messages: [
+          { role: "user", content: `Working directory: ${dir}\nRun npm test 2>&1 after edits.` },
+          {
+            role: "tool",
+            content:
+              `<path>${filePath}</path>\n<type>file</type>\n<content>\n` +
+              "1: export const price = 1;\n" +
+              "\n(End of file - total 1 lines)\n</content>",
+          },
+        ],
+      };
+      const text =
+        `data: ${JSON.stringify({
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_read_again",
+                    type: "function",
+                    function: { name: "read", arguments: JSON.stringify({ filePath }) },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        })}\n\n` +
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n` +
+        "data: [DONE]\n\n";
+
+      const repaired = repairSseText(text, request);
+      expect(repaired.changed).toBe(true);
+      expect(repaired.repairedEvents).toBe(1);
+      expect(repaired.text).toContain('"name":"bash"');
+      expect(repaired.text).toContain("OpenCode repeated-read guard");
+      expect(repaired.text).not.toContain('"name":"read"');
+    });
   });
 
   test("repairs llama.cpp split bash command argument streams", () => {

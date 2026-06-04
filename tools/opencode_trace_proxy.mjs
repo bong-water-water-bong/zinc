@@ -182,6 +182,10 @@ export function syntheticCompletionForRequest(body) {
   if (discoveredReadCalls.length > 0) {
     return { kind: "discovered_source_reads", toolCalls: discoveredReadCalls };
   }
+  const postEditTestCall = syntheticPostEditTestCall(body);
+  if (postEditTestCall) {
+    return { kind: "post_edit_test", toolCalls: [postEditTestCall] };
+  }
   return null;
 }
 
@@ -332,6 +336,87 @@ export function syntheticDiscoveredSourceReadCalls(body) {
         arguments: JSON.stringify({ filePath }),
       },
     }));
+}
+
+function toolCallFunctionName(call) {
+  return String(call?.function?.name ?? call?.name ?? "").toLowerCase();
+}
+
+function parseToolCallArgs(call) {
+  const raw = call?.function?.arguments ?? call?.arguments ?? {};
+  if (raw && typeof raw === "object") return raw;
+  if (typeof raw !== "string") return {};
+  try {
+    const parsed = JSON.parse(raw || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function hasConcreteTestCommand(command) {
+  return typeof command === "string" && command.trim() !== "" && command !== "the project tests";
+}
+
+function isTestCommandRun(command, expected) {
+  if (!hasConcreteTestCommand(expected)) return false;
+  const normalizedCommand = normalizeShellCommand(command ?? "").trim();
+  const normalizedExpected = normalizeShellCommand(expected).trim();
+  return normalizedCommand === normalizedExpected;
+}
+
+export function syntheticPostEditTestCall(body) {
+  if (!body || isOpenCodeTitleRequest(body) || isOpenCodeSuccessfulTestFinalRequest(body)) return null;
+  if (!hasToolNamed(body, "bash")) return null;
+
+  const testCommand = inferTestCommand(body);
+  if (!hasConcreteTestCommand(testCommand)) return null;
+
+  const callsById = new Map();
+  let lastMutationResultIndex = -1;
+  let lastTestResultIndex = -1;
+
+  for (const [index, message] of (body?.messages ?? []).entries()) {
+    if (message?.role === "assistant") {
+      for (const call of message.tool_calls ?? []) {
+        if (call?.id) callsById.set(call.id, call);
+      }
+      continue;
+    }
+
+    if (message?.role !== "tool") continue;
+    const call = callsById.get(message.tool_call_id);
+    if (!call) continue;
+
+    const name = toolCallFunctionName(call);
+    const content = messageText(message);
+    if ((name === "write" || name === "edit") && /(?:Wrote file successfully|Edit applied successfully)/i.test(content)) {
+      lastMutationResultIndex = index;
+    }
+
+    if (name === "bash" || name === "shell") {
+      const args = parseToolCallArgs(call);
+      if (isTestCommandRun(args.command, testCommand)) {
+        lastTestResultIndex = index;
+      }
+    }
+  }
+
+  if (lastMutationResultIndex < 0 || lastTestResultIndex > lastMutationResultIndex) return null;
+
+  const command = normalizeShellCommand(testCommand);
+  return {
+    index: 0,
+    id: syntheticToolCallId("call_post_edit_test", `${command}:${lastMutationResultIndex}`),
+    type: "function",
+    function: {
+      name: "bash",
+      arguments: JSON.stringify({
+        command,
+        description: "Run tests after source edits",
+      }),
+    },
+  };
 }
 
 export function shouldSuppressAssistantContent(body) {
@@ -932,6 +1017,36 @@ export function repairSseEvent(event, requestBody, state = {}) {
   return { event: out.join("\n"), changed, suppressedContentEvents };
 }
 
+function looksLikeSseText(text) {
+  return /^\s*data:\s/m.test(text ?? "");
+}
+
+export function repairSseText(text, requestBody, state = {}) {
+  let pending = String(text ?? "");
+  let out = "";
+  let changed = false;
+  let repairedEvents = 0;
+  let suppressedContentEvents = 0;
+  let idx;
+
+  while ((idx = pending.indexOf("\n\n")) >= 0) {
+    const event = pending.slice(0, idx + 2);
+    pending = pending.slice(idx + 2);
+    const repaired = repairSseEvent(event, requestBody, state);
+    out += repaired.event;
+    if (repaired.changed) {
+      changed = true;
+      repairedEvents += 1;
+    }
+    if (repaired.suppressedContentEvents) {
+      suppressedContentEvents += repaired.suppressedContentEvents;
+    }
+  }
+
+  out += pending;
+  return { text: out, changed, repairedEvents, suppressedContentEvents };
+}
+
 function upstreamUrlFor(incomingUrl, upstream) {
   const base = new URL(upstream);
   const incoming = new URL(incomingUrl, "http://proxy.local");
@@ -1153,7 +1268,21 @@ async function handleProxyRequest(req, res, opts) {
       res.end();
     } else {
       let text = await upstreamResponse.text();
-      if (opts.repairToolPaths && parsedBody && text.trim().startsWith("{")) {
+      if (opts.repairToolPaths && parsedBody && looksLikeSseText(text)) {
+        const repairState = {};
+        const repaired = repairSseText(text, parsedBody, repairState);
+        if (repaired.changed) {
+          trace.response_metrics.repaired_events += repaired.repairedEvents;
+          text = repaired.text;
+        }
+        if (repaired.suppressedContentEvents) {
+          trace.response_metrics.suppressed_content_events += repaired.suppressedContentEvents;
+        }
+        if (repairState.suppressedContentChars) {
+          trace.response_metrics.suppressed_content_chars = repairState.suppressedContentChars;
+          trace.suppressed_content_preview = repairState.suppressedContentPreview ?? "";
+        }
+      } else if (opts.repairToolPaths && parsedBody && text.trim().startsWith("{")) {
         const payload = JSON.parse(text);
         if (repairOpenAiToolCalls(payload, parsedBody)) {
           trace.response_metrics.repaired_events += 1;
