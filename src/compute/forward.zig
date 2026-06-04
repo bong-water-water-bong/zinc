@@ -15394,12 +15394,61 @@ pub const InferenceEngine = struct {
                 self.decode_cmd.computeBuffersBarrier(&i8_ranges);
             }
 
-            const can_fuse_q8_qkv_z = wqkv_t.info.type_ == .q8_0 and
+            const can_mul_mm_q8_qkv_z = !self.use_fused_ssm_qkv_z and
+                wqkv_t.info.type_ == .q8_0 and
+                z_t.info.type_ == .q8_0 and
+                self.dmmv.pipeline_mul_mm_q8_0 != null and
+                self.instance.push_descriptor_fn != null and
+                n_tokens >= 16 and
+                (hidden_dim & 31) == 0 and
+                (conv_channels & 31) == 0 and
+                (d_inner & 31) == 0;
+            const can_fuse_q8_qkv_z = self.use_fused_ssm_qkv_z and
+                wqkv_t.info.type_ == .q8_0 and
                 z_t.info.type_ == .q8_0 and
                 self.dmmv.pipeline_q8_0_fused_pair != null and
                 self.instance.push_descriptor_fn != null and
                 (hidden_dim & 31) == 0;
-            if (can_fuse_q8_qkv_z) {
+            if (can_mul_mm_q8_qkv_z) {
+                const ssm_proj_qkv_z_phase = self.beginProfilePhase();
+                try self.dmmv.recordMulMmQ8_0(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    wqkv_t.gpu_buffer.handle,
+                    wqkv_t.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    scratch_gate.handle,
+                    qkv_total_bytes,
+                    conv_channels,
+                    n_tokens,
+                    hidden_dim,
+                    hidden_dim,
+                    conv_channels,
+                    0,
+                    0,
+                    0,
+                );
+                try self.dmmv.recordMulMmQ8_0(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    z_t.gpu_buffer.handle,
+                    z_t.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    scratch_up.handle,
+                    z_total_bytes,
+                    d_inner,
+                    n_tokens,
+                    hidden_dim,
+                    hidden_dim,
+                    d_inner,
+                    0,
+                    0,
+                    0,
+                );
+                self.endProfilePhase(.ssm_proj_qkv_z, ssm_proj_qkv_z_phase);
+            } else if (can_fuse_q8_qkv_z) {
                 const ssm_proj_qkv_z_phase = self.beginProfilePhase();
                 try self.dispatchDmmvQ8_0FusedPairBatched(
                     wqkv_t,
