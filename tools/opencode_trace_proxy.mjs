@@ -178,6 +178,10 @@ export function syntheticCompletionForRequest(body) {
   if (prefetchReadCalls.length > 0) {
     return { kind: "prefetch_reads", toolCalls: prefetchReadCalls };
   }
+  const discoveredReadCalls = syntheticDiscoveredSourceReadCalls(body);
+  if (discoveredReadCalls.length > 0) {
+    return { kind: "discovered_source_reads", toolCalls: discoveredReadCalls };
+  }
   return null;
 }
 
@@ -296,6 +300,32 @@ export function syntheticPrefetchReadCalls(body) {
     .map((filePath, index) => ({
       index,
       id: syntheticToolCallId("call_prefetch_read", filePath),
+      type: "function",
+      function: {
+        name: "read",
+        arguments: JSON.stringify({ filePath }),
+      },
+    }));
+}
+
+export function syntheticDiscoveredSourceReadCalls(body) {
+  if (!body || isOpenCodeTitleRequest(body) || isOpenCodeSuccessfulTestFinalRequest(body)) return [];
+  if (!hasToolResultMessages(body) || !hasReadTool(body)) return [];
+
+  const alreadyRead = extractReadFileSnapshots(body);
+  return editableKnownFilePaths(body)
+    .filter((filePath) => !alreadyRead.has(filePath))
+    .filter((filePath) => {
+      try {
+        return existsSync(filePath) && statSync(filePath).isFile();
+      } catch {
+        return false;
+      }
+    })
+    .slice(0, 8)
+    .map((filePath, index) => ({
+      index,
+      id: syntheticToolCallId("call_discovered_read", filePath),
       type: "function",
       function: {
         name: "read",

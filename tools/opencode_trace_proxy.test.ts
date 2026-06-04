@@ -28,6 +28,7 @@ import {
   shouldRequireOpenCodeToolChoice,
   stripToolBoundaryTail,
   syntheticCompletionForRequest,
+  syntheticDiscoveredSourceReadCalls,
   syntheticPrefetchReadCalls,
   syntheticResponseText,
   syntheticToolCallResponseText,
@@ -404,6 +405,68 @@ describe("synthetic OpenCode responses", () => {
 
     expect(syntheticPrefetchReadCalls(request)).toEqual([]);
     expect(syntheticCompletionForRequest(request)).toBe(null);
+  });
+
+  test("prefetches source files discovered by glob output", () => {
+    withTempProject(
+      {
+        "src/index.mjs": "export { formatName } from './formatters/name.mjs';\n",
+        "src/formatters/name.mjs": "export function formatName(user) { return user.first; }\n",
+        "test/formatters.test.mjs": "test('x', () => {});\n",
+      },
+      (dir) => {
+        const request = {
+          model: "zinc/qwen",
+          stream: true,
+          tools: [{ type: "function", function: { name: "read" } }],
+          messages: [
+            { role: "system", content: `Working directory: ${dir}` },
+            {
+              role: "tool",
+              content: `${dir}/src/index.mjs\n${dir}/src/formatters/name.mjs\n${dir}/test/formatters.test.mjs`,
+            },
+          ],
+        };
+
+        const calls = syntheticDiscoveredSourceReadCalls(request);
+        expect(calls.map((call) => JSON.parse(call.function.arguments).filePath)).toEqual([
+          `${dir}/src/formatters/name.mjs`,
+          `${dir}/src/index.mjs`,
+        ]);
+        expect(syntheticCompletionForRequest(request)).toEqual({
+          kind: "discovered_source_reads",
+          toolCalls: calls,
+        });
+      },
+    );
+  });
+
+  test("does not prefetch discovered source files after they have already been read", () => {
+    withTempProject(
+      {
+        "src/index.mjs": "export const ok = true;\n",
+      },
+      (dir) => {
+        const request = {
+          model: "zinc/qwen",
+          tools: [{ type: "function", function: { name: "read" } }],
+          messages: [
+            { role: "system", content: `Working directory: ${dir}` },
+            { role: "tool", content: `${dir}/src/index.mjs` },
+            {
+              role: "tool",
+              content:
+                `<path>${dir}/src/index.mjs</path>\n<type>file</type>\n<content>\n` +
+                "1: export const ok = true;\n" +
+                "\n(End of file - total 1 lines)\n</content>",
+            },
+          ],
+        };
+
+        expect(syntheticDiscoveredSourceReadCalls(request)).toEqual([]);
+        expect(syntheticCompletionForRequest(request)).toBe(null);
+      },
+    );
   });
 });
 
