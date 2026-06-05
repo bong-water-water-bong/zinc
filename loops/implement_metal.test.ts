@@ -37,6 +37,7 @@ import {
   shouldRejectPlateauNeutralKeep,
   shouldConfirmCandidate,
   shouldFinalizeBestTree,
+  shouldRunCandidateEvidence,
   shouldRunMetalShapesEvidence,
   shouldRestorePromotedBestDuringPlateau,
   shouldRejectQwen36PlateauNeutralKeep,
@@ -1081,6 +1082,74 @@ describe("buildPrompt", () => {
       selfAnalysis: "No evidence step.",
       ideas: [],
     }, 1)).toBe(false);
+  });
+
+  test("Gemma plateau captures candidate evidence before reverting analysis source", () => {
+    const state = makeState({
+      effortId: 11,
+      effortFile: "MULTI_HOUR_EFFORT_11_METAL_GEMMA_M4.md",
+      effortPlan: "# Effort 11\nGemma 4 26B-A4B MoE",
+      metricMode: "prefill",
+      bestTokPerSec: 383.6,
+      currentBest: { tokPerSec: 383.6, containsReference: true },
+      stalledCycles: 50,
+      lastProfileOutput: "info(forward):   prefill actual path: batched-route-pack default_batched=yes structural_batched=yes route_layers=30 queued_chunks=0",
+      lastMetalShapesOutput: "stale cycle-28 evidence",
+      cycles: [
+        makeCycle({ cycle: 124, kept: true, containsReference: true, tokPerSec: 383.6 }),
+        makeCycle({ cycle: 173, kept: false, containsReference: true, tokPerSec: 373.8, stepKind: "analysis" }),
+      ],
+    });
+
+    expect(shouldRunCandidateEvidence({
+      state,
+      cycle: 174,
+      containsReference: true,
+      buildExitCode: 0,
+      testExitCode: 0,
+      runExitCode: 0,
+      stepKind: "analysis",
+      description: "Add profile-only Q8 batched GEMM token-tile accounting",
+      selfAnalysis: "This analysis-only counter may be reverted by the speed gate.",
+      ideas: [],
+    }, 1, 1)).toEqual({ profile: true, metalShapes: true });
+  });
+
+  test("candidate evidence skips ordinary optimization churn and broken candidates", () => {
+    const state = makeState({
+      metricMode: "prefill",
+      bestTokPerSec: 383.6,
+      currentBest: { tokPerSec: 383.6, containsReference: true },
+      stalledCycles: 50,
+      lastProfileOutput: "info(forward):   prefill actual path: batched-route-pack default_batched=yes structural_batched=yes route_layers=30 queued_chunks=0",
+      cycles: [makeCycle({ cycle: 124, kept: true, containsReference: true, tokPerSec: 383.6 })],
+    });
+
+    expect(shouldRunCandidateEvidence({
+      state,
+      cycle: 175,
+      containsReference: true,
+      buildExitCode: 0,
+      testExitCode: 0,
+      runExitCode: 0,
+      stepKind: "optimization",
+      description: "Retune Q8 shared kernel",
+      selfAnalysis: "No evidence step.",
+      ideas: [],
+    }, 1, 1)).toEqual({ profile: false, metalShapes: false });
+
+    expect(shouldRunCandidateEvidence({
+      state,
+      cycle: 175,
+      containsReference: true,
+      buildExitCode: 0,
+      testExitCode: 1,
+      runExitCode: 0,
+      stepKind: "analysis",
+      description: "Add exact-shape evidence for Gemma shared Q8",
+      selfAnalysis: "Would be useful only if tests pass.",
+      ideas: [],
+    }, 1, 1)).toEqual({ profile: false, metalShapes: false });
   });
 
   test("Gemma plateau rejects neutral optimization churn but allows evidence work", () => {

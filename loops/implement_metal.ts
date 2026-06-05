@@ -3214,6 +3214,70 @@ async function runMetalShapesBenchmark(state?: RunState): Promise<string> {
   return combined;
 }
 
+function evidenceIntentText(args: {
+  description: string;
+  selfAnalysis: string;
+  ideas: string[];
+}): string {
+  return [
+    args.description,
+    args.selfAnalysis,
+    ...args.ideas,
+  ].join("\n").toLowerCase();
+}
+
+function explicitlyRequestsMetalShapesEvidence(text: string): boolean {
+  return /\b(bench-metal-shapes|metal-shapes|gemma26_prefill_hot|microbench|shared_gate_gemm|shared_up_gemm|shared_down_gemm|moe_down_cols|moe_gate_up_geglu|exact-shape)\b/.test(text);
+}
+
+function explicitlyRequestsProfileEvidence(text: string): boolean {
+  return /\b(--profile|profile-only|profile counter|profile counters|profile line|profile lines|profile evidence|dispatch counter|dispatch counters|barrier counter|barrier counters|timing counter|token-tile accounting|q8 gemm #)\b/.test(text);
+}
+
+export type CandidateEvidenceDecision = {
+  profile: boolean;
+  metalShapes: boolean;
+};
+
+export function shouldRunCandidateEvidence(args: {
+  state: RunState;
+  cycle: number;
+  containsReference: boolean;
+  buildExitCode: number;
+  testExitCode: number;
+  runExitCode: number | null;
+  stepKind: StepKind;
+  description: string;
+  selfAnalysis: string;
+  ideas: string[];
+}, profileEvery: number = PROFILE_EVERY, metalShapesEvery: number = METAL_SHAPES_EVERY): CandidateEvidenceDecision {
+  const none = { profile: false, metalShapes: false };
+  if (!args.containsReference) return none;
+  if (args.buildExitCode !== 0 || args.testExitCode !== 0 || args.runExitCode !== 0) return none;
+
+  const text = evidenceIntentText(args);
+  const explicitProfileRequest = explicitlyRequestsProfileEvidence(text);
+  const explicitShapesRequest = explicitlyRequestsMetalShapesEvidence(text);
+  const evidenceStep = args.stepKind === "analysis" || args.stepKind === "enablement" ||
+    explicitProfileRequest || explicitShapesRequest;
+  if (!evidenceStep) return none;
+
+  return {
+    profile: explicitProfileRequest ||
+      (profileEvery > 0 && (args.cycle === 1 || args.cycle % profileEvery === 0)),
+    metalShapes: shouldRunMetalShapesEvidence({
+      state: args.state,
+      cycle: args.cycle,
+      kept: false,
+      containsReference: true,
+      stepKind: args.stepKind,
+      description: args.description,
+      selfAnalysis: args.selfAnalysis,
+      ideas: args.ideas,
+    }, metalShapesEvery),
+  };
+}
+
 export function shouldRunMetalShapesEvidence(args: {
   state: RunState;
   cycle: number;
@@ -3227,14 +3291,8 @@ export function shouldRunMetalShapesEvidence(args: {
   if (metalShapesEvery <= 0) return false;
   if (!args.containsReference) return false;
 
-  const text = [
-    args.description,
-    args.selfAnalysis,
-    ...args.ideas,
-  ].join("\n").toLowerCase();
-  const explicitShapesRequest =
-    /\b(bench-metal-shapes|metal-shapes|gemma26_prefill_hot|microbench|shared_gate_gemm|exact-shape)\b/.test(text);
-
+  const text = evidenceIntentText(args);
+  const explicitShapesRequest = explicitlyRequestsMetalShapesEvidence(text);
   const evidenceStep = args.stepKind === "analysis" || args.stepKind === "enablement" || explicitShapesRequest;
   if (!args.kept && !evidenceStep) return false;
 
@@ -3926,6 +3984,60 @@ async function main() {
     }
     const verifyTps = verify.tokPerSec ?? 0;
 
+    let candidateProfileCaptured = false;
+    let candidateMetalShapesCaptured = false;
+    let candidateMetalShapesAttempted = false;
+    const candidateEvidence = shouldRunCandidateEvidence({
+      state,
+      cycle,
+      containsReference: verify.containsReference,
+      buildExitCode: verify.buildExitCode,
+      testExitCode: verify.testExitCode,
+      runExitCode: verify.runExitCode,
+      stepKind,
+      description,
+      selfAnalysis,
+      ideas: newIdeas,
+    });
+    if (candidateEvidence.profile || candidateEvidence.metalShapes) {
+      const header = [
+        `CANDIDATE EVIDENCE cycle ${cycle} (${stepKind})`,
+        "Captured before the keep/revert verdict while this candidate source tree was still checked out.",
+        "If the cycle was later reverted, these counters describe the reverted candidate, not current HEAD.",
+        `Description: ${description}`,
+        "",
+      ].join("\n");
+
+      if (candidateEvidence.profile) {
+        try {
+          state.lastProfileOutput = header + (await runProfileBenchmark());
+          state.lastProfileCycle = cycle;
+          candidateProfileCaptured = true;
+          await writeFile(join(cycleDir, "candidate_profile.log"), state.lastProfileOutput);
+        } catch {
+          console.log(clr("1;33", "  ⚠ Candidate profile run failed, continuing"));
+        }
+      }
+
+      if (candidateEvidence.metalShapes) {
+        candidateMetalShapesAttempted = true;
+        try {
+          state.lastMetalShapesOutput = header + (await runMetalShapesBenchmark(state));
+          state.lastMetalShapesCycle = cycle;
+          state.lastMetalShapesOk = true;
+          candidateMetalShapesCaptured = true;
+          await writeFile(join(cycleDir, "candidate_metal_shapes.log"), state.lastMetalShapesOutput);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          state.lastMetalShapesOutput = `${header}FAILED candidate metal-shapes evidence run:\n${msg}`;
+          state.lastMetalShapesCycle = cycle;
+          state.lastMetalShapesOk = false;
+          await writeFile(join(cycleDir, "candidate_metal_shapes_failed.log"), state.lastMetalShapesOutput);
+          console.log(clr("1;33", `  ⚠ Candidate Metal-shapes evidence run failed, continuing: ${msg.slice(-500)}`));
+        }
+      }
+    }
+
     if (verify.buildExitCode !== 0 || verify.testExitCode !== 0) {
       // Build or test broken → revert
       console.log(clr("1;31", `  ↩ REVERTING — ${verify.buildExitCode !== 0 ? "build" : "tests"} broken`));
@@ -4038,7 +4150,7 @@ async function main() {
 
     // Periodic profiling run (after verify, so we profile the current accepted state)
     // Also profile on cycle 1 so the agent has data from the start
-    if ((cycle === 1 || cycle % PROFILE_EVERY === 0) && kept && verify.containsReference) {
+    if (!candidateProfileCaptured && (cycle === 1 || cycle % PROFILE_EVERY === 0) && kept && verify.containsReference) {
       try {
         state.lastProfileOutput = await runProfileBenchmark();
         state.lastProfileCycle = cycle;
@@ -4048,7 +4160,7 @@ async function main() {
       }
     }
 
-    if (shouldRunMetalShapesEvidence({
+    if (!candidateMetalShapesCaptured && !(candidateMetalShapesAttempted && !kept) && shouldRunMetalShapesEvidence({
       state,
       cycle,
       kept,
