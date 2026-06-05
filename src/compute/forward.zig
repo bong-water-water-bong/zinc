@@ -13380,6 +13380,13 @@ pub const InferenceEngine = struct {
         return (n_tokens + 31) & ~@as(u32, 31);
     }
 
+    fn qwenA3bPrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
+        if (!self.isQwen36A3bMoePrefillModel()) return n_tokens;
+        if (!self.isAmdRdna()) return n_tokens;
+        if (n_tokens < 128) return n_tokens;
+        return (n_tokens +| 31) & ~@as(u32, 31);
+    }
+
     fn qwenA3bSsmQ8Dp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
@@ -13666,8 +13673,29 @@ pub const InferenceEngine = struct {
         const packed_i8 = self.batched_scratch_norm_q8 orelse return 0;
         const scale = self.batched_scratch_norm_q8_scale orelse return 0;
 
-        const full_cols = n_tokens & ~@as(u32, 31);
+        var full_cols = n_tokens & ~@as(u32, 31);
         if (full_cols == 0) return 0;
+        const padded_cols = self.qwenA3bPrefillPaddedTokenCount(n_tokens);
+        if (padded_cols > full_cols) {
+            const need_input_padded: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, K) *
+                @sizeOf(f32);
+            const need_i8_padded: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, K / 4) *
+                @sizeOf(u32);
+            const need_scale_padded: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, padded_cols) *
+                @as(vk.c.VkDeviceSize, K / 32) *
+                @sizeOf(f32);
+            if (src.size >= need_input_padded and
+                packed_i8.size >= need_i8_padded and
+                scale.size >= need_scale_padded)
+            {
+                full_cols = padded_cols;
+            }
+        }
         const need_input: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, full_cols) *
             @as(vk.c.VkDeviceSize, K) *
@@ -18284,7 +18312,7 @@ pub const InferenceEngine = struct {
             try self.ensureKvPagesForContext(target_context_tokens);
         }
 
-        try self.ensureBatchedScratchCapacity(n_tokens);
+        try self.ensureBatchedScratchCapacity(self.qwenA3bPrefillPaddedTokenCount(n_tokens));
         if (self.prefill_embed_big == null or self.prefill_embed_big_capacity_bytes < total_embed_bytes) {
             if (self.prefill_embed_big) |*b| b.deinit();
             self.prefill_embed_big = try Buffer.initStaging(self.instance, total_embed_bytes);
