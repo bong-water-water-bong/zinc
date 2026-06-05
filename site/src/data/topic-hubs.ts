@@ -38,6 +38,167 @@ export type TopicHub = {
 
 export const topicHubs: TopicHub[] = [
   {
+    slug: 'opencode-local-coding',
+    title: 'OpenCode with Local ZINC Models',
+    shortTitle: 'OpenCode',
+    description: 'A practical guide to using OpenCode with ZINC as a local OpenAI-compatible coding backend: provider config, tool calls, thinking mode, context limits, SSH tunnels, and trace proxy debugging.',
+    keywords: 'OpenCode local LLM, OpenCode ZINC, local coding agent, OpenCode OpenAI compatible provider, Qwen coding model, ZINC tool calling, self-hosted coding assistant',
+    summary: 'OpenCode can use ZINC through the same OpenAI-compatible `/v1/chat/completions` API that powers the browser chat UI. The useful setup is local and boring: run ZINC, point OpenCode at localhost, keep tools enabled, set honest context limits, and use the trace proxy while testing coding workflows.',
+    practicalAnswer: 'For OpenCode, run ZINC on a localhost `/v1` endpoint and configure a custom `@ai-sdk/openai-compatible` provider. Use a Qwen-family model with stable thinking and tool behavior, keep `ZINC_TOOL_CALLING` enabled, and start with conservative context/output limits such as 4096/2048. If OpenCode runs on a laptop while ZINC runs on a GPU box, use an SSH tunnel so the OpenCode config still contains only `127.0.0.1`.',
+    bestUse: 'Use this page when you want a local coding assistant backed by ZINC rather than a hosted API. It is focused on operator setup, not benchmark marketing: provider config, local ports, tool calls, thinking, context budgets, and trace-based debugging.',
+    status: [
+      {
+        label: 'Best current answer',
+        detail: 'OpenCode works best through ZINC\'s OpenAI-compatible chat endpoint, with the optional trace proxy in front during compatibility testing.',
+      },
+      {
+        label: 'Reader problem',
+        detail: 'Users need the exact local-provider shape without leaking private GPU-node addresses or hardcoding machine-specific secrets into a repo.',
+      },
+      {
+        label: 'Main bottleneck',
+        detail: 'Correct agent behavior depends on tool-call round trips, enough output budget, and enough context for source snapshots. Raw tokens per second is only one part of usability.',
+      },
+    ],
+    actionPlan: [
+      {
+        label: 'Start ZINC locally',
+        detail: 'Run the server on `127.0.0.1`, usually port 9090, and verify `/health` plus `/v1/models` before opening OpenCode.',
+      },
+      {
+        label: 'Configure one provider',
+        detail: 'Use OpenCode\'s OpenAI-compatible provider config with `baseURL` set to `http://127.0.0.1:9090/v1` or to the local trace proxy.',
+      },
+      {
+        label: 'Keep tools on',
+        detail: 'Do not disable `ZINC_TOOL_CALLING` for coding sessions. ZINC parses model tool calls; OpenCode executes local tools.',
+      },
+      {
+        label: 'Tunnel remote servers',
+        detail: 'If the GPU is remote, forward it with SSH and keep the OpenCode config pointed at localhost. Never publish private hosts, ports, usernames, or model paths.',
+      },
+    ],
+    checklist: [
+      {
+        label: 'Health check first',
+        detail: '`curl http://127.0.0.1:9090/health` should pass from the same machine that runs OpenCode.',
+      },
+      {
+        label: 'Model shape',
+        detail: 'Use a Qwen/ChatML-family model when tool calling matters, and keep the `model` id consistent between ZINC and OpenCode.',
+      },
+      {
+        label: 'Context budget',
+        detail: 'Set OpenCode `limit.context` at or below the context length ZINC actually has available for the loaded model.',
+      },
+      {
+        label: 'Trace locally',
+        detail: 'Use `tools/opencode_trace_proxy.mjs` when diagnosing repeated reads, malformed tool paths, short answers, or thinking/tool-choice behavior.',
+      },
+    ],
+    measurements: [
+      {
+        label: 'Tool-call success',
+        detail: 'The key coding metric is whether OpenCode can read, edit, write, run tests, and incorporate tool results in the next turn.',
+      },
+      {
+        label: 'First useful action',
+        detail: 'Measure how long it takes to produce the first correct read or edit tool call, not only final answer latency.',
+      },
+      {
+        label: 'Context usage',
+        detail: 'Track prompt tokens, visible source snapshots, and output budget so local runs fail predictably instead of silently truncating.',
+      },
+      {
+        label: 'Trace deltas',
+        detail: 'Compare direct ZINC requests against proxy traces to see whether failures come from model output, client behavior, or compatibility repair.',
+      },
+    ],
+    articleIdeas: [
+      {
+        label: 'Local coding agent smoke test',
+        detail: 'A small reproducible project where OpenCode must read files, patch a bug, and run tests against ZINC.',
+      },
+      {
+        label: 'Tool calling on Qwen in practice',
+        detail: 'Show the exact request, generated `<tool_call>`, structured OpenAI response, and follow-up tool-result prompt.',
+      },
+      {
+        label: 'Remote GPU, local editor',
+        detail: 'A security-focused walkthrough for SSH tunnels, localhost configs, traces, and avoiding credential leaks.',
+      },
+    ],
+    pitfalls: [
+      {
+        label: 'Publishing private endpoints',
+        detail: 'Do not paste GPU-node IPs, SSH ports, usernames, raw model paths, API keys, or trace files into docs, commits, screenshots, or public issues.',
+      },
+      {
+        label: 'Using raw completions',
+        detail: 'OpenCode needs chat completions and tool semantics. `/v1/completions` is not the right endpoint for agentic coding.',
+      },
+      {
+        label: 'Undersizing output',
+        detail: 'A tiny output cap can look like model failure because the response stops before the tool call or final summary is complete.',
+      },
+    ],
+    whatMatters: [
+      'Use `/v1/chat/completions`; it is the endpoint with streaming, thinking, and tool-call support.',
+      'ZINC never executes tools. OpenCode executes tools locally and sends tool results back to ZINC.',
+      'Thinking mode is a request setting; the trace proxy can force it when the client does not expose a direct toggle.',
+      'A localhost SSH tunnel is the safest way to use a remote GPU box from a laptop without leaking private infrastructure.',
+    ],
+    readNext: [
+      {
+        title: 'OpenAI-compatible tool calling design',
+        href: '/zinc/docs/api#tool-calling',
+        description: 'The ZINC API behavior that OpenCode relies on for tool definitions, tool calls, and tool results.',
+      },
+      {
+        title: 'Qwen3.6 local inference',
+        href: '/topics/qwen3-6-local-inference/',
+        description: 'Why Qwen-family models are the main target for thinking and tool-capable local coding sessions.',
+      },
+      {
+        title: 'ZINC performance status',
+        href: '/zinc/benchmarks',
+        description: 'Current AMD and Metal results for the models you may use as local coding backends.',
+      },
+    ],
+    docs: [
+      {
+        title: 'Configure OpenCode with ZINC',
+        href: '/zinc/docs/opencode',
+        description: 'Step-by-step provider config, proxy setup, thinking, tool calling, context limits, and troubleshooting.',
+      },
+      {
+        title: 'Serving HTTP API',
+        href: '/zinc/docs/api',
+        description: 'OpenAI-compatible chat completions, streaming, tools, thinking, models, and health endpoints.',
+      },
+      {
+        title: 'Running ZINC',
+        href: '/zinc/docs/running-zinc',
+        description: 'Start the local server, choose managed models, set context, and verify the runtime path.',
+      },
+    ],
+    related: ['qwen3-6-local-inference', 'amd-rdna4-llm-inference', 'gemma-local-inference'],
+    faqs: [
+      {
+        question: 'Can OpenCode use ZINC as a local model backend?',
+        answer: 'Yes. Configure OpenCode with an OpenAI-compatible provider whose base URL points at the ZINC `/v1` endpoint, usually `http://127.0.0.1:9090/v1` or a local trace proxy.',
+      },
+      {
+        question: 'Should I expose the GPU server directly to OpenCode?',
+        answer: 'Usually no. Keep ZINC bound to localhost on the GPU machine and use an SSH tunnel from the OpenCode machine. The committed config should still contain only localhost URLs and environment placeholders.',
+      },
+      {
+        question: 'Does ZINC run the tools?',
+        answer: 'No. ZINC renders tool definitions and returns structured tool calls. OpenCode executes local tools, then sends the tool results back to ZINC in the next chat request.',
+      },
+    ],
+  },
+  {
     slug: 'gemma-local-inference',
     title: 'Gemma 4 Local Inference',
     shortTitle: 'Gemma 4',
