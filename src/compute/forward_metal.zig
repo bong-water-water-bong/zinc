@@ -905,6 +905,12 @@ pub const RuntimeProfile = struct {
     route_pack_single_tail_blocks_actual: u64 = 0,
     route_pack_padding_slots_actual: u64 = 0,
     route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
+    route_pack_gate_up_threadgroups_actual: u64 = 0,
+    route_pack_gate_up_q4k_geglu_threadgroups_actual: u64 = 0,
+    route_pack_down_threadgroups_actual: u64 = 0,
+    route_pack_down_q5_1_threadgroups_actual: u64 = 0,
+    route_pack_down_q8_0_threadgroups_actual: u64 = 0,
+    route_pack_down_other_threadgroups_actual: u64 = 0,
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1321,6 +1327,12 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     for (0..moe_route_pack_profile_tail_bins) |i| {
         delta.route_pack_tail_size_blocks_actual[i] = total.route_pack_tail_size_blocks_actual[i] -| prefix.route_pack_tail_size_blocks_actual[i];
     }
+    delta.route_pack_gate_up_threadgroups_actual = total.route_pack_gate_up_threadgroups_actual -| prefix.route_pack_gate_up_threadgroups_actual;
+    delta.route_pack_gate_up_q4k_geglu_threadgroups_actual = total.route_pack_gate_up_q4k_geglu_threadgroups_actual -| prefix.route_pack_gate_up_q4k_geglu_threadgroups_actual;
+    delta.route_pack_down_threadgroups_actual = total.route_pack_down_threadgroups_actual -| prefix.route_pack_down_threadgroups_actual;
+    delta.route_pack_down_q5_1_threadgroups_actual = total.route_pack_down_q5_1_threadgroups_actual -| prefix.route_pack_down_q5_1_threadgroups_actual;
+    delta.route_pack_down_q8_0_threadgroups_actual = total.route_pack_down_q8_0_threadgroups_actual -| prefix.route_pack_down_q8_0_threadgroups_actual;
+    delta.route_pack_down_other_threadgroups_actual = total.route_pack_down_other_threadgroups_actual -| prefix.route_pack_down_other_threadgroups_actual;
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1454,6 +1466,18 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                         profile.route_pack_tail_size_blocks_actual[4],
                         profile.route_pack_tail_size_blocks_actual[5],
                         profile.route_pack_tail_size_blocks_actual[6],
+                    });
+                }
+                if (profile.route_pack_gate_up_threadgroups_actual > 0 or profile.route_pack_down_threadgroups_actual > 0) {
+                    log.info("  {s} route pack route-cols tgroups: gate/up {d} q4k_geglu {d} | down {d} q5_1 {d} q8_0 {d} other {d} down/gate {d:.1}%", .{
+                        label,
+                        profile.route_pack_gate_up_threadgroups_actual,
+                        profile.route_pack_gate_up_q4k_geglu_threadgroups_actual,
+                        profile.route_pack_down_threadgroups_actual,
+                        profile.route_pack_down_q5_1_threadgroups_actual,
+                        profile.route_pack_down_q8_0_threadgroups_actual,
+                        profile.route_pack_down_other_threadgroups_actual,
+                        pctOf(profile.route_pack_gate_up_threadgroups_actual, profile.route_pack_down_threadgroups_actual),
                     });
                 }
             }
@@ -2761,12 +2785,20 @@ fn recordRoutePackProfile(
     p.route_pack_dense_dispatch_blocks += denseMoeColsDispatchBlocks(n_tokens, n_experts);
 }
 
-fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, scratch: *const BatchedPrefillScratch, n_layers: usize) void {
+fn routeColsRowThreadgroups(rows: u32) u64 {
+    const rows_per_tg: u64 = 8;
+    return (@as(u64, rows) + rows_per_tg - 1) / rows_per_tg;
+}
+
+fn recordRoutePackActualProfile(engine: *const InferenceEngine, profile: ?*RuntimeProfile, scratch: *const BatchedPrefillScratch, n_layers: usize) void {
     const p = profile orelse return;
     if (scratch.moe_active_block_count.cpu_ptr == null) return;
 
     const words = scratch.moe_active_block_count.size / @sizeOf(u32);
     if (words <= 1) return;
+    const cfg = engine.config;
+    const hidden_dim = cfg.hidden_dim;
+    const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
     const sample_count = @min(n_layers, words - 1);
     const counts: [*]const u32 = @ptrCast(@alignCast(scratch.moe_active_block_count.cpu_ptr.?));
     for (0..sample_count) |i| {
@@ -2779,6 +2811,35 @@ fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, scratch: *const Batch
         }
         if (active_blocks > p.route_pack_active_block_max) {
             p.route_pack_active_block_max = active_blocks;
+        }
+        if (cfg.architecture == .gemma and cfg.n_experts > 0 and i < engine.layer_tensors.len) {
+            const active_blocks_u64 = @as(u64, active_blocks);
+            const lt = engine.layer_tensors[i];
+            const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, hidden_dim) catch null;
+            if (gate_up_layout) |layout| {
+                const gate_up_threadgroups = active_blocks_u64 * routeColsRowThreadgroups(inter_dim);
+                const fused_q4k_geglu =
+                    layout.gate_tensor == layout.up_tensor and
+                    layout.gate_tensor.info.type_ == .q4_k and
+                    layout.gate_expert_stride == layout.up_expert_stride and
+                    engine.dmmv_q4k_moe_cols_geglu_pipe.handle != null;
+                p.route_pack_gate_up_threadgroups_actual += if (fused_q4k_geglu)
+                    gate_up_threadgroups
+                else
+                    gate_up_threadgroups * 2;
+                if (fused_q4k_geglu) {
+                    p.route_pack_gate_up_q4k_geglu_threadgroups_actual += gate_up_threadgroups;
+                }
+            }
+            if (lt.ffn_down_exps) |down_exps| {
+                const down_threadgroups = active_blocks_u64 * routeColsRowThreadgroups(hidden_dim);
+                p.route_pack_down_threadgroups_actual += down_threadgroups;
+                switch (down_exps.info.type_) {
+                    .q5_1 => p.route_pack_down_q5_1_threadgroups_actual += down_threadgroups,
+                    .q8_0 => p.route_pack_down_q8_0_threadgroups_actual += down_threadgroups,
+                    else => p.route_pack_down_other_threadgroups_actual += down_threadgroups,
+                }
+            }
         }
     }
     if (words >= moeRoutePackProfileWords(n_layers)) {
@@ -7002,7 +7063,7 @@ pub const InferenceEngine = struct {
 
         if (shouldCpuLmHeadFallback(self)) {
             commitAndWaitProfiled(&cmd, profile);
-            recordRoutePackActualProfile(profile, &scratch, @as(usize, @intCast(cfg.n_layers)));
+            recordRoutePackActualProfile(self, profile, &scratch, @as(usize, @intCast(cfg.n_layers)));
             if (self.private_decode_buffers) return error.PrivateBatchedPrefillCpuLmHeadUnsupported;
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
@@ -7020,7 +7081,7 @@ pub const InferenceEngine = struct {
                 dispatchCopyF32OnCmd(self, &cmd, &self.logits_buf, &self.logits_readback_buf, cfg.vocab_size);
             }
             commitAndWaitProfiled(&cmd, profile);
-            recordRoutePackActualProfile(profile, &scratch, @as(usize, @intCast(cfg.n_layers)));
+            recordRoutePackActualProfile(self, profile, &scratch, @as(usize, @intCast(cfg.n_layers)));
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             if (self.hidden_buf.cpu_ptr) |dst_bytes| {
                 const src_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
