@@ -3236,11 +3236,10 @@ fn logGemmaBatchedPrefillDecision(
 
 fn shouldDefaultGemmaMoeBatchedPrefillForPrompt(cfg: ModelConfig, prompt_len: usize) bool {
     if (!isGemma26A4BMoeShape(cfg)) return false;
-    // The current public-suite planning prompt is 70 chat-template tokens.
-    // Keep the default experiment on that nearby band so short Paris decode
-    // guards and unrelated Gemma MoE prompts continue using the accepted queued
-    // token-major path unless explicitly opted in.
-    return prompt_len >= 64 and prompt_len <= 96;
+    // Public-prompt harnesses have landed in the mid-length chat-template band
+    // (55-70 tokens so far). Keep short Paris decode guards on queued token-major
+    // while defaulting nearby public prompts onto the structural route-pack path.
+    return prompt_len >= 48 and prompt_len <= 96;
 }
 
 fn shouldDefaultDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
@@ -27923,6 +27922,10 @@ test "gemma26 public prompt prefill uses wide queued split without tiny tail" {
     };
 
     try std.testing.expect(!shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 20));
+    try std.testing.expect(!shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 47));
+    try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 48));
+    try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 55));
+    try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 63));
     try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 64));
     try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 70));
     try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 96));
