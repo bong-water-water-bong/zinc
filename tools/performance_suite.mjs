@@ -96,6 +96,7 @@ export function parseArgs(argv) {
     rdnaBuild: false,
     rdnaStartLlama: false,
     rdnaNode: process.env.ZINC_RDNA_NODE ?? process.env.ZINC_NODE ?? null,
+    rdnaBackend: process.env.ZINC_RDNA_BACKEND ?? "vulkan",
     rdnaVkDevice: process.env.ZINC_RDNA_VK_DEVICE != null
       ? parseInteger(process.env.ZINC_RDNA_VK_DEVICE, "ZINC_RDNA_VK_DEVICE")
       : 0,
@@ -183,6 +184,9 @@ export function parseArgs(argv) {
       case "--rdna-node":
         args.rdnaNode = argv[++i] ?? args.rdnaNode;
         break;
+      case "--rdna-backend":
+        args.rdnaBackend = argv[++i] ?? args.rdnaBackend;
+        break;
       case "--intel-sync":
         args.intelSync = true;
         break;
@@ -235,6 +239,9 @@ export function parseArgs(argv) {
   }
 
   if (args.runs === 0) throw new Error("--runs must be at least 1");
+  if (!["auto", "vulkan", "zinc_rt"].includes(args.rdnaBackend)) {
+    throw new Error(`Invalid --rdna-backend '${args.rdnaBackend}'. Expected auto, vulkan, or zinc_rt.`);
+  }
   return args;
 }
 
@@ -260,6 +267,7 @@ function usage() {
   --rdna-build                Build ReleaseFast on the RDNA node before running
   --rdna-start-llama          Start llama-server on the RDNA node before baseline runs
   --rdna-node <name>          Select node-specific env keys, e.g. rdna2 -> ZINC_RDNA2_HOST/PORT/USER
+  --rdna-backend <backend>    ZINC backend to build on RDNA: auto, vulkan, zinc_rt (default: vulkan)
   --intel-sync                Rsync current repo to the Intel node before running
   --intel-build               Build ReleaseFast on the Intel node before running
   --intel-start-llama         Stop stale llama-server processes on the Intel node before baseline runs
@@ -1842,7 +1850,16 @@ async function prepareRdna(args, creds) {
 
   if (args.rdnaBuild) {
     console.log("Building ReleaseFast on RDNA node...");
-    const remote = `cd ${shellQuote(creds.workdir)} && zig build -Doptimize=ReleaseFast`;
+    const buildArgs = ["zig", "build", "-Doptimize=ReleaseFast"];
+    if (args.rdnaBackend !== "auto") {
+      buildArgs.push(`-Dbackend=${args.rdnaBackend}`);
+    }
+    if (args.rdnaSync) {
+      const syncedProvenance = await captureGitProvenance(ROOT);
+      if (syncedProvenance.version) buildArgs.push(`-Dversion=${shellQuote(syncedProvenance.version)}`);
+      if (syncedProvenance.commit) buildArgs.push(`-Dcommit=${shellQuote(syncedProvenance.commit)}`);
+    }
+    const remote = `cd ${shellQuote(creds.workdir)} && ${buildArgs.join(" ")}`;
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
@@ -2273,7 +2290,9 @@ async function runRdnaTarget(args) {
   const rdnaLlamaCli = await detectRdnaLlamaCliPath(creds);
   const rdnaLlamaServer = await detectRdnaLlamaServerPath(creds);
   const baselineBinary = rdnaLlamaServer || rdnaLlamaCli;
-  const zincProvenance = await captureRemoteGitProvenance(creds);
+  const zincProvenance = args.rdnaSync
+    ? await captureGitProvenance(ROOT)
+    : await captureRemoteGitProvenance(creds);
   const llamaCppProvenance = await captureRemoteLlamaCppProvenance(baselineBinary, creds);
 
   const knownCases = defaultRdnaCases(args.rdnaModelRoot);
@@ -2442,6 +2461,7 @@ async function runRdnaTarget(args) {
       notes: [
         "Hardware: one AMD Radeon AI PRO R9700 benchmark node with 32 GB VRAM and 576 GB/s memory bandwidth. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
         "ZINC path: sync the current source tree to the RDNA node, build with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI with RADV cooperative matrix support enabled.",
+        `ZINC RDNA backend: ${args.rdnaBackend}. Published RDNA runs default to Vulkan; zinc_rt is opt-in because it is a separate bring-up runtime.`,
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
         "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
         "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",

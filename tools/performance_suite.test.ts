@@ -90,6 +90,33 @@ test("parseArgs reads Intel suite options", () => {
   expect(args.intelRemoteLibcConf).toBe("/workspace/zinc/.build-support/libc.conf");
 });
 
+test("parseArgs reads RDNA backend and device options", () => {
+  const args = parseArgs([
+    "--target",
+    "rdna",
+    "--rdna-node",
+    "rdna1",
+    "--rdna-backend",
+    "vulkan",
+    "--rdna-vk-device",
+    "1",
+    "--require-rdna-device-substring",
+    "GFX1201",
+  ]);
+
+  expect(args.target).toBe("rdna");
+  expect(args.rdnaNode).toBe("rdna1");
+  expect(args.rdnaBackend).toBe("vulkan");
+  expect(args.rdnaVkDevice).toBe(1);
+  expect(args.requireRdnaDeviceSubstring).toBe("GFX1201");
+});
+
+test("parseArgs rejects invalid RDNA backend", () => {
+  expect(() => parseArgs(["--target", "rdna", "--rdna-backend", "metal"])).toThrow(
+    "Invalid --rdna-backend 'metal'",
+  );
+});
+
 test("parseArgs enables discovery mode", () => {
   const args = parseArgs(["--target", "metal", "--discover-models"]);
   expect(args.discoverModels).toBe(true);
