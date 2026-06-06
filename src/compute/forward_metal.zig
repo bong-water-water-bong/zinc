@@ -816,12 +816,6 @@ const GpuMoeFinalizerKind = enum(u8) {
     gemma_staged,
 };
 
-const MoeRouteColsStat = struct {
-    calls: u32 = 0,
-    route_blocks: u64 = 0,
-    threadgroups: u64 = 0,
-};
-
 /// Per-request profiling counters for dispatch, barrier, and timing breakdown.
 pub const RuntimeProfile = struct {
     decode_steps: u32 = 0,
@@ -911,12 +905,6 @@ pub const RuntimeProfile = struct {
     route_pack_single_tail_blocks_actual: u64 = 0,
     route_pack_padding_slots_actual: u64 = 0,
     route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
-    moe_route_cols_active_q4k: MoeRouteColsStat = .{},
-    moe_route_cols_active_q4k_geglu: MoeRouteColsStat = .{},
-    moe_route_cols_active_q5_1: MoeRouteColsStat = .{},
-    moe_route_cols_active_q5k: MoeRouteColsStat = .{},
-    moe_route_cols_active_q6k: MoeRouteColsStat = .{},
-    moe_route_cols_active_q8_0: MoeRouteColsStat = .{},
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1263,14 +1251,6 @@ fn q8RepackedDispatchStatMinusPrefix(total_slot: Q8RepackedDispatchStat, prefix:
     };
 }
 
-fn moeRouteColsStatMinusPrefix(total: MoeRouteColsStat, prefix: MoeRouteColsStat) MoeRouteColsStat {
-    return .{
-        .calls = total.calls -| prefix.calls,
-        .route_blocks = total.route_blocks -| prefix.route_blocks,
-        .threadgroups = total.threadgroups -| prefix.threadgroups,
-    };
-}
-
 fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimeProfile {
     var delta: RuntimeProfile = .{};
     delta.decode_steps = total.decode_steps -| prefix.decode_steps;
@@ -1341,12 +1321,6 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     for (0..moe_route_pack_profile_tail_bins) |i| {
         delta.route_pack_tail_size_blocks_actual[i] = total.route_pack_tail_size_blocks_actual[i] -| prefix.route_pack_tail_size_blocks_actual[i];
     }
-    delta.moe_route_cols_active_q4k = moeRouteColsStatMinusPrefix(total.moe_route_cols_active_q4k, prefix.moe_route_cols_active_q4k);
-    delta.moe_route_cols_active_q4k_geglu = moeRouteColsStatMinusPrefix(total.moe_route_cols_active_q4k_geglu, prefix.moe_route_cols_active_q4k_geglu);
-    delta.moe_route_cols_active_q5_1 = moeRouteColsStatMinusPrefix(total.moe_route_cols_active_q5_1, prefix.moe_route_cols_active_q5_1);
-    delta.moe_route_cols_active_q5k = moeRouteColsStatMinusPrefix(total.moe_route_cols_active_q5k, prefix.moe_route_cols_active_q5k);
-    delta.moe_route_cols_active_q6k = moeRouteColsStatMinusPrefix(total.moe_route_cols_active_q6k, prefix.moe_route_cols_active_q6k);
-    delta.moe_route_cols_active_q8_0 = moeRouteColsStatMinusPrefix(total.moe_route_cols_active_q8_0, prefix.moe_route_cols_active_q8_0);
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1484,36 +1458,6 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                 }
             }
         }
-    }
-    const route_cols_calls =
-        profile.moe_route_cols_active_q4k.calls +
-        profile.moe_route_cols_active_q4k_geglu.calls +
-        profile.moe_route_cols_active_q5_1.calls +
-        profile.moe_route_cols_active_q5k.calls +
-        profile.moe_route_cols_active_q6k.calls +
-        profile.moe_route_cols_active_q8_0.calls;
-    if (route_cols_calls > 0) {
-        log.info("  {s} route cols active: q4k {d}/{d}/{d} q4k-geglu {d}/{d}/{d} q5_1 {d}/{d}/{d} q5k {d}/{d}/{d} q6k {d}/{d}/{d} q8_0 {d}/{d}/{d} (calls/blocks/tgs)", .{
-            label,
-            profile.moe_route_cols_active_q4k.calls,
-            profile.moe_route_cols_active_q4k.route_blocks,
-            profile.moe_route_cols_active_q4k.threadgroups,
-            profile.moe_route_cols_active_q4k_geglu.calls,
-            profile.moe_route_cols_active_q4k_geglu.route_blocks,
-            profile.moe_route_cols_active_q4k_geglu.threadgroups,
-            profile.moe_route_cols_active_q5_1.calls,
-            profile.moe_route_cols_active_q5_1.route_blocks,
-            profile.moe_route_cols_active_q5_1.threadgroups,
-            profile.moe_route_cols_active_q5k.calls,
-            profile.moe_route_cols_active_q5k.route_blocks,
-            profile.moe_route_cols_active_q5k.threadgroups,
-            profile.moe_route_cols_active_q6k.calls,
-            profile.moe_route_cols_active_q6k.route_blocks,
-            profile.moe_route_cols_active_q6k.threadgroups,
-            profile.moe_route_cols_active_q8_0.calls,
-            profile.moe_route_cols_active_q8_0.route_blocks,
-            profile.moe_route_cols_active_q8_0.threadgroups,
-        });
     }
     if (profile.queued_prefill_requests > 0) {
         log.info("  {s} queued prefill: requests {d} prompt_tokens {d} chunks {d} async {d} chunk_base {d} requested {d} min {d} max {d} final {d} first_chunks [{d},{d},{d},{d},{d},{d},{d},{d}] total_listed {d}", .{
@@ -8315,34 +8259,6 @@ fn recordMoeDmmvProfile(
     }
 }
 
-fn recordMoeRouteColsActiveProfile(
-    engine: *InferenceEngine,
-    quant_type: GGMLType,
-    rows: u32,
-    route_blocks: u32,
-    fused_geglu: bool,
-) void {
-    if (!engine.profile_enabled) return;
-
-    const rows_per_wg: u64 = 8;
-    const row_groups = (@as(u64, rows) + rows_per_wg - 1) / rows_per_wg;
-    const launched_blocks = @as(u64, route_blocks);
-    const threadgroups = row_groups * launched_blocks;
-    var profile = &engine.request_profile;
-
-    var stat: *MoeRouteColsStat = switch (quant_type) {
-        .q4_k => if (fused_geglu) &profile.moe_route_cols_active_q4k_geglu else &profile.moe_route_cols_active_q4k,
-        .q5_1 => &profile.moe_route_cols_active_q5_1,
-        .q5_k => &profile.moe_route_cols_active_q5k,
-        .q6_k => &profile.moe_route_cols_active_q6k,
-        .q8_0 => &profile.moe_route_cols_active_q8_0,
-        else => return,
-    };
-    stat.calls += 1;
-    stat.route_blocks += launched_blocks;
-    stat.threadgroups += threadgroups;
-}
-
 // ---------------------------------------------------------------------------
 // DMMV dispatch helpers
 // ---------------------------------------------------------------------------
@@ -11014,7 +10930,6 @@ fn dispatchDmmvMoeColsActiveBlocksOnCmd(
 ) !void {
     const route_blocks = @max(active_block_upper_bound, 1);
     recordMoeDmmvProfile(engine, tensor, M, K, route_blocks);
-    recordMoeRouteColsActiveProfile(engine, tensor.info.type_, M, route_blocks, false);
 
     const pipe: *const MetalPipeline = switch (tensor.info.type_) {
         .q4_k => &engine.dmmv_q4k_moe_cols_pipe,
@@ -11084,7 +10999,6 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
 
     const route_blocks = @max(active_block_upper_bound, 1);
     recordMoeDmmvProfile(engine, tensor, M, K, route_blocks * 2);
-    recordMoeRouteColsActiveProfile(engine, tensor.info.type_, M, route_blocks, true);
 
     const push = MoeColsGateUpDmmvPush{
         .M = M,
