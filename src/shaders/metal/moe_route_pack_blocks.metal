@@ -14,7 +14,7 @@ struct Params {
 
 #define NUM_COLS 8u
 #define MAX_EXPERTS 256u
-#define PROFILE_STATS_PER_LAYER 11u
+#define PROFILE_STATS_PER_LAYER 4u
 
 kernel void main0(
     constant Params& p [[buffer(0)]],
@@ -73,10 +73,6 @@ kernel void main0(
         uint tail_blocks = 0u;
         uint singleton_tail_blocks = 0u;
         uint padding_slots = 0u;
-        uint tail_hist[NUM_COLS];
-        for (uint tail = 0u; tail < NUM_COLS; tail++) {
-            tail_hist[tail] = 0u;
-        }
         for (uint expert = 0u; expert < p.n_experts; expert++) {
             total_blocks += block_counts[expert];
             const uint stored_count = route_counts[expert];
@@ -87,7 +83,6 @@ kernel void main0(
             const uint tail_routes = stored_count % NUM_COLS;
             if (tail_routes != 0u) {
                 tail_blocks += 1u;
-                tail_hist[tail_routes] += 1u;
                 padding_slots += NUM_COLS - tail_routes;
                 if (tail_routes == 1u) {
                     singleton_tail_blocks += 1u;
@@ -101,9 +96,6 @@ kernel void main0(
             atomic_store_explicit(layer_stats + 1u, tail_blocks, memory_order_relaxed);
             atomic_store_explicit(layer_stats + 2u, singleton_tail_blocks, memory_order_relaxed);
             atomic_store_explicit(layer_stats + 3u, padding_slots, memory_order_relaxed);
-            for (uint tail = 1u; tail < NUM_COLS; tail++) {
-                atomic_store_explicit(layer_stats + 4u + (tail - 1u), tail_hist[tail], memory_order_relaxed);
-            }
         }
     }
 
