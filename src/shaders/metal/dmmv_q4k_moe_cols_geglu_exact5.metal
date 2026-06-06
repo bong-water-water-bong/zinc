@@ -2,8 +2,8 @@
 using namespace metal;
 
 // Route-packed Gemma MoE Q4_K gate/up DMMV fused with GeGLU.
-// Opt-in exact-5 tail variant; the default production shader intentionally
-// omits this branch to keep decode on the smaller kernel.
+// Opt-in exact tail variant; the default production shader intentionally
+// omits these branches to keep decode on the smaller kernel.
 //
 // This consumes the same expert-major packed route IDs as dmmv_q4k_moe_cols,
 // but reads Gemma's fused [gate, up] expert tensor and writes activated route
@@ -23,6 +23,7 @@ struct MoeColsGateUpDmmvPush {
     uint x_route_divisor;
     uint use_active_blocks;
     uint enable_exact5;
+    uint enable_exact7;
 };
 
 inline float2 get_scale_min_k4(uint j, device const uchar* sc) {
@@ -518,6 +519,156 @@ kernel void main0(
             y_base[route2 * p.M + row] = geglu(gate2, up2);
             y_base[route3 * p.M + row] = geglu(gate3, up3);
             y_base[route4 * p.M + row] = geglu(gate4, up4);
+        }
+        return;
+    }
+
+    if (p.enable_exact7 != 0u && remaining == 7u) {
+        const uint route1 = expert_ids[packed_base + 1u];
+        const uint route2 = expert_ids[packed_base + 2u];
+        const uint route3 = expert_ids[packed_base + 3u];
+        const uint route4 = expert_ids[packed_base + 4u];
+        const uint route5 = expert_ids[packed_base + 5u];
+        const uint route6 = expert_ids[packed_base + 6u];
+
+        device const float* x1 = x_base + (route1 / x_div) * p.K;
+        device const float* x2 = x_base + (route2 / x_div) * p.K;
+        device const float* x3 = x_base + (route3 / x_div) * p.K;
+        device const float* x4 = x_base + (route4 / x_div) * p.K;
+        device const float* x5 = x_base + (route5 / x_div) * p.K;
+        device const float* x6 = x_base + (route6 / x_div) * p.K;
+
+        float4 gate_acc0 = float4(0.0f);
+        float4 gate_acc1 = float4(0.0f);
+        float4 up_acc0 = float4(0.0f);
+        float4 up_acc1 = float4(0.0f);
+
+        for (uint b = 0u; b < nb; b++) {
+            device const uchar* gate_block = gate_src + b * bpb;
+            device const uchar* up_block = up_src + b * bpb;
+
+            const float gate_d = float(as_type<half>(*(device const ushort*)(gate_block)));
+            const float gate_dmin = float(as_type<half>(*(device const ushort*)(gate_block + 2)));
+            device const uchar* gate_scales = gate_block + 4;
+            device const uchar* gate_quants = gate_block + 16;
+
+            const float up_d = float(as_type<half>(*(device const ushort*)(up_block)));
+            const float up_dmin = float(as_type<half>(*(device const ushort*)(up_block + 2)));
+            device const uchar* up_scales = up_block + 4;
+            device const uchar* up_quants = up_block + 16;
+
+            const uint byte_off = tid * 4u;
+            const uint j = byte_off / 32u;
+            const uint local_off = byte_off % 32u;
+
+            const uchar4 gate_qbytes = *(device const uchar4*)(gate_quants + byte_off);
+            const float2 gate_sm_lo = get_scale_min_k4(j * 2u, gate_scales);
+            const float2 gate_sm_hi = get_scale_min_k4(j * 2u + 1u, gate_scales);
+
+            const float gate_d_sc_lo = gate_d * gate_sm_lo.x;
+            const float gate_d_m_lo = gate_dmin * gate_sm_lo.y;
+            const float gate_d_sc_hi = gate_d * gate_sm_hi.x;
+            const float gate_d_m_hi = gate_dmin * gate_sm_hi.y;
+
+            const uchar4 up_qbytes = *(device const uchar4*)(up_quants + byte_off);
+            const float2 up_sm_lo = get_scale_min_k4(j * 2u, up_scales);
+            const float2 up_sm_hi = get_scale_min_k4(j * 2u + 1u, up_scales);
+
+            const float up_d_sc_lo = up_d * up_sm_lo.x;
+            const float up_d_m_lo = up_dmin * up_sm_lo.y;
+            const float up_d_sc_hi = up_d * up_sm_hi.x;
+            const float up_d_m_hi = up_dmin * up_sm_hi.y;
+
+            const uint col_lo = b * 256u + j * 64u + local_off;
+            const uint col_hi = col_lo + 32u;
+
+            const uchar4 gate_q_lo = uchar4(
+                gate_qbytes.x & 0x0F,
+                gate_qbytes.y & 0x0F,
+                gate_qbytes.z & 0x0F,
+                gate_qbytes.w & 0x0F
+            );
+            const uchar4 gate_q_hi = uchar4(
+                gate_qbytes.x >> 4,
+                gate_qbytes.y >> 4,
+                gate_qbytes.z >> 4,
+                gate_qbytes.w >> 4
+            );
+            const float4 gate_lo_vals = fma(float4(gate_q_lo), float4(gate_d_sc_lo), float4(-gate_d_m_lo));
+            const float4 gate_hi_vals = fma(float4(gate_q_hi), float4(gate_d_sc_hi), float4(-gate_d_m_hi));
+
+            const uchar4 up_q_lo = uchar4(
+                up_qbytes.x & 0x0F,
+                up_qbytes.y & 0x0F,
+                up_qbytes.z & 0x0F,
+                up_qbytes.w & 0x0F
+            );
+            const uchar4 up_q_hi = uchar4(
+                up_qbytes.x >> 4,
+                up_qbytes.y >> 4,
+                up_qbytes.z >> 4,
+                up_qbytes.w >> 4
+            );
+            const float4 up_lo_vals = fma(float4(up_q_lo), float4(up_d_sc_lo), float4(-up_d_m_lo));
+            const float4 up_hi_vals = fma(float4(up_q_hi), float4(up_d_sc_hi), float4(-up_d_m_hi));
+
+            const float4 x0_lo = *(device const float4*)(x0 + col_lo);
+            const float4 x0_hi = *(device const float4*)(x0 + col_hi);
+            const float4 x1_lo = *(device const float4*)(x1 + col_lo);
+            const float4 x1_hi = *(device const float4*)(x1 + col_hi);
+            const float4 x2_lo = *(device const float4*)(x2 + col_lo);
+            const float4 x2_hi = *(device const float4*)(x2 + col_hi);
+            const float4 x3_lo = *(device const float4*)(x3 + col_lo);
+            const float4 x3_hi = *(device const float4*)(x3 + col_hi);
+            const float4 x4_lo = *(device const float4*)(x4 + col_lo);
+            const float4 x4_hi = *(device const float4*)(x4 + col_hi);
+            const float4 x5_lo = *(device const float4*)(x5 + col_lo);
+            const float4 x5_hi = *(device const float4*)(x5 + col_hi);
+            const float4 x6_lo = *(device const float4*)(x6 + col_lo);
+            const float4 x6_hi = *(device const float4*)(x6 + col_hi);
+
+            gate_acc0.x += dot(gate_lo_vals, x0_lo) + dot(gate_hi_vals, x0_hi);
+            gate_acc0.y += dot(gate_lo_vals, x1_lo) + dot(gate_hi_vals, x1_hi);
+            gate_acc0.z += dot(gate_lo_vals, x2_lo) + dot(gate_hi_vals, x2_hi);
+            gate_acc0.w += dot(gate_lo_vals, x3_lo) + dot(gate_hi_vals, x3_hi);
+            gate_acc1.x += dot(gate_lo_vals, x4_lo) + dot(gate_hi_vals, x4_hi);
+            gate_acc1.y += dot(gate_lo_vals, x5_lo) + dot(gate_hi_vals, x5_hi);
+            gate_acc1.z += dot(gate_lo_vals, x6_lo) + dot(gate_hi_vals, x6_hi);
+
+            up_acc0.x += dot(up_lo_vals, x0_lo) + dot(up_hi_vals, x0_hi);
+            up_acc0.y += dot(up_lo_vals, x1_lo) + dot(up_hi_vals, x1_hi);
+            up_acc0.z += dot(up_lo_vals, x2_lo) + dot(up_hi_vals, x2_hi);
+            up_acc0.w += dot(up_lo_vals, x3_lo) + dot(up_hi_vals, x3_hi);
+            up_acc1.x += dot(up_lo_vals, x4_lo) + dot(up_hi_vals, x4_hi);
+            up_acc1.y += dot(up_lo_vals, x5_lo) + dot(up_hi_vals, x5_hi);
+            up_acc1.z += dot(up_lo_vals, x6_lo) + dot(up_hi_vals, x6_hi);
+        }
+
+        const float gate0 = simd_sum(gate_acc0.x);
+        const float gate1 = simd_sum(gate_acc0.y);
+        const float gate2 = simd_sum(gate_acc0.z);
+        const float gate3 = simd_sum(gate_acc0.w);
+        const float gate4 = simd_sum(gate_acc1.x);
+        const float gate5 = simd_sum(gate_acc1.y);
+        const float gate6 = simd_sum(gate_acc1.z);
+
+        const float up0 = simd_sum(up_acc0.x);
+        const float up1 = simd_sum(up_acc0.y);
+        const float up2 = simd_sum(up_acc0.z);
+        const float up3 = simd_sum(up_acc0.w);
+        const float up4 = simd_sum(up_acc1.x);
+        const float up5 = simd_sum(up_acc1.y);
+        const float up6 = simd_sum(up_acc1.z);
+
+        device float* y_base = activatedY + (p.y_offset / 4u);
+        if (tid == 0u) {
+            y_base[route0 * p.M + row] = geglu(gate0, up0);
+            y_base[route1 * p.M + row] = geglu(gate1, up1);
+            y_base[route2 * p.M + row] = geglu(gate2, up2);
+            y_base[route3 * p.M + row] = geglu(gate3, up3);
+            y_base[route4 * p.M + row] = geglu(gate4, up4);
+            y_base[route5 * p.M + row] = geglu(gate5, up5);
+            y_base[route6 * p.M + row] = geglu(gate6, up6);
         }
         return;
     }

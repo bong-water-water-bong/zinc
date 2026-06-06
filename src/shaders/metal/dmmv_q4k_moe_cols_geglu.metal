@@ -21,6 +21,7 @@ struct MoeColsGateUpDmmvPush {
     uint x_route_divisor;
     uint use_active_blocks;
     uint enable_exact5;
+    uint enable_exact7;
 };
 
 inline float2 get_scale_min_k4(uint j, device const uchar* sc) {

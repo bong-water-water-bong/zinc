@@ -1806,6 +1806,7 @@ const MoeColsGateUpDmmvPush = extern struct {
     x_route_divisor: u32,
     use_active_blocks: u32,
     enable_exact5: u32,
+    enable_exact7: u32,
 };
 
 fn createMetalBufferForMode(ctx: ?*shim.MetalCtx, size: usize, use_private: bool) !MetalBuffer {
@@ -4200,6 +4201,7 @@ pub const InferenceEngine = struct {
     gemma_q8_moe_fallback_down_enabled: bool,
     gemma_moe_post_norm_residual_decode_enabled: bool,
     gemma_q4k_geglu_exact5_enabled: bool,
+    gemma_q4k_geglu_exact7_enabled: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     qwen_ssm_proj_validate_captured_tokens: u32,
@@ -4417,6 +4419,7 @@ pub const InferenceEngine = struct {
         self.gemma_q8_moe_fallback_down_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_FALLBACK_DOWN") orelse defaultGemmaQ8MoeFallbackDownEnabled(cfg);
         self.gemma_moe_post_norm_residual_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_MOE_POST_NORM_DECODE") orelse defaultGemmaMoePostNormResidualDecodeEnabled(cfg);
         self.gemma_q4k_geglu_exact5_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_EXACT5") orelse false;
+        self.gemma_q4k_geglu_exact7_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_EXACT7") orelse true;
         // Per-kernel timing probe — default off, distorts decode tok/s when on
         // (each dispatch becomes a commit+wait+restart sync). The cycle-33 auto-
         // enable on `--profile` runs was reverted: the probe's per-dispatch
@@ -11023,11 +11026,11 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
 
     const route_blocks = @max(active_block_upper_bound, 1);
     recordMoeDmmvProfile(engine, tensor, M, K, route_blocks * 2);
-    const use_exact5_pipe =
+    const use_tail_pipe =
         engine.in_prefill_phase and
-        engine.gemma_q4k_geglu_exact5_enabled and
+        (engine.gemma_q4k_geglu_exact5_enabled or engine.gemma_q4k_geglu_exact7_enabled) and
         engine.dmmv_q4k_moe_cols_geglu_exact5_pipe.handle != null;
-    const pipe = if (use_exact5_pipe)
+    const pipe = if (use_tail_pipe)
         &engine.dmmv_q4k_moe_cols_geglu_exact5_pipe
     else
         &engine.dmmv_q4k_moe_cols_geglu_pipe;
@@ -11044,7 +11047,8 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
         .ids_stride = ids_stride,
         .x_route_divisor = @max(x_route_divisor, 1),
         .use_active_blocks = 1,
-        .enable_exact5 = if (use_exact5_pipe) 1 else 0,
+        .enable_exact5 = if (engine.in_prefill_phase and engine.gemma_q4k_geglu_exact5_enabled) 1 else 0,
+        .enable_exact7 = if (engine.in_prefill_phase and engine.gemma_q4k_geglu_exact7_enabled) 1 else 0,
     };
     const bufs = [_]*const MetalBuffer{
         &tensor.gpu_buffer,
