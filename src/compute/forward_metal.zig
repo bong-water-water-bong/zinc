@@ -3,6 +3,7 @@
 //! This is the Metal equivalent of forward.zig (Vulkan).
 //! Uses MSL compute shaders dispatched via the Metal shim.
 const std = @import("std");
+const builtin = @import("builtin");
 const config_mod = @import("../model/config.zig");
 const ModelConfig = config_mod.ModelConfig;
 const gguf = @import("../model/gguf.zig");
@@ -46,7 +47,10 @@ const qwen_moe_route_pack_validate_tokens: u32 = 128;
 const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
 const moe_route_block_cols: u32 = 8;
 const moe_cols_dense_dispatch_cols: u32 = moe_route_block_cols;
-const moe_route_pack_profile_stats_per_layer: usize = 4;
+const moe_route_pack_profile_base_stats_per_layer: usize = 4;
+const moe_route_pack_tail_hist_bins: usize = @as(usize, moe_route_block_cols) - 1;
+const moe_route_pack_tail_hist_stats_offset: usize = moe_route_pack_profile_base_stats_per_layer;
+const moe_route_pack_profile_stats_per_layer: usize = moe_route_pack_profile_base_stats_per_layer + moe_route_pack_tail_hist_bins;
 
 fn moeRoutePackProfileWords(n_layers: usize) usize {
     return 1 + n_layers + n_layers * moe_route_pack_profile_stats_per_layer;
@@ -903,6 +907,7 @@ pub const RuntimeProfile = struct {
     route_pack_tail_blocks_actual: u64 = 0,
     route_pack_single_tail_blocks_actual: u64 = 0,
     route_pack_padding_slots_actual: u64 = 0,
+    route_pack_tail_size_hist_actual: [moe_route_pack_tail_hist_bins]u64 = [_]u64{0} ** moe_route_pack_tail_hist_bins,
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1191,6 +1196,44 @@ fn bytesToGiB(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0;
 }
 
+fn routePackTailHistogramTotal(profile: RuntimeProfile) u64 {
+    var total: u64 = 0;
+    for (profile.route_pack_tail_size_hist_actual) |count| {
+        total += count;
+    }
+    return total;
+}
+
+fn logRoutePackTailHistogram(label: []const u8, profile: RuntimeProfile) void {
+    const total = routePackTailHistogramTotal(profile);
+    if (total == 0) return;
+    const h = profile.route_pack_tail_size_hist_actual;
+    if (label.len > 0) {
+        log.info("  {s} route pack tail sizes: total {d} r1 {d} r2 {d} r3 {d} r4 {d} r5 {d} r6 {d} r7 {d}", .{
+            label,
+            total,
+            h[0],
+            h[1],
+            h[2],
+            h[3],
+            h[4],
+            h[5],
+            h[6],
+        });
+    } else {
+        log.info("  route-pack tail sizes: total {d} r1 {d} r2 {d} r3 {d} r4 {d} r5 {d} r6 {d} r7 {d}", .{
+            total,
+            h[0],
+            h[1],
+            h[2],
+            h[3],
+            h[4],
+            h[5],
+            h[6],
+        });
+    }
+}
+
 fn q8ShapeStatMinusPrefix(total_slot: Q8ShapeStat, prefix: RuntimeProfile) Q8ShapeStat {
     if (total_slot.calls == 0) return .{};
 
@@ -1316,6 +1359,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.route_pack_tail_blocks_actual = total.route_pack_tail_blocks_actual -| prefix.route_pack_tail_blocks_actual;
     delta.route_pack_single_tail_blocks_actual = total.route_pack_single_tail_blocks_actual -| prefix.route_pack_single_tail_blocks_actual;
     delta.route_pack_padding_slots_actual = total.route_pack_padding_slots_actual -| prefix.route_pack_padding_slots_actual;
+    inline for (0..moe_route_pack_tail_hist_bins) |i| {
+        delta.route_pack_tail_size_hist_actual[i] = total.route_pack_tail_size_hist_actual[i] -| prefix.route_pack_tail_size_hist_actual[i];
+    }
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1439,6 +1485,7 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                     pctOf(profile.route_pack_active_blocks_actual, profile.route_pack_tail_blocks_actual),
                     pctOf(profile.route_pack_tail_blocks_actual, profile.route_pack_single_tail_blocks_actual),
                 });
+                logRoutePackTailHistogram(label, profile);
             }
         }
     }
@@ -2771,6 +2818,9 @@ fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, scratch: *const Batch
             p.route_pack_tail_blocks_actual += counts[base + 1];
             p.route_pack_single_tail_blocks_actual += counts[base + 2];
             p.route_pack_padding_slots_actual += counts[base + 3];
+            inline for (0..moe_route_pack_tail_hist_bins) |tail_idx| {
+                p.route_pack_tail_size_hist_actual[tail_idx] += counts[base + moe_route_pack_tail_hist_stats_offset + tail_idx];
+            }
         }
     }
 }
@@ -7300,6 +7350,7 @@ pub const InferenceEngine = struct {
                             pctOf(profile.route_pack_active_blocks_actual, profile.route_pack_tail_blocks_actual),
                             pctOf(profile.route_pack_tail_blocks_actual, profile.route_pack_single_tail_blocks_actual),
                         });
+                        logRoutePackTailHistogram("", profile);
                     }
                 }
             }
@@ -7786,10 +7837,14 @@ pub const InferenceEngine = struct {
 
 fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
     const allocator = std.heap.page_allocator;
-    const shader_dir = runtime_assets.resolveShaderDir(allocator, .metal) catch |err| {
-        log.err("Failed to resolve Metal shader directory for '{s}': {s}", .{ name, @errorName(err) });
-        return error.ShaderNotFound;
-    };
+    const shader_dir =
+        if (builtin.is_test and std.posix.getenv("ZINC_SHADER_DIR") == null)
+            allocator.dupe(u8, "src/shaders/metal") catch return error.OutOfMemory
+        else
+            runtime_assets.resolveShaderDir(allocator, .metal) catch |err| {
+                log.err("Failed to resolve Metal shader directory for '{s}': {s}", .{ name, @errorName(err) });
+                return error.ShaderNotFound;
+            };
     defer allocator.free(shader_dir);
 
     const file_name = std.fmt.allocPrint(allocator, "{s}.metal", .{name}) catch return error.OutOfMemory;
@@ -29129,6 +29184,12 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
         try std.testing.expectEqual(@as(u32, 6), active_count_ptr[stats_base + 1]);
         try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 2]);
         try std.testing.expectEqual(@as(u32, 33), active_count_ptr[stats_base + 3]);
+        const hist_start = stats_base + moe_route_pack_tail_hist_stats_offset;
+        try std.testing.expectEqualSlices(
+            u32,
+            &.{ 1, 3, 1, 0, 1, 0, 0 },
+            active_count_ptr[hist_start..][0..moe_route_pack_tail_hist_bins],
+        );
     }
 
     var seen_routes = [_]bool{false} ** route_slots;
