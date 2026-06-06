@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#17281f"/>
+    </linearGradient>
+    <style>
+      .title { fill: #f6fbff; font-size: 32px; font-weight: 780; }
+      .subtitle { fill: #aebdcc; font-size: 15px; }
+      .laneTitle { fill: #f6fbff; font-size: 18px; font-weight: 760; }
+      .boxTitle { fill: #f6fbff; font-size: 15px; font-weight: 760; text-anchor: middle; }
+      .boxText { fill: #aebdcc; font-size: 12px; text-anchor: middle; }
+      .gateText { fill: #07111d; font-size: 15px; font-weight: 820; text-anchor: middle; dominant-baseline: central; }
+      .small { fill: #9fb0c1; font-size: 12px; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L8,3 z" fill="#6f8194"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="760" fill="url(#bg)"/>
+  <text x="56" y="62" class="title">The dense RDNA4 prefill gate is narrow on purpose</text>
+  <text x="56" y="94" class="subtitle">Dense Qwen3-8B can enter the 208 tok/s path. Qwen3.6 35B-A3B needs two additional batched graph shapes first.</text>
+
+  <g transform="translate(56,132)">
+    <rect width="1088" height="244" rx="8" fill="#111c2a" stroke="#344458"/>
+    <text x="28" y="42" class="laneTitle">Dense transformer path: gate open</text>
+    <text x="28" y="67" class="small">Every token uses the same dense FFN and the prompt axis can be column-batched.</text>
+
+    <g transform="translate(40,108)">
+      <rect x="0" y="0" width="180" height="82" rx="7" fill="#17283a" stroke="#3a5168"/>
+      <text x="90" y="31" class="boxTitle">Prompt chunk</text>
+      <text x="90" y="55" class="boxText">many token columns</text>
+
+      <line x1="198" y1="41" x2="262" y2="41" stroke="#6f8194" stroke-width="3" marker-end="url(#arrow)"/>
+
+      <rect x="280" y="0" width="210" height="82" rx="7" fill="#17283a" stroke="#3a5168"/>
+      <text x="385" y="31" class="boxTitle">Column-batched DMMV</text>
+      <text x="385" y="55" class="boxText">reuse weight rows</text>
+
+      <line x1="508" y1="41" x2="572" y2="41" stroke="#6f8194" stroke-width="3" marker-end="url(#arrow)"/>
+
+      <rect x="590" y="0" width="200" height="82" rx="7" fill="#17283a" stroke="#3a5168"/>
+      <text x="690" y="31" class="boxTitle">KV cache writes</text>
+      <text x="690" y="55" class="boxText">batched prompt rows</text>
+
+      <line x1="808" y1="41" x2="872" y2="41" stroke="#6f8194" stroke-width="3" marker-end="url(#arrow)"/>
+
+      <rect x="890" y="6" width="140" height="70" rx="8" fill="#58e6a9"/>
+      <text x="960" y="41" class="gateText">208 tok/s</text>
+    </g>
+  </g>
+
+  <g transform="translate(56,414)">
+    <rect width="1088" height="264" rx="8" fill="#151f2a" stroke="#394b5d"/>
+    <text x="28" y="42" class="laneTitle">Qwen3.6 35B-A3B path: two hybrid gates still closed</text>
+    <text x="28" y="67" class="small">The prompt work is not just bigger. It adds routed experts and recurrent SSM state.</text>
+
+    <g transform="translate(40,110)">
+      <rect x="0" y="0" width="170" height="82" rx="7" fill="#1b2b3a" stroke="#3d5368"/>
+      <text x="85" y="31" class="boxTitle">Prompt chunk</text>
+      <text x="85" y="55" class="boxText">same start</text>
+
+      <line x1="188" y1="41" x2="252" y2="41" stroke="#6f8194" stroke-width="3" marker-end="url(#arrow)"/>
+
+      <rect x="270" y="-18" width="210" height="118" rx="7" fill="#2b2430" stroke="#6a4a60"/>
+      <text x="375" y="24" class="boxTitle">MoE route-pack</text>
+      <text x="375" y="48" class="boxText">group tokens by expert</text>
+      <text x="375" y="70" class="boxText">scatter weighted outputs</text>
+      <rect x="42" y="86" width="126" height="36" rx="6" fill="#ff8f70"/>
+      <text x="105" y="105" class="gateText">missing</text>
+
+      <line x1="498" y1="41" x2="562" y2="41" stroke="#6f8194" stroke-width="3" marker-end="url(#arrow)"/>
+
+      <rect x="580" y="-18" width="230" height="118" rx="7" fill="#222b33" stroke="#5b6672"/>
+      <text x="695" y="24" class="boxTitle">SSM prompt kernel</text>
+      <text x="695" y="48" class="boxText">walk tokens in order</text>
+      <text x="695" y="70" class="boxText">keep state resident</text>
+      <rect x="52" y="86" width="126" height="36" rx="6" fill="#ff8f70"/>
+      <text x="115" y="105" class="gateText">missing</text>
+
+      <line x1="828" y1="41" x2="892" y2="41" stroke="#6f8194" stroke-width="3" marker-end="url(#arrow)"/>
+
+      <rect x="910" y="6" width="122" height="70" rx="8" fill="#ffcf77"/>
+      <text x="971" y="33" class="gateText">fallback</text>
+      <text x="971" y="56" class="gateText">today</text>
+    </g>
+
+    <text x="40" y="226" class="small">Opening the gate safely means proving both missing paths against the current per-token oracle, not deleting the guard.</text>
+  </g>
+
+  <text x="56" y="724" fill="#8fa1b4" font-size="12">This is the architecture reason Qwen 35B cannot inherit the dense Qwen3-8B batched-prefill result yet.</text>
+</svg>

@@ -101,7 +101,7 @@ The first is attention shape. Gemma 4 uses sliding-window attention for most lay
 
 The second is grouped-query attention detail. The earlier [single push constant post](/blog/2026-04-24-the-single-push-constant-blocking-gemma-4-prefill-on-rdna4) covered the hard version: full-attention Gemma layers can force the engine to distinguish Q head dimensions from KV head dimensions. A `head_dim` push constant that worked for LLaMA-shaped and Qwen-shaped paths was too vague for Gemma. The fix was not a better inner loop. It was a more honest kernel interface.
 
-The third is V handling. Dense Gemma 4 has attention layers where V is derived from K and then receives a plain unit-weight RMS norm. The current batched prefill notes in `docs/RDNA4_BATCHED_PREFILL_2X.md` call this out explicitly: the dense Gemma gate came off after the batched path stopped feeding a post-norm, post-RoPE K buffer as V. That is the kind of bug that can pass simple shape checks and still corrupt model behavior.
+The third is V handling. Dense Gemma 4 has attention layers where V is derived from K and then receives a plain unit-weight RMS norm. The [RDNA4 batched prefill post](/blog/2026-06-05-how-zinc-rdna4-batched-prefill-went-from-42-to-208-tok-s) calls this out explicitly: the dense Gemma gate came off after the batched path stopped feeding a post-norm, post-RoPE K buffer as V. That is the kind of bug that can pass simple shape checks and still corrupt model behavior.
 
 The fourth is FFN structure. Qwen-style paths use SwiGLU. Gemma uses GEGLU. Gemma MoE also has different norm placement and can apply post-FFN normalization before the residual add. A generic "run the expert FFN" abstraction hides exactly the details that decide correctness.
 
@@ -144,7 +144,7 @@ Across all backends, Gemma needs to become a regression gate. If a change improv
 
 This post is meant to be read with the measured dashboard open, not as a standalone claim. The live source of truth is the [ZINC benchmark dashboard](/zinc/benchmarks), and the broader context is the June 1 [ZINC performance overview](/blog/2026-06-01-zinc-performance-where-it-is-fast-and-where-it-is-not). The Gemma-specific kernel history starts with the [single push constant that blocked Gemma 4 prefill](/blog/2026-04-24-the-single-push-constant-blocking-gemma-4-prefill-on-rdna4), then continues into the [one-submit-per-prompt prefill work](/blog/2026-04-25-why-one-vkqueuesubmit-per-prompt-is-the-next-quiet-rdna4-prefill-unlock).
 
-For readers who want the architecture mechanics, the most useful companion is [How MoE models work in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc). For readers who want to reproduce local runs, start with [Getting Started with ZINC](/zinc/docs/getting-started) and the RDNA4 [batched prefill notes](/zinc/docs/rdna4-batched-prefill-2x). Those references are the reason the Gemma story can stay precise: the claims tie back to model ids, measured rows, and named kernel work.
+For readers who want the architecture mechanics, the most useful companion is [How MoE models work in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc). For readers who want to reproduce local runs, start with [Getting Started with ZINC](/zinc/docs/getting-started) and the RDNA4 [batched prefill post](/blog/2026-06-05-how-zinc-rdna4-batched-prefill-went-from-42-to-208-tok-s). Those references are the reason the Gemma story can stay precise: the claims tie back to model ids, measured rows, and named kernel work.
 
 ## The broader lesson
 

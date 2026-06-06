@@ -13,7 +13,7 @@ Findings from extensive profiling of LLM inference on AMD Radeon AI PRO R9700 (R
 | Bandwidth utilization (decode) | 31% of 576 GB/s | ~28% | — |
 | Per-token weight traffic | ~1.57 GiB | ~1.57 GiB | — |
 
-Decode beats llama.cpp by 12%. Prefill still trails — the hybrid MoE plus SSM architecture exposes more parallelism than the current dispatcher exploits, and the work to close that gap lives in `docs/RDNA4_BATCHED_PREFILL_2X.md` and the ZINC_RT chunked-prefill plan in `docs/ZINC_RT_DESIGN.md` §18.7. The 31% bandwidth utilization at peak decode is the headroom number to watch — the theoretical ceiling at 100% BW is ~365 tok/s, and the path to closing the gap is no longer one missing fused kernel.
+Decode beats llama.cpp by 12%. Prefill still trails — the hybrid MoE plus SSM architecture exposes more parallelism than the current dispatcher exploits, and the dense-model batched-prefill work is covered in [How ZINC's RDNA4 batched prefill went from 42 to 208 tok/s](/blog/2026-06-05-how-zinc-rdna4-batched-prefill-went-from-42-to-208-tok-s). The remaining hybrid work lives in the ZINC_RT chunked-prefill plan in `docs/ZINC_RT_DESIGN.md` §18.7. The 31% bandwidth utilization at peak decode is the headroom number to watch — the theoretical ceiling at 100% BW is ~365 tok/s, and the path to closing the gap is no longer one missing fused kernel.
 
 ## Hardware Specifications
 - **GPU**: 64 CUs, wave64, 32KB L0 vector cache/CU, 8MB L2
