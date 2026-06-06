@@ -47,9 +47,7 @@ const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
 const moe_route_block_cols: u32 = 8;
 const moe_cols_dense_dispatch_cols: u32 = moe_route_block_cols;
 const moe_route_pack_profile_tail_bins: usize = moe_route_block_cols - 1;
-const moe_route_pack_profile_projection_widths = [_]u32{ 4, 16, 32 };
-const moe_route_pack_profile_projection_stats: usize = moe_route_pack_profile_projection_widths.len * 2;
-const moe_route_pack_profile_stats_per_layer: usize = 4 + moe_route_pack_profile_tail_bins + moe_route_pack_profile_projection_stats;
+const moe_route_pack_profile_stats_per_layer: usize = 4 + moe_route_pack_profile_tail_bins;
 
 fn moeRoutePackProfileWords(n_layers: usize) usize {
     return 1 + n_layers + n_layers * moe_route_pack_profile_stats_per_layer;
@@ -907,8 +905,6 @@ pub const RuntimeProfile = struct {
     route_pack_single_tail_blocks_actual: u64 = 0,
     route_pack_padding_slots_actual: u64 = 0,
     route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
-    route_pack_projected_blocks_actual: [moe_route_pack_profile_projection_widths.len]u64 = [_]u64{0} ** moe_route_pack_profile_projection_widths.len,
-    route_pack_projected_padding_slots_actual: [moe_route_pack_profile_projection_widths.len]u64 = [_]u64{0} ** moe_route_pack_profile_projection_widths.len,
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1325,10 +1321,6 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     for (0..moe_route_pack_profile_tail_bins) |i| {
         delta.route_pack_tail_size_blocks_actual[i] = total.route_pack_tail_size_blocks_actual[i] -| prefix.route_pack_tail_size_blocks_actual[i];
     }
-    for (0..moe_route_pack_profile_projection_widths.len) |i| {
-        delta.route_pack_projected_blocks_actual[i] = total.route_pack_projected_blocks_actual[i] -| prefix.route_pack_projected_blocks_actual[i];
-        delta.route_pack_projected_padding_slots_actual[i] = total.route_pack_projected_padding_slots_actual[i] -| prefix.route_pack_projected_padding_slots_actual[i];
-    }
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1462,26 +1454,6 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                         profile.route_pack_tail_size_blocks_actual[4],
                         profile.route_pack_tail_size_blocks_actual[5],
                         profile.route_pack_tail_size_blocks_actual[6],
-                    });
-                }
-                if (profile.route_pack_projected_blocks_actual[0] > 0 or
-                    profile.route_pack_projected_blocks_actual[1] > 0 or
-                    profile.route_pack_projected_blocks_actual[2] > 0)
-                {
-                    const c4_capacity = profile.route_pack_projected_blocks_actual[0] * @as(u64, moe_route_pack_profile_projection_widths[0]);
-                    const c16_capacity = profile.route_pack_projected_blocks_actual[1] * @as(u64, moe_route_pack_profile_projection_widths[1]);
-                    const c32_capacity = profile.route_pack_projected_blocks_actual[2] * @as(u64, moe_route_pack_profile_projection_widths[2]);
-                    log.info("  {s} route pack width projections: c4 blocks {d} padding {d} util {d:.1}% | c16 blocks {d} padding {d} util {d:.1}% | c32 blocks {d} padding {d} util {d:.1}%", .{
-                        label,
-                        profile.route_pack_projected_blocks_actual[0],
-                        profile.route_pack_projected_padding_slots_actual[0],
-                        pctOf(c4_capacity, profile.route_pack_slots),
-                        profile.route_pack_projected_blocks_actual[1],
-                        profile.route_pack_projected_padding_slots_actual[1],
-                        pctOf(c16_capacity, profile.route_pack_slots),
-                        profile.route_pack_projected_blocks_actual[2],
-                        profile.route_pack_projected_padding_slots_actual[2],
-                        pctOf(c32_capacity, profile.route_pack_slots),
                     });
                 }
             }
@@ -2818,12 +2790,6 @@ fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, scratch: *const Batch
             p.route_pack_padding_slots_actual += counts[base + 3];
             for (0..moe_route_pack_profile_tail_bins) |tail_i| {
                 p.route_pack_tail_size_blocks_actual[tail_i] += counts[base + 4 + tail_i];
-            }
-            const projection_base = base + 4 + moe_route_pack_profile_tail_bins;
-            for (0..moe_route_pack_profile_projection_widths.len) |projection_i| {
-                const stat_base = projection_base + projection_i * 2;
-                p.route_pack_projected_blocks_actual[projection_i] += counts[stat_base + 0];
-                p.route_pack_projected_padding_slots_actual[projection_i] += counts[stat_base + 1];
             }
         }
     }
@@ -29193,12 +29159,6 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
         try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 8]);
         try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 9]);
         try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 10]);
-        try std.testing.expectEqual(@as(u32, 7), active_count_ptr[stats_base + 11]);
-        try std.testing.expectEqual(@as(u32, 13), active_count_ptr[stats_base + 12]);
-        try std.testing.expectEqual(@as(u32, 6), active_count_ptr[stats_base + 13]);
-        try std.testing.expectEqual(@as(u32, 81), active_count_ptr[stats_base + 14]);
-        try std.testing.expectEqual(@as(u32, 6), active_count_ptr[stats_base + 15]);
-        try std.testing.expectEqual(@as(u32, 177), active_count_ptr[stats_base + 16]);
     }
 
     var seen_routes = [_]bool{false} ** route_slots;

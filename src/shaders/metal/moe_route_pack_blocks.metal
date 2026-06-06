@@ -15,8 +15,7 @@ struct Params {
 #define NUM_COLS 8u
 #define MAX_EXPERTS 256u
 #define PROFILE_TAIL_BINS 7u
-#define PROFILE_PROJECTION_STATS 6u
-#define PROFILE_STATS_PER_LAYER (4u + PROFILE_TAIL_BINS + PROFILE_PROJECTION_STATS)
+#define PROFILE_STATS_PER_LAYER (4u + PROFILE_TAIL_BINS)
 
 kernel void main0(
     constant Params& p [[buffer(0)]],
@@ -76,27 +75,12 @@ kernel void main0(
         uint singleton_tail_blocks = 0u;
         uint padding_slots = 0u;
         uint tail_size_blocks[PROFILE_TAIL_BINS] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u };
-        uint c4_blocks = 0u;
-        uint c4_padding_slots = 0u;
-        uint c16_blocks = 0u;
-        uint c16_padding_slots = 0u;
-        uint c32_blocks = 0u;
-        uint c32_padding_slots = 0u;
         for (uint expert = 0u; expert < p.n_experts; expert++) {
             total_blocks += block_counts[expert];
             const uint stored_count = route_counts[expert];
             if (stored_count == 0u) {
                 continue;
             }
-            const uint c4 = (stored_count + 3u) / 4u;
-            const uint c16 = (stored_count + 15u) / 16u;
-            const uint c32 = (stored_count + 31u) / 32u;
-            c4_blocks += c4;
-            c4_padding_slots += c4 * 4u - stored_count;
-            c16_blocks += c16;
-            c16_padding_slots += c16 * 16u - stored_count;
-            c32_blocks += c32;
-            c32_padding_slots += c32 * 32u - stored_count;
             full_blocks += stored_count / NUM_COLS;
             const uint tail_routes = stored_count % NUM_COLS;
             if (tail_routes != 0u) {
@@ -118,13 +102,6 @@ kernel void main0(
             for (uint i = 0u; i < PROFILE_TAIL_BINS; i++) {
                 atomic_store_explicit(layer_stats + 4u + i, tail_size_blocks[i], memory_order_relaxed);
             }
-            const uint projection_base = 4u + PROFILE_TAIL_BINS;
-            atomic_store_explicit(layer_stats + projection_base + 0u, c4_blocks, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + projection_base + 1u, c4_padding_slots, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + projection_base + 2u, c16_blocks, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + projection_base + 3u, c16_padding_slots, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + projection_base + 4u, c32_blocks, memory_order_relaxed);
-            atomic_store_explicit(layer_stats + projection_base + 5u, c32_padding_slots, memory_order_relaxed);
         }
     }
 
