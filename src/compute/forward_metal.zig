@@ -1521,6 +1521,140 @@ fn dmmvPathLabel(path: DmmvPathClass) []const u8 {
     };
 }
 
+fn logQ8HotProfile(label: []const u8, profile: RuntimeProfile) void {
+    if (profile.dmmv_q8_0_bytes == 0) return;
+
+    const q8_repacked_calls =
+        profile.q8_repacked_tg128_calls +
+        profile.q8_repacked_exact_qwen_calls +
+        profile.q8_repacked_quad_calls +
+        profile.q8_repacked_generic_calls;
+    if (q8_repacked_calls > 0) {
+        if (label.len == 0) {
+            log.info("  q8 repacked kernels: tg128 {d:.2} GiB/{d} exact-qwen {d:.2} GiB/{d} quad {d:.2} GiB/{d} generic {d:.2} GiB/{d}", .{
+                bytesToGiB(profile.q8_repacked_tg128_bytes),
+                profile.q8_repacked_tg128_calls,
+                bytesToGiB(profile.q8_repacked_exact_qwen_bytes),
+                profile.q8_repacked_exact_qwen_calls,
+                bytesToGiB(profile.q8_repacked_quad_bytes),
+                profile.q8_repacked_quad_calls,
+                bytesToGiB(profile.q8_repacked_generic_bytes),
+                profile.q8_repacked_generic_calls,
+            });
+        } else {
+            log.info("  {s} q8 repacked kernels: tg128 {d:.2} GiB/{d} exact-qwen {d:.2} GiB/{d} quad {d:.2} GiB/{d} generic {d:.2} GiB/{d}", .{
+                label,
+                bytesToGiB(profile.q8_repacked_tg128_bytes),
+                profile.q8_repacked_tg128_calls,
+                bytesToGiB(profile.q8_repacked_exact_qwen_bytes),
+                profile.q8_repacked_exact_qwen_calls,
+                bytesToGiB(profile.q8_repacked_quad_bytes),
+                profile.q8_repacked_quad_calls,
+                bytesToGiB(profile.q8_repacked_generic_bytes),
+                profile.q8_repacked_generic_calls,
+            });
+        }
+    }
+
+    var top_idxs: [4]?usize = .{ null, null, null, null };
+    for (profile.q8_shape_stats, 0..) |slot, idx| {
+        if (slot.calls == 0) continue;
+        var insert_pos: ?usize = null;
+        for (top_idxs, 0..) |maybe_top_idx, rank| {
+            if (maybe_top_idx) |top_idx| {
+                if (slot.bytes > profile.q8_shape_stats[top_idx].bytes) {
+                    insert_pos = rank;
+                    break;
+                }
+            } else {
+                insert_pos = rank;
+                break;
+            }
+        }
+        if (insert_pos) |rank| {
+            var shift: usize = top_idxs.len - 1;
+            while (shift > rank) : (shift -= 1) {
+                top_idxs[shift] = top_idxs[shift - 1];
+            }
+            top_idxs[rank] = idx;
+        }
+    }
+    for (top_idxs, 0..) |maybe_idx, rank| {
+        if (maybe_idx) |idx| {
+            const slot = profile.q8_shape_stats[idx];
+            if (label.len == 0) {
+                log.info("  q8 hot #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
+                    rank + 1,
+                    dmmvPathLabel(slot.path),
+                    slot.rows,
+                    slot.cols,
+                    bytesToGiB(slot.bytes),
+                    slot.calls,
+                });
+            } else {
+                log.info("  {s} q8 hot #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
+                    label,
+                    rank + 1,
+                    dmmvPathLabel(slot.path),
+                    slot.rows,
+                    slot.cols,
+                    bytesToGiB(slot.bytes),
+                    slot.calls,
+                });
+            }
+        }
+    }
+
+    var dispatch_top: [5]?usize = .{ null, null, null, null, null };
+    for (profile.q8_repacked_dispatch_stats, 0..) |slot, idx| {
+        if (slot.calls == 0) continue;
+        var insert_pos: ?usize = null;
+        for (dispatch_top, 0..) |maybe_top_idx, rank| {
+            if (maybe_top_idx) |top_idx| {
+                if (slot.bytes > profile.q8_repacked_dispatch_stats[top_idx].bytes) {
+                    insert_pos = rank;
+                    break;
+                }
+            } else {
+                insert_pos = rank;
+                break;
+            }
+        }
+        if (insert_pos) |rank| {
+            var shift: usize = dispatch_top.len - 1;
+            while (shift > rank) : (shift -= 1) {
+                dispatch_top[shift] = dispatch_top[shift - 1];
+            }
+            dispatch_top[rank] = idx;
+        }
+    }
+    for (dispatch_top, 0..) |maybe_idx, rank| {
+        if (maybe_idx) |idx| {
+            const slot = profile.q8_repacked_dispatch_stats[idx];
+            if (label.len == 0) {
+                log.info("  q8 dispatch #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
+                    rank + 1,
+                    q8RepackedDispatchKindLabel(slot.kind),
+                    slot.rows,
+                    slot.cols,
+                    bytesToGiB(slot.bytes),
+                    slot.calls,
+                });
+            } else {
+                log.info("  {s} q8 dispatch #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
+                    label,
+                    rank + 1,
+                    q8RepackedDispatchKindLabel(slot.kind),
+                    slot.rows,
+                    slot.cols,
+                    bytesToGiB(slot.bytes),
+                    slot.calls,
+                });
+            }
+        }
+    }
+}
+
 /// Push constants for DMMV dispatch (matches GLSL layout).
 const DmmvPush = extern struct {
     M: u32, // rows
@@ -7287,6 +7421,8 @@ pub const InferenceEngine = struct {
             if (has_prefill_split) {
                 logDetailedProfileBuckets("prefill", self.prefill_profile);
                 logDetailedProfileBuckets("decode", decode_profile);
+                logQ8HotProfile("prefill", self.prefill_profile);
+                logQ8HotProfile("decode", decode_profile);
             } else {
                 logDetailedProfileBuckets(label, profile);
             }
@@ -7331,97 +7467,7 @@ pub const InferenceEngine = struct {
                     }
                 }
             }
-            if (profile.dmmv_q8_0_bytes > 0) {
-                const q8_repacked_calls =
-                    profile.q8_repacked_tg128_calls +
-                    profile.q8_repacked_exact_qwen_calls +
-                    profile.q8_repacked_quad_calls +
-                    profile.q8_repacked_generic_calls;
-                if (q8_repacked_calls > 0) {
-                    log.info("  q8 repacked kernels: tg128 {d:.2} GiB/{d} exact-qwen {d:.2} GiB/{d} quad {d:.2} GiB/{d} generic {d:.2} GiB/{d}", .{
-                        bytesToGiB(profile.q8_repacked_tg128_bytes),
-                        profile.q8_repacked_tg128_calls,
-                        bytesToGiB(profile.q8_repacked_exact_qwen_bytes),
-                        profile.q8_repacked_exact_qwen_calls,
-                        bytesToGiB(profile.q8_repacked_quad_bytes),
-                        profile.q8_repacked_quad_calls,
-                        bytesToGiB(profile.q8_repacked_generic_bytes),
-                        profile.q8_repacked_generic_calls,
-                    });
-                }
-                var top_idxs: [4]?usize = .{ null, null, null, null };
-                for (profile.q8_shape_stats, 0..) |slot, idx| {
-                    if (slot.calls == 0) continue;
-                    var insert_pos: ?usize = null;
-                    for (top_idxs, 0..) |maybe_top_idx, rank| {
-                        if (maybe_top_idx) |top_idx| {
-                            if (slot.bytes > profile.q8_shape_stats[top_idx].bytes) {
-                                insert_pos = rank;
-                                break;
-                            }
-                        } else {
-                            insert_pos = rank;
-                            break;
-                        }
-                    }
-                    if (insert_pos) |rank| {
-                        var shift: usize = top_idxs.len - 1;
-                        while (shift > rank) : (shift -= 1) {
-                            top_idxs[shift] = top_idxs[shift - 1];
-                        }
-                        top_idxs[rank] = idx;
-                    }
-                }
-                for (top_idxs, 0..) |maybe_idx, rank| {
-                    if (maybe_idx) |idx| {
-                        const slot = profile.q8_shape_stats[idx];
-                        log.info("  q8 hot #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
-                            rank + 1,
-                            dmmvPathLabel(slot.path),
-                            slot.rows,
-                            slot.cols,
-                            bytesToGiB(slot.bytes),
-                            slot.calls,
-                        });
-                    }
-                }
-                var dispatch_top: [5]?usize = .{ null, null, null, null, null };
-                for (profile.q8_repacked_dispatch_stats, 0..) |slot, idx| {
-                    if (slot.calls == 0) continue;
-                    var insert_pos: ?usize = null;
-                    for (dispatch_top, 0..) |maybe_top_idx, rank| {
-                        if (maybe_top_idx) |top_idx| {
-                            if (slot.bytes > profile.q8_repacked_dispatch_stats[top_idx].bytes) {
-                                insert_pos = rank;
-                                break;
-                            }
-                        } else {
-                            insert_pos = rank;
-                            break;
-                        }
-                    }
-                    if (insert_pos) |rank| {
-                        var shift: usize = dispatch_top.len - 1;
-                        while (shift > rank) : (shift -= 1) {
-                            dispatch_top[shift] = dispatch_top[shift - 1];
-                        }
-                        dispatch_top[rank] = idx;
-                    }
-                }
-                for (dispatch_top, 0..) |maybe_idx, rank| {
-                    if (maybe_idx) |idx| {
-                        const slot = profile.q8_repacked_dispatch_stats[idx];
-                        log.info("  q8 dispatch #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
-                            rank + 1,
-                            q8RepackedDispatchKindLabel(slot.kind),
-                            slot.rows,
-                            slot.cols,
-                            bytesToGiB(slot.bytes),
-                            slot.calls,
-                        });
-                    }
-                }
-            }
+            logQ8HotProfile("", profile);
         }
         if (profile.gpu_routed_moe_layers == 0 and profile.fallback_moe_layers > 0 and self.layer_tensors.len > 0) {
             const layer0 = self.layer_tensors[0];
