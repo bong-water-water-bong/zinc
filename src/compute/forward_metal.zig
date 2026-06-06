@@ -3925,6 +3925,7 @@ pub const InferenceEngine = struct {
     dmmv_q4k_dense_gate_up_swiglu_pipe: MetalPipeline,
     dmmv_q4k_moe_cols_pipe: MetalPipeline,
     dmmv_q4k_moe_cols_geglu_pipe: MetalPipeline,
+    dmmv_q4k_moe_cols_geglu_exact5_pipe: MetalPipeline,
     dmmv_q5_1_moe_pipe: MetalPipeline,
     dmmv_q5_1_moe_cols_pipe: MetalPipeline,
     dmmv_q8_0_moe_pipe: MetalPipeline,
@@ -4591,6 +4592,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q4k_dense_gate_up_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_swiglu");
         self.dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
         self.dmmv_q4k_moe_cols_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols_geglu");
+        self.dmmv_q4k_moe_cols_geglu_exact5_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols_geglu_exact5");
         self.dmmv_q5_1_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe");
         self.dmmv_q5_1_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
         self.dmmv_q8_0_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_moe");
@@ -5539,6 +5541,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_dense_gate_up_swiglu_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_cols_geglu_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_moe_cols_geglu_exact5_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_moe_pipe);
@@ -10965,6 +10968,14 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
 
     const route_blocks = @max(active_block_upper_bound, 1);
     recordMoeDmmvProfile(engine, tensor, M, K, route_blocks * 2);
+    const use_exact5_pipe =
+        engine.in_prefill_phase and
+        engine.gemma_q4k_geglu_exact5_enabled and
+        engine.dmmv_q4k_moe_cols_geglu_exact5_pipe.handle != null;
+    const pipe = if (use_exact5_pipe)
+        &engine.dmmv_q4k_moe_cols_geglu_exact5_pipe
+    else
+        &engine.dmmv_q4k_moe_cols_geglu_pipe;
 
     const push = MoeColsGateUpDmmvPush{
         .M = M,
@@ -10978,7 +10989,7 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
         .ids_stride = ids_stride,
         .x_route_divisor = @max(x_route_divisor, 1),
         .use_active_blocks = 1,
-        .enable_exact5 = if (engine.in_prefill_phase and engine.gemma_q4k_geglu_exact5_enabled) 1 else 0,
+        .enable_exact5 = if (use_exact5_pipe) 1 else 0,
     };
     const bufs = [_]*const MetalBuffer{
         &tensor.gpu_buffer,
@@ -10991,7 +11002,7 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
     };
     const rows_per_wg: u32 = 8;
     cmd.dispatchV2(
-        &engine.dmmv_q4k_moe_cols_geglu_pipe,
+        pipe,
         .{ (M + rows_per_wg - 1) / rows_per_wg, route_blocks, 1 },
         .{ 256, 1, 1 },
         &bufs,
