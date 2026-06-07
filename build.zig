@@ -307,7 +307,9 @@ pub fn build(b: *std.Build) void {
         "ssm_gated_norm_batch_tok",
     };
 
-    const compile_shaders = b.option(bool, "shaders", "Compile GLSL shaders to SPIR-V (requires glslc)") orelse is_linux;
+    // SPIR-V is only the Vulkan backend's kernel format. CUDA uses NVRTC `.cu`
+    // kernels (and Metal uses MSL), so don't require glslc for those backends.
+    const compile_shaders = b.option(bool, "shaders", "Compile GLSL shaders to SPIR-V (requires glslc)") orelse (selected_backend == .vulkan);
 
     if (compile_shaders) {
         inline for (shader_sources) |name| {
