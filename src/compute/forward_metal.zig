@@ -4054,6 +4054,7 @@ pub const InferenceEngine = struct {
     residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe: MetalPipeline,
     residual_rms_norm_router_f32_topk_pipe: MetalPipeline,
     post_norm_residual_rms_norm_pipe: MetalPipeline,
+    post_norm_residual_rms_norm_wide_pipe: MetalPipeline,
     post_norm_residual_router_f32_shared_gate_pipe: MetalPipeline,
     moe_weighted_acc_shared_pipe: MetalPipeline,
     moe_weighted_acc_shared_gate_f32_pipe: MetalPipeline,
@@ -4723,6 +4724,7 @@ pub const InferenceEngine = struct {
         self.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_repacked_k2048");
         self.residual_rms_norm_router_f32_topk_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_f32_topk");
         self.post_norm_residual_rms_norm_pipe = try loadShaderPipeline(ctx, "post_norm_residual_rms_norm");
+        self.post_norm_residual_rms_norm_wide_pipe = try loadShaderPipeline(ctx, "post_norm_residual_rms_norm_wide");
         self.post_norm_residual_router_f32_shared_gate_pipe = try loadShaderPipeline(ctx, "post_norm_residual_router_f32_shared_gate");
         self.moe_weighted_acc_shared_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared");
         self.moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
@@ -5670,6 +5672,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe);
         metal_pipeline.freePipeline(&self.residual_rms_norm_router_f32_topk_pipe);
         metal_pipeline.freePipeline(&self.post_norm_residual_rms_norm_pipe);
+        metal_pipeline.freePipeline(&self.post_norm_residual_rms_norm_wide_pipe);
         metal_pipeline.freePipeline(&self.post_norm_residual_router_f32_shared_gate_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_pipe);
@@ -11762,7 +11765,15 @@ fn dispatchPostNormResidualRmsNormOnCmd(
         .hidden_scale = hidden_scale,
     };
     const bufs = [_]*const MetalBuffer{ hidden, residual, residual_w, norm_out, output_w };
-    cmd.dispatchV2(&engine.post_norm_residual_rms_norm_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(PostNormResidualRmsNormPush), 0);
+    const use_wide =
+        engine.config.architecture == .gemma and
+        engine.config.n_experts == 0 and
+        n == 5376 and
+        engine.post_norm_residual_rms_norm_wide_pipe.handle != null and
+        engine.post_norm_residual_rms_norm_wide_pipe.max_threads_per_threadgroup >= 512;
+    const pipe = if (use_wide) &engine.post_norm_residual_rms_norm_wide_pipe else &engine.post_norm_residual_rms_norm_pipe;
+    const block: u32 = if (use_wide) 512 else 256;
+    cmd.dispatchV2(pipe, .{ 1, 1, 1 }, .{ block, 1, 1 }, &bufs, &push, @sizeOf(PostNormResidualRmsNormPush), 0);
 }
 
 fn canUseQwenPostNormResidualRouterF32SharedGate(
@@ -28932,6 +28943,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&residual_rms_norm_out_router_f32_shared_gate_pipe);
     var residual_router_f32_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_f32_topk");
     defer metal_pipeline.freePipeline(&residual_router_f32_pipe);
+    var post_norm_residual_rms_norm_wide_pipe = try loadShaderPipeline(ctx, "post_norm_residual_rms_norm_wide");
+    defer metal_pipeline.freePipeline(&post_norm_residual_rms_norm_wide_pipe);
     var post_norm_residual_router_f32_shared_gate_pipe = try loadShaderPipeline(ctx, "post_norm_residual_router_f32_shared_gate");
     defer metal_pipeline.freePipeline(&post_norm_residual_router_f32_shared_gate_pipe);
     var route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
@@ -29054,6 +29067,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(residual_router_q8_repacked_pipe.handle != null);
     try std.testing.expect(residual_rms_norm_out_pipe.handle != null);
     try std.testing.expect(residual_rms_norm_out_router_f32_shared_gate_pipe.handle != null);
+    try std.testing.expect(post_norm_residual_rms_norm_wide_pipe.handle != null);
     try std.testing.expect(post_norm_residual_router_f32_shared_gate_pipe.handle != null);
     try std.testing.expect(route_pack_pipe.handle != null);
     try std.testing.expect(route_pack_blocks_pipe.handle != null);
