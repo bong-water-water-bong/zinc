@@ -4121,6 +4121,7 @@ pub const InferenceEngine = struct {
     position: u32,
     max_context_tokens: u32,
     profile_enabled: bool,
+    q8_repacked_dispatch_profile_enabled: bool,
     debug_validation_enabled: bool,
     gemma_moe_validation_enabled: bool,
     qwen_prefill_validation_enabled: bool,
@@ -4321,6 +4322,7 @@ pub const InferenceEngine = struct {
         self.position = 0;
         self.max_context_tokens = max_ctx;
         self.profile_enabled = options.profile_enabled;
+        self.q8_repacked_dispatch_profile_enabled = readBoolEnv("ZINC_METAL_Q8_DISPATCH_PROFILE") orelse false;
         self.debug_validation_enabled = options.debug_validation_enabled;
         self.gemma_moe_validation_enabled = readBoolEnv("ZINC_GEMMA_MOE_VALIDATE") orelse false;
         self.qwen_prefill_validation_enabled =
@@ -8187,6 +8189,7 @@ fn recordQ8RepackedDispatchProfile(
     kind: Q8RepackedDispatchKind,
 ) void {
     if (!engine.profile_enabled or tensor.info.type_ != .q8_0) return;
+    if (!engine.q8_repacked_dispatch_profile_enabled) return;
     if (kind == .unknown) return;
 
     const bytes = dmmvWeightBytes(.q8_0, rows, cols);
