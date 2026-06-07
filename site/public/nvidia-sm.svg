@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 796" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+  <defs>
+    <linearGradient id="bgnv" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0c130c"/>
+      <stop offset="100%" stop-color="#08080a"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="900" height="796" rx="12" fill="url(#bgnv)"/>
+  <text x="450" y="30" text-anchor="middle" fill="#dce8cc" font-size="16" font-weight="600">NVIDIA Streaming Multiprocessor (SM) — 4 Processing Blocks</text>
+
+  <!-- SM outer box -->
+  <rect x="20" y="46" width="860" height="590" rx="10" fill="none" stroke="#5e7a3e" stroke-width="1.5"/>
+  <text x="40" y="66" fill="#9fb38a" font-size="11" font-weight="600">SM (Streaming Multiprocessor) — Ampere sm_86 · Ada sm_89 · Blackwell sm_120</text>
+
+  <!-- Processing Block 0 -->
+  <rect x="35" y="78" width="410" height="160" rx="8" fill="#0f1a0c" stroke="#76b900" stroke-width="1.5"/>
+  <text x="240" y="96" text-anchor="middle" fill="#76b900" font-size="12" font-weight="600">Processing Block 0</text>
+  <text x="240" y="111" text-anchor="middle" fill="#9fb38a" font-size="8.5">Warp Scheduler · Dispatch · 32 threads/clk</text>
+  <rect x="47" y="118" width="386" height="24" rx="4" fill="#16240e" stroke="#9acd32" stroke-width="1"/>
+  <text x="240" y="134" text-anchor="middle" fill="#9acd32" font-size="9.5" font-weight="600">Register File — 16,384 × 32-bit · 64 KB</text>
+  <rect x="47" y="146" width="186" height="38" rx="3" fill="#142010" stroke="#76b900" stroke-width="1"/>
+  <text x="140" y="162" text-anchor="middle" fill="#76b900" font-size="9" font-weight="600">CUDA Cores</text>
+  <text x="140" y="176" text-anchor="middle" fill="#9fb38a" font-size="8">32 FP32 / 16 INT32</text>
+  <rect x="247" y="146" width="186" height="38" rx="3" fill="#1c3210" stroke="#b3e000" stroke-width="1"/>
+  <text x="340" y="162" text-anchor="middle" fill="#b3e000" font-size="9" font-weight="600">Tensor Core</text>
+  <text x="340" y="176" text-anchor="middle" fill="#9fb38a" font-size="8">gen 3 / 4 / 5</text>
+  <rect x="47" y="188" width="386" height="30" rx="3" fill="#0f1a0c" stroke="#8aa86a" stroke-width="1"/>
+  <text x="240" y="207" text-anchor="middle" fill="#b6c79e" font-size="8">4× SFU (MUFU) · 8× LD/ST · L0 instruction cache</text>
+
+  <!-- Processing Block 1 -->
+  <rect x="455" y="78" width="410" height="160" rx="8" fill="#0f1a0c" stroke="#76b900" stroke-width="1.5"/>
+  <text x="660" y="96" text-anchor="middle" fill="#76b900" font-size="12" font-weight="600">Processing Block 1</text>
+  <text x="660" y="111" text-anchor="middle" fill="#9fb38a" font-size="8.5">Warp Scheduler · Dispatch · 32 threads/clk</text>
+  <rect x="467" y="118" width="386" height="24" rx="4" fill="#16240e" stroke="#9acd32" stroke-width="1"/>
+  <text x="660" y="134" text-anchor="middle" fill="#9acd32" font-size="9.5" font-weight="600">Register File — 16,384 × 32-bit · 64 KB</text>
+  <rect x="467" y="146" width="186" height="38" rx="3" fill="#142010" stroke="#76b900" stroke-width="1"/>
+  <text x="560" y="162" text-anchor="middle" fill="#76b900" font-size="9" font-weight="600">CUDA Cores</text>
+  <text x="560" y="176" text-anchor="middle" fill="#9fb38a" font-size="8">32 FP32 / 16 INT32</text>
+  <rect x="667" y="146" width="186" height="38" rx="3" fill="#1c3210" stroke="#b3e000" stroke-width="1"/>
+  <text x="760" y="162" text-anchor="middle" fill="#b3e000" font-size="9" font-weight="600">Tensor Core</text>
+  <text x="760" y="176" text-anchor="middle" fill="#9fb38a" font-size="8">gen 3 / 4 / 5</text>
+  <rect x="467" y="188" width="386" height="30" rx="3" fill="#0f1a0c" stroke="#8aa86a" stroke-width="1"/>
+  <text x="660" y="207" text-anchor="middle" fill="#b6c79e" font-size="8">4× SFU (MUFU) · 8× LD/ST · L0 instruction cache</text>
+
+  <!-- Processing Block 2 -->
+  <rect x="35" y="248" width="410" height="160" rx="8" fill="#0f1a0c" stroke="#76b900" stroke-width="1.5"/>
+  <text x="240" y="266" text-anchor="middle" fill="#76b900" font-size="12" font-weight="600">Processing Block 2</text>
+  <text x="240" y="281" text-anchor="middle" fill="#9fb38a" font-size="8.5">Warp Scheduler · Dispatch · 32 threads/clk</text>
+  <rect x="47" y="288" width="386" height="24" rx="4" fill="#16240e" stroke="#9acd32" stroke-width="1"/>
+  <text x="240" y="304" text-anchor="middle" fill="#9acd32" font-size="9.5" font-weight="600">Register File — 16,384 × 32-bit · 64 KB</text>
+  <rect x="47" y="316" width="186" height="38" rx="3" fill="#142010" stroke="#76b900" stroke-width="1"/>
+  <text x="140" y="332" text-anchor="middle" fill="#76b900" font-size="9" font-weight="600">CUDA Cores</text>
+  <text x="140" y="346" text-anchor="middle" fill="#9fb38a" font-size="8">32 FP32 / 16 INT32</text>
+  <rect x="247" y="316" width="186" height="38" rx="3" fill="#1c3210" stroke="#b3e000" stroke-width="1"/>
+  <text x="340" y="332" text-anchor="middle" fill="#b3e000" font-size="9" font-weight="600">Tensor Core</text>
+  <text x="340" y="346" text-anchor="middle" fill="#9fb38a" font-size="8">gen 3 / 4 / 5</text>
+  <rect x="47" y="358" width="386" height="30" rx="3" fill="#0f1a0c" stroke="#8aa86a" stroke-width="1"/>
+  <text x="240" y="377" text-anchor="middle" fill="#b6c79e" font-size="8">4× SFU (MUFU) · 8× LD/ST · L0 instruction cache</text>
+
+  <!-- Processing Block 3 -->
+  <rect x="455" y="248" width="410" height="160" rx="8" fill="#0f1a0c" stroke="#76b900" stroke-width="1.5"/>
+  <text x="660" y="266" text-anchor="middle" fill="#76b900" font-size="12" font-weight="600">Processing Block 3</text>
+  <text x="660" y="281" text-anchor="middle" fill="#9fb38a" font-size="8.5">Warp Scheduler · Dispatch · 32 threads/clk</text>
+  <rect x="467" y="288" width="386" height="24" rx="4" fill="#16240e" stroke="#9acd32" stroke-width="1"/>
+  <text x="660" y="304" text-anchor="middle" fill="#9acd32" font-size="9.5" font-weight="600">Register File — 16,384 × 32-bit · 64 KB</text>
+  <rect x="467" y="316" width="186" height="38" rx="3" fill="#142010" stroke="#76b900" stroke-width="1"/>
+  <text x="560" y="332" text-anchor="middle" fill="#76b900" font-size="9" font-weight="600">CUDA Cores</text>
+  <text x="560" y="346" text-anchor="middle" fill="#9fb38a" font-size="8">32 FP32 / 16 INT32</text>
+  <rect x="667" y="316" width="186" height="38" rx="3" fill="#1c3210" stroke="#b3e000" stroke-width="1"/>
+  <text x="760" y="332" text-anchor="middle" fill="#b3e000" font-size="9" font-weight="600">Tensor Core</text>
+  <text x="760" y="346" text-anchor="middle" fill="#9fb38a" font-size="8">gen 3 / 4 / 5</text>
+  <rect x="467" y="358" width="386" height="30" rx="3" fill="#0f1a0c" stroke="#8aa86a" stroke-width="1"/>
+  <text x="660" y="377" text-anchor="middle" fill="#b6c79e" font-size="8">4× SFU (MUFU) · 8× LD/ST · L0 instruction cache</text>
+
+  <!-- L1 / Shared Memory -->
+  <rect x="35" y="416" width="830" height="34" rx="5" fill="#0f1a0c" stroke="#9acd32" stroke-width="1.5"/>
+  <text x="450" y="437" text-anchor="middle" fill="#9acd32" font-size="11" font-weight="600">L1 Data Cache / Shared Memory — 128 KB unified · ≤100 KB shared (Ampere/Ada) · ~20–30 cycles</text>
+
+  <!-- Secondary SM-level units -->
+  <rect x="35" y="456" width="265" height="30" rx="4" fill="#0f1a0c" stroke="#8aa86a" stroke-width="1"/>
+  <text x="167" y="475" text-anchor="middle" fill="#b6c79e" font-size="9">L1 Instruction Cache</text>
+  <rect x="317" y="456" width="265" height="30" rx="4" fill="#0f1a0c" stroke="#8aa86a" stroke-width="1"/>
+  <text x="449" y="475" text-anchor="middle" fill="#b6c79e" font-size="9">Texture / Load-Store Units</text>
+  <rect x="599" y="456" width="266" height="30" rx="4" fill="#0f1a0c" stroke="#8aa86a" stroke-width="1"/>
+  <text x="732" y="475" text-anchor="middle" fill="#b6c79e" font-size="9">Tensor Memory Accelerator (Blackwell)</text>
+
+  <!-- Throughput panel -->
+  <rect x="35" y="494" width="830" height="132" rx="6" fill="#0f1a0c" stroke="#3e5a2e" stroke-width="1"/>
+  <text x="450" y="514" text-anchor="middle" fill="#dce8cc" font-size="11" font-weight="600">Instruction Throughput &amp; Latency per SM</text>
+
+  <text x="50" y="536" fill="#b6c79e" font-size="9">FFMA / FADD / FMUL (FP32)</text>
+  <text x="430" y="536" text-anchor="end" fill="#76b900" font-size="9">128 / clk</text>
+  <text x="50" y="554" fill="#b6c79e" font-size="9">HFMA2 (packed half2)</text>
+  <text x="430" y="554" text-anchor="end" fill="#76b900" font-size="9">256 flop / clk</text>
+  <text x="50" y="572" fill="#b6c79e" font-size="9">IMAD / IADD (INT32)</text>
+  <text x="430" y="572" text-anchor="end" fill="#9acd32" font-size="9">64 / clk</text>
+  <text x="50" y="590" fill="#b6c79e" font-size="9">__dp4a → IDP4A (int8 dot4)</text>
+  <text x="430" y="590" text-anchor="end" fill="#b3e000" font-size="9">64 / clk (256 MACs)</text>
+  <text x="50" y="608" fill="#b6c79e" font-size="9">cp.async (Ampere+)</text>
+  <text x="430" y="608" text-anchor="end" fill="#8aa86a" font-size="9">DRAM→shared, bypass RF</text>
+
+  <text x="470" y="536" fill="#b6c79e" font-size="9">HMMA (FP16·FP16→FP32 tensor)</text>
+  <text x="850" y="536" text-anchor="end" fill="#b3e000" font-size="9">gen-scaled, prefill</text>
+  <text x="470" y="554" fill="#b6c79e" font-size="9">IMMA (int8 tensor)</text>
+  <text x="850" y="554" text-anchor="end" fill="#b3e000" font-size="9">~2× HMMA rate</text>
+  <text x="470" y="572" fill="#b6c79e" font-size="9">MUFU (rcp, rsqrt, ex2, sin)</text>
+  <text x="850" y="572" text-anchor="end" fill="#d0a050" font-size="9">16 / clk (4 SFU)</text>
+  <text x="470" y="590" fill="#b6c79e" font-size="9">LDG.E.128 (global 128-bit)</text>
+  <text x="850" y="590" text-anchor="end" fill="#8aa86a" font-size="9">1/clk · ~400–600 lat</text>
+  <text x="470" y="608" fill="#b6c79e" font-size="9">LDSM (ldmatrix) / BAR.SYNC</text>
+  <text x="850" y="608" text-anchor="end" fill="#9acd32" font-size="9">tensor feed · ~20–30 clk</text>
+
+  <!-- L2 -->
+  <rect x="35" y="646" width="830" height="40" rx="6" fill="#0f1a0c" stroke="#8aa86a" stroke-width="1.5"/>
+  <text x="450" y="665" text-anchor="middle" fill="#b6c79e" font-size="11" font-weight="600">L2 Cache — 6 MB (Ampere GA102) · 72 MB (Ada RTX 4090) · much larger on Blackwell GB202 · 128 B lines</text>
+  <text x="450" y="679" text-anchor="middle" fill="#9fb38a" font-size="8">~200 cycles · GPU-wide scope · the biggest Ada→Blackwell inference lever after raw bandwidth</text>
+
+  <!-- VRAM -->
+  <rect x="35" y="690" width="830" height="40" rx="6" fill="#0f1a0c" stroke="#5e7050" stroke-width="1"/>
+  <text x="450" y="709" text-anchor="middle" fill="#c8d8b8" font-size="11" font-weight="600">GDDR6X / GDDR7 VRAM — 8–32 GB · up to 1.79 TB/s (RTX 5090, GDDR7, 512-bit)</text>
+  <text x="450" y="723" text-anchor="middle" fill="#9fb38a" font-size="8">~400–600 cycles · single-token decode is bound here, not on compute</text>
+
+  <!-- Totals -->
+  <rect x="35" y="734" width="830" height="48" rx="6" fill="#16240e" stroke="#3e5a2e" stroke-width="1"/>
+  <text x="450" y="753" text-anchor="middle" fill="#dce8cc" font-size="9.5" font-weight="600">SM Totals: 4 Processing Blocks · 128 CUDA cores · 4 Tensor Cores · 65,536 × 32-bit registers (256 KB) · 128 KB L1/Shared</text>
+  <text x="450" y="771" text-anchor="middle" fill="#b6c79e" font-size="9">RTX 5090 (GB202): 170 SMs = 21,760 CUDA cores · 680 5th-gen Tensor Cores · 32 GB GDDR7 @ 1.79 TB/s</text>
+</svg>
