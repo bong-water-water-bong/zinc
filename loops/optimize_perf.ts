@@ -94,6 +94,21 @@ const ZINC_HOST = rdnaEnvValue("HOST", "ZINC_RDNA_HOST", "ZINC_HOST") ?? "127.0.
 const ZINC_PORT = Number(rdnaEnvValue("PORT", "ZINC_RDNA_PORT", "ZINC_PORT") ?? "22");
 const ZINC_USER = rdnaEnvValue("USER", "ZINC_RDNA_USER", "ZINC_USER") ?? "root";
 const REMOTE_DIR = rdnaEnvValue("REMOTE_DIR", "ZINC_RDNA_REMOTE_DIR", "ZINC_REMOTE_DIR") ?? "/root/zinc";
+const AGENT_RSYNC_EXCLUDE_ARGS = [
+  "--exclude='.zig-cache'",
+  "--exclude='zig-out'",
+  "--exclude='node_modules'",
+  "--exclude='.git'",
+  "--exclude='.perf_optimize'",
+  "--exclude='.zinc_optimize'",
+  "--exclude='site'",
+  "--exclude='.DS_Store'",
+  "--exclude='.env'",
+  "--exclude='.env.*'",
+  "--exclude='*.swp'",
+  "--exclude='*.swo'",
+].join(" ");
+const DIAGNOSTIC_RUNTIME_FLAGS = new Set(["ZINC_PREFILL_PROFILE"]);
 
 type PromptMode = "raw" | "chat";
 
@@ -1741,7 +1756,7 @@ export function classifyApproachTags(description: string, changedFiles: string[]
 function isEnablementLike(report: AgentReport, changedFiles: string[]): boolean {
   if (report.stepKind === "enablement") return true;
   const text = `${report.description}\n${report.selfAnalysis}\n${changedFiles.join("\n")}`.toLowerCase();
-  return /\b(enablement|plumbing|infrastructure|helper|wrapper|layout|pipeline|descriptor|call site conversion|scaffold)\b/.test(text);
+  return /\b(enablement|plumbing|infrastructure|helper|wrapper|layout|pipeline|descriptor|call site conversion|scaffold|profile|profiling|instrument|instrumentation|phase budget|timing|timestamp)\b/.test(text);
 }
 
 function buildCycleHistoryEntry(cycle: CycleRecord): string {
@@ -2359,7 +2374,7 @@ Before editing any file, re-read the exact current contents from disk. Do not re
    - If you are uncertain, add a tiny enabling or measurement step instead of another large speculative refactor.
 
 5. **Test on remote node:**
-   rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+   rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" ${AGENT_RSYNC_EXCLUDE_ARGS} ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
    ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
 6. **Shader compilation:** glslc --target-env=vulkan1.3 -fshader-stage=compute file.comp -o file.spv
@@ -2511,7 +2526,7 @@ Your output must still end with @@@DESCRIPTION / @@@STEP_KIND / @@@SELF_ANALYSIS
 - enablement (only if you measured flag-on in this same cycle)
 
 ## Test on Remote Node
-rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" ${AGENT_RSYNC_EXCLUDE_ARGS} ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
 ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
 Files you may edit: same as a normal cycle (src/compute/*.zig, src/vulkan/*.zig, src/model/*.zig, src/server/*.zig, src/server/chat.html, src/shaders/*.comp, src/main.zig, and build.zig only when a shader/pipeline change needs build installation). You may also remove files that a revert would remove.
@@ -3430,11 +3445,27 @@ function createInitialState(
  */
 export function introducesRuntimeFlag(report: AgentReport, changedFiles: string[]): boolean {
   const haystack = `${report.description}\n${report.selfAnalysis}\n${report.rawText}`;
+  const mentionedFlags = [...haystack.matchAll(/\bZINC_[A-Z0-9_]+\b/g)].map((match) => match[0]);
+  if (
+    mentionedFlags.length > 0
+    && mentionedFlags.every((flag) => DIAGNOSTIC_RUNTIME_FLAGS.has(flag))
+    && /\b(profile|profiling|instrument|instrumentation|phase budget|bucket|timing|timestamp)\b/i.test(haystack)
+  ) {
+    return false;
+  }
   if (/ZINC_[A-Z0-9_]+\s*=\s*1|ZINC_[A-Z0-9_]+\b.*flag|flag[-_]?gated|behind .*flag|default(?:s)?\s+off|default(?:s)?\s+on/i.test(haystack)) {
     return true;
   }
   // Scan the change diff text indirectly via changedFiles + typical env patterns.
   return /std\.posix\.getenv/i.test(haystack) || /getenv\("ZINC_/.test(haystack);
+}
+
+function isDiagnosticProfileRepair(report: AgentReport): boolean {
+  const haystack = `${report.description}\n${report.selfAnalysis}\n${report.rawText}`;
+  return /\bZINC_PREFILL_PROFILE\b/i.test(haystack)
+    && /\b(profile|profiling|instrument|instrumentation|phase budget|bucket|parseable|emitted|timing|timestamp)\b/i.test(haystack)
+    && (/\b\d+\.\d+\s*(?:ms|µs|us)\b/i.test(haystack)
+      || /\b(?:dense_ffn|attention|qkv|gate_?up|down|ssm|moe|router|prefill_[a-z0-9_]+)\b/i.test(haystack));
 }
 
 /**
@@ -3559,7 +3590,7 @@ export function shouldKeepFoundationStep(
     return false;
   }
 
-  return stalledCycles >= 2 || report.stepKind === "enablement";
+  return stalledCycles >= 2 || report.stepKind === "enablement" || isDiagnosticProfileRepair(report);
 }
 
 export async function loadPreviousRun(effort: number): Promise<{
@@ -3952,7 +3983,7 @@ ${result.buildOutput.slice(-2000)}
 - The code must compile: zig build -Doptimize=ReleaseFast must succeed on the remote node.
 - Do not use sub-agents, delegation, spawn_agent, or wait_agent.
 - Re-read the file right before patching it; do not patch against stale context.
-- rsync to remote: rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+- rsync to remote: rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" ${AGENT_RSYNC_EXCLUDE_ARGS} ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
 - Build on remote: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast 2>&1"
 - Shader compilation: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR}/src/shaders && for f in *.comp; do glslc --target-env=vulkan1.3 -fshader-stage=compute \\$f -o \\$\{f%.comp}.spv 2>&1; done"`;
 

@@ -1046,7 +1046,11 @@ describe("config", () => {
     expect(src).toContain('"--exclude", ".env"');
     expect(src).toContain('"--exclude", ".env.*"');
     expect(src).toContain('"--exclude", "*.swp"');
-    expect(src).toContain("--exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo'");
+    expect(src).toContain('"--exclude=\'.env\'"');
+    expect(src).toContain('"--exclude=\'.env.*\'"');
+    expect(src).toContain('"--exclude=\'*.swp\'"');
+    expect(src).toContain('"--exclude=\'*.swo\'"');
+    expect(src).not.toContain("--exclude .env --exclude .env.*");
   });
 
   test("claude invocations pin the 1M-context Opus model and max effort", async () => {
@@ -1374,18 +1378,18 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
 });
 
 describe("introducesRuntimeFlag / hasFlagOnMeasurementEvidence", () => {
-  function report(description: string, analysis: string): {
+  function report(description: string, analysis: string, stepKind: "analysis" | "enablement" = "enablement"): {
     description: string;
     selfAnalysis: string;
     nextIdeas: string[];
-    stepKind: "enablement";
+    stepKind: "analysis" | "enablement";
     rawText: string;
   } {
     return {
       description,
       selfAnalysis: analysis,
       nextIdeas: [],
-      stepKind: "enablement",
+      stepKind,
       rawText: `${description}\n${analysis}`,
     };
   }
@@ -1403,6 +1407,18 @@ describe("introducesRuntimeFlag / hasFlagOnMeasurementEvidence", () => {
     expect(
       introducesRuntimeFlag(
         report("rewrite SSM proj dispatch ordering", "no env vars, no flags, just reorder"),
+        ["src/compute/forward.zig"],
+      ),
+    ).toBe(false);
+  });
+
+  test("introducesRuntimeFlag ignores the diagnostic prefill profile flag", () => {
+    expect(
+      introducesRuntimeFlag(
+        report(
+          "Repair ZINC_PREFILL_PROFILE=1 phase budget instrumentation",
+          "Profile now emits parseable dense_ffn 293.0 ms and attention 159.8 ms buckets.",
+        ),
         ["src/compute/forward.zig"],
       ),
     ).toBe(false);
@@ -1468,6 +1484,34 @@ describe("introducesRuntimeFlag / hasFlagOnMeasurementEvidence", () => {
       report(
         "Wire behind ZINC_PREFILL_BATCH=1 flag",
         "Plumbing; measured flag-on at 25.40 tok/s vs 25.65 flag-off, acceptable for a foundation step that unlocks cycle N+1.",
+      ),
+      ["src/compute/forward.zig"],
+    );
+    expect(keep).toBe(true);
+  });
+
+  test("shouldKeepFoundationStep keeps diagnostic profile repairs with concrete phase evidence", () => {
+    const bestPerf = {
+      buildOk: true,
+      buildOutput: "",
+      tokPerSec: 62.86,
+      tokPerSecSamples: [62.82, 62.86, 62.90],
+      correct: true,
+      outputText: "Paris.",
+      bandwidthUtil: null,
+      bandwidthSamples: [],
+      error: null,
+    };
+    const candidate = { ...bestPerf, tokPerSec: 62.80, tokPerSecSamples: [62.75, 62.80, 62.86] };
+    const keep = shouldKeepFoundationStep(
+      candidate,
+      bestPerf,
+      0,
+      0,
+      report(
+        "Repair ZINC_PREFILL_PROFILE=1 phase budget instrumentation",
+        "Profile smoke now emits parseable buckets: dense_ffn 293.0 ms, attention 159.8 ms, gate_up 140.0 ms, down 146.6 ms.",
+        "analysis",
       ),
       ["src/compute/forward.zig"],
     );
