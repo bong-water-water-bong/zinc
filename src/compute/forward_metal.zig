@@ -856,6 +856,13 @@ pub const RuntimeProfile = struct {
     full_attn_gate_barrier_calls: u32 = 0,
     full_attn_out_barrier_calls: u32 = 0,
     full_attn_residual_barrier_calls: u32 = 0,
+    full_attn_norm_dispatch_calls: u32 = 0,
+    full_attn_qkv_dispatch_calls: u32 = 0,
+    full_attn_rope_dispatch_calls: u32 = 0,
+    full_attn_flash_dispatch_calls: u32 = 0,
+    full_attn_gate_dispatch_calls: u32 = 0,
+    full_attn_out_dispatch_calls: u32 = 0,
+    full_attn_residual_dispatch_calls: u32 = 0,
     ssm_barrier_calls: u32 = 0,
     ssm_proj_norm_barrier_calls: u32 = 0,
     ssm_qkv_barrier_calls: u32 = 0,
@@ -1157,6 +1164,20 @@ fn recordFullAttnBarrierPhase(profile: ?*RuntimeProfile, phase: FullAttnBarrierP
     }
 }
 
+fn recordFullAttnDispatchDelta(profile: ?*RuntimeProfile, phase: FullAttnBarrierPhase, before: u32, after: u32) void {
+    const delta = after -| before;
+    if (delta == 0) return;
+    if (profile) |p| switch (phase) {
+        .norm => p.full_attn_norm_dispatch_calls += delta,
+        .qkv => p.full_attn_qkv_dispatch_calls += delta,
+        .rope => p.full_attn_rope_dispatch_calls += delta,
+        .flash => p.full_attn_flash_dispatch_calls += delta,
+        .gate => p.full_attn_gate_dispatch_calls += delta,
+        .out => p.full_attn_out_dispatch_calls += delta,
+        .residual => p.full_attn_residual_dispatch_calls += delta,
+    };
+}
+
 fn profileFullAttnBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: FullAttnBarrierPhase) void {
     const before_count = cmd.barrier_count;
     cmd.barrier();
@@ -1401,6 +1422,13 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.full_attn_gate_barrier_calls = total.full_attn_gate_barrier_calls -| prefix.full_attn_gate_barrier_calls;
     delta.full_attn_out_barrier_calls = total.full_attn_out_barrier_calls -| prefix.full_attn_out_barrier_calls;
     delta.full_attn_residual_barrier_calls = total.full_attn_residual_barrier_calls -| prefix.full_attn_residual_barrier_calls;
+    delta.full_attn_norm_dispatch_calls = total.full_attn_norm_dispatch_calls -| prefix.full_attn_norm_dispatch_calls;
+    delta.full_attn_qkv_dispatch_calls = total.full_attn_qkv_dispatch_calls -| prefix.full_attn_qkv_dispatch_calls;
+    delta.full_attn_rope_dispatch_calls = total.full_attn_rope_dispatch_calls -| prefix.full_attn_rope_dispatch_calls;
+    delta.full_attn_flash_dispatch_calls = total.full_attn_flash_dispatch_calls -| prefix.full_attn_flash_dispatch_calls;
+    delta.full_attn_gate_dispatch_calls = total.full_attn_gate_dispatch_calls -| prefix.full_attn_gate_dispatch_calls;
+    delta.full_attn_out_dispatch_calls = total.full_attn_out_dispatch_calls -| prefix.full_attn_out_dispatch_calls;
+    delta.full_attn_residual_dispatch_calls = total.full_attn_residual_dispatch_calls -| prefix.full_attn_residual_dispatch_calls;
     delta.ssm_barrier_calls = total.ssm_barrier_calls -| prefix.ssm_barrier_calls;
     delta.router_barrier_calls = total.router_barrier_calls -| prefix.router_barrier_calls;
     delta.gpu_routed_moe_barrier_calls = total.gpu_routed_moe_barrier_calls -| prefix.gpu_routed_moe_barrier_calls;
@@ -1712,6 +1740,26 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.full_attn_out_barrier_calls,
             profile.full_attn_residual_barrier_calls,
             other_full_attn_barriers,
+        });
+    }
+    const full_attn_dispatches =
+        profile.full_attn_norm_dispatch_calls +
+        profile.full_attn_qkv_dispatch_calls +
+        profile.full_attn_rope_dispatch_calls +
+        profile.full_attn_flash_dispatch_calls +
+        profile.full_attn_gate_dispatch_calls +
+        profile.full_attn_out_dispatch_calls +
+        profile.full_attn_residual_dispatch_calls;
+    if (full_attn_dispatches > 0) {
+        log.info("  {s} attn dispatches: norm {d} qkv {d} rope {d} flash {d} gate {d} out {d} residual {d}", .{
+            label,
+            profile.full_attn_norm_dispatch_calls,
+            profile.full_attn_qkv_dispatch_calls,
+            profile.full_attn_rope_dispatch_calls,
+            profile.full_attn_flash_dispatch_calls,
+            profile.full_attn_gate_dispatch_calls,
+            profile.full_attn_out_dispatch_calls,
+            profile.full_attn_residual_dispatch_calls,
         });
     }
 
@@ -7669,6 +7717,25 @@ pub const InferenceEngine = struct {
                     profile.full_attn_out_barrier_calls,
                     profile.full_attn_residual_barrier_calls,
                     other_full_attn_barriers,
+                });
+            }
+            const full_attn_dispatches =
+                profile.full_attn_norm_dispatch_calls +
+                profile.full_attn_qkv_dispatch_calls +
+                profile.full_attn_rope_dispatch_calls +
+                profile.full_attn_flash_dispatch_calls +
+                profile.full_attn_gate_dispatch_calls +
+                profile.full_attn_out_dispatch_calls +
+                profile.full_attn_residual_dispatch_calls;
+            if (full_attn_dispatches > 0) {
+                log.info("  attn dispatches/request: norm {d} qkv {d} rope {d} flash {d} gate {d} out {d} residual {d}", .{
+                    profile.full_attn_norm_dispatch_calls,
+                    profile.full_attn_qkv_dispatch_calls,
+                    profile.full_attn_rope_dispatch_calls,
+                    profile.full_attn_flash_dispatch_calls,
+                    profile.full_attn_gate_dispatch_calls,
+                    profile.full_attn_out_dispatch_calls,
+                    profile.full_attn_residual_dispatch_calls,
                 });
             }
             if (profile.dense_ffn_barrier_calls > 0) {
@@ -15965,6 +16032,7 @@ fn dispatchFullAttnPrepOnCmd(
     // Separate: attn_q has q_dim rows, gate is in a separate attn_gate tensor — Qwen3.5 MoE style.
     const q_rows: u32 = @intCast(q_tensor.info.numElements() / hidden_dim);
     const gate_mode = classifyFullAttnGate(q_rows, attn.q_dim, lt.attn_gate != null);
+    const qkv_dispatch_before = cmd.dispatch_count;
     const can_pair_attn_kv = !attn.use_k_as_v and
         ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) or
             canUseQwen36FullAttnQ8Pair(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim));
@@ -16025,15 +16093,18 @@ fn dispatchFullAttnPrepOnCmd(
         }
         profileFullAttnQkvBarrier(cmd, profile, .qkv, true, true, true, gate_mode.apply_attn_gate, engine);
     }
+    recordFullAttnDispatchDelta(profile, .qkv, qkv_dispatch_before, cmd.dispatch_count);
 
     // Apply Q/K/V biases if present (gpt-oss)
     if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null) {
+        const bias_dispatch_before = cmd.dispatch_count;
         if (lt.attn_q_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.q_buf, b, attn.q_dim);
         if (lt.attn_k_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.k_buf, b, attn.kv_dim);
         if (!attn.use_k_as_v) {
             if (lt.attn_v_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.v_buf, b, attn.kv_dim);
         }
         profileFullAttnQkvBarrier(cmd, profile, .qkv, lt.attn_q_bias != null, lt.attn_k_bias != null, !attn.use_k_as_v and lt.attn_v_bias != null, false, engine);
+        recordFullAttnDispatchDelta(profile, .qkv, bias_dispatch_before, cmd.dispatch_count);
     }
 
     if (engine.debug_validation_enabled and shouldDebugAttentionValidation(cfg, engine.position, layer_idx)) {
@@ -16057,6 +16128,7 @@ fn dispatchFullAttnPrepOnCmd(
         !engine.kv_cache_q8 and
         !attn.use_k_as_v and
         (attn.rope_dim % 2) == 0;
+    const rope_dispatch_before = cmd.dispatch_count;
     const need_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
     // When the fused rope+kv-write kernel will fire, it can also fold the
     // unit-weight V RMS norm into the same dispatch, eliminating the
@@ -16224,6 +16296,7 @@ fn dispatchFullAttnPrepOnCmd(
         );
         if (profile) |p| p.full_attn_kv_write_calls += 1;
     }
+    recordFullAttnDispatchDelta(profile, .rope, rope_dispatch_before, cmd.dispatch_count);
     return gate_mode.apply_attn_gate;
 }
 
@@ -16241,6 +16314,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
     const k_tensor = lt.attn_k orelse return error.MissingTensor;
     const v_tensor = if (attn.use_k_as_v) k_tensor else lt.attn_v orelse return error.MissingTensor;
 
+    const qkv_dispatch_before = cmd.dispatch_count;
     if (fuse_attn_norm) {
         // The caller already checked the final-tail fused-norm guard. Reuse
         // that decision here so the non-terminal prompt tail does not repeat
@@ -16274,19 +16348,23 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
         }
     }
     profileFullAttnQkvBarrier(cmd, profile, .qkv, false, true, true, false, engine);
+    recordFullAttnDispatchDelta(profile, .qkv, qkv_dispatch_before, cmd.dispatch_count);
 
     if (lt.attn_k_bias != null or lt.attn_v_bias != null) {
+        const bias_dispatch_before = cmd.dispatch_count;
         if (lt.attn_k_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.k_buf, b, attn.kv_dim);
         if (!attn.use_k_as_v) {
             if (lt.attn_v_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.v_buf, b, attn.kv_dim);
         }
         profileFullAttnQkvBarrier(cmd, profile, .qkv, false, lt.attn_k_bias != null, !attn.use_k_as_v and lt.attn_v_bias != null, false, engine);
+        recordFullAttnDispatchDelta(profile, .qkv, bias_dispatch_before, cmd.dispatch_count);
     }
 
     const can_fuse_rope_kv_write =
         !engine.kv_cache_q8 and
         !attn.use_k_as_v and
         (attn.rope_dim % 2) == 0;
+    const rope_dispatch_before = cmd.dispatch_count;
     const need_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
     const fuse_v_unit_norm_into_rope_kv = can_fuse_rope_kv_write and need_v_unit_norm;
     const fuse_qk_norm_into_rope_kv =
@@ -16321,6 +16399,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
             fuse_qk_norm_into_rope_kv,
         );
         if (profile) |p| p.full_attn_kv_write_calls += 1;
+        recordFullAttnDispatchDelta(profile, .rope, rope_dispatch_before, cmd.dispatch_count);
         return;
     }
 
@@ -16336,6 +16415,7 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
         @intCast(@as(u64, engine.position) * attn.kv_cache_bytes_per_token),
     );
     if (profile) |p| p.full_attn_kv_write_calls += 1;
+    recordFullAttnDispatchDelta(profile, .rope, rope_dispatch_before, cmd.dispatch_count);
 }
 
 /// Adapted from llama.cpp `ggml_metal_op_rope_set_rows`: rotates the K vector
@@ -20992,6 +21072,7 @@ fn runDecodeStep(
                 !prev_fused_attn_norm and
                 (canUseQwen36FinalTailKvFusedNorm(engine, lt, attn, hidden_dim) or
                     canUseGemma26FinalTailKvFusedNorm(engine, lt, attn, hidden_dim));
+            const attn_norm_dispatch_before = cmd.dispatch_count;
             if (prev_fused_attn_norm) {
                 // Previous layer's residual_rms_norm already wrote norm_buf using
                 // attn_norm_bufs[layer_idx]; its trailing barrier (or the implicit
@@ -21007,6 +21088,7 @@ fn runDecodeStep(
                 // order that resource instead of flushing all prior buffer writes.
                 profileFullAttnBarrierBuffers(cmd, profile, .norm, &.{&engine.norm_buf});
             }
+            recordFullAttnDispatchDelta(profile, .norm, attn_norm_dispatch_before, cmd.dispatch_count);
             if (skip_final_prompt_tail) {
                 // Non-terminal prompt tokens only need the final layer's K/V
                 // state for future tokens. Adapt llama.cpp's Metal graph
@@ -21026,6 +21108,7 @@ fn runDecodeStep(
             }
             const apply_attn_gate = try dispatchFullAttnPrepOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim);
             profileFullAttnBarrierBuffers(cmd, profile, .flash, &.{ &engine.q_buf, &engine.kv_k_cache[layer_idx], &engine.kv_v_cache[layer_idx] }); // KV cache + q_buf visible before flash attn
+            const flash_dispatch_before = cmd.dispatch_count;
             dispatchFlashAttnOnCmd(
                 engine,
                 cmd,
@@ -21038,6 +21121,7 @@ fn runDecodeStep(
                 attn.kv_cache_head_stride_bytes,
                 attn.kv_cache_bytes_per_token,
             );
+            recordFullAttnDispatchDelta(profile, .flash, flash_dispatch_before, cmd.dispatch_count);
             if (profile) |p| p.full_attn_flash_calls += 1;
             const o_tensor = lt.attn_output orelse return error.MissingTensor;
             const o_weight_buf: *const MetalBuffer = if (engine.private_ssm_out_bufs) |bufs|
@@ -21054,16 +21138,20 @@ fn runDecodeStep(
             // full-attn layer (≈10/token on Qwen3.6-35B).
             const use_gated_attn_out = apply_attn_gate and
                 canUseQwenGatedAttnOutDmmv(engine, o_tensor, o_weight_buf, hidden_dim, attn.q_dim);
+            const gate_dispatch_before = cmd.dispatch_count;
             if (apply_attn_gate and !use_gated_attn_out) {
                 profileFullAttnBarrierBuffers(cmd, profile, .gate, &.{&engine.attn_out_buf}); // attn_out_buf visible before sigmoid_mul
                 dispatchSigmoidMulOnCmd(engine, cmd, &engine.gate_buf, &engine.attn_out_buf, attn.q_dim);
             }
+            recordFullAttnDispatchDelta(profile, .gate, gate_dispatch_before, cmd.dispatch_count);
             profileFullAttnBarrierBuffers(cmd, profile, .out, &.{&engine.attn_out_buf}); // attn_out_buf visible before output DMMV
+            const out_dispatch_before = cmd.dispatch_count;
             if (use_gated_attn_out) {
                 dispatchQwenGatedAttnOutQ8DmmvOnCmd(engine, cmd, o_tensor, o_weight_buf, o_weight_offset, &engine.attn_out_buf, &engine.gate_buf, &engine.down_buf, hidden_dim, attn.q_dim);
             } else {
                 dispatchDmmvOnCmdWithWeightBuf(engine, cmd, o_tensor, o_weight_buf, o_weight_offset, &engine.attn_out_buf, &engine.down_buf, hidden_dim, attn.q_dim, 0);
             }
+            recordFullAttnDispatchDelta(profile, .out, out_dispatch_before, cmd.dispatch_count);
             const fence_deferred_hidden = prev_fused_hidden_barrier_deferred;
             if ((initial_hidden_barrier_deferred and layer_idx == 0) or fence_deferred_hidden) {
                 // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: this edge is
@@ -21109,6 +21197,7 @@ fn runDecodeStep(
             }
             var residual_router_output_ready = false;
             var precomputed_shared_gate: ?QwenSharedGateScalar = null;
+            const attn_residual_dispatch_before = cmd.dispatch_count;
             const can_fuse_post_attn_router = blk: {
                 if (!can_fuse_post_attn_norm) break :blk false;
                 if (!is_moe or skip_pre_ffn_router or !use_standard_gpu_routed_moe) break :blk false;
@@ -21219,6 +21308,7 @@ fn runDecodeStep(
                 // Eliminates one barrier vs separate scale_acc + barrier + rms_norm.
                 dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
             }
+            recordFullAttnDispatchDelta(profile, .residual, attn_residual_dispatch_before, cmd.dispatch_count);
             if (!is_moe) {
                 recordDenseFfnDispatchDelta(profile, .norm, dense_norm_dispatch_before, cmd.dispatch_count);
             }
