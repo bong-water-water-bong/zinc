@@ -11298,7 +11298,8 @@ pub const InferenceEngine = struct {
         if (self.instance.push_descriptor_fn == null) return false;
         const cfg = self.model.config;
         if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
-        if (n_tokens < 64 or n_tokens > 96) return false;
+        const padded_tokens = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
+        if (padded_tokens < 64 or padded_tokens > 96) return false;
         return self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a != null and
             self.dmmv.pipeline_quantize_act_q8_1 != null;
     }
@@ -11310,7 +11311,8 @@ pub const InferenceEngine = struct {
         if (self.instance.push_descriptor_fn == null) return false;
         const cfg = self.model.config;
         if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
-        if (n_tokens < 64 or n_tokens > 96) return false;
+        const padded_tokens = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
+        if (padded_tokens < 64 or padded_tokens > 96) return false;
         const q6_path =
             self.dmmv.pipeline_mul_mm_q6k_full_dp4a != null and
             self.dmmv.pipeline_quantize_act_q8 != null and
@@ -11330,7 +11332,8 @@ pub const InferenceEngine = struct {
         if (self.instance.push_descriptor_fn == null) return false;
         const cfg = self.model.config;
         if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
-        return n_tokens >= 64 and n_tokens <= 96;
+        const padded_tokens = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
+        return padded_tokens >= 64 and padded_tokens <= 96;
     }
 
     fn gemmaDenseProjectionDp4aSupported(self: *const InferenceEngine, tensor: *const LoadedTensor, M: u32, K: u32, n_tokens: u32) bool {
@@ -11353,7 +11356,11 @@ pub const InferenceEngine = struct {
         const packed_i8 = self.batched_scratch_hidden_i8 orelse return 0;
         const scale_dsum = self.batched_scratch_hidden_scale_dsum orelse return 0;
 
-        const full_cols = n_tokens & ~@as(u32, 31);
+        var full_cols = n_tokens & ~@as(u32, 31);
+        const padded_cols = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
+        if (padded_cols > full_cols and (padded_cols & 31) == 0) {
+            full_cols = padded_cols;
+        }
         if (full_cols == 0) return 0;
 
         const need_input: vk.c.VkDeviceSize =
@@ -11412,7 +11419,7 @@ pub const InferenceEngine = struct {
         if (dst.size < need_output) return false;
 
         const push_fn = self.instance.push_descriptor_fn;
-        const tail_cols = n_tokens - pre_quantized_cols;
+        const tail_cols = if (pre_quantized_cols < n_tokens) n_tokens - pre_quantized_cols else 0;
         switch (tensor.info.type_) {
             .q4_k => {
                 try self.dmmv.recordMulMmQ4KFullDp4a(
@@ -11604,26 +11611,44 @@ pub const InferenceEngine = struct {
         if (n_tokens < 16 or (hidden_dim & 255) != 0) return .not_handled;
         if (self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu == null) return .not_handled;
 
-        const full_cols = n_tokens & ~@as(u32, 31);
+        const floor_cols = n_tokens & ~@as(u32, 31);
+        var full_cols = floor_cols;
         if (full_cols > 0 and (inter_dim & 31) == 0 and self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full != null) {
+            var dp4a_cols = full_cols;
+            const padded_cols = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
+            if (padded_cols > dp4a_cols and (padded_cols & 31) == 0) {
+                dp4a_cols = padded_cols;
+            }
             const dp4a_full = blk: {
                 if (!self.gemmaDenseGegluDp4aEnabled(n_tokens)) break :blk false;
                 if ((hidden_dim & 255) != 0) break :blk false;
                 const hidden_i8 = self.batched_scratch_hidden_i8 orelse break :blk false;
                 const hidden_sd = self.batched_scratch_hidden_scale_dsum orelse break :blk false;
+                const need_input: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, dp4a_cols) *
+                    @as(vk.c.VkDeviceSize, hidden_dim) *
+                    @sizeOf(f32);
                 const need_i8: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, full_cols) *
+                    @as(vk.c.VkDeviceSize, dp4a_cols) *
                     @as(vk.c.VkDeviceSize, hidden_dim / 4) *
                     @sizeOf(u32);
                 const need_sd: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, full_cols) *
+                    @as(vk.c.VkDeviceSize, dp4a_cols) *
                     @as(vk.c.VkDeviceSize, hidden_dim / 32) *
                     2 *
                     @sizeOf(f32);
-                break :blk hidden_i8.size >= need_i8 and hidden_sd.size >= need_sd;
+                const need_f32_output: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, dp4a_cols) *
+                    @as(vk.c.VkDeviceSize, inter_dim) *
+                    @sizeOf(f32);
+                break :blk norm_buf.size >= need_input and
+                    hidden_i8.size >= need_i8 and
+                    hidden_sd.size >= need_sd and
+                    geglu_buf.size >= need_f32_output;
             };
             var dp4a_result: GemmaGateUpGegluResult = .f32_geglu;
             if (dp4a_full) {
+                full_cols = dp4a_cols;
                 const hidden_i8 = self.batched_scratch_hidden_i8.?;
                 const hidden_sd = self.batched_scratch_hidden_scale_dsum.?;
                 const fuse_q8 = blk: {
@@ -11868,18 +11893,23 @@ pub const InferenceEngine = struct {
     ) !bool {
         if (!self.gemmaDenseDownDp4aEnabled(n_tokens)) return false;
         if ((hidden_dim & 31) != 0 or (inter_dim & 255) != 0) return false;
-        const full_cols = n_tokens & ~@as(u32, 31);
-        if (full_cols == 0) return false;
+        var dp4a_cols = n_tokens & ~@as(u32, 31);
+        const padded_cols = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
+        if (padded_cols > dp4a_cols and (padded_cols & 31) == 0) {
+            dp4a_cols = padded_cols;
+        }
+        if (gateup_dp4a_cols > dp4a_cols) dp4a_cols = gateup_dp4a_cols;
+        if (dp4a_cols == 0) return false;
 
         const need_output: vk.c.VkDeviceSize =
-            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, dp4a_cols) *
             @as(vk.c.VkDeviceSize, hidden_dim) *
             @sizeOf(f32);
         if (down_buf.size < need_output) return false;
 
         const packed_act = self.batched_scratch_swiglu_i8 orelse return false;
         const need_packed: vk.c.VkDeviceSize =
-            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, dp4a_cols) *
             @as(vk.c.VkDeviceSize, inter_dim / 4) *
             @sizeOf(u32);
         if (packed_act.size < need_packed) return false;
@@ -11894,14 +11924,12 @@ pub const InferenceEngine = struct {
                 if (geglu_already_q8_1) return error.UnsupportedConfiguration;
                 const scale = self.batched_scratch_swiglu_scale orelse return false;
                 const need_scale: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, full_cols) *
+                    @as(vk.c.VkDeviceSize, dp4a_cols) *
                     @as(vk.c.VkDeviceSize, inter_dim / 32) *
                     @sizeOf(f32);
                 if (scale.size < need_scale) return false;
 
-                var dp4a_cols = full_cols;
-                if (geglu_already_q8 and gateup_dp4a_cols > dp4a_cols) dp4a_cols = gateup_dp4a_cols;
-                const dp4a_tail_cols = n_tokens - dp4a_cols;
+                const dp4a_tail_cols = if (dp4a_cols < n_tokens) n_tokens - dp4a_cols else 0;
                 if (!geglu_already_q8) {
                     const down_quant_phase = self.beginProfilePhase();
                     try self.dmmv.recordQuantizeActQ8(
@@ -11994,15 +12022,13 @@ pub const InferenceEngine = struct {
                 if (geglu_already_q8) return error.UnsupportedConfiguration;
                 const scale_dsum = self.batched_scratch_swiglu_scale_dsum orelse return false;
                 const need_scale_dsum: vk.c.VkDeviceSize =
-                    @as(vk.c.VkDeviceSize, full_cols) *
+                    @as(vk.c.VkDeviceSize, dp4a_cols) *
                     @as(vk.c.VkDeviceSize, inter_dim / 32) *
                     2 *
                     @sizeOf(f32);
                 if (scale_dsum.size < need_scale_dsum) return false;
 
-                var dp4a_cols = full_cols;
-                if (geglu_already_q8_1 and gateup_dp4a_cols > dp4a_cols) dp4a_cols = gateup_dp4a_cols;
-                const dp4a_tail_cols = n_tokens - dp4a_cols;
+                const dp4a_tail_cols = if (dp4a_cols < n_tokens) n_tokens - dp4a_cols else 0;
                 if (!geglu_already_q8_1) {
                     const down_quant_phase = self.beginProfilePhase();
                     try self.dmmv.recordQuantizeActQ8_1(
@@ -15007,6 +15033,15 @@ pub const InferenceEngine = struct {
         if (!self.isAmdRdna()) return n_tokens;
         const min_dp4a_tokens: u32 = if (self.isQwen35DenseHybrid9B()) 64 else 128;
         if (n_tokens < min_dp4a_tokens) return n_tokens;
+        return (n_tokens + 31) & ~@as(u32, 31);
+    }
+
+    fn gemmaDensePrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
+        const cfg = self.model.config;
+        if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return n_tokens;
+        if (!self.isAmdRdna()) return n_tokens;
+        if (n_tokens < gemma_prefill_long_draft_prompt_min_tokens or n_tokens > 96) return n_tokens;
+        if (n_tokens < 64) return 64;
         return (n_tokens + 31) & ~@as(u32, 31);
     }
 
@@ -21410,7 +21445,7 @@ pub const InferenceEngine = struct {
         // subsequent prefill calls so the alloc is amortized.
         const n_tokens: u32 = @intCast(@min(prompt_tokens.len, std.math.maxInt(u32)));
         const base_token: u32 = state.position;
-        try self.ensureBatchedScratchCapacity(n_tokens);
+        try self.ensureBatchedScratchCapacity(self.gemmaDensePrefillPaddedTokenCount(n_tokens));
 
         self.prefill_token_samples = 0;
         self.prefill_cpu_embed_ns = 0;
