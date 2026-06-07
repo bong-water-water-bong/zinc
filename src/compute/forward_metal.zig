@@ -982,6 +982,7 @@ pub const RuntimeProfile = struct {
     dense_ffn_down_barrier_calls: u32 = 0,
     dense_ffn_tail_barrier_calls: u32 = 0,
     dense_ffn_scale_barrier_calls: u32 = 0,
+    dense_ffn_generic_barrier_calls: u32 = 0,
     dense_ffn_norm_dispatch_calls: u32 = 0,
     dense_ffn_gate_up_dispatch_calls: u32 = 0,
     dense_ffn_activation_dispatch_calls: u32 = 0,
@@ -1127,7 +1128,10 @@ fn profileBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: BarrierC
         .router => p.router_barrier_calls += 1,
         .gpu_routed_moe => p.gpu_routed_moe_barrier_calls += 1,
         .fallback_moe => p.fallback_moe_barrier_calls += 1,
-        .dense_ffn => p.dense_ffn_barrier_calls += 1,
+        .dense_ffn => {
+            p.dense_ffn_barrier_calls += 1;
+            p.dense_ffn_generic_barrier_calls += 1;
+        },
         .final => p.final_barrier_calls += 1,
     };
 }
@@ -1143,7 +1147,10 @@ fn profileBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: B
         .router => p.router_barrier_calls += 1,
         .gpu_routed_moe => p.gpu_routed_moe_barrier_calls += 1,
         .fallback_moe => p.fallback_moe_barrier_calls += 1,
-        .dense_ffn => p.dense_ffn_barrier_calls += 1,
+        .dense_ffn => {
+            p.dense_ffn_barrier_calls += 1;
+            p.dense_ffn_generic_barrier_calls += 1;
+        },
         .final => p.final_barrier_calls += 1,
     };
 }
@@ -1159,7 +1166,10 @@ fn profileResourceBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, 
         .router => p.router_barrier_calls += 1,
         .gpu_routed_moe => p.gpu_routed_moe_barrier_calls += 1,
         .fallback_moe => p.fallback_moe_barrier_calls += 1,
-        .dense_ffn => p.dense_ffn_barrier_calls += 1,
+        .dense_ffn => {
+            p.dense_ffn_barrier_calls += 1;
+            p.dense_ffn_generic_barrier_calls += 1;
+        },
         .final => p.final_barrier_calls += 1,
     };
 }
@@ -1563,6 +1573,7 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.dense_ffn_down_barrier_calls = total.dense_ffn_down_barrier_calls -| prefix.dense_ffn_down_barrier_calls;
     delta.dense_ffn_tail_barrier_calls = total.dense_ffn_tail_barrier_calls -| prefix.dense_ffn_tail_barrier_calls;
     delta.dense_ffn_scale_barrier_calls = total.dense_ffn_scale_barrier_calls -| prefix.dense_ffn_scale_barrier_calls;
+    delta.dense_ffn_generic_barrier_calls = total.dense_ffn_generic_barrier_calls -| prefix.dense_ffn_generic_barrier_calls;
     delta.dense_ffn_norm_dispatch_calls = total.dense_ffn_norm_dispatch_calls -| prefix.dense_ffn_norm_dispatch_calls;
     delta.dense_ffn_gate_up_dispatch_calls = total.dense_ffn_gate_up_dispatch_calls -| prefix.dense_ffn_gate_up_dispatch_calls;
     delta.dense_ffn_activation_dispatch_calls = total.dense_ffn_activation_dispatch_calls -| prefix.dense_ffn_activation_dispatch_calls;
@@ -1930,12 +1941,13 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.dense_ffn_activation_barrier_calls +
             profile.dense_ffn_down_barrier_calls +
             profile.dense_ffn_tail_barrier_calls +
-            profile.dense_ffn_scale_barrier_calls;
+            profile.dense_ffn_scale_barrier_calls +
+            profile.dense_ffn_generic_barrier_calls;
         const other_dense_barriers = if (profile.dense_ffn_barrier_calls > typed_dense_barriers)
             profile.dense_ffn_barrier_calls - typed_dense_barriers
         else
             0;
-        log.info("  {s} dense barriers: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d} other {d}", .{
+        log.info("  {s} dense barriers: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d} generic {d} other {d}", .{
             label,
             profile.dense_ffn_norm_barrier_calls,
             profile.dense_ffn_gate_up_barrier_calls,
@@ -1943,6 +1955,7 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.dense_ffn_down_barrier_calls,
             profile.dense_ffn_tail_barrier_calls,
             profile.dense_ffn_scale_barrier_calls,
+            profile.dense_ffn_generic_barrier_calls,
             other_dense_barriers,
         });
     }
@@ -7962,18 +7975,20 @@ pub const InferenceEngine = struct {
                     profile.dense_ffn_activation_barrier_calls +
                     profile.dense_ffn_down_barrier_calls +
                     profile.dense_ffn_tail_barrier_calls +
-                    profile.dense_ffn_scale_barrier_calls;
+                    profile.dense_ffn_scale_barrier_calls +
+                    profile.dense_ffn_generic_barrier_calls;
                 const other_dense_barriers = if (profile.dense_ffn_barrier_calls > typed_dense_barriers)
                     profile.dense_ffn_barrier_calls - typed_dense_barriers
                 else
                     0;
-                log.info("  dense barriers/request: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d} other {d}", .{
+                log.info("  dense barriers/request: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d} generic {d} other {d}", .{
                     profile.dense_ffn_norm_barrier_calls,
                     profile.dense_ffn_gate_up_barrier_calls,
                     profile.dense_ffn_activation_barrier_calls,
                     profile.dense_ffn_down_barrier_calls,
                     profile.dense_ffn_tail_barrier_calls,
                     profile.dense_ffn_scale_barrier_calls,
+                    profile.dense_ffn_generic_barrier_calls,
                     other_dense_barriers,
                 });
             }
