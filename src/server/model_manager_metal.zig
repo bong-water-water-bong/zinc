@@ -103,12 +103,16 @@ pub const ModelManager = struct {
     requested_context_length: ?u32 = null,
     current: ?*LoadedResources,
 
+    /// Outcome of a `removeManagedModel` call: what was unloaded and what was deleted on disk.
     pub const RemoveResult = struct {
         unloaded_from_gpu: bool,
         cleared_active_selection: bool,
         removed: managed_mod.RemoveInstalledModelResult,
     };
 
+    /// VRAM and context-budget breakdown for the active model.
+    /// All byte fields reflect the Metal unified-memory budget; token fields reflect the
+    /// context window reserved at load time.
     pub const MemoryUsage = struct {
         weights_bytes: u64,
         runtime_device_local_bytes: u64,
@@ -129,7 +133,13 @@ pub const ModelManager = struct {
         }
     };
 
-    /// Create a manager and eagerly load the requested Metal model.
+    /// Create a manager and eagerly load the model described by `spec`.
+    ///
+    /// Acquires the per-device GPU process lock before touching Metal resources.
+    /// @param spec  Path, optional managed-catalog id, and optional context-length override.
+    /// @param device  Metal device to load weights onto.
+    /// @param allocator  Used for all heap allocations; must outlive the returned manager.
+    /// @returns A fully initialised manager with a loaded model, or an error if loading fails.
     pub fn init(
         spec: LoadSpec,
         device: *const MetalDevice,
@@ -152,6 +162,10 @@ pub const ModelManager = struct {
     }
 
     /// Create an idle manager with no model currently loaded.
+    ///
+    /// The GPU process lock is not acquired until the first model is activated.
+    /// @param requested_context_length  Token limit to apply when a model is later loaded;
+    ///   `null` lets the memory planner auto-size the context window.
     pub fn initEmpty(
         device: *const MetalDevice,
         requested_context_length: ?u32,
@@ -222,6 +236,14 @@ pub const ModelManager = struct {
     }
 
     /// Build a catalog view annotated with install, fit, and active-model status.
+    ///
+    /// Entries are filtered to those that are supported on the current GPU profile and fit within
+    /// the VRAM budget unless `include_all` is true.  The currently-active model is always included
+    /// even if its static VRAM estimate exceeds the live budget.  Unrecognised loaded models
+    /// (raw GGUF files with no catalog entry) appear as a synthetic entry with `managed = false`.
+    /// @param allocator  Used to allocate the returned `ModelCatalogView.data` slice; caller must call `deinit`.
+    /// @param include_all  When true, unsupported and oversized entries are included in the result.
+    /// @returns An owned `ModelCatalogView`; free with `ModelCatalogView.deinit`.
     pub fn collectCatalogView(self: *ModelManager, allocator: std.mem.Allocator, include_all: bool) !ModelCatalogView {
         self.state_mutex.lock();
         defer self.state_mutex.unlock();
@@ -325,7 +347,13 @@ pub const ModelManager = struct {
         return catalog_mod.supportsProfile(entry, self.profile) and fit.fits_current_gpu;
     }
 
-    /// Caller must already hold the shared generation lock.
+    /// Load the specified catalog model and make it the active inference target.
+    ///
+    /// Hot-swaps the previous model if one is loaded.  Validates that the model is installed,
+    /// supported on this GPU profile, and fits within the VRAM budget before touching Metal.
+    /// @param model_id  Catalog identifier of the managed model to activate.
+    /// @param persist_active  When true, writes the selection to the active-model config file.
+    /// @note Caller must already hold the shared generation lock.
     pub fn activateManagedModel(self: *ModelManager, model_id: []const u8, persist_active: bool) !void {
         const entry = catalog_mod.find(model_id) orelse return error.UnknownManagedModel;
         if (!catalog_mod.supportsProfile(entry.*, self.profile)) return error.ModelUnsupportedOnThisGpu;
@@ -373,7 +401,14 @@ pub const ModelManager = struct {
         if (persist_active) try managed_mod.writeActiveSelection(model_id, self.allocator);
     }
 
-    /// Caller must already hold the shared generation lock.
+    /// Unload and delete a managed model from both GPU memory and the model store on disk.
+    ///
+    /// If the model is currently loaded and `force` is false, returns `error.ModelLoadedInGpu`.
+    /// With `force` true the model is evicted from GPU memory before deletion.
+    /// @param model_id  Catalog identifier of the model to remove.
+    /// @param force  When true, evict the model from GPU memory even if it is active.
+    /// @returns A `RemoveResult` describing what was unloaded and what was deleted.
+    /// @note Caller must already hold the shared generation lock.
     pub fn removeManagedModel(self: *ModelManager, model_id: []const u8, force: bool) !RemoveResult {
         var unloaded_from_gpu = false;
         var previous: ?*LoadedResources = null;

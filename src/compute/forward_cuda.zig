@@ -105,6 +105,7 @@ pub const CudaForward = struct {
     ///     6. dense FFN: DMMV gate + DMMV up → swiglu → DMMV down [swiglu done]
     ///     7. scale_accumulate (residual)                         [done]
     ///   8. final rms_norm → DMMV lm_head (Q6_K) → argmax
+    /// @returns The sampled next-token ID (argmax over the vocabulary logits).
     pub fn decodeStep(self: *CudaForward) !u32 {
         _ = self;
         return error.NotImplemented; // M1 TODO
@@ -112,6 +113,7 @@ pub const CudaForward = struct {
 
     /// M2 — batched prefill over the prompt (layer-major DMMV→GEMM; batched SSM
     /// selective scan). See Effort 20 for the prefill-specific kernel plan.
+    /// @param n_tokens Number of prompt tokens to process in this prefill pass.
     pub fn prefill(self: *CudaForward, n_tokens: usize) !void {
         _ = self;
         _ = n_tokens;

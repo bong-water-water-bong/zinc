@@ -83,10 +83,10 @@ pub const Request = struct {
         };
     }
 
-    /// Transition to the next lifecycle state.
+    /// Advance the request through the state machine.
     /// @param self Request to transition.
     /// @param new_state Target state (must be a valid successor of the current state).
-    /// @note Returns error.InvalidTransition if the state change is not allowed.
+    /// @returns error.InvalidTransition if the transition is not allowed by the state machine.
     pub fn transition(self: *Request, new_state: RequestState) !void {
         const valid = switch (self.state) {
             .pending => new_state == .prefilling or new_state == .cancelled,

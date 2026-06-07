@@ -1,9 +1,9 @@
 //! ZINC_RT forward-pass bring-up.
+//! @section Inference Runtime
 //! M1 wires a scalar forward path for the hybrid Qwen MoE+SSM model used by
 //! the RDNA migration harness, plus the first AMDGPU-CS-produced token
 //! boundary. The old no-layer tail remains as a smoke fallback for unsupported
 //! shapes.
-//! @section Inference Runtime
 const std = @import("std");
 const gguf = @import("gguf");
 const zinc_rt = @import("zinc_rt");
@@ -7416,8 +7416,11 @@ pub const Tokenizer = struct {
     }
 
     /// Encode `text` into a token id stream using a longest-match scan over
-    /// the GPT-2 byte-to-unicode mapping. Unmatched single bytes fall back to
-    /// token id 0 so the output is always well-formed.
+    /// the vocab. GPT-2-flavour tokenizers (Qwen) use the byte-to-unicode
+    /// mapping; SentencePiece-flavour tokenizers (Gemma) substitute spaces with
+    /// ▁ and pass raw UTF-8 through. Prepends BOS when `add_bos` is set.
+    /// Unmatched single bytes fall back to token id 0 so the output is always
+    /// well-formed.
     /// @param text Raw UTF-8 prompt bytes.
     /// @param allocator Owns the returned token slice.
     /// @returns Token ids ready to feed into `generate`.
@@ -7455,9 +7458,12 @@ pub const Tokenizer = struct {
         return tokens.toOwnedSlice(allocator);
     }
 
-    /// Render one token id back to its UTF-8 byte form into `buf`, reversing
-    /// the GPT-2 byte-to-unicode mapping. Truncates instead of erroring when
-    /// `buf` is too small; returns an empty slice for out-of-range ids.
+    /// Render one token id back to its UTF-8 byte form into `buf`. For
+    /// GPT-2-flavour vocabs the GPT-2 byte-to-unicode mapping is reversed; for
+    /// SentencePiece-flavour vocabs the SPIECE underline (▁, U+2581) is mapped
+    /// to a plain space and remaining codepoints are copied as-is. Truncates
+    /// instead of erroring when `buf` is too small; returns an empty slice for
+    /// out-of-range ids.
     /// @param token_id Token id produced by `generate` or `encodePrompt`.
     /// @param buf Scratch buffer the decoded bytes are written into.
     /// @returns The prefix of `buf` containing the decoded bytes.

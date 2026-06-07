@@ -270,7 +270,10 @@ fn ioctlChecked(fd: std.posix.fd_t, request: u32, arg: usize) IoctlError!void {
     }
 }
 
-/// Render minor encoded in a `/dev/dri/renderD<minor>` path, e.g. 128.
+/// Extract the DRM render minor number from a `/dev/dri/renderD<N>` path.
+/// @param render_node Absolute path to the DRM render node (e.g. `/dev/dri/renderD128`).
+/// @returns The parsed minor number (e.g. 128), or `null` if the path does not
+/// contain a recognizable `renderD<digits>` suffix.
 pub fn renderMinorOf(render_node: []const u8) ?u32 {
     const marker = "renderD";
     const idx = std.mem.lastIndexOf(u8, render_node, marker) orelse return null;
@@ -302,7 +305,14 @@ fn readPropertyU32(properties: []const u8, key: []const u8) ?u32 {
     return null;
 }
 
-/// Scan the KFD topology for the GPU node backing `render_minor`.
+/// Scan `topology_nodes_dir` for the GPU topology node whose `drm_render_minor`
+/// matches the given render minor, parsing `gpu_id`, `gfx_target_version`,
+/// `simd_count`, `cwsr_size`, and related properties from each node's `properties`
+/// file. CPU-only nodes (gpu_id == 0) are skipped.
+/// @param render_minor DRM render minor to match (e.g. 128 for `renderD128`).
+/// @returns The matching `TopologyNode`, or `null` if no GPU node matches or if
+/// the sysfs directory cannot be opened.
+/// @note Always returns `null` on non-Linux targets.
 pub fn findTopologyNode(render_minor: u32) ?TopologyNode {
     if (builtin.os.tag != .linux) return null;
     var nodes_dir = std.fs.openDirAbsolute(topology_nodes_dir, .{ .iterate = true }) catch return null;
@@ -336,7 +346,11 @@ pub fn findTopologyNode(render_minor: u32) ?TopologyNode {
     return null;
 }
 
-/// Cheap reachability check used by `engine.autoTier()` — no ioctls, no GPU VM.
+/// Cheaply test whether the KFD PM4 path appears usable on this machine without
+/// issuing any ioctls: opens `/dev/kfd` and the default render node, then
+/// verifies that a matching topology node with a non-zero `gpu_id` exists.
+/// @returns `true` when `/dev/kfd`, the default render node, and a valid
+/// topology node are all accessible; `false` otherwise or on non-Linux targets.
 pub fn reachable() bool {
     if (builtin.os.tag != .linux) return false;
     const kfd = std.fs.openFileAbsolute(kfd_device_node, .{ .mode = .read_write }) catch return false;
@@ -601,11 +615,20 @@ pub fn alignUp(value: u64, alignment: u64) u64 {
     return if (rem == 0) value else value + (alignment - rem);
 }
 
-/// CWSR buffer-object size the kernel's `kfd_queue_acquire_buffers` validates
-/// against: `align_up((cwsr_size + debug_memory_size) * num_xcc, PAGE)`, where
-/// for gfx ≥ 10.1.x `debug_memory_size = align_up((simd_count / simd_per_cu /
-/// num_xcc) * 32 * 32, 64)`. Verified on the R9700 (gfx1201): cwsr_size
-/// 0x1d47000, debug 0x10000, BO 0x1d57000.
+/// Compute the CWSR buffer-object size that the kernel's `kfd_queue_acquire_buffers`
+/// will accept for a given GPU topology. The formula is
+/// `align_up((cwsr_size + debug_memory_size) * num_xcc, PAGE)`, where for
+/// gfx ≥ 10.1.x `debug_memory_size = align_up((simd_count / simd_per_cu /
+/// num_xcc) * 32 * 32, 64)` and for older IPs `debug_memory_size = 0`.
+/// Verified on the R9700 (gfx1201): cwsr_size 0x1d47000, debug 0x10000,
+/// resulting BO 0x1d57000.
+/// @param cwsr_size Raw `cwsr_size` from the topology `properties` file (bytes).
+/// @param simd_count Total SIMD units across all XCCs for this GPU.
+/// @param simd_per_cu_in SIMD units per CU; if 0, derived from `gfx_target_version`
+/// (2 for RDNA, 4 for GCN/CDNA).
+/// @param num_xcc_in Number of XCC dies; treated as 1 if 0.
+/// @param gfx_target_version Encoded GFX IP version (major×10000 + minor×100 + step).
+/// @returns Total BO allocation size in bytes, page-aligned.
 pub fn computeCwsrBoSize(
     cwsr_size: u32,
     simd_count: u32,
@@ -909,7 +932,13 @@ pub fn createComputeQueueSmokePath(render_node: []const u8) ComputeQueueSmokeRes
     return result;
 }
 
-/// Render `gfx_target_version` (e.g. 120001) as a GFX target string ("gfx1201").
+/// Format a `gfx_target_version` integer (e.g. 120001) as a GFX target string
+/// such as `"gfx1201"`. The encoding is major×10000 + minor×100 + step, matching
+/// the value read from the KFD topology `properties` file.
+/// @param buf Caller-supplied scratch buffer; 16 bytes is sufficient.
+/// @param gfx_target_version Encoded GFX IP version, or 0 for an unknown target.
+/// @returns A slice into `buf` holding the rendered string, or `"gfx?"` when
+/// `gfx_target_version` is 0 or the buffer is too small.
 pub fn formatGfxTarget(buf: []u8, gfx_target_version: u32) []const u8 {
     if (gfx_target_version == 0) return "gfx?";
     const major = gfx_target_version / 10000;

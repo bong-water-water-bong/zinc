@@ -23,6 +23,10 @@ pub const ArgmaxDispatch = struct {
     device: vk.c.VkDevice,
 
     /// Create the argmax compute pipeline and descriptor pool on the given Vulkan instance.
+    /// @param instance Vulkan instance that owns the device used for all Vulkan calls.
+    /// @param shader_dir Directory path searched for `argmax.spv`; if the shader is missing the pipeline is set to null and a warning is logged.
+    /// @param allocator Allocator used internally by the pipeline creation helper.
+    /// @returns An initialised `ArgmaxDispatch`; the caller must call `deinit` to release GPU resources.
     pub fn init(
         instance: *const Instance,
         shader_dir: []const u8,
@@ -63,6 +67,14 @@ pub const ArgmaxDispatch = struct {
     }
 
     /// Record the two-phase argmax reduction into a command buffer.
+    /// Phase 0 dispatches `phase0_workgroups` workgroups that each reduce a slice of the logit
+    /// vector and write partial (value, index) results; phase 1 dispatches a single workgroup
+    /// that reduces those partials to the final winner.  A compute barrier is inserted between
+    /// the two phases.
+    /// @param cmd Command buffer to record dispatches into.
+    /// @param descriptor_set Descriptor set with logits, partials, and result buffers already bound.
+    /// @param n_logits Total number of logits in the input buffer (vocabulary size).
+    /// @param phase0_workgroups Number of workgroups launched in phase 0; also the number of partial results consumed by phase 1.
     pub fn record(
         self: *const ArgmaxDispatch,
         cmd: *CommandBuffer,
@@ -87,6 +99,8 @@ pub const ArgmaxDispatch = struct {
     }
 
     /// Allocate a descriptor set from the argmax descriptor pool.
+    /// @returns A freshly allocated `VkDescriptorSet` using the pipeline's layout, or an error if allocation fails or the shader was not loaded.
+    /// @note The set must be freed back to the pool before calling `deinit`.
     pub fn allocDescriptorSet(self: *const ArgmaxDispatch) !vk.c.VkDescriptorSet {
         const pip = if (self.pipeline) |*p| p else return error.ShaderNotLoaded;
         const alloc_info = vk.c.VkDescriptorSetAllocateInfo{
@@ -102,7 +116,15 @@ pub const ArgmaxDispatch = struct {
         return ds;
     }
 
-    /// Bind the logits, partials, and result buffers to a descriptor set.
+    /// Bind the logits, partials, and result buffers to a descriptor set via `vkUpdateDescriptorSets`.
+    /// The three buffers map to shader bindings 0, 1, and 2 respectively.
+    /// @param descriptor_set Target descriptor set to update (must have been allocated via `allocDescriptorSet`).
+    /// @param logits_buf Storage buffer containing the raw logit values (shader binding 0).
+    /// @param logits_size Byte range of `logits_buf` to expose to the shader.
+    /// @param partials_buf Intermediate storage buffer for phase-0 partial results (shader binding 1).
+    /// @param partials_size Byte range of `partials_buf` to expose to the shader.
+    /// @param result_buf Output storage buffer that receives the winning token index after phase 1 (shader binding 2).
+    /// @param result_size Byte range of `result_buf` to expose to the shader.
     pub fn writeDescriptorSet(
         self: *const ArgmaxDispatch,
         descriptor_set: vk.c.VkDescriptorSet,

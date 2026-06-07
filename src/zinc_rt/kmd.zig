@@ -1,9 +1,9 @@
 //! Thin AMDGPU kernel-driver queries used by direct ZINC_RT tiers.
+//! @section Inference Runtime
 //!
 //! This file intentionally starts with capability discovery only. T2 UMQ queue
 //! creation needs the same UAPI definitions, but selection must first prove the
 //! kernel exposes compute user queues instead of relying on kernel version alone.
-//! @section Inference Runtime
 const std = @import("std");
 const builtin = @import("builtin");
 

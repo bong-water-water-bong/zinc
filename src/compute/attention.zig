@@ -49,7 +49,12 @@ pub const FlashAttnSplitMergePush = extern struct {
     sink_offset: u32,
 };
 
-/// Manages flash attention pipeline and dispatch.
+/// Owns the Vulkan compute pipelines for flash attention and records
+/// their dispatches into a command buffer. Supports three variants:
+/// single-query decode (`pipeline`), batched prefill/decode
+/// (`pipeline_batched`), and split-K decode (`pipeline_split` +
+/// `pipeline_split_merge`). The active variant is selected by the
+/// caller; all pipelines are loaded during `init` and destroyed by `deinit`.
 pub const AttentionDispatch = struct {
     /// Vulkan compute pipeline, or null if unavailable.
     pipeline: ?Pipeline,
@@ -235,7 +240,17 @@ pub const AttentionDispatch = struct {
     /// Record a batched flash-attention dispatch.
     /// Grid is (n_heads, n_queries, 1); each (head, query) workgroup streams
     /// over the paged KV cache with causal_len = seq_start + query + 1.
-    /// `sink_offset` is layer_idx * n_heads into the per-layer sinks buffer.
+    /// @param self Dispatch wrapper containing the batched flash-attention pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with Q, KV-cache, page-table, output, and sink buffers.
+    /// @param head_dim Hidden width per attention head.
+    /// @param n_heads Number of query heads to process.
+    /// @param n_kv_heads Number of KV heads in the cache (GQA ratio = n_heads / n_kv_heads).
+    /// @param seq_start Token position of the first query in the sequence (0 on fresh prefill).
+    /// @param n_queries Number of query tokens processed in this batch.
+    /// @param page_size Tokens stored per KV-cache page.
+    /// @param attn_scale Attention softmax scale factor (0 = use 1/sqrt(head_dim)).
+    /// @param sink_offset Per-layer offset into the sink buffer (layer_idx * n_heads).
     /// @returns `error.ShaderNotLoaded` when the batched pipeline is unavailable.
     pub fn recordFlashAttnBatched(
         self: *const AttentionDispatch,
@@ -265,9 +280,21 @@ pub const AttentionDispatch = struct {
     }
 
     /// Record the split-K flash attention dispatch (per-chunk partial pass).
-    /// Grid: (n_heads, n_chunks, 1). Each WG runs the same flash_attn body but
-    /// scoped to its (head, chunk_id) i-range and writes (O_partial, M, L) to
-    /// the partial output buffer bound at slot 4.
+    /// Grid: (n_heads, fa_split_k_active, 1). Each workgroup runs the
+    /// standard flash_attn body scoped to its (head, chunk_id) i-range and
+    /// writes (O_partial, M, L) to the partial output buffer bound at slot 4.
+    /// Must be followed by `recordFlashAttnSplitMerge` to produce final output.
+    /// @param self Dispatch wrapper containing the split-K pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with Q, KV-cache, page-table, partial-output, and sink buffers.
+    /// @param head_dim Hidden width per attention head.
+    /// @param n_heads Number of query heads to process.
+    /// @param n_kv_heads Number of KV heads in the cache (GQA ratio = n_heads / n_kv_heads).
+    /// @param seq_len Current decoded sequence length (total KV entries to attend over).
+    /// @param page_size Tokens stored per KV-cache page.
+    /// @param attn_scale Attention softmax scale factor (0 = use 1/sqrt(head_dim)).
+    /// @param sink_offset Per-layer offset into the sink buffer (layer_idx * n_heads).
+    /// @returns `error.ShaderNotLoaded` when the split-K pipeline is unavailable.
     pub fn recordFlashAttnSplit(
         self: *const AttentionDispatch,
         cmd: *CommandBuffer,
@@ -295,7 +322,15 @@ pub const AttentionDispatch = struct {
 
     /// Record the split-K merge pass dispatch — combines per-chunk partials
     /// for each head, applies the per-head sink term, and writes the final
-    /// normalized attention output. One workgroup per head.
+    /// normalized attention output. Grid: (n_heads, 1, 1).
+    /// Must be called after `recordFlashAttnSplit` and a pipeline barrier.
+    /// @param self Dispatch wrapper containing the split-K merge pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with partial-input, final-output, and sink buffers (3 bindings).
+    /// @param head_dim Hidden width per attention head.
+    /// @param n_heads Number of query heads whose partials are to be merged.
+    /// @param sink_offset Per-layer offset into the sink buffer (layer_idx * n_heads).
+    /// @returns `error.ShaderNotLoaded` when the split-K merge pipeline is unavailable.
     pub fn recordFlashAttnSplitMerge(
         self: *const AttentionDispatch,
         cmd: *CommandBuffer,

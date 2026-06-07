@@ -173,11 +173,11 @@ pub const OpCount = struct {
 pub const CriticalPathNode = struct {
     /// Unique identifier.
     id: u32,
-    /// Name identifier.
+    /// Human-readable node label.
     name: []const u8,
     /// Operation type.
     op: OpType,
-    /// Depth from nearest root.
+    /// Longest incoming dependency chain length (0 for root nodes).
     depth: u32,
 };
 
@@ -185,7 +185,7 @@ pub const CriticalPathNode = struct {
 pub const NodeAnalysis = struct {
     /// Unique identifier.
     id: u32,
-    /// Name identifier.
+    /// Human-readable node label copied from the source graph node.
     name: []const u8,
     /// Operation type.
     op: OpType,
@@ -193,7 +193,7 @@ pub const NodeAnalysis = struct {
     dependency_count: u32,
     /// Number of nodes that depend on this one.
     dependent_count: u32,
-    /// Depth from nearest root.
+    /// Longest incoming dependency chain length (0 for root nodes).
     depth: u32,
     /// True if no dependencies.
     is_root: bool,
@@ -263,7 +263,7 @@ pub const Hotspot = struct {
 
 /// Computed summary of the graph structure used by visualization and debugging tools.
 pub const GraphAnalysis = struct {
-    /// Name identifier.
+    /// Debug name propagated from the parent Graph.
     name: []const u8,
     /// Total nodes in graph.
     node_count: u32,
@@ -410,7 +410,7 @@ pub const Graph = struct {
     nodes: std.ArrayList(Node) = .{},
     /// Allocator for owned resources.
     allocator: std.mem.Allocator,
-    /// Name identifier.
+    /// Human-readable debug name used in logs and diagnostic output.
     name: []const u8,
     /// Sequence length assumed by decode-time cost estimates.
     assumed_decode_seq_len: u32 = 0,
@@ -518,6 +518,12 @@ pub const Graph = struct {
     }
 
     /// Attach byte-traffic and FLOP cost estimates used by the bottleneck heuristics.
+    /// @param self Graph containing the node to update.
+    /// @param node_id ID of the node whose cost estimates should be overwritten.
+    /// @param read_bytes Estimated activation bytes read per dispatch.
+    /// @param write_bytes Estimated bytes written per dispatch.
+    /// @param weight_bytes Estimated weight/tensor payload bytes streamed per dispatch.
+    /// @param flops Approximate floating-point operations performed per dispatch.
     pub fn setCostEstimate(self: *Graph, node_id: u32, read_bytes: u64, write_bytes: u64, weight_bytes: u64, flops: u64) void {
         var node = &self.nodes.items[node_id];
         node.read_bytes = read_bytes;

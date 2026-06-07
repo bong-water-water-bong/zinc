@@ -186,7 +186,16 @@ const required_shader_files = [_][]const u8{
     "ssm_gated_norm.metal",
 };
 
-/// Run Metal system diagnostics and output a readable preflight report to stdout.
+/// Run a four-step Metal preflight check (host environment, device, shader assets, model) and print a colour-coded report to stdout.
+///
+/// The steps are: (1) host OS and CPU arch, (2) Metal device capabilities and
+/// unified-memory budget, (3) shader source presence and MSL smoke compile,
+/// (4) GGUF or managed-model memory-fit estimate.  Returns `error.DiagnosticsFailed`
+/// if any check resolves to `.fail`.
+///
+/// @param opts  Diagnostic configuration: optional model path, context ceiling, managed-model entry, and shader directory.
+/// @param allocator  Used for Metal device initialisation and GGUF header inspection.
+/// @returns `error.DiagnosticsFailed` when one or more checks emit a FAIL status; otherwise void.
 pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
     const stdout_file = std.fs.File.stdout();
     var stdout_buffer: [4096]u8 = undefined;
@@ -467,7 +476,17 @@ fn printModelCheck(
     try printStatusLine(writer, styles, summary, .skip, "Model", "No model specified", .{});
 }
 
-/// Estimate unified-memory usage for a model given Apple Silicon memory constraints.
+/// Compute a conservative unified-memory breakdown for running a model on Apple Silicon.
+///
+/// Combines tensor weight bytes with the runtime shared-buffer and KV-cache
+/// cost at the resolved context length, then determines how many tokens could
+/// fit within the Metal working-set budget.
+///
+/// @param inspection  GGUF model inspection result supplying tensor size and model config.
+/// @param recommended_working_set_bytes  Metal driver's recommended working-set ceiling; falls back to `total_memory_bytes` when zero.
+/// @param total_memory_bytes  Physical unified memory on the device.
+/// @param requested_context_length  Optional caller-supplied context cap; when null the model's own `context_length` is used (clamped by the backend runtime cap).
+/// @returns A `UnifiedFitEstimate` with per-category byte breakdowns and derived fit status fields.
 pub fn estimateUnifiedFit(
     inspection: ModelInspection,
     recommended_working_set_bytes: u64,

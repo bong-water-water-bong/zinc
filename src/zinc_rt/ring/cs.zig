@@ -1593,12 +1593,18 @@ pub const TokenBoundary = struct {
         for (0..rows) |i| output[i] = @bitCast(output_words[i]);
     }
 
-    /// Dispatch the wave-lane gfx1201 Q4_0 matrix-vector kernel.
+    /// Dispatch the wave-lane gfx1201 Q4_0 matrix-vector kernel for exactly 64 rows in parallel.
     ///
     /// Stages the same source-format rows as `dmmvQ4_0RowRange`, but launches
-    /// one wave64 workgroup where each lane computes one row. This is used for
-    /// consumed 64-row LM-head prefix/window ranges where the GPU row values
-    /// participate in choosing the sampled token.
+    /// one wave64 workgroup where each lane computes one row. Intended for
+    /// 64-row LM-head prefix/window ranges where the GPU row values participate
+    /// in choosing the sampled token.
+    /// @param input Input activation vector of length `cols`.
+    /// @param weights_q4_0 Row-major GGML Q4_0 row bytes; must hold exactly 64 rows.
+    /// @param rows Must be exactly 64; any other value returns `error.ShapeMismatch`.
+    /// @param cols Inner dimension; must be a multiple of 32.
+    /// @param output Output slice receiving 64 f32 values (one per row).
+    /// @note Returns `error.SignalMismatch` if the post-fence signal value does not match the expected sentinel.
     pub fn dmmvQ4_0RowRangeParallel(
         self: *TokenBoundary,
         input: []const f32,
@@ -1707,8 +1713,14 @@ pub const TokenBoundary = struct {
     ///
     /// The caller supplies two individual source-format rows, which are packed
     /// into the shared staging page as a compact two-row matrix. This lets the
-    /// current forward path consume both LM-head top-2 scores from one real
+    /// current forward path obtain both LM-head top-2 scores from one real
     /// DMMV row-range submission even when the rows are not adjacent in vocab.
+    /// @param input Input activation vector of length `cols`.
+    /// @param row_a_q4_0 Raw GGML Q4_0 bytes for the first row; must hold at least `(cols/32)*18` bytes.
+    /// @param row_b_q4_0 Raw GGML Q4_0 bytes for the second row; same size requirement as `row_a_q4_0`.
+    /// @param cols Inner dimension; must be a multiple of 32.
+    /// @param output Output slice receiving 2 f32 values: `output[0]` for row A, `output[1]` for row B.
+    /// @note Returns `error.SignalMismatch` if the post-fence signal sentinel does not match.
     pub fn dmmvQ4_0TwoRows(
         self: *TokenBoundary,
         input: []const f32,
@@ -2056,6 +2068,14 @@ pub const TokenBoundary = struct {
     /// rows second. This is used by the M1 bridge to consume paired SSM
     /// alpha/beta projections without paying two CS submissions for the same
     /// activation vector.
+    /// @param input Input activation vector of length `cols`.
+    /// @param weights_a_q8_0 Row-major GGML Q8_0 bytes for range A; must hold at least `rows_a * (cols/32*34)` bytes.
+    /// @param rows_a Number of rows in the A range.
+    /// @param weights_b_q8_0 Row-major GGML Q8_0 bytes for range B; must hold at least `rows_b * (cols/32*34)` bytes.
+    /// @param rows_b Number of rows in the B range.
+    /// @param cols Inner dimension; must be a multiple of 32.
+    /// @param output Output slice receiving `rows_a + rows_b` f32 values: A rows first, then B rows.
+    /// @note Returns `error.SignalMismatch` if the post-fence signal sentinel does not match.
     pub fn dmmvQ8_0TwoRowRanges(
         self: *TokenBoundary,
         input: []const f32,
@@ -2069,12 +2089,20 @@ pub const TokenBoundary = struct {
         return self.dmmvQ8_0TwoRowRangesImpl(input, weights_a_q8_0, rows_a, weights_b_q8_0, rows_b, cols, output, false);
     }
 
-    /// Dispatch one wave64 Q8_0 DMMV kernel over two packed row ranges.
+    /// Dispatch one wave64 Q8_0 DMMV kernel over two packed row ranges totalling exactly 64 rows.
     ///
     /// This is the row-parallel companion to `dmmvQ8_0TwoRowRanges` for the
     /// current SSM alpha+beta shape: 32 alpha rows plus 32 beta rows. Each lane
-    /// computes one row from the packed staging block, so the consumed model
-    /// slice no longer runs all 64 rows through one serial GPU workitem.
+    /// computes one row from the packed staging block, eliminating the serial
+    /// per-row loop of the scalar variant.
+    /// @param input Input activation vector of length `cols`.
+    /// @param weights_a_q8_0 Row-major GGML Q8_0 bytes for range A; must hold at least `rows_a * (cols/32*34)` bytes.
+    /// @param rows_a Number of rows in the A range; `rows_a + rows_b` must equal 64.
+    /// @param weights_b_q8_0 Row-major GGML Q8_0 bytes for range B; must hold at least `rows_b * (cols/32*34)` bytes.
+    /// @param rows_b Number of rows in the B range.
+    /// @param cols Inner dimension; must be a multiple of 32.
+    /// @param output Output slice receiving exactly 64 f32 values: A rows first, then B rows.
+    /// @note Returns `error.ShapeMismatch` if `rows_a + rows_b != 64`. Returns `error.SignalMismatch` on sentinel mismatch.
     pub fn dmmvQ8_0TwoRowRangesParallel64(
         self: *TokenBoundary,
         input: []const f32,

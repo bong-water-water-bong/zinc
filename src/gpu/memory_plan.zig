@@ -1,9 +1,9 @@
 //! Shared runtime memory accounting helpers for Vulkan and Metal backends.
+//! @section Inference Runtime
 //!
 //! The helpers in this module turn model dimensions plus backend-specific
 //! runtime characteristics into a comparable memory budget so diagnostics,
 //! server load policy, and inference engines size context and KV consistently.
-//! @section Inference Runtime
 const std = @import("std");
 const config_mod = @import("../model/config.zig");
 
@@ -60,6 +60,11 @@ pub const RuntimeMemoryProfile = struct {
     }
 
     /// Return the largest context that fits within a device-local memory budget.
+    ///
+    /// @param weights_bytes Size of model weights already placed on the device.
+    /// @param budget_bytes  Total device-local memory budget available.
+    /// @param ceiling       Architectural context-length ceiling (e.g. from GGUF).
+    /// @returns             Token count clamped to both the budget and `ceiling`.
     pub fn maxContextTokensForDeviceLocalBudget(
         self: @This(),
         weights_bytes: u64,
@@ -76,6 +81,14 @@ pub const RuntimeMemoryProfile = struct {
     }
 
     /// Return the largest context that fits within a unified-memory budget.
+    ///
+    /// Combines device-local and host-visible costs (both fixed and per-token)
+    /// when computing available room, suitable for backends with a single
+    /// unified address space such as Metal.
+    /// @param weights_bytes Size of model weights counted against the budget.
+    /// @param budget_bytes  Total unified-memory budget available.
+    /// @param ceiling       Architectural context-length ceiling.
+    /// @returns             Token count clamped to both the budget and `ceiling`.
     pub fn maxContextTokensForUnifiedBudget(
         self: @This(),
         weights_bytes: u64,
@@ -93,26 +106,53 @@ pub const RuntimeMemoryProfile = struct {
 };
 
 /// Clamp the requested context length against the model's declared context limit.
+///
+/// @param config                 Model configuration supplying `context_length` as the hard ceiling.
+/// @param requested_context_length Optional caller-supplied cap; `null` means use the model ceiling.
+/// @returns                      The smaller of `config.context_length` and the requested cap.
 pub fn effectiveContextCeiling(config: ModelConfig, requested_context_length: ?u32) u32 {
     return @min(config.context_length, requested_context_length orelse config.context_length);
 }
 
 /// Apply the requested context cap directly to a mutable model config.
+///
+/// Mutates `config.context_length` in place so that downstream code reading
+/// the config sees the clamped value without needing to carry a separate cap.
+/// @param config                 Config to mutate; `context_length` is lowered if necessary.
+/// @param requested_context_length Optional cap; ignored when larger than the current ceiling.
 pub fn applyRequestedContextLimit(config: *ModelConfig, requested_context_length: ?u32) void {
     config.context_length = effectiveContextCeiling(config.*, requested_context_length);
 }
 
 /// Return the runtime context target after applying both model and backend caps.
+///
+/// Applies the model ceiling first (`effectiveContextCeiling`), then further
+/// clamps to the backend's hardware-derived limit.
+/// @param config                 Model configuration providing the architectural ceiling.
+/// @param requested_context_length Optional user-supplied context length cap.
+/// @param backend_cap            Hardware or driver limit reported by the backend.
+/// @returns                      Final context length clamped to all three bounds.
 pub fn requestedContextTokens(config: ModelConfig, requested_context_length: ?u32, backend_cap: u32) u32 {
     return @min(effectiveContextCeiling(config, requested_context_length), backend_cap);
 }
 
 /// Return how many context slots remain available for a request.
+///
+/// Uses saturating subtraction so the result is 0 rather than wrapping when
+/// `used_context_tokens` exceeds the capacity.
+/// @param used_context_tokens    Tokens already committed in the current context window.
+/// @param context_capacity_tokens Total context window size in tokens.
+/// @returns                      Remaining free slots, clamped to 0 on overflow.
 pub fn remainingContextTokens(used_context_tokens: u32, context_capacity_tokens: u32) u32 {
     return context_capacity_tokens -| used_context_tokens;
 }
 
 /// Clamp requested completion tokens against the remaining context budget.
+///
+/// @param used_context_tokens        Tokens already in the context window.
+/// @param requested_completion_tokens Caller-requested number of new tokens to generate.
+/// @param context_capacity_tokens    Total context capacity.
+/// @returns                          Actual completion quota, never exceeding the remaining room.
 pub fn clampedCompletionTokens(
     used_context_tokens: u32,
     requested_completion_tokens: u32,
@@ -122,6 +162,13 @@ pub fn clampedCompletionTokens(
 }
 
 /// Return the total context target needed for prompt plus completion work.
+///
+/// Adds the clamped completion quota to the tokens already used, then caps
+/// the result at `context_capacity_tokens` to prevent over-allocation.
+/// @param used_context_tokens        Tokens already occupying the context window.
+/// @param requested_completion_tokens Tokens the caller wants to generate.
+/// @param context_capacity_tokens    Hard upper bound on the context window size.
+/// @returns                          Total tokens to allocate, bounded by capacity.
 pub fn requestContextTarget(
     used_context_tokens: u32,
     requested_completion_tokens: u32,
@@ -140,6 +187,14 @@ pub const RequestBudget = struct {
 };
 
 /// Compute the clamped completion budget and resulting context target for one request.
+///
+/// Combines `clampedCompletionTokens` and `requestContextTarget` into a single
+/// call so callers get both values in one pass without double-computing the clamp.
+/// @param used_context_tokens        Tokens already committed in the context window.
+/// @param requested_completion_tokens Tokens the caller wants to generate.
+/// @param context_capacity_tokens    Total context capacity.
+/// @returns                          `RequestBudget` with the actual completion quota and the
+///                                   total context window size to allocate for this request.
 pub fn requestBudget(
     used_context_tokens: u32,
     requested_completion_tokens: u32,
@@ -161,6 +216,12 @@ pub fn requestBudget(
 }
 
 /// Build the backend-agnostic runtime memory profile for a normalized model config.
+///
+/// Computes all fixed and per-token memory costs from model dimensions, including
+/// attention buffers, FFN/MoE scratch buffers, SSM convolution and state buffers,
+/// and KV-cache scaling. The returned profile does not include model weights.
+/// @param config Model configuration with dimensions, expert counts, and SSM parameters.
+/// @returns      `RuntimeMemoryProfile` capturing fixed overhead and per-token KV cost.
 pub fn profile(config: ModelConfig) RuntimeMemoryProfile {
     const hidden_size = @as(u64, config.hidden_dim) * @sizeOf(f32);
     const logits_size = @as(u64, config.vocab_size) * @sizeOf(f32);

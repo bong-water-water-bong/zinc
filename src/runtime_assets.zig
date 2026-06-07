@@ -1,10 +1,9 @@
 //! Runtime asset discovery for installed and source-tree ZINC layouts.
-//!
+//! @section Shader Dispatch
 //! Release archives place shader assets next to the executable under
 //! `share/zinc/shaders`, while development builds often run from the repository
 //! with assets under `zig-out` or `src/shaders`. This module centralizes that
 //! lookup and keeps backend code from hardcoding source-checkout paths.
-//! @section Shader Dispatch
 const std = @import("std");
 
 /// Which compiled shader family to locate.

@@ -29,6 +29,10 @@ pub const CudaBuffer = struct {
 };
 
 /// Allocate a device-local buffer (the common case for weights/activations/state).
+/// @param ctx  CUDA context that owns the allocation.
+/// @param size Number of bytes to allocate on the device.
+/// @returns A `CudaBuffer` with no host staging pointer; use `createBufferStaged` when CPU access is needed.
+/// @note Returns `error.CudaBufferAllocFailed` if the shim returns a null handle.
 pub fn createBuffer(ctx: ?*shim.CudaCtx, size: usize) !CudaBuffer {
     const handle = shim.cuda_create_buffer(ctx, size);
     if (handle == null) return error.CudaBufferAllocFailed;
@@ -37,6 +41,10 @@ pub fn createBuffer(ctx: ?*shim.CudaCtx, size: usize) !CudaBuffer {
 
 /// Allocate a device buffer paired with a pinned-host staging mirror for fast
 /// `upload`/`download`. The host pointer is exposed via `contents()`.
+/// @param ctx  CUDA context that owns the allocation.
+/// @param size Number of bytes to allocate on both the device and in pinned host memory.
+/// @returns A `CudaBuffer` whose `host_ptr` field is non-null; `contents()` returns the pinned staging address.
+/// @note Returns `error.CudaBufferAllocFailed` if the shim returns a null handle.
 pub fn createBufferStaged(ctx: ?*shim.CudaCtx, size: usize) !CudaBuffer {
     var cpu_ptr: ?*anyopaque = null;
     const handle = shim.cuda_create_buffer_staged(ctx, size, &cpu_ptr);
@@ -46,15 +54,23 @@ pub fn createBufferStaged(ctx: ?*shim.CudaCtx, size: usize) !CudaBuffer {
 
 /// Register an existing host mapping (e.g. mmap'd weights) and copy to device —
 /// the CUDA analogue of Metal's zero-copy wrapMmap.
+/// @param ctx      CUDA context that will own the resulting device allocation.
+/// @param host_ptr Pointer to the host memory region to copy from (typically an mmap'd file mapping).
+/// @param size     Number of bytes to transfer.
+/// @returns A device-local `CudaBuffer`; `host_ptr` is null (data lives only on device after this call).
+/// @note Returns `error.CudaMmapUploadFailed` if the shim returns a null handle.
 pub fn uploadMmap(ctx: ?*shim.CudaCtx, host_ptr: *const anyopaque, size: usize) !CudaBuffer {
     const handle = shim.cuda_upload_mmap(ctx, host_ptr, size);
     if (handle == null) return error.CudaMmapUploadFailed;
     return .{ .handle = handle, .size = size };
 }
 
-/// Create a lightweight view into an existing buffer's device allocation. The
-/// returned handle must not free the parent's device memory (the shim tracks
-/// ownership on the C side).
+/// Create a lightweight view into an existing buffer's device allocation.
+/// @param base   Parent buffer whose device memory is aliased.
+/// @param offset Byte offset from the start of `base`'s device allocation.
+/// @param size   Number of bytes the alias covers.
+/// @returns A `CudaBuffer` with `owns_handle = false`; calling `freeBuffer` on it releases only the wrapper, not the parent's device memory.
+/// @note Returns `error.CudaBufferAllocFailed` if the shim returns a null handle.
 pub fn aliasBuffer(base: *const CudaBuffer, offset: usize, size: usize) !CudaBuffer {
     const handle = shim.cuda_alias_buffer(base.handle, offset, size);
     if (handle == null) return error.CudaBufferAllocFailed;
@@ -70,12 +86,18 @@ pub fn freeBuffer(buf: *CudaBuffer) void {
     }
 }
 
-/// Host->device copy (synchronous on the context stream).
+/// Copy bytes from host to device (synchronous on the context stream).
+/// @param ctx  CUDA context whose stream is used for the transfer.
+/// @param buf  Destination device buffer; must be at least `data.len` bytes.
+/// @param data Source slice on the host.
 pub fn upload(ctx: ?*shim.CudaCtx, buf: *const CudaBuffer, data: []const u8) void {
     shim.cuda_upload(ctx, buf.handle, @ptrCast(data.ptr), data.len);
 }
 
-/// Device->host copy (synchronous on the context stream).
+/// Copy bytes from device to host (synchronous on the context stream).
+/// @param ctx CUDA context whose stream is used for the transfer.
+/// @param buf Source device buffer; must be at least `dst.len` bytes.
+/// @param dst Destination slice on the host.
 pub fn download(ctx: ?*shim.CudaCtx, buf: *const CudaBuffer, dst: []u8) void {
     shim.cuda_download(ctx, buf.handle, @ptrCast(dst.ptr), dst.len);
 }

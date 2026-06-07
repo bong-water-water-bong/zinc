@@ -178,8 +178,11 @@ pub const Connection = struct {
         try self.stream.writeAll("\r\n");
     }
 
-    /// Write a chunked SSE comment. Useful as a keepalive when a client/proxy
-    /// gives up on a quiet stream before the next model token is ready.
+    /// Write a chunked SSE comment line (`: {text}\n\n`) to keep the connection alive.
+    /// Useful when a client or intermediate proxy would time out on a quiet
+    /// stream before the next model token is ready.
+    /// @param self Active connection to write to.
+    /// @param text Comment payload sent verbatim after the `: ` prefix.
     pub fn writeSseComment(self: *Connection, text: []const u8) !void {
         var size_buf: [16]u8 = undefined;
         const chunk_len = ": ".len + text.len + "\n\n".len;
@@ -204,7 +207,7 @@ pub const Connection = struct {
     /// though response writes are still valid. Let write failures be the source
     /// of truth so long OpenAI-compatible streams do not self-abort.
     /// @param self Active connection to inspect.
-    /// @returns True when the peer is known gone, false otherwise.
+    /// @returns Always `false` (stub — rely on write-path errors for detection).
     pub fn isPeerClosed(self: *Connection) bool {
         _ = self;
         return false;
@@ -217,10 +220,13 @@ pub const Connection = struct {
     }
 };
 
-/// HTTP request methods.
+/// HTTP request method parsed from the request line.
+/// `UNKNOWN` is the fallback for any method not explicitly handled by the server.
 pub const Method = enum { GET, POST, OPTIONS, UNKNOWN };
 
-/// Parsed HTTP request.
+/// Parsed HTTP request produced by `Connection.readRequest`.
+/// @note `body` and `path` are slices into the owning `Connection`'s internal
+/// read buffer and are only valid until the next call on that connection.
 pub const Request = struct {
     method: Method,
     path: []const u8,

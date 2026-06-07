@@ -171,6 +171,8 @@ pub const ServerState = struct {
     chat_reuse_cache: ChatReuseCache,
 
     /// Create a new server state anchored to the given UNIX timestamp.
+    /// @param started_at UNIX timestamp (seconds) of server startup, stored for uptime calculations.
+    /// @returns Initialized `ServerState` with zeroed counters and an empty chat-reuse cache.
     pub fn init(started_at: i64) ServerState {
         return .{
             .started_at = started_at,
@@ -184,11 +186,15 @@ pub const ServerState = struct {
     }
 
     /// Return elapsed seconds since the server started.
+    /// @param now Current UNIX timestamp (seconds) to compare against `started_at`.
+    /// @returns Non-negative elapsed seconds; clamped to 0 if `now` is before `started_at`.
     pub fn uptimeSeconds(self: *const ServerState, now: i64) u64 {
         return @intCast(@max(now - self.started_at, 0));
     }
 
     /// Atomically capture current request and context counters for the health endpoint.
+    /// @param now Current UNIX timestamp (seconds) used to compute uptime in the snapshot.
+    /// @returns `HealthSnapshot` with monotonic reads of all live counters and computed uptime.
     pub fn snapshot(self: *const ServerState, now: i64) HealthSnapshot {
         return .{
             .active_requests = self.active_requests.load(.monotonic),
@@ -199,6 +205,7 @@ pub const ServerState = struct {
     }
 
     /// Update the active KV-cache token count reported by the health endpoint.
+    /// @param tokens Number of tokens currently occupying the KV cache.
     pub fn setActiveContextTokens(self: *ServerState, tokens: u32) void {
         self.active_context_tokens.store(tokens, .monotonic);
     }
@@ -214,6 +221,7 @@ pub const ServerState = struct {
     }
 
     /// Remove a single session from the chat prompt-reuse cache.
+    /// @param session_id Opaque session identifier matching the entry to evict.
     pub fn clearChatReuseSession(self: *ServerState, session_id: []const u8) void {
         self.chat_reuse_cache.removeSession(session_id);
     }
@@ -354,10 +362,8 @@ const GenerationGuard = struct {
 
 /// Handle one HTTP connection: parse request, dispatch to endpoint, send response.
 /// @param conn Active client connection to read from and write to.
-/// @param engine Inference engine for running generation.
-/// @param tokenizer Tokenizer for prompt encoding and token decoding.
-/// @param model Loaded model (used for model name in API responses).
-/// @param server_state Shared server metrics and generation lock.
+/// @param manager Model manager used to resolve the active model for inference.
+/// @param server_state Shared server metrics and generation serialization lock.
 /// @param allocator Allocator for per-request temporaries.
 pub fn handleConnection(
     conn: *http.Connection,
@@ -3055,7 +3061,7 @@ fn streamText(
 }
 
 /// Send content text through the streaming detector.
-/// Returns whether we should stop streaming (peer closed, etc.).
+/// Errors propagate upward; callers use `catch return` to stop streaming on failure.
 fn streamTextViaDetector(
     conn: *http.Connection,
     text: []const u8,

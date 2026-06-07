@@ -1140,7 +1140,9 @@ fn isSsmLayer(cfg: ModelConfig, layer_idx: usize) bool {
     return cfg.ssm_d_inner > 0 and !isFullAttentionLayer(cfg, layer_idx);
 }
 
-/// Return the number of full-attention layers in the model.
+/// Return the number of full-attention (non-SSM) transformer layers in the model.
+/// @param cfg Model configuration supplying `n_layers` and the full-attention interval.
+/// @returns Count of layers that use full multi-head attention; 0 for pure-SSM models.
 pub fn attentionLayerCount(cfg: ModelConfig) u32 {
     const interval = fullAttentionInterval(cfg);
     return if (interval == 0) 0 else @divTrunc(cfg.n_layers, interval);
@@ -1150,7 +1152,12 @@ fn kvDim(config: ModelConfig) u32 {
     return config.n_kv_heads * config.head_dim;
 }
 
-/// Whether Q8 KV cache quantization should be enabled by default for this model.
+/// Return whether Q8 KV cache quantization should be enabled by default for this model.
+/// @param config Model configuration used to check architecture and key-value dimensions.
+/// @param debug_validation_enabled When true, always returns false so the unquantized cache
+///   is available for numerical validation.
+/// @returns True when the architecture and dimensions support Q8 KV cache; false for
+///   gpt-oss (SwiGLU sensitivity) and Gemma4 with SWA (ISWA rotation path not yet ported).
 pub fn defaultKvCacheQ8Enabled(config: ModelConfig, debug_validation_enabled: bool) bool {
     if (debug_validation_enabled) return false;
     // Disable Q8 KV cache for gpt-oss — the OAI SwiGLU activation is sensitive to
@@ -1165,7 +1172,11 @@ pub fn defaultKvCacheQ8Enabled(config: ModelConfig, debug_validation_enabled: bo
     return kv_dim > 0 and config.head_dim > 0 and kv_dim % 32 == 0 and config.head_dim % 32 == 0;
 }
 
-/// Bytes consumed per token in the KV cache (depends on Q8 quantization setting).
+/// Return the bytes consumed per token in the KV cache.
+/// @param config Model configuration providing `n_kv_heads` and `head_dim`.
+/// @param q8_enabled When true, returns the Q8_0 packed size (34 bytes per 32 floats);
+///   otherwise returns the unquantized f32 size.
+/// @returns Bytes per KV-cache slot for a single token position.
 pub fn kvCacheBytesPerToken(config: ModelConfig, q8_enabled: bool) u64 {
     const kv_dim = @as(u64, kvDim(config));
     if (q8_enabled) {
@@ -6028,7 +6039,13 @@ pub const InferenceEngine = struct {
         }
     }
 
-    /// Run prompt prefill by replaying the decode path for each prompt token.
+    /// Run prompt prefill in token-major order, processing one token through all layers at a time.
+    /// Uses a queued async-submit path for short prompts when available; falls back to
+    /// sequential `commitAndWait` per token otherwise. Callers that want the layer-major
+    /// batched path should use `prefillBatched` instead.
+    /// @note Returns `error.ContextLengthExceeded` if the prompt would overflow the KV cache.
+    /// @note Returns `error.KvStateNotAvailable` if `state.position` does not match the
+    ///   engine's internal position (stale or mismatched state).
     pub fn prefillBatch(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
         // Cross-effort gate: see `dispatchQ8RepackedDmmvOnCmd`.
@@ -7117,7 +7134,11 @@ pub const InferenceEngine = struct {
         if (kernel_timing.enabled) kernel_timing.reset();
     }
 
-    /// Log the collected Metal profiling summary for the current request.
+    /// Log the collected Metal profiling summary for the current request to the scoped logger.
+    /// Does nothing when profiling was not enabled via `enableProfiling`.
+    /// @param label Short identifier string included in every log line (e.g. model name).
+    /// @param prompt_tokens Number of prompt tokens processed during prefill.
+    /// @param completion_tokens Number of tokens generated during decode.
     pub fn logRequestProfileSummary(self: *const InferenceEngine, label: []const u8, prompt_tokens: usize, completion_tokens: u32) void {
         if (!self.profile_enabled) return;
 
@@ -15971,7 +15992,14 @@ fn getScaleMinK4(j: usize, scales: []const u8) struct { sc: u8, m: u8 } {
     }
 }
 
-/// Dequantize one row of quantized weights to f32. Supports f32, f16, Q4_K, Q5_K, Q6_K, and Q8_0.
+/// Dequantize one row of quantized weight data to f32 values.
+/// Supports f32, f16, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, and MXFP4.
+/// Unsupported types log a warning and zero the output slice.
+/// @param raw_data Raw GGUF tensor bytes for the full matrix.
+/// @param row Zero-based row index to dequantize.
+/// @param cols Number of columns (elements) per row.
+/// @param quant_type GGML quantization type describing the on-disk layout.
+/// @param output Caller-allocated slice of at least `cols` f32 values; filled in place.
 pub fn dequantRow(raw_data: []const u8, row: u32, cols: u32, quant_type: GGMLType, output: []f32) void {
     switch (quant_type) {
         .f32 => {
@@ -16247,8 +16275,14 @@ fn readMmapFloats(mmap: []const u8, base_off: usize, tensor_type: GGMLType, outp
     }
 }
 
-/// Select the top-k logits, apply softmax, and write indices and weights.
-/// SOFTMAX_WEIGHT gating (gpt-oss): select top-k from raw logits, then softmax over selected.
+/// Select the top-k entries by raw logit value, then apply softmax over only those k values.
+/// Used for the SOFTMAX_WEIGHT expert-routing variant (gpt-oss), which differs from
+/// `topKSoftmax` in that softmax is applied to the pre-selected raw logits rather than
+/// to the full probability distribution first.
+/// @param logits Raw router logit values, one per expert.
+/// @param k Number of top experts to select.
+/// @param out_ids Output slice of length k; filled with the indices of selected experts.
+/// @param out_weights Output slice of length k; filled with softmax-normalized weights.
 pub fn topKSoftmaxWeight(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f32) void {
     const n = logits.len;
     var used = [_]bool{false} ** 256;
@@ -16279,7 +16313,11 @@ pub fn topKSoftmaxWeight(logits: []const f32, k: u32, out_ids: []u32, out_weight
     };
 }
 
-/// Select top-k experts by logit value, returning softmax-normalized probabilities.
+/// Apply softmax over all logits, then select the top-k entries by probability and renormalize.
+/// @param logits Raw router logit values, one per expert.
+/// @param k Number of top experts to select.
+/// @param out_ids Output slice of length k; filled with the indices of selected experts.
+/// @param out_weights Output slice of length k; filled with renormalized softmax weights.
 pub fn topKSoftmax(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f32) void {
     const n = logits.len;
     var max_val: f32 = -std.math.inf(f32);
@@ -23039,7 +23077,13 @@ fn logLayerDiagnostics(engine: *InferenceEngine, lt: LayerTensors, layer: u32, i
 // Generate
 // ---------------------------------------------------------------------------
 
-/// Run prefill + autoregressive decode, returning generated tokens and timing metrics.
+/// Run prompt prefill followed by autoregressive decode and return tokens with timing metrics.
+/// @param engine Initialized inference engine owning the model weights and KV cache.
+/// @param prompt_tokens Tokenized prompt; may be empty for continuation from a prior state.
+/// @param max_tokens Upper bound on the number of tokens to generate (not counting prompt).
+/// @param eos_id Token id that terminates generation early when sampled.
+/// @param allocator Used to allocate the returned `output_tokens` slice; caller must free via `GenerateResult.deinit`.
+/// @returns `GenerateResult` with the generated token slice and per-phase timing metrics.
 pub fn generateWithMetrics(
     engine: *InferenceEngine,
     prompt_tokens: []const u32,
@@ -23140,7 +23184,15 @@ pub fn generateWithMetrics(
     };
 }
 
-/// Convenience wrapper around `generateWithMetrics` that logs timing and returns tokens.
+/// Run prefill and decode, log throughput, and return only the generated token slice.
+/// Convenience wrapper around `generateWithMetrics` for callers that do not need the
+/// structured `GenerateMetrics` breakdown.
+/// @param engine Initialized inference engine owning the model weights and KV cache.
+/// @param prompt_tokens Tokenized prompt passed directly to `generateWithMetrics`.
+/// @param max_tokens Upper bound on tokens to generate.
+/// @param eos_id Token id that terminates generation early when sampled.
+/// @param allocator Used to allocate the returned slice; caller is responsible for freeing it.
+/// @returns Caller-owned slice of generated token ids (excludes the prompt).
 pub fn generate(
     engine: *InferenceEngine,
     prompt_tokens: []const u32,

@@ -44,7 +44,9 @@ pub const DeviceCapabilities = struct {
     /// Shader integer dot product (DP4a / v_dot4_i32_i8) is supported and enabled.
     integer_dot_product: bool = false,
 
-    /// Return whether a compute shader can request the given subgroup size.
+    /// Return whether a compute shader can request the given subgroup size at pipeline creation.
+    /// @param size Desired subgroup width to validate against the device's min/max range.
+    /// @returns `true` when subgroup size control is enabled, `size` is within the supported range, and the compute stage supports `requiredSubgroupSize`.
     pub fn supportsRequiredSubgroupSize(self: DeviceCapabilities, size: u32) bool {
         if (!self.subgroup_size_control) return false;
         if (size < self.min_subgroup_size or size > self.max_subgroup_size) return false;
@@ -54,19 +56,19 @@ pub const DeviceCapabilities = struct {
 
 /// Active Vulkan instance, selected physical device, logical device, and memory metadata.
 pub const Instance = struct {
-    /// Vulkan handle.
+    /// Top-level `VkInstance` created for this process; used when destroying the instance.
     handle: vk.c.VkInstance,
-    /// Selected physical device (GPU).
+    /// The chosen `VkPhysicalDevice`; used for memory queries and capability checks.
     physical_device: vk.c.VkPhysicalDevice,
-    /// Logical device.
+    /// Logical `VkDevice` used for all resource allocation, pipeline creation, and command submission.
     device: vk.c.VkDevice,
-    /// Compute queue for dispatch.
+    /// The single compute queue retrieved from `compute_queue_family`.
     compute_queue: vk.c.VkQueue,
     /// Compute queue family index.
     compute_queue_family: u32,
-    /// Physical device properties.
+    /// Name, vendor, driver version, and API version of the selected physical device.
     device_props: vk.c.VkPhysicalDeviceProperties,
-    /// Device memory properties.
+    /// Memory heap layout and type flags for the selected physical device; consumed by `findMemoryType` and `vramBytes`.
     mem_props: vk.c.VkPhysicalDeviceMemoryProperties,
     /// Actual selected physical-device index after bounds clamping.
     selected_device_index: u32,

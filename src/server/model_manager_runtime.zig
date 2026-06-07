@@ -1,9 +1,9 @@
 //! Backend-selected model manager for the HTTP server.
+//! @section API Server
 //!
 //! This thin shim keeps the HTTP server code importing one stable manager type
 //! while build-time backend selection decides whether that implementation comes
 //! from the Vulkan runtime or the Apple Silicon Metal runtime.
-//! @section API Server
 const gpu = @import("../gpu/interface.zig");
 
 const impl = if (gpu.is_metal)

@@ -64,7 +64,8 @@ pub const Graph = struct {
     nodes: std.ArrayList(Node) = .{},
 
     /// Create an empty graph backed by `allocator`.
-    /// @param allocator Used for the node array; not retained for buffer storage.
+    /// @param allocator Retained for growing the node array; buffer ids are
+    ///   tracked as a plain counter and require no per-buffer heap allocation.
     /// @returns A zero-buffer, zero-node graph ready for `addBuffer`/`addNode`.
     pub fn init(allocator: std.mem.Allocator) Graph {
         return .{ .allocator = allocator };

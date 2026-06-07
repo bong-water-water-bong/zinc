@@ -133,7 +133,7 @@ pub const FitEstimate = struct {
     kv_cache_bytes: u64,
     /// SSM convolution and recurrent state bytes on the GPU.
     gpu_ssm_bytes: u64,
-    /// Sum of weights + runtime + KV cache + SSM state in device-local VRAM.
+    /// Sum of weights and runtime activation buffers in device-local VRAM (excludes KV cache and SSM state).
     total_device_local_bytes: u64,
     /// Available VRAM budget reported by the Vulkan driver.
     vram_budget_bytes: u64,
@@ -187,7 +187,11 @@ const required_shader_files = [_][]const u8{
     "moe_weighted_acc.spv",
 };
 
-/// Run system diagnostics and output a readable preflight report to stdout.
+/// Run the five-step preflight diagnostics sequence and print a human-readable report to stdout.
+/// Probes host OS, Vulkan driver, compiled shader assets, GPU device capabilities, and
+/// (optionally) a GGUF model file. Returns `error.DiagnosticsFailed` if any check is marked FAIL.
+/// @param opts Diagnostic configuration: device index, optional model path, shader dir, etc.
+/// @param allocator Used for Vulkan device enumeration and model inspection scratch space.
 pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
     const stdout_file = std.fs.File.stdout();
     var stdout_buffer: [4096]u8 = undefined;
@@ -721,7 +725,13 @@ fn readGgufHeader(file: std.fs.File) !GgufHeader {
     };
 }
 
-/// Estimate device-local and host-visible VRAM usage for a model given a VRAM budget.
+/// Compute a `FitEstimate` that breaks down VRAM usage for a model at a given budget.
+/// Derives weights, KV cache, SSM state, and runtime buffer sizes from the model config,
+/// then checks whether the total fits within the available device-local budget.
+/// @param inspection GGUF model inspection result supplying tensor byte count and config.
+/// @param vram_budget_bytes Device-local VRAM available, as reported by the Vulkan driver.
+/// @param requested_context_length Optional context ceiling override; null uses the model default.
+/// @returns A `FitEstimate` with per-category byte counts and a budget-headroom context maximum.
 pub fn estimateFit(inspection: ModelInspection, vram_budget_bytes: u64, requested_context_length: ?u32) FitEstimate {
     const config = inspection.config;
     const profile = memory_plan.profile(config);

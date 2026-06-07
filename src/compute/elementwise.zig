@@ -320,8 +320,11 @@ pub const ElementwiseDispatch = struct {
     pipeline_scale_acc: ?Pipeline,
     /// BIAS ADD pipeline, or null.
     pipeline_bias_add: ?Pipeline,
+    /// In-place scale pipeline: `data[i] *= scale` (1 binding, Gemma 4 per-layer output scaling).
     pipeline_scale_in_place: ?Pipeline,
+    /// Element-wise multiply pipeline: `a[i] *= b[i]` (2 bindings, used for ffn_gate_inp.scale).
     pipeline_mul_elementwise: ?Pipeline,
+    /// Per-expert scale pipeline: `down[i] *= scales[expert] * routing[expert]` (3 bindings).
     pipeline_per_expert_scale: ?Pipeline,
     /// SSM CONV1D pipeline, or null.
     pipeline_ssm_conv1d: ?Pipeline,
@@ -857,7 +860,15 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 
-    /// Record a GPT-OSS OAI SwiGLU activation dispatch.
+    /// Record a GPT-OSS / OAI-variant SwiGLU activation dispatch.
+    /// Uses the same 3-binding layout as `recordSwiglu` (gate, up → output) but
+    /// selects the swiglu_oai shader whose activation function matches gpt-oss.
+    /// @param self Dispatch wrapper containing the OAI SwiGLU pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set containing gate, up, and output buffers.
+    /// @param n_elements Total number of output elements to compute.
+    /// @returns `error.ShaderNotLoaded` when the OAI SwiGLU pipeline is unavailable.
+    /// @note Workgroups are sized as `ceil(n_elements / 64)`.
     pub fn recordSwigluOai(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -870,7 +881,13 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 
-    /// Record an in-place bias add dispatch.
+    /// Record an in-place bias add dispatch: `out[i] += bias[src_offset + i]`.
+    /// @param self Dispatch wrapper containing the bias add pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with two bindings: output buffer (rw) and bias buffer (ro).
+    /// @param n_elements Number of elements to update.
+    /// @param src_offset Element offset into the bias buffer (allows a shared bias tensor to be sliced).
+    /// @returns `error.ShaderNotLoaded` when the bias add pipeline is unavailable.
     pub fn recordBiasAdd(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -901,22 +918,20 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 
-    /// Record a rotary-position-embedding dispatch for the active decode position.
-    ///
-    /// This applies RoPE in-place semantics through the dedicated shader so
-    /// attention inputs are rotated consistently with the current token index.
+    /// Record a RoPE dispatch with partial rotation support (IMRoPE).
+    /// Rotates the first `rope_dim` dimensions of each attention head at the
+    /// given sequence position; the remaining `stride - rope_dim` dimensions
+    /// are copied unchanged, enabling interleaved-masked (IMRoPE) layouts.
     /// @param self Dispatch wrapper containing the RoPE pipeline.
     /// @param cmd Command buffer currently being recorded.
-    /// @param descriptor_set Descriptor set containing input and output buffers.
-    /// @param head_dim Hidden width per attention head.
-    /// @param n_heads Number of heads to rotate.
-    /// @param position Decode position being encoded.
-    /// @param freq_base Base rotary frequency parameter.
+    /// @param descriptor_set Descriptor set with three bindings: input, output, and freq buffer.
+    /// @param stride Full head dimension in f32 elements (distance between heads in the buffer).
+    /// @param rope_dim Number of dimensions to rotate (must be <= stride; pass stride for plain RoPE).
+    /// @param n_heads Number of query heads to rotate; one workgroup is dispatched per head.
+    /// @param position Current decode token position used to compute rotation angles.
+    /// @param freq_base Base frequency for the sinusoidal schedule (e.g. 10000.0 for standard RoPE).
+    /// @param attn_scale YaRN magnitude scale applied after rotation; use 1.0 for plain RoPE.
     /// @returns `error.ShaderNotLoaded` when the RoPE pipeline is unavailable.
-    /// @note The helper dispatches one workgroup per head.
-    /// Record a RoPE dispatch with partial rotation support (IMRoPE).
-    /// @param stride Full head dimension (distance between heads in buffer).
-    /// @param rope_dim Number of dimensions to rotate (rest copied unchanged).
     pub fn recordRope(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -990,9 +1005,17 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 
-    /// Token-batched deinterleave: dispatches one Y row per token, splitting
-    /// each token's packed [Q(head_dim), gate(head_dim)] per-head blocks into
-    /// separate Q and gate output buffers.
+    /// Record a token-batched deinterleave dispatch.
+    /// Splits each token's packed `[Q(head_dim), gate(head_dim)]` interleaved
+    /// per-head layout into separate Q and gate output buffers in one dispatch.
+    /// Grid is `(ceil(head_dim * n_heads / 64), n_tokens, 1)`.
+    /// @param self Dispatch wrapper containing the batched deinterleave pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with 3 bindings: packed input, Q output, gate output.
+    /// @param head_dim Per-head dimension in elements.
+    /// @param n_heads Number of query heads per token.
+    /// @param n_tokens Number of tokens to process (Y dimension of the dispatch grid).
+    /// @returns `error.ShaderNotLoaded` when the batched deinterleave pipeline is unavailable.
     pub fn recordDeinterleaveBatched(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -1053,7 +1076,13 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 
-    /// Record an in-place scale dispatch: data[i] *= scale.
+    /// Record an in-place element-wise scale dispatch: `data[i] *= scale`.
+    /// @param self Dispatch wrapper containing the scale-in-place pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with one binding: the buffer to scale in place.
+    /// @param n_elements Number of f32 elements to scale.
+    /// @param scale Scalar multiplier applied to every element.
+    /// @returns `error.ShaderNotLoaded` when the scale-in-place pipeline is unavailable.
     pub fn recordScaleInPlace(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -1067,7 +1096,18 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 
-    /// Record SSM conv1d + SiLU dispatch.
+    /// Record a single-token SSM depthwise conv1d + SiLU dispatch.
+    /// Reads the current SSM conv state via `state_offset` (a rotating index into
+    /// the circular state buffer), applies a depthwise conv kernel of width
+    /// `d_conv`, and writes the SiLU-activated output in-place.
+    /// @param self Dispatch wrapper containing the SSM conv1d pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with four bindings: input, kernel, state, output.
+    /// @param conv_channels Number of SSM channels (width of the depthwise conv).
+    /// @param d_conv Kernel width of the depthwise convolution.
+    /// @param kernel_is_f16 True when the kernel weight buffer is f16; false for f32.
+    /// @param state_offset Current rotation index (0..d_conv-2) into the circular state buffer.
+    /// @returns `error.ShaderNotLoaded` when the SSM conv1d pipeline is unavailable.
     pub fn recordSsmConv1d(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -1088,7 +1128,15 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 
-    /// Record in-place SSM Q/K normalization.
+    /// Record an in-place SSM Q/K RMS-norm dispatch.
+    /// Applies per-group RMS normalization to the concatenated Q and K projections
+    /// inside a Mamba/DeltaNet SSM block; dispatches one workgroup per group.
+    /// @param self Dispatch wrapper containing the SSM Q/K norm pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with one binding: the Q+K buffer (in-place).
+    /// @param d_state Per-group state dimension (qk_dim = d_state * n_group).
+    /// @param n_group Number of normalization groups; one workgroup per group.
+    /// @returns `error.ShaderNotLoaded` when the SSM Q/K norm pipeline is unavailable.
     pub fn recordSsmQkNorm(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -1105,7 +1153,15 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), n_group, 1, 1);
     }
 
-    /// Record SSM delta-net state update dispatch.
+    /// Record an SSM DeltaNet state-update dispatch (baseline variant).
+    /// Executes the DeltaNet recurrence over a single token (or `push.n_tok`
+    /// prefill tokens when n_tok > 1).  Grid is `(dt_rank, head_v_dim, 1)` —
+    /// one wave64 workgroup per (head, row) pair.
+    /// @param self Dispatch wrapper containing the SSM delta-net pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with 7 bindings: conv_out, dt_bias, alpha, beta, ssm_a, state, output.
+    /// @param push Fully populated push-constant struct describing the SSM dimensions and flags.
+    /// @returns `error.ShaderNotLoaded` when the SSM delta-net pipeline is unavailable.
     pub fn recordSsmDeltaNet(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -1118,7 +1174,14 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), push.dt_rank, row_blocks, 1);
     }
 
-    /// Record SSM delta-net cols8 dispatch.
+    /// Record an SSM DeltaNet state-update dispatch using the cols8 tiled variant.
+    /// Each wave64 workgroup processes four output rows (head_v_dim / 4 workgroups
+    /// per head), improving register reuse relative to the baseline 1-row shader.
+    /// @param self Dispatch wrapper containing the SSM delta-net cols8 pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with 7 bindings (same layout as `recordSsmDeltaNet`).
+    /// @param push Fully populated push-constant struct describing the SSM dimensions and flags.
+    /// @returns `error.ShaderNotLoaded` when the SSM delta-net cols8 pipeline is unavailable.
     pub fn recordSsmDeltaNetCols8(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -1131,7 +1194,15 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), push.dt_rank, row_blocks, 1);
     }
 
-    /// Record SSM delta-net cols8 dispatch for pre-normalized Q/K.
+    /// Record an SSM DeltaNet state-update dispatch using the cols8 normed variant.
+    /// Identical semantics to `recordSsmDeltaNetCols8` but selects the shader
+    /// that expects Q/K inputs to be pre-normalized (skipping the in-shader norm).
+    /// Each wave64 workgroup processes eight output rows (head_v_dim / 8 workgroups per head).
+    /// @param self Dispatch wrapper containing the SSM delta-net cols8 normed pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with 7 bindings (same layout as `recordSsmDeltaNet`).
+    /// @param push Fully populated push-constant struct describing the SSM dimensions and flags.
+    /// @returns `error.ShaderNotLoaded` when the SSM delta-net cols8 normed pipeline is unavailable.
     pub fn recordSsmDeltaNetCols8Normed(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -1143,7 +1214,13 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), push.dt_rank, row_blocks, 1);
     }
 
-    /// Record SSM gated norm dispatch.
+    /// Record an SSM gated norm dispatch: applies z-gate * RMS-norm(delta_output).
+    /// Dispatches one wave64 workgroup per head (`push.dt_rank` workgroups total).
+    /// @param self Dispatch wrapper containing the SSM gated norm pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with 4 bindings: delta_output, z_gate, norm_weights, output.
+    /// @param push Push-constant struct specifying d_inner, dt_rank, head_v_dim, d_state, and norm_per_head.
+    /// @returns `error.ShaderNotLoaded` when the SSM gated norm pipeline is unavailable.
     pub fn recordSsmGatedNorm(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,
@@ -1181,10 +1258,16 @@ pub const ElementwiseDispatch = struct {
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups, 1, 1);
     }
 
-    /// Record MoE weighted accumulate: a[i] += routing_weight[expert_index] * b[i].
-    /// Weight is read from GPU routing buffer (binding 2), not from push constant.
-    /// Record batched MoE weighted accumulate: sums all expert outputs at once.
-    /// src_stride: elements per expert in the source buffer (typically = n_elements).
+    /// Record a MoE weighted accumulate dispatch: `a[i] += routing_weight[j] * b[j*src_stride + i]`
+    /// summed over `n_used` selected experts.  Routing weights are read from the GPU
+    /// routing buffer (binding 2), not from a push constant.
+    /// @param self Dispatch wrapper containing the MoE weighted accumulate pipeline.
+    /// @param cmd Command buffer currently being recorded.
+    /// @param descriptor_set Descriptor set with 3 bindings: accum (rw), src experts, routing weights.
+    /// @param n_elements Hidden dimension of the accumulation buffer (elements updated per token).
+    /// @param n_used Number of selected experts whose outputs are summed.
+    /// @param src_stride Elements per expert in the source buffer (typically equal to n_elements).
+    /// @returns `error.ShaderNotLoaded` when the MoE weighted accumulate pipeline is unavailable.
     pub fn recordMoeWeightedAcc(
         self: *const ElementwiseDispatch,
         cmd: *CommandBuffer,

@@ -62,8 +62,13 @@ pub const Tokenizer = struct {
         gemma4_bpe,
     };
 
-    /// Initialize tokenizer from GGUF metadata.
-    /// Reads tokenizer.ggml.tokens, tokenizer.ggml.merges, and special token IDs.
+    /// Initialize a Tokenizer from an open GGUF file.
+    /// Reads `tokenizer.ggml.tokens`, `tokenizer.ggml.merges`, token scores, and
+    /// special token IDs (BOS, EOS, add-BOS flag) from GGUF metadata.  Also builds
+    /// the `merge_ranks` lookup table so that subsequent `encode` calls are fast.
+    /// @param gf Parsed GGUF file whose metadata contains the tokenizer tables.
+    /// @param allocator Used for all owned heap allocations; pass to `deinit` to free.
+    /// @returns An initialized Tokenizer, or an error if required metadata is absent.
     pub fn initFromGGUF(gf: *const gguf.GGUFFile, allocator: std.mem.Allocator) !Tokenizer {
         // Read vocabulary tokens
         const tokens_val = gf.metadata.get("tokenizer.ggml.tokens") orelse {
@@ -228,11 +233,6 @@ pub const Tokenizer = struct {
         };
     }
 
-    /// Encode UTF-8 text into token IDs using the loaded vocabulary and merge tables.
-    /// @param self Tokenizer state containing vocabulary, reverse lookup, merges, and optional scores.
-    /// @param text UTF-8 input text to tokenize.
-    /// @returns A heap-allocated token-ID slice in model order.
-    /// @note Unknown merged symbols fall back to byte-level tokens so encoding always produces a result.
     /// GPT-2 byte-to-unicode mapping. Maps each raw byte to a Unicode character.
     /// Printable ASCII (33-126, 161-172, 174-255) maps to itself.
     /// Non-printable bytes (0-32, 127-160, 173) map to U+0100+ range.
@@ -455,7 +455,12 @@ pub const Tokenizer = struct {
         pos.* = i;
         return text[start..i];
     }
-    /// Encode UTF-8 text into token IDs using the tokenizer's pretokenizer and merges.
+    /// Encode UTF-8 text into a sequence of token IDs.
+    /// Applies the appropriate pretokenizer (Gemma-4 chunk splitter, GPT-2 word
+    /// splitter, or legacy no-split) and then BPE merges via `merge_ranks`.
+    /// The returned slice is owned by the caller; free it with `freeEncoded`.
+    /// @param text UTF-8 input to tokenize; an empty string returns an empty slice.
+    /// @returns Heap-allocated token ID sequence, or an error on allocation failure.
     pub fn encode(self: *const Tokenizer, text: []const u8) ![]u32 {
         if (text.len == 0) return try self.allocator.alloc(u32, 0);
         if (self.pretokenizer == .gemma4_bpe) {
@@ -743,9 +748,7 @@ pub const Tokenizer = struct {
         return @as(u32, byte);
     }
 
-    /// Return the model's configured end-of-sequence token ID.
-    /// @param self Tokenizer to inspect.
-    /// @returns The EOS token ID loaded from GGUF metadata or the default fallback.
+    /// Return the model's end-of-sequence token ID as loaded from GGUF metadata.
     pub fn eosId(self: *const Tokenizer) u32 {
         return self.eos_id;
     }
@@ -764,19 +767,25 @@ pub const Tokenizer = struct {
         return false;
     }
 
-    /// Return the model's configured beginning-of-sequence token ID.
-    /// @param self Tokenizer to inspect.
-    /// @returns The BOS token ID loaded from GGUF metadata or the default fallback.
+    /// Return the model's beginning-of-sequence token ID.
+    /// Falls back to `eos_id` when no BOS token was found in GGUF metadata.
     pub fn bosId(self: *const Tokenizer) u32 {
         return self.bos_id orelse self.eos_id;
     }
 
-    /// Whether prompt construction should prepend BOS automatically.
+    /// Return true when prompt construction should prepend a BOS token.
+    /// Requires both `prepend_bos` (from GGUF metadata) to be set and a valid
+    /// `bos_id` to exist; returns false if either condition is absent.
     pub fn shouldPrependBos(self: *const Tokenizer) bool {
         return self.prepend_bos and self.bos_id != null;
     }
 
-    /// Build prompt tokens following GGUF BOS/EOS policy.
+    /// Wrap a raw token sequence with BOS/EOS according to the GGUF metadata flags.
+    /// Prepends BOS when `shouldPrependBos()` is true and appends EOS when
+    /// `add_eos_token` is set.  Allocates the result with the tokenizer's own
+    /// allocator; caller is responsible for freeing the returned slice.
+    /// @param raw_tokens The BPE-encoded token IDs to wrap.
+    /// @returns A newly allocated slice with optional BOS prefix and EOS suffix.
     pub fn preparePromptTokens(self: *const Tokenizer, raw_tokens: []const u32) ![]u32 {
         const prefix_len: usize = if (self.shouldPrependBos()) 1 else 0;
         const suffix_len: usize = if (self.add_eos_token) 1 else 0;
@@ -796,7 +805,13 @@ pub const Tokenizer = struct {
         return prompt_tokens;
     }
 
-    /// Decode a token ID to UTF-8 text, reversing the GPT-2 byte-to-unicode mapping.
+    /// Decode a single token ID to UTF-8 text, reversing the GPT-2 byte-to-unicode mapping.
+    /// Handles SentencePiece word-boundary markers (▁ → space) and passes through
+    /// non-ASCII codepoints (CJK, emoji) verbatim.  Returns an empty string for
+    /// out-of-range token IDs.
+    /// @param token_id Vocabulary index to decode.
+    /// @param buf Caller-supplied output buffer; result is a slice into this buffer.
+    /// @returns UTF-8 bytes for the token, or an empty slice if the ID is out of range.
     pub fn decodeToken(self: *const Tokenizer, token_id: u32, buf: []u8) []const u8 {
         if (token_id >= self.vocab.len) return "";
         const gpt2_text = self.vocab[token_id];
@@ -920,12 +935,25 @@ pub const Tokenizer = struct {
             false;
     }
 
-    /// Apply chat template to role/content pairs. Returns formatted prompt in buf.
+    /// Format a conversation into a model prompt using the embedded chat template.
+    /// Convenience wrapper around `applyChatTemplateWithOptions` with default options.
+    /// @param roles Parallel slice of role strings (e.g. "user", "assistant", "system").
+    /// @param contents Parallel slice of message body strings.
+    /// @param buf Caller-supplied output buffer that receives the formatted prompt.
+    /// @returns A slice of `buf` containing the rendered prompt.
     pub fn applyChatTemplate(self: *const Tokenizer, roles: []const []const u8, contents: []const []const u8, buf: []u8) ![]const u8 {
         return self.applyChatTemplateWithOptions(roles, contents, .{}, buf);
     }
 
-    /// Apply chat template to role/content pairs with explicit thinking control.
+    /// Format a conversation into a model prompt with fine-grained rendering control.
+    /// Dispatches to the appropriate template renderer (ChatML, Llama-3, Gemma, OpenAI-MoE,
+    /// or generic) based on `detectTemplateKind()`.  Supports optional thinking tags,
+    /// tool definitions, forced tool-call prefills, and generation-prompt suffixes.
+    /// @param roles Parallel slice of role strings (e.g. "user", "assistant", "system").
+    /// @param contents Parallel slice of message body strings.
+    /// @param options Rendering options; see `ChatTemplateOptions` for details.
+    /// @param buf Caller-supplied output buffer that receives the formatted prompt.
+    /// @returns A slice of `buf` containing the rendered prompt.
     pub fn applyChatTemplateWithOptions(self: *const Tokenizer, roles: []const []const u8, contents: []const []const u8, options: ChatTemplateOptions, buf: []u8) ![]const u8 {
         var pos: usize = 0;
         const template_kind = self.detectTemplateKind();
@@ -1126,6 +1154,8 @@ pub const Tokenizer = struct {
         return buf[0..pos];
     }
 
+    /// Enumeration of recognized chat-template families used for prompt formatting.
+    /// `generic` is the fallback for templates that do not match any known pattern.
     pub const TemplateKind = enum { chatml, llama3, gemma, openai_moe, generic };
 
     /// Return the detected chat template kind as a human-readable string (e.g. "chatml", "openai_moe").

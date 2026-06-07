@@ -1,9 +1,9 @@
 //! Cross-process GPU reservation lock keyed by backend and selected device.
+//! @section Inference Runtime
 //!
 //! ZINC uses a filesystem lock to stop multiple inference processes from
 //! loading different models onto the same physical GPU at once, which would
 //! otherwise produce confusing OOM failures and unstable benchmark results.
-//! @section Inference Runtime
 const std = @import("std");
 
 /// Backend identifier encoded into the shared GPU lockfile name.
@@ -36,7 +36,13 @@ pub const AcquireError = std.fs.File.OpenError || error{
     LockPathTooLong,
 };
 
-/// Format the lockfile path for a backend/device pair into the caller buffer.
+/// Format the lockfile path for a backend/device pair into the caller-supplied buffer.
+///
+/// @param buffer Destination slice for the formatted path; must be at least 64 bytes.
+/// @param backend The GPU backend whose tag name is embedded in the path.
+/// @param device_index Zero-based device index embedded in the path.
+/// @returns A slice into `buffer` holding the null-terminated path string, e.g. `/tmp/zinc-gpu-vulkan-0.lock`.
+/// @note Returns `error.LockPathTooLong` if `buffer` is too small to hold the formatted path.
 pub fn lockPath(buffer: []u8, backend: Backend, device_index: u32) error{LockPathTooLong}![]const u8 {
     return std.fmt.bufPrint(buffer, "/tmp/zinc-gpu-{s}-{d}.lock", .{
         @tagName(backend),
@@ -45,6 +51,15 @@ pub fn lockPath(buffer: []u8, backend: Backend, device_index: u32) error{LockPat
 }
 
 /// Acquire the cross-process GPU reservation lock for a backend/device pair.
+///
+/// Opens the lockfile in non-blocking exclusive mode so that a second process
+/// attempting to claim the same GPU immediately receives `error.GpuAlreadyReserved`
+/// rather than blocking indefinitely.
+///
+/// @param backend The GPU backend to reserve.
+/// @param device_index Zero-based index of the device to reserve within that backend.
+/// @returns A `ProcessLock` holding the open lockfile handle; caller must call `deinit` to release.
+/// @note Returns `error.GpuAlreadyReserved` if another process already holds the lock.
 pub fn acquire(backend: Backend, device_index: u32) AcquireError!ProcessLock {
     var path_buffer: [64]u8 = undefined;
     const path = try lockPath(&path_buffer, backend, device_index);

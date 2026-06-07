@@ -37,6 +37,8 @@ pub const ModelManager = model_manager_mod.ModelManager;
 pub const SamplingParams = forward_mod.SamplingParams;
 
 /// Enable logits readback from GPU so sampling can inspect raw logits.
+/// On Metal (UMA) logits are always CPU-accessible, so this is a no-op.
+/// @param _engine Inference engine whose readback mode is updated.
 pub fn enableLogitsReadback(_engine: *InferenceEngine) void {
     if (comptime gpu.is_vulkan) {
         _engine.enableLogitsReadback();
@@ -44,6 +46,9 @@ pub fn enableLogitsReadback(_engine: *InferenceEngine) void {
 }
 
 /// Return whether logits readback is currently enabled on the engine.
+/// Always returns `true` on Metal because UMA makes logits CPU-accessible without an explicit readback step.
+/// @param _engine Inference engine to query.
+/// @returns `true` if the engine will expose logits after each decode step.
 pub fn logitsReadbackEnabled(_engine: *const InferenceEngine) bool {
     if (comptime gpu.is_vulkan) {
         return _engine.logits_readback_enabled;
@@ -60,6 +65,9 @@ pub fn setLogitsReadbackEnabled(_engine: *InferenceEngine, _enabled: bool) void 
 }
 
 /// Enable GPU kernel profiling on the inference engine.
+/// A no-op (returns without error) when running on a backend that has not implemented profiling.
+/// @param _engine Inference engine to configure for profiling.
+/// @returns An error if the backend's profiling setup fails (e.g. out of GPU resources).
 pub fn enableProfiling(_engine: *InferenceEngine) !void {
     if (comptime gpu.is_vulkan) {
         try _engine.enableProfiling();
@@ -69,6 +77,11 @@ pub fn enableProfiling(_engine: *InferenceEngine) !void {
 }
 
 /// Run a single autoregressive decode step, advancing the KV cache by one token.
+/// @param _engine Inference engine that owns the model weights and KV cache.
+/// @param _state Per-sequence decode state tracking position and token history.
+/// @param _token_id Input token to feed into the model for this step.
+/// @param _collect_output When `true`, copy output logits to CPU (Vulkan only; ignored on Metal where logits are always accessible).
+/// @returns An error if the GPU submission or synchronisation fails.
 pub fn decodeStep(
     _engine: *InferenceEngine,
     _state: *DecodeState,
@@ -83,6 +96,11 @@ pub fn decodeStep(
 }
 
 /// Sample the next token from the model's logit distribution.
+/// @param _engine Inference engine holding the current logits.
+/// @param _state Decode state used to retrieve generated-token history for repetition penalty.
+/// @param _params Sampling configuration (temperature, top-p, top-k, repetition penalty, etc.).
+/// @param _random PRNG source for stochastic sampling.
+/// @returns The sampled token ID.
 pub fn sample(
     _engine: *const InferenceEngine,
     _state: *const DecodeState,

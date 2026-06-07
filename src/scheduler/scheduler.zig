@@ -10,7 +10,8 @@ const GenerationParams = @import("request.zig").GenerationParams;
 
 const log = std.log.scoped(.scheduler);
 
-/// Scheduler that manages concurrent inference requests.
+/// Fixed-capacity pool of request slots used to track concurrent inference requests.
+/// Each slot holds at most one active `Request`; slots are reused once released.
 pub const Scheduler = struct {
     /// Active requests indexed by slot ID.
     slots: []?Request,
@@ -37,12 +38,12 @@ pub const Scheduler = struct {
         };
     }
 
-    /// Submit a new request and assign it to a free slot.
+    /// Submit a new request and assign it to the first free slot.
     /// @param self Scheduler to submit to.
     /// @param prompt_tokens Tokenized prompt for the request.
     /// @param params Generation parameters (max_tokens, temperature, etc.).
-    /// @returns The assigned slot ID.
-    /// @note Returns error.AllSlotsBusy if no free slots are available.
+    /// @returns The slot index that was assigned; pass this value to `release` when the request completes.
+    /// @note Returns `error.AllSlotsBusy` if every slot is occupied.
     pub fn submit(self: *Scheduler, prompt_tokens: []const u32, params: GenerationParams) !u32 {
         // Find a free slot
         for (self.slots, 0..) |*slot, i| {
@@ -87,6 +88,7 @@ pub const Scheduler = struct {
     }
 
     /// Return slot IDs of requests in the decoding state.
+    /// @param self Scheduler to query.
     /// @returns Empty slice (stub — allocation strategy TBD).
     pub fn activeDecoding(self: *Scheduler) []u32 {
         _ = self;
@@ -95,7 +97,8 @@ pub const Scheduler = struct {
 
     /// Release a completed or cancelled request's slot, freeing its resources.
     /// @param self Scheduler to release from.
-    /// @param slot_id Slot index to free.
+    /// @param slot_id Slot index to free (the value returned by `submit`).
+    /// @note Silently does nothing if `slot_id` is out of range or the slot is already empty.
     pub fn release(self: *Scheduler, slot_id: u32) void {
         if (slot_id < self.slots.len) {
             if (self.slots[slot_id]) |*req| {

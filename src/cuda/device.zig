@@ -25,6 +25,9 @@ pub const CudaDevice = struct {
     allocator: std.mem.Allocator,
 
     /// Initialize a specific CUDA device by index and query its capabilities.
+    /// @param allocator Allocator stored for future use by the backend.
+    /// @param device_index Zero-based CUDA device ordinal.
+    /// @returns Initialised `CudaDevice` with a live context, or `error.CudaInitFailed` if the shim rejects the index.
     pub fn init(allocator: std.mem.Allocator, device_index: u32) !CudaDevice {
         const ctx = shim.cuda_init(@intCast(device_index));
         if (ctx == null) return error.CudaInitFailed;
@@ -37,7 +40,10 @@ pub const CudaDevice = struct {
     }
 
     /// Initialize the highest-compute-capability device (prefer 5090 over 4090).
-    /// Probes indices until `cuda_init` fails (one past the last device).
+    /// Probes up to 16 device indices, selects the one with the largest compute capability
+    /// value, then opens a final context on that device via `init`.
+    /// @param allocator Forwarded to `init` for the selected device.
+    /// @returns Initialised `CudaDevice` for the best device, or `error.CudaNoDevice` if no device is found.
     pub fn initBest(allocator: std.mem.Allocator) !CudaDevice {
         var best_index: i64 = -1;
         var best_cc: u32 = 0;
@@ -107,6 +113,8 @@ pub const CudaDevice = struct {
     }
 
     /// Copy the device name into `buf` and return the NUL-trimmed slice.
+    /// @param buf Caller-supplied scratch buffer; 64–256 bytes is typically sufficient.
+    /// @returns Slice into `buf` containing the device name without a trailing NUL, or an empty slice if the context has been destroyed.
     pub fn name(self: *const CudaDevice, buf: []u8) []const u8 {
         if (self.ctx) |ctx| {
             shim.cuda_device_name(ctx, buf.ptr, buf.len);

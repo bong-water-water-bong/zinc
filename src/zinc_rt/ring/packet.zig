@@ -119,7 +119,9 @@ pub const PacketBuilder = struct {
         try self.setShReg(compute_user_data_0 + slot, &values);
     }
 
-    /// Emit `DISPATCH_DIRECT` with the default compute dispatch initiator.
+    /// Emit `DISPATCH_DIRECT` with a zero dispatch-initiator field.
+    /// Prefer `dispatchDirectInitiator` when `COMPUTE_DISPATCH_INITIATOR` bits
+    /// must be set explicitly (e.g. `dispatch_initiator_compute`).
     /// @param self Builder to append to.
     /// @param dim_x Workgroup count on X.
     /// @param dim_y Workgroup count on Y.
@@ -198,9 +200,9 @@ pub const PacketBuilder = struct {
     /// @param self Builder to append to.
     /// @param gpu_addr Destination GPU virtual address.
     /// @param value 64-bit payload written little-endian.
-    /// @note Used as the simplest in-band memory scribble for validating
-    ///     CS-submitted fence and output-ring writes before real kernels are
-    ///     wired up.
+    /// @note Uses `dst_sel=5` (memory async/direct) and `engine_sel=0` (ME).
+    ///     The ME stalls until the write lands in memory (WR_CONFIRM=1), so
+    ///     callers observe the value as soon as the packet retires.
     pub fn writeData64(self: *PacketBuilder, gpu_addr: u64, value: u64) Error!void {
         // PKT3_WRITE_DATA, dst_sel=5 (memory async/direct), WR_CONFIRM=1,
         // engine_sel=0 (ME). This is the simplest in-band memory scribble for
@@ -220,10 +222,10 @@ pub const PacketBuilder = struct {
     /// Emit `COPY_DATA` that copies a single 32-bit dword from one GPU memory
     /// address to another with WR_CONFIRM set.
     /// @param self Builder to append to.
-    /// @param src_gpu_addr Source GPU virtual address.
-    /// @param dst_gpu_addr Destination GPU virtual address.
-    /// @note Provides the smallest command-processor dataflow primitive that
-    ///     is available before shader-dispatch lowering is wired.
+    /// @param src_gpu_addr Source GPU virtual address (memory, src_sel=1).
+    /// @param dst_gpu_addr Destination GPU virtual address (memory, dst_sel=5).
+    /// @note Copies exactly 32 bits (count_sel=0). WR_CONFIRM=1 means the
+    ///     command processor stalls until the destination write completes.
     pub fn copyData32(self: *PacketBuilder, src_gpu_addr: u64, dst_gpu_addr: u64) Error!void {
         // PKT3_COPY_DATA, src_sel=1 (memory), dst_sel=5 (memory),
         // count_sel=0 (32 bits), WR_CONFIRM=1. This is the smallest

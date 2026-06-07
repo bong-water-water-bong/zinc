@@ -76,8 +76,14 @@ fn readOffloadOverride() OffloadOverride {
     return .auto;
 }
 
-/// Pure decision function — returns the offload decision without mutating
-/// state, for tests and for use by the side-effecting wrapper below.
+/// Compute whether MoE expert tensors should be offloaded to host RAM, without
+/// mutating any global state. Suitable for unit tests and for use by the
+/// side-effecting `decideOffloadForLoad` wrapper.
+/// @param override Explicit env-var override (.force_on/.force_off) or .auto.
+/// @param total_tensor_bytes Total size of all model tensors in bytes.
+/// @param offloadable_tensor_bytes Bytes belonging to MoE expert tensors only.
+/// @param vram_budget_bytes Reported VRAM capacity in bytes (from Vulkan device).
+/// @returns true if expert tensors should be placed in host-visible memory.
 pub fn computeOffloadDecision(
     override: OffloadOverride,
     total_tensor_bytes: u64,
@@ -100,12 +106,16 @@ pub fn computeOffloadDecision(
 }
 
 /// Decide whether to offload MoE expert tensors for the next model load and
-/// cache the decision. Honors `ZINC_OFFLOAD_MOE_EXPERTS` if set, otherwise
-/// auto-decides:
+/// cache the decision in `offload_state`. Honors `ZINC_OFFLOAD_MOE_EXPERTS` if
+/// set, otherwise auto-decides:
 ///   - If the full model fits in VRAM (with headroom for KV/runtime): no offload.
 ///   - If the model only fits with MoE experts in host RAM: enable offload.
 ///   - If neither fits: don't enable (let allocation fail with a clear OOM
 ///     instead of pretending to fit).
+/// @param total_tensor_bytes Total size of all model tensors in bytes.
+/// @param offloadable_tensor_bytes Bytes belonging to MoE expert tensors only.
+/// @param vram_budget_bytes Reported VRAM capacity in bytes (from Vulkan device).
+/// @returns true if expert tensors will be placed in host-visible memory.
 pub fn decideOffloadForLoad(total_tensor_bytes: u64, offloadable_tensor_bytes: u64, vram_budget_bytes: u64) bool {
     const override = readOffloadOverride();
     const decision = computeOffloadDecision(override, total_tensor_bytes, offloadable_tensor_bytes, vram_budget_bytes);
@@ -129,8 +139,11 @@ pub fn offloadEnabled() bool {
     return offload_state.load(.acquire) == 1;
 }
 
-/// Return true if this tensor should be routed to host-visible memory.
-/// Combines the MoE-expert classifier with the cached offload decision.
+/// Return true if this tensor should be allocated in host-visible memory rather
+/// than device-local VRAM. Returns true only when MoE expert offload is enabled
+/// (see `offloadEnabled`) and the tensor name matches an expert weight suffix.
+/// @param name GGUF tensor name to classify.
+/// @returns true if the tensor belongs to a MoE expert and offload is active.
 pub fn shouldOffloadToHost(name: []const u8) bool {
     return offloadEnabled() and isMoEExpertTensor(name);
 }
@@ -468,7 +481,13 @@ pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfi
     return extractConfigWithLogging(&gf, false);
 }
 
-/// Inspect a GGUF file and return exact tensor upload bytes plus normalized config.
+/// Inspect a GGUF file and return a `ModelInspection` containing the normalized
+/// model config, the on-disk file size, total tensor byte count, offloadable
+/// (MoE expert) tensor byte count, tensor count, and metadata key count.
+/// Does not allocate GPU resources or upload tensors.
+/// @param path Path to the GGUF file on disk.
+/// @param allocator Allocator used for the parsed GGUF metadata structures.
+/// @returns A `ModelInspection` with config and tensor/file size statistics.
 pub fn inspectModel(path: []const u8, allocator: std.mem.Allocator) !ModelInspection {
     const file = try std.fs.cwd().openFile(path, .{});
     defer {

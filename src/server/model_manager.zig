@@ -111,6 +111,14 @@ pub const ModelManager = struct {
     };
 
     /// Creates a manager and immediately loads the model described by `spec`.
+    /// Acquires the per-device GPU process lock before loading.
+    /// @param spec Path, optional catalog ID, and optional context-length override for the model to load.
+    /// @param instance Vulkan instance that owns the selected GPU device.
+    /// @param gpu_config_value Detected GPU capabilities used for shader selection and catalog filtering.
+    /// @param shader_dir Filesystem path to the directory containing compiled SPIR-V shaders.
+    /// @param allocator Used for all heap allocations owned by this manager.
+    /// @returns An initialised `ModelManager` with `current` pointing to the loaded resources,
+    ///   or an error if loading fails.
     pub fn init(
         spec: LoadSpec,
         instance: *const Instance,
@@ -135,7 +143,12 @@ pub const ModelManager = struct {
         };
     }
 
-    /// Creates a manager with no model loaded (server starts idle).
+    /// Creates a manager with no model loaded; the server starts idle and the GPU lock is not held.
+    /// @param instance Vulkan instance that owns the selected GPU device.
+    /// @param gpu_config_value Detected GPU capabilities used for catalog filtering.
+    /// @param shader_dir Filesystem path to the directory containing compiled SPIR-V shaders.
+    /// @param requested_context_length Optional token-count override applied when a model is later activated.
+    /// @param allocator Used for all heap allocations owned by this manager.
     pub fn initEmpty(
         instance: *const Instance,
         gpu_config_value: gpu_detect.GpuConfig,
@@ -192,12 +205,16 @@ pub const ModelManager = struct {
         device_local_bytes: u64,
         device_local_budget_bytes: u64,
 
-        /// Returns the effective context length, clamped to the available capacity.
+        /// Returns the effective context token count: `requested_tokens` clamped to `context_capacity_tokens`.
+        /// @param requested_tokens The number of context tokens the caller wants to use.
+        /// @returns The usable token count, which may be less than requested if the model was loaded with a smaller window.
         pub fn activeContextTokens(self: @This(), requested_tokens: u32) u32 {
             return @min(requested_tokens, self.context_capacity_tokens);
         }
 
-        /// Returns the VRAM bytes required for the effective context length.
+        /// Returns the device-local VRAM bytes consumed by the effective context window.
+        /// @param requested_tokens The desired context length in tokens; clamped via `activeContextTokens`.
+        /// @returns Bytes = clamped token count × `context_bytes_per_token`.
         pub fn activeContextBytes(self: @This(), requested_tokens: u32) u64 {
             return @as(u64, self.activeContextTokens(requested_tokens)) * self.context_bytes_per_token;
         }
@@ -324,7 +341,10 @@ pub const ModelManager = struct {
         };
     }
 
-    /// Returns true if the given catalog entry is compatible with and fits the current GPU.
+    /// Reports whether a catalog entry is both GPU-architecture-compatible and fits within the current VRAM budget.
+    /// @param entry The catalog entry to evaluate.
+    /// @param allocator Used for temporary allocations during fit computation; no long-lived allocation is made.
+    /// @returns `true` when the entry matches the detected GPU profile and `describeFit` reports it fits.
     pub fn supportsManagedEntry(self: *ModelManager, entry: catalog_mod.CatalogEntry, allocator: std.mem.Allocator) bool {
         const fit = managed_mod.describeFit(entry, self.vram_budget_bytes, allocator) catch managed_mod.ModelFit{
             .required_vram_bytes = entry.required_vram_bytes,
@@ -336,7 +356,17 @@ pub const ModelManager = struct {
         return catalog_mod.supportsProfile(entry, self.catalogProfile()) and fit.fits_current_gpu;
     }
 
-    /// Caller must already hold the shared generation lock.
+    /// Loads and activates a managed catalog model, replacing any currently loaded model.
+    /// If the requested model is already active the function returns immediately (optionally
+    /// persisting the selection). The GPU process lock is acquired if not already held.
+    /// @note Caller must hold the shared generation lock before calling this function.
+    /// @param model_id Catalog entry ID to activate; must be installed on disk.
+    /// @param persist_active When true, writes the selection to the active-model file so it
+    ///   survives process restarts.
+    /// @returns `error.UnknownManagedModel` if the ID is not in the catalog,
+    ///   `error.ModelUnsupportedOnThisGpu` if the entry does not match the GPU profile,
+    ///   `error.ModelNotInstalled` if the weights file is absent, or
+    ///   `error.ModelDoesNotFit` if the model exceeds the VRAM budget.
     pub fn activateManagedModel(self: *ModelManager, model_id: []const u8, persist_active: bool) !void {
         const entry = catalog_mod.find(model_id) orelse return error.UnknownManagedModel;
         if (!catalog_mod.supportsProfile(entry.*, self.catalogProfile())) return error.ModelUnsupportedOnThisGpu;
@@ -386,7 +416,13 @@ pub const ModelManager = struct {
         if (persist_active) try managed_mod.writeActiveSelection(model_id, self.allocator);
     }
 
-    /// Caller must already hold the shared generation lock.
+    /// Uninstalls a managed model from disk and, if it is currently loaded, optionally evicts it from the GPU.
+    /// @note Caller must hold the shared generation lock before calling this function.
+    /// @param model_id Catalog entry ID of the model to remove.
+    /// @param force When `false`, returns `error.ModelLoadedInGpu` if the model is currently
+    ///   active. When `true`, the model is unloaded from the GPU before deletion.
+    /// @returns A `RemoveResult` describing whether the GPU was cleared and whether the
+    ///   active-selection file was updated.
     pub fn removeManagedModel(self: *ModelManager, model_id: []const u8, force: bool) !RemoveResult {
         var unloaded_from_gpu = false;
         var previous: ?*LoadedResources = null;

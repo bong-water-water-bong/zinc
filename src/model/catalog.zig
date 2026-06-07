@@ -210,7 +210,13 @@ fn eqlCompactAsciiCaseInsensitive(a: []const u8, b: []const u8) bool {
 }
 
 /// Match a loaded model back to a catalog entry, even when it was opened from a
-/// raw path instead of a managed model id.
+/// raw path instead of a managed-model id. Resolution order: managed id → parent
+/// directory name (for managed-cache `model.gguf` paths) → file-name exact match
+/// → file-name compact-case-insensitive match → display-name fuzzy match.
+/// @param managed_id Optional catalog id previously recorded for this model; tried first.
+/// @param model_path Absolute filesystem path to the GGUF file being loaded.
+/// @param display_name Human-readable name used as a last-resort fuzzy key.
+/// @returns Pointer into `entries`, or null when no catalog entry matches.
 pub fn findForLoadedModel(managed_id: ?[]const u8, model_path: []const u8, display_name: []const u8) ?*const CatalogEntry {
     if (managed_id) |id| {
         if (find(id)) |entry| return entry;
@@ -239,6 +245,11 @@ pub fn findForLoadedModel(managed_id: ?[]const u8, model_path: []const u8, displ
 }
 
 /// Map a detected Vulkan GPU configuration to its catalog profile string.
+/// RDNA4 is further split by VRAM tier (≥28 GiB → "amd-rdna4-32gb", ≥14 GiB →
+/// "amd-rdna4-16gb", otherwise "amd-rdna4-small"); all other vendors map to a
+/// single string each.
+/// @param config GPU vendor/VRAM description produced by `gpu_detect`.
+/// @returns Catalog profile key that can be matched against `CatalogEntry.tested_profiles`.
 pub fn profileForGpu(config: gpu_detect.GpuConfig) []const u8 {
     return switch (config.vendor) {
         .amd_rdna4 => if (config.vram_mb >= 28 * 1024) "amd-rdna4-32gb" else if (config.vram_mb >= 14 * 1024) "amd-rdna4-16gb" else "amd-rdna4-small",
@@ -258,6 +269,9 @@ pub fn profileForMetal() []const u8 {
 }
 
 /// Return whether the entry has been tested on the given GPU profile.
+/// @param entry Catalog entry to check.
+/// @param profile Profile string such as `"amd-rdna4-32gb"` or `apple_silicon_profile`.
+/// @returns true if `profile` appears in `entry.tested_profiles`.
 pub fn supportsProfile(entry: CatalogEntry, profile: []const u8) bool {
     for (entry.tested_profiles) |tested| {
         if (std.mem.eql(u8, tested, profile)) return true;
@@ -294,7 +308,12 @@ pub fn requiresOffloadToFit(entry: CatalogEntry, vram_budget_bytes: u64) bool {
     return fitState(entry, vram_budget_bytes) == .fits_with_offload;
 }
 
-/// Return whether the model is both tested on the given profile and fits in VRAM.
+/// Return whether the model is both tested on the given profile and fits in VRAM
+/// without MoE offload. Equivalent to `supportsProfile and fitsGpu`.
+/// @param entry Catalog entry to evaluate.
+/// @param profile Detected GPU profile string (e.g. from `profileForGpu`).
+/// @param vram_budget_bytes Available VRAM budget in bytes.
+/// @returns true only when both conditions hold; does not consider offload.
 pub fn supportedOnCurrentGpu(entry: CatalogEntry, profile: []const u8, vram_budget_bytes: u64) bool {
     return supportsProfile(entry, profile) and fitsGpu(entry, vram_budget_bytes);
 }
@@ -302,6 +321,10 @@ pub fn supportedOnCurrentGpu(entry: CatalogEntry, profile: []const u8, vram_budg
 /// Map a catalog family string to the GGUF architecture string that models in
 /// that family use. Returns null for unrecognized families — the caller should
 /// treat that as an error (a catalog entry with no known architecture mapping).
+/// Note that `"qwen3.5"` and `"qwen3.6"` both map to `"qwen35"` because the
+/// GGUF file declares the SSM+attention hybrid architecture under that name.
+/// @param family Value of `CatalogEntry.family` (e.g. `"gemma4"`, `"qwen3.6"`).
+/// @returns GGUF architecture identifier, or null if the family is not recognized.
 pub fn ggufArchForFamily(family: []const u8) ?[]const u8 {
     const families = .{
         .{ "qwen3.6", "qwen35" },

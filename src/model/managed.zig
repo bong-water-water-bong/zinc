@@ -200,6 +200,10 @@ pub fn runtimePaths(allocator: std.mem.Allocator) !RuntimePaths {
 }
 
 /// Returns the absolute path to the installed GGUF file for the given model id.
+///
+/// @param model_id Catalog model identifier (e.g. `"qwen3-2b"`).
+/// @param allocator Used to build the path; caller owns the returned slice.
+/// @returns Heap-allocated absolute path `<cache_root>/models/<model_id>/model.gguf`.
 pub fn resolveInstalledModelPath(model_id: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var paths = try runtimePaths(allocator);
     defer paths.deinit(allocator);
@@ -207,6 +211,10 @@ pub fn resolveInstalledModelPath(model_id: []const u8, allocator: std.mem.Alloca
 }
 
 /// Returns the absolute path to the manifest JSON for the given model id.
+///
+/// @param model_id Catalog model identifier.
+/// @param allocator Used to build the path; caller owns the returned slice.
+/// @returns Heap-allocated absolute path `<cache_root>/models/<model_id>/manifest.json`.
 pub fn resolveManifestPath(model_id: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var paths = try runtimePaths(allocator);
     defer paths.deinit(allocator);
@@ -221,6 +229,10 @@ pub fn resolveActiveConfigPath(allocator: std.mem.Allocator) ![]u8 {
 }
 
 /// Returns the absolute path to the cached GPU profile JSON for the given device index.
+///
+/// @param device_index Zero-based index of the GPU device; encoded in the filename.
+/// @param allocator Used to build the path; caller owns the returned slice.
+/// @returns Heap-allocated absolute path `<config_root>/gpu-profile-device-<device_index>.json`.
 pub fn resolveGpuProfileCachePath(device_index: u32, allocator: std.mem.Allocator) ![]u8 {
     const root = try resolveConfigRoot(allocator);
     defer allocator.free(root);
@@ -332,6 +344,13 @@ pub fn readCachedGpuProfile(device_index: u32, allocator: std.mem.Allocator) !?C
 }
 
 /// Persists a GPU capability profile to disk for the given device index.
+///
+/// Overwrites any existing cache file for that device.
+/// @param device_index Zero-based GPU index; used to derive the cache file name.
+/// @param profile Opaque profile string (e.g. `"rdna4"`) returned by the diagnostics layer.
+/// @param device_name Human-readable device name stored for informational display.
+/// @param vram_budget_bytes Effective VRAM budget in bytes for this device.
+/// @param allocator Used only for path construction; nothing is retained after the call.
 pub fn writeCachedGpuProfile(
     device_index: u32,
     profile: []const u8,
@@ -362,8 +381,16 @@ pub fn writeCachedGpuProfile(
     try writer.interface.flush();
 }
 
-/// Checks whether a catalog model fits in the given VRAM budget, using the
-/// installed manifest when available or falling back to catalog estimates.
+/// Returns a VRAM fit assessment for a catalog model against the given budget.
+///
+/// If the model is installed, the on-disk manifest is consulted first (most
+/// accurate); if the manifest lacks VRAM fields, the installed GGUF is
+/// inspected directly and the manifest is updated. For models that are not yet
+/// installed, catalog static estimates are used and `ModelFit.exact` is false.
+/// @param entry Catalog entry describing the model to assess.
+/// @param vram_budget_bytes Available VRAM in bytes on the target device.
+/// @param allocator Used for path resolution and manifest I/O; nothing is retained.
+/// @returns `ModelFit` with exact=true when the installed file was inspected, false for catalog estimates.
 pub fn describeFit(entry: catalog.CatalogEntry, vram_budget_bytes: u64, allocator: std.mem.Allocator) !ModelFit {
     if (isInstalled(entry.id, allocator)) {
         const installed_path = try resolveInstalledModelPath(entry.id, allocator);
@@ -421,7 +448,14 @@ fn makeModelFit(required: u64, offloadable: u64, with_offload: u64, budget: u64,
     };
 }
 
-/// Verifies that the active model is installed and fits in the given VRAM budget.
+/// Verifies that the named model is installed and fits in the given VRAM budget.
+///
+/// Returns `error.UnknownManagedModel` if `model_id` is not in the catalog, or
+/// `error.ModelNotInstalled` if the GGUF file is absent from the local cache.
+/// @param model_id Catalog model identifier to check.
+/// @param vram_budget_bytes Available VRAM in bytes on the target device.
+/// @param allocator Forwarded to `describeFit` for path and manifest I/O.
+/// @returns `ModelFit` describing the exact VRAM requirement and fit state.
 pub fn verifyActiveSelectionFits(model_id: []const u8, vram_budget_bytes: u64, allocator: std.mem.Allocator) !ModelFit {
     const entry = catalog.find(model_id) orelse return error.UnknownManagedModel;
     if (!isInstalled(model_id, allocator)) return error.ModelNotInstalled;
@@ -446,6 +480,14 @@ pub fn pullModel(entry: catalog.CatalogEntry, allocator: std.mem.Allocator, writ
 }
 
 /// Downloads and installs a model, reporting progress via an optional observer.
+///
+/// If the model is already installed and its sha256 matches the catalog, the
+/// function returns immediately without re-downloading. A `.partial` staging
+/// file is used so an interrupted download does not corrupt the cache.
+/// @param entry Catalog entry that supplies the download URL and expected sha256.
+/// @param allocator Used for HTTP client, path construction, and temporary buffers.
+/// @param writer Receives human-readable status lines and the download progress bar.
+/// @param observer Optional lifecycle callbacks for programmatic progress tracking; pass null to skip.
 pub fn pullModelWithObserver(
     entry: catalog.CatalogEntry,
     allocator: std.mem.Allocator,

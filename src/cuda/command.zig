@@ -14,8 +14,16 @@ pub const CudaCommand = struct {
     handle: ?*shim.CudaCmd,
     dispatch_count: u32 = 0,
 
-    /// Launch a kernel: bound `bufs` become the leading device-pointer args,
+    /// Launch a kernel on this command's stream.
+    /// Bound `bufs` become the leading device-pointer args (capped at 32);
     /// `push_data` (push_size bytes) is the trailing by-value push-constant arg.
+    /// @param pipe     Compiled CUDA pipeline (kernel + argument layout) to execute.
+    /// @param grid     3-D grid dimensions in thread-blocks (x, y, z).
+    /// @param block    3-D thread-block dimensions (x, y, z).
+    /// @param bufs     Device buffers passed as pointer args before the push constant.
+    /// @param push_data Pointer to the push-constant struct, or null if unused.
+    /// @param push_size Byte size of the push-constant struct.
+    /// @param shared_bytes Dynamic shared memory in bytes to allocate per block.
     pub fn dispatch(
         self: *CudaCommand,
         pipe: *const CudaPipeline,
@@ -77,7 +85,9 @@ pub const CudaCommand = struct {
         }
     }
 
-    /// Release a command already known complete via a later queue-ordered wait.
+    /// Release a command whose completion is guaranteed by a later queue-ordered
+    /// synchronization (e.g. the caller waited on a subsequent command in the
+    /// same stream).  Frees the shim handle without issuing another wait.
     pub fn releaseCompleted(self: *CudaCommand) void {
         if (self.handle) |h| {
             shim.cuda_release_completed(h);
@@ -87,6 +97,10 @@ pub const CudaCommand = struct {
 };
 
 /// Begin a new command (stream batch + completion event) on the given context.
+/// @param ctx    Active CUDA context that owns the stream; must not be null.
+/// @returns      A fresh `CudaCommand` ready for kernel dispatches.
+/// @note         Returns `error.CudaCommandFailed` if the shim cannot allocate
+///               the underlying stream/event resources.
 pub fn beginCommand(ctx: ?*shim.CudaCtx) !CudaCommand {
     const handle = shim.cuda_begin_command(ctx);
     if (handle == null) return error.CudaCommandFailed;

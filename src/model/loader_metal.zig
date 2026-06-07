@@ -76,9 +76,12 @@ pub const Model = struct {
     }
 };
 
-/// Bytes of model weights resident as Metal resources. Copied tensor arenas
-/// replace their mmap-backed tensors in the GPU-visible working set, so this
-/// intentionally does not double-count aliases into those arenas.
+/// Returns the total byte count of model weights that are resident as Metal resources.
+/// Copied tensor arenas replace their mmap-backed tensors in the GPU-visible working
+/// set, so arena bytes are counted once and aliased per-tensor handles are skipped to
+/// avoid double-counting.
+/// @param model The loaded model whose resident weight size to measure.
+/// @returns Total bytes across all Metal-resident weight buffers (arenas + owned tensors).
 pub fn residentWeightBytes(model: *const Model) u64 {
     var total: u64 = 0;
     for (model.tensor_arenas.items) |arena| {
@@ -429,7 +432,11 @@ fn planCopiedTensorArenas(
     return arena_sizes;
 }
 
-/// Inspect a GGUF file and extract only the model configuration (no GPU operations).
+/// Parse a GGUF file's metadata and return the derived `ModelConfig` without touching the GPU.
+/// The file is memory-mapped and unmapped before returning; no Metal resources are created.
+/// @param path Filesystem path to the `.gguf` model file.
+/// @param allocator Allocator used for GGUF metadata parsing (freed before return).
+/// @returns Parsed `ModelConfig` or an error if the file cannot be opened or parsed.
 pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfig {
     const file = try std.fs.cwd().openFile(path, .{});
     defer {
@@ -454,7 +461,12 @@ pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfi
     return extractConfigWithLogging(&gf, false);
 }
 
-/// Inspect a GGUF file and return exact tensor upload bytes plus normalized config.
+/// Parse a GGUF file and return a `ModelInspection` with size statistics and the derived config.
+/// Computes the total raw byte size of all tensor payloads stored in the file. No GPU
+/// resources are created; the file mapping is released before returning.
+/// @param path Filesystem path to the `.gguf` model file.
+/// @param allocator Allocator used for GGUF metadata parsing (freed before return).
+/// @returns `ModelInspection` containing file size, tensor byte count, and `ModelConfig`.
 pub fn inspectModel(path: []const u8, allocator: std.mem.Allocator) !ModelInspection {
     const file = try std.fs.cwd().openFile(path, .{});
     defer {
@@ -492,7 +504,17 @@ pub fn inspectModel(path: []const u8, allocator: std.mem.Allocator) !ModelInspec
     };
 }
 
-/// Load a GGUF model with zero-copy Metal buffers wrapping mmap'd tensor data.
+/// Load a GGUF model file and return a `Model` backed by zero-copy Metal buffers.
+/// Each tensor's data is wrapped in a `newBufferWithBytesNoCopy` Metal buffer over
+/// the mmap'd file region. For model architectures that benefit from it (e.g. dense
+/// Gemma layers), select tensors are copied into pre-allocated Metal arenas to avoid
+/// UMA pressure from mixed mmap/Metal page-fault patterns. All weight buffers are
+/// registered with an `MTLResidencySet` on macOS 15+ to prevent paging between layers.
+/// @param path Filesystem path to the `.gguf` model file.
+/// @param metal_ctx Active Metal context used to create and wrap GPU buffers; must be non-null.
+/// @param allocator Allocator for tensor and arena bookkeeping (retained in the returned `Model`).
+/// @returns Initialized `Model` or an error if the file cannot be mapped, parsed, or lacks a
+///          supported architecture (qwen2, qwen2_moe, qwen35, mistral, mamba, jamba).
 pub fn load(
     path: []const u8,
     metal_ctx: ?*shim.MetalCtx,

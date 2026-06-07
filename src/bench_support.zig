@@ -6,30 +6,39 @@
 //! @section Inference Runtime
 const std = @import("std");
 
-/// Metal device module re-export used by benchmark binaries.
+/// Metal device enumeration and selection (MTLDevice wrappers).
 pub const metal_device = @import("metal/device.zig");
-/// Metal loader module re-export used by benchmark binaries.
+/// Model loader that maps GGUF weights onto Metal buffers.
 pub const metal_loader = @import("model/loader_metal.zig");
-/// Metal buffer helper re-export used by benchmark binaries.
+/// Metal buffer allocation and management utilities.
 pub const metal_buffer = @import("metal/buffer.zig");
-/// Metal command helper re-export used by benchmark binaries.
+/// Metal command queue and command buffer submission helpers.
 pub const metal_command = @import("metal/command.zig");
-/// Per-kernel Metal dispatch timing probe re-export used by benchmark binaries.
+/// Per-kernel Metal dispatch timing probe for profiling individual GPU kernels.
 pub const kernel_timing = @import("metal/kernel_timing.zig");
-/// Metal pipeline helper re-export used by benchmark binaries.
+/// Metal compute pipeline state cache and compilation helpers.
 pub const metal_pipeline = @import("metal/pipeline.zig");
-/// Raw Metal shim re-export used by benchmark binaries.
+/// Raw Objective-C/Metal C shim types and bindings.
 pub const metal_c = @import("metal/c.zig");
-/// GGUF parser re-export used by benchmark binaries.
+/// GGUF file parser for reading quantized model weights and metadata.
 pub const gguf = @import("model/gguf.zig");
-/// Tokenizer module re-export used by benchmark binaries.
+/// Tokenizer (BPE/SPM) encode and decode for text pre/post-processing.
 pub const tokenizer_mod = @import("model/tokenizer.zig");
-/// Metal inference runtime re-export used by benchmark binaries.
+/// Metal forward-pass runtime that runs the full model inference graph.
 pub const forward_metal = @import("compute/forward_metal.zig");
-/// Cross-process GPU lock helper re-export used by benchmark binaries.
+/// Cross-process GPU ownership lock preventing two zinc processes from sharing a GPU.
 pub const process_lock = @import("gpu/process_lock.zig");
 
 /// Log a user-facing GPU-process-lock error and terminate the benchmark binary.
+///
+/// Prints a human-readable message to stderr explaining why the lock could not
+/// be acquired, then calls `std.process.exit(1)`.
+///
+/// @param err         The lock-acquisition error; `error.GpuAlreadyReserved` gets a
+///                    dedicated "stop the other instance" message; all other errors
+///                    fall back to a generic failure message.
+/// @param backend     The GPU backend whose lock failed (used in the log message).
+/// @param device_index Index of the GPU device that could not be locked (used in the log message).
 pub fn reportGpuProcessLockError(err: anyerror, backend: process_lock.Backend, device_index: u32) noreturn {
     switch (err) {
         error.GpuAlreadyReserved => std.log.err(

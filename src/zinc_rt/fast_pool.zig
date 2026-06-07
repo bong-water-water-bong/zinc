@@ -116,9 +116,12 @@ pub const FastPool = struct {
         self.n_workers = 0;
     }
 
-    /// Run `tasks[0]` on the calling thread and post `tasks[1..]` to workers.
-    /// Returns when every task has completed.
-    /// Caller guarantees `tasks.len <= n_workers + 1`.
+    /// Post `tasks[1..]` to worker slots and run `tasks[0]` on the calling thread.
+    /// Spins on each worker's done-sequence until all tasks have completed, then returns.
+    /// @param tasks Slice of tasks to execute. `tasks[0]` runs on the caller;
+    /// `tasks[1..n]` are posted to workers 0..n-1 via atomic slot writes.
+    /// @note `tasks.len` must be `<= n_workers + 1`; the assertion is a hard
+    /// assert, not a returned error. Passing an empty slice is a no-op.
     pub fn dispatchAndRun(self: *Self, tasks: []const Task) void {
         if (tasks.len == 0) return;
         if (tasks.len == 1) {
@@ -165,7 +168,9 @@ pub const FastPool = struct {
         }
     }
 
-    /// Effective parallelism for the work-split scheduler (workers + main).
+    /// Return the total number of execution contexts available: worker threads plus the calling thread.
+    /// Use this value to size task arrays passed to `dispatchAndRun`.
+    /// @returns `n_workers + 1`.
     pub fn executorCount(self: *const Self) usize {
         return self.n_workers + 1;
     }

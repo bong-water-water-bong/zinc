@@ -259,11 +259,12 @@ pub const CommandBuffer = struct {
     /// @param self Command buffer currently being recorded.
     /// @param pipeline Compute pipeline whose set-0 layout was created for push descriptors.
     /// @param push_desc_fn Loaded `vkCmdPushDescriptorSetKHR` function pointer.
-    /// @param buffer_infos Storage-buffer bindings to push into set `0`.
-    /// @param push_data Raw bytes copied into the pipeline's push-constant range at offset `0`.
+    /// @param buffer_infos Storage-buffer bindings to push into set `0`; at most 8 entries.
+    /// @param push_data Raw bytes copied into the pipeline's push-constant range at offset `0`; may be empty.
     /// @param group_count_x Workgroup count in the X dimension.
     /// @param group_count_y Workgroup count in the Y dimension.
     /// @param group_count_z Workgroup count in the Z dimension.
+    /// @note Asserts that `push_desc_fn` is non-null and `buffer_infos.len <= 8`.
     pub fn pushDescAndDispatch(
         self: *CommandBuffer,
         pipeline: *const Pipeline,
@@ -319,8 +320,16 @@ pub const CommandBuffer = struct {
         vk.c.vkCmdDispatch(self.handle, group_count_x, group_count_y, group_count_z);
     }
 
-    /// Record a push-descriptor compute dispatch whose group counts are read
-    /// from a device buffer containing a VkDispatchIndirectCommand.
+    /// Record a push-descriptor compute dispatch whose group counts are read from a device buffer.
+    /// The indirect buffer must contain a `VkDispatchIndirectCommand` at the given byte offset.
+    /// @param self Command buffer currently being recorded.
+    /// @param pipeline Compute pipeline whose set-0 layout was created for push descriptors.
+    /// @param push_desc_fn Loaded `vkCmdPushDescriptorSetKHR` function pointer.
+    /// @param buffer_infos Storage-buffer bindings to push into set `0`; at most 8 entries.
+    /// @param push_data Raw bytes copied into the pipeline's push-constant range at offset `0`; may be empty.
+    /// @param indirect_buffer Device buffer containing the `VkDispatchIndirectCommand` group counts.
+    /// @param indirect_offset Byte offset into `indirect_buffer` where the command struct begins.
+    /// @note Asserts that `push_desc_fn` is non-null and `buffer_infos.len <= 8`.
     pub fn pushDescAndDispatchIndirect(
         self: *CommandBuffer,
         pipeline: *const Pipeline,

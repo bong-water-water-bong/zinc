@@ -56,7 +56,7 @@ const Graph = graph_mod.Graph;
 
 const log = std.log.scoped(.zinc);
 
-/// Global flag enabling verbose debug log output when `--debug` is passed.
+/// Global flag enabling verbose debug log output when `--debug` is passed or the `ZINC_DEBUG` env var is set.
 pub var is_debug_mode: bool = false;
 
 /// Zig standard library options — sets log level to debug and wires the custom log function.
@@ -66,6 +66,10 @@ pub const std_options = std.Options{
 };
 
 /// Custom log handler that filters debug messages unless `is_debug_mode` is set.
+/// @param level Severity level; debug messages are suppressed when `is_debug_mode` is false.
+/// @param scope Call-site scope tag; displayed as `(<scope>):` or `: ` for the default scope.
+/// @param format Comptime format string passed through to `std.debug.print`.
+/// @param args Runtime arguments matched to `format`.
 pub fn myLogFn(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.enum_literal),
@@ -155,6 +159,7 @@ pub const Config = struct {
     chat: bool = false,
     /// Keep CLI prompt as a raw completion even for chat-first templates.
     raw_prompt: bool = false,
+    /// KV-cache quantization bit-width: 0 disables TurboQuant, 2/3/4 select the quant level.
     kv_quant: u8 = 0, // 0=disabled, 2/3/4=TurboQuant bits
     /// Graph JSON report path.
     graph_report_path: ?[]const u8 = null,
@@ -1084,7 +1089,7 @@ fn writeJsonString(w: anytype, s: []const u8) !void {
 }
 
 /// Output the full catalog as pretty-printed JSON.
-/// When `support` is null, GPU detection was unavailable and fit fields are omitted.
+/// When `support` is null, GPU detection was unavailable; `fits_gpu` is null and `requires_offload_to_fit` is false.
 fn printManagedModelListJson(
     w: anytype,
     active_model_id: ?[]const u8,
@@ -1590,8 +1595,10 @@ fn writeDecodeGraphArtifacts(
     }
 }
 
-/// Start the ZINC process in prompt mode or server mode.
-/// @note Fatal startup errors are logged and terminate the process rather than bubbling to the caller.
+/// Parse arguments, dispatch model-management commands, run diagnostics, or start inference.
+/// In prompt mode the engine runs up to `max_tokens` forward passes and prints the decoded output.
+/// In server mode an HTTP listener is started and requests are handled until SIGINT/SIGTERM.
+/// @note Fatal startup errors are logged and the process exits rather than returning an error.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

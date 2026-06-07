@@ -176,6 +176,13 @@ pub fn buildDecodeGraph(config: *const ModelConfig, allocator: std.mem.Allocator
 }
 
 /// Build a compute graph with per-op weight-size annotations derived from a GGUF file.
+/// Dispatches to the appropriate architecture-specific builder based on `config.architecture`.
+/// @param config Normalized model dimensions and architecture metadata.
+/// @param allocator Allocator used for graph storage.
+/// @param gf Optional parsed GGUF file; when non-null, actual tensor byte sizes are read
+///           from it instead of using float-size approximations.
+/// @returns A Graph describing the decode-time op order for the selected architecture.
+/// @note Returns `error.UnsupportedArchitecture` if `config.architecture` is `.unknown`.
 pub fn buildDecodeGraphDetailed(config: *const ModelConfig, allocator: std.mem.Allocator, gf: ?*const gguf.GGUFFile) !Graph {
     return switch (config.architecture) {
         .mistral, .qwen2 => try buildLlamaDecodeGraph(config, allocator, gf),
@@ -367,7 +374,7 @@ fn buildLlamaDecodeGraph(config: *const ModelConfig, allocator: std.mem.Allocato
     return g;
 }
 
-/// MoE transformer decode graph (Qwen2-MoE).
+/// MoE transformer decode graph (Qwen2-MoE / gpt_oss).
 /// Same as LLaMA but FFN is replaced with expert routing + sparse expert matmuls.
 fn buildMoeDecodeGraph(config: *const ModelConfig, allocator: std.mem.Allocator, gf: ?*const gguf.GGUFFile) !Graph {
     var g = Graph.init(allocator, "moe_decode");

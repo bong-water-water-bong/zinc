@@ -455,6 +455,15 @@ pub fn dotQ8_0Row(raw_data: []const u8, row_index: u32, cols: u32, input: []cons
     return dotQ8_0RowUnchecked(raw_data, row_index, cols, input);
 }
 
+/// Dot one Q8_0-packed row against an f32 input vector without bounds checks.
+/// Callers must have already validated `cols % 32 == 0`, `input.len >= cols`, and
+/// that `raw_data` is long enough.  Uses a 16-wide vectorized inner loop with four
+/// independent accumulators over a 2-block unroll to keep the FP-add chain short.
+/// @param raw_data Raw Q8_0 tensor bytes (34 bytes per 32-element block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a pre-validated multiple of 32.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product (no error path).
 pub inline fn dotQ8_0RowUnchecked(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) f32 {
     // 16-wide inner loop (AVX-512 zmm), four independent accumulators driven by a
     // 2-block unroll. Q8_0's per-element work is tiny next to the weight stream,
@@ -525,6 +534,17 @@ pub fn dotQ4_0Row(raw_data: []const u8, row_index: u32, cols: u32, input: []cons
     return dotQ4_0RowUnchecked(raw_data, row_index, cols, input);
 }
 
+/// Dot one Q4_0-packed row against an f32 input vector without bounds checks.
+/// Callers must have already validated `cols % 32 == 0`, `input.len >= cols`, and
+/// that `raw_data` is long enough.  Uses a 16-wide vectorized inner loop with eight
+/// independent accumulators over a 4-block unroll to break the FP-add dependency chain.
+/// Nibbles are recentered to the signed [-8, 7] range before the FP scale to collapse
+/// the constant bias term out of the inner FMA.
+/// @param raw_data Raw Q4_0 tensor bytes (18 bytes per 32-element block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a pre-validated multiple of 32.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product (no error path).
 pub inline fn dotQ4_0RowUnchecked(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) f32 {
     // 16-wide inner loop (AVX-512 zmm) with eight independent accumulators driven
     // by a 4-block unroll, mirroring dotQ8_0Row. Q4_0's per-element work (nibble
@@ -647,6 +667,18 @@ pub inline fn dotQ4_0RowUnchecked(raw_data: []const u8, row_index: u32, cols: u3
     return @reduce(.Add, ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7)));
 }
 
+/// Dot one Q4_0-packed row against an f32 input vector using precomputed 32-element
+/// block sums to accelerate the zero-point bias subtraction.
+/// The Q4_0 zero-point correction is `-8 * d * sum(x_block)`; passing precomputed
+/// block sums from `fillInputSum32` moves that reduction out of the inner loop.
+/// Callers must have already validated sizes.  All other behavior matches
+/// `dotQ4_0RowUnchecked`.
+/// @param raw_data Raw Q4_0 tensor bytes (18 bytes per 32-element block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a pre-validated multiple of 32.
+/// @param input f32 input vector of length `>= cols`.
+/// @param input_sum32 Per-32-element block sums of `input`, as produced by `fillInputSum32`.
+/// @returns The f32 dot product (no error path).
 pub inline fn dotQ4_0RowWithSum32Unchecked(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32, input_sum32: []const f32) f32 {
     const Vec16f = @Vector(16, f32);
     const Vec16u8 = @Vector(16, u8);
@@ -758,10 +790,14 @@ pub inline fn dotQ4_0RowWithSum32Unchecked(raw_data: []const u8, row_index: u32,
     return @reduce(.Add, ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))) - 8.0 * zero_bias;
 }
 
-/// Quantize one row of f32 weights into the GGML `Q4_0` block layout (32 weights
-/// per block: one f16 scale + 16 packed nibble pairs). Mirrors llama.cpp's
-/// `quantize_row_q4_0_ref`. `dst.len` must be at least `(src.len / 32) * 18` and
-/// `src.len` must be a multiple of 32.
+/// Quantize one row of f32 weights into the GGML `Q4_0` block layout.
+/// Each 32-element block is stored as one f16 scale followed by 16 packed nibble
+/// pairs (low nibble = first weight, high nibble = second weight), where each nibble
+/// encodes a value in [0, 15] representing the original weight offset by +8.
+/// Mirrors llama.cpp's `quantize_row_q4_0_ref`.
+/// @param src Source f32 values; length must be a positive multiple of 32.
+/// @param dst Destination byte buffer; must be at least `(src.len / 32) * 18` bytes.
+/// @note Asserts (debug builds only) that alignment and size preconditions hold.
 pub fn quantizeRowToQ4_0(src: []const f32, dst: []u8) void {
     const block_size: usize = 32;
     const bpb: usize = 18;
@@ -794,10 +830,13 @@ pub fn quantizeRowToQ4_0(src: []const f32, dst: []u8) void {
     }
 }
 
-/// Quantize one row of f32 weights into the GGML `Q8_0` block layout (32 weights
-/// per block: one f16 scale + 32 int8s). Mirrors llama.cpp's
-/// `quantize_row_q8_0_ref`. `dst.len` must be at least `(src.len / 32) * 34` and
-/// `src.len` must be a multiple of 32.
+/// Quantize one row of f32 weights into the GGML `Q8_0` block layout.
+/// Each 32-element block is stored as one f16 scale followed by 32 signed int8
+/// values clamped to [-127, 127]; the scale is `max(|w|) / 127`.
+/// Mirrors llama.cpp's `quantize_row_q8_0_ref`.
+/// @param src Source f32 values; length must be a positive multiple of 32.
+/// @param dst Destination byte buffer; must be at least `(src.len / 32) * 34` bytes.
+/// @note Asserts (debug builds only) that alignment and size preconditions hold.
 pub fn quantizeRowToQ8_0(src: []const f32, dst: []u8) void {
     const block_size: usize = 32;
     const bpb: usize = 34;
@@ -844,6 +883,17 @@ pub fn dotQ4KRow(raw_data: []const u8, row_index: u32, cols: u32, input: []const
     return dotQ4KRowUnchecked(raw_data, row_index, cols, input);
 }
 
+/// Dot one Q4_K-packed row against an f32 input vector without bounds checks.
+/// Callers must have already validated `cols % 256 == 0`, `input.len >= cols`, and
+/// that `raw_data` is long enough.  Iterates over 256-element super-blocks; for each
+/// super-block reads the block-level f16 `d`/`dmin` pair and 12 bytes of packed 6-bit
+/// sub-scales/mins, then processes four pairs of 32-element chunks with four independent
+/// vector accumulators to keep the FP-add chain short.
+/// @param raw_data Raw Q4_K tensor bytes (144 bytes per 256-element super-block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a pre-validated multiple of 256.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product (no error path).
 pub inline fn dotQ4KRowUnchecked(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) f32 {
     // 16-wide so the inner dequant/dot loop maps onto AVX-512 (zmm) on
     // capable CPUs; falls back to 2x256-bit on AVX2-only hosts.
@@ -932,6 +982,17 @@ pub fn fillInputSum32(input: []const f32, sums: []f32) void {
     }
 }
 
+/// Dot one Q4_K-packed row against an f32 input vector using precomputed 32-element
+/// block sums to hoist the asymmetric min subtraction out of the inner loop.
+/// The Q4_K correction term `-dmin * m * sum(x_block)` is accumulated from the
+/// `input_sum32` array (filled by `fillInputSum32`) rather than being recomputed
+/// per weight, reducing inner-loop FMA count.  Callers must have already validated sizes.
+/// @param raw_data Raw Q4_K tensor bytes (144 bytes per 256-element super-block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a pre-validated multiple of 256.
+/// @param input f32 input vector of length `>= cols`.
+/// @param input_sum32 Per-32-element block sums of `input`, as produced by `fillInputSum32`.
+/// @returns The f32 dot product (no error path).
 pub inline fn dotQ4KRowWithSum32Unchecked(
     raw_data: []const u8,
     row_index: u32,
@@ -1018,6 +1079,17 @@ pub fn dotQ5KRow(raw_data: []const u8, row_index: u32, cols: u32, input: []const
     return dotQ5KRowUnchecked(raw_data, row_index, cols, input);
 }
 
+/// Dot one Q5_K-packed row against an f32 input vector without bounds checks.
+/// Callers must have already validated `cols % 256 == 0`, `input.len >= cols`, and
+/// that `raw_data` is long enough.  Layout matches Q4_K super-blocks but with an
+/// additional 32-byte high-bit plane (one bit per weight) that provides the 5th bit;
+/// the plane is merged with the 4-bit base to produce 5-bit unsigned weights before
+/// applying the sub-scale and min.
+/// @param raw_data Raw Q5_K tensor bytes (176 bytes per 256-element super-block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a pre-validated multiple of 256.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product (no error path).
 pub inline fn dotQ5KRowUnchecked(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) f32 {
     // 16-wide inner loop: AVX-512 (zmm) on capable CPUs, 2x256-bit otherwise.
     const Vec16f = @Vector(16, f32);
@@ -1087,6 +1159,17 @@ pub inline fn dotQ5KRowUnchecked(raw_data: []const u8, row_index: u32, cols: u32
     return @reduce(.Add, (acc_lo0 + acc_hi0) + (acc_lo1 + acc_hi1));
 }
 
+/// Dot one Q5_K-packed row against an f32 input vector using precomputed 32-element
+/// block sums to hoist the asymmetric min subtraction out of the inner loop.
+/// Combines the Q5_K high-bit merge from `dotQ5KRowUnchecked` with the precomputed
+/// min-correction strategy from `dotQ4KRowWithSum32Unchecked`.  Callers must have
+/// already validated sizes.
+/// @param raw_data Raw Q5_K tensor bytes (176 bytes per 256-element super-block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a pre-validated multiple of 256.
+/// @param input f32 input vector of length `>= cols`.
+/// @param input_sum32 Per-32-element block sums of `input`, as produced by `fillInputSum32`.
+/// @returns The f32 dot product (no error path).
 pub inline fn dotQ5KRowWithSum32Unchecked(
     raw_data: []const u8,
     row_index: u32,
@@ -1177,6 +1260,16 @@ pub fn dotQ6KRow(raw_data: []const u8, row_index: u32, cols: u32, input: []const
     return dotQ6KRowUnchecked(raw_data, row_index, cols, input);
 }
 
+/// Dot one Q6_K-packed row against an f32 input vector without bounds checks.
+/// Callers must have already validated `cols % 256 == 0`, `input.len >= cols`, and
+/// that `raw_data` is long enough.  Each 256-element super-block is decoded by
+/// combining a 128-byte low-nibble plane, a 64-byte 2-bit high plane, and 8 signed
+/// int8 per-32 sub-scales; weights are recentered by subtracting 32 before scaling.
+/// @param raw_data Raw Q6_K tensor bytes (210 bytes per 256-element super-block).
+/// @param row_index Zero-based row to dot.
+/// @param cols Number of columns; must be a pre-validated multiple of 256.
+/// @param input f32 input vector of length `>= cols`.
+/// @returns The f32 dot product (no error path).
 pub inline fn dotQ6KRowUnchecked(raw_data: []const u8, row_index: u32, cols: u32, input: []const f32) f32 {
     // 16-wide inner loop: AVX-512 (zmm) on capable CPUs, 2x256-bit otherwise.
     const Vec16f = @Vector(16, f32);

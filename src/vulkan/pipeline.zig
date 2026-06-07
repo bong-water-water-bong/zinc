@@ -36,9 +36,9 @@ pub const Pipeline = struct {
 
 /// Specialization constant entry for compute pipelines.
 pub const SpecConst = struct {
-    /// Unique identifier.
+    /// Constant ID as declared in the SPIR-V shader via `layout(constant_id = N)`.
     id: u32,
-    /// Integer value.
+    /// 32-bit unsigned value injected for this constant at pipeline creation time.
     value: u32,
 };
 
@@ -79,7 +79,19 @@ pub fn createFromSpirv(
     );
 }
 
-/// Create a compute pipeline from a SPIR-V file with optional subgroup controls.
+/// Create a compute pipeline from a SPIR-V file with optional subgroup and push-descriptor controls.
+/// Reads the SPIR-V binary from disk, creates a shader module, builds a descriptor set layout
+/// (optionally flagged for push-descriptor recording), a pipeline layout with push constants,
+/// and a compute pipeline with specialization constants applied. Subgroup-size and
+/// full-subgroup requirements are silently dropped when the device does not support them.
+/// @param instance Active Vulkan instance providing the logical device and capability info.
+/// @param spirv_path Filesystem path to the compiled SPIR-V module.
+/// @param binding_count Number of storage-buffer descriptor bindings declared by the shader.
+/// @param push_constant_size Size of the push-constant block in bytes; pass 0 for none.
+/// @param spec_constants Specialization constants applied at pipeline creation time.
+/// @param options Optional subgroup and push-descriptor knobs; use `.{}` for defaults.
+/// @param allocator Allocator used for shader bytes and temporary Vulkan structs; freed before return.
+/// @returns A fully created `Pipeline` with all Vulkan objects owned by the caller.
 pub fn createFromSpirvWithOptions(
     instance: *const Instance,
     spirv_path: []const u8,

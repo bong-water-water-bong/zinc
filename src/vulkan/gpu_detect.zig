@@ -55,9 +55,9 @@ pub const GpuConfig = struct {
     max_workgroup_size: u32,
 
     // Derived tuning parameters
-    /// DMMV workgroup size.
+    /// Number of invocations per DMMV workgroup; set equal to `wave_size` at detection time.
     dmmv_workgroup_size: u32,
-    /// Rows per DMMV workgroup.
+    /// Number of output rows processed per DMMV workgroup; 2 for wave64 (AMD RDNA), 1 for wave32/wave16.
     dmmv_rows_per_workgroup: u32,
     /// Coop matrix tile height.
     matmul_tile_m: u32,
@@ -66,14 +66,13 @@ pub const GpuConfig = struct {
     /// Flash attention block size.
     flash_attn_block_size: u32,
 
-    /// Return the active device name as a trimmed byte slice.
-    /// @returns The populated prefix of `device_name`.
+    /// Return the device name as a byte slice covering only the populated prefix.
+    /// @returns A slice of `device_name[0..device_name_len]`; no null terminator or padding included.
     pub fn nameSlice(self: *const GpuConfig) []const u8 {
         return self.device_name[0..self.device_name_len];
     }
 
-    /// Log the detected GPU properties and derived tuning parameters.
-    /// @param self Derived GPU configuration for the selected device.
+    /// Log the detected GPU name, vendor, memory, wave size, cooperative-matrix support, and all derived tuning parameters at info level.
     pub fn log_info(self: *const GpuConfig) void {
         log.info("GPU: {s}", .{self.nameSlice()});
         log.info("  Vendor: {s}", .{@tagName(self.vendor)});

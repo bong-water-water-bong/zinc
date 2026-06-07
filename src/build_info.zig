@@ -1,8 +1,8 @@
 //! Build metadata exported by `build.zig` for CLI version reporting.
+//! @section CLI & Entrypoints
 //!
 //! The values in this module are generated at compile time from build options
 //! such as `-Dversion` and `-Dcommit`, then printed by `zinc --version`.
-//! @section CLI & Entrypoints
 const std = @import("std");
 const build_options = @import("build_options");
 
@@ -21,7 +21,7 @@ pub const backend = build_options.backend;
 ///
 /// Emits the version, commit, target, optimize mode, and compiled-in backends,
 /// each on its own line.
-/// @param writer Any writer the multi-line metadata block is printed to.
+/// @param writer Destination writer that receives the formatted metadata block.
 /// @returns Propagates only the writer's own error if printing fails.
 pub fn writeVersion(writer: anytype) !void {
     try writer.print(

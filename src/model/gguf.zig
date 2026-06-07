@@ -192,17 +192,18 @@ pub const MetadataValue = union(enum) {
     }
 };
 
-/// Tensor descriptor read from the GGUF header.
+/// Tensor descriptor read from the GGUF header for a single named weight tensor.
 pub const TensorInfo = struct {
-    /// Name identifier.
+    /// Unique tensor name as stored in the GGUF header (e.g. `"token_embd.weight"`).
     name: []const u8,
-    /// Number of dimensions (1-4).
+    /// Number of active dimensions; only `dims[0..n_dims]` are meaningful.
     n_dims: u32,
-    /// Tensor dimensions.
+    /// Shape array (innermost-first); entries beyond `n_dims` are `1`.
     dims: [4]u64,
-    /// GGML quantization type.
+    /// GGML storage and quantization format for the tensor payload.
     type_: GGMLType,
-    offset: u64, // offset from start of tensor data section
+    /// Byte offset of the tensor payload relative to the start of the tensor data section.
+    offset: u64,
 
     /// Multiply the active tensor dimensions to get the logical element count.
     /// @param self Tensor descriptor to inspect.
@@ -229,18 +230,19 @@ pub const TensorInfo = struct {
     }
 };
 
-/// Parsed GGUF header state, metadata map, and tensor table.
+/// Fully decoded GGUF file: header fields, key-value metadata, and tensor descriptor table.
 pub const GGUFFile = struct {
-    /// GGUF container version.
+    /// GGUF container format version read from the file header.
     version: GGUFVersion,
-    /// Number of tensor descriptors.
+    /// Number of tensor descriptors declared in the GGUF header.
     tensor_count: u64,
-    /// Key-value metadata map.
+    /// Key-value metadata decoded from the GGUF header; keys and string values are heap-allocated.
     metadata: std.StringHashMapUnmanaged(MetadataValue),
-    /// Tensor descriptors.
+    /// Ordered list of tensor descriptors mirroring the GGUF tensor table.
     tensors: std.ArrayList(TensorInfo),
-    tensor_data_offset: u64, // file offset where tensor data begins
-    /// Allocator for owned resources.
+    /// Byte offset from the start of the mapped file where raw tensor data begins.
+    tensor_data_offset: u64,
+    /// Allocator that owns all heap memory in this struct; pass the same one to `deinit`.
     allocator: std.mem.Allocator,
 
     /// Release metadata keys, metadata payloads, and tensor names owned by the parsed file.
@@ -323,8 +325,10 @@ fn freeMetadataValue(allocator: std.mem.Allocator, val: MetadataValue) void {
     }
 }
 
-/// Optional flags that control GGUF parsing behavior (e.g. summary logging).
+/// Optional flags that control GGUF parsing behavior.
 pub const ParseOptions = struct {
+    /// When `true`, emit an `info`-level log line summarising the GGUF version,
+    /// tensor count, and metadata entry count after a successful header parse.
     log_summary: bool = true,
 };
 
@@ -337,6 +341,11 @@ pub fn parse(data: []const u8, allocator: std.mem.Allocator) !GGUFFile {
 }
 
 /// Parse a GGUF file from a byte slice with optional logging control.
+/// @param data Raw GGUF bytes, typically from a memory-mapped file; must remain valid for the lifetime of the returned `GGUFFile`.
+/// @param allocator Allocator used for metadata keys, string values, array payloads, and tensor name copies.
+/// @param options Flags controlling parse-time side effects such as summary logging.
+/// @returns A `GGUFFile` whose string data is heap-allocated; call `deinit` to free all owned memory.
+/// @note Returns `error.InvalidMagic` when the four-byte magic is wrong, or `error.UnknownMetadataType` for unrecognized type tags.
 pub fn parseWithOptions(data: []const u8, allocator: std.mem.Allocator, options: ParseOptions) !GGUFFile {
     var reader = Reader{ .data = data, .pos = 0 };
 

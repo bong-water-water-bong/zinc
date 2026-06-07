@@ -29,11 +29,13 @@ pub const Buffer = struct {
     /// @returns A Buffer with memory bound but not automatically mapped.
     /// @note Use `initStaging()` when you need an immediately mapped upload buffer.
     pub fn init(
-        /// Vulkan instance.
+        /// Active Vulkan instance providing the logical device and memory query helpers.
         instance: *const Instance,
-        /// Allocated size in bytes.
+        /// Number of bytes to allocate; passed verbatim to `VkBufferCreateInfo.size`.
         size: vk.c.VkDeviceSize,
+        /// Intended usage of the buffer (e.g. storage, transfer source/destination).
         usage: vk.c.VkBufferUsageFlags,
+        /// Required memory property flags used to select a compatible memory type.
         mem_properties: vk.c.VkMemoryPropertyFlags,
     ) !Buffer {
         const buf_info = vk.c.VkBufferCreateInfo{
@@ -162,18 +164,18 @@ pub const Buffer = struct {
         return buf;
     }
 
-    /// Copy raw bytes into a previously mapped staging buffer.
-    /// @param self Mapped staging buffer to write into.
+    /// Copy raw bytes into a previously mapped buffer (staging or host-visible storage).
+    /// @param self Buffer whose `mapped` pointer is non-null.
     /// @param data Bytes to copy from the CPU into the mapped range.
-    /// @note Debug assertions ensure the buffer is mapped and the write fits in the allocation.
+    /// @note Asserts at debug time that the buffer is mapped and `data` fits within the allocation.
     pub fn upload(self: *const Buffer, data: []const u8) void {
         std.debug.assert(self.mapped != null);
         std.debug.assert(data.len <= self.size);
         @memcpy(self.mapped.?[0..data.len], data);
     }
 
-    /// Destroy the Vulkan buffer, free memory, and unmap any mapped staging pointer.
-    /// @param self Buffer to tear down in place.
+    /// Destroy the Vulkan buffer, free device memory, and unmap any host-mapped pointer.
+    /// @param self Buffer to tear down; the struct is zeroed to `undefined` on return.
     pub fn deinit(self: *Buffer) void {
         if (self.mapped != null) {
             vk.c.vkUnmapMemory(self.device, self.memory);

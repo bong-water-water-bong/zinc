@@ -113,6 +113,8 @@ pub const SamplingParams = struct {
     top_k: u32 = 64,
 
     /// Return whether the current sampling settings require CPU-visible logits.
+    /// @returns `true` when temperature, top-p, or repetition-penalty are active
+    ///   (i.e. any path that needs more than just the argmax token index).
     pub fn requiresLogitsReadback(self: @This()) bool {
         return self.temperature > 0.0001 or self.top_p < 0.9999 or self.repetition_penalty > 1.0001;
     }
@@ -909,7 +911,10 @@ fn intelBatchedPrefillChunkLimit(vendor: GpuVendor) u32 {
 // Inference engine
 // ---------------------------------------------------------------------------
 
-/// Inference engine combining model, pipelines, and dispatch.
+/// Central inference engine that owns the GPU resources for one active model.
+/// Holds the loaded model, all Vulkan pipelines and intermediate activation buffers,
+/// KV-cache page pool, SSM recurrent state, and per-request profiling counters.
+/// One engine instance maps to one GPU device; it is not thread-safe.
 pub const InferenceEngine = struct {
     /// Loaded model.
     model: *Model,
@@ -5579,9 +5584,14 @@ pub const InferenceEngine = struct {
     // Decode step
     // -----------------------------------------------------------------------
 
-    /// Run a single decode step through all transformer layers.
+    /// Run a single decode step for one token through all transformer layers.
     /// embed → [per-layer: norm → QKV → RoPE → KV write → attention → O proj → residual
     ///          → FFN norm → MoE routing → expert DMMVs → residual] → final norm → LM head → logits
+    /// @param state Decode state carrying the current token position and generated token history.
+    /// @param token_id Vocabulary index of the token to embed and feed forward.
+    /// @param collect_output When `true`, the engine accumulates layer outputs needed by
+    ///   diagnostic or GPT-OSS embedding-collection paths.
+    /// @returns `error.ContextLengthExceeded` when `state.position` is at capacity.
     pub fn decodeStep(self: *InferenceEngine, state: *DecodeState, token_id: u32, collect_output: bool) !void {
         if (state.position >= self.max_context_tokens) {
             return error.ContextLengthExceeded;
@@ -19130,6 +19140,8 @@ pub const InferenceEngine = struct {
     /// env gate and the `canUseBatchedPrefillRdna` check are already wired so
     /// callers can migrate to the new name ahead of time — matching the Metal
     /// path where `generateWithMetrics` already routes through `prefillBatched`.
+    /// @param state Decode state for the current request.
+    /// @param prompt_tokens Tokenized prompt sequence to prefill.
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         const mode = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse "";
         const intel_batched_env = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL");
@@ -19587,8 +19599,12 @@ pub const InferenceEngine = struct {
         }
     }
 
-    /// Process all prompt tokens through the full transformer to populate
-    /// KV cache and SSM state. Each token runs through all 40 layers.
+    /// Process all prompt tokens sequentially (one token per GPU submission) to populate
+    /// KV cache and SSM state before the first decode step.
+    /// @param state Decode state; must start at position 0 for a fresh request or have
+    ///   an active KV-page allocation for continuation prefill.
+    /// @param prompt_tokens Tokenized input sequence to prefill. No-op when empty.
+    /// @note This is the per-token serial path. For the experimental batched variant see `prefillBatched`.
     pub fn prefillBatch(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
 
@@ -20237,6 +20253,7 @@ pub const InferenceEngine = struct {
     }
 
     /// Sample a token greedily. Uses GPU argmax when available, otherwise falls back to CPU scan.
+    /// @returns The vocabulary index of the highest-logit token.
     pub fn sampleGreedy(self: *const InferenceEngine) u32 {
         if (self.argmax.pipeline != null and self.argmax_descriptor_set != null) {
             const token_ptr: [*]const u32 = @ptrCast(@alignCast(self.argmax_result_staging.mapped.?));
@@ -20258,7 +20275,13 @@ pub const InferenceEngine = struct {
         return max_idx;
     }
 
-    /// Sample a token using either the GPU argmax fast path or host logits sampling.
+    /// Sample the next token using greedy argmax or stochastic sampling depending on `params`.
+    /// Delegates to `sampleGreedy` when no logit readback is needed; otherwise reads staged
+    /// logits from the host and applies temperature, top-p, top-k, and repetition penalty.
+    /// @param state Decode state supplying the generated-token history for repetition penalty.
+    /// @param params Sampling hyper-parameters controlling temperature and nucleus filtering.
+    /// @param random Random source for stochastic sampling; unused on the greedy path.
+    /// @returns The sampled vocabulary token index.
     pub fn sample(self: *const InferenceEngine, state: *const DecodeState, params: SamplingParams, random: std.Random) u32 {
         if (!params.requiresLogitsReadback()) return self.sampleGreedy();
 

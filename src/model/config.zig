@@ -6,6 +6,10 @@
 const std = @import("std");
 
 /// Supported model families inferred from GGUF architecture metadata.
+/// Multiple GGUF architecture strings may collapse to a single variant —
+/// for example `"llama"` maps to `.mistral` and `"qwen3"` maps to `.qwen2`
+/// because their forward-pass implementations are identical.
+/// `.unknown` is returned for any unrecognised string.
 pub const Architecture = enum {
     mistral,
     qwen2,
@@ -19,6 +23,10 @@ pub const Architecture = enum {
 };
 
 /// Normalized model dimensions and routing metadata extracted from GGUF fields.
+/// SSM-specific fields (`ssm_d_*`, `ssm_n_group`, `full_attn_interval`) default to
+/// zero and are only meaningful for Mamba/Jamba/Qwen3.5 hybrid architectures.
+/// RoPE section fields (`rope_sections`, `rope_attn_factor`, `rope_scaling_factor`,
+/// `rope_original_context`) are used only by the `qwen35` IMRoPE scheme.
 pub const ModelConfig = struct {
     architecture: Architecture,
     n_layers: u32,
@@ -51,7 +59,12 @@ pub const ModelConfig = struct {
     rope_sections: [4]u32 = .{ 0, 0, 0, 0 },
 };
 
-/// Parse architecture string from GGUF metadata.
+/// Map a GGUF `general.architecture` string to an `Architecture` variant.
+/// The mapping is many-to-one: architecturally equivalent families share a variant
+/// (e.g. `"llama"` → `.mistral`, `"qwen3"` → `.qwen2`), so callers must not
+/// assume the variant name matches the original GGUF string.
+/// @param arch_str The raw architecture string from GGUF metadata, e.g. `"qwen2"`.
+/// @returns The matching `Architecture` variant, or `.unknown` if unrecognised.
 pub fn parseArchitecture(arch_str: []const u8) Architecture {
     if (std.mem.eql(u8, arch_str, "mistral")) return .mistral;
     // LLaMA 2/3.x are architecturally identical to Mistral: dense attention,

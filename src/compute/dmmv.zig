@@ -560,10 +560,11 @@ pub const DmmvDispatch = struct {
 
     /// Create the DMMV dispatch wrapper and load the supported quantized pipelines.
     /// @param instance Active Vulkan instance and logical device.
-    /// @param gpu_config Derived GPU tuning parameters.
-    /// @param shader_dir Directory containing compiled SPIR-V shader binaries.
+    /// @param gpu_config Derived GPU tuning parameters (wave size, push-descriptor support).
+    /// @param shader_dir Directory containing compiled SPIR-V shader binaries (`.spv` files).
+    /// @param hidden_dim Maximum K value used by the Q4_K and F32 shaders' shared-memory array; must be >= hidden_dim, inter_dim, q_dim, and d_inner.
     /// @param allocator Allocator used for temporary pipeline creation state.
-    /// @returns A DmmvDispatch ready to record projection work.
+    /// @returns A fully-initialised DmmvDispatch ready to record projection work; missing shaders are silently set to null.
     pub fn init(
         /// Vulkan instance.
         instance: *const Instance,
@@ -1326,7 +1327,10 @@ pub const DmmvDispatch = struct {
         };
     }
 
-    /// Select the MoE quantization-specific pipeline (4 bindings: A, x, y, routing).
+    /// Select the MoE-specific pipeline for the given weight format (4 bindings: A, x, y, routing).
+    /// @param self Dispatch wrapper containing the loaded DMMV pipelines.
+    /// @param quant_type GGML quantization format for the MoE expert weight matrix.
+    /// @returns A pipeline pointer when a MoE shader is loaded for the format, or null for unsupported types.
     pub fn moePipelineForType(self: *const DmmvDispatch, quant_type: GGMLType) ?*const Pipeline {
         return switch (quant_type) {
             .q4_k => if (self.pipeline_q4k_moe) |*p| p else null,
@@ -1338,10 +1342,18 @@ pub const DmmvDispatch = struct {
         };
     }
 
-    /// Record a batched MoE DMMV dispatch — all experts run in parallel via Y workgroups.
-    /// expert_stride: bytes per expert in stacked weight tensor.
-    /// n_experts_y: number of experts to process (dispatched as Y workgroups).
-    /// x_expert_stride: elements between experts' inputs (0=shared input, K=per-expert).
+    /// Record a batched MoE DMMV dispatch where all experts run in parallel via Y workgroups.
+    /// @param cmd Command buffer to record into.
+    /// @param quant_type Weight quantization; resolved via `moePipelineForType`.
+    /// @param descriptor_set Descriptor set with bindings A, x, y, routing.
+    /// @param M Output rows (weight rows per expert).
+    /// @param K Contraction width (shared across all experts).
+    /// @param expert_stride Byte stride between consecutive experts in the stacked weight tensor.
+    /// @param n_experts_y Number of experts to process; becomes the Y workgroup dimension.
+    /// @param x_expert_stride Element stride between consecutive experts' input vectors (0 = shared input; K = per-expert).
+    /// @param x_offset Element offset into the input buffer.
+    /// @param y_offset Element offset into the output buffer.
+    /// @returns `error.UnsupportedQuantType` when no MoE pipeline is loaded for `quant_type`.
     pub fn recordMoeDispatch(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
@@ -1678,7 +1690,7 @@ pub const DmmvDispatch = struct {
     /// @param x_offset Byte offset for the input vector.
     /// @param y_offset Byte offset for the output vector.
     /// @returns `error.UnsupportedQuantType` when no pipeline is available for `quant_type`.
-    /// @note The helper uses one workgroup per 64 output rows.
+    /// @note The helper uses one workgroup per 2 output rows for most quantized formats.
     pub fn recordDispatch(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
@@ -1749,10 +1761,16 @@ pub const DmmvDispatch = struct {
         );
     }
 
-    /// Push-descriptor batch DMMV dispatch.
-    /// Bindings order: 0 = A (weight), 1 = X_batch (K × num_cols, column-major),
+    /// Record a push-descriptor batch DMMV dispatch covering `num_cols` token columns.
+    /// Bindings: 0 = A weight matrix, 1 = X_batch (K × num_cols, column-major),
     /// 2 = Y_batch (M × num_cols, column-major).
-    /// Returns error.UnsupportedQuantType if the batch shader isn't loaded for this quant type.
+    /// @param cmd Command buffer to record into.
+    /// @param quant_type Weight quantization; only Q4_K and Q6_K batch shaders are supported.
+    /// @param push_desc_fn Push-descriptor function pointer (null falls back to bound descriptor sets).
+    /// @param M Output row count (weight matrix rows).
+    /// @param K Contraction width (hidden dimension).
+    /// @param num_cols Number of token columns to process in this batch.
+    /// @returns `error.UnsupportedQuantType` if no batch shader is loaded for `quant_type`.
     pub fn recordBatchDispatchPush(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
@@ -1908,8 +1926,8 @@ pub const DmmvDispatch = struct {
     /// where B and D are column-major (B[col][k] = data_b[b_offset +
     /// col*stride_b + k], analogously for D).
     ///
-    /// Tile shape: WG = 64 threads producing a 32 × 16 output tile.
-    /// Dispatch grid: ((M+31)/32) × ((N+15)/16) × 1.
+    /// Tile shape: WG = 64 threads producing a 32 × 32 output tile.
+    /// Dispatch grid: ((M+31)/32) × ((N+31)/32) × 1.
     ///
     /// Constraints:
     /// - K must be a multiple of 256 (Q4_K super-block size).
@@ -1969,8 +1987,12 @@ pub const DmmvDispatch = struct {
         );
     }
 
-    /// Tiled Q4_K batched dense FFN front-end: computes
-    /// silu(gate_weight * B) * (up_weight * B) directly into D.
+    /// Tiled Q4_K batched dense FFN front-end: computes silu(gate_weight * B) * (up_weight * B) directly into D.
+    /// Ragged (M or N not multiples of 32) shapes are handled by boundary checks in the shader.
+    /// @param M Output rows (gate/up weight rows, i.e. inter_dim).
+    /// @param N Token batch size (number of columns).
+    /// @param K Contraction width; must be a multiple of 256.
+    /// @returns `error.PipelineNotLoaded` if the gate+up+SwiGLU pipeline is absent, or `error.InvalidArgument` for zero/misaligned K or zero M/N.
     pub fn recordMulMmQ4KGateUpSwiglu(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
@@ -2183,8 +2205,9 @@ pub const DmmvDispatch = struct {
         );
     }
 
-    /// Tiled Q8_0 dense GEMM. Same push/layout as recordMulMmQ4K.
-    /// Used by Qwen3.6 A3B layer-major prefill for the SSM out projection.
+    /// Tiled Q8_0 dense GEMM for Qwen3.6 A3B layer-major prefill (SSM out projection).
+    /// Uses the same `MulMmQ4KPush` layout as `recordMulMmQ4K`, but K must be a multiple of 32 (not 256).
+    /// @returns `error.PipelineNotLoaded` if the Q8_0 GEMM pipeline is absent, or `error.InvalidArgument` for K not a multiple of 32 or zero M/N.
     pub fn recordMulMmQ8_0(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
@@ -2284,7 +2307,9 @@ pub const DmmvDispatch = struct {
         );
     }
 
-    /// Branchless full-tile Q6_K GEMM. Requires M and N to be multiples of 32.
+    /// Branchless full-tile Q6_K GEMM for 32-aligned token counts; the host routes only 32-aligned M/N tiles here.
+    /// @note M and N must both be multiples of 32; ragged tails must use `recordMulMmQ6K` instead.
+    /// @returns `error.PipelineNotLoaded` if the full-tile pipeline is absent, or `error.InvalidArgument` for misaligned or zero dimensions.
     pub fn recordMulMmQ6KFull(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,

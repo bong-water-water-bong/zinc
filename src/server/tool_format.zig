@@ -232,7 +232,10 @@ pub const StreamingDetector = struct {
         return self.pending_calls.orderedRemove(0);
     }
 
-    /// Called at end of stream. Returns any held bytes (as content).
+    /// Flush all remaining buffered bytes as content at end of stream. Any bytes
+    /// still held in the speculative-match buffer are appended to the pending
+    /// content buffer, and the combined slice is returned. The returned slice
+    /// aliases the internal buffer; consume before calling deinit.
     pub fn finalize(self: *StreamingDetector) []const u8 {
         const held = self.hold_buf.items;
         if (held.len == 0) return self.content_pending.items;
@@ -252,6 +255,7 @@ pub const ToolFormat = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// Function-pointer table that concrete format implementations fill in.
     pub const VTable = struct {
         renderToolDefinitions: *const fn (
             ctx: *anyopaque,
