@@ -328,8 +328,12 @@ kernel void main0(
             sums_1 = fma(yl4, q4_1, sums_1);
         }
 
-        const float4 sc4_0 = float4(float(sc_0[0]), float(sc_0[2]), float(sc_0[4]), float(sc_0[6]));
-        const float4 sc4_1 = float4(float(sc_1[0]), float(sc_1[2]), float(sc_1[4]), float(sc_1[6]));
+        const packed_char4 sc_lo_0 = *((device const packed_char4*)sc_0);
+        const packed_char4 sc_hi_0 = *((device const packed_char4*)(sc_0 + 4));
+        const packed_char4 sc_lo_1 = *((device const packed_char4*)sc_1);
+        const packed_char4 sc_hi_1 = *((device const packed_char4*)(sc_1 + 4));
+        const float4 sc4_0 = float4(float(sc_lo_0.x), float(sc_lo_0.z), float(sc_hi_0.x), float(sc_hi_0.z));
+        const float4 sc4_1 = float4(float(sc_lo_1.x), float(sc_lo_1.z), float(sc_hi_1.x), float(sc_hi_1.z));
         const float2 dh_d = float2(d_0, d_1);
         const float2 head_dots = float2(dot(sums_0, sc4_0), dot(sums_1, sc4_1));
         const float2 tail_dots = float2(dot(yl_sum4, sc4_0), dot(yl_sum4, sc4_1));
