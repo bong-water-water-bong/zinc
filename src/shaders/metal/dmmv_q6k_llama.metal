@@ -80,13 +80,21 @@ kernel void main0(
         // demote to thread-private stack on register pressure). Pre-storing
         // as float4 yl4_arr[4] makes the natural data shape explicit:
         // 4 vector registers, no gather, and yl_sum4 collapses to a tree of
-        // 3 vector adds. Same FOR_UNROLL on the fill loop preserved.
+        // 3 vector adds. Load the four contiguous 4-float slices as aligned
+        // float4s, then transpose them into the per-l vectors consumed below.
         // dmmv_q6k_llama.metal handles lm_head on Qwen3-8B Q4_K_M (Q6_K =
         // 28.4% of decode bytes/token = 38.46 GiB/step).
-        float4 yl4_arr[4];
-        FOR_UNROLL (ushort l = 0u; l < 4u; ++l) {
-            yl4_arr[l] = float4(y[l + 0u], y[l + 32u], y[l + 64u], y[l + 96u]);
-        }
+        const device float4* y4v = (const device float4*)y;
+        const float4 y0 = y4v[0];
+        const float4 y1 = y4v[8];
+        const float4 y2 = y4v[16];
+        const float4 y3 = y4v[24];
+        const float4 yl4_arr[4] = {
+            float4(y0.x, y1.x, y2.x, y3.x),
+            float4(y0.y, y1.y, y2.y, y3.y),
+            float4(y0.z, y1.z, y2.z, y3.z),
+            float4(y0.w, y1.w, y2.w, y3.w),
+        };
 
         // Cycle 43: hoist the -32 zero-point subtraction out of the inner FMA loop.
         // Q6_K dequant is d * scale * (raw_q - 32) where raw_q ∈ [0,63]. Rewriting

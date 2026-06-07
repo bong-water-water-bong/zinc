@@ -271,10 +271,17 @@ kernel void main0(
     for (uint bi = ix; bi < nb; bi += 2u) {
         device const float* y = src1 + bi * QK_K + y_offset;
 
-        float4 yl4_arr[4];
-        FOR_UNROLL (ushort l = 0u; l < 4u; ++l) {
-            yl4_arr[l] = float4(y[l + 0u], y[l + 32u], y[l + 64u], y[l + 96u]);
-        }
+        const device float4* y4v = (const device float4*)y;
+        const float4 y0 = y4v[0];
+        const float4 y1 = y4v[8];
+        const float4 y2 = y4v[16];
+        const float4 y3 = y4v[24];
+        const float4 yl4_arr[4] = {
+            float4(y0.x, y1.x, y2.x, y3.x),
+            float4(y0.y, y1.y, y2.y, y3.y),
+            float4(y0.z, y1.z, y2.z, y3.z),
+            float4(y0.w, y1.w, y2.w, y3.w),
+        };
         const float4 yl_sum4 = (yl4_arr[0] + yl4_arr[1]) + (yl4_arr[2] + yl4_arr[3]);
 
         device const uchar* block0 = src0 + ulong(first_v_row) * ulong(row_bytes) + ulong(bi) * Q6_BLOCK_SIZE;
