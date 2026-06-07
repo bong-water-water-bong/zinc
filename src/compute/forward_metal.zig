@@ -20449,7 +20449,11 @@ fn runDecodeStep(
                 dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
             }
             if (!is_moe and layer_shared_cmd != null) {
-                profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
+                // Adapt llama.cpp `ggml_metal_op_concurrency_check`: dense
+                // gate/up consumes only the FFN norm row. Defer hidden_buf's
+                // dependency until the post-FFN residual join so the attention
+                // residual write can drain while the dense FFN DMMVs run.
+                profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.norm_buf});
             }
             if (is_moe and !skip_pre_ffn_router) {
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
@@ -21852,7 +21856,14 @@ fn runDecodeStep(
                 profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.swiglu_buf});
 
                 dispatchDmmvOnCmd(engine, cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
-                profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.down_buf});
+                if (layer_shared_cmd != null) {
+                    // The post-FFN residual reads both down_buf and hidden_buf.
+                    // hidden_buf was intentionally not fenced at the dense FFN
+                    // input edge above because gate/up does not consume it.
+                    profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.down_buf, &engine.hidden_buf });
+                } else {
+                    profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.down_buf});
+                }
 
                 const next_layer_idx_u = layer_idx + 1;
                 const keep_terminal_dense_cmd_for_final =
