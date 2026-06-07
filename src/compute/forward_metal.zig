@@ -11783,9 +11783,9 @@ fn dispatchPostNormResidualRmsNormOnCmd(
         n == 5376 and
         (!engine.in_prefill_phase or engine.dense_gemma_wide_post_norm_prefill_enabled) and
         engine.post_norm_residual_rms_norm_wide_pipe.handle != null and
-        engine.post_norm_residual_rms_norm_wide_pipe.max_threads_per_threadgroup >= 512;
+        engine.post_norm_residual_rms_norm_wide_pipe.max_threads_per_threadgroup >= 1024;
     const pipe = if (use_wide) &engine.post_norm_residual_rms_norm_wide_pipe else &engine.post_norm_residual_rms_norm_pipe;
-    const block: u32 = if (use_wide) 512 else 256;
+    const block: u32 = if (use_wide) 1024 else 256;
     cmd.dispatchV2(pipe, .{ 1, 1, 1 }, .{ block, 1, 1 }, &bufs, &push, @sizeOf(PostNormResidualRmsNormPush), 0);
 }
 

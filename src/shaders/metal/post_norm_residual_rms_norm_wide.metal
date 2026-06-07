@@ -10,14 +10,14 @@ struct Params {
 };
 
 // Shape-specific sibling of post_norm_residual_rms_norm.metal for dense
-// Gemma 31B's hidden_dim=5376 decode tail. Same math, wider 512-thread
-// group to expose more parallelism on the two reductions.
-#define N_SIMDGROUPS 16
+// Gemma 31B's hidden_dim=5376 decode tail. Same math, 1024 threads to expose
+// the maximum Apple9 per-threadgroup parallelism on the two reductions.
+#define N_SIMDGROUPS 32
 #define SIMD_WIDTH 32
 #define TG_SIZE (N_SIMDGROUPS * SIMD_WIDTH)
 // This variant is only dispatched for n=5376. The extra pass over the hidden
 // row costs about 21 KiB per call, which is negligible next to the adjacent
-// matvec traffic, and avoids keeping 12 floats live per thread across the
+// matvec traffic, and avoids keeping 6 floats live per thread across the
 // second reduction.
 
 kernel void main0(
