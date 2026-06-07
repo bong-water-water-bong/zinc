@@ -7004,7 +7004,7 @@ pub const InferenceEngine = struct {
 
             const layer_output_scale = self.layer_output_scales[layer_idx];
             if (layer_output_scale != 1.0) {
-                dispatchScaleInPlaceOnCmd(self, &cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, null, .dense_ffn);
+                dispatchScaleInPlaceOnCmd(self, &cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, null, .dense_ffn, true);
             }
 
             const next_layer = layer_idx + 1;
@@ -12185,6 +12185,7 @@ fn dispatchScaleInPlaceOnCmd(
     scale: f32,
     profile: ?*RuntimeProfile,
     barrier_class: BarrierClass,
+    emit_trailing_barrier: bool,
 ) void {
     if (n == 0 or scale == 1.0) return;
     _ = scratch;
@@ -12199,6 +12200,7 @@ fn dispatchScaleInPlaceOnCmd(
     const push = ScaleAccPush{ .n = n, .scale_bits = @as(u32, @bitCast(scale)) };
     const bufs = [_]*const MetalBuffer{buf};
     cmd.dispatchV2(&engine.scale_in_place_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
+    if (!emit_trailing_barrier) return;
     // scale_in_place publishes only `buf`; keep unrelated queued writes free to overlap.
     profileResourceBarrierBuffers(cmd, profile, barrier_class, &.{buf});
 }
@@ -14315,7 +14317,7 @@ fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
 
     const layer_output_scale = engine.layer_output_scales[layer_idx];
     if (layer_output_scale != 1.0) {
-        dispatchScaleInPlaceOnCmd(engine, cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, profile, .gpu_routed_moe);
+        dispatchScaleInPlaceOnCmd(engine, cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, profile, .gpu_routed_moe, true);
     }
 }
 
@@ -14517,7 +14519,7 @@ fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
 
     const layer_output_scale = engine.layer_output_scales[layer_idx];
     if (layer_output_scale != 1.0) {
-        dispatchScaleInPlaceOnCmd(engine, cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, profile, .gpu_routed_moe);
+        dispatchScaleInPlaceOnCmd(engine, cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, profile, .gpu_routed_moe, true);
     }
 }
 
@@ -21851,6 +21853,9 @@ fn runDecodeStep(
                 profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.down_buf});
 
                 const next_layer_idx_u = layer_idx + 1;
+                const ends_dense_cmd_chunk = use_dense_layer_cmd and
+                    layer_shared_cmd != null and
+                    (next_layer_idx_u == layer_count or next_layer_idx_u % dense_cmd_group_layers == 0);
                 const layer_output_scale_folded_pre = skip_pre_ffn_router and !engine.debug_validation_enabled;
                 // The fused kernel now folds an arbitrary `hidden_scale` into
                 // its in-place hidden write, so a non-unit `layer_output_scale`
@@ -21889,9 +21894,11 @@ fn runDecodeStep(
                         hidden_dim,
                         hidden_scale,
                     );
-                    profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
                     prev_fused_attn_norm = true;
                     if (can_fold_layer_scale_here) layer_output_scale_fused_into_post_norm = true;
+                    if (!ends_dense_cmd_chunk) {
+                        profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
+                    }
                 } else {
                     if (engine.post_ffn_norm_present[layer_idx]) {
                         dispatchRmsNormOnCmd(engine, cmd, &engine.down_buf, &engine.down_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
@@ -21900,6 +21907,9 @@ fn runDecodeStep(
 
                     if (layer_shared_cmd != null) {
                         if (can_fuse_next_attn_norm) {
+                            const layer_scale_runs_after_dense = layer_output_scale != 1.0 and
+                                !layer_output_scale_folded_pre and
+                                !layer_output_scale_fused_into_post_norm;
                             dispatchResidualRmsNormOnCmd(
                                 engine,
                                 cmd,
@@ -21910,13 +21920,20 @@ fn runDecodeStep(
                                 hidden_dim,
                                 1.0,
                             );
-                            profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
                             prev_fused_attn_norm = true;
+                            if (!ends_dense_cmd_chunk or layer_scale_runs_after_dense) {
+                                profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
+                            }
                         } else {
+                            const layer_scale_runs_after_dense = layer_output_scale != 1.0 and
+                                !layer_output_scale_folded_pre and
+                                !layer_output_scale_fused_into_post_norm;
                             const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
                             const acc_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.down_buf };
                             cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
-                            profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.hidden_buf});
+                            if (!ends_dense_cmd_chunk or layer_scale_runs_after_dense) {
+                                profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.hidden_buf});
+                            }
                         }
                     }
                 }
@@ -21948,10 +21965,14 @@ fn runDecodeStep(
             else
                 .dense_ffn;
             if (layer_shared_cmd) |cmd| {
-                dispatchScaleInPlaceOnCmd(engine, cmd, &engine.hidden_buf, &engine.residual_buf, hidden_dim, layer_output_scale, profile, scale_barrier_class);
+                const next_layer = layer_idx + 1;
+                const scale_at_dense_cmd_tail = use_dense_layer_cmd and
+                    !is_moe and
+                    (next_layer == layer_count or next_layer % dense_cmd_group_layers == 0);
+                dispatchScaleInPlaceOnCmd(engine, cmd, &engine.hidden_buf, &engine.residual_buf, hidden_dim, layer_output_scale, profile, scale_barrier_class, !scale_at_dense_cmd_tail);
             } else {
                 var scale_cmd = try beginProfiledCommand(engine, profile);
-                dispatchScaleInPlaceOnCmd(engine, &scale_cmd, &engine.hidden_buf, &engine.residual_buf, hidden_dim, layer_output_scale, profile, scale_barrier_class);
+                dispatchScaleInPlaceOnCmd(engine, &scale_cmd, &engine.hidden_buf, &engine.residual_buf, hidden_dim, layer_output_scale, profile, scale_barrier_class, true);
                 commitAndWaitProfiled(&scale_cmd, profile);
             }
         }
