@@ -63,14 +63,15 @@ inline float4 q4k_block_dot_parts(
 
     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+    constexpr ushort4 nibble_mask = ushort4(0x000F, 0x0F00, 0x00F0, 0xF000);
 
     FOR_UNROLL (short i = 0; i < 4; ++i) {
         const float4 yl4 = yl4_arr[i];
         const float4 yh4 = yh4_arr[i];
         const ushort q1i = q1v[i];
         const ushort q2i = q2v[i];
-        const float4 q1m = float4(q1i & 0x000F, q1i & 0x0F00, q1i & 0x00F0, q1i & 0xF000);
-        const float4 q2m = float4(q2i & 0x000F, q2i & 0x0F00, q2i & 0x00F0, q2i & 0xF000);
+        const float4 q1m = float4(ushort4(q1i) & nibble_mask);
+        const float4 q2m = float4(ushort4(q2i) & nibble_mask);
         acc1 = fma(yl4, q1m, acc1);
         acc2 = fma(yh4, q2m, acc2);
     }
