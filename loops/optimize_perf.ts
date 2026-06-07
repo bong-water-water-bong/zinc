@@ -859,6 +859,7 @@ const NOISE_OVERRIDE_STDEV_MULTIPLIER = 3;
 // Previously we only refreshed after perf keeps; a stalled run would stare
 // at a budget from the last perf keep which could be many cycles old.
 const PHASE_BUDGET_REFRESH_STALL_THRESHOLD = 3;
+const PHASE_BUDGET_STALE_PROMPT_AGE = PHASE_BUDGET_REFRESH_STALL_THRESHOLD;
 // Echo-chamber warning: if the last N cycles overwhelmingly target a
 // single phase bucket AND no perf keep has come from that bucket in the
 // same window, surface a warning in the prompt so the agent considers a
@@ -1288,6 +1289,9 @@ export type LoopState = {
   // "prefill" and the runtime was invoked with ZINC_PREFILL_PROFILE=1.
   phaseBudget?: PrefillPhaseBudget | null;
   phaseBudgetCycle?: number | null;
+  phaseBudgetRefreshFailures?: number;
+  phaseBudgetRefreshLastFailure?: string | null;
+  phaseBudgetRefreshLastAttemptCycle?: number | null;
   // Aggregated loop-health metrics recomputed on every save. Cheap to
   // recompute from `cycles` but materialized here so a reader can read the
   // health of a run without knowing the full per-cycle schema.
@@ -1491,6 +1495,9 @@ export type PromptContext = {
   // efforts, or when the baseline profile run did not emit phase data).
   phaseBudget?: PrefillPhaseBudget | null;
   phaseBudgetCycle?: number | null;
+  phaseBudgetRefreshFailures?: number;
+  phaseBudgetRefreshLastFailure?: string | null;
+  phaseBudgetRefreshLastAttemptCycle?: number | null;
 };
 
 function canonicalizeMemoryEntry(text: string): string {
@@ -1614,6 +1621,39 @@ export function formatPhaseBudget(
       `- Biggest top-level bucket: ${budget.biggestBucket.name} (${budget.biggestBucket.totalMs.toFixed(1)} ms). Target this unless a more specific sub-bucket is clearly larger.`,
     );
   }
+  return lines.join("\n");
+}
+
+export function formatPhaseBudgetFreshness(
+  currentCycle: number,
+  capturedAtCycle: number | null | undefined,
+  refreshFailures = 0,
+  lastFailure: string | null | undefined = null,
+  lastAttemptCycle: number | null | undefined = null,
+): string | null {
+  const age = capturedAtCycle != null ? Math.max(0, currentCycle - capturedAtCycle) : null;
+  const stale = capturedAtCycle == null || (age != null && age >= PHASE_BUDGET_STALE_PROMPT_AGE);
+  if (!stale && refreshFailures <= 0) return null;
+
+  const lines: string[] = [];
+  if (capturedAtCycle == null) {
+    lines.push("- No parseable prefill phase profile has been captured for this run.");
+  } else if (stale) {
+    lines.push(`- STALE: phase profile was captured at cycle ${capturedAtCycle}; current cycle is ${currentCycle} (${age} cycles old).`);
+  }
+
+  if (refreshFailures > 0) {
+    const attempt = lastAttemptCycle != null ? ` at cycle ${lastAttemptCycle}` : "";
+    const count = refreshFailures === 1
+      ? "1 refresh attempt has failed"
+      : `${refreshFailures} refresh attempts have failed`;
+    const reason = lastFailure ? `: ${trunc(lastFailure, 180)}` : ".";
+    lines.push(`- ${count}${attempt}${reason}`);
+  }
+
+  lines.push(
+    "- Action: before another production kernel/dataflow edit, collect a fresh `ZINC_PREFILL_PROFILE=1` benchmark sample or fix the missing profile instrumentation/parser. The next self-analysis must cite current top-level and named sub-buckets if it uses the budget.",
+  );
   return lines.join("\n");
 }
 
@@ -2024,8 +2064,14 @@ export function formatLlamaCppComparison(
   const gapPct = bestTokPerSec != null && bestTokPerSec > 0
     ? `${(((llamaPrimary - bestTokPerSec) / bestTokPerSec) * 100).toFixed(1)}%`
     : "—";
+  const primaryAhead = bestTokPerSec != null && bestTokPerSec >= llamaPrimary;
+  const gapLine = bestTokPerSec == null || bestTokPerSec <= 0
+    ? "  gap to beat:     —"
+    : primaryAhead
+      ? `  margin over llama.cpp: +${(bestTokPerSec - llamaPrimary).toFixed(2)} tok/s   (+${(((bestTokPerSec - llamaPrimary) / llamaPrimary) * 100).toFixed(1)}% vs llama.cpp)`
+      : `  gap to beat:     +${gapAbs} tok/s   (+${gapPct} on current best)`;
   const tier =
-    bestTokPerSec != null && bestTokPerSec >= llamaPrimary ? "BEATING llama.cpp ✓" :
+    primaryAhead ? "BEATING llama.cpp ✓" :
     bestTokPerSec != null && bestTokPerSec / llamaPrimary >= 0.9 ? "within striking distance (≥90%)" :
     bestTokPerSec != null && bestTokPerSec / llamaPrimary >= 0.7 ? "closing the gap (70-90%)" :
     "structural gap remains (<70%)";
@@ -2039,13 +2085,16 @@ export function formatLlamaCppComparison(
     `  ZINC best:       ${bestTokPerSec != null ? bestTokPerSec.toFixed(2) : "—"} tok/s`,
     `  llama.cpp:       ${llamaPrimary.toFixed(2)} tok/s`,
     `  ratio:           ${ratioStr}   (${tier})`,
-    `  gap to beat:     +${gapAbs} tok/s   (+${gapPct} on current best)`,
+    gapLine,
+    primaryAhead && baselines.length > 1
+      ? `  next target:     primary is already ahead; protect/measure the other public scenarios before another primary-only micro-tune.`
+      : null,
     "",
     `Other scenarios the loop is NOT measuring per-cycle (also count toward "beat llama.cpp on all 4"):`,
     otherLines,
     "",
     successRule ?? `Project success rule (from MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md): beat llama.cpp on at least 3 of 4 decode scenarios AND keep prefill ≤ 20% behind on every context scenario. A change that improves the controller's prompt but regresses an other scenario does not count. If you are within ~10% of llama.cpp on the primary, prefer the structural lever (validated layer-major batched SSM+dense prefill, Tracks 1-3 in the effort doc) over more micro-fusion — micro-fusion compounds slower than structural batching at this scale.`,
-  ].join("\n");
+  ].filter((line) => line != null).join("\n");
 }
 
 export function formatCorrectnessStreakWarning(w: CorrectnessStreakWarning): string {
@@ -2157,6 +2206,15 @@ export function buildAgentPrompt(
   const phaseBudgetBlock = isPrefillMetricLabel(primaryMetricLabel)
     ? formatPhaseBudget(context?.phaseBudget ?? null, context?.phaseBudgetCycle ?? null)
     : null;
+  const phaseBudgetFreshnessBlock = isPrefillMetricLabel(primaryMetricLabel)
+    ? formatPhaseBudgetFreshness(
+        cycleNum,
+        context?.phaseBudgetCycle ?? null,
+        context?.phaseBudgetRefreshFailures ?? 0,
+        context?.phaseBudgetRefreshLastFailure ?? null,
+        context?.phaseBudgetRefreshLastAttemptCycle ?? null,
+      )
+    : null;
   const dominantBucketDirective = isPrefillMetricLabel(primaryMetricLabel)
     ? formatDominantBucketDirective(context?.phaseBudget ?? null)
     : null;
@@ -2244,7 +2302,7 @@ ${currentVsBestNote}
 - prompt tokens: ${summarizePromptTokens(originalBaseline.promptTokens, originalBaseline.promptTokenSamples)}
 - bandwidth utilization: ${summarizeBenchMetric(originalBaseline.bandwidthUtil, originalBaseline.bandwidthSamples, "%", 1)}
 - output: "${originalBaseline.outputText}"
-${llamaCppBlock ? `\n## llama.cpp Comparison (the real success target)\n${llamaCppBlock}\n` : ""}${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${correctnessStreakBlock ? `\n## ⚠ Correctness Regression Streak\n${correctnessStreakBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
+${llamaCppBlock ? `\n## llama.cpp Comparison (the real success target)\n${llamaCppBlock}\n` : ""}${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${phaseBudgetFreshnessBlock ? `\n## Phase Budget Freshness\n${phaseBudgetFreshnessBlock}\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${correctnessStreakBlock ? `\n## ⚠ Correctness Regression Streak\n${correctnessStreakBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
 ## Controller State
 - mode: ${controllerMode}
 - stalled cycles without a new best checkpoint: ${context?.stalledCycles ?? 0}
@@ -2375,6 +2433,15 @@ export function buildPivotPrompt(
   const phaseBudgetBlock = isPrefillMetricLabel(primaryMetricLabel)
     ? formatPhaseBudget(context?.phaseBudget ?? null, context?.phaseBudgetCycle ?? null)
     : null;
+  const phaseBudgetFreshnessBlock = isPrefillMetricLabel(primaryMetricLabel)
+    ? formatPhaseBudgetFreshness(
+        cycleNum,
+        context?.phaseBudgetCycle ?? null,
+        context?.phaseBudgetRefreshFailures ?? 0,
+        context?.phaseBudgetRefreshLastFailure ?? null,
+        context?.phaseBudgetRefreshLastAttemptCycle ?? null,
+      )
+    : null;
   const dominantBucketDirective = isPrefillMetricLabel(primaryMetricLabel)
     ? formatDominantBucketDirective(context?.phaseBudget ?? null)
     : null;
@@ -2415,7 +2482,7 @@ ${plan}
 - prompt tokens: ${summarizePromptTokens(currentBest.promptTokens, currentBest.promptTokenSamples)}
 - stalled for ${context?.stalledCycles ?? 0} cycles
 - consecutive neutral foundation keeps: ${context?.consecutiveFoundationKeeps ?? 0}
-${llamaCppBlock ? `\n## llama.cpp Comparison (the real success target)\n${llamaCppBlock}\n` : ""}${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}
+${llamaCppBlock ? `\n## llama.cpp Comparison (the real success target)\n${llamaCppBlock}\n` : ""}${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}${phaseBudgetFreshnessBlock ? `\n## Phase Budget Freshness\n${phaseBudgetFreshnessBlock}\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}
 ## Committed Foundations From Recent Cycles
 ${committedFoundations}
 
@@ -2485,23 +2552,70 @@ function zincRemoteCommandProfiled(modelTarget: ModelTarget, prompt: string, max
   return `cd ${REMOTE_DIR} && ${REMOTE_ZINC_ENV} ZINC_PREFILL_PROFILE=1 ./zig-out/bin/zinc ${zincCliArgs(modelTarget, prompt, maxTokens, promptMode)} 2>&1`;
 }
 
+type PhaseBudgetCollection = {
+  budget: PrefillPhaseBudget | null;
+  failureReason: string | null;
+};
+
 /**
  * Run one ZINC_PREFILL_PROFILE=1 sample and return the parsed phase budget.
  * Only call this after buildAndBench has already confirmed the build is green
  * and the output is correct. Profiling adds per-token timestamp overhead
  * (~3%) so we don't include it in the main median calculation.
  */
-async function collectPhaseBudget(modelTarget: ModelTarget, effortSpec: EffortSpec): Promise<PrefillPhaseBudget | null> {
-  if (effortSpec.metricMode !== "prefill") return null;
+async function collectPhaseBudget(modelTarget: ModelTarget, effortSpec: EffortSpec): Promise<PhaseBudgetCollection> {
+  if (effortSpec.metricMode !== "prefill") {
+    return { budget: null, failureReason: "phase budget collection is only available for prefill efforts" };
+  }
   try {
     const output = await ssh(
       zincRemoteCommandProfiled(modelTarget, effortSpec.benchmarkPrompt, effortSpec.benchmarkMaxTokens),
       300_000,
     );
-    return parsePrefillPhaseBudget(output);
-  } catch {
-    return null;
+    const budget = parsePrefillPhaseBudget(output);
+    if (budget) return { budget, failureReason: null };
+    const hasPrefill = /Prefill complete|prefill/i.test(output);
+    return {
+      budget: null,
+      failureReason: hasPrefill
+        ? "profile run completed but emitted no parseable prefill phase budget"
+        : "profile run completed without recognizable prefill output",
+    };
+  } catch (e) {
+    return {
+      budget: null,
+      failureReason: `profile run failed: ${trunc(String(e).replace(/\s+/g, " "), 180)}`,
+    };
   }
+}
+
+function applyPhaseBudgetCollection(
+  state: LoopState,
+  collection: PhaseBudgetCollection,
+  cycle: number,
+  successPrefix: string,
+): void {
+  state.phaseBudgetRefreshLastAttemptCycle = cycle;
+  if (collection.budget) {
+    state.phaseBudget = collection.budget;
+    state.phaseBudgetCycle = cycle;
+    state.phaseBudgetRefreshFailures = 0;
+    state.phaseBudgetRefreshLastFailure = null;
+    if (collection.budget.biggestBucket) {
+      console.log(c(
+        "1;36",
+        `  ${successPrefix}: ${collection.budget.biggestBucket.name} (${collection.budget.biggestBucket.totalMs.toFixed(1)} ms)`,
+      ));
+    }
+    return;
+  }
+
+  state.phaseBudgetRefreshFailures = (state.phaseBudgetRefreshFailures ?? 0) + 1;
+  state.phaseBudgetRefreshLastFailure = collection.failureReason ?? "unknown phase budget refresh failure";
+  console.log(c(
+    "1;33",
+    `  Phase budget refresh failed (${state.phaseBudgetRefreshFailures} consecutive): ${trunc(state.phaseBudgetRefreshLastFailure, 180)}`,
+  ));
 }
 
 async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): Promise<BenchResult> {
@@ -3612,14 +3726,14 @@ async function main() {
   console.log(c("1;32", `  Baseline (${effortSpec.primaryMetricLabel}): ${summarizeBenchMetric(originalBaseline.tokPerSec, originalBaseline.tokPerSecSamples, "tok/s")}, BW: ${summarizeBenchMetric(originalBaseline.bandwidthUtil, originalBaseline.bandwidthSamples, "%", 1)}`));
   console.log(c("1;32", `  Output: "${originalBaseline.outputText.slice(0, 80)}"`));
 
-  let baselinePhaseBudget: PrefillPhaseBudget | null = null;
+  let baselinePhaseBudget: PhaseBudgetCollection = { budget: null, failureReason: null };
   if (effortSpec.metricMode === "prefill") {
     console.log(c("2", "  Capturing baseline prefill phase budget (ZINC_PREFILL_PROFILE=1)..."));
     baselinePhaseBudget = await collectPhaseBudget(modelTarget, effortSpec);
-    if (baselinePhaseBudget?.biggestBucket) {
-      console.log(c("1;36", `  Biggest prefill bucket at baseline: ${baselinePhaseBudget.biggestBucket.name} (${baselinePhaseBudget.biggestBucket.totalMs.toFixed(1)} ms)`));
+    if (baselinePhaseBudget.budget?.biggestBucket) {
+      console.log(c("1;36", `  Biggest prefill bucket at baseline: ${baselinePhaseBudget.budget.biggestBucket.name} (${baselinePhaseBudget.budget.biggestBucket.totalMs.toFixed(1)} ms)`));
     } else {
-      console.log(c("1;33", "  Phase budget collection did not emit parseable phase data; prompt will note this."));
+      console.log(c("1;33", `  Phase budget collection did not emit parseable phase data; prompt will note this (${baselinePhaseBudget.failureReason ?? "unknown"}).`));
     }
   }
 
@@ -3630,8 +3744,11 @@ async function main() {
   let startCycle = 1;
   const headCommit = (await runCommand("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT })).stdout.trim() || null;
   let state = createInitialState(effort, effortFile, originalBaseline, headCommit, benchmarkSignature);
-  state.phaseBudget = baselinePhaseBudget;
-  state.phaseBudgetCycle = baselinePhaseBudget ? 0 : null;
+  state.phaseBudget = baselinePhaseBudget.budget;
+  state.phaseBudgetCycle = baselinePhaseBudget.budget ? 0 : null;
+  state.phaseBudgetRefreshFailures = baselinePhaseBudget.budget ? 0 : (baselinePhaseBudget.failureReason ? 1 : 0);
+  state.phaseBudgetRefreshLastFailure = baselinePhaseBudget.budget ? null : baselinePhaseBudget.failureReason;
+  state.phaseBudgetRefreshLastAttemptCycle = effortSpec.metricMode === "prefill" ? 0 : null;
 
   if (resume) {
     const saved = await loadLoopState(effort);
@@ -3696,6 +3813,9 @@ async function main() {
       bestPerf: state.bestResult ?? benchResultToCheckpoint(bestPerf, 0, state.bestCommitHash),
       phaseBudget: state.phaseBudget ?? null,
       phaseBudgetCycle: state.phaseBudgetCycle ?? null,
+      phaseBudgetRefreshFailures: state.phaseBudgetRefreshFailures ?? 0,
+      phaseBudgetRefreshLastFailure: state.phaseBudgetRefreshLastFailure ?? null,
+      phaseBudgetRefreshLastAttemptCycle: state.phaseBudgetRefreshLastAttemptCycle ?? null,
     };
 
     const agentRun = await spawnAgent(effortFile, plan, originalBaseline, currentCode, cycle, history, model, agent, promptContext, effortSpec);
@@ -3944,13 +4064,7 @@ ${result.buildOutput.slice(-2000)}
       if (effortSpec.metricMode === "prefill") {
         console.log(c("2", "  Refreshing prefill phase budget after keep..."));
         const refreshed = await collectPhaseBudget(modelTarget, effortSpec);
-        if (refreshed) {
-          state.phaseBudget = refreshed;
-          state.phaseBudgetCycle = cycle;
-          if (refreshed.biggestBucket) {
-            console.log(c("1;36", `  New biggest prefill bucket: ${refreshed.biggestBucket.name} (${refreshed.biggestBucket.totalMs.toFixed(1)} ms)`));
-          }
-        }
+        applyPhaseBudgetCollection(state, refreshed, cycle, "New biggest prefill bucket");
       }
     } else if (foundationCandidate) {
       kept = true;
@@ -4030,13 +4144,7 @@ ${result.buildOutput.slice(-2000)}
     ) {
       console.log(c("2", `  Refreshing prefill phase budget (stall=${state.stalledCycles}, last refresh at cycle ${state.phaseBudgetCycle ?? "baseline"})...`));
       const refreshed = await collectPhaseBudget(modelTarget, effortSpec);
-      if (refreshed) {
-        state.phaseBudget = refreshed;
-        state.phaseBudgetCycle = cycle;
-        if (refreshed.biggestBucket) {
-          console.log(c("1;36", `  Refreshed biggest prefill bucket: ${refreshed.biggestBucket.name} (${refreshed.biggestBucket.totalMs.toFixed(1)} ms)`));
-        }
-      }
+      applyPhaseBudgetCollection(state, refreshed, cycle, "Refreshed biggest prefill bucket");
     }
 
     await saveLoopState(state);

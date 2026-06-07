@@ -19,6 +19,7 @@ import {
   formatCorrectnessStreakWarning,
   formatLlamaCppComparison,
   formatPhaseBudget,
+  formatPhaseBudgetFreshness,
   formatToolInput,
   formatClaudeStreamLine,
   getEffortSpec,
@@ -1092,6 +1093,34 @@ describe("formatPhaseBudget", () => {
   });
 });
 
+describe("formatPhaseBudgetFreshness", () => {
+  test("stays quiet for a fresh profile with no failed refreshes", () => {
+    expect(formatPhaseBudgetFreshness(12, 10, 0, null, null)).toBeNull();
+  });
+
+  test("warns when profile data is stale and refreshes have failed", () => {
+    const out = formatPhaseBudgetFreshness(
+      65,
+      50,
+      4,
+      "profile run completed but emitted no parseable prefill phase budget",
+      64,
+    );
+    expect(out).toContain("STALE");
+    expect(out).toContain("cycle 50");
+    expect(out).toContain("current cycle is 65");
+    expect(out).toContain("4 refresh attempts have failed");
+    expect(out).toContain("cycle 64");
+    expect(out).toContain("ZINC_PREFILL_PROFILE=1");
+  });
+
+  test("warns when no parseable profile has ever been captured", () => {
+    const out = formatPhaseBudgetFreshness(1, null, 1, "profile command timed out", 0);
+    expect(out).toContain("No parseable prefill phase profile");
+    expect(out).toContain("profile command timed out");
+  });
+});
+
 describe("buildAgentPrompt — effort-6 controller hints", () => {
   const baseline = {
     buildOk: true,
@@ -1140,6 +1169,8 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
     );
     expect(prompt).toContain("Current Prefill Phase Budget");
     expect(prompt).toContain("Biggest top-level bucket: ssm");
+    expect(prompt).toContain("Phase Budget Freshness");
+    expect(prompt).toContain("STALE: phase profile was captured at cycle 20");
     expect(prompt).toContain("Dominant Bucket Directive");
     expect(prompt).toContain("Largest named sub-buckets overall");
     expect(prompt).toContain("ssm.proj=1300.0 ms");
@@ -1972,6 +2003,9 @@ describe("formatLlamaCppComparison", () => {
   test("classifies tier as 'BEATING llama.cpp ✓' when ahead", () => {
     const out = formatLlamaCppComparison(baselines, "x", "prefill", 200.0);
     expect(out).toContain("BEATING llama.cpp");
+    expect(out).toContain("margin over llama.cpp");
+    expect(out).toContain("next target");
+    expect(out).not.toContain("gap to beat:     +-");
   });
 
   test("classifies tier as 'within striking distance' at >=90%", () => {
