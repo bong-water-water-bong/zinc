@@ -1,6 +1,8 @@
 #version 460
-// ZINC — int8 DP4a full-tile Q4_K gate+up+SwiGLU GEMM for Qwen3.6-27B dense
-// FFN prefill. Same lever as the Q6_K dense-down DP4a path
+// ZINC — int8 DP4a full-tile Q4_K gate+up activation GEMM for dense FFN
+// prefill. Default specialization is SwiGLU for Qwen3.6-27B; Gemma selects
+// GEGLU through ACTIVATION=1 from a second host pipeline. Same lever as the
+// Q6_K dense-down DP4a path
 // (mul_mm_q6k_full_dp4a.comp): the f32-FMA / f16-LDS path is occupancy-bound
 // (shaderstats: 6 subgroups/SIMD at ~12.7KB LDS) and the only remaining
 // throughput lever is hardware int8 dot4 (v_dot4_i32_i8 / OpSDot
@@ -47,6 +49,8 @@ const uint Q4K_BLOCK_U32 = 36u;
 const uint SPACK = 9u;
 
 layout(local_size_x = WG_SIZE) in;
+
+layout(constant_id = 0) const uint ACTIVATION = 0u; // 0 = SwiGLU, 1 = GEGLU
 
 layout(push_constant) uniform PushConstants {
     uint M;
@@ -258,8 +262,16 @@ void main() {
             const uint col_g = ic * BN + tiwc * TN + n;
             const float gate = sums_gate[m][n];
             const float up = sums_up[m][n];
-            const float silu_gate = gate / (1.0 + exp(-gate));
-            d_data[d_offset + col_g * stride_d + row_g] = silu_gate * up;
+            if (ACTIVATION == 1u) {
+                const float g3 = gate * gate * gate;
+                float inner = 0.7978845608 * (gate + 0.044715 * g3);
+                inner = clamp(inner, -15.0, 15.0);
+                const float gelu_gate = 0.5 * gate * (1.0 + tanh(inner));
+                d_data[d_offset + col_g * stride_d + row_g] = gelu_gate * up;
+            } else {
+                const float silu_gate = gate / (1.0 + exp(-gate));
+                d_data[d_offset + col_g * stride_d + row_g] = silu_gate * up;
+            }
         }
     }
 }

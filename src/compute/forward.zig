@@ -3504,7 +3504,11 @@ pub const InferenceEngine = struct {
         // int8 DP4a dense-FFN scratch: packed int8 acts = inter_dim/4 uints/token,
         // scales = inter_dim/32 f32/token. Only allocated when a dense-hybrid
         // prefill shape can use the path.
-        if (self.qwen36Dp4aDownEnabled() or self.qwenDenseFfnDp4aEnabled(n_tokens) or self.qwenA3bSsmQ8Dp4aEnabled(n_tokens)) {
+        if (self.qwen36Dp4aDownEnabled() or
+            self.qwenDenseFfnDp4aEnabled(n_tokens) or
+            self.qwenA3bSsmQ8Dp4aEnabled(n_tokens) or
+            self.gemmaDenseGegluDp4aEnabled(n_tokens))
+        {
             const inter_i8_bytes = n * (inter_dim / 4) * @sizeOf(u32);
             const inter_scale_bytes = n * (inter_dim / 32) * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_swiglu_i8, inter_i8_bytes, storage_xfer);
@@ -11224,6 +11228,18 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn gemmaDenseGegluDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isAmdRdna()) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        const cfg = self.model.config;
+        if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
+        if (n_tokens < 64 or n_tokens > 96) return false;
+        return self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a != null and
+            self.dmmv.pipeline_quantize_act_q8_1 != null;
+    }
+
     fn dispatchGemmaGateUpGegluBatched(
         self: *InferenceEngine,
         gate_t: *const LoadedTensor,
@@ -11242,26 +11258,88 @@ pub const InferenceEngine = struct {
 
         const full_cols = n_tokens & ~@as(u32, 31);
         if (full_cols > 0 and (inter_dim & 31) == 0 and self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full != null) {
-            try self.dmmv.recordMulMmQ4KGateUpGegluFull(
-                &self.decode_cmd,
-                self.instance.push_descriptor_fn,
-                gate_t.gpu_buffer.handle,
-                gate_t.gpu_buffer.size,
-                up_t.gpu_buffer.handle,
-                up_t.gpu_buffer.size,
-                norm_buf.handle,
-                norm_buf.size,
-                geglu_buf.handle,
-                geglu_buf.size,
-                inter_dim,
-                full_cols,
-                hidden_dim,
-                hidden_dim,
-                inter_dim,
-                0,
-                0,
-                0,
-            );
+            const dp4a_full = blk: {
+                if (!self.gemmaDenseGegluDp4aEnabled(n_tokens)) break :blk false;
+                if ((hidden_dim & 255) != 0) break :blk false;
+                const hidden_i8 = self.batched_scratch_hidden_i8 orelse break :blk false;
+                const hidden_sd = self.batched_scratch_hidden_scale_dsum orelse break :blk false;
+                const need_i8: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, full_cols) *
+                    @as(vk.c.VkDeviceSize, hidden_dim / 4) *
+                    @sizeOf(u32);
+                const need_sd: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, full_cols) *
+                    @as(vk.c.VkDeviceSize, hidden_dim / 32) *
+                    2 *
+                    @sizeOf(f32);
+                break :blk hidden_i8.size >= need_i8 and hidden_sd.size >= need_sd;
+            };
+            if (dp4a_full) {
+                const hidden_i8 = self.batched_scratch_hidden_i8.?;
+                const hidden_sd = self.batched_scratch_hidden_scale_dsum.?;
+                const gateup_quant_phase = self.beginProfilePhase();
+                try self.dmmv.recordQuantizeActQ8_1(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    norm_buf.handle,
+                    norm_buf.size,
+                    hidden_i8.handle,
+                    hidden_i8.size,
+                    hidden_sd.handle,
+                    hidden_sd.size,
+                    full_cols,
+                    hidden_dim,
+                );
+                const q8_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = hidden_i8.handle, .size = hidden_i8.size },
+                    .{ .buffer = hidden_sd.handle, .size = hidden_sd.size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+                self.endProfilePhase(.dense_ffn_gateup_quant, gateup_quant_phase);
+
+                const gateup_matmul_phase = self.beginProfilePhase();
+                try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4a(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_t.gpu_buffer.handle,
+                    gate_t.gpu_buffer.size,
+                    up_t.gpu_buffer.handle,
+                    up_t.gpu_buffer.size,
+                    hidden_i8.handle,
+                    hidden_i8.size,
+                    hidden_sd.handle,
+                    hidden_sd.size,
+                    geglu_buf.handle,
+                    geglu_buf.size,
+                    inter_dim,
+                    full_cols,
+                    hidden_dim,
+                    0,
+                    0,
+                );
+                self.endProfilePhase(.dense_ffn_gateup_matmul, gateup_matmul_phase);
+            } else {
+                try self.dmmv.recordMulMmQ4KGateUpGegluFull(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_t.gpu_buffer.handle,
+                    gate_t.gpu_buffer.size,
+                    up_t.gpu_buffer.handle,
+                    up_t.gpu_buffer.size,
+                    norm_buf.handle,
+                    norm_buf.size,
+                    geglu_buf.handle,
+                    geglu_buf.size,
+                    inter_dim,
+                    full_cols,
+                    hidden_dim,
+                    hidden_dim,
+                    inter_dim,
+                    0,
+                    0,
+                    0,
+                );
+            }
             if (full_cols < n_tokens) {
                 const tail_cols = n_tokens - full_cols;
                 if (tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_tail8 != null) {
