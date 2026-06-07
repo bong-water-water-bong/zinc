@@ -1646,6 +1646,75 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
     }
 }
 
+fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
+    if (profile.decode_steps > 0) {
+        const steps_f = @as(f64, @floatFromInt(profile.decode_steps));
+        log.info("  {s} dispatch/step: total {d:.1} barriers {d:.1} (cmds {d:.2} commits {d:.2})", .{
+            label,
+            @as(f64, @floatFromInt(profile.dispatch_calls)) / steps_f,
+            @as(f64, @floatFromInt(profile.barrier_calls)) / steps_f,
+            @as(f64, @floatFromInt(profile.command_buffers)) / steps_f,
+            @as(f64, @floatFromInt(profile.commit_waits)) / steps_f,
+        });
+        log.info("  {s} barrier kinds/step: scope {d:.1} resource {d:.1} resource-entries {d:.1}", .{
+            label,
+            @as(f64, @floatFromInt(profile.scope_barrier_calls)) / steps_f,
+            @as(f64, @floatFromInt(profile.resource_barrier_calls)) / steps_f,
+            @as(f64, @floatFromInt(profile.resource_barrier_resources)) / steps_f,
+        });
+    }
+
+    if (profile.full_attn_barrier_calls > 0) {
+        const typed_full_attn_barriers =
+            profile.full_attn_norm_barrier_calls +
+            profile.full_attn_qkv_barrier_calls +
+            profile.full_attn_rope_barrier_calls +
+            profile.full_attn_flash_barrier_calls +
+            profile.full_attn_gate_barrier_calls +
+            profile.full_attn_out_barrier_calls +
+            profile.full_attn_residual_barrier_calls;
+        const other_full_attn_barriers = if (profile.full_attn_barrier_calls > typed_full_attn_barriers)
+            profile.full_attn_barrier_calls - typed_full_attn_barriers
+        else
+            0;
+        log.info("  {s} attn barriers: norm {d} qkv {d} rope {d} flash {d} gate {d} out {d} residual {d} other {d}", .{
+            label,
+            profile.full_attn_norm_barrier_calls,
+            profile.full_attn_qkv_barrier_calls,
+            profile.full_attn_rope_barrier_calls,
+            profile.full_attn_flash_barrier_calls,
+            profile.full_attn_gate_barrier_calls,
+            profile.full_attn_out_barrier_calls,
+            profile.full_attn_residual_barrier_calls,
+            other_full_attn_barriers,
+        });
+    }
+
+    if (profile.dense_ffn_barrier_calls > 0) {
+        const typed_dense_barriers =
+            profile.dense_ffn_norm_barrier_calls +
+            profile.dense_ffn_gate_up_barrier_calls +
+            profile.dense_ffn_activation_barrier_calls +
+            profile.dense_ffn_down_barrier_calls +
+            profile.dense_ffn_tail_barrier_calls +
+            profile.dense_ffn_scale_barrier_calls;
+        const other_dense_barriers = if (profile.dense_ffn_barrier_calls > typed_dense_barriers)
+            profile.dense_ffn_barrier_calls - typed_dense_barriers
+        else
+            0;
+        log.info("  {s} dense barriers: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d} other {d}", .{
+            label,
+            profile.dense_ffn_norm_barrier_calls,
+            profile.dense_ffn_gate_up_barrier_calls,
+            profile.dense_ffn_activation_barrier_calls,
+            profile.dense_ffn_down_barrier_calls,
+            profile.dense_ffn_tail_barrier_calls,
+            profile.dense_ffn_scale_barrier_calls,
+            other_dense_barriers,
+        });
+    }
+}
+
 fn gemmaMoePrefillPathName(profile: RuntimeProfile) []const u8 {
     if (profile.route_pack_layers > 0 and profile.queued_prefill_requests > 0) return "batched-route-pack+queued-replay";
     if (profile.route_pack_layers > 0) return "batched-route-pack";
@@ -7464,6 +7533,8 @@ pub const InferenceEngine = struct {
                 bytesToGiB(self.prefill_profile.dmmv_total_bytes),
                 bytesToGiB(decode_profile.dmmv_total_bytes),
             });
+            logSplitBarrierBreakdown("prefill", self.prefill_profile);
+            logSplitBarrierBreakdown("decode", decode_profile);
             if (self.config.architecture == .gemma and self.config.n_experts > 0) {
                 log.info("  prefill actual path: {s} default_batched={s} structural_batched={s} route_layers={d} queued_chunks={d}", .{
                     gemmaMoePrefillPathName(self.prefill_profile),
