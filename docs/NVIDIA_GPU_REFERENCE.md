@@ -96,6 +96,8 @@ The RTX PRO 6000 row is the 600 W Workstation Edition (boost 2617 MHz, base 1590
 
 ## SM (Streaming Multiprocessor) Architecture
 
+![NVIDIA SM Architecture](/nvidia-sm.svg)
+
 The SM is NVIDIA's analog of an AMD Compute Unit. At the top level it is structurally constant across Ampere GA10x, Ada AD10x, and Blackwell GB20x **consumer** GPUs: 128 CUDA cores, 4 Tensor cores, 256 KB register file, 128 KB unified L1/shared.
 
 | Per SM | Ampere GA10x (8.6) | Ada AD10x (8.9) | Blackwell GB20x (12.0) |

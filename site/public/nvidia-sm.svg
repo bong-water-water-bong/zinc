@@ -75,7 +75,7 @@
 
   <!-- L1 / Shared Memory -->
   <rect x="35" y="416" width="830" height="34" rx="5" fill="#0f1a0c" stroke="#9acd32" stroke-width="1.5"/>
-  <text x="450" y="437" text-anchor="middle" fill="#9acd32" font-size="11" font-weight="600">L1 Data Cache / Shared Memory — 128 KB unified · ≤100 KB shared (Ampere/Ada) · ~20–30 cycles</text>
+  <text x="450" y="437" text-anchor="middle" fill="#9acd32" font-size="11" font-weight="600">L1 Data Cache / Shared Memory — 128 KB unified · ≤100 KB shared (all 3 gens) · ~20–30 cycles</text>
 
   <!-- Secondary SM-level units -->
   <rect x="35" y="456" width="265" height="30" rx="4" fill="#0f1a0c" stroke="#8aa86a" stroke-width="1"/>
