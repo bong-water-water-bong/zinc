@@ -4212,6 +4212,7 @@ pub const InferenceEngine = struct {
     gemma_q4k_geglu_exact5_enabled: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
+    lm_head_argmax_cpu_reduce_pairs: u32,
     qwen_ssm_proj_validate_captured_tokens: u32,
     qwen_ssm_proj_validate_layer: u32,
     qwen_ssm_prefill_proj_active_tokens: u32,
@@ -4451,6 +4452,7 @@ pub const InferenceEngine = struct {
         }
         self.request_profile = .{};
         self.prefill_profile = .{};
+        self.lm_head_argmax_cpu_reduce_pairs = 0;
         self.qwen_ssm_proj_validate_captured_tokens = 0;
         self.qwen_ssm_prefill_proj_active_tokens = 0;
         self.qwen_ssm_prefill_branch_active_tokens = 0;
@@ -5814,6 +5816,35 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn reduceLmHeadArgmaxPartialsCpu(self: *InferenceEngine, n_pairs: u32) ?u32 {
+        if (n_pairs == 0) return null;
+        const partials_ptr = self.argmax_partials_buf.cpu_ptr orelse return null;
+        const max_pairs = self.argmax_partials_buf.size / (2 * @sizeOf(u32));
+        if (@as(usize, n_pairs) > max_pairs) return null;
+
+        const words: [*]const u32 = @ptrCast(@alignCast(partials_ptr));
+        var best_val: f32 = -std.math.inf(f32);
+        var best_idx: u32 = std.math.maxInt(u32);
+
+        var i: u32 = 0;
+        while (i < n_pairs) : (i += 1) {
+            const idx = words[@as(usize, i) * 2];
+            const val: f32 = @bitCast(words[@as(usize, i) * 2 + 1]);
+            if (val > best_val or (val == best_val and idx < best_idx)) {
+                best_val = val;
+                best_idx = idx;
+            }
+        }
+
+        if (best_idx == std.math.maxInt(u32)) return null;
+        if (self.argmax_buf.cpu_ptr) |out_ptr| {
+            const out_words: [*]u32 = @ptrCast(@alignCast(out_ptr));
+            out_words[0] = best_idx;
+            out_words[1] = @bitCast(best_val);
+        }
+        return best_idx;
+    }
+
     /// Sample the next token greedily (argmax over logits).
     pub fn sampleGreedy(self: *const InferenceEngine) u32 {
         const sample_start = profileStart(self.profile_enabled);
@@ -5823,12 +5854,24 @@ pub const InferenceEngine = struct {
             mutable.request_profile.sample_ns += profileElapsedNs(sample_start);
         };
 
+        const mutable_self = @constCast(self);
+        const pending_lm_head_partials = mutable_self.lm_head_argmax_cpu_reduce_pairs;
+        const skip_argmax_buf = pending_lm_head_partials != 0;
+        if (pending_lm_head_partials != 0) {
+            mutable_self.lm_head_argmax_cpu_reduce_pairs = 0;
+            if (reduceLmHeadArgmaxPartialsCpu(mutable_self, pending_lm_head_partials)) |idx| {
+                return idx;
+            }
+        }
+
         // Final logit softcapping is monotonic, so it cannot change greedy
         // argmax order. The LM-head path already writes argmax_buf; use it
         // directly instead of rescanning Gemma's full vocab every token.
-        if (self.argmax_buf.cpu_ptr) |ptr| {
-            const argmax_words: [*]const u32 = @ptrCast(@alignCast(ptr));
-            return argmax_words[0];
+        if (!skip_argmax_buf) {
+            if (self.argmax_buf.cpu_ptr) |ptr| {
+                const argmax_words: [*]const u32 = @ptrCast(@alignCast(ptr));
+                return argmax_words[0];
+            }
         }
 
         const logits_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
@@ -5867,6 +5910,7 @@ pub const InferenceEngine = struct {
         self.position = 0;
         self.request_profile.reset();
         self.prefill_profile.reset();
+        self.lm_head_argmax_cpu_reduce_pairs = 0;
         self.qwen_ssm_proj_validate_captured_tokens = 0;
         self.qwen_ssm_prefill_proj_active_tokens = 0;
         self.qwen_ssm_prefill_branch_active_tokens = 0;
@@ -8423,6 +8467,7 @@ fn dispatchArgmaxOnCmd(
         engine.argmax_partials_buf.handle != null and
         engine.argmax_partials_buf.size >= @as(usize, ((n + chunk_size - 1) / chunk_size)) * 2 * @sizeOf(u32);
     if (use_chunked) {
+        engine.lm_head_argmax_cpu_reduce_pairs = 0;
         const n_pairs = (n + chunk_size - 1) / chunk_size;
         const chunk_push = ArgmaxPush{ .n = n };
         const chunk_bufs = [_]*const MetalBuffer{ logits_buf, &engine.argmax_partials_buf };
@@ -8432,6 +8477,7 @@ fn dispatchArgmaxOnCmd(
         return;
     }
 
+    engine.lm_head_argmax_cpu_reduce_pairs = 0;
     const push = ArgmaxPush{ .n = n };
     const bufs = [_]*const MetalBuffer{ logits_buf, output_buf };
     cmd.dispatchV2(&engine.argmax_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ArgmaxPush), 2);
@@ -8445,6 +8491,7 @@ fn dispatchArgmaxPairsOnCmd(
     n_pairs: u32,
 ) void {
     if (n_pairs == 0) return;
+    engine.lm_head_argmax_cpu_reduce_pairs = 0;
     const block_size: u32 = if (n_pairs >= 4096 and engine.argmax_pairs_pipe.max_threads_per_threadgroup >= 1024)
         1024
     else
@@ -10231,6 +10278,11 @@ fn dispatchLmHeadQ4KArgmaxPartialsOnCmd(
         @sizeOf(DmmvPush),
         1,
     );
+    if (!engine.in_prefill_phase and engine.argmax_partials_buf.cpu_ptr != null) {
+        engine.lm_head_argmax_cpu_reduce_pairs = n_pairs;
+        return;
+    }
+    engine.lm_head_argmax_cpu_reduce_pairs = 0;
     profileBarrierBuffers(cmd, profile, .final, &.{&engine.argmax_partials_buf});
     dispatchArgmaxPairsOnCmd(engine, cmd, &engine.argmax_partials_buf, output_buf, n_pairs);
 }
