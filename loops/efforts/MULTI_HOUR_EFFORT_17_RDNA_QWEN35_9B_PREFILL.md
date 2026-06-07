@@ -1,5 +1,7 @@
 # Effort 17 - RDNA4 Qwen 3.5 9B prefill gap
 
+> **Status:** active · through cycle 35 · best 818 tok/s (long-draft harness, ~96% of llama there) · board core 32% of llama (176 vs 554)
+
 Date: 2026-06-01
 
 Target model:

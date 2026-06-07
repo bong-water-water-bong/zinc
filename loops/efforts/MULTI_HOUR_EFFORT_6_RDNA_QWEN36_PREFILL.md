@@ -1,4 +1,6 @@
-# Optimization 6: RDNA Prefill Recovery for Qwen3.6-35B-A3B
+# Effort 6 - RDNA4 Qwen3.6-35B-A3B prefill recovery
+
+> **Status:** plateaued · 109 cycles · best 759 tok/s (154-tok harness) · board core 77% of llama (311 vs 405)
 
 ## PIVOT 2026-06-04 — POST-759 PLATEAU; STOP REPLAYING OLD LEVERS
 

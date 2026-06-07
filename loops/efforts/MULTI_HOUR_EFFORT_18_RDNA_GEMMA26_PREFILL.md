@@ -1,5 +1,7 @@
 # Effort 18 - RDNA4 Gemma 4 26B-A4B MoE prefill parity
 
+> **Status:** not started · 0 cycles · board core 18% of llama (89 vs 502)
+
 Date: 2026-06-01
 
 Target model:

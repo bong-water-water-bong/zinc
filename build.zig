@@ -4,6 +4,7 @@ const Backend = enum {
     auto,
     vulkan,
     metal,
+    cuda,
     zinc_rt,
 };
 
@@ -34,6 +35,31 @@ fn configureVulkanModule(
     }
 }
 
+fn configureCudaModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    module: *std.Build.Module,
+) void {
+    // CUDA backend — Linux/WSL2 + NVIDIA only. On the WSL2 deployment box NVIDIA
+    // exposes CUDA, not Vulkan, so ZINC's kernels reach the GPU through a native
+    // CUDA path: the C shim (Driver API + NVRTC) in src/cuda/cuda_shim.c plus the
+    // Zig wrappers in src/cuda/{device,buffer,pipeline,command}.zig. Mirrors
+    // configureVulkanModule. See docs/cuda-backend.md §6.
+    _ = target;
+    const cuda_home = b.graph.env_map.get("CUDA_HOME") orelse "/usr/local/cuda";
+    module.addCSourceFile(.{
+        .file = b.path("src/cuda/cuda_shim.c"),
+        .flags = &.{"-std=c11"},
+    });
+    module.addIncludePath(b.path("src/cuda"));
+    module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ cuda_home, "include" }) });
+    module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda_home, "lib64" }) });
+    // libcuda.so (the driver stub) lives in the WSL passthrough dir, not lib64.
+    module.addLibraryPath(.{ .cwd_relative = "/usr/lib/wsl/lib" });
+    module.linkSystemLibrary("cuda", .{}); // CUDA Driver API
+    module.linkSystemLibrary("nvrtc", .{}); // runtime kernel compilation
+}
+
 fn resolveBunExe(b: *std.Build) []const u8 {
     if (b.graph.env_map.get("BUN_EXE")) |bun_exe| return bun_exe;
     if (std.fs.accessAbsolute("/root/.bun/bin/bun", .{})) |_| return "/root/.bun/bin/bun" else |_| {}
@@ -52,7 +78,7 @@ fn addBunDirToPath(b: *std.Build, run: *std.Build.Step.Run, bun_exe: []const u8)
 }
 
 pub fn build(b: *std.Build) void {
-    const requested_backend = b.option(Backend, "backend", "Select inference backend: auto, vulkan, metal, zinc_rt") orelse .auto;
+    const requested_backend = b.option(Backend, "backend", "Select inference backend: auto, vulkan, metal, cuda, zinc_rt") orelse .auto;
     const target = b.standardTargetOptions(.{
         .default_target = if (requested_backend == .zinc_rt)
             .{ .cpu_model = .native }
@@ -92,6 +118,9 @@ pub fn build(b: *std.Build) void {
     }
     if (selected_backend == .vulkan and !is_linux) {
         @panic("-Dbackend=vulkan currently requires a Linux target");
+    }
+    if (selected_backend == .cuda and !is_linux) {
+        @panic("-Dbackend=cuda currently requires a Linux target (NVIDIA + CUDA toolkit)");
     }
 
     const build_options = b.addOptions();
@@ -329,6 +358,8 @@ pub fn build(b: *std.Build) void {
         exe_mod.addIncludePath(b.path("src/metal"));
         exe_mod.linkFramework("Metal", .{});
         exe_mod.linkFramework("Foundation", .{});
+    } else if (selected_backend == .cuda) {
+        configureCudaModule(b, target, exe_mod);
     } else {
         configureVulkanModule(b, target, exe_mod);
     }
@@ -356,6 +387,29 @@ pub fn build(b: *std.Build) void {
 
     if (install_hot_bench) {
         b.installArtifact(hot_bench);
+    }
+
+    // --- CUDA primitive-layer smoke (Linux/WSL2 + NVIDIA only) ---
+    // Builds & runs src/cuda/smoke.zig standalone — independent of the main exe
+    // and the gpu/interface.zig dispatch — so the src/cuda/* primitive layer can
+    // be validated before forward_cuda exists. `zig build cuda-smoke`. See
+    // docs/cuda-backend.md §6.2 and Effort 20/21.
+    if (is_linux) {
+        const cuda_smoke_mod = b.createModule(.{
+            .root_source_file = b.path("src/cuda/smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        configureCudaModule(b, target, cuda_smoke_mod);
+        const cuda_smoke_exe = b.addExecutable(.{
+            .name = "cuda-smoke",
+            .root_module = cuda_smoke_mod,
+        });
+        const run_cuda_smoke = b.addRunArtifact(cuda_smoke_exe);
+        if (b.args) |args| run_cuda_smoke.addArgs(args);
+        const cuda_smoke_step = b.step("cuda-smoke", "Build & run the CUDA primitive-layer smoke test (Linux/NVIDIA)");
+        cuda_smoke_step.dependOn(&run_cuda_smoke.step);
     }
 
     // --- Documentation ---

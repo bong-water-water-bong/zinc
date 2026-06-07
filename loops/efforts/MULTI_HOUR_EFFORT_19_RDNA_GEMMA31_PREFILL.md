@@ -1,5 +1,7 @@
 # Effort 19 - RDNA4 Gemma 4 31B dense prefill parity
 
+> **Status:** not started · 0 cycles · board core 21% of llama (42 vs 203)
+
 Date: 2026-06-01
 
 Target model:

@@ -1,0 +1,212 @@
+// CUDA backend C implementation for ZINC. See cuda_shim.h for the ABI contract.
+// Uses the CUDA Driver API (cu*) + NVRTC for runtime kernel compilation.
+// Link: -lcuda -lnvrtc  (libcuda.so in /usr/lib/wsl/lib on WSL).
+
+#include "cuda_shim.h"
+#include <cuda.h>
+#include <nvrtc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_DISPATCH_BUFS 32
+
+struct CudaCtx { CUdevice dev; CUcontext ctx; CUstream stream; };
+struct CudaBuf { CUdeviceptr dptr; size_t size; void* host; int owns; int owns_host; };
+struct CudaPipe { CUmodule mod; CUfunction fn; };
+struct CudaCmd { CUstream stream; CUevent event; };
+
+static __thread char g_err[1024];
+
+static void set_err(const char* where, const char* what) {
+    snprintf(g_err, sizeof g_err, "%s: %s", where, what ? what : "(null)");
+    fprintf(stderr, "[cuda_shim] %s\n", g_err);
+}
+static int cu_ok(CUresult r, const char* where) {
+    if (r == CUDA_SUCCESS) return 1;
+    const char* s = NULL; cuGetErrorString(r, &s);
+    set_err(where, s);
+    return 0;
+}
+const char* cuda_last_error(void) { return g_err; }
+
+// ---- Device lifecycle --------------------------------------------------------
+CudaCtx* cuda_init(int device_index) {
+    g_err[0] = 0;
+    static int inited = 0;
+    if (!inited) { if (!cu_ok(cuInit(0), "cuInit")) return NULL; inited = 1; }
+    CudaCtx* c = (CudaCtx*)calloc(1, sizeof *c);
+    if (!c) { set_err("cuda_init", "oom"); return NULL; }
+    if (!cu_ok(cuDeviceGet(&c->dev, device_index), "cuDeviceGet")) { free(c); return NULL; }
+    // Use the device's primary context (shared with the runtime API).
+    if (!cu_ok(cuDevicePrimaryCtxRetain(&c->ctx, c->dev), "cuDevicePrimaryCtxRetain")) { free(c); return NULL; }
+    if (!cu_ok(cuCtxSetCurrent(c->ctx), "cuCtxSetCurrent")) { free(c); return NULL; }
+    if (!cu_ok(cuStreamCreate(&c->stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate")) { free(c); return NULL; }
+    return c;
+}
+void cuda_destroy(CudaCtx* c) {
+    if (!c) return;
+    if (c->stream) cuStreamDestroy(c->stream);
+    if (c->ctx) cuDevicePrimaryCtxRelease(c->dev);
+    free(c);
+}
+static int dev_attr(CUdevice d, CUdevice_attribute a) {
+    int v = 0; cuDeviceGetAttribute(&v, a, d); return v;
+}
+uint64_t cuda_total_memory(CudaCtx* c) { size_t b = 0; cuDeviceTotalMem(&b, c->dev); return b; }
+uint64_t cuda_free_memory(CudaCtx* c) { size_t f = 0, t = 0; cuCtxSetCurrent(c->ctx); cuMemGetInfo(&f, &t); return f; }
+uint32_t cuda_sm_count(CudaCtx* c) { return (uint32_t)dev_attr(c->dev, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT); }
+uint32_t cuda_compute_capability(CudaCtx* c) {
+    int mj = dev_attr(c->dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
+    int mn = dev_attr(c->dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
+    return (uint32_t)(mj * 10 + mn);
+}
+uint32_t cuda_max_threads_per_block(CudaCtx* c) { return (uint32_t)dev_attr(c->dev, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK); }
+uint32_t cuda_max_shared_mem_per_block(CudaCtx* c) { return (uint32_t)dev_attr(c->dev, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN); }
+uint32_t cuda_warp_size(CudaCtx* c) { return (uint32_t)dev_attr(c->dev, CU_DEVICE_ATTRIBUTE_WARP_SIZE); }
+void cuda_device_name(CudaCtx* c, char* out, size_t cap) {
+    if (cap == 0) return;
+    if (cuDeviceGetName(out, (int)cap, c->dev) != CUDA_SUCCESS) out[0] = 0;
+    out[cap - 1] = 0;
+}
+
+// ---- Buffer management -------------------------------------------------------
+CudaBuf* cuda_create_buffer(CudaCtx* c, size_t size) {
+    cuCtxSetCurrent(c->ctx);
+    CudaBuf* b = (CudaBuf*)calloc(1, sizeof *b);
+    if (!b) { set_err("cuda_create_buffer", "oom"); return NULL; }
+    if (!cu_ok(cuMemAlloc(&b->dptr, size ? size : 1), "cuMemAlloc")) { free(b); return NULL; }
+    b->size = size; b->owns = 1;
+    return b;
+}
+CudaBuf* cuda_create_buffer_staged(CudaCtx* c, size_t size, void** cpu_ptr) {
+    CudaBuf* b = cuda_create_buffer(c, size);
+    if (!b) return NULL;
+    if (!cu_ok(cuMemAllocHost(&b->host, size ? size : 1), "cuMemAllocHost")) { cuda_free_buffer(b); return NULL; }
+    b->owns_host = 1;
+    if (cpu_ptr) *cpu_ptr = b->host;
+    return b;
+}
+CudaBuf* cuda_upload_mmap(CudaCtx* c, const void* host_ptr, size_t size) {
+    CudaBuf* b = cuda_create_buffer(c, size);
+    if (!b) return NULL;
+    if (!cu_ok(cuMemcpyHtoD(b->dptr, host_ptr, size), "cuMemcpyHtoD(mmap)")) { cuda_free_buffer(b); return NULL; }
+    return b;
+}
+CudaBuf* cuda_alias_buffer(CudaBuf* base, size_t offset, size_t size) {
+    CudaBuf* b = (CudaBuf*)calloc(1, sizeof *b);
+    if (!b) { set_err("cuda_alias_buffer", "oom"); return NULL; }
+    b->dptr = base->dptr + offset; b->size = size; b->owns = 0;
+    return b;
+}
+uint64_t cuda_buffer_device_ptr(CudaBuf* b) { return (uint64_t)b->dptr; }
+void cuda_upload(CudaCtx* c, CudaBuf* b, const void* src, size_t size) {
+    cuCtxSetCurrent(c->ctx);
+    if (!cu_ok(cuMemcpyHtoDAsync(b->dptr, src, size, c->stream), "cuMemcpyHtoDAsync")) return;
+    cuStreamSynchronize(c->stream);
+}
+void cuda_download(CudaCtx* c, CudaBuf* b, void* dst, size_t size) {
+    cuCtxSetCurrent(c->ctx);
+    if (!cu_ok(cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream), "cuMemcpyDtoHAsync")) return;
+    cuStreamSynchronize(c->stream);
+}
+void cuda_free_buffer(CudaBuf* b) {
+    if (!b) return;
+    if (b->owns && b->dptr) cuMemFree(b->dptr);
+    if (b->owns_host && b->host) cuMemFreeHost(b->host);
+    free(b);
+}
+
+// ---- Pipeline management (NVRTC) ---------------------------------------------
+CudaPipe* cuda_create_pipeline(CudaCtx* c, const char* src, const char* fn_name,
+                               const char* const* opts, uint32_t n_opts) {
+    cuCtxSetCurrent(c->ctx);
+    nvrtcProgram prog;
+    if (nvrtcCreateProgram(&prog, src, "zinc_kernel.cu", 0, NULL, NULL) != NVRTC_SUCCESS) {
+        set_err("nvrtcCreateProgram", "failed"); return NULL;
+    }
+    // Default arch = the running device's cc (e.g. sm_120 / sm_89).
+    char arch[32];
+    snprintf(arch, sizeof arch, "--gpu-architecture=sm_%u", cuda_compute_capability(c));
+    const char* base_opts[2] = { arch, "--std=c++17" };
+    uint32_t total = 2 + n_opts;
+    const char** all = (const char**)malloc(sizeof(char*) * total);
+    all[0] = base_opts[0]; all[1] = base_opts[1];
+    for (uint32_t i = 0; i < n_opts; i++) all[2 + i] = opts[i];
+    nvrtcResult cr = nvrtcCompileProgram(prog, (int)total, all);
+    free(all);
+    if (cr != NVRTC_SUCCESS) {
+        size_t logsz = 0; nvrtcGetProgramLogSize(prog, &logsz);
+        char* log = (char*)malloc(logsz + 1);
+        if (log) { nvrtcGetProgramLog(prog, log); log[logsz] = 0; fprintf(stderr, "[cuda_shim] NVRTC log:\n%s\n", log); free(log); }
+        set_err("nvrtcCompileProgram", nvrtcGetErrorString(cr));
+        nvrtcDestroyProgram(&prog); return NULL;
+    }
+    size_t ptxsz = 0; nvrtcGetPTXSize(prog, &ptxsz);
+    char* ptx = (char*)malloc(ptxsz);
+    nvrtcGetPTX(prog, ptx);
+    nvrtcDestroyProgram(&prog);
+
+    CudaPipe* p = (CudaPipe*)calloc(1, sizeof *p);
+    if (!p) { free(ptx); set_err("cuda_create_pipeline", "oom"); return NULL; }
+    if (!cu_ok(cuModuleLoadData(&p->mod, ptx), "cuModuleLoadData")) { free(ptx); free(p); return NULL; }
+    free(ptx);
+    if (!cu_ok(cuModuleGetFunction(&p->fn, p->mod, fn_name), "cuModuleGetFunction")) {
+        cuModuleUnload(p->mod); free(p); return NULL;
+    }
+    return p;
+}
+CudaPipe* cuda_create_pipeline_from_image(CudaCtx* c, const void* image, size_t image_size, const char* fn_name) {
+    (void)image_size;
+    cuCtxSetCurrent(c->ctx);
+    CudaPipe* p = (CudaPipe*)calloc(1, sizeof *p);
+    if (!p) { set_err("cuda_create_pipeline_from_image", "oom"); return NULL; }
+    if (!cu_ok(cuModuleLoadData(&p->mod, image), "cuModuleLoadData(image)")) { free(p); return NULL; }
+    if (!cu_ok(cuModuleGetFunction(&p->fn, p->mod, fn_name), "cuModuleGetFunction")) {
+        cuModuleUnload(p->mod); free(p); return NULL;
+    }
+    return p;
+}
+static int func_attr(CUfunction f, CUfunction_attribute a) { int v = 0; cuFuncGetAttribute(&v, a, f); return v; }
+uint32_t cuda_pipeline_max_threads(CudaPipe* p) { return (uint32_t)func_attr(p->fn, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK); }
+uint32_t cuda_pipeline_shared_mem(CudaPipe* p) { return (uint32_t)func_attr(p->fn, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES); }
+void cuda_pipeline_set_max_dynamic_shared(CudaPipe* p, uint32_t bytes) {
+    cuFuncSetAttribute(p->fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)bytes);
+}
+void cuda_free_pipeline(CudaPipe* p) { if (!p) return; if (p->mod) cuModuleUnload(p->mod); free(p); }
+
+// ---- Command / dispatch ------------------------------------------------------
+CudaCmd* cuda_begin_command(CudaCtx* c) {
+    cuCtxSetCurrent(c->ctx);
+    CudaCmd* m = (CudaCmd*)calloc(1, sizeof *m);
+    if (!m) { set_err("cuda_begin_command", "oom"); return NULL; }
+    m->stream = c->stream;
+    if (!cu_ok(cuEventCreate(&m->event, CU_EVENT_DEFAULT), "cuEventCreate")) { free(m); return NULL; }
+    return m;
+}
+void cuda_dispatch(CudaCmd* m, CudaPipe* p,
+                   const uint32_t grid[3], const uint32_t block[3],
+                   CudaBuf** bufs, uint32_t n_bufs,
+                   const void* push_data, size_t push_size,
+                   uint32_t shared_bytes) {
+    (void)push_size;
+    if (n_bufs > MAX_DISPATCH_BUFS) { set_err("cuda_dispatch", "too many buffers"); return; }
+    // kernelParams[i] points to the i-th arg's value: &dptr for each buffer,
+    // then the push struct bytes for the trailing by-value param.
+    CUdeviceptr dptrs[MAX_DISPATCH_BUFS];
+    void* args[MAX_DISPATCH_BUFS + 1];
+    for (uint32_t i = 0; i < n_bufs; i++) { dptrs[i] = bufs[i]->dptr; args[i] = &dptrs[i]; }
+    uint32_t nargs = n_bufs;
+    if (push_data) { args[nargs++] = (void*)push_data; }
+    cu_ok(cuLaunchKernel(p->fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
+                         shared_bytes, m->stream, args, NULL), "cuLaunchKernel");
+}
+void cuda_barrier(CudaCmd* m) { (void)m; /* single stream is implicitly ordered */ }
+void cuda_commit_and_wait(CudaCmd* m) {
+    cuEventRecord(m->event, m->stream);
+    cuStreamSynchronize(m->stream);
+    cuEventDestroy(m->event); free(m);
+}
+void cuda_commit_async(CudaCmd* m) { cuEventRecord(m->event, m->stream); }
+void cuda_wait(CudaCmd* m) { cuEventSynchronize(m->event); cuEventDestroy(m->event); free(m); }
+void cuda_release_completed(CudaCmd* m) { if (!m) return; if (m->event) cuEventDestroy(m->event); free(m); }

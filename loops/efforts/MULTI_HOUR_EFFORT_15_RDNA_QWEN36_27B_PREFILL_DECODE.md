@@ -1,5 +1,7 @@
 # Effort 15 - RDNA4 Qwen 3.6 27B dense-hybrid prefill and decode
 
+> **Status:** plateaued · 94 cycles · best 65 tok/s (Coding Review harness) · board core 26% of llama (49 vs 186)
+
 Date: 2026-05-18
 
 Target model:
