@@ -17714,10 +17714,20 @@ fn diffF32Slices(expected: []const f32, actual: []const f32) SliceDiff {
     var max_abs: f32 = 0;
     var max_idx: usize = 0;
     var sum_sq: f64 = 0;
+    var saw_non_finite = false;
     for (0..n) |i| {
         const delta = actual[i] - expected[i];
+        if (!std.math.isFinite(expected[i]) or !std.math.isFinite(actual[i]) or !std.math.isFinite(delta)) {
+            if (!saw_non_finite) {
+                max_abs = std.math.inf(f32);
+                max_idx = i;
+                sum_sq = std.math.inf(f64);
+                saw_non_finite = true;
+            }
+            continue;
+        }
         const abs_delta = @abs(delta);
-        if (abs_delta > max_abs) {
+        if (!saw_non_finite and abs_delta > max_abs) {
             max_abs = abs_delta;
             max_idx = i;
         }
@@ -24993,6 +25003,22 @@ test "topKSoftmax selects correct top-k with renormalization" {
     try std.testing.expectEqual(@as(u32, 7), ids[2]);
     const wsum = weights[0] + weights[1] + weights[2];
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), wsum, 0.01);
+}
+
+test "diffF32Slices treats non-finite values as validation failures" {
+    const expected = [_]f32{ 1.0, 2.0, 3.0 };
+
+    const actual_nan = [_]f32{ 1.0, std.math.nan(f32), 3.0 };
+    const nan_diff = diffF32Slices(expected[0..], actual_nan[0..]);
+    try std.testing.expect(std.math.isInf(nan_diff.max_abs));
+    try std.testing.expect(std.math.isInf(nan_diff.rms));
+    try std.testing.expectEqual(@as(usize, 1), nan_diff.max_idx);
+
+    const actual_inf = [_]f32{ 1.0, 2.0, std.math.inf(f32) };
+    const inf_diff = diffF32Slices(expected[0..], actual_inf[0..]);
+    try std.testing.expect(std.math.isInf(inf_diff.max_abs));
+    try std.testing.expect(std.math.isInf(inf_diff.rms));
+    try std.testing.expectEqual(@as(usize, 2), inf_diff.max_idx);
 }
 
 test "classifyFullAttnGate handles packed, separate, and plain layouts" {
