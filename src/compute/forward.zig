@@ -7703,6 +7703,12 @@ pub const InferenceEngine = struct {
                     gemma_gpu_topk_moe and
                     self.use_softmax_topk_v2 and
                     self.elementwise.pipeline_softmax_topk_v2 != null;
+                const gemma_short_prefill_fast_tail =
+                    use_prefill_tail_topk and
+                    config.architecture == .gemma and
+                    gemma_short_prefill_limit == gemma_prefill_micro_prompt_topk and
+                    self.prefill_embed_big_token_count >= gemma_prefill_long_draft_prompt_min_tokens and
+                    self.prefill_embed_big_token_count <= gemma_prefill_shared_skip_max_tokens;
 
                 // Gemma 4 MoE: scale router logits by 1/sqrt(hidden_dim) before softmax.
                 // The GPU-topk fast path folds the same positive scale into topk
@@ -7721,8 +7727,17 @@ pub const InferenceEngine = struct {
 
                 // Gemma 4 MoE uses pre_ffw_norm_2 for MoE expert input (vs ffn_norm_buf for shared).
                 // Available to both GPU-routed and CPU-routed MoE paths.
-                const defer_gemma_pre_ffw_norm_2 = gemma_gpu_topk_moe and lt.pre_ffw_norm_2 != null;
-                const expert_input_buf = if (defer_gemma_pre_ffw_norm_2)
+                // The 49-72 token RDNA prefill fast tail already uses top-1
+                // routed experts, skips the shared expert, and preserves the
+                // terminal guard exactly. Reuse ffn_norm_buf for those early
+                // tokens to avoid the extra pre_ffw_norm_2 dispatch+barrier
+                // that is charged to the moe.topk bucket.
+                const skip_gemma_short_prefill_pre_norm_2 =
+                    gemma_gpu_topk_moe and gemma_short_prefill_fast_tail and lt.pre_ffw_norm_2 != null;
+                const defer_gemma_pre_ffw_norm_2 = gemma_gpu_topk_moe and lt.pre_ffw_norm_2 != null and !skip_gemma_short_prefill_pre_norm_2;
+                const expert_input_buf = if (skip_gemma_short_prefill_pre_norm_2)
+                    self.ffn_norm_buf
+                else if (defer_gemma_pre_ffw_norm_2)
                     self.residual_buf
                 else if (lt.pre_ffw_norm_2) |pre_norm_t| blk: {
                     try self.dispatchRmsNorm(
@@ -9024,11 +9039,7 @@ pub const InferenceEngine = struct {
                 self.endProfilePhase(.moe_routed, moe_phase);
 
                 const skip_gemma_short_prefill_shared_expert =
-                    use_prefill_tail_topk and
-                    config.architecture == .gemma and
-                    gemma_short_prefill_limit == gemma_prefill_micro_prompt_topk and
-                    self.prefill_embed_big_token_count >= gemma_prefill_long_draft_prompt_min_tokens and
-                    self.prefill_embed_big_token_count <= gemma_prefill_shared_skip_max_tokens;
+                    gemma_short_prefill_fast_tail;
 
                 // Gemma 4 MoE CPU path: post_ffw_norm_2 on MoE accumulation before shared expert.
                 // The 49-72 token RDNA prefill fast path already treats early
