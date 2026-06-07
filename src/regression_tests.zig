@@ -190,6 +190,24 @@ test "Vulkan Intel batched prefill keeps chunk override for fallback debugging" 
     try expectContainsNear(src, "Intel batched prefill chunking ENABLED", "prefillBatchedImpl(state, prompt_tokens[offset..end])", 1200);
 }
 
+test "Vulkan Intel SSM fast paths are default-off with env opt-in" {
+    const src = @embedFile("compute/forward.zig");
+    try expectContains(src, "const intel_ssm_fast_paths_default_off = isIntelGpuVendor(gpu_config.vendor) and config.ssm_d_inner > 0;");
+    try expectContainsNear(src, "const fused_ssm_ab_policy_enabled", "fused_ssm_ab_forced_on", 500);
+    try expectContainsNear(src, "const ssm_delta_cols8_policy_enabled", "ssm_delta_cols8_forced_on", 500);
+    try expectContainsNear(src, "Fused SSM pre-norm DISABLED by default on Intel SSM path", "ZINC_FUSED_SSM_AB=1", 200);
+    try expectContainsNear(src, "SSM delta cols8 DISABLED by default on Intel SSM path", "ZINC_SSM_DELTA_COLS8=1", 200);
+}
+
+test "Vulkan Qwen 3.6 MoE top-k caps default to full metadata top-k on Intel" {
+    const src = @embedFile("compute/forward.zig");
+    try expectContains(src, "const qwen36_moe_intel_safe_defaults = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);");
+    try expectContains(src, "const qwen36_topk_default: u32 = if (qwen36_moe_intel_safe_defaults) 0 else 3;");
+    try expectContains(src, "const qwen36_prefill_topk_default: u32 = if (qwen36_moe_intel_safe_defaults) 0 else 1;");
+    try expectContains(src, "Qwen 3.6 MoE top-k cap disabled by default on Intel");
+    try expectContains(src, "Qwen 3.6 non-terminal prefill MoE top-k cap disabled by default on Intel");
+}
+
 test "Vulkan prefillBatched uses all batched primitives in the per-layer loop" {
     const src = @embedFile("compute/forward.zig");
     const fn_marker = "fn prefillBatchedImpl(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {";

@@ -2287,7 +2287,8 @@ pub const InferenceEngine = struct {
             break :blk alpha0.info.type_ == .f32 and beta0.info.type_ == .f32;
         };
         const qwen36_topk_env = std.posix.getenv("ZINC_QWEN36_MOE_TOPK");
-        const qwen36_topk_default: u32 = 3;
+        const qwen36_moe_intel_safe_defaults = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
+        const qwen36_topk_default: u32 = if (qwen36_moe_intel_safe_defaults) 0 else 3;
         const qwen36_topk_limit: u32 = if (qwen36_like_f32_ssm) blk: {
             if (qwen36_topk_env) |raw| {
                 const parsed = std.fmt.parseInt(u32, raw, 10) catch qwen36_topk_default;
@@ -2303,6 +2304,8 @@ pub const InferenceEngine = struct {
             });
         } else if (qwen36_like_f32_ssm and qwen36_topk_env != null) {
             log.info("Qwen 3.6 MoE top-k cap disabled via ZINC_QWEN36_MOE_TOPK={s}", .{qwen36_topk_env.?});
+        } else if (qwen36_moe_intel_safe_defaults) {
+            log.info("Qwen 3.6 MoE top-k cap disabled by default on Intel (set ZINC_QWEN36_MOE_TOPK to cap)", .{});
         }
         const gemma_topk_env = std.posix.getenv("ZINC_GEMMA_MOE_TOPK");
         const gemma_topk_default: u32 = if (config.architecture == .gemma and isIntelGpuVendor(gpu_config.vendor)) 4 else 0;
@@ -2321,7 +2324,7 @@ pub const InferenceEngine = struct {
             });
         }
         const qwen36_prefill_topk_env = std.posix.getenv("ZINC_QWEN36_MOE_PREFILL_TOPK");
-        const qwen36_prefill_topk_default: u32 = 1;
+        const qwen36_prefill_topk_default: u32 = if (qwen36_moe_intel_safe_defaults) 0 else 1;
         const qwen36_prefill_tail_topk_limit: u32 = if (qwen36_like_f32_ssm) blk: {
             if (qwen36_prefill_topk_env) |raw| {
                 const parsed = std.fmt.parseInt(u32, raw, 10) catch qwen36_prefill_topk_default;
@@ -2348,6 +2351,8 @@ pub const InferenceEngine = struct {
             });
         } else if (qwen36_like_f32_ssm and qwen36_prefill_topk_env != null) {
             log.info("Qwen 3.6 non-terminal prefill MoE top-k cap disabled via ZINC_QWEN36_MOE_PREFILL_TOPK={s}", .{qwen36_prefill_topk_env.?});
+        } else if (qwen36_moe_intel_safe_defaults) {
+            log.info("Qwen 3.6 non-terminal prefill MoE top-k cap disabled by default on Intel (set ZINC_QWEN36_MOE_PREFILL_TOPK to cap)", .{});
         }
 
         const is_amd_rdna_vendor = gpu_config.vendor == .amd_rdna3 or
@@ -2401,35 +2406,66 @@ pub const InferenceEngine = struct {
             log.info("Fused FFN-norm + router DMMV DISABLED via ZINC_FUSED_RMS_ROUTER=0", .{});
         }
 
+        const intel_ssm_fast_paths_default_off = isIntelGpuVendor(gpu_config.vendor) and config.ssm_d_inner > 0;
+
         // Fused SSM pre-norm (cycle 13): merges (rms_norm_mul → alpha
         // DMMV → beta DMMV) into a single dispatch when alpha+beta are
-        // f32 (Qwen 3.5/3.6 35B-A3B Q4_K_XL pack). Default-on whenever
-        // the rms_norm_dmmv_q4k_alpha_beta pipeline is loaded; disable
-        // via ZINC_FUSED_SSM_AB=0. Per-call gates (architecture, weight
-        // type) are evaluated in the forward path so models that don't
-        // fit silently fall back.
+        // f32 (Qwen 3.5/3.6 35B-A3B Q4_K_XL pack). Default-on whenever the
+        // rms_norm_dmmv_q4k_alpha_beta pipeline is loaded, except Intel SSM
+        // models where the fused-SSM + cols8-delta pair corrupts Qwen3.5/3.6
+        // output on BMG. Disable via ZINC_FUSED_SSM_AB=0; force on for A/B via
+        // ZINC_FUSED_SSM_AB=1. Per-call gates (architecture, weight type) are
+        // evaluated in the forward path so models that don't fit silently fall
+        // back.
         const fused_ssm_ab_env = std.posix.getenv("ZINC_FUSED_SSM_AB");
         const fused_ssm_ab_explicitly_off = fused_ssm_ab_env != null and std.mem.eql(u8, fused_ssm_ab_env.?, "0");
-        const fused_ssm_ab_enabled = !fused_ssm_ab_explicitly_off and
+        const fused_ssm_ab_forced_on = fused_ssm_ab_env != null and !fused_ssm_ab_explicitly_off;
+        const fused_ssm_ab_policy_enabled = if (fused_ssm_ab_forced_on)
+            true
+        else if (fused_ssm_ab_explicitly_off)
+            false
+        else
+            !intel_ssm_fast_paths_default_off;
+        const fused_ssm_ab_enabled = fused_ssm_ab_policy_enabled and
             elementwise.pipeline_rms_norm_dmmv_q4k_alpha_beta != null and
             instance.push_descriptor_fn != null;
         if (fused_ssm_ab_enabled) {
-            log.info("Fused SSM pre-norm (rms+alpha+beta) ENABLED (default, set ZINC_FUSED_SSM_AB=0 to disable)", .{});
+            if (intel_ssm_fast_paths_default_off and fused_ssm_ab_forced_on) {
+                log.info("Fused SSM pre-norm (rms+alpha+beta) ENABLED via ZINC_FUSED_SSM_AB=1 on Intel SSM path", .{});
+            } else {
+                log.info("Fused SSM pre-norm (rms+alpha+beta) ENABLED (default, set ZINC_FUSED_SSM_AB=0 to disable)", .{});
+            }
         } else if (fused_ssm_ab_explicitly_off) {
             log.info("Fused SSM pre-norm DISABLED via ZINC_FUSED_SSM_AB=0", .{});
+        } else if (intel_ssm_fast_paths_default_off) {
+            log.info("Fused SSM pre-norm DISABLED by default on Intel SSM path (set ZINC_FUSED_SSM_AB=1 to enable experimental path)", .{});
         }
 
         // SSM delta cols8: port of llama.cpp's GDN workgroup shape for
         // S=128 (8 output rows per wave64 via subgroupClusteredAdd). Disable
-        // via ZINC_SSM_DELTA_COLS8=0 for A/B checks.
+        // via ZINC_SSM_DELTA_COLS8=0 for A/B checks. Default-off on Intel SSM
+        // models together with fused SSM pre-norm for correctness.
         const ssm_delta_cols8_env = std.posix.getenv("ZINC_SSM_DELTA_COLS8");
         const ssm_delta_cols8_explicitly_off = ssm_delta_cols8_env != null and std.mem.eql(u8, ssm_delta_cols8_env.?, "0");
-        const ssm_delta_cols8_enabled = !ssm_delta_cols8_explicitly_off and
+        const ssm_delta_cols8_forced_on = ssm_delta_cols8_env != null and !ssm_delta_cols8_explicitly_off;
+        const ssm_delta_cols8_policy_enabled = if (ssm_delta_cols8_forced_on)
+            true
+        else if (ssm_delta_cols8_explicitly_off)
+            false
+        else
+            !intel_ssm_fast_paths_default_off;
+        const ssm_delta_cols8_enabled = ssm_delta_cols8_policy_enabled and
             elementwise.pipeline_ssm_delta_net_cols8 != null;
         if (ssm_delta_cols8_enabled) {
-            log.info("SSM delta cols8 ENABLED (default, set ZINC_SSM_DELTA_COLS8=0 to disable)", .{});
+            if (intel_ssm_fast_paths_default_off and ssm_delta_cols8_forced_on) {
+                log.info("SSM delta cols8 ENABLED via ZINC_SSM_DELTA_COLS8=1 on Intel SSM path", .{});
+            } else {
+                log.info("SSM delta cols8 ENABLED (default, set ZINC_SSM_DELTA_COLS8=0 to disable)", .{});
+            }
         } else if (ssm_delta_cols8_explicitly_off) {
             log.info("SSM delta cols8 DISABLED via ZINC_SSM_DELTA_COLS8=0", .{});
+        } else if (intel_ssm_fast_paths_default_off) {
+            log.info("SSM delta cols8 DISABLED by default on Intel SSM path (set ZINC_SSM_DELTA_COLS8=1 to enable experimental path)", .{});
         }
 
         const ssm_delta_normed_qk_env = std.posix.getenv("ZINC_SSM_DELTA_NORMED_QK");

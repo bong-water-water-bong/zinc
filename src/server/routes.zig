@@ -3327,8 +3327,8 @@ test "parseJsonFields extracts enable_thinking flag" {
     try std.testing.expectEqual(@as(?bool, false), disabled.enable_thinking);
 }
 
-test "shouldForceDisableThinking keeps qwen thinking enabled" {
-    try std.testing.expect(!shouldForceDisableThinking(
+test "shouldForceDisableThinking follows qwen catalog stability flags" {
+    try std.testing.expect(shouldForceDisableThinking(
         null,
         "/Users/test/Library/Caches/zinc/models/models/qwen36-35b-a3b-q4k-xl/model.gguf",
         "Qwen3.6-35B-A3B-UD-Q4_K_XL",

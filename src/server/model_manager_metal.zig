@@ -654,13 +654,13 @@ test "collectCatalogView exposes validated qwen thinking toggles on Metal" {
         if (std.mem.eql(u8, entry.id, "qwen36-35b-a3b-q4k-xl")) {
             saw_active = true;
             try std.testing.expect(entry.active);
-            try std.testing.expect(entry.supports_thinking_toggle);
+            try std.testing.expect(!entry.supports_thinking_toggle);
         }
     }
     try std.testing.expect(saw_active);
 }
 
-test "collectCatalogView preserves qwen36 thinking toggle for raw matched path on Metal" {
+test "collectCatalogView disables qwen36 A3B thinking toggle for raw matched path on Metal" {
     var fake = ModelManager{
         .allocator = std.testing.allocator,
         .device = undefined,
@@ -719,7 +719,7 @@ test "collectCatalogView preserves qwen36 thinking toggle for raw matched path o
         if (std.mem.eql(u8, entry.id, "qwen36-35b-a3b-q4k-xl")) {
             qwen36_active = true;
             try std.testing.expect(entry.active);
-            try std.testing.expect(entry.supports_thinking_toggle);
+            try std.testing.expect(!entry.supports_thinking_toggle);
         }
         try std.testing.expect(!std.mem.eql(u8, entry.id, "Qwen3.6-35B-A3B-UD-Q4_K_XL"));
     }

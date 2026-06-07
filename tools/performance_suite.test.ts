@@ -217,6 +217,7 @@ test("default Intel cases use the remote managed cache layout", () => {
 
   expect(qwen?.model_path).toBe("/remote/cache/qwen35-9b-q4k-m/model.gguf");
   expect(qwen?.prompt_mode).toBe("raw");
+  expect(qwen?.context_tokens).toBe(512);
 });
 
 test("performance suite canonicalizes and labels Qwen 3.6 GGUFs", () => {
@@ -241,8 +242,10 @@ test("local ZINC command prefers managed model ids when using the default cache"
     prompt_mode: "raw",
     prompt: "The capital of France is",
     max_tokens: 8,
+    context_tokens: 512,
   });
   expect(cmd).toContain("--model-id qwen35-9b-q4k-m");
+  expect(cmd).toContain("--context 512");
   expect(cmd).not.toContain(" -m ");
 });
 
@@ -270,6 +273,7 @@ test("Intel ZINC command does not inject RDNA-specific environment", () => {
     prompt_mode: "raw",
     prompt: "The capital of France is",
     max_tokens: 8,
+    context_tokens: 512,
   }, {
     host: "intel.local",
     user: "tempuser",
@@ -280,6 +284,7 @@ test("Intel ZINC command does not inject RDNA-specific environment", () => {
 
   expect(cmd).toContain("tempuser@intel.local");
   expect(cmd).toContain("./zig-out/bin/zinc");
+  expect(cmd).toContain("--context 512");
   expect(cmd).not.toContain("RADV_PERFTEST");
   expect(cmd).not.toContain("--chat");
 });

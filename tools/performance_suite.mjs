@@ -889,6 +889,7 @@ export function localZincCommand(caseDef) {
   const parts = ["./zig-out/bin/zinc"];
   if (caseDef.prompt_mode === "chat") parts.push("--chat");
   parts.push("-n", String(caseDef.max_tokens));
+  if (caseDef.context_tokens != null) parts.push("--context", String(caseDef.context_tokens));
   if (shouldUseManagedModelId(caseDef)) {
     parts.push("--model-id", caseDef.model_id);
   } else {
@@ -1293,9 +1294,9 @@ export function remoteZincCommand(caseDef, creds) {
     "./zig-out/bin/zinc",
     "-n",
     String(caseDef.max_tokens),
-    "-m",
-    shellQuote(caseDef.model_path),
   );
+  if (caseDef.context_tokens != null) parts.push("--context", String(caseDef.context_tokens));
+  parts.push("-m", shellQuote(caseDef.model_path));
   if (creds.vkDevice != null) parts.push("-d", String(creds.vkDevice));
   if (caseDef.prompt_mode === "chat") parts.push("--chat");
   parts.push("--prompt", shellQuote(caseDef.prompt));
@@ -1802,9 +1803,14 @@ export function defaultIntelCases(modelRoot) {
       prompt_mode: "raw",
       prompt: defaultPromptForModelId("qwen35-9b-q4k-m"),
       max_tokens: defaultMaxTokensForModelId("qwen35-9b-q4k-m"),
+      context_tokens: defaultIntelContextTokensForModel("qwen35-9b-q4k-m"),
       notes: ["Intel Arc Vulkan comparison against llama.cpp on the same host"],
     },
   ];
+}
+
+function defaultIntelContextTokensForModel(_id) {
+  return 512;
 }
 
 async function discoverRemoteCases(modelRoot, creds, note) {
@@ -1842,7 +1848,11 @@ async function discoverRdnaCases(modelRoot, creds) {
 }
 
 async function discoverIntelCases(modelRoot, creds) {
-  return discoverRemoteCases(modelRoot, creds, "Auto-discovered on the Intel benchmark node");
+  const cases = await discoverRemoteCases(modelRoot, creds, "Auto-discovered on the Intel benchmark node");
+  return cases.map((entry) => ({
+    ...entry,
+    context_tokens: entry.context_tokens ?? defaultIntelContextTokensForModel(entry.id),
+  }));
 }
 
 async function rdnaPathExists(modelFile, creds) {
@@ -1995,6 +2005,7 @@ function buildScenarioCase(entry, scenarioDef) {
     prompt_mode: scenarioDef.prompt_mode ?? entry.prompt_mode,
     prompt: scenarioDef.prompt,
     max_tokens: scenarioDef.max_tokens,
+    context_tokens: scenarioDef.context_tokens ?? entry.context_tokens,
   };
 }
 
