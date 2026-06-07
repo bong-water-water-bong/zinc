@@ -76,6 +76,8 @@ const gemma_prefill_tail_topk_default: u32 = 4;
 const gemma_prefill_micro_prompt_topk: u32 = 1;
 const gemma_prefill_micro_prompt_tokens: u32 = 72;
 const gemma_prefill_micro_prompt_guard_tokens: u32 = 8;
+const gemma_prefill_long_draft_prompt_min_tokens: u32 = 49;
+const gemma_prefill_long_draft_prompt_guard_tokens: u32 = 4;
 const gemma_prefill_tiny_prompt_topk: u32 = 2;
 const gemma_prefill_tiny_prompt_tokens: u32 = 80;
 const gemma_prefill_short_prompt_topk: u32 = 3;
@@ -2325,12 +2327,15 @@ pub const InferenceEngine = struct {
         else
             0;
         if (gemma_prefill_tail_topk_limit > 0) {
-            log.info("Gemma non-terminal prefill MoE top-k capped at {d} before final {d} prompt tokens on RDNA; prompts <= {d} tokens use cap {d} with final-token guard {d}, prompts <= {d} tokens use cap {d}, prompts <= {d} tokens use cap {d} (set ZINC_GEMMA_MOE_TOPK=0 to keep metadata top-k={d} throughout prefill)", .{
+            log.info("Gemma non-terminal prefill MoE top-k capped at {d} before final {d} prompt tokens on RDNA; prompts <= {d} tokens use cap {d} with final-token guard {d}, prompts {d}-{d} tokens tighten that guard to {d}, prompts <= {d} tokens use cap {d}, prompts <= {d} tokens use cap {d} (set ZINC_GEMMA_MOE_TOPK=0 to keep metadata top-k={d} throughout prefill)", .{
                 gemma_prefill_tail_topk_limit,
                 gemma_prefill_tail_topk_guard_tokens,
                 gemma_prefill_micro_prompt_tokens,
                 gemma_prefill_micro_prompt_topk,
                 gemma_prefill_micro_prompt_guard_tokens,
+                gemma_prefill_long_draft_prompt_min_tokens,
+                gemma_prefill_micro_prompt_tokens,
+                gemma_prefill_long_draft_prompt_guard_tokens,
                 gemma_prefill_tiny_prompt_tokens,
                 gemma_prefill_tiny_prompt_topk,
                 gemma_prefill_short_prompt_tokens,
@@ -7497,11 +7502,17 @@ pub const InferenceEngine = struct {
                     gemma_prefill_short_prompt_topk
                 else
                     self.moe_prefill_tail_topk_limit;
+                const gemma_effective_micro_guard: u32 = if (config.architecture == .gemma and
+                    self.prefill_embed_big_token_count >= gemma_prefill_long_draft_prompt_min_tokens and
+                    self.prefill_embed_big_token_count <= gemma_prefill_micro_prompt_tokens)
+                    gemma_prefill_long_draft_prompt_guard_tokens
+                else
+                    gemma_prefill_micro_prompt_guard_tokens;
                 const effective_prefill_tail_topk_guard: u32 = if (config.architecture == .gemma and
                     self.prefill_embed_big_token_count > 0 and
                     self.prefill_embed_big_token_count <= gemma_prefill_micro_prompt_tokens and
-                    self.moe_prefill_tail_topk_guard_tokens > gemma_prefill_micro_prompt_guard_tokens)
-                    gemma_prefill_micro_prompt_guard_tokens
+                    self.moe_prefill_tail_topk_guard_tokens > gemma_effective_micro_guard)
+                    gemma_effective_micro_guard
                 else
                     self.moe_prefill_tail_topk_guard_tokens;
                 const use_prefill_tail_topk = self.prefill_active and
