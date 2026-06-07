@@ -41,7 +41,8 @@ kernel void main0(
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    threadgroup float partial_sums[N_SIMDGROUPS];
+    threadgroup float partial_sums_r[N_SIMDGROUPS];
+    threadgroup float partial_sums_h[N_SIMDGROUPS];
 
     const uint base = group_id * p.n;
 
@@ -53,13 +54,12 @@ kernel void main0(
     }
 
     float sg_sum = simd_sum(sum_sq_r);
-    if (lane == 0) partial_sums[sg_idx] = sg_sum;
+    if (lane == 0) partial_sums_r[sg_idx] = sg_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Mirror residual_rms_norm.metal: every simdgroup redundantly performs the
     // final 8-way reduction, avoiding the broadcast barrier through
-    // partial_sums[0]. The later barrier before the second reduction still
-    // protects partial_sums reuse across simdgroups.
-    const float part_r = (lane < N_SIMDGROUPS) ? partial_sums[lane] : 0.0f;
+    // partial_sums_r[0].
+    const float part_r = (lane < N_SIMDGROUPS) ? partial_sums_r[lane] : 0.0f;
     const float total_sq_r = simd_sum(part_r);
     const float rms_inv_r = fast::rsqrt(fast::divide(total_sq_r, float(p.n)) + p.eps);
 
@@ -85,11 +85,13 @@ kernel void main0(
         sum_sq_h += h * h;
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Use a separate scratch row for the second reduction so faster simdgroups
+    // can start the hidden pass without waiting for every lane to finish reading
+    // partial_sums_r above.
     sg_sum = simd_sum(sum_sq_h);
-    if (lane == 0) partial_sums[sg_idx] = sg_sum;
+    if (lane == 0) partial_sums_h[sg_idx] = sg_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float part_h = (lane < N_SIMDGROUPS) ? partial_sums[lane] : 0.0f;
+    const float part_h = (lane < N_SIMDGROUPS) ? partial_sums_h[lane] : 0.0f;
     const float total_sq_h = simd_sum(part_h);
     const float rms_inv_h = fast::rsqrt(fast::divide(total_sq_h, float(p.n)) + p.eps);
 
