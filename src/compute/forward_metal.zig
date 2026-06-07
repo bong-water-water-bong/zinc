@@ -1641,6 +1641,7 @@ const ArgmaxPush = extern struct {
 
 const ArgmaxPairsPush = extern struct {
     n_pairs: u32,
+    stride: u32,
 };
 
 /// Push constants for SwiGLU dispatch (matches SPIRV-Cross layout: buffer(0)).
@@ -8444,9 +8445,16 @@ fn dispatchArgmaxPairsOnCmd(
     n_pairs: u32,
 ) void {
     if (n_pairs == 0) return;
-    const reduce_push = ArgmaxPairsPush{ .n_pairs = n_pairs };
+    const block_size: u32 = if (n_pairs >= 4096 and engine.argmax_pairs_pipe.max_threads_per_threadgroup >= 1024)
+        1024
+    else
+        256;
+    const reduce_push = ArgmaxPairsPush{
+        .n_pairs = n_pairs,
+        .stride = block_size,
+    };
     const reduce_bufs = [_]*const MetalBuffer{ partials_buf, output_buf };
-    cmd.dispatchV2(&engine.argmax_pairs_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &reduce_bufs, &reduce_push, @sizeOf(ArgmaxPairsPush), 2);
+    cmd.dispatchV2(&engine.argmax_pairs_pipe, .{ 1, 1, 1 }, .{ block_size, 1, 1 }, &reduce_bufs, &reduce_push, @sizeOf(ArgmaxPairsPush), 2);
 }
 
 fn writeCpuArgmax(engine: *const InferenceEngine, logits: [*]const f32, n: u32) void {

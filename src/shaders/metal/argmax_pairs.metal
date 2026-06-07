@@ -3,6 +3,7 @@ using namespace metal;
 
 struct ArgmaxPairsPush {
     uint n_pairs;
+    uint stride;
 };
 
 kernel void main0(
@@ -20,7 +21,7 @@ kernel void main0(
     float best_val = -INFINITY;
     uint best_idx = 0xffffffffu;
 
-    for (uint i = tid; i < p.n_pairs; i += 256u) {
+    for (uint i = tid; i < p.n_pairs; i += p.stride) {
         const uint idx = partials[i * 2u + 0u];
         const float v = as_type<float>(partials[i * 2u + 1u]);
         if (v > best_val || (v == best_val && idx < best_idx)) {
