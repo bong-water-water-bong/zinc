@@ -269,6 +269,7 @@ pub fn build(b: *std.Build) void {
         "mul_mm_q4k_gate_up_geglu",
         "mul_mm_q4k_gate_up_geglu_full",
         "mul_mm_q6k",
+        "mul_mm_q6k_tail8",
         "count_experts",
         // Previously-orphaned shaders: these .comp files were added by their
         // cycles (dmmv_f32_dual_batch + ssm_conv1d_batched in effort-15 cycle 9;
