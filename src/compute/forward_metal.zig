@@ -7458,13 +7458,25 @@ pub const InferenceEngine = struct {
             log.info("  debug-validation {d:.2} ms", .{nsToMs(profile.debug_validation_ns)});
         }
         if (kernel_timing.enabled) {
-            var top_buf: [5]kernel_timing.Entry = undefined;
-            const top = kernel_timing.topByTotalNs(&top_buf);
-            if (top.len == 0) {
+            var top_total_buf: [5]kernel_timing.Entry = undefined;
+            const top_total = kernel_timing.topByTotalNs(&top_total_buf);
+            if (top_total.len == 0) {
                 log.info("  kernel timing: probe enabled but no dispatches recorded", .{});
             } else {
-                log.info("  kernel timing (ZINC_METAL_KERNEL_TIMING — distorts decode; CPU-side per-dispatch sync):", .{});
-                for (top, 0..) |entry, rank| {
+                log.info("  kernel timing by total (ZINC_METAL_KERNEL_TIMING — distorts decode; CPU-side per-dispatch sync):", .{});
+                for (top_total, 0..) |entry, rank| {
+                    const avg_us = @as(f64, @floatFromInt(entry.avg_ns)) / 1_000.0;
+                    const max_us = @as(f64, @floatFromInt(entry.max_ns)) / 1_000.0;
+                    const total_ms = @as(f64, @floatFromInt(entry.total_ns)) / 1_000_000.0;
+                    log.info(
+                        "    #{d}: {s} calls={d} avg={d:.2}us max={d:.2}us total={d:.2}ms",
+                        .{ rank + 1, entry.name, entry.calls, avg_us, max_us, total_ms },
+                    );
+                }
+                var top_avg_buf: [5]kernel_timing.Entry = undefined;
+                const top_avg = kernel_timing.topByAvgNs(&top_avg_buf);
+                log.info("  kernel timing by avg dispatch:", .{});
+                for (top_avg, 0..) |entry, rank| {
                     const avg_us = @as(f64, @floatFromInt(entry.avg_ns)) / 1_000.0;
                     const max_us = @as(f64, @floatFromInt(entry.max_ns)) / 1_000.0;
                     const total_ms = @as(f64, @floatFromInt(entry.total_ns)) / 1_000_000.0;
