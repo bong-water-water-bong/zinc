@@ -4121,7 +4121,6 @@ pub const InferenceEngine = struct {
     position: u32,
     max_context_tokens: u32,
     profile_enabled: bool,
-    q8_shape_profile_enabled: bool,
     q8_repacked_dispatch_profile_enabled: bool,
     debug_validation_enabled: bool,
     gemma_moe_validation_enabled: bool,
@@ -4323,7 +4322,6 @@ pub const InferenceEngine = struct {
         self.position = 0;
         self.max_context_tokens = max_ctx;
         self.profile_enabled = options.profile_enabled;
-        self.q8_shape_profile_enabled = readBoolEnv("ZINC_METAL_Q8_SHAPE_PROFILE") orelse false;
         self.q8_repacked_dispatch_profile_enabled = readBoolEnv("ZINC_METAL_Q8_DISPATCH_PROFILE") orelse false;
         self.debug_validation_enabled = options.debug_validation_enabled;
         self.gemma_moe_validation_enabled = readBoolEnv("ZINC_GEMMA_MOE_VALIDATE") orelse false;
@@ -8240,7 +8238,7 @@ fn recordDmmvProfile(
         else => {},
     }
     recordDetailedDmmvBytes(profile, classifyDmmvDetail(engine, tensor, path), bytes);
-    if (tensor.info.type_ == .q8_0 and engine.q8_shape_profile_enabled) {
+    if (tensor.info.type_ == .q8_0) {
         recordQ8ShapeProfile(profile, path, rows, cols, bytes);
     }
 }
@@ -8259,7 +8257,7 @@ fn recordMoeDmmvProfile(
     recordDispatchQuantBytes(profile, tensor.info.type_, bytes);
     profile.moe_expert_bytes += bytes;
     recordDetailedDmmvBytes(profile, classifyDmmvDetail(engine, tensor, .moe_expert), bytes);
-    if (tensor.info.type_ == .q8_0 and engine.q8_shape_profile_enabled) {
+    if (tensor.info.type_ == .q8_0) {
         recordQ8ShapeProfile(profile, .moe_expert, rows, cols, bytes);
     }
 }
