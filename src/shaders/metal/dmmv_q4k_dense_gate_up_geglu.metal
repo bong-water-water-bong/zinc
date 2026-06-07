@@ -114,8 +114,11 @@ kernel void main0(
     device const float* x = X + (p.x_offset / 4);
     device float* out = activatedY + (p.y0_offset / 4);
 
-    float gate_sum[NR0] = {0.f, 0.f};
-    float up_sum[NR0] = {0.f, 0.f};
+    // Keep the two row accumulators in vector registers. The failed inline
+    // row/projection interleave for this GeGLU shader was too register-heavy;
+    // this preserves the helper boundary while avoiding tiny thread arrays.
+    float2 gate_sum = float2(0.0f);
+    float2 up_sum = float2(0.0f);
 
     device const float* y4 = x + ix * QK_K + 64 * iq + 8 * ir;
 
