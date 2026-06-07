@@ -1139,3 +1139,13 @@ extern "C" __global__ void gemm_q5k_tiled_v2(const unsigned char* a, const float
         for(int j=0;j<4;j++){ unsigned tok=t0+tx*4u+(unsigned)j;
             if(row<pc.M&&tok<pc.T){ unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row; if(pc.acc_mode!=0u) Y[yi]+=acc[i][j]; else Y[yi]=acc[i][j]; } } }
 }
+
+// ---- sigmoid_mul (qwen35 attention gate) — out[i] = a[i] * sigmoid(gate[i]) ---
+// ABI: inputs first, output last (matches swiglu). In-place safe (out may alias a).
+struct SigmoidMulPush { unsigned N; };
+extern "C" __global__ void sigmoid_mul(const float* a, const float* gate, float* out, SigmoidMulPush pc) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pc.N) return;
+    float g = gate[idx];
+    out[idx] = a[idx] * (1.0f / (1.0f + expf(-g)));
+}
