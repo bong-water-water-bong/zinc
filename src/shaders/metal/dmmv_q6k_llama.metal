@@ -239,10 +239,10 @@ kernel void main0(
     device float* out = Y + (p.y_offset / 4u);
     // The Zig dispatcher only routes row-multiple-of-four dense shapes to this
     // llama-style Q6_K path, so the NR0=2 row pair is always in bounds.
-    FOR_UNROLL (ushort row = 0u; row < NR0; ++row) {
-        const float total = simd_sum(sumf[row]);
-        if (tiisg == 0u) {
-            out[first_row + uint(row)] = total;
-        }
+    const float total0 = simd_sum(sumf.x);
+    const float total1 = simd_sum(sumf.y);
+    if (tiisg == 0u) {
+        out[first_row + 0u] = total0;
+        out[first_row + 1u] = total1;
     }
 }

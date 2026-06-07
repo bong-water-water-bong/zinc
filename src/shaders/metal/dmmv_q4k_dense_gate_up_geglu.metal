@@ -265,12 +265,12 @@ kernel void main0(
         y4 += 4 * QK_K;
     }
 
-    FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        const int dst_row = first_row + row;
-        const float gate_total = simd_sum(gate_sum[row]);
-        const float up_total = simd_sum(up_sum[row]);
-        if (tiisg == 0) {
-            out[dst_row] = geglu(gate_total, up_total);
-        }
+    const float gate_total0 = simd_sum(gate_sum.x);
+    const float gate_total1 = simd_sum(gate_sum.y);
+    const float up_total0 = simd_sum(up_sum.x);
+    const float up_total1 = simd_sum(up_sum.y);
+    if (tiisg == 0) {
+        out[first_row + 0] = geglu(gate_total0, up_total0);
+        out[first_row + 1] = geglu(gate_total1, up_total1);
     }
 }

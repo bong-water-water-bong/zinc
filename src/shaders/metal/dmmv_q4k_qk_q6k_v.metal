@@ -338,9 +338,10 @@ kernel void main0(
     }
 
     device float* out = Y_v + (p.y_v_offset / 4u);
-    FOR_UNROLL (ushort row = 0u; row < NR0; ++row) {
-        const uint dst_row = first_v_row + uint(row);
-        const float total = simd_sum(sumf[row]);
-        if (tiisg == 0u) out[dst_row] = total;
+    const float total0 = simd_sum(sumf.x);
+    const float total1 = simd_sum(sumf.y);
+    if (tiisg == 0u) {
+        out[first_v_row + 0u] = total0;
+        out[first_v_row + 1u] = total1;
     }
 }
