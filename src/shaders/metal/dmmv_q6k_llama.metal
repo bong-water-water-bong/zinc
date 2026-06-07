@@ -58,7 +58,10 @@ kernel void main0(
     const uint q_offset_l = 64u * uint(ip) + uint(l0);
     const uint q_offset_h = 32u * uint(ip) + uint(l0);
 
-    float sumf[NR0] = {0.0f, 0.0f};
+    // Keep the llama.cpp NR0=2 row pair as a vector accumulator. The inner
+    // loop already builds a float2 delta for row0/row1; carrying that shape to
+    // the final simd reductions avoids a two-slot thread-private scalar array.
+    float2 sumf = float2(0.0f);
 
     for (uint bi = ix; bi < nb; bi += 2u) {
         device const float* y = src1 + bi * QK_K + y_offset;
@@ -222,12 +225,11 @@ kernel void main0(
         const float2 head_dots = float2(dot(sums_0, sc4_0), dot(sums_1, sc4_1));
         const float2 tail_dots = float2(dot(yl_sum4, sc4_0), dot(yl_sum4, sc4_1));
         const float2 delta = dh_d * fma(float2(-32.0f), tail_dots, head_dots);
-        sumf[0] += delta[0];
-        sumf[1] += delta[1];
+        sumf += delta;
     }
 
     device float* out = Y + (p.y_offset / 4u);
-    for (ushort row = 0u; row < NR0; ++row) {
+    FOR_UNROLL (ushort row = 0u; row < NR0; ++row) {
         const uint dst_row = first_row + uint(row);
         if (dst_row >= p.M) {
             continue;
