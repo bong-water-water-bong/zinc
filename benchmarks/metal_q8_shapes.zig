@@ -2967,9 +2967,9 @@ fn benchmarkLmHeadQ4KArgmaxVariant(
 ) !BenchResult {
     var pipe = try loadShaderPipeline(device.ctx, "dmmv_q4k_lmhead_argmax");
     defer metal_pipeline.freePipeline(&pipe);
-    if (pipe.max_threads_per_threadgroup < 64) return error.InvalidThreadgroupSize;
+    if (pipe.max_threads_per_threadgroup < 256) return error.InvalidThreadgroupSize;
 
-    const rows_per_wg: u32 = 4;
+    const rows_per_wg: u32 = 16;
     const n_pairs = (hot_case.rows0 + rows_per_wg - 1) / rows_per_wg;
     var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&input_buf);
@@ -3861,7 +3861,7 @@ pub fn main() !void {
                     @tagName(hot_case.tensor0.info.type_),
                     hot_case.rows0,
                     hot_case.cols,
-                    (hot_case.rows0 + 3) / 4,
+                    (hot_case.rows0 + 15) / 16,
                     @as(f64, @floatFromInt(weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols))) / (1024.0 * 1024.0),
                 },
             );
