@@ -6068,6 +6068,13 @@ pub const InferenceEngine = struct {
         }
     }
 
+    inline fn updateBestArgmaxPartial(best_val: *f32, best_idx: *u32, idx: u32, val: f32) void {
+        if (val > best_val.* or (val == best_val.* and idx < best_idx.*)) {
+            best_val.* = val;
+            best_idx.* = idx;
+        }
+    }
+
     fn reduceLmHeadArgmaxPartialsCpu(self: *InferenceEngine, n_pairs: u32) ?u32 {
         if (n_pairs == 0) return null;
         const partials_ptr = self.argmax_partials_buf.cpu_ptr orelse return null;
@@ -6079,13 +6086,16 @@ pub const InferenceEngine = struct {
         var best_idx: u32 = std.math.maxInt(u32);
 
         var i: u32 = 0;
+        while (i + 3 < n_pairs) : (i += 4) {
+            const base = @as(usize, i) * 2;
+            updateBestArgmaxPartial(&best_val, &best_idx, words[base], @bitCast(words[base + 1]));
+            updateBestArgmaxPartial(&best_val, &best_idx, words[base + 2], @bitCast(words[base + 3]));
+            updateBestArgmaxPartial(&best_val, &best_idx, words[base + 4], @bitCast(words[base + 5]));
+            updateBestArgmaxPartial(&best_val, &best_idx, words[base + 6], @bitCast(words[base + 7]));
+        }
         while (i < n_pairs) : (i += 1) {
-            const idx = words[@as(usize, i) * 2];
-            const val: f32 = @bitCast(words[@as(usize, i) * 2 + 1]);
-            if (val > best_val or (val == best_val and idx < best_idx)) {
-                best_val = val;
-                best_idx = idx;
-            }
+            const base = @as(usize, i) * 2;
+            updateBestArgmaxPartial(&best_val, &best_idx, words[base], @bitCast(words[base + 1]));
         }
 
         if (best_idx == std.math.maxInt(u32)) return null;
