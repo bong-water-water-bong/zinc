@@ -213,8 +213,16 @@ kernel void main0(
         // token on Qwen3-8B Q4_K_M (38.46 GiB/step) — this kernel covers
         // ffn_down. Apple7 ALU is naturally 4-wide; the indexed scalar form
         // leaves the compiler emitting narrower lane-by-lane FMAs.
-        const float4 sc4_0 = float4(float(sc_0[0]), float(sc_0[2]), float(sc_0[4]), float(sc_0[6]));
-        const float4 sc4_1 = float4(float(sc_1[0]), float(sc_1[2]), float(sc_1[4]), float(sc_1[6]));
+        // Q6_K uses scale bytes sc[0,2,4,6] for this lane group. Read them
+        // as two unaligned packed vectors per row instead of four scalar
+        // byte loads, matching the packed-load discipline used by the
+        // llama.cpp-derived Q4_K row-pair kernels.
+        const packed_char4 sc_lo_0 = *((device const packed_char4*)sc_0);
+        const packed_char4 sc_hi_0 = *((device const packed_char4*)(sc_0 + 4));
+        const packed_char4 sc_lo_1 = *((device const packed_char4*)sc_1);
+        const packed_char4 sc_hi_1 = *((device const packed_char4*)(sc_1 + 4));
+        const float4 sc4_0 = float4(float(sc_lo_0.x), float(sc_lo_0.z), float(sc_hi_0.x), float(sc_hi_0.z));
+        const float4 sc4_1 = float4(float(sc_lo_1.x), float(sc_lo_1.z), float(sc_hi_1.x), float(sc_hi_1.z));
         // Cycle 62: port cycles 60/61's cross-row reduction vectorization to
         // this Q6_K kernel. The two independent
         // `d * fma(-32, dot(yl_sum4, sc4), dot(sums, sc4))` chains (row 0,
