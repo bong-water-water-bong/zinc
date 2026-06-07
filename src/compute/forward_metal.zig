@@ -732,6 +732,7 @@ const Q8ShapeStat = struct {
     bytes: u64 = 0,
     calls: u32 = 0,
 };
+const DmmvShapeStat = Q8ShapeStat;
 
 const Q8RepackedKernel = enum(u8) {
     tg128,
@@ -937,6 +938,8 @@ pub const RuntimeProfile = struct {
     ssm_conv_calls: u32 = 0,
     ssm_delta_calls: u32 = 0,
     ssm_gated_norm_calls: u32 = 0,
+    q4k_shape_stats: [16]DmmvShapeStat = [_]DmmvShapeStat{.{}} ** 16,
+    q6k_shape_stats: [16]DmmvShapeStat = [_]DmmvShapeStat{.{}} ** 16,
     q8_shape_stats: [16]Q8ShapeStat = [_]Q8ShapeStat{.{}} ** 16,
     q8_repacked_tg128_bytes: u64 = 0,
     q8_repacked_exact_qwen_bytes: u64 = 0,
@@ -1204,12 +1207,12 @@ fn bytesToGiB(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0;
 }
 
-fn q8ShapeStatMinusPrefix(total_slot: Q8ShapeStat, prefix: RuntimeProfile) Q8ShapeStat {
+fn dmmvShapeStatMinusPrefix(total_slot: DmmvShapeStat, prefix_stats: []const DmmvShapeStat) DmmvShapeStat {
     if (total_slot.calls == 0) return .{};
 
     var prefix_bytes: u64 = 0;
     var prefix_calls: u32 = 0;
-    for (prefix.q8_shape_stats) |slot| {
+    for (prefix_stats) |slot| {
         if (slot.calls != 0 and
             slot.path == total_slot.path and
             slot.rows == total_slot.rows and
@@ -1231,6 +1234,10 @@ fn q8ShapeStatMinusPrefix(total_slot: Q8ShapeStat, prefix: RuntimeProfile) Q8Sha
         .bytes = bytes,
         .calls = calls,
     };
+}
+
+fn q8ShapeStatMinusPrefix(total_slot: Q8ShapeStat, prefix: RuntimeProfile) Q8ShapeStat {
+    return dmmvShapeStatMinusPrefix(total_slot, prefix.q8_shape_stats[0..]);
 }
 
 fn q8RepackedDispatchStatMinusPrefix(total_slot: Q8RepackedDispatchStat, prefix: RuntimeProfile) Q8RepackedDispatchStat {
@@ -1362,6 +1369,12 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.q8_repacked_exact_qwen_calls = total.q8_repacked_exact_qwen_calls -| prefix.q8_repacked_exact_qwen_calls;
     delta.q8_repacked_quad_calls = total.q8_repacked_quad_calls -| prefix.q8_repacked_quad_calls;
     delta.q8_repacked_generic_calls = total.q8_repacked_generic_calls -| prefix.q8_repacked_generic_calls;
+    for (total.q4k_shape_stats, 0..) |slot, idx| {
+        delta.q4k_shape_stats[idx] = dmmvShapeStatMinusPrefix(slot, prefix.q4k_shape_stats[0..]);
+    }
+    for (total.q6k_shape_stats, 0..) |slot, idx| {
+        delta.q6k_shape_stats[idx] = dmmvShapeStatMinusPrefix(slot, prefix.q6k_shape_stats[0..]);
+    }
     for (total.q8_shape_stats, 0..) |slot, idx| {
         delta.q8_shape_stats[idx] = q8ShapeStatMinusPrefix(slot, prefix);
     }
@@ -1530,6 +1543,47 @@ fn dmmvPathLabel(path: DmmvPathClass) []const u8 {
         .lm_head => "lm-head",
         .dense_ffn => "dense",
     };
+}
+
+fn logDmmvHotShapes(label: []const u8, stats: []const DmmvShapeStat) void {
+    var top_idxs: [5]?usize = .{ null, null, null, null, null };
+    for (stats, 0..) |slot, idx| {
+        if (slot.calls == 0) continue;
+        var insert_pos: ?usize = null;
+        for (top_idxs, 0..) |maybe_top_idx, rank| {
+            if (maybe_top_idx) |top_idx| {
+                if (slot.bytes > stats[top_idx].bytes) {
+                    insert_pos = rank;
+                    break;
+                }
+            } else {
+                insert_pos = rank;
+                break;
+            }
+        }
+        if (insert_pos) |rank| {
+            var shift: usize = top_idxs.len - 1;
+            while (shift > rank) : (shift -= 1) {
+                top_idxs[shift] = top_idxs[shift - 1];
+            }
+            top_idxs[rank] = idx;
+        }
+    }
+
+    for (top_idxs, 0..) |maybe_idx, rank| {
+        if (maybe_idx) |idx| {
+            const slot = stats[idx];
+            log.info("  {s} hot #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
+                label,
+                rank + 1,
+                dmmvPathLabel(slot.path),
+                slot.rows,
+                slot.cols,
+                bytesToGiB(slot.bytes),
+                slot.calls,
+            });
+        }
+    }
 }
 
 /// Push constants for DMMV dispatch (matches GLSL layout).
@@ -7416,6 +7470,13 @@ pub const InferenceEngine = struct {
             } else {
                 logDetailedProfileBuckets(label, profile);
             }
+            const shape_profile = if (has_prefill_split) decode_profile else profile;
+            if (shape_profile.dmmv_q4k_bytes > 0) {
+                logDmmvHotShapes(if (has_prefill_split) "decode q4_k" else "q4_k", shape_profile.q4k_shape_stats[0..]);
+            }
+            if (shape_profile.dmmv_q6k_bytes > 0) {
+                logDmmvHotShapes(if (has_prefill_split) "decode q6_k" else "q6_k", shape_profile.q6k_shape_stats[0..]);
+            }
             if (profile.route_pack_layers > 0) {
                 log.info("  route-pack: layers {d} route_slots {d} active_block_upper {d} dense_dispatch_blocks {d} upper/dense {d:.1}%", .{
                     profile.route_pack_layers,
@@ -8249,14 +8310,24 @@ fn recordQ8ShapeProfile(
     cols: u32,
     bytes: u64,
 ) void {
-    for (&profile.q8_shape_stats) |*slot| {
+    recordDmmvShapeProfile(profile.q8_shape_stats[0..], path, rows, cols, bytes);
+}
+
+fn recordDmmvShapeProfile(
+    stats: []DmmvShapeStat,
+    path: DmmvPathClass,
+    rows: u32,
+    cols: u32,
+    bytes: u64,
+) void {
+    for (stats) |*slot| {
         if (slot.calls != 0 and slot.path == path and slot.rows == rows and slot.cols == cols) {
             slot.bytes += bytes;
             slot.calls += 1;
             return;
         }
     }
-    for (&profile.q8_shape_stats) |*slot| {
+    for (stats) |*slot| {
         if (slot.calls == 0) {
             slot.* = .{
                 .path = path,
@@ -8375,8 +8446,11 @@ fn recordDmmvProfile(
         else => {},
     }
     recordDetailedDmmvBytes(profile, classifyDmmvDetail(engine, tensor, path), bytes);
-    if (tensor.info.type_ == .q8_0) {
-        recordQ8ShapeProfile(profile, path, rows, cols, bytes);
+    switch (tensor.info.type_) {
+        .q4_k => recordDmmvShapeProfile(profile.q4k_shape_stats[0..], path, rows, cols, bytes),
+        .q6_k => recordDmmvShapeProfile(profile.q6k_shape_stats[0..], path, rows, cols, bytes),
+        .q8_0 => recordQ8ShapeProfile(profile, path, rows, cols, bytes),
+        else => {},
     }
 }
 
