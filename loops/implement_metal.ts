@@ -142,6 +142,7 @@ const GEMMA_PLATEAU_STALL_CYCLES = parsePositiveIntEnv("ZINC_GEMMA_PLATEAU_STALL
 const GEMMA_PLATEAU_WINDOW = parsePositiveIntEnv("ZINC_GEMMA_PLATEAU_WINDOW", 18);
 const GEMMA_POST_BREAKTHROUGH_FLOOR = parsePositiveFloatEnv("ZINC_GEMMA_POST_BREAKTHROUGH_FLOOR", 80);
 const GEMMA_POST_ROUTEPACK_PLATEAU_FLOOR = parsePositiveFloatEnv("ZINC_GEMMA_POST_ROUTEPACK_PLATEAU_FLOOR", 380);
+const GEMMA31_DECODE_REVERT_STORM_CYCLES = parsePositiveIntEnv("ZINC_GEMMA31_DECODE_REVERT_STORM_CYCLES", 8);
 // Optional outer-harness exact-shape Metal evidence pass. Agents are blocked
 // from running `bench-metal-shapes` because it reserves the Metal GPU; the
 // harness can safely run it between cycles and splice the output into the next
@@ -333,6 +334,22 @@ function isGemmaDecodeRun(
   state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan" | "metricMode">,
 ): boolean {
   return isGemmaRun(state) && (state?.metricMode ?? METRIC_MODE) === "decode";
+}
+
+function isGemma31DenseDecodeRun(
+  state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan" | "metricMode">,
+): boolean {
+  if (!isGemmaDecodeRun(state)) return false;
+  const effortText = [
+    state?.effortFile ?? "",
+    state?.effortPlan ?? "",
+  ].join("\n").toLowerCase();
+  const model = displayModelLabel().toLowerCase();
+  return state?.effortId === 12 ||
+    model.includes("gemma4-31b") ||
+    model.includes("31b") ||
+    effortText.includes("31b") ||
+    effortText.includes("dense decode");
 }
 
 function isQwen36PrefillRun(
@@ -639,6 +656,15 @@ function consecutiveReverts(cycles: CycleResult[]): number {
   return count;
 }
 
+function trailingRevertedCycles(cycles: CycleResult[]): CycleResult[] {
+  const tail: CycleResult[] = [];
+  for (let i = cycles.length - 1; i >= 0; i--) {
+    if (cycles[i].kept) break;
+    tail.push(cycles[i]);
+  }
+  return tail.reverse();
+}
+
 export type PlateauStopDecision = {
   stop: boolean;
   reason: string;
@@ -647,8 +673,11 @@ export type PlateauStopDecision = {
   bestCycle: number | null;
 };
 
+type PlateauStopState = Pick<RunState, "cycles" | "workload"> &
+  Partial<Pick<RunState, "effortId" | "effortFile" | "effortPlan" | "metricMode">>;
+
 export function detectAutoStopForPlateau(
-  state: Pick<RunState, "cycles" | "workload">,
+  state: PlateauStopState,
   opts: { revertStreak?: number; noBestCycles?: number } = {},
 ): PlateauStopDecision {
   const revertStreak = opts.revertStreak ?? AUTO_STOP_REVERT_STREAK;
@@ -657,6 +686,20 @@ export function detectAutoStopForPlateau(
   const last = state.cycles[state.cycles.length - 1];
   const revertCount = consecutiveReverts(state.cycles);
   const cyclesSinceBest = best && last ? Math.max(0, last.cycle - best.cycle) : 0;
+
+  if (
+    isGemma31DenseDecodeRun(state) &&
+    revertCount >= GEMMA31_DECODE_REVERT_STORM_CYCLES &&
+    cyclesSinceBest >= GEMMA_PLATEAU_STALL_CYCLES
+  ) {
+    return {
+      stop: true,
+      reason: `Gemma31 dense decode revert storm: ${revertCount} consecutive reverted cycles after best cycle ${best?.cycle ?? "?"}`,
+      consecutiveReverts: revertCount,
+      cyclesSinceBest,
+      bestCycle: best?.cycle ?? null,
+    };
+  }
 
   if (revertCount >= revertStreak) {
     return {
@@ -850,6 +893,17 @@ export function buildStructuralPivotDirective(state: RunState): string[] {
       lines.push("- Productive directions so far are queued-prefill schedule changes and router/RMS fusion. Prefer consuming exact-shape evidence, auditing full batched-prefill guard blockers, or validating public-suite prompt lengths.");
     }
   } else if (isGemmaDecodeRun(state)) {
+    const tail = trailingRevertedCycles(state.cycles);
+    if (isGemma31DenseDecodeRun(state) && tail.length >= GEMMA31_DECODE_REVERT_STORM_CYCLES) {
+      const tps = tail.map(c => c.tokPerSec).filter((v): v is number => v != null && Number.isFinite(v));
+      const range = tps.length > 0
+        ? `candidate range ${Math.min(...tps).toFixed(2)}-${Math.max(...tps).toFixed(2)} ${METRIC_LABEL}`
+        : "no parseable candidate throughput";
+      const first = tail[0];
+      const last = tail[tail.length - 1];
+      lines.push(`- REVERT-STORM FACT: ${tail.length} consecutive reverted cycles (#${first.cycle}-#${last.cycle}) after the promoted best; ${range}. Resume should stop/finalize the best tree instead of spending another source-edit cycle.`);
+      lines.push("- In this mode, do not add source/profile/instrumentation churn. Valid next work is outside the loop (public suite / Metal-shapes evidence) or one default-on production change that removes a named profile bucket and is expected to clear the promotion band.");
+    }
     lines.push("- For Gemma31 dense decode, the cycle-46..66 tail already mined Q4/Q6 row-pair carries, LM-head argmax widening, wide post-norm variants, hidden-scale tail fusion, and scope-vs-resource barrier swaps.");
     if (isGemmaDenseGeGLUNearMiss(state)) {
       lines.push("- The current GeGLU fast-tanh near-miss is real but correctness-blocked. Passive validator/profile-only cycles after the direct production-vs-unchecked-fast comparison are churn; either convert a validated mask into a default-on correct path or pivot to another named profile bucket.");
@@ -3496,6 +3550,22 @@ async function restorePromotedBestDuringPlateauIfNeeded(runDir: string, state: R
   await restoreBestTree(runDir, state, decision.reason);
 }
 
+async function stopBeforeNextCycleIfPlateaued(runDir: string, state: RunState): Promise<boolean> {
+  if (!AUTO_STOP_PLATEAU) return false;
+  const plateauStop = detectAutoStopForPlateau(state);
+  if (!plateauStop.stop) return false;
+
+  console.log(clr("1;35", "\n" + "=".repeat(64)));
+  console.log(clr("1;35", `  PLATEAU AUTO-STOP BEFORE NEXT CYCLE: ${plateauStop.reason}`));
+  if (plateauStop.bestCycle != null) {
+    console.log(clr("1;35", `  Best promoted cycle: ${plateauStop.bestCycle}; cycles since best: ${plateauStop.cyclesSinceBest}; consecutive reverts: ${plateauStop.consecutiveReverts}`));
+  }
+  console.log(clr("1;35", "=".repeat(64)));
+  await finalizeBestTreeIfNeeded(runDir, state);
+  await saveState(runDir, state);
+  return true;
+}
+
 async function runProfileBenchmark(): Promise<string> {
   console.log(clr("1;33", "  📊 Profiling run (--profile)..."));
   const run = await runCommand(
@@ -4175,6 +4245,14 @@ async function main() {
     if (state.effortFile) {
       console.log(`  Effort: ${clr("1;36", `#${state.effortId}`)} → ${state.effortFile}`);
     }
+  }
+
+  if (await stopBeforeNextCycleIfPlateaued(runDir, state)) {
+    console.log(clr("1;36", `\nLoop complete. Results: ${runDir}`));
+    console.log(clr("1;36", `Total cycles: ${state.cycles.length}`));
+    console.log(clr("1;36", `Kept: ${state.cycles.filter(c => c.kept).length}`));
+    console.log(clr("1;36", `Best kept-correct: ${bestKeptCorrectTokPerSec(state).toFixed(2)} ${METRIC_LABEL}; current accepted: ${currentAcceptedTokPerSec(state).toFixed(2)} ${METRIC_LABEL} (target: ${TARGET_TOK_PER_SEC}), correct=${state.currentBest?.containsReference ?? false}`));
+    return;
   }
 
   for (let cycle = startCycle; cycle <= maxCycles; cycle++) {

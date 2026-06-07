@@ -2024,6 +2024,51 @@ describe("plateau controls", () => {
     expect(decision.reason).toContain("20 cycles since promoted-best");
   });
 
+  test("Gemma31 dense decode auto-stops after the shorter revert-storm threshold", () => {
+    const state = makeState({
+      effortId: 12,
+      effortFile: "MULTI_HOUR_EFFORT_12_METAL_GEMMA_31B_M4.md",
+      effortPlan: "# Effort 12\nGemma 4 31B dense decode",
+      metricMode: "decode",
+      cycles: [
+        makeCycle({ cycle: 34, kept: true, containsReference: true, tokPerSec: 24.05 }),
+        ...Array.from({ length: 8 }, (_, idx) =>
+          makeCycle({
+            cycle: 35 + idx,
+            kept: false,
+            containsReference: true,
+            tokPerSec: 23.2,
+            description: "Another dense Gemma profile/enablement retune",
+          }),
+        ),
+      ],
+    });
+
+    const decision = detectAutoStopForPlateau(state, { revertStreak: 18, noBestCycles: 40 });
+    expect(decision.stop).toBe(true);
+    expect(decision.reason).toContain("Gemma31 dense decode revert storm");
+    expect(decision.consecutiveReverts).toBe(8);
+    expect(decision.bestCycle).toBe(34);
+  });
+
+  test("short revert storms do not auto-stop non-Gemma31 decode runs", () => {
+    const cycles = [
+      makeCycle({ cycle: 34, kept: true, containsReference: true, tokPerSec: 24.05 }),
+      ...Array.from({ length: 8 }, (_, idx) =>
+        makeCycle({
+          cycle: 35 + idx,
+          kept: false,
+          containsReference: true,
+          tokPerSec: 23.2,
+          description: "Another Qwen decode retune",
+        }),
+      ),
+    ];
+
+    const decision = detectAutoStopForPlateau({ cycles }, { revertStreak: 18, noBestCycles: 40 });
+    expect(decision.stop).toBe(false);
+  });
+
   test("classifies simd_sum and Q8 repacked families", () => {
     const families = classifyAttemptFamilies(makeCycle({
       description: "Pack two simd_sum reductions in dmmv_q8_0_repacked_k2048_nr2_qwen.metal",
@@ -2160,6 +2205,35 @@ describe("plateau controls", () => {
     expect(lines).toContain("Gemma31 dense decode");
     expect(lines).toContain("cycle-46..66 tail");
     expect(lines).toContain("post_norm_residual_rms_norm_wide");
+  });
+
+  test("structural pivot directive surfaces Gemma31 revert-storm facts", () => {
+    const state = makeState({
+      effortId: 12,
+      effortFile: "MULTI_HOUR_EFFORT_12_METAL_GEMMA_31B_M4.md",
+      effortPlan: "# Effort 12\nGemma 4 31B dense decode",
+      metricMode: "decode",
+      currentBest: { tokPerSec: 23.99, containsReference: true },
+      bestTokPerSec: 24.05,
+      stalledCycles: 11,
+      cycles: [
+        makeCycle({ cycle: 34, kept: true, containsReference: true, tokPerSec: 24.05 }),
+        ...Array.from({ length: 8 }, (_, idx) =>
+          makeCycle({
+            cycle: 35 + idx,
+            kept: false,
+            containsReference: true,
+            tokPerSec: 23.15 + idx * 0.01,
+            description: "Profile-only dense Gemma enablement churn",
+          }),
+        ),
+      ],
+    });
+
+    const lines = buildStructuralPivotDirective(state).join("\n");
+    expect(lines).toContain("REVERT-STORM FACT");
+    expect(lines).toContain("8 consecutive reverted cycles");
+    expect(lines).toContain("stop/finalize the best tree");
   });
 
   test("best-tree finalization restores when current accepted tree is below promoted best", () => {
