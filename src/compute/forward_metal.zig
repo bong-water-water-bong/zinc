@@ -4160,6 +4160,7 @@ pub const InferenceEngine = struct {
     // dmmv_q8_0_repacked_k2048_nr2_qwen) can swap to a sibling that doesn't
     // erode the prefill metric. Decode keeps its packed kernel by default.
     in_prefill_phase: bool,
+    dense_gemma_wide_post_norm_prefill_enabled: bool,
     qwen_ssm_prefill_proj_enabled: bool,
     fused_ssm_norm_enabled: bool,
     fused_ssm_delta_gated_norm_enabled: bool,
@@ -4358,6 +4359,8 @@ pub const InferenceEngine = struct {
             (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
             (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
         self.in_prefill_phase = false;
+        self.dense_gemma_wide_post_norm_prefill_enabled =
+            readBoolEnv("ZINC_METAL_DENSE_GEMMA_WIDE_POST_NORM_PREFILL") orelse false;
         self.qwen_ssm_prefill_proj_enabled =
             readBoolEnv("ZINC_QWEN36_35B_SSM_PREFILL_PROJ") orelse
             readBoolEnv("ZINC_QWEN36_SSM_PREFILL_PROJ") orelse
@@ -11772,6 +11775,7 @@ fn dispatchPostNormResidualRmsNormOnCmd(
         engine.config.architecture == .gemma and
         engine.config.n_experts == 0 and
         n == 5376 and
+        (!engine.in_prefill_phase or engine.dense_gemma_wide_post_norm_prefill_enabled) and
         engine.post_norm_residual_rms_norm_wide_pipe.handle != null and
         engine.post_norm_residual_rms_norm_wide_pipe.max_threads_per_threadgroup >= 512;
     const pipe = if (use_wide) &engine.post_norm_residual_rms_norm_wide_pipe else &engine.post_norm_residual_rms_norm_pipe;
