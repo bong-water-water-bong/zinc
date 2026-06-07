@@ -20444,7 +20444,7 @@ fn runDecodeStep(
                 dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
             }
             if (!is_moe and layer_shared_cmd != null) {
-                profileBarrier(cmd, profile, .dense_ffn);
+                profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
             }
             if (is_moe and !skip_pre_ffn_router) {
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
@@ -21841,13 +21841,13 @@ fn runDecodeStep(
                     dispatchDmmvOnCmd(engine, cmd, up_t, &engine.norm_buf, &engine.up_buf, inter_dim, hidden_dim, 0);
                 }
                 if (!fused_gate_up) {
-                    profileBarrier(cmd, profile, .dense_ffn);
+                    profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.gate_buf, &engine.up_buf });
                     dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, inter_dim);
                 }
-                profileBarrier(cmd, profile, .dense_ffn);
+                profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.swiglu_buf});
 
                 dispatchDmmvOnCmd(engine, cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
-                profileBarrier(cmd, profile, .dense_ffn);
+                profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.down_buf});
 
                 const next_layer_idx_u = layer_idx + 1;
                 const layer_output_scale_folded_pre = skip_pre_ffn_router and !engine.debug_validation_enabled;
@@ -21888,13 +21888,13 @@ fn runDecodeStep(
                         hidden_dim,
                         hidden_scale,
                     );
-                    profileBarrier(cmd, profile, .dense_ffn);
+                    profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
                     prev_fused_attn_norm = true;
                     if (can_fold_layer_scale_here) layer_output_scale_fused_into_post_norm = true;
                 } else {
                     if (engine.post_ffn_norm_present[layer_idx]) {
                         dispatchRmsNormOnCmd(engine, cmd, &engine.down_buf, &engine.down_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
-                        profileBarrier(cmd, profile, .dense_ffn);
+                        profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.down_buf});
                     }
 
                     if (layer_shared_cmd != null) {
@@ -21909,13 +21909,13 @@ fn runDecodeStep(
                                 hidden_dim,
                                 1.0,
                             );
-                            profileBarrier(cmd, profile, .dense_ffn);
+                            profileBarrierBuffers(cmd, profile, .dense_ffn, &.{ &engine.hidden_buf, &engine.norm_buf });
                             prev_fused_attn_norm = true;
                         } else {
                             const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
                             const acc_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.down_buf };
                             cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
-                            profileBarrier(cmd, profile, .dense_ffn);
+                            profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.hidden_buf});
                         }
                     }
                 }
