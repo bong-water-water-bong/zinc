@@ -19813,6 +19813,7 @@ pub const InferenceEngine = struct {
         const scratch_norm = self.batched_scratch_norm.?;
         const scratch_router_logits = self.batched_scratch_gate.?;
         const scratch_swiglu = self.batched_scratch_swiglu.?;
+        const scratch_route_ids = self.batched_scratch_up.?;
         const route_buf = self.batched_scratch_moe_ids orelse return error.BufferTooSmall;
         if (scratch_hidden.size < hidden_batch_bytes or scratch_norm.size < hidden_batch_bytes) return error.BufferTooSmall;
 
@@ -19921,6 +19922,15 @@ pub const InferenceEngine = struct {
             @as(vk.c.VkDeviceSize, prefix_tokens) *
             @as(vk.c.VkDeviceSize, inter_dim) *
             @sizeOf(f32);
+        const route_pack_counts_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, cfg.n_experts) * @sizeOf(u32);
+        const route_pack_ids_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, cfg.n_experts) *
+            @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @sizeOf(u32);
+        const route_pack_active_blocks_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, prefix_tokens) * @sizeOf(u32);
+        const route_pack_dispatch_args_bytes: vk.c.VkDeviceSize = 6 * @sizeOf(u32);
         if (route_buf.size < route_bytes or scratch_router_logits.size < router_logits_bytes or scratch_swiglu.size < swiglu_prefix_bytes) {
             return error.BufferTooSmall;
         }
@@ -19969,6 +19979,22 @@ pub const InferenceEngine = struct {
             const expert_gate_row_bytes = expertSliceBytes(gate_up.info.type_, fused_inter, hidden_dim);
             const up_base_offset = expertSliceBytes(gate_up.info.type_, inter_dim, hidden_dim);
             const expert_down_row_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+            const route_pack_counts = self.batched_scratch_moe_counts;
+            const route_pack_active_blocks = self.batched_scratch_moe_active_blocks;
+            const route_pack_active_count = self.batched_scratch_moe_active_count;
+            const route_pack_dispatch_args = self.batched_scratch_moe_dispatch_args;
+            const grouped_gate_up =
+                self.dmmv.pipeline_moe_route_pack != null and
+                self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu_cols_top1 != null and
+                route_pack_counts != null and
+                route_pack_active_blocks != null and
+                route_pack_active_count != null and
+                route_pack_dispatch_args != null and
+                route_pack_counts.?.size >= route_pack_counts_bytes and
+                scratch_route_ids.size >= route_pack_ids_bytes and
+                route_pack_active_blocks.?.size >= route_pack_active_blocks_bytes and
+                route_pack_active_count.?.size >= @sizeOf(u32) and
+                route_pack_dispatch_args.?.size >= route_pack_dispatch_args_bytes;
 
             try self.decode_cmd.reset();
             try self.decode_cmd.beginOneTime();
@@ -20027,22 +20053,85 @@ pub const InferenceEngine = struct {
             self.decode_cmd.computeBufferBarrier(route_buf.handle, route_bytes);
             self.endProfilePhase(.moe_topk, topk_phase);
 
+            if (grouped_gate_up) {
+                try self.dmmv.recordMoeRoutePack(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    route_buf.handle,
+                    route_bytes,
+                    route_pack_counts.?.handle,
+                    route_pack_counts_bytes,
+                    scratch_route_ids.handle,
+                    route_pack_ids_bytes,
+                    route_pack_active_count.?.handle,
+                    @sizeOf(u32),
+                    route_pack_active_blocks.?.handle,
+                    route_pack_active_blocks_bytes,
+                    route_pack_dispatch_args.?.handle,
+                    route_pack_dispatch_args_bytes,
+                    prefix_tokens,
+                    cfg.n_experts,
+                    1,
+                    route_stride_u32,
+                    prefix_tokens,
+                    (inter_dim + 3) / 4,
+                    (hidden_dim + 3) / 4,
+                    0,
+                );
+                const route_pack_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = route_pack_counts.?.handle, .size = route_pack_counts_bytes },
+                    .{ .buffer = scratch_route_ids.handle, .size = route_pack_ids_bytes },
+                    .{ .buffer = route_pack_active_blocks.?.handle, .size = route_pack_active_blocks_bytes },
+                };
+                self.decode_cmd.computeBuffersBarrier(&route_pack_ranges);
+                self.decode_cmd.computeToIndirectBufferBarrier(route_pack_dispatch_args.?.handle, route_pack_dispatch_args_bytes);
+            }
+
             const gate_up_phase = self.beginProfilePhase();
-            try self.dispatchDmmvGemmaTop1GateUpGegluBatch(
-                gate_up,
-                scratch_hidden,
-                hidden_batch_bytes,
-                scratch_swiglu,
-                swiglu_prefix_bytes,
-                route_buf.handle,
-                route_bytes,
-                inter_dim,
-                hidden_dim,
-                expert_gate_row_bytes,
-                up_base_offset,
-                route_stride_u32,
-                prefix_tokens,
-            );
+            if (grouped_gate_up) {
+                try self.dmmv.recordGemmaTop1GateUpGegluColsDispatchIndirect(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_up.gpu_buffer.handle,
+                    gate_up.gpu_buffer.size,
+                    scratch_hidden.handle,
+                    hidden_batch_bytes,
+                    scratch_swiglu.handle,
+                    swiglu_prefix_bytes,
+                    route_pack_counts.?.handle,
+                    route_pack_counts_bytes,
+                    scratch_route_ids.handle,
+                    route_pack_ids_bytes,
+                    route_pack_active_blocks.?.handle,
+                    route_pack_active_blocks_bytes,
+                    route_pack_dispatch_args.?.handle,
+                    0,
+                    inter_dim,
+                    hidden_dim,
+                    expert_gate_row_bytes,
+                    up_base_offset,
+                    prefix_tokens,
+                    1,
+                    0,
+                    0,
+                );
+            } else {
+                try self.dispatchDmmvGemmaTop1GateUpGegluBatch(
+                    gate_up,
+                    scratch_hidden,
+                    hidden_batch_bytes,
+                    scratch_swiglu,
+                    swiglu_prefix_bytes,
+                    route_buf.handle,
+                    route_bytes,
+                    inter_dim,
+                    hidden_dim,
+                    expert_gate_row_bytes,
+                    up_base_offset,
+                    route_stride_u32,
+                    prefix_tokens,
+                );
+            }
             self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, swiglu_prefix_bytes);
             self.endProfilePhase(.moe_gate_up, gate_up_phase);
 

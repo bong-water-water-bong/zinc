@@ -110,6 +110,18 @@ pub const GemmaTop1MoeBatchPushConstants = extern struct {
     routing_stride: u32 = 0,
 };
 
+/// Push constants for route-packed Gemma short-prefill top-1 gate/up+GEGLU.
+pub const GemmaTop1GateUpColsPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    expert_stride: u32,
+    up_offset: u32,
+    y_offset: u32,
+    ids_stride: u32,
+    x_route_divisor: u32,
+};
+
 /// Push constants for the fused split-K merge + o_proj DMMV-acc shader
 /// (src/shaders/dmmv_q4k_o_proj_merge.comp). Adds the merge-pass parameters
 /// to the standard DmmvPushConstants so a single dispatch reads partials,
@@ -409,6 +421,8 @@ pub const DmmvDispatch = struct {
     pipeline_q4k_moe_fused_gate_up_geglu: ?Pipeline,
     /// Gemma short-prefill token-batched top-1 fused gate+up+GEGLU.
     pipeline_q4k_moe_fused_gate_up_geglu_batch_top1: ?Pipeline,
+    /// Gemma short-prefill route-packed top-1 fused gate+up+GEGLU.
+    pipeline_q4k_moe_fused_gate_up_geglu_cols_top1: ?Pipeline,
     /// Q8_0 sibling of pipeline_q4k_fused_gate_up_swiglu. Targets the
     /// shared expert in Qwen 3.5 / 3.6 MoE packs where shared FFN
     /// weights ship as Q8_0 (rather than Q4_K). Same 4-binding layout
@@ -881,6 +895,15 @@ pub const DmmvDispatch = struct {
             log.warn("Q4_K Gemma top-1 batched gate+up+GEGLU shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const q4k_moe_fused_gate_up_geglu_cols_top1_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_fused_gate_up_geglu_cols_top1.spv", .{shader_dir}) catch unreachable;
+        const gemma_top1_gate_up_cols_push_size = @sizeOf(GemmaTop1GateUpColsPushConstants);
+        const pipeline_q4k_moe_fused_gate_up_geglu_cols_top1 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_moe_fused_gate_up_geglu_cols_top1_path, 6, gemma_top1_gate_up_cols_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K Gemma grouped top-1 gate+up+GEGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_q4k_moe_fused_gate_up_geglu_cols_top1 != null) {
+            log.info("dmmv_q4k_moe_fused_gate_up_geglu_cols_top1 pipeline loaded (grouped Gemma top-1 MoE prefill gate/up)", .{});
+        }
 
         // Q8_0 fused gate+up+SwiGLU. 4 bindings, same push struct as the
         // Q4_K variant. Used by the shared expert path on Qwen 3.5 / 3.6
@@ -1295,6 +1318,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_fused_gate_up_geglu_pair = pipeline_q4k_fused_gate_up_geglu_pair,
             .pipeline_q4k_moe_fused_gate_up_geglu = pipeline_q4k_moe_fused_gate_up_geglu,
             .pipeline_q4k_moe_fused_gate_up_geglu_batch_top1 = pipeline_q4k_moe_fused_gate_up_geglu_batch_top1,
+            .pipeline_q4k_moe_fused_gate_up_geglu_cols_top1 = pipeline_q4k_moe_fused_gate_up_geglu_cols_top1,
             .pipeline_q8_0_fused_gate_up_swiglu = pipeline_q8_0_fused_gate_up_swiglu,
             .pipeline_q8_0_fused_gate_up_swiglu_gate = pipeline_q8_0_fused_gate_up_swiglu_gate,
             .pipeline_q8_0_sigmoid_acc = pipeline_q8_0_sigmoid_acc,
@@ -1615,6 +1639,64 @@ pub const DmmvDispatch = struct {
             .ids_stride = ids_stride,
             .x_route_divisor = @max(x_route_divisor, 1),
             .accumulate = if (accumulate) 1 else 0,
+        };
+        const infos = [6]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = x_buf, .offset = 0, .range = x_size },
+            .{ .buffer = y_buf, .offset = 0, .range = y_size },
+            .{ .buffer = counts_buf, .offset = 0, .range = counts_size },
+            .{ .buffer = ids_buf, .offset = 0, .range = ids_size },
+            .{ .buffer = active_blocks_buf, .offset = 0, .range = active_blocks_size },
+        };
+        cmd.pushDescAndDispatchIndirect(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            indirect_buf,
+            indirect_offset,
+        );
+    }
+
+    pub fn recordGemmaTop1GateUpGegluColsDispatchIndirect(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        x_buf: vk.c.VkBuffer,
+        x_size: vk.c.VkDeviceSize,
+        y_buf: vk.c.VkBuffer,
+        y_size: vk.c.VkDeviceSize,
+        counts_buf: vk.c.VkBuffer,
+        counts_size: vk.c.VkDeviceSize,
+        ids_buf: vk.c.VkBuffer,
+        ids_size: vk.c.VkDeviceSize,
+        active_blocks_buf: vk.c.VkBuffer,
+        active_blocks_size: vk.c.VkDeviceSize,
+        indirect_buf: vk.c.VkBuffer,
+        indirect_offset: vk.c.VkDeviceSize,
+        M: u32,
+        K: u32,
+        expert_stride: u32,
+        up_offset: u32,
+        ids_stride: u32,
+        x_route_divisor: u32,
+        a_offset: u32,
+        y_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_q4k_moe_fused_gate_up_geglu_cols_top1) |*p| p else return error.PipelineNotLoaded;
+        if (M == 0 or K == 0 or ids_stride == 0) return error.InvalidArgument;
+        if ((K & 255) != 0) return error.InvalidArgument;
+        const push = GemmaTop1GateUpColsPushConstants{
+            .M = M,
+            .K = K,
+            .a_offset = a_offset,
+            .expert_stride = expert_stride,
+            .up_offset = up_offset,
+            .y_offset = y_offset,
+            .ids_stride = ids_stride,
+            .x_route_divisor = @max(x_route_divisor, 1),
         };
         const infos = [6]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = a_buf, .offset = 0, .range = a_size },
@@ -2940,6 +3022,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_fused_gate_up_geglu_pair) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_gate_up_geglu) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_gate_up_geglu_batch_top1) |*p| p.deinit();
+        if (self.pipeline_q4k_moe_fused_gate_up_geglu_cols_top1) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu_gate) |*p| p.deinit();
         if (self.pipeline_q8_0_sigmoid_acc) |*p| p.deinit();
