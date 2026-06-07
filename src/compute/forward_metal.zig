@@ -10233,7 +10233,7 @@ fn dispatchLmHeadOnCmd(
 }
 
 fn canUseLmHeadQ4KArgmaxPartials(engine: *const InferenceEngine, hidden_dim: u32, vocab_size: u32) bool {
-    const rows_per_wg: u32 = 4;
+    const rows_per_wg: u32 = 8;
     const n_pairs: usize = @intCast((vocab_size + rows_per_wg - 1) / rows_per_wg);
     return engine.lm_head.info.type_ == .q4_k and
         hidden_dim > 3072 and
@@ -10242,7 +10242,7 @@ fn canUseLmHeadQ4KArgmaxPartials(engine: *const InferenceEngine, hidden_dim: u32
         vocab_size % rows_per_wg == 0 and
         engine.lm_head_private_buf.handle == null and
         engine.dmmv_q4k_lmhead_argmax_pipe.handle != null and
-        engine.dmmv_q4k_lmhead_argmax_pipe.max_threads_per_threadgroup >= 64 and
+        engine.dmmv_q4k_lmhead_argmax_pipe.max_threads_per_threadgroup >= 128 and
         engine.argmax_pairs_pipe.handle != null and
         engine.argmax_partials_buf.handle != null and
         engine.argmax_partials_buf.size >= n_pairs * 2 * @sizeOf(u32);
@@ -10260,7 +10260,7 @@ fn dispatchLmHeadQ4KArgmaxPartialsOnCmd(
 ) void {
     recordDmmvProfile(engine, engine.lm_head, vocab_size, hidden_dim);
 
-    const rows_per_wg: u32 = 4;
+    const rows_per_wg: u32 = 8;
     const n_pairs = (vocab_size + rows_per_wg - 1) / rows_per_wg;
     const reduce_partials_on_cpu =
         !engine.in_prefill_phase and
@@ -10283,7 +10283,7 @@ fn dispatchLmHeadQ4KArgmaxPartialsOnCmd(
     cmd.dispatchV2(
         &engine.dmmv_q4k_lmhead_argmax_pipe,
         .{ n_pairs, 1, 1 },
-        .{ 64, 1, 1 },
+        .{ 128, 1, 1 },
         &bufs,
         &push,
         @sizeOf(DmmvPush),
