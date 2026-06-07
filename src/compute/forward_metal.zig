@@ -844,6 +844,9 @@ pub const RuntimeProfile = struct {
     commit_waits: u32 = 0,
     dispatch_calls: u32 = 0,
     barrier_calls: u32 = 0,
+    scope_barrier_calls: u32 = 0,
+    resource_barrier_calls: u32 = 0,
+    resource_barrier_resources: u32 = 0,
     embed_barrier_calls: u32 = 0,
     full_attn_barrier_calls: u32 = 0,
     full_attn_norm_barrier_calls: u32 = 0,
@@ -1367,6 +1370,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.commit_waits = total.commit_waits -| prefix.commit_waits;
     delta.dispatch_calls = total.dispatch_calls -| prefix.dispatch_calls;
     delta.barrier_calls = total.barrier_calls -| prefix.barrier_calls;
+    delta.scope_barrier_calls = total.scope_barrier_calls -| prefix.scope_barrier_calls;
+    delta.resource_barrier_calls = total.resource_barrier_calls -| prefix.resource_barrier_calls;
+    delta.resource_barrier_resources = total.resource_barrier_resources -| prefix.resource_barrier_resources;
     delta.embed_barrier_calls = total.embed_barrier_calls -| prefix.embed_barrier_calls;
     delta.full_attn_barrier_calls = total.full_attn_barrier_calls -| prefix.full_attn_barrier_calls;
     delta.full_attn_norm_barrier_calls = total.full_attn_norm_barrier_calls -| prefix.full_attn_norm_barrier_calls;
@@ -1490,6 +1496,19 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
 fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
     if (profile.decode_steps == 0 and profile.dmmv_total_bytes == 0) return;
 
+    if (profile.barrier_calls > 0) {
+        const avg_resources = if (profile.resource_barrier_calls > 0)
+            @as(f64, @floatFromInt(profile.resource_barrier_resources)) / @as(f64, @floatFromInt(profile.resource_barrier_calls))
+        else
+            0.0;
+        log.info("  {s} barrier kinds: scope {d} resource {d} resources {d} avg_resources/resource {d:.2}", .{
+            label,
+            profile.scope_barrier_calls,
+            profile.resource_barrier_calls,
+            profile.resource_barrier_resources,
+            avg_resources,
+        });
+    }
     log.info("  {s} buckets: embed {d:.2} ms | attn proj {d:.2} GiB out {d:.2} GiB flash {d} kv-write {d} | final {d:.2} ms lm-head {d:.2} GiB", .{
         label,
         nsToMs(profile.embedding_ns),
@@ -7487,6 +7506,11 @@ pub const InferenceEngine = struct {
                 @as(f64, @floatFromInt(profile.barrier_calls)) / steps_f,
                 @as(f64, @floatFromInt(profile.command_buffers)) / steps_f,
                 @as(f64, @floatFromInt(profile.commit_waits)) / steps_f,
+            });
+            log.info("  barrier kinds/step: scope {d:.1} resource {d:.1} resource-entries {d:.1}", .{
+                @as(f64, @floatFromInt(profile.scope_barrier_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.resource_barrier_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.resource_barrier_resources)) / steps_f,
             });
             log.info("  barriers/step: embed {d:.1} attn {d:.1} ssm {d:.1} router {d:.1} gpu-moe {d:.1} fallback-moe {d:.1} dense {d:.1} final {d:.1}", .{
                 @as(f64, @floatFromInt(profile.embed_barrier_calls)) / steps_f,
@@ -20441,6 +20465,9 @@ fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     if (profile) |p| {
         p.dispatch_calls += cmd.dispatch_count;
         p.barrier_calls += cmd.barrier_count;
+        p.scope_barrier_calls += cmd.scope_barrier_count;
+        p.resource_barrier_calls += cmd.resource_barrier_count;
+        p.resource_barrier_resources += cmd.resource_barrier_resources;
     }
     const commit_start = profileStart(profile != null);
     cmd.commitAndWait();
@@ -20455,6 +20482,9 @@ fn commitAsyncProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     if (profile) |p| {
         p.dispatch_calls += cmd.dispatch_count;
         p.barrier_calls += cmd.barrier_count;
+        p.scope_barrier_calls += cmd.scope_barrier_count;
+        p.resource_barrier_calls += cmd.resource_barrier_count;
+        p.resource_barrier_resources += cmd.resource_barrier_resources;
     }
     cmd.commitAsync();
 }

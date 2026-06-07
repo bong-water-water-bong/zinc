@@ -39,6 +39,9 @@ pub const MetalCommand = struct {
     handle: ?*shim.MetalCmd,
     dispatch_count: u32,
     barrier_count: u32,
+    scope_barrier_count: u32 = 0,
+    resource_barrier_count: u32 = 0,
+    resource_barrier_resources: u32 = 0,
     barrier_enabled: bool,
     last_barrier_dispatch_count: u32 = 0,
 
@@ -158,6 +161,7 @@ pub const MetalCommand = struct {
         if (self.last_barrier_dispatch_count == self.dispatch_count) return;
         if (self.handle) |h| {
             self.barrier_count += 1;
+            self.scope_barrier_count += 1;
             self.last_barrier_dispatch_count = self.dispatch_count;
             shim.mtl_barrier(h);
         }
@@ -172,6 +176,8 @@ pub const MetalCommand = struct {
             if (bufs.len == 1) {
                 if (bufs[0].handle != null) {
                     self.barrier_count += 1;
+                    self.resource_barrier_count += 1;
+                    self.resource_barrier_resources += 1;
                     self.last_barrier_dispatch_count = self.dispatch_count;
                     // Mirror llama.cpp `ggml_metal_op_concurrency_check/reset`
                     // (ggml-metal-common.cpp `ggml_mem_ranges_check`): when only
@@ -209,6 +215,8 @@ pub const MetalCommand = struct {
                 }
                 if (count == 0) return;
                 self.barrier_count += 1;
+                self.resource_barrier_count += 1;
+                self.resource_barrier_resources += count;
                 self.last_barrier_dispatch_count = self.dispatch_count;
                 shim.mtl_barrier_buffers(h, @ptrCast(&stack_bufs), count);
                 return;
@@ -228,6 +236,7 @@ pub const MetalCommand = struct {
             }
             if (!has_resource) return;
             self.barrier_count += 1;
+            self.scope_barrier_count += 1;
             self.last_barrier_dispatch_count = self.dispatch_count;
             shim.mtl_barrier(h);
         }
@@ -244,6 +253,8 @@ pub const MetalCommand = struct {
             if (bufs.len == 1) {
                 if (bufs[0].handle != null) {
                     self.barrier_count += 1;
+                    self.resource_barrier_count += 1;
+                    self.resource_barrier_resources += 1;
                     self.last_barrier_dispatch_count = self.dispatch_count;
                     shim.mtl_barrier_buffer(h, bufs[0].handle);
                 }
@@ -262,6 +273,8 @@ pub const MetalCommand = struct {
             if (count == 0) return;
 
             self.barrier_count += 1;
+            self.resource_barrier_count += 1;
+            self.resource_barrier_resources += count;
             self.last_barrier_dispatch_count = self.dispatch_count;
             shim.mtl_barrier_buffers(h, @ptrCast(&c_bufs), count);
         }
@@ -314,6 +327,9 @@ pub fn beginCommandWithMode(ctx: ?*shim.MetalCtx, mode: CommandEncoderMode) !Met
         .handle = handle,
         .dispatch_count = 0,
         .barrier_count = 0,
+        .scope_barrier_count = 0,
+        .resource_barrier_count = 0,
+        .resource_barrier_resources = 0,
         .barrier_enabled = mode == .concurrent,
         .last_barrier_dispatch_count = 0,
     };
