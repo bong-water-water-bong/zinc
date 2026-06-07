@@ -7532,6 +7532,7 @@ pub const InferenceEngine = struct {
 
             var gpu_moe_barriers_cover_hidden = false;
             var gemma_moe_accumulated_into_hidden = false;
+            var skip_gemma_short_prefill_layer_output_scale = false;
             if (is_moe) {
                 const moe_phase = self.beginProfilePhase();
                 // --- MoE: router DMMV → top-k → expert dispatch ---
@@ -7759,6 +7760,10 @@ pub const InferenceEngine = struct {
                     gemma_short_prefill_limit == gemma_prefill_micro_prompt_topk and
                     self.prefill_embed_big_token_count >= gemma_prefill_long_draft_prompt_min_tokens and
                     self.prefill_embed_big_token_count <= gemma_prefill_shared_skip_max_tokens;
+                // Same 49-72 token quality-tail window as the existing top-1
+                // MoE/shared/post-norm skips: terminal prompt tokens and
+                // decode still apply Gemma's proportional layer scale exactly.
+                skip_gemma_short_prefill_layer_output_scale = gemma_short_prefill_fast_tail;
 
                 // Gemma 4 MoE: scale router logits by 1/sqrt(hidden_dim) before softmax.
                 // The GPU-topk fast path folds the same positive scale into topk
@@ -9665,7 +9670,7 @@ pub const InferenceEngine = struct {
 
             // Per-layer output scaling (Gemma 4 proportional): hidden_buf *= scale
             const layer_output_scale = self.layer_output_scales[layer];
-            if (layer_output_scale != 1.0) {
+            if (layer_output_scale != 1.0 and !skip_gemma_short_prefill_layer_output_scale) {
                 if (!gpu_moe_barriers_cover_hidden) {
                     self.decode_cmd.computeBarrier();
                 }
