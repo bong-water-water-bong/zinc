@@ -412,6 +412,54 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run_cuda_smoke.addArgs(args);
         const cuda_smoke_step = b.step("cuda-smoke", "Build & run the CUDA primitive-layer smoke test (Linux/NVIDIA)");
         cuda_smoke_step.dependOn(&run_cuda_smoke.step);
+
+        // --- CUDA model loader load-test (Linux/WSL2 + NVIDIA only) ---
+        // Builds & runs src/cuda/loadtest.zig standalone — exercises
+        // src/model/loader_cuda.zig end to end (mmap + GGUF parse + H2D upload
+        // of every tensor) independent of forward_cuda. Pass the model path as
+        // a trailing arg: `zig build cuda-loadtest -Dbackend=cuda -- model.gguf`.
+        // Rooted at src/ (root file src/loadtest_cuda.zig) so the single module
+        // can reach both model/* (loader, gguf, config) and cuda/* (device,
+        // buffer, c) — mirroring how src/main.zig spans both subtrees. Keeping
+        // it one module is what lets the loader's internal `../cuda/*` imports
+        // resolve.
+        const cuda_loadtest_mod = b.createModule(.{
+            .root_source_file = b.path("src/loadtest_cuda.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        configureCudaModule(b, target, cuda_loadtest_mod);
+        const cuda_loadtest_exe = b.addExecutable(.{
+            .name = "cuda-loadtest",
+            .root_module = cuda_loadtest_mod,
+        });
+        const run_cuda_loadtest = b.addRunArtifact(cuda_loadtest_exe);
+        if (b.args) |args| run_cuda_loadtest.addArgs(args);
+        const cuda_loadtest_step = b.step("cuda-loadtest", "Build & run the CUDA model loader load-test (Linux/NVIDIA)");
+        cuda_loadtest_step.dependOn(&run_cuda_loadtest.step);
+
+        // --- CUDA greedy-decode driver (Linux/WSL2 + NVIDIA only) ---
+        // Builds & runs src/run_cuda.zig — drives src/compute/forward_cuda.zig
+        // end to end (loader + forward + argmax) for a single greedy token.
+        // `zig build cuda-run -Dbackend=cuda -- [token] [v0|v1|v2] [model.gguf]`.
+        // Rooted at src/ (like loadtest) so model/*, cuda/*, and compute/*
+        // resolve as one module.
+        const cuda_run_mod = b.createModule(.{
+            .root_source_file = b.path("src/run_cuda.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        configureCudaModule(b, target, cuda_run_mod);
+        const cuda_run_exe = b.addExecutable(.{
+            .name = "cuda-run",
+            .root_module = cuda_run_mod,
+        });
+        const run_cuda_run = b.addRunArtifact(cuda_run_exe);
+        if (b.args) |args| run_cuda_run.addArgs(args);
+        const cuda_run_step = b.step("cuda-run", "Build & run the CUDA greedy-decode driver (Linux/NVIDIA)");
+        cuda_run_step.dependOn(&run_cuda_run.step);
     }
 
     // --- Documentation ---
