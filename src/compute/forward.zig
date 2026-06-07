@@ -8973,14 +8973,34 @@ pub const InferenceEngine = struct {
                     const cpu_down_shexp = lt.ffn_down_shexp;
                     const cpu_shexp_gate = lt.ffn_gate_inp_shexp;
                     if (cpu_gate_shexp != null and cpu_up_shexp != null and cpu_down_shexp != null) {
+                        const shared_phase = self.beginProfilePhase();
                         const cpu_shexp_size = @as(vk.c.VkDeviceSize, shexp_inter_dim) * @sizeOf(f32);
+                        const shared_front_fused =
+                            config.architecture == .gemma and
+                            cpu_gate_shexp.?.info.type_ == .q4_k and
+                            cpu_up_shexp.?.info.type_ == .q4_k and
+                            self.dmmv.pipeline_q4k_fused_gate_up_geglu_pair != null;
 
-                        try self.dispatchDmmv(cpu_gate_shexp.?, self.ffn_norm_buf, hidden_size, self.gate_buf, shexp_inter_dim, hidden_dim);
-                        try self.dispatchDmmv(cpu_up_shexp.?, self.ffn_norm_buf, hidden_size, self.up_buf, shexp_inter_dim, hidden_dim);
+                        const shared_proj_phase = self.beginProfilePhase();
+                        if (shared_front_fused) {
+                            try self.dispatchDmmvFusedGateUpGegluPair(
+                                cpu_gate_shexp.?,
+                                cpu_up_shexp.?,
+                                self.ffn_norm_buf,
+                                hidden_size,
+                                self.swiglu_buf,
+                                shexp_inter_dim,
+                                hidden_dim,
+                            );
+                        } else {
+                            try self.dispatchDmmv(cpu_gate_shexp.?, self.ffn_norm_buf, hidden_size, self.gate_buf, shexp_inter_dim, hidden_dim);
+                            try self.dispatchDmmv(cpu_up_shexp.?, self.ffn_norm_buf, hidden_size, self.up_buf, shexp_inter_dim, hidden_dim);
+                        }
                         if (cpu_shexp_gate) |sg| {
                             try self.dispatchDmmv(sg, self.ffn_norm_buf, hidden_size, self.router_logits_buf, 1, hidden_dim);
                         }
                         self.decode_cmd.computeBarrier();
+                        self.endProfilePhase(.shared_proj, shared_proj_phase);
 
                         if (self.validation_diagnostics_enabled and config.architecture == .gpt_oss and collect_output and state.generated_tokens.items.len == 0 and hidden_dim <= 8192 and cpu_shexp_gate != null) {
                             try self.decode_cmd.end();
@@ -9030,19 +9050,25 @@ pub const InferenceEngine = struct {
                             try self.decode_cmd.begin();
                         }
 
-                        try self.dispatchFfnActivation(
-                            self.gate_buf.handle,
-                            self.gate_buf.size,
-                            self.up_buf.handle,
-                            self.up_buf.size,
-                            self.swiglu_buf.handle,
-                            self.swiglu_buf.size,
-                            shexp_inter_dim,
-                        );
-                        self.decode_cmd.computeBarrier();
+                        if (!shared_front_fused) {
+                            const shared_swiglu_phase = self.beginProfilePhase();
+                            try self.dispatchFfnActivation(
+                                self.gate_buf.handle,
+                                self.gate_buf.size,
+                                self.up_buf.handle,
+                                self.up_buf.size,
+                                self.swiglu_buf.handle,
+                                self.swiglu_buf.size,
+                                shexp_inter_dim,
+                            );
+                            self.decode_cmd.computeBarrier();
+                            self.endProfilePhase(.shared_swiglu, shared_swiglu_phase);
+                        }
 
+                        const shared_down_phase = self.beginProfilePhase();
                         try self.dispatchDmmv(cpu_down_shexp.?, self.swiglu_buf, cpu_shexp_size, self.down_buf, hidden_dim, shexp_inter_dim);
                         self.decode_cmd.computeBarrier();
+                        self.endProfilePhase(.shared_down, shared_down_phase);
 
                         // Gemma 4 MoE: post_ffw_norm_1 on shared expert output BEFORE combining.
                         // Matches Metal forward_metal.zig:4314-4317.
@@ -9062,6 +9088,7 @@ pub const InferenceEngine = struct {
                         }
 
                         const shexp_acc_buf = self.moe_out_buf.handle;
+                        const shared_gate_phase = self.beginProfilePhase();
                         if (cpu_shexp_gate != null and self.elementwise.pipeline_sigmoid_scale_acc != null) {
                             try self.dispatchSigmoidScaleAcc(
                                 shexp_acc_buf,
@@ -9111,6 +9138,8 @@ pub const InferenceEngine = struct {
                             );
                         }
                         self.decode_cmd.computeBarrier();
+                        self.endProfilePhase(.shared_gate_acc, shared_gate_phase);
+                        self.endProfilePhase(.shared_expert, shared_phase);
                     }
                 }
 
@@ -11539,6 +11568,44 @@ pub const InferenceEngine = struct {
             swiglu_buf.handle,
             swiglu_buf.size,
             wg_x,
+            1,
+            1,
+        );
+    }
+
+    /// Gemma shared-expert fusion for separate Q4_K gate/up tensors:
+    /// computes GEGLU(W_gate*x, W_up*x) directly into swiglu_buf.
+    fn dispatchDmmvFusedGateUpGegluPair(
+        self: *InferenceEngine,
+        gate_tensor: *const LoadedTensor,
+        up_tensor: *const LoadedTensor,
+        input_buf: Buffer,
+        input_size: vk.c.VkDeviceSize,
+        geglu_buf: Buffer,
+        M: u32,
+        K: u32,
+    ) !void {
+        const pip = &(self.dmmv.pipeline_q4k_fused_gate_up_geglu_pair orelse return error.ShaderNotLoaded);
+        const push = DmmvPushConstants{
+            .M = M,
+            .K = K,
+            .a_offset = 0,
+            .x_offset = 0,
+            .y_offset = 0,
+            .acc_mode = 0,
+        };
+        self.pushDispatch4(
+            pip,
+            std.mem.asBytes(&push),
+            gate_tensor.gpu_buffer.handle,
+            gate_tensor.gpu_buffer.size,
+            up_tensor.gpu_buffer.handle,
+            up_tensor.gpu_buffer.size,
+            input_buf.handle,
+            input_size,
+            geglu_buf.handle,
+            geglu_buf.size,
+            (M + 1) / 2,
             1,
             1,
         );

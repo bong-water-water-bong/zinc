@@ -213,6 +213,7 @@ pub fn build(b: *std.Build) void {
         "dmmv_q4k_fused_gate_up_swiglu_moe",
         "dmmv_q4k_fused_gate_up_swiglu",
         "dmmv_q4k_fused_gate_up_geglu",
+        "dmmv_q4k_fused_gate_up_geglu_pair",
         "dmmv_q4k_moe_fused_gate_up_geglu",
         "dmmv_q8_0_fused_gate_up_swiglu",
         "dmmv_q8_0_fused_gate_up_swiglu_gate",
