@@ -46,7 +46,8 @@ const qwen_moe_route_pack_validate_tokens: u32 = 128;
 const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
 const moe_route_block_cols: u32 = 8;
 const moe_cols_dense_dispatch_cols: u32 = moe_route_block_cols;
-const moe_route_pack_profile_stats_per_layer: usize = 4;
+const moe_route_pack_profile_tail_bins: usize = moe_route_block_cols - 1;
+const moe_route_pack_profile_stats_per_layer: usize = 4 + moe_route_pack_profile_tail_bins;
 
 fn moeRoutePackProfileWords(n_layers: usize) usize {
     return 1 + n_layers + n_layers * moe_route_pack_profile_stats_per_layer;
@@ -903,6 +904,7 @@ pub const RuntimeProfile = struct {
     route_pack_tail_blocks_actual: u64 = 0,
     route_pack_single_tail_blocks_actual: u64 = 0,
     route_pack_padding_slots_actual: u64 = 0,
+    route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -1316,6 +1318,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.route_pack_tail_blocks_actual = total.route_pack_tail_blocks_actual -| prefix.route_pack_tail_blocks_actual;
     delta.route_pack_single_tail_blocks_actual = total.route_pack_single_tail_blocks_actual -| prefix.route_pack_single_tail_blocks_actual;
     delta.route_pack_padding_slots_actual = total.route_pack_padding_slots_actual -| prefix.route_pack_padding_slots_actual;
+    for (0..moe_route_pack_profile_tail_bins) |i| {
+        delta.route_pack_tail_size_blocks_actual[i] = total.route_pack_tail_size_blocks_actual[i] -| prefix.route_pack_tail_size_blocks_actual[i];
+    }
     delta.shared_expert_bytes = total.shared_expert_bytes -| prefix.shared_expert_bytes;
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
@@ -1439,6 +1444,18 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                     pctOf(profile.route_pack_active_blocks_actual, profile.route_pack_tail_blocks_actual),
                     pctOf(profile.route_pack_tail_blocks_actual, profile.route_pack_single_tail_blocks_actual),
                 });
+                if (profile.route_pack_tail_blocks_actual > 0) {
+                    log.info("  {s} route pack tail sizes: r1 {d} r2 {d} r3 {d} r4 {d} r5 {d} r6 {d} r7 {d}", .{
+                        label,
+                        profile.route_pack_tail_size_blocks_actual[0],
+                        profile.route_pack_tail_size_blocks_actual[1],
+                        profile.route_pack_tail_size_blocks_actual[2],
+                        profile.route_pack_tail_size_blocks_actual[3],
+                        profile.route_pack_tail_size_blocks_actual[4],
+                        profile.route_pack_tail_size_blocks_actual[5],
+                        profile.route_pack_tail_size_blocks_actual[6],
+                    });
+                }
             }
         }
     }
@@ -1758,6 +1775,7 @@ const MoeColsGateUpDmmvPush = extern struct {
     ids_stride: u32,
     x_route_divisor: u32,
     use_active_blocks: u32,
+    enable_exact5: u32,
 };
 
 fn createMetalBufferForMode(ctx: ?*shim.MetalCtx, size: usize, use_private: bool) !MetalBuffer {
@@ -2770,6 +2788,9 @@ fn recordRoutePackActualProfile(profile: ?*RuntimeProfile, scratch: *const Batch
             p.route_pack_tail_blocks_actual += counts[base + 1];
             p.route_pack_single_tail_blocks_actual += counts[base + 2];
             p.route_pack_padding_slots_actual += counts[base + 3];
+            for (0..moe_route_pack_profile_tail_bins) |tail_i| {
+                p.route_pack_tail_size_blocks_actual[tail_i] += counts[base + 4 + tail_i];
+            }
         }
     }
 }
@@ -3236,11 +3257,10 @@ fn logGemmaBatchedPrefillDecision(
 
 fn shouldDefaultGemmaMoeBatchedPrefillForPrompt(cfg: ModelConfig, prompt_len: usize) bool {
     if (!isGemma26A4BMoeShape(cfg)) return false;
-    // The current public-suite planning prompt is 70 chat-template tokens.
-    // Keep the default experiment on that nearby band so short Paris decode
-    // guards and unrelated Gemma MoE prompts continue using the accepted queued
-    // token-major path unless explicitly opted in.
-    return prompt_len >= 64 and prompt_len <= 96;
+    // Public-prompt harnesses have landed in the mid-length chat-template band
+    // (55-70 tokens so far). Keep short Paris decode guards on queued token-major
+    // while defaulting nearby public prompts onto the structural route-pack path.
+    return prompt_len >= 48 and prompt_len <= 96;
 }
 
 fn shouldDefaultDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
@@ -4101,6 +4121,7 @@ pub const InferenceEngine = struct {
     position: u32,
     max_context_tokens: u32,
     profile_enabled: bool,
+    q8_repacked_dispatch_profile_enabled: bool,
     debug_validation_enabled: bool,
     gemma_moe_validation_enabled: bool,
     qwen_prefill_validation_enabled: bool,
@@ -4148,6 +4169,7 @@ pub const InferenceEngine = struct {
     gemma_q8_moe_decode_enabled: bool,
     gemma_q8_moe_fallback_down_enabled: bool,
     gemma_moe_post_norm_residual_decode_enabled: bool,
+    gemma_q4k_geglu_exact5_enabled: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     qwen_ssm_proj_validate_captured_tokens: u32,
@@ -4300,6 +4322,7 @@ pub const InferenceEngine = struct {
         self.position = 0;
         self.max_context_tokens = max_ctx;
         self.profile_enabled = options.profile_enabled;
+        self.q8_repacked_dispatch_profile_enabled = readBoolEnv("ZINC_METAL_Q8_DISPATCH_PROFILE") orelse false;
         self.debug_validation_enabled = options.debug_validation_enabled;
         self.gemma_moe_validation_enabled = readBoolEnv("ZINC_GEMMA_MOE_VALIDATE") orelse false;
         self.qwen_prefill_validation_enabled =
@@ -4364,6 +4387,7 @@ pub const InferenceEngine = struct {
         self.gemma_q8_moe_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_DECODE") orelse defaultGemmaQ8MoeDecodeEnabled(cfg);
         self.gemma_q8_moe_fallback_down_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q8_MOE_FALLBACK_DOWN") orelse defaultGemmaQ8MoeFallbackDownEnabled(cfg);
         self.gemma_moe_post_norm_residual_decode_enabled = readBoolEnv("ZINC_METAL_GEMMA_MOE_POST_NORM_DECODE") orelse defaultGemmaMoePostNormResidualDecodeEnabled(cfg);
+        self.gemma_q4k_geglu_exact5_enabled = readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_EXACT5") orelse false;
         // Per-kernel timing probe — default off, distorts decode tok/s when on
         // (each dispatch becomes a commit+wait+restart sync). The cycle-33 auto-
         // enable on `--profile` runs was reverted: the probe's per-dispatch
@@ -7295,6 +7319,17 @@ pub const InferenceEngine = struct {
                             pctOf(profile.route_pack_active_blocks_actual, profile.route_pack_tail_blocks_actual),
                             pctOf(profile.route_pack_tail_blocks_actual, profile.route_pack_single_tail_blocks_actual),
                         });
+                        if (profile.route_pack_tail_blocks_actual > 0) {
+                            log.info("  route-pack tail sizes: r1 {d} r2 {d} r3 {d} r4 {d} r5 {d} r6 {d} r7 {d}", .{
+                                profile.route_pack_tail_size_blocks_actual[0],
+                                profile.route_pack_tail_size_blocks_actual[1],
+                                profile.route_pack_tail_size_blocks_actual[2],
+                                profile.route_pack_tail_size_blocks_actual[3],
+                                profile.route_pack_tail_size_blocks_actual[4],
+                                profile.route_pack_tail_size_blocks_actual[5],
+                                profile.route_pack_tail_size_blocks_actual[6],
+                            });
+                        }
                     }
                 }
             }
@@ -7787,24 +7822,27 @@ fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
     };
     defer allocator.free(shader_dir);
 
+    return loadShaderPipelineFromDir(ctx, name, shader_dir) catch |err| {
+        if (err == error.ShaderNotFound and std.posix.getenv("ZINC_SHADER_DIR") == null and !std.mem.eql(u8, shader_dir, "src/shaders/metal")) {
+            return loadShaderPipelineFromDir(ctx, name, "src/shaders/metal") catch |source_err| {
+                log.err("Failed to open shader '{s}' from resolved dir and source fallback: {s}", .{ name, @errorName(source_err) });
+                return error.ShaderNotFound;
+            };
+        }
+        log.err("Failed to load Metal shader '{s}' from '{s}': {s}", .{ name, shader_dir, @errorName(err) });
+        return err;
+    };
+}
+
+fn loadShaderPipelineFromDir(ctx: ?*shim.MetalCtx, name: []const u8, shader_dir: []const u8) !MetalPipeline {
+    const allocator = std.heap.page_allocator;
     const file_name = std.fmt.allocPrint(allocator, "{s}.metal", .{name}) catch return error.OutOfMemory;
     defer allocator.free(file_name);
 
     const path = std.fs.path.join(allocator, &.{ shader_dir, file_name }) catch return error.OutOfMemory;
     defer allocator.free(path);
 
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| blk: {
-        if (err == error.FileNotFound and std.posix.getenv("ZINC_SHADER_DIR") == null and !std.mem.eql(u8, shader_dir, "src/shaders/metal")) {
-            const source_path = std.fs.path.join(allocator, &.{ "src/shaders/metal", file_name }) catch return error.OutOfMemory;
-            defer allocator.free(source_path);
-            break :blk std.fs.cwd().openFile(source_path, .{}) catch |source_err| {
-                log.err("Failed to open shader '{s}' from resolved dir and source fallback: {s}", .{ name, @errorName(source_err) });
-                return error.ShaderNotFound;
-            };
-        }
-        log.err("Failed to open shader '{s}': {s}", .{ name, @errorName(err) });
-        return error.ShaderNotFound;
-    };
+    const file = std.fs.cwd().openFile(path, .{}) catch return error.ShaderNotFound;
     defer file.close();
     const stat = try file.stat();
     if (stat.size > 1024 * 1024) return error.ShaderTooLarge;
@@ -8151,6 +8189,7 @@ fn recordQ8RepackedDispatchProfile(
     kind: Q8RepackedDispatchKind,
 ) void {
     if (!engine.profile_enabled or tensor.info.type_ != .q8_0) return;
+    if (!engine.q8_repacked_dispatch_profile_enabled) return;
     if (kind == .unknown) return;
 
     const bytes = dmmvWeightBytes(.q8_0, rows, cols);
@@ -10976,6 +11015,7 @@ fn dispatchDmmvMoeGateUpGeGLUColsActiveBlocksOnCmd(
         .ids_stride = ids_stride,
         .x_route_divisor = @max(x_route_divisor, 1),
         .use_active_blocks = 1,
+        .enable_exact5 = if (engine.gemma_q4k_geglu_exact5_enabled) 1 else 0,
     };
     const bufs = [_]*const MetalBuffer{
         &tensor.gpu_buffer,
@@ -27967,6 +28007,10 @@ test "gemma26 public prompt prefill uses wide queued split without tiny tail" {
     };
 
     try std.testing.expect(!shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 20));
+    try std.testing.expect(!shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 47));
+    try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 48));
+    try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 55));
+    try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 63));
     try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 64));
     try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 70));
     try std.testing.expect(shouldDefaultGemmaMoeBatchedPrefillForPrompt(gemma_cfg, 96));
@@ -29090,7 +29134,7 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
     try std.testing.expect(ctx != null);
     defer shim.mtl_destroy(ctx);
 
-    var pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
+    var pipe = try loadShaderPipelineFromDir(ctx, "moe_route_pack_blocks", "src/shaders/metal");
     defer metal_pipeline.freePipeline(&pipe);
 
     const n_tokens: usize = 5;
@@ -29155,6 +29199,13 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
         try std.testing.expectEqual(@as(u32, 6), active_count_ptr[stats_base + 1]);
         try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 2]);
         try std.testing.expectEqual(@as(u32, 33), active_count_ptr[stats_base + 3]);
+        try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 4]);
+        try std.testing.expectEqual(@as(u32, 3), active_count_ptr[stats_base + 5]);
+        try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 6]);
+        try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 7]);
+        try std.testing.expectEqual(@as(u32, 1), active_count_ptr[stats_base + 8]);
+        try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 9]);
+        try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 10]);
     }
 
     var seen_routes = [_]bool{false} ** route_slots;

@@ -12,11 +12,13 @@ Remote machine details are intentionally supplied by `.env` or CLI flags. Do not
 # Metal target (Apple Silicon, runs locally)
 bun tools/performance_suite.mjs --target metal
 
-# RDNA4 target (remote node from .env)
-bun tools/performance_suite.mjs --target rdna --rdna-sync --rdna-build --rdna-start-llama
+# RDNA4 target (remote node from .env). Published RDNA runs use the
+# Vulkan backend; ZINC_RT is a separate bring-up runtime and must be
+# requested explicitly with --rdna-backend zinc_rt.
+bun tools/performance_suite.mjs --target rdna --rdna-sync --rdna-build --rdna-start-llama --rdna-backend vulkan
 
 # Pick a specific RDNA node when .env defines ZINC_RDNA1_* and ZINC_RDNA2_*.
-bun tools/performance_suite.mjs --target rdna --rdna-node rdna2 --rdna-sync --rdna-build
+bun tools/performance_suite.mjs --target rdna --rdna-node rdna2 --rdna-sync --rdna-build --rdna-backend vulkan
 
 # Intel Arc target (separate remote node from .env)
 bun tools/performance_suite.mjs --target intel --intel-sync --intel-build --intel-start-llama
@@ -25,11 +27,13 @@ bun tools/performance_suite.mjs --target intel --intel-sync --intel-build --inte
 bun tools/performance_suite.mjs --target all --rdna-sync --rdna-build --rdna-start-llama
 ```
 
-Defaults are 1 warmup + 3 measured runs per scenario; pass `--runs N --warmup M` to override. Pass `--no-site-write` to leave `site/src/data/zinc-performance.json` alone (the run still emits a `/tmp` artifact via `--output`). The suite stamps `provenance.zinc.version` from `git describe --dirty`, so commit (or stash) before publishing — a `-dirty` tag means reviewers cannot reproduce the exact tree.
+Defaults are 1 warmup + 3 measured runs per scenario; pass `--runs N --warmup M` to override. Pass `--no-site-write` to leave `site/src/data/zinc-performance.json` alone (the run still emits a `/tmp` artifact via `--output`). The suite stamps `provenance.zinc.version` from `git describe --dirty`; when `--rdna-sync` is used, provenance comes from the local tree that was synced, not from the remote workdir's stale `.git` metadata. Commit (or stash) before publishing — a `-dirty` tag means reviewers cannot reproduce the exact tree.
+
+RDNA suite runs sync into `/root/zinc-bench` by default. Keep that checkout isolated from optimization loops and ad-hoc experiments; sharing `/root/zinc` can overwrite `zig-out/bin/zinc` mid-suite and invalidate later model rows. The suite verifies `zinc --version` reports the requested backend before RDNA measurements, and before every ZINC scenario, so a stale or overwritten binary fails loudly instead of publishing mixed Vulkan/ZINC_RT data.
 
 `bun tools/performance_suite.mjs --help` lists every flag (target subset, model filtering, baseline binary overrides, remote workdir / libc / model-root overrides, etc.).
 
-Current RDNA publish runs cover the two Gemma 4 rows, Qwen 3.5 9B Q4_K_M, Qwen 3.6 27B Q4_K_M, and Qwen 3.6 35B-A3B UD Q4_K_XL. The small-Qwen row is `Qwen3.5-9B-Q4_K_M.gguf`, not the older Qwen 3 8B GGUF.
+Current RDNA publish runs cover Gemma 4 26B-A4B Q4_K_M, Gemma 4 31B Q4_K_M, Qwen 3.5 9B Q4_K_M, Qwen 3.6 27B Q4_K_M, and Qwen 3.6 35B-A3B UD Q4_K_XL. The small-Qwen row is `Qwen3.5-9B-Q4_K_M.gguf`, not the older Qwen 3 8B GGUF.
 
 ## Ad-hoc llama.cpp baseline on the RDNA4 node
 

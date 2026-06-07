@@ -25,6 +25,7 @@ import {
   parseLlamaCppVersionOutput,
   parseOpenAiCompletionOutput,
   parseZincCliOutput,
+  parseZincVersionOutput,
   prefersChatPrompt,
   rdnaEnvValue,
   rdnaNodeEnvKey,
@@ -32,6 +33,7 @@ import {
   rdnaZincCommand,
   resolveLocalLlamaServer,
   summarizeValues,
+  validateZincBackend,
 } from "./performance_suite.mjs";
 
 test("parseArgs reads suite options", () => {
@@ -90,6 +92,60 @@ test("parseArgs reads Intel suite options", () => {
   expect(args.intelRemoteLibcConf).toBe("/workspace/zinc/.build-support/libc.conf");
 });
 
+test("parseArgs reads RDNA backend and device options", () => {
+  const args = parseArgs([
+    "--target",
+    "rdna",
+    "--rdna-node",
+    "rdna1",
+    "--rdna-backend",
+    "vulkan",
+    "--rdna-vk-device",
+    "1",
+    "--require-rdna-device-substring",
+    "GFX1201",
+  ]);
+
+  expect(args.target).toBe("rdna");
+  expect(args.rdnaNode).toBe("rdna1");
+  expect(args.rdnaBackend).toBe("vulkan");
+  expect(args.rdnaVkDevice).toBe(1);
+  expect(args.requireRdnaDeviceSubstring).toBe("GFX1201");
+  expect(args.rdnaWorkdir).toBe("/root/zinc-bench");
+});
+
+test("parseArgs rejects invalid RDNA backend", () => {
+  expect(() => parseArgs(["--target", "rdna", "--rdna-backend", "metal"])).toThrow(
+    "Invalid --rdna-backend 'metal'",
+  );
+});
+
+test("parseZincVersionOutput extracts the compiled backend", () => {
+  const parsed = parseZincVersionOutput(`
+zinc 67cc418bf8f8
+commit: 67cc418bf8f8ce30ec82a6d9a599c3e90186904f
+target: x86_64-linux-gnu
+optimize: ReleaseFast
+backends: vulkan
+`);
+
+  expect(parsed.version).toBe("67cc418bf8f8");
+  expect(parsed.commit).toBe("67cc418bf8f8ce30ec82a6d9a599c3e90186904f");
+  expect(parsed.target).toBe("x86_64-linux-gnu");
+  expect(parsed.optimize).toBe("ReleaseFast");
+  expect(parsed.backend).toBe("vulkan");
+});
+
+test("validateZincBackend rejects stale or overwritten RDNA binaries", () => {
+  expect(() => validateZincBackend("info(zinc_rt): M0 runtime initialized", "vulkan")).toThrow(
+    "RDNA ZINC binary backend mismatch: expected vulkan, observed unknown",
+  );
+  expect(() => validateZincBackend("zinc dev\nbackends: zinc_rt\n", "vulkan")).toThrow(
+    "expected vulkan, observed zinc_rt",
+  );
+  expect(validateZincBackend("zinc dev\nbackends: vulkan\n", "vulkan").backend).toBe("vulkan");
+});
+
 test("parseArgs enables discovery mode", () => {
   const args = parseArgs(["--target", "metal", "--discover-models"]);
   expect(args.discoverModels).toBe(true);
@@ -127,10 +183,22 @@ test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
   expect(qwen36Dense?.model_path).toBe("/tmp/models/qwen36-27b-q4k-m/model.gguf");
 });
 
-test("default RDNA cases include Qwen 3.5 9B and Qwen 3.6 27B dense", () => {
+test("default RDNA cases include Gemma and current Qwen rows", () => {
   const cases = defaultRdnaCases("/root/models");
+  const gemma26 = cases.find((entry) => entry.id === "gemma4-26b-a4b-q4k-m");
+  const gemma31 = cases.find((entry) => entry.id === "gemma4-31b-q4k-m");
   const qwen36Dense = cases.find((entry) => entry.id === "qwen36-27b-q4k-m");
   const qwen35 = cases.find((entry) => entry.id === "qwen35-9b-q4k-m");
+
+  expect(gemma26?.model_path).toBe("/root/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf");
+  expect(gemma26?.prompt_mode).toBe("chat");
+  expect(gemma26?.prompt).toContain("benchmark screenshots");
+  expect(gemma26?.max_tokens).toBe(96);
+
+  expect(gemma31?.model_path).toBe("/root/models/gemma-4-31B-it-Q4_K_M.gguf");
+  expect(gemma31?.prompt_mode).toBe("chat");
+  expect(gemma31?.prompt).toContain("benchmark screenshots");
+  expect(gemma31?.max_tokens).toBe(96);
 
   expect(qwen36Dense?.model_path).toBe("/root/models/Qwen3.6-27B-Q4_K_M.gguf");
   expect(qwen36Dense?.prompt_mode).toBe("raw");

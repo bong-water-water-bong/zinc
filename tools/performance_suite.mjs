@@ -14,7 +14,7 @@ const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_LOCAL_CACHE = path.join(ROOT, ".zig-global-cache");
 export const DEFAULT_LOCAL_MODEL_ROOT = path.join(os.homedir(), "Library", "Caches", "zinc", "models", "models");
 const DEFAULT_DOCKER_LLAMA_SERVER = path.join(os.homedir(), ".docker", "bin", "inference", "llama-server");
-const DEFAULT_RDNA_WORKDIR = "/root/zinc";
+const DEFAULT_RDNA_WORKDIR = "/root/zinc-bench";
 const DEFAULT_RDNA_MODEL_ROOT = "/root/models";
 const TARGET_ORDER = ["rdna", "intel", "metal"];
 const MAX_CAPTURE_CHARS = 256_000;
@@ -96,6 +96,7 @@ export function parseArgs(argv) {
     rdnaBuild: false,
     rdnaStartLlama: false,
     rdnaNode: process.env.ZINC_RDNA_NODE ?? process.env.ZINC_NODE ?? null,
+    rdnaBackend: process.env.ZINC_RDNA_BACKEND ?? "vulkan",
     rdnaVkDevice: process.env.ZINC_RDNA_VK_DEVICE != null
       ? parseInteger(process.env.ZINC_RDNA_VK_DEVICE, "ZINC_RDNA_VK_DEVICE")
       : 0,
@@ -183,6 +184,9 @@ export function parseArgs(argv) {
       case "--rdna-node":
         args.rdnaNode = argv[++i] ?? args.rdnaNode;
         break;
+      case "--rdna-backend":
+        args.rdnaBackend = argv[++i] ?? args.rdnaBackend;
+        break;
       case "--intel-sync":
         args.intelSync = true;
         break;
@@ -235,6 +239,9 @@ export function parseArgs(argv) {
   }
 
   if (args.runs === 0) throw new Error("--runs must be at least 1");
+  if (!["auto", "vulkan", "zinc_rt"].includes(args.rdnaBackend)) {
+    throw new Error(`Invalid --rdna-backend '${args.rdnaBackend}'. Expected auto, vulkan, or zinc_rt.`);
+  }
   return args;
 }
 
@@ -260,6 +267,7 @@ function usage() {
   --rdna-build                Build ReleaseFast on the RDNA node before running
   --rdna-start-llama          Start llama-server on the RDNA node before baseline runs
   --rdna-node <name>          Select node-specific env keys, e.g. rdna2 -> ZINC_RDNA2_HOST/PORT/USER
+  --rdna-backend <backend>    ZINC backend to build on RDNA: auto, vulkan, zinc_rt (default: vulkan)
   --intel-sync                Rsync current repo to the Intel node before running
   --intel-build               Build ReleaseFast on the Intel node before running
   --intel-start-llama         Stop stale llama-server processes on the Intel node before baseline runs
@@ -354,6 +362,35 @@ export function parseLlamaCppVersionOutput(text) {
     version: match[1],
     commit: match[2],
   };
+}
+
+export function parseZincVersionOutput(text) {
+  const lines = String(text ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const versionLine = lines.find((line) => /^zinc\s+/i.test(line));
+  const field = (name) => {
+    const prefix = `${name}:`;
+    return lines.find((line) => line.toLowerCase().startsWith(prefix))?.slice(prefix.length).trim() ?? null;
+  };
+  return {
+    version: versionLine ? versionLine.replace(/^zinc\s+/i, "").trim() : null,
+    commit: field("commit"),
+    target: field("target"),
+    optimize: field("optimize"),
+    backend: field("backends") ?? field("backend"),
+  };
+}
+
+export function validateZincBackend(versionText, expectedBackend) {
+  if (!expectedBackend || expectedBackend === "auto") return parseZincVersionOutput(versionText);
+  const parsed = parseZincVersionOutput(versionText);
+  if (parsed.backend !== expectedBackend) {
+    const observed = parsed.backend ?? "unknown";
+    throw new Error(`RDNA ZINC binary backend mismatch: expected ${expectedBackend}, observed ${observed}. Rebuild or stop the process that overwrote zig-out/bin/zinc.`);
+  }
+  return parsed;
 }
 
 export function parseOpenAiCompletionOutput(text) {
@@ -1697,6 +1734,28 @@ async function discoverMetalCases(modelRoot) {
 export function defaultRdnaCases(modelRoot) {
   return [
     {
+      id: "gemma4-26b-a4b-q4k-m",
+      label: "Gemma 4 26B-A4B MoE Q4_K_M",
+      family: "Gemma 4",
+      quant: "Q4_K_M",
+      model_path: path.join(modelRoot, "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"),
+      prompt_mode: "chat",
+      prompt: defaultPromptForModelId("gemma4-26b-a4b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("gemma4-26b-a4b-q4k-m"),
+      notes: ["RDNA4 Gemma MoE comparison against llama.cpp server"],
+    },
+    {
+      id: "gemma4-31b-q4k-m",
+      label: "Gemma 4 31B Q4_K_M",
+      family: "Gemma 4",
+      quant: "Q4_K_M",
+      model_path: path.join(modelRoot, "gemma-4-31B-it-Q4_K_M.gguf"),
+      prompt_mode: "chat",
+      prompt: defaultPromptForModelId("gemma4-31b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("gemma4-31b-q4k-m"),
+      notes: ["RDNA4 dense Gemma comparison against llama.cpp server"],
+    },
+    {
       id: "qwen36-35b-a3b-q4k-xl",
       label: "Qwen 3.6 35B A3B UD Q4_K_XL",
       family: "Qwen 3.6",
@@ -1842,7 +1901,16 @@ async function prepareRdna(args, creds) {
 
   if (args.rdnaBuild) {
     console.log("Building ReleaseFast on RDNA node...");
-    const remote = `cd ${shellQuote(creds.workdir)} && zig build -Doptimize=ReleaseFast`;
+    const buildArgs = ["zig", "build", "-Doptimize=ReleaseFast"];
+    if (args.rdnaBackend !== "auto") {
+      buildArgs.push(`-Dbackend=${args.rdnaBackend}`);
+    }
+    if (args.rdnaSync) {
+      const syncedProvenance = await captureGitProvenance(ROOT);
+      if (syncedProvenance.version) buildArgs.push(`-Dversion=${shellQuote(syncedProvenance.version)}`);
+      if (syncedProvenance.commit) buildArgs.push(`-Dcommit=${shellQuote(syncedProvenance.commit)}`);
+    }
+    const remote = `cd ${shellQuote(creds.workdir)} && ${buildArgs.join(" ")}`;
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
@@ -1863,6 +1931,15 @@ async function prepareRdna(args, creds) {
     ].join(" && ");
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60000 });
   }
+}
+
+async function verifyRdnaZincBackend(args, creds, { quiet = false } = {}) {
+  if (args.rdnaBackend === "auto") return null;
+  const remote = `cd ${shellQuote(creds.workdir)} && ./zig-out/bin/zinc --version`;
+  const result = await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 120000 });
+  const parsed = validateZincBackend(result.stdout, args.rdnaBackend);
+  if (!quiet) console.log(`[rdna] verified ZINC binary backend: ${parsed.backend}`);
+  return parsed;
 }
 
 async function prepareIntel(args, creds, remoteLibcConf) {
@@ -2269,11 +2346,14 @@ async function verifyRemoteVulkanDevice(creds, requireSubstring) {
 async function runRdnaTarget(args) {
   const creds = await buildRdnaCreds(args);
   await prepareRdna(args, creds);
+  await verifyRdnaZincBackend(args, creds);
   await verifyRemoteVulkanDevice(creds, args.requireRdnaDeviceSubstring);
   const rdnaLlamaCli = await detectRdnaLlamaCliPath(creds);
   const rdnaLlamaServer = await detectRdnaLlamaServerPath(creds);
   const baselineBinary = rdnaLlamaServer || rdnaLlamaCli;
-  const zincProvenance = await captureRemoteGitProvenance(creds);
+  const zincProvenance = args.rdnaSync
+    ? await captureGitProvenance(ROOT)
+    : await captureRemoteGitProvenance(creds);
   const llamaCppProvenance = await captureRemoteLlamaCppProvenance(baselineBinary, creds);
 
   const knownCases = defaultRdnaCases(args.rdnaModelRoot);
@@ -2309,6 +2389,7 @@ async function runRdnaTarget(args) {
         if (phase.phase === "zinc") {
           let zinc = null;
           try {
+            await verifyRdnaZincBackend(args, creds, { quiet: true });
             const zincRows = await runSeries({
               label: `zinc ${entry.id} ${scenarioDef.id}`,
               warmupRuns: args.warmupRuns,
@@ -2442,6 +2523,7 @@ async function runRdnaTarget(args) {
       notes: [
         "Hardware: one AMD Radeon AI PRO R9700 benchmark node with 32 GB VRAM and 576 GB/s memory bandwidth. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
         "ZINC path: sync the current source tree to the RDNA node, build with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI with RADV cooperative matrix support enabled.",
+        `ZINC RDNA backend: ${args.rdnaBackend}. Published RDNA runs default to Vulkan; zinc_rt is opt-in because it is a separate bring-up runtime.`,
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
         "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
         "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
