@@ -44,6 +44,7 @@ const qwen_moe_route_pack_validate_tokens: u32 = 128;
 // keeps the layer-major prompt path from falling back to token-major decode at
 // an arbitrary layer cap.
 const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
+const dense_gemma_q4k_geglu_fast_prefix_default: u32 = 3;
 const moe_route_block_cols: u32 = 8;
 const moe_cols_dense_dispatch_cols: u32 = moe_route_block_cols;
 const moe_route_pack_profile_tail_bins: usize = moe_route_block_cols - 1;
@@ -571,6 +572,16 @@ fn isDenseGemma31Q4KGeGLUShape(cfg: ModelConfig) bool {
         cfg.n_layers == 60 and
         cfg.hidden_dim == 5376 and
         cfg.intermediate_dim == 21504;
+}
+
+fn denseGemmaQ4KGeGLUFastPrefixLayers(cfg: ModelConfig) usize {
+    if (!isDenseGemma31Q4KGeGLUShape(cfg)) return 0;
+    const requested =
+        readU32Env("ZINC_METAL_GEMMA_Q4K_GEGLU_FAST_PREFIX_LAYERS") orelse
+        readU32Env("ZINC_QWEN36_35B_ROUTE_PACK_PREFIX_LAYERS") orelse
+        readU32Env("ZINC_QWEN36_ROUTE_PACK_PREFIX_LAYERS") orelse
+        dense_gemma_q4k_geglu_fast_prefix_default;
+    return @min(@as(usize, @intCast(requested)), @as(usize, @intCast(cfg.n_layers)));
 }
 
 fn denseGemmaQ4KGeGLUValidationScanRequested() bool {
@@ -4413,6 +4424,7 @@ pub const InferenceEngine = struct {
     dmmv_q4k_moe_gate_up_pipe: MetalPipeline,
     dmmv_q4k_moe_gate_up_geglu_pipe: MetalPipeline,
     dmmv_q4k_dense_gate_up_geglu_pipe: MetalPipeline,
+    dmmv_q4k_dense_gate_up_geglu_fast_unchecked_pipe: MetalPipeline,
     dmmv_q4k_dense_gate_up_swiglu_pipe: MetalPipeline,
     dmmv_q4k_moe_cols_pipe: MetalPipeline,
     dmmv_q4k_moe_cols_geglu_pipe: MetalPipeline,
@@ -5121,6 +5133,12 @@ pub const InferenceEngine = struct {
         self.dmmv_q4k_moe_gate_up_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up");
         self.dmmv_q4k_moe_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_geglu");
         self.dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
+        self.dmmv_q4k_dense_gate_up_geglu_fast_unchecked_pipe = try loadShaderPipelineWithPrefix(
+            ctx,
+            "dmmv_q4k_dense_gate_up_geglu_fast_unchecked",
+            "dmmv_q4k_dense_gate_up_geglu",
+            "#define ZINC_DENSE_GEGLU_UNCHECKED_FAST 1\n",
+        );
         self.dmmv_q4k_dense_gate_up_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_swiglu");
         self.dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
         self.dmmv_q4k_moe_cols_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols_geglu");
@@ -6078,6 +6096,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_geglu_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dense_gate_up_geglu_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_dense_gate_up_geglu_fast_unchecked_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dense_gate_up_swiglu_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_cols_geglu_pipe);
@@ -8537,9 +8556,39 @@ fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
     };
 }
 
-fn loadShaderPipelineFromDir(ctx: ?*shim.MetalCtx, name: []const u8, shader_dir: []const u8) !MetalPipeline {
+fn loadShaderPipelineWithPrefix(ctx: ?*shim.MetalCtx, name: []const u8, source_name: []const u8, prefix: []const u8) !MetalPipeline {
     const allocator = std.heap.page_allocator;
-    const file_name = std.fmt.allocPrint(allocator, "{s}.metal", .{name}) catch return error.OutOfMemory;
+    const shader_dir = runtime_assets.resolveShaderDir(allocator, .metal) catch |err| {
+        log.err("Failed to resolve Metal shader directory for '{s}': {s}", .{ name, @errorName(err) });
+        return error.ShaderNotFound;
+    };
+    defer allocator.free(shader_dir);
+
+    return loadShaderPipelineFromDirWithPrefix(ctx, name, source_name, shader_dir, prefix) catch |err| {
+        if (err == error.ShaderNotFound and std.posix.getenv("ZINC_SHADER_DIR") == null and !std.mem.eql(u8, shader_dir, "src/shaders/metal")) {
+            return loadShaderPipelineFromDirWithPrefix(ctx, name, source_name, "src/shaders/metal", prefix) catch |source_err| {
+                log.err("Failed to open shader '{s}' from resolved dir and source fallback: {s}", .{ name, @errorName(source_err) });
+                return error.ShaderNotFound;
+            };
+        }
+        log.err("Failed to load Metal shader '{s}' from '{s}': {s}", .{ name, shader_dir, @errorName(err) });
+        return err;
+    };
+}
+
+fn loadShaderPipelineFromDir(ctx: ?*shim.MetalCtx, name: []const u8, shader_dir: []const u8) !MetalPipeline {
+    return loadShaderPipelineFromDirWithPrefix(ctx, name, name, shader_dir, "");
+}
+
+fn loadShaderPipelineFromDirWithPrefix(
+    ctx: ?*shim.MetalCtx,
+    name: []const u8,
+    source_name: []const u8,
+    shader_dir: []const u8,
+    prefix: []const u8,
+) !MetalPipeline {
+    const allocator = std.heap.page_allocator;
+    const file_name = std.fmt.allocPrint(allocator, "{s}.metal", .{source_name}) catch return error.OutOfMemory;
     defer allocator.free(file_name);
 
     const path = std.fs.path.join(allocator, &.{ shader_dir, file_name }) catch return error.OutOfMemory;
@@ -8548,10 +8597,11 @@ fn loadShaderPipelineFromDir(ctx: ?*shim.MetalCtx, name: []const u8, shader_dir:
     const file = std.fs.cwd().openFile(path, .{}) catch return error.ShaderNotFound;
     defer file.close();
     const stat = try file.stat();
-    if (stat.size > 1024 * 1024) return error.ShaderTooLarge;
+    if (stat.size + prefix.len >= 1024 * 1024) return error.ShaderTooLarge;
     var source_buf: [1024 * 1024]u8 = undefined;
-    const bytes_read = try file.readAll(&source_buf);
-    source_buf[bytes_read] = 0;
+    @memcpy(source_buf[0..prefix.len], prefix);
+    const bytes_read = try file.readAll(source_buf[prefix.len .. source_buf.len - 1]);
+    source_buf[prefix.len + bytes_read] = 0;
     var fn_buf: [128]u8 = undefined;
     const fn_name = std.fmt.bufPrintZ(&fn_buf, "main0", .{}) catch return error.NameTooLong;
     var pipe = try metal_pipeline.createPipeline(ctx, @ptrCast(&source_buf), fn_name);
@@ -9760,9 +9810,16 @@ fn canUseDenseQ4KGateUpGeGLU(
         engine.dmmv_q4k_dense_gate_up_geglu_pipe.max_threads_per_threadgroup >= 64;
 }
 
+fn useDenseQ4KGateUpGeGLUFastUnchecked(engine: *const InferenceEngine, layer_idx: usize) bool {
+    if (engine.dmmv_q4k_dense_gate_up_geglu_fast_unchecked_pipe.handle == null) return false;
+    if (engine.dmmv_q4k_dense_gate_up_geglu_fast_unchecked_pipe.max_threads_per_threadgroup < 64) return false;
+    return layer_idx < denseGemmaQ4KGeGLUFastPrefixLayers(engine.config);
+}
+
 fn dispatchDenseQ4KGateUpGeGLUOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
+    layer_idx: usize,
     gate: *const metal_loader.LoadedTensor,
     up: *const metal_loader.LoadedTensor,
     input_buf: *const MetalBuffer,
@@ -9785,8 +9842,12 @@ fn dispatchDenseQ4KGateUpGeGLUOnCmd(
     };
     const bufs = [_]*const MetalBuffer{ &gate.gpu_buffer, &up.gpu_buffer, input_buf, output_buf };
     const rows_per_wg: u32 = 4;
+    const pipe = if (useDenseQ4KGateUpGeGLUFastUnchecked(engine, layer_idx))
+        &engine.dmmv_q4k_dense_gate_up_geglu_fast_unchecked_pipe
+    else
+        &engine.dmmv_q4k_dense_gate_up_geglu_pipe;
     cmd.dispatchV2(
-        &engine.dmmv_q4k_dense_gate_up_geglu_pipe,
+        pipe,
         .{ (M + rows_per_wg - 1) / rows_per_wg, 1, 1 },
         .{ 64, 1, 1 },
         &bufs,
@@ -23173,7 +23234,7 @@ fn runDecodeStep(
                 const fused_gate_up = fused_gate_up_geglu or fused_gate_up_swiglu;
                 const gate_up_dispatch_before = cmd.dispatch_count;
                 if (fused_gate_up_geglu) {
-                    dispatchDenseQ4KGateUpGeGLUOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
+                    dispatchDenseQ4KGateUpGeGLUOnCmd(engine, cmd, layer_idx, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
                 } else if (fused_gate_up_swiglu) {
                     dispatchDenseQ4KGateUpSwiGLUOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
                 } else if (canUseDenseQ4KGateUpDual(engine, gate_t, up_t, inter_dim, hidden_dim)) {
@@ -30093,6 +30154,13 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q8_0_pair_swiglu_pipe);
     var dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
     defer metal_pipeline.freePipeline(&dmmv_q4k_dense_gate_up_geglu_pipe);
+    var dmmv_q4k_dense_gate_up_geglu_fast_unchecked_pipe = try loadShaderPipelineWithPrefix(
+        ctx,
+        "dmmv_q4k_dense_gate_up_geglu_fast_unchecked",
+        "dmmv_q4k_dense_gate_up_geglu",
+        "#define ZINC_DENSE_GEGLU_UNCHECKED_FAST 1\n",
+    );
+    defer metal_pipeline.freePipeline(&dmmv_q4k_dense_gate_up_geglu_fast_unchecked_pipe);
     var dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
     defer metal_pipeline.freePipeline(&dmmv_q4k_moe_cols_pipe);
     var dmmv_q4k_moe_cols_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols_geglu");
@@ -30270,6 +30338,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q8_0_repacked_k4096_qwen_pipe.handle != null);
     try std.testing.expect(dmmv_q8_0_pair_swiglu_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_fast_unchecked_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_moe_cols_geglu_pipe.handle != null);
     try std.testing.expect(dmmv_q5_1_moe_pipe.handle != null);

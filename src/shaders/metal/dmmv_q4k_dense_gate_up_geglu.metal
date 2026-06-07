@@ -180,9 +180,13 @@ inline float2 q4k_block_dot_pair(
 inline float geglu(float gate, float up) {
     const float g3 = gate * gate * gate;
     float inner = 0.7978845608f * fma(0.044715f, g3, gate);
+#if defined(ZINC_DENSE_GEGLU_UNCHECKED_FAST)
+    const float tanh_inner = fast::tanh(inner);
+#else
     // `fast::tanh` can return NaN for extreme inputs on Apple GPUs. Saturate
     // the GeLU tails instead of clamping every value before the tanh call.
     const float tanh_inner = inner > 15.0f ? 1.0f : (inner < -15.0f ? -1.0f : fast::tanh(inner));
+#endif
     const float gelu_gate = 0.5f * gate * (1.0f + tanh_inner);
     return gelu_gate * up;
 }
