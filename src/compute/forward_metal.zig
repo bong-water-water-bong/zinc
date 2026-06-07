@@ -7604,6 +7604,7 @@ pub const InferenceEngine = struct {
                 // is strictly better.
                 if ((self.config.architecture == .gemma or self.config.architecture == .qwen2) and
                     self.config.n_experts == 0 and
+                    M % 4 == 0 and
                     K % 256 == 0 and
                     self.dmmv_q6k_llama_pipe.handle != null)
                 {
@@ -10566,6 +10567,7 @@ fn canUseDenseQ6kSimdgroupDmmv(
         engine.config.n_experts == 0 and
         tensor.info.type_ == .q6_k and
         M > 0 and
+        M % 4 == 0 and
         K % 256 == 0 and
         engine.dmmv_q6k_llama_pipe.handle != null;
 }
