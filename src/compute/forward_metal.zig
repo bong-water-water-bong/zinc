@@ -880,6 +880,19 @@ const DenseFfnBarrierPhase = enum(u8) {
     scale,
 };
 
+const DenseGemmaQ4KGeGLUValidationStatus = enum(u8) {
+    none,
+    ok,
+    all_ok,
+    first_failure,
+};
+
+const DenseGemmaQ4KGeGLUValidationTensor = enum(u8) {
+    none,
+    dense_gate_up_geglu,
+    dense_gate_up_geglu_fast_unchecked,
+};
+
 const GpuMoeFinalizerKind = enum(u8) {
     scalar_seed_norm,
     scalar,
@@ -967,6 +980,17 @@ pub const RuntimeProfile = struct {
     dense_ffn_down_dispatch_calls: u32 = 0,
     dense_ffn_tail_dispatch_calls: u32 = 0,
     dense_ffn_scale_dispatch_calls: u32 = 0,
+    dense_gemma_q4k_geglu_validation_checks: u32 = 0,
+    dense_gemma_q4k_geglu_validation_status: DenseGemmaQ4KGeGLUValidationStatus = .none,
+    dense_gemma_q4k_geglu_validation_tensor: DenseGemmaQ4KGeGLUValidationTensor = .none,
+    dense_gemma_q4k_geglu_validation_token: u32 = 0,
+    dense_gemma_q4k_geglu_validation_scan_token: u32 = 0,
+    dense_gemma_q4k_geglu_validation_token_limit: u32 = 0,
+    dense_gemma_q4k_geglu_validation_layer: u32 = 0,
+    dense_gemma_q4k_geglu_validation_suggested_safe_prefix_layers: u32 = 0,
+    dense_gemma_q4k_geglu_validation_max_abs: f32 = 0,
+    dense_gemma_q4k_geglu_validation_rms: f32 = 0,
+    dense_gemma_q4k_geglu_validation_tol: f32 = 0,
     final_barrier_calls: u32 = 0,
     sample_calls: u32 = 0,
     full_attn_layers: u32 = 0,
@@ -1783,6 +1807,23 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             pctOf(profile.gpu_completion_wait_ns, profile.queued_prefill_final_wait_ns),
         });
     }
+}
+
+fn denseGemmaQ4KGeGLUValidationStatusName(status: DenseGemmaQ4KGeGLUValidationStatus) []const u8 {
+    return switch (status) {
+        .none => "none",
+        .ok => "ok",
+        .all_ok => "all-ok",
+        .first_failure => "first-failure",
+    };
+}
+
+fn denseGemmaQ4KGeGLUValidationTensorName(tensor: DenseGemmaQ4KGeGLUValidationTensor) []const u8 {
+    return switch (tensor) {
+        .none => "none",
+        .dense_gate_up_geglu => "dense_gate_up_geglu",
+        .dense_gate_up_geglu_fast_unchecked => "dense_gate_up_geglu_fast_unchecked",
+    };
 }
 
 fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
@@ -7917,6 +7958,22 @@ pub const InferenceEngine = struct {
                     profile.dense_ffn_tail_barrier_calls,
                     profile.dense_ffn_scale_barrier_calls,
                     other_dense_barriers,
+                });
+            }
+            if (isDenseGemma31Q4KGeGLUShape(self.config) or profile.dense_gemma_q4k_geglu_validation_checks > 0) {
+                log.info("  dense Gemma Q4_K GeGLU fast: prefix_layers {d} validation_checks {d} status {s} token {d} scan_token {d}/{d} layer {d} tensor {s} max_abs {d:.6} rms {d:.6} tol {d:.6} suggested_safe_prefix {d}", .{
+                    denseGemmaQ4KGeGLUFastPrefixLayers(self.config),
+                    profile.dense_gemma_q4k_geglu_validation_checks,
+                    denseGemmaQ4KGeGLUValidationStatusName(profile.dense_gemma_q4k_geglu_validation_status),
+                    profile.dense_gemma_q4k_geglu_validation_token,
+                    profile.dense_gemma_q4k_geglu_validation_scan_token,
+                    profile.dense_gemma_q4k_geglu_validation_token_limit,
+                    profile.dense_gemma_q4k_geglu_validation_layer,
+                    denseGemmaQ4KGeGLUValidationTensorName(profile.dense_gemma_q4k_geglu_validation_tensor),
+                    profile.dense_gemma_q4k_geglu_validation_max_abs,
+                    profile.dense_gemma_q4k_geglu_validation_rms,
+                    profile.dense_gemma_q4k_geglu_validation_tol,
+                    profile.dense_gemma_q4k_geglu_validation_suggested_safe_prefix_layers,
                 });
             }
             if (profile.ssm_barrier_calls > 0) {
@@ -17663,6 +17720,31 @@ fn diffF32Slices(expected: []const f32, actual: []const f32) SliceDiff {
     return .{ .max_abs = max_abs, .max_idx = max_idx, .rms = rms };
 }
 
+fn recordDenseGemmaQ4KGeGLUValidationProfile(
+    profile: ?*RuntimeProfile,
+    status: DenseGemmaQ4KGeGLUValidationStatus,
+    tensor: DenseGemmaQ4KGeGLUValidationTensor,
+    token: u32,
+    scan_token: u32,
+    token_limit: u32,
+    layer_idx: usize,
+    suggested_safe_prefix_layers: usize,
+    diff: SliceDiff,
+    tol: f32,
+) void {
+    const p = profile orelse return;
+    p.dense_gemma_q4k_geglu_validation_status = status;
+    p.dense_gemma_q4k_geglu_validation_tensor = tensor;
+    p.dense_gemma_q4k_geglu_validation_token = token;
+    p.dense_gemma_q4k_geglu_validation_scan_token = scan_token;
+    p.dense_gemma_q4k_geglu_validation_token_limit = token_limit;
+    p.dense_gemma_q4k_geglu_validation_layer = @intCast(@min(layer_idx, @as(usize, std.math.maxInt(u32))));
+    p.dense_gemma_q4k_geglu_validation_suggested_safe_prefix_layers = @intCast(@min(suggested_safe_prefix_layers, @as(usize, std.math.maxInt(u32))));
+    p.dense_gemma_q4k_geglu_validation_max_abs = diff.max_abs;
+    p.dense_gemma_q4k_geglu_validation_rms = @floatCast(diff.rms);
+    p.dense_gemma_q4k_geglu_validation_tol = tol;
+}
+
 fn shouldValidateDenseGemmaQ4KGeGLU(engine: *const InferenceEngine, layer_idx: usize, fused_gate_up_geglu: bool) bool {
     const requested_layer = denseGemmaQ4KGeGLUValidateLayer(engine);
     const layer_matches = if (engine.dense_gemma_q4k_geglu_validation_scan_layers)
@@ -17726,6 +17808,9 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
         @as(usize, @intCast(engine.config.n_layers - 1));
     const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
     const scan_token = engine.dense_gemma_q4k_geglu_validation_scanned_tokens + 1;
+    if (profile) |p| {
+        p.dense_gemma_q4k_geglu_validation_checks += 1;
+    }
     if (diff.max_abs <= tol) {
         if (!scan_layers) {
             log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
@@ -17794,6 +17879,7 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
 
     if (scan_layers) {
         if (diff.max_abs > tol) {
+            recordDenseGemmaQ4KGeGLUValidationProfile(profile, .first_failure, .dense_gate_up_geglu, engine.position, scan_token, engine.dense_gemma_q4k_geglu_validation_token_limit, layer_idx, layer_idx, diff, tol);
             log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_FIRST_FAILURE: token={d} scan_token={d}/{d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} suggested_safe_prefix_layers={d}", .{
                 engine.position,
                 scan_token,
@@ -17809,6 +17895,7 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
             });
             engine.dense_gemma_q4k_geglu_validation_emitted = true;
         } else if (validate_fast_unchecked and fast_diff.max_abs > tol) {
+            recordDenseGemmaQ4KGeGLUValidationProfile(profile, .first_failure, .dense_gate_up_geglu_fast_unchecked, engine.position, scan_token, engine.dense_gemma_q4k_geglu_validation_token_limit, layer_idx, layer_idx, fast_diff, tol);
             log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_FIRST_FAILURE: token={d} scan_token={d}/{d} layer={d} tensor=dense_gate_up_geglu_fast_unchecked max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} suggested_safe_prefix_layers={d}", .{
                 engine.position,
                 scan_token,
@@ -17826,6 +17913,18 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
         } else if (layer_idx >= last_layer_idx) {
             engine.dense_gemma_q4k_geglu_validation_scanned_tokens += 1;
             if (engine.dense_gemma_q4k_geglu_validation_scanned_tokens >= engine.dense_gemma_q4k_geglu_validation_token_limit) {
+                recordDenseGemmaQ4KGeGLUValidationProfile(
+                    profile,
+                    .all_ok,
+                    if (validate_fast_unchecked) .dense_gate_up_geglu_fast_unchecked else .dense_gate_up_geglu,
+                    engine.position,
+                    engine.dense_gemma_q4k_geglu_validation_scanned_tokens,
+                    engine.dense_gemma_q4k_geglu_validation_token_limit,
+                    layer_idx,
+                    layer_idx + 1,
+                    if (validate_fast_unchecked) fast_diff else diff,
+                    tol,
+                );
                 log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_ALL_OK: token={d} scan_tokens={d} start_layer={d} safe_prefix_layers={d} tol={d:.6}", .{
                     engine.position,
                     engine.dense_gemma_q4k_geglu_validation_scanned_tokens,
@@ -17835,6 +17934,18 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
                 });
                 engine.dense_gemma_q4k_geglu_validation_emitted = true;
             } else {
+                recordDenseGemmaQ4KGeGLUValidationProfile(
+                    profile,
+                    .ok,
+                    if (validate_fast_unchecked) .dense_gate_up_geglu_fast_unchecked else .dense_gate_up_geglu,
+                    engine.position,
+                    engine.dense_gemma_q4k_geglu_validation_scanned_tokens,
+                    engine.dense_gemma_q4k_geglu_validation_token_limit,
+                    layer_idx,
+                    layer_idx + 1,
+                    if (validate_fast_unchecked) fast_diff else diff,
+                    tol,
+                );
                 log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_TOKEN_OK: token={d} scan_token={d}/{d} start_layer={d} safe_prefix_layers={d} tol={d:.6}", .{
                     engine.position,
                     engine.dense_gemma_q4k_geglu_validation_scanned_tokens,
@@ -17846,6 +17957,24 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
             }
         }
     } else {
+        if (diff.max_abs > tol) {
+            recordDenseGemmaQ4KGeGLUValidationProfile(profile, .first_failure, .dense_gate_up_geglu, engine.position, scan_token, engine.dense_gemma_q4k_geglu_validation_token_limit, layer_idx, layer_idx, diff, tol);
+        } else if (validate_fast_unchecked and fast_diff.max_abs > tol) {
+            recordDenseGemmaQ4KGeGLUValidationProfile(profile, .first_failure, .dense_gate_up_geglu_fast_unchecked, engine.position, scan_token, engine.dense_gemma_q4k_geglu_validation_token_limit, layer_idx, layer_idx, fast_diff, tol);
+        } else {
+            recordDenseGemmaQ4KGeGLUValidationProfile(
+                profile,
+                .ok,
+                if (validate_fast_unchecked) .dense_gate_up_geglu_fast_unchecked else .dense_gate_up_geglu,
+                engine.position,
+                scan_token,
+                engine.dense_gemma_q4k_geglu_validation_token_limit,
+                layer_idx,
+                layer_idx + 1,
+                if (validate_fast_unchecked) fast_diff else diff,
+                tol,
+            );
+        }
         engine.dense_gemma_q4k_geglu_validation_emitted = true;
     }
     cmd.* = try beginProfiledCommand(engine, profile);
