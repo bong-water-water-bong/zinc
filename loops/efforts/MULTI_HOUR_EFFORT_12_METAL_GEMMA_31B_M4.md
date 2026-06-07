@@ -4,9 +4,11 @@
 
 Make Gemma 4 31B usable on local Apple Silicon M4 through the Metal backend.
 Coherence is already there: chat mode emits "The capital of France is Paris."
-on the canonical prompt. Throughput is not. The 14-token chat prefill takes
-72 seconds and decode reads at 0.28 tok/s. The model fits in 64 GB UMA at
-Q4_K_M, so this is a kernel/dispatch problem, not a memory problem.
+on the canonical prompt. The old 0.28 tok/s decode bug is fixed on current
+`main`; the remaining work is to move dense 31B from the low-20 tok/s band
+toward the measured bandwidth ceiling while keeping prefill healthy. The model
+fits in 64 GB UMA at Q4_K_M, so this is a kernel/dispatch/profile-guided
+optimization problem, not a memory-fit problem.
 
 Primary model for this effort:
 
@@ -22,24 +24,34 @@ ZINC_MODEL_ID=gemma4-31b-q4k-m \
 ZINC_PROMPT_MODE=chat \
 ZINC_TEST_PROMPT="What is the capital of France?" \
 ZINC_MAX_TOKENS=12 \
-ZINC_TARGET_TOK_PER_SEC=20 \
+ZINC_MIN_DECODE_TOKENS=4 \
+ZINC_TARGET_TOK_PER_SEC=25 \
 ZINC_STOP_ON_TARGET=0 \
 ZINC_BENCHMARK_RUNS=3 \
+ZINC_BENCHMARK_WARMUPS=1 \
 ZINC_PROFILE_EVERY=1 \
 ZINC_BUILD_OPTIMIZE=ReleaseFast \
 ZINC_TEST_TIMEOUT_MS=300000 \
-ZINC_RUN_TIMEOUT_MS=1800000 \
+ZINC_RUN_TIMEOUT_MS=900000 \
+ZINC_CROSS_EFFORT_PROMPT="What is the capital of France?" \
+ZINC_CROSS_EFFORT_METRIC=prefill \
+ZINC_CROSS_EFFORT_PROMPT_MODE=chat \
+ZINC_CROSS_EFFORT_MAX_TOKENS=12 \
+ZINC_CROSS_EFFORT_EVERY=3 \
+ZINC_HARD_FAMILY_COOLDOWN=1 \
+ZINC_WORKLOAD_RESET_ON_CHANGE=1 \
 ZINC_CODEX_REASONING_EFFORT=xhigh \
-bun loops/implement_metal.ts --resume --effort 12 --agent codex --model gpt-5.5 --cycles 100
+bun loops/implement_metal.ts --effort 12 --agent codex --model gpt-5.5 --cycles 100
 ```
 
 `--agent claude` is also fine; the doc is written for either agent. Use
 `ZINC_BENCHMARK_RUNS=3` while every run is multi-minute. Step up to 5
 samples once decode is past 5 tok/s.
 
-`ZINC_RUN_TIMEOUT_MS=1800000` is 30 minutes, sized for the current 70-second
-prefill and to leave headroom for kernel-load slowness early in the effort.
-Tighten this back toward 600000 once prefill is under 30 seconds.
+`ZINC_RUN_TIMEOUT_MS=900000` is 15 minutes, sized for current runs while still
+leaving headroom for profiling and first-load slowness. The old 30-minute
+timeout was for the pre-cycle-1 72-second prefill path and should not be needed
+unless a candidate regresses badly.
 
 Important harness detail:
 
@@ -51,6 +63,28 @@ Important harness detail:
   verifier was built with the same optimize mode.
 
 ## Current baseline
+
+Fresh locked-workload baseline on current `main`, 2026-06-07:
+
+```text
+Prompt: "What is the capital of France?", chat template
+Workload: 20 prompt tokens, 12 max decode tokens, reference text "Paris"
+Prompt fingerprint: raw=5f0147173564daf7 prepared=3c25651a964fa30c
+Samples: 22.23, 22.36, 22.36 decode tok/s
+Median: 22.36 decode tok/s
+Prefill: 20 tokens in 229.1 ms (87.3 tok/s)
+Output: "The capital of France is Paris." (coherent)
+Target for the next loop: 25 decode tok/s with prefill guarded.
+```
+
+Interpretation:
+
+- The old dense-31B `0.28 tok/s` decode bug is no longer present.
+- The old `20 tok/s` target is already met on cycle 1 before any new edit.
+- The useful optimization target is now the `22 -> 25+ tok/s` decode gap and
+  any prefill regression introduced while chasing it.
+- Do not optimize from the May 2026 baseline below unless explicitly analyzing
+  historical regressions.
 
 Loader output on the canonical chat prompt:
 
