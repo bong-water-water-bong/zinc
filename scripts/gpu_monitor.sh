@@ -123,44 +123,62 @@ remote_log() {
   local action="$1"
   case "$action" in
     start)
-      local logger b64
+      local logger supervisor lb64 sb64
       # Single-quoted so nothing expands locally; shipped to the node as base64.
+      # run.sh = the sampler (append-mode, never truncates). supervisor.sh keeps it
+      # alive: if the sampler dies (OOM, transient kill), it's respawned within ~30s.
+      # The supervisor persists because the WSL VM has multi-day uptime; `start` is
+      # idempotent so a cron/keepalive can re-ensure the supervisor itself.
       logger='#!/usr/bin/env bash
 RDIR="$HOME/.gpu_monitor"; CSV="$RDIR/thermals.csv"; PIDF="$RDIR/logger.pid"
 INT="${1:-2}"
 echo $$ > "$PIDF"
-echo "timestamp,index,name,util_gpu,util_mem,mem_used_mib,mem_total_mib,temp_c,power_w,power_limit_w" > "$CSV"
+[ -s "$CSV" ] || echo "timestamp,index,name,util_gpu,util_mem,mem_used_mib,mem_total_mib,temp_c,power_w,power_limit_w" > "$CSV"
 while :; do
   nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits >> "$CSV" 2>/dev/null
   sleep "$INT"
 done'
-      b64="$(printf '%s' "$logger" | base64 | tr -d '\n')"
+      supervisor='#!/usr/bin/env bash
+RDIR="$HOME/.gpu_monitor"; SPID="$RDIR/supervisor.pid"; LPID="$RDIR/logger.pid"
+echo $$ > "$SPID"
+INT="${1:-2}"
+launch() { if command -v setsid >/dev/null 2>&1; then setsid bash "$RDIR/run.sh" "$INT" >/dev/null 2>&1 </dev/null & else nohup bash "$RDIR/run.sh" "$INT" >/dev/null 2>&1 </dev/null & fi; }
+while :; do
+  if [ ! -f "$LPID" ] || ! kill -0 "$(cat "$LPID" 2>/dev/null)" 2>/dev/null; then launch; fi
+  sleep 30
+done'
+      lb64="$(printf '%s' "$logger" | base64 | tr -d '\n')"
+      sb64="$(printf '%s' "$supervisor" | base64 | tr -d '\n')"
       "${SSH[@]}" "$NODE" "
-        RDIR=\"\$HOME/.gpu_monitor\"; mkdir -p \"\$RDIR\"; PIDF=\"\$RDIR/logger.pid\";
-        if [ -f \"\$PIDF\" ] && kill -0 \"\$(cat \"\$PIDF\" 2>/dev/null)\" 2>/dev/null; then
-          echo \"already running (pid \$(cat \"\$PIDF\"))\"; exit 0; fi
-        echo \"$b64\" | base64 -d > \"\$RDIR/run.sh\";
+        RDIR=\"\$HOME/.gpu_monitor\"; mkdir -p \"\$RDIR\"; SPID=\"\$RDIR/supervisor.pid\";
+        echo \"$lb64\" | base64 -d > \"\$RDIR/run.sh\";
+        echo \"$sb64\" | base64 -d > \"\$RDIR/supervisor.sh\";
+        if [ -f \"\$SPID\" ] && kill -0 \"\$(cat \"\$SPID\" 2>/dev/null)\" 2>/dev/null; then
+          echo \"already running (supervisor pid \$(cat \"\$SPID\"))\"; exit 0; fi
         if command -v setsid >/dev/null 2>&1; then
-          setsid bash \"\$RDIR/run.sh\" $INTERVAL >/dev/null 2>&1 </dev/null &
+          setsid bash \"\$RDIR/supervisor.sh\" $INTERVAL >/dev/null 2>&1 </dev/null &
         else
-          nohup bash \"\$RDIR/run.sh\" $INTERVAL >/dev/null 2>&1 </dev/null &
+          nohup bash \"\$RDIR/supervisor.sh\" $INTERVAL >/dev/null 2>&1 </dev/null &
         fi
-        sleep 0.6;
-        if [ -f \"\$PIDF\" ] && kill -0 \"\$(cat \"\$PIDF\" 2>/dev/null)\" 2>/dev/null; then
-          echo \"started (pid \$(cat \"\$PIDF\"), every ${INTERVAL}s) -> \$RDIR/thermals.csv\";
+        sleep 1.5;
+        if [ -f \"\$SPID\" ] && kill -0 \"\$(cat \"\$SPID\" 2>/dev/null)\" 2>/dev/null; then
+          echo \"started (supervisor \$(cat \"\$SPID\"), logger \$(cat \"\$RDIR/logger.pid\" 2>/dev/null || echo ?), every ${INTERVAL}s, auto-respawn) -> \$RDIR/thermals.csv\";
         else echo \"failed to start\" >&2; exit 1; fi" ;;
     stop)
+      # Kill the supervisor FIRST, otherwise it respawns the logger we just killed.
       "${SSH[@]}" "$NODE" "
-        PIDF=\"\$HOME/.gpu_monitor/logger.pid\"; CSV=\"\$HOME/.gpu_monitor/thermals.csv\";
-        if [ -f \"\$PIDF\" ]; then PID=\"\$(cat \"\$PIDF\")\";
-          if kill -0 \"\$PID\" 2>/dev/null; then kill \"\$PID\" 2>/dev/null; sleep 0.3; kill -9 \"\$PID\" 2>/dev/null; echo \"stopped (pid \$PID)\";
-          else echo \"not running (stale pid \$PID)\"; fi; rm -f \"\$PIDF\";
-        else echo \"not running (no pid file)\"; fi;
+        RDIR=\"\$HOME/.gpu_monitor\"; CSV=\"\$RDIR/thermals.csv\";
+        for w in supervisor logger; do PF=\"\$RDIR/\$w.pid\";
+          if [ -f \"\$PF\" ]; then P=\"\$(cat \"\$PF\")\";
+            kill \"\$P\" 2>/dev/null; sleep 0.2; kill -9 \"\$P\" 2>/dev/null; rm -f \"\$PF\"; echo \"stopped \$w (pid \$P)\"; fi
+        done;
         [ -f \"\$CSV\" ] && echo \"logged \$(( \$(wc -l < \"\$CSV\") - 1 )) rows -> \$CSV\" || true" ;;
     status)
       "${SSH[@]}" "$NODE" "
-        PIDF=\"\$HOME/.gpu_monitor/logger.pid\"; CSV=\"\$HOME/.gpu_monitor/thermals.csv\";
-        if [ -f \"\$PIDF\" ] && kill -0 \"\$(cat \"\$PIDF\" 2>/dev/null)\" 2>/dev/null; then echo \"RUNNING (pid \$(cat \"\$PIDF\"))\"; else echo \"NOT RUNNING\"; fi;
+        RDIR=\"\$HOME/.gpu_monitor\"; CSV=\"\$RDIR/thermals.csv\"; sup=stopped; log=stopped;
+        [ -f \"\$RDIR/supervisor.pid\" ] && kill -0 \"\$(cat \"\$RDIR/supervisor.pid\" 2>/dev/null)\" 2>/dev/null && sup=running;
+        [ -f \"\$RDIR/logger.pid\" ] && kill -0 \"\$(cat \"\$RDIR/logger.pid\" 2>/dev/null)\" 2>/dev/null && log=running;
+        echo \"supervisor=\$sup  logger=\$log\";
         if [ -f \"\$CSV\" ]; then echo \"rows=\$(( \$(wc -l < \"\$CSV\") - 1 ))  size=\$(du -h \"\$CSV\" | cut -f1)  path=\$CSV\"; echo \"latest:\"; tail -n 2 \"\$CSV\"; else echo \"(no CSV yet)\"; fi" ;;
     tail)
       "${SSH[@]}" "$NODE" "tail -n 15 \"\$HOME/.gpu_monitor/thermals.csv\" 2>/dev/null || echo '(no CSV yet)'" ;;

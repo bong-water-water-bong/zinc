@@ -79,22 +79,30 @@ function isActive(slug: string): boolean {
   <Breadcrumbs items={breadcrumbItems} />
   <div class="doc-layout wide">
     <aside class="doc-nav">
-      <h3><a href="/zinc/docs">Docs</a></h3>
-      <DocsSearch compact={true} heading="Search" intro="Search guides and the Zig API." placeholder="Search docs and API" />
-      {docNavSections.map(section => (
-        <div class="doc-nav-section">
-          <p class="doc-nav-label">{section.label}</p>
-          <ul>
-            {section.items.map(item => (
-              <li>
-                <a href={`/zinc/docs/${item.slug}`} class:list={[{ active: isActive(item.slug) }]}>
-                  {item.label}
-                </a>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ))}
+      <input type="checkbox" id="doc-nav-toggle" class="doc-nav-checkbox sr-only" />
+      <div class="doc-nav-bar">
+        <h3><a href="/zinc/docs">Docs</a></h3>
+        <label for="doc-nav-toggle" class="doc-nav-toggle-label" aria-label="Toggle docs navigation">
+          <span></span>
+        </label>
+      </div>
+      <div class="doc-nav-panel">
+        <DocsSearch compact={true} heading="Search" intro="Search guides and the Zig API." placeholder="Search docs and API" />
+        {docNavSections.map(section => (
+          <div class="doc-nav-section">
+            <p class="doc-nav-label">{section.label}</p>
+            <ul>
+              {section.items.map(item => (
+                <li>
+                  <a href={`/zinc/docs/${item.slug}`} class:list={[{ active: isActive(item.slug) }]}>
+                    {item.label}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
     </aside>
     <article class="doc-content">
       {lastmod && <p class="lastmod">Last updated: {lastmod}</p>}
@@ -133,6 +141,39 @@ function isActive(slug: string): boolean {
     top: 1rem;
     align-self: start;
   }
+
+  .doc-nav-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  /* The collapse toggle only appears on mobile; desktop shows the full panel. */
+  .doc-nav-toggle-label {
+    display: none;
+    cursor: pointer;
+    padding: var(--space-sm);
+    margin: calc(-1 * var(--space-sm));
+  }
+
+  .doc-nav-toggle-label span,
+  .doc-nav-toggle-label span::before,
+  .doc-nav-toggle-label span::after {
+    display: block;
+    width: 18px;
+    height: 2px;
+    background: var(--color-text-muted);
+    position: relative;
+  }
+
+  .doc-nav-toggle-label span::before,
+  .doc-nav-toggle-label span::after {
+    content: '';
+    position: absolute;
+  }
+
+  .doc-nav-toggle-label span::before { top: -5px; }
+  .doc-nav-toggle-label span::after { top: 5px; }
 
   .doc-nav-section + .doc-nav-section {
     margin-top: var(--space-lg);
@@ -216,6 +257,21 @@ function isActive(slug: string): boolean {
 
     .doc-nav {
       position: static;
+    }
+
+    /* Collapse the doc nav into a tappable "Docs" bar so the article is the
+       first thing visible; the link list expands on demand. */
+    .doc-nav-toggle-label {
+      display: block;
+    }
+
+    .doc-nav-panel {
+      display: none;
+    }
+
+    .doc-nav-checkbox:checked ~ .doc-nav-panel {
+      display: block;
+      margin-top: var(--space-md);
     }
 
     .doc-nav ul {
