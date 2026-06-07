@@ -15,10 +15,11 @@ struct Params {
 #define N_SIMDGROUPS 32
 #define SIMD_WIDTH 32
 #define TG_SIZE (N_SIMDGROUPS * SIMD_WIDTH)
-// This variant is only dispatched for n=5376. The extra pass over the hidden
-// row costs about 21 KiB per call, which is negligible next to the adjacent
-// matvec traffic, and avoids keeping 6 floats live per thread across the
-// second reduction.
+// This variant is only dispatched for n=5376, so each thread owns at most six
+// elements. Cache those six post-residual values in registers, matching the
+// smaller post_norm_residual_rms_norm kernel, and avoid rereading hidden for
+// the final output norm pass.
+#define MAX_PER_THREAD 6
 
 kernel void main0(
     constant Params& p [[buffer(0)]],
@@ -51,6 +52,8 @@ kernel void main0(
     const float rms_inv_r = fast::rsqrt(fast::divide(total_sq_r, float(p.n)) + p.eps);
 
     float sum_sq_h = 0.0f;
+    float h_vals[MAX_PER_THREAD];
+    uint count = 0;
     const float hidden_scale = p.hidden_scale;
     const bool apply_hidden_scale = hidden_scale != 1.0f;
     for (uint i = tid; i < p.n; i += TG_SIZE) {
@@ -58,6 +61,7 @@ kernel void main0(
         const float r_normed = residual_w[i] * (r * rms_inv_r);
         const float h = hidden[base + i] + r_normed;
         hidden[base + i] = apply_hidden_scale ? (h * hidden_scale) : h;
+        h_vals[count++] = h;
         sum_sq_h += h * h;
     }
 
@@ -68,9 +72,8 @@ kernel void main0(
     const float total_sq_h = simd_sum(part_h);
     const float rms_inv_h = fast::rsqrt(fast::divide(total_sq_h, float(p.n)) + p.eps);
 
-    const float hidden_unscale = apply_hidden_scale ? fast::divide(1.0f, hidden_scale) : 1.0f;
+    count = 0;
     for (uint i = tid; i < p.n; i += TG_SIZE) {
-        const float h = hidden[base + i] * hidden_unscale;
-        norm_out[base + i] = output_w[i] * (h * rms_inv_h);
+        norm_out[base + i] = output_w[i] * (h_vals[count++] * rms_inv_h);
     }
 }
