@@ -16199,8 +16199,8 @@ fn dispatchFullAttnPrepOnCmd(
 
     // Fuse RoPE-K with the K/V cache write when:
     //   - cache is f32 (kv_cache_q8 path keeps its own quantizing kernel),
-    //   - V is projected separately (use_k_as_v requires a copy this kernel
-    //     does not perform),
+    //   - v_buf has been materialized (Gemma use_k_as_v layers project the
+    //     same K tensor into both k_buf and v_buf before this edge),
     //   - rope_dim is even (the kernel processes pairs).
     // Saves one barrier and one dispatch per dense full-attn layer (≈60/token
     // on Gemma 31B). The rope→kv-write barrier can be skipped because the
@@ -16208,7 +16208,6 @@ fn dispatchFullAttnPrepOnCmd(
     // cache and q_buf.
     const can_fuse_rope_kv_write =
         !engine.kv_cache_q8 and
-        !attn.use_k_as_v and
         (attn.rope_dim % 2) == 0;
     const rope_dispatch_before = cmd.dispatch_count;
     const need_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
@@ -16444,7 +16443,6 @@ fn dispatchFullAttnKvCacheOnlyOnCmd(
 
     const can_fuse_rope_kv_write =
         !engine.kv_cache_q8 and
-        !attn.use_k_as_v and
         (attn.rope_dim % 2) == 0;
     const rope_dispatch_before = cmd.dispatch_count;
     const need_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
