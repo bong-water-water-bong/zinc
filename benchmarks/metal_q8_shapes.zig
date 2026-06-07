@@ -188,6 +188,7 @@ const CaseId = enum {
     shared_down_gemm,
     shared_dual,
     shared_pair_swiglu,
+    dense_gate_up_geglu,
     moe_gate,
     moe_up,
     moe_down,
@@ -324,6 +325,7 @@ fn helpText() []const u8 {
     \\                            | shared_gate | shared_up | shared_down | shared_dual
     \\                            | shared_gate_gemm | shared_up_gemm | shared_down_gemm
     \\                            | shared_pair_swiglu
+    \\                            | dense_gate_up_geglu
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
     \\                            | moe_gate_up_geglu | moe_gate_up_geglu_cols | moe_gate_up_swiglu
@@ -369,6 +371,7 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "shared_down_gemm")) return .shared_down_gemm;
     if (std.mem.eql(u8, arg, "shared_dual")) return .shared_dual;
     if (std.mem.eql(u8, arg, "shared_pair_swiglu")) return .shared_pair_swiglu;
+    if (std.mem.eql(u8, arg, "dense_gate_up_geglu")) return .dense_gate_up_geglu;
     if (std.mem.eql(u8, arg, "moe_gate")) return .moe_gate;
     if (std.mem.eql(u8, arg, "moe_up")) return .moe_up;
     if (std.mem.eql(u8, arg, "moe_down")) return .moe_down;
@@ -390,6 +393,7 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             .shared_gate_gemm,
             .shared_up_gemm,
             .shared_down_gemm,
+            .dense_gate_up_geglu,
             => false,
             else => true,
         },
@@ -850,6 +854,30 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .rows1 = inter_dim,
                 .cols = hidden_dim,
                 .is_shared_pair_swiglu = true,
+            };
+        },
+        .dense_gate_up_geglu => blk: {
+            // Exact production dense Gemma 31B FFN gate/up fusion:
+            // `dispatchDenseQ4KGateUpGeGLUOnCmd` reads separate Q4_K gate/up
+            // tensors and emits the activated GeGLU vector in one dispatch.
+            if (model.config.n_experts != 0) return error.ExpectedDenseModel;
+            const inter_dim = model.config.intermediate_dim;
+            const hidden_dim = model.config.hidden_dim;
+            const gate = findFirstLayerTensor(model, "ffn_gate.weight") orelse
+                return error.MissingDenseGateTensor;
+            const up = findFirstLayerTensor(model, "ffn_up.weight") orelse
+                return error.MissingDenseUpTensor;
+            if (gate.info.type_ != .q4_k or up.info.type_ != .q4_k) return error.ExpectedExpertQuantTensor;
+            if ((try tensorRows(gate)) != inter_dim or (try tensorCols(gate)) != hidden_dim) return error.InvalidTensorShape;
+            if ((try tensorRows(up)) != inter_dim or (try tensorCols(up)) != hidden_dim) return error.InvalidTensorShape;
+            break :blk .{
+                .key = "dense_gate_up_geglu",
+                .label = "Dense Gemma Q4_K gate+up GeGLU fused",
+                .tensor0 = gate,
+                .tensor1 = up,
+                .rows0 = inter_dim,
+                .rows1 = inter_dim,
+                .cols = hidden_dim,
             };
         },
         .moe_gate, .moe_gate_cols => blk: {
@@ -2485,6 +2513,131 @@ fn benchmarkSharedPairSwigluVariant(
     };
 }
 
+fn runDenseGateUpGegluDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    pipe: *const MetalPipeline,
+    gate_tensor: *const metal_loader.LoadedTensor,
+    up_tensor: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0) return;
+    const push = DualQ8DmmvPush{
+        .M0 = M,
+        .M1 = M,
+        .K = K,
+        .a0_offset = tensorPageOffset(model, gate_tensor),
+        .a1_offset = tensorPageOffset(model, up_tensor),
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate_tensor.gpu_buffer, &up_tensor.gpu_buffer, input_buf, output_buf };
+    const block_size: u32 = 64;
+    const rows_per_wg: u32 = 4;
+    const workgroups = (M + rows_per_wg - 1) / rows_per_wg;
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            pipe,
+            .{ workgroups, 1, 1 },
+            .{ block_size, 1, 1 },
+            &bufs,
+            &push,
+            @sizeOf(DualQ8DmmvPush),
+            2,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn benchmarkDenseGateUpGegluVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    warmup_iterations: u32,
+    iterations: u32,
+) !BenchResult {
+    const up_tensor = hot_case.tensor1 orelse return error.ExpectedDualCase;
+    if (hot_case.tensor0.info.type_ != .q4_k or up_tensor.info.type_ != .q4_k)
+        return error.ExpectedExpertQuantTensor;
+
+    var pipe = try loadShaderPipeline(device.ctx, "dmmv_q4k_dense_gate_up_geglu");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.rows0) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    fillInputBuffer(&input_buf, hot_case.cols);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    try runDenseGateUpGegluDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        up_tensor,
+        model,
+        &input_buf,
+        &output_buf,
+        hot_case.rows0,
+        hot_case.cols,
+        warmup_iterations,
+    );
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runDenseGateUpGegluDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        up_tensor,
+        model,
+        &input_buf,
+        &output_buf,
+        hot_case.rows0,
+        hot_case.cols,
+        iterations,
+    );
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    const per_tensor_bytes = weightBytesPerIter(.q4_k, hot_case.rows0, hot_case.cols);
+    const weight_bytes: u64 = per_tensor_bytes * 2;
+    const total_bytes = weight_bytes * iterations;
+    const output_copy = try copyOutput(allocator, &output_buf, hot_case.rows0);
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = "dense-fused-geglu",
+        .shader_name = "dmmv_q4k_dense_gate_up_geglu",
+        .tensor_name = hot_case.tensor0.info.name,
+        .rows = hot_case.rows0,
+        .cols = hot_case.cols,
+        .expert_slots = 1,
+        .x_expert_stride = 0,
+        .iterations = iterations,
+        .block_size = 64,
+        .rows_per_wg = 4,
+        .thread_execution_width = pipe.thread_execution_width,
+        .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(output_copy),
+        .output = output_copy,
+    };
+}
+
 fn copyOutput(allocator: std.mem.Allocator, output_buf: *const MetalBuffer, rows: u32) ![]f32 {
     const ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     return try allocator.dupe(f32, ptr[0..rows]);
@@ -3299,7 +3452,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
+    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -3413,6 +3566,36 @@ pub fn main() !void {
                 config.iterations,
             );
             try printBenchResult(&stdout, pair_result.?);
+        } else if (case_id == .dense_gate_up_geglu) {
+            const up_tensor = hot_case.tensor1.?;
+            const per_tensor_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols);
+            try stdout.interface.print(
+                "Case {s}: {s} | tensors={s} + {s} | quant={s} + {s} | M={d} K={d} | weight {d:.2} MiB/iter\n",
+                .{
+                    hot_case.key,
+                    hot_case.label,
+                    hot_case.tensor0.info.name,
+                    up_tensor.info.name,
+                    @tagName(hot_case.tensor0.info.type_),
+                    @tagName(up_tensor.info.type_),
+                    hot_case.rows0,
+                    hot_case.cols,
+                    @as(f64, @floatFromInt(per_tensor_bytes * 2)) / (1024.0 * 1024.0),
+                },
+            );
+
+            var dense_result: ?BenchResult = null;
+            defer if (dense_result) |*result| allocator.free(result.output);
+
+            dense_result = try benchmarkDenseGateUpGegluVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, dense_result.?);
         } else if (case_id == .moe_gate_up_geglu) {
             const per_expert_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0 * 2, hot_case.cols);
             try stdout.interface.print(
