@@ -5571,7 +5571,10 @@ pub const InferenceEngine = struct {
         output_stride: u32,
     ) !void {
         if (n_tokens == 0) return;
-        const pip = &(self.elementwise.pipeline_softmax_topk_batch orelse return error.ShaderNotLoaded);
+        const pip = if (k == 1 and self.elementwise.pipeline_softmax_top1_batch != null)
+            &self.elementwise.pipeline_softmax_top1_batch.?
+        else
+            &(self.elementwise.pipeline_softmax_topk_batch orelse return error.ShaderNotLoaded);
         if (!pip.uses_push_descriptors) return error.ShaderNotLoaded;
         const push = SoftmaxTopkBatchPush{
             .n_experts = n_experts,

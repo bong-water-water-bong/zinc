@@ -182,6 +182,7 @@ pub fn build(b: *std.Build) void {
         "softmax_topk",
         "softmax_topk_v2",
         "softmax_top1",
+        "softmax_top1_batch",
         "softmax_topk_batch",
         "router_f32_batch",
         "flash_attn",
