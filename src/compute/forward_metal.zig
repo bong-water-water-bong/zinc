@@ -1603,6 +1603,22 @@ const QKDualPush = extern struct {
     y_k_offset: u32,
 };
 
+/// Push for `dmmv_q4k_qk_q6k_v.metal` — dense Gemma single-token Q+K Q4_K
+/// plus V Q6_K attention projection in one dispatch.
+const QKVDensePush = extern struct {
+    M_q: u32,
+    M_k: u32,
+    M_v: u32,
+    K: u32,
+    a_q_offset: u32,
+    a_k_offset: u32,
+    a_v_offset: u32,
+    x_offset: u32,
+    y_q_offset: u32,
+    y_k_offset: u32,
+    y_v_offset: u32,
+};
+
 const CopyU32Push = extern struct {
     n_words: u32,
     src_offset_words: u32,
@@ -3904,6 +3920,7 @@ pub const InferenceEngine = struct {
     dmmv_q4k_dual_pipe: MetalPipeline,
     dmmv_q4k_dual_llama_pipe: MetalPipeline,
     dmmv_q4k_qk_dual_pipe: MetalPipeline,
+    dmmv_q4k_qk_q6k_v_pipe: MetalPipeline,
     dmmv_q4k_lmhead_pipe: MetalPipeline,
     dmmv_q4k_lmhead_1024_pipe: MetalPipeline,
     dmmv_q4k_lmhead_norm_pipe: MetalPipeline,
@@ -4572,6 +4589,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q4k_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual");
         self.dmmv_q4k_dual_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual_llama");
         self.dmmv_q4k_qk_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qk_dual");
+        self.dmmv_q4k_qk_q6k_v_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qk_q6k_v");
         self.dmmv_q4k_lmhead_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead");
         self.dmmv_q4k_lmhead_1024_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_1024");
         self.dmmv_q4k_lmhead_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_norm");
@@ -5520,6 +5538,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dual_llama_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_qk_dual_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_qk_q6k_v_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_1024_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_norm_pipe);
@@ -8795,6 +8814,38 @@ fn canUseDenseQ4KQKDual(
         engine.dmmv_q4k_qk_dual_pipe.max_threads_per_threadgroup >= 64;
 }
 
+fn canUseDenseQ4KQKQ6KV(
+    engine: *const InferenceEngine,
+    q: *const metal_loader.LoadedTensor,
+    k: *const metal_loader.LoadedTensor,
+    v: *const metal_loader.LoadedTensor,
+    M_q: u32,
+    M_k: u32,
+    M_v: u32,
+    K: u32,
+) bool {
+    // Dense Gemma 31B attention uses Q/K as Q4_K and V as Q6_K. The existing
+    // path already pairs Q+K, then launches V separately before the same QKV
+    // barrier. This heterogeneous kernel keeps the exact row work but encodes
+    // all three projections as one dispatch, saving one dispatch per dense
+    // full-attn layer while preserving the shared Q/K/V visibility barrier.
+    return engine.config.architecture == .gemma and
+        engine.config.n_experts == 0 and
+        q.info.type_ == .q4_k and
+        k.info.type_ == .q4_k and
+        v.info.type_ == .q6_k and
+        K > 0 and
+        K % 256 == 0 and
+        M_q > 0 and
+        M_k > 0 and
+        M_v > 0 and
+        (M_q % 4) == 0 and
+        (M_k % 4) == 0 and
+        (M_v % 4) == 0 and
+        engine.dmmv_q4k_qk_q6k_v_pipe.handle != null and
+        engine.dmmv_q4k_qk_q6k_v_pipe.max_threads_per_threadgroup >= 64;
+}
+
 fn dispatchDenseQ4KQKDualOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -8825,6 +8876,45 @@ fn dispatchDenseQ4KQKDualOnCmd(
     const block_size: u32 = 64;
     const total_rows = M_q + M_k;
     cmd.dispatchV2(&engine.dmmv_q4k_qk_dual_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(QKDualPush), 2);
+}
+
+fn dispatchDenseQ4KQKQ6KVOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    q_tensor: *const metal_loader.LoadedTensor,
+    k_tensor: *const metal_loader.LoadedTensor,
+    v_tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    q_buf: *const MetalBuffer,
+    k_buf: *const MetalBuffer,
+    v_buf: *const MetalBuffer,
+    M_q: u32,
+    M_k: u32,
+    M_v: u32,
+    K: u32,
+) void {
+    recordDmmvProfile(engine, q_tensor, M_q, K);
+    recordDmmvProfile(engine, k_tensor, M_k, K);
+    recordDmmvProfile(engine, v_tensor, M_v, K);
+
+    const push = QKVDensePush{
+        .M_q = M_q,
+        .M_k = M_k,
+        .M_v = M_v,
+        .K = K,
+        .a_q_offset = tensorPageOffset(engine.model, q_tensor),
+        .a_k_offset = tensorPageOffset(engine.model, k_tensor),
+        .a_v_offset = tensorPageOffset(engine.model, v_tensor),
+        .x_offset = 0,
+        .y_q_offset = 0,
+        .y_k_offset = 0,
+        .y_v_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &q_tensor.gpu_buffer, &k_tensor.gpu_buffer, &v_tensor.gpu_buffer, input_buf, q_buf, k_buf, v_buf };
+    const rows_per_wg: u32 = 4; // NSG=2 * NR0=2
+    const block_size: u32 = 64;
+    const total_rows = M_q + M_k + M_v;
+    cmd.dispatchV2(&engine.dmmv_q4k_qk_q6k_v_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(QKVDensePush), 3);
 }
 
 fn dispatchDenseQ4KGateUpDualOnCmd(
@@ -15270,15 +15360,19 @@ fn dispatchFullAttnPrepOnCmd(
         profileFullAttnQkvBarrier(cmd, profile, true, false, false, true, engine);
     } else {
         // Separate: project Q directly to q_buf, gate (if present) to gate_buf.
-        // Q+K Q4_K dual path: when there is no separate attn_gate and Q/K
-        // are both Q4_K (Gemma 31B dense full-attn layers), pair the two
-        // projections into a single dispatch via dmmv_q4k_qk_dual. V stays
-        // separate because Gemma 31B stores V as Q6_K. Saves one dispatch
-        // per qualifying dense full-attn layer with no wasted threadgroups.
-        const can_dual_qk = !gate_mode.separate_attn_gate and
+        // Dense Gemma attention path: Q/K are Q4_K and V is Q6_K. Prefer the
+        // heterogeneous Q+K+V dispatch when available; otherwise keep the older
+        // Q+K dual projection and launch V separately.
+        const can_triple_qkv = !gate_mode.separate_attn_gate and
+            !attn.use_k_as_v and
+            canUseDenseQ4KQKQ6KV(engine, q_tensor, k_tensor, v_tensor, attn.q_dim, attn.kv_dim, attn.kv_dim, hidden_dim);
+        const can_dual_qk = !can_triple_qkv and
+            !gate_mode.separate_attn_gate and
             !attn.use_k_as_v and
             canUseDenseQ4KQKDual(engine, q_tensor, k_tensor, attn.q_dim, attn.kv_dim, hidden_dim);
-        if (can_dual_qk) {
+        if (can_triple_qkv) {
+            dispatchDenseQ4KQKQ6KVOnCmd(engine, cmd, q_tensor, k_tensor, v_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, &engine.v_buf, attn.q_dim, attn.kv_dim, attn.kv_dim, hidden_dim);
+        } else if (can_dual_qk) {
             dispatchDenseQ4KQKDualOnCmd(engine, cmd, q_tensor, k_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, attn.q_dim, attn.kv_dim, hidden_dim);
             dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
         } else if (can_pair_attn_q_gate) {
@@ -28796,6 +28890,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q4k_dual_pipe);
     var dmmv_q4k_dual_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual_llama");
     defer metal_pipeline.freePipeline(&dmmv_q4k_dual_llama_pipe);
+    var dmmv_q4k_qk_q6k_v_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qk_q6k_v");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_qk_q6k_v_pipe);
 
     var dmmv_moe_pipe_k2048 = try loadShaderPipeline(ctx, "dmmv_q4k_moe_k2048");
     defer metal_pipeline.freePipeline(&dmmv_moe_pipe_k2048);
@@ -28940,6 +29036,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_pipe_k2048.handle != null);
     try std.testing.expect(dmmv_q4k_dual_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dual_llama_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_qk_q6k_v_pipe.handle != null);
     try std.testing.expect(dmmv_moe_pipe_k2048.handle != null);
     try std.testing.expect(dmmv_moe_pipe_k2048_1024.handle != null);
     try std.testing.expect(swiglu_pipe.handle != null);
