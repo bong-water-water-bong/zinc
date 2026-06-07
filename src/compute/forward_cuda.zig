@@ -1,49 +1,38 @@
-//! CUDA forward pass for the dense `qwen35` hybrid (Qwen 3.5 9B) — SCAFFOLD.
+//! CUDA forward pass for the dense `qwen35` hybrid (Qwen 3.5 9B).
 //!
-//! Status: M1 bring-up scaffold. Establishes the structure + integration points
-//! for ZINC's CUDA decode/prefill, but is **not yet wired** into the compute
-//! dispatch (`gpu/interface.zig` + `main.zig` three-way) — that lands with the
-//! M1 kernel set. See `docs/cuda-backend.md` §5 and Efforts 20 (prefill) / 21
-//! (decode) under `loops/efforts/`.
-//!
-//! Mirrors `src/compute/forward_metal.zig` (raw-pointer binds; an async
-//! stream/event command ring) using the CUDA backend modules surfaced by
-//! `gpu/interface.zig` when `is_cuda`:
-//!   - device   : `../cuda/device.zig`   — CudaDevice: caps (cc/SMs/vram), ctx
-//!   - buffer   : `../cuda/buffer.zig`   — device buffers + pinned H2D/D2H staging
-//!   - pipeline : `../cuda/pipeline.zig` — NVRTC compile `.cu` → CUfunction
-//!   - command  : `../cuda/command.zig`  — CUstream dispatch; commitAsync/wait ring
-//! Kernels live in `src/shaders/cuda/kernels.cu`, NVRTC-compiled on load for the
-//! running arch (sm_89 on the 4090, sm_120 on the 5090).
-//!
-//! Target is the **dense** 9B — no MoE — so the expert path of the 35B plan
-//! (`softmax_topk`, routed/shared experts) is intentionally absent.
+//! M2 bring-up — incremental. The CUDA backend modules (device/buffer/pipeline/
+//! command) and the kernel library (`src/shaders/cuda/kernels.cu`, NVRTC-compiled)
+//! are wired here into a real forward pass. See `docs/cuda-backend.md` and
+//! Effort 20/21. Weights upload VERBATIM-quantized (Q4_K/Q5_K/Q6_K/Q8_0 blocks)
+//! and are dequantized inside the DMMV/GEMM kernels.
 //!
 //! @section Inference Runtime
 const std = @import("std");
-const gpu = @import("../gpu/interface.zig");
+const device = @import("../cuda/device.zig");
+const buffer = @import("../cuda/buffer.zig");
+const pipeline = @import("../cuda/pipeline.zig");
+const command = @import("../cuda/command.zig");
+const gguf = @import("../model/gguf.zig");
 
-/// Exact `qwen35-9b-q4k-m` config — from the GGUF metadata (general.file_type=15
-/// = Q4_K_M; 427 tensors). Confirmed on box 2026-06-06.
+const log = std.log.scoped(.cuda_fwd);
+
+/// The CUDA kernel library, bundled into the binary and NVRTC-compiled on load.
+const KERNELS_CU = @embedFile("../shaders/cuda/kernels.cu");
+
+/// Exact `qwen35-9b-q4k-m` config (from the GGUF; general.file_type=15 = Q4_K_M).
 pub const Cfg = struct {
     pub const arch = "qwen35";
     pub const n_layers: u32 = 32;
-    pub const n_embd: u32 = 4096; // hidden
-    pub const n_ff: u32 = 12288; // dense SwiGLU FFN (no MoE)
+    pub const n_embd: u32 = 4096;
+    pub const n_ff: u32 = 12288;
     pub const n_head: u32 = 16;
-    pub const n_head_kv: u32 = 4; // GQA 4:1
-    pub const head_dim: u32 = 256; // attention.key_length = value_length
+    pub const n_head_kv: u32 = 4;
+    pub const head_dim: u32 = 256;
     pub const rms_eps: f32 = 1e-6;
     pub const vocab: u32 = 248320;
-    pub const context_train: u32 = 262144; // runtime context is far smaller
-    // Hybrid layer pattern: is_full_attn = ((L+1) % full_attention_interval == 0)
-    //   → layers 3,7,…,31 = full attention (8); the other 24 = delta-net SSM.
-    pub const full_attention_interval: u32 = 4;
-    // RoPE: partial / mRoPE — applied to rope_dim of head_dim; sections×2 = rope_dim.
+    pub const full_attention_interval: u32 = 4; // (L+1)%4==0 → full attn (8); else SSM (24)
     pub const rope_dim: u32 = 64;
     pub const rope_freq_base: f32 = 1.0e7;
-    pub const rope_sections = [4]u32{ 11, 11, 10, 0 };
-    // Delta-net SSM (the 24 non-attention layers):
     pub const ssm_d_conv: u32 = 4;
     pub const ssm_d_inner: u32 = 4096;
     pub const ssm_d_state: u32 = 128;
@@ -51,92 +40,139 @@ pub const Cfg = struct {
     pub const ssm_group_count: u32 = 16;
 };
 
-// Per-tensor quant (the Q4_K_M mix) — drives which DMMV variants are needed:
-//   token_embd            Q4_K  [4096, 248320]   output/LM head  Q6_K [4096, 248320]
-//   full-attn layer : attn_q Q4_K, attn_k Q4_K, attn_v Q6_K, attn_output Q4_K,
-//                     q_norm/k_norm/attn_norm F32
-//   ssm layer       : attn_qkv Q5_K, attn_gate Q4_K, ssm_out Q5_K,
-//                     ssm_alpha/beta Q8_0, ssm_a/conv1d/dt.bias/norm F32
-//   ffn (every layer): gate Q4_K, up Q4_K, down Q6_K;  all *_norm F32
-// Histogram (427): F32 177, Q4_K 132, Q5_K 48, Q8_0 48, Q6_K 22.
-// => DMMV weight types required: Q4_K✓ Q8_0✓ F32✓  +  Q5_K(todo) Q6_K(todo).
-
-/// CUDA forward pass for the dense qwen35 9B.
-/// Milestones: M1 one correct token → M2 full prefill+decode → M3 fused/async perf.
-pub const CudaForward = struct {
-    allocator: std.mem.Allocator,
-    // TODO M1 state (mirrors the Metal/Vulkan engines):
-    //   device     : gpu.backend.CudaDevice
-    //   pipelines  : compiled CUfunctions for the kernel set in the checklist below
-    //   weights    : device buffers (mmap-staged H2D; quant-typed)
-    //   kv_pool    : paged KV cache (attention layers)
-    //   ssm_state  : conv ring `(d_conv-1)*inner` f32/layer + recurrent `dt_rank·…` f32/layer
-    //   ring       : [N]command.CudaCommand pending ring over CUstream+CUevent (M3)
-
-    /// Allocate the CUDA forward engine (M1 scaffold — GPU wiring is still TODO).
-    /// @param allocator Backing allocator for engine-owned device and host buffers.
-    /// @returns An initialized engine; device/kernel/buffer setup lands with the M1 kernels.
-    pub fn init(allocator: std.mem.Allocator) !CudaForward {
-        // TODO M1: select device (by UUID/cc), NVRTC-compile kernels.cu for the
-        // running arch, allocate weight/scratch/KV/SSM buffers, stage weights H2D.
-        return .{ .allocator = allocator };
-    }
-
-    /// Release all engine resources (buffers, streams/events, modules, context).
-    /// @note No-op in the current scaffold; becomes meaningful once `init` allocates GPU state.
-    pub fn deinit(self: *CudaForward) void {
-        _ = self;
-        // TODO: free buffers; destroy streams/events; unload modules; pop ctx.
-    }
-
-    /// M1 — one correct decode token, validated token-for-token vs the
-    /// Metal/Vulkan reference. Forward order for the **dense** qwen35 9B
-    /// (docs/cuda-backend.md §5 M1, minus the MoE path):
-    ///   1. embedding gather (host) → hidden
-    ///   per layer L:
-    ///     2. rms_norm (input)                                    [done]
-    ///     3. is_full_attn = ((L+1) % full_attention_interval == 0)
-    ///          attention: DMMV Q/K/V → qk_norm + RoPE → kv_cache_write →
-    ///                     softmax(QKᵀ)V (single query) → DMMV O
-    ///          SSM      : DMMV in → ssm_conv1d → ssm_delta_net (recurrent) →
-    ///                     ssm_gated_norm → DMMV out
-    ///     4. scale_accumulate (residual)                         [done]
-    ///     5. rms_norm (post-mixer)                               [done]
-    ///     6. dense FFN: DMMV gate + DMMV up → swiglu → DMMV down [swiglu done]
-    ///     7. scale_accumulate (residual)                         [done]
-    ///   8. final rms_norm → DMMV lm_head (Q6_K) → argmax
-    /// @returns The sampled next-token ID (argmax over the vocabulary logits).
-    pub fn decodeStep(self: *CudaForward) !u32 {
-        _ = self;
-        return error.NotImplemented; // M1 TODO
-    }
-
-    /// M2 — batched prefill over the prompt (layer-major DMMV→GEMM; batched SSM
-    /// selective scan). See Effort 20 for the prefill-specific kernel plan.
-    /// @param n_tokens Number of prompt tokens to process in this prefill pass.
-    pub fn prefill(self: *CudaForward, n_tokens: usize) !void {
-        _ = self;
-        _ = n_tokens;
-        return error.NotImplemented; // M2 TODO
-    }
+// ---- kernel push-constant structs (must match kernels.cu byte layout) -------
+const RmsPush = extern struct { N: u32, eps: f32 };
+const DmmvPush = extern struct {
+    M: u32, // output rows  = weight dims[1]
+    K: u32, // input cols   = weight dims[0]
+    a_offset: u32 = 0, // byte offsets within the bound buffers
+    x_offset: u32 = 0,
+    y_offset: u32 = 0,
+    acc_mode: u32 = 0, // 0 = set, 1 = accumulate
 };
 
-// Reference the backend surface so the scaffold documents (and the compiler
-// checks, once wired) the dependency on the CUDA modules.
-comptime {
-    if (gpu.is_cuda) {
-        _ = gpu.backend; // ../cuda/device.zig
-        _ = gpu.buffer_mod; // ../cuda/buffer.zig
-        _ = gpu.pipeline_mod; // ../cuda/pipeline.zig
-        _ = gpu.command_mod; // ../cuda/command.zig
-    }
+/// Map a GGUF quant type to its DMMV kernel name.
+/// @param t GGUF/GGML storage type of the weight tensor.
+/// @returns The kernel name in `kernels.cu`, or null if no DMMV kernel handles it.
+fn dmmvKernel(t: gguf.GGMLType) ?[:0]const u8 {
+    return switch (t) {
+        .q4_k => "dmmv_q4k",
+        .q5_k => "dmmv_q5k",
+        .q6_k => "dmmv_q6k",
+        .q8_0 => "dmmv_q8_0",
+        .f32 => "dmmv_f32",
+        else => null,
+    };
 }
 
-// Kernel checklist — `src/shaders/cuda/kernels.cu`, dense-9B M1 set:
-//   done : rms_norm, dmmv_q4k, dmmv_f32, dmmv_q8_0, swiglu, scale_accumulate,
-//          sigmoid_scale_acc          (all validated on 4090 sm_89 + 5090 sm_120)
-//   todo : dmmv_q5k (attn_qkv, ssm_out), dmmv_q6k (LM head, attn_v, ffn_down),
-//          qk_norm, RoPE (partial/mRoPE, sections [11,11,10,0], dim 64),
-//          kv_cache_write, attention (naive softmax(QKᵀ)V → flash), ssm_conv1d,
-//          ssm_delta_net (recurrent step + batched prefill), ssm_gated_norm,
-//          argmax
+/// Upload one GGUF tensor's raw (quantized) bytes to a device buffer.
+/// @param ctx CUDA context handle (`CudaDevice.ctx`).
+/// @param gf Parsed GGUF file providing tensor offsets/sizes.
+/// @param mmap The memory-mapped model file backing the tensor data.
+/// @param name Tensor name to locate and upload.
+/// @returns A device buffer holding the verbatim (quantized) tensor bytes.
+fn uploadTensor(
+    ctx: ?*anyopaque,
+    gf: *const gguf.GGUFFile,
+    mmap: []const u8,
+    name: []const u8,
+) !buffer.CudaBuffer {
+    const info = gf.findTensor(name) orelse {
+        log.err("tensor not found: {s}", .{name});
+        return error.TensorNotFound;
+    };
+    const off: usize = @intCast(gf.tensor_data_offset + info.offset);
+    const sz: usize = @intCast(info.sizeBytes());
+    return buffer.uploadMmap(@ptrCast(ctx), &mmap[off], sz);
+}
+
+/// M2 increment 1 — validate the CUDA forward foundation on real layer-0 weights:
+/// GGUF→GPU upload, NVRTC kernel compile, and `rms_norm` + `dmmv_q4k` on the GPU,
+/// asserting the output is finite. Called from `main.zig` for `-Dbackend=cuda`.
+/// @param allocator Backing allocator for host scratch and parsing.
+/// @param config CLI config; `config.model_path` and `config.device_index` are read.
+/// @returns Void on success; errors on missing model, tensor, or non-finite output.
+pub fn run(allocator: std.mem.Allocator, config: anytype) !void {
+    const model_path = config.model_path orelse {
+        log.err("CUDA backend needs a model path (-m <gguf>)", .{});
+        return error.NoModel;
+    };
+
+    var dev = try device.CudaDevice.init(allocator, config.device_index);
+    defer dev.deinit();
+    const ctx = dev.ctx;
+    var nb: [128]u8 = undefined;
+    log.info("CUDA forward: {s} (cc={d}, {d} MiB)", .{ dev.name(&nb), dev.computeCapability(), dev.totalMemory() / (1024 * 1024) });
+
+    // mmap + parse the gguf
+    const file = try std.fs.cwd().openFile(model_path, .{});
+    defer file.close();
+    const fsize = (try file.stat()).size;
+    const mmap = try std.posix.mmap(null, fsize, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mmap);
+    var gf = try gguf.parseWithOptions(mmap, allocator, .{ .log_summary = false });
+    defer gf.deinit();
+    log.info("gguf: {d} tensors, data_offset={d}", .{ gf.tensors.items.len, gf.tensor_data_offset });
+
+    // compile kernels (NVRTC wants a null-terminated source)
+    const src = try allocator.dupeZ(u8, KERNELS_CU);
+    defer allocator.free(src);
+    var pipe_rms = try pipeline.createPipeline(ctx, src.ptr, "rms_norm");
+    defer pipeline.freePipeline(&pipe_rms);
+    var pipe_dmmv_q4k = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k");
+    defer pipeline.freePipeline(&pipe_dmmv_q4k);
+    log.info("nvrtc: compiled rms_norm + dmmv_q4k", .{});
+
+    // ---- foundation slice: hidden -> rms_norm -> attn_q DMMV ----------------
+    const N = Cfg.n_embd;
+    const q_info = gf.findTensor("blk.3.attn_q.weight") orelse return error.TensorNotFound;
+    const M: u32 = @intCast(q_info.dims[1]); // output rows
+    const K: u32 = @intCast(q_info.dims[0]); // input cols (== n_embd)
+    log.info("blk.3.attn_q.weight: type={s} dims=[{d},{d}] -> M={d} K={d}", .{ @tagName(q_info.type_), q_info.dims[0], q_info.dims[1], M, K });
+
+    var w_norm = try uploadTensor(ctx, &gf, mmap, "blk.3.attn_norm.weight");
+    defer buffer.freeBuffer(&w_norm);
+    var w_q = try uploadTensor(ctx, &gf, mmap, "blk.3.attn_q.weight");
+    defer buffer.freeBuffer(&w_q);
+
+    var hidden = try buffer.createBufferStaged(ctx, N * @sizeOf(f32));
+    defer buffer.freeBuffer(&hidden);
+    var norm = try buffer.createBuffer(ctx, N * @sizeOf(f32));
+    defer buffer.freeBuffer(&norm);
+    var qout = try buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer buffer.freeBuffer(&qout);
+
+    // synthetic input (increment 1 validates plumbing, not numerics yet)
+    {
+        const h: [*]f32 = @ptrCast(@alignCast(hidden.host_ptr.?));
+        var i: usize = 0;
+        while (i < N) : (i += 1) h[i] = @as(f32, @floatFromInt(i % 17)) * 0.1 - 0.7;
+        buffer.upload(ctx, &hidden, std.mem.sliceAsBytes(h[0..N]));
+    }
+
+    var cmd = try command.beginCommand(ctx);
+    const rms_push = RmsPush{ .N = N, .eps = Cfg.rms_eps };
+    cmd.dispatch(&pipe_rms, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &hidden, &w_norm, &norm }, &rms_push, @sizeOf(RmsPush), 0);
+    cmd.barrier();
+    const dmmv_push = DmmvPush{ .M = M, .K = K };
+    cmd.dispatch(&pipe_dmmv_q4k, .{ M, 1, 1 }, .{ 256, 1, 1 }, &.{ &w_q, &norm, &qout }, &dmmv_push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    // verify finite + sane
+    const out = try allocator.alloc(f32, M);
+    defer allocator.free(out);
+    buffer.download(ctx, &qout, std.mem.sliceAsBytes(out));
+    var mn: f32 = std.math.inf(f32);
+    var mx: f32 = -std.math.inf(f32);
+    var bad: usize = 0;
+    for (out) |v| {
+        if (!std.math.isFinite(v)) bad += 1;
+        mn = @min(mn, v);
+        mx = @max(mx, v);
+    }
+    log.info("attn_q out[0..4] = {d:.4} {d:.4} {d:.4} {d:.4}", .{ out[0], out[1], out[2], out[3] });
+    log.info("attn_q out: min={d:.4} max={d:.4} non-finite={d}/{d}", .{ mn, mx, bad, M });
+    if (bad != 0) return error.NonFiniteOutput;
+    _ = dmmvKernel; // used by later increments (full weight set)
+    log.info("=== M2 increment 1 OK: GGUF->GPU upload + NVRTC + rms_norm + dmmv_q4k on real weights ===", .{});
+}
