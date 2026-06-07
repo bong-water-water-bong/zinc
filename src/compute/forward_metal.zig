@@ -4419,6 +4419,7 @@ pub const InferenceEngine = struct {
     rope_qk_norm_kv_q8_pipe: MetalPipeline,
     sigmoid_mul_pipe: MetalPipeline,
     geglu_pipe: MetalPipeline,
+    geglu_fast_unchecked_pipe: MetalPipeline,
     geglu_batched_pipe: MetalPipeline,
     swiglu_pipe: MetalPipeline,
     swiglu_batched_pipe: MetalPipeline,
@@ -5113,6 +5114,7 @@ pub const InferenceEngine = struct {
         self.rope_qk_norm_kv_q8_pipe = try loadShaderPipeline(ctx, "rope_qk_norm_kv_q8");
         self.sigmoid_mul_pipe = try loadShaderPipeline(ctx, "sigmoid_mul");
         self.geglu_pipe = try loadShaderPipeline(ctx, "geglu");
+        self.geglu_fast_unchecked_pipe = try loadShaderPipeline(ctx, "geglu_fast_unchecked");
         self.geglu_batched_pipe = try loadShaderPipeline(ctx, "geglu_batched");
         self.swiglu_pipe = try loadShaderPipeline(ctx, "swiglu");
         self.swiglu_batched_pipe = try loadShaderPipeline(ctx, "swiglu_batched");
@@ -6067,6 +6069,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.rope_qk_norm_kv_q8_pipe);
         metal_pipeline.freePipeline(&self.sigmoid_mul_pipe);
         metal_pipeline.freePipeline(&self.geglu_pipe);
+        metal_pipeline.freePipeline(&self.geglu_fast_unchecked_pipe);
         metal_pipeline.freePipeline(&self.geglu_batched_pipe);
         metal_pipeline.freePipeline(&self.swiglu_pipe);
         metal_pipeline.freePipeline(&self.swiglu_batched_pipe);
@@ -13275,6 +13278,19 @@ fn dispatchFfnActivationOnCmd(
     cmd.dispatchV2(pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
 }
 
+fn dispatchGeGLUFastUncheckedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate: *const MetalBuffer,
+    output: *const MetalBuffer,
+    up: *const MetalBuffer,
+    n: u32,
+) void {
+    const push = SwiGLUPush{ .n = n };
+    const bufs = [_]*const MetalBuffer{ gate, output, up };
+    cmd.dispatchV2(&engine.geglu_fast_unchecked_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+}
+
 fn dispatchOaiSwiGLUBatchedBiasOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -17566,16 +17582,25 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
     hidden_dim: u32,
 ) !void {
     // The production fused path has already written swiglu_buf. Materialize the
-    // precise reference into gate_buf via separate gate/up matvecs plus
-    // geglu.metal, then diff before down projection consumes swiglu_buf.
+    // precise reference into down_buf via separate gate/up matvecs plus
+    // geglu.metal, then optionally materialize the reverted unchecked-fast
+    // activation into gate_buf. Both scratch buffers are overwritten by the
+    // normal dense FFN tail after validation.
     dispatchDmmvOnCmd(engine, cmd, gate_t, &engine.norm_buf, &engine.gate_buf, inter_dim, hidden_dim, 0);
     dispatchDmmvOnCmd(engine, cmd, up_t, &engine.norm_buf, &engine.up_buf, inter_dim, hidden_dim, 0);
     profileDenseFfnBarrierBuffers(cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
-    dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.gate_buf, &engine.up_buf, inter_dim);
-    profileDenseFfnBarrierBuffers(cmd, profile, .activation, &.{ &engine.gate_buf, &engine.swiglu_buf });
+    dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.down_buf, &engine.up_buf, inter_dim);
+    const validate_fast_unchecked = engine.geglu_fast_unchecked_pipe.handle != null;
+    if (validate_fast_unchecked) {
+        profileDenseFfnBarrierBuffers(cmd, profile, .activation, &.{&engine.down_buf});
+        dispatchGeGLUFastUncheckedOnCmd(engine, cmd, &engine.gate_buf, &engine.gate_buf, &engine.up_buf, inter_dim);
+        profileDenseFfnBarrierBuffers(cmd, profile, .activation, &.{ &engine.gate_buf, &engine.swiglu_buf });
+    } else {
+        profileDenseFfnBarrierBuffers(cmd, profile, .activation, &.{ &engine.down_buf, &engine.swiglu_buf });
+    }
     commitAndWaitProfiled(cmd, profile);
 
-    const ref_ptr: [*]const f32 = @ptrCast(@alignCast(engine.gate_buf.cpu_ptr.?));
+    const ref_ptr: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
     const candidate_ptr: [*]const f32 = @ptrCast(@alignCast(engine.swiglu_buf.cpu_ptr.?));
     const ref_slice = ref_ptr[0..inter_dim];
     const candidate_slice = candidate_ptr[0..inter_dim];
@@ -17608,6 +17633,39 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
             diff.rms,
             tol,
         });
+    }
+    if (validate_fast_unchecked) {
+        const fast_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(engine.gate_buf.cpu_ptr.?));
+        const fast_candidate_slice = fast_candidate_ptr[0..inter_dim];
+        const fast_diff = diffF32Slices(ref_slice, fast_candidate_slice);
+        const fast_ref_value = if (inter_dim > 0) ref_slice[fast_diff.max_idx] else 0.0;
+        const fast_candidate_value = if (inter_dim > 0) fast_candidate_slice[fast_diff.max_idx] else 0.0;
+        const fast_verdict: []const u8 = if (fast_diff.max_abs <= tol) "ok" else "failed";
+        if (fast_diff.max_abs <= tol) {
+            log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu_fast_unchecked max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+                fast_verdict,
+                engine.position,
+                layer_idx,
+                fast_diff.max_abs,
+                fast_diff.max_idx,
+                fast_ref_value,
+                fast_candidate_value,
+                fast_diff.rms,
+                tol,
+            });
+        } else {
+            log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu_fast_unchecked max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+                fast_verdict,
+                engine.position,
+                layer_idx,
+                fast_diff.max_abs,
+                fast_diff.max_idx,
+                fast_ref_value,
+                fast_candidate_value,
+                fast_diff.rms,
+                tol,
+            });
+        }
     }
 
     engine.dense_gemma_q4k_geglu_validation_emitted = true;
@@ -29966,6 +30024,8 @@ test "batched MoE Metal shaders compile" {
 
     var swiglu_pipe = try loadShaderPipeline(ctx, "swiglu_batched");
     defer metal_pipeline.freePipeline(&swiglu_pipe);
+    var geglu_fast_unchecked_pipe = try loadShaderPipeline(ctx, "geglu_fast_unchecked");
+    defer metal_pipeline.freePipeline(&geglu_fast_unchecked_pipe);
     var rms_norm_offset_pipe = try loadShaderPipeline(ctx, "rms_norm_mul_offset");
     defer metal_pipeline.freePipeline(&rms_norm_offset_pipe);
     var copy_rms_norm_offset_pipe = try loadShaderPipeline(ctx, "copy_rms_norm_offset");
@@ -30115,6 +30175,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_moe_pipe_k2048.handle != null);
     try std.testing.expect(dmmv_moe_pipe_k2048_1024.handle != null);
     try std.testing.expect(swiglu_pipe.handle != null);
+    try std.testing.expect(geglu_fast_unchecked_pipe.handle != null);
     try std.testing.expect(rms_norm_offset_pipe.handle != null);
     try std.testing.expect(copy_rms_norm_offset_pipe.handle != null);
     try std.testing.expect(acc_pipe.handle != null);
