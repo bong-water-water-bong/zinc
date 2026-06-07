@@ -564,6 +564,10 @@ fn qwenRoutePackedFullValidationBisectEnabled() bool {
         (readBoolEnv("ZINC_QWEN36_ROUTE_PACK_VALIDATE_FULL_BISECT") orelse false);
 }
 
+fn denseGemmaQ4KGeGLUValidationScansLayers() bool {
+    return qwenRoutePackedFullValidationBisectEnabled();
+}
+
 fn denseGemmaQ4KGeGLUValidationRequested(cfg: ModelConfig) bool {
     if (cfg.architecture != .gemma or cfg.n_experts != 0 or !usesGeglu(cfg)) return false;
     return (readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE") orelse false) or
@@ -17561,11 +17565,16 @@ fn diffF32Slices(expected: []const f32, actual: []const f32) SliceDiff {
 }
 
 fn shouldValidateDenseGemmaQ4KGeGLU(engine: *const InferenceEngine, layer_idx: usize, fused_gate_up_geglu: bool) bool {
+    const requested_layer = denseGemmaQ4KGeGLUValidateLayer(engine);
+    const layer_matches = if (denseGemmaQ4KGeGLUValidationScansLayers())
+        layer_idx >= requested_layer
+    else
+        layer_idx == requested_layer;
     return engine.dense_gemma_q4k_geglu_validation_enabled and
         !engine.dense_gemma_q4k_geglu_validation_emitted and
         !engine.in_prefill_phase and
         fused_gate_up_geglu and
-        layer_idx == denseGemmaQ4KGeGLUValidateLayer(engine) and
+        layer_matches and
         engine.gate_buf.cpu_ptr != null and
         engine.up_buf.cpu_ptr != null and
         engine.swiglu_buf.cpu_ptr != null;
@@ -17608,19 +17617,26 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
     const ref_value = if (inter_dim > 0) ref_slice[diff.max_idx] else 0.0;
     const candidate_value = if (inter_dim > 0) candidate_slice[diff.max_idx] else 0.0;
     const tol: f32 = 5e-2;
+    const scan_layers = denseGemmaQ4KGeGLUValidationScansLayers();
+    const last_layer_idx = if (engine.config.n_layers == 0)
+        0
+    else
+        @as(usize, @intCast(engine.config.n_layers - 1));
     const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
     if (diff.max_abs <= tol) {
-        log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
-            verdict,
-            engine.position,
-            layer_idx,
-            diff.max_abs,
-            diff.max_idx,
-            ref_value,
-            candidate_value,
-            diff.rms,
-            tol,
-        });
+        if (!scan_layers) {
+            log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+                verdict,
+                engine.position,
+                layer_idx,
+                diff.max_abs,
+                diff.max_idx,
+                ref_value,
+                candidate_value,
+                diff.rms,
+                tol,
+            });
+        }
     } else {
         log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
             verdict,
@@ -17634,25 +17650,30 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
             tol,
         });
     }
+    var fast_diff = SliceDiff{ .max_abs = 0, .max_idx = 0, .rms = 0 };
+    var fast_ref_value: f32 = 0;
+    var fast_candidate_value: f32 = 0;
     if (validate_fast_unchecked) {
         const fast_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(engine.gate_buf.cpu_ptr.?));
         const fast_candidate_slice = fast_candidate_ptr[0..inter_dim];
-        const fast_diff = diffF32Slices(ref_slice, fast_candidate_slice);
-        const fast_ref_value = if (inter_dim > 0) ref_slice[fast_diff.max_idx] else 0.0;
-        const fast_candidate_value = if (inter_dim > 0) fast_candidate_slice[fast_diff.max_idx] else 0.0;
+        fast_diff = diffF32Slices(ref_slice, fast_candidate_slice);
+        fast_ref_value = if (inter_dim > 0) ref_slice[fast_diff.max_idx] else 0.0;
+        fast_candidate_value = if (inter_dim > 0) fast_candidate_slice[fast_diff.max_idx] else 0.0;
         const fast_verdict: []const u8 = if (fast_diff.max_abs <= tol) "ok" else "failed";
         if (fast_diff.max_abs <= tol) {
-            log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu_fast_unchecked max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
-                fast_verdict,
-                engine.position,
-                layer_idx,
-                fast_diff.max_abs,
-                fast_diff.max_idx,
-                fast_ref_value,
-                fast_candidate_value,
-                fast_diff.rms,
-                tol,
-            });
+            if (!scan_layers) {
+                log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu_fast_unchecked max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+                    fast_verdict,
+                    engine.position,
+                    layer_idx,
+                    fast_diff.max_abs,
+                    fast_diff.max_idx,
+                    fast_ref_value,
+                    fast_candidate_value,
+                    fast_diff.rms,
+                    tol,
+                });
+            }
         } else {
             log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE[{s}]: token={d} layer={d} tensor=dense_gate_up_geglu_fast_unchecked max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
                 fast_verdict,
@@ -17668,7 +17689,45 @@ fn validateDenseGemmaQ4KGeGLUOnCmd(
         }
     }
 
-    engine.dense_gemma_q4k_geglu_validation_emitted = true;
+    if (scan_layers) {
+        if (diff.max_abs > tol) {
+            log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_FIRST_FAILURE: token={d} layer={d} tensor=dense_gate_up_geglu max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} suggested_safe_prefix_layers={d}", .{
+                engine.position,
+                layer_idx,
+                diff.max_abs,
+                diff.max_idx,
+                ref_value,
+                candidate_value,
+                diff.rms,
+                tol,
+                layer_idx,
+            });
+            engine.dense_gemma_q4k_geglu_validation_emitted = true;
+        } else if (validate_fast_unchecked and fast_diff.max_abs > tol) {
+            log.warn("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_FIRST_FAILURE: token={d} layer={d} tensor=dense_gate_up_geglu_fast_unchecked max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} suggested_safe_prefix_layers={d}", .{
+                engine.position,
+                layer_idx,
+                fast_diff.max_abs,
+                fast_diff.max_idx,
+                fast_ref_value,
+                fast_candidate_value,
+                fast_diff.rms,
+                tol,
+                layer_idx,
+            });
+            engine.dense_gemma_q4k_geglu_validation_emitted = true;
+        } else if (layer_idx >= last_layer_idx) {
+            log.info("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_ALL_OK: token={d} start_layer={d} safe_prefix_layers={d} tol={d:.6}", .{
+                engine.position,
+                denseGemmaQ4KGeGLUValidateLayer(engine),
+                layer_idx + 1,
+                tol,
+            });
+            engine.dense_gemma_q4k_geglu_validation_emitted = true;
+        }
+    } else {
+        engine.dense_gemma_q4k_geglu_validation_emitted = true;
+    }
     cmd.* = try beginProfiledCommand(engine, profile);
 }
 
