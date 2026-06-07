@@ -3521,14 +3521,12 @@ pub const InferenceEngine = struct {
             const inter_scale_dsum_bytes = n * (inter_dim / 32) * 2 * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_swiglu_scale_dsum, inter_scale_dsum_bytes, storage_xfer);
             // Same path also drives the int8 DP4a dense gate/up prefill
-            // (K=hidden_dim) AND the Q5_K SSM out prefill (K=d_inner). The
-            // buffer is reused across both passes within one layer's submit;
-            // size for the larger K so the SSM out path actually fits
-            // (Qwen3.6-27B has d_inner=6144 > hidden_dim=5120, so the older
-            // hidden_dim-only size silently disqualified the SSM out DP4a
-            // path at runtime). packed int8 = max_k/4 uints/token,
-            // (scale,dsum) vec2 = max_k/32 * 8 B/token.
-            const max_dp4a_k = @max(hidden_dim, cfg.ssm_d_inner);
+            // (K=hidden_dim), Q5_K SSM out prefill (K=d_inner), and Gemma
+            // attention projections. Gemma's O projection consumes the full
+            // attention output width, which can exceed hidden_dim, so include
+            // q_dim when the Gemma projection DP4a path is active.
+            const max_attention_proj_k: u32 = if (self.gemmaDenseProjectionDp4aEnabled(n_tokens)) q_dim else 0;
+            const max_dp4a_k = @max(@max(hidden_dim, cfg.ssm_d_inner), max_attention_proj_k);
             const hidden_i8_bytes = n * (max_dp4a_k / 4) * @sizeOf(u32);
             const hidden_scale_dsum_bytes = n * (max_dp4a_k / 32) * 2 * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_hidden_i8, hidden_i8_bytes, storage_xfer);
@@ -21446,13 +21444,18 @@ pub const InferenceEngine = struct {
             try self.dispatchFlashAttnBatched(scratch_q.handle, scratch_q.size, self.kv_k_cache[layer_idx].handle, self.kv_k_cache[layer_idx].size, self.kv_v_cache[layer_idx].handle, self.kv_v_cache[layer_idx].size, self.page_table_buf.handle, self.page_table_buf.size, scratch_attn_out.handle, scratch_attn_out.size, self.attn_sinks_buf.handle, self.attn_sinks_buf.size, layer_head_dim, cfg.n_heads, layer_n_kv_heads, base_token, n_tokens, kv_page_size_tokens, cfg.attn_scale, sink_offset);
             self.decode_cmd.computeBarrier();
 
-            // O projection, then optional Gemma post-attention norm, then
-            // FUSED residual+FFN norm (hidden += down; norm = normalize(hidden)
-            // * ffn_norm_weight). For non-Gemma this replaces
-            // scale_acc → barrier → rms_norm_mul with a single dispatch; for
-            // Gemma we first RMS-normalize the attn output in place before
-            // the residual add.
-            try self.dispatchProjectionBatched(o_t, scratch_attn_out, scratch_down, hidden_dim, o_input_cols, n_tokens);
+            // O projection, optional Gemma post-attention norm, then fused
+            // residual+FFN norm.
+            var o_done = false;
+            if (self.gemmaDenseProjectionDp4aSupported(o_t, hidden_dim, o_input_cols, n_tokens)) {
+                const o_dp4a_cols = try self.gemmaPrepareProjectionQ8_1(scratch_attn_out, o_input_cols, n_tokens);
+                if (o_dp4a_cols > 0) {
+                    o_done = try self.dispatchGemmaProjectionBatchedDp4aQ8_1(o_t, scratch_attn_out, scratch_down, hidden_dim, o_input_cols, n_tokens, o_dp4a_cols);
+                }
+            }
+            if (!o_done) {
+                try self.dispatchProjectionBatched(o_t, scratch_attn_out, scratch_down, hidden_dim, o_input_cols, n_tokens);
+            }
             self.decode_cmd.computeBarrier();
             if (cfg.architecture == .gemma) {
                 if (lt.post_attention_norm) |pan_t| {
