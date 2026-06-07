@@ -198,6 +198,7 @@ const CaseId = enum {
     shared_dual,
     shared_pair_swiglu,
     dense_gate_up_geglu,
+    dense_down_q6k,
     post_norm_residual_wide,
     moe_gate,
     moe_up,
@@ -335,7 +336,7 @@ fn helpText() []const u8 {
     \\                            | shared_gate | shared_up | shared_down | shared_dual
     \\                            | shared_gate_gemm | shared_up_gemm | shared_down_gemm
     \\                            | shared_pair_swiglu
-    \\                            | dense_gate_up_geglu
+    \\                            | dense_gate_up_geglu | dense_down_q6k
     \\                            | post_norm_residual_wide
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
@@ -384,6 +385,7 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "shared_dual")) return .shared_dual;
     if (std.mem.eql(u8, arg, "shared_pair_swiglu")) return .shared_pair_swiglu;
     if (std.mem.eql(u8, arg, "dense_gate_up_geglu")) return .dense_gate_up_geglu;
+    if (std.mem.eql(u8, arg, "dense_down_q6k")) return .dense_down_q6k;
     if (std.mem.eql(u8, arg, "post_norm_residual_wide")) return .post_norm_residual_wide;
     if (std.mem.eql(u8, arg, "moe_gate")) return .moe_gate;
     if (std.mem.eql(u8, arg, "moe_up")) return .moe_up;
@@ -407,6 +409,7 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             .shared_up_gemm,
             .shared_down_gemm,
             .dense_gate_up_geglu,
+            .dense_down_q6k,
             .post_norm_residual_wide,
             .lm_head_q4k_argmax,
             => false,
@@ -908,6 +911,26 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .rows0 = inter_dim,
                 .rows1 = inter_dim,
                 .cols = hidden_dim,
+            };
+        },
+        .dense_down_q6k => blk: {
+            // Exact production dense Gemma 31B FFN down projection:
+            // `dispatchDenseQ6kSimdgroupDmmvOnCmd` uses dmmv_q6k_llama for
+            // dense Q6_K single-token decode, not the routed MoE Q6_K shader.
+            if (model.config.n_experts != 0) return error.ExpectedDenseModel;
+            const hidden_dim = model.config.hidden_dim;
+            const inter_dim = model.config.intermediate_dim;
+            const down = findFirstLayerTensor(model, "ffn_down.weight") orelse
+                return error.MissingDenseDownTensor;
+            if (down.info.type_ != .q6_k) return error.ExpectedQ6KTensor;
+            if ((try tensorRows(down)) != hidden_dim or (try tensorCols(down)) != inter_dim) return error.InvalidTensorShape;
+            if (hidden_dim % 4 != 0 or inter_dim % 256 != 0) return error.InvalidTensorShape;
+            break :blk .{
+                .key = "dense_down_q6k",
+                .label = "Dense Gemma Q6_K down projection",
+                .tensor0 = down,
+                .rows0 = hidden_dim,
+                .cols = inter_dim,
             };
         },
         .moe_gate, .moe_gate_cols => blk: {
@@ -2756,6 +2779,122 @@ fn benchmarkDenseGateUpGegluVariant(
     };
 }
 
+fn runDenseDownQ6kDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    pipe: *const MetalPipeline,
+    tensor: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0) return;
+    const push = DmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(model, tensor),
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
+    const block_size: u32 = 64;
+    const rows_per_wg: u32 = 4;
+    const workgroups = (M + rows_per_wg - 1) / rows_per_wg;
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            pipe,
+            .{ workgroups, 1, 1 },
+            .{ block_size, 1, 1 },
+            &bufs,
+            &push,
+            @sizeOf(DmmvPush),
+            1,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn benchmarkDenseDownQ6kVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    warmup_iterations: u32,
+    iterations: u32,
+) !BenchResult {
+    if (hot_case.tensor0.info.type_ != .q6_k) return error.ExpectedQ6KTensor;
+
+    var pipe = try loadShaderPipeline(device.ctx, "dmmv_q6k_llama");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.rows0) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    fillInputBuffer(&input_buf, hot_case.cols);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    try runDenseDownQ6kDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        model,
+        &input_buf,
+        &output_buf,
+        hot_case.rows0,
+        hot_case.cols,
+        warmup_iterations,
+    );
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runDenseDownQ6kDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        model,
+        &input_buf,
+        &output_buf,
+        hot_case.rows0,
+        hot_case.cols,
+        iterations,
+    );
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    const weight_bytes = weightBytesPerIter(.q6_k, hot_case.rows0, hot_case.cols);
+    const total_bytes = weight_bytes * iterations;
+    const output_copy = try copyOutput(allocator, &output_buf, hot_case.rows0);
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = "dense-llama-q6k",
+        .shader_name = "dmmv_q6k_llama",
+        .tensor_name = hot_case.tensor0.info.name,
+        .rows = hot_case.rows0,
+        .cols = hot_case.cols,
+        .expert_slots = 1,
+        .x_expert_stride = 0,
+        .iterations = iterations,
+        .block_size = 64,
+        .rows_per_wg = 4,
+        .thread_execution_width = pipe.thread_execution_width,
+        .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(output_copy),
+        .output = output_copy,
+    };
+}
+
 fn benchmarkPostNormResidualVariant(
     allocator: std.mem.Allocator,
     device: *const metal_device.MetalDevice,
@@ -3767,7 +3906,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .lm_head_q4k_argmax, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .post_norm_residual_wide, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
+    const hot_case_ids = [_]CaseId{ .lm_head, .lm_head_q4k_argmax, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .dense_down_q6k, .post_norm_residual_wide, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -4018,6 +4157,32 @@ pub fn main() !void {
                 config.iterations,
             );
             try printBenchResult(&stdout, dense_result.?);
+        } else if (case_id == .dense_down_q6k) {
+            try stdout.interface.print(
+                "Case {s}: {s} | tensor={s} | quant={s} | M={d} K={d} | weight {d:.2} MiB/iter\n",
+                .{
+                    hot_case.key,
+                    hot_case.label,
+                    hot_case.tensor0.info.name,
+                    @tagName(hot_case.tensor0.info.type_),
+                    hot_case.rows0,
+                    hot_case.cols,
+                    @as(f64, @floatFromInt(weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols))) / (1024.0 * 1024.0),
+                },
+            );
+
+            var dense_down_result: ?BenchResult = null;
+            defer if (dense_down_result) |*result| allocator.free(result.output);
+
+            dense_down_result = try benchmarkDenseDownQ6kVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, dense_down_result.?);
         } else if (case_id == .moe_gate_up_geglu) {
             const per_expert_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0 * 2, hot_case.cols);
             try stdout.interface.print(
