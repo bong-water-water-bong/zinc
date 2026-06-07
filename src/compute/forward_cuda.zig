@@ -86,6 +86,10 @@ const SwigluPush = extern struct { N: u32 };
 const SigmoidMulPush = extern struct { N: u32 };
 const DeintPush = extern struct { head_dim: u32, n_head: u32 };
 const ArgmaxPush = extern struct { N: u32 };
+// MoE router/combine kernels (byte-match kernels.cu).
+const TopkPush = extern struct { n_experts: u32, k: u32 };
+const MoeAccPush = extern struct { N: u32, n_used: u32, src_stride: u32 };
+const SigmoidAccPush = extern struct { N: u32 };
 
 /// Map a GGUF quant type to its DMMV kernel pipeline (indexes ForwardCuda.dmmv).
 fn dmmvIdx(t: gguf.GGMLType) usize {
@@ -124,6 +128,10 @@ const Derived = struct {
     conv_channels: u32, // d_inner + 2*n_group*d_state = 8192
     conv_state_len: u32, // (d_conv-1) * conv_channels per ssm layer
     ssm_state_len: u32, // dt_rank * head_v_dim * head_v_dim per ssm layer
+    // MoE (0 for the dense qwen35; >0 for the qwen2_moe qwen36)
+    n_experts: u32, // total routed experts (256)
+    n_experts_used: u32, // top-k active experts per token (8)
+    shexp_ff: u32, // shared-expert intermediate dim (512)
 
     fn from(c: anytype) Derived {
         const head_dim = c.head_dim;
@@ -154,6 +162,9 @@ const Derived = struct {
             .conv_channels = conv_channels,
             .conv_state_len = (c.ssm_d_conv - 1) * conv_channels,
             .ssm_state_len = c.ssm_dt_rank * head_v_dim * head_v_dim,
+            .n_experts = c.n_experts,
+            .n_experts_used = c.n_experts_used,
+            .shexp_ff = c.shared_expert_intermediate_dim,
         };
     }
 };
@@ -173,6 +184,10 @@ const Pipelines = struct {
     ssm_gated_norm: CudaPipeline,
     swiglu: CudaPipeline,
     argmax: CudaPipeline,
+    // MoE (qwen2_moe). Compiled unconditionally; only dispatched when n_experts>0.
+    softmax_topk: CudaPipeline,
+    moe_weighted_acc: CudaPipeline,
+    sigmoid_scale_acc: CudaPipeline,
 };
 
 /// Per-token GPU forward state for qwen35 greedy decode.
@@ -198,10 +213,15 @@ pub const ForwardCuda = struct {
     up_buf: CudaBuffer,
     swiglu_buf: CudaBuffer,
     router_buf: CudaBuffer, // ssm alpha [dt_rank]
-    down_buf: CudaBuffer, // ssm beta [dt_rank]
+    down_buf: CudaBuffer, // ssm beta [dt_rank]; MoE: slot-major down outputs [n_used*n_embd]
     logits_buf: CudaBuffer,
     argmax_buf: CudaBuffer, // u32 x1
+    // MoE scratch (only used when n_experts > 0)
+    router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
+    router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
+    gate_scalar_buf: CudaBuffer, // [1] f32 shared-expert sigmoid gate logit
     host_embed: []f32,
+    host_router_ids: []u32, // [n_experts_used] downloaded expert ids
 
     // constant buffers
     inv_freq: CudaBuffer, // [rope_dim/2]
@@ -247,10 +267,18 @@ pub const ForwardCuda = struct {
         pipes.ssm_gated_norm = try pipeline.createPipeline(ctx, src.ptr, "ssm_gated_norm");
         pipes.swiglu = try pipeline.createPipeline(ctx, src.ptr, "swiglu");
         pipes.argmax = try pipeline.createPipeline(ctx, src.ptr, "argmax");
-        log.info("nvrtc: compiled {d} kernel pipelines", .{20});
+        pipes.softmax_topk = try pipeline.createPipeline(ctx, src.ptr, "softmax_topk");
+        pipes.moe_weighted_acc = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc");
+        pipes.sigmoid_scale_acc = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_scale_acc");
+        log.info("nvrtc: compiled {d} kernel pipelines", .{23});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
+        // MoE: down_buf is slot-major [n_used * n_embd]; keep ≥64 for the SSM beta reuse.
+        const down_elems = @max(@as(u32, 64), d.n_experts_used * d.n_embd);
+        // Tiny-but-nonzero stubs so the dense path (n_experts==0) still allocates/free uniformly.
+        const router_logits_elems = @max(@as(u32, 1), d.n_experts);
+        const router_out_elems = @max(@as(u32, 1), 2 * d.n_experts_used);
         var self = ForwardCuda{
             .allocator = allocator,
             .ctx = ctx,
@@ -270,10 +298,14 @@ pub const ForwardCuda = struct {
             .up_buf = try buffer.createBuffer(ctx, d.n_ff * f4),
             .swiglu_buf = try buffer.createBuffer(ctx, max_act * f4),
             .router_buf = try buffer.createBuffer(ctx, 64 * f4),
-            .down_buf = try buffer.createBuffer(ctx, 64 * f4),
+            .down_buf = try buffer.createBuffer(ctx, down_elems * f4),
             .logits_buf = try buffer.createBuffer(ctx, d.vocab * f4),
             .argmax_buf = try buffer.createBuffer(ctx, @sizeOf(u32)),
+            .router_logits_buf = try buffer.createBuffer(ctx, router_logits_elems * f4),
+            .router_out_buf = try buffer.createBuffer(ctx, router_out_elems * @sizeOf(u32)),
+            .gate_scalar_buf = try buffer.createBuffer(ctx, f4),
             .host_embed = try allocator.alloc(f32, d.n_embd),
+            .host_router_ids = try allocator.alloc(u32, @max(@as(u32, 1), d.n_experts_used)),
             .inv_freq = try buffer.createBuffer(ctx, (d.rope_dim / 2) * f4),
             .sinks = try buffer.createBuffer(ctx, d.n_layers * d.n_head * f4),
             .kv_k = try allocator.alloc(CudaBuffer, d.n_layers),
@@ -330,7 +362,7 @@ pub const ForwardCuda = struct {
 
     pub fn deinit(self: *ForwardCuda) void {
         const a = self.allocator;
-        inline for (.{ &self.hidden, &self.norm_buf, &self.qfull_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.gate_buf, &self.attn_out_buf, &self.ffn_norm_buf, &self.up_buf, &self.swiglu_buf, &self.router_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.inv_freq, &self.sinks }) |b| {
+        inline for (.{ &self.hidden, &self.norm_buf, &self.qfull_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.gate_buf, &self.attn_out_buf, &self.ffn_norm_buf, &self.up_buf, &self.swiglu_buf, &self.router_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.router_logits_buf, &self.router_out_buf, &self.gate_scalar_buf, &self.inv_freq, &self.sinks }) |b| {
             buffer.freeBuffer(b);
         }
         for (self.kv_k) |*b| buffer.freeBuffer(b);
@@ -343,6 +375,7 @@ pub const ForwardCuda = struct {
         a.free(self.ssm_state);
         a.free(self.conv_off);
         a.free(self.host_embed);
+        a.free(self.host_router_ids);
         inline for (std.meta.fields(Pipelines)) |f| {
             if (comptime std.mem.eql(u8, f.name, "dmmv")) {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
@@ -374,7 +407,7 @@ pub const ForwardCuda = struct {
                 } else {
                     try self.ssmLayer(L);
                 }
-                try self.ffnBlock(L);
+                if (d.n_experts > 0) try self.moeFfnBlock(L) else try self.ffnBlock(L);
             }
         }
 
@@ -424,11 +457,11 @@ pub const ForwardCuda = struct {
         // per head as [Q(head_dim) | gate(head_dim)] interleaved across heads
         // ([Q0,g0,Q1,g1,...]). Project the full 2*q_dim, then deinterleave into
         // contiguous q_buf (the Q halves) and gate_buf (the gate halves).
-        self.dmmvDispatch(&cmd, wq, &self.norm_buf, &self.qfull_buf, 2 * d.q_dim, d.n_embd, 0);
+        self.dmmvDispatch(&cmd, wq, &self.norm_buf, &self.qfull_buf, 2 * d.q_dim, d.n_embd, 0, 0);
         const deint = DeintPush{ .head_dim = d.head_dim, .n_head = d.n_head };
         cmd.dispatch(&self.pipes.deinterleave, .{ ceilDiv(d.q_dim, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &self.qfull_buf, &self.q_buf, &self.gate_buf }, &deint, @sizeOf(DeintPush), 0);
-        self.dmmvDispatch(&cmd, wk, &self.norm_buf, &self.k_buf, d.kv_dim, d.n_embd, 0);
-        self.dmmvDispatch(&cmd, wv, &self.norm_buf, &self.v_buf, d.kv_dim, d.n_embd, 0);
+        self.dmmvDispatch(&cmd, wk, &self.norm_buf, &self.k_buf, d.kv_dim, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, wv, &self.norm_buf, &self.v_buf, d.kv_dim, d.n_embd, 0, 0);
         // per-head q/k rms norm
         const rms_h = RmsPush{ .N = d.head_dim, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &wqn.gpu_buffer, &self.q_buf }, &rms_h, @sizeOf(RmsPush), 0);
@@ -450,7 +483,7 @@ pub const ForwardCuda = struct {
         const sm = SigmoidMulPush{ .N = d.q_dim };
         cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.attn_out_buf, &self.gate_buf, &self.attn_out_buf }, &sm, @sizeOf(SigmoidMulPush), 0);
         // O projection, accumulate into hidden
-        self.dmmvDispatch(&cmd, wo, &self.attn_out_buf, &self.hidden, d.n_embd, d.q_dim, 1);
+        self.dmmvDispatch(&cmd, wo, &self.attn_out_buf, &self.hidden, d.n_embd, d.q_dim, 1, 0);
         cmd.commitAndWait();
     }
 
@@ -472,11 +505,11 @@ pub const ForwardCuda = struct {
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
         // qkv (conv_channels) and z-gate (d_inner)
-        self.dmmvDispatch(&cmd, wqkv, &self.norm_buf, &self.attn_out_buf, d.conv_channels, d.n_embd, 0);
-        self.dmmvDispatch(&cmd, wz, &self.norm_buf, &self.gate_buf, d.d_inner, d.n_embd, 0);
+        self.dmmvDispatch(&cmd, wqkv, &self.norm_buf, &self.attn_out_buf, d.conv_channels, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, wz, &self.norm_buf, &self.gate_buf, d.d_inner, d.n_embd, 0, 0);
         // alpha, beta (dt_rank)
-        self.dmmvDispatch(&cmd, walpha, &self.norm_buf, &self.router_buf, d.dt_rank, d.n_embd, 0);
-        self.dmmvDispatch(&cmd, wbeta, &self.norm_buf, &self.down_buf, d.dt_rank, d.n_embd, 0);
+        self.dmmvDispatch(&cmd, walpha, &self.norm_buf, &self.router_buf, d.dt_rank, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, wbeta, &self.norm_buf, &self.down_buf, d.dt_rank, d.n_embd, 0, 0);
         // conv1d (+ SiLU) over the qkv stream → swiglu_buf (conv_out)
         const conv = ConvPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .state_offset = self.conv_off[L] };
         cmd.dispatch(&self.pipes.ssm_conv1d, .{ ceilDiv(d.conv_channels, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.attn_out_buf, &wconv.gpu_buffer, &self.ssm_conv_state[L], &self.swiglu_buf }, &conv, @sizeOf(ConvPush), 0);
@@ -502,7 +535,7 @@ pub const ForwardCuda = struct {
         const gn = GatedNormPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head };
         cmd.dispatch(&self.pipes.ssm_gated_norm, .{ d.dt_rank, 1, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &self.attn_out_buf, &self.gate_buf, &wnorm.gpu_buffer, &self.swiglu_buf }, &gn, @sizeOf(GatedNormPush), 0);
         // out projection, accumulate into hidden
-        self.dmmvDispatch(&cmd, wout, &self.swiglu_buf, &self.hidden, d.n_embd, d.d_inner, 1);
+        self.dmmvDispatch(&cmd, wout, &self.swiglu_buf, &self.hidden, d.n_embd, d.d_inner, 1, 0);
         cmd.commitAndWait();
 
         // advance circular conv offset (host), AFTER this token's conv.
@@ -521,12 +554,96 @@ pub const ForwardCuda = struct {
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
-        self.dmmvDispatch(&cmd, wgate, &self.ffn_norm_buf, &self.gate_buf, d.n_ff, d.n_embd, 0);
-        self.dmmvDispatch(&cmd, wup, &self.ffn_norm_buf, &self.up_buf, d.n_ff, d.n_embd, 0);
+        self.dmmvDispatch(&cmd, wgate, &self.ffn_norm_buf, &self.gate_buf, d.n_ff, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, wup, &self.ffn_norm_buf, &self.up_buf, d.n_ff, d.n_embd, 0, 0);
         const sg = SwigluPush{ .N = d.n_ff };
         cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
-        self.dmmvDispatch(&cmd, wdown, &self.swiglu_buf, &self.hidden, d.n_embd, d.n_ff, 1);
+        self.dmmvDispatch(&cmd, wdown, &self.swiglu_buf, &self.hidden, d.n_embd, d.n_ff, 1, 0);
         cmd.commitAndWait();
+    }
+
+    /// MoE FFN block (qwen2_moe / qwen36). Replaces the dense ffnBlock when
+    /// n_experts>0. Steps: rms_norm → router logits → top-k softmax → for each of
+    /// the k routed experts run its gate/up/SwiGLU/down (addressed by a byte slice
+    /// into the stacked expert weight) into a slot-major down_buf → weighted
+    /// accumulate into hidden → shared expert (sigmoid-gated) accumulate into
+    /// hidden. The routed combine and shared expert both += into hidden, so the
+    /// residual is already present (no separate add).
+    fn moeFfnBlock(self: *ForwardCuda, L: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const n_used = d.n_experts_used;
+        const ef = d.n_ff; // expert_ff = intermediate_dim = 512
+        const wfn = self.layer(L, "post_attention_norm.weight");
+        const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [hidden, n_experts] F32
+        const wge = self.layer(L, "ffn_gate_exps.weight"); // stacked [hidden, ef, n_experts]
+        const wue = self.layer(L, "ffn_up_exps.weight");
+        const wde = self.layer(L, "ffn_down_exps.weight"); // stacked [ef, hidden, n_experts]
+
+        // Per-expert byte strides into the stacked tensors (quant may vary per layer).
+        const gate_slice = expertSliceBytes(wge.info.type_, ef, d.n_embd);
+        const up_slice = expertSliceBytes(wue.info.type_, ef, d.n_embd);
+        const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+
+        // --- Router: rms_norm → logits → top-k softmax. -----------------------
+        {
+            var cmd = try command.beginCommand(ctx);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            self.dmmvDispatch(&cmd, wrouter, &self.ffn_norm_buf, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
+            const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
+            cmd.dispatch(&self.pipes.softmax_topk, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.router_logits_buf, &self.router_out_buf }, &tk, @sizeOf(TopkPush), 0);
+            cmd.commitAndWait();
+        }
+
+        // Download the chosen expert ids (host gather of the slot→expert map).
+        buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router_ids[0..n_used]));
+
+        // --- Routed experts: gate/up/SwiGLU/down per slot, slot-major into down_buf.
+        {
+            var cmd = try command.beginCommand(ctx);
+            const sg = SwigluPush{ .N = ef };
+            var j: u32 = 0;
+            while (j < n_used) : (j += 1) {
+                const id = self.host_router_ids[j];
+                self.dmmvDispatch(&cmd, wge, &self.ffn_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gate_slice);
+                self.dmmvDispatch(&cmd, wue, &self.ffn_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * up_slice);
+                cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                // down → slot j's region of down_buf (element offset j*n_embd → y_offset bytes).
+                const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                const didx = dmmvIdx(wde.info.type_);
+                if (didx < 4) {
+                    cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                } else {
+                    cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                }
+            }
+            // weighted combine of the k slot outputs into hidden.
+            const ma = MoeAccPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd };
+            cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
+            cmd.commitAndWait();
+        }
+
+        // --- Shared expert: gate/up/SwiGLU/down, scaled by sigmoid(gate logit).
+        {
+            const wgs = self.layer(L, "ffn_gate_shexp.weight");
+            const wus = self.layer(L, "ffn_up_shexp.weight");
+            const wds = self.layer(L, "ffn_down_shexp.weight");
+            const wgi = self.layer(L, "ffn_gate_inp_shexp.weight"); // [hidden, 1] F32
+            const sf = d.shexp_ff;
+            var cmd = try command.beginCommand(ctx);
+            self.dmmvDispatch(&cmd, wgs, &self.ffn_norm_buf, &self.gate_buf, sf, d.n_embd, 0, 0);
+            self.dmmvDispatch(&cmd, wus, &self.ffn_norm_buf, &self.up_buf, sf, d.n_embd, 0, 0);
+            const sg = SwigluPush{ .N = sf };
+            cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+            // shared-expert gate scalar = W_gi · norm (1×hidden).
+            self.dmmvDispatch(&cmd, wgi, &self.ffn_norm_buf, &self.gate_scalar_buf, 1, d.n_embd, 0, 0);
+            // down → down_buf[0..hidden], then hidden += sigmoid(gate)*down.
+            self.dmmvDispatch(&cmd, wds, &self.swiglu_buf, &self.down_buf, d.n_embd, sf, 0, 0);
+            const ss = SigmoidAccPush{ .N = d.n_embd };
+            cmd.dispatch(&self.pipes.sigmoid_scale_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.down_buf, &self.gate_scalar_buf }, &ss, @sizeOf(SigmoidAccPush), 0);
+            cmd.commitAndWait();
+        }
     }
 
     // Public wrappers for the per-block builders (used by the v1 driver to run
@@ -563,8 +680,8 @@ pub const ForwardCuda = struct {
     /// Dispatch the right DMMV kernel for `w`'s quant type: y[M] = W[M,K] · x.
     /// Quant types (idx < 4: q4k/q5k/q6k/q8_0) use the fast single-row variant at
     /// block=64; f32 (idx == 4) has no fast variant and keeps the base at block=256.
-    fn dmmvDispatch(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, acc_mode: u32) void {
-        const push = DmmvPush{ .M = M, .K = K, .acc_mode = acc_mode };
+    fn dmmvDispatch(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, acc_mode: u32, a_offset: u32) void {
+        const push = DmmvPush{ .M = M, .K = K, .acc_mode = acc_mode, .a_offset = a_offset };
         const idx = dmmvIdx(w.info.type_);
         if (idx < 4) {
             cmd.dispatch(&self.pipes.dmmv_fast[idx], .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
@@ -584,6 +701,13 @@ fn ceilDiv(a: u32, b: u32) u32 {
 
 fn boolU32(b: bool) u32 {
     return if (b) 1 else 0;
+}
+
+/// Bytes for one expert's [rows × cols] slice in a stacked MoE weight tensor.
+/// rows*cols must be the per-expert element count; `q.blockSize()` divides cols
+/// (the contiguous/quantized dim) and `q.bytesPerBlock()` is the block width.
+fn expertSliceBytes(q: gguf.GGMLType, rows: u32, cols: u32) u32 {
+    return rows * (cols / q.blockSize()) * q.bytesPerBlock();
 }
 
 /// Zero a device buffer by uploading a host-side zero array of `n` f32.
