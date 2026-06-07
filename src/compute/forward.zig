@@ -3507,7 +3507,8 @@ pub const InferenceEngine = struct {
         if (self.qwen36Dp4aDownEnabled() or
             self.qwenDenseFfnDp4aEnabled(n_tokens) or
             self.qwenA3bSsmQ8Dp4aEnabled(n_tokens) or
-            self.gemmaDenseGegluDp4aEnabled(n_tokens))
+            self.gemmaDenseGegluDp4aEnabled(n_tokens) or
+            self.gemmaDenseDownDp4aEnabled(n_tokens))
         {
             const inter_i8_bytes = n * (inter_dim / 4) * @sizeOf(u32);
             const inter_scale_bytes = n * (inter_dim / 32) * f32_sz;
@@ -11240,6 +11241,25 @@ pub const InferenceEngine = struct {
             self.dmmv.pipeline_quantize_act_q8_1 != null;
     }
 
+    fn gemmaDenseDownDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isAmdRdna()) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        const cfg = self.model.config;
+        if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
+        if (n_tokens < 64 or n_tokens > 96) return false;
+        const q6_path =
+            self.dmmv.pipeline_mul_mm_q6k_full_dp4a != null and
+            self.dmmv.pipeline_quantize_act_q8 != null and
+            self.dmmv.pipeline_mul_mm_q6k != null;
+        const q4_path =
+            self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and
+            self.dmmv.pipeline_quantize_act_q8_1 != null and
+            self.dmmv.pipeline_mul_mm_q4k != null;
+        return q6_path or q4_path;
+    }
+
     fn dispatchGemmaGateUpGegluBatched(
         self: *InferenceEngine,
         gate_t: *const LoadedTensor,
@@ -11409,6 +11429,229 @@ pub const InferenceEngine = struct {
             );
         }
         return true;
+    }
+
+    fn dispatchGemmaDenseDownDp4aBatched(
+        self: *InferenceEngine,
+        down_t: *const LoadedTensor,
+        geglu_buf: Buffer,
+        down_buf: Buffer,
+        hidden_dim: u32,
+        inter_dim: u32,
+        n_tokens: u32,
+    ) !bool {
+        if (!self.gemmaDenseDownDp4aEnabled(n_tokens)) return false;
+        if ((hidden_dim & 31) != 0 or (inter_dim & 255) != 0) return false;
+        const full_cols = n_tokens & ~@as(u32, 31);
+        if (full_cols == 0) return false;
+
+        const need_output: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        if (down_buf.size < need_output) return false;
+
+        const packed_act = self.batched_scratch_swiglu_i8 orelse return false;
+        const need_packed: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, inter_dim / 4) *
+            @sizeOf(u32);
+        if (packed_act.size < need_packed) return false;
+
+        const push_fn = self.instance.push_descriptor_fn;
+        const tail_cols = n_tokens - full_cols;
+        switch (down_t.info.type_) {
+            .q6_k => {
+                if (self.dmmv.pipeline_mul_mm_q6k_full_dp4a == null or
+                    self.dmmv.pipeline_quantize_act_q8 == null or
+                    self.dmmv.pipeline_mul_mm_q6k == null)
+                    return false;
+                const scale = self.batched_scratch_swiglu_scale orelse return false;
+                const need_scale: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, full_cols) *
+                    @as(vk.c.VkDeviceSize, inter_dim / 32) *
+                    @sizeOf(f32);
+                if (scale.size < need_scale) return false;
+
+                const down_quant_phase = self.beginProfilePhase();
+                try self.dmmv.recordQuantizeActQ8(
+                    &self.decode_cmd,
+                    push_fn,
+                    geglu_buf.handle,
+                    geglu_buf.size,
+                    packed_act.handle,
+                    packed_act.size,
+                    scale.handle,
+                    scale.size,
+                    full_cols,
+                    inter_dim,
+                );
+                const q8_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = packed_act.handle, .size = packed_act.size },
+                    .{ .buffer = scale.handle, .size = scale.size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+                self.endProfilePhase(.dense_ffn_down_quant, down_quant_phase);
+
+                const down_matmul_phase = self.beginProfilePhase();
+                try self.dmmv.recordMulMmQ6KFullDp4a(
+                    &self.decode_cmd,
+                    push_fn,
+                    down_t.gpu_buffer.handle,
+                    down_t.gpu_buffer.size,
+                    packed_act.handle,
+                    packed_act.size,
+                    scale.handle,
+                    scale.size,
+                    down_buf.handle,
+                    down_buf.size,
+                    hidden_dim,
+                    full_cols,
+                    inter_dim,
+                    0,
+                    0,
+                );
+                if (tail_cols > 0) {
+                    if (tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q6k_tail8 != null) {
+                        try self.dmmv.recordMulMmQ6KTail8(
+                            &self.decode_cmd,
+                            push_fn,
+                            down_t.gpu_buffer.handle,
+                            down_t.gpu_buffer.size,
+                            geglu_buf.handle,
+                            geglu_buf.size,
+                            down_buf.handle,
+                            down_buf.size,
+                            hidden_dim,
+                            tail_cols,
+                            inter_dim,
+                            inter_dim,
+                            hidden_dim,
+                            0,
+                            full_cols * inter_dim,
+                            full_cols * hidden_dim,
+                        );
+                    } else {
+                        try self.dmmv.recordMulMmQ6K(
+                            &self.decode_cmd,
+                            push_fn,
+                            down_t.gpu_buffer.handle,
+                            down_t.gpu_buffer.size,
+                            geglu_buf.handle,
+                            geglu_buf.size,
+                            down_buf.handle,
+                            down_buf.size,
+                            hidden_dim,
+                            tail_cols,
+                            inter_dim,
+                            inter_dim,
+                            hidden_dim,
+                            0,
+                            full_cols * inter_dim,
+                            full_cols * hidden_dim,
+                        );
+                    }
+                }
+                self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
+                return true;
+            },
+            .q4_k => {
+                if (self.dmmv.pipeline_mul_mm_q4k_full_dp4a == null or
+                    self.dmmv.pipeline_quantize_act_q8_1 == null or
+                    self.dmmv.pipeline_mul_mm_q4k == null)
+                    return false;
+                const scale_dsum = self.batched_scratch_swiglu_scale_dsum orelse return false;
+                const need_scale_dsum: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, full_cols) *
+                    @as(vk.c.VkDeviceSize, inter_dim / 32) *
+                    2 *
+                    @sizeOf(f32);
+                if (scale_dsum.size < need_scale_dsum) return false;
+
+                const down_quant_phase = self.beginProfilePhase();
+                try self.dmmv.recordQuantizeActQ8_1(
+                    &self.decode_cmd,
+                    push_fn,
+                    geglu_buf.handle,
+                    geglu_buf.size,
+                    packed_act.handle,
+                    packed_act.size,
+                    scale_dsum.handle,
+                    scale_dsum.size,
+                    full_cols,
+                    inter_dim,
+                );
+                const q8_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = packed_act.handle, .size = packed_act.size },
+                    .{ .buffer = scale_dsum.handle, .size = scale_dsum.size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+                self.endProfilePhase(.dense_ffn_down_quant, down_quant_phase);
+
+                const down_matmul_phase = self.beginProfilePhase();
+                try self.dmmv.recordMulMmQ4KFullDp4a(
+                    &self.decode_cmd,
+                    push_fn,
+                    down_t.gpu_buffer.handle,
+                    down_t.gpu_buffer.size,
+                    packed_act.handle,
+                    packed_act.size,
+                    scale_dsum.handle,
+                    scale_dsum.size,
+                    down_buf.handle,
+                    down_buf.size,
+                    hidden_dim,
+                    full_cols,
+                    inter_dim,
+                    0,
+                    0,
+                );
+                if (tail_cols > 0) {
+                    if (tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q4k_tail8 != null) {
+                        try self.dmmv.recordMulMmQ4KTail8(
+                            &self.decode_cmd,
+                            push_fn,
+                            down_t.gpu_buffer.handle,
+                            down_t.gpu_buffer.size,
+                            geglu_buf.handle,
+                            geglu_buf.size,
+                            down_buf.handle,
+                            down_buf.size,
+                            hidden_dim,
+                            tail_cols,
+                            inter_dim,
+                            inter_dim,
+                            hidden_dim,
+                            0,
+                            full_cols * inter_dim,
+                            full_cols * hidden_dim,
+                        );
+                    } else {
+                        try self.dmmv.recordMulMmQ4K(
+                            &self.decode_cmd,
+                            push_fn,
+                            down_t.gpu_buffer.handle,
+                            down_t.gpu_buffer.size,
+                            geglu_buf.handle,
+                            geglu_buf.size,
+                            down_buf.handle,
+                            down_buf.size,
+                            hidden_dim,
+                            tail_cols,
+                            inter_dim,
+                            inter_dim,
+                            hidden_dim,
+                            0,
+                            full_cols * inter_dim,
+                            full_cols * hidden_dim,
+                        );
+                    }
+                }
+                self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
+                return true;
+            },
+            else => return false,
+        }
     }
 
     fn dispatchF32DualBatched(
@@ -20988,7 +21231,9 @@ pub const InferenceEngine = struct {
                 try self.dispatchFfnActivation(scratch_gate.handle, scratch_gate.size, scratch_up.handle, scratch_up.size, scratch_swiglu.handle, scratch_swiglu.size, n_tokens * inter_dim);
             }
             self.decode_cmd.computeBarrier();
-            try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+            if (!try self.dispatchGemmaDenseDownDp4aBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens)) {
+                try self.dispatchProjectionBatched(down_t, scratch_swiglu, scratch_down, hidden_dim, inter_dim, n_tokens);
+            }
             self.decode_cmd.computeBarrier();
             // Fused post_ffw_norm + residual add for Gemma: one dispatch
             // instead of (rms_norm_mul in place) + barrier + (scale_accumulate).
