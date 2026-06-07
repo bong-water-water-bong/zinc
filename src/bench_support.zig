@@ -6,7 +6,7 @@
 //! @section Inference Runtime
 const std = @import("std");
 
-/// Metal device enumeration and selection (MTLDevice wrappers).
+/// Metal device initialization and capability queries (MTLDevice wrapper).
 pub const metal_device = @import("metal/device.zig");
 /// Model loader that maps GGUF weights onto Metal buffers.
 pub const metal_loader = @import("model/loader_metal.zig");
@@ -22,7 +22,7 @@ pub const metal_pipeline = @import("metal/pipeline.zig");
 pub const metal_c = @import("metal/c.zig");
 /// GGUF file parser for reading quantized model weights and metadata.
 pub const gguf = @import("model/gguf.zig");
-/// Tokenizer (BPE/SPM) encode and decode for text pre/post-processing.
+/// BPE tokenizer encode and decode for text pre/post-processing.
 pub const tokenizer_mod = @import("model/tokenizer.zig");
 /// Metal forward-pass runtime that runs the full model inference graph.
 pub const forward_metal = @import("compute/forward_metal.zig");

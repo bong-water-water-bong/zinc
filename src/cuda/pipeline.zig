@@ -22,7 +22,7 @@ pub const CudaPipeline = struct {
 };
 
 /// NVRTC-compile `cu_source` and resolve `fn_name` for dispatch.
-/// @param ctx  Active CUDA context; may be null to use the current thread context.
+/// @param ctx  Active CUDA context; must not be null.
 /// @param cu_source  Null-terminated CUDA C source string passed directly to NVRTC.
 /// @param fn_name  Null-terminated name of the kernel function to extract from the compiled module.
 /// @returns A `CudaPipeline` with populated `max_threads` and `shared_mem` fields, or `error.CudaPipelineCreateFailed`.
@@ -37,7 +37,7 @@ pub fn createPipeline(ctx: ?*shim.CudaCtx, cu_source: [*:0]const u8, fn_name: [*
 }
 
 /// Load a kernel from a precompiled cubin/PTX image (offline nvcc path).
-/// @param ctx  Active CUDA context; may be null to use the current thread context.
+/// @param ctx  Active CUDA context; must not be null.
 /// @param image  Pointer to the raw cubin or PTX image bytes.
 /// @param image_size  Byte length of `image`.
 /// @param fn_name  Null-terminated name of the kernel function to locate in the loaded module.
