@@ -28,8 +28,8 @@ struct DualQ4KDmmvPush {
 
 inline float q4k_block_dot(
     device const uchar* block,
-    thread const float* yl,
-    thread const float* yh,
+    thread const float4* yl4_arr,
+    thread const float4* yh4_arr,
     float4 sumy,
     ushort iq,
     ushort ir
@@ -38,39 +38,48 @@ inline float q4k_block_dot(
     constexpr ushort kmask2 = 0x0f0f;
     constexpr ushort kmask3 = 0xc0c0;
 
-    ushort sc16[4];
-    thread const uchar* sc8 = (thread const uchar*)sc16;
-
-    device const ushort* sc = (device const ushort*)(block + 4) + iq;
+    const packed_uint4 hdr = *((device const packed_uint4*)block);
+    const half2 dh = as_type<half2>(hdr.x);
+    const uint sc_shift = uint(iq) * 16u;
     device const ushort* q1 = (device const ushort*)(block + 16) + 16 * iq + 4 * ir;
-    device const half* dh = (device const half*)block;
 
-    sc16[0] = sc[0] & kmask1;
-    sc16[1] = sc[2] & kmask1;
-    sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-    sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+    const uint3 sc_u3v = uint3(hdr.y, hdr.z, hdr.w);
+    const ushort sc_0 = ushort((sc_u3v.x >> sc_shift) & 0xFFFFu);
+    const ushort sc_2 = ushort((sc_u3v.y >> sc_shift) & 0xFFFFu);
+    const ushort sc_4 = ushort((sc_u3v.z >> sc_shift) & 0xFFFFu);
+    const ushort4 sc16 = ushort4(
+        sc_0 & kmask1,
+        sc_2 & kmask1,
+        ((sc_4 >> 0) & kmask2) | ((sc_0 & kmask3) >> 2),
+        ((sc_4 >> 4) & kmask2) | ((sc_2 & kmask3) >> 2));
 
-    device const ushort* q2 = q1 + 32;
+    const ushort4 q1v = *((device const ushort4*)q1);
+    const ushort4 q2v = *((device const ushort4*)(q1 + 32));
 
     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+    constexpr ushort4 nibble_mask = ushort4(0x000F, 0x0F00, 0x00F0, 0xF000);
 
     FOR_UNROLL (short i = 0; i < 4; ++i) {
-        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+        const float4 yl4 = yl4_arr[i];
+        const float4 yh4 = yh4_arr[i];
+        const ushort q1i = q1v[i];
+        const ushort q2i = q2v[i];
+        const float4 q1m = float4(ushort4(q1i) & nibble_mask);
+        const float4 q2m = float4(ushort4(q2i) & nibble_mask);
+        acc1 = fma(yl4, q1m, acc1);
+        acc2 = fma(yh4, q2m, acc2);
     }
 
-    return dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
-            (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
-            (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
-            (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
-        dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+    const float4 head_pair = fma(
+        float4(acc1[1], acc1[3], acc2[1], acc2[3]),
+        float4(1.f / 256.f),
+        float4(acc1[0], acc1[2], acc2[0], acc2[2]));
+    constexpr ushort4 lo_mask = ushort4(0x00FFu);
+    constexpr float4 sc_pos_scale = float4(1.f, 1.f / 16.f, 1.f, 1.f / 16.f);
+    const float4 sc_pos = float4(ushort4(sc16.x, sc16.x >> 8, sc16.z, sc16.z >> 8) & lo_mask) * sc_pos_scale;
+    const float4 sc_neg = float4(ushort4(sc16.y, sc16.y >> 8, sc16.w, sc16.w >> 8) & lo_mask);
+    return fma(float(dh.x), dot(head_pair, sc_pos), -float(dh.y) * dot(sumy, sc_neg));
 }
 
 inline float geglu(float gate, float up) {
@@ -105,8 +114,6 @@ kernel void main0(
     device const float* x = X + (p.x_offset / 4);
     device float* out = activatedY + (p.y0_offset / 4);
 
-    float yl[16];
-    float yh[16];
     float gate_sum[NR0] = {0.f, 0.f};
     float up_sum[NR0] = {0.f, 0.f};
 
@@ -130,27 +137,32 @@ kernel void main0(
         const float4 c0 = y4v[32];  const float4 c1 = y4v[33];
         const float4 d0 = y4v[40];  const float4 d1 = y4v[41];
 
-        yl[ 0] = a0[0]; yl[ 1] = a0[1]; yl[ 2] = a0[2]; yl[ 3] = a0[3];
-        yl[ 4] = a1[0]; yl[ 5] = a1[1]; yl[ 6] = a1[2]; yl[ 7] = a1[3];
-        yl[ 8] = b0[0]; yl[ 9] = b0[1]; yl[10] = b0[2]; yl[11] = b0[3];
-        yl[12] = b1[0]; yl[13] = b1[1]; yl[14] = b1[2]; yl[15] = b1[3];
-        yh[ 0] = c0[0]; yh[ 1] = c0[1]; yh[ 2] = c0[2]; yh[ 3] = c0[3];
-        yh[ 4] = c1[0]; yh[ 5] = c1[1]; yh[ 6] = c1[2]; yh[ 7] = c1[3];
-        yh[ 8] = d0[0]; yh[ 9] = d0[1]; yh[10] = d0[2]; yh[11] = d0[3];
-        yh[12] = d1[0]; yh[13] = d1[1]; yh[14] = d1[2]; yh[15] = d1[3];
+        const float4 yl4_arr[4] = {
+            float4(a0.xy, b0.xy),
+            float4(a0.zw, b0.zw),
+            float4(a1.xy, b1.xy),
+            float4(a1.zw, b1.zw),
+        };
+        const float4 yh4_arr[4] = {
+            float4(c0.xy, d0.xy),
+            float4(c0.zw, d0.zw),
+            float4(c1.xy, d1.xy),
+            float4(c1.zw, d1.zw),
+        };
 
-        const float4 ones = float4(1.0f);
-        sumy[0] = dot(a0, ones) + dot(a1, ones);
-        sumy[1] = dot(b0, ones) + dot(b1, ones);
-        sumy[2] = dot(c0, ones) + dot(c1, ones);
-        sumy[3] = dot(d0, ones) + dot(d1, ones);
+        const float4 yl_tot = (yl4_arr[0] + yl4_arr[1]) + (yl4_arr[2] + yl4_arr[3]);
+        const float4 yh_tot = (yh4_arr[0] + yh4_arr[1]) + (yh4_arr[2] + yh4_arr[3]);
+        sumy[0] = yl_tot.x + yl_tot.y;
+        sumy[1] = yl_tot.z + yl_tot.w;
+        sumy[2] = yh_tot.x + yh_tot.y;
+        sumy[3] = yh_tot.z + yh_tot.w;
 
         FOR_UNROLL (short row = 0; row < NR0; ++row) {
             const int dst_row = first_row + row;
             if (dst_row < int(p.M0)) {
                 const ulong row_off = ulong(dst_row) * ulong(row_bytes) + ulong(ib) * BLOCK_SIZE;
-                gate_sum[row] += q4k_block_dot(gate_src + row_off, yl, yh, sumy, iq, ir);
-                up_sum[row] += q4k_block_dot(up_src + row_off, yl, yh, sumy, iq, ir);
+                gate_sum[row] += q4k_block_dot(gate_src + row_off, yl4_arr, yh4_arr, sumy, iq, ir);
+                up_sum[row] += q4k_block_dot(up_src + row_off, yl4_arr, yh4_arr, sumy, iq, ir);
             }
         }
 
