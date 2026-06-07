@@ -244,6 +244,16 @@ pub const ForwardCuda = struct {
     /// zero the KV cache and SSM state.
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardCuda {
         const ctx = model.ctx;
+        // The CUDA forward implements the qwen35/qwen36 hybrid-SSM family (dense +
+        // qwen2_moe). Reject other architectures (e.g. gemma4) cleanly here rather
+        // than dividing by zero on the absent SSM dims downstream.
+        switch (model.config.architecture) {
+            .qwen35, .qwen2_moe => {},
+            else => |a| {
+                log.err("CUDA backend: architecture '{s}' is not implemented (only qwen35/qwen36 family)", .{@tagName(a)});
+                return error.UnsupportedArchitecture;
+            },
+        }
         const d = Derived.from(model.config);
 
         const src = try allocator.dupeZ(u8, KERNELS_CU);
