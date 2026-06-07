@@ -953,3 +953,84 @@ extern "C" __global__ void gemm_q4k_tiled(const unsigned* a_u32, const float* A,
         if (pc.acc_mode != 0u) Y[yi] += acc; else Y[yi] = acc;
     }
 }
+
+// ---- gemm_q4k_tiled_v2 — register-blocked prefill GEMM (perf research) -------
+// 64-row x 64-token output tile, 256 threads (16x16) each computing a 4x4
+// register micro-tile. BK=32 (one Q4_K sub-block) per chunk: dequant the 64
+// W-rows' sub-block + stage 64 A-rows into shared, then a register-blocked
+// multiply. W reused 64x, A reused 64x; 16 FMA per 8 shared loads (4x the
+// arithmetic intensity of v1's 1-output-per-thread inner loop). fp32 accumulate.
+extern "C" __global__ void gemm_q4k_tiled_v2(const unsigned* a_u32, const float* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ float Ws[BK * BM];   // Ws[kk*64 + r]
+    __shared__ float As[BK * BT];   // As[kk*64 + t]
+    unsigned m0 = blockIdx.x * BM, t0 = blockIdx.y * BT;
+    unsigned bpr = pc.K >> 8;
+    unsigned nchunk = pc.K >> 5;    // K/32 sub-blocks
+    unsigned tid = threadIdx.x;
+    unsigned tx = tid & 15u, ty = tid >> 4;   // 16x16 thread grid
+    unsigned a0 = (pc.a_offset >> 2);
+    const float* Abase = A + (pc.x_offset >> 2);
+    float acc[4][4];
+    #pragma unroll
+    for (int i=0;i<4;i++) for (int j=0;j<4;j++) acc[i][j]=0.0f;
+    for (unsigned c = 0; c < nchunk; c++) {
+        unsigned sbk = c >> 3, sb8 = c & 7u;   // superblock, sub-block 0..7
+        // dequant W tile: BM*BK = 2048 elems / 256 threads = 8 each
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;   // 0..2047
+            unsigned r = idx >> 5, l = idx & 31u;      // row 0..63, elem 0..31
+            unsigned row = m0 + r;
+            float wv = 0.0f;
+            if (row < pc.M) {
+                unsigned blk = a0 + row * bpr * 36u + sbk * 36u;
+                unsigned dd = a_u32[blk];
+                float d = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
+                float dmin = zinc_half_to_float((unsigned short)(dd >> 16));
+                const unsigned char* scales = (const unsigned char*)(a_u32 + blk + 1u);
+                const unsigned char* qs = (const unsigned char*)(a_u32 + blk + 4u);
+                unsigned char sc, mn; zinc_q4k_scale_min((int)sb8, scales, &sc, &mn);
+                unsigned char qb = qs[(sb8 >> 1) * 32u + l];
+                unsigned nib = (sb8 & 1u) == 0u ? (qb & 0xFu) : (unsigned)(qb >> 4);
+                wv = d * (float)sc * (float)nib - dmin * (float)mn;
+            }
+            Ws[l * BM + r] = wv;
+        }
+        // load A tile: BT*BK = 2048 / 256 = 8 each
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;
+            unsigned t = idx >> 5, l = idx & 31u;
+            unsigned tok = t0 + t;
+            As[l * BT + t] = (tok < pc.T) ? Abase[(size_t)tok * pc.K + c * 32u + l] : 0.0f;
+        }
+        __syncthreads();
+        // register-blocked multiply
+        #pragma unroll
+        for (unsigned kk = 0; kk < BK; kk++) {
+            float wr[4], ar[4];
+            #pragma unroll
+            for (int i=0;i<4;i++) wr[i] = Ws[kk * BM + ty*4u + (unsigned)i];
+            #pragma unroll
+            for (int j=0;j<4;j++) ar[j] = As[kk * BT + tx*4u + (unsigned)j];
+            #pragma unroll
+            for (int i=0;i<4;i++)
+                #pragma unroll
+                for (int j=0;j<4;j++) acc[i][j] += wr[i]*ar[j];
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i=0;i<4;i++) {
+        unsigned row = m0 + ty*4u + (unsigned)i;
+        #pragma unroll
+        for (int j=0;j<4;j++) {
+            unsigned tok = t0 + tx*4u + (unsigned)j;
+            if (row < pc.M && tok < pc.T) {
+                unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row;
+                if (pc.acc_mode != 0u) Y[yi] += acc[i][j]; else Y[yi] = acc[i][j];
+            }
+        }
+    }
+}
