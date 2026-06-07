@@ -20211,6 +20211,9 @@ fn runDecodeStep(
     // norm_buf, so this mirrors llama.cpp's range fencing and lets attention
     // projection work overlap the previous hidden update.
     var prev_fused_hidden_barrier_deferred: bool = false;
+    // Terminal dense FFN tail can materialize final_norm once and feed the LM
+    // head from norm_buf, avoiding per-row final RMS work in the vocab matvec.
+    var final_norm_ready_from_dense_tail: bool = false;
 
     for (start_layer..cfg.n_layers) |layer_idx| {
         const layer: u32 = @intCast(layer_idx);
@@ -21910,6 +21913,11 @@ fn runDecodeStep(
                     next_layer_idx_u < layer_count and
                     engine.layer_output_scales[next_layer_idx_u] != 0.0 and
                     ((@as(u32, @intCast(next_layer_idx_u)) + 1) % full_attn_interval == 0);
+                const can_fuse_final_norm_tail = emit_logits and
+                    layer_shared_cmd != null and
+                    shared_cmd == null and
+                    next_layer_idx_u == layer_count and
+                    !shouldCpuLmHeadFallback(engine);
 
                 // Three-way fusion: post_ffn_norm + residual_add + next-attn-norm
                 // collapses two dispatches and two barriers into one. Adapted from
@@ -21923,8 +21931,12 @@ fn runDecodeStep(
                 // the previous (post_norm_residual_rms_norm → barrier → scale_in_place)
                 // ordering. Removes the trailing scale_in_place dispatch+barrier
                 // (≈60 dispatches/60 barriers per token on Gemma 31B).
-                if (can_fuse_next_attn_norm and engine.post_ffn_norm_present[layer_idx]) {
+                if ((can_fuse_next_attn_norm or can_fuse_final_norm_tail) and engine.post_ffn_norm_present[layer_idx]) {
                     const hidden_scale: f32 = if (can_fold_layer_scale_here) layer_output_scale else 1.0;
+                    const output_norm_weights = if (can_fuse_final_norm_tail)
+                        &engine.final_norm_gpu
+                    else
+                        &engine.attn_norm_bufs[next_layer_idx_u];
                     dispatchPostNormResidualRmsNormOnCmd(
                         engine,
                         cmd,
@@ -21932,13 +21944,21 @@ fn runDecodeStep(
                         &engine.down_buf,
                         &engine.post_ffn_norm_bufs[layer_idx],
                         &engine.norm_buf,
-                        &engine.attn_norm_bufs[next_layer_idx_u],
+                        output_norm_weights,
                         hidden_dim,
                         hidden_scale,
                     );
-                    prev_fused_attn_norm = true;
+                    if (can_fuse_final_norm_tail) {
+                        // Adapt llama.cpp `ggml_metal_op_concurrency_check`:
+                        // LM head consumes only the materialized final norm row.
+                        final_norm_ready_from_dense_tail = true;
+                    } else {
+                        prev_fused_attn_norm = true;
+                    }
                     if (can_fold_layer_scale_here) layer_output_scale_fused_into_post_norm = true;
-                    if (!ends_dense_cmd_chunk) {
+                    if (can_fuse_final_norm_tail) {
+                        profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.norm_buf});
+                    } else if (!ends_dense_cmd_chunk) {
                         profileBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.norm_buf});
                         prev_fused_hidden_barrier_deferred = true;
                     }
@@ -22070,9 +22090,15 @@ fn runDecodeStep(
     const final_record_start = profileStart(profile != null);
     const cpu_lm_head = shouldCpuLmHeadFallback(engine);
     if (cpu_lm_head and using_external_shared_cmd) return error.InvalidPrefillCommandMode;
-    const fuse_final_norm = !cpu_lm_head and canUseLmHeadFusedNorm(engine, hidden_dim);
+    const fuse_final_norm = !final_norm_ready_from_dense_tail and !cpu_lm_head and canUseLmHeadFusedNorm(engine, hidden_dim);
     if (shared_cmd) |cmd| {
-        if (cpu_lm_head) {
+        if (final_norm_ready_from_dense_tail) {
+            dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
+            profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
+            if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
+        } else if (cpu_lm_head) {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(cmd, profile, .final);
             commitAndWaitProfiled(cmd, profile);
@@ -22110,7 +22136,13 @@ fn runDecodeStep(
             final_cmd_storage = try beginProfiledCommand(engine, profile);
             break :blk &final_cmd_storage;
         };
-        if (cpu_lm_head) {
+        if (final_norm_ready_from_dense_tail) {
+            dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
+            profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
+            commitAndWaitProfiled(cmd, profile);
+        } else if (cpu_lm_head) {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(cmd, profile, .final);
             commitAndWaitProfiled(cmd, profile);
