@@ -10853,6 +10853,56 @@ pub const InferenceEngine = struct {
             (K & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q4k != null)
         {
+            const tail_cols = n_tokens & 31;
+            if (cfg.architecture == .gemma and
+                cfg.n_experts == 0 and
+                cfg.ssm_d_inner == 0 and
+                tail_cols > 0 and
+                tail_cols <= 8 and
+                (M & 31) == 0 and
+                self.dmmv.pipeline_mul_mm_q4k_tail8 != null)
+            {
+                const full_cols = n_tokens - tail_cols;
+                if (full_cols > 0) {
+                    try self.dmmv.recordMulMmQ4K(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        x_buf.handle,
+                        x_buf.size,
+                        y_buf.handle,
+                        y_buf.size,
+                        M,
+                        full_cols,
+                        K,
+                        K,
+                        M,
+                        0,
+                        0,
+                        0,
+                    );
+                    try self.dmmv.recordMulMmQ4KTail8(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        x_buf.handle,
+                        x_buf.size,
+                        y_buf.handle,
+                        y_buf.size,
+                        M,
+                        tail_cols,
+                        K,
+                        K,
+                        M,
+                        0,
+                        full_cols * K,
+                        full_cols * M,
+                    );
+                    return;
+                }
+            }
             try self.dmmv.recordMulMmQ4K(
                 &self.decode_cmd,
                 self.instance.push_descriptor_fn,
