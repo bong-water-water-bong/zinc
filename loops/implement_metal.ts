@@ -851,6 +851,9 @@ export function buildStructuralPivotDirective(state: RunState): string[] {
     }
   } else if (isGemmaDecodeRun(state)) {
     lines.push("- For Gemma31 dense decode, the cycle-46..66 tail already mined Q4/Q6 row-pair carries, LM-head argmax widening, wide post-norm variants, hidden-scale tail fusion, and scope-vs-resource barrier swaps.");
+    if (isGemmaDenseGeGLUNearMiss(state)) {
+      lines.push("- The current GeGLU fast-tanh near-miss is real but correctness-blocked. Passive validator/profile-only cycles after the direct production-vs-unchecked-fast comparison are churn; either convert a validated mask into a default-on correct path or pivot to another named profile bucket.");
+    }
     lines.push("- Neutral arithmetic cleanup is now churn. A valid next speed step must either remove a named dispatch/barrier bucket from the latest profile, consume the decode-split hot-shape table to target the top Q4/Q6 byte bucket, or add analysis/enablement that directly unlocks one of those two paths.");
     lines.push("- Avoid another local variant of `dmmv_q4k`, `dmmv_q6k_llama`, `post_norm_residual_rms_norm_wide`, LM-head argmax row grouping, or resource-list-to-scope barriers unless fresh quantified evidence shows that exact family can beat the current progress band.");
   } else {
@@ -2483,6 +2486,20 @@ export function backfillNearMiss(state: RunState): boolean {
  * to chase the same near-miss without making it correct, so the directive can
  * escalate from "go bisect" to "STOP guessing, run the validator". */
 const NEAR_MISS_ROUTE_PACK_RE = /\b(route[- ]?pack(ed|ing)?|shared[- ]?gate|moe[- ]?route|prefix[- ]?layers?)\b/i;
+const NEAR_MISS_GEMMA_GEGLU_RE = /\b(gemma(?:31)?|dense|q4[_-]?k|gate[\/ -]?up|ffn).*(geglu|gelu|fast::tanh|fast[- ]?tanh|unchecked[- ]?fast)|\b(geglu|gelu|fast::tanh|fast[- ]?tanh|unchecked[- ]?fast).*(gemma(?:31)?|dense|q4[_-]?k|gate[\/ -]?up|ffn)\b/i;
+
+function nearMissFamilyRegex(state: RunState): RegExp {
+  const nm = state.bestIncorrect;
+  const text = `${nm?.description ?? ""}\n${nm?.selfAnalysis ?? ""}`;
+  if (isGemmaDecodeRun(state) && NEAR_MISS_GEMMA_GEGLU_RE.test(text)) return NEAR_MISS_GEMMA_GEGLU_RE;
+  return NEAR_MISS_ROUTE_PACK_RE;
+}
+
+function isGemmaDenseGeGLUNearMiss(state: RunState): boolean {
+  const nm = state.bestIncorrect;
+  if (!nm || !isGemmaDecodeRun(state)) return false;
+  return NEAR_MISS_GEMMA_GEGLU_RE.test(`${nm.description}\n${nm.selfAnalysis}`);
+}
 
 /** Cycles since `bestIncorrect` was recorded that attempted the same family
  * but reverted with broken output (so they discovered nothing new and the
@@ -2490,6 +2507,7 @@ const NEAR_MISS_ROUTE_PACK_RE = /\b(route[- ]?pack(ed|ing)?|shared[- ]?gate|moe[
 export function countNearMissFamilyReverts(state: RunState): number {
   const nm = state.bestIncorrect;
   if (!nm) return 0;
+  const familyRe = nearMissFamilyRegex(state);
   let count = 0;
   for (const c of state.cycles) {
     if (c.cycle < nm.cycle) continue; // only count attempts AT OR AFTER the near-miss
@@ -2497,9 +2515,91 @@ export function countNearMissFamilyReverts(state: RunState): number {
     if (c.containsReference) continue;
     if (c.tokPerSec == null) continue;
     const text = `${c.description} ${c.selfAnalysis ?? ""}`;
-    if (NEAR_MISS_ROUTE_PACK_RE.test(text)) count++;
+    if (familyRe.test(text)) count++;
   }
   return count;
+}
+
+function countGemmaGeGLUPassiveEvidenceKeeps(state: RunState): number {
+  if (!isGemmaDenseGeGLUNearMiss(state)) return 0;
+  const nmCycle = state.bestIncorrect?.cycle ?? 0;
+  return state.cycles.filter((c) => {
+    if (c.cycle < nmCycle || !c.kept || !c.containsReference) return false;
+    if (c.stepKind !== "analysis" && c.stepKind !== "enablement") return false;
+    const text = `${c.description}\n${c.selfAnalysis ?? ""}`;
+    return NEAR_MISS_GEMMA_GEGLU_RE.test(text) &&
+      /\b(profile[- ]?only|validation[- ]?only|validator|validate|layer[- ]?scan|mask[- ]?scan|probe|bisection|bisect|diff)\b/i.test(text);
+  }).length;
+}
+
+function actionableGemmaGeGLUEvidenceText(text: string): boolean {
+  return /\b(direct(?:ly)?\s+(?:compare|compares|comparing|diff)|production(?:\s+fused)?\s+(?:output|path)|unchecked[- ]?fast\s+(?:vs|against)\s+(?:production|default|fused)|first\s+diverg(?:ing|ent)\s+(?:layer|tensor)|default[- ]?on\s+(?:mask|fix|path)|convert(?:s|ed)?\s+(?:the\s+)?(?:mask|validator|evidence)|correctness[- ]?preserving\s+speedup)\b/i.test(text);
+}
+
+function rejectGemmaGeGLUPassiveEvidenceChurn(args: {
+  state: RunState;
+  stepKind: StepKind;
+  description: string;
+  selfAnalysis: string;
+}): boolean {
+  if (!isGemmaDenseGeGLUNearMiss(args.state)) return false;
+  if (args.stepKind !== "analysis" && args.stepKind !== "enablement") return false;
+  if (args.state.stalledCycles < GEMMA_PLATEAU_STALL_CYCLES) return false;
+
+  const passiveKeeps = countGemmaGeGLUPassiveEvidenceKeeps(args.state);
+  const familyReverts = countNearMissFamilyReverts(args.state);
+  if (passiveKeeps < 5 && familyReverts < 5) return false;
+
+  const text = `${args.description}\n${args.selfAnalysis}`;
+  if (!NEAR_MISS_GEMMA_GEGLU_RE.test(text)) return false;
+  if (!/\b(profile[- ]?only|validation[- ]?only|validator|validate|layer[- ]?scan|mask[- ]?scan|probe|bisection|bisect|diff)\b/i.test(text)) return false;
+  return !actionableGemmaGeGLUEvidenceText(text);
+}
+
+function buildGemmaDenseGeGLUNearMissDirective(
+  state: RunState,
+  acceptedBestTps: number,
+): string[] {
+  const nm = state.bestIncorrect!;
+  const familyReverts = countNearMissFamilyReverts(state);
+  const passiveKeeps = countGemmaGeGLUPassiveEvidenceKeeps(state);
+  const profile = state.lastProfileOutput ?? "";
+  const validatorLines = profile
+    .split("\n")
+    .filter((line) => /dense Gemma Q4_K GeGLU/i.test(line))
+    .slice(-4)
+    .map((line) => line.trim().replace(/^info\(forward\):\s*/, ""));
+  const hotLines = profile
+    .split("\n")
+    .filter((line) => /decode q[46]_k hot #|decode buckets:|decode barrier kinds:/i.test(line))
+    .slice(-8)
+    .map((line) => line.trim().replace(/^info\(forward\):\s*/, ""));
+
+  const lines: string[] = [];
+  lines.push(`## ★★★★ GEMMA31 GEGLU NEAR-MISS DEADLOCK — ${nm.tokPerSec.toFixed(1)} ${METRIC_LABEL} is correctness-blocked, not performance-blocked`);
+  lines.push(`Cycle ${nm.cycle} reached **${nm.tokPerSec.toFixed(1)} ${METRIC_LABEL}** (current accepted ≈ ${acceptedBestTps.toFixed(1)}, +${nm.gainPctOverAccepted.toFixed(1)}%) by changing dense Gemma Q4_K GeGLU fast-tanh behavior, but output broke to "${nm.outputText}".`);
+  lines.push(`Since then, this family has ${familyReverts} reverted GeGLU attempts and ${passiveKeeps} kept passive GeGLU evidence/probe cycles. That is enough evidence churn; another profile-only validator is not a speed path.`);
+  lines.push("");
+  lines.push("Required pivot:");
+  lines.push("1. If touching GeGLU, the cycle must **directly compare unchecked-fast fused output against the current production fused output** at the first divergent layer/tensor, or convert an existing validated mask into a default-on correctness-preserving path. The `@@@SELF_ANALYSIS` must name the layer/tensor and why it will preserve Paris.");
+  lines.push("2. If not touching GeGLU, abandon this near-miss for now and attack a named profile bucket that can beat the promotion band: dense `M=21504 K=5376`, dense down `M=5376 K=21504`, attention out/QKV buckets, or the unexpectedly high decode commit/wait count.");
+  lines.push("3. Do not add another validation-only/profile-only GeGLU probe, prefix bisection, mask scan, or diagnostic print unless it is the direct production-vs-unchecked-fast comparison above. The harness will reject passive GeGLU evidence churn in plateau mode.");
+  if (nm.selfAnalysis) {
+    lines.push("");
+    lines.push("Near-miss self-analysis:");
+    lines.push(`> ${trunc(nm.selfAnalysis, 700).replace(/\n+/g, " ")}`);
+  }
+  if (validatorLines.length > 0) {
+    lines.push("");
+    lines.push("Latest retained GeGLU validator evidence:");
+    lines.push(...validatorLines.map((line) => `- ${line}`));
+  }
+  if (hotLines.length > 0) {
+    lines.push("");
+    lines.push("Latest profile buckets to pivot to if GeGLU remains correctness-blocked:");
+    lines.push(...hotLines.map((line) => `- ${line}`));
+  }
+  return lines;
 }
 
 /**
@@ -2553,6 +2653,10 @@ export function buildNearMissDirective(
   // accepted tree already is — once a correct change matches/exceeds it, the
   // target is moot.
   if (nm.tokPerSec <= acceptedBestTps + Math.max(0.3, acceptedBestTps * 0.005)) return [];
+
+  if (isGemmaDenseGeGLUNearMiss(state)) {
+    return buildGemmaDenseGeGLUNearMissDirective(state, acceptedBestTps);
+  }
 
   const familyReverts = countNearMissFamilyReverts(state);
   const escalate = familyReverts >= 5; // agent has already tried this family ≥5 times
@@ -3781,6 +3885,7 @@ export function shouldRejectPlateauNeutralKeep(args: {
   currentProgressBand: number;
 }): boolean {
   if (args.verifyTokPerSec >= args.acceptedTokPerSec + args.currentProgressBand) return false;
+  if (rejectGemmaGeGLUPassiveEvidenceChurn(args)) return true;
   if (args.stepKind !== "optimization") return false;
 
   const text = `${args.description}\n${args.selfAnalysis}`.toLowerCase();

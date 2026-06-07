@@ -1278,6 +1278,56 @@ describe("buildPrompt", () => {
     })).toBe(false);
   });
 
+  test("Gemma31 GeGLU deadlock rejects passive validator churn but allows direct production diff", () => {
+    const state = makeState({
+      effortId: 12,
+      effortFile: "MULTI_HOUR_EFFORT_12_METAL_GEMMA_31B_M4.md",
+      effortPlan: "# Effort 12\nGemma 4 31B dense decode",
+      metricMode: "decode",
+      currentBest: { tokPerSec: 23.9, containsReference: true },
+      bestTokPerSec: 24.0,
+      stalledCycles: 18,
+      bestIncorrect: {
+        cycle: 19,
+        tokPerSec: 25.1,
+        gainPctOverAccepted: 4.8,
+        description: "Enabled capped fast `fast::tanh` dense Gemma Q4_K GeGLU for the first 30 layers.",
+        selfAnalysis: "Fast prefix GeGLU near-miss.",
+        outputText: "The capitalTheTheThe",
+      },
+      cycles: [
+        makeCycle({ cycle: 19, kept: false, containsReference: false, tokPerSec: 25.1, description: "Enabled capped fast fast::tanh dense Gemma Q4_K GeGLU" }),
+        makeCycle({ cycle: 20, kept: false, containsReference: false, tokPerSec: 25.0, description: "Default dense Gemma31 Q4_K fused GeGLU unchecked-fast" }),
+        makeCycle({ cycle: 21, kept: false, containsReference: false, tokPerSec: 25.0, description: "Bisection dense Gemma Q4_K fused GeGLU fast-prefix" }),
+        makeCycle({ cycle: 22, kept: true, containsReference: true, tokPerSec: 23.9, stepKind: "enablement", description: "Added dense Gemma Q4_K GeGLU validator" }),
+        makeCycle({ cycle: 23, kept: true, containsReference: true, tokPerSec: 23.9, stepKind: "enablement", description: "Added validation-only dense Gemma Q4_K GeGLU unchecked-fast probe" }),
+        makeCycle({ cycle: 24, kept: true, containsReference: true, tokPerSec: 23.9, stepKind: "analysis", description: "Added dense Gemma Q4_K GeGLU layer-scan validation" }),
+        makeCycle({ cycle: 25, kept: true, containsReference: true, tokPerSec: 23.9, stepKind: "analysis", description: "Enabled profile-only dense Gemma31 Q4_K GeGLU layer-scan validation" }),
+        makeCycle({ cycle: 26, kept: true, containsReference: true, tokPerSec: 23.9, stepKind: "enablement", description: "Adapted precise-GeGLU reference posture into a multi-token Gemma31 Q4_K GeGLU validator scan" }),
+      ],
+    });
+
+    expect(shouldRejectPlateauNeutralKeep({
+      state,
+      stepKind: "enablement",
+      description: "Added another profile-only dense Gemma Q4_K GeGLU layer-mask validation scan",
+      selfAnalysis: "This validator should provide more evidence.",
+      verifyTokPerSec: 23.9,
+      acceptedTokPerSec: 23.9,
+      currentProgressBand: 0.15,
+    })).toBe(true);
+
+    expect(shouldRejectPlateauNeutralKeep({
+      state,
+      stepKind: "enablement",
+      description: "Retarget dense Gemma Q4_K GeGLU validator to directly compare unchecked-fast fused output against production fused output",
+      selfAnalysis: "Names the first divergent layer/tensor so the next default-on mask can preserve Paris.",
+      verifyTokPerSec: 23.9,
+      acceptedTokPerSec: 23.9,
+      currentProgressBand: 0.15,
+    })).toBe(false);
+  });
+
   test("structural pivot directive appears for Gemma prefill plateau", () => {
     const state = makeState({
       effortId: 11,
@@ -1729,6 +1779,45 @@ describe("buildNearMissDirective", () => {
       ],
     });
     expect(countNearMissFamilyReverts(s)).toBe(1); // only cycle 12 qualifies
+  });
+
+  test("Gemma31 GeGLU near-miss gets a family-specific deadlock directive", () => {
+    const s = makeState({
+      effortId: 12,
+      effortFile: "MULTI_HOUR_EFFORT_12_METAL_GEMMA_31B_M4.md",
+      effortPlan: "# Effort 12\nGemma 4 31B dense decode",
+      metricMode: "decode",
+      bestIncorrect: {
+        cycle: 19,
+        tokPerSec: 25.1,
+        gainPctOverAccepted: 4.8,
+        description: "Enabled capped fast `fast::tanh` dense Gemma Q4_K GeGLU for the first 30 layers.",
+        selfAnalysis: "This bisects the known-bad full 60-layer no-clamp near-miss.",
+        outputText: "The capitalTheTheThe",
+      },
+      stalledCycles: 18,
+      lastProfileOutput: [
+        "info(forward):   dense Gemma Q4_K GeGLU fast: prefix_layers 3 validation_checks 56 status first-failure token 20 scan_token 1/1 layer 4 tensor dense_gate_up_geglu max_abs 41.78",
+        "info(forward):   decode barrier kinds: scope 364 resource 3542 resources 5264 avg_resources/resource 1.49",
+        "info(forward):   decode q4_k hot #1: dense M=21504 K=5376 bytes=57.66 GiB calls=952",
+      ].join("\n"),
+      cycles: [
+        makeCycle({ cycle: 19, kept: false, containsReference: false, tokPerSec: 25.1, description: "Enabled capped fast fast::tanh dense Gemma Q4_K GeGLU" }),
+        makeCycle({ cycle: 20, kept: false, containsReference: false, tokPerSec: 25.0, description: "Default dense Gemma31 Q4_K fused GeGLU unchecked-fast" }),
+        makeCycle({ cycle: 21, kept: false, containsReference: false, tokPerSec: 25.0, description: "Bisection dense Gemma Q4_K fused GeGLU fast-prefix" }),
+        makeCycle({ cycle: 22, kept: true, containsReference: true, tokPerSec: 23.9, stepKind: "enablement", description: "Added dense Gemma Q4_K GeGLU validator" }),
+        makeCycle({ cycle: 23, kept: true, containsReference: true, tokPerSec: 23.9, stepKind: "enablement", description: "Added validation-only dense Gemma Q4_K GeGLU unchecked-fast probe" }),
+        makeCycle({ cycle: 24, kept: true, containsReference: true, tokPerSec: 23.9, stepKind: "analysis", description: "Added dense Gemma Q4_K GeGLU layer-scan validation" }),
+        makeCycle({ cycle: 28, kept: false, containsReference: false, tokPerSec: 25.0, description: "Bisected dense Gemma Q4_K GeGLU fast-prefix default from 3 to 5 layers" }),
+        makeCycle({ cycle: 29, kept: false, containsReference: true, tokPerSec: 23.9, description: "Raised dense Gemma31 Q4_K GeGLU unchecked-fast default prefix from 3 to 4 layers" }),
+      ],
+    });
+    expect(countNearMissFamilyReverts(s)).toBe(4);
+    const lines = buildNearMissDirective(s, 23.9, true).join("\n");
+    expect(lines).toContain("GEMMA31 GEGLU NEAR-MISS DEADLOCK");
+    expect(lines).toContain("directly compare unchecked-fast fused output");
+    expect(lines).toContain("another profile-only validator is not a speed path");
+    expect(lines).toContain("dense M=21504 K=5376");
   });
 
   test("is silent when no near-miss is recorded", () => {
