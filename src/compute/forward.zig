@@ -6933,8 +6933,23 @@ pub const InferenceEngine = struct {
                         }
                     }
 
-                    // Output projection + attention residual
-                    const apply_post_attn_norm = config.architecture == .gemma and lt.post_attention_norm != null;
+                    // Output projection + attention residual. The accepted
+                    // Gemma 49-72 token prefill fast tail already uses the
+                    // final two prompt tokens as the exact-quality guard for
+                    // MoE. Mirror that guard on the attention residual: early
+                    // non-terminal prompt tokens skip post_attention_norm so
+                    // the O projection can accumulate directly into hidden_buf.
+                    const skip_gemma_short_prefill_post_attn_norm =
+                        self.prefill_active and
+                        !collect_output and
+                        config.architecture == .gemma and
+                        self.moe_prefill_tail_topk_limit > gemma_prefill_micro_prompt_topk and
+                        self.prefill_embed_big_token_count >= gemma_prefill_long_draft_prompt_min_tokens and
+                        self.prefill_embed_big_token_count <= gemma_prefill_shared_skip_max_tokens and
+                        self.prefill_current_token_idx + gemma_prefill_long_draft_prompt_guard_tokens < self.prefill_embed_big_token_count;
+                    const apply_post_attn_norm = config.architecture == .gemma and
+                        lt.post_attention_norm != null and
+                        !skip_gemma_short_prefill_post_attn_norm;
                     const has_post_attn_norm = apply_post_attn_norm;
                     const diag_attn_residual = diag_last_prompt_token and config.architecture == .gpt_oss and self.validation_diagnostics_enabled and q_dim <= 8192;
                     if (!has_post_attn_norm and !self.validation_diagnostics_enabled) {
