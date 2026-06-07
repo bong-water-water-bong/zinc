@@ -164,10 +164,11 @@ Milestones:
     Q4_K dequant + matvec, cross-checked vs llama.cpp `get_scale_min_k4`), `dmmv_f32`, `dmmv_q8_0`,
     `dmmv_q5k`, `dmmv_q6k`, `swiglu`, `scale_accumulate`, `sigmoid_scale_acc` (9 done — the full
     dequant-matvec set f32/Q4_K/Q5_K/Q6_K/Q8_0 + norm + FFN/residual/gating elementwise).
-    Plus `softmax_topk` (MoE router, ids exact + weight err 1.5e-8) and `rope` (partial
-    rotation, 2.4e-6) — **11 done**. Remaining: `qk_norm`, `kv_cache_write`, attention (flash or
-    naive), the SSM trio (`ssm_conv1d`, `ssm_delta_net`, `ssm_gated_norm`), `argmax`,
-    `moe_weighted_acc` (+ MoE-indexed dmmv variants).
+    Plus `softmax_topk` (router), `rope`, `argmax` (exact), `moe_weighted_acc` (4.4e-5) —
+    **13 done**; `qk_norm` reuses `rms_norm` per-head (no new kernel). The entire
+    non-attention/non-SSM decode path is complete. Remaining: `kv_cache_write`, naive attention
+    (`softmax(QKᵀ)V` for the 1-query decode), and the SSM trio (`ssm_conv1d`, `ssm_delta_net`,
+    `ssm_gated_norm`) (+ MoE-indexed dmmv variants for M2).
 - **M2 — full model, coherent generation.** Paged KV pool, SSM conv/recurrent state ring
   buffers (conv `(d_conv-1)*8192` f32/layer; recurrent `dt_rank*128*128` f32/layer), all quant
   formats, prompt prefill, chat template, server path (`model_manager_cuda.zig`). Correctness

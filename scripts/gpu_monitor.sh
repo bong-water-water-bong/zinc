@@ -9,8 +9,15 @@
 #   scripts/gpu_monitor.sh                 # live dashboard, refresh every 2s
 #   scripts/gpu_monitor.sh -n 1            # refresh every 1s
 #   scripts/gpu_monitor.sh --once          # one snapshot, then exit (good for scripts/cron)
-#   scripts/gpu_monitor.sh --log gpu.csv   # also append timestamped CSV rows to gpu.csv
+#   scripts/gpu_monitor.sh --log gpu.csv   # live dashboard + append timestamped CSV here
 #   scripts/gpu_monitor.sh --no-color      # disable ANSI colour
+#
+# Remote logging (runs detached ON the node, survives SSH disconnect / laptop sleep):
+#   scripts/gpu_monitor.sh --remote-log start    # start a background CSV logger on the node
+#   scripts/gpu_monitor.sh --remote-log status   # running? row count + latest sample
+#   scripts/gpu_monitor.sh --remote-log tail     # last 15 logged rows
+#   scripts/gpu_monitor.sh --remote-log fetch    # scp the node's CSV down to here
+#   scripts/gpu_monitor.sh --remote-log stop     # stop the logger (CSV stays on the node)
 #
 # Env:
 #   GPU_NODE   ssh host/alias to poll (default: agent-zinc)
@@ -22,8 +29,9 @@ INTERVAL=2
 ONCE=0
 LOGFILE=""
 USE_COLOR=1
+REMOTE_LOG=""
 
-usage() { sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,6 +40,11 @@ while [[ $# -gt 0 ]]; do
     --log)         LOGFILE="${2:?missing file}"; shift 2 ;;
     --node)        NODE="${2:?missing node}"; shift 2 ;;
     --no-color)    USE_COLOR=0; shift ;;
+    --remote-log)
+      case "${2:-}" in
+        start|stop|status|fetch|tail) REMOTE_LOG="$2"; shift 2 ;;
+        *)                            REMOTE_LOG="start"; shift 1 ;;
+      esac ;;
     -h|--help)     usage 0 ;;
     [0-9]*)        INTERVAL="$1"; shift ;;          # bare number => interval
     *)             echo "unknown arg: $1" >&2; usage 1 ;;
@@ -52,6 +65,8 @@ fi
 CTL="/tmp/.gpumon-$(id -u)-%C"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8
      -o ServerAliveInterval=5 -o ServerAliveCountMax=2
+     -o ControlMaster=auto -o ControlPersist=30 -o ControlPath="$CTL")
+SCP=(scp -o BatchMode=yes -o ConnectTimeout=8
      -o ControlMaster=auto -o ControlPersist=30 -o ControlPath="$CTL")
 
 QUERY='index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit'
@@ -100,7 +115,71 @@ frame() {                       # one poll; echoes raw CSV, returns ssh status
   "${SSH[@]}" "$NODE" "$REMOTE_CMD" 2>/dev/null
 }
 
+# --- remote logging: a detached nvidia-smi logger that lives ON the node -------
+# State on the node is under ~/.gpu_monitor/ (run.sh, logger.pid, thermals.csv).
+# The logger runs in its own session with stdio detached, so it survives this SSH
+# session closing and your laptop sleeping. Manage via start/stop/status/tail/fetch.
+remote_log() {
+  local action="$1"
+  case "$action" in
+    start)
+      local logger b64
+      # Single-quoted so nothing expands locally; shipped to the node as base64.
+      logger='#!/usr/bin/env bash
+RDIR="$HOME/.gpu_monitor"; CSV="$RDIR/thermals.csv"; PIDF="$RDIR/logger.pid"
+INT="${1:-2}"
+echo $$ > "$PIDF"
+echo "timestamp,index,name,util_gpu,util_mem,mem_used_mib,mem_total_mib,temp_c,power_w,power_limit_w" > "$CSV"
+while :; do
+  nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits >> "$CSV" 2>/dev/null
+  sleep "$INT"
+done'
+      b64="$(printf '%s' "$logger" | base64 | tr -d '\n')"
+      "${SSH[@]}" "$NODE" "
+        RDIR=\"\$HOME/.gpu_monitor\"; mkdir -p \"\$RDIR\"; PIDF=\"\$RDIR/logger.pid\";
+        if [ -f \"\$PIDF\" ] && kill -0 \"\$(cat \"\$PIDF\" 2>/dev/null)\" 2>/dev/null; then
+          echo \"already running (pid \$(cat \"\$PIDF\"))\"; exit 0; fi
+        echo \"$b64\" | base64 -d > \"\$RDIR/run.sh\";
+        if command -v setsid >/dev/null 2>&1; then
+          setsid bash \"\$RDIR/run.sh\" $INTERVAL >/dev/null 2>&1 </dev/null &
+        else
+          nohup bash \"\$RDIR/run.sh\" $INTERVAL >/dev/null 2>&1 </dev/null &
+        fi
+        sleep 0.6;
+        if [ -f \"\$PIDF\" ] && kill -0 \"\$(cat \"\$PIDF\" 2>/dev/null)\" 2>/dev/null; then
+          echo \"started (pid \$(cat \"\$PIDF\"), every ${INTERVAL}s) -> \$RDIR/thermals.csv\";
+        else echo \"failed to start\" >&2; exit 1; fi" ;;
+    stop)
+      "${SSH[@]}" "$NODE" "
+        PIDF=\"\$HOME/.gpu_monitor/logger.pid\"; CSV=\"\$HOME/.gpu_monitor/thermals.csv\";
+        if [ -f \"\$PIDF\" ]; then PID=\"\$(cat \"\$PIDF\")\";
+          if kill -0 \"\$PID\" 2>/dev/null; then kill \"\$PID\" 2>/dev/null; sleep 0.3; kill -9 \"\$PID\" 2>/dev/null; echo \"stopped (pid \$PID)\";
+          else echo \"not running (stale pid \$PID)\"; fi; rm -f \"\$PIDF\";
+        else echo \"not running (no pid file)\"; fi;
+        [ -f \"\$CSV\" ] && echo \"logged \$(( \$(wc -l < \"\$CSV\") - 1 )) rows -> \$CSV\" || true" ;;
+    status)
+      "${SSH[@]}" "$NODE" "
+        PIDF=\"\$HOME/.gpu_monitor/logger.pid\"; CSV=\"\$HOME/.gpu_monitor/thermals.csv\";
+        if [ -f \"\$PIDF\" ] && kill -0 \"\$(cat \"\$PIDF\" 2>/dev/null)\" 2>/dev/null; then echo \"RUNNING (pid \$(cat \"\$PIDF\"))\"; else echo \"NOT RUNNING\"; fi;
+        if [ -f \"\$CSV\" ]; then echo \"rows=\$(( \$(wc -l < \"\$CSV\") - 1 ))  size=\$(du -h \"\$CSV\" | cut -f1)  path=\$CSV\"; echo \"latest:\"; tail -n 2 \"\$CSV\"; else echo \"(no CSV yet)\"; fi" ;;
+    tail)
+      "${SSH[@]}" "$NODE" "tail -n 15 \"\$HOME/.gpu_monitor/thermals.csv\" 2>/dev/null || echo '(no CSV yet)'" ;;
+    fetch)
+      local dest="gpu_thermals_${NODE//[^A-Za-z0-9._-]/_}.csv"
+      if "${SCP[@]}" "$NODE:.gpu_monitor/thermals.csv" "$dest" 2>/dev/null; then
+        echo "fetched -> $dest ($(( $(wc -l < "$dest") - 1 )) rows)"
+      else echo "fetch failed — no CSV on $NODE yet? start it: $0 --remote-log start" >&2; return 1; fi ;;
+    *) echo "unknown --remote-log action: $action (start|stop|status|tail|fetch)" >&2; return 2 ;;
+  esac
+}
+
 set +e                          # the watch loop tolerates transient SSH failures
+
+# --- remote-log dispatch (does its work over SSH, then exits) -----------------
+if [[ -n "$REMOTE_LOG" ]]; then
+  remote_log "$REMOTE_LOG"
+  exit $?
+fi
 
 # --- one-shot mode -----------------------------------------------------------
 if [[ "$ONCE" == 1 ]]; then

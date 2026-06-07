@@ -403,3 +403,59 @@ extern "C" __global__ void moe_weighted_acc(float* a, const float* b, const unsi
     }
     a[i] += sum;
 }
+
+// ---- ssm_conv1d (port of ssm_conv1d.comp) -----------------------------------
+// Depthwise causal 1D conv (d_conv taps) + SiLU, via a circular state buffer.
+// One thread per channel. Updates `state` in place (writes current_input into
+// the state_offset slot). conv_kernel is f16 or f32 per kernel_is_f16.
+struct ConvPush { unsigned conv_channels, d_conv, kernel_is_f16, state_offset; };
+
+extern "C" __global__ void ssm_conv1d(const float* current_input, const unsigned char* conv_kernel,
+                                      float* state, float* out_data, ConvPush pc) {
+    unsigned ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= pc.conv_channels) return;
+    unsigned d_conv_1 = pc.d_conv - 1u;
+    float ci = current_input[ch];
+    float sum = 0.0f;
+    for (unsigned ki = 0; ki < pc.d_conv; ki++) {
+        unsigned k_idx = ch * pc.d_conv + ki;
+        float kw = (pc.kernel_is_f16 != 0u)
+                       ? zinc_half_to_float(((const unsigned short*)conv_kernel)[k_idx])
+                       : ((const float*)conv_kernel)[k_idx];
+        float sv;
+        if (ki < d_conv_1) {
+            unsigned slot = pc.state_offset + ki;
+            if (slot >= d_conv_1) slot -= d_conv_1;
+            sv = state[(size_t)slot * pc.conv_channels + ch];
+        } else {
+            sv = ci;
+        }
+        sum += kw * sv;
+    }
+    out_data[ch] = sum / (1.0f + expf(-sum));            // SiLU
+    state[(size_t)pc.state_offset * pc.conv_channels + ch] = ci;
+}
+
+// ---- ssm_gated_norm (port of ssm_gated_norm.comp) ---------------------------
+// Per head: out = (o / rms(o)) * norm_weight * silu(z). One block per head.
+struct GatedNormPush { unsigned d_inner, dt_rank, head_v_dim, d_state, norm_per_head; };
+
+extern "C" __global__ void ssm_gated_norm(const float* o, const float* z, const float* norm_weight,
+                                          float* out, GatedNormPush pc) {
+    unsigned h = blockIdx.x;
+    unsigned base = h * pc.head_v_dim;
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.head_v_dim; i += blockDim.x) { float v = o[base + i]; ss += v * v; }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.head_v_dim + 1e-6f);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < pc.head_v_dim; i += blockDim.x) {
+        float nv = o[base + i] * rinv;
+        unsigned norm_idx = (pc.norm_per_head != 0u) ? (base + i) : (i % pc.d_state);
+        nv *= norm_weight[norm_idx];
+        float zv = z[base + i];
+        out[base + i] = nv * (zv / (1.0f + expf(-zv)));
+    }
+}
