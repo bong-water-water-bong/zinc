@@ -64,6 +64,8 @@ layout(push_constant) uniform PushConstants {
     uint stride_d_packed;   // per-token uints in output packed swiglu      = M/4
     uint stride_d_scale;    // per-token floats in output scale buffer      = M/32
     uint a_offset;          // byte offset into the Q4_K SSBOs (gate AND up)
+    uint b_packed_offset;   // uint offset into input packed activation
+    uint b_scale_offset;    // vec2 offset into input scale buffer
     uint d_packed_offset;   // uint offset into output packed buffer
     uint d_scale_offset;    // float offset into output scale buffer
 };
@@ -207,11 +209,11 @@ void main() {
             [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
                 const uint col_local = cbase + tid / 2u;
                 const uint col_global = ic * BN + col_local;
-                const uint src = col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
+                const uint src = b_packed_offset + col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
                 const uint base_b = col_local * SPACK + tile_half * 4u;
                 [[unroll]] for (uint w = 0u; w < 4u; w++) buf_b[base_b + w] = b_packed[src + w];
                 if (tile_half == 0u) {
-                    buf_b_sd[col_local] = b_scale_dsum[col_global * b_stride_scale + (k_outer >> 5)];
+                    buf_b_sd[col_local] = b_scale_dsum[b_scale_offset + col_global * b_stride_scale + (k_outer >> 5)];
                 }
             }
         }

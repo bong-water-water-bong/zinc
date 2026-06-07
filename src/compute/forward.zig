@@ -11711,6 +11711,8 @@ pub const InferenceEngine = struct {
                 if (fuse_q8) {
                     const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                     const swiglu_scale = self.batched_scratch_swiglu_scale.?;
+                    const split_n64 = full_cols == 96 and self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_n64 != null;
+                    const first_cols: u32 = if (split_n64) 64 else full_cols;
                     try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8(
                         &self.decode_cmd,
                         self.instance.push_descriptor_fn,
@@ -11727,16 +11729,46 @@ pub const InferenceEngine = struct {
                         swiglu_scale.handle,
                         swiglu_scale.size,
                         inter_dim,
-                        full_cols,
+                        first_cols,
                         hidden_dim,
                         0,
                         0,
                         0,
+                        0,
+                        0,
                     );
+                    if (split_n64) {
+                        try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8(
+                            &self.decode_cmd,
+                            self.instance.push_descriptor_fn,
+                            gate_t.gpu_buffer.handle,
+                            gate_t.gpu_buffer.size,
+                            up_t.gpu_buffer.handle,
+                            up_t.gpu_buffer.size,
+                            hidden_i8.handle,
+                            hidden_i8.size,
+                            hidden_sd.handle,
+                            hidden_sd.size,
+                            swiglu_i8.handle,
+                            swiglu_i8.size,
+                            swiglu_scale.handle,
+                            swiglu_scale.size,
+                            inter_dim,
+                            full_cols - first_cols,
+                            hidden_dim,
+                            0,
+                            first_cols * (hidden_dim / 4),
+                            first_cols * (hidden_dim / 32),
+                            first_cols * (inter_dim / 4),
+                            first_cols * (inter_dim / 32),
+                        );
+                    }
                     dp4a_result = .q8_geglu;
                 } else if (fuse_q8_1) {
                     const swiglu_i8 = self.batched_scratch_swiglu_i8.?;
                     const swiglu_sd = self.batched_scratch_swiglu_scale_dsum.?;
+                    const split_n64 = full_cols == 96 and self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1_n64 != null;
+                    const first_cols: u32 = if (split_n64) 64 else full_cols;
                     try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8_1(
                         &self.decode_cmd,
                         self.instance.push_descriptor_fn,
@@ -11753,12 +11785,40 @@ pub const InferenceEngine = struct {
                         swiglu_sd.handle,
                         swiglu_sd.size,
                         inter_dim,
-                        full_cols,
+                        first_cols,
                         hidden_dim,
                         0,
                         0,
                         0,
+                        0,
+                        0,
                     );
+                    if (split_n64) {
+                        try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8_1(
+                            &self.decode_cmd,
+                            self.instance.push_descriptor_fn,
+                            gate_t.gpu_buffer.handle,
+                            gate_t.gpu_buffer.size,
+                            up_t.gpu_buffer.handle,
+                            up_t.gpu_buffer.size,
+                            hidden_i8.handle,
+                            hidden_i8.size,
+                            hidden_sd.handle,
+                            hidden_sd.size,
+                            swiglu_i8.handle,
+                            swiglu_i8.size,
+                            swiglu_sd.handle,
+                            swiglu_sd.size,
+                            inter_dim,
+                            full_cols - first_cols,
+                            hidden_dim,
+                            0,
+                            first_cols * (hidden_dim / 4),
+                            first_cols * (hidden_dim / 32),
+                            first_cols * (inter_dim / 4),
+                            first_cols * (inter_dim / 32),
+                        );
+                    }
                     dp4a_result = .q8_1_geglu;
                 } else {
                     try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4a(
