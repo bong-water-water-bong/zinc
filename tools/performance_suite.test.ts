@@ -111,6 +111,7 @@ test("parseArgs reads RDNA backend and device options", () => {
   expect(args.rdnaBackend).toBe("vulkan");
   expect(args.rdnaVkDevice).toBe(1);
   expect(args.requireRdnaDeviceSubstring).toBe("GFX1201");
+  expect(args.rdnaWorkdir).toBe("/root/zinc-bench");
 });
 
 test("parseArgs rejects invalid RDNA backend", () => {
