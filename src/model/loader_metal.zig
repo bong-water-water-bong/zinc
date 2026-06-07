@@ -25,7 +25,7 @@ pub const ModelInspection = struct {
     metadata_count: usize,
 };
 
-/// A tensor descriptor paired with a Metal buffer wrapping its mmap'd data.
+/// A tensor descriptor paired with a Metal buffer holding its weight data (mmap-wrapped or copied).
 pub const LoadedTensor = struct {
     info: gguf.TensorInfo,
     gpu_buffer: MetalBuffer,
@@ -514,7 +514,7 @@ pub fn inspectModel(path: []const u8, allocator: std.mem.Allocator) !ModelInspec
 /// @param metal_ctx Active Metal context used to create and wrap GPU buffers; must be non-null.
 /// @param allocator Allocator for tensor and arena bookkeeping (retained in the returned `Model`).
 /// @returns Initialized `Model` or an error if the file cannot be mapped, parsed, or lacks a
-///          supported architecture (qwen2, qwen2_moe, qwen35, mistral, mamba, jamba).
+///          supported architecture (qwen2, qwen2_moe, qwen35, mistral, mamba, jamba, gemma).
 pub fn load(
     path: []const u8,
     metal_ctx: ?*shim.MetalCtx,

@@ -125,7 +125,7 @@ const VulkanProbe = struct {
 pub const FitEstimate = struct {
     /// Tensor weight payload bytes uploaded to device-local VRAM.
     weights_bytes: u64,
-    /// Activation and scratch buffers allocated in device-local VRAM.
+    /// All device-local runtime bytes: activation/scratch, KV cache, and SSM state.
     runtime_device_local_bytes: u64,
     /// Staging buffers allocated in host-visible memory.
     host_visible_bytes: u64,
@@ -133,7 +133,7 @@ pub const FitEstimate = struct {
     kv_cache_bytes: u64,
     /// SSM convolution and recurrent state bytes on the GPU.
     gpu_ssm_bytes: u64,
-    /// Sum of weights and runtime activation buffers in device-local VRAM (excludes KV cache and SSM state).
+    /// Sum of weights and all device-local runtime bytes (includes KV cache and SSM state).
     total_device_local_bytes: u64,
     /// Available VRAM budget reported by the Vulkan driver.
     vram_budget_bytes: u64,
@@ -726,8 +726,8 @@ fn readGgufHeader(file: std.fs.File) !GgufHeader {
 }
 
 /// Compute a `FitEstimate` that breaks down VRAM usage for a model at a given budget.
-/// Derives weights, KV cache, SSM state, and runtime buffer sizes from the model config,
-/// then checks whether the total fits within the available device-local budget.
+/// Derives weights, KV cache, SSM state, and runtime buffer sizes from the model config
+/// and returns per-category byte counts without evaluating fit status.
 /// @param inspection GGUF model inspection result supplying tensor byte count and config.
 /// @param vram_budget_bytes Device-local VRAM available, as reported by the Vulkan driver.
 /// @param requested_context_length Optional context ceiling override; null uses the model default.

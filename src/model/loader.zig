@@ -165,7 +165,7 @@ pub const Model = struct {
 
     /// Release tensor buffers, GGUF metadata, and the backing file mapping owned by the model.
     /// @param self Model instance to tear down in place.
-    /// @param instance Active Vulkan instance that created the device resources.
+    /// @param instance Unused; accepted for call-site symmetry with other deinit patterns.
     pub fn deinit(self: *Model, instance: *const Instance) void {
         _ = instance;
         for (self.tensors.items) |*t| {

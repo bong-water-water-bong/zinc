@@ -185,7 +185,7 @@ pub const CommandBuffer = struct {
     /// @note This helper binds pipeline and descriptors only; required barriers must be recorded separately.
     pub fn dispatch(
         self: *CommandBuffer,
-        /// Vulkan compute pipeline, or null if unavailable.
+        /// Vulkan compute pipeline to bind and dispatch.
         pipeline: *const Pipeline,
         /// Allocated descriptor set.
         descriptor_set: vk.c.VkDescriptorSet,
@@ -221,7 +221,7 @@ pub const CommandBuffer = struct {
     /// @note The caller is responsible for matching `push_data` to the shader layout declared by `pipeline`.
     pub fn dispatchWithPush(
         self: *CommandBuffer,
-        /// Vulkan compute pipeline, or null if unavailable.
+        /// Vulkan compute pipeline to bind and dispatch.
         pipeline: *const Pipeline,
         /// Allocated descriptor set.
         descriptor_set: vk.c.VkDescriptorSet,

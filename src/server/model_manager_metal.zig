@@ -39,12 +39,14 @@ pub const ModelSummary = struct {
     supported_on_current_gpu: bool,
     fits_current_gpu: bool,
     required_vram_bytes: u64,
-    /// VRAM required when MoE expert tensors are offloaded to host RAM.
-    /// On Apple Silicon (UMA) this equals required_vram_bytes — the field
-    /// exists for API parity with the Vulkan path.
+    /// VRAM required when MoE expert tensors are offloaded to host RAM under
+    /// `ZINC_OFFLOAD_MOE_EXPERTS=1`. Equal to `required_vram_bytes` for dense
+    /// models (no offloadable tensors). For MoE catalog entries this will be
+    /// less than `required_vram_bytes`.
     required_vram_with_offload_bytes: u64,
-    /// Always false on Apple Silicon — UMA has no separate VRAM, so the
-    /// offload escape hatch isn't applicable here.
+    /// True when the model doesn't fit in VRAM as-is but does fit if MoE
+    /// expert tensors are offloaded. Derived from catalog metadata; mutually
+    /// exclusive with `fits_current_gpu`.
     requires_offload_to_fit: bool,
     size_bytes: u64,
     exact_fit: bool,

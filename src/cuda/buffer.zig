@@ -52,8 +52,8 @@ pub fn createBufferStaged(ctx: ?*shim.CudaCtx, size: usize) !CudaBuffer {
     return .{ .handle = handle, .size = size, .host_ptr = @ptrCast(cpu_ptr) };
 }
 
-/// Register an existing host mapping (e.g. mmap'd weights) and copy to device —
-/// the CUDA analogue of Metal's zero-copy wrapMmap.
+/// Copy an existing host mapping (e.g. mmap'd weights) to a new device-local buffer.
+/// Unlike Metal's zero-copy wrapMmap, this performs a full host-to-device copy.
 /// @param ctx      CUDA context that will own the resulting device allocation.
 /// @param host_ptr Pointer to the host memory region to copy from (typically an mmap'd file mapping).
 /// @param size     Number of bytes to transfer.

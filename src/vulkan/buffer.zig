@@ -175,7 +175,7 @@ pub const Buffer = struct {
     }
 
     /// Destroy the Vulkan buffer, free device memory, and unmap any host-mapped pointer.
-    /// @param self Buffer to tear down; the struct is zeroed to `undefined` on return.
+    /// @param self Buffer to tear down; the struct fields are set to `undefined` on return.
     pub fn deinit(self: *Buffer) void {
         if (self.mapped != null) {
             vk.c.vkUnmapMemory(self.device, self.memory);

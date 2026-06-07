@@ -757,7 +757,7 @@ fn buildMambaDecodeGraph(config: *const ModelConfig, allocator: std.mem.Allocato
 /// Differs from LLaMA: GEGLU activation, post-attention/FFN norms, embedding scaling.
 /// Per-layer structure:
 ///   input_norm → QKV → Q/K norm → RoPE → flash attention → O proj → post_attn_norm →
-///   residual add → ffn_norm → gate+up ��� GEGLU → down → post_ffn_norm → residual add
+///   residual add → ffn_norm → gate+up → GEGLU → down → post_ffn_norm → residual add
 fn buildGemmaDecodeGraph(config: *const ModelConfig, allocator: std.mem.Allocator, gf: ?*const gguf.GGUFFile) !Graph {
     var g = Graph.init(allocator, "gemma_decode");
     errdefer g.deinit();
@@ -967,7 +967,7 @@ fn buildGemmaDecodeGraph(config: *const ModelConfig, allocator: std.mem.Allocato
 }
 
 /// Gemma MoE decode graph (e.g. Gemma 4 26B-A4B).
-/// Same as Gemma dense but FFN replaced with expert routing + sparse GEGLU experts.
+/// Like Gemma dense but without Q/K per-head norms; FFN replaced with expert routing + sparse GEGLU experts.
 fn buildGemmaMoeDecodeGraph(config: *const ModelConfig, allocator: std.mem.Allocator, gf: ?*const gguf.GGUFFile) !Graph {
     var g = Graph.init(allocator, "gemma_moe_decode");
     errdefer g.deinit();

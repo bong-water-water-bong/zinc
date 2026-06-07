@@ -390,7 +390,7 @@ pub fn writeCachedGpuProfile(
 /// @param entry Catalog entry describing the model to assess.
 /// @param vram_budget_bytes Available VRAM in bytes on the target device.
 /// @param allocator Used for path resolution and manifest I/O; nothing is retained.
-/// @returns `ModelFit` with exact=true when the installed file was inspected, false for catalog estimates.
+/// @returns `ModelFit` with exact=true when data came from the installed model (manifest or file inspection), false for catalog estimates.
 pub fn describeFit(entry: catalog.CatalogEntry, vram_budget_bytes: u64, allocator: std.mem.Allocator) !ModelFit {
     if (isInstalled(entry.id, allocator)) {
         const installed_path = try resolveInstalledModelPath(entry.id, allocator);

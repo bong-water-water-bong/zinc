@@ -15660,7 +15660,7 @@ fn dispatchFusedRopeKvCacheWriteOnCmd(
 /// guarded on f32 KV via `can_fuse_rope_kv_write`) so that Qwen3.6's hot
 /// `kv_cache_q8` decode path can also collapse the (Q-norm, K-norm, Q-rope,
 /// K-rope) sequence into a single grid dispatch. K stays in `k_buf` for the
-/// follow-up `dispatchKvCacheWriteQ8OnCmd` to quantize. Mirrors llama.cpp's
+/// follow-up `dispatchKvCacheWriteOnCmd` to quantize. Mirrors llama.cpp's
 /// `ggml_metal_op_rms_norm` op-fusion (ggml-metal-ops.cpp:3384) extended to
 /// the attention prep path.
 fn dispatchRopeQkNormInplaceOnCmd(
@@ -15851,7 +15851,7 @@ fn addBiasFromTensor(engine: *InferenceEngine, output: [*]f32, tensor: *const me
     for (0..n) |i| output[i] += bias_ptr[i];
 }
 
-/// Add bias from a slice of a per-expert tensor (2D: [n, n_experts], row-major).
+/// Add bias from a slice of a per-expert tensor (2D: [n_experts, n], expert-major).
 fn addBiasFromTensorSlice(engine: *InferenceEngine, output: [*]f32, tensor: *const metal_loader.LoadedTensor, expert_id: u32, n: u32) void {
     const mmap = engine.model.mmap_data orelse return;
     const off: usize = @intCast(engine.model.gguf_file.tensor_data_offset + tensor.info.offset);

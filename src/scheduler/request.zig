@@ -8,7 +8,7 @@ const log = std.log.scoped(.request);
 
 /// Request processing state machine.
 /// Valid transitions: pending → prefilling → decoding → completed,
-/// with cancelled or failed reachable from any active state.
+/// with cancelled reachable from any active state and failed reachable from prefilling or decoding.
 pub const RequestState = enum {
     /// Queued, waiting for a prefill slot.
     pending,

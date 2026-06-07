@@ -225,7 +225,7 @@ pub const NodeAnalysis = struct {
     arithmetic_intensity: f64,
     /// Estimated wall time in microseconds at peak bandwidth.
     estimated_bandwidth_time_us: ?f64,
-    /// Percentage of peak bandwidth utilization at full occupancy.
+    /// Estimated wave occupancy as a percentage of the 4-waves-per-CU target; null when hardware context is absent or domain is not gpu_compute.
     bandwidth_ceiling_pct: ?f64,
     /// Dominant performance bottleneck classification.
     bottleneck: BottleneckKind,

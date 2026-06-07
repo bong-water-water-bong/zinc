@@ -62,7 +62,7 @@ pub const ALLOC_MEM_FLAGS_GTT: u32 = 1 << 1;
 pub const ALLOC_MEM_FLAGS_USERPTR: u32 = 1 << 2;
 /// Allocate a doorbell page so a userspace queue can ring its wptr doorbell.
 pub const ALLOC_MEM_FLAGS_DOORBELL: u32 = 1 << 3;
-/// Request a CPU-coherent BO (snooped on x86); needed by ring/wptr/rptr BOs.
+/// Request a CPU-coherent BO (snooped on x86); not used by the bring-up smoke path.
 pub const ALLOC_MEM_FLAGS_COHERENT: u32 = 1 << 26;
 /// Mark the BO as PCIe-visible / exportable to peer devices.
 pub const ALLOC_MEM_FLAGS_PUBLIC: u32 = 1 << 29;
@@ -347,10 +347,10 @@ pub fn findTopologyNode(render_minor: u32) ?TopologyNode {
 }
 
 /// Cheaply test whether the KFD PM4 path appears usable on this machine without
-/// issuing any ioctls: opens `/dev/kfd` and the default render node, then
-/// verifies that a matching topology node with a non-zero `gpu_id` exists.
-/// @returns `true` when `/dev/kfd`, the default render node, and a valid
-/// topology node are all accessible; `false` otherwise or on non-Linux targets.
+/// issuing any ioctls: opens `/dev/kfd`, then verifies that a matching topology
+/// node with a non-zero `gpu_id` exists in sysfs for the default render minor.
+/// @returns `true` when `/dev/kfd` is accessible and a valid topology node is
+/// found for the default render node; `false` otherwise or on non-Linux targets.
 pub fn reachable() bool {
     if (builtin.os.tag != .linux) return false;
     const kfd = std.fs.openFileAbsolute(kfd_device_node, .{ .mode = .read_write }) catch return false;

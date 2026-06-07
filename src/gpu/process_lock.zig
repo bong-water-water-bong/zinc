@@ -38,10 +38,10 @@ pub const AcquireError = std.fs.File.OpenError || error{
 
 /// Format the lockfile path for a backend/device pair into the caller-supplied buffer.
 ///
-/// @param buffer Destination slice for the formatted path; must be at least 64 bytes.
+/// @param buffer Destination slice for the formatted path; must be large enough to hold the formatted path.
 /// @param backend The GPU backend whose tag name is embedded in the path.
 /// @param device_index Zero-based device index embedded in the path.
-/// @returns A slice into `buffer` holding the null-terminated path string, e.g. `/tmp/zinc-gpu-vulkan-0.lock`.
+/// @returns A slice into `buffer` holding the formatted path string, e.g. `/tmp/zinc-gpu-vulkan-0.lock`.
 /// @note Returns `error.LockPathTooLong` if `buffer` is too small to hold the formatted path.
 pub fn lockPath(buffer: []u8, backend: Backend, device_index: u32) error{LockPathTooLong}![]const u8 {
     return std.fmt.bufPrint(buffer, "/tmp/zinc-gpu-{s}-{d}.lock", .{

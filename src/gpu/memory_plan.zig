@@ -189,7 +189,7 @@ pub const RequestBudget = struct {
 /// Compute the clamped completion budget and resulting context target for one request.
 ///
 /// Combines `clampedCompletionTokens` and `requestContextTarget` into a single
-/// call so callers get both values in one pass without double-computing the clamp.
+/// call so callers get both values in one pass.
 /// @param used_context_tokens        Tokens already committed in the context window.
 /// @param requested_completion_tokens Tokens the caller wants to generate.
 /// @param context_capacity_tokens    Total context capacity.

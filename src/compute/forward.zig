@@ -288,7 +288,7 @@ fn getScaleMinK4(j: usize, scales: []const u8) struct { sc: u8, m: u8 } {
 }
 
 /// Dequantize a single row from a quantized tensor to f32.
-/// Supports F32, F16, Q8_0, Q6_K, Q4_K formats.
+/// Supports F32, F16, Q8_0, Q6_K, Q5_K, Q4_K, Q5_0, and MXFP4 formats.
 fn dequantRow(raw_data: []const u8, row: u32, cols: u32, quant_type: GGMLType, output: []f32) void {
     switch (quant_type) {
         .f32 => {
@@ -1473,7 +1473,7 @@ pub const InferenceEngine = struct {
     batched_scratch_capacity_tokens: u32 = 0,
     modeled_decode_bytes_per_token: u64 = 0,
     // Diagnostic summary stored during BOS processing, printed after generation
-    /// GPU buffer for diag summary buf.
+    /// CPU-side byte buffer holding the diagnostic summary printed after generation.
     diag_summary_buf: [2048]u8 = .{0} ** 2048,
     diag_summary_len: usize = 0,
 
@@ -5109,8 +5109,6 @@ pub const InferenceEngine = struct {
         }
     }
 
-    /// Fused RMS norm + RoPE in-place on a head buffer.
-    /// Eliminates 1 dispatch + 1 barrier vs separate norm then RoPE.
     /// Fused Q+K norm + RoPE + KV cache write. One dispatch absorbs:
     ///   - Q per-head RMS norm + RoPE (in-place on q_buf)
     ///   - K per-head RMS norm + RoPE (writes directly to kv_k_cache slot)
@@ -9819,11 +9817,6 @@ pub const InferenceEngine = struct {
         return self.dispatchDmmvInner(tensor, input_buf, input_size, output_buf, M, K, 0, 0, 0, 0);
     }
 
-    /// Fused residual-add + RMS norm (Vulkan side).
-    /// hidden[i] += scale * residual[i]; norm_out[i] = weights[i] * hidden[i] * rsqrt(...)
-    /// One dispatch per N tokens replaces scale_acc → barrier → rms_norm_mul,
-    /// eliminating one barrier per occurrence in prefillBatched (2 × n_layers
-    /// barriers saved for a 36-layer LLaMA-style network).
     /// Fused rmsnorm(src) + hidden accumulate.
     ///   rms_inv = rsqrt(mean(src^2) + eps)
     ///   hidden[i] += weights[i] * src[i] * rms_inv
@@ -19126,20 +19119,15 @@ pub const InferenceEngine = struct {
         }
     }
 
-    /// Experimental batched prompt prefill for the RDNA/Vulkan backend.
-    /// Gated by `ZINC_BATCHED_PREFILL=1`. This is the Vulkan analogue of
-    /// `forward_metal.InferenceEngine.prefillBatched`.
+    /// Batched prompt prefill for the RDNA/Vulkan backend.
+    /// This is the Vulkan analogue of `forward_metal.InferenceEngine.prefillBatched`.
     ///
-    /// Foundation committed: the `rope_batched` and `flash_attn_batched` SPIR-V
-    /// shaders and their pipeline wrappers (`elementwise.pipeline_rope_batched`,
-    /// `attention.pipeline_batched`, plus matching push structs and dispatchers)
-    /// are loaded at engine init. The orchestration that ties them together with
-    /// `dmmv_q4k_batch` (weight-read-once GEMM) for projections is tracked in
-    /// `loops/efforts/MULTI_HOUR_EFFORT_8_RDNA_BATCHED_PREFILL.md`. Until that orchestration
-    /// lands this entry point transparently delegates to `prefillBatch`, but the
-    /// env gate and the `canUseBatchedPrefillRdna` check are already wired so
-    /// callers can migrate to the new name ahead of time — matching the Metal
-    /// path where `generateWithMetrics` already routes through `prefillBatched`.
+    /// Routes to `prefillA3bProduction` or `prefillQwen36DenseFfnPrefix` when the
+    /// model and prompt length match those specialized paths; otherwise falls back to
+    /// the `canUseBatchedPrefillRdna`-gated batched body or `prefillBatch` (per-token
+    /// serial path). Set `ZINC_BATCHED_PREFILL=0` to force the serial fallback or
+    /// `=validate` to run both paths and diff the last-token logits. Intel Arc devices
+    /// require `ZINC_INTEL_BATCHED_PREFILL=1` to opt in.
     /// @param state Decode state for the current request.
     /// @param prompt_tokens Tokenized prompt sequence to prefill.
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
@@ -20938,7 +20926,7 @@ fn dumpTop5Logits(engine: *const InferenceEngine, step: u32) void {
 /// @param max_tokens Maximum number of decode tokens to emit after prefill.
 /// @param allocator Allocator used for transient decode state and the returned token slice.
 /// @returns A heap-allocated slice containing only the generated continuation tokens.
-/// @note Generation stops early on common EOS token IDs used by the currently supported model families.
+/// @note Generation stops early when the sampled token equals `eos_token_id`.
 pub fn generate(
     engine: *InferenceEngine,
     prompt_tokens: []const u32,

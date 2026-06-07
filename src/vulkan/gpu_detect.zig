@@ -20,7 +20,7 @@ pub const GpuVendor = enum {
     amd_rdna4_apu,
     amd_other,
     nvidia,
-    /// Intel Arc Xe2 (Battlemage, B-series): SIMD16 subgroup.
+    /// Intel Arc Xe2 (Battlemage, B-series): min subgroup 16, default subgroup 32.
     intel_arc_xe2,
     /// Intel Arc Xe-HPG (Alchemist, A-series): SIMD32 subgroup.
     intel_arc,

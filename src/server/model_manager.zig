@@ -16,7 +16,7 @@ const CommandPool = @import("../vulkan/command.zig").CommandPool;
 
 const Instance = instance_mod.Instance;
 
-/// Describes which model to load: a filesystem path and an optional managed-catalog ID.
+/// Describes which model to load: a filesystem path, an optional managed-catalog ID, and an optional context-length override.
 pub const LoadSpec = struct {
     model_path: []const u8,
     managed_id: ?[]const u8 = null,
@@ -190,7 +190,7 @@ pub const ModelManager = struct {
         return if (self.current) |current| current.display_name else "none";
     }
 
-    /// Returns the catalog profile string for the detected GPU (e.g. `"amd_rdna4"`).
+    /// Returns the catalog profile string for the detected GPU (e.g. `"amd-rdna4-32gb"`).
     pub fn catalogProfile(self: *const ModelManager) []const u8 {
         return catalog_mod.profileForGpu(self.gpu_config);
     }
@@ -220,7 +220,7 @@ pub const ModelManager = struct {
         }
     };
 
-    /// Snapshots the VRAM usage of the active model, or returns zeroes if idle.
+    /// Snapshots the VRAM usage of the active model, or returns zeroes with the full VRAM budget in `device_local_budget_bytes` if idle.
     pub fn currentMemoryUsage(self: *ModelManager) MemoryUsage {
         self.state_mutex.lock();
         defer self.state_mutex.unlock();

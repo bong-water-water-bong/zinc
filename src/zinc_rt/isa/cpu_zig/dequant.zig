@@ -19,12 +19,12 @@ fn getScaleMinK4(j: usize, scales: []const u8) struct { sc: u8, m: u8 } {
 
 /// Dequantize one row of a GGML tensor into f32 lanes.
 /// Dispatches on `tensor_type` and writes the first `cols` entries of `output`. Supports the
-/// formats used by ZINC weights today: `.f32`, `.f16`, `.bf16`, `.q8_0`, `.q4_0`, `.q4_k`,
-/// `.q5_k`, `.q6_k`, and `.mxfp4`.
+/// formats used by ZINC weights today: `.f32`, `.f16`, `.bf16`, `.q8_0`, `.q4_0`, `.q5_1`,
+/// `.q4_k`, `.q5_k`, `.q6_k`, and `.mxfp4`.
 /// @param raw_data Raw tensor bytes for the full matrix.
 /// @param row_index Zero-based row to materialize.
 /// @param cols Number of columns per row; quantized formats require this to be a multiple of
-/// their block size (32 for q4_0/q8_0/mxfp4, 256 for q4_k/q5_k/q6_k).
+/// their block size (32 for q4_0/q5_1/q8_0/mxfp4, 256 for q4_k/q5_k/q6_k).
 /// @param tensor_type GGML quantization tag selecting the decode path.
 /// @param output Destination slice; must be at least `cols` long.
 /// @returns `error.OutputTooSmall` when `output.len < cols`, `error.EmptyInput` when `cols == 0`,

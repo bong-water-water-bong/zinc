@@ -245,9 +245,10 @@ pub fn findForLoadedModel(managed_id: ?[]const u8, model_path: []const u8, displ
 }
 
 /// Map a detected Vulkan GPU configuration to its catalog profile string.
-/// RDNA4 is further split by VRAM tier (≥28 GiB → "amd-rdna4-32gb", ≥14 GiB →
-/// "amd-rdna4-16gb", otherwise "amd-rdna4-small"); all other vendors map to a
-/// single string each.
+/// RDNA4 is split by VRAM tier (≥28 GiB → "amd-rdna4-32gb", ≥14 GiB →
+/// "amd-rdna4-16gb", otherwise "amd-rdna4-small"); RDNA3 is split by VRAM
+/// tier (≥14 GiB → "amd-rdna3-16gb", otherwise "amd-rdna3-small"); all
+/// other vendors map to a single string each.
 /// @param config GPU vendor/VRAM description produced by `gpu_detect`.
 /// @returns Catalog profile key that can be matched against `CatalogEntry.tested_profiles`.
 pub fn profileForGpu(config: gpu_detect.GpuConfig) []const u8 {

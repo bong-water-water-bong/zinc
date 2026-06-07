@@ -1,6 +1,6 @@
 //! Pluggable tool-calling format dispatch for chat completions.
 //! @section Tool Calling
-//! ChatMLToolFormat handles Qwen3-family models. NoopToolFormat is the
+//! `chatmlToolFormat()` handles Qwen3-family models. `NoopToolFormat` is the
 //! silent fallback for any other template kind.
 const std = @import("std");
 const TemplateKind = @import("../model/tokenizer.zig").Tokenizer.TemplateKind;

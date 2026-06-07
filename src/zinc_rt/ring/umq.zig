@@ -1,7 +1,7 @@
 //! AMDGPU user-mode queue (T2) availability and create/free smoke gate.
 //! @section Inference Runtime
 //!
-//! M1 uses UMQ for direct submission on Linux kernels that expose the AMDGPU
+//! AMDGPU uses UMQ for direct submission on Linux kernels that expose the AMDGPU
 //! user queue ABI. The preflight is intentionally cheap, while the smoke gate
 //! exercises the actual GEM/VA/USERQ_CREATE/USERQ_FREE path required before
 //! lowering decode packets onto T2.

@@ -457,7 +457,7 @@ pub const Tokenizer = struct {
     }
     /// Encode UTF-8 text into a sequence of token IDs.
     /// Applies the appropriate pretokenizer (Gemma-4 chunk splitter, GPT-2 word
-    /// splitter, or legacy no-split) and then BPE merges via `merge_ranks`.
+    /// splitter, or legacy no-split) and then BPE or SentencePiece merges.
     /// The returned slice is owned by the caller; free it with `freeEncoded`.
     /// @param text UTF-8 input to tokenize; an empty string returns an empty slice.
     /// @returns Heap-allocated token ID sequence, or an error on allocation failure.
@@ -1178,7 +1178,7 @@ pub const Tokenizer = struct {
         return .generic;
     }
 
-    /// Release tokenizer-owned vocabulary tables, merges, and optional score arrays.
+    /// Release all tokenizer-owned resources: vocabulary, reverse-lookup map, merges, merge-rank cache, and optional score arrays.
     pub fn deinit(self: *Tokenizer) void {
         if (self.merge_ranks_ready) {
             var it = self.merge_ranks.iterator();

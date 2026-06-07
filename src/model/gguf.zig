@@ -170,7 +170,7 @@ pub const MetadataValue = union(enum) {
     }
 
     /// Interpret the metadata value as a 32-bit floating-point number when possible.
-    /// @returns An `f32` value or `null` when the stored value is not numeric.
+    /// @returns An `f32` value or `null` when the stored value is not a floating-point type.
     pub fn asF32(self: MetadataValue) ?f32 {
         return switch (self) {
             .float32 => |v| v,
@@ -335,13 +335,13 @@ pub const ParseOptions = struct {
 /// Parse a GGUF file from a byte slice.
 /// @param data Raw GGUF bytes, typically from a memory-mapped file.
 /// @param allocator Allocator used for metadata strings, arrays, and tensor descriptors.
-/// @returns A parsed GGUFFile that borrows from `data` for numeric fields and owns copied strings.
+/// @returns A `GGUFFile` with all data heap-allocated; call `deinit` to free all owned memory.
 pub fn parse(data: []const u8, allocator: std.mem.Allocator) !GGUFFile {
     return parseWithOptions(data, allocator, .{});
 }
 
 /// Parse a GGUF file from a byte slice with optional logging control.
-/// @param data Raw GGUF bytes, typically from a memory-mapped file; must remain valid for the lifetime of the returned `GGUFFile`.
+/// @param data Raw GGUF bytes, typically from a memory-mapped file.
 /// @param allocator Allocator used for metadata keys, string values, array payloads, and tensor name copies.
 /// @param options Flags controlling parse-time side effects such as summary logging.
 /// @returns A `GGUFFile` whose string data is heap-allocated; call `deinit` to free all owned memory.

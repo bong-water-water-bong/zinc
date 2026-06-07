@@ -1060,8 +1060,8 @@ pub const TokenBoundary = struct {
 
     /// Dispatch the gfx1201 top-2 argmax kernel and return the selected token.
     ///
-    /// Loads the argmax program into the compute SGPRs, packs the output VA
-    /// and the two `(score, token)` pairs into `compute_user_data_0..7`, fires
+    /// Loads the argmax program into the compute SGPRs, packs the output VA,
+    /// two ordered scores, and two token ids into `compute_user_data_2..7`, fires
     /// one workgroup, then waits on the signal sentinel before reading the
     /// kernel-chosen token from the output page.
     /// @param token0 First candidate token id.

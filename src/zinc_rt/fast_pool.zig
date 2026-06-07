@@ -30,13 +30,13 @@ const Slot = struct {
     /// Worker's task fn. Set by the dispatcher before bumping `seq`.
     run_fn: std.atomic.Value(?*const fn (*anyopaque) void) align(64),
     /// Opaque context pointer for the worker. Stored atomically with
-    /// release/acquire ordering paired with `run_fn`.
+    /// release ordering; the publish barrier is the subsequent `seq.fetchAdd`.
     ctx: std.atomic.Value(?*anyopaque),
     /// Monotonically incremented by the dispatcher each time this slot
     /// receives new work. The worker observes a change in `seq` to wake.
     seq: std.atomic.Value(u64) align(64),
-    /// Worker writes the seq it just completed. Dispatcher waits for
-    /// `done_seq == seq`.
+    /// Worker writes the seq it just completed. Dispatcher spins until
+    /// `done_seq >= target` (where `target` is the seq value it posted).
     done_seq: std.atomic.Value(u64) align(64),
 };
 

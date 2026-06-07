@@ -79,6 +79,7 @@ pub const Scheduler = struct {
     }
 
     /// Return slot IDs of requests in the prefilling state.
+    /// @param self Scheduler to query.
     /// @returns Empty slice (stub — allocation strategy TBD).
     pub fn pendingPrefill(self: *Scheduler) []u32 {
         // Returns slot IDs of pending requests

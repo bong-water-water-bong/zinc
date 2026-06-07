@@ -16,9 +16,9 @@ pub const Pipeline = struct {
     descriptor_set_layout: vk.c.VkDescriptorSetLayout,
     /// Pipeline layout with push-constant ranges.
     pipeline_layout: vk.c.VkPipelineLayout,
-    /// Vulkan compute pipeline, or null if unavailable.
+    /// Vulkan compute pipeline handle.
     pipeline: vk.c.VkPipeline,
-    /// Whether this pipeline's descriptor set layout is push-descriptor-only.
+    /// Whether push-descriptor recording is enabled for this pipeline's descriptor set layout.
     uses_push_descriptors: bool,
     /// Logical device.
     device: vk.c.VkDevice,

@@ -2,13 +2,13 @@
 
 Hardware specifications, SM microarchitecture, PTX/SASS instruction surface, and compute-architecture reference for LLM inference on NVIDIA consumer GPUs across three generations: Ampere (GeForce RTX 30, `sm_86`), Ada Lovelace (RTX 40, `sm_89`), and Blackwell (RTX 50, `sm_120`), plus the workstation siblings that share the same dies. Consolidated from the NVIDIA Ampere GA102 / Ada / RTX Blackwell architecture whitepapers, the CUDA C++ Programming Guide, the PTX ISA spec, official NVIDIA product pages, and the TechPowerUp GPU database. Framed for ZINC's CUDA backend (`docs/cuda-backend.md`), where **decode is memory-bandwidth-bound matrix-vector (DMMV)** — pick the SKU on VRAM capacity + bandwidth — and **prefill is compute-bound matmul** that lives on the Tensor cores. ZINC's int8 GEMMs are **not** Tensor-core based: they use `__dp4a`, the 1:1 CUDA analog of AMD `v_dot4_i32_i8` (`dotPacked4x8AccSatEXT`), so the matmul port is mechanical.
 
-> Note: Cross-checked on 2026-06-06 against the NVIDIA Ampere GA102 whitepaper (v2.1), Ada GPU Architecture whitepaper (v2.02), RTX Blackwell GPU Architecture whitepaper (v1.1), the CUDA C++ Programming Guide "Technical Specifications per Compute Capability" table, the PTX ISA spec (Release 8.8 / 9.x), official nvidia.com product pages, and the TechPowerUp GPU database. Memory bandwidth equals `bus_bits / 8 × effective_Gbps` and matches the cited per-SKU values. Die-level facts (transistors, die size, process, SM composition, register file, L1/Shared, L2-per-controller) are from the NVIDIA whitepapers. Per-SKU CUDA-core count, boost clock, VRAM, bus width, and TGP are from nvidia.com; SM/Tensor-core count, L2 size, and memory speed are cross-checked against TechPowerUp (whose `/gpu-specs/` pages return HTTP 403 to automated fetchers, so those values are corroborated via search snippets, NVIDIA pages, and arithmetic). Cycle-cost and cache-latency tables are **engineering estimates from third-party microbenchmarks** (Citadel/Jia, "Demystifying Ampere" arXiv 2208.11174, Chips and Cheese RTX 4090) — NVIDIA does not publish per-instruction cycle counts for these consumer parts. SASS mnemonics (HMMA/IMMA/IDP4A) are observed via `cuobjdump`/`nvdisasm`, not documented by NVIDIA. The GA106 transistor count and the RTX 5060 L2 size are genuinely uncertain (see caveats inline).
+> Note: Cross-checked on 2026-06-06 against the NVIDIA Ampere GA102 whitepaper (v2.1), Ada GPU Architecture whitepaper (v2.02), RTX Blackwell GPU Architecture whitepaper (v1.1), the CUDA C++ Programming Guide "Technical Specifications per Compute Capability" table, the PTX ISA spec (Release 8.8 / 9.x), official nvidia.com product pages, and the TechPowerUp GPU database. Memory bandwidth equals `bus_bits / 8 × effective_Gbps` and matches the cited per-SKU values. Register-file capacity equals `SM_count × 256 KB` (the per-SM file is fixed at 256 KB across all three consumer generations). Die-level facts (transistors, die size, process, SM composition, register file, L1/Shared, L2-per-controller) are from the NVIDIA whitepapers. Per-SKU CUDA-core count, boost clock, VRAM, bus width, and TGP are from nvidia.com; SM/Tensor-core count, L2 size, and memory speed are cross-checked against TechPowerUp (whose `/gpu-specs/` pages return HTTP 403 to automated fetchers, so those values are corroborated via search snippets, NVIDIA pages, and arithmetic). Cycle-cost and cache-latency tables are **engineering estimates from third-party microbenchmarks** (Citadel/Jia, "Demystifying Ampere" arXiv 2208.11174 — measured on the **A100** `sm_80` data-center die, reused here as the Ampere reference; consumer GA10x `sm_86` latencies may differ; Chips and Cheese RTX 4090) — NVIDIA does not publish per-instruction cycle counts for these consumer parts. SASS mnemonics (HMMA/IMMA/IDP4A) are observed via `cuobjdump`/`nvdisasm`, not documented by NVIDIA. The RTX PRO 6000 Blackwell boost clock (2617 MHz) is from the NVIDIA RTX PRO 6000 Workstation Edition datasheet. Remaining genuinely-provisional numbers are called out inline and in the caveat list at the end.
 
 ## Hardware Specifications
 
 ### Blackwell — GB20x (RTX 50, `sm_120`)
 
-Full dies (whitepaper Appendices A–C): GB202 = 192 SM / 24576 CUDA / 768 Tensor / 128 MB L2 / 512-bit; GB203 = 84 SM / 10752 CUDA / 64 MB L2 / 256-bit; GB205 = 50 SM / 6400 CUDA / 48 MB L2 / 192-bit; GB206 = 36 SM / 4608 CUDA / 32 MB L2* / 128-bit.
+Full dies (whitepaper Appendices A–C): GB202 = 192 SM / 24576 CUDA / 768 Tensor / 128 MB L2 / 512-bit; GB203 = 84 SM / 10752 CUDA / 64 MB L2 / 256-bit; GB205 = 50 SM / 6400 CUDA / 48 MB L2 / 192-bit; GB206 = 36 SM / 4608 CUDA / 32 MB L2 / 128-bit.
 
 | | RTX 5090 | RTX 5080 | RTX 5070 Ti | RTX 5070 | RTX 5060 Ti | RTX 5060 |
 |---|---|---|---|---|---|---|
@@ -21,15 +21,15 @@ Full dies (whitepaper Appendices A–C): GB202 = 192 SM / 24576 CUDA / 768 Tenso
 | **Memory bus** | 512-bit | 256-bit | 256-bit | 192-bit | 128-bit | 128-bit |
 | **Memory speed** | 28 Gbps | 30 Gbps | 28 Gbps | 28 Gbps | 28 Gbps | 28 Gbps |
 | **Memory bandwidth** | 1792 GB/s | 960 GB/s | 896 GB/s | 672 GB/s | 448 GB/s | 448 GB/s |
-| **L2 cache** | 96 MB | 64 MB | 48 MB | 48 MB | 32 MB* | 32 MB* |
+| **L2 cache** | 96 MB | 64 MB | 48 MB | 48 MB | 32 MB | 24 MB |
 | **Boost clock** | 2407 MHz | 2617 MHz | 2452 MHz | 2512 MHz | 2572 MHz | 2497 MHz |
 | **TGP** | 575 W | 360 W | 300 W | 250 W | 180 W | 145 W |
 | **PCIe** | Gen 5 | Gen 5 | Gen 5 | Gen 5 | Gen 5 | Gen 5 |
-| **Transistors** | 92.2 B | 45.6 B | 45.6 B | 31.1 B | 21.9 B* | 21.9 B* |
-| **Die size** | 750 mm² | 378 mm² | 378 mm² | 263 mm² | 181 mm²* | 181 mm²* |
-| **Process** | TSMC 4N | TSMC 4N | TSMC 4N | TSMC 4N | TSMC 4N* | TSMC 4N* |
+| **Transistors** | 92.2 B | 45.6 B | 45.6 B | 31.1 B | 21.9 B | 21.9 B |
+| **Die size** | 750 mm² | 378 mm² | 378 mm² | 263 mm² | 181 mm² | 181 mm² |
+| **Process** | TSMC 4N | TSMC 4N | TSMC 4N | TSMC 4N | TSMC 4N | TSMC 4N |
 
-The RTX 5090 is a cut GB202 (170 of 192 SMs, 96 MB of the die's full 128 MB L2). The RTX 5080 is the full GB203. `*` = GB206 die-level figures and the RTX 5060 L2 are from TechPowerUp/Notebookcheck (the 5060/5060 Ti launched after the whitepaper); the 5060's L2 may be a cut 25 MB rather than the full 32 MB. The 5060 Ti ships in 16 GB and 8 GB variants — same GPU, same 448 GB/s. Process for every consumer Blackwell die is **TSMC 4N**, not the data-center "4NP".
+The RTX 5090 is a cut GB202 (170 of 192 SMs, 96 MB of the die's full 128 MB L2). The RTX 5080 is the full GB203. The RTX 5060 is a cut GB206: 30 of 36 SMs and **24 MB L2** — a 25% trim of the full die's 32 MB (the 5060 Ti keeps all 32 MB). The 5060 Ti ships in 16 GB and 8 GB variants — same GPU, same 448 GB/s. Process for every consumer Blackwell die is **TSMC 4N** (a 5 nm-class node, the same one Ada used), not the data-center "4NP". The boost clocks are correct as shown: the **5090's 2407 MHz is genuinely below the 5080's 2617 MHz** — the 575 W 512-bit flagship clocks lower than the 360 W 256-bit part by design, not a transcription error.
 
 ### Ada Lovelace — AD10x (RTX 40, `sm_89`)
 
@@ -53,7 +53,7 @@ The RTX 4090 ships a cut AD102-300 with **72 MB L2** enabled out of the full die
 
 ### Ampere — GA10x (RTX 30, `sm_86`)
 
-GA102 (Samsung 8N, 28.3 B, 628.4 mm²) full die: 84 SM / 10752 CUDA / 336 Tensor / 6 MB L2 / 384-bit. GA104 (17.4 B, 392.5 mm²) full die: 48 SM / 6144 / 4 MB / 256-bit. GA106 (276 mm²) full die: 30 SM / 3840 / 192-bit.
+GA102 (Samsung 8N, 28.3 B, 628.4 mm²) full die: 84 SM / 10752 CUDA / 336 Tensor / 6 MB L2 / 384-bit. GA104 (17.4 B, 392.5 mm²) full die: 48 SM / 6144 / 4 MB / 256-bit. GA106 (~12 B, 276 mm²) full die: 30 SM / 3840 / 192-bit.
 
 | | RTX 3090 Ti | RTX 3090 | RTX 3080 Ti | RTX 3080 12G | RTX 3080 10G | RTX 3070 Ti | RTX 3070 | RTX 3060 Ti | RTX 3060 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -71,9 +71,9 @@ GA102 (Samsung 8N, 28.3 B, 628.4 mm²) full die: 84 SM / 10752 CUDA / 336 Tensor
 
 **Ampere L2 is small** — 6 MB on a full 384-bit GA102 (512 KB × twelve 32-bit controllers), trimmed to 5 MB (320-bit RTX 3080 10G) and 3 MB (192-bit GA106) where narrower buses disable memory controllers and their attached L2 slices. A 12 MB figure in some secondary tables is the Ada AD102, not Ampere. The 3060 Ti ships GDDR6 (448 GB/s) and GDDR6X (608 GB/s) variants; both rows are shown. PCIe Gen 4. The GA100 datacenter part (A100) is `sm_80`, a different die, not covered here.
 
-### Workstation siblings (same dies, 2× VRAM, ECC)
+### Workstation siblings (same dies, 2–3× VRAM, ECC)
 
-Pro SKUs binned to the full (or near-full) die — the opposite of the cut-down consumer flagships. Relevant because the 2× VRAM lets one card hold a model that needs two consumer cards, and the compute capability matches the consumer twin exactly (dev-on-consumer, deploy-on-pro).
+Pro SKUs binned to the full (or near-full) die — the opposite of the cut-down consumer flagships. Relevant because the extra VRAM lets one card hold a model that needs two consumer cards, and the compute capability matches the consumer twin exactly (dev-on-consumer, deploy-on-pro). The VRAM multiplier vs the consumer twin is **exactly 2× for the Ampere/Ada pros** (A6000 48 GB vs 3090 Ti 24 GB; RTX 6000 Ada 48 GB vs 4090 24 GB) but **3× for the Blackwell pro** (RTX PRO 6000 96 GB vs RTX 5090 32 GB) — the 5090 already carries 32 GB, so the pro card jumps to 96 GB rather than 64.
 
 | | RTX A6000 | RTX 6000 Ada | RTX PRO 6000 Blackwell |
 |---|---|---|---|
@@ -83,6 +83,7 @@ Pro SKUs binned to the full (or near-full) die — the opposite of the cut-down 
 | **CUDA cores** | 10752 | 18176 | 24064 |
 | **Tensor cores** | 336 (3rd) | 568 (4th) | 752 (5th) |
 | **VRAM (ECC)** | 48 GB GDDR6 | 48 GB GDDR6 | 96 GB GDDR7 |
+| **VRAM vs consumer twin** | 2× (24 → 48) | 2× (24 → 48) | 3× (32 → 96) |
 | **Memory bus** | 384-bit | 384-bit | 512-bit |
 | **Memory bandwidth** | 768 GB/s | 960 GB/s | 1792 GB/s |
 | **L2 cache** | 6 MB | 96 MB | 128 MB |
@@ -91,7 +92,7 @@ Pro SKUs binned to the full (or near-full) die — the opposite of the cut-down 
 | **PCIe / NVLink** | Gen 4 / 2-way | Gen 4 / no | Gen 5 / no |
 | **Compute capability** | `sm_86` | `sm_89` | `sm_120` |
 
-The RTX PRO 6000 row is the 600 W Workstation Edition; Max-Q/Server variants share the die and memory but clock lower (~300 W). RTX 6000 Ada memory clock (20 Gbps) is derived from 960 GB/s over 384-bit. ECC is on by default on all three and costs a small bandwidth slice.
+The RTX PRO 6000 row is the 600 W Workstation Edition (boost 2617 MHz, base 1590 MHz, per the NVIDIA Workstation Edition datasheet); the Max-Q and Server variants share the die and 96 GB but clock lower (~300 W). RTX 6000 Ada memory clock (20 Gbps) is derived from 960 GB/s over 384-bit. ECC is on by default on all three workstation cards; the bandwidth cost is the standard inline-ECC overhead (see "GDDR ECC" under Driver / Toolchain).
 
 ## SM (Streaming Multiprocessor) Architecture
 
@@ -131,19 +132,19 @@ The SM is NVIDIA's analog of an AMD Compute Unit. At the top level it is structu
 
 Each SM is split into **four processing blocks (sub-partitions)**, each holding: a **64 KB register file** (16,384 × 32-bit), **one warp scheduler + one dispatch unit**, an L0 instruction cache, **one Tensor core**, 4 load/store units, 1 SFU, and 32 FP32-capable CUDA lanes. Of those 32 lanes per partition, 16 are FP32-only and 16 are FP32-or-INT32, so a partition issues 32 FP32/clk; the four partitions together do **128 FP32 ops/clk**, or 64 FP32 + 64 INT32/clk. This dual-FP32 datapath is the Ampere change vs Turing (which had one FP32-only + one INT32-only path), doubling FP32 rate; Ada and Blackwell consumer parts keep the same split-issue model (the whitepaper notes "many common INT operations run at up to 2× throughput, but not all"). There is no fully-unified 128-wide INT path on consumer Blackwell — INT-heavy index/dequant math (quantized-weight unpacking) still competes with half the FP32 issue.
 
-Representative SKUs and the resulting full-die memory subsystems (whitepaper spec tables):
+Representative SKUs and the resulting memory subsystems (whitepaper spec tables). Note the SM/CUDA/L2/register-file rows below are the **shipping** values for the named card, not the full die:
 
 | | RTX 3090 (GA102) | RTX 4090 (AD102) | RTX 5090 (GB202) |
 |---|---|---|---|
-| SMs | 82 | 128 | 170 |
+| SMs (shipping) | 82 | 128 | 170 |
 | CUDA cores | 10,496 | 16,384 | 21,760 |
 | Tensor cores | 328 (3rd) | 512 (4th) | 680 (5th) |
 | Peak FP32 (non-Tensor) | ~35.6 TFLOPS | 82.6 TFLOPS | 104.8 TFLOPS |
 | L2 (shipping / full die) | 6 / 6 MB | 72 / 96 MB | 96 / 128 MB |
-| Register file (full die) | 21 MB | 36 MB | 48 MB |
+| Register file (shipping / full die) | 20.5 / 21 MB | 32 / 36 MB | 42.5 / 48 MB |
 | Boost clock | 1695 MHz | 2520 MHz | 2407 MHz |
 
-CUDA cores = SMs × 128; Tensor cores = SMs × 4. Peak non-Tensor FP32 = 2 × CUDA_cores × boost_clock (the 2× FP32/clk from the dual datapath).
+CUDA cores = SMs × 128; Tensor cores = SMs × 4. Peak non-Tensor FP32 = 2 × CUDA_cores × boost_clock (the 2× FP32/clk from the dual datapath). **Register file = SM_count × 256 KB** — so the shipping cards carry 82×256 KB = 20.5 MiB (3090), 128×256 KB = 32 MiB (4090), 170×256 KB = 42.5 MiB (5090), while the full dies (84/144/192 SM) carry 21 / 36 / 48 MiB. The shipping figures are the ones a kernel actually allocates against for occupancy; the full-die figures only apply to the un-cut SKU (3090 Ti / RTX 6000 Ada is 142-SM / RTX PRO 6000 is 188-SM, none of which is the consumer flagship).
 
 **L2 / memory:** 512 KB L2 per 32-bit memory controller → 6 MB on full GA102, 96 MB on full AD102, 128 MB on full GB202. **L2, not L1, is the inference lever across these generations:** Ada's L2 jumped 16× over Ampere (6 → 96 MB) and Blackwell carries 128 MB, while per-SM L1/shared is flat at 128 KB. A large L2 amplifies effective bandwidth for the KV cache and repeatedly-touched activations — NVIDIA's analog of AMD Infinity Cache, except it sits at the L2 level rather than as a separate victim cache.
 
@@ -177,7 +178,7 @@ The execution unit is the **warp = 32 threads** (fixed across all NVIDIA GPUs; t
 
 > Note: consumer Blackwell (`sm_120`) matches Ada (`sm_89`) at **48 warps / 1536 threads / SM** — it does *not* inherit the data-center 64-warp/2048-thread limits of A100 (`sm_80`) or Hopper (`sm_90`). The block limit rises to 24 on `sm_120`.
 
-**Occupancy vs registers/thread.** Registers are statically allocated per warp at 256-register granularity (8 regs/thread × 32 lanes), so high register pressure caps resident warps abruptly. On consumer Ampere/Ada/Blackwell the warp cap is 48, so register pressure only bites above ~32 regs/thread; below that the warp/block limit dominates.
+**Occupancy vs registers/thread.** Registers are statically allocated per warp at 256-register granularity (8 regs/thread × 32 lanes) out of the SM's whole **65,536-register file** (256 KB), so high register pressure caps resident warps abruptly. On consumer Ampere/Ada/Blackwell the warp cap is 48, so register pressure only bites above ~32 regs/thread; below that the warp/block limit dominates.
 
 | Registers / thread | Warps/SM (cap 48: 8.6/8.9/12.0) | Warps/SM (cap 64: A100/H100) |
 |---|---|---|
@@ -190,7 +191,7 @@ The execution unit is the **warp = 32 threads** (fixed across all NVIDIA GPUs; t
 | 168 | 12 | 12 |
 | 255 | 8 | 8 |
 
-Shared memory caps occupancy independently: a block using the 100 KB consumer maximum leaves room for ~1 block/SM out of the 128 KB L1+shared pool. **For decode (DMMV)** the limiter is VRAM bandwidth, not occupancy — keep ≤32 regs/thread and modest shared use so dozens of warps each stream a different weight row and hide GDDR latency. **For prefill** feed full tiles to the 4 Tensor cores/SM.
+Both columns derive from the same 65,536-register file at 256-reg/warp granularity: `warps = floor(65536 / round_up(regs × 32, 256))`, then clamped to the architecture's warp cap (48 or 64). The cap-48 column is the consumer-GPU column to read; the rows at and below 48 regs/thread are identical between the two caps because the register file, not the warp cap, is the binding limit there. Shared memory caps occupancy independently: a block using the 100 KB consumer maximum leaves room for ~1 block/SM out of the 128 KB L1+shared pool. **For decode (DMMV)** the limiter is VRAM bandwidth, not occupancy — keep ≤32 regs/thread and modest shared use so dozens of warps each stream a different weight row and hide GDDR latency. **For prefill** feed full tiles to the 4 Tensor cores/SM.
 
 ## Memory Hierarchy
 
@@ -208,20 +209,28 @@ GPU → GDDR6 / GDDR6X / GDDR7 VRAM (360 GB/s – 1792 GB/s)
 Host ↔ GPU → PCIe 4.0 / 5.0 x16 (model load, KV/weight offload)
 ```
 
-**Cache / latency per generation** (microbenchmark estimates; cycle ↔ ns depends on clock):
+**Cache capacity / latency per generation** (microbenchmark estimates; cycle ↔ ns depends on clock). The "Capacity" column is the size of the level, not a bandwidth — per-level bandwidth is in the separate list below:
 
-| Access | Ampere (A100, measured) | Ada (RTX 4090, measured) | Bandwidth | Cache line |
+| Access | Ampere (A100, measured) | Ada (RTX 4090, measured) | Capacity | Cache line |
 |---|---|---|---|---|
-| Register | 0 | 0 | — | — |
-| Shared (no conflict) | ~23 cyc | ~30 cyc | 32 lanes/clk | — |
-| L1 hit | ~33 cyc | ~32 cyc | 128 KB/SM | 128 B (4 × 32 B sectors) |
-| L2 hit | ~200 cyc | ~285 cyc | multi-TB/s | 128 B (4 × 32 B sectors) |
-| Global / DRAM (miss) | ~290 cyc | ~571 cyc | 936 / 1008 / 1792 GB/s | 32 B sector |
-| PCIe 4.0 / 5.0 x16 | ~µs | ~µs | 32 / 64 GB/s per dir | — |
+| Register | 0 | 0 | 256 KB/SM | — |
+| Shared (no conflict) | ~23 cyc | ~30 cyc | ≤100 KB/SM | — |
+| L1 hit | ~33 cyc | ~32 cyc | ≤128 KB/SM | 128 B (4 × 32 B sectors) |
+| L2 hit | ~200 cyc | ~285 cyc | 6 / 72–96 / 96–128 MB | 128 B (4 × 32 B sectors) |
+| Global / DRAM (miss) | ~290 cyc | ~571 cyc | 8–32 GB | 32 B sector |
+| PCIe 4.0 / 5.0 x16 | ~µs | ~µs | host RAM | — |
 
-Rule of thumb across architectures: **shared ~20–30 cyc, L2 ~200–285 cyc, global ~290–570 cyc.** Ada/Blackwell DRAM latency lands at the high cycle count because the higher boost clock makes the fixed DRAM round-trip cost more cycles, even though absolute ns latency is similar to Ampere. The Ampere figures are from "Demystifying the Nvidia Ampere Architecture" (arXiv 2208.11174); the Ada figures from Chips and Cheese's RTX 4090 microbenchmark.
+> The Ampere latency column is from "Demystifying the Nvidia Ampere Architecture" (arXiv 2208.11174), measured on an **A100 (`sm_80`, data-center die)** — not a consumer GA10x (`sm_86`) part. It is reused here as the Ampere reference; consumer GA10x latencies may differ (the consumer L2 is far smaller, 6 MB vs 40 MB). The Ada column is from Chips and Cheese's RTX 4090 microbenchmark.
 
-**GDDR6X vs GDDR7.** GDDR6X (Ampere/Ada) uses **PAM4** signaling, 19–22.4 Gbps/pin (NVIDIA shipped 19 Gbps on the RTX 3090, up to 22.4 Gbps on the RTX 4080). GDDR7 (Blackwell) uses **PAM3**, 28 Gbps/pin on the RTX 50 series with a standard roadmap to 32–48 Gbps. The 5090's 512-bit × 28 Gbps GDDR7 is the single biggest decode lever in the lineup: 1792 GB/s, +78% over the 4090's 1008 GB/s. GDDR7 adds on-die error detection/replay; software ECC on consumer boards costs bandwidth — leave it off for inference unless correctness demands it.
+**Key bandwidths for inference** (order-of-magnitude; the per-level on-chip rates are estimates, the VRAM/PCIe rates are spec):
+
+- **Shared memory:** 32 banks × 4 B = **128 B/clk/SM** at full speed (one 32-lane access with no bank conflict). At ~2.5 GHz that is ~320 GB/s per SM, aggregating to tens of TB/s across all SMs — the reason tiled prefill stages operands in shared.
+- **L1 data cache:** ~**128 B/clk/SM** read on a hit (one 128 B line/clk), same order as shared since they are the same physical SRAM.
+- **L2:** aggregate **multi-TB/s** — order-of-magnitude `L2_bytes_per_clk × boost_clock`. Ada/Blackwell roughly doubled L2 bandwidth-per-slice vs Ampere alongside the 16× capacity jump; the exact bytes/clk is not published, so treat this as "much higher than VRAM, lower than shared/L1 aggregate."
+- **VRAM:** **360 GB/s (3060) – 1792 GB/s (5090)** theoretical (`bus_bits/8 × Gbps`); large DMMV typically sustains ~60–85% of spec after overhead and KV-cache reads.
+- **PCIe 4.0 x16:** ~**32 GB/s per direction** (64 GB/s bidir); **PCIe 5.0 x16:** ~**64 GB/s per direction** (128 GB/s bidir) — model load and CPU/GPU offload only.
+
+**GDDR6X vs GDDR7.** GDDR6X (Ampere/Ada) uses **PAM4** signaling, 19–22.4 Gbps/pin (NVIDIA shipped 19 Gbps on the RTX 3090, up to 22.4 Gbps on the RTX 4080). GDDR7 (Blackwell) uses **PAM3**, 28 Gbps/pin on the RTX 50 series with a standard roadmap to 32–48 Gbps. The 5090's 512-bit × 28 Gbps GDDR7 is the single biggest decode lever in the lineup: 1792 GB/s, +78% over the 4090's 1008 GB/s. GDDR7 adds on-die error detection/replay; software ECC on consumer boards costs bandwidth — leave it off for inference unless correctness demands it (see "GDDR ECC" under Driver / Toolchain).
 
 **Cache line & sectoring.** L1 and L2 use a **128-byte line split into 4 × 32-byte sectors**, each filled independently from DRAM. On compute capability 6.0+ the global-load access/transaction unit is **32 bytes** whether or not the load is L1-cached (Best Practices Guide; the 128 B-line/sector detail is from Nsight Compute docs).
 
@@ -253,7 +262,7 @@ VRAM is the model-size gate. Use `./zig-out/bin/zinc --check --model-id <id>` fo
 | 8 GB | 5060, 5060 Ti-8G, 4060, 3070 | 7B–8B at 4-bit, short/moderate context |
 | 10–12 GB | 5070, 4070-family, 3080, 3060 | 8B comfortably; 13B only with tight buffers/context |
 | 16 GB | 5080, 5070 Ti, 4080/Super, 5060 Ti-16G | 13B–14B at 4-bit with usable context |
-| 24 GB | 5090?, 4090, 3090/Ti | 30B at 4–8-bit, or 70B at 3-bit with care |
+| 24 GB | 4090, 3090/Ti | 30B at 4–8-bit, or 70B at 3-bit with care |
 | 32 GB | 5090 | 70B at 3–4-bit, or 30B at 8-bit with long context |
 | 48–96 GB | RTX A6000 / 6000 Ada / PRO 6000 | 70B at Q4 (one card); 96 GB → Q8 or ~120B MoE |
 
@@ -261,7 +270,7 @@ KV cache can dominate long-context serving; a backend-independent estimate is `k
 
 ## Tensor Cores
 
-A Tensor core performs a warp-cooperative matrix multiply-accumulate `D = A·B + C`. Each SM has 4 (one per partition) across all three generations; peak-throughput growth comes from clocks plus narrower datatypes (FP8 on Ada, FP4 on Blackwell), not more cores per SM. NVIDIA's published per-core rate: Ampere GA10x = **128 dense / 256 sparse** FP16 FMA ops/clk/core (512/1024 per SM), vs Turing's 64/core; Ada and Blackwell keep 128 dense FP16 FMA/clk/core.
+A Tensor core performs a warp-cooperative matrix multiply-accumulate `D = A·B + C`. Each SM has 4 (one per partition) across all three generations; peak-throughput growth comes from clocks plus narrower datatypes (FP8 on Ada, FP4 on Blackwell), not more cores per SM. NVIDIA's published per-core rate: Ampere GA10x = **128 dense / 256 sparse** FP16 FMA ops/clk/core (512/1024 per SM), vs Turing's 64/core; Ada and Blackwell keep 128 dense FP16 FMA/clk/core. That 128-FMA/clk/core dense rate is what makes the peak-TFLOPS table below consistent: e.g. 5090 = 680 cores × 128 × 2 (FMA = 2 FLOP) × 2.407 GHz ≈ 419 dense FP16-acc TFLOPS.
 
 ### Supported types per generation (`out` = accumulator; sparse = 2:4 structured, 2× rate)
 
@@ -277,7 +286,7 @@ A Tensor core performs a warp-cooperative matrix multiply-accumulate `D = A·B +
 | FP6 e3m2 / e2m3 | FP32 | No | No | Yes (block-scaled) | `sm_120a` |
 | FP4 e2m1 | FP32 | No | No | Yes (block-scaled, NVFP4) | `sm_120a` |
 
-Key boundaries for inference: **FP8 starts at Ada (`sm_89`)** — Ampere (`sm_86`) cannot run FP8 `mma`, which is why Ada is the entry point for FP8-quantized LLM inference. **Blackwell consumer drops the INT4 and binary Tensor paths** — the RTX 5090 spec table has no INT4 TOPS row; low-bit on Blackwell is FP4 (NVFP4), not INT4. **FP4/FP6 are block-scaled (microscaling)** — the 5th-gen core handles NVFP4 element grouping, per-block scaling, and the 4-bit matmul in hardware via `.kind::mxf4nvf4` / `.block_scale` PTX qualifiers. Per NVIDIA's framing, FP4 doubles dense Tensor throughput vs **FP8** (whitepaper Fig. 8) and halves memory vs **FP16**; FP6 element grouping is supported but the consumer SKU publishes only FP4/FP8 TFLOPS. None of the consumer dies has meaningful FP64 Tensor throughput (Ampere GA10x has none; Ada/Blackwell carry a minimal number purely for FP64 program correctness).
+Key boundaries for inference: **FP8 starts at Ada (`sm_89`)** — Ampere (`sm_86`) cannot run FP8 `mma`, which is why Ada is the entry point for FP8-quantized LLM inference. **Blackwell consumer drops the INT4 and binary Tensor paths** — the RTX 5090 spec table has no INT4 TOPS row; low-bit on Blackwell is FP4 (NVFP4), not INT4. **FP4/FP6 are block-scaled (microscaling)** — the 5th-gen core handles NVFP4 element grouping, per-block scaling, and the 4-bit matmul in hardware via `.kind::mxf4nvf4` / `.block_scale` PTX qualifiers. Per NVIDIA's framing, FP4 doubles dense Tensor throughput vs **FP8** (whitepaper Fig. 8) and halves memory vs **FP16**; FP6 element grouping is supported but the consumer SKU publishes only FP4/FP8 TFLOPS (FP6 runs at roughly the FP8 rate). None of the consumer dies has meaningful FP64 Tensor throughput (Ampere GA10x has none; Ada/Blackwell carry a minimal number purely for FP64 program correctness).
 
 Data-format bit layouts (PTX ISA), the storage formats the dequant path targets:
 
@@ -301,11 +310,12 @@ Data-format bit layouts (PTX ISA), the storage formats the dequant path targets:
 | BF16 (FP32 acc) TFLOPS | 71 / 142 | 165.2 / 330.4 | 209.5 / 419 |
 | TF32 TFLOPS | 35.6 / 71 | 82.6 / 165.2 | 104.8 / 209.5 |
 | FP8 (FP16 acc) TFLOPS | — | 660.6 / 1321.2 | 838 / 1676 |
+| FP6 (FP32 acc) TFLOPS | — | — | — (no published consumer TFLOPS; rate ≈ FP8) |
 | FP4 (FP32 acc) TFLOPS | — | — | 1676 / 3352 |
 | INT8 TOPS | 284 / 568 | 660.6 / 1321.2 | 838 / 1676 |
 | INT4 TOPS | 568 / 1136 | 1321.2 / 2642.4 | — (no Tensor path) |
 
-The RTX 5090's headline "3,352 AI TOPS" is exactly the FP4 sparse figure. Each narrower datatype roughly doubles throughput (FP16 → FP8 → FP4), and 2:4 sparsity adds another 2× on top.
+Internal consistency of this table: FP16/FP16-acc = 2× FP16/FP32-acc; INT8 = FP8; INT4 = 2× INT8; FP4 = 2× FP8; sparse = 2× dense throughout. The RTX 5090's headline "3,352 AI TOPS" is exactly the FP4 sparse figure. Each narrower datatype roughly doubles throughput (FP16 → FP8 → FP4), and 2:4 sparsity adds another 2× on top. FP6 has no published consumer TFLOPS row — NVIDIA does not quote one for the 5090 — but it runs at approximately the FP8 rate (838 dense / 1676 sparse); the row is shown with a dash so the table stays exhaustive across every type in the support matrix above.
 
 ### mma.sync PTX tile shapes (warp-level `mma.sync.aligned.mMnNkK...`)
 
@@ -403,7 +413,7 @@ The int8 GEMM core is a literal one-to-one swap; the rest of the port is variati
 
 ## Cycle Costs
 
-> NVIDIA does not publish per-instruction cycle counts or cache latencies for these consumer parts. The numbers below are **order-of-magnitude engineering estimates** from community microbenchmarks and the whitepapers' issue-rate descriptions — use them to reason about bottlenecks, not for cycle-accurate modeling. Verify on-device with Nsight Compute.
+> NVIDIA does not publish per-instruction cycle counts or cache latencies for these consumer parts. The numbers below are **order-of-magnitude engineering estimates** from community microbenchmarks and the whitepapers' issue-rate descriptions — use them to reason about bottlenecks, not for cycle-accurate modeling. Verify on-device with Nsight Compute (`ncu`); see the Driver / Toolchain section for the exact commands.
 
 ### Instruction throughput (per SM, per clock)
 
@@ -420,11 +430,11 @@ The int8 GEMM core is a literal one-to-one swap; the rest of the port is variati
 | `__reduce_*_sync` | 1 warp-reduce / few clk | — | HW reduce, `sm_80+` |
 | Tensor `mma` FP16→FP32 m16n8k16 | (matrix op) | ~33 | Prefill GEMM only; not used by ZINC's `__dp4a` path |
 
-> FP32 FFMA latency is ~4 cyc on consumer Ampere/Ada microbenchmarks; the A100 paper measured ~2 cyc on the GA100 datapath, so latency is datapath-dependent (treat as ~2–4). SFU and shared latencies are approximate.
+> FP32 FFMA latency is ~4 cyc on consumer Ampere/Ada microbenchmarks; the A100 paper measured ~2 cyc on the GA100 datapath, so latency is datapath-dependent (treat as ~2–4, an estimate not a spec). SFU and shared latencies are approximate.
 
 ### Memory latency (microbenchmark, see Memory Hierarchy table)
 
-`shared ~20–30 cyc · L1 ~32 cyc · L2 ~200–285 cyc · global ~290–570 cyc · PCIe ~µs.` Consumer Ada/Blackwell DRAM lands at the high cycle end because of the higher boost clock; absolute ns latency is closer to Ampere than the cycle counts imply.
+`shared ~20–30 cyc · L1 ~32 cyc · L2 ~200–285 cyc · global ~290–570 cyc · PCIe ~µs.` Consumer Ada/Blackwell DRAM lands at the high cycle end because of the higher boost clock; absolute ns latency is closer to Ampere than the cycle counts imply. The Ampere column is an A100 (`sm_80`) measurement reused as the Ampere reference — consumer GA10x (`sm_86`) may differ.
 
 ### Sync / launch costs
 
@@ -526,7 +536,45 @@ For ZINC's two deployment cards: the **RTX 4090 (`sm_89`)** has FP8 Tensor and `
 
 ## Driver / Toolchain Config for Inference
 
-**Build targets.** `nvcc -arch=sm_86` (Ampere) / `sm_89` (Ada) / `sm_120` (Blackwell), or `-gencode arch=compute_XX,code=sm_XX`. A cubin built for one arch does not run on another; `sm_120` cubins are not compatible with data-center Blackwell `sm_100` or `sm_121`. FP8 (`__nv_fp8_*`) needs CUDA 12.x+; FP4/NVFP4 needs the `sm_120a` PTX target and CUTLASS 4.2+. NVRTC compiles per the running GPU's arch on load, so ZINC's `.cu` kernels handle `sm_120`/`sm_89` transparently without a per-arch build matrix.
+### Build targets
+
+`nvcc -arch=sm_86` (Ampere) / `sm_89` (Ada) / `sm_120` (Blackwell), or `-gencode arch=compute_XX,code=sm_XX`. A cubin built for one arch does not run on another; `sm_120` cubins are not compatible with data-center Blackwell `sm_100` or `sm_121`. FP8 (`__nv_fp8_*`) needs CUDA 12.x+; FP4/NVFP4 needs the `sm_120a` PTX target and CUTLASS 4.2+. NVRTC compiles per the running GPU's arch on load, so ZINC's `.cu` kernels handle `sm_120`/`sm_89` transparently without a per-arch build matrix.
+
+### Inspecting register pressure, occupancy, and spills
+
+This is the direct NVIDIA analog of AMD's `RADV_DEBUG=shaderstats` (VGPR count / occupancy / spill dump). Three tools, increasing fidelity:
+
+**1. `ptxas -v` (compile-time, the fastest loop).** Pass `-Xptxas -v` to `nvcc` (or `--ptxas-options=-v`); NVRTC takes the same option via `nvrtcCompileProgram` flags. Per kernel, per target arch it prints registers, spills, stack frame, and constant-memory use:
+
+```bash
+nvcc -arch=sm_89 -Xptxas -v -cubin kernels.cu
+# ptxas info : Compiling entry function 'dmmv_q4k' for 'sm_89'
+# ptxas info : Function properties for dmmv_q4k
+#     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+# ptxas info : Used 38 registers, 96 bytes cmem[0]
+```
+
+Read it like `RADV_DEBUG=shaderstats`: **"Used N registers"** is registers/thread (cross-reference the occupancy table — 38 here caps at 42 warps on `sm_89`); **any non-zero "spill stores/loads"** means the kernel overflowed the register file to local memory (an L1/L2/DRAM round-trip per spill — the thing to eliminate on a hot decode kernel). Note the PTX register count bears little relation to the final SASS count, so always read the `ptxas` (SASS-stage) number, not the PTX.
+
+**2. `cuobjdump --dump-resource-usage` (`-res-usage`, post-link).** Reads registers + shared-memory use back out of an already-built cubin or executable — useful when ZINC ships a cubin and you want to confirm what actually got linked:
+
+```bash
+cuobjdump -res-usage ./zig-out/bin/zinc        # per-kernel REG:/SHARED: per arch
+cuobjdump -sass ./zig-out/bin/zinc | grep IDP4A # confirm __dp4a lowered to the int-dot SASS
+```
+
+**3. Nsight Compute (`ncu`, on-device, ground truth).** The only tool that reports **achieved** (not theoretical) occupancy and measured spill traffic on the real GPU — this is what "verify on-device with Nsight Compute" throughout this doc means:
+
+```bash
+ncu --set full -k dmmv_q4k ./zig-out/bin/zinc --model-id <id>     # full report, one kernel
+ncu --section Occupancy --section LaunchStats ./zig-out/bin/zinc   # registers/thread + occupancy only
+# Achieved Occupancy, Registers Per Thread, and the spill metric
+# l1tex__data_pipe_lsu_wavefronts_mem_lg_cmd_read (local-memory reads = spill loads)
+```
+
+For a decode (DMMV) kernel the target is high achieved occupancy at ≤32 regs/thread with zero spills; for a prefill Tensor GEMM, occupancy matters less than Tensor-pipe utilization (`sm__pipe_tensor_op_*_cycles_active`).
+
+### Device selection, persistence mode, MPS, clocks
 
 ```bash
 export CUDA_DEVICE_ORDER=PCI_BUS_ID    # device indices match nvidia-smi (default is FASTEST_FIRST)
@@ -537,12 +585,26 @@ sudo nvidia-smi -c EXCLUSIVE_PROCESS   # recommended compute mode under MPS
 sudo nvidia-smi -lgc <min>,<max>       # lock SM clocks ;  -pl <watts> sets the power limit
 ```
 
-Set `CUDA_DEVICE_ORDER=PCI_BUS_ID` so indices match `nvidia-smi` and stay stable across runs (essential for pinning ranks; on ZINC's box `cuda:0`=5090, `cuda:1`=4090, but a non-login SSH does not inherit the export — select by cc/SM count at runtime if needed). Persistence mode removes the cold-CUDA-context driver-init cost — the ZINC "cold/warm GPU" concern; always warm up before measuring. MPS enables concurrent (not time-sliced) kernel execution from co-located inference servers.
+Set `CUDA_DEVICE_ORDER=PCI_BUS_ID` so indices match `nvidia-smi` and stay stable across runs (essential for pinning ranks; on ZINC's box `cuda:0`=5090, `cuda:1`=4090, but a non-login SSH does not inherit the export — select by cc/SM count at runtime if needed).
 
-**WSL2 specifics (the deployment constraint).** NVIDIA on WSL2 is a **paravirtualized GPU, CUDA-only**:
+**Persistence mode (`nvidia-smi -pm 1`)** removes the cold-CUDA-context driver-init cost — the exact "cold/warm GPU" regime ZINC tracks on Metal, where the first process pays a one-time init each launch. *Measured impact: not yet benchmarked on ZINC's CUDA box.* The expected shape is a one-time per-process latency reduction (the driver context is already resident), with no steady-state tok/s change once warmed — so it matters for short-lived CLI invocations, not for a long-running server. Either way: **always warm up before measuring** (cuda-backend.md notes the CUDA cold path mirrors Metal's).
+
+**MPS (`nvidia-cuda-mps-control -d`)** enables genuinely concurrent (not time-sliced) kernel execution from co-located processes sharing one card — relevant only when running several inference servers on one GPU. *Measured impact: not yet benchmarked on ZINC.* It does not speed up a single inference stream; the win is aggregate throughput when many small-batch clients would otherwise serialize on the default context.
+
+**Clock/power locking (`-lgc`, `-pl`)** pins SM clocks / power for reproducible benchmarking — the NVIDIA analog of AMD's `RADV_PROFILE_PSTATE`, but note the AMD lesson: on memory-bound RDNA4 work, *forcing peak clocks regressed throughput ~23%* because the power budget got pulled from the memory subsystem to the (idle) shader cores. The same trap can exist on NVIDIA — pinning SM clocks high on a bandwidth-bound decode kernel can shift the power cap away from the memory controllers. *Not yet measured on ZINC's NVIDIA box; benchmark both ways before locking clocks for a decode workload.*
+
+### GDDR ECC
+
+GDDR6X/GDDR7 carry on-die error detection; **software/inline ECC** (selectable on the workstation cards, on by default there) reserves a fraction of memory and bandwidth for check bits. NVIDIA does not publish a single consumer figure; the standard inline-ECC bandwidth/capacity overhead is in the ~5–12% range depending on the scheme, comparable to the ~10% AMD measured for RDNA4 GECC. *Not yet measured on ZINC's NVIDIA box.* For inference where occasional bit flips are tolerable, leave ECC **off** (the consumer GeForce cards have no user-facing ECC toggle anyway — ECC is a workstation/data-center feature; on the RTX A6000 / 6000 Ada / PRO 6000 toggle it with `sudo nvidia-smi -e 0` then reboot, and re-measure tok/s the way AMD did for GECC: +9% on Qwen3 Q4_K when disabled).
+
+### WSL2 specifics (the deployment constraint)
+
+NVIDIA on WSL2 is a **paravirtualized GPU, CUDA-only**:
+
 - The driver exposes CUDA + DirectX/DirectML but ships **no NVIDIA Vulkan ICD** — `nvidia_icd.json` is absent, so `vulkaninfo` falls back to `llvmpipe` (CPU). Vulkan compute backends do **not** see the NVIDIA GPU under WSL2 — the CUDA backend is the only path that touches the hardware (proven empirically in `docs/cuda-backend.md` §1).
 - `/dev/dxg` is the only GPU node (proxies work to the Windows kernel driver via `dxgkrnl`/WDDM); there are **no `/dev/nvidia*`** nodes.
 - `libcuda.so.1` is a **stub** in `/usr/lib/wsl/lib/` (auto-mounted; `nvidia-smi` lives at `/usr/lib/wsl/lib/nvidia-smi`) that forwards to the real Windows driver. **Do not install a Linux NVIDIA display driver inside WSL** — install only the Windows driver + the CUDA toolkit (without its driver) in WSL.
+- Profiling caveat: `ncu`/Nsight Compute works under WSL2 but needs the matching Windows driver + the WSL CUDA toolkit; `nvidia-smi -pm`/`-lgc`/`-e` (persistence, clock-lock, ECC) are managed by the Windows driver and may be no-ops or unavailable from inside the WSL guest — set them on the Windows host.
 
 Contrast with AMD/RDNA on native Linux, where RADV Vulkan is the primary path; on the WSL2 NVIDIA box a Vulkan inference path is a non-starter.
 
@@ -552,7 +614,7 @@ Contrast with AMD/RDNA on native Linux, where RADV Vulkan is the primary path; o
 - [NVIDIA Ampere GA102 GPU Architecture Whitepaper (v2.1, PDF)](https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.1.pdf)
 - [NVIDIA Ada GPU Architecture Whitepaper (v2.02, PDF)](https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf)
 - [NVIDIA RTX Blackwell GPU Architecture Whitepaper (v1.1, PDF)](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf)
-- [NVIDIA RTX Blackwell PRO GPU Architecture Whitepaper (PDF)](https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/quadro-product-literature/NVIDIA-RTX-Blackwell-PRO-GPU-Architecture-v1.0.pdf)
+- [NVIDIA RTX PRO 6000 Blackwell Workstation Edition Datasheet (PDF)](https://www.nvidia.com/content/dam/en-zz/Solutions/data-center/rtx-pro-6000-blackwell-workstation-edition/workstation-blackwell-rtx-pro-6000-workstation-edition-nvidia-us-3519208-web.pdf)
 
 ### CUDA / PTX programming references
 - [CUDA C++ Programming Guide — Compute Capabilities](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities)
@@ -565,7 +627,8 @@ Contrast with AMD/RDNA on native Linux, where RADV Vulkan is the primary path; o
 ### Toolchain & deployment
 - [NVRTC (Runtime Compilation)](https://docs.nvidia.com/cuda/nvrtc/index.html) · [NVCC](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/nvcc.html)
 - [CUDA Graphs](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html) · [CUDA Environment Variables](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html)
-- [CUDA Binary Utilities — `cuobjdump` / `nvdisasm`](https://docs.nvidia.com/cuda/cuda-binary-utilities/index.html)
+- [CUDA Binary Utilities — `cuobjdump` / `nvdisasm` (`-res-usage`, `-sass`)](https://docs.nvidia.com/cuda/cuda-binary-utilities/index.html)
+- [Nsight Compute CLI (`ncu`) — sections, sets, metrics](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html)
 - [nvidia-smi](https://docs.nvidia.com/deploy/nvidia-smi/index.html) · [Multi-Process Service (MPS)](https://docs.nvidia.com/deploy/mps/) · [CUDA on WSL User Guide](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)
 
 ### Product pages, per-SKU databases, deep dives

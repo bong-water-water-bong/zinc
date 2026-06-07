@@ -13,10 +13,11 @@ const dequant = zinc_rt.kernels.dequant;
 
 const log = std.log.scoped(.zinc_rt_forward);
 
-/// Decode-token budget used by the M0 smoke tail and by benchmarks that want a
-/// short, bounded run on the scalar reference path. The full M1 forward respects
-/// the caller-supplied `max_tokens` and uses this only as a hard ceiling when no
-/// other budget is in scope. Override via ZINC_RT_MAX_DECODE_TOKENS.
+/// Decode-token budget used by the no-layer smoke tail (`generateNoLayer`) and
+/// by benchmarks that want a short, bounded run on the scalar reference path.
+/// The full M1 forward paths (`generateScalarHybrid`, `generateScalarDense`)
+/// pass the caller-supplied `max_tokens` through unchanged and never consult
+/// this constant. Override via ZINC_RT_MAX_DECODE_TOKENS.
 pub const m0_max_decode_tokens_default: u32 = 8;
 
 fn m0MaxDecodeTokens() u32 {
@@ -73,10 +74,10 @@ pub const Model = struct {
     embed_info: gguf.TensorInfo,
     final_norm_info: gguf.TensorInfo,
     lm_head_info: gguf.TensorInfo,
-    /// `Q4_0`-re-quantized copy of the `Q8_0` LM-head weights, built at load time
-    /// so the per-token logit matvec streams ~half the DRAM bytes. Null when the
-    /// source is not Q8_0 or re-quantization could not be allocated; decode then
-    /// falls back to `lm_head_info`.
+    /// `Q4_0`-re-quantized copy of the LM-head weights, built at load time so
+    /// the per-token logit matvec streams ~half the DRAM bytes. Null when the
+    /// source is not Q8_0, Q5_K, or Q6_K, or when re-quantization could not be
+    /// allocated; decode then falls back to `lm_head_info`.
     lm_head_q4_0: ?[]u8 = null,
     /// Load-time re-encoded copies of weight matrices whose per-token DRAM / L3
     /// stream is worth shrinking and that tolerate a coarser format, keyed by the
@@ -96,8 +97,10 @@ pub const Model = struct {
     decode_requant_blobs: std.AutoHashMapUnmanaged(usize, []u8) = .{},
     /// Load-time F32 dequant of the small per-layer norm/SSM-side tensors that
     /// the scalar decode path re-reads every token (`attn_norm`, `ffn_norm`,
-    /// `post_attention_norm`, `attn_q_norm`, `attn_k_norm`, `ssm_norm`,
-    /// `ssm_dt_bias`, `ssm_a`, and the final output norm). Keyed by GGUF
+    /// `post_attention_norm`, `post_ffw_norm`, `pre_ffw_norm_2`, `attn_q_norm`,
+    /// `attn_k_norm`, `ssm_norm`, `ssm_dt_bias`, `ssm_a`, `ffn_post_norm_1`,
+    /// `ffn_post_norm_2`, `ffn_gate_inp_scale`, and the final output norm).
+    /// Keyed by GGUF
     /// tensor offset. Across 40 layers + final norm this removes ~190
     /// per-token `readTensorFlat → dequant.row` dispatches and ~1 MiB of
     /// redundant memcpy into `state.row_scratch`, which would otherwise evict
@@ -1192,12 +1195,12 @@ pub const GenerateOptions = struct {
 /// Run the full ZINC_RT forward pass against `model` with default
 /// `GenerateOptions`: prefill the prompt, validate the per-token decode IR,
 /// and decode at most `max_tokens` tokens (stopping early on `eos_token_id`).
-/// Falls back to a no-layer smoke tail for models the scalar hybrid path
-/// cannot run. Equivalent to `generateWithOptions(..., .{})`.
+/// Tries the scalar hybrid path, then the scalar dense path, then falls back
+/// to a no-layer smoke tail. Equivalent to `generateWithOptions(..., .{})`.
 /// @param model Loaded GGUF model.
 /// @param prompt_tokens Tokenised prompt; must be non-empty.
 /// @param max_tokens Upper bound on tokens to produce after prefill.
-/// @param eos_token_id Stop-token id; honoured by the scalar hybrid path.
+/// @param eos_token_id Stop-token id.
 /// @param allocator Owns the returned `GenerateResult.tokens`.
 /// @returns A `GenerateResult` the caller must release via its `deinit`.
 pub fn generate(
@@ -1211,11 +1214,12 @@ pub fn generate(
 }
 
 /// Full ZINC_RT forward pass with caller-supplied `GenerateOptions`. Logs the
-/// validated decode-graph summary, then picks between the scalar hybrid
-/// MoE+SSM path (for Qwen 3.6-shaped models whose tensors fully resolve) and
-/// the no-layer smoke tail (everything else). The scalar hybrid path is the
-/// one that consumes the GPU ring's direct-compute results; the smoke tail is
-/// CPU-only and only retires the embedding / final-norm boundary.
+/// validated decode-graph summary, then picks among three paths: the scalar
+/// hybrid MoE+SSM path (for Qwen 3.6-shaped models whose tensors fully
+/// resolve via `canRunScalarHybrid`), the scalar dense attention path (for
+/// Gemma 4-shaped models via `canRunScalarDense`), and the no-layer smoke
+/// tail (everything else). The hybrid and dense paths consume the GPU ring's
+/// direct-compute results; the smoke tail is CPU-only.
 /// @param model Loaded GGUF model.
 /// @param prompt_tokens Tokenised prompt; must be non-empty.
 /// @param max_tokens Upper bound on tokens to produce after prefill.
@@ -5543,10 +5547,11 @@ const matvec_parallel_large_work_items: u64 = 16 * 1024 * 1024;
 const matvec_parallel_max_workers: usize = 16;
 
 /// File-local handle for the FastPool used by the decode main thread to fan out
-/// matvec, argmax, conv1d/SiLU and SSM-head workloads. `generateScalarHybrid`
-/// sets this before the first dispatch and clears it at scope exit. Reads only
-/// happen from the main decode thread; worker threads stick to their serial
-/// slice (FastPool is single-producer).
+/// matvec, argmax, conv1d/SiLU and SSM-head workloads. Both
+/// `generateScalarHybrid` and `generateScalarDense` set this before the first
+/// dispatch and clear it at scope exit. Reads only happen from the main decode
+/// thread; worker threads stick to their serial slice (FastPool is
+/// single-producer).
 var matvec_fast_pool: ?*zinc_rt.fast_pool.FastPool = null;
 
 const MatvecDirectWorker = struct {
@@ -7325,9 +7330,10 @@ pub const Tokenizer = struct {
     }
 
     /// Wrap the user prompt with Gemma's chat-turn special tokens so the
-    /// instruction-tuned model has the expected scaffolding. Returns null when
-    /// the vocab doesn't carry the Gemma `<start_of_turn>` / `<end_of_turn>`
-    /// special-token strings (i.e. the model isn't Gemma-templated).
+    /// instruction-tuned model has the expected scaffolding. Tries the Gemma 4
+    /// tokens (`<|turn>` / `<turn|>`) first, then falls back to Gemma 2/3
+    /// tokens (`<start_of_turn>` / `<end_of_turn>`). Returns null when neither
+    /// set is present in the vocab (i.e. the model isn't Gemma-templated).
     pub fn encodeGemmaChat(self: *const Tokenizer, user_text: []const u8, allocator: std.mem.Allocator) !?[]u32 {
         // Gemma 2/3 use <start_of_turn>/<end_of_turn>. Gemma 4 uses <|turn>/<turn|>.
         const start_id = self.token_to_id.get("<|turn>") orelse

@@ -62,7 +62,7 @@ pub const AttentionDispatch = struct {
     pipeline_batched: ?Pipeline,
     /// Split-K variant — same flash_attn.spv specialized with N_I_CHUNKS=fa_split_k_active
     /// so it writes per-chunk partials into partial_attn_out_buf instead of the
-    /// final normalized output. Created lazily when ZINC_FA_SPLIT_K is set.
+    /// final normalized output. Enabled by default (N=4); disabled when ZINC_FA_SPLIT_K is 0 or 1.
     pipeline_split: ?Pipeline,
     /// Split-K merge pass — combines per-chunk partials and applies sinks.
     pipeline_split_merge: ?Pipeline,

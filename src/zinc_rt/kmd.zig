@@ -181,7 +181,7 @@ pub const DrmAmdgpuInfo = extern struct {
 };
 
 /// Output buffer for `AMDGPU_INFO_HW_IP_INFO`.
-/// Reports the HW IP version and capabilities, ring-buffer alignment requirements, the bitmask of available kernel rings, and the count of user-queue slots — the last field is what tier 2 reads to confirm UMQ support.
+/// Reports the HW IP version and capabilities, ring-buffer alignment requirements, the bitmask of available kernel rings, and the count of user-queue slots — tier 2 checks both `available_rings` and `userq_num_slots` to confirm UMQ support.
 pub const DrmAmdgpuInfoHwIp = extern struct {
     hw_ip_version_major: u32,
     hw_ip_version_minor: u32,
@@ -213,7 +213,7 @@ pub const DrmAmdgpuInfoUqMetadata = extern union {
 };
 
 /// Input layout for the `DRM_IOCTL_AMDGPU_USERQ` ioctl.
-/// Describes the create/free op, the target IP (compute, gfx, sdma), the doorbell BO and offset to ring, the VA ranges of the queue ring buffer plus its read/write pointers, and a pointer to the IP-specific MQD blob.
+/// Describes the create/free op, the target IP (compute, gfx, sdma), the doorbell BO handle and slot offset within it, the VA ranges of the queue ring buffer plus its read/write pointers, and a pointer to the IP-specific MQD blob.
 pub const DrmAmdgpuUserqIn = extern struct {
     op: u32,
     queue_id: u32,

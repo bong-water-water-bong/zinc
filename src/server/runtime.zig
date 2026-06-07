@@ -65,7 +65,7 @@ pub fn setLogitsReadbackEnabled(_engine: *InferenceEngine, _enabled: bool) void 
 }
 
 /// Enable GPU kernel profiling on the inference engine.
-/// A no-op (returns without error) when running on a backend that has not implemented profiling.
+/// Supported on both Vulkan and Metal backends; calls the backend's own `enableProfiling` method.
 /// @param _engine Inference engine to configure for profiling.
 /// @returns An error if the backend's profiling setup fails (e.g. out of GPU resources).
 pub fn enableProfiling(_engine: *InferenceEngine) !void {

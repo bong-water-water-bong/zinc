@@ -124,15 +124,15 @@ pub const UnifiedFitEstimate = struct {
     runtime_unified_bytes: u64,
     /// Sum of weights + runtime bytes in unified memory.
     total_unified_bytes: u64,
-    /// Recommended working-set budget reported by the Metal driver.
+    /// Effective working-set budget: Metal driver's recommended value, or total memory when the driver reports zero.
     recommended_working_set_bytes: u64,
     /// Total physical memory on the device.
     total_memory_bytes: u64,
     /// KV cache bytes included in the runtime estimate.
     kv_cache_bytes: u64,
-    /// Current runtime context cap used for KV cache sizing.
+    /// Resolved context length (clamped to model ceiling, user request, and backend cap) used for KV cache sizing.
     max_ctx: u32,
-    /// Maximum context the current UMA budget could sustain if runtime caps were lifted.
+    /// Maximum context the current UMA budget could sustain, clamped to the model's declared context length.
     budget_max_ctx: u32,
 
     fn headroomBytes(self: UnifiedFitEstimate) i128 {
@@ -195,7 +195,7 @@ const required_shader_files = [_][]const u8{
 ///
 /// @param opts  Diagnostic configuration: optional model path, context ceiling, managed-model entry, and shader directory.
 /// @param allocator  Used for Metal device initialisation and GGUF header inspection.
-/// @returns `error.DiagnosticsFailed` when one or more checks emit a FAIL status; otherwise void.
+/// @returns `error.DiagnosticsFailed` when one or more checks emit a FAIL status; otherwise succeeds or propagates I/O errors.
 pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
     const stdout_file = std.fs.File.stdout();
     var stdout_buffer: [4096]u8 = undefined;

@@ -107,7 +107,7 @@ pub const CudaDevice = struct {
         return self.caps.warp_size;
     }
 
-    /// Maximum static shared memory per block, in bytes.
+    /// Maximum shared memory per block available with opt-in dynamic allocation, in bytes.
     pub fn maxSharedMemPerBlock(self: *const CudaDevice) u64 {
         return self.caps.max_shared_mem_per_block;
     }

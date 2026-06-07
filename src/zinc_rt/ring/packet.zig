@@ -64,7 +64,7 @@ pub const PacketBuilder = struct {
     }
 
     /// Rewind the write cursor without touching the backing buffer.
-    /// @param self Builder to reset; subsequent writes overwrite previous bytes.
+    /// @param self Builder to reset; subsequent writes overwrite previous dwords.
     pub fn reset(self: *PacketBuilder) void {
         self.len = 0;
     }
