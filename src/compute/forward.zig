@@ -3507,6 +3507,7 @@ pub const InferenceEngine = struct {
         if (self.qwen36Dp4aDownEnabled() or
             self.qwenDenseFfnDp4aEnabled(n_tokens) or
             self.qwenA3bSsmQ8Dp4aEnabled(n_tokens) or
+            self.gemmaDenseProjectionDp4aEnabled(n_tokens) or
             self.gemmaDenseGegluDp4aEnabled(n_tokens) or
             self.gemmaDenseDownDp4aEnabled(n_tokens))
         {
@@ -11258,6 +11259,262 @@ pub const InferenceEngine = struct {
             self.dmmv.pipeline_quantize_act_q8_1 != null and
             self.dmmv.pipeline_mul_mm_q4k != null;
         return q6_path or q4_path;
+    }
+
+    fn gemmaDenseProjectionDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.use_mul_mm_proj) return false;
+        if (!self.isAmdRdna()) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        const cfg = self.model.config;
+        if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
+        return n_tokens >= 64 and n_tokens <= 96;
+    }
+
+    fn gemmaDenseProjectionDp4aSupported(self: *const InferenceEngine, tensor: *const LoadedTensor, M: u32, K: u32, n_tokens: u32) bool {
+        if (!self.gemmaDenseProjectionDp4aEnabled(n_tokens)) return false;
+        if (M == 0 or K == 0 or (M & 31) != 0 or (K & 255) != 0) return false;
+        if (self.dmmv.pipeline_quantize_act_q8_1 == null) return false;
+        if (self.batched_scratch_hidden_i8 == null) return false;
+        if (self.batched_scratch_hidden_scale_dsum == null) return false;
+        return switch (tensor.info.type_) {
+            .q4_k => self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and self.dmmv.pipeline_mul_mm_q4k != null,
+            .q6_k => self.dmmv.pipeline_mul_mm_q6k_full_dp4a_q8_1 != null and self.dmmv.pipeline_mul_mm_q6k != null,
+            else => false,
+        };
+    }
+
+    fn gemmaPrepareProjectionQ8_1(self: *InferenceEngine, src: Buffer, K: u32, n_tokens: u32) !u32 {
+        if (!self.gemmaDenseProjectionDp4aEnabled(n_tokens)) return 0;
+        if (K == 0 or (K & 255) != 0) return 0;
+        if (self.dmmv.pipeline_quantize_act_q8_1 == null) return 0;
+        const packed_i8 = self.batched_scratch_hidden_i8 orelse return 0;
+        const scale_dsum = self.batched_scratch_hidden_scale_dsum orelse return 0;
+
+        const full_cols = n_tokens & ~@as(u32, 31);
+        if (full_cols == 0) return 0;
+
+        const need_input: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K) *
+            @sizeOf(f32);
+        const need_i8: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K / 4) *
+            @sizeOf(u32);
+        const need_sd: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K / 32) *
+            2 *
+            @sizeOf(f32);
+        if (src.size < need_input or packed_i8.size < need_i8 or scale_dsum.size < need_sd) return 0;
+
+        try self.dmmv.recordQuantizeActQ8_1(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            src.handle,
+            src.size,
+            packed_i8.handle,
+            packed_i8.size,
+            scale_dsum.handle,
+            scale_dsum.size,
+            full_cols,
+            K,
+        );
+        const q8_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = packed_i8.handle, .size = packed_i8.size },
+            .{ .buffer = scale_dsum.handle, .size = scale_dsum.size },
+        };
+        self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+        return full_cols;
+    }
+
+    fn dispatchGemmaProjectionBatchedDp4aQ8_1(
+        self: *InferenceEngine,
+        tensor: *const LoadedTensor,
+        src_f32: Buffer,
+        dst: Buffer,
+        M: u32,
+        K: u32,
+        n_tokens: u32,
+        pre_quantized_cols: u32,
+    ) !bool {
+        if (pre_quantized_cols == 0) return false;
+        if (!self.gemmaDenseProjectionDp4aSupported(tensor, M, K, n_tokens)) return false;
+        const packed_i8 = self.batched_scratch_hidden_i8.?;
+        const scale_dsum = self.batched_scratch_hidden_scale_dsum.?;
+        const need_output: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, pre_quantized_cols) *
+            @as(vk.c.VkDeviceSize, M) *
+            @sizeOf(f32);
+        if (dst.size < need_output) return false;
+
+        const push_fn = self.instance.push_descriptor_fn;
+        const tail_cols = n_tokens - pre_quantized_cols;
+        switch (tensor.info.type_) {
+            .q4_k => {
+                try self.dmmv.recordMulMmQ4KFullDp4a(
+                    &self.decode_cmd,
+                    push_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    packed_i8.handle,
+                    packed_i8.size,
+                    scale_dsum.handle,
+                    scale_dsum.size,
+                    dst.handle,
+                    dst.size,
+                    M,
+                    pre_quantized_cols,
+                    K,
+                    0,
+                    0,
+                );
+                if (tail_cols > 0) {
+                    if (tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q4k_tail8 != null) {
+                        try self.dmmv.recordMulMmQ4KTail8(
+                            &self.decode_cmd,
+                            push_fn,
+                            tensor.gpu_buffer.handle,
+                            tensor.gpu_buffer.size,
+                            src_f32.handle,
+                            src_f32.size,
+                            dst.handle,
+                            dst.size,
+                            M,
+                            tail_cols,
+                            K,
+                            K,
+                            M,
+                            0,
+                            pre_quantized_cols * K,
+                            pre_quantized_cols * M,
+                        );
+                    } else {
+                        try self.dmmv.recordMulMmQ4K(
+                            &self.decode_cmd,
+                            push_fn,
+                            tensor.gpu_buffer.handle,
+                            tensor.gpu_buffer.size,
+                            src_f32.handle,
+                            src_f32.size,
+                            dst.handle,
+                            dst.size,
+                            M,
+                            tail_cols,
+                            K,
+                            K,
+                            M,
+                            0,
+                            pre_quantized_cols * K,
+                            pre_quantized_cols * M,
+                        );
+                    }
+                }
+                return true;
+            },
+            .q6_k => {
+                try self.dmmv.recordMulMmQ6KFullDp4aQ8_1(
+                    &self.decode_cmd,
+                    push_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    packed_i8.handle,
+                    packed_i8.size,
+                    scale_dsum.handle,
+                    scale_dsum.size,
+                    dst.handle,
+                    dst.size,
+                    M,
+                    pre_quantized_cols,
+                    K,
+                    0,
+                    0,
+                );
+                if (tail_cols > 0) {
+                    if (tail_cols <= 8 and self.dmmv.pipeline_mul_mm_q6k_tail8 != null) {
+                        try self.dmmv.recordMulMmQ6KTail8(
+                            &self.decode_cmd,
+                            push_fn,
+                            tensor.gpu_buffer.handle,
+                            tensor.gpu_buffer.size,
+                            src_f32.handle,
+                            src_f32.size,
+                            dst.handle,
+                            dst.size,
+                            M,
+                            tail_cols,
+                            K,
+                            K,
+                            M,
+                            0,
+                            pre_quantized_cols * K,
+                            pre_quantized_cols * M,
+                        );
+                    } else {
+                        try self.dmmv.recordMulMmQ6K(
+                            &self.decode_cmd,
+                            push_fn,
+                            tensor.gpu_buffer.handle,
+                            tensor.gpu_buffer.size,
+                            src_f32.handle,
+                            src_f32.size,
+                            dst.handle,
+                            dst.size,
+                            M,
+                            tail_cols,
+                            K,
+                            K,
+                            M,
+                            0,
+                            pre_quantized_cols * K,
+                            pre_quantized_cols * M,
+                        );
+                    }
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn dispatchGemmaQkvProjectionsBatched(
+        self: *InferenceEngine,
+        q_t: *const LoadedTensor,
+        k_t: *const LoadedTensor,
+        v_t_opt: ?*const LoadedTensor,
+        scratch_norm: Buffer,
+        scratch_q: Buffer,
+        scratch_k: Buffer,
+        scratch_v: Buffer,
+        layer_q_dim: u32,
+        layer_kv_dim: u32,
+        hidden_dim: u32,
+        n_tokens: u32,
+    ) !void {
+        var dp4a_supported =
+            self.gemmaDenseProjectionDp4aSupported(q_t, layer_q_dim, hidden_dim, n_tokens) or
+            self.gemmaDenseProjectionDp4aSupported(k_t, layer_kv_dim, hidden_dim, n_tokens);
+        if (v_t_opt) |v_t| {
+            dp4a_supported = dp4a_supported or
+                self.gemmaDenseProjectionDp4aSupported(v_t, layer_kv_dim, hidden_dim, n_tokens);
+        }
+        const dp4a_cols: u32 = if (dp4a_supported)
+            try self.gemmaPrepareProjectionQ8_1(scratch_norm, hidden_dim, n_tokens)
+        else
+            0;
+        if (!try self.dispatchGemmaProjectionBatchedDp4aQ8_1(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens, dp4a_cols)) {
+            try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens);
+        }
+        if (!try self.dispatchGemmaProjectionBatchedDp4aQ8_1(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens, dp4a_cols)) {
+            try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
+        }
+        if (v_t_opt) |v_t| {
+            if (!try self.dispatchGemmaProjectionBatchedDp4aQ8_1(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens, dp4a_cols)) {
+                try self.dispatchProjectionBatched(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens);
+            }
+        }
     }
 
     fn dispatchGemmaGateUpGegluBatched(
@@ -21109,11 +21366,7 @@ pub const InferenceEngine = struct {
             // the copy with the unit-norm: dispatchRmsNorm reads scratch_k and
             // writes scratch_v. For non-use_k_as_v Gemma layers V has its own
             // projection; unit-norm is in place.
-            try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens);
-            try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
-            if (v_t_opt) |v_t| {
-                try self.dispatchProjectionBatched(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens);
-            }
+            try self.dispatchGemmaQkvProjectionsBatched(q_t, k_t, v_t_opt, scratch_norm, scratch_q, scratch_k, scratch_v, layer_q_dim, layer_kv_dim, hidden_dim, n_tokens);
             self.decode_cmd.computeBarrier();
 
             // Optional per-head Q/K norms (Qwen3 style). Dispatch one workgroup per
