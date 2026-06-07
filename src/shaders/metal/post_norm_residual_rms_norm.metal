@@ -76,11 +76,12 @@ kernel void main0(
     float sum_sq_h = 0.0f;
     uint count = 0;
     const float hidden_scale = p.hidden_scale;
+    const bool apply_hidden_scale = hidden_scale != 1.0f;
     for (uint i = tid; i < p.n; i += TG_SIZE) {
         const float r = residual[base + i];
         const float r_normed = residual_w[i] * (r * rms_inv_r);
         const float h = hidden[base + i] + r_normed;
-        hidden[base + i] = h * hidden_scale;
+        hidden[base + i] = apply_hidden_scale ? (h * hidden_scale) : h;
         h_vals[count++] = h;
         sum_sq_h += h * h;
     }
