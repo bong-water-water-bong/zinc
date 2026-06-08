@@ -3815,6 +3815,46 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn writeDescSet3Offsets(
+        self: *InferenceEngine,
+        ds: vk.c.VkDescriptorSet,
+        buf0: vk.c.VkBuffer,
+        offset0: vk.c.VkDeviceSize,
+        size0: vk.c.VkDeviceSize,
+        buf1: vk.c.VkBuffer,
+        offset1: vk.c.VkDeviceSize,
+        size1: vk.c.VkDeviceSize,
+        buf2: vk.c.VkBuffer,
+        offset2: vk.c.VkDeviceSize,
+        size2: vk.c.VkDeviceSize,
+    ) void {
+        var buffer_infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = buf0, .offset = offset0, .range = size0 },
+            .{ .buffer = buf1, .offset = offset1, .range = size1 },
+            .{ .buffer = buf2, .offset = offset2, .range = size2 },
+        };
+        var writes: [3]vk.c.VkWriteDescriptorSet = undefined;
+        for (0..3) |i| {
+            writes[i] = .{
+                .sType = vk.c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = null,
+                .dstSet = ds,
+                .dstBinding = @intCast(i),
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk.c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = null,
+                .pBufferInfo = &buffer_infos[i],
+                .pTexelBufferView = null,
+            };
+        }
+        vk.c.vkUpdateDescriptorSets(self.instance.device, 3, &writes, 0, null);
+        if (self.profile_enabled) {
+            self.profile_token_counters.descriptor_write_calls += 1;
+            self.profile_token_counters.descriptor_bindings += 3;
+        }
+    }
+
     fn writeDescSet3LastOffset(
         self: *InferenceEngine,
         ds: vk.c.VkDescriptorSet,
@@ -4292,6 +4332,39 @@ pub const InferenceEngine = struct {
         );
     }
 
+    fn pushDispatch3Offsets(
+        self: *InferenceEngine,
+        pip: *const Pipeline,
+        push_data: []const u8,
+        buf0: vk.c.VkBuffer,
+        offset0: vk.c.VkDeviceSize,
+        size0: vk.c.VkDeviceSize,
+        buf1: vk.c.VkBuffer,
+        offset1: vk.c.VkDeviceSize,
+        size1: vk.c.VkDeviceSize,
+        buf2: vk.c.VkBuffer,
+        offset2: vk.c.VkDeviceSize,
+        size2: vk.c.VkDeviceSize,
+        wg_x: u32,
+        wg_y: u32,
+        wg_z: u32,
+    ) void {
+        const infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = buf0, .offset = offset0, .range = size0 },
+            .{ .buffer = buf1, .offset = offset1, .range = size1 },
+            .{ .buffer = buf2, .offset = offset2, .range = size2 },
+        };
+        self.decode_cmd.pushDescAndDispatch(
+            pip,
+            self.instance.push_descriptor_fn,
+            infos[0..],
+            push_data,
+            wg_x,
+            wg_y,
+            wg_z,
+        );
+    }
+
     fn pushDispatch3LastOffset(
         self: *InferenceEngine,
         pip: *const Pipeline,
@@ -4665,6 +4738,61 @@ pub const InferenceEngine = struct {
 
         const ds = try self.allocDescSet(pip.descriptor_set_layout);
         self.writeDescSet3(ds, input_buf, input_size, weight_buf, weight_size, output_buf, output_size);
+        try self.elementwise.recordRmsNorm(&self.decode_cmd, ds, hidden_dim, n_tokens, eps);
+    }
+
+    fn dispatchRmsNormOffset(
+        self: *InferenceEngine,
+        input_buf: vk.c.VkBuffer,
+        input_offset: vk.c.VkDeviceSize,
+        input_size: vk.c.VkDeviceSize,
+        weight_buf: vk.c.VkBuffer,
+        weight_size: vk.c.VkDeviceSize,
+        output_buf: vk.c.VkBuffer,
+        output_offset: vk.c.VkDeviceSize,
+        output_size: vk.c.VkDeviceSize,
+        hidden_dim: u32,
+        n_tokens: u32,
+        eps: f32,
+    ) !void {
+        const pip = &(self.elementwise.pipeline_rms_norm orelse return error.ShaderNotLoaded);
+        const push = RmsNormPush{
+            .N = hidden_dim,
+            .eps_bits = @bitCast(eps),
+        };
+        if (pip.uses_push_descriptors) {
+            self.pushDispatch3Offsets(
+                pip,
+                std.mem.asBytes(&push),
+                input_buf,
+                input_offset,
+                input_size,
+                weight_buf,
+                0,
+                weight_size,
+                output_buf,
+                output_offset,
+                output_size,
+                n_tokens,
+                1,
+                1,
+            );
+            return;
+        }
+
+        const ds = try self.allocDescSet(pip.descriptor_set_layout);
+        self.writeDescSet3Offsets(
+            ds,
+            input_buf,
+            input_offset,
+            input_size,
+            weight_buf,
+            0,
+            weight_size,
+            output_buf,
+            output_offset,
+            output_size,
+        );
         try self.elementwise.recordRmsNorm(&self.decode_cmd, ds, hidden_dim, n_tokens, eps);
     }
 
@@ -22648,17 +22776,36 @@ pub const InferenceEngine = struct {
             }
         }
 
-        // Final RMS norm over all N tokens; LM head on the last one.
+        // Prefill only consumes logits for the final prompt token. Normalize
+        // that row directly instead of dispatching one RMS workgroup per token.
         const final_tail_phase = self.beginProfilePhase();
         const output_norm_t = self.tensor_map.get("output_norm.weight") orelse return error.TensorNotFound;
         const lm_head_t = self.tensor_map.get("output.weight") orelse self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
         const final_norm_phase = self.beginProfilePhase();
-        try self.dispatchRmsNorm(scratch_hidden.handle, scratch_hidden.size, output_norm_t.gpu_buffer.handle, output_norm_t.gpu_buffer.size, scratch_norm.handle, scratch_norm.size, hidden_dim, n_tokens, eps);
+        const final_hidden_offset_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens - 1) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        const final_hidden_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        try self.dispatchRmsNormOffset(
+            scratch_hidden.handle,
+            final_hidden_offset_bytes,
+            final_hidden_bytes,
+            output_norm_t.gpu_buffer.handle,
+            output_norm_t.gpu_buffer.size,
+            scratch_norm.handle,
+            0,
+            final_hidden_bytes,
+            hidden_dim,
+            1,
+            eps,
+        );
         self.endProfilePhase(.final_norm, final_norm_phase);
         self.decode_cmd.computeBarrier();
-        const x_offset_bytes: u32 = (n_tokens - 1) * hidden_dim * @sizeOf(f32);
         const final_lm_head_phase = self.beginProfilePhase();
-        try self.dispatchDmmvInner(lm_head_t, scratch_norm, scratch_norm.size, self.logits_buf, cfg.vocab_size, hidden_dim, 0, x_offset_bytes, 0, 0);
+        try self.dispatchDmmvInner(lm_head_t, scratch_norm, scratch_norm.size, self.logits_buf, cfg.vocab_size, hidden_dim, 0, 0, 0, 0);
         self.endProfilePhase(.final_lm_head, final_lm_head_phase);
         self.decode_cmd.computeBarrier();
 
