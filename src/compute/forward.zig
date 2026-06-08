@@ -174,6 +174,13 @@ const ProfilePhase = enum(u8) {
     embed_upload,
     attention,
     flash_attn_kernel,
+    attention_norm,
+    attention_qkv,
+    attention_head_norms,
+    attention_rope,
+    attention_kv_write,
+    attention_o_proj,
+    attention_post_norm,
     ssm,
     ssm_proj,
     ssm_proj_norm_ab,
@@ -233,6 +240,13 @@ const ProfilePhase = enum(u8) {
             .embed_upload => "embed",
             .attention => "attention",
             .flash_attn_kernel => "flash_attn",
+            .attention_norm => "attn_norm",
+            .attention_qkv => "attn_qkv",
+            .attention_head_norms => "attn_head_norms",
+            .attention_rope => "attn_rope",
+            .attention_kv_write => "attn_kv_write",
+            .attention_o_proj => "attn_o_proj",
+            .attention_post_norm => "attn_post_norm",
             .ssm => "ssm",
             .ssm_proj => "ssm_proj",
             .ssm_proj_norm_ab => "ssm_proj_norm_ab",
@@ -21839,6 +21853,7 @@ pub const InferenceEngine = struct {
         const scratch_swiglu = self.batched_scratch_swiglu.?;
         const scratch_down = self.batched_scratch_down.?;
         // The final LM head below still uses dispatchDmmvInner on the last token.
+        // FFN fallback below still uses dispatchFfnActivation after gate/up.
 
         const cpu_record_start = if (enable_gpu_phase_timing) std.time.nanoTimestamp() else 0;
         try self.decode_cmd.reset();
@@ -21907,8 +21922,10 @@ pub const InferenceEngine = struct {
 
             const attention_phase = self.beginProfilePhase();
             // attn RMS norm: hidden → norm
+            const attention_norm_phase = self.beginProfilePhase();
             try self.dispatchRmsNorm(scratch_hidden.handle, scratch_hidden.size, attn_norm_t.gpu_buffer.handle, attn_norm_t.gpu_buffer.size, scratch_norm.handle, scratch_norm.size, hidden_dim, n_tokens, eps);
             self.decode_cmd.computeBarrier();
+            self.endProfilePhase(.attention_norm, attention_norm_phase);
 
             // Q / K / V projections (weight read once per chunk). On Gemma's
             // use_k_as_v layers V is the RAW K projection (pre-norm, pre-rope),
@@ -21916,8 +21933,10 @@ pub const InferenceEngine = struct {
             // the copy with the unit-norm: dispatchRmsNorm reads scratch_k and
             // writes scratch_v. For non-use_k_as_v Gemma layers V has its own
             // projection; unit-norm is in place.
+            const attention_qkv_phase = self.beginProfilePhase();
             try self.dispatchGemmaQkvProjectionsBatched(q_t, k_t, v_t_opt, scratch_norm, scratch_q, scratch_k, scratch_v, layer_q_dim, layer_kv_dim, hidden_dim, n_tokens);
             self.decode_cmd.computeBarrier();
+            self.endProfilePhase(.attention_qkv, attention_qkv_phase);
 
             // Optional per-head Q/K norms (Qwen3 style). Dispatch one workgroup per
             // (token, head) slot — rms_norm_mul handles this via group_id * head_dim.
@@ -21928,6 +21947,8 @@ pub const InferenceEngine = struct {
             // K norm overwrites scratch_k, so place it AHEAD of K norm with a
             // compute barrier between them.
             const apply_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
+            const have_head_norms = apply_v_unit_norm or lt.attn_q_norm != null or lt.attn_k_norm != null;
+            const attention_head_norms_phase = if (have_head_norms) self.beginProfilePhase() else null;
             if (apply_v_unit_norm) {
                 const v_src_for_norm = if (use_k_as_v) scratch_k else scratch_v;
                 try self.dispatchRmsNorm(v_src_for_norm.handle, v_src_for_norm.size, self.unit_norm_weights.handle, self.unit_norm_weights.size, scratch_v.handle, scratch_v.size, layer_head_dim, layer_n_kv_heads * n_tokens, eps);
@@ -21940,6 +21961,7 @@ pub const InferenceEngine = struct {
                 try self.dispatchRmsNorm(scratch_k.handle, scratch_k.size, kn.gpu_buffer.handle, kn.gpu_buffer.size, scratch_k.handle, scratch_k.size, layer_head_dim, layer_n_kv_heads * n_tokens, eps);
             }
             if (lt.attn_q_norm != null or lt.attn_k_norm != null or apply_v_unit_norm) self.decode_cmd.computeBarrier();
+            if (have_head_norms) self.endProfilePhase(.attention_head_norms, attention_head_norms_phase);
 
             // Batched RoPE for Q and K. position_base = state.position so a
             // prefix-reuse call rotates the newly-added tokens at the correct
@@ -21962,15 +21984,18 @@ pub const InferenceEngine = struct {
                 cfg.rope_freq_base_swa
             else
                 cfg.rope_freq_base;
+            const attention_rope_phase = self.beginProfilePhase();
             try self.dispatchRopeBatched(scratch_q.handle, scratch_q.size, scratch_q.handle, scratch_q.size, freq_buf_handle, freq_buf_size, layer_head_dim, layer_rope_dim, cfg.n_heads, base_token, n_tokens, layer_rope_freq_base, 1.0);
             try self.dispatchRopeBatched(scratch_k.handle, scratch_k.size, scratch_k.handle, scratch_k.size, freq_buf_handle, freq_buf_size, layer_head_dim, layer_rope_dim, layer_n_kv_heads, base_token, n_tokens, layer_rope_freq_base, 1.0);
             self.decode_cmd.computeBarrier();
+            self.endProfilePhase(.attention_rope, attention_rope_phase);
 
             // Batched KV cache write: one compute dispatch writes all N tokens'
             // K/V into their paged cache slots via the page_table_buf lookup.
             // base_token places the write after the existing prefix. V was
             // populated from its own projection (or from a duplicate K projection
             // when use_k_as_v) and, for Gemma 4, unit-normed — always use scratch_v.
+            const attention_kv_write_phase = self.beginProfilePhase();
             try self.dispatchKvCacheWriteBatched(
                 scratch_k.handle,
                 scratch_k.size,
@@ -21988,16 +22013,20 @@ pub const InferenceEngine = struct {
                 base_token,
             );
             self.decode_cmd.computeBarrier();
+            self.endProfilePhase(.attention_kv_write, attention_kv_write_phase);
 
             // Batched causal flash attention: N queries over the KV cache.
             // seq_start = base_token so each query attends to prefix + own
             // position within the batch (causal_len = base_token + query + 1).
             const sink_offset = layer * cfg.n_heads;
+            const flash_attn_kernel_phase = self.beginProfilePhase();
             try self.dispatchFlashAttnBatched(scratch_q.handle, scratch_q.size, self.kv_k_cache[layer_idx].handle, self.kv_k_cache[layer_idx].size, self.kv_v_cache[layer_idx].handle, self.kv_v_cache[layer_idx].size, self.page_table_buf.handle, self.page_table_buf.size, scratch_attn_out.handle, scratch_attn_out.size, self.attn_sinks_buf.handle, self.attn_sinks_buf.size, layer_head_dim, cfg.n_heads, layer_n_kv_heads, base_token, n_tokens, kv_page_size_tokens, cfg.attn_scale, sink_offset);
             self.decode_cmd.computeBarrier();
+            self.endProfilePhase(.flash_attn_kernel, flash_attn_kernel_phase);
 
             // O projection, optional Gemma post-attention norm, then fused
             // residual+FFN norm.
+            const attention_o_proj_phase = self.beginProfilePhase();
             var o_done = false;
             if (self.gemmaDenseProjectionDp4aSupported(o_t, hidden_dim, o_input_cols, n_tokens)) {
                 const o_dp4a_cols = try self.gemmaPrepareProjectionQ8_1(scratch_attn_out, o_input_cols, n_tokens);
@@ -22009,6 +22038,8 @@ pub const InferenceEngine = struct {
                 try self.dispatchProjectionBatched(o_t, scratch_attn_out, scratch_down, hidden_dim, o_input_cols, n_tokens);
             }
             self.decode_cmd.computeBarrier();
+            self.endProfilePhase(.attention_o_proj, attention_o_proj_phase);
+            const attention_post_norm_phase = self.beginProfilePhase();
             var ffn_norm_ready = false;
             if (cfg.architecture == .gemma) {
                 if (lt.post_attention_norm) |pan_t| {
@@ -22048,8 +22079,9 @@ pub const InferenceEngine = struct {
             if (!ffn_norm_ready) {
                 try self.dispatchResidualRmsNorm(scratch_hidden.handle, scratch_hidden.size, scratch_down.handle, scratch_down.size, scratch_norm.handle, scratch_norm.size, ffn_norm_t.gpu_buffer.handle, ffn_norm_t.gpu_buffer.size, hidden_dim, n_tokens, eps, 1.0);
             }
-            self.endProfilePhase(.attention, attention_phase);
             self.decode_cmd.computeBarrier();
+            self.endProfilePhase(.attention_post_norm, attention_post_norm_phase);
+            self.endProfilePhase(.attention, attention_phase);
 
             // FFN: gate/up → SwiGLU/GEGLU → down → optional post-ffn norm
             // (Gemma) → residual.
@@ -23773,6 +23805,27 @@ pub fn generate(
             );
             // Drill-down inside the composite buckets so the next cycle can
             // target a named sub-phase instead of a top-level guess.
+            const attn_norm_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_norm)];
+            const attn_qkv_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_qkv)];
+            const attn_head_norms_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_head_norms)];
+            const attn_rope_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_rope)];
+            const attn_kv_write_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_kv_write)];
+            const attn_flash_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.flash_attn_kernel)];
+            const attn_o_proj_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_o_proj)];
+            const attn_post_norm_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_post_norm)];
+            log.info(
+                "Prefill attention subphases totals: norm={d:.1} qkv={d:.1} head_norms={d:.1} rope={d:.1} kv_write={d:.1} flash={d:.1} o_proj={d:.1} post_norm={d:.1} ms",
+                .{
+                    to_ms(attn_norm_ns),
+                    to_ms(attn_qkv_ns),
+                    to_ms(attn_head_norms_ns),
+                    to_ms(attn_rope_ns),
+                    to_ms(attn_kv_write_ns),
+                    to_ms(attn_flash_ns),
+                    to_ms(attn_o_proj_ns),
+                    to_ms(attn_post_norm_ns),
+                },
+            );
             const router_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_router)];
             const topk_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_topk)];
             const gate_up_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_gate_up)];
@@ -23975,6 +24028,16 @@ pub fn generate(
                 avg_shared_phase_ms,
                 avg_dense_ffn_phase_ms,
                 avg_tail_phase_ms,
+            });
+            log.info("PROFILE: avg attention subphases norm={d:.2} ms qkv={d:.2} ms head_norms={d:.2} ms rope={d:.2} ms kv_write={d:.2} ms flash={d:.2} ms o_proj={d:.2} ms post_norm={d:.2} ms", .{
+                engine.avgProfilePhaseMs(.attention_norm),
+                engine.avgProfilePhaseMs(.attention_qkv),
+                engine.avgProfilePhaseMs(.attention_head_norms),
+                engine.avgProfilePhaseMs(.attention_rope),
+                engine.avgProfilePhaseMs(.attention_kv_write),
+                engine.avgProfilePhaseMs(.flash_attn_kernel),
+                engine.avgProfilePhaseMs(.attention_o_proj),
+                engine.avgProfilePhaseMs(.attention_post_norm),
             });
             log.info("PROFILE: avg SSM subphases proj={d:.2} ms norm_ab={d:.2} ms qkv={d:.2} ms z={d:.2} ms alpha={d:.2} ms beta={d:.2} ms qkv_z={d:.2} ms conv={d:.2} ms delta={d:.2} ms gnorm={d:.2} ms out={d:.2} ms", .{
                 engine.avgProfilePhaseMs(.ssm_proj),
