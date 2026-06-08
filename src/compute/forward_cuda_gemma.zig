@@ -63,6 +63,11 @@ const SwigluPush = extern struct { N: u32 };
 const ScaleAccPush = extern struct { N: u32, scale: f32 };
 const ScalarMulPush = extern struct { N: u32 };
 const ArgmaxPush = extern struct { N: u32 };
+// MoE router/combine kernels (byte-match kernels.cu).
+const TopkPush = extern struct { n_experts: u32, k: u32 };
+const MoeAccPush = extern struct { N: u32, n_used: u32, src_stride: u32 };
+const MulVecPush = extern struct { N: u32, scale: f32 };
+const ZeroPush = extern struct { N: u32 };
 
 fn dmmvIdx(t: gguf.GGMLType) usize {
     return switch (t) {
@@ -71,6 +76,7 @@ fn dmmvIdx(t: gguf.GGMLType) usize {
         .q6_k => 2,
         .q8_0 => 3,
         .f32 => 4,
+        .q5_1 => 5,
         else => 0,
     };
 }
@@ -99,12 +105,17 @@ const Derived = struct {
     q_dim_max: u32,
     kv_dim_max: u32,
     head_dim_max: u32,
+    // MoE (0 for the dense gemma4-31b; >0 for the gemma4-26b-a4b)
+    n_experts: u32, // total routed experts (128)
+    n_experts_used: u32, // top-k active experts per token (8)
+    shexp_ff: u32, // shared-expert intermediate dim (2112)
+    ff_buf_max: u32, // max(n_ff, shexp_ff) for FFN scratch sizing
 };
 
 const Pipelines = struct {
     rms_norm: CudaPipeline,
     rms_norm_noweight: CudaPipeline,
-    dmmv: [5]CudaPipeline,
+    dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
     rope: CudaPipeline,
     kv_cache_write: CudaPipeline,
@@ -113,6 +124,11 @@ const Pipelines = struct {
     scale_accumulate: CudaPipeline,
     scalar_mul: CudaPipeline,
     argmax: CudaPipeline,
+    // MoE (compiled unconditionally; dispatched only when n_experts>0)
+    softmax_topk: CudaPipeline,
+    moe_weighted_acc: CudaPipeline,
+    mul_vec_scaled: CudaPipeline,
+    zero_vec: CudaPipeline,
 };
 
 pub const ForwardGemma = struct {
@@ -134,13 +150,22 @@ pub const ForwardGemma = struct {
     attn_out_buf: CudaBuffer, // [q_dim_max]
     o_buf: CudaBuffer, // [n_embd] O-projection / post-attn-norm output
     ffn_norm_buf: CudaBuffer,
-    gate_buf: CudaBuffer, // [n_ff]
-    up_buf: CudaBuffer, // [n_ff]
-    geglu_buf: CudaBuffer, // [n_ff]
-    down_buf: CudaBuffer, // [n_embd]
+    gate_buf: CudaBuffer, // [ff_buf_max]
+    up_buf: CudaBuffer, // [ff_buf_max]
+    geglu_buf: CudaBuffer, // [ff_buf_max]
+    down_buf: CudaBuffer, // [n_embd] dense; [n_used*n_embd] slot-major (MoE)
     logits_buf: CudaBuffer,
     argmax_buf: CudaBuffer,
     host_embed: []f32,
+
+    // MoE scratch (only used when n_experts > 0)
+    shared_buf: CudaBuffer, // [n_embd] shared-expert output (post_ffw_norm_1)
+    moe_norm_buf: CudaBuffer, // [n_embd] pre_ffw_norm_2 (expert input)
+    moe_out_buf: CudaBuffer, // [n_embd] routed-expert weighted sum (post_ffw_norm_2)
+    router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
+    router_out_buf: CudaBuffer, // [2*n_used] u32: ids then weight-bits
+    host_router: []u32, // [2*n_used] downloaded ids + weight bits
+    down_scales: []f32, // [n_layers*n_experts] per-expert ffn_down_exps scale
 
     // per-layer-type rope tables (host-precomputed effective inv_freq)
     inv_freq_swa: CudaBuffer, // [rope_dim_swa/2]
@@ -202,6 +227,10 @@ pub const ForwardGemma = struct {
             .q_dim_max = q_dim_max,
             .kv_dim_max = kv_dim_max,
             .head_dim_max = head_dim_max,
+            .n_experts = c.n_experts,
+            .n_experts_used = c.n_experts_used,
+            .shexp_ff = c.shared_expert_intermediate_dim,
+            .ff_buf_max = @max(c.intermediate_dim, c.shared_expert_intermediate_dim),
         };
 
         // ---- compile kernels -----------------------------------------------
@@ -215,6 +244,7 @@ pub const ForwardGemma = struct {
         pipes.dmmv[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k");
         pipes.dmmv[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0");
         pipes.dmmv[4] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_f32");
+        pipes.dmmv[5] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1");
         pipes.dmmv_fast[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_fast");
         pipes.dmmv_fast[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_fast");
         pipes.dmmv_fast[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_fast");
@@ -226,6 +256,10 @@ pub const ForwardGemma = struct {
         pipes.scale_accumulate = try pipeline.createPipeline(ctx, src.ptr, "scale_accumulate");
         pipes.scalar_mul = try pipeline.createPipeline(ctx, src.ptr, "scalar_mul");
         pipes.argmax = try pipeline.createPipeline(ctx, src.ptr, "argmax");
+        pipes.softmax_topk = try pipeline.createPipeline(ctx, src.ptr, "softmax_topk");
+        pipes.moe_weighted_acc = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc");
+        pipes.mul_vec_scaled = try pipeline.createPipeline(ctx, src.ptr, "mul_vec_scaled");
+        pipes.zero_vec = try pipeline.createPipeline(ctx, src.ptr, "zero_vec");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
         const f4 = @sizeOf(f32);
@@ -245,13 +279,21 @@ pub const ForwardGemma = struct {
             .attn_out_buf = try buffer.createBuffer(ctx, q_dim_max * f4),
             .o_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
             .ffn_norm_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
-            .gate_buf = try buffer.createBuffer(ctx, d.n_ff * f4),
-            .up_buf = try buffer.createBuffer(ctx, d.n_ff * f4),
-            .geglu_buf = try buffer.createBuffer(ctx, d.n_ff * f4),
-            .down_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
+            .gate_buf = try buffer.createBuffer(ctx, d.ff_buf_max * f4),
+            .up_buf = try buffer.createBuffer(ctx, d.ff_buf_max * f4),
+            .geglu_buf = try buffer.createBuffer(ctx, d.ff_buf_max * f4),
+            .down_buf = try buffer.createBuffer(ctx, @max(d.n_embd, d.n_experts_used * d.n_embd) * f4),
             .logits_buf = try buffer.createBuffer(ctx, d.vocab * f4),
             .argmax_buf = try buffer.createBuffer(ctx, @sizeOf(u32)),
             .host_embed = try allocator.alloc(f32, d.n_embd),
+            // MoE scratch (tiny-but-nonzero stubs keep the dense path uniform).
+            .shared_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
+            .moe_norm_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
+            .moe_out_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
+            .router_logits_buf = try buffer.createBuffer(ctx, @max(@as(u32, 1), d.n_experts) * f4),
+            .router_out_buf = try buffer.createBuffer(ctx, @max(@as(u32, 1), 2 * d.n_experts_used) * @sizeOf(u32)),
+            .host_router = try allocator.alloc(u32, @max(@as(u32, 1), 2 * d.n_experts_used)),
+            .down_scales = try allocator.alloc(f32, @max(@as(u32, 1), d.n_layers * d.n_experts)),
             .inv_freq_swa = try buffer.createBuffer(ctx, @max(@as(u32, 1), hd_swa / 2) * f4),
             .inv_freq_full = try buffer.createBuffer(ctx, @max(@as(u32, 1), hd_full / 2) * f4),
             .kv_k = try allocator.alloc(CudaBuffer, n_layers),
@@ -302,12 +344,25 @@ pub const ForwardGemma = struct {
             buffer.upload(ctx, &self.inv_freq_full, std.mem.sliceAsBytes(hf));
         }
 
+        // ---- per-expert down scales (MoE) ----------------------------------
+        // gemma4 MoE multiplies each routed expert's down output by a per-expert
+        // scalar (ffn_down_exps.scale). Pre-download to the host so the routed
+        // combine can fold it into the router weights.
+        if (d.n_experts > 0) {
+            @memset(self.down_scales, 1.0);
+            for (0..n_layers) |li| {
+                const ts = model.getLayer(@intCast(li), "ffn_down_exps.scale") orelse continue;
+                if (ts.info.numElements() != d.n_experts) continue;
+                buffer.download(ctx, &ts.gpu_buffer, std.mem.sliceAsBytes(self.down_scales[li * d.n_experts ..][0..d.n_experts]));
+            }
+        }
+
         return self;
     }
 
     pub fn deinit(self: *ForwardGemma) void {
         const a = self.allocator;
-        inline for (.{ &self.hidden, &self.norm_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.attn_out_buf, &self.o_buf, &self.ffn_norm_buf, &self.gate_buf, &self.up_buf, &self.geglu_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.inv_freq_swa, &self.inv_freq_full }) |b| {
+        inline for (.{ &self.hidden, &self.norm_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.attn_out_buf, &self.o_buf, &self.ffn_norm_buf, &self.gate_buf, &self.up_buf, &self.geglu_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.inv_freq_swa, &self.inv_freq_full, &self.shared_buf, &self.moe_norm_buf, &self.moe_out_buf, &self.router_logits_buf, &self.router_out_buf }) |b| {
             buffer.freeBuffer(b);
         }
         for (self.kv_k) |*b| buffer.freeBuffer(b);
@@ -316,6 +371,8 @@ pub const ForwardGemma = struct {
         a.free(self.kv_v);
         a.free(self.geom);
         a.free(self.host_embed);
+        a.free(self.host_router);
+        a.free(self.down_scales);
         inline for (std.meta.fields(Pipelines)) |f| {
             if (comptime std.mem.eql(u8, f.name, "dmmv")) {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
@@ -343,7 +400,11 @@ pub const ForwardGemma = struct {
             var L: u32 = 0;
             while (L < d.n_layers) : (L += 1) {
                 try self.attentionLayer(L, pos);
-                try self.ffnBlock(L);
+                if (d.n_experts > 0 and self.model.getLayer(L, "ffn_gate_inp.weight") != null) {
+                    try self.moeFfnBlock(L);
+                } else {
+                    try self.ffnBlock(L);
+                }
                 try self.layerOutScale(L);
             }
         }
@@ -463,6 +524,121 @@ pub const ForwardGemma = struct {
         cmd.commitAndWait();
     }
 
+    /// MoE FFN block (gemma4-26b-a4b). On entry `hidden` holds attn_out, the
+    /// shared input to the dense shared expert, the routed experts, AND the
+    /// router; it stays untouched until the final residual add. Mirrors the
+    /// llama.cpp gemma4.cpp build graph:
+    ///   shared = post_ffw_norm_1( geglu_ffn( ffn_norm(attn_out) ) )
+    ///   logits = ffn_gate_inp · ( rms(attn_out)/sqrt(n_embd) * gate_inp_s )
+    ///   moe    = post_ffw_norm_2( Σ_j w_j·downᵉ( geglu( gate_upᵉ( pre_ffw_norm_2(attn_out) ) ) ) )
+    ///   cur    = post_ffw_norm( shared + moe );  hidden += cur
+    /// The per-expert down scale (ffn_down_exps.scale) is folded into the router
+    /// weights on the host before the weighted combine.
+    fn moeFfnBlock(self: *ForwardGemma, L: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const n_used = d.n_experts_used;
+        const ef = d.n_ff; // routed-expert intermediate (704)
+        const sf = d.shexp_ff; // shared-expert intermediate (2112)
+
+        const wfn = self.layer(L, "ffn_norm.weight");
+        const wgate = self.layer(L, "ffn_gate.weight");
+        const wup = self.layer(L, "ffn_up.weight");
+        const wdown = self.layer(L, "ffn_down.weight");
+        const wpn1 = self.layer(L, "post_ffw_norm_1.weight");
+        const wpre2 = self.layer(L, "pre_ffw_norm_2.weight");
+        const wpn2 = self.layer(L, "post_ffw_norm_2.weight");
+        const wpost = self.layer(L, "post_ffw_norm.weight");
+        const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [n_embd, n_experts] F32
+        const wrscale = self.layer(L, "ffn_gate_inp.scale"); // [n_embd] F32
+        const wgu = self.layer(L, "ffn_gate_up_exps.weight"); // [n_embd, 2*ef, n_experts]
+        const wde = self.layer(L, "ffn_down_exps.weight"); // [ef, n_embd, n_experts]
+
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+
+        // --- shared expert → shared_buf -------------------------------------
+        {
+            var cmd = try command.beginCommand(ctx);
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            self.dmmvDispatch(&cmd, wgate, &self.ffn_norm_buf, &self.gate_buf, sf, d.n_embd, 0, 0);
+            self.dmmvDispatch(&cmd, wup, &self.ffn_norm_buf, &self.up_buf, sf, d.n_embd, 0, 0);
+            const sg = SwigluPush{ .N = sf };
+            cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+            self.dmmvDispatch(&cmd, wdown, &self.geglu_buf, &self.shared_buf, d.n_embd, sf, 0, 0);
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.shared_buf, &wpn1.gpu_buffer, &self.shared_buf }, &rms, @sizeOf(RmsPush), 0);
+            cmd.commitAndWait();
+        }
+
+        // --- router logits + top-k softmax (computed from attn_out) ----------
+        {
+            var cmd = try command.beginCommand(ctx);
+            cmd.dispatch(&self.pipes.rms_norm_noweight, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            const mv = MulVecPush{ .N = d.n_embd, .scale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(d.n_embd))) };
+            cmd.dispatch(&self.pipes.mul_vec_scaled, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.norm_buf, &wrscale.gpu_buffer }, &mv, @sizeOf(MulVecPush), 0);
+            self.dmmvDispatch(&cmd, wrouter, &self.norm_buf, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
+            const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
+            cmd.dispatch(&self.pipes.softmax_topk, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.router_logits_buf, &self.router_out_buf }, &tk, @sizeOf(TopkPush), 0);
+            cmd.commitAndWait();
+        }
+
+        // Download ids+weights; fold the per-expert down scale into the weights.
+        buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
+        {
+            const scales = self.down_scales[L * d.n_experts ..][0..d.n_experts];
+            var j: u32 = 0;
+            while (j < n_used) : (j += 1) {
+                const id = self.host_router[j];
+                const w: f32 = @bitCast(self.host_router[n_used + j]);
+                self.host_router[n_used + j] = @bitCast(w * scales[id]);
+            }
+        }
+        buffer.upload(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
+
+        // --- routed experts → moe_out_buf -----------------------------------
+        {
+            // Per-expert byte strides into the fused gate_up / stacked down.
+            const gu_half = expertSliceBytes(wgu.info.type_, ef, d.n_embd); // ef rows
+            const gu_full = gu_half * 2; // 2*ef rows per expert
+            const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+
+            var cmd = try command.beginCommand(ctx);
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wpre2.gpu_buffer, &self.moe_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            const sg = SwigluPush{ .N = ef };
+            var j: u32 = 0;
+            while (j < n_used) : (j += 1) {
+                const id = self.host_router[j];
+                // fused gate_up: gate = rows[0..ef], up = rows[ef..2ef].
+                self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gu_full);
+                self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * gu_full + gu_half);
+                cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                const didx = dmmvIdx(wde.info.type_);
+                if (didx < 4) {
+                    cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                } else {
+                    cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                }
+            }
+            // zero accumulator → weighted combine of the k slots → post_ffw_norm_2.
+            const zp = ZeroPush{ .N = d.n_embd };
+            cmd.dispatch(&self.pipes.zero_vec, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{&self.moe_out_buf}, &zp, @sizeOf(ZeroPush), 0);
+            const ma = MoeAccPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd };
+            cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.moe_out_buf, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.moe_out_buf, &wpn2.gpu_buffer, &self.moe_out_buf }, &rms, @sizeOf(RmsPush), 0);
+            cmd.commitAndWait();
+        }
+
+        // --- combine: cur = post_ffw_norm(shared + moe); hidden += cur. ------
+        {
+            var cmd = try command.beginCommand(ctx);
+            const acc = ScaleAccPush{ .N = d.n_embd, .scale = 1.0 };
+            cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.shared_buf, &self.moe_out_buf }, &acc, @sizeOf(ScaleAccPush), 0);
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.shared_buf, &wpost.gpu_buffer, &self.shared_buf }, &rms, @sizeOf(RmsPush), 0);
+            cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.shared_buf }, &acc, @sizeOf(ScaleAccPush), 0);
+            cmd.commitAndWait();
+        }
+    }
+
     /// Multiply the residual stream by the learned per-layer output scale.
     fn layerOutScale(self: *ForwardGemma, L: u32) !void {
         const d = self.d;
@@ -503,6 +679,13 @@ pub const ForwardGemma = struct {
 
 fn ceilDiv(a: u32, b: u32) u32 {
     return (a + b - 1) / b;
+}
+
+/// Bytes for one expert's [rows × cols] slice in a stacked/fused MoE weight
+/// tensor. cols is the quantized (contiguous) dim; rows is the number of output
+/// rows. Matches the layout the dmmv kernels expect (a_offset in bytes).
+fn expertSliceBytes(q: gguf.GGMLType, rows: u32, cols: u32) u32 {
+    return rows * (cols / q.blockSize()) * q.bytesPerBlock();
 }
 
 fn readArchU32(gf: *const gguf.GGUFFile, arch: []const u8, suffix: []const u8) ?u32 {

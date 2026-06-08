@@ -246,6 +246,37 @@ extern "C" __global__ void dmmv_q8_0(const unsigned char* a, const float* x, flo
     }
 }
 
+// ---- dmmv_q5_1 (gemma4 MoE ffn_down_exps) -----------------------------------
+// y[row] = sum_k dequant(W[row][k]) * x[k], W in Q5_1 (24-byte blocks of 32:
+// f16 d, f16 m, 4-byte qh high-bits, 16-byte qs nibbles). 5-bit q = nibble |
+// (qh_bit<<4); value = d*q + m. (UD-Q4_K_M ships ffn_down_exps as Q5_1.)
+extern "C" __global__ void dmmv_q5_1(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 5;                          // blocks per row (K / 32)
+    const unsigned char* arow = a + pc.a_offset + (size_t)row * bpr * 24u;
+    const float* xrow = x + (pc.x_offset >> 2);
+    float sum = 0.0f;
+    for (unsigned e = threadIdx.x; e < pc.K; e += blockDim.x) {
+        unsigned blk = e >> 5;                          // which 32-elem block
+        unsigned i = e & 31u;                           // 0..31 in block
+        const unsigned char* blkp = arow + (size_t)blk * 24u;
+        float d = zinc_half_to_float((unsigned short)((unsigned)blkp[0] | ((unsigned)blkp[1] << 8)));
+        float m = zinc_half_to_float((unsigned short)((unsigned)blkp[2] | ((unsigned)blkp[3] << 8)));
+        unsigned qh = (unsigned)blkp[4] | ((unsigned)blkp[5] << 8) | ((unsigned)blkp[6] << 16) | ((unsigned)blkp[7] << 24);
+        const unsigned char* qs = blkp + 8;
+        unsigned nib = (i < 16u) ? (unsigned)(qs[i] & 0xFu) : (unsigned)(qs[i - 16u] >> 4);
+        unsigned bit = (qh >> i) & 1u;
+        unsigned q5 = nib | (bit << 4);
+        sum += (d * (float)q5 + m) * xrow[e];
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        unsigned yi = (pc.y_offset >> 2) + row;
+        if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum;
+    }
+}
+
 // ---- dmmv_q5k (port of dmmv_q5k.comp) ---------------------------------------
 // Q5_K block (256 elems, 176 bytes): [0..3] d+dmin(f16); [4..15] 6-bit scales;
 // [16..47] qh (1 high bit/elem); [48..175] qs (4-bit low). 5-bit q = nibble +
@@ -1196,6 +1227,27 @@ extern "C" __global__ void scalar_mul(float* a, const float* s, ScalarMulPush pc
     unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= pc.N) return;
     a[idx] *= s[0];
+}
+
+// ---- mul_vec_scaled (gemma4 MoE router pre-scale) --------------------------
+// a[i] = a[i] * b[i] * scale. The gemma4 MoE router computes its logits from a
+// plain-RMS-normed residual scaled by 1/sqrt(n_embd) and a per-channel weight
+// (ffn_gate_inp.scale) before the gate projection.
+struct MulVecPush { unsigned N; float scale; };
+extern "C" __global__ void mul_vec_scaled(float* a, const float* b, MulVecPush pc) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pc.N) return;
+    a[idx] = a[idx] * b[idx] * pc.scale;
+}
+
+// ---- zero_vec --------------------------------------------------------------
+// a[i] = 0. Clears the MoE combine accumulator before moe_weighted_acc (which
+// is a += kernel).
+struct ZeroPush { unsigned N; };
+extern "C" __global__ void zero_vec(float* a, ZeroPush pc) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pc.N) return;
+    a[idx] = 0.0f;
 }
 
 // ---- gemma_attention (decode: softmax(scale*QK^T)V, GQA, sliding window) ----

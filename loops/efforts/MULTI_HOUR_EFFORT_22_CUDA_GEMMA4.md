@@ -69,6 +69,29 @@ A standard transformer (no SSM) but with several gemma-specific pieces:
     mid-layer could still drift); then wire the **gemma4 MoE (26b)** FFN
     (fused `ffn_gate_up_exps` + shared expert + 3 extra norms) into `ForwardGemma`.
 
+- **Cycle 2 (2026-06-07) — gemma4 MoE (26b-a4b) FFN wired into `ForwardGemma`.**
+  The 26b run was incoherent because the old code ran only the dense `ffn_gate/up/down`
+  (which the MoE GGUF keeps *as the shared expert*) and skipped the 128-expert routed MoE
+  entirely. Added a `moeFfnBlock` path (branch per-layer on `ffn_gate_inp.weight`) mirroring
+  `gemma4.cpp` build graph:
+  - **shared expert**: `post_ffw_norm_1(geglu_ffn(ffn_norm(attn_out)))` (dense FFN, ff=2112).
+  - **router** (operates on attn_out, not the experts' normed input): `logits =
+    ffn_gate_inp · (rms_noweight(attn_out) · (1/√n_embd) · ffn_gate_inp.scale)`; top-8 softmax
+    via the existing `softmax_topk` (softmax-over-topk ≡ softmax-all-then-renorm-topk — Z
+    cancels, so it's correct for gemma4's SOFTMAX+norm_w).
+  - **routed experts**: `pre_ffw_norm_2(attn_out)` → per-slot fused `ffn_gate_up_exps`
+    (one Q4_K dmmv per half: gate=rows[0..ef], up=rows[ef..2ef]) → `geglu` → Q5_1 `ffn_down_exps`
+    (slot-major) → `moe_weighted_acc` → `post_ffw_norm_2`. The per-expert `ffn_down_exps.scale`
+    is folded into the router weights on the host before the combine.
+  - **combine**: `post_ffw_norm(shared + moe)`, then `hidden += cur`.
+  New additive kernels in `kernels.cu`: **`dmmv_q5_1`** (UD-Q4_K_M ships `ffn_down_exps` as Q5_1
+  — ZINC had no Q5_1 dmmv; `dmmvIdx` silently mismapped it to Q4_K), **`mul_vec_scaled`**
+  (router pre-scale), **`zero_vec`** (MoE accumulator clear). `dmmvIdx` extended `q5_1 => 5`,
+  gemma `dmmv` pipeline array grown to `[6]`. Reuses qwen's `softmax_topk`/`moe_weighted_acc`.
+  Dense 31b path unchanged (n_experts==0 → `ffnBlock`); qwen35/36 untouched (separate file).
+  **PENDING:** loop rebuild + run on the 26b — expect coherent; if not, per-layer-diff the
+  first MoE layer (layer 0) vs llama.cpp `ffn_moe_combined-0`.
+
 ## Refs
 
 llama.cpp `src/models/gemma4.cpp` (build graph), `src/llama-model.cpp` gemma4 hparams. The qwen35 bring-up (Effort 21 Cycle 5) for the per-layer-diff method; `scripts/validate_cuda_decode.sh` for the gate.
