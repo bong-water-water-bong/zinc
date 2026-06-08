@@ -11,7 +11,7 @@ const CommandBuffer = @import("../vulkan/command.zig").CommandBuffer;
 
 const log = std.log.scoped(.elementwise);
 const descriptor_pool_max_sets: u32 = 256;
-const max_storage_buffers_per_set: u32 = 7;
+const max_storage_buffers_per_set: u32 = 8;
 
 /// Push constants for RMS norm shader.
 pub const RmsNormPush = extern struct {
@@ -306,6 +306,23 @@ pub const QkNormRopeKvWritePush = extern struct {
     v_norm: u32 = 0, // 1 ⇒ unit-RMS-normalize V while writing kv_v
 };
 
+/// Batched SWA variant of QkNormRopeKvWritePush.
+/// Binding 4 is the KV page table, so this variant computes RoPE frequencies
+/// from freq_base_bits instead of reading a frequency buffer.
+pub const QkNormRopeKvWriteBatchedPush = extern struct {
+    head_dim: u32,
+    rope_dim: u32,
+    n_q_heads: u32,
+    n_k_heads: u32,
+    n_tokens: u32,
+    page_size: u32,
+    base_token: u32,
+    freq_base_bits: u32,
+    attn_scale_bits: u32,
+    eps_bits: u32,
+    v_norm: u32 = 0,
+};
+
 /// Manages element-wise fused kernel pipelines.
 pub const ElementwiseDispatch = struct {
     /// RMS NORM pipeline, or null.
@@ -427,6 +444,10 @@ pub const ElementwiseDispatch = struct {
     /// on Qwen 3 dense attention layers, saving 2 dispatches + 1 barrier
     /// per attention layer.
     pipeline_qk_norm_rope_kv_write: ?Pipeline,
+    /// Batched Gemma SWA sibling of pipeline_qk_norm_rope_kv_write. Binding 4 is
+    /// the KV page table, so this path uses rope_freq_base_swa rather than a
+    /// precomputed frequency buffer.
+    pipeline_qk_norm_rope_kv_write_batched: ?Pipeline,
     /// Descriptor pool for this dispatch.
     descriptor_pool: vk.c.VkDescriptorPool,
     /// Logical device.
@@ -446,7 +467,7 @@ pub const ElementwiseDispatch = struct {
     ) !ElementwiseDispatch {
         const pool_size = vk.c.VkDescriptorPoolSize{
             .type = vk.c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            // The largest elementwise descriptor set binds 7 storage buffers.
+            // The largest elementwise descriptor set binds 8 storage buffers.
             // Keep enough descriptors for runtime reuse plus rotating hot-bench
             // working sets.
             .descriptorCount = descriptor_pool_max_sets * max_storage_buffers_per_set,
@@ -822,6 +843,12 @@ pub const ElementwiseDispatch = struct {
             break :blk null;
         };
 
+        const qk_norm_rope_kv_write_batched_path = std.fmt.bufPrint(&path_buf, "{s}/qk_norm_rope_kv_write_batched.spv", .{shader_dir}) catch unreachable;
+        const pipeline_qk_norm_rope_kv_write_batched = pipeline_mod.createFromSpirvWithOptions(instance, qk_norm_rope_kv_write_batched_path, 8, @sizeOf(QkNormRopeKvWriteBatchedPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("qk_norm_rope_kv_write_batched shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         return ElementwiseDispatch{
             .pipeline_rms_norm = pipeline_rms_norm,
             .pipeline_rms_norm_store_hidden = pipeline_rms_norm_store_hidden,
@@ -870,6 +897,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_rms_norm_scale_dmmv_f32 = pipeline_rms_norm_scale_dmmv_f32,
             .pipeline_rms_norm_dmmv_q4k_alpha_beta = pipeline_rms_norm_dmmv_q4k_alpha_beta,
             .pipeline_qk_norm_rope_kv_write = pipeline_qk_norm_rope_kv_write,
+            .pipeline_qk_norm_rope_kv_write_batched = pipeline_qk_norm_rope_kv_write_batched,
             .descriptor_pool = descriptor_pool,
             .device = instance.device,
         };
@@ -1398,6 +1426,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_rms_norm_scale_dmmv_f32) |*p| p.deinit();
         if (self.pipeline_rms_norm_dmmv_q4k_alpha_beta) |*p| p.deinit();
         if (self.pipeline_qk_norm_rope_kv_write) |*p| p.deinit();
+        if (self.pipeline_qk_norm_rope_kv_write_batched) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.* = undefined;
     }
