@@ -20,9 +20,9 @@
 //   d_scale_dsum: token-major [token][K/32] vec2 (scale, scale*isum_i8);
 //                 write[token * stride_d_scale + ir]
 //
-// Host may only dispatch when M and N are multiples of 32. Ragged N tails
-// keep using the f32 mul_mm_q4k_gate_up_swiglu fallback and the standalone
-// quantize_act_q8_1 dispatch.
+// Host may only dispatch when M is a multiple of 32. The default BN=32 variant
+// requires N to be a multiple of 32; the BN=8 specialization covers Gemma
+// short-prompt Q4_K-down tails with N <= 8.
 
 #include "dp4a_compat.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -197,7 +197,7 @@ void main() {
             }
         }
 
-        {
+        if (BN >= 32u) {
             const uint tile_half = tid & 1u;
             const uint k_in_tile = tile_half * 16u;
             [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
@@ -209,6 +209,20 @@ void main() {
                 if (tile_half == 0u) {
                     buf_b_sd[col_local] = b_scale_dsum[b_scale_offset + col_global * b_stride_scale + (k_outer >> 5)];
                 }
+            }
+        } else {
+            const uint col_local = tid >> 3;
+            const uint pack_idx = tid & 7u;
+            const uint col_global = ic * BN + col_local;
+            const bool col_ok = col_global < N;
+            const uint base_b = col_local * SPACK;
+            buf_b[base_b + pack_idx] = col_ok
+                ? b_packed[b_packed_offset + col_global * b_stride_packed + (k_outer >> 2) + pack_idx]
+                : 0u;
+            if (pack_idx == 0u) {
+                buf_b_sd[col_local] = col_ok
+                    ? b_scale_dsum[b_scale_offset + col_global * b_stride_scale + (k_outer >> 5)]
+                    : vec2(0.0);
             }
         }
 
@@ -284,11 +298,13 @@ void main() {
             local_isum += q;
             packed |= (uint(q) & 0xFFu) << (m * 8u);
         }
-        d_packed[d_packed_offset + col_g * stride_d_packed + ir * 8u + tiwr] = packed;
         const int block_isum = subgroupClusteredAdd(local_isum, TPR_M);
-        if (tiwr == 0u) {
-            d_scale_dsum[d_scale_offset + col_g * stride_d_scale + ir] =
-                vec2(scale, scale * float(block_isum));
+        if (BN >= 32u || col_g < N) {
+            d_packed[d_packed_offset + col_g * stride_d_packed + ir * 8u + tiwr] = packed;
+            if (tiwr == 0u) {
+                d_scale_dsum[d_scale_offset + col_g * stride_d_scale + ir] =
+                    vec2(scale, scale * float(block_isum));
+            }
         }
     }
 }

@@ -12,7 +12,9 @@
 //     = s[n,sb] * factor[m,sb] * idot(nibble, b_i8)
 //       - bias[m,sb] * d[n,sb]                       (d = s * isum precomputed)
 //
-// Host may only dispatch when M and N are multiples of 32 and K of 256.
+// Host may only dispatch when M is a multiple of 32 and K of 256. The default
+// BN=32 variant requires N to be a multiple of 32; the BN=8 specialization is
+// used for Gemma short-prompt tails with N <= 8.
 
 #include "dp4a_compat.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -20,13 +22,10 @@
 #extension GL_EXT_control_flow_attributes : require
 
 const uint BM = 32u;
-const uint BN = 32u;
 const uint BK = 32u;
 const uint TM = 4u;
-const uint TN = 4u;
 const uint WG_SIZE = 64u;
 const uint TPR_M = BM / TM;  // 8
-const uint TPR_N = BN / TN;  // 8
 
 const uint Q4K_BLOCK_U32 = 36u;
 // 8 packed uints (=32 int8) per BM/BN row, +1 pad uint so strided LDS reads
@@ -34,6 +33,11 @@ const uint Q4K_BLOCK_U32 = 36u;
 const uint SPACK = 9u;
 
 layout(constant_id = 0) const uint SPEC_K = 0u;
+layout(constant_id = 1) const uint SPEC_BN = 32u;
+
+const uint BN = SPEC_BN;
+const uint TPR_N = WG_SIZE / TPR_M; // 8
+const uint TN = BN / TPR_N;
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -147,7 +151,7 @@ void main() {
         }
 
         // ---- load pre-quantized Q8_1 activation half-tile + (scale, dsum) ----
-        {
+        if (BN >= 32u) {
             const uint col_local = tid / 2u;
             const uint tile_half = tid & 1u;
             const uint k_in_tile = tile_half * 16u;
@@ -157,6 +161,20 @@ void main() {
             [[unroll]] for (uint w = 0u; w < 4u; w++) buf_b[base_b + w] = b_packed[src + w];
             if (tile_half == 0u) {
                 buf_b_sd[col_local] = b_scale_dsum[col_global * b_stride_scale + (k_outer >> 5)];
+            }
+        } else {
+            const uint col_local = tid >> 3;
+            const uint pack_idx = tid & 7u;
+            const uint col_global = ic * BN + col_local;
+            const bool col_ok = col_global < N;
+            const uint base_b = col_local * SPACK;
+            buf_b[base_b + pack_idx] = col_ok
+                ? b_packed[col_global * b_stride_packed + (k_outer >> 2) + pack_idx]
+                : 0u;
+            if (pack_idx == 0u) {
+                buf_b_sd[col_local] = col_ok
+                    ? b_scale_dsum[col_global * b_stride_scale + (k_outer >> 5)]
+                    : vec2(0.0);
             }
         }
 
@@ -193,7 +211,9 @@ void main() {
         [[unroll]] for (uint n = 0u; n < TN; n++) {
             const uint row_g = ir * BM + tiwr * TM + m;
             const uint col_g = ic * BN + tiwc * TN + n;
-            d_data[d_offset + col_g * stride_d + row_g] = sums[m][n];
+            if (BN >= 32u || col_g < N) {
+                d_data[d_offset + col_g * stride_d + row_g] = sums[m][n];
+            }
         }
     }
 }
