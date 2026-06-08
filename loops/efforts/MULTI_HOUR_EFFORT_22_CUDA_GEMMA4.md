@@ -1,6 +1,6 @@
 # Effort 22 — CUDA gemma4 forward (catalog completeness on the 4090)
 
-> **Status:** dense COHERENT (Cycle 1) · **1/5 still blocked (gemma4-26b MoE)** · goal: `gemma4-31b` (dense) ✅ + `gemma4-26b-a4b` (MoE) generate **coherent text** via ZINC CUDA on the 4090, completing the 5/5 catalog. Catalog now **4/5** on the 4090.
+> **Status:** ✅ **COMPLETE — 5/5 catalog coherent on the 4090.** `gemma4-31b` dense (Cycle 1) AND `gemma4-26b-a4b` MoE (Cycle 2) both generate coherent text via ZINC CUDA. gemma4-26b confirmed: `MoE: 128 experts, 8 active | shared expert 2112` → "The capital of France is **Paris**." (Remaining refinement: per-layer-diff validation vs llama.cpp — argmax is coherent; confirm no mid-layer drift.)
 
 Date: 2026-06-07. Pairs with the qwen35/qwen36 CUDA work (Efforts 20/21, `forward_cuda.zig`).
 
