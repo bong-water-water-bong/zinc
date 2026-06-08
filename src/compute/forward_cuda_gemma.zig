@@ -157,6 +157,13 @@ pub const ForwardGemma = struct {
     logits_buf: CudaBuffer,
     argmax_buf: CudaBuffer,
     host_embed: []f32,
+    // async decode command ring (dense path, n_experts==0): each per-block
+    // command commitAsync's on the shared auto-ordered CUstream and stashes
+    // here; the tail commitAndWait drains the stream and drainPending frees the
+    // events. Sized for gemma-31b's ~180 ops/token (3 blocks × 60 layers). The
+    // 26b MoE keeps the sync path (its router reads ids back mid-block).
+    pending: [256]command.CudaCommand = undefined,
+    n_pending: u32 = 0,
 
     // MoE scratch (only used when n_experts > 0)
     shared_buf: CudaBuffer, // [n_embd] shared-expert output (post_ffw_norm_1)
@@ -441,7 +448,8 @@ pub const ForwardGemma = struct {
         }
         const am = ArgmaxPush{ .N = d.vocab };
         cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &self.argmax_buf }, &am, @sizeOf(ArgmaxPush), 0);
-        cmd.commitAndWait();
+        cmd.commitAndWait(); // drains the shared stream incl. the async layer ops
+        self.drainPending(); // free the stashed async commands (completion guaranteed)
 
         var tok: u32 = 0;
         buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
@@ -510,7 +518,7 @@ pub const ForwardGemma = struct {
         cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.o_buf }, &rms, @sizeOf(RmsPush), 0);
         const acc = ScaleAccPush{ .N = d.n_embd, .scale = 1.0 };
         cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.o_buf }, &acc, @sizeOf(ScaleAccPush), 0);
-        cmd.commitAndWait();
+        self.submit(cmd);
     }
 
     fn ffnBlock(self: *ForwardGemma, L: u32) !void {
@@ -536,7 +544,7 @@ pub const ForwardGemma = struct {
         cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.down_buf }, &rms, @sizeOf(RmsPush), 0);
         const acc = ScaleAccPush{ .N = d.n_embd, .scale = 1.0 };
         cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.down_buf }, &acc, @sizeOf(ScaleAccPush), 0);
-        cmd.commitAndWait();
+        self.submit(cmd);
     }
 
     /// MoE FFN block (gemma4-26b-a4b). On entry `hidden` holds attn_out, the
@@ -662,7 +670,7 @@ pub const ForwardGemma = struct {
         var cmd = try command.beginCommand(ctx);
         const sm = ScalarMulPush{ .N = d.n_embd };
         cmd.dispatch(&self.pipes.scalar_mul, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &ws.gpu_buffer }, &sm, @sizeOf(ScalarMulPush), 0);
-        cmd.commitAndWait();
+        self.submit(cmd);
     }
 
     // ---- public per-block hooks (dbg_cuda per-layer residual diff) ----------
@@ -670,6 +678,7 @@ pub const ForwardGemma = struct {
     // after each gemma layer block and diff it against llama.cpp `l_out-N`.
     pub fn attentionLayerPub(self: *ForwardGemma, L: u32, pos: u32) !void {
         try self.attentionLayer(L, pos);
+        self.waitPending(); // block may be async in-flight; readHidden needs it done
     }
     /// FFN block dispatched exactly as decodeStep: routed MoE when this layer
     /// carries a router, dense GeGLU otherwise.
@@ -679,9 +688,11 @@ pub const ForwardGemma = struct {
         } else {
             try self.ffnBlock(L);
         }
+        self.waitPending();
     }
     pub fn layerOutScalePub(self: *ForwardGemma, L: u32) !void {
         try self.layerOutScale(L);
+        self.waitPending();
     }
 
     pub fn readHidden(self: *ForwardGemma, out: []f32) void {
@@ -708,6 +719,41 @@ pub const ForwardGemma = struct {
         } else {
             cmd.dispatch(&self.pipes.dmmv[idx], .{ M, 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
         }
+    }
+
+    // ---- async decode command ring (mirror ForwardCuda) ---------------------
+    /// Dense path (n_experts==0): commit the per-block command asynchronously on
+    /// the shared auto-ordered CUstream and stash it — the CPU never blocks per
+    /// block. The stream still serializes the GPU, so cross-block buffer reuse is
+    /// safe (only the ~0.4 ms WSL2 CPU↔GPU sync round-trips are removed, which
+    /// also stops the boost-starvation those idle gaps cause). MoE (n_experts>0)
+    /// stays synchronous (its router reads expert ids back to the host
+    /// mid-block); also falls back to sync if the ring fills.
+    fn submit(self: *ForwardGemma, cmd: command.CudaCommand) void {
+        var c = cmd;
+        if (self.d.n_experts == 0 and self.n_pending < self.pending.len) {
+            c.commitAsync();
+            self.pending[self.n_pending] = c;
+            self.n_pending += 1;
+        } else {
+            c.commitAndWait();
+        }
+    }
+
+    /// Free the stashed async commands. Safe once a later same-stream
+    /// commitAndWait (the tail) has drained the stream — completion guaranteed.
+    fn drainPending(self: *ForwardGemma) void {
+        var i: u32 = 0;
+        while (i < self.n_pending) : (i += 1) self.pending[i].releaseCompleted();
+        self.n_pending = 0;
+    }
+
+    /// Wait on + free the stashed async commands, for callers that read a GPU
+    /// result before any tail sync (the per-block Pub wrappers).
+    fn waitPending(self: *ForwardGemma) void {
+        var i: u32 = 0;
+        while (i < self.n_pending) : (i += 1) self.pending[i].wait();
+        self.n_pending = 0;
     }
 };
 
