@@ -90,6 +90,8 @@ const ArgmaxPush = extern struct { N: u32 };
 const TopkPush = extern struct { n_experts: u32, k: u32 };
 const MoeAccPush = extern struct { N: u32, n_used: u32, src_stride: u32 };
 const SigmoidAccPush = extern struct { N: u32 };
+// Batched MoE expert matvec: one launch over all n_used experts, GPU-side ids.
+const ExpertsPush = extern struct { M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32 };
 
 /// Map a GGUF quant type to its DMMV kernel pipeline (indexes ForwardCuda.dmmv).
 fn dmmvIdx(t: gguf.GGMLType) usize {
@@ -188,6 +190,8 @@ const Pipelines = struct {
     softmax_topk: CudaPipeline,
     moe_weighted_acc: CudaPipeline,
     sigmoid_scale_acc: CudaPipeline,
+    dmmv_q4k_experts: CudaPipeline, // batched gate/up over all experts
+    dmmv_q5k_experts: CudaPipeline, // batched down over all experts
 };
 
 /// Per-token GPU forward state for qwen35 greedy decode.
@@ -219,7 +223,7 @@ pub const ForwardCuda = struct {
     // async decode command ring (dense path): commitAsync'd layer commands are
     // stashed here and freed after the tail commitAndWait drains the shared
     // CUstream. Defaults so the init literal need not list them.
-    pending: [128]command.CudaCommand = undefined,
+    pending: [1024]command.CudaCommand = undefined,
     n_pending: u32 = 0,
     // MoE scratch (only used when n_experts > 0)
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
@@ -285,10 +289,14 @@ pub const ForwardCuda = struct {
         pipes.softmax_topk = try pipeline.createPipeline(ctx, src.ptr, "softmax_topk");
         pipes.moe_weighted_acc = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc");
         pipes.sigmoid_scale_acc = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_scale_acc");
-        log.info("nvrtc: compiled {d} kernel pipelines", .{23});
+        pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
+        pipes.dmmv_q5k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_experts");
+        log.info("nvrtc: compiled {d} kernel pipelines", .{25});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
+        // Batched MoE buffers hold all n_used experts' gate/up/swiglu (slot-major).
+        const moe_act = @max(max_act, d.n_experts_used * d.n_ff);
         // MoE: down_buf is slot-major [n_used * n_embd]; keep ≥64 for the SSM beta reuse.
         const down_elems = @max(@as(u32, 64), d.n_experts_used * d.n_embd);
         // Tiny-but-nonzero stubs so the dense path (n_experts==0) still allocates/free uniformly.
@@ -307,11 +315,11 @@ pub const ForwardCuda = struct {
             .q_buf = try buffer.createBuffer(ctx, d.q_dim * f4),
             .k_buf = try buffer.createBuffer(ctx, d.kv_dim * f4),
             .v_buf = try buffer.createBuffer(ctx, d.kv_dim * f4),
-            .gate_buf = try buffer.createBuffer(ctx, max_act * f4),
+            .gate_buf = try buffer.createBuffer(ctx, moe_act * f4),
             .attn_out_buf = try buffer.createBuffer(ctx, d.conv_channels * f4),
             .ffn_norm_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
-            .up_buf = try buffer.createBuffer(ctx, d.n_ff * f4),
-            .swiglu_buf = try buffer.createBuffer(ctx, max_act * f4),
+            .up_buf = try buffer.createBuffer(ctx, moe_act * f4),
+            .swiglu_buf = try buffer.createBuffer(ctx, moe_act * f4),
             .router_buf = try buffer.createBuffer(ctx, 64 * f4),
             .down_buf = try buffer.createBuffer(ctx, down_elems * f4),
             .logits_buf = try buffer.createBuffer(ctx, d.vocab * f4),
@@ -600,6 +608,10 @@ pub const ForwardCuda = struct {
         const gate_slice = expertSliceBytes(wge.info.type_, ef, d.n_embd);
         const up_slice = expertSliceBytes(wue.info.type_, ef, d.n_embd);
         const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+        // Fast batched path when experts are q4k (gate/up) + q5k (down): one
+        // launch over all experts, ids read GPU-side, no host readback. Else the
+        // per-slot host path (correct for any quant).
+        const batched_experts = dmmvIdx(wge.info.type_) == 0 and dmmvIdx(wue.info.type_) == 0 and dmmvIdx(wde.info.type_) == 1;
 
         // --- Router: rms_norm → logits → top-k softmax. -----------------------
         {
@@ -609,36 +621,53 @@ pub const ForwardCuda = struct {
             self.dmmvDispatch(&cmd, wrouter, &self.ffn_norm_buf, &self.router_logits_buf, d.n_experts, d.n_embd, 0, 0);
             const tk = TopkPush{ .n_experts = d.n_experts, .k = n_used };
             cmd.dispatch(&self.pipes.softmax_topk, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.router_logits_buf, &self.router_out_buf }, &tk, @sizeOf(TopkPush), 0);
-            cmd.commitAndWait(); // sync: the host reads the chosen expert ids next
-            self.drainPending(); // stream drained → free any async attn/ssm/prior-layer ops
+            if (batched_experts) {
+                self.submit(cmd); // async: experts read the ids GPU-side, no readback
+            } else {
+                cmd.commitAndWait(); // sync: the fallback host-gathers the ids next
+                self.drainPending();
+            }
         }
 
-        // Download the chosen expert ids (host gather of the slot→expert map).
-        buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router_ids[0..n_used]));
+        // Fallback only: download the chosen expert ids for the per-slot path.
+        if (!batched_experts) {
+            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router_ids[0..n_used]));
+        }
 
-        // --- Routed experts: gate/up/SwiGLU/down per slot, slot-major into down_buf.
+        // --- Routed experts → SwiGLU → down, slot-major into down_buf.
         {
             var cmd = try command.beginCommand(ctx);
-            const sg = SwigluPush{ .N = ef };
-            var j: u32 = 0;
-            while (j < n_used) : (j += 1) {
-                const id = self.host_router_ids[j];
-                self.dmmvDispatch(&cmd, wge, &self.ffn_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gate_slice);
-                self.dmmvDispatch(&cmd, wue, &self.ffn_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * up_slice);
-                cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
-                // down → slot j's region of down_buf (element offset j*n_embd → y_offset bytes).
-                const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
-                const didx = dmmvIdx(wde.info.type_);
-                if (didx < 4) {
-                    cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
-                } else {
-                    cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+            if (batched_experts) {
+                const nrows_gu = n_used * ef;
+                const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gate_slice, .x_stride = 0, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wge.gpu_buffer, &self.ffn_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
+                const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = up_slice, .x_stride = 0, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wue.gpu_buffer, &self.ffn_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                const sg = SwigluPush{ .N = nrows_gu };
+                cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(nrows_gu, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used };
+                cmd.dispatch(&self.pipes.dmmv_q5k_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
+            } else {
+                const sg = SwigluPush{ .N = ef };
+                var j: u32 = 0;
+                while (j < n_used) : (j += 1) {
+                    const id = self.host_router_ids[j];
+                    self.dmmvDispatch(&cmd, wge, &self.ffn_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gate_slice);
+                    self.dmmvDispatch(&cmd, wue, &self.ffn_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * up_slice);
+                    cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                    const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                    const didx = dmmvIdx(wde.info.type_);
+                    if (didx < 4) {
+                        cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    } else {
+                        cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    }
                 }
             }
             // weighted combine of the k slot outputs into hidden.
             const ma = MoeAccPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd };
             cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
-            self.submit(cmd); // async: no host read-back until the next layer's router
+            self.submit(cmd);
         }
 
         // --- Shared expert: gate/up/SwiGLU/down, scaled by sigmoid(gate logit).

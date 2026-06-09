@@ -784,6 +784,90 @@ extern "C" __global__ void dmmv_q5k_fast(const unsigned* a_u32, const float* x, 
     sum = zinc_block_reduce_sum(sum);
     if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
 }
+// ---- batched MoE expert matvecs ---------------------------------------------
+// One launch over ALL n_used experts: block `g` handles (expert e=g/M, row=g%M).
+// The chosen expert id is read GPU-side from `expert_ids` (router_out_buf), so
+// there is NO host readback — the whole MoE block runs async and the GPU stays
+// busy enough to leave its idle clock. Per-expert weight slice = id*slice; x is
+// shared across experts for gate/up (x_stride=0) or per-expert for down
+// (x_stride=K, i.e. swiglu[e*K..]). Output is slot-major: y[e*M + row].
+struct ExpertsPush { unsigned M, K, slice, x_stride, n_used; };
+
+extern "C" __global__ void dmmv_q4k_experts(const unsigned* a_u32, const float* x, float* y, const unsigned* expert_ids, ExpertsPush pc) {
+    unsigned g = blockIdx.x;
+    unsigned e = g / pc.M;
+    if (e >= pc.n_used) return;
+    unsigned row = g - e * pc.M;
+    unsigned bpr = pc.K >> 8;
+    unsigned a_base = (expert_ids[e] * pc.slice >> 2) + row * bpr * 36u;
+    const float4* xv = (const float4*)(x + (size_t)e * pc.x_stride);
+    unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
+    unsigned l0 = 4u * (2u * ir + v_in);
+    unsigned q_off = 32u * v_im + l0, y_loc = 64u * v_im + l0, shift = v_im * 16u;
+    unsigned ngrp = blockDim.x >> 4;
+    float sum = 0.0f;
+    for (unsigned i = grp; i < bpr; i += ngrp) {
+        unsigned blk = a_base + i * 36u;
+        unsigned dd = a_u32[blk];
+        float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF));
+        float dm = zinc_half_to_float((unsigned short)(dd >> 16));
+        unsigned sc0 = a_u32[blk + 1u], sc1 = a_u32[blk + 2u], sc2 = a_u32[blk + 3u];
+        unsigned qs0 = a_u32[blk + 4u + (q_off >> 2)], qs1 = a_u32[blk + 4u + (q_off >> 2) + 16u];
+        unsigned bidx = (i * 256u + y_loc) >> 2, bidx2 = (i * 256u + y_loc + 128u) >> 2;
+        float4 by0 = xv[bidx], by1 = xv[bidx + 8u], by2 = xv[bidx2], by3 = xv[bidx2 + 8u];
+        unsigned s0 = sc0 >> shift, s1 = sc1 >> shift, s2 = sc2 >> shift;
+        float f0 = d * (float)(s0 & 0x3Fu), b0 = dm * (float)(s1 & 0x3Fu);
+        float f1 = d * (float)((s0 >> 8) & 0x3Fu), b1 = dm * (float)((s1 >> 8) & 0x3Fu);
+        float f2 = d * (float)((s2 & 0xFu) | ((s0 & 0xC0u) >> 2)), b2 = dm * (float)(((s2 & 0xF0u) >> 4) | ((s1 & 0xC0u) >> 2));
+        float f3 = d * (float)(((s2 >> 8) & 0xFu) | (((s0 >> 8) & 0xC0u) >> 2)), b3 = dm * (float)((((s2 >> 8) & 0xF0u) >> 4) | (((s1 >> 8) & 0xC0u) >> 2));
+        sum += (f0*(float)(qs0&0xFu)-b0)*by0.x + (f0*(float)((qs0>>8)&0xFu)-b0)*by0.y + (f0*(float)((qs0>>16)&0xFu)-b0)*by0.z + (f0*(float)((qs0>>24)&0xFu)-b0)*by0.w;
+        sum += (f1*(float)((qs0>>4)&0xFu)-b1)*by1.x + (f1*(float)((qs0>>12)&0xFu)-b1)*by1.y + (f1*(float)((qs0>>20)&0xFu)-b1)*by1.z + (f1*(float)((qs0>>28)&0xFu)-b1)*by1.w;
+        sum += (f2*(float)(qs1&0xFu)-b2)*by2.x + (f2*(float)((qs1>>8)&0xFu)-b2)*by2.y + (f2*(float)((qs1>>16)&0xFu)-b2)*by2.z + (f2*(float)((qs1>>24)&0xFu)-b2)*by2.w;
+        sum += (f3*(float)((qs1>>4)&0xFu)-b3)*by3.x + (f3*(float)((qs1>>12)&0xFu)-b3)*by3.y + (f3*(float)((qs1>>20)&0xFu)-b3)*by3.z + (f3*(float)((qs1>>28)&0xFu)-b3)*by3.w;
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (tid == 0) y[(size_t)e * pc.M + row] = sum;
+}
+
+extern "C" __global__ void dmmv_q5k_experts(const unsigned* a_u32, const float* x, float* y, const unsigned* expert_ids, ExpertsPush pc) {
+    unsigned g = blockIdx.x;
+    unsigned e = g / pc.M;
+    if (e >= pc.n_used) return;
+    unsigned row = g - e * pc.M;
+    unsigned bpr = pc.K >> 8;
+    unsigned a_base = (expert_ids[e] * pc.slice >> 2) + row * bpr * 44u;
+    const float4* xv = (const float4*)(x + (size_t)e * pc.x_stride);
+    unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
+    unsigned l0 = 4u * (2u * ir + v_in);
+    unsigned q_off = 32u * v_im + l0, y_loc = 64u * v_im + l0, shift = v_im * 16u, ngrp = blockDim.x >> 4;
+    unsigned sba = 2u*v_im, sbb = 2u*v_im+1u, sbc = 2u*v_im+4u, sbd = 2u*v_im+5u;
+    float sum = 0.0f;
+    for (unsigned i = grp; i < bpr; i += ngrp) {
+        unsigned blk = a_base + i * 44u, dd = a_u32[blk];
+        float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF)), dm = zinc_half_to_float((unsigned short)(dd >> 16));
+        unsigned sc0 = a_u32[blk+1u], sc1 = a_u32[blk+2u], sc2 = a_u32[blk+3u];
+        unsigned qh = a_u32[blk + 4u + (l0 >> 2)];
+        unsigned qs0 = a_u32[blk + 12u + (q_off >> 2)], qs1 = a_u32[blk + 12u + (q_off >> 2) + 16u];
+        unsigned bidx = (i*256u + y_loc) >> 2, bidx2 = (i*256u + y_loc + 128u) >> 2;
+        float4 by0=xv[bidx], by1=xv[bidx+8u], by2=xv[bidx2], by3=xv[bidx2+8u];
+        unsigned s0=sc0>>shift, s1=sc1>>shift, s2=sc2>>shift;
+        float f0=d*(float)(s0&0x3Fu), b0=dm*(float)(s1&0x3Fu);
+        float f1=d*(float)((s0>>8)&0x3Fu), b1=dm*(float)((s1>>8)&0x3Fu);
+        float f2=d*(float)((s2&0xFu)|((s0&0xC0u)>>2)), b2=dm*(float)(((s2&0xF0u)>>4)|((s1&0xC0u)>>2));
+        float f3=d*(float)(((s2>>8)&0xFu)|(((s0>>8)&0xC0u)>>2)), b3=dm*(float)((((s2>>8)&0xF0u)>>4)|(((s1>>8)&0xC0u)>>2));
+        #define Q5E(q,sh,sb,j) ((float)(((q)>>(sh))&0xFu) + 16.0f*(float)(((qh)>>((sb)+(j)*8u))&1u))
+        sum += (f0*Q5E(qs0,0,sba,0)-b0)*by0.x + (f0*Q5E(qs0,8,sba,1)-b0)*by0.y + (f0*Q5E(qs0,16,sba,2)-b0)*by0.z + (f0*Q5E(qs0,24,sba,3)-b0)*by0.w;
+        sum += (f1*Q5E(qs0,4,sbb,0)-b1)*by1.x + (f1*Q5E(qs0,12,sbb,1)-b1)*by1.y + (f1*Q5E(qs0,20,sbb,2)-b1)*by1.z + (f1*Q5E(qs0,28,sbb,3)-b1)*by1.w;
+        sum += (f2*Q5E(qs1,0,sbc,0)-b2)*by2.x + (f2*Q5E(qs1,8,sbc,1)-b2)*by2.y + (f2*Q5E(qs1,16,sbc,2)-b2)*by2.z + (f2*Q5E(qs1,24,sbc,3)-b2)*by2.w;
+        sum += (f3*Q5E(qs1,4,sbd,0)-b3)*by3.x + (f3*Q5E(qs1,12,sbd,1)-b3)*by3.y + (f3*Q5E(qs1,20,sbd,2)-b3)*by3.z + (f3*Q5E(qs1,28,sbd,3)-b3)*by3.w;
+        #undef Q5E
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (tid == 0) y[(size_t)e * pc.M + row] = sum;
+}
+
 // ---- dmmv_q8_0_fast — whole-block-per-thread, d once, float4 x --------------
 extern "C" __global__ void dmmv_q8_0_fast(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x; if (row >= pc.M) return;
