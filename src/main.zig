@@ -1741,13 +1741,18 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     // returned for the last prompt token is the first generated token.
     var pos: u32 = 0;
     var next_tok: u32 = 0;
+    var prefill_timer = try std.time.Timer.start();
     while (pos < prompt_tokens.len) : (pos += 1) {
         next_tok = try fwd.decodeStep(prompt_tokens[pos], pos, true);
     }
+    const prefill_ms = @as(f64, @floatFromInt(prefill_timer.read())) / 1_000_000.0;
+    const prefill_tps = if (prefill_ms > 0) @as(f64, @floatFromInt(prompt_tokens.len)) / (prefill_ms / 1000.0) else 0;
+    log.info("Prefill complete: {d} tokens in {d:.1} ms ({d:.2} tok/s)", .{ prompt_tokens.len, prefill_ms, prefill_tps });
 
     // GENERATE: greedily feed the argmax back until EOS or the token budget /
     // context limit is reached.
     var produced: u32 = 0;
+    var decode_timer = try std.time.Timer.start();
     while (produced < max_new and pos < max_ctx) {
         if (next_tok == eos_id) break;
         try generated.append(allocator, next_tok);
@@ -1757,6 +1762,10 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
         next_tok = try fwd.decodeStep(fed, pos, true);
         pos += 1;
     }
+    const decode_ms = @as(f64, @floatFromInt(decode_timer.read())) / 1_000_000.0;
+    const decode_tps = if (decode_ms > 0) @as(f64, @floatFromInt(produced)) / (decode_ms / 1000.0) else 0;
+    const ms_per_token = if (produced > 0) decode_ms / @as(f64, @floatFromInt(produced)) else 0;
+    log.info("Generated {d} tokens in {d:.1} ms — {d:.2} tok/s ({d:.2} ms/tok)", .{ produced, decode_ms, decode_tps, ms_per_token });
 
     if (config.debug) {
         log.debug("Generated tokens ({d}): {any}", .{

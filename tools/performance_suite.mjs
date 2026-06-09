@@ -16,7 +16,7 @@ export const DEFAULT_LOCAL_MODEL_ROOT = path.join(os.homedir(), "Library", "Cach
 const DEFAULT_DOCKER_LLAMA_SERVER = path.join(os.homedir(), ".docker", "bin", "inference", "llama-server");
 const DEFAULT_RDNA_WORKDIR = "/root/zinc-bench";
 const DEFAULT_RDNA_MODEL_ROOT = "/root/models";
-const TARGET_ORDER = ["rdna", "intel", "metal"];
+const TARGET_ORDER = ["rdna", "cuda", "intel", "metal"];
 const MAX_CAPTURE_CHARS = 256_000;
 
 function modelPath(root, dir) {
@@ -101,6 +101,14 @@ export function parseArgs(argv) {
       ? parseInteger(process.env.ZINC_RDNA_VK_DEVICE, "ZINC_RDNA_VK_DEVICE")
       : 0,
     requireRdnaDeviceSubstring: process.env.ZINC_RDNA_REQUIRE_DEVICE_SUBSTRING ?? null,
+    cudaSync: false,
+    cudaBuild: false,
+    cudaStartLlama: false,
+    cudaNode: process.env.ZINC_CUDA_NODE ?? null,
+    cudaGpuUuid: process.env.ZINC_CUDA_GPU_UUID ?? process.env.ZINC_CUDA_GPU ?? null,
+    cudaWorkdir: process.env.ZINC_CUDA_WORKDIR ?? null,
+    cudaModelRoot: process.env.ZINC_CUDA_MODEL_ROOT ?? null,
+    cudaLlamaServer: process.env.ZINC_CUDA_LLAMA_SERVER_REMOTE ?? null,
     intelSync: false,
     intelBuild: false,
     intelStartLlama: false,
@@ -124,8 +132,8 @@ export function parseArgs(argv) {
     switch (arg) {
       case "--target": {
         const value = argv[++i] ?? "";
-        if (!["metal", "rdna", "intel", "both", "all"].includes(value)) {
-          throw new Error(`Invalid --target '${value}'. Expected metal, rdna, intel, both, or all.`);
+        if (!["metal", "rdna", "cuda", "intel", "both", "all"].includes(value)) {
+          throw new Error(`Invalid --target '${value}'. Expected metal, rdna, cuda, intel, both, or all.`);
         }
         args.target = value;
         break;
@@ -213,6 +221,27 @@ export function parseArgs(argv) {
         break;
       case "--require-rdna-device-substring":
         args.requireRdnaDeviceSubstring = argv[++i] ?? args.requireRdnaDeviceSubstring;
+        break;
+      case "--cuda-sync":
+        args.cudaSync = true;
+        break;
+      case "--cuda-build":
+        args.cudaBuild = true;
+        break;
+      case "--cuda-start-llama":
+        args.cudaStartLlama = true;
+        break;
+      case "--cuda-node":
+        args.cudaNode = argv[++i] ?? args.cudaNode;
+        break;
+      case "--cuda-gpu":
+        args.cudaGpuUuid = argv[++i] ?? args.cudaGpuUuid;
+        break;
+      case "--cuda-workdir":
+        args.cudaWorkdir = argv[++i] ?? args.cudaWorkdir;
+        break;
+      case "--cuda-model-root":
+        args.cudaModelRoot = argv[++i] ?? args.cudaModelRoot;
         break;
       case "--intel-model-root":
         args.intelModelRoot = argv[++i] ?? args.intelModelRoot;
@@ -1089,7 +1118,7 @@ async function waitForHealthyRdnaServer(creds, port, logPath, timeoutMs) {
   while (Date.now() < deadline) {
     try {
       await runShell(
-        rdnaRemoteCommand(`curl -fsS http://127.0.0.1:${port}/health >/dev/null`, creds),
+        rdnaRemoteCommand(`curl -fsS http://${creds.loopbackHost ?? "127.0.0.1"}:${port}/health >/dev/null`, creds),
         { cwd: ROOT, timeoutMs: 10000 },
       );
       return;
@@ -1111,7 +1140,7 @@ async function stopRdnaLlamaServer(creds, port) {
   if (!port) return;
   try {
     await runShell(
-      rdnaRemoteCommand(`pkill -f 'llama-server --host 127.0.0.1 --port ${port}' || true`, creds),
+      rdnaRemoteCommand(`pkill -f 'llama-server --host ${creds.loopbackHost ?? "127.0.0.1"} --port ${port}' || true`, creds),
       { cwd: ROOT, timeoutMs: 30000 },
     );
   } catch {
@@ -1148,10 +1177,10 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targ
 
   const cmd = [
     serverPath,
-    "--host", "127.0.0.1",
+    "--host", (creds.loopbackHost ?? "127.0.0.1"),
     "--port", String(port),
     "-m", caseDef.model_path,
-    "--device", `Vulkan${creds.vkDevice ?? 0}`,
+    ...(creds.serverDeviceArgs ?? ["--device", `Vulkan${creds.vkDevice ?? 0}`]),
     "-ngl", "999",
     "--metrics",
     "--ctx-size", "4096",
@@ -1218,7 +1247,7 @@ async function runRdnaOpenAiSeries({ label, warmupRuns, runs, creds, port, caseD
   const endpoint = caseDef.prompt_mode === "chat" ? `/v1/chat/completions` : `/v1/completions`;
   const payload = buildOpenAiPayload(caseDef);
   const command = rdnaRemoteCommand(
-    `curl -sS http://127.0.0.1:${port}${endpoint} -H 'Content-Type: application/json' -d ${shellQuote(JSON.stringify(payload))}`,
+    `curl -sS http://${creds.loopbackHost ?? "127.0.0.1"}:${port}${endpoint} -H 'Content-Type: application/json' -d ${shellQuote(JSON.stringify(payload))}`,
     creds,
   );
   const measured = [];
@@ -1328,8 +1357,7 @@ function remoteLlamaCommand(caseDef, creds, llamaCliPath) {
     "0",
     "-ngl",
     "999",
-    "--device",
-    `Vulkan${creds.vkDevice ?? 0}`,
+    ...(creds.cliDeviceArgs ?? ["--device", `Vulkan${creds.vkDevice ?? 0}`]),
     "--flash-attn",
     "on",
     "-b",
@@ -2556,6 +2584,317 @@ async function runRdnaTarget(args) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// CUDA target (NVIDIA, e.g. RTX 5090). Mirrors the rdna path: SSH to the node,
+// sync the tree, build -Dbackend=cuda, then run the ZINC CLI vs llama.cpp across
+// the four-scenario matrix. The GPU is pinned by UUID via CUDA_VISIBLE_DEVICES
+// (nvidia-smi indices are unreliable on the WSL2 passthrough), so no Vulkan
+// device flag is used. Host/port/user come from env (ZINC_CUDA_* / ZINC_HOST),
+// never committed — see docs/BENCHMARKING.md.
+// ---------------------------------------------------------------------------
+function cudaEnvValue(dotEnv, args, suffix, ...fallbackKeys) {
+  const envMap = args?.envMap ?? process.env;
+  const node = args?.cudaNode ?? envValueFrom(envMap, dotEnv, "ZINC_CUDA_NODE");
+  const nodeKey = node ? rdnaNodeEnvKey(node, suffix) : null;
+  return envValueFrom(envMap, dotEnv, ...(nodeKey ? [nodeKey] : []), ...fallbackKeys);
+}
+
+async function buildCudaCreds(args) {
+  const dotEnv = await readDotEnv(path.join(ROOT, ".env"));
+  const host = cudaEnvValue(dotEnv, args, "HOST", "ZINC_CUDA_HOST", "ZINC_HOST");
+  const user = cudaEnvValue(dotEnv, args, "USER", "ZINC_CUDA_USER", "ZINC_USER");
+  const port = cudaEnvValue(dotEnv, args, "PORT", "ZINC_CUDA_PORT", "ZINC_PORT") ?? "22";
+  if (!host || !user) {
+    throw new Error("CUDA benchmarking needs ZINC_CUDA_HOST/ZINC_CUDA_USER (or ZINC_HOST/ZINC_USER) in the environment or .env");
+  }
+  const gpuUuid = args.cudaGpuUuid
+    ?? cudaEnvValue(dotEnv, args, "GPU_UUID", "ZINC_CUDA_GPU_UUID", "ZINC_CUDA_GPU")
+    ?? "GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350"; // RTX 5090 on the reference node; override with --cuda-gpu
+  const remoteHome = remoteHomeForUser(user);
+  const workdir = args.cudaWorkdir ?? cudaEnvValue(dotEnv, args, "WORKDIR", "ZINC_CUDA_WORKDIR") ?? `${remoteHome}/zinc-bench-cuda`;
+  const modelRoot = args.cudaModelRoot ?? cudaEnvValue(dotEnv, args, "MODEL_ROOT", "ZINC_CUDA_MODEL_ROOT") ?? `${remoteHome}/workspace/models`;
+  const llamaServerOverride = args.cudaLlamaServer ?? cudaEnvValue(dotEnv, args, "LLAMA_SERVER_REMOTE", "ZINC_CUDA_LLAMA_SERVER_REMOTE") ?? null;
+  return {
+    host,
+    user,
+    port,
+    workdir,
+    // CUDA_VISIBLE_DEVICES pins the target GPU by UUID for both the ZINC CLI and
+    // the llama-server baseline (remoteEnvPrefix / the launch script inject it).
+    env: { CUDA_VISIBLE_DEVICES: gpuUuid },
+    // No Vulkan device flag on CUDA; the env var above already isolates the GPU.
+    serverDeviceArgs: [],
+    cliDeviceArgs: [],
+    // This WSL2 box is net-fenced to 127.99/16; plain 127.0.0.1 loopback is
+    // blackholed (SYN dropped), so the llama-server bind + its health/API curls
+    // must use a 127.99.x.x address. Overridable via ZINC_CUDA_LOOPBACK_HOST.
+    loopbackHost: args.cudaLoopbackHost ?? process.env.ZINC_CUDA_LOOPBACK_HOST ?? "127.99.0.1",
+    gpuUuid,
+    modelRoot,
+    llamaServerOverride,
+    llamaSearchRoots: [`${remoteHome}/workspace/llama.cpp`, `${remoteHome}/llama.cpp`, "/workspace/llama.cpp"],
+  };
+}
+
+export function defaultCudaCases(modelRoot) {
+  return defaultRdnaCases(modelRoot).map((entry) => ({
+    ...entry,
+    notes: ["RTX 5090 (CUDA) comparison against llama.cpp server on the same host"],
+  }));
+}
+
+async function prepareCuda(args, creds) {
+  if (args.cudaSync) {
+    console.log("Syncing current repo to CUDA node...");
+    const rsyncCmd = [
+      "rsync -az --delete",
+      "--exclude '.zig-cache'",
+      "--exclude 'zig-out'",
+      "--exclude 'node_modules'",
+      "--exclude '.git'",
+      "--exclude '.env'",
+      "--exclude '.env.*'",
+      "--exclude '.zinc_rt_autopilot'",
+      "--exclude '.zinc_optimize'",
+      "--exclude '.llm_optimize'",
+      "--exclude '.perf_optimize'",
+      "--exclude '.DS_Store'",
+      "--exclude 'site'",
+      `-e ${shellQuote(remoteSshTransport(creds))}`,
+      `${shellQuote(`${ROOT}/`)}`,
+      `${creds.user}@${creds.host}:${shellQuote(`${creds.workdir}/`)}`,
+    ].join(" ");
+    await runShell(rsyncCmd, { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
+  }
+
+  if (args.cudaBuild) {
+    console.log("Building ReleaseFast (cuda) on CUDA node...");
+    // CUDA kernels are NVRTC-compiled at runtime for the visible GPU's compute
+    // capability, so shader precompilation is off (-Dshaders=false) and one
+    // build runs on any visible NVIDIA GPU.
+    const buildArgs = ["zig", "build", "-Doptimize=ReleaseFast", "-Dbackend=cuda", "-Dshaders=false"];
+    if (args.cudaSync) {
+      const syncedProvenance = await captureGitProvenance(ROOT);
+      if (syncedProvenance.version) buildArgs.push(`-Dversion=${shellQuote(syncedProvenance.version)}`);
+      if (syncedProvenance.commit) buildArgs.push(`-Dcommit=${shellQuote(syncedProvenance.commit)}`);
+    }
+    const remote = `cd ${shellQuote(creds.workdir)} && ${buildArgs.join(" ")}`;
+    await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
+  }
+
+  if (args.cudaStartLlama) {
+    console.log("Stopping pre-existing llama-server processes on CUDA node...");
+    const remote = [
+      "pkill -9 -x llama-server 2>/dev/null || true",
+      "sleep 2",
+      "echo 'cleared'",
+    ].join(" && ");
+    await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60000 });
+  }
+}
+
+async function verifyCudaZincBackend(creds, { quiet = false } = {}) {
+  const remote = `cd ${shellQuote(creds.workdir)} && ./zig-out/bin/zinc --version`;
+  const result = await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 120000 });
+  const parsed = validateZincBackend(result.stdout, "cuda");
+  if (!quiet) console.log(`[cuda] verified ZINC binary backend: ${parsed.backend}`);
+  return parsed;
+}
+
+async function runCudaTarget(args) {
+  const creds = await buildCudaCreds(args);
+  await prepareCuda(args, creds);
+  await verifyCudaZincBackend(creds);
+  const cudaLlamaServer = await detectRemoteLlamaServerPath(creds, creds.llamaSearchRoots, creds.llamaServerOverride);
+  const cudaLlamaCli = await detectRemoteLlamaCliPath(creds, creds.llamaSearchRoots, process.env.ZINC_CUDA_LLAMA_CLI_REMOTE ?? null);
+  const baselineBinary = cudaLlamaServer || cudaLlamaCli;
+  const zincProvenance = args.cudaSync
+    ? await captureGitProvenance(ROOT)
+    : await captureRemoteGitProvenance(creds);
+  const llamaCppProvenance = await captureRemoteLlamaCppProvenance(baselineBinary, creds);
+
+  const knownCases = defaultCudaCases(creds.modelRoot);
+  const discoveredCases = args.discoverModels ? await discoverRemoteCases(creds.modelRoot, creds, "Auto-discovered on the CUDA benchmark node") : [];
+  const mergedCases = new Map();
+  for (const entry of [...discoveredCases, ...knownCases]) {
+    mergedCases.set(entry.id, entry);
+  }
+  const cases = [];
+  for (const entry of mergedCases.values()) {
+    if (args.models && !args.models.has(entry.id)) continue;
+    if (!(await rdnaPathExists(entry.model_path, creds))) {
+      console.log(`[cuda] skipping ${entry.id}: missing GGUF at ${entry.model_path}`);
+      continue;
+    }
+    cases.push(entry);
+  }
+  const models = [];
+
+  for (const entry of cases) {
+    console.log(`[cuda] ${entry.id}`);
+    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase);
+    const scenarioDefs = defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt);
+    const zincByScenario = new Map();
+    const baselineByScenario = new Map();
+    let launchedServer = null;
+    let triedLaunchingServer = false;
+    let serverLaunchFailure = null;
+    try {
+      for (const phase of phases) {
+        const scenarioDef = phase.scenarioDef;
+        const caseDef = buildScenarioCase(entry, scenarioDef);
+        if (phase.phase === "zinc") {
+          let zinc = null;
+          try {
+            await verifyCudaZincBackend(creds, { quiet: true });
+            const zincRows = await runSeries({
+              label: `zinc ${entry.id} ${scenarioDef.id}`,
+              warmupRuns: args.warmupRuns,
+              runs: args.runs,
+              command: remoteZincCommand(caseDef, creds),
+              parser: parseZincCliOutput,
+              cwd: ROOT,
+              timeoutMs: args.timeoutMs,
+            });
+            zinc = createStats("ZINC", zincRows);
+          } catch (error) {
+            zinc = {
+              name: "ZINC",
+              unavailable_reason: benchmarkFailureReason("ZINC run failed", error),
+            };
+          }
+          zincByScenario.set(scenarioDef.id, zinc);
+          continue;
+        }
+
+        if (!triedLaunchingServer && cudaLlamaServer) {
+          triedLaunchingServer = true;
+          try {
+            launchedServer = await launchRdnaLlamaServer(entry, creds, cudaLlamaServer, args.timeoutMs, "cuda", false);
+          } catch (error) {
+            launchedServer = null;
+            serverLaunchFailure = error;
+          }
+        }
+
+        let baseline = null;
+        if (entry.baseline_enabled !== false && launchedServer) {
+          try {
+            const baselineRows = await runRdnaOpenAiSeries({
+              label: `llama.cpp ${entry.id} ${scenarioDef.id}`,
+              warmupRuns: args.warmupRuns,
+              runs: args.runs,
+              creds,
+              port: launchedServer.port,
+              caseDef,
+              timeoutMs: args.timeoutMs,
+            });
+            baseline = createStats("llama.cpp", baselineRows);
+          } catch (error) {
+            baseline = {
+              name: "llama.cpp",
+              unavailable_reason: benchmarkFailureReason("CUDA baseline failed", error),
+            };
+          }
+        } else if (entry.baseline_enabled !== false && serverLaunchFailure) {
+          baseline = {
+            name: "llama.cpp",
+            unavailable_reason: benchmarkFailureReason("CUDA baseline failed", serverLaunchFailure),
+          };
+        } else if (entry.baseline_enabled !== false && cudaLlamaCli) {
+          try {
+            const baselineRows = await runSeries({
+              label: `llama.cpp ${entry.id} ${scenarioDef.id}`,
+              warmupRuns: args.warmupRuns,
+              runs: args.runs,
+              command: remoteLlamaCommand(caseDef, creds, cudaLlamaCli),
+              parser: parseLlamaCliOutput,
+              cwd: ROOT,
+              timeoutMs: args.timeoutMs,
+            });
+            baseline = createStats("llama.cpp", baselineRows);
+          } catch (error) {
+            baseline = {
+              name: "llama.cpp",
+              unavailable_reason: benchmarkFailureReason("CUDA baseline failed", error),
+            };
+          }
+        } else {
+          baseline = {
+            name: "llama.cpp",
+            unavailable_reason: cudaLlamaServer
+              ? "No CUDA llama.cpp baseline is defined for this case yet."
+              : "Could not locate a remote llama.cpp baseline binary on the CUDA node.",
+          };
+        }
+
+        baselineByScenario.set(scenarioDef.id, baseline);
+      }
+    } finally {
+      if (launchedServer) {
+        await stopRdnaLlamaServer(creds, launchedServer.port);
+      }
+    }
+
+    const includeZinc = phaseEnabled(args.phase, "zinc");
+    const includeBaseline = phaseEnabled(args.phase, "baseline");
+    const scenarios = scenarioDefs.map((scenarioDef) => scenarioResultPayload(
+      entry,
+      scenarioDef,
+      zincByScenario.get(scenarioDef.id) ?? (includeZinc ? {
+        name: "ZINC",
+        unavailable_reason: "No ZINC benchmark result was recorded for this scenario.",
+      } : undefined),
+      baselineByScenario.get(scenarioDef.id) ?? (includeBaseline ? {
+        name: "llama.cpp",
+        unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
+      } : undefined),
+    ));
+    const summary = primaryScenarioSummary(entry, scenarios);
+    models.push(summary);
+    logModelSummary("cuda", summary);
+    await writePartialSnapshot(args, "cuda", "RTX 5090", models);
+  }
+
+  return {
+    id: "cuda",
+    label: "RTX 5090",
+    description: "NVIDIA RTX 5090 (CUDA) benchmark node results collected over SSH and compared against llama.cpp on the same hardware.",
+    generated_at: new Date().toISOString(),
+    source: "tools/performance_suite.mjs",
+    machine: {
+      label: "NVIDIA CUDA bench node",
+      machine_model: "Remote Linux host (WSL2)",
+      chip: "NVIDIA GeForce RTX 5090",
+      memory: "32 GB VRAM · 1792 GB/s",
+      gpu: "GeForce RTX 5090",
+      os: "Ubuntu (WSL2)",
+    },
+    provenance: {
+      zinc: zincProvenance,
+      llama_cpp: llamaCppProvenance,
+    },
+    methodology: {
+      runner: "ZINC CLI vs llama.cpp on the same CUDA node",
+      benchmark_style: "Four-scenario matrix with same-file baselines",
+      notes: [
+        "Hardware: one NVIDIA GeForce RTX 5090 (32 GB VRAM, 1792 GB/s) benchmark node. ZINC and llama.cpp run on the same host and use the same GGUF file for each model.",
+        "ZINC path: sync the current source tree to the CUDA node, build with zig build -Doptimize=ReleaseFast -Dbackend=cuda, then measure generation through the ZINC CLI. CUDA kernels are NVRTC-compiled at runtime for the visible GPU.",
+        "GPU selection: the target GPU is pinned by UUID via CUDA_VISIBLE_DEVICES for both engines, because nvidia-smi indices are unreliable on the WSL2 passthrough.",
+        "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
+        "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
+        "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
+        "Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.",
+        "Run hygiene: published CUDA runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.",
+      ],
+      runs: args.runs,
+      warmup_runs: args.warmupRuns,
+    },
+    summary: targetSummary(models),
+    models,
+  };
+}
+
 async function runIntelTarget(args) {
   const config = await buildIntelConfig(args);
   const creds = config.creds;
@@ -2815,6 +3154,9 @@ async function main() {
   }
   if (args.target === "intel" || args.target === "all") {
     incoming.push(await runIntelTarget(args));
+  }
+  if (args.target === "cuda") {
+    incoming.push(await runCudaTarget(args));
   }
 
   const outputArtifact = buildArtifact(incoming);
