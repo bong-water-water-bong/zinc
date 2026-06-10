@@ -91,7 +91,7 @@ const TopkPush = extern struct { n_experts: u32, k: u32 };
 const MoeAccPush = extern struct { N: u32, n_used: u32, src_stride: u32 };
 const SigmoidAccPush = extern struct { N: u32 };
 // Batched MoE expert matvec: one launch over all n_used experts, GPU-side ids.
-const ExpertsPush = extern struct { M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32 };
+const ExpertsPush = extern struct { M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32, base: u32 = 0 };
 
 /// Map a GGUF quant type to its DMMV kernel pipeline (indexes ForwardCuda.dmmv).
 fn dmmvIdx(t: gguf.GGMLType) usize {

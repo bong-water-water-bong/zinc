@@ -68,6 +68,8 @@ const TopkPush = extern struct { n_experts: u32, k: u32 };
 const MoeAccPush = extern struct { N: u32, n_used: u32, src_stride: u32 };
 const MulVecPush = extern struct { N: u32, scale: f32 };
 const ZeroPush = extern struct { N: u32 };
+// Batched MoE expert matvec (one launch over all experts; ids read GPU-side).
+const ExpertsPush = extern struct { M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32, base: u32 = 0 };
 
 fn dmmvIdx(t: gguf.GGMLType) usize {
     return switch (t) {
@@ -129,6 +131,8 @@ const Pipelines = struct {
     moe_weighted_acc: CudaPipeline,
     mul_vec_scaled: CudaPipeline,
     zero_vec: CudaPipeline,
+    dmmv_q4k_experts: CudaPipeline, // batched fused gate/up over all experts
+    dmmv_q5_1_experts: CudaPipeline, // batched down over all experts
 };
 
 pub const ForwardGemma = struct {
@@ -267,6 +271,8 @@ pub const ForwardGemma = struct {
         pipes.moe_weighted_acc = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc");
         pipes.mul_vec_scaled = try pipeline.createPipeline(ctx, src.ptr, "mul_vec_scaled");
         pipes.zero_vec = try pipeline.createPipeline(ctx, src.ptr, "zero_vec");
+        pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
+        pipes.dmmv_q5_1_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1_experts");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
         const f4 = @sizeOf(f32);
@@ -286,9 +292,9 @@ pub const ForwardGemma = struct {
             .attn_out_buf = try buffer.createBuffer(ctx, q_dim_max * f4),
             .o_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
             .ffn_norm_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
-            .gate_buf = try buffer.createBuffer(ctx, d.ff_buf_max * f4),
-            .up_buf = try buffer.createBuffer(ctx, d.ff_buf_max * f4),
-            .geglu_buf = try buffer.createBuffer(ctx, d.ff_buf_max * f4),
+            .gate_buf = try buffer.createBuffer(ctx, @max(d.ff_buf_max, d.n_experts_used * d.n_ff) * f4),
+            .up_buf = try buffer.createBuffer(ctx, @max(d.ff_buf_max, d.n_experts_used * d.n_ff) * f4),
+            .geglu_buf = try buffer.createBuffer(ctx, @max(d.ff_buf_max, d.n_experts_used * d.n_ff) * f4),
             .down_buf = try buffer.createBuffer(ctx, @max(d.n_embd, d.n_experts_used * d.n_embd) * f4),
             .logits_buf = try buffer.createBuffer(ctx, d.vocab * f4),
             .argmax_buf = try buffer.createBuffer(ctx, @sizeOf(u32)),
@@ -626,20 +632,37 @@ pub const ForwardGemma = struct {
 
             var cmd = try command.beginCommand(ctx);
             cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wpre2.gpu_buffer, &self.moe_norm_buf }, &rms, @sizeOf(RmsPush), 0);
-            const sg = SwigluPush{ .N = ef };
-            var j: u32 = 0;
-            while (j < n_used) : (j += 1) {
-                const id = self.host_router[j];
-                // fused gate_up: gate = rows[0..ef], up = rows[ef..2ef].
-                self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gu_full);
-                self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * gu_full + gu_half);
-                cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
-                const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
-                const didx = dmmvIdx(wde.info.type_);
-                if (didx < 4) {
-                    cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
-                } else {
-                    cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+            // Batched path (gate_up Q4_K + down Q5_1): one launch over all
+            // experts, ids read GPU-side from router_out_buf, slot-major output.
+            // The fused gate_up reuses dmmv_q4k_experts with base=gu_half for the
+            // up half. Falls back to the per-slot loop for other expert quants.
+            const batched = dmmvIdx(wgu.info.type_) == 0 and dmmvIdx(wde.info.type_) == 5;
+            if (batched) {
+                const nrows = n_used * ef;
+                const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = 0 };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
+                const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = gu_half };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                const sgb = SwigluPush{ .N = nrows };
+                cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(nrows, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sgb, @sizeOf(SwigluPush), 0);
+                const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0 };
+                cmd.dispatch(&self.pipes.dmmv_q5_1_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
+            } else {
+                const sg = SwigluPush{ .N = ef };
+                var j: u32 = 0;
+                while (j < n_used) : (j += 1) {
+                    const id = self.host_router[j];
+                    // fused gate_up: gate = rows[0..ef], up = rows[ef..2ef].
+                    self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gu_full);
+                    self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * gu_full + gu_half);
+                    cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                    const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                    const didx = dmmvIdx(wde.info.type_);
+                    if (didx < 4) {
+                        cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    } else {
+                        cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                    }
                 }
             }
             // zero accumulator → weighted combine of the k slots → post_ffw_norm_2.

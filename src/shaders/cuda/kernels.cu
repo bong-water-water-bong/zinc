@@ -791,7 +791,7 @@ extern "C" __global__ void dmmv_q5k_fast(const unsigned* a_u32, const float* x, 
 // busy enough to leave its idle clock. Per-expert weight slice = id*slice; x is
 // shared across experts for gate/up (x_stride=0) or per-expert for down
 // (x_stride=K, i.e. swiglu[e*K..]). Output is slot-major: y[e*M + row].
-struct ExpertsPush { unsigned M, K, slice, x_stride, n_used; };
+struct ExpertsPush { unsigned M, K, slice, x_stride, n_used, base; };
 
 extern "C" __global__ void dmmv_q4k_experts(const unsigned* a_u32, const float* x, float* y, const unsigned* expert_ids, ExpertsPush pc) {
     unsigned g = blockIdx.x;
@@ -799,7 +799,7 @@ extern "C" __global__ void dmmv_q4k_experts(const unsigned* a_u32, const float* 
     if (e >= pc.n_used) return;
     unsigned row = g - e * pc.M;
     unsigned bpr = pc.K >> 8;
-    unsigned a_base = (expert_ids[e] * pc.slice >> 2) + row * bpr * 36u;
+    unsigned a_base = ((expert_ids[e] * pc.slice + pc.base) >> 2) + row * bpr * 36u;
     const float4* xv = (const float4*)(x + (size_t)e * pc.x_stride);
     unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
     unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
@@ -866,6 +866,33 @@ extern "C" __global__ void dmmv_q5k_experts(const unsigned* a_u32, const float* 
     }
     sum = zinc_block_reduce_sum(sum);
     if (tid == 0) y[(size_t)e * pc.M + row] = sum;
+}
+
+// Batched Q5_1 expert down-proj (gemma-26b MoE): one launch over all n_used
+// experts, expert id read GPU-side. Same dequant as dmmv_q5_1; per-expert x is
+// swiglu[e*x_stride..]; output slot-major y[e*M + row]. base unused (0).
+extern "C" __global__ void dmmv_q5_1_experts(const unsigned char* a, const float* x, float* y, const unsigned* expert_ids, ExpertsPush pc) {
+    unsigned g = blockIdx.x;
+    unsigned e = g / pc.M;
+    if (e >= pc.n_used) return;
+    unsigned row = g - e * pc.M;
+    unsigned bpr = pc.K >> 5;
+    const unsigned char* arow = a + (size_t)expert_ids[e] * pc.slice + pc.base + (size_t)row * bpr * 24u;
+    const float* xrow = x + (size_t)e * pc.x_stride;
+    float sum = 0.0f;
+    for (unsigned el = threadIdx.x; el < pc.K; el += blockDim.x) {
+        unsigned blk = el >> 5, i = el & 31u;
+        const unsigned char* blkp = arow + (size_t)blk * 24u;
+        float d = zinc_half_to_float((unsigned short)((unsigned)blkp[0] | ((unsigned)blkp[1] << 8)));
+        float m = zinc_half_to_float((unsigned short)((unsigned)blkp[2] | ((unsigned)blkp[3] << 8)));
+        unsigned qh = (unsigned)blkp[4] | ((unsigned)blkp[5] << 8) | ((unsigned)blkp[6] << 16) | ((unsigned)blkp[7] << 24);
+        const unsigned char* qs = blkp + 8;
+        unsigned nib = (i < 16u) ? (unsigned)(qs[i] & 0xFu) : (unsigned)(qs[i - 16u] >> 4);
+        unsigned q5 = nib | (((qh >> i) & 1u) << 4);
+        sum += (d * (float)q5 + m) * xrow[el];
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (threadIdx.x == 0) y[(size_t)e * pc.M + row] = sum;
 }
 
 // ---- dmmv_q8_0_fast — whole-block-per-thread, d once, float4 x --------------
