@@ -806,13 +806,10 @@ extern "C" __global__ void ssm_delta_net(
 }
 // ---- dmmv_q4k_fast (perf research, 5090) — port of tuned Vulkan dmmv_q4k -----
 // 16 threads per Q4_K superblock: header read once/thread (not 256x), qs read
-// once total, x via float4. Block-reduce over 256 threads = one output row.
-extern "C" __global__ void dmmv_q4k_fast(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
-    unsigned row = blockIdx.x;
-    if (row >= pc.M) return;
-    unsigned bpr = pc.K >> 8;
-    unsigned a_base = (pc.a_offset >> 2) + row * bpr * 36u;
-    const float4* xv = (const float4*)(x + (pc.x_offset >> 2));
+// once total, x via float4. Block-reduce over the block = one output row.
+// The per-row compute is factored into a __device__ helper so the fused dual
+// kernel (dmmv_q4k_fast_dual) shares exactly this arithmetic path (bit-exact).
+__device__ __forceinline__ float zinc_dmmv_q4k_fast_sum(const unsigned* a_u32, unsigned a_base, const float4* xv, unsigned bpr) {
     unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
     unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
     unsigned l0 = 4u * (2u * ir + v_in);
@@ -838,8 +835,37 @@ extern "C" __global__ void dmmv_q4k_fast(const unsigned* a_u32, const float* x, 
         sum += (f2*(float)(qs1&0xFu)-b2)*by2.x + (f2*(float)((qs1>>8)&0xFu)-b2)*by2.y + (f2*(float)((qs1>>16)&0xFu)-b2)*by2.z + (f2*(float)((qs1>>24)&0xFu)-b2)*by2.w;
         sum += (f3*(float)((qs1>>4)&0xFu)-b3)*by3.x + (f3*(float)((qs1>>12)&0xFu)-b3)*by3.y + (f3*(float)((qs1>>20)&0xFu)-b3)*by3.z + (f3*(float)((qs1>>28)&0xFu)-b3)*by3.w;
     }
-    sum = zinc_block_reduce_sum(sum);
-    if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
+    return zinc_block_reduce_sum(sum);
+}
+
+extern "C" __global__ void dmmv_q4k_fast(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 8;
+    unsigned a_base = (pc.a_offset >> 2) + row * bpr * 36u;
+    const float4* xv = (const float4*)(x + (pc.x_offset >> 2));
+    float sum = zinc_dmmv_q4k_fast_sum(a_u32, a_base, xv, bpr);
+    if (threadIdx.x == 0) { unsigned yi = (pc.y_offset >> 2) + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
+}
+
+// ---- dmmv_q4k_fast_dual — fuse two same-input Q4_K matvecs into ONE launch ----
+// Both weights (a0,a1) share input x and inner dim K; outputs go to y0,y1. Grid
+// is M0+M1 blocks: block bx<M0 computes row bx of a0→y0, else row bx-M0 of a1→y1.
+// Used for the gemma FFN gate/up pair and the attention Q/K pair (both Q4_K, same
+// norm input) to remove one kernel-launch boundary per layer. Each block's work
+// is bit-identical to the standalone dmmv_q4k_fast with zero offsets (no acc).
+struct Dmmv2Push { unsigned M0, M1, K; };
+extern "C" __global__ void dmmv_q4k_fast_dual(const unsigned* a0, const unsigned* a1, const float* x, float* y0, float* y1, Dmmv2Push pc) {
+    unsigned bx = blockIdx.x;
+    if (bx >= pc.M0 + pc.M1) return;
+    unsigned bpr = pc.K >> 8;
+    const unsigned* a; float* y; unsigned row;
+    if (bx < pc.M0) { a = a0; y = y0; row = bx; }
+    else { a = a1; y = y1; row = bx - pc.M0; }
+    unsigned a_base = row * bpr * 36u;
+    const float4* xv = (const float4*)x;
+    float sum = zinc_dmmv_q4k_fast_sum(a, a_base, xv, bpr);
+    if (threadIdx.x == 0) y[row] = sum;
 }
 
 // ---- dmmv_q6k_fast (perf research) — port of tuned Vulkan dmmv_q6k -----------
