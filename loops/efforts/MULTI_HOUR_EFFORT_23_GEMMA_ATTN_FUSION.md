@@ -251,3 +251,43 @@ of small dispatches remain.
   sign-disagreeing rejected fusions. Stacks on T1+T3+T4+T5 (the four norms it touches are
   distinct launches from the matvec/per-head-norm fusions). Effort 23 net: **5 stacked
   dense-decode fusion wins** — ~+1.5% T1, ~+1.7% T3, ~+1.3% T4, +1.65% T5, +1.41% T6.
+- **2026-06-11 — FFN gate+up matvec + GeGLU 3→1 launch fuse. INCONCLUSIVE
+  (sign-disagreeing, leans NEGATIVE) → REVERTED, not committed.** Found
+  uncommitted in the working tree at cycle start (a prior loop cycle wrote it,
+  never validated). Beyond T4 (which fused gate+up into ONE `dmmv_q4k_fast_dual`
+  launch over `2*n_ff` blocks, then a SEPARATE `geglu` launch read gate_buf/up_buf
+  back): this collapses BOTH matvecs AND the GeGLU elementwise into ONE launch.
+  New kernel `ffn_gate_up_geglu` over `n_ff` blocks — each block computes row `bx`
+  of gate (a0) AND up (a1) via the shared `zinc_dmmv_q4k_fast_sum` helper (same
+  blockDim 64 as the dual → bit-identical f32 g/u), keeps both in registers, and
+  writes `gelu(g)*u` to `geglu_buf` (gelu formula copied verbatim from `geglu`).
+  Removes the standalone geglu launch + the gate_buf/up_buf global round-trip
+  (60/token on the 31b). Gated on both-Q4_K (else the unfused dual+geglu path,
+  restored to its pre-T4 two-matvec form in the else branch). **Bit-exact:**
+  `validate_catalog` → **5/5 token-correct** (qwen 3×12/12; gemma4-26b 12/12;
+  gemma4-31b teacher-forced 11/12 = the documented near-tie, unchanged). **Build:**
+  isolated caches, baseline md5 `b6190048…` → variant `07967f26…` (real recompile).
+  **Perf — UNMEASURABLE in boost noise, leans NEGATIVE.** Interleaved A/B (4090,
+  warmup ignored), THREE batches that **DISAGREE IN SIGN**: b1 (6×160) variant
+  30.39 vs baseline 31.21 = **−2.63%** (won 4/6 but two big baseline rounds, swings
+  26.29–33.79); b2 (8×160) 32.41 vs 32.55 = **−0.44%** (won 4/8, near-tie); b3
+  (8×200) 32.36 vs 32.20 = **+0.50%** (won 6/8). **Pooled 22 rounds: variant 31.84
+  vs baseline 32.06 = −0.69%.** Same coin-flip signature that rejected the Q/K-only
+  norm+rope and MoE output-scale folds — OPPOSITE the all-positive signature of
+  every validated win (T1/T4/T5/T6). **Root cause (a real design cost, not just
+  noise):** unlike T4/T5/T6 which removed launches WITHOUT reducing parallelism,
+  this fusion HALVES the block count (`n_ff` vs the dual's `2*n_ff`) and
+  **serializes** the gate and up reductions within each block (`g` →
+  `__syncthreads` → `u`). At batch-1 decode the Q4_K matvec is memory-latency bound
+  with already-ample blocks to saturate the 4090, so the lost intra-block
+  parallelism roughly cancels the saved geglu launch + round-trip → net ≈ 0,
+  leaning negative. Per the contract ("measurable, repeatable gain"; "never claim a
+  win from one boosted run") this is **NOT a validated win** → **reverted** (working
+  tree + box variant tree restored to HEAD; iso caches + binaries cleared). Unlike
+  the prior coin-flip reverts (which were strictly fewer-ops, true effect ≥0), this
+  one TRADES parallelism for launches and may be a genuine small regression — NOT
+  recoverable as a free future clock-locked win. **Lesson:** the "aggregate ≥2 tiny
+  launches" rule (T5) only clears the floor when the fusion doesn't COST
+  parallelism; fusing same-input matvecs into ONE block (vs T4/dual's two parallel
+  blocks) is a different, worse trade at decode. The T4 dual-matvec (2 parallel
+  blocks/pair, separate geglu) remains the right shape for the FFN gate/up pair.
