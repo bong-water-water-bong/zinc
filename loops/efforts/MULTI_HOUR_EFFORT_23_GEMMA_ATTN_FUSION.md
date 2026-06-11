@@ -151,3 +151,38 @@ of small dispatches remain.
   path (bit-exact; not separately A/B'd — the 26b MoE is boost-unmeasurable, per
   the prior cycle). Effort 23 net: **3 stacked dense-decode fusion wins** —
   ~+1.5% T1, ~+1.7% T3, ~+1.3% T4.
+- **2026-06-11 — Q/K per-head norm+rope fusion (fuse the two rms_norm_rope launches into one). INCONCLUSIVE → REVERTED, not committed.**
+  Found uncommitted in the working tree at cycle start (a prior loop cycle wrote it
+  but never validated). Beyond T1–T4: the attn path still ran TWO `rms_norm_rope`
+  launches/layer — Q (q_buf, dst_offset 0) and K (k_buf → kv_k at `pos*kv_dim`).
+  Both share this layer's head_dim/rope_dim/inv_freq/position, so they fuse into one
+  launch over `n_head + n_kv_head` blocks (block `< n_head` → Q head; else K head
+  into kv_k). The per-head norm+rope arithmetic was factored into a shared
+  `__device__ zinc_rms_rope_head` that the standalone `rms_norm_rope` ALSO calls →
+  each fused block is **bit-identical** to the unfused launch (same pattern as T4's
+  `zinc_dmmv_q4k_fast_sum`). New kernel `rms_norm_rope_qk` + push `RmsRopeQkPush`.
+  Removes **one tiny per-head launch/layer** (60/token on the 31b). **Build:**
+  isolated caches, baseline md5 `4a28f621…` → variant `3ca1c880…` (real recompile).
+  **Correctness:** `validate_catalog` → **5/5 token-correct** (qwen 3×12/12;
+  gemma4-26b 12/12; gemma4-31b teacher-forced 11/12 = the documented near-tie,
+  unchanged — confirms bit-equivalence). **Perf — UNMEASURABLE in boost noise.**
+  Interleaved A/B (4090, warmup ignored), THREE batches that **disagree in sign**:
+  b1 NGEN=160 ×6 → variant 31.41 vs 31.38 = **+0.12%** (won 5/6); b2 NGEN=160 ×8 →
+  31.63 vs 31.24 = **+1.24%** (won 7/8); b3 NGEN=200 ×8 → 31.32 vs 31.65 =
+  **−1.04%** (baseline won 6/8). Pooled 22 rounds: variant 31.46 vs baseline 31.43
+  = **+0.10%** (noise floor). The tell: the **variant binary is rock-steady across
+  ALL batches** (per-round 31.09–31.53) while the **baseline swings per-process**
+  (batch means 31.38 / 31.24 / 31.65) — the apparent b1/b2 gain was just baseline
+  running in a low-boost regime, erased when b3's baseline ran hot. Same coin-flip
+  signature that rejected the MoE output-scale fold. This fusion removes only ONE
+  tiny per-head launch/layer (vs T4's ~2 matvec-pair launches), and that saving sits
+  **below this box's ~±1% per-process boost-noise floor** without locked clocks.
+  Per the contract ("measurable, repeatable gain"; "never claim a win from one
+  boosted run") this is **NOT a validated win**. **Reverted** (working tree + box
+  variant tree restored to HEAD; iso caches cleared). The change is correct and
+  strictly fewer-ops (true effect ≥0, never a regression) — recoverable from this log
+  for a future **clock-locked** cycle (`nvidia-smi -lgc`, needs sudo the agent lacks).
+  **Takeaway: the cheap bit-exact dense fusions are now exhausted at this box's
+  measurability floor — T1/T3/T4 (each ~+1.3–1.7%, removing ≥2 launches/layer or a
+  full round-trip) were the resolvable wins; sub-1% single-tiny-launch fusions like
+  this one are below the boost-noise floor and need locked clocks to A/B.**
