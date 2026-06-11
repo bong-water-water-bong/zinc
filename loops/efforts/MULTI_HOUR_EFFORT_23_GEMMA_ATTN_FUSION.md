@@ -69,3 +69,27 @@ of small dispatches remain.
   — different part of the layer, stacks.
   **NEXT (Target 2/3):** pre-attention `rms_norm` fold into the first Q/K/V matvec
   (likely skip — matvecs dominate), or any remaining FFN norm/elementwise pairs.
+- **2026-06-11 — Target 3 DONE (per-layer output-scale fold). VALIDATED WIN, branch `perf/e23-los-fold` (stacked on Target 1, commit `e45d7475`), pushed (NOT main).**
+  The dense gemma path applied the learned per-layer output scale
+  (`blk.N.layer_output_scale.weight`, confirmed present on all 60 gemma-31b
+  layers) as a standalone `scalar_mul` command after each FFN block — one tiny
+  launch + one command submission per layer. Since it is the layer's LAST write
+  to the residual stream, folded it into the post-ffn `rms_norm_residual` via a
+  new `rms_norm_residual_scale` kernel: `hidden = s[0]*(hidden + w*x/rms(x))`.
+  `ffnBlock` uses it when the scale tensor is present (else plain
+  `rms_norm_residual`); `layerOutScale` now self-skips dense layers (only the MoE
+  path — final write is a `scale_accumulate` — keeps the standalone op). Removes
+  **60 launches + 60 command submissions/token** on the dense path. **Bit-exact**:
+  the residual add is the same FMA producing the same f32 value `scalar_mul`
+  would re-load, then a plain `*s[0]` — verified gemma-31b 32-tok free-run
+  IDENTICAL between baseline and variant binaries. **Build:** isolated caches,
+  md5 `a0b2f95b…` baseline → `08c44e74…` variant (real recompile). **Correctness:**
+  `validate_catalog` → **5/5 token-correct** (gemma-31b teacher-forced 11/12 = the
+  documented near-tie, unchanged). **Perf (interleaved A/B, NGEN=160, 4090,
+  warmup ignored):** gemma-31b DENSE — batch1 (4 rounds) variant 30.93 vs 30.56 =
+  **+1.19%** (3/4); batch2 (6 rounds) 31.36 vs 30.75 = **+1.97%** (5/6); pooled 10
+  rounds variant wins **8/10**, 31.19 vs 30.68 = **+1.66%**. Stacks on Target 1
+  (different part of the layer). **Target 2 SKIP confirmed** — pre-attn norm feeds
+  3 matvecs (Q/K/V), pre-ffn norm feeds 2 (gate/up); no single-consumer fold and
+  the matvecs dominate. Effort 23 net: 2 stacked dense-decode fusion wins
+  (~+1.5% Target 1, ~+1.7% Target 3).
