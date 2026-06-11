@@ -186,3 +186,32 @@ of small dispatches remain.
   measurability floor — T1/T3/T4 (each ~+1.3–1.7%, removing ≥2 launches/layer or a
   full round-trip) were the resolvable wins; sub-1% single-tiny-launch fusions like
   this one are below the boost-noise floor and need locked clocks to A/B.**
+- **2026-06-11 — Target 5 DONE (V/Q/K per-head norm 3→1 launch fuse). VALIDATED WIN, branch `perf/e23-qkv-norm-fuse` (stacked on T1+T3+T4, commit `984535f7`), pushed (NOT main).**
+  Found uncommitted in the working tree at cycle start (a prior loop cycle wrote it,
+  never validated). This is the AGGRESSIVE superset of the rejected Q/K-only fusion: it
+  collapses ALL THREE per-head norm launches the attention path runs after T1 — V
+  plain-normalize+KV-write (`rms_norm_kvwrite`), Q norm+rope and K norm+rope
+  (`rms_norm_rope` ×2) — into ONE kernel `rms_norm_rope_qkv` over `n_head + 2*n_kv_head`
+  blocks: Q heads (norm+rope → q_buf, offset 0), K heads (norm+rope → kv_k at
+  `pos*kv_dim`), V heads (plain norm, no weight/rope → kv_v at `pos*kv_dim`). Each
+  branch's arithmetic is copied verbatim from the standalone kernels → **bit-identical**.
+  No cross-block hazard (Q in-place, K→kv_k, V→kv_v; no block reads a buffer another
+  writes), so `v_src` aliasing `k_buf` on full-attention layers stays safe (k_buf is
+  read-only here). Removes **2 tiny launch boundaries/layer** on the gemma attention
+  path (dense + MoE; ~120/token on the 31b) — the SAME magnitude as T4, vs the rejected
+  Q/K-only fusion which removed only ONE and sat below the noise floor. **Build:**
+  isolated caches, baseline md5 `699acae2…` → variant `bd2d7f39…` (real recompile).
+  **Correctness:** `validate_catalog` → **5/5 token-correct** (qwen 3×12/12; gemma4-26b
+  **12/12 free-run** = the MoE attn path is bit-identical; gemma4-31b teacher-forced
+  11/12 = the documented near-tie, unchanged). **Perf (interleaved back-to-back A/B,
+  NGEN=160, 4090, warmup ignored) — 5 batches, ALL POSITIVE:** b1 31.76/31.18 +1.87%
+  (6/6), b2 31.94/31.39 +1.77% (5/6), b3 31.63/31.49 +0.43% (4/6, baseline ran hot —
+  variant still won the batch), b4 31.91/31.14 +2.47% (6/6), b5 31.64/31.10 +1.74%
+  (6/6). **Pooled 30 rounds: variant 31.78 vs baseline 31.26 = +1.65%, won 27/30**
+  (rock-steady — variant 31.55–31.94 across all batches). Unlike the rejected Q/K-only
+  and MoE-scale fusions (whose batches DISAGREED IN SIGN), every batch here is positive
+  and the variant wins even when the baseline boosts hot — the T4-resolvability
+  signature (removes ≥2 launches/layer). This SUPERSEDES the earlier "cheap bit-exact
+  dense fusions exhausted" conclusion: the Q/K-only fuse was below floor because it
+  removed ONE launch, but folding V in too crosses back above the floor. Effort 23 net:
+  **4 stacked dense-decode fusion wins** — ~+1.5% T1, ~+1.7% T3, ~+1.3% T4, +1.65% T5.
