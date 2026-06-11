@@ -125,3 +125,29 @@ of small dispatches remain.
   agent lacks) that could resolve sub-5% MoE effects. Takeaway: the boost-noisy
   26b MoE path is not A/B-measurable for small fusions on this box without pinned
   clocks; dense-path fusions remain the only cleanly-measurable gemma lever here.
+- **2026-06-11 — Target 4 DONE (same-input Q4_K matvec-pair fusion). VALIDATED WIN, branch `perf/e23-dual-matvec` (stacked on T1+T3, commit `067e71df`), pushed (NOT main).**
+  Beyond the enumerated T1–T3, the dense path still ran each same-input matvec
+  PAIR as two separate launches: FFN `ffn_gate`+`ffn_up` over the pre-ffn norm,
+  and attention `attn_q`+`attn_k` over the pre-attn norm (all four Q4_K on
+  gemma-31b, confirmed via GGUF: gate/up M=21504 K=5376; q M=8192 / k M=4096
+  K=5376). New kernel `dmmv_q4k_fast_dual(a0,a1,x,y0,y1,{M0,M1,K})` fuses a pair
+  into ONE launch over `M0+M1` blocks (block `bx<M0` → `a0` row `bx` → `y0`, else
+  `a1` row `bx-M0` → `y1`). The per-row Q4_K compute was factored into a shared
+  `__device__` helper `zinc_dmmv_q4k_fast_sum` that the standalone `dmmv_q4k_fast`
+  now ALSO calls — so each fused block is **bit-identical** to the unfused fast
+  path (one arithmetic path, no copy-drift). Wired at both gemma sites behind a
+  per-call `both-Q4_K` guard (else the unfused two-launch path). Removes **~2
+  kernel-launch boundaries/layer** (~120/token on the 31b: FFN gate/up + attn
+  Q/K). **Build:** isolated caches, baseline md5 `3c7bd54c…` → variant `e531f52f…`
+  (real recompile; the `.cu` is `@embedFile`'d into the binary). **Correctness:**
+  `validate_catalog` → **5/5 token-correct** (qwen 3×12/12; gemma4-26b 12/12;
+  gemma4-31b teacher-forced 11/12 = the documented near-tie, unchanged). **Perf
+  (interleaved back-to-back A/B, NGEN=160, 4090, warmup ignored):** gemma-31b
+  DENSE — batch1 6 rounds variant wins **6/6**, 31.31 vs 30.80 = **+1.67%**;
+  batch2 6 rounds variant wins **5/6** (round 1 baseline edged on boost), 31.18
+  vs 30.89 = **+0.92%**; **pooled 12 rounds variant wins 11/12, 31.24 vs 30.85 =
+  +1.30%** (rock-steady, all winning rounds +0.7%…+2.2%). Stacks on T1 + T3
+  (different launches). The attn Q/K fusion also runs on the gemma-26b MoE attn
+  path (bit-exact; not separately A/B'd — the 26b MoE is boost-unmeasurable, per
+  the prior cycle). Effort 23 net: **3 stacked dense-decode fusion wins** —
+  ~+1.5% T1, ~+1.7% T3, ~+1.3% T4.
