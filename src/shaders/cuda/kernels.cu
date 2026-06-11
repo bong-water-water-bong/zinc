@@ -1498,6 +1498,89 @@ extern "C" __global__ void rms_norm_kvwrite(const float* v_src, float* v_dst, Rm
         v_dst[base + i] = vh[i] * rinv;
 }
 
+// ---- rms_norm_rope_qkv (gemma: fuse the per-head V/Q/K norm launches) -------
+// Collapses the THREE per-head norm launches on the gemma attention path into
+// ONE: the V plain-normalize+KV-write (rms_norm_kvwrite), the Q norm+rope, and
+// the K norm+rope (both rms_norm_rope). Grid is n_head + 2*n_kv_head blocks:
+//   block <  n_head                       -> Q head: weighted norm + rope -> q_out (offset 0)
+//   block <  n_head + n_kv_head           -> K head: weighted norm + rope -> k_out at kv_offset
+//   else                                  -> V head: plain norm (no weight, no rope) -> v_out at kv_offset
+// Each branch's arithmetic is COPIED verbatim from the standalone kernels
+// (Q/K from rms_norm_rope, V from rms_norm_kvwrite) so the fused result is
+// bit-identical. No cross-block hazard: K writes kv_k (never k_in), V writes
+// kv_v (never v_in), Q writes q_out in-place per head — no block reads a buffer
+// another block writes. Removes 2 tiny launch boundaries/layer on the gemma
+// attention path (dense + MoE).
+struct RmsRopeQkvPush {
+    unsigned head_dim; float eps; unsigned rope_dim; unsigned position;
+    unsigned n_head; unsigned n_kv_head; unsigned kv_offset;
+};
+extern "C" __global__ void rms_norm_rope_qkv(
+    const float* q_in, const float* k_in, const float* v_in,
+    const float* wq, const float* wk, const float* inv_freq,
+    float* q_out, float* k_out, float* v_out, RmsRopeQkvPush pc)
+{
+    unsigned bx = blockIdx.x;
+    unsigned hd = pc.head_dim;
+    extern __shared__ float sh[]; // hd normalized values (Q/K rope staging)
+
+    const float* xt;
+    float* yt;
+    const float* w;
+    bool do_rope;
+    if (bx < pc.n_head) {
+        unsigned head = bx;
+        xt = q_in + (size_t)head * hd;
+        yt = q_out + (size_t)head * hd;                 // dst_offset 0
+        w = wq; do_rope = true;
+    } else if (bx < pc.n_head + pc.n_kv_head) {
+        unsigned head = bx - pc.n_head;
+        xt = k_in + (size_t)head * hd;
+        yt = k_out + (size_t)pc.kv_offset + (size_t)head * hd;
+        w = wk; do_rope = true;
+    } else {
+        unsigned head = bx - pc.n_head - pc.n_kv_head;
+        xt = v_in + (size_t)head * hd;
+        yt = v_out + (size_t)pc.kv_offset + (size_t)head * hd;
+        w = nullptr; do_rope = false;
+    }
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    if (!do_rope) { // V: plain normalize, no weight (matches rms_norm_kvwrite)
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+            yt[i] = xt[i] * rinv;
+        return;
+    }
+
+    // Q/K: weighted norm into shared, then NEOX partial rope (matches rms_norm_rope)
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    unsigned half_rot = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < half_rot; i += blockDim.x) {
+        float xi = sh[i];
+        float xih = sh[i + half_rot];
+        float theta = (float)pc.position * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i] = xi * ct - xih * st;
+        yt[i + half_rot] = xi * st + xih * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < hd; i += blockDim.x)
+        yt[i] = sh[i];
+}
+
 // ---- geglu (gemma FFN activation: gelu(gate) * up) -------------------------
 // Matches ggml LLM_FFN_GELU (tanh approximation). gemma norm weights already
 // carry the +1 offset (baked at GGUF conversion), so the surrounding norms use
