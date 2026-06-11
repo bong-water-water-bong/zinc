@@ -188,6 +188,107 @@ extern "C" __global__ void rms_norm_residual_scale(const float* x, const float* 
     }
 }
 
+// ---- rms_norm_residual_norm / rms_norm_residual_scale_norm ------------------
+// Fuse a block's INPUT rms_norm into the PRECEDING block's output norm+residual.
+// On the dense gemma path each layer runs four single-block n_embd reductions:
+//   pre-attn rms_norm -> ... -> post-attn rms_norm_residual (writes hidden) ->
+//   pre-ffn  rms_norm -> ... -> post-ffn  rms_norm_residual_scale (writes hidden)
+// A post-norm-residual's `hidden` is exactly the input the very next pre-norm
+// reads, and both are ONE-block (grid {1,1,1}) reductions over the same n_embd
+// vector — so the next pre-norm can run in the SAME launch, right after the
+// residual add (a __syncthreads makes the just-written `hidden` visible to the
+// phase-2 reduction). This removes one tiny launch per norm boundary:
+//   post-attn-residual + pre-ffn-norm  (within the layer)
+//   post-ffn-residual  + pre-attn-norm (across the layer boundary, into the
+//                                        NEXT layer's `attn_norm.weight`)
+// = ~2 launches/layer on the dense gemma-31b decode path (~119/token over 60
+// layers; only layer 0's pre-attn norm and the last layer's post-ffn stay
+// standalone). BIT-IDENTICAL to the two-kernel path: phase 1 is the exact
+// rms_norm_residual[_scale] arithmetic (same FMA, same reduction), phase 2 is
+// the exact rms_norm arithmetic re-reading `hidden` from global — the same
+// values the standalone pre-norm would have read. The intervening __syncthreads
+// barriers also make reusing zinc_block_reduce_sum's shared scratch race-free.
+extern "C" __global__ void rms_norm_residual_norm(
+    const float* x, const float* w_post, float* hidden,
+    const float* w_pre, float* pre_out, RmsPush pc) {
+    unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float* ht = hidden + (size_t)token * pc.N;
+    float* pt = pre_out + (size_t)token * pc.N;
+
+    // phase 1: post-norm + residual (identical to rms_norm_residual)
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        ht[i] += w_post[i] * (xt[i] * rinv);
+    }
+    __syncthreads(); // hidden fully written + visible before phase-2 reduction
+
+    // phase 2: pre-norm of the updated residual (identical to rms_norm)
+    float ss2 = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = ht[i];
+        ss2 += v * v;
+    }
+    ss2 = zinc_block_reduce_sum(ss2);
+    __shared__ float rms_inv_sh2;
+    if (threadIdx.x == 0) rms_inv_sh2 = rsqrtf(ss2 / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv2 = rms_inv_sh2;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        pt[i] = w_pre[i] * (ht[i] * rinv2);
+    }
+}
+
+extern "C" __global__ void rms_norm_residual_scale_norm(
+    const float* x, const float* w_post, float* hidden, const float* s,
+    const float* w_pre, float* pre_out, RmsPush pc) {
+    unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float* ht = hidden + (size_t)token * pc.N;
+    float* pt = pre_out + (size_t)token * pc.N;
+
+    // phase 1: post-norm + residual + per-layer output scale (== rms_norm_residual_scale)
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    float scale = s[0];
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        ht[i] = (ht[i] + w_post[i] * (xt[i] * rinv)) * scale;
+    }
+    __syncthreads(); // hidden fully written + visible before phase-2 reduction
+
+    // phase 2: pre-norm of the updated residual (identical to rms_norm)
+    float ss2 = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = ht[i];
+        ss2 += v * v;
+    }
+    ss2 = zinc_block_reduce_sum(ss2);
+    __shared__ float rms_inv_sh2;
+    if (threadIdx.x == 0) rms_inv_sh2 = rsqrtf(ss2 / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv2 = rms_inv_sh2;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        pt[i] = w_pre[i] * (ht[i] * rinv2);
+    }
+}
+
 // ---- rms_norm_rope ----------------------------------------------------------
 // Fused gemma per-head Q/K norm + RoPE: collapses the (per-head rms_norm ->
 // rope) pair into ONE launch, dropping a full head_dim write+read round-trip of

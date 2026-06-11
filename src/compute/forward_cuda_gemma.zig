@@ -123,6 +123,8 @@ const Pipelines = struct {
     rms_norm_noweight: CudaPipeline,
     rms_norm_residual: CudaPipeline,
     rms_norm_residual_scale: CudaPipeline,
+    rms_norm_residual_norm: CudaPipeline,
+    rms_norm_residual_scale_norm: CudaPipeline,
     rms_norm_rope: CudaPipeline,
     rms_norm_rope_qkv: CudaPipeline,
     rms_norm_kvwrite: CudaPipeline,
@@ -262,6 +264,8 @@ pub const ForwardGemma = struct {
         pipes.rms_norm_noweight = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_noweight");
         pipes.rms_norm_residual = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual");
         pipes.rms_norm_residual_scale = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_scale");
+        pipes.rms_norm_residual_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_norm");
+        pipes.rms_norm_residual_scale_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_scale_norm");
         pipes.rms_norm_rope = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope");
         pipes.rms_norm_rope_qkv = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope_qkv");
         pipes.rms_norm_kvwrite = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite");
@@ -495,10 +499,18 @@ pub const ForwardGemma = struct {
         const wo = self.layer(L, "attn_output.weight");
         const wpan = self.layer(L, "post_attention_norm.weight");
 
+        // Dense gemma folds each block's INPUT norm into the PRECEDING block's
+        // output norm+residual (see rms_norm_residual_norm). When folding, the
+        // pre-attn norm (norm_buf) is produced by the previous layer's fused
+        // post-ffn kernel — only layer 0 needs the standalone pre-attn norm.
+        const fold = d.n_experts == 0;
+
         var cmd = try command.beginCommand(ctx);
         // pre-attention norm (gemma rms, +1 baked in)
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        if (!fold or L == 0) {
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        }
         // Q, K projections; V from Wv if present, else the raw K projection. Q & K
         // share the pre-attention norm input — when both are Q4_K, fuse the two
         // matvecs into one launch (q_buf gets the Q rows, k_buf the K rows).
@@ -541,7 +553,14 @@ pub const ForwardGemma = struct {
         self.dmmvDispatch(&cmd, wo, &self.attn_out_buf, &self.o_buf, d.n_embd, g.q_dim, 0, 0);
         // post-attention norm (gemma rms) on the attention output, fused with the
         // residual add into `hidden` (scale 1.0) — one launch, no o_buf round-trip.
-        cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
+        // When folding, the SAME launch also produces the pre-ffn norm
+        // (ffn_norm_buf), so ffnBlock skips its standalone pre-ffn norm.
+        if (fold) {
+            const wfn = self.layer(L, "ffn_norm.weight");
+            cmd.dispatch(&self.pipes.rms_norm_residual_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
+        }
         self.submit(cmd);
     }
 
@@ -559,10 +578,18 @@ pub const ForwardGemma = struct {
         // self-skips dense layers). Absent → plain rms_norm_residual.
         const wlos = self.model.getLayer(L, "layer_output_scale.weight");
 
+        // Dense gemma folds each block's INPUT norm into the PRECEDING block's
+        // output norm+residual: the pre-ffn norm (ffn_norm_buf) was produced by
+        // this layer's fused post-attn kernel, and this block's post-ffn kernel
+        // produces the NEXT layer's pre-attn norm (norm_buf).
+        const fold = d.n_experts == 0;
+
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-        // pre-ffn norm
-        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        // pre-ffn norm (skipped when folded — ffn_norm_buf already filled)
+        if (!fold) {
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        }
         // GeGLU FFN: gelu(gate) * up → down. gate & up share the pre-ffn norm
         // input — when both are Q4_K, fuse the two matvecs into one launch.
         if (dmmvIdx(wgate.info.type_) == 0 and dmmvIdx(wup.info.type_) == 0) {
@@ -577,7 +604,17 @@ pub const ForwardGemma = struct {
         // post-ffn norm (gemma rms) on the FFN output, fused with the residual add
         // into `hidden` (scale 1.0) — one launch, no down_buf round-trip. When the
         // per-layer output scale is present it is folded in here too (one launch).
-        if (wlos) |ws| {
+        // When folding and not the last layer, the SAME launch also produces the
+        // NEXT layer's pre-attn norm (norm_buf), so attentionLayer(L+1) skips it.
+        const fold_next = fold and (L + 1 < d.n_layers);
+        if (fold_next) {
+            const wan_next = self.layer(L + 1, "attn_norm.weight");
+            if (wlos) |ws| {
+                cmd.dispatch(&self.pipes.rms_norm_residual_scale_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden, &ws.gpu_buffer, &wan_next.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.rms_norm_residual_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden, &wan_next.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            }
+        } else if (wlos) |ws| {
             cmd.dispatch(&self.pipes.rms_norm_residual_scale, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden, &ws.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
         } else {
             cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
