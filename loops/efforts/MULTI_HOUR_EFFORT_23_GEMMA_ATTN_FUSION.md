@@ -1,6 +1,10 @@
 # Effort 23 — gemma attention-path kernel fusion (continue the dense decode lever)
 
-> **Status:** OPEN. Scoped continuation of the two fusions already on main
+> **Status:** COMPLETE (2026-06-11) — 5 stacked validated dense wins (T1/T3/T4/T5/T6
+> on `perf/e23-*` branches, ~+7–8% gemma-31b dense decode); dense fusion lever
+> exhausted at this box's ±1% boost-noise floor, remaining fusions are below-floor or
+> MoE-only and need clock-locking (sudo unavailable). See the final cycle-log entry.
+> Scoped continuation of the two fusions already on main
 > (`d134c5a1`): `rms_norm_residual` (post-attn/ffn norm+residual) and
 > `rms_norm_rope` (per-head Q/K norm+RoPE) → gemma-31b dense ~28→~30 tok/s
 > (~+7%). This effort fuses the **remaining small per-layer dispatches** on the
@@ -336,3 +340,38 @@ of small dispatches remain.
   (T4/T5/T6) clear the ±1% boost noise on this box without locked clocks. The T4
   dual remains the right shape for the attention matvecs; folding V to a triple is a
   free-but-unmeasurable extra that wants pinned clocks to bank.
+- **2026-06-11 — EFFORT COMPLETE (dense fusion lever exhausted, no implementable
+  increment this cycle). No code change.** Cycle-start state: working tree clean
+  except the parallel 5090's `site/src/data/zinc-performance.json` (left untouched);
+  NO uncommitted fusion pre-staged (unlike the prior 8 cycles). Did a **fresh full
+  enumeration** of every per-token launch the dense gemma layer issues after T1–T6:
+  attention = `[L0-only pre-attn rms_norm]` · Q/K dual-matvec (T4) · V-matvec (SWA) ·
+  `rms_norm_rope_qkv` (T5) · `gemma_attention` · O-matvec · `rms_norm_residual_norm`
+  (T6); FFN = gate/up dual-matvec (T4) · `geglu` · down-matvec ·
+  `rms_norm_residual_scale_norm` (T6). **Every tiny norm/elementwise/scalar launch is
+  already fused** — no standalone `scalar_mul`/`scale`/`add`/single-block-`rms_norm`
+  remains on the dense path. The ONLY removable launch left is the V-matvec → Q/K/V
+  triple, which removes exactly ONE launch/layer (~50/token, SWA-only) and was already
+  implemented+measured+reverted as below-floor (see the triple-matvec cycle above,
+  recoverable). The other matvecs (O, down) have UNIQUE inputs → no same-input pair to
+  dual (T4's shape needs a shared input). `geglu` can't fuse without serializing
+  (rejected FFN-fuse) or recomputing gelu n_embd× per element (down-fuse, ~5376×
+  redundant — strictly worse). **Conclusion: no new ≥2-launch, parallelism-preserving,
+  bit-exact dense fusion exists.** Remaining un-fused gate/up PAIRS live ONLY on the
+  MoE path (gemma4-26b shared-expert `dmmvDispatch`×2 at forward_cuda_gemma.zig:667-668,
+  and routed-expert `dmmv_q4k_experts`×2 at :723/:725) — each a T4-style dual candidate,
+  but the 26b MoE is **boost-unmeasurable on this box** (proven across 3 cycles: MoE
+  output-scale, and the boost-erratic-regardless-of-NGEN signature), so implementing one
+  would only reproduce a foregone "INCONCLUSIVE → revert" and burn box time. **Re-confirmed
+  the clock-control wall** that gates every below-floor recoverable fusion: on the 4090,
+  `nvidia-smi -i 1 -lgc 2400,2400` → "current user does not have permission to change
+  clocks"; `sudo -n` → "a password is required". No way to pin clocks → sub-1% dense
+  effects and all MoE effects stay unresolvable. **Recommendation: CLOSE Effort 23.** Net
+  delivered: **5 stacked validated dense-decode wins** (T1 +1.54%, T3 +1.66%, T4 +1.30%,
+  T5 +1.65%, T6 +1.41% — each on its own pushed `perf/e23-*` branch, NOT main; compounding
+  ~+7–8% on gemma-31b dense decode atop the two pre-effort fusions). The recoverable
+  below-floor/MoE fusions (V-triple dense; MoE shared/routed gate/up duals) are documented
+  above and worth banking ONLY in a future clock-locked session (`nvidia-smi -lgc`, needs
+  sudo the agent lacks). Box hygiene: cleared `/tmp/lc-* /tmp/gc-* /tmp/cuda-dbg-*`; the
+  reusable `~/zinc-e23` rsync tree sits at the T5-era commit with the already-banked T6
+  uncommitted in it (harmless — the build helper rsyncs fresh from the Mac repo each cycle).
