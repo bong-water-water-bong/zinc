@@ -460,6 +460,30 @@ pub const ForwardCuda = struct {
         return tok;
     }
 
+    /// Prefill helper: run every layer (build the KV cache) but SKIP the tail
+    /// rms_norm + LM head + argmax. A prompt-internal token's logits are never
+    /// used — only the final prompt token's argmax seeds generation — so the
+    /// (vocab x n_embd) head matvec is pure waste on T-1 of the T prompt tokens.
+    /// It is a large share for the MoE models, whose active per-token forward is
+    /// small next to the full-vocab head. The async layer ops are drained here
+    /// (waitPending) so the ring is freed each token; bit-identical generation.
+    pub fn prefillStep(self: *ForwardCuda, token: u32, pos: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        self.model.dequantEmbeddingRow(token, self.host_embed);
+        buffer.upload(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            if (isFullAttn(L, d.full_attn_interval)) {
+                try self.attentionLayer(L, pos);
+            } else {
+                try self.ssmLayer(L);
+            }
+            if (d.n_experts > 0) try self.moeFfnBlock(L) else try self.ffnBlock(L);
+        }
+        self.waitPending(); // drain the async layer ops; no logits for prompt-internal tokens
+    }
+
     // ---- per-block builders -------------------------------------------------
 
     fn attentionLayer(self: *ForwardCuda, L: u32, pos: u32) !void {

@@ -1737,13 +1737,20 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     var generated: std.ArrayList(u32) = .{};
     defer generated.deinit(allocator);
 
-    // PREFILL: run one decodeStep per prompt token (pos 0..T-1). The prediction
-    // returned for the last prompt token is the first generated token.
+    // PREFILL: build the KV cache for every prompt token, but only the LAST
+    // prompt token needs logits — its argmax is the first generated token.
+    // Prompt-internal tokens use prefillStep, which skips the vocab-sized LM
+    // head (pure waste otherwise — a large share for the MoE models, whose
+    // active per-token forward is small). Same KV cache, bit-identical output.
     var pos: u32 = 0;
     var next_tok: u32 = 0;
     var prefill_timer = try std.time.Timer.start();
     while (pos < prompt_tokens.len) : (pos += 1) {
-        next_tok = try fwd.decodeStep(prompt_tokens[pos], pos, true);
+        if (pos + 1 < prompt_tokens.len) {
+            try fwd.prefillStep(prompt_tokens[pos], pos);
+        } else {
+            next_tok = try fwd.decodeStep(prompt_tokens[pos], pos, true);
+        }
     }
     const prefill_ms = @as(f64, @floatFromInt(prefill_timer.read())) / 1_000_000.0;
     const prefill_tps = if (prefill_ms > 0) @as(f64, @floatFromInt(prompt_tokens.len)) / (prefill_ms / 1000.0) else 0;

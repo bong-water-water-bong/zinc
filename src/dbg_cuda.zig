@@ -44,6 +44,11 @@ const Engine = union(enum) {
             inline else => |*e| return e.decodeStep(token, pos, run_layers),
         }
     }
+    fn prefillStep(self: *Engine, token: u32, pos: u32) !void {
+        switch (self.*) {
+            inline else => |*e| try e.prefillStep(token, pos),
+        }
+    }
     fn readLogits(self: *Engine, out: []f32) void {
         switch (self.*) {
             inline else => |*e| e.readLogits(out),
@@ -159,12 +164,25 @@ fn genMode(allocator: std.mem.Allocator, ids_arg: []const u8, ngen: u32, model_p
     std.debug.print("\n", .{});
 
     // Prefill: process each prompt token at its position; the argmax after the
-    // last prompt token is the first generated token.
+    // last prompt token is the first generated token. Prompt-internal tokens
+    // need no logits, so ZINC_PREFILL_SKIP=1 runs them via prefillStep (skips
+    // the LM head, bit-identical generation) to A/B the head-skip prefill win.
+    const pf_skip = std.posix.getenv("ZINC_PREFILL_SKIP") != null;
     var pos: u32 = 0;
     var tok: u32 = 0;
-    for (prompt) |t| {
-        tok = try fwd.decodeStep(t, pos, true);
+    var pf_timer = try std.time.Timer.start();
+    for (prompt, 0..) |t, i| {
+        if (pf_skip and i + 1 < prompt.len) {
+            try fwd.prefillStep(t, pos);
+        } else {
+            tok = try fwd.decodeStep(t, pos, true);
+        }
         pos += 1;
+    }
+    const pf_ns = pf_timer.read();
+    if (prompt.len > 1) {
+        const pf_secs = @as(f64, @floatFromInt(pf_ns)) / 1e9;
+        std.debug.print("PREFILL: {d} tokens in {d:.3}s = {d:.2} tok/s (skip={})\n", .{ prompt.len, pf_secs, @as(f64, @floatFromInt(prompt.len)) / pf_secs, pf_skip });
     }
 
     std.debug.print("GEN_IDS:{d}", .{tok});

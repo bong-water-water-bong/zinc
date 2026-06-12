@@ -471,6 +471,32 @@ pub const ForwardGemma = struct {
         return tok;
     }
 
+    /// Prefill helper (mirrors ForwardCuda.prefillStep): run every layer to
+    /// build the KV cache, but SKIP the tail rms_norm + LM head + argmax — a
+    /// prompt-internal token's logits are never read. Saves the vocab-sized
+    /// head matvec on T-1 of the T prompt tokens; the MoE gemma model (small
+    /// active forward, full head) benefits most. Async layer ops drained here;
+    /// bit-identical generation.
+    pub fn prefillStep(self: *ForwardGemma, token: u32, pos: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        self.model.dequantEmbeddingRow(token, self.host_embed);
+        const embd_scale = std.math.sqrt(@as(f32, @floatFromInt(d.n_embd)));
+        for (self.host_embed) |*v| v.* *= embd_scale;
+        buffer.upload(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            try self.attentionLayer(L, pos);
+            if (d.n_experts > 0 and self.model.getLayer(L, "ffn_gate_inp.weight") != null) {
+                try self.moeFfnBlock(L);
+            } else {
+                try self.ffnBlock(L);
+            }
+            try self.layerOutScale(L);
+        }
+        self.waitPending(); // drain async layer ops; no logits for prompt-internal tokens
+    }
+
     // ---- per-block builders -------------------------------------------------
 
     fn attentionLayer(self: *ForwardGemma, L: u32, pos: u32) !void {
