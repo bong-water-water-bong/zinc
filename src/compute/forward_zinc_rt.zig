@@ -4983,6 +4983,7 @@ fn runMoeLayer(
     var shared_gate_scalar = [_]f32{0};
     var shared_scale: f32 = 1.0;
     var routed_top1 = false;
+    var routed_experts_ready = false;
     if (lt.ffn_gate_inp_shexp) |shared_gate_inp| {
         if (state.decode_phase and n_used == 1) {
             const router_w = model.requantOrRaw(lt.ffn_gate_inp.?);
@@ -5002,16 +5003,22 @@ fn runMoeLayer(
                     state.expert_weights[0] = 1.0;
                     shared_scale = sigmoid(route.shared_gate);
                     routed_top1 = true;
+                    routed_experts_ready = true;
                 } else |_| {}
             }
         }
         if (!routed_top1) {
             if (route_experts) {
-                try matvecFusedTensors(state.pool, model, &[_]FusedPart{
-                    .{ .info = lt.ffn_gate_inp.?, .rows = cfg.n_experts, .out = state.router_logits },
-                    .{ .info = shared_gate_inp, .rows = 1, .out = shared_gate_scalar[0..] },
-                }, state.ffn_norm, state.row_scratch);
-                consumeDirectRouterRowRange(model, state, lt, direct_compute_tracking);
+                if (consumeDirectRouterRowRangePrimary(model, state, lt, direct_compute_tracking, n_used)) {
+                    routed_experts_ready = true;
+                    try matvecTensor(state.pool, model, shared_gate_inp, state.ffn_norm, 1, state.row_scratch, shared_gate_scalar[0..]);
+                } else {
+                    try matvecFusedTensors(state.pool, model, &[_]FusedPart{
+                        .{ .info = lt.ffn_gate_inp.?, .rows = cfg.n_experts, .out = state.router_logits },
+                        .{ .info = shared_gate_inp, .rows = 1, .out = shared_gate_scalar[0..] },
+                    }, state.ffn_norm, state.row_scratch);
+                    consumeDirectRouterRowRange(model, state, lt, direct_compute_tracking);
+                }
             } else {
                 try matvecTensor(state.pool, model, shared_gate_inp, state.ffn_norm, 1, state.row_scratch, shared_gate_scalar[0..]);
             }
@@ -5025,15 +5032,20 @@ fn runMoeLayer(
                     state.expert_ids[0] = expert_id;
                     state.expert_weights[0] = 1.0;
                     routed_top1 = true;
+                    routed_experts_ready = true;
                 } else |_| {}
             }
         }
         if (!routed_top1 and route_experts) {
-            try matvecTensor(state.pool, model, lt.ffn_gate_inp.?, state.ffn_norm, cfg.n_experts, state.row_scratch, state.router_logits);
-            consumeDirectRouterRowRange(model, state, lt, direct_compute_tracking);
+            if (consumeDirectRouterRowRangePrimary(model, state, lt, direct_compute_tracking, n_used)) {
+                routed_experts_ready = true;
+            } else {
+                try matvecTensor(state.pool, model, lt.ffn_gate_inp.?, state.ffn_norm, cfg.n_experts, state.row_scratch, state.router_logits);
+                consumeDirectRouterRowRange(model, state, lt, direct_compute_tracking);
+            }
         }
     }
-    if (!routed_top1 and route_experts) topKSoftmaxCpu(state.router_logits, n_used, state.expert_ids, state.expert_weights);
+    if (!routed_experts_ready and route_experts) topKSoftmaxCpu(state.router_logits, n_used, state.expert_ids, state.expert_weights);
 
     const gate_exps = lt.ffn_gate_exps.?;
     const up_exps = lt.ffn_up_exps.?;
@@ -5381,6 +5393,109 @@ fn dispatchDirectRouterRowRange(
         },
         else => return error.UnsupportedType,
     }
+}
+
+fn consumeDirectRouterRowRangePrimary(
+    model: *const Model,
+    state: *ScalarDecodeState,
+    lt: LayerTensors,
+    maybe_tracking: ?DirectComputeTracking,
+    n_used: u32,
+) bool {
+    const tracking = maybe_tracking orelse return false;
+    if (tracking.phase != .decode) return false;
+    if (n_used == 0) return false;
+    if (state.direct_router_row_range_done) return false;
+    const router_info = lt.ffn_gate_inp orelse return false;
+    const cfg = model.config;
+    const cols: u32 = @intCast(state.ffn_norm.len);
+    const router_w = model.requantOrRaw(router_info);
+    if (!directRouterSupportsRowRange(router_w.type_, cols)) return false;
+    if (!canDotDirect(router_w.type_, cols)) return false;
+
+    const rows = directRouterRowsForSlice(cfg.n_experts);
+    if (!directRouterCanOverwriteAllLogits(cfg.n_experts, rows)) return false;
+    if (rows > state.router_logits.len) return false;
+    if (n_used > state.expert_ids.len or n_used > state.expert_weights.len) return false;
+    const rows_usize: usize = @intCast(rows);
+    const row_bytes = directRouterRowBytes(router_w.type_, cols);
+    if (row_bytes == 0) return false;
+    const total_bytes = @as(usize, rows) * row_bytes;
+    if (router_w.raw.len < total_bytes) return false;
+
+    const gpu_logits = state.router_logits[0..rows_usize];
+    const dispatch_result = dispatchDirectRouterRowRange(
+        tracking.boundary,
+        router_w.type_,
+        state.ffn_norm,
+        router_w.raw[0..total_bytes],
+        rows,
+        cols,
+        row_bytes,
+        gpu_logits,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct router primary {s} row-range unavailable ({s}); router falls back to host matvec", .{ @tagName(router_w.type_), @errorName(err) });
+        return false;
+    };
+
+    for (gpu_logits, 0..) |gpu_value, i| {
+        if (!std.math.isFinite(gpu_value)) {
+            log.warn("M1 AMDGPU CS direct router primary row-range produced non-finite row {d}; router falls back to host matvec", .{i});
+            return false;
+        }
+    }
+
+    topKSoftmaxCpu(gpu_logits, n_used, state.expert_ids, state.expert_weights);
+
+    var max_selected_delta: f32 = 0.0;
+    var max_selected_slot: u32 = 0;
+    var max_selected_row: u32 = 0;
+    for (0..n_used) |slot| {
+        const row = state.expert_ids[slot];
+        if (row >= rows) {
+            log.warn("M1 AMDGPU CS direct router primary selected out-of-range expert row {d}; router falls back to host matvec", .{row});
+            return false;
+        }
+        const cpu_value = dotDirectRaw(router_w.raw, router_w.type_, row, cols, state.ffn_norm, null) catch {
+            log.warn("M1 AMDGPU CS direct router primary selected-row CPU oracle failed; router falls back to host matvec", .{});
+            return false;
+        };
+        const gpu_value = gpu_logits[row];
+        const delta = @abs(cpu_value - gpu_value);
+        if (delta > max_selected_delta) {
+            max_selected_delta = delta;
+            max_selected_slot = @intCast(slot);
+            max_selected_row = row;
+        }
+    }
+    if (max_selected_delta > direct_router_row_range_tolerance) {
+        log.warn("M1 AMDGPU CS direct router primary selected-row mismatch: slot={d} row={d} max_abs_delta={d:.6}; router falls back to host matvec", .{
+            max_selected_slot,
+            max_selected_row,
+            max_selected_delta,
+        });
+        return false;
+    }
+
+    state.direct_router_row_range_done = true;
+    tracking.ops.* += dispatch_result.chunks;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += dispatch_result.chunks;
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s}_primary phase=decode coverage=full rows={d} experts={d} cols={d} chunks={d} selected_topk={d} max_selected_delta={d:.6} max_selected_slot={d} max_selected_row={d} consumed_gpu_model_value=1", .{
+        tracking.ops.*,
+        directRouterRowRangeOpName(router_w.type_, dispatch_result.used_parallel64),
+        rows,
+        cfg.n_experts,
+        cols,
+        dispatch_result.chunks,
+        n_used,
+        max_selected_delta,
+        max_selected_slot,
+        max_selected_row,
+    });
+    return true;
 }
 
 fn consumeDirectRouterRowRange(
