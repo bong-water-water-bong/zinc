@@ -188,6 +188,9 @@ const Pipelines = struct {
     // (f32_to_f16 downcasts the activation once → halves the dominant f32-A read
     // traffic). Output byte-identical to gemm_q4k_tc. Opt-in with the TC path.
     gemm_q4k_tc_f16a: CudaPipeline,
+    // Effort 24 cycle 13: same f16-A TC pattern extended to Q6_K weights (dense
+    // gemma-31b's ffn_down etc.), which cycles 11/12 left on the f32 fallback.
+    gemm_q6k_tc_f16a: CudaPipeline,
     f32_to_f16: CudaPipeline, // element-wise activation downcast for the TC f16-A path
 };
 
@@ -287,6 +290,7 @@ pub const ForwardGemma = struct {
     // the proven byte-identical path is unchanged. NOT byte-identical when on.
     use_tc: bool = false,
     use_tc_plain: bool = false, // cycle 12 A/B: force cycle-11 plain TC (no f16-A pre-convert)
+    use_tc_q6: bool = true, // cycle 13 A/B: ZINC_BATCHED_TC_NOQ6 forces Q6_K back to f32 TC-off
 
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardGemma {
         const ctx = model.ctx;
@@ -395,6 +399,7 @@ pub const ForwardGemma = struct {
         pipes.gemm_f32 = try pipeline.createPipeline(ctx, src.ptr, "gemm_f32_tiled_v2");
         pipes.gemm_q4k_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc");
         pipes.gemm_q4k_tc_f16a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a");
+        pipes.gemm_q6k_tc_f16a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_f16a");
         pipes.f32_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "f32_to_f16");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
@@ -646,6 +651,12 @@ pub const ForwardGemma = struct {
         // path (activation pre-converted to fp16 once). Lets us measure the f16-A
         // memory-traffic win in isolation. Unset → the f16-A path (cycle 12 default).
         self.use_tc_plain = std.posix.getenv("ZINC_BATCHED_TC_PLAIN") != null;
+        // Cycle 13 A/B knob: ZINC_BATCHED_TC_NOQ6 forces the dense Q6_K GEMMs
+        // (ffn_down etc.) back onto the f32 register-tiled gemm_q6k_tiled_v2 even
+        // when the TC path is on — lets us measure the Q6_K-on-TC increment in
+        // isolation (= cycle-12 behavior: Q4_K on TC, Q6_K on f32). Unset → Q6_K
+        // also runs the fp16 TC f16-A kernel (cycle 13 default).
+        self.use_tc_q6 = std.posix.getenv("ZINC_BATCHED_TC_NOQ6") == null;
 
         const b = try self.ensureBatch(T);
 
@@ -889,6 +900,17 @@ pub const ForwardGemma = struct {
                 const cvt = F32ToF16Push{ .N = T * K };
                 cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
                 cmd.dispatch(&self.pipes.gemm_q4k_tc_f16a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
+                return;
+            }
+            if (self.use_tc and idx == 2 and self.use_tc_q6) {
+                // Cycle 13: Q6_K weights (dense gemma-31b's ffn_down etc.) on the
+                // fp16 tensor cores, same pre-converted-fp16-A pattern as Q4_K above
+                // (f32_to_f16 once → half-width A read). gemm_q6k_tc_f16a mirrors the
+                // f32 gemm_q6k_tiled_v2 dequant; fp16 rounding → token-correctness gate.
+                const a16 = &self.batch.?.act_f16;
+                const cvt = F32ToF16Push{ .N = T * K };
+                cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
+                cmd.dispatch(&self.pipes.gemm_q6k_tc_f16a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
                 return;
             }
             // Same GemmPush / grid / block; gemm uses static shared only.

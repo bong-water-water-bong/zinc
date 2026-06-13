@@ -446,3 +446,38 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   (kill the per-GEMM Q4_K dequant — the other half of the TC GEMM's traffic) and/or keep activations fp16
   across the whole layer (avoid the per-GEMM f32→fp16 recast); OR token-GROUPED routed experts (gather by
   expert = memory-traffic win beyond launch batching, harder byte-identity).
+- **2026-06-13 — Cycle 13: extend the f16-A tensor-core GEMM to Q6_K weights (complete TC coverage of the dense gemma GEMMs) — token-correct, marginal (+1.8%, in noise).**
+  Cycles 11/12 wired the fp16 tensor cores only for the dense Q4_K GEMMs (gemmDispatch idx 0 — attn Q/K/V/O +
+  FFN gate/up); the dense gemma-31b also carries **Q6_K** weights (notably ffn_down, idx 2), which still fell
+  back to the f32 register-tiled `gemm_q6k_tiled_v2` even with `ZINC_BATCHED_TC` on. This cycle extends the
+  proven cycle-12 f16-A TC pattern to Q6_K so ALL dense quant types run on the tensor cores when toggled.
+  ADDITIVE (decodeStep/per-token path/dense+MoE batched f32 paths/the Q4_K TC kernels all untouched):
+    - 1 ADDITIVE kernel (kernels.cu): `gemm_q6k_tc_f16a` — `gemm_q4k_tc_f16a` in every respect (same wmma
+      16×16×16 schedule, m-major half Ws tile, k-major fp16 As tile, fp32 accumulate, token-major Cs store +
+      guarded copy, pre-converted fp16 A read once) EXCEPT the weight sub-block is dequant'd with the Q6_K
+      unpack copied VERBATIM from `gemm_q6k_tiled_v2` (210 B/256 elems; 6-bit q=(ql_nibble|(qh_bits<<4));
+      value=d·sc·(q−32)). Q6_K is byte-addressed → `const unsigned char* a`. NOT bit-identical to the f32 Q6_K
+      path (fp16 rounding) → token-correctness gate, same class as the Q4_K TC kernels.
+    - `gemm_q6k_tc_f16a` pipeline + `gemmDispatch` branch: when `use_tc` and idx==2 (and the new `use_tc_q6`),
+      pre-convert A → `act_f16` (reuses the cycle-12 `f32_to_f16` + `BatchScratch.act_f16`, already sized to
+      `T·max(n_ff,…)` so the K=n_ff ffn_down tile fits) then dispatch the Q6_K TC kernel. `x_offset==0` on the
+      batched path (contiguous [T,K]) so the whole tile converts at offset 0.
+    - A/B kill-switch `ZINC_BATCHED_TC_NOQ6` (additive bool `use_tc_q6`, default true) forces Q6_K back to the
+      f32 path even with TC on → lets the Q6_K-on-TC increment be measured in ONE binary (= cycle-12 behavior).
+  Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda -Dshaders=false` EXIT=0,
+  bin md5 b97d310e ≠ cycle 12's 33e6e1a1; NVRTC compiled the new kernel at runtime). GATE — its own tolerance
+  gate CLEARED (TC is fp16 → token-correctness, not GEN byte-identity vs f32):
+    - `ZINC_BATCHED=1 ZINC_BATCHED_TC=1 validate_catalog` (Q6_K-TC path direct vs llama.cpp, 4090): **5/5 PASS**
+      — qwen35-9b/qwen36-27b/qwen36-35b-a3b/gemma4-26b all **12/12**; gemma4-31b the SAME documented near-tie as
+      the f32/Q4_K-TC path (free-run 2/12, teacher-forced 11/12) → the Q6_K fp16 TC introduced **NO new divergence**.
+    - Isolated A/B (ONE binary, gemma-31b 250-tok, 4090, ABBA x2): Q6K-on-TC (cycle 13) **~160.5 t/s** vs
+      Q6K-off-TC (`ZINC_BATCHED_TC_NOQ6=1`, = cycle-12 behavior) **~157.7 t/s** = **+1.8%, WITHIN BOOST NOISE**
+      (B runs spanned 150–168). The increment is marginal because Q6_K is only ~1/7 of the dense GEMM work
+      (one Q6_K ffn_down vs six Q4_K projections/gate/up per layer) — the bulk was already on TC since cycle 12.
+  HONEST OUTCOME: this is a completeness step (all dense quant types now on the tensor cores, token-correct with
+  no new divergence) rather than a meaningful perf win; the Q6_K share is too small to clear the box's ±1% boost
+  floor on its own. Opt-in (off by default) + the new kill-switch → cannot regress production or the proven
+  byte-identical batched gate. Committed to perf/e24-batched-prefill, pushed (NOT main). NEXT (cycle 14): the
+  bigger memory-traffic lever stays the fp16 WEIGHT cache — dequant Q4_K/Q6_K to fp16 ONCE per layer so the TC
+  GEMMs read pre-dequant'd half weights (kills the per-GEMM dequant, the other half of the GEMM traffic); OR
+  token-GROUPED routed experts (gather by expert, memory-traffic win beyond launch batching, harder byte-identity).
