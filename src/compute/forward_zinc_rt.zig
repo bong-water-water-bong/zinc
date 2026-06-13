@@ -1381,6 +1381,7 @@ const ScalarDecodeState = struct {
     direct_ssm_qkv_gate_q4_row_range_done_mask: u128 = 0,
     direct_ssm_qkv_gate_q4_row_range_failed_mask: u128 = 0,
     direct_ssm_qkv_gate_q4_row_range_slice_successes: u32 = 0,
+    direct_ssm_out_q4_row_range_done: bool = false,
     direct_moe_gate_up_row_range_count: u32 = 0,
     direct_shared_moe_gate_up_row_range_done: bool = false,
     direct_moe_down_row_range_count: u32 = 0,
@@ -1534,6 +1535,7 @@ const ScalarDecodeState = struct {
         self.direct_ssm_beta_q8_row_range_slice_successes = 0;
         self.direct_ssm_qkv_gate_q4_row_range_done_mask = 0;
         self.direct_ssm_qkv_gate_q4_row_range_slice_successes = 0;
+        self.direct_ssm_out_q4_row_range_done = false;
         self.direct_moe_gate_up_row_range_count = 0;
         self.direct_shared_moe_gate_up_row_range_done = false;
         self.direct_moe_down_row_range_count = 0;
@@ -1745,6 +1747,7 @@ fn generateScalarHybrid(
         log.info("M1 AMDGPU CS direct SSM QKV/gate Q4_0 row-range budget: {d} layers per tracked decode slice", .{
             direct_ssm_qkv_gate_q4_0_max_successes_per_slice,
         });
+        log.info("M1 AMDGPU CS direct SSM output Q4_0 row-range budget: 1 layer per tracked decode slice", .{});
         log.info("M1 AMDGPU CS direct MoE Q4_0 row-range budget: gate/up routed_slots={d}, down routed_slots={d}, shared_gate_up=1, shared_down=1", .{
             direct_moe_gate_up_q4_0_max_expert_slots,
             direct_moe_down_q4_0_max_expert_slots,
@@ -3482,12 +3485,88 @@ fn runSsmLayer(
         runSsmHeadsParallel(state.pool, &head_ctx);
         try matvecTensor(state.pool, model, lt.ssm_out.?, state.ssm_out[0..d_inner], cfg.hidden_dim, state.row_scratch, state.branch);
     }
+    consumeDirectSsmOutQ4_0RowRange(state, ssm_out_w, layer, direct_compute_tracking);
     for (state.hidden, state.branch) |*h, b| h.* += b;
 }
 
 const direct_ssm_qkv_gate_q4_0_tolerance: f32 = 0.05;
 const direct_ssm_qkv_gate_q4_0_range_rows: u32 = 64;
 const direct_ssm_qkv_gate_q4_0_max_successes_per_slice: u32 = 4;
+const direct_ssm_out_q4_0_tolerance: f32 = 0.05;
+const direct_ssm_out_q4_0_range_rows: u32 = 64;
+
+fn consumeDirectSsmOutQ4_0RowRange(
+    state: *ScalarDecodeState,
+    ssm_out_w: WeightView,
+    layer: u32,
+    maybe_tracking: ?DirectComputeTracking,
+) void {
+    const tracking = maybe_tracking orelse return;
+    if (tracking.phase != .decode) return;
+    if (state.direct_ssm_out_q4_row_range_done) return;
+    if (ssm_out_w.type_ != .q4_0) return;
+
+    const cols: u32 = @intCast(state.ssm_out.len);
+    if (cols == 0 or cols % 32 != 0) return;
+    const rows = direct_ssm_out_q4_0_range_rows;
+    const rows_usize: usize = @intCast(rows);
+    if (state.branch.len < rows_usize or state.row_scratch.len < rows_usize) return;
+
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    const range_bytes = rows_usize * row_bytes;
+    if (row_bytes == 0 or ssm_out_w.raw.len < range_bytes) return;
+
+    const gpu_rows = state.row_scratch[0..rows_usize];
+    tracking.boundary.dmmvQ4_0RowRangeParallel(
+        state.ssm_out[0..@as(usize, @intCast(cols))],
+        ssm_out_w.raw[0..range_bytes],
+        rows,
+        cols,
+        gpu_rows,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct SSM output Q4_0 row range unavailable ({s}); ssm_out projection remains host-computed", .{@errorName(err)});
+        return;
+    };
+
+    var max_abs_delta: f32 = 0.0;
+    var max_row: u32 = 0;
+    for (0..rows_usize) |i| {
+        const gpu = gpu_rows[i];
+        if (!std.math.isFinite(gpu)) {
+            log.warn("M1 AMDGPU CS direct SSM output Q4_0 row range produced non-finite row {d}; ssm_out projection remains host-computed", .{i});
+            return;
+        }
+        const delta = @abs(gpu - state.branch[i]);
+        if (delta > max_abs_delta) {
+            max_abs_delta = delta;
+            max_row = @intCast(i);
+        }
+    }
+    if (max_abs_delta > direct_ssm_out_q4_0_tolerance) {
+        log.warn("M1 AMDGPU CS direct SSM output Q4_0 row range mismatch: layer={d} max_abs_delta={d:.6} row={d}; ssm_out projection remains host-computed", .{
+            layer,
+            max_abs_delta,
+            max_row,
+        });
+        return;
+    }
+
+    @memcpy(state.branch[0..rows_usize], gpu_rows);
+    state.direct_ssm_out_q4_row_range_done = true;
+    tracking.ops.* += 1;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += 1;
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=ssm_out_q4_0_row_range_parallel64 phase=decode layer={d} rows={d} cols={d} chunks=1 max_abs_delta={d:.6} max_row={d} consumed_gpu_model_value=1", .{
+        tracking.ops.*,
+        layer,
+        rows,
+        cols,
+        max_abs_delta,
+        max_row,
+    });
+}
 
 fn consumeDirectSsmQkvGateQ4_0RowRange(
     model: *const Model,
@@ -9089,6 +9168,7 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     state.direct_ssm_qkv_gate_q4_row_range_done_mask = mask;
     state.direct_ssm_qkv_gate_q4_row_range_failed_mask = directSsmLayerBit(4);
     state.direct_ssm_qkv_gate_q4_row_range_slice_successes = direct_ssm_qkv_gate_q4_0_max_successes_per_slice;
+    state.direct_ssm_out_q4_row_range_done = true;
     state.direct_moe_gate_up_row_range_count = direct_moe_gate_up_q4_0_max_expert_slots;
     state.direct_shared_moe_gate_up_row_range_done = true;
     state.direct_moe_down_row_range_count = direct_moe_down_q4_0_max_expert_slots;
@@ -9114,6 +9194,7 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     try std.testing.expectEqual(@as(u128, 0), state.direct_ssm_qkv_gate_q4_row_range_done_mask);
     try std.testing.expectEqual(directSsmLayerBit(4), state.direct_ssm_qkv_gate_q4_row_range_failed_mask);
     try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_qkv_gate_q4_row_range_slice_successes);
+    try std.testing.expect(!state.direct_ssm_out_q4_row_range_done);
     try std.testing.expectEqual(@as(u32, 0), state.direct_moe_gate_up_row_range_count);
     try std.testing.expect(!state.direct_shared_moe_gate_up_row_range_done);
     try std.testing.expectEqual(@as(u32, 0), state.direct_moe_down_row_range_count);
