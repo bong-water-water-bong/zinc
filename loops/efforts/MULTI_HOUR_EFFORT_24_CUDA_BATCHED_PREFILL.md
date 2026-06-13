@@ -736,3 +736,54 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   well-motivated (it shaves the TC path's remaining f32 overhead at large T); OR a flash-style batched attention kernel —
   the grouped sweep showed dense/MoE throughput PEAKS at T≈750 and DROPS by T=1500, the signature of O(T²) attention
   overtaking the O(T) GEMMs, so the unoptimized 3-pass `gemma_attention_batched` is the next large-T bottleneck.
+- **2026-06-13 — Cycle 21: fp16-EMITTING norm/GeGLU producers for the TC path (the heavier activation-fp16 half) — token-correct, PERF IN-NOISE, NOT strictly byte-identical (ULP near-tie) → kept OPT-IN.**
+  Took cycle 20's well-motivated NEXT: cycle 12 pre-converts each dense GEMM's f32 activation A→fp16 via a separate
+  `f32_to_f16` launch into `act_f16`; cycle 19 deduped that recast within same-input GEMM groups (sharea). This cycle
+  removes the recast ENTIRELY on the dense TC path by having the activation PRODUCERS emit fp16 directly into `act_f16`:
+  the pre-attn / pre-FFN rms_norm and the FFN GeGLU. ADDITIVE (decodeStep/per-token path/the default per-GEMM-recast TC
+  path all untouched; default toggle-off path byte-for-byte cycle 19):
+    - 2 ADDITIVE kernels (kernels.cu): `rms_norm_f16` (verbatim `rms_norm` — same `zinc_block_reduce_sum`, same
+      `rinv`, same `w[i]*(x[i]*rinv)` — but `__float2half`-stores into a half output) and `geglu_f16` (verbatim `geglu`,
+      `__float2half(gelu*up)`). Each computes the SAME f32 value its f32 twin writes, so `act_f16` should equal
+      `f32_to_f16(twin)` — see the byte-identity caveat below.
+    - `rms_norm_f16`/`geglu_f16` pipelines + opt-in bool `use_tc_normf16` (`ZINC_BATCHED_TC_NORMF16`, only meaningful with
+      `ZINC_BATCHED_TC`). `attentionLayerBatched`: when set, dispatch `rms_norm_f16`→`act_f16` and call Q/K/V (all Q4_K)
+      with `a_preconv=true` (skip their recast). `ffnBlockBatched`: `rms_norm_f16`→`act_f16` (gate/up `a_preconv`), and
+      `geglu_f16`→`act_f16` for ffn_down ONLY when down takes the act_f16 TC path (Q4_K always, Q6_K iff `use_tc_q6`) —
+      a `down_act_f16` guard so NORMF16+NOQ6 can't read a stale b.geglu. `gemmDispatchA`'s 2 recast-skip conditions
+      extended to honor `use_tc_normf16` (`!(a_preconv and (use_tc_sharea or use_tc_normf16))`). The O projection (input
+      is the f32 attention output, not a norm producer) still recasts. New `scripts/normf16_sweep.sh` (ABBA T-sweep) +
+      `ZINC_BATCHED_TC_NORMF16` passthrough in prefill_catalog/validate_catalog.
+  Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda -Dshaders=false` EXIT=0, NVRTC
+  compiled the 2 new kernels; bin md5 da0b59d5 ≠ cycle 20's bb6e77c1). GATE:
+    - TOKEN-CORRECTNESS (the gate for the fp16 TC family): `ZINC_BATCHED=1 ZINC_BATCHED_TC=1 ZINC_BATCHED_TC_NORMF16=1
+      validate_catalog` (4090): **5/5 PASS** — qwen 12/12 (per-token fallback); gemma4-31b teacher-forced 11/12 (the
+      documented near-tie, unchanged); gemma4-26b teacher-forced **12/12** (every position's argmax matches llama.cpp →
+      the normf16 prefill is token-correct).
+    - BYTE-IDENTITY vs plain-TC — PARTIAL/NO (the honest finding): direct A/B (varied prompts) gemma-31b dense normf16 ==
+      plain-TC GEN_IDS byte-identical (incl. 3 varied leading tokens before the prompt's degenerate tail), BUT gemma-26b
+      MoE normf16 ≠ plain-TC — and 26b plain-TC is DETERMINISTIC (3/3 identical runs), so the difference is a REAL
+      deterministic ULP-level numerical difference, not run noise. The MoE path reads neither `b.norm` nor `act_f16`
+      (router/shared/experts all re-norm `b.hidden` themselves), so the diff originates in the attention norm itself:
+      `rms_norm_f16` and `rms_norm`+`f32_to_f16` are mathematically identical but compile (separate NVRTC kernels) to a
+      ~1-ULP-different fp16, enough to flip 26b's near-tie free-run argmaxes (the SAME near-tie class as the documented
+      31b/26b TC near-ties) while leaving teacher-forced correctness intact. So normf16 has the SAME relationship to
+      plain-TC that the TC path itself has to f32: token-correct, not bit-identical.
+    - PERF — IN-NOISE (`scripts/normf16_sweep.sh`, gemma-31b dense, ABBA x2, 4090): T=250 163.5→168.2 (+2.9%), T=750
+      172.0→174.6 (+1.5%), T=1500 175.6→167.4 (−4.7%) — all within the box's ±10% boost floor (script's rounded gain
+      column reads 0% at every T); GEN_IDS identical on the 31b sweep at all T. The cycle-20 hypothesis that the recast
+      (∝ T·K) would clear the floor at large T is FALSIFIED — at T=1500 it's nominally negative. Expected: `f32_to_f16`
+      is a cheap element-wise launch already fp16-halved since cycle 12, so eliminating 5/6 recasts/layer saves far less
+      than the GEMM cost. Same class as cycles 13/16/18/19.
+  DECISION: the bar for a DEFAULT FLIP is a MEASURED faster increment; this is in-noise AND not strictly byte-identical to
+  the current default TC path, so kept the proven cycle-12 per-GEMM recast as the DEFAULT and made the fp16-emitting
+  producers an ADDITIVE OPT-IN (`ZINC_BATCHED_TC_NORMF16`, off by default → default TC + strict-byte f32 paths both
+  byte-for-byte unchanged → cannot regress), mirroring cycles 13/14/16/17/18/19. NET: both halves of the activation-fp16
+  lever are now EXHAUSTED (cycle 19 shared-A: byte-identical, +2.6% sub-floor; cycle 21 normf16: token-correct, in-noise) —
+  the per-GEMM f32→fp16 recast is NOT a meaningful prefill cost on this box. Committed to perf/e24-batched-prefill, pushed
+  (NOT main; origin/main unchanged at c409e280, branch 0 behind → no rebase). NEXT (cycle 22): the activation-fp16 branch
+  is closed → pivot to the OTHER cycle-20 lever, a flash-style / query-tiled batched attention kernel: the grouped+TC
+  sweeps both show throughput PEAKING at T≈750 and DROPPING by T=1500 = O(T²) attention overtaking the O(T) GEMMs, and the
+  current 3-pass `gemma_attention_batched` re-reads K/V from global once per query block (O(T²) K/V traffic per head). A
+  query-tiled kernel that loads a K/V tile once for a block of queries (own token-correctness gate, fp/online-softmax →
+  not byte-identical) is the genuine remaining large-T win.

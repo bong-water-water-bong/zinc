@@ -62,7 +62,10 @@ case "$MODE" in
             [ "${ZINC_BATCHED_EXPERTS_GROUPED:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_EXPERTS_GROUPED=1"; S_LABEL="$S_LABEL+grouped"; }
             # Cycle 19: share one f32→f16 activation recast across same-input GEMMs
             # (byte-identical → GEN_IDS must still match; this knob measures the win).
-            [ "${ZINC_BATCHED_TC_SHAREA:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC_SHAREA=1"; S_LABEL="$S_LABEL+sharea"; } ;;
+            [ "${ZINC_BATCHED_TC_SHAREA:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC_SHAREA=1"; S_LABEL="$S_LABEL+sharea"; }
+            # Cycle 21: norm/GeGLU producers emit fp16 directly into act_f16, dropping
+            # the per-GEMM recast (byte-identical → GEN_IDS must still match; perf knob).
+            [ "${ZINC_BATCHED_TC_NORMF16:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC_NORMF16=1"; S_LABEL="$S_LABEL+normf16"; } ;;
   *) echo "unknown ZINC_AB '$MODE' (want headskip|batched)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")/.." && pwd)

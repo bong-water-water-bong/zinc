@@ -1863,6 +1863,46 @@ extern "C" __global__ void f32_to_f16(const float* x, half* y, F32ToF16Push pc) 
     y[idx] = __float2half(x[idx]);
 }
 
+// ---- rms_norm_f16 (Effort 24 cycle 21: emit the fp16 norm DIRECTLY for the TC path) ----
+// Byte-for-byte f32_to_f16(rms_norm(x,w)): computes the SAME f32 normalized value
+// w[i]*(x[i]*rinv) with the SAME reduction order as rms_norm, then __float2half-stores
+// it into a half output. So the fp16-A tensor-core GEMMs (gemm_q4k/q6k_tc_f16a*) read
+// the producer's act_f16 directly — the per-GEMM f32->f16 recast launch AND the f32
+// b.norm round-trip are dropped on the TC path. One block per token (grid.x = T).
+extern "C" __global__ void rms_norm_f16(const float* x, const float* w, half* y, RmsPush pc) {
+    unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    half* yt = y + (size_t)token * pc.N;
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        yt[i] = __float2half(w[i] * (xt[i] * rinv));
+    }
+}
+
+// ---- geglu_f16 (Effort 24 cycle 21: emit the fp16 GeGLU DIRECTLY for the TC down GEMM) ----
+// Byte-for-byte f32_to_f16(geglu(gate,up)): same gelu(gate)*up f32 value, __float2half-stored,
+// so the ffn_down TC GEMM reads act_f16 with no separate recast launch.
+extern "C" __global__ void geglu_f16(const float* gate, const float* up, half* y, SwigluPush pc) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pc.N) return;
+    const float k = 0.7978845608028654f; // sqrt(2/pi)
+    float g = gate[idx];
+    float gelu = 0.5f * g * (1.0f + tanhf(k * (g + 0.044715f * g * g * g)));
+    y[idx] = __float2half(gelu * up[idx]);
+}
+
 // ---- gemm_q4k_tc_f16a — tensor-core Q4_K GEMM with a PRE-CONVERTED fp16 A -----
 // Identical to gemm_q4k_tc in every respect (same Q4_K dequant, same wmma 16x16x16
 // fragment schedule, same Cs store / guarded copy) EXCEPT the activation A arrives
