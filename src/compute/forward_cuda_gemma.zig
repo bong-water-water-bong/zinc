@@ -208,6 +208,14 @@ const Pipelines = struct {
     // kernel (same wmma math; phases only reorder writes; GEN_IDS verified identical).
     // ZINC_BATCHED_TC_M64 is the A/B kill-switch back to the 24 KB m64 kernel.
     gemm_q4k_tc_f16a_lowsmem: CudaPipeline,
+    // Effort 24 cycle 16: 8 KB-shared variant of gemm_q6k_tc_f16a (dense gemma-31b
+    // ffn_down, idx 2) — the cycle-15 Q4_K two-phase-Cs occupancy trick extended to the
+    // Q6_K dequant (prior 24 KB m64 kernel caps occupancy at 2 blocks/SM; this reuses the
+    // dead Ws+As region for a two-phase Cs store → 8 KB → ~3x occupancy). Byte-identical
+    // to gemm_q6k_tc_f16a (same wmma math; phases only reorder writes), but perf-NEUTRAL
+    // (Q6_K is ~1/7 of the dense GEMM → below the boost floor) → kept OPT-IN via
+    // ZINC_BATCHED_TC_Q6_LOWSMEM; the proven m64 gemm_q6k_tc_f16a stays the default.
+    gemm_q6k_tc_f16a_lowsmem: CudaPipeline,
     f32_to_f16: CudaPipeline, // element-wise activation downcast for the TC f16-A path
 };
 
@@ -310,6 +318,7 @@ pub const ForwardGemma = struct {
     use_tc_q6: bool = true, // cycle 13 A/B: ZINC_BATCHED_TC_NOQ6 forces Q6_K back to f32 TC-off
     use_tc_m128: bool = false, // cycle 14 A/B: ZINC_BATCHED_TC_M128 opts into the wider 128x64 Q4_K TC kernel (NEGATIVE: -11.8%, off by default)
     use_tc_m64: bool = false, // cycle 15 A/B: ZINC_BATCHED_TC_M64 kill-switch forces the prior 24 KB-shared Q4_K TC kernel (cycle 12 default); the new default is the 8 KB-shared lowsmem kernel (+11.6%, byte-identical)
+    use_tc_q6_lowsmem: bool = false, // cycle 16 A/B: ZINC_BATCHED_TC_Q6_LOWSMEM opts INTO the 8 KB-shared lowsmem Q6_K TC kernel (gemm_q6k_tc_f16a_lowsmem). Byte-identical to the default 24 KB m64 Q6_K kernel but in-noise on perf (Q6_K is ~1/7 of the dense GEMM → its occupancy win is below the box's boost floor; 2 ABBA runs nominally -1/-5%) → kept OPT-IN, the proven m64 kernel stays the default.
 
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardGemma {
         const ctx = model.ctx;
@@ -421,6 +430,7 @@ pub const ForwardGemma = struct {
         pipes.gemm_q6k_tc_f16a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_f16a");
         pipes.gemm_q4k_tc_f16a_m128 = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a_m128");
         pipes.gemm_q4k_tc_f16a_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a_lowsmem");
+        pipes.gemm_q6k_tc_f16a_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_f16a_lowsmem");
         pipes.f32_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "f32_to_f16");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
@@ -693,6 +703,14 @@ pub const ForwardGemma = struct {
         // prompts). ZINC_BATCHED_TC_M64 is the A/B kill-switch back to the prior 24 KB
         // kernel (gemm_q4k_tc_f16a, cycle 12 default). m128/plain-TC (above) override it.
         self.use_tc_m64 = std.posix.getenv("ZINC_BATCHED_TC_M64") != null;
+        // Cycle 16: the 8 KB-shared Q6_K TC kernel (gemm_q6k_tc_f16a_lowsmem) applies the
+        // cycle-15 two-phase-Cs occupancy trick (24 KB→8 KB shared, 2→~8 blocks/SM) to the
+        // dense gemma-31b ffn_down Q6_K GEMM (idx 2). Byte-identical to the default 24 KB m64
+        // Q6_K kernel (gemm_q6k_tc_f16a) — but unlike the Q4_K lowsmem win it is perf-NEUTRAL
+        // (in-noise): the Q6_K GEMM is only ~1/7 of the dense work, so its occupancy win is
+        // below the box's ±10% boost floor (2 ABBA runs nominally -1%/-5%, ranges overlapping).
+        // → kept OPT-IN; ZINC_BATCHED_TC_Q6_LOWSMEM opts into it, the proven m64 kernel stays default.
+        self.use_tc_q6_lowsmem = std.posix.getenv("ZINC_BATCHED_TC_Q6_LOWSMEM") != null;
 
         const b = try self.ensureBatch(T);
 
@@ -959,7 +977,15 @@ pub const ForwardGemma = struct {
                 const a16 = &self.batch.?.act_f16;
                 const cvt = F32ToF16Push{ .N = T * K };
                 cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
-                cmd.dispatch(&self.pipes.gemm_q6k_tc_f16a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
+                // Cycle 16: default to the proven 24 KB m64 Q6_K kernel (gemm_q6k_tc_f16a,
+                // cycle 13); ZINC_BATCHED_TC_Q6_LOWSMEM opts into the byte-identical 8 KB-shared
+                // lowsmem kernel (perf-neutral here — Q6_K is ~1/7 of the dense GEMM, below the
+                // boost floor — so kept opt-in rather than promoted to default).
+                if (self.use_tc_q6_lowsmem) {
+                    cmd.dispatch(&self.pipes.gemm_q6k_tc_f16a_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
+                } else {
+                    cmd.dispatch(&self.pipes.gemm_q6k_tc_f16a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
+                }
                 return;
             }
             // Same GemmPush / grid / block; gemm uses static shared only.

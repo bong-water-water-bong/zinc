@@ -543,3 +543,37 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
       (complete the occupancy win on the dense ffn_down Q6_K GEMM); OR the fp16 WEIGHT cache (dequant Q4_K/Q6_K → fp16
       ONCE per layer, kills the per-GEMM dequant = the other half of GEMM traffic, no occupancy cost); OR token-GROUPED
       routed experts (gather by expert, memory-traffic win beyond launch batching, harder byte-identity).
+- **2026-06-13 — Cycle 16: 8 KB-shared (lowsmem) Q6_K TC GEMM — byte-identical but PERF-NEUTRAL (in-noise); kept OPT-IN, default unchanged.**
+  Took cycle 15's NEXT item: apply the proven two-phase-Cs occupancy trick (24 KB→8 KB static shared, 2→~8 blocks/SM)
+  to the dense gemma-31b ffn_down **Q6_K** TC GEMM (idx 2), the one dense quant type still on the 24 KB m64 kernel after
+  cycle 15 lowered the Q4_K path. Added an ADDITIVE kernel `gemm_q6k_tc_f16a_lowsmem` (kernels.cu): the cycle-13 Q6_K
+  dequant (copied VERBATIM from `gemm_q6k_tc_f16a`/`gemm_q6k_tiled_v2`) wrapped in the cycle-15 lowsmem schedule — `half
+  Ws[64*32]`+`half As[32*64]` (8 KB) during the K-loop, then the SAME smem reused as a `float Cs[64*32]` (8 KB) two-phase
+  output store (phase 1 = c0 → M-tile rows 0..31, phase 2 = c1 → rows 32..63), each Y elem written once → output
+  byte-for-byte `gemm_q6k_tc_f16a`'s (phases reorder writes only; wmma math + Q6_K unpack identical; syncs fence the smem
+  reuse). New pipeline + a bool toggle. Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda
+  -Dshaders=false` EXIT=0, bin md5 27d453a7; NVRTC compiled the new kernel at runtime).
+  GATE — correctness CLEARED, perf NEUTRAL:
+    - BYTE-IDENTITY (the kernel's core claim): direct A/B, ONE binary, lowsmem-Q6 vs m64-Q6 (`ZINC_BATCHED_TC_Q6_M64`
+      during the experiment) — GEN_IDS IDENTICAL on the collapsed 250-tok prompt (250,250,…) AND a varied prompt
+      (27750,27750,…); after the default flip, re-confirmed default(m64) vs `ZINC_BATCHED_TC_Q6_LOWSMEM=1` GEN_IDS identical.
+    - `ZINC_BATCHED=1 ZINC_BATCHED_TC=1 validate_catalog` (lowsmem-Q6 path direct vs llama.cpp, 4090): **5/5 PASS** —
+      qwen35-9b/qwen36-27b/qwen36-35b-a3b/gemma4-26b all **12/12**; gemma4-31b the SAME documented near-tie (free-run 2/12,
+      teacher-forced 11/12) → no new divergence from the Q6_K lowsmem path.
+    - PERF — IN-NOISE (the honest outcome): ABBA x2 (gemma-31b 250-tok, 4090, ONE binary) ×2 independent runs:
+      run 1 m64 174.09 vs lowsmem 165.17 (**−5.1%**); run 2 m64 169.76 vs lowsmem 168.02 (**−1.0%**). Both have FULLY
+      OVERLAPPING ranges (run1 L∈[156.9,173.3]/M∈[166.8,181.3]; run2 L∈[163.4,172.1]/M∈[160.7,177.1]) and the two runs
+      DISAGREE in magnitude → boost noise around zero, NOT a real regression. ROOT CAUSE (predicted): the Q6_K GEMM is only
+      ~1/7 of the dense work (one ffn_down vs six Q4_K projections/gate/up per layer), so even a real ~+10% occupancy win on
+      the Q6_K kernel itself would be ~+1.4% end-to-end — below the box's ±10% boost floor. Same class as cycle 13's Q6_K-on-TC
+      (+1.8%, in-noise). UNLIKE cycle 15's Q4_K lowsmem (+9-12%, the bulk share → measurable), the Q6_K share is too small.
+  DECISION: since the effort's bar for a DEFAULT FLIP is a MEASURED faster increment (which this is not), kept the proven
+  cycle-13 m64 Q6_K kernel as the DEFAULT and made the byte-identical lowsmem-Q6 kernel an ADDITIVE OPT-IN documented
+  experiment (env `ZINC_BATCHED_TC_Q6_LOWSMEM`), mirroring cycle 14's handling of the negative m128 result — so a future
+  cycle won't re-attempt it and the default TC path stays byte-for-byte cycle 15 → cannot regress. ADDITIVE everywhere
+  (1 kernel + 1 pipeline + 1 bool + a dispatch branch); `ZINC_BATCHED_TC` itself off by default → production unchanged.
+  Committed to perf/e24-batched-prefill, pushed (NOT main; origin/main == c409e280, branch ahead at cycle 15 → no rebase).
+  NEXT (cycle 17): the remaining big memory-traffic lever is the **fp16 WEIGHT cache** — dequant Q4_K/Q6_K → fp16 ONCE per
+  layer so the TC GEMMs read pre-dequant'd half weights (kills the per-GEMM dequant = the OTHER half of the GEMM traffic,
+  and unlike the Q6_K occupancy trick it attacks the dominant Q4_K share AND costs no occupancy); OR token-GROUPED routed
+  experts (gather by expert, memory-traffic win beyond launch batching, harder byte-identity).

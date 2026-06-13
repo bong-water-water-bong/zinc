@@ -1945,6 +1945,124 @@ extern "C" __global__ void gemm_q6k_tc_f16a(const unsigned char* a, const half* 
     }
 }
 
+// ---- gemm_q6k_tc_f16a_lowsmem — 8 KB-shared TC Q6_K GEMM (cycle 16) ------------
+// gemm_q6k_tc_f16a in every respect (same Q6_K dequant from gemm_q6k_tiled_v2, same
+// wmma 16x16x16 fp16 schedule, same fp32 accumulate, pre-converted fp16 A read once)
+// EXCEPT it uses only 8 KB of static shared instead of 24 KB — the SAME two-phase-Cs
+// occupancy trick cycle 15 applied to the Q4_K TC kernel (gemm_q4k_tc_f16a_lowsmem),
+// here extended to the dense gemma-31b ffn_down Q6_K GEMM (idx 2). The 24 KB m64 Q6_K
+// kernel's shared is dominated by the 16 KB float Cs output stage (BM*BT*4) → caps
+// occupancy at 2 blocks/SM. Here the Cs stage REUSES the (now-dead) Ws+As shared region
+// after the K-loop, and the 64x64 output is written to Y in TWO PHASES of 8 fragments
+// (c0 = M-tile rows 0..31, c1 = rows 32..63), each phase needing only an 8 KB
+// float[BT*32] tile → total static shared = max(Ws+As = 8 KB during K-loop, Cs = 8 KB
+// after) = 8 KB → ~3x the m64 occupancy (thread-limited to 8 blocks/SM at 256 thr). The
+// wmma math + Q6_K unpack are IDENTICAL to gemm_q6k_tc_f16a → output is byte-for-byte the
+// same (each Y element written exactly once across the two phases; the phase split only
+// reorders writes, not values; the syncs fence the smem reuse). Q6_K is BYTE-addressed →
+// `const unsigned char* a`, pc.a_offset is BYTES. OPT-IN via ZINC_BATCHED_TC_Q6_LOWSMEM —
+// perf-neutral (Q6_K is ~1/7 of the dense GEMM, below the boost floor); the proven 24 KB
+// m64 kernel (gemm_q6k_tc_f16a) stays the default Q6_K TC path.
+extern "C" __global__ void gemm_q6k_tc_f16a_lowsmem(const unsigned char* a, const half* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    // 8 KB shared, aliased: half Ws[BM*BK] (4 KB) + half As[BK*BT] (4 KB) during the
+    // K-loop, then float Cs[BT*32] (8 KB) reusing the SAME memory for the output.
+    __shared__ float smem[BT*32u];               // 2048 floats = 8192 B
+    half* Ws = (half*)smem;                       // bytes [0,4096)   m-major Ws[r*BK + k]
+    half* As = ((half*)smem) + (BM*BK);           // bytes [4096,8192) k-major As[k*BT + t]
+    unsigned m0 = blockIdx.x*BM, t0 = blockIdx.y*BT;
+    unsigned bpr = pc.K >> 8;          // Q6_K superblocks per row (256 elems = 210 bytes)
+    unsigned nchunk = pc.K >> 5;       // K/32 sub-blocks
+    unsigned tid = threadIdx.x;
+    const half* Abase = A + (pc.x_offset >> 1);   // x_offset in bytes → half elems
+    unsigned warp = tid >> 5;          // 0..7
+    unsigned fm = warp >> 2;           // 0..1  (M-block pair base: fm, fm+2)
+    unsigned ft = warp & 3u;           // 0..3  (T-block)
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> c0, c1;
+    wmma::fill_fragment(c0, 0.0f);
+    wmma::fill_fragment(c1, 0.0f);
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        // dequant W sub-block (64 rows x 32 elems) into Ws (m-major) — Q6_K unpack
+        // identical to gemm_q6k_tc_f16a / gemm_q6k_tiled_v2, then cast to half.
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;   // 0..2047
+            unsigned r = idx >> 5, l = idx & 31u;      // row 0..63, elem 0..31
+            unsigned row = m0 + r;
+            float wv = 0.0f;
+            if (row < pc.M) {
+                unsigned e = c*32u + l, within = e & 255u, sb = e >> 8;
+                const unsigned char* blk = a + pc.a_offset + (size_t)row*bpr*210u + (size_t)sb*210u;
+                float d = zinc_half_to_float((unsigned short)((unsigned)blk[208] | ((unsigned)blk[209]<<8)));
+                unsigned half_ = within>>7, wh = within&127u, ll = wh&31u, group = wh>>5;
+                const unsigned char* ql = blk + (size_t)half_*64u;
+                const unsigned char* qh = blk + 128u + (size_t)half_*32u;
+                const signed char* sc = (const signed char*)(blk + 192u + (size_t)half_*8u);
+                unsigned is = ll>>4, qhb = qh[ll], q, sci;
+                if (group==0u) { q=(ql[ll]&0xFu)|(((qhb>>0)&3u)<<4); sci=is+0u; }
+                else if (group==1u) { q=(ql[ll+32u]&0xFu)|(((qhb>>2)&3u)<<4); sci=is+2u; }
+                else if (group==2u) { q=(ql[ll]>>4)|(((qhb>>4)&3u)<<4); sci=is+4u; }
+                else { q=(ql[ll+32u]>>4)|(((qhb>>6)&3u)<<4); sci=is+6u; }
+                wv = d*(float)sc[sci]*((float)q-32.0f);
+            }
+            Ws[r * BK + l] = __float2half(wv);
+        }
+        // stage A sub-block (64 tokens x 32 elems) into As (k-major) — A already fp16.
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;
+            unsigned t = idx >> 5, l = idx & 31u;
+            unsigned tok = t0 + t;
+            As[l * BT + t] = (tok < pc.T) ? Abase[(size_t)tok * pc.K + c * 32u + l] : __float2half(0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned ks = 0; ks < 2; ks++) {
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a0f, a1f;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+            wmma::load_matrix_sync(a0f, &Ws[(fm * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(a1f, &Ws[((fm + 2u) * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(bf, &As[(ks * 16u) * BT + ft * 16u], BT);
+            wmma::mma_sync(c0, a0f, bf, c0);
+            wmma::mma_sync(c1, a1f, bf, c1);
+        }
+        __syncthreads();   // also fences Ws/As reads before the output phases reuse smem
+    }
+    // Output in two phases reusing the 8 KB tile as float Cs[BT*32] (token-major, m in
+    // [0,32) within each half). Phase 1 = c0 (rows 0..31), phase 2 = c1 (rows 32..63).
+    // Each Y element written exactly once → byte-identical to gemm_q6k_tc_f16a.
+    float* Cs = smem;   // [BT*32] = 2048 floats, m-half token-major: Cs[t*32 + m]
+    // ---- phase 1: c0 (fm*16 ∈ {0,16} → rows 0..31) ----
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * 32u + fm * 16u], c0, 32u, wmma::mem_col_major);
+    __syncthreads();
+    #pragma unroll
+    for (int u = 0; u < 8; u++) {
+        unsigned idx = tid + (unsigned)u * 256u;   // 0..2047
+        unsigned t = idx >> 5, m = idx & 31u;      // token 0..63, half-row 0..31
+        unsigned tok = t0 + t, row = m0 + m;
+        if (row < pc.M && tok < pc.T) {
+            unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row;
+            if (pc.acc_mode != 0u) Y[yi] += Cs[t * 32u + m]; else Y[yi] = Cs[t * 32u + m];
+        }
+    }
+    __syncthreads();
+    // ---- phase 2: c1 ((fm+2)*16 ∈ {32,48} → rows 32..63) ----
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * 32u + fm * 16u], c1, 32u, wmma::mem_col_major);
+    __syncthreads();
+    #pragma unroll
+    for (int u = 0; u < 8; u++) {
+        unsigned idx = tid + (unsigned)u * 256u;
+        unsigned t = idx >> 5, m = idx & 31u;
+        unsigned tok = t0 + t, row = m0 + 32u + m;
+        if (row < pc.M && tok < pc.T) {
+            unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row;
+            if (pc.acc_mode != 0u) Y[yi] += Cs[t * 32u + m]; else Y[yi] = Cs[t * 32u + m];
+        }
+    }
+}
+
 // ---- gemm_q4k_tc_f16a_m128 — wider 128x64 M-tile TC Q4_K GEMM (cycle 14) -------
 // gemm_q4k_tc_f16a in every respect (same Q4_K dequant, same wmma 16x16x16 fp16
 // schedule, fp32 accumulate, token-major Cs store + guarded copy, pre-converted
