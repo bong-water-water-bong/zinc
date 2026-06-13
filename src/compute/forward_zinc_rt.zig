@@ -1389,7 +1389,8 @@ const ScalarDecodeState = struct {
         const max_work = @max(max_inter, cfg.q_dim);
         const max_vec = @max(@max(@max(cfg.hidden_dim, cfg.q_dim * 2), @max(cfg.kv_dim, conv_ch)), @max(max_inter, cfg.ssm_d_inner));
         const scratch_len = @max(max_vec, conv_ch * @max(cfg.ssm_d_conv, 1));
-        const moe_worker_slots: usize = @intCast(@max(cfg.n_experts_used, 1));
+        const routed_moe_worker_slots: usize = @intCast(@max(cfg.n_experts_used, 1));
+        const moe_worker_slots = routed_moe_worker_slots + 1; // spare slot for the shared expert branch
         const moe_worker_inter_stride: usize = @intCast(max_inter);
         const moe_worker_scratch_stride: usize = @intCast(@max(cfg.hidden_dim, max_inter));
         const moe_worker_down_stride: usize = @intCast(cfg.hidden_dim);
@@ -5043,7 +5044,8 @@ fn consumeDirectRouterRowRange(
     });
 }
 
-const moe_expert_parallel_max_workers: usize = 8;
+const moe_expert_parallel_max_routed_workers: usize = 8;
+const moe_expert_parallel_max_workers: usize = moe_expert_parallel_max_routed_workers + 1;
 const moe_expert_parallel_max_segments: usize = moe_expert_parallel_max_workers * 2;
 
 const MoeExpertWorker = struct {
@@ -5295,7 +5297,7 @@ fn consumeDirectMoeGateUpQ4_0Rows(
 fn moeExpertWorkerCount(n_used: u32, cpu_count: usize) usize {
     if (n_used < 2 or cpu_count < 2) return 1;
     const used: usize = @intCast(n_used);
-    if (used > moe_expert_parallel_max_workers) return 1;
+    if (used > moe_expert_parallel_max_routed_workers) return 1;
     if (used > cpu_count) return 1;
     return used;
 }
@@ -5392,11 +5394,23 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
         } else {
             swiglu(param.gate, param.up, param.swiglu_out);
         }
-        if (!canDotDirect(param.down_type, param.intermediate_dim) or needsInputSum32(param.down_type)) return false;
+        if (!canDotDirect(param.down_type, param.intermediate_dim)) return false;
+        const down_input_sum32 = sums: {
+            if (wantsInputSum32(param.down_type)) {
+                if (param.intermediate_dim % 32 != 0) return false;
+                const sum_len: usize = @intCast(param.intermediate_dim / 32);
+                if (param.scratch.len < sum_len) return false;
+                const sums = param.scratch[0..sum_len];
+                dequant.fillInputSum32(param.swiglu_out[0..param.intermediate_dim], sums);
+                break :sums sums;
+            }
+            break :sums null;
+        };
         down[i] = .{
             .raw = param.down_raw,
             .type_ = param.down_type,
             .input = param.swiglu_out,
+            .input_sum32 = down_input_sum32,
             .rows = param.hidden_dim,
             .out = param.down,
         };
@@ -5463,11 +5477,11 @@ fn isFullAttentionLayer(cfg: CpuModelConfig, layer: u32) bool {
     return (layer + 1) % interval == 0;
 }
 
-/// Worker-thread count for the persistent decode pool. Three pool workers plus
-/// the caller running `waitAndWork` beat the old four-worker default on the
-/// 9800X3D RDNA test node after the decode matvec fusion/requant changes: the
-/// T-CPU decode path is dominated by streaming quantized matvecs, and extra
-/// AVX-512 workers mostly contend for cache and memory bandwidth.
+/// Worker-thread count for the persistent decode pool. Five pool workers plus
+/// the caller running `waitAndWork` is the current sweet spot on the RDNA1 node
+/// after the shared-expert branch joined the MoE fan-out: enough executors to
+/// keep the 8 routed experts plus shared expert moving, without the cache and
+/// bandwidth contention seen at higher counts.
 /// `ZINC_RT_CPU_WORKERS` remains as a bring-up knob for quick A/Bs on different
 /// hosts.
 fn decodeWorkerThreadCount() usize {
@@ -5484,7 +5498,7 @@ fn decodeWorkerThreadCount() usize {
         const n = file.read(&buf) catch 0;
         if (n >= 1 and buf[0] == '1') physical = @max(@as(usize, 1), logical / 2);
     } else |_| {}
-    return @min(physical, 3);
+    return @min(physical, 5);
 }
 
 fn matvecTensor(
@@ -5761,7 +5775,13 @@ inline fn dotDirectTyped(
         .f32 => dequant.dotF32Row(raw, row, cols, input),
         .f16 => dequant.dotF16Row(raw, row, cols, input),
         .bf16 => dequant.dotBf16Row(raw, row, cols, input),
-        .q4_0 => if (input_sum32) |sums| dequant.dotQ4_0RowWithSum32Unchecked(raw, row, cols, input, sums) else dequant.dotQ4_0RowUnchecked(raw, row, cols, input),
+        .q4_0 => if (input_sum32) |sums|
+            if (cols == 2048)
+                dequant.dotQ4_0RowWithSum32Cols2048Unchecked(raw, row, input, sums)
+            else
+                dequant.dotQ4_0RowWithSum32Unchecked(raw, row, cols, input, sums)
+        else
+            dequant.dotQ4_0RowUnchecked(raw, row, cols, input),
         .q8_0 => dequant.dotQ8_0RowUnchecked(raw, row, cols, input),
         .q4_k => if (input_sum32) |sums| dequant.dotQ4KRowWithSum32Unchecked(raw, row, cols, input, sums) else dequant.dotQ4KRowUnchecked(raw, row, cols, input),
         .q5_k => if (input_sum32) |sums| dequant.dotQ5KRowWithSum32Unchecked(raw, row, cols, input, sums) else dequant.dotQ5KRowUnchecked(raw, row, cols, input),
@@ -6217,9 +6237,15 @@ fn argmaxMatvecRawDirectSerialTyped(
     start_row: u32,
     end_row: u32,
 ) !ArgmaxTop2Result {
+    const row_bytes = rowBytesForType(tensor_type, cols);
+    const prefetch_min_row_bytes: usize = 256;
     var best: ArgmaxTop2Result = .{};
     var row = start_row;
     while (row < end_row) : (row += 1) {
+        if (row_bytes >= prefetch_min_row_bytes and row + 1 < end_row) {
+            const next_off = @as(usize, row + 1) * row_bytes;
+            @prefetch(&raw[next_off], .{ .rw = .read, .locality = 0 });
+        }
         const value = try dotDirectTyped(tensor_type, raw, row, cols, input, input_sum32);
         best.offer(row, value);
     }
@@ -6235,9 +6261,15 @@ fn argmaxMatvecRawBestDirectSerialTyped(
     start_row: u32,
     end_row: u32,
 ) !ScoredToken {
+    const row_bytes = rowBytesForType(tensor_type, cols);
+    const prefetch_min_row_bytes: usize = 256;
     var best = ScoredToken{ .index = 0, .value = -std.math.inf(f32) };
     var row = start_row;
     while (row < end_row) : (row += 1) {
+        if (row_bytes >= prefetch_min_row_bytes and row + 1 < end_row) {
+            const next_off = @as(usize, row + 1) * row_bytes;
+            @prefetch(&raw[next_off], .{ .rw = .read, .locality = 0 });
+        }
         const value = try dotDirectTyped(tensor_type, raw, row, cols, input, input_sum32);
         if (value > best.value) best = .{ .index = row, .value = value };
     }
@@ -6552,6 +6584,7 @@ const MultiInputFusedSegment = struct {
     raw: []const u8,
     type_: gguf.GGMLType,
     input: []const f32,
+    input_sum32: ?[]const f32 = null,
     rows: u32,
     out: []f32,
 };
@@ -6594,7 +6627,7 @@ fn matvecMultiInputFusedSerial(segs: []const MultiInputFusedSegment, start_g: u3
         const lo = @max(start_g, seg_lo);
         const hi = @min(end_g, seg_hi);
         if (lo < hi) {
-            try matvecRawDirectSerial(seg.raw, seg.type_, seg.input, null, lo - seg_lo, hi - seg_lo, seg.out);
+            try matvecRawDirectSerial(seg.raw, seg.type_, seg.input, seg.input_sum32, lo - seg_lo, hi - seg_lo, seg.out);
         }
         seg_lo = seg_hi;
     }

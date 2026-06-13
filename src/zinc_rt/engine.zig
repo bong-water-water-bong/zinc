@@ -4,6 +4,8 @@
 //! @section Inference Runtime
 // SPDX-FileCopyrightText: ZINC Authors
 const std = @import("std");
+const builtin = @import("builtin");
+const kmd = @import("kmd.zig");
 const umq = @import("ring/umq.zig");
 const kfd = @import("ring/kfd.zig");
 
@@ -86,13 +88,43 @@ pub fn autoTier() Tier {
     // amdgpu firmware on the bench node rejects compute user queues, so we
     // fall through to the T1 PM4 path on `/dev/kfd` (the ROCm/tinygrad ABI)
     // whenever it is reachable, and only then to the T-CPU reference.
+    if (!directModelKernelsAvailableDefault()) return .t_cpu;
     if (umq.admissionProbeDefault()) return .t2_umq;
     if (kfd.reachable()) return .t1_pm4;
     return .t_cpu;
 }
 
+fn directModelKernelsAvailableDefault() bool {
+    if (builtin.os.tag != .linux) return false;
+
+    var file = std.fs.openFileAbsolute(umq.default_render_node, .{ .mode = .read_write }) catch return false;
+    defer file.close();
+
+    const hw_ip = kmd.queryHwIp(file, kmd.AMDGPU_HW_IP_COMPUTE) catch return false;
+    return supportsEmbeddedGfx12Kernels(hw_ip);
+}
+
+fn supportsEmbeddedGfx12Kernels(hw_ip: kmd.DrmAmdgpuInfoHwIp) bool {
+    return hw_ip.hw_ip_version_major == 12;
+}
+
 test "parseTier maps explicit CPU tier" {
     try std.testing.expectEqual(Tier.t_cpu, try parseTier("t_cpu"));
+}
+
+test "auto tier embedded-kernel gate rejects pre-gfx12 compute IPs" {
+    var hw_ip: kmd.DrmAmdgpuInfoHwIp = std.mem.zeroes(kmd.DrmAmdgpuInfoHwIp);
+    hw_ip.hw_ip_version_major = 10;
+    try std.testing.expect(!supportsEmbeddedGfx12Kernels(hw_ip));
+
+    hw_ip.hw_ip_version_major = 11;
+    try std.testing.expect(!supportsEmbeddedGfx12Kernels(hw_ip));
+
+    hw_ip.hw_ip_version_major = 12;
+    try std.testing.expect(supportsEmbeddedGfx12Kernels(hw_ip));
+
+    hw_ip.hw_ip_version_major = 13;
+    try std.testing.expect(!supportsEmbeddedGfx12Kernels(hw_ip));
 }
 
 test "auto tier remains CPU on non-Linux hosts" {

@@ -790,6 +790,83 @@ pub inline fn dotQ4_0RowWithSum32Unchecked(raw_data: []const u8, row_index: u32,
     return @reduce(.Add, ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))) - 8.0 * zero_bias;
 }
 
+/// Specialized Q4_0 dot for the dominant 2048-column decode shape.
+/// Same math and accumulation order as `dotQ4_0RowWithSum32Unchecked` for
+/// `cols == 2048`, but with a fixed 64-block row and no dynamic tail handling.
+pub inline fn dotQ4_0RowWithSum32Cols2048Unchecked(raw_data: []const u8, row_index: u32, input: []const f32, input_sum32: []const f32) f32 {
+    const Vec16f = @Vector(16, f32);
+    const Vec16u8 = @Vector(16, u8);
+    const Vec16i32 = @Vector(16, i32);
+    const bpb: usize = 18;
+    const bpr: usize = 64;
+    const row_off = @as(usize, row_index) * bpr * bpb;
+
+    var acc0: Vec16f = @splat(0.0);
+    var acc1: Vec16f = @splat(0.0);
+    var acc2: Vec16f = @splat(0.0);
+    var acc3: Vec16f = @splat(0.0);
+    var acc4: Vec16f = @splat(0.0);
+    var acc5: Vec16f = @splat(0.0);
+    var acc6: Vec16f = @splat(0.0);
+    var acc7: Vec16f = @splat(0.0);
+    var zero_bias0: f32 = 0.0;
+    var zero_bias1: f32 = 0.0;
+    var zero_bias2: f32 = 0.0;
+    var zero_bias3: f32 = 0.0;
+
+    inline for (0..16) |group| {
+        const b = group * 4;
+        const bo0 = row_off + b * bpb;
+        const bo1 = bo0 + bpb;
+        const bo2 = bo1 + bpb;
+        const bo3 = bo2 + bpb;
+        const in_i = group * 128;
+        const d0s: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, raw_data[bo0..][0..2], .little))));
+        const d1s: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, raw_data[bo1..][0..2], .little))));
+        const d2s: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, raw_data[bo2..][0..2], .little))));
+        const d3s: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, raw_data[bo3..][0..2], .little))));
+        const d0: Vec16f = @splat(d0s);
+        const d1: Vec16f = @splat(d1s);
+        const d2: Vec16f = @splat(d2s);
+        const d3: Vec16f = @splat(d3s);
+        const q0: Vec16u8 = raw_data[bo0 + 2 ..][0..16].*;
+        const q1: Vec16u8 = raw_data[bo1 + 2 ..][0..16].*;
+        const q2: Vec16u8 = raw_data[bo2 + 2 ..][0..16].*;
+        const q3: Vec16u8 = raw_data[bo3 + 2 ..][0..16].*;
+        const q0lo: Vec16f = @floatFromInt(@as(Vec16i32, @intCast(q0 & @as(Vec16u8, @splat(0x0F)))));
+        const q0hi: Vec16f = @floatFromInt(@as(Vec16i32, @intCast(q0 >> @as(Vec16u8, @splat(4)))));
+        const q1lo: Vec16f = @floatFromInt(@as(Vec16i32, @intCast(q1 & @as(Vec16u8, @splat(0x0F)))));
+        const q1hi: Vec16f = @floatFromInt(@as(Vec16i32, @intCast(q1 >> @as(Vec16u8, @splat(4)))));
+        const q2lo: Vec16f = @floatFromInt(@as(Vec16i32, @intCast(q2 & @as(Vec16u8, @splat(0x0F)))));
+        const q2hi: Vec16f = @floatFromInt(@as(Vec16i32, @intCast(q2 >> @as(Vec16u8, @splat(4)))));
+        const q3lo: Vec16f = @floatFromInt(@as(Vec16i32, @intCast(q3 & @as(Vec16u8, @splat(0x0F)))));
+        const q3hi: Vec16f = @floatFromInt(@as(Vec16i32, @intCast(q3 >> @as(Vec16u8, @splat(4)))));
+        const x0lo: Vec16f = input[in_i..][0..16].*;
+        const x0hi: Vec16f = input[in_i + 16 ..][0..16].*;
+        const x1lo: Vec16f = input[in_i + 32 ..][0..16].*;
+        const x1hi: Vec16f = input[in_i + 48 ..][0..16].*;
+        const x2lo: Vec16f = input[in_i + 64 ..][0..16].*;
+        const x2hi: Vec16f = input[in_i + 80 ..][0..16].*;
+        const x3lo: Vec16f = input[in_i + 96 ..][0..16].*;
+        const x3hi: Vec16f = input[in_i + 112 ..][0..16].*;
+        acc0 = @mulAdd(Vec16f, q0lo * d0, x0lo, acc0);
+        acc1 = @mulAdd(Vec16f, q0hi * d0, x0hi, acc1);
+        acc2 = @mulAdd(Vec16f, q1lo * d1, x1lo, acc2);
+        acc3 = @mulAdd(Vec16f, q1hi * d1, x1hi, acc3);
+        acc4 = @mulAdd(Vec16f, q2lo * d2, x2lo, acc4);
+        acc5 = @mulAdd(Vec16f, q2hi * d2, x2hi, acc5);
+        acc6 = @mulAdd(Vec16f, q3lo * d3, x3lo, acc6);
+        acc7 = @mulAdd(Vec16f, q3hi * d3, x3hi, acc7);
+        zero_bias0 = @mulAdd(f32, d0s, input_sum32[b], zero_bias0);
+        zero_bias1 = @mulAdd(f32, d1s, input_sum32[b + 1], zero_bias1);
+        zero_bias2 = @mulAdd(f32, d2s, input_sum32[b + 2], zero_bias2);
+        zero_bias3 = @mulAdd(f32, d3s, input_sum32[b + 3], zero_bias3);
+    }
+
+    const zero_bias = (zero_bias0 + zero_bias1) + (zero_bias2 + zero_bias3);
+    return @reduce(.Add, ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))) - 8.0 * zero_bias;
+}
+
 /// Quantize one row of f32 weights into the GGML `Q4_0` block layout.
 /// Each 32-element block is stored as one f16 scale followed by 16 packed nibble
 /// pairs (low nibble = first weight, high nibble = second weight), where each nibble
@@ -1558,6 +1635,35 @@ test "dotQ4_0Row matches dequantized dot" {
         try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
         const summed = dotQ4_0RowWithSum32Unchecked(&raw, @intCast(row_index), cols, &input, &sums);
         try std.testing.expectApproxEqAbs(expected, summed, 0.0001);
+    }
+}
+
+test "dotQ4_0RowWithSum32Cols2048 matches generic sum path" {
+    const cols: usize = 2048;
+    const blocks = cols / 32;
+    var raw = [_]u8{0} ** (2 * blocks * 18);
+    for (0..2) |row_index| {
+        for (0..blocks) |block| {
+            const bo = (row_index * blocks + block) * 18;
+            const d_bits: u16 = @bitCast(@as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt((row_index + block) % 11 + 1)))));
+            std.mem.writeInt(u16, raw[bo..][0..2], d_bits, .little);
+            for (0..16) |j| {
+                const lo: u8 = @intCast((row_index * 17 + block * 5 + j * 7) % 16);
+                const hi: u8 = @intCast((row_index * 11 + block * 3 + j * 13) % 16);
+                raw[bo + 2 + j] = lo | (hi << 4);
+            }
+        }
+    }
+
+    var input: [cols]f32 = undefined;
+    for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 19) % 23)) - 11.0) * 0.03125;
+    var sums = [_]f32{0} ** blocks;
+    fillInputSum32(&input, &sums);
+
+    for (0..2) |row_index| {
+        const generic = dotQ4_0RowWithSum32Unchecked(&raw, @intCast(row_index), cols, &input, &sums);
+        const specialized = dotQ4_0RowWithSum32Cols2048Unchecked(&raw, @intCast(row_index), &input, &sums);
+        try std.testing.expectApproxEqAbs(generic, specialized, 0.0001);
     }
 }
 

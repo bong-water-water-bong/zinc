@@ -211,6 +211,10 @@ const compute_pgm_rsrc1_vgpr12_value: u32 = (compute_pgm_rsrc1_value & ~@as(u32,
 const compute_pgm_rsrc1_vgpr16_value: u32 = (compute_pgm_rsrc1_value & ~@as(u32, 0x3f)) | 0x3;
 const compute_pgm_rsrc2_argmax_top2_value: u32 = 0x90; // 8 user SGPRs + workgroup-id-x.
 const compute_pgm_rsrc2_user8_vgpr_workitem_x_value: u32 = (8 << 1) | (1 << 11);
+
+fn supportsEmbeddedGfx12Kernels(hw_ip: kmd.DrmAmdgpuInfoHwIp) bool {
+    return hw_ip.hw_ip_version_major == 12;
+}
 const shader_offset_argmax_top2: usize = 0x000;
 const shader_offset_rms_norm_elem0: usize = 0x100;
 const shader_offset_dmmv_f32_row_range: usize = 0x200;
@@ -882,6 +886,7 @@ pub const TokenBoundary = struct {
         const ip_type: u32 = AMDGPU_HW_IP_COMPUTE;
         const hw_ip = kmd.queryHwIp(file, ip_type) catch return error.HwIpQueryFailed;
         if (hw_ip.available_rings == 0) return error.NoComputeRings;
+        if (!supportsEmbeddedGfx12Kernels(hw_ip)) return error.UnsupportedComputeIp;
 
         var ctx: DrmAmdgpuCtx = std.mem.zeroes(DrmAmdgpuCtx);
         ctx.in = .{ .op = AMDGPU_CTX_OP_ALLOC_CTX, .flags = 0, .ctx_id = 0, .priority = 0 };
@@ -2642,6 +2647,21 @@ test "amdgpu ctx ioctl number matches uapi" {
     try std.testing.expectEqual(@as(u32, 0xc0186444), ioc_cs);
     // _IOWR('d', DRM_COMMAND_BASE + DRM_AMDGPU_WAIT_CS, union drm_amdgpu_wait_cs) size 32
     try std.testing.expectEqual(@as(u32, 0xc0206449), ioc_wait_cs);
+}
+
+test "embedded gfx12 kernels are not armed on older compute IPs" {
+    var hw_ip: kmd.DrmAmdgpuInfoHwIp = std.mem.zeroes(kmd.DrmAmdgpuInfoHwIp);
+    hw_ip.hw_ip_version_major = 10;
+    try std.testing.expect(!supportsEmbeddedGfx12Kernels(hw_ip));
+
+    hw_ip.hw_ip_version_major = 11;
+    try std.testing.expect(!supportsEmbeddedGfx12Kernels(hw_ip));
+
+    hw_ip.hw_ip_version_major = 12;
+    try std.testing.expect(supportsEmbeddedGfx12Kernels(hw_ip));
+
+    hw_ip.hw_ip_version_major = 13;
+    try std.testing.expect(!supportsEmbeddedGfx12Kernels(hw_ip));
 }
 
 test "setupSmokePath reports unsupported_os off Linux" {
