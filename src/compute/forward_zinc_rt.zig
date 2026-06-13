@@ -1740,6 +1740,9 @@ fn generateScalarHybrid(
             state.direct_ssm_q8_row_range_max_successes,
             state.direct_ssm_q8_row_range_trust_after_successes,
         });
+        log.info("M1 AMDGPU CS direct SSM QKV/gate Q4_0 row-range budget: {d} layers per tracked decode slice", .{
+            direct_ssm_qkv_gate_q4_0_max_successes_per_slice,
+        });
     }
 
     var generated: std.ArrayList(u32) = .{};
@@ -3478,7 +3481,7 @@ fn runSsmLayer(
 
 const direct_ssm_qkv_gate_q4_0_tolerance: f32 = 0.05;
 const direct_ssm_qkv_gate_q4_0_range_rows: u32 = 64;
-const direct_ssm_qkv_gate_q4_0_max_successes_per_slice: u32 = 2;
+const direct_ssm_qkv_gate_q4_0_max_successes_per_slice: u32 = 3;
 
 fn consumeDirectSsmQkvGateQ4_0RowRange(
     model: *const Model,
