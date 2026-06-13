@@ -50,7 +50,11 @@ ONLY=${ZINC_ONLY:-}
 MODE=${ZINC_AB:-headskip}
 case "$MODE" in
   headskip) S_ENV="ZINC_PREFILL_SKIP=1"; S_LABEL="headskip" ;;
-  batched)  S_ENV="ZINC_BATCHED_PREFILL=1"; S_LABEL="batched" ;;
+  batched)  S_ENV="ZINC_BATCHED_PREFILL=1"; S_LABEL="batched"
+            # Cycle 11: ZINC_BATCHED_TC=1 also routes dense Q4_K GEMMs through the
+            # fp16 tensor-core kernel (NOT byte-identical → expect GEN_IDS may
+            # differ; use validate_catalog as its gate, this is for perf only).
+            [ "${ZINC_BATCHED_TC:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC=1"; S_LABEL="batched+tc"; } ;;
   *) echo "unknown ZINC_AB '$MODE' (want headskip|batched)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")/.." && pwd)

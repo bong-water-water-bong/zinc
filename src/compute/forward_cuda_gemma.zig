@@ -179,6 +179,10 @@ const Pipelines = struct {
     // Effort 24: register-blocked prefill GEMMs (Q4_K / Q5_K / Q6_K / Q8_0 weights).
     gemm: [4]CudaPipeline,
     gemm_f32: CudaPipeline, // f32-weight prefill GEMM (gemma4-MoE batched router)
+    // Effort 24 cycle 11: tensor-core (wmma) fp16 GEMM for Q4_K weights — the
+    // dense prefill GEMMs' +2.2× lever, opt-in via ZINC_BATCHED_TC (NOT byte-
+    // identical → its own token-correctness gate, never the default path).
+    gemm_q4k_tc: CudaPipeline,
 };
 
 /// Per-prompt batched activation scratch (Effort 24 batched prefill). Allocated
@@ -268,6 +272,11 @@ pub const ForwardGemma = struct {
     // Effort 24: lazily-allocated batched-prefill scratch (null until the first
     // ZINC_BATCHED_PREFILL run; freed in deinit).
     batch: ?BatchScratch = null,
+    // Effort 24 cycle 11: route the dense batched Q4_K GEMMs through the fp16
+    // tensor-core kernel (gemm_q4k_tc) instead of the f32 register-tiled GEMM.
+    // Opt-in (ZINC_BATCHED_TC, read once per prefillBatched); off by default so
+    // the proven byte-identical path is unchanged. NOT byte-identical when on.
+    use_tc: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardGemma {
         const ctx = model.ctx;
@@ -374,6 +383,7 @@ pub const ForwardGemma = struct {
         pipes.gemm[2] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tiled_v2");
         pipes.gemm[3] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tiled_v2");
         pipes.gemm_f32 = try pipeline.createPipeline(ctx, src.ptr, "gemm_f32_tiled_v2");
+        pipes.gemm_q4k_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
         const f4 = @sizeOf(f32);
@@ -615,6 +625,10 @@ pub const ForwardGemma = struct {
         const T: u32 = @intCast(tokens.len);
         const f4 = @sizeOf(f32);
         const moe = d.n_experts > 0; // gemma-26b-a4b: batched attn + per-token MoE FFN
+        // Cycle 11: opt-in fp16 tensor-core GEMM for the dense Q4_K projections/FFN.
+        // Read once here so gemmDispatch can pick the kernel per weight without a
+        // getenv per launch. Off by default → the byte-identical path is unchanged.
+        self.use_tc = std.posix.getenv("ZINC_BATCHED_TC") != null;
 
         const b = try self.ensureBatch(T);
 
@@ -838,7 +852,11 @@ pub const ForwardGemma = struct {
         };
         if (gi) |idx| {
             const push = GemmPush{ .M = M, .K = K, .T = T };
-            cmd.dispatch(&self.pipes.gemm[idx], .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            // Cycle 11: when ZINC_BATCHED_TC is set, Q4_K GEMMs (idx 0 — the bulk of
+            // the dense FLOPs: gate/up + attn Q/K/V/O) run on the fp16 tensor cores.
+            // Same GemmPush / grid / block; gemm_q4k_tc uses static shared only.
+            const pipe = if (self.use_tc and idx == 0) &self.pipes.gemm_q4k_tc else &self.pipes.gemm[idx];
+            cmd.dispatch(pipe, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             return;
         }
         // Fallback: loop the per-token matvec over the token-major buffers.

@@ -371,3 +371,40 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   tokens by expert → each expert weight read once per group, a memory-traffic win beyond launch batching;
   needs gather/scatter, harder for byte-identity), or NVRTC `-I` fp16 tensor-core GEMM (+2.2× dense, own
   tolerance gate — NOT byte-identical).
+- **2026-06-13 — Cycle 11: fp16 tensor-core (wmma) GEMM for the dense Q4_K projections/FFN — opt-in, token-correct, +6%.**
+  Took the last NEXT-list lever: the NVRTC `-I/usr/local/cuda/include` path (landed in `a0d463af`) lets NVRTC
+  resolve `<mma.h>`, so the dense batched Q4_K GEMMs (attn Q/K/V/O + FFN gate/up — the bulk of the dense FLOPs)
+  can run on the fp16 tensor cores instead of the f32 register-tiled GEMM. Added an ADDITIVE kernel `gemm_q4k_tc`
+  (kernels.cu): same `Y[T,M]=A[T,K]·W[M,K]^T` and SAME Q4_K dequant unpack as `gemm_q4k_tiled_v2`, but the inner
+  product runs on wmma 16×16×16 fragments — the dequant'd W tile (m-major `Ws[r*BK+k]`) and f32 activations
+  (k-major `As[k*BT+t]`) are cast to `__half` in shared mem, accumulated in fp32, stored col-major into a
+  token-major `Cs` tile, then guard-copied to `Y[T,M]`. 64×64 tile / 256 thr = 8 warps, BK=32 (1 Q4_K sub-block
+  = 2 wmma k-steps); each warp owns 2 accumulator fragments (M-blocks fm, fm+2 at T-block ft) → all 4×4=16
+  (m,t)-blocks covered once; static shared = 24 KB. Wired OPT-IN behind `ZINC_BATCHED_TC` (read once per
+  `prefillBatched` into `self.use_tc`): `gemmDispatch` routes Q4_K (idx 0) to `gemm_q4k_tc` only when `use_tc`,
+  same `GemmPush`/grid/block — so with the toggle OFF the dispatch is byte-for-byte the proven f32 path.
+  NOT byte-identical when ON (fp16 input rounding) → its gate is token-correctness vs llama.cpp, NOT the
+  GEN_IDS byte-identity gate. Extended `scripts/validate_catalog.sh` + `scripts/prefill_catalog.sh` ADDITIVELY
+  to pass `ZINC_BATCHED_TC=1` through (gemma rows / batched mode). ADDITIVE everywhere: 1 new kernel + 1 new
+  pipeline + 1 bool + a 1-line dispatch branch; decodeStep/prefillStep/per-token path/the proven dense+MoE
+  batched paths all unchanged when the toggle is off. Built clean on the 4090 box (fresh `.zig-cache`,
+  `zig build cuda-dbg -Dbackend=cuda -Dshaders=false` EXIT=0 + ran, bin md5 602a6918 ≠ cycle 10's 2eca13ad;
+  NVRTC compiled `gemm_q4k_tc` at runtime — "compiled gemma4 kernel pipelines"). GATE — its own tolerance gate
+  CLEARED:
+    - `ZINC_BATCHED=1 ZINC_BATCHED_TC=1 validate_catalog` (TC path direct vs llama.cpp, 4090): **5/5 PASS** —
+      gemma4-26b MoE (TC on its dense-attn Q4_K GEMMs) free-runs **12/12**; gemma4-31b the SAME documented
+      near-tie as the f32 path (free-run 2/12, teacher-forced 11/12) → fp16 TC rounding introduced **NO new
+      divergence**; qwen 12/12 (per-token fallback). So the TC path is token-correct within tolerance.
+    - Default batched path (toggle OFF) unchanged: 3-way direct A/B (gemma-31b, 220-tok) baseline /
+      batched / batched+TC ALL GEN_IDS byte-identical (the off-path is provably the f32 path; on-path matched
+      here too on this prompt).
+    - Perf (ABBA B T T B, gemma-31b 250-tok, 4090): batched ~138.0 t/s (134.4, 141.6) → **batched+TC ~146.6
+      t/s (146.7, 146.5) = +6.2%** over the already-batched dense path; baseline per-token was ~32 t/s
+      (so batched+TC is ~4.6× the per-token prefill).
+  The +6% is modest because the dense GEMM is MEMORY-bound here (Q4_K dequant + f32 activation reads dominate;
+  the fp16 multiply was never the bottleneck) — tensor cores help the FLOP-heavy share only. Committed to
+  perf/e24-batched-prefill, pushed (NOT main). Kept opt-in (off by default) → cannot regress production or the
+  proven byte-identical batched gate. NEXT (cycle 12): make the TC path memory-efficient to unlock more than
+  +6% — cache the dequant'd weights in fp16 once (kill per-GEMM dequant) and/or keep activations fp16 across
+  the layer (kill the f32↔fp16 recast per GEMM); OR token-GROUPED routed experts (gather by expert =
+  memory-traffic win, harder byte-identity).
