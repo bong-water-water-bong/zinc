@@ -2275,8 +2275,10 @@ fn consumeDirectLogitsArgmaxRowRange(
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
 // Use one wave64 direct LM-head prefix by default so an exercised decode token
 // can be selected from GPU-produced Q4_0 row scores while the remaining rows
-// still use the host-assisted fallback.
-const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 64;
+// still use the host-assisted fallback. This is two 64-row chunks submitted in
+// one CS batch, not a widened single-wave dispatch.
+const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 128;
+const direct_lm_head_q4_0_parallel_chunk_rows: u32 = 64;
 const direct_lm_head_q4_0_selected_window_rows: u32 = 64;
 const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 1536 * 1024;
 
@@ -2337,9 +2339,11 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     if (q4_0_raw.len < gpu_weight_bytes) return null;
 
     var selection: ArgmaxTop2Result = .{};
-    if (gpu_rows % 64 == 0 and gpu_rows >= 64) {
+    var gpu_chunks: u32 = 1;
+    if (gpu_rows % direct_lm_head_q4_0_parallel_chunk_rows == 0 and gpu_rows >= direct_lm_head_q4_0_parallel_chunk_rows) {
+        gpu_chunks = gpu_rows / direct_lm_head_q4_0_parallel_chunk_rows;
         const gpu_logits = state.row_scratch[0..gpu_rows_usize];
-        tracking.boundary.dmmvQ4_0RowRangeParallel(
+        tracking.boundary.dmmvQ4_0RowRangeParallelChunks(
             state.norm,
             q4_0_raw[0..gpu_weight_bytes],
             gpu_rows,
@@ -2403,19 +2407,20 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         "gpu_prefix"
     else
         "cpu_rows";
-    tracking.ops.* += 1;
+    tracking.ops.* += gpu_chunks;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
     tracking.real_model_slice.* = true;
     if (tracking.phase == .decode) {
-        if (tracking.decode_model_slices) |slices| slices.* += 1;
+        if (tracking.decode_model_slices) |slices| slices.* += gpu_chunks;
     }
     if (tracking.selected_token) |token| token.* = selection.best.index;
-    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_argmax_prefix phase={s} gpu_rows={d} cols={d} selected_source={s} token={d} score={d:.6} gpu_prefix_best=({d},{d:.6}) abs_delta={d:.6}", .{
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_argmax_prefix phase={s} gpu_rows={d} cols={d} chunks={d} selected_source={s} token={d} score={d:.6} gpu_prefix_best=({d},{d:.6}) abs_delta={d:.6}", .{
         tracking.ops.*,
         directComputePhaseName(tracking.phase),
         gpu_rows,
         cols,
+        gpu_chunks,
         selected_source,
         selection.best.index,
         selection.best.value,
