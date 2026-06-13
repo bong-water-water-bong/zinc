@@ -130,11 +130,14 @@ CudaPipe* cuda_create_pipeline(CudaCtx* c, const char* src, const char* fn_name,
     // Default arch = the running device's cc (e.g. sm_120 / sm_89).
     char arch[32];
     snprintf(arch, sizeof arch, "--gpu-architecture=sm_%u", cuda_compute_capability(c));
-    const char* base_opts[2] = { arch, "--std=c++17" };
-    uint32_t total = 2 + n_opts;
+    // -I the CUDA toolkit headers so kernels may #include <cuda_fp16.h> / <mma.h>
+    // (Blackwell tensor-core / fp16 prefill GEMMs). NVRTC ignores the flag for
+    // kernels that don't include them, so this is additive for the existing set.
+    const char* base_opts[3] = { arch, "--std=c++17", "-I/usr/local/cuda/include" };
+    uint32_t total = 3 + n_opts;
     const char** all = (const char**)malloc(sizeof(char*) * total);
-    all[0] = base_opts[0]; all[1] = base_opts[1];
-    for (uint32_t i = 0; i < n_opts; i++) all[2 + i] = opts[i];
+    all[0] = base_opts[0]; all[1] = base_opts[1]; all[2] = base_opts[2];
+    for (uint32_t i = 0; i < n_opts; i++) all[3 + i] = opts[i];
     nvrtcResult cr = nvrtcCompileProgram(prog, (int)total, all);
     free(all);
     if (cr != NVRTC_SUCCESS) {
