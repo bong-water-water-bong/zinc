@@ -133,3 +133,31 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   correct). NEXT (cycle 4): NVRTC `-I/usr/local/cuda/include` fp16-scratch tensor-core GEMM (+2.2×),
   or run the formal validate_catalog gate to clear merge; gemma-26b MoE prefill (Phase 2) is the
   other open lever (route T tokens, group by expert).
+- **2026-06-12 — Cycle 4: gemma-26b MoE prefill — batched attention + per-token MoE FFN (Phase 2 cycle 1) — output-identical + faster.**
+  Stopped the MoE model (gemma4-26b-a4b) from falling back ENTIRELY to per-token: its
+  ATTENTION block is the SAME structure as the dense gemma-31b, so `prefillBatched` now
+  runs the shared batched attention path (GEMM Q/K/V/O + batched causal attn + batched
+  norm/RoPE/KV-write — already bit-identical to the per-token `attentionLayer`) for the
+  MoE model too. The routed-expert FFN is still LOOPED per token: the FFN is
+  position-independent, so looping the EXISTING single-token `moeFfnBlock` + `layerOutScale`
+  over each token's hidden slice (alias-swap `self.hidden` → `b.hidden[t*n_embd]`, launch
+  captures the raw device ptr at `cuLaunchKernel` so the alias wrapper frees safely) is
+  OUTPUT-IDENTICAL to the per-token path. FFN type is decided PER LAYER (mirrors the
+  per-token `n_experts>0 && ffn_gate_inp present` test, so a MoE model's dense layers still
+  take `ffnBlockBatched`). Async MoE commands drained per layer (attentionLayerBatched's
+  commitAndWait drains the stream → `drainPending`) + `waitPending` before the tail. ADDITIVE:
+  only `prefillBatched` control flow changed (new per-layer MoE branch); single-token
+  kernels + decodeStep/prefillStep + moeFfnBlock + the dense batched path all untouched →
+  `if (moe)`-guarded so the proven dense path is byte-for-byte unchanged. NO new kernels.
+  Built clean on the 4090 box (fresh `.zig-cache`, `-Dbackend=cuda -Dshaders=false` EXIT=0
+  + ran, bin md5 f8cf047a ≠ cycle3's 6e74a1e5). GATE (scripts/prefill_catalog.sh
+  `ZINC_AB=batched`, 4090, ABBA x2, 250-tok):
+    - gemma4-26b MoE:   43.69 → 49.97 t/s (+14%), GEN_IDS byte-IDENTICAL ✓ (NEW: was full per-token fallback)
+    - gemma4-31b dense: 30.34 → 147.87 t/s (+387%, ~4.9×), GEN_IDS byte-IDENTICAL ✓ (NO regression — dense flow unchanged)
+  The +14% is the attention-projection batching only (Q/K/V/O GEMM + batched attn); the
+  routed-expert FFN is still per-token. Committed to perf/e24-batched-prefill, pushed (NOT
+  main). REMAINING for merge: `scripts/validate_catalog.sh` 5/5 (product per-token path
+  unchanged + batched byte-identical → transitively correct). NEXT (cycle 5): full
+  batched-expert MoE FFN (route T tokens, group/scatter by expert — the remaining MoE
+  per-token cost), NVRTC `-I` fp16 tensor-core GEMM (+2.2× on the dense GEMMs), or run the
+  formal validate_catalog gate to clear merge.

@@ -569,26 +569,20 @@ pub const ForwardGemma = struct {
     /// [0..T-1] then decodeStep on the last. ADDITIVE: builds its own token-major
     /// scratch and never touches the single-token decode path.
     ///
-    /// Phase-1 scope is the DENSE gemma-31b (n_experts==0). The 26b MoE prefill
-    /// (route T tokens, group by expert) is Phase 2 — it falls back to the
-    /// per-token path here so the toggle is safe to leave on for any gemma model.
-    ///
-    /// Norms / RoPE / per-head Q·K·V normalize / attention are LOOPED per token
-    /// (each reusing the validated single-token kernels via buffer aliases into
-    /// the token-major scratch) — the GEMM-able projections + FFN are the win;
-    /// a batched-causal-attention kernel is the next target.
+    /// Phase-1 scope is the DENSE gemma-31b (n_experts==0). Phase-2 cycle 1 adds
+    /// the 26b MoE: its ATTENTION block is the SAME structure as the dense model,
+    /// so it shares the batched attention path (GEMM Q/K/V/O + batched causal attn
+    /// + batched norm/RoPE/KV-write) — bit-identical to the per-token attentionLayer.
+    /// Its routed-expert FFN is still LOOPED per token (the existing single-token
+    /// moeFfnBlock, fed each token's hidden slice via an alias-swap) because the
+    /// FFN is position-independent → looping it is output-identical; full
+    /// batched-expert routing (group T tokens by expert) is a later cycle.
     pub fn prefillBatched(self: *ForwardGemma, tokens: []const u32) !u32 {
         const d = self.d;
         const ctx = self.ctx;
         const T: u32 = @intCast(tokens.len);
-
-        // MoE (gemma-26b-a4b) is out of Phase-1 scope: run the per-token path so
-        // the env toggle never silently corrupts the routed-expert prefill.
-        if (d.n_experts > 0) {
-            var pos: u32 = 0;
-            while (pos + 1 < T) : (pos += 1) try self.prefillStep(tokens[pos], pos);
-            return self.decodeStep(tokens[T - 1], T - 1, true);
-        }
+        const f4 = @sizeOf(f32);
+        const moe = d.n_experts > 0; // gemma-26b-a4b: batched attn + per-token MoE FFN
 
         const b = try self.ensureBatch(T);
 
@@ -606,15 +600,43 @@ pub const ForwardGemma = struct {
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
             try self.attentionLayerBatched(L, T, b);
-            try self.ffnBlockBatched(L, T, b);
-            // dense layer_output_scale is folded into the post-ffn norm+residual.
+            // attentionLayerBatched ends with commitAndWait → the stream is drained,
+            // so the previous layer's stashed async MoE commands are complete and
+            // safe to release. (No-op on the dense model: it never goes async here.)
+            if (moe) self.drainPending();
+            // FFN type is per LAYER (a MoE model may carry dense layers): exactly
+            // mirror the per-token path's `n_experts>0 && ffn_gate_inp present` test.
+            const layer_is_moe = moe and self.model.getLayer(L, "ffn_gate_inp.weight") != null;
+            if (layer_is_moe) {
+                // Phase-2 cycle 1: routed-expert FFN per token (full batched-expert
+                // routing is a later cycle). The FFN is position-independent, so
+                // looping the single-token moeFfnBlock + layerOutScale over each
+                // token's hidden slice is OUTPUT-IDENTICAL to the per-token path.
+                const saved_hidden = self.hidden;
+                var t: u32 = 0;
+                while (t < T) : (t += 1) {
+                    // Point self.hidden at this token's slice of the batched stream.
+                    // The launch captures the raw device ptr (cuLaunchKernel), so the
+                    // alias wrapper is safe to free once moeFfnBlock has recorded its
+                    // dispatches — the slice's device memory lives on in b.hidden.
+                    self.hidden = try buffer.aliasBuffer(&b.hidden, t * d.n_embd * f4, d.n_embd * f4);
+                    try self.moeFfnBlock(L);
+                    try self.layerOutScale(L); // MoE's final write is scale_accumulate → standalone scale
+                    buffer.freeBuffer(&self.hidden);
+                }
+                self.hidden = saved_hidden;
+            } else {
+                try self.ffnBlockBatched(L, T, b);
+                // dense layer_output_scale is folded into the post-ffn norm+residual.
+            }
         }
+        // Drain the last layer's async MoE commands before the (synchronous) tail.
+        if (moe) self.waitPending();
 
         // TAIL on the last token only: rms_norm → LM head → argmax. Reuse the
         // single-token decode scratch (norm_buf/logits_buf/argmax_buf) on the
         // last token's slice of the batched hidden stream.
         const last = T - 1;
-        const f4 = @sizeOf(f32);
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
         const lm_head = self.model.get("output.weight") orelse self.model.get("token_embd.weight") orelse return error.MissingTensor;
         var hid_last = try buffer.aliasBuffer(&b.hidden, last * d.n_embd * f4, d.n_embd * f4);
