@@ -5382,7 +5382,7 @@ const direct_moe_gate_up_q4_0_range_rows: u32 = 64;
 const direct_moe_gate_up_q4_0_max_expert_slots: u32 = 2;
 const direct_moe_down_q4_0_tolerance: f32 = 0.05;
 const direct_moe_down_q4_0_range_rows: u32 = 64;
-const direct_moe_down_q4_0_max_expert_slots: u32 = 1;
+const direct_moe_down_q4_0_max_expert_slots: u32 = 2;
 
 fn runMoeExpertsParallel(
     state: *ScalarDecodeState,
