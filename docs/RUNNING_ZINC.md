@@ -255,12 +255,14 @@ That runs a single CLI inference pass and prints the build, model, GPU, prefill,
 
 ## Pick a specific GPU
 
-If your machine exposes multiple Vulkan devices, choose one explicitly:
+By default ZINC auto-selects the best compute-capable discrete Vulkan GPU.
+If your machine exposes multiple Vulkan devices and you need to override that
+choice, choose one explicitly:
 
 ```bash
 ./zig-out/bin/zinc \
   -m /path/to/model.gguf \
-  -d 0 \
+  -d 1 \
   --prompt "Hello"
 ```
 

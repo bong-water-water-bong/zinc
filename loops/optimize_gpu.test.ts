@@ -184,7 +184,7 @@ describe("optimize_gpu remote commands", () => {
     expect(command).toContain("-m '/home/tempuser/.cache/zinc/models/models/qwen35-9b-q4k-m/model.gguf'");
     expect(command).toContain("-p 'Benchmark context only.");
     expect(command).toContain("-n 128");
-    expect(command).toContain("--device Vulkan0");
+    expect(command).toContain("--device Vulkan1");
     expect(command).toContain("-st");
     expect(command).toContain("-fa 1");
     expect(command).toContain("-c 4096");

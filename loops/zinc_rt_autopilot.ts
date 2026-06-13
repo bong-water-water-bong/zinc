@@ -179,6 +179,12 @@ const DEFAULT_VULKAN_DEVICE_INDEX = Number(
     ["ZINC_VULKAN_DEVICE_INDEX", "ZINC_VULKAN_DEVICE"],
   ) ?? "1",
 );
+const DEFAULT_LLAMA_VULKAN_DEVICE_INDEX = Number(
+  nodeEnvValue(
+    ["LLAMA_VULKAN_DEVICE_INDEX", "LLAMA_VULKAN_DEVICE"],
+    ["ZINC_LLAMA_VULKAN_DEVICE_INDEX", "ZINC_LLAMA_VULKAN_DEVICE"],
+  ) ?? String(DEFAULT_VULKAN_DEVICE_INDEX),
+);
 const CLAUDE_MODEL = process.env.ZINC_CLAUDE_MODEL ?? "claude-opus-4-7[1m]";
 const CLAUDE_EFFORT = process.env.ZINC_CLAUDE_EFFORT ?? "max";
 const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
@@ -713,7 +719,7 @@ async function runLlamaOnce(
     "-p", shellQuote(prompt),
     "--temp", "0",
     "-ngl", "999",
-    "-dev", "Vulkan0",
+    "-dev", `Vulkan${DEFAULT_LLAMA_VULKAN_DEVICE_INDEX}`,
     "-fa", "on",
     "-b", "4096",
     "-ub", "1024",

@@ -521,7 +521,7 @@ Errors use an OpenAI-style envelope:
   -m, --model <path>       Path to GGUF model file
   --model-id <id>          Managed model id from the built-in catalog/cache
   -p, --port <port>        Server port (default: 8080; `zinc chat` defaults to 9090)
-  -d, --device <id>        GPU device index (default: 0)
+  -d, --device <id>        GPU device index (default: auto; prefers discrete Vulkan GPU)
   -c, --context <size>     Context length (default: 4096)
   --parallel <n>           Max queued/concurrent HTTP requests (default: 4)
   --kv-quant <bits>        TurboQuant KV cache compression: 0/2/3/4 (default: 0=off)

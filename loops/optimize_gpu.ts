@@ -163,6 +163,7 @@ export type LoopOptions = {
   continueAfterLlama: boolean;
   llamaDir: string;
   llamaBench: string | null;
+  llamaVulkanDevice: number;
   llamaPromptTokens: number;
   llamaDecodeTokens: number;
   allowDirty: boolean;
@@ -314,6 +315,15 @@ export function parseArgsFrom(argv: string[], envMap: Record<string, string> = p
     continueAfterLlama: false,
     llamaDir: envLlamaDir ?? `${remoteHome}/llama.cpp`,
     llamaBench: envMap.ZINC_LLAMA_BENCH ?? fileEnv.ZINC_LLAMA_BENCH ?? null,
+    llamaVulkanDevice: Number(
+      envMap.ZINC_LLAMA_VULKAN_DEVICE_INDEX ??
+      fileEnv.ZINC_LLAMA_VULKAN_DEVICE_INDEX ??
+      envMap.ZINC_VULKAN_DEVICE_INDEX ??
+      fileEnv.ZINC_VULKAN_DEVICE_INDEX ??
+      envMap.ZINC_RDNA_DEVICE_INDEX ??
+      fileEnv.ZINC_RDNA_DEVICE_INDEX ??
+      "1",
+    ),
     llamaPromptTokens: 128,
     llamaDecodeTokens: 128,
     allowDirty: false,
@@ -476,7 +486,7 @@ export function buildRemoteLlamaCliCommand(opts: LoopOptions, target: ModelTarge
     `if [ -z "$llama_bin" ] && [ -n "$llama_cli" ]; then llama_bin="$llama_cli"; llama_kind="llama-cli"; llama_mode="-st"; fi`,
     `test -n "$llama_bin"`,
     `echo "ZINC_LLAMA_SOURCE=$llama_kind" >&2`,
-    `timeout 300s "$llama_bin" $llama_mode -m ${q(target.modelPath)} --device Vulkan0 -ngl 99 -p ${q(target.prompt)} -n ${target.maxTokens} --temp 0 -fa 1 -c ${contextTokens} -b 256 -ub 128`,
+    `timeout 300s "$llama_bin" $llama_mode -m ${q(target.modelPath)} --device Vulkan${opts.llamaVulkanDevice} -ngl 99 -p ${q(target.prompt)} -n ${target.maxTokens} --temp 0 -fa 1 -c ${contextTokens} -b 256 -ub 128`,
   ].join(" && ");
 }
 

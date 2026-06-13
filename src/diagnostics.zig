@@ -18,8 +18,8 @@ const ModelInspection = loader_mod.ModelInspection;
 
 /// Configuration for a Vulkan diagnostics run.
 pub const Options = struct {
-    /// GPU device index to probe (0 = default).
-    device_index: u32 = 0,
+    /// GPU device index to probe, or auto-select when unset by CLI.
+    device_index: u32 = instance_mod.auto_select_device_index,
     /// Path to a GGUF model file for inspection, or null to skip.
     model_path: ?[]const u8 = null,
     /// Requested runtime context ceiling from CLI/server configuration.
@@ -491,7 +491,9 @@ fn printShaderAssets(writer: anytype, styles: Styles, summary: *Summary, shader_
 fn printVulkanProbe(writer: anytype, styles: Styles, summary: *Summary, probe: *const VulkanProbe) !void {
     try printStatusLine(writer, styles, summary, .ok, "Vulkan", "Instance and logical device initialized", .{});
     try printDetailLine(writer, "Visible GPUs", "{d}", .{probe.device_count});
-    if (probe.requested_index != probe.selected_index) {
+    if (probe.requested_index == instance_mod.auto_select_device_index) {
+        try printDetailLine(writer, "Selected GPU", "#{d} {s} (auto)", .{ probe.selected_index, probe.gpu_config.nameSlice() });
+    } else if (probe.requested_index != probe.selected_index) {
         try printDetailLine(writer, "Selected GPU", "#{d} (requested #{d} out of range)", .{ probe.selected_index, probe.requested_index });
     } else {
         try printDetailLine(writer, "Selected GPU", "#{d} {s}", .{ probe.selected_index, probe.gpu_config.nameSlice() });
@@ -797,7 +799,7 @@ fn probeVulkan(allocator: std.mem.Allocator, preferred_device: u32) !VulkanProbe
     defer allocator.free(phys_devices);
     _ = vk.c.vkEnumeratePhysicalDevices(handle, &dev_count, phys_devices.ptr);
 
-    const selected_index: u32 = if (preferred_device < dev_count) preferred_device else 0;
+    const selected_index = try instance_mod.selectPhysicalDeviceIndex(allocator, phys_devices, dev_count, preferred_device);
     const physical_device = phys_devices[selected_index];
 
     var device_props: vk.c.VkPhysicalDeviceProperties = undefined;

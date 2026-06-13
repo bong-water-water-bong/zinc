@@ -5,7 +5,8 @@
 //! @section Inference Runtime
 const std = @import("std");
 const vk = @import("vulkan/vk.zig");
-const Instance = @import("vulkan/instance.zig").Instance;
+const instance_mod = @import("vulkan/instance.zig");
+const Instance = instance_mod.Instance;
 const CommandPool = @import("vulkan/command.zig").CommandPool;
 const CommandBuffer = @import("vulkan/command.zig").CommandBuffer;
 const Buffer = @import("vulkan/buffer.zig").Buffer;
@@ -77,7 +78,7 @@ const BenchResult = struct {
 };
 
 const Args = struct {
-    device: u32 = 0,
+    device: u32 = instance_mod.auto_select_device_index,
     iterations: u32 = 200,
     warmup: u32 = 25,
     working_set: u32 = 16,
@@ -204,7 +205,7 @@ fn printUsage() void {
     std.debug.print(
         \\Usage: zinc-hot-bench [options]
         \\  -m, --model <path>       Optional GGUF path to derive exact hot shapes
-        \\  -d, --device <id>        Vulkan device index (default: 0)
+        \\  -d, --device <id>        Vulkan device index (default: auto, prefers discrete GPU)
         \\  --shader-dir <path>      Shader directory (default: zig-out/share/zinc/shaders)
         \\  --iterations <n>         Timed iterations per case (default: 200)
         \\  --warmup <n>             Warmup iterations per case (default: 25)

@@ -163,8 +163,10 @@ pub const Config = struct {
     model_id: ?[]const u8 = null,
     /// HTTP server port.
     port: u16 = 8080,
-    /// Vulkan device index.
+    /// GPU device index used when explicitly set with `-d/--device`.
     device_index: u32 = 0,
+    /// True when `device_index` came from the CLI instead of the backend default.
+    device_index_explicit: bool = false,
     /// Max sequence length. `null` means auto-size from GPU memory at load.
     context_length: ?u32 = null,
     /// Max concurrent requests.
@@ -205,6 +207,13 @@ pub const Config = struct {
     show_all_models: bool = false,
     /// Output `model list` results as pretty-printed JSON.
     json_output: bool = false,
+
+    fn gpuDevicePreference(self: Config) u32 {
+        if (comptime gpu.is_vulkan) {
+            return if (self.device_index_explicit) self.device_index else instance_mod.auto_select_device_index;
+        }
+        return self.device_index;
+    }
 };
 
 /// Top-level CLI subcommands parsed from argv.
@@ -446,7 +455,7 @@ const banner =
     \\  --chat                   Apply the model chat template to --prompt
     \\  --raw                    Do not auto-apply chat templates to --prompt
     \\  -n, --max-tokens <n>     Max generated tokens in CLI mode (default: 256)
-    \\  -d, --device <id>        Vulkan device index (default: 0)
+    \\  -d, --device <id>        GPU device index (default: auto, prefers discrete Vulkan GPU)
     \\  -c, --context <size>     Context length (default: auto — sized to GPU memory; pass 0 to force auto)
     \\  --kv-quant <bits>        TurboQuant KV cache bits: 0/2/3/4 (default: 0)
     \\
@@ -490,7 +499,7 @@ const banner_full =
     \\  --chat                   Apply the model chat template to --prompt
     \\  --raw                    Do not auto-apply chat templates to --prompt
     \\  -n, --max-tokens <n>     Max generated tokens in CLI mode (default: 256)
-    \\  -d, --device <id>        Vulkan device index (default: 0)
+    \\  -d, --device <id>        GPU device index (default: auto, prefers discrete Vulkan GPU)
     \\  -c, --context <size>     Context length (default: auto — sized to GPU memory; pass 0 to force auto)
     \\  --kv-quant <bits>        TurboQuant KV cache bits: 0/2/3/4 (default: 0)
     \\
@@ -598,6 +607,7 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             config.device_index = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidDevice;
+            config.device_index_explicit = true;
         } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--context")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -890,6 +900,56 @@ const ManagedGpuSupport = struct {
 };
 
 fn resolveManagedGpuSupport(device_index: u32, allocator: std.mem.Allocator) !ManagedGpuSupport {
+    const auto_vulkan = if (comptime gpu.is_vulkan)
+        device_index == instance_mod.auto_select_device_index
+    else
+        false;
+    if (!auto_vulkan) {
+        if (try managed_mod.readCachedGpuProfile(device_index, allocator)) |cached| {
+            defer {
+                var owned = cached;
+                owned.deinit(allocator);
+            }
+            return .{
+                .profile = try allocator.dupe(u8, cached.profile),
+                .vram_budget_bytes = cached.vram_budget_bytes,
+                .from_cache = true,
+            };
+        }
+    }
+
+    if (gpu.is_vulkan) {
+        var vk_instance = try instance_mod.Instance.init(allocator, device_index);
+        defer vk_instance.deinit();
+
+        const selected_device_index = vk_instance.selected_device_index;
+        if (device_index == instance_mod.auto_select_device_index) {
+            if (try managed_mod.readCachedGpuProfile(selected_device_index, allocator)) |cached| {
+                defer {
+                    var owned = cached;
+                    owned.deinit(allocator);
+                }
+                return .{
+                    .profile = try allocator.dupe(u8, cached.profile),
+                    .vram_budget_bytes = cached.vram_budget_bytes,
+                    .from_cache = true,
+                };
+            }
+        }
+
+        const gpu_config = gpu_detect.detect(&vk_instance);
+        const profile = catalog_mod.profileForGpu(gpu_config);
+        const vram_budget_bytes = vk_instance.vramBytes();
+
+        try managed_mod.writeCachedGpuProfile(selected_device_index, profile, gpu_config.nameSlice(), vram_budget_bytes, allocator);
+
+        return .{
+            .profile = try allocator.dupe(u8, profile),
+            .vram_budget_bytes = vram_budget_bytes,
+            .from_cache = false,
+        };
+    }
+
     if (try managed_mod.readCachedGpuProfile(device_index, allocator)) |cached| {
         defer {
             var owned = cached;
@@ -899,23 +959,6 @@ fn resolveManagedGpuSupport(device_index: u32, allocator: std.mem.Allocator) !Ma
             .profile = try allocator.dupe(u8, cached.profile),
             .vram_budget_bytes = cached.vram_budget_bytes,
             .from_cache = true,
-        };
-    }
-
-    if (gpu.is_vulkan) {
-        var vk_instance = try instance_mod.Instance.init(allocator, device_index);
-        defer vk_instance.deinit();
-
-        const gpu_config = gpu_detect.detect(&vk_instance);
-        const profile = catalog_mod.profileForGpu(gpu_config);
-        const vram_budget_bytes = vk_instance.vramBytes();
-
-        try managed_mod.writeCachedGpuProfile(device_index, profile, gpu_config.nameSlice(), vram_budget_bytes, allocator);
-
-        return .{
-            .profile = try allocator.dupe(u8, profile),
-            .vram_budget_bytes = vram_budget_bytes,
-            .from_cache = false,
         };
     }
 
@@ -978,7 +1021,7 @@ fn printManagedModelList(config: Config, allocator: std.mem.Allocator) !void {
     const active_model_id = if (active) |selection| selection.model_id else null;
     const backend_name = if (gpu.is_metal) "Metal" else if (gpu.is_vulkan) "Vulkan" else "GPU";
 
-    const support = resolveManagedGpuSupport(config.device_index, allocator) catch |err| {
+    const support = resolveManagedGpuSupport(config.gpuDevicePreference(), allocator) catch |err| {
         if (!config.show_all_models and !config.json_output) {
             var stderr_buffer: [1024]u8 = undefined;
             var stderr = std.fs.File.stderr().writerStreaming(&stderr_buffer);
@@ -1452,7 +1495,7 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
             const model_id = config.command_model_id orelse return error.MissingArgValue;
             const entry = catalog_mod.find(model_id) orelse return error.UnknownManagedModel;
 
-            var support = try resolveManagedGpuSupport(config.device_index, allocator);
+            var support = try resolveManagedGpuSupport(config.gpuDevicePreference(), allocator);
             defer support.deinit(allocator);
 
             if (!catalog_mod.supportsProfile(entry.*, support.profile)) return error.ModelUnsupportedOnThisGpu;
@@ -1961,7 +2004,7 @@ pub fn main() !void {
         }
 
         diagnostics_mod.run(.{
-            .device_index = config.device_index,
+            .device_index = config.gpuDevicePreference(),
             .model_path = check_target.model_path,
             .requested_context_length = config.context_length,
             .managed_model = check_target.managed_model,
@@ -2226,7 +2269,7 @@ pub fn main() !void {
     }
 
     // Vulkan backend (Linux)
-    var vk_instance = instance_mod.Instance.init(allocator, config.device_index) catch |err| {
+    var vk_instance = instance_mod.Instance.init(allocator, config.gpuDevicePreference()) catch |err| {
         log.err("Vulkan init failed: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -2448,6 +2491,13 @@ test "parseArgs: defaults" {
     try std.testing.expectEqual(@as(u8, 0), config.kv_quant);
     try std.testing.expect(config.model_path == null);
     try std.testing.expect(config.model_id == null);
+    try std.testing.expectEqual(@as(u32, 0), config.device_index);
+    try std.testing.expect(!config.device_index_explicit);
+    if (comptime gpu.is_vulkan) {
+        try std.testing.expectEqual(instance_mod.auto_select_device_index, config.gpuDevicePreference());
+    } else {
+        try std.testing.expectEqual(@as(u32, 0), config.gpuDevicePreference());
+    }
     try std.testing.expect(config.prompt == null);
     try std.testing.expect(!config.chat);
     try std.testing.expect(!config.raw_prompt);
@@ -2467,6 +2517,8 @@ test "parseArgs: full args" {
     try std.testing.expectEqualStrings("qwen35-9b-q4k-m", config.model_id.?);
     try std.testing.expectEqual(@as(u16, 9090), config.port);
     try std.testing.expectEqual(@as(u32, 1), config.device_index);
+    try std.testing.expect(config.device_index_explicit);
+    try std.testing.expectEqual(@as(u32, 1), config.gpuDevicePreference());
     try std.testing.expectEqual(@as(?u32, 8192), config.context_length);
     try std.testing.expectEqual(@as(u32, 8), config.max_parallel);
     try std.testing.expectEqualStrings("hello", config.prompt.?);

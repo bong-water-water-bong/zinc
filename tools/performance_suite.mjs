@@ -1180,7 +1180,7 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targ
     "--host", (creds.loopbackHost ?? "127.0.0.1"),
     "--port", String(port),
     "-m", caseDef.model_path,
-    ...(creds.serverDeviceArgs ?? ["--device", `Vulkan${creds.vkDevice ?? 0}`]),
+    ...(creds.serverDeviceArgs ?? ["--device", `Vulkan${creds.vkDevice ?? 1}`]),
     "-ngl", "999",
     "--metrics",
     "--ctx-size", "4096",
@@ -1357,7 +1357,7 @@ function remoteLlamaCommand(caseDef, creds, llamaCliPath) {
     "0",
     "-ngl",
     "999",
-    ...(creds.cliDeviceArgs ?? ["--device", `Vulkan${creds.vkDevice ?? 0}`]),
+    ...(creds.cliDeviceArgs ?? ["--device", `Vulkan${creds.vkDevice ?? 1}`]),
     "--flash-attn",
     "on",
     "-b",
@@ -2305,7 +2305,7 @@ async function buildRdnaCreds(args) {
     port,
     workdir: args.rdnaWorkdir,
     env: { RADV_PERFTEST: "coop_matrix" },
-    vkDevice: args.rdnaVkDevice ?? 0,
+    vkDevice: args.rdnaVkDevice ?? 1,
   };
 }
 

@@ -1116,7 +1116,7 @@ function buildOptimizationPrompt(state: RunState): string {
     "## Current Setup",
     "- llama.cpp built: -DGGML_VULKAN=ON, -O3 -march=znver4",
     "- Model: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf (MoE 35B/3B active, 22GB)",
-    "- Server flags: -ngl 99 --device Vulkan0 --parallel 4 -c 32768 -ctk q8_0 -ctv q8_0 -b 4096 -ub 1024 --mlock",
+    "- Server flags: -ngl 99 --device Vulkan<N> --parallel 4 -c 32768 -ctk q8_0 -ctv q8_0 -b 4096 -ub 1024 --mlock; choose the discrete Vulkan device, not an APU/iGPU default.",
     "- Env: RADV_PERFTEST=coop_matrix",
     "- Service: /etc/systemd/system/llama-server.service",
     "- systemctl daemon-reload && systemctl restart llama-server to apply changes",

@@ -7,6 +7,10 @@ const vk = @import("vk.zig");
 
 const log = std.log.scoped(.vulkan);
 
+/// Sentinel passed by callers that want ZINC to choose the best Vulkan device.
+/// Explicit CLI `-d/--device` values are still honored exactly.
+pub const auto_select_device_index: u32 = std.math.maxInt(u32);
+
 /// Function pointer type for `vkCmdPushDescriptorSetKHR` when the extension is enabled.
 pub const PushDescriptorFn = *const fn (
     vk.c.VkCommandBuffer,
@@ -53,6 +57,84 @@ pub const DeviceCapabilities = struct {
         return (self.required_subgroup_size_stages & vk.c.VK_SHADER_STAGE_COMPUTE_BIT) != 0;
     }
 };
+
+fn deviceLocalBytes(mem_props: *const vk.c.VkPhysicalDeviceMemoryProperties) u64 {
+    var total: u64 = 0;
+    for (mem_props.memoryHeaps[0..mem_props.memoryHeapCount]) |heap| {
+        if (heap.flags & vk.c.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT != 0) {
+            total += heap.size;
+        }
+    }
+    return total;
+}
+
+fn hasComputeQueue(allocator: std.mem.Allocator, physical_device: vk.c.VkPhysicalDevice) !bool {
+    var qf_count: u32 = 0;
+    vk.c.vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &qf_count, null);
+    if (qf_count == 0) return false;
+
+    const qf_props = try allocator.alloc(vk.c.VkQueueFamilyProperties, qf_count);
+    defer allocator.free(qf_props);
+    vk.c.vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &qf_count, qf_props.ptr);
+
+    for (qf_props[0..qf_count]) |qf| {
+        if (qf.queueFlags & vk.c.VK_QUEUE_COMPUTE_BIT != 0) return true;
+    }
+    return false;
+}
+
+fn deviceSelectionTier(props: *const vk.c.VkPhysicalDeviceProperties) u32 {
+    return switch (props.deviceType) {
+        vk.c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => 5,
+        vk.c.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => 4,
+        vk.c.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => 3,
+        vk.c.VK_PHYSICAL_DEVICE_TYPE_CPU => 1,
+        else => 2,
+    };
+}
+
+/// Resolve a Vulkan physical-device index.
+///
+/// Explicit device indices are honored exactly. The auto path avoids the common
+/// mixed-AMD trap where Mesa enumerates an APU/iGPU as device 0 and the discrete
+/// RDNA card as device 1.
+pub fn selectPhysicalDeviceIndex(
+    allocator: std.mem.Allocator,
+    phys_devices: []const vk.c.VkPhysicalDevice,
+    dev_count: u32,
+    preferred_device: u32,
+) !u32 {
+    if (preferred_device != auto_select_device_index) {
+        if (preferred_device < dev_count) return preferred_device;
+        return error.DeviceIndexOutOfRange;
+    }
+
+    var best_index: u32 = 0;
+    var best_tier: u32 = 0;
+    var best_vram: u64 = 0;
+    var found_compute = false;
+
+    for (phys_devices[0..dev_count], 0..) |pdev, i| {
+        if (!(try hasComputeQueue(allocator, pdev))) continue;
+        found_compute = true;
+
+        var props: vk.c.VkPhysicalDeviceProperties = undefined;
+        vk.c.vkGetPhysicalDeviceProperties(pdev, &props);
+        var mem_props: vk.c.VkPhysicalDeviceMemoryProperties = undefined;
+        vk.c.vkGetPhysicalDeviceMemoryProperties(pdev, &mem_props);
+
+        const tier = deviceSelectionTier(&props);
+        const vram = deviceLocalBytes(&mem_props);
+        if (tier > best_tier or (tier == best_tier and vram > best_vram)) {
+            best_index = @intCast(i);
+            best_tier = tier;
+            best_vram = vram;
+        }
+    }
+
+    if (!found_compute) return error.NoComputeQueue;
+    return best_index;
+}
 
 /// Active Vulkan instance, selected physical device, logical device, and memory metadata.
 pub const Instance = struct {
@@ -135,8 +217,10 @@ pub const Instance = struct {
             log.debug("GPU {d}: {s} (vendor 0x{x:0>4})", .{ i, name, props.vendorID });
         }
 
-        // Select device
-        const dev_idx: u32 = if (preferred_device < dev_count) preferred_device else 0;
+        // Select device. The auto path prefers a compute-capable discrete GPU
+        // over integrated APUs/CPU devices so mixed systems do not silently run
+        // on the wrong adapter.
+        const dev_idx = try selectPhysicalDeviceIndex(allocator, phys_devices, dev_count, preferred_device);
         const physical_device = phys_devices[dev_idx];
 
         var device_props: vk.c.VkPhysicalDeviceProperties = undefined;
@@ -147,7 +231,11 @@ pub const Instance = struct {
 
         const device_caps = try queryDeviceCapabilities(allocator, physical_device);
         const dev_name = std.mem.sliceTo(&device_props.deviceName, 0);
-        log.debug("Selected GPU {d}: {s}", .{ dev_idx, dev_name });
+        if (preferred_device == auto_select_device_index) {
+            log.debug("Auto-selected GPU {d}: {s}", .{ dev_idx, dev_name });
+        } else {
+            log.debug("Selected GPU {d}: {s}", .{ dev_idx, dev_name });
+        }
         if (device_caps.subgroup_size_control) {
             log.debug("Subgroup size control enabled: default {d}, range {d}-{d}", .{
                 device_caps.default_subgroup_size,

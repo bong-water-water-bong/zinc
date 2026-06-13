@@ -62,8 +62,10 @@ cat /sys/module/amdgpu/parameters/ras_enable  # should show 0
 #    provenance.llama_cpp. Rebuild and republish when changing it.
 
 # 5. Server flags (in /etc/systemd/system/llama-server.service):
-#    -ngl 99 --device Vulkan0 --parallel 4 -c 32768
+#    -ngl 99 --device Vulkan<N> --parallel 4 -c 32768
 #    -ctk q8_0 -ctv q8_0 -b 4096 -ub 1024 --mlock --flash-attn on
+#    Pick the discrete GPU index from `vulkaninfo --summary`; on mixed APU+dGPU
+#    nodes this may be Vulkan1 rather than Vulkan0.
 ```
 
 ### Measure llama.cpp
