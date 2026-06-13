@@ -341,3 +341,33 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   each expert weight read once per group, a memory-traffic win beyond launch batching; needs gather/scatter,
   harder for byte-identity), batch the attention layer's remaining per-token bits if any, or NVRTC `-I` fp16
   tensor-core GEMM (+2.2× dense, own tolerance gate).
+- **2026-06-13 — Cycle 10: async-pipeline the batched prefill layer loop (remove per-layer host syncs) — output-identical + faster.**
+  After cycle 9 the gemma MoE/dense prefill FFN+attention were fully batched, but the layer loop still
+  BLOCKED THE CPU twice (dense) / once (MoE) per layer: `attentionLayerBatched`, `ffnBlockBatched` and
+  `sharedExpertBatched` each ended with `cmd.commitAndWait()` — a full `cuStreamSynchronize` round-trip. On
+  WSL2 each is ~0.4 ms and, worse, the idle gaps starve the GPU boost clock (the exact pathology the merged
+  DECODE async ring fixes). This cycle removes them: all three helpers now `self.submit(cmd)` (commitAsync +
+  stash) on the SAME single shared CUstream the async MoE stages already use (confirmed `m->stream = c->stream`
+  in cuda_shim.c → every launch is implicitly ordered, so cross-layer buffer reuse stays byte-identical — only
+  CPU blocking is removed, not GPU execution order). The mid-loop `if (moe) drainPending()` (which relied on
+  attention's commitAndWait draining the stream) is GONE; a single unconditional `waitPending()` before the
+  tail now frees every layer's stashed command (ring depth = blocks/layer × n_layers ≈ 5×48 for gemma-26b,
+  well under the 1024 ring; submit() self-falls-back to sync if it ever fills). The per-token MoE FALLBACK
+  path (non-`pre`) is untouched — its inner `moeRoutedCombine` still commitAndWaits around its host id
+  readback, which safely drains any stashed attention/shared command. ADDITIVE: only `prefillBatched` +
+  its three batched helpers changed; decodeStep/prefillStep/per-token path/single-token kernels untouched;
+  NO new kernels. Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda
+  -Dshaders=false` EXIT=0 + ran, bin md5 2eca13ad ≠ cycle 9's 5a1b0597). GATE — FULLY CLEARED:
+    - `prefill_catalog ZINC_AB=batched` (ABBA x2, 250-tok, 4090): GEN_IDS byte-identical —
+      **gemma4-26b MoE 46.27 → 213.46 t/s (+361%)** (UP from cycle 9's 160.49 — removing the per-layer
+      host syncs is a large MoE win: more layers × launches = more sync gaps removed + boost held),
+      **gemma4-31b dense 30.02 → 140.56 t/s (+368%)** (UP from cycle 9's 130.21).
+    - `ZINC_BATCHED=1 validate_catalog` (DIRECT batched gate, 4090): **5/5 PASS** — gemma4-26b MoE batched
+      free-runs **12/12** DIRECT vs llama.cpp (the async-pipelined prefill path is token-correct); gemma4-31b
+      the documented near-tie (free-run 2/12, teacher-forced 11/12, unchanged); qwen 12/12 (per-token
+      fallback intact → product decode path unregressed).
+  Committed to perf/e24-batched-prefill, pushed (NOT main). The batched prefill layer loop now runs with NO
+  per-layer CPU↔GPU sync (one drain before the tail). NEXT (cycle 11): token-GROUPED routed experts (gather
+  tokens by expert → each expert weight read once per group, a memory-traffic win beyond launch batching;
+  needs gather/scatter, harder for byte-identity), or NVRTC `-I` fp16 tensor-core GEMM (+2.2× dense, own
+  tolerance gate — NOT byte-identical).

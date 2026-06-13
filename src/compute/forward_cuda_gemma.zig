@@ -632,10 +632,16 @@ pub const ForwardGemma = struct {
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
             try self.attentionLayerBatched(L, T, b);
-            // attentionLayerBatched ends with commitAndWait → the stream is drained,
-            // so the previous layer's stashed async MoE commands are complete and
-            // safe to release. (No-op on the dense model: it never goes async here.)
-            if (moe) self.drainPending();
+            // Cycle 10: every batched-prefill block now COMMITS ASYNC on the single
+            // shared CUstream (attention/shared/ffn no longer commitAndWait per layer),
+            // so the CPU never blocks between layers — the same ~0.4ms WSL2 sync round-
+            // trips (and the boost-starvation their idle gaps cause) that the decode
+            // async ring removes are gone from prefill too. The stream still serializes
+            // the GPU in submission order, so cross-layer buffer reuse is byte-identical;
+            // the per-token MoE FALLBACK path (non-`pre`) still commitAndWaits internally
+            // around its host id readback. All stashed commands are freed by the single
+            // waitPending() before the tail (ring depth = blocks/layer × n_layers ≈ 5×48
+            // for gemma-26b MoE, well under the 1024 ring; submit() syncs if it ever fills).
             // FFN type is per LAYER (a MoE model may carry dense layers): exactly
             // mirror the per-token path's `n_experts>0 && ffn_gate_inp present` test.
             const layer_is_moe = moe and self.model.getLayer(L, "ffn_gate_inp.weight") != null;
@@ -684,8 +690,9 @@ pub const ForwardGemma = struct {
                 // dense layer_output_scale is folded into the post-ffn norm+residual.
             }
         }
-        // Drain the last layer's async MoE commands before the (synchronous) tail.
-        if (moe) self.waitPending();
+        // Drain every layer's stashed async commands (attention/shared/ffn/MoE) before
+        // the (synchronous) tail — the dense path now uses the ring too (cycle 10).
+        self.waitPending();
 
         // TAIL on the last token only: rms_norm → LM head → argmax. Reuse the
         // single-token decode scratch (norm_buf/logits_buf/argmax_buf) on the
@@ -779,7 +786,9 @@ pub const ForwardGemma = struct {
         // Batched O projection then the fused post-attention norm + residual add.
         self.gemmDispatch(&cmd, wo, &b.attn_out, &b.o, d.n_embd, g.q_dim, T);
         cmd.dispatch(&self.pipes.rms_norm_residual, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.o, &wpan.gpu_buffer, &b.hidden }, &rms, @sizeOf(RmsPush), 0);
-        cmd.commitAndWait();
+        // Async on the shared stream (cycle 10): the FFN block + next layer chain after
+        // this in submission order; the single tail waitPending() frees it. No host sync.
+        self.submit(cmd);
     }
 
     /// Batched dense GeGLU FFN block: pre-norm + gate/up/down projections via
@@ -810,7 +819,9 @@ pub const ForwardGemma = struct {
         } else {
             cmd.dispatch(&self.pipes.rms_norm_residual, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.down, &wpfn.gpu_buffer, &b.hidden }, &rms, @sizeOf(RmsPush), 0);
         }
-        cmd.commitAndWait();
+        // Async on the shared stream (cycle 10): chains before the next layer's attention
+        // in submission order; freed by the single tail waitPending(). No per-layer sync.
+        self.submit(cmd);
     }
 
     /// Batched prefill GEMM dispatch: Y[T,M] = A[T,K]·W[M,K]^T. Q4_K/Q5_K/Q6_K
@@ -1169,7 +1180,11 @@ pub const ForwardGemma = struct {
         cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(T * sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate, &b.up, &b.geglu }, &sg, @sizeOf(SwigluPush), 0);
         self.gemmDispatch(&cmd, wdown, &b.geglu, &b.shared, d.n_embd, sf, T);
         cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.shared, &wpn1.gpu_buffer, &b.shared }, &rms, @sizeOf(RmsPush), 0);
-        cmd.commitAndWait();
+        // Async on the shared stream (cycle 10): the router/experts/combine stages chain
+        // after this in submission order; freed by the single tail waitPending(). On the
+        // per-token MoE fallback path the following moeRoutedCombine commitAndWaits, which
+        // drains this safely. No host sync per MoE layer.
+        self.submit(cmd);
     }
 
     /// Batched routed-expert matvecs (gemma4-MoE prefill, cycle 8). The pre_ffw_norm_2,
