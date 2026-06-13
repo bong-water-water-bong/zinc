@@ -1588,3 +1588,71 @@ extern "C" __global__ void deinterleave_qgate(const float* qfull, float* q_out, 
     q_out[i]    = qfull[src];
     gate_out[i] = qfull[src + pc.head_dim];
 }
+
+// ---- attention_causal_batched (Effort 24: batched prefill attention) --------
+// Prefill processes T prompt tokens at once. naive_attention is single-query
+// (grid=n_heads, one query over [0..seq_len)). This batches all T queries: block
+// (head=blockIdx.x, t=blockIdx.y) computes attention for query position t, head h,
+// CAUSALLY masked to keys [0..t]. Same 3-pass softmax(QK^T)V + GQA + sink logic.
+// Q/K/V are [T, n_kv_heads-or-n_heads, head_dim]; out is [T, n_heads, head_dim].
+struct AttnBatchPush { unsigned head_dim, n_heads, n_kv_heads, T, attn_scale_bits, sink_offset; };
+
+extern "C" __global__ void attention_causal_batched(const float* q, const float* k, const float* v,
+                                                    const float* sinks, float* out, AttnBatchPush pc) {
+    extern __shared__ float s_scores[];          // size = T floats (max causal length)
+    __shared__ float s_m, s_rescale, s_inv;
+    unsigned head = blockIdx.x;
+    unsigned t = blockIdx.y;                      // query position
+    if (t >= pc.T) return;
+    unsigned seq_len = t + 1u;                    // causal: query t attends keys [0..t]
+    unsigned tid = threadIdx.x;
+    unsigned hd = pc.head_dim;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    const float* qh = q + ((size_t)t * pc.n_heads + head) * hd;   // query t, head h
+    float scale = pc.attn_scale_bits != 0u ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)hd);
+
+    // Pass 1: scores = scale*(q.k_i), track max.
+    float lmax = -3.4e38f;
+    for (unsigned i = tid; i < seq_len; i += blockDim.x) {
+        const float* ki = k + ((size_t)i * pc.n_kv_heads + kv_head) * hd;
+        float dot = 0.0f;
+        for (unsigned d = 0; d < hd; d++) dot += qh[d] * ki[d];
+        float score = dot * scale;
+        s_scores[i] = score;
+        lmax = fmaxf(lmax, score);
+    }
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0) s_m = lmax;
+    __syncthreads();
+    float m = s_m;
+
+    // Pass 2: e_i = exp(score_i - m), sum.
+    float lsum = 0.0f;
+    for (unsigned i = tid; i < seq_len; i += blockDim.x) {
+        float e = expf(s_scores[i] - m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0) {
+        float sum = lsum, rescale = 1.0f, final_sum = lsum;
+        float sink_val = sinks[pc.sink_offset + head];
+        if (sink_val == sink_val) {
+            float sink_max = fmaxf(m, sink_val);
+            rescale = (sum > 0.0f) ? expf(m - sink_max) : 0.0f;
+            final_sum = sum * rescale + expf(sink_val - sink_max);
+        }
+        s_rescale = rescale;
+        s_inv = (final_sum > 0.0f) ? 1.0f / final_sum : 0.0f;
+    }
+    __syncthreads();
+    float rescale = s_rescale, inv = s_inv;
+
+    // Pass 3: out[t,head,d] = (sum_i e_i V[i,d]) * rescale * inv.
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = 0; i < seq_len; i++)
+            acc += s_scores[i] * v[((size_t)i * pc.n_kv_heads + kv_head) * hd + d];
+        out[((size_t)t * pc.n_heads + head) * hd + d] = acc * rescale * inv;
+    }
+}
