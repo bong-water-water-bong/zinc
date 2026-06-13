@@ -96,6 +96,9 @@ for i in "${!NAMES[@]}"; do
   # Effort 24 cycle 18: opt into token-GROUPED routed experts (byte-identical to the
   # _batched path; validates the grouped gemma-26b MoE prefill directly vs llama.cpp).
   [ "${ZINC_BATCHED_EXPERTS_GROUPED:-0}" = "1" ] && [ -n "$zbatch" ] && zbatch="$zbatch ZINC_BATCHED_EXPERTS_GROUPED=1"
+  # Effort 24 cycle 19: opt into shared-A (one f32→f16 activation recast across the
+  # GEMMs that read the same input on the TC path; byte-identical to the per-GEMM recast).
+  [ "${ZINC_BATCHED_TC_SHAREA:-0}" = "1" ] && [ -n "$zbatch" ] && zbatch="$zbatch ZINC_BATCHED_TC_SHAREA=1"
   zgen=$(env CUDA_VISIBLE_DEVICES=$GPU $zbatch "$ZBIN" gen "$pids" "$NGEN" "$m" 2>&1 | awk -F: '/GEN_IDS/{print $2}')
   IFS=',' read -ra L <<< "$lgen"; IFS=',' read -ra Z <<< "$zgen"
   match=0; for j in "${!L[@]}"; do [ "${L[$j]}" = "${Z[$j]:-x}" ] && match=$((match+1)) || break; done

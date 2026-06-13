@@ -667,3 +667,41 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   expert-major restructure. Committed to perf/e24-batched-prefill, pushed (NOT main). NEXT (cycle 19): keep activations fp16
   ACROSS the layer (norm/GeGLU producers emit fp16 → drop the per-GEMM f32→fp16 recast launch on the TC path — touches shared
   kernels, less additive), or a larger-T sweep to see if the grouped L2 win emerges above the boost floor at T≫250.
+- **2026-06-13 — Cycle 19: shared-A f32→f16 activation recast across same-input GEMMs on the TC path — byte-identical + token-correct, PERF IN-NOISE → kept OPT-IN.**
+  Took the cycle-18 NEXT item's lighter, fully-ADDITIVE half: on the fp16 tensor-core path (`ZINC_BATCHED_TC`), each dense
+  GEMM independently pre-converts its f32 activation A → fp16 (`f32_to_f16`) into `act_f16` before the wmma kernel (cycle 12).
+  But several GEMMs in a layer read the SAME input: attn **Q/K/V all read `b.norm`**; FFN **gate+up both read `b.ffn_norm`**;
+  the gemma-26b shared-expert **gate+up both read `b.ffn_norm`**. So the recast for the 2nd/3rd GEMM of each group is
+  REDUNDANT — `act_f16` already holds that exact downcast. This cycle shares it: behind a new opt-in `ZINC_BATCHED_TC_SHAREA`,
+  only the FIRST GEMM of each same-input group runs `f32_to_f16`; the rest pass `a_preconv=true` and reuse `act_f16`. ADDITIVE
+  (decodeStep/per-token path/the default per-GEMM-recast TC path all untouched):
+    - New `gemmDispatchA(...,a_preconv)` wraps the existing `gemmDispatch` (which now calls it with `a_preconv=false`); when
+      `a_preconv && use_tc_sharea` the Q4_K and Q6_K TC branches SKIP the `f32_to_f16` launch and the kernel reads the existing
+      `act_f16`. Byte-identical: x is unchanged between the group's GEMMs, nothing writes `act_f16` in between, and the skipped
+      recast would have produced the bit-for-bit-identical `__float2half` bits → the staged half input is identical. Removes 2
+      recast launches/attn layer + 1/FFN + 1/shared-expert layer.
+    - `attentionLayerBatched`: K/V projections now `gemmDispatchA(..., true)` (reuse Q's recast of `b.norm`). `ffnBlockBatched`
+      + `sharedExpertBatched`: up projection `gemmDispatchA(..., true)` (reuse gate's recast of `b.ffn_norm`). Opt-in bool
+      `use_tc_sharea` read once from `ZINC_BATCHED_TC_SHAREA` in `prefillBatched`. Scripts (validate_catalog/prefill_catalog)
+      pass the toggle through additively; new diagnostic `scripts/sharea_sweep.sh` (ABBA on/off, asserts GEN_IDS identity +
+      reports tok/s). Off (default) → each GEMM recasts independently = byte-for-byte cycle 12.
+  Built clean on the 4090 box (`zig build cuda-dbg -Dbackend=cuda -Dshaders=false` EXIT=0; binary md5 63495b4c embeds the
+  sharea env handling + `gemmDispatchA`, ≠ cycle 18's a51357e7). GATE — CORRECTNESS FULLY CLEARED, perf in-noise:
+    - Byte-identity (the core claim): `scripts/sharea_sweep.sh` (gemma-31b dense, T=250, ABBA x2, 4090) — GEN_IDS **identical**
+      across all on/off runs → shared-A is byte-for-byte the per-GEMM recast, as designed. ✓
+    - `ZINC_BATCHED=1 ZINC_BATCHED_TC=1 ZINC_BATCHED_TC_SHAREA=1 validate_catalog` (DIRECT vs llama.cpp, 4090): **5/5 PASS** —
+      gemma4-26b MoE (sharea on its dense-attn TC GEMMs) free-runs **12/12**; gemma4-31b the SAME documented near-tie (free-run
+      2/12, teacher-forced 11/12) → the shared recast introduced NO new divergence; qwen 12/12 (per-token fallback intact). ✓
+    - PERF — IN-NOISE (the honest outcome): sharea_sweep ABBA x2 (gemma-31b 250-tok, 4090): no-sharea **166.35** vs sharea
+      **170.76** t/s = **+2.6% nominal**, below the box's ±10% boost floor (the script's rounded "gain" column read 0%). Same
+      class as cycles 13/16/18 — byte-identical/token-correct but perf below the measurement floor. Expected: `f32_to_f16` is a
+      cheap element-wise launch and the recast read was already fp16-halved (cycle 12), so removing 2–4 of them per layer saves
+      far less than the GEMM cost — the saving is real but sub-floor.
+  DECISION: the effort's bar for a DEFAULT FLIP is a MEASURED faster increment; this is in-noise, so kept the proven cycle-12
+  per-GEMM recast as the DEFAULT and made the byte-identical shared-A path an ADDITIVE OPT-IN (`ZINC_BATCHED_TC_SHAREA`),
+  mirroring cycles 13/14/16/17/18's handling of neutral/negative results → the default TC path stays byte-for-byte cycle 15 →
+  cannot regress. Committed to perf/e24-batched-prefill, pushed (NOT main; origin/main unchanged, branch 0 behind → no rebase).
+  NEXT (cycle 20): the heavier half of the activation-fp16 lever — keep activations fp16 ACROSS the layer (have the norm/GeGLU
+  producers EMIT fp16 directly so the per-GEMM f32→fp16 recast launch is dropped ENTIRELY, not just shared within a group;
+  touches the shared rms_norm/geglu kernels so less additive, needs its own byte/tolerance gate); OR a larger-T sweep
+  (`scripts/grouped_sweep.sh`, T≫250) to see if cycle 18's grouped-expert L2 win clears the boost floor.

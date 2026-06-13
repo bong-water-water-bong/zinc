@@ -340,6 +340,7 @@ pub const ForwardGemma = struct {
     use_tc_q6_lowsmem: bool = false, // cycle 16 A/B: ZINC_BATCHED_TC_Q6_LOWSMEM opts INTO the 8 KB-shared lowsmem Q6_K TC kernel (gemm_q6k_tc_f16a_lowsmem). Byte-identical to the default 24 KB m64 Q6_K kernel but in-noise on perf (Q6_K is ~1/7 of the dense GEMM → its occupancy win is below the box's boost floor; 2 ABBA runs nominally -1/-5%) → kept OPT-IN, the proven m64 kernel stays the default.
     use_grouped: bool = false, // cycle 18: ZINC_BATCHED_EXPERTS_GROUPED opts into token-GROUPED routed experts (build_expert_order + grouped matvecs → expert weight L2-resident across its tokens). Byte-identical to the cycle-8 _batched path; opt-in pending a measured win.
     use_tc_m128_lowsmem: bool = false, // cycle 17 A/B: ZINC_BATCHED_TC_M128_LOWSMEM opts INTO the 12 KB-shared wider 128x64 M-tile Q4_K TC kernel (gemm_q4k_tc_f16a_m128_lowsmem) — synthesis of cycle 14's wider tile (halves the dominant f16-A read) + cycle 15's two-phase Cs (12 KB shared → ~6 blocks/SM, NOT m128's 44 KB→1 block/SM that lost -11.8%). Byte-identical to the m64/lowsmem default; measured this cycle to decide if it becomes the default.
+    use_tc_sharea: bool = false, // cycle 19: ZINC_BATCHED_TC_SHAREA shares ONE f32→f16 activation recast across GEMMs that read the SAME input (attn Q/K/V from b.norm; FFN gate/up from b.ffn_norm) — skips the redundant per-GEMM f32_to_f16 launch + read for the 2nd/3rd GEMM of each group. Byte-identical (same __float2half bits, same act_f16 contents reused stream-ordered). Off → each GEMM recasts independently (cycle 12 behavior).
 
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardGemma {
         const ctx = model.ctx;
@@ -749,6 +750,13 @@ pub const ForwardGemma = struct {
         // the cycle-8 launch batching). Byte-identical output (same per-block math; each
         // output computed once). Off → the proven cycle-8 _batched matvecs.
         self.use_grouped = std.posix.getenv("ZINC_BATCHED_EXPERTS_GROUPED") != null;
+        // Cycle 19: ZINC_BATCHED_TC_SHAREA shares one f32→f16 activation recast across
+        // the GEMMs that read the SAME input on the TC path (attn Q/K/V all read b.norm;
+        // FFN/shared-expert gate+up both read b.ffn_norm). With it on, only the FIRST GEMM
+        // of each group runs f32_to_f16 into act_f16; the rest reuse it (a_preconv=true).
+        // Byte-identical (same downcast bits, act_f16 untouched between the group's GEMMs,
+        // stream-ordered reuse) — removes 2 recast launches/attn layer + 1/FFN + 1/shared.
+        self.use_tc_sharea = std.posix.getenv("ZINC_BATCHED_TC_SHAREA") != null;
 
         const b = try self.ensureBatch(T);
 
@@ -884,9 +892,11 @@ pub const ForwardGemma = struct {
         // Batched pre-attention norm: one block per token.
         cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wan.gpu_buffer, &b.norm }, &rms, @sizeOf(RmsPush), 0);
         // Batched Q/K projections; V from Wv (SWA layers) else the raw K projection.
+        // Cycle 19: Q/K/V all read b.norm — Q recasts it to fp16 (act_f16) on the TC
+        // path; K/V reuse that recast (a_preconv) when ZINC_BATCHED_TC_SHAREA is set.
         self.gemmDispatch(&cmd, wq, &b.norm, &b.q, g.q_dim, d.n_embd, T);
-        self.gemmDispatch(&cmd, wk, &b.norm, &b.k, g.kv_dim, d.n_embd, T);
-        if (wv_opt) |wv| self.gemmDispatch(&cmd, wv, &b.norm, &b.v, g.kv_dim, d.n_embd, T);
+        self.gemmDispatchA(&cmd, wk, &b.norm, &b.k, g.kv_dim, d.n_embd, T, true);
+        if (wv_opt) |wv| self.gemmDispatchA(&cmd, wv, &b.norm, &b.v, g.kv_dim, d.n_embd, T, true);
 
         // Batched (grid.y = T) V normalize+KV-write and Q/K per-head norm+RoPE:
         // ONE launch each over all T tokens (token t at sequence position t),
@@ -946,8 +956,9 @@ pub const ForwardGemma = struct {
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wfn.gpu_buffer, &b.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
+        // Cycle 19: gate+up both read b.ffn_norm — up reuses gate's fp16 recast (shared-A).
         self.gemmDispatch(&cmd, wgate, &b.ffn_norm, &b.gate, d.n_ff, d.n_embd, T);
-        self.gemmDispatch(&cmd, wup, &b.ffn_norm, &b.up, d.n_ff, d.n_embd, T);
+        self.gemmDispatchA(&cmd, wup, &b.ffn_norm, &b.up, d.n_ff, d.n_embd, T, true);
         // GeGLU is element-wise over the whole [T, n_ff] tile.
         const sg = SwigluPush{ .N = T * d.n_ff };
         cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(T * d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate, &b.up, &b.geglu }, &sg, @sizeOf(SwigluPush), 0);
@@ -967,6 +978,17 @@ pub const ForwardGemma = struct {
     /// (q8_0/f32) falls back to a per-token dmmv loop (correctness-first). Buffers
     /// are token-major [T,K] (x) and [T,M] (y), contiguous (a_offset/x/y == 0).
     fn gemmDispatch(self: *ForwardGemma, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, T: u32) void {
+        self.gemmDispatchA(cmd, w, x, y, M, K, T, false);
+    }
+
+    /// As `gemmDispatch`, but `a_preconv=true` (cycle 19, only honored when
+    /// `use_tc_sharea`) signals that act_f16 ALREADY holds this GEMM's input x
+    /// downcast to fp16 — set by a PRECEDING gemmDispatch on the same command that
+    /// read the SAME x (e.g. attn K/V after Q; FFN up after gate). The redundant
+    /// f32_to_f16 recast is then skipped and the TC kernel reads the existing
+    /// act_f16. Byte-identical: x is unchanged and nothing writes act_f16 between
+    /// the group's GEMMs, so the staged half bits are bit-for-bit Q's/gate's.
+    fn gemmDispatchA(self: *ForwardGemma, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, T: u32, a_preconv: bool) void {
         const gi: ?usize = switch (w.info.type_) {
             .q4_k => 0,
             .q5_k => 1,
@@ -993,8 +1015,12 @@ pub const ForwardGemma = struct {
                 // SAME __float2half the TC kernel applied in shared → byte-for-byte
                 // identical output, just half the dominant A read traffic.
                 const a16 = &self.batch.?.act_f16;
-                const cvt = F32ToF16Push{ .N = T * K };
-                cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
+                // Cycle 19: skip the recast when a preceding same-x GEMM already
+                // filled act_f16 (shared-A) — byte-identical, one fewer launch+read.
+                if (!(a_preconv and self.use_tc_sharea)) {
+                    const cvt = F32ToF16Push{ .N = T * K };
+                    cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
+                }
                 // Cycle 15: DEFAULT to the 8 KB-shared lowsmem kernel (same 64×64
                 // grid/block as m64 but ~3x occupancy → +11.6%, byte-identical). The
                 // 24 KB m64 kernel (gemm_q4k_tc_f16a, cycle 12 default) is the A/B
@@ -1022,8 +1048,10 @@ pub const ForwardGemma = struct {
                 // (f32_to_f16 once → half-width A read). gemm_q6k_tc_f16a mirrors the
                 // f32 gemm_q6k_tiled_v2 dequant; fp16 rounding → token-correctness gate.
                 const a16 = &self.batch.?.act_f16;
-                const cvt = F32ToF16Push{ .N = T * K };
-                cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
+                if (!(a_preconv and self.use_tc_sharea)) { // cycle 19 shared-A (see Q4_K branch)
+                    const cvt = F32ToF16Push{ .N = T * K };
+                    cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
+                }
                 // Cycle 16: default to the proven 24 KB m64 Q6_K kernel (gemm_q6k_tc_f16a,
                 // cycle 13); ZINC_BATCHED_TC_Q6_LOWSMEM opts into the byte-identical 8 KB-shared
                 // lowsmem kernel (perf-neutral here — Q6_K is ~1/7 of the dense GEMM, below the
@@ -1377,8 +1405,9 @@ pub const ForwardGemma = struct {
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wfn.gpu_buffer, &b.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
+        // Cycle 19: shared-expert gate+up both read b.ffn_norm — up reuses gate's recast.
         self.gemmDispatch(&cmd, wgate, &b.ffn_norm, &b.gate, sf, d.n_embd, T);
-        self.gemmDispatch(&cmd, wup, &b.ffn_norm, &b.up, sf, d.n_embd, T);
+        self.gemmDispatchA(&cmd, wup, &b.ffn_norm, &b.up, sf, d.n_embd, T, true);
         const sg = SwigluPush{ .N = T * sf };
         cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(T * sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate, &b.up, &b.geglu }, &sg, @sizeOf(SwigluPush), 0);
         self.gemmDispatch(&cmd, wdown, &b.geglu, &b.shared, d.n_embd, sf, T);

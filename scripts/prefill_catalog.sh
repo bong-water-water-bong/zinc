@@ -59,7 +59,10 @@ case "$MODE" in
             [ "${ZINC_BATCHED_TC_M128_LOWSMEM:-0}" = "1" ] && S_ENV="$S_ENV ZINC_BATCHED_TC_M128_LOWSMEM=1"
             # Cycle 18: opt into token-GROUPED routed experts (byte-identical → GEN_IDS
             # must still match; this knob is for measuring the L2-reuse perf delta).
-            [ "${ZINC_BATCHED_EXPERTS_GROUPED:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_EXPERTS_GROUPED=1"; S_LABEL="$S_LABEL+grouped"; } ;;
+            [ "${ZINC_BATCHED_EXPERTS_GROUPED:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_EXPERTS_GROUPED=1"; S_LABEL="$S_LABEL+grouped"; }
+            # Cycle 19: share one f32→f16 activation recast across same-input GEMMs
+            # (byte-identical → GEN_IDS must still match; this knob measures the win).
+            [ "${ZINC_BATCHED_TC_SHAREA:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC_SHAREA=1"; S_LABEL="$S_LABEL+sharea"; } ;;
   *) echo "unknown ZINC_AB '$MODE' (want headskip|batched)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")/.." && pwd)
