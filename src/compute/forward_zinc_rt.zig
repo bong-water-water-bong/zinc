@@ -1521,6 +1521,7 @@ const ScalarDecodeState = struct {
     }
 
     fn beginDirectDecodeSlice(self: *ScalarDecodeState) void {
+        self.direct_router_row_range_done = false;
         self.direct_ssm_alpha_q8_row_range_done_mask = 0;
         self.direct_ssm_beta_q8_row_range_done_mask = 0;
         self.direct_ssm_alpha_q8_row_range_slice_successes = 0;
@@ -5056,6 +5057,32 @@ fn runGemma4MoeLayer(
 const direct_router_row_range_max_rows: u32 = 128;
 const direct_router_row_range_tolerance: f32 = 0.01;
 
+fn directRouterRowRangeOpName(tensor_type: gguf.GGMLType) []const u8 {
+    return switch (tensor_type) {
+        .f32 => "router_f32_row_range",
+        .q8_0 => "router_q8_0_row_range",
+        .q4_0 => "router_q4_0_row_range",
+        else => "router_unsupported_row_range",
+    };
+}
+
+fn directRouterRowBytes(tensor_type: gguf.GGMLType, cols: u32) usize {
+    return switch (tensor_type) {
+        .f32 => rowBytesForType(.f32, cols),
+        .q8_0 => rowBytesForType(.q8_0, cols),
+        .q4_0 => rowBytesForType(.q4_0, cols),
+        else => 0,
+    };
+}
+
+fn directRouterSupportsRowRange(tensor_type: gguf.GGMLType, cols: u32) bool {
+    return switch (tensor_type) {
+        .f32 => cols != 0 and cols % 64 == 0,
+        .q8_0, .q4_0 => cols != 0 and cols % 32 == 0,
+        else => false,
+    };
+}
+
 fn consumeDirectRouterRowRange(
     model: *const Model,
     state: *ScalarDecodeState,
@@ -5067,30 +5094,49 @@ fn consumeDirectRouterRowRange(
     const router_info = lt.ffn_gate_inp orelse return;
     const cfg = model.config;
     const cols: u32 = @intCast(state.ffn_norm.len);
-    if (cols == 0 or cols % 64 != 0) return;
-    if (router_info.type_ != .f32) return;
-    const router_raw = model.tensorData(router_info);
+    const router_w = model.requantOrRaw(router_info);
+    if (!directRouterSupportsRowRange(router_w.type_, cols)) return;
+    if (!canDotDirect(router_w.type_, cols)) return;
 
     const rows = @min(cfg.n_experts, direct_router_row_range_max_rows);
     const rows_usize: usize = @intCast(rows);
     if (rows == 0 or state.row_scratch.len < rows_usize * 2 or state.router_logits.len < rows_usize) return;
-    const row_bytes: usize = @as(usize, cols) * @sizeOf(f32);
+    const row_bytes = directRouterRowBytes(router_w.type_, cols);
+    if (row_bytes == 0) return;
     const total_bytes = @as(usize, rows) * row_bytes;
-    if (router_raw.len < total_bytes) return;
+    if (router_w.raw.len < total_bytes) return;
 
     const gpu_logits = state.row_scratch[0..rows_usize];
     const cpu_logits = state.row_scratch[rows_usize..][0..rows_usize];
-    matvecRawDirectSerial(router_raw, .f32, state.ffn_norm, null, 0, rows, cpu_logits) catch {
+    matvecRawDirectSerial(router_w.raw, router_w.type_, state.ffn_norm, null, 0, rows, cpu_logits) catch {
         return;
     };
-    tracking.boundary.dmmvF32RowRange(
-        state.ffn_norm,
-        router_raw[0..total_bytes],
-        rows,
-        cols,
-        gpu_logits,
-    ) catch |err| {
-        log.warn("M1 AMDGPU CS direct router row-range unavailable ({s}); router logits remain host-computed", .{@errorName(err)});
+    const direct_dispatch_result = switch (router_w.type_) {
+        .f32 => tracking.boundary.dmmvF32RowRange(
+            state.ffn_norm,
+            router_w.raw[0..total_bytes],
+            rows,
+            cols,
+            gpu_logits,
+        ),
+        .q8_0 => tracking.boundary.dmmvQ8_0RowRange(
+            state.ffn_norm,
+            router_w.raw[0..total_bytes],
+            rows,
+            cols,
+            gpu_logits,
+        ),
+        .q4_0 => tracking.boundary.dmmvQ4_0RowRange(
+            state.ffn_norm,
+            router_w.raw[0..total_bytes],
+            rows,
+            cols,
+            gpu_logits,
+        ),
+        else => unreachable,
+    };
+    direct_dispatch_result catch |err| {
+        log.warn("M1 AMDGPU CS direct router {s} row-range unavailable ({s}); router logits remain host-computed", .{ @tagName(router_w.type_), @errorName(err) });
         return;
     };
 
@@ -5125,8 +5171,9 @@ fn consumeDirectRouterRowRange(
     if (tracking.phase == .decode) {
         if (tracking.decode_model_slices) |slices| slices.* += 1;
     }
-    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=router_f32_row_range phase={s} rows={d} cols={d} max_abs_delta={d:.6} max_row={d}", .{
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase={s} rows={d} cols={d} max_abs_delta={d:.6} max_row={d} consumed_gpu_model_value=1", .{
         tracking.ops.*,
+        directRouterRowRangeOpName(router_w.type_),
         directComputePhaseName(tracking.phase),
         rows,
         cols,
