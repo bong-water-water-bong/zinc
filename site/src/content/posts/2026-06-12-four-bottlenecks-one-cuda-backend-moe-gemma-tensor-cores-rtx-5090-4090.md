@@ -46,7 +46,7 @@ faqs:
     answer: "On the dense Qwen3.5-9B it is ahead — about 104 tok/s versus llama.cpp's 97 on the same RTX 4090 and model file. Across the full five-model RTX 5090 catalog it averages about 59 percent of llama.cpp decode, up from 51 percent, with the Mixture-of-Experts models the furthest behind and improving fastest (2.3x to 5x). llama.cpp's MoE kernels are heavily tuned; closing that gap is the next chapter."
 excerpt: "ZINC's first NVIDIA post beat llama.cpp on one model by fixing one bottleneck. The catalog has five models, and they do not share a bottleneck. Dense decode was sync-bound. MoE was strangled by per-expert dispatch and a router round-trip. Gemma was launch-latency bound, where the async ring is a no-op and only kernel fusion helps. Prefill was dequant-bound, waiting on tensor cores. This is how four different walls fell — Qwen3.6-35B-A3B MoE 16 to 37 tok/s, Gemma-26B MoE 8 to 40 — on RTX 5090 and 4090."
 seoDescription: "How ZINC made its whole local-LLM catalog fast on NVIDIA RTX 5090/4090: batched MoE experts and an async router for Qwen3.6 and Gemma, kernel fusion for launch-latency-bound Gemma decode, and the fp16 tensor-core prefill lever — with verified tok/s versus llama.cpp."
-draft: true
+draft: false
 ---
 
 The [first NVIDIA post](/blog/2026-06-07-how-zinc-got-a-cuda-backend-and-beat-llama-cpp-decode-on-nvidia) ended on a clean number: Qwen3.5-9B decoding at ~104 tok/s on an RTX 4090, ahead of llama.cpp's 97. One model, one bottleneck — per-token sync gaps starving the GPU boost clock — and one fix, an async stream/event ring that removed sixty-four syncs per token.
