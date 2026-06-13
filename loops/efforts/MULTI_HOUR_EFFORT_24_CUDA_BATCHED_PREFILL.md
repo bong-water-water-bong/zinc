@@ -224,3 +224,40 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   active expert's Q4_K/Q5_1 weights — ~28 MB/token, the remaining per-token FFN cost — are read once per group,
   not once per token; needs a gather/scatter + variable-group GEMM, harder for byte-identity), or NVRTC `-I`
   fp16 tensor-core GEMM (+2.2× dense, NOT byte-identical → own tolerance gate).
+- **2026-06-13 — Cycle 7: batched router for gemma-26b MoE prefill (Phase 2 cycle 3) — output-identical + faster.**
+  Cycle 6 batched the Q8_0 shared-expert FFN; the routed-expert sub-block was still fully per-token, and EACH
+  token re-ran the router: rms_norm_noweight + per-channel scale + an **F32 `ffn_gate_inp` matvec (~2 MB/token,
+  re-read T times = ~500 MB at T=250)** + top-k softmax + its own command submit. This cycle BATCHES the router
+  over all T tokens — the F32 router weight is read ONCE and one fewer command submits per token (4→3 on the
+  prerouted path). Changes (all additive; decodeStep/moeFfnBlock/dense path untouched):
+    - 3 ADDITIVE kernels (kernels.cu): `gemm_f32_tiled_v2` (bit-faithful twin of gemm_q4k_tiled_v2 — 64×64 tile,
+      256 thr, 4×4 micro-tile, BK=32 — but NO dequant: stages the W tile straight from a row-major f32 weight;
+      the batched twin of looping dmmv_f32, token-correct not bit-exact, same class as the proven quant GEMMs),
+      `softmax_topk_batched` (verbatim softmax_topk over grid {T} — per-block routing math byte-for-byte the
+      single-token kernel's), `mul_vec_scaled_batched` (a[t*row+i]=a[t*row+i]·b[i]·scale, broadcasting the
+      per-channel ffn_gate_inp.scale across tokens).
+    - `gemm_f32` pipeline + `softmax_topk_batched`/`mul_vec_scaled_batched` pipes; `BatchScratch.router_in`
+      [T,n_embd] / `router_logits` [T,n_experts] / `router_table` [T,2·n_used] (sized 1 on the dense model).
+    - `routerBatched(L,T,b)`: norm→scale→gemm_f32 logits→softmax_topk_batched → b.router_table, async on the
+      shared stream (the per-token expert launches read the finished table by stream order — no host sync).
+      Mirrors moeRoutedCombine's router sub-block op-for-op (same residual input: all tokens' PRE-FFN hidden,
+      identical to the per-token path where each token routes before its own FFN residual add).
+    - `moeRoutedCombine(L, prerouted)`: when prerouted, SKIP the router sub-block (caller aliases
+      self.router_out_buf to b.router_table's row t); experts + combine unchanged. prefillBatched MoE branch
+      calls routerBatched ONCE/layer (only on the Q4_K-gate_up + Q5_1-down async expert path), then loops T ×
+      (alias router_table[t] → moeRoutedCombine(prerouted=true) + layerOutScale).
+  Built clean on the 4090 box (fresh source rsync, warm `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda
+  -Dshaders=false` EXIT=0 + ran, bin md5 0a080dd5 ≠ cycle 6's 11ac3da1). GATE — FULLY CLEARED:
+    - `prefill_catalog ZINC_AB=batched` (ABBA x2, 250-tok, 4090): GEN_IDS byte-identical —
+      **gemma4-26b 44.70 → 103.92 t/s (+132%)** (up from cycle 6's 81.5 t/s — the batched router added ~+27%
+      absolute on top of the batched shared expert), gemma4-31b dense 30.75 → 136.55 t/s (+344%, NO regression
+      — dense flow untouched).
+    - `ZINC_BATCHED=1 validate_catalog` (DIRECT batched gate, 4090): **5/5 PASS** — gemma4-26b MoE batched
+      free-runs **12/12** DIRECT vs llama.cpp (the batched-router prefill path is token-correct); gemma4-31b the
+      documented near-tie (free-run 2/12, teacher-forced 11/12, unchanged); qwen 12/12 (per-token fallback intact
+      → the product decode path is unregressed). Plain validate transitively covered (default path byte-unchanged).
+  Committed to perf/e24-batched-prefill, pushed (NOT main). NEXT (cycle 8): the routed gate_up/down expert GEMMs
+  are the last per-token FFN cost (~36 MB/token Q4_K/Q5_1) — token-GROUPED routing (build per-expert token lists
+  from b.router_table, expert-major grouped GEMM so each expert's weight is read once per group not once per
+  token; needs gather/scatter, harder for byte-identity), or NVRTC `-I` fp16 tensor-core GEMM (+2.2× dense, own
+  tolerance gate). b.router_table is now the device-side foundation a grouped-expert pass consumes.

@@ -79,6 +79,7 @@ const ArgmaxPush = extern struct { N: u32 };
 const TopkPush = extern struct { n_experts: u32, k: u32 };
 const MoeAccPush = extern struct { N: u32, n_used: u32, src_stride: u32 };
 const MulVecPush = extern struct { N: u32, scale: f32 };
+const MulVecBatchPush = extern struct { row: u32, total: u32, scale: f32 };
 const ZeroPush = extern struct { N: u32 };
 // Batched MoE expert matvec (one launch over all experts; ids read GPU-side).
 const ExpertsPush = extern struct { M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32, base: u32 = 0 };
@@ -158,14 +159,17 @@ const Pipelines = struct {
     argmax: CudaPipeline,
     // MoE (compiled unconditionally; dispatched only when n_experts>0)
     softmax_topk: CudaPipeline,
+    softmax_topk_batched: CudaPipeline, // gemma4-MoE prefill: top-k over all T tokens
     moe_weighted_acc: CudaPipeline,
     moe_weighted_acc_scaled: CudaPipeline, // batched MoE: folds down scale GPU-side
     mul_vec_scaled: CudaPipeline,
+    mul_vec_scaled_batched: CudaPipeline, // gemma4-MoE prefill router pre-scale (all T)
     zero_vec: CudaPipeline,
     dmmv_q4k_experts: CudaPipeline, // batched fused gate/up over all experts
     dmmv_q5_1_experts: CudaPipeline, // batched down over all experts
     // Effort 24: register-blocked prefill GEMMs (Q4_K / Q5_K / Q6_K / Q8_0 weights).
     gemm: [4]CudaPipeline,
+    gemm_f32: CudaPipeline, // f32-weight prefill GEMM (gemma4-MoE batched router)
 };
 
 /// Per-prompt batched activation scratch (Effort 24 batched prefill). Allocated
@@ -188,6 +192,10 @@ const BatchScratch = struct {
     geglu: CudaBuffer, // [T, ff_buf_max]
     down: CudaBuffer, // [T, n_embd]
     shared: CudaBuffer, // [T, n_embd] gemma4-MoE shared-expert output (post_ffw_norm_1)
+    // gemma4-MoE batched router (n_experts>0; size 1 on the dense model)
+    router_in: CudaBuffer, // [T, n_embd] plain-RMS-normed residual × ffn_gate_inp.scale
+    router_logits: CudaBuffer, // [T, n_experts] f32 router logits
+    router_table: CudaBuffer, // [T, 2*n_used] u32: per-token ids then weight-bits
 };
 
 pub const ForwardGemma = struct {
@@ -333,9 +341,11 @@ pub const ForwardGemma = struct {
         pipes.scalar_mul = try pipeline.createPipeline(ctx, src.ptr, "scalar_mul");
         pipes.argmax = try pipeline.createPipeline(ctx, src.ptr, "argmax");
         pipes.softmax_topk = try pipeline.createPipeline(ctx, src.ptr, "softmax_topk");
+        pipes.softmax_topk_batched = try pipeline.createPipeline(ctx, src.ptr, "softmax_topk_batched");
         pipes.moe_weighted_acc = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc");
         pipes.moe_weighted_acc_scaled = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc_scaled");
         pipes.mul_vec_scaled = try pipeline.createPipeline(ctx, src.ptr, "mul_vec_scaled");
+        pipes.mul_vec_scaled_batched = try pipeline.createPipeline(ctx, src.ptr, "mul_vec_scaled_batched");
         pipes.zero_vec = try pipeline.createPipeline(ctx, src.ptr, "zero_vec");
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
         pipes.dmmv_q5_1_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1_experts");
@@ -344,6 +354,7 @@ pub const ForwardGemma = struct {
         pipes.gemm[1] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tiled_v2");
         pipes.gemm[2] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tiled_v2");
         pipes.gemm[3] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tiled_v2");
+        pipes.gemm_f32 = try pipeline.createPipeline(ctx, src.ptr, "gemm_f32_tiled_v2");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
         const f4 = @sizeOf(f32);
@@ -610,34 +621,46 @@ pub const ForwardGemma = struct {
             // mirror the per-token path's `n_experts>0 && ffn_gate_inp present` test.
             const layer_is_moe = moe and self.model.getLayer(L, "ffn_gate_inp.weight") != null;
             if (layer_is_moe) {
-                // Phase-2 cycle 2: the Q8_0 shared-expert FFN is now BATCHED over
-                // all T tokens (gemm_q8_0_tiled_v2 reads each ~17.8 MB/token shared
-                // weight ONCE for the whole prompt) → b.shared. The routed experts +
-                // combine still loop per token (token-grouped routing is a later
-                // cycle); each token reads its precomputed shared output from
-                // b.shared. Both pieces are OUTPUT-IDENTICAL to the per-token path
-                // (sharedExpertBatched makes the same dmmv→GEMM swap as the proven
-                // dense ffnBlockBatched; moeRoutedCombine is moeFfnBlock minus its
-                // shared sub-block, same kernels/pushes).
+                // Phase-2 cycle 2: the Q8_0 shared-expert FFN is BATCHED over all T
+                // tokens (gemm_q8_0_tiled_v2 reads each ~17.8 MB/token shared weight
+                // ONCE) → b.shared. Phase-2 cycle 3: the router is ALSO batched —
+                // routerBatched computes all T tokens' top-k routing in one pass
+                // (the F32 ffn_gate_inp weight read once via gemm_f32_tiled_v2) into
+                // b.router_table; each token's moeRoutedCombine then reads its row
+                // (prerouted) instead of recomputing the router. The routed gate_up/
+                // down expert GEMMs still loop per token (token-grouped routing is a
+                // later cycle). All pieces are OUTPUT-IDENTICAL to the per-token path.
                 try self.sharedExpertBatched(L, T, b);
+                const wgu = self.layer(L, "ffn_gate_up_exps.weight");
+                const wde = self.layer(L, "ffn_down_exps.weight");
+                // Preroute only on the GPU-side async expert path (Q4_K gate_up +
+                // Q5_1 down); the host-readback fallback keeps its per-token router.
+                const pre = dmmvIdx(wgu.info.type_) == 0 and dmmvIdx(wde.info.type_) == 5;
+                if (pre) try self.routerBatched(L, T, b);
                 const saved_hidden = self.hidden;
                 const saved_shared = self.shared_buf;
+                const saved_router = self.router_out_buf;
+                const usz = @sizeOf(u32);
+                const rt_stride = 2 * d.n_experts_used;
                 var t: u32 = 0;
                 while (t < T) : (t += 1) {
                     // Point self.hidden / self.shared_buf at this token's slices of
                     // the batched streams. The launch captures the raw device ptr
                     // (cuLaunchKernel), so the alias wrappers are safe to free once
                     // moeRoutedCombine has recorded its dispatches — the slices' device
-                    // memory lives on in b.hidden / b.shared.
+                    // memory lives on in b.hidden / b.shared / b.router_table.
                     self.hidden = try buffer.aliasBuffer(&b.hidden, t * d.n_embd * f4, d.n_embd * f4);
                     self.shared_buf = try buffer.aliasBuffer(&b.shared, t * d.n_embd * f4, d.n_embd * f4);
-                    try self.moeRoutedCombine(L);
+                    if (pre) self.router_out_buf = try buffer.aliasBuffer(&b.router_table, t * rt_stride * usz, rt_stride * usz);
+                    try self.moeRoutedCombine(L, pre);
                     try self.layerOutScale(L); // MoE's final write is scale_accumulate → standalone scale
                     buffer.freeBuffer(&self.hidden);
                     buffer.freeBuffer(&self.shared_buf);
+                    if (pre) buffer.freeBuffer(&self.router_out_buf);
                 }
                 self.hidden = saved_hidden;
                 self.shared_buf = saved_shared;
+                self.router_out_buf = saved_router;
             } else {
                 try self.ffnBlockBatched(L, T, b);
                 // dense layer_output_scale is folded into the post-ffn norm+residual.
@@ -827,13 +850,16 @@ pub const ForwardGemma = struct {
             .geglu = try buffer.createBuffer(ctx, T * ff * f4),
             .down = try buffer.createBuffer(ctx, T * d.n_embd * f4),
             .shared = try buffer.createBuffer(ctx, T * d.n_embd * f4),
+            .router_in = try buffer.createBuffer(ctx, T * d.n_embd * f4),
+            .router_logits = try buffer.createBuffer(ctx, T * @max(@as(u32, 1), d.n_experts) * f4),
+            .router_table = try buffer.createBuffer(ctx, T * @max(@as(u32, 1), 2 * d.n_experts_used) * @sizeOf(u32)),
         };
         return &self.batch.?;
     }
 
     fn freeBatch(self: *ForwardGemma) void {
         if (self.batch) |*bb| {
-            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared }) |buf| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table }) |buf| {
                 buffer.freeBuffer(buf);
             }
             self.batch = null;
@@ -1121,6 +1147,40 @@ pub const ForwardGemma = struct {
         cmd.commitAndWait();
     }
 
+    /// Batched gemma4-MoE router over all T tokens → b.router_table[T, 2*n_used]
+    /// (per-token expert ids then renorm-softmax weight-bits). Computes the router
+    /// input (plain-RMS-norm of the residual × ffn_gate_inp.scale × 1/sqrt(n_embd))
+    /// for all T tokens, the F32 router logits via gemm_f32_tiled_v2 (the F32 router
+    /// weight read ONCE instead of T times), and the per-token top-k softmax in one
+    /// batched launch. Mirrors the per-token router sub-block of `moeRoutedCombine`
+    /// op-for-op — the only change is batching, so the routing it produces is the
+    /// per-token path's (token-correct; the F32 GEMM is the batched twin of looping
+    /// dmmv_f32, same class as the proven dense quant GEMMs). The per-token
+    /// `moeRoutedCombine(prerouted=true)` then reads its row of b.router_table.
+    fn routerBatched(self: *ForwardGemma, L: u32, T: u32, b: *BatchScratch) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [n_embd, n_experts] F32
+        const wrscale = self.layer(L, "ffn_gate_inp.scale"); // [n_embd] F32
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        // Plain-RMS-norm of each token's residual (no learnable weight), batched.
+        cmd.dispatch(&self.pipes.rms_norm_noweight, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &b.router_in }, &rms, @sizeOf(RmsPush), 0);
+        // Per-channel ffn_gate_inp.scale × 1/sqrt(n_embd), broadcast across tokens.
+        const mv = MulVecBatchPush{ .row = d.n_embd, .total = T * d.n_embd, .scale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(d.n_embd))) };
+        cmd.dispatch(&self.pipes.mul_vec_scaled_batched, .{ ceilDiv(T * d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.router_in, &wrscale.gpu_buffer }, &mv, @sizeOf(MulVecBatchPush), 0);
+        // Router logits [T, n_experts] = router_in[T, n_embd] · wrouter[n_experts, n_embd]^T.
+        const gp = GemmPush{ .M = d.n_experts, .K = d.n_embd, .T = T };
+        cmd.dispatch(&self.pipes.gemm_f32, .{ ceilDiv(d.n_experts, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &wrouter.gpu_buffer, &b.router_in, &b.router_logits }, &gp, @sizeOf(GemmPush), 0);
+        // Per-token top-k softmax → routing table (one block per token).
+        const tk = TopkPush{ .n_experts = d.n_experts, .k = d.n_experts_used };
+        cmd.dispatch(&self.pipes.softmax_topk_batched, .{ T, 1, 1 }, .{ 64, 1, 1 }, &.{ &b.router_logits, &b.router_table }, &tk, @sizeOf(TopkPush), 0);
+        // Async on the shared stream: the per-token expert launches that follow read
+        // the finished table by stream order (no host sync needed).
+        self.submit(cmd);
+    }
+
     /// gemma4-MoE routed-expert FFN + combine for ONE token, reading a pre-computed
     /// shared-expert output from `self.shared_buf`. This is exactly `moeFfnBlock`
     /// MINUS its shared-expert sub-block (now computed once for all T tokens by
@@ -1129,7 +1189,12 @@ pub const ForwardGemma = struct {
     /// `self.shared_buf` (aliased by the caller to this token's batched slices).
     /// The router/routed/combine kernels + push constants are identical to
     /// moeFfnBlock, so the per-token math is byte-for-byte the per-token path's.
-    fn moeRoutedCombine(self: *ForwardGemma, L: u32) !void {
+    ///
+    /// When `prerouted` is set (the batched prefill path), the per-token router
+    /// sub-block is SKIPPED: `routerBatched` has already computed all T tokens'
+    /// routing in one pass and the caller has aliased `self.router_out_buf` to this
+    /// token's row of the table, so the routed-expert launches read it as before.
+    fn moeRoutedCombine(self: *ForwardGemma, L: u32, prerouted: bool) !void {
         const d = self.d;
         const ctx = self.ctx;
         const n_used = d.n_experts_used;
@@ -1138,8 +1203,6 @@ pub const ForwardGemma = struct {
         const wpre2 = self.layer(L, "pre_ffw_norm_2.weight");
         const wpn2 = self.layer(L, "post_ffw_norm_2.weight");
         const wpost = self.layer(L, "post_ffw_norm.weight");
-        const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [n_embd, n_experts] F32
-        const wrscale = self.layer(L, "ffn_gate_inp.scale"); // [n_embd] F32
         const wgu = self.layer(L, "ffn_gate_up_exps.weight"); // [n_embd, 2*ef, n_experts]
         const wde = self.layer(L, "ffn_down_exps.weight"); // [ef, n_embd, n_experts]
 
@@ -1147,7 +1210,10 @@ pub const ForwardGemma = struct {
         const batched = dmmvIdx(wgu.info.type_) == 0 and dmmvIdx(wde.info.type_) == 5;
 
         // --- router logits + top-k softmax (computed from this token's hidden) ---
-        {
+        // Skipped when prerouted: routerBatched filled self.router_out_buf's row.
+        if (!prerouted) {
+            const wrouter = self.layer(L, "ffn_gate_inp.weight"); // [n_embd, n_experts] F32
+            const wrscale = self.layer(L, "ffn_gate_inp.scale"); // [n_embd] F32
             var cmd = try command.beginCommand(ctx);
             cmd.dispatch(&self.pipes.rms_norm_noweight, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
             const mv = MulVecPush{ .N = d.n_embd, .scale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(d.n_embd))) };
@@ -1161,20 +1227,21 @@ pub const ForwardGemma = struct {
                 cmd.commitAndWait(); // sync: the fallback host-gathers ids + folds the scale next
                 self.drainPending();
             }
-        }
 
-        // Fallback only: download ids+weights and fold the per-expert down scale into
-        // the weights host-side. The batched path folds it GPU-side (moe_weighted_acc_scaled).
-        if (!batched) {
-            buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
-            const scales = self.down_scales[L * d.n_experts ..][0..d.n_experts];
-            var j: u32 = 0;
-            while (j < n_used) : (j += 1) {
-                const id = self.host_router[j];
-                const w: f32 = @bitCast(self.host_router[n_used + j]);
-                self.host_router[n_used + j] = @bitCast(w * scales[id]);
+            // Fallback only: download ids+weights and fold the per-expert down scale
+            // into the weights host-side. The batched path folds it GPU-side
+            // (moe_weighted_acc_scaled). prerouted implies batched, so this never runs.
+            if (!batched) {
+                buffer.download(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
+                const scales = self.down_scales[L * d.n_experts ..][0..d.n_experts];
+                var j: u32 = 0;
+                while (j < n_used) : (j += 1) {
+                    const id = self.host_router[j];
+                    const w: f32 = @bitCast(self.host_router[n_used + j]);
+                    self.host_router[n_used + j] = @bitCast(w * scales[id]);
+                }
+                buffer.upload(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
             }
-            buffer.upload(ctx, &self.router_out_buf, std.mem.sliceAsBytes(self.host_router[0 .. 2 * n_used]));
         }
 
         // --- routed experts → moe_out_buf -----------------------------------

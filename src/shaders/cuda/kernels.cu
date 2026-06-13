@@ -506,6 +506,52 @@ extern "C" __global__ void softmax_topk(const float* logits, unsigned* out, Topk
     }
 }
 
+// ---- softmax_topk_batched (gemma4-MoE prefill router over all T tokens) ------
+// Verbatim twin of softmax_topk, batched over queries: block t (blockIdx.x) reads
+// its own logits row [t*n_experts ..] and writes its own out row [t*2k ..]. The
+// per-block winner-select / renorm-softmax math is byte-for-byte softmax_topk's,
+// so per-token routing is identical to the per-token path — just one launch over
+// all T tokens instead of T launches. Used by `routerBatched`.
+extern "C" __global__ void softmax_topk_batched(const float* logits, unsigned* out, TopkPush pc) {
+    __shared__ float s_logits[256];
+    __shared__ float s_val[64];
+    __shared__ unsigned s_idx[64];
+    const float NEG_INF = __int_as_float(0xff800000);
+    unsigned tid = threadIdx.x;
+    const float* lt = logits + (size_t)blockIdx.x * pc.n_experts;
+    unsigned* ot = out + (size_t)blockIdx.x * 2u * pc.k;
+    for (unsigned i = tid; i < pc.n_experts; i += 64) s_logits[i] = lt[i];
+    __syncthreads();
+    for (unsigned ki = 0; ki < pc.k; ki++) {
+        float best = NEG_INF; unsigned bidx = 0;
+        for (unsigned i = tid; i < pc.n_experts; i += 64)
+            if (s_logits[i] > best) { best = s_logits[i]; bidx = i; }
+        s_val[tid] = best; s_idx[tid] = bidx;
+        __syncthreads();
+        if (tid == 0) {
+            float gb = NEG_INF; unsigned gi = 0;
+            for (unsigned t = 0; t < 64; t++)
+                if (s_val[t] > gb) { gb = s_val[t]; gi = s_idx[t]; }
+            ot[ki] = gi;
+            ot[pc.k + ki] = __float_as_uint(gb);
+            s_logits[gi] = NEG_INF;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float maxl = NEG_INF;
+        for (unsigned i = 0; i < pc.k; i++) maxl = fmaxf(maxl, __uint_as_float(ot[pc.k + i]));
+        float wsum = 0.0f;
+        for (unsigned i = 0; i < pc.k; i++) {
+            float w = expf(__uint_as_float(ot[pc.k + i]) - maxl);
+            ot[pc.k + i] = __float_as_uint(w); wsum += w;
+        }
+        float inv = (wsum > 0.0f) ? 1.0f / wsum : 0.0f;
+        for (unsigned i = 0; i < pc.k; i++)
+            ot[pc.k + i] = __float_as_uint(__uint_as_float(ot[pc.k + i]) * inv);
+    }
+}
+
 // ---- rope (port of rope_fused.comp) -----------------------------------------
 // RoPE with partial rotation (IMRoPE): rotate first rope_dim dims/head in pairs,
 // copy the rest. freq from inv_freq buffer when freq_base_bits==0, else computed.
@@ -1456,6 +1502,51 @@ extern "C" __global__ void gemm_q8_0_tiled_v2(const unsigned char* a, const floa
             if(row<pc.M&&tok<pc.T){ unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row; if(pc.acc_mode!=0u) Y[yi]+=acc[i][j]; else Y[yi]=acc[i][j]; } } }
 }
 
+// ---- gemm_f32_tiled_v2 — register-blocked prefill GEMM for plain f32 weights --
+// Mirror of gemm_q4k_tiled_v2 (64x64 tile, 256 threads, 4x4 register micro-tile,
+// BK=32) with NO dequant — the W tile is staged straight from a row-major f32
+// weight [M, K] (W[row*K + k]). Same K-tile accumulation as the quant GEMMs, so
+// Y[T,M] = A[T,K]·W[M,K]^T is the batched twin of looping dmmv_f32 per token
+// (token-correct, not necessarily bit-identical — same class as the quant GEMMs).
+// Used by the gemma4-MoE batched router (ffn_gate_inp.weight is f32). pc.a_offset
+// is BYTES.
+extern "C" __global__ void gemm_f32_tiled_v2(const float* W, const float* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ float Ws[BK*BM]; __shared__ float As[BK*BT];
+    unsigned m0=blockIdx.x*BM, t0=blockIdx.y*BT, nchunk=(pc.K+31u)>>5;
+    unsigned tid=threadIdx.x, tx=tid&15u, ty=tid>>4;
+    const float* Wbase=W+(pc.a_offset>>2);
+    const float* Abase=A+(pc.x_offset>>2);
+    float acc[4][4];
+    #pragma unroll
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++) acc[i][j]=0.0f;
+    for(unsigned c=0;c<nchunk;c++){
+        #pragma unroll
+        for(int u=0;u<8;u++){ unsigned idx=tid+(unsigned)u*256u, r=idx>>5, l=idx&31u, row=m0+r, k=c*32u+l;
+            Ws[l*BM+r]=(row<pc.M && k<pc.K)?Wbase[(size_t)row*pc.K+k]:0.0f; }
+        #pragma unroll
+        for(int u=0;u<8;u++){ unsigned idx=tid+(unsigned)u*256u, t=idx>>5, l=idx&31u, tok=t0+t, k=c*32u+l;
+            As[l*BT+t]=(tok<pc.T && k<pc.K)?Abase[(size_t)tok*pc.K+k]:0.0f; }
+        __syncthreads();
+        #pragma unroll
+        for(unsigned kk=0;kk<BK;kk++){ float wr[4],ar[4];
+            #pragma unroll
+            for(int i=0;i<4;i++) wr[i]=Ws[kk*BM+ty*4u+(unsigned)i];
+            #pragma unroll
+            for(int j=0;j<4;j++) ar[j]=As[kk*BT+tx*4u+(unsigned)j];
+            #pragma unroll
+            for(int i=0;i<4;i++)
+                #pragma unroll
+                for(int j=0;j<4;j++) acc[i][j]+=wr[i]*ar[j]; }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int i=0;i<4;i++){ unsigned row=m0+ty*4u+(unsigned)i;
+        #pragma unroll
+        for(int j=0;j<4;j++){ unsigned tok=t0+tx*4u+(unsigned)j;
+            if(row<pc.M&&tok<pc.T){ unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row; if(pc.acc_mode!=0u) Y[yi]+=acc[i][j]; else Y[yi]=acc[i][j]; } } }
+}
+
 // ---- sigmoid_mul (qwen35 attention gate) — out[i] = a[i] * sigmoid(gate[i]) ---
 // ABI: inputs first, output last (matches swiglu). In-place safe (out may alias a).
 struct SigmoidMulPush { unsigned N; };
@@ -1622,6 +1713,17 @@ extern "C" __global__ void mul_vec_scaled(float* a, const float* b, MulVecPush p
     unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= pc.N) return;
     a[idx] = a[idx] * b[idx] * pc.scale;
+}
+
+// ---- mul_vec_scaled_batched (gemma4-MoE prefill router pre-scale, all T) ----
+// a[t*row + i] = a[t*row + i] * b[i] * scale over all T token rows. The per-channel
+// weight b (ffn_gate_inp.scale, length `row`=n_embd) is broadcast across tokens;
+// element math is byte-for-byte mul_vec_scaled's (a*b*scale). Used by routerBatched.
+struct MulVecBatchPush { unsigned row; unsigned total; float scale; };
+extern "C" __global__ void mul_vec_scaled_batched(float* a, const float* b, MulVecBatchPush pc) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pc.total) return;
+    a[idx] = a[idx] * b[idx % pc.row] * pc.scale;
 }
 
 // ---- zero_vec --------------------------------------------------------------
