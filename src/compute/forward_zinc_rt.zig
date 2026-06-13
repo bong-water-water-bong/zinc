@@ -1378,8 +1378,9 @@ const ScalarDecodeState = struct {
     direct_ssm_beta_q8_row_range_failed_mask: u128 = 0,
     direct_ssm_beta_q8_row_range_successes: u32 = 0,
     direct_ssm_beta_q8_row_range_slice_successes: u32 = 0,
-    direct_ssm_qkv_gate_q4_row_range_done: bool = false,
-    direct_ssm_qkv_gate_q4_row_range_failed: bool = false,
+    direct_ssm_qkv_gate_q4_row_range_done_mask: u128 = 0,
+    direct_ssm_qkv_gate_q4_row_range_failed_mask: u128 = 0,
+    direct_ssm_qkv_gate_q4_row_range_slice_successes: u32 = 0,
     direct_moe_gate_up_row_range_count: u32 = 0,
     direct_moe_down_row_range_count: u32 = 0,
     direct_shared_moe_down_row_range_done: bool = false,
@@ -1530,7 +1531,8 @@ const ScalarDecodeState = struct {
         self.direct_ssm_beta_q8_row_range_done_mask = 0;
         self.direct_ssm_alpha_q8_row_range_slice_successes = 0;
         self.direct_ssm_beta_q8_row_range_slice_successes = 0;
-        self.direct_ssm_qkv_gate_q4_row_range_done = false;
+        self.direct_ssm_qkv_gate_q4_row_range_done_mask = 0;
+        self.direct_ssm_qkv_gate_q4_row_range_slice_successes = 0;
         self.direct_moe_gate_up_row_range_count = 0;
         self.direct_moe_down_row_range_count = 0;
         self.direct_shared_moe_down_row_range_done = false;
@@ -3476,6 +3478,7 @@ fn runSsmLayer(
 
 const direct_ssm_qkv_gate_q4_0_tolerance: f32 = 0.05;
 const direct_ssm_qkv_gate_q4_0_range_rows: u32 = 64;
+const direct_ssm_qkv_gate_q4_0_max_successes_per_slice: u32 = 2;
 
 fn consumeDirectSsmQkvGateQ4_0RowRange(
     model: *const Model,
@@ -3486,7 +3489,9 @@ fn consumeDirectSsmQkvGateQ4_0RowRange(
 ) void {
     const tracking = maybe_tracking orelse return;
     if (tracking.phase != .decode) return;
-    if (state.direct_ssm_qkv_gate_q4_row_range_done or state.direct_ssm_qkv_gate_q4_row_range_failed) return;
+    if (state.direct_ssm_qkv_gate_q4_row_range_slice_successes >= direct_ssm_qkv_gate_q4_0_max_successes_per_slice) return;
+    if (directSsmLayerMaskContains(state.direct_ssm_qkv_gate_q4_row_range_done_mask, layer)) return;
+    if (directSsmLayerMaskContains(state.direct_ssm_qkv_gate_q4_row_range_failed_mask, layer)) return;
 
     const qkv_info = lt.attn_qkv orelse return;
     const gate_info = lt.attn_gate orelse return;
@@ -3512,7 +3517,7 @@ fn consumeDirectSsmQkvGateQ4_0RowRange(
         cols,
         gpu_rows,
     ) catch |err| {
-        state.direct_ssm_qkv_gate_q4_row_range_failed = true;
+        state.direct_ssm_qkv_gate_q4_row_range_failed_mask |= directSsmLayerBit(layer);
         log.warn("M1 AMDGPU CS direct SSM qkv/gate Q4_0 row ranges unavailable ({s}); qkv/gate remain host-computed", .{@errorName(err)});
         return;
     };
@@ -3525,7 +3530,7 @@ fn consumeDirectSsmQkvGateQ4_0RowRange(
         const qkv_gpu = gpu_rows[i];
         const gate_gpu = gpu_rows[rows_usize + i];
         if (!std.math.isFinite(qkv_gpu) or !std.math.isFinite(gate_gpu)) {
-            state.direct_ssm_qkv_gate_q4_row_range_failed = true;
+            state.direct_ssm_qkv_gate_q4_row_range_failed_mask |= directSsmLayerBit(layer);
             log.warn("M1 AMDGPU CS direct SSM qkv/gate Q4_0 row ranges produced non-finite row {d}; qkv/gate remain host-computed", .{i});
             return;
         }
@@ -3541,7 +3546,7 @@ fn consumeDirectSsmQkvGateQ4_0RowRange(
         }
     }
     if (max_qkv_delta > direct_ssm_qkv_gate_q4_0_tolerance or max_gate_delta > direct_ssm_qkv_gate_q4_0_tolerance) {
-        state.direct_ssm_qkv_gate_q4_row_range_failed = true;
+        state.direct_ssm_qkv_gate_q4_row_range_failed_mask |= directSsmLayerBit(layer);
         log.warn("M1 AMDGPU CS direct SSM qkv/gate Q4_0 row ranges mismatch: layer={d} qkv_delta={d:.6} qkv_row={d} gate_delta={d:.6} gate_row={d}; qkv/gate remain host-computed", .{
             layer,
             max_qkv_delta,
@@ -3554,7 +3559,8 @@ fn consumeDirectSsmQkvGateQ4_0RowRange(
 
     @memcpy(state.qkv[0..rows_usize], gpu_rows[0..rows_usize]);
     @memcpy(state.z[0..rows_usize], gpu_rows[rows_usize..][0..rows_usize]);
-    state.direct_ssm_qkv_gate_q4_row_range_done = true;
+    state.direct_ssm_qkv_gate_q4_row_range_done_mask |= directSsmLayerBit(layer);
+    state.direct_ssm_qkv_gate_q4_row_range_slice_successes += 1;
     tracking.ops.* += 2;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
@@ -8858,8 +8864,9 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     state.direct_ssm_alpha_q8_row_range_slice_successes = 2;
     state.direct_ssm_beta_q8_row_range_slice_successes = 2;
     state.direct_ssm_q8_row_range_trust_after_successes = 1;
-    state.direct_ssm_qkv_gate_q4_row_range_done = true;
-    state.direct_ssm_qkv_gate_q4_row_range_failed = true;
+    state.direct_ssm_qkv_gate_q4_row_range_done_mask = mask;
+    state.direct_ssm_qkv_gate_q4_row_range_failed_mask = directSsmLayerBit(4);
+    state.direct_ssm_qkv_gate_q4_row_range_slice_successes = direct_ssm_qkv_gate_q4_0_max_successes_per_slice;
     state.direct_moe_gate_up_row_range_count = direct_moe_gate_up_q4_0_max_expert_slots;
     state.direct_moe_down_row_range_count = direct_moe_down_q4_0_max_expert_slots;
     state.direct_shared_moe_down_row_range_done = true;
@@ -8880,8 +8887,9 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     try std.testing.expectEqual(@as(u32, 8), state.direct_ssm_beta_q8_row_range_successes);
     try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_alpha_q8_row_range_slice_successes);
     try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_beta_q8_row_range_slice_successes);
-    try std.testing.expect(!state.direct_ssm_qkv_gate_q4_row_range_done);
-    try std.testing.expect(state.direct_ssm_qkv_gate_q4_row_range_failed);
+    try std.testing.expectEqual(@as(u128, 0), state.direct_ssm_qkv_gate_q4_row_range_done_mask);
+    try std.testing.expectEqual(directSsmLayerBit(4), state.direct_ssm_qkv_gate_q4_row_range_failed_mask);
+    try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_qkv_gate_q4_row_range_slice_successes);
     try std.testing.expectEqual(@as(u32, 0), state.direct_moe_gate_up_row_range_count);
     try std.testing.expectEqual(@as(u32, 0), state.direct_moe_down_row_range_count);
     try std.testing.expect(!state.direct_shared_moe_down_row_range_done);
