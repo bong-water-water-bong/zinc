@@ -3299,7 +3299,7 @@ fn runSsmLayer(
         try matvecFusedTensors(state.pool, model, parts_buf[0..part_count], state.norm, state.row_scratch);
         var consumed_alpha = false;
         var consumed_beta = false;
-        if (direct_alpha and direct_beta and consumeDirectSsmAlphaBetaQ8_0RowRange(model, state, lt, layer, direct_compute_tracking)) {
+        if (direct_alpha and direct_beta and consumeDirectSsmAlphaBetaRowRange(model, state, lt, layer, direct_compute_tracking)) {
             consumed_alpha = true;
             consumed_beta = true;
         }
@@ -3520,6 +3520,35 @@ fn directSsmDispatchRowRange(
     };
 }
 
+fn directSsmDispatchTwoRowRanges(
+    boundary: *zinc_rt.cs.TokenBoundary,
+    tensor_type: gguf.GGMLType,
+    input: []const f32,
+    weights_a: []const u8,
+    rows_a: u32,
+    weights_b: []const u8,
+    rows_b: u32,
+    cols: u32,
+    output: []f32,
+) !bool {
+    switch (tensor_type) {
+        .f32 => {
+            try boundary.dmmvF32TwoRowRanges(input, weights_a, rows_a, weights_b, rows_b, cols, output);
+            return false;
+        },
+        .q8_0 => {
+            const use_parallel64 = rows_a + rows_b == 64;
+            if (use_parallel64) {
+                try boundary.dmmvQ8_0TwoRowRangesParallel64(input, weights_a, rows_a, weights_b, rows_b, cols, output);
+            } else {
+                try boundary.dmmvQ8_0TwoRowRanges(input, weights_a, rows_a, weights_b, rows_b, cols, output);
+            }
+            return use_parallel64;
+        },
+        else => return error.UnsupportedType,
+    }
+}
+
 fn directSsmAlphaQ8_0RowRangeRows(
     cfg: CpuModelConfig,
     state: *const ScalarDecodeState,
@@ -3673,7 +3702,17 @@ fn consumeDirectSsmAlphaQ8_0RowRange(
     return true;
 }
 
-fn consumeDirectSsmAlphaBetaQ8_0RowRange(
+fn directSsmAlphaBetaRowRangeOpName(tensor_type: gguf.GGMLType, used_parallel64: bool, trusted: bool) []const u8 {
+    return switch (tensor_type) {
+        .f32 => if (trusted) "ssm_alpha_beta_f32_row_range_trusted" else "ssm_alpha_beta_f32_row_range",
+        .q8_0 => if (used_parallel64)
+            if (trusted) "ssm_alpha_beta_q8_0_row_range_parallel64_trusted" else "ssm_alpha_beta_q8_0_row_range_parallel64"
+        else if (trusted) "ssm_alpha_beta_q8_0_row_range_trusted" else "ssm_alpha_beta_q8_0_row_range",
+        else => "ssm_alpha_beta_unsupported_row_range",
+    };
+}
+
+fn consumeDirectSsmAlphaBetaRowRange(
     model: *const Model,
     state: *ScalarDecodeState,
     lt: LayerTensors,
@@ -3692,12 +3731,15 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
 
     const alpha_info = lt.ssm_alpha orelse return false;
     const beta_info = lt.ssm_beta orelse return false;
-    if (alpha_info.type_ != .q8_0 or beta_info.type_ != .q8_0) return false;
+    if (alpha_info.type_ != beta_info.type_) return false;
+    const tensor_type = alpha_info.type_;
     const alpha_rows = directSsmAlphaQ8_0RowRangeRows(model.config, state, alpha_info);
     const beta_rows = directSsmBetaQ8_0RowRangeRows(model.config, state, beta_info);
     if (alpha_rows == 0 or beta_rows == 0) return false;
     const cols: u32 = @intCast(state.norm.len);
-    const row_bytes = rowBytesForType(.q8_0, cols);
+    const type_name = directSsmRowRangeTypeName(tensor_type);
+    const row_bytes = directSsmRowBytes(tensor_type, cols);
+    if (row_bytes == 0) return false;
     const alpha_bytes = @as(usize, alpha_rows) * row_bytes;
     const beta_bytes = @as(usize, beta_rows) * row_bytes;
     const alpha_raw = model.tensorData(alpha_info);
@@ -3708,7 +3750,7 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
     const total_rows_usize: usize = @intCast(total_rows);
     const alpha_rows_usize: usize = @intCast(alpha_rows);
     const beta_rows_usize: usize = @intCast(beta_rows);
-    const trusted_no_oracle = canTrustDirectSsmQ8_0RowRangeWithoutOracle(state);
+    const trusted_no_oracle = canTrustDirectSsmRowRangeWithoutOracle(state, tensor_type);
     const required_scratch_rows = if (trusted_no_oracle) total_rows_usize else total_rows_usize * 2;
     if (state.row_scratch.len < required_scratch_rows) return false;
     const gpu_out = state.row_scratch[0..total_rows_usize];
@@ -3716,42 +3758,28 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
         const cpu_out = state.row_scratch[total_rows_usize..][0..total_rows_usize];
         const cpu_alpha = cpu_out[0..alpha_rows_usize];
         const cpu_beta = cpu_out[alpha_rows_usize..][0..beta_rows_usize];
-        matvecRawDirectSerial(alpha_raw, .q8_0, state.norm, null, 0, alpha_rows, cpu_alpha) catch {
+        matvecRawDirectSerial(alpha_raw, tensor_type, state.norm, null, 0, alpha_rows, cpu_alpha) catch {
             return false;
         };
-        matvecRawDirectSerial(beta_raw, .q8_0, state.norm, null, 0, beta_rows, cpu_beta) catch {
+        matvecRawDirectSerial(beta_raw, tensor_type, state.norm, null, 0, beta_rows, cpu_beta) catch {
             return false;
         };
     }
 
-    const used_parallel64 = total_rows == 64;
-    if (used_parallel64) {
-        tracking.boundary.dmmvQ8_0TwoRowRangesParallel64(
-            state.norm,
-            alpha_raw[0..alpha_bytes],
-            alpha_rows,
-            beta_raw[0..beta_bytes],
-            beta_rows,
-            cols,
-            gpu_out,
-        ) catch |err| {
-            log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range parallel64 unavailable ({s}); alpha/beta remain host-computed", .{@errorName(err)});
-            return false;
-        };
-    } else {
-        tracking.boundary.dmmvQ8_0TwoRowRanges(
-            state.norm,
-            alpha_raw[0..alpha_bytes],
-            alpha_rows,
-            beta_raw[0..beta_bytes],
-            beta_rows,
-            cols,
-            gpu_out,
-        ) catch |err| {
-            log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range unavailable ({s}); alpha/beta remain host-computed", .{@errorName(err)});
-            return false;
-        };
-    }
+    const used_parallel64 = directSsmDispatchTwoRowRanges(
+        tracking.boundary,
+        tensor_type,
+        state.norm,
+        alpha_raw[0..alpha_bytes],
+        alpha_rows,
+        beta_raw[0..beta_bytes],
+        beta_rows,
+        cols,
+        gpu_out,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct SSM alpha/beta {s} row-range unavailable ({s}); alpha/beta remain host-computed", .{ type_name, @errorName(err) });
+        return false;
+    };
 
     var max_abs_delta: f32 = 0.0;
     var max_row: u32 = 0;
@@ -3759,14 +3787,14 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
     if (trusted_no_oracle) {
         for (gpu_out[0..alpha_rows_usize], 0..) |gpu_value, i| {
             if (!std.math.isFinite(gpu_value)) {
-                log.warn("M1 AMDGPU CS direct trusted SSM alpha/beta Q8_0 row-range produced non-finite alpha row {d}; alpha remains host-computed and beta may retry individually", .{i});
+                log.warn("M1 AMDGPU CS direct trusted SSM alpha/beta {s} row-range produced non-finite alpha row {d}; alpha remains host-computed and beta may retry individually", .{ type_name, i });
                 markDirectSsmQ8_0RowRangeFailed(state, layer, .alpha);
                 return false;
             }
         }
         for (gpu_out[alpha_rows_usize..][0..beta_rows_usize], 0..) |gpu_value, i| {
             if (!std.math.isFinite(gpu_value)) {
-                log.warn("M1 AMDGPU CS direct trusted SSM alpha/beta Q8_0 row-range produced non-finite beta row {d}; beta remains host-computed and alpha may retry individually", .{i});
+                log.warn("M1 AMDGPU CS direct trusted SSM alpha/beta {s} row-range produced non-finite beta row {d}; beta remains host-computed and alpha may retry individually", .{ type_name, i });
                 markDirectSsmQ8_0RowRangeFailed(state, layer, .beta);
                 return false;
             }
@@ -3777,7 +3805,7 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
         const cpu_beta = cpu_out[alpha_rows_usize..][0..beta_rows_usize];
         for (gpu_out[0..alpha_rows_usize], 0..) |gpu_value, i| {
             if (!std.math.isFinite(gpu_value)) {
-                log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range produced non-finite alpha row {d}; alpha remains host-computed and beta may retry individually", .{i});
+                log.warn("M1 AMDGPU CS direct SSM alpha/beta {s} row-range produced non-finite alpha row {d}; alpha remains host-computed and beta may retry individually", .{ type_name, i });
                 markDirectSsmQ8_0RowRangeFailed(state, layer, .alpha);
                 return false;
             }
@@ -3790,7 +3818,7 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
         }
         for (gpu_out[alpha_rows_usize..][0..beta_rows_usize], 0..) |gpu_value, i| {
             if (!std.math.isFinite(gpu_value)) {
-                log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range produced non-finite beta row {d}; beta remains host-computed and alpha may retry individually", .{i});
+                log.warn("M1 AMDGPU CS direct SSM alpha/beta {s} row-range produced non-finite beta row {d}; beta remains host-computed and alpha may retry individually", .{ type_name, i });
                 markDirectSsmQ8_0RowRangeFailed(state, layer, .beta);
                 return false;
             }
@@ -3804,7 +3832,8 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
         const tolerance = @min(direct_ssm_alpha_q8_0_row_range_tolerance, direct_ssm_beta_q8_0_row_range_tolerance);
         if (max_abs_delta > tolerance) {
             const kind_name = directSsmProjectionKindName(max_kind);
-            log.warn("M1 AMDGPU CS direct SSM alpha/beta Q8_0 row-range mismatch: layer={d} kind={s} rows={d} max_abs_delta={d:.6} row={d}; {s} remains host-computed and the other projection may retry individually", .{
+            log.warn("M1 AMDGPU CS direct SSM alpha/beta {s} row-range mismatch: layer={d} kind={s} rows={d} max_abs_delta={d:.6} row={d}; {s} remains host-computed and the other projection may retry individually", .{
+                type_name,
                 layer,
                 kind_name,
                 total_rows,
@@ -3830,10 +3859,11 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
     tracking.consumed.* = true;
     tracking.real_model_slice.* = true;
     if (tracking.decode_model_slices) |slices| slices.* += 2;
+    const op_name = directSsmAlphaBetaRowRangeOpName(tensor_type, used_parallel64, trusted_no_oracle);
     if (trusted_no_oracle) {
         log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase=decode layer={d} alpha_rows={d} beta_rows={d} cols={d} trust_after_successes={d} validation=finite_only", .{
             tracking.ops.*,
-            if (used_parallel64) "ssm_alpha_beta_q8_0_row_range_parallel64_trusted" else "ssm_alpha_beta_q8_0_row_range_trusted",
+            op_name,
             layer,
             alpha_rows,
             beta_rows,
@@ -3843,7 +3873,7 @@ fn consumeDirectSsmAlphaBetaQ8_0RowRange(
     } else {
         log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase=decode layer={d} alpha_rows={d} beta_rows={d} cols={d} max_abs_delta={d:.6} max_kind={s} max_row={d}", .{
             tracking.ops.*,
-            if (used_parallel64) "ssm_alpha_beta_q8_0_row_range_parallel64" else "ssm_alpha_beta_q8_0_row_range",
+            op_name,
             layer,
             alpha_rows,
             beta_rows,
