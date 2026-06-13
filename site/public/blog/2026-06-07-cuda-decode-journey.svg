@@ -64,13 +64,13 @@
 
       <!-- bar 3: async ring ~104 -> 676px (crosses 630) -->
       <rect x="0" y="214" width="676" height="58" rx="6" fill="url(#zinc)"/>
-      <text x="640" y="249" class="value">~104</text>
+      <text x="664" y="249" text-anchor="end" class="value">~104</text>
       <text x="-16" y="240" text-anchor="end" class="label">async stream / event ring</text>
       <text x="-16" y="260" text-anchor="end" class="sub">1 submit/token, holds full clock</text>
 
       <!-- bar 4: llama 97 -> 630px -->
       <rect x="0" y="314" width="630" height="58" rx="6" fill="url(#llama)"/>
-      <text x="594" y="349" class="value">97</text>
+      <text x="618" y="349" text-anchor="end" class="value">97</text>
       <text x="-16" y="340" text-anchor="end" class="label">llama.cpp CUDA</text>
       <text x="-16" y="360" text-anchor="end" class="sub">reference, same GGUF file</text>
     </g>
