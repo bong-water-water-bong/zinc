@@ -28,6 +28,11 @@
 #   ZINC_NGEN    gen tokens for GEN_IDS  (default 8)
 #   ZINC_ROUNDS  ABBA pairs per model    (default 2 -> 4 runs: B S S B)
 #   ZINC_ONLY    space list of names     (default all)
+#   ZINC_AB      which path to A/B vs baseline: headskip|batched (default headskip)
+#                  headskip -> ZINC_PREFILL_SKIP=1 (the merged LM-head-skip win)
+#                  batched  -> ZINC_BATCHED_PREFILL=1 (Effort 24 batched-GEMM
+#                              prefill; gemma dense only — qwen/MoE fall back to
+#                              per-token so the "S" path == baseline there)
 #   ZIG          zig binary              (default ~/zig-0.15.2/zig)
 set -u
 
@@ -42,6 +47,12 @@ PROMPT_LEN=${ZINC_PROMPT:-250}
 NGEN=${ZINC_NGEN:-8}
 ROUNDS=${ZINC_ROUNDS:-2}
 ONLY=${ZINC_ONLY:-}
+MODE=${ZINC_AB:-headskip}
+case "$MODE" in
+  headskip) S_ENV="ZINC_PREFILL_SKIP=1"; S_LABEL="headskip" ;;
+  batched)  S_ENV="ZINC_BATCHED_PREFILL=1"; S_LABEL="batched" ;;
+  *) echo "unknown ZINC_AB '$MODE' (want headskip|batched)"; exit 1 ;;
+esac
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 cd "$DIR" || { echo "no repo dir $DIR"; exit 1; }
 
@@ -66,7 +77,7 @@ pf_of() { sed -E 's/.* = ([0-9.]+) tok.*/\1/' <<<"$1"; }
 run_one() { # $1 = B|S -> echoes "<tok/s>|<GEN_IDS line>"
   local o
   if [ "$1" = "B" ]; then o=$(timeout 600 "$ZBIN" gen "$PROMPT" "$NGEN" "$2" 2>&1)
-  else o=$(ZINC_PREFILL_SKIP=1 timeout 600 "$ZBIN" gen "$PROMPT" "$NGEN" "$2" 2>&1); fi
+  else o=$(env $S_ENV timeout 600 "$ZBIN" gen "$PROMPT" "$NGEN" "$2" 2>&1); fi
   printf '%s|%s' "$(pf_of "$(grep -E 'PREFILL' <<<"$o" | tail -1)")" "$(grep -E 'GEN_IDS' <<<"$o" | tail -1)"
 }
 
@@ -74,8 +85,8 @@ fails=0
 for gpu in $GPUS; do
   uuid="${GPU_UUID[$gpu]:-}"; [ -n "$uuid" ] || { echo "unknown GPU '$gpu'"; continue; }
   export CUDA_VISIBLE_DEVICES="$uuid"
-  printf '\n=== RTX %s prefill tok/s  |  %s-tok prompt, head-skip vs baseline (ABBA x%s) ===\n' "$gpu" "$PROMPT_LEN" "$ROUNDS"
-  printf '  %-15s %10s %10s %7s   %s\n' "model" "baseline" "headskip" "gain" "correctness"
+  printf '\n=== RTX %s prefill tok/s  |  %s-tok prompt, %s vs baseline (ABBA x%s) ===\n' "$gpu" "$PROMPT_LEN" "$S_LABEL" "$ROUNDS"
+  printf '  %-15s %10s %10s %7s   %s\n' "model" "baseline" "$S_LABEL" "gain" "correctness"
   for i in "${!NAMES[@]}"; do
     nm="${NAMES[$i]}"; m="${PATHS[$i]}"
     [ -n "$ONLY" ] && ! grep -qw "$nm" <<<"$ONLY" && continue
@@ -97,6 +108,6 @@ for gpu in $GPUS; do
   done
 done
 echo ""
-[ "$fails" -eq 0 ] && echo "=== prefill_catalog: ALL PASS (head-skip output-preserving) ===" \
+[ "$fails" -eq 0 ] && echo "=== prefill_catalog: ALL PASS ($S_LABEL output-preserving) ===" \
                    || echo "=== prefill_catalog: $fails FAILURE(S) — DO NOT MERGE ==="
 exit "$fails"

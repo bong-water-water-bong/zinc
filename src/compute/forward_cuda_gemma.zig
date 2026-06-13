@@ -58,6 +58,14 @@ const GemmaAttnPush = extern struct {
     scale_bits: u32,
     window: u32,
 };
+const GemmaAttnBatchPush = extern struct {
+    head_dim: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    T: u32,
+    scale_bits: u32,
+    window: u32,
+};
 const RmsRopePush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, position: u32, dst_offset: u32 };
 const RmsKvWritePush = extern struct { head_dim: u32, eps: f32, dst_offset: u32 };
 const SwigluPush = extern struct { N: u32 };
@@ -138,6 +146,7 @@ const Pipelines = struct {
     dmmv_fast: [4]CudaPipeline,
     rope: CudaPipeline,
     gemma_attention: CudaPipeline,
+    gemma_attention_batched: CudaPipeline,
     geglu: CudaPipeline,
     scale_accumulate: CudaPipeline,
     scalar_mul: CudaPipeline,
@@ -310,6 +319,7 @@ pub const ForwardGemma = struct {
         pipes.dmmv_fast[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_fast");
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.gemma_attention = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention");
+        pipes.gemma_attention_batched = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention_batched");
         pipes.geglu = try pipeline.createPipeline(ctx, src.ptr, "geglu");
         pipes.scale_accumulate = try pipeline.createPipeline(ctx, src.ptr, "scale_accumulate");
         pipes.scalar_mul = try pipeline.createPipeline(ctx, src.ptr, "scalar_mul");
@@ -672,8 +682,6 @@ pub const ForwardGemma = struct {
             const v_base = if (wv_opt != null) &b.v else &b.k;
             var v_sl = try buffer.aliasBuffer(v_base, kv_off_t, g.kv_dim * f4);
             try aliases.append(self.allocator, v_sl);
-            var ao_sl = try buffer.aliasBuffer(&b.attn_out, q_off, g.q_dim * f4);
-            try aliases.append(self.allocator, ao_sl);
 
             const kv_off = pos * g.kv_dim; // element offset into the KV cache
             // V per-head plain-normalize fused with the V KV-cache write.
@@ -684,19 +692,22 @@ pub const ForwardGemma = struct {
             const nr_k = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = kv_off };
             cmd.dispatch(&self.pipes.rms_norm_rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &q_sl, &wqn.gpu_buffer, inv_freq, &q_sl }, &nr_q, @sizeOf(RmsRopePush), nr_sh);
             cmd.dispatch(&self.pipes.rms_norm_rope, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &k_sl, &wkn.gpu_buffer, inv_freq, &self.kv_k[L] }, &nr_k, @sizeOf(RmsRopePush), nr_sh);
-            // Causal (sliding-window on SWA) softmax attention for this query.
-            const seq_len = pos + 1;
-            const window: u32 = if (g.is_swa) d.sliding_window else 0;
-            const attn = GemmaAttnPush{
-                .head_dim = g.head_dim,
-                .n_heads = d.n_head,
-                .n_kv_heads = g.n_kv_head,
-                .seq_len = seq_len,
-                .scale_bits = @bitCast(@as(f32, 1.0)),
-                .window = window,
-            };
-            cmd.dispatch(&self.pipes.gemma_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &q_sl, &self.kv_k[L], &self.kv_v[L], &ao_sl }, &attn, @sizeOf(GemmaAttnPush), seq_len * 4);
         }
+
+        // Single batched causal (sliding-window on SWA) softmax attention over all
+        // T queries: grid=(n_head, T). Reads RoPE'd Q from b.q (token-major) and the
+        // prompt region [0..T) of the KV cache; writes b.attn_out (token-major).
+        // Replaces the T per-token gemma_attention launches; bit-identical math.
+        const window: u32 = if (g.is_swa) d.sliding_window else 0;
+        const attn = GemmaAttnBatchPush{
+            .head_dim = g.head_dim,
+            .n_heads = d.n_head,
+            .n_kv_heads = g.n_kv_head,
+            .T = T,
+            .scale_bits = @bitCast(@as(f32, 1.0)),
+            .window = window,
+        };
+        cmd.dispatch(&self.pipes.gemma_attention_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &b.attn_out }, &attn, @sizeOf(GemmaAttnBatchPush), T * 4);
 
         // Batched O projection then the fused post-attention norm + residual add.
         self.gemmDispatch(&cmd, wo, &b.attn_out, &b.o, d.n_embd, g.q_dim, T);

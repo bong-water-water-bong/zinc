@@ -83,3 +83,31 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   toggle off by default → cannot regress production). NEXT: target #2 batched
   causal-attention kernel (replace the per-token attention loop — the remaining
   per-token launch overhead) for a bigger T, then run the formal gate.
+- **2026-06-12 — Cycle 2: batched causal-attention kernel wired (target #2) — output-identical + faster.**
+  Added an ADDITIVE kernel `gemma_attention_batched` (kernels.cu) — a verbatim twin
+  of `gemma_attention` (same 3-pass softmax / GQA / sliding-window / no-sink / scale,
+  same `zinc_block_reduce_*` order → bit-identical math) but batched over queries:
+  block=(head=blockIdx.x, t=blockIdx.y), seq_len=t+1, token-major Q `q+(t*n_heads+head)*hd`
+  and out, SWA `start = (window>0 && seq_len>window) ? seq_len-window : 0`. Chose a NEW
+  gemma kernel over modifying main's just-landed `attention_causal_batched` (which carries
+  sink logic gemma doesn't use) — zero conflict + guaranteed bit-identity. Wired in
+  `attentionLayerBatched` (forward_cuda_gemma.zig): the per-token loop now does ONLY the
+  norm/RoPE/KV-write (Q RoPE'd in place into b.q, K/V into the cache); the T per-token
+  `gemma_attention` launches are REPLACED by ONE `gemma_attention_batched` launch
+  grid=(n_head,T) reading b.q + the prompt region [0..T) of kv_k/kv_v → b.attn_out
+  (shared mem = T*4). New `GemmaAttnBatchPush` + pipe `gemma_attention_batched`.
+  Extended `scripts/prefill_catalog.sh` ADDITIVELY: `ZINC_AB=headskip|batched` (default
+  headskip, unchanged) — batched mode A/Bs ZINC_BATCHED_PREFILL=1 vs baseline with the
+  same ABBA counterbalancing + GEN_IDS-identical gate. Built clean on the 4090 box
+  (fresh `.zig-cache`, EXIT=0, bin md5 dc54e7cd, CHANGED from cycle 1's 45251da3).
+  GATE (ABBA x2, 250-tok prompt, 4090):
+    - gemma4-31b dense: 31.43 → 94.12 t/s (+199%, ~3×), GEN_IDS byte-IDENTICAL ✓
+    - gemma4-26b MoE:   54.52 → 58.19 (+7% noise, per-token fallback) GEN_IDS identical ✓
+  Direct varied-output A/B (cyclic prompt → GEN 235,612,919,1471,218915,10205,…, not a
+  collapsed prompt): byte-identical, prefill 30.4→91.7 t/s. Cycle 1 was +133% (T=200);
+  the batched attention removed the per-token attn launch overhead → +199%. Committed to
+  perf/e24-batched-prefill (toggle off by default → cannot regress production). REMAINING
+  for merge: `scripts/validate_catalog.sh` 5/5 (per-token product path unchanged + batched
+  is byte-identical to it → transitively correct). NEXT (cycle 3): target #3 batched KV
+  write — fold the per-token norm/RoPE/KV-write loop into batched launches (kills the last
+  T per-token launches); then NVRTC `-I` tensor-core GEMM (+2.2×).

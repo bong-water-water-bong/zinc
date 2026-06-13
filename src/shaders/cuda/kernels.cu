@@ -1573,6 +1573,70 @@ extern "C" __global__ void gemma_attention(const float* q, const float* k, const
     }
 }
 
+// ---- gemma_attention_batched (Effort 24: batched prefill, gemma SWA/full) ----
+// Batched twin of gemma_attention: prefill runs all T prompt queries at once.
+// block (head=blockIdx.x, t=blockIdx.y) computes attention for query position t,
+// head h, causally masked to keys [0..t] with the SAME optional sliding-window
+// mask as gemma_attention (window>0 → last `window` keys). Q is token-major
+// [T, n_heads, head_dim] (post norm+RoPE in b.q); K/V are the prompt region of the
+// KV cache [T, n_kv_heads, head_dim] (positions 0..T-1, written per token). out is
+// token-major [T, n_heads, head_dim]. No sink (gemma). Math/reduction order are
+// byte-for-byte identical to gemma_attention with seq_len=t+1 → bit-identical out.
+struct GemmaAttnBatchPush { unsigned head_dim, n_heads, n_kv_heads, T, scale_bits, window; };
+extern "C" __global__ void gemma_attention_batched(const float* q, const float* k, const float* v,
+                                                   float* out, GemmaAttnBatchPush pc) {
+    extern __shared__ float s_scores[];           // size = T floats (max causal length)
+    __shared__ float s_m, s_inv;
+    unsigned head = blockIdx.x;
+    unsigned t = blockIdx.y;                       // query position
+    if (t >= pc.T) return;
+    unsigned seq_len = t + 1u;                     // causal: query t attends keys [0..t]
+    unsigned tid = threadIdx.x;
+    unsigned hd = pc.head_dim;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    const float* qh = q + ((size_t)t * pc.n_heads + head) * hd;   // query t, head h
+    float scale = pc.scale_bits != 0u ? __uint_as_float(pc.scale_bits) : rsqrtf((float)hd);
+
+    // sliding-window start: identical to gemma_attention for this query's seq_len.
+    unsigned start = 0;
+    if (pc.window != 0u && seq_len > pc.window) start = seq_len - pc.window;
+
+    // Pass 1: scores = scale * (q . k_i), track max.
+    float lmax = -3.4e38f;
+    for (unsigned i = start + tid; i < seq_len; i += blockDim.x) {
+        const float* ki = k + ((size_t)i * pc.n_kv_heads + kv_head) * hd;
+        float dot = 0.0f;
+        for (unsigned d = 0; d < hd; d++) dot += qh[d] * ki[d];
+        float score = dot * scale;
+        s_scores[i] = score;
+        lmax = fmaxf(lmax, score);
+    }
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0) s_m = lmax;
+    __syncthreads();
+    float m = s_m;
+
+    // Pass 2: e_i = exp(score_i - m), sum.
+    float lsum = 0.0f;
+    for (unsigned i = start + tid; i < seq_len; i += blockDim.x) {
+        float e = expf(s_scores[i] - m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0) s_inv = (lsum > 0.0f) ? 1.0f / lsum : 0.0f;
+    __syncthreads();
+    float inv = s_inv;
+
+    // Pass 3: out[t,head,d] = (sum_i e_i * V[i,d]) * inv.
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = start; i < seq_len; i++)
+            acc += s_scores[i] * v[((size_t)i * pc.n_kv_heads + kv_head) * hd + d];
+        out[((size_t)t * pc.n_heads + head) * hd + d] = acc * inv;
+    }
+}
+
 // ---- deinterleave_qgate (qwen35 packed Q+gate projection) ----
 // wq outputs [2*head_dim] per head, laid out as [Q(head_dim) | gate(head_dim)]
 // interleaved across heads: [Q0,g0,Q1,g1,...]. Split into contiguous q_out and
