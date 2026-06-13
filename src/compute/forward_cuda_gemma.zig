@@ -216,6 +216,14 @@ const Pipelines = struct {
     // (Q6_K is ~1/7 of the dense GEMM → below the boost floor) → kept OPT-IN via
     // ZINC_BATCHED_TC_Q6_LOWSMEM; the proven m64 gemm_q6k_tc_f16a stays the default.
     gemm_q6k_tc_f16a_lowsmem: CudaPipeline,
+    // Effort 24 cycle 17: the SYNTHESIS of cycle 14 (wider 128x64 M-tile → grid.x = M/128
+    // halves the dominant f16-A re-read) and cycle 15 (low-shared two-phase Cs → high
+    // occupancy). Cycle 14's plain m128 was -11.8% ONLY because its 44 KB static shared
+    // capped occupancy at 1 block/SM; this kernel writes the 128x64 tile in FOUR phases
+    // reusing the dead Ws+As region → 12 KB static shared (vs 44 KB) → ~6 blocks/SM (same
+    // as the lowsmem default), so the halved A read should now pay off. Byte-identical to
+    // the m128/m64/lowsmem kernels (same wmma math; phases only reorder writes).
+    gemm_q4k_tc_f16a_m128_lowsmem: CudaPipeline,
     f32_to_f16: CudaPipeline, // element-wise activation downcast for the TC f16-A path
 };
 
@@ -319,6 +327,7 @@ pub const ForwardGemma = struct {
     use_tc_m128: bool = false, // cycle 14 A/B: ZINC_BATCHED_TC_M128 opts into the wider 128x64 Q4_K TC kernel (NEGATIVE: -11.8%, off by default)
     use_tc_m64: bool = false, // cycle 15 A/B: ZINC_BATCHED_TC_M64 kill-switch forces the prior 24 KB-shared Q4_K TC kernel (cycle 12 default); the new default is the 8 KB-shared lowsmem kernel (+11.6%, byte-identical)
     use_tc_q6_lowsmem: bool = false, // cycle 16 A/B: ZINC_BATCHED_TC_Q6_LOWSMEM opts INTO the 8 KB-shared lowsmem Q6_K TC kernel (gemm_q6k_tc_f16a_lowsmem). Byte-identical to the default 24 KB m64 Q6_K kernel but in-noise on perf (Q6_K is ~1/7 of the dense GEMM → its occupancy win is below the box's boost floor; 2 ABBA runs nominally -1/-5%) → kept OPT-IN, the proven m64 kernel stays the default.
+    use_tc_m128_lowsmem: bool = false, // cycle 17 A/B: ZINC_BATCHED_TC_M128_LOWSMEM opts INTO the 12 KB-shared wider 128x64 M-tile Q4_K TC kernel (gemm_q4k_tc_f16a_m128_lowsmem) — synthesis of cycle 14's wider tile (halves the dominant f16-A read) + cycle 15's two-phase Cs (12 KB shared → ~6 blocks/SM, NOT m128's 44 KB→1 block/SM that lost -11.8%). Byte-identical to the m64/lowsmem default; measured this cycle to decide if it becomes the default.
 
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardGemma {
         const ctx = model.ctx;
@@ -431,6 +440,7 @@ pub const ForwardGemma = struct {
         pipes.gemm_q4k_tc_f16a_m128 = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a_m128");
         pipes.gemm_q4k_tc_f16a_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a_lowsmem");
         pipes.gemm_q6k_tc_f16a_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_f16a_lowsmem");
+        pipes.gemm_q4k_tc_f16a_m128_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a_m128_lowsmem");
         pipes.f32_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "f32_to_f16");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
@@ -711,6 +721,12 @@ pub const ForwardGemma = struct {
         // below the box's ±10% boost floor (2 ABBA runs nominally -1%/-5%, ranges overlapping).
         // → kept OPT-IN; ZINC_BATCHED_TC_Q6_LOWSMEM opts into it, the proven m64 kernel stays default.
         self.use_tc_q6_lowsmem = std.posix.getenv("ZINC_BATCHED_TC_Q6_LOWSMEM") != null;
+        // Cycle 17: ZINC_BATCHED_TC_M128_LOWSMEM opts into the wider 128x64 M-tile Q4_K TC
+        // kernel that ALSO uses the low-shared two-phase Cs trick — the synthesis of cycle 14
+        // (halve the dominant f16-A re-read via grid.x=M/128) and cycle 15 (12 KB shared →
+        // ~6 blocks/SM, avoiding the 44 KB→1 block/SM occupancy collapse that made plain m128
+        // -11.8%). Byte-identical to the lowsmem default; if measured faster it becomes default.
+        self.use_tc_m128_lowsmem = std.posix.getenv("ZINC_BATCHED_TC_M128_LOWSMEM") != null;
 
         const b = try self.ensureBatch(T);
 
@@ -960,7 +976,12 @@ pub const ForwardGemma = struct {
                 // (gemm_q4k_tc_f16a_m128) halves the dominant f16-A re-read but its
                 // 44 KB shared caps occupancy at 1 block/SM → -11.8%; kept opt-in via
                 // ZINC_BATCHED_TC_M128. Both byte-identical to the lowsmem default.
-                if (self.use_tc_m128) {
+                if (self.use_tc_m128_lowsmem) {
+                    // Cycle 17: wider 128×64 M-tile (grid.x = M/128 → halved f16-A read)
+                    // WITH the low-shared two-phase Cs (12 KB → ~6 blocks/SM, not m128's
+                    // 1 block/SM). Byte-identical to the lowsmem default.
+                    cmd.dispatch(&self.pipes.gemm_q4k_tc_f16a_m128_lowsmem, .{ ceilDiv(M, 128), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
+                } else if (self.use_tc_m128) {
                     cmd.dispatch(&self.pipes.gemm_q4k_tc_f16a_m128, .{ ceilDiv(M, 128), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
                 } else if (self.use_tc_m64) {
                     cmd.dispatch(&self.pipes.gemm_q4k_tc_f16a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);

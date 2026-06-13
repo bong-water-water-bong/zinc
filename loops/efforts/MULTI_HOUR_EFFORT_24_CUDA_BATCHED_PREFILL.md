@@ -577,3 +577,52 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   layer so the TC GEMMs read pre-dequant'd half weights (kills the per-GEMM dequant = the OTHER half of the GEMM traffic,
   and unlike the Q6_K occupancy trick it attacks the dominant Q4_K share AND costs no occupancy); OR token-GROUPED routed
   experts (gather by expert, memory-traffic win beyond launch batching, harder byte-identity).
+- **2026-06-13 — Cycle 17: wider 128×64 M-tile + low-shared two-phase Cs Q4_K TC GEMM — byte-identical but NEGATIVE (−5–7%); kept OPT-IN, default unchanged.**
+  Synthesized cycle 14 (wider 128×64 M-tile → grid.x = M/128 HALVES the dominant f16-A re-read) with cycle 15 (low-shared
+  two-phase Cs → high occupancy) to test whether m128's halved-A-read win could be recovered now that its occupancy killer
+  is removable. Cycle 14's plain m128 was −11.8% ONLY because its 44 KB static shared capped occupancy at 1 block/SM; the
+  hypothesis: a 128×64 tile that writes its output in FOUR phases reusing the dead Ws+As region needs only 12 KB static
+  shared (vs 44 KB) → ~6 blocks/SM (the SAME as the m64 lowsmem default), so the halved A read should finally pay off.
+  Added an ADDITIVE kernel `gemm_q4k_tc_f16a_m128_lowsmem` (kernels.cu): `gemm_q4k_tc_f16a_m128` in every wmma respect
+  (same Q4_K dequant, same 16×16×16 fp16 schedule, fp32 accumulate, BM=128, 8 warps × 4 frags = 32 = all 8×4 output blocks,
+  even/odd M-block grouping) EXCEPT the 128×64 output is NOT held in a 32 KB float `Cs[BT*BM]` tile; instead the Cs stage
+  REUSES the (now-dead) `half Ws[128*32]`(8 KB)+`half As[32*64]`(4 KB) region and writes Y in FOUR phases of two 16-row
+  M-blocks each (phase p = rows 32p..32p+31 = even-group frag c_p ∪ odd-group frag c_p), each phase an 8 KB `float[BT*32]`
+  tile → total static shared = max(12 KB K-loop, 8 KB Cs) = **12 KB** (vs m128's 44 KB). Each Y element written exactly once;
+  the four phases REORDER writes only; wmma math + Q4_K unpack are IDENTICAL → output BYTE-FOR-BYTE the m128/m64/lowsmem
+  kernels' (syncs fence the smem reuse). Opt-in via `ZINC_BATCHED_TC_M128_LOWSMEM`; default TC path byte-for-byte cycle 15.
+  ADDITIVE everywhere (1 kernel + 1 pipeline + 1 bool + a dispatch branch); `ZINC_BATCHED_TC` itself off by default →
+  production unchanged. Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda -Dshaders=false`
+  EXIT=0, bin md5 cc8b175a ≠ cycle 16's 27d453a7; NVRTC compiled the new kernel at runtime). GATE — correctness CLEARED,
+  perf NEGATIVE:
+    - BYTE-IDENTITY (the kernel's core claim): direct A/B, ONE binary, m128_lowsmem vs lowsmem default — GEN_IDS IDENTICAL
+      on the collapsed 250-tok prompt (250,250,…) AND a VARIED non-collapsing prompt ((i*73+11)%251 → GEN 240017,…) across
+      runs each.
+    - `ZINC_BATCHED=1 ZINC_BATCHED_TC=1 ZINC_BATCHED_TC_M128_LOWSMEM=1 validate_catalog` (m128_lowsmem path DIRECT vs
+      llama.cpp, 4090): **5/5 PASS** — qwen35-9b/qwen36-27b/qwen36-35b-a3b/gemma4-26b all **12/12**; gemma4-31b the SAME
+      documented near-tie (free-run 2/12, teacher-forced 11/12) → no new divergence from the wider-tile kernel.
+    - PERF — NEGATIVE (the honest outcome): ABBA x2 ×2 independent runs (gemma-31b 250-tok, 4090, ONE binary): run 1
+      A=m128_lowsmem **156.8** vs B=lowsmem **166.1 (−5.6%)**; run 2 A **155.3** vs B **167.6 (−7.3%)**. Both runs AGREE in
+      direction AND magnitude (ranges barely/non-overlapping in run 2: A∈[152.3,158.7], B∈[157.9,174.5]) → a REAL mild
+      regression, NOT boost noise. ROOT CAUSE (the wider-tile hypothesis FALSIFIED a SECOND way): the 128×64 tile needs 4
+      fp32 accumulator fragments per warp (c0–c3) vs the 64×64 lowsmem default's 2 (c0,c1) → ~2× the accumulator REGISTERS,
+      which drops register-limited occupancy below the lowsmem default's — re-introducing the SAME latency-hiding loss that
+      killed cycle 14's m128 (which lost it via 44 KB SHARED). Freeing shared with the two-phase Cs did NOT help because the
+      binding occupancy limiter for the wider tile is REGISTERS, not shared; and cycle 12 already cut the activation read to
+      fp16, so the halved-A-read saving the wider tile buys is too small to cover the lost occupancy. So widening the M-tile
+      is occupancy-negative on this box via BOTH routes (shared in c14, registers here) — the 64×64 lowsmem tile is the sweet spot.
+  DECISION: since the effort's bar for a DEFAULT FLIP is a MEASURED faster increment (this is measurably SLOWER), kept the
+  proven cycle-15 lowsmem kernel as the DEFAULT and made the byte-identical m128_lowsmem kernel an ADDITIVE OPT-IN documented
+  experiment (`ZINC_BATCHED_TC_M128_LOWSMEM`), mirroring cycle 14/16's handling of negative/neutral results — so a future
+  cycle won't re-attempt M-tile widening and the default TC path stays byte-for-byte cycle 15 → cannot regress. Committed to
+  perf/e24-batched-prefill, pushed (NOT main; origin/main == c409e280, branch ahead at cycle 16 → no rebase). NOTE on the
+  perennial NEXT item, the **fp16 WEIGHT cache**: a traffic analysis this cycle argues it is NET-NEGATIVE for prefill TC and
+  should be deprioritized — each dense weight is used in exactly ONE GEMM per layer, so a "cache" gives NO cross-GEMM reuse;
+  the only redundancy is the in-GEMM dequant repeated grid.y≈4× (T/64), and replacing it with a pre-dequant'd fp16 weight
+  read grid.y× at 2 B/elem (vs Q4_K's ~0.56 B/elem) ROUGHLY DOUBLES total GEMM traffic on this already memory-bound kernel
+  (weight traffic 49→~232 MB for a 4096×5376 proj), almost certainly outweighing the saved dequant ALU. NEXT (cycle 18):
+  token-GROUPED routed experts (gather T tokens by expert so each active expert's Q4_K/Q5_1 weight is read once per group not
+  once per token — a genuine MEMORY-TRAFFIC win beyond launch batching, unlike the M-tile/weight-cache levers; needs a
+  gather/scatter from b.router_table and a variable-group GEMM, harder for byte-identity but the real remaining lever); OR
+  keep activations fp16 ACROSS the layer (have the norm/GeGLU producers emit fp16 so the per-GEMM f32→fp16 recast launch is
+  dropped — touches shared kernels, less additive).

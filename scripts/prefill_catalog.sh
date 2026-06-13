@@ -54,7 +54,9 @@ case "$MODE" in
             # Cycle 11: ZINC_BATCHED_TC=1 also routes dense Q4_K GEMMs through the
             # fp16 tensor-core kernel (NOT byte-identical → expect GEN_IDS may
             # differ; use validate_catalog as its gate, this is for perf only).
-            [ "${ZINC_BATCHED_TC:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC=1"; S_LABEL="batched+tc"; } ;;
+            [ "${ZINC_BATCHED_TC:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC=1"; S_LABEL="batched+tc"; }
+            # Cycle 17: opt into the wider 128x64 M-tile low-shared Q4_K TC kernel.
+            [ "${ZINC_BATCHED_TC_M128_LOWSMEM:-0}" = "1" ] && S_ENV="$S_ENV ZINC_BATCHED_TC_M128_LOWSMEM=1" ;;
   *) echo "unknown ZINC_AB '$MODE' (want headskip|batched)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")/.." && pwd)

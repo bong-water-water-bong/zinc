@@ -91,6 +91,8 @@ for i in "${!NAMES[@]}"; do
   # the fp16 tensor-core kernel (gemm_q4k_tc). That path is NOT byte-identical
   # (fp16 input rounding) → this token-correctness check vs llama.cpp IS its gate.
   [ "${ZINC_BATCHED_TC:-0}" = "1" ] && [ -n "$zbatch" ] && zbatch="$zbatch ZINC_BATCHED_TC=1"
+  # Effort 24 cycle 17: opt into the wider 128x64 M-tile low-shared Q4_K TC kernel.
+  [ "${ZINC_BATCHED_TC_M128_LOWSMEM:-0}" = "1" ] && [ -n "$zbatch" ] && zbatch="$zbatch ZINC_BATCHED_TC_M128_LOWSMEM=1"
   zgen=$(env CUDA_VISIBLE_DEVICES=$GPU $zbatch "$ZBIN" gen "$pids" "$NGEN" "$m" 2>&1 | awk -F: '/GEN_IDS/{print $2}')
   IFS=',' read -ra L <<< "$lgen"; IFS=',' read -ra Z <<< "$zgen"
   match=0; for j in "${!L[@]}"; do [ "${L[$j]}" = "${Z[$j]:-x}" ] && match=$((match+1)) || break; done
