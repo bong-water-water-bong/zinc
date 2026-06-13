@@ -2283,11 +2283,11 @@ fn consumeDirectLogitsArgmaxRowRange(
 }
 
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
-// Use one wave64 direct LM-head prefix by default so an exercised decode token
+// Use a bounded direct LM-head prefix by default so an exercised decode token
 // can be selected from GPU-produced Q4_0 row scores while the remaining rows
-// still use the host-assisted fallback. This is two 64-row chunks submitted in
-// one CS batch, not a widened single-wave dispatch.
-const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 128;
+// still use the host-assisted fallback. This is four 64-row chunks submitted
+// in one CS batch, not a widened single-wave dispatch.
+const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 256;
 const direct_lm_head_q4_0_parallel_chunk_rows: u32 = 64;
 const direct_lm_head_q4_0_selected_window_rows: u32 = 64;
 const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 1536 * 1024;
