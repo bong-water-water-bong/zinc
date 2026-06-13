@@ -191,6 +191,15 @@ const Pipelines = struct {
     // Effort 24 cycle 13: same f16-A TC pattern extended to Q6_K weights (dense
     // gemma-31b's ffn_down etc.), which cycles 11/12 left on the f32 fallback.
     gemm_q6k_tc_f16a: CudaPipeline,
+    // Effort 24 cycle 14: wider 128x64 M-tile variant of gemm_q4k_tc_f16a. The
+    // f16-A activation is the dominant traffic and is re-read once per output
+    // M-block (grid.x = M/BM); BM=128 halves grid.x → halves that read. Output is
+    // byte-identical to gemm_q4k_tc_f16a (verified). NEGATIVE RESULT: the 44 KB
+    // static shared caps occupancy at 1 block/SM (vs m64's 24 KB → 2 blocks/SM),
+    // so the lost latency-hiding outweighs the saved A traffic — measured -11.8%
+    // on gemma-31b (ABBA x2, 4090). Kept OPT-IN behind ZINC_BATCHED_TC_M128 as a
+    // documented experiment; the TC path DEFAULTS to the proven 64x64 m64 kernel.
+    gemm_q4k_tc_f16a_m128: CudaPipeline,
     f32_to_f16: CudaPipeline, // element-wise activation downcast for the TC f16-A path
 };
 
@@ -291,6 +300,7 @@ pub const ForwardGemma = struct {
     use_tc: bool = false,
     use_tc_plain: bool = false, // cycle 12 A/B: force cycle-11 plain TC (no f16-A pre-convert)
     use_tc_q6: bool = true, // cycle 13 A/B: ZINC_BATCHED_TC_NOQ6 forces Q6_K back to f32 TC-off
+    use_tc_m128: bool = false, // cycle 14 A/B: ZINC_BATCHED_TC_M128 opts into the wider 128x64 Q4_K TC kernel (NEGATIVE: -11.8%, off by default)
 
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardGemma {
         const ctx = model.ctx;
@@ -400,6 +410,7 @@ pub const ForwardGemma = struct {
         pipes.gemm_q4k_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc");
         pipes.gemm_q4k_tc_f16a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a");
         pipes.gemm_q6k_tc_f16a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_f16a");
+        pipes.gemm_q4k_tc_f16a_m128 = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a_m128");
         pipes.f32_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "f32_to_f16");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
 
@@ -657,6 +668,12 @@ pub const ForwardGemma = struct {
         // isolation (= cycle-12 behavior: Q4_K on TC, Q6_K on f32). Unset → Q6_K
         // also runs the fp16 TC f16-A kernel (cycle 13 default).
         self.use_tc_q6 = std.posix.getenv("ZINC_BATCHED_TC_NOQ6") == null;
+        // Cycle 14 A/B knob: ZINC_BATCHED_TC_M128 opts INTO the wider 128x64 Q4_K
+        // TC kernel (gemm_q4k_tc_f16a_m128). It halves the dominant f16-A re-read
+        // (grid.x = M/128 vs M/64) but its 44 KB static shared caps occupancy at 1
+        // block/SM → NEGATIVE: -11.8% on gemma-31b (ABBA x2, 4090). Default unset →
+        // the proven 64x64 gemm_q4k_tc_f16a (cycle 12). plain-TC (A/B above) overrides.
+        self.use_tc_m128 = std.posix.getenv("ZINC_BATCHED_TC_M128") != null;
 
         const b = try self.ensureBatch(T);
 
@@ -899,7 +916,16 @@ pub const ForwardGemma = struct {
                 const a16 = &self.batch.?.act_f16;
                 const cvt = F32ToF16Push{ .N = T * K };
                 cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
-                cmd.dispatch(&self.pipes.gemm_q4k_tc_f16a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
+                // Cycle 14: DEFAULT to the proven 64×64 f16a kernel. The wider 128×64
+                // M-tile (gemm_q4k_tc_f16a_m128) reads the dominant f16-A once per
+                // output M-block so doubling BM halves grid.x → halves that read, and
+                // is byte-identical — but its 44 KB shared caps occupancy at 1 block/SM
+                // → measured -11.8% on gemma-31b. Kept opt-in via ZINC_BATCHED_TC_M128.
+                if (self.use_tc_m128) {
+                    cmd.dispatch(&self.pipes.gemm_q4k_tc_f16a_m128, .{ ceilDiv(M, 128), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
+                } else {
+                    cmd.dispatch(&self.pipes.gemm_q4k_tc_f16a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, a16, y }, &push, @sizeOf(GemmPush), 0);
+                }
                 return;
             }
             if (self.use_tc and idx == 2 and self.use_tc_q6) {

@@ -1945,6 +1945,116 @@ extern "C" __global__ void gemm_q6k_tc_f16a(const unsigned char* a, const half* 
     }
 }
 
+// ---- gemm_q4k_tc_f16a_m128 — wider 128x64 M-tile TC Q4_K GEMM (cycle 14) -------
+// gemm_q4k_tc_f16a in every respect (same Q4_K dequant, same wmma 16x16x16 fp16
+// schedule, fp32 accumulate, token-major Cs store + guarded copy, pre-converted
+// fp16 A read once) EXCEPT the output M-tile is 128 rows instead of 64, so a block
+// covers twice as many output rows per pass. Why: cycle 12 found the f32/fp16 A
+// activation re-read is the DOMINANT traffic of this memory-bound GEMM — A is read
+// once per output M-block (grid.x = M/BM). Doubling BM to 128 HALVES grid.x → halves
+// the dominant A traffic (weight bytes & dequant compute are unchanged: every row is
+// still dequant'd grid.y = T/64 times). 256 threads = 8 warps; each warp owns ONE
+// 16-token T-block (ft = warp&3) and FOUR 16-row M-blocks (fmbase = warp>>2 selects
+// the even {0,2,4,6} or odd {1,3,5,7} M-blocks) → 8 warps x 4 frags = 32 = all
+// 8x4 (m,t) 16x16 blocks of the 128x64 tile, covered once. Static shared = 8K Ws +
+// 4K As + 32K Cs = 44 KB (< 48 KB). Output byte-for-byte gemm_q4k_tc_f16a's (same
+// per-output dequant + wmma math, only the tiling/grid differ — verified identical
+// GEN_IDS on a varied prompt). fp16 → token-correct gate, like the other TC kernels.
+// NEGATIVE RESULT: the 44 KB static shared caps occupancy at 1 block/SM (vs m64's
+// 24 KB → 2 blocks/SM), so the lost latency-hiding outweighs the halved A read on
+// this memory-bound GEMM — measured -11.8% on gemma-31b (ABBA x2, 4090). So the TC
+// path DEFAULTS to the 64x64 gemm_q4k_tc_f16a; this kernel is kept as a documented
+// experiment, opt-in via ZINC_BATCHED_TC_M128.
+extern "C" __global__ void gemm_q4k_tc_f16a_m128(const unsigned* a_u32, const half* A, float* Y, GemmPush pc) {
+    const unsigned BM=128u, BT=64u, BK=32u;
+    __shared__ half Ws[BM*BK];   // m-major: Ws[r*BK + k]  (128 rows x 32)
+    __shared__ half As[BK*BT];   // k-major: As[k*BT + t]  (32 x 64 tokens)
+    __shared__ float Cs[BT*BM];  // token-major out tile: Cs[t*BM + m]  (64 x 128)
+    unsigned m0 = blockIdx.x*BM, t0 = blockIdx.y*BT;
+    unsigned bpr = pc.K >> 8;          // Q4_K superblocks per row (256 elems = 36 u32)
+    unsigned nchunk = pc.K >> 5;       // K/32 sub-blocks
+    unsigned tid = threadIdx.x;
+    unsigned a0 = (pc.a_offset >> 2);
+    const half* Abase = A + (pc.x_offset >> 1);   // x_offset in bytes → half elems
+    unsigned warp = tid >> 5;          // 0..7
+    unsigned fmbase = warp >> 2;       // 0 → M-blocks {0,2,4,6}, 1 → {1,3,5,7}
+    unsigned ft = warp & 3u;           // 0..3  (T-block)
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> c0, c1, c2, c3;
+    wmma::fill_fragment(c0, 0.0f);
+    wmma::fill_fragment(c1, 0.0f);
+    wmma::fill_fragment(c2, 0.0f);
+    wmma::fill_fragment(c3, 0.0f);
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        unsigned sbk = c >> 3, sb8 = c & 7u;
+        // dequant W sub-block (128 rows x 32 elems) into Ws (m-major) — identical
+        // Q4_K unpack to gemm_q4k_tc_f16a, 16 elems/thread for the 128-row tile.
+        #pragma unroll
+        for (int u = 0; u < 16; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;   // 0..4095
+            unsigned r = idx >> 5, l = idx & 31u;      // row 0..127, elem 0..31
+            unsigned row = m0 + r;
+            float wv = 0.0f;
+            if (row < pc.M) {
+                unsigned blk = a0 + row * bpr * 36u + sbk * 36u;
+                unsigned dd = a_u32[blk];
+                float d = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
+                float dmin = zinc_half_to_float((unsigned short)(dd >> 16));
+                const unsigned char* scales = (const unsigned char*)(a_u32 + blk + 1u);
+                const unsigned char* qs = (const unsigned char*)(a_u32 + blk + 4u);
+                unsigned char sc, mn; zinc_q4k_scale_min((int)sb8, scales, &sc, &mn);
+                unsigned char qb = qs[(sb8 >> 1) * 32u + l];
+                unsigned nib = (sb8 & 1u) == 0u ? (qb & 0xFu) : (unsigned)(qb >> 4);
+                wv = d * (float)sc * (float)nib - dmin * (float)mn;
+            }
+            Ws[r * BK + l] = __float2half(wv);
+        }
+        // stage A sub-block (64 tokens x 32 elems) into As (k-major) — A already fp16.
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;
+            unsigned t = idx >> 5, l = idx & 31u;
+            unsigned tok = t0 + t;
+            As[l * BT + t] = (tok < pc.T) ? Abase[(size_t)tok * pc.K + c * 32u + l] : __float2half(0.0f);
+        }
+        __syncthreads();
+        // two wmma k-steps over the 32-wide sub-block; 4 M-blocks per warp.
+        #pragma unroll
+        for (unsigned ks = 0; ks < 2; ks++) {
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a0f, a1f, a2f, a3f;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+            wmma::load_matrix_sync(a0f, &Ws[((fmbase + 0u) * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(a1f, &Ws[((fmbase + 2u) * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(a2f, &Ws[((fmbase + 4u) * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(a3f, &Ws[((fmbase + 6u) * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(bf, &As[(ks * 16u) * BT + ft * 16u], BT);
+            wmma::mma_sync(c0, a0f, bf, c0);
+            wmma::mma_sync(c1, a1f, bf, c1);
+            wmma::mma_sync(c2, a2f, bf, c2);
+            wmma::mma_sync(c3, a3f, bf, c3);
+        }
+        __syncthreads();
+    }
+    // store the 4 fragments (out[m][t]) col-major into the token-major Cs tile.
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + (fmbase + 0u) * 16u], c0, BM, wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + (fmbase + 2u) * 16u], c1, BM, wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + (fmbase + 4u) * 16u], c2, BM, wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + (fmbase + 6u) * 16u], c3, BM, wmma::mem_col_major);
+    __syncthreads();
+    // guarded copy Cs -> Y[T,M] (32 elems/thread over the 64x128 tile).
+    #pragma unroll
+    for (int u = 0; u < 32; u++) {
+        unsigned idx = tid + (unsigned)u * 256u;   // 0..8191
+        unsigned t = idx >> 7, m = idx & 127u;     // token 0..63, row 0..127
+        unsigned tok = t0 + t, row = m0 + m;
+        if (row < pc.M && tok < pc.T) {
+            unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row;
+            if (pc.acc_mode != 0u) Y[yi] += Cs[t * BM + m]; else Y[yi] = Cs[t * BM + m];
+        }
+    }
+}
+
 // ---- sigmoid_mul (qwen35 attention gate) — out[i] = a[i] * sigmoid(gate[i]) ---
 // ABI: inputs first, output last (matches swiglu). In-place safe (out may alias a).
 struct SigmoidMulPush { unsigned N; };

@@ -481,3 +481,29 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   bigger memory-traffic lever stays the fp16 WEIGHT cache — dequant Q4_K/Q6_K to fp16 ONCE per layer so the TC
   GEMMs read pre-dequant'd half weights (kills the per-GEMM dequant, the other half of the GEMM traffic); OR
   token-GROUPED routed experts (gather by expert, memory-traffic win beyond launch batching, harder byte-identity).
+- **2026-06-13 — Cycle 14: wider 128×64 M-tile TC GEMM to halve the dominant f16-A re-read — NEGATIVE RESULT (-11.8%, occupancy-limited); kept opt-in, default unchanged.**
+  Took cycle 12's diagnosis to its logical lever: the f16-A activation read DOMINATES this memory-bound TC GEMM
+  because `gemm_q4k_tc_f16a` re-reads A once per output M-block (grid.x = M/BM, BM=64). Widening the output M-tile
+  to 128 rows HALVES grid.x → halves that dominant A traffic (weight bytes & dequant compute unchanged). Added an
+  ADDITIVE kernel `gemm_q4k_tc_f16a_m128` (kernels.cu): `gemm_q4k_tc_f16a` in every respect (same Q4_K dequant, same
+  wmma 16×16×16 fp16 schedule, fp32 accumulate, token-major Cs store + guarded copy, pre-converted fp16 A read once)
+  EXCEPT BM=128 — 256 thr = 8 warps, each warp owns ONE 16-token T-block (`ft = warp&3`) and FOUR 16-row M-blocks
+  (`fmbase = warp>>2` → even {0,2,4,6} / odd {1,3,5,7}) = 8 warps × 4 frags = 32 = all 8×4 (m,t) 16×16 blocks of the
+  128×64 tile once; static shared 8K Ws + 4K As + 32K Cs = 44 KB. New pipeline + dispatch branch.
+  CORRECTNESS — byte-identical (verified): same per-output dequant + wmma math, only tiling/grid differ → output is
+  byte-for-byte `gemm_q4k_tc_f16a`'s. Direct A/B (gemma-31b, VARIED non-collapsing prompt, GEN 238066,240017,…):
+  m128 vs m64 GEN_IDS IDENTICAL ✓. PERF — NEGATIVE: ABBA x2 (gemma-31b 250-tok, 4090) m128(A) **145.96** vs m64(B)
+  **165.53 t/s = -11.8%** (consistent across all 8 runs: A∈[143.7,148.7], B∈[162.6,168.8] — not noise). ROOT CAUSE:
+  the 44 KB static shared caps occupancy at 1 block/SM (vs m64's 24 KB → 2 blocks/SM), so the lost latency-hiding
+  outweighs the halved A read on this memory-bound GEMM. Wider-tile hypothesis FALSIFIED.
+  OUTCOME: flipped the TC path DEFAULT back to the proven 64×64 `gemm_q4k_tc_f16a` (= cycle 12 behavior); the m128
+  kernel is kept as a DOCUMENTED experiment, opt-in via the renamed `ZINC_BATCHED_TC_M128` (was `ZINC_BATCHED_TC_M64`,
+  inverted) so a future cycle won't re-attempt it. ADDITIVE everywhere (1 kernel + 1 pipeline + 1 bool + a dispatch
+  branch); default TC path byte-for-byte cycle 12 → cannot regress. Built clean on the 4090 box (fresh `.zig-cache`,
+  `zig build cuda-dbg -Dbackend=cuda -Dshaders=false` EXIT=0, bin md5 a1b7e365 ≠ cycle 13's b97d310e; NVRTC compiled
+  the new kernel at runtime). GATE: `ZINC_BATCHED=1 ZINC_BATCHED_TC=1 validate_catalog` (default m64 TC path, 4090)
+  **5/5 PASS** — qwen35-9b/qwen36-27b/qwen36-35b-a3b/gemma4-26b all 12/12; gemma4-31b the documented near-tie
+  (teacher-forced 11/12, free-run 2/12), unchanged. Committed to perf/e24-batched-prefill, pushed (NOT main).
+  NEXT (cycle 15): the remaining big memory-traffic lever is the fp16 WEIGHT cache — dequant Q4_K/Q6_K → fp16 ONCE
+  per layer so the TC GEMMs read pre-dequant'd half weights (kills the per-GEMM dequant = the other half of the GEMM
+  traffic, and unlike the M-tile widening does NOT cost occupancy); OR token-GROUPED routed experts (gather by expert).
