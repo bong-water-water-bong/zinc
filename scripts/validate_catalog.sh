@@ -22,6 +22,12 @@ MD=${ZINC_MODELS:-$HOME/workspace/models}
 PROMPT=${ZINC_PROMPT:-The capital of France is}
 NGEN=${ZINC_NGEN:-12}
 MINMATCH=${ZINC_MINMATCH:-8}
+# Effort 24: ZINC_BATCHED=1 validates the BATCHED-GEMM prefill path DIRECTLY vs
+# llama.cpp (not just transitively) — it exports ZINC_BATCHED_PREFILL=1 for the
+# gemma models (ForwardGemma.prefillBatched), so the gemma rows confirm the
+# batched path is itself token-correct, not merely byte-identical to per-token.
+# qwen has no batched path (it internally falls back), so it is left per-token.
+BATCHED=${ZINC_BATCHED:-0}
 T=/tmp/zinc_validate; mkdir -p "$T"
 export CUDA_VISIBLE_DEVICES=$GPU
 LFLAGS="-I $LCPP/include -I $LCPP/ggml/include -L $LCPP/build/bin -lllama -lggml-base -Wl,-rpath,$LCPP/build/bin"
@@ -68,6 +74,7 @@ PATHS=(
   "$MD/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
 )
 
+[ "$BATCHED" = "1" ] && echo "=== BATCHED mode: gemma rows run ZINC_BATCHED_PREFILL=1 (direct batched-prefill gate) ==="
 echo "=== catalog token-for-token vs llama.cpp greedy (prompt: \"$PROMPT\", ngen $NGEN, min match $MINMATCH) ==="
 pass=0; tot=0
 for i in "${!NAMES[@]}"; do
@@ -77,7 +84,10 @@ for i in "${!NAMES[@]}"; do
   ref=$("$T/gen" "$m" "$PROMPT" "$NGEN" 2>/dev/null)
   pids=$(printf '%s\n' "$ref" | awk -F: '/PROMPT_IDS/{print $2}')
   lgen=$(printf '%s\n' "$ref" | awk -F: '/GEN_IDS/{print $2}')
-  zgen=$(CUDA_VISIBLE_DEVICES=$GPU "$ZBIN" gen "$pids" "$NGEN" "$m" 2>&1 | awk -F: '/GEN_IDS/{print $2}')
+  # Batched-prefill direct gate: only ForwardGemma has prefillBatched, so only
+  # the gemma rows get ZINC_BATCHED_PREFILL=1 (qwen would silently fall back).
+  zbatch=""; [ "$BATCHED" = "1" ] && [[ "$name" == gemma* ]] && zbatch="ZINC_BATCHED_PREFILL=1"
+  zgen=$(env CUDA_VISIBLE_DEVICES=$GPU $zbatch "$ZBIN" gen "$pids" "$NGEN" "$m" 2>&1 | awk -F: '/GEN_IDS/{print $2}')
   IFS=',' read -ra L <<< "$lgen"; IFS=',' read -ra Z <<< "$zgen"
   match=0; for j in "${!L[@]}"; do [ "${L[$j]}" = "${Z[$j]:-x}" ] && match=$((match+1)) || break; done
   note=""

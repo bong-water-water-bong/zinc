@@ -161,3 +161,32 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   batched-expert MoE FFN (route T tokens, group/scatter by expert — the remaining MoE
   per-token cost), NVRTC `-I` fp16 tensor-core GEMM (+2.2× on the dense GEMMs), or run the
   formal validate_catalog gate to clear merge.
+- **2026-06-12 — Cycle 5: FORMAL GATE CLEARED — batched prefill now validated DIRECTLY vs llama.cpp (5/5).**
+  The dense Phase-1 goal is COMPLETE (gemma-31b +363%/142 t/s, reproduced this cycle); the sole
+  remaining merge blocker in every prior log was `validate_catalog 5/5`, which only ever exercised
+  the per-token PRODUCT path (it never set `ZINC_BATCHED_PREFILL`), so the batched path was only
+  TRANSITIVELY validated ("product correct + batched byte-identical to it"). This cycle UPGRADES the
+  gate to DIRECT: extended `scripts/validate_catalog.sh` ADDITIVELY with `ZINC_BATCHED=1` — it exports
+  `ZINC_BATCHED_PREFILL=1` for the gemma rows only (ForwardGemma has `prefillBatched`; qwen would
+  silently fall back, so it's left per-token), so the gemma rows now confirm the BATCHED prefill path
+  is itself token-correct vs llama.cpp, not merely identical to per-token. Script-only change → the
+  compute path / binary is byte-for-byte cycle 4 (built clean at HEAD on the 4090 box, fresh
+  `.zig-cache`, `zig build cuda-dbg` EXIT=0; bin md5 f5025990, differs from cycle 4's f8cf047a only by
+  cross-machine link non-determinism — no `.zig` edit). GATE (4090, 250-tok):
+    - `validate_catalog` (plain, product per-token): **5/5 PASS** (qwen35-9b/qwen36-27b/qwen36-35b-a3b/
+      gemma4-26b all 12/12 free-run; gemma4-31b free-run 2/12 = the documented q8_1-reference near-tie
+      at pos 2 → teacher-forced 11/12 confirms correctness).
+    - `ZINC_BATCHED=1 validate_catalog` (DIRECT batched gate): **5/5 PASS** — gemma4-26b MoE batched
+      free-runs **12/12** directly vs llama.cpp; gemma4-31b batched yields the IDENTICAL first token
+      (same 2/12 near-tie + teacher-forced 11/12) → the batched prefill's first gen token == per-token's.
+    - `prefill_catalog ZINC_AB=batched` (perf + GEN_IDS identity): ALL 5 GEN_IDS byte-identical;
+      gemma4-31b dense **30.76 → 142.53 t/s (+363%)** (reproduces cycle 3/4's ~133/148); gemma4-26b MoE
+      53.71 → 44.83 (**−17% this run = BOOST NOISE**, output identical — the routed-expert FFN is still
+      per-token so the MoE gain is small/attention-only and swings ±17% on boost order; cf. cycle 4 saw
+      +14% on the same path); qwen +2–3% (per-token fallback, noise).
+  NET: the merge-gate CORRECTNESS bar is now MET both ways — the product path AND the batched path are
+  independently 5/5 token-correct vs llama.cpp, on top of the GEN_IDS byte-identity. The branch remains
+  WIP/unmerged (coordination: main moves fast; merge is a separate deliberate step), but it is no longer
+  blocked on validation. NEXT (cycle 6): full batched-expert MoE FFN (route/group T tokens by expert —
+  the remaining MoE per-token cost, to turn the noisy ±17% into a real MoE win), or NVRTC `-I` fp16
+  tensor-core GEMM (+2.2× on the dense GEMMs — note: NOT byte-identical, would need its own tolerance gate).
