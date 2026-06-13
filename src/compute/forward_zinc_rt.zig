@@ -1745,6 +1745,10 @@ fn generateScalarHybrid(
         log.info("M1 AMDGPU CS direct SSM QKV/gate Q4_0 row-range budget: {d} layers per tracked decode slice", .{
             direct_ssm_qkv_gate_q4_0_max_successes_per_slice,
         });
+        log.info("M1 AMDGPU CS direct MoE Q4_0 row-range budget: gate/up routed_slots={d}, down routed_slots={d}, shared_gate_up=1, shared_down=1", .{
+            direct_moe_gate_up_q4_0_max_expert_slots,
+            direct_moe_down_q4_0_max_expert_slots,
+        });
     }
 
     var generated: std.ArrayList(u32) = .{};
@@ -5395,7 +5399,7 @@ const direct_moe_gate_up_q4_0_range_rows: u32 = 64;
 const direct_moe_gate_up_q4_0_max_expert_slots: u32 = 2;
 const direct_moe_down_q4_0_tolerance: f32 = 0.05;
 const direct_moe_down_q4_0_range_rows: u32 = 64;
-const direct_moe_down_q4_0_max_expert_slots: u32 = 3;
+const direct_moe_down_q4_0_max_expert_slots: u32 = 4;
 
 fn runMoeExpertsParallel(
     state: *ScalarDecodeState,
