@@ -173,6 +173,12 @@ const DEFAULT_PROMPT = "The capital of France is";
 const DEFAULT_MAX_TOKENS = 96;
 const DEFAULT_LLAMA_CLI =
   nodeEnvValue(["LLAMA_CLI_REMOTE", "LLAMA_CLI"], ["ZINC_LLAMA_CLI_REMOTE", "ZINC_LLAMA_CLI"]) ?? null;
+const DEFAULT_VULKAN_DEVICE_INDEX = Number(
+  nodeEnvValue(
+    ["VULKAN_DEVICE_INDEX", "VULKAN_DEVICE"],
+    ["ZINC_VULKAN_DEVICE_INDEX", "ZINC_VULKAN_DEVICE"],
+  ) ?? "1",
+);
 const CLAUDE_MODEL = process.env.ZINC_CLAUDE_MODEL ?? "claude-opus-4-7[1m]";
 const CLAUDE_EFFORT = process.env.ZINC_CLAUDE_EFFORT ?? "max";
 const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
@@ -537,9 +543,20 @@ async function runOnce(
   prompt: string,
   maxTokens: number,
   envFlags: string,
+  extraArgs: string[] = [],
 ): Promise<{ exitCode: number; output: string }> {
   // flock serializes GPU access on the remote node.
-  const inner = `${envFlags} timeout 120 ${shellQuote(binary)} -m ${shellQuote(modelPath)} --prompt ${shellQuote(prompt)} --max-tokens ${maxTokens} 2>&1`;
+  const quotedExtraArgs = extraArgs.map(shellQuote).join(" ");
+  const inner = [
+    envFlags,
+    "timeout 120",
+    shellQuote(binary),
+    quotedExtraArgs,
+    "-m", shellQuote(modelPath),
+    "--prompt", shellQuote(prompt),
+    "--max-tokens", String(maxTokens),
+    "2>&1",
+  ].filter((part) => part.length > 0).join(" ");
   const wrapped = `cd ${shellQuote(REMOTE_ZINC_DIR)} && flock /tmp/zinc-gpu.lock -c ${shellQuote(inner)}`;
   const { stdout, stderr, exitCode } = await runCommand(
     "ssh",
@@ -579,6 +596,7 @@ async function benchmarkBinary(
   maxTokens: number,
   envFlags: string,
   runsPerBinary: number,
+  extraArgs: string[] = [],
 ): Promise<BenchmarkResult> {
   const decodeSamples: number[] = [];
   const prefillSamples: number[] = [];
@@ -593,7 +611,7 @@ async function benchmarkBinary(
   for (let i = 0; i < runsPerBinary; i++) {
     const tag = `[${i + 1}/${runsPerBinary}]`;
     process.stdout.write(clr("2", `    ${tag} ${binary.split("/").pop()}... `));
-    const res = await runOnce(binary, modelPath, prompt, maxTokens, envFlags);
+    const res = await runOnce(binary, modelPath, prompt, maxTokens, envFlags, extraArgs);
     lastOutput = res.output;
     lastExit = res.exitCode;
 
@@ -788,6 +806,7 @@ async function fullAB(
   maxTokens: number,
   runsPerBinary: number,
   comparisonTarget: ComparisonTarget,
+  vulkanDeviceIndex: number,
 ): Promise<ABBenchmark> {
   let vulkan: BenchmarkResult;
   if (comparisonTarget === "vulkan") {
@@ -820,6 +839,7 @@ async function fullAB(
         maxTokens,
         "RADV_PERFTEST=coop_matrix",
         runsPerBinary,
+        ["-d", String(vulkanDeviceIndex)],
       );
       vulkan.buildExitCode = vkBuild.exitCode;
       vulkan.buildOutput = vkBuild.output;
@@ -2255,6 +2275,7 @@ async function verifyCandidate(
   maxTokens: number,
   runsPerBinary: number,
   comparisonTarget: ComparisonTarget,
+  vulkanDeviceIndex: number,
 ): Promise<VerificationAttempt> {
   try {
     await rsyncToRemote();
@@ -2273,7 +2294,7 @@ async function verifyCandidate(
       };
     }
 
-    const after = await fullAB(modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget);
+    const after = await fullAB(modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget, vulkanDeviceIndex);
     console.log(clr("1;36", `  ${summariseAB("AFTER", after)}`));
 
     const failure = detectRepairableVerificationFailure(after);
@@ -2367,6 +2388,7 @@ async function runCycle(
   maxTokens: number,
   runsPerBinary: number,
   comparisonTarget: ComparisonTarget,
+  vulkanDeviceIndex: number,
 ): Promise<CycleResult> {
   const cycleNum = state.cycles.length + 1;
   const cycleDir = join(runDir, `cycle-${String(cycleNum).padStart(3, "0")}`);
@@ -2409,7 +2431,7 @@ async function runCycle(
 
   // Step 2: BEFORE A/B benchmark
   console.log(clr("1;33", "\n  📊 Baseline A/B benchmark"));
-  const before = await fullAB(modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget);
+  const before = await fullAB(modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget, vulkanDeviceIndex);
   state.phase = detectPhase(before);
   console.log(clr("1;36", `  ${summariseAB("BEFORE", before)} (phase=${state.phase})`));
   await writeCycleFile(cycleDir, "before.json", JSON.stringify(before, null, 2));
@@ -2480,7 +2502,7 @@ async function runCycle(
 
   // Step 6: Verify — rsync + test + A/B
   console.log(clr("1;33", "\n  📊 Verification A/B benchmark"));
-  let verification = await verifyCandidate(before, modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget);
+  let verification = await verifyCandidate(before, modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget, vulkanDeviceIndex);
   let after: ABBenchmark = verification.after;
   let verificationError: string | null = verification.verificationError;
 
@@ -2492,7 +2514,7 @@ async function runCycle(
     console.log(clr("1;33", `  ⚠ ${verification.repairFailure.kind}; asking agent to repair before reverting (${repairAttempt + 1}/${VERIFICATION_REPAIR_ATTEMPTS})`));
     await runRepairPass(agent, cycleDir, verification.repairFailure);
     console.log(clr("1;33", "\n  📊 Verification A/B benchmark after repair"));
-    verification = await verifyCandidate(before, modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget);
+    verification = await verifyCandidate(before, modelPath, prompt, maxTokens, runsPerBinary, comparisonTarget, vulkanDeviceIndex);
     after = verification.after;
     verificationError = verification.verificationError;
   }
@@ -2627,6 +2649,7 @@ type CliOptions = {
   prompt: string;
   maxTokens: number;
   runsPerBinary: number;
+  vulkanDeviceIndex: number;
   comparisonTarget: ComparisonTarget;
   dryRun: boolean;
   resumeDir?: string;
@@ -2643,6 +2666,7 @@ export function parseArgs(argv: string[]): CliOptions {
     prompt: DEFAULT_PROMPT,
     maxTokens: DEFAULT_MAX_TOKENS,
     runsPerBinary: 3,
+    vulkanDeviceIndex: DEFAULT_VULKAN_DEVICE_INDEX,
     comparisonTarget: "vulkan",
     dryRun: false,
     targetRatio: null,
@@ -2671,6 +2695,9 @@ export function parseArgs(argv: string[]): CliOptions {
         break;
       case "--runs-per-binary":
         opts.runsPerBinary = parseInt(argv[++i], 10);
+        break;
+      case "--vulkan-device":
+        opts.vulkanDeviceIndex = parseInt(argv[++i], 10);
         break;
       case "--baseline": {
         const baseline = argv[++i] as ComparisonTarget;
@@ -2718,6 +2745,8 @@ export function parseArgs(argv: string[]): CliOptions {
           "  --baseline <vulkan|llama>  Comparison target (default: vulkan)",
           "  --runs-per-binary N        Runs per backend per benchmark (default: 3,",
           "                             median used)",
+          "  --vulkan-device N          Vulkan physical-device index for the ZINC",
+          "                             Vulkan baseline (default: " + DEFAULT_VULKAN_DEVICE_INDEX + ")",
           "  --dry-run                  A/B benchmark only, no agent",
           "  --resume [dir]             Resume from .zinc_rt_autopilot/<runId>/",
           "                             Bare --resume resumes the latest run with state.json",
@@ -2797,6 +2826,9 @@ async function main() {
   console.log(`  Model:     ${clr("1", opts.modelPath)}`);
   console.log(`  Prompt:    ${clr("1", JSON.stringify(opts.prompt))}`);
   console.log(`  MaxTok:    ${opts.maxTokens}`);
+  if (opts.comparisonTarget === "vulkan") {
+    console.log(`  VkDevice:  ${opts.vulkanDeviceIndex}`);
+  }
   const agentDetail = opts.alternate
     ? `alternating (codex ${CODEX_MODEL}/${CODEX_REASONING_EFFORT} ↔ claude ${CLAUDE_MODEL}/${CLAUDE_EFFORT})`
     : opts.agent === "claude"
@@ -2849,7 +2881,7 @@ async function main() {
   if (opts.dryRun) {
     console.log(clr("1;33", "\n  DRY RUN: rsync + build + benchmark"));
     await rsyncToRemote();
-    const ab = await fullAB(opts.modelPath, opts.prompt, opts.maxTokens, opts.runsPerBinary, opts.comparisonTarget);
+    const ab = await fullAB(opts.modelPath, opts.prompt, opts.maxTokens, opts.runsPerBinary, opts.comparisonTarget, opts.vulkanDeviceIndex);
     console.log(clr("1;33", "\n  Result:"));
     console.log("  " + summariseAB("AB", ab));
     if (ab.ratio != null) {
@@ -2926,6 +2958,7 @@ async function main() {
       opts.maxTokens,
       opts.runsPerBinary,
       opts.comparisonTarget,
+      opts.vulkanDeviceIndex,
     );
     state.cycles.push(cycleResult);
 

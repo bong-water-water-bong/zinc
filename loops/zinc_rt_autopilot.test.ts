@@ -214,6 +214,18 @@ describe("zinc_rt autopilot CLI and baselines", () => {
     expect(args.targetRatio).toBe(1.03);
   });
 
+  test("parseArgs supports explicit Vulkan baseline device selection", () => {
+    const args = parseArgs([
+      "--baseline",
+      "vulkan",
+      "--vulkan-device",
+      "1",
+    ]);
+
+    expect(args.comparisonTarget).toBe("vulkan");
+    expect(args.vulkanDeviceIndex).toBe(1);
+  });
+
   test("parseLlamaCliTimings extracts prompt and decode throughput", () => {
     const parsed = parseLlamaCliTimings(`
 llama_print_timings: prompt eval time =   152.58 ms /    16 tokens (    9.54 ms per token,   104.87 tokens per second)
