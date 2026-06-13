@@ -507,3 +507,39 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   NEXT (cycle 15): the remaining big memory-traffic lever is the fp16 WEIGHT cache — dequant Q4_K/Q6_K → fp16 ONCE
   per layer so the TC GEMMs read pre-dequant'd half weights (kills the per-GEMM dequant = the other half of the GEMM
   traffic, and unlike the M-tile widening does NOT cost occupancy); OR token-GROUPED routed experts (gather by expert).
+- **2026-06-13 — Cycle 15: 8 KB-shared (lowsmem) Q4_K TC GEMM — POSITIVE (+8.9%/+11.6%), byte-identical, now the DEFAULT TC path.**
+  Cycle 14's m128 NEGATIVE result diagnosed this GEMM as OCCUPANCY-bound: 44 KB shared → 1 block/SM lost 11.8%, so
+  the lever is REDUCING shared (raise occupancy), not widening the M-tile. The proven 64×64 m64 kernel
+  (`gemm_q4k_tc_f16a`) uses 24 KB static shared, DOMINATED by the 16 KB float `Cs[BT*BM]` output stage (BM·BT·4) →
+  caps occupancy at 2 blocks/SM. This cycle adds an ADDITIVE kernel `gemm_q4k_tc_f16a_lowsmem` (kernels.cu): identical
+  Q4_K dequant + wmma 16×16×16 fp16 schedule + fp32 accumulate + pre-converted f16-A read once, but the Cs output
+  stage REUSES the (now-dead) Ws+As shared region after the K-loop and the 64×64 tile is stored to Y in TWO PHASES of
+  8 fragments each (phase 1 = c0 → M-tile rows 0..31, phase 2 = c1 → rows 32..63), each phase needing only an 8 KB
+  `float[BT*32]` tile. Total static shared = max(Ws+As = 8 KB during K-loop, Cs = 8 KB after) = **8 KB** → ~3× the m64
+  occupancy (thread-limited to 8 blocks/SM at 256 thr). Each Y element is written exactly once across the two phases;
+  the phase split only REORDERS writes, not values, and the wmma math/Q4_K unpack are IDENTICAL → output BYTE-FOR-BYTE
+  the m64 kernel's (proper `__syncthreads` fence the smem reuse: the K-loop's trailing sync fences Ws/As reads before
+  phase-1 store; a sync between each phase's store↔read↔next-store). DECISION: since byte-identical AND faster, FLIPPED
+  the default TC Q4_K path to lowsmem (m128 still opt-in `ZINC_BATCHED_TC_M128`; new A/B kill-switch
+  `ZINC_BATCHED_TC_M64` forces the prior 24 KB m64 kernel = cycle 12 behavior). ADDITIVE everywhere (1 kernel + 1
+  pipeline + 1 bool + a dispatch reorder); `ZINC_BATCHED_TC` itself is off by default → production unchanged. The Q6_K
+  TC kernel (`gemm_q6k_tc_f16a`, idx 2 ffn_down, ~1/7 of dense GEMM) is left on 24 KB — out of scope this cycle.
+  Built clean on the 4090 box (fresh `.zig-cache` first pass + warm rebuild, `zig build cuda-dbg -Dbackend=cuda
+  -Dshaders=false` EXIT=0, bin md5 82958578 ≠ cycle 14's a1b7e365; NVRTC compiled the new kernel at runtime). GATE —
+  FULLY CLEARED:
+    - BYTE-IDENTITY (lowsmem's core claim): direct ABBA, ONE binary, lowsmem vs m64 — GEN_IDS IDENTICAL on the seq
+      250-tok prompt (collapsed 250,250,…) AND a VARIED non-collapsing prompt (GEN 25994,240017,…) across 2 runs each.
+    - `ZINC_BATCHED=1 ZINC_BATCHED_TC=1 validate_catalog` (new DEFAULT = lowsmem TC path, 4090): **5/5 PASS** —
+      qwen35-9b/qwen36-27b/qwen36-35b-a3b/gemma4-26b all **12/12**; gemma4-31b the SAME documented near-tie
+      (free-run 2/12, teacher-forced 11/12) → no new divergence. Also ran with `ZINC_BATCHED_TC_LOWSMEM`-style
+      explicit-on before the flip → identical 5/5.
+    - PERF (ABBA x2, gemma-31b 250-tok, 4090, ONE binary): run 1 (lowsmem opt-in vs m64 default) lowsmem **174.28**
+      vs m64 **156.15 = +11.6%**; run 2 (after flipping default: lowsmem-default vs `ZINC_BATCHED_TC_M64` kill-switch)
+      lowsmem **166.14** vs m64 **152.60 = +8.9%**. Both ABBA, no run overlap (A∈[151.7,159.2], B∈[165.8,176.3]) →
+      not boost noise (clears the box's ±1% floor, unlike cycle 13's +1.8%). The m128 hypothesis (cut A read) was
+      occupancy-NEGATIVE; the lowsmem hypothesis (cut Cs shared → raise occupancy) is the correct lever — cycle 14's
+      diagnosis VINDICATED. Committed to perf/e24-batched-prefill, pushed (NOT main; origin/main == this branch at
+      c409e280 → no rebase needed). NEXT (cycle 16): apply the same lowsmem two-phase-Cs trick to `gemm_q6k_tc_f16a`
+      (complete the occupancy win on the dense ffn_down Q6_K GEMM); OR the fp16 WEIGHT cache (dequant Q4_K/Q6_K → fp16
+      ONCE per layer, kills the per-GEMM dequant = the other half of GEMM traffic, no occupancy cost); OR token-GROUPED
+      routed experts (gather by expert, memory-traffic win beyond launch batching, harder byte-identity).
