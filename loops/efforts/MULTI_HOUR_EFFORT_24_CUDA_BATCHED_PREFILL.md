@@ -626,3 +626,44 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   gather/scatter from b.router_table and a variable-group GEMM, harder for byte-identity but the real remaining lever); OR
   keep activations fp16 ACROSS the layer (have the norm/GeGLU producers emit fp16 so the per-GEMM f32→fp16 recast launch is
   dropped — touches shared kernels, less additive).
+- **2026-06-13 — Cycle 18: token-GROUPED routed-expert matvecs for gemma-26b MoE prefill (Phase 2 cycle 6) — byte-identical + token-correct, PERF IN-NOISE → kept OPT-IN.**
+  The cycle-8 `dmmv_q4k/q5_1_experts_batched` kernels launch grid.y = token, so blocks reading the SAME expert weight are
+  scattered across grid.y (token t's slot e and token t+1's slot e route to different experts) → no cross-token L2 reuse of
+  the ~2.2 MB/expert Q4_K gate_up + Q5_1 down weights. This cycle adds the GROUPED variant: a single-block counting sort
+  (`build_expert_order`) sorts the T·n_used (token,slot) work-items by expert id into `b.expert_order` (packed token<<16|slot),
+  then the grouped matvecs launch grid = (M output rows, P = T·n_used work-items) and read `order[blockIdx.y]` for their
+  (token,slot) — so consecutive grid.y work-items share the same expert weight, keeping it L2-resident across all the tokens
+  routed to it (the genuine memory-traffic lever the prior NEXT-notes flagged, beyond cycle-8's launch batching). ADDITIVE
+  (decodeStep/moeFfnBlock/the cycle-8 _batched path/dense path all untouched):
+    - 3 ADDITIVE kernels (kernels.cu): `dmmv_q4k_experts_grouped` / `dmmv_q5_1_experts_grouped` — the per-block dequant +
+      `zinc_block_reduce_sum` + the y write location (token t's slice, slot e, row) are BYTE-FOR-BYTE the cycle-8 `_batched`
+      kernels'; only WHICH block computes which (token,slot,row) changes (via `order[]`), and every output is still computed
+      exactly once → byte-identical result regardless of the order permutation. Plus `build_expert_order` (single-block
+      counting sort: zero shared counts → histogram of expert ids → exclusive prefix-sum → scatter; n_experts ≤ 256, intra-bin
+      order race-irrelevant since each work-item maps to a distinct independently-computed output). Reuses `ExpertsBatchPush`.
+    - `dmmv_q4k_experts_grouped`/`dmmv_q5_1_experts_grouped`/`build_expert_order` pipelines + `BuildOrderPush` + `BatchScratch.expert_order`
+      ([T·n_used] u32, size 1 on dense) + `moeRoutedExpertsGrouped(L,T,b)` (= `moeRoutedExpertsBatched` op-for-op with the same
+      push params/buffers/block dims, but build_expert_order → grouped matvecs over grid (M, P)). prefillBatched MoE branch
+      routes through it only when `use_grouped` (`ZINC_BATCHED_EXPERTS_GROUPED`), else the proven cycle-8 `moeRoutedExpertsBatched`.
+    - Opt-in bool `use_grouped` + scripts (validate_catalog/prefill_catalog) pass `ZINC_BATCHED_EXPERTS_GROUPED=1` through additively.
+  Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda -Dshaders=false` EXIT=0, NVRTC compiled
+  the 3 new kernels; binary md5 a51357e7, a fresh build). GATE — CORRECTNESS FULLY CLEARED:
+    - Byte-identity (the core claim): direct A/B gemma-26b MoE, VARIED non-collapsed prompt ((i*73+11)%251+5), grouped vs
+      cycle-8 batched — GEN_IDS BYTE-IDENTICAL at **T=60** (161,236909,164086,…) AND **T=200** (116,195,173310,161,236909,…). ✓
+    - `ZINC_BATCHED=1 ZINC_BATCHED_EXPERTS_GROUPED=1 validate_catalog` (DIRECT vs llama.cpp, 4090): **5/5 PASS** — gemma4-26b
+      MoE GROUPED free-runs **12/12** directly vs llama.cpp (the grouped prefill path is token-correct); gemma4-31b the
+      documented near-tie (free-run 2/12, teacher-forced 11/12, unchanged — dense path has no grouped); qwen 12/12 fallback.
+    - PERF — IN-NOISE (the honest outcome): 2 ABBA x2 runs (gemma-26b 250-tok, 4090, A=cycle-8 batched, B=grouped). Run 1
+      A mean 169.3 / B mean 202.1 (**+19%**), 3/4 pairs favor B; Run 2 A mean 187.7 / B mean 187.5 (**~0%**). The two runs
+      DISAGREE in magnitude and the per-config variance is enormous (single-config values swing 145→236 tok/s, ~60%) — boost
+      noise dominates. Combined mean A 178.5 / B 194.8 (+9%) leans positive but sits well under the box's boost floor today.
+      Same class as cycle 13 (Q6-on-TC +1.8%) and cycle 16 (Q6 lowsmem) — byte-identical/token-correct but perf below the
+      measurement floor. Likely reason the L2-reuse win is small: at T=250 the GPU runs thousands of (M-row × work-item)
+      blocks concurrently across 128 SMs, so grid.y ordering only weakly controls L2 residency timing.
+  DECISION: the effort's bar for a DEFAULT FLIP is a MEASURED faster increment; this is in-noise, so kept the proven cycle-8
+  `_batched` matvecs as the DEFAULT and made the byte-identical grouped path an ADDITIVE OPT-IN (`ZINC_BATCHED_EXPERTS_GROUPED`),
+  mirroring cycles 13/14/16/17's handling of neutral/negative results → the default MoE prefill path stays byte-for-byte cycle
+  10 → cannot regress. The counting-sort `build_expert_order` + `b.expert_order` device foundation is reusable for a future
+  expert-major restructure. Committed to perf/e24-batched-prefill, pushed (NOT main). NEXT (cycle 19): keep activations fp16
+  ACROSS the layer (norm/GeGLU producers emit fp16 → drop the per-GEMM f32→fp16 recast launch on the TC path — touches shared
+  kernels, less additive), or a larger-T sweep to see if the grouped L2 win emerges above the boost floor at T≫250.

@@ -56,7 +56,10 @@ case "$MODE" in
             # differ; use validate_catalog as its gate, this is for perf only).
             [ "${ZINC_BATCHED_TC:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC=1"; S_LABEL="batched+tc"; }
             # Cycle 17: opt into the wider 128x64 M-tile low-shared Q4_K TC kernel.
-            [ "${ZINC_BATCHED_TC_M128_LOWSMEM:-0}" = "1" ] && S_ENV="$S_ENV ZINC_BATCHED_TC_M128_LOWSMEM=1" ;;
+            [ "${ZINC_BATCHED_TC_M128_LOWSMEM:-0}" = "1" ] && S_ENV="$S_ENV ZINC_BATCHED_TC_M128_LOWSMEM=1"
+            # Cycle 18: opt into token-GROUPED routed experts (byte-identical → GEN_IDS
+            # must still match; this knob is for measuring the L2-reuse perf delta).
+            [ "${ZINC_BATCHED_EXPERTS_GROUPED:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_EXPERTS_GROUPED=1"; S_LABEL="$S_LABEL+grouped"; } ;;
   *) echo "unknown ZINC_AB '$MODE' (want headskip|batched)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")/.." && pwd)

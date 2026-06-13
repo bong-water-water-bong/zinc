@@ -93,6 +93,9 @@ for i in "${!NAMES[@]}"; do
   [ "${ZINC_BATCHED_TC:-0}" = "1" ] && [ -n "$zbatch" ] && zbatch="$zbatch ZINC_BATCHED_TC=1"
   # Effort 24 cycle 17: opt into the wider 128x64 M-tile low-shared Q4_K TC kernel.
   [ "${ZINC_BATCHED_TC_M128_LOWSMEM:-0}" = "1" ] && [ -n "$zbatch" ] && zbatch="$zbatch ZINC_BATCHED_TC_M128_LOWSMEM=1"
+  # Effort 24 cycle 18: opt into token-GROUPED routed experts (byte-identical to the
+  # _batched path; validates the grouped gemma-26b MoE prefill directly vs llama.cpp).
+  [ "${ZINC_BATCHED_EXPERTS_GROUPED:-0}" = "1" ] && [ -n "$zbatch" ] && zbatch="$zbatch ZINC_BATCHED_EXPERTS_GROUPED=1"
   zgen=$(env CUDA_VISIBLE_DEVICES=$GPU $zbatch "$ZBIN" gen "$pids" "$NGEN" "$m" 2>&1 | awk -F: '/GEN_IDS/{print $2}')
   IFS=',' read -ra L <<< "$lgen"; IFS=',' read -ra Z <<< "$zgen"
   match=0; for j in "${!L[@]}"; do [ "${L[$j]}" = "${Z[$j]:-x}" ] && match=$((match+1)) || break; done

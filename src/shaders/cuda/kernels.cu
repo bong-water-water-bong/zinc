@@ -1172,6 +1172,110 @@ extern "C" __global__ void dmmv_q5_1_experts_batched(const unsigned char* a, con
     if (threadIdx.x == 0) y[(size_t)t * pc.y_tok_stride + (size_t)e * pc.M + row] = sum;
 }
 
+// ---- token-GROUPED routed-expert matvecs (gemma-26b MoE prefill) ------------
+// Effort 24 cycle 18: the cycle-8 token-batched kernels above launch grid.y =
+// token, so blocks reading the SAME expert weight are scattered across grid.y
+// (token t's slot e routes to a different expert than token t+1's slot e) — no
+// cross-token L2 reuse of the expert weight. These GROUPED kernels instead take
+// a precomputed `order[]` (built by build_expert_order below) that lists the
+// T*n_used (token,slot) work-items SORTED BY EXPERT ID, so consecutive grid.y
+// work-items share the same expert weight → it stays resident in L2 across all
+// the tokens routed to it (a real memory-traffic win beyond launch batching).
+// BYTE-IDENTITY: the per-block dequant + zinc_block_reduce_sum + the y write
+// location (token t's slice, slot e, row) are byte-for-byte the cycle-8 kernel's
+// — only WHICH block computes which (token,slot,row) changes, and every output
+// element is still computed exactly once, so GEN_IDS are identical regardless of
+// the order permutation. order packs (token<<16 | slot); prefill T < 65536.
+// Reuses ExpertsBatchPush (n_used field unused here — slot comes from order).
+extern "C" __global__ void dmmv_q4k_experts_grouped(const unsigned* a_u32, const float* x, float* y, const unsigned* expert_ids, const unsigned* order, ExpertsBatchPush pc) {
+    unsigned packed = order[blockIdx.y];
+    unsigned t = packed >> 16, e = packed & 0xFFFFu;
+    unsigned row = blockIdx.x;
+    unsigned bpr = pc.K >> 8;
+    unsigned a_base = ((expert_ids[(size_t)t * pc.routing_stride + e] * pc.slice + pc.base) >> 2) + row * bpr * 36u;
+    const float4* xv = (const float4*)(x + (size_t)t * pc.x_tok_stride + (size_t)e * pc.x_stride);
+    unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
+    unsigned l0 = 4u * (2u * ir + v_in);
+    unsigned q_off = 32u * v_im + l0, y_loc = 64u * v_im + l0, shift = v_im * 16u;
+    unsigned ngrp = blockDim.x >> 4;
+    float sum = 0.0f;
+    for (unsigned i = grp; i < bpr; i += ngrp) {
+        unsigned blk = a_base + i * 36u;
+        unsigned dd = a_u32[blk];
+        float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF));
+        float dm = zinc_half_to_float((unsigned short)(dd >> 16));
+        unsigned sc0 = a_u32[blk + 1u], sc1 = a_u32[blk + 2u], sc2 = a_u32[blk + 3u];
+        unsigned qs0 = a_u32[blk + 4u + (q_off >> 2)], qs1 = a_u32[blk + 4u + (q_off >> 2) + 16u];
+        unsigned bidx = (i * 256u + y_loc) >> 2, bidx2 = (i * 256u + y_loc + 128u) >> 2;
+        float4 by0 = xv[bidx], by1 = xv[bidx + 8u], by2 = xv[bidx2], by3 = xv[bidx2 + 8u];
+        unsigned s0 = sc0 >> shift, s1 = sc1 >> shift, s2 = sc2 >> shift;
+        float f0 = d * (float)(s0 & 0x3Fu), b0 = dm * (float)(s1 & 0x3Fu);
+        float f1 = d * (float)((s0 >> 8) & 0x3Fu), b1 = dm * (float)((s1 >> 8) & 0x3Fu);
+        float f2 = d * (float)((s2 & 0xFu) | ((s0 & 0xC0u) >> 2)), b2 = dm * (float)(((s2 & 0xF0u) >> 4) | ((s1 & 0xC0u) >> 2));
+        float f3 = d * (float)(((s2 >> 8) & 0xFu) | (((s0 >> 8) & 0xC0u) >> 2)), b3 = dm * (float)((((s2 >> 8) & 0xF0u) >> 4) | (((s1 >> 8) & 0xC0u) >> 2));
+        sum += (f0*(float)(qs0&0xFu)-b0)*by0.x + (f0*(float)((qs0>>8)&0xFu)-b0)*by0.y + (f0*(float)((qs0>>16)&0xFu)-b0)*by0.z + (f0*(float)((qs0>>24)&0xFu)-b0)*by0.w;
+        sum += (f1*(float)((qs0>>4)&0xFu)-b1)*by1.x + (f1*(float)((qs0>>12)&0xFu)-b1)*by1.y + (f1*(float)((qs0>>20)&0xFu)-b1)*by1.z + (f1*(float)((qs0>>28)&0xFu)-b1)*by1.w;
+        sum += (f2*(float)(qs1&0xFu)-b2)*by2.x + (f2*(float)((qs1>>8)&0xFu)-b2)*by2.y + (f2*(float)((qs1>>16)&0xFu)-b2)*by2.z + (f2*(float)((qs1>>24)&0xFu)-b2)*by2.w;
+        sum += (f3*(float)((qs1>>4)&0xFu)-b3)*by3.x + (f3*(float)((qs1>>12)&0xFu)-b3)*by3.y + (f3*(float)((qs1>>20)&0xFu)-b3)*by3.z + (f3*(float)((qs1>>28)&0xFu)-b3)*by3.w;
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (tid == 0) y[(size_t)t * pc.y_tok_stride + (size_t)e * pc.M + row] = sum;
+}
+
+extern "C" __global__ void dmmv_q5_1_experts_grouped(const unsigned char* a, const float* x, float* y, const unsigned* expert_ids, const unsigned* order, ExpertsBatchPush pc) {
+    unsigned packed = order[blockIdx.y];
+    unsigned t = packed >> 16, e = packed & 0xFFFFu;
+    unsigned row = blockIdx.x;
+    unsigned bpr = pc.K >> 5;
+    const unsigned char* arow = a + (size_t)expert_ids[(size_t)t * pc.routing_stride + e] * pc.slice + pc.base + (size_t)row * bpr * 24u;
+    const float* xrow = x + (size_t)t * pc.x_tok_stride + (size_t)e * pc.x_stride;
+    float sum = 0.0f;
+    for (unsigned el = threadIdx.x; el < pc.K; el += blockDim.x) {
+        unsigned blk = el >> 5, i = el & 31u;
+        const unsigned char* blkp = arow + (size_t)blk * 24u;
+        float d = zinc_half_to_float((unsigned short)((unsigned)blkp[0] | ((unsigned)blkp[1] << 8)));
+        float m = zinc_half_to_float((unsigned short)((unsigned)blkp[2] | ((unsigned)blkp[3] << 8)));
+        unsigned qh = (unsigned)blkp[4] | ((unsigned)blkp[5] << 8) | ((unsigned)blkp[6] << 16) | ((unsigned)blkp[7] << 24);
+        const unsigned char* qs = blkp + 8;
+        unsigned nib = (i < 16u) ? (unsigned)(qs[i] & 0xFu) : (unsigned)(qs[i - 16u] >> 4);
+        unsigned q5 = nib | (((qh >> i) & 1u) << 4);
+        sum += (d * (float)q5 + m) * xrow[el];
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (threadIdx.x == 0) y[(size_t)t * pc.y_tok_stride + (size_t)e * pc.M + row] = sum;
+}
+
+// build_expert_order — single-block counting sort of the T*n_used (token,slot)
+// routed-expert work-items by expert id, producing `order[]` (packed token<<16|slot)
+// for the grouped kernels above. Phases: zero shared counts → histogram of expert
+// ids (shared atomics) → exclusive prefix-sum into a shared cursor → scatter each
+// work-item into its expert's contiguous run. Intra-bin order is race-dependent but
+// irrelevant: each (token,slot) maps to a distinct, independently-computed output.
+// n_experts <= 256 (gemma-26b = 128). Async on the shared stream (reads the router
+// table written by routerBatched; the grouped matvecs read order after this).
+struct BuildOrderPush { unsigned T, n_used, n_experts, routing_stride; };
+extern "C" __global__ void build_expert_order(const unsigned* expert_ids, unsigned* order, BuildOrderPush pc) {
+    __shared__ unsigned counts[256];
+    __shared__ unsigned cursor[256];
+    unsigned tid = threadIdx.x, nthr = blockDim.x;
+    unsigned P = pc.T * pc.n_used;
+    for (unsigned e = tid; e < pc.n_experts; e += nthr) counts[e] = 0u;
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        atomicAdd(&counts[expert_ids[(size_t)t * pc.routing_stride + slot]], 1u);
+    }
+    __syncthreads();
+    if (tid == 0) { unsigned acc = 0u; for (unsigned e = 0; e < pc.n_experts; e++) { cursor[e] = acc; acc += counts[e]; } }
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        unsigned pos = atomicAdd(&cursor[expert_ids[(size_t)t * pc.routing_stride + slot]], 1u);
+        order[pos] = (t << 16) | slot;
+    }
+}
+
 // ---- dmmv_q8_0_fast — whole-block-per-thread, d once, float4 x --------------
 extern "C" __global__ void dmmv_q8_0_fast(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x; if (row >= pc.M) return;
