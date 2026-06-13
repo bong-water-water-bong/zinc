@@ -1378,6 +1378,8 @@ const ScalarDecodeState = struct {
     direct_ssm_beta_q8_row_range_failed_mask: u128 = 0,
     direct_ssm_beta_q8_row_range_successes: u32 = 0,
     direct_ssm_beta_q8_row_range_slice_successes: u32 = 0,
+    direct_ssm_qkv_gate_q4_row_range_done: bool = false,
+    direct_ssm_qkv_gate_q4_row_range_failed: bool = false,
     direct_moe_gate_up_row_range_count: u32 = 0,
     pool: ?*std.Thread.Pool = null,
     fast_pool: ?*zinc_rt.fast_pool.FastPool = null,
@@ -1526,6 +1528,7 @@ const ScalarDecodeState = struct {
         self.direct_ssm_beta_q8_row_range_done_mask = 0;
         self.direct_ssm_alpha_q8_row_range_slice_successes = 0;
         self.direct_ssm_beta_q8_row_range_slice_successes = 0;
+        self.direct_ssm_qkv_gate_q4_row_range_done = false;
         self.direct_moe_gate_up_row_range_count = 0;
     }
 };
@@ -3324,6 +3327,7 @@ fn runSsmLayer(
             .{ .info = lt.ssm_beta.?, .rows = dt_rank, .out = state.beta[0..dt_rank] },
         }, state.norm, state.row_scratch);
     }
+    consumeDirectSsmQkvGateQ4_0RowRange(model, state, lt, layer, direct_compute_tracking);
 
     const conv_state = state.convStateForLayer(cfg, layer);
     const d_conv_1 = d_conv - 1;
@@ -3464,6 +3468,104 @@ fn runSsmLayer(
         try matvecTensor(state.pool, model, lt.ssm_out.?, state.ssm_out[0..d_inner], cfg.hidden_dim, state.row_scratch, state.branch);
     }
     for (state.hidden, state.branch) |*h, b| h.* += b;
+}
+
+const direct_ssm_qkv_gate_q4_0_tolerance: f32 = 0.05;
+const direct_ssm_qkv_gate_q4_0_range_rows: u32 = 64;
+
+fn consumeDirectSsmQkvGateQ4_0RowRange(
+    model: *const Model,
+    state: *ScalarDecodeState,
+    lt: LayerTensors,
+    layer: u32,
+    maybe_tracking: ?DirectComputeTracking,
+) void {
+    const tracking = maybe_tracking orelse return;
+    if (tracking.phase != .decode) return;
+    if (state.direct_ssm_qkv_gate_q4_row_range_done or state.direct_ssm_qkv_gate_q4_row_range_failed) return;
+
+    const qkv_info = lt.attn_qkv orelse return;
+    const gate_info = lt.attn_gate orelse return;
+    const qkv_w = model.requantOrRaw(qkv_info);
+    const gate_w = model.requantOrRaw(gate_info);
+    if (qkv_w.type_ != .q4_0 or gate_w.type_ != .q4_0) return;
+
+    const cols: u32 = @intCast(state.norm.len);
+    if (cols == 0 or cols % 32 != 0) return;
+    const rows = direct_ssm_qkv_gate_q4_0_range_rows;
+    const rows_usize: usize = @intCast(rows);
+    if (state.qkv.len < rows_usize or state.z.len < rows_usize or state.row_scratch.len < rows_usize * 2) return;
+
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    const range_bytes = rows_usize * row_bytes;
+    if (row_bytes == 0 or qkv_w.raw.len < range_bytes or gate_w.raw.len < range_bytes) return;
+
+    const gpu_rows = state.row_scratch[0 .. rows_usize * 2];
+    tracking.boundary.dmmvQ4_0TwoRowRangesParallel64(
+        state.norm,
+        qkv_w.raw[0..range_bytes],
+        gate_w.raw[0..range_bytes],
+        cols,
+        gpu_rows,
+    ) catch |err| {
+        state.direct_ssm_qkv_gate_q4_row_range_failed = true;
+        log.warn("M1 AMDGPU CS direct SSM qkv/gate Q4_0 row ranges unavailable ({s}); qkv/gate remain host-computed", .{@errorName(err)});
+        return;
+    };
+
+    var max_qkv_delta: f32 = 0.0;
+    var max_gate_delta: f32 = 0.0;
+    var max_qkv_row: u32 = 0;
+    var max_gate_row: u32 = 0;
+    for (0..rows_usize) |i| {
+        const qkv_gpu = gpu_rows[i];
+        const gate_gpu = gpu_rows[rows_usize + i];
+        if (!std.math.isFinite(qkv_gpu) or !std.math.isFinite(gate_gpu)) {
+            state.direct_ssm_qkv_gate_q4_row_range_failed = true;
+            log.warn("M1 AMDGPU CS direct SSM qkv/gate Q4_0 row ranges produced non-finite row {d}; qkv/gate remain host-computed", .{i});
+            return;
+        }
+        const qkv_delta = @abs(qkv_gpu - state.qkv[i]);
+        const gate_delta = @abs(gate_gpu - state.z[i]);
+        if (qkv_delta > max_qkv_delta) {
+            max_qkv_delta = qkv_delta;
+            max_qkv_row = @intCast(i);
+        }
+        if (gate_delta > max_gate_delta) {
+            max_gate_delta = gate_delta;
+            max_gate_row = @intCast(i);
+        }
+    }
+    if (max_qkv_delta > direct_ssm_qkv_gate_q4_0_tolerance or max_gate_delta > direct_ssm_qkv_gate_q4_0_tolerance) {
+        state.direct_ssm_qkv_gate_q4_row_range_failed = true;
+        log.warn("M1 AMDGPU CS direct SSM qkv/gate Q4_0 row ranges mismatch: layer={d} qkv_delta={d:.6} qkv_row={d} gate_delta={d:.6} gate_row={d}; qkv/gate remain host-computed", .{
+            layer,
+            max_qkv_delta,
+            max_qkv_row,
+            max_gate_delta,
+            max_gate_row,
+        });
+        return;
+    }
+
+    @memcpy(state.qkv[0..rows_usize], gpu_rows[0..rows_usize]);
+    @memcpy(state.z[0..rows_usize], gpu_rows[rows_usize..][0..rows_usize]);
+    state.direct_ssm_qkv_gate_q4_row_range_done = true;
+    tracking.ops.* += 2;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += 2;
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=ssm_qkv_gate_q4_0_row_ranges_parallel64 phase=decode layer={d} rows_per_projection={d} cols={d} chunks=2 max_qkv_delta={d:.6} max_qkv_row={d} max_gate_delta={d:.6} max_gate_row={d} consumed_gpu_model_value=1", .{
+        tracking.ops.*,
+        layer,
+        rows,
+        cols,
+        max_qkv_delta,
+        max_qkv_row,
+        max_gate_delta,
+        max_gate_row,
+    });
 }
 
 const direct_ssm_alpha_q8_0_row_range_tolerance: f32 = 0.02;
@@ -8618,6 +8720,8 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     state.direct_ssm_alpha_q8_row_range_slice_successes = 2;
     state.direct_ssm_beta_q8_row_range_slice_successes = 2;
     state.direct_ssm_q8_row_range_trust_after_successes = 1;
+    state.direct_ssm_qkv_gate_q4_row_range_done = true;
+    state.direct_ssm_qkv_gate_q4_row_range_failed = true;
     state.direct_moe_gate_up_row_range_count = direct_moe_gate_up_q4_0_max_expert_slots;
     try std.testing.expect(!canConsumeDirectMoeGateUpQ4_0Slot(&state));
 
@@ -8634,6 +8738,8 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     try std.testing.expectEqual(@as(u32, 8), state.direct_ssm_beta_q8_row_range_successes);
     try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_alpha_q8_row_range_slice_successes);
     try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_beta_q8_row_range_slice_successes);
+    try std.testing.expect(!state.direct_ssm_qkv_gate_q4_row_range_done);
+    try std.testing.expect(state.direct_ssm_qkv_gate_q4_row_range_failed);
     try std.testing.expectEqual(@as(u32, 0), state.direct_moe_gate_up_row_range_count);
     try std.testing.expect(canConsumeDirectMoeGateUpQ4_0Slot(&state));
 
