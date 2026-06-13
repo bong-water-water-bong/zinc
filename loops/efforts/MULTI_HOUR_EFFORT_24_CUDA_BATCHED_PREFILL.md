@@ -302,3 +302,42 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   each expert's weight is read once per group not once per token — a memory-traffic win beyond launch
   batching, but needs gather/scatter and is harder for byte-identity), batch the per-token accumulate/combine
   tail too (kills the last T launches/layer), or NVRTC `-I` fp16 tensor-core GEMM (+2.2× dense, own tolerance gate).
+- **2026-06-13 — Cycle 9: batched accumulate/combine tail for gemma-26b MoE prefill (Phase 2 cycle 5) — output-identical + faster (the LAST per-token FFN launches gone).**
+  After cycle 8 the gemma-26b MoE FFN was batched through the routed-expert matvecs, but the FINAL stage —
+  per token: zero accumulator → weighted-combine (down scale folded) → post_ffw_norm_2 → shared+=moe →
+  post_ffw_norm → hidden+=cur → layer_output_scale — was still a T-iteration loop (T × ~7 single-token
+  launches/layer + T alias-buffer create/free pairs). This cycle batches that tail, so on the GPU-side async
+  expert path (Q4_K gate_up + Q5_1 down) the prefill MoE FFN has NO per-token loop at all. ADDITIVE
+  (decodeStep/moeFfnBlock/moeRoutedCombine/dense path untouched):
+    - 1 ADDITIVE kernel (kernels.cu): `moe_weighted_acc_scaled_batched` — bit-faithful twin of
+      `moe_weighted_acc_scaled` (same j-loop FMA order, same GPU-side `escale[id]` down-scale fold) with
+      grid.y = T + per-token strides (`a_tok_stride`/`b_tok_stride`/`routing_stride`) so block=(i=blockIdx.x,
+      t=blockIdx.y) reads token t's own accumulator/down/routing slices → per-(t,i) math byte-for-byte the
+      single-token kernel. New `MoeAccBatchPush` + 1 pipeline. The other 6 tail ops needed NO new kernel:
+      `zero_vec`/`scale_accumulate`/`scalar_mul` are element-wise → one launch over the whole [T,n_embd] tile
+      (N=T·n_embd, contiguous token-major → each element identical to the per-token launch); `rms_norm`
+      (post_ffw_norm_2, post_ffw_norm) already indexes token=blockIdx.x → grid.x=T reproduces the per-token
+      reduction block-for-block. The standalone per-token `layerOutScale` is folded in as the final batched
+      `scalar_mul` (self-skips when the layer has no output scale).
+    - `BatchScratch.moe_out_e` [T,n_embd] (the batched post_ffw_norm_2 accumulator; size T·n_embd on dense too,
+      cheap) + `moeRoutedCombineBatched(L,T,b)` (the 7 batched launches above, async on the shared stream —
+      stream order guarantees it reads the experts/router buffers after they're written). prefillBatched MoE
+      branch: on the `pre` (batched) path it now calls sharedExpertBatched + routerBatched +
+      moeRoutedExpertsBatched + **moeRoutedCombineBatched** ONCE/layer — the per-token loop is GONE. The non-`pre`
+      host-readback fallback keeps its per-token `moeRoutedCombine(false,false)` + `layerOutScale` loop (aliasing
+      b.hidden/b.shared per token), byte-for-byte unchanged.
+  Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda -Dshaders=false` EXIT=0,
+  bin md5 5a1b0597 ≠ cycle 8's d14f13bc; NVRTC compiled the new kernel at runtime). GATE — FULLY CLEARED:
+    - `prefill_catalog ZINC_AB=batched` (ABBA x2, 250-tok, 4090): GEN_IDS byte-identical —
+      **gemma4-26b MoE 46.72 → 160.49 t/s (+244%)** (UP from cycle 8's 135.16 — killing the per-token combine
+      loop is the last FFN lever), gemma4-31b dense 30.11 → 130.21 (+332%, NO regression — dense flow untouched).
+    - `ZINC_BATCHED=1 validate_catalog` (DIRECT batched gate, 4090): **5/5 PASS** — gemma4-26b MoE batched
+      free-runs **12/12** DIRECT vs llama.cpp (the fully-batched MoE prefill path is token-correct); gemma4-31b
+      the documented near-tie (free-run 2/12, teacher-forced 11/12, unchanged); qwen 12/12 (per-token fallback
+      intact → product decode path unregressed).
+  Committed to perf/e24-batched-prefill, pushed (NOT main). The gemma-26b MoE prefill FFN is now FULLY batched
+  end-to-end (shared expert + router + routed experts + accumulate/combine + output scale) — zero per-token
+  launches on the async expert path. NEXT (cycle 10): token-GROUPED routed experts (gather tokens by expert →
+  each expert weight read once per group, a memory-traffic win beyond launch batching; needs gather/scatter,
+  harder for byte-identity), batch the attention layer's remaining per-token bits if any, or NVRTC `-I` fp16
+  tensor-core GEMM (+2.2× dense, own tolerance gate).

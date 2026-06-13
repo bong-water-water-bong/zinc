@@ -78,6 +78,9 @@ const ArgmaxPush = extern struct { N: u32 };
 // MoE router/combine kernels (byte-match kernels.cu).
 const TopkPush = extern struct { n_experts: u32, k: u32 };
 const MoeAccPush = extern struct { N: u32, n_used: u32, src_stride: u32 };
+// Token-batched MoE combine (Effort 24 cycle 9): per-token strides so one launch
+// (grid.y = T) does the weighted accumulate for all prompt tokens.
+const MoeAccBatchPush = extern struct { N: u32, n_used: u32, src_stride: u32, a_tok_stride: u32, b_tok_stride: u32, routing_stride: u32 };
 const MulVecPush = extern struct { N: u32, scale: f32 };
 const MulVecBatchPush = extern struct { row: u32, total: u32, scale: f32 };
 const ZeroPush = extern struct { N: u32 };
@@ -165,6 +168,7 @@ const Pipelines = struct {
     softmax_topk_batched: CudaPipeline, // gemma4-MoE prefill: top-k over all T tokens
     moe_weighted_acc: CudaPipeline,
     moe_weighted_acc_scaled: CudaPipeline, // batched MoE: folds down scale GPU-side
+    moe_weighted_acc_scaled_batched: CudaPipeline, // gemma4-MoE prefill combine (all T)
     mul_vec_scaled: CudaPipeline,
     mul_vec_scaled_batched: CudaPipeline, // gemma4-MoE prefill router pre-scale (all T)
     zero_vec: CudaPipeline,
@@ -207,6 +211,7 @@ const BatchScratch = struct {
     up_e: CudaBuffer, // [T, n_used*ef] routed up projection
     geglu_e: CudaBuffer, // [T, n_used*ef] GeGLU(gate,up)
     down_e: CudaBuffer, // [T, n_used*n_embd] routed down projection (slot-major per token)
+    moe_out_e: CudaBuffer, // [T, n_embd] routed-expert weighted sum (post_ffw_norm_2), cycle 9
 };
 
 pub const ForwardGemma = struct {
@@ -355,6 +360,7 @@ pub const ForwardGemma = struct {
         pipes.softmax_topk_batched = try pipeline.createPipeline(ctx, src.ptr, "softmax_topk_batched");
         pipes.moe_weighted_acc = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc");
         pipes.moe_weighted_acc_scaled = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc_scaled");
+        pipes.moe_weighted_acc_scaled_batched = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc_scaled_batched");
         pipes.mul_vec_scaled = try pipeline.createPipeline(ctx, src.ptr, "mul_vec_scaled");
         pipes.mul_vec_scaled_batched = try pipeline.createPipeline(ctx, src.ptr, "mul_vec_scaled_batched");
         pipes.zero_vec = try pipeline.createPipeline(ctx, src.ptr, "zero_vec");
@@ -636,57 +642,43 @@ pub const ForwardGemma = struct {
             if (layer_is_moe) {
                 // The gemma4-MoE FFN is batched in stages over all T tokens, each a
                 // bit-identical twin of the per-token path: the Q8_0 shared expert
-                // (cycle 6 → b.shared), the F32 router (cycle 7 → b.router_table), and
-                // — cycle 8 — the routed gate/up/down expert matvecs themselves
-                // (`moeRoutedExpertsBatched` → b.down_e [T, n_used*n_embd], the last
-                // big per-token FFN cost). With all three batched, the per-token loop
-                // only runs the lightweight accumulate + post_ffw_norm + residual
-                // combine, reading this token's b.shared / b.router_table / b.down_e
-                // slices via aliases (moeRoutedCombine prerouted=preexperts=pre).
+                // (cycle 6 → b.shared), the F32 router (cycle 7 → b.router_table), the
+                // routed gate/up/down expert matvecs (cycle 8 → b.down_e), and — cycle
+                // 9 — the accumulate + post_ffw_norm + residual combine + output scale
+                // (`moeRoutedCombineBatched`, the last per-token launches). With all
+                // four batched, the prefill MoE FFN has NO per-token loop on the GPU-
+                // side async expert path: each stage reads the batched streams in place.
                 try self.sharedExpertBatched(L, T, b);
                 const wgu = self.layer(L, "ffn_gate_up_exps.weight");
                 const wde = self.layer(L, "ffn_down_exps.weight");
-                // The batched router + routed-expert matvecs run only on the GPU-side
-                // async expert path (Q4_K gate_up + Q5_1 down); the host-readback
-                // fallback keeps its per-token router + per-token expert matvecs.
+                // The batched router + routed-expert matvecs + combine run only on the
+                // GPU-side async expert path (Q4_K gate_up + Q5_1 down); the host-
+                // readback fallback keeps its per-token router/experts/combine loop.
                 const pre = dmmvIdx(wgu.info.type_) == 0 and dmmvIdx(wde.info.type_) == 5;
                 if (pre) {
                     try self.routerBatched(L, T, b);
                     try self.moeRoutedExpertsBatched(L, T, b);
-                }
-                const saved_hidden = self.hidden;
-                const saved_shared = self.shared_buf;
-                const saved_router = self.router_out_buf;
-                const saved_down = self.down_buf;
-                const usz = @sizeOf(u32);
-                const rt_stride = 2 * d.n_experts_used;
-                const de_stride = d.n_experts_used * d.n_embd; // b.down_e per-token slot stride
-                var t: u32 = 0;
-                while (t < T) : (t += 1) {
-                    // Point self.hidden / self.shared_buf / self.down_buf at this token's
-                    // slices of the batched streams. The launch captures the raw device
-                    // ptr (cuLaunchKernel), so the alias wrappers are safe to free once
-                    // moeRoutedCombine has recorded its dispatches — the slices' device
-                    // memory lives on in b.hidden / b.shared / b.router_table / b.down_e.
-                    self.hidden = try buffer.aliasBuffer(&b.hidden, t * d.n_embd * f4, d.n_embd * f4);
-                    self.shared_buf = try buffer.aliasBuffer(&b.shared, t * d.n_embd * f4, d.n_embd * f4);
-                    if (pre) {
-                        self.router_out_buf = try buffer.aliasBuffer(&b.router_table, t * rt_stride * usz, rt_stride * usz);
-                        self.down_buf = try buffer.aliasBuffer(&b.down_e, t * de_stride * f4, de_stride * f4);
+                    try self.moeRoutedCombineBatched(L, T, b);
+                } else {
+                    // Fallback (non-Q4_K/Q5_1 experts): the router + routed matvecs are
+                    // NOT batched, so loop the per-token combine, aliasing self.hidden /
+                    // self.shared_buf to this token's batched slices (b.shared holds the
+                    // already-batched shared expert; moeRoutedCombine computes this
+                    // token's router + experts + combine into the single-token scratch).
+                    const saved_hidden = self.hidden;
+                    const saved_shared = self.shared_buf;
+                    var t: u32 = 0;
+                    while (t < T) : (t += 1) {
+                        self.hidden = try buffer.aliasBuffer(&b.hidden, t * d.n_embd * f4, d.n_embd * f4);
+                        self.shared_buf = try buffer.aliasBuffer(&b.shared, t * d.n_embd * f4, d.n_embd * f4);
+                        try self.moeRoutedCombine(L, false, false);
+                        try self.layerOutScale(L); // MoE's final write is scale_accumulate → standalone scale
+                        buffer.freeBuffer(&self.hidden);
+                        buffer.freeBuffer(&self.shared_buf);
                     }
-                    try self.moeRoutedCombine(L, pre, pre);
-                    try self.layerOutScale(L); // MoE's final write is scale_accumulate → standalone scale
-                    buffer.freeBuffer(&self.hidden);
-                    buffer.freeBuffer(&self.shared_buf);
-                    if (pre) {
-                        buffer.freeBuffer(&self.router_out_buf);
-                        buffer.freeBuffer(&self.down_buf);
-                    }
+                    self.hidden = saved_hidden;
+                    self.shared_buf = saved_shared;
                 }
-                self.hidden = saved_hidden;
-                self.shared_buf = saved_shared;
-                self.router_out_buf = saved_router;
-                self.down_buf = saved_down;
             } else {
                 try self.ffnBlockBatched(L, T, b);
                 // dense layer_output_scale is folded into the post-ffn norm+residual.
@@ -885,13 +877,14 @@ pub const ForwardGemma = struct {
             .up_e = try buffer.createBuffer(ctx, T * @max(@as(u32, 1), d.n_experts_used * d.n_ff) * f4),
             .geglu_e = try buffer.createBuffer(ctx, T * @max(@as(u32, 1), d.n_experts_used * d.n_ff) * f4),
             .down_e = try buffer.createBuffer(ctx, T * @max(@as(u32, 1), d.n_experts_used * d.n_embd) * f4),
+            .moe_out_e = try buffer.createBuffer(ctx, T * d.n_embd * f4),
         };
         return &self.batch.?;
     }
 
     fn freeBatch(self: *ForwardGemma) void {
         if (self.batch) |*bb| {
-            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table, &bb.moe_norm_e, &bb.gate_e, &bb.up_e, &bb.geglu_e, &bb.down_e }) |buf| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table, &bb.moe_norm_e, &bb.gate_e, &bb.up_e, &bb.geglu_e, &bb.down_e, &bb.moe_out_e }) |buf| {
                 buffer.freeBuffer(buf);
             }
             self.batch = null;
@@ -1217,6 +1210,60 @@ pub const ForwardGemma = struct {
         // Routed-expert down matvec over all T tokens → b.down_e (slot-major per token).
         const pd = ExpertsBatchPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = n_used * ef, .y_tok_stride = n_used * d.n_embd };
         cmd.dispatch(&self.pipes.dmmv_q5_1_experts_batched, .{ n_used * d.n_embd, T, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &b.geglu_e, &b.down_e, &b.router_table }, &pd, @sizeOf(ExpertsBatchPush), 0);
+        self.submit(cmd);
+    }
+
+    /// Batched gemma4-MoE routed-expert accumulate + combine over all T tokens
+    /// (Effort 24 cycle 9) — the last per-token cost on the prefill MoE FFN path.
+    /// Replaces the per-token `moeRoutedCombine(prerouted, preexperts)` loop (one
+    /// launch per token of zero/acc/norm/scale-acc/norm/scale-acc/output-scale) with
+    /// ~7 batched launches/layer that read the already-batched b.down_e / b.shared /
+    /// b.router_table / b.hidden streams in place. Every op is a bit-identical twin
+    /// of the per-token tail:
+    ///   - zero_vec / scale_accumulate / scalar_mul are element-wise → run over the
+    ///     whole [T, n_embd] tile (N = T*n_embd); each element's result is exactly
+    ///     the per-token launch's (contiguous, token-major layout).
+    ///   - rms_norm (post_ffw_norm_2, post_ffw_norm) already indexes token=blockIdx.x
+    ///     → grid.x = T reproduces the per-token reduction order block-for-block.
+    ///   - moe_weighted_acc_scaled_batched is the per-token kernel with grid.y = T +
+    ///     per-token strides, so the j-loop FMA order + GPU-side down scale are
+    ///     unchanged. The combined output is byte-for-byte the per-token loop's.
+    /// Async on the shared stream (stream order: experts/router write the buffers
+    /// this reads). The standalone per-token `layerOutScale` is folded in as the
+    /// final scalar_mul (self-skipping when the layer has no output scale).
+    fn moeRoutedCombineBatched(self: *ForwardGemma, L: u32, T: u32, b: *BatchScratch) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const n_used = d.n_experts_used;
+        const wpn2 = self.layer(L, "post_ffw_norm_2.weight");
+        const wpost = self.layer(L, "post_ffw_norm.weight");
+        const wdscale = self.layer(L, "ffn_down_exps.scale"); // [n_experts] F32
+        const ws = self.model.getLayer(L, "layer_output_scale.weight"); // optional scalar
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        const total = T * d.n_embd;
+
+        var cmd = try command.beginCommand(ctx);
+        // zero the [T, n_embd] accumulator (moe_weighted_acc_scaled_batched is a +=).
+        const zp = ZeroPush{ .N = total };
+        cmd.dispatch(&self.pipes.zero_vec, .{ ceilDiv(total, 64), 1, 1 }, .{ 64, 1, 1 }, &.{&b.moe_out_e}, &zp, @sizeOf(ZeroPush), 0);
+        // Weighted combine of each token's n_used routed-down slices (down scale
+        // folded GPU-side) → b.moe_out_e[t]. grid.y = T, per-token strides.
+        const ma = MoeAccBatchPush{ .N = d.n_embd, .n_used = n_used, .src_stride = d.n_embd, .a_tok_stride = d.n_embd, .b_tok_stride = n_used * d.n_embd, .routing_stride = 2 * n_used };
+        cmd.dispatch(&self.pipes.moe_weighted_acc_scaled_batched, .{ ceilDiv(d.n_embd, 64), T, 1 }, .{ 64, 1, 1 }, &.{ &b.moe_out_e, &b.down_e, &b.router_table, &wdscale.gpu_buffer }, &ma, @sizeOf(MoeAccBatchPush), 0);
+        // post_ffw_norm_2 over each token's combined routed output (grid.x = T).
+        cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.moe_out_e, &wpn2.gpu_buffer, &b.moe_out_e }, &rms, @sizeOf(RmsPush), 0);
+        // shared += moe (element-wise over the whole tile).
+        const acc = ScaleAccPush{ .N = total, .scale = 1.0 };
+        cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(total, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.shared, &b.moe_out_e }, &acc, @sizeOf(ScaleAccPush), 0);
+        // post_ffw_norm(shared + moe) (grid.x = T).
+        cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.shared, &wpost.gpu_buffer, &b.shared }, &rms, @sizeOf(RmsPush), 0);
+        // hidden += cur (element-wise over the whole tile).
+        cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(total, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.hidden, &b.shared }, &acc, @sizeOf(ScaleAccPush), 0);
+        // layer_output_scale (folded-in per-token layerOutScale; scalar broadcast).
+        if (ws) |wscale| {
+            const sm = ScalarMulPush{ .N = total };
+            cmd.dispatch(&self.pipes.scalar_mul, .{ ceilDiv(total, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.hidden, &wscale.gpu_buffer }, &sm, @sizeOf(ScalarMulPush), 0);
+        }
         self.submit(cmd);
     }
 

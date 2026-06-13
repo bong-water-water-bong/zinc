@@ -645,6 +645,29 @@ extern "C" __global__ void moe_weighted_acc_scaled(float* a, const float* b, con
     a[i] += sum;
 }
 
+// ---- moe_weighted_acc_scaled_batched (gemma4-MoE prefill combine, all T) -----
+// Token-batched twin of moe_weighted_acc_scaled (Effort 24 cycle 9): one launch
+// (grid.y = T) does the routed-expert weighted combine for every prompt token.
+// Block (blockIdx.x → output channel i, blockIdx.y → token t) reads token t's own
+// accumulator slice a[t*a_tok_stride], down slice b[t*b_tok_stride], and routing
+// row routing[t*routing_stride] — so the per-(t,i) math is byte-for-byte the
+// single-token kernel's (same j-loop, same FMA order, same GPU-side down scale).
+struct MoeAccBatchPush { unsigned N, n_used, src_stride, a_tok_stride, b_tok_stride, routing_stride; };
+extern "C" __global__ void moe_weighted_acc_scaled_batched(float* a, const float* b, const unsigned* routing, const float* escale, MoeAccBatchPush pc) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pc.N) return;
+    unsigned t = blockIdx.y;
+    float* at = a + (size_t)t * pc.a_tok_stride;
+    const float* bt = b + (size_t)t * pc.b_tok_stride;
+    const unsigned* rt = routing + (size_t)t * pc.routing_stride;
+    float sum = 0.0f;
+    for (unsigned j = 0; j < pc.n_used; j++) {
+        float w = __uint_as_float(rt[pc.n_used + j]) * escale[rt[j]];
+        sum += w * bt[(size_t)j * pc.src_stride + i];
+    }
+    at[i] += sum;
+}
+
 // ---- ssm_conv1d (port of ssm_conv1d.comp) -----------------------------------
 // Depthwise causal 1D conv (d_conv taps) + SiLU, via a circular state buffer.
 // One thread per channel. Updates `state` in place (writes current_input into
