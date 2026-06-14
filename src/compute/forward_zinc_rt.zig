@@ -1853,6 +1853,7 @@ fn generateScalarHybrid(
         } else {
             log.info("M1 AMDGPU CS direct LM-head prefix decode cadence: first generated token and every {d} generated tokens", .{direct_lm_head_decode_cadence});
         }
+        log.info("M1 AMDGPU CS direct LM-head prefix row cap: {d} rows", .{directLmHeadQ4_0ArgmaxPrefixRowsLimit()});
         if (direct_router_decode_enabled) {
             if (direct_router_decode_cadence == 0) {
                 log.info("M1 AMDGPU CS direct router execution enabled: one full router row-range consumed per decode token", .{});
@@ -2124,6 +2125,7 @@ fn generateScalarDense(
         } else {
             log.info("M1 AMDGPU CS dense direct LM-head prefix decode cadence: first generated token and every {d} generated tokens", .{direct_lm_head_decode_cadence});
         }
+        log.info("M1 AMDGPU CS dense direct LM-head prefix row cap: {d} rows", .{directLmHeadQ4_0ArgmaxPrefixRowsLimit()});
     }
 
     var generated: std.ArrayList(u32) = .{};
@@ -2471,11 +2473,12 @@ fn consumeDirectLogitsArgmaxRowRange(
 }
 
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
-// Cover the full default capped LM-head row scan on tracked direct slices.
-// At Qwen's K=2048 Q4_0 row size, 4096 rows are about 4.5 MiB of staged
-// weights and produce 16 KiB of logits, fitting the direct CS scratch BOs.
-const direct_lm_head_q4_0_argmax_prefix_rows: u32 = 4096;
 const direct_lm_head_q4_0_parallel_chunk_rows: u32 = 64;
+// Cover the historical 4096-row consumed LM-head proof by default. Agents can
+// lower this with ZINC_RT_DIRECT_LM_HEAD_PREFIX_ROWS for one-chunk smoke runs,
+// but the default keeps the same CPU-work replacement while trimming redundant
+// validation around already-GPU-scored rows.
+const direct_lm_head_q4_0_argmax_prefix_rows_default: u32 = 4096;
 const direct_lm_head_q4_0_selected_window_rows: u32 = 64;
 const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 5 * 1024 * 1024;
 
@@ -2512,16 +2515,34 @@ fn directLmHeadQ4_0SelectedWindow(
     return .{ .start = start, .rows = rows };
 }
 
-fn directLmHeadQ4_0ArgmaxPrefixRows(lm_head_rows: u32, row_bytes: usize, scratch_rows: u32) u32 {
+fn directLmHeadQ4_0ArgmaxPrefixRowsLimitForEnv(raw_override: ?[]const u8) u32 {
+    const raw = raw_override orelse return direct_lm_head_q4_0_argmax_prefix_rows_default;
+    return std.fmt.parseInt(u32, raw, 10) catch direct_lm_head_q4_0_argmax_prefix_rows_default;
+}
+
+fn directLmHeadQ4_0ArgmaxPrefixRowsLimit() u32 {
+    return directLmHeadQ4_0ArgmaxPrefixRowsLimitForEnv(std.posix.getenv("ZINC_RT_DIRECT_LM_HEAD_PREFIX_ROWS"));
+}
+
+fn directLmHeadQ4_0ArgmaxPrefixRowsForLimit(lm_head_rows: u32, row_bytes: usize, scratch_rows: u32, prefix_limit: u32) u32 {
     if (row_bytes == 0) return 0;
     const max_rows_by_input: u32 = @intCast(direct_lm_head_q4_0_argmax_max_weight_bytes / row_bytes);
-    var rows: u32 = @min(lm_head_rows, direct_lm_head_q4_0_argmax_prefix_rows);
+    var rows: u32 = @min(lm_head_rows, prefix_limit);
     rows = @min(rows, max_rows_by_input);
     rows = @min(rows, scratch_rows);
     if (rows >= direct_lm_head_q4_0_parallel_chunk_rows) {
         rows -= rows % direct_lm_head_q4_0_parallel_chunk_rows;
     }
     return rows;
+}
+
+fn directLmHeadQ4_0ArgmaxPrefixRows(lm_head_rows: u32, row_bytes: usize, scratch_rows: u32) u32 {
+    return directLmHeadQ4_0ArgmaxPrefixRowsForLimit(
+        lm_head_rows,
+        row_bytes,
+        scratch_rows,
+        directLmHeadQ4_0ArgmaxPrefixRowsLimit(),
+    );
 }
 
 fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
@@ -2637,24 +2658,14 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     });
 
     if (directLmHeadQ4_0SelectedSourceHasGpuScore(selected_source)) {
-        if (!consumeDirectLmHeadQ4_0SelectedRowPartial64(
-            state,
-            tracking,
-            q4_0_raw,
-            lm_head_rows,
-            cols,
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_reused phase={s} source={s} row={d} cols={d} gpu={d:.6} consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            directComputePhaseName(tracking.phase),
             selected_source,
-            &selection.best,
-        )) {
-            log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_reused phase={s} source={s} row={d} cols={d} gpu={d:.6} consumed_gpu_model_value=1", .{
-                tracking.ops.*,
-                directComputePhaseName(tracking.phase),
-                selected_source,
-                selection.best.index,
-                cols,
-                selection.best.value,
-            });
-        }
+            selection.best.index,
+            cols,
+            selection.best.value,
+        });
     } else {
         const selected_row_consumed = consumeDirectLmHeadQ4_0SelectedRowPartial64(
             state,
@@ -10175,19 +10186,31 @@ test "direct LM-head Q4_0 selected source identifies GPU scores" {
 }
 
 test "direct LM-head Q4_0 prefix stays chunk-aligned and bounded" {
-    try std.testing.expect(direct_lm_head_q4_0_argmax_prefix_rows >= direct_lm_head_q4_0_parallel_chunk_rows);
-    try std.testing.expectEqual(@as(u32, 0), direct_lm_head_q4_0_argmax_prefix_rows % direct_lm_head_q4_0_parallel_chunk_rows);
+    try std.testing.expect(direct_lm_head_q4_0_argmax_prefix_rows_default >= direct_lm_head_q4_0_parallel_chunk_rows);
+    try std.testing.expectEqual(@as(u32, 0), direct_lm_head_q4_0_argmax_prefix_rows_default % direct_lm_head_q4_0_parallel_chunk_rows);
+    try std.testing.expectEqual(@as(u32, direct_lm_head_q4_0_argmax_prefix_rows_default), directLmHeadQ4_0ArgmaxPrefixRowsLimitForEnv(null));
+    try std.testing.expectEqual(@as(u32, 4096), directLmHeadQ4_0ArgmaxPrefixRowsLimitForEnv("4096"));
+    try std.testing.expectEqual(@as(u32, 64), directLmHeadQ4_0ArgmaxPrefixRowsLimitForEnv("64"));
+    try std.testing.expectEqual(@as(u32, direct_lm_head_q4_0_argmax_prefix_rows_default), directLmHeadQ4_0ArgmaxPrefixRowsLimitForEnv("bad"));
 
     const qwen_hidden_dim: u32 = 2048;
     const row_bytes = rowBytesForType(.q4_0, qwen_hidden_dim);
-    try std.testing.expect(@as(usize, direct_lm_head_q4_0_argmax_prefix_rows) * row_bytes <= direct_lm_head_q4_0_argmax_max_weight_bytes);
+    try std.testing.expect(@as(usize, direct_lm_head_q4_0_argmax_prefix_rows_default) * row_bytes <= direct_lm_head_q4_0_argmax_max_weight_bytes);
     try std.testing.expectEqual(
         @as(u32, 4096),
-        directLmHeadQ4_0ArgmaxPrefixRows(4096, row_bytes, 4096),
+        directLmHeadQ4_0ArgmaxPrefixRowsForLimit(4096, row_bytes, 4096, direct_lm_head_q4_0_argmax_prefix_rows_default),
+    );
+    try std.testing.expectEqual(
+        @as(u32, direct_lm_head_q4_0_parallel_chunk_rows),
+        directLmHeadQ4_0ArgmaxPrefixRowsForLimit(4096, row_bytes, 4096, 64),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 4096),
+        directLmHeadQ4_0ArgmaxPrefixRowsForLimit(4096, row_bytes, 4096, 4096),
     );
 
     const larger_hidden_row_bytes = rowBytesForType(.q4_0, 4096);
-    const clipped_rows = directLmHeadQ4_0ArgmaxPrefixRows(4096, larger_hidden_row_bytes, 4096);
+    const clipped_rows = directLmHeadQ4_0ArgmaxPrefixRowsForLimit(4096, larger_hidden_row_bytes, 4096, 4096);
     try std.testing.expect(clipped_rows < 4096);
     try std.testing.expect(clipped_rows >= direct_lm_head_q4_0_parallel_chunk_rows);
     try std.testing.expectEqual(@as(u32, 0), clipped_rows % direct_lm_head_q4_0_parallel_chunk_rows);

@@ -147,6 +147,7 @@ This section is the ground truth of what is in tree *today*, ahead of every aspi
 | `ZINC_RT_DIRECT_DECODE_FULL_SLICE` | 0 | Enable broad per-layer decode row-range validation slices; default runs only the cheaper consumed LM-head proof |
 | `ZINC_RT_DIRECT_DECODE_SLICE_CADENCE` | 0 | Full-slice validation cadence when explicitly enabled; setting this var also opts into full-slice validation |
 | `ZINC_RT_DIRECT_LM_HEAD_DECODE_CADENCE` | 0 | LM-head prefix DMMV proof cadence during decode; 0 = first generated token only, N = first token plus every N generated tokens |
+| `ZINC_RT_DIRECT_LM_HEAD_PREFIX_ROWS` | 4096 | Rows in the consumed LM-head prefix proof; set 64 for one-chunk smoke runs |
 | `ZINC_RT_DIRECT_ROUTER_TRUST_AFTER_SUCCESSES` | 1 | After this many validated full Q8_0 router row-range successes, later full router replacements finite-check GPU logits instead of re-running selected CPU dot oracles; 0 disables |
 | `ZINC_RT_DIRECT_SSM_Q8_ROW_RANGE_MAX_SUCCESSES` | 2 | Per tracked decode slice cap on consumed direct SSM alpha/beta F32/Q8_0 row-range successes; set `0` to disable the serial M1 SSM row-range verifier |
 | `ZINC_RT_DIRECT_SSM_Q8_TRUST_AFTER_SUCCESSES` | 1 | After this many validated alpha/beta pair successes, later paired direct Q8_0 SSM row ranges skip the CPU oracle and only finite-check GPU rows; 0 disables |
