@@ -71,8 +71,12 @@ const RmsKvWritePush = extern struct { head_dim: u32, eps: f32, dst_offset: u32 
 // Batched-prefill twins (grid.y = T): explicit per-token src/dst strides.
 const RmsRopeBatchPush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, base_position: u32, src_stride: u32, dst_stride: u32 };
 const RmsKvWriteBatchPush = extern struct { head_dim: u32, eps: f32, src_stride: u32, dst_stride: u32 };
+// Decode fusion: per-head Q/K rms_norm + RoPE + KV-write in one launch.
+const RmsRopeQkvPush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, position: u32, n_head: u32, n_kv_head: u32, kv_offset: u32 };
 const SwigluPush = extern struct { N: u32 };
 const F32ToF16Push = extern struct { N: u32 }; // cycle 12: activation downcast for the TC f16-A GEMM
+const DequantQ4KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 }; // e26 c9: Q4_K weight → fp16 for the cuBLAS prefill GEMM
+const DequantQ6KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 }; // e26 c10: Q6_K weight → fp16 for the cuBLAS prefill GEMM (ffn_down)
 const ScaleAccPush = extern struct { N: u32, scale: f32 };
 const ScalarMulPush = extern struct { N: u32 };
 const ArgmaxPush = extern struct { N: u32 };
@@ -105,6 +109,8 @@ const GemmPush = extern struct {
     y_offset: u32 = 0,
     acc_mode: u32 = 0,
 };
+// Decode fusion: fused dual Q4_K matvec (two same-input weights → two outputs in one launch).
+const Dmmv2Push = extern struct { M0: u32, M1: u32, K: u32 };
 
 fn dmmvIdx(t: gguf.GGMLType) usize {
     return switch (t) {
@@ -154,12 +160,16 @@ const Pipelines = struct {
     rms_norm_noweight: CudaPipeline,
     rms_norm_residual: CudaPipeline,
     rms_norm_residual_scale: CudaPipeline,
+    rms_norm_residual_norm: CudaPipeline,
+    rms_norm_residual_scale_norm: CudaPipeline,
     rms_norm_rope: CudaPipeline,
+    rms_norm_rope_qkv: CudaPipeline,
     rms_norm_kvwrite: CudaPipeline,
     rms_norm_rope_batched: CudaPipeline,
     rms_norm_kvwrite_batched: CudaPipeline,
     dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
+    dmmv_q4k_fast_dual: CudaPipeline, // fuse gate/up & Q/K same-input Q4_K matvecs
     rope: CudaPipeline,
     gemma_attention: CudaPipeline,
     gemma_attention_batched: CudaPipeline,
@@ -235,6 +245,8 @@ const Pipelines = struct {
     // the m128/m64/lowsmem kernels (same wmma math; phases only reorder writes).
     gemm_q4k_tc_f16a_m128_lowsmem: CudaPipeline,
     f32_to_f16: CudaPipeline, // element-wise activation downcast for the TC f16-A path
+    dequant_q4k_to_f16: CudaPipeline, // e26 c9: full Q4_K weight → fp16 for the cuBLAS prefill GEMM
+    dequant_q6k_to_f16: CudaPipeline, // e26 c10: full Q6_K weight → fp16 for the cuBLAS prefill GEMM (ffn_down)
     // Cycle 21: fp16-EMITTING producers for the TC path — write the normalized /
     // GeGLU activation directly as half into act_f16 (byte-for-byte f32_to_f16 of
     // their f32 twins), dropping the per-GEMM recast launch entirely.
@@ -277,6 +289,10 @@ const BatchScratch = struct {
     // Effort 24 cycle 12: fp16 activation scratch for the TC f16-A GEMM path
     // ([T, ff_buf_max] halves; sized to the largest activation; TC opt-in only).
     act_f16: CudaBuffer,
+    // Effort 26 cycle 9: fp16 dense-weight scratch for the cuBLAS prefill GEMM
+    // (dequant Q4_K [M,K] → here, then cublasGemmEx). Sized to the largest dense
+    // Q4_K weight (max(ff,q_dim,n_embd)·max(n_embd,q_dim) halves). cuBLAS opt-in.
+    w_f16: CudaBuffer,
 };
 
 pub const ForwardGemma = struct {
@@ -338,6 +354,9 @@ pub const ForwardGemma = struct {
     // Opt-in (ZINC_BATCHED_TC, read once per prefillBatched); off by default so
     // the proven byte-identical path is unchanged. NOT byte-identical when on.
     use_tc: bool = false,
+    use_cublas: bool = false, // e26 c9: dense Q4_K prefill GEMMs via cuBLAS fp16 TC (dequant W→fp16 + cublasGemmEx). DEFAULT-ON (opt out ZINC_BATCHED_CUBLAS=0/off); supersedes the use_tc Q4_K (idx==0) branch when T >= cublas_min_t.
+    use_cublas_q6: bool = false, // e26 c10: also route Q6_K dense GEMMs (gemma-31b ffn_down, ~1/7 of the dense GEMM, was still on gemm_q6k_tc_f16a) through cuBLAS fp16 TC. DEFAULT-ON when use_cublas (opt out ZINC_BATCHED_CUBLAS_NOQ6); same T >= cublas_min_t gate.
+    cublas_min_t: u32 = 128, // e26 c9: only route Q4_K GEMMs through cuBLAS when the token batch T >= this (the dequant→fp16 round-trip is a fixed per-weight cost; cuBLAS wins +76% @T=512 / +15% @T=128 but is break-even @T=64). Below it, fall back to gemm_q4k_tc.
     use_tc_plain: bool = false, // cycle 12 A/B: force cycle-11 plain TC (no f16-A pre-convert)
     use_tc_q6: bool = true, // cycle 13 A/B: ZINC_BATCHED_TC_NOQ6 forces Q6_K back to f32 TC-off
     use_tc_m128: bool = false, // cycle 14 A/B: ZINC_BATCHED_TC_M128 opts into the wider 128x64 Q4_K TC kernel (NEGATIVE: -11.8%, off by default)
@@ -414,7 +433,10 @@ pub const ForwardGemma = struct {
         pipes.rms_norm_noweight = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_noweight");
         pipes.rms_norm_residual = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual");
         pipes.rms_norm_residual_scale = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_scale");
+        pipes.rms_norm_residual_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_norm");
+        pipes.rms_norm_residual_scale_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_scale_norm");
         pipes.rms_norm_rope = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope");
+        pipes.rms_norm_rope_qkv = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope_qkv");
         pipes.rms_norm_kvwrite = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite");
         pipes.rms_norm_rope_batched = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope_batched");
         pipes.rms_norm_kvwrite_batched = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite_batched");
@@ -428,6 +450,7 @@ pub const ForwardGemma = struct {
         pipes.dmmv_fast[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_fast");
         pipes.dmmv_fast[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_fast");
         pipes.dmmv_fast[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_fast");
+        pipes.dmmv_q4k_fast_dual = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_fast_dual");
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.gemma_attention = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention");
         pipes.gemma_attention_batched = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention_batched");
@@ -464,6 +487,8 @@ pub const ForwardGemma = struct {
         pipes.gemm_q6k_tc_f16a_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_f16a_lowsmem");
         pipes.gemm_q4k_tc_f16a_m128_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_f16a_m128_lowsmem");
         pipes.f32_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "f32_to_f16");
+        pipes.dequant_q4k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q4k_to_f16");
+        pipes.dequant_q6k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q6k_to_f16");
         pipes.rms_norm_f16 = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_f16");
         pipes.geglu_f16 = try pipeline.createPipeline(ctx, src.ptr, "geglu_f16");
         log.info("nvrtc: compiled gemma4 kernel pipelines", .{});
@@ -707,10 +732,30 @@ pub const ForwardGemma = struct {
         const T: u32 = @intCast(tokens.len);
         const f4 = @sizeOf(f32);
         const moe = d.n_experts > 0; // gemma-26b-a4b: batched attn + per-token MoE FFN
-        // Cycle 11: opt-in fp16 tensor-core GEMM for the dense Q4_K projections/FFN.
+        // Cycle 11: fp16 tensor-core GEMM for the dense Q4_K projections/FFN.
         // Read once here so gemmDispatch can pick the kernel per weight without a
-        // getenv per launch. Off by default → the byte-identical path is unchanged.
-        self.use_tc = std.posix.getenv("ZINC_BATCHED_TC") != null;
+        // getenv per launch.
+        // Effort 26 cycle 1: DEFAULT ON. Re-profiling on the RTX 5090 (Blackwell)
+        // showed gemma-31b dense prefill is COMPUTE-bound (~100% util at full
+        // 2850 MHz boost), not launch-bound — so the tensor-core GEMM is a real
+        // end-to-end win here (+24% prefill, ABBA x3, 5090; catalog 5/5
+        // token-correct). Effort 24 found it neutral on the 4090 (weaker fp16 TC),
+        // never negative, so defaulting on is safe there. Opt out with
+        // ZINC_BATCHED_TC=0/off/false/no (the A/B kill-switch back to the
+        // f32 register-tiled GEMM).
+        self.use_tc = tcDefaultOn();
+        // Effort 26 cycle 9: dense Q4_K prefill GEMMs run on cuBLAS fp16 tensor
+        // cores (dequant W→fp16 + cublasGemmEx). DEFAULT-ON (opt out
+        // ZINC_BATCHED_CUBLAS=0/off/false/no) — validated catalog 5/5 token-correct
+        // and +76% on gemma-31b dense prefill @T=512 (the effort's #1 gap row),
+        // neutral on gemma-26b. Gated on T >= cublas_min_t in gemmDispatchA so
+        // short prompts keep the proven gemm_q4k_tc path.
+        self.use_cublas = cublasDefaultOn();
+        // Effort 26 cycle 10: extend the cuBLAS prefill GEMM to Q6_K dense weights
+        // (gemma-31b ffn_down — ~1/7 of the dense GEMM, still on gemm_q6k_tc_f16a
+        // after cycle 9). DEFAULT-ON when cuBLAS is on; ZINC_BATCHED_CUBLAS_NOQ6
+        // forces Q6_K back to the hand TC kernel (the cycle-10 A/B kill-switch).
+        self.use_cublas_q6 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
         // Cycle 12 A/B knob: ZINC_BATCHED_TC_PLAIN forces the cycle-11 plain TC
         // GEMM (f32 activation re-read per M-block) instead of the cycle-12 f16-A
         // path (activation pre-converted to fp16 once). Lets us measure the f16-A
@@ -1043,6 +1088,37 @@ pub const ForwardGemma = struct {
         };
         if (gi) |idx| {
             const push = GemmPush{ .M = M, .K = K, .T = T };
+            // Effort 26 cycle 9: dense Q4_K GEMM (idx 0) on cuBLAS fp16 tensor
+            // cores — ~6× gemm_q4k_tc in isolation. (1) dequant the Q4_K weight
+            // [M,K] → fp16 (b.w_f16); (2) downcast the f32 activation [T,K] → fp16
+            // (b.act_f16) once; (3) cublasGemmEx fp16→fp32. All three run on the
+            // ctx stream (dequant/convert via cmd, cuBLAS via cublasSetStream) so
+            // they are correctly ordered. fp16-rounded → token-correctness gate
+            // (same as the TC path), NOT byte-identical. Gated on T >= cublas_min_t:
+            // the full-weight dequant→fp16 round-trip is a fixed per-GEMM cost, so
+            // cuBLAS only wins once it amortizes over enough tokens (+76% @T=512,
+            // +15% @T=128, break-even @T=64) — below that, fall through to gemm_q4k_tc.
+            // Cycle 10: idx==2 (Q6_K, gemma-31b ffn_down) also rides cuBLAS when
+            // use_cublas_q6 — a dedicated dequant_q6k_to_f16 fills the SAME w_f16
+            // scratch (sized to the largest dense weight = ff·n_embd, which covers
+            // the down weight) and the cuBLAS call is shape-generic.
+            if (self.use_cublas and T >= self.cublas_min_t and (idx == 0 or (idx == 2 and self.use_cublas_q6))) {
+                const b = &self.batch.?;
+                if (idx == 0) {
+                    const dq = DequantQ4KPush{ .M = M, .K = K };
+                    cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ4KPush), 0);
+                } else {
+                    const dq = DequantQ6KPush{ .M = M, .K = K };
+                    cmd.dispatch(&self.pipes.dequant_q6k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ6KPush), 0);
+                }
+                const a16 = &b.act_f16;
+                if (!(a_preconv and (self.use_tc_sharea or self.use_tc_normf16))) {
+                    const cvt = F32ToF16Push{ .N = T * K };
+                    cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
+                }
+                shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(T), @intCast(K), b.w_f16.handle, a16.handle, y.handle);
+                return;
+            }
             // Cycle 11: when ZINC_BATCHED_TC is set, Q4_K GEMMs (idx 0 — the bulk of
             // the dense FLOPs: gate/up + attn Q/K/V/O) run on the fp16 tensor cores.
             if (self.use_tc and idx == 0 and self.use_tc_plain) {
@@ -1167,13 +1243,16 @@ pub const ForwardGemma = struct {
             // TC Q4_K GEMMs read A with K ∈ {n_embd (gate/up,Q/K/V), q_dim (O)};
             // size to the max of those and ff for headroom.
             .act_f16 = try buffer.createBuffer(ctx, T * @max(ff, @max(d.q_dim_max, d.n_embd)) * @sizeOf(u16)),
+            // Largest dense Q4_K weight: gate/up (ff·n_embd), O (n_embd·q_dim),
+            // Q (q_dim·n_embd). max(M)·max(K) is a safe upper bound on M·K.
+            .w_f16 = try buffer.createBuffer(ctx, @max(ff, @max(d.q_dim_max, d.n_embd)) * @max(d.n_embd, d.q_dim_max) * @sizeOf(u16)),
         };
         return &self.batch.?;
     }
 
     fn freeBatch(self: *ForwardGemma) void {
         if (self.batch) |*bb| {
-            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table, &bb.moe_norm_e, &bb.gate_e, &bb.up_e, &bb.geglu_e, &bb.down_e, &bb.moe_out_e, &bb.expert_order, &bb.act_f16 }) |buf| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table, &bb.moe_norm_e, &bb.gate_e, &bb.up_e, &bb.geglu_e, &bb.down_e, &bb.moe_out_e, &bb.expert_order, &bb.act_f16, &bb.w_f16 }) |buf| {
                 buffer.freeBuffer(buf);
             }
             self.batch = null;
@@ -1197,36 +1276,44 @@ pub const ForwardGemma = struct {
         const wo = self.layer(L, "attn_output.weight");
         const wpan = self.layer(L, "post_attention_norm.weight");
 
+        // Dense gemma folds each block's INPUT norm into the PRECEDING block's
+        // output norm+residual (see rms_norm_residual_norm). When folding, the
+        // pre-attn norm (norm_buf) is produced by the previous layer's fused
+        // post-ffn kernel — only layer 0 needs the standalone pre-attn norm.
+        const fold = d.n_experts == 0;
+
         var cmd = try command.beginCommand(ctx);
         // pre-attention norm (gemma rms, +1 baked in)
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
-        // Q, K projections; V from Wv if present, else the raw K projection.
-        self.dmmvDispatch(&cmd, wq, &self.norm_buf, &self.q_buf, g.q_dim, d.n_embd, 0, 0);
-        self.dmmvDispatch(&cmd, wk, &self.norm_buf, &self.k_buf, g.kv_dim, d.n_embd, 0, 0);
+        if (!fold or L == 0) {
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        }
+        // Q, K projections; V from Wv if present, else the raw K projection. Q & K
+        // share the pre-attention norm input — when both are Q4_K, fuse the two
+        // matvecs into one launch (q_buf gets the Q rows, k_buf the K rows).
+        if (dmmvIdx(wq.info.type_) == 0 and dmmvIdx(wk.info.type_) == 0) {
+            self.dmmvDualQ4k(&cmd, wq, wk, &self.norm_buf, &self.q_buf, &self.k_buf, g.q_dim, g.kv_dim, d.n_embd);
+        } else {
+            self.dmmvDispatch(&cmd, wq, &self.norm_buf, &self.q_buf, g.q_dim, d.n_embd, 0, 0);
+            self.dmmvDispatch(&cmd, wk, &self.norm_buf, &self.k_buf, g.kv_dim, d.n_embd, 0, 0);
+        }
         const v_src: *const CudaBuffer = if (wv_opt) |wv| blk: {
             self.dmmvDispatch(&cmd, wv, &self.norm_buf, &self.v_buf, g.kv_dim, d.n_embd, 0, 0);
             break :blk &self.v_buf;
         } else &self.k_buf;
-        // Per-head V plain-normalize (no weight) FUSED with the V KV-cache write:
-        // one launch normalizes V and writes it straight into kv_v at this
-        // position (was rms_norm_noweight→v_buf + the V half of kv_cache_write).
-        // Issued before the Q/K norm+rope because v_src may alias k_buf (the
-        // un-normed K projection on full-attention layers) — and rope no longer
-        // overwrites k_buf (K writes straight to its cache), so k_buf stays raw.
+        // Per-head V/Q/K norm FUSED into ONE launch (was 3): V plain-normalize +
+        // KV-write (rms_norm_kvwrite), Q norm+rope, K norm+rope (rms_norm_rope ×2).
+        // Grid = n_head + 2*n_kv_head blocks: Q heads first (norm+rope → q_buf,
+        // offset 0), then K heads (norm+rope → kv_k at pos*kv_dim), then V heads
+        // (plain norm → kv_v at pos*kv_dim). Bit-identical per-branch arithmetic;
+        // no cross-block hazard (K→kv_k, V→kv_v, Q in-place; nobody reads another
+        // block's destination), so v_src aliasing k_buf on full-attention layers is
+        // safe (k_buf is read-only here — K writes straight to its cache).
         const kv_off = pos * g.kv_dim;
-        const rms_kvw = RmsKvWritePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .dst_offset = kv_off };
-        cmd.dispatch(&self.pipes.rms_norm_kvwrite, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ v_src, &self.kv_v[L] }, &rms_kvw, @sizeOf(RmsKvWritePush), 0);
-        // Q/K: per-head rms_norm fused with NEOX RoPE (this layer's inv_freq
-        // table, attn_scale 1.0) — one launch each, no normalized round-trip.
-        // Q stays in q_buf (dst_offset 0); K writes its norm+roped head straight
-        // into kv_k at this position, folding away the K half of kv_cache_write.
         const inv_freq = if (g.is_swa) &self.inv_freq_swa else &self.inv_freq_full;
-        const nr_q = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = 0 };
-        const nr_k = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = kv_off };
+        const qkv = RmsRopeQkvPush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .n_head = d.n_head, .n_kv_head = g.n_kv_head, .kv_offset = kv_off };
         const nr_sh = g.head_dim * @sizeOf(f32);
-        cmd.dispatch(&self.pipes.rms_norm_rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &wqn.gpu_buffer, inv_freq, &self.q_buf }, &nr_q, @sizeOf(RmsRopePush), nr_sh);
-        cmd.dispatch(&self.pipes.rms_norm_rope, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &wkn.gpu_buffer, inv_freq, &self.kv_k[L] }, &nr_k, @sizeOf(RmsRopePush), nr_sh);
+        cmd.dispatch(&self.pipes.rms_norm_rope_qkv, .{ d.n_head + 2 * g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.k_buf, v_src, &wqn.gpu_buffer, &wkn.gpu_buffer, inv_freq, &self.q_buf, &self.kv_k[L], &self.kv_v[L] }, &qkv, @sizeOf(RmsRopeQkvPush), nr_sh);
         // attention (scale=1.0, sliding window on SWA layers) → attn_out_buf
         const seq_len = pos + 1;
         const window: u32 = if (g.is_swa) d.sliding_window else 0;
@@ -1243,7 +1330,14 @@ pub const ForwardGemma = struct {
         self.dmmvDispatch(&cmd, wo, &self.attn_out_buf, &self.o_buf, d.n_embd, g.q_dim, 0, 0);
         // post-attention norm (gemma rms) on the attention output, fused with the
         // residual add into `hidden` (scale 1.0) — one launch, no o_buf round-trip.
-        cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
+        // When folding, the SAME launch also produces the pre-ffn norm
+        // (ffn_norm_buf), so ffnBlock skips its standalone pre-ffn norm.
+        if (fold) {
+            const wfn = self.layer(L, "ffn_norm.weight");
+            cmd.dispatch(&self.pipes.rms_norm_residual_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
+        }
         self.submit(cmd);
     }
 
@@ -1261,20 +1355,43 @@ pub const ForwardGemma = struct {
         // self-skips dense layers). Absent → plain rms_norm_residual.
         const wlos = self.model.getLayer(L, "layer_output_scale.weight");
 
+        // Dense gemma folds each block's INPUT norm into the PRECEDING block's
+        // output norm+residual: the pre-ffn norm (ffn_norm_buf) was produced by
+        // this layer's fused post-attn kernel, and this block's post-ffn kernel
+        // produces the NEXT layer's pre-attn norm (norm_buf).
+        const fold = d.n_experts == 0;
+
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-        // pre-ffn norm
-        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
-        // GeGLU FFN: gelu(gate) * up → down
-        self.dmmvDispatch(&cmd, wgate, &self.ffn_norm_buf, &self.gate_buf, d.n_ff, d.n_embd, 0, 0);
-        self.dmmvDispatch(&cmd, wup, &self.ffn_norm_buf, &self.up_buf, d.n_ff, d.n_embd, 0, 0);
+        // pre-ffn norm (skipped when folded — ffn_norm_buf already filled)
+        if (!fold) {
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        }
+        // GeGLU FFN: gelu(gate) * up → down. gate & up share the pre-ffn norm
+        // input — when both are Q4_K, fuse the two matvecs into one launch.
+        if (dmmvIdx(wgate.info.type_) == 0 and dmmvIdx(wup.info.type_) == 0) {
+            self.dmmvDualQ4k(&cmd, wgate, wup, &self.ffn_norm_buf, &self.gate_buf, &self.up_buf, d.n_ff, d.n_ff, d.n_embd);
+        } else {
+            self.dmmvDispatch(&cmd, wgate, &self.ffn_norm_buf, &self.gate_buf, d.n_ff, d.n_embd, 0, 0);
+            self.dmmvDispatch(&cmd, wup, &self.ffn_norm_buf, &self.up_buf, d.n_ff, d.n_embd, 0, 0);
+        }
         const sg = SwigluPush{ .N = d.n_ff };
         cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
         self.dmmvDispatch(&cmd, wdown, &self.geglu_buf, &self.down_buf, d.n_embd, d.n_ff, 0, 0);
         // post-ffn norm (gemma rms) on the FFN output, fused with the residual add
         // into `hidden` (scale 1.0) — one launch, no down_buf round-trip. When the
         // per-layer output scale is present it is folded in here too (one launch).
-        if (wlos) |ws| {
+        // When folding and not the last layer, the SAME launch also produces the
+        // NEXT layer's pre-attn norm (norm_buf), so attentionLayer(L+1) skips it.
+        const fold_next = fold and (L + 1 < d.n_layers);
+        if (fold_next) {
+            const wan_next = self.layer(L + 1, "attn_norm.weight");
+            if (wlos) |ws| {
+                cmd.dispatch(&self.pipes.rms_norm_residual_scale_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden, &ws.gpu_buffer, &wan_next.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.rms_norm_residual_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden, &wan_next.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            }
+        } else if (wlos) |ws| {
             cmd.dispatch(&self.pipes.rms_norm_residual_scale, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden, &ws.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
         } else {
             cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
@@ -1717,37 +1834,37 @@ pub const ForwardGemma = struct {
             // self.down_buf aliases this token's b.down_e slice → skip straight to the
             // accumulate. Otherwise compute this token's routed experts in place.
             if (!preexperts) {
-            const gu_half = expertSliceBytes(wgu.info.type_, ef, d.n_embd); // ef rows
-            const gu_full = gu_half * 2; // 2*ef rows per expert
-            const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
-            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wpre2.gpu_buffer, &self.moe_norm_buf }, &rms, @sizeOf(RmsPush), 0);
-            if (batched) {
-                const nrows = n_used * ef;
-                const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = 0 };
-                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
-                const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = gu_half };
-                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
-                const sgb = SwigluPush{ .N = nrows };
-                cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(nrows, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sgb, @sizeOf(SwigluPush), 0);
-                const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0 };
-                cmd.dispatch(&self.pipes.dmmv_q5_1_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
-            } else {
-                const sg = SwigluPush{ .N = ef };
-                var j: u32 = 0;
-                while (j < n_used) : (j += 1) {
-                    const id = self.host_router[j];
-                    self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gu_full);
-                    self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * gu_full + gu_half);
-                    cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
-                    const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
-                    const didx = dmmvIdx(wde.info.type_);
-                    if (didx < 4) {
-                        cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
-                    } else {
-                        cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                const gu_half = expertSliceBytes(wgu.info.type_, ef, d.n_embd); // ef rows
+                const gu_full = gu_half * 2; // 2*ef rows per expert
+                const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+                cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wpre2.gpu_buffer, &self.moe_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+                if (batched) {
+                    const nrows = n_used * ef;
+                    const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = 0 };
+                    cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
+                    const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = gu_half };
+                    cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                    const sgb = SwigluPush{ .N = nrows };
+                    cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(nrows, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sgb, @sizeOf(SwigluPush), 0);
+                    const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0 };
+                    cmd.dispatch(&self.pipes.dmmv_q5_1_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
+                } else {
+                    const sg = SwigluPush{ .N = ef };
+                    var j: u32 = 0;
+                    while (j < n_used) : (j += 1) {
+                        const id = self.host_router[j];
+                        self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gu_full);
+                        self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * gu_full + gu_half);
+                        cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                        const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                        const didx = dmmvIdx(wde.info.type_);
+                        if (didx < 4) {
+                            cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                        } else {
+                            cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                        }
                     }
                 }
-            }
             } // end if (!preexperts)
             const zp = ZeroPush{ .N = d.n_embd };
             cmd.dispatch(&self.pipes.zero_vec, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{&self.moe_out_buf}, &zp, @sizeOf(ZeroPush), 0);
@@ -1837,6 +1954,16 @@ pub const ForwardGemma = struct {
         }
     }
 
+    /// Fuse two same-input Q4_K matvecs (w0→y0 [M0 rows], w1→y1 [M1 rows], shared
+    /// input x of inner dim K) into ONE launch over M0+M1 blocks — removes a
+    /// kernel-launch boundary. Both weights MUST be Q4_K (caller-checked); each
+    /// block's compute is bit-identical to dmmvDispatch's fast path. Used for the
+    /// gemma FFN gate/up and attention Q/K pairs.
+    fn dmmvDualQ4k(self: *ForwardGemma, cmd: *command.CudaCommand, w0: *const LoadedTensor, w1: *const LoadedTensor, x: *const CudaBuffer, y0: *const CudaBuffer, y1: *const CudaBuffer, M0: u32, M1: u32, K: u32) void {
+        const push = Dmmv2Push{ .M0 = M0, .M1 = M1, .K = K };
+        cmd.dispatch(&self.pipes.dmmv_q4k_fast_dual, .{ M0 + M1, 1, 1 }, .{ 64, 1, 1 }, &.{ &w0.gpu_buffer, &w1.gpu_buffer, x, y0, y1 }, &push, @sizeOf(Dmmv2Push), 0);
+    }
+
     // ---- async decode command ring (mirror ForwardCuda) ---------------------
     /// Dense path (n_experts==0): commit the per-block command asynchronously on
     /// the shared auto-ordered CUstream and stash it — the CPU never blocks per
@@ -1881,6 +2008,31 @@ pub const ForwardGemma = struct {
 
 fn ceilDiv(a: u32, b: u32) u32 {
     return (a + b - 1) / b;
+}
+
+/// Effort 26 cycle 1: the fp16 tensor-core dense GEMM is now ON by default for
+/// gemma prefill (a real +24% on the RTX 5090, neutral on the 4090). True unless
+/// ZINC_BATCHED_TC is explicitly off (0/off/false/no) — the A/B kill-switch back
+/// to the f32 register-tiled GEMM. Mirrors batchedPrefillDefaultOn's parsing.
+fn tcDefaultOn() bool {
+    const v = std.posix.getenv("ZINC_BATCHED_TC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+// Effort 26 cycle 9: the cuBLAS dense Q4_K prefill GEMM is default-ON (opt out
+// ZINC_BATCHED_CUBLAS=0/off/false/no). It is +76% on gemma-31b dense prefill at
+// T=512 (the effort's #1 gap row) and neutral on gemma-26b (whose FLOPs are in
+// the experts, not the small dense attn-proj GEMMs cuBLAS touches). The win is
+// T-dependent (the full-weight dequant→fp16 round-trip is a fixed cost amortized
+// over T tokens): +76% @T=512, +15% @T=128, break-even @T=64 — so the dispatch
+// gates cuBLAS on T >= cublas_min_t (128) and falls back to the proven gemm_q4k_tc
+// path for short prompts. qwen (no batched gemma path) and all decode are
+// untouched (prefill-only path).
+fn cublasDefaultOn() bool {
+    const v = std.posix.getenv("ZINC_BATCHED_CUBLAS") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
 
 /// Bytes for one expert's [rows × cols] slice in a stacked/fused MoE weight

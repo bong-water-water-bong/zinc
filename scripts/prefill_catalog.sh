@@ -49,7 +49,7 @@ ROUNDS=${ZINC_ROUNDS:-2}
 ONLY=${ZINC_ONLY:-}
 MODE=${ZINC_AB:-headskip}
 case "$MODE" in
-  headskip) S_ENV="ZINC_PREFILL_SKIP=1"; S_LABEL="headskip" ;;
+  headskip) S_ENV="ZINC_BATCHED_PREFILL=0 ZINC_PREFILL_SKIP=1"; S_LABEL="headskip" ;;
   batched)  S_ENV="ZINC_BATCHED_PREFILL=1"; S_LABEL="batched"
             # Cycle 11: ZINC_BATCHED_TC=1 also routes dense Q4_K GEMMs through the
             # fp16 tensor-core kernel (NOT byte-identical → expect GEN_IDS may
@@ -91,7 +91,10 @@ PROMPT=$(seq -s, 1 "$PROMPT_LEN")
 pf_of() { sed -E 's/.* = ([0-9.]+) tok.*/\1/' <<<"$1"; }
 run_one() { # $1 = B|S -> echoes "<tok/s>|<GEN_IDS line>"
   local o
-  if [ "$1" = "B" ]; then o=$(timeout 600 "$ZBIN" gen "$PROMPT" "$NGEN" "$2" 2>&1)
+  # Effort 25: batched prefill is now the DEFAULT for gemma, so the baseline arm
+  # must explicitly opt OUT (ZINC_BATCHED_PREFILL=0) to be the true per-token path
+  # — otherwise "B" would also run batched and the A/B would show ~0% gain.
+  if [ "$1" = "B" ]; then o=$(env ZINC_BATCHED_PREFILL=0 timeout 600 "$ZBIN" gen "$PROMPT" "$NGEN" "$2" 2>&1)
   else o=$(env $S_ENV timeout 600 "$ZBIN" gen "$PROMPT" "$NGEN" "$2" 2>&1); fi
   printf '%s|%s' "$(pf_of "$(grep -E 'PREFILL' <<<"$o" | tail -1)")" "$(grep -E 'GEN_IDS' <<<"$o" | tail -1)"
 }

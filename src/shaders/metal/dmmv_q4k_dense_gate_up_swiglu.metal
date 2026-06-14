@@ -36,6 +36,10 @@ struct DualQ4KDmmvPush {
 #define BLOCK_SIZE 144
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
+#ifndef ZINC_Q4K_GATE_UP_SWIGLU_FIXED_BLOCKS
+#define ZINC_Q4K_GATE_UP_SWIGLU_FIXED_BLOCKS 0
+#endif
+
 inline float swiglu(float gate, float up) {
     // SiLU(gate) * up = (gate / (1 + exp(-gate))) * up
     // fast::exp maps to Apple GPU hardware exp2 (vs precise::exp polynomial).
@@ -60,9 +64,17 @@ kernel void main0(
     const short iq = it / 4;
     const short ir = it % 4;
 
+#if ZINC_Q4K_GATE_UP_SWIGLU_FIXED_BLOCKS
+    constexpr int nb = ZINC_Q4K_GATE_UP_SWIGLU_FIXED_BLOCKS;
+#else
     const int nb = p.K / QK_K;
+#endif
     const int first_row = (tgpig.x * NSG + sgitg) * NR0;
+#if ZINC_Q4K_GATE_UP_SWIGLU_FIXED_BLOCKS
+    constexpr int row_bytes = ZINC_Q4K_GATE_UP_SWIGLU_FIXED_BLOCKS * BLOCK_SIZE;
+#else
     const int row_bytes = nb * BLOCK_SIZE;
+#endif
 
     device const uchar* gate_src = W0 + p.a0_offset;
     device const uchar* up_src = W1 + p.a1_offset;

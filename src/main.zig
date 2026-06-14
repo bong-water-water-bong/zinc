@@ -1697,6 +1697,17 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
     return runCudaDecode(&fwd, &model, config, max_ctx, allocator);
 }
 
+/// Effort 25: batched-GEMM prefill is the DEFAULT for the gemma forwards
+/// (ForwardGemma exposes `prefillBatched`; the call site gates it at comptime so
+/// the qwen forward — which has none — stays per-token regardless). Returns true
+/// unless ZINC_BATCHED_PREFILL is explicitly set to an off value (0/off/false/no),
+/// the opt-OUT back to the per-token prefill loop for debugging. Unset → on.
+fn batchedPrefillDefaultOn() bool {
+    const v = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
 /// Tokenize the prompt, prefill, greedily generate, and print — shared by the
 /// qwen and gemma CUDA forward paths (`fwd` is duck-typed: needs `decodeStep`
 /// and `d.vocab`).
@@ -1745,15 +1756,28 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     var pos: u32 = 0;
     var next_tok: u32 = 0;
     var prefill_timer = try std.time.Timer.start();
-    // Effort 24: ZINC_BATCHED_PREFILL routes the whole prompt through the batched
-    // GEMM prefill (gemma dense only; the method internally falls back for MoE).
-    // Gated at comptime so the qwen forward (no prefillBatched) still compiles.
+    // Effort 25: batched-GEMM prefill is now the DEFAULT for gemma — it runs the
+    // whole prompt through the batched path (gemma dense + MoE attention/FFN; the
+    // method handles MoE internally) and is output-identical to the per-token
+    // loop but ~4.6–4.7× faster. ZINC_BATCHED_PREFILL=0/off opts back out to the
+    // per-token loop. Gated at comptime so the qwen forward (no prefillBatched)
+    // stays per-token and still compiles.
     var used_batched = false;
     if (comptime @hasDecl(@TypeOf(fwd.*), "prefillBatched")) {
-        if (std.posix.getenv("ZINC_BATCHED_PREFILL") != null and prompt_tokens.len > 1) {
-            next_tok = try fwd.prefillBatched(prompt_tokens);
-            pos = @intCast(prompt_tokens.len);
-            used_batched = true;
+        if (batchedPrefillDefaultOn() and prompt_tokens.len > 1) {
+            // Default-on path: degrade gracefully to the per-token loop if the
+            // batched path fails (e.g. a large-prompt scratch allocation on a
+            // memory-tight box) instead of aborting the whole run. The happy
+            // path is byte-for-byte unchanged; a fallback is LOGGED so a real
+            // regression on short prompts stays visible in the validate gate.
+            // Mirrors the dbg_cuda harness, which already falls back on error.
+            if (fwd.prefillBatched(prompt_tokens)) |first| {
+                next_tok = first;
+                pos = @intCast(prompt_tokens.len);
+                used_batched = true;
+            } else |err| {
+                log.warn("batched prefill failed ({s}); falling back to per-token", .{@errorName(err)});
+            }
         }
     }
     if (!used_batched) {

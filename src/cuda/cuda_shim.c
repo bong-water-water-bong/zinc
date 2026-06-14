@@ -5,13 +5,15 @@
 #include "cuda_shim.h"
 #include <cuda.h>
 #include <nvrtc.h>
+#include <cublas_v2.h>
+#include <cuda_runtime_api.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define MAX_DISPATCH_BUFS 32
 
-struct CudaCtx { CUdevice dev; CUcontext ctx; CUstream stream; };
+struct CudaCtx { CUdevice dev; CUcontext ctx; CUstream stream; cublasHandle_t cublas; };
 struct CudaBuf { CUdeviceptr dptr; size_t size; void* host; int owns; int owns_host; };
 struct CudaPipe { CUmodule mod; CUfunction fn; };
 struct CudaCmd { CUstream stream; CUevent event; };
@@ -44,13 +46,41 @@ CudaCtx* cuda_init(int device_index) {
     if (!cu_ok(cuDevicePrimaryCtxRetain(&c->ctx, c->dev), "cuDevicePrimaryCtxRetain")) { free(c); return NULL; }
     if (!cu_ok(cuCtxSetCurrent(c->ctx), "cuCtxSetCurrent")) { free(c); return NULL; }
     if (!cu_ok(cuStreamCreate(&c->stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate")) { free(c); return NULL; }
+    // Effort 26 cycle 9: cuBLAS handle for the prefill dense Q4_K GEMM (created
+    // lazily-safe here; binds to the current primary context). Non-fatal on
+    // failure — the cuBLAS prefill path is opt-in and falls back if absent.
+    if (cublasCreate(&c->cublas) == CUBLAS_STATUS_SUCCESS) {
+        cublasSetStream(c->cublas, c->stream);
+        cublasSetMathMode(c->cublas, CUBLAS_TENSOR_OP_MATH);
+    } else {
+        c->cublas = NULL;
+    }
     return c;
 }
 void cuda_destroy(CudaCtx* c) {
     if (!c) return;
+    if (c->cublas) cublasDestroy(c->cublas);
     if (c->stream) cuStreamDestroy(c->stream);
     if (c->ctx) cuDevicePrimaryCtxRelease(c->dev);
     free(c);
+}
+// Effort 26 cycle 9 — dense prefill Q4_K GEMM via cuBLAS fp16 tensor cores.
+// Computes Y[N,M] (token-major row-major) = A[N,K]·W[M,K]^T. In cuBLAS's
+// column-major terms: C(M×N) = op(W)·op(A) with op(W)=T (W is row-major M×K =
+// col-major K×M, lda=K) and op(A)=N (A is row-major N×K = col-major K×N, ldb=K);
+// C is col-major M×N (ldc=M) = row-major N×M = the token-major Y. fp16 in, fp32
+// accumulate/out — matches gemm_q4k_tc's fp16-multiply / fp32-accumulate.
+void cuda_cublas_hgemm(CudaCtx* c, unsigned M, unsigned N, unsigned K,
+                       CudaBuf* W, CudaBuf* A, CudaBuf* Y) {
+    if (!c || !c->cublas) { set_err("cuda_cublas_hgemm", "no cublas handle"); return; }
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t s = cublasGemmEx(
+        c->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)M, (int)N, (int)K,
+        &alpha, (const void*)W->dptr, CUDA_R_16F, (int)K,
+        (const void*)A->dptr, CUDA_R_16F, (int)K,
+        &beta, (void*)Y->dptr, CUDA_R_32F, (int)M,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (s != CUBLAS_STATUS_SUCCESS) set_err("cuda_cublas_hgemm", "cublasGemmEx failed");
 }
 static int dev_attr(CUdevice d, CUdevice_attribute a) {
     int v = 0; cuDeviceGetAttribute(&v, a, d); return v;
@@ -112,6 +142,22 @@ void cuda_download(CudaCtx* c, CudaBuf* b, void* dst, size_t size) {
     if (!cu_ok(cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream), "cuMemcpyDtoHAsync")) return;
     cuStreamSynchronize(c->stream);
 }
+// Async variants: enqueue the copy on the ctx stream and return WITHOUT syncing.
+// Issued between cuda_graph_begin/end_launch they become memcpy graph nodes, so
+// the embed H2D and argmax D2H ride the single graph launch instead of each
+// costing a WSL2 sync round-trip. Host side must be pinned (cuda_alloc_host).
+void cuda_upload_async(CudaCtx* c, CudaBuf* b, const void* src, size_t size) {
+    cuMemcpyHtoDAsync(b->dptr, src, size, c->stream);
+}
+void cuda_download_async(CudaCtx* c, CudaBuf* b, void* dst, size_t size) {
+    cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream);
+}
+void* cuda_alloc_host(size_t size) {
+    void* p = NULL;
+    if (!cu_ok(cuMemAllocHost(&p, size ? size : 1), "cuMemAllocHost")) return NULL;
+    return p;
+}
+void cuda_free_host(void* p) { if (p) cuMemFreeHost(p); }
 void cuda_free_buffer(CudaBuf* b) {
     if (!b) return;
     if (b->owns && b->dptr) cuMemFree(b->dptr);
@@ -215,3 +261,54 @@ void cuda_commit_and_wait(CudaCmd* m) {
 void cuda_commit_async(CudaCmd* m) { cuEventRecord(m->event, m->stream); }
 void cuda_wait(CudaCmd* m) { cuEventSynchronize(m->event); cuEventDestroy(m->event); free(m); }
 void cuda_release_completed(CudaCmd* m) { if (!m) return; if (m->event) cuEventDestroy(m->event); free(m); }
+
+// ---- CUDA Graphs (decode replay, Effort 25) ---------------------------------
+// See cuda_shim.h. Capture the per-step kernel chain on the ctx stream and
+// replay it as one graph launch — eliminating the per-kernel launch + inter-
+// kernel-bubble latency that dominates the launch-bound decode regime (~10% GPU
+// util). The exec is cached and updated in place across steps; on an update
+// failure (e.g. an incompatible structural change) it is re-instantiated from
+// the freshly captured graph, so the launched exec always reflects the current
+// step's parameters and is bit-identical to the un-captured chain.
+struct CudaGraph { CUgraphExec exec; int have_exec; };
+
+CudaGraph* cuda_graph_create(void) {
+    CudaGraph* g = (CudaGraph*)calloc(1, sizeof *g);
+    if (!g) { set_err("cuda_graph_create", "oom"); return NULL; }
+    return g;
+}
+int cuda_graph_begin(CudaCtx* c) {
+    cuCtxSetCurrent(c->ctx);
+    return cu_ok(cuStreamBeginCapture(c->stream, CU_STREAM_CAPTURE_MODE_RELAXED), "cuStreamBeginCapture");
+}
+int cuda_graph_end_launch(CudaCtx* c, CudaGraph* g) {
+    CUgraph graph = NULL;
+    if (!cu_ok(cuStreamEndCapture(c->stream, &graph), "cuStreamEndCapture")) return 0;
+    if (g->have_exec) {
+        // Topology is invariant across decode steps (same layers/kernels/order);
+        // only per-token push-constant scalars change → an in-place exec update
+        // is cheap. If the update is rejected, fall back to a re-instantiate.
+        CUgraphExecUpdateResultInfo info;
+        memset(&info, 0, sizeof info);
+        if (cuGraphExecUpdate(g->exec, graph, &info) != CUDA_SUCCESS) {
+            cuGraphExecDestroy(g->exec);
+            g->have_exec = 0;
+        }
+    }
+    if (!g->have_exec) {
+        if (!cu_ok(cuGraphInstantiate(&g->exec, graph, 0), "cuGraphInstantiate")) {
+            cuGraphDestroy(graph);
+            return 0;
+        }
+        g->have_exec = 1;
+    }
+    cuGraphDestroy(graph);
+    int ok = cu_ok(cuGraphLaunch(g->exec, c->stream), "cuGraphLaunch");
+    cuStreamSynchronize(c->stream);
+    return ok;
+}
+void cuda_graph_free(CudaGraph* g) {
+    if (!g) return;
+    if (g->have_exec) cuGraphExecDestroy(g->exec);
+    free(g);
+}
