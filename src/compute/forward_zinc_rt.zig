@@ -1560,23 +1560,45 @@ const DirectComputeTracking = struct {
     lm_head_only: bool = false,
 };
 
-// Keep M1 benchmark runs exercising consumed decode-phase model slices by
-// default. Full repeated tracking is opt-in because the current T1 DMMV
-// row-range kernels are correctness-oriented serial kernels. A scoped LM-head
-// prefix slice repeats at a bounded cadence so current benchmarks keep
-// consuming a GPU-produced token-selection value without also rerunning all
-// layer-level validation slices. F32 projections validate each row range
-// against the CPU oracle; paired Q8_0 projections can use trust-after-success
-// after the first passing pair. The first tracked decode slice already includes
-// a full router row-range via direct_compute_tracking, so standalone recurring
-// router probes stay opt-in.
+// Keep M1 benchmark runs exercising a consumed decode-phase model value by
+// default without paying for broad layer coverage on every run. Full decode
+// slices are validation-only now that coverage has been proven; they remain
+// opt-in. The default decode proof is one LM-head prefix row-range on the first
+// decode step, so token selection still consumes a GPU-produced DMMV value.
+// F32 projections validate each row range against the CPU oracle; paired Q8_0
+// projections can use trust-after-success after the first passing pair.
+const direct_decode_model_slice_enabled_default = false;
 const direct_decode_model_slice_cadence_default: u32 = 0;
-const direct_lm_head_decode_cadence_default: u32 = 32;
+const direct_lm_head_decode_cadence_default: u32 = 0;
 const direct_router_decode_enabled_default = false;
 const direct_router_decode_cadence_default: u32 = 32;
 const direct_router_row_range_trust_after_successes_default: u32 = 1;
 const direct_ssm_q8_0_row_range_max_successes_default: u32 = 2;
 const direct_ssm_q8_0_trust_after_successes_default: u32 = 1;
+
+fn parseBoolEnv(raw: []const u8, default: bool) bool {
+    if (raw.len == 0) return default;
+    if (std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return false;
+    if (std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true")) return true;
+    return default;
+}
+
+fn directDecodeModelSliceEnabledForEnv(raw_override: ?[]const u8, raw_cadence_override: ?[]const u8) bool {
+    if (raw_override) |raw| return parseBoolEnv(raw, direct_decode_model_slice_enabled_default);
+    // Preserve the old cadence override as an explicit opt-in for agents and
+    // harnesses that already know they want broad validation coverage.
+    if (raw_cadence_override) |raw| {
+        if (raw.len != 0) return true;
+    }
+    return direct_decode_model_slice_enabled_default;
+}
+
+fn directDecodeModelSliceEnabled() bool {
+    return directDecodeModelSliceEnabledForEnv(
+        std.posix.getenv("ZINC_RT_DIRECT_DECODE_FULL_SLICE"),
+        std.posix.getenv("ZINC_RT_DIRECT_DECODE_SLICE_CADENCE"),
+    );
+}
 
 fn directDecodeModelSliceCadenceForEnv(raw_override: ?[]const u8) u32 {
     const raw = raw_override orelse return direct_decode_model_slice_cadence_default;
@@ -1604,10 +1626,7 @@ fn directLmHeadDecodeCadence() u32 {
 
 fn directRouterDecodeEnabledForEnv(raw_override: ?[]const u8) bool {
     const raw = raw_override orelse return direct_router_decode_enabled_default;
-    if (raw.len == 0) return direct_router_decode_enabled_default;
-    if (std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return false;
-    if (std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true")) return true;
-    return direct_router_decode_enabled_default;
+    return parseBoolEnv(raw, direct_router_decode_enabled_default);
 }
 
 fn directRouterDecodeEnabled() bool {
@@ -1651,7 +1670,9 @@ fn shouldTrackDirectDecodeModelSlice(generated_len: usize, cadence: u32) bool {
 }
 
 fn shouldTrackDirectLmHeadDecode(generated_len: usize, full_slice_tracked: bool, cadence: u32) bool {
-    if (full_slice_tracked or cadence == 0 or generated_len == 0) return false;
+    if (full_slice_tracked or generated_len == 0) return false;
+    if (generated_len == 1) return true;
+    if (cadence == 0) return false;
     return generated_len % cadence == 0;
 }
 
@@ -1812,20 +1833,25 @@ fn generateScalarHybrid(
     var real_model_slice = false;
     var direct_decode_model_slices: u32 = 0;
     var direct_compute_token: u32 = 0;
+    const direct_decode_slice_enabled = directDecodeModelSliceEnabled();
     const direct_decode_slice_cadence = directDecodeModelSliceCadence();
     const direct_lm_head_decode_cadence = directLmHeadDecodeCadence();
     const direct_router_decode_enabled = directRouterDecodeEnabled();
     const direct_router_decode_cadence = directRouterDecodeCadence();
     if (token_boundary != null) {
-        if (direct_decode_slice_cadence == 0) {
-            log.info("M1 AMDGPU CS direct decode model-slice cadence: first generated token only", .{});
+        if (direct_decode_slice_enabled) {
+            if (direct_decode_slice_cadence == 0) {
+                log.info("M1 AMDGPU CS direct full decode model-slice cadence: first generated token only", .{});
+            } else {
+                log.info("M1 AMDGPU CS direct full decode model-slice cadence: first generated token and every {d} generated tokens", .{direct_decode_slice_cadence});
+            }
         } else {
-            log.info("M1 AMDGPU CS direct decode model-slice cadence: first generated token and every {d} generated tokens", .{direct_decode_slice_cadence});
+            log.info("M1 AMDGPU CS direct full decode model-slice coverage disabled by default; set ZINC_RT_DIRECT_DECODE_FULL_SLICE=1 for broad validation", .{});
         }
         if (direct_lm_head_decode_cadence == 0) {
-            log.info("M1 AMDGPU CS direct LM-head prefix decode cadence: disabled", .{});
+            log.info("M1 AMDGPU CS direct LM-head prefix decode cadence: first generated token only", .{});
         } else {
-            log.info("M1 AMDGPU CS direct LM-head prefix decode cadence: every {d} generated tokens after the first full slice", .{direct_lm_head_decode_cadence});
+            log.info("M1 AMDGPU CS direct LM-head prefix decode cadence: first generated token and every {d} generated tokens", .{direct_lm_head_decode_cadence});
         }
         if (direct_router_decode_enabled) {
             if (direct_router_decode_cadence == 0) {
@@ -1927,7 +1953,7 @@ fn generateScalarHybrid(
     }
     var position: u32 = @intCast(prompt_tokens.len);
     while (generated.items.len < effective_max_tokens and next_token != eos_token_id) : (position += 1) {
-        const track_full_decode_slice = shouldTrackDirectDecodeModelSlice(generated.items.len, direct_decode_slice_cadence);
+        const track_full_decode_slice = direct_decode_slice_enabled and shouldTrackDirectDecodeModelSlice(generated.items.len, direct_decode_slice_cadence);
         const track_lm_head_decode_slice = shouldTrackDirectLmHeadDecode(generated.items.len, track_full_decode_slice, direct_lm_head_decode_cadence);
         const direct_decode_tracking: ?DirectComputeTracking = if ((track_full_decode_slice or track_lm_head_decode_slice) and token_boundary != null)
             .{
@@ -2080,18 +2106,23 @@ fn generateScalarDense(
     var real_model_slice = false;
     var direct_decode_model_slices: u32 = 0;
     var direct_compute_token: u32 = 0;
+    const direct_decode_slice_enabled = directDecodeModelSliceEnabled();
     const direct_decode_slice_cadence = directDecodeModelSliceCadence();
     const direct_lm_head_decode_cadence = directLmHeadDecodeCadence();
     if (token_boundary != null) {
-        if (direct_decode_slice_cadence == 0) {
-            log.info("M1 AMDGPU CS dense direct decode model-slice cadence: first generated token only", .{});
+        if (direct_decode_slice_enabled) {
+            if (direct_decode_slice_cadence == 0) {
+                log.info("M1 AMDGPU CS dense direct full decode model-slice cadence: first generated token only", .{});
+            } else {
+                log.info("M1 AMDGPU CS dense direct full decode model-slice cadence: first generated token and every {d} generated tokens", .{direct_decode_slice_cadence});
+            }
         } else {
-            log.info("M1 AMDGPU CS dense direct decode model-slice cadence: first generated token and every {d} generated tokens", .{direct_decode_slice_cadence});
+            log.info("M1 AMDGPU CS dense direct full decode model-slice coverage disabled by default; set ZINC_RT_DIRECT_DECODE_FULL_SLICE=1 for broad validation", .{});
         }
         if (direct_lm_head_decode_cadence == 0) {
-            log.info("M1 AMDGPU CS dense direct LM-head prefix decode cadence: disabled", .{});
+            log.info("M1 AMDGPU CS dense direct LM-head prefix decode cadence: first generated token only", .{});
         } else {
-            log.info("M1 AMDGPU CS dense direct LM-head prefix decode cadence: every {d} generated tokens after the first full slice", .{direct_lm_head_decode_cadence});
+            log.info("M1 AMDGPU CS dense direct LM-head prefix decode cadence: first generated token and every {d} generated tokens", .{direct_lm_head_decode_cadence});
         }
     }
 
@@ -2135,7 +2166,7 @@ fn generateScalarDense(
     state.decode_phase = true;
     var position: u32 = @intCast(prompt_tokens.len);
     while (generated.items.len < effective_max_tokens and next_token != eos_token_id) : (position += 1) {
-        const track_full_decode_slice = shouldTrackDirectDecodeModelSlice(generated.items.len, direct_decode_slice_cadence);
+        const track_full_decode_slice = direct_decode_slice_enabled and shouldTrackDirectDecodeModelSlice(generated.items.len, direct_decode_slice_cadence);
         const track_lm_head_decode_slice = shouldTrackDirectLmHeadDecode(generated.items.len, track_full_decode_slice, direct_lm_head_decode_cadence);
         const direct_decode_tracking: ?DirectComputeTracking = if ((track_full_decode_slice or track_lm_head_decode_slice) and token_boundary != null)
             .{
@@ -10059,7 +10090,16 @@ test "emitDecodeGraphForShape treats dense models as all attention" {
     try std.testing.expectEqual(@as(u32, 0), summary.moe_layers);
 }
 
-test "direct decode model slice cadence always covers first decode step" {
+test "direct decode model slice policy defaults to LM-head only proof" {
+    try std.testing.expect(!directDecodeModelSliceEnabledForEnv(null, null));
+    try std.testing.expect(directDecodeModelSliceEnabledForEnv("1", null));
+    try std.testing.expect(directDecodeModelSliceEnabledForEnv("true", null));
+    try std.testing.expect(!directDecodeModelSliceEnabledForEnv("0", null));
+    try std.testing.expect(!directDecodeModelSliceEnabledForEnv("false", null));
+    try std.testing.expect(!directDecodeModelSliceEnabledForEnv("bad", null));
+    try std.testing.expect(directDecodeModelSliceEnabledForEnv(null, "0"));
+    try std.testing.expect(directDecodeModelSliceEnabledForEnv(null, "8"));
+
     try std.testing.expectEqual(@as(u32, direct_decode_model_slice_cadence_default), directDecodeModelSliceCadenceForEnv(null));
     try std.testing.expectEqual(@as(u32, 3), directDecodeModelSliceCadenceForEnv("3"));
     try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv("0"));
@@ -10100,9 +10140,9 @@ test "direct decode model slice cadence always covers first decode step" {
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(0, 0));
     try std.testing.expect(shouldTrackDirectDecodeModelSlice(1, 0));
     try std.testing.expect(!shouldTrackDirectDecodeModelSlice(8, 0));
-    try std.testing.expect(!shouldTrackDirectDecodeModelSlice(direct_decode_model_slice_cadence_default - 1, direct_decode_model_slice_cadence_default));
-    try std.testing.expect(shouldTrackDirectDecodeModelSlice(direct_decode_model_slice_cadence_default, direct_decode_model_slice_cadence_default));
     try std.testing.expect(!shouldTrackDirectLmHeadDecode(0, false, 16));
+    try std.testing.expect(shouldTrackDirectLmHeadDecode(1, false, 0));
+    try std.testing.expect(!shouldTrackDirectLmHeadDecode(1, true, 0));
     try std.testing.expect(!shouldTrackDirectLmHeadDecode(16, true, 16));
     try std.testing.expect(!shouldTrackDirectLmHeadDecode(15, false, 16));
     try std.testing.expect(shouldTrackDirectLmHeadDecode(16, false, 16));
