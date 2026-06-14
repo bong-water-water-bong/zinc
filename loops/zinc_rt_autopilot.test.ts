@@ -5,10 +5,12 @@ import {
   decideMigrateKeep,
   detectZincRtExecutionMode,
   hasDirectDecodeModelSliceEvidence,
+  isMeasuredDeadSummary,
   isShortcutFreeZincRtOutput,
   assertZincRtNodeAllowed,
   parseArgs,
   parseLlamaCliTimings,
+  recentMeasuredDeadCount,
   resolveZincRtNode,
   zincRtNodeAllowed,
   type ABBenchmark,
@@ -224,6 +226,51 @@ describe("M1 migration keep signals", () => {
     expect(decision.reason).toContain("throughput gain");
   });
 
+  test("keeps post-coverage default overhead cleanup within the no-regression envelope", () => {
+    const before = abBenchmark(benchmarkResult({
+      decodeTps: 35.1,
+      coherentText: true,
+      runOutput: [
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=136 direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_kpartial64 phase=decode consumed_gpu_model_value=1",
+        "info(zinc_rt): ZINC_RT M1 model_execution=host_assisted_model_slice direct_compute_ops=136 direct_decode_model_slices=65 benchmark_shortcuts=none shortcut_free=1",
+      ].join("\n"),
+    }));
+    const after = abBenchmark(benchmarkResult({
+      decodeTps: 35.08,
+      coherentText: true,
+      runOutput: [
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=135 direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_reused phase=decode consumed_gpu_model_value=1",
+        "info(zinc_rt): ZINC_RT M1 model_execution=host_assisted_model_slice direct_compute_ops=135 direct_decode_model_slices=64 benchmark_shortcuts=none shortcut_free=1",
+      ].join("\n"),
+    }));
+
+    const decision = decideMigrateKeep(before, after, 35.15);
+    expect(decision.keep).toBe(true);
+    expect(decision.reason).toContain("overhead reduction");
+  });
+
+  test("rejects post-coverage overhead cleanup that materially slows decode", () => {
+    const before = abBenchmark(benchmarkResult({
+      decodeTps: 35.1,
+      coherentText: true,
+      runOutput: [
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=136 direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_kpartial64 phase=decode consumed_gpu_model_value=1",
+        "info(zinc_rt): ZINC_RT M1 model_execution=host_assisted_model_slice direct_compute_ops=136 direct_decode_model_slices=65 benchmark_shortcuts=none shortcut_free=1",
+      ].join("\n"),
+    }));
+    const after = abBenchmark(benchmarkResult({
+      decodeTps: 34.7,
+      coherentText: true,
+      runOutput: [
+        "info(zinc_rt_forward): M1 AMDGPU CS direct model slice consumed: direct_compute_ops=135 direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_reused phase=decode consumed_gpu_model_value=1",
+        "info(zinc_rt): ZINC_RT M1 model_execution=host_assisted_model_slice direct_compute_ops=135 direct_decode_model_slices=64 benchmark_shortcuts=none shortcut_free=1",
+      ].join("\n"),
+    }));
+
+    const decision = decideMigrateKeep(before, after, 35.15);
+    expect(decision.keep).toBe(false);
+  });
+
   test("keeps shortcut-free M1 measurement cleanup despite scalar slowdown", () => {
     const before = abBenchmark(benchmarkResult({
       decodeTps: 3.81,
@@ -240,6 +287,19 @@ describe("M1 migration keep signals", () => {
     const decision = decideMigrateKeep(before, after, null);
     expect(decision.keep).toBe(true);
     expect(decision.reason).toContain("shortcut-free");
+  });
+
+  test("counts recent measured-dead cycles for structural pivot prompts", () => {
+    expect(isMeasuredDeadSummary("measured-dead: recurring CS slices regress")).toBe(true);
+    expect(isMeasuredDeadSummary("ordinary no-op")).toBe(false);
+    const cycles = [
+      { description: "kept useful change", selfAnalysis: "" },
+      { description: "measured-dead: router cadence regressed", selfAnalysis: "" },
+      { description: "no code change", selfAnalysis: "MEASURED_DEAD: T2 unavailable" },
+      { description: "flat width tweak", selfAnalysis: "" },
+    ];
+    expect(recentMeasuredDeadCount(cycles, 4)).toBe(2);
+    expect(recentMeasuredDeadCount(cycles, 2)).toBe(1);
   });
 });
 

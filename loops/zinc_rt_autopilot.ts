@@ -1853,6 +1853,20 @@ function formatFailedApproach(cycle: CycleResult): string {
   return `#${cycle.cycle} ${cycle.description} — ${revertReason(cycle)}`;
 }
 
+export function isMeasuredDeadSummary(text: string): boolean {
+  return /\bmeasured[-_]dead\b/i.test(text);
+}
+
+export function recentMeasuredDeadCount(
+  cycles: Array<Pick<CycleResult, "description" | "selfAnalysis">>,
+  window = STRUCTURAL_PIVOT_MEASURED_DEAD_WINDOW,
+): number {
+  return cycles
+    .slice(-window)
+    .filter((cycle) => isMeasuredDeadSummary(`${cycle.description}\n${cycle.selfAnalysis}`))
+    .length;
+}
+
 function buildGapAnalysis(state: RunState, before: ABBenchmark): string {
   const lines: string[] = [];
   const mode = detectZincRtExecutionMode(before.zinc_rt);
@@ -1867,6 +1881,7 @@ function buildGapAnalysis(state: RunState, before: ABBenchmark): string {
   const bestRt = bestZincRtTpsOfState(state);
   const currentRt = before.zinc_rt.decodeTps;
   const directDecodeSlices = maxPositiveCounter(before.zinc_rt.runOutput, ["direct_decode_model_slices", "direct_decode_model_ops"]);
+  const measuredDead = recentMeasuredDeadCount(state.cycles);
 
   if (mode === "cpu_after_admission") {
     lines.push("- Execution gap: direct queue admission is working, but generated tokens still come from `execution_tier=t_cpu_after_admission` / `forward_zinc_rt M0 T-CPU`.");
@@ -1915,6 +1930,10 @@ function buildGapAnalysis(state: RunState, before: ABBenchmark): string {
     isShortcutFreeZincRtOutput(before.zinc_rt.runOutput)
   ) {
     lines.push(`- Post-coverage gap: ${directDecodeSlices} consumed shortcut-free decode slices are enough proof that M1 slices work. More row widening is useful only if it removes enough CPU work per fence to raise tok/s; prefer batching multiple slices/submissions, reducing validation overhead, or making broad coverage debug-only.`);
+  }
+
+  if (measuredDead >= STRUCTURAL_PIVOT_MEASURED_DEAD_MIN) {
+    lines.push(`- Structural-pivot gap: ${measuredDead}/${STRUCTURAL_PIVOT_MEASURED_DEAD_WINDOW} recent cycles are measured-dead. Stop remeasuring GTT-staged AMDGPU-CS cadence, slice width, or validation trims; the next useful change must alter the execution substrate or amortization model.`);
   }
 
   return lines.length > 0 ? lines.map((line) => `  ${line}`).join("\n") : "  (none detected)";
@@ -1975,6 +1994,7 @@ function buildPrompt(state: RunState, before: ABBenchmark, phase: Phase): string
   const gapAnalysis = buildGapAnalysis(state, before);
   const currentRt = before.zinc_rt.decodeTps;
   const directDecodeSlices = maxPositiveCounter(before.zinc_rt.runOutput, ["direct_decode_model_slices", "direct_decode_model_ops"]);
+  const measuredDeadCount = recentMeasuredDeadCount(state.cycles);
   const performanceRecoveryMode =
     bestRt != null &&
     currentRt != null &&
@@ -1983,6 +2003,11 @@ function buildPrompt(state: RunState, before: ABBenchmark, phase: Phase): string
     currentRt < bestRt - Math.max(0.5, bestRt * 0.015);
   const postCoverageThroughputMode =
     phase === "migrate" &&
+    directDecodeSlices >= POST_COVERAGE_PIVOT_MIN_DECODE_SLICES &&
+    isShortcutFreeZincRtOutput(before.zinc_rt.runOutput);
+  const structuralPivotMode =
+    phase === "migrate" &&
+    measuredDeadCount >= STRUCTURAL_PIVOT_MEASURED_DEAD_MIN &&
     directDecodeSlices >= POST_COVERAGE_PIVOT_MIN_DECODE_SLICES &&
     isShortcutFreeZincRtOutput(before.zinc_rt.runOutput);
 
@@ -2249,6 +2274,8 @@ Next useful work must do one of these:
       "",
       "The harness now treats extra slice coverage as a cost unless it moves throughput. A pure widening change such as 256→512 rows, a new verifier, or a higher recurring cadence should be rejected unless the 96-token A/B median improves by a measurable amount.",
       "",
+      "Before measuring another row-range cadence/width idea, read `research/ZINC_RT_CS_RECURRING_SLICE_DEAD_2026-06-14.md`. It records that recurring GTT-staged AMDGPU-CS model-slice substitution is already measured-dead on this node; repeat only if your change alters residency, fence amortization, or the true queue-retirement path.",
+      "",
       "Preferred work:",
       "- batch multiple MoE/router/LM-head slices into one CS submission and one fence;",
       "- replace larger CPU matvec regions per existing fence instead of adding more fences;",
@@ -2259,6 +2286,23 @@ Next useful work must do one of these:
       `Keep threshold for incremental slice-only work in this mode: zinc_rt must improve by at least ${POST_COVERAGE_MIN_ABS_TPS_GAIN_KEEP.toFixed(2)} tok/s or ${(POST_COVERAGE_REL_TPS_GAIN_KEEP * 100).toFixed(1)}% over the cycle's before sample. Flat coverage-only changes are not progress toward beating ${baselineLabel}.`,
       "",
     ] : []),
+    ...(structuralPivotMode ? [
+      "## Structural Pivot Mode",
+      "",
+      `${measuredDeadCount}/${STRUCTURAL_PIVOT_MEASURED_DEAD_WINDOW} recent cycles are measured-dead on the same class of change: GTT-staged AMDGPU-CS row-range verifier slices, cadence changes, slice-width changes, and validation trims. Do not spend this cycle measuring those again.`,
+      "",
+      "Allowed useful outcomes now:",
+      "- implement a true KFD/doorbell-retired shader smoke that writes a GPU signal and is verified without relying on the kernel-managed CS verifier path;",
+      "- create a persistent BAR/VRAM-resident weight/input path for one high-value LM-head/router slice so the benchmark no longer stages the same bytes through GTT each proof;",
+      "- batch multiple same-input row ranges into one retired IB and one wait, with a measured tok/s gain or a concrete retired/not-retired result;",
+      "- if none is implementable, write or update a measured-dead note under `research/` with fresh remote evidence and no source changes.",
+      "",
+      "Forbidden outcomes in this mode:",
+      "- changing LM-head/router/MoE slice width, cadence, or row offsets without changing residency or fence amortization;",
+      "- adding another validation-only marker or verifier;",
+      "- trimming one small proof/check unless direct op count drops and the 96-token median stays within the overhead-cleanup envelope.",
+      "",
+    ] : []),
     "## Rules",
     "",
     `1. Make ONE focused change toward beating ${baselineLabel}. ${phase === "migrate" ? "Correctness/coherent output > tok/s — fix the broken path first." : "Tok/s > everything else."}`,
@@ -2267,6 +2311,7 @@ Next useful work must do one of these:
       "   Do not add standalone future packet/building-block code unless this cycle also wires it into executed forward progress or a failing/passing validation gate.",
       "   If the verified graph is not lowered, prefer lowering the smallest real executed slice over adding another verifier.",
       `   After ${POST_COVERAGE_PIVOT_MIN_DECODE_SLICES}+ shortcut-free consumed decode slices already exist, incremental coverage is keepable only if it produces a measured tok/s gain; prefer batching/fewer fences/default-fast paths over more rows.`,
+      "   Default-path overhead cleanup is keepable when direct op/slice counts decrease, shortcut-free consumed evidence remains, and median tok/s stays inside the tight no-regression envelope.",
     ] : []),
     "2. Before printing the final `@@@` markers, self-verify changed files on the remote. Run repo-root `.env` + rsync + the exact build gates:",
     "   `set -a; source .env; set +a`",
