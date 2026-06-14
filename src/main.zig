@@ -1765,9 +1765,19 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     var used_batched = false;
     if (comptime @hasDecl(@TypeOf(fwd.*), "prefillBatched")) {
         if (batchedPrefillDefaultOn() and prompt_tokens.len > 1) {
-            next_tok = try fwd.prefillBatched(prompt_tokens);
-            pos = @intCast(prompt_tokens.len);
-            used_batched = true;
+            // Default-on path: degrade gracefully to the per-token loop if the
+            // batched path fails (e.g. a large-prompt scratch allocation on a
+            // memory-tight box) instead of aborting the whole run. The happy
+            // path is byte-for-byte unchanged; a fallback is LOGGED so a real
+            // regression on short prompts stays visible in the validate gate.
+            // Mirrors the dbg_cuda harness, which already falls back on error.
+            if (fwd.prefillBatched(prompt_tokens)) |first| {
+                next_tok = first;
+                pos = @intCast(prompt_tokens.len);
+                used_batched = true;
+            } else |err| {
+                log.warn("batched prefill failed ({s}); falling back to per-token", .{@errorName(err)});
+            }
         }
     }
     if (!used_batched) {

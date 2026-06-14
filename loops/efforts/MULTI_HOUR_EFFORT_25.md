@@ -69,3 +69,30 @@ not fake a qwen win.
   complete to the extent legitimately possible: Target 1 shipped (production default,
   gated 5/5, pushed); Target 2 gated on an absent main prereq.** STOP. Re-check
   Target 2 again next cycle with the same `git grep`.
+- 2026-06-13 — **TARGET 1 HARDENING (production-enabling win, committed+pushed).**
+  Target 2 re-checked: `git fetch` → `origin/main` still `497768bb`,
+  `git grep prefillBatched origin/main -- src/compute/forward_cuda.zig` → still
+  NONE → **STILL BLOCKED**, not wired/faked. Found + fixed a real default-on
+  productionization gap: the PRODUCT path (`src/main.zig:1768`) called
+  `fwd.prefillBatched(prompt_tokens)` with a bare `try`, so ANY batched-prefill
+  failure (e.g. a large-prompt `BatchScratch` allocation failing on a memory-tight
+  box — the CUDA gemma `prefillBatched` sizes scratch to the full T with no
+  chunking, unlike the Metal path which chunks at `forward.zig:22214`) would
+  ABORT the whole product run. The opt-in version never exposed this (users
+  opted in for short bench prompts); the default-on flip does. The `dbg_cuda`
+  harness already degrades gracefully (`if (prefillBatched()) |..| else |_| {}`,
+  `dbg_cuda.zig:201`) but the product binary did not. Fix (additive, ~9 lines,
+  `main.zig` only): mirror the harness — catch the error, `log.warn` the
+  fallback (so a real regression on short catalog prompts stays VISIBLE in the
+  gate, not silently masked), and fall through to the proven per-token loop. The
+  happy path is byte-for-byte unchanged (same `next_tok`/`pos`/KV state); only a
+  crash becomes a graceful slow-path. qwen is comptime-gated out (`@hasDecl`), so
+  only gemma reaches this `try`. Box (4090, isolated `~/zinc-e25-box`, fresh
+  `.zig-cache`): **product build `-Dbackend=cuda` EXIT=0** (the change compiles;
+  bin `a1bf5d0e`), cuda-dbg EXIT=0. GATE: `validate_catalog` **5/5 plain AND
+  `ZINC_BATCHED=1`** (qwen 12/12, gemma4-26b 12/12, gemma4-31b free-run 2/12 =
+  documented near-tie, teacher-forced 11/12 — unchanged). Product `zinc` smoke
+  (gemma-26b, "The capital of France is") → coherent "**Paris**.", batched
+  prefill ran, NO fallback warning (happy path taken, output identical). Fallback
+  target = the per-token path = the plain-validate 5/5 path → correct by
+  composition. Committed to `perf/e25-prefill-default`, pushed (NOT main).
