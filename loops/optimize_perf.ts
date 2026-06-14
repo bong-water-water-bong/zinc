@@ -51,10 +51,13 @@ const CLAUDE_MODEL = process.env.ZINC_CLAUDE_MODEL ?? "claude-opus-4-7[1m]";
 const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
 const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh";
 // opencode (https://opencode.ai) headless agent. Drives the same loop as
-// claude/codex via `opencode run`. Default model is GLM-5.2; override with
-// ZINC_OPENCODE_MODEL (provider/model) and optionally pick an opencode agent
-// persona with ZINC_OPENCODE_AGENT.
+// claude/codex via `opencode run`. Default model is GLM-5.2 at max reasoning
+// effort (matches the codex `xhigh` / claude `max` defaults); override model
+// with ZINC_OPENCODE_MODEL, reasoning variant with ZINC_OPENCODE_VARIANT
+// (e.g. max|high|minimal — empty string omits the flag), and optionally pick
+// an opencode agent persona with ZINC_OPENCODE_AGENT.
 const OPENCODE_MODEL = process.env.ZINC_OPENCODE_MODEL ?? "zai-coding-plan/glm-5.2";
+const OPENCODE_VARIANT = process.env.ZINC_OPENCODE_VARIANT ?? "max";
 const OPENCODE_AGENT = process.env.ZINC_OPENCODE_AGENT ?? "";
 
 function loadEnv(): Record<string, string> {
@@ -3430,6 +3433,7 @@ export function opencodeExecArgs(prompt: string): string[] {
   // tool use so the loop is not blocked on prompts; the loop itself still
   // owns git keep/revert, and the prompt forbids destructive git ops.
   const args = ["run", "--dangerously-skip-permissions", "--model", OPENCODE_MODEL];
+  if (OPENCODE_VARIANT.length > 0) args.push("--variant", OPENCODE_VARIANT);
   if (OPENCODE_AGENT.length > 0) args.push("--agent", OPENCODE_AGENT);
   args.push(prompt);
   return args;
@@ -3797,7 +3801,7 @@ async function main() {
   const agentDetails = agent === "claude"
     ? ` (${CLAUDE_MODEL} effort=${CLAUDE_EFFORT})`
     : agent === "opencode"
-      ? ` (${OPENCODE_MODEL}${OPENCODE_AGENT.length > 0 ? `, agent=${OPENCODE_AGENT}` : ""})`
+      ? ` (${OPENCODE_MODEL}${OPENCODE_VARIANT.length > 0 ? `, variant=${OPENCODE_VARIANT}` : ""}${OPENCODE_AGENT.length > 0 ? `, agent=${OPENCODE_AGENT}` : ""})`
       : ` (${CODEX_MODEL} effort=${CODEX_REASONING_EFFORT})`;
   console.log(c("1;37", boxLine(`Agent: ${agent}${agentDetails}`)));
   console.log(c("1;37", boxLine(`Cycles this run: ${cycles}`)));
