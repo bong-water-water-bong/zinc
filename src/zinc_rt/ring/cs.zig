@@ -897,10 +897,11 @@ pub const TokenBoundary = struct {
         const ib_bo_size: usize = 64 * 1024;
         const input_bo_size: usize = 2 * 1024 * 1024;
         const page_size: usize = 4096;
+        const output_bo_size: usize = 8 * 1024;
         const ib_va: u64 = 0x1_0200_0000;
         const input_va: u64 = ib_va + ib_bo_size;
         const output_va: u64 = input_va + input_bo_size;
-        const signal_va: u64 = output_va + page_size;
+        const signal_va: u64 = output_va + output_bo_size;
         const shader_va: u64 = signal_va + page_size;
 
         const ib_bo = kmd.createGem(file, ib_bo_size, 256, kmd.AMDGPU_GEM_DOMAIN_GTT, kmd.AMDGPU_GEM_CREATE_CPU_GTT_USWC) catch return error.IbBoFailed;
@@ -915,7 +916,7 @@ pub const TokenBoundary = struct {
         errdefer std.posix.munmap(input_map);
         kmd.mapGemVa(file, input_bo, input_va, data_va_flags) catch return error.InputVaFailed;
 
-        const output_bo = kmd.createGem(file, page_size, 256, kmd.AMDGPU_GEM_DOMAIN_GTT, kmd.AMDGPU_GEM_CREATE_CPU_GTT_USWC) catch return error.OutputBoFailed;
+        const output_bo = kmd.createGem(file, output_bo_size, 256, kmd.AMDGPU_GEM_DOMAIN_GTT, kmd.AMDGPU_GEM_CREATE_CPU_GTT_USWC) catch return error.OutputBoFailed;
         const output_map = kmd.mmapGem(file, output_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch return error.OutputMapFailed;
         errdefer std.posix.munmap(output_map);
         kmd.mapGemVa(file, output_bo, output_va, data_va_flags) catch return error.OutputVaFailed;
