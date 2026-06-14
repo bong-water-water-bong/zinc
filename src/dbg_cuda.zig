@@ -502,6 +502,8 @@ fn schedMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
     var prompts: [MAXB][MAXP]u32 = undefined;
     var plens: [MAXB]usize = undefined;
     var serial_out: [MAXB][MAXG]u32 = undefined; // isolated production reference
+    var serial_len: [MAXB]u32 = undefined; // isolated stream length once EOS-truncated
+    var sched_len: [MAXB]u32 = [_]u32{0} ** MAXB; // scheduled stream length at eviction
     var nseq: u32 = 0;
     const ng = @min(ngen, @as(u32, MAXG));
 
@@ -575,6 +577,38 @@ fn schedMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
     var j: u32 = 0;
     while (j < nseq) : (j += 1) arrival[j] = j * STRIDE;
 
+    // 2b — EOS-driven eviction with VARIABLE per-request gen lengths.
+    // Pick an EOS token id and apply it to BOTH the isolated reference and the
+    // scheduled run so sequences stop at their OWN (differing) lengths and leave
+    // the running batch at different ticks — freeing slots for waiters mid-flight.
+    // Default (auto): use the token seq0 emits mid-stream, which makes seq0 (the
+    // first arrival) evict early; other seqs stop wherever they hit that token, or
+    // run to the `ng` budget. Override with ZINC_SCHED_EOS=<token-id>. maxInt =
+    // budget-only (the pre-2b uniform-length behavior).
+    var eos: u32 = std.math.maxInt(u32);
+    if (std.process.getEnvVarOwned(allocator, "ZINC_SCHED_EOS")) |v| {
+        defer allocator.free(v);
+        eos = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \n\r\t"), 10) catch std.math.maxInt(u32);
+    } else |_| {
+        if (ng >= 2) eos = serial_out[0][ng / 2];
+    }
+    // Truncate each isolated reference at the first EOS occurrence (the stream the
+    // model would have produced run alone with this stop token); length = idx+1.
+    {
+        j = 0;
+        while (j < nseq) : (j += 1) {
+            var L: u32 = ng;
+            var s: u32 = 0;
+            while (s < ng) : (s += 1) {
+                if (serial_out[j][s] == eos) {
+                    L = s + 1;
+                    break;
+                }
+            }
+            serial_len[j] = L;
+        }
+    }
+
     var sched_out: [MAXB][MAXG]u32 = undefined;
     var completed: u32 = 0;
     const max_ticks = nseq * STRIDE + ng + 16; // safety bound against a stuck loop
@@ -613,8 +647,8 @@ fn schedMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
             }
             try req.appendToken(tok);
             try req.transition(.decoding); // .prefilling → .decoding (valid even if it stops below)
-            if (req.shouldStop(std.math.maxInt(u32))) {
-                try finishSched(&sched, slot_id, &sched_out, ng);
+            if (req.shouldStop(eos)) {
+                try finishSched(&sched, slot_id, &sched_out, &sched_len, ng);
                 completed += 1;
             }
         }
@@ -638,39 +672,42 @@ fn schedMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
             for (decoders, 0..) |slot_id, i| {
                 const req = &sched.slots[slot_id].?;
                 try req.appendToken(out[i]);
-                if (req.shouldStop(std.math.maxInt(u32))) {
-                    try finishSched(&sched, slot_id, &sched_out, ng);
+                if (req.shouldStop(eos)) {
+                    try finishSched(&sched, slot_id, &sched_out, &sched_len, ng);
                     completed += 1;
                 }
             }
         }
     }
 
-    // GATE: every scheduled stream token-identical to its isolated reference.
+    // GATE: every scheduled stream token-identical to its isolated reference,
+    // including the SAME EOS-truncated length (variable per request).
     var gate_pass = completed == nseq;
     j = 0;
     while (j < nseq) : (j += 1) {
-        std.debug.print("SCHED_SEQ{d}:{d}", .{ j, sched_out[j][0] });
-        var s: u32 = 1;
-        while (s < ng) : (s += 1) std.debug.print(",{d}", .{sched_out[j][s]});
-        var match = true;
-        s = 0;
-        while (s < ng) : (s += 1) {
+        const L = serial_len[j];
+        var match = sched_len[j] == L;
+        var s: u32 = 0;
+        while (s < L) : (s += 1) {
             if (sched_out[j][s] != serial_out[j][s]) match = false;
         }
         if (!match) gate_pass = false;
+        std.debug.print("SCHED_SEQ{d}(len={d}/{d}):", .{ j, sched_len[j], L });
+        s = 0;
+        while (s < L) : (s += 1) std.debug.print("{s}{d}", .{ if (s == 0) "" else ",", sched_out[j][s] });
         std.debug.print(" [{s}]\n", .{if (match) "MATCH" else "DIFF"});
     }
-    std.debug.print("SCHED_GATE:{s} (nseq={d} nslots={d} ngen={d} completed={d} ticks={d})\n", .{ if (gate_pass) "PASS" else "FAIL", nseq, nslots, ng, completed, tick });
+    std.debug.print("SCHED_GATE:{s} (nseq={d} nslots={d} ngen={d} eos={d} completed={d} ticks={d})\n", .{ if (gate_pass) "PASS" else "FAIL", nseq, nslots, ng, eos, completed, tick });
 }
 
 /// On EOS/budget: copy a finished request's generated stream into `sched_out`
 /// (indexed by sequence id-1, the enqueue order), complete it, and free its slot
 /// for a waiting arrival.
-fn finishSched(sched: *scheduler.Scheduler, slot_id: u32, sched_out: anytype, ng: u32) !void {
+fn finishSched(sched: *scheduler.Scheduler, slot_id: u32, sched_out: anytype, sched_len: anytype, ng: u32) !void {
     const req = &sched.slots[slot_id].?;
     const seq: usize = @intCast(req.id - 1);
     const items = req.generated_tokens.items;
+    sched_len[seq] = @intCast(items.len);
     var s: u32 = 0;
     while (s < ng) : (s += 1) {
         sched_out[seq][s] = if (s < items.len) items[s] else 0;

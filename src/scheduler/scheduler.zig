@@ -292,6 +292,40 @@ test "Scheduler continuous-batching admit and reuse" {
     try std.testing.expect(!sched.isIdle());
 }
 
+test "Scheduler EOS-driven eviction frees a slot for a waiter (variable lengths)" {
+    const allocator = std.testing.allocator;
+    const EOS: u32 = 42;
+    var sched = try Scheduler.init(allocator, 2); // 2 slots, 3 requests → reuse on eviction
+    defer sched.deinit();
+
+    _ = try sched.enqueue(&.{1}, .{ .max_tokens = 8 }); // will EOS early
+    _ = try sched.enqueue(&.{2}, .{ .max_tokens = 8 }); // runs longer
+    _ = try sched.enqueue(&.{3}, .{ .max_tokens = 8 }); // waits for a free slot
+
+    // Admit the first two; the third stays pending (no free slot).
+    const a = (try sched.admitNext()).?;
+    const b = (try sched.admitNext()).?;
+    try std.testing.expectEqual(@as(?u32, null), try sched.admitNext());
+    for (sched.slots) |*s| {
+        if (s.*) |*r| try r.transition(.decoding);
+    }
+
+    // Slot `a` emits EOS after 2 tokens → shouldStop → release → admit the waiter.
+    try sched.slots[a].?.appendToken(100);
+    try sched.slots[a].?.appendToken(EOS);
+    try std.testing.expect(sched.slots[a].?.shouldStop(EOS));
+    try std.testing.expect(!sched.slots[b].?.shouldStop(EOS)); // still decoding
+    try std.testing.expectEqual(@as(usize, 2), sched.slots[a].?.generated_tokens.items.len);
+
+    try sched.slots[a].?.transition(.completed);
+    sched.release(a);
+    const reused = (try sched.admitNext()).?;
+    try std.testing.expectEqual(a, reused); // waiter takes the freed slot
+    try std.testing.expectEqual(@as(usize, 0), sched.pending.items.len);
+    // `b` keeps decoding alongside the freshly-admitted request → ragged batch.
+    try std.testing.expectEqual(RequestState.decoding, sched.slots[b].?.state);
+}
+
 test "Scheduler request IDs increment" {
     const allocator = std.testing.allocator;
     var sched = try Scheduler.init(allocator, 4);
