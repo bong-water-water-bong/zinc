@@ -1235,6 +1235,47 @@ extern "C" __global__ void dmmv_q5k_experts(const unsigned* a_u32, const float* 
     if (tid == 0) y[(size_t)e * pc.M + row] = sum;
 }
 
+// Batched Q6_K expert matvec (qwen36-35b-a3b MoE: 4 layers have Q6_K ffn_down):
+// one launch over all n_used experts, expert id read GPU-side from expert_ids[e],
+// so the MoE block needs no host readback for these layers either. Same Q6_K
+// dequant + 16-thread-superblock coalesced layout as dmmv_q6k_fast; expert
+// addressing mirrors dmmv_q5k_experts (a is byte-addressed -> unsigned char*).
+// per-expert x is x + e*x_stride; output slot-major y[e*M + row]. base unused (0).
+extern "C" __global__ void dmmv_q6k_experts(const unsigned char* a, const float* x, float* y, const unsigned* expert_ids, ExpertsPush pc) {
+    unsigned g = blockIdx.x;
+    unsigned e = g / pc.M;
+    if (e >= pc.n_used) return;
+    unsigned row = g - e * pc.M;
+    unsigned bpr = pc.K >> 8;
+    const unsigned char* arow = a + (size_t)expert_ids[e] * pc.slice + pc.base + (size_t)row * bpr * 210u;
+    const float4* xv = (const float4*)(x + (size_t)e * pc.x_stride);
+    unsigned tid = threadIdx.x, itid = tid & 15u, ix = tid >> 4;
+    unsigned half_id = itid >> 3, local_id = itid & 7u, e_start = local_id * 4u, is = e_start >> 4;
+    unsigned xvib = (half_id * 128u + e_start) >> 2, ngrp = blockDim.x >> 4;
+    float sum = 0.0f;
+    for (unsigned b = ix; b < bpr; b += ngrp) {
+        const unsigned char* bb = arow + (size_t)b * 210u;
+        float d = zinc_half_to_float((unsigned short)((unsigned)bb[208] | ((unsigned)bb[209] << 8)));
+        const unsigned char* ql = bb + half_id * 64u;
+        const unsigned char* qh = bb + 128u + half_id * 32u;
+        const signed char* sc = (const signed char*)(bb + 192u + half_id * 8u);
+        float ds0 = d * (float)sc[is], ds2 = d * (float)sc[is + 2], ds4 = d * (float)sc[is + 4], ds6 = d * (float)sc[is + 6];
+        unsigned xb = (b * 256u) / 4u + xvib;
+        float4 bx0 = xv[xb], bx32 = xv[xb + 8u], bx64 = xv[xb + 16u], bx96 = xv[xb + 24u];
+        #pragma unroll
+        for (unsigned li = 0; li < 4u; li++) {
+            unsigned l = e_start + li, qllo = ql[l], qlhi = ql[l + 32u], qhv = qh[l];
+            float q1 = (float)((qllo & 0xFu) | (((qhv >> 0) & 3u) << 4)) - 32.0f;
+            float q2 = (float)((qlhi & 0xFu) | (((qhv >> 2) & 3u) << 4)) - 32.0f;
+            float q3 = (float)((qllo >> 4) | (((qhv >> 4) & 3u) << 4)) - 32.0f;
+            float q4 = (float)((qlhi >> 4) | (((qhv >> 6) & 3u) << 4)) - 32.0f;
+            sum += ds0*q1*(&bx0.x)[li] + ds2*q2*(&bx32.x)[li] + ds4*q3*(&bx64.x)[li] + ds6*q4*(&bx96.x)[li];
+        }
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (tid == 0) y[(size_t)e * pc.M + row] = sum;
+}
+
 // Batched Q5_1 expert down-proj (gemma-26b MoE): one launch over all n_used
 // experts, expert id read GPU-side. Same dequant as dmmv_q5_1; per-expert x is
 // swiglu[e*x_stride..]; output slot-major y[e*M + row]. base unused (0).
