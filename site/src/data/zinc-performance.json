@@ -5828,6 +5828,7 @@
         "runner": "ZINC CLI vs llama.cpp on the same CUDA node",
         "benchmark_style": "Four-scenario matrix with same-file baselines",
         "notes": [
+          "PREFILL CAVEAT (2026-06-14): prefill tok/s here are measured on short realistic prompts, where both engines are overhead-bound and the zinc-vs-llama gap compresses; they undermeasure llama standard throughput (llama-bench pp512) by ~9x. The real prefill gap is ~6.5x (gemma-31b dense) to ~26x (gemma-26b MoE). A pp512 re-measurement is pending — do not read the prefill vs-llama as a throughput comparison.",
           "Hardware: one NVIDIA GeForce RTX 5090 (32 GB VRAM, 1792 GB/s) benchmark node. ZINC and llama.cpp run on the same host and use the same GGUF file for each model.",
           "ZINC path: sync the current source tree to the CUDA node, build with zig build -Doptimize=ReleaseFast -Dbackend=cuda, then measure generation through the ZINC CLI. CUDA kernels are NVRTC-compiled at runtime for the visible GPU.",
           "GPU selection: the target GPU is pinned by UUID via CUDA_VISIBLE_DEVICES for both engines, because nvidia-smi indices are unreliable on the WSL2 passthrough.",
