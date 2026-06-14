@@ -13,8 +13,15 @@ const log = std.log.scoped(.scheduler);
 /// Fixed-capacity pool of request slots used to track concurrent inference requests.
 /// Each slot holds at most one active `Request`; slots are reused once released.
 pub const Scheduler = struct {
-    /// Active requests indexed by slot ID.
+    /// Active requests indexed by slot ID (prefilling or decoding).
     slots: []?Request,
+    /// FIFO of admitted-but-waiting requests (state `.pending`, no slot yet).
+    /// Front = index 0. Drained into free slots by `admitNext`.
+    pending: std.ArrayList(Request),
+    /// Backing storage for the slot-ID slices returned by `pendingPrefill` /
+    /// `activeDecoding` (sized `max_parallel`). Each call overwrites it, so a
+    /// returned slice is only valid until the next such call.
+    scratch: []u32,
     /// Maximum number of concurrent requests.
     max_parallel: u32,
     /// Next request ID counter.
@@ -29,13 +36,64 @@ pub const Scheduler = struct {
     pub fn init(allocator: std.mem.Allocator, max_parallel: u32) !Scheduler {
         const slots = try allocator.alloc(?Request, max_parallel);
         @memset(slots, null);
+        const scratch = try allocator.alloc(u32, max_parallel);
         log.info("Scheduler ready: {d} slots", .{max_parallel});
         return .{
             .slots = slots,
+            .pending = .{},
+            .scratch = scratch,
             .max_parallel = max_parallel,
             .next_id = 1,
             .allocator = allocator,
         };
+    }
+
+    /// Enqueue a new request without assigning a slot (continuous-batching path).
+    /// The request sits in `pending` (state `.pending`) until `admitNext` moves it
+    /// into a free slot. Unlike `submit`, this never fails on a full slot array —
+    /// arrivals queue and are admitted as slots free, which is what lets a running
+    /// batch admit/evict sequences between decode steps.
+    /// @returns The new request's unique id.
+    pub fn enqueue(self: *Scheduler, prompt_tokens: []const u32, params: GenerationParams) !u64 {
+        const id = self.next_id;
+        self.next_id += 1;
+        const req = Request.init(self.allocator, id, prompt_tokens, params);
+        try self.pending.append(self.allocator, req);
+        log.info("Request {d} enqueued ({d} prompt tokens, {d} waiting)", .{ id, prompt_tokens.len, self.pending.items.len });
+        return id;
+    }
+
+    /// Admit the oldest pending request into the first free slot, if any.
+    /// Moves it out of the `pending` queue, assigns `slot_id`, and transitions it
+    /// to `.prefilling`. The caller then runs prefill for every slot reported by
+    /// `pendingPrefill` and transitions those to `.decoding`.
+    /// @returns The assigned slot index, or null if no pending request or no free slot.
+    pub fn admitNext(self: *Scheduler) !?u32 {
+        if (self.pending.items.len == 0) return null;
+        for (self.slots, 0..) |*slot, i| {
+            if (slot.* == null) {
+                var req = self.pending.orderedRemove(0);
+                req.slot_id = @intCast(i);
+                try req.transition(.prefilling);
+                slot.* = req;
+                log.info("Request {d} admitted to slot {d}", .{ req.id, i });
+                return @intCast(i);
+            }
+        }
+        return null; // all slots busy — request stays queued
+    }
+
+    /// True if at least one slot is free.
+    pub fn hasFreeSlot(self: *const Scheduler) bool {
+        for (self.slots) |slot| {
+            if (slot == null) return true;
+        }
+        return false;
+    }
+
+    /// True if there is no outstanding work: every slot empty and no waiters.
+    pub fn isIdle(self: *const Scheduler) bool {
+        return self.pending.items.len == 0 and self.activeCount() == 0;
     }
 
     /// Submit a new request and assign it to the first free slot.
@@ -78,22 +136,40 @@ pub const Scheduler = struct {
         return count;
     }
 
-    /// Return slot IDs of requests in the prefilling state.
-    /// @param self Scheduler to query.
-    /// @returns Empty slice (stub — allocation strategy TBD).
+    /// Slot IDs of requests in the `.prefilling` state (admitted, prompt not yet
+    /// processed). The driver runs prefill for each, then transitions it to
+    /// `.decoding`.
+    /// @returns A slice into `self.scratch`, valid until the next pendingPrefill /
+    ///   activeDecoding call.
     pub fn pendingPrefill(self: *Scheduler) []u32 {
-        // Returns slot IDs of pending requests
-        // TODO: implement with proper allocation
-        _ = self;
-        return &.{};
+        var n: usize = 0;
+        for (self.slots, 0..) |slot, i| {
+            if (slot) |req| {
+                if (req.state == .prefilling) {
+                    self.scratch[n] = @intCast(i);
+                    n += 1;
+                }
+            }
+        }
+        return self.scratch[0..n];
     }
 
-    /// Return slot IDs of requests in the decoding state.
-    /// @param self Scheduler to query.
-    /// @returns Empty slice (stub — allocation strategy TBD).
+    /// Slot IDs of requests in the `.decoding` state (the running decode batch).
+    /// The driver gathers (token, position, slot) per id and issues ONE batched
+    /// decode step over them.
+    /// @returns A slice into `self.scratch`, valid until the next pendingPrefill /
+    ///   activeDecoding call.
     pub fn activeDecoding(self: *Scheduler) []u32 {
-        _ = self;
-        return &.{};
+        var n: usize = 0;
+        for (self.slots, 0..) |slot, i| {
+            if (slot) |req| {
+                if (req.state == .decoding) {
+                    self.scratch[n] = @intCast(i);
+                    n += 1;
+                }
+            }
+        }
+        return self.scratch[0..n];
     }
 
     /// Release a completed or cancelled request's slot, freeing its resources.
@@ -110,12 +186,15 @@ pub const Scheduler = struct {
         }
     }
 
-    /// Tear down all active requests and free the slot array.
+    /// Tear down all active and pending requests and free owned buffers.
     /// @param self Scheduler to destroy.
     pub fn deinit(self: *Scheduler) void {
         for (self.slots) |*slot| {
             if (slot.*) |*req| req.deinit();
         }
+        for (self.pending.items) |*req| req.deinit();
+        self.pending.deinit(self.allocator);
+        self.allocator.free(self.scratch);
         self.allocator.free(self.slots);
     }
 };
@@ -176,6 +255,41 @@ test "Scheduler release and reuse slot" {
     const s2 = try sched.submit(&.{20}, .{});
     try std.testing.expectEqual(@as(u32, 0), s2);
     sched.release(s2);
+}
+
+test "Scheduler continuous-batching admit and reuse" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 2); // 2 slots, 3 requests → forces reuse
+    defer sched.deinit();
+
+    _ = try sched.enqueue(&.{ 1, 2 }, .{ .max_tokens = 4 });
+    _ = try sched.enqueue(&.{3}, .{ .max_tokens = 4 });
+    _ = try sched.enqueue(&.{ 4, 5 }, .{ .max_tokens = 4 }); // waits — no free slot
+
+    // Admit as many as fit: 2 fill the slots, the 3rd stays pending.
+    try std.testing.expect((try sched.admitNext()) != null);
+    try std.testing.expect((try sched.admitNext()) != null);
+    try std.testing.expectEqual(@as(?u32, null), try sched.admitNext());
+    try std.testing.expectEqual(@as(usize, 1), sched.pending.items.len);
+
+    // Both admitted requests are prefilling, none decoding yet.
+    try std.testing.expectEqual(@as(usize, 2), sched.pendingPrefill().len);
+    try std.testing.expectEqual(@as(usize, 0), sched.activeDecoding().len);
+
+    // Transition both to decoding (driver does this after prefill).
+    for (sched.slots) |*s| {
+        if (s.*) |*r| try r.transition(.decoding);
+    }
+    try std.testing.expectEqual(@as(usize, 0), sched.pendingPrefill().len);
+    try std.testing.expectEqual(@as(usize, 2), sched.activeDecoding().len);
+
+    // Evict slot 0 → the waiter must now admit into the freed slot.
+    sched.release(0);
+    try std.testing.expect(sched.hasFreeSlot());
+    const reused = (try sched.admitNext()).?;
+    try std.testing.expectEqual(@as(u32, 0), reused);
+    try std.testing.expectEqual(@as(usize, 0), sched.pending.items.len);
+    try std.testing.expect(!sched.isIdle());
 }
 
 test "Scheduler request IDs increment" {

@@ -20,6 +20,7 @@ const forwardgemma = @import("compute/forward_cuda_gemma.zig");
 const pipeline = @import("cuda/pipeline.zig");
 const buffer = @import("cuda/buffer.zig");
 const command = @import("cuda/command.zig");
+const scheduler = @import("scheduler/scheduler.zig");
 
 /// Drives either the qwen35/qwen36 (`ForwardCuda`) or gemma4 (`ForwardGemma`)
 /// decode engine, selected from the model architecture. Both expose the same
@@ -131,6 +132,14 @@ pub fn main() !void {
         const ngen: u32 = std.fmt.parseInt(u32, args.next() orelse "8", 10) catch 8;
         const model_path = args.next() orelse DEFAULT_MODEL;
         try batchMode(allocator, seqs_arg, ngen, model_path);
+    } else if (std.mem.eql(u8, first, "sched")) {
+        // Effort 28 increment 2: continuous-batching scheduler proof. '|' separates
+        // sequences, ',' separates prompt token-ids. nslots < nseq forces slot reuse.
+        const seqs_arg = args.next() orelse "760,6511,314,9338,369|450,3271,310,3444,338|1102,323,1023,1024|99,100,101,102,103";
+        const ngen: u32 = std.fmt.parseInt(u32, args.next() orelse "8", 10) catch 8;
+        const nslots: u32 = std.fmt.parseInt(u32, args.next() orelse "2", 10) catch 2;
+        const model_path = args.next() orelse DEFAULT_MODEL;
+        try schedMode(allocator, seqs_arg, ngen, nslots, model_path);
     } else if (std.mem.eql(u8, first, "prof")) {
         const model_path = args.next() orelse DEFAULT_MODEL;
         try profMode(allocator, model_path);
@@ -455,6 +464,219 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
             std.debug.print("BATCHDEC:skip (qwen — increment 4)\n", .{});
         },
     }
+}
+
+/// Effort 28 increment 2 — continuous-batching SCHEDULER proof (gemma DENSE).
+///
+/// Drives `Scheduler` (src/scheduler/scheduler.zig) as a real running batch:
+/// sequences ARRIVE at staggered ticks, are admitted into a small fixed pool of
+/// `nslots` KV slots (nslots < nseq FORCES slot reuse), prefilled into their slot,
+/// then DECODED TOGETHER each step at their own per-sequence positions; a sequence
+/// that hits its token budget is EVICTED and its slot freed for a waiting arrival.
+/// So the batch membership, the per-row co-residents, and the slot a sequence
+/// lands in all VARY across the run.
+///
+/// GATE (`SCHED_GATE`): every sequence's emitted stream must be TOKEN-IDENTICAL to
+/// its ISOLATED production run (`serial_out`, via single-sequence prefill+decodeStep).
+/// That proves the scheduler introduces no cross-sequence contamination and that a
+/// reused slot starts clean — independent of which other sequences share the batch.
+/// ADDITIVE: the production decode path + the server mutex are untouched (the server
+/// is wired in Increment 3).
+fn schedMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslots_arg: u32, model_path: []const u8) !void {
+    var dev = try device.CudaDevice.initBest(allocator);
+    defer dev.deinit();
+    var model = try loader.Model.load(allocator, dev.ctx, model_path);
+    defer model.deinit();
+    var fwd = try Engine.init(allocator, &model, 512);
+    defer fwd.deinit();
+
+    if (std.meta.activeTag(fwd) != .gemma) {
+        std.debug.print("SCHED:skip (qwen — increment 4)\n", .{});
+        return;
+    }
+    const pf_batched = batchedPrefillDefaultOn();
+
+    const MAXB = 8; // max sequences this harness tracks
+    const MAXP = 256; // max prompt tokens / sequence
+    const MAXG = 64; // max generated tokens / sequence
+    var prompts: [MAXB][MAXP]u32 = undefined;
+    var plens: [MAXB]usize = undefined;
+    var serial_out: [MAXB][MAXG]u32 = undefined; // isolated production reference
+    var nseq: u32 = 0;
+    const ng = @min(ngen, @as(u32, MAXG));
+
+    var seq_it = std.mem.splitScalar(u8, seqs_arg, '|');
+    while (seq_it.next()) |seq_str| {
+        if (nseq >= MAXB) break;
+        const seq_trim = std.mem.trim(u8, seq_str, " ");
+        if (seq_trim.len == 0) continue;
+        var np: usize = 0;
+        var it = std.mem.splitScalar(u8, seq_trim, ',');
+        while (it.next()) |s| {
+            const t = std.mem.trim(u8, s, " ");
+            if (t.len == 0 or np >= MAXP) continue;
+            prompts[nseq][np] = try std.fmt.parseInt(u32, t, 10);
+            np += 1;
+        }
+        if (np == 0) continue;
+        plens[nseq] = np;
+
+        // ISOLATED REFERENCE: this sequence alone through the production path.
+        const prompt = prompts[nseq][0..np];
+        var pos: u32 = 0;
+        var tok: u32 = 0;
+        var used_batched = false;
+        if (pf_batched and prompt.len > 1) {
+            if (fwd.prefillBatched(prompt)) |firstt| {
+                tok = firstt;
+                pos = @intCast(prompt.len);
+                used_batched = true;
+            } else |_| {}
+        }
+        if (!used_batched) {
+            for (prompt) |t| {
+                tok = try fwd.decodeStep(t, pos, true);
+                pos += 1;
+            }
+        }
+        serial_out[nseq][0] = tok;
+        var gi: u32 = 1;
+        while (gi < ng) : (gi += 1) {
+            const next = try fwd.decodeStep(tok, pos, true);
+            pos += 1;
+            serial_out[nseq][gi] = next;
+            tok = next;
+        }
+        nseq += 1;
+    }
+    if (nseq == 0) {
+        std.debug.print("SCHED:skip (no sequences)\n", .{});
+        return;
+    }
+
+    const g = &fwd.gemma;
+    if (g.d.n_experts > 0) {
+        std.debug.print("SCHED:skip (MoE — increment 1/2 are dense gemma)\n", .{});
+        return;
+    }
+
+    const nslots = std.math.clamp(nslots_arg, 1, nseq);
+    const slot_ctx: u32 = 512;
+    try g.allocSlotKv(nslots, slot_ctx);
+    defer g.freeSlotKv();
+
+    var sched = try scheduler.Scheduler.init(allocator, nslots);
+    defer sched.deinit();
+
+    // Staggered arrivals: sequence j arrives at tick j*STRIDE. Combined with
+    // nslots < nseq this yields a ragged batch (mixed positions) + slot reuse.
+    const STRIDE: u32 = 2;
+    var arrival: [MAXB]u32 = undefined;
+    var j: u32 = 0;
+    while (j < nseq) : (j += 1) arrival[j] = j * STRIDE;
+
+    var sched_out: [MAXB][MAXG]u32 = undefined;
+    var completed: u32 = 0;
+    const max_ticks = nseq * STRIDE + ng + 16; // safety bound against a stuck loop
+
+    var tick: u32 = 0;
+    while (completed < nseq and tick < max_ticks) : (tick += 1) {
+        // 1) ARRIVALS for this tick → enqueue (no slot yet).
+        j = 0;
+        while (j < nseq) : (j += 1) {
+            if (arrival[j] == tick) {
+                _ = try sched.enqueue(prompts[j][0..plens[j]], .{ .max_tokens = ng });
+            }
+        }
+
+        // 2) ADMIT waiters into free slots (FIFO) → state .prefilling.
+        while ((try sched.admitNext()) != null) {}
+
+        // 3) PREFILL every prefilling slot (per-token B=1 decodeBatch into its slot),
+        //    record the first generated token, then promote to .decoding (or complete
+        //    immediately if ng==1).
+        const to_prefill = sched.pendingPrefill();
+        for (to_prefill) |slot_id| {
+            const req = &sched.slots[slot_id].?;
+            const np = req.prompt_tokens.len;
+            var pos: u32 = 0;
+            var tok: u32 = 0;
+            var k: usize = 0;
+            while (k < np) : (k += 1) {
+                var tk = [_]u32{req.prompt_tokens[k]};
+                var ps = [_]u32{pos};
+                var sl = [_]u32{slot_id};
+                var ot = [_]u32{0};
+                try g.decodeBatch(&tk, &ps, &sl, &ot);
+                tok = ot[0];
+                pos += 1;
+            }
+            try req.appendToken(tok);
+            try req.transition(.decoding); // .prefilling → .decoding (valid even if it stops below)
+            if (req.shouldStop(std.math.maxInt(u32))) {
+                try finishSched(&sched, slot_id, &sched_out, ng);
+                completed += 1;
+            }
+        }
+
+        // 4) DECODE one step over the whole running batch (mixed positions/slots).
+        const decoders = sched.activeDecoding();
+        if (decoders.len > 0) {
+            var tks: [MAXB]u32 = undefined;
+            var pss: [MAXB]u32 = undefined;
+            var sls: [MAXB]u32 = undefined;
+            var out: [MAXB]u32 = undefined;
+            for (decoders, 0..) |slot_id, i| {
+                const req = &sched.slots[slot_id].?;
+                const gen_n = req.generated_tokens.items.len;
+                tks[i] = req.generated_tokens.items[gen_n - 1];
+                // next feed position = prompt_len + (#generated - 1)
+                pss[i] = @intCast(req.prompt_tokens.len + gen_n - 1);
+                sls[i] = slot_id;
+            }
+            try g.decodeBatch(tks[0..decoders.len], pss[0..decoders.len], sls[0..decoders.len], out[0..decoders.len]);
+            for (decoders, 0..) |slot_id, i| {
+                const req = &sched.slots[slot_id].?;
+                try req.appendToken(out[i]);
+                if (req.shouldStop(std.math.maxInt(u32))) {
+                    try finishSched(&sched, slot_id, &sched_out, ng);
+                    completed += 1;
+                }
+            }
+        }
+    }
+
+    // GATE: every scheduled stream token-identical to its isolated reference.
+    var gate_pass = completed == nseq;
+    j = 0;
+    while (j < nseq) : (j += 1) {
+        std.debug.print("SCHED_SEQ{d}:{d}", .{ j, sched_out[j][0] });
+        var s: u32 = 1;
+        while (s < ng) : (s += 1) std.debug.print(",{d}", .{sched_out[j][s]});
+        var match = true;
+        s = 0;
+        while (s < ng) : (s += 1) {
+            if (sched_out[j][s] != serial_out[j][s]) match = false;
+        }
+        if (!match) gate_pass = false;
+        std.debug.print(" [{s}]\n", .{if (match) "MATCH" else "DIFF"});
+    }
+    std.debug.print("SCHED_GATE:{s} (nseq={d} nslots={d} ngen={d} completed={d} ticks={d})\n", .{ if (gate_pass) "PASS" else "FAIL", nseq, nslots, ng, completed, tick });
+}
+
+/// On EOS/budget: copy a finished request's generated stream into `sched_out`
+/// (indexed by sequence id-1, the enqueue order), complete it, and free its slot
+/// for a waiting arrival.
+fn finishSched(sched: *scheduler.Scheduler, slot_id: u32, sched_out: anytype, ng: u32) !void {
+    const req = &sched.slots[slot_id].?;
+    const seq: usize = @intCast(req.id - 1);
+    const items = req.generated_tokens.items;
+    var s: u32 = 0;
+    while (s < ng) : (s += 1) {
+        sched_out[seq][s] = if (s < items.len) items[s] else 0;
+    }
+    try req.transition(.completed);
+    sched.release(slot_id);
 }
 
 /// Dispatch sync-vs-async microbench: the same kernel launched N times under the
