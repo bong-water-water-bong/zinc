@@ -1714,6 +1714,12 @@ pub const RuntimeProfile = struct {
     qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes: u64 = 0,
     qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes: u64 = 0,
     qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_replay_command_gpu_ns: u64 = 0,
+    qwen35_dense_prefill_replay_async_command_gpu_ns: u64 = 0,
+    qwen35_dense_prefill_replay_final_command_gpu_ns: u64 = 0,
+    qwen35_dense_prefill_replay_command_gpu_samples: u32 = 0,
+    qwen35_dense_prefill_replay_async_command_gpu_samples: u32 = 0,
+    qwen35_dense_prefill_replay_final_command_gpu_samples: u32 = 0,
     qwen35_dense_prefill_materialized_dispatch_calls: u32 = 0,
     qwen35_dense_prefill_materialized_barrier_calls: u32 = 0,
     qwen35_dense_prefill_materialized_resource_barrier_resources: u32 = 0,
@@ -2906,6 +2912,29 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                 avgGiB(profile.qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes, profile.qwen35_dense_prefill_replay_graph_full_attn_runs),
                 avgGiB(profile.qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes, profile.qwen35_dense_prefill_replay_graph_full_attn_runs),
             });
+            if (profile.qwen35_dense_prefill_replay_command_gpu_ns > 0) {
+                const ssm_bytes = profile.qwen35_dense_prefill_remaining_replay_ssm_projection_bytes +|
+                    profile.qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes;
+                const full_attn_bytes = profile.qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes +|
+                    profile.qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes;
+                const total_replay_bytes = ssm_bytes +| full_attn_bytes;
+                const total_replay_bytes_f = @as(f64, @floatFromInt(@max(total_replay_bytes, 1)));
+                const replay_gpu_ms = nsToMs(profile.qwen35_dense_prefill_replay_command_gpu_ns);
+                const ssm_weighted_ms = replay_gpu_ms * @as(f64, @floatFromInt(ssm_bytes)) / total_replay_bytes_f;
+                const full_attn_weighted_ms = replay_gpu_ms * @as(f64, @floatFromInt(full_attn_bytes)) / total_replay_bytes_f;
+                log.info("  {s} qwen35-9b measured replay GPU: cmds {d} total {d:.2} ms async {d:.2} ms/{d} final {d:.2} ms/{d} eff {d:.1} GiB/s byte_weighted_gpu_ms ssm/full_attn {d:.2}/{d:.2}", .{
+                    label,
+                    profile.qwen35_dense_prefill_replay_command_gpu_samples,
+                    replay_gpu_ms,
+                    nsToMs(profile.qwen35_dense_prefill_replay_async_command_gpu_ns),
+                    profile.qwen35_dense_prefill_replay_async_command_gpu_samples,
+                    nsToMs(profile.qwen35_dense_prefill_replay_final_command_gpu_ns),
+                    profile.qwen35_dense_prefill_replay_final_command_gpu_samples,
+                    bytesPerSecondGiB(total_replay_bytes, profile.qwen35_dense_prefill_replay_command_gpu_ns),
+                    ssm_weighted_ms,
+                    full_attn_weighted_ms,
+                });
+            }
         }
         const replay_dispatch_calls = profile.queued_prefill_async_dispatch_calls +| profile.queued_prefill_final_dispatch_calls;
         const replay_barrier_calls = profile.queued_prefill_async_barrier_calls +| profile.queued_prefill_final_barrier_calls;
@@ -5325,6 +5354,38 @@ fn recordQwen35Dense9bLayerMajorPrefillWork(
     p.qwen35_dense_prefill_materialized_barrier_calls +|= cmd.barrier_count;
     p.qwen35_dense_prefill_materialized_resource_barrier_resources +|= cmd.resource_barrier_resources;
     p.qwen35_dense_prefill_materialized_record_ns +|= record_ns;
+}
+
+fn recordQwen35Dense9bQueuedReplayGpuDuration(
+    profile: ?*RuntimeProfile,
+    cfg: ModelConfig,
+    gpu_ns: u64,
+    is_final: bool,
+) void {
+    const p = profile orelse return;
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return;
+    if (gpu_ns == 0) return;
+
+    p.qwen35_dense_prefill_replay_command_gpu_ns +|= gpu_ns;
+    p.qwen35_dense_prefill_replay_command_gpu_samples +|= 1;
+    if (is_final) {
+        p.qwen35_dense_prefill_replay_final_command_gpu_ns +|= gpu_ns;
+        p.qwen35_dense_prefill_replay_final_command_gpu_samples +|= 1;
+    } else {
+        p.qwen35_dense_prefill_replay_async_command_gpu_ns +|= gpu_ns;
+        p.qwen35_dense_prefill_replay_async_command_gpu_samples +|= 1;
+    }
+}
+
+fn recordQwen35Dense9bQueuedReplayPendingGpuDurations(
+    profile: ?*RuntimeProfile,
+    cfg: ModelConfig,
+    pending: []const MetalCommand,
+) void {
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return;
+    for (pending) |*cmd| {
+        recordQwen35Dense9bQueuedReplayGpuDuration(profile, cfg, cmd.gpuDurationNs(), false);
+    }
 }
 
 fn logRoutePackCandidateBlocks(n_tokens: u32, n_experts: u32, n_experts_used: u32) void {
@@ -8887,6 +8948,7 @@ pub const InferenceEngine = struct {
         if (try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &pending[pending_count])) {
             pending_count += 1;
         }
+        const replay_pending_start = pending_count;
 
         const async_chunk_request = readU32Env("ZINC_METAL_GEMMA_PREFILL_CHUNK_TOKENS");
         const async_chunk_tokens = queuedTokenMajorAsyncChunkTokensFromRequest(self.config, prompt_tokens.len, async_chunk_request);
@@ -8942,8 +9004,13 @@ pub const InferenceEngine = struct {
                         @intCast(final_wait_start - first_async_submit_ns)
                     else
                         0;
-                    commitAndWaitProfiled(&chunk_cmd, profile);
-                    recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, profileElapsedNs(final_wait_start));
+                    const wait_timing = if (profile != null and defaultQwen35Dense9bQueuedPrefillEnabled(self.config))
+                        commitAndWaitProfiledMeasuredGpuDuration(&chunk_cmd, profile)
+                    else
+                        CommandWaitTiming{ .wait_ns = commitAndWaitProfiledMeasured(&chunk_cmd, profile), .gpu_ns = 0 };
+                    recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, wait_timing.wait_ns);
+                    recordQwen35Dense9bQueuedReplayGpuDuration(profile, self.config, wait_timing.gpu_ns, true);
+                    recordQwen35Dense9bQueuedReplayPendingGpuDurations(profile, self.config, pending[replay_pending_start..pending_count]);
                     pending_completed_by_final_wait = true;
                     state.position = self.position;
                     return;
@@ -25012,6 +25079,30 @@ fn commitAndWaitProfiledMeasured(cmd: *MetalCommand, profile: ?*RuntimeProfile) 
     return wait_ns;
 }
 
+const CommandWaitTiming = struct {
+    wait_ns: u64 = 0,
+    gpu_ns: u64 = 0,
+};
+
+fn commitAndWaitProfiledMeasuredGpuDuration(cmd: *MetalCommand, profile: ?*RuntimeProfile) CommandWaitTiming {
+    if (profile) |p| {
+        p.dispatch_calls += cmd.dispatch_count;
+        p.barrier_calls += cmd.barrier_count;
+        p.scope_barrier_calls += cmd.scope_barrier_count;
+        p.resource_barrier_calls += cmd.resource_barrier_count;
+        p.resource_barrier_resources += cmd.resource_barrier_resources;
+    }
+    const wait_start = profileStart(profile != null);
+    cmd.commitAsync();
+    const gpu_ns = cmd.waitGpuDurationNs();
+    const wait_ns = profileElapsedNs(wait_start);
+    if (profile) |p| {
+        p.commit_waits += 1;
+        p.gpu_completion_wait_ns += wait_ns;
+    }
+    return .{ .wait_ns = wait_ns, .gpu_ns = gpu_ns };
+}
+
 fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     _ = commitAndWaitProfiledMeasured(cmd, profile);
 }
@@ -33964,6 +34055,16 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     recordQwen35Dense9bLayerMajorPrefillWork(&profile, qwen35_27b_cfg, &prefix_cmd, 9999);
     try std.testing.expectEqual(@as(u32, 17), profile.qwen35_dense_prefill_materialized_dispatch_calls);
     try std.testing.expectEqual(@as(u64, 1234), profile.qwen35_dense_prefill_materialized_record_ns);
+
+    recordQwen35Dense9bQueuedReplayGpuDuration(&profile, qwen35_9b_cfg, 1_500_000, true);
+    recordQwen35Dense9bQueuedReplayGpuDuration(&profile, qwen35_9b_cfg, 500_000, false);
+    recordQwen35Dense9bQueuedReplayGpuDuration(&profile, qwen35_27b_cfg, 999_000, true);
+    try std.testing.expectEqual(@as(u64, 2_000_000), profile.qwen35_dense_prefill_replay_command_gpu_ns);
+    try std.testing.expectEqual(@as(u64, 1_500_000), profile.qwen35_dense_prefill_replay_final_command_gpu_ns);
+    try std.testing.expectEqual(@as(u64, 500_000), profile.qwen35_dense_prefill_replay_async_command_gpu_ns);
+    try std.testing.expectEqual(@as(u32, 2), profile.qwen35_dense_prefill_replay_command_gpu_samples);
+    try std.testing.expectEqual(@as(u32, 1), profile.qwen35_dense_prefill_replay_final_command_gpu_samples);
+    try std.testing.expectEqual(@as(u32, 1), profile.qwen35_dense_prefill_replay_async_command_gpu_samples);
 }
 
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {

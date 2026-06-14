@@ -285,6 +285,16 @@ pub const MetalCommand = struct {
         }
     }
 
+    /// Wait for completion and return Metal's GPU execution duration.
+    pub fn waitGpuDurationNs(self: *MetalCommand) u64 {
+        if (self.handle) |h| {
+            const gpu_ns = shim.mtl_wait_gpu_duration_ns(h);
+            self.handle = null;
+            return gpu_ns;
+        }
+        return 0;
+    }
+
     /// Release an async command buffer that is known to be completed by a later
     /// queue-ordered wait. The shim falls back to waiting if it is still pending.
     pub fn releaseCompleted(self: *MetalCommand) void {
