@@ -907,11 +907,10 @@ fn qwen35Dense9bPrefillMaterializedTokens(cfg: ModelConfig, prompt_len: usize) u
     const capped = @min(prompt_len, @as(usize, qwen_ssm_projection_prefill_max_tokens));
     if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return capped;
 
-    // The current Q4_K/Q6_K prompt GEMM tile is 32 token columns wide. For the
-    // public 33-40 token band, a full-prompt prefix records a second wide tile
-    // that mostly computes unused columns. Materialize one full tile and let
-    // the short tail use the validated token path.
-    if (capped > 32 and capped <= 40) return 32;
+    // Adapt llama.cpp `ggml_metal_graph_compute` materialization discipline:
+    // for the public 33-40 token band, materialize the full prompt so queued
+    // replay starts at model_end instead of paying 1-8 decode-shaped tail
+    // passes after a 32-row prefix.
     return capped;
 }
 
@@ -33506,17 +33505,17 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     const qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 36, null);
     try std.testing.expectEqual(@as(usize, 36), qwen_base);
     try std.testing.expectEqual(@as(usize, 36), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 0, qwen_base, false));
-    try std.testing.expectEqual(@as(usize, 32), qwen35Dense9bPrefillMaterializedTokens(qwen35_9b_cfg, 36));
+    try std.testing.expectEqual(@as(usize, 36), qwen35Dense9bPrefillMaterializedTokens(qwen35_9b_cfg, 36));
 
     const nearby_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 33, null);
     try std.testing.expectEqual(@as(usize, 33), nearby_qwen_base);
     try std.testing.expectEqual(@as(usize, 33), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 33, 0, nearby_qwen_base, false));
-    try std.testing.expectEqual(@as(usize, 32), qwen35Dense9bPrefillMaterializedTokens(qwen35_9b_cfg, 33));
+    try std.testing.expectEqual(@as(usize, 33), qwen35Dense9bPrefillMaterializedTokens(qwen35_9b_cfg, 33));
 
     const upper_nearby_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 40, null);
     try std.testing.expectEqual(@as(usize, 40), upper_nearby_qwen_base);
     try std.testing.expectEqual(@as(usize, 40), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 40, 0, upper_nearby_qwen_base, false));
-    try std.testing.expectEqual(@as(usize, 32), qwen35Dense9bPrefillMaterializedTokens(qwen35_9b_cfg, 40));
+    try std.testing.expectEqual(@as(usize, 40), qwen35Dense9bPrefillMaterializedTokens(qwen35_9b_cfg, 40));
 
     const outside_balanced_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 41, null);
     try std.testing.expectEqual(@as(usize, 16), outside_balanced_qwen_base);
