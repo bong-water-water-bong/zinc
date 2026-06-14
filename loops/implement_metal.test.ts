@@ -39,6 +39,7 @@ import {
   recordNearMiss,
   shouldRejectPlateauNeutralKeep,
   shouldConfirmCandidate,
+  shouldKeepFoundationEvidenceStep,
   shouldFinalizeBestTree,
   shouldRunCandidateEvidence,
   shouldRunMetalShapesEvidence,
@@ -1253,6 +1254,64 @@ describe("buildPrompt", () => {
       verifyTokPerSec: 86.1,
       acceptedTokPerSec: 86.1,
       currentProgressBand: 0.25,
+    })).toBe(false);
+  });
+
+  test("Qwen3.5 M4 prefill rejects neutral optimization churn immediately", () => {
+    const state = makeState({
+      effortId: 25,
+      effortFile: "MULTI_HOUR_EFFORT_25_METAL_QWEN35_9B_M4.md",
+      effortPlan: "# Effort 25\nMetal Qwen 3.5 9B prefill on M4",
+      metricMode: "prefill",
+      bestTokPerSec: 38.4,
+      currentBest: { tokPerSec: 38.4, containsReference: true },
+      stalledCycles: 0,
+    });
+
+    expect(shouldRejectPlateauNeutralKeep({
+      state,
+      stepKind: "optimization",
+      description: "Extend Qwen 3.5 9B queued prefill prefix one more layer",
+      selfAnalysis: "Expected to be neutral to slightly faster.",
+      verifyTokPerSec: 38.2,
+      acceptedTokPerSec: 38.4,
+      currentProgressBand: 0.25,
+    })).toBe(true);
+
+    expect(shouldRejectPlateauNeutralKeep({
+      state,
+      stepKind: "analysis",
+      description: "Add Qwen 3.5 9B layer-major coverage counters",
+      selfAnalysis: "Names the first fallback reason before the next production edit.",
+      verifyTokPerSec: 38.4,
+      acceptedTokPerSec: 38.4,
+      currentProgressBand: 0.25,
+    })).toBe(false);
+  });
+
+  test("Qwen3.5 M4 keeps foundation evidence when the cycle baseline drifted below accepted", () => {
+    expect(shouldKeepFoundationEvidenceStep({
+      stepKind: "analysis",
+      cycleBaselineTokPerSec: 38.0,
+      verifyTokPerSec: 38.0,
+      cycleBaselineSamples: [38.0, 38.0, 37.9],
+      verifySamples: [38.0, 38.0, 38.0],
+    })).toBe(true);
+
+    expect(shouldKeepFoundationEvidenceStep({
+      stepKind: "optimization",
+      cycleBaselineTokPerSec: 38.0,
+      verifyTokPerSec: 38.0,
+      cycleBaselineSamples: [38.0, 38.0, 37.9],
+      verifySamples: [38.0, 38.0, 38.0],
+    })).toBe(false);
+
+    expect(shouldKeepFoundationEvidenceStep({
+      stepKind: "enablement",
+      cycleBaselineTokPerSec: 38.0,
+      verifyTokPerSec: 37.0,
+      cycleBaselineSamples: [38.0, 38.0, 37.9],
+      verifySamples: [37.0, 37.0, 37.1],
     })).toBe(false);
   });
 

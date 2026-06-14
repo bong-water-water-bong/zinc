@@ -70,6 +70,7 @@ void mtl_barrier_buffers(MetalCmd* cmd, MetalBuf** bufs, uint32_t n_bufs);
 void mtl_commit_and_wait(MetalCmd* cmd);
 void mtl_commit_async(MetalCmd* cmd);
 void mtl_wait(MetalCmd* cmd);
+uint64_t mtl_wait_gpu_duration_ns(MetalCmd* cmd);
 void mtl_release_completed(MetalCmd* cmd);
 uint64_t mtl_command_gpu_duration_ns(MetalCmd* cmd);
 

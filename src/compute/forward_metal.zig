@@ -32,7 +32,8 @@ pub const runtime_context_cap: u32 = 262144;
 const queued_prefill_embed_tokens: usize = 256;
 const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
 const qwen_ssm_projection_prefill_min_tokens: usize = 32;
-const qwen_ssm_projection_validate_tokens: u32 = 4;
+const qwen35_dense9b_prefill_prefix_layers: usize = 32;
+const qwen_ssm_projection_validate_default_tokens: u32 = 4;
 // llama.cpp's Metal `ggml_metal_op_mul_mat_id` switches from the small
 // matrix-vector path to the expert-grouped matrix path at 32 prompt rows, but
 // that is only the minimum batch shape. Validate Qwen route packing closer to
@@ -309,12 +310,20 @@ fn isQwen35SsmQkvQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K:
     return isQwen35SsmQkvShapeTarget(cfg, tensor_name, M, K);
 }
 
-fn isQwen35Dense9bSsmQkvQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+fn isQwen35Dense9bSsmQkvTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
     return defaultQwen35Dense9bQueuedPrefillEnabled(cfg) and
         M == qwen35SsmQkvRows(cfg) and
         K == cfg.hidden_dim and
         K == qwen35_9b_ssm_qkv_q4k_blocks * 256 and
         std.mem.endsWith(u8, tensor_name, "attn_qkv.weight");
+}
+
+fn isQwen35Dense9bSsmQkvQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return isQwen35Dense9bSsmQkvTarget(cfg, tensor_name, M, K);
+}
+
+fn isQwen35Dense9bSsmQkvQ5kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return isQwen35Dense9bSsmQkvTarget(cfg, tensor_name, M, K);
 }
 
 fn isQwen35SsmGateQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
@@ -703,6 +712,18 @@ fn qwenMoeRoutePackRequestedValidateTokens() ?u32 {
         readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_TOKENS");
 }
 
+fn qwenSsmProjectionValidateTokens() u32 {
+    const requested = qwenMoeRoutePackRequestedValidateTokens() orelse
+        qwen_ssm_projection_validate_default_tokens;
+    return @min(@max(requested, 1), qwen_ssm_projection_prefill_max_tokens);
+}
+
+fn qwen35Dense9bPrefillPrefixLayerLimit() usize {
+    const requested = readU32Env("ZINC_QWEN35_9B_PREFILL_PREFIX_LAYERS") orelse
+        return qwen35_dense9b_prefill_prefix_layers;
+    return @min(@max(@as(usize, @intCast(requested)), 1), qwen35_dense9b_prefill_prefix_layers);
+}
+
 fn clampQwenMoeRoutePackValidateTokens(requested: u32) u32 {
     return @min(@max(requested, 1), qwen_ssm_projection_prefill_max_tokens);
 }
@@ -867,6 +888,38 @@ fn defaultQwenSsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
         defaultQwen35Dense9bQueuedPrefillEnabled(cfg);
 }
 
+fn qwenSsmPrefillBranchMaterializationEnabled(cfg: ModelConfig) bool {
+    if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) {
+        return readBoolEnv("ZINC_QWEN35_9B_SSM_PREFILL_BRANCH") orelse true;
+    }
+    return true;
+}
+
+fn qwen35Dense9bPrefillDenseLayer0Enabled() bool {
+    return readBoolEnv("ZINC_QWEN35_9B_PREFILL_DENSE_LAYER0") orelse true;
+}
+
+fn qwen35Dense9bPrefillGateUpSwiGLUGemmEnabled() bool {
+    return readBoolEnv("ZINC_QWEN35_9B_PREFILL_GATE_UP_SWIGLU_GEMM") orelse true;
+}
+
+fn qwen35Dense9bPrefillDownAccGemmEnabled() bool {
+    return readBoolEnv("ZINC_QWEN35_9B_PREFILL_DOWN_ACC_GEMM") orelse false;
+}
+
+fn qwen35Dense9bPrefillDenseValidateEnabled() bool {
+    return readBoolEnv("ZINC_QWEN35_9B_PREFILL_DENSE_VALIDATE") orelse false;
+}
+
+fn qwen35Dense9bPrefillDenseValidateTokens(n_tokens: u32) u32 {
+    const requested = readU32Env("ZINC_QWEN35_9B_PREFILL_DENSE_VALIDATE_TOKENS") orelse 1;
+    return @min(@max(requested, 1), @max(n_tokens, 1));
+}
+
+fn qwenSsmPrefillProjectionAllowsSharedDecodeBuffers(cfg: ModelConfig) bool {
+    return defaultQwen35Dense9bQueuedPrefillEnabled(cfg);
+}
+
 fn defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg: ModelConfig) bool {
     return cfg.architecture == .qwen35 and
         cfg.hidden_dim == 5120 and
@@ -899,6 +952,27 @@ fn qwen35DenseSsmResourceBarriersEnabled(cfg: ModelConfig, in_prefill_phase: boo
 
 fn shouldUseDenseQwen35QueuedPrefillTokenCommand(cfg: ModelConfig, in_prefill_phase: bool, has_embed_override: bool) bool {
     return in_prefill_phase and has_embed_override and defaultQwen35Dense9bQueuedPrefillEnabled(cfg);
+}
+
+fn canFuseDenseFfnNextAttnNorm(
+    cfg: ModelConfig,
+    in_prefill_phase: bool,
+    layer_shared_cmd_present: bool,
+    use_dense_layer_cmd: bool,
+    next_layer_idx: usize,
+    layer_count: usize,
+    next_layer_scale: f32,
+) bool {
+    if (!layer_shared_cmd_present) return false;
+    if (next_layer_idx >= layer_count) return false;
+    if (next_layer_scale == 0.0) return false;
+    if (!isFullAttentionLayer(cfg, next_layer_idx)) return false;
+
+    // Dense-only decode already used this tail fusion. Qwen3.5 9B prompt
+    // prefill also records token-major layers into one shared command, so the
+    // same residual+next-norm handoff is valid at dense→full-attn boundaries.
+    return use_dense_layer_cmd or
+        (in_prefill_phase and defaultQwen35Dense9bQueuedPrefillEnabled(cfg));
 }
 
 fn hybridDecodeCommandGroupLayers(cfg: ModelConfig) usize {
@@ -1395,6 +1469,24 @@ const GpuMoeFinalizerKind = enum(u8) {
     gemma_staged,
 };
 
+const Qwen35Dense9bPrefillFallbackReason = enum(u8) {
+    none,
+    ssm_projection_guard_failed,
+    branch_not_batched,
+    layer0_dense_guard_failed,
+    prefix_ssm_guard_failed,
+    prefix_full_attn_guard_failed,
+    full_attn_boundary,
+    configured_prefix_limit,
+    complete,
+};
+
+const Qwen35Dense9bPrefillLayerKind = enum(u8) {
+    none,
+    ssm,
+    full_attn,
+};
+
 const decode_async_profile_slots = 16;
 
 /// Per-request profiling counters for dispatch, barrier, and timing breakdown.
@@ -1632,6 +1724,58 @@ pub const RuntimeProfile = struct {
     queued_prefill_async_submit_count: u32 = 0,
     queued_prefill_async_to_final_wait_ns: u64 = 0,
     queued_prefill_final_wait_ns: u64 = 0,
+    qwen35_dense_prefill_requests: u32 = 0,
+    qwen35_dense_prefill_prompt_tokens: u32 = 0,
+    qwen35_dense_prefill_target_layers: u32 = 0,
+    qwen35_dense_prefill_target_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_materialized_tokens: u32 = 0,
+    qwen35_dense_prefill_materialized_layers: u32 = 0,
+    qwen35_dense_prefill_materialized_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_materialized_ssm_layers: u32 = 0,
+    qwen35_dense_prefill_materialized_full_attn_layers: u32 = 0,
+    qwen35_dense_prefill_materialized_dense_ffn_layers: u32 = 0,
+    qwen35_dense_prefill_replay_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_replay_layers: u32 = 0,
+    qwen35_dense_prefill_replay_ssm_layers: u32 = 0,
+    qwen35_dense_prefill_replay_full_attn_layers: u32 = 0,
+    qwen35_dense_prefill_replay_ssm_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_replay_full_attn_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_replay_dense_ffn_layers: u32 = 0,
+    qwen35_dense_prefill_replay_graph_runs: u32 = 0,
+    qwen35_dense_prefill_replay_graph_ssm_runs: u32 = 0,
+    qwen35_dense_prefill_replay_graph_full_attn_runs: u32 = 0,
+    qwen35_dense_prefill_token_major_replay_steps: u32 = 0,
+    qwen35_dense_prefill_first_token_major_layer: u32 = 0,
+    qwen35_dense_prefill_first_fallback_reason: Qwen35Dense9bPrefillFallbackReason = .none,
+    qwen35_dense_prefill_next_replay_layer: u32 = 0,
+    qwen35_dense_prefill_next_replay_layer_kind: Qwen35Dense9bPrefillLayerKind = .none,
+    qwen35_dense_prefill_next_replay_prompt_tokens: u32 = 0,
+    qwen35_dense_prefill_next_replay_projection_bytes: u64 = 0,
+    qwen35_dense_prefill_next_replay_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_next_replay_run_layers: u32 = 0,
+    qwen35_dense_prefill_next_replay_run_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_next_replay_run_stop_layer: u32 = 0,
+    qwen35_dense_prefill_next_replay_run_stop_kind: Qwen35Dense9bPrefillLayerKind = .none,
+    qwen35_dense_prefill_next_replay_run_projection_bytes: u64 = 0,
+    qwen35_dense_prefill_next_replay_run_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_next_replay_following_projection_bytes: u64 = 0,
+    qwen35_dense_prefill_next_replay_following_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_remaining_replay_projection_bytes: u64 = 0,
+    qwen35_dense_prefill_remaining_replay_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_remaining_replay_ssm_projection_bytes: u64 = 0,
+    qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes: u64 = 0,
+    qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_replay_command_gpu_ns: u64 = 0,
+    qwen35_dense_prefill_replay_async_command_gpu_ns: u64 = 0,
+    qwen35_dense_prefill_replay_final_command_gpu_ns: u64 = 0,
+    qwen35_dense_prefill_replay_command_gpu_samples: u32 = 0,
+    qwen35_dense_prefill_replay_async_command_gpu_samples: u32 = 0,
+    qwen35_dense_prefill_replay_final_command_gpu_samples: u32 = 0,
+    qwen35_dense_prefill_materialized_dispatch_calls: u32 = 0,
+    qwen35_dense_prefill_materialized_barrier_calls: u32 = 0,
+    qwen35_dense_prefill_materialized_resource_barrier_resources: u32 = 0,
+    qwen35_dense_prefill_materialized_record_ns: u64 = 0,
     shared_expert_bytes: u64 = 0,
     shared_expert_gate_up_bytes: u64 = 0,
     shared_expert_down_bytes: u64 = 0,
@@ -2762,6 +2906,163 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             pctOf(profile.gpu_completion_wait_ns, profile.queued_prefill_final_wait_ns),
         });
     }
+    if (profile.qwen35_dense_prefill_requests > 0) {
+        const target_layer_tokens = profile.qwen35_dense_prefill_target_layer_tokens;
+        const materialized_layer_tokens = profile.qwen35_dense_prefill_materialized_layer_tokens;
+        const replay_layer_tokens = target_layer_tokens -| materialized_layer_tokens;
+        log.info("  {s} qwen35-9b layer-major prefill: requests {d} prompt_tokens {d} materialized_tokens {d} layers {d}/{d} layer_tokens {d}/{d} ({d:.1}%) replay_layer_tokens {d} first_token_major_layer {d} reason {s} ssm_layers {d} full_attn_layers {d} dense_ffn_layers {d}", .{
+            label,
+            profile.qwen35_dense_prefill_requests,
+            profile.qwen35_dense_prefill_prompt_tokens,
+            profile.qwen35_dense_prefill_materialized_tokens,
+            profile.qwen35_dense_prefill_materialized_layers,
+            profile.qwen35_dense_prefill_target_layers,
+            materialized_layer_tokens,
+            target_layer_tokens,
+            pctOf(@as(u64, target_layer_tokens), @as(u64, materialized_layer_tokens)),
+            replay_layer_tokens,
+            profile.qwen35_dense_prefill_first_token_major_layer,
+            qwen35Dense9bPrefillFallbackReasonName(profile.qwen35_dense_prefill_first_fallback_reason),
+            profile.qwen35_dense_prefill_materialized_ssm_layers,
+            profile.qwen35_dense_prefill_materialized_full_attn_layers,
+            profile.qwen35_dense_prefill_materialized_dense_ffn_layers,
+        });
+        log.info("  {s} qwen35-9b token-major replay: steps {d} queued_chunks {d} final_chunk {d} replay_layers {d} ssm/full_attn/dense {d}/{d}/{d} replay_layer_tokens {d} ({d:.1}% of target) ideal_layer_major_layers {d}", .{
+            label,
+            profile.qwen35_dense_prefill_token_major_replay_steps,
+            profile.queued_prefill_chunks,
+            profile.queued_prefill_final_chunk_tokens,
+            profile.qwen35_dense_prefill_replay_layers,
+            profile.qwen35_dense_prefill_replay_ssm_layers,
+            profile.qwen35_dense_prefill_replay_full_attn_layers,
+            profile.qwen35_dense_prefill_replay_dense_ffn_layers,
+            profile.qwen35_dense_prefill_replay_layer_tokens,
+            pctOf(@as(u64, target_layer_tokens), @as(u64, profile.qwen35_dense_prefill_replay_layer_tokens)),
+            profile.qwen35_dense_prefill_replay_layers,
+        });
+        if (profile.qwen35_dense_prefill_replay_graph_runs > 0 and profile.qwen35_dense_prefill_replay_layers > 0) {
+            log.info("  {s} qwen35-9b llama graph compare: token_major_layer_visits {d} graph_layer_visits {d} multiplier {d:.1}x graph_runs {d} ssm/full_attn_runs {d}/{d} avg_layers_per_run {d:.1}", .{
+                label,
+                profile.qwen35_dense_prefill_replay_layer_tokens,
+                profile.qwen35_dense_prefill_replay_layers,
+                @as(f64, @floatFromInt(profile.qwen35_dense_prefill_replay_layer_tokens)) / @as(f64, @floatFromInt(profile.qwen35_dense_prefill_replay_layers)),
+                profile.qwen35_dense_prefill_replay_graph_runs,
+                profile.qwen35_dense_prefill_replay_graph_ssm_runs,
+                profile.qwen35_dense_prefill_replay_graph_full_attn_runs,
+                @as(f64, @floatFromInt(profile.qwen35_dense_prefill_replay_layers)) / @as(f64, @floatFromInt(profile.qwen35_dense_prefill_replay_graph_runs)),
+            });
+            log.info("  {s} qwen35-9b llama graph run split: ssm runs {d} avg_layers {d:.1} layer_tokens/run {d:.1} bytes/run projection {d:.2} GiB dense_ffn {d:.2} GiB | full_attn runs {d} avg_layers {d:.1} layer_tokens/run {d:.1} bytes/run projection {d:.2} GiB dense_ffn {d:.2} GiB", .{
+                label,
+                profile.qwen35_dense_prefill_replay_graph_ssm_runs,
+                avgCount(profile.qwen35_dense_prefill_replay_ssm_layers, profile.qwen35_dense_prefill_replay_graph_ssm_runs),
+                avgCount(profile.qwen35_dense_prefill_replay_ssm_layer_tokens, profile.qwen35_dense_prefill_replay_graph_ssm_runs),
+                avgGiB(profile.qwen35_dense_prefill_remaining_replay_ssm_projection_bytes, profile.qwen35_dense_prefill_replay_graph_ssm_runs),
+                avgGiB(profile.qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes, profile.qwen35_dense_prefill_replay_graph_ssm_runs),
+                profile.qwen35_dense_prefill_replay_graph_full_attn_runs,
+                avgCount(profile.qwen35_dense_prefill_replay_full_attn_layers, profile.qwen35_dense_prefill_replay_graph_full_attn_runs),
+                avgCount(profile.qwen35_dense_prefill_replay_full_attn_layer_tokens, profile.qwen35_dense_prefill_replay_graph_full_attn_runs),
+                avgGiB(profile.qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes, profile.qwen35_dense_prefill_replay_graph_full_attn_runs),
+                avgGiB(profile.qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes, profile.qwen35_dense_prefill_replay_graph_full_attn_runs),
+            });
+            if (profile.qwen35_dense_prefill_replay_command_gpu_ns > 0) {
+                const ssm_bytes = profile.qwen35_dense_prefill_remaining_replay_ssm_projection_bytes +|
+                    profile.qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes;
+                const full_attn_bytes = profile.qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes +|
+                    profile.qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes;
+                const total_replay_bytes = ssm_bytes +| full_attn_bytes;
+                const total_replay_bytes_f = @as(f64, @floatFromInt(@max(total_replay_bytes, 1)));
+                const replay_gpu_ms = nsToMs(profile.qwen35_dense_prefill_replay_command_gpu_ns);
+                const ssm_weighted_ms = replay_gpu_ms * @as(f64, @floatFromInt(ssm_bytes)) / total_replay_bytes_f;
+                const full_attn_weighted_ms = replay_gpu_ms * @as(f64, @floatFromInt(full_attn_bytes)) / total_replay_bytes_f;
+                log.info("  {s} qwen35-9b measured replay GPU: cmds {d} total {d:.2} ms async {d:.2} ms/{d} final {d:.2} ms/{d} eff {d:.1} GiB/s byte_weighted_gpu_ms ssm/full_attn {d:.2}/{d:.2}", .{
+                    label,
+                    profile.qwen35_dense_prefill_replay_command_gpu_samples,
+                    replay_gpu_ms,
+                    nsToMs(profile.qwen35_dense_prefill_replay_async_command_gpu_ns),
+                    profile.qwen35_dense_prefill_replay_async_command_gpu_samples,
+                    nsToMs(profile.qwen35_dense_prefill_replay_final_command_gpu_ns),
+                    profile.qwen35_dense_prefill_replay_final_command_gpu_samples,
+                    bytesPerSecondGiB(total_replay_bytes, profile.qwen35_dense_prefill_replay_command_gpu_ns),
+                    ssm_weighted_ms,
+                    full_attn_weighted_ms,
+                });
+            }
+        }
+        const replay_dispatch_calls = profile.queued_prefill_async_dispatch_calls +| profile.queued_prefill_final_dispatch_calls;
+        const replay_barrier_calls = profile.queued_prefill_async_barrier_calls +| profile.queued_prefill_final_barrier_calls;
+        const replay_record_ns = profile.queued_prefill_async_record_ns +| profile.queued_prefill_final_record_ns;
+        if (profile.qwen35_dense_prefill_next_replay_layer_kind != .none) {
+            log.info("  {s} qwen35-9b layer-major next replay blocker: layer {d} kind {s} reason {s} prompt_tokens {d} next_bytes projection {d:.2} GiB dense_ffn {d:.2} GiB remaining_bytes projection {d:.2} GiB dense_ffn {d:.2} GiB", .{
+                label,
+                profile.qwen35_dense_prefill_next_replay_layer,
+                qwen35Dense9bPrefillLayerKindName(profile.qwen35_dense_prefill_next_replay_layer_kind),
+                qwen35Dense9bPrefillFallbackReasonName(profile.qwen35_dense_prefill_first_fallback_reason),
+                profile.qwen35_dense_prefill_next_replay_prompt_tokens,
+                bytesToGiB(profile.qwen35_dense_prefill_next_replay_projection_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_next_replay_dense_ffn_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_projection_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_dense_ffn_bytes),
+            });
+        }
+        if (profile.qwen35_dense_prefill_next_replay_run_layers > 0) {
+            const run_layer_tokens = profile.qwen35_dense_prefill_next_replay_run_layer_tokens;
+            const replay_layer_tokens_f = @as(f64, @floatFromInt(@max(profile.qwen35_dense_prefill_replay_layer_tokens, 1)));
+            const run_layer_tokens_f = @as(f64, @floatFromInt(run_layer_tokens));
+            const run_dispatch_est = @as(f64, @floatFromInt(replay_dispatch_calls)) * run_layer_tokens_f / replay_layer_tokens_f;
+            const run_barrier_est = @as(f64, @floatFromInt(replay_barrier_calls)) * run_layer_tokens_f / replay_layer_tokens_f;
+            log.info("  {s} qwen35-9b next replay run cost: start {d} kind {s} layers {d} layer_tokens {d} stop_layer {d} stop_kind {s} token_major_est dispatch {d:.1} barriers {d:.1} run_bytes projection {d:.2} GiB dense_ffn {d:.2} GiB following_layer projection {d:.2} GiB dense_ffn {d:.2} GiB", .{
+                label,
+                profile.qwen35_dense_prefill_next_replay_layer,
+                qwen35Dense9bPrefillLayerKindName(profile.qwen35_dense_prefill_next_replay_layer_kind),
+                profile.qwen35_dense_prefill_next_replay_run_layers,
+                run_layer_tokens,
+                profile.qwen35_dense_prefill_next_replay_run_stop_layer,
+                qwen35Dense9bPrefillLayerKindName(profile.qwen35_dense_prefill_next_replay_run_stop_kind),
+                run_dispatch_est,
+                run_barrier_est,
+                bytesToGiB(profile.qwen35_dense_prefill_next_replay_run_projection_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_next_replay_run_dense_ffn_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_next_replay_following_projection_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_next_replay_following_dense_ffn_bytes),
+            });
+        }
+        if (profile.qwen35_dense_prefill_replay_ssm_layer_tokens > 0 or profile.qwen35_dense_prefill_replay_full_attn_layer_tokens > 0) {
+            const replay_layer_tokens_f = @as(f64, @floatFromInt(@max(profile.qwen35_dense_prefill_replay_layer_tokens, 1)));
+            const ssm_layer_tokens_f = @as(f64, @floatFromInt(profile.qwen35_dense_prefill_replay_ssm_layer_tokens));
+            const full_attn_layer_tokens_f = @as(f64, @floatFromInt(profile.qwen35_dense_prefill_replay_full_attn_layer_tokens));
+            const replay_dispatch_f = @as(f64, @floatFromInt(replay_dispatch_calls));
+            const replay_barrier_f = @as(f64, @floatFromInt(replay_barrier_calls));
+            log.info("  {s} qwen35-9b remaining replay split: ssm_layer_tokens {d} full_attn_layer_tokens {d} token_major_est dispatch ssm/full_attn {d:.1}/{d:.1} barriers {d:.1}/{d:.1} ssm_bytes projection {d:.2} GiB dense_ffn {d:.2} GiB full_attn_bytes projection {d:.2} GiB dense_ffn {d:.2} GiB", .{
+                label,
+                profile.qwen35_dense_prefill_replay_ssm_layer_tokens,
+                profile.qwen35_dense_prefill_replay_full_attn_layer_tokens,
+                replay_dispatch_f * ssm_layer_tokens_f / replay_layer_tokens_f,
+                replay_dispatch_f * full_attn_layer_tokens_f / replay_layer_tokens_f,
+                replay_barrier_f * ssm_layer_tokens_f / replay_layer_tokens_f,
+                replay_barrier_f * full_attn_layer_tokens_f / replay_layer_tokens_f,
+                bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_ssm_projection_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes),
+            });
+        }
+        if (profile.qwen35_dense_prefill_materialized_dispatch_calls > 0 or replay_dispatch_calls > 0) {
+            log.info("  {s} qwen35-9b prefill work split: layer-major dispatch {d} barriers {d} resource_entries {d} record {d:.2} ms | token-major replay dispatch {d} barriers {d} record {d:.2} ms replay/layer_dispatch {d:.1}x", .{
+                label,
+                profile.qwen35_dense_prefill_materialized_dispatch_calls,
+                profile.qwen35_dense_prefill_materialized_barrier_calls,
+                profile.qwen35_dense_prefill_materialized_resource_barrier_resources,
+                nsToMs(profile.qwen35_dense_prefill_materialized_record_ns),
+                replay_dispatch_calls,
+                replay_barrier_calls,
+                nsToMs(replay_record_ns),
+                if (profile.qwen35_dense_prefill_materialized_dispatch_calls > 0)
+                    @as(f64, @floatFromInt(replay_dispatch_calls)) / @as(f64, @floatFromInt(profile.qwen35_dense_prefill_materialized_dispatch_calls))
+                else
+                    0.0,
+            });
+        }
+    }
 }
 
 fn denseGemmaQ4KGeGLUValidationStatusName(status: DenseGemmaQ4KGeGLUValidationStatus) []const u8 {
@@ -3557,6 +3858,12 @@ const DeinterleavePush = extern struct {
     n_heads: u32,
 };
 
+const DeinterleaveBatchedPush = extern struct {
+    head_dim: u32,
+    n_heads: u32,
+    n_tokens: u32,
+};
+
 /// Push constants for fused MoE accumulate dispatch (matches moe_accumulate.metal: buffer(10)).
 /// Replaces 8+1 sequential scale_accumulate dispatches, eliminating 8 barriers per layer.
 const MoeAccPush = extern struct {
@@ -3587,6 +3894,24 @@ const GemmPush = extern struct {
     ne0: i32,
     ne1: i32,
     src0_off: u32,
+    flags: u32 = 0,
+};
+
+/// Push constants for `gemm_q4k_gate_up_swiglu.metal`.
+const GemmGateUpPush = extern struct {
+    ne00: i32,
+    ne02: i32,
+    nb01: u64,
+    nb02: u64,
+    ne12: i32,
+    _pad0: u32 = 0,
+    nb10: u64,
+    nb11: u64,
+    nb12: u64,
+    ne0: i32,
+    ne1: i32,
+    src0_off: u32,
+    src1_off: u32,
 };
 
 /// Push constants for `gemm_f32_small.metal`.
@@ -4804,6 +5129,317 @@ fn recordQueuedPrefillFinalWait(profile: ?*RuntimeProfile, async_to_final_wait_n
     p.queued_prefill_final_wait_ns += final_wait_ns;
 }
 
+fn qwen35Dense9bPrefillFallbackReasonName(reason: Qwen35Dense9bPrefillFallbackReason) []const u8 {
+    return switch (reason) {
+        .none => "none",
+        .ssm_projection_guard_failed => "ssm-projection-guard-failed",
+        .branch_not_batched => "branch-not-batched",
+        .layer0_dense_guard_failed => "layer0-dense-guard-failed",
+        .prefix_ssm_guard_failed => "prefix-ssm-guard-failed",
+        .prefix_full_attn_guard_failed => "prefix-full-attn-guard-failed",
+        .full_attn_boundary => "full-attn-boundary",
+        .configured_prefix_limit => "configured-prefix-limit",
+        .complete => "complete",
+    };
+}
+
+fn qwen35Dense9bPrefillLayerKindName(kind: Qwen35Dense9bPrefillLayerKind) []const u8 {
+    return switch (kind) {
+        .none => "none",
+        .ssm => "ssm",
+        .full_attn => "full-attn",
+    };
+}
+
+fn recordQwen35Dense9bLayerMajorPrefillProfile(
+    profile: ?*RuntimeProfile,
+    cfg: ModelConfig,
+    prompt_len: usize,
+    materialized_tokens: u32,
+    materialized_layers: u32,
+    fallback_reason: Qwen35Dense9bPrefillFallbackReason,
+) void {
+    const p = profile orelse return;
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return;
+
+    const prompt_tokens = saturatingU32FromUsize(prompt_len);
+    const target_layers = cfg.n_layers;
+    const clamped_layers = @min(materialized_layers, target_layers);
+    const clamped_tokens = @min(materialized_tokens, prompt_tokens);
+    var materialized_ssm_layers: u32 = 0;
+    var materialized_full_attn_layers: u32 = 0;
+    for (0..@as(usize, @intCast(clamped_layers))) |layer_idx| {
+        if (isFullAttentionLayer(cfg, layer_idx)) {
+            materialized_full_attn_layers += 1;
+        } else if (cfg.ssm_d_inner != 0) {
+            materialized_ssm_layers += 1;
+        }
+    }
+    var replay_ssm_layers: u32 = 0;
+    var replay_full_attn_layers: u32 = 0;
+    for (@as(usize, @intCast(clamped_layers))..@as(usize, @intCast(target_layers))) |layer_idx| {
+        if (isFullAttentionLayer(cfg, layer_idx)) {
+            replay_full_attn_layers += 1;
+        } else if (cfg.ssm_d_inner != 0) {
+            replay_ssm_layers += 1;
+        }
+    }
+    const target_layer_tokens = prompt_tokens *| target_layers;
+    const materialized_layer_tokens = clamped_tokens *| clamped_layers;
+    const replay_layer_tokens = target_layer_tokens -| materialized_layer_tokens;
+    const replay_layers = target_layers -| clamped_layers;
+    const replay_schedule = qwen35Dense9bReplayGraphSchedule(cfg, clamped_layers);
+
+    p.qwen35_dense_prefill_requests +|= 1;
+    p.qwen35_dense_prefill_prompt_tokens +|= prompt_tokens;
+    p.qwen35_dense_prefill_target_layers = target_layers;
+    p.qwen35_dense_prefill_target_layer_tokens +|= target_layer_tokens;
+    p.qwen35_dense_prefill_materialized_tokens +|= clamped_tokens;
+    p.qwen35_dense_prefill_materialized_layers +|= clamped_layers;
+    p.qwen35_dense_prefill_materialized_layer_tokens +|= materialized_layer_tokens;
+    p.qwen35_dense_prefill_materialized_ssm_layers +|= materialized_ssm_layers;
+    p.qwen35_dense_prefill_materialized_full_attn_layers +|= materialized_full_attn_layers;
+    p.qwen35_dense_prefill_materialized_dense_ffn_layers +|= clamped_layers;
+    p.qwen35_dense_prefill_replay_layer_tokens +|= replay_layer_tokens;
+    p.qwen35_dense_prefill_replay_layers +|= replay_layers;
+    p.qwen35_dense_prefill_replay_ssm_layers +|= replay_ssm_layers;
+    p.qwen35_dense_prefill_replay_full_attn_layers +|= replay_full_attn_layers;
+    p.qwen35_dense_prefill_replay_ssm_layer_tokens +|= prompt_tokens *| replay_ssm_layers;
+    p.qwen35_dense_prefill_replay_full_attn_layer_tokens +|= prompt_tokens *| replay_full_attn_layers;
+    p.qwen35_dense_prefill_replay_dense_ffn_layers +|= replay_layers;
+    p.qwen35_dense_prefill_replay_graph_runs +|= replay_schedule.runs;
+    p.qwen35_dense_prefill_replay_graph_ssm_runs +|= replay_schedule.ssm_runs;
+    p.qwen35_dense_prefill_replay_graph_full_attn_runs +|= replay_schedule.full_attn_runs;
+    p.qwen35_dense_prefill_token_major_replay_steps +|= if (replay_layer_tokens > 0) prompt_tokens else 0;
+    p.qwen35_dense_prefill_first_token_major_layer = if (clamped_layers < target_layers) clamped_layers else target_layers;
+    p.qwen35_dense_prefill_first_fallback_reason = if (clamped_layers >= target_layers) .complete else fallback_reason;
+}
+
+const Qwen35Dense9bLayerMajorReplayBytes = struct {
+    kind: Qwen35Dense9bPrefillLayerKind = .none,
+    projection: u64 = 0,
+    dense_ffn: u64 = 0,
+};
+
+const Qwen35Dense9bNextReplayRun = struct {
+    kind: Qwen35Dense9bPrefillLayerKind = .none,
+    start_layer: u32 = 0,
+    layers: u32 = 0,
+    stop_layer: u32 = 0,
+    stop_kind: Qwen35Dense9bPrefillLayerKind = .none,
+};
+
+const Qwen35Dense9bReplayGraphSchedule = struct {
+    runs: u32 = 0,
+    ssm_runs: u32 = 0,
+    full_attn_runs: u32 = 0,
+};
+
+fn qwen35Dense9bPrefillLayerKindFor(cfg: ModelConfig, layer_idx: usize) Qwen35Dense9bPrefillLayerKind {
+    const n_layers: usize = @intCast(cfg.n_layers);
+    if (layer_idx >= n_layers) return .none;
+    if (isFullAttentionLayer(cfg, layer_idx)) return .full_attn;
+    if (cfg.ssm_d_inner != 0) return .ssm;
+    return .none;
+}
+
+fn qwen35Dense9bNextReplayRun(cfg: ModelConfig, first_replay_layer: u32) Qwen35Dense9bNextReplayRun {
+    if (first_replay_layer >= cfg.n_layers) return .{};
+
+    const start_layer: usize = @intCast(first_replay_layer);
+    const first_kind = qwen35Dense9bPrefillLayerKindFor(cfg, start_layer);
+    if (first_kind == .none) return .{};
+
+    var stop_layer = start_layer;
+    const n_layers: usize = @intCast(cfg.n_layers);
+    while (stop_layer < n_layers and qwen35Dense9bPrefillLayerKindFor(cfg, stop_layer) == first_kind) {
+        stop_layer += 1;
+    }
+
+    return .{
+        .kind = first_kind,
+        .start_layer = first_replay_layer,
+        .layers = saturatingU32FromUsize(stop_layer - start_layer),
+        .stop_layer = saturatingU32FromUsize(stop_layer),
+        .stop_kind = if (stop_layer < n_layers) qwen35Dense9bPrefillLayerKindFor(cfg, stop_layer) else .none,
+    };
+}
+
+fn qwen35Dense9bReplayGraphSchedule(cfg: ModelConfig, first_replay_layer: u32) Qwen35Dense9bReplayGraphSchedule {
+    var schedule = Qwen35Dense9bReplayGraphSchedule{};
+    if (first_replay_layer >= cfg.n_layers) return schedule;
+
+    var layer = first_replay_layer;
+    while (layer < cfg.n_layers) {
+        const run = qwen35Dense9bNextReplayRun(cfg, layer);
+        if (run.layers == 0 or run.kind == .none) break;
+        schedule.runs += 1;
+        switch (run.kind) {
+            .ssm => schedule.ssm_runs += 1,
+            .full_attn => schedule.full_attn_runs += 1,
+            .none => {},
+        }
+        layer = run.stop_layer;
+    }
+    return schedule;
+}
+
+fn qwen35Dense9bLayerMajorReplayBytes(engine: *const InferenceEngine, layer_idx: usize) Qwen35Dense9bLayerMajorReplayBytes {
+    const cfg = engine.config;
+    if (layer_idx >= engine.layer_tensors.len) return .{};
+
+    const lt = engine.layer_tensors[layer_idx];
+    const hidden_dim = cfg.hidden_dim;
+    const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
+    const q_dim: u32 = cfg.n_heads * cfg.head_dim;
+    const d_inner = cfg.ssm_d_inner;
+    var bytes = Qwen35Dense9bLayerMajorReplayBytes{
+        .kind = if (isFullAttentionLayer(cfg, layer_idx)) .full_attn else if (d_inner != 0) .ssm else .none,
+    };
+
+    if (bytes.kind == .full_attn) {
+        bytes.projection +|= tensorDmmvBytesForCols(lt.attn_q, hidden_dim);
+        bytes.projection +|= tensorDmmvBytesForCols(lt.attn_k, hidden_dim);
+        bytes.projection +|= tensorDmmvBytesForCols(lt.attn_v, hidden_dim);
+        bytes.projection +|= tensorDmmvBytesForCols(lt.attn_output, q_dim);
+    } else if (bytes.kind == .ssm) {
+        bytes.projection +|= tensorDmmvBytesForCols(lt.attn_qkv, hidden_dim);
+        bytes.projection +|= tensorDmmvBytesForCols(lt.attn_gate, hidden_dim);
+        bytes.projection +|= tensorDmmvBytesForCols(lt.ssm_alpha, hidden_dim);
+        bytes.projection +|= tensorDmmvBytesForCols(lt.ssm_beta, hidden_dim);
+        bytes.projection +|= tensorDmmvBytesForCols(lt.ssm_out, d_inner);
+    }
+
+    bytes.dense_ffn +|= tensorDmmvBytesForCols(lt.ffn_gate, hidden_dim);
+    bytes.dense_ffn +|= tensorDmmvBytesForCols(lt.ffn_up, hidden_dim);
+    bytes.dense_ffn +|= tensorDmmvBytesForCols(lt.ffn_down, inter_dim);
+    return bytes;
+}
+
+fn recordQwen35Dense9bLayerMajorNextReplayProfile(
+    profile: ?*RuntimeProfile,
+    engine: *const InferenceEngine,
+    prompt_len: usize,
+    first_replay_layer: u32,
+) void {
+    const p = profile orelse return;
+    const cfg = engine.config;
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return;
+    if (first_replay_layer >= cfg.n_layers) return;
+
+    const prompt_tokens = saturatingU32FromUsize(prompt_len);
+    const prompt_multiplier = @as(u64, prompt_tokens);
+    const first_layer: usize = @intCast(first_replay_layer);
+    const next_bytes = qwen35Dense9bLayerMajorReplayBytes(engine, first_layer);
+    const next_run = qwen35Dense9bNextReplayRun(cfg, first_replay_layer);
+    const next_run_end = first_layer + @as(usize, @intCast(next_run.layers));
+    var run_projection: u64 = 0;
+    var run_dense_ffn: u64 = 0;
+    if (next_run.layers > 0) {
+        for (first_layer..next_run_end) |layer_idx| {
+            const layer_bytes = qwen35Dense9bLayerMajorReplayBytes(engine, layer_idx);
+            run_projection +|= layer_bytes.projection *| prompt_multiplier;
+            run_dense_ffn +|= layer_bytes.dense_ffn *| prompt_multiplier;
+        }
+    }
+    const n_layers: usize = @intCast(cfg.n_layers);
+    const following_bytes = if (next_run.stop_kind != .none and next_run_end < n_layers)
+        qwen35Dense9bLayerMajorReplayBytes(engine, next_run_end)
+    else
+        Qwen35Dense9bLayerMajorReplayBytes{};
+    var remaining_projection: u64 = 0;
+    var remaining_dense_ffn: u64 = 0;
+    var remaining_ssm_projection: u64 = 0;
+    var remaining_ssm_dense_ffn: u64 = 0;
+    var remaining_full_attn_projection: u64 = 0;
+    var remaining_full_attn_dense_ffn: u64 = 0;
+    for (first_layer..@as(usize, @intCast(cfg.n_layers))) |layer_idx| {
+        const layer_bytes = qwen35Dense9bLayerMajorReplayBytes(engine, layer_idx);
+        const projection_bytes = layer_bytes.projection *| prompt_multiplier;
+        const dense_ffn_bytes = layer_bytes.dense_ffn *| prompt_multiplier;
+        remaining_projection +|= projection_bytes;
+        remaining_dense_ffn +|= dense_ffn_bytes;
+        switch (layer_bytes.kind) {
+            .ssm => {
+                remaining_ssm_projection +|= projection_bytes;
+                remaining_ssm_dense_ffn +|= dense_ffn_bytes;
+            },
+            .full_attn => {
+                remaining_full_attn_projection +|= projection_bytes;
+                remaining_full_attn_dense_ffn +|= dense_ffn_bytes;
+            },
+            .none => {},
+        }
+    }
+
+    p.qwen35_dense_prefill_next_replay_layer = first_replay_layer;
+    p.qwen35_dense_prefill_next_replay_layer_kind = next_bytes.kind;
+    p.qwen35_dense_prefill_next_replay_prompt_tokens = prompt_tokens;
+    p.qwen35_dense_prefill_next_replay_projection_bytes = next_bytes.projection *| prompt_multiplier;
+    p.qwen35_dense_prefill_next_replay_dense_ffn_bytes = next_bytes.dense_ffn *| prompt_multiplier;
+    p.qwen35_dense_prefill_next_replay_run_layers = next_run.layers;
+    p.qwen35_dense_prefill_next_replay_run_layer_tokens = prompt_tokens *| next_run.layers;
+    p.qwen35_dense_prefill_next_replay_run_stop_layer = next_run.stop_layer;
+    p.qwen35_dense_prefill_next_replay_run_stop_kind = next_run.stop_kind;
+    p.qwen35_dense_prefill_next_replay_run_projection_bytes = run_projection;
+    p.qwen35_dense_prefill_next_replay_run_dense_ffn_bytes = run_dense_ffn;
+    p.qwen35_dense_prefill_next_replay_following_projection_bytes = following_bytes.projection *| prompt_multiplier;
+    p.qwen35_dense_prefill_next_replay_following_dense_ffn_bytes = following_bytes.dense_ffn *| prompt_multiplier;
+    p.qwen35_dense_prefill_remaining_replay_projection_bytes = remaining_projection;
+    p.qwen35_dense_prefill_remaining_replay_dense_ffn_bytes = remaining_dense_ffn;
+    p.qwen35_dense_prefill_remaining_replay_ssm_projection_bytes = remaining_ssm_projection;
+    p.qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes = remaining_ssm_dense_ffn;
+    p.qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes = remaining_full_attn_projection;
+    p.qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes = remaining_full_attn_dense_ffn;
+}
+
+fn recordQwen35Dense9bLayerMajorPrefillWork(
+    profile: ?*RuntimeProfile,
+    cfg: ModelConfig,
+    cmd: *const MetalCommand,
+    record_ns: u64,
+) void {
+    const p = profile orelse return;
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return;
+
+    p.qwen35_dense_prefill_materialized_dispatch_calls +|= cmd.dispatch_count;
+    p.qwen35_dense_prefill_materialized_barrier_calls +|= cmd.barrier_count;
+    p.qwen35_dense_prefill_materialized_resource_barrier_resources +|= cmd.resource_barrier_resources;
+    p.qwen35_dense_prefill_materialized_record_ns +|= record_ns;
+}
+
+fn recordQwen35Dense9bQueuedReplayGpuDuration(
+    profile: ?*RuntimeProfile,
+    cfg: ModelConfig,
+    gpu_ns: u64,
+    is_final: bool,
+) void {
+    const p = profile orelse return;
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return;
+    if (gpu_ns == 0) return;
+
+    p.qwen35_dense_prefill_replay_command_gpu_ns +|= gpu_ns;
+    p.qwen35_dense_prefill_replay_command_gpu_samples +|= 1;
+    if (is_final) {
+        p.qwen35_dense_prefill_replay_final_command_gpu_ns +|= gpu_ns;
+        p.qwen35_dense_prefill_replay_final_command_gpu_samples +|= 1;
+    } else {
+        p.qwen35_dense_prefill_replay_async_command_gpu_ns +|= gpu_ns;
+        p.qwen35_dense_prefill_replay_async_command_gpu_samples +|= 1;
+    }
+}
+
+fn recordQwen35Dense9bQueuedReplayPendingGpuDurations(
+    profile: ?*RuntimeProfile,
+    cfg: ModelConfig,
+    pending: []const MetalCommand,
+) void {
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return;
+    for (pending) |*cmd| {
+        recordQwen35Dense9bQueuedReplayGpuDuration(profile, cfg, cmd.gpuDurationNs(), false);
+    }
+}
+
 fn logRoutePackCandidateBlocks(n_tokens: u32, n_experts: u32, n_experts_used: u32) void {
     const route_slots = n_tokens * n_experts_used;
     const active_block_upper_bound = maxPackedMoeRouteBlocks(route_slots, n_experts);
@@ -5928,6 +6564,7 @@ pub const InferenceEngine = struct {
 
     // Elementwise compute pipelines (for batched GPU dispatch)
     deinterleave_pipe: MetalPipeline,
+    deinterleave_batched_pipe: MetalPipeline,
     flash_attn_pipe: MetalPipeline,
     flash_attn_q8_pipe: MetalPipeline,
     kv_cache_write_pipe: MetalPipeline,
@@ -6008,6 +6645,7 @@ pub const InferenceEngine = struct {
 
     // Batched GEMM pipelines for prefill (process N tokens per dispatch).
     gemm_q4k_pipe: MetalPipeline,
+    gemm_q4k_gate_up_swiglu_pipe: MetalPipeline,
     gemm_q5k_pipe: MetalPipeline,
     gemm_q6k_pipe: MetalPipeline,
     gemm_q8_0_pipe: MetalPipeline,
@@ -6193,6 +6831,7 @@ pub const InferenceEngine = struct {
     qwen_ssm_prefill_shared_gate_buf: MetalBuffer,
     qwen_ssm_prefill_branch_buf: MetalBuffer,
     qwen35_dense_prefill_layer0_active_tokens: u32,
+    qwen35_dense_prefill_active_layers: u32,
     qwen35_dense_prefill_swiglu_buf: MetalBuffer,
     qwen35_dense_prefill_up_buf: MetalBuffer,
     qwen35_dense_prefill_down_buf: MetalBuffer,
@@ -6472,6 +7111,7 @@ pub const InferenceEngine = struct {
         self.qwen_ssm_prefill_shared_gate_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen_ssm_prefill_branch_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen35_dense_prefill_layer0_active_tokens = 0;
+        self.qwen35_dense_prefill_active_layers = 0;
         self.qwen35_dense_prefill_swiglu_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen35_dense_prefill_up_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.qwen35_dense_prefill_down_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
@@ -6752,6 +7392,7 @@ pub const InferenceEngine = struct {
 
         // Elementwise pipelines for batched GPU dispatch
         self.deinterleave_pipe = try loadShaderPipeline(ctx, "deinterleave");
+        self.deinterleave_batched_pipe = try loadShaderPipeline(ctx, "deinterleave_batched");
         self.flash_attn_pipe = try loadShaderPipeline(ctx, "flash_attn");
         self.flash_attn_q8_pipe = try loadShaderPipeline(ctx, "flash_attn_q8");
         self.kv_cache_write_pipe = try loadShaderPipeline(ctx, "kv_cache_write");
@@ -6854,6 +7495,7 @@ pub const InferenceEngine = struct {
         self.argmax_chunks_pipe = try loadShaderPipeline(ctx, "argmax_chunks");
         self.argmax_pairs_pipe = try loadShaderPipeline(ctx, "argmax_pairs");
         self.gemm_q4k_pipe = try loadShaderPipeline(ctx, "gemm_q4k");
+        self.gemm_q4k_gate_up_swiglu_pipe = try loadShaderPipeline(ctx, "gemm_q4k_gate_up_swiglu");
         self.gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
         self.gemm_q6k_pipe = try loadShaderPipeline(ctx, "gemm_q6k");
         self.gemm_q8_0_pipe = try loadShaderPipeline(ctx, "gemm_q8_0");
@@ -7725,6 +8367,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_dual_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_swiglu_k2048_pipe);
         metal_pipeline.freePipeline(&self.deinterleave_pipe);
+        metal_pipeline.freePipeline(&self.deinterleave_batched_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_q8_pipe);
         metal_pipeline.freePipeline(&self.kv_cache_write_pipe);
@@ -7803,6 +8446,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.argmax_chunks_pipe);
         metal_pipeline.freePipeline(&self.argmax_pairs_pipe);
         metal_pipeline.freePipeline(&self.gemm_q4k_pipe);
+        metal_pipeline.freePipeline(&self.gemm_q4k_gate_up_swiglu_pipe);
         metal_pipeline.freePipeline(&self.gemm_q5k_pipe);
         metal_pipeline.freePipeline(&self.gemm_q6k_pipe);
         metal_pipeline.freePipeline(&self.gemm_q8_0_pipe);
@@ -8022,6 +8666,7 @@ pub const InferenceEngine = struct {
         self.qwen_ssm_prefill_shared_gate_active_tokens = 0;
         self.qwen_ssm_prefill_router_active_tokens = 0;
         self.qwen35_dense_prefill_layer0_active_tokens = 0;
+        self.qwen35_dense_prefill_active_layers = 0;
         self.qwen_moe_route_validate_target_tokens = 0;
         self.qwen_moe_route_validate_failure_hint_emitted = false;
         self.dense_gemma_q4k_geglu_validation_emitted = false;
@@ -8355,6 +9000,7 @@ pub const InferenceEngine = struct {
         if (try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &pending[pending_count])) {
             pending_count += 1;
         }
+        const replay_pending_start = pending_count;
 
         const async_chunk_request = readU32Env("ZINC_METAL_GEMMA_PREFILL_CHUNK_TOKENS");
         const async_chunk_tokens = queuedTokenMajorAsyncChunkTokensFromRequest(self.config, prompt_tokens.len, async_chunk_request);
@@ -8370,7 +9016,10 @@ pub const InferenceEngine = struct {
                     &self.qwen_ssm_prefill_branch_buf
                 else
                     &self.prefill_embed_buf;
-                const start_layer: usize = if (qwen35_dense_layer0_done) 1 else 0;
+                const start_layer: usize = if (qwen35_dense_layer0_done)
+                    @max(@as(usize, 1), @as(usize, @intCast(self.qwen35_dense_prefill_active_layers)))
+                else
+                    0;
                 try runDecodeStep(self, false, embed_src, embed_offset, &pending[pending_count], null, start_layer);
                 recordQueuedPrefillChunkWork(profile, &pending[pending_count], profileElapsedNs(record_start), false);
                 recordQueuedPrefillChunk(profile, 1, false);
@@ -8394,7 +9043,10 @@ pub const InferenceEngine = struct {
                         &self.qwen_ssm_prefill_branch_buf
                     else
                         &self.prefill_embed_buf;
-                    const start_layer: usize = if (qwen35_dense_layer0_done) 1 else 0;
+                    const start_layer: usize = if (qwen35_dense_layer0_done)
+                        @max(@as(usize, 1), @as(usize, @intCast(self.qwen35_dense_prefill_active_layers)))
+                    else
+                        0;
                     try runDecodeStep(self, i + 1 == prompt_tokens.len, embed_src, embed_offset, null, &chunk_cmd, start_layer);
                 }
                 recordQueuedPrefillChunkWork(profile, &chunk_cmd, profileElapsedNs(record_start), is_final_chunk);
@@ -8404,8 +9056,13 @@ pub const InferenceEngine = struct {
                         @intCast(final_wait_start - first_async_submit_ns)
                     else
                         0;
-                    commitAndWaitProfiled(&chunk_cmd, profile);
-                    recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, profileElapsedNs(final_wait_start));
+                    const wait_timing = if (profile != null and defaultQwen35Dense9bQueuedPrefillEnabled(self.config))
+                        commitAndWaitProfiledMeasuredGpuDuration(&chunk_cmd, profile)
+                    else
+                        CommandWaitTiming{ .wait_ns = commitAndWaitProfiledMeasured(&chunk_cmd, profile), .gpu_ns = 0 };
+                    recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, wait_timing.wait_ns);
+                    recordQwen35Dense9bQueuedReplayGpuDuration(profile, self.config, wait_timing.gpu_ns, true);
+                    recordQwen35Dense9bQueuedReplayPendingGpuDurations(profile, self.config, pending[replay_pending_start..pending_count]);
                     pending_completed_by_final_wait = true;
                     state.position = self.position;
                     return;
@@ -8425,7 +9082,10 @@ pub const InferenceEngine = struct {
             &self.qwen_ssm_prefill_branch_buf
         else
             &self.prefill_embed_buf;
-        const final_start_layer: usize = if (final_dense_layer0_done) 1 else 0;
+        const final_start_layer: usize = if (final_dense_layer0_done)
+            @max(@as(usize, 1), @as(usize, @intCast(self.qwen35_dense_prefill_active_layers)))
+        else
+            0;
         recordQueuedPrefillChunk(profile, 1, true);
         const final_wait_start = profileStart(profile != null);
         const async_to_final_wait_ns: u64 = if (first_async_submit_ns >= 0 and final_wait_start > first_async_submit_ns)
@@ -8550,7 +9210,12 @@ pub const InferenceEngine = struct {
     fn defaultQwen35Dense9bQueuedTokenMajorAsyncChunkTokens(cfg: ModelConfig, prompt_len: usize) usize {
         if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return 1;
         if (prompt_len < qwen_ssm_projection_prefill_min_tokens) return 1;
-        if (prompt_len <= 40) return (prompt_len + 1) / 2;
+        // The public M4 raw-completion prompt band is short enough that the
+        // async-leading chunk mostly buys an extra command-buffer boundary.
+        // Keep the layer-0 batched SSM/FFN precompute, but record the remaining
+        // token-major graph as one final command so the harness can measure the
+        // submit/wait cost separately from kernel throughput.
+        if (prompt_len <= 40) return prompt_len;
         return 16;
     }
 
@@ -15076,7 +15741,7 @@ fn dispatchQwenPostNormResidualRouterF32SharedGateOnCmd(
 /// stored in Q4_K blocks (144 bytes / 256 elements). Use for prefill when
 /// N ≥ ~16 — below that DMMV is faster.
 /// gemm_q4k.metal: buffer(0)=push, buffer(1)=weights, buffer(2)=input, buffer(3)=output.
-fn dispatchGemmQ4KOnCmd(
+fn dispatchGemmQ4KOnCmdWithFlags(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
     weight: *const metal_loader.LoadedTensor,
@@ -15085,6 +15750,7 @@ fn dispatchGemmQ4KOnCmd(
     M: u32,
     K: u32,
     N: u32,
+    flags: u32,
 ) void {
     std.debug.assert(K % 256 == 0);
     const push = GemmPush{
@@ -15099,10 +15765,91 @@ fn dispatchGemmQ4KOnCmd(
         .ne0 = @intCast(M),
         .ne1 = @intCast(N),
         .src0_off = tensorPageOffset(engine.model, weight),
+        .flags = flags,
     };
     const bufs = [_]*const MetalBuffer{ &weight.gpu_buffer, input, output };
     const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
     cmd.dispatchV2WithTgMem(&engine.gemm_q4k_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
+}
+
+fn dispatchGemmQ4KOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    dispatchGemmQ4KOnCmdWithFlags(engine, cmd, weight, input, output, M, K, N, 0);
+}
+
+fn dispatchGemmQ4KAccOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    dispatchGemmQ4KOnCmdWithFlags(engine, cmd, weight, input, output, M, K, N, 1);
+}
+
+fn canUseQwen35Dense9bPrefillGateUpSwiGLUGemm(
+    engine: *const InferenceEngine,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+    N: u32,
+) bool {
+    return engine.in_prefill_phase and
+        defaultQwen35Dense9bQueuedPrefillEnabled(engine.config) and
+        !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        N > 1 and
+        K % 256 == 0 and
+        gate.info.type_ == .q4_k and
+        up.info.type_ == .q4_k and
+        isQwen35Dense9bGateUpQ4kTarget(engine.config, gate.info.name, M, K) and
+        isQwen35Dense9bGateUpQ4kTarget(engine.config, up.info.name, M, K) and
+        engine.gemm_q4k_gate_up_swiglu_pipe.handle != null and
+        engine.gemm_q4k_gate_up_swiglu_pipe.max_threads_per_threadgroup >= 128;
+}
+
+fn dispatchQwen35Dense9bPrefillGateUpSwiGLUGemmOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    std.debug.assert(K % 256 == 0);
+    const push = GemmGateUpPush{
+        .ne00 = @intCast(K),
+        .ne02 = 1,
+        .nb01 = @as(u64, K / 256) * 144,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = @as(u64, K) * 4,
+        .nb12 = 0,
+        .ne0 = @intCast(M),
+        .ne1 = @intCast(N),
+        .src0_off = tensorPageOffset(engine.model, gate),
+        .src1_off = tensorPageOffset(engine.model, up),
+    };
+    const bufs = [_]*const MetalBuffer{ &gate.gpu_buffer, &up.gpu_buffer, input, output };
+    const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
+    cmd.dispatchV2WithTgMem(&engine.gemm_q4k_gate_up_swiglu_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmGateUpPush), 0, 16384);
 }
 
 /// Dispatch a Q5_K × f32 batched matmul. Same llama.cpp simdgroup-MM tile
@@ -15382,6 +16129,26 @@ fn dispatchDeinterleaveOnCmd(
     const bufs = [_]*const MetalBuffer{ q_output, input, gate_output };
     const total = head_dim * n_heads;
     cmd.dispatchV2(&engine.deinterleave_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(DeinterleavePush), 0);
+}
+
+fn dispatchDeinterleaveBatchedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    input: *const MetalBuffer,
+    q_output: *const MetalBuffer,
+    gate_output: *const MetalBuffer,
+    head_dim: u32,
+    n_heads: u32,
+    n_tokens: u32,
+) void {
+    const push = DeinterleaveBatchedPush{
+        .head_dim = head_dim,
+        .n_heads = n_heads,
+        .n_tokens = n_tokens,
+    };
+    const bufs = [_]*const MetalBuffer{ input, q_output, gate_output };
+    const total = head_dim * n_heads * n_tokens;
+    cmd.dispatchV2(&engine.deinterleave_batched_pipe, .{ (total + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(DeinterleaveBatchedPush), 0);
 }
 
 fn refreshAttentionSinksForLayer(engine: *InferenceEngine, layer_idx: usize, n_heads: u32) void {
@@ -17206,31 +17973,92 @@ fn canUseQwenSsmProjectionTail(
     return canBatchQwenSsmProjectionTail(engine, tensor, rows, cols) or engine.dmmvPipelineForType(tensor, rows, cols) != null;
 }
 
-fn canUseQwen35Dense9bSsmPrefillProjectionLayer(engine: *const InferenceEngine, lt: LayerTensors) bool {
+const Qwen35Dense9bSsmPrefillProjectionLayerBlocker = enum {
+    ok,
+    model_shape,
+    qkv_missing,
+    gate_missing,
+    alpha_missing,
+    beta_missing,
+    qkv_type,
+    gate_type,
+    alpha_type,
+    beta_type,
+    qkv_shape,
+    gate_shape,
+    alpha_shape,
+    beta_shape,
+    qkv_batched_gemm,
+    gate_batched_gemm,
+    alpha_tail_batched,
+    beta_tail_batched,
+};
+
+fn qwen35Dense9bSsmPrefillProjectionLayerBlockerName(reason: Qwen35Dense9bSsmPrefillProjectionLayerBlocker) []const u8 {
+    return switch (reason) {
+        .ok => "ok",
+        .model_shape => "model-shape",
+        .qkv_missing => "qkv-missing",
+        .gate_missing => "gate-missing",
+        .alpha_missing => "alpha-missing",
+        .beta_missing => "beta-missing",
+        .qkv_type => "qkv-type",
+        .gate_type => "gate-type",
+        .alpha_type => "alpha-type",
+        .beta_type => "beta-type",
+        .qkv_shape => "qkv-shape",
+        .gate_shape => "gate-shape",
+        .alpha_shape => "alpha-shape",
+        .beta_shape => "beta-shape",
+        .qkv_batched_gemm => "qkv-batched-gemm",
+        .gate_batched_gemm => "gate-batched-gemm",
+        .alpha_tail_batched => "alpha-tail-batched",
+        .beta_tail_batched => "beta-tail-batched",
+    };
+}
+
+fn optionalTensorElements(tensor: ?*const metal_loader.LoadedTensor) u64 {
+    return if (tensor) |t| t.info.numElements() else 0;
+}
+
+fn qwen35Dense9bSsmPrefillProjectionLayerBlocker(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+) Qwen35Dense9bSsmPrefillProjectionLayerBlocker {
     const cfg = engine.config;
-    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return false;
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return .model_shape;
 
     const hidden_dim = cfg.hidden_dim;
     const d_inner = cfg.ssm_d_inner;
     const dt_rank = cfg.ssm_dt_rank;
     const conv_channels = d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
-    const wqkv_t = lt.attn_qkv orelse return false;
-    const z_t = lt.attn_gate orelse return false;
-    const alpha_t = lt.ssm_alpha orelse return false;
-    const beta_t = lt.ssm_beta orelse return false;
+    const wqkv_t = lt.attn_qkv orelse return .qkv_missing;
+    const z_t = lt.attn_gate orelse return .gate_missing;
+    const alpha_t = lt.ssm_alpha orelse return .alpha_missing;
+    const beta_t = lt.ssm_beta orelse return .beta_missing;
 
-    return wqkv_t.info.type_ == .q4_k and
-        z_t.info.type_ == .q4_k and
-        alpha_t.info.type_ == .q8_0 and
-        beta_t.info.type_ == .q8_0 and
-        isQwen35Dense9bSsmQkvQ4kTarget(cfg, wqkv_t.info.name, conv_channels, hidden_dim) and
-        isQwen35Dense9bSsmGateQ4kTarget(cfg, z_t.info.name, d_inner, hidden_dim) and
-        isQwen35Dense9bSsmTailQ8Target(cfg, alpha_t.info.name, dt_rank, hidden_dim) and
-        isQwen35Dense9bSsmTailQ8Target(cfg, beta_t.info.name, dt_rank, hidden_dim) and
-        canUseQwenSharedBatchedGemm(engine, wqkv_t.info.type_) and
-        canUseQwenSharedBatchedGemm(engine, z_t.info.type_) and
-        canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim) and
-        canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
+    if (wqkv_t.info.type_ != .q4_k and wqkv_t.info.type_ != .q5_k) return .qkv_type;
+    if (z_t.info.type_ != .q4_k) return .gate_type;
+    if (alpha_t.info.type_ != .q8_0) return .alpha_type;
+    if (beta_t.info.type_ != .q8_0) return .beta_type;
+    const qkv_shape_ok = switch (wqkv_t.info.type_) {
+        .q4_k => isQwen35Dense9bSsmQkvQ4kTarget(cfg, wqkv_t.info.name, conv_channels, hidden_dim),
+        .q5_k => isQwen35Dense9bSsmQkvQ5kTarget(cfg, wqkv_t.info.name, conv_channels, hidden_dim),
+        else => false,
+    };
+    if (!qkv_shape_ok) return .qkv_shape;
+    if (!isQwen35Dense9bSsmGateQ4kTarget(cfg, z_t.info.name, d_inner, hidden_dim)) return .gate_shape;
+    if (!isQwen35Dense9bSsmTailQ8Target(cfg, alpha_t.info.name, dt_rank, hidden_dim)) return .alpha_shape;
+    if (!isQwen35Dense9bSsmTailQ8Target(cfg, beta_t.info.name, dt_rank, hidden_dim)) return .beta_shape;
+    if (!canUseQwenSharedBatchedGemm(engine, wqkv_t.info.type_)) return .qkv_batched_gemm;
+    if (!canUseQwenSharedBatchedGemm(engine, z_t.info.type_)) return .gate_batched_gemm;
+    if (!canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim)) return .alpha_tail_batched;
+    if (!canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim)) return .beta_tail_batched;
+    return .ok;
+}
+
+fn canUseQwen35Dense9bSsmPrefillProjectionLayer(engine: *const InferenceEngine, lt: LayerTensors) bool {
+    return qwen35Dense9bSsmPrefillProjectionLayerBlocker(engine, lt) == .ok;
 }
 
 fn qwenFirstPrefixAttentionDims(engine: *const InferenceEngine) ?BatchedPrefillAttentionDims {
@@ -20373,7 +21201,7 @@ fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_le
     if (prompt_len < qwen_ssm_projection_prefill_min_tokens) return false;
     if (prompt_len > queued_prefill_embed_tokens) return false;
     if (engine.position != 0) return false;
-    if (!engine.private_decode_buffers) return false;
+    if (!engine.private_decode_buffers and !qwenSsmPrefillProjectionAllowsSharedDecodeBuffers(engine.config)) return false;
     if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
 
     const cfg = engine.config;
@@ -20396,9 +21224,123 @@ fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_le
         canUseQwenSsmProjectionTail(engine, beta_t, cfg.ssm_dt_rank, cfg.hidden_dim);
 }
 
+fn logQwenSsmPrefillProjectionChunkBlocker(engine: *const InferenceEngine, prompt_len: usize) void {
+    if (!engine.profile_enabled) return;
+
+    if (!engine.qwen_ssm_prefill_proj_enabled) {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: feature flag off", .{});
+        return;
+    }
+    if (prompt_len < qwen_ssm_projection_prefill_min_tokens or prompt_len > queued_prefill_embed_tokens) {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: prompt_len={d} outside [{d},{d}]", .{
+            prompt_len,
+            qwen_ssm_projection_prefill_min_tokens,
+            queued_prefill_embed_tokens,
+        });
+        return;
+    }
+    if (engine.position != 0) {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: position={d}", .{engine.position});
+        return;
+    }
+    if (!engine.private_decode_buffers and !qwenSsmPrefillProjectionAllowsSharedDecodeBuffers(engine.config)) {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: shared decode buffers unsupported for arch={s} hidden={d} layers={d}", .{
+            @tagName(engine.config.architecture),
+            engine.config.hidden_dim,
+            engine.config.n_layers,
+        });
+        return;
+    }
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: validation mode active debug={} gemma={} qwen={}", .{
+            engine.debug_validation_enabled,
+            engine.gemma_moe_validation_enabled,
+            engine.qwen_prefill_validation_enabled,
+        });
+        return;
+    }
+
+    const cfg = engine.config;
+    if (cfg.ssm_d_inner == 0) {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: model has no SSM inner dim", .{});
+        return;
+    }
+    if (isFullAttentionLayer(cfg, 0)) {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: layer0 is full-attention", .{});
+        return;
+    }
+    if (engine.layer_tensors.len == 0) {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: no layer tensors", .{});
+        return;
+    }
+
+    const lt = engine.layer_tensors[0];
+    if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) {
+        const reason = qwen35Dense9bSsmPrefillProjectionLayerBlocker(engine, lt);
+        if (reason != .ok) {
+            log.info("Metal profile: Qwen35 9B SSM prefill projection disabled: layer0 dense guard {s} types qkv={s} gate={s} alpha={s} beta={s} elems qkv={d} gate={d} alpha={d} beta={d} batched qkv={} gate={} alpha={} beta={}", .{
+                qwen35Dense9bSsmPrefillProjectionLayerBlockerName(reason),
+                optionalTensorTypeName(lt.attn_qkv),
+                optionalTensorTypeName(lt.attn_gate),
+                optionalTensorTypeName(lt.ssm_alpha),
+                optionalTensorTypeName(lt.ssm_beta),
+                optionalTensorElements(lt.attn_qkv),
+                optionalTensorElements(lt.attn_gate),
+                optionalTensorElements(lt.ssm_alpha),
+                optionalTensorElements(lt.ssm_beta),
+                if (lt.attn_qkv) |t| canUseQwenSharedBatchedGemm(engine, t.info.type_) else false,
+                if (lt.attn_gate) |t| canUseQwenSharedBatchedGemm(engine, t.info.type_) else false,
+                if (lt.ssm_alpha) |t| canBatchQwenSsmProjectionTail(engine, t, cfg.ssm_dt_rank, cfg.hidden_dim) else false,
+                if (lt.ssm_beta) |t| canBatchQwenSsmProjectionTail(engine, t, cfg.ssm_dt_rank, cfg.hidden_dim) else false,
+            });
+            return;
+        }
+        log.info("Metal profile: Qwen35 9B SSM prefill projection disabled: dense layer guard passed but chunk guard still failed", .{});
+        return;
+    }
+
+    if (cfg.architecture != .qwen2_moe or cfg.n_experts == 0) {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: unsupported model shape arch={s} experts={d} hidden={d} layers={d}", .{
+            @tagName(cfg.architecture),
+            cfg.n_experts,
+            cfg.hidden_dim,
+            cfg.n_layers,
+        });
+        return;
+    }
+    if (engine.gemm_q8_0_pipe.handle == null) {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: q8 batched GEMM pipeline missing", .{});
+        return;
+    }
+
+    const wqkv_t = lt.attn_qkv orelse {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: layer0 qkv missing", .{});
+        return;
+    };
+    const z_t = lt.attn_gate orelse {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: layer0 gate missing", .{});
+        return;
+    };
+    const alpha_t = lt.ssm_alpha orelse {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: layer0 alpha missing", .{});
+        return;
+    };
+    const beta_t = lt.ssm_beta orelse {
+        log.info("Metal profile: Qwen SSM prefill projection disabled: layer0 beta missing", .{});
+        return;
+    };
+    log.info("Metal profile: Qwen SSM prefill projection disabled: layer0 projection unsupported qkv={s} gate={s} alpha={s} beta={s}", .{
+        @tagName(wqkv_t.info.type_),
+        @tagName(z_t.info.type_),
+        @tagName(alpha_t.info.type_),
+        @tagName(beta_t.info.type_),
+    });
+}
+
 fn canUseQwen35Dense9bLayer0DensePrefill(
     engine: *const InferenceEngine,
     lt: LayerTensors,
+    layer_idx: usize,
     hidden_dim: u32,
     inter_dim: u32,
     n_tokens: u32,
@@ -20408,8 +21350,8 @@ fn canUseQwen35Dense9bLayer0DensePrefill(
     if (cfg.n_experts != 0 or usesGeglu(cfg)) return false;
     if (n_tokens == 0 or n_tokens > qwen_ssm_projection_prefill_max_tokens) return false;
     if (engine.debug_validation_enabled or engine.qwen_prefill_validation_enabled or engine.gemma_moe_validation_enabled) return false;
-    if (engine.post_ffn_norm_present.len == 0 or engine.post_ffn_norm_present[0]) return false;
-    if (engine.layer_output_scales.len == 0 or engine.layer_output_scales[0] != 1.0) return false;
+    if (layer_idx >= engine.post_ffn_norm_present.len or engine.post_ffn_norm_present[layer_idx]) return false;
+    if (layer_idx >= engine.layer_output_scales.len or engine.layer_output_scales[layer_idx] != 1.0) return false;
     if (engine.swiglu_batched_pipe.handle == null or
         engine.scale_acc_pipe.handle == null or
         engine.swiglu_batched_pipe.max_threads_per_threadgroup < 64)
@@ -20444,50 +21386,89 @@ fn recordQwen35Dense9bLayer0DensePrefillOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
     lt: LayerTensors,
+    layer_idx: usize,
+    hidden_acc_buf: *const MetalBuffer,
     hidden_dim: u32,
     inter_dim: u32,
     n_tokens: u32,
     profile: ?*RuntimeProfile,
 ) !bool {
-    if (!canUseQwen35Dense9bLayer0DensePrefill(engine, lt, hidden_dim, inter_dim, n_tokens)) return false;
+    if (!canUseQwen35Dense9bLayer0DensePrefill(engine, lt, layer_idx, hidden_dim, inter_dim, n_tokens)) return false;
 
     const gate_t = lt.ffn_gate orelse return error.MissingTensor;
     const up_t = lt.ffn_up orelse return error.MissingTensor;
     const down_t = lt.ffn_down orelse return error.MissingTensor;
+    const validate_dense = qwen35Dense9bPrefillDenseValidateEnabled();
+    const dense_down_buf: *const MetalBuffer = if (hidden_acc_buf == &engine.qwen35_dense_prefill_down_buf)
+        &engine.qwen_ssm_prefill_branch_buf
+    else
+        &engine.qwen35_dense_prefill_down_buf;
 
     // Adapt llama.cpp `ggml_metal_op_mul_mat`: once layer-0 SSM has already
-    // materialized N prompt FFN-norm rows, run dense FFN as three batched
-    // matmuls instead of replaying N decode-shaped matvec triples.
+    // materialized N prompt FFN-norm rows, run dense FFN as batched matmuls
+    // instead of replaying N decode-shaped matvec triples.
+    if (validate_dense) {
+        const hidden_bytes = @as(usize, n_tokens) * @as(usize, hidden_dim) * @sizeOf(f32);
+        try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_hidden_before_ref_buf, hidden_bytes);
+        try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_post_hidden_ref_buf, hidden_bytes);
+        profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{hidden_acc_buf});
+        dispatchCopyF32OffsetOnCmd(engine, cmd, hidden_acc_buf, &engine.qwen_moe_route_validate_hidden_before_ref_buf, n_tokens * hidden_dim, 0, 0);
+        profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{
+            hidden_acc_buf,
+            &engine.qwen_moe_route_validate_hidden_before_ref_buf,
+        });
+    }
     profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
-    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, gate_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen35_dense_prefill_swiglu_buf, inter_dim, hidden_dim, n_tokens);
-    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, up_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen35_dense_prefill_up_buf, inter_dim, hidden_dim, n_tokens);
-
-    profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{
-        &engine.qwen35_dense_prefill_swiglu_buf,
-        &engine.qwen35_dense_prefill_up_buf,
-    });
-    {
-        const push = SwiGLUPush{ .n = inter_dim };
-        const bufs = [_]*const MetalBuffer{
+    if (canUseQwen35Dense9bPrefillGateUpSwiGLUGemm(engine, gate_t, up_t, inter_dim, hidden_dim, n_tokens)) {
+        // Same producer/consumer fusion llama.cpp applies at the graph level,
+        // but specialized for this dense prompt prefix: gate and up consume the
+        // same normalized rows, and the only consumer is SwiGLU.
+        dispatchQwen35Dense9bPrefillGateUpSwiGLUGemmOnCmd(
+            engine,
+            cmd,
+            gate_t,
+            up_t,
+            &engine.qwen_ssm_prefill_proj_norm_buf,
             &engine.qwen35_dense_prefill_swiglu_buf,
+            inter_dim,
+            hidden_dim,
+            n_tokens,
+        );
+    } else {
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, gate_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen35_dense_prefill_swiglu_buf, inter_dim, hidden_dim, n_tokens);
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, up_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen35_dense_prefill_up_buf, inter_dim, hidden_dim, n_tokens);
+
+        profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{
             &engine.qwen35_dense_prefill_swiglu_buf,
             &engine.qwen35_dense_prefill_up_buf,
-        };
-        cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+        });
+        {
+            const push = SwiGLUPush{ .n = inter_dim };
+            const bufs = [_]*const MetalBuffer{
+                &engine.qwen35_dense_prefill_swiglu_buf,
+                &engine.qwen35_dense_prefill_swiglu_buf,
+                &engine.qwen35_dense_prefill_up_buf,
+            };
+            cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+        }
     }
 
-    profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.qwen35_dense_prefill_swiglu_buf});
-    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, down_t, &engine.qwen35_dense_prefill_swiglu_buf, &engine.qwen35_dense_prefill_down_buf, hidden_dim, inter_dim, n_tokens);
-
     profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{
-        &engine.qwen_ssm_prefill_branch_buf,
-        &engine.qwen35_dense_prefill_down_buf,
+        hidden_acc_buf,
+        &engine.qwen35_dense_prefill_swiglu_buf,
     });
-    {
+    if (qwen35Dense9bPrefillDownAccGemmEnabled() and down_t.info.type_ == .q4_k) {
+        dispatchGemmQ4KAccOnCmd(engine, cmd, down_t, &engine.qwen35_dense_prefill_swiglu_buf, hidden_acc_buf, hidden_dim, inter_dim, n_tokens);
+    } else {
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, down_t, &engine.qwen35_dense_prefill_swiglu_buf, dense_down_buf, hidden_dim, inter_dim, n_tokens);
+        profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{
+            hidden_acc_buf,
+            dense_down_buf,
+        });
         const total = n_tokens * hidden_dim;
-        const push = ScaleAccPush{ .n = total, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
-        const bufs = [_]*const MetalBuffer{ &engine.qwen_ssm_prefill_branch_buf, &engine.qwen35_dense_prefill_down_buf };
-        cmd.dispatchV2(&engine.scale_acc_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
+        const acc_push = ScaleAccPush{ .n = total, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+        const acc_bufs = [_]*const MetalBuffer{ hidden_acc_buf, dense_down_buf };
+        cmd.dispatchV2(&engine.scale_acc_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
     }
 
     if (profile) |p| {
@@ -20495,6 +21476,508 @@ fn recordQwen35Dense9bLayer0DensePrefillOnCmd(
         p.dense_ffn_tail_residual_acc_calls += n_tokens;
     }
     return true;
+}
+
+fn validateQwen35Dense9bLayer0DensePrefill(
+    engine: *InferenceEngine,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    lt: LayerTensors,
+    hidden_dim: u32,
+    inter_dim: u32,
+    n_tokens: u32,
+) !void {
+    if (!qwen35Dense9bPrefillDenseValidateEnabled()) return;
+    if (engine.qwen_moe_route_validate_hidden_before_ref_buf.handle == null or
+        engine.qwen_moe_route_validate_post_hidden_ref_buf.handle == null or
+        engine.qwen_moe_route_validate_hidden_before_ref_buf.cpu_ptr == null or
+        engine.qwen_moe_route_validate_post_hidden_ref_buf.cpu_ptr == null)
+    {
+        return;
+    }
+
+    const gate_t = lt.ffn_gate orelse return error.MissingTensor;
+    const up_t = lt.ffn_up orelse return error.MissingTensor;
+    const down_t = lt.ffn_down orelse return error.MissingTensor;
+    const validate_tokens = qwen35Dense9bPrefillDenseValidateTokens(n_tokens);
+    const hidden_bytes = @as(usize, n_tokens) * @as(usize, hidden_dim) * @sizeOf(f32);
+    const validate_hidden_bytes = @as(usize, validate_tokens) * @as(usize, hidden_dim) * @sizeOf(f32);
+    const validate_inter_bytes = @as(usize, validate_tokens) * @as(usize, inter_dim) * @sizeOf(f32);
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_post_hidden_ref_buf, hidden_bytes);
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_gate_ref_buf, validate_inter_bytes);
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_down_ref_buf, validate_hidden_bytes);
+
+    var cmd = try beginProfiledCommand(engine, profile);
+    var token: u32 = 0;
+    while (token < validate_tokens) : (token += 1) {
+        const hidden_off = token * hidden_dim;
+        const inter_off = token * inter_dim;
+        dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.qwen_moe_route_validate_hidden_before_ref_buf, &engine.hidden_buf, hidden_dim, hidden_off, 0);
+        dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.norm_buf, hidden_dim, hidden_off, 0);
+        profileDenseFfnBarrierBuffers(&cmd, profile, .norm, &.{ &engine.hidden_buf, &engine.norm_buf });
+
+        const fused_gate_up_swiglu =
+            canUseDenseQ4KGateUpSwiGLU(engine, gate_t, up_t, inter_dim, hidden_dim);
+        if (fused_gate_up_swiglu) {
+            dispatchDenseQ4KGateUpSwiGLUOnCmd(engine, &cmd, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
+        } else {
+            dispatchDmmvOnCmd(engine, &cmd, gate_t, &engine.norm_buf, &engine.gate_buf, inter_dim, hidden_dim, 0);
+            dispatchDmmvOnCmd(engine, &cmd, up_t, &engine.norm_buf, &engine.up_buf, inter_dim, hidden_dim, 0);
+            profileDenseFfnBarrierBuffers(&cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
+            dispatchFfnActivationOnCmd(engine, &cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, inter_dim);
+        }
+
+        profileDenseFfnBarrierBuffers(&cmd, profile, .activation, &.{&engine.swiglu_buf});
+        dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.swiglu_buf, &engine.qwen_moe_route_validate_gate_ref_buf, inter_dim, 0, inter_off);
+        dispatchDmmvOnCmd(engine, &cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
+        profileDenseFfnBarrierBuffers(&cmd, profile, .down, &.{ &engine.hidden_buf, &engine.down_buf });
+        dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.down_buf, &engine.qwen_moe_route_validate_down_ref_buf, hidden_dim, 0, hidden_off);
+        const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+        const acc_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.down_buf };
+        cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
+        profileDenseFfnBarrierBuffers(&cmd, profile, .tail, &.{&engine.hidden_buf});
+        dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.hidden_buf, &engine.qwen_moe_route_validate_post_hidden_ref_buf, hidden_dim, 0, hidden_off);
+    }
+    commitAndWaitProfiled(&cmd, profile);
+
+    const total: usize = @as(usize, validate_tokens) * @as(usize, hidden_dim);
+    const inter_total: usize = @as(usize, validate_tokens) * @as(usize, inter_dim);
+    const expected_swiglu: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_gate_ref_buf.cpu_ptr.?));
+    const actual_swiglu: [*]const f32 = @ptrCast(@alignCast(engine.qwen35_dense_prefill_swiglu_buf.cpu_ptr.?));
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "dense_layer0_swiglu", expected_swiglu[0..inter_total], actual_swiglu[0..inter_total], inter_dim, validate_tokens, 5e-2);
+    if (!qwen35Dense9bPrefillDownAccGemmEnabled()) {
+        const expected_down: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_down_ref_buf.cpu_ptr.?));
+        const actual_down: [*]const f32 = @ptrCast(@alignCast(engine.qwen35_dense_prefill_down_buf.cpu_ptr.?));
+        logQwenSsmProjectionChunkValidationDiff(layer_idx, "dense_layer0_down", expected_down[0..total], actual_down[0..total], hidden_dim, validate_tokens, 5e-2);
+    }
+    const expected: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_post_hidden_ref_buf.cpu_ptr.?));
+    const actual: [*]const f32 = @ptrCast(@alignCast(engine.qwen_ssm_prefill_branch_buf.cpu_ptr.?));
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "dense_layer0_hidden", expected[0..total], actual[0..total], hidden_dim, validate_tokens, 5e-2);
+}
+
+fn canUseQwen35Dense9bPrefixFullAttnDensePrefillLayer(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+    layer_idx: usize,
+    hidden_dim: u32,
+    n_tokens: u32,
+) bool {
+    const cfg = engine.config;
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return false;
+    if (cfg.n_experts != 0 or cfg.ssm_d_inner == 0) return false;
+    if (n_tokens == 0 or n_tokens > qwen_ssm_projection_prefill_max_tokens) return false;
+    if (!isFullAttentionLayer(cfg, layer_idx)) return false;
+    if (engine.debug_validation_enabled or engine.qwen_prefill_validation_enabled or engine.gemma_moe_validation_enabled) return false;
+    if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null or lt.attn_output_bias != null) return false;
+    if (engine.deinterleave_batched_pipe.handle == null or
+        engine.rope_batched_pipe.handle == null or
+        engine.sigmoid_mul_pipe.handle == null or
+        engine.residual_rms_norm_out_pipe.handle == null)
+    {
+        return false;
+    }
+    if (engine.kv_cache_q8) {
+        if (engine.kv_cache_write_q8_pipe.handle == null or engine.flash_attn_batched_q8_pipe.handle == null) return false;
+    } else {
+        if (engine.kv_cache_write_pipe.handle == null or engine.flash_attn_batched_pipe.handle == null) return false;
+    }
+
+    const attn = resolveLayerAttentionParams(cfg, lt, hidden_dim, engine.kv_cache_q8) catch return false;
+    if (attn.use_k_as_v or attn.q_dim != hidden_dim) return false;
+
+    const q_t = lt.attn_q orelse return false;
+    const k_t = lt.attn_k orelse return false;
+    const v_t = lt.attn_v orelse return false;
+    const o_t = lt.attn_output orelse return false;
+    const q_rows: u32 = @intCast(q_t.info.numElements() / hidden_dim);
+    const gate_mode = classifyFullAttnGate(q_rows, attn.q_dim, lt.attn_gate != null);
+    if (!gate_mode.packed_q_gate or gate_mode.separate_attn_gate) return false;
+    if (!isQwen35Dense9bFullAttnPackedQGateQ4kTarget(cfg, q_t.info.name, attn.q_dim * 2, hidden_dim)) return false;
+    if (!isQwen35Dense9bFullAttnKvQ6kTarget(cfg, k_t.info.name, attn.kv_dim, hidden_dim) or
+        !isQwen35Dense9bFullAttnKvQ6kTarget(cfg, v_t.info.name, attn.kv_dim, hidden_dim))
+    {
+        return false;
+    }
+    if (!canUseQwenSharedBatchedGemm(engine, q_t.info.type_) or
+        !canUseQwenSharedBatchedGemm(engine, k_t.info.type_) or
+        !canUseQwenSharedBatchedGemm(engine, v_t.info.type_) or
+        !canUseQwenSharedBatchedGemm(engine, o_t.info.type_))
+    {
+        return false;
+    }
+    if (!canUseResidualRmsNormOut(engine, hidden_dim, n_tokens)) return false;
+
+    const n: usize = @intCast(n_tokens);
+    const f32_sz: usize = @sizeOf(f32);
+    const q_dim_usize: usize = @intCast(attn.q_dim);
+    const kv_dim_usize: usize = @intCast(attn.kv_dim);
+    const hidden_usize: usize = @intCast(hidden_dim);
+    const q_full_usize = q_dim_usize * 2;
+    return engine.qwen35_dense_prefill_swiglu_buf.size >= n * q_full_usize * f32_sz and
+        engine.qwen_ssm_prefill_proj_qkv_buf.size >= n * @max(q_dim_usize, kv_dim_usize) * f32_sz and
+        engine.qwen_ssm_prefill_proj_z_buf.size >= n * @max(q_dim_usize, kv_dim_usize) * f32_sz and
+        engine.qwen_ssm_prefill_proj_norm_buf.size >= n * hidden_usize * f32_sz and
+        engine.qwen35_dense_prefill_down_buf.size >= n * hidden_usize * f32_sz;
+}
+
+fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    layer_idx: usize,
+    input_buf: *const MetalBuffer,
+    hidden_acc_buf: *const MetalBuffer,
+    hidden_dim: u32,
+    inter_dim: u32,
+    n_tokens: u32,
+    profile: ?*RuntimeProfile,
+) !bool {
+    const cfg = engine.config;
+    if (layer_idx >= engine.layer_tensors.len or layer_idx >= engine.attn_norm_bufs.len or layer_idx >= engine.ffn_norm_bufs.len) return false;
+    const lt = engine.layer_tensors[layer_idx];
+    if (!canUseQwen35Dense9bPrefixFullAttnDensePrefillLayer(engine, lt, layer_idx, hidden_dim, n_tokens)) return false;
+    if (!canUseQwen35Dense9bLayer0DensePrefill(engine, lt, layer_idx, hidden_dim, inter_dim, n_tokens)) return false;
+
+    const attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, engine.kv_cache_q8);
+    const q_t = lt.attn_q orelse return error.MissingTensor;
+    const k_t = lt.attn_k orelse return error.MissingTensor;
+    const v_t = lt.attn_v orelse return error.MissingTensor;
+    const o_t = lt.attn_output orelse return error.MissingTensor;
+
+    // Adapt llama.cpp `ggml_metal_op_mul_mat`: the 32-40 token public prompt
+    // is large enough to make this first full-attention layer a real batched
+    // matmul/flash-attn slice, then hand its materialized FFN norm to the
+    // existing dense batched FFN path.
+    var dispatch_before = cmd.dispatch_count;
+    dispatchRmsNormOnCmd(engine, cmd, input_buf, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
+    profileFullAttnBarrierBuffers(cmd, profile, .norm, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
+    recordFullAttnDispatchDelta(profile, .norm, dispatch_before, cmd.dispatch_count);
+
+    dispatch_before = cmd.dispatch_count;
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, q_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen35_dense_prefill_swiglu_buf, attn.q_dim * 2, hidden_dim, n_tokens);
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, k_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, attn.kv_dim, hidden_dim, n_tokens);
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, v_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, attn.kv_dim, hidden_dim, n_tokens);
+    recordFullAttnQkvPath(profile, .packed_gate);
+    recordFullAttnQkvPath(profile, .separate);
+    profileFullAttnBarrierBuffers(cmd, profile, .qkv, &.{
+        &engine.qwen35_dense_prefill_swiglu_buf,
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.qwen_ssm_prefill_proj_z_buf,
+    });
+    recordFullAttnDispatchDelta(profile, .qkv, dispatch_before, cmd.dispatch_count);
+
+    if (engine.attn_k_norm_present[layer_idx]) {
+        dispatch_before = cmd.dispatch_count;
+        dispatchRmsNormOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads * n_tokens);
+        profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
+        recordFullAttnDispatchDelta(profile, .rope, dispatch_before, cmd.dispatch_count);
+    }
+
+    const rope_freq_buf = selectRopeFreqBuffer(engine, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
+    dispatch_before = cmd.dispatch_count;
+    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
+    profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
+    recordFullAttnDispatchDelta(profile, .rope, dispatch_before, cmd.dispatch_count);
+
+    if (engine.kv_cache_q8) {
+        const n_blocks = n_tokens * (attn.kv_dim / 32);
+        dispatchKvCacheWriteBatchedQ8OnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, 0, n_blocks);
+    } else {
+        dispatchKvCacheWriteBatchedOnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, 0, n_tokens * attn.kv_dim);
+    }
+    if (profile) |p| p.full_attn_kv_write_calls += 1;
+    profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.qwen_ssm_prefill_proj_z_buf,
+    });
+
+    dispatch_before = cmd.dispatch_count;
+    dispatchDeinterleaveBatchedOnCmd(engine, cmd, &engine.qwen35_dense_prefill_swiglu_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, attn.head_dim, cfg.n_heads, n_tokens);
+    profileFullAttnBarrierBuffers(cmd, profile, .qkv, &.{
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.qwen_ssm_prefill_proj_z_buf,
+    });
+    recordFullAttnDispatchDelta(profile, .qkv, dispatch_before, cmd.dispatch_count);
+
+    if (engine.attn_q_norm_present[layer_idx]) {
+        dispatch_before = cmd.dispatch_count;
+        dispatchRmsNormOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.attn_q_norm_bufs[layer_idx], attn.head_dim, cfg.n_heads * n_tokens);
+        profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
+        recordFullAttnDispatchDelta(profile, .rope, dispatch_before, cmd.dispatch_count);
+    }
+
+    dispatch_before = cmd.dispatch_count;
+    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
+    profileFullAttnBarrierBuffers(cmd, profile, .flash, &.{
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.kv_k_cache[layer_idx],
+        &engine.kv_v_cache[layer_idx],
+    });
+    recordFullAttnDispatchDelta(profile, .rope, dispatch_before, cmd.dispatch_count);
+
+    dispatch_before = cmd.dispatch_count;
+    if (engine.kv_cache_q8) {
+        dispatchFlashAttnBatchedQ8OnCmd(
+            engine,
+            cmd,
+            layer_idx,
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
+            &engine.kv_k_cache[layer_idx],
+            &engine.kv_v_cache[layer_idx],
+            &engine.qwen_ssm_prefill_proj_norm_buf,
+            attn.head_dim,
+            cfg.n_heads,
+            attn.n_kv_heads,
+            n_tokens,
+            n_tokens,
+            0,
+            attn.sliding_window_size,
+            attn.kv_cache_head_stride_bytes,
+            attn.kv_cache_bytes_per_token,
+        );
+    } else {
+        dispatchFlashAttnBatchedOnCmd(
+            engine,
+            cmd,
+            layer_idx,
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
+            &engine.kv_k_cache[layer_idx],
+            &engine.kv_v_cache[layer_idx],
+            &engine.qwen_ssm_prefill_proj_norm_buf,
+            attn.head_dim,
+            cfg.n_heads,
+            attn.n_kv_heads,
+            n_tokens,
+            n_tokens,
+            0,
+            attn.sliding_window_size,
+        );
+    }
+    if (profile) |p| p.full_attn_flash_calls += 1;
+    profileFullAttnBarrierBuffers(cmd, profile, .flash, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
+    recordFullAttnDispatchDelta(profile, .flash, dispatch_before, cmd.dispatch_count);
+
+    dispatch_before = cmd.dispatch_count;
+    dispatchSigmoidMulOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_z_buf, &engine.qwen_ssm_prefill_proj_norm_buf, n_tokens * attn.q_dim);
+    profileFullAttnBarrierBuffers(cmd, profile, .gate, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
+    recordFullAttnDispatchDelta(profile, .gate, dispatch_before, cmd.dispatch_count);
+
+    dispatch_before = cmd.dispatch_count;
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, o_t, &engine.qwen_ssm_prefill_proj_norm_buf, hidden_acc_buf, hidden_dim, attn.q_dim, n_tokens);
+    profileFullAttnBarrierBuffers(cmd, profile, .out, &.{hidden_acc_buf});
+    recordFullAttnDispatchDelta(profile, .out, dispatch_before, cmd.dispatch_count);
+
+    dispatch_before = cmd.dispatch_count;
+    dispatchResidualRmsNormOutOnCmd(
+        engine,
+        cmd,
+        input_buf,
+        hidden_acc_buf,
+        hidden_acc_buf,
+        &engine.qwen_ssm_prefill_proj_norm_buf,
+        &engine.ffn_norm_bufs[layer_idx],
+        hidden_dim,
+        n_tokens,
+        1.0,
+    );
+    profileFullAttnBarrierBuffers(cmd, profile, .residual, &.{
+        hidden_acc_buf,
+        &engine.qwen_ssm_prefill_proj_norm_buf,
+    });
+    recordFullAttnDispatchDelta(profile, .residual, dispatch_before, cmd.dispatch_count);
+
+    if (profile) |p| p.full_attn_layers += n_tokens;
+
+    return try recordQwen35Dense9bLayer0DensePrefillOnCmd(
+        engine,
+        cmd,
+        lt,
+        layer_idx,
+        hidden_acc_buf,
+        hidden_dim,
+        inter_dim,
+        n_tokens,
+        profile,
+    );
+}
+
+fn recordQwen35Dense9bPrefixSsmDensePrefillLayerOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    layer_idx: usize,
+    input_buf: *const MetalBuffer,
+    hidden_acc_buf: *const MetalBuffer,
+    hidden_dim: u32,
+    inter_dim: u32,
+    n_tokens: u32,
+    profile: ?*RuntimeProfile,
+) !bool {
+    const cfg = engine.config;
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return false;
+    if (layer_idx >= engine.layer_tensors.len or layer_idx >= engine.attn_norm_bufs.len or layer_idx >= engine.ffn_norm_bufs.len) return false;
+    if (isFullAttentionLayer(cfg, layer_idx)) return false;
+
+    const lt = engine.layer_tensors[layer_idx];
+    if (!canUseQwen35Dense9bSsmPrefillProjectionLayer(engine, lt)) return false;
+    if (!canUseQwen35Dense9bLayer0DensePrefill(engine, lt, layer_idx, hidden_dim, inter_dim, n_tokens)) return false;
+    if (!canUseResidualRmsNormOut(engine, hidden_dim, n_tokens)) return false;
+
+    const d_inner = cfg.ssm_d_inner;
+    const dt_rank = cfg.ssm_dt_rank;
+    const d_state = cfg.ssm_d_state;
+    const n_group = cfg.ssm_n_group;
+    const d_conv = cfg.ssm_d_conv;
+    const conv_channels = d_inner + 2 * n_group * d_state;
+    if (dt_rank == 0 or d_inner == 0 or d_state == 0 or n_group == 0 or d_inner % dt_rank != 0) return false;
+    const head_v_dim = d_inner / dt_rank;
+
+    if (engine.ssm_conv_kernel_bufs == null or
+        engine.ssm_conv_state_bufs == null or
+        engine.ssm_state_bufs == null or
+        engine.ssm_dt_bias_bufs == null or
+        engine.ssm_a_bufs == null or
+        engine.ssm_norm_weight_bufs == null or
+        engine.ssm_norm_per_head == null or
+        engine.ssm_delta_net_prefill_pipe.handle == null or
+        engine.ssm_gated_norm_pipe.handle == null)
+    {
+        return false;
+    }
+    const conv_prefill_pipe = qwenSsmConvD4PrefillPipe(engine, conv_channels, d_conv);
+    if (conv_prefill_pipe.handle == null) return false;
+
+    const wqkv_t = lt.attn_qkv orelse return false;
+    const z_t = lt.attn_gate orelse return false;
+    const alpha_t = lt.ssm_alpha orelse return false;
+    const beta_t = lt.ssm_beta orelse return false;
+    const ssm_out_t = lt.ssm_out orelse return false;
+    const branch_work_buf: *const MetalBuffer = if (input_buf == &engine.qwen_ssm_prefill_branch_buf)
+        &engine.qwen35_dense_prefill_up_buf
+    else
+        &engine.qwen_ssm_prefill_branch_buf;
+
+    dispatchRmsNormOnCmd(engine, cmd, input_buf, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
+    profileSsmBarrierBuffers(cmd, profile, .proj_norm, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, wqkv_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, conv_channels, hidden_dim, n_tokens);
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
+    try dispatchQwenSsmProjectionTailPairBatchedOnCmd(
+        engine,
+        cmd,
+        alpha_t,
+        beta_t,
+        &engine.qwen_ssm_prefill_proj_norm_buf,
+        &engine.qwen_ssm_prefill_proj_alpha_buf,
+        &engine.qwen_ssm_prefill_proj_beta_buf,
+        dt_rank,
+        hidden_dim,
+        n_tokens,
+    );
+    profileSsmResourceBarrierBuffers(cmd, profile, .qkv, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
+
+    dispatchSsmConv1dPrefillOnCmd(
+        cmd,
+        conv_prefill_pipe,
+        &engine.ssm_conv_kernel_bufs.?[layer_idx],
+        &engine.ssm_conv_state_bufs.?[layer_idx],
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        conv_channels,
+        d_conv,
+        n_tokens,
+        conv_channels,
+        0,
+        0,
+    );
+    if (profile) |p| p.ssm_conv_calls += 1;
+    profileSsmResourceBarrierBuffers(cmd, profile, .conv, &.{
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.qwen_ssm_prefill_proj_alpha_buf,
+        &engine.qwen_ssm_prefill_proj_beta_buf,
+    });
+
+    {
+        const push = SsmDeltaNetPrefillPush{
+            .d_inner = d_inner,
+            .dt_rank = dt_rank,
+            .head_v_dim = head_v_dim,
+            .d_state = d_state,
+            .n_group = n_group,
+            .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
+            .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+            .n_tokens = n_tokens,
+            .alpha_stride = dt_rank,
+            .beta_stride = dt_rank,
+            .conv_stride = conv_channels,
+            .output_stride = d_inner,
+            .alpha_offset = 0,
+            .beta_offset = 0,
+            .conv_offset = 0,
+            .output_offset = 0,
+        };
+        const bufs = [_]*const MetalBuffer{
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
+            &engine.qwen_ssm_prefill_proj_alpha_buf,
+            &engine.ssm_dt_bias_bufs.?[layer_idx],
+            &engine.ssm_a_bufs.?[layer_idx],
+            &engine.qwen_ssm_prefill_proj_beta_buf,
+            &engine.ssm_state_bufs.?[layer_idx],
+            branch_work_buf,
+        };
+        const tg_size = ssmDeltaNetPrefillThreadgroupSize(&engine.ssm_delta_net_prefill_pipe, dt_rank, head_v_dim, d_state, n_group);
+        cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+        if (profile) |p| p.ssm_delta_calls += 1;
+    }
+    profileSsmBarrierBuffers(cmd, profile, .delta, &.{
+        branch_work_buf,
+        &engine.qwen_ssm_prefill_proj_z_buf,
+    });
+
+    dispatchSsmGatedNormBatchedOffsetsWithPipe(
+        cmd,
+        &engine.ssm_gated_norm_pipe,
+        branch_work_buf,
+        &engine.ssm_norm_weight_bufs.?[layer_idx],
+        &engine.qwen_ssm_prefill_proj_z_buf,
+        branch_work_buf,
+        d_inner,
+        dt_rank,
+        head_v_dim,
+        d_state,
+        engine.ssm_norm_per_head.?[layer_idx],
+        0,
+        0,
+        0,
+        n_tokens,
+    );
+    if (profile) |p| p.ssm_gated_norm_calls += 1;
+    profileSsmBarrierBuffers(cmd, profile, .gated_norm, &.{branch_work_buf});
+
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, ssm_out_t, branch_work_buf, &engine.qwen_ssm_prefill_proj_norm_buf, hidden_dim, d_inner, n_tokens);
+    profileSsmBarrierBuffers(cmd, profile, .out, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
+
+    dispatchResidualRmsNormOutOnCmd(
+        engine,
+        cmd,
+        input_buf,
+        &engine.qwen_ssm_prefill_proj_norm_buf,
+        hidden_acc_buf,
+        &engine.qwen_ssm_prefill_proj_norm_buf,
+        &engine.ffn_norm_bufs[layer_idx],
+        hidden_dim,
+        n_tokens,
+        1.0,
+    );
+
+    return try recordQwen35Dense9bLayer0DensePrefillOnCmd(
+        engine,
+        cmd,
+        lt,
+        layer_idx,
+        hidden_acc_buf,
+        hidden_dim,
+        inter_dim,
+        n_tokens,
+        profile,
+    );
 }
 
 fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: usize, async_out: ?*MetalCommand) !bool {
@@ -20505,7 +21988,14 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     engine.qwen_ssm_prefill_shared_gate_active_tokens = 0;
     engine.qwen_ssm_prefill_router_active_tokens = 0;
     engine.qwen35_dense_prefill_layer0_active_tokens = 0;
-    if (!canUseQwenSsmPrefillProjectionChunk(engine, prompt_len)) return false;
+    engine.qwen35_dense_prefill_active_layers = 0;
+    const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
+    if (!canUseQwenSsmPrefillProjectionChunk(engine, prompt_len)) {
+        logQwenSsmPrefillProjectionChunkBlocker(engine, prompt_len);
+        recordQwen35Dense9bLayerMajorPrefillProfile(profile, engine.config, prompt_len, 0, 0, .ssm_projection_guard_failed);
+        recordQwen35Dense9bLayerMajorNextReplayProfile(profile, engine, prompt_len, 0);
+        return false;
+    }
 
     const cfg = engine.config;
     const hidden_dim = cfg.hidden_dim;
@@ -20521,8 +22011,9 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     const alpha_t = lt.ssm_alpha orelse return error.MissingTensor;
     const beta_t = lt.ssm_beta orelse return error.MissingTensor;
     const ssm_out_t = lt.ssm_out orelse return error.MissingTensor;
-    const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
+    var layer_major_fallback_reason: Qwen35Dense9bPrefillFallbackReason = .branch_not_batched;
 
+    const layer_major_record_start = profileStart(profile != null);
     var cmd = try beginProfiledCommand(engine, profile);
     dispatchRmsNormOnCmd(engine, &cmd, &engine.prefill_embed_buf, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[0], hidden_dim, n_tokens);
     profileSsmBarrierBuffers(&cmd, profile, .proj_norm, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
@@ -20530,6 +22021,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
     const beta_batched = canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
     const branch_batched =
+        qwenSsmPrefillBranchMaterializationEnabled(cfg) and
         alpha_batched and
         beta_batched and
         canUseQwenSharedBatchedGemm(engine, ssm_out_t.info.type_) and
@@ -20578,6 +22070,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     var shared_gate_batched = false;
     var router_batched = false;
     var dense_layer0_batched = false;
+    var dense_layer0_validation_completed = false;
     if (branch_batched) {
         const d_conv = cfg.ssm_d_conv;
         const d_state = cfg.ssm_d_state;
@@ -20754,15 +22247,82 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         }
         branch_norm_batched = true;
 
-        dense_layer0_batched = try recordQwen35Dense9bLayer0DensePrefillOnCmd(
-            engine,
-            &cmd,
-            lt,
-            hidden_dim,
-            inter_dim,
-            n_tokens,
-            profile,
-        );
+        if (qwen35Dense9bPrefillDenseLayer0Enabled()) {
+            dense_layer0_batched = try recordQwen35Dense9bLayer0DensePrefillOnCmd(
+                engine,
+                &cmd,
+                lt,
+                0,
+                &engine.qwen_ssm_prefill_branch_buf,
+                hidden_dim,
+                inter_dim,
+                n_tokens,
+                profile,
+            );
+        }
+        layer_major_fallback_reason = if (dense_layer0_batched) .configured_prefix_limit else .layer0_dense_guard_failed;
+        const qwen35_dense9b_prefix_limit = qwen35Dense9bPrefillPrefixLayerLimit();
+        if (dense_layer0_batched and qwen35Dense9bPrefillDenseValidateEnabled() and qwen35_dense9b_prefix_limit > 1) {
+            commitAndWaitProfiled(&cmd, profile);
+            try validateQwen35Dense9bLayer0DensePrefill(engine, profile, 0, lt, hidden_dim, inter_dim, n_tokens);
+            cmd = try beginProfiledCommand(engine, profile);
+            dense_layer0_validation_completed = true;
+        }
+        if (dense_layer0_batched and defaultQwen35Dense9bQueuedPrefillEnabled(cfg) and qwen35_dense9b_prefix_limit > 1) {
+            const max_prefix_layers = @min(qwen35_dense9b_prefix_limit, @as(usize, @intCast(cfg.n_layers)));
+            var prefix_layer_idx: usize = 1;
+            while (prefix_layer_idx < max_prefix_layers) : (prefix_layer_idx += 1) {
+                if (prefix_layer_idx == 1) {
+                    profileResourceBarrierBuffers(&cmd, profile, .dense_ffn, &.{&engine.qwen_ssm_prefill_branch_buf});
+                } else {
+                    profileResourceBarrierBuffers(&cmd, profile, .dense_ffn, &.{
+                        &engine.qwen_ssm_prefill_branch_buf,
+                        &engine.qwen35_dense_prefill_down_buf,
+                    });
+                }
+                const recorded_prefix_layer = if (isFullAttentionLayer(cfg, prefix_layer_idx))
+                    try recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
+                        engine,
+                        &cmd,
+                        prefix_layer_idx,
+                        &engine.qwen_ssm_prefill_branch_buf,
+                        &engine.qwen35_dense_prefill_down_buf,
+                        hidden_dim,
+                        inter_dim,
+                        n_tokens,
+                        profile,
+                    )
+                else
+                    try recordQwen35Dense9bPrefixSsmDensePrefillLayerOnCmd(
+                        engine,
+                        &cmd,
+                        prefix_layer_idx,
+                        &engine.qwen_ssm_prefill_branch_buf,
+                        &engine.qwen35_dense_prefill_down_buf,
+                        hidden_dim,
+                        inter_dim,
+                        n_tokens,
+                        profile,
+                    );
+                if (!recorded_prefix_layer) {
+                    layer_major_fallback_reason = if (isFullAttentionLayer(cfg, prefix_layer_idx))
+                        .prefix_full_attn_guard_failed
+                    else
+                        .prefix_ssm_guard_failed;
+                    break;
+                }
+                profileResourceBarrierBuffers(&cmd, profile, .dense_ffn, &.{&engine.qwen35_dense_prefill_down_buf});
+                dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.qwen35_dense_prefill_down_buf, &engine.qwen_ssm_prefill_branch_buf, n_tokens * hidden_dim, 0, 0);
+                engine.qwen35_dense_prefill_active_layers = @intCast(prefix_layer_idx + 1);
+                if (isFullAttentionLayer(cfg, prefix_layer_idx) and prefix_layer_idx + 1 >= max_prefix_layers) {
+                    layer_major_fallback_reason = .full_attn_boundary;
+                    break;
+                }
+            }
+        }
+        if (dense_layer0_batched and engine.qwen35_dense_prefill_active_layers == 0) {
+            engine.qwen35_dense_prefill_active_layers = 1;
+        }
 
         if ((!router_batched and lt.ffn_gate_inp != null) or can_prefill_shared_down) {
             // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`: the
@@ -20868,17 +22428,33 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
             n_tokens,
         );
     }
+    recordQwen35Dense9bLayerMajorPrefillWork(profile, cfg, &cmd, profileElapsedNs(layer_major_record_start));
+    const validate_dense_layer0 = dense_layer0_batched and qwen35Dense9bPrefillDenseValidateEnabled() and !dense_layer0_validation_completed;
     if (async_out) |out| {
-        commitAsyncProfiled(&cmd, profile);
-        out.* = cmd;
-        cmd = .{
-            .handle = null,
-            .dispatch_count = 0,
-            .barrier_count = 0,
-            .barrier_enabled = false,
-        };
+        if (validate_dense_layer0) {
+            commitAndWaitProfiled(&cmd, profile);
+            try validateQwen35Dense9bLayer0DensePrefill(engine, profile, 0, lt, hidden_dim, inter_dim, n_tokens);
+            out.* = .{
+                .handle = null,
+                .dispatch_count = 0,
+                .barrier_count = 0,
+                .barrier_enabled = false,
+            };
+        } else {
+            commitAsyncProfiled(&cmd, profile);
+            out.* = cmd;
+            cmd = .{
+                .handle = null,
+                .dispatch_count = 0,
+                .barrier_count = 0,
+                .barrier_enabled = false,
+            };
+        }
     } else {
         commitAndWaitProfiled(&cmd, profile);
+        if (validate_dense_layer0) {
+            try validateQwen35Dense9bLayer0DensePrefill(engine, profile, 0, lt, hidden_dim, inter_dim, n_tokens);
+        }
     }
 
     engine.qwen_ssm_prefill_proj_active_tokens = n_tokens;
@@ -20888,8 +22464,17 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     engine.qwen_ssm_prefill_shared_gate_active_tokens = if (shared_gate_batched) n_tokens else 0;
     engine.qwen_ssm_prefill_router_active_tokens = if (router_batched) n_tokens else 0;
     engine.qwen35_dense_prefill_layer0_active_tokens = if (dense_layer0_batched) n_tokens else 0;
+    recordQwen35Dense9bLayerMajorPrefillProfile(
+        profile,
+        cfg,
+        prompt_len,
+        if (dense_layer0_batched) n_tokens else 0,
+        engine.qwen35_dense_prefill_active_layers,
+        layer_major_fallback_reason,
+    );
+    recordQwen35Dense9bLayerMajorNextReplayProfile(profile, engine, prompt_len, engine.qwen35_dense_prefill_active_layers);
     if (engine.profile_enabled) {
-        log.info("Metal profile: Qwen SSM prefill projection chunk active layer=0 tokens={d} async={} alpha_batched={} beta_batched={} branch_batched={} branch_norm_batched={} dense_layer0_batched={} router_batched={} shared_down_batched={} shared_gate_batched={}", .{ n_tokens, async_out != null, alpha_batched, beta_batched, branch_batched, branch_norm_batched, dense_layer0_batched, router_batched, shared_down_batched, shared_gate_batched });
+        log.info("Metal profile: Qwen SSM prefill projection chunk active layer=0 tokens={d} async={} alpha_batched={} beta_batched={} branch_batched={} branch_norm_batched={} dense_layer0_batched={} dense_prefix_layers={d} router_batched={} shared_down_batched={} shared_gate_batched={}", .{ n_tokens, async_out != null, alpha_batched, beta_batched, branch_batched, branch_norm_batched, dense_layer0_batched, engine.qwen35_dense_prefill_active_layers, router_batched, shared_down_batched, shared_gate_batched });
     }
     return true;
 }
@@ -20980,18 +22565,26 @@ fn shouldValidateQwenSsmProjection(
     beta_t: *const metal_loader.LoadedTensor,
 ) bool {
     const cfg = engine.config;
-    return engine.qwen_prefill_validation_enabled and
-        using_local_cmd and
+    const validate_tokens = qwenSsmProjectionValidateTokens();
+    const supports_qwen36_moe =
         cfg.architecture == .qwen2_moe and
         cfg.n_experts > 0 and
         cfg.ssm_d_inner > 0 and
-        engine.position < qwen_ssm_projection_validate_tokens and
-        layer_idx == @as(usize, @intCast(engine.qwen_ssm_proj_validate_layer)) and
         wqkv_t.info.type_ == .q8_0 and
         z_t.info.type_ == .q8_0 and
         alpha_t.info.type_ == .q8_0 and
         beta_t.info.type_ == .q8_0 and
         engine.gemm_q8_0_pipe.handle != null;
+    const supports_qwen35_dense =
+        defaultQwen35Dense9bQueuedPrefillEnabled(cfg) and
+        layer_idx < engine.layer_tensors.len and
+        qwen35Dense9bSsmPrefillProjectionLayerBlocker(engine, engine.layer_tensors[layer_idx]) == .ok;
+    return engine.qwen_prefill_validation_enabled and
+        using_local_cmd and
+        cfg.ssm_d_inner > 0 and
+        engine.position < validate_tokens and
+        layer_idx == @as(usize, @intCast(engine.qwen_ssm_proj_validate_layer)) and
+        (supports_qwen36_moe or supports_qwen35_dense);
 }
 
 fn ensureValidationBuffer(engine: *InferenceEngine, buf: *MetalBuffer, required_bytes: usize) !void {
@@ -21009,12 +22602,23 @@ fn ensureQwenSsmProjectionValidationBuffers(
     dt_rank: u32,
     hidden_dim: u32,
 ) !void {
-    const n: usize = @intCast(qwen_ssm_projection_validate_tokens);
+    const n: usize = @intCast(qwenSsmProjectionValidateTokens());
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_layer_input_ref_buf, n * @as(usize, hidden_dim) * @sizeOf(f32));
     try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_norm_buf, n * @as(usize, hidden_dim) * @sizeOf(f32));
     try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_qkv_ref_buf, n * @as(usize, conv_channels) * @sizeOf(f32));
     try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_z_ref_buf, n * @as(usize, d_inner) * @sizeOf(f32));
     try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_alpha_ref_buf, n * @as(usize, dt_rank) * @sizeOf(f32));
     try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_beta_ref_buf, n * @as(usize, dt_rank) * @sizeOf(f32));
+}
+
+fn ensureQwenSsmBranchValidationBuffers(
+    engine: *InferenceEngine,
+    hidden_dim: u32,
+) !void {
+    const n: usize = @intCast(qwenSsmProjectionValidateTokens());
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_layer_input_ref_buf, n * @as(usize, hidden_dim) * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_hidden_before_ref_buf, n * @as(usize, hidden_dim) * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_norm_buf, n * @as(usize, hidden_dim) * @sizeOf(f32));
 }
 
 fn logQwenSsmProjectionChunkValidationDiff(
@@ -21078,17 +22682,20 @@ fn validateQwenSsmProjectionBatchKernel(
     hidden_dim: u32,
 ) !void {
     try ensureQwenSsmProjectionValidationBuffers(engine, conv_channels, d_inner, dt_rank, hidden_dim);
+    const validate_tokens = qwenSsmProjectionValidateTokens();
 
     if (engine.position == 0) {
         engine.qwen_ssm_proj_validate_captured_tokens = 0;
     }
     const token_idx = engine.position;
-    if (token_idx >= qwen_ssm_projection_validate_tokens) return;
+    if (token_idx >= validate_tokens) return;
 
     const norm_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_norm_buf.cpu_ptr.?));
+    const input_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_layer_input_ref_buf.cpu_ptr.?));
     const hidden_src: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
     const norm_weight: [*]const f32 = @ptrCast(@alignCast(engine.attn_norm_bufs[layer_idx].cpu_ptr.?));
     const norm_off = @as(usize, token_idx) * @as(usize, hidden_dim);
+    @memcpy(input_dst[norm_off .. norm_off + @as(usize, hidden_dim)], hidden_src[0..hidden_dim]);
     cpuRmsNormMul(hidden_src, norm_weight[0..hidden_dim], norm_dst + norm_off, hidden_dim, 1, engine.config.rms_norm_eps);
 
     const qkv_src: [*]const f32 = @ptrCast(@alignCast(engine.attn_out_buf.cpu_ptr.?));
@@ -21108,11 +22715,11 @@ fn validateQwenSsmProjectionBatchKernel(
     @memcpy(beta_ref[ab_off .. ab_off + @as(usize, dt_rank)], beta_src[0..dt_rank]);
 
     engine.qwen_ssm_proj_validate_captured_tokens = @max(engine.qwen_ssm_proj_validate_captured_tokens, token_idx + 1);
-    if (engine.qwen_ssm_proj_validate_captured_tokens < qwen_ssm_projection_validate_tokens) return;
+    if (engine.qwen_ssm_proj_validate_captured_tokens < validate_tokens) return;
 
-    const qkv_bytes = @as(usize, qwen_ssm_projection_validate_tokens) * @as(usize, conv_channels) * @sizeOf(f32);
-    const z_bytes = @as(usize, qwen_ssm_projection_validate_tokens) * @as(usize, d_inner) * @sizeOf(f32);
-    const ab_bytes = @as(usize, qwen_ssm_projection_validate_tokens) * @as(usize, dt_rank) * @sizeOf(f32);
+    const qkv_bytes = @as(usize, validate_tokens) * @as(usize, conv_channels) * @sizeOf(f32);
+    const z_bytes = @as(usize, validate_tokens) * @as(usize, d_inner) * @sizeOf(f32);
+    const ab_bytes = @as(usize, validate_tokens) * @as(usize, dt_rank) * @sizeOf(f32);
     var qkv_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(qkv_bytes, 4));
     defer metal_buffer.freeBuffer(&qkv_candidate);
     var z_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(z_bytes, 4));
@@ -21123,23 +22730,236 @@ fn validateQwenSsmProjectionBatchKernel(
     defer metal_buffer.freeBuffer(&beta_candidate);
 
     var cmd = try beginProfiledCommand(engine, profile);
-    dispatchGemmQ8_0OnCmd(engine, &cmd, wqkv_t, &engine.qwen_ssm_proj_validate_norm_buf, &qkv_candidate, conv_channels, hidden_dim, qwen_ssm_projection_validate_tokens);
-    dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_proj_validate_norm_buf, &z_candidate, d_inner, hidden_dim, qwen_ssm_projection_validate_tokens);
-    dispatchGemmQ8_0OnCmd(engine, &cmd, alpha_t, &engine.qwen_ssm_proj_validate_norm_buf, &alpha_candidate, dt_rank, hidden_dim, qwen_ssm_projection_validate_tokens);
-    dispatchGemmQ8_0OnCmd(engine, &cmd, beta_t, &engine.qwen_ssm_proj_validate_norm_buf, &beta_candidate, dt_rank, hidden_dim, qwen_ssm_projection_validate_tokens);
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, wqkv_t, &engine.qwen_ssm_proj_validate_norm_buf, &qkv_candidate, conv_channels, hidden_dim, validate_tokens);
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, z_t, &engine.qwen_ssm_proj_validate_norm_buf, &z_candidate, d_inner, hidden_dim, validate_tokens);
+    try dispatchQwenSsmProjectionTailPairBatchedOnCmd(
+        engine,
+        &cmd,
+        alpha_t,
+        beta_t,
+        &engine.qwen_ssm_proj_validate_norm_buf,
+        &alpha_candidate,
+        &beta_candidate,
+        dt_rank,
+        hidden_dim,
+        validate_tokens,
+    );
     commitAndWaitProfiled(&cmd, profile);
 
-    const n = qwen_ssm_projection_validate_tokens;
+    const n = validate_tokens;
     const qkv_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(qkv_candidate.cpu_ptr.?));
     const z_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(z_candidate.cpu_ptr.?));
     const alpha_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(alpha_candidate.cpu_ptr.?));
     const beta_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(beta_candidate.cpu_ptr.?));
 
     const n_usize: usize = @intCast(n);
-    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_qkv_gemm_q8_0", qkv_ref[0 .. n_usize * @as(usize, conv_channels)], qkv_candidate_ptr[0 .. n_usize * @as(usize, conv_channels)], conv_channels, n, 2.0);
-    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_z_gemm_q8_0", z_ref[0 .. n_usize * @as(usize, d_inner)], z_candidate_ptr[0 .. n_usize * @as(usize, d_inner)], d_inner, n, 2.0);
-    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_alpha_gemm_q8_0", alpha_ref[0 .. n_usize * @as(usize, dt_rank)], alpha_candidate_ptr[0 .. n_usize * @as(usize, dt_rank)], dt_rank, n, 2.0);
-    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_beta_gemm_q8_0", beta_ref[0 .. n_usize * @as(usize, dt_rank)], beta_candidate_ptr[0 .. n_usize * @as(usize, dt_rank)], dt_rank, n, 2.0);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_qkv_gemm_batched", qkv_ref[0 .. n_usize * @as(usize, conv_channels)], qkv_candidate_ptr[0 .. n_usize * @as(usize, conv_channels)], conv_channels, n, 2.0);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_z_gemm_batched", z_ref[0 .. n_usize * @as(usize, d_inner)], z_candidate_ptr[0 .. n_usize * @as(usize, d_inner)], d_inner, n, 2.0);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_alpha_gemm_batched", alpha_ref[0 .. n_usize * @as(usize, dt_rank)], alpha_candidate_ptr[0 .. n_usize * @as(usize, dt_rank)], dt_rank, n, 2.0);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_beta_gemm_batched", beta_ref[0 .. n_usize * @as(usize, dt_rank)], beta_candidate_ptr[0 .. n_usize * @as(usize, dt_rank)], dt_rank, n, 2.0);
+}
+
+fn shouldValidateQwen35DenseSsmBranch(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    using_local_cmd: bool,
+) bool {
+    const validate_tokens = qwenSsmProjectionValidateTokens();
+    return engine.qwen_prefill_validation_enabled and
+        using_local_cmd and
+        defaultQwen35Dense9bQueuedPrefillEnabled(engine.config) and
+        layer_idx < engine.layer_tensors.len and
+        qwen35Dense9bSsmPrefillProjectionLayerBlocker(engine, engine.layer_tensors[layer_idx]) == .ok and
+        engine.position < validate_tokens and
+        layer_idx == @as(usize, @intCast(engine.qwen_ssm_proj_validate_layer));
+}
+
+fn validateQwen35DenseSsmBranchBatchKernel(
+    engine: *InferenceEngine,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    ssm_out_t: *const metal_loader.LoadedTensor,
+    conv_channels: u32,
+    d_inner: u32,
+    dt_rank: u32,
+    hidden_dim: u32,
+) !void {
+    const cfg = engine.config;
+    try ensureQwenSsmBranchValidationBuffers(engine, hidden_dim);
+    const validate_tokens = qwenSsmProjectionValidateTokens();
+
+    const token_idx = engine.position;
+    if (token_idx >= validate_tokens) return;
+
+    const hidden_n: usize = @intCast(hidden_dim);
+    const token_hidden_off = @as(usize, token_idx) * hidden_n;
+    const hidden_ref: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_hidden_before_ref_buf.cpu_ptr.?));
+    const norm_ref: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_norm_buf.cpu_ptr.?));
+    const hidden_src: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+    const norm_src: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
+    @memcpy(hidden_ref[token_hidden_off .. token_hidden_off + hidden_n], hidden_src[0..hidden_n]);
+    @memcpy(norm_ref[token_hidden_off .. token_hidden_off + hidden_n], norm_src[0..hidden_n]);
+
+    if (token_idx + 1 < validate_tokens) return;
+    if (engine.qwen_ssm_proj_validate_captured_tokens < validate_tokens) return;
+    if (engine.qwen_moe_route_validate_layer_input_ref_buf.handle == null or
+        engine.qwen_ssm_proj_validate_qkv_ref_buf.handle == null or
+        engine.qwen_ssm_proj_validate_z_ref_buf.handle == null or
+        engine.qwen_ssm_proj_validate_alpha_ref_buf.handle == null or
+        engine.qwen_ssm_proj_validate_beta_ref_buf.handle == null)
+    {
+        return;
+    }
+
+    const n = validate_tokens;
+    const n_usize: usize = @intCast(n);
+    const d_state = cfg.ssm_d_state;
+    const n_group = cfg.ssm_n_group;
+    const d_conv = cfg.ssm_d_conv;
+    if (dt_rank == 0 or d_inner == 0 or d_state == 0 or n_group == 0 or d_inner % dt_rank != 0) return;
+    const head_v_dim = d_inner / dt_rank;
+    if (engine.ssm_conv_kernel_bufs == null or
+        engine.ssm_conv_state_bufs == null or
+        engine.ssm_state_bufs == null or
+        engine.ssm_dt_bias_bufs == null or
+        engine.ssm_a_bufs == null or
+        engine.ssm_norm_weight_bufs == null or
+        engine.ssm_norm_per_head == null or
+        engine.ssm_delta_net_prefill_pipe.handle == null or
+        engine.ssm_gated_norm_pipe.handle == null or
+        engine.residual_rms_norm_out_pipe.handle == null)
+    {
+        return;
+    }
+    const conv_prefill_pipe = qwenSsmConvD4PrefillPipe(engine, conv_channels, d_conv);
+    if (conv_prefill_pipe.handle == null) return;
+
+    const qkv_bytes = n_usize * @as(usize, conv_channels) * @sizeOf(f32);
+    const branch_bytes = n_usize * @as(usize, d_inner) * @sizeOf(f32);
+    const hidden_bytes = n_usize * hidden_n * @sizeOf(f32);
+    var conv_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(qkv_bytes, 4));
+    defer metal_buffer.freeBuffer(&conv_candidate);
+    var branch_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(branch_bytes, 4));
+    defer metal_buffer.freeBuffer(&branch_candidate);
+    var ssm_out_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(hidden_bytes, 4));
+    defer metal_buffer.freeBuffer(&ssm_out_candidate);
+    var hidden_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(hidden_bytes, 4));
+    defer metal_buffer.freeBuffer(&hidden_candidate);
+    var norm_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(hidden_bytes, 4));
+    defer metal_buffer.freeBuffer(&norm_candidate);
+    var conv_state_tmp = try metal_buffer.createBuffer(engine.device.ctx, @max(engine.ssm_conv_state_bufs.?[layer_idx].size, 4));
+    defer metal_buffer.freeBuffer(&conv_state_tmp);
+    var ssm_state_tmp = try metal_buffer.createBuffer(engine.device.ctx, @max(engine.ssm_state_bufs.?[layer_idx].size, 4));
+    defer metal_buffer.freeBuffer(&ssm_state_tmp);
+
+    const qkv_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_qkv_ref_buf.cpu_ptr.?));
+    const conv_candidate_ptr: [*]f32 = @ptrCast(@alignCast(conv_candidate.cpu_ptr.?));
+    @memcpy(conv_candidate_ptr[0 .. n_usize * @as(usize, conv_channels)], qkv_ref[0 .. n_usize * @as(usize, conv_channels)]);
+    @memset(branch_candidate.cpu_ptr.?[0..branch_candidate.size], 0);
+    @memset(ssm_out_candidate.cpu_ptr.?[0..ssm_out_candidate.size], 0);
+    @memset(hidden_candidate.cpu_ptr.?[0..hidden_candidate.size], 0);
+    @memset(norm_candidate.cpu_ptr.?[0..norm_candidate.size], 0);
+    @memset(conv_state_tmp.cpu_ptr.?[0..conv_state_tmp.size], 0);
+    @memset(ssm_state_tmp.cpu_ptr.?[0..ssm_state_tmp.size], 0);
+
+    var cmd = try beginProfiledCommand(engine, profile);
+    dispatchSsmConv1dPrefillOnCmd(
+        &cmd,
+        conv_prefill_pipe,
+        &engine.ssm_conv_kernel_bufs.?[layer_idx],
+        &conv_state_tmp,
+        &conv_candidate,
+        &conv_candidate,
+        conv_channels,
+        d_conv,
+        n,
+        conv_channels,
+        0,
+        0,
+    );
+    profileSsmBarrierBuffers(&cmd, profile, .conv, &.{
+        &conv_candidate,
+        &engine.qwen_ssm_proj_validate_alpha_ref_buf,
+        &engine.qwen_ssm_proj_validate_beta_ref_buf,
+    });
+
+    {
+        const push = SsmDeltaNetPrefillPush{
+            .d_inner = d_inner,
+            .dt_rank = dt_rank,
+            .head_v_dim = head_v_dim,
+            .d_state = d_state,
+            .n_group = n_group,
+            .has_dt_bias = if (engine.layer_tensors[layer_idx].ssm_dt_bias != null) @as(u32, 1) else 0,
+            .has_ssm_a = if (engine.layer_tensors[layer_idx].ssm_a != null) @as(u32, 1) else 0,
+            .n_tokens = n,
+            .alpha_stride = dt_rank,
+            .beta_stride = dt_rank,
+            .conv_stride = conv_channels,
+            .output_stride = d_inner,
+            .alpha_offset = 0,
+            .beta_offset = 0,
+            .conv_offset = 0,
+            .output_offset = 0,
+        };
+        const bufs = [_]*const MetalBuffer{
+            &conv_candidate,
+            &engine.qwen_ssm_proj_validate_alpha_ref_buf,
+            &engine.ssm_dt_bias_bufs.?[layer_idx],
+            &engine.ssm_a_bufs.?[layer_idx],
+            &engine.qwen_ssm_proj_validate_beta_ref_buf,
+            &ssm_state_tmp,
+            &branch_candidate,
+        };
+        const tg_size = ssmDeltaNetPrefillThreadgroupSize(&engine.ssm_delta_net_prefill_pipe, dt_rank, head_v_dim, d_state, n_group);
+        cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+    }
+    profileSsmBarrierBuffers(&cmd, profile, .delta, &.{
+        &branch_candidate,
+        &engine.qwen_ssm_proj_validate_z_ref_buf,
+    });
+
+    dispatchSsmGatedNormBatchedOffsetsWithPipe(
+        &cmd,
+        &engine.ssm_gated_norm_pipe,
+        &branch_candidate,
+        &engine.ssm_norm_weight_bufs.?[layer_idx],
+        &engine.qwen_ssm_proj_validate_z_ref_buf,
+        &branch_candidate,
+        d_inner,
+        dt_rank,
+        head_v_dim,
+        d_state,
+        engine.ssm_norm_per_head.?[layer_idx],
+        0,
+        0,
+        0,
+        n,
+    );
+    profileSsmBarrierBuffers(&cmd, profile, .gated_norm, &.{&branch_candidate});
+
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, ssm_out_t, &branch_candidate, &ssm_out_candidate, hidden_dim, d_inner, n);
+    profileSsmBarrierBuffers(&cmd, profile, .out, &.{&ssm_out_candidate});
+
+    dispatchResidualRmsNormOutOnCmd(
+        engine,
+        &cmd,
+        &engine.qwen_moe_route_validate_layer_input_ref_buf,
+        &ssm_out_candidate,
+        &hidden_candidate,
+        &norm_candidate,
+        &engine.ffn_norm_bufs[layer_idx],
+        hidden_dim,
+        n,
+        1.0,
+    );
+    commitAndWaitProfiled(&cmd, profile);
+
+    const hidden_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(hidden_candidate.cpu_ptr.?));
+    const norm_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(norm_candidate.cpu_ptr.?));
+    const total = n_usize * hidden_n;
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_branch_hidden", hidden_ref[0..total], hidden_candidate_ptr[0..total], hidden_dim, n, 5e-2);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_branch_ffn_norm", norm_ref[0..total], norm_candidate_ptr[0..total], hidden_dim, n, 5e-2);
 }
 
 fn supportsQwenMoeRoutePackCols(engine: *const InferenceEngine, quant_type: GGMLType) bool {
@@ -23856,6 +25676,30 @@ fn commitAndWaitProfiledMeasured(cmd: *MetalCommand, profile: ?*RuntimeProfile) 
     return wait_ns;
 }
 
+const CommandWaitTiming = struct {
+    wait_ns: u64 = 0,
+    gpu_ns: u64 = 0,
+};
+
+fn commitAndWaitProfiledMeasuredGpuDuration(cmd: *MetalCommand, profile: ?*RuntimeProfile) CommandWaitTiming {
+    if (profile) |p| {
+        p.dispatch_calls += cmd.dispatch_count;
+        p.barrier_calls += cmd.barrier_count;
+        p.scope_barrier_calls += cmd.scope_barrier_count;
+        p.resource_barrier_calls += cmd.resource_barrier_count;
+        p.resource_barrier_resources += cmd.resource_barrier_resources;
+    }
+    const wait_start = profileStart(profile != null);
+    cmd.commitAsync();
+    const gpu_ns = cmd.waitGpuDurationNs();
+    const wait_ns = profileElapsedNs(wait_start);
+    if (profile) |p| {
+        p.commit_waits += 1;
+        p.gpu_completion_wait_ns += wait_ns;
+    }
+    return .{ .wait_ns = wait_ns, .gpu_ns = gpu_ns };
+}
+
 fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     _ = commitAndWaitProfiledMeasured(cmd, profile);
 }
@@ -25020,6 +26864,7 @@ fn runDecodeStep(
             const use_prefill_branch_norm = shouldUseQwenSsmPrefillBranchNormChunk(engine, layer_idx);
             const use_direct_prefill_branch_norm =
                 use_prefill_branch_norm and
+                is_moe and
                 !engine.debug_validation_enabled and
                 !engine.qwen_prefill_validation_enabled;
             var ffn_norm_input_buf: *const MetalBuffer = &engine.norm_buf;
@@ -25029,11 +26874,11 @@ fn runDecodeStep(
             if (use_prefill_branch_norm) {
                 // `prepareQwenSsmPrefillProjectionChunk` already materialized
                 // hidden += layer0_ssm_out and the FFN norm for this token.
-                // In production, consume the precomputed norm row directly through
-                // input offsets, matching llama.cpp/vLLM's avoid-materializing
-                // discipline for intermediate MoE inputs. Validation/debug keeps
-                // the older single-token buffer so CPU-side comparators see the
-                // same state as before.
+                // MoE production can consume the precomputed norm row directly
+                // through input offsets, matching llama.cpp/vLLM's
+                // avoid-materializing discipline for intermediate MoE inputs.
+                // Dense FFN kernels read engine.norm_buf, so they keep the
+                // single-row copy path below.
                 if (use_direct_prefill_branch_norm) {
                     ffn_norm_input_buf = &engine.qwen_ssm_prefill_proj_norm_buf;
                     ffn_norm_input_byte_offset = @intCast(engine.position * hidden_dim * @sizeOf(f32));
@@ -25593,6 +27438,24 @@ fn runDecodeStep(
                 } else {
                     dispatchResidualRmsNormOffsetOnCmd(engine, cmd, &engine.hidden_buf, ssm_residual_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0, ssm_residual_offset);
                 }
+            }
+            if (shouldValidateQwen35DenseSsmBranch(engine, layer_idx, using_local_cmd)) {
+                commitAndWaitProfiled(cmd, profile);
+                const validation_start = profileStart(profile != null);
+                const branch_ssm_out_t = lt.ssm_out orelse return error.MissingTensor;
+                try validateQwen35DenseSsmBranchBatchKernel(
+                    engine,
+                    profile,
+                    layer_idx,
+                    branch_ssm_out_t,
+                    conv_channels,
+                    d_inner,
+                    dt_rank,
+                    hidden_dim,
+                );
+                if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
+                local_cmd_storage = try beginProfiledCommand(engine, profile);
+                cmd = &local_cmd_storage;
             }
             if (!is_moe and layer_shared_cmd != null) {
                 if (qwen35DenseSsmResourceBarriersEnabled(cfg, engine.in_prefill_phase)) {
@@ -26258,11 +28121,19 @@ fn runDecodeStep(
                 // dispatch + barrier at the layer tail is skipped when this
                 // path fires (see `layer_output_scale_fused_into_post_norm`).
                 const can_fold_layer_scale_here = layer_output_scale != 1.0 and !layer_output_scale_folded_pre;
-                const can_fuse_next_attn_norm = layer_shared_cmd != null and
-                    use_dense_layer_cmd and
-                    next_layer_idx_u < layer_count and
-                    engine.layer_output_scales[next_layer_idx_u] != 0.0 and
-                    ((@as(u32, @intCast(next_layer_idx_u)) + 1) % full_attn_interval == 0);
+                const next_layer_scale = if (next_layer_idx_u < engine.layer_output_scales.len)
+                    engine.layer_output_scales[next_layer_idx_u]
+                else
+                    0.0;
+                const can_fuse_next_attn_norm = canFuseDenseFfnNextAttnNorm(
+                    cfg,
+                    engine.in_prefill_phase,
+                    layer_shared_cmd != null,
+                    use_dense_layer_cmd,
+                    next_layer_idx_u,
+                    layer_count,
+                    next_layer_scale,
+                );
                 const can_fuse_final_norm_tail = emit_logits and
                     layer_shared_cmd != null and
                     shared_cmd == null and
@@ -32643,12 +34514,17 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     };
 
     try std.testing.expect(defaultQwen35Dense9bQueuedPrefillEnabled(qwen35_9b_cfg));
+    try std.testing.expectEqual(@as(usize, 32), qwen35_dense9b_prefill_prefix_layers);
+    try std.testing.expect(!isFullAttentionLayer(qwen35_9b_cfg, qwen35_dense9b_prefill_prefix_layers - 2));
+    try std.testing.expect(isFullAttentionLayer(qwen35_9b_cfg, qwen35_dense9b_prefill_prefix_layers - 1));
     try std.testing.expect(defaultQwenSsmPrefillProjectionEnabled(qwen35_9b_cfg));
+    try std.testing.expect(qwenSsmPrefillProjectionAllowsSharedDecodeBuffers(qwen35_9b_cfg));
     try std.testing.expect(shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_9b_cfg, true, true));
     try std.testing.expect(!shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_9b_cfg, false, true));
     try std.testing.expect(!shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_9b_cfg, true, false));
     try std.testing.expect(!defaultQwen35Dense9bQueuedPrefillEnabled(qwen35_27b_cfg));
     try std.testing.expect(!defaultQwenSsmPrefillProjectionEnabled(qwen35_27b_cfg));
+    try std.testing.expect(!qwenSsmPrefillProjectionAllowsSharedDecodeBuffers(qwen35_27b_cfg));
     try std.testing.expect(!shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_27b_cfg, true, true));
     try std.testing.expect(isQwenSsmConvD4_8192Shape(qwen35_9b_cfg, 8192));
     try std.testing.expect(!isQwenSsmConvD4_8192Shape(qwen35_9b_cfg, 10240));
@@ -32662,6 +34538,14 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_9b_cfg, true, false, 30, 32));
     try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_9b_cfg, false, false, 31, 32));
     try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_27b_cfg, true, false, 63, 64));
+
+    try std.testing.expect(canFuseDenseFfnNextAttnNorm(qwen35_9b_cfg, true, true, false, 7, 32, 1.0));
+    try std.testing.expect(!canFuseDenseFfnNextAttnNorm(qwen35_9b_cfg, false, true, false, 7, 32, 1.0));
+    try std.testing.expect(!canFuseDenseFfnNextAttnNorm(qwen35_9b_cfg, true, false, false, 7, 32, 1.0));
+    try std.testing.expect(!canFuseDenseFfnNextAttnNorm(qwen35_9b_cfg, true, true, false, 6, 32, 1.0));
+    try std.testing.expect(!canFuseDenseFfnNextAttnNorm(qwen35_9b_cfg, true, true, false, 7, 32, 0.0));
+    try std.testing.expect(!canFuseDenseFfnNextAttnNorm(qwen35_27b_cfg, true, true, false, 7, 64, 1.0));
+    try std.testing.expect(canFuseDenseFfnNextAttnNorm(qwen35_27b_cfg, false, true, true, 7, 64, 1.0));
 
     try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_9b_cfg, "output.weight", 248320, 4096));
     try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_9b_cfg, "output.weight", 248320, 5120));
@@ -32682,9 +34566,11 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expect(!isQwen35Dense9bDownQ4kTarget(qwen35_9b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
     try std.testing.expect(!isQwen35Dense9bDownQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_down.weight", 4096, 12288));
     try std.testing.expect(isQwen35Dense9bSsmQkvQ4kTarget(qwen35_9b_cfg, "blk.0.attn_qkv.weight", 8192, 4096));
+    try std.testing.expect(isQwen35Dense9bSsmQkvQ5kTarget(qwen35_9b_cfg, "blk.0.attn_qkv.weight", 8192, 4096));
     try std.testing.expect(!isQwen35Dense9bSsmQkvQ4kTarget(qwen35_9b_cfg, "blk.0.attn_gate.weight", 4096, 4096));
     try std.testing.expect(!isQwen35Dense9bSsmQkvQ4kTarget(qwen35_9b_cfg, "blk.0.attn_qkv.weight", 10240, 4096));
     try std.testing.expect(!isQwen35Dense9bSsmQkvQ4kTarget(qwen35_27b_cfg, "blk.0.attn_qkv.weight", 8192, 4096));
+    try std.testing.expect(!isQwen35Dense9bSsmQkvQ5kTarget(qwen35_27b_cfg, "blk.0.attn_qkv.weight", 8192, 4096));
     try std.testing.expect(isQwen35Dense9bSsmGateQ4kTarget(qwen35_9b_cfg, "blk.0.attn_gate.weight", 4096, 4096));
     try std.testing.expect(!isQwen35Dense9bSsmGateQ4kTarget(qwen35_9b_cfg, "blk.0.attn_qkv.weight", 8192, 4096));
     try std.testing.expect(!isQwen35Dense9bSsmGateQ4kTarget(qwen35_9b_cfg, "blk.0.attn_gate.weight", 6144, 4096));
@@ -32708,25 +34594,97 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expect(!isQwen35Dense9bFullAttnKvQ6kTarget(qwen35_27b_cfg, "blk.3.attn_k.weight", 1024, 4096));
 
     const qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 36, null);
-    try std.testing.expectEqual(@as(usize, 18), qwen_base);
-    try std.testing.expectEqual(@as(usize, 18), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 0, qwen_base, false));
-    try std.testing.expectEqual(@as(usize, 18), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 18, qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 36), qwen_base);
+    try std.testing.expectEqual(@as(usize, 36), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 36, 0, qwen_base, false));
 
     const nearby_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 33, null);
-    try std.testing.expectEqual(@as(usize, 17), nearby_qwen_base);
-    try std.testing.expectEqual(@as(usize, 17), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 33, 0, nearby_qwen_base, false));
-    try std.testing.expectEqual(@as(usize, 16), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 33, 17, nearby_qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 33), nearby_qwen_base);
+    try std.testing.expectEqual(@as(usize, 33), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 33, 0, nearby_qwen_base, false));
 
     const upper_nearby_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 40, null);
-    try std.testing.expectEqual(@as(usize, 20), upper_nearby_qwen_base);
-    try std.testing.expectEqual(@as(usize, 20), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 40, 0, upper_nearby_qwen_base, false));
-    try std.testing.expectEqual(@as(usize, 20), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 40, 20, upper_nearby_qwen_base, false));
+    try std.testing.expectEqual(@as(usize, 40), upper_nearby_qwen_base);
+    try std.testing.expectEqual(@as(usize, 40), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 40, 0, upper_nearby_qwen_base, false));
 
     const outside_balanced_qwen_base = InferenceEngine.queuedTokenMajorAsyncChunkTokensFromRequest(qwen35_9b_cfg, 41, null);
     try std.testing.expectEqual(@as(usize, 16), outside_balanced_qwen_base);
     try std.testing.expectEqual(@as(usize, 16), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 41, 0, outside_balanced_qwen_base, false));
     try std.testing.expectEqual(@as(usize, 16), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 41, 16, outside_balanced_qwen_base, false));
     try std.testing.expectEqual(@as(usize, 9), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 41, 32, outside_balanced_qwen_base, false));
+
+    var profile = RuntimeProfile{};
+    recordQwen35Dense9bLayerMajorPrefillProfile(&profile, qwen35_9b_cfg, 36, 36, 4, .full_attn_boundary);
+    try std.testing.expectEqual(@as(u32, 1), profile.qwen35_dense_prefill_requests);
+    try std.testing.expectEqual(@as(u32, 36), profile.qwen35_dense_prefill_prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 32), profile.qwen35_dense_prefill_target_layers);
+    try std.testing.expectEqual(@as(u32, 1152), profile.qwen35_dense_prefill_target_layer_tokens);
+    try std.testing.expectEqual(@as(u32, 4), profile.qwen35_dense_prefill_materialized_layers);
+    try std.testing.expectEqual(@as(u32, 144), profile.qwen35_dense_prefill_materialized_layer_tokens);
+    try std.testing.expectEqual(@as(u32, 3), profile.qwen35_dense_prefill_materialized_ssm_layers);
+    try std.testing.expectEqual(@as(u32, 1), profile.qwen35_dense_prefill_materialized_full_attn_layers);
+    try std.testing.expectEqual(@as(u32, 1008), profile.qwen35_dense_prefill_replay_layer_tokens);
+    try std.testing.expectEqual(@as(u32, 28), profile.qwen35_dense_prefill_replay_layers);
+    try std.testing.expectEqual(@as(u32, 21), profile.qwen35_dense_prefill_replay_ssm_layers);
+    try std.testing.expectEqual(@as(u32, 7), profile.qwen35_dense_prefill_replay_full_attn_layers);
+    try std.testing.expectEqual(@as(u32, 756), profile.qwen35_dense_prefill_replay_ssm_layer_tokens);
+    try std.testing.expectEqual(@as(u32, 252), profile.qwen35_dense_prefill_replay_full_attn_layer_tokens);
+    try std.testing.expectEqual(@as(u32, 28), profile.qwen35_dense_prefill_replay_dense_ffn_layers);
+    try std.testing.expectEqual(@as(u32, 14), profile.qwen35_dense_prefill_replay_graph_runs);
+    try std.testing.expectEqual(@as(u32, 7), profile.qwen35_dense_prefill_replay_graph_ssm_runs);
+    try std.testing.expectEqual(@as(u32, 7), profile.qwen35_dense_prefill_replay_graph_full_attn_runs);
+    try std.testing.expectEqual(@as(u32, 36), profile.qwen35_dense_prefill_token_major_replay_steps);
+    try std.testing.expectEqual(@as(u32, 4), profile.qwen35_dense_prefill_first_token_major_layer);
+    try std.testing.expectEqualStrings("full-attn-boundary", qwen35Dense9bPrefillFallbackReasonName(profile.qwen35_dense_prefill_first_fallback_reason));
+
+    const whole_model_schedule = qwen35Dense9bReplayGraphSchedule(qwen35_9b_cfg, 0);
+    try std.testing.expectEqual(@as(u32, 16), whole_model_schedule.runs);
+    try std.testing.expectEqual(@as(u32, 8), whole_model_schedule.ssm_runs);
+    try std.testing.expectEqual(@as(u32, 8), whole_model_schedule.full_attn_runs);
+
+    const next_ssm_run = qwen35Dense9bNextReplayRun(qwen35_9b_cfg, profile.qwen35_dense_prefill_first_token_major_layer);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .ssm), next_ssm_run.kind);
+    try std.testing.expectEqual(@as(u32, 4), next_ssm_run.start_layer);
+    try std.testing.expectEqual(@as(u32, 3), next_ssm_run.layers);
+    try std.testing.expectEqual(@as(u32, 7), next_ssm_run.stop_layer);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .full_attn), next_ssm_run.stop_kind);
+
+    const next_attn_run = qwen35Dense9bNextReplayRun(qwen35_9b_cfg, 7);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .full_attn), next_attn_run.kind);
+    try std.testing.expectEqual(@as(u32, 1), next_attn_run.layers);
+    try std.testing.expectEqual(@as(u32, 8), next_attn_run.stop_layer);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .ssm), next_attn_run.stop_kind);
+
+    const final_attn_run = qwen35Dense9bNextReplayRun(qwen35_9b_cfg, 31);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .full_attn), final_attn_run.kind);
+    try std.testing.expectEqual(@as(u32, 1), final_attn_run.layers);
+    try std.testing.expectEqual(@as(u32, 32), final_attn_run.stop_layer);
+    try std.testing.expectEqual(@as(Qwen35Dense9bPrefillLayerKind, .none), final_attn_run.stop_kind);
+
+    const prefix_cmd = MetalCommand{
+        .handle = null,
+        .dispatch_count = 17,
+        .barrier_count = 9,
+        .resource_barrier_resources = 5,
+        .barrier_enabled = false,
+    };
+    recordQwen35Dense9bLayerMajorPrefillWork(&profile, qwen35_9b_cfg, &prefix_cmd, 1234);
+    try std.testing.expectEqual(@as(u32, 17), profile.qwen35_dense_prefill_materialized_dispatch_calls);
+    try std.testing.expectEqual(@as(u32, 9), profile.qwen35_dense_prefill_materialized_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 5), profile.qwen35_dense_prefill_materialized_resource_barrier_resources);
+    try std.testing.expectEqual(@as(u64, 1234), profile.qwen35_dense_prefill_materialized_record_ns);
+
+    recordQwen35Dense9bLayerMajorPrefillWork(&profile, qwen35_27b_cfg, &prefix_cmd, 9999);
+    try std.testing.expectEqual(@as(u32, 17), profile.qwen35_dense_prefill_materialized_dispatch_calls);
+    try std.testing.expectEqual(@as(u64, 1234), profile.qwen35_dense_prefill_materialized_record_ns);
+
+    recordQwen35Dense9bQueuedReplayGpuDuration(&profile, qwen35_9b_cfg, 1_500_000, true);
+    recordQwen35Dense9bQueuedReplayGpuDuration(&profile, qwen35_9b_cfg, 500_000, false);
+    recordQwen35Dense9bQueuedReplayGpuDuration(&profile, qwen35_27b_cfg, 999_000, true);
+    try std.testing.expectEqual(@as(u64, 2_000_000), profile.qwen35_dense_prefill_replay_command_gpu_ns);
+    try std.testing.expectEqual(@as(u64, 1_500_000), profile.qwen35_dense_prefill_replay_final_command_gpu_ns);
+    try std.testing.expectEqual(@as(u64, 500_000), profile.qwen35_dense_prefill_replay_async_command_gpu_ns);
+    try std.testing.expectEqual(@as(u32, 2), profile.qwen35_dense_prefill_replay_command_gpu_samples);
+    try std.testing.expectEqual(@as(u32, 1), profile.qwen35_dense_prefill_replay_final_command_gpu_samples);
+    try std.testing.expectEqual(@as(u32, 1), profile.qwen35_dense_prefill_replay_async_command_gpu_samples);
 }
 
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
@@ -33740,6 +35698,9 @@ test "batched MoE Metal shaders compile" {
     var deinterleave_pipe = try loadShaderPipeline(ctx, "deinterleave");
     defer metal_pipeline.freePipeline(&deinterleave_pipe);
 
+    var deinterleave_batched_pipe = try loadShaderPipeline(ctx, "deinterleave_batched");
+    defer metal_pipeline.freePipeline(&deinterleave_batched_pipe);
+
     var flash_attn_pipe = try loadShaderPipeline(ctx, "flash_attn");
     defer metal_pipeline.freePipeline(&flash_attn_pipe);
 
@@ -33911,6 +35872,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q4k_k17408_pipe);
     var gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
     defer metal_pipeline.freePipeline(&gemm_q5k_pipe);
+    var gemm_q4k_gate_up_swiglu_pipe = try loadShaderPipeline(ctx, "gemm_q4k_gate_up_swiglu");
+    defer metal_pipeline.freePipeline(&gemm_q4k_gate_up_swiglu_pipe);
 
     var dmmv_pipe_k2048 = try loadShaderPipeline(ctx, "dmmv_q4k_k2048");
     defer metal_pipeline.freePipeline(&dmmv_pipe_k2048);
@@ -34030,6 +35993,7 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&ssm_conv1d_prefill_qwen_d4_pipe);
 
     try std.testing.expect(deinterleave_pipe.handle != null);
+    try std.testing.expect(deinterleave_batched_pipe.handle != null);
     try std.testing.expect(flash_attn_pipe.handle != null);
     try std.testing.expect(kv_cache_write_pipe.handle != null);
     try std.testing.expect(rope_pipe.handle != null);
@@ -34085,6 +36049,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q4k_k17408_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dense_gate_up_swiglu_k4096_pipe.handle != null);
     try std.testing.expect(gemm_q5k_pipe.handle != null);
+    try std.testing.expect(gemm_q4k_gate_up_swiglu_pipe.handle != null);
     try std.testing.expect(dmmv_pipe_k2048.handle != null);
     try std.testing.expect(dmmv_q4k_dual_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_dual_llama_pipe.handle != null);

@@ -26,6 +26,7 @@ const GemmPush = extern struct {
     ne0: i32,
     ne1: i32,
     src0_off: u32,
+    flags: u32 = 0,
 };
 
 fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
@@ -98,6 +99,7 @@ fn benchShape(
         .ne0 = @intCast(M),
         .ne1 = @intCast(N),
         .src0_off = 0,
+        .flags = 0,
     };
     const bufs = [_]*const MetalBuffer{ w_buf, x_buf, y_buf };
     const grid_x = (N + 31) / 32;

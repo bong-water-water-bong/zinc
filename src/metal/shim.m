@@ -624,6 +624,22 @@ uint64_t mtl_command_gpu_duration_ns(MetalCmd* cmd) {
     return (uint64_t)ns;
 }
 
+uint64_t mtl_wait_gpu_duration_ns(MetalCmd* cmd) {
+    if (!cmd) return 0;
+    [cmd->cmd_buf waitUntilCompleted];
+
+    if ([cmd->cmd_buf status] == MTLCommandBufferStatusError) {
+        fprintf(stderr, "Error: Metal command buffer failed: %s\n",
+                [[cmd->cmd_buf.error localizedDescription] UTF8String]);
+    }
+
+    const uint64_t gpu_ns = mtl_command_gpu_duration_ns(cmd);
+    cmd->cmd_buf = nil;
+    cmd->queue = nil;
+    free(cmd);
+    return gpu_ns;
+}
+
 void mtl_commit_wait_restart(MetalCmd* cmd) {
     if (!cmd || !cmd->cmd_buf || !cmd->queue) return;
 
