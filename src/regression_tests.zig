@@ -144,7 +144,7 @@ test "Vulkan batched projection chunk size matches selected shader family" {
     // co-located with the kpar/serial chunk loop further down.
     try expectContainsNear(src, fn_marker, "const SERIAL_MAX_COLS: u32 = 32;", 3200);
     try expectContainsNear(src, fn_marker, "const KPAR_MAX_COLS: u32 = 40;", 3200);
-    try expectContainsNear(src, fn_marker, "if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS", 4000);
+    try expectContainsNear(src, fn_marker, "if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS", 5000);
 }
 
 test "Vulkan batched projection kpar is allowed on Intel wave32" {

@@ -11248,6 +11248,18 @@ pub const InferenceEngine = struct {
             M == cfg.hidden_dim and
             K == cfg.ssm_d_inner and
             n_tokens >= 16;
+        // SSM wqkv projection: conv_channels x hidden_dim Q5_K (Qwen3.5-9B).
+        // This is the SSM-layer input projection (Q/K/V + conv input). On the
+        // 9B it is Q5_K while the 27B uses Q6_K (covered by the Q6_K mul_mm
+        // block above). Without this routing the wqkv falls through to the
+        // one-WG-per-row dmmv_q5k kpar path, which is far slower than the tiled
+        // mul_mm_q5k GEMM already used for the SSM-out projection of the same
+        // type. Route it through the same tiled pipeline.
+        const qwen_dense_ssm_wqkv_q5_shape = self.isQwenDenseHybridLayerMajorPrefillModel() and
+            tensor.info.type_ == .q5_k and
+            M == cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state and
+            K == cfg.hidden_dim and
+            n_tokens >= 16;
         const qwen_a3b_ssm_out_q8_shape = self.isQwen36A3bMoePrefillModel() and
             tensor.info.type_ == .q8_0 and
             M == cfg.hidden_dim and
@@ -11542,6 +11554,34 @@ pub const InferenceEngine = struct {
                 0, // a_offset (bytes)
                 0, // b_offset (floats)
                 0, // d_offset (floats)
+            );
+            return;
+        }
+        // SSM wqkv Q5_K projection (Qwen3.5-9B): route through the same tiled
+        // mul_mm_q5k GEMM used for the SSM-out projection above, instead of the
+        // one-WG-per-row dmmv_q5k kpar path. Same buffer layout and strides.
+        if (self.use_qwen36_q5_ssm_out_mul_mm and
+            qwen_dense_ssm_wqkv_q5_shape and
+            (K & 255) == 0 and
+            self.dmmv.pipeline_mul_mm_q5k != null)
+        {
+            try self.dmmv.recordMulMmQ5K(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                tensor.gpu_buffer.handle,
+                tensor.gpu_buffer.size,
+                x_buf.handle,
+                x_buf.size,
+                y_buf.handle,
+                y_buf.size,
+                M,
+                n_tokens,
+                K,
+                K,
+                M,
+                0,
+                0,
+                0,
             );
             return;
         }
