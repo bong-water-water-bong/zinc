@@ -2519,16 +2519,35 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     });
 
     if (directLmHeadQ4_0SelectedSourceHasGpuScore(selected_source)) {
-        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_reused phase={s} source={s} row={d} cols={d} gpu={d:.6} consumed_gpu_model_value=1", .{
-            tracking.ops.*,
-            directComputePhaseName(tracking.phase),
-            selected_source,
-            selection.best.index,
+        if (!consumeDirectLmHeadQ4_0SelectedRowPartial64(
+            state,
+            tracking,
+            q4_0_raw,
+            lm_head_rows,
             cols,
-            selection.best.value,
-        });
+            selected_source,
+            &selection.best,
+        )) {
+            log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_reused phase={s} source={s} row={d} cols={d} gpu={d:.6} consumed_gpu_model_value=1", .{
+                tracking.ops.*,
+                directComputePhaseName(tracking.phase),
+                selected_source,
+                selection.best.index,
+                cols,
+                selection.best.value,
+            });
+        }
     } else {
-        const selected_window_consumed = consumeDirectLmHeadQ4_0SelectedWindow(
+        const selected_row_consumed = consumeDirectLmHeadQ4_0SelectedRowPartial64(
+            state,
+            tracking,
+            q4_0_raw,
+            lm_head_rows,
+            cols,
+            selected_source,
+            &selection.best,
+        );
+        const selected_window_consumed = selected_row_consumed or consumeDirectLmHeadQ4_0SelectedWindow(
             state,
             tracking,
             q4_0_raw,
@@ -2805,6 +2824,16 @@ fn consumeDirectLmHeadQ4_0SelectedWindowAfterTop2(
     row_bytes: usize,
     selected: *ScoredToken,
 ) void {
+    if (consumeDirectLmHeadQ4_0SelectedRowPartial64(
+        state,
+        tracking,
+        q4_0_raw,
+        lm_head_rows,
+        cols,
+        "gpu_top2_rows",
+        selected,
+    )) return;
+
     if (row_bytes == 0) return;
     const max_rows_by_input: u32 = @intCast(direct_lm_head_q4_0_argmax_max_weight_bytes / row_bytes);
     const scratch_rows: u32 = @intCast(@min(state.row_scratch.len, @as(usize, std.math.maxInt(u32))));
@@ -2967,6 +2996,67 @@ fn consumeDirectLmHeadQ4_0SelectedWindow(
         cols,
         selected.index,
         absolute_best.value,
+        delta,
+    });
+    return true;
+}
+
+fn consumeDirectLmHeadQ4_0SelectedRowPartial64(
+    state: *ScalarDecodeState,
+    tracking: DirectComputeTracking,
+    q4_0_raw: []const u8,
+    lm_head_rows: u32,
+    cols: u32,
+    selected_source: []const u8,
+    selected: *ScoredToken,
+) bool {
+    if (selected.index >= lm_head_rows) return false;
+    if (cols == 0 or cols % 32 != 0) return false;
+    if (state.row_scratch.len < 64) return false;
+
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    const row_off = @as(usize, selected.index) * row_bytes;
+    if (row_off + row_bytes > q4_0_raw.len) return false;
+
+    const prior_value = selected.value;
+    const partials = state.row_scratch[0..64];
+    const gpu_value = tracking.boundary.dmmvQ4_0RowPartial64(
+        state.norm,
+        q4_0_raw[row_off..][0..row_bytes],
+        cols,
+        partials,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct LM-head Q4_0 selected-row K-parallel unavailable ({s}); retrying selected-window path", .{@errorName(err)});
+        return false;
+    };
+
+    const delta = @abs(gpu_value - prior_value);
+    if (delta > direct_lm_head_q4_0_best_row_tolerance) {
+        log.warn("M1 AMDGPU CS direct LM-head Q4_0 selected-row K-parallel mismatch: row={d} prior={d:.6} gpu={d:.6} abs_delta={d:.6}; retrying selected-window path", .{
+            selected.index,
+            prior_value,
+            gpu_value,
+            delta,
+        });
+        return false;
+    }
+
+    selected.value = gpu_value;
+    tracking.ops.* += 1;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.phase == .decode) {
+        if (tracking.decode_model_slices) |slices| slices.* += 1;
+    }
+    if (tracking.selected_token) |token| token.* = selected.index;
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=lm_head_q4_0_selected_row_kpartial64 phase={s} source={s} row={d} cols={d} partial_lanes=64 gpu={d:.6} abs_delta={d:.6} consumed_gpu_model_value=1", .{
+        tracking.ops.*,
+        directComputePhaseName(tracking.phase),
+        selected_source,
+        selected.index,
+        cols,
+        gpu_value,
         delta,
     });
     return true;

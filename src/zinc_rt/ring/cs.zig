@@ -209,6 +209,7 @@ const ioc_wait_cs = linux.IOCTL.IOWR(drm_ioctl_base, drm_command_base + drm_amdg
 const compute_pgm_rsrc1_value: u32 = 0xe0000001;
 const compute_pgm_rsrc1_vgpr12_value: u32 = (compute_pgm_rsrc1_value & ~@as(u32, 0x3f)) | 0x2;
 const compute_pgm_rsrc1_vgpr16_value: u32 = (compute_pgm_rsrc1_value & ~@as(u32, 0x3f)) | 0x3;
+const compute_pgm_rsrc1_vgpr32_value: u32 = (compute_pgm_rsrc1_value & ~@as(u32, 0x3f)) | 0x7;
 const compute_pgm_rsrc2_argmax_top2_value: u32 = 0x90; // 8 user SGPRs + workgroup-id-x.
 const compute_pgm_rsrc2_user8_vgpr_workitem_x_value: u32 = (8 << 1) | (1 << 11);
 
@@ -224,6 +225,7 @@ const shader_offset_argmax_u32_range: usize = 0x600;
 const shader_offset_dmmv_q4_0_argmax_row_range: usize = 0x700;
 const shader_offset_dmmv_q4_0_row_range_parallel: usize = 0x900;
 const shader_offset_dmmv_q8_0_row_range_parallel: usize = 0xb00;
+const shader_offset_dmmv_q4_0_row_partial64: usize = 0xd00;
 const shader_page_bytes: usize = 4096;
 
 // gfx1201 one-wave kernel assembled with:
@@ -753,6 +755,72 @@ const dmmv_q8_0_row_range_parallel_gfx1201 = [_]u32{
     0xbfb00000,
 };
 
+// gfx1201 wave64 Q4_0 single-row partial-sum DMMV kernel assembled with:
+//   llvm-mc-20 -triple=amdgcn-amd-amdhsa -mcpu=gfx1201 -filetype=obj
+//
+// ABI:
+//   s[0:1] = input f32 vector pointer
+//   s[2:3] = output f32 partial sums pointer (64 floats)
+//   s[4:5] = one Q4_0 weight row pointer
+//   s6     = cols, multiple of 32
+//   s7     = unused
+//   v0     = workitem_id_x / lane id
+//
+// Lanes 0..31 each accumulate one element from every Q4_0 block, then the host
+// reduces the 64 partials. This is scoped to one row so LM-head selected-row
+// validation can consume a K-parallel GPU-produced value without staging a
+// 64-row window.
+const dmmv_q4_0_row_partial64_gfx1201 = [_]u32{
+    0x7e100300,
+    0x7e020280,
+    0x362a109f,
+    0x362c108f,
+    0x850a8506,
+    0xbe8b0080,
+    0xbf090a0b,
+    0xbfa2001e,
+    0x960d920b,
+    0x7e14020d,
+    0xee048004,
+    0x00000002,
+    0x0000000a,
+    0x960ea00b,
+    0x8411820e,
+    0x30182a82,
+    0x4a181811,
+    0xee050000,
+    0x00000006,
+    0x0000000c,
+    0x8010820d,
+    0x4a162c10,
+    0xee040004,
+    0x00000003,
+    0x0000000b,
+    0xbf8903f7,
+    0x7e041702,
+    0x3608068f,
+    0x320a0684,
+    0x7e3c0290,
+    0x7c923d15,
+    0x02080905,
+    0x4a0808c8,
+    0x7e080b04,
+    0x10080902,
+    0x56020d04,
+    0x800b810b,
+    0xbfa0ffe0,
+    0x7e3c02a0,
+    0x7c923d08,
+    0x02020280,
+    0x301c1082,
+    0xee068002,
+    0x00800000,
+    0x0000000e,
+    0xbf800000,
+    0xbfb60003,
+    0xbfb00000,
+};
+
 comptime {
     std.debug.assert(shader_offset_argmax_top2 + argmax_top2_gfx1201.len * @sizeOf(u32) <= shader_offset_rms_norm_elem0);
     std.debug.assert(shader_offset_rms_norm_elem0 + rms_norm_elem0_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_f32_row_range);
@@ -762,7 +830,8 @@ comptime {
     std.debug.assert(shader_offset_argmax_u32_range + argmax_u32_range_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_argmax_row_range);
     std.debug.assert(shader_offset_dmmv_q4_0_argmax_row_range + dmmv_q4_0_argmax_row_range_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_row_range_parallel);
     std.debug.assert(shader_offset_dmmv_q4_0_row_range_parallel + dmmv_q4_0_row_range_parallel_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q8_0_row_range_parallel);
-    std.debug.assert(shader_offset_dmmv_q8_0_row_range_parallel + dmmv_q8_0_row_range_parallel_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
+    std.debug.assert(shader_offset_dmmv_q8_0_row_range_parallel + dmmv_q8_0_row_range_parallel_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_row_partial64);
+    std.debug.assert(shader_offset_dmmv_q4_0_row_partial64 + dmmv_q4_0_row_partial64_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
 }
 
 /// Result produced by the ordered-score argmax row-range kernel.
@@ -942,6 +1011,7 @@ pub const TokenBoundary = struct {
         for (dmmv_q4_0_argmax_row_range_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_argmax_row_range / @sizeOf(u32) + i] = word;
         for (dmmv_q4_0_row_range_parallel_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_row_range_parallel / @sizeOf(u32) + i] = word;
         for (dmmv_q8_0_row_range_parallel_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q8_0_row_range_parallel / @sizeOf(u32) + i] = word;
+        for (dmmv_q4_0_row_partial64_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_row_partial64 / @sizeOf(u32) + i] = word;
         storeFence();
 
         var bo_entries = [_]DrmAmdgpuBoListEntry{
@@ -1831,6 +1901,130 @@ pub const TokenBoundary = struct {
         const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
         if (signal_value != signal_expected) return error.SignalMismatch;
         for (0..rows) |i| output[i] = @bitCast(output_words[i]);
+    }
+
+    /// Dispatch the wave64 Q4_0 single-row partial-sum kernel and reduce it on the host.
+    ///
+    /// This lowers one real model row through a K-parallel CS kernel: lanes
+    /// 0..31 each accumulate one column per Q4_0 block, the kernel writes 64
+    /// partial sums, and the host performs the final scalar reduction. The
+    /// caller may pass `partials_out` to inspect the raw lane outputs.
+    /// @param input Input activation vector of length `cols`.
+    /// @param row_q4_0 Raw GGML Q4_0 bytes for one row; must hold `(cols/32)*18` bytes.
+    /// @param cols Inner dimension; must be a multiple of 32.
+    /// @param partials_out Optional output slice receiving 64 f32 partial sums.
+    /// @returns Reduced dot-product score.
+    pub fn dmmvQ4_0RowPartial64(
+        self: *TokenBoundary,
+        input: []const f32,
+        row_q4_0: []const u8,
+        cols: u32,
+        partials_out: ?[]f32,
+    ) !f32 {
+        if (cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
+        if (input.len < cols) return error.ShapeMismatch;
+        if (partials_out) |partials| {
+            if (partials.len < 64) return error.ShapeMismatch;
+        }
+        const row_bytes: usize = (@as(usize, cols) / 32) * 18;
+        if (row_q4_0.len < row_bytes) return error.ShapeMismatch;
+
+        const input_bytes = std.mem.sliceAsBytes(input[0..cols]);
+        const weight_off = std.mem.alignForward(usize, input_bytes.len, 64);
+        if (weight_off + row_bytes > self.input_map.len) return error.InputTooLarge;
+        if (64 * @sizeOf(f32) > self.output_map.len) return error.OutputTooLarge;
+
+        @memcpy(self.input_map[0..input_bytes.len], input_bytes);
+        @memcpy(self.input_map[weight_off..][0..row_bytes], row_q4_0[0..row_bytes]);
+
+        const output_words: [*]volatile u32 = @ptrCast(@alignCast(self.output_map.ptr));
+        const signal_words: [*]volatile u32 = @ptrCast(@alignCast(self.signal_map.ptr));
+        for (0..64) |i| output_words[i] = 0x7fc0_0000;
+        signal_words[0] = 0;
+        signal_words[1] = 0;
+        storeFence();
+
+        const signal_expected: u64 = 0x5A494E435254_C000 | @as(u64, self.submit_count + 1);
+        self.builder.reset();
+        try self.builder.writeNop(1);
+
+        const pgm_va = self.shader_va + shader_offset_dmmv_q4_0_row_partial64;
+        const pgm_lo: u32 = @truncate(pgm_va >> 8);
+        const pgm_hi: u32 = @truncate(pgm_va >> 40);
+        try self.builder.setShReg(packet.sh_reg_pgm_lo, &[_]u32{ pgm_lo, pgm_hi });
+        try self.builder.setShReg(packet.sh_reg_pgm_rsrc1, &[_]u32{
+            compute_pgm_rsrc1_vgpr32_value,
+            compute_pgm_rsrc2_user8_vgpr_workitem_x_value,
+        });
+        try self.builder.setShRegOne(packet.sh_reg_pgm_rsrc3, 0);
+        try self.builder.setShReg(packet.sh_reg_num_thread_x, &[_]u32{ 64, 1, 1 });
+        try self.builder.setShReg(packet.sh_reg_resource_limits, &[_]u32{
+            0,
+            0xffff_ffff,
+            0xffff_ffff,
+        });
+
+        const in_lo: u32 = @truncate(self.input_va);
+        const in_hi: u32 = @truncate(self.input_va >> 32);
+        const out_lo: u32 = @truncate(self.output_va);
+        const out_hi: u32 = @truncate(self.output_va >> 32);
+        const weight_va = self.input_va + @as(u64, weight_off);
+        const weight_lo: u32 = @truncate(weight_va);
+        const weight_hi: u32 = @truncate(weight_va >> 32);
+        try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
+            in_lo,
+            in_hi,
+            out_lo,
+            out_hi,
+            weight_lo,
+            weight_hi,
+            cols,
+            0,
+        });
+        try self.builder.dispatchDirectInitiator(1, 1, 1, packet.dispatch_initiator_compute);
+        try self.builder.releaseMemSignal(self.signal_va, signal_expected);
+        try self.builder.padToAlignment(64);
+        storeFence();
+
+        var ib_chunk_data: DrmAmdgpuCsChunkIb = .{
+            ._pad = 0,
+            .flags = AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
+            .va_start = self.ib_va,
+            .ib_bytes = 0,
+            .ip_type = self.ip_type,
+            .ip_instance = 0,
+            .ring = 0,
+        };
+        var chunks = [_]DrmAmdgpuCsChunk{.{
+            .chunk_id = AMDGPU_CHUNK_ID_IB,
+            .length_dw = @sizeOf(DrmAmdgpuCsChunkIb) / @sizeOf(u32),
+            .chunk_data = @intFromPtr(&ib_chunk_data),
+        }};
+        var chunk_ptrs = [_]u64{@intFromPtr(&chunks[0])};
+        self.last_fence_handle = try submitBuilderAndWait(
+            self.file,
+            self.ctx_id,
+            self.ip_type,
+            self.bo_list_handle,
+            &self.builder,
+            &ib_chunk_data,
+            &chunk_ptrs,
+            &self.last_ib_bytes,
+            &self.last_wait_status,
+        );
+        self.submit_count += 1;
+
+        const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
+        if (signal_value != signal_expected) return error.SignalMismatch;
+
+        var sum: f32 = 0.0;
+        for (0..64) |i| {
+            const partial: f32 = @bitCast(output_words[i]);
+            if (!std.math.isFinite(partial)) return error.NonFiniteOutput;
+            if (partials_out) |partials| partials[i] = partial;
+            sum += partial;
+        }
+        return sum;
     }
 
     /// Dispatch one or more 64-row wave-lane Q4_0 DMMV chunks in a single CS submission.
