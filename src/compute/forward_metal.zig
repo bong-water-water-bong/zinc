@@ -902,6 +902,27 @@ fn shouldUseDenseQwen35QueuedPrefillTokenCommand(cfg: ModelConfig, in_prefill_ph
     return in_prefill_phase and has_embed_override and defaultQwen35Dense9bQueuedPrefillEnabled(cfg);
 }
 
+fn canFuseDenseFfnNextAttnNorm(
+    cfg: ModelConfig,
+    in_prefill_phase: bool,
+    layer_shared_cmd_present: bool,
+    use_dense_layer_cmd: bool,
+    next_layer_idx: usize,
+    layer_count: usize,
+    next_layer_scale: f32,
+) bool {
+    if (!layer_shared_cmd_present) return false;
+    if (next_layer_idx >= layer_count) return false;
+    if (next_layer_scale == 0.0) return false;
+    if (!isFullAttentionLayer(cfg, next_layer_idx)) return false;
+
+    // Dense-only decode already used this tail fusion. Qwen3.5 9B prompt
+    // prefill also records token-major layers into one shared command, so the
+    // same residual+next-norm handoff is valid at dense→full-attn boundaries.
+    return use_dense_layer_cmd or
+        (in_prefill_phase and defaultQwen35Dense9bQueuedPrefillEnabled(cfg));
+}
+
 fn hybridDecodeCommandGroupLayers(cfg: ModelConfig) usize {
     if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
         // One layer per command buffer leaves Qwen3.6 27B with 64 async submits
@@ -26511,11 +26532,19 @@ fn runDecodeStep(
                 // dispatch + barrier at the layer tail is skipped when this
                 // path fires (see `layer_output_scale_fused_into_post_norm`).
                 const can_fold_layer_scale_here = layer_output_scale != 1.0 and !layer_output_scale_folded_pre;
-                const can_fuse_next_attn_norm = layer_shared_cmd != null and
-                    use_dense_layer_cmd and
-                    next_layer_idx_u < layer_count and
-                    engine.layer_output_scales[next_layer_idx_u] != 0.0 and
-                    ((@as(u32, @intCast(next_layer_idx_u)) + 1) % full_attn_interval == 0);
+                const next_layer_scale = if (next_layer_idx_u < engine.layer_output_scales.len)
+                    engine.layer_output_scales[next_layer_idx_u]
+                else
+                    0.0;
+                const can_fuse_next_attn_norm = canFuseDenseFfnNextAttnNorm(
+                    cfg,
+                    engine.in_prefill_phase,
+                    layer_shared_cmd != null,
+                    use_dense_layer_cmd,
+                    next_layer_idx_u,
+                    layer_count,
+                    next_layer_scale,
+                );
                 const can_fuse_final_norm_tail = emit_logits and
                     layer_shared_cmd != null and
                     shared_cmd == null and
@@ -32918,6 +32947,14 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_9b_cfg, true, false, 30, 32));
     try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_9b_cfg, false, false, 31, 32));
     try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_27b_cfg, true, false, 63, 64));
+
+    try std.testing.expect(canFuseDenseFfnNextAttnNorm(qwen35_9b_cfg, true, true, false, 7, 32, 1.0));
+    try std.testing.expect(!canFuseDenseFfnNextAttnNorm(qwen35_9b_cfg, false, true, false, 7, 32, 1.0));
+    try std.testing.expect(!canFuseDenseFfnNextAttnNorm(qwen35_9b_cfg, true, false, false, 7, 32, 1.0));
+    try std.testing.expect(!canFuseDenseFfnNextAttnNorm(qwen35_9b_cfg, true, true, false, 6, 32, 1.0));
+    try std.testing.expect(!canFuseDenseFfnNextAttnNorm(qwen35_9b_cfg, true, true, false, 7, 32, 0.0));
+    try std.testing.expect(!canFuseDenseFfnNextAttnNorm(qwen35_27b_cfg, true, true, false, 7, 64, 1.0));
+    try std.testing.expect(canFuseDenseFfnNextAttnNorm(qwen35_27b_cfg, false, true, true, 7, 64, 1.0));
 
     try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_9b_cfg, "output.weight", 248320, 4096));
     try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_9b_cfg, "output.weight", 248320, 5120));
