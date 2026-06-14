@@ -50,6 +50,12 @@ const CLAUDE_EFFORT = "max";
 const CLAUDE_MODEL = process.env.ZINC_CLAUDE_MODEL ?? "claude-opus-4-7[1m]";
 const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
 const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh";
+// opencode (https://opencode.ai) headless agent. Drives the same loop as
+// claude/codex via `opencode run`. Default model is GLM-5.2; override with
+// ZINC_OPENCODE_MODEL (provider/model) and optionally pick an opencode agent
+// persona with ZINC_OPENCODE_AGENT.
+const OPENCODE_MODEL = process.env.ZINC_OPENCODE_MODEL ?? "zai-coding-plan/glm-5.2";
+const OPENCODE_AGENT = process.env.ZINC_OPENCODE_AGENT ?? "";
 
 function loadEnv(): Record<string, string> {
   const envPath = join(REPO_ROOT, ".env");
@@ -151,7 +157,11 @@ const MODELS: Record<string, ModelTarget> = {
   qwen359b: {
     key: "qwen359b",
     name: "Qwen3.5-9B",
-    path: envOrDefault("ZINC_RDNA_QWEN35_9B_MODEL", "/root/models/Qwen3.5-9B-Q4_K_M.gguf"),
+    // Node-aware: prefer an explicit model key, then the selected node's own
+    // REMOTE_MODEL (on rdna2 that is the managed 9B cache path), then the
+    // /root/models layout used by rdna1. Do NOT fall back to the generic
+    // ZINC_RDNA_REMOTE_MODEL — on this repo it points at the 8B, not the 9B.
+    path: envOrDefault("ZINC_RDNA_QWEN35_9B_MODEL", rdnaEnvValue("REMOTE_MODEL") ?? "/root/models/Qwen3.5-9B-Q4_K_M.gguf"),
     promptMode: "raw",
     coherencePromptMode: "chat",
     envVar: "ZINC_RDNA_QWEN35_9B_MODEL",
@@ -719,6 +729,59 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
     llamaCppSuccessRule: "Project success rule (from MULTI_HOUR_EFFORT_17_RDNA_QWEN35_9B_PREFILL.md): close the Qwen3.5-9B RDNA prefill gap without giving back ZINC's decode lead. Primary target is decode-extended prefill, where llama.cpp is 855.82 tok/s and ZINC is 105.91 tok/s in the published artifact. A keep must preserve coherent output and should be checked against core/context-medium/context-long before being treated as public progress.",
   },
+  25: {
+    // RDNA2-node sibling of effort 17: consumer RX 9070 XT (GFX1201, Mesa
+    // 26.0.0-devel). Select with ZINC_RDNA_NODE=rdna2. Cycle-0 already landed
+    // the node-specific DP4a regression fix (6.8 -> ~171 tok/s); this effort
+    // chases the remaining prefill gap to llama.cpp's 973 tok/s ceiling.
+    doc: "MULTI_HOUR_EFFORT_25_RDNA2_907XT_QWEN9B_PREFILL.md",
+    summary: "RDNA2 (RX 9070 XT / Mesa 26) Qwen 3.5 9B prefill recovery (opencode/GLM-5.2)",
+    metricMode: "prefill",
+    primaryMetricLabel: "Qwen3.5-9B RDNA2 prefill tok/s",
+    defaultModel: "qwen359b",
+    benchmarkPrompt: QWEN35_9B_LONG_DRAFT_PREFILL_PROMPT,
+    benchmarkMaxTokens: 8,
+    benchmarkMethod: "site-aligned decode-extended Long Coding Plan prefill benchmark on RDNA2 (RX 9070 XT, Mesa 26.0.0-devel) for Qwen3.5-9B Q4_K_M; run with ZINC_RDNA_NODE=rdna2 --model qwen359b",
+    // Fixed cycle-0 baseline is ~171 tok/s; the DP4a regression drops it to
+    // ~7. A floor of 80 catches "regression returned or worse" without
+    // false-tripping normal variance.
+    minHealthyTokPerSec: 80,
+    knownFlatCategories: [
+      "Do not re-enable DP4a dense FFN for the 9B on this node. The cycle-0 fix deliberately defaults it off when amd_rdna4 + cooperative_matrix are both exposed: the int8 DP4a gate+up+SwiGLU shader runs ~25x slower than the branchless path on Mesa 26.0.0-devel. ZINC_QWEN_DENSE_FFN_DP4A=1 reproduces 6.8 tok/s. Only revisit after Mesa 26.0 stable ships and a paired measurement shows the shader is fast again.",
+      "Do not add the coopmat+rdna4 guard to the SSM DP4a gates (qwenDenseSsmOutDp4aEnabled / qwenDenseSsmProjDp4aEnabled / qwenDenseProjectionDp4aEnabled) expecting a win. Tested cycle-0: SSM moved 165.8 -> 163.5 ms (noise). The 9B SSM projections are NOT on the DP4a path.",
+      "Do not sweep ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS. Forcing prefix layers 3/8/16/31 changed nothing — the layer-major prefix path already engages at prefix=3; the cost is inside it, not in layer count.",
+      "Do not optimize decode. Qwen3.5-9B decode (~39.6 tok/s) already beats llama.cpp (21.7 tok/s) by ~75% on this node. The low absolute number is a card/driver characteristic hitting both runtimes; it is not a ZINC regression.",
+      "Do not run on RDNA1. An autonomous zinc_rt_autopilot loop owns RDNA1 and overwrites zig-out/bin/zinc with its ZINC_RT build. This effort is RDNA2-only (ZINC_RDNA_NODE=rdna2).",
+      "Do not trust the 'Modeled decode bandwidth' line — its 576 GB/s theoretical is hardcoded for the R9700 and the MB/token model is inflated on this node. Use wall-clock tok/s.",
+    ],
+    structuralSwingIdeas: [
+      "[LARGEST SINGLE SUB-PHASE] Eliminate the standalone dense-FFN residual add (dense_ffn_residual_acc ~74 ms). dispatchScaleAcc(hidden += down_out) runs as its own dispatch + barrier per layer and is launch-overhead-bound for the bytes touched. Either fuse the residual into the dense-down projection epilogue (a down+acc shader variant that writes hidden[i] += result[i], removing 32 dispatches + 32 barriers), or make scale_accumulate.comp process more elements per workgroup via a stride loop. Either way measure prefill AND decode (scale_accumulate is shared) and confirm bit-identical output.",
+      "SSM proj (~73 ms) + qkv (~59 ms) are the largest matmul sub-phases and run on the generic batched matmul. This is the structural GEMM gap to llama.cpp (973 tok/s). Multi-cycle work: collect paired RADV_DEBUG=shaderstats for the active SSM projection shader before editing, and prefer layer-major batching of wqkv/z with token-order recurrence preserved over single-shader tile tweaks.",
+      "dense_ffn down_matmul (~60 ms) is on the generic path (DP4a down intentionally off here). If the down+acc fusion lands it partially absorbs this bucket; otherwise shaderstats-first like the SSM track.",
+      "Before any kernel edit, capture a fresh ZINC_PREFILL_PROFILE=1 run on RDNA2 and confirm the exact sub-phase you intend to move. Add missing phase labels as a foundation step before any optimization commit.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        focus: "Read qwenDenseFfnDp4aEnabled (the cycle-0 gate), dispatchQwen36DenseDown, dispatchScaleAcc, the dense_ffn_residual_acc phase (~20650), and dispatchQwen36DenseGateUpDp4a before editing.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/shaders/scale_accumulate.comp",
+        focus: "Vec4-coalesced residual-add shader; candidate for a stride-loop to cut WG launch count, shared by all dispatchScaleAcc callers.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_17_RDNA_QWEN35_9B_PREFILL.md",
+        focus: "The R9700/RDNA1 sibling. Same model + metric, but its baselines and accepted paths assume Mesa 25.0.7 without cooperative matrix — do not port DP4a enablement from it to this node.",
+      },
+    ],
+    // llama.cpp ceiling measured on THIS node (9070 XT, Mesa 26.0.0-devel,
+    // build 9a532ae, Vulkan/RADV). pp512 / tg256 raw. Decode is already won;
+    // these frame the prefill gap only.
+    llamaCppBaselines: [
+      { scenario: "decode-extended",   promptTokens: 64,  prefillTokPerSec: 973.49, decodeTokPerSec: 21.74, isPrimary: true },
+    ],
+    llamaCppSuccessRule: "Node-specific success rule: close the Qwen3.5-9B prefill gap on the RX 9070 XT (llama.cpp 973 tok/s vs ZINC ~171 tok/s after cycle-0) without regressing decode (ZINC 39.6 already beats llama 21.7). Do not re-enable DP4a dense FFN on this coopmat RDNA4 node.",
+  },
   18: {
     doc: "MULTI_HOUR_EFFORT_18_RDNA_GEMMA26_PREFILL.md",
     summary: "RDNA4 Gemma 4 26B-A4B MoE prefill parity with llama.cpp",
@@ -1011,7 +1074,7 @@ function isPrefillMetricLabel(label: string | undefined): boolean {
 
 // -- CLI parsing -------------------------------------------------------------
 
-type AgentType = "claude" | "codex";
+type AgentType = "claude" | "codex" | "opencode";
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -1044,7 +1107,7 @@ function parseArgs() {
     console.error(`  --effort <${effortKeys}>         Optimization to run (required)`);
     console.error("  --cycles N               Max cycles (default: 20)");
     console.error(`  --model NAME             Model: ${MODEL_KEYS} (default: effort-specific, else qwen36b)`);
-    console.error("  --agent claude|codex     AI agent to use (default: codex)");
+    console.error("  --agent claude|codex|opencode   AI agent to use (default: codex)");
     console.error("  --resume                 Resume from previous run (read history from log)");
     console.error("  --analyze                Print controller analysis from saved run state");
     console.error("  --dry-run                Build+bench baseline only, skip agent");
@@ -1055,8 +1118,8 @@ function parseArgs() {
     }
     process.exit(1);
   }
-  if (agent !== "claude" && agent !== "codex") {
-    console.error(`Unknown agent: ${agent}. Use 'claude' or 'codex'.`);
+  if (agent !== "claude" && agent !== "codex" && agent !== "opencode") {
+    console.error(`Unknown agent: ${agent}. Use 'claude', 'codex', or 'opencode'.`);
     process.exit(1);
   }
   if (!(model in MODELS)) {
@@ -3268,6 +3331,15 @@ async function spawnAgent(
       streamOutput: true,
       stdoutLineFormatter: (line) => formatCodexStreamLine(line),
     });
+  } else if (agent === "opencode") {
+    // opencode: headless `opencode run` (default GLM-5.2). Same SSH/rsync
+    // contract as codex — the agent edits code locally, the loop syncs to the
+    // RDNA node and benchmarks.
+    result = await runCommand("opencode", opencodeExecArgs(prompt), {
+      cwd: REPO_ROOT,
+      timeout: 7_200_000,
+      streamOutput: true,
+    });
   } else {
     // Claude: uses stream-json for rich tool-use display
     const claudeState: ClaudeStreamState = {
@@ -3349,6 +3421,18 @@ export function codexExecArgs(prompt: string): string[] {
     CODEX_MODEL,
     prompt,
   ];
+}
+
+export function opencodeExecArgs(prompt: string): string[] {
+  // `opencode run` is the headless, non-interactive mode (see
+  // https://opencode.ai). It starts its own server, drives the model to a
+  // final message, and exits. --dangerously-skip-permissions auto-approves
+  // tool use so the loop is not blocked on prompts; the loop itself still
+  // owns git keep/revert, and the prompt forbids destructive git ops.
+  const args = ["run", "--dangerously-skip-permissions", "--model", OPENCODE_MODEL];
+  if (OPENCODE_AGENT.length > 0) args.push("--agent", OPENCODE_AGENT);
+  args.push(prompt);
+  return args;
 }
 
 function statePathForEffort(effort: number): string {
@@ -3712,7 +3796,9 @@ async function main() {
   console.log(c("1;37", boxLine(`RDNA node: ${SELECTED_RDNA_NODE ?? "(default)"}`)));
   const agentDetails = agent === "claude"
     ? ` (${CLAUDE_MODEL} effort=${CLAUDE_EFFORT})`
-    : ` (${CODEX_MODEL} effort=${CODEX_REASONING_EFFORT})`;
+    : agent === "opencode"
+      ? ` (${OPENCODE_MODEL}${OPENCODE_AGENT.length > 0 ? `, agent=${OPENCODE_AGENT}` : ""})`
+      : ` (${CODEX_MODEL} effort=${CODEX_REASONING_EFFORT})`;
   console.log(c("1;37", boxLine(`Agent: ${agent}${agentDetails}`)));
   console.log(c("1;37", boxLine(`Cycles this run: ${cycles}`)));
   if (resume) console.log(c("1;37", boxLine("Resuming from previous run")));
@@ -3991,6 +4077,10 @@ ${result.buildOutput.slice(-2000)}
         await runCommand("codex", codexExecArgs(fixPrompt), {
           cwd: REPO_ROOT, timeout: 600_000, streamOutput: true,
           stdoutLineFormatter: (line) => formatCodexStreamLine(line),
+        });
+      } else if (agent === "opencode") {
+        await runCommand("opencode", opencodeExecArgs(fixPrompt), {
+          cwd: REPO_ROOT, timeout: 600_000, streamOutput: true,
         });
       } else {
         const fixState: ClaudeStreamState = {
