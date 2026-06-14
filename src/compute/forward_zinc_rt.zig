@@ -1366,6 +1366,8 @@ const ScalarDecodeState = struct {
     ssm_states: []f32,
     moe_expert_workers: usize,
     moe_topk_active: u32,
+    direct_router_row_range_successes: u32 = 0,
+    direct_router_row_range_trust_after_successes: u32,
     direct_ssm_q8_row_range_max_successes: u32,
     direct_ssm_q8_row_range_trust_after_successes: u32,
     decode_phase: bool = false,
@@ -1451,6 +1453,7 @@ const ScalarDecodeState = struct {
             .ssm_states = try allocator.alloc(f32, ssm_state_elems),
             .moe_expert_workers = moeExpertWorkerCount(model.effectiveMoeTopK(), std.Thread.getCpuCount() catch 1),
             .moe_topk_active = model.effectiveMoeTopK(),
+            .direct_router_row_range_trust_after_successes = directRouterRowRangeTrustAfterSuccesses(),
             .direct_ssm_q8_row_range_max_successes = directSsmQ8_0RowRangeMaxSuccesses(),
             .direct_ssm_q8_row_range_trust_after_successes = directSsmQ8_0TrustAfterSuccesses(),
         };
@@ -1565,6 +1568,7 @@ const DirectComputeTracking = struct {
 const direct_decode_model_slice_cadence_default: u32 = 0;
 const direct_router_decode_enabled_default = true;
 const direct_router_decode_cadence_default: u32 = 32;
+const direct_router_row_range_trust_after_successes_default: u32 = 1;
 const direct_ssm_q8_0_row_range_max_successes_default: u32 = 2;
 const direct_ssm_q8_0_trust_after_successes_default: u32 = 1;
 
@@ -1599,6 +1603,26 @@ fn directRouterDecodeCadenceForEnv(raw_override: ?[]const u8) u32 {
 
 fn directRouterDecodeCadence() u32 {
     return directRouterDecodeCadenceForEnv(std.posix.getenv("ZINC_RT_DIRECT_ROUTER_DECODE_CADENCE"));
+}
+
+fn directRouterRowRangeTrustAfterSuccessesForEnv(raw_override: ?[]const u8) u32 {
+    const raw = raw_override orelse return direct_router_row_range_trust_after_successes_default;
+    return std.fmt.parseInt(u32, raw, 10) catch direct_router_row_range_trust_after_successes_default;
+}
+
+fn directRouterRowRangeTrustAfterSuccesses() u32 {
+    return directRouterRowRangeTrustAfterSuccessesForEnv(std.posix.getenv("ZINC_RT_DIRECT_ROUTER_TRUST_AFTER_SUCCESSES"));
+}
+
+fn shouldTrustDirectRouterRowRangeWithoutOracle(successes: u32, threshold: u32) bool {
+    return threshold != 0 and successes >= threshold;
+}
+
+fn canTrustDirectRouterRowRangeWithoutOracle(state: *const ScalarDecodeState, tensor_type: gguf.GGMLType) bool {
+    return tensor_type == .q8_0 and shouldTrustDirectRouterRowRangeWithoutOracle(
+        state.direct_router_row_range_successes,
+        state.direct_router_row_range_trust_after_successes,
+    );
 }
 
 fn shouldTrackDirectDecodeModelSlice(generated_len: usize, cadence: u32) bool {
@@ -1783,6 +1807,9 @@ fn generateScalarHybrid(
         } else {
             log.info("M1 AMDGPU CS direct router execution disabled by ZINC_RT_DIRECT_ROUTER_DECODE", .{});
         }
+        log.info("M1 AMDGPU CS direct router Q8_0 row-range trust_after_successes={d}", .{
+            state.direct_router_row_range_trust_after_successes,
+        });
         log.info("M1 AMDGPU CS direct SSM F32/Q8_0 row-range budget: {d} successes per tracked decode slice per alpha/beta kind; trust_after_successes={d}", .{
             state.direct_ssm_q8_row_range_max_successes,
             state.direct_ssm_q8_row_range_trust_after_successes,
@@ -5528,11 +5555,15 @@ const direct_router_row_range_tolerance: f32 = 0.01;
 const direct_router_parallel64_rows: u32 = 64;
 const direct_router_parallel64_half_rows: u32 = direct_router_parallel64_rows / 2;
 
-fn directRouterRowRangeOpName(tensor_type: gguf.GGMLType, used_parallel64: bool) []const u8 {
+fn directRouterRowRangeOpName(tensor_type: gguf.GGMLType, used_parallel64: bool, trusted: bool) []const u8 {
     return switch (tensor_type) {
-        .f32 => "router_f32_row_range",
-        .q8_0 => if (used_parallel64) "router_q8_0_row_range_parallel64" else "router_q8_0_row_range",
-        .q4_0 => if (used_parallel64) "router_q4_0_row_range_parallel64" else "router_q4_0_row_range",
+        .f32 => if (trusted) "router_f32_row_range_trusted" else "router_f32_row_range",
+        .q8_0 => if (used_parallel64)
+            if (trusted) "router_q8_0_row_range_parallel64_trusted" else "router_q8_0_row_range_parallel64"
+        else if (trusted) "router_q8_0_row_range_trusted" else "router_q8_0_row_range",
+        .q4_0 => if (used_parallel64)
+            if (trusted) "router_q4_0_row_range_parallel64_trusted" else "router_q4_0_row_range_parallel64"
+        else if (trusted) "router_q4_0_row_range_trusted" else "router_q4_0_row_range",
         else => "router_unsupported_row_range",
     };
 }
@@ -5695,54 +5726,72 @@ fn consumeDirectRouterRowRangePrimary(
 
     topKSoftmaxCpu(gpu_logits, n_used, state.expert_ids, state.expert_weights);
 
+    const trusted_no_oracle = canTrustDirectRouterRowRangeWithoutOracle(state, router_w.type_);
     var max_selected_delta: f32 = 0.0;
     var max_selected_slot: u32 = 0;
     var max_selected_row: u32 = 0;
-    for (0..n_used) |slot| {
-        const row = state.expert_ids[slot];
-        if (row >= rows) {
-            log.warn("M1 AMDGPU CS direct router primary selected out-of-range expert row {d}; router falls back to host matvec", .{row});
+    if (!trusted_no_oracle) {
+        for (0..n_used) |slot| {
+            const row = state.expert_ids[slot];
+            if (row >= rows) {
+                log.warn("M1 AMDGPU CS direct router primary selected out-of-range expert row {d}; router falls back to host matvec", .{row});
+                return false;
+            }
+            const cpu_value = dotDirectRaw(router_w.raw, router_w.type_, row, cols, state.ffn_norm, null) catch {
+                log.warn("M1 AMDGPU CS direct router primary selected-row CPU oracle failed; router falls back to host matvec", .{});
+                return false;
+            };
+            const gpu_value = gpu_logits[row];
+            const delta = @abs(cpu_value - gpu_value);
+            if (delta > max_selected_delta) {
+                max_selected_delta = delta;
+                max_selected_slot = @intCast(slot);
+                max_selected_row = row;
+            }
+        }
+        if (max_selected_delta > direct_router_row_range_tolerance) {
+            log.warn("M1 AMDGPU CS direct router primary selected-row mismatch: slot={d} row={d} max_abs_delta={d:.6}; router falls back to host matvec", .{
+                max_selected_slot,
+                max_selected_row,
+                max_selected_delta,
+            });
             return false;
         }
-        const cpu_value = dotDirectRaw(router_w.raw, router_w.type_, row, cols, state.ffn_norm, null) catch {
-            log.warn("M1 AMDGPU CS direct router primary selected-row CPU oracle failed; router falls back to host matvec", .{});
-            return false;
-        };
-        const gpu_value = gpu_logits[row];
-        const delta = @abs(cpu_value - gpu_value);
-        if (delta > max_selected_delta) {
-            max_selected_delta = delta;
-            max_selected_slot = @intCast(slot);
-            max_selected_row = row;
-        }
-    }
-    if (max_selected_delta > direct_router_row_range_tolerance) {
-        log.warn("M1 AMDGPU CS direct router primary selected-row mismatch: slot={d} row={d} max_abs_delta={d:.6}; router falls back to host matvec", .{
-            max_selected_slot,
-            max_selected_row,
-            max_selected_delta,
-        });
-        return false;
     }
 
     state.direct_router_row_range_done = true;
+    state.direct_router_row_range_successes += 1;
     tracking.ops.* += dispatch_result.chunks;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
     tracking.real_model_slice.* = true;
     if (tracking.decode_model_slices) |slices| slices.* += dispatch_result.chunks;
-    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s}_primary phase=decode coverage=full rows={d} experts={d} cols={d} chunks={d} selected_topk={d} max_selected_delta={d:.6} max_selected_slot={d} max_selected_row={d} consumed_gpu_model_value=1", .{
-        tracking.ops.*,
-        directRouterRowRangeOpName(router_w.type_, dispatch_result.used_parallel64),
-        rows,
-        cfg.n_experts,
-        cols,
-        dispatch_result.chunks,
-        n_used,
-        max_selected_delta,
-        max_selected_slot,
-        max_selected_row,
-    });
+    const op_name = directRouterRowRangeOpName(router_w.type_, dispatch_result.used_parallel64, trusted_no_oracle);
+    if (trusted_no_oracle) {
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s}_primary phase=decode coverage=full rows={d} experts={d} cols={d} chunks={d} selected_topk={d} trust_after_successes={d} validation=finite_only consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            op_name,
+            rows,
+            cfg.n_experts,
+            cols,
+            dispatch_result.chunks,
+            n_used,
+            state.direct_router_row_range_trust_after_successes,
+        });
+    } else {
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s}_primary phase=decode coverage=full rows={d} experts={d} cols={d} chunks={d} selected_topk={d} max_selected_delta={d:.6} max_selected_slot={d} max_selected_row={d} consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            op_name,
+            rows,
+            cfg.n_experts,
+            cols,
+            dispatch_result.chunks,
+            n_used,
+            max_selected_delta,
+            max_selected_slot,
+            max_selected_row,
+        });
+    }
     return true;
 }
 
@@ -5818,7 +5867,7 @@ fn consumeDirectRouterRowRange(
     }
     log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase={s} coverage={s} rows={d} experts={d} cols={d} chunks={d} max_abs_delta={d:.6} max_row={d} consumed_gpu_model_value=1", .{
         tracking.ops.*,
-        directRouterRowRangeOpName(router_w.type_, dispatch_result.used_parallel64),
+        directRouterRowRangeOpName(router_w.type_, dispatch_result.used_parallel64, false),
         directComputePhaseName(tracking.phase),
         directRouterCoverageName(full_coverage),
         rows,
@@ -9433,6 +9482,15 @@ test "direct decode model slice cadence always covers first decode step" {
     try std.testing.expectEqual(@as(u32, 16), directRouterDecodeCadenceForEnv("16"));
     try std.testing.expectEqual(@as(u32, 0), directRouterDecodeCadenceForEnv("0"));
     try std.testing.expectEqual(@as(u32, direct_router_decode_cadence_default), directRouterDecodeCadenceForEnv("bad"));
+    try std.testing.expectEqual(@as(u32, direct_router_row_range_trust_after_successes_default), directRouterRowRangeTrustAfterSuccessesForEnv(null));
+    try std.testing.expectEqual(@as(u32, 0), directRouterRowRangeTrustAfterSuccessesForEnv("0"));
+    try std.testing.expectEqual(@as(u32, 3), directRouterRowRangeTrustAfterSuccessesForEnv("3"));
+    try std.testing.expectEqual(@as(u32, direct_router_row_range_trust_after_successes_default), directRouterRowRangeTrustAfterSuccessesForEnv("bad"));
+    try std.testing.expect(!shouldTrustDirectRouterRowRangeWithoutOracle(1, 0));
+    try std.testing.expect(!shouldTrustDirectRouterRowRangeWithoutOracle(0, 1));
+    try std.testing.expect(shouldTrustDirectRouterRowRangeWithoutOracle(1, 1));
+    try std.testing.expect(!shouldTrustDirectRouterRowRangeWithoutOracle(1, 2));
+    try std.testing.expect(shouldTrustDirectRouterRowRangeWithoutOracle(2, 2));
     try std.testing.expect(!shouldTrackDirectRouterDecode(0, false, true, 32));
     try std.testing.expect(!shouldTrackDirectRouterDecode(32, true, true, 32));
     try std.testing.expect(!shouldTrackDirectRouterDecode(32, false, false, 32));
@@ -9500,11 +9558,12 @@ test "direct router row-range names full parallel chunks" {
     try std.testing.expect(!canUseDirectRouterQ4_0Parallel64(32));
     try std.testing.expect(canUseDirectRouterQ4_0Parallel64(64));
     try std.testing.expect(canUseDirectRouterQ4_0Parallel64(256));
-    try std.testing.expectEqualStrings("router_q8_0_row_range", directRouterRowRangeOpName(.q8_0, false));
-    try std.testing.expectEqualStrings("router_q8_0_row_range_parallel64", directRouterRowRangeOpName(.q8_0, true));
-    try std.testing.expectEqualStrings("router_q4_0_row_range", directRouterRowRangeOpName(.q4_0, false));
-    try std.testing.expectEqualStrings("router_q4_0_row_range_parallel64", directRouterRowRangeOpName(.q4_0, true));
-    try std.testing.expectEqualStrings("router_f32_row_range", directRouterRowRangeOpName(.f32, true));
+    try std.testing.expectEqualStrings("router_q8_0_row_range", directRouterRowRangeOpName(.q8_0, false, false));
+    try std.testing.expectEqualStrings("router_q8_0_row_range_parallel64", directRouterRowRangeOpName(.q8_0, true, false));
+    try std.testing.expectEqualStrings("router_q8_0_row_range_parallel64_trusted", directRouterRowRangeOpName(.q8_0, true, true));
+    try std.testing.expectEqualStrings("router_q4_0_row_range", directRouterRowRangeOpName(.q4_0, false, false));
+    try std.testing.expectEqualStrings("router_q4_0_row_range_parallel64", directRouterRowRangeOpName(.q4_0, true, false));
+    try std.testing.expectEqualStrings("router_f32_row_range", directRouterRowRangeOpName(.f32, true, false));
 }
 
 test "direct SSM row-range budget, trust and per-slice reset are bounded" {
