@@ -37,6 +37,10 @@ struct DmmvPush {
 #define ZINC_Q4K_FIXED_BLOCKS 0
 #endif
 
+#ifndef ZINC_Q4K_ACCUMULATE_OUTPUT
+#define ZINC_Q4K_ACCUMULATE_OUTPUT 0
+#endif
+
 kernel void main0(
     device const uchar* W [[buffer(0)]],
     constant DmmvPush& p [[buffer(1)]],
@@ -358,7 +362,11 @@ kernel void main0(
     for (int row = 0; row < NR0 && first_row + row < (int)p.M; ++row) {
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
+#if ZINC_Q4K_ACCUMULATE_OUTPUT
+            dst_f32[first_row + row] += sum_all;
+#else
             dst_f32[first_row + row] = sum_all;
+#endif
         }
     }
 }
