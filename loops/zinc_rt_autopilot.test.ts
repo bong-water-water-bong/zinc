@@ -6,8 +6,11 @@ import {
   detectZincRtExecutionMode,
   hasDirectDecodeModelSliceEvidence,
   isShortcutFreeZincRtOutput,
+  assertZincRtNodeAllowed,
   parseArgs,
   parseLlamaCliTimings,
+  resolveZincRtNode,
+  zincRtNodeAllowed,
   type ABBenchmark,
   type BenchmarkResult,
 } from "./zinc_rt_autopilot";
@@ -196,6 +199,20 @@ describe("M1 migration keep signals", () => {
 });
 
 describe("zinc_rt autopilot CLI and baselines", () => {
+  test("node resolver defaults the ZINC_RT autopilot to RDNA1", () => {
+    expect(resolveZincRtNode(undefined)).toBe("rdna1");
+    expect(resolveZincRtNode("")).toBe("rdna1");
+    expect(resolveZincRtNode("RDNA1")).toBe("rdna1");
+  });
+
+  test("node guard rejects RDNA2 unless explicitly overridden", () => {
+    expect(zincRtNodeAllowed("rdna1")).toBe(true);
+    expect(zincRtNodeAllowed("r9700")).toBe(true);
+    expect(zincRtNodeAllowed("rdna2")).toBe(false);
+    expect(() => assertZincRtNodeAllowed("rdna2", false)).toThrow(/RDNA1\/R9700/);
+    expect(() => assertZincRtNodeAllowed("rdna2", true)).not.toThrow();
+  });
+
   test("parseArgs supports llama baseline and a shared max token cap", () => {
     const args = parseArgs([
       "--baseline",

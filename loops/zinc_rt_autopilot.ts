@@ -137,6 +137,33 @@ function envValue(...keys: string[]): string | undefined {
   return undefined;
 }
 
+function normalizeNodeName(node: string | undefined): string {
+  return (node ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+export function resolveZincRtNode(rawNode: string | undefined): string {
+  const node = normalizeNodeName(rawNode);
+  return node || "rdna1";
+}
+
+export function zincRtNodeAllowed(node: string): boolean {
+  const normalized = normalizeNodeName(node);
+  return normalized === "rdna1" || normalized === "r9700";
+}
+
+export function assertZincRtNodeAllowed(node: string, allowNonRdna1: boolean): void {
+  if (allowNonRdna1 || zincRtNodeAllowed(node)) return;
+  throw new Error(
+    `ZINC_RT autopilot is pinned to the RDNA1/R9700 node; got ZINC_RT node '${node}'. ` +
+    "Set ZINC_RT_RDNA_NODE=rdna1, unset generic ZINC_RDNA_NODE, or set " +
+    "ZINC_RT_ALLOW_NON_RDNA1=1 for an explicit one-off override.",
+  );
+}
+
 function nodeEnvKey(node: string, suffix: string): string {
   const normalized = node
     .trim()
@@ -147,7 +174,7 @@ function nodeEnvKey(node: string, suffix: string): string {
 }
 
 function nodeEnvValue(suffixes: string[], fallbackKeys: string[]): string | undefined {
-  const node = envValue("ZINC_RDNA_NODE", "ZINC_NODE");
+  const node = ZINC_NODE;
   if (node) {
     for (const suffix of suffixes) {
       const value = envValue(nodeEnvKey(node, suffix));
@@ -157,7 +184,8 @@ function nodeEnvValue(suffixes: string[], fallbackKeys: string[]): string | unde
   return envValue(...fallbackKeys);
 }
 
-const ZINC_NODE = envValue("ZINC_RDNA_NODE", "ZINC_NODE") ?? "";
+const ZINC_NODE = resolveZincRtNode(envValue("ZINC_RT_RDNA_NODE", "ZINC_RT_NODE", "ZINC_RDNA_NODE", "ZINC_NODE"));
+const ALLOW_NON_RDNA1_NODE = envValue("ZINC_RT_ALLOW_NON_RDNA1") === "1";
 const ZINC_HOST = nodeEnvValue(["HOST"], ["ZINC_RDNA_HOST", "ZINC_HOST"]) ?? "127.0.0.1";
 const ZINC_PORT = Number(nodeEnvValue(["PORT"], ["ZINC_RDNA_PORT", "ZINC_PORT"]) ?? "22");
 const ZINC_USER = nodeEnvValue(["USER"], ["ZINC_RDNA_USER", "ZINC_USER"]) ?? "root";
@@ -1987,7 +2015,7 @@ Next useful work must do one of these:
     "",
     `Make \`zinc_rt\` (our own GPU runtime, see \`docs/ZINC_RT_DESIGN.md\`) beat \`${baselineLabel}\` tok/s on the validated catalog model.`,
     "",
-    `Every cycle this loop benchmarks ZINC_RT against ${baselineLabel} on the same RDNA node, same prompt, same model, and same max token cap. The ratio (zinc_rt / ${baselineLabel}) is the north star only after the run proves a real model slice is GPU-produced and consumed. Tiny PM4 probes such as top-2 argmax or one RMS element are validation signals, not proof that the decode path can beat ${baselineLabel}. Above 1.0 means we're winning only when benchmark shortcuts are absent.`,
+    `Every cycle this loop benchmarks ZINC_RT against ${baselineLabel} on the same RDNA1/R9700 node, same prompt, same model, and same max token cap. The ratio (zinc_rt / ${baselineLabel}) is the north star only after the run proves a real model slice is GPU-produced and consumed. Tiny PM4 probes such as top-2 argmax or one RMS element are validation signals, not proof that the decode path can beat ${baselineLabel}. Above 1.0 means we're winning only when benchmark shortcuts are absent.`,
     "",
     "## Current Deep Profile",
     "",
@@ -2009,15 +2037,16 @@ Next useful work must do one of these:
     "",
     "Do NOT redesign. Follow the design. If the design has a gap that blocks your work, surface it in `@@@SELF_ANALYSIS` and propose a minimal extension — do not unilaterally change the architecture.",
     "",
-    "## Hardware (remote RDNA node)",
+    "## Hardware (remote RDNA1/R9700 node)",
     "",
     "- GPU: AMD Radeon AI PRO R9700 (RDNA4 / gfx1201, 32 GB VRAM, 576 GB/s)",
+    "- This is the RDNA1 alias for the R9700 ZINC_RT node. Do not use RDNA2 / RX 9070 XT assumptions, model paths, Mesa 26 findings, or prefill-focused effort notes for this loop.",
     "- 64 CUs, wave64 optimal, 32 KB L1/CU, 6 MB L2",
     "- VK_KHR_cooperative_matrix 16x16x16 available",
     "- RADV driver (Mesa), `RADV_PERFTEST=coop_matrix` set for both backends",
     "- System glslc: shaderc 2023.8 (Ubuntu 24.04) — newer versions break RADV",
     "- Zig 0.15.2",
-    "- Kernel: check with `ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST 'uname -r'`",
+    "- Kernel: check with `ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST 'uname -r'` after selecting `ZINC_RT_RDNA_NODE=rdna1`.",
     "  - ≥ 6.16: T2 UMQ may be available, but kernel version is not sufficient. Also check `/sys/module/amdgpu/parameters/user_queue` and a real USERQ_CREATE probe.",
     "  - 6.14–6.15: T1 KFD direct only",
     "  - If benchmark output says `execution_tier=t_cpu_after_admission`, direct queue admission is only a smoke path; tokens are still CPU-produced.",
@@ -2135,16 +2164,16 @@ Next useful work must do one of these:
     ] : []),
     "2. Before printing the final `@@@` markers, self-verify changed files on the remote. Run repo-root `.env` + rsync + the exact build gates:",
     "   `set -a; source .env; set +a`",
-    `   \`rsync -az --delete --exclude '.git' --exclude '.env' --exclude '.env.*' --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' --exclude '.zinc_rt_autopilot' -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${REMOTE_ZINC_DIR}/"\``,
+    `   \`ZINC_RT_RDNA_NODE=rdna1 rsync -az --delete --exclude '.git' --exclude '.env' --exclude '.env.*' --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' --exclude '.zinc_rt_autopilot' -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${REMOTE_ZINC_DIR}/"\``,
     before.comparisonTarget === "vulkan"
-      ? `   \`ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test --summary all && zig build -Doptimize=ReleaseFast -Dbackend=vulkan && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'\``
-      : `   \`ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test -Dbackend=zinc_rt -Dshaders=false --summary all && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'\``,
+      ? `   \`ZINC_RT_RDNA_NODE=rdna1 ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test --summary all && zig build -Doptimize=ReleaseFast -Dbackend=vulkan && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'\``
+      : `   \`ZINC_RT_RDNA_NODE=rdna1 ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test -Dbackend=zinc_rt -Dshaders=false --summary all && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'\``,
     "   If any gate fails, fix it before final output. Do not leave trivial compile errors for the harness rollback.",
     "3. Both build flags MUST stay buildable: `-Dbackend=vulkan` and `-Dbackend=zinc_rt`.",
     "4. Output bit-equality is desirable but not strictly required during MIGRATE. Coherent output comes before absolute performance. In OPTIMIZE phase, zinc_rt MUST produce coherent, shortcut-free text: no top-k=0 decode, no capped LM-head row scan unless explicitly validating row-range quality, and no clamped decode-budget result counted as a win.",
     "5. If you need to reboot the remote node (e.g. you reloaded the amdgpu kernel module, changed sysctl, etc.), emit `@@@REBOOT` on its own line at the end of your output. The loop will reboot and continue.",
     "6. You may SSH into the remote node to inspect the synced ZINC source, compare against the existing Vulkan backend, run probes, inspect /sys, check kernel version, etc. Load repo-root `.env` in the same shell first:",
-    "   `set -a; source .env; set +a; ssh -p \"$ZINC_PORT\" \"$ZINC_USER@$ZINC_HOST\" '<cmd>'`",
+    "   `set -a; source .env; set +a; export ZINC_RT_RDNA_NODE=rdna1; ssh -p \"$ZINC_PORT\" \"$ZINC_USER@$ZINC_HOST\" '<cmd>'`",
     "   If SSH says `Operation not permitted`, report it as a sandbox/network permission problem, not as missing RDNA access.",
     "7. You may edit any repo files except the explicit forbidden items above, but you may not push to remote or destructively rewrite the worktree.",
     "8. Zig 0.15.2 API: `ArrayList` is unmanaged (pass allocator), `StringHashMap` → `StringHashMapUnmanaged`, `File.stdout()`, writer takes a buffer arg.",
@@ -2356,8 +2385,8 @@ function buildRepairPrompt(failure: VerificationFailure): string {
     "",
     "```bash",
     "set -a; source .env; set +a",
-    `rsync -az --delete --exclude '.git' --exclude '.env' --exclude '.env.*' --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' --exclude '.zinc_rt_autopilot' -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${REMOTE_ZINC_DIR}/"`,
-    `ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test --summary all && zig build -Doptimize=ReleaseFast -Dbackend=vulkan && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'`,
+    `ZINC_RT_RDNA_NODE=rdna1 rsync -az --delete --exclude '.git' --exclude '.env' --exclude '.env.*' --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' --exclude '.zinc_rt_autopilot' -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${REMOTE_ZINC_DIR}/"`,
+    `ZINC_RT_RDNA_NODE=rdna1 ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test --summary all && zig build -Doptimize=ReleaseFast -Dbackend=vulkan && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'`,
     "```",
     "",
     "If the self-verification fails, keep fixing until it passes or clearly report the blocker.",
@@ -2763,8 +2792,12 @@ export function parseArgs(argv: string[]): CliOptions {
           "  --target-tps T             Exit when zinc_rt tok/s ≥ T",
           "",
           "Environment overrides (read from process env or .env):",
-          "  ZINC_HOST, ZINC_PORT, ZINC_USER     — remote node SSH",
-          "  ZINC_RDNA_NODE or ZINC_NODE          — selects ZINC_<NODE>_HOST/PORT/USER",
+          "  ZINC_RT_RDNA_NODE or ZINC_RT_NODE    — ZINC_RT node selector (default: rdna1)",
+          "  ZINC_HOST, ZINC_PORT, ZINC_USER      — fallback remote node SSH",
+          "  ZINC_RDNA_NODE or ZINC_NODE           — generic selector, accepted only when",
+          "                                      it resolves to rdna1/r9700 unless",
+          "                                      ZINC_RT_ALLOW_NON_RDNA1=1 is set",
+          "  ZINC_RDNA1_HOST/PORT/USER             — preferred RDNA1/R9700 SSH keys",
           "  ZINC_LLAMA_CLI_REMOTE                — llama-cli path for --baseline llama",
           "  ZINC_RT_TIER                        — force T1/T2/T-CPU (default: auto)",
           "  ZINC_CLAUDE_MODEL                   — claude model (default: " + CLAUDE_MODEL + ")",
@@ -2816,6 +2849,7 @@ async function main() {
   if (!Number.isFinite(opts.maxTokens) || opts.maxTokens <= 0) {
     throw new Error(`Invalid --max-tokens '${opts.maxTokens}'`);
   }
+  assertZincRtNodeAllowed(ZINC_NODE, ALLOW_NON_RDNA1_NODE);
 
   RESULTS_DIR = resolve(REPO_ROOT, ".zinc_rt_autopilot");
 
@@ -2826,6 +2860,7 @@ async function main() {
   console.log(clr("1;35", DSEP));
   console.log(clr("1;35", `  ZINC_RT AUTOPILOT — overnight A/B vs ${comparisonTargetLabel(opts.comparisonTarget)}`));
   console.log(clr("1;35", DSEP));
+  console.log(`  Node:      ${clr("1", ZINC_NODE)}${ALLOW_NON_RDNA1_NODE ? " (non-RDNA1 override enabled)" : ""}`);
   console.log(`  Remote:    ${clr("1", maskedRemoteLabel())}`);
   console.log(`  RemoteDir: ${clr("1", REMOTE_ZINC_DIR)}`);
   console.log(`  Baseline:  ${clr("1", comparisonTargetLabel(opts.comparisonTarget))}`);
