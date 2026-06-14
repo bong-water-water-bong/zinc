@@ -1684,6 +1684,10 @@ pub const RuntimeProfile = struct {
     qwen35_dense_prefill_token_major_replay_steps: u32 = 0,
     qwen35_dense_prefill_first_token_major_layer: u32 = 0,
     qwen35_dense_prefill_first_fallback_reason: Qwen35Dense9bPrefillFallbackReason = .none,
+    qwen35_dense_prefill_materialized_dispatch_calls: u32 = 0,
+    qwen35_dense_prefill_materialized_barrier_calls: u32 = 0,
+    qwen35_dense_prefill_materialized_resource_barrier_resources: u32 = 0,
+    qwen35_dense_prefill_materialized_record_ns: u64 = 0,
     shared_expert_bytes: u64 = 0,
     shared_expert_gate_up_bytes: u64 = 0,
     shared_expert_down_bytes: u64 = 0,
@@ -2848,6 +2852,25 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             pctOf(@as(u64, target_layer_tokens), @as(u64, profile.qwen35_dense_prefill_replay_layer_tokens)),
             profile.qwen35_dense_prefill_replay_layers,
         });
+        const replay_dispatch_calls = profile.queued_prefill_async_dispatch_calls +| profile.queued_prefill_final_dispatch_calls;
+        const replay_barrier_calls = profile.queued_prefill_async_barrier_calls +| profile.queued_prefill_final_barrier_calls;
+        const replay_record_ns = profile.queued_prefill_async_record_ns +| profile.queued_prefill_final_record_ns;
+        if (profile.qwen35_dense_prefill_materialized_dispatch_calls > 0 or replay_dispatch_calls > 0) {
+            log.info("  {s} qwen35-9b prefill work split: layer-major dispatch {d} barriers {d} resource_entries {d} record {d:.2} ms | token-major replay dispatch {d} barriers {d} record {d:.2} ms replay/layer_dispatch {d:.1}x", .{
+                label,
+                profile.qwen35_dense_prefill_materialized_dispatch_calls,
+                profile.qwen35_dense_prefill_materialized_barrier_calls,
+                profile.qwen35_dense_prefill_materialized_resource_barrier_resources,
+                nsToMs(profile.qwen35_dense_prefill_materialized_record_ns),
+                replay_dispatch_calls,
+                replay_barrier_calls,
+                nsToMs(replay_record_ns),
+                if (profile.qwen35_dense_prefill_materialized_dispatch_calls > 0)
+                    @as(f64, @floatFromInt(replay_dispatch_calls)) / @as(f64, @floatFromInt(profile.qwen35_dense_prefill_materialized_dispatch_calls))
+                else
+                    0.0,
+            });
+        }
     }
 }
 
@@ -4985,6 +5008,21 @@ fn recordQwen35Dense9bLayerMajorPrefillProfile(
     p.qwen35_dense_prefill_token_major_replay_steps +|= if (replay_layer_tokens > 0) prompt_tokens else 0;
     p.qwen35_dense_prefill_first_token_major_layer = if (clamped_layers < target_layers) clamped_layers else target_layers;
     p.qwen35_dense_prefill_first_fallback_reason = if (clamped_layers >= target_layers) .complete else fallback_reason;
+}
+
+fn recordQwen35Dense9bLayerMajorPrefillWork(
+    profile: ?*RuntimeProfile,
+    cfg: ModelConfig,
+    cmd: *const MetalCommand,
+    record_ns: u64,
+) void {
+    const p = profile orelse return;
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return;
+
+    p.qwen35_dense_prefill_materialized_dispatch_calls +|= cmd.dispatch_count;
+    p.qwen35_dense_prefill_materialized_barrier_calls +|= cmd.barrier_count;
+    p.qwen35_dense_prefill_materialized_resource_barrier_resources +|= cmd.resource_barrier_resources;
+    p.qwen35_dense_prefill_materialized_record_ns +|= record_ns;
 }
 
 fn logRoutePackCandidateBlocks(n_tokens: u32, n_experts: u32, n_experts_used: u32) void {
@@ -21269,6 +21307,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     const ssm_out_t = lt.ssm_out orelse return error.MissingTensor;
     var layer_major_fallback_reason: Qwen35Dense9bPrefillFallbackReason = .branch_not_batched;
 
+    const layer_major_record_start = profileStart(profile != null);
     var cmd = try beginProfiledCommand(engine, profile);
     dispatchRmsNormOnCmd(engine, &cmd, &engine.prefill_embed_buf, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[0], hidden_dim, n_tokens);
     profileSsmBarrierBuffers(&cmd, profile, .proj_norm, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
@@ -21672,6 +21711,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
             n_tokens,
         );
     }
+    recordQwen35Dense9bLayerMajorPrefillWork(profile, cfg, &cmd, profileElapsedNs(layer_major_record_start));
     if (async_out) |out| {
         commitAsyncProfiled(&cmd, profile);
         out.* = cmd;
@@ -33574,6 +33614,23 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expectEqual(@as(u32, 36), profile.qwen35_dense_prefill_token_major_replay_steps);
     try std.testing.expectEqual(@as(u32, 4), profile.qwen35_dense_prefill_first_token_major_layer);
     try std.testing.expectEqualStrings("full-attn-boundary", qwen35Dense9bPrefillFallbackReasonName(profile.qwen35_dense_prefill_first_fallback_reason));
+
+    const prefix_cmd = MetalCommand{
+        .handle = null,
+        .dispatch_count = 17,
+        .barrier_count = 9,
+        .resource_barrier_resources = 5,
+        .barrier_enabled = false,
+    };
+    recordQwen35Dense9bLayerMajorPrefillWork(&profile, qwen35_9b_cfg, &prefix_cmd, 1234);
+    try std.testing.expectEqual(@as(u32, 17), profile.qwen35_dense_prefill_materialized_dispatch_calls);
+    try std.testing.expectEqual(@as(u32, 9), profile.qwen35_dense_prefill_materialized_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 5), profile.qwen35_dense_prefill_materialized_resource_barrier_resources);
+    try std.testing.expectEqual(@as(u64, 1234), profile.qwen35_dense_prefill_materialized_record_ns);
+
+    recordQwen35Dense9bLayerMajorPrefillWork(&profile, qwen35_27b_cfg, &prefix_cmd, 9999);
+    try std.testing.expectEqual(@as(u32, 17), profile.qwen35_dense_prefill_materialized_dispatch_calls);
+    try std.testing.expectEqual(@as(u64, 1234), profile.qwen35_dense_prefill_materialized_record_ns);
 }
 
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
