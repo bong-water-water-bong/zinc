@@ -1381,6 +1381,7 @@ const ScalarDecodeState = struct {
     direct_ssm_qkv_gate_q4_row_range_done_mask: u128 = 0,
     direct_ssm_qkv_gate_q4_row_range_failed_mask: u128 = 0,
     direct_ssm_qkv_gate_q4_row_range_slice_successes: u32 = 0,
+    direct_attn_out_q4_row_range_done: bool = false,
     direct_ssm_out_q4_row_range_done: bool = false,
     direct_moe_gate_up_row_range_count: u32 = 0,
     direct_shared_moe_gate_up_row_range_done: bool = false,
@@ -1535,6 +1536,7 @@ const ScalarDecodeState = struct {
         self.direct_ssm_beta_q8_row_range_slice_successes = 0;
         self.direct_ssm_qkv_gate_q4_row_range_done_mask = 0;
         self.direct_ssm_qkv_gate_q4_row_range_slice_successes = 0;
+        self.direct_attn_out_q4_row_range_done = false;
         self.direct_ssm_out_q4_row_range_done = false;
         self.direct_moe_gate_up_row_range_count = 0;
         self.direct_shared_moe_gate_up_row_range_done = false;
@@ -1788,6 +1790,7 @@ fn generateScalarHybrid(
         log.info("M1 AMDGPU CS direct SSM QKV/gate Q4_0 row-range budget: {d} layers per tracked decode slice", .{
             direct_ssm_qkv_gate_q4_0_max_successes_per_slice,
         });
+        log.info("M1 AMDGPU CS direct attention output Q4_0 row-range budget: 1 layer per tracked decode slice", .{});
         log.info("M1 AMDGPU CS direct SSM output Q4_0 row-range budget: 1 layer per tracked decode slice", .{});
         log.info("M1 AMDGPU CS direct MoE Q4_0 row-range budget: gate/up routed_slots={d}, down routed_slots={d}, shared_gate_up=1, shared_down=1", .{
             direct_moe_gate_up_q4_0_max_expert_slots,
@@ -2140,6 +2143,10 @@ fn scalarEvalTokenDense(
     consumed_gpu_model_value: *bool,
     direct_compute_tracking: ?DirectComputeTracking,
 ) !void {
+    if (direct_compute_tracking) |tracking| {
+        if (tracking.phase == .decode) state.beginDirectDecodeSlice();
+    }
+
     const cfg = model.config;
     const safe_id = @min(token_id, cfg.vocab_size -| 1);
     try dequant.row(model.tensorData(model.embed_info), safe_id, cfg.hidden_dim, model.embed_info.type_, state.hidden);
@@ -2151,7 +2158,7 @@ fn scalarEvalTokenDense(
     for (model.layer_tensors, 0..) |lt, li| {
         const layer: u32 = @intCast(li);
         try rmsNormTensor(model, lt.attn_norm.?, state.hidden, state.norm, state.row_scratch);
-        try runAttentionLayer(model, state, lt, layer, position);
+        try runAttentionLayer(model, state, lt, layer, position, direct_compute_tracking);
         try runDenseFfnLayer(model, state, lt);
         if (model.layer_output_scales) |scales| {
             const scale = scales[li];
@@ -3252,7 +3259,7 @@ fn scalarEvalToken(
         if (is_ssm_layer) {
             try runSsmLayer(model, state, lt, layer, direct_compute_tracking);
         } else {
-            try runAttentionLayer(model, state, lt, layer, position);
+            try runAttentionLayer(model, state, lt, layer, position, direct_compute_tracking);
         }
         // FFN: dispatch the right block per layer. Gemma 4 MoE (fused
         // `ffn_gate_up_exps`) wants the parallel shared-MLP + routed-experts
@@ -3346,6 +3353,7 @@ fn runAttentionLayer(
     lt: LayerTensors,
     layer: u32,
     position: u32,
+    direct_compute_tracking: ?DirectComputeTracking,
 ) !void {
     const cfg = model.config;
     const q_rows: u32 = @intCast(lt.attn_q.?.numElements() / cfg.hidden_dim);
@@ -3430,7 +3438,9 @@ fn runAttentionLayer(
         }
     }
 
-    try matvecTensor(state.pool, model, lt.attn_output.?, state.attn_out[0..active_q_rows], cfg.hidden_dim, state.row_scratch, state.branch);
+    const attn_output_w = model.requantOrRaw(lt.attn_output.?);
+    try matvecRaw(state.pool, attn_output_w.raw, attn_output_w.type_, state.attn_out[0..active_q_rows], cfg.hidden_dim, state.row_scratch, state.branch);
+    consumeDirectAttentionOutQ4_0RowRange(state, attn_output_w, layer, active_q_rows, direct_compute_tracking);
     // Gemma applies post_attention_norm to the projected attention output
     // before merging it into the residual stream.
     if (cfg.is_gemma) {
@@ -3439,6 +3449,83 @@ fn runAttentionLayer(
         }
     }
     for (state.hidden, state.branch) |*h, b| h.* += b;
+}
+
+const direct_attention_out_q4_0_tolerance: f32 = 0.05;
+const direct_attention_out_q4_0_range_rows: u32 = 64;
+
+fn consumeDirectAttentionOutQ4_0RowRange(
+    state: *ScalarDecodeState,
+    attn_output_w: WeightView,
+    layer: u32,
+    cols: u32,
+    maybe_tracking: ?DirectComputeTracking,
+) void {
+    const tracking = maybe_tracking orelse return;
+    if (tracking.phase != .decode) return;
+    if (state.direct_attn_out_q4_row_range_done) return;
+    if (attn_output_w.type_ != .q4_0) return;
+
+    if (cols == 0 or cols % 32 != 0) return;
+    const rows = direct_attention_out_q4_0_range_rows;
+    const rows_usize: usize = @intCast(rows);
+    const cols_usize: usize = @intCast(cols);
+    if (state.attn_out.len < cols_usize or state.branch.len < rows_usize or state.row_scratch.len < rows_usize) return;
+
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    const range_bytes = rows_usize * row_bytes;
+    if (row_bytes == 0 or attn_output_w.raw.len < range_bytes) return;
+
+    const gpu_rows = state.row_scratch[0..rows_usize];
+    tracking.boundary.dmmvQ4_0RowRangeParallel(
+        state.attn_out[0..cols_usize],
+        attn_output_w.raw[0..range_bytes],
+        rows,
+        cols,
+        gpu_rows,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct attention output Q4_0 row range unavailable ({s}); attention output projection remains host-computed", .{@errorName(err)});
+        return;
+    };
+
+    var max_abs_delta: f32 = 0.0;
+    var max_row: u32 = 0;
+    for (0..rows_usize) |i| {
+        const gpu = gpu_rows[i];
+        if (!std.math.isFinite(gpu)) {
+            log.warn("M1 AMDGPU CS direct attention output Q4_0 row range produced non-finite row {d}; attention output projection remains host-computed", .{i});
+            return;
+        }
+        const delta = @abs(gpu - state.branch[i]);
+        if (delta > max_abs_delta) {
+            max_abs_delta = delta;
+            max_row = @intCast(i);
+        }
+    }
+    if (max_abs_delta > direct_attention_out_q4_0_tolerance) {
+        log.warn("M1 AMDGPU CS direct attention output Q4_0 row range mismatch: layer={d} max_abs_delta={d:.6} row={d}; attention output projection remains host-computed", .{
+            layer,
+            max_abs_delta,
+            max_row,
+        });
+        return;
+    }
+
+    @memcpy(state.branch[0..rows_usize], gpu_rows);
+    state.direct_attn_out_q4_row_range_done = true;
+    tracking.ops.* += 1;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += 1;
+    log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=attention_output_q4_0_row_range_parallel64 phase=decode layer={d} rows={d} cols={d} chunks=1 max_abs_delta={d:.6} max_row={d} consumed_gpu_model_value=1", .{
+        tracking.ops.*,
+        layer,
+        rows,
+        cols,
+        max_abs_delta,
+        max_row,
+    });
 }
 
 fn runSsmLayer(
@@ -9460,6 +9547,7 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     state.direct_ssm_qkv_gate_q4_row_range_done_mask = mask;
     state.direct_ssm_qkv_gate_q4_row_range_failed_mask = directSsmLayerBit(4);
     state.direct_ssm_qkv_gate_q4_row_range_slice_successes = direct_ssm_qkv_gate_q4_0_max_successes_per_slice;
+    state.direct_attn_out_q4_row_range_done = true;
     state.direct_ssm_out_q4_row_range_done = true;
     state.direct_moe_gate_up_row_range_count = direct_moe_gate_up_q4_0_max_expert_slots;
     state.direct_shared_moe_gate_up_row_range_done = true;
@@ -9486,6 +9574,7 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
     try std.testing.expectEqual(@as(u128, 0), state.direct_ssm_qkv_gate_q4_row_range_done_mask);
     try std.testing.expectEqual(directSsmLayerBit(4), state.direct_ssm_qkv_gate_q4_row_range_failed_mask);
     try std.testing.expectEqual(@as(u32, 0), state.direct_ssm_qkv_gate_q4_row_range_slice_successes);
+    try std.testing.expect(!state.direct_attn_out_q4_row_range_done);
     try std.testing.expect(!state.direct_ssm_out_q4_row_range_done);
     try std.testing.expectEqual(@as(u32, 0), state.direct_moe_gate_up_row_range_count);
     try std.testing.expect(!state.direct_shared_moe_gate_up_row_range_done);
