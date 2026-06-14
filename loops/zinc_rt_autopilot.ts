@@ -249,6 +249,10 @@ const INCREMENTAL_DECODE_SLICE_MAX_BEST_TPS_DROP = 0.20;
 const POST_COVERAGE_PIVOT_MIN_DECODE_SLICES = 64;
 const POST_COVERAGE_MIN_ABS_TPS_GAIN_KEEP = 0.10;
 const POST_COVERAGE_REL_TPS_GAIN_KEEP = 0.003;
+const POST_COVERAGE_OVERHEAD_CLEANUP_MAX_ABS_TPS_DROP = 0.08;
+const POST_COVERAGE_OVERHEAD_CLEANUP_MAX_REL_TPS_DROP = 0.003;
+const STRUCTURAL_PIVOT_MEASURED_DEAD_WINDOW = 12;
+const STRUCTURAL_PIVOT_MEASURED_DEAD_MIN = 6;
 const SHORTCUT_FREE_MAX_TPS_REGRESSION = 0.20;
 const HARD_PIVOT_STALL_CYCLES = 8;
 const AGENT_TIMEOUT_MS = 3_600_000; // 1h — M0 layer-lowering cycles can be substantial
@@ -1647,6 +1651,46 @@ function postCoverageThroughputGainOk(before: ABBenchmark, after: ABBenchmark): 
   return afterRt >= beforeRt + requiredGain;
 }
 
+function postCoverageDefaultOverheadReductionOk(
+  before: ABBenchmark,
+  after: ABBenchmark,
+  migrateBestRt: number | null,
+): boolean {
+  if (!postCoveragePivotActive(before.zinc_rt.runOutput)) return false;
+  if (!migrationEvidenceQualityOk(before, after)) return false;
+  if (!hasDirectDecodeModelSliceEvidence(after.zinc_rt.runOutput)) return false;
+  if (!isShortcutFreeZincRtOutput(after.zinc_rt.runOutput)) return false;
+
+  const beforeSlices = maxPositiveCounter(before.zinc_rt.runOutput, ["direct_decode_model_slices", "direct_decode_model_ops"]);
+  const afterSlices = maxPositiveCounter(after.zinc_rt.runOutput, ["direct_decode_model_slices", "direct_decode_model_ops"]);
+  const beforeOps = maxPositiveCounter(before.zinc_rt.runOutput, ["direct_compute_ops", "direct_model_ops"]);
+  const afterOps = maxPositiveCounter(after.zinc_rt.runOutput, ["direct_compute_ops", "direct_model_ops"]);
+  const removedDefaultWork =
+    (beforeSlices > 0 && afterSlices > 0 && afterSlices < beforeSlices) ||
+    (beforeOps > 0 && afterOps > 0 && afterOps < beforeOps);
+  if (!removedDefaultWork) return false;
+
+  const beforeRt = before.zinc_rt.decodeTps;
+  const afterRt = after.zinc_rt.decodeTps;
+  if (beforeRt == null || afterRt == null) return false;
+
+  const cycleDrop = Math.max(
+    POST_COVERAGE_OVERHEAD_CLEANUP_MAX_ABS_TPS_DROP,
+    beforeRt * POST_COVERAGE_OVERHEAD_CLEANUP_MAX_REL_TPS_DROP,
+  );
+  if (afterRt + cycleDrop < beforeRt) return false;
+
+  if (migrateBestRt != null) {
+    const bestDrop = Math.max(
+      INCREMENTAL_DECODE_SLICE_MAX_BEST_TPS_DROP,
+      migrateBestRt * POST_COVERAGE_OVERHEAD_CLEANUP_MAX_REL_TPS_DROP,
+    );
+    if (afterRt + bestDrop < migrateBestRt) return false;
+  }
+
+  return true;
+}
+
 function hasMigratePerformanceRecovery(before: ABBenchmark, after: ABBenchmark, migrateBestRt: number | null): boolean {
   if (migrateBestRt == null) return false;
   if (!migrationEvidenceQualityOk(before, after)) return false;
@@ -1709,6 +1753,9 @@ export function decideMigrateKeep(before: ABBenchmark, after: ABBenchmark, migra
   }
   if (hasMigratePerformanceRecovery(before, after, migrateBestRt)) {
     return { keep: true, reason: `migrate performance recovery ${before.zinc_rt.decodeTps?.toFixed(2)} → ${after.zinc_rt.decodeTps?.toFixed(2)} tok/s` };
+  }
+  if (postCoverageDefaultOverheadReductionOk(before, after, migrateBestRt)) {
+    return { keep: true, reason: "post-coverage default direct-slice overhead reduction" };
   }
   if (hasNewDirectDecodeModelSliceSignal(before, after)) {
     const hadDecodeSlice = hasDirectDecodeModelSliceEvidence(before.zinc_rt.runOutput);
