@@ -7,16 +7,19 @@
 //! point) and is intended ONLY for `--profile` runs where evidence about
 //! which kernels dominate dispatch cost matters more than absolute tok/s.
 //!
-//! Aggregation is keyed by pipeline pointer; the human-readable label comes
-//! from `MetalPipeline.name` set at shader load time in forward_metal.zig.
+//! Aggregation is keyed by pipeline pointer plus label. Dispatch sites can set
+//! a one-shot label for shape-specific probes; otherwise the label comes from
+//! `MetalPipeline.name` set at shader load time in forward_metal.zig.
 //! @section Metal Runtime
 const std = @import("std");
 
 const MAX_SLOTS: usize = 512;
+const MAX_LABEL_BYTES: usize = 160;
 
 const Slot = struct {
     pipe_handle: ?*const anyopaque = null,
     name: []const u8 = "",
+    name_buf: [MAX_LABEL_BYTES]u8 = undefined,
     calls: u64 = 0,
     total_ns: u64 = 0,
     max_ns: u64 = 0,
@@ -60,13 +63,16 @@ pub fn reset() void {
 /// `enabled` is false (skips early at the call site).
 pub fn record(pipe_handle: ?*const anyopaque, name: ?[]const u8, elapsed_ns: u64) void {
     if (pipe_handle == null) return;
+    const raw_name = name orelse "<unnamed>";
+    const label_len = @min(raw_name.len, MAX_LABEL_BYTES);
+    const label = raw_name[0..label_len];
 
     mutex.lock();
     defer mutex.unlock();
 
     var i: usize = 0;
     while (i < slot_count) : (i += 1) {
-        if (slots[i].pipe_handle == pipe_handle) {
+        if (slots[i].pipe_handle == pipe_handle and std.mem.eql(u8, slots[i].name, label)) {
             slots[i].calls += 1;
             slots[i].total_ns += elapsed_ns;
             if (elapsed_ns > slots[i].max_ns) slots[i].max_ns = elapsed_ns;
@@ -76,13 +82,15 @@ pub fn record(pipe_handle: ?*const anyopaque, name: ?[]const u8, elapsed_ns: u64
 
     if (slot_count >= MAX_SLOTS) return;
 
-    slots[slot_count] = .{
+    const slot = &slots[slot_count];
+    slot.* = .{
         .pipe_handle = pipe_handle,
-        .name = name orelse "<unnamed>",
         .calls = 1,
         .total_ns = elapsed_ns,
         .max_ns = elapsed_ns,
     };
+    @memcpy(slot.name_buf[0..label_len], label);
+    slot.name = slot.name_buf[0..label_len];
     slot_count += 1;
 }
 
@@ -174,6 +182,26 @@ test "topByAvgNs ranks by per-dispatch average" {
     try std.testing.expectEqual(@as(u64, 250), top[0].avg_ns);
     try std.testing.expectEqualStrings("many", top[1].name);
     try std.testing.expectEqual(@as(u64, 100), top[1].avg_ns);
+    reset();
+}
+
+test "record separates labels for the same pipeline" {
+    reset();
+    const pipe = @as(*const anyopaque, @ptrFromInt(0x5000));
+    var label_buf: [64]u8 = undefined;
+    const dynamic_label = try std.fmt.bufPrint(&label_buf, "dmmv q4_k dense M={d} K={d}", .{ 17408, 5120 });
+
+    record(pipe, dynamic_label, 1000);
+    label_buf[0] = 'X';
+    record(pipe, "dmmv q4_k ssm M=10240 K=5120", 2000);
+    record(pipe, "dmmv q4_k dense M=17408 K=5120", 3000);
+
+    var buf: [4]Entry = undefined;
+    const top = topByTotalNs(&buf);
+    try std.testing.expectEqual(@as(usize, 2), top.len);
+    try std.testing.expectEqualStrings("dmmv q4_k dense M=17408 K=5120", top[0].name);
+    try std.testing.expectEqual(@as(u64, 4000), top[0].total_ns);
+    try std.testing.expectEqualStrings("dmmv q4_k ssm M=10240 K=5120", top[1].name);
     reset();
 }
 

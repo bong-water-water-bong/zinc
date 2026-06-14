@@ -257,6 +257,100 @@ fn defaultQ8DualThreadgroup(chip: metal_device.GpuFamily, simd_width: u32, max_t
     return null;
 }
 
+fn supportsDenseQ6kSimdgroupDmmvArch(arch: config_mod.Architecture) bool {
+    return arch == .gemma or arch == .qwen2;
+}
+
+const qwen35_27b_dense_down_q6k_blocks: u32 = 68; // 17408 / QK_K
+const qwen35_27b_dense_gate_up_q4k_blocks: u32 = 20; // 5120 / QK_K
+const qwen35_27b_dense_down_q4k_blocks: u32 = 68; // 17408 / QK_K
+const qwen35_27b_lm_head_q6k_blocks: u32 = 20; // 5120 / QK_K
+
+fn qwen35SsmQkvRows(cfg: ModelConfig) u32 {
+    return cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
+}
+
+fn isQwen35SsmQkvShapeTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        cfg.ssm_d_inner == 6144 and
+        cfg.ssm_d_state == 128 and
+        cfg.ssm_dt_rank == 48 and
+        cfg.ssm_n_group == 16 and
+        M == qwen35SsmQkvRows(cfg) and
+        K == cfg.hidden_dim and
+        K == qwen35_27b_dense_gate_up_q4k_blocks * 256 and
+        std.mem.endsWith(u8, tensor_name, "attn_qkv.weight");
+}
+
+fn isQwen35DenseDownQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        M == cfg.hidden_dim and
+        K == cfg.intermediate_dim and
+        K == qwen35_27b_dense_down_q6k_blocks * 256 and
+        std.mem.endsWith(u8, tensor_name, "ffn_down.weight");
+}
+
+fn isQwen35SsmQkvQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return isQwen35SsmQkvShapeTarget(cfg, tensor_name, M, K);
+}
+
+fn isQwen35SsmQkvQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return isQwen35SsmQkvShapeTarget(cfg, tensor_name, M, K);
+}
+
+fn isQwen35SsmGateQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg) and
+        M == cfg.ssm_d_inner and
+        K == cfg.hidden_dim and
+        K == qwen35_27b_dense_gate_up_q4k_blocks * 256 and
+        std.mem.endsWith(u8, tensor_name, "attn_gate.weight");
+}
+
+fn isQwen35LmHeadQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        cfg.vocab_size == 248320 and
+        cfg.n_experts == 0 and
+        M == cfg.vocab_size and
+        K == cfg.hidden_dim and
+        K == qwen35_27b_lm_head_q6k_blocks * 256 and
+        std.mem.eql(u8, tensor_name, "output.weight");
+}
+
+fn isQwen35DenseGateUpQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        M == cfg.intermediate_dim and
+        K == cfg.hidden_dim and
+        K == qwen35_27b_dense_gate_up_q4k_blocks * 256 and
+        (std.mem.endsWith(u8, tensor_name, "ffn_gate.weight") or
+            std.mem.endsWith(u8, tensor_name, "ffn_up.weight"));
+}
+
+fn isQwen35DenseDownQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        M == cfg.hidden_dim and
+        K == cfg.intermediate_dim and
+        K == qwen35_27b_dense_down_q4k_blocks * 256 and
+        std.mem.endsWith(u8, tensor_name, "ffn_down.weight");
+}
+
+fn canUseDenseQ6kSimdgroupDmmvShape(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    if (cfg.n_experts != 0 or M == 0 or M % 4 != 0 or K % 256 != 0) return false;
+    return supportsDenseQ6kSimdgroupDmmvArch(cfg.architecture) or
+        isQwen35DenseDownQ6kTarget(cfg, tensor_name, M, K) or
+        isQwen35SsmQkvQ6kTarget(cfg, tensor_name, M, K) or
+        isQwen35LmHeadQ6kTarget(cfg, tensor_name, M, K);
+}
+
 fn preferApple9Q8K2048Path(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
     if (K > 2048) return false;
 
@@ -613,6 +707,44 @@ fn denseGemmaQ4KGeGLUValidationRequested(cfg: ModelConfig) bool {
         qwenRoutePackedFullValidationBisectEnabled();
 }
 
+fn qwen35DenseQ4KSwiGLUValidationRequested(cfg: ModelConfig) bool {
+    if (!defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) return false;
+    return (readBoolEnv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE") orelse false) or
+        (readBoolEnv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE") orelse false) or
+        qwen35DenseQ4KSwiGLUValidationScanRequested() or
+        std.posix.getenv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_LAYER") != null or
+        std.posix.getenv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_LAYER") != null or
+        std.posix.getenv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN") != null or
+        std.posix.getenv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_TOKEN") != null;
+}
+
+fn qwen35DenseQ4KSwiGLUValidationScanRequested() bool {
+    return (readBoolEnv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_SCAN") orelse false) or
+        (readBoolEnv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_SCAN") orelse false);
+}
+
+fn qwen35DenseQ4KSwiGLUValidateTokens() u32 {
+    const requested =
+        readU32Env("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKENS") orelse
+        readU32Env("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_TOKENS") orelse
+        1;
+    return @min(@max(requested, 1), 8);
+}
+
+fn qwen35DenseQ4KSwiGLUValidateLayer(engine: *const InferenceEngine) usize {
+    const requested =
+        readU32Env("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_LAYER") orelse
+        readU32Env("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_LAYER") orelse
+        0;
+    if (engine.config.n_layers == 0) return 0;
+    return @min(@as(usize, @intCast(requested)), @as(usize, @intCast(engine.config.n_layers - 1)));
+}
+
+fn qwen35DenseQ4KSwiGLUValidateToken() ?u32 {
+    return readU32Env("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN") orelse
+        readU32Env("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_TOKEN");
+}
+
 fn denseGemmaQ4KGeGLUValidateLayer(engine: *const InferenceEngine) usize {
     const default_layer = if (engine.profile_enabled and
         isDenseGemma31Q4KGeGLUShape(engine.config) and
@@ -641,6 +773,36 @@ fn defaultQwen36SsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
         cfg.ssm_n_group == 16;
 }
 
+fn defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg: ModelConfig) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        cfg.n_layers == 64 and
+        cfg.n_experts == 0 and
+        cfg.ssm_d_inner == 6144 and
+        cfg.ssm_d_state == 128 and
+        cfg.ssm_dt_rank == 48 and
+        cfg.ssm_n_group == 16;
+}
+
+fn hybridDecodeCommandGroupLayers(cfg: ModelConfig) usize {
+    if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+        // One layer per command buffer leaves Qwen3.6 27B with 64 async submits
+        // per token. llama.cpp's `ggml_metal_graph_compute` keeps graph work in
+        // a small queued command-buffer set; group two 3xSSM+1xattn blocks while
+        // avoiding the previously failed whole-token command buffer.
+        return 8;
+    }
+    return 1;
+}
+
+fn qwenSsmDeltaGatedNormExactShape(cfg: ModelConfig, dt_rank: u32, head_v_dim: u32, d_state: u32, n_group: u32) bool {
+    if (head_v_dim != 128 or d_state != 128 or n_group != 16) return false;
+    if (defaultQwen36SsmPrefillProjectionEnabled(cfg)) return dt_rank == 32;
+    if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) return dt_rank == 48;
+    return false;
+}
+
 fn defaultFusedSsmNormEnabled(cfg: ModelConfig) bool {
     // llama.cpp keeps norm as a separate graph op before the Metal matmul
     // kernels. For the Qwen3.6 35B SSM shape, fusing RMSNorm into per-row Q8
@@ -667,9 +829,8 @@ fn canUseQwenSsmDeltaGatedNormExact(
     has_ssm_a: bool,
 ) bool {
     if (!engine.qwen_ssm_delta_gated_norm_exact_enabled) return false;
-    if (!defaultQwen36SsmPrefillProjectionEnabled(engine.config)) return false;
     if (!has_dt_bias or !has_ssm_a) return false;
-    if (dt_rank != 32 or head_v_dim != 128 or d_state != 128 or n_group != 16) return false;
+    if (!qwenSsmDeltaGatedNormExactShape(engine.config, dt_rank, head_v_dim, d_state, n_group)) return false;
     if (engine.ssm_delta_net_gated_norm_qwen_pipe.handle == null) return false;
     return engine.ssm_delta_net_gated_norm_qwen_pipe.thread_execution_width == 32 and
         engine.ssm_delta_net_gated_norm_qwen_pipe.max_threads_per_threadgroup >= 128;
@@ -682,7 +843,7 @@ fn ssmDeltaGatedNormThreadgroupSize(
     d_state: u32,
     n_group: u32,
 ) u32 {
-    if (dt_rank == 32 and
+    if ((dt_rank == 32 or dt_rank == 48) and
         head_v_dim == 128 and
         d_state == 128 and
         n_group == 16 and
@@ -719,11 +880,29 @@ fn canUseQwenSsmConvD4FastPath(
     d_conv: u32,
     kernel_is_f16: bool,
 ) bool {
-    return defaultQwen36SsmPrefillProjectionEnabled(engine.config) and
+    return qwenSsmConvD4DecodePipe(engine, conv_channels, d_conv, kernel_is_f16) != null;
+}
+
+fn qwenSsmConvD4DecodePipe(
+    engine: *const InferenceEngine,
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: bool,
+) ?*const MetalPipeline {
+    if (d_conv != 4 or kernel_is_f16) return null;
+    if (defaultQwen36SsmPrefillProjectionEnabled(engine.config) and
         conv_channels == 8192 and
-        d_conv == 4 and
-        !kernel_is_f16 and
-        engine.ssm_conv1d_qwen_d4_pipe.handle != null;
+        engine.ssm_conv1d_qwen_d4_pipe.handle != null)
+    {
+        return &engine.ssm_conv1d_qwen_d4_pipe;
+    }
+    if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(engine.config) and
+        conv_channels == 10240 and
+        engine.ssm_conv1d_qwen27b_d4_pipe.handle != null)
+    {
+        return &engine.ssm_conv1d_qwen27b_d4_pipe;
+    }
+    return null;
 }
 
 fn qwenSsmConvD4PrefillPipe(
@@ -755,6 +934,17 @@ fn ssmConv1dThreadgroupSize(
     {
         return 128;
     }
+    // Qwen3.6 27B's exact D4 conv path has no cross-thread communication.
+    // Keep its 10240 channels spread across 160 one-simdgroup workgroups
+    // instead of 80 two-simdgroup groups so more Apple9 GPU cores stay busy.
+    if (conv_channels == 10240 and
+        d_conv == 4 and
+        !kernel_is_f16 and
+        pipe.thread_execution_width == 32 and
+        pipe.max_threads_per_threadgroup >= 64)
+    {
+        return 64;
+    }
     return 64;
 }
 
@@ -777,6 +967,9 @@ const DmmvDetailClass = enum(u8) {
     ssm_gate,
     ssm_tail,
     ssm_out,
+    dense_gate,
+    dense_up,
+    dense_down,
     shared_gate_up,
     shared_down,
     moe_gate_up,
@@ -792,6 +985,7 @@ const DmmvPipelineChoice = struct {
 
 const Q8ShapeStat = struct {
     path: DmmvPathClass = .other,
+    detail: DmmvDetailClass = .none,
     rows: u32 = 0,
     cols: u32 = 0,
     bytes: u64 = 0,
@@ -826,9 +1020,9 @@ const Q8RepackedDispatchKind = enum(u8) {
 /// The coarse `q8_repacked_*_bytes/_calls` fields on `RuntimeProfile` group
 /// dispatches by the 4-bucket `Q8RepackedKernel` (tg128/exact_qwen/quad/
 /// generic) and the per-shape `q8_shape_stats` is keyed only by
-/// `DmmvPathClass` (lm_head/router/ssm/full_attn/etc.) — so a `q8 hot #N`
-/// line tells you a shape moves 17.93 GiB but NOT which of the 11 sibling
-/// shaders served it. This slot table fills that gap by keying on
+/// `DmmvPathClass` plus `DmmvDetailClass`; a `q8 hot #N` line tells you which
+/// logical edge moves bytes, but NOT which of the sibling shaders served it.
+/// This slot table fills that gap by keying on
 /// `(kind, rows, cols)` for the actual production dispatch path. Default-off
 /// alongside the rest of the runtime profile.
 const Q8RepackedDispatchStat = struct {
@@ -861,6 +1055,175 @@ const SsmBarrierPhase = enum(u8) {
     residual,
 };
 
+const SsmBarrierPhaseCounters = struct {
+    proj_norm: u32 = 0,
+    qkv: u32 = 0,
+    tail: u32 = 0,
+    conv: u32 = 0,
+    delta: u32 = 0,
+    gated_norm: u32 = 0,
+    out: u32 = 0,
+    residual: u32 = 0,
+
+    fn add(self: *SsmBarrierPhaseCounters, phase: SsmBarrierPhase, value: u32) void {
+        if (value == 0) return;
+        switch (phase) {
+            .proj_norm => self.proj_norm += value,
+            .qkv => self.qkv += value,
+            .tail => self.tail += value,
+            .conv => self.conv += value,
+            .delta => self.delta += value,
+            .gated_norm => self.gated_norm += value,
+            .out => self.out += value,
+            .residual => self.residual += value,
+        }
+    }
+
+    fn addCounts(self: *SsmBarrierPhaseCounters, counts: SsmBarrierPhaseCounters) void {
+        self.proj_norm += counts.proj_norm;
+        self.qkv += counts.qkv;
+        self.tail += counts.tail;
+        self.conv += counts.conv;
+        self.delta += counts.delta;
+        self.gated_norm += counts.gated_norm;
+        self.out += counts.out;
+        self.residual += counts.residual;
+    }
+
+    fn total(self: SsmBarrierPhaseCounters) u32 {
+        return self.proj_norm +
+            self.qkv +
+            self.tail +
+            self.conv +
+            self.delta +
+            self.gated_norm +
+            self.out +
+            self.residual;
+    }
+
+    fn diff(total_counts: SsmBarrierPhaseCounters, prefix_counts: SsmBarrierPhaseCounters) SsmBarrierPhaseCounters {
+        return .{
+            .proj_norm = total_counts.proj_norm -| prefix_counts.proj_norm,
+            .qkv = total_counts.qkv -| prefix_counts.qkv,
+            .tail = total_counts.tail -| prefix_counts.tail,
+            .conv = total_counts.conv -| prefix_counts.conv,
+            .delta = total_counts.delta -| prefix_counts.delta,
+            .gated_norm = total_counts.gated_norm -| prefix_counts.gated_norm,
+            .out = total_counts.out -| prefix_counts.out,
+            .residual = total_counts.residual -| prefix_counts.residual,
+        };
+    }
+};
+
+const DenseFfnBarrierPhase = enum(u8) {
+    norm,
+    gate_up,
+    activation,
+    down,
+    tail,
+    scale,
+};
+
+const DenseFfnBarrierPhaseCounters = struct {
+    norm: u32 = 0,
+    gate_up: u32 = 0,
+    activation: u32 = 0,
+    down: u32 = 0,
+    tail: u32 = 0,
+    scale: u32 = 0,
+
+    fn add(self: *DenseFfnBarrierPhaseCounters, phase: DenseFfnBarrierPhase, value: u32) void {
+        if (value == 0) return;
+        switch (phase) {
+            .norm => self.norm += value,
+            .gate_up => self.gate_up += value,
+            .activation => self.activation += value,
+            .down => self.down += value,
+            .tail => self.tail += value,
+            .scale => self.scale += value,
+        }
+    }
+
+    fn addCounts(self: *DenseFfnBarrierPhaseCounters, counts: DenseFfnBarrierPhaseCounters) void {
+        self.norm += counts.norm;
+        self.gate_up += counts.gate_up;
+        self.activation += counts.activation;
+        self.down += counts.down;
+        self.tail += counts.tail;
+        self.scale += counts.scale;
+    }
+
+    fn total(self: DenseFfnBarrierPhaseCounters) u32 {
+        return self.norm +
+            self.gate_up +
+            self.activation +
+            self.down +
+            self.tail +
+            self.scale;
+    }
+
+    fn diff(total_counts: DenseFfnBarrierPhaseCounters, prefix_counts: DenseFfnBarrierPhaseCounters) DenseFfnBarrierPhaseCounters {
+        return .{
+            .norm = total_counts.norm -| prefix_counts.norm,
+            .gate_up = total_counts.gate_up -| prefix_counts.gate_up,
+            .activation = total_counts.activation -| prefix_counts.activation,
+            .down = total_counts.down -| prefix_counts.down,
+            .tail = total_counts.tail -| prefix_counts.tail,
+            .scale = total_counts.scale -| prefix_counts.scale,
+        };
+    }
+};
+
+const DenseFfnBarrierPhaseNsCounters = struct {
+    norm: u64 = 0,
+    gate_up: u64 = 0,
+    activation: u64 = 0,
+    down: u64 = 0,
+    tail: u64 = 0,
+    scale: u64 = 0,
+
+    fn add(self: *DenseFfnBarrierPhaseNsCounters, phase: DenseFfnBarrierPhase, value: u64) void {
+        if (value == 0) return;
+        switch (phase) {
+            .norm => self.norm += value,
+            .gate_up => self.gate_up += value,
+            .activation => self.activation += value,
+            .down => self.down += value,
+            .tail => self.tail += value,
+            .scale => self.scale += value,
+        }
+    }
+
+    fn addCounts(self: *DenseFfnBarrierPhaseNsCounters, counts: DenseFfnBarrierPhaseNsCounters) void {
+        self.norm += counts.norm;
+        self.gate_up += counts.gate_up;
+        self.activation += counts.activation;
+        self.down += counts.down;
+        self.tail += counts.tail;
+        self.scale += counts.scale;
+    }
+
+    fn total(self: DenseFfnBarrierPhaseNsCounters) u64 {
+        return self.norm +
+            self.gate_up +
+            self.activation +
+            self.down +
+            self.tail +
+            self.scale;
+    }
+
+    fn diff(total_counts: DenseFfnBarrierPhaseNsCounters, prefix_counts: DenseFfnBarrierPhaseNsCounters) DenseFfnBarrierPhaseNsCounters {
+        return .{
+            .norm = total_counts.norm -| prefix_counts.norm,
+            .gate_up = total_counts.gate_up -| prefix_counts.gate_up,
+            .activation = total_counts.activation -| prefix_counts.activation,
+            .down = total_counts.down -| prefix_counts.down,
+            .tail = total_counts.tail -| prefix_counts.tail,
+            .scale = total_counts.scale -| prefix_counts.scale,
+        };
+    }
+};
+
 const GpuMoeBarrierPhase = enum(u8) {
     router,
     gate_up,
@@ -879,13 +1242,11 @@ const FullAttnBarrierPhase = enum(u8) {
     residual,
 };
 
-const DenseFfnBarrierPhase = enum(u8) {
-    norm,
-    gate_up,
-    activation,
-    down,
-    tail,
-    scale,
+const DenseFfnTailBarrierVariant = enum(u8) {
+    post_norm_next_norm,
+    residual_next_norm,
+    residual_acc,
+    final_norm,
 };
 
 const DenseGemmaQ4KGeGLUValidationStatus = enum(u8) {
@@ -913,6 +1274,8 @@ const GpuMoeFinalizerKind = enum(u8) {
     gemma_post_norm,
     gemma_staged,
 };
+
+const decode_async_profile_slots = 16;
 
 /// Per-request profiling counters for dispatch, barrier, and timing breakdown.
 pub const RuntimeProfile = struct {
@@ -957,6 +1320,9 @@ pub const RuntimeProfile = struct {
     ssm_gated_norm_barrier_calls: u32 = 0,
     ssm_out_barrier_calls: u32 = 0,
     ssm_residual_barrier_calls: u32 = 0,
+    ssm_scope_barrier_calls_by_phase: SsmBarrierPhaseCounters = .{},
+    ssm_resource_barrier_calls_by_phase: SsmBarrierPhaseCounters = .{},
+    ssm_resource_barrier_resources_by_phase: SsmBarrierPhaseCounters = .{},
     router_barrier_calls: u32 = 0,
     gpu_routed_moe_barrier_calls: u32 = 0,
     gpu_moe_router_barrier_calls: u32 = 0,
@@ -982,12 +1348,27 @@ pub const RuntimeProfile = struct {
     dense_ffn_down_barrier_calls: u32 = 0,
     dense_ffn_tail_barrier_calls: u32 = 0,
     dense_ffn_scale_barrier_calls: u32 = 0,
+    dense_ffn_scope_barrier_calls_by_phase: DenseFfnBarrierPhaseCounters = .{},
+    dense_ffn_resource_barrier_calls_by_phase: DenseFfnBarrierPhaseCounters = .{},
+    dense_ffn_resource_barrier_resources_by_phase: DenseFfnBarrierPhaseCounters = .{},
+    dense_ffn_barrier_encode_ns_by_phase: DenseFfnBarrierPhaseNsCounters = .{},
+    dense_ffn_scope_barrier_encode_ns_by_phase: DenseFfnBarrierPhaseNsCounters = .{},
+    dense_ffn_resource_barrier_encode_ns_by_phase: DenseFfnBarrierPhaseNsCounters = .{},
     dense_ffn_norm_dispatch_calls: u32 = 0,
     dense_ffn_gate_up_dispatch_calls: u32 = 0,
     dense_ffn_activation_dispatch_calls: u32 = 0,
     dense_ffn_down_dispatch_calls: u32 = 0,
     dense_ffn_tail_dispatch_calls: u32 = 0,
     dense_ffn_scale_dispatch_calls: u32 = 0,
+    dense_ffn_tail_post_norm_next_norm_barrier_calls: u32 = 0,
+    dense_ffn_tail_residual_next_norm_barrier_calls: u32 = 0,
+    dense_ffn_tail_residual_acc_barrier_calls: u32 = 0,
+    dense_ffn_tail_final_norm_barrier_calls: u32 = 0,
+    dense_ffn_tail_post_norm_dispatch_calls: u32 = 0,
+    dense_ffn_tail_post_norm_next_norm_calls: u32 = 0,
+    dense_ffn_tail_residual_next_norm_calls: u32 = 0,
+    dense_ffn_tail_residual_acc_calls: u32 = 0,
+    dense_ffn_tail_final_norm_calls: u32 = 0,
     dense_gemma_q4k_geglu_validation_checks: u32 = 0,
     dense_gemma_q4k_geglu_validation_status: DenseGemmaQ4KGeGLUValidationStatus = .none,
     dense_gemma_q4k_geglu_validation_tensor: DenseGemmaQ4KGeGLUValidationTensor = .none,
@@ -1019,6 +1400,52 @@ pub const RuntimeProfile = struct {
     dense_ffn_record_ns: u64 = 0,
     final_record_ns: u64 = 0,
     gpu_completion_wait_ns: u64 = 0,
+    decode_async_submits: u32 = 0,
+    decode_async_max_pending: u32 = 0,
+    decode_async_queue_waits: u32 = 0,
+    decode_async_queue_pending_cmds: u32 = 0,
+    decode_async_queue_wait_ns: u64 = 0,
+    decode_async_final_waits: u32 = 0,
+    decode_async_final_pending_cmds: u32 = 0,
+    decode_async_final_wait_ns: u64 = 0,
+    decode_async_submitted_dispatch_calls: u32 = 0,
+    decode_async_submitted_barrier_calls: u32 = 0,
+    decode_async_submitted_resource_barrier_resources: u32 = 0,
+    decode_async_final_dispatch_calls: u32 = 0,
+    decode_async_final_barrier_calls: u32 = 0,
+    decode_async_final_resource_barrier_resources: u32 = 0,
+    decode_async_slot_submits: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_dispatch_calls: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_barrier_calls: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_resource_barrier_resources: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_completed_cmds: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_gpu_ns: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_encode_ns: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_layer_range_submits: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_layer_start_sum: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_layer_end_sum: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_full_attn_layers: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_layers: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_dense_ffn_layers: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_full_attn_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_projection_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_qkv_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_gate_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_tail_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_out_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_dense_ffn_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_dense_gate_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_dense_up_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_dense_down_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_barrier_phases: [decode_async_profile_slots]SsmBarrierPhaseCounters = [_]SsmBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_dispatch_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_scope_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_resource_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_resource_barrier_entries_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = [_]DenseFfnBarrierPhaseNsCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_scope_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = [_]DenseFfnBarrierPhaseNsCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_resource_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = [_]DenseFfnBarrierPhaseNsCounters{.{}} ** decode_async_profile_slots,
     sample_ns: u64 = 0,
     total_step_ns: u64 = 0,
     debug_validation_ns: u64 = 0,
@@ -1036,6 +1463,16 @@ pub const RuntimeProfile = struct {
     ssm_qkv_projection_bytes: u64 = 0,
     ssm_gate_projection_bytes: u64 = 0,
     ssm_tail_projection_bytes: u64 = 0,
+    ssm_qkv_gate_pair_calls: u32 = 0,
+    ssm_qkv_gate_pair_bytes: u64 = 0,
+    ssm_qkv_gate_pair_q4q4_calls: u32 = 0,
+    ssm_qkv_gate_pair_q4q4_bytes: u64 = 0,
+    ssm_qkv_gate_pair_q6q4_calls: u32 = 0,
+    ssm_qkv_gate_pair_q6q4_bytes: u64 = 0,
+    ssm_qkv_gate_pair_q8q8_calls: u32 = 0,
+    ssm_qkv_gate_pair_q8q8_bytes: u64 = 0,
+    ssm_qkv_gate_pair_other_calls: u32 = 0,
+    ssm_qkv_gate_pair_other_bytes: u64 = 0,
     ssm_out_bytes: u64 = 0,
     full_attn_bytes: u64 = 0,
     full_attn_projection_bytes: u64 = 0,
@@ -1079,6 +1516,9 @@ pub const RuntimeProfile = struct {
     shared_expert_gate_up_bytes: u64 = 0,
     shared_expert_down_bytes: u64 = 0,
     dense_ffn_bytes: u64 = 0,
+    dense_ffn_gate_bytes: u64 = 0,
+    dense_ffn_up_bytes: u64 = 0,
+    dense_ffn_down_bytes: u64 = 0,
     moe_expert_bytes: u64 = 0,
     moe_expert_gate_up_bytes: u64 = 0,
     moe_expert_down_bytes: u64 = 0,
@@ -1180,25 +1620,69 @@ fn recordSsmBarrierPhase(profile: ?*RuntimeProfile, phase: SsmBarrierPhase) void
     }
 }
 
+fn recordSsmBarrierKind(
+    profile: ?*RuntimeProfile,
+    phase: SsmBarrierPhase,
+    scope_delta: u32,
+    resource_delta: u32,
+    resource_entries_delta: u32,
+) void {
+    if (profile) |p| {
+        p.ssm_scope_barrier_calls_by_phase.add(phase, scope_delta);
+        p.ssm_resource_barrier_calls_by_phase.add(phase, resource_delta);
+        p.ssm_resource_barrier_resources_by_phase.add(phase, resource_entries_delta);
+    }
+}
+
 fn profileSsmBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: SsmBarrierPhase) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
     cmd.barrier();
     if (cmd.barrier_count == before_count) return;
     recordSsmBarrierPhase(profile, phase);
+    recordSsmBarrierKind(
+        profile,
+        phase,
+        cmd.scope_barrier_count -| before_scope_count,
+        cmd.resource_barrier_count -| before_resource_count,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
 }
 
 fn profileSsmBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: SsmBarrierPhase, bufs: []const *const MetalBuffer) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
     cmd.barrierBuffers(bufs);
     if (cmd.barrier_count == before_count) return;
     recordSsmBarrierPhase(profile, phase);
+    recordSsmBarrierKind(
+        profile,
+        phase,
+        cmd.scope_barrier_count -| before_scope_count,
+        cmd.resource_barrier_count -| before_resource_count,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
 }
 
 fn profileSsmResourceBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: SsmBarrierPhase, bufs: []const *const MetalBuffer) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
     cmd.barrierResourceBuffers(bufs);
     if (cmd.barrier_count == before_count) return;
     recordSsmBarrierPhase(profile, phase);
+    recordSsmBarrierKind(
+        profile,
+        phase,
+        cmd.scope_barrier_count -| before_scope_count,
+        cmd.resource_barrier_count -| before_resource_count,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
 }
 
 fn recordGpuMoeBarrierPhase(profile: ?*RuntimeProfile, phase: GpuMoeBarrierPhase) void {
@@ -1329,6 +1813,15 @@ fn recordDenseFfnBarrierPhase(profile: ?*RuntimeProfile, phase: DenseFfnBarrierP
     }
 }
 
+fn recordDenseFfnTailBarrierVariant(profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant) void {
+    if (profile) |p| switch (variant) {
+        .post_norm_next_norm => p.dense_ffn_tail_post_norm_next_norm_barrier_calls += 1,
+        .residual_next_norm => p.dense_ffn_tail_residual_next_norm_barrier_calls += 1,
+        .residual_acc => p.dense_ffn_tail_residual_acc_barrier_calls += 1,
+        .final_norm => p.dense_ffn_tail_final_norm_barrier_calls += 1,
+    };
+}
+
 fn recordDenseFfnDispatchDelta(profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase, before: u32, after: u32) void {
     const delta = after -| before;
     if (delta == 0) return;
@@ -1342,18 +1835,145 @@ fn recordDenseFfnDispatchDelta(profile: ?*RuntimeProfile, phase: DenseFfnBarrier
     };
 }
 
+fn recordDenseFfnBarrierKind(
+    profile: ?*RuntimeProfile,
+    phase: DenseFfnBarrierPhase,
+    scope_delta: u32,
+    resource_delta: u32,
+    resource_entries_delta: u32,
+) void {
+    if (profile) |p| {
+        p.dense_ffn_scope_barrier_calls_by_phase.add(phase, scope_delta);
+        p.dense_ffn_resource_barrier_calls_by_phase.add(phase, resource_delta);
+        p.dense_ffn_resource_barrier_resources_by_phase.add(phase, resource_entries_delta);
+    }
+}
+
+fn recordDenseFfnBarrierEncodeNs(
+    profile: ?*RuntimeProfile,
+    phase: DenseFfnBarrierPhase,
+    elapsed_ns: u64,
+    scope_delta: u32,
+    resource_delta: u32,
+) void {
+    if (elapsed_ns == 0) return;
+    if (profile) |p| {
+        p.dense_ffn_barrier_encode_ns_by_phase.add(phase, elapsed_ns);
+        if (scope_delta != 0) p.dense_ffn_scope_barrier_encode_ns_by_phase.add(phase, elapsed_ns);
+        if (resource_delta != 0) p.dense_ffn_resource_barrier_encode_ns_by_phase.add(phase, elapsed_ns);
+    }
+}
+
 fn profileDenseFfnBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
+    const barrier_start = profileStart(profile != null);
     cmd.barrier();
+    const elapsed_ns = profileElapsedNs(barrier_start);
     if (cmd.barrier_count == before_count) return;
+    const scope_delta = cmd.scope_barrier_count -| before_scope_count;
+    const resource_delta = cmd.resource_barrier_count -| before_resource_count;
     recordDenseFfnBarrierPhase(profile, phase);
+    recordDenseFfnBarrierKind(
+        profile,
+        phase,
+        scope_delta,
+        resource_delta,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
+    recordDenseFfnBarrierEncodeNs(profile, phase, elapsed_ns, scope_delta, resource_delta);
 }
 
 fn profileDenseFfnBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase, bufs: []const *const MetalBuffer) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
+    const barrier_start = profileStart(profile != null);
     cmd.barrierBuffers(bufs);
+    const elapsed_ns = profileElapsedNs(barrier_start);
     if (cmd.barrier_count == before_count) return;
+    const scope_delta = cmd.scope_barrier_count -| before_scope_count;
+    const resource_delta = cmd.resource_barrier_count -| before_resource_count;
     recordDenseFfnBarrierPhase(profile, phase);
+    recordDenseFfnBarrierKind(
+        profile,
+        phase,
+        scope_delta,
+        resource_delta,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
+    recordDenseFfnBarrierEncodeNs(profile, phase, elapsed_ns, scope_delta, resource_delta);
+}
+
+fn profileDenseFfnResourceBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase, bufs: []const *const MetalBuffer) void {
+    const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
+    const barrier_start = profileStart(profile != null);
+    cmd.barrierResourceBuffers(bufs);
+    const elapsed_ns = profileElapsedNs(barrier_start);
+    if (cmd.barrier_count == before_count) return;
+    const scope_delta = cmd.scope_barrier_count -| before_scope_count;
+    const resource_delta = cmd.resource_barrier_count -| before_resource_count;
+    recordDenseFfnBarrierPhase(profile, phase);
+    recordDenseFfnBarrierKind(
+        profile,
+        phase,
+        scope_delta,
+        resource_delta,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
+    recordDenseFfnBarrierEncodeNs(profile, phase, elapsed_ns, scope_delta, resource_delta);
+}
+
+fn profileDenseFfnTailBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant) void {
+    const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
+    const barrier_start = profileStart(profile != null);
+    cmd.barrier();
+    const elapsed_ns = profileElapsedNs(barrier_start);
+    if (cmd.barrier_count == before_count) return;
+    const scope_delta = cmd.scope_barrier_count -| before_scope_count;
+    const resource_delta = cmd.resource_barrier_count -| before_resource_count;
+    recordDenseFfnBarrierPhase(profile, .tail);
+    recordDenseFfnTailBarrierVariant(profile, variant);
+    recordDenseFfnBarrierKind(
+        profile,
+        .tail,
+        scope_delta,
+        resource_delta,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
+    recordDenseFfnBarrierEncodeNs(profile, .tail, elapsed_ns, scope_delta, resource_delta);
+}
+
+fn profileDenseFfnTailBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant, bufs: []const *const MetalBuffer) void {
+    const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
+    const barrier_start = profileStart(profile != null);
+    cmd.barrierBuffers(bufs);
+    const elapsed_ns = profileElapsedNs(barrier_start);
+    if (cmd.barrier_count == before_count) return;
+    const scope_delta = cmd.scope_barrier_count -| before_scope_count;
+    const resource_delta = cmd.resource_barrier_count -| before_resource_count;
+    recordDenseFfnBarrierPhase(profile, .tail);
+    recordDenseFfnTailBarrierVariant(profile, variant);
+    recordDenseFfnBarrierKind(
+        profile,
+        .tail,
+        scope_delta,
+        resource_delta,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
+    recordDenseFfnBarrierEncodeNs(profile, .tail, elapsed_ns, scope_delta, resource_delta);
 }
 
 fn profileFullAttnQkvBarrier(
@@ -1454,6 +2074,16 @@ fn avgMs(ns: u64, count: anytype) f64 {
     return nsToMs(ns) / @as(f64, @floatFromInt(denom));
 }
 
+fn nsToUs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000.0;
+}
+
+fn avgUs(ns: u64, count: anytype) f64 {
+    const denom = @as(u64, count);
+    if (denom == 0) return 0.0;
+    return nsToUs(ns) / @as(f64, @floatFromInt(denom));
+}
+
 fn pctOf(total_ns: u64, part_ns: u64) f64 {
     if (total_ns == 0) return 0.0;
     return @as(f64, @floatFromInt(part_ns)) * 100.0 / @as(f64, @floatFromInt(total_ns));
@@ -1461,6 +2091,26 @@ fn pctOf(total_ns: u64, part_ns: u64) f64 {
 
 fn bytesToGiB(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0;
+}
+
+fn avgGiB(bytes: u64, count: u32) f64 {
+    if (count == 0) return 0.0;
+    return bytesToGiB(bytes) / @as(f64, @floatFromInt(count));
+}
+
+fn bytesPerSecondGiB(bytes: u64, ns: u64) f64 {
+    if (bytes == 0 or ns == 0) return 0.0;
+    return bytesToGiB(bytes) * 1_000_000_000.0 / @as(f64, @floatFromInt(ns));
+}
+
+fn avgCount(total: u32, count: u32) f64 {
+    if (count == 0) return 0.0;
+    return @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(count));
+}
+
+fn avgCount64(total: u64, count: u32) f64 {
+    if (count == 0) return 0.0;
+    return @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(count));
 }
 
 fn dmmvShapeStatMinusPrefix(total_slot: DmmvShapeStat, prefix_stats: []const DmmvShapeStat) DmmvShapeStat {
@@ -1471,6 +2121,7 @@ fn dmmvShapeStatMinusPrefix(total_slot: DmmvShapeStat, prefix_stats: []const Dmm
     for (prefix_stats) |slot| {
         if (slot.calls != 0 and
             slot.path == total_slot.path and
+            slot.detail == total_slot.detail and
             slot.rows == total_slot.rows and
             slot.cols == total_slot.cols)
         {
@@ -1485,6 +2136,7 @@ fn dmmvShapeStatMinusPrefix(total_slot: DmmvShapeStat, prefix_stats: []const Dmm
     if (bytes == 0 or calls == 0) return .{};
     return .{
         .path = total_slot.path,
+        .detail = total_slot.detail,
         .rows = total_slot.rows,
         .cols = total_slot.cols,
         .bytes = bytes,
@@ -1553,6 +2205,17 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.full_attn_out_dispatch_calls = total.full_attn_out_dispatch_calls -| prefix.full_attn_out_dispatch_calls;
     delta.full_attn_residual_dispatch_calls = total.full_attn_residual_dispatch_calls -| prefix.full_attn_residual_dispatch_calls;
     delta.ssm_barrier_calls = total.ssm_barrier_calls -| prefix.ssm_barrier_calls;
+    delta.ssm_proj_norm_barrier_calls = total.ssm_proj_norm_barrier_calls -| prefix.ssm_proj_norm_barrier_calls;
+    delta.ssm_qkv_barrier_calls = total.ssm_qkv_barrier_calls -| prefix.ssm_qkv_barrier_calls;
+    delta.ssm_tail_barrier_calls = total.ssm_tail_barrier_calls -| prefix.ssm_tail_barrier_calls;
+    delta.ssm_conv_barrier_calls = total.ssm_conv_barrier_calls -| prefix.ssm_conv_barrier_calls;
+    delta.ssm_delta_barrier_calls = total.ssm_delta_barrier_calls -| prefix.ssm_delta_barrier_calls;
+    delta.ssm_gated_norm_barrier_calls = total.ssm_gated_norm_barrier_calls -| prefix.ssm_gated_norm_barrier_calls;
+    delta.ssm_out_barrier_calls = total.ssm_out_barrier_calls -| prefix.ssm_out_barrier_calls;
+    delta.ssm_residual_barrier_calls = total.ssm_residual_barrier_calls -| prefix.ssm_residual_barrier_calls;
+    delta.ssm_scope_barrier_calls_by_phase = SsmBarrierPhaseCounters.diff(total.ssm_scope_barrier_calls_by_phase, prefix.ssm_scope_barrier_calls_by_phase);
+    delta.ssm_resource_barrier_calls_by_phase = SsmBarrierPhaseCounters.diff(total.ssm_resource_barrier_calls_by_phase, prefix.ssm_resource_barrier_calls_by_phase);
+    delta.ssm_resource_barrier_resources_by_phase = SsmBarrierPhaseCounters.diff(total.ssm_resource_barrier_resources_by_phase, prefix.ssm_resource_barrier_resources_by_phase);
     delta.router_barrier_calls = total.router_barrier_calls -| prefix.router_barrier_calls;
     delta.gpu_routed_moe_barrier_calls = total.gpu_routed_moe_barrier_calls -| prefix.gpu_routed_moe_barrier_calls;
     delta.fallback_moe_barrier_calls = total.fallback_moe_barrier_calls -| prefix.fallback_moe_barrier_calls;
@@ -1563,12 +2226,27 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.dense_ffn_down_barrier_calls = total.dense_ffn_down_barrier_calls -| prefix.dense_ffn_down_barrier_calls;
     delta.dense_ffn_tail_barrier_calls = total.dense_ffn_tail_barrier_calls -| prefix.dense_ffn_tail_barrier_calls;
     delta.dense_ffn_scale_barrier_calls = total.dense_ffn_scale_barrier_calls -| prefix.dense_ffn_scale_barrier_calls;
+    delta.dense_ffn_scope_barrier_calls_by_phase = DenseFfnBarrierPhaseCounters.diff(total.dense_ffn_scope_barrier_calls_by_phase, prefix.dense_ffn_scope_barrier_calls_by_phase);
+    delta.dense_ffn_resource_barrier_calls_by_phase = DenseFfnBarrierPhaseCounters.diff(total.dense_ffn_resource_barrier_calls_by_phase, prefix.dense_ffn_resource_barrier_calls_by_phase);
+    delta.dense_ffn_resource_barrier_resources_by_phase = DenseFfnBarrierPhaseCounters.diff(total.dense_ffn_resource_barrier_resources_by_phase, prefix.dense_ffn_resource_barrier_resources_by_phase);
+    delta.dense_ffn_barrier_encode_ns_by_phase = DenseFfnBarrierPhaseNsCounters.diff(total.dense_ffn_barrier_encode_ns_by_phase, prefix.dense_ffn_barrier_encode_ns_by_phase);
+    delta.dense_ffn_scope_barrier_encode_ns_by_phase = DenseFfnBarrierPhaseNsCounters.diff(total.dense_ffn_scope_barrier_encode_ns_by_phase, prefix.dense_ffn_scope_barrier_encode_ns_by_phase);
+    delta.dense_ffn_resource_barrier_encode_ns_by_phase = DenseFfnBarrierPhaseNsCounters.diff(total.dense_ffn_resource_barrier_encode_ns_by_phase, prefix.dense_ffn_resource_barrier_encode_ns_by_phase);
     delta.dense_ffn_norm_dispatch_calls = total.dense_ffn_norm_dispatch_calls -| prefix.dense_ffn_norm_dispatch_calls;
     delta.dense_ffn_gate_up_dispatch_calls = total.dense_ffn_gate_up_dispatch_calls -| prefix.dense_ffn_gate_up_dispatch_calls;
     delta.dense_ffn_activation_dispatch_calls = total.dense_ffn_activation_dispatch_calls -| prefix.dense_ffn_activation_dispatch_calls;
     delta.dense_ffn_down_dispatch_calls = total.dense_ffn_down_dispatch_calls -| prefix.dense_ffn_down_dispatch_calls;
     delta.dense_ffn_tail_dispatch_calls = total.dense_ffn_tail_dispatch_calls -| prefix.dense_ffn_tail_dispatch_calls;
     delta.dense_ffn_scale_dispatch_calls = total.dense_ffn_scale_dispatch_calls -| prefix.dense_ffn_scale_dispatch_calls;
+    delta.dense_ffn_tail_post_norm_next_norm_barrier_calls = total.dense_ffn_tail_post_norm_next_norm_barrier_calls -| prefix.dense_ffn_tail_post_norm_next_norm_barrier_calls;
+    delta.dense_ffn_tail_residual_next_norm_barrier_calls = total.dense_ffn_tail_residual_next_norm_barrier_calls -| prefix.dense_ffn_tail_residual_next_norm_barrier_calls;
+    delta.dense_ffn_tail_residual_acc_barrier_calls = total.dense_ffn_tail_residual_acc_barrier_calls -| prefix.dense_ffn_tail_residual_acc_barrier_calls;
+    delta.dense_ffn_tail_final_norm_barrier_calls = total.dense_ffn_tail_final_norm_barrier_calls -| prefix.dense_ffn_tail_final_norm_barrier_calls;
+    delta.dense_ffn_tail_post_norm_dispatch_calls = total.dense_ffn_tail_post_norm_dispatch_calls -| prefix.dense_ffn_tail_post_norm_dispatch_calls;
+    delta.dense_ffn_tail_post_norm_next_norm_calls = total.dense_ffn_tail_post_norm_next_norm_calls -| prefix.dense_ffn_tail_post_norm_next_norm_calls;
+    delta.dense_ffn_tail_residual_next_norm_calls = total.dense_ffn_tail_residual_next_norm_calls -| prefix.dense_ffn_tail_residual_next_norm_calls;
+    delta.dense_ffn_tail_residual_acc_calls = total.dense_ffn_tail_residual_acc_calls -| prefix.dense_ffn_tail_residual_acc_calls;
+    delta.dense_ffn_tail_final_norm_calls = total.dense_ffn_tail_final_norm_calls -| prefix.dense_ffn_tail_final_norm_calls;
     delta.final_barrier_calls = total.final_barrier_calls -| prefix.final_barrier_calls;
     delta.sample_calls = total.sample_calls -| prefix.sample_calls;
     delta.full_attn_layers = total.full_attn_layers -| prefix.full_attn_layers;
@@ -1584,6 +2262,54 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.dense_ffn_record_ns = total.dense_ffn_record_ns -| prefix.dense_ffn_record_ns;
     delta.final_record_ns = total.final_record_ns -| prefix.final_record_ns;
     delta.gpu_completion_wait_ns = total.gpu_completion_wait_ns -| prefix.gpu_completion_wait_ns;
+    delta.decode_async_submits = total.decode_async_submits -| prefix.decode_async_submits;
+    delta.decode_async_max_pending = total.decode_async_max_pending;
+    delta.decode_async_queue_waits = total.decode_async_queue_waits -| prefix.decode_async_queue_waits;
+    delta.decode_async_queue_pending_cmds = total.decode_async_queue_pending_cmds -| prefix.decode_async_queue_pending_cmds;
+    delta.decode_async_queue_wait_ns = total.decode_async_queue_wait_ns -| prefix.decode_async_queue_wait_ns;
+    delta.decode_async_final_waits = total.decode_async_final_waits -| prefix.decode_async_final_waits;
+    delta.decode_async_final_pending_cmds = total.decode_async_final_pending_cmds -| prefix.decode_async_final_pending_cmds;
+    delta.decode_async_final_wait_ns = total.decode_async_final_wait_ns -| prefix.decode_async_final_wait_ns;
+    delta.decode_async_submitted_dispatch_calls = total.decode_async_submitted_dispatch_calls -| prefix.decode_async_submitted_dispatch_calls;
+    delta.decode_async_submitted_barrier_calls = total.decode_async_submitted_barrier_calls -| prefix.decode_async_submitted_barrier_calls;
+    delta.decode_async_submitted_resource_barrier_resources = total.decode_async_submitted_resource_barrier_resources -| prefix.decode_async_submitted_resource_barrier_resources;
+    delta.decode_async_final_dispatch_calls = total.decode_async_final_dispatch_calls -| prefix.decode_async_final_dispatch_calls;
+    delta.decode_async_final_barrier_calls = total.decode_async_final_barrier_calls -| prefix.decode_async_final_barrier_calls;
+    delta.decode_async_final_resource_barrier_resources = total.decode_async_final_resource_barrier_resources -| prefix.decode_async_final_resource_barrier_resources;
+    for (0..decode_async_profile_slots) |idx| {
+        delta.decode_async_slot_submits[idx] = total.decode_async_slot_submits[idx] -| prefix.decode_async_slot_submits[idx];
+        delta.decode_async_slot_dispatch_calls[idx] = total.decode_async_slot_dispatch_calls[idx] -| prefix.decode_async_slot_dispatch_calls[idx];
+        delta.decode_async_slot_barrier_calls[idx] = total.decode_async_slot_barrier_calls[idx] -| prefix.decode_async_slot_barrier_calls[idx];
+        delta.decode_async_slot_resource_barrier_resources[idx] = total.decode_async_slot_resource_barrier_resources[idx] -| prefix.decode_async_slot_resource_barrier_resources[idx];
+        delta.decode_async_slot_completed_cmds[idx] = total.decode_async_slot_completed_cmds[idx] -| prefix.decode_async_slot_completed_cmds[idx];
+        delta.decode_async_slot_gpu_ns[idx] = total.decode_async_slot_gpu_ns[idx] -| prefix.decode_async_slot_gpu_ns[idx];
+        delta.decode_async_slot_encode_ns[idx] = total.decode_async_slot_encode_ns[idx] -| prefix.decode_async_slot_encode_ns[idx];
+        delta.decode_async_slot_layer_range_submits[idx] = total.decode_async_slot_layer_range_submits[idx] -| prefix.decode_async_slot_layer_range_submits[idx];
+        delta.decode_async_slot_layer_start_sum[idx] = total.decode_async_slot_layer_start_sum[idx] -| prefix.decode_async_slot_layer_start_sum[idx];
+        delta.decode_async_slot_layer_end_sum[idx] = total.decode_async_slot_layer_end_sum[idx] -| prefix.decode_async_slot_layer_end_sum[idx];
+        delta.decode_async_slot_full_attn_layers[idx] = total.decode_async_slot_full_attn_layers[idx] -| prefix.decode_async_slot_full_attn_layers[idx];
+        delta.decode_async_slot_ssm_layers[idx] = total.decode_async_slot_ssm_layers[idx] -| prefix.decode_async_slot_ssm_layers[idx];
+        delta.decode_async_slot_dense_ffn_layers[idx] = total.decode_async_slot_dense_ffn_layers[idx] -| prefix.decode_async_slot_dense_ffn_layers[idx];
+        delta.decode_async_slot_full_attn_bytes[idx] = total.decode_async_slot_full_attn_bytes[idx] -| prefix.decode_async_slot_full_attn_bytes[idx];
+        delta.decode_async_slot_ssm_projection_bytes[idx] = total.decode_async_slot_ssm_projection_bytes[idx] -| prefix.decode_async_slot_ssm_projection_bytes[idx];
+        delta.decode_async_slot_ssm_qkv_bytes[idx] = total.decode_async_slot_ssm_qkv_bytes[idx] -| prefix.decode_async_slot_ssm_qkv_bytes[idx];
+        delta.decode_async_slot_ssm_gate_bytes[idx] = total.decode_async_slot_ssm_gate_bytes[idx] -| prefix.decode_async_slot_ssm_gate_bytes[idx];
+        delta.decode_async_slot_ssm_tail_bytes[idx] = total.decode_async_slot_ssm_tail_bytes[idx] -| prefix.decode_async_slot_ssm_tail_bytes[idx];
+        delta.decode_async_slot_ssm_out_bytes[idx] = total.decode_async_slot_ssm_out_bytes[idx] -| prefix.decode_async_slot_ssm_out_bytes[idx];
+        delta.decode_async_slot_dense_ffn_bytes[idx] = total.decode_async_slot_dense_ffn_bytes[idx] -| prefix.decode_async_slot_dense_ffn_bytes[idx];
+        delta.decode_async_slot_dense_gate_bytes[idx] = total.decode_async_slot_dense_gate_bytes[idx] -| prefix.decode_async_slot_dense_gate_bytes[idx];
+        delta.decode_async_slot_dense_up_bytes[idx] = total.decode_async_slot_dense_up_bytes[idx] -| prefix.decode_async_slot_dense_up_bytes[idx];
+        delta.decode_async_slot_dense_down_bytes[idx] = total.decode_async_slot_dense_down_bytes[idx] -| prefix.decode_async_slot_dense_down_bytes[idx];
+        delta.decode_async_slot_ssm_barrier_phases[idx] = SsmBarrierPhaseCounters.diff(total.decode_async_slot_ssm_barrier_phases[idx], prefix.decode_async_slot_ssm_barrier_phases[idx]);
+        delta.decode_async_slot_dense_barrier_phases[idx] = DenseFfnBarrierPhaseCounters.diff(total.decode_async_slot_dense_barrier_phases[idx], prefix.decode_async_slot_dense_barrier_phases[idx]);
+        delta.decode_async_slot_dense_dispatch_phases[idx] = DenseFfnBarrierPhaseCounters.diff(total.decode_async_slot_dense_dispatch_phases[idx], prefix.decode_async_slot_dense_dispatch_phases[idx]);
+        delta.decode_async_slot_dense_scope_barrier_phases[idx] = DenseFfnBarrierPhaseCounters.diff(total.decode_async_slot_dense_scope_barrier_phases[idx], prefix.decode_async_slot_dense_scope_barrier_phases[idx]);
+        delta.decode_async_slot_dense_resource_barrier_phases[idx] = DenseFfnBarrierPhaseCounters.diff(total.decode_async_slot_dense_resource_barrier_phases[idx], prefix.decode_async_slot_dense_resource_barrier_phases[idx]);
+        delta.decode_async_slot_dense_resource_barrier_entries_phases[idx] = DenseFfnBarrierPhaseCounters.diff(total.decode_async_slot_dense_resource_barrier_entries_phases[idx], prefix.decode_async_slot_dense_resource_barrier_entries_phases[idx]);
+        delta.decode_async_slot_dense_barrier_encode_ns_phases[idx] = DenseFfnBarrierPhaseNsCounters.diff(total.decode_async_slot_dense_barrier_encode_ns_phases[idx], prefix.decode_async_slot_dense_barrier_encode_ns_phases[idx]);
+        delta.decode_async_slot_dense_scope_barrier_encode_ns_phases[idx] = DenseFfnBarrierPhaseNsCounters.diff(total.decode_async_slot_dense_scope_barrier_encode_ns_phases[idx], prefix.decode_async_slot_dense_scope_barrier_encode_ns_phases[idx]);
+        delta.decode_async_slot_dense_resource_barrier_encode_ns_phases[idx] = DenseFfnBarrierPhaseNsCounters.diff(total.decode_async_slot_dense_resource_barrier_encode_ns_phases[idx], prefix.decode_async_slot_dense_resource_barrier_encode_ns_phases[idx]);
+    }
     delta.sample_ns = total.sample_ns -| prefix.sample_ns;
     delta.total_step_ns = total.total_step_ns -| prefix.total_step_ns;
     delta.debug_validation_ns = total.debug_validation_ns -| prefix.debug_validation_ns;
@@ -1601,6 +2327,16 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.ssm_qkv_projection_bytes = total.ssm_qkv_projection_bytes -| prefix.ssm_qkv_projection_bytes;
     delta.ssm_gate_projection_bytes = total.ssm_gate_projection_bytes -| prefix.ssm_gate_projection_bytes;
     delta.ssm_tail_projection_bytes = total.ssm_tail_projection_bytes -| prefix.ssm_tail_projection_bytes;
+    delta.ssm_qkv_gate_pair_calls = total.ssm_qkv_gate_pair_calls -| prefix.ssm_qkv_gate_pair_calls;
+    delta.ssm_qkv_gate_pair_bytes = total.ssm_qkv_gate_pair_bytes -| prefix.ssm_qkv_gate_pair_bytes;
+    delta.ssm_qkv_gate_pair_q4q4_calls = total.ssm_qkv_gate_pair_q4q4_calls -| prefix.ssm_qkv_gate_pair_q4q4_calls;
+    delta.ssm_qkv_gate_pair_q4q4_bytes = total.ssm_qkv_gate_pair_q4q4_bytes -| prefix.ssm_qkv_gate_pair_q4q4_bytes;
+    delta.ssm_qkv_gate_pair_q6q4_calls = total.ssm_qkv_gate_pair_q6q4_calls -| prefix.ssm_qkv_gate_pair_q6q4_calls;
+    delta.ssm_qkv_gate_pair_q6q4_bytes = total.ssm_qkv_gate_pair_q6q4_bytes -| prefix.ssm_qkv_gate_pair_q6q4_bytes;
+    delta.ssm_qkv_gate_pair_q8q8_calls = total.ssm_qkv_gate_pair_q8q8_calls -| prefix.ssm_qkv_gate_pair_q8q8_calls;
+    delta.ssm_qkv_gate_pair_q8q8_bytes = total.ssm_qkv_gate_pair_q8q8_bytes -| prefix.ssm_qkv_gate_pair_q8q8_bytes;
+    delta.ssm_qkv_gate_pair_other_calls = total.ssm_qkv_gate_pair_other_calls -| prefix.ssm_qkv_gate_pair_other_calls;
+    delta.ssm_qkv_gate_pair_other_bytes = total.ssm_qkv_gate_pair_other_bytes -| prefix.ssm_qkv_gate_pair_other_bytes;
     delta.ssm_out_bytes = total.ssm_out_bytes -| prefix.ssm_out_bytes;
     delta.full_attn_bytes = total.full_attn_bytes -| prefix.full_attn_bytes;
     delta.full_attn_projection_bytes = total.full_attn_projection_bytes -| prefix.full_attn_projection_bytes;
@@ -1628,6 +2364,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
     delta.dense_ffn_bytes = total.dense_ffn_bytes -| prefix.dense_ffn_bytes;
+    delta.dense_ffn_gate_bytes = total.dense_ffn_gate_bytes -| prefix.dense_ffn_gate_bytes;
+    delta.dense_ffn_up_bytes = total.dense_ffn_up_bytes -| prefix.dense_ffn_up_bytes;
+    delta.dense_ffn_down_bytes = total.dense_ffn_down_bytes -| prefix.dense_ffn_down_bytes;
     delta.moe_expert_bytes = total.moe_expert_bytes -| prefix.moe_expert_bytes;
     delta.moe_expert_gate_up_bytes = total.moe_expert_gate_up_bytes -| prefix.moe_expert_gate_up_bytes;
     delta.moe_expert_down_bytes = total.moe_expert_down_bytes -| prefix.moe_expert_down_bytes;
@@ -1709,6 +2448,28 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.router_topk_calls,
         nsToMs(profile.router_cpu_ns),
     });
+    if (profile.ssm_qkv_gate_pair_calls > 0) {
+        log.info("  {s} ssm qkv+gate pair candidates: calls {d} bytes {d:.2} GiB | q4/q4 {d} {d:.2} GiB q6/q4 {d} {d:.2} GiB q8/q8 {d} {d:.2} GiB other {d} {d:.2} GiB", .{
+            label,
+            profile.ssm_qkv_gate_pair_calls,
+            bytesToGiB(profile.ssm_qkv_gate_pair_bytes),
+            profile.ssm_qkv_gate_pair_q4q4_calls,
+            bytesToGiB(profile.ssm_qkv_gate_pair_q4q4_bytes),
+            profile.ssm_qkv_gate_pair_q6q4_calls,
+            bytesToGiB(profile.ssm_qkv_gate_pair_q6q4_bytes),
+            profile.ssm_qkv_gate_pair_q8q8_calls,
+            bytesToGiB(profile.ssm_qkv_gate_pair_q8q8_bytes),
+            profile.ssm_qkv_gate_pair_other_calls,
+            bytesToGiB(profile.ssm_qkv_gate_pair_other_bytes),
+        });
+    }
+    log.info("  {s} buckets: dense ffn total {d:.2} GiB gate {d:.2} GiB up {d:.2} GiB down {d:.2} GiB", .{
+        label,
+        bytesToGiB(profile.dense_ffn_bytes),
+        bytesToGiB(profile.dense_ffn_gate_bytes),
+        bytesToGiB(profile.dense_ffn_up_bytes),
+        bytesToGiB(profile.dense_ffn_down_bytes),
+    });
     log.info("  {s} buckets: moe gate/up {d:.2} GiB down {d:.2} GiB | shared gate/up {d:.2} GiB down {d:.2} GiB | waits {d} commits {d:.2} ms", .{
         label,
         bytesToGiB(profile.moe_expert_gate_up_bytes),
@@ -1718,6 +2479,67 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.commit_waits,
         nsToMs(profile.gpu_completion_wait_ns),
     });
+    if (profile.decode_async_submits > 0 or profile.decode_async_final_waits > 0 or profile.decode_async_queue_waits > 0) {
+        const avg_final_pending = if (profile.decode_async_final_waits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_final_pending_cmds)) / @as(f64, @floatFromInt(profile.decode_async_final_waits))
+        else
+            0.0;
+        const avg_queue_pending = if (profile.decode_async_queue_waits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_queue_pending_cmds)) / @as(f64, @floatFromInt(profile.decode_async_queue_waits))
+        else
+            0.0;
+        log.info("  {s} async decode queue: submits {d} max_pending {d} final_waits {d} avg_pending/final {d:.1} final_wait {d:.2} ms | queue_waits {d} avg_pending/queue {d:.1} queue_wait {d:.2} ms", .{
+            label,
+            profile.decode_async_submits,
+            profile.decode_async_max_pending,
+            profile.decode_async_final_waits,
+            avg_final_pending,
+            nsToMs(profile.decode_async_final_wait_ns),
+            profile.decode_async_queue_waits,
+            avg_queue_pending,
+            nsToMs(profile.decode_async_queue_wait_ns),
+        });
+        const avg_submit_dispatch = if (profile.decode_async_submits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_submitted_dispatch_calls)) / @as(f64, @floatFromInt(profile.decode_async_submits))
+        else
+            0.0;
+        const avg_submit_barriers = if (profile.decode_async_submits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_submitted_barrier_calls)) / @as(f64, @floatFromInt(profile.decode_async_submits))
+        else
+            0.0;
+        const avg_submit_resource_entries = if (profile.decode_async_submits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_submitted_resource_barrier_resources)) / @as(f64, @floatFromInt(profile.decode_async_submits))
+        else
+            0.0;
+        const avg_final_dispatch = if (profile.decode_async_final_waits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_final_dispatch_calls)) / @as(f64, @floatFromInt(profile.decode_async_final_waits))
+        else
+            0.0;
+        const avg_final_barriers = if (profile.decode_async_final_waits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_final_barrier_calls)) / @as(f64, @floatFromInt(profile.decode_async_final_waits))
+        else
+            0.0;
+        const avg_final_resource_entries = if (profile.decode_async_final_waits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_final_resource_barrier_resources)) / @as(f64, @floatFromInt(profile.decode_async_final_waits))
+        else
+            0.0;
+        log.info("  {s} async decode work: submitted dispatch {d} barriers {d} resource-entries {d} avg/submit {d:.1}/{d:.1}/{d:.1} | final dispatch {d} barriers {d} resource-entries {d} avg/final {d:.1}/{d:.1}/{d:.1}", .{
+            label,
+            profile.decode_async_submitted_dispatch_calls,
+            profile.decode_async_submitted_barrier_calls,
+            profile.decode_async_submitted_resource_barrier_resources,
+            avg_submit_dispatch,
+            avg_submit_barriers,
+            avg_submit_resource_entries,
+            profile.decode_async_final_dispatch_calls,
+            profile.decode_async_final_barrier_calls,
+            profile.decode_async_final_resource_barrier_resources,
+            avg_final_dispatch,
+            avg_final_barriers,
+            avg_final_resource_entries,
+        });
+        logDecodeAsyncSlotBreakdown(label, profile);
+    }
     log.info("  {s} moe finalizers: scalar+norm {d} scalar {d} f32+seed+norm {d} f32+norm {d} f32 {d} shared {d} routed {d} | gemma weighted+post {d} post {d} staged {d}", .{
         label,
         profile.gpu_moe_finalizer_scalar_seed_norm_calls,
@@ -1839,6 +2661,358 @@ fn denseGemmaQ4KGeGLUValidationTensorName(tensor: DenseGemmaQ4KGeGLUValidationTe
     };
 }
 
+fn logSsmBarrierKindBreakdown(label: []const u8, profile: RuntimeProfile) void {
+    const scope = profile.ssm_scope_barrier_calls_by_phase;
+    const resource = profile.ssm_resource_barrier_calls_by_phase;
+    const entries = profile.ssm_resource_barrier_resources_by_phase;
+    if (scope.total() > 0) {
+        log.info("  {s} ssm scope barriers: proj-norm {d} qkv {d} tail {d} conv {d} delta {d} gated {d} out {d} residual {d}", .{
+            label,
+            scope.proj_norm,
+            scope.qkv,
+            scope.tail,
+            scope.conv,
+            scope.delta,
+            scope.gated_norm,
+            scope.out,
+            scope.residual,
+        });
+    }
+    if (resource.total() > 0) {
+        log.info("  {s} ssm resource barriers: proj-norm {d} qkv {d} tail {d} conv {d} delta {d} gated {d} out {d} residual {d}", .{
+            label,
+            resource.proj_norm,
+            resource.qkv,
+            resource.tail,
+            resource.conv,
+            resource.delta,
+            resource.gated_norm,
+            resource.out,
+            resource.residual,
+        });
+    }
+    if (entries.total() > 0) {
+        log.info("  {s} ssm resource barrier entries: proj-norm {d} qkv {d} tail {d} conv {d} delta {d} gated {d} out {d} residual {d}", .{
+            label,
+            entries.proj_norm,
+            entries.qkv,
+            entries.tail,
+            entries.conv,
+            entries.delta,
+            entries.gated_norm,
+            entries.out,
+            entries.residual,
+        });
+    }
+}
+
+fn logDenseFfnBarrierKindBreakdown(label: []const u8, profile: RuntimeProfile) void {
+    const scope = profile.dense_ffn_scope_barrier_calls_by_phase;
+    const resource = profile.dense_ffn_resource_barrier_calls_by_phase;
+    const entries = profile.dense_ffn_resource_barrier_resources_by_phase;
+    if (scope.total() > 0) {
+        log.info("  {s} dense scope barriers: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d}", .{
+            label,
+            scope.norm,
+            scope.gate_up,
+            scope.activation,
+            scope.down,
+            scope.tail,
+            scope.scale,
+        });
+    }
+    if (resource.total() > 0) {
+        log.info("  {s} dense resource barriers: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d}", .{
+            label,
+            resource.norm,
+            resource.gate_up,
+            resource.activation,
+            resource.down,
+            resource.tail,
+            resource.scale,
+        });
+    }
+    if (entries.total() > 0) {
+        log.info("  {s} dense resource barrier entries: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d}", .{
+            label,
+            entries.norm,
+            entries.gate_up,
+            entries.activation,
+            entries.down,
+            entries.tail,
+            entries.scale,
+        });
+    }
+    const encode = profile.dense_ffn_barrier_encode_ns_by_phase;
+    if (encode.total() > 0) {
+        const counts = denseBarrierPhaseCountersFromProfile(profile);
+        log.info("  {s} dense barrier encode us/call: norm {d:.2} gate-up {d:.2} activation {d:.2} down {d:.2} tail {d:.2} scale {d:.2}", .{
+            label,
+            avgUs(encode.norm, counts.norm),
+            avgUs(encode.gate_up, counts.gate_up),
+            avgUs(encode.activation, counts.activation),
+            avgUs(encode.down, counts.down),
+            avgUs(encode.tail, counts.tail),
+            avgUs(encode.scale, counts.scale),
+        });
+        if (profile.dense_ffn_scope_barrier_encode_ns_by_phase.total() > 0) {
+            const scope_ns = profile.dense_ffn_scope_barrier_encode_ns_by_phase;
+            log.info("  {s} dense scope barrier encode us/call: norm {d:.2} gate-up {d:.2} activation {d:.2} down {d:.2} tail {d:.2} scale {d:.2}", .{
+                label,
+                avgUs(scope_ns.norm, scope.norm),
+                avgUs(scope_ns.gate_up, scope.gate_up),
+                avgUs(scope_ns.activation, scope.activation),
+                avgUs(scope_ns.down, scope.down),
+                avgUs(scope_ns.tail, scope.tail),
+                avgUs(scope_ns.scale, scope.scale),
+            });
+        }
+        if (profile.dense_ffn_resource_barrier_encode_ns_by_phase.total() > 0) {
+            const resource_ns = profile.dense_ffn_resource_barrier_encode_ns_by_phase;
+            log.info("  {s} dense resource barrier encode us/call: norm {d:.2} gate-up {d:.2} activation {d:.2} down {d:.2} tail {d:.2} scale {d:.2}", .{
+                label,
+                avgUs(resource_ns.norm, resource.norm),
+                avgUs(resource_ns.gate_up, resource.gate_up),
+                avgUs(resource_ns.activation, resource.activation),
+                avgUs(resource_ns.down, resource.down),
+                avgUs(resource_ns.tail, resource.tail),
+                avgUs(resource_ns.scale, resource.scale),
+            });
+        }
+    }
+}
+
+fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void {
+    var emitted_header = false;
+    var emitted_dense_header = false;
+    var emitted_phase_header = false;
+    var emitted_dense_dispatch_header = false;
+    var emitted_dense_barrier_kind_header = false;
+    var emitted_dense_barrier_encode_header = false;
+    var slowest_slot: ?usize = null;
+    var slowest_gpu_ms: f64 = 0.0;
+    for (0..decode_async_profile_slots) |slot| {
+        const submits = profile.decode_async_slot_submits[slot];
+        if (submits == 0) continue;
+        if (!emitted_header) {
+            log.info("  {s} async decode chunk slots: slot submits avg_layers attn/ssm/dense avg_dispatch avg_barriers avg_resource_entries avg_encode_ms avg_gpu_ms avg_GiB attn/ssm-proj/ssm-out/dense", .{label});
+            emitted_header = true;
+        }
+        const completed = profile.decode_async_slot_completed_cmds[slot];
+        const layer_submits = profile.decode_async_slot_layer_range_submits[slot];
+        const gpu_ms = avgMs(profile.decode_async_slot_gpu_ns[slot], completed);
+        if (completed > 0 and gpu_ms >= slowest_gpu_ms) {
+            slowest_slot = slot;
+            slowest_gpu_ms = gpu_ms;
+        }
+        log.info("  {s} async decode chunk slot {d}: {d} [{d:.1},{d:.1}) {d:.1}/{d:.1}/{d:.1} {d:.1} {d:.1} {d:.1} {d:.3} {d:.3} {d:.2}/{d:.2}/{d:.2}/{d:.2}", .{
+            label,
+            slot,
+            submits,
+            avgCount64(profile.decode_async_slot_layer_start_sum[slot], layer_submits),
+            avgCount64(profile.decode_async_slot_layer_end_sum[slot], layer_submits),
+            avgCount(profile.decode_async_slot_full_attn_layers[slot], layer_submits),
+            avgCount(profile.decode_async_slot_ssm_layers[slot], layer_submits),
+            avgCount(profile.decode_async_slot_dense_ffn_layers[slot], layer_submits),
+            avgCount(profile.decode_async_slot_dispatch_calls[slot], submits),
+            avgCount(profile.decode_async_slot_barrier_calls[slot], submits),
+            avgCount(profile.decode_async_slot_resource_barrier_resources[slot], submits),
+            avgMs(profile.decode_async_slot_encode_ns[slot], submits),
+            avgMs(profile.decode_async_slot_gpu_ns[slot], completed),
+            avgGiB(profile.decode_async_slot_full_attn_bytes[slot], layer_submits),
+            avgGiB(profile.decode_async_slot_ssm_projection_bytes[slot], layer_submits),
+            avgGiB(profile.decode_async_slot_ssm_out_bytes[slot], layer_submits),
+            avgGiB(profile.decode_async_slot_dense_ffn_bytes[slot], layer_submits),
+        });
+        const slot_total_bytes =
+            profile.decode_async_slot_full_attn_bytes[slot] +
+            profile.decode_async_slot_ssm_projection_bytes[slot] +
+            profile.decode_async_slot_ssm_out_bytes[slot] +
+            profile.decode_async_slot_dense_ffn_bytes[slot];
+        if (profile.decode_async_slot_ssm_projection_bytes[slot] > 0) {
+            log.info("  {s} async decode chunk slot {d} ssm bytes avg: qkv/gate/tail/out {d:.2}/{d:.2}/{d:.2}/{d:.2} GiB pct_slot_total {d:.1}/{d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                slot,
+                avgGiB(profile.decode_async_slot_ssm_qkv_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_gate_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_tail_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_out_bytes[slot], layer_submits),
+                pctOf(slot_total_bytes, profile.decode_async_slot_ssm_qkv_bytes[slot]),
+                pctOf(slot_total_bytes, profile.decode_async_slot_ssm_gate_bytes[slot]),
+                pctOf(slot_total_bytes, profile.decode_async_slot_ssm_tail_bytes[slot]),
+                pctOf(slot_total_bytes, profile.decode_async_slot_ssm_out_bytes[slot]),
+            });
+        }
+        if (profile.decode_async_slot_dense_ffn_bytes[slot] > 0) {
+            if (!emitted_dense_header) {
+                log.info("  {s} async decode chunk slot dense byte order: gate/up/down", .{label});
+                emitted_dense_header = true;
+            }
+            log.info("  {s} async decode chunk slot {d} dense bytes avg: {d:.2}/{d:.2}/{d:.2} GiB pct {d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                slot,
+                avgGiB(profile.decode_async_slot_dense_gate_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_dense_up_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_dense_down_bytes[slot], layer_submits),
+                pctOf(profile.decode_async_slot_dense_ffn_bytes[slot], profile.decode_async_slot_dense_gate_bytes[slot]),
+                pctOf(profile.decode_async_slot_dense_ffn_bytes[slot], profile.decode_async_slot_dense_up_bytes[slot]),
+                pctOf(profile.decode_async_slot_dense_ffn_bytes[slot], profile.decode_async_slot_dense_down_bytes[slot]),
+            });
+        }
+        const ssm_barriers = profile.decode_async_slot_ssm_barrier_phases[slot];
+        const dense_barriers = profile.decode_async_slot_dense_barrier_phases[slot];
+        if (ssm_barriers.total() > 0 or dense_barriers.total() > 0) {
+            if (!emitted_phase_header) {
+                log.info("  {s} async decode chunk slot barrier phase order: ssm proj-norm/qkv/tail/conv/delta/gated/out/residual | dense norm/gate-up/activation/down/tail/scale", .{label});
+                emitted_phase_header = true;
+            }
+            log.info("  {s} async decode chunk slot {d} barrier phases avg: ssm {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1} dense {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                slot,
+                avgCount(ssm_barriers.proj_norm, submits),
+                avgCount(ssm_barriers.qkv, submits),
+                avgCount(ssm_barriers.tail, submits),
+                avgCount(ssm_barriers.conv, submits),
+                avgCount(ssm_barriers.delta, submits),
+                avgCount(ssm_barriers.gated_norm, submits),
+                avgCount(ssm_barriers.out, submits),
+                avgCount(ssm_barriers.residual, submits),
+                avgCount(dense_barriers.norm, submits),
+                avgCount(dense_barriers.gate_up, submits),
+                avgCount(dense_barriers.activation, submits),
+                avgCount(dense_barriers.down, submits),
+                avgCount(dense_barriers.tail, submits),
+                avgCount(dense_barriers.scale, submits),
+            });
+        }
+        const dense_dispatch = profile.decode_async_slot_dense_dispatch_phases[slot];
+        if (dense_dispatch.total() > 0) {
+            if (!emitted_dense_dispatch_header) {
+                log.info("  {s} async decode chunk slot dense dispatch phase order: norm/gate-up/activation/down/tail/scale", .{label});
+                emitted_dense_dispatch_header = true;
+            }
+            log.info("  {s} async decode chunk slot {d} dense dispatch phases avg: {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                slot,
+                avgCount(dense_dispatch.norm, submits),
+                avgCount(dense_dispatch.gate_up, submits),
+                avgCount(dense_dispatch.activation, submits),
+                avgCount(dense_dispatch.down, submits),
+                avgCount(dense_dispatch.tail, submits),
+                avgCount(dense_dispatch.scale, submits),
+            });
+        }
+        const dense_scope = profile.decode_async_slot_dense_scope_barrier_phases[slot];
+        const dense_resource = profile.decode_async_slot_dense_resource_barrier_phases[slot];
+        const dense_entries = profile.decode_async_slot_dense_resource_barrier_entries_phases[slot];
+        if (dense_scope.total() > 0 or dense_resource.total() > 0 or dense_entries.total() > 0) {
+            if (!emitted_dense_barrier_kind_header) {
+                log.info("  {s} async decode chunk slot dense barrier-kind phase order: scope norm/gate-up/activation/down/tail/scale | resource same | entries same", .{label});
+                emitted_dense_barrier_kind_header = true;
+            }
+            log.info("  {s} async decode chunk slot {d} dense barrier-kind phases avg: scope {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1} resource {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1} entries {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                slot,
+                avgCount(dense_scope.norm, submits),
+                avgCount(dense_scope.gate_up, submits),
+                avgCount(dense_scope.activation, submits),
+                avgCount(dense_scope.down, submits),
+                avgCount(dense_scope.tail, submits),
+                avgCount(dense_scope.scale, submits),
+                avgCount(dense_resource.norm, submits),
+                avgCount(dense_resource.gate_up, submits),
+                avgCount(dense_resource.activation, submits),
+                avgCount(dense_resource.down, submits),
+                avgCount(dense_resource.tail, submits),
+                avgCount(dense_resource.scale, submits),
+                avgCount(dense_entries.norm, submits),
+                avgCount(dense_entries.gate_up, submits),
+                avgCount(dense_entries.activation, submits),
+                avgCount(dense_entries.down, submits),
+                avgCount(dense_entries.tail, submits),
+                avgCount(dense_entries.scale, submits),
+            });
+        }
+        const dense_encode = profile.decode_async_slot_dense_barrier_encode_ns_phases[slot];
+        if (dense_encode.total() > 0) {
+            if (!emitted_dense_barrier_encode_header) {
+                log.info("  {s} async decode chunk slot dense barrier encode us/call order: all norm/gate-up/activation/down/tail/scale | scope same | resource same", .{label});
+                emitted_dense_barrier_encode_header = true;
+            }
+            const dense_scope_ns = profile.decode_async_slot_dense_scope_barrier_encode_ns_phases[slot];
+            const dense_resource_ns = profile.decode_async_slot_dense_resource_barrier_encode_ns_phases[slot];
+            log.info("  {s} async decode chunk slot {d} dense barrier encode us/call: all {d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2} scope {d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2} resource {d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2}", .{
+                label,
+                slot,
+                avgUs(dense_encode.norm, dense_barriers.norm),
+                avgUs(dense_encode.gate_up, dense_barriers.gate_up),
+                avgUs(dense_encode.activation, dense_barriers.activation),
+                avgUs(dense_encode.down, dense_barriers.down),
+                avgUs(dense_encode.tail, dense_barriers.tail),
+                avgUs(dense_encode.scale, dense_barriers.scale),
+                avgUs(dense_scope_ns.norm, dense_scope.norm),
+                avgUs(dense_scope_ns.gate_up, dense_scope.gate_up),
+                avgUs(dense_scope_ns.activation, dense_scope.activation),
+                avgUs(dense_scope_ns.down, dense_scope.down),
+                avgUs(dense_scope_ns.tail, dense_scope.tail),
+                avgUs(dense_scope_ns.scale, dense_scope.scale),
+                avgUs(dense_resource_ns.norm, dense_resource.norm),
+                avgUs(dense_resource_ns.gate_up, dense_resource.gate_up),
+                avgUs(dense_resource_ns.activation, dense_resource.activation),
+                avgUs(dense_resource_ns.down, dense_resource.down),
+                avgUs(dense_resource_ns.tail, dense_resource.tail),
+                avgUs(dense_resource_ns.scale, dense_resource.scale),
+            });
+        }
+    }
+    if (slowest_slot) |slot| {
+        const submits = profile.decode_async_slot_submits[slot];
+        const layer_submits = profile.decode_async_slot_layer_range_submits[slot];
+        const total_bytes =
+            profile.decode_async_slot_full_attn_bytes[slot] +
+            profile.decode_async_slot_ssm_projection_bytes[slot] +
+            profile.decode_async_slot_ssm_out_bytes[slot] +
+            profile.decode_async_slot_dense_ffn_bytes[slot];
+        log.info("  {s} async decode chunk bottleneck: slowest_slot {d} [{d:.1},{d:.1}) avg_encode_ms {d:.3} avg_gpu_ms {d:.3} avg_total_GiB {d:.2} eff_GiB/s {d:.1} dense_bytes {d:.1}% dispatch/barriers {d:.1}/{d:.1}", .{
+            label,
+            slot,
+            avgCount64(profile.decode_async_slot_layer_start_sum[slot], layer_submits),
+            avgCount64(profile.decode_async_slot_layer_end_sum[slot], layer_submits),
+            avgMs(profile.decode_async_slot_encode_ns[slot], submits),
+            slowest_gpu_ms,
+            avgGiB(total_bytes, layer_submits),
+            bytesPerSecondGiB(total_bytes, profile.decode_async_slot_gpu_ns[slot]),
+            pctOf(total_bytes, profile.decode_async_slot_dense_ffn_bytes[slot]),
+            avgCount(profile.decode_async_slot_dispatch_calls[slot], submits),
+            avgCount(profile.decode_async_slot_barrier_calls[slot], submits),
+        });
+        if (profile.decode_async_slot_dense_ffn_bytes[slot] > 0) {
+            log.info("  {s} async decode chunk bottleneck dense split: gate/up/down {d:.2}/{d:.2}/{d:.2} GiB pct_total {d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                avgGiB(profile.decode_async_slot_dense_gate_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_dense_up_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_dense_down_bytes[slot], layer_submits),
+                pctOf(total_bytes, profile.decode_async_slot_dense_gate_bytes[slot]),
+                pctOf(total_bytes, profile.decode_async_slot_dense_up_bytes[slot]),
+                pctOf(total_bytes, profile.decode_async_slot_dense_down_bytes[slot]),
+            });
+        }
+        if (profile.decode_async_slot_ssm_projection_bytes[slot] > 0 or profile.decode_async_slot_ssm_out_bytes[slot] > 0) {
+            log.info("  {s} async decode chunk bottleneck ssm split: qkv/gate/tail/out {d:.2}/{d:.2}/{d:.2}/{d:.2} GiB pct_total {d:.1}/{d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                avgGiB(profile.decode_async_slot_ssm_qkv_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_gate_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_tail_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_out_bytes[slot], layer_submits),
+                pctOf(total_bytes, profile.decode_async_slot_ssm_qkv_bytes[slot]),
+                pctOf(total_bytes, profile.decode_async_slot_ssm_gate_bytes[slot]),
+                pctOf(total_bytes, profile.decode_async_slot_ssm_tail_bytes[slot]),
+                pctOf(total_bytes, profile.decode_async_slot_ssm_out_bytes[slot]),
+            });
+        }
+    }
+}
+
 fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
     if (profile.decode_steps > 0) {
         const steps_f = @as(f64, @floatFromInt(profile.decode_steps));
@@ -1923,6 +3097,35 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
         });
     }
 
+    if (profile.ssm_barrier_calls > 0) {
+        const typed_ssm_barriers =
+            profile.ssm_proj_norm_barrier_calls +
+            profile.ssm_qkv_barrier_calls +
+            profile.ssm_tail_barrier_calls +
+            profile.ssm_conv_barrier_calls +
+            profile.ssm_delta_barrier_calls +
+            profile.ssm_gated_norm_barrier_calls +
+            profile.ssm_out_barrier_calls +
+            profile.ssm_residual_barrier_calls;
+        const other_ssm_barriers = if (profile.ssm_barrier_calls > typed_ssm_barriers)
+            profile.ssm_barrier_calls - typed_ssm_barriers
+        else
+            0;
+        log.info("  {s} ssm barriers: proj-norm {d} qkv {d} tail {d} conv {d} delta {d} gated {d} out {d} residual {d} other {d}", .{
+            label,
+            profile.ssm_proj_norm_barrier_calls,
+            profile.ssm_qkv_barrier_calls,
+            profile.ssm_tail_barrier_calls,
+            profile.ssm_conv_barrier_calls,
+            profile.ssm_delta_barrier_calls,
+            profile.ssm_gated_norm_barrier_calls,
+            profile.ssm_out_barrier_calls,
+            profile.ssm_residual_barrier_calls,
+            other_ssm_barriers,
+        });
+        logSsmBarrierKindBreakdown(label, profile);
+    }
+
     if (profile.dense_ffn_barrier_calls > 0) {
         const typed_dense_barriers =
             profile.dense_ffn_norm_barrier_calls +
@@ -1945,6 +3148,7 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.dense_ffn_scale_barrier_calls,
             other_dense_barriers,
         });
+        logDenseFfnBarrierKindBreakdown(label, profile);
     }
     const dense_dispatches =
         profile.dense_ffn_norm_dispatch_calls +
@@ -1963,6 +3167,28 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.dense_ffn_tail_dispatch_calls,
             profile.dense_ffn_scale_dispatch_calls,
         });
+        log.info("  {s} dense tail variants: post-norm {d} post+next-norm {d} residual+next-norm {d} residual-acc {d} final-norm {d}", .{
+            label,
+            profile.dense_ffn_tail_post_norm_dispatch_calls,
+            profile.dense_ffn_tail_post_norm_next_norm_calls,
+            profile.dense_ffn_tail_residual_next_norm_calls,
+            profile.dense_ffn_tail_residual_acc_calls,
+            profile.dense_ffn_tail_final_norm_calls,
+        });
+        const dense_tail_variant_barriers =
+            profile.dense_ffn_tail_post_norm_next_norm_barrier_calls +
+            profile.dense_ffn_tail_residual_next_norm_barrier_calls +
+            profile.dense_ffn_tail_residual_acc_barrier_calls +
+            profile.dense_ffn_tail_final_norm_barrier_calls;
+        if (dense_tail_variant_barriers > 0) {
+            log.info("  {s} dense tail barriers: post+next-norm {d} residual+next-norm {d} residual-acc {d} final-norm {d}", .{
+                label,
+                profile.dense_ffn_tail_post_norm_next_norm_barrier_calls,
+                profile.dense_ffn_tail_residual_next_norm_barrier_calls,
+                profile.dense_ffn_tail_residual_acc_barrier_calls,
+                profile.dense_ffn_tail_final_norm_barrier_calls,
+            });
+        }
     }
 }
 
@@ -1985,6 +3211,56 @@ fn dmmvPathLabel(path: DmmvPathClass) []const u8 {
         .lm_head => "lm-head",
         .dense_ffn => "dense",
     };
+}
+
+fn dmmvDetailLabel(detail: DmmvDetailClass) []const u8 {
+    return switch (detail) {
+        .none => "none",
+        .full_attn_projection => "attn-proj",
+        .full_attn_output => "attn-out",
+        .ssm_qkv => "ssm-qkv",
+        .ssm_gate => "ssm-gate",
+        .ssm_tail => "ssm-tail",
+        .ssm_out => "ssm-out",
+        .dense_gate => "dense-gate",
+        .dense_up => "dense-up",
+        .dense_down => "dense-down",
+        .shared_gate_up => "shared-gate-up",
+        .shared_down => "shared-down",
+        .moe_gate_up => "moe-gate-up",
+        .moe_down => "moe-down",
+    };
+}
+
+fn setDmmvTimingLabel(
+    cmd: *MetalCommand,
+    engine: *const InferenceEngine,
+    tensor: *const metal_loader.LoadedTensor,
+    rows: u32,
+    cols: u32,
+    pipe: *const MetalPipeline,
+    buf: *[192]u8,
+) bool {
+    if (!kernel_timing.enabled) return false;
+
+    // Same metadata discipline as llama.cpp `ggml_metal_op_encode_impl`: the
+    // probe labels the logical graph edge, not just the reusable pipeline.
+    const path = classifyDmmvPath(engine, tensor);
+    const detail = classifyDmmvDetail(engine, tensor, path);
+    const label = std.fmt.bufPrint(
+        buf,
+        "dmmv {s} {s}/{s} M={d} K={d} pipe={s}",
+        .{
+            @tagName(tensor.info.type_),
+            dmmvPathLabel(path),
+            dmmvDetailLabel(detail),
+            rows,
+            cols,
+            pipe.name orelse "<unnamed>",
+        },
+    ) catch return false;
+    cmd.setTimingLabel(label);
+    return true;
 }
 
 fn logDmmvHotShapes(label: []const u8, stats: []const DmmvShapeStat) void {
@@ -2015,10 +3291,11 @@ fn logDmmvHotShapes(label: []const u8, stats: []const DmmvShapeStat) void {
     for (top_idxs, 0..) |maybe_idx, rank| {
         if (maybe_idx) |idx| {
             const slot = stats[idx];
-            log.info("  {s} hot #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
+            log.info("  {s} hot #{d}: {s}/{s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
                 label,
                 rank + 1,
                 dmmvPathLabel(slot.path),
+                dmmvDetailLabel(slot.detail),
                 slot.rows,
                 slot.cols,
                 bytesToGiB(slot.bytes),
@@ -4423,6 +5700,9 @@ pub const InferenceEngine = struct {
     // DMMV compute pipelines (one per quant type)
     dmmv_q4k_pipe: MetalPipeline,
     dmmv_q4k_k2048_pipe: MetalPipeline,
+    dmmv_q4k_k5120_pipe: MetalPipeline,
+    dmmv_q4k_k5120_llama_pipe: MetalPipeline,
+    dmmv_q4k_k17408_pipe: MetalPipeline,
     dmmv_q4k_dual_pipe: MetalPipeline,
     dmmv_q4k_dual_llama_pipe: MetalPipeline,
     dmmv_q4k_qk_dual_pipe: MetalPipeline,
@@ -4436,6 +5716,8 @@ pub const InferenceEngine = struct {
     dmmv_q5k_native_pipe: MetalPipeline,
     dmmv_q6k_pipe: MetalPipeline,
     dmmv_q6k_llama_pipe: MetalPipeline,
+    dmmv_q6k_llama_k5120_pipe: MetalPipeline,
+    dmmv_q6k_llama_k17408_pipe: MetalPipeline,
     dmmv_q8_0_pipe: MetalPipeline,
     dmmv_q5_0_pipe: MetalPipeline,
     dmmv_q5_1_pipe: MetalPipeline,
@@ -4617,6 +5899,7 @@ pub const InferenceEngine = struct {
     // SSM GPU pipelines (cross-compiled from GLSL via SPIRV-Cross)
     ssm_conv1d_pipe: MetalPipeline,
     ssm_conv1d_qwen_d4_pipe: MetalPipeline,
+    ssm_conv1d_qwen27b_d4_pipe: MetalPipeline,
     ssm_conv1d_prefill_pipe: MetalPipeline,
     ssm_conv1d_prefill_qwen_d4_pipe: MetalPipeline,
     ssm_delta_net_pipe: MetalPipeline,
@@ -4720,6 +6003,14 @@ pub const InferenceEngine = struct {
     dense_gemma_q4k_geglu_validation_emitted: bool,
     dense_gemma_q4k_geglu_validation_scanned_tokens: u32,
     dense_gemma_q4k_geglu_validation_token_limit: u32,
+    qwen35_dense_q4k_swiglu_validation_enabled: bool,
+    qwen35_dense_q4k_swiglu_validation_scan_layers: bool,
+    qwen35_dense_q4k_swiglu_validation_emitted: bool,
+    qwen35_dense_q4k_swiglu_validation_scanned_tokens: u32,
+    qwen35_dense_q4k_swiglu_validation_token_limit: u32,
+    qwen35_dense_q4k_swiglu_validation_prompt_tokens: u32,
+    qwen35_dense_q4k_swiglu_validation_ok_mask: u64,
+    qwen35_dense_q4k_swiglu_validation_fail_mask: u64,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     lm_head_argmax_cpu_reduce_pairs: u32,
@@ -4899,6 +6190,21 @@ pub const InferenceEngine = struct {
         if (dense_gemma_q4k_geglu_profile_scan) {
             log.info("Metal profile: dense Gemma31 Q4_K GeGLU validator layer-mask scan enabled at layer {d}; set ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN=0 to skip or ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_SCAN=1 for first-failure scan", .{denseGemmaQ4KGeGLUValidateLayer(&self)});
         }
+        self.qwen35_dense_q4k_swiglu_validation_enabled = qwen35DenseQ4KSwiGLUValidationRequested(cfg);
+        self.qwen35_dense_q4k_swiglu_validation_scan_layers = qwen35DenseQ4KSwiGLUValidationScanRequested();
+        self.qwen35_dense_q4k_swiglu_validation_emitted = false;
+        self.qwen35_dense_q4k_swiglu_validation_scanned_tokens = 0;
+        self.qwen35_dense_q4k_swiglu_validation_token_limit = qwen35DenseQ4KSwiGLUValidateTokens();
+        self.qwen35_dense_q4k_swiglu_validation_prompt_tokens = 0;
+        self.qwen35_dense_q4k_swiglu_validation_ok_mask = 0;
+        self.qwen35_dense_q4k_swiglu_validation_fail_mask = 0;
+        if (self.qwen35_dense_q4k_swiglu_validation_enabled) {
+            log.info("Metal validation: Qwen3.6 27B dense Q4_K gate/up+SwiGLU validator enabled at layer {d} scan={s} tokens={d}; optional token filter ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN", .{
+                qwen35DenseQ4KSwiGLUValidateLayer(&self),
+                if (self.qwen35_dense_q4k_swiglu_validation_scan_layers) "yes" else "no",
+                self.qwen35_dense_q4k_swiglu_validation_token_limit,
+            });
+        }
         self.in_prefill_phase = false;
         self.dense_gemma_wide_post_norm_prefill_enabled =
             readBoolEnv("ZINC_METAL_DENSE_GEMMA_WIDE_POST_NORM_PREFILL") orelse false;
@@ -4917,14 +6223,17 @@ pub const InferenceEngine = struct {
         self.fused_ssm_norm_enabled = readBoolEnv("ZINC_METAL_FUSED_SSM_NORM") orelse defaultFusedSsmNormEnabled(cfg);
         self.fused_ssm_delta_gated_norm_enabled =
             readBoolEnv("ZINC_METAL_FUSED_SSM_DELTA_GATED_NORM") orelse
-            defaultQwen36SsmPrefillProjectionEnabled(cfg);
+            (defaultQwen36SsmPrefillProjectionEnabled(cfg) or
+                defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg));
         self.qwen_ssm_delta_gated_norm_exact_enabled =
             readBoolEnv("ZINC_METAL_QWEN_SSM_DELTA_GATED_NORM_EXACT") orelse
-            defaultQwen36SsmPrefillProjectionEnabled(cfg);
+            (defaultQwen36SsmPrefillProjectionEnabled(cfg) or
+                defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg));
         self.private_decode_buffers = if (options.debug_validation_enabled or
             self.gemma_moe_validation_enabled or
             self.qwen_prefill_validation_enabled or
-            self.dense_gemma_q4k_geglu_validation_enabled)
+            self.dense_gemma_q4k_geglu_validation_enabled or
+            self.qwen35_dense_q4k_swiglu_validation_enabled)
             false
         else
             options.private_decode_buffers_override orelse
@@ -5136,6 +6445,24 @@ pub const InferenceEngine = struct {
         // Load DMMV compute pipelines for all quant types
         self.dmmv_q4k_pipe = try loadShaderPipeline(ctx, "dmmv_q4k");
         self.dmmv_q4k_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_k2048");
+        self.dmmv_q4k_k5120_pipe = try loadShaderPipelineWithPrefix(
+            ctx,
+            "dmmv_q4k_k5120",
+            "dmmv_q4k",
+            "#define ZINC_Q4K_FIXED_BLOCKS 20\n#define ZINC_Q4K_NSG 4\n",
+        );
+        self.dmmv_q4k_k5120_llama_pipe = try loadShaderPipelineWithPrefix(
+            ctx,
+            "dmmv_q4k_k5120_llama",
+            "dmmv_q4k",
+            "#define ZINC_Q4K_FIXED_BLOCKS 20\n",
+        );
+        self.dmmv_q4k_k17408_pipe = try loadShaderPipelineWithPrefix(
+            ctx,
+            "dmmv_q4k_k17408",
+            "dmmv_q4k",
+            "#define ZINC_Q4K_FIXED_BLOCKS 68\n",
+        );
         self.dmmv_q4k_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual");
         self.dmmv_q4k_dual_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual_llama");
         self.dmmv_q4k_qk_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qk_dual");
@@ -5149,6 +6476,18 @@ pub const InferenceEngine = struct {
         self.dmmv_q5k_native_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_native");
         self.dmmv_q6k_pipe = try loadShaderPipeline(ctx, "dmmv_q6k");
         self.dmmv_q6k_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_llama");
+        self.dmmv_q6k_llama_k5120_pipe = try loadShaderPipelineWithPrefix(
+            ctx,
+            "dmmv_q6k_llama_k5120",
+            "dmmv_q6k_llama",
+            "#define ZINC_Q6K_FIXED_BLOCKS 20\n#define ZINC_Q6K_NSG 4\n",
+        );
+        self.dmmv_q6k_llama_k17408_pipe = try loadShaderPipelineWithPrefix(
+            ctx,
+            "dmmv_q6k_llama_k17408",
+            "dmmv_q6k_llama",
+            "#define ZINC_Q6K_FIXED_BLOCKS 68\n#define ZINC_Q6K_NSG 4\n",
+        );
         self.dmmv_q8_0_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0");
         self.dmmv_q5_0_pipe = try loadShaderPipeline(ctx, "dmmv_q5_0");
         self.dmmv_q5_1_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1");
@@ -5463,6 +6802,7 @@ pub const InferenceEngine = struct {
         // SSM GPU pipelines
         self.ssm_conv1d_pipe = try loadShaderPipeline(ctx, "ssm_conv1d");
         self.ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
+        self.ssm_conv1d_qwen27b_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen27b_d4");
         self.ssm_conv1d_prefill_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill");
         self.ssm_conv1d_prefill_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
         self.ssm_delta_net_pipe = try loadShaderPipeline(ctx, "ssm_delta_net");
@@ -6099,6 +7439,9 @@ pub const InferenceEngine = struct {
 
         metal_pipeline.freePipeline(&self.dmmv_q4k_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_k2048_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_k5120_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_k5120_llama_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_k17408_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dual_llama_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_qk_dual_pipe);
@@ -6112,6 +7455,8 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q5k_native_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_llama_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q6k_llama_k5120_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q6k_llama_k17408_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_0_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_pipe);
@@ -6299,6 +7644,7 @@ pub const InferenceEngine = struct {
 
         metal_pipeline.freePipeline(&self.ssm_conv1d_pipe);
         metal_pipeline.freePipeline(&self.ssm_conv1d_qwen_d4_pipe);
+        metal_pipeline.freePipeline(&self.ssm_conv1d_qwen27b_d4_pipe);
         metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_pipe);
         metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_qwen_d4_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_pipe);
@@ -6475,6 +7821,11 @@ pub const InferenceEngine = struct {
         self.qwen_moe_route_validate_failure_hint_emitted = false;
         self.dense_gemma_q4k_geglu_validation_emitted = false;
         self.dense_gemma_q4k_geglu_validation_scanned_tokens = 0;
+        self.qwen35_dense_q4k_swiglu_validation_emitted = false;
+        self.qwen35_dense_q4k_swiglu_validation_scanned_tokens = 0;
+        self.qwen35_dense_q4k_swiglu_validation_prompt_tokens = 0;
+        self.qwen35_dense_q4k_swiglu_validation_ok_mask = 0;
+        self.qwen35_dense_q4k_swiglu_validation_fail_mask = 0;
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -7976,6 +9327,20 @@ pub const InferenceEngine = struct {
                     profile.dense_ffn_scale_barrier_calls,
                     other_dense_barriers,
                 });
+                logDenseFfnBarrierKindBreakdown("request", profile);
+                const dense_tail_variant_barriers =
+                    profile.dense_ffn_tail_post_norm_next_norm_barrier_calls +
+                    profile.dense_ffn_tail_residual_next_norm_barrier_calls +
+                    profile.dense_ffn_tail_residual_acc_barrier_calls +
+                    profile.dense_ffn_tail_final_norm_barrier_calls;
+                if (dense_tail_variant_barriers > 0) {
+                    log.info("  dense tail barriers/request: post+next-norm {d} residual+next-norm {d} residual-acc {d} final-norm {d}", .{
+                        profile.dense_ffn_tail_post_norm_next_norm_barrier_calls,
+                        profile.dense_ffn_tail_residual_next_norm_barrier_calls,
+                        profile.dense_ffn_tail_residual_acc_barrier_calls,
+                        profile.dense_ffn_tail_final_norm_barrier_calls,
+                    });
+                }
             }
             if (isDenseGemma31Q4KGeGLUShape(self.config) or profile.dense_gemma_q4k_geglu_validation_checks > 0) {
                 log.info("  dense Gemma Q4_K GeGLU fast: prefix_layers {d} validation_checks {d} status {s} token {d} scan_token {d}/{d} layer {d} tensor {s} max_abs {d:.6} rms {d:.6} tol {d:.6} suggested_safe_prefix {d}", .{
@@ -8027,6 +9392,7 @@ pub const InferenceEngine = struct {
                     profile.ssm_residual_barrier_calls,
                     other_ssm_barriers,
                 });
+                logSsmBarrierKindBreakdown("request", profile);
             }
             if (profile.gpu_routed_moe_barrier_calls > 0) {
                 const typed_gpu_moe_barriers =
@@ -8169,9 +9535,10 @@ pub const InferenceEngine = struct {
                 for (top_idxs, 0..) |maybe_idx, rank| {
                     if (maybe_idx) |idx| {
                         const slot = profile.q8_shape_stats[idx];
-                        log.info("  q8 hot #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
+                        log.info("  q8 hot #{d}: {s}/{s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
                             rank + 1,
                             dmmvPathLabel(slot.path),
+                            dmmvDetailLabel(slot.detail),
                             slot.rows,
                             slot.cols,
                             bytesToGiB(slot.bytes),
@@ -8316,6 +9683,28 @@ pub const InferenceEngine = struct {
         return switch (tensor.info.type_) {
             .q4_k => blk: {
                 const k2048_or_less = K <= 2048;
+                if (isQwen35DenseGateUpQ4kTarget(self.config, tensor.info.name, M, K) and
+                    self.dmmv_q4k_k5120_llama_pipe.handle != null)
+                {
+                    // Qwen3.6 27B dense gate/up is the hottest Q4_K bucket
+                    // (M=17408,K=5120). Cycle 5 showed that grouping gate/up
+                    // projections in one dispatch loses throughput here, so keep
+                    // single-projection math. This variant adapts llama.cpp
+                    // `kernel_mul_mv_q4_K_f32_impl` more literally than the
+                    // retained NSG4 cleanup route: bake K=5120, but preserve the
+                    // 2-simdgroup / 4-row threadgroup shape to reduce per-TG
+                    // register pressure on the huge dense gate/up rows.
+                    break :blk .{ .pipe = &self.dmmv_q4k_k5120_llama_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
+                }
+                if (isQwen35DenseDownQ4kTarget(self.config, tensor.info.name, M, K) and
+                    self.dmmv_q4k_k17408_pipe.handle != null)
+                {
+                    // Qwen3.6 27B still has a visible Q4_K dense-down slice
+                    // (M=5120,K=17408). Keep the proven generic Q4_K math, but
+                    // bake the exact K=17408 row stride/trip count for that
+                    // shape only.
+                    break :blk .{ .pipe = &self.dmmv_q4k_k17408_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
+                }
                 if (k2048_or_less and
                     self.device.chip.isM5Class() and
                     tensor == self.lm_head and
@@ -8351,13 +9740,24 @@ pub const InferenceEngine = struct {
                 // single-thread-per-row Vulkan port. For dense Q6_K matvec at
                 // K%256==0 (Gemma final norm, Qwen3 lm_head) the llama variant
                 // is strictly better.
-                if ((self.config.architecture == .gemma or self.config.architecture == .qwen2) and
-                    self.config.n_experts == 0 and
-                    M % 4 == 0 and
-                    K % 256 == 0 and
-                    self.dmmv_q6k_llama_pipe.handle != null)
+                if (canUseDenseQ6kSimdgroupDmmvShape(self.config, tensor.info.name, M, K) and
+                    (self.dmmv_q6k_llama_pipe.handle != null or
+                        self.dmmv_q6k_llama_k5120_pipe.handle != null or
+                        self.dmmv_q6k_llama_k17408_pipe.handle != null))
                 {
-                    break :blk .{ .pipe = &self.dmmv_q6k_llama_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
+                    if (isQwen35DenseDownQ6kTarget(self.config, tensor.info.name, M, K) and
+                        self.dmmv_q6k_llama_k17408_pipe.handle != null)
+                    {
+                        break :blk .{ .pipe = &self.dmmv_q6k_llama_k17408_pipe, .push_idx = 1, .rows_per_wg = 8, .block_size = 128 };
+                    }
+                    if (isQwen35LmHeadQ6kTarget(self.config, tensor.info.name, M, K) and
+                        self.dmmv_q6k_llama_k5120_pipe.handle != null)
+                    {
+                        break :blk .{ .pipe = &self.dmmv_q6k_llama_k5120_pipe, .push_idx = 1, .rows_per_wg = 8, .block_size = 128 };
+                    }
+                    if (self.dmmv_q6k_llama_pipe.handle != null) {
+                        break :blk .{ .pipe = &self.dmmv_q6k_llama_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
+                    }
                 }
                 break :blk .{ .pipe = &self.dmmv_q6k_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 };
             },
@@ -8816,6 +10216,14 @@ fn classifyDmmvDetailUncached(path: DmmvPathClass, name: []const u8) DmmvDetailC
             .ssm_tail
         else
             .none,
+        .dense_ffn => if (std.mem.endsWith(u8, name, "ffn_gate.weight"))
+            .dense_gate
+        else if (std.mem.endsWith(u8, name, "ffn_up.weight"))
+            .dense_up
+        else if (std.mem.endsWith(u8, name, "ffn_down.weight"))
+            .dense_down
+        else
+            .none,
         .shared_expert => if (isSharedDownTensor(name) or std.mem.endsWith(u8, name, "ffn_down.weight"))
             .shared_down
         else if (isSharedGateUpTensor(name) or
@@ -8861,11 +10269,47 @@ fn recordDetailedDmmvBytes(profile: *RuntimeProfile, detail: DmmvDetailClass, by
             profile.ssm_tail_projection_bytes += bytes;
         },
         .ssm_out => profile.ssm_out_bytes += bytes,
+        .dense_gate => profile.dense_ffn_gate_bytes += bytes,
+        .dense_up => profile.dense_ffn_up_bytes += bytes,
+        .dense_down => profile.dense_ffn_down_bytes += bytes,
         .shared_gate_up => profile.shared_expert_gate_up_bytes += bytes,
         .shared_down => profile.shared_expert_down_bytes += bytes,
         .moe_gate_up => profile.moe_expert_gate_up_bytes += bytes,
         .moe_down => profile.moe_expert_down_bytes += bytes,
         .none => {},
+    }
+}
+
+fn recordSsmQkvGatePairProfile(
+    engine: *InferenceEngine,
+    qkv_t: *const metal_loader.LoadedTensor,
+    gate_t: *const metal_loader.LoadedTensor,
+    qkv_rows: u32,
+    gate_rows: u32,
+    cols: u32,
+) void {
+    if (!engine.profile_enabled) return;
+    if (!defaultQwen35Dense27bSsmDeltaGatedNormEnabled(engine.config)) return;
+
+    const qkv_bytes = dmmvWeightBytes(qkv_t.info.type_, qkv_rows, cols);
+    const gate_bytes = dmmvWeightBytes(gate_t.info.type_, gate_rows, cols);
+    const pair_bytes = qkv_bytes + gate_bytes;
+    var profile = &engine.request_profile;
+    profile.ssm_qkv_gate_pair_calls += 1;
+    profile.ssm_qkv_gate_pair_bytes += pair_bytes;
+
+    if (qkv_t.info.type_ == .q4_k and gate_t.info.type_ == .q4_k) {
+        profile.ssm_qkv_gate_pair_q4q4_calls += 1;
+        profile.ssm_qkv_gate_pair_q4q4_bytes += pair_bytes;
+    } else if (qkv_t.info.type_ == .q6_k and gate_t.info.type_ == .q4_k) {
+        profile.ssm_qkv_gate_pair_q6q4_calls += 1;
+        profile.ssm_qkv_gate_pair_q6q4_bytes += pair_bytes;
+    } else if (qkv_t.info.type_ == .q8_0 and gate_t.info.type_ == .q8_0) {
+        profile.ssm_qkv_gate_pair_q8q8_calls += 1;
+        profile.ssm_qkv_gate_pair_q8q8_bytes += pair_bytes;
+    } else {
+        profile.ssm_qkv_gate_pair_other_calls += 1;
+        profile.ssm_qkv_gate_pair_other_bytes += pair_bytes;
     }
 }
 
@@ -8944,22 +10388,24 @@ fn classifyDmmvPath(engine: *const InferenceEngine, tensor: *const metal_loader.
 fn recordQ8ShapeProfile(
     profile: *RuntimeProfile,
     path: DmmvPathClass,
+    detail: DmmvDetailClass,
     rows: u32,
     cols: u32,
     bytes: u64,
 ) void {
-    recordDmmvShapeProfile(profile.q8_shape_stats[0..], path, rows, cols, bytes);
+    recordDmmvShapeProfile(profile.q8_shape_stats[0..], path, detail, rows, cols, bytes);
 }
 
 fn recordDmmvShapeProfile(
     stats: []DmmvShapeStat,
     path: DmmvPathClass,
+    detail: DmmvDetailClass,
     rows: u32,
     cols: u32,
     bytes: u64,
 ) void {
     for (stats) |*slot| {
-        if (slot.calls != 0 and slot.path == path and slot.rows == rows and slot.cols == cols) {
+        if (slot.calls != 0 and slot.path == path and slot.detail == detail and slot.rows == rows and slot.cols == cols) {
             slot.bytes += bytes;
             slot.calls += 1;
             return;
@@ -8969,6 +10415,7 @@ fn recordDmmvShapeProfile(
         if (slot.calls == 0) {
             slot.* = .{
                 .path = path,
+                .detail = detail,
                 .rows = rows,
                 .cols = cols,
                 .bytes = bytes,
@@ -9083,11 +10530,12 @@ fn recordDmmvProfile(
         .moe_expert => profile.moe_expert_bytes += bytes,
         else => {},
     }
-    recordDetailedDmmvBytes(profile, classifyDmmvDetail(engine, tensor, path), bytes);
+    const detail = classifyDmmvDetail(engine, tensor, path);
+    recordDetailedDmmvBytes(profile, detail, bytes);
     switch (tensor.info.type_) {
-        .q4_k => recordDmmvShapeProfile(profile.q4k_shape_stats[0..], path, rows, cols, bytes),
-        .q6_k => recordDmmvShapeProfile(profile.q6k_shape_stats[0..], path, rows, cols, bytes),
-        .q8_0 => recordQ8ShapeProfile(profile, path, rows, cols, bytes),
+        .q4_k => recordDmmvShapeProfile(profile.q4k_shape_stats[0..], path, detail, rows, cols, bytes),
+        .q6_k => recordDmmvShapeProfile(profile.q6k_shape_stats[0..], path, detail, rows, cols, bytes),
+        .q8_0 => recordQ8ShapeProfile(profile, path, detail, rows, cols, bytes),
         else => {},
     }
 }
@@ -9105,9 +10553,10 @@ fn recordMoeDmmvProfile(
     var profile = &engine.request_profile;
     recordDispatchQuantBytes(profile, tensor.info.type_, bytes);
     profile.moe_expert_bytes += bytes;
-    recordDetailedDmmvBytes(profile, classifyDmmvDetail(engine, tensor, .moe_expert), bytes);
+    const detail = classifyDmmvDetail(engine, tensor, .moe_expert);
+    recordDetailedDmmvBytes(profile, detail, bytes);
     if (tensor.info.type_ == .q8_0) {
-        recordQ8ShapeProfile(profile, .moe_expert, rows, cols, bytes);
+        recordQ8ShapeProfile(profile, .moe_expert, detail, rows, cols, bytes);
     }
 }
 
@@ -9618,6 +11067,26 @@ fn canUseDenseQ4KGateUpDual(
         can_use_staged_dual;
 }
 
+fn canUseQwen35DenseQ4KGateUpQKDual(
+    engine: *const InferenceEngine,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    // Keep the rejected dense gate/up `dmmv_q4k_dual` path off. This uses the
+    // newer single-axis Q4 dual-row kernel that is already used for the exact
+    // Qwen3.6 27B SSM Q4/Q4 qkv+gate pair.
+    return !engine.in_prefill_phase and
+        !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        isQwen35DenseQ4KGateUpSwiGLUTarget(engine.config, gate, up, M, K) and
+        (M % 4) == 0 and
+        engine.dmmv_q4k_qk_dual_pipe.handle != null and
+        engine.dmmv_q4k_qk_dual_pipe.max_threads_per_threadgroup >= 64;
+}
+
 /// Pairs the dense Gemma attention Q and K projections (same K, both Q4_K,
 /// distinct M_q and M_k) into one dispatch via `dmmv_q4k_qk_dual.metal`.
 /// The kernel uses a single-axis row layout (rows 0..M_q-1 → Q, rows
@@ -9686,6 +11155,68 @@ fn canUseDenseQ4KQKQ6KV(
         (M_v % 4) == 0 and
         engine.dmmv_q4k_qk_q6k_v_pipe.handle != null and
         engine.dmmv_q4k_qk_q6k_v_pipe.max_threads_per_threadgroup >= 64;
+}
+
+fn canUseQwen35SsmQ6Q4QkvGatePair(
+    engine: *const InferenceEngine,
+    qkv: *const metal_loader.LoadedTensor,
+    gate: *const metal_loader.LoadedTensor,
+    qkv_buf: *const MetalBuffer,
+    gate_buf: *const MetalBuffer,
+    qkv_rows: u32,
+    gate_rows: u32,
+    K: u32,
+) bool {
+    // Adapt llama.cpp `ggml_metal_op_encode_impl` dependency batching to the
+    // exact Qwen3.6 27B SSM projection pair: qkv and gate read the same norm
+    // row and are only joined later at the conv/delta boundary. Reuse the
+    // existing mixed Q4_K/Q6_K QKV shader with M_q=0 so this removes one
+    // SSM projection dispatch without introducing a new arithmetic kernel.
+    return !engine.in_prefill_phase and
+        !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        qkv_buf == &qkv.gpu_buffer and
+        gate_buf == &gate.gpu_buffer and
+        qkv.info.type_ == .q6_k and
+        gate.info.type_ == .q4_k and
+        isQwen35SsmQkvQ6kTarget(engine.config, qkv.info.name, qkv_rows, K) and
+        isQwen35SsmGateQ4kTarget(engine.config, gate.info.name, gate_rows, K) and
+        (qkv_rows % 4) == 0 and
+        (gate_rows % 4) == 0 and
+        engine.dmmv_q4k_qk_q6k_v_pipe.handle != null and
+        engine.dmmv_q4k_qk_q6k_v_pipe.max_threads_per_threadgroup >= 64;
+}
+
+fn canUseQwen35SsmQ4Q4QkvGatePair(
+    engine: *const InferenceEngine,
+    qkv: *const metal_loader.LoadedTensor,
+    gate: *const metal_loader.LoadedTensor,
+    qkv_buf: *const MetalBuffer,
+    gate_buf: *const MetalBuffer,
+    qkv_rows: u32,
+    gate_rows: u32,
+    K: u32,
+) bool {
+    // Same llama.cpp `ggml_metal_op_encode_impl` same-input batching
+    // discipline as the mixed Q6/Q4 sibling, but only for the all-Q4 SSM
+    // pair that the current Qwen3.6 27B profile names separately. Reuse the
+    // optimized single-axis Q4 dual-row shader instead of the dense gate/up
+    // dual path that previously regressed.
+    return !engine.in_prefill_phase and
+        !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        qkv_buf == &qkv.gpu_buffer and
+        gate_buf == &gate.gpu_buffer and
+        qkv.info.type_ == .q4_k and
+        gate.info.type_ == .q4_k and
+        isQwen35SsmQkvQ4kTarget(engine.config, qkv.info.name, qkv_rows, K) and
+        isQwen35SsmGateQ4kTarget(engine.config, gate.info.name, gate_rows, K) and
+        (qkv_rows % 4) == 0 and
+        (gate_rows % 4) == 0 and
+        engine.dmmv_q4k_qk_dual_pipe.handle != null and
+        engine.dmmv_q4k_qk_dual_pipe.max_threads_per_threadgroup >= 64;
 }
 
 fn canUseDenseQ4KQKV(
@@ -9831,6 +11362,75 @@ fn dispatchDenseQ4KQKQ6KVOnCmd(
     cmd.dispatchV2(&engine.dmmv_q4k_qk_q6k_v_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(QKVDensePush), 3);
 }
 
+fn dispatchQwen35SsmQ6Q4QkvGatePairOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    qkv_tensor: *const metal_loader.LoadedTensor,
+    gate_tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    qkv_buf: *const MetalBuffer,
+    gate_buf: *const MetalBuffer,
+    qkv_rows: u32,
+    gate_rows: u32,
+    K: u32,
+) void {
+    recordDmmvProfile(engine, qkv_tensor, qkv_rows, K);
+    recordDmmvProfile(engine, gate_tensor, gate_rows, K);
+
+    const push = QKVDensePush{
+        .M_q = 0,
+        .M_k = gate_rows,
+        .M_v = qkv_rows,
+        .K = K,
+        .a_q_offset = tensorPageOffset(engine.model, gate_tensor),
+        .a_k_offset = tensorPageOffset(engine.model, gate_tensor),
+        .a_v_offset = tensorPageOffset(engine.model, qkv_tensor),
+        .x_offset = 0,
+        .y_q_offset = 0,
+        .y_k_offset = 0,
+        .y_v_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &gate_tensor.gpu_buffer,
+        &gate_tensor.gpu_buffer,
+        &qkv_tensor.gpu_buffer,
+        input_buf,
+        gate_buf,
+        gate_buf,
+        qkv_buf,
+    };
+    const rows_per_wg: u32 = 4;
+    const block_size: u32 = 64;
+    const total_rows = gate_rows + qkv_rows;
+    cmd.dispatchV2(&engine.dmmv_q4k_qk_q6k_v_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(QKVDensePush), 3);
+}
+
+fn dispatchQwen35SsmQ4Q4QkvGatePairOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    qkv_tensor: *const metal_loader.LoadedTensor,
+    gate_tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    qkv_buf: *const MetalBuffer,
+    gate_buf: *const MetalBuffer,
+    qkv_rows: u32,
+    gate_rows: u32,
+    K: u32,
+) void {
+    dispatchDenseQ4KQKDualOnCmd(
+        engine,
+        cmd,
+        qkv_tensor,
+        gate_tensor,
+        input_buf,
+        qkv_buf,
+        gate_buf,
+        qkv_rows,
+        gate_rows,
+        K,
+    );
+}
+
 fn dispatchDenseQ4KGateUpDualOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -9965,6 +11565,54 @@ fn canUseDenseQ4KGateUpSwiGLU(
         engine.dmmv_q4k_dense_gate_up_swiglu_pipe.max_threads_per_threadgroup >= 64;
 }
 
+fn isQwen35DenseQ4KGateUpSwiGLUTarget(
+    cfg: ModelConfig,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    return defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg) and
+        !usesGeglu(cfg) and
+        gate.info.type_ == .q4_k and
+        up.info.type_ == .q4_k and
+        isQwen35DenseGateUpQ4kTarget(cfg, gate.info.name, M, K) and
+        isQwen35DenseGateUpQ4kTarget(cfg, up.info.name, M, K);
+}
+
+fn shouldValidateQwen35DenseQ4KGateUpSwiGLU(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    if (!engine.qwen35_dense_q4k_swiglu_validation_enabled) return false;
+    if (engine.qwen35_dense_q4k_swiglu_validation_emitted) return false;
+    if (engine.in_prefill_phase) return false;
+    if (engine.private_decode_buffers) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    const requested_layer = qwen35DenseQ4KSwiGLUValidateLayer(engine);
+    if (engine.qwen35_dense_q4k_swiglu_validation_scan_layers) {
+        if (layer_idx < requested_layer) return false;
+        if (engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens >= engine.qwen35_dense_q4k_swiglu_validation_token_limit) return false;
+    } else if (layer_idx != requested_layer) return false;
+    if (qwen35DenseQ4KSwiGLUValidateToken()) |token| {
+        if (engine.position != token) return false;
+    }
+    if (!isQwen35DenseQ4KGateUpSwiGLUTarget(engine.config, gate, up, M, K)) return false;
+    return engine.dmmv_q4k_dense_gate_up_swiglu_pipe.handle != null and
+        engine.dmmv_q4k_dense_gate_up_swiglu_pipe.max_threads_per_threadgroup >= 64 and
+        engine.swiglu_buf.cpu_ptr != null and
+        engine.down_buf.cpu_ptr != null;
+}
+
+fn qwen35DenseQ4KSwiGLULayerMaskBit(layer_idx: usize) u64 {
+    if (layer_idx >= 64) return 0;
+    return @as(u64, 1) << @as(u6, @intCast(layer_idx));
+}
+
 fn dispatchDenseQ4KGateUpSwiGLUOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -9999,6 +11647,139 @@ fn dispatchDenseQ4KGateUpSwiGLUOnCmd(
         @sizeOf(DualQ8DmmvPush),
         2,
     );
+}
+
+fn validateQwen35DenseQ4KGateUpSwiGLUOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+) !void {
+    // Default-off validator for the Qwen3.6 27B dense FFN fusion that cycle 3
+    // rejected on throughput. It mirrors llama.cpp's fused op validation
+    // discipline: run the candidate next to the production reference, commit
+    // once, compare the materialized activation row, then resume the normal
+    // command stream with production buffers intact.
+    const push = DualQ8DmmvPush{
+        .M0 = M,
+        .M1 = M,
+        .K = K,
+        .a0_offset = tensorPageOffset(engine.model, gate),
+        .a1_offset = tensorPageOffset(engine.model, up),
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate.gpu_buffer, &up.gpu_buffer, input_buf, &engine.down_buf };
+    const rows_per_wg: u32 = 4;
+    cmd.dispatchV2(
+        &engine.dmmv_q4k_dense_gate_up_swiglu_pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, 1, 1 },
+        .{ 64, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(DualQ8DmmvPush),
+        2,
+    );
+    commitAndWaitProfiled(cmd, profile);
+
+    const ref_ptr: [*]const f32 = @ptrCast(@alignCast(engine.swiglu_buf.cpu_ptr.?));
+    const candidate_ptr: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
+    const ref_slice = ref_ptr[0..M];
+    const candidate_slice = candidate_ptr[0..M];
+    const diff = diffF32Slices(ref_slice, candidate_slice);
+    const ref_value = if (M > 0) ref_slice[diff.max_idx] else 0.0;
+    const candidate_value = if (M > 0) candidate_slice[diff.max_idx] else 0.0;
+    const tol: f32 = 5e-2;
+    const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
+    const scan_layers = engine.qwen35_dense_q4k_swiglu_validation_scan_layers;
+    const requested_layer = qwen35DenseQ4KSwiGLUValidateLayer(engine);
+    const scan_token = engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens + 1;
+    if (scan_layers and layer_idx == requested_layer) {
+        engine.qwen35_dense_q4k_swiglu_validation_ok_mask = 0;
+        engine.qwen35_dense_q4k_swiglu_validation_fail_mask = 0;
+        if (engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens == 0) {
+            engine.qwen35_dense_q4k_swiglu_validation_prompt_tokens = engine.position;
+        }
+    } else if (!scan_layers) {
+        engine.qwen35_dense_q4k_swiglu_validation_prompt_tokens = engine.position;
+    }
+    const prompt_tokens = if (engine.qwen35_dense_q4k_swiglu_validation_prompt_tokens != 0)
+        engine.qwen35_dense_q4k_swiglu_validation_prompt_tokens
+    else
+        engine.position;
+
+    const layer_bit = qwen35DenseQ4KSwiGLULayerMaskBit(layer_idx);
+    if (scan_layers and layer_bit != 0) {
+        if (diff.max_abs <= tol) {
+            engine.qwen35_dense_q4k_swiglu_validation_ok_mask |= layer_bit;
+        } else {
+            engine.qwen35_dense_q4k_swiglu_validation_fail_mask |= layer_bit;
+        }
+    }
+
+    if (diff.max_abs <= tol) {
+        log.info("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE[{s}]: prompt_tokens={d} token={d} scan_token={d}/{d} layer={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} flag_on=ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_SCAN=1", .{
+            verdict,
+            prompt_tokens,
+            engine.position,
+            scan_token,
+            engine.qwen35_dense_q4k_swiglu_validation_token_limit,
+            layer_idx,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    } else {
+        log.warn("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE[{s}]: prompt_tokens={d} token={d} scan_token={d}/{d} layer={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} flag_on=ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_SCAN=1", .{
+            verdict,
+            prompt_tokens,
+            engine.position,
+            scan_token,
+            engine.qwen35_dense_q4k_swiglu_validation_token_limit,
+            layer_idx,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    }
+    if (scan_layers) {
+        const last_layer_idx = if (engine.config.n_layers == 0)
+            0
+        else
+            @as(usize, @intCast(engine.config.n_layers - 1));
+        if (layer_idx >= last_layer_idx) {
+            engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens += 1;
+            log.info("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_SCAN_SUMMARY: prompt_tokens={d} token={d} scan_token={d}/{d} start_layer={d} ok_mask=0x{x} fail_mask=0x{x} flag_on=ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_SCAN=1", .{
+                prompt_tokens,
+                engine.position,
+                engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens,
+                engine.qwen35_dense_q4k_swiglu_validation_token_limit,
+                requested_layer,
+                engine.qwen35_dense_q4k_swiglu_validation_ok_mask,
+                engine.qwen35_dense_q4k_swiglu_validation_fail_mask,
+            });
+            if (engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens >= engine.qwen35_dense_q4k_swiglu_validation_token_limit or
+                qwen35DenseQ4KSwiGLUValidateToken() != null)
+            {
+                engine.qwen35_dense_q4k_swiglu_validation_emitted = true;
+            }
+        }
+    } else {
+        engine.qwen35_dense_q4k_swiglu_validation_emitted = true;
+    }
+    cmd.* = try beginProfiledCommand(engine, profile);
 }
 
 fn dispatchDualQ8DmmvOnCmd(
@@ -11012,6 +12793,9 @@ fn dispatchDmmvOnCmdWithWeightBuf(
     };
     const bufs = [_]*const MetalBuffer{ weight_buf, input_buf, output_buf };
     const wgs = (M + pip.rows_per_wg - 1) / pip.rows_per_wg;
+    var timing_label_buf: [192]u8 = undefined;
+    const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, M, K, pip.pipe, &timing_label_buf);
+    defer if (has_timing_label) cmd.clearTimingLabel();
     cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
 }
 
@@ -11222,6 +13006,9 @@ fn dispatchLmHeadWithInputOffset(
     };
     const bufs = [_]*const MetalBuffer{ weight_buf, input_buf, output_buf };
     const wgs = (vocab_size + pip.rows_per_wg - 1) / pip.rows_per_wg;
+    var timing_label_buf: [192]u8 = undefined;
+    const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, vocab_size, hidden_dim, pip.pipe, &timing_label_buf);
+    defer if (has_timing_label) cmd.clearTimingLabel();
     cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
 }
 
@@ -11300,6 +13087,9 @@ fn dispatchDmmvOnCmdWithInputOffset(
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
     const wgs = (M + pip.rows_per_wg - 1) / pip.rows_per_wg;
+    var timing_label_buf: [192]u8 = undefined;
+    const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, M, K, pip.pipe, &timing_label_buf);
+    defer if (has_timing_label) cmd.clearTimingLabel();
     cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
 }
 
@@ -11330,6 +13120,9 @@ fn dispatchDmmvOnCmdWithInputOutputOffset(
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
     const wgs = (M + pip.rows_per_wg - 1) / pip.rows_per_wg;
+    var timing_label_buf: [192]u8 = undefined;
+    const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, M, K, pip.pipe, &timing_label_buf);
+    defer if (has_timing_label) cmd.clearTimingLabel();
     cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
 }
 
@@ -11570,13 +13363,11 @@ fn canUseDenseQ6kSimdgroupDmmv(
     // Dense single-token decode should follow llama.cpp's mul_mv Q6_K path.
     // The MoE Q6_K shader stages X in threadgroup memory for routed experts;
     // that does not match this N=1 dense projection shape.
-    return engine.config.architecture == .gemma and
-        engine.config.n_experts == 0 and
+    return canUseDenseQ6kSimdgroupDmmvShape(engine.config, tensor.info.name, M, K) and
         tensor.info.type_ == .q6_k and
-        M > 0 and
-        M % 4 == 0 and
-        K % 256 == 0 and
-        engine.dmmv_q6k_llama_pipe.handle != null;
+        (engine.dmmv_q6k_llama_pipe.handle != null or
+            engine.dmmv_q6k_llama_k5120_pipe.handle != null or
+            engine.dmmv_q6k_llama_k17408_pipe.handle != null);
 }
 
 fn dispatchDenseQ6kSimdgroupDmmvOnCmd(
@@ -11590,7 +13381,18 @@ fn dispatchDenseQ6kSimdgroupDmmvOnCmd(
     extra_byte_offset: u32,
     x_byte_offset: u32,
 ) void {
-    if (engine.dmmv_q6k_llama_pipe.handle != null) {
+    const pipe: ?*MetalPipeline = if (isQwen35DenseDownQ6kTarget(engine.config, tensor.info.name, M, K) and
+        engine.dmmv_q6k_llama_k17408_pipe.handle != null)
+        &engine.dmmv_q6k_llama_k17408_pipe
+    else if (isQwen35LmHeadQ6kTarget(engine.config, tensor.info.name, M, K) and
+        engine.dmmv_q6k_llama_k5120_pipe.handle != null)
+        &engine.dmmv_q6k_llama_k5120_pipe
+    else if (engine.dmmv_q6k_llama_pipe.handle != null)
+        &engine.dmmv_q6k_llama_pipe
+    else
+        null;
+
+    if (pipe) |selected_pipe| {
         const push = DmmvPush{
             .M = M,
             .K = K,
@@ -11599,9 +13401,20 @@ fn dispatchDenseQ6kSimdgroupDmmvOnCmd(
             .y_offset = 0,
         };
         const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
-        const rows_per_wg: u32 = 4;
+        const uses_dense_down_nsg4 =
+            selected_pipe == &engine.dmmv_q6k_llama_k17408_pipe and
+            isQwen35DenseDownQ6kTarget(engine.config, tensor.info.name, M, K);
+        const uses_lm_head_nsg4 =
+            selected_pipe == &engine.dmmv_q6k_llama_k5120_pipe and
+            isQwen35LmHeadQ6kTarget(engine.config, tensor.info.name, M, K);
+        const uses_nsg4 = uses_dense_down_nsg4 or uses_lm_head_nsg4;
+        const rows_per_wg: u32 = if (uses_nsg4) 8 else 4;
         const wgs = (M + rows_per_wg - 1) / rows_per_wg;
-        cmd.dispatchV2(&engine.dmmv_q6k_llama_pipe, .{ wgs, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 1);
+        var timing_label_buf: [192]u8 = undefined;
+        const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, M, K, selected_pipe, &timing_label_buf);
+        defer if (has_timing_label) cmd.clearTimingLabel();
+        const block_size: u32 = if (uses_nsg4) 128 else 64;
+        cmd.dispatchV2(selected_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 1);
         return;
     }
 
@@ -13461,7 +15274,19 @@ fn dispatchFfnActivationOnCmd(
     const push = SwiGLUPush{ .n = n };
     const bufs = [_]*const MetalBuffer{ gate, output, up };
     const pipe = if (usesGeglu(engine.config)) &engine.geglu_pipe else &engine.swiglu_pipe;
-    cmd.dispatchV2(pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+    const tg_size = ffnActivationThreadgroupSize(engine, n);
+    cmd.dispatchV2(pipe, .{ (n + tg_size - 1) / tg_size, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+}
+
+fn ffnActivationThreadgroupSize(engine: *const InferenceEngine, n: u32) u32 {
+    if (!usesGeglu(engine.config) and
+        defaultQwen35Dense27bSsmDeltaGatedNormEnabled(engine.config) and
+        n == engine.config.intermediate_dim and
+        engine.swiglu_pipe.max_threads_per_threadgroup >= 256)
+    {
+        return 256;
+    }
+    return 64;
 }
 
 fn dispatchGeGLUFastUncheckedOnCmd(
@@ -21491,7 +23316,11 @@ fn beginProfiledCommand(engine: *InferenceEngine, profile: ?*RuntimeProfile) !Me
     return cmd;
 }
 
-fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
+fn saturatingU32FromUsize(value: usize) u32 {
+    return @intCast(@min(value, @as(usize, std.math.maxInt(u32))));
+}
+
+fn commitAndWaitProfiledMeasured(cmd: *MetalCommand, profile: ?*RuntimeProfile) u64 {
     if (profile) |p| {
         p.dispatch_calls += cmd.dispatch_count;
         p.barrier_calls += cmd.barrier_count;
@@ -21501,10 +23330,32 @@ fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     }
     const commit_start = profileStart(profile != null);
     cmd.commitAndWait();
+    const wait_ns = profileElapsedNs(commit_start);
     if (profile) |p| {
         p.commit_waits += 1;
         // This wall time is the full command-buffer completion wait, not just CPU submit overhead.
-        p.gpu_completion_wait_ns += profileElapsedNs(commit_start);
+        p.gpu_completion_wait_ns += wait_ns;
+    }
+    return wait_ns;
+}
+
+fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
+    _ = commitAndWaitProfiledMeasured(cmd, profile);
+}
+
+fn commitFinalCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile, pending_count: usize) void {
+    const final_dispatch_calls = cmd.dispatch_count;
+    const final_barrier_calls = cmd.barrier_count;
+    const final_resource_barrier_resources = cmd.resource_barrier_resources;
+    const wait_ns = commitAndWaitProfiledMeasured(cmd, profile);
+    if (pending_count == 0) return;
+    if (profile) |p| {
+        p.decode_async_final_waits += 1;
+        p.decode_async_final_pending_cmds += saturatingU32FromUsize(pending_count);
+        p.decode_async_final_wait_ns += wait_ns;
+        p.decode_async_final_dispatch_calls += final_dispatch_calls;
+        p.decode_async_final_barrier_calls += final_barrier_calls;
+        p.decode_async_final_resource_barrier_resources += final_resource_barrier_resources;
     }
 }
 
@@ -21519,13 +23370,19 @@ fn commitAsyncProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     cmd.commitAsync();
 }
 
-fn waitCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
+fn waitCommandProfiledMeasured(cmd: *MetalCommand, profile: ?*RuntimeProfile) u64 {
     const wait_start = profileStart(profile != null);
     cmd.wait();
+    const wait_ns = profileElapsedNs(wait_start);
     if (profile) |p| {
         p.commit_waits += 1;
-        p.gpu_completion_wait_ns += profileElapsedNs(wait_start);
+        p.gpu_completion_wait_ns += wait_ns;
     }
+    return wait_ns;
+}
+
+fn waitCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
+    _ = waitCommandProfiledMeasured(cmd, profile);
 }
 
 fn releaseCommands(cmds: []MetalCommand) void {
@@ -21540,6 +23397,18 @@ fn releaseCompletedCommands(cmds: []MetalCommand) void {
     }
 }
 
+fn recordPendingDenseCommandGpuDurations(cmds: []MetalCommand, profile: ?*RuntimeProfile) void {
+    const p = profile orelse return;
+    for (cmds, 0..) |*cmd, idx| {
+        if (cmd.handle == null) continue;
+        const gpu_ns = cmd.gpuDurationNs();
+        if (gpu_ns == 0) continue;
+        const slot = @min(idx, decode_async_profile_slots - 1);
+        p.decode_async_slot_completed_cmds[slot] += 1;
+        p.decode_async_slot_gpu_ns[slot] += gpu_ns;
+    }
+}
+
 fn waitPendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*RuntimeProfile) void {
     const n = count.*;
     if (n == 0) return;
@@ -21547,28 +23416,270 @@ fn waitPendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*Runt
     // Metal command queues execute command buffers in commit order. Mirroring
     // llama.cpp's graph submission pattern, wait on the last dense chunk to
     // synchronize the token, then release the already-completed earlier chunks.
-    waitCommandProfiled(&cmds[n - 1], profile);
-    releaseCommands(cmds[0 .. n - 1]);
+    const wait_ns = waitCommandProfiledMeasured(&cmds[n - 1], profile);
+    if (profile) |p| {
+        p.decode_async_queue_waits += 1;
+        p.decode_async_queue_pending_cmds += saturatingU32FromUsize(n);
+        p.decode_async_queue_wait_ns += wait_ns;
+    }
+    recordPendingDenseCommandGpuDurations(cmds[0..n], profile);
+    releaseCompletedCommands(cmds[0 .. n - 1]);
     count.* = 0;
 }
 
-fn releasePendingDenseCommands(cmds: []MetalCommand, count: *usize) void {
-    releaseCommands(cmds[0..count.*]);
+fn releasePendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*RuntimeProfile) void {
+    recordPendingDenseCommandGpuDurations(cmds[0..count.*], profile);
+    releaseCompletedCommands(cmds[0..count.*]);
     count.* = 0;
+}
+
+fn decodeAsyncChunkStart(next_layer: usize, start_layer: usize, group_layers: usize) usize {
+    if (group_layers == 0 or next_layer <= start_layer) return start_layer;
+    const rem = next_layer % group_layers;
+    const chunk_start = if (rem == 0) next_layer - group_layers else next_layer - rem;
+    return @max(start_layer, chunk_start);
+}
+
+fn recordDecodeAsyncSlotLayerRange(
+    profile: *RuntimeProfile,
+    cfg: ModelConfig,
+    slot: usize,
+    layer_start: usize,
+    layer_end: usize,
+) void {
+    if (layer_end <= layer_start) return;
+
+    const interval = fullAttentionInterval(cfg);
+    var full_attn_layers: u32 = 0;
+    var ssm_layers: u32 = 0;
+    for (layer_start..layer_end) |layer_idx| {
+        const layer: u32 = @intCast(layer_idx);
+        const is_full_attn = interval != 0 and ((layer + 1) % interval == 0);
+        if (is_full_attn) {
+            full_attn_layers += 1;
+        } else if (cfg.ssm_d_inner != 0) {
+            ssm_layers += 1;
+        }
+    }
+
+    const n_layers_u32 = saturatingU32FromUsize(layer_end - layer_start);
+    profile.decode_async_slot_layer_range_submits[slot] += 1;
+    profile.decode_async_slot_layer_start_sum[slot] += @intCast(layer_start);
+    profile.decode_async_slot_layer_end_sum[slot] += @intCast(layer_end);
+    profile.decode_async_slot_full_attn_layers[slot] += full_attn_layers;
+    profile.decode_async_slot_ssm_layers[slot] += ssm_layers;
+    if (cfg.n_experts == 0) {
+        profile.decode_async_slot_dense_ffn_layers[slot] += n_layers_u32;
+    }
+}
+
+fn tensorDmmvBytesForCols(tensor: ?*const metal_loader.LoadedTensor, cols: u32) u64 {
+    const t = tensor orelse return 0;
+    if (cols == 0) return 0;
+    const elements = t.info.numElements();
+    const cols_u64 = @as(u64, cols);
+    if (elements < cols_u64) return 0;
+    if (elements % cols_u64 != 0) return 0;
+    const rows_u64 = elements / cols_u64;
+    if (rows_u64 == 0 or rows_u64 > std.math.maxInt(u32)) return 0;
+    return dmmvWeightBytes(t.info.type_, @intCast(rows_u64), cols);
+}
+
+fn recordDecodeAsyncSlotLayerBytes(
+    profile: *RuntimeProfile,
+    engine: *const InferenceEngine,
+    slot: usize,
+    layer_start: usize,
+    layer_end: usize,
+) void {
+    if (layer_end <= layer_start) return;
+
+    const cfg = engine.config;
+    const hidden_dim = cfg.hidden_dim;
+    const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
+    const q_dim: u32 = cfg.n_heads * cfg.head_dim;
+    const d_inner = cfg.ssm_d_inner;
+
+    for (layer_start..layer_end) |layer_idx| {
+        const lt = engine.layer_tensors[layer_idx];
+        if (isFullAttentionLayer(cfg, layer_idx)) {
+            var bytes: u64 = 0;
+            bytes += tensorDmmvBytesForCols(lt.attn_q, hidden_dim);
+            bytes += tensorDmmvBytesForCols(lt.attn_k, hidden_dim);
+            bytes += tensorDmmvBytesForCols(lt.attn_v, hidden_dim);
+            bytes += tensorDmmvBytesForCols(lt.attn_output, q_dim);
+            profile.decode_async_slot_full_attn_bytes[slot] += bytes;
+        } else if (cfg.ssm_d_inner != 0) {
+            const qkv_bytes = tensorDmmvBytesForCols(lt.attn_qkv, hidden_dim);
+            const gate_bytes = tensorDmmvBytesForCols(lt.attn_gate, hidden_dim);
+            const tail_bytes =
+                tensorDmmvBytesForCols(lt.ssm_alpha, hidden_dim) +
+                tensorDmmvBytesForCols(lt.ssm_beta, hidden_dim);
+            profile.decode_async_slot_ssm_qkv_bytes[slot] += qkv_bytes;
+            profile.decode_async_slot_ssm_gate_bytes[slot] += gate_bytes;
+            profile.decode_async_slot_ssm_tail_bytes[slot] += tail_bytes;
+            profile.decode_async_slot_ssm_projection_bytes[slot] += qkv_bytes + gate_bytes + tail_bytes;
+            profile.decode_async_slot_ssm_out_bytes[slot] += tensorDmmvBytesForCols(lt.ssm_out, d_inner);
+        }
+
+        if (cfg.n_experts == 0) {
+            const gate_bytes = tensorDmmvBytesForCols(lt.ffn_gate, hidden_dim);
+            const up_bytes = tensorDmmvBytesForCols(lt.ffn_up, hidden_dim);
+            const down_bytes = tensorDmmvBytesForCols(lt.ffn_down, inter_dim);
+            profile.decode_async_slot_dense_gate_bytes[slot] += gate_bytes;
+            profile.decode_async_slot_dense_up_bytes[slot] += up_bytes;
+            profile.decode_async_slot_dense_down_bytes[slot] += down_bytes;
+            profile.decode_async_slot_dense_ffn_bytes[slot] += gate_bytes + up_bytes + down_bytes;
+        }
+    }
+}
+
+fn ssmBarrierPhaseCountersFromProfile(profile: RuntimeProfile) SsmBarrierPhaseCounters {
+    return .{
+        .proj_norm = profile.ssm_proj_norm_barrier_calls,
+        .qkv = profile.ssm_qkv_barrier_calls,
+        .tail = profile.ssm_tail_barrier_calls,
+        .conv = profile.ssm_conv_barrier_calls,
+        .delta = profile.ssm_delta_barrier_calls,
+        .gated_norm = profile.ssm_gated_norm_barrier_calls,
+        .out = profile.ssm_out_barrier_calls,
+        .residual = profile.ssm_residual_barrier_calls,
+    };
+}
+
+fn denseBarrierPhaseCountersFromProfile(profile: RuntimeProfile) DenseFfnBarrierPhaseCounters {
+    return .{
+        .norm = profile.dense_ffn_norm_barrier_calls,
+        .gate_up = profile.dense_ffn_gate_up_barrier_calls,
+        .activation = profile.dense_ffn_activation_barrier_calls,
+        .down = profile.dense_ffn_down_barrier_calls,
+        .tail = profile.dense_ffn_tail_barrier_calls,
+        .scale = profile.dense_ffn_scale_barrier_calls,
+    };
+}
+
+fn denseDispatchPhaseCountersFromProfile(profile: RuntimeProfile) DenseFfnBarrierPhaseCounters {
+    return .{
+        .norm = profile.dense_ffn_norm_dispatch_calls,
+        .gate_up = profile.dense_ffn_gate_up_dispatch_calls,
+        .activation = profile.dense_ffn_activation_dispatch_calls,
+        .down = profile.dense_ffn_down_dispatch_calls,
+        .tail = profile.dense_ffn_tail_dispatch_calls,
+        .scale = profile.dense_ffn_scale_dispatch_calls,
+    };
+}
+
+fn recordDecodeAsyncSlotBarrierPhases(
+    profile: *RuntimeProfile,
+    slot: usize,
+    prefix: RuntimeProfile,
+) void {
+    profile.decode_async_slot_ssm_barrier_phases[slot].addCounts(
+        SsmBarrierPhaseCounters.diff(
+            ssmBarrierPhaseCountersFromProfile(profile.*),
+            ssmBarrierPhaseCountersFromProfile(prefix),
+        ),
+    );
+    profile.decode_async_slot_dense_barrier_phases[slot].addCounts(
+        DenseFfnBarrierPhaseCounters.diff(
+            denseBarrierPhaseCountersFromProfile(profile.*),
+            denseBarrierPhaseCountersFromProfile(prefix),
+        ),
+    );
+    profile.decode_async_slot_dense_dispatch_phases[slot].addCounts(
+        DenseFfnBarrierPhaseCounters.diff(
+            denseDispatchPhaseCountersFromProfile(profile.*),
+            denseDispatchPhaseCountersFromProfile(prefix),
+        ),
+    );
+    profile.decode_async_slot_dense_scope_barrier_phases[slot].addCounts(
+        DenseFfnBarrierPhaseCounters.diff(
+            profile.dense_ffn_scope_barrier_calls_by_phase,
+            prefix.dense_ffn_scope_barrier_calls_by_phase,
+        ),
+    );
+    profile.decode_async_slot_dense_resource_barrier_phases[slot].addCounts(
+        DenseFfnBarrierPhaseCounters.diff(
+            profile.dense_ffn_resource_barrier_calls_by_phase,
+            prefix.dense_ffn_resource_barrier_calls_by_phase,
+        ),
+    );
+    profile.decode_async_slot_dense_resource_barrier_entries_phases[slot].addCounts(
+        DenseFfnBarrierPhaseCounters.diff(
+            profile.dense_ffn_resource_barrier_resources_by_phase,
+            prefix.dense_ffn_resource_barrier_resources_by_phase,
+        ),
+    );
+    profile.decode_async_slot_dense_barrier_encode_ns_phases[slot].addCounts(
+        DenseFfnBarrierPhaseNsCounters.diff(
+            profile.dense_ffn_barrier_encode_ns_by_phase,
+            prefix.dense_ffn_barrier_encode_ns_by_phase,
+        ),
+    );
+    profile.decode_async_slot_dense_scope_barrier_encode_ns_phases[slot].addCounts(
+        DenseFfnBarrierPhaseNsCounters.diff(
+            profile.dense_ffn_scope_barrier_encode_ns_by_phase,
+            prefix.dense_ffn_scope_barrier_encode_ns_by_phase,
+        ),
+    );
+    profile.decode_async_slot_dense_resource_barrier_encode_ns_phases[slot].addCounts(
+        DenseFfnBarrierPhaseNsCounters.diff(
+            profile.dense_ffn_resource_barrier_encode_ns_by_phase,
+            prefix.dense_ffn_resource_barrier_encode_ns_by_phase,
+        ),
+    );
+}
+
+fn decodeAsyncEncodeNsDelta(total: RuntimeProfile, prefix: RuntimeProfile) u64 {
+    // Mirrors llama.cpp `ggml_metal_graph_compute`'s split between graph
+    // encoding and queued command-buffer execution: these counters cover the
+    // CPU-side dispatch/barrier recording work that happened while building a
+    // chunk, while `decode_async_slot_gpu_ns` comes from Metal's GPU timestamps.
+    return (total.layer_record_ns -| prefix.layer_record_ns) +
+        (total.gpu_routed_moe_record_ns -| prefix.gpu_routed_moe_record_ns) +
+        (total.fallback_moe_record_ns -| prefix.fallback_moe_record_ns) +
+        (total.dense_ffn_record_ns -| prefix.dense_ffn_record_ns) +
+        (total.final_record_ns -| prefix.final_record_ns);
 }
 
 fn submitPendingDenseCommand(
     cmd: *MetalCommand,
+    engine: *const InferenceEngine,
     pending_cmds: []MetalCommand,
     pending_count: *usize,
     profile: ?*RuntimeProfile,
+    profile_prefix: ?*const RuntimeProfile,
+    cfg: ModelConfig,
+    layer_start: usize,
+    layer_end: usize,
 ) void {
     if (cmd.handle == null) return;
     if (pending_count.* == pending_cmds.len) {
         waitPendingDenseCommands(pending_cmds, pending_count, profile);
     }
 
+    if (profile) |p| {
+        p.decode_async_submitted_dispatch_calls += cmd.dispatch_count;
+        p.decode_async_submitted_barrier_calls += cmd.barrier_count;
+        p.decode_async_submitted_resource_barrier_resources += cmd.resource_barrier_resources;
+        const slot = @min(pending_count.*, decode_async_profile_slots - 1);
+        p.decode_async_slot_submits[slot] += 1;
+        p.decode_async_slot_dispatch_calls[slot] += cmd.dispatch_count;
+        p.decode_async_slot_barrier_calls[slot] += cmd.barrier_count;
+        p.decode_async_slot_resource_barrier_resources[slot] += cmd.resource_barrier_resources;
+        recordDecodeAsyncSlotLayerRange(p, cfg, slot, layer_start, layer_end);
+        recordDecodeAsyncSlotLayerBytes(p, engine, slot, layer_start, layer_end);
+        if (profile_prefix) |prefix| {
+            recordDecodeAsyncSlotBarrierPhases(p, slot, prefix.*);
+            p.decode_async_slot_encode_ns[slot] += decodeAsyncEncodeNsDelta(p.*, prefix.*);
+        }
+    }
     commitAsyncProfiled(cmd, profile);
+    if (profile) |p| {
+        p.decode_async_submits += 1;
+        const pending_after_submit = saturatingU32FromUsize(pending_count.* + 1);
+        p.decode_async_max_pending = @max(p.decode_async_max_pending, pending_after_submit);
+    }
     pending_cmds[pending_count.*] = cmd.*;
     pending_count.* += 1;
     cmd.* = .{
@@ -21676,6 +23787,7 @@ fn runDecodeStep(
     // re-attempt for Qwen3-8B without a different lever (e.g. holding GPU
     // clocks via residency-set warm-loop) — see EFFORT_14_NOTES.md.
     const dense_cmd_group_layers: usize = 60;
+    const hybrid_cmd_group_layers = hybridDecodeCommandGroupLayers(cfg);
     const use_single_gpu_cmd = !engine.debug_validation_enabled and
         !engine.gemma_moe_validation_enabled and
         !engine.qwen_prefill_validation_enabled and
@@ -21797,11 +23909,19 @@ fn runDecodeStep(
         .barrier_count = 0,
         .barrier_enabled = false,
     };
+    var dense_group_profile_prefix: RuntimeProfile = .{};
+    var hybrid_group_cmd_storage = MetalCommand{
+        .handle = null,
+        .dispatch_count = 0,
+        .barrier_count = 0,
+        .barrier_enabled = false,
+    };
+    var hybrid_group_profile_prefix: RuntimeProfile = .{};
     // Sized to hold one token's worth of async layer command buffers. The
-    // use_dense_layer_cmd path submits a few grouped chunks, but the
-    // use_async_local_decode path (hybrid SSM dense decode) submits two per
-    // layer (attn/ssm + FFN), so a 64-layer model (qwen36-27b) needs 128 slots;
-    // 256 keeps a token's commands in flight without a forced mid-token flush.
+    // use_dense_layer_cmd path submits a few grouped chunks, while the hybrid
+    // SSM dense path submits one small layer group at a time. Keep 256 slots so a full
+    // 64-layer token can stay queued even if a future validation/debug path
+    // temporarily splits a layer command.
     var dense_pending_cmds: [256]MetalCommand = undefined;
     var dense_pending_count: usize = 0;
     errdefer waitPendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count, profile);
@@ -21835,13 +23955,21 @@ fn runDecodeStep(
         // standalone scale_in_place dispatch + barrier at the layer tail can
         // then be skipped (≈60 dispatches/60 barriers per token on Gemma 31B).
         var layer_output_scale_fused_into_post_norm: bool = false;
+        const use_hybrid_layer_cmd = use_async_local_decode and shared_cmd == null and !use_dense_layer_cmd;
         const layer_shared_cmd: ?*MetalCommand = if (shared_cmd) |cmd|
             cmd
         else if (use_dense_layer_cmd) blk: {
             if (dense_group_cmd_storage.handle == null) {
+                dense_group_profile_prefix = if (profile) |p| p.* else .{};
                 dense_group_cmd_storage = try beginProfiledCommand(engine, profile);
             }
             break :blk &dense_group_cmd_storage;
+        } else if (use_hybrid_layer_cmd) blk: {
+            if (hybrid_group_cmd_storage.handle == null) {
+                hybrid_group_profile_prefix = if (profile) |p| p.* else .{};
+                hybrid_group_cmd_storage = try beginProfiledCommand(engine, profile);
+            }
+            break :blk &hybrid_group_cmd_storage;
         } else null;
 
         if (is_full_attn) {
@@ -21889,7 +24017,7 @@ fn runDecodeStep(
                 // real barrier on that path, or by command-buffer ordering
                 // across the early/tail prompt split.
                 if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
-                releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
+                releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count, profile);
                 engine.position += 1;
                 return;
             }
@@ -22321,7 +24449,7 @@ fn runDecodeStep(
             }
             if (using_local_cmd) {
                 if (use_async_local_decode)
-                    submitPendingDenseCommand(cmd, dense_pending_cmds[0..], &dense_pending_count, profile)
+                    submitPendingDenseCommand(cmd, engine, dense_pending_cmds[0..], &dense_pending_count, profile, null, cfg, layer_idx, layer_idx + 1)
                 else
                     commitAndWaitProfiled(cmd, profile);
             }
@@ -22353,6 +24481,15 @@ fn runDecodeStep(
                 &z_t.gpu_buffer;
             const wqkv_offset: u32 = if (wqkv_buf == &wqkv_t.gpu_buffer) tensorPageOffset(engine.model, wqkv_t) else 0;
             const z_offset: u32 = if (z_buf == &z_t.gpu_buffer) tensorPageOffset(engine.model, z_t) else 0;
+            // Analysis hook for the next structural speed path: llama.cpp's
+            // `ggml_metal_op_mul_mat_id` batches same-input expert work once
+            // the ids are mapped, while vLLM's `moe_align_block_size` shows
+            // that single-token decode only has a small packed workset. For
+            // dense Qwen3.6 27B, the analogous unfused pair is SSM qkv+gate:
+            // same normalized row, adjacent dependency boundary, different
+            // quant types. Quantify exact pair calls/bytes before adding a
+            // mixed Q6_K/Q4_K or Q4_K/Q4_K dual projection kernel.
+            recordSsmQkvGatePairProfile(engine, wqkv_t, z_t, conv_channels, d_inner, hidden_dim);
 
             if (shouldCaptureQwenRoutePackedLayerInput(engine, layer_idx, using_local_cmd)) {
                 try captureQwenRoutePackedLayerInput(engine, hidden_dim);
@@ -22442,6 +24579,22 @@ fn runDecodeStep(
                         // private-repacked TG128 row grouping but encode one dispatch.
                         dispatchQwenSsmDualRepackedQ8K2048OnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
                         z_projection_queued_before_conv = true;
+                    } else if (canUseQwen35SsmQ4Q4QkvGatePair(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
+                        // Adapt llama.cpp `ggml_metal_op_encode_impl` range
+                        // batching to the all-Q4 SSM pair: qkv and gate read
+                        // the same norm row and are joined by the same tail
+                        // barrier, so the Q4 dual-row shader can replace the
+                        // second standalone projection launch.
+                        dispatchQwen35SsmQ4Q4QkvGatePairOnCmd(engine, cmd, wqkv_t, z_t, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
+                        z_projection_queued_before_conv = true;
+                    } else if (canUseQwen35SsmQ6Q4QkvGatePair(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
+                        // Same same-input projection batching as llama.cpp
+                        // `ggml_metal_op_mul_mat_id`, but for dense Qwen3.6
+                        // 27B's SSM qkv+gate pair instead of routed experts.
+                        // M_q=0 routes Q4_K gate to gate_buf and Q6_K qkv to
+                        // attn_out_buf through one mixed projection dispatch.
+                        dispatchQwen35SsmQ6Q4QkvGatePairOnCmd(engine, cmd, wqkv_t, z_t, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
+                        z_projection_queued_before_conv = true;
                     } else {
                         dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
                     }
@@ -22493,6 +24646,19 @@ fn runDecodeStep(
                     if (canUseQwenSsmDualRepackedQ8K2048(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
                         dispatchQwenSsmDualRepackedQ8K2048OnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
                         z_projection_queued_before_conv = true;
+                    } else if (canUseQwen35SsmQ4Q4QkvGatePair(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
+                        // All-Q4 sibling of the existing mixed SSM pair route.
+                        // The pair profile names q4/q4 separately, so keep this
+                        // shape-specific and do not broaden dense gate/up fusion.
+                        dispatchQwen35SsmQ4Q4QkvGatePairOnCmd(engine, cmd, wqkv_t, z_t, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
+                        z_projection_queued_before_conv = true;
+                    } else if (canUseQwen35SsmQ6Q4QkvGatePair(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
+                        // Reuse the existing mixed Q4_K/Q6_K projection kernel
+                        // for the exact Qwen3.6 27B SSM pair. This keeps the
+                        // alpha/beta tail projection ordering unchanged while
+                        // eliminating the standalone Q4_K gate launch.
+                        dispatchQwen35SsmQ6Q4QkvGatePairOnCmd(engine, cmd, wqkv_t, z_t, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
+                        z_projection_queued_before_conv = true;
                     } else {
                         dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
                     }
@@ -22543,10 +24709,7 @@ fn runDecodeStep(
                         engine.position * conv_channels
                     else
                         0;
-                    const conv_pipe = if (canUseQwenSsmConvD4FastPath(engine, conv_channels, d_conv, false))
-                        &engine.ssm_conv1d_qwen_d4_pipe
-                    else
-                        &engine.ssm_conv1d_pipe;
+                    const conv_pipe = qwenSsmConvD4DecodePipe(engine, conv_channels, d_conv, false) orelse &engine.ssm_conv1d_pipe;
                     dispatchSsmConv1dOffsetWithPipe(
                         cmd,
                         conv_pipe,
@@ -22710,7 +24873,7 @@ fn runDecodeStep(
                     // after the conv/tail join there is no independent queued
                     // work left to preserve, so use the cheaper buffer-scope
                     // encoder barrier instead of building a one-resource array.
-                    profileSsmBarrierBuffers(cmd, profile, .gated_norm, &.{&engine.attn_out_buf});
+                    profileSsmBarrier(cmd, profile, .gated_norm);
                 } else {
                     // Delta-net: swiglu_buf → attn_out_buf
                     {
@@ -22796,9 +24959,17 @@ fn runDecodeStep(
                 const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
                 const ssm_activation_buf: *const MetalBuffer = if (use_fused_delta_gated_norm) &engine.attn_out_buf else &engine.swiglu_buf;
                 dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, ssm_activation_buf, &engine.down_buf, hidden_dim, d_inner, 0);
-                // The residual/router step only depends on the SSM projection
-                // row, and no unrelated SSM work remains queued at this edge.
-                profileSsmBarrierBuffers(cmd, profile, .out, &.{&engine.down_buf});
+                // Adapt llama.cpp `ggml_metal_op_concurrency_check`: on the
+                // Qwen3.6 27B dense-hybrid path, the next residual+norm join
+                // reads only the previous hidden row and the SSM out row. Keep
+                // unrelated SSM state/conv/tail writes out of this dependency
+                // edge so dense FFN recording can overlap those drains inside
+                // the 8-layer hybrid command chunk.
+                if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+                    profileSsmResourceBarrierBuffers(cmd, profile, .out, &.{ &engine.hidden_buf, &engine.down_buf });
+                } else {
+                    profileSsmBarrier(cmd, profile, .out);
+                }
                 if (should_debug_ssm_compare) {
                     commitAndWaitProfiled(cmd, profile);
                     const debug_start = profileStart(profile != null);
@@ -22898,7 +25069,14 @@ fn runDecodeStep(
                 }
             }
             if (!is_moe and layer_shared_cmd != null) {
-                profileDenseFfnBarrier(cmd, profile, .norm);
+                if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+                    // Dense gate/up consumes only the FFN norm row. The later
+                    // dense-down scope barrier still orders the paired hidden
+                    // residual write before the FFN tail reads hidden_buf.
+                    profileDenseFfnBarrierBuffers(cmd, profile, .norm, &.{&engine.norm_buf});
+                } else {
+                    profileDenseFfnBarrier(cmd, profile, .norm);
+                }
             }
             if (is_moe and !skip_pre_ffn_router) {
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
@@ -23122,7 +25300,7 @@ fn runDecodeStep(
             }
             if (using_local_cmd) {
                 if (use_async_local_decode)
-                    submitPendingDenseCommand(cmd, dense_pending_cmds[0..], &dense_pending_count, profile)
+                    submitPendingDenseCommand(cmd, engine, dense_pending_cmds[0..], &dense_pending_count, profile, null, cfg, layer_idx, layer_idx + 1)
                 else
                     commitAndWaitProfiled(cmd, profile);
             }
@@ -23504,6 +25682,8 @@ fn runDecodeStep(
                     dispatchDenseQ4KGateUpGeGLUOnCmd(engine, cmd, layer_idx, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
                 } else if (fused_gate_up_swiglu) {
                     dispatchDenseQ4KGateUpSwiGLUOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
+                } else if (canUseQwen35DenseQ4KGateUpQKDual(engine, gate_t, up_t, inter_dim, hidden_dim)) {
+                    dispatchDenseQ4KQKDualOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.gate_buf, &engine.up_buf, inter_dim, inter_dim, hidden_dim);
                 } else if (canUseDenseQ4KGateUpDual(engine, gate_t, up_t, inter_dim, hidden_dim)) {
                     dispatchDenseQ4KGateUpDualOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.gate_buf, &engine.up_buf, inter_dim, hidden_dim);
                 } else {
@@ -23515,31 +25695,52 @@ fn runDecodeStep(
                     try validateDenseGemmaQ4KGeGLUOnCmd(engine, cmd, profile, layer_idx, gate_t, up_t, inter_dim, hidden_dim);
                 }
                 if (!fused_gate_up) {
-                    profileDenseFfnBarrierBuffers(cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
+                    if (use_hybrid_layer_cmd and defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+                        // llama.cpp's `ggml_metal_op_concurrency_check` only
+                        // resets when the next op conflicts with tracked
+                        // resource ranges. SwiGLU reads gate/up only; the
+                        // prior residual write to hidden_buf is joined later
+                        // at dense-down/residual, so do not drain it here.
+                        profileDenseFfnResourceBarrierBuffers(cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
+                    } else {
+                        profileDenseFfnBarrierBuffers(cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
+                    }
                     const activation_dispatch_before = cmd.dispatch_count;
                     dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, inter_dim);
                     recordDenseFfnDispatchDelta(profile, .activation, activation_dispatch_before, cmd.dispatch_count);
+                    if (shouldValidateQwen35DenseQ4KGateUpSwiGLU(engine, layer_idx, gate_t, up_t, inter_dim, hidden_dim)) {
+                        try validateQwen35DenseQ4KGateUpSwiGLUOnCmd(engine, cmd, profile, layer_idx, gate_t, up_t, &engine.norm_buf, inter_dim, hidden_dim);
+                    }
                 }
-                // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: the
-                // dense activation join has exactly one prior producer
-                // (gate/up+GeGLU or standalone activation) and the next down
-                // projection consumes its only output, `swiglu_buf`. Unlike
-                // the norm/tail joins, this edge is not preserving deferred
-                // hidden_buf work, so a plain buffer-scope reset avoids a hot
-                // single-resource barrier call without widening any live
-                // independent dependency.
-                profileDenseFfnBarrier(cmd, profile, .activation);
+                // Dense-down consumes only the activation row. On the Qwen3.6
+                // 27B hybrid path, this command buffer also carries SSM/full-attn
+                // work from the same small layer group, so adapt llama.cpp
+                // `ggml_metal_op_concurrency_check/reset`: fence only the
+                // single consumer resource instead of flushing unrelated writes.
+                if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+                    profileDenseFfnBarrierBuffers(cmd, profile, .activation, &.{&engine.swiglu_buf});
+                } else {
+                    profileDenseFfnBarrier(cmd, profile, .activation);
+                }
 
                 const down_dispatch_before = cmd.dispatch_count;
                 dispatchDmmvOnCmd(engine, cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
                 recordDenseFfnDispatchDelta(profile, .down, down_dispatch_before, cmd.dispatch_count);
                 if (layer_shared_cmd != null) {
-                    // The post-FFN residual reads both down_buf and hidden_buf.
-                    // hidden_buf was intentionally not fenced at the dense FFN input
-                    // edge above because gate/up and down do not consume it. This is
-                    // now the actual join, so mirror llama.cpp's reset barrier rather
-                    // than paying a two-resource barrier on every dense layer.
-                    profileDenseFfnBarrier(cmd, profile, .down);
+                    // Qwen3.6 27B hybrid decode keeps one command buffer per
+                    // small layer group. The following tail only joins the deferred
+                    // residual write with dense-down output, so fence those
+                    // two resources instead of every prior buffer write.
+                    if (use_hybrid_layer_cmd and defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+                        profileDenseFfnBarrierBuffers(cmd, profile, .down, &.{ &engine.hidden_buf, &engine.down_buf });
+                    } else {
+                        // The post-FFN residual reads both down_buf and hidden_buf.
+                        // hidden_buf was intentionally not fenced at the dense FFN input
+                        // edge above because gate/up and down do not consume it. This is
+                        // now the actual join, so mirror llama.cpp's reset barrier rather
+                        // than paying a two-resource barrier on every dense layer.
+                        profileDenseFfnBarrier(cmd, profile, .down);
+                    }
                 } else {
                     profileDenseFfnBarrierBuffers(cmd, profile, .down, &.{&engine.down_buf});
                 }
@@ -23550,10 +25751,13 @@ fn runDecodeStep(
                     layer_shared_cmd != null and
                     shared_cmd == null and
                     next_layer_idx_u == layer_count;
-                const ends_dense_cmd_chunk = use_dense_layer_cmd and
-                    layer_shared_cmd != null and
-                    (next_layer_idx_u == layer_count or next_layer_idx_u % dense_cmd_group_layers == 0) and
-                    !keep_terminal_dense_cmd_for_final;
+                const hybrid_cmd_group_boundary = use_hybrid_layer_cmd and
+                    (next_layer_idx_u == layer_count or next_layer_idx_u % hybrid_cmd_group_layers == 0);
+                const ends_dense_cmd_chunk = layer_shared_cmd != null and
+                    ((use_dense_layer_cmd and
+                        (next_layer_idx_u == layer_count or next_layer_idx_u % dense_cmd_group_layers == 0) and
+                        !keep_terminal_dense_cmd_for_final) or
+                        hybrid_cmd_group_boundary);
                 const layer_output_scale_folded_pre = skip_pre_ffn_router and !engine.debug_validation_enabled;
                 // The fused kernel now folds an arbitrary `hidden_scale` into
                 // its in-place hidden write, so a non-unit `layer_output_scale`
@@ -23602,6 +25806,10 @@ fn runDecodeStep(
                         hidden_dim,
                         hidden_scale,
                     );
+                    if (profile) |p| {
+                        p.dense_ffn_tail_post_norm_next_norm_calls += 1;
+                        if (can_fuse_final_norm_tail) p.dense_ffn_tail_final_norm_calls += 1;
+                    }
                     if (can_fuse_final_norm_tail) {
                         // Adapt llama.cpp `ggml_metal_op_concurrency_check`:
                         // LM head consumes only the materialized final norm row.
@@ -23612,21 +25820,22 @@ fn runDecodeStep(
                     if (can_fold_layer_scale_here) layer_output_scale_fused_into_post_norm = true;
                     if (can_fuse_final_norm_tail) {
                         if (prefer_dense_gemma_scope_norm_join) {
-                            profileDenseFfnBarrier(cmd, profile, .tail);
+                            profileDenseFfnTailBarrier(cmd, profile, .final_norm);
                         } else {
-                            profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
+                            profileDenseFfnTailBarrierBuffers(cmd, profile, .final_norm, &.{&engine.norm_buf});
                         }
                     } else if (!ends_dense_cmd_chunk) {
                         if (prefer_dense_gemma_scope_norm_join) {
-                            profileDenseFfnBarrier(cmd, profile, .tail);
+                            profileDenseFfnTailBarrier(cmd, profile, .post_norm_next_norm);
                         } else {
-                            profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
+                            profileDenseFfnTailBarrierBuffers(cmd, profile, .post_norm_next_norm, &.{&engine.norm_buf});
                         }
                         prev_fused_hidden_barrier_deferred = true;
                     }
                 } else {
                     if (engine.post_ffn_norm_present[layer_idx]) {
                         dispatchRmsNormOnCmd(engine, cmd, &engine.down_buf, &engine.down_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
+                        if (profile) |p| p.dense_ffn_tail_post_norm_dispatch_calls += 1;
                         profileDenseFfnBarrierBuffers(cmd, profile, .down, &.{&engine.down_buf});
                     }
 
@@ -23647,14 +25856,15 @@ fn runDecodeStep(
                                 1.0,
                                 hidden_scale,
                             );
+                            if (profile) |p| p.dense_ffn_tail_residual_next_norm_calls += 1;
                             prev_fused_attn_norm = true;
                             if (layer_scale_runs_after_dense) layer_output_scale_fused_into_post_norm = true;
                             if (!ends_dense_cmd_chunk) {
                                 if (prefer_dense_gemma_scope_norm_join) {
-                                    profileDenseFfnBarrier(cmd, profile, .tail);
+                                    profileDenseFfnTailBarrier(cmd, profile, .residual_next_norm);
                                     prev_fused_hidden_barrier_deferred = true;
                                 } else {
-                                    profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
+                                    profileDenseFfnTailBarrierBuffers(cmd, profile, .residual_next_norm, &.{&engine.norm_buf});
                                     prev_fused_hidden_barrier_deferred = true;
                                 }
                             }
@@ -23665,8 +25875,9 @@ fn runDecodeStep(
                             const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
                             const acc_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.down_buf };
                             cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
+                            if (profile) |p| p.dense_ffn_tail_residual_acc_calls += 1;
                             if (!ends_dense_cmd_chunk or layer_scale_runs_after_dense) {
-                                profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.hidden_buf});
+                                profileDenseFfnTailBarrierBuffers(cmd, profile, .residual_acc, &.{&engine.hidden_buf});
                             }
                         }
                     }
@@ -23681,7 +25892,8 @@ fn runDecodeStep(
                         const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
                         const acc_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.down_buf };
                         cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
-                        submitPendingDenseCommand(cmd, dense_pending_cmds[0..], &dense_pending_count, profile);
+                        if (profile) |p| p.dense_ffn_tail_residual_acc_calls += 1;
+                        submitPendingDenseCommand(cmd, engine, dense_pending_cmds[0..], &dense_pending_count, profile, null, cfg, layer_idx, layer_idx + 1);
                     } else {
                         commitAndWaitProfiled(cmd, profile);
 
@@ -23720,11 +25932,19 @@ fn runDecodeStep(
         if (engine.debug_validation_enabled and engine.position == 0) {
             logLayerDiagnostics(engine, lt, layer, is_full_attn, "post_ffn");
         }
+        if (use_hybrid_layer_cmd and hybrid_group_cmd_storage.handle != null) {
+            const next_layer = layer_idx + 1;
+            if (next_layer == layer_count or next_layer % hybrid_cmd_group_layers == 0) {
+                const chunk_start = decodeAsyncChunkStart(next_layer, start_layer, hybrid_cmd_group_layers);
+                submitPendingDenseCommand(&hybrid_group_cmd_storage, engine, dense_pending_cmds[0..], &dense_pending_count, profile, &hybrid_group_profile_prefix, cfg, chunk_start, next_layer);
+            }
+        }
         if (use_dense_layer_cmd and dense_group_cmd_storage.handle != null) {
             const next_layer = layer_idx + 1;
             const keep_terminal_dense_cmd_for_final = emit_logits and shared_cmd == null and next_layer == layer_count;
             if ((next_layer == layer_count or next_layer % dense_cmd_group_layers == 0) and !keep_terminal_dense_cmd_for_final) {
-                submitPendingDenseCommand(&dense_group_cmd_storage, dense_pending_cmds[0..], &dense_pending_count, profile);
+                const chunk_start = decodeAsyncChunkStart(next_layer, start_layer, dense_cmd_group_layers);
+                submitPendingDenseCommand(&dense_group_cmd_storage, engine, dense_pending_cmds[0..], &dense_pending_count, profile, &dense_group_profile_prefix, cfg, chunk_start, next_layer);
             }
         }
     }
@@ -23805,11 +26025,11 @@ fn runDecodeStep(
         if (final_norm_ready_from_dense_tail) {
             dispatchLmHeadAndArgmaxOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, &engine.argmax_buf, hidden_dim, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(cmd, profile);
+            commitFinalCommandProfiled(cmd, profile, dense_pending_count);
         } else if (cpu_lm_head) {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(cmd, profile, .final);
-            commitAndWaitProfiled(cmd, profile);
+            commitFinalCommandProfiled(cmd, profile, dense_pending_count);
             const in_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
             const out_ptr: [*]f32 = @ptrCast(@alignCast(engine.logits_buf.cpu_ptr.?));
             try cpuLmHeadFallbackWithArgmax(engine, in_ptr, out_ptr);
@@ -23822,16 +26042,16 @@ fn runDecodeStep(
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(cmd, profile);
+            commitFinalCommandProfiled(cmd, profile, dense_pending_count);
         } else {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.norm_buf});
             dispatchLmHeadAndArgmaxOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, &engine.argmax_buf, hidden_dim, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(cmd, profile);
+            commitFinalCommandProfiled(cmd, profile, dense_pending_count);
         }
     }
-    releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
+    releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count, profile);
     if (engine.debug_validation_enabled and engine.position == 5) {
         const debug_start = profileStart(profile != null);
         try debugCompareFinalLogits(engine);
@@ -26501,6 +28721,7 @@ test "qwen ssm conv d4 threadgroup helper uses exact model shape" {
     };
 
     try std.testing.expectEqual(@as(u32, 128), ssmConv1dThreadgroupSize(&pipe, 8192, 4, false));
+    try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 10240, 4, false));
     try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 8192, 3, false));
     try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 4096, 4, false));
     try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 8192, 4, true));
@@ -26529,6 +28750,7 @@ test "qwen ssm delta gated norm threadgroup helper uses tg128 exact model shape"
     };
 
     try std.testing.expectEqual(@as(u32, 128), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 128, 128, 16));
+    try std.testing.expectEqual(@as(u32, 128), ssmDeltaGatedNormThreadgroupSize(&pipe, 48, 128, 128, 16));
     try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 16, 128, 128, 16));
     try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 64, 128, 16));
     try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 128, 64, 16));
@@ -26588,6 +28810,82 @@ test "ssm_conv1d shader matches CPU reference" {
         kernel_ptr[0..kernel_len],
         ref_state[0..state_len],
         ref_output[0..conv_channels],
+        conv_channels,
+        d_conv,
+    );
+
+    var cmd = try metal_command.beginCommand(ctx);
+    dispatchSsmConv1dWithPipe(
+        &cmd,
+        &pipe,
+        &kernel_buf,
+        &state_buf,
+        &input_buf,
+        &output_buf,
+        @intCast(conv_channels),
+        @intCast(d_conv),
+        false,
+    );
+    cmd.commitAndWait();
+
+    for (0..conv_channels) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.0005);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.0005);
+    }
+}
+
+test "qwen27b ssm_conv1d d4 shader matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen27b_d4");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const conv_channels: usize = 10240;
+    const d_conv: usize = 4;
+    const state_len: usize = (d_conv - 1) * conv_channels;
+    const kernel_len: usize = conv_channels * d_conv;
+
+    var kernel_buf = try metal_buffer.createBuffer(ctx, kernel_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&kernel_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, conv_channels * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, conv_channels * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const kernel_ptr: [*]f32 = @ptrCast(@alignCast(kernel_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    for (0..kernel_len) |i| {
+        kernel_ptr[i] = (@as(f32, @floatFromInt(i % 19)) - 9.0) * 0.02173913;
+    }
+    for (0..state_len) |i| {
+        state_ptr[i] = (@as(f32, @floatFromInt(i % 31)) - 15.0) * 0.0125;
+    }
+    for (0..conv_channels) |i| {
+        input_ptr[i] = (@as(f32, @floatFromInt(i % 37)) - 18.0) * 0.017857144;
+    }
+    @memset(output_ptr[0..conv_channels], 0);
+
+    const allocator = std.testing.allocator;
+    const ref_state = try allocator.alloc(f32, state_len);
+    defer allocator.free(ref_state);
+    const ref_output = try allocator.alloc(f32, conv_channels);
+    defer allocator.free(ref_output);
+    @memcpy(ref_state, state_ptr[0..state_len]);
+    @memset(ref_output, 0);
+    refRunSsmConv1d(
+        input_ptr[0..conv_channels],
+        kernel_ptr[0..kernel_len],
+        ref_state,
+        ref_output,
         conv_channels,
         d_conv,
     );
@@ -29680,6 +31978,77 @@ test "global q8 override skips gemma shared expert q8 tensors" {
     try std.testing.expect(shouldUseGlobalQ8Override(.qwen35, "blk.0.ffn_down.weight"));
 }
 
+test "q6k simdgroup route covers qwen35 27b exact shapes" {
+    const qwen35_27b_cfg = ModelConfig{
+        .architecture = .qwen35,
+        .n_layers = 64,
+        .n_heads = 24,
+        .n_kv_heads = 4,
+        .head_dim = 128,
+        .hidden_dim = 5120,
+        .intermediate_dim = 17408,
+        .vocab_size = 248320,
+        .context_length = 32768,
+        .rope_freq_base = 1_000_000.0,
+        .n_experts = 0,
+        .n_experts_used = 0,
+        .rope_dim = 128,
+        .ssm_d_conv = 4,
+        .ssm_d_inner = 6144,
+        .ssm_d_state = 128,
+        .ssm_dt_rank = 48,
+        .ssm_n_group = 16,
+        .full_attn_interval = 4,
+        .shared_expert_intermediate_dim = 0,
+    };
+
+    try std.testing.expect(supportsDenseQ6kSimdgroupDmmvArch(.gemma));
+    try std.testing.expect(supportsDenseQ6kSimdgroupDmmvArch(.qwen2));
+    try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen35));
+    try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen2_moe));
+    try std.testing.expect(defaultQwen35Dense27bSsmDeltaGatedNormEnabled(qwen35_27b_cfg));
+    try std.testing.expectEqual(@as(usize, 8), hybridDecodeCommandGroupLayers(qwen35_27b_cfg));
+    try std.testing.expect(qwenSsmDeltaGatedNormExactShape(qwen35_27b_cfg, 48, 128, 128, 16));
+    try std.testing.expect(!qwenSsmDeltaGatedNormExactShape(qwen35_27b_cfg, 32, 128, 128, 16));
+    try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
+    try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.attn_qkv.weight", 10240, 5120));
+    try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "output.weight", 248320, 5120));
+    try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.attn_gate.weight", 6144, 5120));
+    try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ssm_out.weight", 5120, 6144));
+    try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "output.weight", 248320, 4096));
+    try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "output.weight", 151936, 5120));
+    try std.testing.expect(isQwen35SsmQkvQ4kTarget(qwen35_27b_cfg, "blk.0.attn_qkv.weight", 10240, 5120));
+    try std.testing.expect(!isQwen35SsmQkvQ4kTarget(qwen35_27b_cfg, "blk.0.attn_gate.weight", 6144, 5120));
+    try std.testing.expect(!isQwen35SsmQkvQ4kTarget(qwen35_27b_cfg, "blk.0.attn_qkv.weight", 8192, 5120));
+    try std.testing.expect(isQwen35SsmGateQ4kTarget(qwen35_27b_cfg, "blk.0.attn_gate.weight", 6144, 5120));
+    try std.testing.expect(!isQwen35SsmGateQ4kTarget(qwen35_27b_cfg, "blk.0.attn_qkv.weight", 10240, 5120));
+    try std.testing.expect(!isQwen35SsmGateQ4kTarget(qwen35_27b_cfg, "blk.0.attn_gate.weight", 4096, 5120));
+    try std.testing.expect(isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_gate.weight", 17408, 5120));
+    try std.testing.expect(isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_up.weight", 17408, 5120));
+    try std.testing.expect(!isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
+    try std.testing.expect(!isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ssm_out.weight", 10240, 5120));
+    try std.testing.expect(isQwen35DenseDownQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
+    try std.testing.expect(!isQwen35DenseDownQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_gate.weight", 17408, 5120));
+    try std.testing.expect(!isQwen35DenseDownQ4kTarget(qwen35_27b_cfg, "blk.0.ssm_out.weight", 10240, 5120));
+
+    const null_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    const gate = metal_loader.LoadedTensor{
+        .info = .{ .name = "blk.0.ffn_gate.weight", .n_dims = 2, .dims = .{ 5120, 17408, 1, 1 }, .type_ = .q4_k, .offset = 0 },
+        .gpu_buffer = null_buf,
+    };
+    const up = metal_loader.LoadedTensor{
+        .info = .{ .name = "blk.0.ffn_up.weight", .n_dims = 2, .dims = .{ 5120, 17408, 1, 1 }, .type_ = .q4_k, .offset = 0 },
+        .gpu_buffer = null_buf,
+    };
+    const down = metal_loader.LoadedTensor{
+        .info = .{ .name = "blk.0.ffn_down.weight", .n_dims = 2, .dims = .{ 17408, 5120, 1, 1 }, .type_ = .q4_k, .offset = 0 },
+        .gpu_buffer = null_buf,
+    };
+    try std.testing.expect(isQwen35DenseQ4KGateUpSwiGLUTarget(qwen35_27b_cfg, &gate, &up, 17408, 5120));
+    try std.testing.expect(!isQwen35DenseQ4KGateUpSwiGLUTarget(qwen35_27b_cfg, &gate, &down, 17408, 5120));
+    try std.testing.expect(!isQwen35DenseQ4KGateUpSwiGLUTarget(qwen35_27b_cfg, &gate, &up, 17408, 4096));
+}
+
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
     const gemma_cfg = ModelConfig{
         .architecture = .gemma,
@@ -29731,7 +32100,325 @@ test "gemma dense-named shared experts populate detailed profile buckets" {
     try std.testing.expectEqual(DmmvDetailClass.shared_gate_up, classifyDmmvDetailUncached(.shared_expert, "blk.0.ffn_up.weight"));
     try std.testing.expectEqual(DmmvDetailClass.shared_down, classifyDmmvDetailUncached(.shared_expert, "blk.0.ffn_down.weight"));
     try std.testing.expectEqual(DmmvDetailClass.shared_gate_up, classifyDmmvDetailUncached(.shared_expert, "blk.0.ffn_gate_shexp.weight"));
-    try std.testing.expectEqual(DmmvDetailClass.none, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_gate.weight"));
+}
+
+test "dense FFN tensors populate detailed profile buckets" {
+    try std.testing.expectEqual(DmmvDetailClass.dense_gate, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_gate.weight"));
+    try std.testing.expectEqual(DmmvDetailClass.dense_up, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_up.weight"));
+    try std.testing.expectEqual(DmmvDetailClass.dense_down, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_down.weight"));
+    try std.testing.expectEqual(DmmvDetailClass.none, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_gate_shexp.weight"));
+}
+
+test "DMMV hot-shape profile keeps dense gate and up separate" {
+    var stats: [4]DmmvShapeStat = [_]DmmvShapeStat{.{}} ** 4;
+
+    recordDmmvShapeProfile(stats[0..], .dense_ffn, .dense_gate, 17408, 5120, 10);
+    recordDmmvShapeProfile(stats[0..], .dense_ffn, .dense_up, 17408, 5120, 20);
+    recordDmmvShapeProfile(stats[0..], .dense_ffn, .dense_gate, 17408, 5120, 5);
+
+    try std.testing.expectEqual(DmmvPathClass.dense_ffn, stats[0].path);
+    try std.testing.expectEqual(DmmvDetailClass.dense_gate, stats[0].detail);
+    try std.testing.expectEqual(@as(u64, 15), stats[0].bytes);
+    try std.testing.expectEqual(@as(u32, 2), stats[0].calls);
+    try std.testing.expectEqual(DmmvDetailClass.dense_up, stats[1].detail);
+    try std.testing.expectEqual(@as(u64, 20), stats[1].bytes);
+    try std.testing.expectEqual(@as(u32, 1), stats[1].calls);
+
+    const prefix = [_]DmmvShapeStat{
+        .{ .path = .dense_ffn, .detail = .dense_gate, .rows = 17408, .cols = 5120, .bytes = 10, .calls = 1 },
+        .{ .path = .dense_ffn, .detail = .dense_up, .rows = 17408, .cols = 5120, .bytes = 20, .calls = 1 },
+    };
+    const delta = dmmvShapeStatMinusPrefix(stats[0], prefix[0..]);
+    try std.testing.expectEqual(DmmvDetailClass.dense_gate, delta.detail);
+    try std.testing.expectEqual(@as(u64, 5), delta.bytes);
+    try std.testing.expectEqual(@as(u32, 1), delta.calls);
+}
+
+test "profile split preserves SSM and dense tail phase counters" {
+    var prefix = RuntimeProfile{
+        .decode_async_submitted_dispatch_calls = 90,
+        .decode_async_submitted_barrier_calls = 80,
+        .decode_async_submitted_resource_barrier_resources = 70,
+        .decode_async_final_dispatch_calls = 60,
+        .decode_async_final_barrier_calls = 50,
+        .decode_async_final_resource_barrier_resources = 40,
+        .ssm_barrier_calls = 11,
+        .ssm_proj_norm_barrier_calls = 1,
+        .ssm_qkv_barrier_calls = 2,
+        .ssm_tail_barrier_calls = 3,
+        .ssm_conv_barrier_calls = 4,
+        .ssm_delta_barrier_calls = 5,
+        .ssm_gated_norm_barrier_calls = 6,
+        .ssm_out_barrier_calls = 7,
+        .ssm_residual_barrier_calls = 8,
+        .ssm_scope_barrier_calls_by_phase = .{
+            .conv = 2,
+            .gated_norm = 3,
+        },
+        .ssm_resource_barrier_calls_by_phase = .{
+            .out = 4,
+            .residual = 5,
+        },
+        .ssm_resource_barrier_resources_by_phase = .{
+            .out = 8,
+            .residual = 13,
+        },
+        .dense_ffn_tail_post_norm_next_norm_barrier_calls = 9,
+        .dense_ffn_tail_residual_next_norm_barrier_calls = 10,
+        .dense_ffn_tail_residual_acc_barrier_calls = 11,
+        .dense_ffn_tail_final_norm_barrier_calls = 12,
+        .dense_ffn_tail_post_norm_dispatch_calls = 13,
+        .dense_ffn_tail_post_norm_next_norm_calls = 14,
+        .dense_ffn_tail_residual_next_norm_calls = 15,
+        .dense_ffn_tail_residual_acc_calls = 16,
+        .dense_ffn_tail_final_norm_calls = 17,
+    };
+    prefix.decode_async_slot_submits[0] = 2;
+    prefix.decode_async_slot_dispatch_calls[0] = 20;
+    prefix.decode_async_slot_barrier_calls[0] = 18;
+    prefix.decode_async_slot_resource_barrier_resources[0] = 16;
+    prefix.decode_async_slot_completed_cmds[0] = 2;
+    prefix.decode_async_slot_gpu_ns[0] = 2_000_000;
+    prefix.decode_async_slot_encode_ns[0] = 1_000_000;
+    prefix.decode_async_slot_layer_range_submits[0] = 2;
+    prefix.decode_async_slot_layer_start_sum[0] = 4;
+    prefix.decode_async_slot_layer_end_sum[0] = 20;
+    prefix.decode_async_slot_full_attn_layers[0] = 2;
+    prefix.decode_async_slot_ssm_layers[0] = 14;
+    prefix.decode_async_slot_dense_ffn_layers[0] = 16;
+    prefix.decode_async_slot_full_attn_bytes[0] = 200;
+    prefix.decode_async_slot_ssm_projection_bytes[0] = 300;
+    prefix.decode_async_slot_ssm_qkv_bytes[0] = 100;
+    prefix.decode_async_slot_ssm_gate_bytes[0] = 120;
+    prefix.decode_async_slot_ssm_tail_bytes[0] = 80;
+    prefix.decode_async_slot_ssm_out_bytes[0] = 400;
+    prefix.decode_async_slot_dense_ffn_bytes[0] = 500;
+    prefix.decode_async_slot_dense_gate_bytes[0] = 100;
+    prefix.decode_async_slot_dense_up_bytes[0] = 150;
+    prefix.decode_async_slot_dense_down_bytes[0] = 250;
+    prefix.decode_async_slot_dense_dispatch_phases[0] = .{ .gate_up = 2, .activation = 2, .down = 2, .tail = 1 };
+    prefix.decode_async_slot_dense_scope_barrier_phases[0] = .{ .activation = 2, .down = 1 };
+    prefix.decode_async_slot_dense_resource_barrier_phases[0] = .{ .gate_up = 2, .tail = 1 };
+    prefix.decode_async_slot_dense_resource_barrier_entries_phases[0] = .{ .gate_up = 4, .tail = 1 };
+    prefix.decode_async_slot_submits[1] = 3;
+    prefix.decode_async_slot_dispatch_calls[1] = 33;
+    prefix.decode_async_slot_barrier_calls[1] = 30;
+    prefix.decode_async_slot_resource_barrier_resources[1] = 27;
+    prefix.decode_async_slot_completed_cmds[1] = 3;
+    prefix.decode_async_slot_gpu_ns[1] = 6_000_000;
+    prefix.decode_async_slot_encode_ns[1] = 3_000_000;
+    prefix.decode_async_slot_layer_range_submits[1] = 3;
+    prefix.decode_async_slot_layer_start_sum[1] = 72;
+    prefix.decode_async_slot_layer_end_sum[1] = 96;
+    prefix.decode_async_slot_full_attn_layers[1] = 3;
+    prefix.decode_async_slot_ssm_layers[1] = 21;
+    prefix.decode_async_slot_dense_ffn_layers[1] = 24;
+    prefix.decode_async_slot_full_attn_bytes[1] = 600;
+    prefix.decode_async_slot_ssm_projection_bytes[1] = 700;
+    prefix.decode_async_slot_ssm_qkv_bytes[1] = 250;
+    prefix.decode_async_slot_ssm_gate_bytes[1] = 300;
+    prefix.decode_async_slot_ssm_tail_bytes[1] = 150;
+    prefix.decode_async_slot_ssm_out_bytes[1] = 800;
+    prefix.decode_async_slot_dense_ffn_bytes[1] = 900;
+    prefix.decode_async_slot_dense_gate_bytes[1] = 200;
+    prefix.decode_async_slot_dense_up_bytes[1] = 300;
+    prefix.decode_async_slot_dense_down_bytes[1] = 400;
+    prefix.decode_async_slot_dense_dispatch_phases[1] = .{ .norm = 3, .gate_up = 6, .activation = 3, .down = 3, .tail = 3 };
+    prefix.decode_async_slot_dense_scope_barrier_phases[1] = .{ .activation = 3, .down = 3 };
+    prefix.decode_async_slot_dense_resource_barrier_phases[1] = .{ .norm = 3, .gate_up = 3 };
+    prefix.decode_async_slot_dense_resource_barrier_entries_phases[1] = .{ .norm = 3, .gate_up = 6 };
+
+    var total = RuntimeProfile{
+        .decode_async_submitted_dispatch_calls = 900,
+        .decode_async_submitted_barrier_calls = 800,
+        .decode_async_submitted_resource_barrier_resources = 700,
+        .decode_async_final_dispatch_calls = 600,
+        .decode_async_final_barrier_calls = 500,
+        .decode_async_final_resource_barrier_resources = 400,
+        .ssm_barrier_calls = 41,
+        .ssm_proj_norm_barrier_calls = 11,
+        .ssm_qkv_barrier_calls = 22,
+        .ssm_tail_barrier_calls = 33,
+        .ssm_conv_barrier_calls = 44,
+        .ssm_delta_barrier_calls = 55,
+        .ssm_gated_norm_barrier_calls = 66,
+        .ssm_out_barrier_calls = 77,
+        .ssm_residual_barrier_calls = 88,
+        .ssm_scope_barrier_calls_by_phase = .{
+            .conv = 12,
+            .gated_norm = 23,
+        },
+        .ssm_resource_barrier_calls_by_phase = .{
+            .out = 34,
+            .residual = 45,
+        },
+        .ssm_resource_barrier_resources_by_phase = .{
+            .out = 58,
+            .residual = 73,
+        },
+        .dense_ffn_tail_post_norm_next_norm_barrier_calls = 99,
+        .dense_ffn_tail_residual_next_norm_barrier_calls = 110,
+        .dense_ffn_tail_residual_acc_barrier_calls = 121,
+        .dense_ffn_tail_final_norm_barrier_calls = 132,
+        .dense_ffn_tail_post_norm_dispatch_calls = 143,
+        .dense_ffn_tail_post_norm_next_norm_calls = 154,
+        .dense_ffn_tail_residual_next_norm_calls = 165,
+        .dense_ffn_tail_residual_acc_calls = 176,
+        .dense_ffn_tail_final_norm_calls = 187,
+    };
+    total.decode_async_slot_submits[0] = 7;
+    total.decode_async_slot_dispatch_calls[0] = 70;
+    total.decode_async_slot_barrier_calls[0] = 63;
+    total.decode_async_slot_resource_barrier_resources[0] = 56;
+    total.decode_async_slot_completed_cmds[0] = 7;
+    total.decode_async_slot_gpu_ns[0] = 9_000_000;
+    total.decode_async_slot_encode_ns[0] = 4_000_000;
+    total.decode_async_slot_layer_range_submits[0] = 7;
+    total.decode_async_slot_layer_start_sum[0] = 44;
+    total.decode_async_slot_layer_end_sum[0] = 100;
+    total.decode_async_slot_full_attn_layers[0] = 7;
+    total.decode_async_slot_ssm_layers[0] = 49;
+    total.decode_async_slot_dense_ffn_layers[0] = 56;
+    total.decode_async_slot_full_attn_bytes[0] = 2_000;
+    total.decode_async_slot_ssm_projection_bytes[0] = 3_000;
+    total.decode_async_slot_ssm_qkv_bytes[0] = 1_000;
+    total.decode_async_slot_ssm_gate_bytes[0] = 1_200;
+    total.decode_async_slot_ssm_tail_bytes[0] = 800;
+    total.decode_async_slot_ssm_out_bytes[0] = 4_000;
+    total.decode_async_slot_dense_ffn_bytes[0] = 5_000;
+    total.decode_async_slot_dense_gate_bytes[0] = 1_000;
+    total.decode_async_slot_dense_up_bytes[0] = 1_500;
+    total.decode_async_slot_dense_down_bytes[0] = 2_500;
+    total.decode_async_slot_dense_dispatch_phases[0] = .{ .gate_up = 12, .activation = 12, .down = 12, .tail = 6 };
+    total.decode_async_slot_dense_scope_barrier_phases[0] = .{ .activation = 12, .down = 6 };
+    total.decode_async_slot_dense_resource_barrier_phases[0] = .{ .gate_up = 12, .tail = 6 };
+    total.decode_async_slot_dense_resource_barrier_entries_phases[0] = .{ .gate_up = 24, .tail = 6 };
+    total.decode_async_slot_submits[1] = 11;
+    total.decode_async_slot_dispatch_calls[1] = 121;
+    total.decode_async_slot_barrier_calls[1] = 110;
+    total.decode_async_slot_resource_barrier_resources[1] = 99;
+    total.decode_async_slot_completed_cmds[1] = 11;
+    total.decode_async_slot_gpu_ns[1] = 23_000_000;
+    total.decode_async_slot_encode_ns[1] = 10_000_000;
+    total.decode_async_slot_layer_range_submits[1] = 11;
+    total.decode_async_slot_layer_start_sum[1] = 200;
+    total.decode_async_slot_layer_end_sum[1] = 288;
+    total.decode_async_slot_full_attn_layers[1] = 11;
+    total.decode_async_slot_ssm_layers[1] = 77;
+    total.decode_async_slot_dense_ffn_layers[1] = 88;
+    total.decode_async_slot_full_attn_bytes[1] = 6_000;
+    total.decode_async_slot_ssm_projection_bytes[1] = 7_000;
+    total.decode_async_slot_ssm_qkv_bytes[1] = 2_500;
+    total.decode_async_slot_ssm_gate_bytes[1] = 3_000;
+    total.decode_async_slot_ssm_tail_bytes[1] = 1_500;
+    total.decode_async_slot_ssm_out_bytes[1] = 8_000;
+    total.decode_async_slot_dense_ffn_bytes[1] = 9_000;
+    total.decode_async_slot_dense_gate_bytes[1] = 2_000;
+    total.decode_async_slot_dense_up_bytes[1] = 3_000;
+    total.decode_async_slot_dense_down_bytes[1] = 4_000;
+    total.decode_async_slot_dense_dispatch_phases[1] = .{ .norm = 11, .gate_up = 22, .activation = 11, .down = 11, .tail = 11 };
+    total.decode_async_slot_dense_scope_barrier_phases[1] = .{ .activation = 11, .down = 11 };
+    total.decode_async_slot_dense_resource_barrier_phases[1] = .{ .norm = 11, .gate_up = 11 };
+    total.decode_async_slot_dense_resource_barrier_entries_phases[1] = .{ .norm = 11, .gate_up = 22 };
+
+    const delta = profileDeltaForSplit(total, prefix);
+    try std.testing.expectEqual(@as(u32, 810), delta.decode_async_submitted_dispatch_calls);
+    try std.testing.expectEqual(@as(u32, 720), delta.decode_async_submitted_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 630), delta.decode_async_submitted_resource_barrier_resources);
+    try std.testing.expectEqual(@as(u32, 540), delta.decode_async_final_dispatch_calls);
+    try std.testing.expectEqual(@as(u32, 450), delta.decode_async_final_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 360), delta.decode_async_final_resource_barrier_resources);
+    try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_submits[0]);
+    try std.testing.expectEqual(@as(u32, 50), delta.decode_async_slot_dispatch_calls[0]);
+    try std.testing.expectEqual(@as(u32, 45), delta.decode_async_slot_barrier_calls[0]);
+    try std.testing.expectEqual(@as(u32, 40), delta.decode_async_slot_resource_barrier_resources[0]);
+    try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_completed_cmds[0]);
+    try std.testing.expectEqual(@as(u64, 7_000_000), delta.decode_async_slot_gpu_ns[0]);
+    try std.testing.expectEqual(@as(u64, 3_000_000), delta.decode_async_slot_encode_ns[0]);
+    try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_layer_range_submits[0]);
+    try std.testing.expectEqual(@as(u64, 40), delta.decode_async_slot_layer_start_sum[0]);
+    try std.testing.expectEqual(@as(u64, 80), delta.decode_async_slot_layer_end_sum[0]);
+    try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_full_attn_layers[0]);
+    try std.testing.expectEqual(@as(u32, 35), delta.decode_async_slot_ssm_layers[0]);
+    try std.testing.expectEqual(@as(u32, 40), delta.decode_async_slot_dense_ffn_layers[0]);
+    try std.testing.expectEqual(@as(u64, 1_800), delta.decode_async_slot_full_attn_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 2_700), delta.decode_async_slot_ssm_projection_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 900), delta.decode_async_slot_ssm_qkv_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 1_080), delta.decode_async_slot_ssm_gate_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 720), delta.decode_async_slot_ssm_tail_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 3_600), delta.decode_async_slot_ssm_out_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 4_500), delta.decode_async_slot_dense_ffn_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 900), delta.decode_async_slot_dense_gate_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 1_350), delta.decode_async_slot_dense_up_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 2_250), delta.decode_async_slot_dense_down_bytes[0]);
+    try std.testing.expectEqual(@as(u32, 10), delta.decode_async_slot_dense_dispatch_phases[0].gate_up);
+    try std.testing.expectEqual(@as(u32, 10), delta.decode_async_slot_dense_dispatch_phases[0].activation);
+    try std.testing.expectEqual(@as(u32, 10), delta.decode_async_slot_dense_dispatch_phases[0].down);
+    try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_dense_dispatch_phases[0].tail);
+    try std.testing.expectEqual(@as(u32, 10), delta.decode_async_slot_dense_scope_barrier_phases[0].activation);
+    try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_dense_scope_barrier_phases[0].down);
+    try std.testing.expectEqual(@as(u32, 10), delta.decode_async_slot_dense_resource_barrier_phases[0].gate_up);
+    try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_dense_resource_barrier_phases[0].tail);
+    try std.testing.expectEqual(@as(u32, 20), delta.decode_async_slot_dense_resource_barrier_entries_phases[0].gate_up);
+    try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_dense_resource_barrier_entries_phases[0].tail);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_submits[1]);
+    try std.testing.expectEqual(@as(u32, 88), delta.decode_async_slot_dispatch_calls[1]);
+    try std.testing.expectEqual(@as(u32, 80), delta.decode_async_slot_barrier_calls[1]);
+    try std.testing.expectEqual(@as(u32, 72), delta.decode_async_slot_resource_barrier_resources[1]);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_completed_cmds[1]);
+    try std.testing.expectEqual(@as(u64, 17_000_000), delta.decode_async_slot_gpu_ns[1]);
+    try std.testing.expectEqual(@as(u64, 7_000_000), delta.decode_async_slot_encode_ns[1]);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_layer_range_submits[1]);
+    try std.testing.expectEqual(@as(u64, 128), delta.decode_async_slot_layer_start_sum[1]);
+    try std.testing.expectEqual(@as(u64, 192), delta.decode_async_slot_layer_end_sum[1]);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_full_attn_layers[1]);
+    try std.testing.expectEqual(@as(u32, 56), delta.decode_async_slot_ssm_layers[1]);
+    try std.testing.expectEqual(@as(u32, 64), delta.decode_async_slot_dense_ffn_layers[1]);
+    try std.testing.expectEqual(@as(u64, 5_400), delta.decode_async_slot_full_attn_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 6_300), delta.decode_async_slot_ssm_projection_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 2_250), delta.decode_async_slot_ssm_qkv_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 2_700), delta.decode_async_slot_ssm_gate_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 1_350), delta.decode_async_slot_ssm_tail_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 7_200), delta.decode_async_slot_ssm_out_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 8_100), delta.decode_async_slot_dense_ffn_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 1_800), delta.decode_async_slot_dense_gate_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 2_700), delta.decode_async_slot_dense_up_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 3_600), delta.decode_async_slot_dense_down_bytes[1]);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_dense_dispatch_phases[1].norm);
+    try std.testing.expectEqual(@as(u32, 16), delta.decode_async_slot_dense_dispatch_phases[1].gate_up);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_dense_dispatch_phases[1].activation);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_dense_dispatch_phases[1].down);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_dense_dispatch_phases[1].tail);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_dense_scope_barrier_phases[1].activation);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_dense_scope_barrier_phases[1].down);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_dense_resource_barrier_phases[1].norm);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_dense_resource_barrier_phases[1].gate_up);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_dense_resource_barrier_entries_phases[1].norm);
+    try std.testing.expectEqual(@as(u32, 16), delta.decode_async_slot_dense_resource_barrier_entries_phases[1].gate_up);
+    try std.testing.expectEqual(@as(u32, 30), delta.ssm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 10), delta.ssm_proj_norm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 20), delta.ssm_qkv_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 30), delta.ssm_tail_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 40), delta.ssm_conv_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 50), delta.ssm_delta_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 60), delta.ssm_gated_norm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 70), delta.ssm_out_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 80), delta.ssm_residual_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 10), delta.ssm_scope_barrier_calls_by_phase.conv);
+    try std.testing.expectEqual(@as(u32, 20), delta.ssm_scope_barrier_calls_by_phase.gated_norm);
+    try std.testing.expectEqual(@as(u32, 30), delta.ssm_resource_barrier_calls_by_phase.out);
+    try std.testing.expectEqual(@as(u32, 40), delta.ssm_resource_barrier_calls_by_phase.residual);
+    try std.testing.expectEqual(@as(u32, 50), delta.ssm_resource_barrier_resources_by_phase.out);
+    try std.testing.expectEqual(@as(u32, 60), delta.ssm_resource_barrier_resources_by_phase.residual);
+    try std.testing.expectEqual(@as(u32, 90), delta.dense_ffn_tail_post_norm_next_norm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 100), delta.dense_ffn_tail_residual_next_norm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 110), delta.dense_ffn_tail_residual_acc_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 120), delta.dense_ffn_tail_final_norm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 130), delta.dense_ffn_tail_post_norm_dispatch_calls);
+    try std.testing.expectEqual(@as(u32, 140), delta.dense_ffn_tail_post_norm_next_norm_calls);
+    try std.testing.expectEqual(@as(u32, 150), delta.dense_ffn_tail_residual_next_norm_calls);
+    try std.testing.expectEqual(@as(u32, 160), delta.dense_ffn_tail_residual_acc_calls);
+    try std.testing.expectEqual(@as(u32, 170), delta.dense_ffn_tail_final_norm_calls);
 }
 
 test "q8 lm head stays on GPU" {
@@ -30472,6 +33159,41 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q6k_moe_pipe);
     var dmmv_q6k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe_cols");
     defer metal_pipeline.freePipeline(&dmmv_q6k_moe_cols_pipe);
+    var dmmv_q6k_llama_k5120_pipe = try loadShaderPipelineWithPrefix(
+        ctx,
+        "dmmv_q6k_llama_k5120",
+        "dmmv_q6k_llama",
+        "#define ZINC_Q6K_FIXED_BLOCKS 20\n#define ZINC_Q6K_NSG 4\n",
+    );
+    defer metal_pipeline.freePipeline(&dmmv_q6k_llama_k5120_pipe);
+    var dmmv_q6k_llama_k17408_pipe = try loadShaderPipelineWithPrefix(
+        ctx,
+        "dmmv_q6k_llama_k17408",
+        "dmmv_q6k_llama",
+        "#define ZINC_Q6K_FIXED_BLOCKS 68\n",
+    );
+    defer metal_pipeline.freePipeline(&dmmv_q6k_llama_k17408_pipe);
+    var dmmv_q4k_k5120_pipe = try loadShaderPipelineWithPrefix(
+        ctx,
+        "dmmv_q4k_k5120",
+        "dmmv_q4k",
+        "#define ZINC_Q4K_FIXED_BLOCKS 20\n#define ZINC_Q4K_NSG 4\n",
+    );
+    defer metal_pipeline.freePipeline(&dmmv_q4k_k5120_pipe);
+    var dmmv_q4k_k5120_llama_pipe = try loadShaderPipelineWithPrefix(
+        ctx,
+        "dmmv_q4k_k5120_llama",
+        "dmmv_q4k",
+        "#define ZINC_Q4K_FIXED_BLOCKS 20\n",
+    );
+    defer metal_pipeline.freePipeline(&dmmv_q4k_k5120_llama_pipe);
+    var dmmv_q4k_k17408_pipe = try loadShaderPipelineWithPrefix(
+        ctx,
+        "dmmv_q4k_k17408",
+        "dmmv_q4k",
+        "#define ZINC_Q4K_FIXED_BLOCKS 68\n",
+    );
+    defer metal_pipeline.freePipeline(&dmmv_q4k_k17408_pipe);
     var gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
     defer metal_pipeline.freePipeline(&gemm_q5k_pipe);
 
@@ -30587,6 +33309,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&ssm_delta_net_gated_norm_qwen_pipe);
     var ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
     defer metal_pipeline.freePipeline(&ssm_conv1d_qwen_d4_pipe);
+    var ssm_conv1d_qwen27b_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen27b_d4");
+    defer metal_pipeline.freePipeline(&ssm_conv1d_qwen27b_d4_pipe);
     var ssm_conv1d_prefill_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
     defer metal_pipeline.freePipeline(&ssm_conv1d_prefill_qwen_d4_pipe);
 
@@ -30636,6 +33360,10 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q5k_moe_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_moe_cols_pipe.handle != null);
+    try std.testing.expect(dmmv_q6k_llama_k5120_pipe.handle != null);
+    try std.testing.expect(dmmv_q6k_llama_k17408_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_k5120_llama_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_k17408_pipe.handle != null);
     try std.testing.expect(gemm_q5k_pipe.handle != null);
     try std.testing.expect(dmmv_pipe_k2048.handle != null);
     try std.testing.expect(dmmv_q4k_dual_pipe.handle != null);
@@ -30690,6 +33418,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(ssm_delta_net_gated_norm_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_gated_norm_qwen_pipe.handle != null);
     try std.testing.expect(ssm_conv1d_qwen_d4_pipe.handle != null);
+    try std.testing.expect(ssm_conv1d_qwen27b_d4_pipe.handle != null);
     try std.testing.expect(ssm_conv1d_prefill_qwen_d4_pipe.handle != null);
 }
 

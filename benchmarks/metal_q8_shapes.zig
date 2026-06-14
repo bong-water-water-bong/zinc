@@ -39,6 +39,17 @@ const DualQ8DmmvPush = extern struct {
     y1_offset: u32,
 };
 
+const QKDualPush = extern struct {
+    M_q: u32,
+    M_k: u32,
+    K: u32,
+    a_q_offset: u32,
+    a_k_offset: u32,
+    x_offset: u32,
+    y_q_offset: u32,
+    y_k_offset: u32,
+};
+
 const GemmPush = extern struct {
     ne00: i32,
     ne02: i32,
@@ -200,6 +211,11 @@ const CaseId = enum {
     dense_gate_up_geglu,
     dense_down_q6k,
     post_norm_residual_wide,
+    qwen27b_decode_hot,
+    qwen27b_dense_gate_up_q4k,
+    qwen27b_ssm_q4q4,
+    qwen27b_ssm_q6_qkv,
+    qwen27b_lm_head_q6k,
     moe_gate,
     moe_up,
     moe_down,
@@ -338,6 +354,9 @@ fn helpText() []const u8 {
     \\                            | shared_pair_swiglu
     \\                            | dense_gate_up_geglu | dense_down_q6k
     \\                            | post_norm_residual_wide
+    \\                            | qwen27b_decode_hot
+    \\                            | qwen27b_dense_gate_up_q4k | qwen27b_ssm_q4q4
+    \\                            | qwen27b_ssm_q6_qkv | qwen27b_lm_head_q6k
     \\                            | moe_gate | moe_up | moe_down
     \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
     \\                            | moe_gate_up_geglu | moe_gate_up_geglu_cols | moe_gate_up_swiglu
@@ -387,6 +406,11 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "dense_gate_up_geglu")) return .dense_gate_up_geglu;
     if (std.mem.eql(u8, arg, "dense_down_q6k")) return .dense_down_q6k;
     if (std.mem.eql(u8, arg, "post_norm_residual_wide")) return .post_norm_residual_wide;
+    if (std.mem.eql(u8, arg, "qwen27b_decode_hot")) return .qwen27b_decode_hot;
+    if (std.mem.eql(u8, arg, "qwen27b_dense_gate_up_q4k")) return .qwen27b_dense_gate_up_q4k;
+    if (std.mem.eql(u8, arg, "qwen27b_ssm_q4q4")) return .qwen27b_ssm_q4q4;
+    if (std.mem.eql(u8, arg, "qwen27b_ssm_q6_qkv")) return .qwen27b_ssm_q6_qkv;
+    if (std.mem.eql(u8, arg, "qwen27b_lm_head_q6k")) return .qwen27b_lm_head_q6k;
     if (std.mem.eql(u8, arg, "moe_gate")) return .moe_gate;
     if (std.mem.eql(u8, arg, "moe_up")) return .moe_up;
     if (std.mem.eql(u8, arg, "moe_down")) return .moe_down;
@@ -412,6 +436,11 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             .dense_down_q6k,
             .post_norm_residual_wide,
             .lm_head_q4k_argmax,
+            .qwen27b_decode_hot,
+            .qwen27b_dense_gate_up_q4k,
+            .qwen27b_ssm_q4q4,
+            .qwen27b_ssm_q6_qkv,
+            .qwen27b_lm_head_q6k,
             => false,
             else => true,
         },
@@ -427,6 +456,15 @@ fn caseMatchesSelection(selection: CaseId, case_id: CaseId) bool {
             .shared_up_gemm,
             .shared_down_gemm,
             .lm_head,
+            => true,
+            else => false,
+        },
+        .qwen27b_decode_hot => switch (case_id) {
+            .qwen27b_dense_gate_up_q4k,
+            .dense_down_q6k,
+            .qwen27b_ssm_q4q4,
+            .qwen27b_ssm_q6_qkv,
+            .qwen27b_lm_head_q6k,
             => true,
             else => false,
         },
@@ -500,20 +538,27 @@ fn parseArgs(args: []const [:0]const u8) !Config {
 }
 
 fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
+    return loadShaderPipelineWithPrefix(ctx, name, name, "");
+}
+
+fn loadShaderPipelineWithPrefix(ctx: ?*shim.MetalCtx, name: []const u8, source_name: []const u8, prefix: []const u8) !MetalPipeline {
     var path_buf: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "src/shaders/metal/{s}.metal", .{name}) catch return error.PathTooLong;
+    const path = std.fmt.bufPrint(&path_buf, "src/shaders/metal/{s}.metal", .{source_name}) catch return error.PathTooLong;
     const file = std.fs.cwd().openFile(path, .{}) catch return error.ShaderNotFound;
     defer file.close();
     const stat = try file.stat();
-    if (stat.size > 1024 * 1024) return error.ShaderTooLarge;
+    if (stat.size + @as(u64, @intCast(prefix.len)) > 1024 * 1024) return error.ShaderTooLarge;
 
     var source_buf: [1024 * 1024 + 1]u8 = undefined;
-    const bytes_read = try file.readAll(source_buf[0 .. source_buf.len - 1]);
-    source_buf[bytes_read] = 0;
+    @memcpy(source_buf[0..prefix.len], prefix);
+    const bytes_read = try file.readAll(source_buf[prefix.len .. source_buf.len - 1]);
+    source_buf[prefix.len + bytes_read] = 0;
 
     var fn_buf: [16]u8 = undefined;
     const fn_name = try std.fmt.bufPrintZ(&fn_buf, "main0", .{});
-    return metal_pipeline.createPipeline(ctx, @ptrCast(&source_buf), fn_name);
+    var pipe = try metal_pipeline.createPipeline(ctx, @ptrCast(&source_buf), fn_name);
+    pipe.name = name;
+    return pipe;
 }
 
 fn tensorRows(tensor: *const metal_loader.LoadedTensor) !u32 {
@@ -569,6 +614,17 @@ fn findTensorBySuffixAndShape(
         if (rows == expected_rows and cols == expected_cols) return tensor;
     }
     return null;
+}
+
+fn isQwen27BDenseHybrid(model: *const metal_loader.Model) bool {
+    const cfg = model.config;
+    return cfg.architecture == .qwen35 and
+        cfg.n_experts == 0 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        cfg.ssm_d_inner == 6144 and
+        cfg.ssm_d_state == 128 and
+        cfg.n_layers == 64;
 }
 
 fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
@@ -913,21 +969,87 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .cols = hidden_dim,
             };
         },
+        .qwen27b_dense_gate_up_q4k => blk: {
+            if (!isQwen27BDenseHybrid(model)) return error.ExpectedQwen27BDenseHybrid;
+            const inter_dim = model.config.intermediate_dim;
+            const hidden_dim = model.config.hidden_dim;
+            const gate = findFirstLayerTensor(model, "ffn_gate.weight") orelse
+                return error.MissingDenseGateTensor;
+            const up = findFirstLayerTensor(model, "ffn_up.weight") orelse
+                return error.MissingDenseUpTensor;
+            if (gate.info.type_ != .q4_k or up.info.type_ != .q4_k) return error.ExpectedExpertQuantTensor;
+            if ((try tensorRows(gate)) != inter_dim or (try tensorCols(gate)) != hidden_dim) return error.InvalidTensorShape;
+            if ((try tensorRows(up)) != inter_dim or (try tensorCols(up)) != hidden_dim) return error.InvalidTensorShape;
+            break :blk .{
+                .key = "qwen27b_dense_gate_up_q4k",
+                .label = "Qwen3.6 27B dense Q4_K gate + up qk-dual",
+                .tensor0 = gate,
+                .tensor1 = up,
+                .rows0 = inter_dim,
+                .rows1 = inter_dim,
+                .cols = hidden_dim,
+            };
+        },
+        .qwen27b_ssm_q4q4 => blk: {
+            if (!isQwen27BDenseHybrid(model)) return error.ExpectedQwen27BDenseHybrid;
+            const hidden_dim = model.config.hidden_dim;
+            const qkv_rows = model.config.ssm_d_inner + 2 * model.config.ssm_n_group * model.config.ssm_d_state;
+            const gate_rows = model.config.ssm_d_inner;
+            const qkv = findTensorBySuffixAndShape(model, "attn_qkv.weight", .q4_k, qkv_rows, hidden_dim) orelse
+                return error.MissingSsmQkvTensor;
+            const gate = findTensorBySuffixAndShape(model, "attn_gate.weight", .q4_k, gate_rows, hidden_dim) orelse
+                return error.MissingSsmGateTensor;
+            break :blk .{
+                .key = "qwen27b_ssm_q4q4",
+                .label = "Qwen3.6 27B SSM Q4_K qkv + gate qk-dual",
+                .tensor0 = qkv,
+                .tensor1 = gate,
+                .rows0 = qkv_rows,
+                .rows1 = gate_rows,
+                .cols = hidden_dim,
+            };
+        },
+        .qwen27b_ssm_q6_qkv => blk: {
+            if (!isQwen27BDenseHybrid(model)) return error.ExpectedQwen27BDenseHybrid;
+            const hidden_dim = model.config.hidden_dim;
+            const qkv_rows = model.config.ssm_d_inner + 2 * model.config.ssm_n_group * model.config.ssm_d_state;
+            const qkv = findTensorBySuffixAndShape(model, "attn_qkv.weight", .q6_k, qkv_rows, hidden_dim) orelse
+                return error.MissingSsmQkvTensor;
+            break :blk .{
+                .key = "qwen27b_ssm_q6_qkv",
+                .label = "Qwen3.6 27B SSM Q6_K qkv",
+                .tensor0 = qkv,
+                .rows0 = qkv_rows,
+                .cols = hidden_dim,
+            };
+        },
+        .qwen27b_lm_head_q6k => blk: {
+            if (!isQwen27BDenseHybrid(model)) return error.ExpectedQwen27BDenseHybrid;
+            const tensor = findTensorByName(model, "output.weight") orelse
+                findTensorByName(model, "token_embd.weight") orelse return error.MissingLmHeadTensor;
+            if (tensor.info.type_ != .q6_k) return error.ExpectedQ6KTensor;
+            if ((try tensorRows(tensor)) != model.config.vocab_size or (try tensorCols(tensor)) != model.config.hidden_dim) return error.InvalidTensorShape;
+            break :blk .{
+                .key = "qwen27b_lm_head_q6k",
+                .label = "Qwen3.6 27B Q6_K LM head",
+                .tensor0 = tensor,
+                .rows0 = model.config.vocab_size,
+                .cols = model.config.hidden_dim,
+            };
+        },
         .dense_down_q6k => blk: {
-            // Exact production dense Gemma 31B FFN down projection:
+            // Exact production dense FFN down projection:
             // `dispatchDenseQ6kSimdgroupDmmvOnCmd` uses dmmv_q6k_llama for
             // dense Q6_K single-token decode, not the routed MoE Q6_K shader.
             if (model.config.n_experts != 0) return error.ExpectedDenseModel;
             const hidden_dim = model.config.hidden_dim;
             const inter_dim = model.config.intermediate_dim;
-            const down = findFirstLayerTensor(model, "ffn_down.weight") orelse
+            const down = findTensorBySuffixAndShape(model, "ffn_down.weight", .q6_k, hidden_dim, inter_dim) orelse
                 return error.MissingDenseDownTensor;
-            if (down.info.type_ != .q6_k) return error.ExpectedQ6KTensor;
-            if ((try tensorRows(down)) != hidden_dim or (try tensorCols(down)) != inter_dim) return error.InvalidTensorShape;
             if (hidden_dim % 4 != 0 or inter_dim % 256 != 0) return error.InvalidTensorShape;
             break :blk .{
                 .key = "dense_down_q6k",
-                .label = "Dense Gemma Q6_K down projection",
+                .label = "Dense Q6_K down projection",
                 .tensor0 = down,
                 .rows0 = hidden_dim,
                 .cols = inter_dim,
@@ -1034,7 +1156,7 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .is_moe_swiglu_fused = true,
             };
         },
-        .all, .gemma26_prefill_hot => error.InvalidCase,
+        .all, .gemma26_prefill_hot, .qwen27b_decode_hot => error.InvalidCase,
         .post_norm_residual_wide => error.InvalidCase,
     };
 }
@@ -2781,7 +2903,7 @@ fn benchmarkDenseGateUpGegluVariant(
 
 fn runDenseDownQ6kDispatchBatch(
     ctx: ?*shim.MetalCtx,
-    pipe: *const MetalPipeline,
+    selection: *const PipelineSelection,
     tensor: *const metal_loader.LoadedTensor,
     model: *const metal_loader.Model,
     input_buf: *const MetalBuffer,
@@ -2799,16 +2921,14 @@ fn runDenseDownQ6kDispatchBatch(
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
-    const block_size: u32 = 64;
-    const rows_per_wg: u32 = 4;
-    const workgroups = (M + rows_per_wg - 1) / rows_per_wg;
+    const workgroups = (M + selection.rows_per_wg - 1) / selection.rows_per_wg;
 
     var cmd = try metal_command.beginCommand(ctx);
     for (0..dispatches) |_| {
         cmd.dispatchV2(
-            pipe,
+            &selection.pipe,
             .{ workgroups, 1, 1 },
-            .{ block_size, 1, 1 },
+            .{ selection.block_size, 1, 1 },
             &bufs,
             &push,
             @sizeOf(DmmvPush),
@@ -2816,6 +2936,47 @@ fn runDenseDownQ6kDispatchBatch(
         );
     }
     cmd.commitAndWait();
+}
+
+fn selectQ6kLlamaPipeline(ctx: ?*shim.MetalCtx, cols: u32) !PipelineSelection {
+    if (cols == 5120) {
+        return .{
+            .shader_name = "dmmv_q6k_llama_k5120",
+            .variant_label = "production-k5120",
+            .pipe = try loadShaderPipelineWithPrefix(
+                ctx,
+                "dmmv_q6k_llama_k5120",
+                "dmmv_q6k_llama",
+                "#define ZINC_Q6K_FIXED_BLOCKS 20\n#define ZINC_Q6K_NSG 4\n",
+            ),
+            .push_idx = 1,
+            .rows_per_wg = 8,
+            .block_size = 128,
+        };
+    }
+    if (cols == 17408) {
+        return .{
+            .shader_name = "dmmv_q6k_llama_k17408",
+            .variant_label = "production-k17408",
+            .pipe = try loadShaderPipelineWithPrefix(
+                ctx,
+                "dmmv_q6k_llama_k17408",
+                "dmmv_q6k_llama",
+                "#define ZINC_Q6K_FIXED_BLOCKS 68\n#define ZINC_Q6K_NSG 4\n",
+            ),
+            .push_idx = 1,
+            .rows_per_wg = 8,
+            .block_size = 128,
+        };
+    }
+    return .{
+        .shader_name = "dmmv_q6k_llama",
+        .variant_label = "llama-q6k",
+        .pipe = try loadShaderPipeline(ctx, "dmmv_q6k_llama"),
+        .push_idx = 1,
+        .rows_per_wg = 4,
+        .block_size = 64,
+    };
 }
 
 fn benchmarkDenseDownQ6kVariant(
@@ -2828,8 +2989,8 @@ fn benchmarkDenseDownQ6kVariant(
 ) !BenchResult {
     if (hot_case.tensor0.info.type_ != .q6_k) return error.ExpectedQ6KTensor;
 
-    var pipe = try loadShaderPipeline(device.ctx, "dmmv_q6k_llama");
-    defer metal_pipeline.freePipeline(&pipe);
+    var selection = try selectQ6kLlamaPipeline(device.ctx, hot_case.cols);
+    defer metal_pipeline.freePipeline(&selection.pipe);
 
     var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
     defer metal_buffer.freeBuffer(&input_buf);
@@ -2841,7 +3002,7 @@ fn benchmarkDenseDownQ6kVariant(
 
     try runDenseDownQ6kDispatchBatch(
         device.ctx,
-        &pipe,
+        &selection,
         hot_case.tensor0,
         model,
         &input_buf,
@@ -2855,7 +3016,7 @@ fn benchmarkDenseDownQ6kVariant(
     const start_ns = std.time.nanoTimestamp();
     try runDenseDownQ6kDispatchBatch(
         device.ctx,
-        &pipe,
+        &selection,
         hot_case.tensor0,
         model,
         &input_buf,
@@ -2874,18 +3035,18 @@ fn benchmarkDenseDownQ6kVariant(
 
     return .{
         .case_key = hot_case.key,
-        .variant_label = "dense-llama-q6k",
-        .shader_name = "dmmv_q6k_llama",
+        .variant_label = selection.variant_label,
+        .shader_name = selection.shader_name,
         .tensor_name = hot_case.tensor0.info.name,
         .rows = hot_case.rows0,
         .cols = hot_case.cols,
         .expert_slots = 1,
         .x_expert_stride = 0,
         .iterations = iterations,
-        .block_size = 64,
-        .rows_per_wg = 4,
-        .thread_execution_width = pipe.thread_execution_width,
-        .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
+        .block_size = selection.block_size,
+        .rows_per_wg = selection.rows_per_wg,
+        .thread_execution_width = selection.pipe.thread_execution_width,
+        .static_threadgroup_memory_length = selection.pipe.static_threadgroup_memory_length,
         .weight_bytes_per_iter = weight_bytes,
         .total_ms = elapsed_ms,
         .ms_per_iter = ms_per_iter,
@@ -3560,6 +3721,143 @@ fn benchmarkMoeGateUpGegluColsActiveBlocksVariant(
     };
 }
 
+fn runQ4KQKDualDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    pipe: *const MetalPipeline,
+    tensor0: *const metal_loader.LoadedTensor,
+    tensor1: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    input_buf: *const MetalBuffer,
+    output0_buf: *const MetalBuffer,
+    output1_buf: *const MetalBuffer,
+    rows0: u32,
+    rows1: u32,
+    cols: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0) return;
+    const push = QKDualPush{
+        .M_q = rows0,
+        .M_k = rows1,
+        .K = cols,
+        .a_q_offset = tensorPageOffset(model, tensor0),
+        .a_k_offset = tensorPageOffset(model, tensor1),
+        .x_offset = 0,
+        .y_q_offset = 0,
+        .y_k_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor0.gpu_buffer, &tensor1.gpu_buffer, input_buf, output0_buf, output1_buf };
+    const rows_per_wg: u32 = 4;
+    const workgroups = (rows0 + rows1 + rows_per_wg - 1) / rows_per_wg;
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            pipe,
+            .{ workgroups, 1, 1 },
+            .{ 64, 1, 1 },
+            &bufs,
+            &push,
+            @sizeOf(QKDualPush),
+            2,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn benchmarkQ4KQKDualVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    warmup_iterations: u32,
+    iterations: u32,
+) !DualBenchResult {
+    const tensor1 = hot_case.tensor1 orelse return error.ExpectedDualCase;
+    if (hot_case.tensor0.info.type_ != .q4_k or tensor1.info.type_ != .q4_k)
+        return error.ExpectedExpertQuantTensor;
+    if ((hot_case.rows0 % 4) != 0 or hot_case.cols % 256 != 0) return error.InvalidTensorShape;
+
+    var pipe = try loadShaderPipeline(device.ctx, "dmmv_q4k_qk_dual");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    var input_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.cols) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output0_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.rows0) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output0_buf);
+    var output1_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, hot_case.rows1) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output1_buf);
+
+    fillInputBuffer(&input_buf, hot_case.cols);
+    @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
+    @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
+
+    try runQ4KQKDualDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        tensor1,
+        model,
+        &input_buf,
+        &output0_buf,
+        &output1_buf,
+        hot_case.rows0,
+        hot_case.rows1,
+        hot_case.cols,
+        warmup_iterations,
+    );
+    @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
+    @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
+
+    const start_ns = std.time.nanoTimestamp();
+    try runQ4KQKDualDispatchBatch(
+        device.ctx,
+        &pipe,
+        hot_case.tensor0,
+        tensor1,
+        model,
+        &input_buf,
+        &output0_buf,
+        &output1_buf,
+        hot_case.rows0,
+        hot_case.rows1,
+        hot_case.cols,
+        iterations,
+    );
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    const weight_bytes = weightBytesPerIter(.q4_k, hot_case.totalRows(), hot_case.cols);
+    const total_bytes = weight_bytes * iterations;
+    const output0_copy = try copyOutput(allocator, &output0_buf, hot_case.rows0);
+    const output1_copy = try copyOutput(allocator, &output1_buf, hot_case.rows1);
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = "q4k-qk-dual",
+        .shader_name = "dmmv_q4k_qk_dual",
+        .tensor0_name = hot_case.tensor0.info.name,
+        .tensor1_name = tensor1.info.name,
+        .rows0 = hot_case.rows0,
+        .rows1 = hot_case.rows1,
+        .cols = hot_case.cols,
+        .iterations = iterations,
+        .block_size = 64,
+        .rows_per_wg = 4,
+        .thread_execution_width = pipe.thread_execution_width,
+        .static_threadgroup_memory_length = pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum0 = checksumOutput(output0_copy),
+        .checksum1 = checksumOutput(output1_copy),
+        .output0 = output0_copy,
+        .output1 = output1_copy,
+    };
+}
+
 fn benchmarkSeparateDualVariant(
     allocator: std.mem.Allocator,
     device: *const metal_device.MetalDevice,
@@ -3906,7 +4204,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .lm_head_q4k_argmax, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .dense_down_q6k, .post_norm_residual_wide, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
+    const hot_case_ids = [_]CaseId{ .lm_head, .lm_head_q4k_argmax, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .router_f32_fused, .shared_gate, .shared_up, .shared_down, .shared_gate_gemm, .shared_up_gemm, .shared_down_gemm, .shared_dual, .shared_pair_swiglu, .dense_gate_up_geglu, .dense_down_q6k, .post_norm_residual_wide, .qwen27b_dense_gate_up_q4k, .qwen27b_ssm_q4q4, .qwen27b_ssm_q6_qkv, .qwen27b_lm_head_q6k, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols, .moe_gate_up_geglu, .moe_gate_up_geglu_cols, .moe_gate_up_swiglu };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -4157,7 +4455,40 @@ pub fn main() !void {
                 config.iterations,
             );
             try printBenchResult(&stdout, dense_result.?);
-        } else if (case_id == .dense_down_q6k) {
+        } else if (case_id == .qwen27b_dense_gate_up_q4k or case_id == .qwen27b_ssm_q4q4) {
+            const tensor1 = hot_case.tensor1.?;
+            try stdout.interface.print(
+                "Case {s}: {s} | tensors={s} + {s} | quant={s} + {s} | M0={d} M1={d} K={d} | weight {d:.2} MiB/iter\n",
+                .{
+                    hot_case.key,
+                    hot_case.label,
+                    hot_case.tensor0.info.name,
+                    tensor1.info.name,
+                    @tagName(hot_case.tensor0.info.type_),
+                    @tagName(tensor1.info.type_),
+                    hot_case.rows0,
+                    hot_case.rows1,
+                    hot_case.cols,
+                    @as(f64, @floatFromInt(weightBytesPerIter(.q4_k, hot_case.totalRows(), hot_case.cols))) / (1024.0 * 1024.0),
+                },
+            );
+
+            var q4_dual_result: ?DualBenchResult = null;
+            defer if (q4_dual_result) |*result| {
+                allocator.free(result.output0);
+                allocator.free(result.output1);
+            };
+
+            q4_dual_result = try benchmarkQ4KQKDualVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printDualBenchResult(&stdout, q4_dual_result.?);
+        } else if (case_id == .dense_down_q6k or case_id == .qwen27b_ssm_q6_qkv or case_id == .qwen27b_lm_head_q6k) {
             try stdout.interface.print(
                 "Case {s}: {s} | tensor={s} | quant={s} | M={d} K={d} | weight {d:.2} MiB/iter\n",
                 .{

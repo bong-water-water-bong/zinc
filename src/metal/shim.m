@@ -606,6 +606,24 @@ void mtl_release_completed(MetalCmd* cmd) {
     free(cmd);
 }
 
+uint64_t mtl_command_gpu_duration_ns(MetalCmd* cmd) {
+    if (!cmd || !cmd->cmd_buf) return 0;
+
+    MTLCommandBufferStatus status = [cmd->cmd_buf status];
+    if (status != MTLCommandBufferStatusCompleted &&
+        status != MTLCommandBufferStatusError) {
+        return 0;
+    }
+
+    const CFTimeInterval start = [cmd->cmd_buf GPUStartTime];
+    const CFTimeInterval end = [cmd->cmd_buf GPUEndTime];
+    if (start <= 0.0 || end <= start) return 0;
+
+    const double ns = (end - start) * 1000000000.0;
+    if (ns <= 0.0) return 0;
+    return (uint64_t)ns;
+}
+
 void mtl_commit_wait_restart(MetalCmd* cmd) {
     if (!cmd || !cmd->cmd_buf || !cmd->queue) return;
 

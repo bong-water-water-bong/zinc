@@ -18,13 +18,24 @@ inline float s8_to_f32(uint x) {
 }
 
 // Port of llama.cpp's kernel_mul_mv_q6_K_f32 for dense single-token decode.
-// Thread organization matches llama.cpp N_SG_Q6_K=2, N_R0_Q6_K=2:
-// 64 threads = 2 simdgroups, each simdgroup computes 2 rows.
-#define NSG 2
+// Default thread organization matches llama.cpp N_SG_Q6_K=2, N_R0_Q6_K=2:
+// 64 threads = 2 simdgroups, each simdgroup computes 2 rows. Exact M4
+// Qwen3.6 27B dense-down builds can override NSG at compile time to keep the
+// same per-simdgroup row-pair math while grouping more independent row pairs
+// into one Metal threadgroup.
+#ifndef ZINC_Q6K_NSG
+#define ZINC_Q6K_NSG 2
+#endif
+
+#define NSG ZINC_Q6K_NSG
 #define NR0 2
 #define QK_K 256
 #define BLOCK_SIZE 210
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
+
+#ifndef ZINC_Q6K_FIXED_BLOCKS
+#define ZINC_Q6K_FIXED_BLOCKS 0
+#endif
 
 kernel void main0(
     device const uchar* W [[buffer(0)]],
@@ -35,9 +46,14 @@ kernel void main0(
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
+#if ZINC_Q6K_FIXED_BLOCKS
+    constexpr uint nb = ZINC_Q6K_FIXED_BLOCKS;
+    constexpr uint row_bytes = ZINC_Q6K_FIXED_BLOCKS * BLOCK_SIZE;
+#else
     const uint nb = p.K / QK_K;
-    const uint first_row = (tgpig.x * NSG + uint(sgitg)) * NR0;
     const uint row_bytes = nb * BLOCK_SIZE;
+#endif
+    const uint first_row = (tgpig.x * NSG + uint(sgitg)) * NR0;
 
     device const uchar* src0 = W + p.a_offset;
     device const float* src1 = X + (p.x_offset / 4u);

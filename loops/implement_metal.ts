@@ -1444,9 +1444,10 @@ export function parsePrefillTokenCount(output: string): number | null {
   return m ? parseInt(m[1], 10) : null;
 }
 
-function parseTokensGenerated(output: string): number {
-  const m = output.match(/Generated\s+(\d+)\s+tokens/i);
-  return m ? parseInt(m[1], 10) : 0;
+export function parseTokensGenerated(output: string): number {
+  const matches = [...output.matchAll(/(?:^|\n)(?:info\([^)]+\):\s*)?Generated\s+(\d+)\s+tokens\s+in\s+\d+\.?\d*\s*(?:ms|s)\b/g)];
+  const last = matches[matches.length - 1];
+  return last ? parseInt(last[1], 10) : 0;
 }
 
 function parseOutputText(output: string): string {

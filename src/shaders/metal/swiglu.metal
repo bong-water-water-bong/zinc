@@ -31,8 +31,8 @@ kernel void main0(constant _17& _19 [[buffer(0)]], device _34& _36 [[buffer(1)]]
         {
             break;
         }
-        _52._m0[gl_GlobalInvocationID.x] = (_36._m0[gl_GlobalInvocationID.x] / (1.0 + exp(-_36._m0[gl_GlobalInvocationID.x]))) * _58._m0[gl_GlobalInvocationID.x];
+        const float gate = _36._m0[gl_GlobalInvocationID.x];
+        _52._m0[gl_GlobalInvocationID.x] = gate * fast::divide(1.0f, 1.0f + fast::exp(-gate)) * _58._m0[gl_GlobalInvocationID.x];
         break;
     } while(false);
 }
-

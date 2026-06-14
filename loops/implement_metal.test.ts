@@ -17,6 +17,7 @@ import {
   noiseAwareImproveBand,
   parseDiagnosticEnv,
   parsePromptFingerprint,
+  parseTokensGenerated,
   buildPrompt,
   buildGemmaPrefillPostBreakthroughAnalysis,
   buildQwen36PrefillPlateauAnalysis,
@@ -177,6 +178,25 @@ describe("parseTokPerSec", () => {
   test("computes prefill throughput when rate is not printed", () => {
     const output = "info(forward): Prefill complete: 50 tokens in 250 ms";
     expect(parseTokPerSec(output, "prefill")).toBe(200);
+  });
+});
+
+describe("parseTokensGenerated", () => {
+  test("ignores prompt prose mentioning generated-token counts", () => {
+    const output = [
+      "info(zinc): Prompt: The slower run generated 160 tokens after a pasted support ticket.",
+      "info(forward): Generated 128 tokens in 8485.3 ms — 15.08 tok/s (66.3 ms/tok)",
+      "info(zinc): Output (128 tokens):",
+    ].join("\n");
+    expect(parseTokensGenerated(output)).toBe(128);
+  });
+
+  test("uses the last engine timing line when logs contain multiple runs", () => {
+    const output = [
+      "info(forward): Generated 8 tokens in 100.0 ms — 80.0 tok/s",
+      "info(forward): Generated 64 tokens in 1000.0 ms — 64.0 tok/s",
+    ].join("\n");
+    expect(parseTokensGenerated(output)).toBe(64);
   });
 });
 

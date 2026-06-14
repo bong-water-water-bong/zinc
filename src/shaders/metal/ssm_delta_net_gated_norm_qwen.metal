@@ -36,7 +36,12 @@ kernel void main0(
     ushort simd_lane [[thread_index_in_simdgroup]],
     ushort simd_idx [[simdgroup_index_in_threadgroup]]
 ) {
-    if (head >= 32u) {
+    if ((p.dt_rank != 32u && p.dt_rank != 48u) ||
+        p.head_v_dim != 128u ||
+        p.d_state != 128u ||
+        p.n_group != 16u ||
+        head >= p.dt_rank)
+    {
         return;
     }
 
@@ -71,8 +76,8 @@ kernel void main0(
     // `shuffle_xor` instead of two independent 32-bit trees, cutting
     // cross-lane shuffle traffic ~2× on the per-simdgroup tail of the fused
     // delta-net + gated-norm SSM kernel that fires every SSM layer per decode
-    // token (1080 calls/req across 30 SSM layers × 32 head TGs × 4 SGs each ≈
-    // 138K SG-tail reductions per request). Same proven pattern as cycles
+    // token (32 or 48 head TGs per SSM layer, depending on the Qwen dense-
+    // hybrid shape). Same proven pattern as cycles
     // ~67 (q8_0_pair/conv1d_dual), ~73 (repacked_k2048_qwen), and ~75
     // (repacked_k2048_nr2_qwen). Both per-row simd_sums operate on
     // independent values with identical reduction trees, so the pack is

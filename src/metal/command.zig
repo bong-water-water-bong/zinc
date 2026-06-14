@@ -24,7 +24,8 @@ inline fn timingFinish(cmd: *MetalCommand, pipe: *const MetalPipeline, t_start: 
     cmd.last_barrier_dispatch_count = cmd.dispatch_count;
     const elapsed_i = std.time.nanoTimestamp() - t_start;
     const elapsed_ns: u64 = if (elapsed_i < 0) 0 else @intCast(elapsed_i);
-    kernel_timing.record(@ptrCast(pipe.handle), pipe.name, elapsed_ns);
+    const label = if (cmd.timing_label) |timing_label| timing_label else pipe.name;
+    kernel_timing.record(@ptrCast(pipe.handle), label, elapsed_ns);
 }
 
 /// Encoder policy used when opening a Metal compute command buffer.
@@ -44,6 +45,17 @@ pub const MetalCommand = struct {
     resource_barrier_resources: u32 = 0,
     barrier_enabled: bool,
     last_barrier_dispatch_count: u32 = 0,
+    timing_label: ?[]const u8 = null,
+
+    /// Attach a one-dispatch timing label consumed by `ZINC_METAL_KERNEL_TIMING`.
+    /// The timing aggregator copies the bytes before this label can go stale.
+    pub fn setTimingLabel(self: *MetalCommand, label: []const u8) void {
+        self.timing_label = label;
+    }
+
+    pub fn clearTimingLabel(self: *MetalCommand) void {
+        self.timing_label = null;
+    }
 
     /// Encode a compute dispatch binding buffers, push constants, grid, and block sizes.
     pub fn dispatch(
@@ -190,43 +202,12 @@ pub const MetalCommand = struct {
                 return;
             }
 
-            // Extend cycle-10's single-buffer resource-scoping to the small
-            // multi-buffer case (2-4 bufs). The hot decode-side multi-buf
-            // barriers — SSM conv 4-buf join @ 1080/req, full-attn QKV 3-buf
-            // @ 320/req, MoE down 2-buf @ ~1400/req — all fall in this range
-            // and the ObjC stack-array setup for 4 pointer writes is
-            // negligible (a few cycles) vs the scope-only call. Mirroring
-            // llama.cpp `ggml_mem_ranges_check`, listing exact resources
-            // lets the Metal concurrent encoder track per-resource readiness
-            // instead of waiting on every prior buffer write — even when the
-            // immediate next dispatch reads all listed resources, the GPU
-            // scheduler still benefits from precise dependency info while
-            // upstream work drains. Keep the scope fallback for 5+ buffers
-            // so route-packed Qwen prefill (which can build long resource
-            // lists) avoids per-call ObjC array growth.
-            if (bufs.len <= 4) {
-                var stack_bufs: [4]?*shim.MetalBuf = undefined;
-                var count: u32 = 0;
-                for (bufs) |b| {
-                    if (b.handle) |handle| {
-                        stack_bufs[count] = handle;
-                        count += 1;
-                    }
-                }
-                if (count == 0) return;
-                self.barrier_count += 1;
-                self.resource_barrier_count += 1;
-                self.resource_barrier_resources += count;
-                self.last_barrier_dispatch_count = self.dispatch_count;
-                shim.mtl_barrier_buffers(h, @ptrCast(&stack_bufs), count);
-                return;
-            }
-
-            // llama.cpp's Metal backend orders dependency groups with a plain
-            // `memoryBarrierWithScope:MTLBarrierScopeBuffers` in
-            // `ggml_metal_encoder_memory_barrier`. For high-count multi-buffer
-            // joins (route-packed Qwen prefill), keep the same scope barrier
-            // to avoid building large Objective-C resource arrays.
+            // llama.cpp tracks resource ranges to decide whether a barrier is
+            // needed, then resets dependency groups with a plain
+            // `memoryBarrierWithScope:MTLBarrierScopeBuffers`
+            // (`ggml_metal_op_concurrency_reset`). Follow that for generic
+            // multi-buffer joins: callers that have measured a true benefit
+            // from `memoryBarrierWithResources` can use barrierResourceBuffers.
             var has_resource = false;
             for (bufs) |b| {
                 if (b.handle != null) {
@@ -311,6 +292,14 @@ pub const MetalCommand = struct {
             shim.mtl_release_completed(h);
             self.handle = null;
         }
+    }
+
+    /// Return Metal-reported GPU execution time for a completed async command.
+    pub fn gpuDurationNs(self: *const MetalCommand) u64 {
+        if (self.handle) |h| {
+            return shim.mtl_command_gpu_duration_ns(h);
+        }
+        return 0;
     }
 };
 
