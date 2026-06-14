@@ -3587,6 +3587,7 @@ const GemmPush = extern struct {
     ne0: i32,
     ne1: i32,
     src0_off: u32,
+    flags: u32 = 0,
 };
 
 /// Push constants for `gemm_f32_small.metal`.
@@ -15081,7 +15082,7 @@ fn dispatchQwenPostNormResidualRouterF32SharedGateOnCmd(
 /// stored in Q4_K blocks (144 bytes / 256 elements). Use for prefill when
 /// N ≥ ~16 — below that DMMV is faster.
 /// gemm_q4k.metal: buffer(0)=push, buffer(1)=weights, buffer(2)=input, buffer(3)=output.
-fn dispatchGemmQ4KOnCmd(
+fn dispatchGemmQ4KOnCmdWithFlags(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
     weight: *const metal_loader.LoadedTensor,
@@ -15090,6 +15091,7 @@ fn dispatchGemmQ4KOnCmd(
     M: u32,
     K: u32,
     N: u32,
+    flags: u32,
 ) void {
     std.debug.assert(K % 256 == 0);
     const push = GemmPush{
@@ -15104,10 +15106,37 @@ fn dispatchGemmQ4KOnCmd(
         .ne0 = @intCast(M),
         .ne1 = @intCast(N),
         .src0_off = tensorPageOffset(engine.model, weight),
+        .flags = flags,
     };
     const bufs = [_]*const MetalBuffer{ &weight.gpu_buffer, input, output };
     const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
     cmd.dispatchV2WithTgMem(&engine.gemm_q4k_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
+}
+
+fn dispatchGemmQ4KOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    dispatchGemmQ4KOnCmdWithFlags(engine, cmd, weight, input, output, M, K, N, 0);
+}
+
+fn dispatchGemmQ4KAccOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    dispatchGemmQ4KOnCmdWithFlags(engine, cmd, weight, input, output, M, K, N, 1);
 }
 
 /// Dispatch a Q5_K × f32 batched matmul. Same llama.cpp simdgroup-MM tile
@@ -20481,19 +20510,11 @@ fn recordQwen35Dense9bLayer0DensePrefillOnCmd(
         cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
     }
 
-    profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{&engine.qwen35_dense_prefill_swiglu_buf});
-    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, down_t, &engine.qwen35_dense_prefill_swiglu_buf, &engine.qwen35_dense_prefill_down_buf, hidden_dim, inter_dim, n_tokens);
-
     profileResourceBarrierBuffers(cmd, profile, .dense_ffn, &.{
         &engine.qwen_ssm_prefill_branch_buf,
-        &engine.qwen35_dense_prefill_down_buf,
+        &engine.qwen35_dense_prefill_swiglu_buf,
     });
-    {
-        const total = n_tokens * hidden_dim;
-        const push = ScaleAccPush{ .n = total, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
-        const bufs = [_]*const MetalBuffer{ &engine.qwen_ssm_prefill_branch_buf, &engine.qwen35_dense_prefill_down_buf };
-        cmd.dispatchV2(&engine.scale_acc_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
-    }
+    dispatchGemmQ4KAccOnCmd(engine, cmd, down_t, &engine.qwen35_dense_prefill_swiglu_buf, &engine.qwen_ssm_prefill_branch_buf, hidden_dim, inter_dim, n_tokens);
 
     if (profile) |p| {
         p.dense_ffn_layers += n_tokens;

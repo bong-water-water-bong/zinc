@@ -63,6 +63,7 @@ const GemmPush = extern struct {
     ne0: i32,
     ne1: i32,
     src0_off: u32,
+    flags: u32 = 0,
 };
 
 const RmsNormPush = extern struct {
@@ -1770,6 +1771,7 @@ fn runGemmQ8BatchedDispatchBatch(
         .ne0 = @intCast(rows),
         .ne1 = @intCast(tokens),
         .src0_off = tensorPageOffset(model, tensor),
+        .flags = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
     const grid = [_]u32{ (tokens + 31) / 32, (rows + 63) / 64, 1 };

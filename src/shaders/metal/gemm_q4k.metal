@@ -25,6 +25,7 @@ struct GemmPush {
     int32_t  ne0;       // M dimension (rows of weight / output dim)
     int32_t  ne1;       // N dimension (number of input vectors / tokens)
     uint32_t src0_off;  // byte offset to weight data within the Metal buffer
+    uint32_t flags;     // bit0: accumulate into dst instead of overwrite
 };
 
 // Q4_K block: 144 bytes, 256 elements
@@ -182,7 +183,8 @@ kernel void main0(
     }
 
     // --- Store output ---
-    if (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
+    const bool accumulate = (args.flags & 1u) != 0u;
+    if (!accumulate && r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
         // Fast path: full tile, write directly to device memory
         device float * C = (device float *) dst +
             (r0 + 32 * (sgitg & 1)) +
@@ -192,7 +194,7 @@ kernel void main0(
             simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * args.ne0 * (i / 4), args.ne0, 0, false);
         }
     } else {
-        // Slow path: partial tile at matrix boundary
+        // Slow path: partial tile at matrix boundary, or accumulate mode.
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
@@ -212,12 +214,22 @@ kernel void main0(
                 threadgroup float4 * C4 = (threadgroup float4 *) C;
 
                 int i = 0;
-                for (; i < nr0 / 4; i++) {
-                    *(D4 + i) = *(C4 + i);
-                }
-                i *= 4;
-                for (; i < nr0; i++) {
-                    *(D + i) = *(C + i);
+                if (accumulate) {
+                    for (; i < nr0 / 4; i++) {
+                        *(D4 + i) = *(D4 + i) + *(C4 + i);
+                    }
+                    i *= 4;
+                    for (; i < nr0; i++) {
+                        *(D + i) = *(D + i) + *(C + i);
+                    }
+                } else {
+                    for (; i < nr0 / 4; i++) {
+                        *(D4 + i) = *(C4 + i);
+                    }
+                    i *= 4;
+                    for (; i < nr0; i++) {
+                        *(D + i) = *(C + i);
+                    }
                 }
             }
         }
