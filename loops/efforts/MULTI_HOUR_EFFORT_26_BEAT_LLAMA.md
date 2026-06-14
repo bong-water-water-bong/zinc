@@ -1,41 +1,44 @@
-# Effort 26 — Beat llama.cpp on every catalog row where ZINC trails (prefill graphs + MoE decode)
+# Effort 26 — Beat llama.cpp on every catalog row where ZINC trails (prefill GEMM efficiency + MoE expert GEMM)
 
-> **Status:** 🔬 OPEN (spawned 2026-06-13 from the published RTX 5090 catalog). Goal: ZINC > llama.cpp on EVERY row. Runs on the **5090**; the parallel Effort-25 decode loop owns the **4090** — do not disturb it.
+> **Status:** 🔬 OPEN (spawned 2026-06-13). Goal: ZINC > llama.cpp on EVERY row. **LANDED (merged to main): dense prefill GEMM ~2.5× via TC-default + cuBLAS Q4_K/Q6_K (gemma-31B ~200→505 t/s, now ~6.5× behind llama-bench).** Effort 25 (decode graphs) has CONVERGED/stopped → the 4090 is free; still measure on the 5090 for the published target.
 
 Forward paths: `src/compute/forward_cuda_gemma.zig` (gemma4 dense+MoE), `src/compute/forward_cuda.zig` (qwen35/36 hybrid-SSM). Graph/stream layer: `src/cuda/command.zig`, `src/cuda/cuda_shim.c` (Effort 25 already wired `cuStreamBeginCapture`→`cuGraphExec`→`cuGraphLaunch` for DECODE — reuse it).
 
-## The gap (RTX 5090, 2026-06-13, zinc vs llama tok/s — the rows to beat)
+## The gap — CORRECTED (the original perf_suite prefill numbers were WRONG)
 
-**PREFILL (the big gaps):**
-- `gemma-4-31B` dense — **57.3 vs 381.5 (0.15×)** ⚠️ biggest gap
-- `gemma-4-26B-A4B` MoE — **106.3 vs 413.9 (0.26×)** ⚠️
-- `qwen36-35B-A3B` MoE — 45.5 vs 48.3 (0.94×) — close
-- (qwen35-9B 1.14× ✓ and qwen36-27B 1.66× ✓ already BEAT llama — leave them.)
+⚠️ **The effort's original "0.15×/0.26×" prefill gaps were `performance_suite.mjs` artifacts** — it undermeasures prefill throughput for BOTH engines. Cycles 1 + 7 re-measured with `llama-bench` on the SAME 5090 + same gguf:
 
-**DECODE:**
-- `gemma-4-26B-A4B` MoE — **31% of llama** ⚠️ ; `qwen36-35B-A3B` MoE — **42%** ⚠️ (the big decode gaps)
-- gemma-31B 82%, qwen35-9B 75%, qwen36-27B 91% (close; lower priority)
+| row | zinc (batched default) | llama (llama-bench pp512) | real gap |
+| --- | ---: | ---: | --- |
+| gemma-31B dense PREFILL | ~200 → **505** (after c9+c10) | **~3283–3542** | **~6.5×** behind |
+| gemma-26B MoE PREFILL | ~343 | **~9129** | **~26×** behind |
+| MoE DECODE (gemma-26B / qwen36-35B-A3B) | 31% / 42% of llama | — | the other big gap |
 
-The two structural gaps: **gemma PREFILL** (pure-transformer GEMM prefill, where llama runs cuBLAS-class kernels) and **MoE DECODE**. (Qwen prefill already wins only because qwen36 is hybrid-SSM — slow prefill in BOTH engines; that's not a real lead, just a slow llama baseline.)
+The real prefill gaps are **far bigger than the blog/dashboard say** (which still carry the bogus suite numbers — a SEPARATE fix: the perf-suite prefill metric needs to match llama-bench). The qwen "prefill wins" (1.14×/1.66×) are also suite artifacts (qwen36 is hybrid-SSM, slow prefill in both engines) — ignore them as the bar.
 
-## Why we're behind, and the lever (the finding that directs this effort)
+## Why we're behind, and the lever (CORRECTED — cycle 1 refuted the original premise)
 
-**Gemma prefill is LAUNCH-BOUND, not compute-bound.** Effort 25 profiled a batched gemma-31B prefill (T=413) at **7–12% GPU util / ~76 W of 575 W — the GPU sits ~90% idle.** So faster GEMM kernels are the WRONG move: Effort 24 proved the batched/tensor-core GEMM is 5.9× isolated but **end-to-end NEUTRAL** (the GPU is idle between kernels, not crunching). The fp16 tensor-core GEMM (`ZINC_BATCHED_TC`, default OFF) compiles and is ~2.2× isolated but is end-to-end neutral for the same reason.
+**Gemma prefill is COMPUTE-bound on the 5090, NOT launch-bound.** Cycle 1 re-profiled (fine 30–50 ms sampling, pp256/512/1024): during the compute window the GPU runs at **~100% util, full 2850 MHz, ~380–418 W**. The earlier "7–12% util" (Effort 25, 4090, T=413) was the model-load / clock-ramp phase, not steady-state. **⇒ CUDA graphs over the prefill chain (the original T1) is a DEAD END — there are no launch bubbles to reclaim.**
 
-**The lever is the SAME as Effort 25's decode win: CUDA GRAPHS.** Capture the per-layer prefill kernel chain once, `cuGraphLaunch` to replay it, collapsing ~16 launches/layer × 60 layers of per-kernel launch + inter-kernel-bubble latency. The 90% idle is the 4–7× headroom needed to beat llama. Effort 25 already built the capture machinery for decode — extend it to prefill.
+**The lever is a more EFFICIENT batched GEMM.** The gap is pure kernel efficiency: zinc ran a hand-written Q4_K-dequant tiled GEMM; llama runs MMQ/cuBLAS-class fp16 tensor-core GEMM. Cycles 1/9/10 closed most of it (all MERGED TO MAIN):
+- **c1: TC default-on** (`ZINC_BATCHED_TC`, Blackwell fp16 TC) — gemma-31B prefill **+25%**.
+- **c9: cuBLAS fp16-TC dense Q4_K GEMM** (dequant W→fp16 + `cublasGemmEx`, default-on T≥128) — **+80%** (240→430).
+- **c10: extend cuBLAS to Q6_K** (ffn_down) — **+17%** (432→505).
+- ⇒ **gemma-31B prefill ~200 → 505 t/s (~2.5×), now ~6.5× behind llama.**
 
-## Targets (priority order; the BAR is BEAT llama on the 5090, interleaved-A/B-confirmed)
+**The remaining ~6.5× = the dequant round-trip.** zinc's cuBLAS path writes the FULL fp16 weight to scratch then cuBLAS reads it back (a fixed per-GEMM weight round-trip); llama fuses dequant INTO the GEMM (MMQ / on-the-fly), avoiding it. **Dead ends already logged — do NOT re-litigate:** int8 MMQ (per-subblock store-rescale epilogue tax eats the int8 win), FP8 e4m3 (weight-traffic-bound → 2× TC rate buys nothing), m128 / normf16 / grouped-experts (in-noise), CUDA graphs (compute-bound).
 
-- **T1 — Gemma prefill via CUDA graphs (PRIMARY).** Extend Effort 25's `cuStreamBeginCapture`/`cuGraphExec` to `prefillBatched` in `forward_cuda_gemma.zig`. **KEY DESIGN:** prefill replays the chain ~ONCE per prompt, so a single whole-prompt graph isn't amortized (capture cost ≈ one replay). **CHUNK** prefill into fixed-size token chunks (e.g. C=128/256), capture the per-C-chunk per-layer chain ONCE, replay it `ceil(T/C)` times — amortizes the instantiate AND cuts the launch chain C-fold. Per-chunk topology is invariant (C fixed); KV cache + causal attention already handle cross-chunk dependencies (each chunk attends prior chunks via the cache). Per-chunk-varying scalars (chunk base position, KV offset) ride device-buffer reads or `cuGraphExecKernelNodeSetParams` so topology stays invariant (same trick decode used). Beat llama: gemma-31B > 381, gemma-26B > 414.
-- **T2 — MoE decode gap (gemma-26B 31%, qwen36-35B-A3B 42%).** The router keeps a per-layer host sync and the small-M routed-expert matvecs are occupancy-starved. Levers: (a) **GPU-side expert gather** — drop the last router host round-trip (the e25 doc's MoE-graph blocker), so the MoE step is sync-free; (b) **wider/multi-row expert kernels** for the small-M matvecs (more output rows/block → occupancy); (c) **uniform-quant MoE** — the catalog 35B-A3B has MIXED expert quants (q4k/q5k/q6k) which blocks graph capture; a per-quant-group batched expert kernel (or a requant) unblocks the MoE decode graph. Token-correct gate.
-- **T3 — qwen36-35B-A3B MoE prefill (0.94× → beat).** Just +6%. Same chunked-prefill-graph lever as T1 over the MoE prefill chain (batched experts already default-on).
-- **T4 (stretch) — dense decode last mile (gemma-31B 82%, qwen35-9B 75%, qwen36-27B 91%).** e25 graphs are size-gated (help 9B, fade at 27B); the lever here is deeper kernel fusion (fewer/fatter launches — the Effort 23 playbook). Lower priority (already close).
+## Targets (priority; BAR = BEAT llama on the 5090, **llama-bench** baseline, interleaved-A/B)
+
+- **T1 — kill the dequant round-trip on dense prefill GEMM (close the remaining ~6.5×).** Options: (a) **persistent fp16 weight cache** — dequant each dense weight to fp16 ONCE per model load, cuBLAS reads fp16 directly every prefill (trades ~2× VRAM on the dense weights for removing the per-GEMM dequant; simplest clearly-real win); (b) **MMQ-style on-the-fly dequant GEMM** (the real llama approach — dequant in the GEMM K-loop, no scratch round-trip); (c) cp.async/wgmma fp16 pipelining on the existing TC kernel. Validate 5/5 token-correct, A/B vs `llama-bench` (~3283).
+- **T2 — MoE expert GEMM (prefill ~26× + decode 31–42%).** Same root cause: experts run hand-written Q4_K-dequant matvecs vs llama's MMQ. Route the batched routed-expert matvecs through the cuBLAS/MMQ path (per-expert or grouped GEMM); for DECODE additionally drop the router host round-trip (GPU-side gather) + wider expert kernels. Token-correct gate.
+- **T3 (stretch) — dense decode last mile (gemma-31B 82%, qwen35-9B 75%, qwen36-27B 91%).** Deeper kernel fusion (Effort 23 playbook). Lower priority (already close).
 
 ## Plan (incremental, validate-before-commit; ONE target per cycle)
 
-1. **Cycle 1 — CONFIRM THE REGIME (cheap, do first):** re-profile gemma-31B prefill util on the 5090 (`nvidia-smi --query-gpu=utilization.gpu,power.draw,clocks.sm` DURING a batched prefill) to re-confirm launch-bound (~10% util). Then an interleaved end-to-end A/B of the TC path (`ZINC_BATCHED_TC` on/off) — **if TC is NOT neutral (a real end-to-end GEMM win), take it first, it's free**; if neutral (expected), graphs are confirmed as the only lever. Log util + the TC A/B in the cycle log.
-2. **Cycle 2+ — T1 chunked-prefill graph capture.** Validate 5/5 token-correct + prefill A/B (util before→after, zinc vs llama). Commit `perf/e26-prefill-graph-<step>`.
-3. Then T2, T3, T4.
+1. ✅ **DONE (c1, c9, c10) — MERGED TO MAIN:** TC default-on + cuBLAS Q4_K/Q6_K dense prefill GEMM → gemma-31B prefill ~2.5×.
+2. **NEXT — T1 dequant round-trip:** start with the persistent fp16 weight cache (simplest) or MMQ on-the-fly dequant; A/B vs llama-bench (~3283).
+3. Then T2 (MoE expert GEMM), T3.
 
 ## Validation contract
 
@@ -46,9 +49,9 @@ The two structural gaps: **gemma PREFILL** (pure-transformer GEMM prefill, where
 
 ## HARD RULES
 
-- **5090-pinned** (UUID `GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350`). The parallel **Effort-25 decode loop owns the 4090** (`GPU-e59a6fce-…`) + `~/zinc-e25` — DO NOT touch it. Util-gate A/B rounds (`--query-gpu=utilization.gpu`, NOT `--query-compute-apps` — hidepid hides foreign procs); skip a round if the 5090 is contended.
+- **5090-pinned** (UUID `GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350`) for the published target. Effort-25 has CONVERGED → the **4090** (`GPU-e59a6fce-…`) is now FREE (use it for a parallel validate if helpful). Util-gate A/B rounds (`--query-gpu=utilization.gpu`, NOT `--query-compute-apps` — hidepid hides foreign procs); skip a round if contended. **BOX STABILITY: the WSL2 box wedges under gemma 18 GB reloads (4-cycle SSH outage 06-14) — when SSH hangs past connect it needs a human restart.**
 - Isolated box dir `~/zinc-e26`, **never** `~/workspace/zinc`. Box gotchas: `DECODE/PREFILL tok/s` print is on STDERR (`2>&1`); `nohup … >FILE 2>&1 &` + poll the FILE (a backgrounded `ssh '… bash'` orphans its remote script); `pkill -f <pat>` self-matches the ssh argv (kill by PID); gemma-31B `gen` reloads 18 GB/call (~45 s).
-- **DO NOT async gemma decode** (boost-saturated, proven regression — Effort 23/25). Prefill graphs are fine (prefill is launch-bound).
+- **DO NOT async gemma decode** (boost-saturated, proven regression — Effort 23/25). **CUDA graphs are dead for prefill too (compute-bound — cycle 1).**
 - Branches not main; validate before commit; commit ONLY the scoped change; never commit host/IP/port; a neutral cycle is a logged negative (valuable) → revert the code.
 
 ## Cycle log
