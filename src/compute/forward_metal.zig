@@ -1417,6 +1417,18 @@ const GpuMoeFinalizerKind = enum(u8) {
     gemma_staged,
 };
 
+const Qwen35Dense9bPrefillFallbackReason = enum(u8) {
+    none,
+    ssm_projection_guard_failed,
+    branch_not_batched,
+    layer0_dense_guard_failed,
+    prefix_ssm_guard_failed,
+    prefix_full_attn_guard_failed,
+    full_attn_boundary,
+    configured_prefix_limit,
+    complete,
+};
+
 const decode_async_profile_slots = 16;
 
 /// Per-request profiling counters for dispatch, barrier, and timing breakdown.
@@ -1654,6 +1666,18 @@ pub const RuntimeProfile = struct {
     queued_prefill_async_submit_count: u32 = 0,
     queued_prefill_async_to_final_wait_ns: u64 = 0,
     queued_prefill_final_wait_ns: u64 = 0,
+    qwen35_dense_prefill_requests: u32 = 0,
+    qwen35_dense_prefill_prompt_tokens: u32 = 0,
+    qwen35_dense_prefill_target_layers: u32 = 0,
+    qwen35_dense_prefill_target_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_materialized_tokens: u32 = 0,
+    qwen35_dense_prefill_materialized_layers: u32 = 0,
+    qwen35_dense_prefill_materialized_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_materialized_ssm_layers: u32 = 0,
+    qwen35_dense_prefill_materialized_full_attn_layers: u32 = 0,
+    qwen35_dense_prefill_materialized_dense_ffn_layers: u32 = 0,
+    qwen35_dense_prefill_first_token_major_layer: u32 = 0,
+    qwen35_dense_prefill_first_fallback_reason: Qwen35Dense9bPrefillFallbackReason = .none,
     shared_expert_bytes: u64 = 0,
     shared_expert_gate_up_bytes: u64 = 0,
     shared_expert_down_bytes: u64 = 0,
@@ -2782,6 +2806,28 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             nsToMs(profile.queued_prefill_async_to_final_wait_ns),
             nsToMs(profile.queued_prefill_final_wait_ns),
             pctOf(profile.gpu_completion_wait_ns, profile.queued_prefill_final_wait_ns),
+        });
+    }
+    if (profile.qwen35_dense_prefill_requests > 0) {
+        const target_layer_tokens = profile.qwen35_dense_prefill_target_layer_tokens;
+        const materialized_layer_tokens = profile.qwen35_dense_prefill_materialized_layer_tokens;
+        const replay_layer_tokens = target_layer_tokens -| materialized_layer_tokens;
+        log.info("  {s} qwen35-9b layer-major prefill: requests {d} prompt_tokens {d} materialized_tokens {d} layers {d}/{d} layer_tokens {d}/{d} ({d:.1}%) replay_layer_tokens {d} first_token_major_layer {d} reason {s} ssm_layers {d} full_attn_layers {d} dense_ffn_layers {d}", .{
+            label,
+            profile.qwen35_dense_prefill_requests,
+            profile.qwen35_dense_prefill_prompt_tokens,
+            profile.qwen35_dense_prefill_materialized_tokens,
+            profile.qwen35_dense_prefill_materialized_layers,
+            profile.qwen35_dense_prefill_target_layers,
+            materialized_layer_tokens,
+            target_layer_tokens,
+            pctOf(@as(u64, target_layer_tokens), @as(u64, materialized_layer_tokens)),
+            replay_layer_tokens,
+            profile.qwen35_dense_prefill_first_token_major_layer,
+            qwen35Dense9bPrefillFallbackReasonName(profile.qwen35_dense_prefill_first_fallback_reason),
+            profile.qwen35_dense_prefill_materialized_ssm_layers,
+            profile.qwen35_dense_prefill_materialized_full_attn_layers,
+            profile.qwen35_dense_prefill_materialized_dense_ffn_layers,
         });
     }
 }
@@ -4848,6 +4894,59 @@ fn recordQueuedPrefillFinalWait(profile: ?*RuntimeProfile, async_to_final_wait_n
     const p = profile orelse return;
     p.queued_prefill_async_to_final_wait_ns += async_to_final_wait_ns;
     p.queued_prefill_final_wait_ns += final_wait_ns;
+}
+
+fn qwen35Dense9bPrefillFallbackReasonName(reason: Qwen35Dense9bPrefillFallbackReason) []const u8 {
+    return switch (reason) {
+        .none => "none",
+        .ssm_projection_guard_failed => "ssm-projection-guard-failed",
+        .branch_not_batched => "branch-not-batched",
+        .layer0_dense_guard_failed => "layer0-dense-guard-failed",
+        .prefix_ssm_guard_failed => "prefix-ssm-guard-failed",
+        .prefix_full_attn_guard_failed => "prefix-full-attn-guard-failed",
+        .full_attn_boundary => "full-attn-boundary",
+        .configured_prefix_limit => "configured-prefix-limit",
+        .complete => "complete",
+    };
+}
+
+fn recordQwen35Dense9bLayerMajorPrefillProfile(
+    profile: ?*RuntimeProfile,
+    cfg: ModelConfig,
+    prompt_len: usize,
+    materialized_tokens: u32,
+    materialized_layers: u32,
+    fallback_reason: Qwen35Dense9bPrefillFallbackReason,
+) void {
+    const p = profile orelse return;
+    if (!defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return;
+
+    const prompt_tokens = saturatingU32FromUsize(prompt_len);
+    const target_layers = cfg.n_layers;
+    const clamped_layers = @min(materialized_layers, target_layers);
+    const clamped_tokens = @min(materialized_tokens, prompt_tokens);
+    var materialized_ssm_layers: u32 = 0;
+    var materialized_full_attn_layers: u32 = 0;
+    for (0..@as(usize, @intCast(clamped_layers))) |layer_idx| {
+        if (isFullAttentionLayer(cfg, layer_idx)) {
+            materialized_full_attn_layers += 1;
+        } else if (cfg.ssm_d_inner != 0) {
+            materialized_ssm_layers += 1;
+        }
+    }
+
+    p.qwen35_dense_prefill_requests +|= 1;
+    p.qwen35_dense_prefill_prompt_tokens +|= prompt_tokens;
+    p.qwen35_dense_prefill_target_layers = target_layers;
+    p.qwen35_dense_prefill_target_layer_tokens +|= prompt_tokens *| target_layers;
+    p.qwen35_dense_prefill_materialized_tokens +|= clamped_tokens;
+    p.qwen35_dense_prefill_materialized_layers +|= clamped_layers;
+    p.qwen35_dense_prefill_materialized_layer_tokens +|= clamped_tokens *| clamped_layers;
+    p.qwen35_dense_prefill_materialized_ssm_layers +|= materialized_ssm_layers;
+    p.qwen35_dense_prefill_materialized_full_attn_layers +|= materialized_full_attn_layers;
+    p.qwen35_dense_prefill_materialized_dense_ffn_layers +|= clamped_layers;
+    p.qwen35_dense_prefill_first_token_major_layer = if (clamped_layers < target_layers) clamped_layers else target_layers;
+    p.qwen35_dense_prefill_first_fallback_reason = if (clamped_layers >= target_layers) .complete else fallback_reason;
 }
 
 fn logRoutePackCandidateBlocks(n_tokens: u32, n_experts: u32, n_experts_used: u32) void {
@@ -21110,7 +21209,11 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     engine.qwen_ssm_prefill_router_active_tokens = 0;
     engine.qwen35_dense_prefill_layer0_active_tokens = 0;
     engine.qwen35_dense_prefill_active_layers = 0;
-    if (!canUseQwenSsmPrefillProjectionChunk(engine, prompt_len)) return false;
+    const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
+    if (!canUseQwenSsmPrefillProjectionChunk(engine, prompt_len)) {
+        recordQwen35Dense9bLayerMajorPrefillProfile(profile, engine.config, prompt_len, 0, 0, .ssm_projection_guard_failed);
+        return false;
+    }
 
     const cfg = engine.config;
     const hidden_dim = cfg.hidden_dim;
@@ -21126,7 +21229,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     const alpha_t = lt.ssm_alpha orelse return error.MissingTensor;
     const beta_t = lt.ssm_beta orelse return error.MissingTensor;
     const ssm_out_t = lt.ssm_out orelse return error.MissingTensor;
-    const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
+    var layer_major_fallback_reason: Qwen35Dense9bPrefillFallbackReason = .branch_not_batched;
 
     var cmd = try beginProfiledCommand(engine, profile);
     dispatchRmsNormOnCmd(engine, &cmd, &engine.prefill_embed_buf, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[0], hidden_dim, n_tokens);
@@ -21370,6 +21473,7 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
             n_tokens,
             profile,
         );
+        layer_major_fallback_reason = if (dense_layer0_batched) .configured_prefix_limit else .layer0_dense_guard_failed;
         if (dense_layer0_batched and defaultQwen35Dense9bQueuedPrefillEnabled(cfg) and qwen35_dense9b_prefill_prefix_layers > 1) {
             const max_prefix_layers = @min(qwen35_dense9b_prefill_prefix_layers, @as(usize, @intCast(cfg.n_layers)));
             var prefix_layer_idx: usize = 1;
@@ -21406,11 +21510,20 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
                         n_tokens,
                         profile,
                     );
-                if (!recorded_prefix_layer) break;
+                if (!recorded_prefix_layer) {
+                    layer_major_fallback_reason = if (isFullAttentionLayer(cfg, prefix_layer_idx))
+                        .prefix_full_attn_guard_failed
+                    else
+                        .prefix_ssm_guard_failed;
+                    break;
+                }
                 profileResourceBarrierBuffers(&cmd, profile, .dense_ffn, &.{&engine.qwen35_dense_prefill_down_buf});
                 dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.qwen35_dense_prefill_down_buf, &engine.qwen_ssm_prefill_branch_buf, n_tokens * hidden_dim, 0, 0);
                 engine.qwen35_dense_prefill_active_layers = @intCast(prefix_layer_idx + 1);
-                if (isFullAttentionLayer(cfg, prefix_layer_idx)) break;
+                if (isFullAttentionLayer(cfg, prefix_layer_idx)) {
+                    layer_major_fallback_reason = .full_attn_boundary;
+                    break;
+                }
             }
         }
         if (dense_layer0_batched and engine.qwen35_dense_prefill_active_layers == 0) {
@@ -21541,6 +21654,14 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
     engine.qwen_ssm_prefill_shared_gate_active_tokens = if (shared_gate_batched) n_tokens else 0;
     engine.qwen_ssm_prefill_router_active_tokens = if (router_batched) n_tokens else 0;
     engine.qwen35_dense_prefill_layer0_active_tokens = if (dense_layer0_batched) n_tokens else 0;
+    recordQwen35Dense9bLayerMajorPrefillProfile(
+        profile,
+        cfg,
+        prompt_len,
+        if (dense_layer0_batched) n_tokens else 0,
+        engine.qwen35_dense_prefill_active_layers,
+        layer_major_fallback_reason,
+    );
     if (engine.profile_enabled) {
         log.info("Metal profile: Qwen SSM prefill projection chunk active layer=0 tokens={d} async={} alpha_batched={} beta_batched={} branch_batched={} branch_norm_batched={} dense_layer0_batched={} dense_prefix_layers={d} router_batched={} shared_down_batched={} shared_gate_batched={}", .{ n_tokens, async_out != null, alpha_batched, beta_batched, branch_batched, branch_norm_batched, dense_layer0_batched, engine.qwen35_dense_prefill_active_layers, router_batched, shared_down_batched, shared_gate_batched });
     }
@@ -33396,6 +33517,19 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expectEqual(@as(usize, 16), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 41, 0, outside_balanced_qwen_base, false));
     try std.testing.expectEqual(@as(usize, 16), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 41, 16, outside_balanced_qwen_base, false));
     try std.testing.expectEqual(@as(usize, 9), InferenceEngine.queuedTokenMajorAsyncChunkLen(qwen35_9b_cfg, 41, 32, outside_balanced_qwen_base, false));
+
+    var profile = RuntimeProfile{};
+    recordQwen35Dense9bLayerMajorPrefillProfile(&profile, qwen35_9b_cfg, 36, 36, 4, .full_attn_boundary);
+    try std.testing.expectEqual(@as(u32, 1), profile.qwen35_dense_prefill_requests);
+    try std.testing.expectEqual(@as(u32, 36), profile.qwen35_dense_prefill_prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 32), profile.qwen35_dense_prefill_target_layers);
+    try std.testing.expectEqual(@as(u32, 1152), profile.qwen35_dense_prefill_target_layer_tokens);
+    try std.testing.expectEqual(@as(u32, 4), profile.qwen35_dense_prefill_materialized_layers);
+    try std.testing.expectEqual(@as(u32, 144), profile.qwen35_dense_prefill_materialized_layer_tokens);
+    try std.testing.expectEqual(@as(u32, 3), profile.qwen35_dense_prefill_materialized_ssm_layers);
+    try std.testing.expectEqual(@as(u32, 1), profile.qwen35_dense_prefill_materialized_full_attn_layers);
+    try std.testing.expectEqual(@as(u32, 4), profile.qwen35_dense_prefill_first_token_major_layer);
+    try std.testing.expectEqualStrings("full-attn-boundary", qwen35Dense9bPrefillFallbackReasonName(profile.qwen35_dense_prefill_first_fallback_reason));
 }
 
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
