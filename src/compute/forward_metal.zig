@@ -9006,27 +9006,42 @@ pub const InferenceEngine = struct {
             var final_cmd = try beginProfiledCommand(self, profile);
             errdefer if (final_cmd.handle != null) final_cmd.wait();
 
-            const final_record_start = profileStart(profile != null);
-            dispatchRmsNormOnCmd(self, &final_cmd, &scratch.hidden, &scratch.norm, &self.final_norm_gpu, hidden_dim, n_tokens);
-            profileBarrier(&final_cmd, profile, .final);
-
             const final_base = @as(usize, prompt_tokens.len - 1) * hidden_dim_usize;
+            const final_base_u32: u32 = @intCast(final_base);
+            const final_record_start = profileStart(profile != null);
+            // llama.cpp's `ggml_metal_graph_compute` materializes only graph
+            // outputs consumed by later nodes. The full-prefix Qwen 9B path only
+            // consumes the last prompt row for logits, so avoid normalizing the
+            // entire prompt matrix in the tail command.
+            dispatchCopyRmsNormOffsetOnCmd(
+                self,
+                &final_cmd,
+                &scratch.hidden,
+                &self.hidden_buf,
+                &self.norm_buf,
+                &self.final_norm_gpu,
+                hidden_dim,
+                final_base_u32,
+            );
+            profileBarrierBuffers(&final_cmd, profile, .final, &.{&self.norm_buf});
+
             if (shouldCpuLmHeadFallback(self)) {
                 commitAndWaitProfiled(&final_cmd, profile);
-                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.norm.cpu_ptr.?));
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(self.norm_buf.cpu_ptr.?));
                 const out_ptr: [*]f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
-                try cpuLmHeadFallbackWithArgmax(self, norm_ptr + final_base, out_ptr);
+                try cpuLmHeadFallbackWithArgmax(self, norm_ptr, out_ptr);
                 if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
             } else {
-                const x_offset_bytes: u32 = @intCast(final_base * @sizeOf(f32));
-                dispatchLmHeadWithInputOffset(self, &final_cmd, &scratch.norm, &self.logits_buf, hidden_dim, cfg.vocab_size, x_offset_bytes);
-                profileBarrier(&final_cmd, profile, .final);
-                dispatchArgmaxOnCmd(self, &final_cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size, profile);
+                dispatchLmHeadAndArgmaxOnCmd(self, &final_cmd, &self.norm_buf, &self.logits_buf, &self.argmax_buf, hidden_dim, cfg.vocab_size, profile);
                 if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
                 commitAndWaitProfiled(&final_cmd, profile);
             }
 
-            waitCommandProfiled(&layer0_pending, profile);
+            // `final_cmd` is committed after the async prefix command on the
+            // same Metal queue, so completing it also completes the prefix.
+            // Release the retained prefix handle without adding a redundant
+            // profiled wait to the prefill tail.
+            layer0_pending.releaseCompleted();
             self.position = @intCast(prompt_tokens.len);
             state.position = self.position;
             if (profile) |p| p.total_step_ns += profileElapsedNs(tail_start);
