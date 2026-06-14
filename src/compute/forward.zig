@@ -11288,6 +11288,7 @@ pub const InferenceEngine = struct {
                 .q4_k => break :blk if (self.dmmv.pipeline_q4k_batch_kpar) |*p| p else null,
                 .q5_k => break :blk if (self.dmmv.pipeline_q5k) |*p| p else null,
                 .q6_k => break :blk if (self.dmmv.pipeline_q6k_batch_kpar) |*p| p else null,
+                .q8_0 => break :blk if (self.dmmv.pipeline_q8_0_kpar_batch) |*p| p else null,
                 else => break :blk null,
             }
         };
@@ -11653,7 +11654,7 @@ pub const InferenceEngine = struct {
                     .y_offset = y_offset,
                     .num_cols = chunk,
                 };
-                if (tensor.info.type_ == .q5_k) {
+                if (tensor.info.type_ == .q5_k or tensor.info.type_ == .q8_0) {
                     const q5_push = DmmvPushConstants{
                         .M = M,
                         .K = K,
@@ -19159,14 +19160,29 @@ pub const InferenceEngine = struct {
                 .head_v_dim = head_v_dim,
                 .d_state = cfg.ssm_d_state,
                 .norm_per_head = if (norm_per_head) 1 else 0,
+                .n_tok = n_tokens,
             };
-            // Effort-15 cycle 11: token-batched gated norm dispatch. Replaces
-            // the per-token pushDescAndDispatch loop (n_tokens dispatches per
-            // SSM segment, ~280 per context-medium prefill) with a single
-            // (dt_rank, n_tokens, 1) dispatch. Falls back to the per-token
-            // path when the batched pipeline failed to load.
+            // Prefer the fused token-loop variant (one WG per head, all tokens
+            // internal) to eliminate per-token WG launch overhead. Falls back
+            // to the per-token grid or per-token host loop.
             var tok_idx: u32 = 0;
-            if (self.elementwise.pipeline_ssm_gated_norm_batch_tok) |*batch_pip| {
+            if (self.elementwise.pipeline_ssm_gated_norm_batch_tok_fused) |*fused_pip| {
+                const infos = [4]vk.c.VkDescriptorBufferInfo{
+                    .{ .buffer = scratch_attn_out.handle, .offset = 0, .range = z_total_bytes },
+                    .{ .buffer = scratch_up.handle, .offset = 0, .range = z_total_bytes },
+                    .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
+                    .{ .buffer = scratch_swiglu.handle, .offset = 0, .range = z_total_bytes },
+                };
+                self.decode_cmd.pushDescAndDispatch(
+                    fused_pip,
+                    self.instance.push_descriptor_fn,
+                    infos[0..],
+                    std.mem.asBytes(&gnorm_push),
+                    dt_rank,
+                    1,
+                    1,
+                );
+            } else if (self.elementwise.pipeline_ssm_gated_norm_batch_tok) |*batch_pip| {
                 const infos = [4]vk.c.VkDescriptorBufferInfo{
                     .{ .buffer = scratch_attn_out.handle, .offset = 0, .range = z_total_bytes },
                     .{ .buffer = scratch_up.handle, .offset = 0, .range = z_total_bytes },
@@ -25526,6 +25542,6 @@ test "push constant struct sizes match GLSL expectations" {
     const ew = @import("elementwise.zig");
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(ew.SsmConv1dPush));
     try std.testing.expectEqual(@as(usize, 52), @sizeOf(ew.SsmDeltaNetPush));
-    try std.testing.expectEqual(@as(usize, 20), @sizeOf(ew.SsmGatedNormPush));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(ew.SsmGatedNormPush));
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(ew.SoftmaxTopkPush));
 }

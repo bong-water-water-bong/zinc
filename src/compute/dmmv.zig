@@ -338,6 +338,9 @@ pub const DmmvDispatch = struct {
     pipeline_q8_0: ?Pipeline,
     /// Q8_0 one-row-per-thread batch-style variant for very tall matrices.
     pipeline_q8_0_batch: ?Pipeline,
+    /// Q8_0 K-parallel batch variant for multi-column prefill (one WG per row,
+    /// 64 threads cooperate on K, acc_mode > 1 = num_cols).
+    pipeline_q8_0_kpar_batch: ?Pipeline,
     /// Q8_0 pipeline with SPEC_BLOCKS_PER_ROW=64 (K=2048).
     pipeline_q8_0_spec64: ?Pipeline,
     /// Q8_0 pipeline with SPEC_BLOCKS_PER_ROW=128 (K=4096).
@@ -738,6 +741,11 @@ pub const DmmvDispatch = struct {
         const q8_batch_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_batch.spv", .{shader_dir}) catch unreachable;
         const pipeline_q8_0_batch = pipeline_mod.createFromSpirvWithOptions(instance, q8_batch_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q8_0 batch shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_kpar_batch_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_kpar_batch.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_kpar_batch = pipeline_mod.createFromSpirvWithOptions(instance, q8_kpar_batch_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 kpar batch shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
         const q8_spec64 = [_]pipeline_mod.SpecConst{.{ .id = 2, .value = 64 }};
@@ -1546,6 +1554,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q6k_wide = pipeline_q6k_wide,
             .pipeline_q8_0 = pipeline_q8_0,
             .pipeline_q8_0_batch = pipeline_q8_0_batch,
+            .pipeline_q8_0_kpar_batch = pipeline_q8_0_kpar_batch,
             .pipeline_q8_0_spec64 = pipeline_q8_0_spec64,
             .pipeline_q8_0_spec128 = pipeline_q8_0_spec128,
             .pipeline_q8_0_wide = pipeline_q8_0_wide,
@@ -4064,6 +4073,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q6k_wide) |*p| p.deinit();
         if (self.pipeline_q8_0) |*p| p.deinit();
         if (self.pipeline_q8_0_batch) |*p| p.deinit();
+        if (self.pipeline_q8_0_kpar_batch) |*p| p.deinit();
         if (self.pipeline_q8_0_spec64) |*p| p.deinit();
         if (self.pipeline_q8_0_spec128) |*p| p.deinit();
         if (self.pipeline_q8_0_wide) |*p| p.deinit();

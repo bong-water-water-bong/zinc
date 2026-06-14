@@ -165,6 +165,7 @@ pub fn build(b: *std.Build) void {
         "dmmv_q4k",
         "dmmv_q8_0",
         "dmmv_q8_0_batch",
+        "dmmv_q8_0_kpar_batch",
         "dmmv_q8_0_wide",
         "dmmv_q8_0_q8_1",
         "dmmv_q8_0_fused_pair",
@@ -323,6 +324,7 @@ pub fn build(b: *std.Build) void {
         // n_tokens, 1) dispatch — ~280 dispatch records dropped per SSM
         // segment.
         "ssm_gated_norm_batch_tok",
+        "ssm_gated_norm_batch_tok_fused",
     };
 
     // SPIR-V is only the Vulkan backend's kernel format. CUDA uses NVRTC `.cu`

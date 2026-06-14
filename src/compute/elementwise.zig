@@ -136,6 +136,7 @@ pub const SsmGatedNormPush = extern struct {
     head_v_dim: u32,
     d_state: u32,
     norm_per_head: u32,
+    n_tok: u32 = 1,
 };
 
 /// Push constants for softmax + top-k MoE router shader.
@@ -397,6 +398,9 @@ pub const ElementwiseDispatch = struct {
     /// instead of dispatching the per-token loop from the host. Used by
     /// prefillQwen36RunSsmLayerToFfnNorm when n_tokens > 1.
     pipeline_ssm_gated_norm_batch_tok: ?Pipeline,
+    /// Fused token-loop variant: each WG processes one head across ALL tokens
+    /// (grid is (dt_rank, 1, 1)), eliminating per-token WG launch overhead.
+    pipeline_ssm_gated_norm_batch_tok_fused: ?Pipeline,
     /// SOFTMAX TOPK pipeline, or null.
     pipeline_softmax_topk: ?Pipeline,
     /// SOFTMAX TOPK v2 (subgroup-parallel reduction), or null.
@@ -689,6 +693,13 @@ pub const ElementwiseDispatch = struct {
         if (pipeline_ssm_gated_norm_batch_tok != null) {
             log.info("ssm_gated_norm_batch_tok pipeline loaded (Qwen3.6-27B SSM gated norm token-batched dispatch)", .{});
         }
+        // Fused token-loop variant: one WG per head, all tokens processed
+        // internally via n_tok push constant.
+        const gnorm_batch_tok_fused_path = std.fmt.bufPrint(&path_buf, "{s}/ssm_gated_norm_batch_tok_fused.spv", .{shader_dir}) catch unreachable;
+        const pipeline_ssm_gated_norm_batch_tok_fused = pipeline_mod.createFromSpirvWithOptions(instance, gnorm_batch_tok_fused_path, 4, @sizeOf(SsmGatedNormPush), &.{}, push_wave64_options, allocator) catch |err| blk: {
+            log.warn("ssm_gated_norm_batch_tok_fused shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         // Softmax + top-k: 2 bindings (logits, output)
         const topk_path = std.fmt.bufPrint(&path_buf, "{s}/softmax_topk.spv", .{shader_dir}) catch unreachable;
@@ -901,6 +912,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_ssm_delta_net_cols8_normed = pipeline_ssm_delta_net_cols8_normed,
             .pipeline_ssm_gated_norm = pipeline_ssm_gated_norm,
             .pipeline_ssm_gated_norm_batch_tok = pipeline_ssm_gated_norm_batch_tok,
+            .pipeline_ssm_gated_norm_batch_tok_fused = pipeline_ssm_gated_norm_batch_tok_fused,
             .pipeline_softmax_topk = pipeline_softmax_topk,
             .pipeline_softmax_topk_v2 = pipeline_softmax_topk_v2,
             .pipeline_softmax_top1 = pipeline_softmax_top1,
@@ -1431,6 +1443,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_ssm_delta_net_cols8_normed) |*p| p.deinit();
         if (self.pipeline_ssm_gated_norm) |*p| p.deinit();
         if (self.pipeline_ssm_gated_norm_batch_tok) |*p| p.deinit();
+        if (self.pipeline_ssm_gated_norm_batch_tok_fused) |*p| p.deinit();
         if (self.pipeline_softmax_topk) |*p| p.deinit();
         if (self.pipeline_softmax_topk_v2) |*p| p.deinit();
         if (self.pipeline_softmax_top1) |*p| p.deinit();
