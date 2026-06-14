@@ -268,25 +268,35 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
 
     const pf_batched = batchedPrefillDefaultOn();
 
-    var seq_it = std.mem.splitScalar(u8, seqs_arg, '|');
+    const MAXB = 8; // max concurrent sequences in this harness
+    const MAXP = 256; // max prompt tokens / sequence
+    const MAXG = 64; // max generated tokens / sequence
+    var prompts: [MAXB][MAXP]u32 = undefined;
+    var plens: [MAXB]usize = undefined;
+    var serial_out: [MAXB][MAXG]u32 = undefined; // production single-seq reference (decodeStep)
     var nseq: u32 = 0;
+    const ng = @min(ngen, @as(u32, MAXG));
+
+    var seq_it = std.mem.splitScalar(u8, seqs_arg, '|');
     while (seq_it.next()) |seq_str| {
+        if (nseq >= MAXB) break;
         const seq_trim = std.mem.trim(u8, seq_str, " ");
         if (seq_trim.len == 0) continue;
 
-        var prompt_buf: [256]u32 = undefined;
         var np: usize = 0;
         var it = std.mem.splitScalar(u8, seq_trim, ',');
         while (it.next()) |s| {
             const t = std.mem.trim(u8, s, " ");
-            if (t.len == 0 or np >= prompt_buf.len) continue;
-            prompt_buf[np] = try std.fmt.parseInt(u32, t, 10);
+            if (t.len == 0 or np >= MAXP) continue;
+            prompts[nseq][np] = try std.fmt.parseInt(u32, t, 10);
             np += 1;
         }
         if (np == 0) continue;
-        const prompt = prompt_buf[0..np];
+        plens[nseq] = np;
+        const prompt = prompts[nseq][0..np];
 
-        // Prefill (mirror genMode): batched-GEMM prefill for gemma, else per-token.
+        // SERIAL REFERENCE: generate this sequence on its own via the production
+        // single-sequence path (prefillBatched + decodeStep over the shared cache).
         var pos: u32 = 0;
         var tok: u32 = 0;
         var used_batched = false;
@@ -303,12 +313,13 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                 pos += 1;
             }
         }
-
+        serial_out[nseq][0] = tok;
         std.debug.print("BATCH_SEQ{d}:{d}", .{ nseq, tok });
-        var g: u32 = 1;
-        while (g < ngen) : (g += 1) {
+        var gi: u32 = 1;
+        while (gi < ng) : (gi += 1) {
             const next = try fwd.decodeStep(tok, pos, true);
             pos += 1;
+            serial_out[nseq][gi] = next;
             std.debug.print(",{d}", .{next});
             tok = next;
         }
@@ -316,20 +327,133 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
         nseq += 1;
     }
 
-    // Slot-KV plumbing smoke (gemma): one slot per sequence (>=1), modest ctx.
+    // Slot-KV smoke + the sub-step 1b batched-DECODE proof (gemma DENSE only).
     switch (fwd) {
         .gemma => |*g| {
-            const slots = if (nseq == 0) 1 else nseq;
-            try g.allocSlotKv(slots, 512);
+            const slot_ctx: u32 = 512;
+            const slots_n = if (nseq == 0) 1 else nseq;
+            try g.allocSlotKv(slots_n, slot_ctx);
+            defer g.freeSlotKv();
             const ok = g.slotKvSmoke() catch |e| {
                 std.debug.print("SLOTKV_SMOKE:ERR {s}\n", .{@errorName(e)});
-                g.freeSlotKv();
                 return;
             };
-            std.debug.print("SLOTKV_SMOKE:{s} (slots={d} slot_ctx=512)\n", .{ if (ok) "ok" else "FAIL", slots });
-            g.freeSlotKv();
+            std.debug.print("SLOTKV_SMOKE:{s} (slots={d} slot_ctx={d})\n", .{ if (ok) "ok" else "FAIL", slots_n, slot_ctx });
+            if (nseq == 0 or g.d.n_experts > 0) {
+                std.debug.print("BATCHDEC:skip ({s})\n", .{if (g.d.n_experts > 0) "MoE — increment 1 is dense gemma" else "no sequences"});
+                return;
+            }
+
+            // The smoke wrote sentinels into layer-0's K slot — realloc clean KV so
+            // every sequence's history starts fresh (each reads only what it wrote).
+            try g.allocSlotKv(nseq, slot_ctx);
+
+            // PASS A — SOLO: run each sequence ALONE through decodeBatch (B=1) into
+            // its own slot. This is the same numeric path as the batched run, so the
+            // batched output must equal it token-for-token (the isolation gate). It
+            // is also the "B=1 decodeBatch == gen" sanity vs serial_out.
+            var solo_out: [MAXB][MAXG]u32 = undefined;
+            var j: u32 = 0;
+            while (j < nseq) : (j += 1) {
+                const np = plens[j];
+                var pos: u32 = 0;
+                var tok: u32 = 0;
+                var k: usize = 0;
+                while (k < np) : (k += 1) { // per-token B=1 prefill into slot j
+                    var tk = [_]u32{prompts[j][k]};
+                    var ps = [_]u32{pos};
+                    var sl = [_]u32{j};
+                    var ot = [_]u32{0};
+                    try g.decodeBatch(&tk, &ps, &sl, &ot);
+                    tok = ot[0];
+                    pos += 1;
+                }
+                solo_out[j][0] = tok;
+                var s: u32 = 1;
+                while (s < ng) : (s += 1) {
+                    var tk = [_]u32{tok};
+                    var ps = [_]u32{pos};
+                    var sl = [_]u32{j};
+                    var ot = [_]u32{0};
+                    try g.decodeBatch(&tk, &ps, &sl, &ot);
+                    tok = ot[0];
+                    pos += 1;
+                    solo_out[j][s] = tok;
+                }
+            }
+
+            // PASS B — BATCHED: reset the slots, prefill each into its slot (B=1),
+            // then decode ALL sequences TOGETHER each step (mixed positions, since
+            // prompt lengths differ). This exercises per-sequence positions/slots.
+            try g.allocSlotKv(nseq, slot_ctx);
+            var batched_out: [MAXB][MAXG]u32 = undefined;
+            var cur_tok: [MAXB]u32 = undefined;
+            var cur_pos: [MAXB]u32 = undefined;
+            j = 0;
+            while (j < nseq) : (j += 1) {
+                const np = plens[j];
+                var pos: u32 = 0;
+                var tok: u32 = 0;
+                var k: usize = 0;
+                while (k < np) : (k += 1) {
+                    var tk = [_]u32{prompts[j][k]};
+                    var ps = [_]u32{pos};
+                    var sl = [_]u32{j};
+                    var ot = [_]u32{0};
+                    try g.decodeBatch(&tk, &ps, &sl, &ot);
+                    tok = ot[0];
+                    pos += 1;
+                }
+                batched_out[j][0] = tok;
+                cur_tok[j] = tok;
+                cur_pos[j] = pos;
+            }
+            var step: u32 = 1;
+            while (step < ng) : (step += 1) {
+                var tks: [MAXB]u32 = undefined;
+                var pss: [MAXB]u32 = undefined;
+                var sls: [MAXB]u32 = undefined;
+                var out: [MAXB]u32 = undefined;
+                j = 0;
+                while (j < nseq) : (j += 1) {
+                    tks[j] = cur_tok[j];
+                    pss[j] = cur_pos[j];
+                    sls[j] = j;
+                }
+                try g.decodeBatch(tks[0..nseq], pss[0..nseq], sls[0..nseq], out[0..nseq]);
+                j = 0;
+                while (j < nseq) : (j += 1) {
+                    batched_out[j][step] = out[j];
+                    cur_tok[j] = out[j];
+                    cur_pos[j] += 1;
+                }
+            }
+
+            // Emit + compare. GATE: batched == solo (same numeric path → isolation
+            // proof). SANITY: solo == serial (decodeBatch B=1 == production gen).
+            var gate_pass = true;
+            var sanity_pass = true;
+            j = 0;
+            while (j < nseq) : (j += 1) {
+                std.debug.print("BATCHDEC_SEQ{d}:{d}", .{ j, batched_out[j][0] });
+                var s: u32 = 1;
+                while (s < ng) : (s += 1) std.debug.print(",{d}", .{batched_out[j][s]});
+                var gmatch = true;
+                var smatch = true;
+                s = 0;
+                while (s < ng) : (s += 1) {
+                    if (batched_out[j][s] != solo_out[j][s]) gmatch = false;
+                    if (solo_out[j][s] != serial_out[j][s]) smatch = false;
+                }
+                if (!gmatch) gate_pass = false;
+                if (!smatch) sanity_pass = false;
+                std.debug.print(" [gate={s} sanity={s}]\n", .{ if (gmatch) "MATCH" else "DIFF", if (smatch) "MATCH" else "DIFF" });
+            }
+            std.debug.print("BATCH_GATE:{s} BATCH_SANITY:{s} (nseq={d} ngen={d})\n", .{ if (gate_pass) "PASS" else "FAIL", if (sanity_pass) "PASS" else "FAIL", nseq, ng });
         },
-        else => {},
+        else => {
+            std.debug.print("BATCHDEC:skip (qwen — increment 4)\n", .{});
+        },
     }
 }
 
