@@ -52,3 +52,20 @@ not fake a qwen win.
   `metal: batch Qwen 9B queued prefill chunks`). CUDA qwen batched prefill needs a
   batched SSM scan prereq that is not on main → do NOT wire / fake it. Re-check next
   cycle: `git grep prefillBatched origin/main -- src/compute/forward_cuda.zig`.
+- 2026-06-13 — **STATUS / GATE-RECHECK cycle — both targets resolved, no new commit
+  (honest no-op, per hard rules).** `git fetch` → `origin/main` UNCHANGED (still
+  `497768bb`); `git grep prefillBatched origin/main -- src/compute/forward_cuda.zig`
+  → **still NONE** (qwen CUDA forward still per-token-only; parallel Qwen prefill
+  remains Metal-only) → **Target 2 STILL BLOCKED**, not wired/faked. **Target 1
+  CONFIRMED LANDED**: HEAD `40c8c7f5` == `origin/perf/e25-prefill-default` (pushed),
+  branch 2-ahead/0-behind `origin/main`. Re-verified the landed default-on wiring is
+  sound + additive: `main.zig:1705 batchedPrefillDefaultOn()` (true unless
+  `0/off/false/no`), call site `main.zig:1766` comptime-gates
+  `@hasDecl(.,"prefillBatched")` (qwen compiles → per-token fallback) with a
+  `prompt_tokens.len > 1` guard and a clean `!used_batched` per-token fallback;
+  `dbg_cuda.zig` mirrors via `error.Unsupported`. No source change this cycle →
+  rebuilding the unchanged HEAD would reproduce last cycle's identical binary +
+  5/5 gate (pure redundant box cost, no new info) → NOT rebuilt. **Effort 25 is
+  complete to the extent legitimately possible: Target 1 shipped (production default,
+  gated 5/5, pushed); Target 2 gated on an absent main prereq.** STOP. Re-check
+  Target 2 again next cycle with the same `git grep`.
