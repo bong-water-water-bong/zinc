@@ -29,6 +29,56 @@ direct_compute_ops=2 direct_compute_kind=argmax_rms_norm_elem0
 So the 80 tok/s result is a bring-up metric, not proof that M2/M3 decode is
 near Vulkan. It exercises CPU-side decode with two tiny direct compute probes.
 
+## 2026-06-14 Re-baseline (shortcut-free) + resident-weight pivot
+
+Hands-on re-baseline this session (`--dry-run`, runs/bin=3, `/root/zinc-rdna1-m1`,
+Qwen3.6-35B-A3B, full LM head, no row cap / no top-k clamp):
+
+```
+vulkan:  109.8 tok/s   (samples 128.4 / 109.8 / 97.5, coherent)
+zinc_rt:  34.3 tok/s   (34.3 / 35.4 / 34.1, coherent)
+ratio:    0.312
+```
+
+The 80 tok/s / 0.70 in "Current Standing" was shortcut-inflated. The honest
+MIGRATE standing is **~0.31**.
+
+**Root cause (verified in `src/compute/forward_zinc_rt.zig`):** the bulk Q4_K
+matvecs (`matvecRaw`/`matvecTensor`/`matvecFusedTensors` — MoE gate/up/down,
+attn projections, LM head) run on the CPU thread pool (`state.pool`). The GPU
+only runs tiny LM-head argmax validation slices. Decode is CPU-DRAM-bandwidth
+bound (~3B active Q4_K bytes/token → ~35 tok/s ≈ CPU BW ceiling).
+
+**DO NOT (new anti-pattern):** route bulk decode matvecs through the existing
+`dmmvQ4_0RowRangeParallel` as-is. It re-stages the weight bytes into `input_map`
+**every call** (`cs.zig:1866`) and is capped at **64 rows per submit-and-wait**.
+Per token that is a full weight re-upload + ~33 µs submit × ~1400 matvecs →
+**slower than the CPU pool**. This is exactly the scalar-plateau trap; verified
+by code inspection.
+
+**The lever = resident weights + batched submit:**
+1. Weights resident in VRAM (own BO, uploaded once at load — not re-staged per call).
+2. Grid-over-rows: workgroup `g` handles rows `[g*64, (g+1)*64)` reading
+   `weight_va + g*64*row_bytes`; dispatch `grid=(ceil(rows/64),1,1)` → ONE submit
+   per matvec. (The parallel template avoided multi-WG TGID delivery — validate
+   it on gfx1201; if TGID is unreliable, fall back to a few single-WG chunk
+   dispatches, still one upload.)
+3. Per token: upload only the input activation (`cols*4` B), read back outputs.
+
+**First target = LM head.** ~half the per-token DRAM bytes (design doc §0), one
+matvec/token (amortizes the single submit cleanly), `Model.lm_head_q4_0` blob
+already built at load, already partially GPU-wired (`dmmvQ4_0ArgmaxRowRange`).
+Rough budget: 384 MB Q4_0 head ≈ 7.7 ms on CPU (~50 GB/s) → ~0.7 ms on GPU
+(576 GB/s) → ~+30% decode if the submit is amortized.
+
+**Cycle-1 steps:** (a) add a resident weight BO to `TokenBoundary` + upload the
+head once; (b) new `dmmv_q4_0_resident_grid.s` (parallel template + resident
+weight ptr in user_data + `workgroup_id_x` row-block offset), embed in `cs.zig`;
+(c) `dmmvQ4_0Resident(input, rows, cols, output)` boundary method; (d) validate
+**bit-exact vs the CPU LM-head matvec** before consuming; (e) consume in decode,
+keep coherence, A/B vs Vulkan, keep iff ratio↑ + coherent. Cycle 2 = native
+K-parallel **Q4_K** resident kernel (§806) for the gate/up experts that stay Q4_K.
+
 ## Profiling Snapshot
 
 Remote node: R9700 RDNA4 / gfx1201, Linux 6.17, Zig 0.15.2. Measurements were
