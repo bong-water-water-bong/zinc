@@ -2893,6 +2893,19 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                 profile.qwen35_dense_prefill_replay_graph_full_attn_runs,
                 @as(f64, @floatFromInt(profile.qwen35_dense_prefill_replay_layers)) / @as(f64, @floatFromInt(profile.qwen35_dense_prefill_replay_graph_runs)),
             });
+            log.info("  {s} qwen35-9b llama graph run split: ssm runs {d} avg_layers {d:.1} layer_tokens/run {d:.1} bytes/run projection {d:.2} GiB dense_ffn {d:.2} GiB | full_attn runs {d} avg_layers {d:.1} layer_tokens/run {d:.1} bytes/run projection {d:.2} GiB dense_ffn {d:.2} GiB", .{
+                label,
+                profile.qwen35_dense_prefill_replay_graph_ssm_runs,
+                avgCount(profile.qwen35_dense_prefill_replay_ssm_layers, profile.qwen35_dense_prefill_replay_graph_ssm_runs),
+                avgCount(profile.qwen35_dense_prefill_replay_ssm_layer_tokens, profile.qwen35_dense_prefill_replay_graph_ssm_runs),
+                avgGiB(profile.qwen35_dense_prefill_remaining_replay_ssm_projection_bytes, profile.qwen35_dense_prefill_replay_graph_ssm_runs),
+                avgGiB(profile.qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes, profile.qwen35_dense_prefill_replay_graph_ssm_runs),
+                profile.qwen35_dense_prefill_replay_graph_full_attn_runs,
+                avgCount(profile.qwen35_dense_prefill_replay_full_attn_layers, profile.qwen35_dense_prefill_replay_graph_full_attn_runs),
+                avgCount(profile.qwen35_dense_prefill_replay_full_attn_layer_tokens, profile.qwen35_dense_prefill_replay_graph_full_attn_runs),
+                avgGiB(profile.qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes, profile.qwen35_dense_prefill_replay_graph_full_attn_runs),
+                avgGiB(profile.qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes, profile.qwen35_dense_prefill_replay_graph_full_attn_runs),
+            });
         }
         const replay_dispatch_calls = profile.queued_prefill_async_dispatch_calls +| profile.queued_prefill_final_dispatch_calls;
         const replay_barrier_calls = profile.queued_prefill_async_barrier_calls +| profile.queued_prefill_final_barrier_calls;
