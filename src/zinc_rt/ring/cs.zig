@@ -878,6 +878,19 @@ pub const PendingDmmvQ4_0RowRangeParallelChunks = struct {
     }
 };
 
+/// Q4_0 row window staged once into the long-lived CS input BO.
+///
+/// This is still GTT-backed bring-up memory, not the final device-local weight
+/// residency model, but it lets the executed M1 LM-head proof stop copying the
+/// same weight rows into the dispatch scratch on every run.
+pub const ResidentDmmvQ4_0Rows = struct {
+    weight_off: usize,
+    rows: u32,
+    cols: u32,
+    row_bytes: usize,
+    bytes: usize,
+};
+
 /// Outcome classification for the CS bring-up smoke gate.
 /// Each variant maps to a specific failure point in the open → submit → wait
 /// pipeline, so the benchmark UI can attribute a regression to render-node
@@ -2095,6 +2108,58 @@ pub const TokenBoundary = struct {
         try pending.finish(output);
     }
 
+    /// Stage a Q4_0 row window into the high end of the long-lived input BO.
+    ///
+    /// The returned handle is valid until another caller overwrites the same
+    /// resident region. Default M1 generation uses it for the first LM-head
+    /// prefix proof, before any broad validation slices can reuse the scratch.
+    pub fn stageDmmvQ4_0RowsResident(
+        self: *TokenBoundary,
+        weights_q4_0: []const u8,
+        rows: u32,
+        cols: u32,
+    ) !ResidentDmmvQ4_0Rows {
+        if (rows == 0 or rows % 64 != 0 or cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
+        const row_bytes: usize = (@as(usize, cols) / 32) * 18;
+        const weights_bytes = @as(usize, rows) * row_bytes;
+        if (weights_q4_0.len < weights_bytes) return error.ShapeMismatch;
+        if (weights_bytes > self.input_map.len) return error.InputTooLarge;
+
+        const unaligned_off = self.input_map.len - weights_bytes;
+        const weight_off = unaligned_off - (unaligned_off % 64);
+        if (weight_off == 0) return error.InputTooLarge;
+
+        @memcpy(self.input_map[weight_off..][0..weights_bytes], weights_q4_0[0..weights_bytes]);
+        storeFence();
+        return .{
+            .weight_off = weight_off,
+            .rows = rows,
+            .cols = cols,
+            .row_bytes = row_bytes,
+            .bytes = weights_bytes,
+        };
+    }
+
+    /// Dispatch a previously staged resident Q4_0 row window.
+    ///
+    /// Only the activation vector is copied for this submission; PM4 points the
+    /// shader at the resident weight VA in the shared input BO.
+    pub fn beginDmmvQ4_0RowRangeParallelChunksResident(
+        self: *TokenBoundary,
+        input: []const f32,
+        resident: ResidentDmmvQ4_0Rows,
+    ) !PendingDmmvQ4_0RowRangeParallelChunks {
+        if (resident.weight_off + resident.bytes > self.input_map.len) return error.InputTooLarge;
+        return self.beginDmmvQ4_0RowRangeParallelChunksAtWeightVa(
+            input,
+            resident.rows,
+            resident.cols,
+            resident.row_bytes,
+            self.input_va + @as(u64, resident.weight_off),
+            resident.weight_off,
+        );
+    }
+
     /// Submit one or more 64-row wave-lane Q4_0 chunks and return before
     /// waiting for the CS fence. The shared input/output/signal maps and PM4
     /// builder must not be reused until the returned dispatch is finished.
@@ -2114,10 +2179,35 @@ pub const TokenBoundary = struct {
         const input_bytes = std.mem.sliceAsBytes(input[0..cols]);
         const weight_off = std.mem.alignForward(usize, input_bytes.len, 64);
         if (weight_off + weights_bytes > self.input_map.len) return error.InputTooLarge;
+
+        @memcpy(self.input_map[weight_off..][0..weights_bytes], weights_q4_0[0..weights_bytes]);
+        return self.beginDmmvQ4_0RowRangeParallelChunksAtWeightVa(
+            input,
+            rows,
+            cols,
+            row_bytes,
+            self.input_va + @as(u64, weight_off),
+            weight_off,
+        );
+    }
+
+    fn beginDmmvQ4_0RowRangeParallelChunksAtWeightVa(
+        self: *TokenBoundary,
+        input: []const f32,
+        rows: u32,
+        cols: u32,
+        row_bytes: usize,
+        weight_va: u64,
+        scratch_weight_off: usize,
+    ) !PendingDmmvQ4_0RowRangeParallelChunks {
+        if (rows == 0 or rows % 64 != 0 or cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
+        if (input.len < cols) return error.ShapeMismatch;
+
+        const input_bytes = std.mem.sliceAsBytes(input[0..cols]);
+        if (input_bytes.len > scratch_weight_off) return error.InputTooLarge;
         if (@as(usize, rows) * @sizeOf(f32) > self.output_map.len) return error.OutputTooLarge;
 
         @memcpy(self.input_map[0..input_bytes.len], input_bytes);
-        @memcpy(self.input_map[weight_off..][0..weights_bytes], weights_q4_0[0..weights_bytes]);
 
         const output_words: [*]volatile u32 = @ptrCast(@alignCast(self.output_map.ptr));
         const signal_words: [*]volatile u32 = @ptrCast(@alignCast(self.signal_map.ptr));
@@ -2148,7 +2238,6 @@ pub const TokenBoundary = struct {
 
         const in_lo: u32 = @truncate(self.input_va);
         const in_hi: u32 = @truncate(self.input_va >> 32);
-        const weight_va = self.input_va + @as(u64, weight_off);
         var row_start: u32 = 0;
         while (row_start < rows) : (row_start += 64) {
             const out_va = self.output_va + @as(u64, row_start) * @sizeOf(f32);
