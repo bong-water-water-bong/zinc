@@ -11549,24 +11549,51 @@ pub const InferenceEngine = struct {
             (K & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q5k != null)
         {
-            try self.dmmv.recordMulMmQ5K(
-                &self.decode_cmd,
-                self.instance.push_descriptor_fn,
-                tensor.gpu_buffer.handle,
-                tensor.gpu_buffer.size,
-                x_buf.handle,
-                x_buf.size,
-                y_buf.handle,
-                y_buf.size,
-                M,
-                n_tokens,
-                K,
-                K, // stride_b: per-col floats in B (one column = K elements)
-                M, // stride_d: per-col floats in D (one column = M elements)
-                0, // a_offset (bytes)
-                0, // b_offset (floats)
-                0, // d_offset (floats)
-            );
+                // Wide (BN=64) variant gated behind ZINC_WIDE_GEMM=1.
+                // Disabled by default: BN=64 halves WG count, reducing
+                // parallelism and latency hiding on this 64-CU GPU.
+                if (n_tokens >= 64 and
+                    std.posix.getenv("ZINC_WIDE_GEMM") != null and
+                    self.dmmv.pipeline_mul_mm_q5k_wide != null)
+            {
+                try self.dmmv.recordMulMmQ5KWide(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    x_buf.handle,
+                    x_buf.size,
+                    y_buf.handle,
+                    y_buf.size,
+                    M,
+                    n_tokens,
+                    K,
+                    K,
+                    M,
+                    0,
+                    0,
+                    0,
+                );
+            } else {
+                try self.dmmv.recordMulMmQ5K(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    x_buf.handle,
+                    x_buf.size,
+                    y_buf.handle,
+                    y_buf.size,
+                    M,
+                    n_tokens,
+                    K,
+                    K, // stride_b: per-col floats in B (one column = K elements)
+                    M, // stride_d: per-col floats in D (one column = M elements)
+                    0, // a_offset (bytes)
+                    0, // b_offset (floats)
+                    0, // d_offset (floats)
+                );
+            }
             return;
         }
         // SSM wqkv Q5_K projection (Qwen3.5-9B): route through the same tiled
@@ -11577,24 +11604,48 @@ pub const InferenceEngine = struct {
             (K & 255) == 0 and
             self.dmmv.pipeline_mul_mm_q5k != null)
         {
-            try self.dmmv.recordMulMmQ5K(
-                &self.decode_cmd,
-                self.instance.push_descriptor_fn,
-                tensor.gpu_buffer.handle,
-                tensor.gpu_buffer.size,
-                x_buf.handle,
-                x_buf.size,
-                y_buf.handle,
-                y_buf.size,
-                M,
-                n_tokens,
-                K,
-                K,
-                M,
-                0,
-                0,
-                0,
-            );
+            if (n_tokens >= 64 and
+                std.posix.getenv("ZINC_WIDE_GEMM") != null and
+                self.dmmv.pipeline_mul_mm_q5k_wide != null)
+            {
+                try self.dmmv.recordMulMmQ5KWide(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    x_buf.handle,
+                    x_buf.size,
+                    y_buf.handle,
+                    y_buf.size,
+                    M,
+                    n_tokens,
+                    K,
+                    K,
+                    M,
+                    0,
+                    0,
+                    0,
+                );
+            } else {
+                try self.dmmv.recordMulMmQ5K(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    x_buf.handle,
+                    x_buf.size,
+                    y_buf.handle,
+                    y_buf.size,
+                    M,
+                    n_tokens,
+                    K,
+                    K,
+                    M,
+                    0,
+                    0,
+                    0,
+                );
+            }
             return;
         }
         if (qwen_a3b_ssm_out_q8_shape and
@@ -16846,24 +16897,51 @@ pub const InferenceEngine = struct {
                 self.dmmv.pipeline_mul_mm_q4k_down_acc != null)
             {
                 const down_matmul_phase = self.beginProfilePhase();
-                try self.dmmv.recordMulMmQ4KDownAcc(
-                    &self.decode_cmd,
-                    self.instance.push_descriptor_fn,
-                    down_t.gpu_buffer.handle,
-                    down_t.gpu_buffer.size,
-                    scratch_swiglu.handle,
-                    scratch_swiglu.size,
-                    target.handle,
-                    target.size,
-                    hidden_dim,
-                    n_tokens,
-                    inter_dim,
-                    inter_dim,
-                    hidden_dim,
-                    0,
-                    0,
-                    0,
-                );
+                // Wide variant disabled: BN=64 halves WG count, reducing
+                // parallelism and latency hiding. Kept as infrastructure for
+                // future cooperative-matrix work. Set ZINC_WIDE_DOWN=1 to test.
+                if (n_tokens >= 64 and
+                    std.posix.getenv("ZINC_WIDE_GEMM") != null and
+                    self.dmmv.pipeline_mul_mm_q4k_down_acc_wide != null)
+                {
+                    try self.dmmv.recordMulMmQ4KDownAccWide(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        down_t.gpu_buffer.handle,
+                        down_t.gpu_buffer.size,
+                        scratch_swiglu.handle,
+                        scratch_swiglu.size,
+                        target.handle,
+                        target.size,
+                        hidden_dim,
+                        n_tokens,
+                        inter_dim,
+                        inter_dim,
+                        hidden_dim,
+                        0,
+                        0,
+                        0,
+                    );
+                } else {
+                    try self.dmmv.recordMulMmQ4KDownAcc(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        down_t.gpu_buffer.handle,
+                        down_t.gpu_buffer.size,
+                        scratch_swiglu.handle,
+                        scratch_swiglu.size,
+                        target.handle,
+                        target.size,
+                        hidden_dim,
+                        n_tokens,
+                        inter_dim,
+                        inter_dim,
+                        hidden_dim,
+                        0,
+                        0,
+                        0,
+                    );
+                }
                 self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
                 return true;
             }

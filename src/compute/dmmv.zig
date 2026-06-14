@@ -526,6 +526,9 @@ pub const DmmvDispatch = struct {
     /// to eliminate the standalone barrier + scale_accumulate dispatch.
     /// Fires for the Qwen3.5-9B whose down_proj is Q4_K.
     pipeline_mul_mm_q4k_down_acc: ?Pipeline,
+    /// Wide-tile (BN=64) variant of the fused-residual Q4_K dense-down GEMM.
+    /// Halves weight VRAM traffic for N=64 prefill (1 WG/M-tile vs 2).
+    pipeline_mul_mm_q4k_down_acc_wide: ?Pipeline,
     /// Batched dense FFN front-end for Qwen3.6-27B: gate/up Q4_K GEMMs plus
     /// SwiGLU in one tiled dispatch.
     pipeline_mul_mm_q4k_gate_up_swiglu: ?Pipeline,
@@ -552,6 +555,9 @@ pub const DmmvDispatch = struct {
     pipeline_mul_mm_q6k_tail8: ?Pipeline,
     /// Tiled Q5_K dense GEMM for Qwen3.6-27B batched SSM out projection prefill.
     pipeline_mul_mm_q5k: ?Pipeline,
+    /// Wide-tile (BN=64) variant of the Q5_K GEMM for SSM projections.
+    /// Halves weight VRAM traffic for N=64 prefill.
+    pipeline_mul_mm_q5k_wide: ?Pipeline,
     /// Tiled Q8_0 dense GEMM for Qwen3.6 A3B batched SSM out projection prefill.
     pipeline_mul_mm_q8_0: ?Pipeline,
     /// int8 DP4a full-tile Q8_0 GEMM over Q8_0-style pre-quantized activations.
@@ -1151,6 +1157,14 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k_down_acc != null) {
             log.info("mul_mm_q4k_down_acc pipeline loaded (fused-residual Q4_K dense-down GEMM)", .{});
         }
+        const mul_mm_q4k_down_acc_wide_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_down_acc_wide.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q4k_down_acc_wide = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_down_acc_wide_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_down_acc_wide shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_down_acc_wide != null) {
+            log.info("mul_mm_q4k_down_acc_wide pipeline loaded (BN=64 fused-residual Q4_K dense-down GEMM)", .{});
+        }
         const mul_mm_q4k_tail8_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_tail8.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q4k_tail8 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_tail8_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_tail8 shader not loaded: {s}", .{@errorName(err)});
@@ -1238,6 +1252,14 @@ pub const DmmvDispatch = struct {
         };
         if (pipeline_mul_mm_q5k != null) {
             log.info("mul_mm_q5k pipeline loaded (Qwen3.6-27B batched Q5_K SSM-out prefill projection)", .{});
+        }
+        const mul_mm_q5k_wide_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q5k_wide.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q5k_wide = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q5k_wide_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q5k_wide shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q5k_wide != null) {
+            log.info("mul_mm_q5k_wide pipeline loaded (BN=64 Q5_K SSM prefill projection)", .{});
         }
         const mul_mm_q8_0_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q8_0.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q8_0 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q8_0_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
@@ -1603,6 +1625,7 @@ pub const DmmvDispatch = struct {
             .pipeline_moe_route_pack = pipeline_moe_route_pack,
             .pipeline_mul_mm_q4k = pipeline_mul_mm_q4k,
             .pipeline_mul_mm_q4k_down_acc = pipeline_mul_mm_q4k_down_acc,
+            .pipeline_mul_mm_q4k_down_acc_wide = pipeline_mul_mm_q4k_down_acc_wide,
             .pipeline_mul_mm_q4k_tail8 = pipeline_mul_mm_q4k_tail8,
             .pipeline_mul_mm_q4k_gate_up_swiglu = pipeline_mul_mm_q4k_gate_up_swiglu,
             .pipeline_mul_mm_q4k_gate_up_geglu = pipeline_mul_mm_q4k_gate_up_geglu,
@@ -1646,6 +1669,7 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q5k_full_dp4a = pipeline_mul_mm_q5k_full_dp4a,
             .pipeline_quantize_act_q8_1 = pipeline_quantize_act_q8_1,
             .pipeline_mul_mm_q5k = pipeline_mul_mm_q5k,
+            .pipeline_mul_mm_q5k_wide = pipeline_mul_mm_q5k_wide,
             .pipeline_mul_mm_q8_0 = pipeline_mul_mm_q8_0,
             .pipeline_mul_mm_q8_0_full_dp4a = pipeline_mul_mm_q8_0_full_dp4a,
             .descriptor_pool = descriptor_pool,
@@ -2452,6 +2476,60 @@ pub const DmmvDispatch = struct {
         );
     }
 
+    /// Wide-tile (BN=64) variant of recordMulMmQ4KDownAcc. Each WG produces a
+    /// 32×64 output tile. Caller must ensure N is a multiple of 64 for full
+    /// efficiency (the shader handles ragged N via bounds checks).
+    pub fn recordMulMmQ4KDownAccWide(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q4k_down_acc_wide) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        // BM=32, BN=64 in the shader.
+        const wg_x = (M + 31) / 32;
+        const wg_y = (N + 63) / 64;
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            wg_x,
+            wg_y,
+            1,
+        );
+    }
+
     /// Tiled Q4_K batched dense FFN front-end: computes silu(gate_weight * B) * (up_weight * B) directly into D.
     /// Ragged (M or N not multiples of 32) shapes are handled by boundary checks in the shader.
     /// @param M Output rows (gate/up weight rows, i.e. inter_dim).
@@ -2921,6 +2999,59 @@ pub const DmmvDispatch = struct {
         };
         const wg_x = (M + 31) / 32;
         const wg_y = (N + 31) / 32;
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            wg_x,
+            wg_y,
+            1,
+        );
+    }
+
+    /// Wide-tile (BN=64) variant of recordMulMmQ5K. Each WG produces a 32×64
+    /// output tile. Halves weight VRAM traffic for N=64 prefill.
+    pub fn recordMulMmQ5KWide(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q5k_wide) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        // BM=32, BN=64 in the shader.
+        const wg_x = (M + 31) / 32;
+        const wg_y = (N + 63) / 64;
         cmd.pushDescAndDispatch(
             pip,
             push_desc_fn,
@@ -4120,6 +4251,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_moe_route_pack) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_down_acc) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_down_acc_wide) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_tail8) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_geglu) |*p| p.deinit();
@@ -4131,6 +4263,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q6k_full_down_acc) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_tail8) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q5k_wide) |*p| p.deinit();
         if (self.pipeline_mul_mm_q8_0) |*p| p.deinit();
         if (self.pipeline_mul_mm_q8_0_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a) |*p| p.deinit();

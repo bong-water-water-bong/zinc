@@ -289,6 +289,7 @@ pub fn build(b: *std.Build) void {
         "mul_mm_q6k_full",
         "mul_mm_q6k_full_down_acc",
         "mul_mm_q4k_down_acc",
+        "mul_mm_q4k_down_acc_wide",
         "mul_mm_q4k_tail8",
         "mul_mm_q4k_gate_up_swiglu_full",
         // Vulkan port of the Metal MoE route-pack kernel; the .comp was added
@@ -302,6 +303,7 @@ pub fn build(b: *std.Build) void {
         // the parity guard flagged them on the next baseline. The loop's
         // commit now also stages build.zig to prevent recurrence.
         "mul_mm_q5k",
+        "mul_mm_q5k_wide",
         "mul_mm_q8_0",
         "mul_mm_q8_0_full_dp4a",
         "mul_mm_q6k_full_dp4a",

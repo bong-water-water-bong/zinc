@@ -1,74 +1,55 @@
 #version 460
-// ZINC — Tiled Q5_K dense GEMM. Mirrors mul_mm_q4k.comp / mul_mm_q6k.comp tile
-// shape (BM=32 × BN=32 × BK=32, TM=TN=4, WG=64) for Qwen3.6-27B layer-major
-// prefill. Targets the SSM out projection:
-//   A[M=hidden_dim, K=d_inner] Q5_K × B[K, N] f32 -> D[M, N] f32.
-// Before this shader, ssm_out (q5_k) was the only batched projection still on
-// the dmmv_q5k one-WG-per-row + subgroup-reduction path; gate/up (q4_k) and
-// down/wqkv (q6_k) already use tiled GEMMs that keep each 32-row weight tile
-// resident in LDS and walk K once per N-tile. Same X/Y layout as
-// recordMulMmQ4K so the host call is identical apart from the pipeline.
+// ZINC — Wide-tile (BN=64) Q5_K dense GEMM. Identical to mul_mm_q5k.comp
+// except BN=64 and TN=8. Each WG produces a 32×64 output tile instead of
+// 32×32, halving weight VRAM traffic for N=64 prefill (1 WG per M-tile
+// instead of 2). Used for SSM out and wqkv projections.
 //
-// Memory layout:
-//   A: M × K Q5_K. Row stride (bytes) = (K/256) × 176. As u32 = (K/256) × 44.
-//      a_offset is in bytes; this shader divides by 4 to index a_u32[].
-//   B: K × N f32 column-major. B[col][k] = b_data[col * stride_b + k].
-//   D: M × N f32 column-major. D[col][row] = d_data[col * stride_d + row].
-//
-// Q5_K super-block (256 elements, 176 bytes = 44 u32):
-//   [0..3]    d(f16) + dmin(f16)          — u32[0]
-//   [4..15]   k_scales (12 bytes)         — u32[1..3]   (same packing as Q4_K)
-//   [16..47]  qh (32 bytes, 1 hi-bit/elt) — u32[4..11]
-//   [48..175] qs (128 bytes, lo nibble)   — u32[12..43]
-// Element value = d * sc[sb] * (qs_nibble + 16 * qh_bit) - dmin * mn[sb],
-// with qh_bit = (qh[p] >> sb) & 1 for sub-block sb and in-sub-block position p.
-// Bit-exact with dmmv_q5k.comp / ggml dequantize_row_q5_K.
+// See mul_mm_q5k.comp for the Q5_K dequant reference and memory layout.
 
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : require
 
 const uint BM = 32u;
-const uint BN = 32u;
+const uint BN = 64u;
 const uint BK = 32u;
 const uint TM = 4u;
-const uint TN = 4u;
+const uint TN = 8u;
 const uint WG_SIZE = 64u;
-const uint TPR_M = BM / TM;          // threads-per-row-axis = 8
-const uint TPR_N = BN / TN;          // threads-per-col-axis = 8
+const uint TPR_M = BM / TM;          // 8
+const uint TPR_N = BN / TN;          // 8
 
 const uint Q5K_BLOCK_U32 = 44u;      // 176 bytes / 4
 
-// +1 stride in K dimension to dodge 32-bank LDS conflicts on RDNA.
 const uint STRIDE_A = BK + 1u;
 const uint STRIDE_B = BK + 1u;
 
 layout(local_size_x = WG_SIZE) in;
 
 layout(push_constant) uniform PushConstants {
-    uint M;          // total output rows
-    uint N;          // total output cols
-    uint K;          // K dim (must be multiple of 256)
-    uint stride_b;   // floats per col of B
-    uint stride_d;   // floats per col of D
-    uint a_offset;   // BYTES — a_offset/4 = u32 index of weights start
-    uint b_offset;   // floats — start of B tensor
-    uint d_offset;   // floats — start of D tensor
+    uint M;
+    uint N;
+    uint K;
+    uint stride_b;
+    uint stride_d;
+    uint a_offset;
+    uint b_offset;
+    uint d_offset;
 };
 
 layout(set = 0, binding = 0) readonly buffer MatA { uint a_u32[]; };
 layout(set = 0, binding = 1) readonly buffer MatB { float b_data[]; };
 layout(set = 0, binding = 2) writeonly buffer MatD { float d_data[]; };
 
-// A-tile stored as f16 (same optimization as mul_mm_q4k_gate_up_swiglu_full):
-// cuts LDS from 8448 → 6336 bytes, lifting occupancy from ~7 to ~10 WGs/CU.
-shared float16_t buf_a[BM * STRIDE_A];
-shared float buf_b[BN * STRIDE_B];
+shared float buf_a[BM * STRIDE_A];
+// B tile stored as f16 to keep total LDS at 8448 bytes (same as BN=32 f32
+// variant), preserving occupancy. Conversion folds into v_fma_mix_f32.
+shared float16_t buf_b[BN * STRIDE_B];
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint ir = gl_WorkGroupID.x;    // M-tile index
-    const uint ic = gl_WorkGroupID.y;    // N-tile index
+    const uint ir = gl_WorkGroupID.x;
+    const uint ic = gl_WorkGroupID.y;
 
     const uint tiwr = tid % TPR_M;       // 0..7
     const uint tiwc = tid / TPR_M;       // 0..7
@@ -85,14 +66,12 @@ void main() {
 
     for (uint k_outer = 0u; k_outer < K; k_outer += BK) {
         const uint super_block = k_outer / 256u;
-        const uint sb_offset = k_outer & 0xFFu;        // K offset within super-block
-        const uint sb = sb_offset >> 5;                // sub-block index, 0..7
-        const uint chunk = sb >> 1;                    // qs chunk, 0..3
-        const uint nibble_choice = sb & 1u;            // 0=low, 1=high
+        const uint sb_offset = k_outer & 0xFFu;
+        const uint sb = sb_offset >> 5;
+        const uint chunk = sb >> 1;
+        const uint nibble_choice = sb & 1u;
 
         // ---- Load A tile (BM × BK = 32 × 32, dequant Q5_K) ----
-        // 64 threads × 16 elements each. Thread t covers row (t/2), K offset
-        // (t%2)*16, length 16, all inside sub-block sb (BK = sub-block size).
         {
             const uint row_local = tid / 2u;
             const uint k_in_tile = (tid & 1u) * 16u;
@@ -104,12 +83,10 @@ void main() {
                     + row_global * blocks_per_row * Q5K_BLOCK_U32
                     + super_block * Q5K_BLOCK_U32;
 
-                // d, dmin from u32[0].
                 const uint d_dmin = a_u32[blk_u32];
                 const float d_val = unpackHalf2x16(d_dmin & 0xFFFFu).x;
                 const float dmin_val = unpackHalf2x16(d_dmin >> 16).x;
 
-                // 12 scale bytes packed into 3 u32s (identical to Q4_K).
                 const uint sc0 = a_u32[blk_u32 + 1u];
                 const uint sc1 = a_u32[blk_u32 + 2u];
                 const uint sc2 = a_u32[blk_u32 + 3u];
@@ -141,9 +118,6 @@ void main() {
                 const float factor = d_val * sc_val;
                 const float bias = dmin_val * mn_val;
 
-                // qs: 16 lo/hi nibbles starting at byte (chunk*32 + k_in_tile),
-                // read as 4 u32. The qs region begins at u32[12]. chunk*32 and
-                // k_in_tile are both multiples of 4 so the index is u32-aligned.
                 const uint qs_byte_base = chunk * 32u + k_in_tile;
                 const uint qs_u32_idx = blk_u32 + 12u + (qs_byte_base >> 2);
                 const uint qs0 = a_u32[qs_u32_idx];
@@ -151,9 +125,6 @@ void main() {
                 const uint qs2 = a_u32[qs_u32_idx + 2u];
                 const uint qs3 = a_u32[qs_u32_idx + 3u];
 
-                // qh: one high bit per element for the same 16 positions, read
-                // as 4 u32. The qh region begins at u32[4]; byte p holds the
-                // high bits for in-sub-block position p, selected by bit sb.
                 const uint qh_u32_idx = blk_u32 + 4u + (k_in_tile >> 2);
                 const uint qh0 = a_u32[qh_u32_idx];
                 const uint qh1 = a_u32[qh_u32_idx + 1u];
@@ -183,13 +154,13 @@ void main() {
 
             const uint base_a = row_local * STRIDE_A + k_in_tile;
             [[unroll]] for (uint i = 0u; i < 16u; i++) {
-                buf_a[base_a + i] = float16_t(vals[i]);
+                buf_a[base_a + i] = vals[i];
             }
         }
 
-        // ---- Load B tile (BN × BK = 32 × 32 floats) ----
-        {
-            const uint col_local = tid / 2u;
+        // ---- Load B tile (BN × BK = 64 × 32 = 2048 floats) ----
+        [[unroll]] for (uint batch = 0u; batch < 2u; batch++) {
+            const uint col_local = batch * 32u + tid / 2u;
             const uint k_in_tile_b = (tid & 1u) * 16u;
             const uint col_global = ic * BN + col_local;
             const bool col_ok = col_global < N;
@@ -199,25 +170,23 @@ void main() {
             [[unroll]] for (uint i = 0u; i < 16u; i++) {
                 float v = 0.0;
                 if (col_ok) {
-                    // Host-side dispatch rejects non-256-aligned K; with BK=32
-                    // this inner index is always in range.
                     v = b_data[b_col_base + k_outer + k_in_tile_b + i];
                 }
-                buf_b[base_b + i] = v;
+                buf_b[base_b + i] = float16_t(v);
             }
         }
 
         barrier();
 
-        // ---- Compute: TM × TN micro-tile per thread ----
+        // ---- Compute: TM × TN = 4 × 8 micro-tile per thread ----
         [[unroll]] for (uint k = 0u; k < BK; k++) {
             float a_reg[TM];
             [[unroll]] for (uint m = 0u; m < TM; m++) {
-                a_reg[m] = float(buf_a[(tiwr * TM + m) * STRIDE_A + k]);
+                a_reg[m] = buf_a[(tiwr * TM + m) * STRIDE_A + k];
             }
             float b_reg[TN];
             [[unroll]] for (uint n = 0u; n < TN; n++) {
-                b_reg[n] = buf_b[(tiwc * TN + n) * STRIDE_B + k];
+                b_reg[n] = float(buf_b[(tiwc * TN + n) * STRIDE_B + k]);
             }
             [[unroll]] for (uint m = 0u; m < TM; m++) {
                 [[unroll]] for (uint n = 0u; n < TN; n++) {
