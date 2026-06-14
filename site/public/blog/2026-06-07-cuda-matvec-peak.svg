@@ -51,19 +51,19 @@
 
       <!-- q4k_fast 72% -> 504px -->
       <rect x="0" y="114" width="504" height="58" rx="6" fill="url(#zinc)"/>
-      <text x="468" y="149" class="value">72%</text>
+      <text x="492" y="149" text-anchor="end" class="value">72%</text>
       <text x="-16" y="140" text-anchor="end" class="label">dmmv_q4k_fast</text>
       <text x="-16" y="160" text-anchor="end" class="sub">header once, float4 loads</text>
 
       <!-- q6k_fast 85% -> 595px -->
       <rect x="0" y="214" width="595" height="58" rx="6" fill="url(#zinc)"/>
-      <text x="559" y="249" class="value">85%</text>
+      <text x="583" y="249" text-anchor="end" class="value">85%</text>
       <text x="-16" y="240" text-anchor="end" class="label">dmmv_q6k_fast</text>
       <text x="-16" y="260" text-anchor="end" class="sub">the real Q6_K LM head</text>
 
       <!-- autotuned 90% -> 630px -->
       <rect x="0" y="314" width="630" height="58" rx="6" fill="url(#zinc)"/>
-      <text x="594" y="349" class="value">90%</text>
+      <text x="618" y="349" text-anchor="end" class="value">90%</text>
       <text x="-16" y="340" text-anchor="end" class="label">autotuned block=64</text>
       <text x="-16" y="360" text-anchor="end" class="sub">1613 GB/s, Q6_K LM head</text>
     </g>

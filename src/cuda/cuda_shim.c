@@ -112,6 +112,22 @@ void cuda_download(CudaCtx* c, CudaBuf* b, void* dst, size_t size) {
     if (!cu_ok(cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream), "cuMemcpyDtoHAsync")) return;
     cuStreamSynchronize(c->stream);
 }
+// Async variants: enqueue the copy on the ctx stream and return WITHOUT syncing.
+// Issued between cuda_graph_begin/end_launch they become memcpy graph nodes, so
+// the embed H2D and argmax D2H ride the single graph launch instead of each
+// costing a WSL2 sync round-trip. Host side must be pinned (cuda_alloc_host).
+void cuda_upload_async(CudaCtx* c, CudaBuf* b, const void* src, size_t size) {
+    cuMemcpyHtoDAsync(b->dptr, src, size, c->stream);
+}
+void cuda_download_async(CudaCtx* c, CudaBuf* b, void* dst, size_t size) {
+    cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream);
+}
+void* cuda_alloc_host(size_t size) {
+    void* p = NULL;
+    if (!cu_ok(cuMemAllocHost(&p, size ? size : 1), "cuMemAllocHost")) return NULL;
+    return p;
+}
+void cuda_free_host(void* p) { if (p) cuMemFreeHost(p); }
 void cuda_free_buffer(CudaBuf* b) {
     if (!b) return;
     if (b->owns && b->dptr) cuMemFree(b->dptr);
@@ -215,3 +231,54 @@ void cuda_commit_and_wait(CudaCmd* m) {
 void cuda_commit_async(CudaCmd* m) { cuEventRecord(m->event, m->stream); }
 void cuda_wait(CudaCmd* m) { cuEventSynchronize(m->event); cuEventDestroy(m->event); free(m); }
 void cuda_release_completed(CudaCmd* m) { if (!m) return; if (m->event) cuEventDestroy(m->event); free(m); }
+
+// ---- CUDA Graphs (decode replay, Effort 25) ---------------------------------
+// See cuda_shim.h. Capture the per-step kernel chain on the ctx stream and
+// replay it as one graph launch — eliminating the per-kernel launch + inter-
+// kernel-bubble latency that dominates the launch-bound decode regime (~10% GPU
+// util). The exec is cached and updated in place across steps; on an update
+// failure (e.g. an incompatible structural change) it is re-instantiated from
+// the freshly captured graph, so the launched exec always reflects the current
+// step's parameters and is bit-identical to the un-captured chain.
+struct CudaGraph { CUgraphExec exec; int have_exec; };
+
+CudaGraph* cuda_graph_create(void) {
+    CudaGraph* g = (CudaGraph*)calloc(1, sizeof *g);
+    if (!g) { set_err("cuda_graph_create", "oom"); return NULL; }
+    return g;
+}
+int cuda_graph_begin(CudaCtx* c) {
+    cuCtxSetCurrent(c->ctx);
+    return cu_ok(cuStreamBeginCapture(c->stream, CU_STREAM_CAPTURE_MODE_RELAXED), "cuStreamBeginCapture");
+}
+int cuda_graph_end_launch(CudaCtx* c, CudaGraph* g) {
+    CUgraph graph = NULL;
+    if (!cu_ok(cuStreamEndCapture(c->stream, &graph), "cuStreamEndCapture")) return 0;
+    if (g->have_exec) {
+        // Topology is invariant across decode steps (same layers/kernels/order);
+        // only per-token push-constant scalars change → an in-place exec update
+        // is cheap. If the update is rejected, fall back to a re-instantiate.
+        CUgraphExecUpdateResultInfo info;
+        memset(&info, 0, sizeof info);
+        if (cuGraphExecUpdate(g->exec, graph, &info) != CUDA_SUCCESS) {
+            cuGraphExecDestroy(g->exec);
+            g->have_exec = 0;
+        }
+    }
+    if (!g->have_exec) {
+        if (!cu_ok(cuGraphInstantiate(&g->exec, graph, 0), "cuGraphInstantiate")) {
+            cuGraphDestroy(graph);
+            return 0;
+        }
+        g->have_exec = 1;
+    }
+    cuGraphDestroy(graph);
+    int ok = cu_ok(cuGraphLaunch(g->exec, c->stream), "cuGraphLaunch");
+    cuStreamSynchronize(c->stream);
+    return ok;
+}
+void cuda_graph_free(CudaGraph* g) {
+    if (!g) return;
+    if (g->have_exec) cuGraphExecDestroy(g->exec);
+    free(g);
+}

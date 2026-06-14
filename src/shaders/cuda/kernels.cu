@@ -195,6 +195,107 @@ extern "C" __global__ void rms_norm_residual_scale(const float* x, const float* 
     }
 }
 
+// ---- rms_norm_residual_norm / rms_norm_residual_scale_norm ------------------
+// Fuse a block's INPUT rms_norm into the PRECEDING block's output norm+residual.
+// On the dense gemma path each layer runs four single-block n_embd reductions:
+//   pre-attn rms_norm -> ... -> post-attn rms_norm_residual (writes hidden) ->
+//   pre-ffn  rms_norm -> ... -> post-ffn  rms_norm_residual_scale (writes hidden)
+// A post-norm-residual's `hidden` is exactly the input the very next pre-norm
+// reads, and both are ONE-block (grid {1,1,1}) reductions over the same n_embd
+// vector — so the next pre-norm can run in the SAME launch, right after the
+// residual add (a __syncthreads makes the just-written `hidden` visible to the
+// phase-2 reduction). This removes one tiny launch per norm boundary:
+//   post-attn-residual + pre-ffn-norm  (within the layer)
+//   post-ffn-residual  + pre-attn-norm (across the layer boundary, into the
+//                                        NEXT layer's `attn_norm.weight`)
+// = ~2 launches/layer on the dense gemma-31b decode path (~119/token over 60
+// layers; only layer 0's pre-attn norm and the last layer's post-ffn stay
+// standalone). BIT-IDENTICAL to the two-kernel path: phase 1 is the exact
+// rms_norm_residual[_scale] arithmetic (same FMA, same reduction), phase 2 is
+// the exact rms_norm arithmetic re-reading `hidden` from global — the same
+// values the standalone pre-norm would have read. The intervening __syncthreads
+// barriers also make reusing zinc_block_reduce_sum's shared scratch race-free.
+extern "C" __global__ void rms_norm_residual_norm(
+    const float* x, const float* w_post, float* hidden,
+    const float* w_pre, float* pre_out, RmsPush pc) {
+    unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float* ht = hidden + (size_t)token * pc.N;
+    float* pt = pre_out + (size_t)token * pc.N;
+
+    // phase 1: post-norm + residual (identical to rms_norm_residual)
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        ht[i] += w_post[i] * (xt[i] * rinv);
+    }
+    __syncthreads(); // hidden fully written + visible before phase-2 reduction
+
+    // phase 2: pre-norm of the updated residual (identical to rms_norm)
+    float ss2 = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = ht[i];
+        ss2 += v * v;
+    }
+    ss2 = zinc_block_reduce_sum(ss2);
+    __shared__ float rms_inv_sh2;
+    if (threadIdx.x == 0) rms_inv_sh2 = rsqrtf(ss2 / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv2 = rms_inv_sh2;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        pt[i] = w_pre[i] * (ht[i] * rinv2);
+    }
+}
+
+extern "C" __global__ void rms_norm_residual_scale_norm(
+    const float* x, const float* w_post, float* hidden, const float* s,
+    const float* w_pre, float* pre_out, RmsPush pc) {
+    unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float* ht = hidden + (size_t)token * pc.N;
+    float* pt = pre_out + (size_t)token * pc.N;
+
+    // phase 1: post-norm + residual + per-layer output scale (== rms_norm_residual_scale)
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    float scale = s[0];
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        ht[i] = (ht[i] + w_post[i] * (xt[i] * rinv)) * scale;
+    }
+    __syncthreads(); // hidden fully written + visible before phase-2 reduction
+
+    // phase 2: pre-norm of the updated residual (identical to rms_norm)
+    float ss2 = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = ht[i];
+        ss2 += v * v;
+    }
+    ss2 = zinc_block_reduce_sum(ss2);
+    __shared__ float rms_inv_sh2;
+    if (threadIdx.x == 0) rms_inv_sh2 = rsqrtf(ss2 / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv2 = rms_inv_sh2;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        pt[i] = w_pre[i] * (ht[i] * rinv2);
+    }
+}
+
 // ---- rms_norm_rope ----------------------------------------------------------
 // Fused gemma per-head Q/K norm + RoPE: collapses the (per-head rms_norm ->
 // rope) pair into ONE launch, dropping a full head_dim write+read round-trip of
@@ -619,6 +720,43 @@ extern "C" __global__ void argmax(const float* logits, unsigned* token_id, Argma
     }
 }
 
+// ---- embed_lookup_q4k (Effort 25 cycle 5: GPU-side embedding dequant) -------
+// Dequantize one Q4_K row of token_embd.weight (the row for token `tok[0]`) into
+// out[0..K], replacing the per-token CPU dequant + full-row H2D with a GPU
+// dispatch reading the token id from a tiny device buffer (so it captures as the
+// decode graph's first node). Bit-identical math to the CPU `dequantRow` Q4_K
+// path: 144-byte superblocks, d/dmin f16, 12 scale bytes, 128 quant bytes;
+// per 256-block output order [g0_lo32, g0_hi32, g1_lo32, ...], value =
+// (d*sc) * nibble - (dmin*m), scale sub-index = 2*group + half (low/high nibble).
+// Grid: one block per superblock (K/256). Block: 256 threads, one output each.
+struct EmbedPush { unsigned K; unsigned vocab; };
+
+extern "C" __global__ void embed_lookup_q4k(const unsigned char* W,
+                                            const unsigned* tok, float* out,
+                                            EmbedPush pc) {
+    unsigned t = tok[0];
+    unsigned vmax = pc.vocab ? pc.vocab - 1u : 0u;
+    if (t > vmax) t = vmax;
+    unsigned nsb = pc.K >> 8;          // superblocks per row (K / 256)
+    unsigned sb = blockIdx.x;
+    if (sb >= nsb) return;
+    const unsigned char* blk = W + ((size_t)t * nsb + sb) * 144u;
+    float d = zinc_half_to_float(*(const unsigned short*)(blk + 0));
+    float dmin = zinc_half_to_float(*(const unsigned short*)(blk + 2));
+    const unsigned char* scales = blk + 4;
+    const unsigned char* qs = blk + 16;
+    unsigned idx = threadIdx.x;        // 0..255 output element within the superblock
+    if (idx >= 256u) return;
+    unsigned g = idx >> 6;             // group 0..3 (each 64 outputs)
+    unsigned h = (idx >> 5) & 1u;      // 0 = low nibble half, 1 = high nibble half
+    unsigned l = idx & 31u;
+    unsigned char sc, m;
+    zinc_q4k_scale_min((int)(2u * g + h), scales, &sc, &m);
+    unsigned char qb = qs[g * 32u + l];
+    unsigned nib = (h == 0u) ? (qb & 0xFu) : (unsigned)(qb >> 4);
+    out[sb * 256u + idx] = (d * (float)sc) * (float)nib - (dmin * (float)m);
+}
+
 // ---- moe_weighted_acc (port of moe_weighted_acc.comp) -----------------------
 // a[i] += sum_j weight_j * b[j*src_stride + i]. Weights from the softmax_topk
 // routing buffer (routing[n_used .. 2*n_used-1], as float bits).
@@ -882,13 +1020,10 @@ extern "C" __global__ void ssm_delta_net(
 }
 // ---- dmmv_q4k_fast (perf research, 5090) — port of tuned Vulkan dmmv_q4k -----
 // 16 threads per Q4_K superblock: header read once/thread (not 256x), qs read
-// once total, x via float4. Block-reduce over 256 threads = one output row.
-extern "C" __global__ void dmmv_q4k_fast(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
-    unsigned row = blockIdx.x;
-    if (row >= pc.M) return;
-    unsigned bpr = pc.K >> 8;
-    unsigned a_base = (pc.a_offset >> 2) + row * bpr * 36u;
-    const float4* xv = (const float4*)(x + (pc.x_offset >> 2));
+// once total, x via float4. Block-reduce over the block = one output row.
+// The per-row compute is factored into a __device__ helper so the fused dual
+// kernel (dmmv_q4k_fast_dual) shares exactly this arithmetic path (bit-exact).
+__device__ __forceinline__ float zinc_dmmv_q4k_fast_sum(const unsigned* a_u32, unsigned a_base, const float4* xv, unsigned bpr) {
     unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
     unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
     unsigned l0 = 4u * (2u * ir + v_in);
@@ -914,8 +1049,37 @@ extern "C" __global__ void dmmv_q4k_fast(const unsigned* a_u32, const float* x, 
         sum += (f2*(float)(qs1&0xFu)-b2)*by2.x + (f2*(float)((qs1>>8)&0xFu)-b2)*by2.y + (f2*(float)((qs1>>16)&0xFu)-b2)*by2.z + (f2*(float)((qs1>>24)&0xFu)-b2)*by2.w;
         sum += (f3*(float)((qs1>>4)&0xFu)-b3)*by3.x + (f3*(float)((qs1>>12)&0xFu)-b3)*by3.y + (f3*(float)((qs1>>20)&0xFu)-b3)*by3.z + (f3*(float)((qs1>>28)&0xFu)-b3)*by3.w;
     }
-    sum = zinc_block_reduce_sum(sum);
-    if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
+    return zinc_block_reduce_sum(sum);
+}
+
+extern "C" __global__ void dmmv_q4k_fast(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 8;
+    unsigned a_base = (pc.a_offset >> 2) + row * bpr * 36u;
+    const float4* xv = (const float4*)(x + (pc.x_offset >> 2));
+    float sum = zinc_dmmv_q4k_fast_sum(a_u32, a_base, xv, bpr);
+    if (threadIdx.x == 0) { unsigned yi = (pc.y_offset >> 2) + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
+}
+
+// ---- dmmv_q4k_fast_dual — fuse two same-input Q4_K matvecs into ONE launch ----
+// Both weights (a0,a1) share input x and inner dim K; outputs go to y0,y1. Grid
+// is M0+M1 blocks: block bx<M0 computes row bx of a0→y0, else row bx-M0 of a1→y1.
+// Used for the gemma FFN gate/up pair and the attention Q/K pair (both Q4_K, same
+// norm input) to remove one kernel-launch boundary per layer. Each block's work
+// is bit-identical to the standalone dmmv_q4k_fast with zero offsets (no acc).
+struct Dmmv2Push { unsigned M0, M1, K; };
+extern "C" __global__ void dmmv_q4k_fast_dual(const unsigned* a0, const unsigned* a1, const float* x, float* y0, float* y1, Dmmv2Push pc) {
+    unsigned bx = blockIdx.x;
+    if (bx >= pc.M0 + pc.M1) return;
+    unsigned bpr = pc.K >> 8;
+    const unsigned* a; float* y; unsigned row;
+    if (bx < pc.M0) { a = a0; y = y0; row = bx; }
+    else { a = a1; y = y1; row = bx - pc.M0; }
+    unsigned a_base = row * bpr * 36u;
+    const float4* xv = (const float4*)x;
+    float sum = zinc_dmmv_q4k_fast_sum(a, a_base, xv, bpr);
+    if (threadIdx.x == 0) y[row] = sum;
 }
 
 // ---- dmmv_q6k_fast (perf research) — port of tuned Vulkan dmmv_q6k -----------
@@ -2717,6 +2881,89 @@ extern "C" __global__ void rms_norm_kvwrite_batched(const float* v_src, float* v
     size_t base = (size_t)t * pc.dst_stride + (size_t)head * hd;
     for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
         v_dst[base + i] = vh[i] * rinv;
+}
+
+// ---- rms_norm_rope_qkv (gemma: fuse the per-head V/Q/K norm launches) -------
+// Collapses the THREE per-head norm launches on the gemma attention path into
+// ONE: the V plain-normalize+KV-write (rms_norm_kvwrite), the Q norm+rope, and
+// the K norm+rope (both rms_norm_rope). Grid is n_head + 2*n_kv_head blocks:
+//   block <  n_head                       -> Q head: weighted norm + rope -> q_out (offset 0)
+//   block <  n_head + n_kv_head           -> K head: weighted norm + rope -> k_out at kv_offset
+//   else                                  -> V head: plain norm (no weight, no rope) -> v_out at kv_offset
+// Each branch's arithmetic is COPIED verbatim from the standalone kernels
+// (Q/K from rms_norm_rope, V from rms_norm_kvwrite) so the fused result is
+// bit-identical. No cross-block hazard: K writes kv_k (never k_in), V writes
+// kv_v (never v_in), Q writes q_out in-place per head — no block reads a buffer
+// another block writes. Removes 2 tiny launch boundaries/layer on the gemma
+// attention path (dense + MoE).
+struct RmsRopeQkvPush {
+    unsigned head_dim; float eps; unsigned rope_dim; unsigned position;
+    unsigned n_head; unsigned n_kv_head; unsigned kv_offset;
+};
+extern "C" __global__ void rms_norm_rope_qkv(
+    const float* q_in, const float* k_in, const float* v_in,
+    const float* wq, const float* wk, const float* inv_freq,
+    float* q_out, float* k_out, float* v_out, RmsRopeQkvPush pc)
+{
+    unsigned bx = blockIdx.x;
+    unsigned hd = pc.head_dim;
+    extern __shared__ float sh[]; // hd normalized values (Q/K rope staging)
+
+    const float* xt;
+    float* yt;
+    const float* w;
+    bool do_rope;
+    if (bx < pc.n_head) {
+        unsigned head = bx;
+        xt = q_in + (size_t)head * hd;
+        yt = q_out + (size_t)head * hd;                 // dst_offset 0
+        w = wq; do_rope = true;
+    } else if (bx < pc.n_head + pc.n_kv_head) {
+        unsigned head = bx - pc.n_head;
+        xt = k_in + (size_t)head * hd;
+        yt = k_out + (size_t)pc.kv_offset + (size_t)head * hd;
+        w = wk; do_rope = true;
+    } else {
+        unsigned head = bx - pc.n_head - pc.n_kv_head;
+        xt = v_in + (size_t)head * hd;
+        yt = v_out + (size_t)pc.kv_offset + (size_t)head * hd;
+        w = nullptr; do_rope = false;
+    }
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    if (!do_rope) { // V: plain normalize, no weight (matches rms_norm_kvwrite)
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+            yt[i] = xt[i] * rinv;
+        return;
+    }
+
+    // Q/K: weighted norm into shared, then NEOX partial rope (matches rms_norm_rope)
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    unsigned half_rot = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < half_rot; i += blockDim.x) {
+        float xi = sh[i];
+        float xih = sh[i + half_rot];
+        float theta = (float)pc.position * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i] = xi * ct - xih * st;
+        yt[i + half_rot] = xi * st + xih * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < hd; i += blockDim.x)
+        yt[i] = sh[i];
 }
 
 // ---- geglu (gemma FFN activation: gelu(gate) * up) -------------------------

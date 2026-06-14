@@ -71,6 +71,8 @@ const RmsKvWritePush = extern struct { head_dim: u32, eps: f32, dst_offset: u32 
 // Batched-prefill twins (grid.y = T): explicit per-token src/dst strides.
 const RmsRopeBatchPush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, base_position: u32, src_stride: u32, dst_stride: u32 };
 const RmsKvWriteBatchPush = extern struct { head_dim: u32, eps: f32, src_stride: u32, dst_stride: u32 };
+// Decode fusion: per-head Q/K rms_norm + RoPE + KV-write in one launch.
+const RmsRopeQkvPush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, position: u32, n_head: u32, n_kv_head: u32, kv_offset: u32 };
 const SwigluPush = extern struct { N: u32 };
 const F32ToF16Push = extern struct { N: u32 }; // cycle 12: activation downcast for the TC f16-A GEMM
 const ScaleAccPush = extern struct { N: u32, scale: f32 };
@@ -105,6 +107,8 @@ const GemmPush = extern struct {
     y_offset: u32 = 0,
     acc_mode: u32 = 0,
 };
+// Decode fusion: fused dual Q4_K matvec (two same-input weights → two outputs in one launch).
+const Dmmv2Push = extern struct { M0: u32, M1: u32, K: u32 };
 
 fn dmmvIdx(t: gguf.GGMLType) usize {
     return switch (t) {
@@ -154,12 +158,16 @@ const Pipelines = struct {
     rms_norm_noweight: CudaPipeline,
     rms_norm_residual: CudaPipeline,
     rms_norm_residual_scale: CudaPipeline,
+    rms_norm_residual_norm: CudaPipeline,
+    rms_norm_residual_scale_norm: CudaPipeline,
     rms_norm_rope: CudaPipeline,
+    rms_norm_rope_qkv: CudaPipeline,
     rms_norm_kvwrite: CudaPipeline,
     rms_norm_rope_batched: CudaPipeline,
     rms_norm_kvwrite_batched: CudaPipeline,
     dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
+    dmmv_q4k_fast_dual: CudaPipeline, // fuse gate/up & Q/K same-input Q4_K matvecs
     rope: CudaPipeline,
     gemma_attention: CudaPipeline,
     gemma_attention_batched: CudaPipeline,
@@ -414,7 +422,10 @@ pub const ForwardGemma = struct {
         pipes.rms_norm_noweight = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_noweight");
         pipes.rms_norm_residual = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual");
         pipes.rms_norm_residual_scale = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_scale");
+        pipes.rms_norm_residual_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_norm");
+        pipes.rms_norm_residual_scale_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_residual_scale_norm");
         pipes.rms_norm_rope = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope");
+        pipes.rms_norm_rope_qkv = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope_qkv");
         pipes.rms_norm_kvwrite = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite");
         pipes.rms_norm_rope_batched = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_rope_batched");
         pipes.rms_norm_kvwrite_batched = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_kvwrite_batched");
@@ -428,6 +439,7 @@ pub const ForwardGemma = struct {
         pipes.dmmv_fast[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_fast");
         pipes.dmmv_fast[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_fast");
         pipes.dmmv_fast[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_fast");
+        pipes.dmmv_q4k_fast_dual = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_fast_dual");
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.gemma_attention = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention");
         pipes.gemma_attention_batched = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention_batched");
@@ -1197,36 +1209,44 @@ pub const ForwardGemma = struct {
         const wo = self.layer(L, "attn_output.weight");
         const wpan = self.layer(L, "post_attention_norm.weight");
 
+        // Dense gemma folds each block's INPUT norm into the PRECEDING block's
+        // output norm+residual (see rms_norm_residual_norm). When folding, the
+        // pre-attn norm (norm_buf) is produced by the previous layer's fused
+        // post-ffn kernel — only layer 0 needs the standalone pre-attn norm.
+        const fold = d.n_experts == 0;
+
         var cmd = try command.beginCommand(ctx);
         // pre-attention norm (gemma rms, +1 baked in)
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
-        // Q, K projections; V from Wv if present, else the raw K projection.
-        self.dmmvDispatch(&cmd, wq, &self.norm_buf, &self.q_buf, g.q_dim, d.n_embd, 0, 0);
-        self.dmmvDispatch(&cmd, wk, &self.norm_buf, &self.k_buf, g.kv_dim, d.n_embd, 0, 0);
+        if (!fold or L == 0) {
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        }
+        // Q, K projections; V from Wv if present, else the raw K projection. Q & K
+        // share the pre-attention norm input — when both are Q4_K, fuse the two
+        // matvecs into one launch (q_buf gets the Q rows, k_buf the K rows).
+        if (dmmvIdx(wq.info.type_) == 0 and dmmvIdx(wk.info.type_) == 0) {
+            self.dmmvDualQ4k(&cmd, wq, wk, &self.norm_buf, &self.q_buf, &self.k_buf, g.q_dim, g.kv_dim, d.n_embd);
+        } else {
+            self.dmmvDispatch(&cmd, wq, &self.norm_buf, &self.q_buf, g.q_dim, d.n_embd, 0, 0);
+            self.dmmvDispatch(&cmd, wk, &self.norm_buf, &self.k_buf, g.kv_dim, d.n_embd, 0, 0);
+        }
         const v_src: *const CudaBuffer = if (wv_opt) |wv| blk: {
             self.dmmvDispatch(&cmd, wv, &self.norm_buf, &self.v_buf, g.kv_dim, d.n_embd, 0, 0);
             break :blk &self.v_buf;
         } else &self.k_buf;
-        // Per-head V plain-normalize (no weight) FUSED with the V KV-cache write:
-        // one launch normalizes V and writes it straight into kv_v at this
-        // position (was rms_norm_noweight→v_buf + the V half of kv_cache_write).
-        // Issued before the Q/K norm+rope because v_src may alias k_buf (the
-        // un-normed K projection on full-attention layers) — and rope no longer
-        // overwrites k_buf (K writes straight to its cache), so k_buf stays raw.
+        // Per-head V/Q/K norm FUSED into ONE launch (was 3): V plain-normalize +
+        // KV-write (rms_norm_kvwrite), Q norm+rope, K norm+rope (rms_norm_rope ×2).
+        // Grid = n_head + 2*n_kv_head blocks: Q heads first (norm+rope → q_buf,
+        // offset 0), then K heads (norm+rope → kv_k at pos*kv_dim), then V heads
+        // (plain norm → kv_v at pos*kv_dim). Bit-identical per-branch arithmetic;
+        // no cross-block hazard (K→kv_k, V→kv_v, Q in-place; nobody reads another
+        // block's destination), so v_src aliasing k_buf on full-attention layers is
+        // safe (k_buf is read-only here — K writes straight to its cache).
         const kv_off = pos * g.kv_dim;
-        const rms_kvw = RmsKvWritePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .dst_offset = kv_off };
-        cmd.dispatch(&self.pipes.rms_norm_kvwrite, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ v_src, &self.kv_v[L] }, &rms_kvw, @sizeOf(RmsKvWritePush), 0);
-        // Q/K: per-head rms_norm fused with NEOX RoPE (this layer's inv_freq
-        // table, attn_scale 1.0) — one launch each, no normalized round-trip.
-        // Q stays in q_buf (dst_offset 0); K writes its norm+roped head straight
-        // into kv_k at this position, folding away the K half of kv_cache_write.
         const inv_freq = if (g.is_swa) &self.inv_freq_swa else &self.inv_freq_full;
-        const nr_q = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = 0 };
-        const nr_k = RmsRopePush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .dst_offset = kv_off };
+        const qkv = RmsRopeQkvPush{ .head_dim = g.head_dim, .eps = d.rms_eps, .rope_dim = g.rope_dim, .position = pos, .n_head = d.n_head, .n_kv_head = g.n_kv_head, .kv_offset = kv_off };
         const nr_sh = g.head_dim * @sizeOf(f32);
-        cmd.dispatch(&self.pipes.rms_norm_rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &wqn.gpu_buffer, inv_freq, &self.q_buf }, &nr_q, @sizeOf(RmsRopePush), nr_sh);
-        cmd.dispatch(&self.pipes.rms_norm_rope, .{ g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &wkn.gpu_buffer, inv_freq, &self.kv_k[L] }, &nr_k, @sizeOf(RmsRopePush), nr_sh);
+        cmd.dispatch(&self.pipes.rms_norm_rope_qkv, .{ d.n_head + 2 * g.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.k_buf, v_src, &wqn.gpu_buffer, &wkn.gpu_buffer, inv_freq, &self.q_buf, &self.kv_k[L], &self.kv_v[L] }, &qkv, @sizeOf(RmsRopeQkvPush), nr_sh);
         // attention (scale=1.0, sliding window on SWA layers) → attn_out_buf
         const seq_len = pos + 1;
         const window: u32 = if (g.is_swa) d.sliding_window else 0;
@@ -1243,7 +1263,14 @@ pub const ForwardGemma = struct {
         self.dmmvDispatch(&cmd, wo, &self.attn_out_buf, &self.o_buf, d.n_embd, g.q_dim, 0, 0);
         // post-attention norm (gemma rms) on the attention output, fused with the
         // residual add into `hidden` (scale 1.0) — one launch, no o_buf round-trip.
-        cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
+        // When folding, the SAME launch also produces the pre-ffn norm
+        // (ffn_norm_buf), so ffnBlock skips its standalone pre-ffn norm.
+        if (fold) {
+            const wfn = self.layer(L, "ffn_norm.weight");
+            cmd.dispatch(&self.pipes.rms_norm_residual_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.o_buf, &wpan.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
+        }
         self.submit(cmd);
     }
 
@@ -1261,20 +1288,43 @@ pub const ForwardGemma = struct {
         // self-skips dense layers). Absent → plain rms_norm_residual.
         const wlos = self.model.getLayer(L, "layer_output_scale.weight");
 
+        // Dense gemma folds each block's INPUT norm into the PRECEDING block's
+        // output norm+residual: the pre-ffn norm (ffn_norm_buf) was produced by
+        // this layer's fused post-attn kernel, and this block's post-ffn kernel
+        // produces the NEXT layer's pre-attn norm (norm_buf).
+        const fold = d.n_experts == 0;
+
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-        // pre-ffn norm
-        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
-        // GeGLU FFN: gelu(gate) * up → down
-        self.dmmvDispatch(&cmd, wgate, &self.ffn_norm_buf, &self.gate_buf, d.n_ff, d.n_embd, 0, 0);
-        self.dmmvDispatch(&cmd, wup, &self.ffn_norm_buf, &self.up_buf, d.n_ff, d.n_embd, 0, 0);
+        // pre-ffn norm (skipped when folded — ffn_norm_buf already filled)
+        if (!fold) {
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wfn.gpu_buffer, &self.ffn_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        }
+        // GeGLU FFN: gelu(gate) * up → down. gate & up share the pre-ffn norm
+        // input — when both are Q4_K, fuse the two matvecs into one launch.
+        if (dmmvIdx(wgate.info.type_) == 0 and dmmvIdx(wup.info.type_) == 0) {
+            self.dmmvDualQ4k(&cmd, wgate, wup, &self.ffn_norm_buf, &self.gate_buf, &self.up_buf, d.n_ff, d.n_ff, d.n_embd);
+        } else {
+            self.dmmvDispatch(&cmd, wgate, &self.ffn_norm_buf, &self.gate_buf, d.n_ff, d.n_embd, 0, 0);
+            self.dmmvDispatch(&cmd, wup, &self.ffn_norm_buf, &self.up_buf, d.n_ff, d.n_embd, 0, 0);
+        }
         const sg = SwigluPush{ .N = d.n_ff };
         cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
         self.dmmvDispatch(&cmd, wdown, &self.geglu_buf, &self.down_buf, d.n_embd, d.n_ff, 0, 0);
         // post-ffn norm (gemma rms) on the FFN output, fused with the residual add
         // into `hidden` (scale 1.0) — one launch, no down_buf round-trip. When the
         // per-layer output scale is present it is folded in here too (one launch).
-        if (wlos) |ws| {
+        // When folding and not the last layer, the SAME launch also produces the
+        // NEXT layer's pre-attn norm (norm_buf), so attentionLayer(L+1) skips it.
+        const fold_next = fold and (L + 1 < d.n_layers);
+        if (fold_next) {
+            const wan_next = self.layer(L + 1, "attn_norm.weight");
+            if (wlos) |ws| {
+                cmd.dispatch(&self.pipes.rms_norm_residual_scale_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden, &ws.gpu_buffer, &wan_next.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.rms_norm_residual_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden, &wan_next.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            }
+        } else if (wlos) |ws| {
             cmd.dispatch(&self.pipes.rms_norm_residual_scale, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden, &ws.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
         } else {
             cmd.dispatch(&self.pipes.rms_norm_residual, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.down_buf, &wpfn.gpu_buffer, &self.hidden }, &rms, @sizeOf(RmsPush), 0);
@@ -1717,37 +1767,37 @@ pub const ForwardGemma = struct {
             // self.down_buf aliases this token's b.down_e slice → skip straight to the
             // accumulate. Otherwise compute this token's routed experts in place.
             if (!preexperts) {
-            const gu_half = expertSliceBytes(wgu.info.type_, ef, d.n_embd); // ef rows
-            const gu_full = gu_half * 2; // 2*ef rows per expert
-            const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
-            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wpre2.gpu_buffer, &self.moe_norm_buf }, &rms, @sizeOf(RmsPush), 0);
-            if (batched) {
-                const nrows = n_used * ef;
-                const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = 0 };
-                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
-                const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = gu_half };
-                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
-                const sgb = SwigluPush{ .N = nrows };
-                cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(nrows, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sgb, @sizeOf(SwigluPush), 0);
-                const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0 };
-                cmd.dispatch(&self.pipes.dmmv_q5_1_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
-            } else {
-                const sg = SwigluPush{ .N = ef };
-                var j: u32 = 0;
-                while (j < n_used) : (j += 1) {
-                    const id = self.host_router[j];
-                    self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gu_full);
-                    self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * gu_full + gu_half);
-                    cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
-                    const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
-                    const didx = dmmvIdx(wde.info.type_);
-                    if (didx < 4) {
-                        cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
-                    } else {
-                        cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                const gu_half = expertSliceBytes(wgu.info.type_, ef, d.n_embd); // ef rows
+                const gu_full = gu_half * 2; // 2*ef rows per expert
+                const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
+                cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wpre2.gpu_buffer, &self.moe_norm_buf }, &rms, @sizeOf(RmsPush), 0);
+                if (batched) {
+                    const nrows = n_used * ef;
+                    const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = 0 };
+                    cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
+                    const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = gu_half };
+                    cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                    const sgb = SwigluPush{ .N = nrows };
+                    cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(nrows, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sgb, @sizeOf(SwigluPush), 0);
+                    const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0 };
+                    cmd.dispatch(&self.pipes.dmmv_q5_1_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
+                } else {
+                    const sg = SwigluPush{ .N = ef };
+                    var j: u32 = 0;
+                    while (j < n_used) : (j += 1) {
+                        const id = self.host_router[j];
+                        self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.gate_buf, ef, d.n_embd, 0, id * gu_full);
+                        self.dmmvDispatch(&cmd, wgu, &self.moe_norm_buf, &self.up_buf, ef, d.n_embd, 0, id * gu_full + gu_half);
+                        cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sg, @sizeOf(SwigluPush), 0);
+                        const down_push = DmmvPush{ .M = d.n_embd, .K = ef, .acc_mode = 0, .a_offset = id * down_slice, .y_offset = j * d.n_embd * @sizeOf(f32) };
+                        const didx = dmmvIdx(wde.info.type_);
+                        if (didx < 4) {
+                            cmd.dispatch(&self.pipes.dmmv_fast[didx], .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                        } else {
+                            cmd.dispatch(&self.pipes.dmmv[didx], .{ d.n_embd, 1, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &self.geglu_buf, &self.down_buf }, &down_push, @sizeOf(DmmvPush), 0);
+                        }
                     }
                 }
-            }
             } // end if (!preexperts)
             const zp = ZeroPush{ .N = d.n_embd };
             cmd.dispatch(&self.pipes.zero_vec, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{&self.moe_out_buf}, &zp, @sizeOf(ZeroPush), 0);
@@ -1835,6 +1885,16 @@ pub const ForwardGemma = struct {
         } else {
             cmd.dispatch(&self.pipes.dmmv[idx], .{ M, 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
         }
+    }
+
+    /// Fuse two same-input Q4_K matvecs (w0→y0 [M0 rows], w1→y1 [M1 rows], shared
+    /// input x of inner dim K) into ONE launch over M0+M1 blocks — removes a
+    /// kernel-launch boundary. Both weights MUST be Q4_K (caller-checked); each
+    /// block's compute is bit-identical to dmmvDispatch's fast path. Used for the
+    /// gemma FFN gate/up and attention Q/K pairs.
+    fn dmmvDualQ4k(self: *ForwardGemma, cmd: *command.CudaCommand, w0: *const LoadedTensor, w1: *const LoadedTensor, x: *const CudaBuffer, y0: *const CudaBuffer, y1: *const CudaBuffer, M0: u32, M1: u32, K: u32) void {
+        const push = Dmmv2Push{ .M0 = M0, .M1 = M1, .K = K };
+        cmd.dispatch(&self.pipes.dmmv_q4k_fast_dual, .{ M0 + M1, 1, 1 }, .{ 64, 1, 1 }, &.{ &w0.gpu_buffer, &w1.gpu_buffer, x, y0, y1 }, &push, @sizeOf(Dmmv2Push), 0);
     }
 
     // ---- async decode command ring (mirror ForwardCuda) ---------------------
