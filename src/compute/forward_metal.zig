@@ -785,6 +785,23 @@ fn defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg: ModelConfig) bool {
         cfg.ssm_n_group == 16;
 }
 
+fn defaultQwen35Dense9bQueuedPrefillEnabled(cfg: ModelConfig) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 4096 and
+        cfg.intermediate_dim == 12288 and
+        cfg.n_layers == 32 and
+        cfg.n_experts == 0 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.ssm_d_state == 128 and
+        cfg.ssm_dt_rank == 32 and
+        cfg.ssm_n_group == 16 and
+        cfg.full_attn_interval == 4;
+}
+
+fn shouldUseDenseQwen35QueuedPrefillTokenCommand(cfg: ModelConfig, in_prefill_phase: bool, has_embed_override: bool) bool {
+    return in_prefill_phase and has_embed_override and defaultQwen35Dense9bQueuedPrefillEnabled(cfg);
+}
+
 fn hybridDecodeCommandGroupLayers(cfg: ModelConfig) usize {
     if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
         // One layer per command buffer leaves Qwen3.6 27B with 64 async submits
@@ -8090,12 +8107,15 @@ pub const InferenceEngine = struct {
 
     fn canUseQueuedTokenMajorPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
         if (prompt_len <= 1 or prompt_len > queued_prefill_embed_tokens) return false;
+        const can_queue_qwen35_dense = defaultQwen35Dense9bQueuedPrefillEnabled(self.config);
         const can_queue_shared_embedding =
             self.config.architecture == .gemma and
             self.copy_f32_pipe.handle != null;
-        if (!self.private_decode_buffers and !can_queue_shared_embedding) return false;
+        if (!self.private_decode_buffers and !can_queue_shared_embedding and !can_queue_qwen35_dense) return false;
         if (self.debug_validation_enabled or self.gemma_moe_validation_enabled or self.qwen_prefill_validation_enabled) return false;
-        if (self.config.n_experts == 0) return false;
+        if (self.config.n_experts == 0) {
+            return can_queue_qwen35_dense;
+        }
 
         const hidden_dim = self.config.hidden_dim;
         const inter_dim: u32 = if (self.config.intermediate_dim > 0) self.config.intermediate_dim else hidden_dim * 4;
@@ -23791,15 +23811,16 @@ fn runDecodeStep(
     const use_single_gpu_cmd = !engine.debug_validation_enabled and
         !engine.gemma_moe_validation_enabled and
         !engine.qwen_prefill_validation_enabled and
-        is_moe and blk: {
-        for (engine.layer_tensors, 0..) |lt, layer_idx| {
-            if (canUseGpuRoutedBatchedMoe(engine, lt)) continue;
-            if (canUseGpuRoutedGptOssMoe(engine, lt, layer_idx, hidden_dim, inter_dim)) continue;
-            if (isGemma26Q8ExplicitMoeFallbackLayer(cfg, lt)) continue;
-            break :blk false;
-        }
-        break :blk true;
-    };
+        (shouldUseDenseQwen35QueuedPrefillTokenCommand(cfg, engine.in_prefill_phase, embed_src_override != null) or
+            (is_moe and blk: {
+                for (engine.layer_tensors, 0..) |lt, layer_idx| {
+                    if (canUseGpuRoutedBatchedMoe(engine, lt)) continue;
+                    if (canUseGpuRoutedGptOssMoe(engine, lt, layer_idx, hidden_dim, inter_dim)) continue;
+                    if (isGemma26Q8ExplicitMoeFallbackLayer(cfg, lt)) continue;
+                    break :blk false;
+                }
+                break :blk true;
+            }));
     if (engine.profile_enabled and engine.position == 0 and is_moe and !use_single_gpu_cmd) {
         for (engine.layer_tensors, 0..) |lt, layer_idx| {
             if (canUseGpuRoutedBatchedMoe(engine, lt)) continue;
@@ -32047,6 +32068,60 @@ test "q6k simdgroup route covers qwen35 27b exact shapes" {
     try std.testing.expect(isQwen35DenseQ4KGateUpSwiGLUTarget(qwen35_27b_cfg, &gate, &up, 17408, 5120));
     try std.testing.expect(!isQwen35DenseQ4KGateUpSwiGLUTarget(qwen35_27b_cfg, &gate, &down, 17408, 5120));
     try std.testing.expect(!isQwen35DenseQ4KGateUpSwiGLUTarget(qwen35_27b_cfg, &gate, &up, 17408, 4096));
+}
+
+test "qwen35 9b dense SSM prefill uses queued token commands only for exact shape" {
+    const qwen35_9b_cfg = ModelConfig{
+        .architecture = .qwen35,
+        .n_layers = 32,
+        .n_heads = 16,
+        .n_kv_heads = 4,
+        .head_dim = 256,
+        .hidden_dim = 4096,
+        .intermediate_dim = 12288,
+        .vocab_size = 248320,
+        .context_length = 32768,
+        .rope_freq_base = 1_000_000.0,
+        .n_experts = 0,
+        .n_experts_used = 0,
+        .rope_dim = 128,
+        .ssm_d_conv = 4,
+        .ssm_d_inner = 4096,
+        .ssm_d_state = 128,
+        .ssm_dt_rank = 32,
+        .ssm_n_group = 16,
+        .full_attn_interval = 4,
+        .shared_expert_intermediate_dim = 0,
+    };
+    const qwen35_27b_cfg = ModelConfig{
+        .architecture = .qwen35,
+        .n_layers = 64,
+        .n_heads = 24,
+        .n_kv_heads = 4,
+        .head_dim = 128,
+        .hidden_dim = 5120,
+        .intermediate_dim = 17408,
+        .vocab_size = 248320,
+        .context_length = 32768,
+        .rope_freq_base = 1_000_000.0,
+        .n_experts = 0,
+        .n_experts_used = 0,
+        .rope_dim = 128,
+        .ssm_d_conv = 4,
+        .ssm_d_inner = 6144,
+        .ssm_d_state = 128,
+        .ssm_dt_rank = 48,
+        .ssm_n_group = 16,
+        .full_attn_interval = 4,
+        .shared_expert_intermediate_dim = 0,
+    };
+
+    try std.testing.expect(defaultQwen35Dense9bQueuedPrefillEnabled(qwen35_9b_cfg));
+    try std.testing.expect(shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_9b_cfg, true, true));
+    try std.testing.expect(!shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_9b_cfg, false, true));
+    try std.testing.expect(!shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_9b_cfg, true, false));
+    try std.testing.expect(!defaultQwen35Dense9bQueuedPrefillEnabled(qwen35_27b_cfg));
+    try std.testing.expect(!shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_27b_cfg, true, true));
 }
 
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
