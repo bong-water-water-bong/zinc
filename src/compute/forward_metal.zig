@@ -21372,23 +21372,26 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
         );
         if (dense_layer0_batched and defaultQwen35Dense9bQueuedPrefillEnabled(cfg) and qwen35_dense9b_prefill_prefix_layers > 1) {
             const max_prefix_layers = @min(qwen35_dense9b_prefill_prefix_layers, @as(usize, @intCast(cfg.n_layers)));
+            var prefix_input_buf: *const MetalBuffer = &engine.qwen_ssm_prefill_branch_buf;
             var prefix_layer_idx: usize = 1;
             while (prefix_layer_idx < max_prefix_layers) : (prefix_layer_idx += 1) {
-                if (prefix_layer_idx == 1) {
-                    profileResourceBarrierBuffers(&cmd, profile, .dense_ffn, &.{&engine.qwen_ssm_prefill_branch_buf});
-                } else {
-                    profileResourceBarrierBuffers(&cmd, profile, .dense_ffn, &.{
-                        &engine.qwen_ssm_prefill_branch_buf,
-                        &engine.qwen35_dense_prefill_down_buf,
-                    });
-                }
+                const prefix_output_buf: *const MetalBuffer = if (prefix_input_buf == &engine.qwen_ssm_prefill_branch_buf)
+                    &engine.qwen35_dense_prefill_down_buf
+                else
+                    &engine.qwen_ssm_prefill_branch_buf;
+                // Keep llama.cpp-style graph materialization minimal: only
+                // copy back to branch_buf if the final recorded layer ends in
+                // the alternate buffer. The two-resource barrier preserves the
+                // previous layer's read-before-write edge in the concurrent
+                // encoder while making the new input visible.
+                profileResourceBarrierBuffers(&cmd, profile, .dense_ffn, &.{ prefix_input_buf, prefix_output_buf });
                 const recorded_prefix_layer = if (isFullAttentionLayer(cfg, prefix_layer_idx))
                     try recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
                         engine,
                         &cmd,
                         prefix_layer_idx,
-                        &engine.qwen_ssm_prefill_branch_buf,
-                        &engine.qwen35_dense_prefill_down_buf,
+                        prefix_input_buf,
+                        prefix_output_buf,
                         hidden_dim,
                         inter_dim,
                         n_tokens,
@@ -21399,17 +21402,20 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
                         engine,
                         &cmd,
                         prefix_layer_idx,
-                        &engine.qwen_ssm_prefill_branch_buf,
-                        &engine.qwen35_dense_prefill_down_buf,
+                        prefix_input_buf,
+                        prefix_output_buf,
                         hidden_dim,
                         inter_dim,
                         n_tokens,
                         profile,
                     );
                 if (!recorded_prefix_layer) break;
-                profileResourceBarrierBuffers(&cmd, profile, .dense_ffn, &.{&engine.qwen35_dense_prefill_down_buf});
-                dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.qwen35_dense_prefill_down_buf, &engine.qwen_ssm_prefill_branch_buf, n_tokens * hidden_dim, 0, 0);
+                prefix_input_buf = prefix_output_buf;
                 engine.qwen35_dense_prefill_active_layers = @intCast(prefix_layer_idx + 1);
+            }
+            if (engine.qwen35_dense_prefill_active_layers > 1 and prefix_input_buf != &engine.qwen_ssm_prefill_branch_buf) {
+                profileResourceBarrierBuffers(&cmd, profile, .dense_ffn, &.{ prefix_input_buf, &engine.qwen_ssm_prefill_branch_buf });
+                dispatchCopyF32OffsetOnCmd(engine, &cmd, prefix_input_buf, &engine.qwen_ssm_prefill_branch_buf, n_tokens * hidden_dim, 0, 0);
             }
         }
         if (dense_layer0_batched and engine.qwen35_dense_prefill_active_layers == 0) {
