@@ -32,7 +32,7 @@ pub const runtime_context_cap: u32 = 262144;
 const queued_prefill_embed_tokens: usize = 256;
 const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
 const qwen_ssm_projection_prefill_min_tokens: usize = 32;
-const qwen35_dense9b_prefill_prefix_layers: usize = 4;
+const qwen35_dense9b_prefill_prefix_layers: usize = 5;
 const qwen_ssm_projection_validate_tokens: u32 = 4;
 // llama.cpp's Metal `ggml_metal_op_mul_mat_id` switches from the small
 // matrix-vector path to the expert-grouped matrix path at 32 prompt rows, but
@@ -21410,7 +21410,6 @@ fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: us
                 profileResourceBarrierBuffers(&cmd, profile, .dense_ffn, &.{&engine.qwen35_dense_prefill_down_buf});
                 dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.qwen35_dense_prefill_down_buf, &engine.qwen_ssm_prefill_branch_buf, n_tokens * hidden_dim, 0, 0);
                 engine.qwen35_dense_prefill_active_layers = @intCast(prefix_layer_idx + 1);
-                if (isFullAttentionLayer(cfg, prefix_layer_idx)) break;
             }
         }
         if (dense_layer0_batched and engine.qwen35_dense_prefill_active_layers == 0) {
@@ -33304,9 +33303,9 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     };
 
     try std.testing.expect(defaultQwen35Dense9bQueuedPrefillEnabled(qwen35_9b_cfg));
-    try std.testing.expectEqual(@as(usize, 4), qwen35_dense9b_prefill_prefix_layers);
-    try std.testing.expect(!isFullAttentionLayer(qwen35_9b_cfg, qwen35_dense9b_prefill_prefix_layers - 2));
-    try std.testing.expect(isFullAttentionLayer(qwen35_9b_cfg, qwen35_dense9b_prefill_prefix_layers - 1));
+    try std.testing.expectEqual(@as(usize, 5), qwen35_dense9b_prefill_prefix_layers);
+    try std.testing.expect(isFullAttentionLayer(qwen35_9b_cfg, 3));
+    try std.testing.expect(!isFullAttentionLayer(qwen35_9b_cfg, qwen35_dense9b_prefill_prefix_layers - 1));
     try std.testing.expect(defaultQwenSsmPrefillProjectionEnabled(qwen35_9b_cfg));
     try std.testing.expect(shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_9b_cfg, true, true));
     try std.testing.expect(!shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_9b_cfg, false, true));
