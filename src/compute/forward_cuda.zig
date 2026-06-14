@@ -193,7 +193,8 @@ const Pipelines = struct {
     moe_weighted_acc: CudaPipeline,
     sigmoid_scale_acc: CudaPipeline,
     dmmv_q4k_experts: CudaPipeline, // batched gate/up over all experts
-    dmmv_q5k_experts: CudaPipeline, // batched down over all experts
+    dmmv_q5k_experts: CudaPipeline, // batched gate/up or down over all experts
+    dmmv_q6k_experts: CudaPipeline, // batched down (the 4 Q6_K layers of 35b-a3b)
 };
 
 /// Per-token GPU forward state for qwen35 greedy decode.
@@ -310,7 +311,8 @@ pub const ForwardCuda = struct {
         pipes.sigmoid_scale_acc = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_scale_acc");
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
         pipes.dmmv_q5k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_experts");
-        log.info("nvrtc: compiled {d} kernel pipelines", .{26});
+        pipes.dmmv_q6k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_experts");
+        log.info("nvrtc: compiled {d} kernel pipelines", .{27});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
@@ -758,6 +760,19 @@ pub const ForwardCuda = struct {
     /// accumulate into hidden → shared expert (sigmoid-gated) accumulate into
     /// hidden. The routed combine and shared expert both += into hidden, so the
     /// residual is already present (no separate add).
+    /// The batched single-launch routed-expert kernel for a quant, or null if we
+    /// only have the per-slot path. q4k/q5k serve gate/up (and q5k down); q6k
+    /// serves the 4 Q6_K ffn_down layers of qwen36-35b-a3b. When every routed
+    /// tensor has one, the whole MoE block runs async with no host readback.
+    fn expertsPipe(self: *ForwardCuda, t: gguf.GGMLType) ?*CudaPipeline {
+        return switch (t) {
+            .q4_k => &self.pipes.dmmv_q4k_experts,
+            .q5_k => &self.pipes.dmmv_q5k_experts,
+            .q6_k => &self.pipes.dmmv_q6k_experts,
+            else => null,
+        };
+    }
+
     fn moeFfnBlock(self: *ForwardCuda, L: u32) !void {
         const d = self.d;
         const ctx = self.ctx;
@@ -773,10 +788,17 @@ pub const ForwardCuda = struct {
         const gate_slice = expertSliceBytes(wge.info.type_, ef, d.n_embd);
         const up_slice = expertSliceBytes(wue.info.type_, ef, d.n_embd);
         const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
-        // Fast batched path when experts are q4k (gate/up) + q5k (down): one
-        // launch over all experts, ids read GPU-side, no host readback. Else the
-        // per-slot host path (correct for any quant).
-        const batched_experts = dmmvIdx(wge.info.type_) == 0 and dmmvIdx(wue.info.type_) == 0 and dmmvIdx(wde.info.type_) == 1;
+        // Fast batched path: one launch over all experts, ids read GPU-side, no
+        // host readback (so the whole MoE block stays async — no boost-starving
+        // per-layer drain). Engages whenever every routed tensor has a batched
+        // experts kernel: gate/up in {q4k,q5k}, down in {q5k,q6k}. The catalog
+        // 35b-a3b has 4 Q6_K-down + 1 Q5_K-gate/up layers that USED to fall to
+        // the sync per-slot path; q6k/q5k experts kernels keep them async too.
+        // Else (any unsupported quant) the per-slot host path (correct for any).
+        const gate_pipe = self.expertsPipe(wge.info.type_);
+        const up_pipe = self.expertsPipe(wue.info.type_);
+        const down_pipe = self.expertsPipe(wde.info.type_);
+        const batched_experts = gate_pipe != null and up_pipe != null and down_pipe != null;
 
         // --- Router: rms_norm → logits → top-k softmax. -----------------------
         {
@@ -805,13 +827,13 @@ pub const ForwardCuda = struct {
             if (batched_experts) {
                 const nrows_gu = n_used * ef;
                 const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gate_slice, .x_stride = 0, .n_used = n_used };
-                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wge.gpu_buffer, &self.ffn_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
+                cmd.dispatch(gate_pipe.?, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wge.gpu_buffer, &self.ffn_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
                 const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = up_slice, .x_stride = 0, .n_used = n_used };
-                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wue.gpu_buffer, &self.ffn_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                cmd.dispatch(up_pipe.?, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wue.gpu_buffer, &self.ffn_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
                 const sg = SwigluPush{ .N = nrows_gu };
                 cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(nrows_gu, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
                 const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used };
-                cmd.dispatch(&self.pipes.dmmv_q5k_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
+                cmd.dispatch(down_pipe.?, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
             } else {
                 const sg = SwigluPush{ .N = ef };
                 var j: u32 = 0;
