@@ -1564,9 +1564,11 @@ const DirectComputeTracking = struct {
 // kernels are correctness-oriented serial kernels. Each tracked slice consumes
 // the terminal LM-head score plus a small SSM alpha/beta budget. F32
 // projections validate each row range against the CPU oracle; paired Q8_0
-// projections can use trust-after-success after the first passing pair.
+// projections can use trust-after-success after the first passing pair. The
+// first tracked decode slice already includes a full router row-range via
+// direct_compute_tracking, so standalone recurring router probes stay opt-in.
 const direct_decode_model_slice_cadence_default: u32 = 0;
-const direct_router_decode_enabled_default = true;
+const direct_router_decode_enabled_default = false;
 const direct_router_decode_cadence_default: u32 = 32;
 const direct_router_row_range_trust_after_successes_default: u32 = 1;
 const direct_ssm_q8_0_row_range_max_successes_default: u32 = 2;
@@ -9472,12 +9474,12 @@ test "direct decode model slice cadence always covers first decode step" {
     try std.testing.expectEqual(@as(u32, 3), directDecodeModelSliceCadenceForEnv("3"));
     try std.testing.expectEqual(@as(u32, 0), directDecodeModelSliceCadenceForEnv("0"));
     try std.testing.expectEqual(@as(u32, direct_decode_model_slice_cadence_default), directDecodeModelSliceCadenceForEnv("bad"));
-    try std.testing.expect(directRouterDecodeEnabledForEnv(null));
+    try std.testing.expect(!directRouterDecodeEnabledForEnv(null));
     try std.testing.expect(directRouterDecodeEnabledForEnv("1"));
     try std.testing.expect(directRouterDecodeEnabledForEnv("true"));
     try std.testing.expect(!directRouterDecodeEnabledForEnv("0"));
     try std.testing.expect(!directRouterDecodeEnabledForEnv("false"));
-    try std.testing.expect(directRouterDecodeEnabledForEnv("bad"));
+    try std.testing.expect(!directRouterDecodeEnabledForEnv("bad"));
     try std.testing.expectEqual(@as(u32, direct_router_decode_cadence_default), directRouterDecodeCadenceForEnv(null));
     try std.testing.expectEqual(@as(u32, 16), directRouterDecodeCadenceForEnv("16"));
     try std.testing.expectEqual(@as(u32, 0), directRouterDecodeCadenceForEnv("0"));
