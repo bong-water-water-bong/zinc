@@ -3360,3 +3360,67 @@ extern "C" __global__ void attention_causal_batched(const float* q, const float*
         out[((size_t)t * pc.n_heads + head) * hd + d] = acc * rescale * inv;
     }
 }
+
+// ---- deinterleave_qgate_batched (Effort 26 T0: batched-prefill twin) ---------
+// Batched twin of deinterleave_qgate over T prompt tokens. qfull is token-major
+// [T, 2*q_dim] (each token's row is [Q0,g0,Q1,g1,...] interleaved per head);
+// split into contiguous token-major q_out / gate_out (each [T, q_dim]). Block
+// (chunk=blockIdx.x, token=blockIdx.y); identical per-element math to the
+// single-token kernel.
+struct DeintBatchPush { unsigned head_dim, n_head, T; };
+extern "C" __global__ void deinterleave_qgate_batched(const float* qfull, float* q_out, float* gate_out, DeintBatchPush pc) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned t = blockIdx.y;
+    unsigned total = pc.n_head * pc.head_dim;        // = q_dim
+    if (i >= total || t >= pc.T) return;
+    unsigned h = i / pc.head_dim;
+    unsigned d = i % pc.head_dim;
+    unsigned src = t * 2u * total + h * 2u * pc.head_dim + d;
+    q_out[(size_t)t * total + i]    = qfull[src];
+    gate_out[(size_t)t * total + i] = qfull[src + pc.head_dim];
+}
+
+// ---- rope_batched (Effort 26 T0: batched-prefill twin of rope) --------------
+// Batched twin of `rope` over T prompt tokens. x/y token-major [T, n_heads*stride];
+// block (head=blockIdx.x, token=blockIdx.y) rotates head `head` of token `t` at
+// sequence position base_position+t. Identical per-(head,position) math to `rope`.
+struct RopeBatchPush { unsigned stride, rope_dim, n_heads, base_position, freq_base_bits, attn_scale_bits; };
+extern "C" __global__ void rope_batched(const float* x, float* y, const float* inv_freq, RopeBatchPush pc) {
+    unsigned tid = threadIdx.x;
+    unsigned head = blockIdx.x;
+    unsigned t = blockIdx.y;
+    unsigned base = ((size_t)t * pc.n_heads + head) * pc.stride;
+    unsigned position = pc.base_position + t;
+    unsigned half_rot = pc.rope_dim >> 1;
+    float freq_base = __uint_as_float(pc.freq_base_bits);
+    float attn_scale = pc.attn_scale_bits != 0u ? __uint_as_float(pc.attn_scale_bits) : 1.0f;
+    bool use_buf = (pc.freq_base_bits == 0u);
+    for (unsigned i = tid; i < half_rot; i += blockDim.x) {
+        float xi = x[base + i];
+        float xih = x[base + i + half_rot];
+        float freq_i = use_buf ? inv_freq[i]
+                               : (1.0f / powf(freq_base, (float)(2u * i) / (float)pc.rope_dim));
+        float theta = (float)position * freq_i;
+        float ct = cosf(theta) * attn_scale;
+        float st = sinf(theta) * attn_scale;
+        y[base + i] = xi * ct - xih * st;
+        y[base + i + half_rot] = xi * st + xih * ct;
+    }
+    for (unsigned i = pc.rope_dim + tid; i < pc.stride; i += blockDim.x)
+        y[base + i] = x[base + i];
+}
+
+// ---- kv_cache_write_batched (Effort 26 T0: batched-prefill twin) ------------
+// Batched twin of kv_cache_write over T prompt tokens. k_src/v_src token-major
+// [T, kv_dim]; token t writes into the KV cache at physical position dst_base+t
+// (= (dst_base+t)*kv_dim). Block (chunk=blockIdx.x, token=blockIdx.y).
+struct KvWriteBatchPush { unsigned kv_dim, dst_base, T; };
+extern "C" __global__ void kv_cache_write_batched(const float* k_src, float* k_dst, const float* v_src, float* v_dst, KvWriteBatchPush pc) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned t = blockIdx.y;
+    if (i >= pc.kv_dim || t >= pc.T) return;
+    size_t dst = (size_t)(pc.dst_base + t) * pc.kv_dim + i;
+    size_t src = (size_t)t * pc.kv_dim + i;
+    k_dst[dst] = k_src[src];
+    v_dst[dst] = v_src[src];
+}

@@ -101,6 +101,11 @@ const DequantQ6KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
 const AddPush = extern struct { N: u32 };
 const ConvBatchPush = extern struct { conv_channels: u32, d_conv: u32, kernel_is_f16: u32, n_tok: u32, state_offset: u32 };
 const GatedNormBatchPush = extern struct { d_inner: u32, dt_rank: u32, head_v_dim: u32, d_state: u32, norm_per_head: u32, n_tok: u32 };
+// Effort 26 T0: batched attention-inner twins (grid.y = T).
+const DeintBatchPush = extern struct { head_dim: u32, n_head: u32, T: u32 };
+const RopeBatchPush = extern struct { stride: u32, rope_dim: u32, n_heads: u32, base_position: u32, freq_base_bits: u32, attn_scale_bits: u32 };
+const KvWriteBatchPush = extern struct { kv_dim: u32, dst_base: u32, T: u32 };
+const AttnBatchPush = extern struct { head_dim: u32, n_heads: u32, n_kv_heads: u32, T: u32, attn_scale_bits: u32, sink_offset: u32 };
 
 /// Map a GGUF quant type to its DMMV kernel pipeline (indexes ForwardCuda.dmmv).
 fn dmmvIdx(t: gguf.GGMLType) usize {
@@ -209,6 +214,11 @@ const Pipelines = struct {
     add_inplace: CudaPipeline, // residual fold: hidden += projection
     ssm_conv1d_batched: CudaPipeline, // one launch over all T (circular state)
     ssm_gated_norm_batched: CudaPipeline, // grid.y = T (stateless per token)
+    // Effort 26 T0: batched attention-inner kernels (collapse the per-token loop).
+    deinterleave_batched: CudaPipeline,
+    rope_batched: CudaPipeline,
+    kv_cache_write_batched: CudaPipeline,
+    attention_causal_batched: CudaPipeline,
 };
 
 /// Token-major scratch for the batched prefill path (Effort 26 T0). Allocated
@@ -370,7 +380,11 @@ pub const ForwardCuda = struct {
         pipes.add_inplace = try pipeline.createPipeline(ctx, src.ptr, "add_inplace");
         pipes.ssm_conv1d_batched = try pipeline.createPipeline(ctx, src.ptr, "ssm_conv1d_batched");
         pipes.ssm_gated_norm_batched = try pipeline.createPipeline(ctx, src.ptr, "ssm_gated_norm_batched");
-        log.info("nvrtc: compiled {d} kernel pipelines", .{32});
+        pipes.deinterleave_batched = try pipeline.createPipeline(ctx, src.ptr, "deinterleave_qgate_batched");
+        pipes.rope_batched = try pipeline.createPipeline(ctx, src.ptr, "rope_batched");
+        pipes.kv_cache_write_batched = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write_batched");
+        pipes.attention_causal_batched = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_batched");
+        log.info("nvrtc: compiled {d} kernel pipelines", .{36});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
@@ -681,9 +695,10 @@ pub const ForwardCuda = struct {
     }
 
     /// Token-major attention block: pre-norm + Q/K/V/O projections via batched
-    /// GEMM over all T tokens; the per-head deinterleave-gate, q/k norm, RoPE,
-    /// KV-write, causal attention and sigmoid-gate LOOP per token on the proven
-    /// single-token kernels (token t at sequence position t).
+    /// GEMM over all T tokens; the deinterleave-gate, per-head q/k norm, RoPE,
+    /// KV-write, causal attention and sigmoid-gate are each ONE batched launch
+    /// over all T tokens (Effort 26 T0), bit-identical to the old per-token loop
+    /// (token t at sequence position t). qwen35-9b pp512 +32% vs per-token.
     fn attentionLayerBatched(self: *ForwardCuda, L: u32, T: u32, b: *BatchScratch) !void {
         const d = self.d;
         const ctx = self.ctx;
@@ -702,37 +717,32 @@ pub const ForwardCuda = struct {
         self.gemmDispatch(&cmd, wk, &b.norm, &b.k, d.kv_dim, d.n_embd, T);
         self.gemmDispatch(&cmd, wv, &b.norm, &b.v, d.kv_dim, d.n_embd, T);
 
-        const deint = DeintPush{ .head_dim = d.head_dim, .n_head = d.n_head };
+        // Effort 26 T0: batched attention inner — each of the per-token ops below
+        // is collapsed into ONE launch over all T tokens (grid.y = T, or grid.x
+        // scaled by T for the per-head norms), bit-identical to the per-token loop
+        // (token t at sequence position t). Kernels in a stream run in order, so
+        // the batched KV write completes before the causal attention reads it.
+        // Deinterleave the packed [Q|gate] projection for all T tokens.
+        const deint = DeintBatchPush{ .head_dim = d.head_dim, .n_head = d.n_head, .T = T };
+        cmd.dispatch(&self.pipes.deinterleave_batched, .{ ceilDiv(d.q_dim, 256), T, 1 }, .{ 256, 1, 1 }, &.{ &b.qfull, &b.q, &b.attn_gate }, &deint, @sizeOf(DeintBatchPush), 0);
+        // Per-head q/k RMS norm: one block per (token, head) row of head_dim.
         const rms_h = RmsPush{ .N = d.head_dim, .eps = d.rms_eps };
-        var t: u32 = 0;
-        while (t < T) : (t += 1) {
-            var qfull_t = try aliasRow(&b.qfull, t, 2 * d.q_dim);
-            var q_t = try aliasRow(&b.q, t, d.q_dim);
-            var gate_t = try aliasRow(&b.attn_gate, t, d.q_dim);
-            var k_t = try aliasRow(&b.k, t, d.kv_dim);
-            var v_t = try aliasRow(&b.v, t, d.kv_dim);
-            var ao_t = try aliasRow(&b.attn_out, t, d.q_dim);
-            cmd.dispatch(&self.pipes.deinterleave, .{ ceilDiv(d.q_dim, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &qfull_t, &q_t, &gate_t }, &deint, @sizeOf(DeintPush), 0);
-            cmd.dispatch(&self.pipes.rms_norm, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &q_t, &wqn.gpu_buffer, &q_t }, &rms_h, @sizeOf(RmsPush), 0);
-            cmd.dispatch(&self.pipes.rms_norm, .{ d.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &k_t, &wkn.gpu_buffer, &k_t }, &rms_h, @sizeOf(RmsPush), 0);
-            const rope_q = RopePush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_head, .position = t, .freq_base_bits = 0, .attn_scale_bits = 0 };
-            cmd.dispatch(&self.pipes.rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &q_t, &q_t, &self.inv_freq }, &rope_q, @sizeOf(RopePush), 0);
-            const rope_k = RopePush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_kv_head, .position = t, .freq_base_bits = 0, .attn_scale_bits = 0 };
-            cmd.dispatch(&self.pipes.rope, .{ d.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &k_t, &k_t, &self.inv_freq }, &rope_k, @sizeOf(RopePush), 0);
-            const kvw = KvWritePush{ .kv_dim = d.kv_dim, .dst_offset = t * d.kv_dim };
-            cmd.dispatch(&self.pipes.kv_cache_write, .{ ceilDiv(d.kv_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &k_t, &self.kv_k[L], &v_t, &self.kv_v[L] }, &kvw, @sizeOf(KvWritePush), 0);
-            const seq_len = t + 1;
-            const attn = AttnPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .seq_len = seq_len, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
-            cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &q_t, &self.kv_k[L], &self.kv_v[L], &self.sinks, &ao_t }, &attn, @sizeOf(AttnPush), seq_len * 4);
-            const sm = SigmoidMulPush{ .N = d.q_dim };
-            cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &ao_t, &gate_t, &ao_t }, &sm, @sizeOf(SigmoidMulPush), 0);
-            buffer.freeBuffer(&qfull_t);
-            buffer.freeBuffer(&q_t);
-            buffer.freeBuffer(&gate_t);
-            buffer.freeBuffer(&k_t);
-            buffer.freeBuffer(&v_t);
-            buffer.freeBuffer(&ao_t);
-        }
+        cmd.dispatch(&self.pipes.rms_norm, .{ d.n_head * T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &wqn.gpu_buffer, &b.q }, &rms_h, @sizeOf(RmsPush), 0);
+        cmd.dispatch(&self.pipes.rms_norm, .{ d.n_kv_head * T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.k, &wkn.gpu_buffer, &b.k }, &rms_h, @sizeOf(RmsPush), 0);
+        // RoPE q/k over all T (position = token index, base 0).
+        const rope_q = RopeBatchPush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_head, .base_position = 0, .freq_base_bits = 0, .attn_scale_bits = 0 };
+        cmd.dispatch(&self.pipes.rope_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &b.q, &self.inv_freq }, &rope_q, @sizeOf(RopeBatchPush), 0);
+        const rope_k = RopeBatchPush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_kv_head, .base_position = 0, .freq_base_bits = 0, .attn_scale_bits = 0 };
+        cmd.dispatch(&self.pipes.rope_batched, .{ d.n_kv_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.k, &b.k, &self.inv_freq }, &rope_k, @sizeOf(RopeBatchPush), 0);
+        // Write all T tokens' K/V into the cache at positions 0..T-1.
+        const kvw = KvWriteBatchPush{ .kv_dim = d.kv_dim, .dst_base = 0, .T = T };
+        cmd.dispatch(&self.pipes.kv_cache_write_batched, .{ ceilDiv(d.kv_dim, 64), T, 1 }, .{ 64, 1, 1 }, &.{ &b.k, &self.kv_k[L], &b.v, &self.kv_v[L] }, &kvw, @sizeOf(KvWriteBatchPush), 0);
+        // Causal attention for all T queries (block (head, t), seq_len = t+1).
+        const attn = AttnBatchPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .T = T, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
+        cmd.dispatch(&self.pipes.attention_causal_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), T * 4);
+        // Sigmoid attention gate, element-wise over all [T, q_dim].
+        const sm = SigmoidMulPush{ .N = T * d.q_dim };
+        cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(T * d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.attn_out, &b.attn_gate, &b.attn_out }, &sm, @sizeOf(SigmoidMulPush), 0);
         // O projection → b.o, then fold into the residual stream.
         self.gemmDispatch(&cmd, wo, &b.attn_out, &b.o, d.n_embd, d.q_dim, T);
         const add = AddPush{ .N = T * d.n_embd };
