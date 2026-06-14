@@ -719,10 +719,18 @@ pub const ForwardGemma = struct {
         const T: u32 = @intCast(tokens.len);
         const f4 = @sizeOf(f32);
         const moe = d.n_experts > 0; // gemma-26b-a4b: batched attn + per-token MoE FFN
-        // Cycle 11: opt-in fp16 tensor-core GEMM for the dense Q4_K projections/FFN.
+        // Cycle 11: fp16 tensor-core GEMM for the dense Q4_K projections/FFN.
         // Read once here so gemmDispatch can pick the kernel per weight without a
-        // getenv per launch. Off by default → the byte-identical path is unchanged.
-        self.use_tc = std.posix.getenv("ZINC_BATCHED_TC") != null;
+        // getenv per launch.
+        // Effort 26 cycle 1: DEFAULT ON. Re-profiling on the RTX 5090 (Blackwell)
+        // showed gemma-31b dense prefill is COMPUTE-bound (~100% util at full
+        // 2850 MHz boost), not launch-bound — so the tensor-core GEMM is a real
+        // end-to-end win here (+24% prefill, ABBA x3, 5090; catalog 5/5
+        // token-correct). Effort 24 found it neutral on the 4090 (weaker fp16 TC),
+        // never negative, so defaulting on is safe there. Opt out with
+        // ZINC_BATCHED_TC=0/off/false/no (the A/B kill-switch back to the
+        // f32 register-tiled GEMM).
+        self.use_tc = tcDefaultOn();
         // Cycle 12 A/B knob: ZINC_BATCHED_TC_PLAIN forces the cycle-11 plain TC
         // GEMM (f32 activation re-read per M-block) instead of the cycle-12 f16-A
         // path (activation pre-converted to fp16 once). Lets us measure the f16-A
@@ -1941,6 +1949,16 @@ pub const ForwardGemma = struct {
 
 fn ceilDiv(a: u32, b: u32) u32 {
     return (a + b - 1) / b;
+}
+
+/// Effort 26 cycle 1: the fp16 tensor-core dense GEMM is now ON by default for
+/// gemma prefill (a real +24% on the RTX 5090, neutral on the 4090). True unless
+/// ZINC_BATCHED_TC is explicitly off (0/off/false/no) — the A/B kill-switch back
+/// to the f32 register-tiled GEMM. Mirrors batchedPrefillDefaultOn's parsing.
+fn tcDefaultOn() bool {
+    const v = std.posix.getenv("ZINC_BATCHED_TC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
 
 /// Bytes for one expert's [rows × cols] slice in a stacked/fused MoE weight
