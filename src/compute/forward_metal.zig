@@ -1686,6 +1686,8 @@ pub const RuntimeProfile = struct {
     qwen35_dense_prefill_replay_layers: u32 = 0,
     qwen35_dense_prefill_replay_ssm_layers: u32 = 0,
     qwen35_dense_prefill_replay_full_attn_layers: u32 = 0,
+    qwen35_dense_prefill_replay_ssm_layer_tokens: u32 = 0,
+    qwen35_dense_prefill_replay_full_attn_layer_tokens: u32 = 0,
     qwen35_dense_prefill_replay_dense_ffn_layers: u32 = 0,
     qwen35_dense_prefill_replay_graph_runs: u32 = 0,
     qwen35_dense_prefill_replay_graph_ssm_runs: u32 = 0,
@@ -1708,6 +1710,10 @@ pub const RuntimeProfile = struct {
     qwen35_dense_prefill_next_replay_following_dense_ffn_bytes: u64 = 0,
     qwen35_dense_prefill_remaining_replay_projection_bytes: u64 = 0,
     qwen35_dense_prefill_remaining_replay_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_remaining_replay_ssm_projection_bytes: u64 = 0,
+    qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes: u64 = 0,
+    qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes: u64 = 0,
+    qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes: u64 = 0,
     qwen35_dense_prefill_materialized_dispatch_calls: u32 = 0,
     qwen35_dense_prefill_materialized_barrier_calls: u32 = 0,
     qwen35_dense_prefill_materialized_resource_barrier_resources: u32 = 0,
@@ -2924,6 +2930,26 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
                 bytesToGiB(profile.qwen35_dense_prefill_next_replay_run_dense_ffn_bytes),
                 bytesToGiB(profile.qwen35_dense_prefill_next_replay_following_projection_bytes),
                 bytesToGiB(profile.qwen35_dense_prefill_next_replay_following_dense_ffn_bytes),
+            });
+        }
+        if (profile.qwen35_dense_prefill_replay_ssm_layer_tokens > 0 or profile.qwen35_dense_prefill_replay_full_attn_layer_tokens > 0) {
+            const replay_layer_tokens_f = @as(f64, @floatFromInt(@max(profile.qwen35_dense_prefill_replay_layer_tokens, 1)));
+            const ssm_layer_tokens_f = @as(f64, @floatFromInt(profile.qwen35_dense_prefill_replay_ssm_layer_tokens));
+            const full_attn_layer_tokens_f = @as(f64, @floatFromInt(profile.qwen35_dense_prefill_replay_full_attn_layer_tokens));
+            const replay_dispatch_f = @as(f64, @floatFromInt(replay_dispatch_calls));
+            const replay_barrier_f = @as(f64, @floatFromInt(replay_barrier_calls));
+            log.info("  {s} qwen35-9b remaining replay split: ssm_layer_tokens {d} full_attn_layer_tokens {d} token_major_est dispatch ssm/full_attn {d:.1}/{d:.1} barriers {d:.1}/{d:.1} ssm_bytes projection {d:.2} GiB dense_ffn {d:.2} GiB full_attn_bytes projection {d:.2} GiB dense_ffn {d:.2} GiB", .{
+                label,
+                profile.qwen35_dense_prefill_replay_ssm_layer_tokens,
+                profile.qwen35_dense_prefill_replay_full_attn_layer_tokens,
+                replay_dispatch_f * ssm_layer_tokens_f / replay_layer_tokens_f,
+                replay_dispatch_f * full_attn_layer_tokens_f / replay_layer_tokens_f,
+                replay_barrier_f * ssm_layer_tokens_f / replay_layer_tokens_f,
+                replay_barrier_f * full_attn_layer_tokens_f / replay_layer_tokens_f,
+                bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_ssm_projection_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes),
+                bytesToGiB(profile.qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes),
             });
         }
         if (profile.qwen35_dense_prefill_materialized_dispatch_calls > 0 or replay_dispatch_calls > 0) {
@@ -5084,6 +5110,8 @@ fn recordQwen35Dense9bLayerMajorPrefillProfile(
     p.qwen35_dense_prefill_replay_layers +|= replay_layers;
     p.qwen35_dense_prefill_replay_ssm_layers +|= replay_ssm_layers;
     p.qwen35_dense_prefill_replay_full_attn_layers +|= replay_full_attn_layers;
+    p.qwen35_dense_prefill_replay_ssm_layer_tokens +|= prompt_tokens *| replay_ssm_layers;
+    p.qwen35_dense_prefill_replay_full_attn_layer_tokens +|= prompt_tokens *| replay_full_attn_layers;
     p.qwen35_dense_prefill_replay_dense_ffn_layers +|= replay_layers;
     p.qwen35_dense_prefill_replay_graph_runs +|= replay_schedule.runs;
     p.qwen35_dense_prefill_replay_graph_ssm_runs +|= replay_schedule.ssm_runs;
@@ -5227,10 +5255,27 @@ fn recordQwen35Dense9bLayerMajorNextReplayProfile(
         Qwen35Dense9bLayerMajorReplayBytes{};
     var remaining_projection: u64 = 0;
     var remaining_dense_ffn: u64 = 0;
+    var remaining_ssm_projection: u64 = 0;
+    var remaining_ssm_dense_ffn: u64 = 0;
+    var remaining_full_attn_projection: u64 = 0;
+    var remaining_full_attn_dense_ffn: u64 = 0;
     for (first_layer..@as(usize, @intCast(cfg.n_layers))) |layer_idx| {
         const layer_bytes = qwen35Dense9bLayerMajorReplayBytes(engine, layer_idx);
-        remaining_projection +|= layer_bytes.projection *| prompt_multiplier;
-        remaining_dense_ffn +|= layer_bytes.dense_ffn *| prompt_multiplier;
+        const projection_bytes = layer_bytes.projection *| prompt_multiplier;
+        const dense_ffn_bytes = layer_bytes.dense_ffn *| prompt_multiplier;
+        remaining_projection +|= projection_bytes;
+        remaining_dense_ffn +|= dense_ffn_bytes;
+        switch (layer_bytes.kind) {
+            .ssm => {
+                remaining_ssm_projection +|= projection_bytes;
+                remaining_ssm_dense_ffn +|= dense_ffn_bytes;
+            },
+            .full_attn => {
+                remaining_full_attn_projection +|= projection_bytes;
+                remaining_full_attn_dense_ffn +|= dense_ffn_bytes;
+            },
+            .none => {},
+        }
     }
 
     p.qwen35_dense_prefill_next_replay_layer = first_replay_layer;
@@ -5248,6 +5293,10 @@ fn recordQwen35Dense9bLayerMajorNextReplayProfile(
     p.qwen35_dense_prefill_next_replay_following_dense_ffn_bytes = following_bytes.dense_ffn *| prompt_multiplier;
     p.qwen35_dense_prefill_remaining_replay_projection_bytes = remaining_projection;
     p.qwen35_dense_prefill_remaining_replay_dense_ffn_bytes = remaining_dense_ffn;
+    p.qwen35_dense_prefill_remaining_replay_ssm_projection_bytes = remaining_ssm_projection;
+    p.qwen35_dense_prefill_remaining_replay_ssm_dense_ffn_bytes = remaining_ssm_dense_ffn;
+    p.qwen35_dense_prefill_remaining_replay_full_attn_projection_bytes = remaining_full_attn_projection;
+    p.qwen35_dense_prefill_remaining_replay_full_attn_dense_ffn_bytes = remaining_full_attn_dense_ffn;
 }
 
 fn recordQwen35Dense9bLayerMajorPrefillWork(
@@ -33852,6 +33901,8 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expectEqual(@as(u32, 28), profile.qwen35_dense_prefill_replay_layers);
     try std.testing.expectEqual(@as(u32, 21), profile.qwen35_dense_prefill_replay_ssm_layers);
     try std.testing.expectEqual(@as(u32, 7), profile.qwen35_dense_prefill_replay_full_attn_layers);
+    try std.testing.expectEqual(@as(u32, 756), profile.qwen35_dense_prefill_replay_ssm_layer_tokens);
+    try std.testing.expectEqual(@as(u32, 252), profile.qwen35_dense_prefill_replay_full_attn_layer_tokens);
     try std.testing.expectEqual(@as(u32, 28), profile.qwen35_dense_prefill_replay_dense_ffn_layers);
     try std.testing.expectEqual(@as(u32, 14), profile.qwen35_dense_prefill_replay_graph_runs);
     try std.testing.expectEqual(@as(u32, 7), profile.qwen35_dense_prefill_replay_graph_ssm_runs);
