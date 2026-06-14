@@ -847,6 +847,37 @@ pub const DmmvArgmaxResult = struct {
     score: f32,
 };
 
+/// In-flight Q4_0 row-range dispatch submitted through `DRM_IOCTL_AMDGPU_CS`.
+///
+/// Callers can overlap independent CPU work with this fence, then call
+/// `finish` before reusing the `TokenBoundary` maps or PM4 builder.
+pub const PendingDmmvQ4_0RowRangeParallelChunks = struct {
+    boundary: *TokenBoundary,
+    fence_handle: u64,
+    signal_expected: u64,
+    rows: u32,
+
+    /// Wait for the submitted CS fence, validate the signal sentinel, and copy
+    /// the GPU-written row scores into `output`.
+    pub fn finish(self: PendingDmmvQ4_0RowRangeParallelChunks, output: []f32) !void {
+        if (output.len < self.rows) return error.ShapeMismatch;
+
+        const boundary = self.boundary;
+        try boundary.waitFence(self.fence_handle);
+
+        const output_words: [*]volatile u32 = @ptrCast(@alignCast(boundary.output_map.ptr));
+        const signal_words: [*]volatile u32 = @ptrCast(@alignCast(boundary.signal_map.ptr));
+        const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
+        if (signal_value != self.signal_expected) return error.SignalMismatch;
+        for (0..self.rows) |i| output[i] = @bitCast(output_words[i]);
+    }
+
+    /// Retire the fence when the caller must abandon the result after submit.
+    pub fn waitDiscard(self: PendingDmmvQ4_0RowRangeParallelChunks) void {
+        self.boundary.waitFence(self.fence_handle) catch {};
+    }
+};
+
 /// Outcome classification for the CS bring-up smoke gate.
 /// Each variant maps to a specific failure point in the open → submit → wait
 /// pipeline, so the benchmark UI can attribute a regression to render-node
@@ -1070,6 +1101,16 @@ pub const TokenBoundary = struct {
         std.posix.munmap(self.ib_map);
         self.file.close();
         self.* = undefined;
+    }
+
+    fn waitFence(self: *TokenBoundary, fence_handle: u64) SubmitError!void {
+        try waitSubmittedFence(
+            self.file,
+            self.ctx_id,
+            self.ip_type,
+            fence_handle,
+            &self.last_wait_status,
+        );
     }
 
     /// Round-trip one `u32` through the GPU as the simplest end-to-end gate:
@@ -2050,8 +2091,22 @@ pub const TokenBoundary = struct {
         cols: u32,
         output: []f32,
     ) !void {
+        const pending = try self.beginDmmvQ4_0RowRangeParallelChunks(input, weights_q4_0, rows, cols);
+        try pending.finish(output);
+    }
+
+    /// Submit one or more 64-row wave-lane Q4_0 chunks and return before
+    /// waiting for the CS fence. The shared input/output/signal maps and PM4
+    /// builder must not be reused until the returned dispatch is finished.
+    pub fn beginDmmvQ4_0RowRangeParallelChunks(
+        self: *TokenBoundary,
+        input: []const f32,
+        weights_q4_0: []const u8,
+        rows: u32,
+        cols: u32,
+    ) !PendingDmmvQ4_0RowRangeParallelChunks {
         if (rows == 0 or rows % 64 != 0 or cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
-        if (input.len < cols or output.len < rows) return error.ShapeMismatch;
+        if (input.len < cols) return error.ShapeMismatch;
         const row_bytes: usize = (@as(usize, cols) / 32) * 18;
         const weights_bytes = @as(usize, rows) * row_bytes;
         if (weights_q4_0.len < weights_bytes) return error.ShapeMismatch;
@@ -2129,22 +2184,23 @@ pub const TokenBoundary = struct {
             .chunk_data = @intFromPtr(&ib_chunk_data),
         }};
         var chunk_ptrs = [_]u64{@intFromPtr(&chunks[0])};
-        self.last_fence_handle = try submitBuilderAndWait(
+        self.last_fence_handle = try submitBuilder(
             self.file,
             self.ctx_id,
-            self.ip_type,
             self.bo_list_handle,
             &self.builder,
             &ib_chunk_data,
             &chunk_ptrs,
             &self.last_ib_bytes,
-            &self.last_wait_status,
         );
         self.submit_count += 1;
 
-        const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
-        if (signal_value != signal_expected) return error.SignalMismatch;
-        for (0..rows) |i| output[i] = @bitCast(output_words[i]);
+        return .{
+            .boundary = self,
+            .fence_handle = self.last_fence_handle,
+            .signal_expected = signal_expected,
+            .rows = rows,
+        };
     }
 
     /// Dispatch two 64-row Q4_0 DMMV ranges that share one input vector in one CS submission.
@@ -3218,6 +3274,28 @@ fn submitBuilderAndWait(
     ib_bytes_out: *u32,
     wait_status_out: *u64,
 ) SubmitError!u64 {
+    const fence_handle = try submitBuilder(
+        file,
+        ctx_id,
+        bo_list_handle,
+        builder,
+        ib_chunk_data,
+        chunk_ptrs,
+        ib_bytes_out,
+    );
+    try waitSubmittedFence(file, ctx_id, ip_type, fence_handle, wait_status_out);
+    return fence_handle;
+}
+
+fn submitBuilder(
+    file: std.fs.File,
+    ctx_id: u32,
+    bo_list_handle: u32,
+    builder: *const packet.PacketBuilder,
+    ib_chunk_data: *DrmAmdgpuCsChunkIb,
+    chunk_ptrs: []u64,
+    ib_bytes_out: *u32,
+) SubmitError!u64 {
     ib_chunk_data.ib_bytes = @intCast(builder.written().len * @sizeOf(u32));
     ib_bytes_out.* = ib_chunk_data.ib_bytes;
 
@@ -3230,10 +3308,19 @@ fn submitBuilderAndWait(
         .chunks = @intFromPtr(chunk_ptrs.ptr),
     };
     ioctlRaw(file, ioc_cs, @intFromPtr(&submit)) catch return error.SubmitFailed;
+    return submit.out.handle;
+}
 
+fn waitSubmittedFence(
+    file: std.fs.File,
+    ctx_id: u32,
+    ip_type: u32,
+    fence_handle: u64,
+    wait_status_out: *u64,
+) SubmitError!void {
     var wait: DrmAmdgpuWaitCs = std.mem.zeroes(DrmAmdgpuWaitCs);
     wait.in = .{
-        .handle = submit.out.handle,
+        .handle = fence_handle,
         .timeout = std.math.maxInt(u64),
         .ip_type = ip_type,
         .ip_instance = 0,
@@ -3245,7 +3332,6 @@ fn submitBuilderAndWait(
     if (wait.out.status != 0) {
         return error.WaitTimedOut;
     }
-    return submit.out.handle;
 }
 
 const SubmitError = error{ SubmitFailed, WaitFailed, WaitTimedOut, OutOfSpace };

@@ -2590,16 +2590,33 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
 
     var selection: ArgmaxTop2Result = .{};
     var gpu_chunks: u32 = 1;
+    var cpu_tail_selection: ?ArgmaxTop2Result = null;
     if (gpu_rows % direct_lm_head_q4_0_parallel_chunk_rows == 0 and gpu_rows >= direct_lm_head_q4_0_parallel_chunk_rows) {
         gpu_chunks = gpu_rows / direct_lm_head_q4_0_parallel_chunk_rows;
         const gpu_logits = state.row_scratch[0..gpu_rows_usize];
-        tracking.boundary.dmmvQ4_0RowRangeParallelChunks(
+        const pending = tracking.boundary.beginDmmvQ4_0RowRangeParallelChunks(
             state.norm,
             q4_0_raw[0..gpu_weight_bytes],
             gpu_rows,
             cols,
-            gpu_logits,
         ) catch |err| {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix parallel unavailable ({s}); selected token remains host-computed", .{@errorName(err)});
+            return null;
+        };
+        if (gpu_rows < lm_head_rows) {
+            const cpu_rows = lm_head_rows - gpu_rows;
+            const cpu_off = @as(usize, gpu_rows) * row_bytes;
+            const cpu_bytes = @as(usize, cpu_rows) * row_bytes;
+            if (cpu_off + cpu_bytes > q4_0_raw.len) {
+                pending.waitDiscard();
+                return null;
+            }
+            cpu_tail_selection = argmaxMatvecRawTop2(state.pool, q4_0_raw[cpu_off..][0..cpu_bytes], .q4_0, state.norm, cpu_rows, state.row_scratch) catch |err| {
+                pending.waitDiscard();
+                return err;
+            };
+        }
+        pending.finish(gpu_logits) catch |err| {
             log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix parallel unavailable ({s}); selected token remains host-computed", .{@errorName(err)});
             return null;
         };
@@ -2647,7 +2664,7 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         const cpu_off = @as(usize, gpu_rows) * row_bytes;
         const cpu_bytes = @as(usize, cpu_rows) * row_bytes;
         if (cpu_off + cpu_bytes > q4_0_raw.len) return null;
-        const cpu_tail = try argmaxMatvecRawTop2(state.pool, q4_0_raw[cpu_off..][0..cpu_bytes], .q4_0, state.norm, cpu_rows, state.row_scratch);
+        const cpu_tail = if (cpu_tail_selection) |tail| tail else try argmaxMatvecRawTop2(state.pool, q4_0_raw[cpu_off..][0..cpu_bytes], .q4_0, state.norm, cpu_rows, state.row_scratch);
         selection.offerToken(offsetScoredToken(cpu_tail.best, gpu_rows));
         selection.offerToken(offsetScoredToken(cpu_tail.second, gpu_rows));
     }
