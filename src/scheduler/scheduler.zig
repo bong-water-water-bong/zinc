@@ -1,8 +1,9 @@
 //! Continuous-batching scheduler groundwork for concurrent inference requests.
 //! @section Scheduler
-//! Today this module owns request slot accounting only. The HTTP serving hot
-//! path still serializes generation behind ServerState.generation_mutex; the
-//! batched prefill/decode dispatch loop is not wired yet.
+//! Today this module owns request slot accounting and state collection only.
+//! The HTTP serving hot path still serializes generation behind
+//! ServerState.generation_mutex; the batched prefill/decode dispatch loop is
+//! not wired yet.
 const std = @import("std");
 const Request = @import("request.zig").Request;
 const RequestState = @import("request.zig").RequestState;
@@ -78,22 +79,53 @@ pub const Scheduler = struct {
         return count;
     }
 
-    /// Return slot IDs of requests in the prefilling state.
+    /// Transition a live slot through the request state machine.
     /// @param self Scheduler to query.
-    /// @returns Empty slice (stub — allocation strategy TBD).
-    pub fn pendingPrefill(self: *Scheduler) []u32 {
-        // Returns slot IDs of pending requests
-        // TODO: implement with proper allocation
-        _ = self;
-        return &.{};
+    /// @param slot_id Slot index to update.
+    /// @param new_state Target request state.
+    /// @returns error.InvalidSlot if the slot is out of range or empty.
+    pub fn transition(self: *Scheduler, slot_id: u32, new_state: RequestState) !void {
+        if (slot_id >= self.slots.len) return error.InvalidSlot;
+        if (self.slots[slot_id]) |*req| {
+            try req.transition(new_state);
+            return;
+        }
+        return error.InvalidSlot;
     }
 
-    /// Return slot IDs of requests in the decoding state.
+    /// Collect slot IDs whose request currently has `state`.
     /// @param self Scheduler to query.
-    /// @returns Empty slice (stub — allocation strategy TBD).
-    pub fn activeDecoding(self: *Scheduler) []u32 {
-        _ = self;
-        return &.{};
+    /// @param state Request state to match.
+    /// @param out Caller-owned scratch buffer for slot IDs.
+    /// @returns A slice of `out` containing the collected slot IDs.
+    pub fn collectByState(self: *const Scheduler, state: RequestState, out: []u32) []u32 {
+        var count: usize = 0;
+        for (self.slots, 0..) |slot, i| {
+            if (count == out.len) break;
+            if (slot) |req| {
+                if (req.state == state) {
+                    out[count] = @intCast(i);
+                    count += 1;
+                }
+            }
+        }
+        return out[0..count];
+    }
+
+    /// Return slot IDs of requests waiting for prefill admission.
+    /// @param self Scheduler to query.
+    /// @param out Caller-owned scratch buffer for slot IDs.
+    /// @returns A slice of `out` containing pending prefill slot IDs.
+    pub fn pendingPrefill(self: *const Scheduler, out: []u32) []u32 {
+        return self.collectByState(.pending, out);
+    }
+
+    /// Return slot IDs of requests currently in decode.
+    /// @param self Scheduler to query.
+    /// @param out Caller-owned scratch buffer for slot IDs.
+    /// @returns A slice of `out` containing decoding slot IDs.
+    pub fn activeDecoding(self: *const Scheduler, out: []u32) []u32 {
+        return self.collectByState(.decoding, out);
     }
 
     /// Release a completed or cancelled request's slot, freeing its resources.
@@ -191,4 +223,43 @@ test "Scheduler request IDs increment" {
     try std.testing.expect(sched.slots[0] != null);
     try std.testing.expect(sched.slots[1] != null);
     try std.testing.expect(sched.slots[0].?.id != sched.slots[1].?.id);
+}
+
+test "Scheduler collects pending prefill and active decoding slots" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 4);
+    defer sched.deinit();
+
+    const prefill_slot = try sched.submit(&.{1}, .{});
+    const decode_slot = try sched.submit(&.{2}, .{});
+    const other_slot = try sched.submit(&.{3}, .{});
+
+    try sched.transition(decode_slot, .prefilling);
+    try sched.transition(decode_slot, .decoding);
+    try sched.transition(other_slot, .cancelled);
+
+    var scratch: [4]u32 = undefined;
+    const pending = sched.pendingPrefill(&scratch);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(prefill_slot, pending[0]);
+
+    const decoding = sched.activeDecoding(&scratch);
+    try std.testing.expectEqual(@as(usize, 1), decoding.len);
+    try std.testing.expectEqual(decode_slot, decoding[0]);
+}
+
+test "Scheduler state collection respects scratch capacity" {
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 3);
+    defer sched.deinit();
+
+    _ = try sched.submit(&.{1}, .{});
+    _ = try sched.submit(&.{2}, .{});
+    _ = try sched.submit(&.{3}, .{});
+
+    var scratch: [2]u32 = undefined;
+    const pending = sched.pendingPrefill(&scratch);
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqual(@as(u32, 0), pending[0]);
+    try std.testing.expectEqual(@as(u32, 1), pending[1]);
 }

@@ -28,6 +28,27 @@ pub const Options = struct {
     tier: Tier = .t_cpu,
 };
 
+/// Runtime capability bits surfaced to harnesses and server integration code.
+/// The batch planner is present, but continuous batched model execution is not
+/// wired into `forward_zinc_rt` yet.
+pub const Capabilities = struct {
+    /// Tenant-aware admission and prefill/decode batch selection is available.
+    multitenant_batch_planning: bool = true,
+    /// Requests must name a registered tenant before admission.
+    requires_explicit_tenant_registration: bool = true,
+    /// End-to-end batched inference execution is available.
+    multitenant_batched_execution: bool = false,
+    /// The `-Dbackend=zinc_rt` binary exposes an HTTP server entrypoint.
+    server_entrypoint: bool = false,
+};
+
+/// True when ZINC_RT can plan multitenant batches.
+pub const supports_multitenant_batch_planning = true;
+/// True only when ZINC_RT can execute multiple tenants in one continuous
+/// inference loop. This remains false until M3 wires the planner into
+/// `forward_zinc_rt` and the server runtime.
+pub const supports_multitenant_batched_execution = false;
+
 /// Top-level runtime handle. Owns the allocator the engine was built with and
 /// the selected tier; future revisions will also own the ring backend.
 pub const Engine = struct {
@@ -49,6 +70,12 @@ pub const Engine = struct {
     /// once per successful `init`.
     pub fn deinit(self: *Engine) void {
         self.* = undefined;
+    }
+
+    /// Return static runtime capability bits for the selected build.
+    pub fn capabilities(self: *const Engine) Capabilities {
+        _ = self;
+        return .{};
     }
 };
 
@@ -110,6 +137,19 @@ fn supportsEmbeddedGfx12Kernels(hw_ip: kmd.DrmAmdgpuInfoHwIp) bool {
 
 test "parseTier maps explicit CPU tier" {
     try std.testing.expectEqual(Tier.t_cpu, try parseTier("t_cpu"));
+}
+
+test "capabilities distinguish batch planning from batched execution" {
+    var eng = try Engine.init(std.testing.allocator, .{});
+    defer eng.deinit();
+
+    const caps = eng.capabilities();
+    try std.testing.expect(caps.multitenant_batch_planning);
+    try std.testing.expect(caps.requires_explicit_tenant_registration);
+    try std.testing.expect(!caps.multitenant_batched_execution);
+    try std.testing.expect(!caps.server_entrypoint);
+    try std.testing.expect(supports_multitenant_batch_planning);
+    try std.testing.expect(!supports_multitenant_batched_execution);
 }
 
 test "auto tier embedded-kernel gate rejects pre-gfx12 compute IPs" {

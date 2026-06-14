@@ -3,7 +3,9 @@
 //! The M0 binary is intentionally small: it brings up tier selection and the
 //! T-CPU packet runner without linking the Vulkan backend. Pass `--prompt`
 //! to drive the host-assisted forward path, or `--probe-tier` to report
-//! tier admission status without running a model.
+//! tier admission status without running a model. The tenant-aware batch
+//! planner lives in `zinc_rt.batching`; the CLI does not yet expose the HTTP
+//! server or end-to-end batched inference executor.
 const std = @import("std");
 const zinc_rt = @import("zinc_rt");
 const engine = zinc_rt.engine;
@@ -146,9 +148,13 @@ fn printHelp() !void {
         \\Usage: zinc -m model.gguf --prompt "Hello"
         \\       ZINC_RT_TIER=t2_umq zinc --probe-tier
         \\
-        \\This binary was built with -Dbackend=zinc_rt. M0 currently brings up
-        \\the ZINC_RT tier selector and T-CPU packet runner without linking
-        \\Vulkan. Full forward_zinc_rt model inference is the next M0 step.
+        \\This binary was built with -Dbackend=zinc_rt. It brings up the
+        \\ZINC_RT tier selector, T-CPU packet runner, and host-assisted
+        \\forward_zinc_rt prompt path without linking Vulkan.
+        \\
+        \\Batching status: tenant-aware admission and batch planning are in
+        \\zinc_rt.batching; the HTTP server and end-to-end multitenant
+        \\batched executor are not wired yet.
         \\
     );
     try stdout.interface.flush();

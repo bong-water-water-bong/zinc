@@ -57,7 +57,12 @@ pub const kernels = @import("isa/cpu_zig/mod.zig");
 /// the scalar M1 decode path without paying allocator/scheduler overhead.
 pub const fast_pool = @import("fast_pool.zig");
 
+/// Tenant-aware admission and batch-selection primitives for the M3
+/// continuous-batching executor.
+pub const batching = @import("batching.zig");
+
 comptime {
     _ = @import("tests/ir_smoke.zig");
     _ = @import("fast_pool.zig");
+    _ = @import("batching.zig");
 }

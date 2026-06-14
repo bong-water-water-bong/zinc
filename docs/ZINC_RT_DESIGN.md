@@ -2,9 +2,9 @@
 
 > **Read this first.** ZINC_RT is **not the default production backend today.** The hot path that ships with ZINC and produces every benchmark number on the public site is the **Vulkan backend**. ZINC_RT is an opt-in alternate runtime (`zig build -Dbackend=zinc_rt`) that exists to escape the per-submit/per-record Vulkan tax for multitenant continuous batching — the long-term home for those use cases. Today's ZINC_RT decode numbers (~80 tok/s on R9700) are produced by a host-assisted, scalar path with explicit shortcuts (LM-head row cap, MoE top-k clamp after prefill); they are not a like-for-like replacement for Vulkan's 115+ tok/s yet. If you are choosing what to build against, default to the Vulkan path. If you are working on the runtime itself, this document is the spec.
 
-**Status:** M0 shipped; M1 in progress — host-assisted scalar decode landing on R9700 at ~80 tok/s (vs Vulkan 115 tok/s) with two PM4 validation probes on the hot-path edge. Effort 15 is frozen at the scalar plateau pending a real direct DMMV row-range kernel (see §1.A and §25.3 below).
+**Status:** M0 shipped; M1 in progress — host-assisted scalar decode landing on R9700 at ~80 tok/s (vs Vulkan 115 tok/s) with two PM4 validation probes on the hot-path edge. Effort 15 is frozen at the scalar plateau pending a real direct DMMV row-range kernel (see §1.A and §25.3 below). Multitenant batching has tenant-aware admission and batch planning in tree, but no end-to-end batched inference executor yet.
 **Audience:** AI coding agents executing on this design; senior contributors reviewing it
-**Last updated:** 2026-05-24
+**Last updated:** 2026-06-14
 **Owner:** ZINC core
 **Primary target:** AMD RDNA4 (Radeon AI PRO R9700, RX 9070 family). Portable path to RDNA3 first, Intel Arc Xe2 and NVIDIA later. **Apple Silicon Metal is folded in as a tier.**
 
@@ -109,6 +109,7 @@ This section is the ground truth of what is in tree *today*, ahead of every aspi
 * **`src/zinc_rt/ring/cpu.zig`** — T-CPU reference backend (M0 done). Executes packets synchronously through pure Zig kernels. This is the validation oracle for every GPU tier.
 * **`src/zinc_rt/isa/cpu_zig/`** — 14 CPU kernels: `embed`, `rms_norm`, `residual_rms_norm`, `rope`, `flash_attn`, `swiglu`, `sigmoid_mul`, `vadd`, `moe_gate_topk`, `lm_head`, `argmax`, `dequant` (shared GGML row + Q4_0/Q8_0 dot loops), `matvec`, plus the `mod.zig` glue.
 * **`src/zinc_rt/fast_pool.zig`** — persistent worker pool for decode matvec fan-out. Atomic-only dispatch, no heap/mutex traffic. Measured worth ~2–5 tok/s vs `std.Thread.Pool` on the scalar path; `ZINC_RT_FAST_POOL=0` disables.
+* **`src/zinc_rt/batching.zig`** — tenant-aware admission and batch-selection primitives. Every request must name an explicitly registered tenant; there is no anonymous default-tenant admission path. The planner enforces per-tenant active-request limits, per-batch prefill-token limits, and per-batch decode-slot limits, then round-robins prefill and decode rows across tenants. This is planner groundwork only; it is not wired into `forward_zinc_rt` or the HTTP server yet.
 * **`src/compute/forward_zinc_rt.zig`** — ~5 600 lines. Bridges `forward.zig`'s model loading and tokenizer into ZINC_RT. **First-class models today:** Qwen 3.6 35B-A3B (MoE + F32 SSM hybrid), Qwen 3.6 27B (dense), Qwen 3 8B / 14B / 32B (dense), Gemma 4 (MoE + GELU activation, per-layer output scales, SWA RoPE).
 
 ### 1.A.2 What is scaffolded but not on the model-value hot path
@@ -121,7 +122,7 @@ This section is the ground truth of what is in tree *today*, ahead of every aspi
 ### 1.A.3 What is in the design doc but has zero code yet
 
 * **Direct GPU model decode.** No `dmmv_q4k.s`, no `flash_attn.s`, no router kernel, no megakernel. The next concrete step is a Q4_0/Q8_0 DMMV row-range kernel reachable via T1 that consumes a value the prompt actually uses (effort 15, recommended-next-moves #1).
-* **Continuous-batching scheduler (§18).** Design section is fully written; no `src/zinc_rt/sched/` directory exists. Aggregate-throughput numbers in §3.2 are forecasts only.
+* **End-to-end continuous-batching executor (§18).** `src/zinc_rt/batching.zig` can admit tenants and select prefill/decode batches, but `forward_zinc_rt` still runs one request at a time and the `-Dbackend=zinc_rt` binary is still CLI-only. Server integration, batched KV ownership, and batched graph execution are M3 work. Aggregate-throughput numbers in §3.2 are forecasts only.
 * **Paged KV v2 (§19).** Design section is written; no `src/zinc_rt/mem/pagetable.zig` exists.
 * **T-Metal tier (§16).** Apple Silicon still ships via the standalone `src/metal/` + `src/compute/forward_metal.zig` path. The fold-in to ZINC_RT has not started. The standalone Metal backend remains a first-class build target via `-Dbackend=metal`.
 * **T-Intel (§22, M7) and T-CUDA (§22, M8).** Planning posts exist (`site/src/content/posts/2026-05-18-intel-arc-pro-b70-deep-dive-and-zincs-t-intel-plan.md`); no `src/zinc_rt/ring/i915.zig`, `src/zinc_rt/ring/cuda.zig`, or `src/zinc_rt/isa/{xe2hpg,sm_90}/` exist.
