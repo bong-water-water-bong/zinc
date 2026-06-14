@@ -73,6 +73,15 @@ const Engine = union(enum) {
 
 const DEFAULT_MODEL = "/home/agent-zinc/workspace/Qwen3.5-9B-Q4_K_M.gguf";
 
+/// Effort 25: batched-GEMM prefill is the DEFAULT for gemma (matches main.zig).
+/// True unless ZINC_BATCHED_PREFILL is explicitly off (0/off/false/no). qwen has
+/// no prefillBatched (Engine returns error.Unsupported) so it falls back anyway.
+fn batchedPrefillDefaultOn() bool {
+    const v = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
 // Synthetic compute kernel for the dispatch sync-vs-async bench: a per-thread
 // FMA loop of `iters` so each dispatch costs a tunable, decode-matvec-like amount.
 const BENCH_CU =
@@ -178,10 +187,12 @@ fn genMode(allocator: std.mem.Allocator, ids_arg: []const u8, ngen: u32, model_p
     // need no logits, so ZINC_PREFILL_SKIP=1 runs them via prefillStep (skips
     // the LM head, bit-identical generation) to A/B the head-skip prefill win.
     const pf_skip = std.posix.getenv("ZINC_PREFILL_SKIP") != null;
-    // Effort 24: ZINC_BATCHED_PREFILL routes the whole prompt through the batched
-    // GEMM prefill (gemma dense). Used by scripts/prefill_catalog.sh to A/B the
-    // batched-vs-per-token GEN_IDS (must be byte-identical — the gate).
-    const pf_batched = std.posix.getenv("ZINC_BATCHED_PREFILL") != null;
+    // Effort 25: batched-GEMM prefill is the DEFAULT for gemma (qwen falls back
+    // via error.Unsupported). ZINC_BATCHED_PREFILL=0/off opts out to per-token.
+    // scripts/prefill_catalog.sh forces the opt-out on its baseline arm so the
+    // batched-vs-per-token A/B (GEN_IDS must be byte-identical — the gate) still
+    // measures the real delta after the default flip.
+    const pf_batched = batchedPrefillDefaultOn();
     var pos: u32 = 0;
     var tok: u32 = 0;
     var pf_timer = try std.time.Timer.start();

@@ -31,4 +31,24 @@ not fake a qwen win.
 - Gate (validate_catalog 5/5 + token-correct) before ANY commit. Negative → revert + log.
 
 ## CYCLE LOG
-- (none yet)
+- 2026-06-13 — **TARGET 1 DONE (production win, committed+pushed).** Batched-GEMM
+  prefill is now the DEFAULT for the gemma forwards (`ForwardGemma.prefillBatched`),
+  opt-OUT via `ZINC_BATCHED_PREFILL=0/off/false/no`. Wired in `src/main.zig`
+  (`batchedPrefillDefaultOn()` + comptime-gated call site so qwen `ForwardCuda`,
+  which has no `prefillBatched`, stays per-token & still compiles) and `src/dbg_cuda.zig`
+  (same default + `error.Unsupported` runtime fallback for qwen). `scripts/prefill_catalog.sh`
+  baseline arm now forces `ZINC_BATCHED_PREFILL=0` so the A/B still measures the real
+  per-token-vs-batched delta after the default flip. Box build clean (EXIT=0, cuda-dbg,
+  isolated `~/zinc-e25-box` caches, 4090). GATE: `validate_catalog.sh` **5/5 token-correct
+  vs llama.cpp on the bare-default path** (gemma now batched by default; qwen35-9b/qwen36-27b/
+  qwen36-35b-a3b 12/12, gemma4-26b 12/12, gemma4-31b teacher-forced 11/12 = known near-tie).
+  `prefill_catalog.sh` batched A/B (gemma-only): gemma4-31b 6.64→164.09 t/s, gemma4-26b
+  57.83→76.94 t/s, **both PASS (GEN_IDS identical)** — the Effort-24 prefill speedup is now
+  production, not opt-in.
+- 2026-06-13 — **TARGET 2 BLOCKED (gate not met, no work done — per hard rule).**
+  `origin/main:src/compute/forward_cuda.zig` (qwen `ForwardCuda`) still exposes only
+  per-token `decodeStep`/`prefillStep` — NO `prefillBatched`, no batched/chunked SSM
+  scan. The parallel team's qwen prefill work is Metal-only so far (see recent
+  `metal: batch Qwen 9B queued prefill chunks`). CUDA qwen batched prefill needs a
+  batched SSM scan prereq that is not on main → do NOT wire / fake it. Re-check next
+  cycle: `git grep prefillBatched origin/main -- src/compute/forward_cuda.zig`.
