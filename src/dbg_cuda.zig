@@ -124,6 +124,13 @@ pub fn main() !void {
         const ngen: u32 = std.fmt.parseInt(u32, args.next() orelse "16", 10) catch 16;
         const model_path = args.next() orelse DEFAULT_MODEL;
         try genMode(allocator, ids_arg, ngen, model_path);
+    } else if (std.mem.eql(u8, first, "batch")) {
+        // Effort 28 increment 1 (1a): multi-sequence harness. '|' separates
+        // sequences, ',' separates prompt token-ids within a sequence.
+        const seqs_arg = args.next() orelse "760,6511,314,9338,369|450,3271,310,3444,338";
+        const ngen: u32 = std.fmt.parseInt(u32, args.next() orelse "8", 10) catch 8;
+        const model_path = args.next() orelse DEFAULT_MODEL;
+        try batchMode(allocator, seqs_arg, ngen, model_path);
     } else if (std.mem.eql(u8, first, "prof")) {
         const model_path = args.next() orelse DEFAULT_MODEL;
         try profMode(allocator, model_path);
@@ -235,6 +242,94 @@ fn genMode(allocator: std.mem.Allocator, ids_arg: []const u8, ngen: u32, model_p
         const secs = @as(f64, @floatFromInt(ns)) / 1e9;
         const steps: f64 = @floatFromInt(ngen - 1);
         std.debug.print("DECODE: {d} tokens in {d:.3}s = {d:.2} tok/s (correctness-first, sync-per-layer)\n", .{ ngen - 1, secs, steps / secs });
+    }
+}
+
+/// Effort 28 increment 1, sub-step 1a — multi-sequence batched-serving harness.
+///
+/// Generates each of B sequences (prompts separated by '|', ids by ',')
+/// INDEPENDENTLY through the production single-sequence path (prefillBatched /
+/// decodeStep over the shared kv_k cache, which each sequence overwrites from
+/// pos 0 — sound because every sequence reads only positions it wrote). Emits
+/// `BATCH_SEQ{j}:tok,tok,...` per sequence. This is the SERIAL REFERENCE that
+/// the future `decodeBatch` proof (sub-step 1d) must reproduce token-identically.
+///
+/// It also exercises the NEW slot-based KV plumbing (gemma only): allocate one
+/// slot per sequence and run `slotKvSmoke` to validate the slot-offset
+/// arithmetic the batched forward (1b/1c) will depend on. Additive — the
+/// production decode path is untouched.
+fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, model_path: []const u8) !void {
+    var dev = try device.CudaDevice.initBest(allocator);
+    defer dev.deinit();
+    var model = try loader.Model.load(allocator, dev.ctx, model_path);
+    defer model.deinit();
+    var fwd = try Engine.init(allocator, &model, 512);
+    defer fwd.deinit();
+
+    const pf_batched = batchedPrefillDefaultOn();
+
+    var seq_it = std.mem.splitScalar(u8, seqs_arg, '|');
+    var nseq: u32 = 0;
+    while (seq_it.next()) |seq_str| {
+        const seq_trim = std.mem.trim(u8, seq_str, " ");
+        if (seq_trim.len == 0) continue;
+
+        var prompt_buf: [256]u32 = undefined;
+        var np: usize = 0;
+        var it = std.mem.splitScalar(u8, seq_trim, ',');
+        while (it.next()) |s| {
+            const t = std.mem.trim(u8, s, " ");
+            if (t.len == 0 or np >= prompt_buf.len) continue;
+            prompt_buf[np] = try std.fmt.parseInt(u32, t, 10);
+            np += 1;
+        }
+        if (np == 0) continue;
+        const prompt = prompt_buf[0..np];
+
+        // Prefill (mirror genMode): batched-GEMM prefill for gemma, else per-token.
+        var pos: u32 = 0;
+        var tok: u32 = 0;
+        var used_batched = false;
+        if (pf_batched and prompt.len > 1) {
+            if (fwd.prefillBatched(prompt)) |first| {
+                tok = first;
+                pos = @intCast(prompt.len);
+                used_batched = true;
+            } else |_| {}
+        }
+        if (!used_batched) {
+            for (prompt) |t| {
+                tok = try fwd.decodeStep(t, pos, true);
+                pos += 1;
+            }
+        }
+
+        std.debug.print("BATCH_SEQ{d}:{d}", .{ nseq, tok });
+        var g: u32 = 1;
+        while (g < ngen) : (g += 1) {
+            const next = try fwd.decodeStep(tok, pos, true);
+            pos += 1;
+            std.debug.print(",{d}", .{next});
+            tok = next;
+        }
+        std.debug.print("\n", .{});
+        nseq += 1;
+    }
+
+    // Slot-KV plumbing smoke (gemma): one slot per sequence (>=1), modest ctx.
+    switch (fwd) {
+        .gemma => |*g| {
+            const slots = if (nseq == 0) 1 else nseq;
+            try g.allocSlotKv(slots, 512);
+            const ok = g.slotKvSmoke() catch |e| {
+                std.debug.print("SLOTKV_SMOKE:ERR {s}\n", .{@errorName(e)});
+                g.freeSlotKv();
+                return;
+            };
+            std.debug.print("SLOTKV_SMOKE:{s} (slots={d} slot_ctx=512)\n", .{ if (ok) "ok" else "FAIL", slots });
+            g.freeSlotKv();
+        },
+        else => {},
     }
 }
 

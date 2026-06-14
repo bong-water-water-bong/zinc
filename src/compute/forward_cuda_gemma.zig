@@ -346,6 +346,17 @@ pub const ForwardGemma = struct {
     kv_k: []CudaBuffer,
     kv_v: []CudaBuffer,
 
+    // Effort 28 increment 1 — slot-based KV for batched / continuous decode.
+    // Allocated lazily by allocSlotKv (driven by the dbg_cuda `batch` harness);
+    // SEPARATE from the production single-sequence kv_k/kv_v, which stay the
+    // default and are never touched. Each concurrent sequence occupies one slot
+    // of up to slot_ctx positions: the K/V for (slot s, pos p) in layer L live at
+    // (s*slot_ctx + p)*kv_dim(L). Null until a batched path allocates them.
+    kv_k_slots: ?[]CudaBuffer = null,
+    kv_v_slots: ?[]CudaBuffer = null,
+    n_slots: u32 = 0,
+    slot_ctx: u32 = 0,
+
     // Effort 24: lazily-allocated batched-prefill scratch (null until the first
     // ZINC_BATCHED_PREFILL run; freed in deinit).
     batch: ?BatchScratch = null,
@@ -620,6 +631,7 @@ pub const ForwardGemma = struct {
         a.free(self.host_router);
         a.free(self.down_scales);
         self.freeBatch();
+        self.freeSlotKv();
         inline for (std.meta.fields(Pipelines)) |f| {
             if (comptime std.mem.eql(u8, f.name, "dmmv")) {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
@@ -1257,6 +1269,89 @@ pub const ForwardGemma = struct {
             }
             self.batch = null;
         }
+    }
+
+    // ---- Effort 28 increment 1: slot-based KV (batched / continuous decode) --
+
+    /// Allocate slot-based KV for `n_slots` concurrent sequences of up to
+    /// `slot_ctx` positions each. ADDITIVE: a fresh per-layer allocation that
+    /// never aliases or touches the production single-sequence kv_k/kv_v. The
+    /// batched-decode path (sub-steps 1b/1c) writes/reads it via
+    /// `slotKvOffsetBytes`; the production decodeStep is unchanged. Idempotent —
+    /// frees any prior slot KV first. Sub-step 1a only allocates + smoke-tests it.
+    pub fn allocSlotKv(self: *ForwardGemma, n_slots: u32, slot_ctx: u32) !void {
+        self.freeSlotKv();
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const kk = try self.allocator.alloc(CudaBuffer, self.d.n_layers);
+        const vv = try self.allocator.alloc(CudaBuffer, self.d.n_layers);
+        for (0..self.d.n_layers) |li| {
+            const bytes = @as(usize, n_slots) * slot_ctx * self.geom[li].kv_dim * f4;
+            kk[li] = try buffer.createBuffer(ctx, bytes);
+            vv[li] = try buffer.createBuffer(ctx, bytes);
+        }
+        self.kv_k_slots = kk;
+        self.kv_v_slots = vv;
+        self.n_slots = n_slots;
+        self.slot_ctx = slot_ctx;
+    }
+
+    pub fn freeSlotKv(self: *ForwardGemma) void {
+        if (self.kv_k_slots) |ks| {
+            for (ks) |*b| buffer.freeBuffer(b);
+            self.allocator.free(ks);
+            self.kv_k_slots = null;
+        }
+        if (self.kv_v_slots) |vs| {
+            for (vs) |*b| buffer.freeBuffer(b);
+            self.allocator.free(vs);
+            self.kv_v_slots = null;
+        }
+        self.n_slots = 0;
+        self.slot_ctx = 0;
+    }
+
+    /// Byte offset of sequence-slot `slot`'s K/V for position `pos` in layer `L`'s
+    /// slot KV buffer: (slot*slot_ctx + pos)*kv_dim(L)*sizeof(f32). This is the
+    /// exact indexing the 1c per-sequence kv-write + slot attention kernels use.
+    pub fn slotKvOffsetBytes(self: *const ForwardGemma, L: u32, slot: u32, pos: u32) usize {
+        return (@as(usize, slot) * self.slot_ctx + pos) * self.geom[L].kv_dim * @sizeOf(f32);
+    }
+
+    /// Sub-step 1a plumbing smoke: prove the slot-KV offset arithmetic round-trips
+    /// and that distinct (slot,pos) pairs map to NON-overlapping device regions.
+    /// Writes a sentinel into (slot 0, pos 0) and a distinct pattern into the LAST
+    /// (slot, pos) of layer 0's K cache, reads both back, and checks neither write
+    /// clobbered the other. Returns true on success. Requires allocSlotKv first.
+    pub fn slotKvSmoke(self: *ForwardGemma) !bool {
+        const ks = self.kv_k_slots orelse return error.SlotKvNotAllocated;
+        if (self.n_slots == 0 or self.slot_ctx == 0) return error.SlotKvNotAllocated;
+        const ctx = self.ctx;
+        const kv_dim = self.geom[0].kv_dim;
+        const f4 = @sizeOf(f32);
+        const pat = try self.allocator.alloc(f32, kv_dim);
+        defer self.allocator.free(pat);
+        const sentinel = try self.allocator.alloc(f32, kv_dim);
+        defer self.allocator.free(sentinel);
+        const rd = try self.allocator.alloc(f32, kv_dim);
+        defer self.allocator.free(rd);
+        for (pat, 0..) |*v, i| v.* = 1234.5 + @as(f32, @floatFromInt(i));
+        @memset(sentinel, -1.0);
+
+        const off_pat = self.slotKvOffsetBytes(0, self.n_slots - 1, self.slot_ctx - 1);
+        const off_sent = self.slotKvOffsetBytes(0, 0, 0);
+        var v_pat = try buffer.aliasBuffer(&ks[0], off_pat, kv_dim * f4);
+        defer buffer.freeBuffer(&v_pat);
+        var v_sent = try buffer.aliasBuffer(&ks[0], off_sent, kv_dim * f4);
+        defer buffer.freeBuffer(&v_sent);
+
+        buffer.upload(ctx, &v_sent, std.mem.sliceAsBytes(sentinel)); // (0,0)
+        buffer.upload(ctx, &v_pat, std.mem.sliceAsBytes(pat)); // far away
+        buffer.download(ctx, &v_pat, std.mem.sliceAsBytes(rd));
+        for (pat, rd) |x, y| if (x != y) return false;
+        buffer.download(ctx, &v_sent, std.mem.sliceAsBytes(rd));
+        for (sentinel, rd) |x, y| if (x != y) return false;
+        return true;
     }
 
     // ---- per-block builders -------------------------------------------------
