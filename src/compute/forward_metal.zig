@@ -23721,10 +23721,14 @@ fn shouldSkipFinalPromptTail(
 
     // Adapt llama.cpp's graph materialization discipline: non-terminal prompt
     // tokens only need the last layer's K/V cache rows, not the final hidden
-    // state or logits. Qwen SSM already used this path; Gemma26 MoE has all
-    // layers in full-attention form, so the same final-layer K/V-only tail is
-    // valid for queued prefill while leaving decode untouched.
+    // state or logits. Qwen SSM MoE already used this path; the dense Qwen35 9B
+    // queued prefill shape has the same final full-attention layer, so its
+    // nonterminal prompt tokens can skip the final-layer attention output and
+    // dense FFN tail too. Gemma26 MoE has all layers in full-attention form, so
+    // the same final-layer K/V-only tail is valid for queued prefill while
+    // leaving decode untouched.
     if (cfg.architecture == .qwen2_moe and cfg.ssm_d_inner != 0) return true;
+    if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return true;
     if (isGemma26A4BMoeShape(cfg)) return true;
     return false;
 }
@@ -32122,6 +32126,12 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expect(!shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_9b_cfg, true, false));
     try std.testing.expect(!defaultQwen35Dense9bQueuedPrefillEnabled(qwen35_27b_cfg));
     try std.testing.expect(!shouldUseDenseQwen35QueuedPrefillTokenCommand(qwen35_27b_cfg, true, true));
+
+    try std.testing.expect(shouldSkipFinalPromptTail(qwen35_9b_cfg, true, false, 31, 32));
+    try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_9b_cfg, true, true, 31, 32));
+    try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_9b_cfg, true, false, 30, 32));
+    try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_9b_cfg, false, false, 31, 32));
+    try std.testing.expect(!shouldSkipFinalPromptTail(qwen35_27b_cfg, true, false, 63, 64));
 }
 
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
