@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1724"/><stop offset="1" stop-color="#18251f"/></linearGradient>
+    <linearGradient id="zinc" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#38d7ff"/><stop offset="1" stop-color="#58e6a9"/></linearGradient>
+    <linearGradient id="mute" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#274056"/><stop offset="1" stop-color="#2b4a44"/></linearGradient>
+    <style>
+      .title{fill:#f6fbff;font-size:31px;font-weight:780}
+      .subtitle{fill:#aebdcc;font-size:15px}
+      .ptitle{fill:#f6fbff;font-size:20px;font-weight:760}
+      .psub{fill:#9fb0c0;font-size:13px}
+      .axis{fill:#8595a8;font-size:13px}
+      .label{fill:#e8f1f8;font-size:16px;font-weight:720}
+      .sub{fill:#9fb0c0;font-size:13px}
+      .dn{fill:#9fb0c0;font-size:12px;font-weight:600}
+      .gain{fill:#ffd86b;font-size:17px;font-weight:820}
+      .moe{fill:#58e6a9;font-size:12px;font-weight:760}
+      .leg{fill:#aebdcc;font-size:13px}
+    </style>
+  </defs>
+  <rect width="1200" height="900" fill="url(#bg)"/>
+  <text x="56" y="56" class="title">A day later: prefill and decode, re-measured on RTX 5090</text>
+  <text x="56" y="84" class="subtitle">Muted bar = previously published snapshot; bright = the gain to today's build. tok/s, medians of three.</text>
+  <g transform="translate(820,44)"><rect x="0" y="0" width="22" height="13" rx="3" fill="url(#mute)"/><text x="30" y="11" class="leg">published</text><rect x="138" y="0" width="22" height="13" rx="3" fill="url(#zinc)"/><text x="168" y="11" class="leg">today</text></g>
+  <text x="56" y="164" class="ptitle">Prefill — fp16 tensor-core path wired</text>
+  <text x="56" y="184" class="psub">Gemma-26B MoE 12.8x; ZINC now beats llama.cpp on dense Qwen prefill</text>
+  <g transform="translate(300,190)">
+    <text x="0" y="-10" class="axis">0</text>
+    <line x1="0" y1="2" x2="0" y2="348" stroke="#263548" />
+    <text x="220" y="-10" class="axis">40</text>
+    <line x1="220" y1="2" x2="220" y2="348" stroke="#263548" stroke-dasharray="4 6"/>
+    <text x="440" y="-10" class="axis">80</text>
+    <line x1="440" y1="2" x2="440" y2="348" stroke="#263548" stroke-dasharray="4 6"/>
+    <text x="660" y="-10" class="axis">120 tok/s</text>
+    <line x1="660" y1="2" x2="660" y2="348" stroke="#263548" stroke-dasharray="4 6"/>
+    <rect x="0" y="0" width="46" height="46" rx="6" fill="url(#mute)"/>
+    <rect x="46" y="0" width="539" height="46" rx="6" fill="url(#zinc)"/>
+    <text x="599" y="30" class="gain">12.8x</text>
+    <text x="-16" y="24" text-anchor="end" class="label">Gemma-4-26B <tspan class="moe">MoE</tspan></text>
+    <text x="-16" y="42" text-anchor="end" class="sub">8.3 &#8594; 106.3</text>
+    <rect x="0" y="74" width="81" height="46" rx="6" fill="url(#mute)"/>
+    <rect x="81" y="74" width="169" height="46" rx="6" fill="url(#zinc)"/>
+    <text x="264" y="104" class="gain">3.1x</text>
+    <text x="-16" y="98" text-anchor="end" class="label">Qwen3.6-35B-A3B <tspan class="moe">MoE</tspan></text>
+    <text x="-16" y="116" text-anchor="end" class="sub">14.8 &#8594; 45.5</text>
+    <rect x="0" y="148" width="164" height="46" rx="6" fill="url(#mute)"/>
+    <rect x="164" y="148" width="151" height="46" rx="6" fill="url(#zinc)"/>
+    <text x="329" y="178" class="gain">1.92x</text>
+    <text x="-16" y="172" text-anchor="end" class="label">Gemma-4-31B <tspan class="dn">dense</tspan></text>
+    <text x="-16" y="190" text-anchor="end" class="sub">29.9 &#8594; 57.3</text>
+    <rect x="0" y="222" width="355" height="46" rx="6" fill="url(#mute)"/>
+    <rect x="355" y="222" width="182" height="46" rx="6" fill="url(#zinc)"/>
+    <text x="551" y="252" class="gain">1.51x</text>
+    <text x="-16" y="246" text-anchor="end" class="label">Qwen3.5-9B <tspan class="dn">dense</tspan></text>
+    <text x="-16" y="264" text-anchor="end" class="sub">64.6 &#8594; 97.6</text>
+    <rect x="0" y="296" width="216" height="46" rx="6" fill="url(#mute)"/>
+    <rect x="216" y="296" width="47" height="46" rx="6" fill="url(#zinc)"/>
+    <text x="277" y="326" class="gain">1.22x</text>
+    <text x="-16" y="320" text-anchor="end" class="label">Qwen3.6-27B <tspan class="dn">dense</tspan></text>
+    <text x="-16" y="338" text-anchor="end" class="sub">39.2 &#8594; 47.8</text>
+  </g>
+  <text x="56" y="534" class="ptitle">Decode — 51% → 70% of llama.cpp</text>
+  <text x="56" y="554" class="psub">catalog average 39.6 → 63.7 tok/s; MoE still the frontier</text>
+  <g transform="translate(300,560)">
+    <text x="0" y="-10" class="axis">0</text>
+    <line x1="0" y1="2" x2="0" y2="348" stroke="#263548" />
+    <text x="254" y="-10" class="axis">50</text>
+    <line x1="254" y1="2" x2="254" y2="348" stroke="#263548" stroke-dasharray="4 6"/>
+    <text x="508" y="-10" class="axis">100 tok/s</text>
+    <line x1="508" y1="2" x2="508" y2="348" stroke="#263548" stroke-dasharray="4 6"/>
+    <rect x="0" y="0" width="42" height="46" rx="6" fill="url(#mute)"/>
+    <rect x="42" y="0" width="199" height="46" rx="6" fill="url(#zinc)"/>
+    <text x="255" y="30" class="gain">5.7x</text>
+    <text x="-16" y="24" text-anchor="end" class="label">Gemma-4-26B <tspan class="moe">MoE</tspan></text>
+    <text x="-16" y="42" text-anchor="end" class="sub">8.3 &#8594; 47.5</text>
+    <rect x="0" y="74" width="83" height="46" rx="6" fill="url(#mute)"/>
+    <rect x="83" y="74" width="186" height="46" rx="6" fill="url(#zinc)"/>
+    <text x="283" y="104" class="gain">3.2x</text>
+    <text x="-16" y="98" text-anchor="end" class="label">Qwen3.6-35B-A3B <tspan class="moe">MoE</tspan></text>
+    <text x="-16" y="116" text-anchor="end" class="sub">16.3 &#8594; 52.9</text>
+    <rect x="0" y="148" width="172" height="46" rx="6" fill="url(#mute)"/>
+    <rect x="172" y="148" width="66" height="46" rx="6" fill="url(#zinc)"/>
+    <text x="252" y="178" class="gain">1.38x</text>
+    <text x="-16" y="172" text-anchor="end" class="label">Gemma-4-31B <tspan class="dn">dense</tspan></text>
+    <text x="-16" y="190" text-anchor="end" class="sub">33.9 &#8594; 46.9</text>
+    <rect x="0" y="222" width="467" height="46" rx="6" fill="url(#mute)"/>
+    <rect x="467" y="222" width="146" height="46" rx="6" fill="url(#zinc)"/>
+    <text x="627" y="252" class="gain">1.31x</text>
+    <text x="-16" y="246" text-anchor="end" class="label">Qwen3.5-9B <tspan class="dn">dense</tspan></text>
+    <text x="-16" y="264" text-anchor="end" class="sub">92 &#8594; 120.8</text>
+    <rect x="0" y="296" width="242" height="46" rx="6" fill="url(#mute)"/>
+    <rect x="242" y="296" width="14" height="46" rx="6" fill="url(#zinc)"/>
+    <text x="270" y="326" class="gain">1.06x</text>
+    <text x="-16" y="320" text-anchor="end" class="label">Qwen3.6-27B <tspan class="dn">dense</tspan></text>
+    <text x="-16" y="338" text-anchor="end" class="sub">47.7 &#8594; 50.5</text>
+  </g>
+</svg>
