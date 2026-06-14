@@ -4040,6 +4040,25 @@ export function shouldRejectPlateauNeutralKeep(args: {
   return false;
 }
 
+export function shouldKeepFoundationEvidenceStep(args: {
+  stepKind: StepKind;
+  cycleBaselineTokPerSec: number | null | undefined;
+  verifyTokPerSec: number | null | undefined;
+  cycleBaselineSamples?: number[];
+  verifySamples?: number[];
+}): boolean {
+  if (args.stepKind !== "analysis" && args.stepKind !== "enablement") return false;
+  const baseline = args.cycleBaselineTokPerSec ?? 0;
+  const verify = args.verifyTokPerSec ?? 0;
+  if (baseline <= 0 || verify <= 0) return false;
+
+  const baselineAgg = aggregateTimedSamples(args.cycleBaselineSamples ?? []);
+  const verifyAgg = aggregateTimedSamples(args.verifySamples ?? []);
+  const observedRange = Math.max(baselineAgg.range, verifyAgg.range);
+  const tolerance = Math.max(0.25, baseline * 0.015, observedRange);
+  return verify >= baseline - tolerance;
+}
+
 export function shouldRejectQwen36PlateauNeutralKeep(args: {
   state: RunState;
   stepKind: StepKind;
@@ -4637,6 +4656,17 @@ async function main() {
       state.bestTokPerSec = verifyTps;
       state.stalledCycles = 0;
       console.log(clr("1;32", `  ✅ KEPT — gained correct output! ${verifyTps.toFixed(2)} ${METRIC_LABEL}`));
+    } else if (verify.containsReference && shouldKeepFoundationEvidenceStep({
+      stepKind,
+      cycleBaselineTokPerSec: result.tokPerSec,
+      verifyTokPerSec: verifyTps,
+      cycleBaselineSamples: result.tokPerSecSamples,
+      verifySamples: verify.tokPerSecSamples,
+    })) {
+      kept = true;
+      state.stalledCycles++;
+      const cycleBaselineTps = result.tokPerSec ?? 0;
+      console.log(clr("1;33", `  ≈ KEPT — ${stepKind} evidence stayed flat vs cycle baseline ${cycleBaselineTps.toFixed(2)} → ${verifyTps.toFixed(2)} ${METRIC_LABEL}; promoted best ${bestTps.toFixed(2)} unchanged`));
     } else {
       // Regressed speed or no correctness
       console.log(clr("1;31", `  ↩ REVERTING — ${verifyTps.toFixed(2)} ${METRIC_LABEL} < current ${acceptedTps.toFixed(2)} (regressed ${(acceptedTps - verifyTps).toFixed(2)}; band -${noiseBand.toFixed(2)})`));

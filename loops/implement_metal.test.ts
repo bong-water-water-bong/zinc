@@ -39,6 +39,7 @@ import {
   recordNearMiss,
   shouldRejectPlateauNeutralKeep,
   shouldConfirmCandidate,
+  shouldKeepFoundationEvidenceStep,
   shouldFinalizeBestTree,
   shouldRunCandidateEvidence,
   shouldRunMetalShapesEvidence,
@@ -1285,6 +1286,32 @@ describe("buildPrompt", () => {
       verifyTokPerSec: 38.4,
       acceptedTokPerSec: 38.4,
       currentProgressBand: 0.25,
+    })).toBe(false);
+  });
+
+  test("Qwen3.5 M4 keeps foundation evidence when the cycle baseline drifted below accepted", () => {
+    expect(shouldKeepFoundationEvidenceStep({
+      stepKind: "analysis",
+      cycleBaselineTokPerSec: 38.0,
+      verifyTokPerSec: 38.0,
+      cycleBaselineSamples: [38.0, 38.0, 37.9],
+      verifySamples: [38.0, 38.0, 38.0],
+    })).toBe(true);
+
+    expect(shouldKeepFoundationEvidenceStep({
+      stepKind: "optimization",
+      cycleBaselineTokPerSec: 38.0,
+      verifyTokPerSec: 38.0,
+      cycleBaselineSamples: [38.0, 38.0, 37.9],
+      verifySamples: [38.0, 38.0, 38.0],
+    })).toBe(false);
+
+    expect(shouldKeepFoundationEvidenceStep({
+      stepKind: "enablement",
+      cycleBaselineTokPerSec: 38.0,
+      verifyTokPerSec: 37.0,
+      cycleBaselineSamples: [38.0, 38.0, 37.9],
+      verifySamples: [37.0, 37.0, 37.1],
     })).toBe(false);
   });
 
