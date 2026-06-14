@@ -225,6 +225,13 @@ pub const ForwardCuda = struct {
     // CUstream. Defaults so the init literal need not list them.
     pending: [1024]command.CudaCommand = undefined,
     n_pending: u32 = 0,
+    // CUDA-graph decode replay (Effort 25, behind ZINC_CUDA_GRAPH). When set, the
+    // dense per-step kernel chain is stream-captured into a cached CUgraphExec and
+    // replayed as ONE graph launch — collapsing the ~480 launch-bound kernel
+    // dispatches/token into a single submission. `capturing` is true only while
+    // recording, switching `submit`/attention to a no-sync capture path.
+    graph: ?*shim.CudaGraph = null,
+    capturing: bool = false,
     // MoE scratch (only used when n_experts > 0)
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
     router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
@@ -380,11 +387,20 @@ pub const ForwardCuda = struct {
             buffer.upload(ctx, &self.sinks, std.mem.sliceAsBytes(sk));
         }
 
+        // CUDA-graph decode replay (opt-in via ZINC_CUDA_GRAPH). Only the dense
+        // path (n_experts==0) is graph-capturable — the MoE router reads expert
+        // ids back to the host mid-block, which is illegal during stream capture.
+        if (d.n_experts == 0 and std.posix.getenv("ZINC_CUDA_GRAPH") != null) {
+            self.graph = shim.cuda_graph_create();
+            log.info("ZINC_CUDA_GRAPH: dense decode will replay via a captured CUDA graph", .{});
+        }
+
         return self;
     }
 
     pub fn deinit(self: *ForwardCuda) void {
         const a = self.allocator;
+        if (self.graph) |g| shim.cuda_graph_free(g);
         inline for (.{ &self.hidden, &self.norm_buf, &self.qfull_buf, &self.q_buf, &self.k_buf, &self.v_buf, &self.gate_buf, &self.attn_out_buf, &self.ffn_norm_buf, &self.up_buf, &self.swiglu_buf, &self.router_buf, &self.down_buf, &self.logits_buf, &self.argmax_buf, &self.router_logits_buf, &self.router_out_buf, &self.gate_scalar_buf, &self.inv_freq, &self.sinks }) |b| {
             buffer.freeBuffer(b);
         }
@@ -418,9 +434,22 @@ pub const ForwardCuda = struct {
         const d = self.d;
         const ctx = self.ctx;
 
-        // EMBED: CPU-dequant the token_embd row, upload to hidden.
+        // EMBED: CPU-dequant the token_embd row, upload to hidden. Done OUTSIDE
+        // any graph capture — it depends on host data and buffer.upload syncs the
+        // stream (illegal mid-capture); the captured chain starts from `hidden`.
         self.model.dequantEmbeddingRow(token, self.host_embed);
         buffer.upload(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
+
+        // TAIL tensors (resolved up-front so the graph and async paths share them).
+        const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
+        const lm_head = self.model.get("output.weight") orelse return error.MissingTensor;
+
+        // CUDA-graph replay path: capture the full dense per-step chain (layers +
+        // tail) and launch it as one graph. Bit-identical to the async chain (same
+        // kernels, same order, same single stream) — see decodeStepGraph.
+        if (run_layers and self.graph != null) {
+            return try self.decodeStepGraph(pos, &out_norm.gpu_buffer, &lm_head.gpu_buffer, lm_head.info.type_);
+        }
 
         if (run_layers) {
             var L: u32 = 0;
@@ -435,29 +464,68 @@ pub const ForwardCuda = struct {
         }
 
         // TAIL: final rms_norm → LM head → argmax.
-        const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
-        const lm_head = self.model.get("output.weight") orelse return error.MissingTensor;
-
         var cmd = try command.beginCommand(ctx);
-        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &out_norm.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
-        const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
-        // LM head is the single biggest matvec (vocab x n_embd, Q6_K). Use the fast
-        // variant at block=64 like every other quant matvec; f32 falls back to base.
-        const lm_idx = dmmvIdx(lm_head.info.type_);
-        if (lm_idx < 4) {
-            cmd.dispatch(&self.pipes.dmmv_fast[lm_idx], .{ d.vocab, 1, 1 }, .{ 64, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
-        } else {
-            cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
-        }
-        const am = ArgmaxPush{ .N = d.vocab };
-        cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &self.argmax_buf }, &am, @sizeOf(ArgmaxPush), 0);
+        self.tailDispatch(&cmd, &out_norm.gpu_buffer, &lm_head.gpu_buffer, lm_head.info.type_);
         cmd.commitAndWait(); // drains the whole stream incl. the async layer ops
         self.drainPending(); // free the stashed async commands (completion guaranteed)
 
         var tok: u32 = 0;
         buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
         return tok;
+    }
+
+    /// Dense decode step via CUDA-graph replay (Effort 25). `hidden` already holds
+    /// the embedded token. Stream-captures the layer chain + tail into the cached
+    /// CUgraphExec and launches it as one submission, eliminating the per-kernel
+    /// launch + inter-kernel-bubble latency of the ~480-kernel launch-bound chain.
+    /// While `capturing`, `submit` and the attention kernel take a no-sync,
+    /// shape-invariant path so the captured topology is identical every step
+    /// (only per-token push-constant scalars change → cheap in-place exec update).
+    fn decodeStepGraph(self: *ForwardCuda, pos: u32, out_norm: *const CudaBuffer, lm_head: *const CudaBuffer, lm_type: gguf.GGMLType) !u32 {
+        const d = self.d;
+        const ctx = self.ctx;
+
+        self.capturing = true;
+        _ = shim.cuda_graph_begin(ctx);
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            if (isFullAttn(L, d.full_attn_interval)) {
+                try self.attentionLayer(L, pos);
+            } else {
+                try self.ssmLayer(L);
+            }
+            try self.ffnBlock(L); // dense only — graph path is gated on n_experts==0
+        }
+        var cmd = try command.beginCommand(ctx);
+        self.tailDispatch(&cmd, out_norm, lm_head, lm_type);
+        cmd.releaseCompleted(); // captured onto the stream; no event record / no sync
+        self.capturing = false;
+
+        // End capture, instantiate-or-update the cached exec, launch + sync.
+        _ = shim.cuda_graph_end_launch(ctx, self.graph.?);
+
+        var tok: u32 = 0;
+        buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
+        return tok;
+    }
+
+    /// Record the decode tail (final rms_norm → LM head matvec → argmax) onto
+    /// `cmd`. Shared by the async and graph-capture paths.
+    fn tailDispatch(self: *ForwardCuda, cmd: *command.CudaCommand, out_norm: *const CudaBuffer, lm_head: *const CudaBuffer, lm_type: gguf.GGMLType) void {
+        const d = self.d;
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, out_norm, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
+        // LM head is the single biggest matvec (vocab x n_embd, Q6_K). Use the fast
+        // variant at block=64 like every other quant matvec; f32 falls back to base.
+        const lm_idx = dmmvIdx(lm_type);
+        if (lm_idx < 4) {
+            cmd.dispatch(&self.pipes.dmmv_fast[lm_idx], .{ d.vocab, 1, 1 }, .{ 64, 1, 1 }, &.{ lm_head, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ lm_head, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+        }
+        const am = ArgmaxPush{ .N = d.vocab };
+        cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &self.argmax_buf }, &am, @sizeOf(ArgmaxPush), 0);
     }
 
     // ---- per-block builders -------------------------------------------------
@@ -502,7 +570,13 @@ pub const ForwardCuda = struct {
         // attention: out → attn_out_buf
         const seq_len = pos + 1;
         const attn = AttnPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .seq_len = seq_len, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
-        cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.kv_k[L], &self.kv_v[L], &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), seq_len * 4);
+        // naive_attention's dynamic shared mem holds `seq_len` f32 scores. Under
+        // graph capture, request the MAX (max_ctx) so the kernel node's shared-mem
+        // size is constant across steps — keeping the captured topology invariant
+        // (only push scalars change) so the exec updates in place instead of
+        // re-instantiating each token. The kernel still uses only seq_len entries.
+        const attn_smem: u32 = if (self.capturing) self.max_ctx * 4 else seq_len * 4;
+        cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.kv_k[L], &self.kv_v[L], &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), attn_smem);
         // gate: attn_out *= sigmoid(gate)
         const sm = SigmoidMulPush{ .N = d.q_dim };
         cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.attn_out_buf, &self.gate_buf, &self.attn_out_buf }, &sm, @sizeOf(SigmoidMulPush), 0);
@@ -719,6 +793,14 @@ pub const ForwardCuda = struct {
     /// ~4 syncs/layer to 1 (the router) — recovering the starved GPU boost.
     fn submit(self: *ForwardCuda, cmd: command.CudaCommand) void {
         var c = cmd;
+        if (self.capturing) {
+            // Graph capture: the dispatches are already recorded onto the captured
+            // stream. Don't record a completion event or sync — just free the
+            // (unused) command handle; the single graph launch + its sync drains
+            // all captured work at the end of the step.
+            c.releaseCompleted();
+            return;
+        }
         if (self.n_pending < self.pending.len) {
             c.commitAsync();
             self.pending[self.n_pending] = c;

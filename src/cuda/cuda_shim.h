@@ -28,10 +28,11 @@
 #include <stddef.h>
 
 // Opaque handles
-typedef struct CudaCtx CudaCtx;   // device + context + default compute stream
-typedef struct CudaBuf CudaBuf;   // device allocation (+ optional pinned host mirror)
-typedef struct CudaPipe CudaPipe; // compiled CUfunction (+ its CUmodule)
-typedef struct CudaCmd CudaCmd;   // stream batch + completion event
+typedef struct CudaCtx CudaCtx;     // device + context + default compute stream
+typedef struct CudaBuf CudaBuf;     // device allocation (+ optional pinned host mirror)
+typedef struct CudaPipe CudaPipe;   // compiled CUfunction (+ its CUmodule)
+typedef struct CudaCmd CudaCmd;     // stream batch + completion event
+typedef struct CudaGraph CudaGraph; // cached captured per-step kernel chain (CUgraphExec)
 
 // ---- Device lifecycle --------------------------------------------------------
 // device_index selects the CUDA device (PCI-bus order is the caller's concern;
@@ -98,6 +99,25 @@ void cuda_commit_and_wait(CudaCmd* cmd);
 void cuda_commit_async(CudaCmd* cmd);
 void cuda_wait(CudaCmd* cmd);
 void cuda_release_completed(CudaCmd* cmd);
+
+// ---- CUDA Graphs (decode replay, Effort 25) ----------------------------------
+// Capture the per-decode-step kernel chain once and replay it as a SINGLE graph
+// launch, collapsing the ~480 per-kernel launches + inter-kernel GPU bubbles of
+// a launch-bound step into one submission. Per-step usage:
+//     cuda_graph_begin(ctx);            // start capturing the ctx stream
+//     ... issue the normal cuda_dispatch chain (captured, NOT executed) ...
+//     cuda_graph_end_launch(ctx, g);    // end capture, instantiate-or-update the
+//                                        // cached exec, launch it, sync the stream
+// The exec is cached in `g` and updated in place across steps (per-token params —
+// position, seq_len, KV offset — change but topology is invariant); on an update
+// failure it is re-instantiated from the freshly captured graph, so the launched
+// exec always matches the current step's parameters (bit-identical to the
+// un-captured chain). MUST NOT be used around a chain that synchronizes or reads
+// back mid-capture (e.g. the MoE router host readback).
+CudaGraph* cuda_graph_create(void);
+int        cuda_graph_begin(CudaCtx* ctx);                 // 1 on success, 0 on failure
+int        cuda_graph_end_launch(CudaCtx* ctx, CudaGraph* graph); // 1 on success
+void       cuda_graph_free(CudaGraph* graph);
 
 // ---- Diagnostics -------------------------------------------------------------
 // Last CUDA/NVRTC error string for the calling thread ("" if none). Not freed.
