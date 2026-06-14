@@ -413,12 +413,24 @@ pub const ForwardCuda = struct {
             buffer.upload(ctx, &self.sinks, std.mem.sliceAsBytes(sk));
         }
 
-        // CUDA-graph decode replay (opt-in via ZINC_CUDA_GRAPH). Only the dense
-        // path (n_experts==0) is graph-capturable — the MoE router reads expert
-        // ids back to the host mid-block, which is illegal during stream capture.
-        if (d.n_experts == 0 and std.posix.getenv("ZINC_CUDA_GRAPH") != null) {
-            self.graph = shim.cuda_graph_create();
-            log.info("ZINC_CUDA_GRAPH: dense decode will replay via a captured CUDA graph", .{});
+        // CUDA-graph decode replay (opt-in via ZINC_CUDA_GRAPH). The dense path
+        // (n_experts==0) is always capturable. The MoE path is capturable ONLY when
+        // every layer takes the batched async expert path (Effort-27 C1): that path
+        // reads expert ids GPU-side with NO host readback, so the whole MoE step is
+        // a static stream. Before C1's q5k/q6k experts kernels, mixed-quant layers
+        // fell to a per-slot fallback that synced + read ids back mid-block (illegal
+        // during capture) — which is why Effort-25 C4 found the catalog MoE non-
+        // capturable. With all-quant batched experts, the 35b-a3b now qualifies.
+        if (std.posix.getenv("ZINC_CUDA_GRAPH") != null) {
+            if (d.n_experts == 0) {
+                self.graph = shim.cuda_graph_create();
+                log.info("ZINC_CUDA_GRAPH: dense decode will replay via a captured CUDA graph", .{});
+            } else if (self.moeGraphCapturable()) {
+                self.graph = shim.cuda_graph_create();
+                log.info("ZINC_CUDA_GRAPH: MoE decode (all-batched experts) will replay via a captured CUDA graph", .{});
+            } else {
+                log.info("ZINC_CUDA_GRAPH: MoE has a non-batched expert layer (per-slot fallback) — graph disabled", .{});
+            }
         }
 
         return self;
@@ -571,7 +583,9 @@ pub const ForwardCuda = struct {
             } else {
                 try self.ssmLayer(L);
             }
-            try self.ffnBlock(L); // dense only — graph path is gated on n_experts==0
+            // MoE path is captured too when every layer is batched (moeGraphCapturable
+            // gated this at setup); the batched expert path is a static stream.
+            if (d.n_experts > 0) try self.moeFfnBlock(L) else try self.ffnBlock(L);
         }
         var cmd = try command.beginCommand(ctx);
         self.tailDispatch(&cmd, out_norm, lm_head, lm_type);
@@ -771,6 +785,25 @@ pub const ForwardCuda = struct {
             .q6_k => &self.pipes.dmmv_q6k_experts,
             else => null,
         };
+    }
+
+    /// MoE decode is graph-capturable iff EVERY layer takes the batched async
+    /// expert path — i.e. each layer's gate/up/down expert tensors all have a
+    /// batched experts kernel (`expertsPipe != null`). Any layer that would fall
+    /// to the per-slot path syncs + reads ids back to the host mid-block, which is
+    /// illegal during stream capture. Mirrors the `batched_experts` predicate in
+    /// `moeFfnBlock`, checked over all layers up front.
+    fn moeGraphCapturable(self: *ForwardCuda) bool {
+        var L: u32 = 0;
+        while (L < self.d.n_layers) : (L += 1) {
+            const wge = self.layer(L, "ffn_gate_exps.weight");
+            const wue = self.layer(L, "ffn_up_exps.weight");
+            const wde = self.layer(L, "ffn_down_exps.weight");
+            if (self.expertsPipe(wge.info.type_) == null) return false;
+            if (self.expertsPipe(wue.info.type_) == null) return false;
+            if (self.expertsPipe(wde.info.type_) == null) return false;
+        }
+        return true;
     }
 
     fn moeFfnBlock(self: *ForwardCuda, L: u32) !void {
