@@ -2497,11 +2497,10 @@ fn consumeDirectLogitsArgmaxRowRange(
 
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
 const direct_lm_head_q4_0_parallel_chunk_rows: u32 = 64;
-// Cover the historical 4096-row consumed LM-head proof by default. Agents can
-// lower this with ZINC_RT_DIRECT_LM_HEAD_PREFIX_ROWS for one-chunk smoke runs,
-// but the default keeps the same CPU-work replacement while trimming redundant
-// validation around already-GPU-scored rows.
-const direct_lm_head_q4_0_argmax_prefix_rows_default: u32 = 4096;
+// Keep the default consumed LM-head proof to one parallel chunk. Broader
+// prefixes remain opt-in validation; recurring/staged CS slices are already
+// measured-dead for throughput on the RDNA4 node.
+const direct_lm_head_q4_0_argmax_prefix_rows_default: u32 = direct_lm_head_q4_0_parallel_chunk_rows;
 const direct_lm_head_q4_0_selected_window_rows: u32 = 64;
 const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 5 * 1024 * 1024;
 
@@ -10226,7 +10225,7 @@ test "direct LM-head Q4_0 prefix stays chunk-aligned and bounded" {
     const row_bytes = rowBytesForType(.q4_0, qwen_hidden_dim);
     try std.testing.expect(@as(usize, direct_lm_head_q4_0_argmax_prefix_rows_default) * row_bytes <= direct_lm_head_q4_0_argmax_max_weight_bytes);
     try std.testing.expectEqual(
-        @as(u32, 4096),
+        @as(u32, direct_lm_head_q4_0_parallel_chunk_rows),
         directLmHeadQ4_0ArgmaxPrefixRowsForLimit(4096, row_bytes, 4096, direct_lm_head_q4_0_argmax_prefix_rows_default),
     );
     try std.testing.expectEqual(
