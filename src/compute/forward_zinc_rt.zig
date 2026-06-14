@@ -5985,6 +5985,7 @@ const MoeSharedParams = struct {
 const direct_moe_gate_up_q4_0_tolerance: f32 = 0.05;
 const direct_moe_gate_up_q4_0_range_rows: u32 = 64;
 const direct_moe_gate_up_q4_0_max_expert_slots: u32 = 2;
+const direct_moe_gate_up_q4_0_trust_after_successes: u32 = 1;
 const direct_moe_down_q4_0_tolerance: f32 = 0.05;
 const direct_moe_down_q4_0_chunk_rows: u32 = 64;
 const direct_moe_down_q4_0_range_rows: u32 = direct_moe_down_q4_0_chunk_rows * 4;
@@ -6272,6 +6273,311 @@ fn consumeDirectMoeGateUpQ4_0TwoRoutedSlots(
     return true;
 }
 
+fn directMoeGateUpScratch(
+    state: *ScalarDecodeState,
+    input_sum32: ?[]const f32,
+    needed: usize,
+) ?[]f32 {
+    const scratch_base = if (input_sum32) |sums| sums.len else 0;
+    if (state.row_scratch.len < scratch_base + needed) return null;
+    return state.row_scratch[scratch_base..][0..needed];
+}
+
+fn consumeDirectMoeGateUpQ4_0TwoRoutedSlotsBeforeCpuTail(
+    state: *ScalarDecodeState,
+    maybe_tracking: ?DirectComputeTracking,
+    params: []MoeExpertWorker,
+    input_sum32: ?[]const f32,
+    consumed_prefix_rows: []u32,
+) bool {
+    const tracking = maybe_tracking orelse return false;
+    if (tracking.phase != .decode) return false;
+    if (consumed_prefix_rows.len < params.len) return false;
+    if (state.direct_moe_gate_up_row_range_count + 2 > direct_moe_gate_up_q4_0_max_expert_slots) return false;
+
+    const range_rows = direct_moe_gate_up_q4_0_range_rows;
+    const range_len: usize = @intCast(range_rows);
+    var candidates: [2]DirectMoeGateUpQ4_0Candidate = undefined;
+    var candidate_count: usize = 0;
+    for (params, 0..) |*param, i| {
+        if (candidate_count == candidates.len) break;
+        if (param.is_shared) continue;
+        if (param.gate_type != .q4_0 or param.up_type != .q4_0) continue;
+        if (param.intermediate_dim < range_rows or param.gate.len < range_len or param.up.len < range_len) continue;
+        const cols_for_param: u32 = @intCast(param.ffn_norm.len);
+        if (cols_for_param == 0 or cols_for_param % 32 != 0) continue;
+        const row_bytes_for_param = rowBytesForType(.q4_0, cols_for_param);
+        const range_bytes_for_param = range_len * row_bytes_for_param;
+        if (row_bytes_for_param == 0 or param.gate_raw.len < range_bytes_for_param or param.up_raw.len < range_bytes_for_param) continue;
+        candidates[candidate_count] = .{ .param = param, .expert_slot = i };
+        candidate_count += 1;
+    }
+    if (candidate_count != candidates.len) return false;
+
+    const first = candidates[0].param;
+    const second = candidates[1].param;
+    const cols: u32 = @intCast(first.ffn_norm.len);
+    if (cols == 0 or cols % 32 != 0 or second.ffn_norm.len != first.ffn_norm.len) return false;
+    if (first.ffn_norm.ptr != second.ffn_norm.ptr) return false;
+
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    const range_bytes = range_len * row_bytes;
+    const scratch = directMoeGateUpScratch(state, input_sum32, range_len * 8) orelse return false;
+    const gpu_rows = scratch[0 .. range_len * 4];
+    tracking.boundary.dmmvQ4_0FourRowRangesParallel64(
+        first.ffn_norm,
+        first.gate_raw[0..range_bytes],
+        first.up_raw[0..range_bytes],
+        second.gate_raw[0..range_bytes],
+        second.up_raw[0..range_bytes],
+        cols,
+        gpu_rows,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 two-slot prefix-before-tail unavailable ({s}); gate/up projections remain host-computed", .{@errorName(err)});
+        return false;
+    };
+
+    const trusted_no_oracle = state.direct_moe_gate_up_row_range_count >= direct_moe_gate_up_q4_0_trust_after_successes;
+    var max_gate_delta: f32 = 0.0;
+    var max_up_delta: f32 = 0.0;
+    var max_gate_slot: usize = candidates[0].expert_slot;
+    var max_up_slot: usize = candidates[0].expert_slot;
+    var max_gate_row: u32 = 0;
+    var max_up_row: u32 = 0;
+
+    if (!trusted_no_oracle) {
+        const cpu_rows = scratch[range_len * 4 .. range_len * 8];
+        matvecRawDirectSerial(first.gate_raw, .q4_0, first.ffn_norm, input_sum32, 0, range_rows, cpu_rows[0..range_len]) catch return false;
+        matvecRawDirectSerial(first.up_raw, .q4_0, first.ffn_norm, input_sum32, 0, range_rows, cpu_rows[range_len..][0..range_len]) catch return false;
+        matvecRawDirectSerial(second.gate_raw, .q4_0, second.ffn_norm, input_sum32, 0, range_rows, cpu_rows[range_len * 2 ..][0..range_len]) catch return false;
+        matvecRawDirectSerial(second.up_raw, .q4_0, second.ffn_norm, input_sum32, 0, range_rows, cpu_rows[range_len * 3 ..][0..range_len]) catch return false;
+
+        for (candidates, 0..) |candidate, ci| {
+            const base = ci * range_len * 2;
+            const gate_gpu = gpu_rows[base..][0..range_len];
+            const up_gpu = gpu_rows[base + range_len ..][0..range_len];
+            const gate_cpu = cpu_rows[base..][0..range_len];
+            const up_cpu = cpu_rows[base + range_len ..][0..range_len];
+            for (0..range_len) |i| {
+                if (!std.math.isFinite(gate_gpu[i]) or !std.math.isFinite(up_gpu[i])) {
+                    log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 two-slot prefix-before-tail produced non-finite expert_slot={d} row={d}; gate/up projections remain host-computed", .{ candidate.expert_slot, i });
+                    return false;
+                }
+                const gate_delta = @abs(gate_gpu[i] - gate_cpu[i]);
+                const up_delta = @abs(up_gpu[i] - up_cpu[i]);
+                if (gate_delta > max_gate_delta) {
+                    max_gate_delta = gate_delta;
+                    max_gate_slot = candidate.expert_slot;
+                    max_gate_row = @intCast(i);
+                }
+                if (up_delta > max_up_delta) {
+                    max_up_delta = up_delta;
+                    max_up_slot = candidate.expert_slot;
+                    max_up_row = @intCast(i);
+                }
+            }
+        }
+        if (max_gate_delta > direct_moe_gate_up_q4_0_tolerance or max_up_delta > direct_moe_gate_up_q4_0_tolerance) {
+            log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 two-slot prefix-before-tail mismatch: gate_delta={d:.6} gate_slot={d} gate_row={d} up_delta={d:.6} up_slot={d} up_row={d}; gate/up projections remain host-computed", .{
+                max_gate_delta,
+                max_gate_slot,
+                max_gate_row,
+                max_up_delta,
+                max_up_slot,
+                max_up_row,
+            });
+            return false;
+        }
+    } else {
+        for (gpu_rows, 0..) |gpu, i| {
+            if (!std.math.isFinite(gpu)) {
+                log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 two-slot prefix-before-tail produced non-finite output {d}; gate/up projections remain host-computed", .{i});
+                return false;
+            }
+        }
+    }
+
+    for (candidates, 0..) |candidate, ci| {
+        const param = candidate.param;
+        const base = ci * range_len * 2;
+        @memcpy(param.gate[0..range_len], gpu_rows[base..][0..range_len]);
+        @memcpy(param.up[0..range_len], gpu_rows[base + range_len ..][0..range_len]);
+        consumed_prefix_rows[candidate.expert_slot] = range_rows;
+    }
+    state.direct_moe_gate_up_row_range_count += 2;
+    tracking.ops.* += 4;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += 4;
+    if (trusted_no_oracle) {
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_expert_gate_up_q4_0_two_slots_prefix_before_cpu_tail phase=decode expert_slot_a={d} expert_id_a={d} expert_slot_b={d} expert_id_b={d} rows_per_projection={d} cols={d} chunks=4 trust_after_successes={d} validation=finite_only consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            candidates[0].expert_slot,
+            first.expert_id,
+            candidates[1].expert_slot,
+            second.expert_id,
+            range_rows,
+            cols,
+            direct_moe_gate_up_q4_0_trust_after_successes,
+        });
+    } else {
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_expert_gate_up_q4_0_two_slots_prefix_before_cpu_tail phase=decode expert_slot_a={d} expert_id_a={d} expert_slot_b={d} expert_id_b={d} rows_per_projection={d} cols={d} chunks=4 max_gate_delta={d:.6} max_gate_slot={d} max_gate_row={d} max_up_delta={d:.6} max_up_slot={d} max_up_row={d} consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            candidates[0].expert_slot,
+            first.expert_id,
+            candidates[1].expert_slot,
+            second.expert_id,
+            range_rows,
+            cols,
+            max_gate_delta,
+            max_gate_slot,
+            max_gate_row,
+            max_up_delta,
+            max_up_slot,
+            max_up_row,
+        });
+    }
+    return true;
+}
+
+fn consumeDirectMoeGateUpQ4_0PrefixBeforeCpuTail(
+    state: *ScalarDecodeState,
+    maybe_tracking: ?DirectComputeTracking,
+    param: *MoeExpertWorker,
+    expert_slot: usize,
+    input_sum32: ?[]const f32,
+    consumed_prefix_rows: []u32,
+) u32 {
+    const tracking = maybe_tracking orelse return 0;
+    if (tracking.phase != .decode) return 0;
+    if (expert_slot >= consumed_prefix_rows.len or consumed_prefix_rows[expert_slot] != 0) return 0;
+    if (!canConsumeDirectMoeGateUpQ4_0Param(state, param)) return 0;
+    if (param.gate_type != .q4_0 or param.up_type != .q4_0) return 0;
+    if (param.intermediate_dim < direct_moe_gate_up_q4_0_range_rows) return 0;
+
+    const cols: u32 = @intCast(param.ffn_norm.len);
+    if (cols == 0 or cols % 32 != 0) return 0;
+    const row_bytes = rowBytesForType(.q4_0, cols);
+    if (row_bytes == 0) return 0;
+
+    const range_rows = direct_moe_gate_up_q4_0_range_rows;
+    const range_len: usize = @intCast(range_rows);
+    const range_bytes = range_len * row_bytes;
+    if (param.gate.len < range_len or param.up.len < range_len) return 0;
+    if (param.gate_raw.len < range_bytes or param.up_raw.len < range_bytes) return 0;
+
+    const scratch = directMoeGateUpScratch(state, input_sum32, range_len * 4) orelse return 0;
+    const gpu_rows = scratch[0 .. range_len * 2];
+    tracking.boundary.dmmvQ4_0TwoRowRangesParallel64(
+        param.ffn_norm,
+        param.gate_raw[0..range_bytes],
+        param.up_raw[0..range_bytes],
+        cols,
+        gpu_rows,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 prefix-before-tail unavailable ({s}); gate/up projections remain host-computed", .{@errorName(err)});
+        return 0;
+    };
+
+    const trusted_no_oracle = state.direct_moe_gate_up_row_range_count >= direct_moe_gate_up_q4_0_trust_after_successes;
+    var max_gate_delta: f32 = 0.0;
+    var max_up_delta: f32 = 0.0;
+    var max_gate_row: u32 = 0;
+    var max_up_row: u32 = 0;
+    if (!trusted_no_oracle) {
+        const cpu_rows = scratch[range_len * 2 .. range_len * 4];
+        matvecRawDirectSerial(param.gate_raw, .q4_0, param.ffn_norm, input_sum32, 0, range_rows, cpu_rows[0..range_len]) catch {
+            log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 prefix-before-tail CPU oracle failed; gate/up projections remain host-computed", .{});
+            return 0;
+        };
+        matvecRawDirectSerial(param.up_raw, .q4_0, param.ffn_norm, input_sum32, 0, range_rows, cpu_rows[range_len..][0..range_len]) catch {
+            log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 prefix-before-tail CPU oracle failed; gate/up projections remain host-computed", .{});
+            return 0;
+        };
+        for (0..range_len) |i| {
+            const gate_gpu = gpu_rows[i];
+            const up_gpu = gpu_rows[range_len + i];
+            if (!std.math.isFinite(gate_gpu) or !std.math.isFinite(up_gpu)) {
+                log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 prefix-before-tail produced non-finite row {d}; gate/up projections remain host-computed", .{i});
+                return 0;
+            }
+            const gate_delta = @abs(gate_gpu - cpu_rows[i]);
+            const up_delta = @abs(up_gpu - cpu_rows[range_len + i]);
+            if (gate_delta > max_gate_delta) {
+                max_gate_delta = gate_delta;
+                max_gate_row = @intCast(i);
+            }
+            if (up_delta > max_up_delta) {
+                max_up_delta = up_delta;
+                max_up_row = @intCast(i);
+            }
+        }
+        if (max_gate_delta > direct_moe_gate_up_q4_0_tolerance or max_up_delta > direct_moe_gate_up_q4_0_tolerance) {
+            log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 prefix-before-tail mismatch: expert_slot={d} expert_id={d} shared={d} gate_delta={d:.6} gate_row={d} up_delta={d:.6} up_row={d}; gate/up projections remain host-computed", .{
+                expert_slot,
+                param.expert_id,
+                @as(u32, @intFromBool(param.is_shared)),
+                max_gate_delta,
+                max_gate_row,
+                max_up_delta,
+                max_up_row,
+            });
+            return 0;
+        }
+    } else {
+        for (gpu_rows, 0..) |gpu, i| {
+            if (!std.math.isFinite(gpu)) {
+                log.warn("M1 AMDGPU CS direct MoE gate/up Q4_0 prefix-before-tail produced non-finite output {d}; gate/up projections remain host-computed", .{i});
+                return 0;
+            }
+        }
+    }
+
+    @memcpy(param.gate[0..range_len], gpu_rows[0..range_len]);
+    @memcpy(param.up[0..range_len], gpu_rows[range_len..][0..range_len]);
+    consumed_prefix_rows[expert_slot] = range_rows;
+    if (param.is_shared) {
+        state.direct_shared_moe_gate_up_row_range_done = true;
+    } else {
+        state.direct_moe_gate_up_row_range_count += 1;
+    }
+    tracking.ops.* += 2;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += 2;
+    const op_name: []const u8 = if (param.is_shared)
+        "moe_shared_gate_up_q4_0_prefix_before_cpu_tail"
+    else
+        "moe_expert_gate_up_q4_0_prefix_before_cpu_tail";
+    if (trusted_no_oracle) {
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase=decode expert_slot={d} expert_id={d} rows_per_projection={d} cols={d} chunks=2 trust_after_successes={d} validation=finite_only consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            op_name,
+            expert_slot,
+            param.expert_id,
+            range_rows,
+            cols,
+            direct_moe_gate_up_q4_0_trust_after_successes,
+        });
+    } else {
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase=decode expert_slot={d} expert_id={d} rows_per_projection={d} cols={d} chunks=2 max_gate_delta={d:.6} max_gate_row={d} max_up_delta={d:.6} max_up_row={d} consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            op_name,
+            expert_slot,
+            param.expert_id,
+            range_rows,
+            cols,
+            max_gate_delta,
+            max_gate_row,
+            max_up_delta,
+            max_up_row,
+        });
+    }
+    return range_rows;
+}
+
 fn consumeDirectMoeGateUpQ4_0Rows(
     state: *ScalarDecodeState,
     maybe_tracking: ?DirectComputeTracking,
@@ -6538,6 +6844,42 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
         if (requires_input_sum32) return false;
         break :sums null;
     };
+
+    var gate_up_prefix_rows = [_]u32{0} ** moe_expert_parallel_max_workers;
+    if (direct_compute_tracking != null) {
+        _ = consumeDirectMoeGateUpQ4_0TwoRoutedSlotsBeforeCpuTail(
+            state,
+            direct_compute_tracking,
+            params,
+            input_sum32,
+            gate_up_prefix_rows[0..params.len],
+        );
+        for (params, 0..) |*param, i| {
+            if (!canConsumeDirectMoeGateUpQ4_0Param(state, param)) continue;
+            _ = consumeDirectMoeGateUpQ4_0PrefixBeforeCpuTail(
+                state,
+                direct_compute_tracking,
+                param,
+                i,
+                input_sum32,
+                gate_up_prefix_rows[0..params.len],
+            );
+        }
+        for (params, 0..) |*param, i| {
+            const prefix_rows = gate_up_prefix_rows[i];
+            if (prefix_rows == 0 or prefix_rows >= param.intermediate_dim) continue;
+            const row_bytes = rowBytesForType(.q4_0, @intCast(ffn_norm.len));
+            const prefix_bytes = @as(usize, prefix_rows) * row_bytes;
+            if (row_bytes == 0 or param.gate_raw.len < prefix_bytes or param.up_raw.len < prefix_bytes) return false;
+            gate_up[i * 2].raw = param.gate_raw[prefix_bytes..];
+            gate_up[i * 2].rows = param.intermediate_dim - prefix_rows;
+            gate_up[i * 2].out = param.gate[prefix_rows..];
+            gate_up[i * 2 + 1].raw = param.up_raw[prefix_bytes..];
+            gate_up[i * 2 + 1].rows = param.intermediate_dim - prefix_rows;
+            gate_up[i * 2 + 1].out = param.up[prefix_rows..];
+        }
+    }
+
     matvecFused(pool, gate_up[0 .. params.len * 2], ffn_norm, input_sum32) catch return false;
     if (direct_compute_tracking != null) {
         _ = consumeDirectMoeGateUpQ4_0TwoRoutedSlots(state, direct_compute_tracking, params);
@@ -9836,6 +10178,8 @@ test "direct router row-range names full parallel chunks" {
 }
 
 test "direct MoE down Q4_0 prefix uses chunk-aligned row ranges" {
+    try std.testing.expectEqual(@as(u32, 64), direct_moe_gate_up_q4_0_range_rows);
+    try std.testing.expectEqual(@as(u32, 1), direct_moe_gate_up_q4_0_trust_after_successes);
     try std.testing.expect(direct_moe_down_q4_0_range_rows > direct_moe_down_q4_0_chunk_rows);
     try std.testing.expectEqual(@as(u32, 0), direct_moe_down_q4_0_range_rows % direct_moe_down_q4_0_chunk_rows);
     try std.testing.expectEqual(@as(u32, 4), directMoeDownQ4_0RangeChunks(direct_moe_down_q4_0_range_rows));
