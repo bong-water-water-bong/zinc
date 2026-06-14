@@ -60,7 +60,7 @@ ZINC_MODEL_ID=qwen35-9b-q4k-m \
 ZINC_METRIC_MODE=prefill \
 ZINC_PROMPT_MODE=raw \
 ZINC_TEST_PROMPT="$PROMPT" \
-ZINC_REFERENCE_TEXT="tokens per second" \
+ZINC_REFERENCE_TEXT="token throughput" \
 ZINC_MAX_TOKENS=96 \
 ZINC_MIN_DECODE_TOKENS=32 \
 ZINC_TARGET_TOK_PER_SEC=333 \
@@ -90,7 +90,7 @@ ZINC_MODEL_ID=qwen35-9b-q4k-m \
 ZINC_METRIC_MODE=prefill \
 ZINC_PROMPT_MODE=raw \
 ZINC_TEST_PROMPT="$PROMPT" \
-ZINC_REFERENCE_TEXT="tokens per second" \
+ZINC_REFERENCE_TEXT="token throughput" \
 ZINC_MAX_TOKENS=96 \
 ZINC_MIN_DECODE_TOKENS=32 \
 ZINC_BENCHMARK_RUNS=3 \
@@ -110,10 +110,11 @@ Current public numbers:
 
 Harness correctness sentinel:
 
-- Use `ZINC_REFERENCE_TEXT="tokens per second"`.
-- Do not use the literal `tok/s` as the sentinel. The baseline answer is
-  semantically correct but may phrase the unit as `tokens per second`, and the
-  loop should not route a valid baseline into rollback/correctness-repair mode.
+- Use `ZINC_REFERENCE_TEXT="token throughput"`.
+- The harness checks its short output preview, not the full generated text.
+  The baseline first line contains `token throughput`; later lines contain
+  `tokens per second`. Avoid `tok/s` or later-line strings, because they route a
+  valid baseline into rollback/correctness-repair mode.
 
 Milestones:
 
