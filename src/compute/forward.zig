@@ -15795,6 +15795,25 @@ pub const InferenceEngine = struct {
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
         if (!self.isAmdRdna()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
+
+        // Mesa 26.0-devel regression workaround (measured on the Radeon RX
+        // 9070 XT / GFX1201 with cooperative matrix exposed): the int8 DP4a
+        // dense gate+up+SwiGLU shader (`mul_mm_q4k_gate_up_swiglu_full_dp4a`)
+        // runs ~25x slower than the non-DP4a branchless Q4_K path — a 64-token
+        // prefill measured 9095 ms in the gateup matmul (6.8 tok/s overall)
+        // versus ~0 ms (169 tok/s) on the branchless path, with identical
+        // output. The same shader is fast on RDNA4 without cooperative matrix
+        // (Radeon AI PRO R9700 / Mesa 25.0.7). Default to the branchless path
+        // for the 9B on this configuration; force DP4a back on with
+        // ZINC_QWEN_DENSE_FFN_DP4A=1.
+        if (self.isQwen35DenseHybrid9B() and
+            self.gpu_config.vendor == .amd_rdna4 and
+            self.instance.caps.cooperative_matrix)
+        {
+            const force_dp4a = std.posix.getenv("ZINC_QWEN_DENSE_FFN_DP4A");
+            if (force_dp4a == null or !std.mem.eql(u8, force_dp4a.?, "1")) return false;
+        }
+
         if (std.posix.getenv("ZINC_QWEN_DENSE_FFN_DP4A")) |v| {
             if (std.mem.eql(u8, v, "0")) return false;
         }
