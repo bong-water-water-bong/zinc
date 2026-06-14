@@ -2700,6 +2700,24 @@ function applyPhaseBudgetCollection(
 }
 
 async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): Promise<BenchResult> {
+  // RX 9070 XT (rdna2) in dynamic power mode ramps sclk from 0 MHz on every
+  // short prefill burst, producing 25-30% sample-to-sample noise (160 vs 210
+  // tok/s on identical code) that buries real improvements under the median.
+  // Pin the card to high-performance so the benchmark is stable. Gated to
+  // rdna2 — RDNA1 is managed by the zinc_rt_autopilot loop and Mesa 25.0.7
+  // there does not show this ramp-on-burst behaviour. Disable with
+  // ZINC_FORCE_GPU_HIGH=0. Idempotent + best-effort, so a node reboot or a
+  // driver reset mid-loop no longer silently reintroduces the noise.
+  if (SELECTED_RDNA_NODE === "rdna2" && process.env.ZINC_FORCE_GPU_HIGH !== "0") {
+    try {
+      await ssh(
+        `for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do echo high > "$f" 2>/dev/null || true; done`,
+        15_000,
+      );
+    } catch {
+      // best-effort; the benchmark can proceed regardless
+    }
+  }
   console.log(c("2", "  Compiling shaders..."));
   try {
     await ssh(`cd ${REMOTE_DIR} && rm -rf zig-out/share/zinc/shaders`, 30_000);
