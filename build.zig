@@ -287,6 +287,7 @@ pub fn build(b: *std.Build) void {
         "ssm_conv1d_batched",
         "mul_mm_q6k_full",
         "mul_mm_q6k_full_down_acc",
+        "mul_mm_q4k_down_acc",
         "mul_mm_q4k_tail8",
         "mul_mm_q4k_gate_up_swiglu_full",
         // Vulkan port of the Metal MoE route-pack kernel; the .comp was added

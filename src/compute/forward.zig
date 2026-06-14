@@ -16776,12 +16776,47 @@ pub const InferenceEngine = struct {
                 return false;
             }
         }
-        // Fused-residual Q6_K full-tile path: when an accumulate target is
+        // Fused-residual dense-down path: when an accumulate target is
         // provided, the GEMM writes directly into the hidden buffer with
         // d[idx] += result, eliminating the standalone barrier +
-        // scale_accumulate dispatch. Only applies to 32-aligned full tiles
-        // on the generic Q6_K path (no ragged tail, no DP4a).
+        // scale_accumulate dispatch. The Q4_K variant fires for the
+        // Qwen3.5-9B (whose down_proj is Q4_K); the Q6_K variant fires for
+        // the Qwen3.6-27B. Both remove one barrier + one dispatch per
+        // dense-FFN layer.
         if (accum_target) |target| {
+            // Q4_K fused down+acc: handles ragged token counts via in-shader
+            // boundary checks (same as the base mul_mm_q4k shader).
+            if (down_t.info.type_ == .q4_k and
+                (hidden_dim & 31) == 0 and
+                (inter_dim & 255) == 0 and
+                self.use_mul_mm_proj and
+                self.isQwenDenseHybridLayerMajorPrefillModel() and
+                self.dmmv.pipeline_mul_mm_q4k_down_acc != null)
+            {
+                const down_matmul_phase = self.beginProfilePhase();
+                try self.dmmv.recordMulMmQ4KDownAcc(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    down_t.gpu_buffer.handle,
+                    down_t.gpu_buffer.size,
+                    scratch_swiglu.handle,
+                    scratch_swiglu.size,
+                    target.handle,
+                    target.size,
+                    hidden_dim,
+                    n_tokens,
+                    inter_dim,
+                    inter_dim,
+                    hidden_dim,
+                    0,
+                    0,
+                    0,
+                );
+                self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
+                return true;
+            }
+            // Q6_K fused down+acc: only applies to 32-aligned full tiles
+            // (no ragged tail, no DP4a).
             if (down_t.info.type_ == .q6_k and
                 (hidden_dim & 31) == 0 and
                 (n_tokens & 31) == 0 and

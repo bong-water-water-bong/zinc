@@ -518,6 +518,11 @@ pub const DmmvDispatch = struct {
     /// will add the MUL_MAT_ID variant. 3 bindings (A weights, B f32
     /// activations, D f32 outputs), push = MulMmQ4KPush.
     pipeline_mul_mm_q4k: ?Pipeline,
+    /// Same GEMM as pipeline_mul_mm_q4k but the output ACCUMULATES into
+    /// d_data (d[idx] += result). Used by the fused dense-FFN residual path
+    /// to eliminate the standalone barrier + scale_accumulate dispatch.
+    /// Fires for the Qwen3.5-9B whose down_proj is Q4_K.
+    pipeline_mul_mm_q4k_down_acc: ?Pipeline,
     /// Batched dense FFN front-end for Qwen3.6-27B: gate/up Q4_K GEMMs plus
     /// SwiGLU in one tiled dispatch.
     pipeline_mul_mm_q4k_gate_up_swiglu: ?Pipeline,
@@ -1130,6 +1135,14 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k != null) {
             log.info("mul_mm_q4k pipeline loaded (tiled Q4_K dense GEMM; LM head opt-in via ZINC_MUL_MM_LM_HEAD=1)", .{});
         }
+        const mul_mm_q4k_down_acc_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_down_acc.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q4k_down_acc = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_down_acc_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_down_acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_down_acc != null) {
+            log.info("mul_mm_q4k_down_acc pipeline loaded (fused-residual Q4_K dense-down GEMM)", .{});
+        }
         const mul_mm_q4k_tail8_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_tail8.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q4k_tail8 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_tail8_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_tail8 shader not loaded: {s}", .{@errorName(err)});
@@ -1580,6 +1593,7 @@ pub const DmmvDispatch = struct {
             .pipeline_count_experts = pipeline_count_experts,
             .pipeline_moe_route_pack = pipeline_moe_route_pack,
             .pipeline_mul_mm_q4k = pipeline_mul_mm_q4k,
+            .pipeline_mul_mm_q4k_down_acc = pipeline_mul_mm_q4k_down_acc,
             .pipeline_mul_mm_q4k_tail8 = pipeline_mul_mm_q4k_tail8,
             .pipeline_mul_mm_q4k_gate_up_swiglu = pipeline_mul_mm_q4k_gate_up_swiglu,
             .pipeline_mul_mm_q4k_gate_up_geglu = pipeline_mul_mm_q4k_gate_up_geglu,
@@ -2337,6 +2351,67 @@ pub const DmmvDispatch = struct {
         d_offset: u32,
     ) !void {
         const pip = if (self.pipeline_mul_mm_q4k) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        // BM=32, BN=32 in the shader; keep these in sync.
+        const wg_x = (M + 31) / 32;
+        const wg_y = (N + 31) / 32;
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            wg_x,
+            wg_y,
+            1,
+        );
+    }
+
+    /// Tiled Q4_K dense GEMM with fused-residual accumulate: identical to
+    /// recordMulMmQ4K but the output ACCUMULATES into D (d[idx] += result)
+    /// instead of overwriting. Eliminates the standalone barrier +
+    /// scale_accumulate dispatch for the dense-FFN residual add. Ragged
+    /// shapes (M or N not multiples of 32) are handled by boundary checks
+    /// in the shader.
+    /// @param M Output rows (weight rows, i.e. hidden_dim for down projection).
+    /// @param N Token batch size (number of columns).
+    /// @param K Contraction width; must be a multiple of 256.
+    /// @returns `error.PipelineNotLoaded` if the acc pipeline is absent, or `error.InvalidArgument` for zero/misaligned K or zero M/N.
+    pub fn recordMulMmQ4KDownAcc(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q4k_down_acc) |*p| p else return error.PipelineNotLoaded;
         if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
         if (M == 0 or N == 0) return error.InvalidArgument;
         const push = MulMmQ4KPush{
@@ -4034,6 +4109,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_count_experts) |*p| p.deinit();
         if (self.pipeline_moe_route_pack) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_down_acc) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_tail8) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_gate_up_geglu) |*p| p.deinit();
