@@ -369,6 +369,15 @@ pub const ForwardGemma = struct {
     // the observed monotonic throughput collapse over a sustained run).
     pos_scratch: ?CudaBuffer = null,
     slots_scratch: ?CudaBuffer = null,
+    // E28 degradation fix (suspect #2): persistent per-step decode TAIL scratch.
+    // `argmax_scratch` [n_slots] u32 collects every row's argmax into a distinct
+    // slot so the whole tail (rms_norm → LM head → argmax for all B rows) runs in
+    // ONE command buffer + ONE commitAndWait + ONE B-wide download, instead of B
+    // serial commitAndWait+download round-trips per decoded token. `embed_host`
+    // [n_slots·n_embd] f32 stages the per-step embedding dequant so decodeBatch no
+    // longer does a host allocator.alloc/free of B·n_embd floats every step.
+    argmax_scratch: ?CudaBuffer = null,
+    embed_host: ?[]f32 = null,
 
     // Effort 24: lazily-allocated batched-prefill scratch (null until the first
     // ZINC_BATCHED_PREFILL run; freed in deinit).
@@ -1156,12 +1165,14 @@ pub const ForwardGemma = struct {
         self.use_tc_sharea = std.posix.getenv("ZINC_BATCHED_TC_SHAREA") != null;
         self.use_tc_normf16 = std.posix.getenv("ZINC_BATCHED_TC_NORMF16") != null;
 
+        std.debug.assert(B <= self.n_slots);
         const b = try self.ensureBatch(B);
 
         // EMBED all B input tokens into b.hidden [B, n_embd] (dequant, scale, upload).
+        // Suspect-#2 fix: stage into the persistent host embed buffer (sized to
+        // n_slots ≥ B) instead of a per-step allocator.alloc/free.
         const embd_scale = std.math.sqrt(@as(f32, @floatFromInt(d.n_embd)));
-        const host = try self.allocator.alloc(f32, B * d.n_embd);
-        defer self.allocator.free(host);
+        const host = self.embed_host.?[0 .. B * d.n_embd];
         for (0..B) |bi| {
             const row = host[bi * d.n_embd ..][0..d.n_embd];
             self.model.dequantEmbeddingRow(tokens[bi], row);
@@ -1176,7 +1187,6 @@ pub const ForwardGemma = struct {
         // in allocSlotKv, sized to n_slots ≥ B) instead of a cudaMalloc/cudaFree
         // pair per step. The batched attention kernels read only the first B
         // entries. (Eliminates 2 device alloc + 2 free per decoded token.)
-        std.debug.assert(B <= self.n_slots);
         const pos_buf = &self.pos_scratch.?;
         const slots_buf = &self.slots_scratch.?;
         buffer.upload(ctx, pos_buf, std.mem.sliceAsBytes(positions));
@@ -1191,16 +1201,27 @@ pub const ForwardGemma = struct {
         }
         self.waitPending(); // single tail drain: both blocks chain async on the shared stream
 
-        // TAIL per row: final rms_norm → LM head → per-row argmax. Reuse the
-        // single-row decode scratch on each row's slice of the batched hidden.
+        // TAIL: final rms_norm → LM head → per-row argmax for all B rows.
+        // Suspect-#2 fix: chain every row's tail into ONE command buffer +
+        // ONE commitAndWait + ONE B-wide download (was B serial commitAndWait +
+        // B downloads per decoded token). The single decode scratch
+        // (`norm_buf`/`logits_buf`) is reused across rows: on ONE stream the
+        // dispatches execute strictly in order, so row b+1's rms_norm cannot run
+        // until row b's LM head has consumed `norm_buf` — identical math to the
+        // per-row-commitAndWait form. Only the argmax OUTPUT must be per-row, so
+        // each row's argmax writes its own slot of `argmax_scratch` (aliased at
+        // bi·4) and we download all B results once.
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
         const lm_head = self.model.get("output.weight") orelse self.model.get("token_embd.weight") orelse return error.MissingTensor;
         const lm_idx = dmmvIdx(lm_head.info.type_);
+        const argmax_out = &self.argmax_scratch.?;
+        var cmd = try command.beginCommand(ctx);
         var bi: u32 = 0;
         while (bi < B) : (bi += 1) {
             var hid = try buffer.aliasBuffer(&b.hidden, bi * d.n_embd * f4, d.n_embd * f4);
             defer buffer.freeBuffer(&hid);
-            var cmd = try command.beginCommand(ctx);
+            var am_slot = try buffer.aliasBuffer(argmax_out, bi * @sizeOf(u32), @sizeOf(u32));
+            defer buffer.freeBuffer(&am_slot);
             const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
             cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &hid, &out_norm.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
             const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
@@ -1210,12 +1231,10 @@ pub const ForwardGemma = struct {
                 cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
             }
             const am = ArgmaxPush{ .N = d.vocab };
-            cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &self.argmax_buf }, &am, @sizeOf(ArgmaxPush), 0);
-            cmd.commitAndWait();
-            var tok: u32 = 0;
-            buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
-            out_tokens[bi] = tok;
+            cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &am_slot }, &am, @sizeOf(ArgmaxPush), 0);
         }
+        cmd.commitAndWait();
+        buffer.download(ctx, argmax_out, std.mem.sliceAsBytes(out_tokens));
     }
 
     /// Decode variant of `attentionLayerBatched` (1c — batched attention kernels).
@@ -1508,6 +1527,10 @@ pub const ForwardGemma = struct {
         // max batch (n_slots) so every decodeBatch step just re-uploads into it.
         self.pos_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
         self.slots_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        // Suspect-#2 tail scratch (see field comment): one argmax slot per row +
+        // a persistent host embed staging buffer, both sized to the max batch.
+        self.argmax_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        self.embed_host = try self.allocator.alloc(f32, @as(usize, n_slots) * self.d.n_embd);
     }
 
     pub fn freeSlotKv(self: *ForwardGemma) void {
@@ -1528,6 +1551,14 @@ pub const ForwardGemma = struct {
         if (self.slots_scratch) |*b| {
             buffer.freeBuffer(b);
             self.slots_scratch = null;
+        }
+        if (self.argmax_scratch) |*b| {
+            buffer.freeBuffer(b);
+            self.argmax_scratch = null;
+        }
+        if (self.embed_host) |h| {
+            self.allocator.free(h);
+            self.embed_host = null;
         }
         self.n_slots = 0;
         self.slot_ctx = 0;
