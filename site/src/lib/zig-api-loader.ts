@@ -308,6 +308,14 @@ const SECTION_META = new Map<string, { title: string; description: string; order
       order: 14,
     },
   ],
+  [
+    'cuda-multi-tenant-serving-engine-effort-28-increment-3-3b',
+    {
+      title: 'CUDA Multi-Tenant Serving Engine',
+      description: 'Continuous-batching serving worker, request registry, per-token streaming channels, and GPU-owned decode loop for concurrent CUDA inference.',
+      order: 15,
+    },
+  ],
 ]);
 
 function resolveSiteRoot(): string {
