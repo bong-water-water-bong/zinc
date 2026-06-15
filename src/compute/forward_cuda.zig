@@ -430,6 +430,20 @@ pub const ForwardCuda = struct {
     // MoE path runs; `_force` lets the harness A/B it (false → restore per-row sync).
     moe_collapse: bool = true,
     moe_collapse_force: ?bool = null,
+    // Effort 28 DENSE batched-decode launch-collapse: the per-layer batched blocks
+    // (`attentionLayerBatchedDecode`/`ssmLayerBatchedDecode`/`ffnBlockBatchedDecode`)
+    // each ended with a blocking `commitAndWait` so the shared per-layer scratch
+    // (db.norm/db.qfull/db.gate/…) was safe to reuse next layer. That sync is
+    // UNNECESSARY — all commands ride ONE shared CUstream in-order, so layer L+1's
+    // writes serialize after layer L's reads with no host round-trip. Route those
+    // blocks through the async `submit` ring instead and drain once at the decode
+    // tail → removes ~2 CPU↔GPU round-trips per layer per token (boost-starved
+    // launch-bound decode), AND is the structural prerequisite for graph-capturing
+    // the batched step (a captured region must contain no commitAndWait). Default-on
+    // when the batched path runs; `_force` lets the harness A/B it (false → restore
+    // per-layer sync). Set only by `decodeBatch`; serial decodeStep never touches it.
+    decode_collapse: bool = true,
+    decode_collapse_force: ?bool = null,
     // MoE scratch (only used when n_experts > 0)
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
     router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
@@ -1055,6 +1069,10 @@ pub const ForwardCuda = struct {
         // that never touch it — harmless since they never run the routed-batch path).
         self.moe_collapse = self.moe_collapse_force orelse true;
         defer self.moe_collapse = true;
+        // DENSE batched-decode launch-collapse (async submit + single tail drain).
+        // Default-on; `_force` restores the per-layer sync for the harness A/B.
+        self.decode_collapse = self.decode_collapse_force orelse true;
+        defer self.decode_collapse = true;
 
         const db = try self.ensureDecodeBatch(B);
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
@@ -1151,6 +1169,11 @@ pub const ForwardCuda = struct {
             cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &am_slot }, &am, @sizeOf(ArgmaxPush), 0);
         }
         cmd.commitAndWait();
+        // The tail commitAndWait drained the shared stream (incl. any async layer
+        // commands stashed by the dense launch-collapse) → their completion is
+        // guaranteed; free the stashed handles. No-op when n_pending==0 (e.g. the
+        // MoE path drains the ring each layer via its `waitPending`).
+        self.drainPending();
         buffer.download(ctx, argmax_out, std.mem.sliceAsBytes(out));
     }
 
@@ -1259,7 +1282,7 @@ pub const ForwardCuda = struct {
 
         // 5. Batched O projection, accumulate into db.hidden (residual).
         self.gemmDispatch(&cmd, wo, &db.attn_out, &db.hidden, d.n_embd, d.q_dim, B, 1);
-        cmd.commitAndWait();
+        if (self.decode_collapse) self.submit(cmd) else cmd.commitAndWait();
     }
 
     /// 4c-step-2b SSM block: pre-norm + qkv/z/alpha/beta + out projections run as
@@ -1332,7 +1355,7 @@ pub const ForwardCuda = struct {
 
         // 5. Batched out projection, accumulate into db.hidden (residual).
         self.gemmDispatch(&cmd, wout, &db.ssm_y, &db.hidden, d.n_embd, d.d_inner, B, 1);
-        cmd.commitAndWait();
+        if (self.decode_collapse) self.submit(cmd) else cmd.commitAndWait();
     }
 
     /// 4c dense FFN block: fully batched over B rows (pre-norm + gate/up GEMMs +
@@ -1353,7 +1376,7 @@ pub const ForwardCuda = struct {
         const sg = SwigluPush{ .N = B * d.n_ff };
         cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(B * d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &db.gate, &db.up, &db.swiglu }, &sg, @sizeOf(SwigluPush), 0);
         self.gemmDispatch(&cmd, wdown, &db.swiglu, &db.hidden, d.n_embd, d.n_ff, B, 1);
-        cmd.commitAndWait();
+        if (self.decode_collapse) self.submit(cmd) else cmd.commitAndWait();
     }
 
     /// 4d: batched-decode MoE FFN block (qwen36-35b-a3b). The MoE FFN is STATELESS
