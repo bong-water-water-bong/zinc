@@ -724,6 +724,33 @@ pub const ForwardCuda = struct {
         return @as(usize, slot) * self.d.ssm_state_len * @sizeOf(f32);
     }
 
+    /// Effort 28 increment 4 (qwen serving): zero a REUSED slot's SSM conv ring +
+    /// recurrent state so a new request prefilling from pos=0 into this slot starts
+    /// from clean state. The serving engine reuses slots across requests
+    /// (nslots < concurrent clients) and qwen's SSM state is ACCUMULATED (not
+    /// position-indexed), so without this a reused slot inherits the prior request's
+    /// recurrent state → corruption. The attention slot KV needs NO reset (it is
+    /// position-indexed and overwritten on prefill; reads never reach beyond the
+    /// current sequence's positions — same reason gemma's slot KV reuses cleanly).
+    /// No-op if slot state is unallocated. Call on ADMIT, before per-token prefill.
+    pub fn resetSlot(self: *ForwardCuda, slot: u32) !void {
+        const cc = self.ssm_conv_slots orelse return;
+        const ss = self.ssm_state_slots orelse return;
+        const d = self.d;
+        const f4 = @sizeOf(f32);
+        std.debug.assert(slot < self.n_slots);
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            if (isFullAttn(L, d.full_attn_interval)) continue; // attn KV is position-overwritten
+            var convst = try buffer.aliasBuffer(&cc[L], self.slotConvOffsetBytes(slot), d.conv_state_len * f4);
+            defer buffer.freeBuffer(&convst);
+            try zeroBuffer(self.allocator, self.ctx, &convst, d.conv_state_len);
+            var recst = try buffer.aliasBuffer(&ss[L], self.slotStateOffsetBytes(slot), d.ssm_state_len * f4);
+            defer buffer.freeBuffer(&recst);
+            try zeroBuffer(self.allocator, self.ctx, &recst, d.ssm_state_len);
+        }
+    }
+
     /// Upload distinct data into two device regions of `buf` and read both back to
     /// prove they do NOT alias (the slot-offset arithmetic carves non-overlapping
     /// per-sequence regions). Returns false if either write clobbered the other.

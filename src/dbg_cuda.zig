@@ -76,6 +76,39 @@ const Engine = union(enum) {
             },
         }
     }
+    /// Effort 28 serving: per-sequence slot state alloc/free + batched decode +
+    /// per-slot reset, dispatched by arch (gemma `allocSlotKv`/qwen `allocSlotState`;
+    /// `resetSlot` clears a reused slot's accumulated SSM state — gemma has none).
+    fn allocSlots(self: *Engine, nslots: u32, slot_ctx: u32) !void {
+        switch (self.*) {
+            inline else => |*e| {
+                if (comptime @hasDecl(@TypeOf(e.*), "allocSlotKv")) {
+                    try e.allocSlotKv(nslots, slot_ctx);
+                } else {
+                    try e.allocSlotState(nslots, slot_ctx);
+                }
+            },
+        }
+    }
+    fn freeSlots(self: *Engine) void {
+        switch (self.*) {
+            inline else => |*e| {
+                if (comptime @hasDecl(@TypeOf(e.*), "freeSlotKv")) e.freeSlotKv() else e.freeSlotState();
+            },
+        }
+    }
+    fn decodeBatch(self: *Engine, tokens: []const u32, positions: []const u32, slots: []const u32, out: []u32) !void {
+        switch (self.*) {
+            inline else => |*e| try e.decodeBatch(tokens, positions, slots, out),
+        }
+    }
+    fn resetSlot(self: *Engine, slot: u32) !void {
+        switch (self.*) {
+            inline else => |*e| {
+                if (comptime @hasDecl(@TypeOf(e.*), "resetSlot")) try e.resetSlot(slot);
+            },
+        }
+    }
     fn vocab(self: *const Engine) u32 {
         switch (self.*) {
             inline else => |*e| return e.d.vocab,
@@ -987,7 +1020,7 @@ const SERVE_MAXG = 64; // max generated tokens / sequence
 
 /// Shared state between the GPU worker thread and the N producer threads.
 const ServeCtx = struct {
-    g: *forwardgemma.ForwardGemma,
+    eng: *Engine,
     sched: *scheduler.Scheduler,
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
@@ -1031,7 +1064,7 @@ fn serveFinish(c: *ServeCtx, slot_id: u32) void {
 /// The GPU worker: admit waiters, prefill new slots, run ONE batched decode step
 /// over all decoders, evict on EOS/budget — until every sequence has finished.
 fn serveWorker(c: *ServeCtx) void {
-    const g = c.g;
+    const eng = c.eng;
     while (true) {
         // Admit pending arrivals into free slots (touches `pending` → under lock).
         c.mutex.lock();
@@ -1056,12 +1089,15 @@ fn serveWorker(c: *ServeCtx) void {
             var pos: u32 = 0;
             var tok: u32 = 0;
             var k: usize = 0;
+            // Clear a reused slot's accumulated SSM state before prefilling the new
+            // request from pos=0 (qwen; no-op for gemma) — same as the HTTP engine.
+            eng.resetSlot(slot_id) catch return;
             while (k < np) : (k += 1) {
                 var tk = [_]u32{req.prompt_tokens[k]};
                 var ps = [_]u32{pos};
                 var sl = [_]u32{slot_id};
                 var ot = [_]u32{0};
-                g.decodeBatch(&tk, &ps, &sl, &ot) catch return;
+                eng.decodeBatch(&tk, &ps, &sl, &ot) catch return;
                 tok = ot[0];
                 pos += 1;
             }
@@ -1085,7 +1121,7 @@ fn serveWorker(c: *ServeCtx) void {
                 pss[i] = @intCast(req.prompt_tokens.len + gen_n - 1);
                 sls[i] = slot_id;
             }
-            g.decodeBatch(tks[0..decoders.len], pss[0..decoders.len], sls[0..decoders.len], out[0..decoders.len]) catch return;
+            eng.decodeBatch(tks[0..decoders.len], pss[0..decoders.len], sls[0..decoders.len], out[0..decoders.len]) catch return;
             for (decoders, 0..) |slot_id, i| {
                 const req = &c.sched.slots[slot_id].?;
                 req.appendToken(out[i]) catch return;
@@ -1135,16 +1171,15 @@ fn serveMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
     var fwd = try Engine.init(allocator, &model, 512);
     defer fwd.deinit();
 
-    if (std.meta.activeTag(fwd) != .gemma) {
-        std.debug.print("SERVE:skip (qwen — increment 4)\n", .{});
-        return;
-    }
+    // Effort 28 increment 4: this harness now drives EITHER gemma4 dense OR the
+    // qwen35/36 hybrid-SSM (+MoE) forward — both expose decodeBatch + slot state via
+    // the Engine union dispatch, so the threading/slot-reuse proof is arch-uniform.
     const pf_batched = batchedPrefillDefaultOn();
 
     const ng = @min(ngen, @as(u32, SERVE_MAXG));
     const ctx = try allocator.create(ServeCtx);
     defer allocator.destroy(ctx);
-    ctx.* = .{ .g = undefined, .sched = undefined, .ng = ng };
+    ctx.* = .{ .eng = undefined, .sched = undefined, .ng = ng };
 
     var serial_out: [SERVE_MAXB][SERVE_MAXG]u32 = undefined; // isolated reference
     var serial_len: [SERVE_MAXB]u32 = undefined; // EOS-truncated reference length
@@ -1167,6 +1202,9 @@ fn serveMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
         ctx.plens[nseq] = np;
 
         // ISOLATED REFERENCE: this sequence alone through the production path.
+        // Reset the production single-seq recurrent state first so qwen's unindexed
+        // SSM state does not leak from the previous reference sequence (no-op gemma).
+        try fwd.resetState();
         const prompt = ctx.prompts[nseq][0..np];
         var pos: u32 = 0;
         var tok: u32 = 0;
@@ -1199,12 +1237,6 @@ fn serveMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
         return;
     }
 
-    const g = &fwd.gemma;
-    if (g.d.n_experts > 0) {
-        std.debug.print("SERVE:skip (MoE — increment 1/2/3 are dense gemma)\n", .{});
-        return;
-    }
-
     // EOS for variable per-request lengths (mirrors schedMode): mid-flight eviction
     // exercises the slot-reuse race under concurrency. Env override or auto.
     var eos: u32 = std.math.maxInt(u32);
@@ -1232,13 +1264,13 @@ fn serveMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
 
     const nslots = std.math.clamp(nslots_arg, 1, nseq);
     const slot_ctx: u32 = 512;
-    try g.allocSlotKv(nslots, slot_ctx);
-    defer g.freeSlotKv();
+    try fwd.allocSlots(nslots, slot_ctx);
+    defer fwd.freeSlots();
 
     var sched = try scheduler.Scheduler.init(allocator, nslots);
     defer sched.deinit();
 
-    ctx.g = g;
+    ctx.eng = &fwd;
     ctx.sched = &sched;
     ctx.nseq = nseq;
 

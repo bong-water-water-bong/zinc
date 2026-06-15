@@ -28,8 +28,49 @@
 const std = @import("std");
 const scheduler = @import("../scheduler/scheduler.zig");
 const forwardgemma = @import("../compute/forward_cuda_gemma.zig");
+const forwardcuda = @import("../compute/forward_cuda.zig");
 
 const log = std.log.scoped(.cuda_serve);
+
+/// Architecture-dispatched GPU forward held by the serving engine. gemma4 dense
+/// (`ForwardGemma`) and the qwen35/36 hybrid-SSM family (`ForwardCuda`) expose the
+/// SAME batched serving primitives — `decodeBatch(tokens,positions,slots,out)` and
+/// per-sequence slot-state alloc — only under different method names, so the engine
+/// drives EITHER through this thin union. Effort 28 increment 4 (qwen serving): the
+/// Scheduler / ReqChannel / worker threading are model-agnostic; only these calls
+/// differ. The forward is owned by the caller (its frame outlives the engine).
+pub const Forward = union(enum) {
+    gemma: *forwardgemma.ForwardGemma,
+    qwen: *forwardcuda.ForwardCuda,
+
+    fn allocSlots(self: Forward, nslots: u32, slot_ctx: u32) !void {
+        switch (self) {
+            .gemma => |g| try g.allocSlotKv(nslots, slot_ctx),
+            .qwen => |q| try q.allocSlotState(nslots, slot_ctx),
+        }
+    }
+    fn freeSlots(self: Forward) void {
+        switch (self) {
+            .gemma => |g| g.freeSlotKv(),
+            .qwen => |q| q.freeSlotState(),
+        }
+    }
+    fn decodeBatch(self: Forward, tokens: []const u32, positions: []const u32, slots: []const u32, out: []u32) !void {
+        switch (self) {
+            .gemma => |g| try g.decodeBatch(tokens, positions, slots, out),
+            .qwen => |q| try q.decodeBatch(tokens, positions, slots, out),
+        }
+    }
+    /// Clear a reused slot's accumulated state before a new request prefills into
+    /// it. No-op for gemma (attention-only, position-indexed KV overwritten on
+    /// prefill); zeros the slot's SSM conv ring + recurrent state for qwen.
+    fn resetSlot(self: Forward, slot: u32) !void {
+        switch (self) {
+            .gemma => {},
+            .qwen => |q| try q.resetSlot(slot),
+        }
+    }
+};
 
 /// Per-request published-token channel. The handler thread that submitted the
 /// request OWNS this struct (it lives on the handler's stack/frame); the worker
@@ -58,7 +99,7 @@ pub const Chunk = struct {
 
 pub const ServeEngine = struct {
     allocator: std.mem.Allocator,
-    g: *forwardgemma.ForwardGemma,
+    fwd: Forward,
     sched: scheduler.Scheduler,
     /// Stop token id (the tokenizer's EOS for real serving; overridable for the gate).
     eos: u32,
@@ -84,26 +125,27 @@ pub const ServeEngine = struct {
     prefill_wall_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     peak_batch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// Allocate slot-based KV + a scheduler with `nslots` concurrent slots, each
-    /// `slot_ctx` tokens deep. The forward (`g`) must already be initialized.
+    /// Allocate slot-based per-sequence state + a scheduler with `nslots` concurrent
+    /// slots, each `slot_ctx` tokens deep. The forward (`fwd`) must already be
+    /// initialized; it may be EITHER a gemma or qwen forward (dispatched by `Forward`).
     pub fn init(
         allocator: std.mem.Allocator,
-        g: *forwardgemma.ForwardGemma,
+        fwd: Forward,
         nslots: u32,
         slot_ctx: u32,
         eos: u32,
     ) !ServeEngine {
-        try g.allocSlotKv(nslots, slot_ctx);
-        errdefer g.freeSlotKv();
+        try fwd.allocSlots(nslots, slot_ctx);
+        errdefer fwd.freeSlots();
         const sched = try scheduler.Scheduler.init(allocator, nslots);
         log.info("CUDA serve engine ready: {d} slots × {d} ctx, eos={d}", .{ nslots, slot_ctx, eos });
-        return .{ .allocator = allocator, .g = g, .sched = sched, .eos = eos };
+        return .{ .allocator = allocator, .fwd = fwd, .sched = sched, .eos = eos };
     }
 
     pub fn deinit(self: *ServeEngine) void {
         self.registry.deinit(self.allocator);
         self.sched.deinit();
-        self.g.freeSlotKv();
+        self.fwd.freeSlots();
     }
 
     /// Spawn the GPU worker thread.
@@ -170,17 +212,15 @@ pub const ServeEngine = struct {
     /// (atomic loads) so `/stats` never contends the worker. The gate diffs two
     /// snapshots around each B-concurrent phase → pure decode tok/s + occupancy.
     pub fn statsJson(self: *ServeEngine, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf,
-            "{{\"decode_steps\":{d},\"decode_tokens\":{d},\"decode_wall_ns\":{d}," ++
-            "\"prefill_tokens\":{d},\"prefill_wall_ns\":{d},\"peak_batch\":{d}}}",
-            .{
-                self.decode_steps.load(.monotonic),
-                self.decode_tokens.load(.monotonic),
-                self.decode_wall_ns.load(.monotonic),
-                self.prefill_tokens.load(.monotonic),
-                self.prefill_wall_ns.load(.monotonic),
-                self.peak_batch.load(.monotonic),
-            });
+        return std.fmt.bufPrint(buf, "{{\"decode_steps\":{d},\"decode_tokens\":{d},\"decode_wall_ns\":{d}," ++
+            "\"prefill_tokens\":{d},\"prefill_wall_ns\":{d},\"peak_batch\":{d}}}", .{
+            self.decode_steps.load(.monotonic),
+            self.decode_tokens.load(.monotonic),
+            self.decode_wall_ns.load(.monotonic),
+            self.prefill_tokens.load(.monotonic),
+            self.prefill_wall_ns.load(.monotonic),
+            self.peak_batch.load(.monotonic),
+        });
     }
 
     // ── worker-thread internals ──────────────────────────────────────────────
@@ -222,7 +262,7 @@ pub const ServeEngine = struct {
     }
 
     fn workerLoop(self: *ServeEngine) void {
-        const g = self.g;
+        const fwd = self.fwd;
         // Local copies of the scratch slot-id slices (scratch is reused across
         // pendingPrefill/activeDecoding; copying decouples iteration from it).
         var prefill_buf: [scheduler_max]u32 = undefined;
@@ -259,12 +299,19 @@ pub const ServeEngine = struct {
                 var tok: u32 = 0;
                 var k: usize = 0;
                 const pf_t0 = if (timer_opt) |*tm| tm.read() else 0;
+                // Clear any accumulated state from this slot's previous request
+                // BEFORE prefilling the new one from pos=0 (qwen SSM recurrent state;
+                // no-op for gemma). Slots are reused when nslots < concurrent clients.
+                fwd.resetSlot(slot_id) catch {
+                    self.failSlot(slot_id);
+                    continue;
+                };
                 while (k < np) : (k += 1) {
                     var tk = [_]u32{req.prompt_tokens[k]};
                     var ps = [_]u32{pos};
                     var sl = [_]u32{slot_id};
                     var ot = [_]u32{0};
-                    g.decodeBatch(&tk, &ps, &sl, &ot) catch {
+                    fwd.decodeBatch(&tk, &ps, &sl, &ot) catch {
                         self.failSlot(slot_id);
                         break;
                     };
@@ -300,7 +347,7 @@ pub const ServeEngine = struct {
                     sls[i] = slot_id;
                 }
                 const dec_t0 = if (timer_opt) |*tm| tm.read() else 0;
-                g.decodeBatch(tks[0..ndec], pss[0..ndec], sls[0..ndec], out[0..ndec]) catch {
+                fwd.decodeBatch(tks[0..ndec], pss[0..ndec], sls[0..ndec], out[0..ndec]) catch {
                     for (dec_buf[0..ndec]) |slot_id| {
                         if (self.sched.slots[slot_id] != null) self.failSlot(slot_id);
                     }

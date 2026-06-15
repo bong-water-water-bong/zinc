@@ -1668,9 +1668,10 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
     };
     defer model.deinit();
 
-    // server_mode = no CLI prompt → multi-tenant HTTP serving (Effort 28). Only
-    // the gemma4 dense forward has the batched serving path (decodeBatch); qwen +
-    // MoE serving is increment 4. Prompt mode (single-sequence) is unchanged.
+    // server_mode = no CLI prompt → multi-tenant HTTP serving (Effort 28). Both the
+    // gemma4 dense forward AND the qwen35/36 hybrid-SSM+MoE forward expose the
+    // batched serving path (decodeBatch + slot state); the server dispatches by
+    // architecture via cuda_serve.Forward. Prompt mode (single-sequence) unchanged.
     const server_mode = config.prompt == null;
 
     // Build the forward state. max_ctx must cover prompt + generated tokens.
@@ -1686,13 +1687,8 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
         log.info("CUDA gemma4 forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
             fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
         });
-        if (server_mode) return runCudaServe(&fwd, &model, config, max_ctx, allocator);
+        if (server_mode) return runCudaServe(.{ .gemma = &fwd }, &model, config, max_ctx, allocator);
         return runCudaDecode(&fwd, &model, config, max_ctx, allocator);
-    }
-
-    if (server_mode) {
-        log.err("CUDA server mode is currently gemma4-only (qwen/MoE serving is Effort 28 increment 4). Pass --prompt \"...\" for single-sequence qwen inference.", .{});
-        return error.ServerModeUnavailableOnThisBackend;
     }
 
     var fwd = forward_cuda_mod.ForwardCuda.init(allocator, &model, max_ctx) catch |err| {
@@ -1703,6 +1699,7 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
     log.info("CUDA forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
         fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
     });
+    if (server_mode) return runCudaServe(.{ .qwen = &fwd }, &model, config, max_ctx, allocator);
     return runCudaDecode(&fwd, &model, config, max_ctx, allocator);
 }
 
@@ -1866,7 +1863,9 @@ const ServeConnCtx = struct {
 
 /// Stand up the CUDA serving path: build the tokenizer, spawn the GPU worker via
 /// `ServeEngine`, then accept connections and hand each to a detached handler.
-fn runCudaServe(fwd: *forward_cuda_gemma_mod.ForwardGemma, model: *loader_cuda_mod.Model, config: Config, max_ctx: u32, allocator: std.mem.Allocator) !void {
+/// `fwd` is a `cuda_serve.Forward` so the server drives EITHER the gemma4 dense or
+/// the qwen35/36 hybrid-SSM+MoE forward (Effort 28 increment 4 — qwen serving).
+fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, config: Config, max_ctx: u32, allocator: std.mem.Allocator) !void {
     var tokenizer = tokenizer_mod.Tokenizer.initFromGGUF(&model.gguf_file, allocator) catch |err| {
         log.err("Failed to init tokenizer from GGUF: {s}", .{@errorName(err)});
         return err;
