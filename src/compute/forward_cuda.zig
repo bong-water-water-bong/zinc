@@ -595,6 +595,26 @@ pub const ForwardCuda = struct {
         return true;
     }
 
+    /// Reset the production single-sequence recurrent state to a fresh-process
+    /// start: zero every ssm layer's conv ring + recurrent state and clear the
+    /// per-layer conv offset. The attention KV cache needs no reset — it is
+    /// position-indexed and each sequence overwrites from pos 0, reading only what
+    /// it wrote. Used by the batch harness to make the per-sequence SERIAL
+    /// reference truly single-sequence (without this, the unindexed SSM recurrent
+    /// state leaks from one reference sequence into the next). Additive — never
+    /// called on the real decode/prefill path; that path runs one sequence/process.
+    pub fn resetState(self: *ForwardCuda) !void {
+        const d = self.d;
+        for (0..d.n_layers) |li| {
+            const L: u32 = @intCast(li);
+            self.conv_off[li] = 0;
+            if (!isFullAttn(L, d.full_attn_interval)) {
+                try zeroBuffer(self.allocator, self.ctx, &self.ssm_conv_state[li], d.conv_state_len);
+                try zeroBuffer(self.allocator, self.ctx, &self.ssm_state[li], d.ssm_state_len);
+            }
+        }
+    }
+
     /// Run one greedy decode step for `token` at sequence position `pos`,
     /// returning the argmax token id. v0: embed → final rms_norm → LM head →
     /// argmax (layers are gated by `run_layers`).
@@ -679,6 +699,201 @@ pub const ForwardCuda = struct {
             if (d.n_experts > 0) try self.moeFfnBlock(L) else try self.ffnBlock(L);
         }
         self.waitPending(); // drain the async layer ops; no logits for prompt-internal tokens
+    }
+
+    // ---- Effort 28 inc 4 / 4b: batched DECODE for qwen (hybrid-SSM) ----------
+
+    /// Batched decode step for the DENSE qwen35 hybrid-SSM model: advance B
+    /// sequences one token each, every sequence reading/writing its OWN slot
+    /// state (KV for attn layers; conv ring + recurrent state for ssm layers) at
+    /// its OWN position. ADDITIVE — the production single-sequence `decodeStep` /
+    /// `prefillStep` + single-seq buffers are untouched.
+    ///
+    /// This is the 4b "looped" form (the qwen analog of gemma's 1b): the per-row
+    /// loop runs each sequence's forward against its slot state, so the output is
+    /// trivially token-identical to N isolated single-sequence runs — proving the
+    /// per-slot KV + SSM conv/recurrent isolation and per-seq positions. Batching
+    /// the projections/FFN over B rows + fusing the per-seq attention/SSM kernels
+    /// (the throughput win) is sub-step 4c. MoE (qwen36) is 4d → `error.Unsupported`.
+    ///
+    /// Requires `allocSlotState(n_slots, slot_ctx)` with n_slots > max(slots) and
+    /// slot_ctx > max(positions). Each sequence b's slot must already hold its
+    /// state for [0..positions[b]-1] (written by prior `decodeBatch` calls, e.g. a
+    /// per-token B=1 prefill into the slot — exactly as the gemma harness drives it).
+    ///
+    ///   tokens[b]     input token for sequence b this step
+    ///   positions[b]  sequence b's current position (slot holds [0..pos-1])
+    ///   slots[b]      sequence b's state slot index
+    ///   out[b]        greedy argmax for sequence b (caller advances pos + feeds back)
+    pub fn decodeBatch(self: *ForwardCuda, tokens: []const u32, positions: []const u32, slots: []const u32, out: []u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        if (d.n_experts > 0) return error.Unsupported; // 4b = dense qwen35; MoE is 4d
+        if (self.kv_k_slots == null) return error.SlotStateNotAllocated;
+        const B: u32 = @intCast(tokens.len);
+        std.debug.assert(positions.len == B and slots.len == B and out.len == B);
+
+        const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
+        const lm_head = self.model.get("output.weight") orelse return error.MissingTensor;
+
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) {
+            const token = tokens[bi];
+            const pos = positions[bi];
+            const slot = slots[bi];
+            std.debug.assert(slot < self.n_slots and pos < self.slot_ctx);
+
+            // EMBED row bi into `hidden` (same path as decodeStep so the per-seq
+            // forward is maximally bit-aligned with the production reference).
+            if (self.embed_gpu) {
+                self.host_tok_in[0] = token;
+                buffer.upload(ctx, &self.tok_in_buf, std.mem.sliceAsBytes(self.host_tok_in));
+                try self.recordEmbed();
+                self.waitPending();
+            } else {
+                self.model.dequantEmbeddingRow(token, self.host_embed);
+                buffer.upload(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
+            }
+
+            var L: u32 = 0;
+            while (L < d.n_layers) : (L += 1) {
+                if (isFullAttn(L, d.full_attn_interval)) {
+                    try self.attentionLayerSlot(L, pos, slot);
+                } else {
+                    try self.ssmLayerSlot(L, pos, slot);
+                }
+                try self.ffnBlockPub(L); // dense, position/slot-independent; sync (drains ring)
+            }
+
+            // TAIL: final rms_norm → LM head → argmax → out[bi].
+            var cmd = try command.beginCommand(ctx);
+            self.tailDispatch(&cmd, &out_norm.gpu_buffer, &lm_head.gpu_buffer, lm_head.info.type_);
+            cmd.commitAndWait();
+            self.drainPending();
+            var tok: u32 = 0;
+            buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
+            out[bi] = tok;
+        }
+    }
+
+    /// Slot-state variant of `attentionLayer`: identical block math, but the KV
+    /// cache read/write target sequence `slot`'s region of the slot KV (aliased to
+    /// its base), and the kernels run SYNCHRONOUSLY (commitAndWait) so the per-row
+    /// slot aliases are safe to free on return. The kv-write/attention offsets are
+    /// pos-relative within the slot's aliased region — byte-for-byte the same
+    /// values as the single-seq path. 4c fuses this into a batched per-seq kernel.
+    fn attentionLayerSlot(self: *ForwardCuda, L: u32, pos: u32, slot: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const wq = self.layer(L, "attn_q.weight"); // packed [Q | gate], M = 2*q_dim
+        const wk = self.layer(L, "attn_k.weight");
+        const wv = self.layer(L, "attn_v.weight");
+        const wqn = self.layer(L, "attn_q_norm.weight");
+        const wkn = self.layer(L, "attn_k_norm.weight");
+        const wo = self.layer(L, "attn_output.weight");
+        const wan = self.layer(L, "attn_norm.weight");
+
+        // Alias sequence `slot`'s KV region to its base; pos-relative offsets below.
+        const kv_base = @as(usize, slot) * self.slot_ctx * d.kv_dim * f4;
+        const kv_span = @as(usize, self.slot_ctx) * d.kv_dim * f4;
+        var kk = try buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_base, kv_span);
+        var vv = try buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_base, kv_span);
+        defer {
+            buffer.freeBuffer(&kk);
+            buffer.freeBuffer(&vv);
+        }
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        self.dmmvDispatch(&cmd, wq, &self.norm_buf, &self.qfull_buf, 2 * d.q_dim, d.n_embd, 0, 0);
+        const deint = DeintPush{ .head_dim = d.head_dim, .n_head = d.n_head };
+        cmd.dispatch(&self.pipes.deinterleave, .{ ceilDiv(d.q_dim, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &self.qfull_buf, &self.q_buf, &self.gate_buf }, &deint, @sizeOf(DeintPush), 0);
+        self.dmmvDispatch(&cmd, wk, &self.norm_buf, &self.k_buf, d.kv_dim, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, wv, &self.norm_buf, &self.v_buf, d.kv_dim, d.n_embd, 0, 0);
+        const rms_h = RmsPush{ .N = d.head_dim, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &wqn.gpu_buffer, &self.q_buf }, &rms_h, @sizeOf(RmsPush), 0);
+        cmd.dispatch(&self.pipes.rms_norm, .{ d.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &wkn.gpu_buffer, &self.k_buf }, &rms_h, @sizeOf(RmsPush), 0);
+        const rope_q = RopePush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_head, .position = pos, .freq_base_bits = 0, .attn_scale_bits = 0 };
+        cmd.dispatch(&self.pipes.rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.q_buf, &self.inv_freq }, &rope_q, @sizeOf(RopePush), 0);
+        const rope_k = RopePush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_kv_head, .position = pos, .freq_base_bits = 0, .attn_scale_bits = 0 };
+        cmd.dispatch(&self.pipes.rope, .{ d.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.k_buf, &self.k_buf, &self.inv_freq }, &rope_k, @sizeOf(RopePush), 0);
+        // KV write at this position WITHIN the slot's aliased region.
+        const kvw = KvWritePush{ .kv_dim = d.kv_dim, .dst_offset = pos * d.kv_dim };
+        const kv_grid = ceilDiv(d.kv_dim, 64);
+        cmd.dispatch(&self.pipes.kv_cache_write, .{ kv_grid, 1, 1 }, .{ 64, 1, 1 }, &.{ &self.k_buf, &kk, &self.v_buf, &vv }, &kvw, @sizeOf(KvWritePush), 0);
+        const seq_len = pos + 1;
+        const attn = AttnPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .seq_len = seq_len, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
+        const attn_smem: u32 = seq_len * 4;
+        cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &kk, &vv, &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), attn_smem);
+        const sm = SigmoidMulPush{ .N = d.q_dim };
+        cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.attn_out_buf, &self.gate_buf, &self.attn_out_buf }, &sm, @sizeOf(SigmoidMulPush), 0);
+        self.dmmvDispatch(&cmd, wo, &self.attn_out_buf, &self.hidden, d.n_embd, d.q_dim, 1, 0);
+        cmd.commitAndWait(); // sync: keeps the slot aliases valid until the kernels run
+    }
+
+    /// Slot-state variant of `ssmLayer`: identical block math, but the conv ring
+    /// + recurrent state read/write sequence `slot`'s aliased region, and the conv
+    /// ring offset is DERIVED from the position (`pos % (d_conv-1)`) instead of the
+    /// per-layer host counter — production advances `conv_off[L]` one step per
+    /// token, so at position p it equals `p % (d_conv-1)`; deriving it makes each
+    /// slot's conv offset self-consistent without extra per-slot host state. Runs
+    /// SYNCHRONOUSLY so the per-row aliases are safe to free on return.
+    fn ssmLayerSlot(self: *ForwardCuda, L: u32, pos: u32, slot: u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const wan = self.layer(L, "attn_norm.weight");
+        const wqkv = self.layer(L, "attn_qkv.weight");
+        const wz = self.layer(L, "attn_gate.weight");
+        const walpha = self.layer(L, "ssm_alpha.weight");
+        const wbeta = self.layer(L, "ssm_beta.weight");
+        const wconv = self.layer(L, "ssm_conv1d.weight");
+        const wdt = self.layer(L, "ssm_dt.bias");
+        const wa = self.layer(L, "ssm_a");
+        const wnorm = self.layer(L, "ssm_norm.weight");
+        const wout = self.layer(L, "ssm_out.weight");
+
+        // Alias sequence `slot`'s conv ring + recurrent state to their bases.
+        var convst = try buffer.aliasBuffer(&self.ssm_conv_slots.?[L], self.slotConvOffsetBytes(slot), d.conv_state_len * f4);
+        var recst = try buffer.aliasBuffer(&self.ssm_state_slots.?[L], self.slotStateOffsetBytes(slot), d.ssm_state_len * f4);
+        defer {
+            buffer.freeBuffer(&convst);
+            buffer.freeBuffer(&recst);
+        }
+        const conv_off = pos % (d.d_conv - 1);
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &wan.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+        self.dmmvDispatch(&cmd, wqkv, &self.norm_buf, &self.attn_out_buf, d.conv_channels, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, wz, &self.norm_buf, &self.gate_buf, d.d_inner, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, walpha, &self.norm_buf, &self.router_buf, d.dt_rank, d.n_embd, 0, 0);
+        self.dmmvDispatch(&cmd, wbeta, &self.norm_buf, &self.down_buf, d.dt_rank, d.n_embd, 0, 0);
+        const conv = ConvPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .state_offset = conv_off };
+        cmd.dispatch(&self.pipes.ssm_conv1d, .{ ceilDiv(d.conv_channels, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.attn_out_buf, &wconv.gpu_buffer, &convst, &self.swiglu_buf }, &conv, @sizeOf(ConvPush), 0);
+        const dn = DeltaNetPush{
+            .d_inner = d.d_inner,
+            .dt_rank = d.dt_rank,
+            .head_v_dim = d.head_v_dim,
+            .d_state = d.d_state,
+            .n_group = d.n_group,
+            .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
+            .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+            .has_dt_bias = 1,
+            .has_ssm_a = 1,
+            .n_tok = 1,
+            .conv_stride_tok = d.conv_channels,
+            .ab_stride_tok = d.dt_rank,
+            .y_stride_tok = d.d_inner,
+        };
+        cmd.dispatch(&self.pipes.ssm_delta_net, .{ d.dt_rank, d.head_v_dim, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &self.swiglu_buf, &wdt.gpu_buffer, &self.router_buf, &self.down_buf, &wa.gpu_buffer, &recst, &self.attn_out_buf }, &dn, @sizeOf(DeltaNetPush), 0);
+        const norm_per_head: u32 = if (wnorm.info.numElements() == d.d_inner) 1 else 0;
+        const gn = GatedNormPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head };
+        cmd.dispatch(&self.pipes.ssm_gated_norm, .{ d.dt_rank, 1, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &self.attn_out_buf, &self.gate_buf, &wnorm.gpu_buffer, &self.swiglu_buf }, &gn, @sizeOf(GatedNormPush), 0);
+        self.dmmvDispatch(&cmd, wout, &self.swiglu_buf, &self.hidden, d.n_embd, d.d_inner, 1, 0);
+        cmd.commitAndWait(); // sync: keeps the slot aliases valid until the kernels run
     }
 
     /// Dense decode step via CUDA-graph replay (Effort 25). `hidden` already holds
