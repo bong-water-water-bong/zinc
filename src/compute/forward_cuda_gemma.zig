@@ -173,6 +173,7 @@ const Pipelines = struct {
     rms_norm_kvwrite_batched: CudaPipeline,
     dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
+    dmmv_q4k_btok: [7]CudaPipeline, // Effort 28: small-B (2..8) token-batch matvec
     dmmv_q4k_fast_dual: CudaPipeline, // fuse gate/up & Q/K same-input Q4_K matvecs
     rope: CudaPipeline,
     gemma_attention: CudaPipeline,
@@ -393,6 +394,16 @@ pub const ForwardGemma = struct {
     // gate for an in-process A/B (null → use the env default).
     decode_b1: bool = false,
     decode_b1_force: ?bool = null,
+    // Effort 28: small-B (2..8) Q4_K token-batch matvec. At a small decode batch
+    // the 64×64-tiled batched GEMM wastes 56-62/64 row-slots and goes compute-bound
+    // on tile padding; `dmmv_q4k_btok` reads each Q4_K weight row ONCE and amortizes
+    // its dequant across the B token x-vectors → bandwidth-bound, no tile waste,
+    // bit-identical to `dmmv_q4k_fast` per row. Set per-call by `decodeBatch` (true
+    // only when 2≤B≤8 AND `mrowMatvecOn()`); never set by prefill/decodeStep.
+    // OPT-IN, default-off (ZINC_BATCH_MROW); `decode_mrow_force` (harness-only)
+    // overrides the env gate for an in-process A/B (null → env default).
+    decode_mrow: bool = false,
+    decode_mrow_force: ?bool = null,
     // Effort 24 cycle 11: route the dense batched Q4_K GEMMs through the fp16
     // tensor-core kernel (gemm_q4k_tc) instead of the f32 register-tiled GEMM.
     // Opt-in (ZINC_BATCHED_TC, read once per prefillBatched); off by default so
@@ -495,6 +506,14 @@ pub const ForwardGemma = struct {
         pipes.dmmv_fast[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_fast");
         pipes.dmmv_fast[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_fast");
         pipes.dmmv_fast[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_fast");
+        // Effort 28: small-B token-batch Q4_K matvec (B=2..8), pipeline idx B-2.
+        pipes.dmmv_q4k_btok[0] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok2");
+        pipes.dmmv_q4k_btok[1] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok3");
+        pipes.dmmv_q4k_btok[2] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok4");
+        pipes.dmmv_q4k_btok[3] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok5");
+        pipes.dmmv_q4k_btok[4] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok6");
+        pipes.dmmv_q4k_btok[5] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok7");
+        pipes.dmmv_q4k_btok[6] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok8");
         pipes.dmmv_q4k_fast_dual = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_fast_dual");
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.gemma_attention = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention");
@@ -672,6 +691,8 @@ pub const ForwardGemma = struct {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
             } else if (comptime std.mem.eql(u8, f.name, "dmmv_fast")) {
                 for (&self.pipes.dmmv_fast) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q4k_btok")) {
+                for (&self.pipes.dmmv_q4k_btok) |*p| pipeline.freePipeline(p);
             } else if (comptime std.mem.eql(u8, f.name, "gemm")) {
                 for (&self.pipes.gemm) |*p| pipeline.freePipeline(p);
             } else {
@@ -1149,6 +1170,11 @@ pub const ForwardGemma = struct {
         // leaks the flag into a later prefillBatched (which never sets it).
         self.decode_b1 = (B == 1) and (self.decode_b1_force orelse b1MatvecOn());
         defer self.decode_b1 = false;
+        // Effort 28: small-B Q4_K token-batch matvec for 2≤B≤8 (opt-in, default-off;
+        // see `gemmDispatchA`). `defer` clears it so an early-return error never
+        // leaks the flag into a later prefillBatched (which never sets it).
+        self.decode_mrow = (B >= 2 and B <= 8) and (self.decode_mrow_force orelse mrowMatvecOn());
+        defer self.decode_mrow = false;
 
         // Mirror prefillBatched's GEMM knobs so the batched projections/FFN take
         // the same kernel path. cuBLAS self-gates on T >= cublas_min_t (128), so a
@@ -1318,6 +1344,18 @@ pub const ForwardGemma = struct {
         // reaches here with decode_b1 true.
         if (T == 1 and self.decode_b1) {
             self.dmmvDispatch(cmd, w, x, y, M, K, 0, 0);
+            return;
+        }
+        // Effort 28: small-B (2..8) Q4_K token-batch matvec. x/y are token-major
+        // [T,*] (contiguous), and every decode GEMM here overwrites y (the residual
+        // is the separate rms_norm_residual, not GEMM acc) → acc_mode 0. Reads each
+        // Q4_K weight row ONCE, amortizing the dequant over the T tokens →
+        // bandwidth-bound, no tile waste, bit-identical to dmmv_q4k_fast per row.
+        // Skip when the normf16 opt-in staged the fp16 norm into act_f16 instead of
+        // materializing the f32 x this kernel reads (a_preconv & use_tc_normf16).
+        if (self.decode_mrow and T >= 2 and T <= 8 and w.info.type_ == .q4_k and !(a_preconv and self.use_tc_normf16)) {
+            const push = DmmvPush{ .M = M, .K = K };
+            cmd.dispatch(&self.pipes.dmmv_q4k_btok[T - 2], .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
             return;
         }
         const gi: ?usize = switch (w.info.type_) {
@@ -2379,6 +2417,16 @@ fn b1MatvecOn() bool {
     const v = std.posix.getenv("ZINC_BATCH_B1_MATVEC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+// Effort 28: the small-B (2..8) Q4_K token-batch matvec (`dmmv_q4k_btok`) is
+// OPT-IN, default-off (enable ZINC_BATCH_MROW=1/on/true/yes). Same env knob as the
+// qwen `decodeBatch` port. Default-off keeps the validated batched-GEMM path the
+// serving default until the throughput win is confirmed end-to-end vs llama-server.
+fn mrowMatvecOn() bool {
+    const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return false;
+    return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on") or
+        std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes");
 }
 
 // Effort 26 cycle 9: the cuBLAS dense Q4_K prefill GEMM is default-ON (opt out
