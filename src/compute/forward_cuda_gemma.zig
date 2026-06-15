@@ -189,6 +189,7 @@ const Pipelines = struct {
     dmmv_q4k_experts: CudaPipeline, // batched fused gate/up over all experts
     dmmv_q4k_experts_dual: CudaPipeline, // gate+up over all experts in ONE launch
     moe_combine_tail: CudaPipeline, // shared+moe → post_ffw_norm → hidden in ONE launch
+    moe_norm_combine_tail: CudaPipeline, // post_ffw_norm_2 + combine fused (cycle 17)
     rms_norm_triple: CudaPipeline, // 3 MoE pre-norms off the same hidden → ONE launch
     dmmv_q5_1_experts: CudaPipeline, // batched down over all experts
     dmmv_q4k_experts_batched: CudaPipeline, // token-batched gate/up (all T prompt tokens)
@@ -366,6 +367,7 @@ pub const ForwardGemma = struct {
     use_tc_m64: bool = false, // cycle 15 A/B: ZINC_BATCHED_TC_M64 kill-switch forces the prior 24 KB-shared Q4_K TC kernel (cycle 12 default); the new default is the 8 KB-shared lowsmem kernel (+11.6%, byte-identical)
     use_tc_q6_lowsmem: bool = false, // cycle 16 A/B: ZINC_BATCHED_TC_Q6_LOWSMEM opts INTO the 8 KB-shared lowsmem Q6_K TC kernel (gemm_q6k_tc_f16a_lowsmem). Byte-identical to the default 24 KB m64 Q6_K kernel but in-noise on perf (Q6_K is ~1/7 of the dense GEMM → its occupancy win is below the box's boost floor; 2 ABBA runs nominally -1/-5%) → kept OPT-IN, the proven m64 kernel stays the default.
     use_grouped: bool = false, // cycle 18: ZINC_BATCHED_EXPERTS_GROUPED opts into token-GROUPED routed experts (build_expert_order + grouped matvecs → expert weight L2-resident across its tokens). Byte-identical to the cycle-8 _batched path; opt-in pending a measured win.
+    fuse_norm_combine: bool = false, // e27 cycle 17 A/B: ZINC_MOE_NORM_COMBINE fuses the MoE decode post_ffw_norm_2 + combine tail into ONE single-block launch (moe_norm_combine_tail). Byte-identical; off → the two-launch path. Read once in init.
     use_tc_m128_lowsmem: bool = false, // cycle 17 A/B: ZINC_BATCHED_TC_M128_LOWSMEM opts INTO the 12 KB-shared wider 128x64 M-tile Q4_K TC kernel (gemm_q4k_tc_f16a_m128_lowsmem) — synthesis of cycle 14's wider tile (halves the dominant f16-A read) + cycle 15's two-phase Cs (12 KB shared → ~6 blocks/SM, NOT m128's 44 KB→1 block/SM that lost -11.8%). Byte-identical to the m64/lowsmem default; measured this cycle to decide if it becomes the default.
     use_tc_sharea: bool = false, // cycle 19: ZINC_BATCHED_TC_SHAREA shares ONE f32→f16 activation recast across GEMMs that read the SAME input (attn Q/K/V from b.norm; FFN gate/up from b.ffn_norm) — skips the redundant per-GEMM f32_to_f16 launch + read for the 2nd/3rd GEMM of each group. Byte-identical (same __float2half bits, same act_f16 contents reused stream-ordered). Off → each GEMM recasts independently (cycle 12 behavior).
     use_tc_normf16: bool = false, // cycle 21: ZINC_BATCHED_TC_NORMF16 has the norm/GeGLU PRODUCERS emit fp16 directly into act_f16 (rms_norm_f16/geglu_f16) so ALL the dense TC GEMMs reading a produced activation (attn Q/K/V from the pre-attn norm; FFN gate/up from the pre-FFN norm; ffn_down from GeGLU) skip their per-GEMM f32→fp16 recast launch ENTIRELY — not just the shared-A dedup. Byte-identical to the per-GEMM-recast TC path (the producer __float2half's the SAME f32 value f32_to_f16 would). Off → cycle-12 per-GEMM recast.
@@ -472,6 +474,7 @@ pub const ForwardGemma = struct {
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
         pipes.dmmv_q4k_experts_dual = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts_dual");
         pipes.moe_combine_tail = try pipeline.createPipeline(ctx, src.ptr, "moe_combine_tail");
+        pipes.moe_norm_combine_tail = try pipeline.createPipeline(ctx, src.ptr, "moe_norm_combine_tail");
         pipes.rms_norm_triple = try pipeline.createPipeline(ctx, src.ptr, "rms_norm_triple");
         pipes.dmmv_q5_1_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1_experts");
         pipes.dmmv_q4k_experts_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts_batched");
@@ -608,6 +611,9 @@ pub const ForwardGemma = struct {
                 buffer.download(ctx, &ts.gpu_buffer, std.mem.sliceAsBytes(self.down_scales[li * d.n_experts ..][0..d.n_experts]));
             }
         }
+
+        // e27 cycle 17 A/B: fuse the MoE decode post_ffw_norm_2 + combine tail.
+        self.fuse_norm_combine = std.posix.getenv("ZINC_MOE_NORM_COMBINE") != null;
 
         return self;
     }
@@ -1547,7 +1553,10 @@ pub const ForwardGemma = struct {
                 // Fallback: the down scale was already folded into the router weights host-side.
                 cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.moe_out_buf, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
             }
-            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.moe_out_buf, &wpn2.gpu_buffer, &self.moe_out_buf }, &rms, @sizeOf(RmsPush), 0);
+            // Cycle 17: when fusing, skip the standalone post_ffw_norm_2 here — the
+            // fused moe_norm_combine_tail does it from the raw weighted-acc moe_out_buf.
+            if (!self.fuse_norm_combine)
+                cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.moe_out_buf, &wpn2.gpu_buffer, &self.moe_out_buf }, &rms, @sizeOf(RmsPush), 0);
             if (batched) self.submit(cmd) else cmd.commitAndWait();
         }
 
@@ -1558,7 +1567,13 @@ pub const ForwardGemma = struct {
         // t = shared+moe is recomputed in both passes, shared is never written.
         {
             var cmd = try command.beginCommand(ctx);
-            cmd.dispatch(&self.pipes.moe_combine_tail, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.shared_buf, &self.moe_out_buf, &wpost.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
+            if (self.fuse_norm_combine) {
+                // Cycle 17: also fold post_ffw_norm_2 (above) into the combine — reads
+                // moe_out_buf RAW, norms it internally. Two single-block launches → one.
+                cmd.dispatch(&self.pipes.moe_norm_combine_tail, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.shared_buf, &self.moe_out_buf, &wpn2.gpu_buffer, &wpost.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.moe_combine_tail, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.shared_buf, &self.moe_out_buf, &wpost.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
+            }
             if (batched) self.submit(cmd) else cmd.commitAndWait();
         }
     }
@@ -1889,7 +1904,10 @@ pub const ForwardGemma = struct {
             } else {
                 cmd.dispatch(&self.pipes.moe_weighted_acc, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.moe_out_buf, &self.down_buf, &self.router_out_buf }, &ma, @sizeOf(MoeAccPush), 0);
             }
-            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.moe_out_buf, &wpn2.gpu_buffer, &self.moe_out_buf }, &rms, @sizeOf(RmsPush), 0);
+            // Cycle 17: when fusing, skip the standalone post_ffw_norm_2 here — the
+            // fused moe_norm_combine_tail does it from the raw weighted-acc moe_out_buf.
+            if (!self.fuse_norm_combine)
+                cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.moe_out_buf, &wpn2.gpu_buffer, &self.moe_out_buf }, &rms, @sizeOf(RmsPush), 0);
             if (batched) self.submit(cmd) else cmd.commitAndWait();
         }
 
@@ -1900,7 +1918,13 @@ pub const ForwardGemma = struct {
         // t = shared+moe is recomputed in both passes, shared is never written.
         {
             var cmd = try command.beginCommand(ctx);
-            cmd.dispatch(&self.pipes.moe_combine_tail, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.shared_buf, &self.moe_out_buf, &wpost.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
+            if (self.fuse_norm_combine) {
+                // Cycle 17: also fold post_ffw_norm_2 (above) into the combine — reads
+                // moe_out_buf RAW, norms it internally. Two single-block launches → one.
+                cmd.dispatch(&self.pipes.moe_norm_combine_tail, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.shared_buf, &self.moe_out_buf, &wpn2.gpu_buffer, &wpost.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.moe_combine_tail, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.shared_buf, &self.moe_out_buf, &wpost.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
+            }
             if (batched) self.submit(cmd) else cmd.commitAndWait();
         }
     }

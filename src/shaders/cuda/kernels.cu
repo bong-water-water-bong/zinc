@@ -438,6 +438,53 @@ extern "C" __global__ void moe_combine_tail(float* hidden, const float* shared,
     }
 }
 
+// ---- moe_norm_combine_tail (gemma4-MoE decode: post_ffw_norm_2 + combine fused)
+// Fuses the routed-experts post_ffw_norm_2 (rms_norm(moe, w_pn2)) with the combine
+// tail (moe_combine_tail) — two ADJACENT single-block rms-style launches across a
+// command boundary. The fused kernel reads `moe` RAW (the weighted-acc, NOT pre-
+// normed): phase 1 norms it (== rms_norm(moe, w_pn2)) producing rinv1; phase 2
+// forms t = shared + w_pn2*(moe*rinv1) and reduces ss2 (== moe_combine_tail's
+// reduction over the post_ffw_norm_2 output); phase 3 writes hidden += w_post*
+// (t*rinv2). BYTE-IDENTITY: the normed-moe value w_pn2[i]*(moe[i]*rinv1) is
+// recomputed (never written back) so it matches rms_norm's f32 output exactly, and
+// t / ss2 / rinv2 / the hidden update are byte-for-byte moe_combine_tail's. Removes
+// one launch + the moe_out_buf store/reload round-trip. One block (grid {1,1,1}),
+// block-count PRESERVED (both originals were single-block). Intervening
+// __syncthreads make the zinc_block_reduce_sum scratch reuse race-free.
+extern "C" __global__ void moe_norm_combine_tail(float* hidden, const float* shared,
+                                                 const float* moe, const float* w_pn2,
+                                                 const float* w_post, RmsPush pc) {
+    // phase 1: post_ffw_norm_2 over the raw weighted-acc moe (== rms_norm(moe,w_pn2))
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = moe[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv1 = rms_inv_sh;
+
+    // phase 2: t = shared + post_ffw_norm_2(moe); reduce ss2 (== moe_combine_tail)
+    float ss2 = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float t = shared[i] + w_pn2[i] * (moe[i] * rinv1);
+        ss2 += t * t;
+    }
+    ss2 = zinc_block_reduce_sum(ss2);
+    __shared__ float rms_inv_sh2;
+    if (threadIdx.x == 0) rms_inv_sh2 = rsqrtf(ss2 / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv2 = rms_inv_sh2;
+
+    // phase 3: hidden += post_ffw_norm(t)
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float t = shared[i] + w_pn2[i] * (moe[i] * rinv1);
+        hidden[i] += w_post[i] * (t * rinv2);
+    }
+}
+
 // ---- sigmoid_scale_acc (port of sigmoid_scale_acc.comp) ---------------------
 // a[i] += sigmoid(c[0]) * b[i]  (MoE shared-expert sigmoid gating). a read-write.
 struct SigmoidAccPush { unsigned N; };
