@@ -415,6 +415,18 @@ pub const ForwardCuda = struct {
     // token (per-step alloc/free fragments the allocator → monotonic collapse).
     pos_scratch: ?CudaBuffer = null,
     slots_scratch: ?CudaBuffer = null,
+    // E28 lever C suspect #2 (qwen port of the gemma `bf4ad2a6` fix): persistent
+    // scratch to collapse the per-step embed + tail B-serial GPU round-trips into
+    // single batched ops. `argmax_scratch` [n_slots] u32 collects every row's tail
+    // argmax (ONE B-wide download vs B downloads/token); `embed_host`
+    // [n_slots*n_embd] stages the CPU embed (ONE upload vs B); `tok_scratch`
+    // [n_slots] u32 holds the B token ids for the GPU embed path (ONE command
+    // buffer vs B commitAndWaits). All sized to n_slots ≥ B, alloc'd in
+    // allocSlotState / freed in freeSlotState. ADDITIVE — production decodeStep
+    // (single-seq argmax_buf/host_embed/tok_in_buf) is untouched.
+    argmax_scratch: ?CudaBuffer = null,
+    embed_host: ?[]f32 = null,
+    tok_scratch: ?CudaBuffer = null,
 
     // Effort 28 4c: token-major [B, dim] activation scratch for batched decode.
     // Lazily allocated on the first decodeBatch call, grown if B exceeds cap.
@@ -669,6 +681,10 @@ pub const ForwardCuda = struct {
         // max batch (n_slots) so every decodeBatch step just re-uploads into it.
         self.pos_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
         self.slots_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        // Suspect-#2 port: persistent tail/embed scratch (see field comment).
+        self.argmax_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        self.tok_scratch = try buffer.createBuffer(ctx, @as(usize, n_slots) * @sizeOf(u32));
+        self.embed_host = try self.allocator.alloc(f32, @as(usize, n_slots) * d.n_embd);
     }
 
     pub fn freeSlotState(self: *ForwardCuda) void {
@@ -679,11 +695,15 @@ pub const ForwardCuda = struct {
                 field.* = null;
             }
         }
-        inline for (.{ &self.pos_scratch, &self.slots_scratch }) |field| {
+        inline for (.{ &self.pos_scratch, &self.slots_scratch, &self.argmax_scratch, &self.tok_scratch }) |field| {
             if (field.*) |*b| {
                 buffer.freeBuffer(b);
                 field.* = null;
             }
+        }
+        if (self.embed_host) |h| {
+            self.allocator.free(h);
+            self.embed_host = null;
         }
         self.n_slots = 0;
         self.slot_ctx = 0;
@@ -915,25 +935,38 @@ pub const ForwardCuda = struct {
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
         const lm_head = self.model.get("output.weight") orelse return error.MissingTensor;
 
-        // EMBED each row into its slice of db.hidden, using the SAME kernel/weight
-        // as the serial decodeStep so the projection inputs are bit-aligned.
+        // EMBED all B rows into db.hidden, SAME kernel/weight as serial decodeStep
+        // so the projection inputs are bit-aligned. Suspect-#2 port: collapse the
+        // per-row B-serial round-trips. GPU path: upload all B token ids ONCE to
+        // tok_scratch, then ONE command buffer dispatches embed_q4k per row (the
+        // kernel reads tok[0] → alias tok_scratch at bi·4 for the bi-th id) into
+        // each row's db.hidden slice → ONE commitAndWait (was B). CPU path: dequant
+        // all B rows into the persistent embed_host, ONE upload to the contiguous
+        // [B,n_embd] db.hidden (was B uploads).
         var bi: u32 = 0;
-        while (bi < B) : (bi += 1) {
-            std.debug.assert(slots[bi] < self.n_slots and positions[bi] < self.slot_ctx);
-            var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
-            defer buffer.freeBuffer(&hrow);
-            if (self.embed_gpu) {
-                self.host_tok_in[0] = tokens[bi];
-                buffer.upload(ctx, &self.tok_in_buf, std.mem.sliceAsBytes(self.host_tok_in));
-                var cmd = try command.beginCommand(ctx);
-                const push = EmbedPush{ .K = d.n_embd, .vocab = d.vocab };
-                const nsb = d.n_embd / 256;
-                cmd.dispatch(&self.pipes.embed_q4k, .{ nsb, 1, 1 }, .{ 256, 1, 1 }, &.{ self.embed_weight.?, &self.tok_in_buf, &hrow }, &push, @sizeOf(EmbedPush), 0);
-                cmd.commitAndWait();
-            } else {
-                self.model.dequantEmbeddingRow(tokens[bi], self.host_embed);
-                buffer.upload(ctx, &hrow, std.mem.sliceAsBytes(self.host_embed));
+        while (bi < B) : (bi += 1) std.debug.assert(slots[bi] < self.n_slots and positions[bi] < self.slot_ctx);
+        if (self.embed_gpu) {
+            const tok_buf = &self.tok_scratch.?;
+            buffer.upload(ctx, tok_buf, std.mem.sliceAsBytes(tokens));
+            const push = EmbedPush{ .K = d.n_embd, .vocab = d.vocab };
+            const nsb = d.n_embd / 256;
+            var cmd = try command.beginCommand(ctx);
+            bi = 0;
+            while (bi < B) : (bi += 1) {
+                var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+                defer buffer.freeBuffer(&hrow);
+                var trow = try buffer.aliasBuffer(tok_buf, bi * @sizeOf(u32), @sizeOf(u32));
+                defer buffer.freeBuffer(&trow);
+                cmd.dispatch(&self.pipes.embed_q4k, .{ nsb, 1, 1 }, .{ 256, 1, 1 }, &.{ self.embed_weight.?, &trow, &hrow }, &push, @sizeOf(EmbedPush), 0);
             }
+            cmd.commitAndWait();
+        } else {
+            const host = self.embed_host.?[0 .. B * d.n_embd];
+            bi = 0;
+            while (bi < B) : (bi += 1) {
+                self.model.dequantEmbeddingRow(tokens[bi], host[bi * d.n_embd ..][0..d.n_embd]);
+            }
+            buffer.upload(ctx, &db.hidden, std.mem.sliceAsBytes(host));
         }
 
         // 4c-step-2: upload per-seq positions[]/slots[] ONCE (same for all layers)
@@ -964,13 +997,23 @@ pub const ForwardCuda = struct {
             if (d.n_experts > 0) try self.moeFfnBlockBatchedDecode(L, B, db) else try self.ffnBlockBatchedDecode(L, B, db);
         }
 
-        // TAIL per row: rms_norm → LM head → argmax → out[bi]. Reuse single-row scratch.
+        // TAIL: rms_norm → LM head → argmax for all B rows. Suspect-#2 port: chain
+        // every row into ONE command buffer + ONE commitAndWait + ONE B-wide
+        // download (was B serial commitAndWait+download per decoded token). On one
+        // stream the dispatches execute strictly in order, so reusing the single
+        // norm_buf/logits_buf scratch across rows is hazard-free (row b+1's rms_norm
+        // can't run until row b's LM head consumed norm_buf) → identical math to the
+        // per-row form. Only the argmax OUTPUT is per-row → each writes its own slot
+        // of argmax_scratch (aliased bi·4), downloaded once into out[0..B].
         const lm_idx = dmmvIdx(lm_head.info.type_);
+        const argmax_out = &self.argmax_scratch.?;
+        var cmd = try command.beginCommand(ctx);
         bi = 0;
         while (bi < B) : (bi += 1) {
             var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
             defer buffer.freeBuffer(&hrow);
-            var cmd = try command.beginCommand(ctx);
+            var am_slot = try buffer.aliasBuffer(argmax_out, bi * @sizeOf(u32), @sizeOf(u32));
+            defer buffer.freeBuffer(&am_slot);
             const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
             cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &hrow, &out_norm.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
             const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
@@ -980,12 +1023,10 @@ pub const ForwardCuda = struct {
                 cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
             }
             const am = ArgmaxPush{ .N = d.vocab };
-            cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &self.argmax_buf }, &am, @sizeOf(ArgmaxPush), 0);
-            cmd.commitAndWait();
-            var tok: u32 = 0;
-            buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
-            out[bi] = tok;
+            cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &am_slot }, &am, @sizeOf(ArgmaxPush), 0);
         }
+        cmd.commitAndWait();
+        buffer.download(ctx, argmax_out, std.mem.sliceAsBytes(out));
     }
 
     /// (Re)allocate the [B, dim] batched-decode scratch, growing if B exceeds cap.
