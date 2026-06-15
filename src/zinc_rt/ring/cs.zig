@@ -264,9 +264,8 @@ const tgid_dump_gfx1201 = [_]u32{
 };
 
 const tgid_probe_gfx1201 = [_]u32{
-    0x84028208, // s_lshl_b32 s2, s8, 2
-    0x7e000202, // v_mov_b32_e32 v0, s2
-    0x7e020208, // v_mov_b32_e32 v1, s8
+    0x7e020275, // v_mov_b32_e32 v1, ttmp9   (v1 = workgroup_id_x on gfx11/gfx12)
+    0x30000282, // v_lshlrev_b32_e32 v0, 2, v1   (v0 = id*4 byte offset)
     0xee068000, 0x00800000, 0x00000000, // global_store_b32 v0, v1, s[0:1]
     0xbf8903f7, // s_waitcnt vmcnt(0)
     0xbfb60003, // s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)

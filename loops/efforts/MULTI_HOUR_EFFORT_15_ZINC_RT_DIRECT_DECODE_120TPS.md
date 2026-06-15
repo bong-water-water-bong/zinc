@@ -111,6 +111,21 @@ compute COMPUTE_PGM_RSRC2 + COMPUTE_DISPATCH_INITIATOR + grid register setup
 register recipe exists — copy it). Probe lives on branch
 `zinc-rt-rdna1-lmhead-gpu-matvec`.
 
+**2026-06-15 RESOLVED — the fix is `ttmp9` (2 instructions).** Compiling
+`@llvm.amdgcn.workgroup.id.x()` for gfx1201 with `llc` shows LLVM reads the
+workgroup id from **`ttmp9`** (`v_mov_b32 v0, ttmp9`), NOT an s8-style SGPR —
+the gfx11/gfx12 (RDNA3/RDNA4) ABI change. `rsrc2=0x90` (bit 7
+ENABLE_SGPR_WORKGROUP_ID_X) was already correct; on gfx12 that bit makes the CP
+write `workgroup_id_x` into `ttmp9` instead of a post-user SGPR. Changed the
+probe kernel from `s8` to `v_mov_b32 v1, ttmp9` and `--probe-gpu` now reports
+`TGID out[0..4] = {0,1,2,3}` — multi-WG dispatch launches N groups and each
+reads its correct id. **The grid-over-rows resident matvec is UNBLOCKED:**
+row-block index = `ttmp9`, weights from a resident VRAM BO, `grid=(ceil(rows/64),1,1)`,
+one submit/token. This is precisely the wall that stalled autopilot cy66-82, and
+the dump correctly shows s8..s19 empty (the id was never there — it's in ttmp9).
+Next: build `dmmv_q4_0_resident_grid.s` + resident VRAM weight BO, validate
+bit-exact vs the CPU LM-head, wire into decode, A/B vs Vulkan.
+
 ## Profiling Snapshot
 
 Remote node: R9700 RDNA4 / gfx1201, Linux 6.17, Zig 0.15.2. Measurements were
