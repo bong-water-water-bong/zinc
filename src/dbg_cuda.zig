@@ -655,6 +655,57 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                 std.debug.print(" [gate={s} sanity={s}]\n", .{ if (gmatch) "MATCH" else "DIFF", if (smatch) "MATCH" else "DIFF" });
             }
             std.debug.print("BATCH_GATE:{s} BATCH_SANITY:{s} (nseq={d} ngen={d})\n", .{ if (gate_pass) "PASS" else "FAIL", if (sanity_pass) "PASS" else "FAIL", nseq, ng });
+
+            // Effort 28 perf A/B (qwen analog of the gemma B1_TIMING): time NG
+            // steady-state B=1 decodeBatch steps with the matvec fast path OFF
+            // then ON in ONE model load (boost-comparable). Token-identity is
+            // already gated above (PASS-A-solo runs B=1) — this reports the
+            // per-stream speedup the fast path buys for qwen.
+            {
+                var which: u32 = 0;
+                while (which < 2) : (which += 1) {
+                    q.decode_b1_force = (which == 1);
+                    try q.allocSlotState(1, slot_ctx); // fresh slot 0
+                    const np = plens[0];
+                    var pos: u32 = 0;
+                    var tok: u32 = 0;
+                    var k: usize = 0;
+                    while (k < np) : (k += 1) { // prefill seq0 into slot 0 (B=1)
+                        var tk = [_]u32{prompts[0][k]};
+                        var ps = [_]u32{pos};
+                        var sl = [_]u32{0};
+                        var ot = [_]u32{0};
+                        try q.decodeBatch(&tk, &ps, &sl, &ot);
+                        tok = ot[0];
+                        pos += 1;
+                    }
+                    var w: u32 = 0; // warm a few steps before timing
+                    while (w < 3) : (w += 1) {
+                        var tk = [_]u32{tok};
+                        var ps = [_]u32{pos};
+                        var sl = [_]u32{0};
+                        var ot = [_]u32{0};
+                        try q.decodeBatch(&tk, &ps, &sl, &ot);
+                        tok = ot[0];
+                        pos += 1;
+                    }
+                    var timer = try std.time.Timer.start();
+                    var s: u32 = 0;
+                    while (s < ng) : (s += 1) {
+                        var tk = [_]u32{tok};
+                        var ps = [_]u32{pos};
+                        var sl = [_]u32{0};
+                        var ot = [_]u32{0};
+                        try q.decodeBatch(&tk, &ps, &sl, &ot);
+                        tok = ot[0];
+                        pos += 1;
+                    }
+                    const ns = timer.read();
+                    const tps = @as(f64, @floatFromInt(ng)) * 1e9 / @as(f64, @floatFromInt(ns));
+                    std.debug.print("B1_TIMING matvec={s}: {d:.2} tok/s ({d} steps)\n", .{ if (which == 1) "ON " else "OFF", tps, ng });
+                }
+                q.decode_b1_force = null;
+            }
         },
     }
 }

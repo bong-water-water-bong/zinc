@@ -363,6 +363,17 @@ pub const ForwardCuda = struct {
     // token_embd.weight device buffer; null/false → fall back to the CPU path.
     embed_weight: ?*const CudaBuffer = null,
     embed_gpu: bool = false,
+    // Effort 28 B==1 matvec fast path (qwen analog of ForwardGemma.decode_b1).
+    // When a `decodeBatch` step batches a single sequence — every per-token
+    // prefill and any single-client decode — its per-layer projection/FFN GEMMs
+    // waste 63/64 of the 64×64 batched tile on one row. Set true only when B==1
+    // AND `b1MatvecOn()` (default-on, opt out ZINC_BATCH_B1_MATVEC=0); routes
+    // those GEMMs through the tuned `dmmvDispatch` matvec (exactly what production
+    // `decodeStep` uses). Never set by `decodeStep`/`prefillStep`, so the serial
+    // path is untouched. `decode_b1_force` (harness-only) overrides the env gate
+    // for an in-process A/B (null → env default).
+    decode_b1: bool = false,
+    decode_b1_force: ?bool = null,
     // MoE scratch (only used when n_experts > 0)
     router_logits_buf: CudaBuffer, // [n_experts] f32 router logits
     router_out_buf: CudaBuffer, // [2*n_experts_used] u32: ids then weight-bits
@@ -876,6 +887,13 @@ pub const ForwardCuda = struct {
         std.debug.assert(positions.len == B and slots.len == B and out.len == B);
         const f4 = @sizeOf(f32);
 
+        // Effort 28 B==1 matvec fast path: when this step batches a single
+        // sequence, route the per-layer projection/FFN GEMMs (`gemmDispatch`) to
+        // the tuned matvec. `defer` clears it so an early-return error never leaks
+        // the flag past this call (production decodeStep/prefillStep never set it).
+        self.decode_b1 = (B == 1) and (self.decode_b1_force orelse b1MatvecOn());
+        defer self.decode_b1 = false;
+
         const db = try self.ensureDecodeBatch(B);
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
         const lm_head = self.model.get("output.weight") orelse return error.MissingTensor;
@@ -968,6 +986,15 @@ pub const ForwardCuda = struct {
     /// buffers; acc_mode 1 accumulates into y for the residual). The dense
     /// projection / FFN weights are all q4k/q5k/q6k/q8_0 (tiled gemm) or f32.
     fn gemmDispatch(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, B: u32, acc_mode: u32) void {
+        // Effort 28: B==1 decode → tuned matvec (decodeStep's path). At B==1 the
+        // single-row x/y are contiguous (a_offset 0) and dmmvDispatch honors the
+        // residual acc_mode (O-proj / FFN-down / SSM-out use acc_mode 1), so this
+        // is a drop-in for the batched-GEMM tile across every decode weight type
+        // (q4k/q5k/q6k/q8_0/f32). Only set on a B==1 decodeBatch step.
+        if (B == 1 and self.decode_b1) {
+            self.dmmvDispatch(cmd, w, x, y, M, K, acc_mode, 0);
+            return;
+        }
         const idx = dmmvIdx(w.info.type_);
         const push = GemmPush{ .M = M, .K = K, .T = B, .acc_mode = acc_mode };
         if (w.info.type_ == .f32) {
@@ -1776,6 +1803,14 @@ pub const ForwardCuda = struct {
         }
     }
 };
+
+// Effort 28: the B==1 decodeBatch matvec fast path is default-ON (opt out
+// ZINC_BATCH_B1_MATVEC=0/off/false/no — the SAME env knob as the gemma path).
+fn b1MatvecOn() bool {
+    const v = std.posix.getenv("ZINC_BATCH_B1_MATVEC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
 
 fn isFullAttn(L: u32, interval: u32) bool {
     return (L + 1) % interval == 0;
