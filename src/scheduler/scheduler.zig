@@ -326,6 +326,43 @@ test "Scheduler EOS-driven eviction frees a slot for a waiter (variable lengths)
     try std.testing.expectEqual(RequestState.decoding, sched.slots[b].?.state);
 }
 
+test "Scheduler concurrent enqueue under external mutex assigns unique slots" {
+    // Effort 28 inc 3 (3a): the concurrent serving harness drives enqueue from N
+    // producer threads guarded by one external mutex (the worker owns admit/decode).
+    // Prove that pattern yields exactly N pending requests with unique, contiguous
+    // ids and no lost/duplicated entries — i.e. enqueue is safe under that locking.
+    const allocator = std.testing.allocator;
+    var sched = try Scheduler.init(allocator, 2);
+    defer sched.deinit();
+
+    const N: u32 = 6;
+    const Ctx = struct {
+        sched: *Scheduler,
+        mutex: *std.Thread.Mutex,
+        fn run(self: *@This()) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            _ = self.sched.enqueue(&.{ 1, 2, 3 }, .{ .max_tokens = 4 }) catch {};
+        }
+    };
+    var mutex = std.Thread.Mutex{};
+    var ctx = Ctx{ .sched = &sched, .mutex = &mutex };
+
+    var threads: [N]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+    for (&threads) |t| t.join();
+
+    try std.testing.expectEqual(@as(usize, N), sched.pending.items.len);
+    try std.testing.expectEqual(@as(u64, N + 1), sched.next_id);
+    // Ids are exactly the set {1..N}, each once.
+    var seen = [_]bool{false} ** (N + 1);
+    for (sched.pending.items) |req| {
+        try std.testing.expect(req.id >= 1 and req.id <= N);
+        try std.testing.expect(!seen[req.id]);
+        seen[req.id] = true;
+    }
+}
+
 test "Scheduler request IDs increment" {
     const allocator = std.testing.allocator;
     var sched = try Scheduler.init(allocator, 4);

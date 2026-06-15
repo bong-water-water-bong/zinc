@@ -140,6 +140,16 @@ pub fn main() !void {
         const nslots: u32 = std.fmt.parseInt(u32, args.next() orelse "2", 10) catch 2;
         const model_path = args.next() orelse DEFAULT_MODEL;
         try schedMode(allocator, seqs_arg, ngen, nslots, model_path);
+    } else if (std.mem.eql(u8, first, "serve")) {
+        // Effort 28 increment 3 (3a): concurrent serving engine proof. ONE GPU
+        // worker thread drives the admit→prefill→decodeBatch→evict loop; N producer
+        // threads enqueue independently and receive their own token stream via a
+        // mutex+condvar handoff. Same args as `sched` (nslots < nseq forces reuse).
+        const seqs_arg = args.next() orelse "760,6511,314,9338,369|450,3271,310,3444,338|1102,323,1023,1024|99,100,101,102,103";
+        const ngen: u32 = std.fmt.parseInt(u32, args.next() orelse "8", 10) catch 8;
+        const nslots: u32 = std.fmt.parseInt(u32, args.next() orelse "2", 10) catch 2;
+        const model_path = args.next() orelse DEFAULT_MODEL;
+        try serveMode(allocator, seqs_arg, ngen, nslots, model_path);
     } else if (std.mem.eql(u8, first, "prof")) {
         const model_path = args.next() orelse DEFAULT_MODEL;
         try profMode(allocator, model_path);
@@ -714,6 +724,319 @@ fn finishSched(sched: *scheduler.Scheduler, slot_id: u32, sched_out: anytype, sc
     }
     try req.transition(.completed);
     sched.release(slot_id);
+}
+
+// ── Effort 28 increment 3 (3a): concurrent serving engine ────────────────────
+//
+// The single-threaded `schedMode` driver proved the continuous-batch loop is
+// token-correct. Increment 3 turns it into a *server*: the GPU loop must run on
+// its OWN worker thread while many request threads submit work concurrently and
+// each receives its own stream. This is the threading model the CUDA HTTP server
+// (not yet wired — main.zig:1662) will adopt; 3a proves it WITHOUT the HTTP
+// transport so correctness under real thread concurrency is isolated.
+//
+// Thread-safety model (why this is sound):
+//   * ALL GPU work (decodeBatch) runs ONLY on the worker thread. The CUDA shim
+//     rebinds the context per call (cuCtxSetCurrent at every entry point), so a
+//     single GPU-owning thread needs no extra ceremony.
+//   * The ONLY cross-thread mutable state is the scheduler's `pending` FIFO
+//     (producers append via enqueue; the worker drains it via admitNext) plus the
+//     result/done registry. Both are guarded by ONE mutex. Slot state
+//     (prefill/decode/append/release) is worker-only and needs no lock.
+//   * Each sequence's tokens depend only on its own slot KV + positions (proven
+//     isolated in increment 1), so the nondeterministic admit/interleave ORDER
+//     across threads cannot change any sequence's output — exactly what the gate
+//     asserts.
+const SERVE_MAXB = 8; // max concurrent client threads / sequences
+const SERVE_MAXP = 256; // max prompt tokens / sequence
+const SERVE_MAXG = 64; // max generated tokens / sequence
+
+/// Shared state between the GPU worker thread and the N producer threads.
+const ServeCtx = struct {
+    g: *forwardgemma.ForwardGemma,
+    sched: *scheduler.Scheduler,
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    // Inputs (filled before threads start; prompts must outlive every request —
+    // Request borrows the slice, so this storage lives in the parent frame).
+    prompts: [SERVE_MAXB][SERVE_MAXP]u32 = undefined,
+    plens: [SERVE_MAXB]usize = undefined,
+    nseq: u32 = 0,
+    ng: u32 = 0,
+    eos: u32 = std.math.maxInt(u32),
+    // Worker → published stream, keyed by request id-1 (assigned by enqueue).
+    pub_out: [SERVE_MAXB][SERVE_MAXG]u32 = undefined,
+    pub_len: [SERVE_MAXB]u32 = [_]u32{0} ** SERVE_MAXB,
+    pub_done: [SERVE_MAXB]bool = [_]bool{false} ** SERVE_MAXB,
+    published: u32 = 0,
+    // Client j → received stream + the request id it was assigned (for the gate).
+    client_id: [SERVE_MAXB]u64 = [_]u64{0} ** SERVE_MAXB,
+    cli_out: [SERVE_MAXB][SERVE_MAXG]u32 = undefined,
+    cli_len: [SERVE_MAXB]u32 = [_]u32{0} ** SERVE_MAXB,
+};
+
+/// Publish a finished request's stream to its waiter, complete it, free its slot.
+/// Worker-thread only; takes the mutex just to flip the done flag + counters.
+fn serveFinish(c: *ServeCtx, slot_id: u32) void {
+    const req = &c.sched.slots[slot_id].?;
+    const items = req.generated_tokens.items;
+    const idx: usize = @intCast(req.id - 1);
+    const lim = @min(items.len, @as(usize, SERVE_MAXG));
+    c.mutex.lock();
+    var s: usize = 0;
+    while (s < lim) : (s += 1) c.pub_out[idx][s] = items[s];
+    c.pub_len[idx] = @intCast(lim);
+    c.pub_done[idx] = true;
+    c.published += 1;
+    c.mutex.unlock();
+    c.cond.broadcast(); // wake the client blocked on this request
+    req.transition(.completed) catch {};
+    c.sched.release(slot_id); // worker-only; frees the slot for a waiter
+}
+
+/// The GPU worker: admit waiters, prefill new slots, run ONE batched decode step
+/// over all decoders, evict on EOS/budget — until every sequence has finished.
+fn serveWorker(c: *ServeCtx) void {
+    const g = c.g;
+    while (true) {
+        // Admit pending arrivals into free slots (touches `pending` → under lock).
+        c.mutex.lock();
+        if (c.published >= c.nseq) {
+            c.mutex.unlock();
+            break;
+        }
+        while ((c.sched.admitNext() catch null) != null) {}
+        c.mutex.unlock();
+
+        var did_work = false;
+
+        // PREFILL each prefilling slot (per-token B=1 decodeBatch into its slot),
+        // record the first generated token, promote to .decoding (slots + GPU are
+        // worker-only → no lock). `pendingPrefill` aliases sched.scratch; consume
+        // it fully before activeDecoding overwrites it.
+        const to_prefill = c.sched.pendingPrefill();
+        if (to_prefill.len > 0) did_work = true;
+        for (to_prefill) |slot_id| {
+            const req = &c.sched.slots[slot_id].?;
+            const np = req.prompt_tokens.len;
+            var pos: u32 = 0;
+            var tok: u32 = 0;
+            var k: usize = 0;
+            while (k < np) : (k += 1) {
+                var tk = [_]u32{req.prompt_tokens[k]};
+                var ps = [_]u32{pos};
+                var sl = [_]u32{slot_id};
+                var ot = [_]u32{0};
+                g.decodeBatch(&tk, &ps, &sl, &ot) catch return;
+                tok = ot[0];
+                pos += 1;
+            }
+            req.appendToken(tok) catch return;
+            req.transition(.decoding) catch return;
+            if (req.shouldStop(c.eos)) serveFinish(c, slot_id);
+        }
+
+        // DECODE one step over the whole running batch (mixed positions/slots).
+        const decoders = c.sched.activeDecoding();
+        if (decoders.len > 0) {
+            did_work = true;
+            var tks: [SERVE_MAXB]u32 = undefined;
+            var pss: [SERVE_MAXB]u32 = undefined;
+            var sls: [SERVE_MAXB]u32 = undefined;
+            var out: [SERVE_MAXB]u32 = undefined;
+            for (decoders, 0..) |slot_id, i| {
+                const req = &c.sched.slots[slot_id].?;
+                const gen_n = req.generated_tokens.items.len;
+                tks[i] = req.generated_tokens.items[gen_n - 1];
+                pss[i] = @intCast(req.prompt_tokens.len + gen_n - 1);
+                sls[i] = slot_id;
+            }
+            g.decodeBatch(tks[0..decoders.len], pss[0..decoders.len], sls[0..decoders.len], out[0..decoders.len]) catch return;
+            for (decoders, 0..) |slot_id, i| {
+                const req = &c.sched.slots[slot_id].?;
+                req.appendToken(out[i]) catch return;
+                if (req.shouldStop(c.eos)) serveFinish(c, slot_id);
+            }
+        }
+
+        // Nothing ready (waiting on a slow producer to enqueue) → yield briefly.
+        if (!did_work) std.Thread.sleep(100 * std.time.ns_per_us);
+    }
+}
+
+/// A producer thread: enqueue one request, block until the worker publishes its
+/// stream, then copy it out for the gate. Mirrors what an HTTP handler will do
+/// (enqueue + SSE-stream its own tokens) minus the transport.
+fn serveClient(c: *ServeCtx, j: u32) void {
+    c.mutex.lock();
+    const id = c.sched.enqueue(c.prompts[j][0..c.plens[j]], .{ .max_tokens = c.ng }) catch {
+        c.mutex.unlock();
+        return;
+    };
+    c.client_id[j] = id;
+    const idx: usize = @intCast(id - 1);
+    while (!c.pub_done[idx]) c.cond.wait(&c.mutex);
+    const lim: usize = c.pub_len[idx];
+    var s: usize = 0;
+    while (s < lim) : (s += 1) c.cli_out[j][s] = c.pub_out[idx][s];
+    c.cli_len[j] = c.pub_len[idx];
+    c.mutex.unlock();
+}
+
+/// Effort 28 increment 3, sub-step 3a — concurrent serving engine proof.
+///
+/// Computes an ISOLATED single-sequence reference for each prompt (production
+/// decodeStep over the shared cache), then runs ALL sequences concurrently
+/// through ONE GPU worker thread fed by N producer threads, and asserts each
+/// client's received stream is token-identical to its isolated reference. This
+/// proves the server's threading model (one GPU owner, many producers, per-request
+/// delivery, thread-safe enqueue + slot reuse) is correct under real concurrency.
+/// Additive — production paths untouched; the worker reuses the SAME Scheduler API
+/// + decodeBatch the future HTTP server will call.
+fn serveMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslots_arg: u32, model_path: []const u8) !void {
+    var dev = try device.CudaDevice.initBest(allocator);
+    defer dev.deinit();
+    var model = try loader.Model.load(allocator, dev.ctx, model_path);
+    defer model.deinit();
+    var fwd = try Engine.init(allocator, &model, 512);
+    defer fwd.deinit();
+
+    if (std.meta.activeTag(fwd) != .gemma) {
+        std.debug.print("SERVE:skip (qwen — increment 4)\n", .{});
+        return;
+    }
+    const pf_batched = batchedPrefillDefaultOn();
+
+    const ng = @min(ngen, @as(u32, SERVE_MAXG));
+    const ctx = try allocator.create(ServeCtx);
+    defer allocator.destroy(ctx);
+    ctx.* = .{ .g = undefined, .sched = undefined, .ng = ng };
+
+    var serial_out: [SERVE_MAXB][SERVE_MAXG]u32 = undefined; // isolated reference
+    var serial_len: [SERVE_MAXB]u32 = undefined; // EOS-truncated reference length
+    var nseq: u32 = 0;
+
+    var seq_it = std.mem.splitScalar(u8, seqs_arg, '|');
+    while (seq_it.next()) |seq_str| {
+        if (nseq >= SERVE_MAXB) break;
+        const seq_trim = std.mem.trim(u8, seq_str, " ");
+        if (seq_trim.len == 0) continue;
+        var np: usize = 0;
+        var it = std.mem.splitScalar(u8, seq_trim, ',');
+        while (it.next()) |s| {
+            const t = std.mem.trim(u8, s, " ");
+            if (t.len == 0 or np >= SERVE_MAXP) continue;
+            ctx.prompts[nseq][np] = try std.fmt.parseInt(u32, t, 10);
+            np += 1;
+        }
+        if (np == 0) continue;
+        ctx.plens[nseq] = np;
+
+        // ISOLATED REFERENCE: this sequence alone through the production path.
+        const prompt = ctx.prompts[nseq][0..np];
+        var pos: u32 = 0;
+        var tok: u32 = 0;
+        var used_batched = false;
+        if (pf_batched and prompt.len > 1) {
+            if (fwd.prefillBatched(prompt)) |firstt| {
+                tok = firstt;
+                pos = @intCast(prompt.len);
+                used_batched = true;
+            } else |_| {}
+        }
+        if (!used_batched) {
+            for (prompt) |t| {
+                tok = try fwd.decodeStep(t, pos, true);
+                pos += 1;
+            }
+        }
+        serial_out[nseq][0] = tok;
+        var gi: u32 = 1;
+        while (gi < ng) : (gi += 1) {
+            const next = try fwd.decodeStep(tok, pos, true);
+            pos += 1;
+            serial_out[nseq][gi] = next;
+            tok = next;
+        }
+        nseq += 1;
+    }
+    if (nseq == 0) {
+        std.debug.print("SERVE:skip (no sequences)\n", .{});
+        return;
+    }
+
+    const g = &fwd.gemma;
+    if (g.d.n_experts > 0) {
+        std.debug.print("SERVE:skip (MoE — increment 1/2/3 are dense gemma)\n", .{});
+        return;
+    }
+
+    // EOS for variable per-request lengths (mirrors schedMode): mid-flight eviction
+    // exercises the slot-reuse race under concurrency. Env override or auto.
+    var eos: u32 = std.math.maxInt(u32);
+    if (std.process.getEnvVarOwned(allocator, "ZINC_SCHED_EOS")) |v| {
+        defer allocator.free(v);
+        eos = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \n\r\t"), 10) catch std.math.maxInt(u32);
+    } else |_| {
+        if (ng >= 2) eos = serial_out[0][ng / 2];
+    }
+    ctx.eos = eos;
+    {
+        var j: u32 = 0;
+        while (j < nseq) : (j += 1) {
+            var L: u32 = ng;
+            var s: u32 = 0;
+            while (s < ng) : (s += 1) {
+                if (serial_out[j][s] == eos) {
+                    L = s + 1;
+                    break;
+                }
+            }
+            serial_len[j] = L;
+        }
+    }
+
+    const nslots = std.math.clamp(nslots_arg, 1, nseq);
+    const slot_ctx: u32 = 512;
+    try g.allocSlotKv(nslots, slot_ctx);
+    defer g.freeSlotKv();
+
+    var sched = try scheduler.Scheduler.init(allocator, nslots);
+    defer sched.deinit();
+
+    ctx.g = g;
+    ctx.sched = &sched;
+    ctx.nseq = nseq;
+
+    // Spawn the GPU worker, then N producers that all hit the engine concurrently.
+    const worker = try std.Thread.spawn(.{}, serveWorker, .{ctx});
+    var clients: [SERVE_MAXB]std.Thread = undefined;
+    var spawned: u32 = 0;
+    while (spawned < nseq) : (spawned += 1) {
+        clients[spawned] = try std.Thread.spawn(.{}, serveClient, .{ ctx, spawned });
+    }
+    var ci: u32 = 0;
+    while (ci < nseq) : (ci += 1) clients[ci].join();
+    worker.join();
+
+    // GATE: each client's received stream token-identical to its isolated
+    // reference, including the SAME EOS-truncated length.
+    var gate_pass = ctx.published == nseq;
+    var j: u32 = 0;
+    while (j < nseq) : (j += 1) {
+        const L = serial_len[j];
+        var match = ctx.cli_len[j] == L;
+        var s: u32 = 0;
+        while (s < L) : (s += 1) {
+            if (ctx.cli_out[j][s] != serial_out[j][s]) match = false;
+        }
+        if (!match) gate_pass = false;
+        std.debug.print("SERVE_SEQ{d}(id={d} len={d}/{d}):", .{ j, ctx.client_id[j], ctx.cli_len[j], L });
+        s = 0;
+        while (s < L) : (s += 1) std.debug.print("{s}{d}", .{ if (s == 0) "" else ",", ctx.cli_out[j][s] });
+        std.debug.print(" [{s}]\n", .{if (match) "MATCH" else "DIFF"});
+    }
+    std.debug.print("SERVE_GATE:{s} (nseq={d} nslots={d} ngen={d} eos={d} published={d})\n", .{ if (gate_pass) "PASS" else "FAIL", nseq, nslots, ng, eos, ctx.published });
 }
 
 /// Dispatch sync-vs-async microbench: the same kernel launched N times under the
