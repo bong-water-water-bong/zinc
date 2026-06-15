@@ -365,6 +365,17 @@ pub const ForwardGemma = struct {
     // Effort 24: lazily-allocated batched-prefill scratch (null until the first
     // ZINC_BATCHED_PREFILL run; freed in deinit).
     batch: ?BatchScratch = null,
+    // Effort 28 (perf lever): when a decodeBatch step has B==1 (the common
+    // serving case — ALL per-token prefill + single-client decode), route the
+    // per-layer projection/FFN GEMMs through the tuned `dmmv` matvec (exactly
+    // what production `decodeStep` uses) instead of the 64×64-tiled batched TC
+    // GEMM, which wastes 63/64 of its tile on one row (B=1 batched ≈2.2 vs
+    // decodeStep ≈8 tok/s). Set per-call by `decodeBatch` (true only when B==1
+    // AND `b1MatvecOn()`); never set by prefill/decodeStep, so those paths are
+    // untouched even at T==1. `decode_b1_force` (harness-only) overrides the env
+    // gate for an in-process A/B (null → use the env default).
+    decode_b1: bool = false,
+    decode_b1_force: ?bool = null,
     // Effort 24 cycle 11: route the dense batched Q4_K GEMMs through the fp16
     // tensor-core kernel (gemm_q4k_tc) instead of the f32 register-tiled GEMM.
     // Opt-in (ZINC_BATCHED_TC, read once per prefillBatched); off by default so
@@ -1115,6 +1126,13 @@ pub const ForwardGemma = struct {
         const B: u32 = @intCast(tokens.len);
         std.debug.assert(positions.len == B and slots.len == B and out_tokens.len == B);
 
+        // Effort 28 B==1 matvec fast path: when this step batches a single
+        // sequence, route the per-layer projection/FFN GEMMs to the tuned matvec
+        // (see `gemmDispatchA`). `defer` clears it so an early-return error never
+        // leaks the flag into a later prefillBatched (which never sets it).
+        self.decode_b1 = (B == 1) and (self.decode_b1_force orelse b1MatvecOn());
+        defer self.decode_b1 = false;
+
         // Mirror prefillBatched's GEMM knobs so the batched projections/FFN take
         // the same kernel path. cuBLAS self-gates on T >= cublas_min_t (128), so a
         // small decode batch keeps the hand TC / f32 GEMM; the env A/B knobs apply.
@@ -1265,6 +1283,15 @@ pub const ForwardGemma = struct {
     /// act_f16. Byte-identical: x is unchanged and nothing writes act_f16 between
     /// the group's GEMMs, so the staged half bits are bit-for-bit Q's/gate's.
     fn gemmDispatchA(self: *ForwardGemma, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, T: u32, a_preconv: bool) void {
+        // Effort 28: B==1 decode → tuned matvec (decodeStep's path). All decode
+        // projections/FFN GEMMs overwrite y (acc_mode 0) and are contiguous
+        // (a_offset 0) at T==1, so this is a drop-in for the batched-GEMM tile.
+        // Only set on a B==1 decodeBatch step; prefill (a_preconv staging) never
+        // reaches here with decode_b1 true.
+        if (T == 1 and self.decode_b1) {
+            self.dmmvDispatch(cmd, w, x, y, M, K, 0, 0);
+            return;
+        }
         const gi: ?usize = switch (w.info.type_) {
             .q4_k => 0,
             .q5_k => 1,
@@ -2285,6 +2312,19 @@ fn ceilDiv(a: u32, b: u32) u32 {
 /// to the f32 register-tiled GEMM. Mirrors batchedPrefillDefaultOn's parsing.
 fn tcDefaultOn() bool {
     const v = std.posix.getenv("ZINC_BATCHED_TC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+// Effort 28: the B==1 decodeBatch matvec fast path is default-ON (opt out
+// ZINC_BATCH_B1_MATVEC=0/off/false/no). When a decode step batches just one
+// sequence — every per-token prefill, and any single-client decode — the
+// 64×64-tiled TC GEMM processes one row and wastes the tile, so routing those
+// projections to the tuned `dmmv` matvec (the same kernel `decodeStep` uses)
+// recovers the ~4× per-stream gap. Token-identical to the production decode
+// matvec; argmax-identical to the batched-GEMM form (the BATCH_GATE tolerance).
+fn b1MatvecOn() bool {
+    const v = std.posix.getenv("ZINC_BATCH_B1_MATVEC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
