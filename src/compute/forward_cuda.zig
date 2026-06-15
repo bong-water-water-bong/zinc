@@ -722,11 +722,27 @@ pub const ForwardCuda = struct {
                 break :blk true;
             };
         }
-        // Effort 28: opt-in CUDA-graph replay for the BATCHED decode step. Dense
-        // always; MoE when `moe_graph_capturable` (no host readback on the routed
-        // path). Per-B execs are created lazily on first use in `decodeBatch`.
-        if ((d.n_experts == 0 or self.moe_graph_capturable) and std.posix.getenv("ZINC_BATCH_GRAPH") != null) {
-            self.batch_graph_on = true;
+        // Effort 28: CUDA-graph replay for the BATCHED decode step. Per-B execs are
+        // created lazily on first use in `decodeBatch`.
+        // - MoE-capturable models (every routed layer reads expert ids GPU-side, no
+        //   host readback) are DEFAULT-ON: validated WIN on a CLEAN 5090 window
+        //   (qwen36-35b-a3b B=4, 3 boost-comparable rounds, graph ON +36..+46% agg,
+        //   token-identical BATCH_GATE+SANITY) — the boost-starved MoE step recovers
+        //   its per-step launch bubble via graph replay (mirrors e27's serial
+        //   MoE-graph default-on). Opt OUT with ZINC_BATCH_GRAPH=0/off/false/no.
+        // - Dense models stay OPT-IN (measured NEUTRAL-to-slightly-negative on a
+        //   clean window — the dense batched step is already launch-collapsed): env
+        //   must be set truthy.
+        const bg_env = std.posix.getenv("ZINC_BATCH_GRAPH");
+        const bg_falsey = if (bg_env) |v| (std.mem.eql(u8, v, "0") or
+            std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
+            std.ascii.eqlIgnoreCase(v, "no")) else false;
+        if (self.moe_graph_capturable) {
+            self.batch_graph_on = !bg_falsey; // default-on for MoE-capturable, opt-out
+        } else if (d.n_experts == 0) {
+            self.batch_graph_on = (bg_env != null) and !bg_falsey; // dense opt-in
+        }
+        if (self.batch_graph_on) {
             log.info("ZINC_BATCH_GRAPH: batched decode will replay via per-B captured CUDA graphs (moe_capturable={})", .{self.moe_graph_capturable});
         }
 
