@@ -85,6 +85,17 @@ const GatedNormPush = extern struct {
 const SwigluPush = extern struct { N: u32 };
 const SigmoidMulPush = extern struct { N: u32 };
 const DeintPush = extern struct { head_dim: u32, n_head: u32 };
+// Effort 28 4c: batched GEMM push (must byte-match `struct GemmPush` in kernels.cu).
+// Output Y is token-major [T, M]; offsets are in BYTES; acc_mode 1 => Y += .
+const GemmPush = extern struct {
+    M: u32,
+    K: u32,
+    T: u32,
+    a_offset: u32 = 0,
+    x_offset: u32 = 0,
+    y_offset: u32 = 0,
+    acc_mode: u32 = 0,
+};
 const ArgmaxPush = extern struct { N: u32 };
 const EmbedPush = extern struct { K: u32, vocab: u32 };
 // MoE router/combine kernels (byte-match kernels.cu).
@@ -177,6 +188,9 @@ const Pipelines = struct {
     rms_norm: CudaPipeline,
     dmmv: [5]CudaPipeline, // q4k, q5k, q6k, q8_0, f32
     dmmv_fast: [4]CudaPipeline, // q4k_fast, q5k_fast, q6k_fast, q8_0_fast (block=64)
+    // Effort 28 4c: batched-decode GEMM (one weight read amortized over B rows).
+    gemm: [4]CudaPipeline, // q4k, q5k, q6k, q8_0 tiled_v2
+    gemm_f32: CudaPipeline, // f32 weights (e.g. some ssm projections)
     rope: CudaPipeline,
     kv_cache_write: CudaPipeline,
     naive_attention: CudaPipeline,
@@ -194,6 +208,62 @@ const Pipelines = struct {
     sigmoid_scale_acc: CudaPipeline,
     dmmv_q4k_experts: CudaPipeline, // batched gate/up over all experts
     dmmv_q5k_experts: CudaPipeline, // batched down over all experts
+};
+
+/// Effort 28 4c: token-major [B, dim] activation scratch for batched decode.
+/// Distinct from the single-token scratch on ForwardCuda — additive, never
+/// aliases it. Sized to the per-row max over the attention / SSM / FFN blocks so
+/// every batched projection (and the per-row inner on row b's slice) has room.
+const DecodeBatch = struct {
+    b_cap: u32,
+    hidden: CudaBuffer, // [B, n_embd] residual stream
+    norm: CudaBuffer, // [B, n_embd] pre-block rms norm
+    qfull: CudaBuffer, // [B, 2*q_dim] packed [Q|gate] (attn)
+    q: CudaBuffer, // [B, q_dim]
+    k: CudaBuffer, // [B, kv_dim]
+    v: CudaBuffer, // [B, kv_dim]
+    gate: CudaBuffer, // [B, max(q_dim, d_inner, n_ff)] attn gate / ssm z / ffn gate
+    attn_out: CudaBuffer, // [B, max(q_dim, conv_channels, d_inner)] attn out / ssm qkv / delta_out
+    swiglu: CudaBuffer, // [B, max(n_ff, conv_channels, d_inner)] conv_out / gated_norm / ffn swiglu
+    up: CudaBuffer, // [B, n_ff] ffn up
+    alpha: CudaBuffer, // [B, dt_rank] ssm alpha
+    beta: CudaBuffer, // [B, dt_rank] ssm beta
+    ssm_delta: CudaBuffer, // [B, d_inner] ssm delta-net output (dedicated stride)
+    ssm_y: CudaBuffer, // [B, d_inner] ssm gated-norm output → out-proj
+    ffn_norm: CudaBuffer, // [B, n_embd] ffn pre-norm
+
+    fn alloc(ctx: ?*shim.CudaCtx, d: Derived, b_cap: u32) !DecodeBatch {
+        const f4 = @sizeOf(f32);
+        const dt = @max(@as(u32, 1), d.dt_rank);
+        const di = @max(@as(u32, 1), d.d_inner);
+        const gate_n = @max(d.q_dim, @max(d.d_inner, d.n_ff));
+        const aout_n = @max(d.q_dim, @max(d.conv_channels, d.d_inner));
+        const swig_n = @max(d.n_ff, @max(d.conv_channels, d.d_inner));
+        return .{
+            .b_cap = b_cap,
+            .hidden = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
+            .norm = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
+            .qfull = try buffer.createBuffer(ctx, b_cap * 2 * d.q_dim * f4),
+            .q = try buffer.createBuffer(ctx, b_cap * d.q_dim * f4),
+            .k = try buffer.createBuffer(ctx, b_cap * d.kv_dim * f4),
+            .v = try buffer.createBuffer(ctx, b_cap * d.kv_dim * f4),
+            .gate = try buffer.createBuffer(ctx, b_cap * gate_n * f4),
+            .attn_out = try buffer.createBuffer(ctx, b_cap * aout_n * f4),
+            .swiglu = try buffer.createBuffer(ctx, b_cap * swig_n * f4),
+            .up = try buffer.createBuffer(ctx, b_cap * d.n_ff * f4),
+            .alpha = try buffer.createBuffer(ctx, b_cap * dt * f4),
+            .beta = try buffer.createBuffer(ctx, b_cap * dt * f4),
+            .ssm_delta = try buffer.createBuffer(ctx, b_cap * di * f4),
+            .ssm_y = try buffer.createBuffer(ctx, b_cap * di * f4),
+            .ffn_norm = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
+        };
+    }
+
+    fn free(self: *DecodeBatch) void {
+        inline for (.{ &self.hidden, &self.norm, &self.qfull, &self.q, &self.k, &self.v, &self.gate, &self.attn_out, &self.swiglu, &self.up, &self.alpha, &self.beta, &self.ssm_delta, &self.ssm_y, &self.ffn_norm }) |b| {
+            buffer.freeBuffer(b);
+        }
+    }
 };
 
 /// Per-token GPU forward state for qwen35 greedy decode.
@@ -276,6 +346,11 @@ pub const ForwardCuda = struct {
     n_slots: u32 = 0,
     slot_ctx: u32 = 0,
 
+    // Effort 28 4c: token-major [B, dim] activation scratch for batched decode.
+    // Lazily allocated on the first decodeBatch call, grown if B exceeds cap.
+    // ADDITIVE — never aliases the single-sequence scratch above.
+    decode_batch: ?DecodeBatch = null,
+
     /// Compile kernels, allocate every device buffer, upload inv_freq + sinks,
     /// zero the KV cache and SSM state.
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardCuda {
@@ -324,7 +399,13 @@ pub const ForwardCuda = struct {
         pipes.sigmoid_scale_acc = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_scale_acc");
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
         pipes.dmmv_q5k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_experts");
-        log.info("nvrtc: compiled {d} kernel pipelines", .{26});
+        // Effort 28 4c: batched-decode GEMMs (weights read once over B rows).
+        pipes.gemm[0] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tiled_v2");
+        pipes.gemm[1] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tiled_v2");
+        pipes.gemm[2] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tiled_v2");
+        pipes.gemm[3] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tiled_v2");
+        pipes.gemm_f32 = try pipeline.createPipeline(ctx, src.ptr, "gemm_f32_tiled_v2");
+        log.info("nvrtc: compiled {d} kernel pipelines", .{31});
 
         const f4 = @sizeOf(f32);
         const max_act = @max(d.n_ff, d.conv_channels); // 12288 vs 8192 → 12288
@@ -446,6 +527,7 @@ pub const ForwardCuda = struct {
         for (self.kv_v) |*b| buffer.freeBuffer(b);
         for (self.ssm_conv_state) |*b| buffer.freeBuffer(b);
         for (self.ssm_state) |*b| buffer.freeBuffer(b);
+        if (self.decode_batch) |*db| db.free();
         self.freeSlotState();
         a.free(self.kv_k);
         a.free(self.kv_v);
@@ -461,6 +543,8 @@ pub const ForwardCuda = struct {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
             } else if (comptime std.mem.eql(u8, f.name, "dmmv_fast")) {
                 for (&self.pipes.dmmv_fast) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "gemm")) {
+                for (&self.pipes.gemm) |*p| pipeline.freePipeline(p);
             } else {
                 pipeline.freePipeline(&@field(self.pipes, f.name));
             }
@@ -728,52 +812,294 @@ pub const ForwardCuda = struct {
     pub fn decodeBatch(self: *ForwardCuda, tokens: []const u32, positions: []const u32, slots: []const u32, out: []u32) !void {
         const d = self.d;
         const ctx = self.ctx;
-        if (d.n_experts > 0) return error.Unsupported; // 4b = dense qwen35; MoE is 4d
+        if (d.n_experts > 0) return error.Unsupported; // dense qwen35; MoE is 4d
         if (self.kv_k_slots == null) return error.SlotStateNotAllocated;
         const B: u32 = @intCast(tokens.len);
         std.debug.assert(positions.len == B and slots.len == B and out.len == B);
+        const f4 = @sizeOf(f32);
 
+        const db = try self.ensureDecodeBatch(B);
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
         const lm_head = self.model.get("output.weight") orelse return error.MissingTensor;
 
+        // EMBED each row into its slice of db.hidden, using the SAME kernel/weight
+        // as the serial decodeStep so the projection inputs are bit-aligned.
         var bi: u32 = 0;
         while (bi < B) : (bi += 1) {
-            const token = tokens[bi];
-            const pos = positions[bi];
-            const slot = slots[bi];
-            std.debug.assert(slot < self.n_slots and pos < self.slot_ctx);
-
-            // EMBED row bi into `hidden` (same path as decodeStep so the per-seq
-            // forward is maximally bit-aligned with the production reference).
+            std.debug.assert(slots[bi] < self.n_slots and positions[bi] < self.slot_ctx);
+            var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+            defer buffer.freeBuffer(&hrow);
             if (self.embed_gpu) {
-                self.host_tok_in[0] = token;
+                self.host_tok_in[0] = tokens[bi];
                 buffer.upload(ctx, &self.tok_in_buf, std.mem.sliceAsBytes(self.host_tok_in));
-                try self.recordEmbed();
-                self.waitPending();
+                var cmd = try command.beginCommand(ctx);
+                const push = EmbedPush{ .K = d.n_embd, .vocab = d.vocab };
+                const nsb = d.n_embd / 256;
+                cmd.dispatch(&self.pipes.embed_q4k, .{ nsb, 1, 1 }, .{ 256, 1, 1 }, &.{ self.embed_weight.?, &self.tok_in_buf, &hrow }, &push, @sizeOf(EmbedPush), 0);
+                cmd.commitAndWait();
             } else {
-                self.model.dequantEmbeddingRow(token, self.host_embed);
-                buffer.upload(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
+                self.model.dequantEmbeddingRow(tokens[bi], self.host_embed);
+                buffer.upload(ctx, &hrow, std.mem.sliceAsBytes(self.host_embed));
             }
+        }
 
-            var L: u32 = 0;
-            while (L < d.n_layers) : (L += 1) {
-                if (isFullAttn(L, d.full_attn_interval)) {
-                    try self.attentionLayerSlot(L, pos, slot);
-                } else {
-                    try self.ssmLayerSlot(L, pos, slot);
-                }
-                try self.ffnBlockPub(L); // dense, position/slot-independent; sync (drains ring)
+        // Layer-major: each block reads/writes db.hidden over ALL B rows. The big
+        // projection/FFN GEMMs read each weight ONCE for all B rows (the
+        // amortization win — 4c); the per-seq attention/SSM inner still loops per
+        // row on its slice + slot state (kernel fusion is the next 4c step).
+        var L: u32 = 0;
+        while (L < d.n_layers) : (L += 1) {
+            if (isFullAttn(L, d.full_attn_interval)) {
+                try self.attentionLayerBatchedDecode(L, B, db, positions, slots);
+            } else {
+                try self.ssmLayerBatchedDecode(L, B, db, positions, slots);
             }
+            try self.ffnBlockBatchedDecode(L, B, db);
+        }
 
-            // TAIL: final rms_norm → LM head → argmax → out[bi].
+        // TAIL per row: rms_norm → LM head → argmax → out[bi]. Reuse single-row scratch.
+        const lm_idx = dmmvIdx(lm_head.info.type_);
+        bi = 0;
+        while (bi < B) : (bi += 1) {
+            var hrow = try buffer.aliasBuffer(&db.hidden, bi * d.n_embd * f4, d.n_embd * f4);
+            defer buffer.freeBuffer(&hrow);
             var cmd = try command.beginCommand(ctx);
-            self.tailDispatch(&cmd, &out_norm.gpu_buffer, &lm_head.gpu_buffer, lm_head.info.type_);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &hrow, &out_norm.gpu_buffer, &self.norm_buf }, &rms, @sizeOf(RmsPush), 0);
+            const lm = DmmvPush{ .M = d.vocab, .K = d.n_embd };
+            if (lm_idx < 4) {
+                cmd.dispatch(&self.pipes.dmmv_fast[lm_idx], .{ d.vocab, 1, 1 }, .{ 64, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+            } else {
+                cmd.dispatch(&self.pipes.dmmv[lm_idx], .{ d.vocab, 1, 1 }, .{ 256, 1, 1 }, &.{ &lm_head.gpu_buffer, &self.norm_buf, &self.logits_buf }, &lm, @sizeOf(DmmvPush), 0);
+            }
+            const am = ArgmaxPush{ .N = d.vocab };
+            cmd.dispatch(&self.pipes.argmax, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.logits_buf, &self.argmax_buf }, &am, @sizeOf(ArgmaxPush), 0);
             cmd.commitAndWait();
-            self.drainPending();
             var tok: u32 = 0;
             buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
             out[bi] = tok;
         }
+    }
+
+    /// (Re)allocate the [B, dim] batched-decode scratch, growing if B exceeds cap.
+    fn ensureDecodeBatch(self: *ForwardCuda, B: u32) !*DecodeBatch {
+        if (self.decode_batch) |*db| {
+            if (db.b_cap >= B) return db;
+            db.free();
+            self.decode_batch = null;
+        }
+        self.decode_batch = try DecodeBatch.alloc(self.ctx, self.d, B);
+        return &self.decode_batch.?;
+    }
+
+    /// Batched GEMM y[B,M] = x[B,K] · Wᵀ for B rows, reading W ONCE (token-major
+    /// buffers; acc_mode 1 accumulates into y for the residual). The dense
+    /// projection / FFN weights are all q4k/q5k/q6k/q8_0 (tiled gemm) or f32.
+    fn gemmDispatch(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, B: u32, acc_mode: u32) void {
+        const idx = dmmvIdx(w.info.type_);
+        const push = GemmPush{ .M = M, .K = K, .T = B, .acc_mode = acc_mode };
+        if (w.info.type_ == .f32) {
+            cmd.dispatch(&self.pipes.gemm_f32, .{ ceilDiv(M, 64), ceilDiv(B, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.gemm[idx], .{ ceilDiv(M, 64), ceilDiv(B, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+        }
+    }
+
+    /// 4c attention block: pre-norm + Q(+gate)/K/V + O projections run as GEMMs
+    /// over ALL B rows (each weight read once). The per-head deinterleave / q-k
+    /// norm / RoPE / KV-write / softmax / gate inner loops per row on row b's slice
+    /// of the batched buffers + its slot KV at positions[b]. Per-row block math is
+    /// copied verbatim from `attentionLayer` (→ token-identical to N serial runs).
+    fn attentionLayerBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch, positions: []const u32, slots: []const u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const wq = self.layer(L, "attn_q.weight");
+        const wk = self.layer(L, "attn_k.weight");
+        const wv = self.layer(L, "attn_v.weight");
+        const wqn = self.layer(L, "attn_q_norm.weight");
+        const wkn = self.layer(L, "attn_k_norm.weight");
+        const wo = self.layer(L, "attn_output.weight");
+        const wan = self.layer(L, "attn_norm.weight");
+
+        // Batched pre-attn norm + Q(+gate)/K/V projections over B rows.
+        {
+            var cmd = try command.beginCommand(ctx);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wan.gpu_buffer, &db.norm }, &rms, @sizeOf(RmsPush), 0);
+            self.gemmDispatch(&cmd, wq, &db.norm, &db.qfull, 2 * d.q_dim, d.n_embd, B, 0);
+            self.gemmDispatch(&cmd, wk, &db.norm, &db.k, d.kv_dim, d.n_embd, B, 0);
+            self.gemmDispatch(&cmd, wv, &db.norm, &db.v, d.kv_dim, d.n_embd, B, 0);
+            cmd.commitAndWait();
+        }
+
+        // Per-row attention inner on each row's slice + slot KV.
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) {
+            const pos = positions[bi];
+            const slot = slots[bi];
+            var qf = try buffer.aliasBuffer(&db.qfull, bi * 2 * d.q_dim * f4, 2 * d.q_dim * f4);
+            var qq = try buffer.aliasBuffer(&db.q, bi * d.q_dim * f4, d.q_dim * f4);
+            var gg = try buffer.aliasBuffer(&db.gate, bi * d.q_dim * f4, d.q_dim * f4);
+            var ka = try buffer.aliasBuffer(&db.k, bi * d.kv_dim * f4, d.kv_dim * f4);
+            var va = try buffer.aliasBuffer(&db.v, bi * d.kv_dim * f4, d.kv_dim * f4);
+            var ao = try buffer.aliasBuffer(&db.attn_out, bi * d.q_dim * f4, d.q_dim * f4);
+            const kv_base = @as(usize, slot) * self.slot_ctx * d.kv_dim * f4;
+            const kv_span = @as(usize, self.slot_ctx) * d.kv_dim * f4;
+            var kk = try buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_base, kv_span);
+            var vv = try buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_base, kv_span);
+            defer {
+                buffer.freeBuffer(&qf);
+                buffer.freeBuffer(&qq);
+                buffer.freeBuffer(&gg);
+                buffer.freeBuffer(&ka);
+                buffer.freeBuffer(&va);
+                buffer.freeBuffer(&ao);
+                buffer.freeBuffer(&kk);
+                buffer.freeBuffer(&vv);
+            }
+
+            var cmd = try command.beginCommand(ctx);
+            const deint = DeintPush{ .head_dim = d.head_dim, .n_head = d.n_head };
+            cmd.dispatch(&self.pipes.deinterleave, .{ ceilDiv(d.q_dim, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &qf, &qq, &gg }, &deint, @sizeOf(DeintPush), 0);
+            const rms_h = RmsPush{ .N = d.head_dim, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &qq, &wqn.gpu_buffer, &qq }, &rms_h, @sizeOf(RmsPush), 0);
+            cmd.dispatch(&self.pipes.rms_norm, .{ d.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &ka, &wkn.gpu_buffer, &ka }, &rms_h, @sizeOf(RmsPush), 0);
+            const rope_q = RopePush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_head, .position = pos, .freq_base_bits = 0, .attn_scale_bits = 0 };
+            cmd.dispatch(&self.pipes.rope, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &qq, &qq, &self.inv_freq }, &rope_q, @sizeOf(RopePush), 0);
+            const rope_k = RopePush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_kv_head, .position = pos, .freq_base_bits = 0, .attn_scale_bits = 0 };
+            cmd.dispatch(&self.pipes.rope, .{ d.n_kv_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &ka, &ka, &self.inv_freq }, &rope_k, @sizeOf(RopePush), 0);
+            const kvw = KvWritePush{ .kv_dim = d.kv_dim, .dst_offset = pos * d.kv_dim };
+            const kv_grid = ceilDiv(d.kv_dim, 64);
+            cmd.dispatch(&self.pipes.kv_cache_write, .{ kv_grid, 1, 1 }, .{ 64, 1, 1 }, &.{ &ka, &kk, &va, &vv }, &kvw, @sizeOf(KvWritePush), 0);
+            const seq_len = pos + 1;
+            const attn = AttnPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .seq_len = seq_len, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
+            const attn_smem: u32 = seq_len * 4;
+            cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &qq, &kk, &vv, &self.sinks, &ao }, &attn, @sizeOf(AttnPush), attn_smem);
+            const sm = SigmoidMulPush{ .N = d.q_dim };
+            cmd.dispatch(&self.pipes.sigmoid_mul, .{ ceilDiv(d.q_dim, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &ao, &gg, &ao }, &sm, @sizeOf(SigmoidMulPush), 0);
+            cmd.commitAndWait();
+        }
+
+        // Batched O projection, accumulate into db.hidden (residual).
+        {
+            var cmd = try command.beginCommand(ctx);
+            self.gemmDispatch(&cmd, wo, &db.attn_out, &db.hidden, d.n_embd, d.q_dim, B, 1);
+            cmd.commitAndWait();
+        }
+    }
+
+    /// 4c SSM block: pre-norm + qkv/z/alpha/beta + out projections run as GEMMs
+    /// over ALL B rows (each weight read once). The conv1d / delta-net scan /
+    /// gated-norm inner loops per row on row b's slice + its slot conv ring +
+    /// recurrent state, with conv_off DERIVED `pos % (d_conv-1)` (mirrors 4b's
+    /// `ssmLayerSlot`). Block math copied verbatim from `ssmLayer`.
+    fn ssmLayerBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch, positions: []const u32, slots: []const u32) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const f4 = @sizeOf(f32);
+        const wan = self.layer(L, "attn_norm.weight");
+        const wqkv = self.layer(L, "attn_qkv.weight");
+        const wz = self.layer(L, "attn_gate.weight");
+        const walpha = self.layer(L, "ssm_alpha.weight");
+        const wbeta = self.layer(L, "ssm_beta.weight");
+        const wconv = self.layer(L, "ssm_conv1d.weight");
+        const wdt = self.layer(L, "ssm_dt.bias");
+        const wa = self.layer(L, "ssm_a");
+        const wnorm = self.layer(L, "ssm_norm.weight");
+        const wout = self.layer(L, "ssm_out.weight");
+
+        // Batched pre-norm + qkv / z / alpha / beta projections over B rows.
+        {
+            var cmd = try command.beginCommand(ctx);
+            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wan.gpu_buffer, &db.norm }, &rms, @sizeOf(RmsPush), 0);
+            self.gemmDispatch(&cmd, wqkv, &db.norm, &db.attn_out, d.conv_channels, d.n_embd, B, 0);
+            self.gemmDispatch(&cmd, wz, &db.norm, &db.gate, d.d_inner, d.n_embd, B, 0);
+            self.gemmDispatch(&cmd, walpha, &db.norm, &db.alpha, d.dt_rank, d.n_embd, B, 0);
+            self.gemmDispatch(&cmd, wbeta, &db.norm, &db.beta, d.dt_rank, d.n_embd, B, 0);
+            cmd.commitAndWait();
+        }
+
+        // Per-row SSM inner on each row's slice + slot conv ring + recurrent state.
+        var bi: u32 = 0;
+        while (bi < B) : (bi += 1) {
+            const pos = positions[bi];
+            const slot = slots[bi];
+            const conv_off = pos % (d.d_conv - 1);
+            var qkv = try buffer.aliasBuffer(&db.attn_out, bi * d.conv_channels * f4, d.conv_channels * f4);
+            var zg = try buffer.aliasBuffer(&db.gate, bi * d.d_inner * f4, d.d_inner * f4);
+            var al = try buffer.aliasBuffer(&db.alpha, bi * d.dt_rank * f4, d.dt_rank * f4);
+            var be = try buffer.aliasBuffer(&db.beta, bi * d.dt_rank * f4, d.dt_rank * f4);
+            var conv_out = try buffer.aliasBuffer(&db.swiglu, bi * d.conv_channels * f4, d.conv_channels * f4);
+            var delta = try buffer.aliasBuffer(&db.ssm_delta, bi * d.d_inner * f4, d.d_inner * f4);
+            var ysl = try buffer.aliasBuffer(&db.ssm_y, bi * d.d_inner * f4, d.d_inner * f4);
+            var convst = try buffer.aliasBuffer(&self.ssm_conv_slots.?[L], self.slotConvOffsetBytes(slot), d.conv_state_len * f4);
+            var recst = try buffer.aliasBuffer(&self.ssm_state_slots.?[L], self.slotStateOffsetBytes(slot), d.ssm_state_len * f4);
+            defer {
+                buffer.freeBuffer(&qkv);
+                buffer.freeBuffer(&zg);
+                buffer.freeBuffer(&al);
+                buffer.freeBuffer(&be);
+                buffer.freeBuffer(&conv_out);
+                buffer.freeBuffer(&delta);
+                buffer.freeBuffer(&ysl);
+                buffer.freeBuffer(&convst);
+                buffer.freeBuffer(&recst);
+            }
+
+            var cmd = try command.beginCommand(ctx);
+            const conv = ConvPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .state_offset = conv_off };
+            cmd.dispatch(&self.pipes.ssm_conv1d, .{ ceilDiv(d.conv_channels, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &qkv, &wconv.gpu_buffer, &convst, &conv_out }, &conv, @sizeOf(ConvPush), 0);
+            const dn = DeltaNetPush{
+                .d_inner = d.d_inner,
+                .dt_rank = d.dt_rank,
+                .head_v_dim = d.head_v_dim,
+                .d_state = d.d_state,
+                .n_group = d.n_group,
+                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
+                .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+                .has_dt_bias = 1,
+                .has_ssm_a = 1,
+                .n_tok = 1,
+                .conv_stride_tok = d.conv_channels,
+                .ab_stride_tok = d.dt_rank,
+                .y_stride_tok = d.d_inner,
+            };
+            cmd.dispatch(&self.pipes.ssm_delta_net, .{ d.dt_rank, d.head_v_dim, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &conv_out, &wdt.gpu_buffer, &al, &be, &wa.gpu_buffer, &recst, &delta }, &dn, @sizeOf(DeltaNetPush), 0);
+            const norm_per_head: u32 = if (wnorm.info.numElements() == d.d_inner) 1 else 0;
+            const gn = GatedNormPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head };
+            cmd.dispatch(&self.pipes.ssm_gated_norm, .{ d.dt_rank, 1, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &delta, &zg, &wnorm.gpu_buffer, &ysl }, &gn, @sizeOf(GatedNormPush), 0);
+            cmd.commitAndWait();
+        }
+
+        // Batched out projection, accumulate into db.hidden (residual).
+        {
+            var cmd = try command.beginCommand(ctx);
+            self.gemmDispatch(&cmd, wout, &db.ssm_y, &db.hidden, d.n_embd, d.d_inner, B, 1);
+            cmd.commitAndWait();
+        }
+    }
+
+    /// 4c dense FFN block: fully batched over B rows (pre-norm + gate/up GEMMs +
+    /// SwiGLU + down GEMM accumulate). Position/slot-independent. Mirrors `ffnBlock`.
+    fn ffnBlockBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch) !void {
+        const d = self.d;
+        const ctx = self.ctx;
+        const wfn = self.layer(L, "post_attention_norm.weight");
+        const wgate = self.layer(L, "ffn_gate.weight");
+        const wup = self.layer(L, "ffn_up.weight");
+        const wdown = self.layer(L, "ffn_down.weight");
+
+        var cmd = try command.beginCommand(ctx);
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wfn.gpu_buffer, &db.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
+        self.gemmDispatch(&cmd, wgate, &db.ffn_norm, &db.gate, d.n_ff, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wup, &db.ffn_norm, &db.up, d.n_ff, d.n_embd, B, 0);
+        const sg = SwigluPush{ .N = B * d.n_ff };
+        cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(B * d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &db.gate, &db.up, &db.swiglu }, &sg, @sizeOf(SwigluPush), 0);
+        self.gemmDispatch(&cmd, wdown, &db.swiglu, &db.hidden, d.n_embd, d.n_ff, B, 1);
+        cmd.commitAndWait();
     }
 
     /// Slot-state variant of `attentionLayer`: identical block math, but the KV
