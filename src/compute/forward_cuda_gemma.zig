@@ -188,6 +188,7 @@ const Pipelines = struct {
     zero_vec: CudaPipeline,
     dmmv_q4k_experts: CudaPipeline, // batched fused gate/up over all experts
     dmmv_q4k_experts_dual: CudaPipeline, // gate+up over all experts in ONE launch
+    moe_combine_tail: CudaPipeline, // shared+moe → post_ffw_norm → hidden in ONE launch
     dmmv_q5_1_experts: CudaPipeline, // batched down over all experts
     dmmv_q4k_experts_batched: CudaPipeline, // token-batched gate/up (all T prompt tokens)
     dmmv_q5_1_experts_batched: CudaPipeline, // token-batched down (all T prompt tokens)
@@ -469,6 +470,7 @@ pub const ForwardGemma = struct {
         pipes.zero_vec = try pipeline.createPipeline(ctx, src.ptr, "zero_vec");
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
         pipes.dmmv_q4k_experts_dual = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts_dual");
+        pipes.moe_combine_tail = try pipeline.createPipeline(ctx, src.ptr, "moe_combine_tail");
         pipes.dmmv_q5_1_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1_experts");
         pipes.dmmv_q4k_experts_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts_batched");
         pipes.dmmv_q5_1_experts_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1_experts_batched");
@@ -1540,13 +1542,14 @@ pub const ForwardGemma = struct {
             if (batched) self.submit(cmd) else cmd.commitAndWait();
         }
 
-        // --- combine: cur = post_ffw_norm(shared + moe); hidden += cur. ------
+        // --- combine: hidden += post_ffw_norm(shared + moe). ----------------
+        // Fused: the old scale_acc(shared+=moe) + rms_norm(shared,wpost) +
+        // scale_acc(hidden+=shared) chain (3 tiny n_embd launches, all bubbles
+        // exposed) collapses to ONE byte-identical launch (moe_combine_tail);
+        // t = shared+moe is recomputed in both passes, shared is never written.
         {
             var cmd = try command.beginCommand(ctx);
-            const acc = ScaleAccPush{ .N = d.n_embd, .scale = 1.0 };
-            cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.shared_buf, &self.moe_out_buf }, &acc, @sizeOf(ScaleAccPush), 0);
-            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.shared_buf, &wpost.gpu_buffer, &self.shared_buf }, &rms, @sizeOf(RmsPush), 0);
-            cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.shared_buf }, &acc, @sizeOf(ScaleAccPush), 0);
+            cmd.dispatch(&self.pipes.moe_combine_tail, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.shared_buf, &self.moe_out_buf, &wpost.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
             if (batched) self.submit(cmd) else cmd.commitAndWait();
         }
     }
@@ -1881,13 +1884,14 @@ pub const ForwardGemma = struct {
             if (batched) self.submit(cmd) else cmd.commitAndWait();
         }
 
-        // --- combine: cur = post_ffw_norm(shared + moe); hidden += cur. ------
+        // --- combine: hidden += post_ffw_norm(shared + moe). ----------------
+        // Fused: the old scale_acc(shared+=moe) + rms_norm(shared,wpost) +
+        // scale_acc(hidden+=shared) chain (3 tiny n_embd launches, all bubbles
+        // exposed) collapses to ONE byte-identical launch (moe_combine_tail);
+        // t = shared+moe is recomputed in both passes, shared is never written.
         {
             var cmd = try command.beginCommand(ctx);
-            const acc = ScaleAccPush{ .N = d.n_embd, .scale = 1.0 };
-            cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.shared_buf, &self.moe_out_buf }, &acc, @sizeOf(ScaleAccPush), 0);
-            cmd.dispatch(&self.pipes.rms_norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.shared_buf, &wpost.gpu_buffer, &self.shared_buf }, &rms, @sizeOf(RmsPush), 0);
-            cmd.dispatch(&self.pipes.scale_accumulate, .{ ceilDiv(d.n_embd, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.hidden, &self.shared_buf }, &acc, @sizeOf(ScaleAccPush), 0);
+            cmd.dispatch(&self.pipes.moe_combine_tail, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.hidden, &self.shared_buf, &self.moe_out_buf, &wpost.gpu_buffer }, &rms, @sizeOf(RmsPush), 0);
             if (batched) self.submit(cmd) else cmd.commitAndWait();
         }
     }

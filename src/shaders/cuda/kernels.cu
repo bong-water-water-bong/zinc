@@ -410,6 +410,34 @@ extern "C" __global__ void scale_accumulate(float* a, const float* b, ScaleAccPu
     a[idx] += pc.scale * b[idx];
 }
 
+// ---- moe_combine_tail (gemma4-MoE decode combine, 3 launches fused to 1) ----
+// Fuses the per-token MoE combine tail: hidden += post_ffw_norm(shared + moe).
+// Replaces scale_accumulate(shared += moe) + rms_norm(shared, w) + scale_accumulate
+// (hidden += shared) — three tiny n_embd-sized launches in a strict dependency
+// chain (all bubbles exposed). BYTE-IDENTITY: t = shared[i]+moe[i] is recomputed
+// in both passes (never written back), so ss, rinv and w*(t*rinv) match the
+// separate kernels' f32 values exactly; the only removed work is the intermediate
+// f32 store/reload (an identity). One block (grid {1,1,1}), like rms_norm.
+extern "C" __global__ void moe_combine_tail(float* hidden, const float* shared,
+                                            const float* moe, const float* w, RmsPush pc) {
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float t = shared[i] + moe[i];
+        ss += t * t;
+    }
+    ss = zinc_block_reduce_sum(ss);
+
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float t = shared[i] + moe[i];
+        hidden[i] += w[i] * (t * rinv);
+    }
+}
+
 // ---- sigmoid_scale_acc (port of sigmoid_scale_acc.comp) ---------------------
 // a[i] += sigmoid(c[0]) * b[i]  (MoE shared-expert sigmoid gating). a read-write.
 struct SigmoidAccPush { unsigned N; };
