@@ -331,7 +331,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
 
     const pf_batched = batchedPrefillDefaultOn();
 
-    const MAXB = 24; // max concurrent sequences in this harness (btok covers B≤24)
+    const MAXB = 27; // max concurrent sequences in this harness (btok covers B≤27)
     const MAXP = 256; // max prompt tokens / sequence
     const MAXG = 64; // max generated tokens / sequence
     var prompts: [MAXB][MAXP]u32 = undefined;
@@ -574,7 +574,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
             // (boost-comparable). Token-identity is gated by BATCH_GATE above (run
             // with ZINC_BATCH_MROW=1 to exercise btok there). Reports the AGGREGATE
             // decode throughput btok buys at this batch size vs the 64-tile GEMM.
-            if (nseq >= 2 and nseq <= 24) {
+            if (nseq >= 2 and nseq <= 27) {
                 var which: u32 = 0;
                 while (which < 2) : (which += 1) {
                     g.decode_mrow_force = (which == 1);
@@ -824,7 +824,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
             // BATCH_GATE above (run with ZINC_BATCH_MROW=1 to exercise btok there).
             // Reports the AGGREGATE decode throughput btok buys at this batch size
             // vs the 64-tile batched GEMM.
-            if (nseq >= 2 and nseq <= 24) {
+            if (nseq >= 2 and nseq <= 27) {
                 var which: u32 = 0;
                 while (which < 2) : (which += 1) {
                     q.decode_mrow_force = (which == 1);
