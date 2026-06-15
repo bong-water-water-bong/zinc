@@ -1729,6 +1729,189 @@ extern "C" __global__ void dmmv_q4k_btok6(const unsigned* a_u32, const float* x,
 extern "C" __global__ void dmmv_q4k_btok7(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<7>(a_u32, x, y, pc); }
 extern "C" __global__ void dmmv_q4k_btok8(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<8>(a_u32, x, y, pc); }
 
+// ---- dmmv_q6k_btok (Effort 28) — Q6_K token-BATCH matvec ---------------------
+// The Q6_K analog of dmmv_q4k_btok: read each Q6_K weight row's superblock + its
+// dequant ONCE, reuse across B token x-vectors. Targets gemma-31b's ffn_down
+// (Q6_K) decode GEMM, which otherwise hits the tile-padding gemm_q6k_tiled_v2 at
+// small B. Same per-element Q6_K dequant as dmmv_q6k_fast; per-token local sum
+// then sum[t] += s (the proven dmmv_q4k_btok reduction pattern) → token-identical
+// to dmmv_q6k_fast on x[t]. x token-major [B,K], y token-major [B,M].
+template<int B>
+__device__ __forceinline__ void dmmv_q6k_btok_impl(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 8;
+    const unsigned char* arow = a + pc.a_offset + (size_t)row * bpr * 210u;
+    unsigned tid = threadIdx.x, itid = tid & 15u, ix = tid >> 4;
+    unsigned half_id = itid >> 3, local_id = itid & 7u, e_start = local_id * 4u, is = e_start >> 4;
+    unsigned xvib = (half_id * 128u + e_start) >> 2, ngrp = blockDim.x >> 4;
+    unsigned xo = (pc.x_offset >> 2);
+    float sum[B];
+    #pragma unroll
+    for (int t = 0; t < B; t++) sum[t] = 0.0f;
+    for (unsigned bi = ix; bi < bpr; bi += ngrp) {
+        const unsigned char* bb = arow + (size_t)bi * 210u;
+        float d = zinc_half_to_float((unsigned short)((unsigned)bb[208] | ((unsigned)bb[209] << 8)));
+        const unsigned char* ql = bb + half_id * 64u;
+        const unsigned char* qh = bb + 128u + half_id * 32u;
+        const signed char* sc = (const signed char*)(bb + 192u + half_id * 8u);
+        float ds0 = d * (float)sc[is], ds2 = d * (float)sc[is + 2], ds4 = d * (float)sc[is + 4], ds6 = d * (float)sc[is + 6];
+        // dequant the 4 quads ONCE (weight-only) — reused across all B tokens.
+        float q1[4], q2[4], q3[4], q4[4];
+        #pragma unroll
+        for (unsigned li = 0; li < 4u; li++) {
+            unsigned l = e_start + li, qllo = ql[l], qlhi = ql[l + 32u], qhv = qh[l];
+            q1[li] = (float)((qllo & 0xFu) | (((qhv >> 0) & 3u) << 4)) - 32.0f;
+            q2[li] = (float)((qlhi & 0xFu) | (((qhv >> 2) & 3u) << 4)) - 32.0f;
+            q3[li] = (float)((qllo >> 4) | (((qhv >> 4) & 3u) << 4)) - 32.0f;
+            q4[li] = (float)((qlhi >> 4) | (((qhv >> 6) & 3u) << 4)) - 32.0f;
+        }
+        unsigned xb = (bi * 256u) / 4u + xvib;
+        #pragma unroll
+        for (int t = 0; t < B; t++) {
+            const float4* xv = (const float4*)(x + (unsigned)t * pc.K + xo);
+            float4 bx0 = xv[xb], bx32 = xv[xb + 8u], bx64 = xv[xb + 16u], bx96 = xv[xb + 24u];
+            float s = 0.0f;
+            #pragma unroll
+            for (unsigned li = 0; li < 4u; li++)
+                s += ds0 * q1[li] * (&bx0.x)[li] + ds2 * q2[li] * (&bx32.x)[li] + ds4 * q3[li] * (&bx64.x)[li] + ds6 * q4[li] * (&bx96.x)[li];
+            sum[t] += s;
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < B; t++) {
+        float r = zinc_block_reduce_sum(sum[t]);
+        if (tid == 0) {
+            unsigned yi = (pc.y_offset >> 2) + (unsigned)t * pc.M + row;
+            if (pc.acc_mode != 0u) y[yi] += r; else y[yi] = r;
+        }
+        __syncthreads();
+    }
+}
+extern "C" __global__ void dmmv_q6k_btok2(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<2>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok3(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<3>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok4(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<4>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok5(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<5>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok6(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<6>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok7(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<7>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok8(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<8>(a, x, y, pc); }
+
+// ---- dmmv_q5k_btok (Effort 28) — Q5_K token-BATCH matvec ---------------------
+// The Q5_K analog: read each Q5_K weight row's superblock + dequant ONCE, reuse
+// across B tokens. Same per-element Q5_K dequant (qh 5th-bit promote) as
+// dmmv_q5k_fast; per-token local sum then sum[t] += s → token-identical to
+// dmmv_q5k_fast on x[t]. x token-major [B,K], y token-major [B,M].
+template<int B>
+__device__ __forceinline__ void dmmv_q5k_btok_impl(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 8;
+    unsigned a_base = (pc.a_offset >> 2) + row * bpr * 44u;
+    unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
+    unsigned l0 = 4u * (2u * ir + v_in);
+    unsigned q_off = 32u * v_im + l0, y_loc = 64u * v_im + l0, shift = v_im * 16u, ngrp = blockDim.x >> 4;
+    unsigned sba = 2u*v_im, sbb = 2u*v_im+1u, sbc = 2u*v_im+4u, sbd = 2u*v_im+5u;
+    unsigned xo = (pc.x_offset >> 2);
+    float sum[B];
+    #pragma unroll
+    for (int t = 0; t < B; t++) sum[t] = 0.0f;
+    for (unsigned i = grp; i < bpr; i += ngrp) {
+        unsigned blk = a_base + i * 44u, dd = a_u32[blk];
+        float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF)), dm = zinc_half_to_float((unsigned short)(dd >> 16));
+        unsigned sc0 = a_u32[blk+1u], sc1 = a_u32[blk+2u], sc2 = a_u32[blk+3u];
+        unsigned qh = a_u32[blk + 4u + (l0 >> 2)];
+        unsigned qs0 = a_u32[blk + 12u + (q_off >> 2)], qs1 = a_u32[blk + 12u + (q_off >> 2) + 16u];
+        unsigned s0=sc0>>shift, s1=sc1>>shift, s2=sc2>>shift;
+        float f0=d*(float)(s0&0x3Fu), b0=dm*(float)(s1&0x3Fu);
+        float f1=d*(float)((s0>>8)&0x3Fu), b1=dm*(float)((s1>>8)&0x3Fu);
+        float f2=d*(float)((s2&0xFu)|((s0&0xC0u)>>2)), b2=dm*(float)(((s2&0xF0u)>>4)|((s1&0xC0u)>>2));
+        float f3=d*(float)(((s2>>8)&0xFu)|(((s0>>8)&0xC0u)>>2)), b3=dm*(float)((((s2>>8)&0xF0u)>>4)|(((s1>>8)&0xC0u)>>2));
+        // dequant the 16 nibbles ONCE (weight-only, qh 5th-bit promote) — reused
+        // across all B tokens. v0[j] = group-0 quad lane j, etc. (matches the Q5
+        // macro in dmmv_q5k_fast: nibble + 16*qh_bit).
+        #define Q5B(q,sh,sb,j) ((float)(((q)>>(sh))&0xFu) + 16.0f*(float)(((qh)>>((sb)+(j)*8u))&1u))
+        float v0[4] = { Q5B(qs0,0,sba,0), Q5B(qs0,8,sba,1), Q5B(qs0,16,sba,2), Q5B(qs0,24,sba,3) };
+        float v1[4] = { Q5B(qs0,4,sbb,0), Q5B(qs0,12,sbb,1), Q5B(qs0,20,sbb,2), Q5B(qs0,28,sbb,3) };
+        float v2[4] = { Q5B(qs1,0,sbc,0), Q5B(qs1,8,sbc,1), Q5B(qs1,16,sbc,2), Q5B(qs1,24,sbc,3) };
+        float v3[4] = { Q5B(qs1,4,sbd,0), Q5B(qs1,12,sbd,1), Q5B(qs1,20,sbd,2), Q5B(qs1,28,sbd,3) };
+        #undef Q5B
+        unsigned bidx = (i*256u + y_loc) >> 2, bidx2 = (i*256u + y_loc + 128u) >> 2;
+        #pragma unroll
+        for (int t = 0; t < B; t++) {
+            const float4* xv = (const float4*)(x + (unsigned)t * pc.K + xo);
+            float4 by0=xv[bidx], by1=xv[bidx+8u], by2=xv[bidx2], by3=xv[bidx2+8u];
+            float s = 0.0f;
+            s += (f0*v0[0]-b0)*by0.x + (f0*v0[1]-b0)*by0.y + (f0*v0[2]-b0)*by0.z + (f0*v0[3]-b0)*by0.w;
+            s += (f1*v1[0]-b1)*by1.x + (f1*v1[1]-b1)*by1.y + (f1*v1[2]-b1)*by1.z + (f1*v1[3]-b1)*by1.w;
+            s += (f2*v2[0]-b2)*by2.x + (f2*v2[1]-b2)*by2.y + (f2*v2[2]-b2)*by2.z + (f2*v2[3]-b2)*by2.w;
+            s += (f3*v3[0]-b3)*by3.x + (f3*v3[1]-b3)*by3.y + (f3*v3[2]-b3)*by3.z + (f3*v3[3]-b3)*by3.w;
+            sum[t] += s;
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < B; t++) {
+        float r = zinc_block_reduce_sum(sum[t]);
+        if (tid == 0) {
+            unsigned yi = (pc.y_offset >> 2) + (unsigned)t * pc.M + row;
+            if (pc.acc_mode != 0u) y[yi] += r; else y[yi] = r;
+        }
+        __syncthreads();
+    }
+}
+extern "C" __global__ void dmmv_q5k_btok2(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<2>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok3(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<3>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok4(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<4>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok5(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<5>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok6(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<6>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok7(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<7>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok8(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<8>(a_u32, x, y, pc); }
+
+// ---- dmmv_q8_0_btok (Effort 28) — Q8_0 token-BATCH matvec --------------------
+// The Q8_0 analog: read each Q8_0 block (d + 32 int8) ONCE, reuse across B tokens.
+// Same per-element arithmetic as dmmv_q8_0_fast; per-token local sum then
+// sum[t] += s → token-identical to dmmv_q8_0_fast on x[t]. x/y token-major.
+template<int B>
+__device__ __forceinline__ void dmmv_q8_0_btok_impl(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
+    unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    unsigned bpr = pc.K >> 5;
+    const unsigned char* arow = a + pc.a_offset + (size_t)row * bpr * 34u;
+    unsigned xb0 = pc.x_offset >> 2, tid = threadIdx.x;
+    float sum[B];
+    #pragma unroll
+    for (int t = 0; t < B; t++) sum[t] = 0.0f;
+    for (unsigned bi = tid; bi < bpr; bi += blockDim.x) {
+        const unsigned char* blk = arow + (size_t)bi * 34u;
+        float d = zinc_half_to_float((unsigned short)((unsigned)blk[0] | ((unsigned)blk[1] << 8)));
+        const signed char* qs = (const signed char*)(blk + 2);
+        #pragma unroll
+        for (int t = 0; t < B; t++) {
+            const float4* xb = (const float4*)(x + (unsigned)t * pc.K + xb0 + (size_t)bi * 32u);
+            float s = 0.0f;
+            #pragma unroll
+            for (unsigned j = 0; j < 8u; j++) { float4 xx = xb[j]; s += d * ((float)qs[j*4]*xx.x + (float)qs[j*4+1]*xx.y + (float)qs[j*4+2]*xx.z + (float)qs[j*4+3]*xx.w); }
+            sum[t] += s;
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < B; t++) {
+        float r = zinc_block_reduce_sum(sum[t]);
+        if (tid == 0) {
+            unsigned yi = (pc.y_offset >> 2) + (unsigned)t * pc.M + row;
+            if (pc.acc_mode != 0u) y[yi] += r; else y[yi] = r;
+        }
+        __syncthreads();
+    }
+}
+extern "C" __global__ void dmmv_q8_0_btok2(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<2>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok3(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<3>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok4(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<4>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok5(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<5>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok6(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<6>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok7(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<7>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok8(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<8>(a, x, y, pc); }
+
 // ---- dmmv_q5k multi-row (perf research, agenda 1: extend mr2 to Q5_K) --------
 // One block computes R=2 output rows; each shared x-superblock loaded once and
 // reused across both rows. Same Q5_K dequant as dmmv_q5k_fast (qh 5th-bit

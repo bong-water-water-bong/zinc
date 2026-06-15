@@ -174,6 +174,9 @@ const Pipelines = struct {
     dmmv: [6]CudaPipeline,
     dmmv_fast: [4]CudaPipeline,
     dmmv_q4k_btok: [7]CudaPipeline, // Effort 28: small-B (2..8) token-batch matvec
+    dmmv_q6k_btok: [7]CudaPipeline, // Effort 28: Q6_K small-B token-batch matvec (gemma ffn_down)
+    dmmv_q5k_btok: [7]CudaPipeline, // Effort 28: Q5_K small-B token-batch matvec
+    dmmv_q8_0_btok: [7]CudaPipeline, // Effort 28: Q8_0 small-B token-batch matvec
     dmmv_q4k_fast_dual: CudaPipeline, // fuse gate/up & Q/K same-input Q4_K matvecs
     rope: CudaPipeline,
     gemma_attention: CudaPipeline,
@@ -514,6 +517,14 @@ pub const ForwardGemma = struct {
         pipes.dmmv_q4k_btok[4] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok6");
         pipes.dmmv_q4k_btok[5] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok7");
         pipes.dmmv_q4k_btok[6] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_btok8");
+        // Effort 28: Q6_K/Q5_K/Q8_0 token-batch matvecs (B=2..8, idx B-2) — the
+        // non-Q4_K decode GEMMs (gemma-31b ffn_down is Q6_K) otherwise hit the
+        // tile-padding GEMM at small B.
+        inline for ([_][]const u8{ "2", "3", "4", "5", "6", "7", "8" }, 0..) |suf, i| {
+            pipes.dmmv_q6k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_btok" ++ suf);
+            pipes.dmmv_q5k_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_btok" ++ suf);
+            pipes.dmmv_q8_0_btok[i] = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q8_0_btok" ++ suf);
+        }
         pipes.dmmv_q4k_fast_dual = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_fast_dual");
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.gemma_attention = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention");
@@ -693,6 +704,12 @@ pub const ForwardGemma = struct {
                 for (&self.pipes.dmmv_fast) |*p| pipeline.freePipeline(p);
             } else if (comptime std.mem.eql(u8, f.name, "dmmv_q4k_btok")) {
                 for (&self.pipes.dmmv_q4k_btok) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q6k_btok")) {
+                for (&self.pipes.dmmv_q6k_btok) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q5k_btok")) {
+                for (&self.pipes.dmmv_q5k_btok) |*p| pipeline.freePipeline(p);
+            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q8_0_btok")) {
+                for (&self.pipes.dmmv_q8_0_btok) |*p| pipeline.freePipeline(p);
             } else if (comptime std.mem.eql(u8, f.name, "gemm")) {
                 for (&self.pipes.gemm) |*p| pipeline.freePipeline(p);
             } else {
@@ -1353,10 +1370,22 @@ pub const ForwardGemma = struct {
         // bandwidth-bound, no tile waste, bit-identical to dmmv_q4k_fast per row.
         // Skip when the normf16 opt-in staged the fp16 norm into act_f16 instead of
         // materializing the f32 x this kernel reads (a_preconv & use_tc_normf16).
-        if (self.decode_mrow and T >= 2 and T <= 8 and w.info.type_ == .q4_k and !(a_preconv and self.use_tc_normf16)) {
-            const push = DmmvPush{ .M = M, .K = K };
-            cmd.dispatch(&self.pipes.dmmv_q4k_btok[T - 2], .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
-            return;
+        if (self.decode_mrow and T >= 2 and T <= 8 and !(a_preconv and self.use_tc_normf16)) {
+            // Q4_K covers proj/gate/up; Q6_K covers gemma-31b's ffn_down; Q5_K/Q8_0
+            // cover other mixed-quant dense weights. All bit-identical-per-row to
+            // their *_fast matvec → token-identical to the serial decode path.
+            const btok: ?*CudaPipeline = switch (w.info.type_) {
+                .q4_k => &self.pipes.dmmv_q4k_btok[T - 2],
+                .q6_k => &self.pipes.dmmv_q6k_btok[T - 2],
+                .q5_k => &self.pipes.dmmv_q5k_btok[T - 2],
+                .q8_0 => &self.pipes.dmmv_q8_0_btok[T - 2],
+                else => null,
+            };
+            if (btok) |pipe| {
+                const push = DmmvPush{ .M = M, .K = K };
+                cmd.dispatch(pipe, .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+                return;
+            }
         }
         const gi: ?usize = switch (w.info.type_) {
             .q4_k => 0,
