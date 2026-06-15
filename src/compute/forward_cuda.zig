@@ -163,6 +163,19 @@ fn dmmvIdx(t: gguf.GGMLType) usize {
     };
 }
 
+/// Effort 28: a stacked-MoE expert weight type that has a GPU-side `dmmv_*_experts`
+/// kernel (reads the chosen expert id from `router_out_buf` GPU-side, no host
+/// readback). The async `batched_experts` path is enabled only when ALL of
+/// gate/up/down are supported; any other type (q8_0/f32) keeps the host-id
+/// fallback (correct, but per-row sync). Adding q6_k (cycle 2026-06-15) brings the
+/// 5 mixed-quant Q6_K-expert layers of qwen36-35b-a3b onto the async/collapse path.
+fn expertsSupported(t: gguf.GGMLType) bool {
+    return switch (t) {
+        .q4_k, .q5_k, .q6_k => true,
+        else => false,
+    };
+}
+
 /// Derived dims (one decode token, qwen35).
 const Derived = struct {
     n_embd: u32,
@@ -267,6 +280,7 @@ const Pipelines = struct {
     sigmoid_scale_acc: CudaPipeline,
     dmmv_q4k_experts: CudaPipeline, // batched gate/up over all experts
     dmmv_q5k_experts: CudaPipeline, // batched down over all experts
+    dmmv_q6k_experts: CudaPipeline, // batched experts for mixed-quant Q6_K layers
 };
 
 /// Effort 28 4c: token-major [B, dim] activation scratch for batched decode.
@@ -528,6 +542,7 @@ pub const ForwardCuda = struct {
         pipes.sigmoid_scale_acc = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_scale_acc");
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
         pipes.dmmv_q5k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5k_experts");
+        pipes.dmmv_q6k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q6k_experts");
         // Effort 28 4c: batched-decode GEMMs (weights read once over B rows).
         pipes.gemm[0] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tiled_v2");
         pipes.gemm[1] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tiled_v2");
@@ -1470,7 +1485,10 @@ pub const ForwardCuda = struct {
         const gate_slice = expertSliceBytes(wge.info.type_, ef, d.n_embd);
         const up_slice = expertSliceBytes(wue.info.type_, ef, d.n_embd);
         const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
-        const batched_experts = dmmvIdx(wge.info.type_) == 0 and dmmvIdx(wue.info.type_) == 0 and dmmvIdx(wde.info.type_) == 1;
+        // GPU-side async experts (no host id readback) when ALL of gate/up/down have
+        // a `dmmv_*_experts` kernel. Adding q6_k (this cycle) brings the 5 mixed-quant
+        // Q6_K-expert layers onto this path so they ride the launch-collapse too.
+        const batched_experts = expertsSupported(wge.info.type_) and expertsSupported(wue.info.type_) and expertsSupported(wde.info.type_);
 
         // --- Router: logits → top-k softmax (rms_norm precomputed → norm_row). ----
         {
@@ -1495,14 +1513,11 @@ pub const ForwardCuda = struct {
             var cmd = try command.beginCommand(ctx);
             if (batched_experts) {
                 const nrows_gu = n_used * ef;
-                const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gate_slice, .x_stride = 0, .n_used = n_used };
-                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wge.gpu_buffer, norm_row, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
-                const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = up_slice, .x_stride = 0, .n_used = n_used };
-                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows_gu, 1, 1 }, .{ 64, 1, 1 }, &.{ &wue.gpu_buffer, norm_row, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                self.expertsDispatch(&cmd, wge, norm_row, &self.gate_buf, &self.router_out_buf, ef, d.n_embd, gate_slice, 0, n_used);
+                self.expertsDispatch(&cmd, wue, norm_row, &self.up_buf, &self.router_out_buf, ef, d.n_embd, up_slice, 0, n_used);
                 const sg = SwigluPush{ .N = nrows_gu };
                 cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(nrows_gu, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.swiglu_buf }, &sg, @sizeOf(SwigluPush), 0);
-                const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used };
-                cmd.dispatch(&self.pipes.dmmv_q5k_experts, .{ n_used * d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &self.swiglu_buf, &self.down_buf, &self.router_out_buf }, &pd, @sizeOf(ExpertsPush), 0);
+                self.expertsDispatch(&cmd, wde, &self.swiglu_buf, &self.down_buf, &self.router_out_buf, d.n_embd, ef, down_slice, ef, n_used);
             } else {
                 const sg = SwigluPush{ .N = ef };
                 var j: u32 = 0;
@@ -2162,6 +2177,24 @@ pub const ForwardCuda = struct {
         } else {
             cmd.dispatch(&self.pipes.dmmv[idx], .{ M, 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
         }
+    }
+
+    /// Effort 28: GPU-side stacked-MoE expert matvec over all `n_used` experts in
+    /// ONE launch (block g handles expert e=g/M, row=g%M; the chosen expert id is
+    /// read GPU-side from `ids`). Picks the `dmmv_*_experts` kernel by weight quant
+    /// (q4_k/q5_k/q6_k); the per-row math equals `dmmvDispatch` on x[e] bit-for-bit,
+    /// so the async path stays token-identical to the host-id fallback. `w.info.type_`
+    /// must be `expertsSupported`. x is shared (x_stride=0) for gate/up or per-expert
+    /// (x_stride=K) for down; output is slot-major y[e*M + row].
+    fn expertsDispatch(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, ids: *const CudaBuffer, M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32) void {
+        const p = ExpertsPush{ .M = M, .K = K, .slice = slice, .x_stride = x_stride, .n_used = n_used };
+        const pipe = switch (dmmvIdx(w.info.type_)) {
+            0 => &self.pipes.dmmv_q4k_experts,
+            1 => &self.pipes.dmmv_q5k_experts,
+            2 => &self.pipes.dmmv_q6k_experts,
+            else => unreachable, // gated by expertsSupported(w.info.type_)
+        };
+        cmd.dispatch(pipe, .{ n_used * M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y, ids }, &p, @sizeOf(ExpertsPush), 0);
     }
 };
 
