@@ -1782,6 +1782,17 @@ extern "C" __global__ void dmmv_q4k_btok13(const unsigned* a_u32, const float* x
 extern "C" __global__ void dmmv_q4k_btok14(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<14>(a_u32, x, y, pc); }
 extern "C" __global__ void dmmv_q4k_btok15(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<15>(a_u32, x, y, pc); }
 extern "C" __global__ void dmmv_q4k_btok16(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<16>(a_u32, x, y, pc); }
+// Effort 28: B=17..24 — extend btok up to (just below) the ~B≈27 Q4_K roofline
+// crossover so the B=17..24 serving regime keeps the bandwidth-bound matvec
+// instead of falling back to the padded 64×64 tile GEMM.
+extern "C" __global__ void dmmv_q4k_btok17(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<17>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok18(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<18>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok19(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<19>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok20(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<20>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok21(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<21>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok22(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<22>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok23(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<23>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q4k_btok24(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q4k_btok_impl<24>(a_u32, x, y, pc); }
 
 // ---- dmmv_q6k_btok (Effort 28) — Q6_K token-BATCH matvec ---------------------
 // The Q6_K analog of dmmv_q4k_btok: read each Q6_K weight row's superblock + its
@@ -1857,6 +1868,14 @@ extern "C" __global__ void dmmv_q6k_btok13(const unsigned char* a, const float* 
 extern "C" __global__ void dmmv_q6k_btok14(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<14>(a, x, y, pc); }
 extern "C" __global__ void dmmv_q6k_btok15(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<15>(a, x, y, pc); }
 extern "C" __global__ void dmmv_q6k_btok16(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<16>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok17(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<17>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok18(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<18>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok19(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<19>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok20(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<20>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok21(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<21>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok22(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<22>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok23(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<23>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q6k_btok24(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q6k_btok_impl<24>(a, x, y, pc); }
 
 // ---- dmmv_q5k_btok (Effort 28) — Q5_K token-BATCH matvec ---------------------
 // The Q5_K analog: read each Q5_K weight row's superblock + dequant ONCE, reuse
@@ -1936,6 +1955,14 @@ extern "C" __global__ void dmmv_q5k_btok13(const unsigned* a_u32, const float* x
 extern "C" __global__ void dmmv_q5k_btok14(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<14>(a_u32, x, y, pc); }
 extern "C" __global__ void dmmv_q5k_btok15(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<15>(a_u32, x, y, pc); }
 extern "C" __global__ void dmmv_q5k_btok16(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<16>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok17(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<17>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok18(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<18>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok19(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<19>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok20(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<20>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok21(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<21>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok22(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<22>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok23(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<23>(a_u32, x, y, pc); }
+extern "C" __global__ void dmmv_q5k_btok24(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<24>(a_u32, x, y, pc); }
 
 // ---- dmmv_q8_0_btok (Effort 28) — Q8_0 token-BATCH matvec --------------------
 // The Q8_0 analog: read each Q8_0 block (d + 32 int8) ONCE, reuse across B tokens.
@@ -1989,6 +2016,14 @@ extern "C" __global__ void dmmv_q8_0_btok13(const unsigned char* a, const float*
 extern "C" __global__ void dmmv_q8_0_btok14(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<14>(a, x, y, pc); }
 extern "C" __global__ void dmmv_q8_0_btok15(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<15>(a, x, y, pc); }
 extern "C" __global__ void dmmv_q8_0_btok16(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<16>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok17(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<17>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok18(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<18>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok19(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<19>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok20(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<20>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok21(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<21>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok22(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<22>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok23(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<23>(a, x, y, pc); }
+extern "C" __global__ void dmmv_q8_0_btok24(const unsigned char* a, const float* x, float* y, DmmvPush pc) { dmmv_q8_0_btok_impl<24>(a, x, y, pc); }
 
 // ---- dmmv_q5k multi-row (perf research, agenda 1: extend mr2 to Q5_K) --------
 // One block computes R=2 output rows; each shared x-superblock loaded once and
