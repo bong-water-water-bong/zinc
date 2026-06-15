@@ -1273,6 +1273,79 @@ extern "C" __global__ void dmmv_q4k_experts(const unsigned* a_u32, const float* 
     if (tid == 0) y[(size_t)e * pc.M + row] = sum;
 }
 
+// ---- dmmv_q4k_experts_dual — fuse the routed gate + up matvecs (gemma MoE) ----
+// The fused gate_up expert tensor stores gate (rows base 0) and up (rows base
+// pc.base = gu_half) contiguously per expert; both are Q4_K and share the SAME
+// input x (the pre-ffn norm, x_stride=0). This kernel computes BOTH for each
+// (expert e, row) in ONE launch, reading x ONCE per superblock iteration (shared
+// between the gate and up accumulators) instead of once per separate launch.
+// Removes one kernel launch per MoE layer with no per-token overhead (vs the
+// reverted C4 graph, whose per-token re-instantiate cost cancelled the bubble it
+// removed). Each accumulator's dequant arithmetic is byte-for-byte that of
+// dmmv_q4k_experts → bit-identical to the two-launch path. Output slot-major:
+// y_gate[e*M+row], y_up[e*M+row].
+extern "C" __global__ void dmmv_q4k_experts_dual(const unsigned* a_u32, const float* x, float* y_gate, float* y_up, const unsigned* expert_ids, ExpertsPush pc) {
+    unsigned g = blockIdx.x;
+    unsigned e = g / pc.M;
+    if (e >= pc.n_used) return;
+    unsigned row = g - e * pc.M;
+    unsigned bpr = pc.K >> 8;
+    unsigned base_e = (expert_ids[e] * pc.slice) >> 2;
+    unsigned a_gate = base_e + row * bpr * 36u;
+    unsigned a_up = base_e + (pc.base >> 2) + row * bpr * 36u;
+    const float4* xv = (const float4*)(x + (size_t)e * pc.x_stride);
+    unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    unsigned il = itid >> 2, ir = itid & 3u, v_im = il >> 1, v_in = il & 1u;
+    unsigned l0 = 4u * (2u * ir + v_in);
+    unsigned q_off = 32u * v_im + l0, y_loc = 64u * v_im + l0, shift = v_im * 16u;
+    unsigned ngrp = blockDim.x >> 4;
+    float sg = 0.0f, su = 0.0f;
+    for (unsigned i = grp; i < bpr; i += ngrp) {
+        unsigned bidx = (i * 256u + y_loc) >> 2, bidx2 = (i * 256u + y_loc + 128u) >> 2;
+        float4 by0 = xv[bidx], by1 = xv[bidx + 8u], by2 = xv[bidx2], by3 = xv[bidx2 + 8u];
+        // gate accumulator (weights at a_gate)
+        {
+            unsigned blk = a_gate + i * 36u;
+            unsigned dd = a_u32[blk];
+            float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF));
+            float dm = zinc_half_to_float((unsigned short)(dd >> 16));
+            unsigned sc0 = a_u32[blk + 1u], sc1 = a_u32[blk + 2u], sc2 = a_u32[blk + 3u];
+            unsigned qs0 = a_u32[blk + 4u + (q_off >> 2)], qs1 = a_u32[blk + 4u + (q_off >> 2) + 16u];
+            unsigned s0 = sc0 >> shift, s1 = sc1 >> shift, s2 = sc2 >> shift;
+            float f0 = d * (float)(s0 & 0x3Fu), b0 = dm * (float)(s1 & 0x3Fu);
+            float f1 = d * (float)((s0 >> 8) & 0x3Fu), b1 = dm * (float)((s1 >> 8) & 0x3Fu);
+            float f2 = d * (float)((s2 & 0xFu) | ((s0 & 0xC0u) >> 2)), b2 = dm * (float)(((s2 & 0xF0u) >> 4) | ((s1 & 0xC0u) >> 2));
+            float f3 = d * (float)(((s2 >> 8) & 0xFu) | (((s0 >> 8) & 0xC0u) >> 2)), b3 = dm * (float)((((s2 >> 8) & 0xF0u) >> 4) | (((s1 >> 8) & 0xC0u) >> 2));
+            sg += (f0*(float)(qs0&0xFu)-b0)*by0.x + (f0*(float)((qs0>>8)&0xFu)-b0)*by0.y + (f0*(float)((qs0>>16)&0xFu)-b0)*by0.z + (f0*(float)((qs0>>24)&0xFu)-b0)*by0.w;
+            sg += (f1*(float)((qs0>>4)&0xFu)-b1)*by1.x + (f1*(float)((qs0>>12)&0xFu)-b1)*by1.y + (f1*(float)((qs0>>20)&0xFu)-b1)*by1.z + (f1*(float)((qs0>>28)&0xFu)-b1)*by1.w;
+            sg += (f2*(float)(qs1&0xFu)-b2)*by2.x + (f2*(float)((qs1>>8)&0xFu)-b2)*by2.y + (f2*(float)((qs1>>16)&0xFu)-b2)*by2.z + (f2*(float)((qs1>>24)&0xFu)-b2)*by2.w;
+            sg += (f3*(float)((qs1>>4)&0xFu)-b3)*by3.x + (f3*(float)((qs1>>12)&0xFu)-b3)*by3.y + (f3*(float)((qs1>>20)&0xFu)-b3)*by3.z + (f3*(float)((qs1>>28)&0xFu)-b3)*by3.w;
+        }
+        // up accumulator (weights at a_up)
+        {
+            unsigned blk = a_up + i * 36u;
+            unsigned dd = a_u32[blk];
+            float d = zinc_half_to_float((unsigned short)(dd & 0xFFFF));
+            float dm = zinc_half_to_float((unsigned short)(dd >> 16));
+            unsigned sc0 = a_u32[blk + 1u], sc1 = a_u32[blk + 2u], sc2 = a_u32[blk + 3u];
+            unsigned qs0 = a_u32[blk + 4u + (q_off >> 2)], qs1 = a_u32[blk + 4u + (q_off >> 2) + 16u];
+            unsigned s0 = sc0 >> shift, s1 = sc1 >> shift, s2 = sc2 >> shift;
+            float f0 = d * (float)(s0 & 0x3Fu), b0 = dm * (float)(s1 & 0x3Fu);
+            float f1 = d * (float)((s0 >> 8) & 0x3Fu), b1 = dm * (float)((s1 >> 8) & 0x3Fu);
+            float f2 = d * (float)((s2 & 0xFu) | ((s0 & 0xC0u) >> 2)), b2 = dm * (float)(((s2 & 0xF0u) >> 4) | ((s1 & 0xC0u) >> 2));
+            float f3 = d * (float)(((s2 >> 8) & 0xFu) | (((s0 >> 8) & 0xC0u) >> 2)), b3 = dm * (float)((((s2 >> 8) & 0xF0u) >> 4) | (((s1 >> 8) & 0xC0u) >> 2));
+            su += (f0*(float)(qs0&0xFu)-b0)*by0.x + (f0*(float)((qs0>>8)&0xFu)-b0)*by0.y + (f0*(float)((qs0>>16)&0xFu)-b0)*by0.z + (f0*(float)((qs0>>24)&0xFu)-b0)*by0.w;
+            su += (f1*(float)((qs0>>4)&0xFu)-b1)*by1.x + (f1*(float)((qs0>>12)&0xFu)-b1)*by1.y + (f1*(float)((qs0>>20)&0xFu)-b1)*by1.z + (f1*(float)((qs0>>28)&0xFu)-b1)*by1.w;
+            su += (f2*(float)(qs1&0xFu)-b2)*by2.x + (f2*(float)((qs1>>8)&0xFu)-b2)*by2.y + (f2*(float)((qs1>>16)&0xFu)-b2)*by2.z + (f2*(float)((qs1>>24)&0xFu)-b2)*by2.w;
+            su += (f3*(float)((qs1>>4)&0xFu)-b3)*by3.x + (f3*(float)((qs1>>12)&0xFu)-b3)*by3.y + (f3*(float)((qs1>>20)&0xFu)-b3)*by3.z + (f3*(float)((qs1>>28)&0xFu)-b3)*by3.w;
+        }
+    }
+    sg = zinc_block_reduce_sum(sg);
+    __syncthreads(); // sh[] reuse between the two reductions
+    su = zinc_block_reduce_sum(su);
+    if (tid == 0) { unsigned o = (size_t)e * pc.M + row; y_gate[o] = sg; y_up[o] = su; }
+}
+
 extern "C" __global__ void dmmv_q5k_experts(const unsigned* a_u32, const float* x, float* y, const unsigned* expert_ids, ExpertsPush pc) {
     unsigned g = blockIdx.x;
     unsigned e = g / pc.M;

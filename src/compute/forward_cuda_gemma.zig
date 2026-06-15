@@ -187,6 +187,7 @@ const Pipelines = struct {
     mul_vec_scaled_batched: CudaPipeline, // gemma4-MoE prefill router pre-scale (all T)
     zero_vec: CudaPipeline,
     dmmv_q4k_experts: CudaPipeline, // batched fused gate/up over all experts
+    dmmv_q4k_experts_dual: CudaPipeline, // gate+up over all experts in ONE launch
     dmmv_q5_1_experts: CudaPipeline, // batched down over all experts
     dmmv_q4k_experts_batched: CudaPipeline, // token-batched gate/up (all T prompt tokens)
     dmmv_q5_1_experts_batched: CudaPipeline, // token-batched down (all T prompt tokens)
@@ -467,6 +468,7 @@ pub const ForwardGemma = struct {
         pipes.mul_vec_scaled_batched = try pipeline.createPipeline(ctx, src.ptr, "mul_vec_scaled_batched");
         pipes.zero_vec = try pipeline.createPipeline(ctx, src.ptr, "zero_vec");
         pipes.dmmv_q4k_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts");
+        pipes.dmmv_q4k_experts_dual = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts_dual");
         pipes.dmmv_q5_1_experts = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1_experts");
         pipes.dmmv_q4k_experts_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_experts_batched");
         pipes.dmmv_q5_1_experts_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q5_1_experts_batched");
@@ -1496,10 +1498,10 @@ pub const ForwardGemma = struct {
             // up half. Falls back to the per-slot loop for other expert quants.
             if (batched) {
                 const nrows = n_used * ef;
-                const pg = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = 0 };
-                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.gate_buf, &self.router_out_buf }, &pg, @sizeOf(ExpertsPush), 0);
-                const pu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = gu_half };
-                cmd.dispatch(&self.pipes.dmmv_q4k_experts, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.up_buf, &self.router_out_buf }, &pu, @sizeOf(ExpertsPush), 0);
+                // Fuse gate (base 0) + up (base gu_half) into ONE launch sharing the
+                // x-reads — bit-identical to the two dmmv_q4k_experts launches.
+                const pgu = ExpertsPush{ .M = ef, .K = d.n_embd, .slice = gu_full, .x_stride = 0, .n_used = n_used, .base = gu_half };
+                cmd.dispatch(&self.pipes.dmmv_q4k_experts_dual, .{ nrows, 1, 1 }, .{ 64, 1, 1 }, &.{ &wgu.gpu_buffer, &self.moe_norm_buf, &self.gate_buf, &self.up_buf, &self.router_out_buf }, &pgu, @sizeOf(ExpertsPush), 0);
                 const sgb = SwigluPush{ .N = nrows };
                 cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(nrows, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &self.gate_buf, &self.up_buf, &self.geglu_buf }, &sgb, @sizeOf(SwigluPush), 0);
                 const pd = ExpertsPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0 };
