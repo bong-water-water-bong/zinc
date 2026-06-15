@@ -296,6 +296,64 @@ extern "C" __global__ void rms_norm_residual_scale_norm(
     }
 }
 
+// ---- rms_norm_residual_triple (gemma MoE: post-attn norm+residual + 3 pre-norms) -
+// The MoE analogue of rms_norm_residual_norm. On the gemma-26b MoE decode path the
+// attention block ends with rms_norm_residual (post-attn norm + residual → hidden,
+// one launch) and the MoE block then opens with rms_norm_triple (the 3 pre-norms off
+// the just-updated hidden, another launch) across a command boundary. Both are
+// single-block (grid {1,1,1}) n_embd reductions over the SAME hidden vector, so the
+// triple can run in the SAME launch right after the residual add (a __syncthreads
+// makes the just-written hidden visible to the phase-2 reduction). Removes one tiny
+// launch + the hidden store/reload round-trip per MoE layer (~30 launches/token on
+// gemma-26b). BIT-IDENTICAL to the two-kernel path: phase 1 is the exact
+// rms_norm_residual arithmetic (same FMA + reduction), phase 2 is the exact
+// rms_norm_triple arithmetic re-reading hidden from global — the same values the
+// standalone triple would have read. The intervening __syncthreads also make reusing
+// zinc_block_reduce_sum's shared scratch race-free. Block-count PRESERVED (both
+// originals were single-block — the C8/C11/C17 win-class).
+extern "C" __global__ void rms_norm_residual_triple(
+    const float* x, const float* w_post, float* hidden,
+    const float* w1, const float* w3,
+    float* y1, float* y2, float* y3, RmsPush pc) {
+    unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float* ht = hidden + (size_t)token * pc.N;
+
+    // phase 1: post-attn norm + residual (identical to rms_norm_residual)
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        ht[i] += w_post[i] * (xt[i] * rinv);
+    }
+    __syncthreads(); // hidden fully written + visible before phase-2 reduction
+
+    // phase 2: 3 pre-norms off the updated residual (identical to rms_norm_triple)
+    float ss2 = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float v = ht[i];
+        ss2 += v * v;
+    }
+    ss2 = zinc_block_reduce_sum(ss2);
+    __shared__ float rms_inv_sh2;
+    if (threadIdx.x == 0) rms_inv_sh2 = rsqrtf(ss2 / (float)pc.N + pc.eps);
+    __syncthreads();
+    float rinv2 = rms_inv_sh2;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        float xr = ht[i] * rinv2;
+        y1[(size_t)token * pc.N + i] = w1[i] * xr;
+        y2[(size_t)token * pc.N + i] = xr;
+        y3[(size_t)token * pc.N + i] = w3[i] * xr;
+    }
+}
+
 // ---- rms_norm_rope ----------------------------------------------------------
 // Fused gemma per-head Q/K norm + RoPE: collapses the (per-head rms_norm ->
 // rope) pair into ONE launch, dropping a full head_dim write+read round-trip of
