@@ -1018,6 +1018,148 @@ extern "C" __global__ void ssm_delta_net(
     }
     state[row_base + col] = rs;                             // write final state
 }
+
+// ---- ssm_conv1d_seq (Effort 28 4c-2b: batched DECODE per-seq conv1d) ---------
+// Batched twin of ssm_conv1d for DECODE: B sequences in ONE launch, each row b
+// reading/writing its OWN slot conv ring at per-row state_offset = positions[b] %
+// (d_conv-1). grid = (ceilDiv(conv_channels,64), B). Input/output token-major
+// [B, conv_channels]; `state` the slot conv buffer [n_slots*conv_state_len], row
+// b at base slots[b]*conv_state_len. Per-channel math copied verbatim from
+// ssm_conv1d (state_offset derived from positions[b] instead of a push field).
+struct ConvSeqPush { unsigned conv_channels, d_conv, kernel_is_f16, conv_state_len; };
+extern "C" __global__ void ssm_conv1d_seq(const float* current_input, const unsigned char* conv_kernel,
+                                          float* state, float* out_data,
+                                          const unsigned* positions, const unsigned* slots, ConvSeqPush pc) {
+    unsigned ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= pc.conv_channels) return;
+    unsigned b = blockIdx.y;
+    unsigned d_conv_1 = pc.d_conv - 1u;
+    unsigned state_offset = positions[b] % d_conv_1;
+    const float* in_row = current_input + (size_t)b * pc.conv_channels;
+    float* out_row = out_data + (size_t)b * pc.conv_channels;
+    float* st = state + (size_t)slots[b] * pc.conv_state_len;
+    float ci = in_row[ch];
+    float sum = 0.0f;
+    for (unsigned ki = 0; ki < pc.d_conv; ki++) {
+        unsigned k_idx = ch * pc.d_conv + ki;
+        float kw = (pc.kernel_is_f16 != 0u)
+                       ? zinc_half_to_float(((const unsigned short*)conv_kernel)[k_idx])
+                       : ((const float*)conv_kernel)[k_idx];
+        float sv;
+        if (ki < d_conv_1) {
+            unsigned slot = state_offset + ki;
+            if (slot >= d_conv_1) slot -= d_conv_1;
+            sv = st[(size_t)slot * pc.conv_channels + ch];
+        } else {
+            sv = ci;
+        }
+        sum += kw * sv;
+    }
+    out_row[ch] = sum / (1.0f + expf(-sum));            // SiLU
+    st[(size_t)state_offset * pc.conv_channels + ch] = ci;
+}
+
+// ---- ssm_gated_norm_seq (Effort 28 4c-2b: batched DECODE gated norm) ---------
+// Batched twin of ssm_gated_norm: grid = (dt_rank, B); block per (head h, row b).
+// o/z/out token-major [B, d_inner], row b at b*d_inner; norm_weight is the shared
+// layer weight (per-head index uses head_base only, NOT the row offset). Per-head
+// math copied verbatim from ssm_gated_norm.
+struct GatedNormSeqPush { unsigned d_inner, dt_rank, head_v_dim, d_state, norm_per_head; };
+extern "C" __global__ void ssm_gated_norm_seq(const float* o, const float* z, const float* norm_weight,
+                                              float* out, GatedNormSeqPush pc) {
+    unsigned h = blockIdx.x;
+    unsigned b = blockIdx.y;
+    unsigned head_base = h * pc.head_v_dim;
+    unsigned base = b * pc.d_inner + head_base;
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.head_v_dim; i += blockDim.x) { float v = o[base + i]; ss += v * v; }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.head_v_dim + 1e-6f);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < pc.head_v_dim; i += blockDim.x) {
+        float nv = o[base + i] * rinv;
+        unsigned norm_idx = (pc.norm_per_head != 0u) ? (head_base + i) : (i % pc.d_state);
+        nv *= norm_weight[norm_idx];
+        float zv = z[base + i];
+        out[base + i] = nv * (zv / (1.0f + expf(-zv)));
+    }
+}
+
+// ---- ssm_delta_net_seq (Effort 28 4c-2b: batched DECODE delta-net scan) ------
+// Batched twin of ssm_delta_net for single-token DECODE: grid = (dt_rank,
+// head_v_dim, B); block per (head h, row, b). Each row b reads/writes its OWN
+// slot recurrent state (base slots[b]*ssm_state_len) and its OWN token-major
+// slices of conv_out/alpha/beta/out_data (b*{conv,ab,y}_stride_tok). One token
+// per row (no n_tok loop). Per-(h,row,b) math copied verbatim from ssm_delta_net.
+struct DeltaNetSeqPush {
+    unsigned d_inner, dt_rank, head_v_dim, d_state, n_group;
+    unsigned ssm_a_is_f16, dt_bias_is_f16, has_dt_bias, has_ssm_a;
+    unsigned conv_stride_tok, ab_stride_tok, y_stride_tok, ssm_state_len;
+};
+extern "C" __global__ void ssm_delta_net_seq(
+    const float* conv_out, const unsigned char* dt_bias, const float* alpha,
+    const float* beta, const unsigned char* ssm_a, float* state, float* out_data,
+    const unsigned* slots, DeltaNetSeqPush pc) {
+    unsigned h = blockIdx.x;
+    unsigned row = blockIdx.y;
+    unsigned b = blockIdx.z;
+    unsigned col = threadIdx.x;                  // 0..head_v_dim-1
+    if (h >= pc.dt_rank || row >= pc.head_v_dim) return;
+    unsigned hv = pc.head_v_dim;
+    unsigned qk_dim = pc.d_state * pc.n_group;
+    unsigned k_len = (hv < pc.d_state) ? hv : pc.d_state;
+    size_t state_base = (size_t)slots[b] * pc.ssm_state_len;
+    size_t row_base = state_base + ((size_t)h * hv + row) * hv;
+    float rs = state[row_base + col];            // state[slot][h][row][col]
+
+    float dt_bias_val = 0.0f;
+    if (pc.has_dt_bias != 0u)
+        dt_bias_val = pc.dt_bias_is_f16 ? zinc_half_to_float(((const unsigned short*)dt_bias)[h])
+                                        : ((const float*)dt_bias)[h];
+    float ssm_a_val = 0.0f;
+    if (pc.has_ssm_a != 0u)
+        ssm_a_val = pc.ssm_a_is_f16 ? zinc_half_to_float(((const unsigned short*)ssm_a)[h])
+                                    : ((const float*)ssm_a)[h];
+    unsigned k_hi = (pc.n_group == pc.dt_rank) ? h : (h % pc.n_group);
+
+    __shared__ float s_g, s_b;
+
+    // Single decode token for row b: bases are b * per-token stride.
+    unsigned conv_base = b * pc.conv_stride_tok;
+    unsigned q_off = conv_base + k_hi * pc.d_state;
+    unsigned k_off = conv_base + qk_dim + k_hi * pc.d_state;
+    unsigned v_off = conv_base + 2u * qk_dim + h * hv;
+
+    // L2-normalize Q/K per group (sum-sq reduced across cols), scale Q.
+    float qi = (col < k_len) ? conv_out[q_off + col] : 0.0f;
+    float ki = (col < k_len) ? conv_out[k_off + col] : 0.0f;
+    float sumq = zinc_block_reduce_sum_all(qi * qi);
+    float sumk = zinc_block_reduce_sum_all(ki * ki);
+    float sq = qi * (rsqrtf(fmaxf(sumq, 1e-12f)) / sqrtf((float)pc.d_state));
+    float skv = ki * rsqrtf(fmaxf(sumk, 1e-12f));
+
+    if (col == 0) {
+        float a = alpha[b * pc.ab_stride_tok + h] + dt_bias_val;
+        float sp = logf(1.0f + expf(a));               // softplus
+        float gate_val = (pc.has_ssm_a != 0u) ? (sp * ssm_a_val) : (-sp);
+        s_g = expf(gate_val);
+        s_b = 1.0f / (1.0f + expf(-beta[b * pc.ab_stride_tok + h]));
+    }
+    __syncthreads();
+    float g = s_g, bcoef = s_b;
+
+    float v_val = conv_out[v_off + row];
+    rs *= g;                                            // decay
+    float sk = zinc_block_reduce_sum_all((col < k_len) ? rs * skv : 0.0f);
+    float delta = bcoef * (v_val - sk);
+    if (col < k_len) rs += skv * delta;                 // rank-1 update
+    float o = zinc_block_reduce_sum_all((col < k_len) ? rs * sq : 0.0f);  // readout
+    if (col == 0) out_data[b * pc.y_stride_tok + h * hv + row] = o;
+    state[row_base + col] = rs;                          // write final state
+}
+
 // ---- dmmv_q4k_fast (perf research, 5090) — port of tuned Vulkan dmmv_q4k -----
 // 16 threads per Q4_K superblock: header read once/thread (not 256x), qs read
 // once total, x via float4. Block-reduce over the block = one output row.

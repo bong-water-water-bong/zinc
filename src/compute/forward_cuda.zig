@@ -82,6 +82,35 @@ const GatedNormPush = extern struct {
     d_state: u32,
     norm_per_head: u32,
 };
+// Effort 28 4c-2b: batched-decode SSM-inner kernels (byte-match kernels.cu).
+const ConvSeqPush = extern struct {
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: u32,
+    conv_state_len: u32,
+};
+const GatedNormSeqPush = extern struct {
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    norm_per_head: u32,
+};
+const DeltaNetSeqPush = extern struct {
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    ssm_a_is_f16: u32,
+    dt_bias_is_f16: u32,
+    has_dt_bias: u32,
+    has_ssm_a: u32,
+    conv_stride_tok: u32,
+    ab_stride_tok: u32,
+    y_stride_tok: u32,
+    ssm_state_len: u32,
+};
 const SwigluPush = extern struct { N: u32 };
 const SigmoidMulPush = extern struct { N: u32 };
 const DeintPush = extern struct { head_dim: u32, n_head: u32 };
@@ -214,6 +243,9 @@ const Pipelines = struct {
     // Effort 28 4c-2: fused batched-decode attention (grid.y=B per-seq) twins.
     qwen_norm_rope_qkv_seq: CudaPipeline,
     naive_attention_batched_seq: CudaPipeline,
+    ssm_conv1d_seq: CudaPipeline,
+    ssm_delta_net_seq: CudaPipeline,
+    ssm_gated_norm_seq: CudaPipeline,
     sigmoid_mul: CudaPipeline,
     deinterleave: CudaPipeline,
     ssm_conv1d: CudaPipeline,
@@ -408,6 +440,9 @@ pub const ForwardCuda = struct {
         pipes.naive_attention = try pipeline.createPipeline(ctx, src.ptr, "naive_attention");
         pipes.qwen_norm_rope_qkv_seq = try pipeline.createPipeline(ctx, src.ptr, "qwen_norm_rope_qkv_seq");
         pipes.naive_attention_batched_seq = try pipeline.createPipeline(ctx, src.ptr, "naive_attention_batched_seq");
+        pipes.ssm_conv1d_seq = try pipeline.createPipeline(ctx, src.ptr, "ssm_conv1d_seq");
+        pipes.ssm_delta_net_seq = try pipeline.createPipeline(ctx, src.ptr, "ssm_delta_net_seq");
+        pipes.ssm_gated_norm_seq = try pipeline.createPipeline(ctx, src.ptr, "ssm_gated_norm_seq");
         pipes.sigmoid_mul = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_mul");
         pipes.deinterleave = try pipeline.createPipeline(ctx, src.ptr, "deinterleave_qgate");
         pipes.ssm_conv1d = try pipeline.createPipeline(ctx, src.ptr, "ssm_conv1d");
@@ -880,15 +915,15 @@ pub const ForwardCuda = struct {
 
         // Layer-major: each block reads/writes db.hidden over ALL B rows. The big
         // projection/FFN GEMMs read each weight ONCE for all B rows (the
-        // amortization win — 4c-step-1). The attention inner is now FUSED into two
-        // batched grid.y=B kernels (4c-step-2); the SSM inner still loops per row
-        // on its slot conv/recurrent state (SSM fusion is the next 4c step).
+        // amortization win — 4c-step-1). Both the attention inner (4c-step-2a) AND
+        // the SSM inner (conv1d/delta-net/gated-norm, 4c-step-2b) are now FUSED into
+        // batched grid.y/z=B kernels — each block is ONE command buffer / one sync.
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
             if (isFullAttn(L, d.full_attn_interval)) {
                 try self.attentionLayerBatchedDecode(L, B, db, &pos_buf, &slot_buf, max_seq_len);
             } else {
-                try self.ssmLayerBatchedDecode(L, B, db, positions, slots);
+                try self.ssmLayerBatchedDecode(L, B, db, &pos_buf, &slot_buf);
             }
             try self.ffnBlockBatchedDecode(L, B, db);
         }
@@ -995,15 +1030,24 @@ pub const ForwardCuda = struct {
         cmd.commitAndWait();
     }
 
-    /// 4c SSM block: pre-norm + qkv/z/alpha/beta + out projections run as GEMMs
-    /// over ALL B rows (each weight read once). The conv1d / delta-net scan /
-    /// gated-norm inner loops per row on row b's slice + its slot conv ring +
-    /// recurrent state, with conv_off DERIVED `pos % (d_conv-1)` (mirrors 4b's
-    /// `ssmLayerSlot`). Block math copied verbatim from `ssmLayer`.
-    fn ssmLayerBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch, positions: []const u32, slots: []const u32) !void {
+    /// 4c-step-2b SSM block: pre-norm + qkv/z/alpha/beta + out projections run as
+    /// GEMMs over ALL B rows (each weight read once), AND the conv1d / delta-net
+    /// scan / gated-norm inner is now FUSED into three batched grid.y/z=B kernels
+    /// (the genuinely-new hybrid-SSM batched work; gemma had no SSM). Collapses the
+    /// per-row decode loop from B per-row `commitAndWait` syncs to ONE command
+    /// buffer / ONE commitAndWait (mirrors 4c-step-2a's attention fusion):
+    ///   1. batched pre-norm + qkv/z/alpha/beta projections (GEMMs over B rows)
+    ///   2. ssm_conv1d_seq — per-(channel,b) depthwise causal conv + SiLU over each
+    ///      row's slot conv ring at per-row state_offset = positions[b] % (d_conv-1)
+    ///   3. ssm_delta_net_seq — per-(head,row,b) gated delta-net scan over each
+    ///      row's slot recurrent state (one decode token per row)
+    ///   4. ssm_gated_norm_seq — per-(head,b) gated RMS-norm over token-major rows
+    ///   5. batched out projection, accumulate into db.hidden (residual)
+    /// Per-element arithmetic is copied verbatim from the per-row kernels (slot/row
+    /// bases derived from positions[]/slots[]) → token-identical to N serial runs.
+    fn ssmLayerBatchedDecode(self: *ForwardCuda, L: u32, B: u32, db: *DecodeBatch, pos_buf: *const CudaBuffer, slot_buf: *const CudaBuffer) !void {
         const d = self.d;
         const ctx = self.ctx;
-        const f4 = @sizeOf(f32);
         const wan = self.layer(L, "attn_norm.weight");
         const wqkv = self.layer(L, "attn_qkv.weight");
         const wz = self.layer(L, "attn_gate.weight");
@@ -1015,76 +1059,48 @@ pub const ForwardCuda = struct {
         const wnorm = self.layer(L, "ssm_norm.weight");
         const wout = self.layer(L, "ssm_out.weight");
 
-        // Batched pre-norm + qkv / z / alpha / beta projections over B rows.
-        {
-            var cmd = try command.beginCommand(ctx);
-            const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-            cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wan.gpu_buffer, &db.norm }, &rms, @sizeOf(RmsPush), 0);
-            self.gemmDispatch(&cmd, wqkv, &db.norm, &db.attn_out, d.conv_channels, d.n_embd, B, 0);
-            self.gemmDispatch(&cmd, wz, &db.norm, &db.gate, d.d_inner, d.n_embd, B, 0);
-            self.gemmDispatch(&cmd, walpha, &db.norm, &db.alpha, d.dt_rank, d.n_embd, B, 0);
-            self.gemmDispatch(&cmd, wbeta, &db.norm, &db.beta, d.dt_rank, d.n_embd, B, 0);
-            cmd.commitAndWait();
-        }
+        var cmd = try command.beginCommand(ctx);
 
-        // Per-row SSM inner on each row's slice + slot conv ring + recurrent state.
-        var bi: u32 = 0;
-        while (bi < B) : (bi += 1) {
-            const pos = positions[bi];
-            const slot = slots[bi];
-            const conv_off = pos % (d.d_conv - 1);
-            var qkv = try buffer.aliasBuffer(&db.attn_out, bi * d.conv_channels * f4, d.conv_channels * f4);
-            var zg = try buffer.aliasBuffer(&db.gate, bi * d.d_inner * f4, d.d_inner * f4);
-            var al = try buffer.aliasBuffer(&db.alpha, bi * d.dt_rank * f4, d.dt_rank * f4);
-            var be = try buffer.aliasBuffer(&db.beta, bi * d.dt_rank * f4, d.dt_rank * f4);
-            var conv_out = try buffer.aliasBuffer(&db.swiglu, bi * d.conv_channels * f4, d.conv_channels * f4);
-            var delta = try buffer.aliasBuffer(&db.ssm_delta, bi * d.d_inner * f4, d.d_inner * f4);
-            var ysl = try buffer.aliasBuffer(&db.ssm_y, bi * d.d_inner * f4, d.d_inner * f4);
-            var convst = try buffer.aliasBuffer(&self.ssm_conv_slots.?[L], self.slotConvOffsetBytes(slot), d.conv_state_len * f4);
-            var recst = try buffer.aliasBuffer(&self.ssm_state_slots.?[L], self.slotStateOffsetBytes(slot), d.ssm_state_len * f4);
-            defer {
-                buffer.freeBuffer(&qkv);
-                buffer.freeBuffer(&zg);
-                buffer.freeBuffer(&al);
-                buffer.freeBuffer(&be);
-                buffer.freeBuffer(&conv_out);
-                buffer.freeBuffer(&delta);
-                buffer.freeBuffer(&ysl);
-                buffer.freeBuffer(&convst);
-                buffer.freeBuffer(&recst);
-            }
+        // 1. Batched pre-norm + qkv / z / alpha / beta projections over B rows.
+        const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
+        cmd.dispatch(&self.pipes.rms_norm, .{ B, 1, 1 }, .{ 256, 1, 1 }, &.{ &db.hidden, &wan.gpu_buffer, &db.norm }, &rms, @sizeOf(RmsPush), 0);
+        self.gemmDispatch(&cmd, wqkv, &db.norm, &db.attn_out, d.conv_channels, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wz, &db.norm, &db.gate, d.d_inner, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, walpha, &db.norm, &db.alpha, d.dt_rank, d.n_embd, B, 0);
+        self.gemmDispatch(&cmd, wbeta, &db.norm, &db.beta, d.dt_rank, d.n_embd, B, 0);
 
-            var cmd = try command.beginCommand(ctx);
-            const conv = ConvPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .state_offset = conv_off };
-            cmd.dispatch(&self.pipes.ssm_conv1d, .{ ceilDiv(d.conv_channels, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &qkv, &wconv.gpu_buffer, &convst, &conv_out }, &conv, @sizeOf(ConvPush), 0);
-            const dn = DeltaNetPush{
-                .d_inner = d.d_inner,
-                .dt_rank = d.dt_rank,
-                .head_v_dim = d.head_v_dim,
-                .d_state = d.d_state,
-                .n_group = d.n_group,
-                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
-                .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
-                .has_dt_bias = 1,
-                .has_ssm_a = 1,
-                .n_tok = 1,
-                .conv_stride_tok = d.conv_channels,
-                .ab_stride_tok = d.dt_rank,
-                .y_stride_tok = d.d_inner,
-            };
-            cmd.dispatch(&self.pipes.ssm_delta_net, .{ d.dt_rank, d.head_v_dim, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &conv_out, &wdt.gpu_buffer, &al, &be, &wa.gpu_buffer, &recst, &delta }, &dn, @sizeOf(DeltaNetPush), 0);
-            const norm_per_head: u32 = if (wnorm.info.numElements() == d.d_inner) 1 else 0;
-            const gn = GatedNormPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head };
-            cmd.dispatch(&self.pipes.ssm_gated_norm, .{ d.dt_rank, 1, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &delta, &zg, &wnorm.gpu_buffer, &ysl }, &gn, @sizeOf(GatedNormPush), 0);
-            cmd.commitAndWait();
-        }
+        // 2. Batched conv1d over (ceilDiv(conv_channels,64), B): each row reads/writes
+        //    its slot conv ring at per-row state_offset = positions[b] % (d_conv-1).
+        const conv = ConvSeqPush{ .conv_channels = d.conv_channels, .d_conv = d.d_conv, .kernel_is_f16 = boolU32(wconv.info.type_ == .f16), .conv_state_len = d.conv_state_len };
+        cmd.dispatch(&self.pipes.ssm_conv1d_seq, .{ ceilDiv(d.conv_channels, 64), B, 1 }, .{ 64, 1, 1 }, &.{ &db.attn_out, &wconv.gpu_buffer, &self.ssm_conv_slots.?[L], &db.swiglu, pos_buf, slot_buf }, &conv, @sizeOf(ConvSeqPush), 0);
 
-        // Batched out projection, accumulate into db.hidden (residual).
-        {
-            var cmd = try command.beginCommand(ctx);
-            self.gemmDispatch(&cmd, wout, &db.ssm_y, &db.hidden, d.n_embd, d.d_inner, B, 1);
-            cmd.commitAndWait();
-        }
+        // 3. Batched delta-net scan over (dt_rank, head_v_dim, B): each row reads/writes
+        //    its slot recurrent state (one decode token per row).
+        const dn = DeltaNetSeqPush{
+            .d_inner = d.d_inner,
+            .dt_rank = d.dt_rank,
+            .head_v_dim = d.head_v_dim,
+            .d_state = d.d_state,
+            .n_group = d.n_group,
+            .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
+            .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+            .has_dt_bias = 1,
+            .has_ssm_a = 1,
+            .conv_stride_tok = d.conv_channels,
+            .ab_stride_tok = d.dt_rank,
+            .y_stride_tok = d.d_inner,
+            .ssm_state_len = d.ssm_state_len,
+        };
+        cmd.dispatch(&self.pipes.ssm_delta_net_seq, .{ d.dt_rank, d.head_v_dim, B }, .{ d.head_v_dim, 1, 1 }, &.{ &db.swiglu, &wdt.gpu_buffer, &db.alpha, &db.beta, &wa.gpu_buffer, &self.ssm_state_slots.?[L], &db.ssm_delta, slot_buf }, &dn, @sizeOf(DeltaNetSeqPush), 0);
+
+        // 4. Batched gated norm over (dt_rank, B): position/slot-independent.
+        const norm_per_head: u32 = if (wnorm.info.numElements() == d.d_inner) 1 else 0;
+        const gn = GatedNormSeqPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head };
+        cmd.dispatch(&self.pipes.ssm_gated_norm_seq, .{ d.dt_rank, B, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &db.ssm_delta, &db.gate, &wnorm.gpu_buffer, &db.ssm_y }, &gn, @sizeOf(GatedNormSeqPush), 0);
+
+        // 5. Batched out projection, accumulate into db.hidden (residual).
+        self.gemmDispatch(&cmd, wout, &db.ssm_y, &db.hidden, d.n_embd, d.d_inner, B, 1);
+        cmd.commitAndWait();
     }
 
     /// 4c dense FFN block: fully batched over B rows (pre-norm + gate/up GEMMs +
