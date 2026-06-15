@@ -390,11 +390,21 @@ pub const ForwardCuda = struct {
     // `capturing`, and the per-step scalars (positions/slots/tokens) live in
     // device scratch uploaded BEFORE capture, so the topology + push-constants are
     // invariant across steps → `cuGraphExecUpdate` is a cheap in-place no-op.
-    // MoE is excluded (the router host-readback is illegal mid-capture), exactly
-    // like the serial `graph` path. Set only by `decodeBatch`.
+    // MoE is now ALSO capturable when `moe_graph_capturable` (cycle 2026-06-15):
+    // after `4439e0be` (GPU-side expert-id for ALL supported quants) + `6516c010`
+    // (per-row sync collapse), the batched MoE routed + shared path contains NO
+    // host readback and NO commitAndWait — `submit`/`waitPending` are no-ops under
+    // `capturing` — and the expert id is read GPU-side from a device buffer (not a
+    // push constant), so topology + push-constants stay invariant across steps. Set
+    // only by `decodeBatch`.
     batch_graph: [9]?*shim.CudaGraph = .{null} ** 9,
     batch_graph_on: bool = false,
     batch_graph_force: ?bool = null,
+    // True when EVERY MoE layer's gate/up/down expert tensors have a GPU-side
+    // `dmmv_*_experts` kernel (`expertsSupported`) → no host id readback anywhere on
+    // the routed path → the batched MoE decode step is stream-capturable. Computed
+    // once at init (false for dense models, which use the `n_experts==0` graph gate).
+    moe_graph_capturable: bool = false,
     // GPU-side embedding (Effort 25 cycle 5): when the token_embd tensor is Q4_K,
     // dequant the token's row on-GPU (reading the id from `tok_in_buf`) instead of
     // a per-token CPU dequant + full-row H2D. `embed_weight` points at the resident
@@ -699,12 +709,29 @@ pub const ForwardCuda = struct {
             self.graph = shim.cuda_graph_create();
             log.info("ZINC_CUDA_GRAPH: dense decode will replay via a captured CUDA graph", .{});
         }
-        // Effort 28: opt-in CUDA-graph replay for the BATCHED dense-decode step.
-        // Dense only (MoE router host-readback is illegal mid-capture); per-B execs
-        // are created lazily on first use in `decodeBatch`.
-        if (d.n_experts == 0 and std.posix.getenv("ZINC_BATCH_GRAPH") != null) {
+        // Effort 28: is the batched MoE decode step stream-capturable? Only when
+        // EVERY MoE layer is on the GPU-side `batched_experts` path (all of
+        // gate/up/down `expertsSupported`) — else a layer host-gathers its expert
+        // ids (download + commitAndWait), illegal mid-capture. Dense models stay on
+        // the `n_experts==0` gate. Scanned once here (model weights are loaded).
+        if (d.n_experts > 0) {
+            self.moe_graph_capturable = blk: {
+                var L: u32 = 0;
+                while (L < d.n_layers) : (L += 1) {
+                    const wge = self.model.getLayer(L, "ffn_gate_exps.weight") orelse break :blk false;
+                    const wue = self.model.getLayer(L, "ffn_up_exps.weight") orelse break :blk false;
+                    const wde = self.model.getLayer(L, "ffn_down_exps.weight") orelse break :blk false;
+                    if (!expertsSupported(wge.info.type_) or !expertsSupported(wue.info.type_) or !expertsSupported(wde.info.type_)) break :blk false;
+                }
+                break :blk true;
+            };
+        }
+        // Effort 28: opt-in CUDA-graph replay for the BATCHED decode step. Dense
+        // always; MoE when `moe_graph_capturable` (no host readback on the routed
+        // path). Per-B execs are created lazily on first use in `decodeBatch`.
+        if ((d.n_experts == 0 or self.moe_graph_capturable) and std.posix.getenv("ZINC_BATCH_GRAPH") != null) {
             self.batch_graph_on = true;
-            log.info("ZINC_BATCH_GRAPH: dense batched decode will replay via per-B captured CUDA graphs", .{});
+            log.info("ZINC_BATCH_GRAPH: batched decode will replay via per-B captured CUDA graphs (moe_capturable={})", .{self.moe_graph_capturable});
         }
 
         return self;
@@ -1146,14 +1173,18 @@ pub const ForwardCuda = struct {
         var max_seq_len: u32 = 1;
         for (positions) |p| max_seq_len = @max(max_seq_len, p + 1);
 
-        // Effort 28 CUDA-graph replay (opt-in): the dense batched-decode step is
-        // sync-free after the launch-collapse, so capture the whole layer chain +
-        // tail into a per-B cached exec and replay it as ONE graph launch. The
-        // embed + pos/slot uploads above already ran (sync) into device scratch,
-        // so the captured kernels read the current step's data. Requires
-        // `decode_collapse` (no commitAndWait may appear inside a captured region)
-        // and dense (MoE router host-readback is illegal mid-capture).
-        const use_graph = d.n_experts == 0 and self.decode_collapse and (self.batch_graph_force orelse self.batch_graph_on);
+        // Effort 28 CUDA-graph replay (opt-in): the batched-decode step is sync-free
+        // after the launch-collapse, so capture the whole layer chain + tail into a
+        // per-B cached exec and replay it as ONE graph launch. The embed + pos/slot
+        // uploads above already ran (sync) into device scratch, so the captured
+        // kernels read the current step's data. Requires `decode_collapse` (no
+        // commitAndWait inside a captured region). For MoE, additionally requires the
+        // capturable batched routed+shared path (`moe_shared_batched` + `moe_collapse`,
+        // both ride `decode_mrow`) and `moe_graph_capturable` (no host id readback on
+        // ANY MoE layer) — else the routed loop host-gathers ids mid-capture.
+        const moe_graph_ok = d.n_experts == 0 or
+            (self.moe_graph_capturable and self.moe_shared_batched and self.moe_collapse);
+        const use_graph = moe_graph_ok and self.decode_collapse and (self.batch_graph_force orelse self.batch_graph_on);
         if (use_graph) {
             return try self.decodeBatchGraph(B, db, pos_buf, slot_buf, max_seq_len, &out_norm.gpu_buffer, &lm_head.gpu_buffer, lm_head.info.type_, out);
         }
@@ -1219,7 +1250,9 @@ pub const ForwardCuda = struct {
     /// read from a device buffer, not a push constant) → `cuGraphExecUpdate` is a
     /// cheap in-place no-op. Bit-identical to the non-graph batched chain (same
     /// kernels, same order, same single stream) → token-identical to N serial runs.
-    /// Dense only (gated by the caller on `n_experts==0`).
+    /// Dense OR MoE (MoE gated by the caller on `moe_graph_capturable` — every layer
+    /// reads expert ids GPU-side, no host readback — plus `moe_shared_batched` +
+    /// `moe_collapse` so the routed+shared path is the no-sync batched form).
     fn decodeBatchGraph(self: *ForwardCuda, B: u32, db: *DecodeBatch, pos_buf: *const CudaBuffer, slot_buf: *const CudaBuffer, max_seq_len: u32, out_norm: *const CudaBuffer, lm_head: *const CudaBuffer, lm_type: gguf.GGMLType, out: []u32) !void {
         const d = self.d;
         const ctx = self.ctx;
@@ -1240,7 +1273,10 @@ pub const ForwardCuda = struct {
             } else {
                 try self.ssmLayerBatchedDecode(L, B, db, pos_buf, slot_buf);
             }
-            try self.ffnBlockBatchedDecode(L, B, db); // dense only — graph gated on n_experts==0
+            // MoE: the capturable batched routed+shared path (gated above on
+            // moe_graph_capturable + moe_shared_batched + moe_collapse → no host
+            // readback, submit/waitPending are no-ops under `capturing`).
+            if (d.n_experts > 0) try self.moeFfnBlockBatchedDecode(L, B, db) else try self.ffnBlockBatchedDecode(L, B, db);
         }
         // TAIL: rms_norm → LM head → argmax for all B rows, recorded into ONE command
         // buffer (no commitAndWait — captured). On one stream the dispatches execute

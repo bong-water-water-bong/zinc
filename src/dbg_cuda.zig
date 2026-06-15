@@ -980,11 +980,13 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
             // steps (B=nseq) with the dense batched-decode CUDA-graph replay OFF (the
             // async submit chain) then ON (one captured graph launch per step) in ONE
             // model load (boost-comparable). mrow held ON for both arms (the default
-            // serving path) so the A/B isolates the graph capture. Dense only (the
-            // graph path is gated on n_experts==0). Token-identity is validated by
-            // re-running the GATE above under ZINC_BATCH_GRAPH=1 (graph batched ==
-            // solo == serial). The win needs a CLEAN 5090 window to be a real claim.
-            if (q.d.n_experts == 0 and nseq >= 2 and nseq <= 8) {
+            // serving path) so the A/B isolates the graph capture. Dense OR MoE — MoE
+            // is capturable when `moe_graph_capturable` (every layer reads expert ids
+            // GPU-side, no host readback) AND mrow on (→ moe_shared_batched +
+            // moe_collapse, the no-sync batched routed+shared path). Token-identity is
+            // validated by re-running the GATE above under ZINC_BATCH_GRAPH=1 (graph
+            // batched == solo == serial). The win needs a CLEAN 5090 window to claim.
+            if ((q.d.n_experts == 0 or q.moe_graph_capturable) and nseq >= 2 and nseq <= 8) {
                 var which: u32 = 0;
                 while (which < 2) : (which += 1) {
                     q.decode_mrow_force = true;
