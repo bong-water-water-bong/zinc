@@ -212,6 +212,10 @@ const compute_pgm_rsrc1_vgpr16_value: u32 = (compute_pgm_rsrc1_value & ~@as(u32,
 const compute_pgm_rsrc1_vgpr32_value: u32 = (compute_pgm_rsrc1_value & ~@as(u32, 0x3f)) | 0x7;
 const compute_pgm_rsrc2_argmax_top2_value: u32 = 0x90; // 8 user SGPRs + workgroup-id-x.
 const compute_pgm_rsrc2_user8_vgpr_workitem_x_value: u32 = (8 << 1) | (1 << 11);
+// 8 user SGPRs + ENABLE_SGPR_WORKGROUP_ID_X (bit 7 -> ttmp9 on gfx11/12) + VGPR
+// workitem id x (bit 11). For multi-workgroup grid dispatches that index output
+// rows by workgroup_id_x.
+const compute_pgm_rsrc2_user8_wgid_vgpr_x_value: u32 = (8 << 1) | (1 << 7) | (1 << 11);
 
 fn supportsEmbeddedGfx12Kernels(hw_ip: kmd.DrmAmdgpuInfoHwIp) bool {
     return hw_ip.hw_ip_version_major == 12;
@@ -261,6 +265,23 @@ const tgid_dump_gfx1201 = [_]u32{
     0xee068000, 0x00800000, 0x00000000, 0x7e0002ff, 0x00000f00, 0x7e0202ff, 0x53475052, 0xee068000,
     0x00800000, 0x00000000, 0x7e000280, 0x7e020205, 0xee068002, 0x00800000, 0x00000000, 0x7e000284,
     0x7e020206, 0xee068002, 0x00800000, 0x00000000, 0xbf8903f7, 0xbfb60003, 0xbfb00000,
+};
+
+// Grid-over-rows Q4_0 dequant-matvec (src/zinc_rt/isa/gfx1201/dmmv_q4_0_resident_grid.s).
+// One wave per workgroup; workgroup_id_x (ttmp9) selects the 64-row block, so a
+// grid of ceil(rows/64) workgroups covers all rows in one submit across all CUs.
+// ABI: s[0:1]=input, s[2:3]=output, s[4:5]=Q4_0 weights, s6=cols, s7=total_rows.
+const shader_offset_dmmv_q4_0_resident_grid: usize = 0x1400;
+const dmmv_q4_0_resident_grid_gfx1201 = [_]u32{
+    0x84088675, 0x4a100008, 0x7e1e0207, 0x7d921f08, 0xbfa5003b, 0x7e020280, 0x850a8506, 0xd72c0009,
+    0x0002100a, 0xd72c0009, 0x00021292, 0xbe8b0080, 0xbf090a0b, 0xbfa2002d, 0x960d920b, 0x4a14120d,
+    0xee048004, 0x00000002, 0x0000000a, 0x960ea00b, 0xbe8f0080, 0xbf8903f7, 0x7e041702, 0xbf09900f,
+    0xbfa20020, 0x8010820d, 0x80100f10, 0x4a161210, 0xee040004, 0x00000003, 0x0000000b, 0x80110f0e,
+    0x84118211, 0x7e180211, 0xee050000, 0x00000006, 0x0000000c, 0x80120f0e, 0x80129012, 0x84128212,
+    0x7e1a0212, 0xee050000, 0x00000007, 0x0000000d, 0xbf8903f7, 0x3608068f, 0x320a0684, 0x4a0808c8,
+    0x4a0a0ac8, 0x7e080b04, 0x7e0a0b05, 0x10080902, 0x56020d04, 0x100a0b02, 0x56020f05, 0x800f810f,
+    0xbfa0ffde, 0x800b810b, 0xbfa0ffd1, 0x301c1082, 0xee068002, 0x00800000, 0x0000000e, 0xbfa00000,
+    0xbf800000, 0xbfb60003, 0xbfb00000,
 };
 
 const tgid_probe_gfx1201 = [_]u32{
@@ -877,7 +898,8 @@ comptime {
     std.debug.assert(shader_offset_dmmv_q8_0_row_range_parallel + dmmv_q8_0_row_range_parallel_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_row_partial64);
     std.debug.assert(shader_offset_dmmv_q4_0_row_partial64 + dmmv_q4_0_row_partial64_gfx1201.len * @sizeOf(u32) <= shader_offset_tgid_probe);
     std.debug.assert(shader_offset_tgid_probe + tgid_probe_gfx1201.len * @sizeOf(u32) <= shader_offset_tgid_dump);
-    std.debug.assert(shader_offset_tgid_dump + tgid_dump_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
+    std.debug.assert(shader_offset_tgid_dump + tgid_dump_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_resident_grid);
+    std.debug.assert(shader_offset_dmmv_q4_0_resident_grid + dmmv_q4_0_resident_grid_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
 }
 
 /// Result produced by the ordered-score argmax row-range kernel.
@@ -1107,6 +1129,7 @@ pub const TokenBoundary = struct {
         for (dmmv_q4_0_row_partial64_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_row_partial64 / @sizeOf(u32) + i] = word;
         for (tgid_probe_gfx1201, 0..) |word, i| shader_words[shader_offset_tgid_probe / @sizeOf(u32) + i] = word;
         for (tgid_dump_gfx1201, 0..) |word, i| shader_words[shader_offset_tgid_dump / @sizeOf(u32) + i] = word;
+        for (dmmv_q4_0_resident_grid_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_resident_grid / @sizeOf(u32) + i] = word;
         storeFence();
 
         var bo_entries = [_]DrmAmdgpuBoListEntry{
@@ -2154,6 +2177,103 @@ pub const TokenBoundary = struct {
         const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
         if (signal_value != signal_expected) return error.SignalMismatch;
         for (0..out.len) |i| out[i] = output_words[i];
+    }
+
+    /// Grid-over-rows Q4_0 dequant-matvec. Stages `input` + `weights_q4_0` into
+    /// the input BO, dispatches ceil(rows/64) workgroups (each picks its 64-row
+    /// block from workgroup_id_x/ttmp9), and reads back `rows` results in ONE
+    /// submit. This is the correctness path (weights staged per call); the perf
+    /// path will instead point s[4:5] at a VRAM-resident weight BO.
+    pub fn dmmvQ4_0ResidentGrid(
+        self: *TokenBoundary,
+        input: []const f32,
+        weights_q4_0: []const u8,
+        rows: u32,
+        cols: u32,
+        output: []f32,
+    ) !void {
+        if (rows == 0 or cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
+        if (input.len < cols or output.len < rows) return error.ShapeMismatch;
+        const row_bytes: usize = (@as(usize, cols) / 32) * 18;
+        const weights_bytes = @as(usize, rows) * row_bytes;
+        if (weights_q4_0.len < weights_bytes) return error.ShapeMismatch;
+
+        const input_bytes = std.mem.sliceAsBytes(input[0..cols]);
+        const weight_off = std.mem.alignForward(usize, input_bytes.len, 64);
+        if (weight_off + weights_bytes > self.input_map.len) return error.InputTooLarge;
+        if (@as(usize, rows) * @sizeOf(f32) > self.output_map.len) return error.OutputTooLarge;
+
+        @memcpy(self.input_map[0..input_bytes.len], input_bytes);
+        @memcpy(self.input_map[weight_off..][0..weights_bytes], weights_q4_0[0..weights_bytes]);
+
+        const output_words: [*]volatile u32 = @ptrCast(@alignCast(self.output_map.ptr));
+        const signal_words: [*]volatile u32 = @ptrCast(@alignCast(self.signal_map.ptr));
+        for (0..rows) |i| output_words[i] = 0x7fc0_0000;
+        signal_words[0] = 0;
+        signal_words[1] = 0;
+        storeFence();
+
+        const signal_expected: u64 = 0x5A494E435254_B000 | @as(u64, self.submit_count + 1);
+        self.builder.reset();
+        try self.builder.writeNop(1);
+
+        const pgm_va = self.shader_va + shader_offset_dmmv_q4_0_resident_grid;
+        try self.builder.setShReg(packet.sh_reg_pgm_lo, &[_]u32{ @truncate(pgm_va >> 8), @truncate(pgm_va >> 40) });
+        try self.builder.setShReg(packet.sh_reg_pgm_rsrc1, &[_]u32{
+            compute_pgm_rsrc1_vgpr16_value,
+            compute_pgm_rsrc2_user8_wgid_vgpr_x_value,
+        });
+        try self.builder.setShRegOne(packet.sh_reg_pgm_rsrc3, 0);
+        try self.builder.setShReg(packet.sh_reg_num_thread_x, &[_]u32{ 64, 1, 1 });
+        try self.builder.setShReg(packet.sh_reg_resource_limits, &[_]u32{ 0, 0xffff_ffff, 0xffff_ffff });
+
+        const in_lo: u32 = @truncate(self.input_va);
+        const in_hi: u32 = @truncate(self.input_va >> 32);
+        const out_lo: u32 = @truncate(self.output_va);
+        const out_hi: u32 = @truncate(self.output_va >> 32);
+        const weight_va = self.input_va + @as(u64, weight_off);
+        const weight_lo: u32 = @truncate(weight_va);
+        const weight_hi: u32 = @truncate(weight_va >> 32);
+        try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
+            in_lo, in_hi, out_lo, out_hi, weight_lo, weight_hi, cols, rows,
+        });
+        const groups: u32 = (rows + 63) / 64;
+        try self.builder.dispatchDirectInitiator(groups, 1, 1, packet.dispatch_initiator_compute);
+        try self.builder.releaseMemSignal(self.signal_va, signal_expected);
+        try self.builder.padToAlignment(64);
+        storeFence();
+
+        var ib_chunk_data: DrmAmdgpuCsChunkIb = .{
+            ._pad = 0,
+            .flags = AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
+            .va_start = self.ib_va,
+            .ib_bytes = 0,
+            .ip_type = self.ip_type,
+            .ip_instance = 0,
+            .ring = 0,
+        };
+        var chunks = [_]DrmAmdgpuCsChunk{.{
+            .chunk_id = AMDGPU_CHUNK_ID_IB,
+            .length_dw = @sizeOf(DrmAmdgpuCsChunkIb) / @sizeOf(u32),
+            .chunk_data = @intFromPtr(&ib_chunk_data),
+        }};
+        var chunk_ptrs = [_]u64{@intFromPtr(&chunks[0])};
+        self.last_fence_handle = try submitBuilderAndWait(
+            self.file,
+            self.ctx_id,
+            self.ip_type,
+            self.bo_list_handle,
+            &self.builder,
+            &ib_chunk_data,
+            &chunk_ptrs,
+            &self.last_ib_bytes,
+            &self.last_wait_status,
+        );
+        self.submit_count += 1;
+
+        const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
+        if (signal_value != signal_expected) return error.SignalMismatch;
+        for (0..rows) |i| output[i] = @bitCast(output_words[i]);
     }
 
     /// One-shot check that a `size`-byte VRAM BO is CPU-mappable (large-BAR) and

@@ -150,6 +150,44 @@ fn runGpuProbe() !void {
         break :blk false;
     };
     try w.print("probe: VRAM 400MB CPU-mappable + roundtrip = {}\n", .{vram_ok});
+
+    // --- grid-over-rows Q4_0 matvec correctness (multi-WG + ttmp9 row index) ---
+    // 130 rows (3 workgroups), 64 cols (2 Q4_0 blocks/row). Per-row scale = r+1,
+    // every nibble = 9 (value 9-8=1), input all 1.0 => out[r] = (r+1)*64 exactly
+    // (all integers, no FP rounding). Varying the scale per row also catches a
+    // kernel that reads the wrong weight row.
+    const g_rows: u32 = 130;
+    const g_cols: u32 = 64;
+    const g_row_bytes: usize = (g_cols / 32) * 18; // 36
+    var wbuf: [g_rows * 36]u8 = undefined;
+    var ginput: [g_cols]f32 = [_]f32{1.0} ** g_cols;
+    var goutput: [g_rows]f32 = [_]f32{0} ** g_rows;
+    for (0..g_rows) |r| {
+        const scale_f16: u16 = @bitCast(@as(f16, @floatFromInt(r + 1)));
+        for (0..(g_cols / 32)) |b| {
+            const base = r * g_row_bytes + b * 18;
+            wbuf[base] = @truncate(scale_f16);
+            wbuf[base + 1] = @truncate(scale_f16 >> 8);
+            for (0..16) |k| wbuf[base + 2 + k] = 0x99; // two nibbles = 9,9
+        }
+    }
+    boundary.dmmvQ4_0ResidentGrid(ginput[0..], wbuf[0..], g_rows, g_cols, goutput[0..]) catch |e| {
+        try w.print("probe: grid matvec dispatch FAILED: {s}\n", .{@errorName(e)});
+        try w.flush();
+        return;
+    };
+    var bad: u32 = 0;
+    for (0..g_rows) |r| {
+        const want: f32 = @floatFromInt((r + 1) * g_cols);
+        if (goutput[r] != want) {
+            bad += 1;
+            if (bad <= 3) try w.print("probe:   row {d}: got {d} want {d}\n", .{ r, goutput[r], want });
+        }
+    }
+    try w.print(
+        "probe: grid matvec rows=130 cols=64 (3 WGs): mismatches={d} (0 => OK); out[0]={d} out[64]={d} out[129]={d}\n",
+        .{ bad, goutput[0], goutput[64], goutput[129] },
+    );
     try w.flush();
 }
 
