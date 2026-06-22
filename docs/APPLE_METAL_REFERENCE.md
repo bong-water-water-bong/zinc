@@ -6,8 +6,8 @@ This document is the backend-facing Metal reference for ZINC on Apple Silicon. I
 
 Related docs:
 
-- [`docs/APPLE_SILICON_REFERENCE.md`](./APPLE_SILICON_REFERENCE.md) covers chip generations, MLX/TensorOps context, public capability families, and opcode-surface boundaries.
-- [`docs/APPLE_SILICON_METAL_ENABLEMENT.md`](./APPLE_SILICON_METAL_ENABLEMENT.md) covers the implementation history and file-by-file bring-up details of the current Metal backend.
+- [`docs/APPLE_SILICON_REFERENCE.md`](/zinc/docs/apple-silicon-reference/) covers chip generations, MLX/TensorOps context, public capability families, and opcode-surface boundaries.
+- [`docs/APPLE_SILICON_METAL_ENABLEMENT.md`](/zinc/docs/apple-silicon-metal-enablement/) covers the implementation history and file-by-file bring-up details of the current Metal backend.
 
 ## Scope
 

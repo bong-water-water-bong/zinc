@@ -16,8 +16,8 @@ It starts with the simple pieces first and moves toward the harder parts at the 
 
 Companion references:
 
-- [`docs/APPLE_SILICON_REFERENCE.md`](./APPLE_SILICON_REFERENCE.md) covers Apple GPU family mapping, MLX/TensorOps context, and public capability boundaries.
-- [`docs/APPLE_METAL_REFERENCE.md`](./APPLE_METAL_REFERENCE.md) covers the backend-facing Metal runtime contract and tuning guidance.
+- [`docs/APPLE_SILICON_REFERENCE.md`](/zinc/docs/apple-silicon-reference/) covers Apple GPU family mapping, MLX/TensorOps context, and public capability boundaries.
+- [`docs/APPLE_METAL_REFERENCE.md`](/zinc/docs/apple-metal-reference/) covers the backend-facing Metal runtime contract and tuning guidance.
 
 ## Part I. What We Actually Enabled
 
@@ -106,7 +106,7 @@ The Apple Silicon implementation is spread across a relatively small set of file
 
 ## 4. Compile-Time Backend Selection
 
-Backend selection is handled in [`src/gpu/interface.zig`](../src/gpu/interface.zig).
+Backend selection is handled in [`src/gpu/interface.zig`](https://github.com/zolotukhin/zinc/blob/main/src/gpu/interface.zig).
 
 The rule is simple:
 
@@ -128,7 +128,7 @@ The practical consequence is:
 
 ## 5. Build Integration on macOS
 
-The macOS-specific behavior in [`build.zig`](../build.zig) does four main things:
+The macOS-specific behavior in [`build.zig`](https://github.com/zolotukhin/zinc/blob/main/build.zig) does four main things:
 
 1. It compiles `src/metal/shim.m`.
 2. It adds `src/metal` to the include path.
@@ -163,7 +163,7 @@ The cost is startup time and slightly more moving parts at runtime.
 
 ## 6. `main.zig` Startup Flow on Metal
 
-The Metal startup path in [`src/main.zig`](../src/main.zig) does the following:
+The Metal startup path in [`src/main.zig`](https://github.com/zolotukhin/zinc/blob/main/src/main.zig) does the following:
 
 1. initialize `MetalDevice`
 2. log device family and memory capabilities
@@ -192,9 +192,9 @@ This log is not just cosmetic. Those values inform tuning decisions later:
 
 ## 7. The One-File Objective-C Shim
 
-The bridge to Metal lives in [`src/metal/shim.m`](../src/metal/shim.m). This is intentionally the **only** Objective-C file in the repo.
+The bridge to Metal lives in [`src/metal/shim.m`](https://github.com/zolotukhin/zinc/blob/main/src/metal/shim.m). This is intentionally the **only** Objective-C file in the repo.
 
-That file wraps a small C ABI defined in [`src/metal/shim.h`](../src/metal/shim.h).
+That file wraps a small C ABI defined in [`src/metal/shim.h`](https://github.com/zolotukhin/zinc/blob/main/src/metal/shim.h).
 
 The shim owns:
 
@@ -232,7 +232,7 @@ Everywhere else in the codebase, the Metal backend looks like ordinary Zig code 
 
 ## 8. Device and Capability Model
 
-[`src/metal/device.zig`](../src/metal/device.zig) wraps the shim with a Zig-native `MetalDevice`.
+[`src/metal/device.zig`](https://github.com/zolotukhin/zinc/blob/main/src/metal/device.zig) wraps the shim with a Zig-native `MetalDevice`.
 
 Important fields:
 
@@ -264,7 +264,7 @@ That is used for tuning decisions such as:
 
 ## 9. Shared Buffers and Unified Memory
 
-[`src/metal/buffer.zig`](../src/metal/buffer.zig) is deliberately simple because the hardware model is different from discrete Vulkan devices.
+[`src/metal/buffer.zig`](https://github.com/zolotukhin/zinc/blob/main/src/metal/buffer.zig) is deliberately simple because the hardware model is different from discrete Vulkan devices.
 
 Each `MetalBuffer` stores:
 
@@ -288,7 +288,7 @@ This is one of the main reasons the Metal port did not look like a literal trans
 
 ## 10. Command Recording and Push Constants
 
-[`src/metal/command.zig`](../src/metal/command.zig) wraps a command buffer + compute encoder pair.
+[`src/metal/command.zig`](https://github.com/zolotukhin/zinc/blob/main/src/metal/command.zig) wraps a command buffer + compute encoder pair.
 
 There are two important dispatch entry points:
 
@@ -314,7 +314,7 @@ That matters because the Metal runtime often records multiple dependent dispatch
 
 ## 11. Pipeline Creation Model
 
-[`src/metal/pipeline.zig`](../src/metal/pipeline.zig) creates `MetalPipeline` values that cache:
+[`src/metal/pipeline.zig`](https://github.com/zolotukhin/zinc/blob/main/src/metal/pipeline.zig) creates `MetalPipeline` values that cache:
 
 - the pipeline handle
 - `max_threads_per_threadgroup`
@@ -340,7 +340,7 @@ The Vulkan loader path is built around:
 
 That is not the natural model on Apple Silicon.
 
-The Metal loader in [`src/model/loader_metal.zig`](../src/model/loader_metal.zig) instead:
+The Metal loader in [`src/model/loader_metal.zig`](https://github.com/zolotukhin/zinc/blob/main/src/model/loader_metal.zig) instead:
 
 1. `mmap`s the GGUF file
 2. parses GGUF metadata
@@ -398,7 +398,7 @@ That information is used by:
 
 ## 15. High-Level Shape
 
-The heart of the backend is [`src/compute/forward_metal.zig`](../src/compute/forward_metal.zig).
+The heart of the backend is [`src/compute/forward_metal.zig`](https://github.com/zolotukhin/zinc/blob/main/src/compute/forward_metal.zig).
 
 `InferenceEngine` owns:
 
@@ -780,7 +780,7 @@ This is not yet presented as a separate "Metal graph compiler"; it is a direct d
 
 One of the better architectural decisions in the codebase is that the route layer was kept shared.
 
-[`src/server/runtime.zig`](../src/server/runtime.zig) acts as the backend adapter for the shared HTTP layer by aliasing:
+[`src/server/runtime.zig`](https://github.com/zolotukhin/zinc/blob/main/src/server/runtime.zig) acts as the backend adapter for the shared HTTP layer by aliasing:
 
 - the loader
 - the forward runtime
@@ -793,7 +793,7 @@ This means the higher-level server code does not need to fork into "routes_metal
 
 ## 34. What the Metal Model Manager Does
 
-[`src/server/model_manager_metal.zig`](../src/server/model_manager_metal.zig) owns the active server-side resources:
+[`src/server/model_manager_metal.zig`](https://github.com/zolotukhin/zinc/blob/main/src/server/model_manager_metal.zig) owns the active server-side resources:
 
 - loaded model
 - tokenizer
@@ -887,11 +887,11 @@ There are two useful benchmark paths in-tree:
 
 ### Local CLI-style benchmark
 
-- [`benchmarks/metal_inference.zig`](../benchmarks/metal_inference.zig)
+- [`benchmarks/metal_inference.zig`](https://github.com/zolotukhin/zinc/blob/main/benchmarks/metal_inference.zig)
 
 ### HTTP/API benchmark
 
-- [`tools/benchmark_api.mjs`](../tools/benchmark_api.mjs)
+- [`tools/benchmark_api.mjs`](https://github.com/zolotukhin/zinc/blob/main/tools/benchmark_api.mjs)
 
 The HTTP benchmark is especially useful because it separates:
 
