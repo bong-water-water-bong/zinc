@@ -1472,7 +1472,7 @@ pub const ForwardGemma = struct {
                     const cvt = F32ToF16Push{ .N = T * K };
                     cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, a16 }, &cvt, @sizeOf(F32ToF16Push), 0);
                 }
-                shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(T), @intCast(K), b.w_f16.handle, a16.handle, y.handle);
+                shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(T), @intCast(K), b.w_f16.handle, a16.handle, y.handle, 0.0);
                 return;
             }
             // Cycle 11: when ZINC_BATCHED_TC is set, Q4_K GEMMs (idx 0 — the bulk of

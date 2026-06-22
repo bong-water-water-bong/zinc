@@ -114,8 +114,11 @@ void cuda_release_completed(CudaCmd* cmd);
 // accumulate. W and A are fp16 device buffers (W dequant'd from Q4_K, A downcast
 // from f32 by the caller's kernels on the SAME ctx stream — cuBLAS runs on that
 // stream so it is correctly ordered after them). Y is an fp32 device buffer.
+// `beta` is the cublas accumulate factor on Y (0 = overwrite, used by prefill;
+// 1 = accumulate the residual in place, used by the B>27 serving decode GEMMs
+// whose acc_mode==1 weights — O-proj / FFN-down / SSM-out — fold into Y).
 void cuda_cublas_hgemm(CudaCtx* ctx, unsigned M, unsigned N, unsigned K,
-                       CudaBuf* W, CudaBuf* A, CudaBuf* Y);
+                       CudaBuf* W, CudaBuf* A, CudaBuf* Y, float beta);
 
 // ---- CUDA Graphs (decode replay, Effort 25) ----------------------------------
 // Capture the per-decode-step kernel chain once and replay it as a SINGLE graph

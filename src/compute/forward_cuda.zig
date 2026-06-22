@@ -406,6 +406,11 @@ const DecodeBatch = struct {
     ffn_norm: CudaBuffer, // [B, n_embd] ffn pre-norm
     moe_down: CudaBuffer, // [B, n_embd] batched MoE shared-expert down output (pre-scale)
     moe_gate_scalar: CudaBuffer, // [B] batched MoE shared-expert sigmoid gate logit
+    // Effort 29 T3: fp16 scratch for the B>27 serving-decode cuBLAS GEMM (one
+    // dequant'd weight at a time + the B activation columns). Sized like the
+    // prefill BatchScratch's w_f16/act_f16 (largest decode weight / B*max_k).
+    w_f16: CudaBuffer, // [max_w] one dequant'd weight (fp16) for cuBLAS
+    act_f16: CudaBuffer, // [B, max_k] fp16 activation column block for cuBLAS
 
     fn alloc(ctx: ?*shim.CudaCtx, d: Derived, b_cap: u32) !DecodeBatch {
         const f4 = @sizeOf(f32);
@@ -414,6 +419,8 @@ const DecodeBatch = struct {
         const gate_n = @max(d.q_dim, @max(d.d_inner, d.n_ff));
         const aout_n = @max(d.q_dim, @max(d.conv_channels, d.d_inner));
         const swig_n = @max(d.n_ff, @max(d.conv_channels, d.d_inner));
+        const max_k = @max(@max(d.n_embd, d.q_dim), @max(d.d_inner, d.n_ff));
+        const max_w = @max(@max(d.conv_channels, 2 * d.q_dim), d.n_ff) * @max(d.n_embd, d.n_ff);
         return .{
             .b_cap = b_cap,
             .hidden = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
@@ -433,11 +440,13 @@ const DecodeBatch = struct {
             .ffn_norm = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
             .moe_down = try buffer.createBuffer(ctx, b_cap * d.n_embd * f4),
             .moe_gate_scalar = try buffer.createBuffer(ctx, b_cap * f4),
+            .w_f16 = try buffer.createBuffer(ctx, max_w * @sizeOf(u16)),
+            .act_f16 = try buffer.createBuffer(ctx, b_cap * max_k * @sizeOf(u16)),
         };
     }
 
     fn free(self: *DecodeBatch) void {
-        inline for (.{ &self.hidden, &self.norm, &self.qfull, &self.q, &self.k, &self.v, &self.gate, &self.attn_out, &self.swiglu, &self.up, &self.alpha, &self.beta, &self.ssm_delta, &self.ssm_y, &self.ffn_norm, &self.moe_down, &self.moe_gate_scalar }) |b| {
+        inline for (.{ &self.hidden, &self.norm, &self.qfull, &self.q, &self.k, &self.v, &self.gate, &self.attn_out, &self.swiglu, &self.up, &self.alpha, &self.beta, &self.ssm_delta, &self.ssm_y, &self.ffn_norm, &self.moe_down, &self.moe_gate_scalar, &self.w_f16, &self.act_f16 }) |b| {
             buffer.freeBuffer(b);
         }
     }
@@ -623,6 +632,15 @@ pub const ForwardCuda = struct {
     // the proven _batched matvec stays (256 experts → <20 tok/64-tile = mostly-empty
     // padded tiles, the wasted wmma cancels the weight-traffic win).
     moe_tc_min_t: u32 = 640,
+    // Effort 29 T3: route the B>27 SERVING-decode dense GEMMs through the same
+    // cuBLAS fp16-TC path (dequant W→fp16 + cublasGemmEx) instead of the f32
+    // register-tiled gemm[idx]. btok covers B≤27 (bandwidth-bound, no round-trip);
+    // past it the tile GEMM pads B to 64 and runs f32 ALU math, so cuBLAS's TC
+    // throughput should win. Default-on, opt out ZINC_SERVE_CUBLAS=0. Set per
+    // decodeBatch from the gate below; min-B tunable via ZINC_SERVE_CUBLAS_MINB.
+    serve_cublas: bool = false,
+    serve_cublas_force: ?bool = null,
+    serve_cublas_min_b: u32 = 28,
 
     // Effort 28 inc 4 — per-SEQUENCE slot state for batched decode (null until
     // allocSlotState; freed by freeSlotState). Mirrors the gemma slot KV but also
@@ -1650,7 +1668,7 @@ pub const ForwardCuda = struct {
             }
             const cvt = F32ToF16Push{ .N = T * K };
             cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, &b.act_f16 }, &cvt, @sizeOf(F32ToF16Push), 0);
-            shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(T), @intCast(K), b.w_f16.handle, b.act_f16.handle, y.handle);
+            shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(T), @intCast(K), b.w_f16.handle, b.act_f16.handle, y.handle, 0.0);
             return;
         }
         // Fallback: per-token matvec over the token-major buffers (x_offset/y_offset).
@@ -1767,6 +1785,15 @@ pub const ForwardCuda = struct {
         // Default-on; `_force` restores the per-layer sync for the harness A/B.
         self.decode_collapse = self.decode_collapse_force orelse true;
         defer self.decode_collapse = true;
+        // Effort 29 T3: route the B>27 serving GEMMs through cuBLAS fp16 TC (the
+        // f32 tile GEMM's regime). Independent of decode_mrow (btok owns B≤27). The
+        // min-B is tunable for the A/B sweep (ZINC_SERVE_CUBLAS_MINB). `defer` clears
+        // the live flag so a forced value never leaks past this call.
+        if (std.posix.getenv("ZINC_SERVE_CUBLAS_MINB")) |mb| {
+            self.serve_cublas_min_b = std.fmt.parseInt(u32, mb, 10) catch self.serve_cublas_min_b;
+        }
+        self.serve_cublas = (B >= self.serve_cublas_min_b) and (self.serve_cublas_force orelse serveCublasOn());
+        defer self.serve_cublas = false;
 
         const db = try self.ensureDecodeBatch(B);
         const out_norm = self.model.get("output_norm.weight") orelse return error.MissingTensor;
@@ -2000,6 +2027,36 @@ pub const ForwardCuda = struct {
             if (btok) |pipe| {
                 const push = DmmvPush{ .M = M, .K = K, .acc_mode = acc_mode };
                 cmd.dispatch(pipe, .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
+                return;
+            }
+        }
+        // Effort 29 T3: the B>27 serving regime. btok stops at B=27 (float sum[B]
+        // register ceiling); past it the default f32 tile GEMM (below) pads B to 64
+        // and runs ALU math. Route the same dense quants the prefill cuBLAS path
+        // handles (Q4_K/Q6_K/Q8_0) through cuBLAS fp16 TC instead: dequant W→fp16
+        // (db.w_f16, reused per GEMM, stream-ordered) + x→fp16 (db.act_f16) + one
+        // cublasGemmEx. acc_mode==1 (O-proj/down/ssm-out) folds into the residual y
+        // via beta=1; acc_mode==0 overwrites (beta=0). Token-correctness-tolerance
+        // gate (fp16 TC reduction order differs from the f32 tile GEMM). q5_k/f32
+        // have no dequant→fp16 kernel → fall through to the tile GEMM.
+        if (self.serve_cublas) {
+            const ci = dmmvIdx(w.info.type_);
+            if (ci == 0 or ci == 2 or ci == 3) {
+                const db = &self.decode_batch.?;
+                if (ci == 0) {
+                    const dq = DequantQ4KPush{ .M = M, .K = K };
+                    cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &db.w_f16 }, &dq, @sizeOf(DequantQ4KPush), 0);
+                } else if (ci == 2) {
+                    const dq = DequantQ6KPush{ .M = M, .K = K };
+                    cmd.dispatch(&self.pipes.dequant_q6k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &db.w_f16 }, &dq, @sizeOf(DequantQ6KPush), 0);
+                } else {
+                    const dq = DequantQ8_0Push{ .M = M, .K = K };
+                    cmd.dispatch(&self.pipes.dequant_q8_0_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &db.w_f16 }, &dq, @sizeOf(DequantQ8_0Push), 0);
+                }
+                const cvt = F32ToF16Push{ .N = B * K };
+                cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(B * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, &db.act_f16 }, &cvt, @sizeOf(F32ToF16Push), 0);
+                const beta: f32 = if (acc_mode == 1) 1.0 else 0.0;
+                shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(B), @intCast(K), db.w_f16.handle, db.act_f16.handle, y.handle, beta);
                 return;
             }
         }
@@ -3097,6 +3154,15 @@ fn aliasRow(buf: *const CudaBuffer, t: u32, width: u32) !CudaBuffer {
 /// ZINC_BATCHED_CUBLAS=0/off/false/no (the A/B kill-switch to the matvec path).
 fn cublasDefaultOn() bool {
     const v = std.posix.getenv("ZINC_BATCHED_CUBLAS") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no"));
+}
+
+/// Effort 29 T3: the B>27 serving-decode cuBLAS GEMM path. DEFAULT-ON; opt out
+/// with ZINC_SERVE_CUBLAS=0/off/false/no (the A/B kill-switch back to the f32
+/// tile GEMM). Only engages for B > serve_cublas_min_b, so the production B==1
+/// decodeStep and the B≤27 btok serving path are untouched.
+fn serveCublasOn() bool {
+    const v = std.posix.getenv("ZINC_SERVE_CUBLAS") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no"));
 }
 

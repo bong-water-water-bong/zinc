@@ -71,9 +71,9 @@ void cuda_destroy(CudaCtx* c) {
 // C is col-major M×N (ldc=M) = row-major N×M = the token-major Y. fp16 in, fp32
 // accumulate/out — matches gemm_q4k_tc's fp16-multiply / fp32-accumulate.
 void cuda_cublas_hgemm(CudaCtx* c, unsigned M, unsigned N, unsigned K,
-                       CudaBuf* W, CudaBuf* A, CudaBuf* Y) {
+                       CudaBuf* W, CudaBuf* A, CudaBuf* Y, float beta) {
     if (!c || !c->cublas) { set_err("cuda_cublas_hgemm", "no cublas handle"); return; }
-    const float alpha = 1.0f, beta = 0.0f;
+    const float alpha = 1.0f;
     cublasStatus_t s = cublasGemmEx(
         c->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)M, (int)N, (int)K,
         &alpha, (const void*)W->dptr, CUDA_R_16F, (int)K,
