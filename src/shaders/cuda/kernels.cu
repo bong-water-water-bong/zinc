@@ -2103,6 +2103,127 @@ extern "C" __global__ void scatter_by_order(const float* yg, const unsigned* ord
     for (unsigned m = blockIdx.x * blockDim.x + threadIdx.x; m < pc.M; m += gridDim.x * blockDim.x) dd[m] = s[m];
 }
 
+// ---- T2 v1: SINGLE-LAUNCH grouped Tensor-core MoE-expert GEMM ----------------
+// v0 (per-expert gemm_q4k_tc + host readback) was token-correct but launch-bound
+// (~10k launches + 40 syncs -> -27%). v1 collapses it to ONE launch per gate/up:
+// build_expert_order_padded pads each expert's (token,slot) run up to the 64-token
+// tile boundary and tags each tile with its expert id; gemm_q4k_experts_grouped_tc
+// runs the gemm_q4k_tc dequant+wmma core, picking the weight per TILE's expert and
+// gathering A / scattering Y via the padded order — NO per-expert launch, NO host
+// readback. fp16 -> token-tolerance gate (not bit-identical to the matvec).
+struct BuildOrderPadPush { unsigned T, n_used, n_experts, routing_stride, max_pos; };
+extern "C" __global__ void build_expert_order_padded(const unsigned* expert_ids, unsigned* order, unsigned* tile_expert, BuildOrderPadPush pc) {
+    __shared__ unsigned counts[256];
+    __shared__ unsigned poff[256]; // padded start position per expert
+    const unsigned INV = 0xFFFFFFFFu;
+    unsigned tid = threadIdx.x, nthr = blockDim.x;
+    unsigned P = pc.T * pc.n_used;
+    unsigned maxtiles = pc.max_pos >> 6;
+    for (unsigned p = tid; p < pc.max_pos; p += nthr) order[p] = INV;
+    for (unsigned tl = tid; tl < maxtiles; tl += nthr) tile_expert[tl] = INV;
+    for (unsigned e = tid; e < pc.n_experts; e += nthr) counts[e] = 0u;
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        atomicAdd(&counts[expert_ids[(size_t)t * pc.routing_stride + slot]], 1u);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        unsigned acc = 0u;
+        for (unsigned e = 0; e < pc.n_experts; e++) {
+            poff[e] = acc;
+            unsigned ntile = (counts[e] + 63u) >> 6; // ceil(count/64)
+            for (unsigned k = 0; k < ntile; k++) tile_expert[(acc >> 6) + k] = e;
+            acc += ntile * 64u;
+        }
+    }
+    __syncthreads();
+    for (unsigned e = tid; e < pc.n_experts; e += nthr) counts[e] = 0u; // reuse as cursor
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        unsigned E = expert_ids[(size_t)t * pc.routing_stride + slot];
+        unsigned within = atomicAdd(&counts[E], 1u);
+        order[poff[E] + within] = (t << 16) | slot;
+    }
+}
+
+struct GroupedTCPush { unsigned M, K, base, gu_full, dst_tok_stride; };
+extern "C" __global__ void gemm_q4k_experts_grouped_tc(const unsigned* a_u32, const float* A, const unsigned* order, const unsigned* tile_expert, float* dst, GroupedTCPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u, INV=0xFFFFFFFFu;
+    __shared__ half Ws[BM*BK];
+    __shared__ half As[BK*BT];
+    __shared__ float Cs[BT*BM];
+    unsigned expert = tile_expert[blockIdx.y];
+    if (expert == INV) return; // unused padded tile
+    unsigned m0 = blockIdx.x*BM, t0 = blockIdx.y*BT;
+    unsigned bpr = pc.K >> 8;
+    unsigned nchunk = pc.K >> 5;
+    unsigned tid = threadIdx.x;
+    unsigned a0 = (unsigned)(((size_t)expert * pc.gu_full + pc.base) >> 2);
+    unsigned warp = tid >> 5, fm = warp >> 2, ft = warp & 3u;
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> c0, c1;
+    wmma::fill_fragment(c0, 0.0f);
+    wmma::fill_fragment(c1, 0.0f);
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        unsigned sbk = c >> 3, sb8 = c & 7u;
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;
+            unsigned r = idx >> 5, l = idx & 31u;
+            unsigned row = m0 + r;
+            float wv = 0.0f;
+            if (row < pc.M) {
+                unsigned blk = a0 + row * bpr * 36u + sbk * 36u;
+                unsigned dd = a_u32[blk];
+                float d = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
+                float dmin = zinc_half_to_float((unsigned short)(dd >> 16));
+                const unsigned char* scales = (const unsigned char*)(a_u32 + blk + 1u);
+                const unsigned char* qs = (const unsigned char*)(a_u32 + blk + 4u);
+                unsigned char sc, mn; zinc_q4k_scale_min((int)sb8, scales, &sc, &mn);
+                unsigned char qb = qs[(sb8 >> 1) * 32u + l];
+                unsigned nib = (sb8 & 1u) == 0u ? (qb & 0xFu) : (unsigned)(qb >> 4);
+                wv = d * (float)sc * (float)nib - dmin * (float)mn;
+            }
+            Ws[r * BK + l] = __float2half(wv);
+        }
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;
+            unsigned t = idx >> 5, l = idx & 31u;
+            unsigned packed = order[t0 + t];
+            As[l * BT + t] = (packed != INV) ? __float2half(A[(size_t)(packed >> 16) * pc.K + c * 32u + l]) : __float2half(0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned ks = 0; ks < 2; ks++) {
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a0f, a1f;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+            wmma::load_matrix_sync(a0f, &Ws[(fm * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(a1f, &Ws[((fm + 2u) * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(bf, &As[(ks * 16u) * BT + ft * 16u], BT);
+            wmma::mma_sync(c0, a0f, bf, c0);
+            wmma::mma_sync(c1, a1f, bf, c1);
+        }
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + fm * 16u], c0, BM, wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + (fm + 2u) * 16u], c1, BM, wmma::mem_col_major);
+    __syncthreads();
+    #pragma unroll
+    for (int u = 0; u < 16; u++) {
+        unsigned idx = tid + (unsigned)u * 256u;
+        unsigned t = idx >> 6, m = idx & 63u;
+        unsigned row = m0 + m;
+        if (row < pc.M) {
+            unsigned packed = order[t0 + t];
+            if (packed != INV) dst[(size_t)(packed >> 16) * pc.dst_tok_stride + (size_t)(packed & 0xFFFFu) * pc.M + row] = Cs[t * BM + m];
+        }
+    }
+}
+
 // ---- dmmv_q8_0_fast — whole-block-per-thread, d once, float4 x --------------
 extern "C" __global__ void dmmv_q8_0_fast(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x; if (row >= pc.M) return;

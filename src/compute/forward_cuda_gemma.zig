@@ -103,6 +103,9 @@ const BuildOrderPush = extern struct { T: u32, n_used: u32, n_experts: u32, rout
 // T2 grouped Tensor-core MoE-expert GEMM glue (match kernels.cu).
 const GatherOrderPush = extern struct { P: u32, K: u32, src_tok_stride: u32 };
 const ScatterOrderPush = extern struct { P: u32, M: u32, dst_tok_stride: u32 };
+// T2 v1: single-launch padded grouped TC GEMM (match kernels.cu).
+const BuildOrderPadPush = extern struct { T: u32, n_used: u32, n_experts: u32, routing_stride: u32, max_pos: u32 };
+const GroupedTCPush = extern struct { M: u32, K: u32, base: u32, gu_full: u32, dst_tok_stride: u32 };
 // Batched prefill GEMM (Effort 24): Y[T,M] = A[T,K]·W[M,K]^T over all T prompt
 // tokens at once (the gemm_*_tiled_v2 kernels). Must byte-match `struct GemmPush`
 // in kernels.cu. Offsets are in BYTES (the kernels shift them internally).
@@ -218,6 +221,9 @@ const Pipelines = struct {
     build_expert_order_off: CudaPipeline, // sort + per-expert offsets[n_experts+1]
     gather_by_order: CudaPipeline, // gather token acts into expert-grouped order
     scatter_by_order: CudaPipeline, // scatter grouped GEMM output back to (token,slot)
+    // T2 v1: single-launch padded grouped TC GEMM.
+    build_expert_order_padded: CudaPipeline, // sort + pad runs to 64-tile + per-tile expert id
+    gemm_q4k_experts_grouped_tc: CudaPipeline, // one-launch grouped Tensor-core gate/up GEMM
     // Effort 24: register-blocked prefill GEMMs (Q4_K / Q5_K / Q6_K / Q8_0 weights).
     gemm: [4]CudaPipeline,
     gemm_f32: CudaPipeline, // f32-weight prefill GEMM (gemma4-MoE batched router)
@@ -319,6 +325,9 @@ const BatchScratch = struct {
     yg_gate: CudaBuffer, // [P, ef] f32 grouped gate output
     yg_up: CudaBuffer, // [P, ef] f32 grouped up output
     expert_offsets: CudaBuffer, // [n_experts+1] u32 per-expert run boundaries in order[]
+    // T2 v1 single-launch: padded order + per-tile expert id (size 1 when unused).
+    padded_order: CudaBuffer, // [P + 64*n_experts] u32 ((token<<16|slot) or 0xFFFFFFFF)
+    tile_expert: CudaBuffer, // [(P + 64*n_experts)/64] u32 (expert id per 64-tile or 0xFFFFFFFF)
 };
 
 pub const ForwardGemma = struct {
@@ -572,6 +581,8 @@ pub const ForwardGemma = struct {
         pipes.build_expert_order_off = try pipeline.createPipeline(ctx, src.ptr, "build_expert_order_off");
         pipes.gather_by_order = try pipeline.createPipeline(ctx, src.ptr, "gather_by_order");
         pipes.scatter_by_order = try pipeline.createPipeline(ctx, src.ptr, "scatter_by_order");
+        pipes.build_expert_order_padded = try pipeline.createPipeline(ctx, src.ptr, "build_expert_order_padded");
+        pipes.gemm_q4k_experts_grouped_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_experts_grouped_tc");
         // Effort 24: batched-prefill GEMMs (Q4_K / Q5_K / Q6_K).
         pipes.gemm[0] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tiled_v2");
         pipes.gemm[1] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tiled_v2");
@@ -1583,6 +1594,9 @@ pub const ForwardGemma = struct {
             .yg_gate = try buffer.createBuffer(ctx, T * @max(@as(u32, 1), d.n_experts_used * d.n_ff) * f4),
             .yg_up = try buffer.createBuffer(ctx, T * @max(@as(u32, 1), d.n_experts_used * d.n_ff) * f4),
             .expert_offsets = try buffer.createBuffer(ctx, (@max(@as(u32, 1), d.n_experts) + 1) * @sizeOf(u32)),
+            // T2 v1: max_pos = P + 64*n_experts bounds the padded order; tiles = max_pos/64.
+            .padded_order = try buffer.createBuffer(ctx, @max(@as(u32, 1), T * d.n_experts_used + 64 * d.n_experts) * @sizeOf(u32)),
+            .tile_expert = try buffer.createBuffer(ctx, @max(@as(u32, 1), (T * d.n_experts_used >> 6) + d.n_experts + 2) * @sizeOf(u32)),
             // fp16 activation scratch: T × largest-activation halves (2 bytes each).
             // TC Q4_K GEMMs read A with K ∈ {n_embd (gate/up,Q/K/V), q_dim (O)};
             // size to the max of those and ff for headroom.
@@ -1596,7 +1610,7 @@ pub const ForwardGemma = struct {
 
     fn freeBatch(self: *ForwardGemma) void {
         if (self.batch) |*bb| {
-            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table, &bb.moe_norm_e, &bb.gate_e, &bb.up_e, &bb.geglu_e, &bb.down_e, &bb.moe_out_e, &bb.expert_order, &bb.act_f16, &bb.w_f16, &bb.a_grouped, &bb.yg_gate, &bb.yg_up, &bb.expert_offsets }) |buf| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.q, &bb.k, &bb.v, &bb.attn_out, &bb.o, &bb.ffn_norm, &bb.gate, &bb.up, &bb.geglu, &bb.down, &bb.shared, &bb.router_in, &bb.router_logits, &bb.router_table, &bb.moe_norm_e, &bb.gate_e, &bb.up_e, &bb.geglu_e, &bb.down_e, &bb.moe_out_e, &bb.expert_order, &bb.act_f16, &bb.w_f16, &bb.a_grouped, &bb.yg_gate, &bb.yg_up, &bb.expert_offsets, &bb.padded_order, &bb.tile_expert }) |buf| {
                 buffer.freeBuffer(buf);
             }
             self.batch = null;
@@ -2150,24 +2164,24 @@ pub const ForwardGemma = struct {
         self.submit(cmd);
     }
 
-    /// T2: routed gate/up experts via the fp16 Tensor cores. Sorts the T*n_used
-    /// (token,slot) work-items by expert id (`build_expert_order_off`, with per-expert
-    /// offsets), gathers each expert's token inputs contiguously (`gather_by_order`),
-    /// runs the existing `gemm_q4k_tc` ONCE per expert over its tokens (weight read
-    /// once, TC compute — the lever the scalar matvec can't reach), then scatters the
-    /// gate/up outputs back to the [T, n_used*ef] slot-major layout so the existing
-    /// GeGLU + Q5_1 down matvec proceed unchanged. NOT bit-identical (`gemm_q4k_tc`
-    /// is fp16) → rides the token-correctness tolerance gate, like the dense TC path.
-    /// Needs the per-expert offsets on the host (one readback) so cmd1 (norm + sort)
-    /// commitAndWaits; cmd2 (gather + per-expert GEMMs + scatter + GeGLU + down) is
-    /// async on the shared stream.
+    /// T2 v1: routed gate/up experts on the fp16 Tensor cores in a SINGLE launch each
+    /// (v0's per-expert launches + host readback were launch-bound, −27%).
+    /// `build_expert_order_padded` sorts the T*n_used (token,slot) work-items by expert
+    /// id, padding each expert's run to the 64-token GEMM tile and tagging each tile
+    /// with its expert id; `gemm_q4k_experts_grouped_tc` then runs the gemm_q4k_tc
+    /// dequant+wmma core ONCE over the whole padded order — picking the weight per
+    /// tile's expert and gathering A / scattering Y via the order, NO per-expert launch
+    /// and NO host readback (fully async on the shared stream). The gate/up land in the
+    /// [T, n_used*ef] slot-major buffers so the existing GeGLU + Q5_1 down matvec are
+    /// unchanged. fp16 → token-tolerance gate, not bit-identical to the matvec.
     fn moeRoutedExpertsTC(self: *ForwardGemma, L: u32, T: u32, b: *BatchScratch) !void {
         const d = self.d;
         const ctx = self.ctx;
         const n_used = d.n_experts_used;
         const ef = d.n_ff;
         const P = n_used * T;
-        const f4 = @sizeOf(f32);
+        const max_pos = P + 64 * d.n_experts; // bounds the padded order / tiles
+        const max_tiles = max_pos >> 6;
         const wpre2 = self.layer(L, "pre_ffw_norm_2.weight");
         const wgu = self.layer(L, "ffn_gate_up_exps.weight");
         const wde = self.layer(L, "ffn_down_exps.weight");
@@ -2176,44 +2190,24 @@ pub const ForwardGemma = struct {
         const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
         const rt_stride = 2 * n_used;
 
-        // cmd1: pre_ffw_norm_2 → moe_norm_e, then counting-sort (token,slot) by expert
-        // id into expert_order with per-expert offsets. commitAndWait so the host can
-        // read the offsets back (the per-expert GEMM dims are data-dependent).
-        var cmd1 = try command.beginCommand(ctx);
+        var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
-        cmd1.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wpre2.gpu_buffer, &b.moe_norm_e }, &rms, @sizeOf(RmsPush), 0);
-        const bo = BuildOrderPush{ .T = T, .n_used = n_used, .n_experts = d.n_experts, .routing_stride = rt_stride };
-        cmd1.dispatch(&self.pipes.build_expert_order_off, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.router_table, &b.expert_order, &b.expert_offsets }, &bo, @sizeOf(BuildOrderPush), 0);
-        cmd1.commitAndWait();
-
-        var offs: [257]u32 = undefined; // n_experts ≤ 256 (gemma-26b = 128); +1 boundary
-        buffer.download(ctx, &b.expert_offsets, std.mem.sliceAsBytes(offs[0 .. d.n_experts + 1]));
-
-        // cmd2: gather acts by expert → per-expert gemm_q4k_tc (gate, up) → scatter →
-        // GeGLU → Q5_1 down matvec (unchanged). Async on the shared stream.
-        var cmd2 = try command.beginCommand(ctx);
-        const gp = GatherOrderPush{ .P = P, .K = d.n_embd, .src_tok_stride = d.n_embd };
-        cmd2.dispatch(&self.pipes.gather_by_order, .{ ceilDiv(d.n_embd, 256), P, 1 }, .{ 256, 1, 1 }, &.{ &b.moe_norm_e, &b.expert_order, &b.a_grouped }, &gp, @sizeOf(GatherOrderPush), 0);
-        var e: u32 = 0;
-        while (e < d.n_experts) : (e += 1) {
-            const cnt = offs[e + 1] - offs[e];
-            if (cnt == 0) continue;
-            const xo = offs[e] * d.n_embd * f4;
-            const yo = offs[e] * ef * f4;
-            const pg = GemmPush{ .M = ef, .K = d.n_embd, .T = cnt, .a_offset = e * gu_full, .x_offset = xo, .y_offset = yo };
-            cmd2.dispatch(&self.pipes.gemm_q4k_tc, .{ ceilDiv(ef, 64), ceilDiv(cnt, 64), 1 }, .{ 256, 1, 1 }, &.{ &wgu.gpu_buffer, &b.a_grouped, &b.yg_gate }, &pg, @sizeOf(GemmPush), 0);
-            const pu = GemmPush{ .M = ef, .K = d.n_embd, .T = cnt, .a_offset = e * gu_full + gu_half, .x_offset = xo, .y_offset = yo };
-            cmd2.dispatch(&self.pipes.gemm_q4k_tc, .{ ceilDiv(ef, 64), ceilDiv(cnt, 64), 1 }, .{ 256, 1, 1 }, &.{ &wgu.gpu_buffer, &b.a_grouped, &b.yg_up }, &pu, @sizeOf(GemmPush), 0);
-        }
-        // Scatter the grouped gate/up back to the [T, n_used*ef] slot-major buffers.
-        const sc = ScatterOrderPush{ .P = P, .M = ef, .dst_tok_stride = n_used * ef };
-        cmd2.dispatch(&self.pipes.scatter_by_order, .{ ceilDiv(ef, 256), P, 1 }, .{ 256, 1, 1 }, &.{ &b.yg_gate, &b.expert_order, &b.gate_e }, &sc, @sizeOf(ScatterOrderPush), 0);
-        cmd2.dispatch(&self.pipes.scatter_by_order, .{ ceilDiv(ef, 256), P, 1 }, .{ 256, 1, 1 }, &.{ &b.yg_up, &b.expert_order, &b.up_e }, &sc, @sizeOf(ScatterOrderPush), 0);
+        cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wpre2.gpu_buffer, &b.moe_norm_e }, &rms, @sizeOf(RmsPush), 0);
+        // Padded counting sort: (token,slot) by expert, each run padded to a 64-tile,
+        // with a per-tile expert id — fully GPU-side (no readback).
+        const bo = BuildOrderPadPush{ .T = T, .n_used = n_used, .n_experts = d.n_experts, .routing_stride = rt_stride, .max_pos = max_pos };
+        cmd.dispatch(&self.pipes.build_expert_order_padded, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.router_table, &b.padded_order, &b.tile_expert }, &bo, @sizeOf(BuildOrderPadPush), 0);
+        // Gate (base 0) + up (base gu_half): one grouped TC GEMM each over all tiles.
+        const pg = GroupedTCPush{ .M = ef, .K = d.n_embd, .base = 0, .gu_full = gu_full, .dst_tok_stride = n_used * ef };
+        cmd.dispatch(&self.pipes.gemm_q4k_experts_grouped_tc, .{ ceilDiv(ef, 64), max_tiles, 1 }, .{ 256, 1, 1 }, &.{ &wgu.gpu_buffer, &b.moe_norm_e, &b.padded_order, &b.tile_expert, &b.gate_e }, &pg, @sizeOf(GroupedTCPush), 0);
+        const pu = GroupedTCPush{ .M = ef, .K = d.n_embd, .base = gu_half, .gu_full = gu_full, .dst_tok_stride = n_used * ef };
+        cmd.dispatch(&self.pipes.gemm_q4k_experts_grouped_tc, .{ ceilDiv(ef, 64), max_tiles, 1 }, .{ 256, 1, 1 }, &.{ &wgu.gpu_buffer, &b.moe_norm_e, &b.padded_order, &b.tile_expert, &b.up_e }, &pu, @sizeOf(GroupedTCPush), 0);
+        // GeGLU + Q5_1 down matvec (unchanged from the batched path).
         const sg = SwigluPush{ .N = T * n_used * ef };
-        cmd2.dispatch(&self.pipes.geglu, .{ ceilDiv(T * n_used * ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_e, &b.up_e, &b.geglu_e }, &sg, @sizeOf(SwigluPush), 0);
+        cmd.dispatch(&self.pipes.geglu, .{ ceilDiv(T * n_used * ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_e, &b.up_e, &b.geglu_e }, &sg, @sizeOf(SwigluPush), 0);
         const pd = ExpertsBatchPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = n_used * ef, .y_tok_stride = n_used * d.n_embd };
-        cmd2.dispatch(&self.pipes.dmmv_q5_1_experts_batched, .{ n_used * d.n_embd, T, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &b.geglu_e, &b.down_e, &b.router_table }, &pd, @sizeOf(ExpertsBatchPush), 0);
-        self.submit(cmd2);
+        cmd.dispatch(&self.pipes.dmmv_q5_1_experts_batched, .{ n_used * d.n_embd, T, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &b.geglu_e, &b.down_e, &b.router_table }, &pd, @sizeOf(ExpertsBatchPush), 0);
+        self.submit(cmd);
     }
 
     /// Batched gemma4-MoE routed-expert accumulate + combine over all T tokens
