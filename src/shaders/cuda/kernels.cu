@@ -2224,6 +2224,94 @@ extern "C" __global__ void gemm_q4k_experts_grouped_tc(const unsigned* a_u32, co
     }
 }
 
+// gemm_q5k_experts_grouped_tc — the DOWN-projection twin of
+// gemm_q4k_experts_grouped_tc. Same padded order + tile_expert (built once for the
+// gate/up step) and wmma core, but (1) the weight is Q5_K (176-byte super-blocks,
+// dequant copied verbatim from dmmv_q5k), and (2) A is the GeGLU/SwiGLU output
+// indexed per WORK-ITEM (token*n_used + slot) into the [P, K] buffer — not the
+// shared per-token norm row that gate/up read. dst scatter is identical. qwen
+// down is Q5_K on 36/40 layers (the other 4 are Q6_K → matvec fallback). fp16 →
+// token-tolerance, not bit-identical to the matvec.
+struct GroupedTCDownPush { unsigned M, K, slice, n_used, dst_tok_stride; };
+extern "C" __global__ void gemm_q5k_experts_grouped_tc(const unsigned char* a, const float* A, const unsigned* order, const unsigned* tile_expert, float* dst, GroupedTCDownPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u, INV=0xFFFFFFFFu;
+    __shared__ half Ws[BM*BK];
+    __shared__ half As[BK*BT];
+    __shared__ float Cs[BT*BM];
+    unsigned expert = tile_expert[blockIdx.y];
+    if (expert == INV) return; // unused padded tile
+    unsigned m0 = blockIdx.x*BM, t0 = blockIdx.y*BT;
+    unsigned bpr = pc.K >> 8;     // Q5_K super-blocks per weight row
+    unsigned nchunk = pc.K >> 5;  // 32-chunks per row (== 8 sub-blocks/super-block)
+    unsigned tid = threadIdx.x;
+    const unsigned char* a_e = a + (size_t)expert * pc.slice; // this tile's expert weight
+    unsigned warp = tid >> 5, fm = warp >> 2, ft = warp & 3u;
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> c0, c1;
+    wmma::fill_fragment(c0, 0.0f);
+    wmma::fill_fragment(c1, 0.0f);
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        unsigned sbk = c >> 3, sb8 = c & 7u; // super-block, sub-block (0..7)
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;
+            unsigned r = idx >> 5, l = idx & 31u;
+            unsigned row = m0 + r;
+            float wv = 0.0f;
+            if (row < pc.M) {
+                const unsigned char* blk = a_e + (size_t)row * bpr * 176u + (size_t)sbk * 176u;
+                float d = zinc_half_to_float((unsigned short)((unsigned)blk[0] | ((unsigned)blk[1] << 8)));
+                float dmin = zinc_half_to_float((unsigned short)((unsigned)blk[2] | ((unsigned)blk[3] << 8)));
+                const unsigned char* scales = blk + 4;  // 12 bytes (6-bit packed)
+                const unsigned char* qh = blk + 16;     // 32 bytes (1 high bit/elem)
+                const unsigned char* qs = blk + 48;     // 128 bytes (4-bit low)
+                unsigned char sc, mn; zinc_q4k_scale_min((int)sb8, scales, &sc, &mn);
+                unsigned char ql = qs[(sb8 >> 1) * 32u + l];
+                unsigned nib = (sb8 & 1u) == 0u ? (ql & 0xFu) : (unsigned)(ql >> 4);
+                unsigned bit = (qh[l] >> sb8) & 1u;
+                unsigned q5 = nib + (bit ? 16u : 0u);
+                wv = d * (float)sc * (float)q5 - dmin * (float)mn;
+            }
+            Ws[r * BK + l] = __float2half(wv);
+        }
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;
+            unsigned t = idx >> 5, l = idx & 31u;
+            unsigned packed = order[t0 + t];
+            // A row = work-item (token*n_used + slot) into the [P, K] SwiGLU buffer.
+            size_t arow = (size_t)(packed >> 16) * pc.n_used + (size_t)(packed & 0xFFFFu);
+            As[l * BT + t] = (packed != INV) ? __float2half(A[arow * pc.K + c * 32u + l]) : __float2half(0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned ks = 0; ks < 2; ks++) {
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a0f, a1f;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+            wmma::load_matrix_sync(a0f, &Ws[(fm * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(a1f, &Ws[((fm + 2u) * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(bf, &As[(ks * 16u) * BT + ft * 16u], BT);
+            wmma::mma_sync(c0, a0f, bf, c0);
+            wmma::mma_sync(c1, a1f, bf, c1);
+        }
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + fm * 16u], c0, BM, wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + (fm + 2u) * 16u], c1, BM, wmma::mem_col_major);
+    __syncthreads();
+    #pragma unroll
+    for (int u = 0; u < 16; u++) {
+        unsigned idx = tid + (unsigned)u * 256u;
+        unsigned t = idx >> 6, m = idx & 63u;
+        unsigned row = m0 + m;
+        if (row < pc.M) {
+            unsigned packed = order[t0 + t];
+            if (packed != INV) dst[(size_t)(packed >> 16) * pc.dst_tok_stride + (size_t)(packed & 0xFFFFu) * pc.M + row] = Cs[t * BM + m];
+        }
+    }
+}
+
 // ---- dmmv_q8_0_fast — whole-block-per-thread, d once, float4 x --------------
 extern "C" __global__ void dmmv_q8_0_fast(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x; if (row >= pc.M) return;
