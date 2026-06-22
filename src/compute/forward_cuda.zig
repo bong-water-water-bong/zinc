@@ -155,6 +155,11 @@ const ExpertsPush = extern struct { M: u32, K: u32, slice: u32, x_stride: u32, n
 const ExpertsBatchPush = extern struct { M: u32, K: u32, slice: u32, x_stride: u32, n_used: u32, base: u32, routing_stride: u32, x_tok_stride: u32, y_tok_stride: u32 };
 const MoeAccBatchPush = extern struct { N: u32, n_used: u32, src_stride: u32, a_tok_stride: u32, b_tok_stride: u32, routing_stride: u32 };
 const MatvecBatchPush = extern struct { M: u32, K: u32, x_tok_stride: u32, y_tok_stride: u32 };
+// T2 (qwen MoE port): grouped Tensor-core routed-expert gate/up GEMM. Twins of
+// the gemma push structs (forward_cuda_gemma.zig) — the SAME kernels
+// (build_expert_order_padded + gemm_q4k_experts_grouped_tc) serve both paths.
+const BuildOrderPadPush = extern struct { T: u32, n_used: u32, n_experts: u32, routing_stride: u32, max_pos: u32 };
+const GroupedTCPush = extern struct { M: u32, K: u32, base: u32, gu_full: u32, dst_tok_stride: u32 };
 // Effort 26 T0 (qwen batched prefill): cuBLAS fp16-TC dense GEMM helpers + the
 // batched SSM/util kernels. Must byte-match kernels.cu.
 const F32ToF16Push = extern struct { N: u32 };
@@ -308,6 +313,10 @@ const Pipelines = struct {
     dmmv_f32_batched: CudaPipeline, // router logits + shared gate scalar (all T)
     moe_weighted_acc_batched: CudaPipeline, // routed combine (all T)
     sigmoid_scale_acc_batched: CudaPipeline, // shared-expert gating (all T)
+    // T2 (qwen MoE port): single-launch padded grouped Tensor-core gate/up GEMM
+    // over the routed experts (ZINC_MOE_TC). Same kernels as the gemma path.
+    build_expert_order_padded: CudaPipeline,
+    gemm_q4k_experts_grouped_tc: CudaPipeline,
     // Effort 26 T0: batched-prefill GEMM + SSM kernels (qwen prefillBatched).
     dequant_q4k_to_f16: CudaPipeline, // full Q4_K weight [M,K] → fp16 for cuBLAS
     dequant_q6k_to_f16: CudaPipeline, // full Q6_K weight [M,K] → fp16 for cuBLAS
@@ -361,6 +370,10 @@ const BatchScratch = struct {
     swiglu_e: CudaBuffer, // [T, n_used*ef] routed SwiGLU
     down_e: CudaBuffer, // [T, n_used*n_embd] routed down (slot-major per token)
     gate_scalar_e: CudaBuffer, // [T] shared-expert sigmoid gate logit per token
+    // T2 (qwen MoE port): padded counting-sort order + per-tile expert id for the
+    // single-launch grouped-TC gate/up GEMM (ZINC_MOE_TC). Stubs on dense qwen35.
+    padded_order: CudaBuffer, // [P + 64*n_experts] u32 ((token<<16|slot) or INV)
+    tile_expert: CudaBuffer, // [(P + 64*n_experts)/64] u32 (expert id per 64-tile)
 };
 
 /// Effort 28 4c: token-major [B, dim] activation scratch for batched decode.
@@ -575,6 +588,24 @@ pub const ForwardCuda = struct {
     use_cublas_q6: bool = false, // also route Q6_K dense GEMMs through cuBLAS
     use_cublas_q8: bool = false, // also route Q8_0 dense GEMMs through cuBLAS (qwen36 shexp)
     cublas_min_t: u32 = 128, // only use cuBLAS once T amortizes the dequant round-trip
+    // T2 (qwen MoE port): route the routed gate/up experts through the single-launch
+    // padded grouped Tensor-core GEMM (build_expert_order_padded +
+    // gemm_q4k_experts_grouped_tc) instead of the dmmv_*_experts_batched matvec.
+    // Q4_K-only (the down + any non-Q4_K gate/up layer stay on the matvec). fp16 →
+    // token-tolerance gate, not bit-identical. DEFAULT-ON (opt out ZINC_MOE_TC=0/off),
+    // T-gated by moe_tc_min_t (the padded tiles are mostly empty at small T). An
+    // EXPLICIT truthy ZINC_MOE_TC=1 bypasses the T-gate (lets validate_catalog
+    // exercise the TC path with the short catalog prompt). Mirrors the gemma path.
+    use_tc_experts: bool = false,
+    tc_experts_forced: bool = false,
+    // Crossover measured on the 4090 / qwen36-35b-a3b (256 experts, 8 active): the
+    // grouped-TC win is gated higher than the gemma path's 512 because 256 experts
+    // each pad to a 64-token tile — at small T the per-expert run (≈T·8/256) is far
+    // below 64, so the padded tiles are mostly empty and the wasted TC work cancels
+    // the weight-traffic win. Interleaved A/B: T=1037 neutral (≈+0.7%, in boost
+    // noise), T=1536 win (TC ≥ matvec every round, ≈+7.7% median), T=2000 clean
+    // +8.5% (3/3). Gate at 1536 = the zero-regression crossover.
+    moe_tc_min_t: u32 = 1536,
 
     // Effort 28 inc 4 — per-SEQUENCE slot state for batched decode (null until
     // allocSlotState; freed by freeSlotState). Mirrors the gemma slot KV but also
@@ -675,6 +706,9 @@ pub const ForwardCuda = struct {
         pipes.dmmv_f32_batched = try pipeline.createPipeline(ctx, src.ptr, "dmmv_f32_batched");
         pipes.moe_weighted_acc_batched = try pipeline.createPipeline(ctx, src.ptr, "moe_weighted_acc_batched");
         pipes.sigmoid_scale_acc_batched = try pipeline.createPipeline(ctx, src.ptr, "sigmoid_scale_acc_batched");
+        // T2 (qwen MoE port): grouped Tensor-core routed gate/up experts.
+        pipes.build_expert_order_padded = try pipeline.createPipeline(ctx, src.ptr, "build_expert_order_padded");
+        pipes.gemm_q4k_experts_grouped_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_experts_grouped_tc");
         // Effort 26 T0: batched-prefill GEMM + SSM kernels.
         pipes.dequant_q4k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q4k_to_f16");
         pipes.dequant_q6k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q6k_to_f16");
@@ -1229,6 +1263,9 @@ pub const ForwardCuda = struct {
         // Effort 29 T2: token-batched MoE FFN (qwen36). DEFAULT-ON; opt out to the
         // proven per-token loop via ZINC_QWEN_MOE_BATCHED=0 (for the A/B baseline).
         const moe_batched = qwenMoeBatchedOn();
+        // T2 (qwen MoE port): grouped Tensor-core routed gate/up experts (ZINC_MOE_TC).
+        self.use_tc_experts = moeTcDefaultOn();
+        self.tc_experts_forced = moeTcForced();
 
         const b = try self.ensureBatch(T);
 
@@ -1494,10 +1531,34 @@ pub const ForwardCuda = struct {
         cmd.dispatch(&self.pipes.softmax_topk_batched, .{ T, 1, 1 }, .{ 64, 1, 1 }, &.{ &b.router_logits_e, &b.router_table_e }, &tk, @sizeOf(TopkPush), 0);
 
         // --- Routed experts: gate/up → SwiGLU → down, slot-major per token. -------
-        const pg = ExpertsBatchPush{ .M = ef, .K = d.n_embd, .slice = gate_slice, .x_stride = 0, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = d.n_embd, .y_tok_stride = n_used * ef };
-        cmd.dispatch(gate_pipe, .{ n_used * ef, T, 1 }, .{ 64, 1, 1 }, &.{ &wge.gpu_buffer, &b.ffn_norm, &b.gate_e, &b.router_table_e }, &pg, @sizeOf(ExpertsBatchPush), 0);
-        const pu = ExpertsBatchPush{ .M = ef, .K = d.n_embd, .slice = up_slice, .x_stride = 0, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = d.n_embd, .y_tok_stride = n_used * ef };
-        cmd.dispatch(up_pipe, .{ n_used * ef, T, 1 }, .{ 64, 1, 1 }, &.{ &wue.gpu_buffer, &b.ffn_norm, &b.up_e, &b.router_table_e }, &pu, @sizeOf(ExpertsBatchPush), 0);
+        // T2 port: when ZINC_MOE_TC is on (T-gated) and both gate/up are Q4_K, run a
+        // single-launch padded grouped Tensor-core GEMM each instead of the per-token
+        // matvec — the matvec re-reads every routed token's expert weight (≈T·n_used/
+        // n_experts× redundant), the grouped TC reads each expert weight ~once/tile.
+        // The down + any non-Q4_K layer (the model's 1 Q5_K gate/up layer) stay on the
+        // matvec. fp16 → token-tolerance, not bit-identical.
+        const use_tc = self.use_tc_experts and (self.tc_experts_forced or T >= self.moe_tc_min_t) and
+            wge.info.type_ == .q4_k and wue.info.type_ == .q4_k;
+        if (use_tc) {
+            const P = n_used * T;
+            const max_pos = P + 64 * d.n_experts; // bounds the padded order / tiles
+            const max_tiles = max_pos >> 6;
+            // Padded counting sort of the (token,slot) work-items by expert, each run
+            // padded to a 64-tile with a per-tile expert id — GPU-side, no readback.
+            const bo = BuildOrderPadPush{ .T = T, .n_used = n_used, .n_experts = d.n_experts, .routing_stride = rt_stride, .max_pos = max_pos };
+            cmd.dispatch(&self.pipes.build_expert_order_padded, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.router_table_e, &b.padded_order, &b.tile_expert }, &bo, @sizeOf(BuildOrderPadPush), 0);
+            // gate (wge) + up (wue) are SEPARATE tensors (gemma fuses them) → per-expert
+            // stride = the whole slice, base 0. A = the per-token ffn_norm row.
+            const pg = GroupedTCPush{ .M = ef, .K = d.n_embd, .base = 0, .gu_full = gate_slice, .dst_tok_stride = n_used * ef };
+            cmd.dispatch(&self.pipes.gemm_q4k_experts_grouped_tc, .{ ceilDiv(ef, 64), max_tiles, 1 }, .{ 256, 1, 1 }, &.{ &wge.gpu_buffer, &b.ffn_norm, &b.padded_order, &b.tile_expert, &b.gate_e }, &pg, @sizeOf(GroupedTCPush), 0);
+            const pu = GroupedTCPush{ .M = ef, .K = d.n_embd, .base = 0, .gu_full = up_slice, .dst_tok_stride = n_used * ef };
+            cmd.dispatch(&self.pipes.gemm_q4k_experts_grouped_tc, .{ ceilDiv(ef, 64), max_tiles, 1 }, .{ 256, 1, 1 }, &.{ &wue.gpu_buffer, &b.ffn_norm, &b.padded_order, &b.tile_expert, &b.up_e }, &pu, @sizeOf(GroupedTCPush), 0);
+        } else {
+            const pg = ExpertsBatchPush{ .M = ef, .K = d.n_embd, .slice = gate_slice, .x_stride = 0, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = d.n_embd, .y_tok_stride = n_used * ef };
+            cmd.dispatch(gate_pipe, .{ n_used * ef, T, 1 }, .{ 64, 1, 1 }, &.{ &wge.gpu_buffer, &b.ffn_norm, &b.gate_e, &b.router_table_e }, &pg, @sizeOf(ExpertsBatchPush), 0);
+            const pu = ExpertsBatchPush{ .M = ef, .K = d.n_embd, .slice = up_slice, .x_stride = 0, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = d.n_embd, .y_tok_stride = n_used * ef };
+            cmd.dispatch(up_pipe, .{ n_used * ef, T, 1 }, .{ 64, 1, 1 }, &.{ &wue.gpu_buffer, &b.ffn_norm, &b.up_e, &b.router_table_e }, &pu, @sizeOf(ExpertsBatchPush), 0);
+        }
         const sg = SwigluPush{ .N = T * n_used * ef };
         cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(T * n_used * ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_e, &b.up_e, &b.swiglu_e }, &sg, @sizeOf(SwigluPush), 0);
         const pd = ExpertsBatchPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = n_used * ef, .y_tok_stride = n_used * d.n_embd };
@@ -1611,13 +1672,15 @@ pub const ForwardCuda = struct {
             .swiglu_e = try buffer.createBuffer(ctx, e_gu),
             .down_e = try buffer.createBuffer(ctx, e_dn),
             .gate_scalar_e = try buffer.createBuffer(ctx, if (moe) T * f4 else f4),
+            .padded_order = try buffer.createBuffer(ctx, if (moe) @max(@as(u32, 1), T * nu + 64 * d.n_experts) * @sizeOf(u32) else f4),
+            .tile_expert = try buffer.createBuffer(ctx, if (moe) @max(@as(u32, 1), (T * nu >> 6) + d.n_experts + 2) * @sizeOf(u32) else f4),
         };
         return &self.batch.?;
     }
 
     fn freeBatch(self: *ForwardCuda) void {
         if (self.batch) |*bb| {
-            inline for (.{ &bb.hidden, &bb.norm, &bb.o, &bb.qfull, &bb.q, &bb.attn_gate, &bb.k, &bb.v, &bb.attn_out, &bb.qkv, &bb.conv_out, &bb.z, &bb.alpha, &bb.beta, &bb.delta_out, &bb.ssm_gn, &bb.ffn_norm, &bb.gate_ff, &bb.up_ff, &bb.swiglu_ff, &bb.act_f16, &bb.w_f16, &bb.router_logits_e, &bb.router_table_e, &bb.gate_e, &bb.up_e, &bb.swiglu_e, &bb.down_e, &bb.gate_scalar_e }) |buf| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.o, &bb.qfull, &bb.q, &bb.attn_gate, &bb.k, &bb.v, &bb.attn_out, &bb.qkv, &bb.conv_out, &bb.z, &bb.alpha, &bb.beta, &bb.delta_out, &bb.ssm_gn, &bb.ffn_norm, &bb.gate_ff, &bb.up_ff, &bb.swiglu_ff, &bb.act_f16, &bb.w_f16, &bb.router_logits_e, &bb.router_table_e, &bb.gate_e, &bb.up_e, &bb.swiglu_e, &bb.down_e, &bb.gate_scalar_e, &bb.padded_order, &bb.tile_expert }) |buf| {
                 buffer.freeBuffer(buf);
             }
             self.batch = null;
@@ -3002,6 +3065,23 @@ fn qwenMoeBatchedOn() bool {
 
 fn ceilDiv(a: u32, b: u32) u32 {
     return (a + b - 1) / b;
+}
+
+/// T2 (qwen MoE port): grouped Tensor-core routed gate/up experts. DEFAULT-ON;
+/// opt out with ZINC_MOE_TC=0/off/false/no (the A/B kill-switch to the matvec).
+fn moeTcDefaultOn() bool {
+    const v = std.posix.getenv("ZINC_MOE_TC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+/// T2: true only when ZINC_MOE_TC is an EXPLICIT truthy value → run the grouped TC
+/// experts at ANY T (bypass moe_tc_min_t) so validate_catalog can exercise the path
+/// with the short catalog prompt. Unset = default-on but T-gated; falsy = off.
+fn moeTcForced() bool {
+    const v = std.posix.getenv("ZINC_MOE_TC") orelse return false;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
 
 fn boolU32(b: bool) u32 {
