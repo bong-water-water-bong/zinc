@@ -2224,6 +2224,94 @@ extern "C" __global__ void gemm_q4k_experts_grouped_tc(const unsigned* a_u32, co
     }
 }
 
+// ---- T2 v1 (down): SINGLE-LAUNCH grouped Tensor-core Q5_1 MoE-down GEMM -------
+// Twin of gemm_q4k_experts_grouped_tc for the routed-expert DOWN projection,
+// whose weight is Q5_1 (gemma ffn_down_exps). Reuses the SAME padded order +
+// per-tile expert id (b.padded_order / b.tile_expert) the gate/up GEMM built, so
+// no extra sort. Two differences from the Q4_K gate/up kernel:
+//   (1) weight dequant is Q5_1 — each 32-wide GEMM K-chunk maps to exactly one
+//       Q5_1 block (24 bytes: d|m halfs, 32-bit qh, 16 nibble bytes); value =
+//       d*(nib | high-bit) + m, matching dmmv_q5_1_experts_batched bit-for-bit.
+//   (2) A is the GeGLU output [P, ef] indexed by WORK-ITEM (token*n_used+slot),
+//       not by token — so the A-gather row uses both halves of the packed order
+//       entry (the gate/up A was the shared per-token moe_norm row, x_stride=0).
+// dst scatter matches gate/up (dst_tok_stride = n_used*n_embd, per-slot *M).
+// fp16 -> token-tolerance gate, not bit-identical to the matvec.
+struct GroupedTCDownPush { unsigned M, K, slice, n_used, dst_tok_stride; };
+extern "C" __global__ void gemm_q5_1_experts_grouped_tc(const unsigned char* a, const float* A, const unsigned* order, const unsigned* tile_expert, float* dst, GroupedTCDownPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u, INV=0xFFFFFFFFu;
+    __shared__ half Ws[BM*BK];
+    __shared__ half As[BK*BT];
+    __shared__ float Cs[BT*BM];
+    unsigned expert = tile_expert[blockIdx.y];
+    if (expert == INV) return; // unused padded tile
+    unsigned m0 = blockIdx.x*BM, t0 = blockIdx.y*BT;
+    unsigned bpr = pc.K >> 5;     // Q5_1 blocks per weight row (== nchunk)
+    unsigned nchunk = pc.K >> 5;
+    unsigned tid = threadIdx.x;
+    const unsigned char* a_e = a + (size_t)expert * pc.slice; // this tile's expert weight
+    unsigned warp = tid >> 5, fm = warp >> 2, ft = warp & 3u;
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> c0, c1;
+    wmma::fill_fragment(c0, 0.0f);
+    wmma::fill_fragment(c1, 0.0f);
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;
+            unsigned r = idx >> 5, l = idx & 31u;
+            unsigned row = m0 + r;
+            float wv = 0.0f;
+            if (row < pc.M) {
+                const unsigned char* blkp = a_e + (size_t)row * bpr * 24u + (size_t)c * 24u;
+                float d = zinc_half_to_float((unsigned short)((unsigned)blkp[0] | ((unsigned)blkp[1] << 8)));
+                float m = zinc_half_to_float((unsigned short)((unsigned)blkp[2] | ((unsigned)blkp[3] << 8)));
+                unsigned qh = (unsigned)blkp[4] | ((unsigned)blkp[5] << 8) | ((unsigned)blkp[6] << 16) | ((unsigned)blkp[7] << 24);
+                const unsigned char* qs = blkp + 8;
+                unsigned nib = (l < 16u) ? (unsigned)(qs[l] & 0xFu) : (unsigned)(qs[l - 16u] >> 4);
+                unsigned q5 = nib | (((qh >> l) & 1u) << 4);
+                wv = d * (float)q5 + m;
+            }
+            Ws[r * BK + l] = __float2half(wv);
+        }
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            unsigned idx = tid + (unsigned)u * 256u;
+            unsigned t = idx >> 5, l = idx & 31u;
+            unsigned packed = order[t0 + t];
+            // A row = work-item (token*n_used + slot) into the [P, K] GeGLU buffer.
+            size_t arow = (size_t)(packed >> 16) * pc.n_used + (size_t)(packed & 0xFFFFu);
+            As[l * BT + t] = (packed != INV) ? __float2half(A[arow * pc.K + c * 32u + l]) : __float2half(0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned ks = 0; ks < 2; ks++) {
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a0f, a1f;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+            wmma::load_matrix_sync(a0f, &Ws[(fm * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(a1f, &Ws[((fm + 2u) * 16u) * BK + ks * 16u], BK);
+            wmma::load_matrix_sync(bf, &As[(ks * 16u) * BT + ft * 16u], BT);
+            wmma::mma_sync(c0, a0f, bf, c0);
+            wmma::mma_sync(c1, a1f, bf, c1);
+        }
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + fm * 16u], c0, BM, wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft * 16u) * BM + (fm + 2u) * 16u], c1, BM, wmma::mem_col_major);
+    __syncthreads();
+    #pragma unroll
+    for (int u = 0; u < 16; u++) {
+        unsigned idx = tid + (unsigned)u * 256u;
+        unsigned t = idx >> 6, m = idx & 63u;
+        unsigned row = m0 + m;
+        if (row < pc.M) {
+            unsigned packed = order[t0 + t];
+            if (packed != INV) dst[(size_t)(packed >> 16) * pc.dst_tok_stride + (size_t)(packed & 0xFFFFu) * pc.M + row] = Cs[t * BM + m];
+        }
+    }
+}
+
 // ---- dmmv_q8_0_fast — whole-block-per-thread, d once, float4 x --------------
 extern "C" __global__ void dmmv_q8_0_fast(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x; if (row >= pc.M) return;
