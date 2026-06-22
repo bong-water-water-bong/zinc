@@ -57,6 +57,22 @@ naive `cublasGemmGroupedBatched` underutilizes TC at N≈8. Mitigations: (a) the
 (b) consider a fused-dequant MMQ expert kernel rather than cuBLAS so skinny-N stays efficient.
 Microbench-gate vs `dmmv_q4k_experts_batched` at realistic per-expert N before wiring.
 
+**De-risk CONFIRMED (2026-06-22):** `dmmv_q4k_experts_batched` (kernels.cu:1743) launches grid
+`(n_used·M, T)` = **one block per (token, expert-slot, output-row)**; each block reads its expert's
+weight row keyed by `expert_ids[t][e]` independently. So **every token routed to an expert re-reads
+that expert's entire weight** — ≈ `T·top_k/n_experts` (8-64×) redundant Q4_K weight reads, and the
+matvec is weight-traffic-bound (AI ≈ 4 ops/byte). A grouped TC GEMM reads each expert weight ~once
+→ ~5-16× less weight traffic at realistic N. This also explains why e29's *matvec restructuring*
+(cycles 4/6) was negative on the **5090** but is worth re-testing on the **4090**: the 5090's 96 MB
+L2 serves the re-reads (traffic cut hidden); the 4090 (72 MB L2, lower BW, 16-21 GB MoE models that
+overflow L2) exposes the DRAM traffic the grouping removes. **Implementation = a fresh multi-hour
+kernel cycle:** (1) gather-by-expert index (histogram → prefix-sum offsets → scatter token-slot ids
+into per-expert buckets); (2) per-expert gather token acts → fp16, dequant expert weight (reuse
+`dequant_q4k_to_f16`) → cuBLAS fp16 GEMM (or fused `gemm_q4k_tc`), scatter back; (3) wire a
+`moeFfnBlockBatchedTC` variant, gated, validate bit-close + 5/5. **Microbench step 1 (go/no-go):**
+time `dmmv_q4k_experts_batched` (N re-reads) vs dequant-once+cuBLAS at M=512/704, K=2048,
+N∈{8,16,32,64} on the 4090 before any gather/scatter wiring.
+
 ### T1 — Fused dequant + Tensor-core dense GEMM (MMQ-class)  *(the dense 6-16× rows; Effort-29's T1a, the hard one)*
 Bring `gemm_q4k_tc`/`_f16a` up to cuBLAS-class throughput so it beats cuBLAS+round-trip:
 **cp.async double-buffering** (overlap the next tile's global load + Q4_K dequant with the current
