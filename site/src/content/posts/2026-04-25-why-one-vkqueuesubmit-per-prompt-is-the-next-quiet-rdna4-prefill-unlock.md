@@ -33,7 +33,7 @@ seoDescription: "Why Gemma 4 prefill on AMD RDNA4 should use one Vulkan command 
 
 Gemma 4 is a useful stress test for Vulkan LLM inference because its 60-layer prefill path makes every avoidable `vkQueueSubmit` visible. On AMD RDNA4, recording one command buffer per prompt removes dozens of CPU submission gaps without changing the shader math, so the same fix helps Gemma 4 and the broader ZINC prefill path.
 
-The 0.6-second `CPU and submit gap` bar in the [RDNA4 prefill phase budget](/blog/2026-04-18-why-rdna4-prefill-for-qwen-3-5-is-stuck-at-25-tok-s) was the most embarrassing slice of that chart. The kernels were doing the work the kernels are supposed to do. The reason 600 milliseconds of wall time on a Qwen3.5-35B prompt was sitting on the CPU side of the timeline is that the Vulkan backend was issuing one `vkQueueSubmit` per layer, and the cost of a `vkQueueSubmit` on `amdgpu` is not zero. On a 60-layer model that adds up fast.
+The 0.6-second `CPU and submit gap` bar in the [RDNA4 prefill phase budget](/blog/2026-04-18-why-rdna4-prefill-for-qwen-3-5-is-stuck-at-25-tok-s/) was the most embarrassing slice of that chart. The kernels were doing the work the kernels are supposed to do. The reason 600 milliseconds of wall time on a Qwen3.5-35B prompt was sitting on the CPU side of the timeline is that the Vulkan backend was issuing one `vkQueueSubmit` per layer, and the cost of a `vkQueueSubmit` on `amdgpu` is not zero. On a 60-layer model that adds up fast.
 
 The shape of the fix is small. Record one command buffer per prompt instead of one per layer. Submit it once. Wait once. The shader inner loops are unchanged, the descriptor sets are unchanged, the pipeline cache is unchanged. The change is purely about command-buffer granularity, and it is the kind of plumbing decision that sits well below the "we ported a kernel" headline but compounds with everything above it.
 
@@ -96,7 +96,7 @@ The table is an estimate, not a benchmark. The point is the order of magnitude, 
 
 ## What comes next
 
-The per-prompt submit recording lands inside the same `prefillBatched` entry point that yesterday's [Gemma 4 head-dim work](/blog/2026-04-24-the-single-push-constant-blocking-gemma-4-prefill-on-rdna4) is targeting. The recorder change is a few hundred lines of Zig, mostly bookkeeping for the barrier ledger and the descriptor pool sizing. The per-prompt fence wait replaces the per-layer fence stack with a single `VkFence` and a `VkSemaphore` chain for the host-readable end-of-prompt signal.
+The per-prompt submit recording lands inside the same `prefillBatched` entry point that yesterday's [Gemma 4 head-dim work](/blog/2026-04-24-the-single-push-constant-blocking-gemma-4-prefill-on-rdna4/) is targeting. The recorder change is a few hundred lines of Zig, mostly bookkeeping for the barrier ledger and the descriptor pool sizing. The per-prompt fence wait replaces the per-layer fence stack with a single `VkFence` and a `VkSemaphore` chain for the host-readable end-of-prompt signal.
 
 The follow-on work is the descriptor buffer port. Once the per-prompt recorder lands and the descriptor pool grows by 60x to hold every layer's sets, the right move is to skip the pool entirely and build the descriptor data once into a `VK_EXT_descriptor_buffer` allocation that the command buffer addresses directly. That move is mechanical after the recording shape is right, and it is the same shape the Metal port has been using through `MTLArgumentEncoder` from the start.
 

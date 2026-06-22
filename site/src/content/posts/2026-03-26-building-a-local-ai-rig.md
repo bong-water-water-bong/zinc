@@ -20,7 +20,7 @@ No GPU plans. No AI ambitions. Just a fast, quiet box for running trading strate
 
 ![Amazon order for AMD Ryzen 9800X3D, ASRock X870E Taichi, DDR5-6000, Noctua fans, ASUS ProArt PA602 case — $2,009 before the GPU](/blog/order.jpg)
 
-Then I started thinking about local LLM inference on AMD hardware — the gap I wrote about in [why we are building ZINC](/blog/2026-03-25-why-we-are-building-zinc). The CPU, memory, and motherboard were already sitting on my desk, tuned and stable. All I needed was a GPU.
+Then I started thinking about local LLM inference on AMD hardware — the gap I wrote about in [why we are building ZINC](/blog/2026-03-25-why-we-are-building-zinc/). The CPU, memory, and motherboard were already sitting on my desk, tuned and stable. All I needed was a GPU.
 
 That one decision changed the whole project.
 
@@ -141,7 +141,7 @@ Here is the full parts list with links:
 
 The node runs Ubuntu 24.04.3 LTS with the Vulkan driver pinned to Mesa 25.0.7 (newer versions caused a 14% RADV regression), `RADV_PERFTEST=coop_matrix` for cooperative matrix support, and GPU ECC disabled for extra bandwidth. The llama.cpp baseline on this hardware is 107 tok/s decode on Qwen3.5-35B-A3B Q4_K_XL.
 
-I edit code on my laptop and push to this machine over SSH. The [ZINC optimization loop](/blog/2026-03-25-why-we-are-building-zinc) rsyncs source, builds, runs, measures, and iterates — sometimes overnight, sometimes for dozens of cycles. The machine needs to be thermally stable for that. Quiet enough that I forget it is running. And producing numbers I can trust.
+I edit code on my laptop and push to this machine over SSH. The [ZINC optimization loop](/blog/2026-03-25-why-we-are-building-zinc/) rsyncs source, builds, runs, measures, and iterates — sometimes overnight, sometimes for dozens of cycles. The machine needs to be thermally stable for that. Quiet enough that I forget it is running. And producing numbers I can trust.
 
 The fact that this started as a trading workstation turned out to be a feature. An overclocking-grade platform — fast CPU, tuned memory, real VRMs — is exactly the kind of foundation you want for sustained GPU inference work. The 9800X3D handles Zig compilation, SSH orchestration, and host-side decode overhead without breaking a sweat. The DDR5 stays out of the way — and the price of that RAM kit has tripled since I bought it, so I am glad I did not wait. The VRMs stay cool.
 

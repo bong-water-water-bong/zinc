@@ -41,11 +41,11 @@ Quick answer: Mixture of Experts inference is not just "run fewer weights." A GP
 | Top-k selection | CPU readbacks destroy decode latency if routing leaves the GPU. |
 | Expert execution | Sparse choices reduce compute but fragment memory access. |
 | Shared expert | Adds a dense side path that every token still pays. |
-| Related ZINC path | [Qwen3.6 architecture](/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc), [RDNA4 debugging](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4), and [Getting Started](/zinc/docs/getting-started). |
+| Related ZINC path | [Qwen3.6 architecture](/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc/), [RDNA4 debugging](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4/), and [Getting Started](/zinc/docs/getting-started/). |
 
-Mixture of Experts (MoE) models are the current answer to a very practical LLM question: how do you make the model bigger without paying dense-model cost on every token? The short answer is sparse routing. Instead of running one giant feed-forward network everywhere, an MoE model asks a router which experts should handle the current token, runs only the top-k experts, and combines their outputs. The long answer is that MoE inference lives or dies on the routing implementation, which is exactly why [ZINC](/zinc) treats MoE as a first-class runtime problem instead of "just another model family."
+Mixture of Experts (MoE) models are the current answer to a very practical LLM question: how do you make the model bigger without paying dense-model cost on every token? The short answer is sparse routing. Instead of running one giant feed-forward network everywhere, an MoE model asks a router which experts should handle the current token, runs only the top-k experts, and combines their outputs. The long answer is that MoE inference lives or dies on the routing implementation, which is exactly why [ZINC](/zinc/) treats MoE as a first-class runtime problem instead of "just another model family."
 
-This post explains what MoE models are, which MoE variants ZINC currently supports, and how the ZINC runtime executes them on Vulkan and Metal. If you want broader engine context first, start with [the design decisions behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc) and [the shader work that moved routing back onto the GPU](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s).
+This post explains what MoE models are, which MoE variants ZINC currently supports, and how the ZINC runtime executes them on Vulkan and Metal. If you want broader engine context first, start with [the design decisions behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc/) and [the shader work that moved routing back onto the GPU](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s/).
 
 ## What a Mixture of Experts model actually does
 
@@ -147,7 +147,7 @@ When the loader reads a model, it extracts the fields that define sparse routing
 
 The shared expert handling is worth calling out separately because real GGUFs are not always tidy. Some Qwen3.5 GGUFs omit the shared-expert intermediate dimension in metadata. ZINC handles that by falling back to the actual tensor shapes of `ffn_gate_shexp.weight`, `ffn_up_shexp.weight`, or `ffn_down_shexp.weight` and inferring the width from there.
 
-That is one of those details that sounds boring until it breaks. If the runtime gets the shared-expert shape wrong, the model may still produce text, but the text quality drifts because the math is wrong in a way that is easy to miss. We hit exactly that class of bug during the [RDNA4 bring-up work](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4).
+That is one of those details that sounds boring until it breaks. If the runtime gets the shared-expert shape wrong, the model may still produce text, but the text quality drifts because the math is wrong in a way that is easy to miss. We hit exactly that class of bug during the [RDNA4 bring-up work](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4/).
 
 Hybrid Qwen3.5-style models add one more twist. When SSM metadata exists, ZINC also tracks `full_attention_interval`. If the GGUF does not provide it, the loader defaults that interval to `4`, which means the runtime treats every fourth layer as a full attention layer and the others as SSM layers. That scheduling decision is part of how ZINC interprets the model, not a cosmetic detail.
 
@@ -293,4 +293,4 @@ Because some MoE models do not send tokens only through routed experts. They als
 
 No. ZINC has a generic transformer-MoE path, a hybrid Qwen3.5 path, and a Gemma MoE path. The routing idea is shared, but the surrounding layer structure, activations, norms, and scheduling differ.
 
-If you want to run one of the managed MoE models yourself, the fastest path is still the same: start from the [ZINC docs](/zinc/docs/getting-started), pull a managed model, and then inspect the architecture in [the spec page](/zinc/docs/spec). The interesting part of MoE is not that the model has experts. The interesting part is how much real inference engineering is required to make those experts behave like one coherent layer.
+If you want to run one of the managed MoE models yourself, the fastest path is still the same: start from the [ZINC docs](/zinc/docs/getting-started/), pull a managed model, and then inspect the architecture in [the spec page](/zinc/docs/spec/). The interesting part of MoE is not that the model has experts. The interesting part is how much real inference engineering is required to make those experts behave like one coherent layer.

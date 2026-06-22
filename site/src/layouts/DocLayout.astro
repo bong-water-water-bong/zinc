@@ -17,8 +17,8 @@ const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin
 const metaDescription = description ?? `${title} — ZINC documentation`;
 const breadcrumbItems = [
   { name: 'Home', href: '/' },
-  { name: 'ZINC', href: '/zinc' },
-  { name: 'Docs', href: '/zinc/docs' },
+  { name: 'ZINC', href: '/zinc/' },
+  { name: 'Docs', href: '/zinc/docs/' },
   { name: title },
 ];
 
@@ -81,7 +81,7 @@ function isActive(slug: string): boolean {
     <aside class="doc-nav">
       <input type="checkbox" id="doc-nav-toggle" class="doc-nav-checkbox sr-only" />
       <div class="doc-nav-bar">
-        <h3><a href="/zinc/docs">Docs</a></h3>
+        <h3><a href="/zinc/docs/">Docs</a></h3>
         <label for="doc-nav-toggle" class="doc-nav-toggle-label" aria-label="Toggle docs navigation">
           <span></span>
         </label>
@@ -94,7 +94,7 @@ function isActive(slug: string): boolean {
             <ul>
               {section.items.map(item => (
                 <li>
-                  <a href={`/zinc/docs/${item.slug}`} class:list={[{ active: isActive(item.slug) }]}>
+                  <a href={`/zinc/docs/${item.slug}/`} class:list={[{ active: isActive(item.slug) }]}>
                     {item.label}
                   </a>
                 </li>

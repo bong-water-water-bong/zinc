@@ -8,7 +8,7 @@ ZINC runs local LLMs on AMD GPUs without ROCm by using Vulkan, and it runs the s
 2. Build the binary.
 3. Run one prompt from the terminal.
 
-If that works, move on to the [hardware requirements](/zinc/docs/hardware-requirements), [running ZINC](/zinc/docs/running-zinc), and the lower-level tuning docs.
+If that works, move on to the [hardware requirements](/zinc/docs/hardware-requirements/), [running ZINC](/zinc/docs/running-zinc/), and the lower-level tuning docs.
 
 ## Fast path
 
@@ -171,10 +171,10 @@ Then open `http://localhost:8080/` in your browser.
 
 ## What to read next
 
-- [Hardware requirements](/zinc/docs/hardware-requirements) for GPU, memory, and OS details
-- [Running ZINC](/zinc/docs/running-zinc) for CLI flags, server mode, and API endpoints
-- [Serving HTTP API](/zinc/docs/api) for the full endpoint reference
-- [Development Guide](/zinc/docs/development) for building, testing, and contributing
-- [RDNA4 tuning](/zinc/docs/rdna4-tuning) for AMD performance work
-- [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for Arc B-series hardware details
-- [Apple Silicon Reference](/zinc/docs/apple-silicon-reference) for M1 through M5 platform details
+- [Hardware requirements](/zinc/docs/hardware-requirements/) for GPU, memory, and OS details
+- [Running ZINC](/zinc/docs/running-zinc/) for CLI flags, server mode, and API endpoints
+- [Serving HTTP API](/zinc/docs/api/) for the full endpoint reference
+- [Development Guide](/zinc/docs/development/) for building, testing, and contributing
+- [RDNA4 tuning](/zinc/docs/rdna4-tuning/) for AMD performance work
+- [Intel GPU Reference](/zinc/docs/intel-gpu-reference/) for Arc B-series hardware details
+- [Apple Silicon Reference](/zinc/docs/apple-silicon-reference/) for M1 through M5 platform details

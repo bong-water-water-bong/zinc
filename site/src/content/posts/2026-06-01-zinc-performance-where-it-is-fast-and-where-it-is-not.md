@@ -52,7 +52,7 @@ That is the useful state of the project before v0.1. The engine is no longer a b
   <figcaption>The headline is phase-specific. The current dashboard shows Qwen 3.6 35B A3B decode ahead of llama.cpp on RDNA and M4 Max, while Intel remains an experimental Vulkan path.</figcaption>
 </figure>
 
-The source for the numbers is the current [ZINC benchmark dashboard](/zinc/benchmarks), backed by `site/src/data/zinc-performance.json`. The RDNA data was collected on one AMD Radeon AI PRO R9700 node with 32 GB of VRAM and 576 GB/s memory bandwidth. The Metal data was collected on an Apple M4 Max. The baseline for the compared rows is llama.cpp on the same model files.
+The source for the numbers is the current [ZINC benchmark dashboard](/zinc/benchmarks/), backed by `site/src/data/zinc-performance.json`. The RDNA data was collected on one AMD Radeon AI PRO R9700 node with 32 GB of VRAM and 576 GB/s memory bandwidth. The Metal data was collected on an Apple M4 Max. The baseline for the compared rows is llama.cpp on the same model files.
 
 The most important thing to know before reading any of these charts is that "tokens per second" is not one metric. It is at least three different waits.
 

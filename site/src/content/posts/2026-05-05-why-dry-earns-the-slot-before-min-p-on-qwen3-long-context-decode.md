@@ -69,7 +69,7 @@ The detail that bites engines integrating DRY for the first time is that the seq
 
 ## The sampler chain order again
 
-The [previous post on min-p as the right default truncation sampler](/blog/2026-05-04-why-min-p-is-the-right-default-sampler-for-local-qwen3-decode) made the case that temperature has to run after min-p on the sampler chain. DRY adds a second ordering constraint: it has to run before min-p, not after.
+The [previous post on min-p as the right default truncation sampler](/blog/2026-05-04-why-min-p-is-the-right-default-sampler-for-local-qwen3-decode/) made the case that temperature has to run after min-p on the sampler chain. DRY adds a second ordering constraint: it has to run before min-p, not after.
 
 The reason is that DRY's penalty is in logit space. It subtracts a value from the candidate token's logit before any truncation has happened. If min-p runs first, it produces a small set of candidate tokens that the model thinks are likely. If DRY runs after that, on a confident distribution the candidate that would extend a verbatim match is exactly the candidate min-p kept, and DRY's job is to push it out of the kept set. If min-p has already produced a single-element set, DRY is stuck applying a penalty that only changes which single token gets sampled, and on the looping case that single token is the loop continuation. Running DRY first, then min-p, lets the truncation step see the post-DRY distribution and pick a different candidate that is actually likely under the model and not on a loop.
 
@@ -79,7 +79,7 @@ The recommended chain order, which matches the [llama.cpp server sampler chain](
 
 The cost concern with DRY is that the suffix-match scan looks superficially quadratic. The naive implementation walks backward through the input on every decode step, comparing the current suffix against every earlier window. On a 64k-context decode, that would be a million-comparison loop per token, which would dominate the per-token budget on a 30 ms decode step.
 
-The original p-e-w PR addressed this with a Z-algorithm implementation that does the scan in linear time. The llama.cpp port keeps the same structure but caps the maximum match length, on the observation that the penalty is exponential and the value past length forty is already in the range of `10^9` and irrelevantly large; capping makes no behavioral difference. The cost on the host CPU is on the order of fifty microseconds per decode token at 64k context, which sits in the same fraction-of-a-percent range as min-p on the [decode roofline](/blog/2026-04-30-rdna4-matrix-cores-sit-out-the-decode-loop).
+The original p-e-w PR addressed this with a Z-algorithm implementation that does the scan in linear time. The llama.cpp port keeps the same structure but caps the maximum match length, on the observation that the penalty is exponential and the value past length forty is already in the range of `10^9` and irrelevantly large; capping makes no behavioral difference. The cost on the host CPU is on the order of fifty microseconds per decode token at 64k context, which sits in the same fraction-of-a-percent range as min-p on the [decode roofline](/blog/2026-04-30-rdna4-matrix-cores-sit-out-the-decode-loop/).
 
 | Sampler stage at 64k context | Cost per decoded token | Share of 33 ms decode |
 | --- | ---: | ---: |

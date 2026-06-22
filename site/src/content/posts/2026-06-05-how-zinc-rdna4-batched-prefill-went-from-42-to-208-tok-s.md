@@ -81,7 +81,7 @@ The output text in the validated rows stayed boring: "The capital of France is P
 
 The direct target of the session was not Qwen3-8B. It was Qwen3.6-35B-A3B. On the same R9700, ZINC decode was already near llama.cpp parity, but prefill was badly behind. A typical chat session feels that gap as time-to-first-token.
 
-The annoying discovery was that Qwen3.6 could not use the batched path yet. It is a hybrid MoE plus SSM architecture, and `canUseBatchedPrefillRdna` rejected any model with experts or SSM state. That is the subject of the later [Qwen 35B prefill gate post](/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4).
+The annoying discovery was that Qwen3.6 could not use the batched path yet. It is a hybrid MoE plus SSM architecture, and `canUseBatchedPrefillRdna` rejected any model with experts or SSM state. That is the subject of the later [Qwen 35B prefill gate post](/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4/).
 
 But testing the dense model was not wasted work. Qwen3-8B was supposed to be the easy case. It had no MoE router, no SSM recurrence, and a clean dense transformer schedule. If the dense batched path was not helping, there was no honest path to opening the hybrid gate.
 
@@ -287,7 +287,7 @@ On the R9700, dense Gemma 4 31B moved like this:
 | 313 tokens | 4.96 tok/s | 44.50 tok/s | 9.0x |
 | **613 tokens** | **4.96 tok/s** | **57.58 tok/s** | **11.6x** |
 
-Validate delta was `max_abs_diff=0.000064`, which is float noise. This is why the [Gemma honesty post](/blog/2026-06-02-gemma-is-the-model-family-that-keeps-zinc-honest) calls out the batched-prefill V-handling bug: it is a clean example of a model-family assumption that Qwen did not punish.
+Validate delta was `max_abs_diff=0.000064`, which is float noise. This is why the [Gemma honesty post](/blog/2026-06-02-gemma-is-the-model-family-that-keeps-zinc-honest/) calls out the batched-prefill V-handling bug: it is a clean example of a model-family assumption that Qwen did not punish.
 
 ## What this did not solve
 
@@ -301,7 +301,7 @@ Qwen3.5 and Qwen3.6 35B-A3B still need different structural work:
 | Batched per-expert matmul | Per-token expert DMMV keeps dispatch count high and cannot amortize expert weights across routed tokens. |
 | Block-resident SSM state | Gated delta-net should walk prompt tokens inside one workgroup/block, not reload recurrent state once per token. |
 
-That is the split between this post, the [Qwen 35B prefill gate post](/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4), and the follow-up on [why Qwen 35B cannot use the 208 tok/s path yet](/blog/2026-06-06-why-qwen-35b-cannot-use-zincs-208-tok-s-batched-prefill-path-yet). Dense Qwen3-8B proved the Vulkan batched prefill machinery and shader shape. Hybrid Qwen needs MoE and SSM batching before it gets the same benefit.
+That is the split between this post, the [Qwen 35B prefill gate post](/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4/), and the follow-up on [why Qwen 35B cannot use the 208 tok/s path yet](/blog/2026-06-06-why-qwen-35b-cannot-use-zincs-208-tok-s-batched-prefill-path-yet/). Dense Qwen3-8B proved the Vulkan batched prefill machinery and shader shape. Hybrid Qwen needs MoE and SSM batching before it gets the same benefit.
 
 ## The lessons worth keeping
 
@@ -313,4 +313,4 @@ The third lesson is that gates should be treated as product surface. `ZINC_BATCH
 
 The fourth lesson is that dense models are the right staging ground for hybrid work. Qwen3-8B gave us a simpler correctness surface. Gemma dense then caught architecture details. Only after both pass does it make sense to reopen the MoE plus SSM gate.
 
-For the design argument that predicted this direction, read [Why RDNA4 prefill wants a 32-column DMMV before it wants a GEMM](/blog/2026-04-22-why-rdna4-prefill-wants-a-32-column-dmmv-before-a-gemm). For the part that remains on the flagship model, read [The gate that keeps Qwen 35B prefill at half of llama.cpp on RDNA4](/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4). This post sits between them: the measured dense-model proof that the batched path can be correct, fast, and worth turning on by default.
+For the design argument that predicted this direction, read [Why RDNA4 prefill wants a 32-column DMMV before it wants a GEMM](/blog/2026-04-22-why-rdna4-prefill-wants-a-32-column-dmmv-before-a-gemm/). For the part that remains on the flagship model, read [The gate that keeps Qwen 35B prefill at half of llama.cpp on RDNA4](/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4/). This post sits between them: the measured dense-model proof that the batched path can be correct, fast, and worth turning on by default.

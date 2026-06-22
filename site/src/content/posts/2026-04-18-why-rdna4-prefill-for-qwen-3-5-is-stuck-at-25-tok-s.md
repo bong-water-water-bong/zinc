@@ -50,7 +50,7 @@ The current best checkpoint is **25.67 tok/s prefill**, on the same machine wher
 
 That gap is not noise. It is not a tuning constant. It is the shape of a deeper problem that only shows up when you try to optimize prompt ingestion on consumer AMD. This post is the honest write-up of what the measurements said, what moved, what did not, and why the story matters for anyone trying to run a 35B-class hybrid model on an RX 9070 locally.
 
-If you want the broader engine context first, read [Every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc), [How Mixture of Experts models work in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc), and the earlier [RDNA4 4 tok/s to 27 tok/s post](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s).
+If you want the broader engine context first, read [Every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc/), [How Mixture of Experts models work in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc/), and the earlier [RDNA4 4 tok/s to 27 tok/s post](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s/).
 
 ## Prefill is not decode in a loop
 
@@ -95,7 +95,7 @@ The chart is the reason we are not chasing micro-wins anymore. SSM proj is a sin
 
 ## The RDNA4-specific shape of the problem
 
-Part of what makes this bring-up confusing is that RDNA4 has everything a real prefill path needs. The RX 9070's 64 compute units and 640 GB/s bandwidth are comfortably in the range where 300 tok/s prefill for a 35B A3B model is not exotic. The [GLSL cooperative matrix extension](https://github.com/KhronosGroup/GLSL/blob/main/extensions/khr/GLSL_KHR_cooperative_matrix.txt) is implemented in current Mesa, and RADV now supports `VK_KHR_cooperative_matrix` on RDNA4 with `RADV_PERFTEST=coop_matrix`. We use the same flag in the [Qwen3.6 on AMD and Metal post](/blog/2026-04-17-qwen-3-6-is-now-generally-available-in-zinc) and it works.
+Part of what makes this bring-up confusing is that RDNA4 has everything a real prefill path needs. The RX 9070's 64 compute units and 640 GB/s bandwidth are comfortably in the range where 300 tok/s prefill for a 35B A3B model is not exotic. The [GLSL cooperative matrix extension](https://github.com/KhronosGroup/GLSL/blob/main/extensions/khr/GLSL_KHR_cooperative_matrix.txt) is implemented in current Mesa, and RADV now supports `VK_KHR_cooperative_matrix` on RDNA4 with `RADV_PERFTEST=coop_matrix`. We use the same flag in the [Qwen3.6 on AMD and Metal post](/blog/2026-04-17-qwen-3-6-is-now-generally-available-in-zinc/) and it works.
 
 The hardware is not the blocker. The issue is that ZINC's RDNA prefill never left the decode-shaped schedule. The dispatch helper that would let us batch matvecs across prompt tokens exists in the source tree. It has zero callers in the prefill hot path. The shader backing it exists. It is flag-gated, untested at scale, and not wired into the runtime's hot loop. We have been pattern-matching "inference engine" onto "decode-style forward pass repeated N times" because that is how the engine was born.
 
@@ -119,4 +119,4 @@ If the plan works, prefill on the flagship should clear Phase 2 (150 tok/s) with
 
 Either way, the boring takeaway stands. On consumer AMD, inference engines are not usually shader-limited. They are schedule-limited. The faster we internalize that, the faster the prefill number starts moving for real.
 
-For the background on the runtime pieces, the most relevant reads are [the earlier RDNA4 shader deep-dive](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s), [how we got from 7 to 33 tok/s on AMD RDNA4](/blog/2026-03-30-how-we-moved-zinc-from-7-tok-s-to-33-tok-s-on-amd-rdna4), and the most recent [Qwen3.6 on AMD and Metal](/blog/2026-04-17-qwen-3-6-is-now-generally-available-in-zinc) announcement. If you just want to run a model, start with [Getting Started](/zinc/docs/getting-started) and [Running ZINC](/zinc/docs/running-zinc).
+For the background on the runtime pieces, the most relevant reads are [the earlier RDNA4 shader deep-dive](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s/), [how we got from 7 to 33 tok/s on AMD RDNA4](/blog/2026-03-30-how-we-moved-zinc-from-7-tok-s-to-33-tok-s-on-amd-rdna4/), and the most recent [Qwen3.6 on AMD and Metal](/blog/2026-04-17-qwen-3-6-is-now-generally-available-in-zinc/) announcement. If you just want to run a model, start with [Getting Started](/zinc/docs/getting-started/) and [Running ZINC](/zinc/docs/running-zinc/).

@@ -109,15 +109,15 @@ Use zinc model list to inspect supported models.`,
   it('indexes markdown pages and heading anchors', () => {
     const entries = buildDocsSearchIndex(docs, zigApi);
 
-    expect(findEntry(entries, entry => entry.kind === 'Guide' && entry.url === '/zinc/docs/running-zinc')?.title).toBe('Running ZINC');
-    expect(findEntry(entries, entry => entry.kind === 'Section' && entry.url === '/zinc/docs/running-zinc#use-with-openai-sdks')?.title).toBe('Use with OpenAI SDKs');
-    expect(findEntry(entries, entry => entry.kind === 'Section' && entry.url === '/zinc/docs/running-zinc#inspect-the-managed-model-catalog')?.preview).toContain('Use zinc model list');
+    expect(findEntry(entries, entry => entry.kind === 'Guide' && entry.url === '/zinc/docs/running-zinc/')?.title).toBe('Running ZINC');
+    expect(findEntry(entries, entry => entry.kind === 'Section' && entry.url === '/zinc/docs/running-zinc/#use-with-openai-sdks')?.title).toBe('Use with OpenAI SDKs');
+    expect(findEntry(entries, entry => entry.kind === 'Section' && entry.url === '/zinc/docs/running-zinc/#inspect-the-managed-model-catalog')?.preview).toContain('Use zinc model list');
   });
 
   it('indexes Zig API sections, modules, symbols, and methods', () => {
     const entries = buildDocsSearchIndex(docs, zigApi);
 
-    expect(findEntry(entries, entry => entry.kind === 'API Section' && entry.url === '/zinc/docs/zig-api#inference-runtime')?.title).toBe('Inference Runtime');
+    expect(findEntry(entries, entry => entry.kind === 'API Section' && entry.url === '/zinc/docs/zig-api/#inference-runtime')?.title).toBe('Inference Runtime');
     expect(findEntry(entries, entry => entry.kind === 'API Module' && entry.url === '/zinc/docs/zig-api/forward')?.searchText).toContain('InferenceEngine');
     expect(findEntry(entries, entry => entry.kind === 'API Symbol' && entry.url === '/zinc/docs/zig-api/forward#inferenceengine')?.title).toBe('InferenceEngine');
     expect(findEntry(entries, entry => entry.kind === 'API Method' && entry.url === '/zinc/docs/zig-api/forward#inferenceengine-init')?.preview).toContain('Allocates the decode state');

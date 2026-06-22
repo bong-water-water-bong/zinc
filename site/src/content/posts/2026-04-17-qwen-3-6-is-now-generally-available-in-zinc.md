@@ -56,7 +56,7 @@ That is the moment when a model stops being discourse and becomes software.
 
 The important distinction is that this is not a vague "we think we can support the family eventually" announcement. It is a concrete local release path inside the engine: **Qwen 3.6 is now generally available in ZINC as the managed model `qwen36-35b-a3b-q4k-xl`**, backed by the exact GGUF `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`.
 
-This post is the follow-through to [our earlier Qwen 3.6 architecture piece](/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc). If you want the broader engine context first, the best companions are [how MoE models work in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc), [every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc), and the practical path in [Getting Started](/zinc/docs/getting-started).
+This post is the follow-through to [our earlier Qwen 3.6 architecture piece](/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc/). If you want the broader engine context first, the best companions are [how MoE models work in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc/), [every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc/), and the practical path in [Getting Started](/zinc/docs/getting-started/).
 
 That matters because local inference projects get into trouble when they announce support too early. A model is not real support because it once produced a decent answer on one machine. In ZINC, "generally available" means something narrower and more operational:
 
@@ -117,7 +117,7 @@ That description is intentionally concrete because Qwen 3.6 can mean different t
 
 There is the broader Qwen 3.6 story as a hosted product line and architecture direction. Then there is the specific local open-weight path that matters for a real engine. ZINC is announcing the second one: the local 35B-A3B GGUF you can run through the managed catalog today.
 
-If you read our earlier post, [Qwen 3.6 architecture and local inference in ZINC](/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc), that piece was about what the family implied and what a port might require. This post is the follow-through: a compatible local Qwen 3.6 line exists now, and ZINC has moved it into the supported managed path.
+If you read our earlier post, [Qwen 3.6 architecture and local inference in ZINC](/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc/), that piece was about what the family implied and what a port might require. This post is the follow-through: a compatible local Qwen 3.6 line exists now, and ZINC has moved it into the supported managed path.
 
 ## Why this matters for AMD RDNA4 and Apple Silicon Metal
 
@@ -157,7 +157,7 @@ In practice, the managed Qwen 3.6 path already benefits from:
 - smoke coverage that launches the real CLI against the actual GGUF
 - both major local targets we care about: RDNA4 on Vulkan and Apple Silicon on Metal
 
-If you want the platform-specific background behind those two targets, the best references are [RDNA4 tuning](/zinc/docs/rdna4-tuning), [the Apple Silicon reference](/zinc/docs/apple-silicon-reference), and [bringing ZINC to Apple Silicon](/blog/2026-04-01-bringing-zinc-to-apple-silicon).
+If you want the platform-specific background behind those two targets, the best references are [RDNA4 tuning](/zinc/docs/rdna4-tuning/), [the Apple Silicon reference](/zinc/docs/apple-silicon-reference/), and [bringing ZINC to Apple Silicon](/blog/2026-04-01-bringing-zinc-to-apple-silicon/).
 
 That is a much better place to launch from than "we have a draft branch that kind of works if you know which flags not to touch."
 
@@ -165,7 +165,7 @@ It also lets us be honest about the shape of the support. This is not an everyth
 
 ## Run Qwen3.6-35B-A3B on AMD and Metal
 
-If you want the shortest path from announcement to prompt, this is it. If you want the full operational detail around managed models, model switching, and server behavior, the companion docs are [Getting Started](/zinc/docs/getting-started), [Running ZINC](/zinc/docs/running-zinc), and the [API reference](/zinc/docs/api).
+If you want the shortest path from announcement to prompt, this is it. If you want the full operational detail around managed models, model switching, and server behavior, the companion docs are [Getting Started](/zinc/docs/getting-started/), [Running ZINC](/zinc/docs/running-zinc/), and the [API reference](/zinc/docs/api/).
 
 On a local ZINC build:
 
@@ -240,4 +240,4 @@ It is the exact local GGUF path `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`, it is marked 
 
 That is what local model support is supposed to look like.
 
-If you want the background on the runtime pieces that make this possible, the most relevant reads inside the ZINC blog are [the earlier Qwen 3.6 architecture post](/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc), [how MoE models work in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc), [bringing ZINC to Apple Silicon](/blog/2026-04-01-bringing-zinc-to-apple-silicon), and [every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc). If you just want to run the model, start with [Getting Started](/zinc/docs/getting-started) and [Running ZINC](/zinc/docs/running-zinc).
+If you want the background on the runtime pieces that make this possible, the most relevant reads inside the ZINC blog are [the earlier Qwen 3.6 architecture post](/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc/), [how MoE models work in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc/), [bringing ZINC to Apple Silicon](/blog/2026-04-01-bringing-zinc-to-apple-silicon/), and [every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc/). If you just want to run the model, start with [Getting Started](/zinc/docs/getting-started/) and [Running ZINC](/zinc/docs/running-zinc/).

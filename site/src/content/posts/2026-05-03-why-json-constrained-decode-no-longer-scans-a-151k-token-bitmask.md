@@ -65,7 +65,7 @@ The implementations differ in where the work happens but agree on the shape of t
 
 ## What the wall-time math looks like on RDNA4 decode
 
-The bandwidth-bound floor for a Qwen3-30B-A3B decode step on the R9700 sits around thirty-three milliseconds per token at the Q4_K_M quantization the engine ships. The active-weight read is roughly two gigabytes, the KV cache reads scale with the resident context, and the [16k crossover post](/blog/2026-04-27-the-16k-crossover-where-kv-reads-outweigh-active-weights-on-rdna4-decode) walked through how the KV term overtakes the weight term once the resident context grows past sixteen thousand tokens. Anything the engine adds on the CPU side has to be measured against that thirty-three-millisecond budget.
+The bandwidth-bound floor for a Qwen3-30B-A3B decode step on the R9700 sits around thirty-three milliseconds per token at the Q4_K_M quantization the engine ships. The active-weight read is roughly two gigabytes, the KV cache reads scale with the resident context, and the [16k crossover post](/blog/2026-04-27-the-16k-crossover-where-kv-reads-outweigh-active-weights-on-rdna4-decode/) walked through how the KV term overtakes the weight term once the resident context grows past sixteen thousand tokens. Anything the engine adds on the CPU side has to be measured against that thirty-three-millisecond budget.
 
 | Constrained-decoding backend | Per-token mask time | As share of 33 ms decode | Notes |
 | --- | ---: | ---: | --- |

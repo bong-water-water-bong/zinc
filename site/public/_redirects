@@ -27,3 +27,15 @@ https://www.zolotukhin.ai/*  https://zolotukhin.ai/:splat             301
 
 /zinc/docs/gpu-reference     /zinc/docs/amd-gpu-reference/            301
 /zinc/docs/gpu-reference/    /zinc/docs/amd-gpu-reference/            301
+
+# Removed docs (planning/debug/renamed) -> nearest relevant live page
+/zinc/docs/zig-api/session          /zinc/docs/zig-api/        301
+/zinc/docs/zig-api/session/         /zinc/docs/zig-api/        301
+/zinc/docs/rdna4-performance-plan   /zinc/docs/rdna4-tuning/   301
+/zinc/docs/rdna4-performance-plan/  /zinc/docs/rdna4-tuning/   301
+/zinc/docs/performance-gap-analysis  /zinc/benchmarks/         301
+/zinc/docs/performance-gap-analysis/ /zinc/benchmarks/         301
+/zinc/docs/decode-throughput-plan   /zinc/benchmarks/          301
+/zinc/docs/decode-throughput-plan/  /zinc/benchmarks/          301
+/zinc/docs/qwen35-debug             /zinc/docs/                301
+/zinc/docs/qwen35-debug/            /zinc/docs/                301

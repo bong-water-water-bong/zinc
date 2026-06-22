@@ -49,7 +49,7 @@ seoDescription: "How ZINC made its whole local-LLM catalog fast on NVIDIA RTX 50
 draft: false
 ---
 
-The [first NVIDIA post](/blog/2026-06-07-how-zinc-got-a-cuda-backend-and-beat-llama-cpp-decode-on-nvidia) ended on a clean number: Qwen3.5-9B decoding at ~104 tok/s on an RTX 4090, ahead of llama.cpp's 97. One model, one bottleneck — per-token sync gaps starving the GPU boost clock — and one fix, an async stream/event ring that removed sixty-four syncs per token.
+The [first NVIDIA post](/blog/2026-06-07-how-zinc-got-a-cuda-backend-and-beat-llama-cpp-decode-on-nvidia/) ended on a clean number: Qwen3.5-9B decoding at ~104 tok/s on an RTX 4090, ahead of llama.cpp's 97. One model, one bottleneck — per-token sync gaps starving the GPU boost clock — and one fix, an async stream/event ring that removed sixty-four syncs per token.
 
 Then we pointed it at the rest of the catalog, and the clean story fell apart in the most useful way.
 
@@ -80,7 +80,7 @@ Two honest framings sit on top of that table. The win: the dense 9B is *ahead* o
 
 ## Bottleneck 1 — dense decode was sync-bound (recap)
 
-The 9B's story is [the previous post](/blog/2026-06-07-how-zinc-got-a-cuda-backend-and-beat-llama-cpp-decode-on-nvidia), so the one-paragraph version: decode was not compute-bound, it was *sync*-bound. The 32-layer stack issued ~65 blocking `commitAndWait` calls per token, the CPU stalled on each, and in the gaps the GPU dropped its clock — a **525 MHz** median during sync-bound decode against **2520 MHz** during sustained prefill on the same card. The async `CUstream`/`CUevent` ring submits the whole token's work once and lets the CPU run ahead; throughput went from a bimodal 22/66 to a steady ~104, and the GPU held boost. Keep that mechanism in mind, because the next model refuses to play along with it.
+The 9B's story is [the previous post](/blog/2026-06-07-how-zinc-got-a-cuda-backend-and-beat-llama-cpp-decode-on-nvidia/), so the one-paragraph version: decode was not compute-bound, it was *sync*-bound. The 32-layer stack issued ~65 blocking `commitAndWait` calls per token, the CPU stalled on each, and in the gaps the GPU dropped its clock — a **525 MHz** median during sync-bound decode against **2520 MHz** during sustained prefill on the same card. The async `CUstream`/`CUevent` ring submits the whole token's work once and lets the CPU run ahead; throughput went from a bimodal 22/66 to a steady ~104, and the GPU held boost. Keep that mechanism in mind, because the next model refuses to play along with it.
 
 ## Bottleneck 2 — MoE decode was paying for its routing twice
 
@@ -154,7 +154,7 @@ Step back and the catalog is a catalog of bottlenecks as much as models:
   <figcaption>Same `src/cuda` backend, same NVRTC kernel library, same profiler. Four paths, four distinct bottlenecks, and in three of the four the obvious fix — faster kernels, the async ring, tensor cores — was the wrong first move until the profiler said otherwise.</figcaption>
 </figure>
 
-The recurring lesson from the first post held, and got sharper: the bottleneck is rarely the thing you're looking at. But the new edge is that **it's not even the same bottleneck across models that share a backend**. A Mixture-of-Experts model and a dense model, or two dense models from different families, can be limited by entirely different layers of the stack — host sync, dispatch count, launch latency, dequant throughput — and a fix that's transformative for one is provably inert for the next. The only thing that generalized was the method: a llama.cpp reference to diff correctness against, a profiler to read the clock and the utilization, boost-aware interleaved A/B so a real 1.5% win isn't drowned by a wandering clock, and a [validation harness](/blog/2026-06-07-how-zinc-got-a-cuda-backend-and-beat-llama-cpp-decode-on-nvidia) that exits non-zero the instant a token drifts.
+The recurring lesson from the first post held, and got sharper: the bottleneck is rarely the thing you're looking at. But the new edge is that **it's not even the same bottleneck across models that share a backend**. A Mixture-of-Experts model and a dense model, or two dense models from different families, can be limited by entirely different layers of the stack — host sync, dispatch count, launch latency, dequant throughput — and a fix that's transformative for one is provably inert for the next. The only thing that generalized was the method: a llama.cpp reference to diff correctness against, a profiler to read the clock and the utilization, boost-aware interleaved A/B so a real 1.5% win isn't drowned by a wandering clock, and a [validation harness](/blog/2026-06-07-how-zinc-got-a-cuda-backend-and-beat-llama-cpp-decode-on-nvidia/) that exits non-zero the instant a token drifts.
 
 ## What's next, and what it's worth
 

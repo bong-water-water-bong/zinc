@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="520" viewBox="0 0 1240 520" role="img" aria-labelledby="title desc">
+  <title id="title">Anatomy of a GLM 5.2 loop</title>
+  <desc id="desc">A horizontal pipeline of seven stages — ship, build, run, measure, propose one change, verify, and keep or revert — flowing left to right above a controller and memory panel. The propose stage is highlighted as the GLM 5.2 model's job. The output of each cycle is recorded into the controller's memory, which feeds the next cycle. A footnote notes the brain is swappable with one environment variable.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fcfbf7"/>
+      <stop offset="100%" stop-color="#eef2f8"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#1f2937" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="6.5" refY="4.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#738496"/>
+    </marker>
+    <style>
+      .title { font: 700 38px Georgia, serif; fill: #14213d; }
+      .subtitle { font: 500 18px Arial, sans-serif; fill: #5b6776; }
+      .node { stroke-width: 2; }
+      .node-cool { fill: #eef5ff; stroke: #97b3da; }
+      .node-plain { fill: #fffdf9; stroke: #d8d0bf; }
+      .node-accent { fill: #fdeee2; stroke: #e0a86a; }
+      .idx { font: 700 12px Arial, sans-serif; fill: #8a93a0; letter-spacing: 0.10em; }
+      .step { font: 700 21px Arial, sans-serif; fill: #14213d; text-anchor: middle; }
+      .sub { font: 400 13px Arial, sans-serif; fill: #5b6776; text-anchor: middle; }
+      .tag { font: 700 12px Arial, sans-serif; fill: #b06a1f; text-anchor: middle; letter-spacing: 0.06em; }
+      .flow { fill: none; stroke: #738496; stroke-width: 3.5; stroke-linecap: round; marker-end: url(#arrow); }
+      .panel { fill: #17324d; }
+      .panel-label { font: 700 13px Arial, sans-serif; fill: #a8c0d7; letter-spacing: 0.12em; }
+      .panel-copy { font: 400 17px Arial, sans-serif; fill: #e3eaf1; }
+      .edge { font: 700 12px Arial, sans-serif; fill: #5b6776; }
+      .foot { font: 400 15px Arial, sans-serif; fill: #4d5d6d; }
+    </style>
+  </defs>
+
+  <rect width="1240" height="520" fill="url(#bg)"/>
+
+  <g transform="translate(60 54)">
+    <text class="title">Anatomy of a GLM 5.2 loop</text>
+    <text class="subtitle" x="0" y="32">One focused change per cycle. The model proposes; the controller decides.</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect class="node node-plain"  x="58"   y="150" width="140" height="96" rx="18"/>
+    <rect class="node node-plain"  x="222"  y="150" width="140" height="96" rx="18"/>
+    <rect class="node node-cool"   x="386"  y="150" width="140" height="96" rx="18"/>
+    <rect class="node node-cool"   x="550"  y="150" width="140" height="96" rx="18"/>
+    <rect class="node node-accent" x="714"  y="150" width="140" height="96" rx="18"/>
+    <rect class="node node-cool"   x="878"  y="150" width="140" height="96" rx="18"/>
+    <rect class="node node-plain"  x="1042" y="150" width="140" height="96" rx="18"/>
+  </g>
+
+  <text class="idx"  x="128"  y="176" text-anchor="middle">01</text>
+  <text class="step" x="128"  y="200">Ship</text>
+  <text class="sub"  x="128"  y="222">sync to the box</text>
+
+  <text class="idx"  x="292"  y="176" text-anchor="middle">02</text>
+  <text class="step" x="292"  y="200">Build</text>
+  <text class="sub"  x="292"  y="222">on the target</text>
+
+  <text class="idx"  x="456"  y="176" text-anchor="middle">03</text>
+  <text class="step" x="456"  y="200">Run</text>
+  <text class="sub"  x="456"  y="222">fixed benchmark</text>
+
+  <text class="idx"  x="620"  y="176" text-anchor="middle">04</text>
+  <text class="step" x="620"  y="200">Measure</text>
+  <text class="sub"  x="620"  y="222">tok/s &amp; coherence</text>
+
+  <text class="tag"  x="784"  y="176">GLM 5.2</text>
+  <text class="step" x="784"  y="200">Propose</text>
+  <text class="sub"  x="784"  y="222">one change</text>
+
+  <text class="idx"  x="948"  y="176" text-anchor="middle">06</text>
+  <text class="step" x="948"  y="200">Verify</text>
+  <text class="sub"  x="948"  y="222">re-run, compare</text>
+
+  <text class="idx"  x="1112" y="176" text-anchor="middle">07</text>
+  <text class="step" x="1112" y="200">Keep</text>
+  <text class="sub"  x="1112" y="222">or revert</text>
+
+  <path class="flow" d="M198 198 H218"/>
+  <path class="flow" d="M362 198 H382"/>
+  <path class="flow" d="M526 198 H546"/>
+  <path class="flow" d="M690 198 H710"/>
+  <path class="flow" d="M854 198 H874"/>
+  <path class="flow" d="M1018 198 H1038"/>
+
+  <rect class="panel" x="58" y="316" width="1124" height="92" rx="20" filter="url(#shadow)"/>
+  <text class="panel-label" x="86" y="352">CONTROLLER &#183; MEMORY</text>
+  <text class="panel-copy" x="86" y="382">carries history, failed approaches, self-analysis, and stall detection into the next cycle</text>
+
+  <path class="flow" d="M1112 250 V312"/>
+  <text class="edge" x="1124" y="286">record</text>
+  <path class="flow" d="M128 312 V250"/>
+  <text class="edge" x="140" y="286">next cycle</text>
+
+  <text class="foot" x="60" y="456">The brain is swappable: point the agent CLI at GLM 5.2 and the controller never changes.</text>
+</svg>

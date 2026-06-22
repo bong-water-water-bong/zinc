@@ -439,7 +439,7 @@ for await (const chunk of stream) {
 | POST | `/v1/chat/completions` | Chat completion (streaming + non-streaming) |
 | POST | `/v1/completions` | Text completion |
 
-The full API contract is documented in [Serving HTTP API](/zinc/docs/api).
+The full API contract is documented in [Serving HTTP API](/zinc/docs/api/).
 
 ## Export the decode graph
 
@@ -468,7 +468,7 @@ open decode-graph-report.html   # macOS
 # xdg-open decode-graph-report.html   # Linux
 ```
 
-That dashboard is built by [`tools/render_graph_report.ts`](../tools/render_graph_report.ts). It groups the raw graph into:
+That dashboard is built by [`tools/render_graph_report.ts`](https://github.com/zolotukhin/zinc/blob/main/tools/render_graph_report.ts). It groups the raw graph into:
 
 - top hotspots
 - bottleneck mix
@@ -540,7 +540,7 @@ Those four commands answer most “why is this not working?” questions:
 
 ## Related docs
 
-- [Getting started](/zinc/docs/getting-started)
-- [Hardware requirements](/zinc/docs/hardware-requirements)
-- [Serving HTTP API](/zinc/docs/api)
-- [RDNA4 tuning](/zinc/docs/rdna4-tuning)
+- [Getting started](/zinc/docs/getting-started/)
+- [Hardware requirements](/zinc/docs/hardware-requirements/)
+- [Serving HTTP API](/zinc/docs/api/)
+- [RDNA4 tuning](/zinc/docs/rdna4-tuning/)

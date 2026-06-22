@@ -155,7 +155,7 @@ export const topicHubs: TopicHub[] = [
     readNext: [
       {
         title: 'OpenAI-compatible tool calling design',
-        href: '/zinc/docs/api#tool-calling',
+        href: '/zinc/docs/api/#tool-calling',
         description: 'The ZINC API behavior that OpenCode relies on for tool definitions, tool calls, and tool results.',
       },
       {
@@ -165,24 +165,24 @@ export const topicHubs: TopicHub[] = [
       },
       {
         title: 'ZINC performance status',
-        href: '/zinc/benchmarks',
+        href: '/zinc/benchmarks/',
         description: 'Current AMD and Metal results for the models you may use as local coding backends.',
       },
     ],
     docs: [
       {
         title: 'Configure OpenCode with ZINC',
-        href: '/zinc/docs/opencode',
+        href: '/zinc/docs/opencode/',
         description: 'Step-by-step OpenCode local LLM provider config for ZINC and Qwen, including proxy setup, thinking, tool calling, context limits, and troubleshooting.',
       },
       {
         title: 'Serving HTTP API',
-        href: '/zinc/docs/api',
+        href: '/zinc/docs/api/',
         description: 'OpenAI-compatible chat completions, streaming, tools, thinking, models, and health endpoints.',
       },
       {
         title: 'Running ZINC',
-        href: '/zinc/docs/running-zinc',
+        href: '/zinc/docs/running-zinc/',
         description: 'Start the local server, choose managed models, set context, and verify the runtime path.',
       },
     ],
@@ -320,39 +320,39 @@ export const topicHubs: TopicHub[] = [
     readNext: [
       {
         title: 'The single push constant blocking Gemma 4 prefill on RDNA4',
-        href: '/blog/2026-04-24-the-single-push-constant-blocking-gemma-4-prefill-on-rdna4',
+        href: '/blog/2026-04-24-the-single-push-constant-blocking-gemma-4-prefill-on-rdna4/',
         description: 'Why Gemma 4 forces a split between Q and KV head dimensions in Vulkan flash attention.',
       },
       {
         title: 'Why one vkQueueSubmit per prompt matters for Gemma 4',
-        href: '/blog/2026-04-25-why-one-vkqueuesubmit-per-prompt-is-the-next-quiet-rdna4-prefill-unlock',
+        href: '/blog/2026-04-25-why-one-vkqueuesubmit-per-prompt-is-the-next-quiet-rdna4-prefill-unlock/',
         description: 'How 60-layer Gemma prefill exposes command submission overhead on AMD.',
       },
       {
         title: 'How MoE models work in ZINC',
-        href: '/blog/2026-04-04-how-moe-models-work-in-zinc',
+        href: '/blog/2026-04-04-how-moe-models-work-in-zinc/',
         description: 'The shared routing ideas and the Gemma-specific differences in sparse inference.',
       },
       {
         title: 'Why FP16 KV cache is the wrong default for 128k context',
-        href: '/blog/2026-04-26-why-fp16-kv-cache-is-the-wrong-default-for-128k-context-on-32gb-rdna4',
+        href: '/blog/2026-04-26-why-fp16-kv-cache-is-the-wrong-default-for-128k-context-on-32gb-rdna4/',
         description: 'How Gemma sliding-window attention changes, but does not remove, the KV memory problem.',
       },
     ],
     docs: [
       {
         title: 'Getting Started with ZINC',
-        href: '/zinc/docs/getting-started',
+        href: '/zinc/docs/getting-started/',
         description: 'Build ZINC, pull a managed model, and run local inference on AMD or Apple Silicon.',
       },
       {
         title: 'ZINC Benchmarks',
-        href: '/zinc/benchmarks',
+        href: '/zinc/benchmarks/',
         description: 'Current same-machine benchmark results for Gemma, Qwen, AMD, Metal, and baseline comparisons.',
       },
       {
         title: 'Running ZINC',
-        href: '/zinc/docs/running-zinc',
+        href: '/zinc/docs/running-zinc/',
         description: 'CLI and server usage, managed model ids, backend selection, and runtime flags.',
       },
     ],
@@ -486,49 +486,49 @@ export const topicHubs: TopicHub[] = [
     readNext: [
       {
         title: 'Qwen 3.6 architecture and local inference in ZINC',
-        href: '/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc',
+        href: '/blog/2026-04-05-qwen-3-6-architecture-and-what-it-would-take-to-bring-it-into-zinc/',
         description: 'The main architecture explainer for Qwen3.6, MoE, SSM, context, and local engine implications.',
       },
       {
         title: 'Qwen3.6-35B-A3B GGUF on AMD and Metal',
-        href: '/blog/2026-04-17-qwen-3-6-is-now-generally-available-in-zinc',
+        href: '/blog/2026-04-17-qwen-3-6-is-now-generally-available-in-zinc/',
         description: 'Managed model support, AMD RDNA4 and Apple Silicon notes, and practical run guidance.',
       },
       {
         title: 'Why speculative decoding does not net out on Qwen 35B-A3B',
-        href: '/blog/2026-04-28-why-speculative-decoding-does-not-net-out-on-qwen-35b-a3b',
+        href: '/blog/2026-04-28-why-speculative-decoding-does-not-net-out-on-qwen-35b-a3b/',
         description: 'Why generic draft-model speculation can lose on sparse Qwen verification.',
       },
       {
         title: 'Why MTP heads are the speculative decode draft Qwen3 A3B deserves',
-        href: '/blog/2026-05-08-why-mtp-heads-are-the-speculative-decode-draft-qwen3-a3b-deserves',
+        href: '/blog/2026-05-08-why-mtp-heads-are-the-speculative-decode-draft-qwen3-a3b-deserves/',
         description: 'Why target-attached multi-token prediction is a better fit than separate draft models.',
       },
       {
         title: 'The gate that keeps Qwen 35B prefill at half of llama.cpp on RDNA4',
-        href: '/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4',
+        href: '/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4/',
         description: 'The structural MoE plus SSM prefill work needed for flagship Qwen performance.',
       },
     ],
     docs: [
       {
         title: 'Getting Started with ZINC',
-        href: '/zinc/docs/getting-started',
+        href: '/zinc/docs/getting-started/',
         description: 'Pull a managed Qwen model and run local inference through the CLI or chat path.',
       },
       {
         title: 'ZINC Benchmarks',
-        href: '/zinc/benchmarks',
+        href: '/zinc/benchmarks/',
         description: 'Current Qwen3.6 results against same-machine llama.cpp baselines.',
       },
       {
         title: 'Running ZINC',
-        href: '/zinc/docs/running-zinc',
+        href: '/zinc/docs/running-zinc/',
         description: 'Model ids, CLI flags, chat mode, server mode, and KV quantization options.',
       },
       {
         title: 'Configure OpenCode with ZINC',
-        href: '/zinc/docs/opencode',
+        href: '/zinc/docs/opencode/',
         description: 'Use Qwen through ZINC as a local OpenCode coding backend with tools, thinking, and context limits.',
       },
     ],
@@ -662,49 +662,49 @@ export const topicHubs: TopicHub[] = [
     readNext: [
       {
         title: 'How we made AMD LLM inference 4x faster on a single GPU',
-        href: '/blog/2026-03-30-how-we-moved-zinc-from-7-tok-s-to-33-tok-s-on-amd-rdna4',
+        href: '/blog/2026-03-30-how-we-moved-zinc-from-7-tok-s-to-33-tok-s-on-amd-rdna4/',
         description: 'The early RDNA4 speedup story and what changed in the decode path.',
       },
       {
         title: 'What broke first in local LLM inference on AMD RDNA4',
-        href: '/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4',
+        href: '/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4/',
         description: 'The first correctness failures: attention, KV cache, RoPE, MoE, SSM, and tokenizer drift.',
       },
       {
         title: 'The broken Vulkan shaders keeping AMD RDNA4 inference stuck at 4 tok/s',
-        href: '/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s',
+        href: '/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s/',
         description: 'How shader debugging moved work back onto the GPU.',
       },
       {
         title: 'Why RDNA4 prefill for Qwen3.5-35B is stuck at 25 tok/s',
-        href: '/blog/2026-04-18-why-rdna4-prefill-for-qwen-3-5-is-stuck-at-25-tok-s',
+        href: '/blog/2026-04-18-why-rdna4-prefill-for-qwen-3-5-is-stuck-at-25-tok-s/',
         description: 'Why prefill needs different kernels than decode on AMD.',
       },
       {
         title: 'How AMD Qwen decode passed llama.cpp in six weeks',
-        href: '/blog/2026-05-09-how-we-made-amd-qwen-inference-faster-than-llama-cpp-in-six-weeks-on-the-radeon-ai-pro-r9700',
+        href: '/blog/2026-05-09-how-we-made-amd-qwen-inference-faster-than-llama-cpp-in-six-weeks-on-the-radeon-ai-pro-r9700/',
         description: 'The public comparison point against llama.cpp on the R9700.',
       },
     ],
     docs: [
       {
         title: 'Run LLMs on AMD GPUs Without ROCm',
-        href: '/zinc/docs/getting-started',
+        href: '/zinc/docs/getting-started/',
         description: 'The fastest path from clone to local AMD inference.',
       },
       {
         title: 'AMD RDNA3/RDNA4 GPU Reference',
-        href: '/zinc/docs/amd-gpu-reference',
+        href: '/zinc/docs/amd-gpu-reference/',
         description: 'Hardware, memory, wave execution, and Vulkan compute details.',
       },
       {
         title: 'RDNA4 Tuning Guide',
-        href: '/zinc/docs/rdna4-tuning',
+        href: '/zinc/docs/rdna4-tuning/',
         description: 'Driver, shader, cooperative matrix, and benchmark tuning notes.',
       },
       {
         title: 'ZINC Benchmarks',
-        href: '/zinc/benchmarks',
+        href: '/zinc/benchmarks/',
         description: 'Current public measurements across AMD, Metal, and baseline engines.',
       },
     ],
@@ -838,44 +838,44 @@ export const topicHubs: TopicHub[] = [
     readNext: [
       {
         title: 'Why FP16 KV cache is the wrong default for 128k context',
-        href: '/blog/2026-04-26-why-fp16-kv-cache-is-the-wrong-default-for-128k-context-on-32gb-rdna4',
+        href: '/blog/2026-04-26-why-fp16-kv-cache-is-the-wrong-default-for-128k-context-on-32gb-rdna4/',
         description: 'The memory math for long context on a 32 GB RDNA4 card.',
       },
       {
         title: 'The 16k crossover where KV reads outweigh active weights',
-        href: '/blog/2026-04-27-the-16k-crossover-where-kv-reads-outweigh-active-weights-on-rdna4-decode',
+        href: '/blog/2026-04-27-the-16k-crossover-where-kv-reads-outweigh-active-weights-on-rdna4-decode/',
         description: 'Why decode becomes KV-bandwidth dominated at long context.',
       },
       {
         title: 'Paged KV cache is the serving fix a single-user local engine can mostly skip',
-        href: '/blog/2026-05-26-paged-kv-cache-is-the-serving-fix-a-single-user-local-engine-can-mostly-skip',
+        href: '/blog/2026-05-26-paged-kv-cache-is-the-serving-fix-a-single-user-local-engine-can-mostly-skip/',
         description: 'Where paging matters, where contiguous cache is simpler, and what prefix sharing changes.',
       },
       {
         title: 'FP8 KV cache is the next decode bandwidth cut RDNA4 already has the WMMA for',
-        href: '/blog/2026-05-19-fp8-kv-cache-is-the-next-decode-bandwidth-cut-rdna4-already-has-the-wmma-for',
+        href: '/blog/2026-05-19-fp8-kv-cache-is-the-next-decode-bandwidth-cut-rdna4-already-has-the-wmma-for/',
         description: 'Why lower-precision K/V storage also becomes a throughput optimization.',
       },
       {
         title: 'Why GQA is not the last KV cache shape for local 32 GB long context',
-        href: '/blog/2026-05-03-why-gqa-is-not-the-last-kv-cache-shape-for-local-32gb-long-context',
+        href: '/blog/2026-05-03-why-gqa-is-not-the-last-kv-cache-shape-for-local-32gb-long-context/',
         description: 'Why the next reductions are architectural and memory-layout driven.',
       },
     ],
     docs: [
       {
         title: 'TurboQuant KV Cache Compression',
-        href: '/zinc/docs/turboquant-spec',
+        href: '/zinc/docs/turboquant-spec/',
         description: 'ZINC design notes for 2-4 bit K/V pages and QJL correction.',
       },
       {
         title: 'ZINC Technical Specification',
-        href: '/zinc/docs/spec',
+        href: '/zinc/docs/spec/',
         description: 'Paged KV cache, request scheduling, and attention engine architecture.',
       },
       {
         title: 'Running ZINC',
-        href: '/zinc/docs/running-zinc',
+        href: '/zinc/docs/running-zinc/',
         description: 'Runtime flags and model-running details, including KV-related options.',
       },
     ],

@@ -377,7 +377,7 @@ function modulePath(relativePath: string): string {
 }
 
 function moduleHref(slug: string): string {
-  return `/zinc/docs/zig-api/${slug}`;
+  return `/zinc/docs/zig-api/${slug}/`;
 }
 
 function sourceHref(sourcePath: string, line: number): string {

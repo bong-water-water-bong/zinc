@@ -50,9 +50,9 @@ That is the line ZINC_RT started crossing this week.
 
 ## The honest state
 
-ZINC_RT is still an opt-in runtime. The production backend for published performance numbers is still Vulkan on AMD and Metal on Apple Silicon. The broader performance picture is in the [June 1 ZINC performance overview](/blog/2026-06-01-zinc-performance-where-it-is-fast-and-where-it-is-not).
+ZINC_RT is still an opt-in runtime. The production backend for published performance numbers is still Vulkan on AMD and Metal on Apple Silicon. The broader performance picture is in the [June 1 ZINC performance overview](/blog/2026-06-01-zinc-performance-where-it-is-fast-and-where-it-is-not/).
 
-The point of ZINC_RT is different. The [runtime-below-Vulkan post](/blog/2026-05-12-the-runtime-below-vulkan-that-local-llms-needed) explained the motivation: once the kernels get fast enough, the runtime layer starts showing through the profile. The longer [ROCm vs Vulkan vs ZINC_RT decision record](/blog/2026-05-18-inside-the-decision-to-write-our-own-gpu-runtime-for-local-llm-inference) explained why the direct path exists beside Vulkan instead of replacing it overnight.
+The point of ZINC_RT is different. The [runtime-below-Vulkan post](/blog/2026-05-12-the-runtime-below-vulkan-that-local-llms-needed/) explained the motivation: once the kernels get fast enough, the runtime layer starts showing through the profile. The longer [ROCm vs Vulkan vs ZINC_RT decision record](/blog/2026-05-18-inside-the-decision-to-write-our-own-gpu-runtime-for-local-llm-inference/) explained why the direct path exists beside Vulkan instead of replacing it overnight.
 
 This week is the first practical answer to the obvious question after those posts: what is the smallest unit of real model work ZINC_RT can own?
 
@@ -160,7 +160,7 @@ The only metric that matters at this stage is whether the GPU produced a value t
 
 The direct-runtime story is moving from architecture to contracts.
 
-The architecture was the easy part to write about: no Vulkan, PM4 packets, user-mapped rings, eventually user-mode queues, eventually persistent decode. Those ideas are in the [ZINC_RT design doc](/zinc/docs/zinc-rt-design), and they are still the reason the runtime exists.
+The architecture was the easy part to write about: no Vulkan, PM4 packets, user-mapped rings, eventually user-mode queues, eventually persistent decode. Those ideas are in the [ZINC_RT design doc](/zinc/docs/zinc-rt-design/), and they are still the reason the runtime exists.
 
 The contracts are harder:
 

@@ -100,7 +100,7 @@ Two things are worth stating plainly so nobody reads this as a performance claim
 
 Nothing about this change makes the underlying engine faster. The same ZINC binary that reported 1.0 tok/s prefill in the cold harness still has the same per-token cost once the pages are warm. What changes is that the reported number stops depending on OS state that ZINC does not control. The April 18 "regression" against April 15 disappears because it was never a regression.
 
-It also does not eliminate the real cold-start cost. Users who open ZINC for the first time after a reboot still pay the mmap fault-in tax, and that cost deserves its own dedicated metric. We keep the CLI path alive for exactly that reason, and `bench-metal` remains the right tool for cold-process microbenchmarks cited in the earlier [RDNA4 shader post](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s) and the [bring-up post](/blog/2026-04-01-bringing-zinc-to-apple-silicon).
+It also does not eliminate the real cold-start cost. Users who open ZINC for the first time after a reboot still pay the mmap fault-in tax, and that cost deserves its own dedicated metric. We keep the CLI path alive for exactly that reason, and `bench-metal` remains the right tool for cold-process microbenchmarks cited in the earlier [RDNA4 shader post](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s/) and the [bring-up post](/blog/2026-04-01-bringing-zinc-to-apple-silicon/).
 
 ## What this says about local inference benchmarking
 
@@ -114,4 +114,4 @@ For ZINC, that is what the next performance suite publishes. The numbers will be
 
 That is the measurement we should have been publishing the whole time.
 
-For the background on how ZINC's managed-model surface and benchmark path fit together, see [Qwen3.6-35B-A3B is now generally available](/blog/2026-04-17-qwen-3-6-is-now-generally-available-in-zinc), [every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc), and [bringing ZINC to Apple Silicon](/blog/2026-04-01-bringing-zinc-to-apple-silicon). If you just want to run a model, start with [Getting Started](/zinc/docs/getting-started) and [Running ZINC](/zinc/docs/running-zinc).
+For the background on how ZINC's managed-model surface and benchmark path fit together, see [Qwen3.6-35B-A3B is now generally available](/blog/2026-04-17-qwen-3-6-is-now-generally-available-in-zinc/), [every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc/), and [bringing ZINC to Apple Silicon](/blog/2026-04-01-bringing-zinc-to-apple-silicon/). If you just want to run a model, start with [Getting Started](/zinc/docs/getting-started/) and [Running ZINC](/zinc/docs/running-zinc/).

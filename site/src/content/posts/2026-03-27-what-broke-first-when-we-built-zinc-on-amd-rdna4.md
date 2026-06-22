@@ -35,7 +35,7 @@ The first version of ZINC, our local LLM inference engine for AMD RDNA4 GPUs, di
 
 I think these early local LLM inference failures are worth writing down because people tend to talk about inference engines as if the hard part starts with optimization. It does not. The hard part starts earlier, when you are still proving that the computation you think you are running is actually the computation the model needs.
 
-That was the real beginning of [ZINC](/zinc). It is the same project I introduced in [why we're building ZINC for local LLM inference on AMD GPUs](/blog/2026-03-25-why-we-are-building-zinc), but this was the less glamorous part of that story. Before any serious throughput work, before any clean benchmark story, the project had to survive a long sequence of correctness failures on the path to a working forward pass for Qwen3.5-35B-A3B on AMD RDNA4. The exact GGUF we were running was [Unsloth's `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/blob/main/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf). By the time these fixes landed, ZINC was still only around 0.8 tok/s against a llama.cpp baseline of 107 tok/s on the same node. But for the first time, it was running something recognizably close to the right model.
+That was the real beginning of [ZINC](/zinc/). It is the same project I introduced in [why we're building ZINC for local LLM inference on AMD GPUs](/blog/2026-03-25-why-we-are-building-zinc/), but this was the less glamorous part of that story. Before any serious throughput work, before any clean benchmark story, the project had to survive a long sequence of correctness failures on the path to a working forward pass for Qwen3.5-35B-A3B on AMD RDNA4. The exact GGUF we were running was [Unsloth's `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/blob/main/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf). By the time these fixes landed, ZINC was still only around 0.8 tok/s against a llama.cpp baseline of 107 tok/s on the same node. But for the first time, it was running something recognizably close to the right model.
 
 ## The first mistake was thinking the model was simpler than it was
 
@@ -110,7 +110,7 @@ One of the more frustrating lessons from this stage had nothing to do with Zig o
 
 The answer was simpler and more annoying. Ubuntu had auto-updated Mesa from 25.0.7 to 25.2.8, and RADV performance on RDNA4 cooperative matrix workloads dropped by about 14%. That is not just a benchmark inconvenience. It changes how every optimization result gets interpreted. If the baseline is drifting under your feet, you stop learning from your measurements.
 
-That is why driver pinning ended up in the same category as tokenizer correctness and descriptor bindings. Reproducibility is not administrative overhead on a project like this. It is part of the engine. If the target environment moves too much, the development loop gets noisier and the wrong ideas survive longer than they should. I wrote the hardware and driver side of that setup down in the [home AI rig post](/blog/2026-03-26-building-a-local-ai-rig), and the lower-level environment details live in the [RDNA4 tuning notes](/zinc/docs/rdna4-tuning).
+That is why driver pinning ended up in the same category as tokenizer correctness and descriptor bindings. Reproducibility is not administrative overhead on a project like this. It is part of the engine. If the target environment moves too much, the development loop gets noisier and the wrong ideas survive longer than they should. I wrote the hardware and driver side of that setup down in the [home AI rig post](/blog/2026-03-26-building-a-local-ai-rig/), and the lower-level environment details live in the [RDNA4 tuning notes](/zinc/docs/rdna4-tuning/).
 
 <figure class="diagram-card diagram-wide">
   <img src="/blog/early-zinc-timeline.svg" alt="A timeline showing the early ZINC debugging sequence from fake forward pass to pinned benchmark environment." loading="lazy" />
@@ -127,7 +127,7 @@ Those are hard problems, but they are the right problems. These were not ROCm pa
 
 ## Related reading behind these bugs
 
-If you want the bigger story around this project, the first two posts are still the right place to start: [why we're building ZINC for local LLM inference on AMD GPUs](/blog/2026-03-25-why-we-are-building-zinc) explains the thesis, and [building a local AI rig: from trading workstation to home AI server](/blog/2026-03-26-building-a-local-ai-rig) shows the RDNA4 node the engine runs on.
+If you want the bigger story around this project, the first two posts are still the right place to start: [why we're building ZINC for local LLM inference on AMD GPUs](/blog/2026-03-25-why-we-are-building-zinc/) explains the thesis, and [building a local AI rig: from trading workstation to home AI server](/blog/2026-03-26-building-a-local-ai-rig/) shows the RDNA4 node the engine runs on.
 
 The underlying algorithms and systems ideas also have a clear paper trail:
 

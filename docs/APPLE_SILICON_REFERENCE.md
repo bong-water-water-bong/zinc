@@ -8,8 +8,8 @@ Last updated: 2026-03-31
 
 Related docs:
 
-- [`docs/APPLE_METAL_REFERENCE.md`](./APPLE_METAL_REFERENCE.md) covers the backend-facing Metal runtime contract, tuning surface, and implementation guidance for ZINC on macOS.
-- [`docs/APPLE_SILICON_METAL_ENABLEMENT.md`](./APPLE_SILICON_METAL_ENABLEMENT.md) covers the full-detail bring-up and implementation history of the current Metal backend.
+- [`docs/APPLE_METAL_REFERENCE.md`](/zinc/docs/apple-metal-reference/) covers the backend-facing Metal runtime contract, tuning surface, and implementation guidance for ZINC on macOS.
+- [`docs/APPLE_SILICON_METAL_ENABLEMENT.md`](/zinc/docs/apple-silicon-metal-enablement/) covers the full-detail bring-up and implementation history of the current Metal backend.
 
 ## How To Use This Doc
 

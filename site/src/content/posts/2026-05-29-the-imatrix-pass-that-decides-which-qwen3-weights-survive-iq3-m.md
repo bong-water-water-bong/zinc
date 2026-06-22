@@ -33,7 +33,7 @@ The cheapest way to ship Qwen3-30B on a 32 GB card is to take it past 4 bits, an
 
 It is dominant on a specific condition that nobody puts in the filename. `IQ3_M`, like every other quant in the IQ family, is built around an importance matrix. Strip the imatrix step out of the pipeline, ship the file anyway, and the quality curve in that bit range collapses back to where the k-quants live. The codebook is doing the work of 3 bits and the imatrix is telling it where to spend them. This post is about that calibration pass, what it actually computes, and why it is the part of the GGUF supply chain that turns IQ3 from a research curiosity into the default sub-4-bit quant for a single-user local engine.
 
-The reason this matters now is that the IQ3 family is the operating point for 30B-class models on consumer 32 GB cards. We sized [Qwen3 activations off 4 bits](/blog/2026-05-23-the-outlier-channels-that-keep-qwen3-activations-off-4-bit) last week and argued that the activation floor is 8-bit, which leaves all the bit-saving on the weight side. IQ3_M is the result of that arithmetic, and it only exists because of an offline pass that runs on CPU for an hour and is then never spoken of again.
+The reason this matters now is that the IQ3 family is the operating point for 30B-class models on consumer 32 GB cards. We sized [Qwen3 activations off 4 bits](/blog/2026-05-23-the-outlier-channels-that-keep-qwen3-activations-off-4-bit/) last week and argued that the activation floor is 8-bit, which leaves all the bit-saving on the weight side. IQ3_M is the result of that arithmetic, and it only exists because of an offline pass that runs on CPU for an hour and is then never spoken of again.
 
 ## What an importance matrix actually is
 

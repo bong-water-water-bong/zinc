@@ -61,7 +61,7 @@ For a local engine, that reframes the decision but does not flip it. The practic
 
 ## What this costs on an RDNA4 decode
 
-The cost of swapping the truncation step on the sampler chain is essentially zero on the decode roofline. The [batch=1 decode roofline post](/blog/2026-04-30-rdna4-matrix-cores-sit-out-the-decode-loop) walked through why the wall-time floor on a Qwen3-30B-A3B decode step on the R9700 is set by the ~3 GB of active-weight reads at Q4_K_M and the KV cache reads scaling with context. The sampler runs after the logits land back on the host. A 151,936-entry sort plus a single threshold comparison is a few hundred microseconds on a modern CPU; the truncation walk is linear in the number of tokens above the threshold, which for any real distribution is a few thousand tokens at most.
+The cost of swapping the truncation step on the sampler chain is essentially zero on the decode roofline. The [batch=1 decode roofline post](/blog/2026-04-30-rdna4-matrix-cores-sit-out-the-decode-loop/) walked through why the wall-time floor on a Qwen3-30B-A3B decode step on the R9700 is set by the ~3 GB of active-weight reads at Q4_K_M and the KV cache reads scaling with context. The sampler runs after the logits land back on the host. A 151,936-entry sort plus a single threshold comparison is a few hundred microseconds on a modern CPU; the truncation walk is linear in the number of tokens above the threshold, which for any real distribution is a few thousand tokens at most.
 
 | Sampler stage | Cost per decoded token | Share of 33 ms decode |
 | --- | ---: | ---: |
