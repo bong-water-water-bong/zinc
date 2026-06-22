@@ -1,0 +1,27 @@
+You are autonomously landing ONE validated CUDA PREFILL performance improvement on the ZINC inference engine (Zig) this cycle, then stopping. Be rigorous and honest; a documented NEGATIVE result is valuable. Work from this repo checkout on the Mac; build + measure happen on the remote NVIDIA box over SSH.
+
+STEP 0 — READ FIRST (these hold the full state, box access, and the gotchas; honor them):
+- /Users/stepan/.claude/projects/-Users-stepan-Workspace-zinc/memory/MEMORY.md
+- the memory it points to: project_llama_gap_4090.md (THE prefill gap + lever plan + T2 state), project_agent_zinc_access.md (box SSH), project_zinc_cuda_backend.md
+- docs/prefill_gap_closure_plan.md (root cause + prioritized levers T1/T2/T3/T4)
+
+THE GOAL: close ZINC's CUDA prefill gap vs llama.cpp on the RTX 4090. Decode is ~85-90% of llama; PREFILL is the gap (matched 4090 p90: dense 6-16x, MoE 21-29x behind). Improve prefill THROUGHPUT (prompt processing tok/s) without breaking token-correctness.
+
+STATE (2026-06-22): T2 v1 is a VALIDATED WIN on branch `perf/t2-gemma-tc-experts` — a single-launch padded grouped Tensor-core MoE-expert GEMM (`build_expert_order_padded` + `gemm_q4k_experts_grouped_tc` in src/shaders/cuda/kernels.cu; `moeRoutedExpertsTC` in src/compute/forward_cuda_gemma.zig, env `ZINC_MOE_TC`). gemma-26b prefill T=1037 ~+18% (336 vs 270 t/s), token-correct. It is OPT-IN (off by default).
+
+LEVERS (pick ONE per cycle; let the measurement decide; prefer continuing perf/t2-gemma-tc-experts first):
+1. PRODUCTIONIZE T2 (highest EV, mostly done): (a) make `ZINC_MOE_TC` DEFAULT-ON, T-GATED — measure the crossover (it is SLOWER at tiny T due to padding/overhead; +18% at T=1037) and gate default-on at the measured T (mirror the cuBLAS `cublas_min_t`); add an opt-OUT. (b) remove the v0 dead code (the per-expert path: `gather_by_order`/`scatter_by_order`/`build_expert_order_off` kernels + `a_grouped`/`yg_gate`/`yg_up`/`expert_offsets` buffers — all unused by v1). (c) put the Q5_1 down-proj on Tensor cores too (needs a Q5_1 grouped-TC kernel; currently down stays matvec). (d) PORT the grouped-TC experts to the qwen MoE prefill path (`src/compute/forward_cuda.zig` `moeFfnBlockBatched` — qwen36-35b-a3b prefill is the worst row, 29x).
+2. T1 — fused dequant + Tensor-core DENSE GEMM (MMQ-class): bring `gemm_q4k_tc` to cuBLAS-class via cp.async double-buffering + larger tiles, beating cuBLAS+round-trip at T>=512 in an isolated microbench BEFORE wiring. (Hard; this overlaps Effort-29's T1a on the 5090 — coordinate, don't duplicate.)
+3. T3 — qwen hybrid-SSM prefill: profile (nsys, kernel timings — ncu counters are BLOCKED on this box) why qwen dense prefill (16x) trails gemma dense (6x); optimize the delta-net scan / conv1d / per-head norms if they dominate.
+4. T4 — launch/recast fusion (incremental, bit-identical where possible).
+
+HARD RULES (violating these wastes the cycle):
+- PIN THE 4090: export CUDA_VISIBLE_DEVICES and ZINC_GPU to the 4090 UUID (from project_llama_gap_4090 / project_agent_zinc_access memory) for EVERY build-dbg run and measurement.
+- CORRECTNESS GATE: `scripts/validate_catalog.sh` (ZINC_GPU=4090) MUST stay 5/5 token-correct. fp16/TC paths are token-TOLERANCE (>=8/12 prefix match), not bit-identical — that is OK; an EARLY divergence is a real bug → REVERT. To exercise a T-gated path in validate, set its env flag (e.g. ZINC_MOE_TC=1) or use a long ZINC_PROMPT.
+- ISOLATED-CACHE BUILD: `rm -rf .zig-cache` is NOT enough (the zig GLOBAL cache serves stale binaries). Build with `ZIG_LOCAL_CACHE_DIR=/tmp/lc-$RANDOM ZIG_GLOBAL_CACHE_DIR=/tmp/gc-$RANDOM ~/zig-0.15.2/zig build ... -Dbackend=cuda` and VERIFY the binary md5 changed, or you are measuring stale code.
+- PROFILING: `ncu` perf counters are BLOCKED on this WSL2 box (ERR_NVGPUCTRPERM) — A/B is the ONLY perf gate. nsys (tracing/timings) works.
+- MEASURE interleaved A/B at a REAL prefill size (~1037-token prompt; tok/s prints to STDERR, use 2>&1; parse "Prefill complete: T tokens in X ms (Y tok/s)"). The 4090 is boost-noisy — run >=3 interleaved rounds, compare clean rounds (both near full boost), never trust one run. Compare vs llama-bench pp<T> on the SAME 4090 + gguf for gap context.
+- COMMIT ONLY to a `perf/<short-name>` branch and `git push origin <branch>` — NEVER push to main (the operator harvests validated wins). On a WIN: commit the change + append a dated result to project_llama_gap_4090.md memory. On a NEGATIVE: revert the code, but document the finding in memory (prevents re-trying).
+- Work in an ISOLATED box dir (e.g. `~/zinc-prefill` as a git worktree off the perf branch); do NOT touch the operator's other checkouts, the 5090, or other efforts. gemma models reload ~18GB/call (slow); qwen35-9b is at ~/workspace/Qwen3.5-9B-Q4_K_M.gguf, the rest at ~/workspace/models/.
+
+WORKFLOW THIS CYCLE: (1) git fetch origin; pick a lever; create/continue a perf/<name> branch off origin/main (or perf/t2-gemma-tc-experts). (2) implement ONE focused change. (3) rsync the repo to the isolated box dir; isolated-cache build; verify md5 changed. (4) validate_catalog 5/5 (REVERT if correctness breaks). (5) interleaved A/B vs the pre-change baseline on the 4090. (6) WIN (5/5 + measurably faster) → commit + push the perf branch + log to memory; NEGATIVE → revert + log. (7) clean up box scratch. STOP (do not loop yourself; the outer driver spawns the next cycle).
