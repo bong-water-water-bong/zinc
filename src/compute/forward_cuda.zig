@@ -160,6 +160,7 @@ const MatvecBatchPush = extern struct { M: u32, K: u32, x_tok_stride: u32, y_tok
 const F32ToF16Push = extern struct { N: u32 };
 const DequantQ4KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
 const DequantQ6KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
+const DequantQ8_0Push = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
 const AddPush = extern struct { N: u32 };
 const ConvBatchPush = extern struct { conv_channels: u32, d_conv: u32, kernel_is_f16: u32, n_tok: u32, state_offset: u32 };
 const GatedNormBatchPush = extern struct { d_inner: u32, dt_rank: u32, head_v_dim: u32, d_state: u32, norm_per_head: u32, n_tok: u32 };
@@ -310,6 +311,7 @@ const Pipelines = struct {
     // Effort 26 T0: batched-prefill GEMM + SSM kernels (qwen prefillBatched).
     dequant_q4k_to_f16: CudaPipeline, // full Q4_K weight [M,K] → fp16 for cuBLAS
     dequant_q6k_to_f16: CudaPipeline, // full Q6_K weight [M,K] → fp16 for cuBLAS
+    dequant_q8_0_to_f16: CudaPipeline, // full Q8_0 weight [M,K] → fp16 for cuBLAS (shexp)
     f32_to_f16: CudaPipeline, // activation downcast [T,K] → fp16 for cuBLAS
     add_inplace: CudaPipeline, // residual fold: hidden += projection
     ssm_conv1d_batched: CudaPipeline, // one launch over all T (circular state)
@@ -571,6 +573,7 @@ pub const ForwardCuda = struct {
     batch: ?BatchScratch = null,
     use_cublas: bool = false, // dense Q4_K/Q6_K prefill GEMMs via cuBLAS fp16 TC
     use_cublas_q6: bool = false, // also route Q6_K dense GEMMs through cuBLAS
+    use_cublas_q8: bool = false, // also route Q8_0 dense GEMMs through cuBLAS (qwen36 shexp)
     cublas_min_t: u32 = 128, // only use cuBLAS once T amortizes the dequant round-trip
 
     // Effort 28 inc 4 — per-SEQUENCE slot state for batched decode (null until
@@ -675,6 +678,7 @@ pub const ForwardCuda = struct {
         // Effort 26 T0: batched-prefill GEMM + SSM kernels.
         pipes.dequant_q4k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q4k_to_f16");
         pipes.dequant_q6k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q6k_to_f16");
+        pipes.dequant_q8_0_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q8_0_to_f16");
         pipes.f32_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "f32_to_f16");
         pipes.add_inplace = try pipeline.createPipeline(ctx, src.ptr, "add_inplace");
         pipes.ssm_conv1d_batched = try pipeline.createPipeline(ctx, src.ptr, "ssm_conv1d_batched");
@@ -1221,6 +1225,7 @@ pub const ForwardCuda = struct {
         // cuBLAS dense-GEMM defaults (mirror the gemma path): on unless opted out.
         self.use_cublas = cublasDefaultOn();
         self.use_cublas_q6 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
+        self.use_cublas_q8 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ8") == null;
         // Effort 29 T2: token-batched MoE FFN (qwen36). DEFAULT-ON; opt out to the
         // proven per-token loop via ZINC_QWEN_MOE_BATCHED=0 (for the A/B baseline).
         const moe_batched = qwenMoeBatchedOn();
@@ -1526,14 +1531,17 @@ pub const ForwardCuda = struct {
     /// prefillStep). Always OVERWRITES y (residual folds use add_inplace).
     fn gemmDispatchPrefill(self: *ForwardCuda, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, T: u32) void {
         const idx = dmmvIdx(w.info.type_);
-        if (self.use_cublas and T >= self.cublas_min_t and (idx == 0 or (idx == 2 and self.use_cublas_q6))) {
+        if (self.use_cublas and T >= self.cublas_min_t and (idx == 0 or (idx == 2 and self.use_cublas_q6) or (idx == 3 and self.use_cublas_q8))) {
             const b = &self.batch.?;
             if (idx == 0) {
                 const dq = DequantQ4KPush{ .M = M, .K = K };
                 cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ4KPush), 0);
-            } else {
+            } else if (idx == 2) {
                 const dq = DequantQ6KPush{ .M = M, .K = K };
                 cmd.dispatch(&self.pipes.dequant_q6k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ6KPush), 0);
+            } else {
+                const dq = DequantQ8_0Push{ .M = M, .K = K };
+                cmd.dispatch(&self.pipes.dequant_q8_0_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ8_0Push), 0);
             }
             const cvt = F32ToF16Push{ .N = T * K };
             cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, &b.act_f16 }, &cvt, @sizeOf(F32ToF16Push), 0);

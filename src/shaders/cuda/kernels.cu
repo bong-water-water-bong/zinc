@@ -3024,6 +3024,28 @@ extern "C" __global__ void dequant_q6k_to_f16(const unsigned char* a, half* Wf16
     Wf16[i] = __float2half(d * (float)sc[sci] * ((float)q - 32.0f));
 }
 
+// ---- dequant_q8_0_to_f16 (Effort 29 cycle 5: full-weight Q8_0 -> fp16) --------
+// Q8_0 analog of dequant_q4k/q6k_to_f16: dequant a Q8_0 weight W[M,K] (row-major,
+// 32-elem blocks = 34 BYTES each: f16 d + 32 int8) to a dense fp16 buffer
+// Wf16[M,K] so prefill GEMMs can run on cuBLAS fp16 tensor cores. The qwen36
+// MoE's shared-expert gate/up/down are Q8_0 → gemmDispatchPrefill's cuBLAS path
+// only fired for Q4_K/Q6_K, so they fell back to per-token matvec (~T launches
+// each). Per-element unpack identical to dmmv_q8_0_fast (val = d*(float)qs[e]),
+// then __float2half. One thread per (row,col) element. a_offset is BYTES.
+struct DequantQ8_0Push { unsigned M, K, a_offset; };
+extern "C" __global__ void dequant_q8_0_to_f16(const unsigned char* a, half* Wf16, DequantQ8_0Push pc) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)pc.M * pc.K;
+    if (i >= total) return;
+    unsigned row = (unsigned)(i / pc.K), k = (unsigned)(i % pc.K);
+    unsigned bpr = pc.K >> 5;            // Q8_0 blocks per row
+    unsigned bi = k >> 5, within = k & 31u;
+    const unsigned char* blk = a + pc.a_offset + (size_t)row * bpr * 34u + (size_t)bi * 34u;
+    float d = zinc_half_to_float((unsigned short)((unsigned)blk[0] | ((unsigned)blk[1] << 8)));
+    const signed char* qs = (const signed char*)(blk + 2);
+    Wf16[i] = __float2half(d * (float)qs[within]);
+}
+
 // ---- rms_norm_f16 (Effort 24 cycle 21: emit the fp16 norm DIRECTLY for the TC path) ----
 // Byte-for-byte f32_to_f16(rms_norm(x,w)): computes the SAME f32 normalized value
 // w[i]*(x[i]*rinv) with the SAME reduction order as rms_norm, then __float2half-stores
