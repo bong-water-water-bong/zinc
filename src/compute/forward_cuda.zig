@@ -321,6 +321,7 @@ const Pipelines = struct {
     build_expert_order_padded: CudaPipeline,
     gemm_q4k_experts_grouped_tc: CudaPipeline,
     gemm_q5k_experts_grouped_tc: CudaPipeline,
+    gemm_q6k_experts_grouped_tc: CudaPipeline, // down twin for the 4 Q6_K layers
     // Effort 26 T0: batched-prefill GEMM + SSM kernels (qwen prefillBatched).
     dequant_q4k_to_f16: CudaPipeline, // full Q4_K weight [M,K] → fp16 for cuBLAS
     dequant_q6k_to_f16: CudaPipeline, // full Q6_K weight [M,K] → fp16 for cuBLAS
@@ -714,6 +715,7 @@ pub const ForwardCuda = struct {
         pipes.build_expert_order_padded = try pipeline.createPipeline(ctx, src.ptr, "build_expert_order_padded");
         pipes.gemm_q4k_experts_grouped_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_experts_grouped_tc");
         pipes.gemm_q5k_experts_grouped_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_experts_grouped_tc");
+        pipes.gemm_q6k_experts_grouped_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_experts_grouped_tc");
         // Effort 26 T0: batched-prefill GEMM + SSM kernels.
         pipes.dequant_q4k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q4k_to_f16");
         pipes.dequant_q6k_to_f16 = try pipeline.createPipeline(ctx, src.ptr, "dequant_q6k_to_f16");
@@ -1566,18 +1568,24 @@ pub const ForwardCuda = struct {
         }
         const sg = SwigluPush{ .N = T * n_used * ef };
         cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(T * n_used * ef, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_e, &b.up_e, &b.swiglu_e }, &sg, @sizeOf(SwigluPush), 0);
-        // Down projection: when the gate/up grouped-TC path ran (use_tc) AND down is
-        // Q5_K (36/40 qwen36-35b-a3b layers), put down on TC too — reuse the SAME
-        // padded order/tile_expert (same routing) with a Q5_K grouped-TC GEMM whose A
-        // is the per-work-item SwiGLU output. Down is 1/3 of expert FLOPs and the
-        // matvec re-reads each expert's whole down weight per routed token. The 4
-        // Q6_K down layers (and any non-TC layer) keep the matvec.
-        if (use_tc and wde.info.type_ == .q5_k and moeDownTcOn()) {
+        // Down projection: when the gate/up grouped-TC path ran (use_tc), put down on
+        // TC too — reuse the SAME padded order/tile_expert (same routing) with a
+        // grouped-TC GEMM whose A is the per-work-item SwiGLU output. Down is 1/3 of
+        // expert FLOPs and the matvec re-reads each expert's whole down weight per
+        // routed token. qwen36-35b-a3b down = Q5_K ×36 + Q6_K ×4 — a per-quant kernel
+        // each (the Q6_K matvec is the heaviest, 6-bit weight traffic). Any other
+        // quant falls back to the matvec.
+        const down_tc_pipe: ?*CudaPipeline = if (use_tc and moeDownTcOn()) switch (wde.info.type_) {
+            .q5_k => &self.pipes.gemm_q5k_experts_grouped_tc,
+            .q6_k => if (moeDownQ6kTcOn()) &self.pipes.gemm_q6k_experts_grouped_tc else null, // the 4 Q6_K layers
+            else => null,
+        } else null;
+        if (down_tc_pipe) |dpipe| {
             const Pd = n_used * T;
             const max_pos_d = Pd + 64 * d.n_experts;
             const max_tiles_d = max_pos_d >> 6;
             const pd = GroupedTCDownPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .n_used = n_used, .dst_tok_stride = n_used * d.n_embd };
-            cmd.dispatch(&self.pipes.gemm_q5k_experts_grouped_tc, .{ ceilDiv(d.n_embd, 64), max_tiles_d, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &b.swiglu_e, &b.padded_order, &b.tile_expert, &b.down_e }, &pd, @sizeOf(GroupedTCDownPush), 0);
+            cmd.dispatch(dpipe, .{ ceilDiv(d.n_embd, 64), max_tiles_d, 1 }, .{ 256, 1, 1 }, &.{ &wde.gpu_buffer, &b.swiglu_e, &b.padded_order, &b.tile_expert, &b.down_e }, &pd, @sizeOf(GroupedTCDownPush), 0);
         } else {
             const pd = ExpertsBatchPush{ .M = d.n_embd, .K = ef, .slice = down_slice, .x_stride = ef, .n_used = n_used, .base = 0, .routing_stride = rt_stride, .x_tok_stride = n_used * ef, .y_tok_stride = n_used * d.n_embd };
             cmd.dispatch(down_pipe, .{ n_used * d.n_embd, T, 1 }, .{ 64, 1, 1 }, &.{ &wde.gpu_buffer, &b.swiglu_e, &b.down_e, &b.router_table_e }, &pd, @sizeOf(ExpertsBatchPush), 0);
@@ -3108,6 +3116,16 @@ fn moeTcForced() bool {
 /// with ZINC_MOE_DOWN_TC=0/off → down falls back to the matvec (the A/B baseline).
 fn moeDownTcOn() bool {
     const v = std.posix.getenv("ZINC_MOE_DOWN_TC") orelse return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+        std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+/// T2 (qwen MoE port): extend down-TC to the 4 Q6_K down layers (gemm_q6k_experts_
+/// grouped_tc), in addition to the 36 Q5_K layers. DEFAULT-ON when down-TC runs;
+/// opt out / A/B-isolate the Q6_K layers with ZINC_MOE_DOWN_Q6K_TC=0/off → they
+/// fall back to the matvec while Q5_K stays on TC.
+fn moeDownQ6kTcOn() bool {
+    const v = std.posix.getenv("ZINC_MOE_DOWN_Q6K_TC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
