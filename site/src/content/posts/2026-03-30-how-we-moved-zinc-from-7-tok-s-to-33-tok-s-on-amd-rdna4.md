@@ -40,7 +40,7 @@ That question is starting to get a much better answer.
 
 On March 30, 2026, the clean `ReleaseFast` baseline on the same single RDNA4 GPU measured **33.58 tok/s** on [Qwen3.5-35B-A3B-UD Q4_K_XL](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF) running on an **AMD Radeon AI PRO R9700**. That is a little more than a **4x jump** from the old coherent baseline. But the interesting part is not the headline number. It is that the speedup did not come from one heroic trick. It came from a less glamorous mix of real GPU work, fewer CPU round trips, less intrusive measurement, and finally benchmarking the right path.
 
-This post is the bridge between the earlier ZINC story of [basic correctness](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4) and the next stage of throughput work. It is the point where the engine stopped looking "alive but slow" and started posting numbers that actually deserve to be compared.
+This post is the bridge between the earlier ZINC story of [basic correctness](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4/) and the next stage of throughput work. It is the point where the engine stopped looking "alive but slow" and started posting numbers that actually deserve to be compared.
 
 <figure class="diagram-card diagram-wide">
   <img src="/blog/zinc-7-to-33-rdna4.gif" alt="A sped-up screen recording of ZINC running Qwen3.5-35B on the AMD Radeon AI PRO R9700 after the throughput jump, showing the faster AMD RDNA4 decode path in action." loading="lazy" />
@@ -190,6 +190,6 @@ The answer is becoming much clearer: AMD RDNA4 is not the problem. Vulkan is not
 
 That is a much better place to build from.
 
-If you want the broader context around how ZINC got here, the earlier posts tell the story in order: [why we are building ZINC](/blog/2026-03-25-why-we-are-building-zinc), [the local AI rig behind it](/blog/2026-03-26-building-a-local-ai-rig), [what broke first](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4), and [the self-improving loop behind the optimization work](/blog/2026-03-28-karpathy-loop-autoresearch-and-the-self-improving-ai-loop-behind-zinc).
+If you want the broader context around how ZINC got here, the earlier posts tell the story in order: [why we are building ZINC](/blog/2026-03-25-why-we-are-building-zinc/), [the local AI rig behind it](/blog/2026-03-26-building-a-local-ai-rig/), [what broke first](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4/), and [the self-improving loop behind the optimization work](/blog/2026-03-28-karpathy-loop-autoresearch-and-the-self-improving-ai-loop-behind-zinc/).
 
 This new phase is simpler to describe: the engine is no longer arguing with basic correctness or fake baselines. It is finally arguing with the real performance ceiling.

@@ -48,7 +48,7 @@ faqs:
 
 A mixture-of-experts model was decoding at **9 tokens per second** on an RTX 4090. The same GPU runs a *dense* 27B model — which touches far more weights per token — at 36 tok/s. Something was badly wrong, and the fix turned out to have almost nothing to do with arithmetic.
 
-This is the second half of [ZINC's CUDA story](/blog/2026-06-07-how-zinc-got-a-cuda-backend-and-beat-llama-cpp-decode-on-nvidia). The first half was getting a Zig inference engine to produce a *correct token* on NVIDIA at all. This half is about making it **fast** — and the punchline is that the two biggest wins came from the same realization, applied in opposite directions: **on modern GPUs, LLM decode is usually starved, not compute-bound — and you have to measure which kind of "not fast" you're looking at before you write a single kernel.**
+This is the second half of [ZINC's CUDA story](/blog/2026-06-07-how-zinc-got-a-cuda-backend-and-beat-llama-cpp-decode-on-nvidia/). The first half was getting a Zig inference engine to produce a *correct token* on NVIDIA at all. This half is about making it **fast** — and the punchline is that the two biggest wins came from the same realization, applied in opposite directions: **on modern GPUs, LLM decode is usually starved, not compute-bound — and you have to measure which kind of "not fast" you're looking at before you write a single kernel.**
 
 Here is how CUDA LLM decode in ZINC went from "embarrassing" to "beats llama.cpp," what we tried that *didn't* work (and why those failures were the useful part), and the autonomous loop that now hunts these wins on its own.
 

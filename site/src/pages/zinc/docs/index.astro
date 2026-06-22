@@ -13,7 +13,7 @@ const zigCodeLines = zigApi.codeLineCount.toLocaleString('en-US');
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin.ai';
 const breadcrumbItems = [
   { name: 'Home', href: '/' },
-  { name: 'ZINC', href: '/zinc' },
+  { name: 'ZINC', href: '/zinc/' },
   { name: 'Docs' },
 ];
 
@@ -42,7 +42,7 @@ const deepDocs = orderedDocs.filter(doc => !['getting-started', 'hardware-requir
 const combinedDocs = [
   ...startHere.map(doc => ({ label: docMeta[doc.slug]?.label ?? doc.title, href: `/zinc/docs/${doc.slug}` })),
   ...deepDocs.map(doc => ({ label: docMeta[doc.slug]?.label ?? doc.title, href: `/zinc/docs/${doc.slug}` })),
-  { label: 'ZINC Zig API', href: '/zinc/docs/zig-api' },
+  { label: 'ZINC Zig API', href: '/zinc/docs/zig-api/' },
 ];
 
 const jsonLd = {
@@ -92,7 +92,7 @@ const jsonLd = {
         <h2>Experimental and under active development</h2>
         <p>The CLI path is the best-supported way to use ZINC today. Linux on AMD RDNA3 or RDNA4 is the intended environment. Server mode and broader model coverage are still evolving.</p>
       </div>
-      <a href="/zinc/benchmarks" class="status-link">Benchmarks</a>
+      <a href="/zinc/benchmarks/" class="status-link">Benchmarks</a>
     </section>
 
     <section class="quickstart-panel">
@@ -138,7 +138,7 @@ export RADV_PERFTEST=coop_matrix
       </div>
       <div class="grid start-grid">
         {startHere.map(doc => (
-          <a href={`/zinc/docs/${doc.slug}`} class:list={['card', { primary: doc.slug === 'getting-started' }]}>
+          <a href={`/zinc/docs/${doc.slug}/`} class:list={['card', { primary: doc.slug === 'getting-started' }]}>
             <div class="card-head">
               <h3>{docMeta[doc.slug]?.label ?? doc.title}</h3>
               {doc.slug === 'getting-started' && <span class="badge">First</span>}
@@ -156,12 +156,12 @@ export RADV_PERFTEST=coop_matrix
       </div>
       <div class="grid deep-grid">
         {deepDocs.map(doc => (
-          <a href={`/zinc/docs/${doc.slug}`} class="card">
+          <a href={`/zinc/docs/${doc.slug}/`} class="card">
             <h3>{docMeta[doc.slug]?.label ?? doc.title}</h3>
             <p>{docMeta[doc.slug]?.description}</p>
           </a>
         ))}
-        <a href="/zinc/docs/zig-api" class="card api-card">
+        <a href="/zinc/docs/zig-api/" class="card api-card">
           <div class="card-head">
             <h3>Zig API Reference</h3>
             <span class="badge">Generated</span>
@@ -181,7 +181,7 @@ export RADV_PERFTEST=coop_matrix
       <h3>Zig API Sections</h3>
       <div class="section-list">
         {zigApi.sections.map(section => (
-          <a href={`/zinc/docs/zig-api#${section.slug}`} class="section-link">
+          <a href={`/zinc/docs/zig-api/#${section.slug}`} class="section-link">
             <span class="section-name">{section.title}</span>
             <span class="section-meta">{section.modules.length} modules, {section.symbolCount} symbols</span>
           </a>

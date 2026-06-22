@@ -22,11 +22,11 @@ const posts = (await getCollection('posts', ({ data }) => !data.draft))
 >
   <section class="hero">
     <h1>Stepan Zolotukhin</h1>
-    <p>I'm building <a href="/zinc">ZINC</a>, a local LLM inference engine for AMD GPUs and Apple Silicon. This site is where I write about the work — GPU kernels, Vulkan and Metal compute, quantization, and the systems engineering underneath.</p>
+    <p>I'm building <a href="/zinc/">ZINC</a>, a local LLM inference engine for AMD GPUs and Apple Silicon. This site is where I write about the work — GPU kernels, Vulkan and Metal compute, quantization, and the systems engineering underneath.</p>
   </section>
 
   <section class="project-highlight">
-    <a href="/zinc" class="project-card">
+    <a href="/zinc/" class="project-card">
       <h2>ZINC</h2>
       <p>Local LLM inference on AMD GPUs and Apple Silicon — hand-tuned Vulkan and Metal shaders, no ROCm, no MLX, one binary. 37.95 tok/s on RDNA4 with a 35B model, native Apple Silicon support via Metal.</p>
       <span class="project-link">Learn more &rarr;</span>
@@ -44,7 +44,7 @@ const posts = (await getCollection('posts', ({ data }) => !data.draft))
         tags={post.data.tags}
       />
     ))}
-    <p class="all-posts"><a href="/blog">All posts &rarr;</a></p>
+    <p class="all-posts"><a href="/blog/">All posts &rarr;</a></p>
   </section>
 </BaseLayout>
 

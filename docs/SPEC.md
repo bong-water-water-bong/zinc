@@ -576,10 +576,10 @@ Those are active engineering directions, not hidden features.
 
 ## 14. Related Docs
 
-- [Running ZINC](/zinc/docs/running-zinc) for CLI, server mode, and managed-model usage
-- [API Reference](/zinc/docs/api) for HTTP request/response details
-- [Development Guide](/zinc/docs/development) for build, test, graph export, and profiling workflow
-- [Apple Silicon Metal Enablement](/zinc/docs/apple-silicon-metal-enablement) for the full Metal port narrative
-- [TurboQuant Spec](/zinc/docs/turboquant-spec) for the forward-looking KV compression design
-- [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning) for AMD-specific performance work
-- [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for Arc B-series hardware, memory-bandwidth, and opcode notes
+- [Running ZINC](/zinc/docs/running-zinc/) for CLI, server mode, and managed-model usage
+- [API Reference](/zinc/docs/api/) for HTTP request/response details
+- [Development Guide](/zinc/docs/development/) for build, test, graph export, and profiling workflow
+- [Apple Silicon Metal Enablement](/zinc/docs/apple-silicon-metal-enablement/) for the full Metal port narrative
+- [TurboQuant Spec](/zinc/docs/turboquant-spec/) for the forward-looking KV compression design
+- [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning/) for AMD-specific performance work
+- [Intel GPU Reference](/zinc/docs/intel-gpu-reference/) for Arc B-series hardware, memory-bandwidth, and opcode notes

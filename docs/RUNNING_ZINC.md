@@ -439,7 +439,7 @@ for await (const chunk of stream) {
 | POST | `/v1/chat/completions` | Chat completion (streaming + non-streaming) |
 | POST | `/v1/completions` | Text completion |
 
-The full API contract is documented in [Serving HTTP API](/zinc/docs/api).
+The full API contract is documented in [Serving HTTP API](/zinc/docs/api/).
 
 ## Export the decode graph
 
@@ -540,7 +540,7 @@ Those four commands answer most “why is this not working?” questions:
 
 ## Related docs
 
-- [Getting started](/zinc/docs/getting-started)
-- [Hardware requirements](/zinc/docs/hardware-requirements)
-- [Serving HTTP API](/zinc/docs/api)
-- [RDNA4 tuning](/zinc/docs/rdna4-tuning)
+- [Getting started](/zinc/docs/getting-started/)
+- [Hardware requirements](/zinc/docs/hardware-requirements/)
+- [Serving HTTP API](/zinc/docs/api/)
+- [RDNA4 tuning](/zinc/docs/rdna4-tuning/)

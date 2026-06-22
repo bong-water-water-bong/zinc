@@ -62,7 +62,7 @@ function collectMarkdownSections(doc: DocPage): MarkdownSection[] {
     const preview = truncate(stripMarkdown(currentBody.join('\n')), 220);
     sections.push({
       heading: currentHeading,
-      url: `/zinc/docs/${doc.slug}#${currentSlug}`,
+      url: `/zinc/docs/${doc.slug}/#${currentSlug}`,
       preview,
     });
   };
@@ -149,7 +149,7 @@ export function buildDocsSearchIndex(docs: DocPage[], zigApi: ZigApiIndex): Docs
     const preview = pagePreview(doc);
     entries.push({
       title,
-      url: `/zinc/docs/${doc.slug}`,
+      url: `/zinc/docs/${doc.slug}/`,
       kind: 'Guide',
       group: 'ZINC Docs',
       preview,
@@ -171,7 +171,7 @@ export function buildDocsSearchIndex(docs: DocPage[], zigApi: ZigApiIndex): Docs
   for (const section of zigApi.sections) {
     entries.push({
       title: section.title,
-      url: `/zinc/docs/zig-api#${section.slug}`,
+      url: `/zinc/docs/zig-api/#${section.slug}`,
       kind: 'API Section',
       group: 'Zig API',
       preview: truncate(section.description, 220),

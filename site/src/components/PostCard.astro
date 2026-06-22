@@ -21,7 +21,7 @@ const formattedDate = new Intl.DateTimeFormat('en-US', {
 
 <article class="post-card">
   <time datetime={isoDate}>{formattedDate}</time>
-  <h2><a href={`/blog/${slug}`}>{title}</a></h2>
+  <h2><a href={`/blog/${slug}/`}>{title}</a></h2>
   <p>{excerpt}</p>
   {tags && tags.length > 0 && (
     <div class="tags">

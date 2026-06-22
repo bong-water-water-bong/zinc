@@ -46,7 +46,7 @@ excerpt: "Zig is the best systems programming language we have found for GPU wor
 
 We did not pick Zig because it was trendy. We picked it because we had a gut feeling that language choice would matter more than any single optimization we could write. One week and two GPU backends later, that gut feeling turned into a conviction.
 
-ZINC runs the same LLM inference engine on [AMD GPUs through Vulkan](/blog/2026-03-25-why-we-are-building-zinc) and on [Apple Silicon through Metal](/blog/2026-04-01-bringing-zinc-to-apple-silicon). Not two engines. Not a compatibility layer. One codebase, two backends, zero runtime cost to switch between them. The reason that works is Zig.
+ZINC runs the same LLM inference engine on [AMD GPUs through Vulkan](/blog/2026-03-25-why-we-are-building-zinc/) and on [Apple Silicon through Metal](/blog/2026-04-01-bringing-zinc-to-apple-silicon/). Not two engines. Not a compatibility layer. One codebase, two backends, zero runtime cost to switch between them. The reason that works is Zig.
 
 This post is about the moments where the language saved us, the patterns that make GPU programming in Zig surprisingly pleasant, and the honest realization that if we had started this in C++, we would still be writing [CMakeLists](https://cmake.org/cmake/help/latest/manual/cmake-language.7.html).
 
@@ -109,7 +109,7 @@ defer device.deinit();
 
 No bridging headers. No Objective-C++. No `@autoreleasepool` blocks leaking into business logic. The entire Objective-C surface is 400 lines of C-shaped wrapper code, and nothing outside that file knows it exists.
 
-Compare this to what Metal integration looks like in a C++ codebase. You either pull in Objective-C++ (which means every file that touches Metal becomes `.mm`), or you build an elaborate C wrapper with manual reference counting. We did the second option, but Zig made the wrapper so thin that it barely registers as complexity. The [Apple Silicon blog post](/blog/2026-04-01-bringing-zinc-to-apple-silicon) has more detail on how this shim evolved during the Metal port.
+Compare this to what Metal integration looks like in a C++ codebase. You either pull in Objective-C++ (which means every file that touches Metal becomes `.mm`), or you build an elaborate C wrapper with manual reference counting. We did the second option, but Zig made the wrapper so thin that it barely registers as complexity. The [Apple Silicon blog post](/blog/2026-04-01-bringing-zinc-to-apple-silicon/) has more detail on how this shim evolved during the Metal port.
 
 ## Zig build system: shaders, frameworks, one file
 
@@ -163,7 +163,7 @@ We went from zero to "shaders compile, frameworks link, binary runs on both plat
 
 ## Zig error handling on the GPU
 
-GPU programming has a reputation for silent corruption. You write to the wrong buffer offset, and the output is garbage, but nothing crashes. You dispatch with the wrong workgroup size, and the shader reads uninitialized memory. Good luck debugging that at 3 AM. We [cataloged 13 bugs](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4) in our first working forward pass, and most of them were exactly this kind of silent failure.
+GPU programming has a reputation for silent corruption. You write to the wrong buffer offset, and the output is garbage, but nothing crashes. You dispatch with the wrong workgroup size, and the shader reads uninitialized memory. Good luck debugging that at 3 AM. We [cataloged 13 bugs](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4/) in our first working forward pass, and most of them were exactly this kind of silent failure.
 
 Zig's error handling does not magically fix GPU bugs. But it creates a culture in the codebase where every failure point is explicit.
 
@@ -230,7 +230,7 @@ var gpu_buffer = try metal_buffer.wrapMmap(device_ctx,
     mmap_data.ptr + tensor.offset, tensor.size_bytes);
 ```
 
-On discrete AMD GPUs, VRAM is separate. You have to stage through a host-visible buffer and then DMA the data across the PCIe bus. We covered the throughput implications of this in [how we moved from 7 to 33 tok/s](/blog/2026-03-30-how-we-moved-zinc-from-7-tok-s-to-33-tok-s-on-amd-rdna4):
+On discrete AMD GPUs, VRAM is separate. You have to stage through a host-visible buffer and then DMA the data across the PCIe bus. We covered the throughput implications of this in [how we moved from 7 to 33 tok/s](/blog/2026-03-30-how-we-moved-zinc-from-7-tok-s-to-33-tok-s-on-amd-rdna4/):
 
 ```zig
 // Vulkan: stage and transfer
@@ -322,4 +322,4 @@ The comptime system means our abstractions have zero runtime cost. The explicit 
 
 A week ago we chose Zig because it seemed like a reasonable systems language. Today we are convinced it is the reason ZINC ships on two GPU platforms instead of one. Language choice matters. For this project, it might matter more than any single kernel optimization we have written.
 
-If you want to see the engine in action, [Getting Started](/zinc/docs/getting-started) will get you running in five minutes. The full source is on [GitHub](https://github.com/zolotukhin/zinc). And if you want to follow the journey from the beginning, start with [why we are building ZINC](/blog/2026-03-25-why-we-are-building-zinc).
+If you want to see the engine in action, [Getting Started](/zinc/docs/getting-started/) will get you running in five minutes. The full source is on [GitHub](https://github.com/zolotukhin/zinc). And if you want to follow the journey from the beginning, start with [why we are building ZINC](/blog/2026-03-25-why-we-are-building-zinc/).

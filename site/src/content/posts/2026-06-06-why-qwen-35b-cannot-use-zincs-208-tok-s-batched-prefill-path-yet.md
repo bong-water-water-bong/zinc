@@ -60,7 +60,7 @@ The dense path sounds general if you describe it too quickly:
 4. Write a batch of KV cache entries.
 5. Continue into decode with the same logits.
 
-That is exactly what [the 42 to 208 tok/s post](/blog/2026-06-05-how-zinc-rdna4-batched-prefill-went-from-42-to-208-tok-s) covered. It fixed dead Vulkan wiring, Q6_K dispatch, stale GPU argmax state, and the serial-over-K batched DMMV shape. The end result was a dense Qwen3-8B path that made the prompt side behave like prompt work instead of 658 tiny decode steps.
+That is exactly what [the 42 to 208 tok/s post](/blog/2026-06-05-how-zinc-rdna4-batched-prefill-went-from-42-to-208-tok-s/) covered. It fixed dead Vulkan wiring, Q6_K dispatch, stale GPU argmax state, and the serial-over-K batched DMMV shape. The end result was a dense Qwen3-8B path that made the prompt side behave like prompt work instead of 658 tiny decode steps.
 
 But Qwen3.6 35B-A3B is not just a bigger Qwen3-8B. It is a hybrid architecture:
 
@@ -83,11 +83,11 @@ Until those are answered, Qwen 35B cannot simply inherit the 208 tok/s dense res
 
 ## The current public shape
 
-The public benchmark story already hints at this split. In the June 1 [ZINC benchmark dashboard](/zinc/benchmarks) data, Qwen3.6 35B-A3B is one of ZINC's best RDNA decode rows: **127.9 tok/s** for ZINC against **108.5 tok/s** for llama.cpp on the Radeon AI PRO R9700.
+The public benchmark story already hints at this split. In the June 1 [ZINC benchmark dashboard](/zinc/benchmarks/) data, Qwen3.6 35B-A3B is one of ZINC's best RDNA decode rows: **127.9 tok/s** for ZINC against **108.5 tok/s** for llama.cpp on the Radeon AI PRO R9700.
 
 That is not the problem.
 
-The same dashboard row has ZINC prefill at **154.27 tok/s** against llama.cpp at **398.82 tok/s**. The [RDNA4 tuning note](/zinc/docs/rdna4-tuning), measured under a different profiling regime, shows the same shape with a larger prompt-side gap: **88.08 tok/s** for ZINC prefill against **181.95 tok/s** for llama.cpp.
+The same dashboard row has ZINC prefill at **154.27 tok/s** against llama.cpp at **398.82 tok/s**. The [RDNA4 tuning note](/zinc/docs/rdna4-tuning/), measured under a different profiling regime, shows the same shape with a larger prompt-side gap: **88.08 tok/s** for ZINC prefill against **181.95 tok/s** for llama.cpp.
 
 The exact number changes with prompt shape, harness, and measurement mode. The conclusion does not:
 

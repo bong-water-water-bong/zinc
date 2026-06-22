@@ -46,7 +46,7 @@ Prefill on ZINC's Metal backend ran at **7.9 tok/s** on Qwen3 8B with a 103-toke
 
 The new `prefillBatched` path runs at **298 tok/s** on the same benchmark. That is a **38x speedup** against the per-token path inside the same engine, and it lands at **85% of llama.cpp's prefill throughput** without touching a single shader. Everything that follows is the measurement, the code, and the thing we did not expect to find.
 
-If you want the wider ZINC context first, read [Every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc) and [Bringing ZINC to Apple Silicon](/blog/2026-04-01-bringing-zinc-to-apple-silicon). For the twin RDNA4 story, [Why RDNA4 prefill for Qwen3.5-35B is stuck at 25 tok/s](/blog/2026-04-18-why-rdna4-prefill-for-qwen-3-5-is-stuck-at-25-tok-s) covers the same shape of problem on a different GPU family.
+If you want the wider ZINC context first, read [Every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc/) and [Bringing ZINC to Apple Silicon](/blog/2026-04-01-bringing-zinc-to-apple-silicon/). For the twin RDNA4 story, [Why RDNA4 prefill for Qwen3.5-35B is stuck at 25 tok/s](/blog/2026-04-18-why-rdna4-prefill-for-qwen-3-5-is-stuck-at-25-tok-s/) covers the same shape of problem on a different GPU family.
 
 ## TL;DR
 
@@ -412,7 +412,7 @@ The concrete unlocks in priority order:
 1. ~~**Port `flash_attn_batched_q8`**. Removes the `ZINC_METAL_KV_Q8=0` requirement.~~ **Done** (2026-04-20, same day). Both f32 and Q8 KV caches route through the batched path now.
 2. **Tune the Q4_K GEMM kernel**. Close the 15% gap to llama.cpp through better K-dim blocking, explicit unroll hints like llama.cpp's `FOR_UNROLL`, or a larger tile. The per-tile arithmetic intensity is already at 6.7 TFLOPS / ~10 TFLOPS theoretical half matmul peak, so the last 30% of peak is what separates us from llama.cpp.
 3. **Fuse gate + up GEMM**. The two projections share their input. A single GEMM that writes two tiles would halve the input-read traffic for that layer phase. Small win (~0.3 ms total) but easy.
-4. **Q8_0 GEMM variant**. SSM projections in Qwen3.5 use Q8_0. Batching them would fix the 35B MoE prefill path described in [our RDNA4 post](/blog/2026-04-18-why-rdna4-prefill-for-qwen-3-5-is-stuck-at-25-tok-s), because the same SSM bottleneck exists on Metal.
+4. **Q8_0 GEMM variant**. SSM projections in Qwen3.5 use Q8_0. Batching them would fix the 35B MoE prefill path described in [our RDNA4 post](/blog/2026-04-18-why-rdna4-prefill-for-qwen-3-5-is-stuck-at-25-tok-s/), because the same SSM bottleneck exists on Metal.
 5. **Batched MoE expert dispatch**. For Qwen3.5-35B MoE and similar models, route experts' gate/up/down through a batched MoE GEMM. The single-token MoE path today reads ~400 MB of expert weights per prompt token.
 6. **Prefix cache reuse**. The current gate rejects `state.position > 0`. Extending the batched path to handle "append M tokens at offset P" is a straightforward change to the KV cache write offset and the flash attention kv_pos_offset.
 

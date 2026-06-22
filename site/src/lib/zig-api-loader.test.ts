@@ -74,7 +74,7 @@ describe('loadZigApi', () => {
     expect(api.exportCount).toBeGreaterThan(10);
     expect(api.memberCount).toBeGreaterThan(10);
     expect(api.sections.some(section => section.title === 'Vulkan Runtime')).toBe(true);
-    expect(api.modules.some(module => module.href === '/zinc/docs/zig-api/loader')).toBe(true);
+    expect(api.modules.some(module => module.href === '/zinc/docs/zig-api/loader/')).toBe(true);
   }, 30000);
 
   it('extracts struct layout metadata for rendered API docs', async () => {

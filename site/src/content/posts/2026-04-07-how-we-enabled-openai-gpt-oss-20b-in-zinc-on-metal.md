@@ -46,7 +46,7 @@ What GPT-OSS 20B actually did was expose every shortcut we could no longer take.
 
 If you are coming at this from the practical search side, the short answer is: **yes, GPT-OSS 20B can run on a Mac or MacBook when that Mac is Apple Silicon and has enough unified memory**. In ZINC, the current managed guidance is **16+ GB unified memory**, with a **4096-token default context** because we would rather ship a stable exact-fit deployment than pretend every Mac should reserve the model's full 128k architectural window.
 
-This post is the technical story of that bring-up. If you want the broader engine context first, read [Bringing ZINC to Apple Silicon](/blog/2026-04-01-bringing-zinc-to-apple-silicon), [How Mixture of Experts models work in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc), and [Every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc).
+This post is the technical story of that bring-up. If you want the broader engine context first, read [Bringing ZINC to Apple Silicon](/blog/2026-04-01-bringing-zinc-to-apple-silicon/), [How Mixture of Experts models work in ZINC](/blog/2026-04-04-how-moe-models-work-in-zinc/), and [Every design decision behind ZINC](/blog/2026-04-03-every-design-decision-behind-zinc/).
 
 ## Why this mattered now
 
@@ -370,4 +370,4 @@ That is why GPT-OSS 20B was such a good model to bring up.
 
 It forced us to stop thinking of model support as a loader problem. It is a tokenizer problem, a kernel problem, an attention problem, a memory-policy problem, and a validation problem all at once. If an inference engine survives that combination, it is probably becoming a real engine.
 
-If you want to try the exact model we are talking about, the managed entry in ZINC points to [Bartowski's GGUF build](https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF). For the model-family context, OpenAI's [GPT-OSS launch post](https://openai.com/index/introducing-gpt-oss/) and the [`gpt-oss-20b` model page](https://platform.openai.com/docs/models/gpt-oss-20b) are the right external references. And if you want the backend side of the story from the beginning, start with [our Metal bring-up post](/blog/2026-04-01-bringing-zinc-to-apple-silicon).
+If you want to try the exact model we are talking about, the managed entry in ZINC points to [Bartowski's GGUF build](https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF). For the model-family context, OpenAI's [GPT-OSS launch post](https://openai.com/index/introducing-gpt-oss/) and the [`gpt-oss-20b` model page](https://platform.openai.com/docs/models/gpt-oss-20b) are the right external references. And if you want the backend side of the story from the beginning, start with [our Metal bring-up post](/blog/2026-04-01-bringing-zinc-to-apple-silicon/).

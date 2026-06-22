@@ -47,7 +47,7 @@ If you build local LLM inference systems, you have probably seen some version of
 
 That was exactly where ZINC got stuck.
 
-This post picks up after [what broke first in local LLM inference on AMD RDNA4](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4) and after [the loop that made those bugs cheaper to chase](/blog/2026-03-28-karpathy-loop-autoresearch-and-the-self-improving-ai-loop-behind-zinc). The next bottleneck was more low-level: not tokenizer correctness, not graph structure, but shader correctness in the last CPU-owned parts of the decode path.
+This post picks up after [what broke first in local LLM inference on AMD RDNA4](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4/) and after [the loop that made those bugs cheaper to chase](/blog/2026-03-28-karpathy-loop-autoresearch-and-the-self-improving-ai-loop-behind-zinc/). The next bottleneck was more low-level: not tokenizer correctness, not graph structure, but shader correctness in the last CPU-owned parts of the decode path.
 
 ## The real problem was not compute. It was round trips.
 
@@ -266,6 +266,6 @@ That does not magically get ZINC to the full llama.cpp baseline. There is still 
 
 It is the difference between "the engine is technically alive" and "the engine is finally on the right side of the PCIe boundary."
 
-If you want the broader context around these failures, the earlier pieces connect directly to this one: [why we are building ZINC](/blog/2026-03-25-why-we-are-building-zinc), [the home AI rig behind it](/blog/2026-03-26-building-a-local-ai-rig), [the early correctness bugs in the forward pass](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4), and [the optimization loop we use to hunt these bugs faster](/blog/2026-03-28-karpathy-loop-autoresearch-and-the-self-improving-ai-loop-behind-zinc).
+If you want the broader context around these failures, the earlier pieces connect directly to this one: [why we are building ZINC](/blog/2026-03-25-why-we-are-building-zinc/), [the home AI rig behind it](/blog/2026-03-26-building-a-local-ai-rig/), [the early correctness bugs in the forward pass](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4/), and [the optimization loop we use to hunt these bugs faster](/blog/2026-03-28-karpathy-loop-autoresearch-and-the-self-improving-ai-loop-behind-zinc/).
 
 This shader phase is what sits between those stories. It is the moment where the project stops arguing with basic model correctness and starts arguing with the GPU at the level that actually matters.

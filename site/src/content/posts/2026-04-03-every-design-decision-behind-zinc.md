@@ -99,7 +99,7 @@ The cost was real: we wrote a GGUF parser, a BPE tokenizer, a model config extra
 
 ## Decision 2: Zig, not C++, not Rust
 
-The language choice deserves its own post (and [it got one](/blog/2026-04-02-why-zig-is-the-secret-weapon-behind-zinc)). The short version: Zig gives us C-level performance, first-class C interop for talking to Vulkan and Metal, comptime for zero-cost backend selection, explicit allocators for predictable memory, and a build system that compiles shaders without CMake.
+The language choice deserves its own post (and [it got one](/blog/2026-04-02-why-zig-is-the-secret-weapon-behind-zinc/)). The short version: Zig gives us C-level performance, first-class C interop for talking to Vulkan and Metal, comptime for zero-cost backend selection, explicit allocators for predictable memory, and a build system that compiles shaders without CMake.
 
 But the deeper reason is cultural. Zig's design philosophy is "no hidden control flow, no hidden allocations, no hidden anything." In GPU programming, hidden things kill you. A silent allocation in a hot path. An exception that unwinds through a command buffer recording. A default constructor that secretly initializes a 4 GB buffer. Zig makes all of that structurally impossible.
 
@@ -356,7 +356,7 @@ The awkward part is the GPU-to-CPU readback of the router logits. That readback 
 
 In practice, it costs about **0.3 ms** per layer, and the alternative — implementing top-k selection as a GPU shader with atomic operations or multi-pass reduction — would be more complex, more fragile, and would save less time than you think, because the CPU is otherwise idle during GPU execution anyway.
 
-We did eventually write a [GPU-side softmax+top-k shader](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s) to reduce the total number of synchronization points. But the expert selection itself remains CPU-side, because it is simpler, debuggable, and fast enough.
+We did eventually write a [GPU-side softmax+top-k shader](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s/) to reduce the total number of synchronization points. But the expert selection itself remains CPU-side, because it is simpler, debuggable, and fast enough.
 
 This is a recurring theme in ZINC's design: do the simple thing that works, measure whether it matters, and only optimize when the profiler says so. The profiler has never said "top-k selection is your bottleneck."
 
@@ -451,7 +451,7 @@ Not every decision was right the first time.
 
 **We underestimated SSM debugging cost.** The delta-net state space layers in Qwen3.5-35B carry persistent recurrent state across tokens. A tiny numerical error in token 1 compounds through every subsequent token. We spent more time debugging SSM shaders than every other shader combined. If we started over, we would build per-tensor comparison tooling against a reference implementation before writing the first SSM shader, not after.
 
-**We started with CPU fallbacks for everything.** The first working forward pass ran MoE routing, SSM conv1d, SSM state updates, and gated normalization on the CPU. That made debugging easier but hid the real performance profile. When we finally moved those operations to GPU shaders, the [synchronization overhead alone](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s) was eating 45 ms per token. We should have measured the CPU-GPU sync cost earlier and set a harder deadline for writing the GPU versions.
+**We started with CPU fallbacks for everything.** The first working forward pass ran MoE routing, SSM conv1d, SSM state updates, and gated normalization on the CPU. That made debugging easier but hid the real performance profile. When we finally moved those operations to GPU shaders, the [synchronization overhead alone](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s/) was eating 45 ms per token. We should have measured the CPU-GPU sync cost earlier and set a harder deadline for writing the GPU versions.
 
 **We over-specified shader workgroup sizes.** Early shaders hardcoded workgroup sizes for specific tensor dimensions. When we tested on a different model with different hidden dimensions, half the shaders dispatched wrong. We now use push constants for all dimension-dependent values and only hardcode the wave size (64 on RDNA, which is a hardware constant, not a model parameter).
 
@@ -496,6 +496,6 @@ The architecture is designed to support what comes next without major rewrites:
 
 None of these require rethinking the core architecture. That is the real test of whether design decisions were good: not whether they work today, but whether they leave room for tomorrow.
 
-If you want to run ZINC, [Getting Started](/zinc/docs/getting-started) gets you going in five minutes. The full source is at [github.com/zolotukhin/zinc](https://github.com/zolotukhin/zinc). And if you want the story from the beginning: [why we are building ZINC](/blog/2026-03-25-why-we-are-building-zinc), [the first bugs](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4), [the shader debugging](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s), [the performance journey](/blog/2026-03-30-how-we-moved-zinc-from-7-tok-s-to-33-tok-s-on-amd-rdna4), [the Metal port](/blog/2026-04-01-bringing-zinc-to-apple-silicon), and [why Zig](/blog/2026-04-02-why-zig-is-the-secret-weapon-behind-zinc).
+If you want to run ZINC, [Getting Started](/zinc/docs/getting-started/) gets you going in five minutes. The full source is at [github.com/zolotukhin/zinc](https://github.com/zolotukhin/zinc). And if you want the story from the beginning: [why we are building ZINC](/blog/2026-03-25-why-we-are-building-zinc/), [the first bugs](/blog/2026-03-27-what-broke-first-when-we-built-zinc-on-amd-rdna4/), [the shader debugging](/blog/2026-03-29-the-shaders-standing-between-4-tok-s-and-27-tok-s/), [the performance journey](/blog/2026-03-30-how-we-moved-zinc-from-7-tok-s-to-33-tok-s-on-amd-rdna4/), [the Metal port](/blog/2026-04-01-bringing-zinc-to-apple-silicon/), and [why Zig](/blog/2026-04-02-why-zig-is-the-secret-weapon-behind-zinc/).
 
 Every decision in this post was a bet that focus beats generality. So far, the bets are paying off.

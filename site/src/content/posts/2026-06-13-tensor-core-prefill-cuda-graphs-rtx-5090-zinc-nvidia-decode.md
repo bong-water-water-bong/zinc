@@ -48,7 +48,7 @@ seoDescription: "ZINC CUDA backend on RTX 5090: decode 51 to 70% of llama.cpp, a
 draft: false
 ---
 
-[Yesterday's post](/blog/2026-06-12-four-bottlenecks-one-cuda-backend-moe-gemma-tensor-cores-rtx-5090-4090) was a tour of four different decode bottlenecks and ended, like most honest engineering posts, with a to-do list:
+[Yesterday's post](/blog/2026-06-12-four-bottlenecks-one-cuda-backend-moe-gemma-tensor-cores-rtx-5090-4090/) was a tour of four different decode bottlenecks and ended, like most honest engineering posts, with a to-do list:
 
 > Wire the fp16 tensor-core prefill · move the dense per-token glue onto the GPU · more Gemma fusion · close the MoE gap.
 

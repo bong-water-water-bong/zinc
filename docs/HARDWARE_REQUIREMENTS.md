@@ -83,7 +83,7 @@ If that command does not show your Intel Arc GPU, ZINC will not use it.
 | 24 GB | B60 | 20B class and tight larger-model experiments |
 | 32 GB | B65, B70 | 27B dense and 35B MoE targets |
 
-See [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for the full B-series card table, device IDs, memory bandwidth, Xe2 opcode notes, and ZINC tuning guidance.
+See [Intel GPU Reference](/zinc/docs/intel-gpu-reference/) for the full B-series card table, device IDs, memory bandwidth, Xe2 opcode notes, and ZINC tuning guidance.
 
 ## Other Vulkan GPUs
 
@@ -204,7 +204,7 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/zinc chat
 ```
 
-Then see [RDNA4 Tuning](/zinc/docs/rdna4-tuning) for performance work.
+Then see [RDNA4 Tuning](/zinc/docs/rdna4-tuning/) for performance work.
 
 ### On Linux with an Intel Arc GPU
 
@@ -215,7 +215,7 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/zinc chat
 ```
 
-Then see [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for Arc B-series hardware details and current tuning notes.
+Then see [Intel GPU Reference](/zinc/docs/intel-gpu-reference/) for Arc B-series hardware details and current tuning notes.
 
 ### On macOS with Apple Silicon
 
@@ -226,4 +226,4 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/zinc chat
 ```
 
-Then see [Apple Silicon Reference](/zinc/docs/apple-silicon-reference) and [Apple Metal Reference](/zinc/docs/apple-metal-reference) for platform details.
+Then see [Apple Silicon Reference](/zinc/docs/apple-silicon-reference/) and [Apple Metal Reference](/zinc/docs/apple-metal-reference/) for platform details.

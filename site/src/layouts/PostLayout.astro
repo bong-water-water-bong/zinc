@@ -53,7 +53,7 @@ const xShareText = `${xStarters[Math.floor(Math.random() * xStarters.length)]} $
 const xIntentUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(xShareText)}&url=${encodeURIComponent(canonicalUrl)}`;
 const breadcrumbItems = [
   { name: 'Home', href: '/' },
-  { name: 'Blog', href: '/blog' },
+  { name: 'Blog', href: '/blog/' },
   { name: title },
 ];
 
@@ -134,14 +134,14 @@ const jsonLd = {
   {(prevPost || nextPost) && (
     <nav class="post-nav-grid">
       {prevPost ? (
-        <a href={`/blog/${prevPost.slug}`} class="nav-card nav-prev">
+        <a href={`/blog/${prevPost.slug}/`} class="nav-card nav-prev">
           <span class="nav-label">&larr; Previous</span>
           <span class="nav-title">{prevPost.title}</span>
           <span class="nav-excerpt">{prevPost.excerpt.slice(0, 120)}{prevPost.excerpt.length > 120 ? '...' : ''}</span>
         </a>
       ) : <div />}
       {nextPost ? (
-        <a href={`/blog/${nextPost.slug}`} class="nav-card nav-next">
+        <a href={`/blog/${nextPost.slug}/`} class="nav-card nav-next">
           <span class="nav-label">Next &rarr;</span>
           <span class="nav-title">{nextPost.title}</span>
           <span class="nav-excerpt">{nextPost.excerpt.slice(0, 120)}{nextPost.excerpt.length > 120 ? '...' : ''}</span>
@@ -150,7 +150,7 @@ const jsonLd = {
     </nav>
   )}
   <nav class="post-nav">
-    <a href="/blog">&larr; All posts</a>
+    <a href="/blog/">&larr; All posts</a>
   </nav>
   <div class="lightbox" id="lightbox">
     <img src="" alt="" />
