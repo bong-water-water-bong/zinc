@@ -49,6 +49,8 @@ header h1 span{color:var(--accent)}
 .msg .bbl{padding:10px 14px;border-radius:12px;line-height:1.6;font-size:14px;max-width:85%}
 .msg.u .bbl{background:var(--user);border:1px solid var(--accent2);border-bottom-right-radius:4px;white-space:pre-wrap;word-break:break-word}
 .msg.a .bbl{background:var(--bg2);border:1px solid var(--border);border-bottom-left-radius:4px;width:85%;max-width:85%}
+.msg.a .bbl.streaming .stream-text{white-space:pre-wrap;overflow-wrap:anywhere;word-break:normal}
+.msg.a .bbl.streaming .reasoning-summary::before{transition:none}
 .msg.a .bbl p{margin:0 0 8px}
 .msg.a .bbl p:last-child{margin:0}
 .msg.a .bbl h1,.msg.a .bbl h2,.msg.a .bbl h3,.msg.a .bbl h4{margin:0 0 10px;color:#fff;line-height:1.25}
@@ -482,6 +484,18 @@ function assistantHtmlFromRaw(raw,isThinking){
   if(view.showReasoning)html+=renderReasoning(view.reasoning,view.isThinking,view.collapsedReasoning);
   if(view.answer)html+=md(view.answer);
   if(!html&&raw&&!view.suppressedReasoning&&!view.collapsedReasoning&&!view.promotedReasoning)html=md(stripTrailingArtifacts(raw));
+  return{html,view};
+}
+
+function assistantLiveHtmlFromRaw(raw,isThinking){
+  // Do not run Markdown while a stream is still incomplete: partial lists,
+  // headings, and code fences repeatedly change DOM shape and make text rewrap.
+  // The final render path applies Markdown once the response is complete.
+  let view=splitDisplayContent(raw,isThinking);
+  let html='';
+  if(view.showReasoning)html+=renderLiveReasoning(view.reasoning,view.isThinking,view.collapsedReasoning);
+  if(view.answer)html+=renderLiveText(view.answer);
+  if(!html&&raw)html=renderLiveText(raw);
   return{html,view};
 }
 
@@ -1093,6 +1107,20 @@ function renderReasoning(thinkText,isThinking,collapsed){
   return '<details'+open+' class="reasoning-block"><summary><span class="reasoning-summary"><span class="'+stateClass+'">'+stateText+'</span>'+previewHtml+'</span></summary><div class="reasoning-body">'+body+'</div></details>';
 }
 
+function renderLiveText(text){
+  let s=stripTrailingArtifacts(text||'');
+  return s?'<div class="stream-text">'+esc(s)+'</div>':'';
+}
+
+function renderLiveReasoning(thinkText,isThinking,collapsed){
+  let open=collapsed?'':isThinking?' open':'';
+  let body=(thinkText||'').trim();
+  let stateClass=isThinking?'reasoning-state live':'reasoning-state';
+  let stateText=isThinking?'Thinking':'Reasoning';
+  let bodyHtml=body?'<div class="stream-text">'+esc(body)+'</div>':'<p><em>Thinking...</em></p>';
+  return '<details'+open+' class="reasoning-block"><summary><span class="reasoning-summary"><span class="'+stateClass+'">'+stateText+'</span></span></summary><div class="reasoning-body">'+bodyHtml+'</div></details>';
+}
+
 function stripTrailingStandaloneQuote(text){
   let s=(text||'').replace(/\s+$/,'');
   if(/(?:^|\r?\n)\s*"\s*$/u.test(s)) s=s.replace(/(?:^|\r?\n)\s*"\s*$/u,'').replace(/\s+$/,'');
@@ -1514,6 +1542,7 @@ async function send(){
   I.value='';I.style.height='auto';userScrolledUp=false;
   addMsg('user',t);H.push({role:'user',content:t});saveChatState();
   let bbl=addMsg('assistant','');
+  bbl.classList.add('streaming');
   let liveMeta=document.createElement('div');liveMeta.className='meta';liveMeta.textContent='generating...';
   bbl.parentElement.appendChild(liveMeta);
   let cur=document.createElement('span');cur.className='cursor';bbl.appendChild(cur);
@@ -1587,7 +1616,7 @@ async function send(){
                 draftEntry={role:'assistant',content:'',raw:'',transport:'',partial:true};
                 H.push(draftEntry);
               }
-              let rendered=assistantHtmlFromRaw(raw,false);
+              let rendered=assistantLiveHtmlFromRaw(raw,false);
               if(draftEntry){
                 draftEntry.raw=raw;
                 draftEntry.content=rendered.view.answer||stripTrailingArtifacts(raw);
@@ -1596,7 +1625,7 @@ async function send(){
               }
               let html=rendered.html;
               flushPendingRender();
-              if(html){bbl.innerHTML=html;bbl.appendChild(cur);highlightAll();autoScroll()}
+              if(html){bbl.innerHTML=html;bbl.appendChild(cur);autoScroll()}
               finishReason='stop';
               sawFinishReason=true;
               try{rd.cancel();}catch(_e){}
@@ -1609,7 +1638,7 @@ async function send(){
                 draftEntry={role:'assistant',content:'',raw:'',transport:'',partial:true};
                 H.push(draftEntry);
               }
-              let rendered=assistantHtmlFromRaw(raw,false);
+              let rendered=assistantLiveHtmlFromRaw(raw,false);
               if(draftEntry){
                 draftEntry.raw=raw;
                 draftEntry.content=rendered.view.answer||stripTrailingArtifacts(raw);
@@ -1618,7 +1647,7 @@ async function send(){
               }
               let html=rendered.html;
               flushPendingRender();
-              if(html){bbl.innerHTML=html;bbl.appendChild(cur);highlightAll();autoScroll()}
+              if(html){bbl.innerHTML=html;bbl.appendChild(cur);autoScroll()}
               finishReason='stop';
               sawFinishReason=true;
               try{rd.cancel();}catch(_e){}
@@ -1635,11 +1664,11 @@ async function send(){
             draftEntry.transport='';
             let visibleAnswer=(splitDisplayContent(raw,thinking).answer)||stripTrailingArtifacts(raw);
             scheduleRender(function(){
-              let rendered=assistantHtmlFromRaw(raw,thinking);
+              let rendered=assistantLiveHtmlFromRaw(raw,thinking);
               draftEntry.content=rendered.view.answer||stripTrailingArtifacts(raw);
               saveChatState();
               let html=rendered.html;
-              if(html){bbl.innerHTML=html;bbl.appendChild(cur);highlightAll();autoScroll();autoScrollReasoning(bbl)}
+              if(html){bbl.innerHTML=html;bbl.appendChild(cur);autoScroll();autoScrollReasoning(bbl)}
             });
             if(findRestartedAnswerStart(visibleAnswer)!==-1){
               errorMessage='Response started repeating itself and was stopped early.';
@@ -1675,6 +1704,7 @@ async function send(){
   clearStallTimer();
   flushPendingRender();
   if(cur.parentNode)cur.remove();
+  bbl.classList.remove('streaming');
   highlightAll();
   activeController=null;stopRequested=false;setGenerating(false);I.focus();
   let finalView=normalizeDisplayView(splitDisplayContent(raw,false));

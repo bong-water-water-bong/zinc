@@ -77,11 +77,11 @@ pub const entries = [_]CatalogEntry{
         // 35B-A3B: same architecture as Qwen3.5; ≈ 18 GiB of offloadable experts.
         .offloadable_vram_bytes = 18 * 1024 * 1024 * 1024,
         .default_context_length = 4096,
-        // Raw completion is validated on Intel/RDNA/Metal, but the ChatML
-        // thinking scaffolds currently echo or loop on short direct-answer
-        // prompts for this MoE pack.
+        // Raw completion is validated on Intel/RDNA/Metal. The model exposes
+        // the Qwen thinking scaffold; chat is still not the recommended default
+        // workflow for this MoE pack because short direct prompts can be brittle.
         .recommended_for_chat = false,
-        .thinking_stable = false,
+        .thinking_stable = true,
         .status = .supported,
         .tested_profiles = &.{
             "amd-rdna4-32gb",
@@ -409,7 +409,7 @@ test "find returns known qwen3.6 entry" {
     try std.testing.expectEqualStrings("2026-04-15", entry.release_date);
     try std.testing.expectEqualStrings("qwen3.6", entry.family);
     try std.testing.expect(!entry.recommended_for_chat);
-    try std.testing.expect(!entry.thinking_stable);
+    try std.testing.expect(entry.thinking_stable);
     try std.testing.expect(entry.status == .supported);
 }
 
@@ -539,8 +539,29 @@ test "qwen thinking stability flags track validated chat behavior" {
 
     const qwen36 = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
     try std.testing.expect(!qwen36.recommended_for_chat);
-    try std.testing.expect(!qwen36.thinking_stable);
+    try std.testing.expect(qwen36.thinking_stable);
 
     const qwen36_dense = find("qwen36-27b-q4k-m") orelse return error.TestExpectedEqual;
     try std.testing.expect(qwen36_dense.thinking_stable);
+}
+
+test "supported qwen catalog entries expose validated thinking toggles" {
+    // The chat UI only shows thinking when the active catalog entry marks it as
+    // stable. Keep every supported Qwen entry on the validated path.
+    for (&entries) |entry| {
+        if (entry.status == .supported and std.mem.startsWith(u8, entry.family, "qwen")) {
+            try std.testing.expect(entry.thinking_stable);
+        }
+    }
+}
+
+test "supported catalog entries do not force-hide thinking metadata" {
+    // `supported` models are the default user-facing choices. If a future entry
+    // still needs the thinking toggle hidden, keep it experimental until chat
+    // behavior is validated and this invariant can stay true.
+    for (&entries) |entry| {
+        if (entry.status == .supported) {
+            try std.testing.expect(entry.thinking_stable);
+        }
+    }
 }

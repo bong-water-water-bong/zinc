@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 
 type ChatUiApi = {
   md: (text: string) => string;
-  renderReasoning: (text: string, isThinking: boolean) => string;
+  renderReasoning: (text: string, isThinking: boolean, collapsed?: boolean) => string;
   stripInlineTransportArtifacts: (text: string) => string;
   findInlineStopArtifactStart: (text: string) => number;
   hasInlineStopArtifact: (text: string) => boolean;
@@ -20,6 +20,15 @@ type ChatUiApi = {
       showReasoning: boolean;
       isThinking: boolean;
       suppressedReasoning?: boolean;
+    };
+  };
+  assistantLiveHtmlFromRaw: (raw: string, isThinking: boolean) => {
+    html: string;
+    view: {
+      reasoning: string;
+      answer: string;
+      showReasoning: boolean;
+      isThinking: boolean;
     };
   };
   reasoningIsLowSignal: (text: string) => boolean;
@@ -119,7 +128,7 @@ function loadChatUiApi(): ChatUiApi {
     "navigator",
     "hljs",
     "alert",
-    `${match[1]}\nreturn { md, renderReasoning, stripInlineTransportArtifacts, findInlineStopArtifactStart, hasInlineStopArtifact, looksLikeRepeatedParagraphLoop, findRestartedAnswerStart, historyTransportContent, chatMaxTokens, assistantHtmlFromRaw, reasoningIsLowSignal, reasoningDuplicatesAnswer, normalizeDisplayView, completionNotice, requestMessagesFromHistory, splitDisplayContent, findUnexpectedThinkingTailStart, hasRepeatedPhraseLoop, startsWithLeakedReasoning };`,
+    `${match[1]}\nreturn { md, renderReasoning, stripInlineTransportArtifacts, findInlineStopArtifactStart, hasInlineStopArtifact, looksLikeRepeatedParagraphLoop, findRestartedAnswerStart, historyTransportContent, chatMaxTokens, assistantHtmlFromRaw, assistantLiveHtmlFromRaw, reasoningIsLowSignal, reasoningDuplicatesAnswer, normalizeDisplayView, completionNotice, requestMessagesFromHistory, splitDisplayContent, findUnexpectedThinkingTailStart, hasRepeatedPhraseLoop, startsWithLeakedReasoning };`,
   );
 
   return factory(
@@ -592,6 +601,29 @@ test("assistantHtmlFromRaw does not leak suppressed live reasoning into the answ
   expect(rendered.view.suppressedReasoning).toBe(true);
   expect(rendered.html).toContain("Thinking...");
   expect(rendered.html).not.toContain("I need to complete the response.");
+});
+
+test("assistantLiveHtmlFromRaw keeps streaming markdown as stable escaped text", () => {
+  const { assistantLiveHtmlFromRaw } = loadChatUiApi();
+  const rendered = assistantLiveHtmlFromRaw("1. **Fast**\n```zig\nconst x = 1;", false);
+
+  expect(rendered.html).toContain('class="stream-text"');
+  expect(rendered.html).toContain("1. **Fast**");
+  expect(rendered.html).toContain("```zig");
+  expect(rendered.html).not.toContain("<strong>");
+  expect(rendered.html).not.toContain("code-block");
+});
+
+test("assistantLiveHtmlFromRaw keeps live reasoning in a stable plain-text block", () => {
+  const { assistantLiveHtmlFromRaw } = loadChatUiApi();
+  const rendered = assistantLiveHtmlFromRaw("<think>1. **Analyze**\n- item", true);
+
+  expect(rendered.html).toContain('class="reasoning-block"');
+  expect(rendered.html).toContain('class="stream-text"');
+  expect(rendered.html).toContain("1. **Analyze**");
+  expect(rendered.html).toContain("- item");
+  expect(rendered.html).not.toContain("<strong>");
+  expect(rendered.html).not.toContain("<ul>");
 });
 
 test("completionNotice surfaces token-limit hits clearly", () => {

@@ -805,7 +805,7 @@ const harmony_stop_strs = [_][]const u8{
 };
 const chat_history_answer_limit_bytes: usize = 640;
 const default_chat_system_prompt =
-    "Answer directly. If a user term is ambiguous or looks misspelled, say that briefly and continue with the most likely interpretation. Never output self-referential planning or phrases like 'I need to complete the response'.";
+    "You are a helpful assistant. Answer directly. Do not show analysis.";
 
 const FinishReason = enum {
     stop,
@@ -1153,8 +1153,8 @@ fn shouldForceDisableThinking(managed_id: ?[]const u8, model_path: []const u8, d
     return !entry.thinking_stable;
 }
 
-fn shouldSkipThinkingTemplateForRequest(force_skip_by_model: bool, tools_len: usize, tool_choice: ToolChoice) bool {
-    return force_skip_by_model or (tools_len > 0 and tool_choice != .none);
+fn shouldSkipThinkingTemplateForRequest(tools_len: usize, tool_choice: ToolChoice) bool {
+    return tools_len > 0 and tool_choice != .none;
 }
 
 fn warmChatReuseCache(
@@ -2047,11 +2047,17 @@ fn handleChatCompletions(
     const tokenizer = &resources.tokenizer;
     const model_name = resources.display_name;
 
-    // If the catalog marks this model's thinking as unstable, force-disable thinking.
-    // Tool-calling requests also skip the Qwen empty-thinking scaffold so the
+    // If the catalog marks this model's thinking as unstable, force-disable
+    // visible thinking but still keep the tokenizer's no-thinking generation
+    // suffix. Some Qwen thinking models stop immediately after a bare assistant
+    // header, but answer correctly after the closed <think></think> scaffold.
+    const force_disable_thinking = shouldForceDisableThinking(resources.managed_id, resources.model_path, resources.display_name);
+    if (force_disable_thinking) {
+        parsed.enable_thinking = false;
+    }
+    // Tool-calling requests skip the Qwen empty-thinking scaffold so the
     // assistant can begin directly with a <tool_call> block.
-    const force_skip_thinking_template = shouldForceDisableThinking(resources.managed_id, resources.model_path, resources.display_name);
-    const skip_thinking_template = shouldSkipThinkingTemplateForRequest(force_skip_thinking_template, parsed.tools.len, parsed.tool_choice);
+    const skip_thinking_template = shouldSkipThinkingTemplateForRequest(parsed.tools.len, parsed.tool_choice);
     if (skip_thinking_template) {
         parsed.enable_thinking = null;
     }
@@ -3328,7 +3334,7 @@ test "parseJsonFields extracts enable_thinking flag" {
 }
 
 test "shouldForceDisableThinking follows qwen catalog stability flags" {
-    try std.testing.expect(shouldForceDisableThinking(
+    try std.testing.expect(!shouldForceDisableThinking(
         null,
         "/Users/test/Library/Caches/zinc/models/models/qwen36-35b-a3b-q4k-xl/model.gguf",
         "Qwen3.6-35B-A3B-UD-Q4_K_XL",
@@ -3697,10 +3703,10 @@ test "buildChatPrompt enables thinking when requested" {
 }
 
 test "tool-calling requests skip qwen thinking scaffold" {
-    try std.testing.expect(shouldSkipThinkingTemplateForRequest(false, 1, .auto));
-    try std.testing.expect(shouldSkipThinkingTemplateForRequest(false, 1, .required));
-    try std.testing.expect(!shouldSkipThinkingTemplateForRequest(false, 1, .none));
-    try std.testing.expect(shouldSkipThinkingTemplateForRequest(true, 0, .auto));
+    try std.testing.expect(shouldSkipThinkingTemplateForRequest(1, .auto));
+    try std.testing.expect(shouldSkipThinkingTemplateForRequest(1, .required));
+    try std.testing.expect(!shouldSkipThinkingTemplateForRequest(1, .none));
+    try std.testing.expect(!shouldSkipThinkingTemplateForRequest(0, .auto));
 
     var tok = makeTestTokenizer(
         \\{%- if add_generation_prompt %}
@@ -3726,6 +3732,26 @@ test "tool-calling requests skip qwen thinking scaffold" {
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<think>") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<tool_call>") != null);
+}
+
+test "force-disabled qwen thinking keeps closed generation scaffold" {
+    var tok = makeTestTokenizer(
+        \\{%- if add_generation_prompt %}
+        \\  {{- '<|im_start|>assistant\n' }}
+        \\  {%- if enable_thinking is defined and enable_thinking is true %}
+        \\    {{- '<think>\n' }}
+        \\  {%- else %}
+        \\    {{- '<think>\n\n</think>\n\n' }}
+        \\  {%- endif %}
+        \\{%- endif %}
+    );
+    defer tok.token_to_id.deinit();
+
+    const roles = [_][]const u8{"user"};
+    const contents = [_][]const u8{"hello"};
+    var buf: [512]u8 = undefined;
+    const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, false, false, &.{}, .auto, &buf);
+    try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
 }
 
 test "required single-tool prompt prefills the tool call arguments slot" {
@@ -3986,7 +4012,7 @@ test "parseChatRequest prepends default system guidance when missing" {
 
     try std.testing.expectEqual(@as(usize, 2), parsed.roles.len);
     try std.testing.expectEqualStrings("system", parsed.roles[0]);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[0], "ambiguous") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[0], "Answer directly") != null);
     try std.testing.expectEqualStrings("user", parsed.roles[1]);
 }
 
