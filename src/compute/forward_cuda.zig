@@ -1534,21 +1534,43 @@ pub const ForwardCuda = struct {
         self.conv_off[L] = (self.conv_off[L] + T) % (d.d_conv - 1); // match the in-kernel advance
         // Delta-net scan: warp-level kernel (no __syncthreads in hot loop).
         // Grid: (dt_rank, ceilDiv(head_v_dim, 4)). Block: (32, 4) = 4 warps.
-        const dn_warp = DeltaNetWarpPush{
-            .dt_rank = d.dt_rank,
-            .head_v_dim = d.head_v_dim,
-            .d_state = d.d_state,
-            .n_group = d.n_group,
-            .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
-            .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
-            .has_dt_bias = 1,
-            .has_ssm_a = 1,
-            .n_tok = T,
-            .conv_stride_tok = d.conv_channels,
-            .ab_stride_tok = d.dt_rank,
-            .y_stride_tok = d.d_inner,
-        };
-        cmd.dispatch(&self.pipes.ssm_delta_net_warp, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_warp, @sizeOf(DeltaNetWarpPush), 0);
+        // A/B toggle: ZINC_SSM_WARP=0 falls back to the old block-reduce kernel.
+        const use_warp = std.posix.getenv("ZINC_SSM_WARP") == null or
+            !std.mem.eql(u8, std.posix.getenv("ZINC_SSM_WARP").?, "0");
+        if (use_warp) {
+            const dn_warp = DeltaNetWarpPush{
+                .dt_rank = d.dt_rank,
+                .head_v_dim = d.head_v_dim,
+                .d_state = d.d_state,
+                .n_group = d.n_group,
+                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
+                .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+                .has_dt_bias = 1,
+                .has_ssm_a = 1,
+                .n_tok = T,
+                .conv_stride_tok = d.conv_channels,
+                .ab_stride_tok = d.dt_rank,
+                .y_stride_tok = d.d_inner,
+            };
+            cmd.dispatch(&self.pipes.ssm_delta_net_warp, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_warp, @sizeOf(DeltaNetWarpPush), 0);
+        } else {
+            const dn = DeltaNetPush{
+                .d_inner = d.d_inner,
+                .dt_rank = d.dt_rank,
+                .head_v_dim = d.head_v_dim,
+                .d_state = d.d_state,
+                .n_group = d.n_group,
+                .ssm_a_is_f16 = boolU32(wa.info.type_ == .f16),
+                .dt_bias_is_f16 = boolU32(wdt.info.type_ == .f16),
+                .has_dt_bias = 1,
+                .has_ssm_a = 1,
+                .n_tok = T,
+                .conv_stride_tok = d.conv_channels,
+                .ab_stride_tok = d.dt_rank,
+                .y_stride_tok = d.d_inner,
+            };
+            cmd.dispatch(&self.pipes.ssm_delta_net, .{ d.dt_rank, d.head_v_dim, 1 }, .{ d.head_v_dim, 1, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn, @sizeOf(DeltaNetPush), 0);
+        }
         // Batched gated norm: grid.y = T (stateless per token).
         const norm_per_head: u32 = if (wnorm.info.numElements() == d.d_inner) 1 else 0;
         const gn = GatedNormBatchPush{ .d_inner = d.d_inner, .dt_rank = d.dt_rank, .head_v_dim = d.head_v_dim, .d_state = d.d_state, .norm_per_head = norm_per_head, .n_tok = T };

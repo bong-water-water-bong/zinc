@@ -1254,7 +1254,7 @@ struct DeltaNetWarpPush {
 #define DN_N_WARPS 4
 #define DN_MAX_ROWS_PER_LANE 4  // head_v_dim(128) / warp_size(32) = 4
 
-extern "C" __global__ void ssm_delta_net_warp(
+extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
     const float* conv_out, const unsigned char* dt_bias, const float* alpha,
     const float* beta, const unsigned char* ssm_a, float* state, float* out_data,
     DeltaNetWarpPush pc)
