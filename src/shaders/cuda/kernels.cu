@@ -1290,6 +1290,21 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
 
     const float inv_sqrt_d_state = rsqrtf((float)pc.d_state);
 
+    // Precompute gate[t] and beta[t] for ALL tokens (parallelizable, no state dep).
+    // This removes expf/logf from the sequential scan loop, letting the warp
+    // scheduler overlap them with the state-dependent compute.
+    // Each thread precomputes T/n_threads values, stored in shared memory.
+    extern __shared__ float smem_gate_beta[];  // [2 * n_tok]
+    float* sh_gate = smem_gate_beta;
+    float* sh_beta = smem_gate_beta + pc.n_tok;
+    for (unsigned t = lane; t < pc.n_tok; t += DN_WARP_SIZE * DN_N_WARPS) {
+        float a = alpha[t * pc.ab_stride_tok + h] + dt_bias_val;
+        float sp = logf(1.0f + expf(a));
+        sh_gate[t] = (pc.has_ssm_a != 0u) ? expf(sp * ssm_a_val) : expf(-sp);
+        sh_beta[t] = 1.0f / (1.0f + expf(-beta[t * pc.ab_stride_tok + h]));
+    }
+    __syncthreads();  // one-time sync before the scan loop starts
+
     for (unsigned t = 0; t < pc.n_tok; t++) {
         const unsigned conv_base = t * pc.conv_stride_tok;
         const unsigned q_off = conv_base + k_hi * pc.d_state;
@@ -1319,11 +1334,9 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
         const float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) * inv_sqrt_d_state;
         const float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
 
-        // Gate and beta: all lanes compute independently (same h, t) — no broadcast needed
-        float a = alpha[t * pc.ab_stride_tok + h] + dt_bias_val;
-        float sp = logf(1.0f + expf(a));
-        float gate = (pc.has_ssm_a != 0u) ? expf(sp * ssm_a_val) : expf(-sp);
-        float b = 1.0f / (1.0f + expf(-beta[t * pc.ab_stride_tok + h]));
+        // Gate and beta: read from shared memory (precomputed above)
+        float gate = sh_gate[t];
+        float b = sh_beta[t];
 
         // Load V for this column
         float v_val = conv_out[v_off + col];
