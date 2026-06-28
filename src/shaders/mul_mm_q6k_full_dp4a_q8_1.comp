@@ -15,7 +15,7 @@
 // int8 + scale_dsum buffer pair.
 //
 // LDS is tiny (int8 packed): ~2.7KB vs the f16 path's 6.3KB, so occupancy is no
-// longer the bottleneck. Host may only dispatch when M,N are multiples of 32.
+// longer the bottleneck. Host may only dispatch supported full-token tiles.
 
 #include "dp4a_compat.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -23,13 +23,17 @@
 #extension GL_EXT_control_flow_attributes : require
 
 const uint BM = 32u;
-const uint BN = 32u;
 const uint BK = 32u;
 const uint TM = 4u;
-const uint TN = 4u;
 const uint WG_SIZE = 64u;
 const uint TPR_M = BM / TM; // 8
-const uint TPR_N = BN / TN; // 8
+
+layout(constant_id = 0) const uint SPEC_K = 0u;
+layout(constant_id = 1) const uint SPEC_BN = 32u;
+
+const uint BN = SPEC_BN;
+const uint TPR_N = WG_SIZE / TPR_M; // 8
+const uint TN = BN / TPR_N;
 
 const uint Q6K_BLOCK_SIZE = 256u;
 const uint Q6K_BYTES = 210u;
@@ -118,9 +122,12 @@ void main() {
         }
     }
 
-    const uint blocks_per_row = K / Q6K_BLOCK_SIZE;
+    const uint k_limit = (SPEC_K != 0u) ? SPEC_K : K;
+    const uint blocks_per_row = k_limit / Q6K_BLOCK_SIZE;
+    const uint b_stride_packed = (SPEC_K != 0u) ? (SPEC_K / 4u) : stride_b_packed;
+    const uint b_stride_scale = (SPEC_K != 0u) ? (SPEC_K / 32u) : stride_b_scale;
 
-    for (uint k_outer = 0u; k_outer < K; k_outer += BK) {
+    for (uint k_outer = 0u; k_outer < k_limit; k_outer += BK) {
         // ---- load + dequant weight half-tile (one 16-wide sub-block) ----
         {
             const uint row_local = tid / 2u;
@@ -145,15 +152,19 @@ void main() {
 
         // ---- load pre-quantized int8 activation half-tile ----
         {
-            const uint col_local = tid / 2u;
             const uint sub = tid & 1u;
             const uint k_in_tile = sub * 16u;
-            const uint col_global = ic * BN + col_local;
-            const uint src = col_global * stride_b_packed + ((k_outer + k_in_tile) >> 2);
-            const uint base_b = col_local * SPACK + sub * 4u;
-            [[unroll]] for (uint p = 0u; p < 4u; p++) buf_b[base_b + p] = b_packed[src + p];
-            if (sub == 0u) {
-                buf_bs[col_local] = b_scale_dsum[col_global * stride_b_scale + (k_outer >> 5)].x;
+            [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
+                const uint col_local = cbase + tid / 2u;
+                if (col_local < BN) {
+                    const uint col_global = ic * BN + col_local;
+                    const uint src = col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
+                    const uint base_b = col_local * SPACK + sub * 4u;
+                    [[unroll]] for (uint p = 0u; p < 4u; p++) buf_b[base_b + p] = b_packed[src + p];
+                    if (sub == 0u) {
+                        buf_bs[col_local] = b_scale_dsum[col_global * b_stride_scale + (k_outer >> 5)].x;
+                    }
+                }
             }
         }
 

@@ -15860,6 +15860,17 @@ pub const InferenceEngine = struct {
         return self.qwen36DensePrefillPaddedTokenCount(n_tokens);
     }
 
+    fn qwen36SsmPrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
+        if (self.isQwen36DenseHybrid27B() and n_tokens > 32 and n_tokens <= 40 and
+            self.dmmv.pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n40 != null and
+            self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k5120_n40 != null and
+            self.dmmv.pipeline_mul_mm_q5k_full_dp4a_k6144_n40 != null)
+        {
+            return 40;
+        }
+        return self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+    }
+
     fn gemmaDensePrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
         const cfg = self.model.config;
         if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return n_tokens;
@@ -17046,7 +17057,7 @@ pub const InferenceEngine = struct {
         if (input_pre_quantized_q8_1 and pre_quantized_cols > full_cols) {
             full_cols = pre_quantized_cols;
         } else if (!input_pre_quantized_q8_1) {
-            const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+            const padded_cols = self.qwen36SsmPrefillPaddedTokenCount(n_tokens);
             if (padded_cols > full_cols) {
                 const norm_i8 = self.batched_scratch_norm_q8.?;
                 const norm_scale = self.batched_scratch_norm_q8_scale.?;
@@ -17249,7 +17260,7 @@ pub const InferenceEngine = struct {
         if (input_pre_quantized_q8_1 and pre_quantized_cols > full_cols) {
             full_cols = pre_quantized_cols;
         } else if (!input_pre_quantized_q8_1) {
-            const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+            const padded_cols = self.qwen36SsmPrefillPaddedTokenCount(n_tokens);
             if (padded_cols > full_cols) {
                 const norm_i8 = self.batched_scratch_hidden_i8.?;
                 const norm_sd = self.batched_scratch_hidden_scale_dsum.?;
@@ -17374,8 +17385,8 @@ pub const InferenceEngine = struct {
         d_inner: u32,
         n_tokens: u32,
     ) !bool {
-        // Dense-hybrid Qwen short prompts pad profitably to the 64-column DP4a
-        // path; smaller prompts still fall back through qwenDenseSsmOutDp4aEnabled.
+        // Dense-hybrid Qwen short prompts pad profitably to a full DP4a body;
+        // smaller prompts still fall back through qwenDenseSsmOutDp4aEnabled.
         const dp4a_ok = self.qwenDenseSsmOutDp4aEnabled(n_tokens) and
             ssm_out_t.info.type_ == .q5_k and
             (d_inner & 255) == 0 and
@@ -17395,7 +17406,7 @@ pub const InferenceEngine = struct {
         // but the runtime check guards against future shape drift.
         const act_i8 = self.batched_scratch_hidden_i8.?;
         const act_sd = self.batched_scratch_hidden_scale_dsum.?;
-        const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+        const padded_cols = self.qwen36SsmPrefillPaddedTokenCount(n_tokens);
         if (padded_cols > full_cols) {
             const need_input: vk.c.VkDeviceSize =
                 @as(vk.c.VkDeviceSize, padded_cols) *
@@ -18940,7 +18951,7 @@ pub const InferenceEngine = struct {
             if (shared_q8_1_ok) {
                 const norm_i8 = self.batched_scratch_hidden_i8.?;
                 const norm_sd = self.batched_scratch_hidden_scale_dsum.?;
-                const padded_cols = self.qwen36DensePrefillPaddedTokenCount(n_tokens);
+                const padded_cols = self.qwen36SsmPrefillPaddedTokenCount(n_tokens);
                 if (padded_cols > shared_q8_1_floor_cols) {
                     const need_input: vk.c.VkDeviceSize =
                         @as(vk.c.VkDeviceSize, padded_cols) *
