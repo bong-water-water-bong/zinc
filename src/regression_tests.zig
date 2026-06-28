@@ -273,6 +273,34 @@ test "Vulkan exact-64 BM64 DP4a down shaders use 128-thread column loaders" {
     }
 }
 
+test "Vulkan BM64 gate-up producers keep per-32 Q8 output blocks" {
+    const q8 = @embedFile("shaders/mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_bm64.comp");
+    const q8_1 = @embedFile("shaders/mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_bm64.comp");
+    for ([_][]const u8{ q8, q8_1 }) |src| {
+        try expectContains(src, "const uint BM = 64u;");
+        try expectContains(src, "const uint WG_SIZE = 128u;");
+        try expectContains(src, "const uint Q8_BLOCK_THREADS = 8u;");
+        try expectContains(src, "const uint col_local = tid / 2u;");
+        try expectNotContains(src, "for (uint cbase = 0u; cbase < BN; cbase += 32u)");
+        try expectContains(src, "const uint q8_block = tiwr / Q8_BLOCK_THREADS;");
+        try expectContains(src, "const uint q8_lane = tiwr & (Q8_BLOCK_THREADS - 1u);");
+        try expectContains(src, "subgroupClusteredMax(local_max, Q8_BLOCK_THREADS)");
+        try expectContains(src, "ir * (BM / 4u) + tiwr");
+        try expectContains(src, "ir * (BM / 32u) + q8_block");
+    }
+    try expectContains(q8_1, "subgroupClusteredAdd(local_isum, Q8_BLOCK_THREADS)");
+}
+
+test "Vulkan Qwen gate-up BM64 path is isolated to K5120 N64 dispatches" {
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n64_bm64");
+    try expectContains(dmmv, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n64_ragged_bm64");
+    try expectContains(dmmv, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64_bm64");
+    try expectContains(dmmv, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64_ragged_bm64");
+    try expectContains(dmmv, "const m_tile: u32 = if (use_bm64_n64 or use_bm64_ragged_n64) 64 else 32;");
+    try expectContains(dmmv, "M / m_tile");
+}
+
 test "Vulkan Qwen DP4a ragged BN64 shaders guard inactive columns" {
     const q4 = @embedFile("shaders/mul_mm_q4k_full_dp4a.comp");
     const q6 = @embedFile("shaders/mul_mm_q6k_full_dp4a.comp");
