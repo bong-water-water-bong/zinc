@@ -243,13 +243,25 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     try expectContains(forward, "full_cols == n_tokens and");
 }
 
-test "Vulkan Qwen SSM DP4a keeps BN40 specializations" {
+test "Vulkan Qwen SSM DP4a keeps BN40 and BN64 specializations" {
     const src = @embedFile("compute/dmmv.zig");
+    try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n64_ragged");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n40");
+    try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k5120_n64_ragged");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k5120_n40");
     try expectContains(src, "pipeline_mul_mm_q5k_full_dp4a_k6144_n40");
+    try expectContains(src, "K == 5120 and n_tile == 64");
+    try expectContains(src, "K == 5120 and N > 64 and (N & 63) != 0");
     try expectContains(src, "K == 5120 and n_tile == 40");
     try expectContains(src, "K == 6144 and n_tile == 40");
+    try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4aQ8_1(", "use_ragged_n64", 1800);
+    try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_k5120_ragged_n64", 2400);
+
+    const q6_q8_1 = @embedFile("shaders/mul_mm_q6k_full_dp4a_q8_1.comp");
+    try expectContains(q6_q8_1, "layout(constant_id = 2) const uint SPEC_RAGGED_N = 0u;");
+    try expectContains(q6_q8_1, "const bool col_ok = SPEC_RAGGED_N == 0u || col_global < N;");
+    try expectContains(q6_q8_1, "col_ok ? b_packed[src + p] : 0u");
+    try expectContains(q6_q8_1, "if (SPEC_RAGGED_N == 0u || col_g < N)");
 }
 
 test "Vulkan full-DP4a wide shaders load every activation half tile safely" {
