@@ -1337,10 +1337,21 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
         // for ALL 4 warps in a (32,4) block → all write sh[0] → race condition.
         // Each warp owns 32 lanes × 4 rows = 128 elements = the full Q/K vector,
         // so warp_reduce_sum_all correctly sums all 128 elements.
+        //
+        // NOTE: The L2 norm costs 2 warp_reduce_sum_all + 2 rsqrt + 8 multiplies
+        // per iteration (~40% of per-iteration FLOPs). llama.cpp's gated_delta_net
+        // kernel does NOT L2-normalize — it uses raw k/q with scale=1/sqrt(S_v).
+        // Keeping the normalization for correctness (the model may depend on it).
         sumq = zinc_warp_reduce_sum_all(sumq);
         sumk = zinc_warp_reduce_sum_all(sumk);
-        const float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) * inv_sqrt_d_state;
-        const float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
+        float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) * inv_sqrt_d_state;
+        float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
+        // Apply normalization to q_reg/k_reg (saves repeating rinv multiplies later)
+        #pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            q_reg[r] *= q_rinv;
+            k_reg[r] *= k_rinv;
+        }
 
         // Gate and beta: read from shared memory (precomputed above)
         float gate = sh_gate[t];
@@ -1349,26 +1360,24 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
         // Load V for this column
         float v_val = conv_out[v_off + col];
 
-        // State update (per-lane, no sync):
+        // State update (per-lane, no sync — q_reg/k_reg already normalized):
         // 1. Decay: s_shard *= gate
-        // 2. sk = dot(state, k_normalized) — warp reduce (broadcast)
-        // 3. d = beta * (v - sk)
-        // 4. state += k_normalized * d — rank-1 update
+        // 2. sk = dot(state, k) — warp reduce (k already normalized)
         float sk_partial = 0.0f;
         #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             s_shard[r] *= gate;
-            sk_partial += s_shard[r] * (k_reg[r] * k_rinv);
+            sk_partial += s_shard[r] * k_reg[r];
         }
         float sk = zinc_warp_reduce_sum_all(sk_partial);
         float d = b * (v_val - sk);
 
-        // Readout: o = dot(state, q_normalized) — warp reduce (broadcast)
+        // Readout: o = dot(state, q) — warp reduce (q already normalized)
         float o_partial = 0.0f;
         #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
-            s_shard[r] += (k_reg[r] * k_rinv) * d;  // rank-1 update
-            o_partial += s_shard[r] * (q_reg[r] * q_rinv);
+            s_shard[r] += k_reg[r] * d;  // rank-1 update
+            o_partial += s_shard[r] * q_reg[r];
         }
         float o = zinc_warp_reduce_sum_all(o_partial);
 
