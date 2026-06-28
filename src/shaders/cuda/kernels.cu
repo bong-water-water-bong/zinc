@@ -1297,7 +1297,11 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
     extern __shared__ float smem_gate_beta[];  // [2 * n_tok]
     float* sh_gate = smem_gate_beta;
     float* sh_beta = smem_gate_beta + pc.n_tok;
-    for (unsigned t = lane; t < pc.n_tok; t += DN_WARP_SIZE * DN_N_WARPS) {
+    // Use FULL thread index (threadIdx.y * 32 + threadIdx.x = 0..127), not just
+    // lane (threadIdx.x = 0..31). Otherwise warps 1-3 duplicate warp 0's work
+    // and tokens 32+ are never initialized → garbage gate/beta.
+    const unsigned full_tid = threadIdx.y * DN_WARP_SIZE + threadIdx.x;
+    for (unsigned t = full_tid; t < pc.n_tok; t += DN_WARP_SIZE * DN_N_WARPS) {
         float a = alpha[t * pc.ab_stride_tok + h] + dt_bias_val;
         float sp = logf(1.0f + expf(a));
         sh_gate[t] = (pc.has_ssm_a != 0u) ? expf(sp * ssm_a_val) : expf(-sp);
@@ -1328,14 +1332,13 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
             }
         }
 
-        // Q/K norms: use BLOCK-level reduce (zinc_block_reduce_sum_all) to be
-        // bit-compatible with the decode kernel (ssm_delta_net_seq). This adds
-        // 2 __syncthreads per iteration but enables the warp kernel for server
-        // prefill (state compatible with decode). The state-dependent reduces
-        // (sk, o) stay warp-level — their FP differences are bounded by the
-        // rank-1 update structure and don't compound.
-        sumq = zinc_block_reduce_sum_all(sumq);
-        sumk = zinc_block_reduce_sum_all(sumk);
+        // Q/K norms: WARP-level reduce only. zinc_block_reduce_sum_all CANNOT be
+        // used in this kernel: it indexes warps via threadIdx.x >> 5, which is 0
+        // for ALL 4 warps in a (32,4) block → all write sh[0] → race condition.
+        // Each warp owns 32 lanes × 4 rows = 128 elements = the full Q/K vector,
+        // so warp_reduce_sum_all correctly sums all 128 elements.
+        sumq = zinc_warp_reduce_sum_all(sumq);
+        sumk = zinc_warp_reduce_sum_all(sumk);
         const float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) * inv_sqrt_d_state;
         const float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
 

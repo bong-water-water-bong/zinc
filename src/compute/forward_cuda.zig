@@ -1490,8 +1490,10 @@ pub const ForwardCuda = struct {
         }
 
         // Run batched prefill — writes land in the slot's aliased state.
-        // The warp kernel uses block-level Q/K norm reduces → bit-compatible
-        // with the decode ssm_delta_net_seq kernel → no force_block_ssm needed.
+        // The warp kernel's Q/K norm uses a different FP reduction tree than
+        // the decode kernel → state divergence during decode. Force the block-
+        // reduce kernel for slot-aware prefill to ensure bit-compatible state.
+        self.force_block_ssm = true;
         const tok = self.prefillBatched(tokens) catch |err| {
             self.restorePrefillAliases(saved_kv_k, saved_kv_v, saved_ssm, saved_conv, d.n_layers);
             @memcpy(self.conv_off, saved_conv_off);
@@ -1499,6 +1501,7 @@ pub const ForwardCuda = struct {
         };
 
         self.restorePrefillAliases(saved_kv_k, saved_kv_v, saved_ssm, saved_conv, d.n_layers);
+        self.force_block_ssm = false;
         @memcpy(self.conv_off, saved_conv_off);
         return tok;
     }
