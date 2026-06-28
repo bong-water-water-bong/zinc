@@ -16605,7 +16605,13 @@ pub const InferenceEngine = struct {
                 full_cols * inter_dim,
             );
         }
-        self.endProfilePhase(.dense_ffn_gateup_matmul, gateup_matmul_phase);
+        const gateup_profile_phase: ProfilePhase = if (fuse_q8)
+            .dense_ffn_gateup_matmul_q6
+        else if (fuse_q8_1)
+            .dense_ffn_gateup_matmul_q4
+        else
+            .dense_ffn_gateup_matmul;
+        self.endProfilePhase(gateup_profile_phase, gateup_matmul_phase);
         if (fuse_q8) return .q8_swiglu;
         if (fuse_q8_1) return .q8_1_swiglu;
         return .f32_swiglu;
@@ -16766,7 +16772,7 @@ pub const InferenceEngine = struct {
                         full_cols * hidden_dim,
                     );
                 }
-                self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
+                self.endProfilePhase(.dense_ffn_down_matmul_q6, down_matmul_phase);
                 return false;
             }
         }
@@ -16895,7 +16901,7 @@ pub const InferenceEngine = struct {
                         full_cols * hidden_dim,
                     );
                 }
-                self.endProfilePhase(.dense_ffn_down_matmul, down_matmul_phase);
+                self.endProfilePhase(.dense_ffn_down_matmul_q4, down_matmul_phase);
                 return false;
             }
         }
