@@ -571,12 +571,16 @@ pub const DmmvDispatch = struct {
     pipeline_mul_mm_q6k_full_dp4a_k17408_n64: ?Pipeline,
     /// K=17408, BN=64 two-slice sibling used only by exact 64-token bodies.
     pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2: ?Pipeline,
+    /// K=17408, BM=64/BN=64 sibling for 64-aligned overwrite bodies.
+    pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64: ?Pipeline,
     /// K=17408, BM=64/BN=64 two-wave sibling that accumulates exact 64-token bodies.
     pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64_acc: ?Pipeline,
     /// K=17408, BN=64 two-slice sibling that accumulates into the residual.
     pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc: ?Pipeline,
     /// K=17408, BN=64 guarded sibling for long dense-hybrid ragged bodies.
     pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged: ?Pipeline,
+    /// K=17408, BM=64/BN=64 guarded sibling for long dense-hybrid ragged overwrite bodies.
+    pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged_bm64: ?Pipeline,
     /// K=17408, BN=40 sibling for 33-40 token dense-hybrid 27B prompts.
     pipeline_mul_mm_q6k_full_dp4a_k17408_n40: ?Pipeline,
     /// Same Q6_K DP4a dense-down shader with K=21504 specialized for
@@ -681,12 +685,16 @@ pub const DmmvDispatch = struct {
     pipeline_mul_mm_q4k_full_dp4a_k17408_n64: ?Pipeline,
     /// K=17408, BN=64 two-slice sibling used only by exact 64-token bodies.
     pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2: ?Pipeline,
+    /// K=17408, BM=64/BN=64 sibling for 64-aligned overwrite bodies.
+    pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64: ?Pipeline,
     /// K=17408, BM=64/BN=64 two-wave sibling that accumulates exact 64-token bodies.
     pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64_acc: ?Pipeline,
     /// K=17408, BN=64 two-slice sibling that accumulates into the residual.
     pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc: ?Pipeline,
     /// K=17408, BN=64 guarded sibling for long Q4_K dense-down ragged bodies.
     pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged: ?Pipeline,
+    /// K=17408, BM=64/BN=64 guarded sibling for long Q4_K dense-down ragged overwrite bodies.
+    pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged_bm64: ?Pipeline,
     /// K=17408, BN=40 sibling for 33-40 token dense-hybrid 27B Q4_K dense-down bodies.
     pipeline_mul_mm_q4k_full_dp4a_k17408_n40: ?Pipeline,
     /// Same Q4_K DP4a shader with K=21504 specialized for Gemma 4 31B dense
@@ -1382,6 +1390,12 @@ pub const DmmvDispatch = struct {
             .{ .id = 1, .value = 64 },
             .{ .id = 2, .value = 1 },
         };
+        const spec_k_17408_n64_bk2_ragged = [_]pipeline_mod.SpecConst{
+            .{ .id = 0, .value = 17408 },
+            .{ .id = 1, .value = 64 },
+            .{ .id = 2, .value = 1 },
+            .{ .id = 3, .value = 2 },
+        };
         const spec_k_21504 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 21504 }};
         const spec_k_21504_n64 = [_]pipeline_mod.SpecConst{
             .{ .id = 0, .value = 21504 },
@@ -1447,6 +1461,13 @@ pub const DmmvDispatch = struct {
         }
         var mul_mm_q6k_full_dp4a_bm64_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const mul_mm_q6k_full_dp4a_bm64_path = std.fmt.bufPrint(&mul_mm_q6k_full_dp4a_bm64_path_buf, "{s}/mul_mm_q6k_full_dp4a_bm64_n64_acc.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_bm64_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_17408_n64_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q6k_full_dp4a K=17408 BM64 BN64 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64 != null) {
+            log.info("mul_mm_q6k_full_dp4a K=17408 BM64 BN64 pipeline loaded (Qwen dense-hybrid 27B 64-aligned dense-down prefill)", .{});
+        }
         const pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64_acc = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_bm64_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_17408_n64_bk2_acc, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q6k_full_dp4a K=17408 BM64 BN64 accumulate shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
@@ -1460,6 +1481,13 @@ pub const DmmvDispatch = struct {
         };
         if (pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged != null) {
             log.info("mul_mm_q6k_full_dp4a K=17408 BN=64 ragged pipeline loaded (Qwen dense-hybrid 27B long dense-down prefill)", .{});
+        }
+        const pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged_bm64 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_bm64_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_17408_n64_bk2_ragged, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q6k_full_dp4a K=17408 BM64 BN64 ragged shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged_bm64 != null) {
+            log.info("mul_mm_q6k_full_dp4a K=17408 BM64 BN64 ragged pipeline loaded (Qwen dense-hybrid 27B long dense-down prefill)", .{});
         }
         const pipeline_mul_mm_q6k_full_dp4a_k17408_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_17408_n40_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q6k_full_dp4a K=17408 BN=40 shader not loaded: {s}", .{@errorName(err)});
@@ -1807,6 +1835,13 @@ pub const DmmvDispatch = struct {
         }
         var mul_mm_q4k_full_dp4a_bm64_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const mul_mm_q4k_full_dp4a_bm64_path = std.fmt.bufPrint(&mul_mm_q4k_full_dp4a_bm64_path_buf, "{s}/mul_mm_q4k_full_dp4a_bm64_n64_acc.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_bm64_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_17408_n64_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_full_dp4a K=17408 BM64 BN64 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64 != null) {
+            log.info("mul_mm_q4k_full_dp4a K=17408 BM64 BN64 pipeline loaded (Qwen dense-hybrid 27B Q4_K dense-down 64-aligned bodies)", .{});
+        }
         const pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64_acc = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_bm64_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_17408_n64_bk2_acc, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_full_dp4a K=17408 BM64 BN64 accumulate shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
@@ -1820,6 +1855,13 @@ pub const DmmvDispatch = struct {
         };
         if (pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged != null) {
             log.info("mul_mm_q4k_full_dp4a K=17408 BN=64 ragged pipeline loaded (Qwen dense-hybrid 27B Q4_K dense-down long bodies)", .{});
+        }
+        const pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged_bm64 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_bm64_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_17408_n64_bk2_ragged, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_full_dp4a K=17408 BM64 BN64 ragged shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged_bm64 != null) {
+            log.info("mul_mm_q4k_full_dp4a K=17408 BM64 BN64 ragged pipeline loaded (Qwen dense-hybrid 27B Q4_K dense-down long bodies)", .{});
         }
         const pipeline_mul_mm_q4k_full_dp4a_k17408_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_17408_n40_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_full_dp4a K=17408 BN=40 shader not loaded: {s}", .{@errorName(err)});
@@ -1943,9 +1985,11 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q6k_full_dp4a_k12288 = pipeline_mul_mm_q6k_full_dp4a_k12288,
             .pipeline_mul_mm_q6k_full_dp4a_k17408_n64 = pipeline_mul_mm_q6k_full_dp4a_k17408_n64,
             .pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2 = pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2,
+            .pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64 = pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64,
             .pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64_acc = pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64_acc,
             .pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc = pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc,
             .pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged = pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged,
+            .pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged_bm64 = pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged_bm64,
             .pipeline_mul_mm_q6k_full_dp4a_k17408_n40 = pipeline_mul_mm_q6k_full_dp4a_k17408_n40,
             .pipeline_mul_mm_q6k_full_dp4a_k21504 = pipeline_mul_mm_q6k_full_dp4a_k21504,
             .pipeline_mul_mm_q6k_full_dp4a_k21504_n8 = pipeline_mul_mm_q6k_full_dp4a_k21504_n8,
@@ -1988,9 +2032,11 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q4k_full_dp4a_k5120_n40 = pipeline_mul_mm_q4k_full_dp4a_k5120_n40,
             .pipeline_mul_mm_q4k_full_dp4a_k17408_n64 = pipeline_mul_mm_q4k_full_dp4a_k17408_n64,
             .pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2 = pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2,
+            .pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64 = pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64,
             .pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64_acc = pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64_acc,
             .pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc = pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc,
             .pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged = pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged,
+            .pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged_bm64 = pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged_bm64,
             .pipeline_mul_mm_q4k_full_dp4a_k17408_n40 = pipeline_mul_mm_q4k_full_dp4a_k17408_n40,
             .pipeline_mul_mm_q4k_full_dp4a_k21504 = pipeline_mul_mm_q4k_full_dp4a_k21504,
             .pipeline_mul_mm_q4k_full_dp4a_k21504_n64 = pipeline_mul_mm_q4k_full_dp4a_k21504_n64,
@@ -3664,12 +3710,14 @@ pub const DmmvDispatch = struct {
         d_offset: u32,
         accumulate: bool,
     ) !void {
+        const use_n64_bm64 = !accumulate and K == 17408 and N >= 64 and (N & 63) == 0 and (M & 63) == 0 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64 != null;
         const use_exact_n64_bm64_acc = accumulate and K == 17408 and N == 64 and (M & 63) == 0 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64_acc != null;
         const use_exact_n64_acc = accumulate and K == 17408 and N == 64 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc != null;
         const use_exact_n64_bk2 = !accumulate and K == 17408 and N == 64 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2 != null;
-        const use_ragged_n64 = K == 17408 and N > 64 and (N & 63) != 0 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged != null;
+        const use_ragged_n64_bm64 = !accumulate and K == 17408 and N > 64 and (N & 63) != 0 and (M & 63) == 0 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged_bm64 != null;
+        const use_ragged_n64 = K == 17408 and N > 64 and (N & 63) != 0 and (use_ragged_n64_bm64 or self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged != null);
         if (accumulate and !(use_exact_n64_bm64_acc or use_exact_n64_acc)) return error.PipelineNotLoaded;
-        const n_tile: u32 = if (use_exact_n64_bm64_acc)
+        const n_tile: u32 = if (use_n64_bm64 or use_exact_n64_bm64_acc)
             64
         else if (K == 17408 and N == 40 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n40 != null)
             40
@@ -3682,6 +3730,12 @@ pub const DmmvDispatch = struct {
         else
             32;
         const pip = blk: {
+            if (use_ragged_n64_bm64) {
+                if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged_bm64) |*p| break :blk p;
+            }
+            if (use_n64_bm64) {
+                if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64) |*p| break :blk p;
+            }
             if (use_exact_n64_bm64_acc) {
                 if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64_acc) |*p| break :blk p;
             }
@@ -3736,7 +3790,7 @@ pub const DmmvDispatch = struct {
             push_desc_fn,
             infos[0..],
             std.mem.asBytes(&push),
-            if (use_exact_n64_bm64_acc) M / 64 else M / 32,
+            if (use_n64_bm64 or use_exact_n64_bm64_acc or use_ragged_n64_bm64) M / 64 else M / 32,
             if (use_ragged_n64) (N + n_tile - 1) / n_tile else N / n_tile,
             1,
         );
@@ -4549,12 +4603,14 @@ pub const DmmvDispatch = struct {
         d_offset: u32,
         accumulate: bool,
     ) !void {
+        const use_n64_bm64 = !accumulate and K == 17408 and N >= 64 and (N & 63) == 0 and (M & 63) == 0 and self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64 != null;
         const use_exact_n64_bm64_acc = accumulate and K == 17408 and N == 64 and (M & 63) == 0 and self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64_acc != null;
         const use_exact_n64_acc = accumulate and K == 17408 and N == 64 and self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc != null;
         const use_exact_n64_bk2 = !accumulate and K == 17408 and N == 64 and self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2 != null;
-        const use_ragged_n64 = K == 17408 and N > 64 and (N & 63) != 0 and self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged != null;
+        const use_ragged_n64_bm64 = !accumulate and K == 17408 and N > 64 and (N & 63) != 0 and (M & 63) == 0 and self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged_bm64 != null;
+        const use_ragged_n64 = K == 17408 and N > 64 and (N & 63) != 0 and (use_ragged_n64_bm64 or self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged != null);
         if (accumulate and !(use_exact_n64_bm64_acc or use_exact_n64_acc)) return error.PipelineNotLoaded;
-        const n_tile: u32 = if (use_exact_n64_bm64_acc)
+        const n_tile: u32 = if (use_n64_bm64 or use_exact_n64_bm64_acc)
             64
         else if (K == 5120 and N == 40 and self.pipeline_mul_mm_q4k_full_dp4a_k5120_n40 != null)
             40
@@ -4573,6 +4629,12 @@ pub const DmmvDispatch = struct {
         else
             32;
         const pip = blk: {
+            if (use_ragged_n64_bm64) {
+                if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged_bm64) |*p| break :blk p;
+            }
+            if (use_n64_bm64) {
+                if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64) |*p| break :blk p;
+            }
             if (use_exact_n64_bm64_acc) {
                 if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64_acc) |*p| break :blk p;
             }
@@ -4633,7 +4695,7 @@ pub const DmmvDispatch = struct {
             push_desc_fn,
             infos[0..],
             std.mem.asBytes(&push),
-            if (use_exact_n64_bm64_acc) M / 64 else M / 32,
+            if (use_n64_bm64 or use_exact_n64_bm64_acc or use_ragged_n64_bm64) M / 64 else M / 32,
             if (use_ragged_n64) (N + n_tile - 1) / n_tile else N / n_tile,
             1,
         );
@@ -4777,9 +4839,11 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q6k_full_dp4a_k12288) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64_acc) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bk2_acc) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged_bm64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n40) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k21504) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k21504_n8) |*p| p.deinit();
@@ -4821,9 +4885,11 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q4k_full_dp4a_k5120_n40) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bm64_acc) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_bk2_acc) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged_bm64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n40) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k21504) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k21504_n64) |*p| p.deinit();

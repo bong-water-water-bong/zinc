@@ -1,5 +1,5 @@
 #version 460
-// ZINC — exact 64-token BM64 Q4_K DP4a dense-down accumulate prefill.
+// ZINC — BM64 Q4_K DP4a dense-down prefill.
 // Used by the Qwen3.6-27B SSM z prefill projection (M=d_inner, K=hidden_dim).
 // Same DP4a math as mul_mm_q4k_gate_up_swiglu_full_dp4a.comp but stripped to a
 // single Q4_K weight SSBO + Q8_1 activation + raw f32 output (token-major
@@ -36,7 +36,7 @@ layout(constant_id = 0) const uint SPEC_K = 0u;
 layout(constant_id = 1) const uint SPEC_BN = 64u;
 layout(constant_id = 2) const uint SPEC_RAGGED_N = 0u;
 layout(constant_id = 3) const uint SPEC_BK_STEP = 2u;
-layout(constant_id = 4) const uint SPEC_ACCUMULATE = 1u;
+layout(constant_id = 4) const uint SPEC_ACCUMULATE = 0u;
 
 const uint BN = SPEC_BN;
 const uint BK_STEP = SPEC_BK_STEP;
@@ -210,7 +210,11 @@ void main() {
             const uint col_g = ic * BN + tiwc * TN + n;
             if (row_g < M && col_g < N) {
                 const uint out_idx = d_offset + col_g * stride_d + row_g;
-                d_data[out_idx] += sums[m][n];
+                if (SPEC_ACCUMULATE != 0u) {
+                    d_data[out_idx] += sums[m][n];
+                } else {
+                    d_data[out_idx] = sums[m][n];
+                }
             }
         }
     }

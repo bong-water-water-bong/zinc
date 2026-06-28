@@ -1,5 +1,5 @@
 #version 460
-// ZINC — exact 64-token BM64 Q6_K DP4a dense-down accumulate prefill.
+// ZINC — BM64 Q6_K DP4a dense-down prefill.
 //
 // The f32-FMA Q6_K GEMM (mul_mm_q6k_full.comp) is a tuned local optimum: cycle
 // 19 (occupancy-lift via f16 activations) and cycle 22 (better LDS:FMA via wide
@@ -45,7 +45,7 @@ layout(constant_id = 0) const uint SPEC_K = 0u;
 layout(constant_id = 1) const uint SPEC_BN = 64u;
 layout(constant_id = 2) const uint SPEC_RAGGED_N = 0u;
 layout(constant_id = 3) const uint SPEC_BK_STEP = 2u;
-layout(constant_id = 4) const uint SPEC_ACCUMULATE = 1u;
+layout(constant_id = 4) const uint SPEC_ACCUMULATE = 0u;
 
 const uint BN = SPEC_BN;
 const uint BK_STEP = SPEC_BK_STEP;
@@ -218,7 +218,11 @@ void main() {
             const uint col_g = ic * BN + tiwc * TN + n;
             if (row_g < M && col_g < N) {
                 const uint out_idx = d_offset + col_g * stride_d + row_g;
-                d_data[out_idx] += sums[m][n];
+                if (SPEC_ACCUMULATE != 0u) {
+                    d_data[out_idx] += sums[m][n];
+                } else {
+                    d_data[out_idx] = sums[m][n];
+                }
             }
         }
     }
