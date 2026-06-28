@@ -34,8 +34,10 @@ const uint SPACK = 9u;
 
 layout(constant_id = 0) const uint SPEC_K = 0u;
 layout(constant_id = 1) const uint SPEC_BN = 32u;
+layout(constant_id = 3) const uint SPEC_BK_STEP = 1u;
 
 const uint BN = SPEC_BN;
+const uint BK_STEP = SPEC_BK_STEP;
 const uint TPR_N = WG_SIZE / TPR_M; // 8
 const uint TN = BN / TPR_N;
 
@@ -57,10 +59,10 @@ layout(set = 0, binding = 1) readonly buffer ActB  { uint b_packed[]; };
 layout(set = 0, binding = 2) readonly buffer SclB  { vec2 b_scale_dsum[]; };
 layout(set = 0, binding = 3) writeonly buffer MatD { float d_data[]; };
 
-shared uint  buf_a[BM * SPACK];
-shared vec2  buf_a_fb[BM];      // (factor, bias) per row
-shared uint  buf_b[BN * SPACK];
-shared vec2  buf_b_sd[BN];      // (scale, dsum)  per column
+shared uint  buf_a[BK_STEP * BM * SPACK];
+shared vec2  buf_a_fb[BK_STEP * BM];      // (factor, bias) per row
+shared uint  buf_b[BK_STEP * BN * SPACK];
+shared vec2  buf_b_sd[BK_STEP * BN];      // (scale, dsum)  per column
 
 uint q4k_scale_byte(uint sc0, uint sc1, uint sc2, uint idx) {
     uint word = (idx < 4u) ? sc0 : ((idx < 8u) ? sc1 : sc2);
@@ -101,15 +103,15 @@ void main() {
     const uint b_stride_packed = (SPEC_K != 0u) ? (SPEC_K / 4u) : stride_b_packed;
     const uint b_stride_scale = (SPEC_K != 0u) ? (SPEC_K / 32u) : stride_b_scale;
 
-    for (uint k_outer = 0u; k_outer < k_limit; k_outer += BK) {
-        const uint super_block = k_outer / 256u;
-        const uint sb_offset = k_outer & 0xFFu;
-        const uint sb = sb_offset >> 5;         // 0..7 within the 256-block
-        const uint chunk = sb >> 1;             // 0..3
-        const uint nibble_choice = sb & 1u;     // 0 = low nibble, 1 = high nibble
-
+    for (uint k_outer = 0u; k_outer < k_limit; k_outer += BK * BK_STEP) {
         // ---- load Q4_K weights for the BM rows in this tile ----
-        {
+        [[unroll]] for (uint ks = 0u; ks < BK_STEP; ks++) {
+            const uint k_step_base = k_outer + ks * BK;
+            const uint super_block = k_step_base / 256u;
+            const uint sb_offset = k_step_base & 0xFFu;
+            const uint sb = sb_offset >> 5;         // 0..7 within the 256-block
+            const uint chunk = sb >> 1;             // 0..3
+            const uint nibble_choice = sb & 1u;     // 0 = low nibble, 1 = high nibble
             const uint row_local = tid / 2u;
             const uint tile_half = tid & 1u;          // 0 -> k 0..15, 1 -> k 16..31
             const uint k_in_tile = tile_half * 16u;
@@ -140,71 +142,76 @@ void main() {
                 a_packed[w] = (nibble_choice == 0u) ? (qs_word & 0x0F0F0F0Fu)
                                                    : ((qs_word >> 4) & 0x0F0F0F0Fu);
             }
-            const uint base_a = row_local * SPACK + tile_half * 4u;
+            const uint base_a = ks * BM * SPACK + row_local * SPACK + tile_half * 4u;
             [[unroll]] for (uint w = 0u; w < 4u; w++) buf_a[base_a + w] = a_packed[w];
 
             // factor/bias is row-scalar — only one of the row's two threads
             // needs to write it.
             if (tile_half == 0u) {
-                buf_a_fb[row_local] = vec2(a_factor, a_bias);
+                buf_a_fb[ks * BM + row_local] = vec2(a_factor, a_bias);
             }
         }
 
         // ---- load pre-quantized Q8_1 activation half-tile + (scale, dsum) ----
-        if (BN >= 32u) {
+        [[unroll]] for (uint ks = 0u; ks < BK_STEP; ks++) {
+            const uint k_step_base = k_outer + ks * BK;
             const uint tile_half = tid & 1u;
             const uint k_in_tile = tile_half * 16u;
-            [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
-                const uint col_local = cbase + tid / 2u;
-                if (col_local < BN) {
-                    const uint col_global = ic * BN + col_local;
-                    const uint src = col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
-                    const uint base_b = col_local * SPACK + tile_half * 4u;
-                    [[unroll]] for (uint w = 0u; w < 4u; w++) buf_b[base_b + w] = b_packed[src + w];
-                    if (tile_half == 0u) {
-                        buf_b_sd[col_local] = b_scale_dsum[col_global * b_stride_scale + (k_outer >> 5)];
+            if (BN >= 32u) {
+                [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
+                    const uint col_local = cbase + tid / 2u;
+                    if (col_local < BN) {
+                        const uint col_global = ic * BN + col_local;
+                        const uint src = col_global * b_stride_packed + ((k_step_base + k_in_tile) >> 2);
+                        const uint base_b = ks * BN * SPACK + col_local * SPACK + tile_half * 4u;
+                        [[unroll]] for (uint w = 0u; w < 4u; w++) buf_b[base_b + w] = b_packed[src + w];
+                        if (tile_half == 0u) {
+                            buf_b_sd[ks * BN + col_local] = b_scale_dsum[col_global * b_stride_scale + (k_step_base >> 5)];
+                        }
                     }
                 }
-            }
-        } else {
-            const uint col_local = tid >> 3;
-            const uint pack_idx = tid & 7u;
-            const uint col_global = ic * BN + col_local;
-            const bool col_ok = col_global < N;
-            const uint base_b = col_local * SPACK;
-            buf_b[base_b + pack_idx] = col_ok
-                ? b_packed[col_global * b_stride_packed + (k_outer >> 2) + pack_idx]
-                : 0u;
-            if (pack_idx == 0u) {
-                buf_b_sd[col_local] = col_ok
-                    ? b_scale_dsum[col_global * b_stride_scale + (k_outer >> 5)]
-                    : vec2(0.0);
+            } else {
+                const uint col_local = tid >> 3;
+                const uint pack_idx = tid & 7u;
+                const uint col_global = ic * BN + col_local;
+                const bool col_ok = col_global < N;
+                const uint base_b = ks * BN * SPACK + col_local * SPACK;
+                buf_b[base_b + pack_idx] = col_ok
+                    ? b_packed[col_global * b_stride_packed + (k_step_base >> 2) + pack_idx]
+                    : 0u;
+                if (pack_idx == 0u) {
+                    buf_b_sd[ks * BN + col_local] = col_ok
+                        ? b_scale_dsum[col_global * b_stride_scale + (k_step_base >> 5)]
+                        : vec2(0.0);
+                }
             }
         }
 
         barrier();
 
         // ---- int8 dot4 accumulate ----
-        uint a_reg[TM][8];
-        vec2 a_fb_reg[TM];
-        [[unroll]] for (uint m = 0u; m < TM; m++) {
-            const uint wrow = (tiwr * TM + m) * SPACK;
-            [[unroll]] for (uint p = 0u; p < 8u; p++) a_reg[m][p] = buf_a[wrow + p];
-            a_fb_reg[m] = buf_a_fb[tiwr * TM + m];
-        }
-        [[unroll]] for (uint n = 0u; n < TN; n++) {
-            const uint acol = (tiwc * TN + n) * SPACK;
-            uint breg[8];
-            [[unroll]] for (uint p = 0u; p < 8u; p++) breg[p] = buf_b[acol + p];
-            const vec2 b_sd = buf_b_sd[tiwc * TN + n]; // (scale, dsum)
+        [[unroll]] for (uint ks = 0u; ks < BK_STEP; ks++) {
+            uint a_reg[TM][8];
+            vec2 a_fb_reg[TM];
             [[unroll]] for (uint m = 0u; m < TM; m++) {
-                int a_isum = 0;
-                [[unroll]] for (uint p = 0u; p < 8u; p++) {
-                    a_isum = dotPacked4x8AccSatEXT(int(a_reg[m][p]), int(breg[p]), a_isum);
+                const uint wrow = ks * BM * SPACK + (tiwr * TM + m) * SPACK;
+                [[unroll]] for (uint p = 0u; p < 8u; p++) a_reg[m][p] = buf_a[wrow + p];
+                a_fb_reg[m] = buf_a_fb[ks * BM + tiwr * TM + m];
+            }
+            [[unroll]] for (uint n = 0u; n < TN; n++) {
+                const uint acol = ks * BN * SPACK + (tiwc * TN + n) * SPACK;
+                uint breg[8];
+                [[unroll]] for (uint p = 0u; p < 8u; p++) breg[p] = buf_b[acol + p];
+                const vec2 b_sd = buf_b_sd[ks * BN + tiwc * TN + n]; // (scale, dsum)
+                [[unroll]] for (uint m = 0u; m < TM; m++) {
+                    int a_isum = 0;
+                    [[unroll]] for (uint p = 0u; p < 8u; p++) {
+                        a_isum = dotPacked4x8AccSatEXT(int(a_reg[m][p]), int(breg[p]), a_isum);
+                    }
+                    // contribution = b_scale * factor * idot - bias * dsum.
+                    sums[m][n] += b_sd.x * a_fb_reg[m].x * float(a_isum)
+                                - a_fb_reg[m].y * b_sd.y;
                 }
-                // contribution = b_scale * factor * idot - bias * dsum.
-                sums[m][n] += b_sd.x * a_fb_reg[m].x * float(a_isum)
-                            - a_fb_reg[m].y * b_sd.y;
             }
         }
 

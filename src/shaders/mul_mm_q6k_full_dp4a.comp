@@ -44,8 +44,10 @@ const uint SPACK = 9u;
 layout(constant_id = 0) const uint SPEC_K = 0u;
 layout(constant_id = 1) const uint SPEC_BN = 32u;
 layout(constant_id = 2) const uint SPEC_RAGGED_N = 0u;
+layout(constant_id = 3) const uint SPEC_BK_STEP = 1u;
 
 const uint BN = SPEC_BN;
+const uint BK_STEP = SPEC_BK_STEP;
 const uint TPR_N = WG_SIZE / TPR_M; // 8
 const uint TN = BN / TPR_N;
 
@@ -67,10 +69,10 @@ layout(set = 0, binding = 1) readonly buffer ActB  { uint b_packed[]; };
 layout(set = 0, binding = 2) readonly buffer SclB  { float b_scale[]; };
 layout(set = 0, binding = 3) writeonly buffer MatD { float d_data[]; };
 
-shared uint  buf_a[BM * SPACK];   // packed int8 weights (q-32), 8 uints/row
-shared float buf_aw[BM * 2u];     // Q6_K weight scale per (row, sub-block-in-tile)
-shared uint  buf_b[BN * SPACK];   // packed int8 activations, 8 uints/col
-shared float buf_bs[BN];          // activation scale per column (this 32-block)
+shared uint  buf_a[BK_STEP * BM * SPACK];   // packed int8 weights (q-32), 8 uints/row
+shared float buf_aw[BK_STEP * BM * 2u];     // Q6_K weight scale per (row, sub-block-in-tile)
+shared uint  buf_b[BK_STEP * BN * SPACK];   // packed int8 activations, 8 uints/col
+shared float buf_bs[BK_STEP * BN];          // activation scale per column (this 32-block)
 
 int signed_i8(uint b) {
     return int(b) - (b >= 128u ? 256 : 0);
@@ -134,14 +136,15 @@ void main() {
     const uint b_stride_packed = (SPEC_K != 0u) ? (SPEC_K / 4u) : stride_b_packed;
     const uint b_stride_scale = (SPEC_K != 0u) ? (SPEC_K / 32u) : stride_b_scale;
 
-    for (uint k_outer = 0u; k_outer < k_limit; k_outer += BK) {
+    for (uint k_outer = 0u; k_outer < k_limit; k_outer += BK * BK_STEP) {
         // ---- load + dequant weight half-tile (one 16-wide sub-block) ----
-        {
+        [[unroll]] for (uint ks = 0u; ks < BK_STEP; ks++) {
+            const uint k_step_base = k_outer + ks * BK;
             const uint row_local = tid / 2u;
             const uint sub = tid & 1u;          // 0 -> k 0..15, 1 -> k 16..31
             const uint k_in_tile = sub * 16u;
             const uint row_global = ir * BM + row_local;
-            const uint k_base = k_outer + k_in_tile;
+            const uint k_base = k_step_base + k_in_tile;
             const uint super_block = k_base >> 8;
             const uint byte_off = a_offset
                 + row_global * blocks_per_row * Q6K_BYTES
@@ -152,70 +155,75 @@ void main() {
             float s;
             load_q6k_run_i8(byte_off, k_block_base, packed, s);
 
-            const uint base_a = row_local * SPACK + sub * 4u;
+            const uint base_a = ks * BM * SPACK + row_local * SPACK + sub * 4u;
             [[unroll]] for (uint p = 0u; p < 4u; p++) buf_a[base_a + p] = packed[p];
-            buf_aw[row_local * 2u + sub] = s;
+            buf_aw[ks * BM * 2u + row_local * 2u + sub] = s;
         }
 
         // ---- load pre-quantized int8 activation half-tile ----
-        if (BN >= 32u) {
+        [[unroll]] for (uint ks = 0u; ks < BK_STEP; ks++) {
+            const uint k_step_base = k_outer + ks * BK;
             const uint sub = tid & 1u;
             const uint k_in_tile = sub * 16u;
-            [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
-                const uint col_local = cbase + tid / 2u;
-                if (col_local < BN) {
-                    const uint col_global = ic * BN + col_local;
-                    const bool col_ok = SPEC_RAGGED_N == 0u || col_global < N;
-                    const uint src = col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
-                    const uint base_b = col_local * SPACK + sub * 4u;
-                    [[unroll]] for (uint p = 0u; p < 4u; p++) {
-                        buf_b[base_b + p] = col_ok ? b_packed[src + p] : 0u;
-                    }
-                    if (sub == 0u) {
-                        buf_bs[col_local] = col_ok ? b_scale[col_global * b_stride_scale + (k_outer >> 5)] : 0.0;
+            if (BN >= 32u) {
+                [[unroll]] for (uint cbase = 0u; cbase < BN; cbase += 32u) {
+                    const uint col_local = cbase + tid / 2u;
+                    if (col_local < BN) {
+                        const uint col_global = ic * BN + col_local;
+                        const bool col_ok = SPEC_RAGGED_N == 0u || col_global < N;
+                        const uint src = col_global * b_stride_packed + ((k_step_base + k_in_tile) >> 2);
+                        const uint base_b = ks * BN * SPACK + col_local * SPACK + sub * 4u;
+                        [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                            buf_b[base_b + p] = col_ok ? b_packed[src + p] : 0u;
+                        }
+                        if (sub == 0u) {
+                            buf_bs[ks * BN + col_local] = col_ok ? b_scale[col_global * b_stride_scale + (k_step_base >> 5)] : 0.0;
+                        }
                     }
                 }
-            }
-        } else {
-            const uint col_local = tid >> 3;
-            const uint pack_idx = tid & 7u;
-            const uint col_global = ic * BN + col_local;
-            const bool col_ok = col_global < N;
-            const uint base_b = col_local * SPACK;
-            buf_b[base_b + pack_idx] = col_ok
-                ? b_packed[col_global * b_stride_packed + (k_outer >> 2) + pack_idx]
-                : 0u;
-            if (pack_idx == 0u) {
-                buf_bs[col_local] = col_ok
-                    ? b_scale[col_global * b_stride_scale + (k_outer >> 5)]
-                    : 0.0;
+            } else {
+                const uint col_local = tid >> 3;
+                const uint pack_idx = tid & 7u;
+                const uint col_global = ic * BN + col_local;
+                const bool col_ok = col_global < N;
+                const uint base_b = ks * BN * SPACK + col_local * SPACK;
+                buf_b[base_b + pack_idx] = col_ok
+                    ? b_packed[col_global * b_stride_packed + (k_step_base >> 2) + pack_idx]
+                    : 0u;
+                if (pack_idx == 0u) {
+                    buf_bs[ks * BN + col_local] = col_ok
+                        ? b_scale[col_global * b_stride_scale + (k_step_base >> 5)]
+                        : 0.0;
+                }
             }
         }
 
         barrier();
 
         // ---- int8 dot4 accumulate ----
-        uint wreg[TM][8];
-        float ws[TM][2];
-        [[unroll]] for (uint m = 0u; m < TM; m++) {
-            const uint wrow = (tiwr * TM + m) * SPACK;
-            [[unroll]] for (uint p = 0u; p < 8u; p++) wreg[m][p] = buf_a[wrow + p];
-            ws[m][0] = buf_aw[(tiwr * TM + m) * 2u + 0u];
-            ws[m][1] = buf_aw[(tiwr * TM + m) * 2u + 1u];
-        }
-        [[unroll]] for (uint n = 0u; n < TN; n++) {
-            const uint acol = (tiwc * TN + n) * SPACK;
-            uint areg[8];
-            [[unroll]] for (uint p = 0u; p < 8u; p++) areg[p] = buf_b[acol + p];
-            const float as = buf_bs[tiwc * TN + n];
+        [[unroll]] for (uint ks = 0u; ks < BK_STEP; ks++) {
+            uint wreg[TM][8];
+            float ws[TM][2];
             [[unroll]] for (uint m = 0u; m < TM; m++) {
-                int isum0 = 0;
-                int isum1 = 0;
-                [[unroll]] for (uint p = 0u; p < 4u; p++) {
-                    isum0 = dotPacked4x8AccSatEXT(int(wreg[m][p]),      int(areg[p]),      isum0);
-                    isum1 = dotPacked4x8AccSatEXT(int(wreg[m][4u + p]), int(areg[4u + p]), isum1);
+                const uint wrow = ks * BM * SPACK + (tiwr * TM + m) * SPACK;
+                [[unroll]] for (uint p = 0u; p < 8u; p++) wreg[m][p] = buf_a[wrow + p];
+                ws[m][0] = buf_aw[ks * BM * 2u + (tiwr * TM + m) * 2u + 0u];
+                ws[m][1] = buf_aw[ks * BM * 2u + (tiwr * TM + m) * 2u + 1u];
+            }
+            [[unroll]] for (uint n = 0u; n < TN; n++) {
+                const uint acol = ks * BN * SPACK + (tiwc * TN + n) * SPACK;
+                uint areg[8];
+                [[unroll]] for (uint p = 0u; p < 8u; p++) areg[p] = buf_b[acol + p];
+                const float as = buf_bs[ks * BN + tiwc * TN + n];
+                [[unroll]] for (uint m = 0u; m < TM; m++) {
+                    int isum0 = 0;
+                    int isum1 = 0;
+                    [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                        isum0 = dotPacked4x8AccSatEXT(int(wreg[m][p]),      int(areg[p]),      isum0);
+                        isum1 = dotPacked4x8AccSatEXT(int(wreg[m][4u + p]), int(areg[4u + p]), isum1);
+                    }
+                    sums[m][n] += as * (ws[m][0] * float(isum0) + ws[m][1] * float(isum1));
                 }
-                sums[m][n] += as * (ws[m][0] * float(isum0) + ws[m][1] * float(isum1));
             }
         }
 

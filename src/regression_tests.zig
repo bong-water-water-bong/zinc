@@ -183,7 +183,7 @@ test "Vulkan Qwen dense gate-up DP4a keeps K5120 specializations" {
 
 test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     const src = @embedFile("compute/dmmv.zig");
-    try expectContains(src, "const spec_k_17408_n40 = [_]pipeline_mod.SpecConst{");
+    try expectContains(src, "const spec_k_17408_n40_bk2 = [_]pipeline_mod.SpecConst{");
     try expectContains(src, "const spec_k_17408_n64 = [_]pipeline_mod.SpecConst{");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n40");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n64");
@@ -216,6 +216,32 @@ test "Vulkan full-DP4a wide shaders load every activation half tile safely" {
         try expectContains(src, "const uint col_local = cbase + tid / 2u;");
         try expectContains(src, "if (col_local < BN)");
     }
+}
+
+test "Vulkan full-DP4a prefill shaders expose guarded two-slice K staging" {
+    const q4 = @embedFile("shaders/mul_mm_q4k_full_dp4a.comp");
+    const q5 = @embedFile("shaders/mul_mm_q5k_full_dp4a.comp");
+    const q6 = @embedFile("shaders/mul_mm_q6k_full_dp4a.comp");
+    const q6_q8_1 = @embedFile("shaders/mul_mm_q6k_full_dp4a_q8_1.comp");
+    for ([_][]const u8{ q4, q5, q6, q6_q8_1 }) |src| {
+        try expectContains(src, "layout(constant_id = 3) const uint SPEC_BK_STEP = 1u;");
+        try expectContains(src, "const uint BK_STEP = SPEC_BK_STEP;");
+        try expectContains(src, "for (uint k_outer = 0u; k_outer < k_limit; k_outer += BK * BK_STEP)");
+        try expectContains(src, "shared uint  buf_a[BK_STEP * BM * SPACK]");
+        try expectContains(src, "shared uint  buf_b[BK_STEP * BN * SPACK]");
+        try expectContains(src, "[[unroll]] for (uint ks = 0u; ks < BK_STEP; ks++)");
+    }
+
+    const dispatch = @embedFile("compute/dmmv.zig");
+    try expectContains(dispatch, "const spec_k_5120_n40_bk2 = [_]pipeline_mod.SpecConst{");
+    try expectContains(dispatch, "const spec_k_6144_n40_bk2 = [_]pipeline_mod.SpecConst{");
+    try expectContains(dispatch, "const spec_k_17408_n40_bk2 = [_]pipeline_mod.SpecConst{");
+    try expectContains(dispatch, ".{ .id = 3, .value = 2 },");
+    try expectContainsNear(dispatch, "const pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n40", "&spec_k_5120_n40_bk2", 300);
+    try expectContainsNear(dispatch, "const pipeline_mul_mm_q4k_full_dp4a_k5120_n40", "&spec_k_5120_n40_bk2", 300);
+    try expectContainsNear(dispatch, "const pipeline_mul_mm_q5k_full_dp4a_k6144_n40", "&spec_k_6144_n40_bk2", 300);
+    try expectContainsNear(dispatch, "const pipeline_mul_mm_q6k_full_dp4a_k17408_n40", "&spec_k_17408_n40_bk2", 300);
+    try expectContainsNear(dispatch, "const pipeline_mul_mm_q4k_full_dp4a_k17408_n40", "&spec_k_17408_n40_bk2", 300);
 }
 
 test "Vulkan batched kpar shaders merge cross-subgroup partials" {

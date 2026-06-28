@@ -1328,15 +1328,7 @@ pub const DmmvDispatch = struct {
             .{ .id = 0, .value = 5120 },
             .{ .id = 1, .value = 40 },
         };
-        const spec_k_6144_n40 = [_]pipeline_mod.SpecConst{
-            .{ .id = 0, .value = 6144 },
-            .{ .id = 1, .value = 40 },
-        };
         const spec_k_12288 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 12288 }};
-        const spec_k_17408_n40 = [_]pipeline_mod.SpecConst{
-            .{ .id = 0, .value = 17408 },
-            .{ .id = 1, .value = 40 },
-        };
         const spec_k_17408_n64 = [_]pipeline_mod.SpecConst{
             .{ .id = 0, .value = 17408 },
             .{ .id = 1, .value = 64 },
@@ -1355,6 +1347,24 @@ pub const DmmvDispatch = struct {
             .{ .id = 1, .value = 72 },
             .{ .id = 2, .value = 1 },
         };
+        // The dense-hybrid 40-token single-projection shapes benefit from
+        // staging two K slices per LDS phase. Wider body/tail shapes keep the
+        // default one-slice path to avoid excess LDS and register pressure.
+        const spec_k_5120_n40_bk2 = [_]pipeline_mod.SpecConst{
+            .{ .id = 0, .value = 5120 },
+            .{ .id = 1, .value = 40 },
+            .{ .id = 3, .value = 2 },
+        };
+        const spec_k_6144_n40_bk2 = [_]pipeline_mod.SpecConst{
+            .{ .id = 0, .value = 6144 },
+            .{ .id = 1, .value = 40 },
+            .{ .id = 3, .value = 2 },
+        };
+        const spec_k_17408_n40_bk2 = [_]pipeline_mod.SpecConst{
+            .{ .id = 0, .value = 17408 },
+            .{ .id = 1, .value = 40 },
+            .{ .id = 3, .value = 2 },
+        };
         const geglu_q8_k5376_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 2, .value = 1 } };
         const geglu_q8_k5376_n64_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 1, .value = 64 }, .{ .id = 2, .value = 1 } };
         const geglu_q8_k5376_n8_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 1, .value = 8 }, .{ .id = 2, .value = 1 } };
@@ -1372,7 +1382,7 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q6k_full_dp4a_k17408_n64 != null) {
             log.info("mul_mm_q6k_full_dp4a K=17408 BN=64 pipeline loaded (Qwen dense-hybrid 27B 64-token dense-down prefill)", .{});
         }
-        const pipeline_mul_mm_q6k_full_dp4a_k17408_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_17408_n40, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_mul_mm_q6k_full_dp4a_k17408_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_17408_n40_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q6k_full_dp4a K=17408 BN=40 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -1414,7 +1424,7 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q6k_full_dp4a_q8_1 != null) {
             log.info("mul_mm_q6k_full_dp4a_q8_1 pipeline loaded (int8 DP4a Qwen3.6-27B SSM wqkv prefill, Q8_1 input)", .{});
         }
-        const pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_q8_1_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_5120_n40, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_mul_mm_q6k_full_dp4a_q8_1_k5120_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_q8_1_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_5120_n40_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q6k_full_dp4a_q8_1 K=5120 BN=40 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -1635,7 +1645,7 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k_full_dp4a != null) {
             log.info("mul_mm_q4k_full_dp4a pipeline loaded (int8 DP4a Qwen3.6-27B SSM z prefill)", .{});
         }
-        const pipeline_mul_mm_q4k_full_dp4a_k5120_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_5120_n40, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_mul_mm_q4k_full_dp4a_k5120_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_5120_n40_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_full_dp4a K=5120 BN=40 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -1656,7 +1666,7 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k_full_dp4a_k17408_n64 != null) {
             log.info("mul_mm_q4k_full_dp4a K=17408 BN=64 pipeline loaded (Qwen dense-hybrid 27B Q4_K dense-down 64-token bodies)", .{});
         }
-        const pipeline_mul_mm_q4k_full_dp4a_k17408_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_17408_n40, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_mul_mm_q4k_full_dp4a_k17408_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_17408_n40_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_full_dp4a K=17408 BN=40 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -1695,7 +1705,7 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q5k_full_dp4a != null) {
             log.info("mul_mm_q5k_full_dp4a pipeline loaded (int8 DP4a Qwen3.6-27B SSM out prefill)", .{});
         }
-        const pipeline_mul_mm_q5k_full_dp4a_k6144_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q5k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_6144_n40, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_mul_mm_q5k_full_dp4a_k6144_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q5k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_6144_n40_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q5k_full_dp4a K=6144 BN=40 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };

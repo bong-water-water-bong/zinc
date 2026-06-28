@@ -1339,8 +1339,8 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
         // so warp_reduce_sum_all correctly sums all 128 elements.
         //
         // NOTE: The L2 norm costs 2 warp_reduce_sum_all + 2 rsqrt + 8 multiplies
-        // per iteration (~40% of per-iteration FLOPs). llama.cpp's gated_delta_net
-        // kernel does NOT L2-normalize — it uses raw k/q with scale=1/sqrt(S_v).
+        // per iteration (~40% of per-iteration FLOPs). The comparable
+        // gated_delta_net path uses raw k/q with scale=1/sqrt(S_v).
         // Keeping the normalization for correctness (the model may depend on it).
         sumq = zinc_warp_reduce_sum_all(sumq);
         sumk = zinc_warp_reduce_sum_all(sumk);
