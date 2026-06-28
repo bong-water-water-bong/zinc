@@ -567,6 +567,8 @@ pub const DmmvDispatch = struct {
     /// Same Q6_K DP4a dense-down shader with K=12288 specialized for
     /// Qwen3.5-9B dense FFN down projections.
     pipeline_mul_mm_q6k_full_dp4a_k12288: ?Pipeline,
+    /// K=17408, BN=64 sibling for short prompts padded to a 64-column body.
+    pipeline_mul_mm_q6k_full_dp4a_k17408_n64: ?Pipeline,
     /// Same Q6_K DP4a dense-down shader with K=21504 specialized for
     /// Gemma 4 31B dense FFN down projections.
     pipeline_mul_mm_q6k_full_dp4a_k21504: ?Pipeline,
@@ -1307,6 +1309,10 @@ pub const DmmvDispatch = struct {
             .{ .id = 1, .value = 64 },
         };
         const spec_k_12288 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 12288 }};
+        const spec_k_17408_n64 = [_]pipeline_mod.SpecConst{
+            .{ .id = 0, .value = 17408 },
+            .{ .id = 1, .value = 64 },
+        };
         const spec_k_21504 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 21504 }};
         const spec_k_21504_n64 = [_]pipeline_mod.SpecConst{
             .{ .id = 0, .value = 21504 },
@@ -1330,6 +1336,13 @@ pub const DmmvDispatch = struct {
         };
         if (pipeline_mul_mm_q6k_full_dp4a_k12288 != null) {
             log.info("mul_mm_q6k_full_dp4a K=12288 pipeline loaded (Qwen3.5-9B dense-down prefill)", .{});
+        }
+        const pipeline_mul_mm_q6k_full_dp4a_k17408_n64 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_17408_n64, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q6k_full_dp4a K=17408 BN=64 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q6k_full_dp4a_k17408_n64 != null) {
+            log.info("mul_mm_q6k_full_dp4a K=17408 BN=64 pipeline loaded (Qwen dense-hybrid 27B 64-token dense-down prefill)", .{});
         }
         const pipeline_mul_mm_q6k_full_dp4a_k21504 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_21504, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q6k_full_dp4a K=21504 shader not loaded: {s}", .{@errorName(err)});
@@ -1679,6 +1692,7 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q6k_tail8 = pipeline_mul_mm_q6k_tail8,
             .pipeline_mul_mm_q6k_full_dp4a = pipeline_mul_mm_q6k_full_dp4a,
             .pipeline_mul_mm_q6k_full_dp4a_k12288 = pipeline_mul_mm_q6k_full_dp4a_k12288,
+            .pipeline_mul_mm_q6k_full_dp4a_k17408_n64 = pipeline_mul_mm_q6k_full_dp4a_k17408_n64,
             .pipeline_mul_mm_q6k_full_dp4a_k21504 = pipeline_mul_mm_q6k_full_dp4a_k21504,
             .pipeline_mul_mm_q6k_full_dp4a_k21504_n8 = pipeline_mul_mm_q6k_full_dp4a_k21504_n8,
             .pipeline_mul_mm_q6k_full_dp4a_k21504_n72 = pipeline_mul_mm_q6k_full_dp4a_k21504_n72,
@@ -3378,7 +3392,11 @@ pub const DmmvDispatch = struct {
         a_offset: u32,
         d_offset: u32,
     ) !void {
+        const n_tile: u32 = if (K == 17408 and N == 64 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64 != null) 64 else 32;
         const pip = blk: {
+            if (K == 17408 and n_tile == 64) {
+                if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64) |*p| break :blk p;
+            }
             if (K == 12288) {
                 if (self.pipeline_mul_mm_q6k_full_dp4a_k12288) |*p| break :blk p;
             }
@@ -3411,7 +3429,7 @@ pub const DmmvDispatch = struct {
             infos[0..],
             std.mem.asBytes(&push),
             M / 32,
-            N / 32,
+            N / n_tile,
             1,
         );
     }
@@ -4325,6 +4343,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q8_0_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k12288) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k21504) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_k21504_n8) |*p| p.deinit();
         if (self.pipeline_mul_mm_q6k_full_dp4a_q8_1) |*p| p.deinit();
