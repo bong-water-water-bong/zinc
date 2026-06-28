@@ -179,6 +179,8 @@ test "Vulkan Qwen dense gate-up DP4a keeps K5120 specializations" {
     try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n40");
     try expectContains(src, "K == 5120 and n_tile == 40");
     try expectContains(src, "K == 5120 and n_tile == 64");
+    try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8(", "N >= 64 and (N & 63) == 0", 2200);
+    try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8_1(", "N >= 64 and (N & 63) == 0", 2200);
 }
 
 test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
@@ -191,6 +193,7 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n64");
     try expectContains(src, "K == 17408 and n_tile == 40");
     try expectContains(src, "K == 17408 and n_tile == 64");
+    try expectContains(src, "K == 17408 and N >= 64 and (N & 63) == 0");
     try expectContains(src, "N / n_tile");
 }
 

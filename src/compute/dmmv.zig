@@ -3496,7 +3496,7 @@ pub const DmmvDispatch = struct {
     ) !void {
         const n_tile: u32 = if (K == 17408 and N == 40 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n40 != null)
             40
-        else if (K == 17408 and N == 64 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64 != null)
+        else if (K == 17408 and N >= 64 and (N & 63) == 0 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64 != null)
             64
         else
             32;
@@ -3908,7 +3908,7 @@ pub const DmmvDispatch = struct {
     ) !void {
         const n_tile: u32 = if (N == 40 and K == 5120 and self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n40 != null)
             40
-        else if (N == 64 and ((K == 4096 and self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096_n64 != null) or (K == 5120 and self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n64 != null)))
+        else if (N >= 64 and (N & 63) == 0 and ((K == 4096 and self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096_n64 != null) or (K == 5120 and self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n64 != null)))
             64
         else
             32;
@@ -4088,7 +4088,7 @@ pub const DmmvDispatch = struct {
     ) !void {
         const n_tile: u32 = if (N == 40 and K == 5120 and self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n40 != null)
             40
-        else if (N == 64 and ((K == 4096 and self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096_n64 != null) or (K == 5120 and self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64 != null)))
+        else if (N >= 64 and (N & 63) == 0 and ((K == 4096 and self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096_n64 != null) or (K == 5120 and self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64 != null)))
             64
         else
             32;
@@ -4324,6 +4324,8 @@ pub const DmmvDispatch = struct {
         else if (K == 17408 and N == 40 and self.pipeline_mul_mm_q4k_full_dp4a_k17408_n40 != null)
             40
         else if (K == 17408 and N == 64 and self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64 != null)
+            64
+        else if (K == 17408 and N >= 64 and (N & 63) == 0 and self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64 != null)
             64
         else if (K == 21504 and N == 64 and self.pipeline_mul_mm_q4k_full_dp4a_k21504_n64 != null)
             64
