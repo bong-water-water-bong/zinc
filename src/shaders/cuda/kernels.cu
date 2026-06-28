@@ -1235,7 +1235,7 @@ extern "C" __global__ void ssm_delta_net(
 }
 
 // ---- ssm_delta_net_warp (warp-level scan — no __syncthreads in hot loop) -----
-// Port of llama.cpp's gated_delta_net_cuda approach: each WARP owns one column,
+// Gated delta-net approach: each WARP owns one column,
 // state elements spread across lanes (rows_per_lane = head_v_dim/warp_size).
 // ALL reductions use __shfl_down_sync (warp-level) — ZERO __syncthreads per
 // token iteration. Eliminates the 2048 barriers that made the old kernel 60%
