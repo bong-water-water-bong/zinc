@@ -175,7 +175,9 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN64 specialization" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContains(src, "const spec_k_17408_n64 = [_]pipeline_mod.SpecConst{");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n64");
+    try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n64");
     try expectContains(src, "K == 17408 and n_tile == 64");
+    try expectContains(src, "N / n_tile");
 }
 
 test "Vulkan batched kpar shaders merge cross-subgroup partials" {

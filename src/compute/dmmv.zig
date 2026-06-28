@@ -647,6 +647,8 @@ pub const DmmvDispatch = struct {
     /// Same Q4_K DP4a shader with K=12288 specialized for Qwen3.5-9B dense
     /// FFN down projections when a layer's down tensor is Q4_K.
     pipeline_mul_mm_q4k_full_dp4a_k12288: ?Pipeline,
+    /// K=17408, BN=64 sibling for Qwen dense-hybrid 27B Q4_K dense-down bodies.
+    pipeline_mul_mm_q4k_full_dp4a_k17408_n64: ?Pipeline,
     /// Same Q4_K DP4a shader with K=21504 specialized for Gemma 4 31B dense
     /// FFN down projections when a layer's down tensor is Q4_K.
     pipeline_mul_mm_q4k_full_dp4a_k21504: ?Pipeline,
@@ -1586,6 +1588,13 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k_full_dp4a_k12288 != null) {
             log.info("mul_mm_q4k_full_dp4a K=12288 pipeline loaded (Qwen3.5-9B dense-down prefill)", .{});
         }
+        const pipeline_mul_mm_q4k_full_dp4a_k17408_n64 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_17408_n64, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_full_dp4a K=17408 BN=64 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_full_dp4a_k17408_n64 != null) {
+            log.info("mul_mm_q4k_full_dp4a K=17408 BN=64 pipeline loaded (Qwen dense-hybrid 27B Q4_K dense-down 64-token bodies)", .{});
+        }
         const pipeline_mul_mm_q4k_full_dp4a_k21504 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_21504, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_full_dp4a K=21504 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
@@ -1722,6 +1731,7 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64 = pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64,
             .pipeline_mul_mm_q4k_full_dp4a = pipeline_mul_mm_q4k_full_dp4a,
             .pipeline_mul_mm_q4k_full_dp4a_k12288 = pipeline_mul_mm_q4k_full_dp4a_k12288,
+            .pipeline_mul_mm_q4k_full_dp4a_k17408_n64 = pipeline_mul_mm_q4k_full_dp4a_k17408_n64,
             .pipeline_mul_mm_q4k_full_dp4a_k21504 = pipeline_mul_mm_q4k_full_dp4a_k21504,
             .pipeline_mul_mm_q4k_full_dp4a_k21504_n64 = pipeline_mul_mm_q4k_full_dp4a_k21504_n64,
             .pipeline_mul_mm_q4k_full_dp4a_k21504_n8 = pipeline_mul_mm_q4k_full_dp4a_k21504_n8,
@@ -4166,7 +4176,11 @@ pub const DmmvDispatch = struct {
         a_offset: u32,
         d_offset: u32,
     ) !void {
+        const n_tile: u32 = if (K == 17408 and N == 64 and self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64 != null) 64 else if (K == 21504 and N == 64 and self.pipeline_mul_mm_q4k_full_dp4a_k21504_n64 != null) 64 else 32;
         const pip = blk: {
+            if (K == 17408 and n_tile == 64) {
+                if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64) |*p| break :blk p;
+            }
             if (K == 21504 and N == 64) {
                 if (self.pipeline_mul_mm_q4k_full_dp4a_k21504_n64) |*p| break :blk p;
             }
@@ -4202,7 +4216,7 @@ pub const DmmvDispatch = struct {
             infos[0..],
             std.mem.asBytes(&push),
             M / 32,
-            if (K == 21504 and N == 64 and self.pipeline_mul_mm_q4k_full_dp4a_k21504_n64 != null) N / 64 else N / 32,
+            N / n_tile,
             1,
         );
     }
@@ -4372,6 +4386,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k12288) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_full_dp4a_k17408_n64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k21504) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k21504_n64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k21504_n8) |*p| p.deinit();
