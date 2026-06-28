@@ -173,28 +173,40 @@ test "Vulkan Qwen dense gate-up DP4a keeps K5120 specializations" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContains(src, "const spec_k_5120 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 5120 }};");
     try expectContains(src, "const spec_k_5120_n40 = [_]pipeline_mod.SpecConst{");
+    try expectContains(src, "const spec_k_5120_n64_ragged = [_]pipeline_mod.SpecConst{");
     try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n64");
+    try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n64_ragged");
     try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k5120_n40");
     try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64");
+    try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n64_ragged");
     try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k5120_n40");
     try expectContains(src, "K == 5120 and n_tile == 40");
     try expectContains(src, "K == 5120 and n_tile == 64");
     try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8(", "N >= 64 and (N & 63) == 0", 2200);
     try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8_1(", "N >= 64 and (N & 63) == 0", 2200);
+    try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8(", "use_ragged_n64", 2200);
+    try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8_1(", "use_ragged_n64", 2200);
 }
 
 test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContains(src, "const spec_k_17408_n40_bk2 = [_]pipeline_mod.SpecConst{");
     try expectContains(src, "const spec_k_17408_n64 = [_]pipeline_mod.SpecConst{");
+    try expectContains(src, "const spec_k_17408_n64_ragged = [_]pipeline_mod.SpecConst{");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n40");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n64");
+    try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k17408_n64_ragged");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n40");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n64");
+    try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k17408_n64_ragged");
     try expectContains(src, "K == 17408 and n_tile == 40");
     try expectContains(src, "K == 17408 and n_tile == 64");
     try expectContains(src, "K == 17408 and N >= 64 and (N & 63) == 0");
+    try expectContains(src, "K == 17408 and N > 64 and (N & 63) != 0");
     try expectContains(src, "N / n_tile");
+    try expectContains(src, "(N + n_tile - 1) / n_tile");
+    try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_ragged_n64", 2200);
+    try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_ragged_n64", 2400);
 }
 
 test "Vulkan Qwen SSM DP4a keeps BN40 specializations" {
@@ -219,6 +231,30 @@ test "Vulkan full-DP4a wide shaders load every activation half tile safely" {
         try expectContains(src, "const uint col_local = cbase + tid / 2u;");
         try expectContains(src, "if (col_local < BN)");
     }
+}
+
+test "Vulkan Qwen DP4a ragged BN64 shaders guard inactive columns" {
+    const q4 = @embedFile("shaders/mul_mm_q4k_full_dp4a.comp");
+    const q6 = @embedFile("shaders/mul_mm_q6k_full_dp4a.comp");
+    const gate_q8 = @embedFile("shaders/mul_mm_q4k_gate_up_swiglu_full_dp4a_q8.comp");
+    const gate_q8_1 = @embedFile("shaders/mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1.comp");
+
+    try expectContains(q4, "layout(constant_id = 2) const uint SPEC_RAGGED_N = 0u;");
+    try expectContains(q6, "layout(constant_id = 2) const uint SPEC_RAGGED_N = 0u;");
+    for ([_][]const u8{ gate_q8, gate_q8_1 }) |src| {
+        try expectContains(src, "layout(constant_id = 3) const uint SPEC_RAGGED_N = 0u;");
+    }
+
+    for ([_][]const u8{ q4, q6, gate_q8, gate_q8_1 }) |src| {
+        try expectContains(src, "const bool col_ok = SPEC_RAGGED_N == 0u || col_global < N;");
+        try expectContains(src, "col_ok ? b_packed[src +");
+        try expectContains(src, "SPEC_RAGGED_N == 0u");
+    }
+
+    for ([_][]const u8{ q4, gate_q8, gate_q8_1 }) |src| {
+        try expectContains(src, "if ((BN >= 32u && SPEC_RAGGED_N == 0u) || col_g < N)");
+    }
+    try expectContains(q6, "if (SPEC_RAGGED_N == 0u || col_g < N)");
 }
 
 test "Vulkan full-DP4a prefill shaders expose guarded two-slice K staging" {

@@ -26,9 +26,9 @@
 //             write[token * stride_d_packed + ir*8 + tiwr]
 //   d_scale:  token-major [token][K/32] f32; write[token * stride_d_scale + ir]
 //
-// Host may only dispatch when M and N are multiples of 32. Ragged N tails
-// keep using the f32 mul_mm_q4k_gate_up_swiglu fallback and the standalone
-// quantize_act_q8 dispatch.
+// Host normally dispatches exact 32/40/64-column bodies. A specialized guarded
+// BN=64 variant can cover a long ragged body by zero-filling inactive columns
+// and suppressing out-of-range writes.
 
 #include "dp4a_compat.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -48,6 +48,7 @@ const uint SPACK = 9u;
 layout(constant_id = 0) const uint SPEC_K = 0u;
 layout(constant_id = 1) const uint SPEC_BN = 32u;
 layout(constant_id = 2) const uint ACTIVATION = 0u; // 0 = SwiGLU, 1 = GEGLU
+layout(constant_id = 3) const uint SPEC_RAGGED_N = 0u;
 
 const uint BN = SPEC_BN;
 const uint TPR_N = WG_SIZE / TPR_M;  // 8
@@ -210,11 +211,12 @@ void main() {
                 const uint col_local = cbase + tid / 2u;
                 if (col_local < BN) {
                     const uint col_global = ic * BN + col_local;
+                    const bool col_ok = SPEC_RAGGED_N == 0u || col_global < N;
                     const uint src = b_packed_offset + col_global * b_stride_packed + ((k_outer + k_in_tile) >> 2);
                     const uint base_b = col_local * SPACK + tile_half * 4u;
-                    [[unroll]] for (uint w = 0u; w < 4u; w++) buf_b[base_b + w] = b_packed[src + w];
+                    [[unroll]] for (uint w = 0u; w < 4u; w++) buf_b[base_b + w] = col_ok ? b_packed[src + w] : 0u;
                     if (tile_half == 0u) {
-                        buf_b_sd[col_local] = b_scale_dsum[b_scale_offset + col_global * b_stride_scale + (k_outer >> 5)];
+                        buf_b_sd[col_local] = col_ok ? b_scale_dsum[b_scale_offset + col_global * b_stride_scale + (k_outer >> 5)] : vec2(0.0);
                     }
                 }
             }
@@ -303,7 +305,7 @@ void main() {
         }
         // Each row group of 4 m-values maps to one packed uint at p = tiwr,
         // exactly the layout written by quantize_act_q8.comp.
-        if (BN >= 32u || col_g < N) {
+        if ((BN >= 32u && SPEC_RAGGED_N == 0u) || col_g < N) {
             d_packed[d_packed_offset + col_g * stride_d_packed + ir * 8u + tiwr] = packed;
             if (tiwr == 0u) {
                 d_scale[d_scale_offset + col_g * stride_d_scale + ir] = scale;
