@@ -229,7 +229,8 @@ test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate"
     try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_shared_norm", 26000);
     try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_swiglu", 30000);
     try expectContainsNear(src, marker, "const enable_gpu_phase_timing =", 9200);
-    try expectContainsNear(src, marker, "self.resetTimestamps();", 13600);
+    try expectContainsNear(src, "leaves the command buffer open", "fn prefillGemmaRunBatchedAttentionToFfnNorm", 400);
+    try expectContainsNear(src, marker, "try self.decode_cmd.submitAndWait(self.instance.compute_queue);", 31000);
     try expectContainsNear(src, "fn prefillBatchedImpl", "return self.prefillGemmaGroupedMoeExact(state, prompt_tokens);", 1800);
 }
 

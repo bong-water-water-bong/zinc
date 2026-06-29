@@ -22309,8 +22309,8 @@ pub const InferenceEngine = struct {
     ///   - K/V cache entries are populated for [base_token, base_token+n_tokens)
     ///
     /// This mirrors the Gemma attention segment in the dense batched prefill
-    /// path, but stops before any FFN work so the caller can run Gemma's
-    /// exact top-k grouped MoE.
+    /// path, but leaves the command buffer open before any FFN work so the
+    /// caller can append Gemma's exact top-k grouped MoE and submit once.
     fn prefillGemmaRunBatchedAttentionToFfnNorm(
         self: *InferenceEngine,
         state: *DecodeState,
@@ -22691,12 +22691,6 @@ pub const InferenceEngine = struct {
         self.endProfilePhase(.attention_post_norm, attention_post_norm_phase);
         self.endProfilePhase(.attention, attention_phase);
 
-        self.decode_cmd.computeToTransferBarrier();
-        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-        try self.decode_cmd.end();
-        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-        self.recordProfilingSample();
-
         state.position = base_token + n_tokens - 1;
     }
 
@@ -22929,11 +22923,6 @@ pub const InferenceEngine = struct {
             const up_base_offset = expertSliceBytes(gate_up.info.type_, inter_dim, hidden_dim);
             const expert_down_row_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
 
-            try self.decode_cmd.reset();
-            try self.decode_cmd.beginOneTime();
-            self.resetTimestamps();
-            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-            self.decode_cmd.transferToComputeBarrier();
             const moe_phase = self.beginProfilePhase();
 
             const router_phase = self.beginProfilePhase();
