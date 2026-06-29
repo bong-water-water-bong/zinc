@@ -3617,10 +3617,10 @@ pub const InferenceEngine = struct {
             const hidden_scale_dsum_bytes = n * (max_dp4a_k / 32) * 2 * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_hidden_i8, hidden_i8_bytes, storage_xfer);
             try growSlot(self.instance, &self.batched_scratch_hidden_scale_dsum, hidden_scale_dsum_bytes, storage_xfer);
-            // Q8_0 norm scratch for the SSM wqkv DP4a path (Q6_K weights, scale-only).
-            // Packed int8 layout is identical to hidden_i8 (hidden_dim/4 uints/token);
-            // scale layout is Q8_0 (hidden_dim/32 f32/token, half the size of Q8_1).
-            const norm_scale_bytes = n * (hidden_dim / 32) * f32_sz;
+            // Q8_0 norm scratch for scale-only DP4a consumers. Gemma O-proj
+            // can consume q_dim columns, so size both packed data and scale
+            // metadata from the same max K.
+            const norm_scale_bytes = n * (max_dp4a_k / 32) * f32_sz;
             try growSlot(self.instance, &self.batched_scratch_norm_q8, hidden_i8_bytes, storage_xfer);
             try growSlot(self.instance, &self.batched_scratch_norm_q8_scale, norm_scale_bytes, storage_xfer);
         }
@@ -3645,6 +3645,7 @@ pub const InferenceEngine = struct {
 
         const n: u64 = padded_tokens;
         const hidden_i8_bytes = n * (max_dp4a_k / 4) * @sizeOf(u32);
+        const hidden_scale_bytes = n * (max_dp4a_k / 32) * @sizeOf(f32);
         const hidden_scale_dsum_bytes = n * (max_dp4a_k / 32) * 2 * @sizeOf(f32);
         const storage_xfer = vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
             vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -3662,6 +3663,8 @@ pub const InferenceEngine = struct {
 
         try growSlot(self.instance, &self.batched_scratch_hidden_i8, hidden_i8_bytes, storage_xfer);
         try growSlot(self.instance, &self.batched_scratch_hidden_scale_dsum, hidden_scale_dsum_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_norm_q8, hidden_i8_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_norm_q8_scale, hidden_scale_bytes, storage_xfer);
 
         if (need_shared_gateup or need_shared_down) {
             if ((shared_inter_dim & 255) != 0) return;
@@ -11975,18 +11978,22 @@ pub const InferenceEngine = struct {
 
     fn gemmaDenseProjectionDp4aSupported(self: *const InferenceEngine, tensor: *const LoadedTensor, M: u32, K: u32, n_tokens: u32) bool {
         if (!self.gemmaDenseProjectionDp4aEnabled(n_tokens)) return false;
-        if (M == 0 or K == 0 or (M & 31) != 0 or (K & 255) != 0) return false;
-        if (self.dmmv.pipeline_quantize_act_q8_1 == null) return false;
+        if (M == 0 or K == 0 or (M & 31) != 0) return false;
         return switch (tensor.info.type_) {
-            .q4_k => self.batched_scratch_hidden_i8 != null and
+            .q4_k => (K & 255) == 0 and
+                self.batched_scratch_hidden_i8 != null and
                 self.batched_scratch_hidden_scale_dsum != null and
+                self.dmmv.pipeline_quantize_act_q8_1 != null and
                 self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and
                 self.dmmv.pipeline_mul_mm_q4k != null,
-            .q6_k => self.batched_scratch_hidden_i8 != null and
+            .q6_k => (K & 255) == 0 and
+                self.batched_scratch_hidden_i8 != null and
                 self.batched_scratch_hidden_scale_dsum != null and
+                self.dmmv.pipeline_quantize_act_q8_1 != null and
                 self.dmmv.pipeline_mul_mm_q6k_full_dp4a_q8_1 != null and
                 self.dmmv.pipeline_mul_mm_q6k != null,
-            .q8_0 => self.batched_scratch_norm_q8 != null and
+            .q8_0 => (K & 31) == 0 and
+                self.batched_scratch_norm_q8 != null and
                 self.batched_scratch_norm_q8_scale != null and
                 self.dmmv.pipeline_quantize_act_q8 != null and
                 self.dmmv.pipeline_mul_mm_q8_0_full_dp4a != null and
@@ -22298,7 +22305,7 @@ pub const InferenceEngine = struct {
     ///
     /// Postconditions:
     ///   - scratch_hidden[token] includes the attention residual for `layer`
-    ///   - scratch_norm[token] holds the layer's FFN-entry RMS norm
+    ///   - scratch_q[token] is no longer Q; it holds the layer's FFN-entry norm
     ///   - K/V cache entries are populated for [base_token, base_token+n_tokens)
     ///
     /// This mirrors the Gemma attention segment in the dense batched prefill
@@ -22640,8 +22647,8 @@ pub const InferenceEngine = struct {
                     scratch_down.size,
                     pan_t.gpu_buffer.handle,
                     pan_t.gpu_buffer.size,
-                    scratch_norm.handle,
-                    scratch_norm.size,
+                    scratch_q.handle,
+                    scratch_q.size,
                     ffn_norm_t.gpu_buffer.handle,
                     ffn_norm_t.gpu_buffer.size,
                     hidden_dim,
@@ -22670,8 +22677,8 @@ pub const InferenceEngine = struct {
                 scratch_hidden.size,
                 scratch_down.handle,
                 scratch_down.size,
-                scratch_norm.handle,
-                scratch_norm.size,
+                scratch_q.handle,
+                scratch_q.size,
                 ffn_norm_t.gpu_buffer.handle,
                 ffn_norm_t.gpu_buffer.size,
                 hidden_dim,
@@ -22914,7 +22921,6 @@ pub const InferenceEngine = struct {
             const router_tensor = lt.ffn_gate_inp orelse return error.TensorNotFound;
             const router_scale = lt.ffn_gate_inp_scale orelse return error.TensorNotFound;
             const pre_norm_t = lt.pre_ffw_norm_2 orelse return error.TensorNotFound;
-            const ffn_norm_t = lt.ffn_norm orelse lt.post_attention_norm orelse return error.TensorNotFound;
             const gate_up = lt.ffn_gate_up_exps orelse return error.TensorNotFound;
             const down_exps = lt.ffn_down_exps orelse return error.TensorNotFound;
             const down_scale = lt.ffn_down_exps_scale orelse return error.TensorNotFound;
@@ -23124,19 +23130,6 @@ pub const InferenceEngine = struct {
                 if (scratch_router_logits.size < shared_inter_bytes or scratch_shared_up.size < shared_inter_bytes or scratch_swiglu.size < shared_inter_bytes or scratch_shared_down.size < hidden_batch_bytes) {
                     return error.BufferTooSmall;
                 }
-                try self.dispatchRmsNorm(
-                    scratch_hidden.handle,
-                    scratch_hidden.size,
-                    ffn_norm_t.gpu_buffer.handle,
-                    ffn_norm_t.gpu_buffer.size,
-                    scratch_shared_norm.handle,
-                    scratch_shared_norm.size,
-                    hidden_dim,
-                    n_tokens,
-                    cfg.rms_norm_eps,
-                );
-                self.decode_cmd.computeBufferBarrier(scratch_shared_norm.handle, hidden_batch_bytes);
-
                 const shexp_gate = lt.ffn_gate_inp_shexp;
                 if (shexp_gate) |sg| {
                     try self.dispatchProjectionBatched(sg, scratch_shared_norm, route_buf, 1, hidden_dim, n_tokens);
@@ -23156,8 +23149,41 @@ pub const InferenceEngine = struct {
                     &shared_gateup_dp4a_cols,
                 );
                 if (shared_gateup_result == .not_handled) {
-                    try self.dispatchProjectionBatched(gate_shexp.?, scratch_shared_norm, scratch_router_logits, shexp_inter_dim, hidden_dim, n_tokens);
-                    try self.dispatchProjectionBatched(up_shexp.?, scratch_shared_norm, scratch_shared_up, shexp_inter_dim, hidden_dim, n_tokens);
+                    var shared_gateup_done = false;
+                    if (gate_shexp.?.info.type_ == .q8_0 and
+                        up_shexp.?.info.type_ == .q8_0 and
+                        self.gemmaDenseProjectionDp4aSupported(gate_shexp.?, shexp_inter_dim, hidden_dim, n_tokens) and
+                        self.gemmaDenseProjectionDp4aSupported(up_shexp.?, shexp_inter_dim, hidden_dim, n_tokens))
+                    {
+                        const shared_q8_cols = try self.gemmaPrepareProjectionQ8(scratch_shared_norm, hidden_dim, n_tokens);
+                        if (shared_q8_cols > 0) {
+                            const gate_done = try self.dispatchGemmaProjectionBatchedDp4a(
+                                gate_shexp.?,
+                                scratch_shared_norm,
+                                scratch_router_logits,
+                                shexp_inter_dim,
+                                hidden_dim,
+                                n_tokens,
+                                0,
+                                shared_q8_cols,
+                            );
+                            const up_done = try self.dispatchGemmaProjectionBatchedDp4a(
+                                up_shexp.?,
+                                scratch_shared_norm,
+                                scratch_shared_up,
+                                shexp_inter_dim,
+                                hidden_dim,
+                                n_tokens,
+                                0,
+                                shared_q8_cols,
+                            );
+                            shared_gateup_done = gate_done and up_done;
+                        }
+                    }
+                    if (!shared_gateup_done) {
+                        try self.dispatchProjectionBatched(gate_shexp.?, scratch_shared_norm, scratch_router_logits, shexp_inter_dim, hidden_dim, n_tokens);
+                        try self.dispatchProjectionBatched(up_shexp.?, scratch_shared_norm, scratch_shared_up, shexp_inter_dim, hidden_dim, n_tokens);
+                    }
                     const shared_gateup_ranges = [_]CommandBuffer.BufferRange{
                         .{ .buffer = scratch_router_logits.handle, .size = shared_inter_bytes },
                         .{ .buffer = scratch_shared_up.handle, .size = shared_inter_bytes },
@@ -23181,7 +23207,27 @@ pub const InferenceEngine = struct {
                 const shared_already_q8_1 = shared_gateup_result == .q8_1_geglu;
                 if (!try self.dispatchGemmaDenseDownDp4aBatched(down_shexp.?, scratch_swiglu, scratch_shared_down, hidden_dim, shexp_inter_dim, n_tokens, shared_already_q8, shared_already_q8_1, shared_gateup_dp4a_cols)) {
                     if (shared_already_q8 or shared_already_q8_1) return error.UnsupportedConfiguration;
-                    try self.dispatchProjectionBatched(down_shexp.?, scratch_swiglu, scratch_shared_down, hidden_dim, shexp_inter_dim, n_tokens);
+                    var shared_down_done = false;
+                    if (down_shexp.?.info.type_ == .q8_0 and
+                        self.gemmaDenseProjectionDp4aSupported(down_shexp.?, hidden_dim, shexp_inter_dim, n_tokens))
+                    {
+                        const shared_down_q8_cols = try self.gemmaPrepareProjectionQ8(scratch_swiglu, shexp_inter_dim, n_tokens);
+                        if (shared_down_q8_cols > 0) {
+                            shared_down_done = try self.dispatchGemmaProjectionBatchedDp4a(
+                                down_shexp.?,
+                                scratch_swiglu,
+                                scratch_shared_down,
+                                hidden_dim,
+                                shexp_inter_dim,
+                                n_tokens,
+                                0,
+                                shared_down_q8_cols,
+                            );
+                        }
+                    }
+                    if (!shared_down_done) {
+                        try self.dispatchProjectionBatched(down_shexp.?, scratch_swiglu, scratch_shared_down, hidden_dim, shexp_inter_dim, n_tokens);
+                    }
                 }
                 self.decode_cmd.computeBufferBarrier(scratch_shared_down.handle, hidden_batch_bytes);
 

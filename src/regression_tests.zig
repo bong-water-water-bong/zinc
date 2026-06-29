@@ -213,15 +213,21 @@ test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate"
     try expectContains(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm");
     try expectContainsNear(src, marker, "try self.prefillGemmaRunBatchedAttentionToFfnNorm", 18000);
     try expectContainsNear(src, marker, "try self.ensureGemmaMoePrefillDp4aScratchCapacity", 4200);
+    try expectContainsNear(src, "fn ensureGemmaMoePrefillDp4aScratchCapacity", "batched_scratch_norm_q8_scale", 2400);
     try expectContainsNear(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm", "try self.dispatchGemmaQkvProjectionsBatched", 9000);
     try expectContainsNear(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm", "try self.dispatchFlashAttnBatched", 22000);
     try expectContains(src, "fn gemmaProjectionPrefillPaddedTokenCount");
     try expectContainsNear(src, "fn gemmaDenseProjectionDp4aEnabled", "cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()", 900);
+    try expectContainsNear(src, "fn gemmaDenseProjectionDp4aSupported", ".q8_0 => (K & 31) == 0", 1400);
+    try expectContainsNear(src, "fn gemmaDenseProjectionDp4aSupported", "self.batched_scratch_norm_q8", 1500);
+    try expectContainsNear(src, "fn dispatchGemmaProjectionBatchedDp4a", "recordMulMmQ8_0FullDp4a", 7000);
     try expectContainsNear(src, "fn gemmaDenseGegluDp4aEnabled", "cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()", 900);
     try expectContainsNear(src, marker, "const scratch_route_ids = scratch_shared_up;", 2600);
     try expectContainsNear(src, marker, "if (scratch_route_ids.size < route_pack_ids_bytes) return error.BufferTooSmall;", 11200);
     try expectContainsNear(src, marker, "scratch_route_ids.handle", 15500);
     try expectContainsNear(src, marker, "try self.dispatchMoeWeightedAccScaledBatch", 20000);
+    try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_shared_norm", 26000);
+    try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_swiglu", 30000);
     try expectContainsNear(src, marker, "const enable_gpu_phase_timing =", 9200);
     try expectContainsNear(src, marker, "self.resetTimestamps();", 13600);
     try expectContainsNear(src, "fn prefillBatchedImpl", "return self.prefillGemmaGroupedMoeExact(state, prompt_tokens);", 1800);
@@ -240,6 +246,8 @@ test "Vulkan Gemma grouped MoE prefill wires Q5_1 route-column down projection" 
 
     const q5_cols = @embedFile("shaders/dmmv_q5_1_moe_cols.comp");
     try expectContains(q5_cols, "Q5_1_BYTES = 24u");
+    try expectContains(q5_cols, "ROWS_PER_WG = 8u");
+    try expectContains(q5_cols, "LANES_PER_ROW = 8u");
     try expectContains(q5_cols, "const float w0 = d * float(lo | (bit_lo << 4)) + m;");
     try expectContains(q5_cols, "x_route_divisor");
 }

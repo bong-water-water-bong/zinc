@@ -33,8 +33,8 @@ layout(set = 0, binding = 4) readonly buffer PackedIds { uint packed_ids[]; };
 layout(set = 0, binding = 5) readonly buffer ActiveBlocks { uint active_blocks[]; };
 
 const uint NUM_COLS = 8u;
-const uint ROWS_PER_WG = 4u;
-const uint LANES_PER_ROW = 16u;
+const uint ROWS_PER_WG = 8u;
+const uint LANES_PER_ROW = 8u;
 const uint Q5_1_BLOCK_SIZE = 32u;
 const uint Q5_1_BYTES = 24u;
 
