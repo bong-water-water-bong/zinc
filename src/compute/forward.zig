@@ -45,6 +45,7 @@ const RouterF32BatchPush = elementwise_mod.RouterF32BatchPush;
 const SoftmaxTopkBatchPush = elementwise_mod.SoftmaxTopkBatchPush;
 const MoeWeightedAccPush = elementwise_mod.MoeWeightedAccPush;
 const MoeWeightedAccBatchPush = elementwise_mod.MoeWeightedAccBatchPush;
+const MoeWeightedAccScaledBatchPush = elementwise_mod.MoeWeightedAccScaledBatchPush;
 const SigmoidScaleAccBatchPush = elementwise_mod.SigmoidScaleAccBatchPush;
 const SsmConv1dPush = elementwise_mod.SsmConv1dPush;
 const SsmConv1dBatchedPush = elementwise_mod.SsmConv1dBatchedPush;
@@ -3627,6 +3628,52 @@ pub const InferenceEngine = struct {
         self.batched_scratch_capacity_tokens = n_tokens;
     }
 
+    fn ensureGemmaMoePrefillDp4aScratchCapacity(self: *InferenceEngine, n_tokens: u32, shared_inter_dim: u32) !void {
+        const need_projection = self.gemmaDenseProjectionDp4aEnabled(n_tokens);
+        const need_shared_gateup = self.gemmaDenseGegluDp4aEnabled(n_tokens);
+        const need_shared_down = self.gemmaDenseDownDp4aEnabled(n_tokens);
+        if (!need_projection and !need_shared_gateup and !need_shared_down) return;
+
+        const cfg = &self.model.config;
+        const padded_tokens = self.gemmaProjectionPrefillPaddedTokenCount(n_tokens);
+        if (padded_tokens == n_tokens and padded_tokens < 64) return;
+
+        const hidden_dim = cfg.hidden_dim;
+        const q_dim: u32 = cfg.n_heads * cfg.head_dim;
+        const max_dp4a_k = @max(hidden_dim, q_dim);
+        if ((max_dp4a_k & 255) != 0) return;
+
+        const n: u64 = padded_tokens;
+        const hidden_i8_bytes = n * (max_dp4a_k / 4) * @sizeOf(u32);
+        const hidden_scale_dsum_bytes = n * (max_dp4a_k / 32) * 2 * @sizeOf(f32);
+        const storage_xfer = vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+            vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+        const growSlot = struct {
+            fn run(instance: *const @import("../vulkan/instance.zig").Instance, slot: *?Buffer, size: u64, usage: u32) !void {
+                if (slot.*) |*existing| {
+                    if (existing.size >= size) return;
+                    existing.deinit();
+                }
+                slot.* = try Buffer.initDeviceLocal(instance, size, usage);
+            }
+        }.run;
+
+        try growSlot(self.instance, &self.batched_scratch_hidden_i8, hidden_i8_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_hidden_scale_dsum, hidden_scale_dsum_bytes, storage_xfer);
+
+        if (need_shared_gateup or need_shared_down) {
+            if ((shared_inter_dim & 255) != 0) return;
+            const inter_i8_bytes = n * (shared_inter_dim / 4) * @sizeOf(u32);
+            const inter_scale_bytes = n * (shared_inter_dim / 32) * @sizeOf(f32);
+            const inter_scale_dsum_bytes = n * (shared_inter_dim / 32) * 2 * @sizeOf(f32);
+            try growSlot(self.instance, &self.batched_scratch_swiglu_i8, inter_i8_bytes, storage_xfer);
+            try growSlot(self.instance, &self.batched_scratch_swiglu_scale, inter_scale_bytes, storage_xfer);
+            try growSlot(self.instance, &self.batched_scratch_swiglu_scale_dsum, inter_scale_dsum_bytes, storage_xfer);
+        }
+    }
+
     fn ensureKvPagesForContext(self: *InferenceEngine, target_context_tokens: u32) !void {
         const normalized_context = self.normalizeRequestedContext(target_context_tokens, 1);
         const required_pages = kvPageCountForContext(normalized_context);
@@ -6163,6 +6210,53 @@ pub const InferenceEngine = struct {
             src_size,
             routing_buf,
             routing_size,
+            (hidden_dim + 63) / 64,
+            n_tokens,
+            1,
+        );
+    }
+
+    fn dispatchMoeWeightedAccScaledBatch(
+        self: *InferenceEngine,
+        accum_buf: vk.c.VkBuffer,
+        accum_size: vk.c.VkDeviceSize,
+        src_buf: vk.c.VkBuffer,
+        src_size: vk.c.VkDeviceSize,
+        routing_buf: vk.c.VkBuffer,
+        routing_size: vk.c.VkDeviceSize,
+        expert_scale_buf: vk.c.VkBuffer,
+        expert_scale_size: vk.c.VkDeviceSize,
+        hidden_dim: u32,
+        n_tokens: u32,
+        n_used: u32,
+        routing_stride: u32,
+        routing_token_base: u32,
+        accum_token_base: u32,
+        scale_offset: u32,
+    ) !void {
+        if (n_tokens == 0 or n_used == 0) return;
+        const pip = &(self.elementwise.pipeline_moe_weighted_acc_scaled_batch orelse return error.ShaderNotLoaded);
+        if (!pip.uses_push_descriptors) return error.ShaderNotLoaded;
+        const push = MoeWeightedAccScaledBatchPush{
+            .hidden_dim = hidden_dim,
+            .n_tokens = n_tokens,
+            .n_used = n_used,
+            .routing_stride = routing_stride,
+            .routing_token_base = routing_token_base,
+            .accum_token_base = accum_token_base,
+            .scale_offset = scale_offset,
+        };
+        self.pushDispatch4(
+            pip,
+            std.mem.asBytes(&push),
+            accum_buf,
+            accum_size,
+            src_buf,
+            src_size,
+            routing_buf,
+            routing_size,
+            expert_scale_buf,
+            expert_scale_size,
             (hidden_dim + 63) / 64,
             n_tokens,
             1,
@@ -11815,7 +11909,8 @@ pub const InferenceEngine = struct {
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         const cfg = self.model.config;
-        if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
+        if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return false;
+        if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return false;
         const padded_tokens = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
         if (padded_tokens < 64 or padded_tokens > 96) return false;
         return self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a != null and
@@ -11828,7 +11923,8 @@ pub const InferenceEngine = struct {
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         const cfg = self.model.config;
-        if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
+        if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return false;
+        if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return false;
         const padded_tokens = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
         if (padded_tokens < 64 or padded_tokens > 96) return false;
         const q6_path =
@@ -11871,8 +11967,9 @@ pub const InferenceEngine = struct {
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         const cfg = self.model.config;
-        if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
-        const padded_tokens = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
+        if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return false;
+        if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return false;
+        const padded_tokens = self.gemmaProjectionPrefillPaddedTokenCount(n_tokens);
         return padded_tokens >= 64 and padded_tokens <= 96;
     }
 
@@ -11880,11 +11977,20 @@ pub const InferenceEngine = struct {
         if (!self.gemmaDenseProjectionDp4aEnabled(n_tokens)) return false;
         if (M == 0 or K == 0 or (M & 31) != 0 or (K & 255) != 0) return false;
         if (self.dmmv.pipeline_quantize_act_q8_1 == null) return false;
-        if (self.batched_scratch_hidden_i8 == null) return false;
-        if (self.batched_scratch_hidden_scale_dsum == null) return false;
         return switch (tensor.info.type_) {
-            .q4_k => self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and self.dmmv.pipeline_mul_mm_q4k != null,
-            .q6_k => self.dmmv.pipeline_mul_mm_q6k_full_dp4a_q8_1 != null and self.dmmv.pipeline_mul_mm_q6k != null,
+            .q4_k => self.batched_scratch_hidden_i8 != null and
+                self.batched_scratch_hidden_scale_dsum != null and
+                self.dmmv.pipeline_mul_mm_q4k_full_dp4a != null and
+                self.dmmv.pipeline_mul_mm_q4k != null,
+            .q6_k => self.batched_scratch_hidden_i8 != null and
+                self.batched_scratch_hidden_scale_dsum != null and
+                self.dmmv.pipeline_mul_mm_q6k_full_dp4a_q8_1 != null and
+                self.dmmv.pipeline_mul_mm_q6k != null,
+            .q8_0 => self.batched_scratch_norm_q8 != null and
+                self.batched_scratch_norm_q8_scale != null and
+                self.dmmv.pipeline_quantize_act_q8 != null and
+                self.dmmv.pipeline_mul_mm_q8_0_full_dp4a != null and
+                self.dmmv.pipeline_mul_mm_q8_0 != null,
             else => false,
         };
     }
@@ -11897,7 +12003,7 @@ pub const InferenceEngine = struct {
         const scale_dsum = self.batched_scratch_hidden_scale_dsum orelse return 0;
 
         var full_cols = n_tokens & ~@as(u32, 31);
-        const padded_cols = self.gemmaDensePrefillPaddedTokenCount(n_tokens);
+        const padded_cols = self.gemmaProjectionPrefillPaddedTokenCount(n_tokens);
         if (padded_cols > full_cols and (padded_cols & 31) == 0) {
             full_cols = padded_cols;
         }
@@ -11938,7 +12044,55 @@ pub const InferenceEngine = struct {
         return full_cols;
     }
 
-    fn dispatchGemmaProjectionBatchedDp4aQ8_1(
+    fn gemmaPrepareProjectionQ8(self: *InferenceEngine, src: Buffer, K: u32, n_tokens: u32) !u32 {
+        if (!self.gemmaDenseProjectionDp4aEnabled(n_tokens)) return 0;
+        if (K == 0 or (K & 31) != 0) return 0;
+        if (self.dmmv.pipeline_quantize_act_q8 == null) return 0;
+        const packed_i8 = self.batched_scratch_norm_q8 orelse return 0;
+        const scale = self.batched_scratch_norm_q8_scale orelse return 0;
+
+        var full_cols = n_tokens & ~@as(u32, 31);
+        const padded_cols = self.gemmaProjectionPrefillPaddedTokenCount(n_tokens);
+        if (padded_cols > full_cols and (padded_cols & 31) == 0) {
+            full_cols = padded_cols;
+        }
+        if (full_cols == 0) return 0;
+
+        const need_input: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K) *
+            @sizeOf(f32);
+        const need_i8: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K / 4) *
+            @sizeOf(u32);
+        const need_scale: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, K / 32) *
+            @sizeOf(f32);
+        if (src.size < need_input or packed_i8.size < need_i8 or scale.size < need_scale) return 0;
+
+        try self.dmmv.recordQuantizeActQ8(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            src.handle,
+            src.size,
+            packed_i8.handle,
+            packed_i8.size,
+            scale.handle,
+            scale.size,
+            full_cols,
+            K,
+        );
+        const q8_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = packed_i8.handle, .size = packed_i8.size },
+            .{ .buffer = scale.handle, .size = scale.size },
+        };
+        self.decode_cmd.computeBuffersBarrier(&q8_ranges);
+        return full_cols;
+    }
+
+    fn dispatchGemmaProjectionBatchedDp4a(
         self: *InferenceEngine,
         tensor: *const LoadedTensor,
         src_f32: Buffer,
@@ -11946,12 +12100,16 @@ pub const InferenceEngine = struct {
         M: u32,
         K: u32,
         n_tokens: u32,
-        pre_quantized_cols: u32,
+        pre_quantized_q8_1_cols: u32,
+        pre_quantized_q8_cols: u32,
     ) !bool {
-        if (pre_quantized_cols == 0) return false;
         if (!self.gemmaDenseProjectionDp4aSupported(tensor, M, K, n_tokens)) return false;
-        const packed_i8 = self.batched_scratch_hidden_i8.?;
-        const scale_dsum = self.batched_scratch_hidden_scale_dsum.?;
+        const pre_quantized_cols: u32 = switch (tensor.info.type_) {
+            .q4_k, .q6_k => pre_quantized_q8_1_cols,
+            .q8_0 => pre_quantized_q8_cols,
+            else => 0,
+        };
+        if (pre_quantized_cols == 0) return false;
         const need_output: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, pre_quantized_cols) *
             @as(vk.c.VkDeviceSize, M) *
@@ -11962,6 +12120,8 @@ pub const InferenceEngine = struct {
         const tail_cols = if (pre_quantized_cols < n_tokens) n_tokens - pre_quantized_cols else 0;
         switch (tensor.info.type_) {
             .q4_k => {
+                const packed_i8 = self.batched_scratch_hidden_i8.?;
+                const scale_dsum = self.batched_scratch_hidden_scale_dsum.?;
                 try self.dmmv.recordMulMmQ4KFullDp4a(
                     &self.decode_cmd,
                     push_fn,
@@ -12024,6 +12184,8 @@ pub const InferenceEngine = struct {
                 return true;
             },
             .q6_k => {
+                const packed_i8 = self.batched_scratch_hidden_i8.?;
+                const scale_dsum = self.batched_scratch_hidden_scale_dsum.?;
                 try self.dmmv.recordMulMmQ6KFullDp4aQ8_1(
                     &self.decode_cmd,
                     push_fn,
@@ -12084,6 +12246,48 @@ pub const InferenceEngine = struct {
                 }
                 return true;
             },
+            .q8_0 => {
+                const packed_i8 = self.batched_scratch_norm_q8.?;
+                const scale = self.batched_scratch_norm_q8_scale.?;
+                try self.dmmv.recordMulMmQ8_0FullDp4a(
+                    &self.decode_cmd,
+                    push_fn,
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    packed_i8.handle,
+                    packed_i8.size,
+                    scale.handle,
+                    scale.size,
+                    dst.handle,
+                    dst.size,
+                    M,
+                    pre_quantized_cols,
+                    K,
+                    0,
+                    0,
+                );
+                if (tail_cols > 0) {
+                    try self.dmmv.recordMulMmQ8_0(
+                        &self.decode_cmd,
+                        push_fn,
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        src_f32.handle,
+                        src_f32.size,
+                        dst.handle,
+                        dst.size,
+                        M,
+                        tail_cols,
+                        K,
+                        K,
+                        M,
+                        0,
+                        pre_quantized_cols * K,
+                        pre_quantized_cols * M,
+                    );
+                }
+                return true;
+            },
             else => return false,
         }
     }
@@ -12102,25 +12306,36 @@ pub const InferenceEngine = struct {
         hidden_dim: u32,
         n_tokens: u32,
     ) !void {
-        var dp4a_supported =
-            self.gemmaDenseProjectionDp4aSupported(q_t, layer_q_dim, hidden_dim, n_tokens) or
-            self.gemmaDenseProjectionDp4aSupported(k_t, layer_kv_dim, hidden_dim, n_tokens);
+        var dp4a_q8_wanted =
+            q_t.info.type_ == .q8_0 and self.gemmaDenseProjectionDp4aSupported(q_t, layer_q_dim, hidden_dim, n_tokens);
+        var dp4a_q8_1_wanted =
+            q_t.info.type_ != .q8_0 and self.gemmaDenseProjectionDp4aSupported(q_t, layer_q_dim, hidden_dim, n_tokens);
+        dp4a_q8_wanted = dp4a_q8_wanted or
+            (k_t.info.type_ == .q8_0 and self.gemmaDenseProjectionDp4aSupported(k_t, layer_kv_dim, hidden_dim, n_tokens));
+        dp4a_q8_1_wanted = dp4a_q8_1_wanted or
+            (k_t.info.type_ != .q8_0 and self.gemmaDenseProjectionDp4aSupported(k_t, layer_kv_dim, hidden_dim, n_tokens));
         if (v_t_opt) |v_t| {
-            dp4a_supported = dp4a_supported or
-                self.gemmaDenseProjectionDp4aSupported(v_t, layer_kv_dim, hidden_dim, n_tokens);
+            dp4a_q8_wanted = dp4a_q8_wanted or
+                (v_t.info.type_ == .q8_0 and self.gemmaDenseProjectionDp4aSupported(v_t, layer_kv_dim, hidden_dim, n_tokens));
+            dp4a_q8_1_wanted = dp4a_q8_1_wanted or
+                (v_t.info.type_ != .q8_0 and self.gemmaDenseProjectionDp4aSupported(v_t, layer_kv_dim, hidden_dim, n_tokens));
         }
-        const dp4a_cols: u32 = if (dp4a_supported)
+        const dp4a_q8_cols: u32 = if (dp4a_q8_wanted)
+            try self.gemmaPrepareProjectionQ8(scratch_norm, hidden_dim, n_tokens)
+        else
+            0;
+        const dp4a_q8_1_cols: u32 = if (dp4a_q8_1_wanted)
             try self.gemmaPrepareProjectionQ8_1(scratch_norm, hidden_dim, n_tokens)
         else
             0;
-        if (!try self.dispatchGemmaProjectionBatchedDp4aQ8_1(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens, dp4a_cols)) {
+        if (!try self.dispatchGemmaProjectionBatchedDp4a(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens, dp4a_q8_1_cols, dp4a_q8_cols)) {
             try self.dispatchProjectionBatched(q_t, scratch_norm, scratch_q, layer_q_dim, hidden_dim, n_tokens);
         }
-        if (!try self.dispatchGemmaProjectionBatchedDp4aQ8_1(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens, dp4a_cols)) {
+        if (!try self.dispatchGemmaProjectionBatchedDp4a(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens, dp4a_q8_1_cols, dp4a_q8_cols)) {
             try self.dispatchProjectionBatched(k_t, scratch_norm, scratch_k, layer_kv_dim, hidden_dim, n_tokens);
         }
         if (v_t_opt) |v_t| {
-            if (!try self.dispatchGemmaProjectionBatchedDp4aQ8_1(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens, dp4a_cols)) {
+            if (!try self.dispatchGemmaProjectionBatchedDp4a(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens, dp4a_q8_1_cols, dp4a_q8_cols)) {
                 try self.dispatchProjectionBatched(v_t, scratch_norm, scratch_v, layer_kv_dim, hidden_dim, n_tokens);
             }
         }
@@ -15920,7 +16135,18 @@ pub const InferenceEngine = struct {
 
     fn gemmaDensePrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
         const cfg = self.model.config;
-        if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return n_tokens;
+        if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return n_tokens;
+        if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return n_tokens;
+        if (!self.isAmdRdna()) return n_tokens;
+        if (n_tokens < gemma_prefill_long_draft_prompt_min_tokens or n_tokens > 96) return n_tokens;
+        if (n_tokens < 64) return 64;
+        return (n_tokens + 31) & ~@as(u32, 31);
+    }
+
+    fn gemmaProjectionPrefillPaddedTokenCount(self: *const InferenceEngine, n_tokens: u32) u32 {
+        const cfg = self.model.config;
+        if (cfg.architecture != .gemma or cfg.ssm_d_inner != 0) return n_tokens;
+        if (cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()) return n_tokens;
         if (!self.isAmdRdna()) return n_tokens;
         if (n_tokens < gemma_prefill_long_draft_prompt_min_tokens or n_tokens > 96) return n_tokens;
         if (n_tokens < 64) return 64;
@@ -22025,6 +22251,1031 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    fn gemmaGroupedMoePrefillEnvEnabled() bool {
+        const env = std.posix.getenv("ZINC_GEMMA_MOE_GROUPED_PREFILL") orelse return false;
+        return std.mem.eql(u8, env, "1");
+    }
+
+    fn gemmaGroupedMoePrefillEnabled(self: *const InferenceEngine, prompt_len: usize) bool {
+        if (!gemmaGroupedMoePrefillEnvEnabled()) return false;
+        if (prompt_len < 2) return false;
+        const cfg = self.model.config;
+        if (cfg.architecture != .gemma or cfg.n_experts == 0 or cfg.n_experts_used == 0) return false;
+        if (cfg.n_experts_used > 16 or cfg.n_experts > 256) return false;
+        if (!self.isAmdRdna() or self.instance.push_descriptor_fn == null) return false;
+        if (self.validation_diagnostics_enabled) return false;
+        if (self.use_capture_routing or self.use_capture_ffn_input or self.use_count_experts_prefill) return false;
+        if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
+
+        if (self.elementwise.pipeline_rms_norm_scale_dmmv_f32_batch == null) return false;
+        if (self.elementwise.pipeline_softmax_topk_batch == null) return false;
+        if (self.elementwise.pipeline_moe_weighted_acc_scaled_batch == null) return false;
+        if (self.dmmv.pipeline_moe_route_pack == null) return false;
+        if (self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu_cols_top1 == null) return false;
+        if (self.dmmv.pipeline_q5_1_moe_cols == null) return false;
+
+        var layer: u32 = 0;
+        while (layer + 1 < cfg.n_layers) : (layer += 1) {
+            const lt = self.layer_tensors[layer];
+            const router_tensor = lt.ffn_gate_inp orelse return false;
+            const router_scale = lt.ffn_gate_inp_scale orelse return false;
+            const pre_norm = lt.pre_ffw_norm_2 orelse return false;
+            const gate_up = lt.ffn_gate_up_exps orelse return false;
+            const down_exps = lt.ffn_down_exps orelse return false;
+            const down_scale = lt.ffn_down_exps_scale orelse return false;
+            if (router_tensor.info.type_ != .f32 or router_scale.info.type_ != .f32 or pre_norm.info.type_ != .f32 or down_scale.info.type_ != .f32) return false;
+            if (gate_up.info.type_ != .q4_k or down_exps.info.type_ != .q5_1) return false;
+            if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) return false;
+            if (lt.ffn_gate_shexp != null or lt.ffn_up_shexp != null or lt.ffn_down_shexp != null) {
+                if (lt.ffn_gate_shexp == null or lt.ffn_up_shexp == null or lt.ffn_down_shexp == null) return false;
+                if (lt.ffn_gate_inp_shexp != null and self.elementwise.pipeline_sigmoid_scale_acc_batch == null) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Batched Gemma attention front-half for exact grouped MoE prefill.
+    ///
+    /// Postconditions:
+    ///   - scratch_hidden[token] includes the attention residual for `layer`
+    ///   - scratch_norm[token] holds the layer's FFN-entry RMS norm
+    ///   - K/V cache entries are populated for [base_token, base_token+n_tokens)
+    ///
+    /// This mirrors the Gemma attention segment in the dense batched prefill
+    /// path, but stops before any FFN work so the caller can run Gemma's
+    /// exact top-k grouped MoE.
+    fn prefillGemmaRunBatchedAttentionToFfnNorm(
+        self: *InferenceEngine,
+        state: *DecodeState,
+        base_token: u32,
+        n_tokens: u32,
+        hidden_dim: u32,
+        layer: u32,
+        scratch_hidden: Buffer,
+        scratch_norm: Buffer,
+        scratch_q: Buffer,
+        scratch_k: Buffer,
+        scratch_v: Buffer,
+        scratch_attn_out: Buffer,
+        scratch_down: Buffer,
+    ) !void {
+        if (n_tokens == 0) return;
+
+        const cfg = self.model.config;
+        if (cfg.architecture != .gemma) return error.UnsupportedPartialDecode;
+        const lt = self.layer_tensors[layer];
+        const eps = cfg.rms_norm_eps;
+        const layer_idx: usize = @intCast(layer);
+
+        const attn_norm_t = lt.attn_norm orelse return error.TensorNotFound;
+        const ffn_norm_t = lt.ffn_norm orelse
+            lt.post_attention_norm orelse return error.TensorNotFound;
+        const q_t = lt.attn_q orelse return error.TensorNotFound;
+        const k_t = lt.attn_k orelse return error.TensorNotFound;
+        const v_t_opt = lt.attn_v;
+        const o_t = lt.attn_output orelse return error.TensorNotFound;
+
+        const use_k_as_v = v_t_opt == null;
+        const layer_head_dim: u32 = if (lt.attn_q_norm) |qn|
+            @intCast(qn.info.numElements())
+        else
+            cfg.head_dim;
+        if (layer_head_dim == 0) return error.UnsupportedPartialDecode;
+        const layer_q_dim: u32 = @intCast(q_t.info.numElements() / hidden_dim);
+        const layer_kv_dim: u32 = @intCast(k_t.info.numElements() / hidden_dim);
+        if ((layer_kv_dim % layer_head_dim) != 0) return error.UnsupportedPartialDecode;
+        const layer_n_kv_heads: u32 = layer_kv_dim / layer_head_dim;
+        const layer_rope_dim: u32 = if (cfg.rope_dim > 0)
+            @min(cfg.rope_dim, layer_head_dim)
+        else
+            layer_head_dim;
+        const o_input_cols: u32 = @intCast(o_t.info.numElements() / hidden_dim);
+
+        const hidden_batch_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        const q_total_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, layer_q_dim) *
+            @sizeOf(f32);
+        const kv_total_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, layer_kv_dim) *
+            @sizeOf(f32);
+        if (scratch_hidden.size < hidden_batch_bytes or scratch_norm.size < hidden_batch_bytes) return error.BufferTooSmall;
+        if (scratch_q.size < q_total_bytes or scratch_attn_out.size < q_total_bytes) return error.BufferTooSmall;
+        if (scratch_k.size < kv_total_bytes or scratch_v.size < kv_total_bytes) return error.BufferTooSmall;
+        if (scratch_down.size < hidden_batch_bytes) return error.BufferTooSmall;
+
+        if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        self.resetTimestamps();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        self.decode_cmd.transferToComputeBarrier();
+
+        const attention_phase = self.beginProfilePhase();
+
+        const attention_norm_phase = self.beginProfilePhase();
+        try self.dispatchRmsNorm(
+            scratch_hidden.handle,
+            scratch_hidden.size,
+            attn_norm_t.gpu_buffer.handle,
+            attn_norm_t.gpu_buffer.size,
+            scratch_norm.handle,
+            scratch_norm.size,
+            hidden_dim,
+            n_tokens,
+            eps,
+        );
+        self.decode_cmd.computeBarrier();
+        self.endProfilePhase(.attention_norm, attention_norm_phase);
+
+        const attention_qkv_phase = self.beginProfilePhase();
+        try self.dispatchGemmaQkvProjectionsBatched(
+            q_t,
+            k_t,
+            v_t_opt,
+            scratch_norm,
+            scratch_q,
+            scratch_k,
+            scratch_v,
+            layer_q_dim,
+            layer_kv_dim,
+            hidden_dim,
+            n_tokens,
+        );
+        self.decode_cmd.computeBarrier();
+        self.endProfilePhase(.attention_qkv, attention_qkv_phase);
+
+        const apply_v_unit_norm = cfg.rope_freq_base_swa > 0;
+        const layer_is_swa_rope = cfg.rope_freq_base_swa > 0 and layer_head_dim < cfg.head_dim;
+        const layer_use_precomp_freq = !layer_is_swa_rope;
+        const layer_rope_freq_base: f32 = if (layer_use_precomp_freq)
+            0.0
+        else
+            cfg.rope_freq_base_swa;
+
+        var fused_qk_rope_kv = false;
+        if (self.use_fused_qk_kv and
+            layer_is_swa_rope and
+            apply_v_unit_norm and
+            lt.attn_q_norm != null and
+            lt.attn_k_norm != null and
+            layer_rope_freq_base != 0.0 and
+            self.instance.push_descriptor_fn != null and
+            self.elementwise.pipeline_qk_norm_rope_kv_write_batched != null)
+        {
+            const attention_head_norms_phase = self.beginProfilePhase();
+            const qn = lt.attn_q_norm.?;
+            const kn = lt.attn_k_norm.?;
+            const v_src_for_norm = if (use_k_as_v) scratch_k else scratch_v;
+            fused_qk_rope_kv = self.dispatchQkNormRopeKvWriteBatched(
+                scratch_q.handle,
+                scratch_q.size,
+                qn.gpu_buffer.handle,
+                qn.gpu_buffer.size,
+                scratch_k.handle,
+                scratch_k.size,
+                kn.gpu_buffer.handle,
+                kn.gpu_buffer.size,
+                self.page_table_buf.handle,
+                self.page_table_buf.size,
+                self.kv_k_cache[layer_idx].handle,
+                self.kv_k_cache[layer_idx].size,
+                v_src_for_norm.handle,
+                v_src_for_norm.size,
+                self.kv_v_cache[layer_idx].handle,
+                self.kv_v_cache[layer_idx].size,
+                layer_head_dim,
+                layer_rope_dim,
+                cfg.n_heads,
+                layer_n_kv_heads,
+                n_tokens,
+                kv_page_size_tokens,
+                base_token,
+                layer_rope_freq_base,
+                1.0,
+                eps,
+                true,
+            );
+            if (fused_qk_rope_kv) {
+                self.decode_cmd.computeBarrier();
+            }
+            self.endProfilePhase(.attention_head_norms, attention_head_norms_phase);
+        }
+
+        if (!fused_qk_rope_kv) {
+            const fused_full_kv = try self.dispatchGemmaFullAttnKvFusedBatched(
+                layer_idx,
+                scratch_q,
+                scratch_k,
+                layer_head_dim,
+                layer_rope_dim,
+                layer_n_kv_heads,
+                n_tokens,
+                base_token,
+                eps,
+            );
+            if (!fused_full_kv) {
+                const have_head_norms = apply_v_unit_norm or lt.attn_q_norm != null or lt.attn_k_norm != null;
+                const attention_head_norms_phase = if (have_head_norms) self.beginProfilePhase() else null;
+                if (apply_v_unit_norm) {
+                    const v_src_for_norm = if (use_k_as_v) scratch_k else scratch_v;
+                    try self.dispatchRmsNorm(
+                        v_src_for_norm.handle,
+                        v_src_for_norm.size,
+                        self.unit_norm_weights.handle,
+                        self.unit_norm_weights.size,
+                        scratch_v.handle,
+                        scratch_v.size,
+                        layer_head_dim,
+                        layer_n_kv_heads * n_tokens,
+                        eps,
+                    );
+                    if (use_k_as_v) self.decode_cmd.computeBarrier();
+                }
+                if (lt.attn_q_norm) |qn| {
+                    try self.dispatchRmsNorm(
+                        scratch_q.handle,
+                        scratch_q.size,
+                        qn.gpu_buffer.handle,
+                        qn.gpu_buffer.size,
+                        scratch_q.handle,
+                        scratch_q.size,
+                        layer_head_dim,
+                        cfg.n_heads * n_tokens,
+                        eps,
+                    );
+                }
+                if (lt.attn_k_norm) |kn| {
+                    try self.dispatchRmsNorm(
+                        scratch_k.handle,
+                        scratch_k.size,
+                        kn.gpu_buffer.handle,
+                        kn.gpu_buffer.size,
+                        scratch_k.handle,
+                        scratch_k.size,
+                        layer_head_dim,
+                        layer_n_kv_heads * n_tokens,
+                        eps,
+                    );
+                }
+                if (lt.attn_q_norm != null or lt.attn_k_norm != null or apply_v_unit_norm) self.decode_cmd.computeBarrier();
+                if (have_head_norms) self.endProfilePhase(.attention_head_norms, attention_head_norms_phase);
+
+                const attention_rope_phase = self.beginProfilePhase();
+                try self.dispatchRopeBatched(
+                    scratch_q.handle,
+                    scratch_q.size,
+                    scratch_q.handle,
+                    scratch_q.size,
+                    self.rope_freq_buf.handle,
+                    self.rope_freq_buf.size,
+                    layer_head_dim,
+                    layer_rope_dim,
+                    cfg.n_heads,
+                    base_token,
+                    n_tokens,
+                    layer_rope_freq_base,
+                    1.0,
+                );
+                try self.dispatchRopeBatched(
+                    scratch_k.handle,
+                    scratch_k.size,
+                    scratch_k.handle,
+                    scratch_k.size,
+                    self.rope_freq_buf.handle,
+                    self.rope_freq_buf.size,
+                    layer_head_dim,
+                    layer_rope_dim,
+                    layer_n_kv_heads,
+                    base_token,
+                    n_tokens,
+                    layer_rope_freq_base,
+                    1.0,
+                );
+                self.decode_cmd.computeBarrier();
+                self.endProfilePhase(.attention_rope, attention_rope_phase);
+
+                const attention_kv_write_phase = self.beginProfilePhase();
+                try self.dispatchKvCacheWriteBatched(
+                    scratch_k.handle,
+                    scratch_k.size,
+                    self.kv_k_cache[layer_idx].handle,
+                    self.kv_k_cache[layer_idx].size,
+                    scratch_v.handle,
+                    scratch_v.size,
+                    self.kv_v_cache[layer_idx].handle,
+                    self.kv_v_cache[layer_idx].size,
+                    self.page_table_buf.handle,
+                    self.page_table_buf.size,
+                    layer_kv_dim,
+                    n_tokens,
+                    kv_page_size_tokens,
+                    base_token,
+                );
+                self.decode_cmd.computeBarrier();
+                self.endProfilePhase(.attention_kv_write, attention_kv_write_phase);
+            }
+        }
+
+        const sink_offset = layer * cfg.n_heads;
+        const flash_attn_kernel_phase = self.beginProfilePhase();
+        try self.dispatchFlashAttnBatched(
+            scratch_q.handle,
+            scratch_q.size,
+            self.kv_k_cache[layer_idx].handle,
+            self.kv_k_cache[layer_idx].size,
+            self.kv_v_cache[layer_idx].handle,
+            self.kv_v_cache[layer_idx].size,
+            self.page_table_buf.handle,
+            self.page_table_buf.size,
+            scratch_attn_out.handle,
+            scratch_attn_out.size,
+            self.attn_sinks_buf.handle,
+            self.attn_sinks_buf.size,
+            layer_head_dim,
+            cfg.n_heads,
+            layer_n_kv_heads,
+            base_token,
+            n_tokens,
+            kv_page_size_tokens,
+            cfg.attn_scale,
+            sink_offset,
+        );
+        self.decode_cmd.computeBarrier();
+        self.endProfilePhase(.flash_attn_kernel, flash_attn_kernel_phase);
+
+        const attention_o_proj_phase = self.beginProfilePhase();
+        var o_done = false;
+        if (self.gemmaDenseProjectionDp4aSupported(o_t, hidden_dim, o_input_cols, n_tokens)) {
+            const o_dp4a_q8_cols: u32 = if (o_t.info.type_ == .q8_0)
+                try self.gemmaPrepareProjectionQ8(scratch_attn_out, o_input_cols, n_tokens)
+            else
+                0;
+            const o_dp4a_q8_1_cols: u32 = if (o_t.info.type_ != .q8_0)
+                try self.gemmaPrepareProjectionQ8_1(scratch_attn_out, o_input_cols, n_tokens)
+            else
+                0;
+            if (o_dp4a_q8_cols > 0 or o_dp4a_q8_1_cols > 0) {
+                o_done = try self.dispatchGemmaProjectionBatchedDp4a(o_t, scratch_attn_out, scratch_down, hidden_dim, o_input_cols, n_tokens, o_dp4a_q8_1_cols, o_dp4a_q8_cols);
+            }
+        }
+        if (!o_done) {
+            try self.dispatchProjectionBatched(o_t, scratch_attn_out, scratch_down, hidden_dim, o_input_cols, n_tokens);
+        }
+        self.decode_cmd.computeBarrier();
+        self.endProfilePhase(.attention_o_proj, attention_o_proj_phase);
+
+        const attention_post_norm_phase = self.beginProfilePhase();
+        var ffn_norm_ready = false;
+        if (lt.post_attention_norm) |pan_t| {
+            if (self.elementwise.pipeline_post_norm_residual_rms_norm != null) {
+                try self.dispatchPostNormResidualRmsNorm(
+                    scratch_hidden.handle,
+                    scratch_hidden.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    pan_t.gpu_buffer.handle,
+                    pan_t.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    ffn_norm_t.gpu_buffer.handle,
+                    ffn_norm_t.gpu_buffer.size,
+                    hidden_dim,
+                    n_tokens,
+                    eps,
+                );
+                ffn_norm_ready = true;
+            } else {
+                try self.dispatchRmsNorm(
+                    scratch_down.handle,
+                    scratch_down.size,
+                    pan_t.gpu_buffer.handle,
+                    pan_t.gpu_buffer.size,
+                    scratch_down.handle,
+                    scratch_down.size,
+                    hidden_dim,
+                    n_tokens,
+                    eps,
+                );
+                self.decode_cmd.computeBarrier();
+            }
+        }
+        if (!ffn_norm_ready) {
+            try self.dispatchResidualRmsNorm(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                scratch_down.handle,
+                scratch_down.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                ffn_norm_t.gpu_buffer.handle,
+                ffn_norm_t.gpu_buffer.size,
+                hidden_dim,
+                n_tokens,
+                eps,
+                1.0,
+            );
+        }
+        self.decode_cmd.computeBarrier();
+        self.endProfilePhase(.attention_post_norm, attention_post_norm_phase);
+        self.endProfilePhase(.attention, attention_phase);
+
+        self.decode_cmd.computeToTransferBarrier();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        self.recordProfilingSample();
+
+        state.position = base_token + n_tokens - 1;
+    }
+
+    fn prefillGemmaGroupedMoeExact(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        if (prompt_tokens.len == 0) return;
+        const cfg = self.model.config;
+        const n_tokens: u32 = @intCast(@min(prompt_tokens.len, std.math.maxInt(u32)));
+        const n_used = cfg.n_experts_used;
+        const route_count = n_tokens * n_used;
+        const hidden_dim = cfg.hidden_dim;
+        const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
+        const shared_scratch_inter_dim: u32 = if (cfg.shared_expert_intermediate_dim > 0) cfg.shared_expert_intermediate_dim else inter_dim;
+        const hidden_size: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
+        const hidden_batch_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        const route_inter_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, route_count) *
+            @as(vk.c.VkDeviceSize, inter_dim) *
+            @sizeOf(f32);
+        const route_hidden_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, route_count) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        const total_embed_bytes: u64 = @as(u64, hidden_dim) * @as(u64, n_tokens) * @sizeOf(f32);
+        const base_token: u32 = state.position;
+        const target_context_tokens = if (state.requested_context_tokens > 0)
+            @max(state.requested_context_tokens, base_token +| n_tokens)
+        else
+            base_token +| n_tokens;
+        if (base_token == 0 and state.generated_tokens.items.len == 0) {
+            try self.resetRequestState(target_context_tokens);
+        } else if (base_token > 0 and self.active_kv_page_ids == null) {
+            return error.KvStateNotAvailable;
+        } else {
+            try self.ensureKvPagesForContext(target_context_tokens);
+        }
+
+        try self.ensureBatchedScratchCapacity(route_count);
+        try self.ensureGemmaMoePrefillDp4aScratchCapacity(n_tokens, shared_scratch_inter_dim);
+        const scratch_hidden = self.batched_scratch_hidden.?;
+        const scratch_norm = self.batched_scratch_norm.?;
+        const scratch_router_logits = self.batched_scratch_gate.?;
+        const scratch_shared_up = self.batched_scratch_attn_out.?;
+        const scratch_shared_down = self.batched_scratch_up.?;
+        const scratch_route_ids = scratch_shared_up;
+        const scratch_swiglu = self.batched_scratch_swiglu.?;
+        const scratch_down = self.batched_scratch_down.?;
+        const scratch_shared_norm = self.batched_scratch_q.?;
+        const scratch_k = self.batched_scratch_k.?;
+        const scratch_v = self.batched_scratch_v.?;
+        const route_buf = self.batched_scratch_moe_ids orelse return error.BufferTooSmall;
+        const route_pack_counts = self.batched_scratch_moe_counts orelse return error.BufferTooSmall;
+        const route_pack_active_blocks = self.batched_scratch_moe_active_blocks orelse return error.BufferTooSmall;
+        const route_pack_active_count = self.batched_scratch_moe_active_count orelse return error.BufferTooSmall;
+        const route_pack_dispatch_args = self.batched_scratch_moe_dispatch_args orelse return error.BufferTooSmall;
+        if (scratch_hidden.size < hidden_batch_bytes or scratch_norm.size < hidden_batch_bytes or scratch_shared_norm.size < hidden_batch_bytes) return error.BufferTooSmall;
+        if (scratch_swiglu.size < route_inter_bytes or scratch_down.size < route_hidden_bytes) return error.BufferTooSmall;
+
+        if (self.prefill_embed_big == null or self.prefill_embed_big_capacity_bytes < total_embed_bytes) {
+            if (self.prefill_embed_big) |*b| b.deinit();
+            self.prefill_embed_big = try Buffer.initStaging(self.instance, total_embed_bytes);
+            self.prefill_embed_big_capacity_bytes = total_embed_bytes;
+        }
+        {
+            const big_f32: [*]f32 = @ptrCast(@alignCast(self.prefill_embed_big.?.mapped.?));
+            const embd = self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
+            const mmap = self.model.mmap_data orelse return error.NoMmapData;
+            const data_start: usize = @intCast(self.model.gguf_file.tensor_data_offset + embd.info.offset);
+            const vocab_last = cfg.vocab_size -| 1;
+            const gemma_scale: f32 = @floatCast(@sqrt(@as(f64, @floatFromInt(hidden_dim))));
+            for (prompt_tokens, 0..) |tok, i| {
+                const safe_id = @min(tok, vocab_last);
+                const dst = big_f32[i * hidden_dim ..][0..hidden_dim];
+                dequantRow(mmap[data_start..], safe_id, hidden_dim, embd.info.type_, dst);
+                for (dst) |*v| v.* *= gemma_scale;
+            }
+        }
+        self.prefill_embed_big_hidden = hidden_dim;
+        self.prefill_embed_big_token_count = n_tokens;
+        self.prefill_current_token_idx = 0;
+        defer {
+            self.prefill_embed_big_hidden = 0;
+            self.prefill_embed_big_token_count = 0;
+            self.prefill_current_token_idx = 0;
+        }
+
+        const saved_partial_start = self.partial_decode_start_layer;
+        const saved_partial_end = self.partial_decode_end_layer;
+        const saved_hidden_in = self.partial_decode_hidden_in;
+        const saved_hidden_in_offset = self.partial_decode_hidden_in_offset;
+        const saved_hidden_out = self.partial_decode_hidden_out;
+        const saved_hidden_out_offset = self.partial_decode_hidden_out_offset;
+        const saved_advance = self.partial_decode_advance_position;
+        const saved_allow_tail = self.partial_decode_allow_final_tail;
+        const saved_stop_before_norm = self.partial_decode_stop_before_ffn_norm;
+        const saved_stop_after_norm = self.partial_decode_stop_after_ffn_norm;
+        const saved_norm_out = self.partial_decode_ffn_norm_out;
+        const saved_norm_out_offset = self.partial_decode_ffn_norm_out_offset;
+        const saved_resume = self.partial_decode_resume_from_ffn_norm;
+        const saved_norm_in = self.partial_decode_ffn_norm_in;
+        const saved_norm_in_offset = self.partial_decode_ffn_norm_in_offset;
+        const saved_router_in = self.partial_decode_router_output_in;
+        const saved_router_in_offset = self.partial_decode_router_output_in_offset;
+        const saved_router_in_size = self.partial_decode_router_output_in_size;
+        defer {
+            self.partial_decode_start_layer = saved_partial_start;
+            self.partial_decode_end_layer = saved_partial_end;
+            self.partial_decode_hidden_in = saved_hidden_in;
+            self.partial_decode_hidden_in_offset = saved_hidden_in_offset;
+            self.partial_decode_hidden_out = saved_hidden_out;
+            self.partial_decode_hidden_out_offset = saved_hidden_out_offset;
+            self.partial_decode_advance_position = saved_advance;
+            self.partial_decode_allow_final_tail = saved_allow_tail;
+            self.partial_decode_stop_before_ffn_norm = saved_stop_before_norm;
+            self.partial_decode_stop_after_ffn_norm = saved_stop_after_norm;
+            self.partial_decode_ffn_norm_out = saved_norm_out;
+            self.partial_decode_ffn_norm_out_offset = saved_norm_out_offset;
+            self.partial_decode_resume_from_ffn_norm = saved_resume;
+            self.partial_decode_ffn_norm_in = saved_norm_in;
+            self.partial_decode_ffn_norm_in_offset = saved_norm_in_offset;
+            self.partial_decode_router_output_in = saved_router_in;
+            self.partial_decode_router_output_in_offset = saved_router_in_offset;
+            self.partial_decode_router_output_in_size = saved_router_in_size;
+            self.prefill_pipeline_mode = false;
+        }
+
+        try self.decode_cmd.reset();
+        try self.decode_cmd.beginOneTime();
+        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.prefill_embed_big.?.handle, scratch_hidden.handle, 1, &vk.c.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = total_embed_bytes,
+        });
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+        self.prefill_token_samples = 0;
+        self.prefill_cpu_embed_ns = 0;
+        self.prefill_cpu_record_ns = 0;
+        self.prefill_submit_wait_ns = 0;
+        self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
+        self.prefill_gpu_total_ns = 0;
+        const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
+        const want_gpu_phases = profile_env != null and profile_env.?.len > 0 and !std.mem.eql(u8, profile_env.?, "0");
+        const profile_was_enabled = self.profile_enabled;
+        const prefill_active_was = self.prefill_active;
+        const enable_gpu_phase_timing = self.timestamp_query_pool != null and (want_gpu_phases or profile_was_enabled);
+        if (enable_gpu_phase_timing) {
+            self.profile_enabled = true;
+            self.resetProfilingSamples();
+        }
+        self.prefill_active = true;
+        defer {
+            if (enable_gpu_phase_timing) {
+                for (0..profile_phase_count) |p| {
+                    self.prefill_gpu_phase_ns[p] = self.profile_total_counters.gpu_phase_ns[p];
+                }
+                self.prefill_gpu_total_ns = @intFromFloat(@max(self.profile_total_gpu_ms * 1_000_000.0, 0.0));
+                self.resetProfilingSamples();
+                self.profile_enabled = profile_was_enabled;
+            }
+            self.prefill_active = prefill_active_was;
+        }
+
+        log.info("FASTPATH: Gemma exact grouped top-{d} MoE prefill ENABLED (tokens={d})", .{ n_used, n_tokens });
+
+        const route_stride_u32: u32 = 2 * n_used;
+        const route_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, route_stride_u32) *
+            @sizeOf(u32);
+        const router_logits_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, n_tokens) *
+            @as(vk.c.VkDeviceSize, cfg.n_experts) *
+            @sizeOf(f32);
+        const route_pack_counts_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, cfg.n_experts) * @sizeOf(u32);
+        const ids_stride = route_count;
+        const route_pack_ids_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, cfg.n_experts) *
+            @as(vk.c.VkDeviceSize, ids_stride) *
+            @sizeOf(u32);
+        const route_pack_active_blocks_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, route_count) * @sizeOf(u32);
+        const route_pack_dispatch_args_bytes: vk.c.VkDeviceSize = 6 * @sizeOf(u32);
+        if (route_buf.size < @max(route_bytes, @as(vk.c.VkDeviceSize, n_tokens) * @sizeOf(f32))) return error.BufferTooSmall;
+        if (scratch_router_logits.size < router_logits_bytes) return error.BufferTooSmall;
+        if (scratch_route_ids.size < route_pack_ids_bytes) return error.BufferTooSmall;
+        if (route_pack_counts.size < route_pack_counts_bytes or
+            route_pack_active_blocks.size < route_pack_active_blocks_bytes or
+            route_pack_active_count.size < @sizeOf(u32) or
+            route_pack_dispatch_args.size < route_pack_dispatch_args_bytes)
+            return error.BufferTooSmall;
+
+        const pipeline_tail =
+            n_tokens >= 16 and
+            !self.validation_diagnostics_enabled and
+            !self.profile_enabled and
+            self.instance.push_descriptor_fn != null and
+            self.isAmdRdna();
+
+        var layer: u32 = 0;
+        while (layer + 1 < cfg.n_layers) : (layer += 1) {
+            try self.prefillGemmaRunBatchedAttentionToFfnNorm(
+                state,
+                base_token,
+                n_tokens,
+                hidden_dim,
+                layer,
+                scratch_hidden,
+                scratch_norm,
+                scratch_shared_norm,
+                scratch_k,
+                scratch_v,
+                scratch_shared_up,
+                scratch_down,
+            );
+
+            const lt = self.layer_tensors[layer];
+            const router_tensor = lt.ffn_gate_inp orelse return error.TensorNotFound;
+            const router_scale = lt.ffn_gate_inp_scale orelse return error.TensorNotFound;
+            const pre_norm_t = lt.pre_ffw_norm_2 orelse return error.TensorNotFound;
+            const ffn_norm_t = lt.ffn_norm orelse lt.post_attention_norm orelse return error.TensorNotFound;
+            const gate_up = lt.ffn_gate_up_exps orelse return error.TensorNotFound;
+            const down_exps = lt.ffn_down_exps orelse return error.TensorNotFound;
+            const down_scale = lt.ffn_down_exps_scale orelse return error.TensorNotFound;
+            const fused_inter = inter_dim * 2;
+            const expert_gate_row_bytes = expertSliceBytes(gate_up.info.type_, fused_inter, hidden_dim);
+            const up_base_offset = expertSliceBytes(gate_up.info.type_, inter_dim, hidden_dim);
+            const expert_down_row_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+
+            try self.decode_cmd.reset();
+            try self.decode_cmd.beginOneTime();
+            self.resetTimestamps();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            self.decode_cmd.transferToComputeBarrier();
+            const moe_phase = self.beginProfilePhase();
+
+            const router_phase = self.beginProfilePhase();
+            try self.dispatchRmsNormScaleDmmvF32Batch(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                router_scale.gpu_buffer.handle,
+                router_scale.gpu_buffer.size,
+                router_tensor.gpu_buffer.handle,
+                router_tensor.gpu_buffer.size,
+                scratch_router_logits.handle,
+                scratch_router_logits.size,
+                cfg.n_experts,
+                hidden_dim,
+                n_tokens,
+                cfg.rms_norm_eps,
+            );
+            self.decode_cmd.computeBufferBarrier(scratch_router_logits.handle, router_logits_bytes);
+            self.endProfilePhase(.moe_router, router_phase);
+
+            const topk_phase = self.beginProfilePhase();
+            const gemma_router_scale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(hidden_dim)));
+            try self.dispatchSoftmaxTopkBatchScaled(
+                scratch_router_logits.handle,
+                scratch_router_logits.size,
+                route_buf.handle,
+                route_buf.size,
+                cfg.n_experts,
+                n_used,
+                0,
+                n_tokens,
+                route_stride_u32,
+                gemma_router_scale,
+            );
+            self.decode_cmd.computeBufferBarrier(route_buf.handle, route_bytes);
+            self.endProfilePhase(.moe_topk, topk_phase);
+
+            try self.dmmv.recordMoeRoutePack(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                route_buf.handle,
+                route_buf.size,
+                route_pack_counts.handle,
+                route_pack_counts_bytes,
+                scratch_route_ids.handle,
+                route_pack_ids_bytes,
+                route_pack_active_count.handle,
+                @sizeOf(u32),
+                route_pack_active_blocks.handle,
+                route_pack_active_blocks_bytes,
+                route_pack_dispatch_args.handle,
+                route_pack_dispatch_args_bytes,
+                n_tokens,
+                cfg.n_experts,
+                n_used,
+                route_stride_u32,
+                ids_stride,
+                (inter_dim + 3) / 4,
+                (hidden_dim + 3) / 4,
+                0,
+            );
+            const route_pack_ranges = [_]CommandBuffer.BufferRange{
+                .{ .buffer = route_pack_counts.handle, .size = route_pack_counts_bytes },
+                .{ .buffer = scratch_route_ids.handle, .size = route_pack_ids_bytes },
+                .{ .buffer = route_pack_active_blocks.handle, .size = route_pack_active_blocks_bytes },
+            };
+            self.decode_cmd.computeBuffersBarrier(&route_pack_ranges);
+            self.decode_cmd.computeToIndirectBufferBarrier(route_pack_dispatch_args.handle, route_pack_dispatch_args_bytes);
+
+            try self.dispatchRmsNorm(
+                scratch_hidden.handle,
+                scratch_hidden.size,
+                pre_norm_t.gpu_buffer.handle,
+                pre_norm_t.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                hidden_dim,
+                n_tokens,
+                cfg.rms_norm_eps,
+            );
+            self.decode_cmd.computeBufferBarrier(scratch_norm.handle, hidden_batch_bytes);
+
+            const gate_up_phase = self.beginProfilePhase();
+            try self.dmmv.recordGemmaTop1GateUpGegluColsDispatchIndirect(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                gate_up.gpu_buffer.handle,
+                gate_up.gpu_buffer.size,
+                scratch_norm.handle,
+                scratch_norm.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                route_pack_counts.handle,
+                route_pack_counts_bytes,
+                scratch_route_ids.handle,
+                route_pack_ids_bytes,
+                route_pack_active_blocks.handle,
+                route_pack_active_blocks_bytes,
+                route_pack_dispatch_args.handle,
+                0,
+                inter_dim,
+                hidden_dim,
+                expert_gate_row_bytes,
+                up_base_offset,
+                ids_stride,
+                n_used,
+                0,
+                0,
+            );
+            self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, route_inter_bytes);
+            self.endProfilePhase(.moe_gate_up, gate_up_phase);
+
+            const down_phase = self.beginProfilePhase();
+            try self.dmmv.recordMoeColsDispatchIndirect(
+                &self.decode_cmd,
+                self.instance.push_descriptor_fn,
+                .q5_1,
+                down_exps.gpu_buffer.handle,
+                down_exps.gpu_buffer.size,
+                scratch_swiglu.handle,
+                scratch_swiglu.size,
+                scratch_down.handle,
+                scratch_down.size,
+                route_pack_counts.handle,
+                route_pack_counts_bytes,
+                scratch_route_ids.handle,
+                route_pack_ids_bytes,
+                route_pack_active_blocks.handle,
+                route_pack_active_blocks_bytes,
+                route_pack_dispatch_args.handle,
+                3 * @sizeOf(u32),
+                hidden_dim,
+                inter_dim,
+                expert_down_row_bytes,
+                ids_stride,
+                1,
+                0,
+                0,
+                0,
+                false,
+            );
+            self.decode_cmd.computeBufferBarrier(scratch_down.handle, route_hidden_bytes);
+            self.endProfilePhase(.moe_down, down_phase);
+
+            self.decode_cmd.computeToTransferBarrier();
+            vk.c.vkCmdFillBuffer(self.decode_cmd.handle, scratch_norm.handle, 0, hidden_batch_bytes, 0);
+            self.decode_cmd.transferToComputeBarrier();
+            const acc_phase = self.beginProfilePhase();
+            try self.dispatchMoeWeightedAccScaledBatch(
+                scratch_norm.handle,
+                scratch_norm.size,
+                scratch_down.handle,
+                scratch_down.size,
+                route_buf.handle,
+                route_bytes,
+                down_scale.gpu_buffer.handle,
+                down_scale.gpu_buffer.size,
+                hidden_dim,
+                n_tokens,
+                n_used,
+                route_stride_u32,
+                0,
+                0,
+                0,
+            );
+            self.decode_cmd.computeBufferBarrier(scratch_norm.handle, hidden_batch_bytes);
+            self.endProfilePhase(.moe_weighted_acc, acc_phase);
+
+            if (lt.post_ffw_norm_2) |pfn2_t| {
+                try self.dispatchRmsNorm(
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    pfn2_t.gpu_buffer.handle,
+                    pfn2_t.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    hidden_dim,
+                    n_tokens,
+                    cfg.rms_norm_eps,
+                );
+                self.decode_cmd.computeBufferBarrier(scratch_norm.handle, hidden_batch_bytes);
+            }
+
+            const gate_shexp = lt.ffn_gate_shexp;
+            const up_shexp = lt.ffn_up_shexp;
+            const down_shexp = lt.ffn_down_shexp;
+            if (gate_shexp != null and up_shexp != null and down_shexp != null) {
+                const shared_phase = self.beginProfilePhase();
+                const shexp_inter_dim = if (cfg.shared_expert_intermediate_dim > 0) cfg.shared_expert_intermediate_dim else inter_dim;
+                const shared_inter_bytes: vk.c.VkDeviceSize =
+                    @as(vk.c.VkDeviceSize, n_tokens) *
+                    @as(vk.c.VkDeviceSize, shexp_inter_dim) *
+                    @sizeOf(f32);
+                if (scratch_router_logits.size < shared_inter_bytes or scratch_shared_up.size < shared_inter_bytes or scratch_swiglu.size < shared_inter_bytes or scratch_shared_down.size < hidden_batch_bytes) {
+                    return error.BufferTooSmall;
+                }
+                try self.dispatchRmsNorm(
+                    scratch_hidden.handle,
+                    scratch_hidden.size,
+                    ffn_norm_t.gpu_buffer.handle,
+                    ffn_norm_t.gpu_buffer.size,
+                    scratch_shared_norm.handle,
+                    scratch_shared_norm.size,
+                    hidden_dim,
+                    n_tokens,
+                    cfg.rms_norm_eps,
+                );
+                self.decode_cmd.computeBufferBarrier(scratch_shared_norm.handle, hidden_batch_bytes);
+
+                const shexp_gate = lt.ffn_gate_inp_shexp;
+                if (shexp_gate) |sg| {
+                    try self.dispatchProjectionBatched(sg, scratch_shared_norm, route_buf, 1, hidden_dim, n_tokens);
+                    self.decode_cmd.computeBufferBarrier(route_buf.handle, @as(vk.c.VkDeviceSize, n_tokens) * @sizeOf(f32));
+                }
+
+                var shared_gateup_dp4a_cols: u32 = 0;
+                const shared_gateup_result = try self.dispatchGemmaGateUpGegluBatched(
+                    gate_shexp.?,
+                    up_shexp.?,
+                    down_shexp.?,
+                    scratch_shared_norm,
+                    scratch_swiglu,
+                    shexp_inter_dim,
+                    hidden_dim,
+                    n_tokens,
+                    &shared_gateup_dp4a_cols,
+                );
+                if (shared_gateup_result == .not_handled) {
+                    try self.dispatchProjectionBatched(gate_shexp.?, scratch_shared_norm, scratch_router_logits, shexp_inter_dim, hidden_dim, n_tokens);
+                    try self.dispatchProjectionBatched(up_shexp.?, scratch_shared_norm, scratch_shared_up, shexp_inter_dim, hidden_dim, n_tokens);
+                    const shared_gateup_ranges = [_]CommandBuffer.BufferRange{
+                        .{ .buffer = scratch_router_logits.handle, .size = shared_inter_bytes },
+                        .{ .buffer = scratch_shared_up.handle, .size = shared_inter_bytes },
+                    };
+                    self.decode_cmd.computeBuffersBarrier(&shared_gateup_ranges);
+                    try self.dispatchFfnActivation(
+                        scratch_router_logits.handle,
+                        scratch_router_logits.size,
+                        scratch_shared_up.handle,
+                        scratch_shared_up.size,
+                        scratch_swiglu.handle,
+                        scratch_swiglu.size,
+                        n_tokens * shexp_inter_dim,
+                    );
+                    self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, shared_inter_bytes);
+                } else {
+                    self.barrierAfterGemmaGateUpGeglu(shared_gateup_result, scratch_swiglu, shared_inter_bytes, n_tokens, shared_gateup_dp4a_cols);
+                }
+
+                const shared_already_q8 = shared_gateup_result == .q8_geglu;
+                const shared_already_q8_1 = shared_gateup_result == .q8_1_geglu;
+                if (!try self.dispatchGemmaDenseDownDp4aBatched(down_shexp.?, scratch_swiglu, scratch_shared_down, hidden_dim, shexp_inter_dim, n_tokens, shared_already_q8, shared_already_q8_1, shared_gateup_dp4a_cols)) {
+                    if (shared_already_q8 or shared_already_q8_1) return error.UnsupportedConfiguration;
+                    try self.dispatchProjectionBatched(down_shexp.?, scratch_swiglu, scratch_shared_down, hidden_dim, shexp_inter_dim, n_tokens);
+                }
+                self.decode_cmd.computeBufferBarrier(scratch_shared_down.handle, hidden_batch_bytes);
+
+                if (lt.post_ffw_norm_1) |pfn1_t| {
+                    try self.dispatchRmsNorm(
+                        scratch_shared_down.handle,
+                        scratch_shared_down.size,
+                        pfn1_t.gpu_buffer.handle,
+                        pfn1_t.gpu_buffer.size,
+                        scratch_shared_down.handle,
+                        scratch_shared_down.size,
+                        hidden_dim,
+                        n_tokens,
+                        cfg.rms_norm_eps,
+                    );
+                    self.decode_cmd.computeBufferBarrier(scratch_shared_down.handle, hidden_batch_bytes);
+                }
+                if (shexp_gate != null) {
+                    try self.dispatchSigmoidScaleAccBatch(
+                        scratch_norm.handle,
+                        scratch_norm.size,
+                        scratch_shared_down.handle,
+                        scratch_shared_down.size,
+                        route_buf.handle,
+                        @as(vk.c.VkDeviceSize, n_tokens) * @sizeOf(f32),
+                        hidden_dim,
+                        n_tokens,
+                        0,
+                    );
+                } else {
+                    try self.dispatchScaleAcc(
+                        scratch_norm.handle,
+                        scratch_norm.size,
+                        scratch_shared_down.handle,
+                        scratch_shared_down.size,
+                        n_tokens * hidden_dim,
+                        1.0,
+                    );
+                }
+                self.decode_cmd.computeBufferBarrier(scratch_norm.handle, hidden_batch_bytes);
+                self.endProfilePhase(.shared_expert, shared_phase);
+            }
+
+            if (lt.post_ffw_norm) |pfn_t| {
+                try self.dispatchRmsNorm(
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    pfn_t.gpu_buffer.handle,
+                    pfn_t.gpu_buffer.size,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    hidden_dim,
+                    n_tokens,
+                    cfg.rms_norm_eps,
+                );
+                self.decode_cmd.computeBufferBarrier(scratch_norm.handle, hidden_batch_bytes);
+            }
+            try self.dispatchScaleAcc(scratch_hidden.handle, scratch_hidden.size, scratch_norm.handle, scratch_norm.size, n_tokens * hidden_dim, 1.0);
+            self.decode_cmd.computeBufferBarrier(scratch_hidden.handle, hidden_batch_bytes);
+            const layer_output_scale = self.layer_output_scales[layer];
+            if (layer_output_scale != 1.0) {
+                try self.dispatchScaleInPlace(scratch_hidden.handle, scratch_hidden.size, n_tokens * hidden_dim, layer_output_scale);
+                self.decode_cmd.computeBufferBarrier(scratch_hidden.handle, hidden_batch_bytes);
+            }
+            self.endProfilePhase(.moe_routed, moe_phase);
+            self.decode_cmd.computeToTransferBarrier();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            try self.decode_cmd.end();
+            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+            if (enable_gpu_phase_timing) self.recordProfilingSample();
+        }
+
+        try self.prefillQwen36RunPartialTokenLoop(
+            state,
+            prompt_tokens,
+            base_token,
+            n_tokens,
+            hidden_size,
+            cfg.n_layers - 1,
+            cfg.n_layers,
+            scratch_hidden,
+            null,
+            false,
+            0,
+            false,
+            false,
+            true,
+            pipeline_tail,
+        );
+
+        self.prefill_token_samples = n_tokens;
+        state.position = base_token + n_tokens;
+    }
+
     fn prefillGemmaShortMoePrefix(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
         const cfg = self.model.config;
@@ -22611,6 +23862,9 @@ pub const InferenceEngine = struct {
             if (dense_prefix_layers > 0) {
                 return self.prefillQwen36DenseFfnPrefix(state, prompt_tokens, dense_prefix_layers);
             }
+            if (self.gemmaGroupedMoePrefillEnabled(prompt_tokens.len)) {
+                return self.prefillGemmaGroupedMoeExact(state, prompt_tokens);
+            }
             if (self.gemmaShortMoePrefixPrefillEnabled(prompt_tokens.len)) {
                 return self.prefillGemmaShortMoePrefix(state, prompt_tokens);
             }
@@ -22954,9 +24208,16 @@ pub const InferenceEngine = struct {
             const attention_o_proj_phase = self.beginProfilePhase();
             var o_done = false;
             if (self.gemmaDenseProjectionDp4aSupported(o_t, hidden_dim, o_input_cols, n_tokens)) {
-                const o_dp4a_cols = try self.gemmaPrepareProjectionQ8_1(scratch_attn_out, o_input_cols, n_tokens);
-                if (o_dp4a_cols > 0) {
-                    o_done = try self.dispatchGemmaProjectionBatchedDp4aQ8_1(o_t, scratch_attn_out, scratch_down, hidden_dim, o_input_cols, n_tokens, o_dp4a_cols);
+                const o_dp4a_q8_cols: u32 = if (o_t.info.type_ == .q8_0)
+                    try self.gemmaPrepareProjectionQ8(scratch_attn_out, o_input_cols, n_tokens)
+                else
+                    0;
+                const o_dp4a_q8_1_cols: u32 = if (o_t.info.type_ != .q8_0)
+                    try self.gemmaPrepareProjectionQ8_1(scratch_attn_out, o_input_cols, n_tokens)
+                else
+                    0;
+                if (o_dp4a_q8_cols > 0 or o_dp4a_q8_1_cols > 0) {
+                    o_done = try self.dispatchGemmaProjectionBatchedDp4a(o_t, scratch_attn_out, scratch_down, hidden_dim, o_input_cols, n_tokens, o_dp4a_q8_1_cols, o_dp4a_q8_cols);
                 }
             }
             if (!o_done) {

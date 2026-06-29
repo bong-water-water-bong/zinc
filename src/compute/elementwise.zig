@@ -196,6 +196,19 @@ pub const MoeWeightedAccBatchPush = extern struct {
     accum_token_base: u32,
 };
 
+/// Push constants for the Gemma batched MoE weighted-accumulate shader.
+/// Same route-major contract as `MoeWeightedAccBatchPush`, with an extra
+/// per-expert scale offset for model-specific down-projection scales.
+pub const MoeWeightedAccScaledBatchPush = extern struct {
+    hidden_dim: u32,
+    n_tokens: u32,
+    n_used: u32,
+    routing_stride: u32,
+    routing_token_base: u32,
+    accum_token_base: u32,
+    scale_offset: u32,
+};
+
 /// Push constants for the **batched** `sigmoid_scale_acc` shader.
 /// Applies a per-token sigmoid-gated shared-expert add across a token batch:
 /// `accum[t,i] += sigmoid(gate_t) * src[t,i]`.
@@ -421,6 +434,8 @@ pub const ElementwiseDispatch = struct {
     pipeline_moe_weighted_acc: ?Pipeline,
     /// Batched route-major MoE weighted accumulate, 3 bindings.
     pipeline_moe_weighted_acc_batch: ?Pipeline,
+    /// Batched route-major weighted accumulate with per-expert scale, 4 bindings.
+    pipeline_moe_weighted_acc_scaled_batch: ?Pipeline,
     /// Batched per-token sigmoid-gated accumulate, 3 bindings.
     pipeline_sigmoid_scale_acc_batch: ?Pipeline,
     /// KV CACHE WRITE pipeline: compute-based KV cache copy, 4 bindings (k_src, k_dst, v_src, v_dst).
@@ -762,6 +777,12 @@ pub const ElementwiseDispatch = struct {
             break :blk null;
         };
 
+        const mwa_scaled_batch_path = std.fmt.bufPrint(&path_buf, "{s}/moe_weighted_acc_scaled_batch.spv", .{shader_dir}) catch unreachable;
+        const pipeline_moe_weighted_acc_scaled_batch = pipeline_mod.createFromSpirvWithOptions(instance, mwa_scaled_batch_path, 4, @sizeOf(MoeWeightedAccScaledBatchPush), &.{}, push_options, allocator) catch |err| blk: {
+            log.warn("moe_weighted_acc_scaled_batch shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         const ssa_batch_path = std.fmt.bufPrint(&path_buf, "{s}/sigmoid_scale_acc_batch.spv", .{shader_dir}) catch unreachable;
         const pipeline_sigmoid_scale_acc_batch = pipeline_mod.createFromSpirvWithOptions(instance, ssa_batch_path, 3, @sizeOf(SigmoidScaleAccBatchPush), &.{}, push_options, allocator) catch |err| blk: {
             log.warn("sigmoid_scale_acc_batch shader not loaded: {s}", .{@errorName(err)});
@@ -923,6 +944,7 @@ pub const ElementwiseDispatch = struct {
             .pipeline_sigmoid_scale_acc = pipeline_sigmoid_scale_acc,
             .pipeline_moe_weighted_acc = pipeline_moe_weighted_acc,
             .pipeline_moe_weighted_acc_batch = pipeline_moe_weighted_acc_batch,
+            .pipeline_moe_weighted_acc_scaled_batch = pipeline_moe_weighted_acc_scaled_batch,
             .pipeline_sigmoid_scale_acc_batch = pipeline_sigmoid_scale_acc_batch,
             .pipeline_kv_cache_write = pipeline_kv_cache_write,
             .pipeline_kv_cache_write_batched = pipeline_kv_cache_write_batched,
@@ -1454,6 +1476,7 @@ pub const ElementwiseDispatch = struct {
         if (self.pipeline_sigmoid_scale_acc) |*p| p.deinit();
         if (self.pipeline_moe_weighted_acc) |*p| p.deinit();
         if (self.pipeline_moe_weighted_acc_batch) |*p| p.deinit();
+        if (self.pipeline_moe_weighted_acc_scaled_batch) |*p| p.deinit();
         if (self.pipeline_sigmoid_scale_acc_batch) |*p| p.deinit();
         if (self.pipeline_kv_cache_write) |*p| p.deinit();
         if (self.pipeline_kv_cache_write_batched) |*p| p.deinit();

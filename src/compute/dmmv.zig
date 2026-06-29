@@ -477,6 +477,8 @@ pub const DmmvDispatch = struct {
     pipeline_mxfp4_moe: ?Pipeline,
     /// MoE Q5_1 pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_q5_1_moe: ?Pipeline,
+    /// Grouped Gemma Q5_1 MoE down DMMV over route-packed token columns.
+    pipeline_q5_1_moe_cols: ?Pipeline,
     /// Q5_1 DMMV fused with scaled accumulation. Used by Gemma CPU-routed
     /// MoE to fold down projection + weighted accumulation into one dispatch.
     pipeline_q5_1_acc: ?Pipeline,
@@ -1174,6 +1176,14 @@ pub const DmmvDispatch = struct {
             log.warn("Q5_1 MoE shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const q5_1_moe_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1_moe_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5_1_moe_cols = pipeline_mod.createFromSpirvWithOptions(instance, q5_1_moe_cols_path, 6, moe_cols_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_1 grouped MoE cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_q5_1_moe_cols != null) {
+            log.info("dmmv_q5_1_moe_cols pipeline loaded (grouped Gemma Q5_1 MoE prefill)", .{});
+        }
 
         const q6k_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_moe.spv", .{shader_dir}) catch unreachable;
         const pipeline_q6k_moe = pipeline_mod.createFromSpirvWithOptions(instance, q6k_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
@@ -2067,6 +2077,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q5k_moe_fused_down_acc = pipeline_q5k_moe_fused_down_acc,
             .pipeline_mxfp4_moe = pipeline_mxfp4_moe,
             .pipeline_q5_1_moe = pipeline_q5_1_moe,
+            .pipeline_q5_1_moe_cols = pipeline_q5_1_moe_cols,
             .pipeline_q5_1_acc = pipeline_q5_1_acc,
             .pipeline_q5_1_moe_fused_down_acc = pipeline_q5_1_moe_fused_down_acc,
             .pipeline_q5_1_moe_fused_down_acc_scaled = pipeline_q5_1_moe_fused_down_acc_scaled,
@@ -2389,7 +2400,7 @@ pub const DmmvDispatch = struct {
     /// paired with its byte size.
     /// @param cmd Command buffer to record into.
     /// @param push_desc_fn Optional push-descriptor function (null uses bound descriptor sets).
-    /// @param quant_type Weight quantization; only `q4_k` and `q5_k` are supported here.
+    /// @param quant_type Weight quantization; supports K-quant columns plus Gemma Q5_1 down rows.
     /// @param indirect_buf Buffer holding the `VkDispatchIndirectCommand` workgroup dims.
     /// @param indirect_offset Byte offset of the dispatch args within `indirect_buf`.
     /// @param M Output rows (expert weight rows).
@@ -2398,8 +2409,8 @@ pub const DmmvDispatch = struct {
     /// @param ids_stride Per-token stride into the packed IDs buffer.
     /// @param x_route_divisor Divisor mapping output rows back to source activation rows.
     /// @param accumulate When true, add into `y_buf` instead of overwriting it.
-    /// @returns `error.UnsupportedQuantType` for non-q4_k/q5_k weights, or
-    ///   `error.InvalidArgument` on zero M/K/ids_stride or K not 256-aligned.
+    /// @returns `error.UnsupportedQuantType` for unsupported weights, or
+    ///   `error.InvalidArgument` on zero M/K/ids_stride or incompatible K alignment.
     pub fn recordMoeColsDispatchIndirect(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
@@ -2432,10 +2443,13 @@ pub const DmmvDispatch = struct {
         const pip = switch (quant_type) {
             .q4_k => if (self.pipeline_q4k_moe_cols) |*p| p else return error.UnsupportedQuantType,
             .q5_k => if (self.pipeline_q5k_moe_cols) |*p| p else return error.UnsupportedQuantType,
+            .q5_1 => if (self.pipeline_q5_1_moe_cols) |*p| p else return error.UnsupportedQuantType,
             else => return error.UnsupportedQuantType,
         };
         if (M == 0 or K == 0 or ids_stride == 0) return error.InvalidArgument;
-        if ((K & 255) != 0) return error.InvalidArgument;
+        if (quant_type == .q5_1) {
+            if ((K & 31) != 0) return error.InvalidArgument;
+        } else if ((K & 255) != 0) return error.InvalidArgument;
         const push = MoeColsDmmvPushConstants{
             .M = M,
             .K = K,
@@ -2570,10 +2584,13 @@ pub const DmmvDispatch = struct {
         const pip = switch (quant_type) {
             .q4_k => if (self.pipeline_q4k_moe_cols) |*p| p else return error.UnsupportedQuantType,
             .q5_k => if (self.pipeline_q5k_moe_cols) |*p| p else return error.UnsupportedQuantType,
+            .q5_1 => if (self.pipeline_q5_1_moe_cols) |*p| p else return error.UnsupportedQuantType,
             else => return error.UnsupportedQuantType,
         };
         if (M == 0 or K == 0 or active_block_count == 0 or ids_stride == 0) return error.InvalidArgument;
-        if ((K & 255) != 0) return error.InvalidArgument;
+        if (quant_type == .q5_1) {
+            if ((K & 31) != 0) return error.InvalidArgument;
+        } else if ((K & 255) != 0) return error.InvalidArgument;
         const push = MoeColsDmmvPushConstants{
             .M = M,
             .K = K,
@@ -5179,6 +5196,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5k_moe) |*p| p.deinit();
         if (self.pipeline_q5k_moe_kpar) |*p| p.deinit();
         if (self.pipeline_q5k_moe_cols) |*p| p.deinit();
+        if (self.pipeline_q5_1_moe_cols) |*p| p.deinit();
         if (self.pipeline_q5_1_acc) |*p| p.deinit();
         if (self.pipeline_q5_1_moe_fused_down_acc) |*p| p.deinit();
         if (self.pipeline_q5_1_moe_fused_down_acc_scaled) |*p| p.deinit();

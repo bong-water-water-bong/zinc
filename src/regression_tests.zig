@@ -206,6 +206,44 @@ test "Vulkan Gemma prefill top-k cap can be tested without decode top-k cap" {
     try expectContainsNear(src, "Gemma non-terminal prefill MoE top-k cap disabled by default on RDNA", "ZINC_GEMMA_MOE_PREFILL_TOPK", 200);
 }
 
+test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate" {
+    const src = @embedFile("compute/forward.zig");
+    const marker = "fn prefillGemmaGroupedMoeExact";
+    try expectContains(src, "ZINC_GEMMA_MOE_GROUPED_PREFILL");
+    try expectContains(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm");
+    try expectContainsNear(src, marker, "try self.prefillGemmaRunBatchedAttentionToFfnNorm", 18000);
+    try expectContainsNear(src, marker, "try self.ensureGemmaMoePrefillDp4aScratchCapacity", 4200);
+    try expectContainsNear(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm", "try self.dispatchGemmaQkvProjectionsBatched", 9000);
+    try expectContainsNear(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm", "try self.dispatchFlashAttnBatched", 22000);
+    try expectContains(src, "fn gemmaProjectionPrefillPaddedTokenCount");
+    try expectContainsNear(src, "fn gemmaDenseProjectionDp4aEnabled", "cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()", 900);
+    try expectContainsNear(src, "fn gemmaDenseGegluDp4aEnabled", "cfg.n_experts != 0 and !gemmaGroupedMoePrefillEnvEnabled()", 900);
+    try expectContainsNear(src, marker, "const scratch_route_ids = scratch_shared_up;", 2600);
+    try expectContainsNear(src, marker, "if (scratch_route_ids.size < route_pack_ids_bytes) return error.BufferTooSmall;", 11200);
+    try expectContainsNear(src, marker, "scratch_route_ids.handle", 15500);
+    try expectContainsNear(src, marker, "try self.dispatchMoeWeightedAccScaledBatch", 20000);
+    try expectContainsNear(src, marker, "const enable_gpu_phase_timing =", 9200);
+    try expectContainsNear(src, marker, "self.resetTimestamps();", 13600);
+    try expectContainsNear(src, "fn prefillBatchedImpl", "return self.prefillGemmaGroupedMoeExact(state, prompt_tokens);", 1800);
+}
+
+test "Vulkan Gemma grouped MoE prefill wires Q5_1 route-column down projection" {
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_q5_1_moe_cols");
+    try expectContains(dmmv, "dmmv_q5_1_moe_cols.spv");
+    try expectContainsNear(dmmv, "recordMoeColsDispatchIndirect", ".q5_1 => if (self.pipeline_q5_1_moe_cols)", 1800);
+
+    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    defer std.testing.allocator.free(build);
+    try expectContains(build, "\"dmmv_q5_1_moe_cols\"");
+    try expectContains(build, "\"moe_weighted_acc_scaled_batch\"");
+
+    const q5_cols = @embedFile("shaders/dmmv_q5_1_moe_cols.comp");
+    try expectContains(q5_cols, "Q5_1_BYTES = 24u");
+    try expectContains(q5_cols, "const float w0 = d * float(lo | (bit_lo << 4)) + m;");
+    try expectContains(q5_cols, "x_route_divisor");
+}
+
 test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContains(src, "const spec_k_17408_n40_bk2 = [_]pipeline_mod.SpecConst{");

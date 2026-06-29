@@ -1,5 +1,5 @@
 const std = @import("std");
-const gguf = @import("../src/model/gguf.zig");
+const gguf = @import("gguf");
 
 fn printTensor(gf: *const gguf.GGUFFile, name: []const u8) void {
     if (gf.findTensor(name)) |t| {
@@ -111,6 +111,9 @@ pub fn main() !void {
         "blk.0.ffn_gate.weight",
         "blk.0.ffn_up.weight",
         "blk.0.ffn_down.weight",
+        "blk.0.ffn_gate_shexp.weight",
+        "blk.0.ffn_up_shexp.weight",
+        "blk.0.ffn_down_shexp.weight",
         "blk.0.ffn_gate_inp.weight",
         "blk.0.ffn_gate_up_exps.weight",
         "blk.0.ffn_down_exps.weight",
