@@ -32,6 +32,7 @@ import {
   intelZincCommand,
   rdnaZincCommand,
   resolveLocalLlamaServer,
+  rdnaDpmHighScript,
   summarizeValues,
   validateZincBackend,
 } from "./performance_suite.mjs";
@@ -112,6 +113,17 @@ test("parseArgs reads RDNA backend and device options", () => {
   expect(args.rdnaVkDevice).toBe(1);
   expect(args.requireRdnaDeviceSubstring).toBe("GFX1201");
   expect(args.rdnaWorkdir).toBe("/root/zinc-bench");
+});
+
+test("RDNA DPM high script targets AMD memory-clock controls safely", () => {
+  const script = rdnaDpmHighScript();
+  expect(script).toContain("/sys/class/drm/card*/device");
+  expect(script).toContain("pp_dpm_mclk");
+  expect(script).toContain("power_dpm_force_performance_level");
+  expect(script).toContain("echo high");
+  expect(script).toContain("2>/dev/null || true");
+  expect(script).not.toContain("do;");
+  expect(script).not.toContain("then;");
 });
 
 test("parseArgs rejects invalid RDNA backend", () => {
@@ -265,6 +277,11 @@ test("RDNA ZINC command preserves chat prompt mode", () => {
   expect(cmd).toContain("./zig-out/bin/zinc");
   expect(cmd).toContain("--chat");
   expect(cmd).toContain("--prompt");
+  expect(cmd).toContain("pp_dpm_mclk");
+  expect(cmd).toContain("power_dpm_force_performance_level");
+  expect(cmd).toContain("done; true && cd");
+  expect(cmd).not.toContain("do;");
+  expect(cmd).not.toContain("then;");
 });
 
 test("Intel ZINC command does not inject RDNA-specific environment", () => {

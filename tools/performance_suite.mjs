@@ -1026,6 +1026,14 @@ async function stopProcess(child, graceMs = 5000) {
   }
 }
 
+export function rdnaDpmHighScript() {
+  return "for c in /sys/class/drm/card*/device; do if [ -f \"$c/pp_dpm_mclk\" ] && grep -q amdgpu \"$c/uevent\" 2>/dev/null; then levels=$(awk 'END { print NR }' \"$c/pp_dpm_mclk\" 2>/dev/null || printf 0); if [ \"${levels:-0}\" -ge 5 ]; then echo high > \"$c/power_dpm_force_performance_level\" 2>/dev/null || true; fi; fi; done; true";
+}
+
+async function lockRdnaDpmHigh(creds, timeoutMs = 30000) {
+  await runShell(rdnaRemoteCommand(rdnaDpmHighScript(), creds), { cwd: ROOT, timeoutMs }).catch(() => {});
+}
+
 function detectLocalLlamaServer(args) {
   return resolveLocalLlamaServer(args);
 }
@@ -1162,17 +1170,7 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targ
   // Card discovery: the discrete GPU is whichever card1/card2 has
   // amdgpu driver + a 6-level pp_dpm_mclk; we just try both.
   if (lockDpm) {
-    const dpmLockScript = [
-      "for c in /sys/class/drm/card*/device; do",
-      "  if [ -f \"$c/pp_dpm_mclk\" ] && grep -q amdgpu \"$c/uevent\" 2>/dev/null; then",
-      "    levels=$(wc -l < \"$c/pp_dpm_mclk\")",
-      "    if [ \"$levels\" -ge 5 ]; then",
-      "      echo high > \"$c/power_dpm_force_performance_level\" 2>/dev/null || true",
-      "    fi",
-      "  fi",
-      "done",
-    ].join(" ");
-    await runShell(rdnaRemoteCommand(dpmLockScript, creds), { cwd: ROOT, timeoutMs: 30000 }).catch(() => {});
+    await lockRdnaDpmHigh(creds);
   }
 
   const cmd = [
@@ -1313,10 +1311,9 @@ function rdnaSshTransport(creds) {
 }
 
 export function remoteZincCommand(caseDef, creds) {
-  const parts = [
-    `cd ${shellQuote(creds.workdir)}`,
-    "&&",
-  ];
+  const parts = [];
+  if (creds.commandPrelude) parts.push(creds.commandPrelude, "&&");
+  parts.push(`cd ${shellQuote(creds.workdir)}`, "&&");
   const envPrefix = remoteEnvPrefix(creds);
   if (envPrefix) parts.push(envPrefix);
   parts.push(
@@ -1333,7 +1330,11 @@ export function remoteZincCommand(caseDef, creds) {
 }
 
 export function rdnaZincCommand(caseDef, creds) {
-  return remoteZincCommand(caseDef, { ...creds, env: { RADV_PERFTEST: "coop_matrix", ...(creds.env ?? {}) } });
+  return remoteZincCommand(caseDef, {
+    ...creds,
+    commandPrelude: rdnaDpmHighScript(),
+    env: { RADV_PERFTEST: "coop_matrix", ...(creds.env ?? {}) },
+  });
 }
 
 export function intelZincCommand(caseDef, creds) {
@@ -2436,6 +2437,10 @@ async function runRdnaTarget(args) {
           let zinc = null;
           try {
             await verifyRdnaZincBackend(args, creds, { quiet: true });
+            // The baseline server path pins RDNA DPM high before launch; do
+            // the same for one-shot ZINC CLI runs so short-prefill scenarios
+            // are not measured at idle memory clocks.
+            await lockRdnaDpmHigh(creds);
             const zincRows = await runSeries({
               label: `zinc ${entry.id} ${scenarioDef.id}`,
               warmupRuns: args.warmupRuns,

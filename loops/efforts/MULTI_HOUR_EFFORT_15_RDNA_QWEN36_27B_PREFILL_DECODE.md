@@ -325,6 +325,14 @@ reason the prior failure mode no longer applies.
 | Layer-major dense segment lower-bound additions | layer-1 extension measured old 4-62 override at `50.16 tok/s` vs new layer-1 schedule at `50.07 tok/s`; earlier prefix/layer-depth sweeps were flat or worse | rejected unless a new profile proves lower layers are hot |
 | Partial hidden scratch copy fused with first attention RMS norm at segment handoff (`ZINC_QWEN36_27B_PARTIAL_ATTN_NORM_STORE`) | OFF median `49.96 tok/s` `[51.32, 49.82, 49.96]`; ON median `49.53 tok/s` `[49.53, 49.42, 49.62]`; also moved attention RMS outside the normal phase timer | rejected |
 | Branchless full-tile Q6_K GEMM (`mul_mm_q6k_full.comp`) and Q4_K gate/up/SwiGLU (`mul_mm_q4k_gate_up_swiglu_full.comp`) for dense prefill (cyc43/cyc44) | reported `73.98`→`79.63 tok/s`, but the new shaders were never added to `shader_sources` in `build.zig`; clean builds ran fallback kernels. When the install was actually wired (cyc47) the number fell to `63.71 tok/s` | rejected as stale-shader artifact; delete the orphan `.comp` files or re-measure honestly with them installed |
+| Dense gate/up Q8 output interleaved by K-block for exact 64-token dense-down | enabled with `ZINC_QWEN36_27B_INTERLEAVED_DOWN=1`; profiled `64 tokens in 472.1 ms (135.57 tok/s)`, with dense down around `224 ms` vs roughly `105 ms` default | rejected; worse activation layout for current dense-down kernels |
+| Disabling the BM64 exact dense-down accumulate sibling | enabled with `ZINC_QWEN36_27B_BM64_DOWN_ACC=0`; profiled `64 tokens in 371.5 ms (172.29 tok/s)` during one run, but dense down split was worse (`q4=57.0 ms`, `q6=55.3 ms`) than default | rejected; do not use as a keep without full-suite evidence |
+| Dense-down residual accumulation opt-out | enabled with `ZINC_QWEN36_27B_DENSE_DOWN_ACC=0`; clean profile showed `149.15 tok/s` and added `4.7 ms` residual_acc, vs default `175.43 tok/s` profile in the same build | rejected; fused residual write is faster despite read-modify-write |
+| Forcing DP4a pipelines to request subgroup 32 | enabled with `ZINC_DP4A_WAVE32=1`; one stale/profile run looked promising, but clean rebuild profile fell to `152.60 tok/s` and quick steady samples stayed near `150-153 tok/s` | rejected for this metric unless a later shaderstats run explains and fixes the instability |
+| Low-register MMQ64-style exact dense-down shader | enabled with `ZINC_QWEN36_27B_MMQ64_DOWN=1`; clean exact-prompt samples were `145.49, 141.22, 146.63 tok/s` vs current default steady `151.50, 151.42 tok/s`; adding `ZINC_DP4A_WAVE32=1` still settled around `148.06, 143.89 tok/s` | rejected; lower per-lane register footprint did not offset worse memory/reuse behavior |
+| RDNA DPM pre-command lock as a speed lever | fixed the suite shell prelude, but the active RDNA card exposed only one memory-clock line and remained at `auto`; suite artifact `/private/tmp/zinc-rdna1-qwen36-27b-command-dpm-suite-r3w1-20260628221155.json` measured `decode-extended=141.85 tok/s` vs accepted `146.95 tok/s` | keep the harness hardening only; do not treat DPM locking as a performance win on this node |
+| Prefix-depth retune for exact 64-token prompt | swept `ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS={1,2,3,4,5,6,8,12}`; steady samples stayed near `149-153 tok/s` for 1-3 and got worse after 4 (`~146`, `~142`, `~137 tok/s`) | rejected; default prefix split remains best-enough for this metric |
+| Disabling default-on layer-major / DP4a gates for exact 64-token prompt | default steady `~149-151 tok/s`; `ZINC_QWEN_DENSE_FFN_DP4A=0` fell to `~89 tok/s`, `ZINC_QWEN36_27B_DP4A_DOWN=0` to `~74 tok/s`, `ZINC_QWEN36_27B_SSM_BATCHED_DELTA=0` to `~69 tok/s`, `ZINC_QWEN36_27B_DENSE_PREFILL=0` to `~26 tok/s` | rejected; the accepted layer-major/DP4a structure is still mandatory |
 
 Rejected matrix details:
 
@@ -369,6 +377,42 @@ Each cell is `prefill tok/s / decode tok/s`.
   measurement-backed dense subphase work: shaderstats for the current
   fused Q4_K gate/up/SwiGLU path and Q6_K batched down/kpar path, then
   one code change tied to the top subphase.
+
+2026-06-28 live session notes:
+
+- Current accepted comparison artifact for `decode-extended` prefill:
+  baseline median `252.70 tok/s` vs ZINC median `146.95 tok/s`.
+- Clean current quick samples after rebuilding on RDNA for the exact
+  64-token prompt: `178.04, 149.87, 150.80, 153.04, 151.51 tok/s`.
+  Treat the first sample as warm cache/setup outlier; steady state remains
+  around `150-153 tok/s`, not a pass.
+- Current clean profile for the same prompt: `64 tokens in 364.8 ms
+  (175.43 tok/s)`, with GPU phase totals `dense_ffn=176.2 ms`,
+  `ssm=121.0 ms`, `attn=22.6 ms`, `tail=2.2 ms`.
+- Dense subphases remain split roughly `gateup=70.6 ms`, `down=105.5 ms`.
+  SSM projection remains `proj=69.7 ms` (`qkv=56.6 ms`, `z=7.6 ms`,
+  `out=24.3 ms`). The next target must remove substantial projection
+  matmul time; residual-add and layout micro-switches are too small or
+  negative.
+- A K=5120 BM64/BN64 exact SSM projection specialization moved the profile
+  only slightly (`~368.9 ms` to `~362-365 ms` depending on run) and did not
+  materially move steady `decode-extended` prefill. Keep only if a full
+  suite later proves it, otherwise treat it as diagnostic.
+- Reference-code inspection of the Vulkan path showed the closest analogue
+  uses the Q8_1 integer-dot MMQ route for quantized activations and a
+  medium tile for this exact `M=5120,N=64,K=17408` dense-down shape. A local
+  low-register MMQ64 approximation did not reproduce the win, so the next
+  attempt needs shaderstats or a closer instruction/layout match before
+  spending more cycles on dense-down tile shape changes.
+- RADV shaderstats on the exact dense-down kernels showed no spills but high
+  register pressure: Q6_K BM64 accumulate reported `SGPRs=128`, `VGPRs=228`,
+  `LDS=19456`, and Q4_K BM64 accumulate reported `SGPRs=128`, `VGPRs=192`,
+  `LDS=16384`. Since the low-register MMQ64 approximation was slower, do not
+  assume VGPR reduction alone is enough; preserve exact A/B evidence.
+- The `decode-extended` gap remains unresolved after harness/DPM checks:
+  reference prefill median `252.70 tok/s`, current ZINC suite median
+  `141.85-146.95 tok/s`, and manual exact-prompt steady samples mostly
+  `~149-153 tok/s` with occasional first-run/cache outliers around `178-181`.
 
 ## Measurement contract
 
