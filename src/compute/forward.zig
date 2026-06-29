@@ -13076,25 +13076,47 @@ pub const InferenceEngine = struct {
                 }
 
                 const down_matmul_phase = self.beginProfilePhase();
-                try self.dmmv.recordMulMmQ4KFullDp4a(
-                    &self.decode_cmd,
-                    push_fn,
-                    down_t.gpu_buffer.handle,
-                    down_t.gpu_buffer.size,
-                    packed_act.handle,
-                    packed_act.size,
-                    scale_dsum.handle,
-                    scale_dsum.size,
-                    down_buf.handle,
-                    down_buf.size,
-                    hidden_dim,
-                    dp4a_cols,
-                    inter_dim,
-                    0,
-                    0,
-                    false,
-                );
-                if (dp4a_tail_cols > 0) {
+                const use_ragged72 = q4_ragged_tail_cols > 0 and
+                    self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k21504_n72 != null;
+                if (use_ragged72) {
+                    try self.dmmv.recordMulMmQ4KRagged72Dp4a(
+                        &self.decode_cmd,
+                        push_fn,
+                        down_t.gpu_buffer.handle,
+                        down_t.gpu_buffer.size,
+                        packed_act.handle,
+                        packed_act.size,
+                        scale_dsum.handle,
+                        scale_dsum.size,
+                        down_buf.handle,
+                        down_buf.size,
+                        hidden_dim,
+                        n_tokens,
+                        inter_dim,
+                        0,
+                        0,
+                    );
+                } else {
+                    try self.dmmv.recordMulMmQ4KFullDp4a(
+                        &self.decode_cmd,
+                        push_fn,
+                        down_t.gpu_buffer.handle,
+                        down_t.gpu_buffer.size,
+                        packed_act.handle,
+                        packed_act.size,
+                        scale_dsum.handle,
+                        scale_dsum.size,
+                        down_buf.handle,
+                        down_buf.size,
+                        hidden_dim,
+                        dp4a_cols,
+                        inter_dim,
+                        0,
+                        0,
+                        false,
+                    );
+                }
+                if (!use_ragged72 and dp4a_tail_cols > 0) {
                     if (q4_ragged_tail_cols > 0) {
                         try self.dmmv.recordMulMmQ4KTail8Dp4a(
                             &self.decode_cmd,
@@ -22259,8 +22281,11 @@ pub const InferenceEngine = struct {
     }
 
     fn gemmaGroupedMoePrefillEnvEnabled() bool {
-        const env = std.posix.getenv("ZINC_GEMMA_MOE_GROUPED_PREFILL") orelse return false;
-        return std.mem.eql(u8, env, "1");
+        const env = std.posix.getenv("ZINC_GEMMA_MOE_GROUPED_PREFILL") orelse return true;
+        if (std.mem.eql(u8, env, "0")) return false;
+        if (std.ascii.eqlIgnoreCase(env, "false")) return false;
+        if (std.ascii.eqlIgnoreCase(env, "off")) return false;
+        return true;
     }
 
     fn gemmaGroupedMoePrefillEnabled(self: *const InferenceEngine, prompt_len: usize) bool {
@@ -22309,8 +22334,8 @@ pub const InferenceEngine = struct {
     ///   - K/V cache entries are populated for [base_token, base_token+n_tokens)
     ///
     /// This mirrors the Gemma attention segment in the dense batched prefill
-    /// path, but leaves the command buffer open before any FFN work so the
-    /// caller can append Gemma's exact top-k grouped MoE and submit once.
+    /// path, but stops before any FFN work so the caller can run Gemma's
+    /// exact top-k grouped MoE.
     fn prefillGemmaRunBatchedAttentionToFfnNorm(
         self: *InferenceEngine,
         state: *DecodeState,
@@ -22691,6 +22716,12 @@ pub const InferenceEngine = struct {
         self.endProfilePhase(.attention_post_norm, attention_post_norm_phase);
         self.endProfilePhase(.attention, attention_phase);
 
+        self.decode_cmd.computeToTransferBarrier();
+        _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        try self.decode_cmd.end();
+        try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+        self.recordProfilingSample();
+
         state.position = base_token + n_tokens - 1;
     }
 
@@ -22923,6 +22954,11 @@ pub const InferenceEngine = struct {
             const up_base_offset = expertSliceBytes(gate_up.info.type_, inter_dim, hidden_dim);
             const expert_down_row_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
 
+            try self.decode_cmd.reset();
+            try self.decode_cmd.beginOneTime();
+            self.resetTimestamps();
+            _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            self.decode_cmd.transferToComputeBarrier();
             const moe_phase = self.beginProfilePhase();
 
             const router_phase = self.beginProfilePhase();

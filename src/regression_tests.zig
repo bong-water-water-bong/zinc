@@ -211,6 +211,8 @@ test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate"
     const marker = "fn prefillGemmaGroupedMoeExact";
     try expectContains(src, "ZINC_GEMMA_MOE_GROUPED_PREFILL");
     try expectContains(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm");
+    try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnvEnabled", "orelse return true", 200);
+    try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnvEnabled", "std.ascii.eqlIgnoreCase(env, \"off\")", 500);
     try expectContainsNear(src, marker, "try self.prefillGemmaRunBatchedAttentionToFfnNorm", 18000);
     try expectContainsNear(src, marker, "try self.ensureGemmaMoePrefillDp4aScratchCapacity", 4200);
     try expectContainsNear(src, "fn ensureGemmaMoePrefillDp4aScratchCapacity", "batched_scratch_norm_q8_scale", 2400);
@@ -229,8 +231,7 @@ test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate"
     try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_shared_norm", 26000);
     try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_swiglu", 30000);
     try expectContainsNear(src, marker, "const enable_gpu_phase_timing =", 9200);
-    try expectContainsNear(src, "leaves the command buffer open", "fn prefillGemmaRunBatchedAttentionToFfnNorm", 400);
-    try expectContainsNear(src, marker, "try self.decode_cmd.submitAndWait(self.instance.compute_queue);", 31000);
+    try expectContainsNear(src, marker, "self.resetTimestamps();", 13600);
     try expectContainsNear(src, "fn prefillBatchedImpl", "return self.prefillGemmaGroupedMoeExact(state, prompt_tokens);", 1800);
 }
 
@@ -329,6 +330,25 @@ test "Vulkan Qwen SSM DP4a keeps BN40 and BN64 specializations" {
     try expectContains(q6_q8_1, "const bool col_ok = SPEC_RAGGED_N == 0u || col_global < N;");
     try expectContains(q6_q8_1, "col_ok ? b_packed[src + p] : 0u");
     try expectContains(q6_q8_1, "if (SPEC_RAGGED_N == 0u || col_g < N)");
+}
+
+test "Vulkan Gemma dense-down DP4a keeps K21504 short-prompt specializations" {
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n64");
+    try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n72");
+    try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k21504_n64");
+    try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k21504_n72");
+    try expectContains(dmmv, "const pipeline_mul_mm_q6k_full_dp4a_k21504_n64");
+    try expectContains(dmmv, "const pipeline_mul_mm_q4k_full_dp4a_k21504_n72");
+    try expectContains(dmmv, "K == 21504 and N == 64");
+    try expectContains(dmmv, "pub fn recordMulMmQ4KRagged72Dp4a(");
+    try expectContainsNear(dmmv, "pub fn recordMulMmQ4KRagged72Dp4a(", "if (N <= 64 or N > 72) return error.InvalidArgument;", 1200);
+
+    const forward = @embedFile("compute/forward.zig");
+    try expectContains(forward, "const use_ragged72 = q4_ragged_tail_cols > 0");
+    try expectContains(forward, "self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k21504_n72 != null");
+    try expectContains(forward, "try self.dmmv.recordMulMmQ4KRagged72Dp4a(");
+    try expectContains(forward, "if (!use_ragged72 and dp4a_tail_cols > 0)");
 }
 
 test "Vulkan full-DP4a wide shaders load every activation half tile safely" {
