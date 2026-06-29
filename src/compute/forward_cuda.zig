@@ -676,6 +676,14 @@ pub const ForwardCuda = struct {
     // with the decode ssm_delta_net_seq kernel). Set by prefillBatchedSlot so
     // the batched prefill's SSM state is bit-compatible with subsequent decode.
     force_block_ssm: bool = false,
+
+    // Lazy fp16 weight cache for prefill GEMMs. Keyed by weight device-ptr.
+    // On first prefill call, each Q4_K weight is dequanted to fp16 once and
+    // cached. Subsequent calls hit the cache → skip the dequant kernel entirely
+    // → cuBLAS runs at full fp16 TC throughput (no DRAM round-trip).
+    // Decode path is unaffected (uses original Q4_K weights for dmmv).
+    // Opt-in via ZINC_PRE_DEQUANT=1. VRAM cost: ~3.5× the Q4_K weight bytes.
+    w_f16_cache: ?std.AutoHashMap(usize, buffer.CudaBuffer) = null,
     serve_wcache_cap: usize = 24 * 1024 * 1024 * 1024,
 
     // Effort 28 inc 4 — per-SEQUENCE slot state for batched decode (null until
@@ -998,6 +1006,11 @@ pub const ForwardCuda = struct {
         }
         if (self.batch_graph_on) {
             log.info("ZINC_BATCH_GRAPH: batched decode will replay via per-B captured CUDA graphs (moe_capturable={})", .{self.moe_graph_capturable});
+        }
+
+        if (std.posix.getenv("ZINC_PRE_DEQUANT") != null) {
+            self.w_f16_cache = std.AutoHashMap(usize, buffer.CudaBuffer).init(allocator);
+            log.info("ZINC_PRE_DEQUANT: lazy fp16 cache enabled (first prefill dequants, subsequent hit cache)", .{});
         }
 
         return self;
@@ -1828,22 +1841,67 @@ pub const ForwardCuda = struct {
         const idx = dmmvIdx(w.info.type_);
         if (self.use_cublas and T >= self.cublas_min_t and (idx == 0 or (idx == 1 and self.use_cublas_q5) or (idx == 2 and self.use_cublas_q6) or (idx == 3 and self.use_cublas_q8))) {
             const b = &self.batch.?;
-            if (idx == 0) {
-                const dq = DequantQ4KPush{ .M = M, .K = K };
-                cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ4KPush), 0);
-            } else if (idx == 1) {
-                const dq = DequantQ5KPush{ .M = M, .K = K };
-                cmd.dispatch(&self.pipes.dequant_q5k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ5KPush), 0);
-            } else if (idx == 2) {
-                const dq = DequantQ6KPush{ .M = M, .K = K };
-                cmd.dispatch(&self.pipes.dequant_q6k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ6KPush), 0);
-            } else {
-                const dq = DequantQ8_0Push{ .M = M, .K = K };
-                cmd.dispatch(&self.pipes.dequant_q8_0_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ8_0Push), 0);
+
+            // Determine fp16 weight source: lazy cache (persistent) or scratch
+            // (per-GEMM dequant round-trip). The cache eliminates the dequant
+            // kernel on 2nd+ prefill calls → ~30% GEMM speedup.
+            var w_f16_handle = b.w_f16.handle; // default: scratch
+            var need_dequant = true;
+
+            if (self.w_f16_cache) |*cache| {
+                const key = @intFromPtr(w.gpu_buffer.handle);
+                if (cache.getPtr(key)) |cached| {
+                    // Cache HIT: use persistent fp16 weight, skip dequant
+                    w_f16_handle = cached.handle;
+                    need_dequant = false;
+                } else {
+                    // Cache MISS: try to allocate persistent buffer + dequant into it
+                    const new_buf = buffer.createBuffer(self.ctx, @as(usize, M) * K * @sizeOf(u16)) catch null;
+                    if (new_buf) |dq_buf| {
+                        if (idx == 0) {
+                            const dq = DequantQ4KPush{ .M = M, .K = K };
+                            cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &dq_buf }, &dq, @sizeOf(DequantQ4KPush), 0);
+                        } else if (idx == 1) {
+                            const dq = DequantQ5KPush{ .M = M, .K = K };
+                            cmd.dispatch(&self.pipes.dequant_q5k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &dq_buf }, &dq, @sizeOf(DequantQ5KPush), 0);
+                        } else if (idx == 2) {
+                            const dq = DequantQ6KPush{ .M = M, .K = K };
+                            cmd.dispatch(&self.pipes.dequant_q6k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &dq_buf }, &dq, @sizeOf(DequantQ6KPush), 0);
+                        } else {
+                            const dq = DequantQ8_0Push{ .M = M, .K = K };
+                            cmd.dispatch(&self.pipes.dequant_q8_0_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &dq_buf }, &dq, @sizeOf(DequantQ8_0Push), 0);
+                        }
+                        cache.put(key, dq_buf) catch {};
+                        if (cache.getPtr(key)) |cached| {
+                            w_f16_handle = cached.handle;
+                            need_dequant = false;
+                        }
+                    }
+                    // else: alloc failed → fall through to scratch dequant below
+                }
             }
+
+            // Scratch dequant (first call or cache alloc failure)
+            if (need_dequant) {
+                if (idx == 0) {
+                    const dq = DequantQ4KPush{ .M = M, .K = K };
+                    cmd.dispatch(&self.pipes.dequant_q4k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ4KPush), 0);
+                } else if (idx == 1) {
+                    const dq = DequantQ5KPush{ .M = M, .K = K };
+                    cmd.dispatch(&self.pipes.dequant_q5k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ5KPush), 0);
+                } else if (idx == 2) {
+                    const dq = DequantQ6KPush{ .M = M, .K = K };
+                    cmd.dispatch(&self.pipes.dequant_q6k_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ6KPush), 0);
+                } else {
+                    const dq = DequantQ8_0Push{ .M = M, .K = K };
+                    cmd.dispatch(&self.pipes.dequant_q8_0_to_f16, .{ ceilDiv(M * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.w_f16 }, &dq, @sizeOf(DequantQ8_0Push), 0);
+                }
+                w_f16_handle = b.w_f16.handle;
+            }
+
             const cvt = F32ToF16Push{ .N = T * K };
             cmd.dispatch(&self.pipes.f32_to_f16, .{ ceilDiv(T * K, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ x, &b.act_f16 }, &cvt, @sizeOf(F32ToF16Push), 0);
-            shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(T), @intCast(K), b.w_f16.handle, b.act_f16.handle, y.handle, 0.0);
+            shim.cuda_cublas_hgemm(self.ctx, @intCast(M), @intCast(T), @intCast(K), w_f16_handle, b.act_f16.handle, y.handle, 0.0);
             return;
         }
         // Fallback: per-token matvec over the token-major buffers (x_offset/y_offset).
