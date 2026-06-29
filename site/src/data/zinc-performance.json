@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-06-29T16:44:34.164Z",
+  "generated_at": "2026-06-29T17:14:35.317Z",
   "targets": [
     {
       "id": "rdna",
@@ -54,7 +54,7 @@
         "average_end_to_end_tps": 87.31672961009471,
         "average_total_latency_ms": 2310.8448163999797,
         "compared_models": 5,
-        "average_pct_of_llama": 107.1014282785364
+        "average_pct_of_llama": 118.30529332165894
       },
       "models": [
         {
@@ -273,7 +273,12 @@
             "zinc_end_to_end_tps": 102.88815095109133,
             "baseline_end_to_end_tps": 118.65898799116844,
             "zinc_overall_tps": 117.6467737180162,
-            "baseline_overall_tps": 152.10183403278538,
+            "baseline_overall_tps": 140.8056766718519,
+            "zinc_overall_seconds": 1.3940033782234127,
+            "baseline_overall_seconds": 1.043992,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 104.30703056249999,
             "delta_tps": 4.392627311580981,
             "delta_pct": 4.307030562499989,
@@ -283,8 +288,8 @@
             "latency_delta_ms": 355.11970799999835,
             "end_to_end_pct_of_baseline": 86.70910876026441,
             "end_to_end_delta_tps": -15.770837040077112,
-            "overall_pct_of_baseline": 77.34737353177319,
-            "overall_delta_tps": -34.45506031476917
+            "overall_pct_of_baseline": 74.89164060208486,
+            "overall_delta_tps": -23.158902953835693
           },
           "scenarios": [
             {
@@ -502,7 +507,12 @@
                 "zinc_end_to_end_tps": 102.88815095109133,
                 "baseline_end_to_end_tps": 118.65898799116844,
                 "zinc_overall_tps": 117.6467737180162,
-                "baseline_overall_tps": 152.10183403278538,
+                "baseline_overall_tps": 140.8056766718519,
+                "zinc_overall_seconds": 1.3940033782234127,
+                "baseline_overall_seconds": 1.043992,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 104.30703056249999,
                 "delta_tps": 4.392627311580981,
                 "delta_pct": 4.307030562499989,
@@ -512,8 +522,8 @@
                 "latency_delta_ms": 355.11970799999835,
                 "end_to_end_pct_of_baseline": 86.70910876026441,
                 "end_to_end_delta_tps": -15.770837040077112,
-                "overall_pct_of_baseline": 77.34737353177319,
-                "overall_delta_tps": -34.45506031476917
+                "overall_pct_of_baseline": 74.89164060208486,
+                "overall_delta_tps": -23.158902953835693
               }
             },
             {
@@ -731,7 +741,12 @@
                 "zinc_end_to_end_tps": 112.25216210477917,
                 "baseline_end_to_end_tps": 194.87755988244933,
                 "zinc_overall_tps": 120.81072263687165,
-                "baseline_overall_tps": 137.0413952188141,
+                "baseline_overall_tps": 135.2734863049734,
+                "zinc_overall_seconds": 3.0709194672656492,
+                "baseline_overall_seconds": 2.6169208,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 103.65116402500001,
                 "delta_tps": 3.68212146118492,
                 "delta_pct": 3.651164025000014,
@@ -741,8 +756,8 @@
                 "latency_delta_ms": 1488.5336259999895,
                 "end_to_end_pct_of_baseline": 57.601379128766794,
                 "end_to_end_delta_tps": -82.62539777767016,
-                "overall_pct_of_baseline": 88.15637234572304,
-                "overall_delta_tps": -16.230672581942457
+                "overall_pct_of_baseline": 85.21619755564967,
+                "overall_delta_tps": -14.462763668101758
               }
             },
             {
@@ -960,7 +975,12 @@
                 "zinc_end_to_end_tps": 118.18532780006223,
                 "baseline_end_to_end_tps": 314.4071847402596,
                 "zinc_overall_tps": 125.4711540001264,
-                "baseline_overall_tps": 147.72168515385079,
+                "baseline_overall_tps": 146.64369248817687,
+                "zinc_overall_seconds": 3.929189971421665,
+                "baseline_overall_seconds": 3.218686,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 102.81590943749998,
                 "delta_tps": 2.827524377481865,
                 "delta_pct": 2.8159094374999825,
@@ -970,8 +990,8 @@
                 "latency_delta_ms": 2670.176625999986,
                 "end_to_end_pct_of_baseline": 37.5898941042643,
                 "end_to_end_delta_tps": -196.22185694019737,
-                "overall_pct_of_baseline": 84.93753227188638,
-                "overall_delta_tps": -22.25053115372438
+                "overall_pct_of_baseline": 81.91729143692716,
+                "overall_delta_tps": -21.172538488050463
               }
             },
             {
@@ -1189,7 +1209,12 @@
                 "zinc_end_to_end_tps": 105.11064723632882,
                 "baseline_end_to_end_tps": 113.53337603358275,
                 "zinc_overall_tps": 111.75578148209276,
-                "baseline_overall_tps": 129.22493830958408,
+                "baseline_overall_tps": 124.0655569751888,
+                "zinc_overall_seconds": 3.0870886089708143,
+                "baseline_overall_seconds": 2.643763571428571,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 103.84983582421876,
                 "delta_tps": 3.8898787834295803,
                 "delta_pct": 3.849835824218758,
@@ -1199,8 +1224,8 @@
                 "latency_delta_ms": 393.23720900001354,
                 "end_to_end_pct_of_baseline": 92.5812751355491,
                 "end_to_end_delta_tps": -8.422728797253939,
-                "overall_pct_of_baseline": 86.4815901202905,
-                "overall_delta_tps": -17.469156827491318
+                "overall_pct_of_baseline": 85.63938086344594,
+                "overall_delta_tps": -12.30977549309604
               }
             }
           ]
@@ -1421,7 +1446,12 @@
             "zinc_end_to_end_tps": 36.57856415560595,
             "baseline_end_to_end_tps": 38.16192689693495,
             "zinc_overall_tps": 38.261250821111375,
-            "baseline_overall_tps": 44.28423312984488,
+            "baseline_overall_tps": 40.62466923366674,
+            "zinc_overall_seconds": 4.286320924707194,
+            "baseline_overall_seconds": 3.6184910000000006,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 85.95503640625,
             "delta_tps": -4.008176499703467,
             "delta_pct": -14.044963593749998,
@@ -1431,8 +1461,8 @@
             "latency_delta_ms": 631.4934579999826,
             "end_to_end_pct_of_baseline": 95.85093607666816,
             "end_to_end_delta_tps": -1.5833627413289975,
-            "overall_pct_of_baseline": 86.39926248451985,
-            "overall_delta_tps": -6.0229823087335035
+            "overall_pct_of_baseline": 84.4195071615452,
+            "overall_delta_tps": -2.3634184125553617
           },
           "scenarios": [
             {
@@ -1650,7 +1680,12 @@
                 "zinc_end_to_end_tps": 36.57856415560595,
                 "baseline_end_to_end_tps": 38.16192689693495,
                 "zinc_overall_tps": 38.261250821111375,
-                "baseline_overall_tps": 44.28423312984488,
+                "baseline_overall_tps": 40.62466923366674,
+                "zinc_overall_seconds": 4.286320924707194,
+                "baseline_overall_seconds": 3.6184910000000006,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 85.95503640625,
                 "delta_tps": -4.008176499703467,
                 "delta_pct": -14.044963593749998,
@@ -1660,8 +1695,8 @@
                 "latency_delta_ms": 631.4934579999826,
                 "end_to_end_pct_of_baseline": 95.85093607666816,
                 "end_to_end_delta_tps": -1.5833627413289975,
-                "overall_pct_of_baseline": 86.39926248451985,
-                "overall_delta_tps": -6.0229823087335035
+                "overall_pct_of_baseline": 84.4195071615452,
+                "overall_delta_tps": -2.3634184125553617
               }
             },
             {
@@ -1879,7 +1914,12 @@
                 "zinc_end_to_end_tps": 43.0346288036314,
                 "baseline_end_to_end_tps": 59.20382396495518,
                 "zinc_overall_tps": 44.86980095132823,
-                "baseline_overall_tps": 36.05726079618048,
+                "baseline_overall_tps": 35.69384889716897,
+                "zinc_overall_seconds": 8.268367412693364,
+                "baseline_overall_seconds": 9.9176752,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 85.24154547500001,
                 "delta_tps": -4.158747658962479,
                 "delta_pct": -14.75845452499999,
@@ -1889,8 +1929,8 @@
                 "latency_delta_ms": 2641.6208329999645,
                 "end_to_end_pct_of_baseline": 72.68893446664038,
                 "end_to_end_delta_tps": -16.169195161323778,
-                "overall_pct_of_baseline": 124.44040384809614,
-                "overall_delta_tps": 8.812540155147751
+                "overall_pct_of_baseline": 119.9472000334028,
+                "overall_delta_tps": 9.17595205415926
               }
             },
             {
@@ -2108,7 +2148,12 @@
                 "zinc_end_to_end_tps": 56.034445418817526,
                 "baseline_end_to_end_tps": 97.04725336634313,
                 "zinc_overall_tps": 57.72083630950348,
-                "baseline_overall_tps": 38.254917735631665,
+                "baseline_overall_tps": 38.03973140339078,
+                "zinc_overall_seconds": 8.541109788439252,
+                "baseline_overall_seconds": 12.408079200000001,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 84.91323750000001,
                 "delta_tps": -4.235716698471187,
                 "delta_pct": -15.086762499999992,
@@ -2118,8 +2163,8 @@
                 "latency_delta_ms": 3934.549626000022,
                 "end_to_end_pct_of_baseline": 57.73934189285441,
                 "end_to_end_delta_tps": -41.0128079475256,
-                "overall_pct_of_baseline": 150.8847482260842,
-                "overall_delta_tps": 19.465918573871818
+                "overall_pct_of_baseline": 145.27478872587324,
+                "overall_delta_tps": 19.6811049061127
               }
             },
             {
@@ -2337,7 +2382,12 @@
                 "zinc_end_to_end_tps": 30.856739381318327,
                 "baseline_end_to_end_tps": 34.16214922418823,
                 "zinc_overall_tps": 31.431569672001608,
-                "baseline_overall_tps": 36.51540513037259,
+                "baseline_overall_tps": 34.978461052831875,
+                "zinc_overall_seconds": 10.976225610116973,
+                "baseline_overall_seconds": 9.377199285714285,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 85.55831597265625,
                 "delta_tps": -4.072986145393227,
                 "delta_pct": -14.441684027343754,
@@ -2347,8 +2397,8 @@
                 "latency_delta_ms": 1579.4322909999755,
                 "end_to_end_pct_of_baseline": 90.3243504348095,
                 "end_to_end_delta_tps": -3.3054098428698993,
-                "overall_pct_of_baseline": 86.07755975808035,
-                "overall_delta_tps": -5.083835458370984
+                "overall_pct_of_baseline": 85.43191092091949,
+                "overall_delta_tps": -3.5468913808302673
               }
             }
           ]
@@ -2569,7 +2619,12 @@
             "zinc_end_to_end_tps": 107.5118218329675,
             "baseline_end_to_end_tps": 91.46790624308495,
             "zinc_overall_tps": 127.41757540623941,
-            "baseline_overall_tps": 110.71632937887517,
+            "baseline_overall_tps": 110.0466732302647,
+            "zinc_overall_seconds": 1.0359638344957567,
+            "baseline_overall_seconds": 1.1904039999999998,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 114.11817722916663,
             "delta_tps": 12.033798054128525,
             "delta_pct": 14.118177229166633,
@@ -2579,8 +2634,8 @@
             "latency_delta_ms": -204.42437600006815,
             "end_to_end_pct_of_baseline": 117.54048632888158,
             "end_to_end_delta_tps": 16.043915589882545,
-            "overall_pct_of_baseline": 115.08471796442237,
-            "overall_delta_tps": 16.701246027364235
+            "overall_pct_of_baseline": 114.90787229840076,
+            "overall_delta_tps": 17.370902175974706
           },
           "scenarios": [
             {
@@ -2798,7 +2853,12 @@
                 "zinc_end_to_end_tps": 107.5118218329675,
                 "baseline_end_to_end_tps": 91.46790624308495,
                 "zinc_overall_tps": 127.41757540623941,
-                "baseline_overall_tps": 110.71632937887517,
+                "baseline_overall_tps": 110.0466732302647,
+                "zinc_overall_seconds": 1.0359638344957567,
+                "baseline_overall_seconds": 1.1904039999999998,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 114.11817722916663,
                 "delta_tps": 12.033798054128525,
                 "delta_pct": 14.118177229166633,
@@ -2808,8 +2868,8 @@
                 "latency_delta_ms": -204.42437600006815,
                 "end_to_end_pct_of_baseline": 117.54048632888158,
                 "end_to_end_delta_tps": 16.043915589882545,
-                "overall_pct_of_baseline": 115.08471796442237,
-                "overall_delta_tps": 16.701246027364235
+                "overall_pct_of_baseline": 114.90787229840076,
+                "overall_delta_tps": 17.370902175974706
               }
             },
             {
@@ -3027,7 +3087,12 @@
                 "zinc_end_to_end_tps": 163.17866831986646,
                 "baseline_end_to_end_tps": 145.738465216975,
                 "zinc_overall_tps": 187.25377845208305,
-                "baseline_overall_tps": 122.77202319656075,
+                "baseline_overall_tps": 119.48244252269427,
+                "zinc_overall_seconds": 1.783675623322433,
+                "baseline_overall_seconds": 2.61963175,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 113.48918233750001,
                 "delta_tps": 11.450851963406421,
                 "delta_pct": 13.489182337500011,
@@ -3037,8 +3102,8 @@
                 "latency_delta_ms": -100.84666699997615,
                 "end_to_end_pct_of_baseline": 111.96678109442593,
                 "end_to_end_delta_tps": 17.440203102891473,
-                "overall_pct_of_baseline": 152.52153835755038,
-                "overall_delta_tps": 64.4817552555223
+                "overall_pct_of_baseline": 146.86704890435408,
+                "overall_delta_tps": 67.77133592938878
               }
             },
             {
@@ -3256,7 +3321,12 @@
                 "zinc_end_to_end_tps": 249.72310798900003,
                 "baseline_end_to_end_tps": 254.6734994474318,
                 "zinc_overall_tps": 284.64208632868724,
-                "baseline_overall_tps": 147.95163428197182,
+                "baseline_overall_tps": 147.2638631848902,
+                "zinc_overall_seconds": 1.5809327629799887,
+                "baseline_overall_seconds": 3.00820575,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 113.86153706249999,
                 "delta_tps": 11.762547261623482,
                 "delta_pct": 13.861537062499991,
@@ -3266,8 +3336,8 @@
                 "latency_delta_ms": 62.51370800007135,
                 "end_to_end_pct_of_baseline": 98.05618116169421,
                 "end_to_end_delta_tps": -4.950391458431767,
-                "overall_pct_of_baseline": 192.3886057157068,
-                "overall_delta_tps": 136.69045204671542
+                "overall_pct_of_baseline": 190.28043573021188,
+                "overall_delta_tps": 137.37822314379704
               }
             },
             {
@@ -3485,7 +3555,12 @@
                 "zinc_end_to_end_tps": 108.62682722717906,
                 "baseline_end_to_end_tps": 96.42977815029596,
                 "zinc_overall_tps": 118.35775654813375,
-                "baseline_overall_tps": 103.15520825248217,
+                "baseline_overall_tps": 102.8716674336357,
+                "zinc_overall_seconds": 2.703667333115277,
+                "baseline_overall_seconds": 3.100951,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 114.14683812109374,
                 "delta_tps": 11.963487612162112,
                 "delta_pct": 14.146838121093737,
@@ -3495,8 +3570,8 @@
                 "latency_delta_ms": -362.2414590000408,
                 "end_to_end_pct_of_baseline": 112.64863334837575,
                 "end_to_end_delta_tps": 12.197049076883104,
-                "overall_pct_of_baseline": 114.73754796601439,
-                "overall_delta_tps": 15.202548295651582
+                "overall_pct_of_baseline": 114.6942511017787,
+                "overall_delta_tps": 15.486089114498057
               }
             }
           ]
@@ -3717,7 +3792,12 @@
             "zinc_end_to_end_tps": 39.149970118651666,
             "baseline_end_to_end_tps": 36.791230808901105,
             "zinc_overall_tps": 41.562904168452455,
-            "baseline_overall_tps": 39.6456074005683,
+            "baseline_overall_tps": 39.409661323599046,
+            "zinc_overall_seconds": 3.1759089659618187,
+            "baseline_overall_seconds": 3.324058,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 104.225906,
             "delta_tps": 1.2946222657925368,
             "delta_pct": 4.225905999999995,
@@ -3727,8 +3807,8 @@
             "latency_delta_ms": -188.98099999997066,
             "end_to_end_pct_of_baseline": 106.41114542213113,
             "end_to_end_delta_tps": 2.358739309750561,
-            "overall_pct_of_baseline": 104.83608877148056,
-            "overall_delta_tps": 1.917296767884153
+            "overall_pct_of_baseline": 104.6647758366498,
+            "overall_delta_tps": 2.153242844853409
           },
           "scenarios": [
             {
@@ -3946,7 +4026,12 @@
                 "zinc_end_to_end_tps": 39.149970118651666,
                 "baseline_end_to_end_tps": 36.791230808901105,
                 "zinc_overall_tps": 41.562904168452455,
-                "baseline_overall_tps": 39.6456074005683,
+                "baseline_overall_tps": 39.409661323599046,
+                "zinc_overall_seconds": 3.1759089659618187,
+                "baseline_overall_seconds": 3.324058,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 104.225906,
                 "delta_tps": 1.2946222657925368,
                 "delta_pct": 4.225905999999995,
@@ -3956,8 +4041,8 @@
                 "latency_delta_ms": -188.98099999997066,
                 "end_to_end_pct_of_baseline": 106.41114542213113,
                 "end_to_end_delta_tps": 2.358739309750561,
-                "overall_pct_of_baseline": 104.83608877148056,
-                "overall_delta_tps": 1.917296767884153
+                "overall_pct_of_baseline": 104.6647758366498,
+                "overall_delta_tps": 2.153242844853409
               }
             },
             {
@@ -4175,7 +4260,12 @@
                 "zinc_end_to_end_tps": 57.32812039351553,
                 "baseline_end_to_end_tps": 56.08495730554087,
                 "zinc_overall_tps": 60.784039785408496,
-                "baseline_overall_tps": 44.08919931439975,
+                "baseline_overall_tps": 42.90568689177462,
+                "zinc_overall_seconds": 5.494863473687353,
+                "baseline_overall_seconds": 7.29507025,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 104.07943402500001,
                 "delta_tps": 1.2428858222045882,
                 "delta_pct": 4.079434025000012,
@@ -4185,8 +4275,8 @@
                 "latency_delta_ms": 245.2920420000446,
                 "end_to_end_pct_of_baseline": 102.21657133694893,
                 "end_to_end_delta_tps": 1.243163087974665,
-                "overall_pct_of_baseline": 137.86605502167995,
-                "overall_delta_tps": 16.694840471008746
+                "overall_pct_of_baseline": 132.7616288363323,
+                "overall_delta_tps": 17.878352893633874
               }
             },
             {
@@ -4404,7 +4494,12 @@
                 "zinc_end_to_end_tps": 88.81861326866286,
                 "baseline_end_to_end_tps": 98.80005696048526,
                 "zinc_overall_tps": 93.16607686863402,
-                "baseline_overall_tps": 52.79059285712778,
+                "baseline_overall_tps": 52.54933676924542,
+                "zinc_overall_seconds": 4.830084244445634,
+                "baseline_overall_seconds": 8.430173,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 103.87297799999999,
                 "delta_tps": 1.1812113737607461,
                 "delta_pct": 3.872977999999989,
@@ -4414,8 +4509,8 @@
                 "latency_delta_ms": 582.702500000014,
                 "end_to_end_pct_of_baseline": 89.89733002298324,
                 "end_to_end_delta_tps": -9.981443691822406,
-                "overall_pct_of_baseline": 176.48234624069912,
-                "overall_delta_tps": 40.375484011506245
+                "overall_pct_of_baseline": 174.534699051974,
+                "overall_delta_tps": 40.6167400993886
               }
             },
             {
@@ -4633,7 +4728,12 @@
                 "zinc_end_to_end_tps": 37.657982775222685,
                 "baseline_end_to_end_tps": 35.824324587247276,
                 "zinc_overall_tps": 38.6079079712109,
-                "baseline_overall_tps": 36.896131124399055,
+                "baseline_overall_tps": 36.797611177522406,
+                "zinc_overall_seconds": 8.288457386466453,
+                "baseline_overall_seconds": 8.669041,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 104.06435549999999,
                 "delta_tps": 1.2357373223725965,
                 "delta_pct": 4.064355499999991,
@@ -4643,8 +4743,8 @@
                 "latency_delta_ms": -407.0299580000574,
                 "end_to_end_pct_of_baseline": 105.11847245998925,
                 "end_to_end_delta_tps": 1.8336581879754092,
-                "overall_pct_of_baseline": 104.63944807936747,
-                "overall_delta_tps": 1.7117768468118442
+                "overall_pct_of_baseline": 104.59173035207941,
+                "overall_delta_tps": 1.8102967936884937
               }
             }
           ]
@@ -4865,7 +4965,12 @@
             "zinc_end_to_end_tps": 150.4551409921571,
             "baseline_end_to_end_tps": 107.20189411442414,
             "zinc_overall_tps": 205.5004106845087,
-            "baseline_overall_tps": 135.34037048576883,
+            "baseline_overall_tps": 134.66241366443154,
+            "zinc_overall_seconds": 0.6423344827405282,
+            "baseline_overall_seconds": 0.972803,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 153.6611468333333,
             "delta_tps": 58.22501781290123,
             "delta_pct": 53.661146833333305,
@@ -4875,8 +4980,8 @@
             "latency_delta_ms": -344.65541700000176,
             "end_to_end_pct_of_baseline": 140.34746515911905,
             "end_to_end_delta_tps": 43.25324687773298,
-            "overall_pct_of_baseline": 151.83969864048603,
-            "overall_delta_tps": 70.16004019873986
+            "overall_pct_of_baseline": 151.44804243569857,
+            "overall_delta_tps": 70.83799702007715
           },
           "scenarios": [
             {
@@ -5094,7 +5199,12 @@
                 "zinc_end_to_end_tps": 150.4551409921571,
                 "baseline_end_to_end_tps": 107.20189411442414,
                 "zinc_overall_tps": 205.5004106845087,
-                "baseline_overall_tps": 135.34037048576883,
+                "baseline_overall_tps": 134.66241366443154,
+                "zinc_overall_seconds": 0.6423344827405282,
+                "baseline_overall_seconds": 0.972803,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 153.6611468333333,
                 "delta_tps": 58.22501781290123,
                 "delta_pct": 53.661146833333305,
@@ -5104,8 +5214,8 @@
                 "latency_delta_ms": -344.65541700000176,
                 "end_to_end_pct_of_baseline": 140.34746515911905,
                 "end_to_end_delta_tps": 43.25324687773298,
-                "overall_pct_of_baseline": 151.83969864048603,
-                "overall_delta_tps": 70.16004019873986
+                "overall_pct_of_baseline": 151.44804243569857,
+                "overall_delta_tps": 70.83799702007715
               }
             },
             {
@@ -5323,7 +5433,12 @@
                 "zinc_end_to_end_tps": 260.52005731441716,
                 "baseline_end_to_end_tps": 183.86771308065315,
                 "zinc_overall_tps": 310.2729941064391,
-                "baseline_overall_tps": 145.12047606468028,
+                "baseline_overall_tps": 142.10446267033808,
+                "zinc_overall_seconds": 1.0764713859866946,
+                "baseline_overall_seconds": 2.202605,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 154.6188643125,
                 "delta_tps": 58.97481809556072,
                 "delta_pct": 54.618864312499994,
@@ -5333,8 +5448,8 @@
                 "latency_delta_ms": -420.2598340000259,
                 "end_to_end_pct_of_baseline": 141.68885496505882,
                 "end_to_end_delta_tps": 76.65234423376401,
-                "overall_pct_of_baseline": 213.80373226459804,
-                "overall_delta_tps": 165.15251804175884
+                "overall_pct_of_baseline": 204.6134275999441,
+                "overall_delta_tps": 168.16853143610103
               }
             },
             {
@@ -5552,7 +5667,12 @@
                 "zinc_end_to_end_tps": 382.83905524556235,
                 "baseline_end_to_end_tps": 316.74153287749436,
                 "zinc_overall_tps": 462.954053280123,
-                "baseline_overall_tps": 167.80131429447192,
+                "baseline_overall_tps": 167.221618471232,
+                "zinc_overall_seconds": 0.9720187064173196,
+                "baseline_overall_seconds": 2.649179,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 153.79213727343748,
                 "delta_tps": 58.16353596345324,
                 "delta_pct": 53.792137273437476,
@@ -5562,8 +5682,8 @@
                 "latency_delta_ms": -223.1880419999943,
                 "end_to_end_pct_of_baseline": 120.86796820347283,
                 "end_to_end_delta_tps": 66.09752236806798,
-                "overall_pct_of_baseline": 275.8941759345771,
-                "overall_delta_tps": 295.15273898565107
+                "overall_pct_of_baseline": 272.5440346476851,
+                "overall_delta_tps": 295.73243480889096
               }
             },
             {
@@ -5781,7 +5901,12 @@
                 "zinc_end_to_end_tps": 175.19442646306547,
                 "baseline_end_to_end_tps": 117.10611159660115,
                 "zinc_overall_tps": 199.17735034195752,
-                "baseline_overall_tps": 128.6554344984072,
+                "baseline_overall_tps": 128.34253859127367,
+                "zinc_overall_seconds": 1.6066083791686563,
+                "baseline_overall_seconds": 2.485536,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 154.80959267578123,
                 "delta_tps": 59.03703653447003,
                 "delta_pct": 54.80959267578123,
@@ -5791,8 +5916,8 @@
                 "latency_delta_ms": -897.4830829999992,
                 "end_to_end_pct_of_baseline": 149.6031454503099,
                 "end_to_end_delta_tps": 58.088314866464316,
-                "overall_pct_of_baseline": 154.81456428055,
-                "overall_delta_tps": 70.52191584355032
+                "overall_pct_of_baseline": 154.70702333110867,
+                "overall_delta_tps": 70.83481175068385
               }
             }
           ]
@@ -5852,7 +5977,7 @@
         "average_end_to_end_tps": 9.222315556339181,
         "average_total_latency_ms": 16573.93527500001,
         "compared_models": 5,
-        "average_pct_of_llama": 69.95482512485924
+        "average_pct_of_llama": 39.133675321427795
       },
       "models": [
         {
@@ -6062,19 +6187,24 @@
             "baseline_total_latency_ms": 2125.2527919999557,
             "zinc_end_to_end_tps": 7.092577537509781,
             "baseline_end_to_end_tps": 69.63877452937048,
-            "zinc_overall_tps": 58.443433395872425,
-            "baseline_overall_tps": 195.71790813460314,
+            "zinc_overall_tps": 67.03468979319547,
+            "baseline_overall_tps": 235.29190152959706,
+            "zinc_overall_seconds": 2.1630591630591627,
+            "baseline_overall_seconds": 0.6290059242918026,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 30.813156000000006,
             "delta_tps": -106.69984038246517,
             "delta_pct": -69.186844,
             "leader": "baseline",
-            "prompt_pct_of_baseline": 4.3,
+            "prompt_pct_of_baseline": 4.299323138631236,
             "latency_pct_of_baseline": 961.9518064842251,
             "latency_delta_ms": 18318.65483300005,
             "end_to_end_pct_of_baseline": 10.184810955451914,
             "end_to_end_delta_tps": -62.5461969918607,
-            "overall_pct_of_baseline": 29.861055614634154,
-            "overall_delta_tps": -137.2744747387307
+            "overall_pct_of_baseline": 29.079460008953923,
+            "overall_delta_tps": -168.2572117364016
           },
           "scenarios": [
             {
@@ -6283,19 +6413,24 @@
                 "baseline_total_latency_ms": 2125.2527919999557,
                 "zinc_end_to_end_tps": 7.092577537509781,
                 "baseline_end_to_end_tps": 69.63877452937048,
-                "zinc_overall_tps": 58.443433395872425,
-                "baseline_overall_tps": 195.71790813460314,
+                "zinc_overall_tps": 67.03468979319547,
+                "baseline_overall_tps": 235.29190152959706,
+                "zinc_overall_seconds": 2.1630591630591627,
+                "baseline_overall_seconds": 0.6290059242918026,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 30.813156000000006,
                 "delta_tps": -106.69984038246517,
                 "delta_pct": -69.186844,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 4.3,
+                "prompt_pct_of_baseline": 4.299323138631236,
                 "latency_pct_of_baseline": 961.9518064842251,
                 "latency_delta_ms": 18318.65483300005,
                 "end_to_end_pct_of_baseline": 10.184810955451914,
                 "end_to_end_delta_tps": -62.5461969918607,
-                "overall_pct_of_baseline": 29.861055614634154,
-                "overall_delta_tps": -137.2744747387307
+                "overall_pct_of_baseline": 29.079460008953923,
+                "overall_delta_tps": -168.2572117364016
               }
             },
             {
@@ -6504,19 +6639,24 @@
                 "baseline_total_latency_ms": 2965.4852919999976,
                 "zinc_end_to_end_tps": 20.333731067428786,
                 "baseline_end_to_end_tps": 119.71059204295669,
-                "zinc_overall_tps": 95.44817846541332,
-                "baseline_overall_tps": 217.81748329988062,
+                "zinc_overall_tps": 99.61105113357543,
+                "baseline_overall_tps": 235.41875639683136,
+                "zinc_overall_seconds": 3.533744459015683,
+                "baseline_overall_seconds": 1.5079512160942592,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 49.88299012499999,
                 "delta_tps": -54.05239590727122,
                 "delta_pct": -50.11700987500001,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 4.3,
+                "prompt_pct_of_baseline": 4.299323138631236,
                 "latency_pct_of_baseline": 583.7539251568819,
                 "latency_delta_ms": 14345.651500000007,
                 "end_to_end_pct_of_baseline": 16.98574096111084,
                 "end_to_end_delta_tps": -99.3768609755279,
-                "overall_pct_of_baseline": 43.82025584879469,
-                "overall_delta_tps": -122.3693048344673
+                "overall_pct_of_baseline": 42.67289934468821,
+                "overall_delta_tps": -135.8077052632559
               }
             },
             {
@@ -6725,19 +6865,24 @@
                 "baseline_total_latency_ms": 2668.858499999973,
                 "zinc_end_to_end_tps": 26.851679776812748,
                 "baseline_end_to_end_tps": 177.2293285687513,
-                "zinc_overall_tps": 132.94176801563492,
-                "baseline_overall_tps": 56.253443743257,
+                "zinc_overall_tps": 136.9604294023097,
+                "baseline_overall_tps": 372.8778517968938,
+                "zinc_overall_seconds": 3.4608536353786175,
+                "baseline_overall_seconds": 1.268511920782151,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 49.967960625,
                 "delta_tps": -52.266941110026536,
                 "delta_pct": -50.032039375,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 4.3,
+                "prompt_pct_of_baseline": 4.299323138631236,
                 "latency_pct_of_baseline": 661.4261084280107,
                 "latency_delta_ms": 14983.66841600003,
                 "end_to_end_pct_of_baseline": 15.15081053099875,
                 "end_to_end_delta_tps": -150.37764879193855,
-                "overall_pct_of_baseline": 236.32645251442125,
-                "overall_delta_tps": 76.68832427237791
+                "overall_pct_of_baseline": 36.65315134436119,
+                "overall_delta_tps": -235.91742239458412
               }
             },
             {
@@ -6946,19 +7091,24 @@
                 "baseline_total_latency_ms": 3991.3497919999645,
                 "zinc_end_to_end_tps": 17.879001894678456,
                 "baseline_end_to_end_tps": 82.42825538854775,
-                "zinc_overall_tps": 65.81090742328436,
-                "baseline_overall_tps": 128.00979033345692,
+                "zinc_overall_tps": 69.80374470161316,
+                "baseline_overall_tps": 135.28076433071809,
+                "zinc_overall_seconds": 4.67023655240184,
+                "baseline_overall_seconds": 2.4319791629481076,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 54.248655578125,
                 "delta_tps": -48.341604677837346,
                 "delta_pct": -45.751344421875,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 4.3,
+                "prompt_pct_of_baseline": 4.299323138631236,
                 "latency_pct_of_baseline": 456.829919481038,
                 "latency_delta_ms": 14242.33024900005,
                 "end_to_end_pct_of_baseline": 21.69038008920724,
                 "end_to_end_delta_tps": -64.5492534938693,
-                "overall_pct_of_baseline": 51.41083916460715,
-                "overall_delta_tps": -62.19888291017256
+                "overall_pct_of_baseline": 52.074003868120414,
+                "overall_delta_tps": -65.47701962910493
               }
             }
           ]
@@ -7170,19 +7320,24 @@
             "baseline_total_latency_ms": 3161.598250000039,
             "zinc_end_to_end_tps": 5.7559968241685375,
             "baseline_end_to_end_tps": 46.81176680180607,
-            "zinc_overall_tps": 49.96475409836066,
-            "baseline_overall_tps": 79.85985104063262,
+            "zinc_overall_tps": 67.68987577607459,
+            "baseline_overall_tps": 86.85191847071697,
+            "zinc_overall_seconds": 2.1421224125107816,
+            "baseline_overall_seconds": 1.7040498656330747,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 82.41181256249999,
             "delta_tps": -10.007183233822538,
             "delta_pct": -17.58818743750001,
             "leader": "baseline",
-            "prompt_pct_of_baseline": 16.7,
+            "prompt_pct_of_baseline": 16.698966408268735,
             "latency_pct_of_baseline": 796.7843110047156,
             "latency_delta_ms": 22029.520582999918,
             "end_to_end_pct_of_baseline": 12.296046950200697,
             "end_to_end_delta_tps": -41.05576997763754,
-            "overall_pct_of_baseline": 62.56554882996043,
-            "overall_delta_tps": -29.895096942271962
+            "overall_pct_of_baseline": 79.5496025661651,
+            "overall_delta_tps": -19.16204269464238
           },
           "scenarios": [
             {
@@ -7391,19 +7546,24 @@
                 "baseline_total_latency_ms": 3161.598250000039,
                 "zinc_end_to_end_tps": 5.7559968241685375,
                 "baseline_end_to_end_tps": 46.81176680180607,
-                "zinc_overall_tps": 49.96475409836066,
-                "baseline_overall_tps": 79.85985104063262,
+                "zinc_overall_tps": 67.68987577607459,
+                "baseline_overall_tps": 86.85191847071697,
+                "zinc_overall_seconds": 2.1421224125107816,
+                "baseline_overall_seconds": 1.7040498656330747,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 82.41181256249999,
                 "delta_tps": -10.007183233822538,
                 "delta_pct": -17.58818743750001,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 16.7,
+                "prompt_pct_of_baseline": 16.698966408268735,
                 "latency_pct_of_baseline": 796.7843110047156,
                 "latency_delta_ms": 22029.520582999918,
                 "end_to_end_pct_of_baseline": 12.296046950200697,
                 "end_to_end_delta_tps": -41.05576997763754,
-                "overall_pct_of_baseline": 62.56554882996043,
-                "overall_delta_tps": -29.895096942271962
+                "overall_pct_of_baseline": 79.5496025661651,
+                "overall_delta_tps": -19.16204269464238
               }
             },
             {
@@ -7612,19 +7772,24 @@
                 "baseline_total_latency_ms": 4616.284291999997,
                 "zinc_end_to_end_tps": 12.813598547946265,
                 "baseline_end_to_end_tps": 76.90167622804637,
-                "zinc_overall_tps": 71.98015157807309,
-                "baseline_overall_tps": 103.35407719964827,
+                "zinc_overall_tps": 86.687563703334,
+                "baseline_overall_tps": 108.51847081292233,
+                "zinc_overall_seconds": 4.060559380866094,
+                "baseline_overall_seconds": 3.271332496124031,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 86.96628297499998,
                 "delta_tps": -6.499901893435506,
                 "delta_pct": -13.033717025000016,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 16.7,
+                "prompt_pct_of_baseline": 16.698966408268735,
                 "latency_pct_of_baseline": 595.0849999123067,
                 "latency_delta_ms": 22854.53108300001,
                 "end_to_end_pct_of_baseline": 16.66231371855727,
                 "end_to_end_delta_tps": -64.0880776801001,
-                "overall_pct_of_baseline": 69.64423032777853,
-                "overall_delta_tps": -31.373925621575182
+                "overall_pct_of_baseline": 80.56359208878938,
+                "overall_delta_tps": -21.830907109588324
               }
             },
             {
@@ -7833,19 +7998,24 @@
                 "baseline_total_latency_ms": 3975.075458999956,
                 "zinc_end_to_end_tps": 24.653100097756237,
                 "baseline_end_to_end_tps": 118.99145182994756,
-                "zinc_overall_tps": 101.5989585623839,
-                "baseline_overall_tps": 28.195069096418585,
+                "zinc_overall_tps": 128.19826260479084,
+                "baseline_overall_tps": 180.66280732948036,
+                "zinc_overall_seconds": 3.6973980018843586,
+                "baseline_overall_seconds": 2.6181371085271317,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 82.7799498515625,
                 "delta_tps": -8.793089644046383,
                 "delta_pct": -17.220050148437494,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 16.7,
+                "prompt_pct_of_baseline": 16.698966408268735,
                 "latency_pct_of_baseline": 483.6836702425014,
                 "latency_delta_ms": 15251.715415999992,
                 "end_to_end_pct_of_baseline": 20.718379109272778,
                 "end_to_end_delta_tps": -94.33835173219133,
-                "overall_pct_of_baseline": 360.3430025829917,
-                "overall_delta_tps": 73.4038894659653
+                "overall_pct_of_baseline": 70.8102591928922,
+                "overall_delta_tps": -52.46454472468952
               }
             },
             {
@@ -8054,19 +8224,24 @@
                 "baseline_total_latency_ms": 6660.309083000058,
                 "zinc_end_to_end_tps": 16.35786639567282,
                 "baseline_end_to_end_tps": 49.39710693603514,
-                "zinc_overall_tps": 50.506398143668335,
-                "baseline_overall_tps": 63.43014854535382,
+                "zinc_overall_tps": 57.40526254456628,
+                "baseline_overall_tps": 65.79847595767754,
+                "zinc_overall_seconds": 5.678921854018377,
+                "baseline_overall_seconds": 5.0001158113695094,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 89.7720619765625,
                 "delta_tps": -5.261393884944489,
                 "delta_pct": -10.227938023437503,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 16.7,
+                "prompt_pct_of_baseline": 16.698966408268735,
                 "latency_pct_of_baseline": 299.2240932011396,
                 "latency_delta_ms": 13268.940375000006,
                 "end_to_end_pct_of_baseline": 33.115029219939544,
                 "end_to_end_delta_tps": -33.039240540362314,
-                "overall_pct_of_baseline": 79.62522444284559,
-                "overall_delta_tps": -12.923750401685488
+                "overall_pct_of_baseline": 88.0469205229766,
+                "overall_delta_tps": -8.393213413111262
               }
             }
           ]
@@ -8278,19 +8453,24 @@
             "baseline_total_latency_ms": 1992.5587920001708,
             "zinc_end_to_end_tps": 14.324623245951454,
             "baseline_end_to_end_tps": 65.74460965766514,
-            "zinc_overall_tps": 113.40509083272077,
-            "baseline_overall_tps": 129.6461445986666,
+            "zinc_overall_tps": 108.55103796306916,
+            "baseline_overall_tps": 217.69146109168855,
+            "zinc_overall_seconds": 1.2160178518505604,
+            "baseline_overall_seconds": 0.6017691247192496,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 75.11586479166667,
             "delta_tps": -40.00497333143541,
             "delta_pct": -24.884135208333333,
             "leader": "baseline",
-            "prompt_pct_of_baseline": 1.13,
+            "prompt_pct_of_baseline": 1.1296076099881094,
             "latency_pct_of_baseline": 462.46575403428795,
             "latency_delta_ms": 7222.343249999918,
             "end_to_end_pct_of_baseline": 21.78828548916839,
             "end_to_end_delta_tps": -51.41998641171368,
-            "overall_pct_of_baseline": 87.47278307718156,
-            "overall_delta_tps": -16.241053765945836
+            "overall_pct_of_baseline": 49.486865986668306,
+            "overall_delta_tps": -109.14042312861939
           },
           "scenarios": [
             {
@@ -8499,19 +8679,24 @@
                 "baseline_total_latency_ms": 1992.5587920001708,
                 "zinc_end_to_end_tps": 14.324623245951454,
                 "baseline_end_to_end_tps": 65.74460965766514,
-                "zinc_overall_tps": 113.40509083272077,
-                "baseline_overall_tps": 129.6461445986666,
+                "zinc_overall_tps": 108.55103796306916,
+                "baseline_overall_tps": 217.69146109168855,
+                "zinc_overall_seconds": 1.2160178518505604,
+                "baseline_overall_seconds": 0.6017691247192496,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 75.11586479166667,
                 "delta_tps": -40.00497333143541,
                 "delta_pct": -24.884135208333333,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 1.13,
+                "prompt_pct_of_baseline": 1.1296076099881094,
                 "latency_pct_of_baseline": 462.46575403428795,
                 "latency_delta_ms": 7222.343249999918,
                 "end_to_end_pct_of_baseline": 21.78828548916839,
                 "end_to_end_delta_tps": -51.41998641171368,
-                "overall_pct_of_baseline": 87.47278307718156,
-                "overall_delta_tps": -16.241053765945836
+                "overall_pct_of_baseline": 49.486865986668306,
+                "overall_delta_tps": -109.14042312861939
               }
             },
             {
@@ -8720,19 +8905,24 @@
                 "baseline_total_latency_ms": 2290.1660840001423,
                 "zinc_end_to_end_tps": 33.06194805467045,
                 "baseline_end_to_end_tps": 136.67131051617676,
-                "zinc_overall_tps": 106.45439675398285,
-                "baseline_overall_tps": 104.1212207932572,
+                "zinc_overall_tps": 95.78814354767727,
+                "baseline_overall_tps": 305.2753042631628,
+                "zinc_overall_seconds": 3.4868616055154673,
+                "baseline_overall_seconds": 1.0253040309155768,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 69.2318555625,
                 "delta_tps": -48.97972430329621,
                 "delta_pct": -30.7681444375,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 1.13,
+                "prompt_pct_of_baseline": 1.1296076099881094,
                 "latency_pct_of_baseline": 441.11421056217876,
                 "latency_delta_ms": 7812.08195799985,
                 "end_to_end_pct_of_baseline": 24.190847318140815,
                 "end_to_end_delta_tps": -103.60936246150631,
-                "overall_pct_of_baseline": 102.2408265509664,
-                "overall_delta_tps": 2.3331759607256544
+                "overall_pct_of_baseline": 29.40478134531539,
+                "overall_delta_tps": -209.48716071548554
               }
             },
             {
@@ -8941,19 +9131,24 @@
                 "baseline_total_latency_ms": 2097.5868750000373,
                 "zinc_end_to_end_tps": 40.82281436627556,
                 "baseline_end_to_end_tps": 211.19506671207225,
-                "zinc_overall_tps": 126.08462074324962,
-                "baseline_overall_tps": 106.33365800543577,
+                "zinc_overall_tps": 91.17890695931492,
+                "baseline_overall_tps": 522.119281354395,
+                "zinc_overall_seconds": 4.935351991012518,
+                "baseline_overall_seconds": 0.8484651224732461,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 69.0044145,
                 "delta_tps": -49.17202427222972,
                 "delta_pct": -30.995585500000004,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 1.13,
+                "prompt_pct_of_baseline": 1.1296076099881094,
                 "latency_pct_of_baseline": 525.5204427706768,
                 "latency_delta_ms": 8925.66095799976,
                 "end_to_end_pct_of_baseline": 19.329435579066043,
                 "end_to_end_delta_tps": -170.37225234579668,
-                "overall_pct_of_baseline": 118.5745163932987,
-                "overall_delta_tps": 19.75096273781385
+                "overall_pct_of_baseline": 17.191582768935966,
+                "overall_delta_tps": -430.94037439508
               }
             },
             {
@@ -9162,19 +9357,24 @@
                 "baseline_total_latency_ms": 2970.646582999965,
                 "zinc_end_to_end_tps": 33.106639355190836,
                 "baseline_end_to_end_tps": 107.38402939802138,
-                "zinc_overall_tps": 116.95361966336665,
-                "baseline_overall_tps": 131.90795792465914,
+                "zinc_overall_tps": 106.6146324868863,
+                "baseline_overall_tps": 198.610174005622,
+                "zinc_overall_seconds": 3.001464175561083,
+                "baseline_overall_seconds": 1.6061614244946492,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 70.92278591406249,
                 "delta_tps": -46.58649253553867,
                 "delta_pct": -29.077214085937513,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 1.13,
+                "prompt_pct_of_baseline": 1.1296076099881094,
                 "latency_pct_of_baseline": 325.3747844766858,
                 "latency_delta_ms": 6695.088334000204,
                 "end_to_end_pct_of_baseline": 30.830133252385522,
                 "end_to_end_delta_tps": -74.27739004283055,
-                "overall_pct_of_baseline": 88.66305073888428,
-                "overall_delta_tps": -14.954338261292492
+                "overall_pct_of_baseline": 53.51259687097212,
+                "overall_delta_tps": -91.99554151873572
               }
             }
           ]
@@ -9386,19 +9586,24 @@
             "baseline_total_latency_ms": 3235.4244580001105,
             "zinc_end_to_end_tps": 10.138181558276793,
             "baseline_end_to_end_tps": 40.48927789863284,
-            "zinc_overall_tps": 49.69086767407852,
-            "baseline_overall_tps": 44.36549775903822,
+            "zinc_overall_tps": 48.97144078666096,
+            "baseline_overall_tps": 75.3903313897912,
+            "zinc_overall_seconds": 2.695448569198615,
+            "baseline_overall_seconds": 1.7376233475177303,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 90.68145575,
             "delta_tps": -5.185335181995029,
             "delta_pct": -9.318544250000002,
             "leader": "baseline",
-            "prompt_pct_of_baseline": 1.61,
+            "prompt_pct_of_baseline": 1.6099290780141842,
             "latency_pct_of_baseline": 402.42282229170183,
             "latency_delta_ms": 9784.661958999932,
             "end_to_end_pct_of_baseline": 25.039176010148402,
             "end_to_end_delta_tps": -30.35109634035605,
-            "overall_pct_of_baseline": 112.00340396035658,
-            "overall_delta_tps": 5.325369915040298
+            "overall_pct_of_baseline": 64.46509005491222,
+            "overall_delta_tps": -26.418890603130237
           },
           "scenarios": [
             {
@@ -9607,19 +9812,24 @@
                 "baseline_total_latency_ms": 3235.4244580001105,
                 "zinc_end_to_end_tps": 10.138181558276793,
                 "baseline_end_to_end_tps": 40.48927789863284,
-                "zinc_overall_tps": 49.69086767407852,
-                "baseline_overall_tps": 44.36549775903822,
+                "zinc_overall_tps": 48.97144078666096,
+                "baseline_overall_tps": 75.3903313897912,
+                "zinc_overall_seconds": 2.695448569198615,
+                "baseline_overall_seconds": 1.7376233475177303,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 90.68145575,
                 "delta_tps": -5.185335181995029,
                 "delta_pct": -9.318544250000002,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 1.61,
+                "prompt_pct_of_baseline": 1.6099290780141842,
                 "latency_pct_of_baseline": 402.42282229170183,
                 "latency_delta_ms": 9784.661958999932,
                 "end_to_end_pct_of_baseline": 25.039176010148402,
                 "end_to_end_delta_tps": -30.35109634035605,
-                "overall_pct_of_baseline": 112.00340396035658,
-                "overall_delta_tps": 5.325369915040298
+                "overall_pct_of_baseline": 64.46509005491222,
+                "overall_delta_tps": -26.418890603130237
               }
             },
             {
@@ -9828,19 +10038,24 @@
                 "baseline_total_latency_ms": 4266.524375000037,
                 "zinc_end_to_end_tps": 14.246786399461635,
                 "baseline_end_to_end_tps": 73.36182158809235,
-                "zinc_overall_tps": 45.93681980592381,
-                "baseline_overall_tps": 36.621359429816394,
+                "zinc_overall_tps": 45.990334891522714,
+                "baseline_overall_tps": 105.71258947978576,
+                "zinc_overall_seconds": 7.262395474784103,
+                "baseline_overall_seconds": 2.960858319148936,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 84.74564371875,
                 "delta_tps": -8.397077292633362,
                 "delta_pct": -15.254356281249997,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 1.61,
+                "prompt_pct_of_baseline": 1.6099290780141842,
                 "latency_pct_of_baseline": 549.4843436350914,
                 "latency_delta_ms": 19177.359083000105,
                 "end_to_end_pct_of_baseline": 19.419891833457537,
                 "end_to_end_delta_tps": -59.11503518863072,
-                "overall_pct_of_baseline": 125.43723259088779,
-                "overall_delta_tps": 9.315460376107417
+                "overall_pct_of_baseline": 40.76972025868581,
+                "overall_delta_tps": -59.72225458826305
               }
             },
             {
@@ -10049,19 +10264,24 @@
                 "baseline_total_latency_ms": 3768.393374999985,
                 "zinc_end_to_end_tps": 22.370266853111257,
                 "baseline_end_to_end_tps": 117.55672933163507,
-                "zinc_overall_tps": 49.17233499645193,
-                "baseline_overall_tps": 32.96983117578148,
+                "zinc_overall_tps": 46.05778482087271,
+                "baseline_overall_tps": 185.3557161896587,
+                "zinc_overall_seconds": 9.770335280998287,
+                "baseline_overall_seconds": 2.389999127659575,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 85.08015359375,
                 "delta_tps": -8.382315123971985,
                 "delta_pct": -14.919846406250002,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 1.61,
+                "prompt_pct_of_baseline": 1.6099290780141842,
                 "latency_pct_of_baseline": 533.8080482375348,
                 "latency_delta_ms": 16347.59375,
                 "end_to_end_pct_of_baseline": 19.02933756348673,
                 "end_to_end_delta_tps": -95.18646247852381,
-                "overall_pct_of_baseline": 149.14342367810565,
-                "overall_delta_tps": 16.20250382067045
+                "overall_pct_of_baseline": 24.461792343070705,
+                "overall_delta_tps": -139.29793136878598
               }
             },
             {
@@ -10270,19 +10490,24 @@
                 "baseline_total_latency_ms": 6307.7049579999875,
                 "zinc_end_to_end_tps": 12.934447327979989,
                 "baseline_end_to_end_tps": 50.57306930556669,
-                "zinc_overall_tps": 43.4331597051597,
-                "baseline_overall_tps": 47.231510265916356,
+                "zinc_overall_tps": 44.64487304255507,
+                "baseline_overall_tps": 69.04082815691362,
+                "zinc_overall_seconds": 7.167676335309074,
+                "baseline_overall_seconds": 4.620454425531915,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 79.856307984375,
                 "delta_tps": -11.215000663315443,
                 "delta_pct": -20.143692015625007,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 1.61,
+                "prompt_pct_of_baseline": 1.6099290780141842,
                 "latency_pct_of_baseline": 392.2208988646844,
                 "latency_delta_ms": 18432.432125999825,
                 "end_to_end_pct_of_baseline": 25.575760984228545,
                 "end_to_end_delta_tps": -37.6386219775867,
-                "overall_pct_of_baseline": 91.9580158682801,
-                "overall_delta_tps": -3.798350560756653
+                "overall_pct_of_baseline": 64.46237538337002,
+                "overall_delta_tps": -24.39595511435855
               }
             }
           ]
@@ -10494,19 +10719,24 @@
             "baseline_total_latency_ms": 2163.0733339998405,
             "zinc_end_to_end_tps": 8.800198615789343,
             "baseline_end_to_end_tps": 60.561978154370635,
-            "zinc_overall_tps": 50.63971438416478,
-            "baseline_overall_tps": 87.50396916678322,
+            "zinc_overall_tps": 49.17464788732394,
+            "baseline_overall_tps": 170.50059231621165,
+            "zinc_overall_seconds": 2.6843100189035916,
+            "baseline_overall_seconds": 0.7683257765876053,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 42.04282604166667,
             "delta_tps": -72.92408220506704,
             "delta_pct": -57.95717395833333,
             "leader": "baseline",
-            "prompt_pct_of_baseline": 0.63,
+            "prompt_pct_of_baseline": 0.6335118592195869,
             "latency_pct_of_baseline": 693.4421141544647,
             "latency_delta_ms": 12836.588124000118,
             "end_to_end_pct_of_baseline": 14.530896915813921,
             "end_to_end_delta_tps": -51.761779538581294,
-            "overall_pct_of_baseline": 57.871334142163434,
-            "overall_delta_tps": -36.86425478261844
+            "overall_pct_of_baseline": 28.62284055034107,
+            "overall_delta_tps": -121.32594442888771
           },
           "scenarios": [
             {
@@ -10715,19 +10945,24 @@
                 "baseline_total_latency_ms": 2163.0733339998405,
                 "zinc_end_to_end_tps": 8.800198615789343,
                 "baseline_end_to_end_tps": 60.561978154370635,
-                "zinc_overall_tps": 50.63971438416478,
-                "baseline_overall_tps": 87.50396916678322,
+                "zinc_overall_tps": 49.17464788732394,
+                "baseline_overall_tps": 170.50059231621165,
+                "zinc_overall_seconds": 2.6843100189035916,
+                "baseline_overall_seconds": 0.7683257765876053,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 42.04282604166667,
                 "delta_tps": -72.92408220506704,
                 "delta_pct": -57.95717395833333,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 0.63,
+                "prompt_pct_of_baseline": 0.6335118592195869,
                 "latency_pct_of_baseline": 693.4421141544647,
                 "latency_delta_ms": 12836.588124000118,
                 "end_to_end_pct_of_baseline": 14.530896915813921,
                 "end_to_end_delta_tps": -51.761779538581294,
-                "overall_pct_of_baseline": 57.871334142163434,
-                "overall_delta_tps": -36.86425478261844
+                "overall_pct_of_baseline": 28.62284055034107,
+                "overall_delta_tps": -121.32594442888771
               }
             },
             {
@@ -10936,19 +11171,24 @@
                 "baseline_total_latency_ms": 2378.017125000013,
                 "zinc_end_to_end_tps": 11.69493409052925,
                 "baseline_end_to_end_tps": 131.62226491535392,
-                "zinc_overall_tps": 40.68461833688699,
-                "baseline_overall_tps": 96.58864241915798,
+                "zinc_overall_tps": 41.25574284594277,
+                "baseline_overall_tps": 313.2708556116332,
+                "zinc_overall_seconds": 8.095842589654078,
+                "baseline_overall_seconds": 0.9991353947972454,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 25.0638845625,
                 "delta_tps": -122.8809659093821,
                 "delta_pct": -74.9361154375,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 0.63,
+                "prompt_pct_of_baseline": 0.6335118592195869,
                 "latency_pct_of_baseline": 1200.9742903344231,
                 "latency_delta_ms": 26181.357165999943,
                 "end_to_end_pct_of_baseline": 8.885224774129394,
                 "end_to_end_delta_tps": -119.92733082482468,
-                "overall_pct_of_baseline": 42.12153449712153,
-                "overall_delta_tps": -55.904024082270986
+                "overall_pct_of_baseline": 12.341339196417564,
+                "overall_delta_tps": -272.0151127656904
               }
             },
             {
@@ -11157,19 +11397,24 @@
                 "baseline_total_latency_ms": 2093.121541999979,
                 "zinc_end_to_end_tps": 22.89249274152574,
                 "baseline_end_to_end_tps": 211.6456168984402,
-                "zinc_overall_tps": 57.59725373411048,
-                "baseline_overall_tps": 81.255340845841,
+                "zinc_overall_tps": 44.980874369723544,
+                "baseline_overall_tps": 553.8538550136088,
+                "zinc_overall_seconds": 10.004251947198547,
+                "baseline_overall_seconds": 0.7998499892884467,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 33.75956525,
                 "delta_tps": -112.80247732981394,
                 "delta_pct": -66.24043474999999,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 0.63,
+                "prompt_pct_of_baseline": 0.6335118592195869,
                 "latency_pct_of_baseline": 939.1284152671643,
                 "latency_delta_ms": 17563.977625000058,
                 "end_to_end_pct_of_baseline": 10.81642657051144,
                 "end_to_end_delta_tps": -188.75312415691448,
-                "overall_pct_of_baseline": 70.88426820260953,
-                "overall_delta_tps": -23.658087111730524
+                "overall_pct_of_baseline": 7.995100418401854,
+                "overall_delta_tps": -508.8729806438853
               }
             },
             {
@@ -11378,19 +11623,24 @@
                 "baseline_total_latency_ms": 2898.8332089998294,
                 "zinc_end_to_end_tps": 10.981414018132993,
                 "baseline_end_to_end_tps": 110.04427540350383,
-                "zinc_overall_tps": 38.29158263453986,
-                "baseline_overall_tps": 134.49599517159376,
+                "zinc_overall_tps": 39.047035766780986,
+                "baseline_overall_tps": 208.29450966116394,
+                "zinc_overall_seconds": 8.195244369157413,
+                "baseline_overall_seconds": 1.5314853978576894,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 22.8871220703125,
                 "delta_tps": -129.71686834073114,
                 "delta_pct": -77.1128779296875,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 0.63,
+                "prompt_pct_of_baseline": 0.6335118592195869,
                 "latency_pct_of_baseline": 1005.2370450818037,
                 "latency_delta_ms": 26241.312083000084,
                 "end_to_end_pct_of_baseline": 9.979087033711654,
                 "end_to_end_delta_tps": -99.06286138537084,
-                "overall_pct_of_baseline": 28.470425893117774,
-                "overall_delta_tps": -96.20441253705391
+                "overall_pct_of_baseline": 18.687489095766256,
+                "overall_delta_tps": -169.24747389438295
               }
             }
           ]
@@ -11448,7 +11698,7 @@
         "average_end_to_end_tps": 10.568655490117568,
         "average_total_latency_ms": 21802.864141599952,
         "compared_models": 5,
-        "average_pct_of_llama": 64.5006143422151
+        "average_pct_of_llama": 74.88146192638206
       },
       "models": [
         {
@@ -11667,7 +11917,12 @@
             "zinc_end_to_end_tps": 2.3683726664771205,
             "baseline_end_to_end_tps": 74.11346927784743,
             "zinc_overall_tps": 16.570399877060453,
-            "baseline_overall_tps": 84.65601241932896,
+            "baseline_overall_tps": 85.85080174787592,
+            "zinc_overall_seconds": 8.750543202082497,
+            "baseline_overall_seconds": 1.7239209999999998,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 25.714741541666662,
             "delta_tps": -46.5677776464527,
             "delta_pct": -74.28525845833335,
@@ -11677,8 +11932,8 @@
             "latency_delta_ms": 59226.535042,
             "end_to_end_pct_of_baseline": 3.195603565120151,
             "end_to_end_delta_tps": -71.74509661137031,
-            "overall_pct_of_baseline": 19.57380155703748,
-            "overall_delta_tps": -68.0856125422685
+            "overall_pct_of_baseline": 19.700731259628917,
+            "overall_delta_tps": -69.28040187081547
           },
           "scenarios": [
             {
@@ -11896,7 +12151,12 @@
                 "zinc_end_to_end_tps": 2.3683726664771205,
                 "baseline_end_to_end_tps": 74.11346927784743,
                 "zinc_overall_tps": 16.570399877060453,
-                "baseline_overall_tps": 84.65601241932896,
+                "baseline_overall_tps": 85.85080174787592,
+                "zinc_overall_seconds": 8.750543202082497,
+                "baseline_overall_seconds": 1.7239209999999998,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 25.714741541666662,
                 "delta_tps": -46.5677776464527,
                 "delta_pct": -74.28525845833335,
@@ -11906,8 +12166,8 @@
                 "latency_delta_ms": 59226.535042,
                 "end_to_end_pct_of_baseline": 3.195603565120151,
                 "end_to_end_delta_tps": -71.74509661137031,
-                "overall_pct_of_baseline": 19.57380155703748,
-                "overall_delta_tps": -68.0856125422685
+                "overall_pct_of_baseline": 19.700731259628917,
+                "overall_delta_tps": -69.28040187081547
               }
             },
             {
@@ -12125,7 +12385,12 @@
                 "zinc_end_to_end_tps": 29.1351856423082,
                 "baseline_end_to_end_tps": 122.06578112015616,
                 "zinc_overall_tps": 52.9161173169934,
-                "baseline_overall_tps": 76.1496388862977,
+                "baseline_overall_tps": 76.2959129461484,
+                "zinc_overall_seconds": 6.652037561473907,
+                "baseline_overall_seconds": 4.652936,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 74.41353475,
                 "delta_tps": -15.314702709173481,
                 "delta_pct": -25.586465250000003,
@@ -12135,8 +12400,8 @@
                 "latency_delta_ms": 9173.34375099995,
                 "end_to_end_pct_of_baseline": 23.86843009969257,
                 "end_to_end_delta_tps": -92.93059547784796,
-                "overall_pct_of_baseline": 69.48964970931083,
-                "overall_delta_tps": -23.233521569304294
+                "overall_pct_of_baseline": 69.9475304671767,
+                "overall_delta_tps": -23.379795629155005
               }
             },
             {
@@ -12354,7 +12619,12 @@
                 "zinc_end_to_end_tps": 34.23011768400458,
                 "baseline_end_to_end_tps": 191.5102164677769,
                 "zinc_overall_tps": 56.05038686646466,
-                "baseline_overall_tps": 81.5623800439363,
+                "baseline_overall_tps": 81.53829843534383,
+                "zinc_overall_seconds": 8.456676688588523,
+                "baseline_overall_seconds": 5.800955,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 73.77702149999999,
                 "delta_tps": -15.52542617730915,
                 "delta_pct": -26.22297850000001,
@@ -12364,8 +12634,8 @@
                 "latency_delta_ms": 11377.61245799996,
                 "end_to_end_pct_of_baseline": 17.873781522127867,
                 "end_to_end_delta_tps": -157.2800987837723,
-                "overall_pct_of_baseline": 68.7208819020132,
-                "overall_delta_tps": -25.511993177471638
+                "overall_pct_of_baseline": 68.59615441876635,
+                "overall_delta_tps": -25.48791156887917
               }
             },
             {
@@ -12583,7 +12853,12 @@
                 "zinc_end_to_end_tps": 26.525426723736167,
                 "baseline_end_to_end_tps": 70.45662828359734,
                 "zinc_overall_tps": 47.69112870049623,
-                "baseline_overall_tps": 73.6994959070028,
+                "baseline_overall_tps": 74.22565261616761,
+                "zinc_overall_seconds": 6.835652853747786,
+                "baseline_overall_seconds": 4.432429873015872,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 73.511288421875,
                 "delta_tps": -16.099780846154275,
                 "delta_pct": -26.488711578125006,
@@ -12593,8 +12868,8 @@
                 "latency_delta_ms": 7620.555083999934,
                 "end_to_end_pct_of_baseline": 37.64787979488286,
                 "end_to_end_delta_tps": -43.93120155986117,
-                "overall_pct_of_baseline": 64.71025088241437,
-                "overall_delta_tps": -26.00836720650657
+                "overall_pct_of_baseline": 64.84281703371906,
+                "overall_delta_tps": -26.53452391567138
               }
             }
           ]
@@ -12815,7 +13090,12 @@
             "zinc_end_to_end_tps": 9.329692855009945,
             "baseline_end_to_end_tps": 22.301378302405748,
             "zinc_overall_tps": 16.547723780137943,
-            "baseline_overall_tps": 22.990892807291868,
+            "baseline_overall_tps": 23.298379991225325,
+            "zinc_overall_seconds": 8.76253446858002,
+            "baseline_overall_seconds": 6.352373,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 92.54653261458333,
             "delta_tps": -1.2861840501450335,
             "delta_pct": -7.453467385416673,
@@ -12825,8 +13105,8 @@
             "latency_delta_ms": 8905.415250000195,
             "end_to_end_pct_of_baseline": 41.834602007551744,
             "end_to_end_delta_tps": -12.971685447395803,
-            "overall_pct_of_baseline": 71.97512475413575,
-            "overall_delta_tps": -6.443169027153925
+            "overall_pct_of_baseline": 72.4946991395905,
+            "overall_delta_tps": -6.750656211087382
           },
           "scenarios": [
             {
@@ -13044,7 +13324,12 @@
                 "zinc_end_to_end_tps": 9.329692855009945,
                 "baseline_end_to_end_tps": 22.301378302405748,
                 "zinc_overall_tps": 16.547723780137943,
-                "baseline_overall_tps": 22.990892807291868,
+                "baseline_overall_tps": 23.298379991225325,
+                "zinc_overall_seconds": 8.76253446858002,
+                "baseline_overall_seconds": 6.352373,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 92.54653261458333,
                 "delta_tps": -1.2861840501450335,
                 "delta_pct": -7.453467385416673,
@@ -13054,8 +13339,8 @@
                 "latency_delta_ms": 8905.415250000195,
                 "end_to_end_pct_of_baseline": 41.834602007551744,
                 "end_to_end_delta_tps": -12.971685447395803,
-                "overall_pct_of_baseline": 71.97512475413575,
-                "overall_delta_tps": -6.443169027153925
+                "overall_pct_of_baseline": 72.4946991395905,
+                "overall_delta_tps": -6.750656211087382
               }
             },
             {
@@ -13273,7 +13558,12 @@
                 "zinc_end_to_end_tps": 12.712158905229646,
                 "baseline_end_to_end_tps": 34.97732494215352,
                 "zinc_overall_tps": 16.66359516616314,
-                "baseline_overall_tps": 20.56599751882925,
+                "baseline_overall_tps": 20.601768966539826,
+                "zinc_overall_seconds": 21.12389292286494,
+                "baseline_overall_seconds": 17.23153,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 95.46485484374999,
                 "delta_tps": -0.7482181408838535,
                 "delta_pct": -4.53514515625001,
@@ -13283,8 +13573,8 @@
                 "latency_delta_ms": 17540.59262400004,
                 "end_to_end_pct_of_baseline": 36.34399979487674,
                 "end_to_end_delta_tps": -22.265166036923876,
-                "overall_pct_of_baseline": 81.0249789775903,
-                "overall_delta_tps": -3.9024023526661082
+                "overall_pct_of_baseline": 81.57364773113498,
+                "overall_delta_tps": -3.938173800376685
               }
             },
             {
@@ -13502,7 +13792,12 @@
                 "zinc_end_to_end_tps": 13.552728530958984,
                 "baseline_end_to_end_tps": 56.37927918007835,
                 "zinc_overall_tps": 16.878933407258117,
-                "baseline_overall_tps": 21.110561058766073,
+                "baseline_overall_tps": 21.105529028379525,
+                "zinc_overall_seconds": 28.08234315304396,
+                "baseline_overall_seconds": 22.411189000000004,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 96.1143920703125,
                 "delta_tps": -0.628638458873457,
                 "delta_pct": -3.8856079296874952,
@@ -13512,8 +13807,8 @@
                 "latency_delta_ms": 26584.8999989999,
                 "end_to_end_pct_of_baseline": 24.038492027666518,
                 "end_to_end_delta_tps": -42.82655064911937,
-                "overall_pct_of_baseline": 79.95492568990349,
-                "overall_delta_tps": -4.2316276515079565
+                "overall_pct_of_baseline": 79.80526723807505,
+                "overall_delta_tps": -4.226595621121408
               }
             },
             {
@@ -13731,7 +14026,12 @@
                 "zinc_end_to_end_tps": 12.021613201110501,
                 "baseline_end_to_end_tps": 20.099763300794613,
                 "zinc_overall_tps": 16.138060456262963,
-                "baseline_overall_tps": 20.249688319406243,
+                "baseline_overall_tps": 20.391076187423806,
+                "zinc_overall_seconds": 20.200692696840395,
+                "baseline_overall_seconds": 16.13450888888889,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 94.01074553125001,
                 "delta_tps": -1.004041079496849,
                 "delta_pct": -5.989254468749991,
@@ -13741,8 +14041,8 @@
                 "latency_delta_ms": 10749.472790999804,
                 "end_to_end_pct_of_baseline": 59.809725225148526,
                 "end_to_end_delta_tps": -8.078150099684112,
-                "overall_pct_of_baseline": 79.69535235165614,
-                "overall_delta_tps": -4.11162786314328
+                "overall_pct_of_baseline": 79.87106744815983,
+                "overall_delta_tps": -4.253015731160843
               }
             }
           ]
@@ -13963,7 +14263,12 @@
             "zinc_end_to_end_tps": 29.761486207452396,
             "baseline_end_to_end_tps": 56.9551432760874,
             "zinc_overall_tps": 59.30974580793754,
-            "baseline_overall_tps": 64.30948015835388,
+            "baseline_overall_tps": 64.04170630571261,
+            "zinc_overall_seconds": 2.2256038733913135,
+            "baseline_overall_seconds": 2.045542,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 106.20232358333332,
             "delta_tps": 3.309001558293744,
             "delta_pct": 6.202323583333325,
@@ -13973,8 +14278,8 @@
             "latency_delta_ms": 2135.206709000282,
             "end_to_end_pct_of_baseline": 52.254255709945255,
             "end_to_end_delta_tps": -27.193657068635,
-            "overall_pct_of_baseline": 92.22550961677013,
-            "overall_delta_tps": -4.99973435041634
+            "overall_pct_of_baseline": 91.90952731777287,
+            "overall_delta_tps": -4.73196049777507
           },
           "scenarios": [
             {
@@ -14192,7 +14497,12 @@
                 "zinc_end_to_end_tps": 29.761486207452396,
                 "baseline_end_to_end_tps": 56.9551432760874,
                 "zinc_overall_tps": 59.30974580793754,
-                "baseline_overall_tps": 64.30948015835388,
+                "baseline_overall_tps": 64.04170630571261,
+                "zinc_overall_seconds": 2.2256038733913135,
+                "baseline_overall_seconds": 2.045542,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 106.20232358333332,
                 "delta_tps": 3.309001558293744,
                 "delta_pct": 6.202323583333325,
@@ -14202,8 +14512,8 @@
                 "latency_delta_ms": 2135.206709000282,
                 "end_to_end_pct_of_baseline": 52.254255709945255,
                 "end_to_end_delta_tps": -27.193657068635,
-                "overall_pct_of_baseline": 92.22550961677013,
-                "overall_delta_tps": -4.99973435041634
+                "overall_pct_of_baseline": 91.90952731777287,
+                "overall_delta_tps": -4.73196049777507
               }
             },
             {
@@ -14421,7 +14731,12 @@
                 "zinc_end_to_end_tps": 44.50260033597096,
                 "baseline_end_to_end_tps": 92.60620562811725,
                 "zinc_overall_tps": 62.28611591177837,
-                "baseline_overall_tps": 68.42868481297047,
+                "baseline_overall_tps": 67.18372376628521,
+                "zinc_overall_seconds": 5.362350743993659,
+                "baseline_overall_seconds": 4.6588665,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 105.37264003125,
                 "delta_tps": 2.8272319042633995,
                 "delta_pct": 5.3726400312500004,
@@ -14431,8 +14746,8 @@
                 "latency_delta_ms": 4125.276332000038,
                 "end_to_end_pct_of_baseline": 48.05574316982814,
                 "end_to_end_delta_tps": -48.10360529214629,
-                "overall_pct_of_baseline": 91.02340061338167,
-                "overall_delta_tps": -6.1425689011921065
+                "overall_pct_of_baseline": 86.88104755583869,
+                "overall_delta_tps": -4.897607854506845
               }
             },
             {
@@ -14650,7 +14965,12 @@
                 "zinc_end_to_end_tps": 49.85063779598381,
                 "baseline_end_to_end_tps": 163.05204219371902,
                 "zinc_overall_tps": 65.26187757923623,
-                "baseline_overall_tps": 73.91232470768291,
+                "baseline_overall_tps": 73.72369084594317,
+                "zinc_overall_seconds": 6.895296560440553,
+                "baseline_overall_seconds": 6.00892325,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 104.72416796875001,
                 "delta_tps": 2.481081906124899,
                 "delta_pct": 4.7241679687500095,
@@ -14660,8 +14980,8 @@
                 "latency_delta_ms": 6310.041790999938,
                 "end_to_end_pct_of_baseline": 30.573451963733895,
                 "end_to_end_delta_tps": -113.20140439773522,
-                "overall_pct_of_baseline": 88.29634007229717,
-                "overall_delta_tps": -8.650447128446686
+                "overall_pct_of_baseline": 87.14524744989473,
+                "overall_delta_tps": -8.46181326670694
               }
             },
             {
@@ -14879,7 +15199,12 @@
                 "zinc_end_to_end_tps": 41.19800383440752,
                 "baseline_end_to_end_tps": 59.98520677549685,
                 "zinc_overall_tps": 57.641300087436306,
-                "baseline_overall_tps": 63.146757405550076,
+                "baseline_overall_tps": 62.99269817868166,
+                "zinc_overall_seconds": 5.551574990754733,
+                "baseline_overall_seconds": 5.0640789999999996,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 104.7489669140625,
                 "delta_tps": 2.509383399542351,
                 "delta_pct": 4.748966914062507,
@@ -14889,8 +15214,8 @@
                 "latency_delta_ms": 2449.388791000005,
                 "end_to_end_pct_of_baseline": 68.68027310232821,
                 "end_to_end_delta_tps": -18.787202941089326,
-                "overall_pct_of_baseline": 91.28148848125987,
-                "overall_delta_tps": -5.50545731811377
+                "overall_pct_of_baseline": 91.21878040796385,
+                "overall_delta_tps": -5.3513980912453505
               }
             }
           ]
@@ -15111,7 +15436,12 @@
             "zinc_end_to_end_tps": 8.062610958888948,
             "baseline_end_to_end_tps": 20.922561446399705,
             "zinc_overall_tps": 18.52963547308435,
-            "baseline_overall_tps": 21.994196045866293,
+            "baseline_overall_tps": 21.92660545851963,
+            "zinc_overall_seconds": 7.123723518022772,
+            "baseline_overall_seconds": 5.974477,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 94.80879287500001,
             "delta_tps": -0.9916038184106029,
             "delta_pct": -5.191207124999991,
@@ -15121,8 +15451,8 @@
             "latency_delta_ms": 10110.684040999971,
             "end_to_end_pct_of_baseline": 38.53548706043513,
             "end_to_end_delta_tps": -12.859950487510757,
-            "overall_pct_of_baseline": 84.24784172353009,
-            "overall_delta_tps": -3.4645605727819415
+            "overall_pct_of_baseline": 83.86733405479285,
+            "overall_delta_tps": -3.3969699854352804
           },
           "scenarios": [
             {
@@ -15340,7 +15670,12 @@
                 "zinc_end_to_end_tps": 8.062610958888948,
                 "baseline_end_to_end_tps": 20.922561446399705,
                 "zinc_overall_tps": 18.52963547308435,
-                "baseline_overall_tps": 21.994196045866293,
+                "baseline_overall_tps": 21.92660545851963,
+                "zinc_overall_seconds": 7.123723518022772,
+                "baseline_overall_seconds": 5.974477,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 94.80879287500001,
                 "delta_tps": -0.9916038184106029,
                 "delta_pct": -5.191207124999991,
@@ -15350,8 +15685,8 @@
                 "latency_delta_ms": 10110.684040999971,
                 "end_to_end_pct_of_baseline": 38.53548706043513,
                 "end_to_end_delta_tps": -12.859950487510757,
-                "overall_pct_of_baseline": 84.24784172353009,
-                "overall_delta_tps": -3.4645605727819415
+                "overall_pct_of_baseline": 83.86733405479285,
+                "overall_delta_tps": -3.3969699854352804
               }
             },
             {
@@ -15569,7 +15904,12 @@
                 "zinc_end_to_end_tps": 14.016555062294934,
                 "baseline_end_to_end_tps": 35.113030820056025,
                 "zinc_overall_tps": 18.949798715067885,
-                "baseline_overall_tps": 24.06227374078303,
+                "baseline_overall_tps": 23.6667921334305,
+                "zinc_overall_seconds": 17.625517031715,
+                "baseline_overall_seconds": 13.225282,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 94.53949887499999,
                 "delta_tps": -1.0338850036293898,
                 "delta_pct": -5.4605011250000075,
@@ -15579,8 +15919,8 @@
                 "latency_delta_ms": 14914.895417000167,
                 "end_to_end_pct_of_baseline": 39.91838566749098,
                 "end_to_end_delta_tps": -21.09647575776109,
-                "overall_pct_of_baseline": 78.75315075877457,
-                "overall_delta_tps": -5.1124750257151454
+                "overall_pct_of_baseline": 75.03485983533245,
+                "overall_delta_tps": -4.716993418362616
               }
             },
             {
@@ -15798,7 +16138,12 @@
                 "zinc_end_to_end_tps": 14.932925715343774,
                 "baseline_end_to_end_tps": 61.377259987364845,
                 "zinc_overall_tps": 19.320772205053537,
-                "baseline_overall_tps": 26.7654832447034,
+                "baseline_overall_tps": 26.695338947118053,
+                "zinc_overall_seconds": 23.290994543287358,
+                "baseline_overall_seconds": 16.59465725,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 94.429307671875,
                 "delta_tps": -1.0512598231910388,
                 "delta_pct": -5.570692328125006,
@@ -15808,8 +16153,8 @@
                 "latency_delta_ms": 22917.09429100016,
                 "end_to_end_pct_of_baseline": 24.329736645816176,
                 "end_to_end_delta_tps": -46.44433427202107,
-                "overall_pct_of_baseline": 72.18540397127673,
-                "overall_delta_tps": -7.444711039649864
+                "overall_pct_of_baseline": 71.24924278848671,
+                "overall_delta_tps": -7.374566742064516
               }
             },
             {
@@ -16027,7 +16372,12 @@
                 "zinc_end_to_end_tps": 13.206728225110576,
                 "baseline_end_to_end_tps": 21.817672158852382,
                 "zinc_overall_tps": 18.240495740531664,
-                "baseline_overall_tps": 22.33125491898228,
+                "baseline_overall_tps": 22.280751295758392,
+                "zinc_overall_seconds": 17.54338284177976,
+                "baseline_overall_seconds": 14.317291,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 94.4879181796875,
                 "delta_tps": -1.0424708685153306,
                 "delta_pct": -5.512081820312503,
@@ -16037,8 +16387,8 @@
                 "latency_delta_ms": 9608.898958999896,
                 "end_to_end_pct_of_baseline": 60.532251694652174,
                 "end_to_end_delta_tps": -8.610943933741806,
-                "overall_pct_of_baseline": 81.68146307365225,
-                "overall_delta_tps": -4.090759178450618
+                "overall_pct_of_baseline": 81.61077671920386,
+                "overall_delta_tps": -4.040255555226729
               }
             }
           ]
@@ -16259,7 +16609,12 @@
             "zinc_end_to_end_tps": 3.3211147627594273,
             "baseline_end_to_end_tps": 70.43649479155097,
             "zinc_overall_tps": 69.26115516690213,
-            "baseline_overall_tps": 127.12948913910908,
+            "baseline_overall_tps": 84.36367570603058,
+            "zinc_overall_seconds": 0.5486480828745849,
+            "baseline_overall_seconds": 1.552801,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": false,
+            "overall_unavailable_reason": "Generated token counts did not match the scenario budget, or phase telemetry was incomplete.",
             "pct_of_baseline": 139.5244909375,
             "delta_tps": 29.452616491628433,
             "delta_pct": 39.52449093749999,
@@ -16269,8 +16624,8 @@
             "latency_delta_ms": 9582.109916999936,
             "end_to_end_pct_of_baseline": 4.715048317761836,
             "end_to_end_delta_tps": -67.11538002879155,
-            "overall_pct_of_baseline": 54.48079405960201,
-            "overall_delta_tps": -57.868333972206955
+            "overall_pct_of_baseline": null,
+            "overall_delta_tps": null
           },
           "scenarios": [
             {
@@ -16488,7 +16843,12 @@
                 "zinc_end_to_end_tps": 3.3211147627594273,
                 "baseline_end_to_end_tps": 70.43649479155097,
                 "zinc_overall_tps": 69.26115516690213,
-                "baseline_overall_tps": 127.12948913910908,
+                "baseline_overall_tps": 84.36367570603058,
+                "zinc_overall_seconds": 0.5486480828745849,
+                "baseline_overall_seconds": 1.552801,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": false,
+                "overall_unavailable_reason": "Generated token counts did not match the scenario budget, or phase telemetry was incomplete.",
                 "pct_of_baseline": 139.5244909375,
                 "delta_tps": 29.452616491628433,
                 "delta_pct": 39.52449093749999,
@@ -16498,8 +16858,8 @@
                 "latency_delta_ms": 9582.109916999936,
                 "end_to_end_pct_of_baseline": 4.715048317761836,
                 "end_to_end_delta_tps": -67.11538002879155,
-                "overall_pct_of_baseline": 54.48079405960201,
-                "overall_delta_tps": -57.868333972206955
+                "overall_pct_of_baseline": null,
+                "overall_delta_tps": null
               }
             },
             {
@@ -16717,7 +17077,12 @@
                 "zinc_end_to_end_tps": 17.10920280840363,
                 "baseline_end_to_end_tps": 126.21151588347742,
                 "zinc_overall_tps": 69.85268578628614,
-                "baseline_overall_tps": 99.67869109906007,
+                "baseline_overall_tps": 84.7702006474087,
+                "zinc_overall_seconds": 2.5625356847072336,
+                "baseline_overall_seconds": 3.69233525,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": false,
+                "overall_unavailable_reason": "Generated token counts did not match the scenario budget, or phase telemetry was incomplete.",
                 "pct_of_baseline": 87.58576339375,
                 "delta_tps": -9.140687798060483,
                 "delta_pct": -12.41423660625,
@@ -16727,8 +17092,8 @@
                 "latency_delta_ms": 7982.241875000298,
                 "end_to_end_pct_of_baseline": 13.555976004756495,
                 "end_to_end_delta_tps": -109.1023130750738,
-                "overall_pct_of_baseline": 70.07785216287297,
-                "overall_delta_tps": -29.82600531277393
+                "overall_pct_of_baseline": null,
+                "overall_delta_tps": null
               }
             },
             {
@@ -16946,7 +17311,12 @@
                 "zinc_end_to_end_tps": 30.733299689986296,
                 "baseline_end_to_end_tps": 217.9958752247072,
                 "zinc_overall_tps": 63.83426336505406,
-                "baseline_overall_tps": 89.24492545916762,
+                "baseline_overall_tps": 89.12453801224417,
+                "zinc_overall_seconds": 7.049505645996874,
+                "baseline_overall_seconds": 4.97057275,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 70.57890450000002,
                 "delta_tps": -21.60970904160179,
                 "delta_pct": -29.42109549999998,
@@ -16956,8 +17326,8 @@
                 "latency_delta_ms": 12609.949915999547,
                 "end_to_end_pct_of_baseline": 14.09811064466556,
                 "end_to_end_delta_tps": -187.2625755347209,
-                "overall_pct_of_baseline": 71.52705101900753,
-                "overall_delta_tps": -25.410662094113555
+                "overall_pct_of_baseline": 70.50952222192467,
+                "overall_delta_tps": -25.29027464719011
               }
             },
             {
@@ -17175,7 +17545,12 @@
                 "zinc_end_to_end_tps": 23.78283992851728,
                 "baseline_end_to_end_tps": 79.83198994843193,
                 "zinc_overall_tps": 54.83264822854367,
-                "baseline_overall_tps": 86.84931692624518,
+                "baseline_overall_tps": 86.66469429776195,
+                "zinc_overall_seconds": 5.8359391774446685,
+                "baseline_overall_seconds": 3.680853,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 70.1940834140625,
                 "delta_tps": -22.127026064735844,
                 "delta_pct": -29.805916585937496,
@@ -17185,8 +17560,8 @@
                 "latency_delta_ms": 9459.18754200032,
                 "end_to_end_pct_of_baseline": 29.791114995229336,
                 "end_to_end_delta_tps": -56.04915001991465,
-                "overall_pct_of_baseline": 63.13538225649956,
-                "overall_delta_tps": -32.01666869770151
+                "overall_pct_of_baseline": 63.072161790618644,
+                "overall_delta_tps": -31.832046069218286
               }
             }
           ]
@@ -17244,7 +17619,7 @@
         "average_end_to_end_tps": 21.901157801150998,
         "average_total_latency_ms": 7214.6811416000055,
         "compared_models": 5,
-        "average_pct_of_llama": 77.98544925389828
+        "average_pct_of_llama": 77.45991818902101
       },
       "models": [
         {
@@ -17463,7 +17838,12 @@
             "zinc_end_to_end_tps": 19.361470819335416,
             "baseline_end_to_end_tps": 116.14461102738055,
             "zinc_overall_tps": 94.83051818831738,
-            "baseline_overall_tps": 114.27819331693244,
+            "baseline_overall_tps": 115.97664481133813,
+            "zinc_overall_seconds": 1.5290436324734038,
+            "baseline_overall_seconds": 1.276119,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 83.15956553125001,
             "delta_tps": -14.060094682985493,
             "delta_pct": -16.84043446874999,
@@ -17473,8 +17853,8 @@
             "latency_delta_ms": 6214.826958999991,
             "end_to_end_pct_of_baseline": 16.67014134196122,
             "end_to_end_delta_tps": -96.78314020804513,
-            "overall_pct_of_baseline": 82.9821643446182,
-            "overall_delta_tps": -19.44767512861506
+            "overall_pct_of_baseline": 83.45863864824648,
+            "overall_delta_tps": -21.14612662302075
           },
           "scenarios": [
             {
@@ -17692,7 +18072,12 @@
                 "zinc_end_to_end_tps": 19.361470819335416,
                 "baseline_end_to_end_tps": 116.14461102738055,
                 "zinc_overall_tps": 94.83051818831738,
-                "baseline_overall_tps": 114.27819331693244,
+                "baseline_overall_tps": 115.97664481133813,
+                "zinc_overall_seconds": 1.5290436324734038,
+                "baseline_overall_seconds": 1.276119,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 83.15956553125001,
                 "delta_tps": -14.060094682985493,
                 "delta_pct": -16.84043446874999,
@@ -17702,8 +18087,8 @@
                 "latency_delta_ms": 6214.826958999991,
                 "end_to_end_pct_of_baseline": 16.67014134196122,
                 "end_to_end_delta_tps": -96.78314020804513,
-                "overall_pct_of_baseline": 82.9821643446182,
-                "overall_delta_tps": -19.44767512861506
+                "overall_pct_of_baseline": 83.45863864824648,
+                "overall_delta_tps": -21.14612662302075
               }
             },
             {
@@ -17921,7 +18306,12 @@
                 "zinc_end_to_end_tps": 32.6931775942847,
                 "baseline_end_to_end_tps": 181.0852888000815,
                 "zinc_overall_tps": 72.67412473334169,
-                "baseline_overall_tps": 107.61450917511523,
+                "baseline_overall_tps": 107.83783619584567,
+                "zinc_overall_seconds": 4.84353958567193,
+                "baseline_overall_seconds": 3.2919799999999997,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 74.13474149999999,
                 "delta_tps": -21.509391605891018,
                 "delta_pct": -25.86525850000001,
@@ -17931,8 +18321,8 @@
                 "latency_delta_ms": 8806.370124999987,
                 "end_to_end_pct_of_baseline": 18.054021842921777,
                 "end_to_end_delta_tps": -148.39211120579682,
-                "overall_pct_of_baseline": 67.5319018693688,
-                "overall_delta_tps": -34.940384441773546
+                "overall_pct_of_baseline": 67.96641055104152,
+                "overall_delta_tps": -35.16371146250398
               }
             },
             {
@@ -18150,7 +18540,12 @@
                 "zinc_end_to_end_tps": 37.564993159099714,
                 "baseline_end_to_end_tps": 299.4984192330926,
                 "zinc_overall_tps": 68.25383882017506,
-                "baseline_overall_tps": 118.45763362733318,
+                "baseline_overall_tps": 118.41818342500937,
+                "zinc_overall_seconds": 6.944664332343619,
+                "baseline_overall_seconds": 3.994319,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 68.4820930703125,
                 "delta_tps": -26.182811372148677,
                 "delta_pct": -31.5179069296875,
@@ -18160,8 +18555,8 @@
                 "latency_delta_ms": 11038.823707999982,
                 "end_to_end_pct_of_baseline": 12.542634867753263,
                 "end_to_end_delta_tps": -261.9334260739929,
-                "overall_pct_of_baseline": 57.61877620728194,
-                "overall_delta_tps": -50.20379480715812
+                "overall_pct_of_baseline": 57.51637240978119,
+                "overall_delta_tps": -50.16434460483431
               }
             },
             {
@@ -18379,7 +18774,12 @@
                 "zinc_end_to_end_tps": 32.97209837316579,
                 "baseline_end_to_end_tps": 102.82551253647874,
                 "zinc_overall_tps": 75.87148304680991,
-                "baseline_overall_tps": 101.50674902252182,
+                "baseline_overall_tps": 102.26285490883288,
+                "zinc_overall_seconds": 4.296739524636285,
+                "baseline_overall_seconds": 3.2171994444444447,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 75.06736256250001,
                 "delta_tps": -20.71537541607598,
                 "delta_pct": -24.93263743749999,
@@ -18389,8 +18789,8 @@
                 "latency_delta_ms": 6687.552458999999,
                 "end_to_end_pct_of_baseline": 32.066067612810095,
                 "end_to_end_delta_tps": -69.85341416331295,
-                "overall_pct_of_baseline": 74.74525957872606,
-                "overall_delta_tps": -25.635265975711903
+                "overall_pct_of_baseline": 74.87536598385674,
+                "overall_delta_tps": -26.391371862022964
               }
             }
           ]
@@ -18611,7 +19011,12 @@
             "zinc_end_to_end_tps": 14.221302933487515,
             "baseline_end_to_end_tps": 31.13275716039894,
             "zinc_overall_tps": 31.476818145977344,
-            "baseline_overall_tps": 30.862697534567104,
+            "baseline_overall_tps": 31.158557846286566,
+            "zinc_overall_seconds": 4.606564720981197,
+            "baseline_overall_seconds": 4.717805,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 99.66442500000001,
             "delta_tps": -0.07636467074384612,
             "delta_pct": -0.3355749999999915,
@@ -18621,8 +19026,8 @@
             "latency_delta_ms": 5474.2567500000005,
             "end_to_end_pct_of_baseline": 45.67954858677631,
             "end_to_end_delta_tps": -16.911454226911424,
-            "overall_pct_of_baseline": 101.98984748731831,
-            "overall_delta_tps": 0.6141206114102395
+            "overall_pct_of_baseline": 102.41482071253975,
+            "overall_delta_tps": 0.3182602996907775
           },
           "scenarios": [
             {
@@ -18840,7 +19245,12 @@
                 "zinc_end_to_end_tps": 14.221302933487515,
                 "baseline_end_to_end_tps": 31.13275716039894,
                 "zinc_overall_tps": 31.476818145977344,
-                "baseline_overall_tps": 30.862697534567104,
+                "baseline_overall_tps": 31.158557846286566,
+                "zinc_overall_seconds": 4.606564720981197,
+                "baseline_overall_seconds": 4.717805,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 99.66442500000001,
                 "delta_tps": -0.07636467074384612,
                 "delta_pct": -0.3355749999999915,
@@ -18850,8 +19260,8 @@
                 "latency_delta_ms": 5474.2567500000005,
                 "end_to_end_pct_of_baseline": 45.67954858677631,
                 "end_to_end_delta_tps": -16.911454226911424,
-                "overall_pct_of_baseline": 101.98984748731831,
-                "overall_delta_tps": 0.6141206114102395
+                "overall_pct_of_baseline": 102.41482071253975,
+                "overall_delta_tps": 0.3182602996907775
               }
             },
             {
@@ -19069,7 +19479,12 @@
                 "zinc_end_to_end_tps": 23.894220218667616,
                 "baseline_end_to_end_tps": 48.79872793152274,
                 "zinc_overall_tps": 39.6233314132818,
-                "baseline_overall_tps": 23.93175544470892,
+                "baseline_overall_tps": 23.937920128248827,
+                "zinc_overall_seconds": 8.883654842863846,
+                "baseline_overall_seconds": 14.7882522,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 89.50841679375,
                 "delta_tps": -2.380603551618357,
                 "delta_pct": -10.491583206249999,
@@ -19079,8 +19494,8 @@
                 "latency_delta_ms": 7477.308583999984,
                 "end_to_end_pct_of_baseline": 48.964842387279845,
                 "end_to_end_delta_tps": -24.904507712855125,
-                "overall_pct_of_baseline": 165.56801069117614,
-                "overall_delta_tps": 15.691575968572877
+                "overall_pct_of_baseline": 166.46585737039592,
+                "overall_delta_tps": 15.68541128503297
               }
             },
             {
@@ -19298,7 +19713,12 @@
                 "zinc_end_to_end_tps": 32.92297737955191,
                 "baseline_end_to_end_tps": 78.12248605315645,
                 "zinc_overall_tps": 55.721635105500724,
-                "baseline_overall_tps": 22.68550642138625,
+                "baseline_overall_tps": 22.68436162217408,
+                "zinc_overall_seconds": 8.506570187729608,
+                "baseline_overall_seconds": 20.807285999999998,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 87.587830859375,
                 "delta_tps": -2.7279389569613564,
                 "delta_pct": -12.412169140624997,
@@ -19308,8 +19728,8 @@
                 "latency_delta_ms": 8355.44537599996,
                 "end_to_end_pct_of_baseline": 42.14276713768467,
                 "end_to_end_delta_tps": -45.19950867360454,
-                "overall_pct_of_baseline": 245.6265867310346,
-                "overall_delta_tps": 33.03612868411447
+                "overall_pct_of_baseline": 244.60253122949234,
+                "overall_delta_tps": 33.03727348332664
               }
             },
             {
@@ -19527,7 +19947,12 @@
                 "zinc_end_to_end_tps": 17.482474043530924,
                 "baseline_end_to_end_tps": 27.083047885336786,
                 "zinc_overall_tps": 25.814101243583515,
-                "baseline_overall_tps": 26.797457500342112,
+                "baseline_overall_tps": 26.926535884153505,
+                "zinc_overall_seconds": 12.62875654371396,
+                "baseline_overall_seconds": 12.181292142857142,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 95.89187759765625,
                 "delta_tps": -0.9060912246825588,
                 "delta_pct": -4.108122402343753,
@@ -19537,8 +19962,8 @@
                 "latency_delta_ms": 6536.349458000041,
                 "end_to_end_pct_of_baseline": 64.55135373813015,
                 "end_to_end_delta_tps": -9.600573841805861,
-                "overall_pct_of_baseline": 96.33041210440936,
-                "overall_delta_tps": -0.9833562567585972
+                "overall_pct_of_baseline": 96.45678179551615,
+                "overall_delta_tps": -1.1124346405699903
               }
             }
           ]
@@ -19759,7 +20184,12 @@
             "zinc_end_to_end_tps": 27.598515442234632,
             "baseline_end_to_end_tps": 73.0197164382399,
             "zinc_overall_tps": 31.04708048395581,
-            "baseline_overall_tps": 73.61646342016257,
+            "baseline_overall_tps": 73.18120952338921,
+            "zinc_overall_seconds": 4.251607492311994,
+            "baseline_overall_seconds": 1.790077,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 51.605299374999994,
             "delta_tps": -27.570893214588587,
             "delta_pct": -48.394700625000006,
@@ -19769,8 +20199,8 @@
             "latency_delta_ms": 2988.829957999871,
             "end_to_end_pct_of_baseline": 37.79597729002065,
             "end_to_end_delta_tps": -45.42120099600527,
-            "overall_pct_of_baseline": 42.174099435823244,
-            "overall_delta_tps": -42.569382936206765
+            "overall_pct_of_baseline": 42.10353385718042,
+            "overall_delta_tps": -42.134129039433404
           },
           "scenarios": [
             {
@@ -19988,7 +20418,12 @@
                 "zinc_end_to_end_tps": 27.598515442234632,
                 "baseline_end_to_end_tps": 73.0197164382399,
                 "zinc_overall_tps": 31.04708048395581,
-                "baseline_overall_tps": 73.61646342016257,
+                "baseline_overall_tps": 73.18120952338921,
+                "zinc_overall_seconds": 4.251607492311994,
+                "baseline_overall_seconds": 1.790077,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 51.605299374999994,
                 "delta_tps": -27.570893214588587,
                 "delta_pct": -48.394700625000006,
@@ -19998,8 +20433,8 @@
                 "latency_delta_ms": 2988.829957999871,
                 "end_to_end_pct_of_baseline": 37.79597729002065,
                 "end_to_end_delta_tps": -45.42120099600527,
-                "overall_pct_of_baseline": 42.174099435823244,
-                "overall_delta_tps": -42.569382936206765
+                "overall_pct_of_baseline": 42.10353385718042,
+                "overall_delta_tps": -42.134129039433404
               }
             },
             {
@@ -20217,7 +20652,12 @@
                 "zinc_end_to_end_tps": 30.81262770271074,
                 "baseline_end_to_end_tps": 109.9925412406154,
                 "zinc_overall_tps": 32.439204072290885,
-                "baseline_overall_tps": 67.09694423641267,
+                "baseline_overall_tps": 66.40318955946681,
+                "zinc_overall_seconds": 10.296183570215835,
+                "baseline_overall_seconds": 4.713629,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 50.3137338125,
                 "delta_tps": -28.509959331953826,
                 "delta_pct": -49.6862661875,
@@ -20227,8 +20667,8 @@
                 "latency_delta_ms": 7994.064167000004,
                 "end_to_end_pct_of_baseline": 28.01337923023911,
                 "end_to_end_delta_tps": -79.17991353790465,
-                "overall_pct_of_baseline": 48.34676815980322,
-                "overall_delta_tps": -34.65774016412178
+                "overall_pct_of_baseline": 45.78035121319414,
+                "overall_delta_tps": -33.963985487175925
               }
             },
             {
@@ -20446,7 +20886,12 @@
                 "zinc_end_to_end_tps": 32.43721687399615,
                 "baseline_end_to_end_tps": 196.01476834732662,
                 "zinc_overall_tps": 33.75170628621118,
-                "baseline_overall_tps": 76.4384895652544,
+                "baseline_overall_tps": 76.28552189908933,
+                "zinc_overall_seconds": 13.33265927903152,
+                "baseline_overall_seconds": 5.80713075,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 49.239258328125,
                 "delta_tps": -29.411571357308475,
                 "delta_pct": -50.760741671875,
@@ -20456,8 +20901,8 @@
                 "latency_delta_ms": 11612.919666999951,
                 "end_to_end_pct_of_baseline": 16.548353548809807,
                 "end_to_end_delta_tps": -163.57755147333046,
-                "overall_pct_of_baseline": 44.15538098433755,
-                "overall_delta_tps": -42.68678327904322
+                "overall_pct_of_baseline": 43.555682542138946,
+                "overall_delta_tps": -42.53381561287815
               }
             },
             {
@@ -20675,7 +21120,12 @@
                 "zinc_end_to_end_tps": 28.757543154119553,
                 "baseline_end_to_end_tps": 69.89616274485971,
                 "zinc_overall_tps": 30.231406835471784,
-                "baseline_overall_tps": 70.25937737289853,
+                "baseline_overall_tps": 70.07440627866681,
+                "zinc_overall_seconds": 10.58501847901205,
+                "baseline_overall_seconds": 4.5523039999999995,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 49.8612347109375,
                 "delta_tps": -29.10108174973003,
                 "delta_pct": -50.1387652890625,
@@ -20685,8 +21135,8 @@
                 "latency_delta_ms": 6563.602333000046,
                 "end_to_end_pct_of_baseline": 41.143235944285706,
                 "end_to_end_delta_tps": -41.138619590740156,
-                "overall_pct_of_baseline": 43.028287419941016,
-                "overall_delta_tps": -40.02797053742674
+                "overall_pct_of_baseline": 43.00704820710797,
+                "overall_delta_tps": -39.842999443195026
               }
             }
           ]
@@ -20907,7 +21357,12 @@
             "zinc_end_to_end_tps": 13.439801279195947,
             "baseline_end_to_end_tps": 27.7582282685728,
             "zinc_overall_tps": 15.562793914246196,
-            "baseline_overall_tps": 27.974789628219593,
+            "baseline_overall_tps": 27.819217557961128,
+            "zinc_overall_seconds": 8.481767523707108,
+            "baseline_overall_seconds": 4.708975,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 70.35501375,
             "delta_tps": -6.505841777338864,
             "delta_pct": -29.644986250000002,
@@ -20917,8 +21372,8 @@
             "latency_delta_ms": 5102.252416000236,
             "end_to_end_pct_of_baseline": 48.41735988752628,
             "end_to_end_delta_tps": -14.318426989376853,
-            "overall_pct_of_baseline": 55.63149578986365,
-            "overall_delta_tps": -12.411995713973397
+            "overall_pct_of_baseline": 55.5187935396496,
+            "overall_delta_tps": -12.256423643714932
           },
           "scenarios": [
             {
@@ -21136,7 +21591,12 @@
                 "zinc_end_to_end_tps": 13.439801279195947,
                 "baseline_end_to_end_tps": 27.7582282685728,
                 "zinc_overall_tps": 15.562793914246196,
-                "baseline_overall_tps": 27.974789628219593,
+                "baseline_overall_tps": 27.819217557961128,
+                "zinc_overall_seconds": 8.481767523707108,
+                "baseline_overall_seconds": 4.708975,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 70.35501375,
                 "delta_tps": -6.505841777338864,
                 "delta_pct": -29.644986250000002,
@@ -21146,8 +21606,8 @@
                 "latency_delta_ms": 5102.252416000236,
                 "end_to_end_pct_of_baseline": 48.41735988752628,
                 "end_to_end_delta_tps": -14.318426989376853,
-                "overall_pct_of_baseline": 55.63149578986365,
-                "overall_delta_tps": -12.411995713973397
+                "overall_pct_of_baseline": 55.5187935396496,
+                "overall_delta_tps": -12.256423643714932
               }
             },
             {
@@ -21365,7 +21825,12 @@
                 "zinc_end_to_end_tps": 14.623674753632994,
                 "baseline_end_to_end_tps": 41.84552141057006,
                 "zinc_overall_tps": 15.501786480914937,
-                "baseline_overall_tps": 24.576993336728247,
+                "baseline_overall_tps": 24.38777861405696,
+                "zinc_overall_seconds": 21.545903784135135,
+                "baseline_overall_seconds": 12.834297249999999,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 69.57836462499999,
                 "delta_tps": -6.641499032591701,
                 "delta_pct": -30.421635375000008,
@@ -21375,8 +21840,8 @@
                 "latency_delta_ms": 15359.783999999985,
                 "end_to_end_pct_of_baseline": 34.94680974375216,
                 "end_to_end_delta_tps": -27.221846656937064,
-                "overall_pct_of_baseline": 63.07438126594933,
-                "overall_delta_tps": -9.07520685581331
+                "overall_pct_of_baseline": 59.567226228171776,
+                "overall_delta_tps": -8.885992133142022
               }
             },
             {
@@ -21594,7 +22059,12 @@
                 "zinc_end_to_end_tps": 14.752054798165798,
                 "baseline_end_to_end_tps": 72.07322753021516,
                 "zinc_overall_tps": 15.476065498777176,
-                "baseline_overall_tps": 24.05747812674041,
+                "baseline_overall_tps": 24.038636654962396,
+                "zinc_overall_seconds": 29.07715788845403,
+                "baseline_overall_seconds": 18.428665749999997,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 69.850476,
                 "delta_tps": -6.448544295675239,
                 "delta_pct": -30.149524,
@@ -21604,8 +22074,8 @@
                 "latency_delta_ms": 24357.698623999953,
                 "end_to_end_pct_of_baseline": 20.468147887481955,
                 "end_to_end_delta_tps": -57.32117273204936,
-                "overall_pct_of_baseline": 64.32954201286456,
-                "overall_delta_tps": -8.581412627963234
+                "overall_pct_of_baseline": 63.37849737823813,
+                "overall_delta_tps": -8.56257115618522
               }
             },
             {
@@ -21823,7 +22293,12 @@
                 "zinc_end_to_end_tps": 14.345302553386837,
                 "baseline_end_to_end_tps": 25.64265617469481,
                 "zinc_overall_tps": 15.283818274629914,
-                "baseline_overall_tps": 25.727988460629636,
+                "baseline_overall_tps": 25.662191121541532,
+                "zinc_overall_seconds": 20.937176447012458,
+                "baseline_overall_seconds": 12.430738999999997,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 70.972813203125,
                 "delta_tps": -6.200291801611286,
                 "delta_pct": -29.027186796875,
@@ -21833,8 +22308,8 @@
                 "latency_delta_ms": 9866.744792000158,
                 "end_to_end_pct_of_baseline": 55.943122489562334,
                 "end_to_end_delta_tps": -11.297353621307973,
-                "overall_pct_of_baseline": 59.40541483846683,
-                "overall_delta_tps": -10.444170185999722
+                "overall_pct_of_baseline": 59.37161121729835,
+                "overall_delta_tps": -10.378372846911619
               }
             }
           ]
@@ -22055,7 +22530,12 @@
             "zinc_end_to_end_tps": 34.88469853150149,
             "baseline_end_to_end_tps": 79.14639704530099,
             "zinc_overall_tps": 85.44882306423112,
-            "baseline_overall_tps": 79.74718691798148,
+            "baseline_overall_tps": 79.30314930361546,
+            "zinc_overall_seconds": 1.5447842962187646,
+            "baseline_overall_seconds": 1.6518889999999997,
+            "overall_basis": "phase_wall_time_v2",
+            "overall_comparable": true,
+            "overall_unavailable_reason": null,
             "pct_of_baseline": 130.61260931249998,
             "delta_tps": 19.146268250065468,
             "delta_pct": 30.612609312499984,
@@ -22065,8 +22545,8 @@
             "latency_delta_ms": 2128.733332999982,
             "end_to_end_pct_of_baseline": 44.076167499494076,
             "end_to_end_delta_tps": -44.261698513799494,
-            "overall_pct_of_baseline": 107.14963921186795,
-            "overall_delta_tps": 5.7016361462496405
+            "overall_pct_of_baseline": 106.93331127481034,
+            "overall_delta_tps": 6.145673760615665
           },
           "scenarios": [
             {
@@ -22284,7 +22764,12 @@
                 "zinc_end_to_end_tps": 34.88469853150149,
                 "baseline_end_to_end_tps": 79.14639704530099,
                 "zinc_overall_tps": 85.44882306423112,
-                "baseline_overall_tps": 79.74718691798148,
+                "baseline_overall_tps": 79.30314930361546,
+                "zinc_overall_seconds": 1.5447842962187646,
+                "baseline_overall_seconds": 1.6518889999999997,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 130.61260931249998,
                 "delta_tps": 19.146268250065468,
                 "delta_pct": 30.612609312499984,
@@ -22294,8 +22779,8 @@
                 "latency_delta_ms": 2128.733332999982,
                 "end_to_end_pct_of_baseline": 44.076167499494076,
                 "end_to_end_delta_tps": -44.261698513799494,
-                "overall_pct_of_baseline": 107.14963921186795,
-                "overall_delta_tps": 5.7016361462496405
+                "overall_pct_of_baseline": 106.93331127481034,
+                "overall_delta_tps": 6.145673760615665
               }
             },
             {
@@ -22513,7 +22998,12 @@
                 "zinc_end_to_end_tps": 54.06402390979423,
                 "baseline_end_to_end_tps": 118.32271130255758,
                 "zinc_overall_tps": 85.73358118776564,
-                "baseline_overall_tps": 86.98063899519133,
+                "baseline_overall_tps": 84.7786100045802,
+                "zinc_overall_seconds": 3.895789670426861,
+                "baseline_overall_seconds": 3.6919690000000003,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 120.95965702500003,
                 "delta_tps": 12.829508980918021,
                 "delta_pct": 20.959657025000027,
@@ -22523,8 +23013,8 @@
                 "latency_delta_ms": 3532.5526660000905,
                 "end_to_end_pct_of_baseline": 45.69200901046765,
                 "end_to_end_delta_tps": -64.25868739276335,
-                "overall_pct_of_baseline": 98.56628116115054,
-                "overall_delta_tps": -1.2470578074256906
+                "overall_pct_of_baseline": 94.768180839585,
+                "overall_delta_tps": 0.9549711831854353
               }
             },
             {
@@ -22742,7 +23232,12 @@
                 "zinc_end_to_end_tps": 57.97561457115917,
                 "baseline_end_to_end_tps": 211.5116361500942,
                 "zinc_overall_tps": 80.3076003188945,
-                "baseline_overall_tps": 92.89056871734638,
+                "baseline_overall_tps": 92.60392517310194,
+                "zinc_overall_seconds": 5.603454694363785,
+                "baseline_overall_seconds": 4.783814499999999,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 114.16444349999999,
                 "delta_tps": 8.813970754738534,
                 "delta_pct": 14.16444349999999,
@@ -22752,8 +23247,8 @@
                 "latency_delta_ms": 5667.43666700006,
                 "end_to_end_pct_of_baseline": 27.4101300649096,
                 "end_to_end_delta_tps": -153.53602157893505,
-                "overall_pct_of_baseline": 86.45398712463461,
-                "overall_delta_tps": -12.582968398451882
+                "overall_pct_of_baseline": 85.37259174794046,
+                "overall_delta_tps": -12.296324854207441
               }
             },
             {
@@ -22971,7 +23466,12 @@
                 "zinc_end_to_end_tps": 51.741921774514566,
                 "baseline_end_to_end_tps": 74.92879122360773,
                 "zinc_overall_tps": 79.97942263613275,
-                "baseline_overall_tps": 75.31571265201121,
+                "baseline_overall_tps": 75.11822879222838,
+                "zinc_overall_seconds": 4.0010291329038905,
+                "baseline_overall_seconds": 4.246639000000001,
+                "overall_basis": "phase_wall_time_v2",
+                "overall_comparable": true,
+                "overall_unavailable_reason": null,
                 "pct_of_baseline": 121.85631847265628,
                 "delta_tps": 13.608148541698547,
                 "delta_pct": 21.856318472656284,
@@ -22981,8 +23481,8 @@
                 "latency_delta_ms": 1927.1647920000833,
                 "end_to_end_pct_of_baseline": 69.05479313032384,
                 "end_to_end_delta_tps": -23.186869449093166,
-                "overall_pct_of_baseline": 106.19221384210987,
-                "overall_delta_tps": 4.663709984121539
+                "overall_pct_of_baseline": 106.13866730127633,
+                "overall_delta_tps": 4.861193843904374
               }
             }
           ]

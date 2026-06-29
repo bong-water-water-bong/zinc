@@ -184,6 +184,22 @@ function generatedTokensValue(scenario: any) {
   return scenario?.zinc?.generated_tokens ?? scenario?.baseline?.generated_tokens ?? scenario?.max_tokens ?? null;
 }
 
+function zincPromptTokensValue(scenario: any) {
+  return scenario?.zinc?.prompt_tokens ?? null;
+}
+
+function baselinePromptTokensValue(scenario: any) {
+  return scenario?.baseline?.prompt_tokens ?? null;
+}
+
+function zincGeneratedTokensValue(scenario: any) {
+  return scenario?.zinc?.generated_tokens ?? null;
+}
+
+function baselineGeneratedTokensValue(scenario: any) {
+  return scenario?.baseline?.generated_tokens ?? null;
+}
+
 function tokenShapeText(scenario: any, compact = false) {
   const promptTokens = promptTokensValue(scenario);
   const generatedTokens = generatedTokensValue(scenario);
@@ -285,12 +301,22 @@ function combinedPhaseThroughput(
   return ((promptTokens ?? 0) + (generatedTokens ?? 0)) / (seconds ?? 1);
 }
 
+function matchingGeneratedBudget(scenario: any) {
+  const zincGenerated = zincGeneratedTokensValue(scenario);
+  const baselineGenerated = baselineGeneratedTokensValue(scenario);
+  if (!hasValue(zincGenerated) || !hasValue(baselineGenerated)) return false;
+  if (zincGenerated !== baselineGenerated) return false;
+  const expected = scenario?.max_tokens ?? null;
+  if (hasValue(expected) && (zincGenerated ?? 0) < (expected ?? 0)) return false;
+  return true;
+}
+
 function overallValue(scenario: any) {
   return combinedPhaseThroughput(
     promptValue(scenario),
     decodeValue(scenario),
-    promptTokensValue(scenario),
-    generatedTokensValue(scenario),
+    zincPromptTokensValue(scenario),
+    zincGeneratedTokensValue(scenario),
   ) ?? endToEndValue(scenario);
 }
 
@@ -298,44 +324,81 @@ function baselineOverallValue(scenario: any) {
   return combinedPhaseThroughput(
     baselinePromptValue(scenario),
     baselineDecodeValue(scenario),
-    promptTokensValue(scenario),
-    generatedTokensValue(scenario),
+    baselinePromptTokensValue(scenario),
+    baselineGeneratedTokensValue(scenario),
   ) ?? baselineEndToEndValue(scenario);
 }
 
-function overallRatioValue(scenario: any) {
-  if (hasValue(scenario?.comparison?.overall_pct_of_baseline)) {
-    return scenario.comparison.overall_pct_of_baseline;
-  }
-
+function computedOverallRatioValue(scenario: any) {
+  if (!matchingGeneratedBudget(scenario)) return null;
   const zincSeconds = combinedPhaseSeconds(
     promptValue(scenario),
     decodeValue(scenario),
-    promptTokensValue(scenario),
-    generatedTokensValue(scenario),
+    zincPromptTokensValue(scenario),
+    zincGeneratedTokensValue(scenario),
   );
   const baselineSeconds = combinedPhaseSeconds(
     baselinePromptValue(scenario),
     baselineDecodeValue(scenario),
-    promptTokensValue(scenario),
-    generatedTokensValue(scenario),
+    baselinePromptTokensValue(scenario),
+    baselineGeneratedTokensValue(scenario),
   );
   if (hasValue(zincSeconds) && hasValue(baselineSeconds) && (zincSeconds ?? 0) > 0) {
     return ((baselineSeconds ?? 0) / (zincSeconds ?? 1)) * 100;
   }
+  return null;
+}
 
-  if (hasValue(endToEndRatioValue(scenario))) return endToEndRatioValue(scenario);
-  return mean([promptRatioValue(scenario), decodeRatioValue(scenario)]);
+function overallRatioValue(scenario: any) {
+  const computed = computedOverallRatioValue(scenario);
+  if (hasValue(computed)) return computed;
+
+  if (
+    scenario?.comparison?.overall_basis === 'phase_wall_time_v2'
+    && scenario?.comparison?.overall_comparable
+    && hasValue(scenario?.comparison?.overall_pct_of_baseline)
+  ) {
+    return scenario.comparison.overall_pct_of_baseline;
+  }
+
+  if (matchingGeneratedBudget(scenario) && hasValue(endToEndRatioValue(scenario))) return endToEndRatioValue(scenario);
+  return null;
 }
 
 function overallDeltaValue(scenario: any) {
-  if (hasValue(scenario?.comparison?.overall_delta_tps)) {
+  if (hasValue(overallRatioValue(scenario)) && hasValue(scenario?.comparison?.overall_delta_tps)) {
     return scenario.comparison.overall_delta_tps;
   }
   const zinc = overallValue(scenario);
   const baseline = baselineOverallValue(scenario);
   if (!hasValue(zinc) || !hasValue(baseline)) return null;
   return (zinc ?? 0) - (baseline ?? 0);
+}
+
+function aggregateOverallRatio(scenarios: any[]) {
+  let zincSeconds = 0;
+  let baselineSeconds = 0;
+  let count = 0;
+  for (const scenario of scenarios) {
+    if (!matchingGeneratedBudget(scenario)) continue;
+    const zinc = combinedPhaseSeconds(
+      promptValue(scenario),
+      decodeValue(scenario),
+      zincPromptTokensValue(scenario),
+      zincGeneratedTokensValue(scenario),
+    );
+    const baseline = combinedPhaseSeconds(
+      baselinePromptValue(scenario),
+      baselineDecodeValue(scenario),
+      baselinePromptTokensValue(scenario),
+      baselineGeneratedTokensValue(scenario),
+    );
+    if (!hasValue(zinc) || !hasValue(baseline) || (zinc ?? 0) <= 0 || (baseline ?? 0) <= 0) continue;
+    zincSeconds += zinc ?? 0;
+    baselineSeconds += baseline ?? 0;
+    count += 1;
+  }
+  return count > 0 && zincSeconds > 0 ? (baselineSeconds / zincSeconds) * 100 : null;
 }
 
 function ratioTone(value: number | null | undefined) {
@@ -455,7 +518,7 @@ function normalizeTarget(target: any) {
       compared_models: compared.length,
       average_decode_tps: mean(successful.map((model: any) => model.zinc.decode_tps.median ?? model.zinc.decode_tps.avg ?? null)),
       average_prompt_tps: mean(successful.map((model: any) => model.zinc.prefill_tps?.median ?? model.zinc.prefill_tps?.avg ?? null)),
-      average_pct_of_llama: mean(summaryScenarios.map((scenario: any) => overallRatioValue(scenario))),
+      average_pct_of_llama: aggregateOverallRatio(summaryScenarios),
     },
   };
 }
@@ -573,6 +636,7 @@ function scenarioSummary(target: any, scenarioId: string) {
   const rows = scenarioRows(target, scenarioId);
   const summaryRows = rows.filter((row) => !isReviewOutputScenario(row.scenario));
   const comparedRows = summaryRows.filter((row) => overallRatioValue(row.scenario) != null);
+  const summaryScenarios = summaryRows.map((row) => row.scenario);
   const fastestRow = summaryRows.length > 0
     ? [...summaryRows].sort((a, b) => (decodeValue(b.scenario) ?? -1) - (decodeValue(a.scenario) ?? -1))[0]
     : null;
@@ -591,7 +655,7 @@ function scenarioSummary(target: any, scenarioId: string) {
     avgPromptGap: mean(summaryRows.map((row) => promptRatioValue(row.scenario))),
     avgDecodeGap: mean(summaryRows.map((row) => decodeRatioValue(row.scenario))),
     avgOverall: mean(summaryRows.map((row) => overallValue(row.scenario))),
-    avgOverallGap: mean(summaryRows.map((row) => overallRatioValue(row.scenario))),
+    avgOverallGap: aggregateOverallRatio(summaryScenarios),
     reviewCount: rows.filter((row) => isReviewOutputScenario(row.scenario)).length,
     fastestModelLabel: fastestRow?.model?.label ?? null,
     fastestDecode: fastestRow ? decodeValue(fastestRow.scenario) : null,

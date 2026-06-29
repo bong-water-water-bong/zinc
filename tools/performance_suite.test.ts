@@ -588,6 +588,96 @@ test("buildComparison adds prompt and latency deltas", () => {
   expect(comparison?.overall_delta_tps).toBeCloseTo(-42.857, 3);
 });
 
+test("buildComparison rates overall by backend wall time, not mixed throughput averages", () => {
+  const comparison = buildComparison(
+    {
+      name: "ZINC",
+      prompt_tokens: 36,
+      generated_tokens: 96,
+      prefill_tps: { median: 45.4, avg: 45.4 },
+      decode_tps: { median: 50.46, avg: 50.46 },
+    },
+    {
+      name: "llama.cpp",
+      prompt_tokens: 35,
+      generated_tokens: 96,
+      prefill_tps: { median: 2820, avg: 2820 },
+      decode_tps: { median: 55.64533518199503, avg: 55.64533518199503 },
+    },
+    { expectedGeneratedTokens: 96 },
+  );
+
+  expect(comparison?.prompt_pct_of_baseline).toBeCloseTo(1.61, 2);
+  expect(comparison?.pct_of_baseline).toBeCloseTo(90.68, 2);
+  expect(comparison?.zinc_overall_tps).toBeCloseTo(48.971, 3);
+  expect(comparison?.baseline_overall_tps).toBeCloseTo(75.390, 3);
+  expect(comparison?.overall_pct_of_baseline).toBeCloseTo(64.465, 3);
+  expect(comparison?.overall_delta_tps).toBeCloseTo(-26.419, 3);
+});
+
+test("buildComparison withholds overall percentage for early-stop rows", () => {
+  const comparison = buildComparison(
+    {
+      name: "ZINC",
+      prompt_tokens: 36,
+      generated_tokens: 2,
+      prefill_tps: { median: 85, avg: 85 },
+      decode_tps: { median: 140, avg: 140 },
+    },
+    {
+      name: "llama.cpp",
+      prompt_tokens: 35,
+      generated_tokens: 96,
+      prefill_tps: { median: 160, avg: 160 },
+      decode_tps: { median: 100, avg: 100 },
+    },
+    { expectedGeneratedTokens: 96 },
+  );
+
+  expect(comparison?.pct_of_baseline).toBe(140);
+  expect(comparison?.overall_pct_of_baseline).toBeNull();
+  expect(comparison?.overall_comparable).toBe(false);
+  expect(comparison?.overall_delta_tps).toBeNull();
+});
+
+test("buildArtifact recomputes stale overall ratings and aggregates by total wall time", () => {
+  const artifact = buildArtifact([
+    {
+      id: "cuda",
+      label: "CUDA",
+      models: [
+        {
+          id: "m",
+          label: "Model",
+          zinc: { name: "ZINC", prompt_tokens: 0, generated_tokens: 100, decode_tps: { median: 10, avg: 10 } },
+          baseline: { name: "llama.cpp", prompt_tokens: 0, generated_tokens: 100, decode_tps: { median: 20, avg: 20 } },
+          scenarios: [
+            {
+              id: "long",
+              max_tokens: 100,
+              zinc: { name: "ZINC", prompt_tokens: 0, generated_tokens: 100, decode_tps: { median: 10, avg: 10 } },
+              baseline: { name: "llama.cpp", prompt_tokens: 0, generated_tokens: 100, decode_tps: { median: 20, avg: 20 } },
+              comparison: { overall_pct_of_baseline: 999 },
+            },
+            {
+              id: "short",
+              max_tokens: 10,
+              zinc: { name: "ZINC", prompt_tokens: 0, generated_tokens: 10, decode_tps: { median: 10, avg: 10 } },
+              baseline: { name: "llama.cpp", prompt_tokens: 0, generated_tokens: 10, decode_tps: { median: 5, avg: 5 } },
+            },
+          ],
+        },
+      ],
+    },
+  ]);
+
+  const model = artifact.targets[0]?.models[0];
+  expect(model?.scenarios[0]?.comparison?.overall_pct_of_baseline).toBe(50);
+  expect(model?.summary).toBeUndefined();
+  expect(artifact.targets[0]?.summary.compared_models).toBe(1);
+  expect(artifact.targets[0]?.summary.average_pct_of_llama).toBeCloseTo(63.636, 3);
+});
+
 test("mergeArtifacts replaces matching targets and preserves others", () => {
   const merged = mergeArtifacts(
     {

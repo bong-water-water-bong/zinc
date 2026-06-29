@@ -495,42 +495,70 @@ export function summarizeValues(values) {
   };
 }
 
-export function buildComparison(zincSummary, baselineSummary) {
+function finiteMetric(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function finiteTokenCount(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function backendPhaseSeconds(prefillTps, decodeTps, promptTokens, generatedTokens) {
+  const prompt = finiteTokenCount(promptTokens) ?? 0;
+  const generated = finiteTokenCount(generatedTokens) ?? 0;
+  if (prompt <= 0 && generated <= 0) return null;
+
+  let seconds = 0;
+  if (prompt > 0) {
+    if (!prefillTps || prefillTps <= 0) return null;
+    seconds += prompt / prefillTps;
+  }
+  if (generated > 0) {
+    if (!decodeTps || decodeTps <= 0) return null;
+    seconds += generated / decodeTps;
+  }
+  return seconds > 0 ? seconds : null;
+}
+
+function matchingGeneratedBudget(zincGenerated, baselineGenerated, expectedGeneratedTokens) {
+  const zinc = finiteTokenCount(zincGenerated);
+  const baseline = finiteTokenCount(baselineGenerated);
+  if (zinc == null || baseline == null) return false;
+  if (zinc !== baseline) return false;
+  const expected = finiteTokenCount(expectedGeneratedTokens);
+  if (expected != null && zinc < expected) return false;
+  return true;
+}
+
+export function buildComparison(zincSummary, baselineSummary, options = {}) {
   if (!zincSummary || !baselineSummary) return null;
-  const zincDecode = zincSummary.decode_tps?.median ?? zincSummary.decode_tps?.avg ?? null;
-  const baselineDecode = baselineSummary.decode_tps?.median ?? baselineSummary.decode_tps?.avg ?? null;
-  const zincPrefill = zincSummary.prefill_tps?.median ?? zincSummary.prefill_tps?.avg ?? null;
-  const baselinePrefill = baselineSummary.prefill_tps?.median ?? baselineSummary.prefill_tps?.avg ?? null;
-  const promptTokens = zincSummary.prompt_tokens ?? baselineSummary.prompt_tokens ?? null;
-  const generatedTokens = zincSummary.generated_tokens ?? baselineSummary.generated_tokens ?? null;
-  const zincLatency = zincSummary.total_latency_ms?.median ?? zincSummary.total_latency_ms?.avg ?? null;
-  const baselineLatency = baselineSummary.total_latency_ms?.median ?? baselineSummary.total_latency_ms?.avg ?? null;
-  const zincEndToEnd = zincSummary.end_to_end_tps?.median ?? zincSummary.end_to_end_tps?.avg ?? null;
-  const baselineEndToEnd = baselineSummary.end_to_end_tps?.median ?? baselineSummary.end_to_end_tps?.avg ?? null;
+  const zincDecode = finiteMetric(zincSummary.decode_tps?.median ?? zincSummary.decode_tps?.avg ?? null);
+  const baselineDecode = finiteMetric(baselineSummary.decode_tps?.median ?? baselineSummary.decode_tps?.avg ?? null);
+  const zincPrefill = finiteMetric(zincSummary.prefill_tps?.median ?? zincSummary.prefill_tps?.avg ?? null);
+  const baselinePrefill = finiteMetric(baselineSummary.prefill_tps?.median ?? baselineSummary.prefill_tps?.avg ?? null);
+  const zincPromptTokens = finiteTokenCount(zincSummary.prompt_tokens);
+  const baselinePromptTokens = finiteTokenCount(baselineSummary.prompt_tokens);
+  const zincGeneratedTokens = finiteTokenCount(zincSummary.generated_tokens);
+  const baselineGeneratedTokens = finiteTokenCount(baselineSummary.generated_tokens);
+  const zincLatency = finiteMetric(zincSummary.total_latency_ms?.median ?? zincSummary.total_latency_ms?.avg ?? null);
+  const baselineLatency = finiteMetric(baselineSummary.total_latency_ms?.median ?? baselineSummary.total_latency_ms?.avg ?? null);
+  const zincEndToEnd = finiteMetric(zincSummary.end_to_end_tps?.median ?? zincSummary.end_to_end_tps?.avg ?? null);
+  const baselineEndToEnd = finiteMetric(baselineSummary.end_to_end_tps?.median ?? baselineSummary.end_to_end_tps?.avg ?? null);
   if (!zincDecode || !baselineDecode) return null;
 
-  function phaseSeconds(prefillTps, decodeTps) {
-    const prompt = promptTokens ?? 0;
-    const generated = generatedTokens ?? 0;
-    if (prompt <= 0 && generated <= 0) return null;
-    let seconds = 0;
-    if (prompt > 0) {
-      if (!prefillTps || prefillTps <= 0) return null;
-      seconds += prompt / prefillTps;
-    }
-    if (generated > 0) {
-      if (!decodeTps || decodeTps <= 0) return null;
-      seconds += generated / decodeTps;
-    }
-    return seconds > 0 ? seconds : null;
-  }
-
-  const zincOverallSeconds = phaseSeconds(zincPrefill, zincDecode);
-  const baselineOverallSeconds = phaseSeconds(baselinePrefill, baselineDecode);
-  const totalPhaseTokens = (promptTokens ?? 0) + (generatedTokens ?? 0);
-  const zincOverall = zincOverallSeconds && totalPhaseTokens > 0 ? totalPhaseTokens / zincOverallSeconds : null;
-  const baselineOverall = baselineOverallSeconds && totalPhaseTokens > 0 ? totalPhaseTokens / baselineOverallSeconds : null;
-  const overallPct = zincOverallSeconds && baselineOverallSeconds ? (baselineOverallSeconds / zincOverallSeconds) * 100 : null;
+  // Overall rating is a wall-clock comparison, not an average of prefill and
+  // decode percentages. Each backend uses its own tokenizer counts; early-stop
+  // rows do not get an aggregate percentage.
+  const zincOverallSeconds = backendPhaseSeconds(zincPrefill, zincDecode, zincPromptTokens, zincGeneratedTokens);
+  const baselineOverallSeconds = backendPhaseSeconds(baselinePrefill, baselineDecode, baselinePromptTokens, baselineGeneratedTokens);
+  const zincTotalPhaseTokens = (zincPromptTokens ?? 0) + (zincGeneratedTokens ?? 0);
+  const baselineTotalPhaseTokens = (baselinePromptTokens ?? 0) + (baselineGeneratedTokens ?? 0);
+  const zincOverall = zincOverallSeconds && zincTotalPhaseTokens > 0 ? zincTotalPhaseTokens / zincOverallSeconds : null;
+  const baselineOverall = baselineOverallSeconds && baselineTotalPhaseTokens > 0 ? baselineTotalPhaseTokens / baselineOverallSeconds : null;
+  const overallComparable = matchingGeneratedBudget(zincGeneratedTokens, baselineGeneratedTokens, options.expectedGeneratedTokens);
+  const overallPct = overallComparable && zincOverallSeconds && baselineOverallSeconds
+    ? (baselineOverallSeconds / zincOverallSeconds) * 100
+    : null;
 
   const pctOfBaseline = (zincDecode / baselineDecode) * 100;
   const gapTps = zincDecode - baselineDecode;
@@ -546,6 +574,13 @@ export function buildComparison(zincSummary, baselineSummary) {
     baseline_end_to_end_tps: baselineEndToEnd,
     zinc_overall_tps: zincOverall,
     baseline_overall_tps: baselineOverall,
+    zinc_overall_seconds: zincOverallSeconds,
+    baseline_overall_seconds: baselineOverallSeconds,
+    overall_basis: "phase_wall_time_v2",
+    overall_comparable: overallPct != null,
+    overall_unavailable_reason: overallPct == null
+      ? "Generated token counts did not match the scenario budget, or phase telemetry was incomplete."
+      : null,
     pct_of_baseline: pctOfBaseline,
     delta_tps: gapTps,
     delta_pct: pctOfBaseline - 100,
@@ -556,7 +591,7 @@ export function buildComparison(zincSummary, baselineSummary) {
     end_to_end_pct_of_baseline: zincEndToEnd && baselineEndToEnd ? (zincEndToEnd / baselineEndToEnd) * 100 : null,
     end_to_end_delta_tps: zincEndToEnd != null && baselineEndToEnd != null ? zincEndToEnd - baselineEndToEnd : null,
     overall_pct_of_baseline: overallPct,
-    overall_delta_tps: zincOverall != null && baselineOverall != null ? zincOverall - baselineOverall : null,
+    overall_delta_tps: overallPct != null && zincOverall != null && baselineOverall != null ? zincOverall - baselineOverall : null,
   };
 }
 
@@ -571,7 +606,7 @@ function mergeScenarioForPartialRun(existingScenario, incomingScenario) {
     ...incomingScenario,
     zinc,
     baseline,
-    comparison: buildComparison(zinc, baseline),
+    comparison: buildComparison(zinc, baseline, { expectedGeneratedTokens: incomingScenario.max_tokens ?? existingScenario.max_tokens }),
   };
 }
 
@@ -598,7 +633,7 @@ function mergeModelForPartialRun(existingModel, incomingModel) {
     ...incomingModel,
     zinc,
     baseline,
-    comparison: buildComparison(zinc, baseline),
+    comparison: buildComparison(zinc, baseline, { expectedGeneratedTokens: primary?.max_tokens ?? incomingModel.max_tokens ?? existingModel.max_tokens }),
     scenarios,
   };
 }
@@ -621,6 +656,32 @@ function mergeTargetForPartialRun(existingTarget, incomingTarget) {
     ...existingTarget,
     ...incomingTarget,
     models,
+  };
+}
+
+function recalculateScenarioComparison(scenario) {
+  const comparison = scenario?.baseline?.decode_tps
+    ? buildComparison(scenario.zinc, scenario.baseline, { expectedGeneratedTokens: scenario.max_tokens })
+    : null;
+  return {
+    ...scenario,
+    comparison,
+  };
+}
+
+function recalculateModelComparisons(model) {
+  const scenarios = Array.isArray(model.scenarios)
+    ? model.scenarios.map(recalculateScenarioComparison)
+    : null;
+  const primary = scenarios?.find((scenario) => scenario.id === "core") ?? scenarios?.[0] ?? null;
+  const comparison = primary?.comparison
+    ?? (model.baseline?.decode_tps
+      ? buildComparison(model.zinc, model.baseline, { expectedGeneratedTokens: model.max_tokens })
+      : null);
+  return {
+    ...model,
+    comparison,
+    ...(scenarios ? { scenarios } : {}),
   };
 }
 
@@ -647,7 +708,9 @@ export function mergeArtifacts(existing, incomingTargets, options = {}) {
   const byId = new Map();
   const preserveMissingPhases = options.preserveMissingPhases ?? false;
   const normalizeTarget = (target) => {
-    const models = [...(target?.models ?? [])].sort(compareModelsByName);
+    const models = [...(target?.models ?? [])]
+      .map(recalculateModelComparisons)
+      .sort(compareModelsByName);
     return {
       ...target,
       models,
@@ -693,6 +756,34 @@ function compactMean(values) {
   return mean(values.filter((value) => value != null));
 }
 
+function modelScenariosForSummary(model) {
+  if (Array.isArray(model.scenarios) && model.scenarios.length > 0) return model.scenarios;
+  return [{
+    id: "core",
+    zinc: model.zinc,
+    baseline: model.baseline,
+    comparison: model.comparison,
+  }];
+}
+
+function aggregateOverallPct(scenarios) {
+  let zincSeconds = 0;
+  let baselineSeconds = 0;
+  let count = 0;
+  for (const scenario of scenarios) {
+    const comparison = scenario?.comparison;
+    if (comparison?.overall_pct_of_baseline == null) continue;
+    if (!comparison?.overall_comparable) continue;
+    const zinc = finiteMetric(comparison.zinc_overall_seconds);
+    const baseline = finiteMetric(comparison.baseline_overall_seconds);
+    if (zinc == null || baseline == null || zinc <= 0 || baseline <= 0) continue;
+    zincSeconds += zinc;
+    baselineSeconds += baseline;
+    count += 1;
+  }
+  return count > 0 && zincSeconds > 0 ? (baselineSeconds / zincSeconds) * 100 : null;
+}
+
 function targetSummary(models) {
   if (!models.length) {
     return {
@@ -714,7 +805,8 @@ function targetSummary(models) {
   const fastest = successful.length > 0
     ? [...successful].sort((a, b) => (b.zinc.decode_tps.median ?? b.zinc.decode_tps.avg) - (a.zinc.decode_tps.median ?? a.zinc.decode_tps.avg))[0]
     : null;
-  const compared = models.filter((model) => (model.comparison?.overall_pct_of_baseline ?? model.comparison?.pct_of_baseline) != null);
+  const scenarioRows = models.flatMap(modelScenariosForSummary);
+  const compared = models.filter((model) => modelScenariosForSummary(model).some((scenario) => scenario.comparison?.overall_pct_of_baseline != null));
 
   return {
     fastest_model_id: fastest?.id ?? null,
@@ -727,7 +819,7 @@ function targetSummary(models) {
     average_end_to_end_tps: compactMean(successful.map((model) => model.zinc.end_to_end_tps?.median ?? model.zinc.end_to_end_tps?.avg ?? null)),
     average_total_latency_ms: compactMean(successful.map((model) => model.zinc.total_latency_ms?.median ?? model.zinc.total_latency_ms?.avg ?? null)),
     compared_models: compared.length,
-    average_pct_of_llama: mean(compared.map((model) => model.comparison.overall_pct_of_baseline ?? model.comparison.pct_of_baseline)),
+    average_pct_of_llama: aggregateOverallPct(scenarioRows),
   };
 }
 
@@ -2176,7 +2268,7 @@ function scenarioResultPayload(entry, scenarioDef, zinc, baseline) {
     notes: scenarioDef.notes ?? [],
     zinc,
     baseline: baseline?.decode_tps ? baseline : baseline,
-    comparison: baseline?.decode_tps ? buildComparison(zinc, baseline) : null,
+    comparison: baseline?.decode_tps ? buildComparison(zinc, baseline, { expectedGeneratedTokens: scenarioDef.max_tokens }) : null,
   };
 }
 
