@@ -19280,11 +19280,12 @@ pub const InferenceEngine = struct {
                 .norm_per_head = if (norm_per_head) 1 else 0,
                 .n_tok = n_tokens,
             };
-            // Prefer the fused token-loop variant (one WG per head, all tokens
-            // internal) to eliminate per-token WG launch overhead. Falls back
-            // to the per-token grid or per-token host loop.
+            // The fused token-loop variant wins on short prompts by reducing
+            // workgroups, but long prompts need token-level parallelism.
+            const prefer_fused_gnorm = n_tokens <= 256;
             var tok_idx: u32 = 0;
-            if (self.elementwise.pipeline_ssm_gated_norm_batch_tok_fused) |*fused_pip| {
+            if (prefer_fused_gnorm and self.elementwise.pipeline_ssm_gated_norm_batch_tok_fused != null) {
+                const fused_pip = &(self.elementwise.pipeline_ssm_gated_norm_batch_tok_fused.?);
                 const infos = [4]vk.c.VkDescriptorBufferInfo{
                     .{ .buffer = scratch_attn_out.handle, .offset = 0, .range = z_total_bytes },
                     .{ .buffer = scratch_up.handle, .offset = 0, .range = z_total_bytes },
@@ -19314,6 +19315,22 @@ pub const InferenceEngine = struct {
                     std.mem.asBytes(&gnorm_push),
                     dt_rank,
                     n_tokens,
+                    1,
+                );
+            } else if (self.elementwise.pipeline_ssm_gated_norm_batch_tok_fused) |*fused_pip| {
+                const infos = [4]vk.c.VkDescriptorBufferInfo{
+                    .{ .buffer = scratch_attn_out.handle, .offset = 0, .range = z_total_bytes },
+                    .{ .buffer = scratch_up.handle, .offset = 0, .range = z_total_bytes },
+                    .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
+                    .{ .buffer = scratch_swiglu.handle, .offset = 0, .range = z_total_bytes },
+                };
+                self.decode_cmd.pushDescAndDispatch(
+                    fused_pip,
+                    self.instance.push_descriptor_fn,
+                    infos[0..],
+                    std.mem.asBytes(&gnorm_push),
+                    dt_rank,
+                    1,
                     1,
                 );
             } else {
