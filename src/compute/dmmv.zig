@@ -1460,6 +1460,7 @@ pub const DmmvDispatch = struct {
         const spec_k_21504_n8 = [_]pipeline_mod.SpecConst{
             .{ .id = 0, .value = 21504 },
             .{ .id = 1, .value = 8 },
+            .{ .id = 2, .value = 1 },
         };
         const spec_k_21504_n72_ragged = [_]pipeline_mod.SpecConst{
             .{ .id = 0, .value = 21504 },
@@ -1486,7 +1487,7 @@ pub const DmmvDispatch = struct {
         };
         const geglu_q8_k5376_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 2, .value = 1 } };
         const geglu_q8_k5376_n64_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 1, .value = 64 }, .{ .id = 2, .value = 1 } };
-        const geglu_q8_k5376_n8_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 1, .value = 8 }, .{ .id = 2, .value = 1 } };
+        const geglu_q8_k5376_n8_spec = [_]pipeline_mod.SpecConst{ .{ .id = 0, .value = 5376 }, .{ .id = 1, .value = 8 }, .{ .id = 2, .value = 1 }, .{ .id = 3, .value = 1 } };
         const pipeline_mul_mm_q6k_full_dp4a_k12288 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_dp4a_path, 4, @sizeOf(MulMmQ6KDp4aPush), &spec_k_12288, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q6k_full_dp4a K=12288 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
@@ -1703,7 +1704,8 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_k5376_n8 != null) {
             log.info("mul_mm_q4k_gate_up_geglu_full_dp4a_q8 K=5376 N8 pipeline loaded (Gemma 4 31B dense GEGLU ragged tail)", .{});
         }
-        const mul_mm_q4k_gateup_geglu_n1_dp4a_q8_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_gate_up_geglu_n1_dp4a_q8.spv", .{shader_dir}) catch unreachable;
+        var mul_mm_q4k_gateup_geglu_n1_dp4a_q8_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const mul_mm_q4k_gateup_geglu_n1_dp4a_q8_path = std.fmt.bufPrint(&mul_mm_q4k_gateup_geglu_n1_dp4a_q8_path_buf, "{s}/mul_mm_q4k_gate_up_geglu_n1_dp4a_q8.spv", .{shader_dir}) catch unreachable;
         const geglu_n1_k5376_spec = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 5376 }};
         const pipeline_mul_mm_q4k_gate_up_geglu_n1_dp4a_q8 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gateup_geglu_n1_dp4a_q8_path, 6, @sizeOf(MulMmQ4KGateUpDp4aQ8Push), &geglu_n1_k5376_spec, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_gate_up_geglu_n1_dp4a_q8 shader not loaded: {s}", .{@errorName(err)});
