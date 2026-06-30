@@ -334,21 +334,15 @@ test "Vulkan Qwen SSM DP4a keeps BN40 and BN64 specializations" {
 
 test "Vulkan Gemma dense-down DP4a keeps K21504 short-prompt specializations" {
     const dmmv = @embedFile("compute/dmmv.zig");
-    try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n64");
     try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n72");
     try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k21504_n64");
-    try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k21504_n72");
-    try expectContains(dmmv, "const pipeline_mul_mm_q6k_full_dp4a_k21504_n64");
-    try expectContains(dmmv, "const pipeline_mul_mm_q4k_full_dp4a_k21504_n72");
-    try expectContains(dmmv, "K == 21504 and N == 64");
-    try expectContains(dmmv, "pub fn recordMulMmQ4KRagged72Dp4a(");
-    try expectContainsNear(dmmv, "pub fn recordMulMmQ4KRagged72Dp4a(", "if (N <= 64 or N > 72) return error.InvalidArgument;", 1200);
+    try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k21504_n8");
+    try expectContains(dmmv, "const pipeline_mul_mm_q6k_full_dp4a_k21504_n72");
+    try expectContains(dmmv, "const pipeline_mul_mm_q4k_full_dp4a_k21504_n64");
 
     const forward = @embedFile("compute/forward.zig");
-    try expectContains(forward, "const use_ragged72 = q4_ragged_tail_cols > 0");
-    try expectContains(forward, "self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k21504_n72 != null");
-    try expectContains(forward, "try self.dmmv.recordMulMmQ4KRagged72Dp4a(");
-    try expectContains(forward, "if (!use_ragged72 and dp4a_tail_cols > 0)");
+    try expectContains(forward, "self.gemmaDenseQ4RaggedTailDp4aEnabled(down_t, n_tokens)");
+    try expectContains(forward, "try self.dmmv.recordMulMmQ4KTail8Dp4a(");
 }
 
 test "Vulkan full-DP4a wide shaders load every activation half tile safely" {
@@ -738,6 +732,12 @@ test "Vulkan post-attention norm applied before attn residual" {
     // Gemma requires RMS norm on o_proj output before residual add.
     const src = @embedFile("compute/forward.zig");
     try expectContains(src, "Gemma post-attention norm: RMS norm on o_proj output before residual add");
+    try expectContains(src, "const use_fused_pan_ffn_norm_decode = apply_post_attn_norm");
+    try expectContainsNear(src, "const use_fused_pan_ffn_norm_decode = apply_post_attn_norm", "!is_moe", 500);
+    try expectContainsNear(src, "const use_fused_pan_ffn_norm_decode = apply_post_attn_norm", "self.elementwise.pipeline_post_norm_residual_rms_norm != null", 500);
+    try expectContainsNear(src, "const use_fused_pan_ffn_norm_decode = apply_post_attn_norm", "config.architecture == .gemma", 600);
+    try expectContainsNear(src, "else if (use_fused_pan_ffn_norm_decode)", "try self.dispatchPostNormResidualRmsNorm(", 1200);
+    try expectContainsNear(src, "if (!ffn_norm_precomputed and !resume_from_ffn_norm", "try self.dispatchRmsNorm(", 600);
 }
 
 test "Vulkan post-FFN norm applied before FFN residual" {

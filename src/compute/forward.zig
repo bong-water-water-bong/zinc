@@ -6529,6 +6529,7 @@ pub const InferenceEngine = struct {
                 self.prefill_active and
                 layer == layer_start and
                 self.partial_decode_ffn_norm_in != null;
+            var ffn_norm_precomputed = false;
 
             // --- Input RMS norm: hidden_buf → norm_buf ---
             const attn_norm = if (!resume_from_ffn_norm) lt.attn_norm orelse {
@@ -6654,6 +6655,7 @@ pub const InferenceEngine = struct {
                         });
                     }
 
+                    const attention_qkv_phase = self.beginProfilePhase();
                     if (packed_q_gate) {
                         // Qwen3Next packs per-head [Q(head_dim), gate(head_dim)] blocks.
                         // Project into a temporary buffer and split each head block out.
@@ -6699,6 +6701,7 @@ pub const InferenceEngine = struct {
                     if (!use_k_as_v and !final_attn_kv_preloaded) {
                         try self.dispatchDmmv(v_tensor, self.norm_buf, hidden_size, self.v_buf, v_rows, hidden_dim);
                     }
+                    self.endProfilePhase(.attention_qkv, attention_qkv_phase);
                     if (packed_q_gate) {
                         // Wait for all DMMV outputs (Q+gate, K, V) before deinterleave
                         self.decode_cmd.computeBarrier();
@@ -6891,6 +6894,7 @@ pub const InferenceEngine = struct {
                     const fused_qk_kv_eligible = fused_qk_kv_base_eligible;
 
                     if (fused_qk_kv_eligible) {
+                        const attention_kv_write_phase = self.beginProfilePhase();
                         const qn = q_norm_tensor.?;
                         const kn = k_norm_tensor.?;
                         const dst_offset_floats: u32 = physical_token_for_fused.? * layer_kv_dim;
@@ -6926,6 +6930,7 @@ pub const InferenceEngine = struct {
                         self.decode_cmd.computeBarrier();
                         q_rope_done = true;
                         k_rope_done = true;
+                        self.endProfilePhase(.attention_kv_write, attention_kv_write_phase);
                     } else if (q_norm_tensor) |qn| {
                         // Skip Q norm/RoPE for dead-tail tokens: q_buf only feeds flash_attn.
                         // Still mark q_rope_done=true so the fallback-path Q RoPE below is
@@ -7656,6 +7661,7 @@ pub const InferenceEngine = struct {
                         !skip_gemma_short_prefill_post_attn_norm;
                     const has_post_attn_norm = apply_post_attn_norm;
                     const diag_attn_residual = diag_last_prompt_token and config.architecture == .gpt_oss and self.validation_diagnostics_enabled and q_dim <= 8192;
+                    const attention_o_proj_phase = self.beginProfilePhase();
                     if (!has_post_attn_norm and !self.validation_diagnostics_enabled) {
                         // Fused: O-proj DMMV accumulates directly into hidden_buf,
                         // eliminating separate scale_acc dispatch + barrier
@@ -7691,6 +7697,7 @@ pub const InferenceEngine = struct {
                             }
                         }
                         self.decode_cmd.computeBarrier();
+                        self.endProfilePhase(.attention_o_proj, attention_o_proj_phase);
                     } else {
                         // Unfused path: needed when post-attn norm exists (Gemma) or diagnostics enabled
                         try self.dispatchDmmv(o_tensor, self.attn_out_buf, self.attn_out_buf.size, self.o_proj_buf, hidden_dim, o_cols);
@@ -7761,13 +7768,24 @@ pub const InferenceEngine = struct {
                             try self.decode_cmd.reset();
                             try self.decode_cmd.begin();
                         }
+                        self.endProfilePhase(.attention_o_proj, attention_o_proj_phase);
 
+                        const attention_post_norm_phase = self.beginProfilePhase();
                         // Gemma post-attention norm: RMS norm on o_proj output before residual add.
                         // When the fused rms_norm_add pipeline is loaded and we're not in a
                         // diagnostics path, skip the separate norm dispatch and let the
                         // residual-add branch below fuse both into one pass.
+                        const post_attn_ffn_norm_tensor = lt.ffn_norm orelse lt.post_attention_norm;
+                        const use_fused_pan_ffn_norm_decode = apply_post_attn_norm and
+                            post_attn_ffn_norm_tensor != null and
+                            !is_moe and
+                            !self.prefill_active and
+                            self.elementwise.pipeline_post_norm_residual_rms_norm != null and
+                            !diag_attn_residual and
+                            config.architecture == .gemma;
                         const use_fused_pan_decode = apply_post_attn_norm and
                             self.elementwise.pipeline_rms_norm_add != null and
+                            !use_fused_pan_ffn_norm_decode and
                             !diag_attn_residual and
                             config.architecture != .gpt_oss;
                         if (apply_post_attn_norm and !use_fused_pan_decode) {
@@ -7813,6 +7831,26 @@ pub const InferenceEngine = struct {
                                 .size = hidden_size,
                             });
                             self.decode_cmd.transferToComputeBarrier();
+                        } else if (use_fused_pan_ffn_norm_decode) {
+                            const pan_tensor = lt.post_attention_norm.?;
+                            const next_norm_tensor = post_attn_ffn_norm_tensor.?;
+                            try self.dispatchPostNormResidualRmsNorm(
+                                self.hidden_buf.handle,
+                                hidden_size,
+                                self.o_proj_buf.handle,
+                                hidden_size,
+                                pan_tensor.gpu_buffer.handle,
+                                pan_tensor.gpu_buffer.size,
+                                self.ffn_norm_buf.handle,
+                                hidden_size,
+                                next_norm_tensor.gpu_buffer.handle,
+                                next_norm_tensor.gpu_buffer.size,
+                                hidden_dim,
+                                1,
+                                rms_norm_eps,
+                            );
+                            ffn_norm_precomputed = true;
+                            self.decode_cmd.computeBarrier();
                         } else if (use_fused_pan_decode) {
                             // Fused Gemma post_attention_norm + residual add in one
                             // dispatch: hidden += pan_weight * rmsnorm(o_proj_buf).
@@ -7894,6 +7932,7 @@ pub const InferenceEngine = struct {
                             try self.decode_cmd.reset();
                             try self.decode_cmd.begin();
                         }
+                        self.endProfilePhase(.attention_post_norm, attention_post_norm_phase);
                     }
 
                     // --- Mid-layer diagnostic: o_proj RMS at attention layers (BOS only) ---
@@ -8137,7 +8176,7 @@ pub const InferenceEngine = struct {
                 partial_hidden_out_written_by_stop = true;
                 break;
             }
-            if (!resume_from_ffn_norm and !can_fuse_rms_router and !skip_gemma_short_prefill_ffn_norm) {
+            if (!ffn_norm_precomputed and !resume_from_ffn_norm and !can_fuse_rms_router and !skip_gemma_short_prefill_ffn_norm) {
                 try self.dispatchRmsNorm(
                     self.hidden_buf.handle,
                     hidden_size,
@@ -13076,47 +13115,25 @@ pub const InferenceEngine = struct {
                 }
 
                 const down_matmul_phase = self.beginProfilePhase();
-                const use_ragged72 = q4_ragged_tail_cols > 0 and
-                    self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k21504_n72 != null;
-                if (use_ragged72) {
-                    try self.dmmv.recordMulMmQ4KRagged72Dp4a(
-                        &self.decode_cmd,
-                        push_fn,
-                        down_t.gpu_buffer.handle,
-                        down_t.gpu_buffer.size,
-                        packed_act.handle,
-                        packed_act.size,
-                        scale_dsum.handle,
-                        scale_dsum.size,
-                        down_buf.handle,
-                        down_buf.size,
-                        hidden_dim,
-                        n_tokens,
-                        inter_dim,
-                        0,
-                        0,
-                    );
-                } else {
-                    try self.dmmv.recordMulMmQ4KFullDp4a(
-                        &self.decode_cmd,
-                        push_fn,
-                        down_t.gpu_buffer.handle,
-                        down_t.gpu_buffer.size,
-                        packed_act.handle,
-                        packed_act.size,
-                        scale_dsum.handle,
-                        scale_dsum.size,
-                        down_buf.handle,
-                        down_buf.size,
-                        hidden_dim,
-                        dp4a_cols,
-                        inter_dim,
-                        0,
-                        0,
-                        false,
-                    );
-                }
-                if (!use_ragged72 and dp4a_tail_cols > 0) {
+                try self.dmmv.recordMulMmQ4KFullDp4a(
+                    &self.decode_cmd,
+                    push_fn,
+                    down_t.gpu_buffer.handle,
+                    down_t.gpu_buffer.size,
+                    packed_act.handle,
+                    packed_act.size,
+                    scale_dsum.handle,
+                    scale_dsum.size,
+                    down_buf.handle,
+                    down_buf.size,
+                    hidden_dim,
+                    dp4a_cols,
+                    inter_dim,
+                    0,
+                    0,
+                    false,
+                );
+                if (dp4a_tail_cols > 0) {
                     if (q4_ragged_tail_cols > 0) {
                         try self.dmmv.recordMulMmQ4KTail8Dp4a(
                             &self.decode_cmd,
