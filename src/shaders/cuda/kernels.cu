@@ -1241,6 +1241,20 @@ extern "C" __global__ void ssm_delta_net(
 // token iteration. Eliminates the 2048 barriers that made the old kernel 60%
 // of prefill time.
 //
+// KNOWN BUG (discovered 2026-06-30): This kernel computes S^T @ k (column-wise
+// dot product) while the block kernel (ssm_delta_net) computes S @ k (row-wise
+// dot product). These produce DIFFERENT states for n_tok > 1:
+//
+//   Block kernel: sk[row] = sum_col S[row][col] * k[col] → d[row], S += d ⊗ k
+//   Warp kernel:  sk[col] = sum_row S[row][col] * k[row] → d[col], S += k ⊗ d
+//
+// For T=1 with S_0=0 they're identical (sk=0 → d=beta*v → same rank-1 update).
+// For T>1 they diverge, compounding across layers. The 35B MoE model amplifies
+// this divergence into garbage output.
+//
+// FIX: Block kernel is used for all T>1 prefill (see forward_cuda.zig).
+// This warp kernel is ONLY safe for T=1 decode.
+//
 // Grid: (dt_rank, ceilDiv(head_v_dim, N_WARPS))
 // Block: (32, N_WARPS) = 128 threads
 // Each warp (threadIdx.y) owns column = blockIdx.y * N_WARPS + threadIdx.y.
