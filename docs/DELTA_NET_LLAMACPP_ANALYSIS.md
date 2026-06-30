@@ -1,18 +1,32 @@
 # Delta-Net: llama.cpp vs ZINC Analysis
 
-## Executive Summary (Updated 2026-06-29)
+## Executive Summary (Updated 2026-06-30)
 
-Through profiling and A/B experiments on the RTX 5090, we discovered that the
-**SSM GEMMs (not the delta-net scan) are the prefill bottleneck**. Routing
-prefill GEMMs through ZINC's existing batched tiled GEMM kernel (`gemm_*_tiled_v2`)
-instead of the per-token DMMV loop yielded a **24% overall prefill speedup**.
+Three bugs found and fixed. CUDA prefill optimized 38%. The 35B MoE model
+now produces coherent output on CUDA for the first time.
 
-### Verified Results (Qwen3.5-9B, RTX 5090, T=101)
+### Critical Bug: Warp SSM Kernel S^T@k vs S@k
 
-| Config | attn | ssm | ffn | total | vs baseline |
-|--------|------|-----|-----|-------|-------------|
-| Baseline (per-token DMMV) | 61ms | 254ms | 250ms | 565ms | — |
-| **Batched tiled GEMM** | 37ms | 171ms | 223ms | **431ms** | **24% faster** |
+The warp-level delta-net kernel (`ssm_delta_net_warp`) computed column-wise
+dot products (`S^T @ k`) instead of row-wise (`S @ k`). This is because
+each warp owned a COLUMN and lanes owned ROWS. The fix swaps ownership:
+each warp owns a ROW and lanes own COLUMNS. This also improves memory
+coalescing (contiguous per-lane state access).
+
+**Before**: 35B MoE → "Paris为其 alast Palav" (garbage)
+**After**: 35B MoE → "Paris, a city renowned for its iconic landmarks such"
+
+Same bug existed in the Metal warp shader (`ssm_delta_net_prefill_warp.metal`)
+— fixed proactively.
+
+### Performance (Qwen3.5-9B, RTX 5090, T=102)
+
+| Config | Total | tok/s | vs Original |
+|--------|-------|-------|-------------|
+| Original (per-token DMMV + broken warp SSM) | 565ms | 178 | — |
+| + Batched tiled GEMM | 431ms | 243 | +36% |
+| + Lowsmem TC GEMM (3 blocks/SM) | ~370ms | 283 | +59% |
+| + Fixed warp SSM (correct + fast) | 350ms | **292** | **+64%** |
 | Batched GEMM + chunked SSM | 47ms | 201ms | 240ms | 488ms | 14% faster |
 | cuBLAS + fp16 cache | 95ms | 876ms | 633ms | 1604ms | 2.8× slower |
 
