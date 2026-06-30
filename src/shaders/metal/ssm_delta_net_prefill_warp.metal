@@ -1,9 +1,12 @@
 // ssm_delta_net_prefill_warp.metal — warp-level delta-net scan (ZERO barriers in hot loop)
 //
 // Port of the CUDA ssm_delta_net_warp approach to Metal:
-//   Each SIMDGROUP (32 lanes) owns one COLUMN of the state matrix.
-//   Each lane holds 4 state elements (rows_per_lane = head_v_dim / simd_width = 128/32 = 4).
+//   Each SIMDGROUP (32 lanes) owns one ROW of the state matrix.
+//   Each lane holds 4 state elements (cols_per_lane = head_v_dim / simd_width = 128/32 = 4).
 //   ALL reductions use simd_sum() — NO threadgroup_barrier per token iteration.
+//
+// FIXED (2026-06-30): swap row/col ownership — warp owns ROW (not column)
+// to compute S@k (row-wise dot product), matching the block shader.
 //
 // Compared to ssm_delta_net_prefill.metal: eliminates 4 barriers/iteration → 0.
 // The only barrier is ONE before the scan loop (for gate/beta precompute).
@@ -53,24 +56,24 @@ kernel void main0(
     const uint head = tg_pos.x;
     const uint simd_lane = tid % simd_width;
     const uint simd_idx = tid / simd_width;
-    const uint col = tg_pos.y * simdgroups_per_tg + simd_idx;
+    const uint row = tg_pos.y * simdgroups_per_tg + simd_idx;
 
-    if (head >= p.dt_rank || col >= p.head_v_dim || p.head_v_dim > 128u || p.d_state > 128u) {
+    if (head >= p.dt_rank || row >= p.head_v_dim || p.head_v_dim > 128u || p.d_state > 128u) {
         return;
     }
 
     constexpr uint hv = 128u;
-    constexpr uint rows_per_lane = 4u;  // hv / 32 = 4
+    constexpr uint cols_per_lane = 4u;  // hv / 32 = 4
 
     const uint qk_dim = p.d_state * p.n_group;
     const uint k_len = min(p.d_state, p.head_v_dim);
     const uint k_hi = (p.n_group == p.dt_rank) ? head : (head % p.n_group);
     const uint head_state_base = head * hv * hv;
 
-    // Load initial state: each lane owns 4 elements at rows simd_lane, simd_lane+32, simd_lane+64, simd_lane+96
-    float s_shard[rows_per_lane];
-    for (uint r = 0u; r < rows_per_lane; ++r) {
-        const uint row = r * simd_width + simd_lane;
+    // Load initial state: each lane owns 4 elements at cols simd_lane, simd_lane+32, simd_lane+64, simd_lane+96
+    float s_shard[cols_per_lane];
+    for (uint r = 0u; r < cols_per_lane; ++r) {
+        const uint col = r * simd_width + simd_lane;
         s_shard[r] = state[head_state_base + row * hv + col];
     }
 
@@ -99,14 +102,14 @@ kernel void main0(
         const uint k_base = conv_token_base + qk_dim + k_hi * p.d_state;
         const uint v_base = conv_token_base + 2u * qk_dim + head * hv;
 
-        // Load Q, K into registers (4 per lane)
-        float q_reg[rows_per_lane], k_reg[rows_per_lane];
+        // Load Q, K into registers (4 per lane, indexed by COLUMN)
+        float q_reg[cols_per_lane], k_reg[cols_per_lane];
         float sumq = 0.0f, sumk = 0.0f;
-        for (uint r = 0u; r < rows_per_lane; ++r) {
-            const uint row = r * simd_width + simd_lane;
-            if (row < k_len) {
-                q_reg[r] = conv_out[q_base + row];
-                k_reg[r] = conv_out[k_base + row];
+        for (uint r = 0u; r < cols_per_lane; ++r) {
+            const uint col_idx = r * simd_width + simd_lane;
+            if (col_idx < k_len) {
+                q_reg[r] = conv_out[q_base + col_idx];
+                k_reg[r] = conv_out[k_base + col_idx];
                 sumq = fma(q_reg[r], q_reg[r], sumq);
                 sumk = fma(k_reg[r], k_reg[r], sumk);
             } else {
@@ -125,23 +128,21 @@ kernel void main0(
         const float gate = sh_gate[t];
         const float b_val = sh_beta[t];
 
-        // Load V for this column
-        const float v_val = conv_out[v_base + col];
+        // Load V for this row (indexed by ROW, not column)
+        const float v_val = conv_out[v_base + row];
 
-        // State update (per-lane, no sync):
-        // 1. Decay: s_shard *= gate
-        // 2. sk = dot(state, k_normalized) — simd_sum
+        // State update: sk = (S @ k_norm)[row] — simd_sum across COLUMNS
         float sk_partial = 0.0f;
-        for (uint r = 0u; r < rows_per_lane; ++r) {
+        for (uint r = 0u; r < cols_per_lane; ++r) {
             s_shard[r] *= gate;
             sk_partial = fma(s_shard[r], k_reg[r] * k_rinv, sk_partial);
         }
         const float sk = simd_sum(sk_partial);
         const float d = b_val * (v_val - sk);
 
-        // Readout: o = dot(state, q_normalized) — simd_sum
+        // Readout: o = (S @ q_norm)[row] — simd_sum across COLUMNS
         float o_partial = 0.0f;
-        for (uint r = 0u; r < rows_per_lane; ++r) {
+        for (uint r = 0u; r < cols_per_lane; ++r) {
             s_shard[r] = fma(k_reg[r] * k_rinv, d, s_shard[r]);  // rank-1 update
             o_partial = fma(s_shard[r], q_reg[r] * q_rinv, o_partial);
         }
@@ -149,13 +150,13 @@ kernel void main0(
 
         // Write output (lane 0 of each simdgroup writes)
         if (simd_lane == 0u) {
-            output[p.output_offset + t * p.output_stride + head * hv + col] = o;
+            output[p.output_offset + t * p.output_stride + head * hv + row] = o;
         }
     }
 
     // Write final state back to global memory
-    for (uint r = 0u; r < rows_per_lane; ++r) {
-        const uint row = r * simd_width + simd_lane;
+    for (uint r = 0u; r < cols_per_lane; ++r) {
+        const uint col = r * simd_width + simd_lane;
         state[head_state_base + row * hv + col] = s_shard[r];
     }
 }
