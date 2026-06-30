@@ -579,28 +579,28 @@ test "Vulkan Gemma norm-add vec4 path stays wired and wave64" {
     try expectContains(shader, "hidden_v4[idx] +=");
 }
 
-test "Vulkan K-quant Q8_1 DMMV path covers Q4_K and Q6_K" {
+test "Vulkan Q4_K Q8_1 DMMV path stays gated and does not route Q6_K" {
     const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
     defer std.testing.allocator.free(build);
     try expectContains(build, "\"dmmv_q4k_q8_1\"");
-    try expectContains(build, "\"dmmv_q6k_q8_1\"");
+    try expectNotContains(build, "\"dmmv_q6k_q8_1\"");
+    try expectNotContains(build, "\"dmmv_q4k_pair_geglu_q8_1\"");
 
     const dmmv = @embedFile("compute/dmmv.zig");
     try expectContains(dmmv, "pipeline_q4k_q8_1: ?Pipeline");
-    try expectContains(dmmv, "pipeline_q6k_q8_1: ?Pipeline");
-    try expectContains(dmmv, "dmmv_q6k_q8_1.spv");
-    try expectContains(dmmv, ".pipeline_q6k_q8_1 = pipeline_q6k_q8_1");
-    try expectContains(dmmv, "if (self.pipeline_q6k_q8_1) |*p| p.deinit();");
+    try expectContains(dmmv, "dmmv_q4k_q8_1.spv");
+    try expectNotContains(dmmv, "pipeline_q6k_q8_1");
+    try expectNotContains(dmmv, "pipeline_q4k_pair_geglu_q8_1");
 
     const forward = @embedFile("compute/forward.zig");
-    try expectContainsNear(forward, "const qk_q81_pip", ".q4_k =>", 800);
-    try expectContainsNear(forward, "const qk_q81_pip", ".q6_k =>", 800);
-    try expectContainsNear(forward, "const q4k_q8_1_enabled", "dmmv.pipeline_q6k_q8_1 != null", 500);
+    try expectContains(forward, "ZINC_Q4K_Q8_1_DMMV");
+    try expectContainsNear(forward, "if (self.use_q4k_q8_1_dmmv", "qt == .q4_k", 300);
+    try expectNotContains(forward, "ZINC_GEMMA_Q4K_GEGLU_Q8_1");
+    try expectNotContains(forward, "dispatchDmmvFusedGateUpGegluPairQ8_1");
 
-    const shader = @embedFile("shaders/dmmv_q6k_q8_1.comp");
+    const shader = @embedFile("shaders/dmmv_q4k_q8_1.comp");
     try expectContains(shader, "layout(local_size_x = 64) in;");
     try expectContains(shader, "dotPacked4x8AccSatEXT");
-    try expectContains(shader, "Q6K_BYTES = 210u");
     try expectContains(shader, "Q8_1_U32_PER_BLOCK = 9u");
 }
 

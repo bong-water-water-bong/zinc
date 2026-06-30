@@ -1318,7 +1318,7 @@ pub const InferenceEngine = struct {
     // and runs Q8_0 x Q8_1 integer-dot DMMV for Q8_0 LM heads.
     use_q8_1_lm_head: bool = false,
     // Opt-in via ZINC_Q4K_Q8_1_DMMV=1. Quantizes the current f32 activation
-    // and runs K-quant x Q8_1 integer-dot DMMV for overwrite decode matvecs.
+    // and runs Q4_K x Q8_1 integer-dot DMMV for overwrite decode matvecs.
     use_q4k_q8_1_dmmv: bool = false,
     // Opt-in via ZINC_Q8_SPEC_DMMV=1. Routes Q8_0 K=2048/4096 DMMVs through
     // pipelines with the block count baked as a specialization constant.
@@ -2834,13 +2834,12 @@ pub const InferenceEngine = struct {
         const q4k_q8_1_flag = q4k_q8_1_env != null and std.mem.eql(u8, q4k_q8_1_env.?, "1");
         const q4k_q8_1_enabled = q4k_q8_1_flag and
             dmmv.pipeline_q4k_q8_1 != null and
-            dmmv.pipeline_q6k_q8_1 != null and
             dmmv.pipeline_quantize_q8_1 != null and
             instance.push_descriptor_fn != null;
         if (q4k_q8_1_enabled) {
-            log.info("K-quant x Q8_1 DMMV path ENABLED via ZINC_Q4K_Q8_1_DMMV=1", .{});
+            log.info("Q4_K x Q8_1 DMMV path ENABLED via ZINC_Q4K_Q8_1_DMMV=1", .{});
         } else if (q4k_q8_1_flag) {
-            log.info("ZINC_Q4K_Q8_1_DMMV=1 requested but prerequisites are missing; using generic K-quant DMMV", .{});
+            log.info("ZINC_Q4K_Q8_1_DMMV=1 requested but prerequisites are missing; using generic Q4_K DMMV", .{});
         }
 
         const q8_spec_env = std.posix.getenv("ZINC_Q8_SPEC_DMMV");
@@ -15127,19 +15126,12 @@ pub const InferenceEngine = struct {
         };
 
         if (pip.uses_push_descriptors) {
-            const qk_q81_pip: ?*const Pipeline = if (self.use_q4k_q8_1_dmmv)
-                switch (qt) {
-                    .q4_k => if (self.dmmv.pipeline_q4k_q8_1) |*p| p else null,
-                    .q6_k => if (self.dmmv.pipeline_q6k_q8_1) |*p| p else null,
-                    else => null,
-                }
-            else
-                null;
             if (self.use_q4k_q8_1_dmmv and
-                qk_q81_pip != null and
+                qt == .q4_k and
                 acc_mode == 0 and
                 x_offset == 0 and
                 (K & 31) == 0 and
+                self.dmmv.pipeline_q4k_q8_1 != null and
                 self.dmmv.pipeline_quantize_q8_1 != null)
             {
                 const input_bytes = @as(vk.c.VkDeviceSize, K) * @sizeOf(f32);
@@ -15156,7 +15148,8 @@ pub const InferenceEngine = struct {
                     );
                     self.decode_cmd.computeBufferBarrier(self.q8_1_buf.handle, q8_1_bytes);
 
-                    const push_q81 = DmmvPushConstants{
+                    const q4_q81_pip = &self.dmmv.pipeline_q4k_q8_1.?;
+                    const push_q4_q81 = DmmvPushConstants{
                         .M = M,
                         .K = K,
                         .a_offset = a_offset,
@@ -15165,8 +15158,8 @@ pub const InferenceEngine = struct {
                         .acc_mode = acc_mode,
                     };
                     self.pushDispatch3(
-                        qk_q81_pip.?,
-                        std.mem.asBytes(&push_q81),
+                        q4_q81_pip,
+                        std.mem.asBytes(&push_q4_q81),
                         tensor.gpu_buffer.handle,
                         tensor.gpu_buffer.size,
                         self.q8_1_buf.handle,
