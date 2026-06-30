@@ -346,8 +346,14 @@ fn extractConfigWithLogging(gf: *const gguf.GGUFFile, log_metadata: bool) ModelC
     const ssm_d_state = gf.getU32(std.fmt.bufPrint(&key_buf, "{s}.ssm.state_size", .{prefix}) catch "") orelse 0;
     const ssm_dt_rank = gf.getU32(std.fmt.bufPrint(&key_buf, "{s}.ssm.time_step_rank", .{prefix}) catch "") orelse 0;
     const ssm_n_group = gf.getU32(std.fmt.bufPrint(&key_buf, "{s}.ssm.group_count", .{prefix}) catch "") orelse 0;
-    const full_attn_interval = gf.getU32(std.fmt.bufPrint(&key_buf, "{s}.full_attention_interval", .{prefix}) catch "") orelse
-        if (ssm_d_inner > 0) @as(u32, 4) else @as(u32, 1);
+    const full_attn_interval = blk: {
+        if (std.posix.getenv("ZINC_FULL_ATTN_INTERVAL")) |v| {
+            if (std.fmt.parseInt(u32, v, 10)) |parsed| break :blk parsed else |_| {}
+        }
+        break :blk gf.getU32(std.fmt.bufPrint(&key_buf, "{s}.full_attention_interval", .{prefix}) catch "") orelse
+            if (ssm_d_inner > 0) @as(u32, 4) else @as(u32, 1);
+    };
+    log.info("full_attn_interval = {d} (override: ZINC_FULL_ATTN_INTERVAL)", .{full_attn_interval});
 
     const rope_freq_base: f32 = blk: {
         const key = std.fmt.bufPrint(&key_buf, "{s}.rope.freq_base", .{prefix}) catch break :blk @as(f32, 10000.0);
