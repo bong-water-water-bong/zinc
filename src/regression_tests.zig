@@ -322,7 +322,7 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     try expectContains(src, "use_n64_bm64");
     try expectContains(src, "use_exact_n64_bm64_acc");
     try expectContains(src, "use_ragged_n64_bm64");
-    try expectContains(src, "if (use_n64_bm64 or use_exact_n64_mmq64_acc or use_exact_n64_bm64_acc or use_ragged_n64_bm64) M / 64 else M / 32");
+    try expectContains(src, "if (use_n64_bm64 or use_k21504_n64_bm64 or use_exact_n64_mmq64_acc or use_exact_n64_bm64_acc or use_ragged_n64_bm64) M / 64 else M / 32");
     try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_exact_n64_bk2", 2200);
     try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_exact_n64_acc", 2200);
     try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_ragged_n64", 2200);
@@ -364,13 +364,16 @@ test "Vulkan Qwen SSM DP4a keeps BN40 and BN64 specializations" {
 
 test "Vulkan Gemma dense-down DP4a keeps K21504 short-prompt specializations" {
     const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n64_bm64");
     try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n64");
     try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n72");
     try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k21504_n64");
     try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k21504_n8");
+    try expectContains(dmmv, "const pipeline_mul_mm_q6k_full_dp4a_k21504_n64_bm64");
     try expectContains(dmmv, "const pipeline_mul_mm_q6k_full_dp4a_k21504_n64");
     try expectContains(dmmv, "const pipeline_mul_mm_q6k_full_dp4a_k21504_n72");
     try expectContains(dmmv, "const pipeline_mul_mm_q4k_full_dp4a_k21504_n64");
+    try expectContains(dmmv, "const use_k21504_n64_bm64");
     try expectContains(dmmv, "K == 21504 and n_tile == 64");
 
     const forward = @embedFile("compute/forward.zig");
