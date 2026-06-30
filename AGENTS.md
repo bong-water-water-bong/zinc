@@ -679,6 +679,31 @@ The main file. Contains the decode loop, all layer dispatch, MoE routing, SSM st
 | Agent timeout | 30 min | optimize_zinc.ts:606 |
 | Keep threshold | max(+3 tok/s, +2%) | optimize_zinc.ts |
 | GPU lock file | /tmp/zinc-gpu.lock | optimize_zinc.ts |
+| cuBLAS prefill threshold | T≥256 | forward_cuda.zig |
+| Tiled GEMM threshold | T≥32 | forward_cuda.zig |
+| Tiled GEMM tile | 64×64, BK=32 | kernels.cu |
+
+### CUDA Prefill GEMM Strategy
+
+The CUDA backend uses a hybrid GEMM strategy based on prompt length:
+
+```
+T < 32:    per-token DMMV (dmmv_q4k_fast) — no tile waste
+T < 256:   lowsmem TC GEMM (gemm_q4k_tc_lowsmem) — 16KB aliased shared, 3 blocks/SM
+T >= 256:  cuBLAS fp16 (cublasGemmEx) — one-time dequant, reused across all tokens
+```
+
+Environment variables for GEMM kernel selection:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `ZINC_PREFILL_LOWSMEM` | on | Use 16KB aliased-shared TC kernel (3 blocks/SM). Set `0` to use 24KB regular TC |
+| `ZINC_PREFILL_TC` | on | Use tensor-core wmma for Q4_K multiply. Set `0` for fp32 FMA |
+| `ZINC_PREFILL_DP4A` | off | Use DP4a int8 dot product (alternative to TC) |
+| `ZINC_PREFILL_F16` | off | Use pre-dequanted fp16 weights (server mode with cache) |
+| `ZINC_CUBLAS_MIN_T` | 256 | Threshold for switching to cuBLAS. Set high to disable |
+| `ZINC_SSM_PROFILE` | off | Per-phase SSM timing (pre-scan/scan/post-scan) |
+| `ZINC_SSM_CHUNKED` | off | Use chunked delta-net kernel (correct, not faster) |
 
 ### Decode Loop Data Flow
 
