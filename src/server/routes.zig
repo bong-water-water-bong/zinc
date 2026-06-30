@@ -1066,6 +1066,7 @@ const ParsedChatRequest = struct {
     enable_thinking: ?bool,
     tools: []const tool_format.ToolDefinition,
     tool_choice: ToolChoice,
+    injected_default_system: bool = false,
     /// Owns parameters_json strings and tool_calls rendering.
     arena: std.heap.ArenaAllocator,
 
@@ -1366,10 +1367,12 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
     // meta-planning, and Qwen loops forever trying to satisfy both sides.
     // Skip it when thinking is enabled and the caller hasn't supplied their own.
     const thinking_on = parsed.value.enable_thinking orelse false;
+    var injected_default_system = false;
     if (!has_guiding_message and !thinking_on) {
         roles[count] = "system";
         contents[count] = default_chat_system_prompt;
         count += 1;
+        injected_default_system = true;
     }
 
     for (messages) |message| {
@@ -1430,8 +1433,22 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         .enable_thinking = parsed.value.enable_thinking,
         .tools = tools_out,
         .tool_choice = if (tools_enabled) parseToolChoice(parsed.value.tool_choice) else .auto,
+        .injected_default_system = injected_default_system,
         .arena = arena,
     };
+}
+
+fn dropInjectedDefaultSystemForGemma(parsed: *ParsedChatRequest, is_gemma: bool) void {
+    if (!is_gemma or !parsed.injected_default_system) return;
+    if (parsed.roles.len == 0 or parsed.contents.len == 0) return;
+    if (!std.mem.eql(u8, parsed.roles[0], "system")) return;
+    if (!std.mem.eql(u8, parsed.contents[0], default_chat_system_prompt)) return;
+
+    // Gemma chat templates already provide their own model turn scaffold.
+    // Keep user-supplied guidance, but do not add an invisible extra turn.
+    parsed.roles = parsed.roles[1..];
+    parsed.contents = parsed.contents[1..];
+    parsed.injected_default_system = false;
 }
 fn findFirstStop(text: []const u8, stop_strs: []const []const u8) ?usize {
     var first: ?usize = null;
@@ -2090,6 +2107,7 @@ fn handleChatCompletions(
     const engine = &resources.engine;
     const tokenizer = &resources.tokenizer;
     const model_name = resources.display_name;
+    dropInjectedDefaultSystemForGemma(&parsed, resources.model.config.architecture == .gemma);
 
     // If the catalog marks this model's thinking as unstable, force-disable
     // visible thinking but still keep the tokenizer's no-thinking generation
@@ -4092,6 +4110,37 @@ test "parseChatRequest prepends default system guidance when missing" {
     try std.testing.expectEqualStrings("system", parsed.roles[0]);
     try std.testing.expect(std.mem.indexOf(u8, parsed.contents[0], "Answer directly") != null);
     try std.testing.expectEqualStrings("user", parsed.roles[1]);
+}
+
+test "dropInjectedDefaultSystemForGemma removes only synthetic guidance" {
+    const body =
+        \\{"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.injected_default_system);
+    dropInjectedDefaultSystemForGemma(&parsed, true);
+
+    try std.testing.expect(!parsed.injected_default_system);
+    try std.testing.expectEqual(@as(usize, 1), parsed.roles.len);
+    try std.testing.expectEqualStrings("user", parsed.roles[0]);
+    try std.testing.expectEqualStrings("hello", parsed.contents[0]);
+}
+
+test "dropInjectedDefaultSystemForGemma preserves explicit system guidance" {
+    const body =
+        \\{"messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hello"}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expect(!parsed.injected_default_system);
+    dropInjectedDefaultSystemForGemma(&parsed, true);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.roles.len);
+    try std.testing.expectEqualStrings("system", parsed.roles[0]);
+    try std.testing.expectEqualStrings("be terse", parsed.contents[0]);
 }
 
 test "parseChatRequest defaults to greedy temperature when omitted" {
