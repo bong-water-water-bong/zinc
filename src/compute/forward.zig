@@ -1320,8 +1320,8 @@ pub const InferenceEngine = struct {
     // and runs Q8_0 x Q8_1 integer-dot DMMV for Q8_0 LM heads.
     use_q8_1_lm_head: bool = false,
     // Opt-in via ZINC_Q4K_LM_HEAD_DP4A=1. Quantizes the final norm vector to
-    // the DP4a Q8_1 activation layout and runs the Q4_K LM head through the
-    // BN=8 int8 tiled GEMM. Initial target is Intel Gemma 26B (K=2816).
+    // the DP4a Q8_1 activation layout and runs matching Q4_K LM heads through
+    // the BN=8 int8 tiled GEMM.
     use_q4k_lm_head_dp4a: bool = false,
     // Opt-in via ZINC_Q4K_Q8_1_DMMV=1. Quantizes the current f32 activation
     // and runs Q4_K x Q8_1 integer-dot DMMV for overwrite decode matvecs.
@@ -15219,13 +15219,14 @@ pub const InferenceEngine = struct {
     ) !bool {
         if (!self.use_q4k_lm_head_dp4a) return false;
         if (tensor.info.type_ != .q4_k) return false;
-        if (K != 2816) return false;
+        if (K != 2816 and K != 5376) return false;
         if (K == 0 or (K & 255) != 0) return false;
         if (M == 0 or (M & 31) != 0) return false;
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         if (self.dmmv.pipeline_quantize_act_q8_1 == null) return false;
-        if (self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k2816_n8 == null) return false;
+        if (K == 2816 and self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k2816_n8 == null) return false;
+        if (K == 5376 and self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k5376_n8 == null) return false;
 
         const input_bytes = @as(vk.c.VkDeviceSize, K) * @sizeOf(f32);
         const output_bytes = @as(vk.c.VkDeviceSize, M) * @sizeOf(f32);

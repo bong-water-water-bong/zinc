@@ -381,16 +381,20 @@ test "Vulkan Gemma dense-down DP4a keeps K21504 short-prompt specializations" {
     try expectContains(forward, "try self.dmmv.recordMulMmQ4KTail8Dp4a(");
 }
 
-test "Vulkan Gemma 26B Q4_K LM-head DP4a path stays opt-in" {
+test "Vulkan Gemma Q4_K LM-head DP4a path stays opt-in" {
     const dmmv = @embedFile("compute/dmmv.zig");
     try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k2816_n8");
+    try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k5376_n8");
     try expectContains(dmmv, "const spec_k_2816_n8");
+    try expectContains(dmmv, "const spec_k_5376_n8");
     try expectContainsNear(dmmv, "pub fn recordMulMmQ4KTail8Dp4a", "K == 2816", 1200);
+    try expectContainsNear(dmmv, "pub fn recordMulMmQ4KTail8Dp4a", "K == 5376", 1400);
 
     const forward = @embedFile("compute/forward.zig");
     try expectContains(forward, "ZINC_Q4K_LM_HEAD_DP4A");
     try expectContains(forward, "q8_1_act_packed_buf");
-    try expectContainsNear(forward, "fn dispatchQ4KLmHeadDp4a", "K != 2816", 900);
+    try expectContainsNear(forward, "fn dispatchQ4KLmHeadDp4a", "K != 2816 and K != 5376", 900);
+    try expectContainsNear(forward, "fn dispatchQ4KLmHeadDp4a", "pipeline_mul_mm_q4k_full_dp4a_k5376_n8", 1400);
     try expectContainsNear(forward, "fn dispatchQ4KLmHeadDp4a", "try self.dmmv.recordQuantizeActQ8_1(", 2400);
     try expectContainsNear(forward, "fn dispatchQ4KLmHeadDp4a", "try self.dmmv.recordMulMmQ4KTail8Dp4a(", 4200);
     try expectContainsNear(forward, "const use_q8_1_lm_path =", "try self.dispatchQ4KLmHeadDp4a(", 700);
