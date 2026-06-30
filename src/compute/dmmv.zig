@@ -354,6 +354,9 @@ pub const DmmvDispatch = struct {
     /// Q4_K x Q8_1 integer-dot DMMV. Binding 1 is a quantized Q8_1 activation
     /// buffer produced by pipeline_quantize_q8_1.
     pipeline_q4k_q8_1: ?Pipeline,
+    /// Q6_K x Q8_1 integer-dot DMMV. Binding 1 is a quantized Q8_1 activation
+    /// buffer produced by pipeline_quantize_q8_1.
+    pipeline_q6k_q8_1: ?Pipeline,
     /// Fused Q8_0 pair DMMV. Five bindings: A0, A1, X, Y0, Y1. Used as an
     /// opt-in SSM projection experiment for wqkv + z/gate, whose matrices
     /// share the same normalized hidden vector.
@@ -504,8 +507,8 @@ pub const DmmvDispatch = struct {
     /// Q8_1 blocks. 2 bindings (A f32 vec4 in, D u32 stream out), push
     /// constants {ne, num_blocks}. Activation pre-quantizer preserved as
     /// reusable infrastructure (per effort-6 plan); the SSM proj mmq DMMV
-    /// consumers (dmmv_q8_0_q8_1, dmmv_q4k_q8_1) were measured flat in
-    /// cycles 8 + 33 of the loop and removed in cycle 60's pivot.
+    /// consumers (dmmv_q8_0_q8_1, dmmv_q4k_q8_1, dmmv_q6k_q8_1) share this
+    /// exact 36-byte-per-block layout.
     pipeline_quantize_q8_1: ?Pipeline,
     /// Effort-6 Step 3 foundation for the MUL_MAT_ID tiled GEMM port.
     /// Counts how many tokens were routed to each expert. Output is a
@@ -868,6 +871,11 @@ pub const DmmvDispatch = struct {
         const q4_q81_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_q8_1.spv", .{shader_dir}) catch unreachable;
         const pipeline_q4k_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q4_q81_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q4_K x Q8_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q6_q81_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q6_q81_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q6_K x Q8_1 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
         const q8_pair_push_size = @sizeOf(DmmvQ8PairPushConstants);
@@ -2056,6 +2064,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q8_0_wide = pipeline_q8_0_wide,
             .pipeline_q8_0_q8_1 = pipeline_q8_0_q8_1,
             .pipeline_q4k_q8_1 = pipeline_q4k_q8_1,
+            .pipeline_q6k_q8_1 = pipeline_q6k_q8_1,
             .pipeline_q8_0_fused_pair = pipeline_q8_0_fused_pair,
             .pipeline_f16 = pipeline_f16,
             .pipeline_f32 = pipeline_f32,
@@ -5175,6 +5184,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q8_0_wide) |*p| p.deinit();
         if (self.pipeline_q8_0_q8_1) |*p| p.deinit();
         if (self.pipeline_q4k_q8_1) |*p| p.deinit();
+        if (self.pipeline_q6k_q8_1) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_pair) |*p| p.deinit();
         if (self.pipeline_f16) |*p| p.deinit();
         if (self.pipeline_f32) |*p| p.deinit();

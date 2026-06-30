@@ -551,6 +551,59 @@ test "Vulkan residual_rms_norm shader matches Metal's fused semantics" {
     try expectContains(src, "norm_out[base + i] = weights[i] * hidden[base + i] * rms_inv;");
 }
 
+test "Vulkan Gemma norm-add vec4 path stays wired and wave64" {
+    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    defer std.testing.allocator.free(build);
+    try expectContains(build, "\"rms_norm_add_vec4\"");
+    try expectNotContains(build, "dmmv_q4k_q8_1_fused_gate_up_geglu_pair");
+
+    const elementwise = @embedFile("compute/elementwise.zig");
+    try expectContains(elementwise, "pipeline_rms_norm_add_vec4: ?Pipeline");
+    try expectContains(elementwise, "rms_norm_add_vec4.spv");
+    try expectContains(elementwise, ".pipeline_rms_norm_add_vec4 = pipeline_rms_norm_add_vec4");
+    try expectContains(elementwise, "if (self.pipeline_rms_norm_add_vec4) |*p| p.deinit();");
+
+    const forward = @embedFile("compute/forward.zig");
+    const marker = "fn dispatchRmsNormAdd(";
+    try expectContainsNear(forward, marker, "hidden_dim & 3", 1200);
+    try expectContainsNear(forward, marker, "pipeline_rms_norm_add_vec4", 1200);
+    try expectContainsNear(forward, marker, "pipeline_rms_norm_add orelse", 1200);
+    try expectNotContains(forward, "dmmv_q4k_q8_1_fused_gate_up_geglu_pair");
+
+    const shader = @embedFile("shaders/rms_norm_add_vec4.comp");
+    try expectContains(shader, "layout(local_size_x = 64) in;");
+    try expectContains(shader, "vec4 hidden_v4[]");
+    try expectContains(shader, "const uint n4 = n >> 2u;");
+    try expectContains(shader, "subgroupAdd");
+    try expectContains(shader, "gl_NumSubgroups > 1u");
+    try expectContains(shader, "hidden_v4[idx] +=");
+}
+
+test "Vulkan Q6_K Q8_1 DMMV path stays wired behind Q8_1 flag" {
+    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    defer std.testing.allocator.free(build);
+    try expectContains(build, "\"dmmv_q6k_q8_1\"");
+
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_q6k_q8_1: ?Pipeline");
+    try expectContains(dmmv, "dmmv_q6k_q8_1.spv");
+    try expectContains(dmmv, ".pipeline_q6k_q8_1 = pipeline_q6k_q8_1");
+    try expectContains(dmmv, "if (self.pipeline_q6k_q8_1) |*p| p.deinit();");
+
+    const forward = @embedFile("compute/forward.zig");
+    try expectContains(forward, "Q4_K/Q6_K x Q8_1 DMMV path ENABLED");
+    try expectContainsNear(forward, "self.use_q4k_q8_1_dmmv", "qt == .q4_k or qt == .q6_k", 500);
+    try expectContainsNear(forward, ".q6_k => if (M == self.model.config.hidden_dim and K == self.model.config.intermediate_dim)", "pipeline_q6k_q8_1", 500);
+
+    const shader = @embedFile("shaders/dmmv_q6k_q8_1.comp");
+    try expectContains(shader, "dotPacked4x8AccSatEXT");
+    try expectContains(shader, "const bool high_nibble = group >= 2u;");
+    try expectContains(shader, "const uint lo = high_nibble ?");
+    try expectContains(shader, "const uint scale_idx = q8_block * 2u + half16;");
+    try expectContains(shader, "return ds.x * d * scale * float(isum);");
+    try expectNotContains(shader, "ds.y");
+}
+
 test "softmax_topk shader keeps RADV-safe shared-memory winner scan" {
     const src = @embedFile("shaders/softmax_topk.comp");
     try expectContains(src, "shared float s_local_val[64];");
