@@ -1318,11 +1318,8 @@ pub const InferenceEngine = struct {
     // and runs Q8_0 x Q8_1 integer-dot DMMV for Q8_0 LM heads.
     use_q8_1_lm_head: bool = false,
     // Opt-in via ZINC_Q4K_Q8_1_DMMV=1. Quantizes the current f32 activation
-    // and runs Q4_K x Q8_1 integer-dot DMMV for overwrite decode matvecs.
+    // and runs K-quant x Q8_1 integer-dot DMMV for overwrite decode matvecs.
     use_q4k_q8_1_dmmv: bool = false,
-    // Opt-in via ZINC_GEMMA_Q4K_GEGLU_Q8_1=1. Quantizes Gemma dense FFN input
-    // once per layer and runs fused Q4_K gate/up GEGLU on Q8_1 activations.
-    use_gemma_q4k_geglu_q8_1: bool = false,
     // Opt-in via ZINC_Q8_SPEC_DMMV=1. Routes Q8_0 K=2048/4096 DMMVs through
     // pipelines with the block count baked as a specialization constant.
     use_q8_spec_dmmv: bool = false,
@@ -2837,24 +2834,13 @@ pub const InferenceEngine = struct {
         const q4k_q8_1_flag = q4k_q8_1_env != null and std.mem.eql(u8, q4k_q8_1_env.?, "1");
         const q4k_q8_1_enabled = q4k_q8_1_flag and
             dmmv.pipeline_q4k_q8_1 != null and
+            dmmv.pipeline_q6k_q8_1 != null and
             dmmv.pipeline_quantize_q8_1 != null and
             instance.push_descriptor_fn != null;
         if (q4k_q8_1_enabled) {
-            log.info("Q4_K x Q8_1 DMMV path ENABLED via ZINC_Q4K_Q8_1_DMMV=1", .{});
+            log.info("K-quant x Q8_1 DMMV path ENABLED via ZINC_Q4K_Q8_1_DMMV=1", .{});
         } else if (q4k_q8_1_flag) {
-            log.info("ZINC_Q4K_Q8_1_DMMV=1 requested but prerequisites are missing; using generic Q4_K DMMV", .{});
-        }
-
-        const gemma_q4k_geglu_q8_1_env = std.posix.getenv("ZINC_GEMMA_Q4K_GEGLU_Q8_1");
-        const gemma_q4k_geglu_q8_1_flag = gemma_q4k_geglu_q8_1_env != null and std.mem.eql(u8, gemma_q4k_geglu_q8_1_env.?, "1");
-        const gemma_q4k_geglu_q8_1_enabled = gemma_q4k_geglu_q8_1_flag and
-            dmmv.pipeline_q4k_pair_geglu_q8_1 != null and
-            dmmv.pipeline_quantize_q8_1 != null and
-            instance.push_descriptor_fn != null;
-        if (gemma_q4k_geglu_q8_1_enabled) {
-            log.info("Gemma Q4_K pair GEGLU x Q8_1 path ENABLED via ZINC_GEMMA_Q4K_GEGLU_Q8_1=1", .{});
-        } else if (gemma_q4k_geglu_q8_1_flag) {
-            log.info("ZINC_GEMMA_Q4K_GEGLU_Q8_1=1 requested but prerequisites are missing; using standard Gemma dense GEGLU", .{});
+            log.info("ZINC_Q4K_Q8_1_DMMV=1 requested but prerequisites are missing; using generic K-quant DMMV", .{});
         }
 
         const q8_spec_env = std.posix.getenv("ZINC_Q8_SPEC_DMMV");
@@ -3334,7 +3320,6 @@ pub const InferenceEngine = struct {
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
             .use_q4k_q8_1_dmmv = q4k_q8_1_enabled,
-            .use_gemma_q4k_geglu_q8_1 = gemma_q4k_geglu_q8_1_enabled,
             .use_q8_spec_dmmv = q8_spec_enabled,
             .use_fused_ssm_qkv_z = fused_ssm_qkv_z_enabled,
             .use_count_experts_prefill = count_experts_enabled,
@@ -10254,11 +10239,6 @@ pub const InferenceEngine = struct {
                     up_tensor.info.type_ == .q4_k and
                     (hidden_dim % 4) == 0 and
                     (hidden_dim % 256) == 0;
-                const gemma_dense_geglu_q8_1_eligible = gemma_dense_geglu_pair_eligible and
-                    self.use_gemma_q4k_geglu_q8_1 and
-                    self.dmmv.pipeline_q4k_pair_geglu_q8_1 != null and
-                    self.dmmv.pipeline_quantize_q8_1 != null and
-                    (hidden_dim & 31) == 0;
 
                 var gemma_decode_dp4a_activation: GemmaDecodeDp4aActivation = .none;
                 const dense_ffn_gateup_phase = self.beginProfilePhase();
@@ -10277,25 +10257,6 @@ pub const InferenceEngine = struct {
                 } else if (fused_dense_ffn_eligible) {
                     const dense_ffn_gateup_matmul_phase = self.beginProfilePhase();
                     try self.dispatchDmmvFusedGateUpSwiglu(gate_tensor, up_tensor, self.ffn_norm_buf, hidden_size, self.swiglu_buf, inter_dim, hidden_dim);
-                    self.endProfilePhase(.dense_ffn_gateup_matmul_q4, dense_ffn_gateup_matmul_phase);
-                    self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
-                } else if (gemma_dense_geglu_q8_1_eligible) {
-                    const dense_ffn_gateup_quant_phase = self.beginProfilePhase();
-                    try self.dmmv.recordQuantizeQ8_1(
-                        &self.decode_cmd,
-                        self.instance.push_descriptor_fn,
-                        self.ffn_norm_buf.handle,
-                        hidden_size,
-                        self.q8_1_buf.handle,
-                        self.q8_1_buf.size,
-                        hidden_dim,
-                    );
-                    const q8_1_bytes = @as(vk.c.VkDeviceSize, (hidden_dim + 31) / 32) * Q8_1_BLOCK_BYTES;
-                    self.decode_cmd.computeBufferBarrier(self.q8_1_buf.handle, q8_1_bytes);
-                    self.endProfilePhase(.dense_ffn_gateup_quant, dense_ffn_gateup_quant_phase);
-
-                    const dense_ffn_gateup_matmul_phase = self.beginProfilePhase();
-                    try self.dispatchDmmvFusedGateUpGegluPairQ8_1(gate_tensor, up_tensor, self.q8_1_buf, self.q8_1_buf.size, self.swiglu_buf, inter_dim, hidden_dim);
                     self.endProfilePhase(.dense_ffn_gateup_matmul_q4, dense_ffn_gateup_matmul_phase);
                     self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
                 } else if (gemma_dense_geglu_pair_eligible) {
@@ -14515,45 +14476,6 @@ pub const InferenceEngine = struct {
         );
     }
 
-    /// Experimental Gemma dense GEGLU producer over a pre-quantized Q8_1
-    /// activation vector. Kept separate from the f32-input fused shader so A/B
-    /// measurements can isolate activation quantization plus integer-dot cost.
-    fn dispatchDmmvFusedGateUpGegluPairQ8_1(
-        self: *InferenceEngine,
-        gate_tensor: *const LoadedTensor,
-        up_tensor: *const LoadedTensor,
-        q8_1_buf: Buffer,
-        q8_1_size: vk.c.VkDeviceSize,
-        geglu_buf: Buffer,
-        M: u32,
-        K: u32,
-    ) !void {
-        const pip = &(self.dmmv.pipeline_q4k_pair_geglu_q8_1 orelse return error.ShaderNotLoaded);
-        const push = DmmvPushConstants{
-            .M = M,
-            .K = K,
-            .a_offset = 0,
-            .x_offset = 0,
-            .y_offset = 0,
-            .acc_mode = 0,
-        };
-        self.pushDispatch4(
-            pip,
-            std.mem.asBytes(&push),
-            gate_tensor.gpu_buffer.handle,
-            gate_tensor.gpu_buffer.size,
-            up_tensor.gpu_buffer.handle,
-            up_tensor.gpu_buffer.size,
-            q8_1_buf.handle,
-            q8_1_size,
-            geglu_buf.handle,
-            geglu_buf.size,
-            (M + 1) / 2,
-            1,
-            1,
-        );
-    }
-
     /// Gemma CPU-MoE expert fusion for the packed Q4_K gate/up tensor:
     /// computes GEGLU(W_gate·x, W_up·x) directly into swiglu_buf.
     fn dispatchDmmvFusedGateUpGegluOffset(
@@ -15205,12 +15127,19 @@ pub const InferenceEngine = struct {
         };
 
         if (pip.uses_push_descriptors) {
+            const qk_q81_pip: ?*const Pipeline = if (self.use_q4k_q8_1_dmmv)
+                switch (qt) {
+                    .q4_k => if (self.dmmv.pipeline_q4k_q8_1) |*p| p else null,
+                    .q6_k => if (self.dmmv.pipeline_q6k_q8_1) |*p| p else null,
+                    else => null,
+                }
+            else
+                null;
             if (self.use_q4k_q8_1_dmmv and
-                qt == .q4_k and
+                qk_q81_pip != null and
                 acc_mode == 0 and
                 x_offset == 0 and
                 (K & 31) == 0 and
-                self.dmmv.pipeline_q4k_q8_1 != null and
                 self.dmmv.pipeline_quantize_q8_1 != null)
             {
                 const input_bytes = @as(vk.c.VkDeviceSize, K) * @sizeOf(f32);
@@ -15227,8 +15156,7 @@ pub const InferenceEngine = struct {
                     );
                     self.decode_cmd.computeBufferBarrier(self.q8_1_buf.handle, q8_1_bytes);
 
-                    const q4_q81_pip = &self.dmmv.pipeline_q4k_q8_1.?;
-                    const push_q4_q81 = DmmvPushConstants{
+                    const push_q81 = DmmvPushConstants{
                         .M = M,
                         .K = K,
                         .a_offset = a_offset,
@@ -15237,8 +15165,8 @@ pub const InferenceEngine = struct {
                         .acc_mode = acc_mode,
                     };
                     self.pushDispatch3(
-                        q4_q81_pip,
-                        std.mem.asBytes(&push_q4_q81),
+                        qk_q81_pip.?,
+                        std.mem.asBytes(&push_q81),
                         tensor.gpu_buffer.handle,
                         tensor.gpu_buffer.size,
                         self.q8_1_buf.handle,

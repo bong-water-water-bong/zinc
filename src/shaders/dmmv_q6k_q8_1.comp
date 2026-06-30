@@ -1,0 +1,168 @@
+#version 460
+// ZINC - Q6_K weights x Q8_1 activation DMMV.
+//
+// One wave computes two output rows. The work distribution matches the
+// generic Q6_K row-pair DMMV, but consumes a pre-quantized Q8_1 activation
+// vector and uses signed int8 dot4 for the 6-bit weight lanes.
+
+#include "dp4a_compat.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint a_offset;
+    uint x_offset;
+    uint y_offset;
+    uint acc_mode;
+};
+
+layout(set = 0, binding = 0) readonly buffer Weight { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer VectorXQ81 { uint x_q81[]; };
+layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
+
+const uint Q6K_BYTES = 210u;
+const uint Q8_1_U32_PER_BLOCK = 9u;
+const uint NUM_ROWS = 2u;
+
+shared float s_sg_sums0[4];
+shared float s_sg_sums1[4];
+
+float fp16_to_fp32(uint h) {
+    return unpackHalf2x16(h).x;
+}
+
+float signed_scale(uint byte_value) {
+    return (byte_value >= 128u) ? float(byte_value) - 256.0 : float(byte_value);
+}
+
+uint pack_i8_4(int v0, int v1, int v2, int v3) {
+    return (uint(v0) & 0xFFu) |
+        ((uint(v1) & 0xFFu) << 8u) |
+        ((uint(v2) & 0xFFu) << 16u) |
+        ((uint(v3) & 0xFFu) << 24u);
+}
+
+float dot_q6_group(uint ql_base, uint qh_base, uint group, uint e_start, uint x_word_u32) {
+    const bool upper_nibble = group >= 2u;
+    const uint ql_pair = (group & 1u) * 32u;
+    int isum = 0;
+
+    [[unroll]] for (uint li = 0u; li < 4u; li++) {
+        const uint l = e_start + li;
+        const uint ql_v = uint(w[ql_base + ql_pair + l]);
+        const uint qh_v = uint(w[qh_base + l]);
+        const uint lo = upper_nibble ? (ql_v >> 4u) : (ql_v & 0xFu);
+        const uint hi = (qh_v >> (group * 2u)) & 3u;
+        const int q = int(lo | (hi << 4u)) - 32;
+        const uint packed = pack_i8_4(q, q, q, q);
+        const uint shift = li * 8u;
+        const uint mask = 0xFFu << shift;
+        const uint current = uint(isum);
+        const uint replaced = (current & ~mask) | ((packed & 0xFFu) << shift);
+        isum = int(replaced);
+    }
+
+    return float(dotPacked4x8AccSatEXT(isum, int(x_q81[x_word_u32]), 0));
+}
+
+float block_dot_q6k_q8_1(uint bb, uint half_id, uint local_id, uint e_start, uint is, uint x_block_u32) {
+    const uint d_bits = uint(w[bb + 208u]) | (uint(w[bb + 209u]) << 8u);
+    const float d = fp16_to_fp32(d_bits);
+
+    const uint ql_base = bb + half_id * 64u;
+    const uint qh_base = bb + 128u + half_id * 32u;
+    const uint sc_base = bb + 192u + half_id * 8u;
+
+    const float s0 = signed_scale(uint(w[sc_base + is]));
+    const float s2 = signed_scale(uint(w[sc_base + is + 2u]));
+    const float s4 = signed_scale(uint(w[sc_base + is + 4u]));
+    const float s6 = signed_scale(uint(w[sc_base + is + 6u]));
+
+    float sum = 0.0;
+    const uint q8_group_base = half_id * 4u;
+    const uint x_word = local_id;
+
+    const uint x0 = (x_block_u32 + q8_group_base + 0u) * Q8_1_U32_PER_BLOCK;
+    const uint x2 = (x_block_u32 + q8_group_base + 1u) * Q8_1_U32_PER_BLOCK;
+    const uint x4 = (x_block_u32 + q8_group_base + 2u) * Q8_1_U32_PER_BLOCK;
+    const uint x6 = (x_block_u32 + q8_group_base + 3u) * Q8_1_U32_PER_BLOCK;
+
+    const float dx0 = unpackHalf2x16(x_q81[x0 + 8u]).x;
+    const float dx2 = unpackHalf2x16(x_q81[x2 + 8u]).x;
+    const float dx4 = unpackHalf2x16(x_q81[x4 + 8u]).x;
+    const float dx6 = unpackHalf2x16(x_q81[x6 + 8u]).x;
+
+    sum += dx0 * d * s0 * dot_q6_group(ql_base, qh_base, 0u, e_start, x0 + x_word);
+    sum += dx2 * d * s2 * dot_q6_group(ql_base, qh_base, 1u, e_start, x2 + x_word);
+    sum += dx4 * d * s4 * dot_q6_group(ql_base, qh_base, 2u, e_start, x4 + x_word);
+    sum += dx6 * d * s6 * dot_q6_group(ql_base, qh_base, 3u, e_start, x6 + x_word);
+    return sum;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * NUM_ROWS;
+    if (row0 >= M) return;
+    const uint row1 = row0 + 1u;
+    const bool row1_valid = row1 < M;
+
+    const uint blocks_per_row = K / 256u;
+    const uint x_base_block = x_offset / 36u;
+    const uint y_base = y_offset / 4u;
+
+    const uint itid = tid & 15u;
+    const uint ix = tid >> 4u;
+    const uint half_id = itid >> 3u;
+    const uint local_id = itid & 7u;
+    const uint e_start = local_id * 4u;
+    const uint is = e_start >> 4u;
+
+    const uint row0_offset = a_offset + row0 * blocks_per_row * Q6K_BYTES;
+    const uint row1_offset = a_offset + row1 * blocks_per_row * Q6K_BYTES;
+
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    for (uint b = ix; b < blocks_per_row; b += 4u) {
+        const uint x_block_u32 = x_base_block + b * 8u;
+        sum0 += block_dot_q6k_q8_1(row0_offset + b * Q6K_BYTES, half_id, local_id, e_start, is, x_block_u32);
+        if (row1_valid) {
+            sum1 += block_dot_q6k_q8_1(row1_offset + b * Q6K_BYTES, half_id, local_id, e_start, is, x_block_u32);
+        }
+    }
+
+    sum0 = subgroupAdd(sum0);
+    sum1 = subgroupAdd(sum1);
+    if (gl_NumSubgroups > 1u) {
+        if (subgroupElect()) {
+            s_sg_sums0[gl_SubgroupID] = sum0;
+            s_sg_sums1[gl_SubgroupID] = sum1;
+        }
+        barrier();
+        if (tid == 0u) {
+            sum0 = s_sg_sums0[0];
+            sum1 = s_sg_sums1[0];
+            for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                sum0 += s_sg_sums0[sg];
+                sum1 += s_sg_sums1[sg];
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        if (acc_mode != 0u) {
+            y_data[y_base + row0] += sum0;
+            if (row1_valid) y_data[y_base + row1] += sum1;
+        } else {
+            y_data[y_base + row0] = sum0;
+            if (row1_valid) y_data[y_base + row1] = sum1;
+        }
+    }
+}
