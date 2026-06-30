@@ -631,6 +631,7 @@ pub const ForwardCuda = struct {
     ssm_conv_state: []CudaBuffer,
     ssm_state: []CudaBuffer,
     conv_off: []u32, // per-layer circular conv state offset
+    layer_is_attn: []bool, // per-layer: true=attention, false=SSM (detected from tensor names)
 
     // Effort 26 T0: batched prefill (qwen). Lazily-allocated token-major scratch
     // + the cuBLAS dense-GEMM toggles (mirrors the gemma prefillBatched path).
@@ -895,6 +896,7 @@ pub const ForwardCuda = struct {
             .ssm_conv_state = try allocator.alloc(CudaBuffer, d.n_layers),
             .ssm_state = try allocator.alloc(CudaBuffer, d.n_layers),
             .conv_off = try allocator.alloc(u32, d.n_layers),
+            .layer_is_attn = try allocator.alloc(bool, d.n_layers),
         };
 
         // GPU-side embed: enable only when token_embd.weight is Q4_K and the row
@@ -911,7 +913,10 @@ pub const ForwardCuda = struct {
         for (0..d.n_layers) |li| {
             const L: u32 = @intCast(li);
             self.conv_off[li] = 0;
-            if (isFullAttn(L, d.full_attn_interval)) {
+            // Detect layer type from tensor presence: attention layers have
+            // attn_q.weight, SSM layers have attn_qkv.weight.
+            self.layer_is_attn[li] = model.getLayer(L, "attn_q.weight") != null;
+            if (self.layer_is_attn[li]) {
                 self.kv_k[li] = try buffer.createBuffer(ctx, max_ctx * d.kv_dim * f4);
                 self.kv_v[li] = try buffer.createBuffer(ctx, max_ctx * d.kv_dim * f4);
                 self.ssm_conv_state[li] = try buffer.createBuffer(ctx, f4);
@@ -1066,6 +1071,7 @@ pub const ForwardCuda = struct {
         a.free(self.ssm_conv_state);
         a.free(self.ssm_state);
         a.free(self.conv_off);
+        a.free(self.layer_is_attn);
         buffer.freeHost(self.host_embed);
         buffer.freeHost(self.host_tok);
         buffer.freeHost(self.host_tok_in);
@@ -1109,7 +1115,7 @@ pub const ForwardCuda = struct {
         const ss = try self.allocator.alloc(CudaBuffer, d.n_layers);
         for (0..d.n_layers) |li| {
             const L: u32 = @intCast(li);
-            if (isFullAttn(L, d.full_attn_interval)) {
+            if (self.layer_is_attn[L]) {
                 const kv_bytes = @as(usize, n_slots) * slot_ctx * d.kv_dim * f4;
                 kk[li] = try buffer.createBuffer(ctx, kv_bytes);
                 vv[li] = try buffer.createBuffer(ctx, kv_bytes);
@@ -1194,7 +1200,7 @@ pub const ForwardCuda = struct {
         std.debug.assert(slot < self.n_slots);
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
-            if (isFullAttn(L, d.full_attn_interval)) continue; // attn KV is position-overwritten
+            if (self.layer_is_attn[L]) continue; // attn KV is position-overwritten
             var convst = try buffer.aliasBuffer(&cc[L], self.slotConvOffsetBytes(slot), d.conv_state_len * f4);
             defer buffer.freeBuffer(&convst);
             try zeroBuffer(self.allocator, self.ctx, &convst, d.conv_state_len);
@@ -1243,7 +1249,7 @@ pub const ForwardCuda = struct {
         var ssm_l: ?u32 = null;
         for (0..d.n_layers) |li| {
             const L: u32 = @intCast(li);
-            if (isFullAttn(L, d.full_attn_interval)) {
+            if (self.layer_is_attn[L]) {
                 if (attn_l == null) attn_l = L;
             } else if (ssm_l == null) ssm_l = L;
         }
@@ -1277,7 +1283,7 @@ pub const ForwardCuda = struct {
         for (0..d.n_layers) |li| {
             const L: u32 = @intCast(li);
             self.conv_off[li] = 0;
-            if (!isFullAttn(L, d.full_attn_interval)) {
+            if (!self.layer_is_attn[L]) {
                 try zeroBuffer(self.allocator, self.ctx, &self.ssm_conv_state[li], d.conv_state_len);
                 try zeroBuffer(self.allocator, self.ctx, &self.ssm_state[li], d.ssm_state_len);
             }
@@ -1326,7 +1332,7 @@ pub const ForwardCuda = struct {
         if (run_layers) {
             var L: u32 = 0;
             while (L < d.n_layers) : (L += 1) {
-                if (isFullAttn(L, d.full_attn_interval)) {
+                if (self.layer_is_attn[L]) {
                     try self.attentionLayer(L, pos);
                 } else {
                     try self.ssmLayer(L);
@@ -1360,7 +1366,7 @@ pub const ForwardCuda = struct {
         buffer.upload(ctx, &self.hidden, std.mem.sliceAsBytes(self.host_embed));
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
-            if (isFullAttn(L, d.full_attn_interval)) {
+            if (self.layer_is_attn[L]) {
                 try self.attentionLayer(L, pos);
             } else {
                 try self.ssmLayer(L);
@@ -1409,14 +1415,14 @@ pub const ForwardCuda = struct {
             if (profile) {
                 self.waitPending();
                 const t0 = std.time.milliTimestamp();
-                if (isFullAttn(L, d.full_attn_interval)) {
+                if (self.layer_is_attn[L]) {
                     try self.attentionLayerBatched(L, T, b);
                 } else {
                     try self.ssmLayerBatched(L, T, b);
                 }
                 self.waitPending();
                 const dt0 = std.time.milliTimestamp() - t0;
-                if (isFullAttn(L, d.full_attn_interval)) prof_attn += dt0 else prof_ssm += dt0;
+                if (self.layer_is_attn[L]) prof_attn += dt0 else prof_ssm += dt0;
                 const t1 = std.time.milliTimestamp();
                 if (d.n_experts > 0) {
                     if (moe_batched and self.moeBatchedSupported(L)) {
@@ -1437,7 +1443,7 @@ pub const ForwardCuda = struct {
                 self.waitPending();
                 prof_ffn += std.time.milliTimestamp() - t1;
             } else {
-                if (isFullAttn(L, d.full_attn_interval)) {
+                if (self.layer_is_attn[L]) {
                     try self.attentionLayerBatched(L, T, b);
                 } else {
                     try self.ssmLayerBatched(L, T, b);
@@ -1518,7 +1524,7 @@ pub const ForwardCuda = struct {
         var alias_err: ?anyerror = null;
         L_alias: for (0..d.n_layers) |li| {
             const L: u32 = @intCast(li);
-            if (isFullAttn(L, d.full_attn_interval)) {
+            if (self.layer_is_attn[L]) {
                 const kv_off = @as(usize, slot) * self.slot_ctx * d.kv_dim * f4;
                 self.kv_k[L] = buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_off, T * d.kv_dim * f4) catch |e| { alias_err = e; break :L_alias; };
                 self.kv_v[L] = buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_off, T * d.kv_dim * f4) catch |e| { alias_err = e; break :L_alias; };
@@ -1556,7 +1562,7 @@ pub const ForwardCuda = struct {
             // Only free the buffers that were actually aliased (per layer type).
             // Attention layers: kv_k/kv_v aliased; ssm_state/conv untouched.
             // SSM layers: ssm_state/conv aliased; kv_k/kv_v untouched.
-            if (isFullAttn(i, self.d.full_attn_interval)) {
+            if (self.layer_is_attn[i]) {
                 buffer.freeBuffer(&self.kv_k[i]);
                 buffer.freeBuffer(&self.kv_v[i]);
             } else {
@@ -2215,7 +2221,7 @@ pub const ForwardCuda = struct {
         // batched grid.y/z=B kernels — each block is ONE command buffer / one sync.
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
-            if (isFullAttn(L, d.full_attn_interval)) {
+            if (self.layer_is_attn[L]) {
                 try self.attentionLayerBatchedDecode(L, B, db, pos_buf, slot_buf, max_seq_len);
             } else {
                 try self.ssmLayerBatchedDecode(L, B, db, pos_buf, slot_buf);
@@ -2287,7 +2293,7 @@ pub const ForwardCuda = struct {
         // max_seq_len) so the captured kernel-node shape is invariant across steps.
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
-            if (isFullAttn(L, d.full_attn_interval)) {
+            if (self.layer_is_attn[L]) {
                 try self.attentionLayerBatchedDecode(L, B, db, pos_buf, slot_buf, max_seq_len);
             } else {
                 try self.ssmLayerBatchedDecode(L, B, db, pos_buf, slot_buf);
@@ -3040,7 +3046,7 @@ pub const ForwardCuda = struct {
         }
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
-            if (isFullAttn(L, d.full_attn_interval)) {
+            if (self.layer_is_attn[L]) {
                 try self.attentionLayer(L, pos);
             } else {
                 try self.ssmLayer(L);
