@@ -1227,6 +1227,11 @@ pub const InferenceEngine = struct {
     // instead of widening the regular NUM_ROWS=2 path that previously
     // regressed this target. Disable with ZINC_QWEN36_27B_DENSE_FUSED_ROW1=0.
     use_qwen36_dense_fused_row1: bool = false,
+    // Opt-in diagnostic for the exact dense Gemma 31B FFN shape. Reuses the
+    // BN=8 int8-DP4a prefill kernels for one-token decode: hidden -> Q8_1,
+    // fused Q4_K gate/up/GEGLU -> packed activation, then Q4_K/Q6_K down.
+    // Enable with ZINC_GEMMA_DENSE_DECODE_DP4A=1 for A/B runs.
+    use_gemma_dense_decode_dp4a: bool = false,
     // Effort-11 cycle-17: fused split-K flash attention merge + o_proj
     // DMMV-acc. When ZINC_FUSED_OPROJ_MERGE=1 (and split-K is active), the
     // o_proj dispatch site uses a single dmmv_q4k_o_proj_merge dispatch
@@ -2568,6 +2573,24 @@ pub const InferenceEngine = struct {
         } else if (qwen36_dense_row1_explicitly_off) {
             log.info("Qwen3.6-27B dense fused gate+up+SwiGLU row1 path DISABLED via ZINC_QWEN36_27B_DENSE_FUSED_ROW1=0", .{});
         }
+        const gemma_dense_decode_dp4a_env = std.posix.getenv("ZINC_GEMMA_DENSE_DECODE_DP4A");
+        const gemma_dense_decode_dp4a_requested = gemma_dense_decode_dp4a_env != null and
+            std.mem.eql(u8, gemma_dense_decode_dp4a_env.?, "1");
+        const gemma_dense_decode_dp4a_q6_ready =
+            dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_k5376_n8 != null and
+            dmmv.pipeline_mul_mm_q6k_full_dp4a_k21504_n8 != null;
+        const gemma_dense_decode_dp4a_q4_ready =
+            dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1_k5376_n8 != null and
+            dmmv.pipeline_mul_mm_q4k_full_dp4a_k21504_n8 != null;
+        const gemma_dense_decode_dp4a_enabled = gemma_dense_decode_dp4a_requested and
+            instance.push_descriptor_fn != null and
+            dmmv.pipeline_quantize_act_q8_1 != null and
+            (gemma_dense_decode_dp4a_q6_ready or gemma_dense_decode_dp4a_q4_ready);
+        if (gemma_dense_decode_dp4a_enabled) {
+            log.info("Gemma dense decode DP4a diagnostic path ENABLED via ZINC_GEMMA_DENSE_DECODE_DP4A=1 for matching shape", .{});
+        } else if (gemma_dense_decode_dp4a_requested) {
+            log.info("ZINC_GEMMA_DENSE_DECODE_DP4A=1 requested but prerequisites missing; using standard Gemma dense decode path", .{});
+        }
 
         // Fused split-K merge + o_proj DMMV-acc (effort-11 cycle 17). When
         // ZINC_FUSED_OPROJ_MERGE=1 AND split-K is active, the o_proj site
@@ -3259,6 +3282,7 @@ pub const InferenceEngine = struct {
             .use_ssm_delta_normed_qk = ssm_delta_normed_qk_enabled,
             .use_fused_dense_ffn = fused_dense_ffn_enabled,
             .use_qwen36_dense_fused_row1 = qwen36_dense_row1_enabled,
+            .use_gemma_dense_decode_dp4a = gemma_dense_decode_dp4a_enabled,
             .use_fused_oproj_merge = fused_oproj_merge_enabled,
             .use_fused_qk_kv = fused_qk_kv_enabled,
             .fa_profile_layer = fa_profile_layer_enabled,
@@ -6529,7 +6553,6 @@ pub const InferenceEngine = struct {
                 self.prefill_active and
                 layer == layer_start and
                 self.partial_decode_ffn_norm_in != null;
-            var ffn_norm_precomputed = false;
 
             // --- Input RMS norm: hidden_buf → norm_buf ---
             const attn_norm = if (!resume_from_ffn_norm) lt.attn_norm orelse {
@@ -7775,17 +7798,8 @@ pub const InferenceEngine = struct {
                         // When the fused rms_norm_add pipeline is loaded and we're not in a
                         // diagnostics path, skip the separate norm dispatch and let the
                         // residual-add branch below fuse both into one pass.
-                        const post_attn_ffn_norm_tensor = lt.ffn_norm orelse lt.post_attention_norm;
-                        const use_fused_pan_ffn_norm_decode = apply_post_attn_norm and
-                            post_attn_ffn_norm_tensor != null and
-                            !is_moe and
-                            !self.prefill_active and
-                            self.elementwise.pipeline_post_norm_residual_rms_norm != null and
-                            !diag_attn_residual and
-                            config.architecture == .gemma;
                         const use_fused_pan_decode = apply_post_attn_norm and
                             self.elementwise.pipeline_rms_norm_add != null and
-                            !use_fused_pan_ffn_norm_decode and
                             !diag_attn_residual and
                             config.architecture != .gpt_oss;
                         if (apply_post_attn_norm and !use_fused_pan_decode) {
@@ -7831,26 +7845,6 @@ pub const InferenceEngine = struct {
                                 .size = hidden_size,
                             });
                             self.decode_cmd.transferToComputeBarrier();
-                        } else if (use_fused_pan_ffn_norm_decode) {
-                            const pan_tensor = lt.post_attention_norm.?;
-                            const next_norm_tensor = post_attn_ffn_norm_tensor.?;
-                            try self.dispatchPostNormResidualRmsNorm(
-                                self.hidden_buf.handle,
-                                hidden_size,
-                                self.o_proj_buf.handle,
-                                hidden_size,
-                                pan_tensor.gpu_buffer.handle,
-                                pan_tensor.gpu_buffer.size,
-                                self.ffn_norm_buf.handle,
-                                hidden_size,
-                                next_norm_tensor.gpu_buffer.handle,
-                                next_norm_tensor.gpu_buffer.size,
-                                hidden_dim,
-                                1,
-                                rms_norm_eps,
-                            );
-                            ffn_norm_precomputed = true;
-                            self.decode_cmd.computeBarrier();
                         } else if (use_fused_pan_decode) {
                             // Fused Gemma post_attention_norm + residual add in one
                             // dispatch: hidden += pan_weight * rmsnorm(o_proj_buf).
@@ -8176,7 +8170,7 @@ pub const InferenceEngine = struct {
                 partial_hidden_out_written_by_stop = true;
                 break;
             }
-            if (!ffn_norm_precomputed and !resume_from_ffn_norm and !can_fuse_rms_router and !skip_gemma_short_prefill_ffn_norm) {
+            if (!resume_from_ffn_norm and !can_fuse_rms_router and !skip_gemma_short_prefill_ffn_norm) {
                 try self.dispatchRmsNorm(
                     self.hidden_buf.handle,
                     hidden_size,
@@ -10229,12 +10223,29 @@ pub const InferenceEngine = struct {
                     (hidden_dim % 4) == 0 and
                     (hidden_dim % 256) == 0;
 
+                var gemma_decode_dp4a_activation: GemmaDecodeDp4aActivation = .none;
                 const dense_ffn_gateup_phase = self.beginProfilePhase();
-                if (fused_dense_ffn_eligible) {
+                if (!dense_prefill_validate_capture or self.dense_prefill_validate_production) {
+                    gemma_decode_dp4a_activation = try self.dispatchGemmaDenseDecodeGateUpDp4a(
+                        gate_tensor,
+                        up_tensor,
+                        down_tensor,
+                        self.ffn_norm_buf,
+                        hidden_dim,
+                        inter_dim,
+                    );
+                }
+                if (gemma_decode_dp4a_activation != .none) {
+                    // The packed activation was already barriered by the helper.
+                } else if (fused_dense_ffn_eligible) {
+                    const dense_ffn_gateup_matmul_phase = self.beginProfilePhase();
                     try self.dispatchDmmvFusedGateUpSwiglu(gate_tensor, up_tensor, self.ffn_norm_buf, hidden_size, self.swiglu_buf, inter_dim, hidden_dim);
+                    self.endProfilePhase(.dense_ffn_gateup_matmul_q4, dense_ffn_gateup_matmul_phase);
                     self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
                 } else if (gemma_dense_geglu_pair_eligible) {
+                    const dense_ffn_gateup_matmul_phase = self.beginProfilePhase();
                     try self.dispatchDmmvFusedGateUpGegluPair(gate_tensor, up_tensor, self.ffn_norm_buf, hidden_size, self.swiglu_buf, inter_dim, hidden_dim);
+                    self.endProfilePhase(.dense_ffn_gateup_matmul_q4, dense_ffn_gateup_matmul_phase);
                     self.decode_cmd.computeBufferBarrier(self.swiglu_buf.handle, self.swiglu_buf.size);
                 } else {
                     const dense_ffn_gate_phase = self.beginProfilePhase();
@@ -10291,14 +10302,34 @@ pub const InferenceEngine = struct {
                     self.elementwise.pipeline_rms_norm_add != null and
                     !self.validation_diagnostics_enabled;
                 const dense_ffn_down_phase = self.beginProfilePhase();
-                if (lt.post_ffw_norm == null and !self.validation_diagnostics_enabled and (!dense_prefill_validate_capture or self.dense_prefill_validate_production)) {
+                const dense_ffn_down_matmul_profile_phase: ProfilePhase = switch (down_tensor.info.type_) {
+                    .q4_k => .dense_ffn_down_matmul_q4,
+                    .q6_k => .dense_ffn_down_matmul_q6,
+                    else => .dense_ffn_down_matmul,
+                };
+                if (lt.post_ffw_norm == null and !self.validation_diagnostics_enabled and (!dense_prefill_validate_capture or self.dense_prefill_validate_production) and gemma_decode_dp4a_activation == .none) {
                     // Fused: down DMMV accumulates directly into hidden_buf,
                     // eliminating separate scale_acc dispatch + barrier
+                    const down_matmul_phase = self.beginProfilePhase();
                     try self.dispatchDmmvAcc(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.hidden_buf, hidden_dim, inter_dim);
+                    self.endProfilePhase(dense_ffn_down_matmul_profile_phase, down_matmul_phase);
                 } else if (use_fused_pfn_decode) {
-                    try self.dispatchDmmv(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.down_buf, hidden_dim, inter_dim);
+                    const down_matmul_phase = self.beginProfilePhase();
+                    if (gemma_decode_dp4a_activation != .none) {
+                        if (!try self.dispatchGemmaDenseDecodeDownDp4a(
+                            down_tensor,
+                            self.down_buf,
+                            hidden_dim,
+                            inter_dim,
+                            gemma_decode_dp4a_activation,
+                        )) return error.GemmaDenseDecodeDp4aFailed;
+                    } else {
+                        try self.dispatchDmmv(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.down_buf, hidden_dim, inter_dim);
+                    }
+                    self.endProfilePhase(dense_ffn_down_matmul_profile_phase, down_matmul_phase);
                     self.decode_cmd.computeBarrier();
                     const pfn_tensor = lt.post_ffw_norm.?;
+                    const dense_ffn_residual_phase = self.beginProfilePhase();
                     try self.dispatchRmsNormAdd(
                         self.hidden_buf.handle,
                         hidden_size,
@@ -10310,9 +10341,22 @@ pub const InferenceEngine = struct {
                         1,
                         rms_norm_eps,
                     );
+                    self.endProfilePhase(.dense_ffn_residual_acc, dense_ffn_residual_phase);
                 } else {
                     // Unfused path: needed for Gemma post-FFN norm or diagnostics
-                    try self.dispatchDmmv(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.down_buf, hidden_dim, inter_dim);
+                    const down_matmul_phase = self.beginProfilePhase();
+                    if (gemma_decode_dp4a_activation != .none) {
+                        if (!try self.dispatchGemmaDenseDecodeDownDp4a(
+                            down_tensor,
+                            self.down_buf,
+                            hidden_dim,
+                            inter_dim,
+                            gemma_decode_dp4a_activation,
+                        )) return error.GemmaDenseDecodeDp4aFailed;
+                    } else {
+                        try self.dispatchDmmv(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.down_buf, hidden_dim, inter_dim);
+                    }
+                    self.endProfilePhase(dense_ffn_down_matmul_profile_phase, down_matmul_phase);
                     self.decode_cmd.computeBarrier();
 
                     // Gemma post-FFN norm: RMS norm on down_proj output before residual add
@@ -10399,6 +10443,7 @@ pub const InferenceEngine = struct {
 
                     // FFN residual: hidden_buf += down_buf
                     if (!use_fused_pfn_decode) {
+                        const dense_ffn_residual_phase = self.beginProfilePhase();
                         try self.dispatchScaleAcc(
                             self.hidden_buf.handle,
                             hidden_size,
@@ -10407,6 +10452,7 @@ pub const InferenceEngine = struct {
                             hidden_dim,
                             1.0,
                         );
+                        self.endProfilePhase(.dense_ffn_residual_acc, dense_ffn_residual_phase);
                     }
                 }
                 if (dense_prefill_validate_capture) {
@@ -12393,6 +12439,249 @@ pub const InferenceEngine = struct {
         q8_geglu,
         q8_1_geglu,
     };
+
+    const GemmaDecodeDp4aActivation = enum {
+        none,
+        q8_geglu,
+        q8_1_geglu,
+    };
+
+    fn gemmaDenseDecodeDp4aSupported(
+        self: *const InferenceEngine,
+        gate_t: *const LoadedTensor,
+        up_t: *const LoadedTensor,
+        down_t: *const LoadedTensor,
+        hidden_dim: u32,
+        inter_dim: u32,
+    ) bool {
+        if (!self.use_gemma_dense_decode_dp4a) return false;
+        if (self.validation_diagnostics_enabled) return false;
+        if (!self.isAmdRdna()) return false;
+        if (!self.instance.caps.integer_dot_product) return false;
+        if (self.instance.push_descriptor_fn == null) return false;
+        const cfg = self.model.config;
+        if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
+        if (hidden_dim != 5376 or inter_dim != 21504) return false;
+        if ((hidden_dim & 255) != 0 or (inter_dim & 255) != 0) return false;
+        if (gate_t.info.type_ != .q4_k or up_t.info.type_ != .q4_k) return false;
+        if (self.dmmv.pipeline_quantize_act_q8_1 == null) return false;
+        return switch (down_t.info.type_) {
+            .q6_k => self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_k5376_n8 != null and
+                self.dmmv.pipeline_mul_mm_q6k_full_dp4a_k21504_n8 != null,
+            .q4_k => self.dmmv.pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1_k5376_n8 != null and
+                self.dmmv.pipeline_mul_mm_q4k_full_dp4a_k21504_n8 != null,
+            else => false,
+        };
+    }
+
+    fn ensureGemmaDenseDecodeDp4aScratchCapacity(self: *InferenceEngine, hidden_dim: u32, inter_dim: u32) !bool {
+        if ((hidden_dim & 255) != 0 or (inter_dim & 255) != 0) return false;
+        const n: u64 = 8;
+        const f32_sz: u64 = @sizeOf(f32);
+        const u32_sz: u64 = @sizeOf(u32);
+        const hidden_i8_bytes = n * @as(u64, hidden_dim / 4) * u32_sz;
+        const hidden_scale_dsum_bytes = n * @as(u64, hidden_dim / 32) * 2 * f32_sz;
+        const inter_i8_bytes = n * @as(u64, inter_dim / 4) * u32_sz;
+        const inter_scale_bytes = n * @as(u64, inter_dim / 32) * f32_sz;
+        const inter_scale_dsum_bytes = n * @as(u64, inter_dim / 32) * 2 * f32_sz;
+        const storage_xfer = vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+            vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+        const growSlot = struct {
+            fn run(instance: *const @import("../vulkan/instance.zig").Instance, slot: *?Buffer, size: u64, usage: u32) !void {
+                if (slot.*) |*existing| {
+                    if (existing.size >= size) return;
+                    existing.deinit();
+                }
+                slot.* = try Buffer.initDeviceLocal(instance, size, usage);
+            }
+        }.run;
+
+        try growSlot(self.instance, &self.batched_scratch_hidden_i8, hidden_i8_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_hidden_scale_dsum, hidden_scale_dsum_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_swiglu_i8, inter_i8_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_swiglu_scale, inter_scale_bytes, storage_xfer);
+        try growSlot(self.instance, &self.batched_scratch_swiglu_scale_dsum, inter_scale_dsum_bytes, storage_xfer);
+        return true;
+    }
+
+    fn dispatchGemmaDenseDecodeGateUpDp4a(
+        self: *InferenceEngine,
+        gate_t: *const LoadedTensor,
+        up_t: *const LoadedTensor,
+        down_t: *const LoadedTensor,
+        norm_buf: Buffer,
+        hidden_dim: u32,
+        inter_dim: u32,
+    ) !GemmaDecodeDp4aActivation {
+        if (!self.gemmaDenseDecodeDp4aSupported(gate_t, up_t, down_t, hidden_dim, inter_dim)) return .none;
+        if (!try self.ensureGemmaDenseDecodeDp4aScratchCapacity(hidden_dim, inter_dim)) return .none;
+        const hidden_i8 = self.batched_scratch_hidden_i8 orelse return .none;
+        const hidden_sd = self.batched_scratch_hidden_scale_dsum orelse return .none;
+        if (norm_buf.size < @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32)) return .none;
+
+        const gateup_quant_phase = self.beginProfilePhase();
+        try self.dmmv.recordQuantizeActQ8_1(
+            &self.decode_cmd,
+            self.instance.push_descriptor_fn,
+            norm_buf.handle,
+            norm_buf.size,
+            hidden_i8.handle,
+            hidden_i8.size,
+            hidden_sd.handle,
+            hidden_sd.size,
+            1,
+            hidden_dim,
+        );
+        const hidden_ranges = [_]CommandBuffer.BufferRange{
+            .{ .buffer = hidden_i8.handle, .size = hidden_i8.size },
+            .{ .buffer = hidden_sd.handle, .size = hidden_sd.size },
+        };
+        self.decode_cmd.computeBuffersBarrier(&hidden_ranges);
+        self.endProfilePhase(.dense_ffn_gateup_quant, gateup_quant_phase);
+
+        const gateup_matmul_phase = self.beginProfilePhase();
+        switch (down_t.info.type_) {
+            .q6_k => {
+                const swiglu_i8 = self.batched_scratch_swiglu_i8 orelse return .none;
+                const swiglu_scale = self.batched_scratch_swiglu_scale orelse return .none;
+                try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_t.gpu_buffer.handle,
+                    gate_t.gpu_buffer.size,
+                    up_t.gpu_buffer.handle,
+                    up_t.gpu_buffer.size,
+                    hidden_i8.handle,
+                    hidden_i8.size,
+                    hidden_sd.handle,
+                    hidden_sd.size,
+                    swiglu_i8.handle,
+                    swiglu_i8.size,
+                    swiglu_scale.handle,
+                    swiglu_scale.size,
+                    inter_dim,
+                    1,
+                    hidden_dim,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                self.endProfilePhase(.dense_ffn_gateup_matmul_q4, gateup_matmul_phase);
+                const ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = swiglu_i8.handle, .size = swiglu_i8.size },
+                    .{ .buffer = swiglu_scale.handle, .size = swiglu_scale.size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&ranges);
+                return .q8_geglu;
+            },
+            .q4_k => {
+                const swiglu_i8 = self.batched_scratch_swiglu_i8 orelse return .none;
+                const swiglu_sd = self.batched_scratch_swiglu_scale_dsum orelse return .none;
+                try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8_1(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_t.gpu_buffer.handle,
+                    gate_t.gpu_buffer.size,
+                    up_t.gpu_buffer.handle,
+                    up_t.gpu_buffer.size,
+                    hidden_i8.handle,
+                    hidden_i8.size,
+                    hidden_sd.handle,
+                    hidden_sd.size,
+                    swiglu_i8.handle,
+                    swiglu_i8.size,
+                    swiglu_sd.handle,
+                    swiglu_sd.size,
+                    inter_dim,
+                    1,
+                    hidden_dim,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                self.endProfilePhase(.dense_ffn_gateup_matmul_q4, gateup_matmul_phase);
+                const ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = swiglu_i8.handle, .size = swiglu_i8.size },
+                    .{ .buffer = swiglu_sd.handle, .size = swiglu_sd.size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&ranges);
+                return .q8_1_geglu;
+            },
+            else => return .none,
+        }
+    }
+
+    fn dispatchGemmaDenseDecodeDownDp4a(
+        self: *InferenceEngine,
+        down_t: *const LoadedTensor,
+        down_buf: Buffer,
+        hidden_dim: u32,
+        inter_dim: u32,
+        activation: GemmaDecodeDp4aActivation,
+    ) !bool {
+        if (activation == .none) return false;
+        if ((hidden_dim & 31) != 0 or (inter_dim & 255) != 0) return false;
+        if (down_buf.size < @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32)) return false;
+        const packed_act = self.batched_scratch_swiglu_i8 orelse return false;
+        const push_fn = self.instance.push_descriptor_fn;
+        switch (activation) {
+            .q8_geglu => {
+                if (down_t.info.type_ != .q6_k) return false;
+                const scale = self.batched_scratch_swiglu_scale orelse return false;
+                try self.dmmv.recordMulMmQ6KTail8Dp4a(
+                    &self.decode_cmd,
+                    push_fn,
+                    down_t.gpu_buffer.handle,
+                    down_t.gpu_buffer.size,
+                    packed_act.handle,
+                    packed_act.size,
+                    scale.handle,
+                    scale.size,
+                    down_buf.handle,
+                    down_buf.size,
+                    hidden_dim,
+                    1,
+                    inter_dim,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                return true;
+            },
+            .q8_1_geglu => {
+                if (down_t.info.type_ != .q4_k) return false;
+                const scale_dsum = self.batched_scratch_swiglu_scale_dsum orelse return false;
+                try self.dmmv.recordMulMmQ4KTail8Dp4a(
+                    &self.decode_cmd,
+                    push_fn,
+                    down_t.gpu_buffer.handle,
+                    down_t.gpu_buffer.size,
+                    packed_act.handle,
+                    packed_act.size,
+                    scale_dsum.handle,
+                    scale_dsum.size,
+                    down_buf.handle,
+                    down_buf.size,
+                    hidden_dim,
+                    1,
+                    inter_dim,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                return true;
+            },
+            .none => return false,
+        }
+    }
 
     fn barrierAfterGemmaGateUpGeglu(
         self: *InferenceEngine,

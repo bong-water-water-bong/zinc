@@ -47,7 +47,7 @@ test "decode loop keeps compute-to-transfer barrier before KV cache writes" {
 
 test "decode loop keeps layer-boundary compute barrier after FFN residual" {
     const src = @embedFile("compute/forward.zig");
-    try expectContainsNear(src, "// FFN residual: hidden_buf += down_buf", "self.decode_cmd.computeBarrier();", 1200);
+    try expectContainsNear(src, "// FFN residual: hidden_buf += down_buf", "self.decode_cmd.computeBarrier();", 2400);
 }
 
 test "prefill resets per-request state before processing prompt tokens" {
@@ -194,7 +194,21 @@ test "Vulkan Gemma dense decode keeps fused GEGLU gate-up pair path" {
     try expectContainsNear(src, marker, "pipeline_q4k_fused_gate_up_geglu_pair != null", 500);
     try expectContainsNear(src, marker, "config.architecture == .gemma", 500);
     try expectContainsNear(src, marker, "gate_tensor.info.type_ == .q4_k", 600);
-    try expectContainsNear(src, marker, "try self.dispatchDmmvFusedGateUpGegluPair", 1200);
+    try expectContainsNear(src, marker, "try self.dispatchDmmvFusedGateUpGegluPair", 2200);
+}
+
+test "Vulkan Gemma dense decode keeps BN8 DP4a packed GEGLU path" {
+    const src = @embedFile("compute/forward.zig");
+    try expectContains(src, "ZINC_GEMMA_DENSE_DECODE_DP4A");
+    try expectContainsNear(src, "fn gemmaDenseDecodeDp4aSupported", "hidden_dim != 5376 or inter_dim != 21504", 1200);
+    try expectContainsNear(src, "fn gemmaDenseDecodeDp4aSupported", "cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0", 900);
+    try expectContainsNear(src, "fn dispatchGemmaDenseDecodeGateUpDp4a", "try self.dmmv.recordQuantizeActQ8_1(", 2200);
+    try expectContainsNear(src, "fn dispatchGemmaDenseDecodeGateUpDp4a", "try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8(", 5200);
+    try expectContainsNear(src, "fn dispatchGemmaDenseDecodeGateUpDp4a", "try self.dmmv.recordMulMmQ4KGateUpGegluFullDp4aQ8_1(", 7600);
+    try expectContainsNear(src, "fn dispatchGemmaDenseDecodeDownDp4a", "try self.dmmv.recordMulMmQ6KTail8Dp4a(", 2200);
+    try expectContainsNear(src, "fn dispatchGemmaDenseDecodeDownDp4a", "try self.dmmv.recordMulMmQ4KTail8Dp4a(", 3800);
+    try expectContainsNear(src, "var gemma_decode_dp4a_activation: GemmaDecodeDp4aActivation = .none;", "try self.dispatchGemmaDenseDecodeGateUpDp4a(", 800);
+    try expectContainsNear(src, "else if (use_fused_pfn_decode)", "try self.dispatchGemmaDenseDecodeDownDp4a(", 1800);
 }
 
 test "Vulkan Gemma prefill top-k cap can be tested without decode top-k cap" {
@@ -732,12 +746,6 @@ test "Vulkan post-attention norm applied before attn residual" {
     // Gemma requires RMS norm on o_proj output before residual add.
     const src = @embedFile("compute/forward.zig");
     try expectContains(src, "Gemma post-attention norm: RMS norm on o_proj output before residual add");
-    try expectContains(src, "const use_fused_pan_ffn_norm_decode = apply_post_attn_norm");
-    try expectContainsNear(src, "const use_fused_pan_ffn_norm_decode = apply_post_attn_norm", "!is_moe", 500);
-    try expectContainsNear(src, "const use_fused_pan_ffn_norm_decode = apply_post_attn_norm", "self.elementwise.pipeline_post_norm_residual_rms_norm != null", 500);
-    try expectContainsNear(src, "const use_fused_pan_ffn_norm_decode = apply_post_attn_norm", "config.architecture == .gemma", 600);
-    try expectContainsNear(src, "else if (use_fused_pan_ffn_norm_decode)", "try self.dispatchPostNormResidualRmsNorm(", 1200);
-    try expectContainsNear(src, "if (!ffn_norm_precomputed and !resume_from_ffn_norm", "try self.dispatchRmsNorm(", 600);
 }
 
 test "Vulkan post-FFN norm applied before FFN residual" {
