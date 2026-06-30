@@ -917,6 +917,13 @@ pub const ForwardCuda = struct {
             // attn_q.weight, SSM layers have attn_qkv.weight.
             self.layer_is_attn[li] = model.getLayer(L, "attn_q.weight") != null;
             if (li < 8) log.info("  layer {d}: {s}", .{ li, if (self.layer_is_attn[li]) "attention" else "SSM" });
+            if (li == 0 and d.n_experts > 0) {
+                if (model.getLayer(L, "ffn_gate_exps.weight")) |w| log.info("  ffn_gate_exps: type={} dims={any}", .{w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)]});
+                if (model.getLayer(L, "ffn_down_exps.weight")) |w| log.info("  ffn_down_exps: type={} dims={any}", .{w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)]});
+                if (model.getLayer(L, "ffn_gate_shexp.weight")) |w| log.info("  ffn_gate_shexp: type={} dims={any}", .{w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)]});
+                if (model.getLayer(L, "ffn_down_shexp.weight")) |w| log.info("  ffn_down_shexp: type={} dims={any}", .{w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)]});
+                if (model.getLayer(L, "ffn_gate_inp.weight")) |w| log.info("  ffn_gate_inp: type={} dims={any}", .{w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)]});
+            }
             if (self.layer_is_attn[li]) {
                 self.kv_k[li] = try buffer.createBuffer(ctx, max_ctx * d.kv_dim * f4);
                 self.kv_v[li] = try buffer.createBuffer(ctx, max_ctx * d.kv_dim * f4);
