@@ -156,6 +156,15 @@ test "Vulkan batched projection kpar is allowed on Intel wave32" {
     try expectNotContains(src[start..end], "gpu_config.wave_size == 64");
 }
 
+test "Vulkan Intel Gemma decode uses split-K at short sequence lengths" {
+    const src = @embedFile("compute/forward.zig");
+    const marker = "const intel_gemma_split_k_short_seq =";
+    try expectContains(src, "for all Intel Gemma decode lengths");
+    try expectContainsNear(src, marker, "config.architecture == .gemma", 200);
+    try expectContainsNear(src, marker, "isIntelGpuVendor(self.gpu_config.vendor)", 200);
+    try expectContainsNear(src, marker, "self.fa_split_k_forced or intel_gemma_split_k_short_seq or attn_seq_len", 400);
+}
+
 test "Vulkan Qwen dense prefill padding covers short dense-hybrid DP4a shapes" {
     const src = @embedFile("compute/forward.zig");
     const marker = "fn qwen36DensePrefillPaddedTokenCount";
@@ -227,6 +236,8 @@ test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate"
     try expectContains(src, "fn prefillGemmaRunBatchedAttentionToFfnNorm");
     try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnvEnabled", "orelse return true", 200);
     try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnvEnabled", "std.ascii.eqlIgnoreCase(env, \"off\")", 500);
+    try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnabled", "isIntelGpuVendor(self.gpu_config.vendor)", 900);
+    try expectContainsNear(src, "fn gemmaShortMoePrefixPrefillEnabled", "!self.isAmdRdna()", 700);
     try expectContainsNear(src, marker, "try self.prefillGemmaRunBatchedAttentionToFfnNorm", 18000);
     try expectContainsNear(src, marker, "try self.ensureGemmaMoePrefillDp4aScratchCapacity", 4200);
     try expectContainsNear(src, "fn ensureGemmaMoePrefillDp4aScratchCapacity", "batched_scratch_norm_q8_scale", 2400);

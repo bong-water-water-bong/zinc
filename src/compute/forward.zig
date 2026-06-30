@@ -2672,6 +2672,8 @@ pub const InferenceEngine = struct {
         if (fa_split_k > 1) {
             if (fa_split_k_forced) {
                 log.info("Flash-attn split-K ENABLED: N_I_CHUNKS={d} via ZINC_FA_SPLIT_K", .{fa_split_k});
+            } else if (config.architecture == .gemma and isIntelGpuVendor(gpu_config.vendor)) {
+                log.info("Flash-attn split-K ENABLED: N_I_CHUNKS={d} for all Intel Gemma decode lengths (set ZINC_FA_SPLIT_K=0 to disable)", .{fa_split_k});
             } else {
                 log.info("Flash-attn split-K ENABLED: N_I_CHUNKS={d} for seq_len>=128 (default; set ZINC_FA_SPLIT_K=0 to disable or =4 to force)", .{fa_split_k});
             }
@@ -7197,7 +7199,9 @@ pub const InferenceEngine = struct {
                     const use_batched = self.use_batch_attn and self.attention.pipeline_batched != null;
                     const attn_seq_len = state.position + 1;
                     const split_k_min_seq_len: u32 = 128;
-                    const split_k_seq_ok = self.fa_split_k_forced or attn_seq_len >= split_k_min_seq_len;
+                    const intel_gemma_split_k_short_seq =
+                        config.architecture == .gemma and isIntelGpuVendor(self.gpu_config.vendor);
+                    const split_k_seq_ok = self.fa_split_k_forced or intel_gemma_split_k_short_seq or attn_seq_len >= split_k_min_seq_len;
                     const use_split_k = !use_batched and split_k_seq_ok and self.fa_split_k > 1 and
                         self.attention.pipeline_split != null and
                         self.attention.pipeline_split_merge != null and
@@ -22695,7 +22699,8 @@ pub const InferenceEngine = struct {
         const cfg = self.model.config;
         if (cfg.architecture != .gemma or cfg.n_experts == 0 or cfg.n_experts_used == 0) return false;
         if (cfg.n_experts_used > 16 or cfg.n_experts > 256) return false;
-        if (!self.isAmdRdna() or self.instance.push_descriptor_fn == null) return false;
+        const supported_vendor = self.isAmdRdna() or isIntelGpuVendor(self.gpu_config.vendor);
+        if (!supported_vendor or self.instance.push_descriptor_fn == null) return false;
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_capture_routing or self.use_capture_ffn_input or self.use_count_experts_prefill) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
