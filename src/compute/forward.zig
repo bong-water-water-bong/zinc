@@ -6563,6 +6563,7 @@ pub const InferenceEngine = struct {
         self.resetTimestamps();
         _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
 
+        var gemma_dense_next_attn_norm_ready = false;
         for (layer_start..layer_end) |layer_idx| {
             const layer: u32 = @intCast(layer_idx);
             const lt = self.layer_tensors[layer_idx];
@@ -6598,6 +6599,9 @@ pub const InferenceEngine = struct {
                 self.prefill_active and
                 layer == layer_start and
                 self.partial_decode_ffn_norm_in != null;
+            const attn_norm_ready_from_prev = gemma_dense_next_attn_norm_ready and !resume_from_ffn_norm;
+            gemma_dense_next_attn_norm_ready = false;
+            var ffn_norm_ready = resume_from_ffn_norm;
 
             // --- Input RMS norm: hidden_buf → norm_buf ---
             const attn_norm = if (!resume_from_ffn_norm) lt.attn_norm orelse {
@@ -6637,7 +6641,10 @@ pub const InferenceEngine = struct {
             };
 
             if (!resume_from_ffn_norm) {
-                if (!use_fused_ssm_pre_norm) {
+                if (attn_norm_ready_from_prev) {
+                    // Dense Gemma's previous FFN tail already materialized
+                    // norm_buf with this layer's attn_norm weights.
+                } else if (!use_fused_ssm_pre_norm) {
                     try self.dispatchRmsNorm(
                         self.hidden_buf.handle,
                         hidden_size,
@@ -7842,14 +7849,23 @@ pub const InferenceEngine = struct {
 
                         const attention_post_norm_phase = self.beginProfilePhase();
                         // Gemma post-attention norm: RMS norm on o_proj output before residual add.
-                        // When the fused rms_norm_add pipeline is loaded and we're not in a
-                        // diagnostics path, skip the separate norm dispatch and let the
-                        // residual-add branch below fuse both into one pass.
+                        // Prefer the three-way fusion when possible: post-attn norm,
+                        // residual add, and this layer's FFN input norm are all single-
+                        // consumer work on Gemma decode. The two-way rms_norm_add path
+                        // remains as the fallback when the FFN norm cannot be written here.
+                        const pan_fused_ffn_norm_tensor = lt.ffn_norm orelse lt.post_attention_norm;
+                        const use_fused_pan_ffn_norm_decode = apply_post_attn_norm and
+                            self.elementwise.pipeline_post_norm_residual_rms_norm != null and
+                            pan_fused_ffn_norm_tensor != null and
+                            !diag_attn_residual and
+                            config.architecture == .gemma and
+                            !self.validation_diagnostics_enabled;
                         const use_fused_pan_decode = apply_post_attn_norm and
                             self.elementwise.pipeline_rms_norm_add != null and
+                            !use_fused_pan_ffn_norm_decode and
                             !diag_attn_residual and
                             config.architecture != .gpt_oss;
-                        if (apply_post_attn_norm and !use_fused_pan_decode) {
+                        if (apply_post_attn_norm and !use_fused_pan_decode and !use_fused_pan_ffn_norm_decode) {
                             const pan_tensor = lt.post_attention_norm.?;
                             try self.dispatchRmsNorm(
                                 self.o_proj_buf.handle,
@@ -7892,6 +7908,27 @@ pub const InferenceEngine = struct {
                                 .size = hidden_size,
                             });
                             self.decode_cmd.transferToComputeBarrier();
+                        } else if (use_fused_pan_ffn_norm_decode) {
+                            const pan_tensor = lt.post_attention_norm.?;
+                            const ffn_norm_out_tensor = pan_fused_ffn_norm_tensor.?;
+                            try self.dispatchPostNormResidualRmsNorm(
+                                self.hidden_buf.handle,
+                                hidden_size,
+                                self.o_proj_buf.handle,
+                                hidden_size,
+                                pan_tensor.gpu_buffer.handle,
+                                pan_tensor.gpu_buffer.size,
+                                self.ffn_norm_buf.handle,
+                                hidden_size,
+                                ffn_norm_out_tensor.gpu_buffer.handle,
+                                ffn_norm_out_tensor.gpu_buffer.size,
+                                hidden_dim,
+                                1,
+                                rms_norm_eps,
+                                1.0,
+                            );
+                            ffn_norm_ready = true;
+                            self.decode_cmd.computeBarrier();
                         } else if (use_fused_pan_decode) {
                             const pan_tensor = lt.post_attention_norm.?;
                             // Fused Gemma post_attention_norm + residual add in
@@ -8218,7 +8255,7 @@ pub const InferenceEngine = struct {
                 partial_hidden_out_written_by_stop = true;
                 break;
             }
-            if (!resume_from_ffn_norm and !can_fuse_rms_router and !skip_gemma_short_prefill_ffn_norm) {
+            if (!resume_from_ffn_norm and !ffn_norm_ready and !can_fuse_rms_router and !skip_gemma_short_prefill_ffn_norm) {
                 try self.dispatchRmsNorm(
                     self.hidden_buf.handle,
                     hidden_size,
@@ -8311,6 +8348,8 @@ pub const InferenceEngine = struct {
             var gpu_moe_barriers_cover_hidden = false;
             var gemma_moe_accumulated_into_hidden = false;
             var skip_gemma_short_prefill_layer_output_scale = false;
+            var gemma_dense_tail_wrote_next_attn_norm = false;
+            var gemma_dense_tail_folded_layer_output_scale = false;
             if (is_moe) {
                 const moe_phase = self.beginProfilePhase();
                 // --- MoE: router DMMV → top-k → expert dispatch ---
@@ -10362,6 +10401,20 @@ pub const InferenceEngine = struct {
                     try self.dispatchDmmvAcc(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.hidden_buf, hidden_dim, inter_dim);
                     self.endProfilePhase(dense_ffn_down_matmul_profile_phase, down_matmul_phase);
                 } else if (use_fused_pfn_decode) {
+                    const next_attn_norm_tensor = if (layer_idx + 1 < layer_end)
+                        self.layer_tensors[layer_idx + 1].attn_norm
+                    else
+                        null;
+                    const can_fuse_dense_tail_next_attn_norm =
+                        config.architecture == .gemma and
+                        config.n_experts == 0 and
+                        config.ssm_d_inner == 0 and
+                        !self.prefill_active and
+                        !self.validation_diagnostics_enabled and
+                        (!dense_prefill_validate_capture or self.dense_prefill_validate_production) and
+                        self.elementwise.pipeline_post_norm_residual_rms_norm != null and
+                        layer_idx + 1 < layer_end and
+                        next_attn_norm_tensor != null;
                     const down_matmul_phase = self.beginProfilePhase();
                     if (gemma_decode_dp4a_activation != .none) {
                         if (!try self.dispatchGemmaDenseDecodeDownDp4a(
@@ -10378,17 +10431,40 @@ pub const InferenceEngine = struct {
                     self.decode_cmd.computeBarrier();
                     const pfn_tensor = lt.post_ffw_norm.?;
                     const dense_ffn_residual_phase = self.beginProfilePhase();
-                    try self.dispatchRmsNormAdd(
-                        self.hidden_buf.handle,
-                        hidden_size,
-                        self.down_buf.handle,
-                        hidden_size,
-                        pfn_tensor.gpu_buffer.handle,
-                        pfn_tensor.gpu_buffer.size,
-                        hidden_dim,
-                        1,
-                        rms_norm_eps,
-                    );
+                    if (can_fuse_dense_tail_next_attn_norm) {
+                        const layer_output_scale_for_tail = self.layer_output_scales[layer];
+                        try self.dispatchPostNormResidualRmsNorm(
+                            self.hidden_buf.handle,
+                            hidden_size,
+                            self.down_buf.handle,
+                            hidden_size,
+                            pfn_tensor.gpu_buffer.handle,
+                            pfn_tensor.gpu_buffer.size,
+                            self.norm_buf.handle,
+                            hidden_size,
+                            next_attn_norm_tensor.?.gpu_buffer.handle,
+                            next_attn_norm_tensor.?.gpu_buffer.size,
+                            hidden_dim,
+                            1,
+                            rms_norm_eps,
+                            layer_output_scale_for_tail,
+                        );
+                        gemma_dense_next_attn_norm_ready = true;
+                        gemma_dense_tail_wrote_next_attn_norm = true;
+                        gemma_dense_tail_folded_layer_output_scale = layer_output_scale_for_tail != 1.0;
+                    } else {
+                        try self.dispatchRmsNormAdd(
+                            self.hidden_buf.handle,
+                            hidden_size,
+                            self.down_buf.handle,
+                            hidden_size,
+                            pfn_tensor.gpu_buffer.handle,
+                            pfn_tensor.gpu_buffer.size,
+                            hidden_dim,
+                            1,
+                            rms_norm_eps,
+                        );
+                    }
                     self.endProfilePhase(.dense_ffn_residual_acc, dense_ffn_residual_phase);
                 } else {
                     // Unfused path: needed for Gemma post-FFN norm or diagnostics
@@ -10518,7 +10594,7 @@ pub const InferenceEngine = struct {
 
             // Per-layer output scaling (Gemma 4 proportional): hidden_buf *= scale
             const layer_output_scale = self.layer_output_scales[layer];
-            if (layer_output_scale != 1.0 and !skip_gemma_short_prefill_layer_output_scale) {
+            if (layer_output_scale != 1.0 and !skip_gemma_short_prefill_layer_output_scale and !gemma_dense_tail_folded_layer_output_scale) {
                 if (!gpu_moe_barriers_cover_hidden) {
                     self.decode_cmd.computeBarrier();
                 }
@@ -10529,6 +10605,15 @@ pub const InferenceEngine = struct {
                     layer_output_scale,
                 );
                 gpu_moe_barriers_cover_hidden = false;
+            }
+
+            if (gemma_dense_tail_wrote_next_attn_norm) {
+                const tail_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = self.hidden_buf.handle, .size = hidden_size },
+                    .{ .buffer = self.norm_buf.handle, .size = hidden_size },
+                };
+                self.decode_cmd.computeBuffersBarrier(&tail_ranges);
+                gpu_moe_barriers_cover_hidden = true;
             }
 
             // The next layer immediately reads hidden_buf as its input.
@@ -11075,9 +11160,10 @@ pub const InferenceEngine = struct {
         hidden_dim: u32,
         n_tokens: u32,
         eps: f32,
+        hidden_scale: f32,
     ) !void {
         const pip = &(self.elementwise.pipeline_post_norm_residual_rms_norm orelse return error.ShaderNotLoaded);
-        const push = PostNormResidualRmsNormPush{ .n = hidden_dim, .eps = eps };
+        const push = PostNormResidualRmsNormPush{ .n = hidden_dim, .eps = eps, .hidden_scale = hidden_scale };
         if (pip.uses_push_descriptors) {
             self.pushDispatch5(
                 pip,
@@ -23182,6 +23268,7 @@ pub const InferenceEngine = struct {
                     hidden_dim,
                     n_tokens,
                     eps,
+                    1.0,
                 );
                 ffn_norm_ready = true;
             } else {
@@ -24818,6 +24905,7 @@ pub const InferenceEngine = struct {
                             hidden_dim,
                             n_tokens,
                             eps,
+                            1.0,
                         );
                         ffn_norm_ready = true;
                     } else {

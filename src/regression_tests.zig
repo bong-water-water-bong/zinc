@@ -582,6 +582,26 @@ test "Vulkan residual_rms_norm shader matches Metal's fused semantics" {
     try expectContains(src, "norm_out[base + i] = weights[i] * hidden[base + i] * rms_inv;");
 }
 
+test "Vulkan Gemma decode keeps post-norm residual next-norm fusions wired" {
+    const forward = @embedFile("compute/forward.zig");
+    try expectContains(forward, "use_fused_pan_ffn_norm_decode");
+    try expectContainsNear(forward, "use_fused_pan_ffn_norm_decode", "try self.dispatchPostNormResidualRmsNorm", 2400);
+    try expectContainsNear(forward, "use_fused_pan_ffn_norm_decode", "ffn_norm_ready = true", 2600);
+    try expectContains(forward, "gemma_dense_next_attn_norm_ready");
+    try expectContainsNear(forward, "can_fuse_dense_tail_next_attn_norm", "self.layer_output_scales[layer]", 2400);
+    try expectContainsNear(forward, "gemma_dense_tail_wrote_next_attn_norm", "self.norm_buf.handle", 900);
+}
+
+test "Vulkan post_norm_residual_rms_norm shader folds Gemma layer scale" {
+    const elementwise = @embedFile("compute/elementwise.zig");
+    try expectContains(elementwise, "hidden_scale: f32 = 1.0");
+
+    const shader = @embedFile("shaders/post_norm_residual_rms_norm.comp");
+    try expectContains(shader, "float hidden_scale;");
+    try expectContains(shader, "hidden[base + i] = apply_hidden_scale ? (h * hidden_scale) : h;");
+    try expectContains(shader, "if (apply_hidden_scale) h = h / hidden_scale;");
+}
+
 test "Vulkan Gemma norm-add vec4 path stays wired and wave64" {
     const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
     defer std.testing.allocator.free(build);

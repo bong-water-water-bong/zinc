@@ -3,8 +3,9 @@
 //
 // Semantics per token:
 //   r_norm[i] = post_w[i] * residual[i] * rsqrt(mean(residual^2) + eps)
-//   hidden[i] += r_norm[i]
-//   norm_out[i] = norm_w[i] * hidden[i] * rsqrt(mean(hidden^2) + eps)
+//   h = hidden[i] + r_norm[i]
+//   hidden[i] = h * hidden_scale
+//   norm_out[i] = norm_w[i] * h * rsqrt(mean(h^2) + eps)
 //
 // This replaces:
 //   rms_norm_mul(residual -> residual)
@@ -20,6 +21,7 @@ layout(local_size_x = 64) in;
 layout(push_constant) uniform PushConstants {
     uint  n;
     float eps;
+    float hidden_scale;
 };
 
 layout(set = 0, binding = 0)          buffer Hidden      { float hidden[];     };
@@ -60,16 +62,19 @@ void main() {
     float residual_rms_inv = inversesqrt((residual_total / float(n)) + eps);
 
     float hidden_sum_sq = 0.0;
+    bool apply_hidden_scale = hidden_scale != 1.0;
     for (uint i = tid; i < n; i += 64u) {
         float r_norm = post_w[i] * residual[base + i] * residual_rms_inv;
         float h = hidden[base + i] + r_norm;
-        hidden[base + i] = h;
+        hidden[base + i] = apply_hidden_scale ? (h * hidden_scale) : h;
         hidden_sum_sq += h * h;
     }
     float hidden_total = reduce_sum(hidden_sum_sq);
     float hidden_rms_inv = inversesqrt((hidden_total / float(n)) + eps);
 
     for (uint i = tid; i < n; i += 64u) {
-        norm_out[base + i] = norm_w[i] * hidden[base + i] * hidden_rms_inv;
+        float h = hidden[base + i];
+        if (apply_hidden_scale) h = h / hidden_scale;
+        norm_out[base + i] = norm_w[i] * h * hidden_rms_inv;
     }
 }

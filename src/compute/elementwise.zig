@@ -248,6 +248,7 @@ pub const ResidualRmsNormPush = extern struct {
 pub const PostNormResidualRmsNormPush = extern struct {
     n: u32,
     eps: f32,
+    hidden_scale: f32 = 1.0,
 };
 
 /// Push constants for fused residual-add + RMS norm + Q8_1 activation quantize
