@@ -25108,7 +25108,9 @@ pub const InferenceEngine = struct {
             self.endProfilePhase(.final_argmax, final_argmax_phase);
         }
 
-        // Read logits and argmax result back for the sampler.
+        // Read back only what the sampler needs. Greedy server/CLI paths use
+        // GPU argmax and only need the 4-byte token id; validation and
+        // stochastic sampling still require the full logits buffer.
         const final_copy_phase = self.beginProfilePhase();
         const barrier = vk.c.VkMemoryBarrier{
             .sType = vk.c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -25117,12 +25119,15 @@ pub const InferenceEngine = struct {
             .dstAccessMask = vk.c.VK_ACCESS_TRANSFER_READ_BIT,
         };
         vk.c.vkCmdPipelineBarrier(self.decode_cmd.handle, vk.c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, null, 0, null);
-        const logits_size = @as(vk.c.VkDeviceSize, cfg.vocab_size) * @sizeOf(f32);
-        const logits_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = logits_size };
-        vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.logits_buf.handle, self.logits_staging.handle, 1, &logits_region);
         if (have_gpu_argmax) {
             const token_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = @sizeOf(u32) };
             vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.argmax_result_buf.handle, self.argmax_result_staging.handle, 1, &token_region);
+        }
+        const need_logits_readback = validate_mode or self.logits_readback_enabled or self.validation_diagnostics_enabled or !have_gpu_argmax;
+        if (need_logits_readback) {
+            const logits_size = @as(vk.c.VkDeviceSize, cfg.vocab_size) * @sizeOf(f32);
+            const logits_region = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = logits_size };
+            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.logits_buf.handle, self.logits_staging.handle, 1, &logits_region);
         }
         self.endProfilePhase(.final_copy, final_copy_phase);
         self.endProfilePhase(.final_tail, final_tail_phase);

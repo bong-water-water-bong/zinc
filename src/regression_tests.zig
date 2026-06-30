@@ -364,11 +364,14 @@ test "Vulkan Qwen SSM DP4a keeps BN40 and BN64 specializations" {
 
 test "Vulkan Gemma dense-down DP4a keeps K21504 short-prompt specializations" {
     const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n64");
     try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n72");
     try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k21504_n64");
     try expectContains(dmmv, "pipeline_mul_mm_q4k_full_dp4a_k21504_n8");
+    try expectContains(dmmv, "const pipeline_mul_mm_q6k_full_dp4a_k21504_n64");
     try expectContains(dmmv, "const pipeline_mul_mm_q6k_full_dp4a_k21504_n72");
     try expectContains(dmmv, "const pipeline_mul_mm_q4k_full_dp4a_k21504_n64");
+    try expectContains(dmmv, "K == 21504 and n_tile == 64");
 
     const forward = @embedFile("compute/forward.zig");
     try expectContains(forward, "self.gemmaDenseQ4RaggedTailDp4aEnabled(down_t, n_tokens)");
@@ -566,6 +569,15 @@ test "Vulkan prefillBatched threads base_token through RoPE, KV write, flash att
     const fn_marker = "fn prefillBatchedImpl(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {";
     try expectContainsNear(src, fn_marker, "const base_token: u32 = state.position;", 6000);
     try expectContainsNear(src, fn_marker, "state.position = base_token + n_tokens;", 24000);
+}
+
+test "Vulkan prefillBatched avoids full logits copy for greedy GPU argmax" {
+    const src = @embedFile("compute/forward.zig");
+    const marker = "// Read back only what the sampler needs.";
+    try expectContainsNear(src, marker, "vkCmdCopyBuffer(self.decode_cmd.handle, self.argmax_result_buf.handle", 1200);
+    try expectContainsNear(src, marker, "const need_logits_readback = validate_mode or self.logits_readback_enabled or self.validation_diagnostics_enabled or !have_gpu_argmax;", 1600);
+    try expectContainsNear(src, marker, "if (need_logits_readback) {", 1800);
+    try expectContainsNear(src, marker, "vkCmdCopyBuffer(self.decode_cmd.handle, self.logits_buf.handle", 2200);
 }
 
 test "Vulkan batched KV write shader uses page_table with base_token offset" {
