@@ -916,6 +916,7 @@ pub const ForwardCuda = struct {
             // Detect layer type from tensor presence: attention layers have
             // attn_q.weight, SSM layers have attn_qkv.weight.
             self.layer_is_attn[li] = model.getLayer(L, "attn_q.weight") != null;
+            if (li < 8) log.info("  layer {d}: {s}", .{ li, if (self.layer_is_attn[li]) "attention" else "SSM" });
             if (self.layer_is_attn[li]) {
                 self.kv_k[li] = try buffer.createBuffer(ctx, max_ctx * d.kv_dim * f4);
                 self.kv_v[li] = try buffer.createBuffer(ctx, max_ctx * d.kv_dim * f4);
