@@ -354,6 +354,7 @@ fn extractConfigWithLogging(gf: *const gguf.GGUFFile, log_metadata: bool) ModelC
             if (ssm_d_inner > 0) @as(u32, 4) else @as(u32, 1);
     };
     log.info("full_attn_interval = {d} (override: ZINC_FULL_ATTN_INTERVAL)", .{full_attn_interval});
+    log.info("rope_dim = {d}, head_dim = {d}, n_head = {d}, n_kv_head = {d}", .{ rope_dim, head_dim, n_heads, n_kv_heads });
 
     const rope_freq_base: f32 = blk: {
         const key = std.fmt.bufPrint(&key_buf, "{s}.rope.freq_base", .{prefix}) catch break :blk @as(f32, 10000.0);
