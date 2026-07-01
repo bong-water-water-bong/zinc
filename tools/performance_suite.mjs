@@ -936,6 +936,12 @@ const REMOTE_ZINC_TUNING_ENV_KEYS = [
   "ZINC_MUL_MM_PROJ",
   "ZINC_Q4K_BATCH_KPAR",
   "ZINC_PREFILL_PROFILE",
+  "ZINC_PREFILL_Q8",
+  "ZINC_PREFILL_DP4A",
+  "ZINC_PREFILL_F16",
+  "ZINC_PREFILL_LOWSMEM",
+  "ZINC_PREFILL_TC",
+  "ZINC_PREFILL_Q8_TC",
 ];
 
 function collectRemoteZincTuningEnv(dotEnv) {
@@ -2902,7 +2908,7 @@ async function buildCudaCreds(args) {
     workdir,
     // CUDA_VISIBLE_DEVICES pins the target GPU by UUID for both the ZINC CLI and
     // the llama-server baseline (remoteEnvPrefix / the launch script inject it).
-    env: { CUDA_VISIBLE_DEVICES: gpuUuid },
+    env: { CUDA_VISIBLE_DEVICES: gpuUuid, ...collectRemoteZincTuningEnv(dotEnv) },
     // No Vulkan device flag on CUDA; the env var above already isolates the GPU.
     serverDeviceArgs: [],
     cliDeviceArgs: [],
