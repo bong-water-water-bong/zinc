@@ -5121,6 +5121,133 @@ extern "C" __global__ void gemm_q4k_tc_lowsmem(const unsigned* a_u32, const floa
     }
 }
 
+// ---- gemm_q4k_gate_up_swiglu_lowsmem — fused gate+up+SwiGLU TC Q4_K GEMM ------
+// Reads the activation input ONCE, multiplies by both gate and up Q4_K weight
+// matrices, applies SwiGLU (silu(gate)*up) inline. Eliminates 2 intermediate
+// buffers and 2 kernel launches vs the unfused path. Same 16KB alias pattern as
+// gemm_q4k_tc_lowsmem, but the K-loop uses 12KB (3 half-tiles: gate_Ws, up_Ws, As).
+struct GateUpSwigluPush { unsigned M, K, T, gate_a_offset, up_a_offset, x_offset, y_offset; };
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_gate_up_swiglu_lowsmem(
+    const unsigned* __restrict__ gate_u32,
+    const unsigned* __restrict__ up_u32,
+    const float* __restrict__ A,
+    float* __restrict__ Y, GateUpSwigluPush pc)
+{
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ float smem[BT*BM];                    // 16 KB
+    half* gate_Ws = (half*)smem;                      // [0, 4 KB)
+    half* up_Ws   = ((half*)smem) + (BM*BK);          // [4, 8 KB)
+    half* As      = ((half*)smem) + (2u*BM*BK);       // [8, 12 KB)
+    unsigned m0=blockIdx.x*BM, t0=blockIdx.y*BT;
+    unsigned bpr=pc.K>>8, nchunk=pc.K>>5;
+    unsigned tid=threadIdx.x;
+    unsigned warp=tid>>5, fm=warp>>2, ft=warp&3u;
+    unsigned wid=tid>>5, lane=tid&31u;
+    const float* Abase=A+(pc.x_offset>>2);
+    unsigned gate_a0=(pc.gate_a_offset>>2);
+    unsigned up_a0  =(pc.up_a_offset>>2);
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> cg0,cg1,cu0,cu1;
+    wmma::fill_fragment(cg0,0.0f); wmma::fill_fragment(cg1,0.0f);
+    wmma::fill_fragment(cu0,0.0f); wmma::fill_fragment(cu1,0.0f);
+
+    for (unsigned c=0u;c<nchunk;c++){
+        unsigned sbk=c>>3, sb8=c&7u;
+        // Stage gate weights
+        #pragma unroll
+        for(int u=0;u<8;u++){
+            unsigned r=wid+(unsigned)u*8u, l=lane, row=m0+r;
+            float gv=0.0f, uv=0.0f;
+            if(row<pc.M){
+                // Gate
+                unsigned gblk=gate_a0+row*bpr*36u+sbk*36u;
+                float gd_sc,gdm_mn;
+                if(lane==0){
+                    unsigned dd=gate_u32[gblk];
+                    float d=zinc_half_to_float((unsigned short)(dd&0xFFFFu));
+                    float dmin=zinc_half_to_float((unsigned short)(dd>>16));
+                    const unsigned char* sc=(const unsigned char*)(gate_u32+gblk+1u);
+                    unsigned char s,mn; zinc_q4k_scale_min((int)sb8,sc,&s,&mn);
+                    gd_sc=d*(float)s; gdm_mn=dmin*(float)mn;
+                }
+                gd_sc=__shfl_sync(0xFFFFFFFFu,gd_sc,0);
+                gdm_mn=__shfl_sync(0xFFFFFFFFu,gdm_mn,0);
+                const unsigned char* gqs=(const unsigned char*)(gate_u32+gblk+4u);
+                unsigned gqb=gqs[(sb8>>1)*32u+l];
+                unsigned gnib=(sb8&1u)==0u?(gqb&0xFu):(unsigned)(gqb>>4);
+                gv=gd_sc*(float)gnib-gdm_mn;
+                // Up
+                unsigned ublk=up_a0+row*bpr*36u+sbk*36u;
+                float ud_sc,udm_mn;
+                if(lane==0){
+                    unsigned dd=up_u32[ublk];
+                    float d=zinc_half_to_float((unsigned short)(dd&0xFFFFu));
+                    float dmin=zinc_half_to_float((unsigned short)(dd>>16));
+                    const unsigned char* sc=(const unsigned char*)(up_u32+ublk+1u);
+                    unsigned char s,mn; zinc_q4k_scale_min((int)sb8,sc,&s,&mn);
+                    ud_sc=d*(float)s; udm_mn=dmin*(float)mn;
+                }
+                ud_sc=__shfl_sync(0xFFFFFFFFu,ud_sc,0);
+                udm_mn=__shfl_sync(0xFFFFFFFFu,udm_mn,0);
+                const unsigned char* uqs=(const unsigned char*)(up_u32+ublk+4u);
+                unsigned uqb=uqs[(sb8>>1)*32u+l];
+                unsigned unib=(sb8&1u)==0u?(uqb&0xFu):(unsigned)(uqb>>4);
+                uv=ud_sc*(float)unib-udm_mn;
+            }
+            gate_Ws[r*BK+l]=__float2half(gv);
+            up_Ws[r*BK+l]=__float2half(uv);
+        }
+        // Float->half A load (read input ONCE for both gate and up)
+        #pragma unroll
+        for(int u=0;u<8;u++){
+            unsigned idx=tid+(unsigned)u*256u;
+            unsigned t=idx>>5,l=idx&31u,tok=t0+t;
+            As[l*BT+t]=(tok<pc.T)?__float2half(Abase[(size_t)tok*pc.K+c*32u+l]):(half)0;
+        }
+        __syncthreads();
+        #pragma unroll
+        for(unsigned ks=0;ks<2;ks++){
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> ag0,ag1,au0,au1;
+            wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+            wmma::load_matrix_sync(ag0,&gate_Ws[(fm*16u)*BK+ks*16u],BK);
+            wmma::load_matrix_sync(ag1,&gate_Ws[((fm+2u)*16u)*BK+ks*16u],BK);
+            wmma::load_matrix_sync(au0,&up_Ws[(fm*16u)*BK+ks*16u],BK);
+            wmma::load_matrix_sync(au1,&up_Ws[((fm+2u)*16u)*BK+ks*16u],BK);
+            wmma::load_matrix_sync(bf,&As[(ks*16u)*BT+ft*16u],BT);
+            wmma::mma_sync(cg0,ag0,bf,cg0);
+            wmma::mma_sync(cg1,ag1,bf,cg1);
+            wmma::mma_sync(cu0,au0,bf,cu0);
+            wmma::mma_sync(cu1,au1,bf,cu1);
+        }
+        __syncthreads();
+    }
+    // Apply SwiGLU in fragment registers: result = silu(gate) * up
+    #pragma unroll
+    for(int i=0;i<cg0.num_elements;i++){
+        float g=cg0.x[i], u=cu0.x[i];
+        cg0.x[i]=g/(1.0f+expf(-g))*u;
+    }
+    #pragma unroll
+    for(int i=0;i<cg1.num_elements;i++){
+        float g=cg1.x[i], u=cu1.x[i];
+        cg1.x[i]=g/(1.0f+expf(-g))*u;
+    }
+    // Store to smem, then copy to Y
+    float* Cs = smem;
+    wmma::store_matrix_sync(&Cs[(ft*16u)*BM+fm*16u], cg0, BM, wmma::mem_col_major);
+    wmma::store_matrix_sync(&Cs[(ft*16u)*BM+(fm+2u)*16u], cg1, BM, wmma::mem_col_major);
+    __syncthreads();
+    #pragma unroll
+    for(int u=0;u<16;u++){
+        unsigned idx=tid+(unsigned)u*256u;
+        unsigned r=idx%BM, t=idx/BM;
+        unsigned row=m0+r, tok=t0+t;
+        if(row<pc.M&&tok<pc.T){
+            Y[(pc.y_offset>>2)+(size_t)tok*pc.M+row]=Cs[t*BM+r];
+        }
+    }
+}
+
 // ---- gemm_q4k_tc_f16a_m128_lowsmem — 12 KB-shared wider 128x64 M-tile TC Q4_K GEMM (cycle 17)
 // The SYNTHESIS of cycle 14 (wider M-tile) and cycle 15 (low-shared two-phase Cs):
 // it is gemm_q4k_tc_f16a_m128 in every wmma respect (same Q4_K dequant, same 16x16x16

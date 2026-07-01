@@ -197,6 +197,7 @@ const GroupedTCDownPush = extern struct { M: u32, K: u32, slice: u32, n_used: u3
 // batched SSM/util kernels. Must byte-match kernels.cu.
 const F32ToF16Push = extern struct { N: u32 };
 const QuantActPush = extern struct { K: u32 };
+const GateUpSwigluPush = extern struct { M: u32, K: u32, T: u32, gate_a_offset: u32 = 0, up_a_offset: u32 = 0, x_offset: u32 = 0, y_offset: u32 = 0 };
 const GemmQ8Push = extern struct { M: u32, K: u32, T: u32, a_offset: u32, x_q8_stride: u32 };
 const DequantQ4KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
 const DequantQ5KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
@@ -314,6 +315,7 @@ const Pipelines = struct {
     gemm_q4k_dp4a: CudaPipeline, // DP4a int8 Q4_K GEMM (ZINC_PREFILL_DP4A=1)
     gemm_f16_tc: CudaPipeline, // fp16 pre-dequanted TC GEMM (ZINC_PREFILL_F16=1)
     gemm_q4k_tc_lowsmem: CudaPipeline, // 8KB-shared TC GEMM (3x occupancy)
+    gemm_q4k_gate_up_swiglu: CudaPipeline, // fused gate+up+SwiGLU TC GEMM
     gemm_q8_0_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q8_0 GEMM (shared experts)
     gemm_q6k_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q6_K GEMM
     gemm_q5k_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q5_K GEMM
@@ -846,6 +848,7 @@ pub const ForwardCuda = struct {
         pipes.gemm_q4k_dp4a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_dp4a");
         pipes.gemm_f16_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_f16_tc");
         pipes.gemm_q4k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_lowsmem");
+        pipes.gemm_q4k_gate_up_swiglu = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_gate_up_swiglu_lowsmem");
         pipes.gemm_q8_0_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tc_lowsmem");
         pipes.gemm_q6k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_lowsmem");
         pipes.gemm_q5k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tc_lowsmem");
@@ -1807,10 +1810,21 @@ pub const ForwardCuda = struct {
         var cmd = try command.beginCommand(ctx);
         const rms = RmsPush{ .N = d.n_embd, .eps = d.rms_eps };
         cmd.dispatch(&self.pipes.rms_norm, .{ T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &wfn.gpu_buffer, &b.ffn_norm }, &rms, @sizeOf(RmsPush), 0);
-        self.gemmDispatchPrefill(&cmd, wgate, &b.ffn_norm, &b.gate_ff, d.n_ff, d.n_embd, T);
-        self.gemmDispatchPrefill(&cmd, wup, &b.ffn_norm, &b.up_ff, d.n_ff, d.n_embd, T);
-        const sg = SwigluPush{ .N = T * d.n_ff };
-        cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(T * d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_ff, &b.up_ff, &b.swiglu_ff }, &sg, @sizeOf(SwigluPush), 0);
+
+        // Fused gate+up+SwiGLU when both are Q4_K and the tile is big enough
+        const fuse_gate_up_swiglu = prefillGateUpSwigluOn();
+        const dense_gate_up_uses_cublas = self.use_cublas and T >= self.cublas_min_t;
+        const can_fuse_gate_up = wgate.info.type_ == .q4_k and wup.info.type_ == .q4_k and
+            T >= 32 and d.n_ff >= 64 and !dense_gate_up_uses_cublas and fuse_gate_up_swiglu;
+        if (can_fuse_gate_up) {
+            const gp = GateUpSwigluPush{ .M = d.n_ff, .K = d.n_embd, .T = T };
+            cmd.dispatch(&self.pipes.gemm_q4k_gate_up_swiglu, .{ ceilDiv(d.n_ff, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &wgate.gpu_buffer, &wup.gpu_buffer, &b.ffn_norm, &b.swiglu_ff }, &gp, @sizeOf(GateUpSwigluPush), 0);
+        } else {
+            self.gemmDispatchPrefill(&cmd, wgate, &b.ffn_norm, &b.gate_ff, d.n_ff, d.n_embd, T);
+            self.gemmDispatchPrefill(&cmd, wup, &b.ffn_norm, &b.up_ff, d.n_ff, d.n_embd, T);
+            const sg = SwigluPush{ .N = T * d.n_ff };
+            cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(T * d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_ff, &b.up_ff, &b.swiglu_ff }, &sg, @sizeOf(SwigluPush), 0);
+        }
         self.gemmDispatchPrefill(&cmd, wdown, &b.swiglu_ff, &b.o, d.n_embd, d.n_ff, T);
         const add = AddPush{ .N = T * d.n_embd };
         cmd.dispatch(&self.pipes.add_inplace, .{ ceilDiv(T * d.n_embd, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &b.hidden, &b.o }, &add, @sizeOf(AddPush), 0);
@@ -1940,10 +1954,19 @@ pub const ForwardCuda = struct {
         const wus = self.layer(L, "ffn_up_shexp.weight");
         const wds = self.layer(L, "ffn_down_shexp.weight");
         const wgi = self.layer(L, "ffn_gate_inp_shexp.weight"); // [n_embd, 1] F32
-        self.gemmDispatchPrefill(&cmd, wgs, &b.ffn_norm, &b.gate_ff, sf, d.n_embd, T);
-        self.gemmDispatchPrefill(&cmd, wus, &b.ffn_norm, &b.up_ff, sf, d.n_embd, T);
-        const ssg = SwigluPush{ .N = T * sf };
-        cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(T * sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_ff, &b.up_ff, &b.swiglu_ff }, &ssg, @sizeOf(SwigluPush), 0);
+        const fuse_gate_up_swiglu = prefillGateUpSwigluOn();
+        const shared_gate_up_uses_cublas = self.use_cublas and T >= self.cublas_min_t;
+        const can_fuse_shexp = wgs.info.type_ == .q4_k and wus.info.type_ == .q4_k and
+            T >= 32 and sf >= 64 and !shared_gate_up_uses_cublas and fuse_gate_up_swiglu;
+        if (can_fuse_shexp) {
+            const gp = GateUpSwigluPush{ .M = sf, .K = d.n_embd, .T = T };
+            cmd.dispatch(&self.pipes.gemm_q4k_gate_up_swiglu, .{ ceilDiv(sf, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &wgs.gpu_buffer, &wus.gpu_buffer, &b.ffn_norm, &b.swiglu_ff }, &gp, @sizeOf(GateUpSwigluPush), 0);
+        } else {
+            self.gemmDispatchPrefill(&cmd, wgs, &b.ffn_norm, &b.gate_ff, sf, d.n_embd, T);
+            self.gemmDispatchPrefill(&cmd, wus, &b.ffn_norm, &b.up_ff, sf, d.n_embd, T);
+            const ssg = SwigluPush{ .N = T * sf };
+            cmd.dispatch(&self.pipes.swiglu, .{ ceilDiv(T * sf, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate_ff, &b.up_ff, &b.swiglu_ff }, &ssg, @sizeOf(SwigluPush), 0);
+        }
         // Shared-expert gate scalar = sigmoid(W_gi · norm) per token (1 row, all T).
         const gs = MatvecBatchPush{ .M = 1, .K = d.n_embd, .x_tok_stride = d.n_embd, .y_tok_stride = 1 };
         cmd.dispatch(&self.pipes.dmmv_f32_batched, .{ 1, T, 1 }, .{ 256, 1, 1 }, &.{ &wgi.gpu_buffer, &b.ffn_norm, &b.gate_scalar_e }, &gs, @sizeOf(MatvecBatchPush), 0);
@@ -3677,6 +3700,15 @@ fn q8TcLowsmemOn() bool {
     const v = std.posix.getenv("ZINC_PREFILL_Q8_TC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+/// Experimental fused Q4_K gate+up+SwiGLU prefill kernel. Opt-in because the
+/// qwen35 short-core A/B on the 5090 regressed prefill versus the unfused
+/// lowsmem TC path.
+fn prefillGateUpSwigluOn() bool {
+    const v = std.posix.getenv("ZINC_PREFILL_GATE_UP_SWIGLU") orelse return false;
+    return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on") or
+        std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes");
 }
 
 /// Effort 29 T3: the B>27 serving-decode cuBLAS GEMM path. DEFAULT-ON; opt out
