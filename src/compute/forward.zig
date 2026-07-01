@@ -24515,8 +24515,15 @@ pub const InferenceEngine = struct {
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         const mode = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse "";
         const intel_batched_env = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL");
+        const cfg = self.model.config;
+        const intel_dense_gemma_default =
+            cfg.architecture == .gemma and
+            cfg.n_experts == 0 and
+            cfg.ssm_d_inner == 0;
+        const intel_batched_explicitly_on = intel_batched_env != null and std.mem.eql(u8, intel_batched_env.?, "1");
+        const intel_batched_explicitly_off = intel_batched_env != null and std.mem.eql(u8, intel_batched_env.?, "0");
         const intel_batched_requested = isIntelGpuVendor(self.gpu_config.vendor) and
-            intel_batched_env != null and std.mem.eql(u8, intel_batched_env.?, "1");
+            (intel_batched_explicitly_on or (!intel_batched_explicitly_off and intel_dense_gemma_default));
         const chunk_limit = intelBatchedPrefillChunkLimit(self.gpu_config.vendor);
         if (intel_batched_requested and
             chunk_limit > 0 and
