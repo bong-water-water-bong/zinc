@@ -26,12 +26,16 @@
 > Fastest measured local LLM inference for AMD GPUs. ZINC beats llama.cpp across the current five-model RDNA4 headline sweep — decode, prefill, end-to-end, and model-level overall — with no ROCm.
 
 <p align="center">
-  <img src="assets/amd-rdna4-benchmark-sweep.svg" alt="AMD RDNA4 benchmark sweep chart showing ZINC ahead of llama.cpp across five models" width="760">
+  <img src="assets/amd-rdna4-benchmark-sweep.svg" alt="AMD RDNA4 benchmark sweep chart showing ZINC ahead of llama.cpp across five models" width="860">
 </p>
 
-## AMD RDNA4 Benchmark Sweep
+## AMD RDNA4: ZINC Beats llama.cpp
 
-Latest checked-in artifact: 2026-07-01 UTC, Radeon AI PRO R9700, 32 GB VRAM, 576 GB/s. The fair harness runs one reusable ZINC server and one reusable llama.cpp server per model, with the same GGUF, same scenario matrix, same warmup/run count, and server-side timings.
+ZINC is the fastest measured local AI engine for AMD GPUs in our current suite.
+On the Radeon AI PRO R9700, it beats llama.cpp on all five published models:
+decode, prefill, end-to-end, and overall.
+
+Same GPU. Same GGUF files. Same prompts. Same server-vs-server harness.
 
 | Model | Decode | Prefill | Overall |
 |-------|-------:|--------:|--------:|
@@ -41,7 +45,7 @@ Latest checked-in artifact: 2026-07-01 UTC, Radeon AI PRO R9700, 32 GB VRAM, 576
 | Gemma 4 26B-A4B MoE Q4_K_M | **113.7** vs 102.1 tok/s (**1.11x**) | **809** vs 497 tok/s (**1.63x**) | **115%** |
 | Gemma 4 31B Q4_K_M | **28.8** vs 28.5 tok/s (**1.01x**) | **249** vs 200 tok/s (**1.25x**) | **103%** |
 
-Overall is the suite's phase wall-time metric. The narrow row is Gemma 4 31B decode, and the next work is widening that margin while extending the same sweep across more scenarios. We are still cooking.
+The closest row is Gemma 4 31B decode at `1.01x`. We are still cooking: the next work is widening that margin and adding more scenarios.
 
 ## Supported Platforms
 
