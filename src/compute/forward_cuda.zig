@@ -195,6 +195,8 @@ const GroupedTCDownPush = extern struct { M: u32, K: u32, slice: u32, n_used: u3
 // Effort 26 T0 (qwen batched prefill): cuBLAS fp16-TC dense GEMM helpers + the
 // batched SSM/util kernels. Must byte-match kernels.cu.
 const F32ToF16Push = extern struct { N: u32 };
+const QuantActPush = extern struct { K: u32 };
+const GemmQ8Push = extern struct { M: u32, K: u32, T: u32, a_offset: u32, x_q8_stride: u32 };
 const DequantQ4KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
 const DequantQ5KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
 const DequantQ6KPush = extern struct { M: u32, K: u32, a_offset: u32 = 0 };
@@ -408,6 +410,7 @@ const BatchScratch = struct {
     swiglu_ff: CudaBuffer, // [T, n_ff]
     act_f16: CudaBuffer, // [T, maxK] fp16 activation for cuBLAS
     w_f16: CudaBuffer, // [maxM*maxK] fp16 dequant'd weight for cuBLAS
+    act_q8: CudaBuffer, // [T, maxK/32*34] Q8_0 pre-quantized activation for DP4a
     // Effort 29 T2: token-major MoE prefill scratch (n_experts>0; size-1 stubs on
     // the dense qwen35). Mirrors the per-token moeFfnBlock buffers, batched over T.
     router_logits_e: CudaBuffer, // [T, n_experts]
@@ -2030,7 +2033,8 @@ pub const ForwardCuda = struct {
         // ZINC_PREFILL_Q8_TC=0: opt out of the Q8_0 tensor-core shared-expert path.
         const use_f16 = idx == 0 and std.posix.getenv("ZINC_PREFILL_F16") != null;
         const use_dp4a = !use_f16 and idx == 0 and std.posix.getenv("ZINC_PREFILL_DP4A") != null;
-        const use_lowsmem = !use_f16 and !use_dp4a and idx == 0 and (std.posix.getenv("ZINC_PREFILL_LOWSMEM") == null or
+        const use_q8 = !use_f16 and !use_dp4a and idx == 0 and std.posix.getenv("ZINC_PREFILL_Q8") != null;
+        const use_lowsmem = !use_f16 and !use_dp4a and !use_q8 and idx == 0 and (std.posix.getenv("ZINC_PREFILL_LOWSMEM") == null or
             !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_LOWSMEM").?, "0"));
         const use_tc = !use_f16 and !use_dp4a and !use_lowsmem and idx == 0 and (std.posix.getenv("ZINC_PREFILL_TC") == null or
             !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_TC").?, "0"));
@@ -2064,7 +2068,20 @@ pub const ForwardCuda = struct {
         }
         if (T >= 32 and M >= 64 and idx < 4) {
             const push = GemmPush{ .M = M, .K = K, .T = T };
-            if (use_dp4a) {
+            if (use_q8) {
+                // Pre-quant DP4a path: quantize input to Q8_0, then DP4a multiply
+                if (self.batch) |b| {
+                    // Quantize input to Q8_0
+                    const qp = QuantActPush{ .K = K };
+                    cmd.dispatch(&self.pipes.quantize_act_q8, .{ ceilDiv(K, 256), T, 1 }, .{ 256, 1, 1 }, &.{ x, &b.act_q8 }, &qp, @sizeOf(QuantActPush), 0);
+                    // DP4a GEMM
+                    const q8push = GemmQ8Push{ .M = M, .K = K, .T = T, .a_offset = 0, .x_q8_stride = K / 32 * 34 };
+                    cmd.dispatch(&self.pipes.gemm_q4k_q8_dp4a, .{ ceilDiv(M, 64), T, 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, &b.act_q8, y }, &q8push, @sizeOf(GemmQ8Push), 0);
+                } else {
+                    // Fallback to lowsmem if batch scratch not available
+                    cmd.dispatch(&self.pipes.gemm_q4k_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+                }
+            } else if (use_dp4a) {
                 cmd.dispatch(&self.pipes.gemm_q4k_dp4a, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
             } else if (idx == 3 and q8TcLowsmemOn()) {
                 cmd.dispatch(&self.pipes.gemm_q8_0_tc_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
@@ -2136,6 +2153,7 @@ pub const ForwardCuda = struct {
             .swiglu_ff = try buffer.createBuffer(ctx, T * max_ff * f4),
             .act_f16 = try buffer.createBuffer(ctx, T * max_k * @sizeOf(u16)),
             .w_f16 = try buffer.createBuffer(ctx, max_w * @sizeOf(u16)),
+            .act_q8 = try buffer.createBuffer(ctx, T * (max_k / 32) * 34),
             .router_logits_e = try buffer.createBuffer(ctx, if (moe) T * d.n_experts * f4 else f4),
             .router_table_e = try buffer.createBuffer(ctx, if (moe) T * 2 * nu * f4 else f4),
             .gate_e = try buffer.createBuffer(ctx, e_gu),
@@ -2151,7 +2169,7 @@ pub const ForwardCuda = struct {
 
     fn freeBatch(self: *ForwardCuda) void {
         if (self.batch) |*bb| {
-            inline for (.{ &bb.hidden, &bb.norm, &bb.o, &bb.qfull, &bb.q, &bb.attn_gate, &bb.k, &bb.v, &bb.attn_out, &bb.qkv, &bb.conv_out, &bb.z, &bb.alpha, &bb.beta, &bb.delta_out, &bb.ssm_gn, &bb.ffn_norm, &bb.gate_ff, &bb.up_ff, &bb.swiglu_ff, &bb.act_f16, &bb.w_f16, &bb.router_logits_e, &bb.router_table_e, &bb.gate_e, &bb.up_e, &bb.swiglu_e, &bb.down_e, &bb.gate_scalar_e, &bb.padded_order, &bb.tile_expert }) |buf| {
+            inline for (.{ &bb.hidden, &bb.norm, &bb.o, &bb.qfull, &bb.q, &bb.attn_gate, &bb.k, &bb.v, &bb.attn_out, &bb.qkv, &bb.conv_out, &bb.z, &bb.alpha, &bb.beta, &bb.delta_out, &bb.ssm_gn, &bb.ffn_norm, &bb.gate_ff, &bb.up_ff, &bb.swiglu_ff, &bb.act_f16, &bb.w_f16, &bb.act_q8, &bb.router_logits_e, &bb.router_table_e, &bb.gate_e, &bb.up_e, &bb.swiglu_e, &bb.down_e, &bb.gate_scalar_e, &bb.padded_order, &bb.tile_expert }) |buf| {
                 buffer.freeBuffer(buf);
             }
             self.batch = null;

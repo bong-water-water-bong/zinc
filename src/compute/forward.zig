@@ -24508,8 +24508,9 @@ pub const InferenceEngine = struct {
     /// model and prompt length match those specialized paths; otherwise falls back to
     /// the `canUseBatchedPrefillRdna`-gated batched body or `prefillBatch` (per-token
     /// serial path). Set `ZINC_BATCHED_PREFILL=0` to force the serial fallback or
-    /// `=validate` to run both paths and diff the last-token logits. Intel Arc devices
-    /// require `ZINC_INTEL_BATCHED_PREFILL=1` to opt in.
+    /// `=validate` to run both paths and diff the last-token logits. Intel Arc dense
+    /// Gemma uses the chunked batched path by default; other Intel models still require
+    /// `ZINC_INTEL_BATCHED_PREFILL=1` to opt in.
     /// @param state Decode state for the current request.
     /// @param prompt_tokens Tokenized prompt sequence to prefill.
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {

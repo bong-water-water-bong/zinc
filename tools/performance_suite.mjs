@@ -3186,7 +3186,9 @@ async function runIntelTarget(args) {
   const intelLlamaCli = await detectRemoteLlamaCliPath(creds, config.llamaSearchRoots, config.llamaCliOverride);
   const intelLlamaServer = await detectRemoteLlamaServerPath(creds, config.llamaSearchRoots, config.llamaServerOverride);
   const baselineBinary = intelLlamaServer || intelLlamaCli;
-  const zincProvenance = await captureRemoteGitProvenance(creds);
+  const zincProvenance = args.intelSync
+    ? await captureGitProvenance(ROOT)
+    : await captureRemoteGitProvenance(creds);
   const llamaCppProvenance = await captureRemoteLlamaCppProvenance(baselineBinary, creds);
 
   const knownCases = defaultIntelCases(config.modelRoot);
