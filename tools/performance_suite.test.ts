@@ -703,6 +703,42 @@ test("buildComparison withholds overall percentage for early-stop rows", () => {
   expect(comparison?.overall_delta_tps).toBeNull();
 });
 
+test("buildArtifact skips non-comparable core rows for model headlines", () => {
+  const artifact = buildArtifact([
+    {
+      id: "intel",
+      label: "Intel",
+      models: [
+        {
+          id: "m",
+          label: "Model",
+          scenarios: [
+            {
+              id: "core",
+              max_tokens: 64,
+              zinc: { name: "ZINC", prompt_tokens: 0, generated_tokens: 2, decode_tps: { median: 200, avg: 200 } },
+              baseline: { name: "llama.cpp", prompt_tokens: 0, generated_tokens: 64, decode_tps: { median: 50, avg: 50 } },
+            },
+            {
+              id: "context-long",
+              max_tokens: 64,
+              zinc: { name: "ZINC", prompt_tokens: 0, generated_tokens: 64, decode_tps: { median: 40, avg: 40 } },
+              baseline: { name: "llama.cpp", prompt_tokens: 0, generated_tokens: 64, decode_tps: { median: 50, avg: 50 } },
+            },
+          ],
+        },
+      ],
+    },
+  ]);
+
+  const model = artifact.targets[0]?.models[0];
+  expect(model?.scenarios[0]?.comparison?.overall_comparable).toBe(false);
+  expect(model?.max_tokens).toBe(64);
+  expect(model?.zinc?.generated_tokens).toBe(64);
+  expect(model?.comparison?.overall_pct_of_baseline).toBeCloseTo(80, 3);
+  expect(artifact.targets[0]?.summary.average_pct_of_llama).toBeCloseTo(80, 3);
+});
+
 test("buildArtifact recomputes stale overall ratings and aggregates by total wall time", () => {
   const artifact = buildArtifact([
     {

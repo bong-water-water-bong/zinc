@@ -678,13 +678,20 @@ function recalculateModelComparisons(model) {
   const scenarios = Array.isArray(model.scenarios)
     ? model.scenarios.map(recalculateScenarioComparison)
     : null;
-  const primary = scenarios?.find((scenario) => scenario.id === "core") ?? scenarios?.[0] ?? null;
+  const primary = selectPrimaryScenario(scenarios);
   const comparison = primary?.comparison
     ?? (model.baseline?.decode_tps
       ? buildComparison(model.zinc, model.baseline, { expectedGeneratedTokens: model.max_tokens })
       : null);
   return {
     ...model,
+    ...(primary ? {
+      prompt_mode: primary.prompt_mode ?? model.prompt_mode,
+      prompt: primary.prompt ?? model.prompt,
+      max_tokens: primary.max_tokens ?? model.max_tokens,
+      zinc: primary.zinc ?? model.zinc,
+      baseline: primary.baseline ?? model.baseline,
+    } : {}),
     comparison,
     ...(scenarios ? { scenarios } : {}),
   };
@@ -787,6 +794,18 @@ function aggregateOverallPct(scenarios) {
     count += 1;
   }
   return count > 0 && zincSeconds > 0 ? (baselineSeconds / zincSeconds) * 100 : null;
+}
+
+function scenarioComparableForPrimary(scenario) {
+  const comparison = scenario?.comparison;
+  return !comparison || comparison.overall_comparable !== false;
+}
+
+function selectPrimaryScenario(scenarios) {
+  if (!Array.isArray(scenarios) || scenarios.length === 0) return null;
+  const core = scenarios.find((scenario) => scenario.id === "core") ?? null;
+  if (core && scenarioComparableForPrimary(core)) return core;
+  return scenarios.find(scenarioComparableForPrimary) ?? core ?? scenarios[0];
 }
 
 function targetSummary(models) {
@@ -2349,7 +2368,7 @@ function scenarioResultPayload(entry, scenarioDef, zinc, baseline) {
 }
 
 function primaryScenarioSummary(entry, scenarios) {
-  const primary = scenarios.find((scenario) => scenario.id === "core") ?? scenarios[0];
+  const primary = selectPrimaryScenario(scenarios);
   return {
     id: entry.id,
     label: entry.label,
