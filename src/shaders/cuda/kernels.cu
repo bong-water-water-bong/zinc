@@ -40,6 +40,45 @@ __device__ __forceinline__ float zinc_half_to_float(unsigned short h) {
     return __int_as_float((int)f);
 }
 
+// Float -> IEEE half bit pattern (no cuda_fp16.h dependency).
+__device__ __forceinline__ unsigned short zinc_float_to_half(float x) {
+    unsigned ux = __float_as_int(x);
+    unsigned sign = (ux >> 16) & 0x8000u;
+    unsigned abs = ux & 0x7FFFFFFFu;
+    // Exponent + mantissa extraction
+    unsigned exp = (abs >> 23) & 0xFFu;
+    unsigned mant = abs & 0x7FFFFFu;
+    if (exp >= 142u) {
+        // Overflow or inf/nan → inf (or nan if mant!=0)
+        return (unsigned short)(sign | 0x7C00u | (mant ? 0x200u : 0u));
+    } else if (exp >= 113u) {
+        // Normal range: exp bias 127→15
+        unsigned new_exp = exp - 112u;
+        unsigned h = sign | (new_exp << 10) | (mant >> 13);
+        // Round-to-nearest-even
+        unsigned lsb = (mant >> 12) & 1u;
+        unsigned rem = mant & 0xFFFu;
+        if (rem > 0x800u || (rem == 0x800u && lsb)) {
+            h++;
+            // Handle mantissa overflow into exponent
+        }
+        return (unsigned short)h;
+    } else if (exp >= 103u) {
+        // Subnormal: shift mantissa with implicit 1
+        unsigned shift = 113u - exp;
+        unsigned mant_full = (mant | 0x800000u) >> shift;
+        unsigned h = sign | (mant_full >> 13);
+        // Round-to-nearest-even
+        unsigned lsb = (mant_full >> 12) & 1u;
+        unsigned rem = mant_full & 0xFFFu;
+        if (rem > 0x800u || (rem == 0x800u && lsb)) h++;
+        return (unsigned short)h;
+    } else {
+        // Underflow → zero
+        return (unsigned short)sign;
+    }
+}
+
 // GGML Q4_K 6-bit scale/min unpack (j in 0..7), canonical the reference implementation form.
 __device__ __forceinline__ void zinc_q4k_scale_min(int j, const unsigned char* q,
                                                     unsigned char* d, unsigned char* m) {
@@ -3712,7 +3751,7 @@ extern "C" __global__ void quantize_act_q8_0(const float* __restrict__ act,
 
     // Lane 0 writes the fp16 scale
     if (wlane == 0 && k_idx < pc.K) {
-        unsigned short dh = __float2half_rn(d);
+        unsigned short dh = zinc_float_to_half(d);
         out_base[wblk * 34u]     = (unsigned char)(dh & 0xFF);
         out_base[wblk * 34u + 1] = (unsigned char)(dh >> 8);
     }
@@ -3762,7 +3801,8 @@ extern "C" __global__ __launch_bounds__(256, 4) void gemm_q4k_q8_dp4a(
         // --- Input Q8_0 (pre-quantized) ---
         const unsigned char* ab = xq8 + (size_t)c * 34u;
         float d_a = zinc_half_to_float((unsigned short)((unsigned)ab[0] | ((unsigned)ab[1] << 8)));
-        int a_pk = *((const int*)(ab + 2u + grp * 4u));
+        const unsigned char* ap = ab + 2u + grp * 4u;
+        int a_pk = (int)ap[0] | ((int)ap[1] << 8) | ((int)ap[2] << 16) | ((int)ap[3] << 24);
 
         // DP4a: sum of nibble[i] * int8[i]
         int dp = __dp4a(w_pk, a_pk, 0);
@@ -3796,7 +3836,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void gemm_q4k_q8_dp4a(
 // Math: result = d_sc * sum(nib*in)/scale - dm_mn * sum(in)
 //   DP4a computes sum(nib * in_int8) = scale * sum(nib * in)
 //   So: result = d_sc * dp4a / scale - dm_mn * sum_input
-extern "C" __global__ void gemm_q4k_dp4a(const unsigned* a_u32, const float* A,
+extern "C" __global__ __launch_bounds__(256, 3) void gemm_q4k_dp4a(const unsigned* a_u32, const float* A,
     const unsigned char* Ab_q8, float* Y, GemmPush pc) {
     const unsigned BM=64u, BT=64u, BK=32u;
     __shared__ int Ws_pk[BK/4 * BM];       // [8][64] packed nibble int32
@@ -3851,7 +3891,8 @@ extern "C" __global__ void gemm_q4k_dp4a(const unsigned* a_u32, const float* A,
                     float d = zinc_half_to_float((unsigned short)((unsigned)ab[0] | ((unsigned)ab[1] << 8)));
                     float sv = 0.0f;
                     if(lane<8u){
-                        int pk = *((const int*)(ab + 2u + lane * 4u));
+                        const unsigned char* p = ab + 2u + lane * 4u;
+                        int pk = (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16) | ((int)p[3] << 24);
                         As_pk[lane*BT+t] = pk;
                         // Sum of 32 int8 values (each lane sums 4)
                         sv = (float)((signed char)(pk & 0xFF)) + (float)((signed char)((pk >> 8) & 0xFF))
@@ -3859,7 +3900,7 @@ extern "C" __global__ void gemm_q4k_dp4a(const unsigned* a_u32, const float* A,
                     }
                     // Warp-reduce sum across 8 lanes
                     for(int o=4;o>0;o>>=1) sv += __shfl_xor_sync(0xFFFFFFFFu, sv, o);
-                    if(lane==0){A_inv[t]=d; A_sum[t]=sv;}
+                    if(lane==0){A_inv[t]=d; A_sum[t]=d*sv;}
                 } else {
                     // Dynamic quantization from float input
                     float val=Ab[(size_t)tok*pc.K+c*32u+lane];
