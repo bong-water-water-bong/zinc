@@ -63,9 +63,9 @@ const rdna35Decode = metricMedian(rdna35?.zinc?.decode_tps);
 const rdna35BaselineDecode = metricMedian(rdna35?.baseline?.decode_tps);
 const metal35Decode = metricMedian(metal35?.zinc?.decode_tps);
 
-const homeDescription = `Fastest measured local LLM inference for AMD Radeon GPUs. ZINC beats llama.cpp across the current five-model RDNA4 suite, led by ${formatTokNumber(rdna35Decode)} tok/s on Qwen3.6-35B-A3B — ${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp, no ROCm.`;
+const homeDescription = `Fastest measured local LLM inference for AMD Radeon GPUs. ZINC beats llama.cpp across the current five-model RDNA4 headline sweep, led by ${formatTokNumber(rdna35Decode)} tok/s on Qwen3.6-35B-A3B — ${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp, no ROCm.`;
 const appDescription = `LLM inference engine for AMD Radeon GPUs (RDNA4/RDNA3) and Apple Silicon, built with Zig, Vulkan compute shaders, and Metal. The current RDNA4 sweep beats llama.cpp on all five published models.`;
-const performanceAnswer = `On the Radeon AI PRO R9700 (32GB, 576 GB/s), the current validated ZINC plain-decode number is ${formatTokNumber(rdna35Decode)} tok/s on Qwen3.6-35B-A3B-UD-Q4_K_XL - ${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp on the same machine. The current RDNA4 suite is ahead of llama.cpp on decode, prefill, and model-level overall across all five published models. On the current Apple Silicon validation box, a Mac Studio (Mac16,9) with Apple M4 Max, 40-core GPU, and 64 GB unified memory, Qwen3.6-35B-A3B-UD-Q4_K_XL measures ${formatTokNumber(metal35Decode)} tok/s decode in the Metal benchmark.`;
+const performanceAnswer = `On the Radeon AI PRO R9700 (32GB, 576 GB/s), the current validated ZINC plain-decode number is ${formatTokNumber(rdna35Decode)} tok/s on Qwen3.6-35B-A3B-UD-Q4_K_XL - ${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp on the same machine. The current RDNA4 suite is ahead of llama.cpp on decode, prefill, end-to-end, and model-level overall across all five published models. On the current Apple Silicon validation box, a Mac Studio (Mac16,9) with Apple M4 Max, 40-core GPU, and 64 GB unified memory, Qwen3.6-35B-A3B-UD-Q4_K_XL measures ${formatTokNumber(metal35Decode)} tok/s decode in the Metal benchmark.`;
 
 function ratioX(zinc: number | null | undefined, baseline: number | null | undefined) {
   if (zinc == null || baseline == null || Number.isNaN(zinc) || Number.isNaN(baseline) || baseline <= 0) return null;
@@ -163,7 +163,7 @@ const jsonLd = {
           name: 'How do I run LLM inference on an AMD Radeon GPU without ROCm?',
           acceptedAnswer: {
             '@type': 'Answer',
-            text: 'ZINC runs LLM inference on AMD Radeon GPUs through Vulkan compute, so you do not need ROCm at all. Install a Vulkan 1.3 driver (RADV or AMDVLK), build ZINC with zig build -Doptimize=ReleaseFast, and point it at a GGUF model. This is the fastest path to local LLM inference on RDNA3 and RDNA4 cards such as the RX 7900 XTX, RX 9070 XT, and Radeon AI PRO R9700.',
+            text: 'ZINC runs LLM inference on AMD Radeon GPUs through Vulkan compute, so you do not need ROCm at all. Install a Vulkan 1.3 driver (RADV or AMDVLK), build ZINC with zig build -Doptimize=ReleaseFast, and point it at a GGUF model. In the current public benchmark sweep, this is the fastest measured path to local LLM inference on RDNA3 and RDNA4 cards such as the RX 7900 XTX, RX 9070 XT, and Radeon AI PRO R9700.',
           },
         },
         {

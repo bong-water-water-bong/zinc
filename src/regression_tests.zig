@@ -125,7 +125,7 @@ test "Vulkan prefillBatched gates on env flag + canUseBatchedPrefillRdna" {
     try expectContainsNear(src, fn_marker, "ensureBatchedScratchCapacity", 3500);
 }
 
-test "Vulkan batched prefill keeps RDNA default and Intel opt-in" {
+test "Vulkan batched prefill keeps RDNA default and Intel dense Gemma guard" {
     const src = @embedFile("compute/forward.zig");
     const fn_marker = "fn canUseBatchedPrefillRdna(engine: *const InferenceEngine) bool {";
     try expectContainsNear(src, fn_marker, "vendor == .amd_rdna3", 900);
@@ -133,7 +133,11 @@ test "Vulkan batched prefill keeps RDNA default and Intel opt-in" {
     try expectContainsNear(src, fn_marker, "vendor == .amd_rdna4_apu", 900);
     try expectContainsNear(src, "fn isIntelGpuVendor", "vendor == .intel_arc_xe2", 200);
     try expectContainsNear(src, fn_marker, "ZINC_INTEL_BATCHED_PREFILL", 1200);
-    try expectContainsNear(src, "if (is_intel) {", "return false;", 400);
+    try expectContainsNear(src, "if (is_intel) {", "intel_dense_gemma_default", 700);
+    try expectContainsNear(src, "const intel_dense_gemma_default", "cfg.architecture == .gemma", 250);
+    try expectContainsNear(src, "const intel_dense_gemma_default", "cfg.n_experts == 0", 300);
+    try expectContainsNear(src, "const intel_dense_gemma_default", "cfg.ssm_d_inner == 0", 350);
+    try expectContainsNear(src, "if (is_intel) {", "return false;", 900);
 }
 
 test "Vulkan batched projection chunk size matches selected shader family" {
@@ -536,7 +540,8 @@ test "Vulkan batched kpar pipelines use non-wave64 options on Intel" {
 test "Vulkan Intel batched prefill keeps chunk override for fallback debugging" {
     const src = @embedFile("compute/forward.zig");
     try expectContains(src, "ZINC_INTEL_BATCHED_PREFILL_CHUNK");
-    try expectContainsNear(src, "fn intelBatchedPrefillChunkLimit", "orelse return 0;", 500);
+    try expectContainsNear(src, "fn intelBatchedPrefillChunkLimit", "orelse return 96;", 500);
+    try expectContainsNear(src, "fn intelBatchedPrefillChunkLimit", "if (std.mem.eql(u8, raw, \"0\")) return 0;", 700);
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine", "intelBatchedPrefillChunkLimit", 1200);
     try expectContainsNear(src, "Intel batched prefill chunking ENABLED", "prefillBatchedImpl(state, prompt_tokens[offset..end])", 1200);
 }

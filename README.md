@@ -325,15 +325,15 @@ Validated on AMD Radeon AI PRO R9700 (RDNA4): Vulkan 1.3 init, GGUF parsing, 21 
 
 ## Next Steps
 
-The next push is closing the prefill gap to llama.cpp on hybrid MoE-plus-SSM models:
+The next push is turning the clean RDNA headline sweep into a wider, harder-to-move advantage:
 
-1. **Wire `mul_mm_q4k` into SSM proj prefill** — the tiled Q4_K GEMM is in the tree but only routes the language-model head where N=1 wastes the BN tile. The SSM proj fires 4 DMMVs per layer per token; batching them across the prompt is the deferred cycle-40 refactor.
-2. **Port the `gated_delta_net.cu` block-resident state pattern** — today every prompt token re-reads and re-writes the full 2 MB SSM state per layer. Loading state once per workgroup and walking all tokens inside the kernel collapses 18 GB of state DRAM traffic per prefill to 4 MB.
-3. **Open `canUseBatchedPrefillRdna` for MoE+SSM hybrids** — the entire batched prefill body (`flash_attn_batched`, `rope_batched`, `dmmv_q4k_batch_kpar`) is gated off when `n_experts > 0` or `ssm_d_inner > 0`. Once items 1 and 2 land, dropping the gate activates Br-row attention batching on the same workload.
-4. **Land the cycle-50 micro-restructure pattern on MoE inner loops** — wider threads-per-row plus halved per-thread register slabs lifted ssm_delta_net by 2.7%. The same shape change is untried on `dmmv_q4k_moe_kpar` and `dmmv_q4k_moe_fused_down_acc`.
-5. **Ship batched Metal prefill across the catalog** — Qwen 3 8B and Gemma 4 31B now show the fast path, but Qwen 3.6 27B/35B and Gemma 4 26B still need the same treatment.
+1. **Widen the Gemma 4 31B margin** — it is ahead in the current RDNA suite, but decode is only `1.01x` llama.cpp. This is the row most likely to regress if we stop paying attention.
+2. **Extend the sweep across more scenarios** — the headline five-model board is green; long-context and long-draft cells need the same level of repeatable coverage.
+3. **Keep improving MoE and SSM prefill** — RDNA prefill now wins the published rows, but the best kernel work is still in batching SSM projections, reducing recurrent-state traffic, and opening more hybrid fast paths.
+4. **Port the RDNA discipline to Metal and Intel** — Apple Silicon and Intel Arc stay public in the same benchmark format, even where they are not winning yet.
+5. **Keep the dashboard honest** — all public claims should come from the fair server-vs-server harness, not one-off CLI runs or mixed warmup conditions.
 
-The full plan and 50-cycle field report is in the [cycle-50 blog post](https://zolotukhin.ai/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4).
+The detailed cycle-50 field report is in the [RDNA optimization blog post](https://zolotukhin.ai/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4).
 
 ## License
 
