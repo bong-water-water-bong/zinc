@@ -1,0 +1,23 @@
+name: qodo-merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  qodo_merge:
+    name: Qodo Merge
+    runs-on: ubuntu-latest
+    if: ${{ github.event.sender.type != 'Bot' && secrets.QODO_API_KEY != '' }}
+    steps:
+      - uses: qodo-ai/qodo-ci-action@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QODO_API_KEY: ${{ secrets.QODO_API_KEY }}

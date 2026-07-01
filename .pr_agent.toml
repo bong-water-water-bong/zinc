@@ -1,0 +1,31 @@
+[pr_agent]
+model = "deepseek/deepseek-chat"
+model_turbo = "deepseek/deepseek-chat"
+fallback_models = ["deepseek/deepseek-chat"]
+verbosity_level = 2
+publish_output = true
+publish_output_progress = false
+
+[pr_agent.pr_reviewer]
+require_score_review = false
+require_tests_review = true
+num_ais = 1
+extra_instructions = "You are reviewing a Zig GPU inference engine (Vulkan, CUDA, Metal). Focus on: GPU compute shader correctness, memory safety in Zig, Vulkan pipeline barriers and synchronization, and performance regressions in GEMM kernels."
+inline_code_comments = true
+automatic_review = true
+persistent_comment = false
+
+[pr_agent.pr_description]
+publish_labels = true
+extra_instructions = "Use conventional commits. Include performance impact notes."
+enable_help_text = false
+
+[pr_agent.pr_code_suggestions]
+num_code_suggestions = 4
+extra_instructions = "Prefer suggestions that improve GPU kernel performance, reduce synchronization overhead, or fix memory safety issues."
+
+[pr_agent.pr_update_changelog]
+push_changelog_changes = true
+
+[config]
+ignore_pr_labels = []
