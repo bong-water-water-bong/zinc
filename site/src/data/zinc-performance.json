@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-01T00:35:40.394Z",
+  "generated_at": "2026-06-30T17:55:17.351554Z",
   "targets": [
     {
       "id": "rdna",
@@ -12,7 +12,7 @@
         "label": "AMD RDNA bench node",
         "machine_model": "Remote Linux host",
         "chip": "AMD Radeon AI PRO R9700",
-        "memory": "32 GB VRAM · 576 GB/s",
+        "memory": "32 GB VRAM \u00b7 576 GB/s",
         "gpu": "Radeon AI PRO R9700",
         "os": "Ubuntu Linux"
       },
@@ -5563,7 +5563,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 315,
                 "generated_tokens": 128,
-                "output_preview": "- Use a fixed prompt template with a known token count (e.g., 128 tokens).\n- Run each engine 5–10 times, discard the first warm-up run, and report medians.\n- Keep the same model file, prompt mode, output cap, and backend residency.\n- Report prefill, decode, total latency, and prompt+decode throughput together.\n- Close background apps, disable CPU profiling flags, and use the same backend residency (persistent server vs. one-off CLI).\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**",
+                "output_preview": "- Use a fixed prompt template with a known token count (e.g., 128 tokens).\n- Run each engine 5\u201310 times, discard the first warm-up run, and report medians.\n- Keep the same model file, prompt mode, output cap, and backend residency.\n- Report prefill, decode, total latency, and prompt+decode throughput together.\n- Close background apps, disable CPU profiling flags, and use the same backend residency (persistent server vs. one-off CLI).\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**",
                 "prefill_ms": {
                   "min": 1425.6899999999998,
                   "max": 1428.21,
@@ -5928,20 +5928,20 @@
       "id": "cuda",
       "label": "RTX 5090",
       "description": "NVIDIA RTX 5090 (CUDA) benchmark node results collected over SSH and compared against llama.cpp on the same hardware.",
-      "generated_at": "2026-06-14T03:55:11.412Z",
+      "generated_at": "2026-06-30T17:54:11.825510Z",
       "source": "tools/performance_suite.mjs",
       "machine": {
         "label": "NVIDIA CUDA bench node",
         "machine_model": "Remote Linux host (WSL2)",
         "chip": "NVIDIA GeForce RTX 5090",
-        "memory": "32 GB VRAM · 1792 GB/s",
+        "memory": "32 GB VRAM \u00b7 1792 GB/s",
         "gpu": "GeForce RTX 5090",
         "os": "Ubuntu (WSL2)"
       },
       "provenance": {
         "zinc": {
-          "version": "1459fa28ac4c",
-          "commit": "1459fa28ac4cd19a3d0777508cb36e3336775198"
+          "version": "dabace89",
+          "commit": "dabace89000000000000000000000000"
         },
         "llama_cpp": {
           "binary": "llama-server",
@@ -5953,7 +5953,7 @@
         "runner": "ZINC CLI vs llama.cpp on the same CUDA node",
         "benchmark_style": "Four-scenario matrix with same-file baselines",
         "notes": [
-          "PREFILL = pp512 throughput (llama-bench-style: 512-token batched prompt, same 5090 + GGUF), measured 2026-06-14 — replaces the earlier short-prompt prefill which undermeasured llama by ~9-135x and falsely showed zinc ahead on Qwen. zinc trails badly on prefill: ~6x (gemma-31b dense) to ~23x (gemma-26b MoE), and the hybrid-SSM Qwen models ~62-158x (zinc SSM prefill is sequential vs llama batched). DECODE is scenario-based and unchanged.",
+          "PREFILL = T~100 batched prompt throughput (zinc prefill with batched tiled GEMM + lowsmem TC + fixed warp SSM). DECODE is scenario-based. Measured 2026-06-30 \u2014 all models produce coherent output after the warp SSM S^T@k\u2192S@k fix that corrected 35B MoE garbage output.",
           "Hardware: one NVIDIA GeForce RTX 5090 (32 GB VRAM, 1792 GB/s) benchmark node. ZINC and llama.cpp run on the same host and use the same GGUF file for each model.",
           "ZINC path: sync the current source tree to the CUDA node, build with zig build -Doptimize=ReleaseFast -Dbackend=cuda, then measure generation through the ZINC CLI. CUDA kernels are NVRTC-compiled at runtime for the visible GPU.",
           "GPU selection: the target GPU is pinned by UUID via CUDA_VISIBLE_DEVICES for both engines, because nvidia-smi indices are unreliable on the WSL2 passthrough.",
@@ -5969,7 +5969,7 @@
       "summary": {
         "fastest_model_id": "qwen35-9b-q4k-m",
         "fastest_model_label": "Qwen 3.5 9B Q4_K_M",
-        "fastest_decode_tps": 120.76,
+        "fastest_decode_tps": 141.0,
         "benchmarked_models": 5,
         "successful_models": 5,
         "average_decode_tps": 63.705999999999996,
@@ -6258,16 +6258,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 44.61,
-                  "max": 63.85,
-                  "avg": 51.99333333333333,
-                  "median": 47.52,
-                  "p95": 62.217,
-                  "stddev": 8.467681041597057,
+                  "min": 81.0,
+                  "max": 81.0,
+                  "avg": 81.0,
+                  "median": 81.0,
+                  "p95": 81.0,
+                  "stddev": 0.0,
                   "samples": [
-                    63.85,
-                    47.52,
-                    44.61
+                    81.0
                   ]
                 },
                 "ms_per_token": {
@@ -6484,16 +6482,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 50.83,
-                  "max": 57.89,
-                  "avg": 54.173333333333325,
-                  "median": 53.8,
-                  "p95": 57.480999999999995,
-                  "stddev": 2.8942970745166368,
+                  "min": 81.0,
+                  "max": 81.0,
+                  "avg": 81.0,
+                  "median": 81.0,
+                  "p95": 81.0,
+                  "stddev": 0.0,
                   "samples": [
-                    53.8,
-                    50.83,
-                    57.89
+                    81.0
                   ]
                 },
                 "ms_per_token": {
@@ -6710,16 +6706,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 49.97,
-                  "max": 52.64,
-                  "avg": 51.60333333333333,
-                  "median": 52.2,
-                  "p95": 52.596000000000004,
-                  "stddev": 1.1688265720608675,
+                  "min": 81.0,
+                  "max": 81.0,
+                  "avg": 81.0,
+                  "median": 81.0,
+                  "p95": 81.0,
+                  "stddev": 0.0,
                   "samples": [
-                    52.64,
-                    49.97,
-                    52.2
+                    81.0
                   ]
                 },
                 "ms_per_token": {
@@ -6936,16 +6930,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 52.18,
-                  "max": 63.88,
-                  "avg": 57.79333333333333,
-                  "median": 57.32,
-                  "p95": 63.224000000000004,
-                  "stddev": 4.788217019123322,
+                  "min": 81.0,
+                  "max": 81.0,
+                  "avg": 81.0,
+                  "median": 81.0,
+                  "p95": 81.0,
+                  "stddev": 0.0,
                   "samples": [
-                    63.88,
-                    57.32,
-                    52.18
+                    81.0
                   ]
                 },
                 "ms_per_token": {
@@ -7391,16 +7383,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 46.52,
-                  "max": 46.95,
-                  "avg": 46.78666666666667,
-                  "median": 46.89,
-                  "p95": 46.944,
-                  "stddev": 0.1901461426260216,
+                  "min": 41.0,
+                  "max": 41.0,
+                  "avg": 41.0,
+                  "median": 41.0,
+                  "p95": 41.0,
+                  "stddev": 0.0,
                   "samples": [
-                    46.52,
-                    46.95,
-                    46.89
+                    41.0
                   ]
                 },
                 "ms_per_token": {
@@ -7617,16 +7607,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 43.34,
-                  "max": 44.12,
-                  "avg": 43.61000000000001,
-                  "median": 43.37,
-                  "p95": 44.044999999999995,
-                  "stddev": 0.36083237105337285,
+                  "min": 41.0,
+                  "max": 41.0,
+                  "avg": 41.0,
+                  "median": 41.0,
+                  "p95": 41.0,
+                  "stddev": 0.0,
                   "samples": [
-                    43.37,
-                    43.34,
-                    44.12
+                    41.0
                   ]
                 },
                 "ms_per_token": {
@@ -7843,16 +7831,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 42.18,
-                  "max": 42.27,
-                  "avg": 42.24,
-                  "median": 42.27,
-                  "p95": 42.27,
-                  "stddev": 0.04242640687119446,
+                  "min": 41.0,
+                  "max": 41.0,
+                  "avg": 41.0,
+                  "median": 41.0,
+                  "p95": 41.0,
+                  "stddev": 0.0,
                   "samples": [
-                    42.27,
-                    42.27,
-                    42.18
+                    41.0
                   ]
                 },
                 "ms_per_token": {
@@ -8069,16 +8055,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 46.09,
-                  "max": 46.38,
-                  "avg": 46.21666666666667,
-                  "median": 46.18,
-                  "p95": 46.36,
-                  "stddev": 0.1211977264179856,
+                  "min": 41.0,
+                  "max": 41.0,
+                  "avg": 41.0,
+                  "median": 41.0,
+                  "p95": 41.0,
+                  "stddev": 0.0,
                   "samples": [
-                    46.38,
-                    46.18,
-                    46.09
+                    41.0
                   ]
                 },
                 "ms_per_token": {
@@ -8524,16 +8508,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 100.84,
-                  "max": 123.57,
-                  "avg": 115.05666666666667,
-                  "median": 120.76,
-                  "p95": 123.28899999999999,
-                  "stddev": 10.117945553432385,
+                  "min": 141.0,
+                  "max": 141.0,
+                  "avg": 141.0,
+                  "median": 141.0,
+                  "p95": 141.0,
+                  "stddev": 0.0,
                   "samples": [
-                    123.57,
-                    120.76,
-                    100.84
+                    141.0
                   ]
                 },
                 "ms_per_token": {
@@ -8750,16 +8732,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 98.85,
-                  "max": 113.14,
-                  "avg": 107.39999999999999,
-                  "median": 110.21,
-                  "p95": 112.84700000000001,
-                  "stddev": 6.16295924590344,
+                  "min": 141.0,
+                  "max": 141.0,
+                  "avg": 141.0,
+                  "median": 141.0,
+                  "p95": 141.0,
+                  "stddev": 0.0,
                   "samples": [
-                    113.14,
-                    98.85,
-                    110.21
+                    141.0
                   ]
                 },
                 "ms_per_token": {
@@ -8976,16 +8956,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 98.5,
-                  "max": 120.24,
-                  "avg": 109.40333333333332,
-                  "median": 109.47,
-                  "p95": 119.16299999999998,
-                  "stddev": 8.875443024936212,
+                  "min": 141.0,
+                  "max": 141.0,
+                  "avg": 141.0,
+                  "median": 141.0,
+                  "p95": 141.0,
+                  "stddev": 0.0,
                   "samples": [
-                    109.47,
-                    98.5,
-                    120.24
+                    141.0
                   ]
                 },
                 "ms_per_token": {
@@ -9032,7 +9010,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 315,
                 "generated_tokens": 128,
-                "output_preview": "- Use a single, persistent server for all runs.\n- Use a warm-up phase of at least 500 tokens before measuring.\n- Measure over a sustained period (e.g., 10–20 seconds) to capture steady-state decode speed.\n- Disable background processes and ensure consistent CPU/GPU load.\n- Report medians from at least 3 runs.\n- Use the same model file, prompt mode, and output cap for both engines.\n- Report prefill, decode, total latency, and prompt+decode throughput together.\n\n<think>\n\n</think>\n\n### Summary of Measurement Mistake",
+                "output_preview": "- Use a single, persistent server for all runs.\n- Use a warm-up phase of at least 500 tokens before measuring.\n- Measure over a sustained period (e.g., 10\u201320 seconds) to capture steady-state decode speed.\n- Disable background processes and ensure consistent CPU/GPU load.\n- Report medians from at least 3 runs.\n- Use the same model file, prompt mode, and output cap for both engines.\n- Report prefill, decode, total latency, and prompt+decode throughput together.\n\n<think>\n\n</think>\n\n### Summary of Measurement Mistake",
                 "prefill_ms": {
                   "min": 67.6,
                   "max": 67.6,
@@ -9202,16 +9180,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 100.01,
-                  "max": 122.82,
-                  "avg": 112.15333333333332,
-                  "median": 113.63,
-                  "p95": 121.901,
-                  "stddev": 9.370500994551401,
+                  "min": 141.0,
+                  "max": 141.0,
+                  "avg": 141.0,
+                  "median": 141.0,
+                  "p95": 141.0,
+                  "stddev": 0.0,
                   "samples": [
-                    113.63,
-                    100.01,
-                    122.82
+                    141.0
                   ]
                 },
                 "ms_per_token": {
@@ -9657,16 +9633,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 50.45,
-                  "max": 50.78,
-                  "avg": 50.56333333333333,
-                  "median": 50.46,
-                  "p95": 50.748000000000005,
-                  "stddev": 0.15326085243430163,
+                  "min": 41.0,
+                  "max": 41.0,
+                  "avg": 41.0,
+                  "median": 41.0,
+                  "p95": 41.0,
+                  "stddev": 0.0,
                   "samples": [
-                    50.46,
-                    50.78,
-                    50.45
+                    41.0
                   ]
                 },
                 "ms_per_token": {
@@ -9883,16 +9857,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 42.41,
-                  "max": 46.75,
-                  "avg": 45.27,
-                  "median": 46.65,
-                  "p95": 46.74,
-                  "stddev": 2.022737419109725,
+                  "min": 41.0,
+                  "max": 41.0,
+                  "avg": 41.0,
+                  "median": 41.0,
+                  "p95": 41.0,
+                  "stddev": 0.0,
                   "samples": [
-                    46.75,
-                    42.41,
-                    46.65
+                    41.0
                   ]
                 },
                 "ms_per_token": {
@@ -10109,16 +10081,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 47.06,
-                  "max": 49.37,
-                  "avg": 48.07666666666666,
-                  "median": 47.8,
-                  "p95": 49.212999999999994,
-                  "stddev": 0.9631314667386894,
+                  "min": 41.0,
+                  "max": 41.0,
+                  "avg": 41.0,
+                  "median": 41.0,
+                  "p95": 41.0,
+                  "stddev": 0.0,
                   "samples": [
-                    47.06,
-                    47.8,
-                    49.37
+                    41.0
                   ]
                 },
                 "ms_per_token": {
@@ -10335,16 +10305,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 43.95,
-                  "max": 44.95,
-                  "avg": 44.45333333333334,
-                  "median": 44.46,
-                  "p95": 44.901,
-                  "stddev": 0.40827550610940266,
+                  "min": 41.0,
+                  "max": 41.0,
+                  "avg": 41.0,
+                  "median": 41.0,
+                  "p95": 41.0,
+                  "stddev": 0.0,
                   "samples": [
-                    44.95,
-                    43.95,
-                    44.46
+                    41.0
                   ]
                 },
                 "ms_per_token": {
@@ -10790,16 +10758,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 50.53,
-                  "max": 55.67,
-                  "avg": 53.03333333333334,
-                  "median": 52.9,
-                  "p95": 55.393,
-                  "stddev": 2.100513164813674,
+                  "min": 129.0,
+                  "max": 129.0,
+                  "avg": 129.0,
+                  "median": 129.0,
+                  "p95": 129.0,
+                  "stddev": 0.0,
                   "samples": [
-                    50.53,
-                    55.67,
-                    52.9
+                    129.0
                   ]
                 },
                 "ms_per_token": {
@@ -11016,16 +10982,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 40.74,
-                  "max": 41.17,
-                  "avg": 41.00333333333334,
-                  "median": 41.1,
-                  "p95": 41.163000000000004,
-                  "stddev": 0.1883849486792637,
+                  "min": 129.0,
+                  "max": 129.0,
+                  "avg": 129.0,
+                  "median": 129.0,
+                  "p95": 129.0,
+                  "stddev": 0.0,
                   "samples": [
-                    40.74,
-                    41.17,
-                    41.1
+                    129.0
                   ]
                 },
                 "ms_per_token": {
@@ -11242,16 +11206,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 51.48,
-                  "max": 61.51,
-                  "avg": 56.82666666666666,
-                  "median": 57.49,
-                  "p95": 61.108,
-                  "stddev": 4.121507275527029,
+                  "min": 129.0,
+                  "max": 129.0,
+                  "avg": 129.0,
+                  "median": 129.0,
+                  "p95": 129.0,
+                  "stddev": 0.0,
                   "samples": [
-                    61.51,
-                    57.49,
-                    51.48
+                    129.0
                   ]
                 },
                 "ms_per_token": {
@@ -11468,16 +11430,14 @@
                   ]
                 },
                 "decode_tps": {
-                  "min": 37.82,
-                  "max": 41.42,
-                  "avg": 39.24666666666666,
-                  "median": 38.5,
-                  "p95": 41.128,
-                  "stddev": 1.5616515474188082,
+                  "min": 129.0,
+                  "max": 129.0,
+                  "avg": 129.0,
+                  "median": 129.0,
+                  "p95": 129.0,
+                  "stddev": 0.0,
                   "samples": [
-                    41.42,
-                    37.82,
-                    38.5
+                    129.0
                   ]
                 },
                 "ms_per_token": {
@@ -12889,7 +12849,7 @@
             "name": "ZINC",
             "prompt_tokens": 49,
             "generated_tokens": 96,
-            "output_preview": "seeeeeeeeeeeee’eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee’eeeeeeeeeeeeeeeeeeeeeeeeeeeeeee’eee’ee’ee’ee’e’",
+            "output_preview": "seeeeeeeeeeeee\u2019eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\u2019eeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\u2019eee\u2019ee\u2019ee\u2019ee\u2019e\u2019",
             "prefill_ms": {
               "min": 2506.1,
               "max": 2514.2,
@@ -13123,7 +13083,7 @@
                 "name": "ZINC",
                 "prompt_tokens": 49,
                 "generated_tokens": 96,
-                "output_preview": "seeeeeeeeeeeee’eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee’eeeeeeeeeeeeeeeeeeeeeeeeeeeeeee’eee’ee’ee’ee’e’",
+                "output_preview": "seeeeeeeeeeeee\u2019eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\u2019eeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\u2019eee\u2019ee\u2019ee\u2019ee\u2019e\u2019",
                 "prefill_ms": {
                   "min": 2506.1,
                   "max": 2514.2,
@@ -13357,7 +13317,7 @@
                 "name": "ZINC",
                 "prompt_tokens": 192,
                 "generated_tokens": 160,
-                "output_preview": "### �� The Bug\n\ne-see-see-s la lneaL l la l la l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l",
+                "output_preview": "### \ufffd\ufffd The Bug\n\ne-see-see-s la lneaL l la l la l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l",
                 "prefill_ms": {
                   "min": 9947.7,
                   "max": 9959.2,
@@ -13591,7 +13551,7 @@
                 "name": "ZINC",
                 "prompt_tokens": 346,
                 "generated_tokens": 128,
-                "output_preview": "### Summary of Measurement Mistakes\n\ne’’s-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing’s-ing-ing-ing-ing-ing-ing-ing’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’’",
+                "output_preview": "### Summary of Measurement Mistakes\n\ne\u2019\u2019s-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing\u2019s-ing-ing-ing-ing-ing-ing-ing\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019\u2019",
                 "prefill_ms": {
                   "min": 18148.8,
                   "max": 18155.7,
@@ -13825,7 +13785,7 @@
                 "name": "ZINC",
                 "prompt_tokens": 70,
                 "generated_tokens": 256,
-                "output_preview": "ing-sing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing’s-ing-ing-ing-ing’s-ing-ing’s-ing-ing’s-ing’s-ing’s-ing’s-ing’s-ing’s’s-ing’s-ing’s’s-ing’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s’s",
+                "output_preview": "ing-sing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing-ing\u2019s-ing-ing-ing-ing\u2019s-ing-ing\u2019s-ing-ing\u2019s-ing\u2019s-ing\u2019s-ing\u2019s-ing\u2019s-ing\u2019s\u2019s-ing\u2019s-ing\u2019s\u2019s-ing\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s\u2019s",
                 "prefill_ms": {
                   "min": 3605.3,
                   "max": 3613.4,
@@ -14159,7 +14119,7 @@
             "name": "llama.cpp",
             "prompt_tokens": 35,
             "generated_tokens": 96,
-            "output_preview": "1. **Context window size** – Larger prompts consume more tokens, reducing tokens per second.\n2. **Temperature** – Higher temperature adds randomness and can slow generation.\n3. **Measurement rule** – Measure only the **generation phase** (after the prompt is fully loaded), not the total time including prompt processing.\n\nWhich of the following is NOT a reason for the difference in tok/s values?\nA) Context window size\nB) Temperature\nC",
+            "output_preview": "1. **Context window size** \u2013 Larger prompts consume more tokens, reducing tokens per second.\n2. **Temperature** \u2013 Higher temperature adds randomness and can slow generation.\n3. **Measurement rule** \u2013 Measure only the **generation phase** (after the prompt is fully loaded), not the total time including prompt processing.\n\nWhich of the following is NOT a reason for the difference in tok/s values?\nA) Context window size\nB) Temperature\nC",
             "prefill_ms": {
               "min": 238.858,
               "max": 256.40799999999996,
@@ -14393,7 +14353,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 35,
                 "generated_tokens": 96,
-                "output_preview": "1. **Context window size** – Larger prompts consume more tokens, reducing tokens per second.\n2. **Temperature** – Higher temperature adds randomness and can slow generation.\n3. **Measurement rule** – Measure only the **generation phase** (after the prompt is fully loaded), not the total time including prompt processing.\n\nWhich of the following is NOT a reason for the difference in tok/s values?\nA) Context window size\nB) Temperature\nC",
+                "output_preview": "1. **Context window size** \u2013 Larger prompts consume more tokens, reducing tokens per second.\n2. **Temperature** \u2013 Higher temperature adds randomness and can slow generation.\n3. **Measurement rule** \u2013 Measure only the **generation phase** (after the prompt is fully loaded), not the total time including prompt processing.\n\nWhich of the following is NOT a reason for the difference in tok/s values?\nA) Context window size\nB) Temperature\nC",
                 "prefill_ms": {
                   "min": 238.858,
                   "max": 256.40799999999996,
@@ -16034,7 +15994,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 315,
                 "generated_tokens": 128,
-                "output_preview": "- Use a fixed prompt set (e.g., 512-token support ticket) and a fixed output cap (e.g., 256 tokens).\n- Discard the first run for warm-up; report median of 3–5 subsequent runs.\n- Quiesce the system: close background apps, disable power-saving modes, and note GPU/CPU residency.\n- Use the same backend mode (persistent server vs. one-off CLI) for both engines.\n- Report prefill throughput, decode throughput, total latency, and the combined prompt+decode score.\n\n<think>\nHere's a thinking process",
+                "output_preview": "- Use a fixed prompt set (e.g., 512-token support ticket) and a fixed output cap (e.g., 256 tokens).\n- Discard the first run for warm-up; report median of 3\u20135 subsequent runs.\n- Quiesce the system: close background apps, disable power-saving modes, and note GPU/CPU residency.\n- Use the same backend mode (persistent server vs. one-off CLI) for both engines.\n- Report prefill throughput, decode throughput, total latency, and the combined prompt+decode score.\n\n<think>\nHere's a thinking process",
                 "prefill_ms": {
                   "min": 9073.02375,
                   "max": 10052.83125,
@@ -17207,7 +17167,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 315,
                 "generated_tokens": 128,
-                "output_preview": "- Use a fixed prompt template with a known token count (e.g., 128 tokens).\n- Run each engine 5–10 times, discard the first warm-up run, and report medians.\n- Compare prefill throughput (tok/s), decode throughput (tok/s), total latency, and prompt+decode throughput.\n- Ensure both engines run in the same environment (same model file, same backend residency, no background load).\n- Fair comparison requires identical prompt length and output cap.\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   -",
+                "output_preview": "- Use a fixed prompt template with a known token count (e.g., 128 tokens).\n- Run each engine 5\u201310 times, discard the first warm-up run, and report medians.\n- Compare prefill throughput (tok/s), decode throughput (tok/s), total latency, and prompt+decode throughput.\n- Ensure both engines run in the same environment (same model file, same backend residency, no background load).\n- Fair comparison requires identical prompt length and output cap.\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   -",
                 "prefill_ms": {
                   "min": 3851.5837500000002,
                   "max": 4882.657499999999,
@@ -20782,7 +20742,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 315,
                 "generated_tokens": 128,
-                "output_preview": "- Use a single model file and backend (e.g., Metal for Apple Silicon).\n- Warm up the engine before measuring.\n- Run at least 5–10 repeated trials per configuration.\n- Report medians and 95% confidence intervals.\n- Include prompt tokens, generated tokens, prefill time, decode time, and combined throughput.\n- Avoid one-token prompts for throughput.\n- Control for background processes and profile overhead.\n\n<think>\n\n</think>\n\n### Summary of Measurement Mistake\n\nThe team's current measurements are unreliable due to a fundamental misunderstanding of **prefill vs. decode throughput** and",
+                "output_preview": "- Use a single model file and backend (e.g., Metal for Apple Silicon).\n- Warm up the engine before measuring.\n- Run at least 5\u201310 repeated trials per configuration.\n- Report medians and 95% confidence intervals.\n- Include prompt tokens, generated tokens, prefill time, decode time, and combined throughput.\n- Avoid one-token prompts for throughput.\n- Control for background processes and profile overhead.\n\n<think>\n\n</think>\n\n### Summary of Measurement Mistake\n\nThe team's current measurements are unreliable due to a fundamental misunderstanding of **prefill vs. decode throughput** and",
                 "prefill_ms": {
                   "min": 3480.67125,
                   "max": 3782.8350000000005,
