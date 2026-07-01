@@ -314,6 +314,8 @@ const Pipelines = struct {
     gemm_q8_0_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q8_0 GEMM (shared experts)
     gemm_q6k_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q6_K GEMM
     gemm_q5k_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q5_K GEMM
+    quantize_act_q8: CudaPipeline, // float→Q8_0 activation pre-quantizer
+    gemm_q4k_q8_dp4a: CudaPipeline, // Q4_K × Q8_0 DP4a GEMM (pre-quant path)
     // Effort 28: Q4_K token-BATCH matvec for small-B decode (idx B-2, B=2..8).
     // Reads each weight row once + amortizes the dequant over B tokens, dodging
     // the 64-tile padding waste of the batched GEMM at small B (opt-in).
@@ -843,6 +845,8 @@ pub const ForwardCuda = struct {
         pipes.gemm_q8_0_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tc_lowsmem");
         pipes.gemm_q6k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_lowsmem");
         pipes.gemm_q5k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tc_lowsmem");
+        pipes.quantize_act_q8 = try pipeline.createPipeline(ctx, src.ptr, "quantize_act_q8_0");
+        pipes.gemm_q4k_q8_dp4a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_q8_dp4a");
         // Effort 28: token-batch matvecs B=2..16 (idx B-2) for every common decode
         // quant — Q4_K covers most proj/gate/up; Q6_K/Q5_K/Q8_0 cover the residual
         // O-proj/FFN-down/SSM-out on mixed-quant layers. B=9..16 extends btok past

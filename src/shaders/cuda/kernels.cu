@@ -3681,6 +3681,111 @@ extern "C" __global__ void gemm_q5k_tc_lowsmem(const unsigned char* a, const flo
     }
 }
 
+// ---- quantize_act_q8_0 — pre-quantize float activations to Q8_0 format -----
+// Grid: (ceilDiv(K, 256), T). Block: 256 threads. Each block quantizes 256 elements
+// (8 Q8_0 blocks of 32 elements each). Output: Q8_0 format, 34 bytes per 32 elements.
+struct QuantActPush { unsigned K; };
+extern "C" __global__ void quantize_act_q8_0(const float* __restrict__ act,
+    unsigned char* __restrict__ out, QuantActPush pc) {
+    unsigned tok = blockIdx.y;
+    unsigned chunk_base = blockIdx.x * 256u;
+    unsigned tid = threadIdx.x;
+    unsigned k_idx = chunk_base + tid;
+    const float* in = act + (size_t)tok * pc.K;
+    unsigned char* out_base = out + (size_t)tok * (pc.K / 32u) * 34u + (chunk_base / 32u) * 34u;
+
+    // Read element (zero-pad beyond K)
+    float val = (k_idx < pc.K) ? in[k_idx] : 0.0f;
+
+    // Each warp handles 32 elements → 1 Q8_0 block
+    unsigned wblk = tid >> 5;  // 0..7 (8 warps, 8 blocks)
+    unsigned wlane = tid & 31u;
+
+    // Warp-reduce max_abs
+    float av = fabsf(val);
+    for (int o = 16; o > 0; o >>= 1)
+        av = fmaxf(av, __shfl_xor_sync(0xFFFFFFFFu, av, o));
+
+    float d = av / 127.0f;
+    float scale = 127.0f / fmaxf(av, 1e-5f);
+    int q = max(-127, min(127, __float2int_rn(val * scale)));
+
+    // Lane 0 writes the fp16 scale
+    if (wlane == 0 && k_idx < pc.K) {
+        unsigned short dh = __float2half_rn(d);
+        out_base[wblk * 34u]     = (unsigned char)(dh & 0xFF);
+        out_base[wblk * 34u + 1] = (unsigned char)(dh >> 8);
+    }
+    // All threads write their int8 value
+    out_base[wblk * 34u + 2u + wlane] = (unsigned char)q;
+}
+
+// ---- gemm_q4k_q8_dp4a — Q4_K weights × Q8_0 pre-quantized input, DP4a ------
+// Reads pre-quantized Q8_0 activations (from quantize_act_q8_0) instead of
+// quantizing float on-the-fly in the K-loop. Saves ~40% per-iteration cost.
+struct GemmQ8Push { unsigned M, K, T, a_offset, x_q8_stride; };
+extern "C" __global__ __launch_bounds__(256, 4) void gemm_q4k_q8_dp4a(
+    const unsigned* __restrict__ a_u32,
+    const unsigned char* __restrict__ x_q8,
+    float* __restrict__ Y, GemmQ8Push pc)
+{
+    const unsigned BM=64u, BT=1u;  // One token per block (matvec-style for now)
+    unsigned row = blockIdx.x * BM + (threadIdx.x >> 2);  // 64 rows, 4 threads per row
+    unsigned t = blockIdx.y;
+    unsigned grp = threadIdx.x & 3u;  // 0..3: which group of 4 within BK
+    if (row >= pc.M) return;
+
+    unsigned bpr = pc.K >> 8;
+    const unsigned char* xq8 = x_q8 + (size_t)t * pc.x_q8_stride;
+    float acc = 0.0f;
+
+    // Iterate over K in chunks of 32 (one Q8_0 block per chunk)
+    for (unsigned c = 0u; c < (pc.K >> 5); c++) {
+        unsigned sbk = c >> 3, sb8 = c & 7u;
+
+        // --- Weight Q4_K ---
+        unsigned blk = (pc.a_offset >> 2) + row * bpr * 36u + sbk * 36u;
+        unsigned dd = a_u32[blk];
+        float d_w = zinc_half_to_float((unsigned short)(dd & 0xFFFFu));
+        float dm_w = zinc_half_to_float((unsigned short)(dd >> 16));
+        const unsigned char* sc = (const unsigned char*)(a_u32 + blk + 1u);
+        unsigned char s, mn;
+        zinc_q4k_scale_min((int)sb8, sc, &s, &mn);
+
+        // Weight nibbles: 4 packed int8 (from 4-bit nibbles, 0-15)
+        const unsigned char* qs = (const unsigned char*)(a_u32 + blk + 4u);
+        unsigned q_off = (sb8 >> 1) * 32u + grp * 4u;
+        unsigned w32 = *((const unsigned*)(qs + q_off));
+        int w_pk = (sb8 & 1u) == 0u ? (int)(w32 & 0x0F0F0F0Fu)
+                                     : (int)((w32 >> 4) & 0x0F0F0F0Fu);
+
+        // --- Input Q8_0 (pre-quantized) ---
+        const unsigned char* ab = xq8 + (size_t)c * 34u;
+        float d_a = zinc_half_to_float((unsigned short)((unsigned)ab[0] | ((unsigned)ab[1] << 8)));
+        int a_pk = *((const int*)(ab + 2u + grp * 4u));
+
+        // DP4a: sum of nibble[i] * int8[i]
+        int dp = __dp4a(w_pk, a_pk, 0);
+
+        // Accumulate scaled result
+        acc += (float)dp * d_w * (float)s * d_a;
+    }
+
+    // Reduce 4 partial sums per row via shared memory
+    __shared__ float s_row[BM];
+    unsigned row_idx = threadIdx.x >> 2;
+    unsigned slot = threadIdx.x & 3u;
+    // Thread 0 of each group initializes
+    if (slot == 0) s_row[row_idx] = 0.0f;
+    __syncthreads();
+    atomicAdd(&s_row[row_idx], acc);
+    __syncthreads();
+
+    if (slot == 0 && t < pc.T) {
+        Y[(size_t)t * pc.M + row] = s_row[row_idx];
+    }
+}
+
 // ---- gemm_q4k_dp4a — DP4a int8 dot product Q4_K GEMM ------------------------
 // Key insight: Q4_K nibbles (0-15) are valid unsigned int8 values. Instead of
 // dequanting to float (20+ instructions/element), just extract nibbles and pack
