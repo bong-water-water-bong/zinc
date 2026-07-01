@@ -52,8 +52,8 @@ Latest checked-in benchmark artifact, same machine, same weights, same prompt:
 | Platform | Compared models | Decode vs llama.cpp | Prefill vs llama.cpp | Read this as |
 |----------|----------------:|--------------------:|---------------------:|--------------|
 | AMD RDNA4 / Vulkan | 5 | 117% avg, 5 model wins | 135% avg, 5 model wins | Current RDNA suite is ahead overall; long-context dense decode remains close |
-| Apple Silicon / Metal | 5 | 62% avg, 1 model win | 58% avg, 2 model wins | Mixed by model; tuning is still uneven |
-| Intel Arc / Vulkan | 1 | 84% | 152% | Experimental, not full-catalog coverage yet |
+| Apple Silicon / Metal | 5 | 87% avg, 1 model win | 54% avg, 1 model win | Mixed by model; Gemma 31B and Qwen 35B are closest |
+| Intel Arc / Vulkan | 5 | 102% avg, 3 model wins | 59% avg, 1 model win | Decode is viable; prefill still trails on most rows |
 
 Full per-model numbers are in [Benchmarks](#benchmarks) and on the public
 dashboard: [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks).
@@ -273,17 +273,17 @@ The tables below are pulled directly from the published benchmark data at [zolot
 
 | Model | ZINC prefill | llama.cpp prefill | ZINC % | ZINC decode | llama.cpp decode | ZINC % |
 |---|---:|---:|---:|---:|---:|---:|
-| Gemma 4 31B Q4_K_M | **132.60** | 84.47 | **157%** | 21.86 | 23.30 | 94% |
-| Qwen 3.6 35B A3B UD Q4_K_XL | 97.40 | 151.50 | 64% | **81.07** | 73.09 | **111%** |
-| Qwen 3.6 27B Dense Q4_K_M | 9.60 | 27.87 | 34% | 8.93 | 23.32 | 38% |
-| Qwen 3.5 9B Q4_K_M | 23.20 | 90.65 | 26% | 23.21 | 66.52 | 35% |
-| Gemma 4 26B-A4B MoE Q4_K_M | 34.00 | 365.45 | 9% | 30.01 | 88.44 | 34% |
+| Gemma 4 26B-A4B MoE Q4_K_M | 327.87 | 407.46 | 81% | 69.51 | 82.81 | 83% |
+| Gemma 4 31B Q4_K_M | **131.07** | 102.28 | **128%** | 22.68 | 22.70 | 100% |
+| Qwen 3.5 9B Q4_K_M | 36.53 | 332.65 | 11% | 29.42 | 57.87 | 52% |
+| Qwen 3.6 27B Dense Q4_K_M | 15.87 | 104.34 | 15% | 15.44 | 21.93 | 70% |
+| Qwen 3.6 35B A3B UD Q4_K_XL | 97.17 | 300.71 | 33% | **81.64** | 63.09 | **131%** |
 
 ### Where we stand vs llama.cpp
 
 - **Ahead of llama.cpp on RDNA4**: aggregate prefill and decode are ahead for all five published RDNA models in the latest suite. Qwen 3.6 35B-A3B decode is `1.54x`, Gemma 4 26B MoE decode is `1.11x`, and Gemma 4 31B dense decode is narrowly ahead at `1.01x`.
 - **Still close**: Gemma 4 31B long-context decode remains a tight row even though the model-level RDNA result is ahead overall.
-- **Metal is mixed by model**: Gemma 4 31B prefill and Qwen 3.6 35B decode are ahead of llama.cpp, while Qwen 3.5/3.6 dense and Gemma 4 26B still need backend-specific tuning.
+- **Metal is mixed by model**: Gemma 4 31B prefill and Qwen 3.6 35B decode are ahead of llama.cpp, Gemma 4 31B decode is essentially tied, and the smaller Qwen dense rows still need backend-specific tuning.
 
 For local benchmark commands, harnesses, and methodology, see:
 

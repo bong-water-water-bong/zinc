@@ -106,20 +106,22 @@ After the `*.pages.dev` deployment looks correct:
 
 If you use both domains, redirect `www` to the apex with a Cloudflare Redirect Rule. Do not rely on `_redirects` for that hostname-level redirect.
 
-## Optional manual deploy after the project exists
+## Manual deploy
 
-Once the Pages project already exists, you can also deploy a local build manually:
+The current Cloudflare Pages project is `zolotukhin-ai`. It is not connected to
+a Git provider, so production deploys are manual uploads from a local build:
 
 ```bash
 cd site
 npm run build
-npx wrangler pages deploy dist --project-name <your-pages-project-name>
+npx wrangler pages deploy dist --project-name zolotukhin-ai --branch main
 ```
 
-Use this only if you intentionally want a manual upload flow. Do not mix ad hoc manual deploys with Git-triggered production deploys unless you understand which one should be the source of truth.
+Use this flow after benchmark-data or docs changes that need to appear on
+`zolotukhin.ai`.
 
 ## Current deployment behavior
 
-- Production deploys should come from pushes to `main`
-- Pull requests get preview deployments from Cloudflare Pages
+- Production deploys are manual Wrangler Pages uploads to `zolotukhin-ai`
+- Pushes to `main` update the source of truth but do not deploy production by themselves
 - GitHub Actions in `.github/workflows/site-check.yml` only validate the build; they do not deploy the site
