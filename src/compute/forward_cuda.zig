@@ -315,6 +315,7 @@ const Pipelines = struct {
     gemm_q4k_dp4a: CudaPipeline, // DP4a int8 Q4_K GEMM (ZINC_PREFILL_DP4A=1)
     gemm_f16_tc: CudaPipeline, // fp16 pre-dequanted TC GEMM (ZINC_PREFILL_F16=1)
     gemm_q4k_tc_lowsmem: CudaPipeline, // 8KB-shared TC GEMM (3x occupancy)
+    gemm_q4k_mma_lowsmem: CudaPipeline, // inline-PTX fp16 MMA (bypasses broken wmma)
     gemm_q4k_gate_up_swiglu: CudaPipeline, // fused gate+up+SwiGLU TC GEMM
     gemm_q8_0_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q8_0 GEMM (shared experts)
     gemm_q6k_tc_lowsmem: CudaPipeline, // 16KB-shared TC Q6_K GEMM
@@ -848,6 +849,7 @@ pub const ForwardCuda = struct {
         pipes.gemm_q4k_dp4a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_dp4a");
         pipes.gemm_f16_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_f16_tc");
         pipes.gemm_q4k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_lowsmem");
+        pipes.gemm_q4k_mma_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_mma_lowsmem");
         pipes.gemm_q4k_gate_up_swiglu = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_gate_up_swiglu_lowsmem");
         pipes.gemm_q8_0_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tc_lowsmem");
         pipes.gemm_q6k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_lowsmem");
@@ -2056,9 +2058,10 @@ pub const ForwardCuda = struct {
         // ZINC_PREFILL_TC=0: opt out of Q4_K tensor-core (default on).
         // ZINC_PREFILL_Q8_TC=0: opt out of the Q8_0 tensor-core shared-expert path.
         const use_f16 = idx == 0 and std.posix.getenv("ZINC_PREFILL_F16") != null;
-        const use_dp4a = !use_f16 and idx == 0 and std.posix.getenv("ZINC_PREFILL_DP4A") != null;
-        const use_q8 = !use_f16 and !use_dp4a and idx == 0 and std.posix.getenv("ZINC_PREFILL_Q8") != null;
-        const use_lowsmem = !use_f16 and !use_dp4a and !use_q8 and idx == 0 and (std.posix.getenv("ZINC_PREFILL_LOWSMEM") == null or
+        const use_mma = !use_f16 and idx == 0 and std.posix.getenv("ZINC_PREFILL_MMA") != null;
+        const use_dp4a = !use_f16 and !use_mma and idx == 0 and std.posix.getenv("ZINC_PREFILL_DP4A") != null;
+        const use_q8 = !use_f16 and !use_mma and !use_dp4a and idx == 0 and std.posix.getenv("ZINC_PREFILL_Q8") != null;
+        const use_lowsmem = !use_f16 and !use_mma and !use_dp4a and !use_q8 and idx == 0 and (std.posix.getenv("ZINC_PREFILL_LOWSMEM") == null or
             !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_LOWSMEM").?, "0"));
         const use_tc = !use_f16 and !use_dp4a and !use_lowsmem and idx == 0 and (std.posix.getenv("ZINC_PREFILL_TC") == null or
             !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_TC").?, "0"));
@@ -2092,7 +2095,9 @@ pub const ForwardCuda = struct {
         }
         if (T >= 32 and M >= 64 and idx < 4) {
             const push = GemmPush{ .M = M, .K = K, .T = T };
-            if (use_q8) {
+            if (use_mma) {
+                cmd.dispatch(&self.pipes.gemm_q4k_mma_lowsmem, .{ ceilDiv(M, 64), ceilDiv(T, 64), 1 }, .{ 256, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(GemmPush), 0);
+            } else if (use_q8) {
                 // Pre-quant tiled DP4a: quantize input to Q8_0, then tiled DP4a GEMM
                 if (self.batch) |b| {
                     const qp = QuantActPush{ .K = K };

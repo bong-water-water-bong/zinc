@@ -5125,6 +5125,149 @@ extern "C" __global__ void gemm_q4k_tc_lowsmem(const unsigned* a_u32, const floa
     }
 }
 
+// ---- Inline PTX mma.sync.m16n8k16 helpers (bypass broken wmma fp32 path) -----
+// NVRTC's wmma::mma_sync generates .f32.f32 (fp32) MMA instead of .f32.f16
+// (fp16). These helpers use inline PTX to force the fp16 MMA instruction.
+// m16n8k16 computes D[16,8] = A[16,16] * B[16,8]^T + C[16,8] (fp16×fp16→fp32).
+// Each warp (32 threads) provides 4 u32 (A), 2 u32 (B), 4 f32 (C/D) registers.
+__device__ __forceinline__ void mma_m16n8k16(
+    float& d0, float& d1, float& d2, float& d3,
+    unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+    unsigned b0, unsigned b1,
+    float c0, float c1, float c2, float c3) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+          "r"(b0), "r"(b1),
+          "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+}
+
+// Load A[16,16] fp16 row-major fragment from shared memory into 4 packed u32.
+// stride is in fp16 elements. Uses the mma.sync.m16n8k16.row thread mapping.
+__device__ __forceinline__ void load_a_frag(
+    unsigned& a0, unsigned& a1, unsigned& a2, unsigned& a3,
+    const half* smem, unsigned base, unsigned stride) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned r0 = lane >> 2;           // 0-7
+    const unsigned r1 = r0 + 8u;             // 8-15
+    const unsigned c0 = (lane & 3u) << 1;    // 0,2,4,6
+    const unsigned c1 = c0 + 8u;             // 8,10,12,14
+    // Each read: 2 adjacent fp16 = 4 bytes = 1 u32 (4-byte aligned since c0,c1 even)
+    const unsigned* p = (const unsigned*)(smem + base);
+    a0 = p[(r0 * stride + c0) >> 1];
+    a1 = p[(r0 * stride + c1) >> 1];
+    a2 = p[(r1 * stride + c0) >> 1];
+    a3 = p[(r1 * stride + c1) >> 1];
+}
+
+// Load B[16,8] fp16 col-major fragment into 2 packed u32.
+// smem layout: As[k * stride + t]. We read B[k][n] = As[(ks*16+k)*stride + ft*16+n].
+// For .col layout: thread t holds B[(t%4)*2 + {0,1,8,9}][t/4].
+__device__ __forceinline__ void load_b_frag(
+    unsigned& b0, unsigned& b1,
+    const half* smem, unsigned base, unsigned stride) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned n = lane >> 2;            // column 0-7
+    const unsigned k0 = (lane & 3u) << 1;    // row 0,2,4,6
+    const unsigned* p = (const unsigned*)(smem + base);
+    // B[k][n], B[k+1][n] are NOT contiguous (stride apart) → load individually
+    unsigned short h0 = ((const unsigned short*)p)[k0 * stride + n];
+    unsigned short h1 = ((const unsigned short*)p)[(k0+1u) * stride + n];
+    b0 = (unsigned)h0 | ((unsigned)h1 << 16);
+    unsigned short h2 = ((const unsigned short*)p)[(k0+8u) * stride + n];
+    unsigned short h3 = ((const unsigned short*)p)[(k0+9u) * stride + n];
+    b1 = (unsigned)h2 | ((unsigned)h3 << 16);
+}
+
+// ---- gemm_q4k_mma_lowsmem — inline-PTX fp16 MMA Q4_K GEMM (fixes wmma bug) ----
+// Same structure as gemm_q4k_tc_lowsmem but uses mma.sync.m16n8k16.f32.f16.f16.f32
+// via inline PTX instead of wmma::mma_sync (which generates fp32 MMA on NVRTC).
+extern "C" __global__ void gemm_q4k_mma_lowsmem(const unsigned* a_u32, const float* A, float* Y, GemmPush pc) {
+    const unsigned BM=64u, BT=64u, BK=32u;
+    __shared__ float smem[BT*BM];
+    half* Ws = (half*)smem;
+    half* As = ((half*)smem) + (BM*BK);
+    unsigned m0=blockIdx.x*BM, t0=blockIdx.y*BT;
+    unsigned bpr=pc.K>>8, nchunk=pc.K>>5;
+    unsigned tid=threadIdx.x;
+    unsigned warp=tid>>5, fm=warp>>2, ft=warp&3u;
+    unsigned a0_base=(pc.a_offset>>2);
+    const float* Abase=A+(pc.x_offset>>2);
+    const unsigned lane = tid & 31u;
+
+    // Accumulators: 4 floats per m16n8 output, 2 per warp for 16x16 output
+    float cL0=0,cL1=0,cL2=0,cL3=0; // left half (cols ft*16..ft*16+7)
+    float cR0=0,cR1=0,cR2=0,cR3=0; // right half (cols ft*16+8..ft*16+15)
+
+    for (unsigned c=0u;c<nchunk;c++){
+        unsigned sbk=c>>3, sb8=c&7u;
+        // Warp-broadcast dequant (same as lowsmem)
+        unsigned wid=tid>>5, wl=tid&31u;
+        #pragma unroll
+        for(int u=0;u<8;u++){
+            unsigned r=wid+(unsigned)u*8u, l=wl, row=m0+r;
+            float wv=0.0f;
+            if(row<pc.M){
+                unsigned blk=a0_base+row*bpr*36u+sbk*36u;
+                float d_sc,dm_mn;
+                if(l==0){
+                    unsigned dd=a_u32[blk];
+                    float d=zinc_half_to_float((unsigned short)(dd&0xFFFFu));
+                    float dmin=zinc_half_to_float((unsigned short)(dd>>16));
+                    const unsigned char* sc=(const unsigned char*)(a_u32+blk+1u);
+                    unsigned char s,mn; zinc_q4k_scale_min((int)sb8,sc,&s,&mn);
+                    d_sc=d*(float)s; dm_mn=dmin*(float)mn;
+                }
+                d_sc=__shfl_sync(0xFFFFFFFFu,d_sc,0);
+                dm_mn=__shfl_sync(0xFFFFFFFFu,dm_mn,0);
+                const unsigned char* qs=(const unsigned char*)(a_u32+blk+4u);
+                unsigned char qb=qs[(sb8>>1)*32u+l];
+                unsigned nib=(sb8&1u)==0u?(qb&0xFu):(unsigned)(qb>>4);
+                wv=d_sc*(float)nib-dm_mn;
+            }
+            Ws[r*BK+l]=__float2half(wv);
+        }
+        #pragma unroll
+        for(int u=0;u<8;u++){
+            unsigned idx=tid+(unsigned)u*256u;
+            unsigned t=idx>>5,l=idx&31u,tok=t0+t;
+            As[l*BT+t]=(tok<pc.T)?__float2half(Abase[(size_t)tok*pc.K+c*32u+l]):(half)0;
+        }
+        __syncthreads();
+        // MMA: 2 K-sub-blocks per BK=32 chunk
+        #pragma unroll
+        for(unsigned ks=0;ks<2;ks++){
+            unsigned a0r,a1r,a2r,a3r;
+            load_a_frag(a0r,a1r,a2r,a3r,Ws,(fm*16u)*BK+ks*16u,BK);
+            unsigned bL0,bL1,bR0,bR1;
+            load_b_frag(bL0,bL1,As,(ks*16u)*BT+ft*16u,BT);
+            load_b_frag(bR0,bR1,As,(ks*16u)*BT+ft*16u+8u,BT);
+            mma_m16n8k16(cL0,cL1,cL2,cL3,a0r,a1r,a2r,a3r,bL0,bL1,cL0,cL1,cL2,cL3);
+            mma_m16n8k16(cR0,cR1,cR2,cR3,a0r,a1r,a2r,a3r,bR0,bR1,cR0,cR1,cR2,cR3);
+        }
+        __syncthreads();
+    }
+    // Store accumulator: each thread holds D[row][col], D[row][col+1], D[row+8][col], D[row+8][col+1]
+    // where row=lane/4, col=2*(lane%4)
+    {
+        unsigned row0 = m0 + fm*16u + (lane>>2);
+        unsigned row1 = row0 + 8u;
+        unsigned col0 = t0 + ft*16u + (lane&3u)*2u;
+        unsigned col1 = col0 + 1u;
+        if(row0<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row0]=cL0;
+        if(row0<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row0]=cL1;
+        if(row1<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row1]=cL2;
+        if(row1<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row1]=cL3;
+        col0 += 8u; col1 += 8u;
+        if(row0<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row0]=cR0;
+        if(row0<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row0]=cR1;
+        if(row1<pc.M&&col0<pc.T) Y[(pc.y_offset>>2)+(size_t)col0*pc.M+row1]=cR2;
+        if(row1<pc.M&&col1<pc.T) Y[(pc.y_offset>>2)+(size_t)col1*pc.M+row1]=cR3;
+    }
+}
+
 // ---- gemm_q4k_gate_up_swiglu_lowsmem — fused gate+up+SwiGLU TC Q4_K GEMM ------
 // Reads the activation input ONCE, multiplies by both gate and up Q4_K weight
 // matrices, applies SwiGLU (silu(gate)*up) inline. Eliminates 2 intermediate
