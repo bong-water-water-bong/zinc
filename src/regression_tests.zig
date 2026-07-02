@@ -578,6 +578,17 @@ test "Vulkan Qwen DP4a ragged BN64 shaders guard inactive columns" {
     try expectContains(q6, "if (SPEC_RAGGED_N == 0u || col_g < N)");
 }
 
+test "Vulkan Qwen 9B SSM Q5 projections keep K4096 BK2 selector guarded" {
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pipeline_mul_mm_q5k_full_dp4a_k4096_bk2");
+    try expectContains(dmmv, "const spec_k_4096_bk2 = [_]pipeline_mod.SpecConst{");
+    try expectContainsNear(dmmv, "const spec_k_4096_bk2", ".{ .id = 0, .value = 4096 },", 180);
+    try expectContainsNear(dmmv, "const spec_k_4096_bk2", ".{ .id = 3, .value = 2 },", 180);
+    try expectContainsNear(dmmv, "const pipeline_mul_mm_q5k_full_dp4a_k4096_bk2", "&spec_k_4096_bk2", 360);
+    try expectContains(dmmv, "ZINC_QWEN35_9B_SSM_Q5_BK2");
+    try expectContains(dmmv, "const use_k4096_bk2 = qwen35_ssm_q5_bk2_enabled and K == 4096");
+}
+
 test "Vulkan full-DP4a prefill shaders expose guarded two-slice K staging" {
     const q4 = @embedFile("shaders/mul_mm_q4k_full_dp4a.comp");
     const q5 = @embedFile("shaders/mul_mm_q5k_full_dp4a.comp");

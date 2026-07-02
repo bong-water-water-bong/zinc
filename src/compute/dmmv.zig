@@ -766,6 +766,8 @@ pub const DmmvDispatch = struct {
     /// projection. Same push/binding layout as the Q4_K variant — the only
     /// difference is the 5-bit weight unpack (qs nibble | qh hi bit).
     pipeline_mul_mm_q5k_full_dp4a: ?Pipeline,
+    /// K=4096, two-slice sibling for Qwen3.5-9B SSM Q5_K prefill projections.
+    pipeline_mul_mm_q5k_full_dp4a_k4096_bk2: ?Pipeline,
     /// K=6144, BN=40 sibling for 33-40 token dense-hybrid 27B SSM out prefill.
     pipeline_mul_mm_q5k_full_dp4a_k6144_n40: ?Pipeline,
     /// Q8_1-style activation quantizer (packed int8 + per-block scale,dsum)
@@ -1447,6 +1449,10 @@ pub const DmmvDispatch = struct {
             .{ .id = 0, .value = 4096 },
             .{ .id = 1, .value = 64 },
             .{ .id = 3, .value = 1 },
+        };
+        const spec_k_4096_bk2 = [_]pipeline_mod.SpecConst{
+            .{ .id = 0, .value = 4096 },
+            .{ .id = 3, .value = 2 },
         };
         const spec_k_5120 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 5120 }};
         const spec_k_5120_n64 = [_]pipeline_mod.SpecConst{
@@ -2207,6 +2213,13 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q5k_full_dp4a != null) {
             log.info("mul_mm_q5k_full_dp4a pipeline loaded (int8 DP4a Qwen3.6-27B SSM out prefill)", .{});
         }
+        const pipeline_mul_mm_q5k_full_dp4a_k4096_bk2 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q5k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_4096_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q5k_full_dp4a K=4096 BK2 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q5k_full_dp4a_k4096_bk2 != null) {
+            log.info("mul_mm_q5k_full_dp4a K=4096 BK2 pipeline loaded (Qwen3.5-9B SSM Q5_K prefill)", .{});
+        }
         const pipeline_mul_mm_q5k_full_dp4a_k6144_n40 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q5k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_6144_n40_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q5k_full_dp4a K=6144 BN=40 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
@@ -2375,6 +2388,7 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q4k_full_dp4a_k21504_n64 = pipeline_mul_mm_q4k_full_dp4a_k21504_n64,
             .pipeline_mul_mm_q4k_full_dp4a_k21504_n8 = pipeline_mul_mm_q4k_full_dp4a_k21504_n8,
             .pipeline_mul_mm_q5k_full_dp4a = pipeline_mul_mm_q5k_full_dp4a,
+            .pipeline_mul_mm_q5k_full_dp4a_k4096_bk2 = pipeline_mul_mm_q5k_full_dp4a_k4096_bk2,
             .pipeline_mul_mm_q5k_full_dp4a_k6144_n40 = pipeline_mul_mm_q5k_full_dp4a_k6144_n40,
             .pipeline_quantize_act_q8_1 = pipeline_quantize_act_q8_1,
             .pipeline_mul_mm_q5k = pipeline_mul_mm_q5k,
@@ -5166,8 +5180,13 @@ pub const DmmvDispatch = struct {
         a_offset: u32,
         d_offset: u32,
     ) !void {
+        const qwen35_ssm_q5_bk2_enabled = if (std.posix.getenv("ZINC_QWEN35_9B_SSM_Q5_BK2")) |raw| !std.mem.eql(u8, raw, "0") else true;
+        const use_k4096_bk2 = qwen35_ssm_q5_bk2_enabled and K == 4096 and self.pipeline_mul_mm_q5k_full_dp4a_k4096_bk2 != null;
         const n_tile: u32 = if (K == 6144 and N == 40 and self.pipeline_mul_mm_q5k_full_dp4a_k6144_n40 != null) 40 else 32;
         const pip = blk: {
+            if (use_k4096_bk2) {
+                if (self.pipeline_mul_mm_q5k_full_dp4a_k4096_bk2) |*p| break :blk p;
+            }
             if (K == 6144 and n_tile == 40) {
                 if (self.pipeline_mul_mm_q5k_full_dp4a_k6144_n40) |*p| break :blk p;
             }
@@ -5634,6 +5653,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q4k_full_dp4a_k21504_n64) |*p| p.deinit();
         if (self.pipeline_mul_mm_q4k_full_dp4a_k21504_n8) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k_full_dp4a) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q5k_full_dp4a_k4096_bk2) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k_full_dp4a_k6144_n40) |*p| p.deinit();
         if (self.pipeline_quantize_act_q8_1) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
