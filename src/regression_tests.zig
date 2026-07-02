@@ -216,11 +216,18 @@ test "Vulkan Qwen 9B long prefill keeps K4096 and K12288 ragged BN64 paths" {
     try expectContainsNear(src, "const spec_k_4096_n64_gateup_ragged = [_]pipeline_mod.SpecConst{", ".{ .id = 3, .value = 1 },", 260);
     try expectContains(src, "const spec_k_12288_n64_ragged = [_]pipeline_mod.SpecConst{");
     try expectContainsNear(src, "const spec_k_12288_n64_ragged = [_]pipeline_mod.SpecConst{", ".{ .id = 2, .value = 1 },", 260);
+    try expectContains(src, "const spec_k_12288_n64_bk2_ragged = [_]pipeline_mod.SpecConst{");
+    try expectContainsNear(src, "const spec_k_12288_n64_bk2_ragged = [_]pipeline_mod.SpecConst{", ".{ .id = 2, .value = 1 },", 320);
+    try expectContainsNear(src, "const spec_k_12288_n64_bk2_ragged = [_]pipeline_mod.SpecConst{", ".{ .id = 3, .value = 2 },", 360);
     try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096_n64_ragged");
     try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096_n64_ragged");
     try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k12288_n64_ragged");
+    try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k12288_n64_bk2_ragged");
     try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k12288_n64_ragged");
+    try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k12288_n64_bk2_ragged");
+    try expectContains(src, "ZINC_QWEN35_9B_K12288_BK2");
     try expectContains(src, "const use_k4096_ragged_n64 = K == 4096 and N > 64 and (N & 63) != 0");
+    try expectContains(src, "const use_k12288_ragged_n64_bk2 = k12288_bk2_enabled and !accumulate and K == 12288 and N > 64 and (N & 63) != 0");
     try expectContains(src, "const use_k12288_ragged_n64 = !accumulate and K == 12288 and N > 64 and (N & 63) != 0");
     try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8(", "use_k4096_ragged_n64", 2400);
     try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8_1(", "use_k4096_ragged_n64", 2400);
@@ -360,7 +367,7 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_ragged_n64", 3000);
     try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_exact_n64_bk2", 2400);
     try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_exact_n64_acc", 2400);
-    try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_ragged_n64", 2400);
+    try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_ragged_n64", 3000);
 
     const forward = @embedFile("compute/forward.zig");
     try expectContains(forward, "fn qwenDenseDownDp4aAccEligible(");
