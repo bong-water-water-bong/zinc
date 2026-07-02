@@ -627,6 +627,37 @@ test "Vulkan Intel Qwen MoE enables Q8 wide LM-head by default" {
     try expectContains(shader, "for (uint sg = 1u; sg < gl_NumSubgroups; sg++)");
 }
 
+test "Vulkan Q8 wide LM-head row-count variants stay opt-in and wired" {
+    const forward = @embedFile("compute/forward.zig");
+    try expectContains(forward, "ZINC_Q8_WIDE_LM_HEAD_ROWS");
+    try expectContains(forward, "q8_wide_lm_rows = 8;");
+    try expectContains(forward, "q8_wide_lm_rows = 4;");
+    try expectContains(forward, ".q8_wide_lm_head_rows = q8_wide_lm_rows");
+    try expectContainsNear(forward, "if (self.q8_wide_lm_head_rows == 8", "(M + 7) / 8", 2000);
+    try expectContainsNear(forward, "if (self.q8_wide_lm_head_rows == 4", "(M + 3) / 4", 2000);
+
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "dmmv_q8_0_wide4.spv");
+    try expectContains(dmmv, "dmmv_q8_0_wide8.spv");
+    try expectContains(dmmv, "pipeline_q8_0_wide4");
+    try expectContains(dmmv, "pipeline_q8_0_wide8");
+
+    const shaders = [_][]const u8{
+        @embedFile("shaders/dmmv_q8_0_wide4.comp"),
+        @embedFile("shaders/dmmv_q8_0_wide8.comp"),
+    };
+    for (shaders) |shader| {
+        try expectContains(shader, "GL_KHR_shader_subgroup_basic");
+        try expectContains(shader, "gl_NumSubgroups > 1u");
+        try expectContains(shader, "subgroupElect()");
+        try expectContains(shader, "for (uint sg = 1u; sg < gl_NumSubgroups; sg++)");
+    }
+    try expectContains(shaders[0], "gl_WorkGroupID.x * 4u");
+    try expectContains(shaders[0], "s_sum3[gl_SubgroupID]");
+    try expectContains(shaders[1], "gl_WorkGroupID.x * 8u");
+    try expectContains(shaders[1], "s_sum7[gl_SubgroupID]");
+}
+
 test "Vulkan batched kpar pipelines use non-wave64 options on Intel" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContainsNear(src, "const q4k_batch_kpar_path", "effective_wave64_options", 700);

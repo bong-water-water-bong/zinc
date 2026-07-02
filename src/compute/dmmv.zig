@@ -348,6 +348,10 @@ pub const DmmvDispatch = struct {
     /// Q8_0 wide-vocab LM-head variant. Same two-row workgroup shape and
     /// binding layout as pipeline_q8_0, but shares x-vector loads across rows.
     pipeline_q8_0_wide: ?Pipeline,
+    /// Q8_0 wide-vocab LM-head variant with four rows per workgroup.
+    pipeline_q8_0_wide4: ?Pipeline,
+    /// Q8_0 wide-vocab LM-head variant with eight rows per workgroup.
+    pipeline_q8_0_wide8: ?Pipeline,
     /// Q8_0 x Q8_1 integer-dot DMMV. Binding 1 is a quantized Q8_1 activation
     /// buffer produced by pipeline_quantize_q8_1.
     pipeline_q8_0_q8_1: ?Pipeline,
@@ -885,6 +889,16 @@ pub const DmmvDispatch = struct {
         const q8_wide_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_wide.spv", .{shader_dir}) catch unreachable;
         const pipeline_q8_0_wide = pipeline_mod.createFromSpirvWithOptions(instance, q8_wide_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q8_0 wide shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_wide4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_wide4.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_wide4 = pipeline_mod.createFromSpirvWithOptions(instance, q8_wide4_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 wide4 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_wide8_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_wide8.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_wide8 = pipeline_mod.createFromSpirvWithOptions(instance, q8_wide8_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 wide8 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
         const q8_q81_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_q8_1.spv", .{shader_dir}) catch unreachable;
@@ -2209,6 +2223,8 @@ pub const DmmvDispatch = struct {
             .pipeline_q8_0_spec64 = pipeline_q8_0_spec64,
             .pipeline_q8_0_spec128 = pipeline_q8_0_spec128,
             .pipeline_q8_0_wide = pipeline_q8_0_wide,
+            .pipeline_q8_0_wide4 = pipeline_q8_0_wide4,
+            .pipeline_q8_0_wide8 = pipeline_q8_0_wide8,
             .pipeline_q8_0_q8_1 = pipeline_q8_0_q8_1,
             .pipeline_q4k_q8_1 = pipeline_q4k_q8_1,
             .pipeline_q8_0_fused_pair = pipeline_q8_0_fused_pair,
@@ -5463,6 +5479,8 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q8_0_spec64) |*p| p.deinit();
         if (self.pipeline_q8_0_spec128) |*p| p.deinit();
         if (self.pipeline_q8_0_wide) |*p| p.deinit();
+        if (self.pipeline_q8_0_wide4) |*p| p.deinit();
+        if (self.pipeline_q8_0_wide8) |*p| p.deinit();
         if (self.pipeline_q8_0_q8_1) |*p| p.deinit();
         if (self.pipeline_q4k_q8_1) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_pair) |*p| p.deinit();
