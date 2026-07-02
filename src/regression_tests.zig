@@ -174,8 +174,12 @@ test "Vulkan Intel Qwen MoE defaults fused SSM QKV plus Z projection" {
     const marker = "const fused_ssm_qkv_z_default_on =";
     try expectContainsNear(src, marker, "qwen36_like_f32_ssm", 160);
     try expectContainsNear(src, marker, "isIntelGpuVendor(gpu_config.vendor)", 160);
-    try expectContainsNear(src, marker, "ZINC_FUSED_SSM_QKV_Z=0", 900);
+    try expectContainsNear(src, marker, "ZINC_FUSED_SSM_QKV_Z=0", 1500);
     try expectContainsNear(src, marker, "pipeline_q8_0_fused_pair != null", 500);
+    try expectContains(src, "ZINC_QWEN36_Q8_WIDE4_SSM_OUT");
+    try expectContains(src, "use_qwen36_q8_wide4_ssm_out");
+    try expectContains(src, "qwen36_q8_wide4_ssm_out_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor)");
+    try expectContains(src, "K == self.model.config.ssm_d_inner");
 }
 
 test "Vulkan Qwen dense prefill padding covers short dense-hybrid DP4a shapes" {

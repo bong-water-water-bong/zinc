@@ -1331,6 +1331,9 @@ pub const InferenceEngine = struct {
     // Experimental Intel Gemma path: route medium/large Q8_0 projections
     // through the existing four-row DMMV shader.
     use_gemma_q8_wide4_dmmv: bool = false,
+    // Experimental Intel Qwen A3B path: route SSM-out Q8_0 projections
+    // through the existing four-row DMMV shader.
+    use_qwen36_q8_wide4_ssm_out: bool = false,
     // Opt-in via ZINC_Q8_BATCH_LM_HEAD=1. Routes very tall Q8_0 LM-head
     // matrices through a one-row-per-thread shader to reduce workgroup count.
     use_q8_batch_lm_head: bool = false,
@@ -2924,6 +2927,28 @@ pub const InferenceEngine = struct {
             log.info("Gemma Q8_0 four-row DMMV path DISABLED via ZINC_GEMMA_Q8_WIDE4_DMMV=0", .{});
         }
 
+        const qwen36_q8_wide4_ssm_out_env = std.posix.getenv("ZINC_QWEN36_Q8_WIDE4_SSM_OUT");
+        const qwen36_q8_wide4_ssm_out_explicitly_off = qwen36_q8_wide4_ssm_out_env != null and
+            std.mem.eql(u8, qwen36_q8_wide4_ssm_out_env.?, "0");
+        const qwen36_q8_wide4_ssm_out_forced_on = qwen36_q8_wide4_ssm_out_env != null and
+            !qwen36_q8_wide4_ssm_out_explicitly_off;
+        const qwen36_q8_wide4_ssm_out_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
+        const qwen36_q8_wide4_ssm_out_requested = !qwen36_q8_wide4_ssm_out_explicitly_off and
+            (qwen36_q8_wide4_ssm_out_forced_on or qwen36_q8_wide4_ssm_out_default_on);
+        const qwen36_q8_wide4_ssm_out_enabled = qwen36_q8_wide4_ssm_out_requested and
+            dmmv.pipeline_q8_0_wide4 != null;
+        if (qwen36_q8_wide4_ssm_out_enabled) {
+            if (qwen36_q8_wide4_ssm_out_forced_on) {
+                log.info("Qwen 3.6 Q8_0 SSM-out wide4 path ENABLED via ZINC_QWEN36_Q8_WIDE4_SSM_OUT", .{});
+            } else {
+                log.info("Qwen 3.6 Q8_0 SSM-out wide4 path ENABLED by default on Intel (set ZINC_QWEN36_Q8_WIDE4_SSM_OUT=0 to disable)", .{});
+            }
+        } else if (qwen36_q8_wide4_ssm_out_explicitly_off) {
+            log.info("Qwen 3.6 Q8_0 SSM-out wide4 path DISABLED via ZINC_QWEN36_Q8_WIDE4_SSM_OUT=0", .{});
+        } else if (qwen36_q8_wide4_ssm_out_requested) {
+            log.info("Qwen 3.6 Q8_0 SSM-out wide4 requested but the pipeline is missing; using generic Q8_0 DMMV", .{});
+        }
+
         const q8_batch_lm_env = std.posix.getenv("ZINC_Q8_BATCH_LM_HEAD");
         const q8_batch_lm_flag = q8_batch_lm_env != null and std.mem.eql(u8, q8_batch_lm_env.?, "1");
         const q8_batch_lm_enabled = q8_batch_lm_flag and dmmv.pipeline_q8_0_batch != null;
@@ -3478,6 +3503,7 @@ pub const InferenceEngine = struct {
             .q8_wide_lm_head_rows = q8_wide_lm_rows,
             .gemma_q8_geglu_rows = gemma_q8_geglu_rows,
             .use_gemma_q8_wide4_dmmv = gemma_q8_wide4_enabled,
+            .use_qwen36_q8_wide4_ssm_out = qwen36_q8_wide4_ssm_out_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
             .use_q4k_lm_head_dp4a = q4k_lm_head_dp4a_enabled,
@@ -15618,6 +15644,32 @@ pub const InferenceEngine = struct {
             }
 
             if (self.use_gemma_q8_wide4_dmmv and qt == .q8_0 and M >= 1024 and K == self.model.config.hidden_dim and acc_mode == 0 and self.dmmv.pipeline_q8_0_wide4 != null) {
+                const wide4_pip = &self.dmmv.pipeline_q8_0_wide4.?;
+                const push_wide4 = DmmvPushConstants{
+                    .M = M,
+                    .K = K,
+                    .a_offset = a_offset,
+                    .x_offset = x_offset,
+                    .y_offset = y_offset,
+                    .acc_mode = acc_mode,
+                };
+                self.pushDispatch3(
+                    wide4_pip,
+                    std.mem.asBytes(&push_wide4),
+                    tensor.gpu_buffer.handle,
+                    tensor.gpu_buffer.size,
+                    input_buf.handle,
+                    input_size,
+                    output_buf.handle,
+                    output_buf.size,
+                    (M + 3) / 4,
+                    1,
+                    1,
+                );
+                return;
+            }
+
+            if (self.use_qwen36_q8_wide4_ssm_out and qt == .q8_0 and M == self.model.config.hidden_dim and K == self.model.config.ssm_d_inner and acc_mode == 0 and self.dmmv.pipeline_q8_0_wide4 != null) {
                 const wide4_pip = &self.dmmv.pipeline_q8_0_wide4.?;
                 const push_wide4 = DmmvPushConstants{
                     .M = M,
