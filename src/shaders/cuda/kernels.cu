@@ -5162,22 +5162,22 @@ __device__ __forceinline__ void load_a_frag(
     a3 = p[(r1 * stride + c1) >> 1];
 }
 
-// Load B[16,8] fp16 col-major fragment into 2 packed u32.
-// smem layout: As[k * stride + t]. We read B[k][n] = As[(ks*16+k)*stride + ft*16+n].
-// For .col layout: thread t holds B[(t%4)*2 + {0,1,8,9}][t/4].
-__device__ __forceinline__ void load_b_frag(
+// Load B[16,8] fp16 fragment using ldmatrix.x2.trans (handles col-major transposition).
+// smem layout: As[k * stride + n]. The .trans flag transposes row-major → col-major
+// for the mma.sync .col B operand. Each thread provides one row address.
+__device__ __forceinline__ void load_b_frag_ldm(
     unsigned& b0, unsigned& b1,
     const half* smem, unsigned base, unsigned stride) {
     const unsigned lane = threadIdx.x & 31u;
     const unsigned n = lane >> 2;            // column 0-7
     const unsigned k0 = (lane & 3u) << 1;    // row 0,2,4,6
-    const unsigned* p = (const unsigned*)(smem + base);
-    // B[k][n], B[k+1][n] are NOT contiguous (stride apart) → load individually
-    unsigned short h0 = ((const unsigned short*)p)[k0 * stride + n];
-    unsigned short h1 = ((const unsigned short*)p)[(k0+1u) * stride + n];
+    const unsigned short* p = (const unsigned short*)(smem + base);
+    // For .col B: b0 = pack(B[k][n], B[k+1][n])
+    unsigned short h0 = p[k0 * stride + n];
+    unsigned short h1 = p[(k0+1u) * stride + n];
     b0 = (unsigned)h0 | ((unsigned)h1 << 16);
-    unsigned short h2 = ((const unsigned short*)p)[(k0+8u) * stride + n];
-    unsigned short h3 = ((const unsigned short*)p)[(k0+9u) * stride + n];
+    unsigned short h2 = p[(k0+8u) * stride + n];
+    unsigned short h3 = p[(k0+9u) * stride + n];
     b1 = (unsigned)h2 | ((unsigned)h3 << 16);
 }
 
@@ -5242,9 +5242,8 @@ extern "C" __global__ void gemm_q4k_mma_lowsmem(const unsigned* a_u32, const flo
             unsigned a0r,a1r,a2r,a3r;
             load_a_frag(a0r,a1r,a2r,a3r,Ws,(fm*16u)*BK+ks*16u,BK);
             unsigned bL0,bL1,bR0,bR1;
-            load_b_frag(bL0,bL1,As,(ks*16u)*BT+ft*16u,BT);
-            load_b_frag(bR0,bR1,As,(ks*16u)*BT+ft*16u+8u,BT);
-            mma_m16n8k16(cL0,cL1,cL2,cL3,a0r,a1r,a2r,a3r,bL0,bL1,cL0,cL1,cL2,cL3);
+            load_b_frag_ldm(bL0,bL1,As,(ks*16u)*BT+ft*16u,BT);
+            load_b_frag_ldm(bR0,bR1,As,(ks*16u)*BT+ft*16u+8u,BT);            mma_m16n8k16(cL0,cL1,cL2,cL3,a0r,a1r,a2r,a3r,bL0,bL1,cL0,cL1,cL2,cL3);
             mma_m16n8k16(cR0,cR1,cR2,cR3,a0r,a1r,a2r,a3r,bR0,bR1,cR0,cR1,cR2,cR3);
         }
         __syncthreads();
