@@ -210,6 +210,25 @@ test "Vulkan Qwen dense gate-up DP4a keeps K5120 specializations" {
     try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8_1(", "use_ragged_n64", 2200);
 }
 
+test "Vulkan Qwen 9B long prefill keeps K4096 and K12288 ragged BN64 paths" {
+    const src = @embedFile("compute/dmmv.zig");
+    try expectContains(src, "const spec_k_4096_n64_gateup_ragged = [_]pipeline_mod.SpecConst{");
+    try expectContainsNear(src, "const spec_k_4096_n64_gateup_ragged = [_]pipeline_mod.SpecConst{", ".{ .id = 3, .value = 1 },", 260);
+    try expectContains(src, "const spec_k_12288_n64_ragged = [_]pipeline_mod.SpecConst{");
+    try expectContainsNear(src, "const spec_k_12288_n64_ragged = [_]pipeline_mod.SpecConst{", ".{ .id = 2, .value = 1 },", 260);
+    try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_k4096_n64_ragged");
+    try expectContains(src, "pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1_k4096_n64_ragged");
+    try expectContains(src, "pipeline_mul_mm_q6k_full_dp4a_k12288_n64_ragged");
+    try expectContains(src, "pipeline_mul_mm_q4k_full_dp4a_k12288_n64_ragged");
+    try expectContains(src, "const use_k4096_ragged_n64 = K == 4096 and N > 64 and (N & 63) != 0");
+    try expectContains(src, "const use_k12288_ragged_n64 = !accumulate and K == 12288 and N > 64 and (N & 63) != 0");
+    try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8(", "use_k4096_ragged_n64", 2400);
+    try expectContainsNear(src, "pub fn recordMulMmQ4KGateUpSwigluFullDp4aQ8_1(", "use_k4096_ragged_n64", 2400);
+    try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_k12288_ragged_n64", 2600);
+    try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_k12288_ragged_n64", 2600);
+    try expectContains(src, "use_ragged_n64 or use_k12288_ragged_n64");
+}
+
 test "Vulkan Gemma dense decode keeps fused GEGLU gate-up pair path" {
     const src = @embedFile("compute/forward.zig");
     const marker = "const gemma_dense_geglu_pair_eligible =";
@@ -338,7 +357,7 @@ test "Vulkan Qwen dense-down DP4a keeps K17408 BN40 and BN64 specializations" {
     try expectContains(src, "if (use_n64_bm64 or use_k21504_n64_bm64 or use_exact_n64_mmq64_acc or use_exact_n64_bm64_acc or use_ragged_n64_bm64) M / 64 else M / 32");
     try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_exact_n64_bk2", 2200);
     try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_exact_n64_acc", 2200);
-    try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_ragged_n64", 2200);
+    try expectContainsNear(src, "pub fn recordMulMmQ6KFullDp4a(", "use_ragged_n64", 3000);
     try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_exact_n64_bk2", 2400);
     try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_exact_n64_acc", 2400);
     try expectContainsNear(src, "pub fn recordMulMmQ4KFullDp4a(", "use_ragged_n64", 2400);
