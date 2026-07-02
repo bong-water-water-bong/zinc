@@ -559,6 +559,16 @@ test "Vulkan batched kpar shaders merge cross-subgroup partials" {
     }
 }
 
+test "Vulkan Q4_K wide LM-head shader merges cross-subgroup partials" {
+    const src = @embedFile("shaders/dmmv_q4k_wide.comp");
+    try expectContains(src, "GL_KHR_shader_subgroup_basic");
+    try expectContains(src, "shared float s_sg_sums[4];");
+    try expectContains(src, "gl_NumSubgroups > 1u");
+    try expectContains(src, "subgroupElect()");
+    try expectContains(src, "s_sg_sums[gl_SubgroupID]");
+    try expectContains(src, "for (uint sg = 1u; sg < gl_NumSubgroups; sg++)");
+}
+
 test "Vulkan batched kpar pipelines use non-wave64 options on Intel" {
     const src = @embedFile("compute/dmmv.zig");
     try expectContainsNear(src, "const q4k_batch_kpar_path", "effective_wave64_options", 700);
