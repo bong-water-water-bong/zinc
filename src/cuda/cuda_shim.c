@@ -193,15 +193,34 @@ CudaPipe* cuda_create_pipeline(CudaCtx* c, const char* src, const char* fn_name,
         set_err("nvrtcCompileProgram", nvrtcGetErrorString(cr));
         nvrtcDestroyProgram(&prog); return NULL;
     }
-    size_t ptxsz = 0; nvrtcGetPTXSize(prog, &ptxsz);
-    char* ptx = (char*)malloc(ptxsz);
-    nvrtcGetPTX(prog, ptx);
+    // Use nvrtcGetCUBIN (direct machine code) instead of nvrtcGetPTX + driver JIT.
+    // The driver JIT can generate incorrect SASS for mma.sync inline PTX on some
+    // architectures. CUBIN is compiled by NVRTC's internal ptxas, which is correct.
+    size_t cubinsz = 0;
+    if (nvrtcGetCUBINSize(prog, &cubinsz) != NVRTC_SUCCESS || cubinsz == 0) {
+        // Fallback to PTX if CUBIN not available
+        size_t ptxsz = 0; nvrtcGetPTXSize(prog, &ptxsz);
+        char* ptx = (char*)malloc(ptxsz);
+        nvrtcGetPTX(prog, ptx);
+        nvrtcDestroyProgram(&prog);
+        CudaPipe* p = (CudaPipe*)calloc(1, sizeof *p);
+        if (!p) { free(ptx); set_err("cuda_create_pipeline", "oom"); return NULL; }
+        if (!cu_ok(cuModuleLoadData(&p->mod, ptx), "cuModuleLoadData")) { free(ptx); free(p); return NULL; }
+        free(ptx);
+        if (!cu_ok(cuModuleGetFunction(&p->fn, p->mod, fn_name), "cuModuleGetFunction")) {
+            cuModuleUnload(p->mod); free(p); return NULL;
+        }
+        return p;
+    }
+    char* cubin = (char*)malloc(cubinsz);
+    nvrtcResult cubin_ret = nvrtcGetCUBIN(prog, cubin);
     nvrtcDestroyProgram(&prog);
+    if (cubin_ret != NVRTC_SUCCESS) { free(cubin); set_err("nvrtcGetCUBIN", nvrtcGetErrorString(cubin_ret)); return NULL; }
 
     CudaPipe* p = (CudaPipe*)calloc(1, sizeof *p);
-    if (!p) { free(ptx); set_err("cuda_create_pipeline", "oom"); return NULL; }
-    if (!cu_ok(cuModuleLoadData(&p->mod, ptx), "cuModuleLoadData")) { free(ptx); free(p); return NULL; }
-    free(ptx);
+    if (!p) { free(cubin); set_err("cuda_create_pipeline", "oom"); return NULL; }
+    if (!cu_ok(cuModuleLoadData(&p->mod, cubin), "cuModuleLoadData(cubin)")) { free(cubin); free(p); return NULL; }
+    free(cubin);
     if (!cu_ok(cuModuleGetFunction(&p->fn, p->mod, fn_name), "cuModuleGetFunction")) {
         cuModuleUnload(p->mod); free(p); return NULL;
     }
