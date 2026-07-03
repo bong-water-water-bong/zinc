@@ -986,6 +986,7 @@ test("output quality status flags malformed benchmark previews", () => {
   expect(outputQualityStatus("<|im_end|>", 2).tone).toBe("caution");
   expect(outputQualityStatus("2\n</think>\n<|im_start|>0.\n<|im_end|>", 96).tone).toBe("caution");
   expect(outputQualityStatus("##\n<think>first</think>\n<think>second", 128).tone).toBe("caution");
+  expect(outputQualityStatus("1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.", 128).tone).toBe("caution");
   expect(outputQualityStatus("This implementation plan explains the command shape and warmup policy.", 96).tone).toBe("positive");
 });
 

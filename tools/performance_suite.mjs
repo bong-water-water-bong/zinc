@@ -569,7 +569,12 @@ export function outputQualityStatus(preview, generatedTokens = null) {
     };
   }
 
-  if (/(?:^|[\s:])(?:\d+\.){12,}/.test(text) || /([#*_=-])\1{31,}/.test(text) || /\b([A-Za-z]{3,})\1{8,}\b/.test(text)) {
+  if (
+    /(?:^|[\s:])(?:\d+\.){12,}/.test(text) ||
+    /(?:^|\n)\s*(\d+[.)])\s*(?:\n\s*\1\s*){11,}/.test(text) ||
+    /([#*_=-])\1{31,}/.test(text) ||
+    /\b([A-Za-z]{3,})\1{8,}\b/.test(text)
+  ) {
     return {
       tone: "caution",
       label: "Preview flagged",

@@ -479,7 +479,10 @@ function outputQualityStatus(scenario: any) {
     };
   }
 
-  if (/(?:^|[\s:])(?:\d+\.){12,}/.test(preview)) {
+  if (
+    /(?:^|[\s:])(?:\d+\.){12,}/.test(preview) ||
+    /(?:^|\n)\s*(\d+[.)])\s*(?:\n\s*\1\s*){11,}/.test(preview)
+  ) {
     return {
       tone: 'caution',
       label: 'Preview flagged',
