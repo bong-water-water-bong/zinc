@@ -6,8 +6,9 @@
 // router weights are f32. Saves one vkCmdDispatch + one pipeline
 // barrier per MoE layer (30 on Qwen3.6 35B-A3B, ~1.5 ms / decode).
 //
-// Each workgroup is 64 threads = 1 wave64 on RDNA4. NUM_ROWS=1 router
-// output row per workgroup, dispatched as (M, 1, 1).
+// Each workgroup is 64 threads = 1 wave64 on RDNA4 or 2 wave32 subgroups
+// on Intel. NUM_ROWS=1 router output row per workgroup, dispatched as
+// (M, 1, 1).
 //
 // Cycle 42 (effort-6): hidden, ffn_norm weights, router weights, and
 // the WG-0 ffn_norm writeback are all reorganized as vec4-strided
@@ -20,8 +21,9 @@
 //
 // Algorithm:
 //   1. All WGs independently compute the same RMS norm scale via
-//      subgroupAdd over hidden[] (deterministic across WGs because
-//      every thread reads the same hidden[] in the same order).
+//      subgroupAdd + cross-subgroup merge over hidden[] (deterministic
+//      across WGs because every thread reads the same hidden[] in the
+//      same order).
 //   2. WG 0 ALSO writes ffn_norm_buf[] = w[i]*(hidden[i]*rms_inv)
 //      so downstream MoE gate/up + shared-expert dispatches see the
 //      normalized vector. Other WGs skip the writeback (single-writer
@@ -69,6 +71,7 @@ layout(set = 0, binding = 4) writeonly buffer RouterLogits    { float router_out
 const uint NUM_ROWS = 1u;
 
 shared float s_rms_inv;
+shared float s_partial[64];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -84,7 +87,15 @@ void main() {
     }
     sum_sq = subgroupAdd(sum_sq);
 
-    if (tid == 0u) {
+    if (gl_NumSubgroups > 1u) {
+        if (gl_SubgroupInvocationID == 0u) s_partial[gl_SubgroupID] = sum_sq;
+        barrier();
+        if (tid == 0u) {
+            float merged = 0.0;
+            for (uint sg = 0u; sg < gl_NumSubgroups; sg++) merged += s_partial[sg];
+            s_rms_inv = inversesqrt(merged / float(K) + eps);
+        }
+    } else if (tid == 0u) {
         s_rms_inv = inversesqrt(sum_sq / float(K) + eps);
     }
     barrier();
@@ -115,7 +126,15 @@ void main() {
             sum += dot(nv, router_w_v4[w_base_v4 + k_v4]);
         }
         sum = subgroupAdd(sum);
-        if (tid == 0u) {
+        if (gl_NumSubgroups > 1u) {
+            if (gl_SubgroupInvocationID == 0u) s_partial[gl_SubgroupID] = sum;
+            barrier();
+            if (tid == 0u) {
+                float merged = 0.0;
+                for (uint sg = 0u; sg < gl_NumSubgroups; sg++) merged += s_partial[sg];
+                router_out[row] = merged;
+            }
+        } else if (tid == 0u) {
             router_out[row] = sum;
         }
     }

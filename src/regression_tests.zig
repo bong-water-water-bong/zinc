@@ -752,6 +752,14 @@ test "Vulkan Intel SSM fast paths are wave32-safe by default" {
     try expectContains(cols8_normed, "uint row_slot = tid / LANES_PER_ROW;");
 }
 
+test "Vulkan fused RMS router merges wave32 subgroup partials" {
+    const src = @embedFile("shaders/rms_norm_dmmv_f32.comp");
+    try expectContains(src, "subgroupAdd(sum_sq)");
+    try expectContains(src, "subgroupAdd(sum)");
+    try expectMultiSubgroupFallback(src, "s_partial");
+    try expectContains(src, "router_out[row] = merged;");
+}
+
 test "Vulkan Qwen 3.6 MoE top-k caps default to full metadata top-k on Intel" {
     const src = @embedFile("compute/forward.zig");
     try expectContains(src, "const qwen36_moe_intel_safe_defaults = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);");

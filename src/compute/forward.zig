@@ -2496,19 +2496,16 @@ pub const InferenceEngine = struct {
         }
 
         // Fused FFN-RMS-norm + f32 router DMMV: default ON when the
-        // rms_norm_dmmv_f32 pipeline is loaded, except on Intel Qwen 3.6
-        // MoE where the fused route currently produces malformed output.
-        // Folds the standalone ffn-norm dispatch into the MoE router DMMV,
-        // saving one dispatch + one barrier per MoE layer (~30 layers on
-        // Qwen 3.6 35B-A3B). Disabled by setting ZINC_FUSED_RMS_ROUTER=0.
-        // Per-call gates (architecture, weight type, etc.) are evaluated
-        // in the forward path so models that don't fit silently fall back.
+        // rms_norm_dmmv_f32 pipeline is loaded. Folds the standalone
+        // ffn-norm dispatch into the MoE router DMMV, saving one
+        // dispatch + one barrier per MoE layer (~30 layers on Qwen 3.6
+        // 35B-A3B). Disabled by setting ZINC_FUSED_RMS_ROUTER=0. Per-call
+        // gates (architecture, weight type, etc.) are evaluated in the
+        // forward path so models that don't fit silently fall back.
         const fused_rms_router_env = std.posix.getenv("ZINC_FUSED_RMS_ROUTER");
         const fused_rms_router_explicitly_off = fused_rms_router_env != null and std.mem.eql(u8, fused_rms_router_env.?, "0");
         const fused_rms_router_forced_on = fused_rms_router_env != null and !fused_rms_router_explicitly_off;
-        const fused_rms_router_intel_qwen_disabled = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
-        const fused_rms_router_policy_enabled = fused_rms_router_forced_on or
-            (!fused_rms_router_explicitly_off and !fused_rms_router_intel_qwen_disabled);
+        const fused_rms_router_policy_enabled = !fused_rms_router_explicitly_off;
         const fused_rms_router_enabled = fused_rms_router_policy_enabled and
             elementwise.pipeline_rms_norm_dmmv_f32 != null;
         if (fused_rms_router_enabled) {
@@ -2519,8 +2516,6 @@ pub const InferenceEngine = struct {
             }
         } else if (fused_rms_router_explicitly_off) {
             log.info("Fused FFN-norm + router DMMV DISABLED via ZINC_FUSED_RMS_ROUTER=0", .{});
-        } else if (fused_rms_router_intel_qwen_disabled) {
-            log.info("Fused FFN-norm + router DMMV DISABLED by default on Intel Qwen 3.6 MoE (set ZINC_FUSED_RMS_ROUTER=1 to force)", .{});
         }
 
         // Fused SSM pre-norm (cycle 13): merges (rms_norm_mul → alpha
