@@ -688,10 +688,17 @@ The main file. Contains the decode loop, all layer dispatch, MoE routing, SSM st
 The CUDA backend uses a hybrid GEMM strategy based on prompt length:
 
 ```
-T < 32:    per-token DMMV (dmmv_q4k_fast) — no tile waste
+T < 32:    per-token DMMV (dmmv_q4k_fast) — batched via grid.y=T
 T < 256:   lowsmem TC GEMM (gemm_q4k_tc_lowsmem) — 16KB aliased shared, 3 blocks/SM
 T >= 256:  cuBLAS fp16 (cublasGemmEx) — one-time dequant, reused across all tokens
 ```
+
+**CRITICAL (sm_120 / Blackwell)**: NVRTC's `wmma::mma_sync` generates fp32 MMA
+(`wmma.mma.sync.f32.f32`) instead of fp16. This limits all TC kernels to ~10%
+over scalar fp32. Inline PTX `wmma.mma.sync.f32.f16` is rejected by ptxas on
+sm_120, and inline `mma.sync.m16n8k16.row.col.f32.f16.f16.f32` produces wrong
+SASS output (driver bug). The ONLY viable fp16 TC path on Blackwell is
+`wgmma.mma_async` (requires kernel rewrite: warp groups, descriptors, async barriers).
 
 Environment variables for GEMM kernel selection:
 
@@ -701,6 +708,10 @@ Environment variables for GEMM kernel selection:
 | `ZINC_PREFILL_TC` | on | Use tensor-core wmma for Q4_K multiply. Set `0` for fp32 FMA |
 | `ZINC_PREFILL_DP4A` | off | Use DP4a int8 dot product (alternative to TC) |
 | `ZINC_PREFILL_F16` | off | Use pre-dequanted fp16 weights (server mode with cache) |
+| `ZINC_PREFILL_Q8` | off | Pre-quant tiled DP4a: quantize input to Q8_0, then DP4a GEMM |
+| `ZINC_PREFILL_MMA` | off | Inline PTX mma.sync.m16n8k16 (fp16 TC, correct PTX, wrong SASS on sm_120) |
+| `ZINC_PREFILL_F16TC` | off | Inline PTX wmma.mma.sync.f32.f16 (rejected by sm_120 ptxas) |
+| `ZINC_PREFILL_GATE_UP_SWIGLU` | off | Fused gate+up+SwiGLU TC kernel |
 | `ZINC_CUBLAS_MIN_T` | 256 | Threshold for switching to cuBLAS. Set high to disable |
 | `ZINC_SSM_PROFILE` | off | Per-phase SSM timing (pre-scan/scan/post-scan) |
 | `ZINC_SSM_CHUNKED` | off | Use chunked delta-net kernel (correct, not faster) |
