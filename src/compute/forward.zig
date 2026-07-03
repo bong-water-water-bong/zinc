@@ -19296,6 +19296,10 @@ pub const InferenceEngine = struct {
             (inter_dim & 255) == 0 and
             q8_1_down_packed.?.size >= prefix_inter_i8_bytes and
             q8_1_down_scale_dsum.?.size >= prefix_inter_scale_dsum_bytes;
+        const prefix_down_workgroups_x: u32 = if (use_q8_1_down_cols)
+            (hidden_dim + 31) / 32
+        else
+            (hidden_dim + 3) / 4;
         const suffix_route_inter_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, suffix_route_count) *
             @as(vk.c.VkDeviceSize, inter_dim) *
@@ -19454,7 +19458,7 @@ pub const InferenceEngine = struct {
             route_stride_u32,
             ids_stride,
             (inter_dim + 3) / 4,
-            (hidden_dim + 3) / 4,
+            prefix_down_workgroups_x,
             0,
         );
         const route_pack_ranges = [_]CommandBuffer.BufferRange{
