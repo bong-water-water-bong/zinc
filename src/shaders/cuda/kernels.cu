@@ -5047,18 +5047,25 @@ extern "C" __global__ void gemm_q4k_tc_f16a_lowsmem(const unsigned* a_u32, const
 // NVRTC's default fp32 (.f32.f32) wmma::mma_sync.
 __device__ __forceinline__ void wmma_mma_f16_inline(
     float* d, const half* a, const half* b, const float* c) {
+    // Zero-extend each fp16 to u32 (wmma.mma.sync.f16 expects 8 regs, not 4 packed)
+    unsigned a0=*(const unsigned short*)&a[0], a1=*(const unsigned short*)&a[1];
+    unsigned a2=*(const unsigned short*)&a[2], a3=*(const unsigned short*)&a[3];
+    unsigned a4=*(const unsigned short*)&a[4], a5=*(const unsigned short*)&a[5];
+    unsigned a6=*(const unsigned short*)&a[6], a7=*(const unsigned short*)&a[7];
+    unsigned b0=*(const unsigned short*)&b[0], b1=*(const unsigned short*)&b[1];
+    unsigned b2=*(const unsigned short*)&b[2], b3=*(const unsigned short*)&b[3];
+    unsigned b4=*(const unsigned short*)&b[4], b5=*(const unsigned short*)&b[5];
+    unsigned b6=*(const unsigned short*)&b[6], b7=*(const unsigned short*)&b[7];
     asm volatile(
         "wmma.mma.sync.aligned.row.row.m16n16k16.f32.f16 "
         "{%0,%1,%2,%3,%4,%5,%6,%7}, "
-        "{%8,%9,%10,%11}, "
-        "{%12,%13,%14,%15}, "
-        "{%16,%17,%18,%19,%20,%21,%22,%23};\n"
+        "{%8,%9,%10,%11,%12,%13,%14,%15}, "
+        "{%16,%17,%18,%19,%20,%21,%22,%23}, "
+        "{%24,%25,%26,%27,%28,%29,%30,%31};\n"
         : "=f"(d[0]),"=f"(d[1]),"=f"(d[2]),"=f"(d[3]),
           "=f"(d[4]),"=f"(d[5]),"=f"(d[6]),"=f"(d[7])
-        : "r"(*(const unsigned*)&a[0]), "r"(*(const unsigned*)&a[2]),
-          "r"(*(const unsigned*)&a[4]), "r"(*(const unsigned*)&a[6]),
-          "r"(*(const unsigned*)&b[0]), "r"(*(const unsigned*)&b[2]),
-          "r"(*(const unsigned*)&b[4]), "r"(*(const unsigned*)&b[6]),
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(a4),"r"(a5),"r"(a6),"r"(a7),
+          "r"(b0),"r"(b1),"r"(b2),"r"(b3),"r"(b4),"r"(b5),"r"(b6),"r"(b7),
           "f"(c[0]),"f"(c[1]),"f"(c[2]),"f"(c[3]),
           "f"(c[4]),"f"(c[5]),"f"(c[6]),"f"(c[7]));
 }
