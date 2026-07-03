@@ -19507,16 +19507,45 @@ pub const InferenceEngine = struct {
             @as(vk.c.VkDeviceSize, inter_dim / 32) *
             2 *
             @sizeOf(f32);
+        const q8_1_down_quant_supported =
+            (down_exps.info.type_ == .q4_k and self.dmmv.pipeline_q4k_moe_cols_q8_1 != null) or
+            (down_exps.info.type_ == .q5_k and self.dmmv.pipeline_q5k_moe_cols_q8_1 != null);
         const use_q8_1_down_cols =
             q8_1_down_cols_requested and
-            down_exps.info.type_ == .q4_k and
-            self.dmmv.pipeline_q4k_moe_cols_q8_1 != null and
+            q8_1_down_quant_supported and
             self.dmmv.pipeline_quantize_act_q8_1 != null and
             q8_1_down_packed != null and
             q8_1_down_scale_dsum != null and
             (inter_dim & 255) == 0 and
             q8_1_down_packed.?.size >= prefix_inter_i8_bytes and
             q8_1_down_scale_dsum.?.size >= prefix_inter_scale_dsum_bytes;
+        const q8_1_down_compare_requested = if (std.posix.getenv("ZINC_MOE_Q8_1_DOWN_COMPARE")) |raw|
+            !(std.mem.eql(u8, raw, "0") or
+                std.ascii.eqlIgnoreCase(raw, "off") or
+                std.ascii.eqlIgnoreCase(raw, "false") or
+                std.ascii.eqlIgnoreCase(raw, "no"))
+        else
+            false;
+        const q8_1_down_compare_sample_elems: u32 = @min(hidden_dim, 64);
+        const q8_1_down_compare_sample_count: u32 = if (prefix_tokens >= 3) 3 else 0;
+        var q8_1_down_compare_tokens = [_]u32{ 0, 0, 0 };
+        if (q8_1_down_compare_sample_count == 3) {
+            q8_1_down_compare_tokens[1] = prefix_tokens / 2;
+            q8_1_down_compare_tokens[2] = prefix_tokens - 1;
+        }
+        const q8_1_down_compare_sample_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, q8_1_down_compare_sample_elems) * @sizeOf(f32);
+        const q8_1_down_compare_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, q8_1_down_compare_sample_count) *
+            q8_1_down_compare_sample_bytes *
+            2;
+        const use_q8_1_down_compare =
+            use_q8_1_down_cols and
+            q8_1_down_compare_requested and
+            q8_1_down_compare_sample_count > 0 and
+            self.logits_staging.mapped != null and
+            self.logits_staging.size >= q8_1_down_compare_bytes;
+        var q8_1_down_compare_ran = false;
         const prefix_down_workgroups_x: u32 = if (use_q8_1_down_cols)
             (hidden_dim + 31) / 32
         else
@@ -19869,35 +19898,134 @@ pub const InferenceEngine = struct {
                 .{ .buffer = swiglu_sd.handle, .size = prefix_inter_scale_dsum_bytes },
             };
             self.decode_cmd.computeBuffersBarrier(&q8_1_swiglu_ranges);
-            try self.dmmv.recordMoeColsQ8_1DispatchIndirect(
-                &self.decode_cmd,
-                self.instance.push_descriptor_fn,
-                down_exps.gpu_buffer.handle,
-                down_exps.gpu_buffer.size,
-                swiglu_i8.handle,
-                swiglu_i8.size,
-                swiglu_sd.handle,
-                swiglu_sd.size,
-                scratch_hidden.handle,
-                prefix_hidden_bytes,
-                counts.handle,
-                counts_bytes,
-                ids.handle,
-                ids_bytes,
-                active_blocks.handle,
-                active_blocks_bytes,
-                dispatch_args.handle,
-                3 * @sizeOf(u32),
-                hidden_dim,
-                inter_dim,
-                down_stride,
-                ids_stride,
-                1,
-                0,
-                0,
-                0,
-                true,
-            );
+            if (use_q8_1_down_compare) {
+                // Diagnostic-only replay: compare the exact f32-input routed
+                // down projection with the Q8_1-input candidate on three token
+                // rows. Normal runs keep the single fused accumulate below.
+                try self.dmmv.recordMoeColsDispatchIndirect(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    down_exps.info.type_,
+                    down_exps.gpu_buffer.handle,
+                    down_exps.gpu_buffer.size,
+                    scratch_swiglu.handle,
+                    scratch_swiglu.size,
+                    scratch_down.handle,
+                    prefix_hidden_bytes,
+                    counts.handle,
+                    counts_bytes,
+                    ids.handle,
+                    ids_bytes,
+                    active_blocks.handle,
+                    active_blocks_bytes,
+                    dispatch_args.handle,
+                    3 * @sizeOf(u32),
+                    hidden_dim,
+                    inter_dim,
+                    down_stride,
+                    ids_stride,
+                    1,
+                    0,
+                    0,
+                    0,
+                    false,
+                );
+                self.decode_cmd.computeBufferBarrier(scratch_down.handle, prefix_hidden_bytes);
+                self.decode_cmd.computeToTransferBarrier();
+                for (0..q8_1_down_compare_sample_count) |sample_i| {
+                    const token_idx = q8_1_down_compare_tokens[sample_i];
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_down.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                        .srcOffset = @as(vk.c.VkDeviceSize, token_idx) * @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32),
+                        .dstOffset = @as(vk.c.VkDeviceSize, sample_i) * q8_1_down_compare_sample_bytes,
+                        .size = q8_1_down_compare_sample_bytes,
+                    });
+                }
+                self.decode_cmd.transferToComputeBarrier();
+
+                try self.dmmv.recordMoeColsQ8_1DispatchIndirect(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    down_exps.info.type_,
+                    down_exps.gpu_buffer.handle,
+                    down_exps.gpu_buffer.size,
+                    swiglu_i8.handle,
+                    swiglu_i8.size,
+                    swiglu_sd.handle,
+                    swiglu_sd.size,
+                    scratch_down.handle,
+                    prefix_hidden_bytes,
+                    counts.handle,
+                    counts_bytes,
+                    ids.handle,
+                    ids_bytes,
+                    active_blocks.handle,
+                    active_blocks_bytes,
+                    dispatch_args.handle,
+                    3 * @sizeOf(u32),
+                    hidden_dim,
+                    inter_dim,
+                    down_stride,
+                    ids_stride,
+                    1,
+                    0,
+                    0,
+                    0,
+                    false,
+                );
+                self.decode_cmd.computeBufferBarrier(scratch_down.handle, prefix_hidden_bytes);
+                self.decode_cmd.computeToTransferBarrier();
+                for (0..q8_1_down_compare_sample_count) |sample_i| {
+                    const token_idx = q8_1_down_compare_tokens[sample_i];
+                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_down.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                        .srcOffset = @as(vk.c.VkDeviceSize, token_idx) * @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32),
+                        .dstOffset = (@as(vk.c.VkDeviceSize, q8_1_down_compare_sample_count) + @as(vk.c.VkDeviceSize, sample_i)) * q8_1_down_compare_sample_bytes,
+                        .size = q8_1_down_compare_sample_bytes,
+                    });
+                }
+                self.decode_cmd.transferToComputeBarrier();
+                try self.dispatchScaleAccWithOffsets(
+                    scratch_hidden.handle,
+                    0,
+                    prefix_hidden_bytes,
+                    scratch_down.handle,
+                    0,
+                    prefix_hidden_bytes,
+                    prefix_tokens * hidden_dim,
+                    1.0,
+                );
+                q8_1_down_compare_ran = true;
+            } else {
+                try self.dmmv.recordMoeColsQ8_1DispatchIndirect(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    down_exps.info.type_,
+                    down_exps.gpu_buffer.handle,
+                    down_exps.gpu_buffer.size,
+                    swiglu_i8.handle,
+                    swiglu_i8.size,
+                    swiglu_sd.handle,
+                    swiglu_sd.size,
+                    scratch_hidden.handle,
+                    prefix_hidden_bytes,
+                    counts.handle,
+                    counts_bytes,
+                    ids.handle,
+                    ids_bytes,
+                    active_blocks.handle,
+                    active_blocks_bytes,
+                    dispatch_args.handle,
+                    3 * @sizeOf(u32),
+                    hidden_dim,
+                    inter_dim,
+                    down_stride,
+                    ids_stride,
+                    1,
+                    0,
+                    0,
+                    0,
+                    true,
+                );
+            }
         } else {
             try self.dmmv.recordMoeColsDispatchIndirect(
                 &self.decode_cmd,
@@ -20243,6 +20371,50 @@ pub const InferenceEngine = struct {
         try self.decode_cmd.end();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
         self.recordProfilingSample();
+        if (q8_1_down_compare_ran) {
+            const ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+            const sample_elems_usize: usize = @intCast(q8_1_down_compare_sample_elems);
+            const sample_count_usize: usize = @intCast(q8_1_down_compare_sample_count);
+            const q8_base = sample_count_usize * sample_elems_usize;
+            var max_abs: f32 = 0;
+            var max_sample: usize = 0;
+            var max_elem: usize = 0;
+            var max_ref: f32 = 0;
+            var max_q8: f32 = 0;
+            var sum_abs: f64 = 0;
+            var compared: usize = 0;
+            for (0..sample_count_usize) |sample_i| {
+                const ref_base = sample_i * sample_elems_usize;
+                const got_base = q8_base + ref_base;
+                for (0..sample_elems_usize) |elem_i| {
+                    const ref_v = ptr[ref_base + elem_i];
+                    const got_v = ptr[got_base + elem_i];
+                    const diff = @abs(ref_v - got_v);
+                    sum_abs += diff;
+                    compared += 1;
+                    if (diff > max_abs) {
+                        max_abs = diff;
+                        max_sample = sample_i;
+                        max_elem = elem_i;
+                        max_ref = ref_v;
+                        max_q8 = got_v;
+                    }
+                }
+            }
+            const mean_abs = if (compared > 0) sum_abs / @as(f64, @floatFromInt(compared)) else 0.0;
+            log.info("ZINC_MOE_Q8_1_DOWN_COMPARE: layer={d} prefix_tokens={d} samples={d} elems={d} max_abs={e:.6}@tok{d}/elem{d} mean_abs={e:.6} ref={d:.6} q8={d:.6}", .{
+                layer,
+                prefix_tokens,
+                q8_1_down_compare_sample_count,
+                q8_1_down_compare_sample_elems,
+                max_abs,
+                q8_1_down_compare_tokens[max_sample],
+                max_elem,
+                mean_abs,
+                max_ref,
+                max_q8,
+            });
+        }
 
         self.prefill_current_token_idx = grouped_total_tokens - 1;
         state.position = base_token + grouped_total_tokens - 1;

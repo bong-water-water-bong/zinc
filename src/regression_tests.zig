@@ -953,33 +953,40 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(build, "\"dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1\"");
     try expectContains(build, "\"dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1\"");
     try expectContains(build, "\"dmmv_q4k_moe_cols_q8_1\"");
+    try expectContains(build, "\"dmmv_q5k_moe_cols_q8_1\"");
 
     const dmmv = @embedFile("compute/dmmv.zig");
     try expectContains(dmmv, "pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1: ?Pipeline");
     try expectContains(dmmv, "pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1: ?Pipeline");
     try expectContains(dmmv, "pipeline_q4k_moe_cols_q8_1: ?Pipeline");
+    try expectContains(dmmv, "pipeline_q5k_moe_cols_q8_1: ?Pipeline");
     try expectContains(dmmv, "dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.spv");
     try expectContains(dmmv, "dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1.spv");
     try expectContains(dmmv, "dmmv_q4k_moe_cols_q8_1.spv");
+    try expectContains(dmmv, "dmmv_q5k_moe_cols_q8_1.spv");
     try expectContains(dmmv, "recordQwenTop1GateUpSwigluColsDispatchIndirect");
     try expectContains(dmmv, "recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect");
     try expectContains(dmmv, "recordMoeColsQ8_1DispatchIndirect");
     try expectContains(dmmv, ".pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1 = pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1");
     try expectContains(dmmv, ".pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1 = pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1");
     try expectContains(dmmv, ".pipeline_q4k_moe_cols_q8_1 = pipeline_q4k_moe_cols_q8_1");
+    try expectContains(dmmv, ".pipeline_q5k_moe_cols_q8_1 = pipeline_q5k_moe_cols_q8_1");
     try expectContains(dmmv, "if (self.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1) |*p| p.deinit();");
     try expectContains(dmmv, "if (self.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1) |*p| p.deinit();");
     try expectContains(dmmv, "if (self.pipeline_q4k_moe_cols_q8_1) |*p| p.deinit();");
+    try expectContains(dmmv, "if (self.pipeline_q5k_moe_cols_q8_1) |*p| p.deinit();");
 
     const forward = @embedFile("compute/forward.zig");
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1", 9200);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "self.use_moe_fused_gate_up_swiglu", 9200);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_GATE_UP_COLS", 12000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COLS", 14000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COMPARE", 17000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQuantizeActQ8_1", 20000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsDispatchIndirect", 24000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect", 24000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordMoeColsQ8_1DispatchIndirect", 26000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordMoeColsQ8_1DispatchIndirect", 42000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COMPARE: layer=", 52000);
 
     const shader = @embedFile("shaders/dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.comp");
     try expectContains(shader, "layout(local_size_x = 64) in;");
@@ -1004,6 +1011,13 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(q8_down_shader, "dotPacked4x8AccSatEXT");
     try expectContains(q8_down_shader, "accumulate");
     try expectContains(q8_down_shader, "x_route_divisor");
+
+    const q8_q5_down_shader = @embedFile("shaders/dmmv_q5k_moe_cols_q8_1.comp");
+    try expectContains(q8_q5_down_shader, "#include \"dp4a_compat.glsl\"");
+    try expectContains(q8_q5_down_shader, "ActScaleDsum");
+    try expectContains(q8_q5_down_shader, "dotPacked4x8AccSatEXT");
+    try expectContains(q8_q5_down_shader, "Q5_K");
+    try expectContains(q8_q5_down_shader, "x_route_divisor");
 }
 
 test "softmax_topk shader keeps RADV-safe shared-memory winner scan" {

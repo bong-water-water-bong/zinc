@@ -849,7 +849,25 @@ pub const ForwardCuda = struct {
         pipes.gemm_q4k_dp4a = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_dp4a");
         pipes.gemm_f16_tc = try pipeline.createPipeline(ctx, src.ptr, "gemm_f16_tc");
         pipes.gemm_q4k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_lowsmem");
-        pipes.gemm_q4k_mma_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_mma_lowsmem");
+        // mma.sync kernel: use nvcc-compiled cubin (NVRTC generates wrong SASS for mma.sync)
+        pipes.gemm_q4k_mma_lowsmem = blk: {
+            const cc = shim.cuda_compute_capability(ctx);
+            log.info("mma.sync cubin: cc={d}, trying nvcc cubin path", .{cc});
+            if (cc >= 89) {
+                const cubin_data = if (cc >= 100) @embedFile("../cuda/cubins/mma_kernel.sm120.cubin") else @embedFile("../cuda/cubins/mma_kernel.sm89.cubin");
+                log.info("mma.sync cubin: {d} bytes embedded", .{cubin_data.len});
+                if (pipeline.createPipelineFromImage(ctx, cubin_data.ptr, cubin_data.len, "gemm_q4k_mma_lowsmem")) |pipe| {
+                    log.info("mma.sync: nvcc cubin loaded OK", .{});
+                    break :blk pipe;
+                } else |err| {
+                    log.warn("mma.sync: cubin load failed ({s}), falling back to NVRTC", .{@errorName(err)});
+                }
+            } else {
+                log.info("mma.sync: cc<89, using NVRTC", .{});
+            }
+            break :blk pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_mma_lowsmem") catch
+                try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tc_lowsmem");
+        };
         pipes.gemm_q4k_gate_up_swiglu = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_gate_up_swiglu_lowsmem");
         pipes.gemm_q8_0_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q8_0_tc_lowsmem");
         pipes.gemm_q6k_tc_lowsmem = try pipeline.createPipeline(ctx, src.ptr, "gemm_q6k_tc_lowsmem");

@@ -492,6 +492,8 @@ pub const DmmvDispatch = struct {
     pipeline_q5k_moe_kpar: ?Pipeline,
     /// Grouped top-1 prefill Q5_K MoE DMMV over route-packed token columns.
     pipeline_q5k_moe_cols: ?Pipeline,
+    /// Q8_1-input sibling for grouped Q5_K MoE down projection probes.
+    pipeline_q5k_moe_cols_q8_1: ?Pipeline,
     /// MoE MXFP4 pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_mxfp4_moe: ?Pipeline,
     /// MoE Q5_1 pipeline (4 bindings: A, x, y, routing), or null.
@@ -1260,6 +1262,14 @@ pub const DmmvDispatch = struct {
         };
         if (pipeline_q5k_moe_cols != null) {
             log.info("dmmv_q5k_moe_cols pipeline loaded (grouped top-1 MoE prefill)", .{});
+        }
+        const q5k_moe_cols_q8_1_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_moe_cols_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5k_moe_cols_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q5k_moe_cols_q8_1_path, 7, moe_cols_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_K grouped MoE cols Q8_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_q5k_moe_cols_q8_1 != null) {
+            log.info("dmmv_q5k_moe_cols_q8_1 pipeline loaded (grouped top-1 MoE prefill Q8_1 down)", .{});
         }
 
         const mxfp4_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_mxfp4_moe.spv", .{shader_dir}) catch unreachable;
@@ -2330,6 +2340,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q5k_moe = pipeline_q5k_moe,
             .pipeline_q5k_moe_kpar = pipeline_q5k_moe_kpar,
             .pipeline_q5k_moe_cols = pipeline_q5k_moe_cols,
+            .pipeline_q5k_moe_cols_q8_1 = pipeline_q5k_moe_cols_q8_1,
             .pipeline_q6k_moe = pipeline_q6k_moe,
             .pipeline_quantize_q8_1 = pipeline_quantize_q8_1,
             .pipeline_count_experts = pipeline_count_experts,
@@ -2741,6 +2752,7 @@ pub const DmmvDispatch = struct {
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
         push_desc_fn: ?PushDescriptorFn,
+        quant_type: GGMLType,
         a_buf: vk.c.VkBuffer,
         a_size: vk.c.VkDeviceSize,
         x_packed_buf: vk.c.VkBuffer,
@@ -2767,7 +2779,11 @@ pub const DmmvDispatch = struct {
         y_offset: u32,
         accumulate: bool,
     ) !void {
-        const pip = if (self.pipeline_q4k_moe_cols_q8_1) |*p| p else return error.PipelineNotLoaded;
+        const pip = switch (quant_type) {
+            .q4_k => if (self.pipeline_q4k_moe_cols_q8_1) |*p| p else return error.UnsupportedQuantType,
+            .q5_k => if (self.pipeline_q5k_moe_cols_q8_1) |*p| p else return error.UnsupportedQuantType,
+            else => return error.UnsupportedQuantType,
+        };
         if (M == 0 or K == 0 or ids_stride == 0) return error.InvalidArgument;
         if ((K & 255) != 0) return error.InvalidArgument;
         const push = MoeColsDmmvPushConstants{
@@ -5775,6 +5791,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5k_moe) |*p| p.deinit();
         if (self.pipeline_q5k_moe_kpar) |*p| p.deinit();
         if (self.pipeline_q5k_moe_cols) |*p| p.deinit();
+        if (self.pipeline_q5k_moe_cols_q8_1) |*p| p.deinit();
         if (self.pipeline_q5_1_moe_cols) |*p| p.deinit();
         if (self.pipeline_q5_1_acc) |*p| p.deinit();
         if (self.pipeline_q5_1_moe_fused_down_acc) |*p| p.deinit();

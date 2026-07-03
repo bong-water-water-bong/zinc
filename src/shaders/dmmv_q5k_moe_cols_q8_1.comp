@@ -1,0 +1,217 @@
+#version 460
+// ZINC - tiled grouped Q5_K MoE down projection with route-major Q8_1 activations.
+//
+// One workgroup computes a 32-row by up-to-8-route tile for a single active
+// expert block. This targets Qwen A3B Q4_K_XL down experts, which store
+// ffn_down_exps as Q5_K.
+
+#include "dp4a_compat.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint a_offset;
+    uint expert_stride;
+    uint x_offset;
+    uint y_offset;
+    uint ids_stride;
+    uint x_route_divisor;
+    uint accumulate;
+};
+
+layout(set = 0, binding = 0) readonly buffer MatrixA { uint a_u32[]; };
+layout(set = 0, binding = 1) readonly buffer ActPacked { uint x_q8[]; };
+layout(set = 0, binding = 2) readonly buffer ActScaleDsum { vec2 x_sd[]; };
+layout(set = 0, binding = 3) buffer VectorY { float y_data[]; };
+layout(set = 0, binding = 4) readonly buffer Counts { uint counts[]; };
+layout(set = 0, binding = 5) readonly buffer PackedIds { uint packed_ids[]; };
+layout(set = 0, binding = 6) readonly buffer ActiveBlocks { uint active_blocks[]; };
+
+const uint BM = 32u;
+const uint BN = 8u;
+const uint BK = 32u;
+const uint TM = 4u;
+const uint WG_SIZE = 64u;
+const uint TPR_M = BM / TM;
+const uint TPR_N = WG_SIZE / TPR_M;
+const uint TN = BN / TPR_N;
+const uint Q5K_BLOCK_U32 = 44u;
+const uint SPACK = 9u;
+
+shared uint buf_a[BM * SPACK];
+shared vec2 buf_a_fb[BM];
+shared uint buf_b[BN * SPACK];
+shared vec2 buf_b_sd[BN];
+shared uint route_ids[BN];
+shared uint route_active[BN];
+
+void decode_sb(uint bytes[12], uint sb, out float sc, out float mn) {
+    if (sb < 4u) {
+        sc = float(bytes[sb] & 63u);
+        mn = float(bytes[sb + 4u] & 63u);
+    } else {
+        sc = float((bytes[sb + 4u] & 0xFu) | ((bytes[sb - 4u] >> 6u) << 4u));
+        mn = float(((bytes[sb + 4u] >> 4u) & 0xFu) | ((bytes[sb] >> 6u) << 4u));
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row_tile = gl_WorkGroupID.x;
+    const uint active_tile = gl_WorkGroupID.y;
+
+    const uint block_entry = active_blocks[active_tile];
+    if (block_entry == 0xFFFFFFFFu) return;
+    const uint expert_id = block_entry & 0xFFFFu;
+    const uint packed_base = (block_entry >> 16u) * BN;
+    const uint count = counts[expert_id];
+    if (packed_base >= count) return;
+
+    if (tid < BN) {
+        const bool route_is_active = packed_base + tid < count;
+        route_active[tid] = route_is_active ? 1u : 0u;
+        route_ids[tid] = route_is_active ? packed_ids[expert_id * ids_stride + packed_base + tid] : 0u;
+    }
+    barrier();
+
+    const uint tiwr = tid % TPR_M;
+    const uint tiwc = tid / TPR_M;
+    const uint row_base = row_tile * BM;
+
+    float sums[TM][TN];
+    [[unroll]] for (uint m = 0u; m < TM; m++) {
+        [[unroll]] for (uint n = 0u; n < TN; n++) sums[m][n] = 0.0;
+    }
+
+    const uint blocks_per_row = K / 256u;
+    const uint expert_base_u32 = (a_offset + expert_id * expert_stride) / 4u;
+    const uint packed_offset = x_offset / 4u;
+    const uint scale_offset = (x_offset / 4u) / 8u;
+    const uint x_div = max(x_route_divisor, 1u);
+
+    for (uint k_outer = 0u; k_outer < K; k_outer += BK) {
+        const uint super_block = k_outer / 256u;
+        const uint sb_offset = k_outer & 0xFFu;
+        const uint sb = sb_offset >> 5u;
+        const uint chunk = sb >> 1u;
+        const uint nibble_choice = sb & 1u;
+
+        {
+            const uint row_local = tid / 2u;
+            const uint tile_half = tid & 1u;
+            const uint k_in_tile = tile_half * 16u;
+            const uint row_global = row_base + row_local;
+            const uint blk_u32 = expert_base_u32 +
+                row_global * blocks_per_row * Q5K_BLOCK_U32 +
+                super_block * Q5K_BLOCK_U32;
+
+            const uint d_dmin = a_u32[blk_u32];
+            const float d_val = unpackHalf2x16(d_dmin & 0xFFFFu).x;
+            const float dmin_val = unpackHalf2x16(d_dmin >> 16).x;
+
+            const uint sc0 = a_u32[blk_u32 + 1u];
+            const uint sc1 = a_u32[blk_u32 + 2u];
+            const uint sc2 = a_u32[blk_u32 + 3u];
+            uint bytes[12];
+            bytes[0] = sc0 & 0xFFu;
+            bytes[1] = (sc0 >> 8u) & 0xFFu;
+            bytes[2] = (sc0 >> 16u) & 0xFFu;
+            bytes[3] = (sc0 >> 24u) & 0xFFu;
+            bytes[4] = sc1 & 0xFFu;
+            bytes[5] = (sc1 >> 8u) & 0xFFu;
+            bytes[6] = (sc1 >> 16u) & 0xFFu;
+            bytes[7] = (sc1 >> 24u) & 0xFFu;
+            bytes[8] = sc2 & 0xFFu;
+            bytes[9] = (sc2 >> 8u) & 0xFFu;
+            bytes[10] = (sc2 >> 16u) & 0xFFu;
+            bytes[11] = (sc2 >> 24u) & 0xFFu;
+
+            float sc_val;
+            float mn_val;
+            decode_sb(bytes, sb, sc_val, mn_val);
+
+            const uint qs_byte_base = chunk * 32u + k_in_tile;
+            const uint qs_u32_idx = blk_u32 + 12u + (qs_byte_base >> 2u);
+            const uint qh_u32_idx = blk_u32 + 4u + (k_in_tile >> 2u);
+
+            const uint base_a = row_local * SPACK + tile_half * 4u;
+            [[unroll]] for (uint w = 0u; w < 4u; w++) {
+                const uint qs_word = a_u32[qs_u32_idx + w];
+                const uint qh_word = a_u32[qh_u32_idx + w];
+                const uint nib = (nibble_choice == 0u) ? (qs_word & 0x0F0F0F0Fu)
+                                                       : ((qs_word >> 4u) & 0x0F0F0F0Fu);
+                const uint hi_x16 = ((qh_word >> sb) & 0x01010101u) << 4u;
+                buf_a[base_a + w] = nib | hi_x16;
+            }
+            if (tile_half == 0u) {
+                buf_a_fb[row_local] = vec2(d_val * sc_val, dmin_val * mn_val);
+            }
+        }
+
+        {
+            const uint col_local = tid >> 3u;
+            const uint pack_idx = tid & 7u;
+            if (col_local < BN) {
+                const bool route_is_active = route_active[col_local] != 0u;
+                const uint token_idx = route_ids[col_local] / x_div;
+                const uint base_b = col_local * SPACK;
+                const uint src = packed_offset + token_idx * (K / 4u) + (k_outer >> 2u) + pack_idx;
+                buf_b[base_b + pack_idx] = route_is_active ? x_q8[src] : 0u;
+                if (pack_idx == 0u) {
+                    buf_b_sd[col_local] = route_is_active
+                        ? x_sd[scale_offset + token_idx * (K / 32u) + (k_outer >> 5u)]
+                        : vec2(0.0);
+                }
+            }
+        }
+
+        barrier();
+
+        uint a_reg[TM][8];
+        vec2 a_fb_reg[TM];
+        [[unroll]] for (uint m = 0u; m < TM; m++) {
+            const uint wrow = (tiwr * TM + m) * SPACK;
+            [[unroll]] for (uint p = 0u; p < 8u; p++) a_reg[m][p] = buf_a[wrow + p];
+            a_fb_reg[m] = buf_a_fb[tiwr * TM + m];
+        }
+        [[unroll]] for (uint n = 0u; n < TN; n++) {
+            const uint col_local = tiwc * TN + n;
+            const uint acol = col_local * SPACK;
+            uint breg[8];
+            [[unroll]] for (uint p = 0u; p < 8u; p++) breg[p] = buf_b[acol + p];
+            const vec2 b_sd = buf_b_sd[col_local];
+            [[unroll]] for (uint m = 0u; m < TM; m++) {
+                int isum = 0;
+                [[unroll]] for (uint p = 0u; p < 8u; p++) {
+                    isum = dotPacked4x8AccSatEXT(int(a_reg[m][p]), int(breg[p]), isum);
+                }
+                sums[m][n] += b_sd.x * a_fb_reg[m].x * float(isum) - a_fb_reg[m].y * b_sd.y;
+            }
+        }
+
+        barrier();
+    }
+
+    const uint y_base = y_offset / 4u;
+    [[unroll]] for (uint m = 0u; m < TM; m++) {
+        [[unroll]] for (uint n = 0u; n < TN; n++) {
+            const uint row_g = row_base + tiwr * TM + m;
+            const uint col_local = tiwc * TN + n;
+            if (row_g < M && route_active[col_local] != 0u) {
+                const uint route = route_ids[col_local];
+                const uint out_idx = y_base + route * M + row_g;
+                if (accumulate != 0u) {
+                    y_data[out_idx] += sums[m][n];
+                } else {
+                    y_data[out_idx] = sums[m][n];
+                }
+            }
+        }
+    }
+}
