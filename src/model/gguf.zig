@@ -86,6 +86,7 @@ pub const GGMLType = enum(u32) {
             .q5_k => 256,
             .q6_k => 256,
             .q8_k => 256,
+            .iq1_s, .iq1_m => 256,
             else => 1,
         };
     }
@@ -117,6 +118,8 @@ pub const GGMLType = enum(u32) {
             .q6_k => 210,
             .q8_k => 292,
             .mxfp4 => 17, // 1 (E8M0 exponent) + 16 (32 × 4-bit packed)
+            .iq1_s => 34, // 256 × 1-bit + 2 bytes fp16 scale
+            .iq1_m => 36, // 256 × 1-bit + 2 bytes fp16 scale + 2 bytes min
             else => 0,
         };
     }
