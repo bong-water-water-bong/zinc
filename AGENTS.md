@@ -697,8 +697,11 @@ T >= 256:  cuBLAS fp16 (cublasGemmEx) — one-time dequant, reused across all to
 (`wmma.mma.sync.f32.f32`) instead of fp16. This limits all TC kernels to ~10%
 over scalar fp32. Inline PTX `wmma.mma.sync.f32.f16` is rejected by ptxas on
 sm_120, and inline `mma.sync.m16n8k16.row.col.f32.f16.f16.f32` produces wrong
-SASS output (driver bug). The ONLY viable fp16 TC path on Blackwell is
-`wgmma.mma_async` (requires kernel rewrite: warp groups, descriptors, async barriers).
+SASS output (NVRTC ptxas bug — nvcc compiles the same PTX correctly).
+
+**CUBIN compilation**: The CUDA shim uses `nvrtcGetCUBIN` instead of
+`nvrtcGetPTX` + driver JIT. This gives +30% on ALL kernels (NVRTC's internal
+ptxas generates better SASS than the driver JIT).
 
 Environment variables for GEMM kernel selection:
 
