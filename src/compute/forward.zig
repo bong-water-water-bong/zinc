@@ -1186,6 +1186,10 @@ pub const InferenceEngine = struct {
     // back automatically when the call site needs ffn_down_exps_scale or
     // post_ffw_norm or shared expert overlap.
     use_moe_fused_down_acc: bool = false,
+    // Routed Q5_K down+acc path: quantizes selected expert SwiGLU activations
+    // to Q8_1, then runs a K=512 DP4a fused down+weighted_acc shader. Defaults
+    // on for the measured Intel Qwen 3.6 A3B shape.
+    use_moe_q5k_q8_1_down_acc: bool = false,
     // Non-zero caps MoE top-k routing below the model's metadata value.
     // Used for the Qwen 3.6 35B-A3B pack, where lower-k routing is the direct
     // structural lever on the MoE prefill bucket. Override with
@@ -2385,6 +2389,34 @@ pub const InferenceEngine = struct {
         };
         const qwen36_topk_env = std.posix.getenv("ZINC_QWEN36_MOE_TOPK");
         const qwen36_moe_intel_safe_defaults = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
+
+        const moe_q5k_q8_1_down_acc_env = std.posix.getenv("ZINC_MOE_Q5K_Q8_1_DOWN_ACC");
+        const moe_q5k_q8_1_down_acc_explicitly_off = moe_q5k_q8_1_down_acc_env != null and
+            std.mem.eql(u8, moe_q5k_q8_1_down_acc_env.?, "0");
+        const moe_q5k_q8_1_down_acc_forced_on = moe_q5k_q8_1_down_acc_env != null and
+            !moe_q5k_q8_1_down_acc_explicitly_off;
+        const moe_q5k_q8_1_down_acc_default_on = qwen36_moe_intel_safe_defaults;
+        const moe_q5k_q8_1_down_acc_requested = !moe_fused_down_acc_explicitly_off and
+            !moe_q5k_q8_1_down_acc_explicitly_off and
+            (moe_q5k_q8_1_down_acc_forced_on or moe_q5k_q8_1_down_acc_default_on);
+        const moe_q5k_q8_1_down_acc_prereqs =
+            dmmv.pipeline_q5k_moe_fused_down_acc_q8_1 != null and
+            dmmv.pipeline_quantize_q8_1 != null and
+            instance.push_descriptor_fn != null;
+        const moe_q5k_q8_1_down_acc_enabled = moe_q5k_q8_1_down_acc_requested and
+            moe_q5k_q8_1_down_acc_prereqs;
+        if (moe_q5k_q8_1_down_acc_enabled) {
+            if (moe_q5k_q8_1_down_acc_forced_on) {
+                log.info("MoE Q5_K x Q8_1 fused down+acc ENABLED via ZINC_MOE_Q5K_Q8_1_DOWN_ACC", .{});
+            } else {
+                log.info("MoE Q5_K x Q8_1 fused down+acc ENABLED by default on Intel Qwen 3.6 MoE (set ZINC_MOE_Q5K_Q8_1_DOWN_ACC=0 to disable)", .{});
+            }
+        } else if (moe_q5k_q8_1_down_acc_requested) {
+            log.info("MoE Q5_K x Q8_1 fused down+acc requested but prerequisites missing; using default fused down+acc", .{});
+        } else if (moe_q5k_q8_1_down_acc_explicitly_off) {
+            log.info("MoE Q5_K x Q8_1 fused down+acc DISABLED via ZINC_MOE_Q5K_Q8_1_DOWN_ACC=0", .{});
+        }
+
         const qwen36_topk_default: u32 = if (qwen36_moe_intel_safe_defaults) 0 else 3;
         const qwen36_topk_limit: u32 = if (qwen36_like_f32_ssm) blk: {
             if (qwen36_topk_env) |raw| {
@@ -3517,6 +3549,7 @@ pub const InferenceEngine = struct {
             .use_moe_fused_gate_up = moe_fused_gate_up_enabled,
             .use_moe_fused_gate_up_swiglu = moe_fused_gate_up_swiglu_enabled,
             .use_moe_fused_down_acc = moe_fused_down_acc_enabled,
+            .use_moe_q5k_q8_1_down_acc = moe_q5k_q8_1_down_acc_enabled,
             .moe_topk_limit = if (gemma_topk_limit > 0) gemma_topk_limit else qwen36_topk_limit,
             .moe_prefill_tail_topk_limit = if (gemma_prefill_tail_topk_limit > 0) gemma_prefill_tail_topk_limit else qwen36_prefill_tail_topk_limit,
             .moe_prefill_tail_topk_guard_tokens = if (gemma_prefill_tail_topk_limit > 0) gemma_prefill_tail_topk_guard_tokens else qwen36_prefill_tail_topk_guard_tokens,
@@ -9159,11 +9192,61 @@ pub const InferenceEngine = struct {
                         !has_post_ffw_norm and
                         !has_per_expert_scale and
                         fused_pip_for_qt != null;
+                    const q8_1_moe_down_elems: u32 = n_used * inter_dim;
+                    const q8_1_moe_down_bytes: vk.c.VkDeviceSize =
+                        @as(vk.c.VkDeviceSize, (q8_1_moe_down_elems + 31) / 32) * Q8_1_BLOCK_BYTES;
+                    const can_q5k_q8_1_down_acc = self.use_moe_q5k_q8_1_down_acc and
+                        down_qt == .q5_k and
+                        !has_post_ffw_norm and
+                        !has_per_expert_scale and
+                        inter_dim == 512 and
+                        (q8_1_moe_down_elems & 31) == 0 and
+                        self.dmmv.pipeline_q5k_moe_fused_down_acc_q8_1 != null and
+                        self.dmmv.pipeline_quantize_q8_1 != null and
+                        self.instance.push_descriptor_fn != null and
+                        self.q8_1_buf.size >= q8_1_moe_down_bytes;
 
                     // down DMMV: ALL experts at once
                     // x_expert_stride=inter_dim: each expert reads from its own swiglu section
                     const moe_down_phase = self.beginProfilePhase();
-                    if (can_fuse_down_acc) {
+                    if (can_q5k_q8_1_down_acc) {
+                        try self.dmmv.recordQuantizeQ8_1(
+                            &self.decode_cmd,
+                            self.instance.push_descriptor_fn,
+                            self.swiglu_buf.handle,
+                            self.swiglu_buf.size,
+                            self.q8_1_buf.handle,
+                            self.q8_1_buf.size,
+                            q8_1_moe_down_elems,
+                        );
+                        self.decode_cmd.computeBufferBarrier(self.q8_1_buf.handle, q8_1_moe_down_bytes);
+                        const pip = &self.dmmv.pipeline_q5k_moe_fused_down_acc_q8_1.?;
+                        const push = MoeFusedDownAccPushConstants{
+                            .M = hidden_dim,
+                            .K = inter_dim,
+                            .expert_stride = expert_down_row_bytes,
+                            .x_expert_stride = inter_dim,
+                            .x_offset = 0,
+                            .y_offset = 0,
+                            .n_used = n_used,
+                        };
+                        self.pushDispatch4LastOffset(
+                            pip,
+                            std.mem.asBytes(&push),
+                            down_exps.gpu_buffer.handle,
+                            down_exps.gpu_buffer.size,
+                            self.q8_1_buf.handle,
+                            self.q8_1_buf.size,
+                            self.hidden_buf.handle,
+                            hidden_size,
+                            moe_route_buf,
+                            moe_route_offset,
+                            moe_route_size,
+                            (hidden_dim + 3) / 4,
+                            1,
+                            1,
+                        );
+                    } else if (can_fuse_down_acc) {
                         // Fused path: single dispatch produces weighted accumulation
                         // straight into hidden_buf. No down_buf intermediate needed.
                         const pip = fused_pip_for_qt.?;

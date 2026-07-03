@@ -266,6 +266,7 @@ pub fn build(b: *std.Build) void {
         "dmmv_q4k_moe_batched",
         "dmmv_q4k_moe_fused_down_acc",
         "dmmv_q5k_moe_fused_down_acc",
+        "dmmv_q5k_moe_fused_down_acc_q8_1",
         "dmmv_q5_1_moe_fused_down_acc",
         "dmmv_q5_1_moe_fused_down_acc_scaled",
         "dmmv_q5_1_moe_down_acc_scaled_batch_top1",

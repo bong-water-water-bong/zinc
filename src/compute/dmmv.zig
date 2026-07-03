@@ -483,6 +483,9 @@ pub const DmmvDispatch = struct {
     /// packs where the down projection ships as Q5_K (e.g.
     /// Qwen3.6-35B-A3B-UD-Q4_K_XL) so the fused path can engage there too.
     pipeline_q5k_moe_fused_down_acc: ?Pipeline,
+    /// Q5_K fused routed down+acc over Q8_1-quantized per-expert SwiGLU
+    /// activations. A3B decode specialization for K=512.
+    pipeline_q5k_moe_fused_down_acc_q8_1: ?Pipeline,
     /// MoE Q5K pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_q5k_moe: ?Pipeline,
     /// Experimental K-parallel Q5K MoE pipeline (same 4 bindings, wave64 subgroupAdd).
@@ -1207,6 +1210,11 @@ pub const DmmvDispatch = struct {
         const q5k_fused_down_acc_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_moe_fused_down_acc.spv", .{shader_dir}) catch unreachable;
         const pipeline_q5k_moe_fused_down_acc = pipeline_mod.createFromSpirvWithOptions(instance, q5k_fused_down_acc_path, 4, fused_down_acc_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("Q5_K MoE fused down+acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q5k_fused_down_acc_q81_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_moe_fused_down_acc_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5k_moe_fused_down_acc_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q5k_fused_down_acc_q81_path, 4, fused_down_acc_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("Q5_K MoE fused down+acc Q8_1 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -2310,6 +2318,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_o_proj_merge = pipeline_q4k_o_proj_merge,
             .pipeline_q4k_moe_fused_down_acc = pipeline_q4k_moe_fused_down_acc,
             .pipeline_q5k_moe_fused_down_acc = pipeline_q5k_moe_fused_down_acc,
+            .pipeline_q5k_moe_fused_down_acc_q8_1 = pipeline_q5k_moe_fused_down_acc_q8_1,
             .pipeline_mxfp4_moe = pipeline_mxfp4_moe,
             .pipeline_q5_1_moe = pipeline_q5_1_moe,
             .pipeline_q5_1_moe_cols = pipeline_q5_1_moe_cols,
@@ -5762,6 +5771,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_o_proj_merge) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_down_acc) |*p| p.deinit();
         if (self.pipeline_q5k_moe_fused_down_acc) |*p| p.deinit();
+        if (self.pipeline_q5k_moe_fused_down_acc_q8_1) |*p| p.deinit();
         if (self.pipeline_q5k_moe) |*p| p.deinit();
         if (self.pipeline_q5k_moe_kpar) |*p| p.deinit();
         if (self.pipeline_q5k_moe_cols) |*p| p.deinit();

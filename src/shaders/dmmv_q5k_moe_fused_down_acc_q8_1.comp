@@ -1,0 +1,140 @@
+#version 460
+// ZINC - Fused Q5_K MoE down + weighted_acc over Q8_1 activations.
+//
+// A3B routed-down specialization: K=512, so each expert activation has sixteen
+// 32-element Q8_1 blocks. One 64-lane workgroup handles four output rows:
+// lane layout is row_local[0..3] x q8_block[0..15]. Lane 0 of each row reduces
+// its sixteen block partials and accumulates the weighted expert sum directly
+// into hidden_buf.
+
+#include "dp4a_compat.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint expert_stride;
+    uint x_expert_stride;
+    uint x_offset;
+    uint y_offset;
+    uint n_used;
+};
+
+layout(set = 0, binding = 0) readonly buffer MatrixA { uint a_u32[]; };
+layout(set = 0, binding = 1) readonly buffer VectorXQ81 { uint x_q81[]; };
+layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
+layout(set = 0, binding = 3) readonly buffer MoeRouting { uint routing_data[]; };
+
+const uint NUM_ROWS = 4u;
+const uint LANES_PER_ROW = 16u;
+const uint Q5K_BLOCK_U32 = 44u;
+const uint Q8_1_U32_PER_BLOCK = 9u;
+
+shared float s_partials[64];
+
+uint q5k_scale_byte(uint sc0, uint sc1, uint sc2, uint idx) {
+    uint word = (idx < 4u) ? sc0 : ((idx < 8u) ? sc1 : sc2);
+    return (word >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+void q5k_scale_min(uint sb, uint sc0, uint sc1, uint sc2, out float sc_val, out float mn_val) {
+    if (sb < 4u) {
+        const uint b0 = q5k_scale_byte(sc0, sc1, sc2, sb);
+        const uint b4 = q5k_scale_byte(sc0, sc1, sc2, sb + 4u);
+        sc_val = float(b0 & 63u);
+        mn_val = float(b4 & 63u);
+    } else {
+        const uint b = q5k_scale_byte(sc0, sc1, sc2, sb);
+        const uint b4 = q5k_scale_byte(sc0, sc1, sc2, sb + 4u);
+        const uint bm4 = q5k_scale_byte(sc0, sc1, sc2, sb - 4u);
+        sc_val = float((b4 & 0xFu) | ((bm4 >> 6) << 4));
+        mn_val = float(((b4 >> 4) & 0xFu) | ((b >> 6) << 4));
+    }
+}
+
+uint q5k_pack_nibbles(uint qs_word, bool high) {
+    if (high) qs_word >>= 4u;
+    const uint q0 = qs_word & 0xFu;
+    const uint q1 = (qs_word >> 8u) & 0xFu;
+    const uint q2 = (qs_word >> 16u) & 0xFu;
+    const uint q3 = (qs_word >> 24u) & 0xFu;
+    return q0 | (q1 << 8u) | (q2 << 16u) | (q3 << 24u);
+}
+
+float dot_q5k_q8_1_block(uint row_u32, uint q5_block, uint sb, uint x_block_u32) {
+    const uint blk_u32 = row_u32 + q5_block * Q5K_BLOCK_U32;
+    const uint d_dmin = a_u32[blk_u32];
+    const float d_val = unpackHalf2x16(d_dmin & 0xFFFFu).x;
+    const float dmin_val = unpackHalf2x16(d_dmin >> 16).x;
+    const uint sc0 = a_u32[blk_u32 + 1u];
+    const uint sc1 = a_u32[blk_u32 + 2u];
+    const uint sc2 = a_u32[blk_u32 + 3u];
+
+    float sc_val;
+    float mn_val;
+    q5k_scale_min(sb, sc0, sc1, sc2, sc_val, mn_val);
+
+    const uint q_group = sb >> 1u;
+    const bool high = (sb & 1u) != 0u;
+    const uint qs_base = blk_u32 + 12u + q_group * 8u;
+    const uint qh_base = blk_u32 + 4u;
+
+    int isum = 0;
+    [[unroll]] for (uint p = 0u; p < 8u; p++) {
+        const uint qs_word = a_u32[qs_base + p];
+        const uint qh_word = a_u32[qh_base + p];
+        const uint nib = q5k_pack_nibbles(qs_word, high);
+        const uint hi_x16 = ((qh_word >> sb) & 0x01010101u) << 4u;
+        const uint q_packed = nib | hi_x16;
+        isum = dotPacked4x8AccSatEXT(int(q_packed), int(x_q81[x_block_u32 + p]), isum);
+    }
+
+    const vec2 ds = unpackHalf2x16(x_q81[x_block_u32 + 8u]);
+    return ds.x * (d_val * sc_val) * float(isum) - (dmin_val * mn_val) * ds.y;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row_local = tid / LANES_PER_ROW;
+    const uint q8_block = tid & (LANES_PER_ROW - 1u);
+    const uint row = gl_WorkGroupID.x * NUM_ROWS + row_local;
+    const bool row_valid = row < M;
+
+    const uint blocks_per_row = K / 256u;
+    const uint q8_blocks_per_expert = K / 32u;
+    const uint y_base = y_offset / 4u;
+    const uint x_base_block = x_offset / 36u;
+
+    float row_acc = 0.0;
+    for (uint e = 0u; e < n_used; e++) {
+        float part = 0.0;
+        if (row_valid && q8_block < q8_blocks_per_expert) {
+            const uint expert_id = routing_data[e];
+            const uint a_base_u32 = (expert_id * expert_stride) / 4u;
+            const uint row_u32 = a_base_u32 + row * blocks_per_row * Q5K_BLOCK_U32;
+            const uint x_block_u32 = (x_base_block + (e * x_expert_stride) / 32u + q8_block) * Q8_1_U32_PER_BLOCK;
+            part = dot_q5k_q8_1_block(row_u32, q8_block >> 3u, q8_block & 7u, x_block_u32);
+        }
+
+        s_partials[tid] = part;
+        barrier();
+
+        if (row_valid && q8_block == 0u) {
+            float sum = 0.0;
+            const uint base = row_local * LANES_PER_ROW;
+            [[unroll]] for (uint i = 0u; i < LANES_PER_ROW; i++) {
+                sum += s_partials[base + i];
+            }
+            row_acc += uintBitsToFloat(routing_data[n_used + e]) * sum;
+        }
+        barrier();
+    }
+
+    if (row_valid && q8_block == 0u) {
+        y_data[y_base + row] += row_acc;
+    }
+}
