@@ -107,10 +107,12 @@ test("remote tuning env forwards Q8_1 projection toggles", () => {
     ZINC_Q8_1_LM_HEAD: "1",
     ZINC_Q8_1_SSM_QKV_Z: "1",
     ZINC_MOE_Q5K_Q8_1_DOWN_ACC: "1",
+    ZINC_INTEL_A3B_PRODUCTION: "0",
   });
   expect(env.ZINC_Q8_1_LM_HEAD).toBe("1");
   expect(env.ZINC_Q8_1_SSM_QKV_Z).toBe("1");
   expect(env.ZINC_MOE_Q5K_Q8_1_DOWN_ACC).toBe("1");
+  expect(env.ZINC_INTEL_A3B_PRODUCTION).toBe("0");
 });
 
 test("parseArgs reads RDNA backend and device options", () => {

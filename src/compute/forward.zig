@@ -17230,6 +17230,12 @@ pub const InferenceEngine = struct {
             self.gpu_config.vendor == .amd_rdna4_apu;
     }
 
+    fn intelA3bProductionEnabled(self: *const InferenceEngine) bool {
+        if (!isIntelGpuVendor(self.gpu_config.vendor)) return false;
+        const raw = std.posix.getenv("ZINC_INTEL_A3B_PRODUCTION") orelse return true;
+        return raw.len > 0 and !std.mem.eql(u8, raw, "0");
+    }
+
     fn qwen36DensePrefillSsmPreprojEnabled(self: *const InferenceEngine) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwen36DenseHybrid27B()) return false;
@@ -17311,7 +17317,7 @@ pub const InferenceEngine = struct {
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
         if (!self.isQwen36A3bMoePrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isAmdRdna() and !self.intelA3bProductionEnabled()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         if (n_tokens < 128) return false;
@@ -22270,7 +22276,7 @@ pub const InferenceEngine = struct {
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
         if (!self.isQwen36A3bMoePrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isAmdRdna() and !self.intelA3bProductionEnabled()) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         if (self.elementwise.pipeline_rope_batched == null) return false;
         if (self.elementwise.pipeline_kv_cache_write_batched == null) return false;
@@ -22339,7 +22345,7 @@ pub const InferenceEngine = struct {
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
         if (!self.isQwen36A3bMoePrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isAmdRdna() and !self.intelA3bProductionEnabled()) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         if (self.attention.pipeline_batched == null) return false;
         if (self.elementwise.pipeline_rope_batched == null) return false;
@@ -22753,7 +22759,7 @@ pub const InferenceEngine = struct {
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
         if (!self.isQwen36A3bMoePrefillModel()) return false;
-        if (!self.isAmdRdna()) return false;
+        if (!self.isAmdRdna() and !self.intelA3bProductionEnabled()) return false;
         if (self.instance.push_descriptor_fn == null) return false;
         if (self.use_ssm_delta_normed_qk) return false;
         if (self.elementwise.pipeline_ssm_conv1d == null) return false;
@@ -22917,7 +22923,7 @@ pub const InferenceEngine = struct {
                 !self.validation_diagnostics_enabled and
                 !self.profile_enabled and
                 self.instance.push_descriptor_fn != null and
-                self.isAmdRdna());
+                (self.isAmdRdna() or self.intelA3bProductionEnabled()));
         var layer: u32 = 0;
         while (layer < cfg.n_layers) : (layer += 1) {
             const is_final_layer = layer + 1 == cfg.n_layers;
@@ -25241,8 +25247,9 @@ pub const InferenceEngine = struct {
     /// the `canUseBatchedPrefillRdna`-gated batched body or `prefillBatch` (per-token
     /// serial path). Set `ZINC_BATCHED_PREFILL=0` to force the serial fallback or
     /// `=validate` to run both paths and diff the last-token logits. Intel Arc dense
-    /// Gemma uses the chunked batched path by default; other Intel models still require
-    /// `ZINC_INTEL_BATCHED_PREFILL=1` to opt in.
+    /// Gemma uses the chunked batched path by default; Qwen 3.6 A3B uses the
+    /// specialized layer-major path by default; other Intel models still
+    /// require `ZINC_INTEL_BATCHED_PREFILL=1` to opt in.
     /// @param state Decode state for the current request.
     /// @param prompt_tokens Tokenized prompt sequence to prefill.
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
