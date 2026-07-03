@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-03T01:48:13.127Z",
+  "generated_at": "2026-07-03T03:38:41.661Z",
   "targets": [
     {
       "id": "rdna",
@@ -11650,7 +11650,7 @@
       "id": "intel",
       "label": "Intel Arc",
       "description": "Intel Arc benchmark node results collected over SSH and compared against llama.cpp on the same hardware.",
-      "generated_at": "2026-07-03T01:46:23.934Z",
+      "generated_at": "2026-07-03T03:38:24.067Z",
       "source": "tools/performance_suite.mjs",
       "machine": {
         "label": "Intel Arc bench node",
@@ -11662,8 +11662,8 @@
       },
       "provenance": {
         "zinc": {
-          "version": "bd672a826b76-dirty",
-          "commit": "bd672a826b762ebf2da2d84a1df225da64f55ff4"
+          "version": "9f3fb7019a99-dirty",
+          "commit": "9f3fb7019a991768fba6f0c4820153db78cc746d"
         },
         "llama_cpp": {
           "binary": "llama-server",
@@ -11692,12 +11692,12 @@
         "fastest_decode_tps": 62.78,
         "benchmarked_models": 5,
         "successful_models": 5,
-        "average_decode_tps": 42.239999999999995,
-        "average_prompt_tps": 114.64000000000001,
-        "average_end_to_end_tps": 21.587291052606467,
-        "average_total_latency_ms": 10040.160775000031,
+        "average_decode_tps": 43.19799999999999,
+        "average_prompt_tps": 117.672,
+        "average_end_to_end_tps": 21.57395618798653,
+        "average_total_latency_ms": 10044.993083200034,
         "compared_models": 5,
-        "average_pct_of_llama": 112.23041918133201
+        "average_pct_of_llama": 113.10304396951732
       },
       "models": [
         {
@@ -11715,96 +11715,96 @@
             "name": "ZINC",
             "prompt_tokens": 49,
             "generated_tokens": 96,
-            "output_preview": "The most likely cause is a difference in **quantization precision or bit-depth**. If one benchmark used a 4-bit quantization and the other used an 8-bit or FP16 precision, the latter will naturally be slower because the GPU must process more data per token. Higher precision increases the memory bandwidth requirements and the computational load, directly reducing the tokens-per-second (tok/s) output.\n\nAnother common cause is a difference in **hardware utilization",
+            "output_preview": "The discrepancy in tokens per second (tok/s) likely stems from differences in **hardware utilization** or **software configuration**. If one benchmark used a higher batch size or a different precision (e.g., FP16 vs. FP32), the throughput would vary. Additionally, one teammate may have used a different number of threads or a different attention mechanism (like FlashAttention) to optimize the inference speed.\n\nThe second most likely cause is a difference in **quant",
             "prefill_ms": {
-              "min": 175.4,
-              "max": 177.3,
-              "avg": 176.5,
-              "median": 176.8,
-              "p95": 177.25,
-              "stddev": 0.8041558721209905,
+              "min": 166.8,
+              "max": 175.1,
+              "avg": 169.83333333333334,
+              "median": 167.6,
+              "p95": 174.35,
+              "stddev": 3.738389433373083,
               "samples": [
-                175.4,
-                177.3,
-                176.8
+                167.6,
+                175.1,
+                166.8
               ]
             },
             "prefill_tps": {
-              "min": 276.31,
-              "max": 279.37,
-              "avg": 277.6333333333333,
-              "median": 277.22,
-              "p95": 279.15500000000003,
-              "stddev": 1.2829739756605425,
+              "min": 279.81,
+              "max": 293.84,
+              "avg": 288.6766666666667,
+              "median": 292.38,
+              "p95": 293.69399999999996,
+              "stddev": 6.297948519601875,
               "samples": [
-                279.37,
-                276.31,
-                277.22
+                292.38,
+                279.81,
+                293.84
               ]
             },
             "decode_ms": {
-              "min": 1782,
-              "max": 1787.7,
-              "avg": 1783.9666666666665,
-              "median": 1782.2,
-              "p95": 1787.15,
-              "stddev": 2.6411277052720523,
+              "min": 1615.9,
+              "max": 1644.4,
+              "avg": 1632.2666666666667,
+              "median": 1636.5,
+              "p95": 1643.6100000000001,
+              "stddev": 12.013973345881674,
               "samples": [
-                1787.7,
-                1782.2,
-                1782
+                1644.4,
+                1636.5,
+                1615.9
               ]
             },
             "decode_tps": {
-              "min": 53.7,
-              "max": 53.87,
-              "avg": 53.81333333333333,
-              "median": 53.87,
-              "p95": 53.87,
-              "stddev": 0.08013876853447284,
+              "min": 58.38,
+              "max": 59.41,
+              "avg": 58.81666666666666,
+              "median": 58.66,
+              "p95": 59.335,
+              "stddev": 0.43484352230300866,
               "samples": [
-                53.7,
-                53.87,
-                53.87
+                58.38,
+                58.66,
+                59.41
               ]
             },
             "ms_per_token": {
-              "min": 18.6,
-              "max": 18.6,
-              "avg": 18.6,
-              "median": 18.6,
-              "p95": 18.6,
-              "stddev": 0,
+              "min": 16.8,
+              "max": 17.1,
+              "avg": 16.966666666666665,
+              "median": 17,
+              "p95": 17.090000000000003,
+              "stddev": 0.12472191289246491,
               "samples": [
-                18.6,
-                18.6,
-                18.6
+                17.1,
+                17,
+                16.8
               ]
             },
             "total_latency_ms": {
-              "min": 7209.288791999999,
-              "max": 7268.450124999999,
-              "avg": 7238.1610279999995,
-              "median": 7236.744166999999,
-              "p95": 7265.279529199999,
-              "stddev": 24.17328348823985,
+              "min": 7174.200666000004,
+              "max": 8463.771875000006,
+              "avg": 7632.959416333339,
+              "median": 7260.905708000006,
+              "p95": 8343.485258300007,
+              "stddev": 588.5385556239398,
               "samples": [
-                7236.744166999999,
-                7209.288791999999,
-                7268.450124999999
+                8463.771875000006,
+                7260.905708000006,
+                7174.200666000004
               ]
             },
             "end_to_end_tps": {
-              "min": 19.94923229936864,
-              "max": 20.11294098259783,
-              "avg": 20.032936026621602,
-              "median": 20.03663479789834,
-              "p95": 20.10531036412788,
-              "stddev": 0.0668849456050074,
+              "min": 17.131841706213272,
+              "max": 20.21131088334126,
+              "avg": 19.10437102145106,
+              "median": 19.969960474798647,
+              "p95": 20.187175842487,
+              "stddev": 1.3982647411536584,
               "samples": [
-                20.03663479789834,
-                20.11294098259783,
-                19.94923229936864
+                17.131841706213272,
+                19.969960474798647,
+                20.21131088334126
               ]
             }
           },
@@ -11907,32 +11907,32 @@
           },
           "comparison": {
             "baseline_name": "llama.cpp",
-            "zinc_prompt_tps": 277.22,
+            "zinc_prompt_tps": 292.38,
             "baseline_prompt_tps": 268.9882421101093,
-            "zinc_decode_tps": 53.87,
+            "zinc_decode_tps": 58.66,
             "baseline_decode_tps": 61.97962936181642,
-            "zinc_total_latency_ms": 7236.744166999999,
+            "zinc_total_latency_ms": 7260.905708000006,
             "baseline_total_latency_ms": 2064.8535000000265,
-            "zinc_end_to_end_tps": 20.03663479789834,
+            "zinc_end_to_end_tps": 19.969960474798647,
             "baseline_end_to_end_tps": 71.675787168435,
-            "zinc_overall_tps": 74.02404912358668,
+            "zinc_overall_tps": 80.3707149509967,
             "baseline_overall_tps": 84.94942926037173,
-            "zinc_overall_seconds": 1.9588228652274289,
+            "zinc_overall_seconds": 1.8041397303533855,
             "baseline_overall_seconds": 1.7422129999999998,
             "overall_basis": "phase_wall_time_v2",
             "overall_comparable": true,
             "overall_unavailable_reason": null,
-            "pct_of_baseline": 86.91565366666666,
-            "delta_tps": -8.109629361816424,
-            "delta_pct": -13.084346333333343,
+            "pct_of_baseline": 94.64399933333331,
+            "delta_tps": -3.3196293618164248,
+            "delta_pct": -5.356000666666688,
             "leader": "baseline",
-            "prompt_pct_of_baseline": 103.06026680769232,
-            "latency_pct_of_baseline": 350.4725234502063,
-            "latency_delta_ms": 5171.890666999972,
-            "end_to_end_pct_of_baseline": 27.954537493691024,
-            "end_to_end_delta_tps": -51.63915237053665,
-            "overall_pct_of_baseline": 88.94183496258711,
-            "overall_delta_tps": -10.925380136785051
+            "prompt_pct_of_baseline": 108.69620088461538,
+            "latency_pct_of_baseline": 351.6426568761373,
+            "latency_delta_ms": 5196.052207999979,
+            "end_to_end_pct_of_baseline": 27.861515392736607,
+            "end_to_end_delta_tps": -51.70582669363635,
+            "overall_pct_of_baseline": 96.56752028063504,
+            "overall_delta_tps": -4.57871430937503
           },
           "scenarios": [
             {
@@ -11949,96 +11949,96 @@
                 "name": "ZINC",
                 "prompt_tokens": 49,
                 "generated_tokens": 96,
-                "output_preview": "The most likely cause is a difference in **quantization precision or bit-depth**. If one benchmark used a 4-bit quantization and the other used an 8-bit or FP16 precision, the latter will naturally be slower because the GPU must process more data per token. Higher precision increases the memory bandwidth requirements and the computational load, directly reducing the tokens-per-second (tok/s) output.\n\nAnother common cause is a difference in **hardware utilization",
+                "output_preview": "The discrepancy in tokens per second (tok/s) likely stems from differences in **hardware utilization** or **software configuration**. If one benchmark used a higher batch size or a different precision (e.g., FP16 vs. FP32), the throughput would vary. Additionally, one teammate may have used a different number of threads or a different attention mechanism (like FlashAttention) to optimize the inference speed.\n\nThe second most likely cause is a difference in **quant",
                 "prefill_ms": {
-                  "min": 175.4,
-                  "max": 177.3,
-                  "avg": 176.5,
-                  "median": 176.8,
-                  "p95": 177.25,
-                  "stddev": 0.8041558721209905,
+                  "min": 166.8,
+                  "max": 175.1,
+                  "avg": 169.83333333333334,
+                  "median": 167.6,
+                  "p95": 174.35,
+                  "stddev": 3.738389433373083,
                   "samples": [
-                    175.4,
-                    177.3,
-                    176.8
+                    167.6,
+                    175.1,
+                    166.8
                   ]
                 },
                 "prefill_tps": {
-                  "min": 276.31,
-                  "max": 279.37,
-                  "avg": 277.6333333333333,
-                  "median": 277.22,
-                  "p95": 279.15500000000003,
-                  "stddev": 1.2829739756605425,
+                  "min": 279.81,
+                  "max": 293.84,
+                  "avg": 288.6766666666667,
+                  "median": 292.38,
+                  "p95": 293.69399999999996,
+                  "stddev": 6.297948519601875,
                   "samples": [
-                    279.37,
-                    276.31,
-                    277.22
+                    292.38,
+                    279.81,
+                    293.84
                   ]
                 },
                 "decode_ms": {
-                  "min": 1782,
-                  "max": 1787.7,
-                  "avg": 1783.9666666666665,
-                  "median": 1782.2,
-                  "p95": 1787.15,
-                  "stddev": 2.6411277052720523,
+                  "min": 1615.9,
+                  "max": 1644.4,
+                  "avg": 1632.2666666666667,
+                  "median": 1636.5,
+                  "p95": 1643.6100000000001,
+                  "stddev": 12.013973345881674,
                   "samples": [
-                    1787.7,
-                    1782.2,
-                    1782
+                    1644.4,
+                    1636.5,
+                    1615.9
                   ]
                 },
                 "decode_tps": {
-                  "min": 53.7,
-                  "max": 53.87,
-                  "avg": 53.81333333333333,
-                  "median": 53.87,
-                  "p95": 53.87,
-                  "stddev": 0.08013876853447284,
+                  "min": 58.38,
+                  "max": 59.41,
+                  "avg": 58.81666666666666,
+                  "median": 58.66,
+                  "p95": 59.335,
+                  "stddev": 0.43484352230300866,
                   "samples": [
-                    53.7,
-                    53.87,
-                    53.87
+                    58.38,
+                    58.66,
+                    59.41
                   ]
                 },
                 "ms_per_token": {
-                  "min": 18.6,
-                  "max": 18.6,
-                  "avg": 18.6,
-                  "median": 18.6,
-                  "p95": 18.6,
-                  "stddev": 0,
+                  "min": 16.8,
+                  "max": 17.1,
+                  "avg": 16.966666666666665,
+                  "median": 17,
+                  "p95": 17.090000000000003,
+                  "stddev": 0.12472191289246491,
                   "samples": [
-                    18.6,
-                    18.6,
-                    18.6
+                    17.1,
+                    17,
+                    16.8
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 7209.288791999999,
-                  "max": 7268.450124999999,
-                  "avg": 7238.1610279999995,
-                  "median": 7236.744166999999,
-                  "p95": 7265.279529199999,
-                  "stddev": 24.17328348823985,
+                  "min": 7174.200666000004,
+                  "max": 8463.771875000006,
+                  "avg": 7632.959416333339,
+                  "median": 7260.905708000006,
+                  "p95": 8343.485258300007,
+                  "stddev": 588.5385556239398,
                   "samples": [
-                    7236.744166999999,
-                    7209.288791999999,
-                    7268.450124999999
+                    8463.771875000006,
+                    7260.905708000006,
+                    7174.200666000004
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 19.94923229936864,
-                  "max": 20.11294098259783,
-                  "avg": 20.032936026621602,
-                  "median": 20.03663479789834,
-                  "p95": 20.10531036412788,
-                  "stddev": 0.0668849456050074,
+                  "min": 17.131841706213272,
+                  "max": 20.21131088334126,
+                  "avg": 19.10437102145106,
+                  "median": 19.969960474798647,
+                  "p95": 20.187175842487,
+                  "stddev": 1.3982647411536584,
                   "samples": [
-                    20.03663479789834,
-                    20.11294098259783,
-                    19.94923229936864
+                    17.131841706213272,
+                    19.969960474798647,
+                    20.21131088334126
                   ]
                 }
               },
@@ -12141,32 +12141,32 @@
               },
               "comparison": {
                 "baseline_name": "llama.cpp",
-                "zinc_prompt_tps": 277.22,
+                "zinc_prompt_tps": 292.38,
                 "baseline_prompt_tps": 268.9882421101093,
-                "zinc_decode_tps": 53.87,
+                "zinc_decode_tps": 58.66,
                 "baseline_decode_tps": 61.97962936181642,
-                "zinc_total_latency_ms": 7236.744166999999,
+                "zinc_total_latency_ms": 7260.905708000006,
                 "baseline_total_latency_ms": 2064.8535000000265,
-                "zinc_end_to_end_tps": 20.03663479789834,
+                "zinc_end_to_end_tps": 19.969960474798647,
                 "baseline_end_to_end_tps": 71.675787168435,
-                "zinc_overall_tps": 74.02404912358668,
+                "zinc_overall_tps": 80.3707149509967,
                 "baseline_overall_tps": 84.94942926037173,
-                "zinc_overall_seconds": 1.9588228652274289,
+                "zinc_overall_seconds": 1.8041397303533855,
                 "baseline_overall_seconds": 1.7422129999999998,
                 "overall_basis": "phase_wall_time_v2",
                 "overall_comparable": true,
                 "overall_unavailable_reason": null,
-                "pct_of_baseline": 86.91565366666666,
-                "delta_tps": -8.109629361816424,
-                "delta_pct": -13.084346333333343,
+                "pct_of_baseline": 94.64399933333331,
+                "delta_tps": -3.3196293618164248,
+                "delta_pct": -5.356000666666688,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 103.06026680769232,
-                "latency_pct_of_baseline": 350.4725234502063,
-                "latency_delta_ms": 5171.890666999972,
-                "end_to_end_pct_of_baseline": 27.954537493691024,
-                "end_to_end_delta_tps": -51.63915237053665,
-                "overall_pct_of_baseline": 88.94183496258711,
-                "overall_delta_tps": -10.925380136785051
+                "prompt_pct_of_baseline": 108.69620088461538,
+                "latency_pct_of_baseline": 351.6426568761373,
+                "latency_delta_ms": 5196.052207999979,
+                "end_to_end_pct_of_baseline": 27.861515392736607,
+                "end_to_end_delta_tps": -51.70582669363635,
+                "overall_pct_of_baseline": 96.56752028063504,
+                "overall_delta_tps": -4.57871430937503
               }
             },
             {
@@ -12183,96 +12183,96 @@
                 "name": "ZINC",
                 "prompt_tokens": 192,
                 "generated_tokens": 160,
-                "output_preview": "### The Bug\n\nThe bug lies in the second line of the function:\n```ts\nif (pending.has(key)) return cache.get(key)!;\n```\n\nThere are two critical issues here:\n1. **Logic Error:** It attempts to return `cache.get(key)!`, but if the code reaches this line, it means the key is in `pending` but **not** in `cache`. This will result in `undefined` being returned (or a runtime error if the type is strictly enforced), rather than the actual promise stored in `pending`.\n2. **The Race Condition (Concurrency Bug):** Even if the line were corrected to `return pending.get(key)!`, the function is not \"atomic\" regarding the check-and",
+                "output_preview": "### The Bug\n\nThe bug is a **logic error in the second conditional check**:\n`if (pending.has(key)) return cache.get(key)!;`\n\nWhile the intention was to prevent a new request from starting, the implementation is flawed. Specifically, it attempts to return the result of a value from the `cache` map, but `pending` is a separate map holding `Promises`. \n\nIf `pending.has(key)` is true, the code tries to call `cache.get(key)`, but the `cache` does not yet contain the value—the `pending` map contains the `Promise`.\n\n---\n\n### Why it appears under concurrent requests\n\nThis is a classic **\"Cache Stamp\"** or **\"Thundering\"** issue",
                 "prefill_ms": {
-                  "min": 1904.4,
-                  "max": 1907.6,
-                  "avg": 1906.1333333333332,
-                  "median": 1906.4,
-                  "p95": 1907.4799999999998,
-                  "stddev": 1.3199326582148214,
+                  "min": 1890.5,
+                  "max": 1906.2,
+                  "avg": 1898.7666666666667,
+                  "median": 1899.6,
+                  "p95": 1905.54,
+                  "stddev": 6.436527704351864,
                   "samples": [
-                    1906.4,
-                    1907.6,
-                    1904.4
+                    1890.5,
+                    1899.6,
+                    1906.2
                   ]
                 },
                 "prefill_tps": {
-                  "min": 100.65,
-                  "max": 100.82,
-                  "avg": 100.73,
-                  "median": 100.72,
-                  "p95": 100.80999999999999,
-                  "stddev": 0.06976149845484944,
+                  "min": 100.73,
+                  "max": 101.56,
+                  "avg": 101.12,
+                  "median": 101.07,
+                  "p95": 101.51100000000001,
+                  "stddev": 0.34068558329736603,
                   "samples": [
-                    100.72,
-                    100.65,
-                    100.82
+                    101.56,
+                    101.07,
+                    100.73
                   ]
                 },
                 "decode_ms": {
-                  "min": 3070.8,
-                  "max": 3078.4,
-                  "avg": 3075.6,
-                  "median": 3077.6,
-                  "p95": 3078.32,
-                  "stddev": 3.409789827345101,
+                  "min": 2817.2,
+                  "max": 2833.3,
+                  "avg": 2824.6999999999994,
+                  "median": 2823.6,
+                  "p95": 2832.33,
+                  "stddev": 6.618660488850344,
                   "samples": [
-                    3077.6,
-                    3070.8,
-                    3078.4
+                    2833.3,
+                    2823.6,
+                    2817.2
                   ]
                 },
                 "decode_tps": {
-                  "min": 51.98,
-                  "max": 52.1,
-                  "avg": 52.02333333333333,
-                  "median": 51.99,
-                  "p95": 52.089,
-                  "stddev": 0.05436502143433473,
+                  "min": 56.47,
+                  "max": 56.79,
+                  "avg": 56.64333333333334,
+                  "median": 56.67,
+                  "p95": 56.778000000000006,
+                  "stddev": 0.13199326582148918,
                   "samples": [
-                    51.99,
-                    52.1,
-                    51.98
+                    56.47,
+                    56.67,
+                    56.79
                   ]
                 },
                 "ms_per_token": {
-                  "min": 19.2,
-                  "max": 19.2,
-                  "avg": 19.2,
-                  "median": 19.2,
-                  "p95": 19.2,
-                  "stddev": 0,
+                  "min": 17.6,
+                  "max": 17.7,
+                  "avg": 17.633333333333336,
+                  "median": 17.6,
+                  "p95": 17.69,
+                  "stddev": 0.04714045207910216,
                   "samples": [
-                    19.2,
-                    19.2,
-                    19.2
+                    17.7,
+                    17.6,
+                    17.6
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 10221.402583999996,
-                  "max": 10240.845375000004,
-                  "avg": 10233.109514000002,
-                  "median": 10237.080583000003,
-                  "p95": 10240.468895800004,
-                  "stddev": 8.419523827374265,
+                  "min": 10123.119917000004,
+                  "max": 10153.399416999993,
+                  "avg": 10138.489778000003,
+                  "median": 10138.950000000012,
+                  "p95": 10151.954475299995,
+                  "stddev": 12.365836897930045,
                   "samples": [
-                    10221.402583999996,
-                    10237.080583000003,
-                    10240.845375000004
+                    10138.950000000012,
+                    10123.119917000004,
+                    10153.399416999993
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 34.37216236652727,
-                  "max": 34.43754387983904,
-                  "avg": 34.39816977674009,
-                  "median": 34.38480308385396,
-                  "p95": 34.43226980024053,
-                  "stddev": 0.02831591931250445,
+                  "min": 34.66819195654225,
+                  "max": 34.77188879377767,
+                  "avg": 34.71922657091236,
+                  "median": 34.71759896241717,
+                  "p95": 34.76645981064162,
+                  "stddev": 0.04234969771806656,
                   "samples": [
-                    34.43754387983904,
-                    34.38480308385396,
-                    34.37216236652727
+                    34.71759896241717,
+                    34.77188879377767,
+                    34.66819195654225
                   ]
                 }
               },
@@ -12375,32 +12375,32 @@
               },
               "comparison": {
                 "baseline_name": "llama.cpp",
-                "zinc_prompt_tps": 100.72,
+                "zinc_prompt_tps": 101.07,
                 "baseline_prompt_tps": 88.46269528139983,
-                "zinc_decode_tps": 51.99,
+                "zinc_decode_tps": 56.67,
                 "baseline_decode_tps": 59.653413666597075,
-                "zinc_total_latency_ms": 10237.080583000003,
+                "zinc_total_latency_ms": 10138.950000000012,
                 "baseline_total_latency_ms": 3047.4779590000107,
-                "zinc_end_to_end_tps": 34.38480308385396,
+                "zinc_end_to_end_tps": 34.71759896241717,
                 "baseline_end_to_end_tps": 116.48976785921974,
-                "zinc_overall_tps": 70.62898300512545,
+                "zinc_overall_tps": 74.52832002555094,
                 "baseline_overall_tps": 72.64944758792579,
-                "zinc_overall_seconds": 4.983789727999564,
+                "zinc_overall_seconds": 4.723036825187016,
                 "baseline_overall_seconds": 4.886479,
                 "overall_basis": "phase_wall_time_v2",
                 "overall_comparable": true,
                 "overall_unavailable_reason": null,
-                "pct_of_baseline": 87.1534365,
-                "delta_tps": -7.663413666597073,
-                "delta_pct": -12.846563500000002,
+                "pct_of_baseline": 94.99875449999999,
+                "delta_tps": -2.983413666597073,
+                "delta_pct": -5.00124550000001,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 113.8559024,
-                "latency_pct_of_baseline": 335.9197579351538,
-                "latency_delta_ms": 7189.602623999992,
-                "end_to_end_pct_of_baseline": 29.517444935943814,
-                "end_to_end_delta_tps": -82.10496477536577,
-                "overall_pct_of_baseline": 98.04745518349498,
-                "overall_delta_tps": -2.0204645828003436
+                "prompt_pct_of_baseline": 114.2515494,
+                "latency_pct_of_baseline": 332.6996991087992,
+                "latency_delta_ms": 7091.472041000001,
+                "end_to_end_pct_of_baseline": 29.803131726019146,
+                "end_to_end_delta_tps": -81.77216889680257,
+                "overall_pct_of_baseline": 103.46053145174264,
+                "overall_delta_tps": 1.878872437625148
               }
             },
             {
@@ -12417,96 +12417,96 @@
                 "name": "ZINC",
                 "prompt_tokens": 346,
                 "generated_tokens": 128,
-                "output_preview": "### Summary of the Measurement Mistake\n\nThe primary mistake was a **failure of experimental control**, specifically regarding **input variability** and **environment noise**. The developer conflated two fundamentally different workload profiles:\n\n1.  **Workload Disparity:** The comparison pitted a \"coherence smoke test\" (1 token) against a sustained generation task (160 tokens). Because throughput is a function of both prefill (prompt processing) and decode (token generation) phases, comparing a single-token run to a long-form run is mathematically invalid.\n2.  **Variable Metrics:** The team compared raw \"tokens per second",
+                "output_preview": "### Summary of the Measurement Mistake\n\nThe measurement mistake was a **failure of statistical consistency and control variables**, specifically resulting from **conflicting task definitions** and **uncontrolled environmental noise**. \n\nThe team fell into a \"comparison trap\" where they compared two non-identical runs without accounting for the following variables:\n1 **Task Dissimality:** The 49 tok/s run was a \"coherence smoke test\" (1 token), while the 37 tok/s run was a \"sustained throughput test\" (160 tokens). Comparing these is a category error.\n2 **Systemic Noise",
                 "prefill_ms": {
-                  "min": 3390.8,
-                  "max": 3402.4,
-                  "avg": 3394.7333333333336,
-                  "median": 3391,
-                  "p95": 3401.26,
-                  "stddev": 5.421766829692655,
+                  "min": 3372.1,
+                  "max": 3383.7,
+                  "avg": 3377.1,
+                  "median": 3375.5,
+                  "p95": 3382.8799999999997,
+                  "stddev": 4.868949236402672,
                   "samples": [
-                    3390.8,
-                    3402.4,
-                    3391
+                    3372.1,
+                    3375.5,
+                    3383.7
                   ]
                 },
                 "prefill_tps": {
-                  "min": 101.69,
-                  "max": 102.04,
-                  "avg": 101.92,
-                  "median": 102.03,
-                  "p95": 102.03900000000002,
-                  "stddev": 0.16268579122550192,
+                  "min": 102.25,
+                  "max": 102.61,
+                  "avg": 102.45333333333333,
+                  "median": 102.5,
+                  "p95": 102.599,
+                  "stddev": 0.15062831370259985,
                   "samples": [
-                    102.04,
-                    101.69,
-                    102.03
+                    102.61,
+                    102.5,
+                    102.25
                   ]
                 },
                 "decode_ms": {
-                  "min": 2515.6,
-                  "max": 2518.6,
-                  "avg": 2517.4666666666667,
-                  "median": 2518.2,
-                  "p95": 2518.56,
-                  "stddev": 1.3299958228839837,
+                  "min": 2313,
+                  "max": 2323.7,
+                  "avg": 2317.3333333333335,
+                  "median": 2315.3,
+                  "p95": 2322.8599999999997,
+                  "stddev": 4.598792111945034,
                   "samples": [
-                    2518.6,
-                    2518.2,
-                    2515.6
+                    2315.3,
+                    2323.7,
+                    2313
                   ]
                 },
                 "decode_tps": {
-                  "min": 50.82,
-                  "max": 50.88,
-                  "avg": 50.843333333333334,
-                  "median": 50.83,
-                  "p95": 50.875,
-                  "stddev": 0.0262466929133741,
+                  "min": 55.09,
+                  "max": 55.34,
+                  "avg": 55.23666666666667,
+                  "median": 55.28,
+                  "p95": 55.334,
+                  "stddev": 0.10656244908763822,
                   "samples": [
-                    50.82,
-                    50.83,
-                    50.88
+                    55.28,
+                    55.09,
+                    55.34
                   ]
                 },
                 "ms_per_token": {
-                  "min": 19.7,
-                  "max": 19.7,
-                  "avg": 19.7,
-                  "median": 19.7,
-                  "p95": 19.7,
-                  "stddev": 0,
+                  "min": 18.1,
+                  "max": 18.2,
+                  "avg": 18.133333333333336,
+                  "median": 18.1,
+                  "p95": 18.19,
+                  "stddev": 0.04714045207910216,
                   "samples": [
-                    19.7,
-                    19.7,
-                    19.7
+                    18.1,
+                    18.2,
+                    18.1
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 11183.448250000001,
-                  "max": 11197.215666999997,
-                  "avg": 11189.582569666667,
-                  "median": 11188.083792000005,
-                  "p95": 11196.302479499998,
-                  "stddev": 5.719568374362199,
+                  "min": 11063.201834000007,
+                  "max": 11209.022832999995,
+                  "avg": 11114.744069333334,
+                  "median": 11072.007540999999,
+                  "p95": 11195.321303799996,
+                  "stddev": 66.76201054406172,
                   "samples": [
-                    11188.083792000005,
-                    11183.448250000001,
-                    11197.215666999997
+                    11063.201834000007,
+                    11072.007540999999,
+                    11209.022832999995
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 42.33195234391658,
-                  "max": 42.38406521888273,
-                  "avg": 42.36084061847429,
-                  "median": 42.36650429262354,
-                  "p95": 42.38230912625681,
-                  "stddev": 0.021648646423599704,
+                  "min": 42.2873614463981,
+                  "max": 42.8447394445321,
+                  "avg": 42.64758845824778,
+                  "median": 42.81066448381315,
+                  "p95": 42.84133194846021,
+                  "stddev": 0.2550985440787059,
                   "samples": [
-                    42.36650429262354,
-                    42.38406521888273,
-                    42.33195234391658
+                    42.8447394445321,
+                    42.81066448381315,
+                    42.2873614463981
                   ]
                 }
               },
@@ -12609,32 +12609,32 @@
               },
               "comparison": {
                 "baseline_name": "llama.cpp",
-                "zinc_prompt_tps": 102.03,
+                "zinc_prompt_tps": 102.5,
                 "baseline_prompt_tps": 82.76364358664526,
-                "zinc_decode_tps": 50.83,
+                "zinc_decode_tps": 55.28,
                 "baseline_decode_tps": 58.67092030838903,
-                "zinc_total_latency_ms": 11188.083792000005,
+                "zinc_total_latency_ms": 11072.007540999999,
                 "baseline_total_latency_ms": 2591.5690830000094,
-                "zinc_end_to_end_tps": 42.36650429262354,
+                "zinc_end_to_end_tps": 42.81066448381315,
                 "baseline_end_to_end_tps": 182.51491079390928,
-                "zinc_overall_tps": 80.21176749321795,
+                "zinc_overall_tps": 83.28802042244088,
                 "baseline_overall_tps": 74.48634734542783,
-                "zinc_overall_seconds": 5.909357377520419,
+                "zinc_overall_seconds": 5.69109456072853,
                 "baseline_overall_seconds": 6.350157,
                 "overall_basis": "phase_wall_time_v2",
                 "overall_comparable": true,
                 "overall_unavailable_reason": null,
-                "pct_of_baseline": 86.63576390624999,
-                "delta_tps": -7.84092030838903,
-                "delta_pct": -13.364236093750009,
+                "pct_of_baseline": 94.22044125,
+                "delta_tps": -3.3909203083890276,
+                "delta_pct": -5.779558750000007,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 123.2787678,
-                "latency_pct_of_baseline": 431.7108066071169,
-                "latency_delta_ms": 8596.514708999995,
-                "end_to_end_pct_of_baseline": 23.21262635931297,
-                "end_to_end_delta_tps": -140.14840650128573,
-                "overall_pct_of_baseline": 107.45934954207392,
-                "overall_delta_tps": 5.725420147790118
+                "prompt_pct_of_baseline": 123.84665,
+                "latency_pct_of_baseline": 427.2318115549906,
+                "latency_delta_ms": 8480.43845799999,
+                "end_to_end_pct_of_baseline": 23.455981923665266,
+                "end_to_end_delta_tps": -139.70424631009612,
+                "overall_pct_of_baseline": 111.58059196238521,
+                "overall_delta_tps": 8.80167307701305
               }
             },
             {
@@ -12651,96 +12651,96 @@
                 "name": "ZINC",
                 "prompt_tokens": 70,
                 "generated_tokens": 256,
-                "output_preview": "This implementation plan outlines the technical requirements for integrating a **Stable Benchmark Preset** into a local LLM CLI. The goal is to provide a repeatable, scientifically valid measurement of model performance across different hardware configurations.\n\n---\n\n### 1. Command Shape (CLI Interface)\nThe CLI must support a structured command format to allow for easy scripting and reproducibility.\n\n**Command Syntax:**\n`llm-bench --model <model_path> --preset <preset_name> --warmup <mode> --samples <n>`\n\n**Arguments:**\n*   `--model`: Path to GGUF or quantized weights.\n*   `--preset`: A predefined configuration (e.g, `low_latency`, `high_throughput`, `standard_v1`).\n*   `--warmup`: Boolean or integer (0/1) to toggle initial inference skip.\n*   `--samples`: Number of iterations to run for statistical significance.\n\n---\n\n### 2. Warmup Policy\nTo prevent \"cold start\" bias (where the first token is artificially slow due to cache loading or memory bus initialization), the following policy is implemented:\n\n*   **Policy A (Zero Warmup):** The first iteration is included in the",
+                "output_preview": "This implementation plan outlines the technical requirements for integrating a **Benchmark Preset** into the existing local LLM CLI. This preset will allow users to move from \"real-world usage\" to \"performance testing\" mode.\n\n---\n\n### 1. Command Shape (CLI Interface)\nTo maintain an unencumbered UX, the command should be a subset of the existing execution command.\n\n**Command Syntax:**\n`llm-cli benchmark --preset <preset_name>`\n\n**Arguments for Implementation:**\n*   `--preset`: A string identifier (e. l., `\"standard_performance\"`)\n*   `--model`: (Optional) The model being benchmarked.\n*   `--prompt`: The input text/instruction.\n*   `--repetition`: (Optional) A flag to run the benchmark multiple times to prevent noise.\n\n---\n\n### 2. Warmup Policy\nThe warmup policy ensures that the first measurement is not skewed by the \"cold start\" penalty of a new process/session.\n\n*   **Standard Warmup:** The CLI must first trigger the LLM engine (e.g., `llama.cpp` or local engine) to load the model into memory and initialize the KV-cache.",
                 "prefill_ms": {
-                  "min": 209,
-                  "max": 214.2,
-                  "avg": 211.83333333333334,
-                  "median": 212.3,
-                  "p95": 214.01,
-                  "stddev": 2.1483844059095993,
+                  "min": 209.1,
+                  "max": 222.7,
+                  "avg": 215.46666666666667,
+                  "median": 214.6,
+                  "p95": 221.89,
+                  "stddev": 5.585894934764007,
                   "samples": [
-                    209,
-                    214.2,
-                    212.3
+                    209.1,
+                    214.6,
+                    222.7
                   ]
                 },
                 "prefill_tps": {
-                  "min": 326.82,
-                  "max": 334.94,
-                  "avg": 330.5133333333333,
-                  "median": 329.78,
-                  "p95": 334.424,
-                  "stddev": 3.355287700861966,
+                  "min": 314.3,
+                  "max": 334.78,
+                  "avg": 325.08,
+                  "median": 326.16,
+                  "p95": 333.918,
+                  "stddev": 8.395729072967185,
                   "samples": [
-                    334.94,
-                    326.82,
-                    329.78
+                    334.78,
+                    326.16,
+                    314.3
                   ]
                 },
                 "decode_ms": {
-                  "min": 4876.2,
-                  "max": 4878.4,
-                  "avg": 4877.499999999999,
-                  "median": 4877.9,
-                  "p95": 4878.35,
-                  "stddev": 0.9416297927882853,
+                  "min": 4460.5,
+                  "max": 4477.4,
+                  "avg": 4466.4,
+                  "median": 4461.3,
+                  "p95": 4475.79,
+                  "stddev": 7.785028366464915,
                   "samples": [
-                    4877.9,
-                    4876.2,
-                    4878.4
+                    4461.3,
+                    4460.5,
+                    4477.4
                   ]
                 },
                 "decode_tps": {
-                  "min": 52.48,
-                  "max": 52.5,
-                  "avg": 52.48666666666666,
-                  "median": 52.48,
-                  "p95": 52.498,
-                  "stddev": 0.009428090415822108,
+                  "min": 57.18,
+                  "max": 57.39,
+                  "avg": 57.31666666666666,
+                  "median": 57.38,
+                  "p95": 57.389,
+                  "stddev": 0.09672412085698022,
                   "samples": [
-                    52.48,
-                    52.5,
-                    52.48
+                    57.38,
+                    57.39,
+                    57.18
                   ]
                 },
                 "ms_per_token": {
-                  "min": 19,
-                  "max": 19.1,
-                  "avg": 19.066666666666666,
-                  "median": 19.1,
-                  "p95": 19.1,
+                  "min": 17.4,
+                  "max": 17.5,
+                  "avg": 17.433333333333334,
+                  "median": 17.4,
+                  "p95": 17.49,
                   "stddev": 0.04714045207910384,
                   "samples": [
-                    19.1,
-                    19,
-                    19.1
+                    17.4,
+                    17.4,
+                    17.5
                   ]
                 },
                 "total_latency_ms": {
-                  "min": 10347.249167000002,
-                  "max": 10374.71416600002,
-                  "avg": 10356.801958000016,
-                  "median": 10348.442541000026,
-                  "p95": 10372.08700350002,
-                  "stddev": 12.675210240269214,
+                  "min": 9997.869708000013,
+                  "max": 10280.565792000009,
+                  "avg": 10171.704764000004,
+                  "median": 10236.678791999992,
+                  "p95": 10276.177092000007,
+                  "stddev": 124.2188585069124,
                   "samples": [
-                    10374.71416600002,
-                    10347.249167000002,
-                    10348.442541000026
+                    9997.869708000013,
+                    10280.565792000009,
+                    10236.678791999992
                   ]
                 },
                 "end_to_end_tps": {
-                  "min": 31.422552446636665,
-                  "max": 31.5059582250804,
-                  "avg": 31.47694521841666,
-                  "median": 31.50232498353292,
-                  "p95": 31.50559490092565,
-                  "stddev": 0.03849008813940381,
+                  "min": 31.710316980188217,
+                  "max": 32.606946231670136,
+                  "avg": 32.05450987513713,
+                  "median": 31.846266413553035,
+                  "p95": 32.530878249858425,
+                  "stddev": 0.394554608068939,
                   "samples": [
-                    31.422552446636665,
-                    31.5059582250804,
-                    31.50232498353292
+                    32.606946231670136,
+                    31.710316980188217,
+                    31.846266413553035
                   ]
                 }
               },
@@ -12843,32 +12843,32 @@
               },
               "comparison": {
                 "baseline_name": "llama.cpp",
-                "zinc_prompt_tps": 329.78,
+                "zinc_prompt_tps": 326.16,
                 "baseline_prompt_tps": 294.9217287094599,
-                "zinc_decode_tps": 52.48,
+                "zinc_decode_tps": 57.38,
                 "baseline_decode_tps": 60.72912910633291,
-                "zinc_total_latency_ms": 10348.442541000026,
+                "zinc_total_latency_ms": 10236.678791999992,
                 "baseline_total_latency_ms": 4749.302042000025,
-                "zinc_end_to_end_tps": 31.50232498353292,
+                "zinc_end_to_end_tps": 31.846266413553035,
                 "baseline_end_to_end_tps": 69.27333681676132,
-                "zinc_overall_tps": 64.04323191817046,
+                "zinc_overall_tps": 69.71616536683003,
                 "baseline_overall_tps": 73.71783673035975,
-                "zinc_overall_seconds": 5.090311501089418,
+                "zinc_overall_seconds": 4.676103430024656,
                 "baseline_overall_seconds": 4.462963301587302,
                 "overall_basis": "phase_wall_time_v2",
                 "overall_comparable": true,
                 "overall_unavailable_reason": null,
-                "pct_of_baseline": 86.41651999999999,
-                "delta_tps": -8.249129106332916,
-                "delta_pct": -13.583480000000009,
+                "pct_of_baseline": 94.485135625,
+                "delta_tps": -3.34912910633291,
+                "delta_pct": -5.514864375000002,
                 "leader": "baseline",
-                "prompt_pct_of_baseline": 111.81949917460318,
-                "latency_pct_of_baseline": 217.89396524972523,
-                "latency_delta_ms": 5599.140499000001,
-                "end_to_end_pct_of_baseline": 45.47539707356878,
-                "end_to_end_delta_tps": -37.7710118332284,
-                "overall_pct_of_baseline": 87.67564225945992,
-                "overall_delta_tps": -9.674604812189287
+                "prompt_pct_of_baseline": 110.5920548571429,
+                "latency_pct_of_baseline": 215.54069843258748,
+                "latency_delta_ms": 5487.376749999967,
+                "end_to_end_pct_of_baseline": 45.971896081448094,
+                "end_to_end_delta_tps": -37.427070403208276,
+                "overall_pct_of_baseline": 95.4419286992497,
+                "overall_delta_tps": -4.001671363529724
               }
             }
           ]

@@ -2400,7 +2400,7 @@ pub const InferenceEngine = struct {
             log.info("Qwen 3.6 MoE top-k cap disabled by default on Intel (set ZINC_QWEN36_MOE_TOPK to cap)", .{});
         }
         const gemma_topk_env = std.posix.getenv("ZINC_GEMMA_MOE_TOPK");
-        const gemma_topk_default: u32 = if (config.architecture == .gemma and isIntelGpuVendor(gpu_config.vendor)) 4 else 0;
+        const gemma_topk_default: u32 = if (config.architecture == .gemma and isIntelGpuVendor(gpu_config.vendor)) 2 else 0;
         const gemma_topk_limit: u32 = if (config.architecture == .gemma) blk: {
             const requested = if (gemma_topk_env) |raw|
                 std.fmt.parseInt(u32, raw, 10) catch gemma_topk_default
