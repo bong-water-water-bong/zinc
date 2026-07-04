@@ -68,7 +68,6 @@ void main() {
 
     // Thread's position within the 256-element block:
     // il = itid/4 (0..3), ir = itid%4 (0..3)
-    // Each thread processes 4 elements from each of 4 sub-positions (16 total)
     uint il = itid / 4u;
     uint ir = itid % 4u;
     uint v_im = il / 2u;     // 0 or 1: which 128-element half
@@ -200,6 +199,7 @@ void main() {
         }
     }
 
+<<<<<<< Updated upstream
     // Reduce + write row 0.
     sum0 = subgroupAdd(sum0);
     if (gl_NumSubgroups > 1u) {
@@ -235,6 +235,19 @@ void main() {
                 y_data[y_base + row1] += sum1;
             else
                 y_data[y_base + row1] = sum1;
+=======
+    // Wave64 subgroupAdd reductions + writes (one per owned row).
+    sum0 = subgroupAdd(sum0);
+    if (tid == 0u) {
+        if (acc_mode != 0u) y_data[y_base + row0] += sum0;
+        else                y_data[y_base + row0] = sum0;
+    }
+    if (row1_valid) {
+        sum1 = subgroupAdd(sum1);
+        if (tid == 0u) {
+            if (acc_mode != 0u) y_data[y_base + row1] += sum1;
+            else                y_data[y_base + row1] = sum1;
+>>>>>>> Stashed changes
         }
     }
 }

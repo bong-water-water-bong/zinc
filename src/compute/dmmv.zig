@@ -782,8 +782,6 @@ pub const DmmvDispatch = struct {
     pipeline_mul_mm_q5k_full_dp4a_k4096_bk2: ?Pipeline,
     /// K=6144, BN=40 sibling for 33-40 token dense-hybrid 27B SSM out prefill.
     pipeline_mul_mm_q5k_full_dp4a_k6144_n40: ?Pipeline,
-    /// K=6144, BN=64 sibling for long dense-hybrid 27B SSM out prefill probes.
-    pipeline_mul_mm_q5k_full_dp4a_k6144_n64: ?Pipeline,
     /// Q8_1-style activation quantizer (packed int8 + per-block scale,dsum)
     /// for the DP4a gate/up path's Q4_K bias-correction term.
     pipeline_quantize_act_q8_1: ?Pipeline,
@@ -1615,10 +1613,6 @@ pub const DmmvDispatch = struct {
             .{ .id = 1, .value = 40 },
             .{ .id = 3, .value = 2 },
         };
-        const spec_k_6144_n64 = [_]pipeline_mod.SpecConst{
-            .{ .id = 0, .value = 6144 },
-            .{ .id = 1, .value = 64 },
-        };
         const spec_k_17408_n40_bk2 = [_]pipeline_mod.SpecConst{
             .{ .id = 0, .value = 17408 },
             .{ .id = 1, .value = 40 },
@@ -2282,14 +2276,6 @@ pub const DmmvDispatch = struct {
         if (pipeline_mul_mm_q5k_full_dp4a_k6144_n40 != null) {
             log.info("mul_mm_q5k_full_dp4a K=6144 BN=40 pipeline loaded (Qwen dense-hybrid 27B SSM out 40-token prefill)", .{});
         }
-        const pipeline_mul_mm_q5k_full_dp4a_k6144_n64 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q5k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_6144_n64, push_desc_wave64_options, allocator) catch |err| blk: {
-            log.warn("mul_mm_q5k_full_dp4a K=6144 BN=64 shader not loaded: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        if (pipeline_mul_mm_q5k_full_dp4a_k6144_n64 != null) {
-            log.info("mul_mm_q5k_full_dp4a K=6144 BN=64 pipeline loaded (Qwen dense-hybrid 27B long SSM out prefill probe)", .{});
-        }
-
         return DmmvDispatch{
             .pipeline_q4k = pipeline_q4k,
             .pipeline_q4k_wide = pipeline_q4k_wide,
@@ -2457,7 +2443,6 @@ pub const DmmvDispatch = struct {
             .pipeline_mul_mm_q5k_full_dp4a = pipeline_mul_mm_q5k_full_dp4a,
             .pipeline_mul_mm_q5k_full_dp4a_k4096_bk2 = pipeline_mul_mm_q5k_full_dp4a_k4096_bk2,
             .pipeline_mul_mm_q5k_full_dp4a_k6144_n40 = pipeline_mul_mm_q5k_full_dp4a_k6144_n40,
-            .pipeline_mul_mm_q5k_full_dp4a_k6144_n64 = pipeline_mul_mm_q5k_full_dp4a_k6144_n64,
             .pipeline_quantize_act_q8_1 = pipeline_quantize_act_q8_1,
             .pipeline_mul_mm_q5k = pipeline_mul_mm_q5k,
             .pipeline_mul_mm_q5k_wide = pipeline_mul_mm_q5k_wide,
@@ -5440,21 +5425,14 @@ pub const DmmvDispatch = struct {
         d_offset: u32,
     ) !void {
         const qwen35_ssm_q5_bk2_enabled = if (std.posix.getenv("ZINC_QWEN35_9B_SSM_Q5_BK2")) |raw| !std.mem.eql(u8, raw, "0") else true;
-        const qwen36_ssm_q5_n64_enabled = if (std.posix.getenv("ZINC_QWEN36_27B_Q5_SSM_OUT_N64")) |raw| !std.mem.eql(u8, raw, "0") else false;
         const use_k4096_bk2 = qwen35_ssm_q5_bk2_enabled and K == 4096 and self.pipeline_mul_mm_q5k_full_dp4a_k4096_bk2 != null;
-        const use_k6144_n64 = qwen36_ssm_q5_n64_enabled and K == 6144 and (N & 63) == 0 and self.pipeline_mul_mm_q5k_full_dp4a_k6144_n64 != null;
-        const n_tile: u32 = if (use_k6144_n64)
-            64
-        else if (K == 6144 and N == 40 and self.pipeline_mul_mm_q5k_full_dp4a_k6144_n40 != null)
+        const n_tile: u32 = if (K == 6144 and N == 40 and self.pipeline_mul_mm_q5k_full_dp4a_k6144_n40 != null)
             40
         else
             32;
         const pip = blk: {
             if (use_k4096_bk2) {
                 if (self.pipeline_mul_mm_q5k_full_dp4a_k4096_bk2) |*p| break :blk p;
-            }
-            if (use_k6144_n64) {
-                if (self.pipeline_mul_mm_q5k_full_dp4a_k6144_n64) |*p| break :blk p;
             }
             if (K == 6144 and n_tile == 40) {
                 if (self.pipeline_mul_mm_q5k_full_dp4a_k6144_n40) |*p| break :blk p;
@@ -5465,8 +5443,6 @@ pub const DmmvDispatch = struct {
         if (M == 0 or N == 0 or (M & 31) != 0) return error.InvalidArgument;
         if (n_tile == 40) {
             if (N != 40) return error.InvalidArgument;
-        } else if (n_tile == 64) {
-            if ((N & 63) != 0) return error.InvalidArgument;
         } else if ((N & 31) != 0) return error.InvalidArgument;
         const push = MulMmQ4KGateUpDp4aPush{
             .M = M,
@@ -5931,7 +5907,6 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q5k_full_dp4a) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k_full_dp4a_k4096_bk2) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k_full_dp4a_k6144_n40) |*p| p.deinit();
-        if (self.pipeline_mul_mm_q5k_full_dp4a_k6144_n64) |*p| p.deinit();
         if (self.pipeline_quantize_act_q8_1) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.* = undefined;
