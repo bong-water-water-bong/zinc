@@ -1438,6 +1438,22 @@ Done when:
 
 Skip this step if Steps 8–11 already push us past Phase 3 (300 tok/s). It is the largest engineering investment per unit of throughput at that point in the curve.
 
+## 2026-07-04 Row-Tile Rejects
+
+Qwen3.6 35B A3B MoE, RDNA4, 2971-token raw prompt, `ZINC_PREFILL_PROFILE=1`.
+Correct baseline for this probe is first output token `{ 17 }`, text `2`.
+
+| variant | prefill | gate/up | output | verdict |
+|---|---:|---:|---|---|
+| current 4-row grouped gate/up | 802.19 tok/s | 374.7 ms | `{ 17 }` / `2` | keep |
+| BM32 shared-memory gate/up probe | 783.38 tok/s | 469.2 ms | `{ 198 }` / empty | reject |
+| rows8/lane-pair gate/up probe | 798.05 tok/s | 378.5 ms | `{ 198 }` / empty | reject |
+
+Do not repeat wider row tiling on `dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.comp`
+without a per-layer numeric validator. The current four-row / 16-lane reduction
+order is the measured-correct path; both wider row probes changed model output
+before they produced any speedup.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:
