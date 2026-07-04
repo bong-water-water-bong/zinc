@@ -73,6 +73,7 @@ pub fn parseArchitecture(arch_str: []const u8) Architecture {
     if (std.mem.eql(u8, arch_str, "llama")) return .mistral;
     if (std.mem.eql(u8, arch_str, "qwen2")) return .qwen2;
     if (std.mem.eql(u8, arch_str, "qwen3")) return .qwen2;
+    if (std.mem.eql(u8, arch_str, "hunyuan-dense")) return .qwen2;
     if (std.mem.eql(u8, arch_str, "qwen2moe")) return .qwen2_moe;
     if (std.mem.eql(u8, arch_str, "qwen3moe")) return .qwen2_moe;
     if (std.mem.eql(u8, arch_str, "qwen35moe")) return .qwen2_moe;
