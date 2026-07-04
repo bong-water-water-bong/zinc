@@ -39,6 +39,8 @@ const server_runtime = @import("server/runtime.zig");
 const loader_mod = if (gpu.is_vulkan) @import("model/loader.zig") else struct {};
 const architecture_mod = if (gpu.is_vulkan) @import("model/architecture.zig") else struct {};
 const forward_mod = if (gpu.is_vulkan) @import("compute/forward.zig") else struct {};
+const train_mod = if (gpu.is_vulkan) @import("train/trainer.zig") else struct {};
+const lora_mod = if (gpu.is_vulkan) @import("train/lora.zig") else struct {};
 
 // Backend-specific imports (only one branch compiles per platform)
 const instance_mod = if (gpu.is_vulkan) @import("vulkan/instance.zig") else gpu.backend;
@@ -59,6 +61,10 @@ const CommandPool = if (gpu.is_vulkan) @import("vulkan/command.zig").CommandPool
         return .{};
     }
     pub fn deinit(_: *@This()) void {}
+};
+const CommandBuffer = if (gpu.is_vulkan) @import("vulkan/command.zig").CommandBuffer else struct {
+    pub fn init(_: anytype, _: anytype) !@This() { return .{}; }
+    pub fn deinit(_: *@This(), _: anytype) void {}
 };
 const Graph = graph_mod.Graph;
 
@@ -152,6 +158,9 @@ comptime {
     _ = @import("scheduler/kv_cache.zig");
     if (gpu.is_vulkan) {
         _ = @import("diagnostics.zig");
+        // Training modules (Vulkan-only for now)
+        _ = @import("train/lora.zig");
+        _ = @import("train/trainer.zig");
     }
     if (gpu.is_metal) {
         _ = @import("diagnostics_metal.zig");
@@ -211,6 +220,25 @@ pub const Config = struct {
     /// Output `model list` results as pretty-printed JSON.
     json_output: bool = false,
 
+    // ── Training config ─────────────────────────────────────────────────
+    /// LoRA rank (default: 8).
+    lora_rank: u32 = 8,
+    /// LoRA alpha (default: 16).
+    lora_alpha: f32 = 16.0,
+    /// Training steps (default: 1000).
+    train_steps: u32 = 1000,
+    /// Learning rate (default: 2e-4).
+    learning_rate: f32 = 2e-4,
+    /// Batch size in tokens (default: 64).
+    train_batch_size: u32 = 64,
+    /// Training data file path (token IDs, one per line).
+    train_data_path: ?[]const u8 = null,
+    /// Comma-separated list of projection targets for LoRA: "q,k,v,o,gate,up,down"
+    /// or "all" for all projection types (default: "q,k,v,o").
+    lora_targets: ?[]const u8 = null,
+    /// Checkpoint save interval steps (0 = never).
+    train_save_interval: u32 = 0,
+
     fn gpuDevicePreference(self: Config) u32 {
         if (comptime gpu.is_vulkan) {
             return if (self.device_index_explicit) self.device_index else instance_mod.auto_select_device_index;
@@ -223,6 +251,7 @@ pub const Config = struct {
 pub const Command = enum {
     run,
     chat,
+    train,
     model_list,
     model_pull,
     model_use,
@@ -449,6 +478,7 @@ const banner =
     \\  zinc chat [-m <model.gguf> | --model-id <id>] [-p 9090]
     \\  zinc --model-id <id> [--prompt "Hello"]
     \\  zinc --check [-m <model.gguf> | --model-id <id>]
+    \\  zinc train -m <model.gguf> --train-data <tokens.txt> [options]
     \\  zinc model <list|pull|use|active|rm> [args]
     \\
     \\Common options:
@@ -559,6 +589,9 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
         } else if (std.mem.eql(u8, arg, "--version")) {
             config.show_version = true;
             return config;
+        } else if (std.mem.eql(u8, arg, "train")) {
+            if (config.command != .run) return error.UnknownArgument;
+            config.command = .train;
         } else if (std.mem.eql(u8, arg, "chat")) {
             if (config.command != .run) return error.UnknownArgument;
             config.command = .chat;
@@ -651,6 +684,38 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             config.max_tokens = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidMaxTokens;
+        } else if (std.mem.eql(u8, arg, "--lora-rank")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.lora_rank = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidArg;
+        } else if (std.mem.eql(u8, arg, "--lora-alpha")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.lora_alpha = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidArg;
+        } else if (std.mem.eql(u8, arg, "--train-steps")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.train_steps = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidArg;
+        } else if (std.mem.eql(u8, arg, "--learning-rate") or std.mem.eql(u8, arg, "--lr")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.learning_rate = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidArg;
+        } else if (std.mem.eql(u8, arg, "--batch-size")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.train_batch_size = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidArg;
+        } else if (std.mem.eql(u8, arg, "--train-data")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.train_data_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--lora-targets")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.lora_targets = args[i];
+        } else if (std.mem.eql(u8, arg, "--train-save-interval")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.train_save_interval = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidArg;
         } else if (std.mem.eql(u8, arg, "--profile")) {
             config.profile = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
@@ -673,6 +738,10 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
     }
     if (config.chat and config.raw_prompt) {
         return error.ConflictingPromptModes;
+    }
+
+    if (config.command == .train and config.train_data_path == null) {
+        return error.MissingTrainingData;
     }
 
     return config;
@@ -1525,6 +1594,7 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
             }
             try stdout.interface.flush();
         },
+        .train => unreachable, // handled in main() before reaching here
         .model_rm => {
             const model_id = config.command_model_id orelse return error.MissingArgValue;
             _ = catalog_mod.find(model_id) orelse return error.UnknownManagedModel;
@@ -2334,6 +2404,200 @@ pub fn main() !void {
             log.err("Diagnostics completed with error: {s}", .{@errorName(err)});
             std.process.exit(1);
         };
+        return;
+    }
+
+    if (config.command == .train) {
+        // ── LoRA training mode ──────────────────────────────────────────
+        is_debug_mode = config.debug or std.posix.getenv("ZINC_DEBUG") != null;
+
+        const resolved_model_for_train: ResolvedStartupModel = resolveStartupModel(config, allocator) catch |err| {
+            log.err("Failed to resolve model for training: {s}", .{@errorName(err)});
+            std.process.exit(1);
+        };
+
+        const train_model_path = resolved_model_for_train.spec.model_path;
+
+        // Initialize Vulkan
+        var vk_instance = instance_mod.Instance.init(allocator, config.gpuDevicePreference()) catch |err| {
+            log.err("Vulkan init failed for training: {s}", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer vk_instance.deinit();
+
+        const gpu_config = gpu_detect.detect(&vk_instance);
+        gpu_config.log_info();
+
+        const train_shader_dir = resolveShaderDir(allocator) catch |err| {
+            log.err("Could not locate shader directory: {s}", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer allocator.free(train_shader_dir);
+
+        var gpu_process_lock = process_lock_mod.acquire(.vulkan, vk_instance.selected_device_index) catch |err| {
+            reportGpuProcessLockError(err, .vulkan, vk_instance.selected_device_index);
+        };
+        defer gpu_process_lock.deinit();
+
+        var train_cmd_pool = try CommandPool.init(&vk_instance);
+        defer train_cmd_pool.deinit();
+
+        // Load model
+        var train_model = loader_mod.load(train_model_path, &vk_instance, &train_cmd_pool, allocator) catch |err| {
+            log.err("Failed to load model for training: {s}", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer train_model.deinit(&vk_instance);
+        memory_plan.applyRequestedContextLimit(&train_model.config, config.context_length);
+
+        // We need at least a minimal inference engine to get the forward graph.
+        // For training, we reuse the inference engine's forward pass and then
+        // add LoRA adapters.
+        var train_engine = forward_mod.InferenceEngine.init(&train_model, &vk_instance, gpu_config, train_shader_dir, allocator) catch |err| {
+            log.err("Failed to init inference engine for training: {s}", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer train_engine.deinit();
+
+        if (config.prompt) |prompt| {
+            log.info("Training prompt: {s}", .{prompt});
+        }
+
+        // Build adapter configs from --lora-targets
+        var train_adapter_configs = std.ArrayList(lora_mod.LoraConfig){};
+        defer train_adapter_configs.deinit(allocator);
+
+        const hidden_dim = train_model.config.hidden_dim;
+        const n_layers = train_model.config.n_layers;
+        //inter_dim is not directly in ModelConfig; estimate from hidden_dim
+        const inter_dim = hidden_dim * 4; // typical SwiGLU up-project
+
+        // Determine which projection types to target
+        const targets_str = config.lora_targets orelse "q,k,v,o";
+        const prj_targets = [_]struct { name: []const u8, prj_idx: u32 }{
+            .{ .name = "q", .prj_idx = 0 },
+            .{ .name = "k", .prj_idx = 1 },
+            .{ .name = "v", .prj_idx = 2 },
+            .{ .name = "o", .prj_idx = 3 },
+            .{ .name = "gate", .prj_idx = 4 },
+            .{ .name = "up", .prj_idx = 5 },
+            .{ .name = "down", .prj_idx = 6 },
+        };
+
+        for (0..n_layers) |layer| {
+            var rest = targets_str;
+            while (rest.len > 0) {
+                const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+                const tok = std.mem.trim(u8, rest[0..comma], " ");
+                rest = if (comma < rest.len) rest[comma + 1 ..] else "";
+
+                for (prj_targets) |pt| {
+                    if (std.mem.eql(u8, tok, pt.name) or std.mem.eql(u8, tok, "all")) {
+                        const dim = if (pt.prj_idx <= 3) hidden_dim else inter_dim;
+                        _ = dim; // used for config, hidden_dim is the input dim for all
+                        try train_adapter_configs.append(allocator,.{
+                            .weight_name = undefined, // filled below
+                            .rank = config.lora_rank,
+                            .alpha = config.lora_alpha,
+                            .layer_index = @intCast(layer),
+                            .projection_index = pt.prj_idx,
+                        });
+                    }
+                }
+                if (std.mem.eql(u8, tok, "all")) break; // don't duplicate for each prj name
+            }
+        }
+
+        // Load training data
+        const data_path = config.train_data_path orelse {
+            log.err("--train-data is required for training mode", .{});
+            std.process.exit(1);
+        };
+        var train_tokens: []u32 = undefined;
+        {
+            const file = std.fs.cwd().openFile(data_path, .{}) catch |err| {
+                log.err("Failed to open training data file '{s}': {s}", .{ data_path, @errorName(err) });
+                std.process.exit(1);
+            };
+            defer file.close();
+            const stat = try file.stat();
+            // Text format: one token ID per line, or space-separated
+            const file_bytes = try allocator.alloc(u8, stat.size);
+            defer allocator.free(file_bytes);
+            _ = try file.readAll(file_bytes);
+
+            // Parse as space/newline-separated u32 values
+            var tok_list = std.ArrayList(u32){};
+            defer tok_list.deinit(allocator);
+            var iter = std.mem.tokenizeAny(u8, file_bytes, " \n\r");
+            while (iter.next()) |tok_str| {
+                const val = std.fmt.parseInt(u32, tok_str, 10) catch continue;
+                try tok_list.append(allocator, val);
+            }
+            train_tokens = try tok_list.toOwnedSlice(allocator);
+            log.info("Loaded {d} training tokens from {s}", .{ train_tokens.len, data_path });
+        }
+
+        // Allocate trainer
+        var trainer = try train_mod.Trainer.init(
+            allocator,
+            &vk_instance,
+            &gpu_config,
+            train_shader_dir,
+            train_adapter_configs.items,
+            hidden_dim,
+            train_model.config.vocab_size,
+            train_tokens,
+            .{
+                .learning_rate = config.learning_rate,
+                .batch_size = config.train_batch_size,
+                .max_steps = config.train_steps,
+                .log_interval = 10,
+                .save_interval = config.train_save_interval,
+                .data_path = data_path,
+            },
+        );
+        defer trainer.deinit();
+
+        // Run training loop
+        log.info("Starting LoRA training: {d} layers, {d} adapters, rank {d}, lr {e}, batch {d}, {d} steps", .{
+            n_layers,
+            train_adapter_configs.items.len,
+            config.lora_rank,
+            config.learning_rate,
+            config.train_batch_size,
+            config.train_steps,
+        });
+
+
+        while (trainer.current_step < trainer.config.max_steps) {
+            // Forward: run the engine for this batch
+            const loss = try trainer.step(&vk_instance, &train_engine);
+
+            if (@abs(loss) > 0) {
+                // Normal logging done inside step()
+            }
+
+            if (trainer.config.save_interval > 0 and
+                trainer.current_step > 0 and
+                trainer.current_step % trainer.config.save_interval == 0)
+            {
+                try trainer.saveCheckpoint("lora_checkpoint.zinc");
+            }
+        }
+
+        log.info("Training complete after {d} steps. Final moving loss: {d:.6}", .{
+            trainer.current_step,
+            trainer.moving_loss,
+        });
+
+        try trainer.saveCheckpoint("lora_checkpoint.zinc");
+
+        // Free allocated training tokens
+        allocator.free(train_tokens);
+        var owned_train = resolved_model_for_train;
+        owned_train.deinit(allocator);
+
         return;
     }
 

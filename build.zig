@@ -67,7 +67,6 @@ fn configureCudaModule(
 
 fn resolveBunExe(b: *std.Build) []const u8 {
     if (b.graph.env_map.get("BUN_EXE")) |bun_exe| return bun_exe;
-    if (std.fs.accessAbsolute("/root/.bun/bin/bun", .{})) |_| return "/root/.bun/bin/bun" else |_| {}
     return "bun";
 }
 
@@ -104,12 +103,6 @@ pub fn build(b: *std.Build) void {
     const full_tests = b.option(bool, "full-tests", "Require integration smoke tests and fail when their environment is missing") orelse false;
     const install_hot_bench = b.option(bool, "install-hot-bench", "Install the zinc-hot-bench binary as part of the default install step") orelse false;
 
-    // Rolling Linux distros can ship CRT objects with sections Zig's bundled
-    // LLD does not understand yet. Let local builders override libc paths
-    // without baking machine-specific files into the repository.
-    if (std.fs.cwd().access(".build-support/libc.conf", .{})) |_| {
-        b.libc_file = ".build-support/libc.conf";
-    } else |_| {}
 
     const is_linux = target.result.os.tag == .linux;
     const is_macos = target.result.os.tag == .macos;
@@ -353,6 +346,30 @@ pub fn build(b: *std.Build) void {
     if (compile_shaders) {
         inline for (shader_sources) |name| {
             const comp_file = shader_dir ++ "/" ++ name ++ ".comp";
+            const spv_file = name ++ ".spv";
+
+            const compile_cmd = b.addSystemCommand(&.{
+                "glslc",
+                "--target-env=vulkan1.3",
+                "-O",
+                "-o",
+            });
+            const spv_output = compile_cmd.addOutputFileArg(spv_file);
+            compile_cmd.addFileArg(b.path(comp_file));
+
+            b.getInstallStep().dependOn(&b.addInstallFile(spv_output, "share/zinc/shaders/" ++ spv_file).step);
+        }
+
+        // Training shaders (src/train/shaders/)
+        const train_shader_dir = "src/train/shaders";
+        const train_shader_sources = .{
+            "lora_fwd",
+            "cross_entropy",
+            "lora_bwd",
+            "adamw_update",
+        };
+        inline for (train_shader_sources) |name| {
+            const comp_file = train_shader_dir ++ "/" ++ name ++ ".comp";
             const spv_file = name ++ ".spv";
 
             const compile_cmd = b.addSystemCommand(&.{

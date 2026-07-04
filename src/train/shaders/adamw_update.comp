@@ -1,0 +1,82 @@
+// AdamW optimizer update for LoRA adapter parameters.
+//
+//   m = beta1 * m + (1 - beta1) * g
+//   v = beta2 * v + (1 - beta2) * g * g
+//   m_hat = m / (1 - beta1^step)
+//   v_hat = v / (1 - beta2^step)
+//   w = w - lr * (m_hat / (sqrt(v_hat) + eps) + wd * w)
+//
+// Push: N, lr, beta1, beta2, eps, weight_decay, step, offsets
+//
+// Bindings:
+//   0: params — f32 [N] (in-place)
+//   1: grad   — f32 [N] (read-only)
+//   2: m      — f32 [N] (first moment, in-place)
+//   3: v      — f32 [N] (second moment, in-place)
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer ParamsBuf { float params[]; };
+layout(set = 0, binding = 1) readonly buffer GradBuf { float grad[]; };
+layout(set = 0, binding = 2) buffer MBuf { float m[]; };
+layout(set = 0, binding = 3) buffer VBuf { float v[]; };
+
+layout(push_constant) uniform Push {
+    uint N;
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    uint step;
+    uint params_off;
+    uint grad_off;
+    uint m_off;
+    uint v_off;
+} push;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= push.N) return;
+
+    float g = grad[push.grad_off + i];
+    float m_old = m[push.m_off + i];
+    float v_old = v[push.v_off + i];
+
+    // Update moments
+    float m_new = push.beta1 * m_old + (1.0 - push.beta1) * g;
+    float v_new = push.beta2 * v_old + (1.0 - push.beta2) * g * g;
+    m[push.m_off + i] = m_new;
+    v[push.v_off + i] = v_new;
+
+    // Bias correction: 1 - beta^step
+    // Manual pow_u32 for integer exponents
+    float b1t = 1.0;
+    uint s = push.step;
+    float b1 = push.beta1;
+    while (s > 0) {
+        if ((s & 1u) != 0u) b1t *= b1;
+        s >>= 1u;
+        b1 *= b1;
+    }
+    float b2t = 1.0;
+    s = push.step;
+    float b2 = push.beta2;
+    while (s > 0) {
+        if ((s & 1u) != 0u) b2t *= b2;
+        s >>= 1u;
+        b2 *= b2;
+    }
+
+    float m_hat = m_new / max(1.0 - b1t, 1.0e-30);
+    float v_hat = v_new / max(1.0 - b2t, 1.0e-30);
+
+    // Update
+    float w = params[push.params_off + i];
+    float update = push.lr * m_hat / (sqrt(v_hat) + push.eps);
+    if (push.weight_decay > 0.0) {
+        update += push.lr * push.weight_decay * w;
+    }
+    params[push.params_off + i] = w - update;
+}

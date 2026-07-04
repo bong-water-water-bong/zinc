@@ -1,0 +1,73 @@
+// LoRA forward: y[m] += scale * sum_r (B[r] · x) * A[r][m]
+//
+// Each WG processes one element of the output (m = 0..M-1).
+// All 64 threads in the WG cooperate on the R×K accumulation.
+//
+// Push constants: M, K, R, scale, buffer offsets
+//
+// Bindings:
+//   0: A — f16 [R × M], uint-packed (one uint16 per element)
+//   1: B — f16 [R × K], uint-packed
+//   2: x — f32 [K]
+//   3: y — f32 [M] (read-accumulate-write)
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer AData { uint a_data[]; };
+layout(set = 0, binding = 1) readonly buffer BData { uint b_data[]; };
+layout(set = 0, binding = 2) readonly buffer XData { float x_data[]; };
+layout(set = 0, binding = 3) buffer YData { float y_data[]; };
+
+layout(push_constant) uniform Push {
+    uint M;
+    uint K;
+    uint R;
+    float scale;
+    uint a_off;
+    uint b_off;
+    uint x_off;
+    uint y_off;
+} push;
+
+shared float s_x[2048];
+
+float f16_from_u16(uint w) {
+    // Reinterpret low 16 bits as float16, convert to float32.
+    // The buffer stores f16 values in the low 16 bits of each uint.
+    return float(uint16_t(w & 0xFFFFu));
+}
+
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    if (m >= push.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+
+    // Load x into shared memory
+    for (uint k = tid; k < push.K; k += 64) {
+        s_x[k] = x_data[push.x_off + k];
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // Accumulate LoRA contribution
+    float total = 0.0;
+    for (uint r = tid; r < push.R; r += 64) {
+        // a_val = A[r][m]
+        float a_val = f16_from_u16(a_data[push.a_off + r * push.M + m]);
+        // dot = B[r] · x  over K
+        float dot = 0.0;
+        for (uint k = 0; k < push.K; k++) {
+            dot += f16_from_u16(b_data[push.b_off + r * push.K + k]) * s_x[k];
+        }
+        total += a_val * dot;
+    }
+
+    // Atomic read-modify-write for the output
+    // Each thread writes to a unique m (no conflict), so plain += is safe
+    y_data[push.y_off + m] += push.scale * total;
+}
