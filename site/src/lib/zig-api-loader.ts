@@ -316,6 +316,22 @@ const SECTION_META = new Map<string, { title: string; description: string; order
       order: 15,
     },
   ],
+  [
+    'training-integration',
+    {
+      title: 'Training Integration',
+      description: 'LoRA adapter structures, GPU buffer management, and injection-point descriptors for on-device fine-tuning of frozen models.',
+      order: 16,
+    },
+  ],
+  [
+    'training-pipeline',
+    {
+      title: 'Training Pipeline',
+      description: 'Training loop orchestrator: forward pass with LoRA injection, cross-entropy loss, backward gradient computation, and AdamW parameter updates.',
+      order: 17,
+    },
+  ],
 ]);
 
 function resolveSiteRoot(): string {

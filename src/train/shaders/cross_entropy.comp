@@ -1,0 +1,87 @@
+// Cross-entropy loss with softmax.
+//
+// Per token: softmax(logits[t]) → cross-entropy w.r.t. target[t].
+// Does NOT compute the mean — host reads per-token loss and averages.
+//
+// Each workgroup handles one token (Y dim = N). 64 threads cooperate on V.
+//
+// Bindings:
+//   0: logits  — f32 [N × V]
+//   1: targets — u32 [N]
+//   2: probs   — f32 [N × V] (softmax output, for gradient use)
+//   3: loss    — f32 [N] (per-token loss output)
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer LogitsBuf { float logits[]; };
+layout(set = 0, binding = 1) readonly buffer TargetsBuf { uint targets[]; };
+layout(set = 0, binding = 2) buffer ProbsBuf { float probs[]; };
+layout(set = 0, binding = 3) buffer LossBuf { float loss[]; };
+
+layout(push_constant) uniform Push {
+    uint N;
+    uint V;
+    uint logits_off;
+    uint targets_off;
+    uint probs_off;
+    uint loss_off;
+} push;
+
+shared float s_scratch[64];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint n = gl_GlobalInvocationID.y;
+    if (n >= push.N) return;
+
+    uint base = n * push.V;
+    uint off = push.logits_off + base;
+
+    // 1. max logit
+    float mv = -3.4e38;
+    for (uint v = t; v < push.V; v += 64) {
+        mv = max(mv, logits[off + v]);
+    }
+    s_scratch[t] = mv;
+    memoryBarrierShared(); barrier();
+
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (t < s) s_scratch[t] = max(s_scratch[t], s_scratch[t + s]);
+        memoryBarrierShared(); barrier();
+    }
+    float lmax = s_scratch[0];
+    memoryBarrierShared(); barrier();
+
+    // 2. sum(exp)
+    float xsum = 0.0;
+    for (uint v = t; v < push.V; v += 64) {
+        float e = exp(logits[off + v] - lmax);
+        probs[push.probs_off + base + v] = e;
+        xsum += e;
+    }
+    s_scratch[t] = xsum;
+    memoryBarrierShared(); barrier();
+
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (t < s) s_scratch[t] += s_scratch[t + s];
+        memoryBarrierShared(); barrier();
+    }
+    xsum = s_scratch[0];
+    memoryBarrierShared(); barrier();
+
+    // 3. Normalize
+    float inv = 1.0 / max(xsum, 1.0e-30);
+    for (uint v = t; v < push.V; v += 64) {
+        probs[push.probs_off + base + v] *= inv;
+    }
+
+    // 4. Loss: -log(p[target])
+    if (t == 0) {
+        uint tv = targets[push.targets_off + n];
+        if (tv == 0xFFFFFFFFu || tv >= push.V) tv = 0;
+        float pt = probs[push.probs_off + base + tv];
+        if (pt < 1.0e-7) pt = 1.0e-7;
+        loss[push.loss_off + n] = -log(pt);
+    }
+}

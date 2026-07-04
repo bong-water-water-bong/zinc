@@ -1,0 +1,93 @@
+// LoRA backward: compute dL/dA and dL/dB for one rank.
+//
+// Forward: y_lora[m] = scale * sum_r (B[r] · x) * A[r][m]
+//
+// Gradients:
+//   dL/dB[r][k] = scale * A[r][m] · dL/dy[m] · x[k]  = scale * (A[r] · dL/dy) * x[k]
+//   dL/dA[r][m] = scale * (B[r] · x) * dL/dy[m]
+//
+// where:
+//   (A[r] · dL/dy) = sum_m A[r][m] * dL/dy[m]   (scalar per rank)
+//   (B[r] · x)     = sum_k B[r][k] * x[k]        (scalar per rank)
+//
+// Dispatch: R workgroups, M=out_dim, K=in_dim
+// Each WG processes one rank r.
+//
+// Bindings:
+//   0: A      — f16 [R × M], packed as uint
+//   1: B      — f16 [R × K], packed as uint
+//   2: x      — f32 [K]
+//   3: dy     — f32 [M] (upstream gradient dL/dy)
+//   4: grad_a — f32 [R × M] (output)
+//   5: grad_b — f32 [R × K] (output)
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer AData { uint a_data[]; };
+layout(set = 0, binding = 1) readonly buffer BData { uint b_data[]; };
+layout(set = 0, binding = 2) readonly buffer XData { float x_data[]; };
+layout(set = 0, binding = 3) readonly buffer DYData { float dy_data[]; };
+layout(set = 0, binding = 4) buffer GradABuf { float grad_a_buf[]; };
+layout(set = 0, binding = 5) buffer GradBBuf { float grad_b_buf[]; };
+
+layout(push_constant) uniform Push {
+    uint M;
+    uint K;
+    uint R;
+    float scale;
+    uint a_off;
+    uint b_off;
+    uint x_off;
+    uint dy_off;
+    uint grad_a_off;
+    uint grad_b_off;
+} push;
+
+shared float s_x[2048];
+shared float s_dy[2048];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= push.R) return;
+
+    // Load x and dy into shared
+    for (uint k = t; k < push.K; k += 64) {
+        s_x[k] = x_data[push.x_off + k];
+    }
+    for (uint m = t; m < push.M; m += 64) {
+        s_dy[m] = dy_data[push.dy_off + m];
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // A[r] · dy (scalar)
+    float a_dot_dy = 0.0;
+    for (uint m = 0; m < push.M; m++) {
+        uint w = a_data[push.a_off + r * push.M + m];
+        float av = float(uint16_t(w & 0xFFFFu));
+        a_dot_dy += av * s_dy[m];
+    }
+
+    // B[r] · x (scalar)
+    float b_dot_x = 0.0;
+    for (uint k = 0; k < push.K; k++) {
+        uint w = b_data[push.b_off + r * push.K + k];
+        float bv = float(uint16_t(w & 0xFFFFu));
+        b_dot_x += bv * s_x[k];
+    }
+
+    // Write grad_b[r][k] = scale * (A[r] · dy) * x[k]
+    for (uint k = t; k < push.K; k += 64) {
+        grad_b_buf[push.grad_b_off + r * push.K + k] = push.scale * a_dot_dy * s_x[k];
+    }
+
+    // Write grad_a[r][m] = scale * (B[r] · x) * dy[m]
+    for (uint m = t; m < push.M; m += 64) {
+        grad_a_buf[push.grad_a_off + r * push.M + m] = push.scale * b_dot_x * s_dy[m];
+    }
+}
