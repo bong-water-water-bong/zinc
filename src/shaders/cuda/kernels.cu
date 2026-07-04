@@ -5131,22 +5131,16 @@ extern "C" __global__ void gemm_q4k_tc_lowsmem(const unsigned* a_u32, const floa
 
 // ---- Inline PTX mma.sync.m16n8k16 helpers (bypass broken wmma fp32 path) -----
 // NVRTC's wmma::mma_sync generates .f32.f32 (fp32) MMA instead of .f32.f16
-// (fp16). These helpers use inline PTX to force the fp16 MMA instruction.
-// m16n8k16 computes D[16,8] = A[16,16] * B[16,8]^T + C[16,8] (fp16×fp16→fp32).
-// Each warp (32 threads) provides 4 u32 (A), 2 u32 (B), 4 f32 (C/D) registers.
-__device__ __forceinline__ void mma_m16n8k16(
-    float& d0, float& d1, float& d2, float& d3,
-    unsigned a0, unsigned a1, unsigned a2, unsigned a3,
-    unsigned b0, unsigned b1,
-    float c0, float c1, float c2, float c3) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-          "r"(b0), "r"(b1),
-          "f"(c0), "f"(c1), "f"(c2), "f"(c3));
-}
+// (fp16). This macro uses inline PTX to force the fp16 MMA instruction.
+// Uses "+f" (read-write) constraints so D and C share registers (accumulate).
+// MUST be a macro, not a function — nvcc generates wrong code when float&
+// output aliases float input params in __forceinline__ functions.
+#define mma_m16n8k16(d0,d1,d2,d3,a0,a1,a2,a3,b0,b1) \
+    asm volatile( \
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 " \
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
+        : "+f"(d0),"+f"(d1),"+f"(d2),"+f"(d3) \
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1))
 
 // Load A[16,16] fp16 row-major fragment using ldmatrix.x4 (matches mma.sync layout).
 // smem layout: Ws[row * stride + col]. Each thread provides one row address.
@@ -5248,10 +5242,10 @@ extern "C" __global__ void gemm_q4k_mma_lowsmem(const unsigned* a_u32, const flo
             unsigned bL0,bL1,bR0,bR1;
             load_b_frag_ldm(bL0,bL1,As,(ks*16u)*BT+ft*16u,BT);
             load_b_frag_ldm(bR0,bR1,As,(ks*16u)*BT+ft*16u+8u,BT);
-            mma_m16n8k16(cL0a,cL1a,cL2a,cL3a,a0r,a1r,a2r,a3r,bL0,bL1,cL0a,cL1a,cL2a,cL3a);
-            mma_m16n8k16(cR0a,cR1a,cR2a,cR3a,a0r,a1r,a2r,a3r,bR0,bR1,cR0a,cR1a,cR2a,cR3a);
-            mma_m16n8k16(cL0b,cL1b,cL2b,cL3b,b0r,b1r,b2r,b3r,bL0,bL1,cL0b,cL1b,cL2b,cL3b);
-            mma_m16n8k16(cR0b,cR1b,cR2b,cR3b,b0r,b1r,b2r,b3r,bR0,bR1,cR0b,cR1b,cR2b,cR3b);
+            mma_m16n8k16(cL0a,cL1a,cL2a,cL3a,a0r,a1r,a2r,a3r,bL0,bL1);
+            mma_m16n8k16(cR0a,cR1a,cR2a,cR3a,a0r,a1r,a2r,a3r,bR0,bR1);
+            mma_m16n8k16(cL0b,cL1b,cL2b,cL3b,b0r,b1r,b2r,b3r,bL0,bL1);
+            mma_m16n8k16(cR0b,cR1b,cR2b,cR3b,b0r,b1r,b2r,b3r,bR0,bR1);
         }
         __syncthreads();
     }
