@@ -107,6 +107,8 @@ const gemma_prefill_tiny_prompt_tokens: u32 = 80;
 const gemma_prefill_short_prompt_topk: u32 = 3;
 const gemma_prefill_short_prompt_tokens: u32 = 96;
 const qwen_dense_intel_deep_prefill_min_tokens: usize = 32;
+const moe_route_block_cols: u32 = 8;
+const moe_route_pack_profile_tail_bins: usize = moe_route_block_cols - 1;
 
 fn gemmaPrefillTailTopkLimit(prompt_tokens: u32, base_limit: u32) u32 {
     if (prompt_tokens > 0 and
@@ -800,6 +802,19 @@ fn expertSliceBytes(quant_type: GGMLType, rows: u32, cols: u32) u32 {
     return rows * blocks_per_row * bpb;
 }
 
+fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
+    if (route_slots == 0 or n_experts == 0) return 0;
+    const first_blocks = @min(route_slots, n_experts);
+    const remaining_routes = route_slots - first_blocks;
+    return first_blocks + remaining_routes / moe_route_block_cols;
+}
+
+fn denseMoeColsDispatchBlocks(n_tokens: u32, n_experts: u32) u32 {
+    if (n_tokens == 0 or n_experts == 0) return 0;
+    const blocks_per_expert = (n_tokens + moe_route_block_cols - 1) / moe_route_block_cols;
+    return n_experts * blocks_per_expert;
+}
+
 // ---------------------------------------------------------------------------
 // Tensor lookup helper
 // ---------------------------------------------------------------------------
@@ -1410,6 +1425,19 @@ pub const InferenceEngine = struct {
     // path after prefillBatch temporarily flips profile_enabled on.
     prefill_gpu_phase_ns: [profile_phase_count]u64 = [_]u64{0} ** profile_phase_count,
     prefill_gpu_total_ns: u64 = 0,
+    prefill_route_pack_layers: u32 = 0,
+    prefill_route_pack_slots: u64 = 0,
+    prefill_route_pack_active_block_upper_bound: u64 = 0,
+    prefill_route_pack_dense_dispatch_blocks: u64 = 0,
+    prefill_route_pack_active_blocks_actual: u64 = 0,
+    prefill_route_pack_active_block_samples: u32 = 0,
+    prefill_route_pack_active_block_min: u32 = 0,
+    prefill_route_pack_active_block_max: u32 = 0,
+    prefill_route_pack_full_blocks_actual: u64 = 0,
+    prefill_route_pack_tail_blocks_actual: u64 = 0,
+    prefill_route_pack_single_tail_blocks_actual: u64 = 0,
+    prefill_route_pack_padding_slots_actual: u64 = 0,
+    prefill_route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
     // Pipelined prefill: second command buffer + embedding staging so the CPU
     // can prepare and submit the next prompt token while the GPU is still
     // executing the previous one. See prefillBatch() for the ping-pong logic.
@@ -3792,6 +3820,73 @@ pub const InferenceEngine = struct {
         self.profile_logged_cpu_moe_fallback = false;
         self.fa_per_layer_ns = [_]u64{0} ** 128;
         self.fa_per_layer_count = [_]u32{0} ** 128;
+    }
+
+    fn resetPrefillRoutePackProfile(self: *InferenceEngine) void {
+        self.prefill_route_pack_layers = 0;
+        self.prefill_route_pack_slots = 0;
+        self.prefill_route_pack_active_block_upper_bound = 0;
+        self.prefill_route_pack_dense_dispatch_blocks = 0;
+        self.prefill_route_pack_active_blocks_actual = 0;
+        self.prefill_route_pack_active_block_samples = 0;
+        self.prefill_route_pack_active_block_min = 0;
+        self.prefill_route_pack_active_block_max = 0;
+        self.prefill_route_pack_full_blocks_actual = 0;
+        self.prefill_route_pack_tail_blocks_actual = 0;
+        self.prefill_route_pack_single_tail_blocks_actual = 0;
+        self.prefill_route_pack_padding_slots_actual = 0;
+        self.prefill_route_pack_tail_size_blocks_actual = [_]u64{0} ** moe_route_pack_profile_tail_bins;
+    }
+
+    fn recordPrefillRoutePackCounts(
+        self: *InferenceEngine,
+        counts: []const u32,
+        n_tokens: u32,
+        route_slots: u32,
+        n_experts: u32,
+    ) void {
+        if (counts.len == 0 or n_experts == 0) return;
+        self.prefill_route_pack_layers += 1;
+        self.prefill_route_pack_slots += route_slots;
+        self.prefill_route_pack_active_block_upper_bound += maxPackedMoeRouteBlocks(route_slots, n_experts);
+        self.prefill_route_pack_dense_dispatch_blocks += denseMoeColsDispatchBlocks(n_tokens, n_experts);
+
+        var active_blocks: u32 = 0;
+        var full_blocks: u64 = 0;
+        var tail_blocks: u64 = 0;
+        var singleton_tail_blocks: u64 = 0;
+        var padding_slots: u64 = 0;
+        var tail_size_blocks = [_]u64{0} ** moe_route_pack_profile_tail_bins;
+        const expert_count = @min(@as(usize, @intCast(n_experts)), counts.len);
+        for (counts[0..expert_count]) |count| {
+            if (count == 0) continue;
+            const full = count / moe_route_block_cols;
+            const tail = count % moe_route_block_cols;
+            active_blocks += full + @as(u32, if (tail > 0) 1 else 0);
+            full_blocks += full;
+            if (tail > 0) {
+                tail_blocks += 1;
+                if (tail == 1) singleton_tail_blocks += 1;
+                padding_slots += moe_route_block_cols - tail;
+                tail_size_blocks[@as(usize, @intCast(tail - 1))] += 1;
+            }
+        }
+        if (active_blocks == 0) return;
+        self.prefill_route_pack_active_blocks_actual += active_blocks;
+        self.prefill_route_pack_active_block_samples += 1;
+        if (self.prefill_route_pack_active_block_min == 0 or active_blocks < self.prefill_route_pack_active_block_min) {
+            self.prefill_route_pack_active_block_min = active_blocks;
+        }
+        if (active_blocks > self.prefill_route_pack_active_block_max) {
+            self.prefill_route_pack_active_block_max = active_blocks;
+        }
+        self.prefill_route_pack_full_blocks_actual += full_blocks;
+        self.prefill_route_pack_tail_blocks_actual += tail_blocks;
+        self.prefill_route_pack_single_tail_blocks_actual += singleton_tail_blocks;
+        self.prefill_route_pack_padding_slots_actual += padding_slots;
+        for (0..moe_route_pack_profile_tail_bins) |i| {
+            self.prefill_route_pack_tail_size_blocks_actual[i] += tail_size_blocks[i];
+        }
     }
 
     fn avgProfilePhaseMs(self: *const InferenceEngine, phase: ProfilePhase) f64 {
@@ -19630,6 +19725,14 @@ pub const InferenceEngine = struct {
                     suffix_hidden_bytes <= scratch_down.size and
                     (shexp_gate == null or @as(vk.c.VkDeviceSize, suffix_tokens) * @sizeOf(f32) <= scratch_router_output.size)));
         if (prefix_tokens == 0 and !can_group_suffix) return inactive;
+        const route_profile_counts_bytes = counts_bytes * if (can_group_suffix) @as(vk.c.VkDeviceSize, 2) else @as(vk.c.VkDeviceSize, 1);
+        const collect_route_profile =
+            self.profile_enabled and
+            !use_q8_1_down_compare and
+            self.logits_staging.mapped != null and
+            self.logits_staging.size >= route_profile_counts_bytes;
+        var route_profile_prefix_copied = false;
+        var route_profile_suffix_copied = false;
 
         const need_precompute = !route_cache_active;
         if (need_precompute) {
@@ -19752,6 +19855,16 @@ pub const InferenceEngine = struct {
                 prefix_down_workgroups_x,
                 0,
             );
+            if (collect_route_profile) {
+                self.decode_cmd.computeToTransferBarrier();
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, counts.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                    .srcOffset = 0,
+                    .dstOffset = 0,
+                    .size = counts_bytes,
+                });
+                self.decode_cmd.transferToComputeBarrier();
+                route_profile_prefix_copied = true;
+            }
             self.decode_cmd.computeBuffersBarrier(&route_pack_ranges);
             self.decode_cmd.computeToIndirectBufferBarrier(dispatch_args.handle, dispatch_args_bytes);
 
@@ -20121,6 +20234,16 @@ pub const InferenceEngine = struct {
                 (hidden_dim + 3) / 4,
                 prefix_tokens,
             );
+            if (collect_route_profile) {
+                self.decode_cmd.computeToTransferBarrier();
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, counts.handle, self.logits_staging.handle, 1, &vk.c.VkBufferCopy{
+                    .srcOffset = 0,
+                    .dstOffset = counts_bytes,
+                    .size = counts_bytes,
+                });
+                self.decode_cmd.transferToComputeBarrier();
+                route_profile_suffix_copied = true;
+            }
             self.decode_cmd.computeBuffersBarrier(&route_pack_ranges);
             self.decode_cmd.computeToIndirectBufferBarrier(dispatch_args.handle, dispatch_args_bytes);
 
@@ -20408,6 +20531,27 @@ pub const InferenceEngine = struct {
         try self.decode_cmd.end();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
         self.recordProfilingSample();
+        if (collect_route_profile) {
+            const counts_ptr: [*]const u32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+            const n_experts_usize: usize = @intCast(cfg.n_experts);
+            if (route_profile_prefix_copied) {
+                self.recordPrefillRoutePackCounts(
+                    counts_ptr[0..n_experts_usize],
+                    prefix_tokens,
+                    prefix_tokens,
+                    cfg.n_experts,
+                );
+            }
+            if (route_profile_suffix_copied) {
+                const suffix_counts_offset: usize = @intCast(counts_bytes / @sizeOf(u32));
+                self.recordPrefillRoutePackCounts(
+                    counts_ptr[suffix_counts_offset..][0..n_experts_usize],
+                    suffix_tokens,
+                    suffix_route_count,
+                    cfg.n_experts,
+                );
+            }
+        }
         if (q8_1_down_compare_ran) {
             const ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
             const sample_elems_usize: usize = @intCast(q8_1_down_compare_sample_elems);
@@ -27578,6 +27722,7 @@ pub fn generate(
     }
     engine.diag_summary_len = 0;
     engine.resetProfilingSamples();
+    engine.resetPrefillRoutePackProfile();
 
     log.debug("Generating: {d} prompt tokens, max {d} output tokens", .{
         prompt_tokens.len, effective_max_tokens,
@@ -27802,6 +27947,48 @@ pub fn generate(
                     to_ms(dense_residual_ns),
                 },
             );
+        }
+        if (engine.prefill_route_pack_layers > 0) {
+            const pct = struct {
+                fn f(total: u64, part: u64) f64 {
+                    if (total == 0) return 0.0;
+                    return @as(f64, @floatFromInt(part)) * 100.0 / @as(f64, @floatFromInt(total));
+                }
+            }.f;
+            log.info(
+                "Prefill route-pack: layers={d} slots={d} active_blocks={d} min={d} max={d} upper={d} actual/upper={d:.1}% dense_blocks={d}",
+                .{
+                    engine.prefill_route_pack_layers,
+                    engine.prefill_route_pack_slots,
+                    engine.prefill_route_pack_active_blocks_actual,
+                    engine.prefill_route_pack_active_block_min,
+                    engine.prefill_route_pack_active_block_max,
+                    engine.prefill_route_pack_active_block_upper_bound,
+                    pct(engine.prefill_route_pack_active_block_upper_bound, engine.prefill_route_pack_active_blocks_actual),
+                    engine.prefill_route_pack_dense_dispatch_blocks,
+                },
+            );
+            const active_capacity = engine.prefill_route_pack_active_blocks_actual * @as(u64, moe_route_block_cols);
+            if (active_capacity > 0) {
+                log.info(
+                    "Prefill route-pack occupancy: full={d} tail={d} singleton_tail={d} padding_slots={d} util={d:.1}% tail_blocks={d:.1}% tail_sizes r1={d} r2={d} r3={d} r4={d} r5={d} r6={d} r7={d}",
+                    .{
+                        engine.prefill_route_pack_full_blocks_actual,
+                        engine.prefill_route_pack_tail_blocks_actual,
+                        engine.prefill_route_pack_single_tail_blocks_actual,
+                        engine.prefill_route_pack_padding_slots_actual,
+                        pct(active_capacity, engine.prefill_route_pack_slots),
+                        pct(engine.prefill_route_pack_active_blocks_actual, engine.prefill_route_pack_tail_blocks_actual),
+                        engine.prefill_route_pack_tail_size_blocks_actual[0],
+                        engine.prefill_route_pack_tail_size_blocks_actual[1],
+                        engine.prefill_route_pack_tail_size_blocks_actual[2],
+                        engine.prefill_route_pack_tail_size_blocks_actual[3],
+                        engine.prefill_route_pack_tail_size_blocks_actual[4],
+                        engine.prefill_route_pack_tail_size_blocks_actual[5],
+                        engine.prefill_route_pack_tail_size_blocks_actual[6],
+                    },
+                );
+            }
         }
     }
     // Decode profiling should describe only generated tokens, not the prompt prefill steps.
@@ -28454,6 +28641,16 @@ test "expertSliceBytes F16" {
     const result = expertSliceBytes(.f16, 512, 2048);
     // blocks_per_row = 2048/1 = 2048, bytes = 512 * 2048 * 2 = 2,097,152
     try std.testing.expectEqual(@as(u32, 2_097_152), result);
+}
+
+test "MoE route-pack block bounds match 8-column schedule" {
+    try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(0, 256));
+    try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(16, 0));
+    try std.testing.expectEqual(@as(u32, 8), maxPackedMoeRouteBlocks(8, 256));
+    try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(257, 256));
+    try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(260, 256));
+    try std.testing.expectEqual(@as(u32, 358), maxPackedMoeRouteBlocks(134 * moe_route_block_cols, 256));
+    try std.testing.expectEqual(@as(u32, 512), denseMoeColsDispatchBlocks(16, 256));
 }
 
 // ---------------------------------------------------------------------------
