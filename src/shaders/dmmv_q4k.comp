@@ -199,7 +199,6 @@ void main() {
         }
     }
 
-<<<<<<< Updated upstream
     // Reduce + write row 0.
     sum0 = subgroupAdd(sum0);
     if (gl_NumSubgroups > 1u) {
@@ -235,19 +234,6 @@ void main() {
                 y_data[y_base + row1] += sum1;
             else
                 y_data[y_base + row1] = sum1;
-=======
-    // Wave64 subgroupAdd reductions + writes (one per owned row).
-    sum0 = subgroupAdd(sum0);
-    if (tid == 0u) {
-        if (acc_mode != 0u) y_data[y_base + row0] += sum0;
-        else                y_data[y_base + row0] = sum0;
-    }
-    if (row1_valid) {
-        sum1 = subgroupAdd(sum1);
-        if (tid == 0u) {
-            if (acc_mode != 0u) y_data[y_base + row1] += sum1;
-            else                y_data[y_base + row1] = sum1;
->>>>>>> Stashed changes
         }
     }
 }
