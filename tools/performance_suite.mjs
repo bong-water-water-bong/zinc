@@ -2714,6 +2714,11 @@ async function buildIntelConfig(args) {
   if (!host || !user) {
     throw new Error("Intel benchmarking needs ZINC_INTEL_HOST and ZINC_INTEL_USER in the environment or .env");
   }
+  const vkDeviceRaw = envValue(dotEnv, "ZINC_INTEL_VK_DEVICE") ?? "0";
+  if (!/^\d+$/.test(vkDeviceRaw)) {
+    throw new Error(`Invalid ZINC_INTEL_VK_DEVICE '${vkDeviceRaw}'. Expected a Vulkan GPU index.`);
+  }
+  const vkDevice = Number.parseInt(vkDeviceRaw, 10);
   const remoteHome = envValue(dotEnv, "ZINC_INTEL_REMOTE_HOME") ?? remoteHomeForUser(user);
   const xdgCacheHome = args.intelXdgCacheHome
     ?? envValue(dotEnv, "ZINC_INTEL_XDG_CACHE_HOME", "ZINC_INTEL_REMOTE_XDG_CACHE_HOME")
@@ -2743,6 +2748,7 @@ async function buildIntelConfig(args) {
       sshKey,
       workdir,
       env: remoteEnv,
+      vkDevice,
       serverDeviceArgs: intelLlamaDeviceArgs,
       cliDeviceArgs: intelLlamaDeviceArgs,
     },
@@ -2750,13 +2756,17 @@ async function buildIntelConfig(args) {
     xdgCacheHome,
     modelRoot,
     remoteLibcConf,
+    requireDeviceSubstring: envValue(dotEnv, "ZINC_INTEL_REQUIRE_DEVICE_SUBSTRING") ?? "Intel",
     llamaCliOverride: envValue(dotEnv, "ZINC_INTEL_LLAMA_CLI_REMOTE"),
     llamaServerOverride: envValue(dotEnv, "ZINC_INTEL_LLAMA_SERVER_REMOTE"),
     llamaSearchRoots,
   };
 }
 
-async function verifyRemoteVulkanDevice(creds, requireSubstring) {
+async function verifyRemoteVulkanDevice(creds, requireSubstring, options = {}) {
+  const targetId = options.targetId ?? "rdna";
+  const nodeLabel = options.nodeLabel ?? `${targetId.toUpperCase()} node`;
+  const selectorHelp = options.selectorHelp ?? "Pick the discrete GPU with --rdna-vk-device <n> or ZINC_RDNA_VK_DEVICE=<n>.";
   const cmd = remoteCommand("vulkaninfo --summary 2>/dev/null || true", creds);
   const { stdout } = await runShell(cmd, { cwd: ROOT, timeoutMs: 30000 });
   const blocks = stdout.split(/^GPU(\d+):/m);
@@ -2769,18 +2779,18 @@ async function verifyRemoteVulkanDevice(creds, requireSubstring) {
     devices.push({ idx, name, type });
   }
   if (devices.length === 0) {
-    throw new Error("Could not parse vulkaninfo --summary on RDNA node; cannot verify selected device.");
+    throw new Error(`Could not parse vulkaninfo --summary on ${nodeLabel}; cannot verify selected device.`);
   }
   const selected = devices.find((d) => d.idx === creds.vkDevice);
   const summary = devices.map((d) => `  GPU${d.idx}: ${d.type} ${d.name}`).join("\n");
   if (!selected) {
-    throw new Error(`Selected Vulkan device index ${creds.vkDevice} not present on RDNA node.\nDetected:\n${summary}`);
+    throw new Error(`Selected Vulkan device index ${creds.vkDevice} not present on ${nodeLabel}.\nDetected:\n${summary}`);
   }
   if (selected.type !== "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU") {
     throw new Error(
       `Refusing to run: Vulkan device ${creds.vkDevice} is ${selected.type} (${selected.name}), not a discrete GPU.\n` +
       `Detected:\n${summary}\n` +
-      `Pick the discrete GPU with --rdna-vk-device <n> or ZINC_RDNA_VK_DEVICE=<n>.`,
+      selectorHelp,
     );
   }
   if (requireSubstring && !selected.name.includes(requireSubstring)) {
@@ -2789,7 +2799,7 @@ async function verifyRemoteVulkanDevice(creds, requireSubstring) {
       `Detected:\n${summary}`,
     );
   }
-  process.stdout.write(`[rdna] Vulkan device ${creds.vkDevice}: ${selected.name} (${selected.type})\n`);
+  process.stdout.write(`[${targetId}] Vulkan device ${creds.vkDevice}: ${selected.name} (${selected.type})\n`);
 }
 
 async function runRdnaTarget(args) {
@@ -3331,6 +3341,11 @@ async function runCudaTarget(args) {
 async function runIntelTarget(args) {
   const config = await buildIntelConfig(args);
   const creds = config.creds;
+  await verifyRemoteVulkanDevice(creds, config.requireDeviceSubstring, {
+    targetId: "intel",
+    nodeLabel: "Intel node",
+    selectorHelp: "Set ZINC_INTEL_VK_DEVICE=<n> to the Intel discrete GPU index.",
+  });
   await prepareIntel(args, creds, config.remoteLibcConf);
   const intelLlamaCli = await detectRemoteLlamaCliPath(creds, config.llamaSearchRoots, config.llamaCliOverride);
   const intelLlamaServer = await detectRemoteLlamaServerPath(creds, config.llamaSearchRoots, config.llamaServerOverride);
