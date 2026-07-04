@@ -996,6 +996,9 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(shader, "MatrixAUp");
     try expectContains(shader, "ActiveBlocks");
     try expectContains(shader, "x_route_divisor");
+    try expectContains(shader, "const uint ROWS_PER_WG = 4u;");
+    try expectContains(shader, "const uint LANES_PER_ROW = 16u;");
+    try expectNotContains(shader, "lane_pass");
     try expectContains(shader, "float swiglu(float gate, float up)");
     try expectContains(shader, "exp(-g)");
 
