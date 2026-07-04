@@ -283,6 +283,18 @@ test "Vulkan Gemma MoE shared expert keeps Q8_0 fused GEGLU front-end" {
     try expectContains(forward, "ZINC_GEMMA_Q8_WIDE4_DMMV");
     try expectContains(forward, "config.architecture == .gemma and config.n_experts > 0 and isIntelGpuVendor(gpu_config.vendor)");
     try expectContains(forward, "K == self.model.config.hidden_dim");
+    try expectContains(forward, "ZINC_GEMMA_Q8_1_DMMV");
+    try expectContains(forward, "Gemma Q8_0 x Q8_1 DMMV path ENABLED by default on Intel");
+    try expectContains(forward, "const gemma_q8_1_dmmv_default_on =");
+    try expectContainsNear(forward, "const gemma_q8_1_dmmv_default_on =", "config.architecture == .gemma", 220);
+    try expectContainsNear(forward, "const gemma_q8_1_dmmv_default_on =", "config.n_experts > 0", 260);
+    try expectContainsNear(forward, "const gemma_q8_1_dmmv_default_on =", "isIntelGpuVendor(gpu_config.vendor)", 320);
+    try expectContainsNear(forward, "if (self.use_gemma_q8_1_dmmv", "qt == .q8_0", 500);
+    try expectContainsNear(forward, "if (self.use_gemma_q8_1_dmmv", "try self.dmmv.recordQuantizeQ8_1(", 1600);
+    try expectContainsNear(forward, "if (self.use_gemma_q8_1_dmmv", "pipeline_q8_0_q8_1", 2200);
+    try expectContainsNear(forward, "if (self.use_gemma_q8_1_dmmv", "self.decode_cmd.computeBarrier();", 3200);
+    try expectContains(forward, "config.architecture == .gemma and config.n_experts > 0)) and");
+    try expectContains(forward, "Q8_0 x Q8_1 LM-head path ENABLED by default on Intel Qwen 3.6/Gemma MoE");
     try expectContainsNear(forward, "if (!shared_front_fused and !shared_front_q8_geglu)", "try self.dispatchFfnActivation", 500);
 
     const shader = @embedFile("shaders/dmmv_q8_0_fused_gate_up_geglu.comp");

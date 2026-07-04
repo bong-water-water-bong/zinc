@@ -1351,13 +1351,17 @@ pub const InferenceEngine = struct {
     // Experimental Intel Gemma path: route medium/large Q8_0 projections
     // through the existing four-row DMMV shader.
     use_gemma_q8_wide4_dmmv: bool = false,
+    // Default-on for Intel Gemma MoE: quantize f32 activations to Q8_1 and run
+    // Q8_0 x Q8_1 integer-dot DMMV for medium/large overwrite projections.
+    // Disable with ZINC_GEMMA_Q8_1_DMMV=0.
+    use_gemma_q8_1_dmmv: bool = false,
     // Experimental Intel Qwen A3B path: route SSM-out Q8_0 projections
     // through the existing four-row DMMV shader.
     use_qwen36_q8_wide4_ssm_out: bool = false,
     // Opt-in via ZINC_Q8_BATCH_LM_HEAD=1. Routes very tall Q8_0 LM-head
     // matrices through a one-row-per-thread shader to reduce workgroup count.
     use_q8_batch_lm_head: bool = false,
-    // Default-on for Intel Qwen 3.6 MoE; force on elsewhere with
+    // Default-on for Intel Qwen 3.6 and Gemma MoE; force on elsewhere with
     // ZINC_Q8_1_LM_HEAD=1 or disable with =0. Quantizes the final norm vector
     // to Q8_1 and runs Q8_0 x Q8_1 integer-dot DMMV for Q8_0 LM heads.
     use_q8_1_lm_head: bool = false,
@@ -2996,6 +3000,36 @@ pub const InferenceEngine = struct {
         } else if (gemma_q8_wide4_explicitly_off) {
             log.info("Gemma Q8_0 four-row DMMV path DISABLED via ZINC_GEMMA_Q8_WIDE4_DMMV=0", .{});
         }
+        const gemma_q8_1_dmmv_env = std.posix.getenv("ZINC_GEMMA_Q8_1_DMMV");
+        const gemma_q8_1_dmmv_explicitly_off = gemma_q8_1_dmmv_env != null and
+            std.mem.eql(u8, gemma_q8_1_dmmv_env.?, "0");
+        const gemma_q8_1_dmmv_forced_on = gemma_q8_1_dmmv_env != null and
+            !gemma_q8_1_dmmv_explicitly_off;
+        const gemma_q8_1_dmmv_default_on =
+            config.architecture == .gemma and
+            config.n_experts > 0 and
+            isIntelGpuVendor(gpu_config.vendor);
+        const gemma_q8_1_dmmv_requested = !gemma_q8_1_dmmv_explicitly_off and
+            (gemma_q8_1_dmmv_forced_on or gemma_q8_1_dmmv_default_on);
+        const gemma_q8_1_dmmv_enabled =
+            gemma_q8_1_dmmv_requested and
+            config.architecture == .gemma and
+            config.n_experts > 0 and
+            dmmv.pipeline_q8_0_q8_1 != null and
+            dmmv.pipeline_quantize_q8_1 != null and
+            instance.push_descriptor_fn != null and
+            (config.hidden_dim & 31) == 0;
+        if (gemma_q8_1_dmmv_enabled) {
+            if (gemma_q8_1_dmmv_forced_on) {
+                log.info("Gemma Q8_0 x Q8_1 DMMV path ENABLED via ZINC_GEMMA_Q8_1_DMMV", .{});
+            } else {
+                log.info("Gemma Q8_0 x Q8_1 DMMV path ENABLED by default on Intel (set ZINC_GEMMA_Q8_1_DMMV=0 to disable)", .{});
+            }
+        } else if (gemma_q8_1_dmmv_requested) {
+            log.info("Gemma Q8_0 x Q8_1 DMMV requested but prerequisites are missing; using default Q8_0 DMMV paths", .{});
+        } else if (gemma_q8_1_dmmv_explicitly_off) {
+            log.info("Gemma Q8_0 x Q8_1 DMMV path DISABLED via ZINC_GEMMA_Q8_1_DMMV=0", .{});
+        }
 
         const qwen36_q8_wide4_ssm_out_env = std.posix.getenv("ZINC_QWEN36_Q8_WIDE4_SSM_OUT");
         const qwen36_q8_wide4_ssm_out_explicitly_off = qwen36_q8_wide4_ssm_out_env != null and
@@ -3031,7 +3065,9 @@ pub const InferenceEngine = struct {
         const q8_1_lm_env = std.posix.getenv("ZINC_Q8_1_LM_HEAD");
         const q8_1_lm_explicitly_off = q8_1_lm_env != null and std.mem.eql(u8, q8_1_lm_env.?, "0");
         const q8_1_lm_forced_on = q8_1_lm_env != null and !q8_1_lm_explicitly_off;
-        const q8_1_lm_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
+        const q8_1_lm_default_on = (qwen36_like_f32_ssm or
+            (config.architecture == .gemma and config.n_experts > 0)) and
+            isIntelGpuVendor(gpu_config.vendor);
         const q8_1_lm_requested = !q8_1_lm_explicitly_off and (q8_1_lm_forced_on or q8_1_lm_default_on);
         const q8_1_lm_enabled = q8_1_lm_requested and
             dmmv.pipeline_q8_0_q8_1 != null and
@@ -3042,7 +3078,7 @@ pub const InferenceEngine = struct {
             if (q8_1_lm_forced_on) {
                 log.info("Q8_0 x Q8_1 LM-head path ENABLED via ZINC_Q8_1_LM_HEAD", .{});
             } else {
-                log.info("Q8_0 x Q8_1 LM-head path ENABLED by default on Intel Qwen 3.6 MoE (set ZINC_Q8_1_LM_HEAD=0 to disable)", .{});
+                log.info("Q8_0 x Q8_1 LM-head path ENABLED by default on Intel Qwen 3.6/Gemma MoE (set ZINC_Q8_1_LM_HEAD=0 to disable)", .{});
             }
         } else if (q8_1_lm_requested) {
             log.info("Q8_0 x Q8_1 LM-head path requested but prerequisites are missing; using generic Q8_0 DMMV", .{});
@@ -3608,6 +3644,7 @@ pub const InferenceEngine = struct {
             .q8_wide_lm_head_rows = q8_wide_lm_rows,
             .gemma_q8_geglu_rows = gemma_q8_geglu_rows,
             .use_gemma_q8_wide4_dmmv = gemma_q8_wide4_enabled,
+            .use_gemma_q8_1_dmmv = gemma_q8_1_dmmv_enabled,
             .use_qwen36_q8_wide4_ssm_out = qwen36_q8_wide4_ssm_out_enabled,
             .use_q8_batch_lm_head = q8_batch_lm_enabled,
             .use_q8_1_lm_head = q8_1_lm_enabled,
@@ -15902,6 +15939,59 @@ pub const InferenceEngine = struct {
                     1,
                 );
                 return;
+            }
+
+            if (self.use_gemma_q8_1_dmmv and
+                self.model.config.architecture == .gemma and
+                self.model.config.n_experts > 0 and
+                qt == .q8_0 and
+                M >= 1024 and
+                M < 100_000 and
+                acc_mode == 0 and
+                x_offset == 0 and
+                (K & 31) == 0 and
+                self.dmmv.pipeline_q8_0_q8_1 != null and
+                self.dmmv.pipeline_quantize_q8_1 != null)
+            {
+                const input_bytes = @as(vk.c.VkDeviceSize, K) * @sizeOf(f32);
+                const q8_1_bytes = @as(vk.c.VkDeviceSize, (K + 31) / 32) * Q8_1_BLOCK_BYTES;
+                if (input_size >= input_bytes and self.q8_1_buf.size >= q8_1_bytes) {
+                    try self.dmmv.recordQuantizeQ8_1(
+                        &self.decode_cmd,
+                        self.instance.push_descriptor_fn,
+                        input_buf.handle,
+                        input_size,
+                        self.q8_1_buf.handle,
+                        self.q8_1_buf.size,
+                        K,
+                    );
+                    self.decode_cmd.computeBufferBarrier(self.q8_1_buf.handle, q8_1_bytes);
+
+                    const q8_q81_pip = &self.dmmv.pipeline_q8_0_q8_1.?;
+                    const push_q8_q81 = DmmvPushConstants{
+                        .M = M,
+                        .K = K,
+                        .a_offset = a_offset,
+                        .x_offset = 0,
+                        .y_offset = y_offset,
+                        .acc_mode = acc_mode,
+                    };
+                    self.pushDispatch3(
+                        q8_q81_pip,
+                        std.mem.asBytes(&push_q8_q81),
+                        tensor.gpu_buffer.handle,
+                        tensor.gpu_buffer.size,
+                        self.q8_1_buf.handle,
+                        self.q8_1_buf.size,
+                        output_buf.handle,
+                        output_buf.size,
+                        (M + 1) / 2,
+                        1,
+                        1,
+                    );
+                    self.decode_cmd.computeBarrier();
+                    return;
+                }
             }
 
             if (self.use_gemma_q8_wide4_dmmv and qt == .q8_0 and M >= 1024 and K == self.model.config.hidden_dim and acc_mode == 0 and self.dmmv.pipeline_q8_0_wide4 != null) {
