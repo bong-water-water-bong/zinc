@@ -51,13 +51,17 @@ shared vec2 buf_b_sd[BN];
 shared uint route_ids[BN];
 shared uint route_active[BN];
 
-void decode_sb(uint bytes[12], uint sb, out float sc, out float mn) {
+void decode_scale_min(uint sc0, uint sc1, uint sc2, uint sb, out float sc_val, out float mn_val) {
+    const uint shift = (sb & 3u) * 8u;
+    const uint sc0_v = sc0 >> shift;
+    const uint sc1_v = sc1 >> shift;
     if (sb < 4u) {
-        sc = float(bytes[sb] & 63u);
-        mn = float(bytes[sb + 4u] & 63u);
+        sc_val = float(sc0_v & 0x3Fu);
+        mn_val = float(sc1_v & 0x3Fu);
     } else {
-        sc = float((bytes[sb + 4u] & 0xFu) | ((bytes[sb - 4u] >> 6u) << 4u));
-        mn = float(((bytes[sb + 4u] >> 4u) & 0xFu) | ((bytes[sb] >> 6u) << 4u));
+        const uint sc2_v = sc2 >> shift;
+        sc_val = float((sc2_v & 0xFu) | ((sc0_v & 0xC0u) >> 2u));
+        mn_val = float(((sc2_v & 0xF0u) >> 4u) | ((sc1_v & 0xC0u) >> 2u));
     }
 }
 
@@ -118,23 +122,10 @@ void main() {
             const uint sc0 = a_u32[blk_u32 + 1u];
             const uint sc1 = a_u32[blk_u32 + 2u];
             const uint sc2 = a_u32[blk_u32 + 3u];
-            uint bytes[12];
-            bytes[0] = sc0 & 0xFFu;
-            bytes[1] = (sc0 >> 8u) & 0xFFu;
-            bytes[2] = (sc0 >> 16u) & 0xFFu;
-            bytes[3] = (sc0 >> 24u) & 0xFFu;
-            bytes[4] = sc1 & 0xFFu;
-            bytes[5] = (sc1 >> 8u) & 0xFFu;
-            bytes[6] = (sc1 >> 16u) & 0xFFu;
-            bytes[7] = (sc1 >> 24u) & 0xFFu;
-            bytes[8] = sc2 & 0xFFu;
-            bytes[9] = (sc2 >> 8u) & 0xFFu;
-            bytes[10] = (sc2 >> 16u) & 0xFFu;
-            bytes[11] = (sc2 >> 24u) & 0xFFu;
 
             float sc_val;
             float mn_val;
-            decode_sb(bytes, sb, sc_val, mn_val);
+            decode_scale_min(sc0, sc1, sc2, sb, sc_val, mn_val);
 
             const uint qs_byte_base = chunk * 32u + k_in_tile;
             const uint qs_u32_idx = blk_u32 + 12u + (qs_byte_base >> 2u);
