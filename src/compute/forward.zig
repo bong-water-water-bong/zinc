@@ -2445,7 +2445,7 @@ pub const InferenceEngine = struct {
             log.info("MoE Q5_K x Q8_1 fused down+acc DISABLED via ZINC_MOE_Q5K_Q8_1_DOWN_ACC=0", .{});
         }
 
-        const qwen36_topk_default: u32 = if (qwen36_moe_intel_safe_defaults) 0 else 3;
+        const qwen36_topk_default: u32 = 3;
         const qwen36_topk_limit: u32 = if (qwen36_like_f32_ssm) blk: {
             if (qwen36_topk_env) |raw| {
                 const parsed = std.fmt.parseInt(u32, raw, 10) catch qwen36_topk_default;
@@ -2461,8 +2461,6 @@ pub const InferenceEngine = struct {
             });
         } else if (qwen36_like_f32_ssm and qwen36_topk_env != null) {
             log.info("Qwen 3.6 MoE top-k cap disabled via ZINC_QWEN36_MOE_TOPK={s}", .{qwen36_topk_env.?});
-        } else if (qwen36_moe_intel_safe_defaults) {
-            log.info("Qwen 3.6 MoE top-k cap disabled by default on Intel (set ZINC_QWEN36_MOE_TOPK to cap)", .{});
         }
         const gemma_topk_env = std.posix.getenv("ZINC_GEMMA_MOE_TOPK");
         const gemma_topk_default: u32 = if (config.architecture == .gemma and isIntelGpuVendor(gpu_config.vendor)) 2 else 0;
@@ -12050,6 +12048,12 @@ pub const InferenceEngine = struct {
             M == cfg.hidden_dim and
             K == cfg.ssm_d_inner and
             n_tokens >= 16;
+        const qwen_a3b_shared_inter_dim = if (cfg.shared_expert_intermediate_dim > 0) cfg.shared_expert_intermediate_dim else cfg.intermediate_dim;
+        const qwen_a3b_shared_q8_shape = self.isQwen36A3bMoePrefillModel() and
+            tensor.info.type_ == .q8_0 and
+            n_tokens >= 16 and
+            ((M == qwen_a3b_shared_inter_dim and K == cfg.hidden_dim) or
+                (M == cfg.hidden_dim and K == qwen_a3b_shared_inter_dim));
         const gemma_dense_q6_projection_shape = cfg.architecture == .gemma and
             cfg.n_experts == 0 and
             cfg.ssm_d_inner == 0 and
@@ -12422,7 +12426,7 @@ pub const InferenceEngine = struct {
             }
             return;
         }
-        if (qwen_a3b_ssm_out_q8_shape and
+        if ((qwen_a3b_ssm_out_q8_shape or qwen_a3b_shared_q8_shape) and
             (K & 31) == 0 and
             self.instance.push_descriptor_fn != null and
             self.dmmv.pipeline_mul_mm_q8_0 != null)
@@ -17420,7 +17424,7 @@ pub const InferenceEngine = struct {
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
         if (!self.isQwen36A3bMoePrefillModel()) return false;
         if (!isIntelGpuVendor(self.gpu_config.vendor)) return false;
-        if (n_tokens < 16 or n_tokens > 64) return false;
+        if (n_tokens < 16 or n_tokens > 192) return false;
         if (std.posix.getenv("ZINC_QWEN36_MOE_GROUPED_EXACT")) |env| {
             if (std.mem.eql(u8, env, "0") or
                 std.ascii.eqlIgnoreCase(env, "off") or
@@ -20479,49 +20483,72 @@ pub const InferenceEngine = struct {
             if (has_suffix_shared_expert) {
                 self.decode_cmd.computeBarrier();
                 const shared_phase = self.beginProfilePhase();
+                const batch_shared_suffix = prefix_tokens == 0;
                 const shared_proj_phase = self.beginProfilePhase();
-                var suffix_tok: u32 = 0;
-                while (suffix_tok < suffix_tokens) : (suffix_tok += 1) {
-                    const input_tok = prefix_tokens + suffix_tok;
-                    const x_offset: u32 = @intCast(input_tok * hidden_dim * @sizeOf(f32));
-                    const shexp_offset: u32 = @intCast(suffix_tok * shexp_inter_dim * @sizeOf(f32));
-                    try self.dispatchDmmvInner(
-                        gate_shexp.?,
-                        scratch_norm,
-                        scratch_norm.size,
-                        scratch_gate,
-                        shexp_inter_dim,
-                        hidden_dim,
-                        0,
-                        x_offset,
-                        shexp_offset,
-                        0,
-                    );
-                    try self.dispatchDmmvInner(
-                        up_shexp.?,
-                        scratch_norm,
-                        scratch_norm.size,
-                        scratch_up,
-                        shexp_inter_dim,
-                        hidden_dim,
-                        0,
-                        x_offset,
-                        shexp_offset,
-                        0,
-                    );
+                if (batch_shared_suffix) {
+                    try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, suffix_tokens);
+                    try self.dispatchProjectionBatched(up_shexp.?, scratch_norm, scratch_up, shexp_inter_dim, hidden_dim, suffix_tokens);
                     if (shexp_gate) |sg| {
+                        var suffix_tok: u32 = 0;
+                        while (suffix_tok < suffix_tokens) : (suffix_tok += 1) {
+                            try self.dispatchDmmvInner(
+                                sg,
+                                scratch_norm,
+                                scratch_norm.size,
+                                scratch_router_output,
+                                1,
+                                hidden_dim,
+                                0,
+                                suffix_tok * hidden_dim * @sizeOf(f32),
+                                suffix_tok * @sizeOf(f32),
+                                0,
+                            );
+                        }
+                    }
+                } else {
+                    var suffix_tok: u32 = 0;
+                    while (suffix_tok < suffix_tokens) : (suffix_tok += 1) {
+                        const input_tok = prefix_tokens + suffix_tok;
+                        const x_offset: u32 = @intCast(input_tok * hidden_dim * @sizeOf(f32));
+                        const shexp_offset: u32 = @intCast(suffix_tok * shexp_inter_dim * @sizeOf(f32));
                         try self.dispatchDmmvInner(
-                            sg,
+                            gate_shexp.?,
                             scratch_norm,
                             scratch_norm.size,
-                            scratch_router_output,
-                            1,
+                            scratch_gate,
+                            shexp_inter_dim,
                             hidden_dim,
                             0,
                             x_offset,
-                            suffix_tok * @sizeOf(f32),
+                            shexp_offset,
                             0,
                         );
+                        try self.dispatchDmmvInner(
+                            up_shexp.?,
+                            scratch_norm,
+                            scratch_norm.size,
+                            scratch_up,
+                            shexp_inter_dim,
+                            hidden_dim,
+                            0,
+                            x_offset,
+                            shexp_offset,
+                            0,
+                        );
+                        if (shexp_gate) |sg| {
+                            try self.dispatchDmmvInner(
+                                sg,
+                                scratch_norm,
+                                scratch_norm.size,
+                                scratch_router_output,
+                                1,
+                                hidden_dim,
+                                0,
+                                x_offset,
+                                suffix_tok * @sizeOf(f32),
+                                0,
+                            );
+                        }
                     }
                 }
                 self.endProfilePhase(.shared_proj, shared_proj_phase);
@@ -20546,20 +20573,24 @@ pub const InferenceEngine = struct {
 
                 self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, suffix_shared_inter_bytes);
                 const shared_down_phase = self.beginProfilePhase();
-                suffix_tok = 0;
-                while (suffix_tok < suffix_tokens) : (suffix_tok += 1) {
-                    try self.dispatchDmmvInner(
-                        down_shexp.?,
-                        scratch_swiglu,
-                        scratch_swiglu.size,
-                        scratch_down,
-                        hidden_dim,
-                        shexp_inter_dim,
-                        0,
-                        @intCast(suffix_tok * shexp_inter_dim * @sizeOf(f32)),
-                        @intCast(suffix_tok * hidden_dim * @sizeOf(f32)),
-                        0,
-                    );
+                if (batch_shared_suffix) {
+                    try self.dispatchProjectionBatched(down_shexp.?, scratch_swiglu, scratch_down, hidden_dim, shexp_inter_dim, suffix_tokens);
+                } else {
+                    var suffix_tok: u32 = 0;
+                    while (suffix_tok < suffix_tokens) : (suffix_tok += 1) {
+                        try self.dispatchDmmvInner(
+                            down_shexp.?,
+                            scratch_swiglu,
+                            scratch_swiglu.size,
+                            scratch_down,
+                            hidden_dim,
+                            shexp_inter_dim,
+                            0,
+                            @intCast(suffix_tok * shexp_inter_dim * @sizeOf(f32)),
+                            @intCast(suffix_tok * hidden_dim * @sizeOf(f32)),
+                            0,
+                        );
+                    }
                 }
                 self.endProfilePhase(.shared_down, shared_down_phase);
 

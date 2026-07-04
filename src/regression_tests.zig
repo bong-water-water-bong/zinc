@@ -760,12 +760,12 @@ test "Vulkan fused RMS router merges wave32 subgroup partials" {
     try expectContains(src, "router_out[row] = merged;");
 }
 
-test "Vulkan Qwen 3.6 MoE top-k caps default to full metadata top-k on Intel" {
+test "Vulkan Qwen 3.6 MoE decode top-k cap stays default-on on Intel" {
     const src = @embedFile("compute/forward.zig");
     try expectContains(src, "const qwen36_moe_intel_safe_defaults = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);");
-    try expectContains(src, "const qwen36_topk_default: u32 = if (qwen36_moe_intel_safe_defaults) 0 else 3;");
+    try expectContains(src, "const qwen36_topk_default: u32 = 3;");
     try expectContains(src, "const qwen36_prefill_topk_default: u32 = if (qwen36_moe_intel_safe_defaults) 0 else 1;");
-    try expectContains(src, "Qwen 3.6 MoE top-k cap disabled by default on Intel");
+    try expectContains(src, "Qwen 3.6 MoE top-k capped at {d} (set ZINC_QWEN36_MOE_TOPK={d} to restore metadata top-k)");
     try expectContains(src, "Qwen 3.6 non-terminal prefill MoE top-k cap disabled by default on Intel");
 }
 
@@ -988,7 +988,10 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsDispatchIndirect", 30000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect", 30000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordMoeColsQ8_1DispatchIndirect", 42000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COMPARE: layer=", 54000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COMPARE: layer=", 60000);
+    try expectContains(forward, "if (n_tokens < 16 or n_tokens > 192) return false;");
+    try expectContains(forward, "const qwen_a3b_shared_q8_shape = self.isQwen36A3bMoePrefillModel()");
+    try expectContains(forward, "try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, suffix_tokens);");
 
     const shader = @embedFile("shaders/dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.comp");
     try expectContains(shader, "layout(local_size_x = 64) in;");
