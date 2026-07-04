@@ -19590,13 +19590,14 @@ pub const InferenceEngine = struct {
         const use_fused_gate_up_cols =
             self.use_moe_fused_gate_up_swiglu and
             self.dmmv.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1 != null;
+        const q8_1_gate_up_cols_default_on = exact_grouped and prefix_tokens == 0;
         const q8_1_gate_up_cols_enabled = if (std.posix.getenv("ZINC_MOE_Q8_1_GATE_UP_COLS")) |raw|
-            std.mem.eql(u8, raw, "1") or
-                std.ascii.eqlIgnoreCase(raw, "on") or
-                std.ascii.eqlIgnoreCase(raw, "true") or
-                std.ascii.eqlIgnoreCase(raw, "yes")
+            !(std.mem.eql(u8, raw, "0") or
+                std.ascii.eqlIgnoreCase(raw, "off") or
+                std.ascii.eqlIgnoreCase(raw, "false") or
+                std.ascii.eqlIgnoreCase(raw, "no"))
         else
-            false;
+            q8_1_gate_up_cols_default_on;
         const q8_1_gate_up_packed = self.batched_scratch_hidden_i8;
         const q8_1_gate_up_scale_dsum = self.batched_scratch_hidden_scale_dsum;
         const prefix_hidden_i8_bytes: vk.c.VkDeviceSize =
@@ -19605,6 +19606,15 @@ pub const InferenceEngine = struct {
             @sizeOf(u32);
         const prefix_hidden_scale_dsum_bytes: vk.c.VkDeviceSize =
             @as(vk.c.VkDeviceSize, prefix_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim / 32) *
+            2 *
+            @sizeOf(f32);
+        const suffix_hidden_i8_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, suffix_tokens) *
+            @as(vk.c.VkDeviceSize, hidden_dim / 4) *
+            @sizeOf(u32);
+        const suffix_hidden_scale_dsum_bytes: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, suffix_tokens) *
             @as(vk.c.VkDeviceSize, hidden_dim / 32) *
             2 *
             @sizeOf(f32);
@@ -19618,6 +19628,18 @@ pub const InferenceEngine = struct {
             (hidden_dim & 255) == 0 and
             q8_1_gate_up_packed.?.size >= prefix_hidden_i8_bytes and
             q8_1_gate_up_scale_dsum.?.size >= prefix_hidden_scale_dsum_bytes;
+        const use_q8_1_suffix_gate_up_cols =
+            use_fused_gate_up_cols and
+            q8_1_gate_up_cols_enabled and
+            exact_grouped and
+            prefix_tokens == 0 and
+            self.dmmv.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1 != null and
+            self.dmmv.pipeline_quantize_act_q8_1 != null and
+            q8_1_gate_up_packed != null and
+            q8_1_gate_up_scale_dsum != null and
+            (hidden_dim & 255) == 0 and
+            q8_1_gate_up_packed.?.size >= suffix_hidden_i8_bytes and
+            q8_1_gate_up_scale_dsum.?.size >= suffix_hidden_scale_dsum_bytes;
         const q8_1_down_cols_env = std.posix.getenv("ZINC_MOE_Q8_1_DOWN_COLS");
         const q8_1_down_cols_requested = if (q8_1_down_cols_env) |raw|
             !(std.mem.eql(u8, raw, "0") or
@@ -20248,7 +20270,56 @@ pub const InferenceEngine = struct {
             self.decode_cmd.computeToIndirectBufferBarrier(dispatch_args.handle, dispatch_args_bytes);
 
             const suffix_gate_up_phase = self.beginProfilePhase();
-            if (use_fused_gate_up_cols) {
+            if (use_q8_1_suffix_gate_up_cols) {
+                const hidden_i8 = q8_1_gate_up_packed.?;
+                const hidden_sd = q8_1_gate_up_scale_dsum.?;
+                try self.dmmv.recordQuantizeActQ8_1(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    scratch_norm.handle,
+                    scratch_norm.size,
+                    hidden_i8.handle,
+                    hidden_i8.size,
+                    hidden_sd.handle,
+                    hidden_sd.size,
+                    suffix_tokens,
+                    hidden_dim,
+                );
+                const q8_1_ranges = [_]CommandBuffer.BufferRange{
+                    .{ .buffer = hidden_i8.handle, .size = suffix_hidden_i8_bytes },
+                    .{ .buffer = hidden_sd.handle, .size = suffix_hidden_scale_dsum_bytes },
+                };
+                self.decode_cmd.computeBuffersBarrier(&q8_1_ranges);
+                try self.dmmv.recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect(
+                    &self.decode_cmd,
+                    self.instance.push_descriptor_fn,
+                    gate_exps.gpu_buffer.handle,
+                    gate_exps.gpu_buffer.size,
+                    up_exps.gpu_buffer.handle,
+                    up_exps.gpu_buffer.size,
+                    hidden_i8.handle,
+                    hidden_i8.size,
+                    hidden_sd.handle,
+                    hidden_sd.size,
+                    scratch_swiglu.handle,
+                    suffix_route_inter_bytes,
+                    counts.handle,
+                    counts_bytes,
+                    ids.handle,
+                    ids_bytes,
+                    active_blocks.handle,
+                    active_blocks_bytes,
+                    dispatch_args.handle,
+                    0,
+                    inter_dim,
+                    hidden_dim,
+                    gate_stride,
+                    suffix_route_count,
+                    suffix_k,
+                    0,
+                    0,
+                );
+            } else if (use_fused_gate_up_cols) {
                 try self.dmmv.recordQwenTop1GateUpSwigluColsDispatchIndirect(
                     &self.decode_cmd,
                     self.instance.push_descriptor_fn,

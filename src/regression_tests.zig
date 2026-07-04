@@ -979,14 +979,16 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     const forward = @embedFile("compute/forward.zig");
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1", 9200);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "self.use_moe_fused_gate_up_swiglu", 9200);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "q8_1_gate_up_cols_default_on = exact_grouped", 12000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "use_q8_1_suffix_gate_up_cols", 16000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_GATE_UP_COLS", 12000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COLS", 14000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COMPARE", 17000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQuantizeActQ8_1", 20000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsDispatchIndirect", 24000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect", 24000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQuantizeActQ8_1", 26000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsDispatchIndirect", 30000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordQwenTop1GateUpSwigluColsQ8_1DispatchIndirect", 30000);
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "recordMoeColsQ8_1DispatchIndirect", 42000);
-    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COMPARE: layer=", 52000);
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q8_1_DOWN_COMPARE: layer=", 54000);
 
     const shader = @embedFile("shaders/dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.comp");
     try expectContains(shader, "layout(local_size_x = 64) in;");
