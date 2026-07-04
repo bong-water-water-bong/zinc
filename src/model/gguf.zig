@@ -66,6 +66,9 @@ pub const GGMLType = enum(u32) {
     iq1_m = 29,
     bf16 = 30,
     mxfp4 = 39,
+    nvfp4 = 40,
+    q1_0 = 41,
+    stq1_0 = 42,
     _,
 
     /// Return the number of tensor elements encoded by one storage block.
@@ -87,6 +90,9 @@ pub const GGMLType = enum(u32) {
             .q6_k => 256,
             .q8_k => 256,
             .iq1_s, .iq1_m, .iq2_xxs => 256,
+            .nvfp4 => 32,
+            .q1_0 => 32,
+            .stq1_0 => 256,
             else => 1,
         };
     }
@@ -121,6 +127,9 @@ pub const GGMLType = enum(u32) {
             .iq1_s => 34, // 256 × 1-bit + 2 bytes fp16 scale
             .iq1_m => 36, // 256 × 1-bit + 2 bytes fp16 scale + 2 bytes min
             .iq2_xxs => 66, // 256 × 2-bit + 2 bytes fp16 scale (2.0625 bpw)
+            .nvfp4 => 17,
+            .q1_0 => 5,
+            .stq1_0 => 42, // 32 qs + 8 sign + 2 d = 42 bytes (1.3125 bpw)
             else => 0,
         };
     }

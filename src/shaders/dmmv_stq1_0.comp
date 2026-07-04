@@ -1,0 +1,190 @@
+#version 460
+// ZINC — STQ1_0 1.3125-bit sparse ternary dequantize + matrix-vector multiply
+// AngelSlim Sherry format: 3-of-4 sparse ternary (±1/0), block scale fp16
+//
+// STQ1_0 block layout (256 elements, 42 bytes):
+//   qs[32]    — 4-bit slot per group of 4 (64 groups × 4 bits = 32 bytes)
+//   sign[8]   — 1-bit global sign per group (64 groups × 1 bit = 8 bytes)
+//   d         — fp16 block scale (2 bytes)
+//
+// Each group of 4: exactly one 0, three ±1 values.
+// Codebook: 32 patterns encoded as 4×2-bit lanes per byte.
+//   2-bit codes: 00=-1, 01=0, 10=+1
+//   index = (sign << 4) | slot
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;           // number of output rows
+    uint K;           // number of input columns (elements)
+    uint a_offset;    // byte offset into matrix A buffer
+    uint x_offset;    // byte offset into vector x buffer
+    uint y_offset;    // byte offset into vector y buffer
+    uint acc_mode;    // 0 = overwrite, 1 = accumulate
+};
+
+layout(set = 0, binding = 0) readonly buffer MatrixA { uint8_t a_data[]; };
+layout(set = 0, binding = 1) readonly buffer VectorX { float x_data[]; };
+layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
+
+const uint STQ1_0_BLOCK_SIZE = 256u;
+const uint STQ1_0_BYTES      = 42u;
+const uint GROUPS_PER_BLOCK  = 64u;  // 256/4
+const uint GROUP_QS_BYTES    = 32u;  // 64 × 4 bits
+const uint GROUP_SIGN_BYTES  = 8u;   // 64 × 1 bit
+
+// STQ1_0 codebook: 32 entries × 1 byte each
+// Byte encodes 4 lanes of 2-bit ternary codes: lane3<<6 | lane2<<4 | lane1<<2 | lane0
+// 2-bit codes: 00=-1, 01=0, 10=+1
+const uint stq1_0_codebook[32] = uint[32](
+    // sign=0 (first non-zero lane is +1)
+    0xA9u, 0x89u, 0x29u, 0x09u, 0xA6u, 0x86u, 0x26u, 0x06u,
+    0x9Au, 0x92u, 0x1Au, 0x12u, 0x6Au, 0x62u, 0x4Au, 0x42u,
+    // sign=1 (every non-zero lane negated)
+    0x01u, 0x21u, 0x81u, 0xA1u, 0x04u, 0x24u, 0x84u, 0xA4u,
+    0x10u, 0x18u, 0x90u, 0x98u, 0x40u, 0x48u, 0x60u, 0x68u
+);
+
+shared float s_sum0[4];
+shared float s_sum1[4];
+
+// Decode 2-bit ternary code to float: 00=-1, 01=0, 10=+1
+float decode_ternary(uint code) {
+    if (code == 0u) return -1.0;
+    if (code == 1u) return 0.0;
+    return 1.0;  // code == 2u → +1, code == 3u → +1 (reserved, treat as +1)
+}
+
+// Decode fp16 (stored as uint16) to fp32
+float fp16_to_fp32(uint v) {
+    uint sign  = (v >> 15u) & 1u;
+    uint exp   = (v >> 10u) & 0x1Fu;
+    uint mant  = v & 0x03FFu;
+
+    if (exp == 0u) {
+        // Denormal: mantissa → float subnormal
+        if (mant == 0u) return sign == 0u ? 0.0 : -0.0;
+        // Normalize
+        return uintBitsToFloat((sign << 31u) | ((125u - exp) << 23u) | (mant << 13u));
+    } else if (exp == 0x1Fu) {
+        // Infinity or NaN
+        return uintBitsToFloat((sign << 31u) | 0x7F800000u | (mant << 13u));
+    } else {
+        // Normal
+        return uintBitsToFloat((sign << 31u) | ((exp + 112u) << 23u) | (mant << 13u));
+    }
+}
+
+void main() {
+    uint wg_id = gl_WorkGroupID.x;
+    uint row0 = wg_id * 2u;
+    uint row1 = row0 + 1u;
+    uint tid = gl_LocalInvocationID.x;  // 0..63
+
+    uint blocks_per_row = K / STQ1_0_BLOCK_SIZE;
+    uint groups_per_thread = (GROUPS_PER_BLOCK + 63u) / 64u;  // ceil(64/64) = 1
+
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+
+    for (uint blk = tid / GROUPS_PER_BLOCK; blk < blocks_per_row; blk += 1u) {
+        uint group_start = tid % GROUPS_PER_BLOCK;
+
+        for (uint g = group_start; g < GROUPS_PER_BLOCK; g += 64u) {
+            uint x_base = x_offset / 4u + blk * STQ1_0_BLOCK_SIZE + g * 4u;
+
+            // Read slot (4 bits) from qs
+            uint qs_byte_idx = g / 2u;  // 2 groups per byte
+            uint qs_nibble   = (g & 1u) * 4u;  // low or high nibble
+            uint qs_base = a_offset + blk * STQ1_0_BYTES;
+            uint slot = (uint(a_data[qs_base + qs_byte_idx]) >> qs_nibble) & 0x0Fu;
+
+            // Read sign bit
+            uint sign_byte_idx = g / 8u;  // 8 groups per byte
+            uint sign_bit      = g & 7u;
+            uint sign = (uint(a_data[qs_base + GROUP_QS_BYTES + sign_byte_idx]) >> sign_bit) & 1u;
+
+            // Codebook lookup
+            uint codebook_idx = (sign << 4u) | slot;
+            uint packed = stq1_0_codebook[codebook_idx];
+
+            // Read block scale (fp16 as uint16)
+            uint scale_word = uint(a_data[qs_base + GROUP_QS_BYTES + GROUP_SIGN_BYTES]) |
+                             (uint(a_data[qs_base + GROUP_QS_BYTES + GROUP_SIGN_BYTES + 1u]) << 8u);
+            float d = fp16_to_fp32(scale_word);
+
+            // Decode 4 lanes
+            for (uint lane = 0u; lane < 4u; lane++) {
+                uint code = (packed >> (lane * 2u)) & 3u;
+                float w = decode_ternary(code) * d;
+
+                if (row0 < M) {
+                    sum0 += w * x_data[x_base + lane];
+                }
+                if (row1 < M) {
+                    sum1 += w * x_data[x_base + lane];
+                }
+            }
+        }
+    }
+
+    // Subgroup reduction
+    for (uint i = 32u; i > 0u; i >>= 1u) {
+        sum0 += subgroupShuffleXor(sum0, i);
+        sum1 += subgroupShuffleXor(sum1, i);
+    }
+
+    if (subgroupElect()) {
+        uint sg_idx = gl_SubgroupID;
+        s_sum0[sg_idx] = sum0;
+        s_sum1[sg_idx] = sum1;
+    }
+
+    memoryBarrierShared();
+    barrier();
+
+    // Final reduction across subgroups
+    if (tid < 4u) {
+        float f0 = s_sum0[tid];
+        float f1 = s_sum1[tid];
+        for (uint i = 2u; i > 0u; i >>= 1u) {
+            f0 += subgroupShuffleXor(f0, i);
+            f1 += subgroupShuffleXor(f1, i);
+        }
+        if (subgroupElect()) {
+            s_sum0[tid] = f0;
+            s_sum1[tid] = f1;
+        }
+    }
+
+    memoryBarrierShared();
+    barrier();
+
+    if (tid == 0u) {
+        float total0 = 0.0;
+        float total1 = 0.0;
+        for (uint i = 0u; i < 4u; i++) {
+            total0 += s_sum0[i];
+            total1 += s_sum1[i];
+        }
+        uint y0 = y_offset / 4u + row0;
+        uint y1 = y_offset / 4u + row1;
+        if (row0 < M) {
+            if (acc_mode == 0u)
+                y_data[y0] = total0;
+            else
+                y_data[y0] += total0;
+        }
+        if (row1 < M) {
+            if (acc_mode == 0u)
+                y_data[y1] = total1;
+            else
+                y_data[y1] += total1;
+        }
+    }
+}

@@ -206,6 +206,7 @@ pub fn build(b: *std.Build) void {
         "ssm_gated_norm",
         "ssm_gated_norm_batched",
         "dmmv_mxfp4",
+        "dmmv_stq1_0",
         "dmmv_q5_0",
         "dmmv_q5_1",
         "dmmv_q5_1_acc",
