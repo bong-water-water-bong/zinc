@@ -199,6 +199,107 @@ void accumulate_up_row(
     if (active7) acc1.w += dot(w0, x_v4[x7 + idx0]) + dot(w1, x_v4[x7 + idx1]) + dot(w2, x_v4[x7 + idx2]) + dot(w3, x_v4[x7 + idx3]);
 }
 
+void accumulate_route_pair(
+    vec4 gate_w0,
+    vec4 gate_w1,
+    vec4 gate_w2,
+    vec4 gate_w3,
+    vec4 up_w0,
+    vec4 up_w1,
+    vec4 up_w2,
+    vec4 up_w3,
+    uint x_base,
+    uint idx0,
+    uint idx1,
+    uint idx2,
+    uint idx3,
+    inout float gate_acc,
+    inout float up_acc
+) {
+    const vec4 x0v = x_v4[x_base + idx0];
+    const vec4 x1v = x_v4[x_base + idx1];
+    const vec4 x2v = x_v4[x_base + idx2];
+    const vec4 x3v = x_v4[x_base + idx3];
+    gate_acc += dot(gate_w0, x0v) + dot(gate_w1, x1v) + dot(gate_w2, x2v) + dot(gate_w3, x3v);
+    up_acc += dot(up_w0, x0v) + dot(up_w1, x1v) + dot(up_w2, x2v) + dot(up_w3, x3v);
+}
+
+void accumulate_gate_up_row(
+    uint row_u32,
+    uint block_idx,
+    uint q_offset_in_half,
+    uint shift,
+    uint idx0,
+    uint idx1,
+    uint idx2,
+    uint idx3,
+    uint x0,
+    uint x1,
+    uint x2,
+    uint x3,
+    uint x4,
+    uint x5,
+    uint x6,
+    uint x7,
+    bool active0,
+    bool active1,
+    bool active2,
+    bool active3,
+    bool active4,
+    bool active5,
+    bool active6,
+    bool active7,
+    inout vec4 gate0,
+    inout vec4 gate1,
+    inout vec4 up0,
+    inout vec4 up1
+) {
+    const uint blk_u32 = row_u32 + block_idx * Q4K_BLOCK_U32;
+
+    const uint gate_d_dmin = a_gate_u32[blk_u32];
+    const float gate_d_val = unpackHalf2x16(gate_d_dmin & 0xFFFFu).x;
+    const float gate_dmin_val = unpackHalf2x16(gate_d_dmin >> 16).x;
+    const uint gate_sc0 = a_gate_u32[blk_u32 + 1u];
+    const uint gate_sc1 = a_gate_u32[blk_u32 + 2u];
+    const uint gate_sc2 = a_gate_u32[blk_u32 + 3u];
+    float gate_sc_a, gate_mn_a, gate_sc_b, gate_mn_b, gate_sc_c, gate_mn_c, gate_sc_d, gate_mn_d;
+    decode_scales(gate_sc0, gate_sc1, gate_sc2, shift, gate_sc_a, gate_mn_a, gate_sc_b, gate_mn_b, gate_sc_c, gate_mn_c, gate_sc_d, gate_mn_d);
+
+    const uint up_d_dmin = a_up_u32[blk_u32];
+    const float up_d_val = unpackHalf2x16(up_d_dmin & 0xFFFFu).x;
+    const float up_dmin_val = unpackHalf2x16(up_d_dmin >> 16).x;
+    const uint up_sc0 = a_up_u32[blk_u32 + 1u];
+    const uint up_sc1 = a_up_u32[blk_u32 + 2u];
+    const uint up_sc2 = a_up_u32[blk_u32 + 3u];
+    float up_sc_a, up_mn_a, up_sc_b, up_mn_b, up_sc_c, up_mn_c, up_sc_d, up_mn_d;
+    decode_scales(up_sc0, up_sc1, up_sc2, shift, up_sc_a, up_mn_a, up_sc_b, up_mn_b, up_sc_c, up_mn_c, up_sc_d, up_mn_d);
+
+    const uint q_word_offset = 4u + q_offset_in_half / 4u;
+    const uint gate_qs_u32_0 = a_gate_u32[blk_u32 + q_word_offset];
+    const uint gate_qs_u32_1 = a_gate_u32[blk_u32 + q_word_offset + 16u];
+    const uint up_qs_u32_0 = a_up_u32[blk_u32 + q_word_offset];
+    const uint up_qs_u32_1 = a_up_u32[blk_u32 + q_word_offset + 16u];
+
+    const vec4 gate_w0 = vec4(gate_d_val * gate_sc_a) * unpack_nibbles_lo(gate_qs_u32_0) - vec4(gate_dmin_val * gate_mn_a);
+    const vec4 gate_w1 = vec4(gate_d_val * gate_sc_b) * unpack_nibbles_hi(gate_qs_u32_0) - vec4(gate_dmin_val * gate_mn_b);
+    const vec4 gate_w2 = vec4(gate_d_val * gate_sc_c) * unpack_nibbles_lo(gate_qs_u32_1) - vec4(gate_dmin_val * gate_mn_c);
+    const vec4 gate_w3 = vec4(gate_d_val * gate_sc_d) * unpack_nibbles_hi(gate_qs_u32_1) - vec4(gate_dmin_val * gate_mn_d);
+
+    const vec4 up_w0 = vec4(up_d_val * up_sc_a) * unpack_nibbles_lo(up_qs_u32_0) - vec4(up_dmin_val * up_mn_a);
+    const vec4 up_w1 = vec4(up_d_val * up_sc_b) * unpack_nibbles_hi(up_qs_u32_0) - vec4(up_dmin_val * up_mn_b);
+    const vec4 up_w2 = vec4(up_d_val * up_sc_c) * unpack_nibbles_lo(up_qs_u32_1) - vec4(up_dmin_val * up_mn_c);
+    const vec4 up_w3 = vec4(up_d_val * up_sc_d) * unpack_nibbles_hi(up_qs_u32_1) - vec4(up_dmin_val * up_mn_d);
+
+    if (active0) accumulate_route_pair(gate_w0, gate_w1, gate_w2, gate_w3, up_w0, up_w1, up_w2, up_w3, x0, idx0, idx1, idx2, idx3, gate0.x, up0.x);
+    if (active1) accumulate_route_pair(gate_w0, gate_w1, gate_w2, gate_w3, up_w0, up_w1, up_w2, up_w3, x1, idx0, idx1, idx2, idx3, gate0.y, up0.y);
+    if (active2) accumulate_route_pair(gate_w0, gate_w1, gate_w2, gate_w3, up_w0, up_w1, up_w2, up_w3, x2, idx0, idx1, idx2, idx3, gate0.z, up0.z);
+    if (active3) accumulate_route_pair(gate_w0, gate_w1, gate_w2, gate_w3, up_w0, up_w1, up_w2, up_w3, x3, idx0, idx1, idx2, idx3, gate0.w, up0.w);
+    if (active4) accumulate_route_pair(gate_w0, gate_w1, gate_w2, gate_w3, up_w0, up_w1, up_w2, up_w3, x4, idx0, idx1, idx2, idx3, gate1.x, up1.x);
+    if (active5) accumulate_route_pair(gate_w0, gate_w1, gate_w2, gate_w3, up_w0, up_w1, up_w2, up_w3, x5, idx0, idx1, idx2, idx3, gate1.y, up1.y);
+    if (active6) accumulate_route_pair(gate_w0, gate_w1, gate_w2, gate_w3, up_w0, up_w1, up_w2, up_w3, x6, idx0, idx1, idx2, idx3, gate1.z, up1.z);
+    if (active7) accumulate_route_pair(gate_w0, gate_w1, gate_w2, gate_w3, up_w0, up_w1, up_w2, up_w3, x7, idx0, idx1, idx2, idx3, gate1.w, up1.w);
+}
+
 float swiglu(float gate, float up) {
     const float g = clamp(gate, -60.0, 60.0);
     return gate * (1.0 / (1.0 + exp(-g))) * up;
@@ -273,8 +374,7 @@ void main() {
         const uint idx2 = (b * 256u + y_offset_local + 128u) / 4u;
         const uint idx3 = idx2 + 8u;
 
-        accumulate_gate_row(gate_row_u32, b, q_offset_in_half, shift, idx0, idx1, idx2, idx3, x0, x1, x2, x3, x4, x5, x6, x7, active0, active1, active2, active3, active4, active5, active6, active7, gate0, gate1);
-        accumulate_up_row(up_row_u32, b, q_offset_in_half, shift, idx0, idx1, idx2, idx3, x0, x1, x2, x3, x4, x5, x6, x7, active0, active1, active2, active3, active4, active5, active6, active7, up0, up1);
+        accumulate_gate_up_row(gate_row_u32, b, q_offset_in_half, shift, idx0, idx1, idx2, idx3, x0, x1, x2, x3, x4, x5, x6, x7, active0, active1, active2, active3, active4, active5, active6, active7, gate0, gate1, up0, up1);
     }
 
     const float gate_out0 = subgroupClusteredAdd(gate0.x, LANES_PER_ROW);
