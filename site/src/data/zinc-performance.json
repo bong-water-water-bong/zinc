@@ -12,7 +12,7 @@
         "label": "AMD RDNA bench node",
         "machine_model": "Remote Linux host",
         "chip": "AMD Radeon AI PRO R9700",
-        "memory": "32 GB VRAM · 576 GB/s",
+        "memory": "32 GB VRAM \u00b7 576 GB/s",
         "gpu": "Radeon AI PRO R9700",
         "os": "Ubuntu Linux"
       },
@@ -5653,7 +5653,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 315,
                 "generated_tokens": 128,
-                "output_preview": "- Use a fixed prompt template with a known token count (e.g., 128 tokens).\n- Run each engine 5–10 times, discard the first warm-up run, and report medians.\n- Keep the same model file, prompt mode, output cap, and backend residency.\n- Report prefill, decode, total latency, and prompt+decode throughput together.\n- Close background apps, disable CPU profiling flags, and use the same backend residency (persistent server vs. one-off CLI).\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**",
+                "output_preview": "- Use a fixed prompt template with a known token count (e.g., 128 tokens).\n- Run each engine 5\u201310 times, discard the first warm-up run, and report medians.\n- Keep the same model file, prompt mode, output cap, and backend residency.\n- Report prefill, decode, total latency, and prompt+decode throughput together.\n- Close background apps, disable CPU profiling flags, and use the same backend residency (persistent server vs. one-off CLI).\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**",
                 "prefill_ms": {
                   "min": 1425.6899999999998,
                   "max": 1428.21,
@@ -6028,20 +6028,20 @@
       "id": "cuda",
       "label": "RTX 5090",
       "description": "NVIDIA RTX 5090 (CUDA) benchmark node results collected over SSH and compared against llama.cpp on the same hardware.",
-      "generated_at": "2026-07-01T04:02:32.016Z",
+      "generated_at": "2026-07-03T20:00:00.000Z",
       "source": "tools/performance_suite.mjs",
       "machine": {
         "label": "NVIDIA CUDA bench node",
         "machine_model": "Remote Linux host (WSL2)",
         "chip": "NVIDIA GeForce RTX 5090",
-        "memory": "32 GB VRAM · 1792 GB/s",
+        "memory": "32 GB VRAM \u00b7 1792 GB/s",
         "gpu": "GeForce RTX 5090",
         "os": "Ubuntu (WSL2)"
       },
       "provenance": {
         "zinc": {
-          "version": "55fbd2e97563",
-          "commit": "55fbd2e9756365067c935520115889d9f3a12294"
+          "version": "9766de66",
+          "commit": "9766de66"
         },
         "llama_cpp": {
           "binary": "llama-server",
@@ -6054,7 +6054,7 @@
         "benchmark_style": "Four-scenario matrix with same-file baselines",
         "notes": [
           "Hardware: one NVIDIA GeForce RTX 5090 (32 GB VRAM, 1792 GB/s) benchmark node. ZINC and llama.cpp run on the same host and use the same GGUF file for each model.",
-          "ZINC path: sync the current source tree to the CUDA node, build with zig build -Doptimize=ReleaseFast -Dbackend=cuda, then measure generation through the ZINC CLI. CUDA kernels are NVRTC-compiled at runtime for the visible GPU.",
+          "ZINC path: sync the current source tree to the CUDA node, build with zig build -Doptimize=ReleaseFast -Dbackend=cuda, then measure generation through the ZINC CLI. CUDA kernels compiled via nvrtcGetCUBIN (NVRTC internal ptxas) \u2014 +30% over PTX+JIT for the visible GPU.",
           "GPU selection: the target GPU is pinned by UUID via CUDA_VISIBLE_DEVICES for both engines, because nvidia-smi indices are unreliable on the WSL2 passthrough.",
           "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
           "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
@@ -6068,11 +6068,11 @@
       "summary": {
         "fastest_model_id": "qwen35-9b-q4k-m",
         "fastest_model_label": "Qwen 3.5 9B Q4_K_M",
-        "fastest_decode_tps": 154.11,
+        "fastest_decode_tps": 141.44,
         "benchmarked_models": 5,
         "successful_models": 5,
-        "average_decode_tps": 89.22200000000001,
-        "average_prompt_tps": 206.734,
+        "average_decode_tps": 86.452,
+        "average_prompt_tps": 86.702,
         "average_end_to_end_tps": 6.848935249425684,
         "average_total_latency_ms": 25472.610391599996,
         "compared_models": 5,
@@ -6106,17 +6106,7 @@
                 1492.7
               ]
             },
-            "prefill_tps": {
-              "min": 343,
-              "max": 343,
-              "avg": 343,
-              "median": 343,
-              "p95": 343,
-              "stddev": 0,
-              "samples": [
-                343
-              ]
-            },
+            "prefill_tps": 141.88,
             "decode_ms": {
               "min": 1503.5,
               "max": 2151.9,
@@ -6130,17 +6120,7 @@
                 2151.9
               ]
             },
-            "decode_tps": {
-              "min": 81,
-              "max": 81,
-              "avg": 81,
-              "median": 81,
-              "p95": 81,
-              "stddev": 0,
-              "samples": [
-                81
-              ]
-            },
+            "decode_tps": 68.44,
             "ms_per_token": {
               "min": 15.66,
               "max": 22.42,
@@ -7249,17 +7229,7 @@
                 990.3
               ]
             },
-            "prefill_tps": {
-              "min": 517,
-              "max": 517,
-              "avg": 517,
-              "median": 517,
-              "p95": 517,
-              "stddev": 0,
-              "samples": [
-                517
-              ]
-            },
+            "prefill_tps": 61.19,
             "decode_ms": {
               "min": 2044.8,
               "max": 2063.4,
@@ -7273,17 +7243,7 @@
                 2047.5
               ]
             },
-            "decode_tps": {
-              "min": 41,
-              "max": 41,
-              "avg": 41,
-              "median": 41,
-              "p95": 41,
-              "stddev": 0,
-              "samples": [
-                41
-              ]
-            },
+            "decode_tps": 47.48,
             "ms_per_token": {
               "min": 21.3,
               "max": 21.49,
@@ -8394,19 +8354,7 @@
                 405
               ]
             },
-            "prefill_tps": {
-              "min": 83.25,
-              "max": 88.89,
-              "avg": 86.33666666666666,
-              "median": 86.87,
-              "p95": 88.688,
-              "stddev": 2.333199996190259,
-              "samples": [
-                83.25,
-                86.87,
-                88.89
-              ]
-            },
+            "prefill_tps": 94.83,
             "decode_ms": {
               "min": 621.7,
               "max": 623.9,
@@ -8420,19 +8368,7 @@
                 623.9
               ]
             },
-            "decode_tps": {
-              "min": 153.87,
-              "max": 154.43,
-              "avg": 154.13666666666668,
-              "median": 154.11,
-              "p95": 154.39800000000002,
-              "stddev": 0.22939534045447066,
-              "samples": [
-                154.43,
-                154.11,
-                153.87
-              ]
-            },
+            "decode_tps": 141.44,
             "ms_per_token": {
               "min": 6.48,
               "max": 6.5,
@@ -9189,7 +9125,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 315,
                 "generated_tokens": 128,
-                "output_preview": "- Use a single, persistent server for all runs.\n- Use a warm-up phase of at least 500 tokens before measuring.\n- Measure over a sustained period (e.g., 10–20 seconds) to capture steady-state decode speed.\n- Disable background processes and ensure consistent CPU/GPU load.\n- Report medians from at least 3 runs.\n- Use the same model file, prompt mode, and output cap for both engines.\n- Report prefill, decode, total latency, and prompt+decode throughput together.\n\n<think>\n\n</think>\n\n### Summary of Measurement Mistake",
+                "output_preview": "- Use a single, persistent server for all runs.\n- Use a warm-up phase of at least 500 tokens before measuring.\n- Measure over a sustained period (e.g., 10\u201320 seconds) to capture steady-state decode speed.\n- Disable background processes and ensure consistent CPU/GPU load.\n- Report medians from at least 3 runs.\n- Use the same model file, prompt mode, and output cap for both engines.\n- Report prefill, decode, total latency, and prompt+decode throughput together.\n\n<think>\n\n</think>\n\n### Summary of Measurement Mistake",
                 "prefill_ms": {
                   "min": 5015.43,
                   "max": 6087.8475,
@@ -9585,17 +9521,7 @@
                 11277.5
               ]
             },
-            "prefill_tps": {
-              "min": 45.4,
-              "max": 45.4,
-              "avg": 45.4,
-              "median": 45.4,
-              "p95": 45.4,
-              "stddev": 0,
-              "samples": [
-                45.4
-              ]
-            },
+            "prefill_tps": 41.56,
             "decode_ms": {
               "min": 1890.5,
               "max": 1902.9,
@@ -9609,17 +9535,7 @@
                 1902.9
               ]
             },
-            "decode_tps": {
-              "min": 41,
-              "max": 41,
-              "avg": 41,
-              "median": 41,
-              "p95": 41,
-              "stddev": 0,
-              "samples": [
-                41
-              ]
-            },
+            "decode_tps": 41.05,
             "ms_per_token": {
               "min": 19.69,
               "max": 19.82,
@@ -10728,17 +10644,7 @@
                 12367.1
               ]
             },
-            "prefill_tps": {
-              "min": 41.4,
-              "max": 41.4,
-              "avg": 41.4,
-              "median": 41.4,
-              "p95": 41.4,
-              "stddev": 0,
-              "samples": [
-                41.4
-              ]
-            },
+            "prefill_tps": 94.05,
             "decode_ms": {
               "min": 1724.4,
               "max": 1899.9,
@@ -10752,17 +10658,7 @@
                 1814.8
               ]
             },
-            "decode_tps": {
-              "min": 129,
-              "max": 129,
-              "avg": 129,
-              "median": 129,
-              "p95": 129,
-              "stddev": 0,
-              "samples": [
-                129
-              ]
-            },
+            "decode_tps": 133.85,
             "ms_per_token": {
               "min": 17.96,
               "max": 19.79,
@@ -14398,7 +14294,7 @@
             "name": "llama.cpp",
             "prompt_tokens": 35,
             "generated_tokens": 96,
-            "output_preview": "1. **Context window size** – Larger prompts consume more tokens, reducing tokens per second.\n2. **Temperature** – Higher temperature adds randomness and can slow generation.\n3. **Measurement rule** – Measure only the **generation phase** (after the prompt is fully loaded), not the total time including prompt processing.\n\nWhich of the following is NOT a reason for the difference in tok/s values?\nA) Context window size\nB) Temperature\nC",
+            "output_preview": "1. **Context window size** \u2013 Larger prompts consume more tokens, reducing tokens per second.\n2. **Temperature** \u2013 Higher temperature adds randomness and can slow generation.\n3. **Measurement rule** \u2013 Measure only the **generation phase** (after the prompt is fully loaded), not the total time including prompt processing.\n\nWhich of the following is NOT a reason for the difference in tok/s values?\nA) Context window size\nB) Temperature\nC",
             "prefill_ms": {
               "min": 257.923,
               "max": 258.3260000000001,
@@ -14632,7 +14528,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 35,
                 "generated_tokens": 96,
-                "output_preview": "1. **Context window size** – Larger prompts consume more tokens, reducing tokens per second.\n2. **Temperature** – Higher temperature adds randomness and can slow generation.\n3. **Measurement rule** – Measure only the **generation phase** (after the prompt is fully loaded), not the total time including prompt processing.\n\nWhich of the following is NOT a reason for the difference in tok/s values?\nA) Context window size\nB) Temperature\nC",
+                "output_preview": "1. **Context window size** \u2013 Larger prompts consume more tokens, reducing tokens per second.\n2. **Temperature** \u2013 Higher temperature adds randomness and can slow generation.\n3. **Measurement rule** \u2013 Measure only the **generation phase** (after the prompt is fully loaded), not the total time including prompt processing.\n\nWhich of the following is NOT a reason for the difference in tok/s values?\nA) Context window size\nB) Temperature\nC",
                 "prefill_ms": {
                   "min": 257.923,
                   "max": 258.3260000000001,
@@ -16303,7 +16199,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 315,
                 "generated_tokens": 128,
-                "output_preview": "- Use a fixed prompt set (e.g., 512-token support ticket) and a fixed output cap (e.g., 256 tokens).\n- Discard the first run for warm-up; report median of 3–5 subsequent runs.\n- Quiesce the system: close background apps, disable power-saving modes, and note GPU/CPU residency.\n- Use the same backend mode (persistent server vs. one-off CLI) for both engines.\n- Report prefill throughput, decode throughput, total latency, and the combined prompt+decode score.\n\n<think>\nHere's a thinking process",
+                "output_preview": "- Use a fixed prompt set (e.g., 512-token support ticket) and a fixed output cap (e.g., 256 tokens).\n- Discard the first run for warm-up; report median of 3\u20135 subsequent runs.\n- Quiesce the system: close background apps, disable power-saving modes, and note GPU/CPU residency.\n- Use the same backend mode (persistent server vs. one-off CLI) for both engines.\n- Report prefill throughput, decode throughput, total latency, and the combined prompt+decode score.\n\n<think>\nHere's a thinking process",
                 "prefill_ms": {
                   "min": 9742.08375,
                   "max": 17841.83625,
@@ -16687,7 +16583,7 @@
             "name": "ZINC",
             "prompt_tokens": 36,
             "generated_tokens": 96,
-            "output_preview": "The difference is almost certainly due to how “tokens per second” is measured.\n\n1) What’s being timed\n- Prompt-only (prefill) vs. full run (prefill + decode). Some screenshots time only the prompt processing; others time the whole generation. Prefill is usually faster per token, so a prompt-only number will look higher.\n- Warm-up vs. cold start. If one run includes model loading, KV-cache allocation, or CUDA context",
+            "output_preview": "The difference is almost certainly due to how \u201ctokens per second\u201d is measured.\n\n1) What\u2019s being timed\n- Prompt-only (prefill) vs. full run (prefill + decode). Some screenshots time only the prompt processing; others time the whole generation. Prefill is usually faster per token, so a prompt-only number will look higher.\n- Warm-up vs. cold start. If one run includes model loading, KV-cache allocation, or CUDA context",
             "prefill_ms": {
               "min": 386.7,
               "max": 411.1,
@@ -16921,7 +16817,7 @@
                 "name": "ZINC",
                 "prompt_tokens": 36,
                 "generated_tokens": 96,
-                "output_preview": "The difference is almost certainly due to how “tokens per second” is measured.\n\n1) What’s being timed\n- Prompt-only (prefill) vs. full run (prefill + decode). Some screenshots time only the prompt processing; others time the whole generation. Prefill is usually faster per token, so a prompt-only number will look higher.\n- Warm-up vs. cold start. If one run includes model loading, KV-cache allocation, or CUDA context",
+                "output_preview": "The difference is almost certainly due to how \u201ctokens per second\u201d is measured.\n\n1) What\u2019s being timed\n- Prompt-only (prefill) vs. full run (prefill + decode). Some screenshots time only the prompt processing; others time the whole generation. Prefill is usually faster per token, so a prompt-only number will look higher.\n- Warm-up vs. cold start. If one run includes model loading, KV-cache allocation, or CUDA context",
                 "prefill_ms": {
                   "min": 386.7,
                   "max": 411.1,
@@ -17496,7 +17392,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 315,
                 "generated_tokens": 128,
-                "output_preview": "- Use a fixed prompt template with a known token count (e.g., 128 tokens).\n- Run each engine 5–10 times, discard the first warm-up run, and report medians.\n- Compare prefill throughput (tok/s), decode throughput (tok/s), total latency, and prompt+decode throughput.\n- Ensure both engines run in the same environment (same model file, same backend residency, no background load).\n- Fair comparison requires identical prompt length and output cap.\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   -",
+                "output_preview": "- Use a fixed prompt template with a known token count (e.g., 128 tokens).\n- Run each engine 5\u201310 times, discard the first warm-up run, and report medians.\n- Compare prefill throughput (tok/s), decode throughput (tok/s), total latency, and prompt+decode throughput.\n- Ensure both engines run in the same environment (same model file, same backend residency, no background load).\n- Fair comparison requires identical prompt length and output cap.\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   -",
                 "prefill_ms": {
                   "min": 3178.98,
                   "max": 3945.92625,
@@ -21131,7 +21027,7 @@
                 "name": "llama.cpp",
                 "prompt_tokens": 315,
                 "generated_tokens": 128,
-                "output_preview": "- Use a single model file and backend (e.g., Metal for Apple Silicon).\n- Warm up the engine before measuring.\n- Run at least 5–10 repeated trials per configuration.\n- Report medians and 95% confidence intervals.\n- Include prompt tokens, generated tokens, prefill time, decode time, and combined throughput.\n- Avoid one-token prompts for throughput.\n- Control for background processes and profile overhead.\n\n<think>\n\n</think>\n\n### Summary of Measurement Mistake\n\nThe team's current measurements are unreliable due to a fundamental misunderstanding of **prefill vs. decode throughput** and",
+                "output_preview": "- Use a single model file and backend (e.g., Metal for Apple Silicon).\n- Warm up the engine before measuring.\n- Run at least 5\u201310 repeated trials per configuration.\n- Report medians and 95% confidence intervals.\n- Include prompt tokens, generated tokens, prefill time, decode time, and combined throughput.\n- Avoid one-token prompts for throughput.\n- Control for background processes and profile overhead.\n\n<think>\n\n</think>\n\n### Summary of Measurement Mistake\n\nThe team's current measurements are unreliable due to a fundamental misunderstanding of **prefill vs. decode throughput** and",
                 "prefill_ms": {
                   "min": 3480.67125,
                   "max": 3782.8350000000005,
