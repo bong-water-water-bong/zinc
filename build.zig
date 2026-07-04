@@ -338,6 +338,7 @@ pub fn build(b: *std.Build) void {
         // segment.
         "ssm_gated_norm_batch_tok",
         "ssm_gated_norm_batch_tok_fused",
+        "h2o_score_accum",
     };
 
     // SPIR-V is only the Vulkan backend's kernel format. CUDA uses NVRTC `.cu`
