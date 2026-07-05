@@ -895,7 +895,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
 
-        const stq1_0_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_stq1_0.spv", .{shader_dir}) catch unreachable;
+        const stq1_0_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q2_0.spv", .{shader_dir}) catch unreachable;
         const pipeline_stq1_0 = pipeline_mod.createFromSpirvWithOptions(instance, stq1_0_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("STQ1_0 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;

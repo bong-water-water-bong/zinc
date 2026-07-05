@@ -602,6 +602,24 @@ fn dequantRow(raw_data: []const u8, row: u32, cols: u32, quant_type: GGMLType, o
                 out_i += 32;
             }
         },
+        .stq1_0 => { // type 42 = prism-ml Q2_0 ternary (128 elems / 34 bytes), value=(code-1)*d
+            const block_size: usize = 128;
+            const bpb: usize = 34;
+            const bpr = @as(usize, cols) / block_size;
+            const row_off = @as(usize, row) * bpr * bpb;
+            var out_i: usize = 0;
+            for (0..bpr) |b| {
+                const bo = row_off + b * bpb;
+                const scale_bits = std.mem.readInt(u16, raw_data[bo..][0..2], .little);
+                const scale: f32 = @floatCast(@as(f16, @bitCast(scale_bits)));
+                for (0..block_size) |j| {
+                    const byte = raw_data[bo + 2 + (j >> 2)];
+                    const code: u8 = (byte >> @as(u3, @intCast((j & 3) * 2))) & 0x3;
+                    output[out_i] = @as(f32, @floatFromInt(@as(i32, code) - 1)) * scale;
+                    out_i += 1;
+                }
+            }
+        },
         else => {
             log.warn("Unsupported embedding quant type {d}, using zeros", .{@intFromEnum(quant_type)});
             @memset(output, 0);

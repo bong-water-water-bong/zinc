@@ -92,7 +92,7 @@ pub const GGMLType = enum(u32) {
             .iq1_s, .iq1_m, .iq2_xxs => 256,
             .nvfp4 => 32,
             .q1_0 => 32,
-            .stq1_0 => 256,
+            .stq1_0 => 128, // type 42 retargeted to prism-ml Q2_0 (128 elems)
             else => 1,
         };
     }
@@ -129,7 +129,7 @@ pub const GGMLType = enum(u32) {
             .iq2_xxs => 66, // 256 × 2-bit + 2 bytes fp16 scale (2.0625 bpw)
             .nvfp4 => 17,
             .q1_0 => 5,
-            .stq1_0 => 42, // 32 qs + 8 sign + 2 d = 42 bytes (1.3125 bpw)
+            .stq1_0 => 34, // prism-ml Q2_0: 2 (fp16 d) + 32 (2-bit codes) = 34 bytes
             else => 0,
         };
     }

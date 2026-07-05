@@ -1,27 +1,18 @@
 #version 460
 // ZINC — Q2_0 1.58-bit ternary dequantize + matrix-vector multiply
-// prism-ml "Q2_0" format (Ternary-Bonsai-*-gguf). GGML tensor type id 42.
-//
-// WARNING: type id 42 collides with ZINC's `stq1_0` (AngelSlim "Sherry", 256/42).
-//     These are DIFFERENT formats. Dispatch must disambiguate by on-disk block
-//     size: Q2_0 is 128 elems / 34 bytes; stq1_0 is 256 elems / 42 bytes.
-//     ggml_row_size(tensor) tells them apart unambiguously.
-//
-// Q2_0 block layout (128 elements, 34 bytes):
-//   d       — fp16 block scale         (bytes 0..1, little-endian)
-//   qs[32]  — 2-bit codes, LSB-first   (bytes 2..33)  4 codes per byte
-//
-//   code(j)  = (qs[j/4] >> ((j%4)*2)) & 0x3          j = 0..127
-//   value(j) = (int(code) - 1) * d                   {0,1,2,3} -> {-1,0,+1,+2}
-//
-// Verified bit-exact vs F16 reference (cos = 1.000000). See tools/q2_0_decode.py.
+// prism-ml "Q2_0" (Ternary-Bonsai-*-gguf), GGML type id 42, 128 elems / 34 bytes.
+//   d       — fp16 block scale (bytes 0..1)
+//   qs[32]  — 2-bit codes, LSB-first, 4/byte (bytes 2..33)
+//   value(j) = (int(code)-1) * d      code {0,1,2,3} -> {-1,0,+1,+2}
+// Structure mirrors the proven dmmv_q8_0.comp exactly (strided blocks, full-block
+// dot, subgroupAdd). Verified format vs F16 (cos=1.0, tools/q2_0_decode.py).
 
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 64) in;
+layout(constant_id = 2) const uint SPEC_BLOCKS_PER_ROW = 0u;
 
 layout(push_constant) uniform PushConstants {
     uint M;
@@ -38,83 +29,76 @@ layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
 
 const uint Q2_0_BLOCK_SIZE = 128u;
 const uint Q2_0_BYTES      = 34u;
-const uint Q2_0_QS_OFFSET  = 2u;
 
 shared float s_sum0[4];
 shared float s_sum1[4];
 
-float fp16_to_fp32(uint v) {
-    uint sign = (v >> 15u) & 1u;
-    uint exp  = (v >> 10u) & 0x1Fu;
-    uint mant = v & 0x03FFu;
-    if (exp == 0u) {
-        if (mant == 0u) return sign == 0u ? 0.0 : -0.0;
-        return uintBitsToFloat((sign << 31u) | ((125u - exp) << 23u) | (mant << 13u));
-    } else if (exp == 0x1Fu) {
-        return uintBitsToFloat((sign << 31u) | 0x7F800000u | (mant << 13u));
-    } else {
-        return uintBitsToFloat((sign << 31u) | ((exp + 112u) << 23u) | (mant << 13u));
+// dot over one 128-element Q2_0 block: sum_j (code-1) * x[j]
+float dot_q2_block(uint qs_off, uint x_base) {
+    float acc = 0.0;
+    for (uint j = 0u; j < Q2_0_BLOCK_SIZE; j++) {
+        uint byte = uint(a_data[qs_off + (j >> 2u)]);
+        uint code = (byte >> ((j & 3u) * 2u)) & 3u;
+        acc += float(int(code) - 1) * x_data[x_base + j];
     }
+    return acc;
 }
 
 void main() {
     uint wg_id = gl_WorkGroupID.x;
     uint row0 = wg_id * 2u;
     uint row1 = row0 + 1u;
-    uint tid  = gl_LocalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
 
-    uint blocks_per_row = K / Q2_0_BLOCK_SIZE;
+    uint blocks_per_row = (SPEC_BLOCKS_PER_ROW != 0u) ? SPEC_BLOCKS_PER_ROW : (K / Q2_0_BLOCK_SIZE);
 
     float sum0 = 0.0;
     float sum1 = 0.0;
 
-    uint row0_base = a_offset + row0 * blocks_per_row * Q2_0_BYTES;
-    uint row1_base = a_offset + row1 * blocks_per_row * Q2_0_BYTES;
-
-    for (uint blk = 0u; blk < blocks_per_row; blk++) {
+    for (uint blk = tid; blk < blocks_per_row; blk += 64u) {
         uint x_base = x_offset / 4u + blk * Q2_0_BLOCK_SIZE;
-        for (uint hh = 0u; hh < 2u; hh++) {
-            uint j = tid + hh * 64u;
-            uint byte_idx = Q2_0_QS_OFFSET + (j >> 2u);
-            uint bit_off  = (j & 3u) * 2u;
-            if (row0 < M) {
-                uint blk_base = row0_base + blk * Q2_0_BYTES;
-                float d = fp16_to_fp32(uint(a_data[blk_base]) | (uint(a_data[blk_base + 1u]) << 8u));
-                uint code = (uint(a_data[blk_base + byte_idx]) >> bit_off) & 3u;
-                sum0 += (float(int(code) - 1)) * d * x_data[x_base + j];
-            }
-            if (row1 < M) {
-                uint blk_base = row1_base + blk * Q2_0_BYTES;
-                float d = fp16_to_fp32(uint(a_data[blk_base]) | (uint(a_data[blk_base + 1u]) << 8u));
-                uint code = (uint(a_data[blk_base + byte_idx]) >> bit_off) & 3u;
-                sum1 += (float(int(code) - 1)) * d * x_data[x_base + j];
-            }
+
+        if (row0 < M) {
+            uint byte_off = a_offset + row0 * blocks_per_row * Q2_0_BYTES + blk * Q2_0_BYTES;
+            uint d_bits = uint(a_data[byte_off]) | (uint(a_data[byte_off + 1u]) << 8);
+            float d = unpackHalf2x16(d_bits).x;
+            sum0 += d * dot_q2_block(byte_off + 2u, x_base);
+        }
+        if (row1 < M) {
+            uint byte_off = a_offset + row1 * blocks_per_row * Q2_0_BYTES + blk * Q2_0_BYTES;
+            uint d_bits = uint(a_data[byte_off]) | (uint(a_data[byte_off + 1u]) << 8);
+            float d = unpackHalf2x16(d_bits).x;
+            sum1 += d * dot_q2_block(byte_off + 2u, x_base);
         }
     }
 
-    for (uint i = 32u; i > 0u; i >>= 1u) {
-        sum0 += subgroupShuffleXor(sum0, i);
-        sum1 += subgroupShuffleXor(sum1, i);
+    sum0 = subgroupAdd(sum0);
+    sum1 = subgroupAdd(sum1);
+
+    if (gl_NumSubgroups > 1u) {
+        if (subgroupElect()) {
+            s_sum0[gl_SubgroupID] = sum0;
+            s_sum1[gl_SubgroupID] = sum1;
+        }
+        barrier();
+        if (tid == 0u) {
+            sum0 = s_sum0[0];
+            sum1 = s_sum1[0];
+            for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                sum0 += s_sum0[sg];
+                sum1 += s_sum1[sg];
+            }
+        }
     }
-    if (subgroupElect()) {
-        uint sg_idx = gl_SubgroupID;
-        s_sum0[sg_idx] = sum0;
-        s_sum1[sg_idx] = sum1;
-    }
-    memoryBarrierShared();
-    barrier();
 
     if (tid == 0u) {
-        float total0 = 0.0;
-        float total1 = 0.0;
-        uint n_sg = (gl_WorkGroupSize.x + gl_SubgroupSize - 1u) / gl_SubgroupSize;
-        for (uint i = 0u; i < n_sg && i < 4u; i++) {
-            total0 += s_sum0[i];
-            total1 += s_sum1[i];
+        uint y_base = y_offset / 4u;
+        if (acc_mode != 0u) {
+            if (row0 < M) y_data[y_base + row0] += sum0;
+            if (row1 < M) y_data[y_base + row1] += sum1;
+        } else {
+            if (row0 < M) y_data[y_base + row0] = sum0;
+            if (row1 < M) y_data[y_base + row1] = sum1;
         }
-        uint y0 = y_offset / 4u + row0;
-        uint y1 = y_offset / 4u + row1;
-        if (row0 < M) { if (acc_mode == 0u) y_data[y0] = total0; else y_data[y0] += total0; }
-        if (row1 < M) { if (acc_mode == 0u) y_data[y1] = total1; else y_data[y1] += total1; }
     }
 }
