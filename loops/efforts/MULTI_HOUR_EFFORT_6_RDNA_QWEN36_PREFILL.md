@@ -8,6 +8,29 @@
 started at 149.95 tok/s and landed a 5.06x improvement on the
 canonical 154-token Qwen3.6-35B-A3B prefill harness.
 
+### 2026-07-04 continuation: A3B Q8_0 DP4a crossover keep
+
+Commit `f10a910c` lowered the Qwen3.6 A3B SSM qkv/z Q8_0 DP4a crossover
+to 64 prompt tokens, gives that path priority over the older fused Q8_0
+pair at the crossover, and keeps Q8 activation quantization on real
+full 32-token columns instead of padding the 2971-token shape. Commit
+`e11a033b` adds the source-level guard and comments for that policy.
+
+Measured on the RDNA node, Qwen3.6-35B-A3B UD Q4_K_XL, same prompts and
+same output tokens:
+
+| Shape | Base | Candidate | Result |
+|---|---:|---:|---:|
+| 111p, no profile avg of 3 | 556.7 tok/s | 626.9 tok/s | +12.6% |
+| 111p, profile | 393.6 tok/s | 631.0 tok/s | SSM 104.5 -> 51.1 ms |
+| 2971p, no profile avg of 2 | 1145.9 tok/s | 1166.6 tok/s | +1.8% |
+| 2971p, profile | 813.8 tok/s | 873.2 tok/s | output `{17}` unchanged |
+
+Rejected follow-up: batching the alpha/beta Q8_0 projections through the
+same DP4a scratch was noisy and not worth keeping. Against the kept
+candidate, 111p no-profile moved 674.2 -> 645.5 tok/s across three runs
+and 2971p was flat (1138.6 -> 1139.8 tok/s across two runs).
+
 The original A3b problem is no longer open. The accepted production
 path is now layer-major A3B prefill:
 
