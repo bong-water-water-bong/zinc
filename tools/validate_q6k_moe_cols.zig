@@ -113,8 +113,14 @@ fn uploadPattern(
         ids[1 * n_tokens + token] = @intCast(token * k_used);
         ids[2 * n_tokens + token] = @intCast(token * k_used + 1);
     }
-    active_blocks[0] = 1;
-    active_blocks[1] = 2;
+    var active_i: usize = 0;
+    for ([_]usize{ 1, 2 }) |expert| {
+        const block_count = (n_tokens + 7) / 8;
+        for (0..block_count) |block| {
+            active_blocks[active_i] = @intCast(expert | (block << 16));
+            active_i += 1;
+        }
+    }
 }
 
 pub fn main() !void {
@@ -148,10 +154,11 @@ pub fn main() !void {
 
     const M: usize = 2048;
     const K: usize = 768;
-    const n_tokens: usize = 5;
+    const n_tokens: usize = 19;
     const k_used: usize = 2;
     const n_experts: usize = 3;
     const route_slots = n_tokens * k_used;
+    const active_block_count = 2 * ((n_tokens + 7) / 8);
     const blocks_per_row = K / 256;
     const row_bytes = blocks_per_row * 210;
     const expert_stride = M * row_bytes;
@@ -166,7 +173,7 @@ pub fn main() !void {
     defer counts_buf.deinit();
     var ids_buf = try Buffer.initHostVisibleStorage(&instance, n_experts * n_tokens * @sizeOf(u32));
     defer ids_buf.deinit();
-    var active_buf = try Buffer.initHostVisibleStorage(&instance, 2 * @sizeOf(u32));
+    var active_buf = try Buffer.initHostVisibleStorage(&instance, active_block_count * @sizeOf(u32));
     defer active_buf.deinit();
 
     const weight = weight_buf.mapped.?[0..weight_buf.size];
@@ -181,7 +188,7 @@ pub fn main() !void {
         input[0 .. route_slots * K],
         counts[0..n_experts],
         ids[0 .. n_experts * n_tokens],
-        active_blocks[0..2],
+        active_blocks[0..active_block_count],
         M,
         K,
         n_tokens,
@@ -228,8 +235,8 @@ pub fn main() !void {
             instance.push_descriptor_fn,
             infos[0..],
             std.mem.asBytes(&push),
-            @intCast((M + 1) / 2),
-            2,
+            @intCast((M + 3) / 4),
+            active_block_count,
             1,
         );
         try cmd.end();

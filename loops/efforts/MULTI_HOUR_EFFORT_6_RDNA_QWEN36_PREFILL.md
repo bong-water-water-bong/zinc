@@ -55,8 +55,10 @@ prompt reports the expected safe default mask:
 
 Prototype Q6_K route-packed columns support validated as a standalone shader
 with `tools/validate_q6k_moe_cols.zig`: overwrite and accumulate both matched
-the CPU Q6_K dequant reference at `M=2048, K=768`. But enabling it inside the
-Qwen A3B grouped path changed the answer-bearing diagnostic prompt:
+the CPU Q6_K dequant reference at `M=2048, K=768`. The validator now uses a
+19-token route set so each active expert spans multiple eight-route blocks.
+But enabling it inside the Qwen A3B grouped path changed the answer-bearing
+diagnostic prompt:
 
 | Variant | Prefill | Mask | Output |
 |---|---:|---|---|
@@ -69,6 +71,16 @@ the in-model Q6_K columns path opt-in via `ZINC_MOE_Q6K_COLS=1` until a
 layer replay validator compares grouped layer output against token fallback
 inside the full prefill orchestration. Do not claim the Q6_K speedup as a
 valid win.
+
+Historical rejected follow-up: an earlier exact-suffix
+`ZINC_MOE_Q8_1_DOWN_COLS=1` prototype was not safe on the 154-token diagnostic
+prompt (`the capital of France.` changed to `also a a reference...`) and was
+reverted. The later Intel-only exact-grouped implementation fixes the suffix
+scratch sizing and was accepted only after the fixed-token Intel performance
+suite cleared all supported rows (`/tmp/zinc-intel-full-q8suffix-20260705-125016.json`:
+20/20 overall, 20/20 prefill, 20/20 decode vs llama.cpp). Keep the default
+limited to Intel exact-grouped prefill unless a new full-suite run proves a
+broader policy.
 
 Rejected follow-up: forcing `ZINC_QWEN36_Q8_WIDE4_SSM_OUT=1` on RDNA is
 not a default-on keep. It preserved the first output token on the 111p
