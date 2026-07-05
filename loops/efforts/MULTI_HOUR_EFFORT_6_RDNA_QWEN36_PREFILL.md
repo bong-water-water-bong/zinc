@@ -54,6 +54,14 @@ prefill fell 804.6 -> 741.4 tok/s. The current eight-route shader should
 stay branch-unified; if singleton tails are attacked again, split them
 into a separate dispatch rather than branching inside the hot shader.
 
+Rejected follow-up: adding a 30 KB dummy LDS occupancy pad to
+`flash_attn.comp` is not a keep for this scalar attention path. One
+profile sample looked better on 2971p, but no-profile repeats rejected
+it: default averaged 1159.5 tok/s over three long runs while the padded
+shader averaged 1139.0 tok/s, and short runs were flat-to-worse. The
+llama.cpp-style occupancy limiter should not be copied into this shader
+without a separate long-sequence pipeline and no-profile proof.
+
 The original A3b problem is no longer open. The accepted production
 path is now layer-major A3B prefill:
 
