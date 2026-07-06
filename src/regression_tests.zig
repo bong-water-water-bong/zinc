@@ -168,6 +168,30 @@ test "Vulkan Qwen prefill profile keeps MoE route-pack occupancy visible" {
     try expectContains(src, "Prefill route-pack occupancy:");
 }
 
+test "Vulkan Qwen prefill profile splits SSM out projection and residual handoff" {
+    const src = @embedFile("compute/forward.zig");
+
+    try expectContains(src, "ssm_out_proj");
+    try expectContains(src, "ssm_out_resid");
+    try expectContains(src, "if (use_batched_ssm_out) {\n                const ssm_out_proj_phase = self.beginProfilePhase();");
+    try expectContains(src, "self.endProfilePhase(.ssm_out_proj, ssm_out_proj_phase);");
+    try expectContains(src, "const ssm_out_residual_phase = self.beginProfilePhase();");
+    try expectContains(src, "self.endProfilePhase(.ssm_out_residual, ssm_out_residual_phase);");
+    try expectContains(src, "out_proj={d:.1}");
+    try expectContains(src, "out_resid={d:.1}");
+}
+
+test "Vulkan Qwen A3B prefill can try Q8 SSM out DP4a before f32 GEMM fallback" {
+    const src = @embedFile("compute/forward.zig");
+
+    try expectContains(src, "fn dispatchQwenA3bSsmOutQ8Dp4a");
+    try expectContains(src, "ZINC_A3B_SSM_OUT_Q8_DP4A");
+    try expectContains(src, "qwenA3bPrepareProjectionQ8(scratch_swiglu, d_inner, n_tokens)");
+    try expectContains(src, "dispatchQwenA3bQ8ProjectionDp4a(\n            ssm_out_t");
+    try expectContains(src, "const wrote_ssm_out_dp4a = try self.dispatchQwenA3bSsmOutQ8Dp4a(");
+    try expectContainsNear(src, "const wrote_ssm_out_dp4a = try self.dispatchQwenA3bSsmOutQ8Dp4a(", "try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);", 700);
+}
+
 test "Vulkan batched projection kpar is allowed on Intel wave32" {
     const src = @embedFile("compute/forward.zig");
     const marker = "const q4k_batch_kpar_enabled =";

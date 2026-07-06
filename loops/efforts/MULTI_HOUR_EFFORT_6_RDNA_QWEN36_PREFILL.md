@@ -1685,6 +1685,47 @@ Use this guardrail before attempting another A3B SSM-out or layer-major prefill
 change. The previous delta-only validator was not enough to catch hidden-state
 corruption after gated norm and residual accumulation.
 
+## 2026-07-05 A3B Q8 SSM-Out DP4a Probe
+
+Added explicit SSM-out profiling split:
+
+- `ssm_out_proj`: Q8_0 SSM-out projection into `scratch_down`
+- `ssm_out_resid`: residual + FFN-norm handoff
+
+Clean 322-token `context-long` profile before the split showed `ssm_out=50.4 ms`.
+The split identified this as projection-bound, not residual-bound:
+
+| phase | before DP4a | after DP4a |
+|---|---:|---:|
+| SSM total | 142.7 ms | 134.7 ms |
+| SSM out | 50.4 ms | 41.2 ms |
+| SSM out projection | 44.0 ms | 34.7 ms |
+| SSM out residual handoff | 6.2 ms | 6.3 ms |
+
+Implementation: A3B Q8_0 SSM-out now reuses the existing
+`qwenA3bPrepareProjectionQ8` + `dispatchQwenA3bQ8ProjectionDp4a` full-column
+path, with the ragged token tail left on the existing f32 Q8_0 GEMM fallback.
+
+RDNA4 profile samples on `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`,
+322 prompt tokens / 32 decode tokens:
+
+| run | prefill | SSM out projection | decode |
+|---:|---:|---:|---:|
+| profiled | 644.72 tok/s | 34.5 ms | 125.01 tok/s |
+| profiled repeat | 643.85 tok/s | 34.7 ms | 125.95 tok/s |
+
+No-profile repeats after the change: `644.98`, `941.76`, `772.09`,
+`700.58`, `698.73` tok/s. Treat the end-to-end number as noisy, but the
+sub-bucket win is repeatable. The new largest named buckets are MoE down
+(`~51 ms`), MoE gate/up (`~48-49 ms`), SSM qkv/z (`~40-41 ms`), and SSM-out
+projection (`~35 ms`).
+
+Validation caveat: `ZINC_A3B_VALIDATE=1` currently disables the A3B Q8 DP4a
+production paths, so it is not a direct validator for this new SSM-out DP4a
+route. It still allocated/captured successfully, but did not compare this path.
+Do not claim a hard numerical-correctness proof for this change until a
+production-path replay check exists.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:

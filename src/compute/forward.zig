@@ -218,6 +218,8 @@ const ProfilePhase = enum(u8) {
     ssm_delta,
     ssm_gated_norm,
     ssm_out,
+    ssm_out_proj,
+    ssm_out_residual,
     moe_routed,
     moe_router,
     moe_topk,
@@ -288,6 +290,8 @@ const ProfilePhase = enum(u8) {
             .ssm_delta => "ssm_delta",
             .ssm_gated_norm => "ssm_gnorm",
             .ssm_out => "ssm_out",
+            .ssm_out_proj => "ssm_out_proj",
+            .ssm_out_residual => "ssm_out_resid",
             .moe_routed => "moe",
             .moe_router => "moe_router",
             .moe_topk => "moe_topk",
@@ -18090,6 +18094,43 @@ pub const InferenceEngine = struct {
         return true;
     }
 
+    fn dispatchQwenA3bSsmOutQ8Dp4a(
+        self: *InferenceEngine,
+        ssm_out_t: *const LoadedTensor,
+        scratch_swiglu: Buffer,
+        scratch_down: Buffer,
+        hidden_dim: u32,
+        d_inner: u32,
+        n_tokens: u32,
+    ) !bool {
+        if (!self.qwenA3bSsmQ8Dp4aEnabled(n_tokens)) return false;
+        if (std.posix.getenv("ZINC_A3B_SSM_OUT_Q8_DP4A")) |v| {
+            if (std.mem.eql(u8, v, "0")) return false;
+        }
+        if (ssm_out_t.info.type_ != .q8_0) return false;
+        if ((hidden_dim & 31) != 0 or (d_inner & 31) != 0) return false;
+
+        const full_cols = n_tokens & ~@as(u32, 31);
+        if (full_cols == 0) return false;
+        const need_output: vk.c.VkDeviceSize =
+            @as(vk.c.VkDeviceSize, full_cols) *
+            @as(vk.c.VkDeviceSize, hidden_dim) *
+            @sizeOf(f32);
+        if (scratch_down.size < need_output) return false;
+
+        const q8_cols = try self.qwenA3bPrepareProjectionQ8(scratch_swiglu, d_inner, n_tokens);
+        if (q8_cols == 0) return false;
+        return try self.dispatchQwenA3bQ8ProjectionDp4a(
+            ssm_out_t,
+            scratch_swiglu,
+            scratch_down,
+            hidden_dim,
+            d_inner,
+            n_tokens,
+            q8_cols,
+        );
+    }
+
     /// Dense gate+up+SwiGLU prefill projection for Qwen3.6-27B. Uses int8 DP4a
     /// (one-shot Q8_1-style activation quant + hardware dot4 GEMM with Q4_K
     /// bias correction) when enabled and the shape qualifies. The ragged token
@@ -21870,6 +21911,7 @@ pub const InferenceEngine = struct {
                 (hidden_dim & 31) == 0;
             const use_batched_ssm_out = use_batched_q5k_ssm_out or use_batched_q8_ssm_out;
             if (use_batched_ssm_out) {
+                const ssm_out_proj_phase = self.beginProfilePhase();
                 // Effort-15 run-3 cycle 4: route Qwen3.6-27B SSM out (Q5_K,
                 // K=d_inner) through the int8 DP4a tiled GEMM when the shape
                 // and runtime flags allow it; fall through to the f32
@@ -21890,9 +21932,21 @@ pub const InferenceEngine = struct {
                         try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
                     }
                 } else {
-                    try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                    const wrote_ssm_out_dp4a = try self.dispatchQwenA3bSsmOutQ8Dp4a(
+                        ssm_out_t,
+                        scratch_swiglu,
+                        scratch_down,
+                        hidden_dim,
+                        d_inner,
+                        n_tokens,
+                    );
+                    if (!wrote_ssm_out_dp4a) {
+                        try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                    }
                 }
+                self.endProfilePhase(.ssm_out_proj, ssm_out_proj_phase);
                 self.decode_cmd.computeBarrier();
+                const ssm_out_residual_phase = self.beginProfilePhase();
                 // Effort-15 cycle 16: when the downstream layer-major dense
                 // FFN call will run its DP4a gate+up path, emit the packed
                 // Q8_1 activation here in the same dispatch so the dense FFN
@@ -21936,7 +21990,9 @@ pub const InferenceEngine = struct {
                         1.0,
                     );
                 }
+                self.endProfilePhase(.ssm_out_residual, ssm_out_residual_phase);
             } else {
+                const ssm_out_proj_phase = self.beginProfilePhase();
                 tok_idx = 0;
                 while (tok_idx < n_tokens) : (tok_idx += 1) {
                     const x_offset = tok_idx * d_inner * @sizeOf(f32);
@@ -21954,6 +22010,7 @@ pub const InferenceEngine = struct {
                         1,
                     );
                 }
+                self.endProfilePhase(.ssm_out_proj, ssm_out_proj_phase);
             }
             self.endProfilePhase(.ssm_out, ssm_out_phase);
             self.endProfilePhase(.ssm, ssm_phase);
@@ -22190,6 +22247,7 @@ pub const InferenceEngine = struct {
                 (hidden_dim & 31) == 0;
             const use_batched_ssm_out = use_batched_q5k_ssm_out or use_batched_q8_ssm_out;
             if (use_batched_ssm_out) {
+                const ssm_out_proj_phase = self.beginProfilePhase();
                 // Effort-15 run-3 cycle 4: route Qwen3.6-27B SSM out (Q5_K,
                 // K=d_inner) through the int8 DP4a tiled GEMM when the shape
                 // and runtime flags allow it; fall through to the f32
@@ -22210,9 +22268,21 @@ pub const InferenceEngine = struct {
                         try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
                     }
                 } else {
-                    try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                    const wrote_ssm_out_dp4a = try self.dispatchQwenA3bSsmOutQ8Dp4a(
+                        ssm_out_t,
+                        scratch_swiglu,
+                        scratch_down,
+                        hidden_dim,
+                        d_inner,
+                        n_tokens,
+                    );
+                    if (!wrote_ssm_out_dp4a) {
+                        try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                    }
                 }
+                self.endProfilePhase(.ssm_out_proj, ssm_out_proj_phase);
                 self.decode_cmd.computeBarrier();
+                const ssm_out_residual_phase = self.beginProfilePhase();
                 // Effort-15 cycle 16: when the downstream layer-major dense
                 // FFN call will run its DP4a gate+up path, emit the packed
                 // Q8_1 activation here in the same dispatch so the dense FFN
@@ -22256,7 +22326,9 @@ pub const InferenceEngine = struct {
                         1.0,
                     );
                 }
+                self.endProfilePhase(.ssm_out_residual, ssm_out_residual_phase);
             } else {
+                const ssm_out_proj_phase = self.beginProfilePhase();
                 tok_idx = 0;
                 while (tok_idx < n_tokens) : (tok_idx += 1) {
                     const x_offset = tok_idx * d_inner * @sizeOf(f32);
@@ -22274,6 +22346,7 @@ pub const InferenceEngine = struct {
                         1,
                     );
                 }
+                self.endProfilePhase(.ssm_out_proj, ssm_out_proj_phase);
             }
             self.endProfilePhase(.ssm_out, ssm_out_phase);
             self.endProfilePhase(.ssm, ssm_phase);
@@ -22390,6 +22463,7 @@ pub const InferenceEngine = struct {
             (hidden_dim & 31) == 0;
         const use_batched_ssm_out = use_batched_q5k_ssm_out or use_batched_q8_ssm_out;
         if (use_batched_ssm_out) {
+            const ssm_out_proj_phase = self.beginProfilePhase();
             // Effort-15 run-3 cycle 4: route Qwen3.6-27B SSM out (Q5_K,
             // K=d_inner) through the int8 DP4a tiled GEMM when the shape and
             // runtime flags allow it; fall through to the f32 mul_mm_q5k
@@ -22410,9 +22484,21 @@ pub const InferenceEngine = struct {
                     try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
                 }
             } else {
-                try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                const wrote_ssm_out_dp4a = try self.dispatchQwenA3bSsmOutQ8Dp4a(
+                    ssm_out_t,
+                    scratch_swiglu,
+                    scratch_down,
+                    hidden_dim,
+                    d_inner,
+                    n_tokens,
+                );
+                if (!wrote_ssm_out_dp4a) {
+                    try self.dispatchProjectionBatched(ssm_out_t, scratch_swiglu, scratch_down, hidden_dim, d_inner, n_tokens);
+                }
             }
+            self.endProfilePhase(.ssm_out_proj, ssm_out_proj_phase);
             self.decode_cmd.computeBarrier();
+            const ssm_out_residual_phase = self.beginProfilePhase();
             try self.dispatchResidualRmsNorm(
                 scratch_hidden.handle,
                 scratch_hidden.size,
@@ -22427,7 +22513,9 @@ pub const InferenceEngine = struct {
                 self.model.config.rms_norm_eps,
                 1.0,
             );
+            self.endProfilePhase(.ssm_out_residual, ssm_out_residual_phase);
         } else {
+            const ssm_out_proj_phase = self.beginProfilePhase();
             var out_tok: u32 = 0;
             while (out_tok < n_tokens) : (out_tok += 1) {
                 const x_offset = out_tok * d_inner * @sizeOf(f32);
@@ -22445,6 +22533,7 @@ pub const InferenceEngine = struct {
                     1,
                 );
             }
+            self.endProfilePhase(.ssm_out_proj, ssm_out_proj_phase);
         }
         self.endProfilePhase(.ssm_out, ssm_out_phase);
         self.endProfilePhase(.ssm, ssm_phase);
@@ -28546,8 +28635,10 @@ pub fn generate(
             const ssm_delta_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_delta)];
             const ssm_gnorm_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_gated_norm)];
             const ssm_out_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_out)];
+            const ssm_out_proj_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_out_proj)];
+            const ssm_out_residual_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_out_residual)];
             log.info(
-                "Prefill SSM subphases totals: proj={d:.1} norm_ab={d:.1} qkv={d:.1} z={d:.1} alpha={d:.1} beta={d:.1} qkv_z={d:.1} conv={d:.1} delta={d:.1} gnorm={d:.1} out={d:.1} ms",
+                "Prefill SSM subphases totals: proj={d:.1} norm_ab={d:.1} qkv={d:.1} z={d:.1} alpha={d:.1} beta={d:.1} qkv_z={d:.1} conv={d:.1} delta={d:.1} gnorm={d:.1} out={d:.1} out_proj={d:.1} out_resid={d:.1} ms",
                 .{
                     to_ms(ssm_proj_ns),
                     to_ms(ssm_proj_norm_ab_ns),
@@ -28560,6 +28651,8 @@ pub fn generate(
                     to_ms(ssm_delta_ns),
                     to_ms(ssm_gnorm_ns),
                     to_ms(ssm_out_ns),
+                    to_ms(ssm_out_proj_ns),
+                    to_ms(ssm_out_residual_ns),
                 },
             );
             const dense_gateup_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup)];
@@ -28802,7 +28895,7 @@ pub fn generate(
                 engine.avgProfilePhaseMs(.attention_o_proj),
                 engine.avgProfilePhaseMs(.attention_post_norm),
             });
-            log.info("PROFILE: avg SSM subphases proj={d:.2} ms norm_ab={d:.2} ms qkv={d:.2} ms z={d:.2} ms alpha={d:.2} ms beta={d:.2} ms qkv_z={d:.2} ms conv={d:.2} ms delta={d:.2} ms gnorm={d:.2} ms out={d:.2} ms", .{
+            log.info("PROFILE: avg SSM subphases proj={d:.2} ms norm_ab={d:.2} ms qkv={d:.2} ms z={d:.2} ms alpha={d:.2} ms beta={d:.2} ms qkv_z={d:.2} ms conv={d:.2} ms delta={d:.2} ms gnorm={d:.2} ms out={d:.2} ms out_proj={d:.2} ms out_resid={d:.2} ms", .{
                 engine.avgProfilePhaseMs(.ssm_proj),
                 engine.avgProfilePhaseMs(.ssm_proj_norm_ab),
                 engine.avgProfilePhaseMs(.ssm_proj_qkv),
@@ -28814,6 +28907,8 @@ pub fn generate(
                 engine.avgProfilePhaseMs(.ssm_delta),
                 engine.avgProfilePhaseMs(.ssm_gated_norm),
                 engine.avgProfilePhaseMs(.ssm_out),
+                engine.avgProfilePhaseMs(.ssm_out_proj),
+                engine.avgProfilePhaseMs(.ssm_out_residual),
             });
             log.info("PROFILE: avg MoE subphases router={d:.2} ms topk={d:.2} ms gate_up={d:.2} ms swiglu={d:.2} ms down={d:.2} ms acc={d:.2} ms", .{
                 engine.avgProfilePhaseMs(.moe_router),
