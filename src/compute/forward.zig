@@ -1024,6 +1024,15 @@ fn intelBatchedPrefillChunkLimit(vendor: GpuVendor) u32 {
     return std.fmt.parseInt(u32, raw, 10) catch 16;
 }
 
+fn prefillProfileRequested() bool {
+    const raw = std.posix.getenv("ZINC_PREFILL_PROFILE") orelse return false;
+    return raw.len > 0 and
+        !std.mem.eql(u8, raw, "0") and
+        !std.ascii.eqlIgnoreCase(raw, "off") and
+        !std.ascii.eqlIgnoreCase(raw, "false") and
+        !std.ascii.eqlIgnoreCase(raw, "no");
+}
+
 // ---------------------------------------------------------------------------
 // Inference engine
 // ---------------------------------------------------------------------------
@@ -19991,8 +20000,11 @@ pub const InferenceEngine = struct {
                     (shexp_gate == null or @as(vk.c.VkDeviceSize, suffix_tokens) * @sizeOf(f32) <= scratch_router_output.size)));
         if (prefix_tokens == 0 and !can_group_suffix) return inactive;
         const route_profile_counts_bytes = counts_bytes * if (can_group_suffix) @as(vk.c.VkDeviceSize, 2) else @as(vk.c.VkDeviceSize, 1);
+        // `ZINC_PREFILL_PROFILE` only flips `profile_enabled` inside selected
+        // prefill bodies. Keep route occupancy tied to the env gate as well so
+        // MoE lane-utilization diagnostics cannot silently disappear.
         const collect_route_profile =
-            self.profile_enabled and
+            (self.profile_enabled or prefillProfileRequested()) and
             !use_q8_1_down_compare and
             self.logits_staging.mapped != null and
             self.logits_staging.size >= route_profile_counts_bytes;

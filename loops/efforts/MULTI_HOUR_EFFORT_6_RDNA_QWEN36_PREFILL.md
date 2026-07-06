@@ -103,6 +103,23 @@ member of the French Foreign Legion`; route utilization fell to 28.4% while
 only down improved modestly to 24.6 ms. Code was reverted; do not retry simple
 route-width reduction without a layer replay validator and a correctness sweep.
 
+Measurement follow-up: `ZINC_PREFILL_PROFILE=1` now also records route-pack
+occupancy when decode profiling is off. On the RDNA node with the current
+`context-long` 322-token site scenario, Qwen3.6-35B-A3B measured 633.4 tok/s
+prefill with path coverage `moe_grouped_layers=36`, `top1_prefix_tokens=11016`,
+and `exact_suffix_tokens=576`. Route packing was very sparse:
+
+- `layers=72`, `slots=12744`, `active_blocks=3746`, `actual/upper=33.6%`
+- occupancy `util=42.5%`, `tail_blocks=79.5%`
+- singleton tails `1477`, tail sizes r2/r3/r4/r5/r6/r7 = `601/320/222/159/114/86`
+
+This proves the MoE column shaders are lane-underfilled on the published
+context-long shape, but the simple levers are already measured rejects:
+8->4 route width changed answers, and branching singleton tails inside the
+hot gate/up shader regressed. If attacking this again, use either a separate
+tail dispatch with a layer replay validator or skip directly to grouped-MoE
+GEMM / `mul_mat_id` style work. Do not re-submit another route-width flip.
+
 Kept follow-up: full-attention layer-major prefill now keeps the fused
 RMS+Q8_1 handoff opt-in via `ZINC_QWEN36_27B_FULL_ATTN_FUSE_RMS_QUANT=1`.
 The root cause was narrower than the whole batched full-attention segment:
@@ -136,6 +153,16 @@ from 229.0 ms to 276.0 ms and total prefill fell from 807.2 to
 764.4 tok/s; no-profile long runs were effectively flat around
 1.14k tok/s. Leave this path Intel/default-off unless a new per-shape
 policy is proven with no-profile wins.
+
+Rejected follow-up: changing `mul_mm_q8_0.comp` to store the dequantized
+Q8_0 A tile in f16 LDS is not a keep for A3B SSM-out. The A3B all-layer
+validator passed (`ALL-LAYER output replay PASS@1e-3`, max SSM-out/post-hidden
+diff `2.98e-8`), but the 322-token context-long profile regressed from the
+current default 633.4 tok/s to 578.2 tok/s and SSM-out moved 49.9 -> 51.2 ms.
+No-profile repeats were noisy (`694.9 / 921.7 / 772.4 tok/s`), but the targeted
+bucket did not improve, so the shader was reverted. Do not retry f16 A-tile
+storage in `mul_mm_q8_0.comp` without shaderstats showing LDS occupancy is the
+limiter and a profile where SSM-out itself drops.
 
 Rejected follow-up: reducing the Qwen A3B prefill MoE exact-tail guard
 below 16 is still correctness-sensitive. Guard 12 and 8 preserved the

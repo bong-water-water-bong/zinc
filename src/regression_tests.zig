@@ -160,6 +160,14 @@ test "Vulkan Qwen full-attn prefill keeps fused prequant handoff opt-in" {
     try expectContainsNear(src, "const segment_pre_quantized = if (segment_is_full_attn)", "self.qwenDenseFullAttnFuseRmsQuantEnabled(n_tokens)", 350);
 }
 
+test "Vulkan Qwen prefill profile keeps MoE route-pack occupancy visible" {
+    const src = @embedFile("compute/forward.zig");
+
+    try expectContainsNear(src, "fn prefillProfileRequested", "ZINC_PREFILL_PROFILE", 500);
+    try expectContainsNear(src, "const collect_route_profile =", "self.profile_enabled or prefillProfileRequested()", 300);
+    try expectContains(src, "Prefill route-pack occupancy:");
+}
+
 test "Vulkan batched projection kpar is allowed on Intel wave32" {
     const src = @embedFile("compute/forward.zig");
     const marker = "const q4k_batch_kpar_enabled =";
