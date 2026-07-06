@@ -1743,6 +1743,41 @@ depth (`max_abs` reached `4.91e-3` by layer 37) and the MoE-down bucket regresse
 to `54.2 ms` versus the normal `~51 ms`. Keep Q8_1 routed-down off for this
 model; it is neither faster nor numerically tight enough on the current path.
 
+Rejected suffix down+acc fusion probe (2026-07-06): tried a flag-gated
+token-batched Q5_K exact-suffix shader that read token-major routing ids/weights
+and accumulated route-major SwiGLU slabs directly into `scratch_hidden`, bypassing
+the suffix `scratch_down` write plus weighted-acc read. Linux shader build passed,
+but the RDNA4 profile on the same 322-token `context-long` prompt did not improve:
+
+| mode | prefill samples | median | MoE down | MoE weighted_acc |
+|---|---:|---:|---:|---:|
+| normal | `641.22`, `862.22`, `712.16` tok/s | `712.16` tok/s | `41.9-51.2 ms` | `3.6-4.6 ms` |
+| suffix fused | `639.78`, `842.66`, `708.71` tok/s | `708.71` tok/s | `44.2-52.5 ms` | `3.5-3.9 ms` |
+
+Reason: the removed weighted-acc work is too small, and the direct-token form
+loses enough routed-down locality that down grows by roughly the same amount.
+The run also changed generation length/output (`28` tokens and `###` preview
+versus normal `32` tokens), so do not keep this path without a stronger
+correctness replay and a genuinely different data layout.
+
+Rejected Q8_0 DP4a K-specialization probe (2026-07-06): `mul_mm_q8_0_full_dp4a`
+already exposes `SPEC_K`, so the probe loaded K=2048 and K=512 specialized
+pipelines and routed A3B SSM qkv/z and SSM-out through them automatically. The
+pipelines built and loaded on RDNA4, but the target SSM buckets did not move
+materially:
+
+| run set | prefill samples | SSM qkv/z | SSM out_proj |
+|---|---:|---:|---:|
+| pre-probe normal | `641.22`, `862.22`, `712.16` tok/s | `38.3-40.9 ms` on warm runs | `23.8-35.0 ms` |
+| K-specialized | `599.10`, `863.95`, `720.08`, `505.25`, `721.41`, `570.56`, `507.45`, `505.54` tok/s | `38.4-41.4 ms` | `23.9-41.1 ms` |
+
+Reason: specializing out the runtime K/stride selects was too small compared
+with the tiled DP4a body and node power-state noise. The first three-sample
+median looked like a possible +1% (`720.08` vs `712.16` tok/s), but the named
+SSM sub-buckets were flat and later samples fell with all phases slowing
+together. Do not keep extra Q8_0 DP4a pipeline variants without a shader-shape
+change (e.g. larger BM/BN or different BK), not just `SPEC_K`.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:
