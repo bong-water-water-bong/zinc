@@ -935,7 +935,15 @@ pub const ForwardGemma = struct {
         // the cycle-8 launch batching). Byte-identical output (same per-block math; each
         // output computed once). Off → the proven cycle-8 _batched matvecs.
         self.use_grouped = std.posix.getenv("ZINC_BATCHED_EXPERTS_GROUPED") != null;
-        self.use_attn_v2 = std.posix.getenv("ZINC_ATTN_V2") != null;
+        // DEFAULT-ON (opt out ZINC_ATTN_V2=0/off/false/no): coalesced warp-per-key
+        // prefill attention — validated token-identical to the naive kernel + ~+8%
+        // gemma-26b prefill on the 5090 (softmax was 271ms/28% of prefill).
+        self.use_attn_v2 = blk: {
+            if (std.posix.getenv("ZINC_ATTN_V2")) |e| break :blk !(std.mem.eql(u8, e, "0") or
+                std.ascii.eqlIgnoreCase(e, "off") or std.ascii.eqlIgnoreCase(e, "false") or
+                std.ascii.eqlIgnoreCase(e, "no"));
+            break :blk true;
+        };
         self.use_tc_experts = moeTcDefaultOn();
         self.tc_experts_forced = moeTcForced();
         // Cycle 19: ZINC_BATCHED_TC_SHAREA shares one f32→f16 activation recast across
