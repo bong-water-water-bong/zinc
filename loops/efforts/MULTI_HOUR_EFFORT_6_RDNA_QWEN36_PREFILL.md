@@ -93,6 +93,16 @@ correct Paris answer. SSM-out itself moved 18.4 -> 35.0 ms. Code was reverted;
 do not retry activation-Q8_0 DP4a for SSM-out without an in-layer numeric replay
 validator and cross-prompt correctness sweep.
 
+Rejected follow-up: reducing route-packed MoE columns from 8 routes to 4 routes
+is not a safe default-on win. The prototype specialized the route-pack and
+grouped gate/up/down column shaders behind `ZINC_MOE_ROUTE_COLS4=1`. On the
+154-token diagnostic, the warmed default profile was correct at 538.7 tok/s
+with route-pack utilization 34.3% and MoE gate_up/down at 25.6/26.5 ms. The
+4-route variant was slower at 532.5 tok/s and changed the answer to `is a
+member of the French Foreign Legion`; route utilization fell to 28.4% while
+only down improved modestly to 24.6 ms. Code was reverted; do not retry simple
+route-width reduction without a layer replay validator and a correctness sweep.
+
 Kept follow-up: A3B production now routes `pipeline_tail` only through
 `qwen36DensePrefillTailPipelineEnabled` and that helper keeps A3B tail
 pipelining opt-in via `ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE=1`. On the clean
