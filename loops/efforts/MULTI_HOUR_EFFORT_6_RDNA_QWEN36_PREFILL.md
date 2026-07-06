@@ -93,6 +93,15 @@ correct Paris answer. SSM-out itself moved 18.4 -> 35.0 ms. Code was reverted;
 do not retry activation-Q8_0 DP4a for SSM-out without an in-layer numeric replay
 validator and cross-prompt correctness sweep.
 
+Kept follow-up: A3B production now routes `pipeline_tail` only through
+`qwen36DensePrefillTailPipelineEnabled` and that helper keeps A3B tail
+pipelining opt-in via `ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE=1`. On the clean
+154-token no-profile diagnostic after the SSM-out DP4a revert, default-off was
+correct across 3/3 runs at 476.9 / 768.1 / 774.2 tok/s (median 768.1). Forced
+tail pipelining was also correct but slower/noisier at 557.3 / 550.1 /
+729.0 tok/s (median 557.3). Keep default-off for A3B until a layer-boundary
+validator plus no-profile sweep proves a stable win.
+
 Rejected follow-up: forcing `ZINC_QWEN36_Q8_WIDE4_SSM_OUT=1` on RDNA is
 not a default-on keep. It preserved the first output token on the 111p
 and 2971p probes, but the no-profile 111p repeats were noisy and did not

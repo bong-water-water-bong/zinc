@@ -508,6 +508,17 @@ test "Vulkan Qwen A3B SSM Q8 DP4a keeps RDNA crossover and no-padding policy" {
     try expectNotContains(prep_src, "qwenA3bPrefillPaddedTokenCount");
 }
 
+test "Vulkan Qwen A3B production tail pipeline remains opt-in" {
+    const src = @embedFile("compute/forward.zig");
+    try expectContainsNear(src, "fn qwen36DensePrefillTailPipelineEnabled", "if (self.isQwen36A3bMoePrefillModel()) return false;", 1000);
+    try expectContainsNear(src, "fn prefillA3bProduction", "const pipeline_tail = self.qwen36DensePrefillTailPipelineEnabled(n_tokens);", 9000);
+
+    const start = std.mem.indexOf(u8, src, "fn prefillA3bProduction") orelse return error.TestExpectedEqual;
+    const end = std.mem.indexOf(u8, src[start..], "var layer: u32 = 0;") orelse return error.TestExpectedEqual;
+    const setup_src = src[start .. start + end];
+    try expectNotContains(setup_src, "or\n            (n_tokens >= 16");
+}
+
 test "Vulkan Gemma dense-down DP4a keeps K21504 short-prompt specializations" {
     const dmmv = @embedFile("compute/dmmv.zig");
     try expectContains(dmmv, "pipeline_mul_mm_q6k_full_dp4a_k21504_n64_bm64");

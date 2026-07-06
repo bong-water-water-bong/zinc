@@ -19347,6 +19347,10 @@ pub const InferenceEngine = struct {
         }
         if (!self.isQwenDenseHybridLayerMajorPrefillModel()) return false;
         if (!self.isQwenDensePrefillAccelGpu()) return false;
+        // A3B tail pipelining is not a stable win on the diagnostic prefill
+        // harness; keep it opt-in until its boundary dependency and perf are
+        // validated together.
+        if (self.isQwen36A3bMoePrefillModel()) return false;
         return n_tokens >= 16;
     }
 
@@ -23676,12 +23680,7 @@ pub const InferenceEngine = struct {
         }
 
         const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
-        const pipeline_tail = self.qwen36DensePrefillTailPipelineEnabled(n_tokens) or
-            (n_tokens >= 16 and
-                !self.validation_diagnostics_enabled and
-                !self.profile_enabled and
-                self.instance.push_descriptor_fn != null and
-                (self.isAmdRdna() or self.intelA3bProductionEnabled()));
+        const pipeline_tail = self.qwen36DensePrefillTailPipelineEnabled(n_tokens);
         var layer: u32 = 0;
         while (layer < cfg.n_layers) : (layer += 1) {
             const is_final_layer = layer + 1 == cfg.n_layers;
