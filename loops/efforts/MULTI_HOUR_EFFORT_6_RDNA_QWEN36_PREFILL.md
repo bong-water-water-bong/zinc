@@ -120,6 +120,25 @@ hot gate/up shader regressed. If attacking this again, use either a separate
 tail dispatch with a layer replay validator or skip directly to grouped-MoE
 GEMM / `mul_mat_id` style work. Do not re-submit another route-width flip.
 
+Rejected follow-up: the separate singleton-tail dispatch variant is also not a
+keep. The probe added specialized route-tail modes to
+`dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1.comp` and
+`dmmv_q5k_moe_cols.comp`, then recorded non-singleton and singleton-only
+dispatches back-to-back behind `ZINC_MOE_SINGLETON_TAIL_SPLIT=1`. It built on
+RDNA and preserved output tokens on the no-profile A/B, but it failed the
+primary 154-token benchmark:
+
+| Mode | Samples | Median |
+|---|---|---:|
+| default | 498.20, 687.59, 506.26, 694.90, 597.58, 472.02 tok/s | 551.92 tok/s |
+| singleton-tail split | 668.37, 559.82, 473.05, 477.99, 708.08, 497.51 tok/s | 528.67 tok/s |
+
+The profiled off/on/off/on run was similarly too noisy to keep: one flag-on
+sample cut MoE down from 27.7 ms to 21.6 ms, but the aggregate no-profile
+median regressed. Code was reverted. Do not retry singleton-tail splitting
+without first adding a layer replay validator and a lower-overhead route-pack
+tail schedule; the extra dispatches are not free enough on this harness.
+
 Rejected follow-up: batching the Qwen A3B exact-suffix shared-expert Q8_0
 projections with explicit source/destination token offsets is not a keep. The
 prototype replaced the per-token shared gate/up/down DMMVs for suffix tokens
