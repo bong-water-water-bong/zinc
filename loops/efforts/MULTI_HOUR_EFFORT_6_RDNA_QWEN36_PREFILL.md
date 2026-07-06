@@ -1602,6 +1602,36 @@ Do not force `ZINC_MOE_Q8_1_GATE_UP_COLS=1` for the long top-1 prefix path.
 It is noise-level on throughput and changes the first output token. The existing
 default, which limits that path to exact grouped suffix-only runs, should stay.
 
+## 2026-07-05 A3B SSM Output Validator Guardrail
+
+Added A3B validation coverage for the part that broke during the failed
+post-loop SSM-out optimization attempt. `ZINC_A3B_VALIDATE=1` now captures
+per-(layer, token) gated-norm output, pre-SSM hidden, and post-SSM hidden, then
+replays batched `ssm_gated_norm` + `ssm_out` from the captured batched
+`ssm_delta_net` result and compares sampled output against the per-token path.
+
+RDNA4 smoke on `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`, 14 prompt tokens:
+
+| check | result |
+|---|---:|
+| delta replay | `PASS@1e-3`, 30/30 SSM layers |
+| output replay | `PASS@1e-3`, 30/30 SSM layers |
+| max gated-norm sample diff | `0.0` |
+| max SSM-out/post-hidden sample diff | `2.98e-8` |
+
+Default-path smoke after the validator patch, same binary with validation off,
+154-token prompt:
+
+| run | prefill | output |
+|---:|---:|---|
+| 1 | 543.77 tok/s | `the capital of France.` |
+| 2 | 809.90 tok/s | `the capital of France.` |
+| 3 | 804.59 tok/s | `the capital of France.` |
+
+Use this guardrail before attempting another A3B SSM-out or layer-major prefill
+change. The previous delta-only validator was not enough to catch hidden-state
+corruption after gated norm and residual accumulation.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:

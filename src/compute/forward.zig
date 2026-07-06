@@ -1526,6 +1526,12 @@ pub const InferenceEngine = struct {
     // the input set so Pass 2's gnorm has both delta_net output (batched)
     // and z gate (captured) per token. Default-OFF behind ZINC_A3B_VALIDATE=1.
     a3b_gate_capture: ?Buffer = null,
+    // A3B validator output guardrails. These mirror the dense SSM validator
+    // but use the all-layer A3B capture layout, so future SSM-out changes can
+    // prove both the intermediate gated norm and the final hidden update.
+    a3b_gnorm_capture: ?Buffer = null,
+    a3b_pre_hidden_capture: ?Buffer = null,
+    a3b_post_hidden_capture: ?Buffer = null,
     a3b_capture_max_tokens: u32 = 0,
 
     // Default-off Qwen3.6 27B dense-FFN prefill validator. During the
@@ -3325,6 +3331,9 @@ pub const InferenceEngine = struct {
         var a3b_delta_out: ?Buffer = null;
         var a3b_per_token_delta_out: ?Buffer = null;
         var a3b_gate_capture: ?Buffer = null;
+        var a3b_gnorm_capture: ?Buffer = null;
+        var a3b_pre_hidden_capture: ?Buffer = null;
+        var a3b_post_hidden_capture: ?Buffer = null;
         var a3b_capture_max_tokens: u32 = 0;
         if (a3b_buffers_needed) {
             // Cycle 123: extend the layer-0-only validation to ALL SSM layers.
@@ -3363,6 +3372,11 @@ pub const InferenceEngine = struct {
                 @as(vk.c.VkDeviceSize, A3B_MAX_TOKENS) *
                 @as(vk.c.VkDeviceSize, d_inner_a3b) *
                 @sizeOf(f32);
+            const hidden_bytes_a3b: vk.c.VkDeviceSize =
+                @as(vk.c.VkDeviceSize, n_layers_a3b) *
+                @as(vk.c.VkDeviceSize, A3B_MAX_TOKENS) *
+                @as(vk.c.VkDeviceSize, config.hidden_dim) *
+                @sizeOf(f32);
             const usage_dst = vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             const usage_src_dst = vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT | vk.c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
             a3b_alpha_capture = try Buffer.initDeviceLocal(instance, ab_bytes_a3b, usage_dst);
@@ -3379,8 +3393,14 @@ pub const InferenceEngine = struct {
             errdefer if (a3b_per_token_delta_out) |*b| b.deinit();
             a3b_gate_capture = try Buffer.initDeviceLocal(instance, out_bytes_a3b, usage_src_dst);
             errdefer if (a3b_gate_capture) |*b| b.deinit();
+            a3b_gnorm_capture = try Buffer.initDeviceLocal(instance, out_bytes_a3b, usage_src_dst);
+            errdefer if (a3b_gnorm_capture) |*b| b.deinit();
+            a3b_pre_hidden_capture = try Buffer.initDeviceLocal(instance, hidden_bytes_a3b, usage_src_dst);
+            errdefer if (a3b_pre_hidden_capture) |*b| b.deinit();
+            a3b_post_hidden_capture = try Buffer.initDeviceLocal(instance, hidden_bytes_a3b, usage_src_dst);
+            errdefer if (a3b_post_hidden_capture) |*b| b.deinit();
             a3b_capture_max_tokens = A3B_MAX_TOKENS;
-            const total_mb_a3b: u64 = @intCast((ab_bytes_a3b * 2 + conv_bytes_a3b + state_bytes_a3b + out_bytes_a3b * 3) / (1024 * 1024));
+            const total_mb_a3b: u64 = @intCast((ab_bytes_a3b * 2 + conv_bytes_a3b + state_bytes_a3b + out_bytes_a3b * 4 + hidden_bytes_a3b * 2) / (1024 * 1024));
             // Cycle 127: production-only no longer allocates these buffers
             // (cycle 125's broken post-loop dispatch was removed). Mode
             // string reflects only validate now; production flag without
@@ -3699,6 +3719,9 @@ pub const InferenceEngine = struct {
             .a3b_delta_out = a3b_delta_out,
             .a3b_per_token_delta_out = a3b_per_token_delta_out,
             .a3b_gate_capture = a3b_gate_capture,
+            .a3b_gnorm_capture = a3b_gnorm_capture,
+            .a3b_pre_hidden_capture = a3b_pre_hidden_capture,
+            .a3b_post_hidden_capture = a3b_post_hidden_capture,
             .a3b_capture_max_tokens = a3b_capture_max_tokens,
             .use_qwen36_dense_prefill_validate = dense_prefill_validate_enabled,
             .dense_prefill_validate_layer = dense_prefill_validate_layer,
@@ -17297,6 +17320,10 @@ pub const InferenceEngine = struct {
             self.prefill_active and
             self.a3b_per_token_delta_out != null and
             self.prefill_current_token_idx < self.a3b_capture_max_tokens;
+        const a3b_output_capture = a3b_capture_output and
+            self.a3b_gnorm_capture != null and
+            self.a3b_pre_hidden_capture != null and
+            self.a3b_post_hidden_capture != null;
         if (!is_dead_tail) {
             if (a3b_capture_output or ssm_prefill_validate_delta_capture) {
                 self.decode_cmd.computeAndTransferBarrier();
@@ -17390,7 +17417,7 @@ pub const InferenceEngine = struct {
                 try self.elementwise.recordSsmGatedNorm(&self.decode_cmd, ds, push);
             }
         }
-        if (ssm_prefill_validate_output_capture or (stop_after_ssm_gnorm and !direct_ssm_gnorm_store)) {
+        if (ssm_prefill_validate_output_capture or a3b_output_capture or (stop_after_ssm_gnorm and !direct_ssm_gnorm_store)) {
             const tok_idx = self.prefill_current_token_idx;
             const z_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * z_bytes;
             const hidden_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
@@ -17400,6 +17427,19 @@ pub const InferenceEngine = struct {
                 vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.ssm_prefill_validate_gnorm_ref.?.handle, 1, &r_gnorm);
                 const r_pre_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = hidden_dst_off, .size = hidden_size };
                 vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.ssm_prefill_validate_pre_hidden_ref.?.handle, 1, &r_pre_hidden);
+            }
+            if (a3b_output_capture) {
+                const max_tokens = self.a3b_capture_max_tokens;
+                const layer_stride_z: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, max_tokens) * z_bytes;
+                const layer_stride_hidden: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, max_tokens) * hidden_size;
+                const layer_z_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, layer) * layer_stride_z;
+                const layer_hidden_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, layer) * layer_stride_hidden;
+                const a3b_z_dst_off = layer_z_off + z_dst_off;
+                const a3b_hidden_dst_off = layer_hidden_off + hidden_dst_off;
+                const r_gnorm = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = a3b_z_dst_off, .size = z_bytes };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.swiglu_buf.handle, self.a3b_gnorm_capture.?.handle, 1, &r_gnorm);
+                const r_pre_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = a3b_hidden_dst_off, .size = hidden_size };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.a3b_pre_hidden_capture.?.handle, 1, &r_pre_hidden);
             }
             if (stop_after_ssm_gnorm) {
                 const gnorm_copy = vk.c.VkBufferCopy{
@@ -17419,12 +17459,21 @@ pub const InferenceEngine = struct {
         const ssm_out_tensor = lt.ssm_out orelse return;
         const ssm_out_phase = self.beginProfilePhase();
         try self.dispatchDmmvAcc(ssm_out_tensor, self.swiglu_buf, z_bytes, self.hidden_buf, hidden_dim, @intCast(d_inner));
-        if (ssm_prefill_validate_output_capture) {
+        if (ssm_prefill_validate_output_capture or a3b_output_capture) {
             const tok_idx = self.prefill_current_token_idx;
             const hidden_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_idx) * hidden_size;
             self.decode_cmd.computeAndTransferBarrier();
-            const r_post_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = hidden_dst_off, .size = hidden_size };
-            vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.ssm_prefill_validate_post_hidden_ref.?.handle, 1, &r_post_hidden);
+            if (ssm_prefill_validate_output_capture) {
+                const r_post_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = hidden_dst_off, .size = hidden_size };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.ssm_prefill_validate_post_hidden_ref.?.handle, 1, &r_post_hidden);
+            }
+            if (a3b_output_capture) {
+                const max_tokens = self.a3b_capture_max_tokens;
+                const layer_stride_hidden: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, max_tokens) * hidden_size;
+                const post_dst_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, layer) * layer_stride_hidden + hidden_dst_off;
+                const r_post_hidden = vk.c.VkBufferCopy{ .srcOffset = 0, .dstOffset = post_dst_off, .size = hidden_size };
+                vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.hidden_buf.handle, self.a3b_post_hidden_capture.?.handle, 1, &r_post_hidden);
+            }
         } else {
             self.decode_cmd.computeBufferBarrier(self.hidden_buf.handle, hidden_size);
         }
@@ -27071,6 +27120,7 @@ pub const InferenceEngine = struct {
                 const ab_layer_stride: vk.c.VkDeviceSize = max_tokens_a3b * @as(vk.c.VkDeviceSize, dt_rank_a3b) * @sizeOf(f32);
                 const conv_layer_stride: vk.c.VkDeviceSize = max_tokens_a3b * @as(vk.c.VkDeviceSize, conv_ch_a3b) * @sizeOf(f32);
                 const out_layer_stride: vk.c.VkDeviceSize = max_tokens_a3b * @as(vk.c.VkDeviceSize, d_inner_a3b) * @sizeOf(f32);
+                const z_bytes_a3b: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, d_inner_a3b) * @sizeOf(f32);
                 const conv_total_layer: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tok_a3b) * @as(vk.c.VkDeviceSize, conv_ch_a3b) * @sizeOf(f32);
                 const ab_total_layer: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tok_a3b) * @as(vk.c.VkDeviceSize, dt_rank_a3b) * @sizeOf(f32);
                 const out_total_layer: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tok_a3b) * @as(vk.c.VkDeviceSize, d_inner_a3b) * @sizeOf(f32);
@@ -27267,6 +27317,182 @@ pub const InferenceEngine = struct {
                     } else {
                         log.info("ZINC_A3B_VALIDATE: ALL-LAYER batched ssm_delta_net dispatched (n_tok={d}, ssm_layers={d}; sample skipped — no per-token capture or staging too small {d} < {d})", .{
                             n_tok_a3b, ssm_count, self.logits_staging.size, sample_total_bytes,
+                        });
+                    }
+
+                    const hidden_size_a3b: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, cfg_a3b.hidden_dim) * @sizeOf(f32);
+                    const hidden_layer_stride: vk.c.VkDeviceSize = max_tokens_a3b * hidden_size_a3b;
+                    const hidden_total_layer: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_tok_a3b) * hidden_size_a3b;
+                    const output_samples_per_layer_bytes: vk.c.VkDeviceSize = sample_bytes * 15;
+                    const output_sample_total_bytes: vk.c.VkDeviceSize = output_samples_per_layer_bytes * @as(vk.c.VkDeviceSize, ssm_count);
+                    const can_sample_output = can_sample and
+                        self.a3b_gate_capture != null and
+                        self.a3b_gnorm_capture != null and
+                        self.a3b_pre_hidden_capture != null and
+                        self.a3b_post_hidden_capture != null and
+                        self.elementwise.pipeline_ssm_gated_norm != null and
+                        self.elementwise.pipeline_ssm_gated_norm.?.uses_push_descriptors and
+                        self.logits_staging.size >= output_sample_total_bytes and
+                        @as(vk.c.VkDeviceSize, cfg_a3b.hidden_dim) >= @as(vk.c.VkDeviceSize, sample_floats);
+                    if (can_sample_output) {
+                        try self.ensureBatchedScratchCapacity(n_tok_a3b);
+                        const scratch_gnorm = self.batched_scratch_swiglu orelse return error.BufferTooSmall;
+                        const scratch_ssm_out = self.batched_scratch_down orelse return error.BufferTooSmall;
+                        if (out_total_layer <= scratch_gnorm.size and hidden_total_layer <= scratch_ssm_out.size) {
+                            try self.decode_cmd.reset();
+                            try self.decode_cmd.begin();
+                            self.decode_cmd.transferToComputeBarrier();
+                            const gnorm_pip = &(self.elementwise.pipeline_ssm_gated_norm.?);
+                            const output_tokens = [_]u32{ tok_first, tok_mid, tok_last };
+                            var staging_off: vk.c.VkDeviceSize = 0;
+                            for (ssm_layers, 0..) |L, ssm_idx| {
+                                const lt_a3b = self.layer_tensors[L];
+                                const ssm_out_tensor = lt_a3b.ssm_out orelse return error.TensorNotFound;
+                                const norm_tensor = lt_a3b.ssm_norm;
+                                const norm_elems: u32 = if (norm_tensor) |t| @intCast(t.info.numElements()) else 0;
+                                const norm_per_head = norm_elems >= d_inner_a3b;
+                                const norm_buf_handle = if (norm_tensor) |t| t.gpu_buffer.handle else self.down_buf.handle;
+                                const norm_buf_size = if (norm_tensor) |t| t.gpu_buffer.size else ab_total_layer;
+                                const gnorm_push = SsmGatedNormPush{
+                                    .d_inner = d_inner_a3b,
+                                    .dt_rank = dt_rank_a3b,
+                                    .head_v_dim = head_v_dim_a3b,
+                                    .d_state = cfg_a3b.ssm_d_state,
+                                    .norm_per_head = if (norm_per_head) 1 else 0,
+                                };
+                                const layer_out_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, L) * out_layer_stride;
+                                const layer_hidden_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, L) * hidden_layer_stride;
+
+                                var tok_replay: u32 = 0;
+                                while (tok_replay < n_tok_a3b) : (tok_replay += 1) {
+                                    const z_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_replay) * z_bytes_a3b;
+                                    const infos = [4]vk.c.VkDescriptorBufferInfo{
+                                        .{ .buffer = self.a3b_delta_out.?.handle, .offset = layer_out_off + z_off, .range = z_bytes_a3b },
+                                        .{ .buffer = self.a3b_gate_capture.?.handle, .offset = layer_out_off + z_off, .range = z_bytes_a3b },
+                                        .{ .buffer = norm_buf_handle, .offset = 0, .range = norm_buf_size },
+                                        .{ .buffer = scratch_gnorm.handle, .offset = z_off, .range = z_bytes_a3b },
+                                    };
+                                    self.decode_cmd.pushDescAndDispatch(
+                                        gnorm_pip,
+                                        self.instance.push_descriptor_fn,
+                                        infos[0..],
+                                        std.mem.asBytes(&gnorm_push),
+                                        dt_rank_a3b,
+                                        1,
+                                        1,
+                                    );
+                                }
+                                self.decode_cmd.computeBufferBarrier(scratch_gnorm.handle, out_total_layer);
+                                tok_replay = 0;
+                                while (tok_replay < n_tok_a3b) : (tok_replay += 1) {
+                                    const x_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_replay) * z_bytes_a3b;
+                                    const y_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok_replay) * hidden_size_a3b;
+                                    try self.dispatchDmmvInner(
+                                        ssm_out_tensor,
+                                        scratch_gnorm,
+                                        scratch_gnorm.size,
+                                        scratch_ssm_out,
+                                        cfg_a3b.hidden_dim,
+                                        @intCast(d_inner_a3b),
+                                        0,
+                                        @intCast(x_off),
+                                        @intCast(y_off),
+                                        0,
+                                    );
+                                }
+
+                                self.decode_cmd.computeToTransferBarrier();
+                                for (output_tokens) |tok| {
+                                    const z_sample_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok) * z_bytes_a3b;
+                                    const hidden_sample_off: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, tok) * hidden_size_a3b;
+                                    const r_gnorm_ref = vk.c.VkBufferCopy{ .srcOffset = layer_out_off + z_sample_off, .dstOffset = staging_off, .size = sample_bytes };
+                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.a3b_gnorm_capture.?.handle, self.logits_staging.handle, 1, &r_gnorm_ref);
+                                    staging_off += sample_bytes;
+                                    const r_gnorm_replay = vk.c.VkBufferCopy{ .srcOffset = z_sample_off, .dstOffset = staging_off, .size = sample_bytes };
+                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_gnorm.handle, self.logits_staging.handle, 1, &r_gnorm_replay);
+                                    staging_off += sample_bytes;
+                                    const r_pre_hidden = vk.c.VkBufferCopy{ .srcOffset = layer_hidden_off + hidden_sample_off, .dstOffset = staging_off, .size = sample_bytes };
+                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.a3b_pre_hidden_capture.?.handle, self.logits_staging.handle, 1, &r_pre_hidden);
+                                    staging_off += sample_bytes;
+                                    const r_post_hidden = vk.c.VkBufferCopy{ .srcOffset = layer_hidden_off + hidden_sample_off, .dstOffset = staging_off, .size = sample_bytes };
+                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, self.a3b_post_hidden_capture.?.handle, self.logits_staging.handle, 1, &r_post_hidden);
+                                    staging_off += sample_bytes;
+                                    const r_ssm_out = vk.c.VkBufferCopy{ .srcOffset = hidden_sample_off, .dstOffset = staging_off, .size = sample_bytes };
+                                    vk.c.vkCmdCopyBuffer(self.decode_cmd.handle, scratch_ssm_out.handle, self.logits_staging.handle, 1, &r_ssm_out);
+                                    staging_off += sample_bytes;
+                                }
+                                if (ssm_idx + 1 < ssm_layers.len) {
+                                    self.decode_cmd.transferToComputeBarrier();
+                                }
+                            }
+                            try self.decode_cmd.end();
+                            try self.decode_cmd.submitAndWait(self.instance.compute_queue);
+
+                            const output_base: [*]const f32 = @ptrCast(@alignCast(self.logits_staging.mapped.?));
+                            var gnorm_max_overall: f64 = 0.0;
+                            var ssm_out_max_overall: f64 = 0.0;
+                            var post_max_overall: f64 = 0.0;
+                            var output_pass_layers: u32 = 0;
+                            var output_pass_e2_layers: u32 = 0;
+                            var output_fail_layers: u32 = 0;
+                            for (ssm_layers, 0..) |L, ssm_idx| {
+                                const layer_base: usize = ssm_idx * 15 * sample_floats;
+                                var gnorm_max_layer: f64 = 0.0;
+                                var ssm_out_max_layer: f64 = 0.0;
+                                var post_max_layer: f64 = 0.0;
+                                for (0..3) |slot| {
+                                    const off_gnorm_ref = layer_base + slot * 5 * sample_floats;
+                                    const off_gnorm_replay = off_gnorm_ref + sample_floats;
+                                    const off_pre_hidden = off_gnorm_replay + sample_floats;
+                                    const off_post_hidden = off_pre_hidden + sample_floats;
+                                    const off_ssm_out = off_post_hidden + sample_floats;
+                                    for (0..sample_floats) |k| {
+                                        const g_ref: f64 = output_base[off_gnorm_ref + k];
+                                        const g_replay: f64 = output_base[off_gnorm_replay + k];
+                                        const g_diff_raw = g_ref - g_replay;
+                                        const g_diff = if (g_diff_raw < 0) -g_diff_raw else g_diff_raw;
+                                        if (g_diff > gnorm_max_layer) gnorm_max_layer = g_diff;
+
+                                        const pre_h: f64 = output_base[off_pre_hidden + k];
+                                        const post_h: f64 = output_base[off_post_hidden + k];
+                                        const replay_out: f64 = output_base[off_ssm_out + k];
+                                        const ref_out = post_h - pre_h;
+                                        const out_diff_raw = ref_out - replay_out;
+                                        const out_diff = if (out_diff_raw < 0) -out_diff_raw else out_diff_raw;
+                                        if (out_diff > ssm_out_max_layer) ssm_out_max_layer = out_diff;
+                                        const post_diff_raw = post_h - (pre_h + replay_out);
+                                        const post_diff = if (post_diff_raw < 0) -post_diff_raw else post_diff_raw;
+                                        if (post_diff > post_max_layer) post_max_layer = post_diff;
+                                    }
+                                }
+                                if (gnorm_max_layer > gnorm_max_overall) gnorm_max_overall = gnorm_max_layer;
+                                if (ssm_out_max_layer > ssm_out_max_overall) ssm_out_max_overall = ssm_out_max_layer;
+                                if (post_max_layer > post_max_overall) post_max_overall = post_max_layer;
+                                const layer_max = @max(gnorm_max_layer, @max(ssm_out_max_layer, post_max_layer));
+                                const layer_verdict: []const u8 = if (layer_max < 1e-3) "PASS@1e-3" else if (layer_max < 1e-2) "PASS@1e-2" else "FAIL";
+                                if (layer_max < 1e-3) {
+                                    output_pass_layers += 1;
+                                } else if (layer_max < 1e-2) {
+                                    output_pass_e2_layers += 1;
+                                } else {
+                                    output_fail_layers += 1;
+                                }
+                                log.info("ZINC_A3B_VALIDATE: layer={d} output verdict={s} gnorm={e:.6} ssm_out={e:.6} post_hidden={e:.6}", .{
+                                    L, layer_verdict, gnorm_max_layer, ssm_out_max_layer, post_max_layer,
+                                });
+                            }
+                            const output_overall_verdict: []const u8 = if (output_fail_layers > 0) "FAIL" else if (output_pass_e2_layers > 0) "PASS@1e-2" else "PASS@1e-3";
+                            log.info("ZINC_A3B_VALIDATE: ALL-LAYER output replay verdict={s} (gnorm_max={e:.6}, ssm_out_max={e:.6}, post_hidden_max={e:.6}, n_tok={d}, ssm_layers={d}, pass_1e-3={d} pass_1e-2={d} fail={d})", .{
+                                output_overall_verdict, gnorm_max_overall, ssm_out_max_overall, post_max_overall, n_tok_a3b, ssm_count, output_pass_layers, output_pass_e2_layers, output_fail_layers,
+                            });
+                        } else {
+                            log.info("ZINC_A3B_VALIDATE: output replay sample skipped — scratch too small (gnorm {d} < {d} or hidden {d} < {d})", .{
+                                scratch_gnorm.size, out_total_layer, scratch_ssm_out.size, hidden_total_layer,
+                            });
+                        }
+                    } else if (can_sample) {
+                        log.info("ZINC_A3B_VALIDATE: output replay sample skipped — missing capture/pipeline/staging (staging {d} < {d})", .{
+                            self.logits_staging.size, output_sample_total_bytes,
                         });
                     }
                 }
@@ -27958,6 +28184,9 @@ pub const InferenceEngine = struct {
         if (self.a3b_delta_out) |*b| b.deinit();
         if (self.a3b_per_token_delta_out) |*b| b.deinit();
         if (self.a3b_gate_capture) |*b| b.deinit();
+        if (self.a3b_gnorm_capture) |*b| b.deinit();
+        if (self.a3b_pre_hidden_capture) |*b| b.deinit();
+        if (self.a3b_post_hidden_capture) |*b| b.deinit();
         if (self.dense_prefill_validate_norm_ref) |*b| b.deinit();
         if (self.dense_prefill_validate_pre_hidden_ref) |*b| b.deinit();
         if (self.dense_prefill_validate_post_hidden_ref) |*b| b.deinit();
