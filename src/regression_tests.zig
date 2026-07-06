@@ -151,6 +151,15 @@ test "Vulkan batched projection chunk size matches selected shader family" {
     try expectContainsNear(src, fn_marker, "if (kpar_pipeline != null) KPAR_MAX_COLS else SERIAL_MAX_COLS", 5000);
 }
 
+test "Vulkan Qwen full-attn prefill keeps fused prequant handoff opt-in" {
+    const src = @embedFile("compute/forward.zig");
+
+    try expectContainsNear(src, "fn qwenDenseFullAttnFuseRmsQuantEnabled", "ZINC_QWEN36_27B_FULL_ATTN_FUSE_RMS_QUANT", 900);
+    try expectContainsNear(src, "fn qwenDenseFullAttnFuseRmsQuantEnabled", "return false;", 1200);
+    try expectContainsNear(src, "Full-attention segments keep the fused RMS+quant handoff opt-in.", "self.qwenDenseFullAttnFuseRmsQuantEnabled(n_tokens)", 400);
+    try expectContainsNear(src, "const segment_pre_quantized = if (segment_is_full_attn)", "self.qwenDenseFullAttnFuseRmsQuantEnabled(n_tokens)", 350);
+}
+
 test "Vulkan batched projection kpar is allowed on Intel wave32" {
     const src = @embedFile("compute/forward.zig");
     const marker = "const q4k_batch_kpar_enabled =";

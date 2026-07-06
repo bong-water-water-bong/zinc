@@ -103,6 +103,22 @@ member of the French Foreign Legion`; route utilization fell to 28.4% while
 only down improved modestly to 24.6 ms. Code was reverted; do not retry simple
 route-width reduction without a layer replay validator and a correctness sweep.
 
+Kept follow-up: full-attention layer-major prefill now keeps the fused
+RMS+Q8_1 handoff opt-in via `ZINC_QWEN36_27B_FULL_ATTN_FUSE_RMS_QUANT=1`.
+The root cause was narrower than the whole batched full-attention segment:
+forcing CPU argmax did not remove divergence, and replacing layer-start
+barriers with a transfer-or-compute producer barrier still produced one wrong
+answer in five repeats. Disabling the full-attn fused handoff globally through
+`ZINC_QWEN36_27B_FUSE_RMS_QUANT=0` was 5/5 correct but too broad; the accepted
+patch leaves SSM fused RMS+quant on, leaves `full_attn_batched=9`, and makes
+only the full-attn handoff opt-in. RDNA default validation on the 154-token
+diagnostic after the patch was 5/5 correct at 588.8 / 792.0 / 808.7 / 626.2 /
+614.1 tok/s. Profile sample: 542.2 tok/s, path coverage `ssm_layers=30
+full_attn_batched=9 full_attn_fallback=0 final_kv_only=1`, top buckets MoE
+74.6 ms and SSM 82.7 ms. Next target remains MoE gate_up/down or SSM-out;
+do not re-enable full-attn fused prequant by default without a cross-prompt
+correctness sweep.
+
 Kept follow-up: A3B production now routes `pipeline_tail` only through
 `qwen36DensePrefillTailPipelineEnabled` and that helper keeps A3B tail
 pipelining opt-in via `ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE=1`. On the clean
