@@ -218,6 +218,24 @@ controller. Five current-path samples were `510.64, 682.44, 703.56, 573.41,
 Do not count this path as a kept prefill improvement unless the full harness
 beats this noisy direct A/B with the exact same prompt and run count.
 
+Foundation follow-up: the shared-expert f32 gate batch is now explicit opt-in
+behind `ZINC_A3B_SHARED_F32_GATE_BATCH=1`, preserving the measured old default
+path while keeping the experiment available. Prefill profile output now also
+prints A3B path details so the next cycle can verify the production route before
+changing kernels:
+
+```
+Prefill path details: a3b_production=1 a3b_batched_delta_layers=30 a3b_layer_major_ssm_layers=30 exact_suffix_guard_tokens=16
+```
+
+Same RDNA node, same 154-token prompt, profiled sample after the instrumentation:
+`442.83 tok/s`, with top buckets `ssm=98.3 ms`, `moe=77.9 ms`, and sub-buckets
+`ssm_out_proj=31.1 ms`, `moe_down=27.7 ms`, `moe_gate_up=25.9 ms`,
+`ssm_qkv_z=25.6 ms`. Short no-profile sanity samples were `473.88, 703.06,
+710.95 tok/s` (median `703.06 tok/s`). This is a diagnostics/foundation keep;
+the next optimization should target one of the named 25-31 ms sub-buckets, not
+the now-default-off shared f32 gate experiment.
+
 Rejected follow-up: reducing the Qwen A3B prefill MoE exact-tail guard
 below 16 is still correctness-sensitive. Guard 12 and 8 preserved the
 111p first token, but guard 4 and 0 changed it; on the 2971p probe,

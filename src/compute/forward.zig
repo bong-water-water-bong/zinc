@@ -1468,9 +1468,13 @@ pub const InferenceEngine = struct {
     prefill_path_moe_grouped_tokens: u64 = 0,
     prefill_path_moe_top1_prefix_tokens: u64 = 0,
     prefill_path_moe_exact_suffix_tokens: u64 = 0,
+    prefill_path_moe_exact_suffix_guard_tokens: u32 = 0,
     prefill_path_moe_token_fallbacks: u64 = 0,
     prefill_path_moe_grouped_layer_mask: u64 = 0,
     prefill_path_moe_fallback_layer_mask: u64 = 0,
+    prefill_path_a3b_production_requested: u32 = 0,
+    prefill_path_a3b_batched_delta_layers: u32 = 0,
+    prefill_path_a3b_layer_major_ssm_layers: u32 = 0,
     // Pipelined prefill: second command buffer + embedding staging so the CPU
     // can prepare and submit the next prompt token while the GPU is still
     // executing the previous one. See prefillBatch() for the ping-pong logic.
@@ -2568,7 +2572,7 @@ pub const InferenceEngine = struct {
         const gemma_prefill_tail_topk_limit: u32 = if (config.architecture == .gemma and
             config.n_experts > 0 and
             config.n_experts_used > gemma_prefill_tail_topk_default and
-            is_amd_rdna_vendor and
+            (is_amd_rdna_vendor or (isIntelGpuVendor(gpu_config.vendor) and gemma_prefill_topk_env != null)) and
             gemma_prefill_base_topk_limit > 0)
             gemma_prefill_base_topk_limit
         else
@@ -2593,8 +2597,8 @@ pub const InferenceEngine = struct {
                 gemma_prefill_short_prompt_topk,
                 config.n_experts_used,
             });
-        } else if (config.architecture == .gemma and config.n_experts > 0 and is_amd_rdna_vendor) {
-            log.info("Gemma non-terminal prefill MoE top-k cap disabled by default on RDNA (set ZINC_GEMMA_MOE_PREFILL_TOPK to opt in)", .{});
+        } else if (config.architecture == .gemma and config.n_experts > 0 and (is_amd_rdna_vendor or isIntelGpuVendor(gpu_config.vendor))) {
+            log.info("Gemma non-terminal prefill MoE top-k cap disabled by default (set ZINC_GEMMA_MOE_PREFILL_TOPK to opt in)", .{});
         }
 
         // Fused FFN-RMS-norm + f32 router DMMV: default ON when the
@@ -3955,9 +3959,13 @@ pub const InferenceEngine = struct {
         self.prefill_path_moe_grouped_tokens = 0;
         self.prefill_path_moe_top1_prefix_tokens = 0;
         self.prefill_path_moe_exact_suffix_tokens = 0;
+        self.prefill_path_moe_exact_suffix_guard_tokens = 0;
         self.prefill_path_moe_token_fallbacks = 0;
         self.prefill_path_moe_grouped_layer_mask = 0;
         self.prefill_path_moe_fallback_layer_mask = 0;
+        self.prefill_path_a3b_production_requested = 0;
+        self.prefill_path_a3b_batched_delta_layers = 0;
+        self.prefill_path_a3b_layer_major_ssm_layers = 0;
     }
 
     fn recordPrefillRoutePackCounts(
@@ -4027,6 +4035,10 @@ pub const InferenceEngine = struct {
             const exact_suffix = @min(grouped_tokens -| prefix_tokens, self.moe_prefill_tail_topk_guard_tokens);
             self.prefill_path_moe_top1_prefix_tokens += @min(grouped_tokens, prefix_tokens);
             self.prefill_path_moe_exact_suffix_tokens += exact_suffix;
+            self.prefill_path_moe_exact_suffix_guard_tokens = @max(
+                self.prefill_path_moe_exact_suffix_guard_tokens,
+                self.moe_prefill_tail_topk_guard_tokens,
+            );
         } else if (grouped_tokens == n_tokens and grouped_tokens > 0) {
             self.prefill_path_moe_exact_suffix_tokens += grouped_tokens;
         }
@@ -17674,6 +17686,16 @@ pub const InferenceEngine = struct {
             self.elementwise.pipeline_moe_weighted_acc_batch != null;
     }
 
+    fn qwenA3bSharedF32GateBatchEnabled(self: *const InferenceEngine) bool {
+        if (!self.isQwen36A3bMoePrefillModel()) return false;
+        const raw = std.posix.getenv("ZINC_A3B_SHARED_F32_GATE_BATCH") orelse return false;
+        return raw.len > 0 and
+            !std.mem.eql(u8, raw, "0") and
+            !std.ascii.eqlIgnoreCase(raw, "off") and
+            !std.ascii.eqlIgnoreCase(raw, "false") and
+            !std.ascii.eqlIgnoreCase(raw, "no");
+    }
+
     fn qwenA3bSsmQ8Dp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool {
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
@@ -20781,20 +20803,38 @@ pub const InferenceEngine = struct {
                     try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, suffix_tokens);
                     try self.dispatchProjectionBatched(up_shexp.?, scratch_norm, scratch_up, shexp_inter_dim, hidden_dim, suffix_tokens);
                     if (shexp_gate) |sg| {
-                        var suffix_tok: u32 = 0;
-                        while (suffix_tok < suffix_tokens) : (suffix_tok += 1) {
-                            try self.dispatchDmmvInner(
-                                sg,
-                                scratch_norm,
+                        if (self.qwenA3bSharedF32GateBatchEnabled() and
+                            sg.info.type_ == .f32 and
+                            self.elementwise.pipeline_router_f32_batch != null and
+                            self.instance.push_descriptor_fn != null)
+                        {
+                            try self.dispatchRouterF32Batch(
+                                scratch_norm.handle,
                                 scratch_norm.size,
-                                scratch_router_output,
+                                sg.gpu_buffer.handle,
+                                sg.gpu_buffer.size,
+                                scratch_router_output.handle,
+                                @as(vk.c.VkDeviceSize, suffix_tokens) * @sizeOf(f32),
                                 1,
                                 hidden_dim,
-                                0,
-                                suffix_tok * hidden_dim * @sizeOf(f32),
-                                suffix_tok * @sizeOf(f32),
-                                0,
+                                suffix_tokens,
                             );
+                        } else {
+                            var suffix_tok: u32 = 0;
+                            while (suffix_tok < suffix_tokens) : (suffix_tok += 1) {
+                                try self.dispatchDmmvInner(
+                                    sg,
+                                    scratch_norm,
+                                    scratch_norm.size,
+                                    scratch_router_output,
+                                    1,
+                                    hidden_dim,
+                                    0,
+                                    suffix_tok * hidden_dim * @sizeOf(f32),
+                                    suffix_tok * @sizeOf(f32),
+                                    0,
+                                );
+                            }
                         }
                     }
                 } else {
@@ -21414,6 +21454,12 @@ pub const InferenceEngine = struct {
                 (lt.ssm_alpha.?.info.type_ == .q8_0 and
                     lt.ssm_beta.?.info.type_ == .q8_0 and
                     self.dmmv.pipeline_q8_0 != null));
+
+        if (self.isQwen36A3bMoePrefillModel()) {
+            self.prefill_path_a3b_production_requested = if (self.use_a3b_production) 1 else 0;
+            if (use_batched_delta) self.prefill_path_a3b_batched_delta_layers += 1;
+            if (use_layer_major_ssm_proj) self.prefill_path_a3b_layer_major_ssm_layers += 1;
+        }
 
         if (use_layer_major_ssm_proj) {
             const attn_norm_t = lt.attn_norm.?;
@@ -24520,7 +24566,7 @@ pub const InferenceEngine = struct {
         const cfg = self.model.config;
         if (cfg.architecture != .gemma or cfg.n_experts == 0 or cfg.n_experts_used == 0) return false;
         if (prompt_len < gemma_prefill_long_draft_prompt_min_tokens or prompt_len > gemma_prefill_shared_skip_max_tokens) return false;
-        if (!self.isAmdRdna() or self.instance.push_descriptor_fn == null) return false;
+        if (!(self.isAmdRdna() or isIntelGpuVendor(self.gpu_config.vendor)) or self.instance.push_descriptor_fn == null) return false;
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_capture_routing or self.use_capture_ffn_input or self.use_count_experts_prefill) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
@@ -26213,11 +26259,11 @@ pub const InferenceEngine = struct {
             if (dense_prefix_layers > 0) {
                 return self.prefillQwen36DenseFfnPrefix(state, prompt_tokens, dense_prefix_layers);
             }
-            if (self.gemmaGroupedMoePrefillEnabled(prompt_tokens.len)) {
-                return self.prefillGemmaGroupedMoeExact(state, prompt_tokens);
-            }
             if (self.gemmaShortMoePrefixPrefillEnabled(prompt_tokens.len)) {
                 return self.prefillGemmaShortMoePrefix(state, prompt_tokens);
+            }
+            if (self.gemmaGroupedMoePrefillEnabled(prompt_tokens.len)) {
+                return self.prefillGemmaGroupedMoeExact(state, prompt_tokens);
             }
         }
         if ((batched_disabled and !validate_mode) or !canUseBatchedPrefillRdna(self)) {
@@ -28720,6 +28766,15 @@ pub fn generate(
                 .{
                     engine.prefill_path_moe_grouped_layer_mask,
                     engine.prefill_path_moe_fallback_layer_mask,
+                },
+            );
+            log.info(
+                "Prefill path details: a3b_production={d} a3b_batched_delta_layers={d} a3b_layer_major_ssm_layers={d} exact_suffix_guard_tokens={d}",
+                .{
+                    engine.prefill_path_a3b_production_requested,
+                    engine.prefill_path_a3b_batched_delta_layers,
+                    engine.prefill_path_a3b_layer_major_ssm_layers,
+                    engine.prefill_path_moe_exact_suffix_guard_tokens,
                 },
             );
         }

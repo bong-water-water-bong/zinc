@@ -166,6 +166,7 @@ test "Vulkan Qwen prefill profile keeps MoE route-pack occupancy visible" {
     try expectContainsNear(src, "fn prefillProfileRequested", "ZINC_PREFILL_PROFILE", 500);
     try expectContainsNear(src, "const collect_route_profile =", "self.profile_enabled or prefillProfileRequested()", 300);
     try expectContains(src, "Prefill route-pack occupancy:");
+    try expectContains(src, "Prefill path details: a3b_production={d} a3b_batched_delta_layers={d} a3b_layer_major_ssm_layers={d} exact_suffix_guard_tokens={d}");
 }
 
 test "Vulkan Qwen prefill profile splits SSM out projection and residual handoff" {
@@ -372,7 +373,7 @@ test "Vulkan Gemma prefill top-k cap can be tested without decode top-k cap" {
     try expectContainsNear(src, marker, "ZINC_GEMMA_MOE_PREFILL_TOPK", 200);
     try expectContainsNear(src, marker, "gemma_prefill_base_topk_limit", 900);
     try expectContainsNear(src, marker, "else if (gemma_topk_env != null)", 900);
-    try expectContainsNear(src, "Gemma non-terminal prefill MoE top-k cap disabled by default on RDNA", "ZINC_GEMMA_MOE_PREFILL_TOPK", 200);
+    try expectContainsNear(src, "Gemma non-terminal prefill MoE top-k cap disabled by default", "ZINC_GEMMA_MOE_PREFILL_TOPK", 200);
 }
 
 test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate" {
@@ -383,7 +384,7 @@ test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate"
     try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnvEnabled", "orelse return true", 200);
     try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnvEnabled", "std.ascii.eqlIgnoreCase(env, \"off\")", 500);
     try expectContainsNear(src, "fn gemmaGroupedMoePrefillEnabled", "isIntelGpuVendor(self.gpu_config.vendor)", 900);
-    try expectContainsNear(src, "fn gemmaShortMoePrefixPrefillEnabled", "!self.isAmdRdna()", 700);
+    try expectContainsNear(src, "fn gemmaShortMoePrefixPrefillEnabled", "!(self.isAmdRdna() or isIntelGpuVendor(self.gpu_config.vendor))", 900);
     try expectContainsNear(src, marker, "try self.prefillGemmaRunBatchedAttentionToFfnNorm", 18000);
     try expectContainsNear(src, marker, "try self.ensureGemmaMoePrefillDp4aScratchCapacity", 4200);
     try expectContainsNear(src, "fn ensureGemmaMoePrefillDp4aScratchCapacity", "batched_scratch_norm_q8_scale", 2400);
@@ -1130,6 +1131,24 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(q8_q5_down_shader, "dotPacked4x8AccSatEXT");
     try expectContains(q8_q5_down_shader, "Q5_K");
     try expectContains(q8_q5_down_shader, "x_route_divisor");
+}
+
+test "Vulkan Qwen grouped prefill keeps shared expert f32 gate batching opt-in" {
+    const forward = @embedFile("compute/forward.zig");
+    const marker = "try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, suffix_tokens);";
+    const start = std.mem.indexOf(u8, forward, marker) orelse return error.TestExpectedEqual;
+    const block = forward[start..@min(start + 2400, forward.len)];
+
+    try expectContains(forward, "fn qwenA3bSharedF32GateBatchEnabled");
+    try expectContains(forward, "ZINC_A3B_SHARED_F32_GATE_BATCH");
+    try expectContainsNear(forward, "fn qwenA3bSharedF32GateBatchEnabled", "orelse return false;", 400);
+    try expectContains(block, "self.qwenA3bSharedF32GateBatchEnabled()");
+    try expectContains(block, "sg.info.type_ == .f32");
+    try expectContains(block, "self.elementwise.pipeline_router_f32_batch != null");
+    try expectContains(block, "try self.dispatchRouterF32Batch(");
+    try expectContains(block, "@as(vk.c.VkDeviceSize, suffix_tokens) * @sizeOf(f32)");
+    try expectContains(block, "suffix_tokens,");
+    try expectContains(block, "try self.dispatchDmmvInner(");
 }
 
 test "softmax_topk shader keeps RADV-safe shared-memory winner scan" {
