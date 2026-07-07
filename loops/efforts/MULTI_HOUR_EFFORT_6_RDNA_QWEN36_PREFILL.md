@@ -193,6 +193,31 @@ bucket did not improve, so the shader was reverted. Do not retry f16 A-tile
 storage in `mul_mm_q8_0.comp` without shaderstats showing LDS occupancy is the
 limiter and a profile where SSM-out itself drops.
 
+Rejected follow-up: a BN=64 f32 `mul_mm_q8_0` sibling for A3B Q8_0 prefill
+projections is not a keep. The first profile was tempting: SSM moved
+`97.6 -> 53.3 ms` and SSM-out projection `31.0 -> 14.7 ms`, but the primary
+unprofiled 154-token controller rejected it. Plain BN=64 samples were noisy
+and the adjusted full-64-column body + BN=32 ragged-tail variant regressed the
+fresh interleaved median:
+
+| Mode | Samples | Median |
+|---|---|---:|
+| default BN=32 | 486.74, 746.77, 491.64, 488.98, 481.89 tok/s | 488.98 tok/s |
+| BN=64 body + BN=32 tail | 798.00, 552.41, 451.03, 453.07, 462.37 tok/s | 462.37 tok/s |
+
+Output text stayed unchanged (`some of the most common acronyms`), so this was
+a performance rejection rather than a correctness rejection. The probe files
+were removed; do not retry a simple BN=64 Q8_0 f32 GEMM without a scheduler or
+shape policy that fixes the low-band samples.
+
+Unproven follow-up: batching the A3B suffix shared-expert f32 gate through the
+existing batched f32 router shader is not a confirmed win on the direct 154-token
+controller. Five current-path samples were `510.64, 682.44, 703.56, 573.41,
+492.19 tok/s` for a `573.41 tok/s` median. Five temporary old-path samples were
+`472.20, 702.87, 717.48, 593.32, 498.91 tok/s` for a `593.32 tok/s` median.
+Do not count this path as a kept prefill improvement unless the full harness
+beats this noisy direct A/B with the exact same prompt and run count.
+
 Rejected follow-up: reducing the Qwen A3B prefill MoE exact-tail guard
 below 16 is still correctness-sensitive. Guard 12 and 8 preserved the
 111p first token, but guard 4 and 0 changed it; on the 2971p probe,
