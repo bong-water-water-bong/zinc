@@ -1004,7 +1004,7 @@ fn printResults(results: []const BenchResult) void {
 
 /// Run the hot-decode microbenchmark suite against the selected model and kernels.
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) log.err("memory leak detected", .{});

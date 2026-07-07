@@ -182,7 +182,7 @@ If you are on Intel Mac, ZINC's Metal path will not initialize — Apple Silicon
 
 ### 5. Still stuck
 
-Open the [ZINC Discord](https://discord.gg/QRUgWH2aGV) or [file a GitHub issue](https://github.com/zolotukhin/zinc/issues) with the full `--check` output, your GPU model, and `vulkaninfo --summary` (Linux) or `system_profiler SPDisplaysDataType` (macOS).
+[File a GitHub issue](https://github.com/zolotukhin/zinc/issues) with the full `--check` output, your GPU model, and `vulkaninfo --summary` (Linux) or `system_profiler SPDisplaysDataType` (macOS).
 
 ## Inspect the managed model catalog
 

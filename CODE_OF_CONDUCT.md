@@ -31,7 +31,7 @@ This applies to:
 - GitHub issues
 - pull requests
 - code review discussions
-- project chat spaces such as the ZINC Discord
+- project chat spaces
 
 ## Enforcement
 
@@ -39,7 +39,7 @@ Project maintainers may remove comments, close discussions, reject contributions
 
 ## Reporting
 
-If you need to report a conduct problem, contact the project maintainer privately through GitHub or the project Discord rather than escalating the situation in a public thread.
+If you need to report a conduct problem, contact the project maintainer privately through GitHub rather than escalating the situation in a public thread.
 
 ## Notes
 

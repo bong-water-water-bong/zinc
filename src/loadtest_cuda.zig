@@ -24,7 +24,7 @@ const DEFAULT_MODEL = "models/Qwen3.5-9B-Q4_K_M.gguf";
 /// @returns Propagates loader errors (init/open/parse/upload) so the build step
 /// surfaces a nonzero exit on failure.
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

@@ -25,7 +25,7 @@ const DEFAULT_MODEL = "models/Qwen3.5-9B-Q4_K_M.gguf";
 const Milestone = enum { v0, v1, v2 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

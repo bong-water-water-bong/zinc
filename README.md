@@ -18,9 +18,6 @@
   <a href="https://zolotukhin.ai/zinc">
     <img src="https://img.shields.io/badge/web-zolotukhin.ai%2Fzinc-8B5CF6" alt="Website">
   </a>
-  <a href="https://discord.gg/QRUgWH2aGV">
-    <img src="https://img.shields.io/badge/Discord-Join%20ZINC-5865F2?logo=discord&logoColor=white" alt="ZINC Discord">
-  </a>
 </p>
 
 > Fastest measured local LLM inference for AMD GPUs. ZINC beats llama.cpp across the current five-model RDNA4 headline sweep — decode, prefill, end-to-end, and model-level overall — with no ROCm.

@@ -69,6 +69,7 @@ pub const GGMLType = enum(u32) {
     nvfp4 = 40,
     q1_0 = 41,
     stq1_0 = 42,
+    q2_0 = 1000,
     _,
 
     /// Return the number of tensor elements encoded by one storage block.
@@ -93,6 +94,7 @@ pub const GGMLType = enum(u32) {
             .nvfp4 => 32,
             .q1_0 => 32,
             .stq1_0 => 256,
+            .q2_0 => 128,
             else => 1,
         };
     }
@@ -130,6 +132,7 @@ pub const GGMLType = enum(u32) {
             .nvfp4 => 17,
             .q1_0 => 5,
             .stq1_0 => 42, // 32 qs + 8 sign + 2 d = 42 bytes (1.3125 bpw)
+            .q2_0 => 34, // 128 elems: fp16 d (2) + qs[32] 2-bit codes (32) = 34 bytes (2.125 bpw)
             else => 0,
         };
     }
@@ -404,7 +407,10 @@ pub fn parseWithOptions(data: []const u8, allocator: std.mem.Allocator, options:
             dims[d] = reader.readU64();
         }
 
-        const type_: GGMLType = @enumFromInt(reader.readU32());
+        const raw_type = reader.readU32();
+        // Disambiguate GGML type id 42: Q2_0 (Bonsai ternary, 128/34) vs stq1_0 (AngelSlim, 256/42).
+        // Default to Q2_0 (the Bonsai format used by prism-ml/Ternary-Bonsai-*-gguf).
+        const type_: GGMLType = if (raw_type == 42) .q2_0 else @enumFromInt(raw_type);
         const offset = reader.readU64();
 
         try tensors.append(allocator, .{

@@ -114,7 +114,7 @@ For performance bugs, include both expected and actual tok/s.
 
 ## Communication
 
-The README links to the project Discord. Use GitHub issues for actionable bugs and feature requests, and use Discord for faster discussion, early feedback, and testing coordination.
+Use GitHub issues for actionable bugs and feature requests.
 
 ## Code of conduct
 

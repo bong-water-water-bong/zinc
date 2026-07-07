@@ -125,7 +125,7 @@
 
 <div class="gap crit">
   <h4><span class="badge b-crit">Blocker</span> A3 · No troubleshooting path where the user actually is <span class="who">hurts: anyone with a non-stock setup</span></h4>
-  <p>"Common early mistakes" and "fast troubleshooting commands" exist only at the <em>end</em> of Running ZINC, with no actionable next steps and no link to Discord/issues. A cryptic Vulkan/driver/VRAM error leaves the user with nowhere to go.</p>
+  <p>"Common early mistakes" and "fast troubleshooting commands" exist only at the <em>end</em> of Running ZINC, with no actionable next steps and no link to issues. A cryptic Vulkan/driver/VRAM error leaves the user with nowhere to go.</p>
   <p class="ev">Evidence: <code>docs/RUNNING_ZINC.md:445–462</code> (mistakes, no remedies), <code>:464–479</code> (commands, buried). No top-of-page Troubleshooting section anywhere.</p>
   <p class="fix"><b>Fix:</b> a dedicated "Troubleshooting" section early in Running ZINC, per failure mode (wrong driver, unsupported HW, missing env var, model too large), each with a diagnostic command and a help link.</p>
 </div>
@@ -173,8 +173,8 @@
 </div>
 
 <div class="gap low">
-  <h4><span class="badge b-low">Polish</span> A10 · Discord help link absent from docs &amp; /about <span class="who">hurts: stuck users</span></h4>
-  <p>The Discord invite lives on <code>/zinc/</code> only; doc pages and <code>/about</code> don't surface any community/help link, so a stuck reader has to navigate back.</p>
+  <h4><span class="badge b-low">Polish</span> A10 · Help link absent from docs &amp; /about <span class="who">hurts: stuck users</span></h4>
+  <p>Doc pages and <code>/about</code> don't surface any community/help link, so a stuck reader has to navigate back.</p>
   <p class="ev">Evidence: <code>site/src/pages/zinc/index.astro</code> (has it); docs + <code>site/src/pages/about.astro</code> (don't).</p>
   <p class="fix"><b>Fix:</b> add a "Getting help" link in the doc layout footer.</p>
 </div>
@@ -354,7 +354,7 @@
 
 <div class="gap low">
   <h4><span class="badge b-low">Polish</span> D9 · No benchmark-specific OG image/title for social sharing <span class="who">hurts: link previews</span></h4>
-  <p>Benchmark/perf links share the generic site OG image; a "128 tok/s on RDNA4" preview card would convert far better in Discord/X.</p>
+  <p>Benchmark/perf links share the generic site OG image; a "128 tok/s on RDNA4" preview card would convert far better on X.</p>
   <p class="ev">Evidence: default <code>ogImage</code> in <code>SEOHead.astro</code>; no per-page override in <code>BenchmarksDashboard.astro</code>.</p>
   <p class="fix"><b>Fix:</b> a benchmark OG image + custom description.</p>
 </div>
@@ -416,7 +416,7 @@
   <tr><td>D6</td><td>Color-only chart encoding</td><td><span class="tag b-med">Hygiene</span></td><td>Colorblind users</td></tr>
   <tr><td>A8</td><td>--chat vs chat confusion</td><td><span class="tag b-low">Polish</span></td><td>Clarity</td></tr>
   <tr><td>A9</td><td>No platform-choice guidance</td><td><span class="tag b-low">Polish</span></td><td>Buyers</td></tr>
-  <tr><td>A10</td><td>Discord absent from docs</td><td><span class="tag b-low">Polish</span></td><td>Stuck users</td></tr>
+  <tr><td>A10</td><td>Help link absent from docs</td><td><span class="tag b-low">Polish</span></td><td>Stuck users</td></tr>
   <tr><td>C4</td><td>No freshness dates / sidebar split</td><td><span class="tag b-low">Polish</span></td><td>Trust</td></tr>
   <tr><td>C5</td><td>Search ranks all doc types equally</td><td><span class="tag b-low">Polish</span></td><td>Search</td></tr>
   <tr><td>D7</td><td>404 dead-ends to blog</td><td><span class="tag b-low">Polish</span></td><td>Lost users</td></tr>
