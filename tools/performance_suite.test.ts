@@ -32,6 +32,7 @@ import {
   parseZincServerOutput,
   parseZincVersionOutput,
   prefersChatPrompt,
+  remoteSshFailureSummary,
   rdnaEnvValue,
   rdnaNodeEnvKey,
   intelZincCommand,
@@ -107,7 +108,9 @@ test("remote tuning env forwards tuning toggles", () => {
     ZINC_Q8_1_LM_HEAD: "1",
     ZINC_Q8_1_SSM_QKV_Z: "1",
     ZINC_MOE_Q5K_Q8_1_DOWN_ACC: "1",
+    ZINC_MOE_SINGLETON_TAIL_SPLIT: "1",
     ZINC_INTEL_A3B_PRODUCTION: "0",
+    ZINC_A3B_SHARED_F32_GATE_BATCH: "0",
     ZINC_QWEN35_9B_BM64_DOWN: "0",
     ZINC_QWEN35_9B_K12288_BK2: "0",
     ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS: "4",
@@ -120,7 +123,9 @@ test("remote tuning env forwards tuning toggles", () => {
   expect(env.ZINC_Q8_1_LM_HEAD).toBe("1");
   expect(env.ZINC_Q8_1_SSM_QKV_Z).toBe("1");
   expect(env.ZINC_MOE_Q5K_Q8_1_DOWN_ACC).toBe("1");
+  expect(env.ZINC_MOE_SINGLETON_TAIL_SPLIT).toBe("1");
   expect(env.ZINC_INTEL_A3B_PRODUCTION).toBe("0");
+  expect(env.ZINC_A3B_SHARED_F32_GATE_BATCH).toBe("0");
   expect(env.ZINC_QWEN35_9B_BM64_DOWN).toBe("0");
   expect(env.ZINC_QWEN35_9B_K12288_BK2).toBe("0");
   expect(env.ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS).toBe("4");
@@ -377,7 +382,9 @@ test("Intel ZINC command can pin a temporary SSH key", () => {
     env: {},
   });
 
-  expect(cmd).toContain("ssh -i '/tmp/zinc_key' -o IdentitiesOnly=yes -p 8888 tempuser@intel.local");
+  expect(cmd).toContain("ssh -i '/tmp/zinc_key' -o IdentitiesOnly=yes");
+  expect(cmd).toContain("ConnectTimeout=15");
+  expect(cmd).toContain("-p 8888 tempuser@intel.local");
 });
 
 test("Intel ZINC command supports temporary password auth without embedding the secret", () => {
@@ -399,9 +406,10 @@ test("Intel ZINC command supports temporary password auth without embedding the 
   expect(cmd).toContain("SSH_ASKPASS=");
   expect(cmd).toContain("SSH_ASKPASS_REQUIRE=force");
   expect(cmd).toContain("NumberOfPasswordPrompts=1");
+  expect(cmd).toContain("ConnectTimeout=15");
   expect(cmd).toContain("StrictHostKeyChecking=accept-new");
   expect(cmd).toContain("ZINC_INTEL_SSH_PASSWORD");
-  expect(cmd).not.toContain("ChangeMe");
+  expect(cmd).not.toContain("actual-secret");
 });
 
 test("RDNA startup failure detection spots unsupported model architecture logs", () => {
@@ -421,6 +429,13 @@ test("benchmark failure reasons do not publish shell commands", () => {
   const diagnostic = new Error("Command failed (1): remote benchmark command with private args\nerr(zinc): Failed to init inference engine: QueueSubmitFailed");
   expect(benchmarkFailureReason("ZINC run failed", diagnostic)).toBe("ZINC run failed: err(zinc): Failed to init inference engine: QueueSubmitFailed");
   expect(benchmarkFailureReason("Intel baseline failed", new Error("Remote server failed to start"))).toBe("Intel baseline failed: Remote server failed to start");
+});
+
+test("remote SSH failure summaries omit private endpoints", () => {
+  const error = new Error("Command failed (255): ssh -p 2222 tempuser@bench-host.example.invalid true\nssh: connect to host bench-host.example.invalid port 2222: Operation timed out");
+  error.stderr = "ssh: connect to host bench-host.example.invalid port 2222: Operation timed out\n";
+  expect(remoteSshFailureSummary(error)).toBe("ssh: connect to host <host> port <port>: Operation timed out");
+  expect(benchmarkFailureReason("Intel preflight failed", error)).toBe("Intel preflight failed: ssh: connect to host <host> port <port>: Operation timed out");
 });
 
 test("performance suite rsync excludes local secrets and run state", () => {
@@ -612,6 +627,14 @@ test("RDNA ZINC server payload keeps the preloaded GGUF active", () => {
   expect(chat).not.toHaveProperty("model");
 });
 
+test("remote llama-server baselines disable prompt cache for prefill timing", () => {
+  const src = readFileSync(new URL("./performance_suite.mjs", import.meta.url), "utf8");
+  const launchStart = src.indexOf("async function launchRdnaLlamaServer");
+  expect(launchStart).toBeGreaterThanOrEqual(0);
+  const launchBody = src.slice(launchStart, launchStart + 4000);
+  expect(launchBody).toContain("\"--no-cache-prompt\"");
+});
+
 test("RDNA ZINC timing wait is bounded after the API response", () => {
   expect(zincServerTimingWaitSeconds(12_000)).toBe(10);
   expect(zincServerTimingWaitSeconds(65_000)).toBe(60);
@@ -656,12 +679,36 @@ test("parseOpenAiCompletionOutput extracts throughput from server JSON", () => {
   }));
 
   expect(parsed.promptTokens).toBe(24);
+  expect(parsed.prefillTokens).toBe(24);
   expect(parsed.prefillMs).toBeCloseTo((24 / 220.5) * 1000, 6);
   expect(parsed.prefillTps).toBe(220.5);
   expect(parsed.decodeMs).toBeCloseTo((128 / 107.2) * 1000, 6);
   expect(parsed.decodeTps).toBe(107.2);
   expect(parsed.msPerToken).toBeCloseTo(1000 / 107.2, 6);
   expect(parsed.outputPreview).toBe("Paris");
+});
+
+test("parseOpenAiCompletionOutput uses llama-server timing token counts for cached prompts", () => {
+  const parsed = parseOpenAiCompletionOutput(JSON.stringify({
+    usage: {
+      prompt_tokens: 73,
+      completion_tokens: 256,
+    },
+    timings: {
+      prompt_n: 5,
+      prompt_ms: 44.02,
+      prompt_per_second: 113.59763716914688,
+      predicted_per_second: 60.9357832057173,
+    },
+    choices: [{ message: { content: "Implementation plan" } }],
+  }));
+
+  expect(parsed.promptTokens).toBe(73);
+  expect(parsed.prefillTokens).toBe(5);
+  expect(parsed.prefillMs).toBe(44.02);
+  expect(parsed.prefillTps).toBeCloseTo(113.59763716914688, 6);
+  expect(parsed.decodeMs).toBeCloseTo((256 / 60.9357832057173) * 1000, 6);
+  expect(parsed.outputPreview).toBe("Implementation plan");
 });
 
 test("summarizeValues includes median, p95, and stddev", () => {
@@ -704,6 +751,32 @@ test("buildComparison adds prompt and latency deltas", () => {
   expect(comparison?.zinc_overall_tps).toBeCloseTo(42.857, 3);
   expect(comparison?.baseline_overall_tps).toBeCloseTo(85.714, 3);
   expect(comparison?.overall_delta_tps).toBeCloseTo(-42.857, 3);
+});
+
+test("buildComparison uses measured prefill tokens for cached server timings", () => {
+  const comparison = buildComparison(
+    {
+      name: "ZINC",
+      prompt_tokens: 70,
+      prefill_tokens: 70,
+      generated_tokens: 256,
+      prefill_tps: { median: 325.02, avg: 325.02 },
+      decode_tps: { median: 63.35, avg: 63.35 },
+    },
+    {
+      name: "llama.cpp",
+      prompt_tokens: 73,
+      prefill_tokens: 5,
+      generated_tokens: 256,
+      prefill_tps: { median: 113.59763716914688, avg: 113.59763716914688 },
+      decode_tps: { median: 60.9357832057173, avg: 60.9357832057173 },
+    },
+    { expectedGeneratedTokens: 256 },
+  );
+
+  expect(comparison?.baseline_overall_seconds).toBeCloseTo((5 / 113.59763716914688) + (256 / 60.9357832057173), 6);
+  expect(comparison?.baseline_overall_seconds).toBeLessThan(4.3);
+  expect(comparison?.zinc_overall_seconds).toBeCloseTo((70 / 325.02) + (256 / 63.35), 6);
 });
 
 test("buildComparison rates overall by backend wall time, not mixed throughput averages", () => {
@@ -1034,6 +1107,14 @@ test("output quality status flags malformed benchmark previews", () => {
     "4. What is the most important thing to remember about the relationship between the brain and the body?",
     96,
   ).tone).toBe("caution");
+  expect(outputQualityStatus([
+    "- The team should not publish the benchmark protocol.",
+    "- The team should not publish the benchmark protocol.",
+    "- The team should not publish the benchmark protocol.",
+    "",
+    "Engineering guidance:",
+    "- The team should not publish the benchmark protocol.",
+  ].join("\n"), 128).tone).toBe("caution");
   expect(outputQualityStatus("This implementation plan explains the command shape and warmup policy.", 96).tone).toBe("positive");
 });
 

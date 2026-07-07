@@ -2572,7 +2572,7 @@ pub const InferenceEngine = struct {
         const gemma_prefill_tail_topk_limit: u32 = if (config.architecture == .gemma and
             config.n_experts > 0 and
             config.n_experts_used > gemma_prefill_tail_topk_default and
-            (is_amd_rdna_vendor or (isIntelGpuVendor(gpu_config.vendor) and gemma_prefill_topk_env != null)) and
+            is_amd_rdna_vendor and
             gemma_prefill_base_topk_limit > 0)
             gemma_prefill_base_topk_limit
         else
@@ -2597,8 +2597,8 @@ pub const InferenceEngine = struct {
                 gemma_prefill_short_prompt_topk,
                 config.n_experts_used,
             });
-        } else if (config.architecture == .gemma and config.n_experts > 0 and (is_amd_rdna_vendor or isIntelGpuVendor(gpu_config.vendor))) {
-            log.info("Gemma non-terminal prefill MoE top-k cap disabled by default (set ZINC_GEMMA_MOE_PREFILL_TOPK to opt in)", .{});
+        } else if (config.architecture == .gemma and config.n_experts > 0 and is_amd_rdna_vendor) {
+            log.info("Gemma non-terminal prefill MoE top-k cap disabled by default on RDNA (set ZINC_GEMMA_MOE_PREFILL_TOPK to opt in)", .{});
         }
 
         // Fused FFN-RMS-norm + f32 router DMMV: default ON when the
@@ -24566,7 +24566,7 @@ pub const InferenceEngine = struct {
         const cfg = self.model.config;
         if (cfg.architecture != .gemma or cfg.n_experts == 0 or cfg.n_experts_used == 0) return false;
         if (prompt_len < gemma_prefill_long_draft_prompt_min_tokens or prompt_len > gemma_prefill_shared_skip_max_tokens) return false;
-        if (!(self.isAmdRdna() or isIntelGpuVendor(self.gpu_config.vendor)) or self.instance.push_descriptor_fn == null) return false;
+        if (!self.isAmdRdna() or self.instance.push_descriptor_fn == null) return false;
         if (self.validation_diagnostics_enabled) return false;
         if (self.use_capture_routing or self.use_capture_ffn_input or self.use_count_experts_prefill) return false;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return false;
@@ -26259,11 +26259,11 @@ pub const InferenceEngine = struct {
             if (dense_prefix_layers > 0) {
                 return self.prefillQwen36DenseFfnPrefix(state, prompt_tokens, dense_prefix_layers);
             }
-            if (self.gemmaShortMoePrefixPrefillEnabled(prompt_tokens.len)) {
-                return self.prefillGemmaShortMoePrefix(state, prompt_tokens);
-            }
             if (self.gemmaGroupedMoePrefillEnabled(prompt_tokens.len)) {
                 return self.prefillGemmaGroupedMoeExact(state, prompt_tokens);
+            }
+            if (self.gemmaShortMoePrefixPrefillEnabled(prompt_tokens.len)) {
+                return self.prefillGemmaShortMoePrefix(state, prompt_tokens);
             }
         }
         if ((batched_disabled and !validate_mode) or !canUseBatchedPrefillRdna(self)) {

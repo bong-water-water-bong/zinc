@@ -14,6 +14,7 @@ import {
   parseLlamaCliMetrics,
   parseZincMetrics,
   resolveModelTarget,
+  sshFailureSummary,
   stateTargetMismatchReason,
   type LoopOptions,
 } from "./optimize_gpu";
@@ -141,6 +142,7 @@ describe("optimize_gpu args and model resolution", () => {
     expect(opts.sshPasswordFile).toBeNull();
     expect(buildSshOptions(opts)).toContain("BatchMode=no");
     expect(buildSshOptions(opts)).toContain("NumberOfPasswordPrompts=1");
+    expect(buildSshOptions(opts)).toContain("ConnectTimeout=15");
   });
 
   test("keeps keyless default SSH in batch mode when no password auth is configured", () => {
@@ -153,6 +155,7 @@ describe("optimize_gpu args and model resolution", () => {
     expect(opts.sshPasswordEnvVar).toBeNull();
     expect(opts.sshPasswordFile).toBeNull();
     expect(buildSshOptions(opts)).toContain("BatchMode=yes");
+    expect(buildSshOptions(opts)).toContain("ConnectTimeout=15");
   });
 
   test("derives remote defaults from an explicit SSH user", () => {
@@ -304,6 +307,18 @@ llama_perf_context_print:        eval time =   474.72 ms /    15 runs   (   31.6
 
     expect(metrics.decodeTokPerSec).toBe(100);
     expect(metrics.coherent).toBe(true);
+  });
+
+  test("summarizes SSH failures without exposing endpoints", () => {
+    expect(sshFailureSummary({
+      stdout: "",
+      stderr: "ssh: connect to host bench-host.example.invalid port 2222: Operation timed out\n",
+    })).toBe("ssh: connect to host <host> port <port>: Operation timed out");
+
+    expect(sshFailureSummary({
+      stdout: "err: FenceWaitFailed\nextra diagnostic",
+      stderr: "",
+    })).toBe("err: FenceWaitFailed");
   });
 });
 

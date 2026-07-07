@@ -296,12 +296,13 @@ function hasSshPasswordAuth(opts: Pick<LoopOptions, "sshPasswordEnvVar" | "sshPa
 
 export function buildSshOptions(opts: Pick<LoopOptions, "sshPasswordEnvVar" | "sshPasswordFile">): string[] {
   if (!hasSshPasswordAuth(opts)) {
-    return ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"];
+    return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=no"];
   }
   return [
     "-o", "BatchMode=no",
     "-o", "NumberOfPasswordPrompts=1",
     "-o", "PreferredAuthentications=publickey,password,keyboard-interactive",
+    "-o", "ConnectTimeout=15",
     "-o", "StrictHostKeyChecking=no",
   ];
 }
@@ -651,6 +652,24 @@ export function combinedCommandOutput(result: Pick<CommandResult, "stdout" | "st
   return [result.stdout, result.stderr].filter((part) => part.length > 0).join("\n");
 }
 
+function sanitizeSshDiagnostic(line: string): string {
+  return line
+    .replace(/\b[A-Za-z_][A-Za-z0-9_.-]*@(?:\d{1,3}\.){3}\d{1,3}\b/g, "<user>@<host>")
+    .replace(/\b[A-Za-z_][A-Za-z0-9_.-]*@[A-Za-z0-9_.-]+\b/g, "<user>@<host>")
+    .replace(/(connect to host )\S+( port )\d+/i, "$1<host>$2<port>")
+    .replace(/(Could not resolve hostname )\S+/i, "$1<host>")
+    .replace(/(Connection (?:closed|reset) by )\S+/i, "$1<host>");
+}
+
+export function sshFailureSummary(result: Pick<CommandResult, "stdout" | "stderr">): string {
+  const lines = combinedCommandOutput(result)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const sshDiagnostic = lines.find((line) => /^(ssh:|Permission denied|Host key verification failed|Could not resolve hostname|Connection (?:closed|refused|reset|timed out)|No route to host|kex_exchange_identification:)/i.test(line));
+  return sanitizeSshDiagnostic(sshDiagnostic ?? lines[0] ?? "no remote command output");
+}
+
 export function isAgentAuthFailure(result: Pick<CommandResult, "exitCode" | "stdout" | "stderr">): boolean {
   if (result.exitCode === 0) return false;
   return /(?:Failed to authenticate|Invalid authentication credentials|API Error:\s*401|401 Unauthorized|authentication credentials)/i.test(
@@ -745,7 +764,7 @@ async function ssh(opts: LoopOptions, command: string, timeout = 120_000): Promi
 async function checkedSsh(opts: LoopOptions, command: string, timeout = 120_000): Promise<string> {
   const res = await ssh(opts, command, timeout);
   if (res.exitCode !== 0) {
-    throw new Error(`remote command failed (${res.exitCode}): ${res.stderr || res.stdout}`);
+    throw new Error(`remote command failed (${res.exitCode}): ${sshFailureSummary(res)}`);
   }
   return combinedCommandOutput(res);
 }

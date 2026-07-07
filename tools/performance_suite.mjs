@@ -457,12 +457,16 @@ export function parseOpenAiCompletionOutput(text) {
   const content = body.choices?.[0]?.text ?? body.choices?.[0]?.message?.content ?? "";
   const promptTokens = body.usage?.prompt_tokens ?? null;
   const generatedTokens = body.usage?.completion_tokens ?? 0;
-  const promptTps = body.timings?.prompt_per_second ?? null;
-  const decodeTps = body.timings?.predicted_per_second ?? null;
+  const timings = body.timings ?? {};
+  const promptTps = timings.prompt_per_second ?? null;
+  const decodeTps = timings.predicted_per_second ?? null;
+  const timingPromptTokens = finiteTokenCount(timings.prompt_n);
+  const timingPromptMs = finiteMetric(timings.prompt_ms);
+  const prefillTokens = timingPromptTokens ?? promptTokens;
   return {
     promptTokens,
-    prefillTokens: promptTokens,
-    prefillMs: promptTokens != null && promptTps ? (promptTokens / promptTps) * 1000 : null,
+    prefillTokens,
+    prefillMs: timingPromptMs ?? (prefillTokens != null && promptTps ? (prefillTokens / promptTps) * 1000 : null),
     prefillTps: promptTps,
     generatedTokens,
     decodeMs: generatedTokens > 0 && decodeTps ? (generatedTokens / decodeTps) * 1000 : null,
@@ -573,6 +577,7 @@ export function outputQualityStatus(preview, generatedTokens = null) {
     /(?:^|[\s:])(?:\d+\.){12,}/.test(text) ||
     /(?:^|\n)\s*(\d+[.)])\s*(?:\n\s*\1\s*){11,}/.test(text) ||
     hasRepeatedNumberedItemText(text) ||
+    hasRepeatedLineText(text) ||
     /([#*_=-])\1{31,}/.test(text) ||
     /\b([A-Za-z]{3,})\1{8,}\b/.test(text)
   ) {
@@ -612,6 +617,33 @@ function hasRepeatedNumberedItemText(text) {
   return false;
 }
 
+function hasRepeatedLineText(text) {
+  const counts = new Map();
+  let previous = "";
+  let run = 0;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine
+      .toLowerCase()
+      .replace(/^\s*(?:[-*\u2022]|\d{1,3}[.)])\s+/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (line.length < 18) continue;
+
+    if (line === previous) {
+      run += 1;
+    } else {
+      previous = line;
+      run = 1;
+    }
+    if (run >= 3) return true;
+
+    const nextCount = (counts.get(line) ?? 0) + 1;
+    if (nextCount >= 4) return true;
+    counts.set(line, nextCount);
+  }
+  return false;
+}
+
 function scenarioNeedsOutputReview(scenario) {
   return outputQualityStatus(
     scenario?.zinc?.output_preview,
@@ -627,6 +659,8 @@ export function buildComparison(zincSummary, baselineSummary, options = {}) {
   const baselinePrefill = finiteMetric(baselineSummary.prefill_tps?.median ?? baselineSummary.prefill_tps?.avg ?? null);
   const zincPromptTokens = finiteTokenCount(zincSummary.prompt_tokens);
   const baselinePromptTokens = finiteTokenCount(baselineSummary.prompt_tokens);
+  const zincPrefillTokens = finiteTokenCount(zincSummary.prefill_tokens) ?? zincPromptTokens;
+  const baselinePrefillTokens = finiteTokenCount(baselineSummary.prefill_tokens) ?? baselinePromptTokens;
   const zincGeneratedTokens = finiteTokenCount(zincSummary.generated_tokens);
   const baselineGeneratedTokens = finiteTokenCount(baselineSummary.generated_tokens);
   const zincLatency = finiteMetric(zincSummary.total_latency_ms?.median ?? zincSummary.total_latency_ms?.avg ?? null);
@@ -638,10 +672,10 @@ export function buildComparison(zincSummary, baselineSummary, options = {}) {
   // Overall rating is a wall-clock comparison, not an average of prefill and
   // decode percentages. Each backend uses its own tokenizer counts; early-stop
   // rows do not get an aggregate percentage.
-  const zincOverallSeconds = backendPhaseSeconds(zincPrefill, zincDecode, zincPromptTokens, zincGeneratedTokens);
-  const baselineOverallSeconds = backendPhaseSeconds(baselinePrefill, baselineDecode, baselinePromptTokens, baselineGeneratedTokens);
-  const zincTotalPhaseTokens = (zincPromptTokens ?? 0) + (zincGeneratedTokens ?? 0);
-  const baselineTotalPhaseTokens = (baselinePromptTokens ?? 0) + (baselineGeneratedTokens ?? 0);
+  const zincOverallSeconds = backendPhaseSeconds(zincPrefill, zincDecode, zincPrefillTokens, zincGeneratedTokens);
+  const baselineOverallSeconds = backendPhaseSeconds(baselinePrefill, baselineDecode, baselinePrefillTokens, baselineGeneratedTokens);
+  const zincTotalPhaseTokens = (zincPrefillTokens ?? 0) + (zincGeneratedTokens ?? 0);
+  const baselineTotalPhaseTokens = (baselinePrefillTokens ?? 0) + (baselineGeneratedTokens ?? 0);
   const zincOverall = zincOverallSeconds && zincTotalPhaseTokens > 0 ? zincTotalPhaseTokens / zincOverallSeconds : null;
   const baselineOverall = baselineOverallSeconds && baselineTotalPhaseTokens > 0 ? baselineTotalPhaseTokens / baselineOverallSeconds : null;
   const overallComparable = matchingGeneratedBudget(zincGeneratedTokens, baselineGeneratedTokens, options.expectedGeneratedTokens);
@@ -956,6 +990,7 @@ function createStats(name, rows) {
   return {
     name,
     prompt_tokens: rows[0]?.promptTokens ?? null,
+    prefill_tokens: rows[0]?.prefillTokens ?? null,
     generated_tokens: rows[0]?.generatedTokens ?? null,
     output_preview: rows.find((row) => row.outputPreview)?.outputPreview ?? "",
     prefill_ms: summarizeValues(prefillMsValues),
@@ -968,6 +1003,31 @@ function createStats(name, rows) {
   };
 }
 
+function sanitizeSshDiagnostic(line) {
+  return line
+    .replace(/\b[A-Za-z_][A-Za-z0-9_.-]*@(?:\d{1,3}\.){3}\d{1,3}\b/g, "<user>@<host>")
+    .replace(/\b[A-Za-z_][A-Za-z0-9_.-]*@[A-Za-z0-9_.-]+\b/g, "<user>@<host>")
+    .replace(/(connect to host )\S+( port )\d+/i, "$1<host>$2<port>")
+    .replace(/(Could not resolve hostname )\S+/i, "$1<host>")
+    .replace(/(Connection (?:closed|reset) by )\S+/i, "$1<host>");
+}
+
+function remoteSshDiagnostic(error) {
+  const text = [error?.stderr, error?.stdout, error?.message ?? error]
+    .filter(Boolean)
+    .map(String)
+    .join("\n");
+  const diagnostic = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^(ssh:|Permission denied|Host key verification failed|Could not resolve hostname|Connection (?:closed|refused|reset|timed out)|No route to host|kex_exchange_identification:)/i.test(line));
+  return diagnostic ? sanitizeSshDiagnostic(diagnostic) : null;
+}
+
+export function remoteSshFailureSummary(error) {
+  return remoteSshDiagnostic(error) ?? "remote SSH command exited unsuccessfully before benchmark diagnostics were available";
+}
+
 export function benchmarkFailureReason(prefix, error) {
   const lines = String(error?.message ?? error ?? "unknown error")
     .split(/\r?\n/)
@@ -976,6 +1036,8 @@ export function benchmarkFailureReason(prefix, error) {
   const firstLine = lines[0] ?? "unknown error";
   const commandFailure = firstLine.match(/^Command failed \(([^)]+)\):/);
   if (commandFailure) {
+    const sshDiagnostic = remoteSshDiagnostic(error);
+    if (sshDiagnostic) return `${prefix}: ${sshDiagnostic}`;
     const diagnostic = lines
       .slice(1)
       .find((line) => /^(err\(|error:|.*\b(?:ENOMEM|QueueSubmitFailed|ShaderFileNotFound|FileNotFound)\b)/i.test(line));
@@ -1069,11 +1131,13 @@ const REMOTE_ZINC_TUNING_ENV_KEYS = [
   "ZINC_MOE_Q5K_Q8_1_DOWN_ACC",
   "ZINC_MOE_FUSED_GATE_UP",
   "ZINC_MOE_FUSED_GATE_UP_SWIGLU",
+  "ZINC_MOE_SINGLETON_TAIL_SPLIT",
   "ZINC_FUSE_MOE_DOWN_ACC",
   "ZINC_QWEN36_MOE_TOPK",
   "ZINC_QWEN36_MOE_PREFILL_TOPK",
   "ZINC_QWEN36_MOE_PREFILL_TOPK_GUARD",
   "ZINC_QWEN36_MOE_GROUPED_EXACT",
+  "ZINC_A3B_SHARED_F32_GATE_BATCH",
   "ZINC_INTEL_A3B_PRODUCTION",
   "ZINC_QWEN36_Q8_WIDE4_SSM_OUT",
   "ZINC_GEMMA_Q8_GEGLU_FUSED",
@@ -1552,6 +1616,7 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targ
     "-b", "4096",
     "-ub", "1024",
     "--flash-attn", "on",
+    "--no-cache-prompt",
   ];
   const launchScript = [
     "import os, subprocess",
@@ -1714,6 +1779,7 @@ function remoteCommand(commandText, creds) {
   if (creds.sshKey) {
     sshArgs.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
   }
+  sshArgs.push("-o", "ConnectTimeout=15");
   appendPasswordSshOptions(sshArgs, creds);
   if (process.env.ZINC_SSH_STRICT === "no") {
     sshArgs.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
@@ -1731,6 +1797,7 @@ function remoteDetachedCommand(commandText, creds) {
   if (creds.sshKey) {
     sshArgs.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
   }
+  sshArgs.push("-o", "ConnectTimeout=15");
   appendPasswordSshOptions(sshArgs, creds);
   if (process.env.ZINC_SSH_STRICT === "no") {
     sshArgs.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
@@ -1748,6 +1815,7 @@ function remoteSshTransport(creds) {
   if (creds.sshKey) {
     parts.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
   }
+  parts.push("-o", "ConnectTimeout=15");
   appendPasswordSshOptions(parts, creds);
   if (process.env.ZINC_SSH_STRICT === "no") {
     parts.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
@@ -2946,6 +3014,15 @@ async function verifyRemoteVulkanDevice(creds, requireSubstring, options = {}) {
   process.stdout.write(`[${targetId}] Vulkan device ${creds.vkDevice}: ${selected.name} (${selected.type})\n`);
 }
 
+async function verifyRemoteSshReachable(creds, options = {}) {
+  const nodeLabel = options.nodeLabel ?? "Remote node";
+  try {
+    await runShell(remoteCommand("true", creds), { cwd: ROOT, timeoutMs: 30000 });
+  } catch (error) {
+    throw new Error(`${nodeLabel} SSH preflight failed: ${remoteSshFailureSummary(error)}`);
+  }
+}
+
 async function runRdnaTarget(args) {
   const creds = await buildRdnaCreds(args);
   await prepareRdna(args, creds);
@@ -3485,6 +3562,7 @@ async function runCudaTarget(args) {
 async function runIntelTarget(args) {
   const config = await buildIntelConfig(args);
   const creds = config.creds;
+  await verifyRemoteSshReachable(creds, { nodeLabel: "Intel node" });
   await verifyRemoteVulkanDevice(creds, config.requireDeviceSubstring, {
     targetId: "intel",
     nodeLabel: "Intel node",
