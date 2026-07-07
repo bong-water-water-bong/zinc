@@ -610,6 +610,30 @@ fn dequantRow(raw_data: []const u8, row: u32, cols: u32, quant_type: GGMLType, o
                 out_i += 32;
             }
         },
+        .q2_0 => {
+            // Q2_0 1.58-bit ternary: 128 elems / 34 bytes (prism-ml Bonsai ternary).
+            // block: fp16 d (2 bytes) + qs[32] 2-bit codes LSB-first (32 bytes).
+            // value(j) = (int(code) - 1) * d, code ∈ {0,1,2,3} → {-1,0,+1,+2}.
+            const bsz: usize = 128;
+            const bpb_q20: usize = 34;
+            const bpr = @as(usize, cols) / bsz;
+            const row_off = @as(usize, row) * bpr * bpb_q20;
+
+            var out_i: usize = 0;
+            for (0..bpr) |b| {
+                const bo = row_off + b * bpb_q20;
+                const d_bits = std.mem.readInt(u16, raw_data[bo..][0..2], .little);
+                const d: f32 = @floatCast(@as(f16, @bitCast(d_bits)));
+                const qs = raw_data[bo + 2 .. bo + 34];
+                for (0..bsz) |j| {
+                    const byte_idx = j >> 2;
+                    const bit_off = (j & 3) * 2;
+                    const code: u32 = (@as(u32, qs[byte_idx]) >> @intCast(bit_off)) & 3;
+                    output[out_i + j] = (@as(f32, @floatFromInt(@as(i32, @intCast(code)) - 1))) * d;
+                }
+                out_i += bsz;
+            }
+        },
         else => {
             log.warn("Unsupported embedding quant type {d}, using zeros", .{@intFromEnum(quant_type)});
             @memset(output, 0);

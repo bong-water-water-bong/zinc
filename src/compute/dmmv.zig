@@ -370,6 +370,8 @@ pub const DmmvDispatch = struct {
     pipeline_q6k_wide: ?Pipeline,
     /// MXFP4 pipeline, or null.
     pipeline_mxfp4: ?Pipeline,
+    pipeline_stq1_0: ?Pipeline,
+    pipeline_q2_0: ?Pipeline,
     /// Q5_0 pipeline, or null.
     pipeline_q5_0: ?Pipeline,
     /// Q5_1 pipeline, or null.
@@ -981,6 +983,18 @@ pub const DmmvDispatch = struct {
         const mxfp4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_mxfp4.spv", .{shader_dir}) catch unreachable;
         const pipeline_mxfp4 = pipeline_mod.createFromSpirvWithOptions(instance, mxfp4_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("MXFP4 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const stq1_0_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_stq1_0.spv", .{shader_dir}) catch unreachable;
+        const pipeline_stq1_0 = pipeline_mod.createFromSpirvWithOptions(instance, stq1_0_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("STQ1_0 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const q2_0_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q2_0.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q2_0 = pipeline_mod.createFromSpirvWithOptions(instance, q2_0_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q2_0 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -2346,6 +2360,8 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k = pipeline_q4k,
             .pipeline_q4k_wide = pipeline_q4k_wide,
             .pipeline_mxfp4 = pipeline_mxfp4,
+            .pipeline_stq1_0 = pipeline_stq1_0,
+            .pipeline_q2_0 = pipeline_q2_0,
             .pipeline_q5_0 = pipeline_q5_0,
             .pipeline_q5_1 = pipeline_q5_1,
             .pipeline_q5k = pipeline_q5k,
@@ -2530,6 +2546,8 @@ pub const DmmvDispatch = struct {
         return switch (quant_type) {
             .q4_k => if (self.pipeline_q4k) |*p| p else null,
             .mxfp4 => if (self.pipeline_mxfp4) |*p| p else null,
+            .stq1_0 => if (self.pipeline_stq1_0) |*p| p else null,
+            .q2_0 => if (self.pipeline_q2_0) |*p| p else null,
             .q5_0 => if (self.pipeline_q5_0) |*p| p else null,
             .q5_1 => if (self.pipeline_q5_1) |*p| p else null,
             .q5_k => if (self.pipeline_q5k) |*p| p else null,
@@ -2593,7 +2611,7 @@ pub const DmmvDispatch = struct {
         };
 
         const workgroups_x = switch (quant_type) {
-            .mxfp4, .q8_0, .f16 => (M + 1) / 2,
+            .mxfp4, .q8_0, .f16, .stq1_0, .q2_0 => (M + 1) / 2,
             else => (M + 63) / 64,
         };
 
@@ -3218,7 +3236,7 @@ pub const DmmvDispatch = struct {
                 }
                 break :blk (M + 1) / 2; // fallback to K-parallel
             },
-            .q5_0, .q5_1, .mxfp4, .q8_0, .f16 => (M + 1) / 2,
+            .q5_0, .q5_1, .mxfp4, .q8_0, .f16, .stq1_0, .q2_0 => (M + 1) / 2,
             .f32 => M, // K-parallel: 64 threads per row via subgroupAdd
             else => (M + 63) / 64,
         };
@@ -6056,6 +6074,9 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_mul_mm_q5k_full_dp4a_k4096_bk2) |*p| p.deinit();
         if (self.pipeline_mul_mm_q5k_full_dp4a_k6144_n40) |*p| p.deinit();
         if (self.pipeline_quantize_act_q8_1) |*p| p.deinit();
+        if (self.pipeline_mxfp4) |*p| p.deinit();
+        if (self.pipeline_stq1_0) |*p| p.deinit();
+        if (self.pipeline_q2_0) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.* = undefined;
     }
