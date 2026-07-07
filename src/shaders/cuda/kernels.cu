@@ -6077,6 +6077,76 @@ extern "C" __global__ void gemma_attention_batched(const float* q, const float* 
     }
 }
 
+// ---- gemma_attention_batched_v2 — coalesced prefill attention ----------------
+// Same 3-pass softmax math as gemma_attention_batched, but pass 1 (scores) is
+// WARP-PER-KEY: the 32 lanes of a warp cooperate on ONE key's head_dim dot
+// product, reading CONTIGUOUS ki[lane], ki[lane+32], ... (one coalesced 128B
+// transaction) instead of the naive thread-per-key layout (256 threads reading
+// 256 keys strided by kv_stride => 32 separate transactions per element). Query
+// row staged once in shared. NOT bit-identical (warp-tree reduction reorders the
+// FMA sum vs the naive serial dot) — token-tolerance gate. Pass 2/3 unchanged.
+// Dynamic shared = (T + head_dim) floats. Opt-in ZINC_ATTN_V2.
+extern "C" __global__ void gemma_attention_batched_v2(const float* q, const float* k, const float* v,
+                                                      float* out, GemmaAttnBatchPush pc) {
+    extern __shared__ float smem[];
+    float* s_scores = smem;               // [T]
+    float* qsh = smem + pc.T;             // [head_dim]
+    __shared__ float s_m, s_inv;
+    unsigned head = blockIdx.x;
+    unsigned t = blockIdx.y;
+    if (t >= pc.T) return;
+    unsigned seq_len = t + 1u;
+    unsigned tid = threadIdx.x, hd = pc.head_dim, nthr = blockDim.x;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    const float* qh = q + ((size_t)t * pc.n_heads + head) * hd;
+    float scale = pc.scale_bits != 0u ? __uint_as_float(pc.scale_bits) : rsqrtf((float)hd);
+    unsigned start = 0;
+    if (pc.window != 0u && seq_len > pc.window) start = seq_len - pc.window;
+
+    for (unsigned d = tid; d < hd; d += nthr) qsh[d] = qh[d];
+    __syncthreads();
+
+    // Pass 1: warp-per-key coalesced dot -> s_scores[i].
+    unsigned warp = tid >> 5, lane = tid & 31u, nwarp = nthr >> 5;
+    for (unsigned i = start + warp; i < seq_len; i += nwarp) {
+        const float* ki = k + ((size_t)i * pc.n_kv_heads + kv_head) * hd;
+        float p = 0.0f;
+        for (unsigned d = lane; d < hd; d += 32u) p += qsh[d] * ki[d];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) p += __shfl_down_sync(0xffffffffu, p, o);
+        if (lane == 0u) s_scores[i] = p * scale;
+    }
+    __syncthreads();
+
+    // Pass 1b: block max.
+    float lmax = -3.4e38f;
+    for (unsigned i = start + tid; i < seq_len; i += nthr) lmax = fmaxf(lmax, s_scores[i]);
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0) s_m = lmax;
+    __syncthreads();
+    float mval = s_m;
+
+    // Pass 2: exp + sum.
+    float lsum = 0.0f;
+    for (unsigned i = start + tid; i < seq_len; i += nthr) {
+        float e = expf(s_scores[i] - mval);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0) s_inv = (lsum > 0.0f) ? 1.0f / lsum : 0.0f;
+    __syncthreads();
+    float inv = s_inv;
+
+    // Pass 3: out[t,head,d] = (sum_i e_i * V[i,d]) * inv  (coalesced, unchanged).
+    for (unsigned d = tid; d < hd; d += nthr) {
+        float acc = 0.0f;
+        for (unsigned i = start; i < seq_len; i++)
+            acc += s_scores[i] * v[((size_t)i * pc.n_kv_heads + kv_head) * hd + d];
+        out[((size_t)t * pc.n_heads + head) * hd + d] = acc * inv;
+    }
+}
+
 // ---- gemma_attention_batched_seq (Effort 28 1c: batched request DECODE) ------
 // Batched twin of gemma_attention for DECODE: B independent sequences, each at
 // its OWN position over its OWN KV slot, in ONE launch. block (head=blockIdx.x,
@@ -6400,6 +6470,82 @@ extern "C" __global__ void attention_causal_batched(const float* q, const float*
 
     // Pass 3: out[t,head,d] = (sum_i e_i V[i,d]) * rescale * inv.
     for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = 0; i < seq_len; i++)
+            acc += s_scores[i] * v[((size_t)i * pc.n_kv_heads + kv_head) * hd + d];
+        out[((size_t)t * pc.n_heads + head) * hd + d] = acc * rescale * inv;
+    }
+}
+
+// ---- attention_causal_batched_v2 — coalesced qwen prefill attention ----------
+// Coalesced twin of attention_causal_batched: pass 1 is WARP-PER-KEY (32 lanes
+// cooperate on one key's head_dim dot, contiguous ki reads + warp-shuffle reduce)
+// instead of thread-per-key strided reads. Query row staged in shared. Pass 2
+// (attention sinks / rescale) and pass 3 are byte-for-byte the naive kernel's.
+// NOT bit-identical (pass-1 reduction reorder) -> token-tolerance. Opt via
+// ZINC_ATTN_V2. Dynamic shared = (T + head_dim) floats.
+extern "C" __global__ void attention_causal_batched_v2(const float* q, const float* k, const float* v,
+                                                       const float* sinks, float* out, AttnBatchPush pc) {
+    extern __shared__ float smem2[];
+    float* s_scores = smem2;              // [T]
+    float* qsh = smem2 + pc.T;            // [head_dim]
+    __shared__ float s_m, s_rescale, s_inv;
+    unsigned head = blockIdx.x;
+    unsigned t = blockIdx.y;
+    if (t >= pc.T) return;
+    unsigned seq_len = t + 1u;
+    unsigned tid = threadIdx.x, hd = pc.head_dim, nthr = blockDim.x;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    const float* qh = q + ((size_t)t * pc.n_heads + head) * hd;
+    float scale = pc.attn_scale_bits != 0u ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)hd);
+
+    for (unsigned d = tid; d < hd; d += nthr) qsh[d] = qh[d];
+    __syncthreads();
+
+    // Pass 1: warp-per-key coalesced dot -> s_scores[i].
+    unsigned warp = tid >> 5, lane = tid & 31u, nwarp = nthr >> 5;
+    for (unsigned i = warp; i < seq_len; i += nwarp) {
+        const float* ki = k + ((size_t)i * pc.n_kv_heads + kv_head) * hd;
+        float p = 0.0f;
+        for (unsigned d = lane; d < hd; d += 32u) p += qsh[d] * ki[d];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) p += __shfl_down_sync(0xffffffffu, p, o);
+        if (lane == 0u) s_scores[i] = p * scale;
+    }
+    __syncthreads();
+
+    // Pass 1b: block max.
+    float lmax = -3.4e38f;
+    for (unsigned i = tid; i < seq_len; i += nthr) lmax = fmaxf(lmax, s_scores[i]);
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0) s_m = lmax;
+    __syncthreads();
+    float m = s_m;
+
+    // Pass 2: exp + sum, with attention sinks (byte-for-byte the naive kernel).
+    float lsum = 0.0f;
+    for (unsigned i = tid; i < seq_len; i += nthr) {
+        float e = expf(s_scores[i] - m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0) {
+        float sum = lsum, rescale = 1.0f, final_sum = lsum;
+        float sink_val = sinks[pc.sink_offset + head];
+        if (sink_val == sink_val) {
+            float sink_max = fmaxf(m, sink_val);
+            rescale = (sum > 0.0f) ? expf(m - sink_max) : 0.0f;
+            final_sum = sum * rescale + expf(sink_val - sink_max);
+        }
+        s_rescale = rescale;
+        s_inv = (final_sum > 0.0f) ? 1.0f / final_sum : 0.0f;
+    }
+    __syncthreads();
+    float rescale = s_rescale, inv = s_inv;
+
+    // Pass 3: out[t,head,d] = (sum_i e_i V[i,d]) * rescale * inv (unchanged).
+    for (unsigned d = tid; d < hd; d += nthr) {
         float acc = 0.0f;
         for (unsigned i = 0; i < seq_len; i++)
             acc += s_scores[i] * v[((size_t)i * pc.n_kv_heads + kv_head) * hd + d];

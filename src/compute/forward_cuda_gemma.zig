@@ -188,6 +188,7 @@ const Pipelines = struct {
     rope: CudaPipeline,
     gemma_attention: CudaPipeline,
     gemma_attention_batched: CudaPipeline,
+    gemma_attention_v2: CudaPipeline, // coalesced warp-per-key prefill attention (ZINC_ATTN_V2)
     gemma_attention_batched_seq: CudaPipeline, // Effort 28 1c: batched-decode per-seq slot attn
     geglu: CudaPipeline,
     scale_accumulate: CudaPipeline,
@@ -449,6 +450,7 @@ pub const ForwardGemma = struct {
     use_tc_m64: bool = false, // cycle 15 A/B: ZINC_BATCHED_TC_M64 kill-switch forces the prior 24 KB-shared Q4_K TC kernel (cycle 12 default); the new default is the 8 KB-shared lowsmem kernel (+11.6%, byte-identical)
     use_tc_q6_lowsmem: bool = false, // cycle 16 A/B: ZINC_BATCHED_TC_Q6_LOWSMEM opts INTO the 8 KB-shared lowsmem Q6_K TC kernel (gemm_q6k_tc_f16a_lowsmem). Byte-identical to the default 24 KB m64 Q6_K kernel but in-noise on perf (Q6_K is ~1/7 of the dense GEMM → its occupancy win is below the box's boost floor; 2 ABBA runs nominally -1/-5%) → kept OPT-IN, the proven m64 kernel stays the default.
     use_grouped: bool = false, // cycle 18: ZINC_BATCHED_EXPERTS_GROUPED opts into token-GROUPED routed experts (build_expert_order + grouped matvecs → expert weight L2-resident across its tokens). Byte-identical to the cycle-8 _batched path; opt-in pending a measured win.
+    use_attn_v2: bool = false, // ZINC_ATTN_V2: coalesced warp-per-key prefill attention (token-tolerance). A/B before default.
     use_tc_experts: bool = false, // T2: ZINC_MOE_TC routes the routed gate/up AND Q5_1 down experts through the fp16 Tensor cores (single-launch padded grouped-TC GEMMs: build_expert_order_padded → gemm_q4k_experts_grouped_tc gate/up + gemm_q5_1_experts_grouped_tc down). fp16 → token-tolerance gate, not bit-identical. DEFAULT-ON (opt out ZINC_MOE_TC=0/off), T-gated by moe_tc_min_t (the grouped TC GEMM pads each expert run to a 64-token tile, so it only beats the matvec once T is large enough to fill the tiles).
     tc_experts_forced: bool = false, // T2: ZINC_MOE_TC was set to an EXPLICIT truthy value (1/on/...) → force the grouped TC experts at ANY T, bypassing moe_tc_min_t. Lets validate_catalog exercise the TC path with a short prompt (set ZINC_MOE_TC=1). Unset env = default-on-but-gated; falsy = off.
     moe_tc_min_t: u32 = 256, // T2: only route the routed experts through the grouped TC GEMM when the prefill batch T >= this. RE-MEASURED 2026-06-22 after the FULL expert FFN moved onto TC (gate/up Q4_K + Q5_1 down all grouped-TC) — the crossover dropped well below the old 512 gate because the per-tile fixed cost is now amortized over the whole expert FFN, not just gate/up. 4090 / gemma-26b, single main binary, ZINC_MOE_TC=1 (forced TC) vs =0 (matvec), order-alternated to de-bias the cold-start boost lottery: T=256 tc-first TC/MV=1.556, mv-first 1.202 (TC wins +20% even when matvec gets the order/boost advantage) → geomean +37%; an earlier cold round was +21% tc-first. Gate lowered 512→256: T=256 is the decisive zero-regression crossover (de-biased lower bound +20%); below 256 the padded per-expert tiles are mostly empty (P=n_used*T over n_experts buckets, ~65 tok/expert at T=256 fills the 64-tile) so the proven _batched matvec stays. Earlier (gate/up-only on TC) crossover was T=512. Mirrors cublas_min_t.
@@ -557,6 +559,7 @@ pub const ForwardGemma = struct {
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.gemma_attention = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention");
         pipes.gemma_attention_batched = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention_batched");
+        pipes.gemma_attention_v2 = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention_batched_v2");
         pipes.gemma_attention_batched_seq = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention_batched_seq");
         pipes.geglu = try pipeline.createPipeline(ctx, src.ptr, "geglu");
         pipes.scale_accumulate = try pipeline.createPipeline(ctx, src.ptr, "scale_accumulate");
@@ -932,6 +935,15 @@ pub const ForwardGemma = struct {
         // the cycle-8 launch batching). Byte-identical output (same per-block math; each
         // output computed once). Off → the proven cycle-8 _batched matvecs.
         self.use_grouped = std.posix.getenv("ZINC_BATCHED_EXPERTS_GROUPED") != null;
+        // DEFAULT-ON (opt out ZINC_ATTN_V2=0/off/false/no): coalesced warp-per-key
+        // prefill attention — validated token-identical to the naive kernel + ~+8%
+        // gemma-26b prefill on the 5090 (softmax was 271ms/28% of prefill).
+        self.use_attn_v2 = blk: {
+            if (std.posix.getenv("ZINC_ATTN_V2")) |e| break :blk !(std.mem.eql(u8, e, "0") or
+                std.ascii.eqlIgnoreCase(e, "off") or std.ascii.eqlIgnoreCase(e, "false") or
+                std.ascii.eqlIgnoreCase(e, "no"));
+            break :blk true;
+        };
         self.use_tc_experts = moeTcDefaultOn();
         self.tc_experts_forced = moeTcForced();
         // Cycle 19: ZINC_BATCHED_TC_SHAREA shares one f32→f16 activation recast across
@@ -1131,7 +1143,11 @@ pub const ForwardGemma = struct {
             .scale_bits = @bitCast(@as(f32, 1.0)),
             .window = window,
         };
-        cmd.dispatch(&self.pipes.gemma_attention_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &b.attn_out }, &attn, @sizeOf(GemmaAttnBatchPush), T * 4);
+        if (self.use_attn_v2) {
+            cmd.dispatch(&self.pipes.gemma_attention_v2, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &b.attn_out }, &attn, @sizeOf(GemmaAttnBatchPush), (T + g.head_dim) * 4);
+        } else {
+            cmd.dispatch(&self.pipes.gemma_attention_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &b.attn_out }, &attn, @sizeOf(GemmaAttnBatchPush), T * 4);
+        }
 
         // Batched O projection then the fused post-attention norm + residual add.
         self.gemmDispatch(&cmd, wo, &b.attn_out, &b.o, d.n_embd, g.q_dim, T);
