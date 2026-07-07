@@ -1,0 +1,84 @@
+# MULTI-HOUR EFFORT 30 — CUDA RTX 5090 PREFILL: close the llama.cpp gap
+
+**Goal:** improve ZINC prompt-**prefill** throughput on the RTX 5090 toward / past
+llama.cpp, one validated increment per cycle. Decode is already ~85-90% of llama;
+prefill is the structural gap.
+
+## Current state (2026-07-06, after the attention-coalescing win landed on main)
+
+The single biggest cheap win of this effort is DONE and on main:
+**coalesced warp-per-key prefill attention (`gemma_attention_batched_v2`,
+`attention_causal_batched_v2`, default-on `ZINC_ATTN_V2`).** It fixed the naive
+uncoalesced pass-1 score loop (256 threads read 256 keys strided by kv_stride →
+~32 uncoalesced txns/element). Measured on the 5090:
+- **gemma-31b (dense): +53% prefill (552→847 t/s), gap to llama 6.0×→3.9×** ← headline
+- gemma-26b (MoE): +7% (experts dilute it)
+- qwen: marginal (attention is a small fraction of SSM-heavy qwen prefill)
+
+## Measure-FIRST discipline (this is how the win was found — honor it)
+
+Phase-profile before optimizing. Tools already in the tree:
+- `ZINC_PREFILL_PROFILE=1` (qwen path, forward_cuda.zig) → `attn/ssm/ffn` split.
+- `ZINC_SSM_PROFILE=1` → SSM `scan` timing.
+- For gemma, add throwaway `waitPending`+`nanoTimestamp` phase timers (single
+  stream → GPU order unchanged → reliable RELATIVE breakdown; revert, never commit).
+The BT=32 negative below was the ONE guess made without profiling — it was neutral.
+
+## Gemma-26b MoE prefill phase split (T=1042, post-v2): attn 312 / experts 264 / shared 133 / router 23 / combine 24 ms
+## Qwen prefill: SSM dominates (qwen35-9b 52% / qwen36-27b 80% / a3b ~65%); the SCAN is cheap (5-9ms/layer) — the cost is the SSM PROJECTION GEMMs (all cuBLAS-eligible).
+
+## Candidate levers (priority = EV × tractability). Pick ONE per cycle, profile-gate it.
+
+1. **Flash-attention for dense (highest EV — v2's +53% proves attention work pays
+   off on dense).** v2 still uses a 3-pass materialized-scores softmax
+   (`gemma_attention_batched_v2`). A query-tiled online-softmax kernel (load K/V
+   tiles to shared, reuse across a query tile, running max/sum) cuts K/V re-reads
+   and avoids full-score materialization. HARD: online-softmax numerics — gate
+   HARD on token-identity to the default kernel. gemma-31b (dense, all-attention)
+   is the best target + measurement.
+2. **QKV projection fusion** (attention GEMMs, ~200ms): Q/K/V read the SAME b.norm
+   input with 3 separate cuBLAS GEMMs → one grouped/concatenated GEMM (dequant 3
+   weights into one fp16 buffer, one cublasGemmEx, slice outputs). Watch the
+   gemma SWA/global V-variant (some layers have no separate Wv). Modest (+2-5%).
+3. **qwen SSM conv1d** (`ssm_conv1d_batched`, F32): grid `conv_channels/64` = low
+   block count (160 for 27b, ~1 block/SM). Possible naive-parallelism win, but
+   it's a small fraction of the SSM — PROFILE its share first.
+4. **int8 MMQ TC GEMM** (LAST resort, hard, uncertain): the only lever left for
+   the cuBLAS GEMM wall. Reads Q4_K nibbles as int8, Q8_1 activation, `mma.sync
+   s8.s8.s32` (2× TC rate). The correct-SASS CUBIN path exists + is integrated
+   (ZINC_PREFILL_MMA, output token-correct). BUT the Q4_K-asymmetric per-subblock
+   store-rescale EPILOGUE TAX is STRUCTURAL (a prior microbench killed int8 to
+   <1.3×). Only attempt with an isolated microbench gate (≥1.3× vs cuBLAS) BEFORE
+   wiring. Multi-cycle.
+
+## Dead ends — DO NOT re-litigate (all tested this effort, negative)
+- **BT=32 MoE expert tiles**: neutral (padding not the bottleneck; weight-dequant-ALU-bound).
+- **qwen attention v2**: marginal (attention small in SSM-heavy qwen) — opt-in, don't default-on.
+- **fp16 weight cache / ZINC_PREFILL_F16**: warm/serving-only; −24% on cold single prefill.
+- **CUBIN fp16 mma (gemm_q4k_mma_lowsmem, Q4_K-direct TC)**: −11% vs cuBLAS. The
+  fp16-TC = cuBLAS-parity ceiling is REAL (correct SASS, still loses). fp16 hand
+  GEMM is DEAD; only int8 could beat cuBLAS, gated by the epilogue-tax microbench.
+- **Prefill CUDA graphs / TC-default micro-opts / m128 / normf16 / FP8**: all prior negatives.
+
+## HARD RULES (override the generic playbook)
+- **Pin the 5090**: `export CUDA_VISIBLE_DEVICES=GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350`
+  and `ZINC_GPU=` the same. The 4090 (GPU-e59a6fce-…) may be used by other loops.
+- **Box build dir `~/zinc-harvest`** (a full main checkout, NOT a git repo — rsync
+  the WHOLE worktree `./ dest/` single-source, never multi-source+--delete which
+  scrambles the tree). Build: `~/zig-0.15.2/zig build -Dbackend=cuda -Dshaders=false -Doptimize=ReleaseFast`.
+- **Correctness gate**: `validate_catalog.sh` is UNUSABLE in a non-.git box tree
+  (its `zig build cuda-dbg` auto-RUNS the binary → FileNotFound). Gate instead on
+  **default-vs-change greedy token match** (`--prompt "<real text>" --raw -n 20`,
+  compare the `Output (…)` line): a change that is token-identical to the shipped
+  default is as-correct-as-default. For token-tolerance kernels (reduction reorder)
+  require the tokens to MATCH on ≥2 real prompts across gemma-26b + gemma-31b.
+- **A/B**: interleaved ABBA, ≥4 rounds, discard the cold first round; the box has
+  ~±10% boost noise — require a consistent multi-round win. `Prefill complete: … tok/s` is on STDERR (2>&1). Models reload per process (gemma-31b 18GB ~90s).
+- **Git**: the main checkout `/Users/stepan/Workspace/zinc` may be owned by a
+  parallel loop → `git checkout` can abort. Use `git worktree add` for all branch
+  work; commit ONLY your scoped change to a `perf/e30-<target>` branch and push it
+  (NEVER main). If a win, append a dated entry here + to `project_effort26_beat_llama` memory.
+- Revert + log negatives (they're valuable). Clean box scratch. STOP after one increment.
+
+## Cycle log
+(append dated one-liners per cycle: target, verdict, branch)
