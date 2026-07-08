@@ -666,3 +666,47 @@ test "MetadataValue conversions" {
     const v_u32_bool = MetadataValue{ .uint32 = 0 };
     try std.testing.expectEqual(false, v_u32_bool.asBool().?);
 }
+
+test "q2_0/stq1_0/nvfp4 block sizes" {
+    // q2_0 (Bonsai ternary): 128 elements, 34 bytes per block
+    try std.testing.expectEqual(@as(u32, 128), GGMLType.q2_0.blockSize());
+    try std.testing.expectEqual(@as(u32, 34), GGMLType.q2_0.bytesPerBlock());
+
+    // stq1_0 (AngelSlim Sherry): 256 elements, 42 bytes per block
+    try std.testing.expectEqual(@as(u32, 256), GGMLType.stq1_0.blockSize());
+    try std.testing.expectEqual(@as(u32, 42), GGMLType.stq1_0.bytesPerBlock());
+
+    // nvfp4 (NVIDIA FP4): 32 elements, 17 bytes per block
+    try std.testing.expectEqual(@as(u32, 32), GGMLType.nvfp4.blockSize());
+    try std.testing.expectEqual(@as(u32, 17), GGMLType.nvfp4.bytesPerBlock());
+
+    // q1_0: 32 elements, 5 bytes per block
+    try std.testing.expectEqual(@as(u32, 32), GGMLType.q1_0.blockSize());
+    try std.testing.expectEqual(@as(u32, 5), GGMLType.q1_0.bytesPerBlock());
+}
+
+test "TensorInfo sizeBytes q2_0/stq1_0/nvfp4" {
+    inline for (.{ .q2_0, .stq1_0, .nvfp4, .q1_0 }) |type_| {
+        const t = TensorInfo{
+            .name = "test",
+            .n_dims = 2,
+            .dims = .{ 4096, 4096, 1, 1 },
+            .type_ = type_,
+            .offset = 0,
+        };
+        const n_elems: u64 = 4096 * 4096;
+        const bs: u64 = type_.blockSize();
+        const bpb: u64 = type_.bytesPerBlock();
+        const blocks = (n_elems + bs - 1) / bs;
+        const expected = blocks * bpb;
+        try std.testing.expectEqual(expected, t.sizeBytes());
+    }
+}
+
+test "GGMLType enum id 42 is stq1_0" {
+    // @enumFromInt(42) must give .stq1_0 (the enum's declared value).
+    // q2_0 is at 1000; the disambiguation pass in parseWithOptions
+    // reassigns to .q2_0 when the tensor data size matches 128/34.
+    try std.testing.expectEqual(GGMLType.stq1_0, @as(GGMLType, @enumFromInt(42)));
+    try std.testing.expectEqual(GGMLType.q2_0, @as(GGMLType, @enumFromInt(1000)));
+}
