@@ -1151,7 +1151,13 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "ZINC_MOE_Q6K_SUFFIX_COMPARE", 23000);
     try expectContains(forward, "ZINC_MOE_Q6K_SUFFIX_COMPARE: layer=");
     try expectContains(forward, "q6_suffix_compare_routes[sample_i]");
-    try expectContains(forward, "else\n            exact_grouped;");
+    try expectContains(forward, "fn qwenA3bQ6MoeColsRequestedForLayer(layer: u32, default_value: bool) bool");
+    try expectContains(forward, "std.posix.getenv(\"ZINC_MOE_Q6K_COLS\") orelse return default_value");
+    try expectContains(forward, "const prefix = \"layers=\";");
+    try expectContains(forward, "std.mem.splitScalar(u8, raw[prefix.len..], ',')");
+    try expectContains(forward, "const q6_cols_default_on = exact_grouped or");
+    try expectContains(forward, "(self.isQwen36A3bMoePrefillModel() and layer == 34)");
+    try expectContainsNear(forward, "fn prefillRunTop1MoePrefixGrouped(", "qwenA3bQ6MoeColsRequestedForLayer(layer, q6_cols_default_on)", 12000);
     try expectContains(forward, "prefix_tokens * hidden_dim");
     try expectContainsNear(forward, "suffix_route_count", "suffix_k", 80);
     try expectContainsNear(forward, "suffix_route_count", "prefix_tokens", 120);

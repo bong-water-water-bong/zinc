@@ -2042,6 +2042,42 @@ produce a clean win. Removed the flag and the in-command MoE recording hook.
 Next submit-reduction attempts need a larger unit of fusion than just SSM+MoE
 within one layer, or they need to keep multiple layer command buffers in flight.
 
+Accepted Q6_K layer-34 grouped-down default (2026-07-08): added a diagnostic
+selector for `ZINC_MOE_Q6K_COLS=layers=...`, then used it to isolate the Q6_K
+routed-column correctness gap. On the 300-token RDNA A3B calibration prompt,
+layer 1 alone changed the first generated tokens, while layer 34 alone preserved
+the default token stream and removed one fallback island.
+
+Selector probe, same remote build:
+
+| mode | prefill | output |
+|---|---:|---|
+| default | `616.21 tok/s` | `{248046}` |
+| `layers=1` | `1177.39 tok/s` | changed, 16-token continuation |
+| `layers=34` | `891.54 tok/s` | `{248046}` |
+| `layers=1,34` | `854.14 tok/s` | changed, same as all-Q6 continuation |
+| `1` / all eligible | `856.81 tok/s` | changed, same as `layers=1,34` |
+
+Layer-34 diagnostic replay was numerically tight:
+`ZINC_MOE_Q6K_COLS_COMPARE=1 ZINC_MOE_Q6K_COLS=layers=34` reported
+`max_abs=5.96e-8`, `mean_abs=7.00e-9`, `invalid_routes=0` for layer 34.
+Three extra short prompts matched output-token sequences exactly with layer 34
+enabled. After making Qwen A3B layer 34 default-on and leaving layer 1 opt-in,
+old-forced versus new-default no-profile repeats on the 300-token prompt were:
+
+| mode | samples | median | output |
+|---|---:|---:|---|
+| `ZINC_MOE_Q6K_COLS=0` | `802.60`, `988.08`, `803.51` tok/s | `803.51 tok/s` | `{248046}` |
+| new default | `1284.97`, `916.80`, `883.34` tok/s | `916.80 tok/s` | `{248046}` |
+
+Profile of the new default on the same prompt: `734.94 tok/s` with profiling
+overhead; MoE `143.4 ms`, SSM `135.8 ms`, attention `37.3 ms`, shared `8.2 ms`.
+Path mask: `grouped=0x3ffffffffd`, `fallback=0x4000000002`, so layers 1 and 38
+remain fallback. Route-pack occupancy remains poor (`41.6%` utilization,
+`79.6%` tail blocks), but the immediately actionable correctness blocker is
+layer 1; the broader performance targets are now SSM qkv/z and SSM out
+projection, plus reducing route-pack tail waste.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:

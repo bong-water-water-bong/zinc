@@ -1039,6 +1039,28 @@ fn envFlagEnabled(comptime name: []const u8, default_value: bool) bool {
         !std.ascii.eqlIgnoreCase(raw, "no");
 }
 
+fn qwenA3bQ6MoeColsRequestedForLayer(layer: u32, default_value: bool) bool {
+    const raw = std.posix.getenv("ZINC_MOE_Q6K_COLS") orelse return default_value;
+    if (std.mem.eql(u8, raw, "0") or
+        std.ascii.eqlIgnoreCase(raw, "off") or
+        std.ascii.eqlIgnoreCase(raw, "false") or
+        std.ascii.eqlIgnoreCase(raw, "no"))
+    {
+        return false;
+    }
+    const prefix = "layers=";
+    if (!std.mem.startsWith(u8, raw, prefix)) return raw.len > 0;
+
+    var parts = std.mem.splitScalar(u8, raw[prefix.len..], ',');
+    while (parts.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) continue;
+        const selected_layer = std.fmt.parseInt(u32, part, 10) catch continue;
+        if (selected_layer == layer) return true;
+    }
+    return false;
+}
+
 fn prefillProfileRequested() bool {
     return envFlagEnabled("ZINC_PREFILL_PROFILE", false);
 }
@@ -19882,13 +19904,11 @@ pub const InferenceEngine = struct {
         const down_exps = lt.ffn_down_exps orelse return inactive;
         if (self.dmmv.moePipelineForType(gate_exps.info.type_) == null) return inactive;
         if (self.dmmv.moePipelineForType(up_exps.info.type_) == null) return inactive;
-        const q6_cols_requested = if (std.posix.getenv("ZINC_MOE_Q6K_COLS")) |raw|
-            !(std.mem.eql(u8, raw, "0") or
-                std.ascii.eqlIgnoreCase(raw, "off") or
-                std.ascii.eqlIgnoreCase(raw, "false") or
-                std.ascii.eqlIgnoreCase(raw, "no"))
-        else
-            exact_grouped;
+        // Layer 34 is late enough to keep sampled outputs stable while removing
+        // one expensive token-fallback island from Qwen A3B prefill.
+        const q6_cols_default_on = exact_grouped or
+            (self.isQwen36A3bMoePrefillModel() and layer == 34);
+        const q6_cols_requested = qwenA3bQ6MoeColsRequestedForLayer(layer, q6_cols_default_on);
         // Q6_K routed columns match CPU dequant replay. Keep them opt-in for
         // the older approximate top-1 prefix path, but allow them by default
         // for exact grouped A3B prefill where the shared expert is batched too.
