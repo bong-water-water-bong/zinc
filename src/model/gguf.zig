@@ -408,9 +408,7 @@ pub fn parseWithOptions(data: []const u8, allocator: std.mem.Allocator, options:
         }
 
         const raw_type = reader.readU32();
-        // Disambiguate GGML type id 42: Q2_0 (Bonsai ternary, 128/34) vs stq1_0 (AngelSlim, 256/42).
-        // Default to Q2_0 (the Bonsai format used by prism-ml/Ternary-Bonsai-*-gguf).
-        const type_: GGMLType = if (raw_type == 42) .q2_0 else @enumFromInt(raw_type);
+        const type_: GGMLType = @enumFromInt(raw_type);
         const offset = reader.readU64();
 
         try tensors.append(allocator, .{
@@ -430,6 +428,56 @@ pub fn parseWithOptions(data: []const u8, allocator: std.mem.Allocator, options:
         break :blk 32;
     };
     const tensor_data_offset = (reader.pos + alignment - 1) & ~(alignment - 1);
+
+    // ── Disambiguate GGML type id 42 ──────────────────────────────────
+    // GGML type id 42 is shared by two formats:
+    //   stq1_0 (AngelSlim Sherry): block_size=256, bytes_per_block=42 (1.3125 bpw)
+    //   q2_0   (Bonsai ternary):   block_size=128, bytes_per_block=34 (2.125 bpw)
+    //
+    // GGUF type id = 42 is officially stq1_0, but some older GGUF writers
+    // used 42 for q2_0 before it was reassigned to its current id (1000).
+    // Since 128 divides 256, element-count modulo alone cannot distinguish
+    // them — we need the actual tensor data size, which we derive from the
+    // offset delta to the next tensor (or to tensor_data_offset for the
+    // last tensor).
+    // ──────────────────────────────────────────────────────────────────
+    {
+        const stq1_0_bs: u64 = GGMLType.stq1_0.blockSize();
+        const stq1_0_bpb: u64 = GGMLType.stq1_0.bytesPerBlock();
+        const q2_0_bs: u64 = GGMLType.q2_0.blockSize();
+        const q2_0_bpb: u64 = GGMLType.q2_0.bytesPerBlock();
+
+        for (tensors.items, 0..) |*tensor, i| {
+            // Only tensors with raw type id 42 need disambiguation.
+            // @enumFromInt(42) gives .stq1_0; if the tensor was
+            // originally q2_0, we must reassign.
+            if (@intFromEnum(tensor.type_) != 42) continue;
+
+            const n_elems = tensor.numElements();
+            const actual_size: u64 = if (i + 1 < tensors.items.len)
+                tensors.items[i + 1].offset - tensor.offset
+            else
+                break; // Last tensor — cannot disambiguate; keep .stq1_0
+
+            const stq1_0_blocks = (n_elems + stq1_0_bs - 1) / stq1_0_bs;
+            const stq1_0_size = stq1_0_blocks * stq1_0_bpb;
+            const q2_0_blocks = (n_elems + q2_0_bs - 1) / q2_0_bs;
+            const q2_0_size = q2_0_blocks * q2_0_bpb;
+
+            if (actual_size == stq1_0_size and actual_size != q2_0_size) {
+                // Only stq1_0 geometry fits — must be stq1_0
+                tensor.type_ = .stq1_0;
+            } else if (actual_size == q2_0_size and actual_size != stq1_0_size) {
+                // Only q2_0 geometry fits — must be Bonsai ternary
+                tensor.type_ = .q2_0;
+            } else if (actual_size == stq1_0_size and actual_size == q2_0_size) {
+                // Both geometries match — default to q2_0 (backward compat
+                // with older Bonsai ternary models that used type id 42).
+                tensor.type_ = .q2_0;
+            }
+            // If neither matches, keep .stq1_0 (the enum-correct default).
+        }
+    }
 
     return GGUFFile{
         .version = version,
