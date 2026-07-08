@@ -594,15 +594,37 @@ pub fn load(
 
     var total_vram: u64 = 0;
     var total_host_visible: u64 = 0;
-    for (gf.tensors.items) |tensor_info| {
+    const n_tensors = gf.tensors.items.len;
+    log.info("Uploading {d} tensors to GPU (VRAM budget: {d} MB)", .{
+        n_tensors,
+        instance.vramBytes() / (1024 * 1024),
+    });
+    for (gf.tensors.items, 0..) |tensor_info, ti| {
         const tensor_size = tensor_info.sizeBytes();
+        log.info("[{d}/{d}] '{s}' | type={s} | {d} bytes ({d:.2} MB)", .{
+            ti + 1,
+            n_tensors,
+            tensor_info.name,
+            @tagName(tensor_info.type_),
+            tensor_size,
+            @as(f64, @floatFromInt(tensor_size)) / (1024.0 * 1024.0),
+        });
+
         const data_offset = gf.tensor_data_offset + tensor_info.offset;
         const src_data = mmap_data[data_offset..][0..@intCast(tensor_size)];
         const offload = shouldOffloadToHost(tensor_info.name);
 
+        log.info("  → allocating GPU buffer ({s})", .{if (offload) "host-visible" else if (instance.is_unified_memory) "unified-device" else "device-local"});
         var gpu_buf = blk: {
             if (offload) {
                 break :blk try Buffer.initHostVisibleStorage(instance, tensor_size);
+            } else if (instance.is_unified_memory) {
+                break :blk try Buffer.initDeviceLocalAndUpload(
+                    instance,
+                    tensor_size,
+                    vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    src_data,
+                );
             } else {
                 break :blk try Buffer.initDeviceLocal(
                     instance,
@@ -614,14 +636,19 @@ pub fn load(
         errdefer gpu_buf.deinit();
 
         if (offload) {
-            // Host-visible: GPU reads directly over PCIe; memcpy from mmap, no staging.
+            log.info("  → uploading to host-visible memory", .{});
             gpu_buf.upload(src_data);
             total_host_visible += tensor_size;
+        } else if (instance.is_unified_memory) {
+            log.info("  → unified memory: data already uploaded during allocation", .{});
+            total_vram += tensor_size;
         } else {
-            // Device-local: stage in host memory, then GPU-side copy into VRAM.
+            log.info("  → creating staging buffer ({d} bytes)", .{tensor_size});
             var staging = try Buffer.initStaging(instance, tensor_size);
             defer staging.deinit();
+            log.info("  → uploading to staging", .{});
             staging.upload(src_data);
+            log.info("  → copying staging → device-local (vkCmdCopyBuffer)", .{});
             try buffer_mod.copyBuffer(instance, cmd_pool.handle, &staging, &gpu_buf, tensor_size);
             total_vram += tensor_size;
         }
