@@ -2121,6 +2121,23 @@ Rejected and removed. The default qkv/z DP4a math is not interchangeable with
 the older Q8 branches under the current coherence gate; future work should look
 inside the DP4a kernel/quantizer rather than bypassing it.
 
+Rejected Q8 DP4a fixed-K specialization (2026-07-08): temporarily added
+`mul_mm_q8_0_full_dp4a` pipeline variants with `SPEC_K=2048` and `SPEC_K=4096`,
+selected by default for the A3B Q8 DP4a path, with `ZINC_Q8_DP4A_SPEC_K=0` to
+force the generic pipeline. Output stayed stable, but the speed signal was flat
+to worse:
+
+| mode | samples | median | output |
+|---|---:|---:|---|
+| fixed-K pipelines | `894.72`, `942.51`, `901.51` tok/s | `901.51 tok/s` | `{248046}` |
+| generic pipeline | `1285.22`, `896.66`, `891.31` tok/s | `896.66 tok/s` | `{248046}` |
+
+Profile check was clearly worse for fixed-K in the hot SSM-out projection:
+fixed-K profile `826.80 tok/s`, SSM `130.7 ms`, `qkv_z=37.4 ms`,
+`out_proj=38.4 ms`; generic profile `1164.81 tok/s`, SSM `89.7 ms`,
+`qkv_z=36.0 ms`, `out_proj=17.4 ms`. Rejected and removed. The generic shader
+variant appears to compile better on this RDNA stack than the `SPEC_K` variants.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:
