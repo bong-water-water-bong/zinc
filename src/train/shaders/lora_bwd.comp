@@ -47,47 +47,92 @@ layout(push_constant) uniform Push {
     uint grad_b_off;
 } push;
 
+// Shared-memory cache for x and dy.  When K or M exceeds 2048 the
+// shader falls back to direct global-memory reads to avoid overflow;
+// shared memory is only used when both dimensions fit.
 shared float s_x[2048];
 shared float s_dy[2048];
+shared float s_partial[64]; // reduction scratch
+
+float f16_from_u16(uint w) {
+    // Correct f16→f32 via float16_t constructor (not raw integer cast).
+    return float(float16_t(w & 0xFFFFu));
+}
 
 void main() {
     uint t = gl_LocalInvocationID.x;
     uint r = gl_GlobalInvocationID.x;
     if (r >= push.R) return;
 
-    // Load x and dy into shared
-    for (uint k = t; k < push.K; k += 64) {
-        s_x[k] = x_data[push.x_off + k];
+    // ── Load x and dy ────────────────────────────────────────────────
+    // Use shared memory when dimensions fit; fall back to direct
+    // global-memory reads when the cache would overflow s_x[2048]/s_dy[2048].
+    bool use_shared_x = (push.K <= 2048);
+    bool use_shared_y = (push.M <= 2048);
+
+    if (use_shared_x) {
+        for (uint k = t; k < push.K; k += 64) {
+            s_x[k] = x_data[push.x_off + k];
+        }
     }
-    for (uint m = t; m < push.M; m += 64) {
-        s_dy[m] = dy_data[push.dy_off + m];
+    if (use_shared_y) {
+        for (uint m = t; m < push.M; m += 64) {
+            s_dy[m] = dy_data[push.dy_off + m];
+        }
     }
     memoryBarrierShared();
     barrier();
 
-    // A[r] · dy (scalar)
-    float a_dot_dy = 0.0;
-    for (uint m = 0; m < push.M; m++) {
-        uint w = a_data[push.a_off + r * push.M + m];
-        float av = float(uint16_t(w & 0xFFFFu));
-        a_dot_dy += av * s_dy[m];
-    }
-
-    // B[r] · x (scalar)
-    float b_dot_x = 0.0;
-    for (uint k = 0; k < push.K; k++) {
-        uint w = b_data[push.b_off + r * push.K + k];
-        float bv = float(uint16_t(w & 0xFFFFu));
-        b_dot_x += bv * s_x[k];
-    }
-
-    // Write grad_b[r][k] = scale * (A[r] · dy) * x[k]
-    for (uint k = t; k < push.K; k += 64) {
-        grad_b_buf[push.grad_b_off + r * push.K + k] = push.scale * a_dot_dy * s_x[k];
-    }
-
-    // Write grad_a[r][m] = scale * (B[r] · x) * dy[m]
+    // ── A[r] · dy (scalar) ───────────────────────────────────────────
+    // Parallelised over M: each thread handles M/64 elements,
+    // then we tree-reduce across 64 threads (uses s_partial so the
+    // original s_dy cache is preserved for the write phase).
+    float a_partial = 0.0;
     for (uint m = t; m < push.M; m += 64) {
-        grad_a_buf[push.grad_a_off + r * push.M + m] = push.scale * b_dot_x * s_dy[m];
+        float av = f16_from_u16(a_data[push.a_off + r * push.M + m]);
+        a_partial += av * (use_shared_y ? s_dy[m] : dy_data[push.dy_off + m]);
+    }
+    s_partial[t] = a_partial;
+    memoryBarrierShared();
+    barrier();
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (t < s) s_partial[t] += s_partial[t + s];
+        barrier();
+    }
+    float a_dot_dy = s_partial[0];
+    barrier();
+
+    // ── B[r] · x (scalar) ───────────────────────────────────────────
+    // Same parallel pattern over K.
+    float b_partial = 0.0;
+    for (uint k = t; k < push.K; k += 64) {
+        float bv = f16_from_u16(b_data[push.b_off + r * push.K + k]);
+        b_partial += bv * (use_shared_x ? s_x[k] : x_data[push.x_off + k]);
+    }
+    s_partial[t] = b_partial;
+    memoryBarrierShared();
+    barrier();
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (t < s) s_partial[t] += s_partial[t + s];
+        barrier();
+    }
+    float b_dot_x = s_partial[0];
+    barrier();
+
+    // ── Write gradients ──────────────────────────────────────────────
+    // Both write loops are parallelised across 64 threads.
+    // s_x / s_dy still hold the original cached values (s_partial was
+    // used for reduction), so shared reads here are safe.
+
+    // grad_b[r][k] = scale * (A[r] · dy) * x[k]
+    for (uint k = t; k < push.K; k += 64) {
+        float xv = use_shared_x ? s_x[k] : x_data[push.x_off + k];
+        grad_b_buf[push.grad_b_off + r * push.K + k] = push.scale * a_dot_dy * xv;
+    }
+
+    // grad_a[r][m] = scale * (B[r] · x) * dy[m]
+    for (uint m = t; m < push.M; m += 64) {
+        float dyv = use_shared_y ? s_dy[m] : dy_data[push.dy_off + m];
+        grad_a_buf[push.grad_a_off + r * push.M + m] = push.scale * b_dot_x * dyv;
     }
 }

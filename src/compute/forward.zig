@@ -1212,7 +1212,10 @@ pub const InferenceEngine = struct {
     /// Whether LoRA injection is active for the current forward pass.
     lora_active: bool = false,
     /// Injection points for the current forward pass.
-    lora_injections: [128]LoraInjectionBindings = undefined,
+    /// Zero-initialised so the linear scan in dispatchLoraFwd never reads
+    /// uninitialised memory when lora_active is accidentally set without
+    /// populating injections.
+    lora_injections: [128]LoraInjectionBindings = .{.{}} ** 128,
     /// Number of valid entries in lora_injections.
     lora_injection_count: u32 = 0,
 
@@ -29399,6 +29402,12 @@ pub const InferenceEngine = struct {
     /// Reads x from input_buf (norm_buf/ffn_norm_buf), accumulates y into DMMV output buffer.
     fn dispatchLoraFwd(self: *InferenceEngine, layer: u32, proj_idx: u32, input_buf: Buffer, output_buf: Buffer, m: u32, k: u32) !void {
         if (!self.lora_active) return;
+
+        // Pipeline barrier: ensure preceding dispatches (DMMV, etc.) have
+        // finished writing to output_buf before we read and accumulate.
+        // Without this barrier, dispatchLoraFwd can race with dispatchDmmv
+        // on the same buffer (read-after-write / write-after-write).
+        self.decode_cmd.computeBarrier();
         var found = false;
         var i: u32 = 0;
         while (i < self.lora_injection_count) : (i += 1) {

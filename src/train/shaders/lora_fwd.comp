@@ -34,11 +34,14 @@ layout(push_constant) uniform Push {
 } push;
 
 shared float s_x[2048];
+shared float s_partial[64]; // dot-product reduction scratch
 
 float f16_from_u16(uint w) {
-    // Reinterpret low 16 bits as float16, convert to float32.
-    // The buffer stores f16 values in the low 16 bits of each uint.
-    return float(uint16_t(w & 0xFFFFu));
+    // Reinterpret low 16 bits as float16 via float16_t constructor,
+    // then widen to float32.  This is the correct bit-reinterpret path;
+    // float(uint16_t(...)) would interpret the raw bit pattern as an
+    // integer, producing wrong values (e.g. f16 1.0 = 0x3C00 → 15360.0).
+    return float(float16_t(w & 0xFFFFu));
 }
 
 void main() {
@@ -59,12 +62,27 @@ void main() {
     for (uint r = tid; r < push.R; r += 64) {
         // a_val = A[r][m]
         float a_val = f16_from_u16(a_data[push.a_off + r * push.M + m]);
-        // dot = B[r] · x  over K
-        float dot = 0.0;
-        for (uint k = 0; k < push.K; k++) {
-            dot += f16_from_u16(b_data[push.b_off + r * push.K + k]) * s_x[k];
+
+        // Parallel dot = B[r] · x over K.
+        // Each thread accumulates K/64 elements, then we reduce across
+        // all 64 threads via shared memory tree reduction.
+        float part = 0.0;
+        for (uint k = t; k < push.K; k += 64) {
+            part += f16_from_u16(b_data[push.b_off + r * push.K + k]) * s_x[k];
         }
+        s_partial[t] = part;
+        memoryBarrierShared();
+        barrier();
+
+        // Tree reduction: 64 → 1
+        for (uint s = 32; s > 0; s >>= 1) {
+            if (t < s) s_partial[t] += s_partial[t + s];
+            barrier();
+        }
+
+        float dot = s_partial[0];
         total += a_val * dot;
+        barrier(); // clear s_partial for next rank
     }
 
     // Atomic read-modify-write for the output
