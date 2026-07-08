@@ -58,6 +58,21 @@ pub const DeviceCapabilities = struct {
     }
 };
 
+/// Detect unified memory (CPU+GPU share physical RAM).
+/// Returns true when there is at least one memory type that is both
+/// DEVICE_LOCAL and HOST_VISIBLE — typical of integrated/APU GPUs.
+fn isUnifiedMemory(mem_props: *const vk.c.VkPhysicalDeviceMemoryProperties) bool {
+    for (mem_props.memoryTypes[0..mem_props.memoryTypeCount]) |mt| {
+        const flags = mt.propertyFlags;
+        if (flags & vk.c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0 and
+            flags & vk.c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT != 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn deviceLocalBytes(mem_props: *const vk.c.VkPhysicalDeviceMemoryProperties) u64 {
     var total: u64 = 0;
     for (mem_props.memoryHeaps[0..mem_props.memoryHeapCount]) |heap| {
@@ -158,6 +173,10 @@ pub const Instance = struct {
     caps: DeviceCapabilities = .{},
     /// Loaded `vkCmdPushDescriptorSetKHR` entrypoint when push descriptors are enabled.
     push_descriptor_fn: ?PushDescriptorFn = null,
+    /// True when the GPU uses unified memory (CPU and GPU share the same physical RAM).
+    /// Detected by finding a memory type that is both DEVICE_LOCAL and HOST_VISIBLE.
+    /// When true, staging buffers are unnecessary — upload directly to device-local memory.
+    is_unified_memory: bool = false,
     /// Allocator for owned resources.
     allocator: std.mem.Allocator,
 
@@ -377,6 +396,11 @@ pub const Instance = struct {
 
         log.debug("Vulkan device ready — compute queue family {d}", .{compute_queue_family});
 
+        const unified = isUnifiedMemory(&mem_props);
+        if (unified) {
+            log.info("Unified memory architecture detected (CPU+GPU share physical RAM)", .{});
+        }
+
         return Instance{
             .handle = instance,
             .physical_device = physical_device,
@@ -389,6 +413,7 @@ pub const Instance = struct {
             .caps = device_caps,
             .push_descriptor_fn = push_descriptor_fn,
             .allocator = allocator,
+            .is_unified_memory = unified,
         };
     }
 

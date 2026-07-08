@@ -174,6 +174,41 @@ pub const Buffer = struct {
         @memcpy(self.mapped.?[0..data.len], data);
     }
 
+    /// Create a device-local buffer on unified memory, map it, and directly upload data.
+    /// On unified-memory GPUs (APUs, integrated), this skips the staging-buffer round-trip
+    /// by allocating a single buffer that is both DEVICE_LOCAL and HOST_VISIBLE|HOST_COHERENT.
+    /// Returns error.NoSuitableMemoryType on discrete GPUs that lack unified memory types.
+    /// @param instance Active Vulkan instance and logical device.
+    /// @param size Buffer size in bytes.
+    /// @param usage Vulkan buffer usage flags (STORAGE_BUFFER is added automatically).
+    /// @param data Source bytes to copy into the buffer.
+    /// @returns A device-local buffer with data already uploaded.
+    pub fn initDeviceLocalAndUpload(
+        instance: *const Instance,
+        size: vk.c.VkDeviceSize,
+        usage: vk.c.VkBufferUsageFlags,
+        data: []const u8,
+    ) !Buffer {
+        var buf = try init(
+            instance,
+            size,
+            usage | vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            vk.c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | vk.c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        );
+        errdefer buf.deinit();
+
+        var ptr: ?*anyopaque = null;
+        const result = vk.c.vkMapMemory(instance.device, buf.memory, 0, size, 0, &ptr);
+        if (result != vk.c.VK_SUCCESS) {
+            log.err("vkMapMemory failed (unified): {d}", .{result});
+            return error.MapMemoryFailed;
+        }
+        buf.mapped = @ptrCast(ptr);
+        @memcpy(buf.mapped.?[0..data.len], data);
+        // Keep mapped — no staging needed on unified memory
+        return buf;
+    }
+
     /// Destroy the Vulkan buffer, free device memory, and unmap any host-mapped pointer.
     /// @param self Buffer to tear down; the struct fields are set to `undefined` on return.
     pub fn deinit(self: *Buffer) void {
