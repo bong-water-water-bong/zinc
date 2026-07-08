@@ -40,9 +40,31 @@ and the routed `mul_mm_id_q4k` gate projection on the same prefix routing table,
 then logs sampled row diffs as `ZINC_MOE_ID_Q4K_COMPARE`. It does not alter
 default generation.
 
-Next credible step: run that validator on RDNA. If it passes with tight diffs,
-extend it from gate-only to gate+up/down or build a route-pack-native tiled GEMM
-consumer over the already packed expert-major ID table.
+RDNA validator result on a 300-token prompt: grouped MoE was active
+(`moe_grouped_layers=36`, `top1_prefix_tokens=10224`), and the routed
+`mul_mm_id_q4k` gate projection matched the current route-packed projection on
+sampled rows across grouped layers. Worst sampled layer diff was
+`max_abs=1.24e-5`, with most layers in the `1e-6` to `1e-5` range. The dormant
+token-major GEMM is numerically useful as a replay oracle, but still should not
+be selected directly because it scans route IDs in-shader.
+
+Rejected follow-up in the same continuation: a route-pack-native tiled Q4_K
+gate+up+SwiGLU shader prototype compiled and ran behind
+`ZINC_MOE_Q4K_TILED_GATE_UP=1`, using 32 output rows x 8 packed routes per
+workgroup. It was removed after measurement. On the same 300-token profile
+shape, current default was `582.14 tok/s` with MoE `132.0 ms` and gate_up
+`46.1 ms`; the tiled prototype fell to `358.35 tok/s`, MoE `439.4 ms`, and
+gate_up `351.6 ms`. Do not retry this simple shared-memory tiled
+route-pack-native gate/up shape without a different inner-loop design and a
+small standalone shaderstats/microbench proving it fixes the register/LDS cost.
+
+Next credible step: keep the gate-only `mul_mm_id_q4k` replay oracle for
+numeric validation, but target a different structural lever. The fresh
+300-token profile says the biggest named buckets are SSM (`155.8 ms`) and MoE
+(`132.0 ms`), with MoE gate_up/down at `46.1/50.3 ms` and route-pack/barrier
+overhead around `15 ms`. A new MoE attempt should either fuse down+acc safely
+or use a lower-overhead route schedule; another wide tiled gate/up pass is a
+known reject.
 
 ## PIVOT 2026-06-04 — POST-759 PLATEAU; STOP REPLAYING OLD LEVERS
 
