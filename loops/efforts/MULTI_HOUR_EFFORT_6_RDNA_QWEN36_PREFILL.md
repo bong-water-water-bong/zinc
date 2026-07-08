@@ -2105,6 +2105,22 @@ path; keep `qwenA3bPrepareProjectionQ8` on real columns only unless a future
 change also proves the extra columns are mathematically invisible at all
 consumers.
 
+Rejected A3B SSM qkv/z branch-family probe (2026-07-08): temporarily added a
+scoped `ZINC_A3B_SSM_QKV_Z_Q8_DP4A=0` selector around the SSM wqkv+z branch so
+the existing plain Q8 batched path and the older fused Q8 pair could be tested
+without changing attention or SSM-out. Both alternatives changed observable
+generation on the same 300-token prompt:
+
+| mode | samples | output |
+|---|---:|---|
+| default qkv/z DP4a | `703.37`, `709.94`, `715.79` tok/s | `{248046}` |
+| plain Q8 qkv/z | `921.73`, `624.03`, `612.37` tok/s | `{271, 248068, 198, ...}` |
+| fused Q8 pair qkv/z | `494.33`, `429.04`, `435.43` tok/s | `{5272, 2250, 961, ...}` |
+
+Rejected and removed. The default qkv/z DP4a math is not interchangeable with
+the older Q8 branches under the current coherence gate; future work should look
+inside the DP4a kernel/quantizer rather than bypassing it.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:
