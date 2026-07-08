@@ -2089,6 +2089,22 @@ observable generation. Do not default-enable layer 1 through an exact-suffix
 rewrite without updating the coherence contract and comparing against a stronger
 reference.
 
+Rejected A3B Q8 DP4a padded-column probe (2026-07-08): temporarily added
+`ZINC_A3B_Q8_DP4A_PAD=1` to pad short-prompt Q8 DP4a projections from real
+full columns up to `qwenA3bPrefillPaddedTokenCount(n_tokens)`, removing the
+12-token scalar tail on the 300-token prompt. It was faster but not
+output-stable:
+
+| mode | samples | output |
+|---|---:|---|
+| default | `804.35`, `1088.76`, `891.90` tok/s | `{248046}` |
+| padded Q8 columns | `1416.16`, `1033.44`, `1008.24` tok/s | `{198, 248046}` |
+
+Rejected and removed. The scratch padding columns are not a safe no-op for this
+path; keep `qwenA3bPrepareProjectionQ8` on real columns only unless a future
+change also proves the extra columns are mathematically invisible at all
+consumers.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:
