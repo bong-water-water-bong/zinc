@@ -765,120 +765,23 @@ fn bytesToGiB(bytes: u64) f64 {
 }
 
 fn probeVulkan(allocator: std.mem.Allocator, preferred_device: u32) !VulkanProbe {
-    const app_info = vk.c.VkApplicationInfo{
-        .sType = vk.c.VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pNext = null,
-        .pApplicationName = "zinc",
-        .applicationVersion = vk.c.VK_MAKE_VERSION(0, 1, 0),
-        .pEngineName = "zinc",
-        .engineVersion = vk.c.VK_MAKE_VERSION(0, 1, 0),
-        .apiVersion = vk.c.VK_API_VERSION_1_3,
-    };
+    // Use the proper Instance.init() which enables cooperative matrix,
+    // push descriptors, and other device extensions. The bare-bones
+    // instance previously used here could not detect these capabilities.
+    var instance = try Instance.init(allocator, preferred_device);
+    errdefer instance.deinit();
 
-    const create_info = vk.c.VkInstanceCreateInfo{
-        .sType = vk.c.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pNext = null,
-        .flags = 0,
-        .pApplicationInfo = &app_info,
-        .enabledLayerCount = 0,
-        .ppEnabledLayerNames = null,
-        .enabledExtensionCount = 0,
-        .ppEnabledExtensionNames = null,
-    };
+    const gpu_config = gpu_detect.detect(&instance);
 
-    var handle: vk.c.VkInstance = null;
-    const create_result = vk.c.vkCreateInstance(&create_info, null, &handle);
-    if (create_result != vk.c.VK_SUCCESS) return error.VulkanInitFailed;
-    errdefer vk.c.vkDestroyInstance(handle, null);
-
+    // Count physical devices for diagnostics display
     var dev_count: u32 = 0;
-    _ = vk.c.vkEnumeratePhysicalDevices(handle, &dev_count, null);
-    if (dev_count == 0) return error.NoDevices;
-
-    const phys_devices = try allocator.alloc(vk.c.VkPhysicalDevice, dev_count);
-    defer allocator.free(phys_devices);
-    _ = vk.c.vkEnumeratePhysicalDevices(handle, &dev_count, phys_devices.ptr);
-
-    const selected_index = try instance_mod.selectPhysicalDeviceIndex(allocator, phys_devices, dev_count, preferred_device);
-    const physical_device = phys_devices[selected_index];
-
-    var device_props: vk.c.VkPhysicalDeviceProperties = undefined;
-    vk.c.vkGetPhysicalDeviceProperties(physical_device, &device_props);
-
-    var mem_props: vk.c.VkPhysicalDeviceMemoryProperties = undefined;
-    vk.c.vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_props);
-
-    var qf_count: u32 = 0;
-    vk.c.vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &qf_count, null);
-    const qf_props = try allocator.alloc(vk.c.VkQueueFamilyProperties, qf_count);
-    defer allocator.free(qf_props);
-    vk.c.vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &qf_count, qf_props.ptr);
-
-    var compute_family: ?u32 = null;
-    for (qf_props[0..qf_count], 0..) |qf, qi| {
-        if (qf.queueFlags & vk.c.VK_QUEUE_COMPUTE_BIT != 0 and qf.queueFlags & vk.c.VK_QUEUE_GRAPHICS_BIT == 0) {
-            compute_family = @intCast(qi);
-            break;
-        }
-    }
-    if (compute_family == null) {
-        for (qf_props[0..qf_count], 0..) |qf, qi| {
-            if (qf.queueFlags & vk.c.VK_QUEUE_COMPUTE_BIT != 0) {
-                compute_family = @intCast(qi);
-                break;
-            }
-        }
-    }
-    const compute_queue_family = compute_family orelse return error.NoComputeQueue;
-
-    const queue_priority: f32 = 1.0;
-    const queue_create_info = vk.c.VkDeviceQueueCreateInfo{
-        .sType = vk.c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .pNext = null,
-        .flags = 0,
-        .queueFamilyIndex = compute_queue_family,
-        .queueCount = 1,
-        .pQueuePriorities = &queue_priority,
-    };
-
-    const device_create_info = vk.c.VkDeviceCreateInfo{
-        .sType = vk.c.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = null,
-        .flags = 0,
-        .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = &queue_create_info,
-        .enabledLayerCount = 0,
-        .ppEnabledLayerNames = null,
-        .enabledExtensionCount = 0,
-        .ppEnabledExtensionNames = null,
-        .pEnabledFeatures = null,
-    };
-
-    var device: vk.c.VkDevice = null;
-    const device_result = vk.c.vkCreateDevice(physical_device, &device_create_info, null, &device);
-    if (device_result != vk.c.VK_SUCCESS) return error.DeviceCreateFailed;
-    errdefer vk.c.vkDestroyDevice(device, null);
-
-    var compute_queue: vk.c.VkQueue = null;
-    vk.c.vkGetDeviceQueue(device, compute_queue_family, 0, &compute_queue);
-
-    var instance = Instance{
-        .handle = handle,
-        .physical_device = physical_device,
-        .device = device,
-        .compute_queue = compute_queue,
-        .compute_queue_family = compute_queue_family,
-        .device_props = device_props,
-        .mem_props = mem_props,
-        .selected_device_index = selected_index,
-        .allocator = allocator,
-    };
+    _ = vk.c.vkEnumeratePhysicalDevices(instance.handle, &dev_count, null);
 
     return .{
         .instance = instance,
-        .gpu_config = gpu_detect.detect(&instance),
+        .gpu_config = gpu_config,
         .requested_index = preferred_device,
-        .selected_index = selected_index,
+        .selected_index = instance.selected_device_index,
         .device_count = dev_count,
     };
 }
