@@ -15,6 +15,30 @@ The historical plateau marker below is kept for continuity: best 759.18
 prefill tok/s on the old 154-token harness after 109 cycles; do not compare
 that number directly to the newer 111p/2971p continuation probes.
 
+### 2026-07-08 continuation: routed Q4_K GEMM foundation restored
+
+Restored the dormant `mul_mm_id_q4k.comp` routed MoE GEMM foundation and
+compile-registered it next to the existing dense `mul_mm_q4k` path. This does
+not change production prefill selection; Qwen A3B still uses the corrected
+route-packed columns path by default.
+
+Why keep this dormant instead of wiring it immediately:
+
+- The older token-major `mul_mm_id` layout has to scan route ids inside the
+  shader. ZINC already has expert-major route ids from `moe_route_pack`, so the
+  eventual production path should probably consume that existing layout instead
+  of paying a second scan.
+- The 2026-07-04 shared-memory gate/up and 16-route block probes changed model
+  output or regressed, so any new grouped GEMM needs a per-layer numeric replay
+  gate before it can touch the default path.
+- Source guards now keep the shader installed, the DMMV pipeline/recorder
+  wired, and the GLSL comments free of external-runtime naming.
+
+Next credible step: add a layer replay validator for routed MoE GEMM that
+compares one layer's post-FFN output against the current route-packed path on
+the same routing table. If it passes, prefer a route-pack-native tiled GEMM
+consumer over token-major id scanning.
+
 ## PIVOT 2026-06-04 — POST-759 PLATEAU; STOP REPLAYING OLD LEVERS
 
 **Best 759.18 prefill tok/s at cycle 43.** The overnight RDNA1 run
@@ -1474,7 +1498,7 @@ These code paths were added in earlier cycles and compile into the binary, but h
 
 What is **not** in the tree, despite being mentioned in earlier commits or docs:
 
-- ~~"device-side per-(token, layer) MoE routing capture" buffer not in tree~~ → **OUT OF DATE**: `routing_capture_buf` IS in tree (forward.zig:885, gated `ZINC_CAPTURE_ROUTING=1`). Useful as `data_ids` input to a future MUL_MAT_ID GEMM port.
+- ~~"device-side per-(token, layer) MoE routing capture" buffer not in tree~~ → **OUT OF DATE**: `routing_capture_buf` IS in tree (forward.zig:885, gated `ZINC_CAPTURE_ROUTING=1`). Useful as `data_ids` input to the dormant routed GEMM validation path.
 - ~~No `quantize_q8_1.comp` shader, no Q8_1 buffer plumbing, no `mul_mmq` pipeline~~ → **OUT OF DATE**: `quantize_q8_1.comp` + `pipeline_quantize_q8_1` ARE in tree. `mul_mmq_q4k.comp` was ported (cycle 18), reverted as dormant (cycle 40), deleted. Re-port + wire is the deferred work, not "Step 10 has to add all three."
 
 Any cycle whose self-analysis proposes "batch X across prompt tokens" and does not reference the existing `recordBatchDispatch` / `recordCoopMatmul` helpers is proposing unnecessary new infrastructure. Check for the existing helper first.

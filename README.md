@@ -68,7 +68,7 @@ Latest checked-in benchmark artifact, same machine, same weights, same prompt:
 | Platform | Compared models | Decode vs llama.cpp | Prefill vs llama.cpp | Read this as |
 |----------|----------------:|--------------------:|---------------------:|--------------|
 | AMD RDNA4 / Vulkan | 5 | 117% avg, 5/5 model wins | 135% avg, 5/5 model wins | Clean current sweep: every published RDNA model is ahead on decode, prefill, end-to-end, and model-level overall |
-| Intel Arc / Vulkan | 5 | 103% avg, 5/5 model wins | 162% avg, 5/5 model wins | Official Linux Vulkan target; all five catalog rows validate on the public Intel node, with performance tuning still younger than RDNA4 |
+| Intel Arc / Vulkan | 5 | 103% avg, 5/5 model wins | 181% avg, 5/5 model wins | Official Linux Vulkan target; all five catalog rows validate on the public Intel node, with performance tuning still younger than RDNA4 |
 | Apple Silicon / Metal | 5 | 87% avg, 1 model win | 54% avg, 1 model win | Mixed by model; Gemma 31B and Qwen 35B are closest |
 
 Full per-model numbers are in [Benchmarks](#benchmarks) and on the public
@@ -305,7 +305,7 @@ The tables below are pulled directly from the published benchmark data at [zolot
 | Qwen 3.6 35B A3B UD Q4_K_XL | **191.18** | 135.39 | **141%** | **75.26** | 75.07 | **100%** |
 | Qwen 3.5 9B Q4_K_M | **191.06** | 141.98 | **135%** | **55.98** | 54.00 | **104%** |
 | Qwen 3.6 27B Dense Q4_K_M | **92.21** | 37.07 | **249%** | **20.01** | 19.23 | **104%** |
-| Gemma 4 26B-A4B MoE Q4_K_M | **282.08** | 270.37 | **104%** | **64.99** | 62.29 | **104%** |
+| Gemma 4 26B-A4B MoE Q4_K_M | **492.97** | 247.57 | **199%** | **64.98** | 62.43 | **104%** |
 | Gemma 4 31B Q4_K_M | **120.83** | 67.23 | **180%** | **18.01** | 17.37 | **104%** |
 
 ### Where we stand vs llama.cpp

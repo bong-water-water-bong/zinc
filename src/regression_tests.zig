@@ -1076,6 +1076,29 @@ test "Vulkan Gemma dense decode uses true single-token GEGLU producer" {
     try expectNotContains(shader, "const uint BN");
 }
 
+test "Vulkan routed Q4_K MoE GEMM foundation stays compile registered" {
+    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    defer std.testing.allocator.free(build);
+    try expectContains(build, "\"mul_mm_id_q4k\"");
+
+    const dmmv = @embedFile("compute/dmmv.zig");
+    try expectContains(dmmv, "pub const MulMmIdQ4KPush = extern struct");
+    try expectContains(dmmv, "pipeline_mul_mm_id_q4k: ?Pipeline");
+    try expectContains(dmmv, "mul_mm_id_q4k.spv");
+    try expectContains(dmmv, "pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_id_q4k_path, 5");
+    try expectContains(dmmv, "pub fn recordMulMmIdQ4K(");
+    try expectContains(dmmv, ".pipeline_mul_mm_id_q4k = pipeline_mul_mm_id_q4k");
+    try expectContains(dmmv, "if (self.pipeline_mul_mm_id_q4k) |*p| p.deinit();");
+
+    const shader = @embedFile("shaders/mul_mm_id_q4k.comp");
+    try expectContains(shader, "layout(local_size_x = WG_SIZE) in;");
+    try expectContains(shader, "layout(set = 0, binding = 3) readonly buffer Ids");
+    try expectContains(shader, "layout(set = 0, binding = 4) readonly buffer Counts");
+    try expectContains(shader, "data_expert_count[expert_idx]");
+    try expectContains(shader, "row_ids[count - ic * BN] = uvec2(ii0, ii1);");
+    try expectContains(shader, "d_data[d_idx] = sums[m][n];");
+}
+
 test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
     defer std.testing.allocator.free(build);
