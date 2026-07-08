@@ -601,7 +601,7 @@ pub fn load(
     });
     for (gf.tensors.items, 0..) |tensor_info, ti| {
         const tensor_size = tensor_info.sizeBytes();
-        log.info("[{d}/{d}] '{s}' | type={s} | {d} bytes ({d:.2} MB)", .{
+        log.debug("[{d}/{d}] '{s}' | type={s} | {d} bytes ({d:.2} MB)", .{
             ti + 1,
             n_tensors,
             tensor_info.name,
@@ -614,7 +614,7 @@ pub fn load(
         const src_data = mmap_data[data_offset..][0..@intCast(tensor_size)];
         const offload = shouldOffloadToHost(tensor_info.name);
 
-        log.info("  → allocating GPU buffer ({s})", .{if (offload) "host-visible" else if (instance.is_unified_memory) "unified-device" else "device-local"});
+        log.debug("  → allocating GPU buffer ({s})", .{if (offload) "host-visible" else if (instance.is_unified_memory) "unified-device" else "device-local"});
         var gpu_buf = blk: {
             if (offload) {
                 break :blk try Buffer.initHostVisibleStorage(instance, tensor_size);
@@ -636,19 +636,19 @@ pub fn load(
         errdefer gpu_buf.deinit();
 
         if (offload) {
-            log.info("  → uploading to host-visible memory", .{});
+            log.debug("  → uploading to host-visible memory", .{});
             gpu_buf.upload(src_data);
             total_host_visible += tensor_size;
         } else if (instance.is_unified_memory) {
-            log.info("  → unified memory: data already uploaded during allocation", .{});
+            log.debug("  → unified memory: data already uploaded during allocation", .{});
             total_vram += tensor_size;
         } else {
-            log.info("  → creating staging buffer ({d} bytes)", .{tensor_size});
+            log.debug("  → creating staging buffer ({d} bytes)", .{tensor_size});
             var staging = try Buffer.initStaging(instance, tensor_size);
             defer staging.deinit();
-            log.info("  → uploading to staging", .{});
+            log.debug("  → uploading to staging", .{});
             staging.upload(src_data);
-            log.info("  → copying staging → device-local (vkCmdCopyBuffer)", .{});
+            log.debug("  → copying staging → device-local (vkCmdCopyBuffer)", .{});
             try buffer_mod.copyBuffer(instance, cmd_pool.handle, &staging, &gpu_buf, tensor_size);
             total_vram += tensor_size;
         }

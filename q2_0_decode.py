@@ -30,8 +30,11 @@ import numpy as np
 
 
 def parse_gguf(path):
-    f = open(path, "rb")
+    with open(path, "rb") as f:
+        return _parse_gguf_impl(f)
 
+
+def _parse_gguf_impl(f):
     def rd(fmt):
         return struct.unpack("<" + fmt, f.read(struct.calcsize(fmt)))[0]
 

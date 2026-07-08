@@ -2589,7 +2589,6 @@ pub fn main() !void {
             config.train_steps,
         });
 
-
         while (trainer.current_step < trainer.config.max_steps) {
             // Forward: run the engine for this batch
             const loss = try trainer.step(&vk_instance, &train_engine);

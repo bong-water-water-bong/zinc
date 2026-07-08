@@ -424,8 +424,9 @@ void main() {
         o_data_v4[out_base_v4 + d4] = s_out_v4[d4] * rescale * inv_sum;
     }
 
-    // H2O: force retention of score_accum binding even though this shader
-    // doesn't accumulate scores (the per-head flash_attn shader does).
-    // This keeps the pipeline layout compatible (7 bindings).
-    if (tid == 0u) score_accum[0] = score_accum[0];
+    // H2O: keep score_accum binding alive for the shared pipeline layout.
+    // A volatile read avoids the coherent read-modify-write self-assignment
+    // that previously caused unnecessary global-memory traffic on every
+    // workgroup invocation.
+    if (tid == 0u) { float _keep = score_accum[0]; (void)_keep; }
 }

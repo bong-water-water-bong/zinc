@@ -46,7 +46,12 @@ void main() {
     s_scratch[t] = mv;
     memoryBarrierShared(); barrier();
 
-    for (uint s = 32; s > 0; s >>= 1) {
+    // Tree reduction over all 64 threads.  Start at the workgroup midpoint
+    // (64/2 = 32) and halve each step.  Using the workgroup size rather
+    // than a hardcoded stride ensures correct behaviour on wave32 hardware
+    // (RDNA4) where the subgroup size is 32: the barrier() guarantees
+    // cross-wave shared-memory visibility between the two wavefronts.
+    for (uint s = gl_WorkGroupSize.x >> 1; s > 0; s >>= 1) {
         if (t < s) s_scratch[t] = max(s_scratch[t], s_scratch[t + s]);
         memoryBarrierShared(); barrier();
     }
@@ -63,7 +68,7 @@ void main() {
     s_scratch[t] = xsum;
     memoryBarrierShared(); barrier();
 
-    for (uint s = 32; s > 0; s >>= 1) {
+    for (uint s = gl_WorkGroupSize.x >> 1; s > 0; s >>= 1) {
         if (t < s) s_scratch[t] += s_scratch[t + s];
         memoryBarrierShared(); barrier();
     }
