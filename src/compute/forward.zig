@@ -7335,6 +7335,7 @@ pub const InferenceEngine = struct {
                                 1,
                                 &region,
                             );
+                            self.decode_cmd.transferToComputeBarrier();
                         }
                     }
                 }
@@ -8973,6 +8974,7 @@ pub const InferenceEngine = struct {
                             1,
                             &region,
                         );
+                        self.decode_cmd.transferToComputeBarrier();
                     }
                 }
             }

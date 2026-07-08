@@ -67,16 +67,16 @@ void main() {
         // Each thread accumulates K/64 elements, then we reduce across
         // all 64 threads via shared memory tree reduction.
         float part = 0.0;
-        for (uint k = t; k < push.K; k += 64) {
+        for (uint k = tid; k < push.K; k += 64) {
             part += f16_from_u16(b_data[push.b_off + r * push.K + k]) * s_x[k];
         }
-        s_partial[t] = part;
+        s_partial[tid] = part;
         memoryBarrierShared();
         barrier();
 
         // Tree reduction: 64 → 1
         for (uint s = 32; s > 0; s >>= 1) {
-            if (t < s) s_partial[t] += s_partial[t + s];
+            if (tid < s) s_partial[tid] += s_partial[tid + s];
             barrier();
         }
 

@@ -438,8 +438,8 @@ pub fn parseWithOptions(data: []const u8, allocator: std.mem.Allocator, options:
     // used 42 for q2_0 before it was reassigned to its current id (1000).
     // Since 128 divides 256, element-count modulo alone cannot distinguish
     // them — we need the actual tensor data size, which we derive from the
-    // offset delta to the next tensor (or to tensor_data_offset for the
-    // last tensor).
+    // offset delta to the next tensor (or to the end of the mmap'd data for
+    // the last tensor).
     // ──────────────────────────────────────────────────────────────────
     {
         const stq1_0_bs: u64 = GGMLType.stq1_0.blockSize();
@@ -457,7 +457,10 @@ pub fn parseWithOptions(data: []const u8, allocator: std.mem.Allocator, options:
             const actual_size: u64 = if (i + 1 < tensors.items.len)
                 tensors.items[i + 1].offset - tensor.offset
             else
-                break; // Last tensor — cannot disambiguate; keep .stq1_0
+                // Last tensor: compute from remaining data in the mmap'd slice.
+                // reader.pos is past all headers; the rest of data[] is the
+                // tensor data section, so total_data = data.len - tensor_data_offset.
+                data.len - tensor_data_offset - tensor.offset;
 
             const stq1_0_blocks = (n_elems + stq1_0_bs - 1) / stq1_0_bs;
             const stq1_0_size = stq1_0_blocks * stq1_0_bpb;

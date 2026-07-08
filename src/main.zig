@@ -2489,8 +2489,10 @@ pub fn main() !void {
 
         const hidden_dim = train_model.config.hidden_dim;
         const n_layers = train_model.config.n_layers;
-        //inter_dim is not directly in ModelConfig; estimate from hidden_dim
-        const inter_dim = hidden_dim * 4; // typical SwiGLU up-project
+        const inter_dim = if (train_model.config.intermediate_dim > 0)
+            train_model.config.intermediate_dim
+        else
+            hidden_dim * 4; // fallback for configs that don't expose it
 
         // Determine which projection types to target
         const targets_str = config.lora_targets orelse "q,k,v,o";
@@ -2614,8 +2616,7 @@ pub fn main() !void {
 
         // Free allocated training tokens
         allocator.free(train_tokens);
-        var owned_train = resolved_model_for_train;
-        owned_train.deinit(allocator);
+        resolved_model_for_train.deinit(allocator);
 
         return;
     }
