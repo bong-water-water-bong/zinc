@@ -2167,6 +2167,24 @@ with the recurring `out_proj` profile bucket. Useful probes should change the
 SSM-out shader shape or scheduling, not reroute qkv/z away from the current
 DP4a branch.
 
+Rejected Q8 DP4a BN=64 SSM-out probe (2026-07-08): temporarily added a
+`mul_mm_q8_0_full_dp4a_bn64` shader selected for the exact A3B SSM-out
+`M=2048 K=4096` shape when `N` was 64-aligned. The isolated `hot-bench`
+`q8_ssm_out_dp4a --cols 320` kernel looked promising:
+
+| mode | gpu ms/iter | note |
+|---|---:|---|
+| BN=64 | `0.367` | lower modeled bytes, fewer weight rereads |
+| generic BN=32 | `0.432` | current production path |
+
+Whole-prefill did not confirm the win. On a 321-token prompt (`320` full
+columns), output stayed stable (`{20}` for both paths), but the profiled run
+with BN=64 regressed badly: `476.3 ms` prefill, SSM `147.2 ms`, SSM
+`out_proj=27.5 ms` versus generic `272.1 ms` prefill, SSM `86.0 ms`,
+`out_proj=24.3 ms`. Rejected and removed. `hot-bench --cols` remains useful
+for future shape-specific A/Bs, but do not re-add the BN=64 Q8_0 variant without
+first explaining why the isolated kernel result inverted in whole-prefill.
+
 ## Success Criteria
 
 This effort is succeeding when all of these are true:

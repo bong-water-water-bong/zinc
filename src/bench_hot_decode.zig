@@ -87,6 +87,7 @@ const Args = struct {
     iterations: u32 = 200,
     warmup: u32 = 25,
     working_set: u32 = 16,
+    cols_override: ?u32 = null,
     shader_dir: ?[]const u8 = null,
     model_path: ?[]const u8 = null,
     case_filter: ?[]const u8 = null,
@@ -183,6 +184,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingArgument;
             args.working_set = @max(1, try std.fmt.parseUnsigned(u32, argv[i], 10));
+        } else if (std.mem.eql(u8, arg, "--cols")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingArgument;
+            args.cols_override = try std.fmt.parseUnsigned(u32, argv[i], 10);
         } else if (std.mem.eql(u8, arg, "--shader-dir")) {
             i += 1;
             if (i >= argv.len) return error.MissingArgument;
@@ -215,6 +220,7 @@ fn printUsage() void {
         \\  --iterations <n>         Timed iterations per case (default: 200)
         \\  --warmup <n>             Warmup iterations per case (default: 25)
         \\  --working-set <n>        Rotate across N buffer sets to reduce cache-hot bias (default: 16)
+        \\  --cols <n>               Override N for Q8_0 DP4a cases
         \\  --case <name>            Run one case: q8_router | q8_shared_gate_up | q8_shared_down | q8_ssm_out | q8_ssm_qkv_dp4a | q8_ssm_z_dp4a | q8_ssm_out_dp4a | ssm_delta
         \\  --json                   Emit JSON instead of log lines
         \\  -h, --help               Show this help
@@ -344,8 +350,8 @@ fn q8ActivationBytes(N: u32, K: u32) u64 {
     return @as(u64, N) * (@as(u64, K) + @as(u64, K / 32) * @sizeOf(f32));
 }
 
-fn q8Dp4aBytesPerIter(M: u32, N: u32, K: u32) u64 {
-    const weight_bytes = q8MatrixBytes(M, K) * @as(u64, N / 32);
+fn q8Dp4aBytesPerIter(M: u32, N: u32, K: u32, tile_n: u32) u64 {
+    const weight_bytes = q8MatrixBytes(M, K) * @as(u64, N / tile_n);
     const quantize_input_bytes = @as(u64, N) * @as(u64, K) * @sizeOf(f32);
     const quantize_output_bytes = q8ActivationBytes(N, K);
     const activation_bytes = quantize_output_bytes * @as(u64, M / 32);
@@ -805,7 +811,7 @@ fn runQ8Dp4aCase(
     try recordRepeatedQ8Dp4a(cmd, timer, dispatch, instance.push_descriptor_fn, slots, case.M, case.N, case.K, iterations);
     const measured = try runRecorded(cmd, queue, timer);
 
-    const bytes_per_iter = q8Dp4aBytesPerIter(case.M, case.N, case.K);
+    const bytes_per_iter = q8Dp4aBytesPerIter(case.M, case.N, case.K, 32);
     const eff_gbps = (@as(f64, @floatFromInt(bytes_per_iter)) * @as(f64, @floatFromInt(iterations))) / (measured.gpu_ms / 1000.0) / 1_000_000_000.0;
     const utilization = if (gpu_config.bandwidth_gbps > 0) eff_gbps / @as(f64, @floatFromInt(gpu_config.bandwidth_gbps)) * 100.0 else 0.0;
 
@@ -1041,18 +1047,22 @@ pub fn main() !void {
     defer results.deinit(allocator);
 
     for (cases) |case| {
-        if (!matchesCaseFilter(case.name, args.case_filter)) continue;
+        var active_case = case;
+        if (args.cols_override) |cols| {
+            if (active_case.kind == .mul_mm_q8_0_dp4a) active_case.N = cols;
+        }
+        if (!matchesCaseFilter(active_case.name, args.case_filter)) continue;
         var desc_buf: [128]u8 = undefined;
         log.info("Running {s} ({s}) warmup={d} iterations={d}", .{
-            case.name,
-            case.describe(&desc_buf),
+            active_case.name,
+            active_case.describe(&desc_buf),
             args.warmup,
             args.iterations,
         });
-        const result = switch (case.kind) {
-            .dmmv_q8_0 => try runDmmvCase(allocator, &instance, instance.compute_queue, &cmd_pool, &cmd, &timer, &dmmv, &gpu_cfg, case, args.iterations, args.warmup, args.working_set),
-            .mul_mm_q8_0_dp4a => try runQ8Dp4aCase(allocator, &instance, instance.compute_queue, &cmd_pool, &cmd, &timer, &dmmv, &gpu_cfg, case, args.iterations, args.warmup, args.working_set),
-            .ssm_delta_net => try runSsmDeltaCase(allocator, &instance, instance.compute_queue, &cmd_pool, &cmd, &timer, &elt, &gpu_cfg, case, args.iterations, args.warmup, args.working_set),
+        const result = switch (active_case.kind) {
+            .dmmv_q8_0 => try runDmmvCase(allocator, &instance, instance.compute_queue, &cmd_pool, &cmd, &timer, &dmmv, &gpu_cfg, active_case, args.iterations, args.warmup, args.working_set),
+            .mul_mm_q8_0_dp4a => try runQ8Dp4aCase(allocator, &instance, instance.compute_queue, &cmd_pool, &cmd, &timer, &dmmv, &gpu_cfg, active_case, args.iterations, args.warmup, args.working_set),
+            .ssm_delta_net => try runSsmDeltaCase(allocator, &instance, instance.compute_queue, &cmd_pool, &cmd, &timer, &elt, &gpu_cfg, active_case, args.iterations, args.warmup, args.working_set),
         };
         try results.append(allocator, result);
     }
@@ -1075,8 +1085,9 @@ test "q8 dmmv bytes model matches 256x2048 router shape" {
 }
 
 test "q8 dp4a bytes model matches qwen a3b ssm prefill tiles" {
-    try std.testing.expectEqual(@as(u64, 342_761_472), q8Dp4aBytesPerIter(8192, qwen_a3b_prefill_full_cols, 2048));
-    try std.testing.expectEqual(@as(u64, 173_555_712), q8Dp4aBytesPerIter(2048, qwen_a3b_prefill_full_cols, 4096));
+    try std.testing.expectEqual(@as(u64, 342_761_472), q8Dp4aBytesPerIter(8192, qwen_a3b_prefill_full_cols, 2048, 32));
+    try std.testing.expectEqual(@as(u64, 173_555_712), q8Dp4aBytesPerIter(2048, qwen_a3b_prefill_full_cols, 4096, 32));
+    try std.testing.expectEqual(@as(u64, 192_839_680), q8Dp4aBytesPerIter(2048, 320, 4096, 32));
 }
 
 test "bench defaults match current qwen35 hot shapes" {
