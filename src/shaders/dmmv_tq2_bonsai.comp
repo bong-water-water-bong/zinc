@@ -1,0 +1,130 @@
+#version 460
+// ZINC - TQ2_0_g128 ternary Bonsai GEMV. Vulkan port of
+// /home/bcloud/src/bonsai_tq2_gemv.hip (Bonsai-1.7B production decode-path
+// kernel, 113 tok/s / 48.5 GB/s reference on gfx1151 ROCm).
+//
+// Format: per 128-weight block, 2 bytes f16 scale `d` (first), then 32
+// bytes of 2-bit codes (4/byte, LSB-first). Code map: 00->-1, 01->0,
+// 10->+1, 11->0 (reserved, unused).
+//
+// Deliberate deviations from the HIP reference (see plan notes):
+//   - Activations (binding=1) are float16_t, matching the real decode-path
+//     buffer.
+//   - Output (binding=2) is f32, not fp16-clamped, so the correctness test
+//     compares directly against an f32 CPU reference without an extra
+//     precision-matching step.
+//
+// Thread model — MUST run at subgroup size 32 (pipeline creation pins
+// required_subgroup_size=32 + require_full_subgroups; no cross-subgroup-size
+// fallback path exists in this shader):
+//   - One workgroup = 128 threads (4 subgroups x 32 lanes) = 8 output rows.
+//   - Subgroup `w` owns rows [8*wg + 2*w, 8*wg + 2*w + 2) -- 2 rows/subgroup,
+//     each subgroup's reduction is self-contained (no cross-subgroup fold).
+//   - Activations for the current 128-weight block are staged into `shared`
+//     memory once per block by all 128 threads, then all 8 rows read from
+//     that slab (8x amortization over per-row activation reads).
+//   - Each lane covers 4 consecutive weights (one qs byte) per row per
+//     block: lane `l` -> weights 4l..4l+3, i.e. byte index `l` in qs[].
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint a_offset;
+    uint x_offset;
+    uint y_offset;
+    uint acc_mode;
+};
+
+layout(set = 0, binding = 0) readonly buffer MatrixA { uint8_t a_data[]; };
+layout(set = 0, binding = 1) readonly buffer VectorX { float16_t x_data[]; };
+layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
+
+const uint BLOCK_WEIGHTS = 128u;
+const uint BLOCK_BYTES = 34u;
+const uint ROWS_PER_WG = 8u;
+const uint ROWS_PER_SUBGROUP = 2u;
+
+shared float16_t x_lds[BLOCK_WEIGHTS];
+
+float ternaryValue(uint code) {
+    // v(c) = float(c==2) - float(c==0); reserved 0b11 -> 0 (both false).
+    float pos = (code == 2u) ? 1.0 : 0.0;
+    float neg = (code == 0u) ? 1.0 : 0.0;
+    return pos - neg;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint wave = gl_SubgroupID;
+    const uint row_base = gl_WorkGroupID.x * ROWS_PER_WG;
+
+    const uint num_blocks = K / BLOCK_WEIGHTS;
+    const uint row_bytes = num_blocks * BLOCK_BYTES;
+
+    float acc[ROWS_PER_SUBGROUP];
+    acc[0] = 0.0;
+    acc[1] = 0.0;
+
+    for (uint b = 0u; b < num_blocks; b++) {
+        // Cooperative load: 128 threads each stage one fp16 activation.
+        barrier();
+        x_lds[tid] = x_data[x_offset + b * BLOCK_WEIGHTS + tid];
+        barrier();
+
+        // This lane's 4 activations (byte index `lane` within the block).
+        const uint a_base = lane * 4u;
+        const float a0 = float(x_lds[a_base + 0u]);
+        const float a1 = float(x_lds[a_base + 1u]);
+        const float a2 = float(x_lds[a_base + 2u]);
+        const float a3 = float(x_lds[a_base + 3u]);
+
+        for (uint r = 0u; r < ROWS_PER_SUBGROUP; r++) {
+            const uint row = row_base + wave * ROWS_PER_SUBGROUP + r;
+            const bool row_valid = row < M;
+            const uint row_eff = row_valid ? row : 0u;
+            const uint blk_off = a_offset + row_eff * row_bytes + b * BLOCK_BYTES;
+
+            // `d` is warp-uniform; manual 2-byte unpack (same style as
+            // dmmv_q8_0_wide.comp) since a_data is a uint8_t buffer.
+            const uint scale_lo = uint(a_data[blk_off + 0u]);
+            const uint scale_hi = uint(a_data[blk_off + 1u]);
+            const float d = unpackHalf2x16(scale_lo | (scale_hi << 8u)).x;
+
+            // Each lane loads its own unique qs byte -- lanes 0..31 cover
+            // the full 32-byte qs region in one coalesced transaction.
+            const uint qbyte = uint(a_data[blk_off + 2u + lane]);
+            const uint c0 = qbyte & 3u;
+            const uint c1 = (qbyte >> 2u) & 3u;
+            const uint c2 = (qbyte >> 4u) & 3u;
+            const uint c3 = (qbyte >> 6u) & 3u;
+
+            float partial = ternaryValue(c0) * a0;
+            partial += ternaryValue(c1) * a1;
+            partial += ternaryValue(c2) * a2;
+            partial += ternaryValue(c3) * a3;
+
+            if (row_valid) acc[r] += d * partial;
+        }
+    }
+
+    // Per-row reduction within the owning subgroup (2 rows/subgroup,
+    // self-contained -- no cross-subgroup fold, unlike dmmv_q8_0_wide.comp).
+    for (uint r = 0u; r < ROWS_PER_SUBGROUP; r++) {
+        float v = subgroupAdd(acc[r]);
+        if (lane == 0u) {
+            const uint row = row_base + wave * ROWS_PER_SUBGROUP + r;
+            if (row < M) {
+                const uint y_idx = y_offset / 4u + row;
+                y_data[y_idx] = (acc_mode != 0u) ? y_data[y_idx] + v : v;
+            }
+        }
+    }
+}

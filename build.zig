@@ -166,6 +166,7 @@ pub fn build(b: *std.Build) void {
         "dmmv_q8_0_kpar_batch",
         "dmmv_q8_0_wide",
         "dmmv_q8_0_wide4",
+        "dmmv_tq2_bonsai",
         "dmmv_q8_0_q8_1",
         "dmmv_q4k_q8_1",
         "dmmv_q8_0_fused_pair",
@@ -459,6 +460,20 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(hot_bench);
     }
 
+    const bench_tq2_gemv_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_tq2_gemv.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    bench_tq2_gemv_mod.addOptions("build_options", build_options);
+    configureVulkanModule(b, target, bench_tq2_gemv_mod);
+
+    const bench_tq2_gemv = b.addExecutable(.{
+        .name = "zinc-bench-tq2-gemv",
+        .root_module = bench_tq2_gemv_mod,
+    });
+
     // --- CUDA primitive-layer smoke (Linux/WSL2 + NVIDIA only) ---
     // Builds & runs src/cuda/smoke.zig standalone — independent of the main exe
     // and the gpu/interface.zig dispatch — so the src/cuda/* primitive layer can
@@ -571,6 +586,14 @@ pub fn build(b: *std.Build) void {
     }
     const hot_bench_step = b.step("hot-bench", "Run hot decode microbenchmarks");
     hot_bench_step.dependOn(&run_hot_bench.step);
+
+    const run_bench_tq2_gemv = b.addRunArtifact(bench_tq2_gemv);
+    run_bench_tq2_gemv.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_bench_tq2_gemv.addArgs(args);
+    }
+    const bench_tq2_gemv_step = b.step("bench-tq2-gemv", "Run TQ2 Bonsai ternary GEMV correctness + throughput spike");
+    bench_tq2_gemv_step.dependOn(&run_bench_tq2_gemv.step);
 
     if (is_macos) {
         const bench_mod = b.createModule(.{
