@@ -1,11 +1,11 @@
-//! Correctness + throughput spike for the TQ2_0_g128 ternary Bonsai GEMV
-//! Vulkan port (shaders/dmmv_tq2_bonsai.comp), the Vulkan side of the
-//! ROCm-vs-Vulkan dual-backend prove-out. Validates GPU dispatch output
-//! against the CPU reference in tq2_ref.zig at a small shape, then
-//! benchmarks throughput at 6912x6912 -- the same shape as the ROCm
-//! reference kernel (bonsai_tq2_gemv.hip, 48.5 GB/s, see
-//! docs/gpu/HANDOFF-ROCM-GPU.md) -- so the two numbers are directly
-//! comparable.
+//! Correctness + throughput benchmark for the wave32-specialized Q2_0
+//! (prism-ml Bonsai ternary) GEMV (shaders/dmmv_q2_0_wave32.comp), the
+//! production GGUF-wired kernel driven by pipeline_q2_0_wave32 in
+//! dmmv.zig. Validates GPU dispatch output against the CPU reference in
+//! tq2_ref.zig at a small shape, then benchmarks throughput at 6912x6912
+//! -- the same shape as the ROCm reference kernel (bonsai_tq2_gemv.hip,
+//! steady-state ~160 GB/s measured on this box) -- so the two numbers are
+//! directly comparable.
 //! Run via `zig build bench-tq2-gemv -Doptimize=ReleaseFast`.
 const std = @import("std");
 const vk = @import("vulkan/vk.zig");
@@ -157,12 +157,13 @@ fn tq2MatrixBytes(m: u32, k: u32) u64 {
 }
 
 fn tq2BytesPerIter(m: u32, k: u32) u64 {
-    return tq2MatrixBytes(m, k) + @as(u64, k) * @sizeOf(f16) + @as(u64, m) * @sizeOf(f32);
+    return tq2MatrixBytes(m, k) + @as(u64, k) * @sizeOf(f32) + @as(u64, m) * @sizeOf(f32);
 }
 
-/// Deliberately exercises all 4 two-bit codes (including the reserved
-/// 0b11 -> 0 case) across lanes/blocks/rows/salt, and varies the f16 scale
-/// per (row, block), rather than filling with a degenerate constant.
+/// Deliberately exercises all 4 two-bit codes (including code 3, which is
+/// a genuine +2 quant level, not reserved) across lanes/blocks/rows/salt,
+/// and varies the f16 scale per (row, block), rather than filling with a
+/// degenerate constant.
 fn fillTq2Weights(dst: []u8, m: u32, k: u32, salt: u32) void {
     const row_bytes = tq2RowBytes(k);
     const num_blocks = k / BLOCK_WEIGHTS;
@@ -187,10 +188,10 @@ fn fillTq2Weights(dst: []u8, m: u32, k: u32, salt: u32) void {
     }
 }
 
-fn fillActivations(dst: []f16, salt: u32) void {
+fn fillActivations(dst: []f32, salt: u32) void {
     for (dst, 0..) |*v, i| {
         const lane: f32 = @floatFromInt(((i + salt) % 11) + 1);
-        v.* = @floatCast(lane * 0.0625);
+        v.* = lane * 0.0625;
     }
 }
 
@@ -247,13 +248,13 @@ fn runCorrectness(
 ) !void {
     const m: u32 = 16;
     const k: u32 = 256;
-    const pipeline = dispatch.pipeline_tq2_bonsai orelse return error.ShaderNotLoaded;
+    const pipeline = dispatch.pipeline_q2_0_wave32 orelse return error.ShaderNotLoaded;
 
     const weight_blob = try allocator.alloc(u8, @intCast(tq2MatrixBytes(m, k)));
     defer allocator.free(weight_blob);
     fillTq2Weights(weight_blob, m, k, 42);
 
-    const act_host = try allocator.alloc(f16, k);
+    const act_host = try allocator.alloc(f32, k);
     defer allocator.free(act_host);
     fillActivations(act_host, 7);
 
@@ -331,11 +332,11 @@ fn runThroughput(
     const warmup: u32 = 25;
     const working_set: usize = 16;
 
-    const pipeline = dispatch.pipeline_tq2_bonsai orelse return error.ShaderNotLoaded;
+    const pipeline = dispatch.pipeline_q2_0_wave32 orelse return error.ShaderNotLoaded;
 
     const weight_blob = try allocator.alloc(u8, @intCast(tq2MatrixBytes(m, k)));
     defer allocator.free(weight_blob);
-    const act_host = try allocator.alloc(f16, k);
+    const act_host = try allocator.alloc(f32, k);
     defer allocator.free(act_host);
 
     const slots = try allocator.alloc(DmmvSlot, working_set);
@@ -386,7 +387,7 @@ fn runThroughput(
     const eff_gbps = (@as(f64, @floatFromInt(bytes_per_iter)) * @as(f64, @floatFromInt(iterations))) / (gpu_ms / 1000.0) / 1_000_000_000.0;
     const utilization = if (gpu_config.bandwidth_gbps > 0) eff_gbps / @as(f64, @floatFromInt(gpu_config.bandwidth_gbps)) * 100.0 else 0.0;
 
-    log.info("tq2_bonsai M={d} K={d}: gpu={d:.3} ms/iter wall={d:.3} ms/iter | {d:.1} GB/s | {d:.1}% of peak | {d} B/iter", .{
+    log.info("q2_0_wave32 M={d} K={d}: gpu={d:.3} ms/iter wall={d:.3} ms/iter | {d:.1} GB/s | {d:.1}% of peak | {d} B/iter", .{
         m,
         k,
         gpu_ms / @as(f64, @floatFromInt(iterations)),
@@ -395,7 +396,7 @@ fn runThroughput(
         utilization,
         bytes_per_iter,
     });
-    log.info("ROCm reference (bonsai_tq2_gemv.hip, same shape family): 48.5 GB/s (docs/gpu/HANDOFF-ROCM-GPU.md)", .{});
+    log.info("ROCm reference (bonsai_tq2_gemv.hip, steady-state, same shape): ~160 GB/s", .{});
 }
 
 pub fn main() !void {
