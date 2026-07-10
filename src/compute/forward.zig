@@ -10,6 +10,7 @@ const Buffer = @import("../vulkan/buffer.zig").Buffer;
 const CommandPool = @import("../vulkan/command.zig").CommandPool;
 const CommandBuffer = @import("../vulkan/command.zig").CommandBuffer;
 const Pipeline = @import("../vulkan/pipeline.zig").Pipeline;
+const pipeline_mod = @import("../vulkan/pipeline.zig");
 const GpuConfig = @import("../vulkan/gpu_detect.zig").GpuConfig;
 const GpuVendor = @import("../vulkan/gpu_detect.zig").GpuVendor;
 const loader = @import("../model/loader.zig");
@@ -1101,6 +1102,31 @@ fn moePrefixSharedExactRequested() bool {
 /// Holds the loaded model, all Vulkan pipelines and intermediate activation buffers,
 /// KV-cache page pool, SSM recurrent state, and per-request profiling counters.
 /// One engine instance maps to one GPU device; it is not thread-safe.
+
+/// Per-(layer, projection) LoRA adapter buffers for fwd-pass injection.
+pub const LoraInjectionBindings = extern struct {
+    layer: u32 = 0,
+    proj_idx: u32 = 0, // 0=q, 1=k, 2=v, 3=o, 4=gate, 5=up, 6=down
+    a_buf: vk.c.VkBuffer = null,
+    b_buf: vk.c.VkBuffer = null,
+    a_size: vk.c.VkDeviceSize = 0,
+    b_size: vk.c.VkDeviceSize = 0,
+    rank: u32 = 0,
+    scale: f32 = 0,
+};
+
+/// Push constants for lora_fwd shader: y[m] += scale * sum_r B[r]·x * A[r][m]
+const LoraFwdPush = extern struct {
+    M: u32,
+    K: u32,
+    R: u32,
+    scale: f32,
+    a_off: u32,
+    b_off: u32,
+    x_off: u32,
+    y_off: u32,
+};
+
 pub const InferenceEngine = struct {
     /// Loaded model.
     model: *Model,
@@ -1164,6 +1190,35 @@ pub const InferenceEngine = struct {
     rope_freq_buf: Buffer, // precomputed inverse frequencies for IMROPE / proportional RoPE / YaRN
     unit_norm_weights: Buffer, // all-1.0 weights for plain RMS normalization (Gemma 4 V norm)
     attn_sinks_buf: Buffer, // default per-head sink values (NaN = disabled)
+
+    // ── LoRA training capture buffers ──────────────────────────────────
+    /// Device-local capture buffer for attention norm (norm_buf) at each layer.
+    /// Layout: slot(layer) starts at layer * hidden_dim * sizeof(f32).
+    lora_attn_input_capture_buf: Buffer = .{ .handle = null, .memory = null, .size = 0, .mapped = null, .device = null },
+    /// Device-local capture buffer for FFN norm (ffn_norm_buf) at each layer.
+    lora_ffn_input_capture_buf: Buffer = .{ .handle = null, .memory = null, .size = 0, .mapped = null, .device = null },
+    /// Max layers we allocated capture space for.
+    lora_capture_n_layers: u32 = 0,
+    /// Enable capturing attn norm inputs for LoRA training.
+    capture_lora_attn_input: bool = false,
+    /// Enable capturing FFN norm inputs for LoRA training.
+    capture_lora_ffn_input: bool = false,
+
+    // ── LoRA fwd injection ──────────────────────────────────────────────
+    /// LoRA forward shader pipeline (lora_fwd.spv, 4 bindings: A, B, x, y).
+    lora_fwd_pipeline: ?Pipeline = null,
+    /// LoRA fwd descriptor-set layout (cached).
+    lora_fwd_ds_layout: vk.c.VkDescriptorSetLayout = null,
+    /// Whether LoRA injection is active for the current forward pass.
+    lora_active: bool = false,
+    /// Injection points for the current forward pass.
+    /// Zero-initialised so the linear scan in dispatchLoraFwd never reads
+    /// uninitialised memory when lora_active is accidentally set without
+    /// populating injections.
+    lora_injections: [128]LoraInjectionBindings = [_]LoraInjectionBindings{.{}} ** 128,
+    /// Number of valid entries in lora_injections.
+    lora_injection_count: u32 = 0,
+
     // KV cache (per-layer, for attention layers)
     kv_k_cache: []Buffer, // [n_layers] K cache buffers
     kv_v_cache: []Buffer, // [n_layers] V cache buffers
@@ -1795,6 +1850,21 @@ pub const InferenceEngine = struct {
         errdefer attention.deinit();
         var argmax = try ArgmaxDispatch.init(instance, shader_dir, allocator);
         errdefer argmax.deinit();
+
+        // Load lora_fwd pipeline (optional — only needed for LoRA training)
+        var lora_fwd_pipeline: ?Pipeline = null;
+        var lora_fwd_ds_layout: vk.c.VkDescriptorSetLayout = null;
+        {
+            var path_buf: [512]u8 = undefined;
+            const lora_fwd_path = std.fmt.bufPrint(&path_buf, "{s}/lora_fwd.spv", .{shader_dir}) catch unreachable;
+            lora_fwd_pipeline = pipeline_mod.createFromSpirv(instance, lora_fwd_path, 4, @sizeOf(LoraFwdPush), &.{}, allocator) catch |err| blk: {
+                log.warn("lora_fwd shader not loaded (LoRA training unavailable): {s}", .{@errorName(err)});
+                break :blk null;
+            };
+            if (lora_fwd_pipeline) |pip| {
+                lora_fwd_ds_layout = pip.descriptor_set_layout;
+            }
+        }
 
         const weights_bytes = tensorBytes(model);
         const runtime_profile = memory_plan.profile(config.*);
@@ -3362,6 +3432,34 @@ pub const InferenceEngine = struct {
             log.info("ZINC_CAPTURE_FFN_INPUT=1 requested but prerequisites missing (n_layers or hidden_dim is 0); skipping", .{});
         }
 
+        // LoRA training capture buffers: attn_norm_buf and ffn_norm_buf per layer.
+        // Enabled by ZINC_CAPTURE_LORA_HIDDEN=1 at runtime.
+        const lora_hidden_capture_env = std.posix.getenv("ZINC_CAPTURE_LORA_HIDDEN");
+        const lora_hidden_capture_flag = lora_hidden_capture_env != null and std.mem.eql(u8, lora_hidden_capture_env.?, "1");
+        var lora_attn_input_capture_buf = Buffer{ .handle = null, .memory = null, .size = 0, .mapped = null, .device = instance.device };
+        var lora_ffn_input_capture_buf = Buffer{ .handle = null, .memory = null, .size = 0, .mapped = null, .device = instance.device };
+        var lora_capture_n_layers: u32 = 0;
+        if (lora_hidden_capture_flag and config.n_layers > 0 and config.hidden_dim > 0) {
+            const layer_stride = @as(vk.c.VkDeviceSize, config.hidden_dim) * @sizeOf(f32);
+            const total_bytes = @as(vk.c.VkDeviceSize, config.n_layers) * layer_stride;
+            lora_attn_input_capture_buf = try Buffer.initDeviceLocal(
+                instance,
+                total_bytes,
+                vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            );
+            errdefer lora_attn_input_capture_buf.deinit();
+            lora_ffn_input_capture_buf = try Buffer.initDeviceLocal(
+                instance,
+                total_bytes,
+                vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            );
+            errdefer lora_ffn_input_capture_buf.deinit();
+            lora_capture_n_layers = config.n_layers;
+            log.info("ZINC_CAPTURE_LORA_HIDDEN=1: capture buffers {d} B each (layers={d} hidden={d})", .{
+                total_bytes, config.n_layers, config.hidden_dim,
+            });
+        }
+
         // Effort-6 cycle 97 (A3b foundation): allocate per-token capture
         // buffers for ssm_delta_net inputs at layer 0. The shader already
         // supports n_tok>1 (cycle 77 added the t-loop fold + strides). This
@@ -3829,6 +3927,11 @@ pub const InferenceEngine = struct {
             .prefill_expert_count_buf = prefill_expert_count_buf,
             .prefill_ffn_input_capture_buf = prefill_ffn_input_capture_buf,
             .prefill_ffn_input_capture_max_tokens = prefill_ffn_input_capture_max_tokens,
+            .lora_attn_input_capture_buf = lora_attn_input_capture_buf,
+            .lora_ffn_input_capture_buf = lora_ffn_input_capture_buf,
+            .lora_capture_n_layers = lora_capture_n_layers,
+            .lora_fwd_pipeline = lora_fwd_pipeline,
+            .lora_fwd_ds_layout = lora_fwd_ds_layout,
             .elementwise = elementwise,
             .attention = attention,
             .argmax = argmax,
@@ -7214,6 +7317,27 @@ pub const InferenceEngine = struct {
                         rms_norm_eps,
                     );
                     self.decode_cmd.computeBarrier();
+                    // LoRA training: capture attention norm input per layer
+                    if (self.capture_lora_attn_input and layer < self.lora_capture_n_layers) {
+                        self.decode_cmd.computeAndTransferBarrier();
+                        const slot_off = @as(vk.c.VkDeviceSize, layer) *
+                            @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
+                        if (slot_off + hidden_size <= self.lora_attn_input_capture_buf.size) {
+                            const region = vk.c.VkBufferCopy{
+                                .srcOffset = 0,
+                                .dstOffset = slot_off,
+                                .size = hidden_size,
+                            };
+                            vk.c.vkCmdCopyBuffer(
+                                self.decode_cmd.handle,
+                                self.norm_buf.handle,
+                                self.lora_attn_input_capture_buf.handle,
+                                1,
+                                &region,
+                            );
+                            self.decode_cmd.transferToComputeBarrier();
+                        }
+                    }
                 }
 
                 if (is_full_attn) {
@@ -7296,6 +7420,7 @@ pub const InferenceEngine = struct {
                         // gated below.
                         if (!is_dead_attn_tail) {
                             try self.dispatchDmmv(q_tensor, self.norm_buf, hidden_size, self.attn_out_buf, q_rows, hidden_dim);
+                            try self.dispatchLoraFwd(layer, 0, self.norm_buf, self.attn_out_buf, q_rows, hidden_dim);
                         }
                     } else {
                         // Dense qwen35 may store Q and gate as separate tensors.
@@ -7304,6 +7429,7 @@ pub const InferenceEngine = struct {
                         // gate_buf only feed flash_attn / sigmoid_mul, which also get skipped.
                         if (!is_dead_attn_tail) {
                             try self.dispatchDmmv(q_tensor, self.norm_buf, hidden_size, self.q_buf, q_rows, hidden_dim);
+                            try self.dispatchLoraFwd(layer, 0, self.norm_buf, self.q_buf, q_rows, hidden_dim);
                             if (attn_gate_tensor) |gate_tensor| {
                                 try self.dispatchDmmv(gate_tensor, self.norm_buf, hidden_size, self.gate_buf, q_rows, hidden_dim);
                             }
@@ -7311,6 +7437,7 @@ pub const InferenceEngine = struct {
                     }
                     if (!final_attn_kv_preloaded) {
                         try self.dispatchDmmv(k_tensor, self.norm_buf, hidden_size, self.k_buf, k_rows, hidden_dim);
+                        try self.dispatchLoraFwd(layer, 1, self.norm_buf, self.k_buf, k_rows, hidden_dim);
                     }
                     // Gemma full-attn layers (use_k_as_v) have v_tensor == k_tensor; the
                     // V projection would be a second DMMV reading the same Q4_K weights
@@ -7332,6 +7459,7 @@ pub const InferenceEngine = struct {
                     // first changing one of those three premises.
                     if (!use_k_as_v and !final_attn_kv_preloaded) {
                         try self.dispatchDmmv(v_tensor, self.norm_buf, hidden_size, self.v_buf, v_rows, hidden_dim);
+                        try self.dispatchLoraFwd(layer, 2, self.norm_buf, self.v_buf, v_rows, hidden_dim);
                     }
                     self.endProfilePhase(.attention_qkv, attention_qkv_phase);
                     if (packed_q_gate) {
@@ -8325,6 +8453,7 @@ pub const InferenceEngine = struct {
                             );
                         } else {
                             try self.dispatchDmmvAcc(o_tensor, self.attn_out_buf, self.attn_out_buf.size, self.hidden_buf, hidden_dim, o_cols);
+                            try self.dispatchLoraFwd(layer, 3, self.attn_out_buf, self.hidden_buf, hidden_dim, o_cols);
                             if (lt.attn_output_bias) |bias| {
                                 self.decode_cmd.computeBarrier();
                                 try self.dispatchBiasAdd(self.hidden_buf.handle, hidden_size, bias, hidden_dim);
@@ -8335,6 +8464,7 @@ pub const InferenceEngine = struct {
                     } else {
                         // Unfused path: needed when post-attn norm exists (Gemma) or diagnostics enabled
                         try self.dispatchDmmv(o_tensor, self.attn_out_buf, self.attn_out_buf.size, self.o_proj_buf, hidden_dim, o_cols);
+                        try self.dispatchLoraFwd(layer, 3, self.attn_out_buf, self.o_proj_buf, hidden_dim, o_cols);
                         if (lt.attn_output_bias) |bias| {
                             self.decode_cmd.computeBarrier();
                             try self.dispatchBiasAdd(self.o_proj_buf.handle, hidden_size, bias, hidden_dim);
@@ -8826,6 +8956,27 @@ pub const InferenceEngine = struct {
                     rms_norm_eps,
                 );
                 self.decode_cmd.computeBarrier();
+                // LoRA training: capture FFN norm input per layer
+                if (self.capture_lora_ffn_input and layer < self.lora_capture_n_layers) {
+                    self.decode_cmd.computeAndTransferBarrier();
+                    const slot_off = @as(vk.c.VkDeviceSize, layer) *
+                        @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
+                    if (slot_off + hidden_size <= self.lora_ffn_input_capture_buf.size) {
+                        const region = vk.c.VkBufferCopy{
+                            .srcOffset = 0,
+                            .dstOffset = slot_off,
+                            .size = hidden_size,
+                        };
+                        vk.c.vkCmdCopyBuffer(
+                            self.decode_cmd.handle,
+                            self.ffn_norm_buf.handle,
+                            self.lora_ffn_input_capture_buf.handle,
+                            1,
+                            &region,
+                        );
+                        self.decode_cmd.transferToComputeBarrier();
+                    }
+                }
             }
 
             if (self.partial_decode_stop_after_ffn_norm) {
@@ -10963,9 +11114,11 @@ pub const InferenceEngine = struct {
                 } else {
                     const dense_ffn_gate_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(gate_tensor, self.ffn_norm_buf, hidden_size, self.gate_buf, inter_dim, hidden_dim);
+                    try self.dispatchLoraFwd(layer, 4, self.ffn_norm_buf, self.gate_buf, inter_dim, hidden_dim);
                     self.endProfilePhase(.dense_ffn_gate, dense_ffn_gate_phase);
                     const dense_ffn_up_phase = self.beginProfilePhase();
                     try self.dispatchDmmv(up_tensor, self.ffn_norm_buf, hidden_size, self.up_buf, inter_dim, hidden_dim);
+                    try self.dispatchLoraFwd(layer, 5, self.ffn_norm_buf, self.up_buf, inter_dim, hidden_dim);
                     self.endProfilePhase(.dense_ffn_up, dense_ffn_up_phase);
                     const dense_gateup_ranges = [_]CommandBuffer.BufferRange{
                         .{ .buffer = self.gate_buf.handle, .size = self.gate_buf.size },
@@ -11025,6 +11178,7 @@ pub const InferenceEngine = struct {
                     // eliminating separate scale_acc dispatch + barrier
                     const down_matmul_phase = self.beginProfilePhase();
                     try self.dispatchDmmvAcc(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.hidden_buf, hidden_dim, inter_dim);
+                    try self.dispatchLoraFwd(layer, 6, self.swiglu_buf, self.hidden_buf, hidden_dim, inter_dim);
                     self.endProfilePhase(dense_ffn_down_matmul_profile_phase, down_matmul_phase);
                 } else if (use_fused_pfn_decode) {
                     const next_attn_norm_tensor = if (layer_idx + 1 < layer_end)
@@ -11052,6 +11206,7 @@ pub const InferenceEngine = struct {
                         )) return error.GemmaDenseDecodeDp4aFailed;
                     } else {
                         try self.dispatchDmmv(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.down_buf, hidden_dim, inter_dim);
+                        try self.dispatchLoraFwd(layer, 6, self.swiglu_buf, self.down_buf, hidden_dim, inter_dim);
                     }
                     self.endProfilePhase(dense_ffn_down_matmul_profile_phase, down_matmul_phase);
                     self.decode_cmd.computeBarrier();
@@ -11105,6 +11260,7 @@ pub const InferenceEngine = struct {
                         )) return error.GemmaDenseDecodeDp4aFailed;
                     } else {
                         try self.dispatchDmmv(down_tensor, self.swiglu_buf, self.swiglu_buf.size, self.down_buf, hidden_dim, inter_dim);
+                        try self.dispatchLoraFwd(layer, 6, self.swiglu_buf, self.down_buf, hidden_dim, inter_dim);
                     }
                     self.endProfilePhase(dense_ffn_down_matmul_profile_phase, down_matmul_phase);
                     self.decode_cmd.computeBarrier();
@@ -29180,6 +29336,8 @@ pub const InferenceEngine = struct {
         self.rope_freq_buf.deinit();
         self.unit_norm_weights.deinit();
         self.attn_sinks_buf.deinit();
+        if (self.lora_attn_input_capture_buf.handle != null) self.lora_attn_input_capture_buf.deinit();
+        if (self.lora_ffn_input_capture_buf.handle != null) self.lora_ffn_input_capture_buf.deinit();
         self.moe_out_buf.deinit();
         self.down_buf.deinit();
         self.swiglu_buf.deinit();
@@ -29210,6 +29368,7 @@ pub const InferenceEngine = struct {
         self.attention.deinit();
         self.elementwise.deinit();
         self.dmmv.deinit();
+        if (self.lora_fwd_pipeline) |*pip| pip.deinit();
         self.decode_cmd.deinit(&self.cmd_pool);
         self.prefill_cmd_alt.deinit(&self.cmd_pool);
         self.prefill_cmd_alt2.deinit(&self.cmd_pool);
@@ -29240,9 +29399,104 @@ pub const InferenceEngine = struct {
         self.cmd_pool.deinit();
         self.* = undefined;
     }
-};
 
-/// Dump top-5 logits for a given decode step (for comparing with the reference implementation).
+    /// Dispatch lora_fwd for one adapter at (layer, proj_idx).
+    /// Reads x from input_buf (norm_buf/ffn_norm_buf), accumulates y into DMMV output buffer.
+    fn dispatchLoraFwd(self: *InferenceEngine, layer: u32, proj_idx: u32, input_buf: Buffer, output_buf: Buffer, m: u32, k: u32) !void {
+        if (!self.lora_active) return;
+
+        // Pipeline barrier: ensure preceding dispatches (DMMV, etc.) have
+        // finished writing to output_buf before we read and accumulate.
+        // Without this barrier, dispatchLoraFwd can race with dispatchDmmv
+        // on the same buffer (read-after-write / write-after-write).
+        self.decode_cmd.computeBarrier();
+        var found = false;
+        var i: u32 = 0;
+        while (i < self.lora_injection_count) : (i += 1) {
+            const inj = &self.lora_injections[i];
+            if (inj.layer == layer and inj.proj_idx == proj_idx) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return;
+
+        const inj = &self.lora_injections[i];
+        const pip = self.lora_fwd_pipeline orelse return;
+        const push_data = std.mem.asBytes(&LoraFwdPush{
+            .M = m,
+            .K = k,
+            .R = inj.rank,
+            .scale = inj.scale,
+            .a_off = 0,
+            .b_off = 0,
+            .x_off = 0,
+            .y_off = 0,
+        });
+
+        if (self.instance.push_descriptor_fn != null) {
+            const infos = [4]vk.c.VkDescriptorBufferInfo{
+                .{ .buffer = inj.a_buf, .offset = 0, .range = inj.a_size },
+                .{ .buffer = inj.b_buf, .offset = 0, .range = inj.b_size },
+                .{ .buffer = input_buf.handle, .offset = 0, .range = input_buf.size },
+                .{ .buffer = output_buf.handle, .offset = 0, .range = output_buf.size },
+            };
+            self.decode_cmd.pushDescAndDispatch(&pip, self.instance.push_descriptor_fn, infos[0..], push_data, m, 1, 1);
+        } else {
+            const ds = try self.allocDescSetLora(pip.descriptor_set_layout);
+            self.writeDescSetLora4(ds,
+                inj.a_buf, inj.a_size,
+                inj.b_buf, inj.b_size,
+                input_buf.handle, input_buf.size,
+                output_buf.handle, output_buf.size);
+            self.decode_cmd.dispatchWithPush(&pip, ds, push_data, m, 1, 1);
+        }
+    }
+
+    fn allocDescSetLora(self: *InferenceEngine, layout: vk.c.VkDescriptorSetLayout) !vk.c.VkDescriptorSet {
+        const alloc_info = vk.c.VkDescriptorSetAllocateInfo{
+            .sType = vk.c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.shared_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout,
+        };
+        var ds: vk.c.VkDescriptorSet = null;
+        const result = vk.c.vkAllocateDescriptorSets(self.instance.device, &alloc_info, &ds);
+        if (result != vk.c.VK_SUCCESS) return error.DescriptorSetAllocFailed;
+        return ds;
+    }
+
+    fn writeDescSetLora4(self: *InferenceEngine, ds: vk.c.VkDescriptorSet,
+        buf0: vk.c.VkBuffer, size0: vk.c.VkDeviceSize,
+        buf1: vk.c.VkBuffer, size1: vk.c.VkDeviceSize,
+        buf2: vk.c.VkBuffer, size2: vk.c.VkDeviceSize,
+        buf3: vk.c.VkBuffer, size3: vk.c.VkDeviceSize,
+    ) void {
+        var buffer_infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = buf0, .offset = 0, .range = size0 },
+            .{ .buffer = buf1, .offset = 0, .range = size1 },
+            .{ .buffer = buf2, .offset = 0, .range = size2 },
+            .{ .buffer = buf3, .offset = 0, .range = size3 },
+        };
+        var writes: [4]vk.c.VkWriteDescriptorSet = undefined;
+        for (&writes, 0..) |*w, i| {
+            w.* = .{
+                .sType = vk.c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = null,
+                .dstSet = ds,
+                .dstBinding = @intCast(i),
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk.c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = null,
+                .pBufferInfo = &buffer_infos[i],
+                .pTexelBufferView = null,
+            };
+        }
+        vk.c.vkUpdateDescriptorSets(self.instance.device, 4, &writes, 0, null);
+    }
+};
 fn dumpTop5Logits(engine: *const InferenceEngine, step: u32) void {
     const vocab_size = engine.model.config.vocab_size;
     const logits_ptr: [*]const f32 = @ptrCast(@alignCast(engine.logits_staging.mapped.?));
