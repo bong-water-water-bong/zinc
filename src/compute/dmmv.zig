@@ -392,6 +392,12 @@ pub const DmmvDispatch = struct {
     pipeline_q8_0_wide: ?Pipeline,
     /// Q8_0 wide-vocab LM-head variant with four rows per workgroup.
     pipeline_q8_0_wide4: ?Pipeline,
+    /// TQ2_0_g128 ternary Bonsai GEMV (Vulkan port of bonsai_tq2_gemv.hip).
+    /// 8-row workgroups, LDS-staged activations, hard-pinned to
+    /// required_subgroup_size=32 -- no cross-subgroup-size fallback exists
+    /// in the shader, so pipeline creation fails (not degrades) if the
+    /// driver can't honor the request.
+    pipeline_tq2_bonsai: ?Pipeline,
     /// Q8_0 x Q8_1 integer-dot DMMV. Binding 1 is a quantized Q8_1 activation
     /// buffer produced by pipeline_quantize_q8_1.
     pipeline_q8_0_q8_1: ?Pipeline,
@@ -961,6 +967,22 @@ pub const DmmvDispatch = struct {
         const q8_wide4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_wide4.spv", .{shader_dir}) catch unreachable;
         const pipeline_q8_0_wide4 = pipeline_mod.createFromSpirvWithOptions(instance, q8_wide4_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q8_0 wide4 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        // Hard-pinned wave32: this shader's byte-per-lane qs decode and
+        // 8-rows-per-workgroup (4 subgroups x 2 rows) topology only make
+        // sense at exactly 32 lanes/subgroup, unlike the wave64-capable
+        // effective_wave64_options used above. No conditional fallback --
+        // if the driver can't honor required_subgroup_size=32, pipeline
+        // creation fails and the pipeline stays null (spike-only kernel).
+        const tq2_bonsai_options = pipeline_mod.PipelineOptions{
+            .required_subgroup_size = 32,
+            .require_full_subgroups = true,
+            .push_descriptors = has_push_desc,
+        };
+        const tq2_bonsai_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_tq2_bonsai.spv", .{shader_dir}) catch unreachable;
+        const pipeline_tq2_bonsai = pipeline_mod.createFromSpirvWithOptions(instance, tq2_bonsai_path, 3, push_size, &.{}, tq2_bonsai_options, allocator) catch |err| blk: {
+            log.warn("TQ2 Bonsai shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
         const q8_q81_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_q8_1.spv", .{shader_dir}) catch unreachable;
@@ -2374,6 +2396,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q8_0_spec128 = pipeline_q8_0_spec128,
             .pipeline_q8_0_wide = pipeline_q8_0_wide,
             .pipeline_q8_0_wide4 = pipeline_q8_0_wide4,
+            .pipeline_tq2_bonsai = pipeline_tq2_bonsai,
             .pipeline_q8_0_q8_1 = pipeline_q8_0_q8_1,
             .pipeline_q4k_q8_1 = pipeline_q4k_q8_1,
             .pipeline_q8_0_fused_pair = pipeline_q8_0_fused_pair,
@@ -5918,6 +5941,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q8_0_spec128) |*p| p.deinit();
         if (self.pipeline_q8_0_wide) |*p| p.deinit();
         if (self.pipeline_q8_0_wide4) |*p| p.deinit();
+        if (self.pipeline_tq2_bonsai) |*p| p.deinit();
         if (self.pipeline_q8_0_q8_1) |*p| p.deinit();
         if (self.pipeline_q4k_q8_1) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_pair) |*p| p.deinit();
