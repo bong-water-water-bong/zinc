@@ -1,35 +1,32 @@
 #version 460
-// ZINC - TQ2_0_g128 ternary Bonsai GEMV. Vulkan port of
-// /home/bcloud/src/bonsai_tq2_gemv.hip (Bonsai-1.7B production decode-path
-// kernel, 113 tok/s / 48.5 GB/s reference on gfx1151 ROCm).
+// ZINC - Q2_0 (prism-ml Bonsai ternary) GEMV, wave32-specialized fast path.
+// Same format as dmmv_q2_0.comp (128 elems/34 bytes, d-first, LSB-first 2-bit
+// codes, value(code)=code-1 in {-1,0,+1,+2} -- verified bit-exact vs F16 via
+// q2_0_decode.py) and the same 3-binding / DmmvPushConstants contract, but
+// with the 8-rows/workgroup, LDS-staged-activation topology proven out in
+// the bonsai_tq2_gemv.hip -> Vulkan spike (8x activation-read amortization
+// vs dmmv_q2_0.comp's 2-rows/workgroup design).
 //
-// Format: per 128-weight block, 2 bytes f16 scale `d` (first), then 32
-// bytes of 2-bit codes (4/byte, LSB-first). Code map: 00->-1, 01->0,
-// 10->+1, 11->0 (reserved, unused).
+// MUST run at subgroup size 32 (pipeline creation pins
+// required_subgroup_size=32 + require_full_subgroups) -- unlike
+// dmmv_q2_0.comp, this shader has no cross-subgroup-size fallback path, so
+// it is loaded as a separate pipeline (pipeline_q2_0_wave32) selected only
+// when the device confirms wave32 support; dmmv_q2_0.comp remains the
+// portable fallback for wave64 hardware.
 //
-// Deliberate deviations from the HIP reference (see plan notes):
-//   - Activations (binding=1) are float16_t, matching the real decode-path
-//     buffer.
-//   - Output (binding=2) is f32, not fp16-clamped, so the correctness test
-//     compares directly against an f32 CPU reference without an extra
-//     precision-matching step.
-//
-// Thread model — MUST run at subgroup size 32 (pipeline creation pins
-// required_subgroup_size=32 + require_full_subgroups; no cross-subgroup-size
-// fallback path exists in this shader):
+// Thread model:
 //   - One workgroup = 128 threads (4 subgroups x 32 lanes) = 8 output rows.
 //   - Subgroup `w` owns rows [8*wg + 2*w, 8*wg + 2*w + 2) -- 2 rows/subgroup,
 //     each subgroup's reduction is self-contained (no cross-subgroup fold).
 //   - Activations for the current 128-weight block are staged into `shared`
 //     memory once per block by all 128 threads, then all 8 rows read from
-//     that slab (8x amortization over per-row activation reads).
+//     that slab.
 //   - Each lane covers 4 consecutive weights (one qs byte) per row per
 //     block: lane `l` -> weights 4l..4l+3, i.e. byte index `l` in qs[].
 
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_EXT_shader_16bit_storage : require
 
 layout(local_size_x = 128) in;
 
@@ -43,7 +40,7 @@ layout(push_constant) uniform PushConstants {
 };
 
 layout(set = 0, binding = 0) readonly buffer MatrixA { uint8_t a_data[]; };
-layout(set = 0, binding = 1) readonly buffer VectorX { float16_t x_data[]; };
+layout(set = 0, binding = 1) readonly buffer VectorX { float x_data[]; };
 layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
 
 const uint BLOCK_WEIGHTS = 128u;
@@ -51,13 +48,11 @@ const uint BLOCK_BYTES = 34u;
 const uint ROWS_PER_WG = 8u;
 const uint ROWS_PER_SUBGROUP = 2u;
 
-shared float16_t x_lds[BLOCK_WEIGHTS];
+shared float x_lds[BLOCK_WEIGHTS];
 
-float ternaryValue(uint code) {
-    // v(c) = float(c==2) - float(c==0); reserved 0b11 -> 0 (both false).
-    float pos = (code == 2u) ? 1.0 : 0.0;
-    float neg = (code == 0u) ? 1.0 : 0.0;
-    return pos - neg;
+// value(code) = code - 1 -> {-1, 0, +1, +2}. Verified bit-exact vs F16.
+float codeValue(uint code) {
+    return float(code) - 1.0;
 }
 
 void main() {
@@ -74,17 +69,17 @@ void main() {
     acc[1] = 0.0;
 
     for (uint b = 0u; b < num_blocks; b++) {
-        // Cooperative load: 128 threads each stage one fp16 activation.
+        // Cooperative load: 128 threads each stage one f32 activation.
         barrier();
-        x_lds[tid] = x_data[x_offset + b * BLOCK_WEIGHTS + tid];
+        x_lds[tid] = x_data[x_offset / 4u + b * BLOCK_WEIGHTS + tid];
         barrier();
 
         // This lane's 4 activations (byte index `lane` within the block).
         const uint a_base = lane * 4u;
-        const float a0 = float(x_lds[a_base + 0u]);
-        const float a1 = float(x_lds[a_base + 1u]);
-        const float a2 = float(x_lds[a_base + 2u]);
-        const float a3 = float(x_lds[a_base + 3u]);
+        const float a0 = x_lds[a_base + 0u];
+        const float a1 = x_lds[a_base + 1u];
+        const float a2 = x_lds[a_base + 2u];
+        const float a3 = x_lds[a_base + 3u];
 
         for (uint r = 0u; r < ROWS_PER_SUBGROUP; r++) {
             const uint row = row_base + wave * ROWS_PER_SUBGROUP + r;
@@ -93,7 +88,7 @@ void main() {
             const uint blk_off = a_offset + row_eff * row_bytes + b * BLOCK_BYTES;
 
             // `d` is warp-uniform; manual 2-byte unpack (same style as
-            // dmmv_q8_0_wide.comp) since a_data is a uint8_t buffer.
+            // dmmv_q2_0.comp) since a_data is a uint8_t buffer.
             const uint scale_lo = uint(a_data[blk_off + 0u]);
             const uint scale_hi = uint(a_data[blk_off + 1u]);
             const float d = unpackHalf2x16(scale_lo | (scale_hi << 8u)).x;
@@ -106,17 +101,17 @@ void main() {
             const uint c2 = (qbyte >> 4u) & 3u;
             const uint c3 = (qbyte >> 6u) & 3u;
 
-            float partial = ternaryValue(c0) * a0;
-            partial += ternaryValue(c1) * a1;
-            partial += ternaryValue(c2) * a2;
-            partial += ternaryValue(c3) * a3;
+            float partial = codeValue(c0) * a0;
+            partial += codeValue(c1) * a1;
+            partial += codeValue(c2) * a2;
+            partial += codeValue(c3) * a3;
 
             if (row_valid) acc[r] += d * partial;
         }
     }
 
     // Per-row reduction within the owning subgroup (2 rows/subgroup,
-    // self-contained -- no cross-subgroup fold, unlike dmmv_q8_0_wide.comp).
+    // self-contained -- no cross-subgroup fold, unlike dmmv_q2_0.comp).
     for (uint r = 0u; r < ROWS_PER_SUBGROUP; r++) {
         float v = subgroupAdd(acc[r]);
         if (lane == 0u) {
