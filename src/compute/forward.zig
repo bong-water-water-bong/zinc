@@ -1105,14 +1105,14 @@ fn moePrefixSharedExactRequested() bool {
 
 /// Per-(layer, projection) LoRA adapter buffers for fwd-pass injection.
 pub const LoraInjectionBindings = extern struct {
-    layer: u32,
-    proj_idx: u32, // 0=q, 1=k, 2=v, 3=o, 4=gate, 5=up, 6=down
-    a_buf: vk.c.VkBuffer,
-    b_buf: vk.c.VkBuffer,
-    a_size: vk.c.VkDeviceSize,
-    b_size: vk.c.VkDeviceSize,
-    rank: u32,
-    scale: f32,
+    layer: u32 = 0,
+    proj_idx: u32 = 0, // 0=q, 1=k, 2=v, 3=o, 4=gate, 5=up, 6=down
+    a_buf: vk.c.VkBuffer = null,
+    b_buf: vk.c.VkBuffer = null,
+    a_size: vk.c.VkDeviceSize = 0,
+    b_size: vk.c.VkDeviceSize = 0,
+    rank: u32 = 0,
+    scale: f32 = 0,
 };
 
 /// Push constants for lora_fwd shader: y[m] += scale * sum_r B[r]·x * A[r][m]
@@ -1215,7 +1215,7 @@ pub const InferenceEngine = struct {
     /// Zero-initialised so the linear scan in dispatchLoraFwd never reads
     /// uninitialised memory when lora_active is accidentally set without
     /// populating injections.
-    lora_injections: [128]LoraInjectionBindings = .{.{}} ** 128,
+    lora_injections: [128]LoraInjectionBindings = [_]LoraInjectionBindings{.{}} ** 128,
     /// Number of valid entries in lora_injections.
     lora_injection_count: u32 = 0,
 

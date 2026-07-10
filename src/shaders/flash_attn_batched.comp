@@ -427,6 +427,7 @@ void main() {
     // H2O: keep score_accum binding alive for the shared pipeline layout.
     // A volatile read avoids the coherent read-modify-write self-assignment
     // that previously caused unnecessary global-memory traffic on every
-    // workgroup invocation.
-    if (tid == 0u) { float _keep = score_accum[0]; (void)_keep; }
+    // workgroup invocation. GLSL has no (void)-cast idiom like C/C++ and
+    // doesn't warn on unused locals, so the bare read is sufficient.
+    if (tid == 0u) { float _keep = score_accum[0]; }
 }

@@ -2431,7 +2431,7 @@ pub fn main() !void {
         // ── LoRA training mode ──────────────────────────────────────────
         is_debug_mode = config.debug or std.posix.getenv("ZINC_DEBUG") != null;
 
-        const resolved_model_for_train: ResolvedStartupModel = resolveStartupModel(config, allocator) catch |err| {
+        var resolved_model_for_train: ResolvedStartupModel = resolveStartupModel(config, allocator) catch |err| {
             log.err("Failed to resolve model for training: {s}", .{@errorName(err)});
             std.process.exit(1);
         };
