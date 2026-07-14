@@ -630,7 +630,10 @@ fn dequantRow(raw_data: []const u8, row: u32, cols: u32, quant_type: GGMLType, o
                     const byte_idx = j >> 2;
                     const bit_off = (j & 3) * 2;
                     const code: u32 = (@as(u32, qs[byte_idx]) >> @intCast(bit_off)) & 3;
-                    output[out_i + j] = (@as(f32, @floatFromInt(@as(i32, @intCast(code)) - 1))) * d;
+                    // code 3 is reserved/0 per Bonsai spec (not +2)
+                    output[out_i + j] = (@as(f32, @floatFromInt(@as(i32, @intCast(code & 3)) - 1)))
+                        * @as(f32, @floatFromInt(if (code == 3) @as(u32, 0) else @as(u32, 1)))
+                        * d;
                 }
                 out_i += bsz;
             }
