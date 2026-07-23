@@ -510,6 +510,36 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // --- C ABI shared library (for embedding as a backend in 1bit-systems'
+    // unified_server, see src/c_abi.zig) — Vulkan-only for now, matching
+    // this checkout's primary target hardware. ---
+    if (selected_backend != .zinc_rt) {
+        const c_abi_mod = b.createModule(.{
+            .root_source_file = b.path("src/c_abi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        if (is_macos) {
+            c_abi_mod.addCSourceFile(.{
+                .file = b.path("src/metal/shim.m"),
+                .flags = &.{ "-fobjc-arc", "-fmodules" },
+            });
+            c_abi_mod.addIncludePath(b.path("src/metal"));
+            c_abi_mod.linkFramework("Metal", .{});
+            c_abi_mod.linkFramework("Foundation", .{});
+        } else {
+            configureVulkanModule(b, target, c_abi_mod);
+        }
+
+        const c_abi_lib = b.addLibrary(.{
+            .name = "zinc",
+            .root_module = c_abi_mod,
+            .linkage = .dynamic,
+        });
+        b.installArtifact(c_abi_lib);
+    }
+
     const hot_bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_hot_decode.zig"),
         .target = target,
