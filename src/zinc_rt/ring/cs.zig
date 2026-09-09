@@ -946,17 +946,20 @@ pub const PendingDmmvQ4_0RowRangeParallelChunks = struct {
     }
 };
 
-/// Q4_0 row window staged once into the long-lived CS input BO.
-///
-/// This is still GTT-backed bring-up memory, not the final device-local weight
-/// residency model, but it lets the executed M1 LM-head proof stop copying the
-/// same weight rows into the dispatch scratch on every run.
+pub const ResidentDmmvQ4_0Memory = enum {
+    gtt_input_bo,
+    vram_bo,
+};
+
+/// Q4_0 row window staged once into a long-lived CS-visible BO.
 pub const ResidentDmmvQ4_0Rows = struct {
     weight_off: usize,
+    weight_va: u64,
     rows: u32,
     cols: u32,
     row_bytes: usize,
     bytes: usize,
+    memory: ResidentDmmvQ4_0Memory,
 };
 
 /// Outcome classification for the CS bring-up smoke gate.
@@ -1029,11 +1032,14 @@ pub const TokenBoundary = struct {
     output_va: u64,
     signal_va: u64,
     shader_va: u64,
+    resident_va: u64,
     ib_map: []align(std.heap.page_size_min) u8,
     input_map: []align(std.heap.page_size_min) u8,
     output_map: []align(std.heap.page_size_min) u8,
     signal_map: []align(std.heap.page_size_min) u8,
     shader_map: []align(std.heap.page_size_min) u8,
+    resident_map: ?[]align(std.heap.page_size_min) u8,
+    resident_size: usize,
     builder: packet.PacketBuilder,
     submit_count: u32 = 0,
     last_fence_handle: u64 = 0,
@@ -1081,12 +1087,14 @@ pub const TokenBoundary = struct {
         // consume a fully GPU-produced capped LM-head argmax.
         const input_bo_size: usize = 6 * 1024 * 1024;
         const page_size: usize = 4096;
-        const output_bo_size: usize = 32 * 1024;
+        const output_bo_size: usize = 2 * 1024 * 1024;
+        const resident_bo_size: usize = 320 * 1024 * 1024;
         const ib_va: u64 = 0x1_0200_0000;
         const input_va: u64 = ib_va + ib_bo_size;
         const output_va: u64 = input_va + input_bo_size;
         const signal_va: u64 = output_va + output_bo_size;
         const shader_va: u64 = signal_va + page_size;
+        const resident_va: u64 = shader_va + shader_page_bytes;
 
         const ib_bo = kmd.createGem(file, ib_bo_size, 256, kmd.AMDGPU_GEM_DOMAIN_GTT, kmd.AMDGPU_GEM_CREATE_CPU_GTT_USWC) catch return error.IbBoFailed;
         const ib_map = kmd.mmapGem(file, ib_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch return error.IbMapFailed;
@@ -1115,6 +1123,26 @@ pub const TokenBoundary = struct {
         errdefer std.posix.munmap(shader_map);
         kmd.mapGemVa(file, shader_bo, shader_va, exec_va_flags) catch return error.ShaderVaFailed;
 
+        var resident_map: ?[]align(std.heap.page_size_min) u8 = null;
+        var resident_bo_handle: u32 = 0;
+        if (kmd.createGem(
+            file,
+            resident_bo_size,
+            256,
+            kmd.AMDGPU_GEM_DOMAIN_VRAM,
+            kmd.AMDGPU_GEM_CREATE_VRAM_CLEARED | kmd.AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
+        )) |resident_bo| {
+            if (kmd.mmapGem(file, resident_bo, std.posix.PROT.READ | std.posix.PROT.WRITE)) |map| {
+                if (kmd.mapGemVa(file, resident_bo, resident_va, data_va_flags)) {
+                    resident_map = map;
+                    resident_bo_handle = resident_bo.handle;
+                } else |_| {
+                    std.posix.munmap(map);
+                }
+            } else |_| {}
+        } else |_| {}
+        errdefer if (resident_map) |map| std.posix.munmap(map);
+
         const shader_words = @as([*]u32, @ptrCast(@alignCast(shader_map.ptr)))[0 .. shader_page_bytes / @sizeOf(u32)];
         for (shader_words) |*word| word.* = 0xbfb00000;
         for (argmax_top2_gfx1201, 0..) |word, i| shader_words[shader_offset_argmax_top2 / @sizeOf(u32) + i] = word;
@@ -1132,20 +1160,29 @@ pub const TokenBoundary = struct {
         for (dmmv_q4_0_resident_grid_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_resident_grid / @sizeOf(u32) + i] = word;
         storeFence();
 
-        var bo_entries = [_]DrmAmdgpuBoListEntry{
-            .{ .bo_handle = ib_bo.handle, .bo_priority = 0 },
-            .{ .bo_handle = input_bo.handle, .bo_priority = 0 },
-            .{ .bo_handle = output_bo.handle, .bo_priority = 0 },
-            .{ .bo_handle = signal_bo.handle, .bo_priority = 0 },
-            .{ .bo_handle = shader_bo.handle, .bo_priority = 0 },
-        };
+        var bo_entries: [6]DrmAmdgpuBoListEntry = undefined;
+        var bo_count: usize = 0;
+        bo_entries[bo_count] = .{ .bo_handle = ib_bo.handle, .bo_priority = 0 };
+        bo_count += 1;
+        bo_entries[bo_count] = .{ .bo_handle = input_bo.handle, .bo_priority = 0 };
+        bo_count += 1;
+        bo_entries[bo_count] = .{ .bo_handle = output_bo.handle, .bo_priority = 0 };
+        bo_count += 1;
+        bo_entries[bo_count] = .{ .bo_handle = signal_bo.handle, .bo_priority = 0 };
+        bo_count += 1;
+        bo_entries[bo_count] = .{ .bo_handle = shader_bo.handle, .bo_priority = 0 };
+        bo_count += 1;
+        if (resident_bo_handle != 0) {
+            bo_entries[bo_count] = .{ .bo_handle = resident_bo_handle, .bo_priority = 0 };
+            bo_count += 1;
+        }
         var bo_list: DrmAmdgpuBoList = std.mem.zeroes(DrmAmdgpuBoList);
         bo_list.in = .{
             .operation = AMDGPU_BO_LIST_OP_CREATE,
             .list_handle = 0,
-            .bo_number = bo_entries.len,
+            .bo_number = @intCast(bo_count),
             .bo_info_size = @sizeOf(DrmAmdgpuBoListEntry),
-            .bo_info_ptr = @intFromPtr(&bo_entries),
+            .bo_info_ptr = @intFromPtr(bo_entries[0..bo_count].ptr),
         };
         ioctlRaw(file, ioc_bo_list, @intFromPtr(&bo_list)) catch return error.BoListFailed;
         const bo_list_handle = bo_list.out.list_handle;
@@ -1162,11 +1199,14 @@ pub const TokenBoundary = struct {
             .output_va = output_va,
             .signal_va = signal_va,
             .shader_va = shader_va,
+            .resident_va = resident_va,
             .ib_map = ib_map,
             .input_map = input_map,
             .output_map = output_map,
             .signal_map = signal_map,
             .shader_map = shader_map,
+            .resident_map = resident_map,
+            .resident_size = if (resident_map != null) resident_bo_size else 0,
             .builder = packet.PacketBuilder.init(ib_words),
         };
     }
@@ -1178,6 +1218,7 @@ pub const TokenBoundary = struct {
     pub fn deinit(self: *TokenBoundary) void {
         destroyBoList(self.file, self.bo_list_handle);
         freeContext(self.file, self.ctx_id);
+        if (self.resident_map) |map| std.posix.munmap(map);
         std.posix.munmap(self.signal_map);
         std.posix.munmap(self.output_map);
         std.posix.munmap(self.input_map);
@@ -1185,6 +1226,15 @@ pub const TokenBoundary = struct {
         std.posix.munmap(self.ib_map);
         self.file.close();
         self.* = undefined;
+    }
+
+    pub fn residentDmmvQ4_0CapacityBytes(self: *const TokenBoundary) usize {
+        if (self.resident_map) |map| return map.len;
+        return self.input_map.len;
+    }
+
+    pub fn dmmvOutputRowsCapacity(self: *const TokenBoundary) u32 {
+        return @intCast(@min(self.output_map.len / @sizeOf(f32), @as(usize, std.math.maxInt(u32))));
     }
 
     fn waitFence(self: *TokenBoundary, fence_handle: u64) SubmitError!void {
@@ -2137,9 +2187,9 @@ pub const TokenBoundary = struct {
         const sig_lo: u32 = @truncate(self.signal_va);
         const sig_hi: u32 = @truncate(self.signal_va >> 32);
         try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
-            out_lo,                              out_hi,
-            sig_lo,                              sig_hi,
-            groups,                              @truncate(signal_expected),
+            out_lo,                           out_hi,
+            sig_lo,                           sig_hi,
+            groups,                           @truncate(signal_expected),
             @truncate(signal_expected >> 32), 0,
         });
         try self.builder.dispatchDirectInitiator(groups, 1, 1, packet.dispatch_initiator_compute);
@@ -2183,7 +2233,7 @@ pub const TokenBoundary = struct {
     /// the input BO, dispatches ceil(rows/64) workgroups (each picks its 64-row
     /// block from workgroup_id_x/ttmp9), and reads back `rows` results in ONE
     /// submit. This is the correctness path (weights staged per call); the perf
-    /// path will instead point s[4:5] at a VRAM-resident weight BO.
+    /// path points s[4:5] at a previously staged resident row window.
     pub fn dmmvQ4_0ResidentGrid(
         self: *TokenBoundary,
         input: []const f32,
@@ -2192,8 +2242,22 @@ pub const TokenBoundary = struct {
         cols: u32,
         output: []f32,
     ) !void {
+        const pending = try self.beginDmmvQ4_0ResidentGrid(input, weights_q4_0, rows, cols);
+        try pending.finish(output);
+    }
+
+    /// Submit the staged-weight grid-over-rows Q4_0 DMMV and return before the
+    /// fence wait. Callers can overlap CPU tail work with the resident-grid
+    /// dispatch, then finish through the returned pending handle.
+    pub fn beginDmmvQ4_0ResidentGrid(
+        self: *TokenBoundary,
+        input: []const f32,
+        weights_q4_0: []const u8,
+        rows: u32,
+        cols: u32,
+    ) !PendingDmmvQ4_0RowRangeParallelChunks {
         if (rows == 0 or cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
-        if (input.len < cols or output.len < rows) return error.ShapeMismatch;
+        if (input.len < cols) return error.ShapeMismatch;
         const row_bytes: usize = (@as(usize, cols) / 32) * 18;
         const weights_bytes = @as(usize, rows) * row_bytes;
         if (weights_q4_0.len < weights_bytes) return error.ShapeMismatch;
@@ -2201,10 +2265,63 @@ pub const TokenBoundary = struct {
         const input_bytes = std.mem.sliceAsBytes(input[0..cols]);
         const weight_off = std.mem.alignForward(usize, input_bytes.len, 64);
         if (weight_off + weights_bytes > self.input_map.len) return error.InputTooLarge;
+
+        @memcpy(self.input_map[weight_off..][0..weights_bytes], weights_q4_0[0..weights_bytes]);
+        return self.beginDmmvQ4_0ResidentGridAtWeightVa(
+            input,
+            rows,
+            cols,
+            row_bytes,
+            self.input_va + @as(u64, weight_off),
+            weight_off,
+        );
+    }
+
+    /// Submit the resident-weight grid-over-rows Q4_0 DMMV. Only the activation
+    /// vector is copied; weights are read from the long-lived resident region.
+    pub fn beginDmmvQ4_0ResidentGridResident(
+        self: *TokenBoundary,
+        input: []const f32,
+        resident: ResidentDmmvQ4_0Rows,
+    ) !PendingDmmvQ4_0RowRangeParallelChunks {
+        const scratch_weight_off = switch (resident.memory) {
+            .gtt_input_bo => blk: {
+                if (resident.weight_off + resident.bytes > self.input_map.len) return error.InputTooLarge;
+                break :blk resident.weight_off;
+            },
+            .vram_bo => blk: {
+                if (resident.weight_off + resident.bytes > self.resident_size) return error.InputTooLarge;
+                break :blk self.input_map.len;
+            },
+        };
+        return self.beginDmmvQ4_0ResidentGridAtWeightVa(
+            input,
+            resident.rows,
+            resident.cols,
+            resident.row_bytes,
+            resident.weight_va,
+            scratch_weight_off,
+        );
+    }
+
+    fn beginDmmvQ4_0ResidentGridAtWeightVa(
+        self: *TokenBoundary,
+        input: []const f32,
+        rows: u32,
+        cols: u32,
+        row_bytes: usize,
+        weight_va: u64,
+        scratch_weight_off: usize,
+    ) !PendingDmmvQ4_0RowRangeParallelChunks {
+        if (rows == 0 or cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
+        if (input.len < cols) return error.ShapeMismatch;
+        if (row_bytes == 0) return error.ShapeMismatch;
+
+        const input_bytes = std.mem.sliceAsBytes(input[0..cols]);
+        if (input_bytes.len > scratch_weight_off) return error.InputTooLarge;
         if (@as(usize, rows) * @sizeOf(f32) > self.output_map.len) return error.OutputTooLarge;
 
         @memcpy(self.input_map[0..input_bytes.len], input_bytes);
-        @memcpy(self.input_map[weight_off..][0..weights_bytes], weights_q4_0[0..weights_bytes]);
 
         const output_words: [*]volatile u32 = @ptrCast(@alignCast(self.output_map.ptr));
         const signal_words: [*]volatile u32 = @ptrCast(@alignCast(self.signal_map.ptr));
@@ -2231,7 +2348,6 @@ pub const TokenBoundary = struct {
         const in_hi: u32 = @truncate(self.input_va >> 32);
         const out_lo: u32 = @truncate(self.output_va);
         const out_hi: u32 = @truncate(self.output_va >> 32);
-        const weight_va = self.input_va + @as(u64, weight_off);
         const weight_lo: u32 = @truncate(weight_va);
         const weight_hi: u32 = @truncate(weight_va >> 32);
         try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
@@ -2258,22 +2374,23 @@ pub const TokenBoundary = struct {
             .chunk_data = @intFromPtr(&ib_chunk_data),
         }};
         var chunk_ptrs = [_]u64{@intFromPtr(&chunks[0])};
-        self.last_fence_handle = try submitBuilderAndWait(
+        self.last_fence_handle = try submitBuilder(
             self.file,
             self.ctx_id,
-            self.ip_type,
             self.bo_list_handle,
             &self.builder,
             &ib_chunk_data,
             &chunk_ptrs,
             &self.last_ib_bytes,
-            &self.last_wait_status,
         );
         self.submit_count += 1;
 
-        const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
-        if (signal_value != signal_expected) return error.SignalMismatch;
-        for (0..rows) |i| output[i] = @bitCast(output_words[i]);
+        return .{
+            .boundary = self,
+            .fence_handle = self.last_fence_handle,
+            .signal_expected = signal_expected,
+            .rows = rows,
+        };
     }
 
     /// One-shot check that a `size`-byte VRAM BO is CPU-mappable (large-BAR) and
@@ -2446,7 +2563,8 @@ pub const TokenBoundary = struct {
         try pending.finish(output);
     }
 
-    /// Stage a Q4_0 row window into the high end of the long-lived input BO.
+    /// Stage a Q4_0 row window into the resident VRAM BO when available, or
+    /// into the high end of the long-lived input BO as a compatibility fallback.
     ///
     /// The returned handle is valid until another caller overwrites the same
     /// resident region. Default M1 generation uses it for the first LM-head
@@ -2461,8 +2579,23 @@ pub const TokenBoundary = struct {
         const row_bytes: usize = (@as(usize, cols) / 32) * 18;
         const weights_bytes = @as(usize, rows) * row_bytes;
         if (weights_q4_0.len < weights_bytes) return error.ShapeMismatch;
-        if (weights_bytes > self.input_map.len) return error.InputTooLarge;
+        if (self.resident_map) |resident_map| {
+            if (weights_bytes <= resident_map.len) {
+                @memcpy(resident_map[0..weights_bytes], weights_q4_0[0..weights_bytes]);
+                storeFence();
+                return .{
+                    .weight_off = 0,
+                    .weight_va = self.resident_va,
+                    .rows = rows,
+                    .cols = cols,
+                    .row_bytes = row_bytes,
+                    .bytes = weights_bytes,
+                    .memory = .vram_bo,
+                };
+            }
+        }
 
+        if (weights_bytes > self.input_map.len) return error.InputTooLarge;
         const unaligned_off = self.input_map.len - weights_bytes;
         const weight_off = unaligned_off - (unaligned_off % 64);
         if (weight_off == 0) return error.InputTooLarge;
@@ -2471,10 +2604,12 @@ pub const TokenBoundary = struct {
         storeFence();
         return .{
             .weight_off = weight_off,
+            .weight_va = self.input_va + @as(u64, weight_off),
             .rows = rows,
             .cols = cols,
             .row_bytes = row_bytes,
             .bytes = weights_bytes,
+            .memory = .gtt_input_bo,
         };
     }
 
@@ -2487,14 +2622,23 @@ pub const TokenBoundary = struct {
         input: []const f32,
         resident: ResidentDmmvQ4_0Rows,
     ) !PendingDmmvQ4_0RowRangeParallelChunks {
-        if (resident.weight_off + resident.bytes > self.input_map.len) return error.InputTooLarge;
+        const scratch_weight_off = switch (resident.memory) {
+            .gtt_input_bo => blk: {
+                if (resident.weight_off + resident.bytes > self.input_map.len) return error.InputTooLarge;
+                break :blk resident.weight_off;
+            },
+            .vram_bo => blk: {
+                if (resident.weight_off + resident.bytes > self.resident_size) return error.InputTooLarge;
+                break :blk self.input_map.len;
+            },
+        };
         return self.beginDmmvQ4_0RowRangeParallelChunksAtWeightVa(
             input,
             resident.rows,
             resident.cols,
             resident.row_bytes,
-            self.input_va + @as(u64, resident.weight_off),
-            resident.weight_off,
+            resident.weight_va,
+            scratch_weight_off,
         );
     }
 
@@ -3283,6 +3427,122 @@ pub const TokenBoundary = struct {
         output: []f32,
     ) !void {
         return self.dmmvQ8_0TwoRowRangesImpl(input, weights_a_q8_0, rows_a, weights_b_q8_0, rows_b, cols, output, true);
+    }
+
+    /// Dispatch one or more adjacent 64-row Q8_0 row-parallel chunks in one CS submission.
+    ///
+    /// The helper stages a contiguous Q8_0 row window once, emits one
+    /// row-parallel dispatch per 64 rows into the same IB, and waits once after
+    /// the final release fence. The default router verifier uses this to keep
+    /// full 256-expert coverage without four independent `amdgpu_cs` waits.
+    /// @param input Input activation vector of length `cols`.
+    /// @param weights_q8_0 Row-major GGML Q8_0 rows; must hold exactly `rows` rows.
+    /// @param rows Number of rows to compute; must be a positive multiple of 64.
+    /// @param cols Inner dimension; must be a multiple of 32.
+    /// @param output Output slice receiving `rows` f32 values.
+    pub fn dmmvQ8_0RowRangeParallelChunks(
+        self: *TokenBoundary,
+        input: []const f32,
+        weights_q8_0: []const u8,
+        rows: u32,
+        cols: u32,
+        output: []f32,
+    ) !void {
+        const chunk_rows: u32 = 64;
+        if (rows == 0 or rows % chunk_rows != 0 or cols == 0 or cols % 32 != 0) return error.ShapeMismatch;
+        if (input.len < cols or output.len < rows) return error.ShapeMismatch;
+
+        const row_bytes: usize = (@as(usize, cols) / 32) * 34;
+        const weights_bytes = @as(usize, rows) * row_bytes;
+        if (weights_q8_0.len < weights_bytes) return error.ShapeMismatch;
+
+        const input_bytes = std.mem.sliceAsBytes(input[0..cols]);
+        const weight_off = std.mem.alignForward(usize, input_bytes.len, 64);
+        if (weight_off + weights_bytes > self.input_map.len) return error.InputTooLarge;
+        if (@as(usize, rows) * @sizeOf(f32) > self.output_map.len) return error.OutputTooLarge;
+
+        @memcpy(self.input_map[0..input_bytes.len], input_bytes);
+        @memcpy(self.input_map[weight_off..][0..weights_bytes], weights_q8_0[0..weights_bytes]);
+
+        const output_words: [*]volatile u32 = @ptrCast(@alignCast(self.output_map.ptr));
+        const signal_words: [*]volatile u32 = @ptrCast(@alignCast(self.signal_map.ptr));
+        for (0..rows) |i| output_words[i] = 0x7fc0_0000;
+        signal_words[0] = 0;
+        signal_words[1] = 0;
+        storeFence();
+
+        const signal_expected: u64 = 0x5A494E435254_8200 | @as(u64, self.submit_count + 1);
+        self.builder.reset();
+        try self.builder.writeNop(1);
+
+        const pgm_va = self.shader_va + shader_offset_dmmv_q8_0_row_range_parallel;
+        try self.builder.setShReg(packet.sh_reg_pgm_lo, &[_]u32{ @truncate(pgm_va >> 8), @truncate(pgm_va >> 40) });
+        try self.builder.setShReg(packet.sh_reg_pgm_rsrc1, &[_]u32{
+            compute_pgm_rsrc1_vgpr16_value,
+            compute_pgm_rsrc2_user8_vgpr_workitem_x_value,
+        });
+        try self.builder.setShRegOne(packet.sh_reg_pgm_rsrc3, 0);
+        try self.builder.setShReg(packet.sh_reg_num_thread_x, &[_]u32{ chunk_rows, 1, 1 });
+        try self.builder.setShReg(packet.sh_reg_resource_limits, &[_]u32{
+            0,
+            0xffff_ffff,
+            0xffff_ffff,
+        });
+
+        const in_lo: u32 = @truncate(self.input_va);
+        const in_hi: u32 = @truncate(self.input_va >> 32);
+        const weight_va = self.input_va + @as(u64, weight_off);
+        var row_start: u32 = 0;
+        while (row_start < rows) : (row_start += chunk_rows) {
+            const out_va = self.output_va + @as(u64, row_start) * @sizeOf(f32);
+            const chunk_weight_va = weight_va + @as(u64, row_start) * @as(u64, row_bytes);
+            try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
+                in_lo,
+                in_hi,
+                @truncate(out_va),
+                @truncate(out_va >> 32),
+                @truncate(chunk_weight_va),
+                @truncate(chunk_weight_va >> 32),
+                cols,
+                chunk_rows,
+            });
+            try self.builder.dispatchDirectInitiator(1, 1, 1, packet.dispatch_initiator_compute);
+        }
+        try self.builder.releaseMemSignal(self.signal_va, signal_expected);
+        try self.builder.padToAlignment(64);
+        storeFence();
+
+        var ib_chunk_data: DrmAmdgpuCsChunkIb = .{
+            ._pad = 0,
+            .flags = AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
+            .va_start = self.ib_va,
+            .ib_bytes = 0,
+            .ip_type = self.ip_type,
+            .ip_instance = 0,
+            .ring = 0,
+        };
+        var chunks = [_]DrmAmdgpuCsChunk{.{
+            .chunk_id = AMDGPU_CHUNK_ID_IB,
+            .length_dw = @sizeOf(DrmAmdgpuCsChunkIb) / @sizeOf(u32),
+            .chunk_data = @intFromPtr(&ib_chunk_data),
+        }};
+        var chunk_ptrs = [_]u64{@intFromPtr(&chunks[0])};
+        self.last_fence_handle = try submitBuilderAndWait(
+            self.file,
+            self.ctx_id,
+            self.ip_type,
+            self.bo_list_handle,
+            &self.builder,
+            &ib_chunk_data,
+            &chunk_ptrs,
+            &self.last_ib_bytes,
+            &self.last_wait_status,
+        );
+        self.submit_count += 1;
+
+        const signal_value = @as(u64, signal_words[0]) | (@as(u64, signal_words[1]) << 32);
+        if (signal_value != signal_expected) return error.SignalMismatch;
+        for (0..rows) |i| output[i] = @bitCast(output_words[i]);
     }
 
     fn dmmvQ8_0TwoRowRangesImpl(

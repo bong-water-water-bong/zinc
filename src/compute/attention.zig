@@ -3,6 +3,7 @@
 //! This helper owns the pipeline resources needed to bind paged attention
 //! inputs and record a flash-attention compute pass.
 const std = @import("std");
+const kv_dtype = @import("kv_dtype.zig");
 const vk = @import("../vulkan/vk.zig");
 const Instance = @import("../vulkan/instance.zig").Instance;
 const Pipeline = @import("../vulkan/pipeline.zig").Pipeline;
@@ -55,11 +56,19 @@ pub const FlashAttnSplitMergePush = extern struct {
 /// (`pipeline_batched`), and split-K decode (`pipeline_split` +
 /// `pipeline_split_merge`). The active variant is selected by the
 /// caller; all pipelines are loaded during `init` and destroyed by `deinit`.
+/// Queries packed into one workgroup by flash_attn_batched_qt. Must match `QT`
+/// in the shader.
+pub const flash_attn_query_tile: u32 = 4;
+
 pub const AttentionDispatch = struct {
     /// Vulkan compute pipeline, or null if unavailable.
     pipeline: ?Pipeline,
     /// Batched variant — processes N queries per dispatch with causal mask.
     pipeline_batched: ?Pipeline,
+    /// Query-tiled prefill variant (flash_attn_batched_qt): one workgroup owns
+    /// `query_tile` consecutive queries of a head, so each loaded K/V row feeds
+    /// that many dot products. Null when the shader is unavailable.
+    pipeline_batched_qt: ?Pipeline,
     /// Split-K variant — same flash_attn.spv specialized with N_I_CHUNKS=fa_split_k_active
     /// so it writes per-chunk partials into partial_attn_out_buf instead of the
     /// final normalized output. Enabled by default (N=4); disabled when ZINC_FA_SPLIT_K is 0 or 1.
@@ -111,7 +120,7 @@ pub const AttentionDispatch = struct {
         };
 
         // Flash attention: 6 bindings (Q, K cache, V cache, page table, output, per-head sinks)
-        const attn_path = std.fmt.bufPrint(&path_buf, "{s}/flash_attn.spv", .{shader_dir}) catch unreachable;
+        const attn_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.spv", .{ shader_dir, kv_dtype.shaderName("flash_attn") }) catch unreachable;
         const pipeline = pipeline_mod.createFromSpirvWithOptions(instance, attn_path, 6, @sizeOf(FlashAttnPush), &.{}, wave64_push_options, allocator) catch |err| blk: {
             log.warn("flash_attn shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
@@ -123,9 +132,17 @@ pub const AttentionDispatch = struct {
         // handles all prompt tokens with per-query causal masking. Used by
         // both the prefill batched path (n_queries=N) and the decode-shape
         // foundation gated by ZINC_BATCH_ATTN=1 (n_queries=1).
-        const attn_batched_path = std.fmt.bufPrint(&path_buf, "{s}/flash_attn_batched.spv", .{shader_dir}) catch unreachable;
+        const attn_batched_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.spv", .{ shader_dir, kv_dtype.shaderName("flash_attn_batched") }) catch unreachable;
         const pipeline_batched = pipeline_mod.createFromSpirvWithOptions(instance, attn_batched_path, 6, @sizeOf(FlashAttnBatchedPush), &.{}, wave64_push_options, allocator) catch |err| blk: {
             log.warn("flash_attn_batched shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        // Query-tiled prefill sibling. Same bindings and push constants, so it
+        // is a drop-in for long prompts; the grid packs `flash_attn_query_tile`
+        // queries per workgroup.
+        const attn_qt_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.spv", .{ shader_dir, kv_dtype.shaderName("flash_attn_batched_qt") }) catch unreachable;
+        const pipeline_batched_qt = pipeline_mod.createFromSpirvWithOptions(instance, attn_qt_path, 6, @sizeOf(FlashAttnBatchedPush), &.{}, wave64_push_options, allocator) catch |err| blk: {
+            log.warn("flash_attn_batched_qt shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -152,7 +169,7 @@ pub const AttentionDispatch = struct {
         if (fa_split_k_request > 1) {
             // path_buf was reused by the batched-shader path above; rebuild
             // the flash_attn.spv path before specializing the split-K variant.
-            const split_attn_path = std.fmt.bufPrint(&path_buf, "{s}/flash_attn.spv", .{shader_dir}) catch unreachable;
+            const split_attn_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.spv", .{ shader_dir, kv_dtype.shaderName("flash_attn") }) catch unreachable;
             const split_specs = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = fa_split_k_request }};
             pipeline_split = pipeline_mod.createFromSpirvWithOptions(instance, split_attn_path, 6, @sizeOf(FlashAttnPush), &split_specs, wave64_push_options, allocator) catch |err| blk: {
                 log.warn("flash_attn split-K specialization not loaded: {s}", .{@errorName(err)});
@@ -182,6 +199,7 @@ pub const AttentionDispatch = struct {
         return AttentionDispatch{
             .pipeline = pipeline,
             .pipeline_batched = pipeline_batched,
+            .pipeline_batched_qt = pipeline_batched_qt,
             .pipeline_split = pipeline_split,
             .pipeline_split_merge = pipeline_split_merge,
             .fa_split_k_active = fa_split_k_active,
@@ -252,6 +270,34 @@ pub const AttentionDispatch = struct {
     /// @param attn_scale Attention softmax scale factor (0 = use 1/sqrt(head_dim)).
     /// @param sink_offset Per-layer offset into the sink buffer (layer_idx * n_heads).
     /// @returns `error.ShaderNotLoaded` when the batched pipeline is unavailable.
+    pub fn recordFlashAttnBatchedQt(
+        self: *const AttentionDispatch,
+        cmd: *CommandBuffer,
+        descriptor_set: vk.c.VkDescriptorSet,
+        head_dim: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        seq_start: u32,
+        n_queries: u32,
+        page_size: u32,
+        attn_scale: f32,
+        sink_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_batched_qt) |*p| p else return error.ShaderNotLoaded;
+        const push = FlashAttnBatchedPush{
+            .head_dim = head_dim,
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .seq_start = seq_start,
+            .n_queries = n_queries,
+            .page_size = page_size,
+            .attn_scale_bits = if (attn_scale != 0) @as(u32, @bitCast(attn_scale)) else 0,
+            .sink_offset = sink_offset,
+        };
+        const groups_y = (n_queries + flash_attn_query_tile - 1) / flash_attn_query_tile;
+        cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), n_heads, groups_y, 1);
+    }
+
     pub fn recordFlashAttnBatched(
         self: *const AttentionDispatch,
         cmd: *CommandBuffer,
@@ -353,6 +399,7 @@ pub const AttentionDispatch = struct {
     pub fn deinit(self: *AttentionDispatch) void {
         if (self.pipeline) |*p| p.deinit();
         if (self.pipeline_batched) |*p| p.deinit();
+        if (self.pipeline_batched_qt) |*p| p.deinit();
         if (self.pipeline_split) |*p| p.deinit();
         if (self.pipeline_split_merge) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);

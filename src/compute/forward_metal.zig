@@ -30,9 +30,27 @@ const log = std.log.scoped(.forward);
 /// see this as a soft safety net rather than the primary limit.
 pub const runtime_context_cap: u32 = 262144;
 const queued_prefill_embed_tokens: usize = 256;
+/// Max tokens verified in one speculative-decode batched pass (1 seed + drafts).
+/// Sizes `verify_logits_buf` (vocab x this). Draft length is capped below it.
+/// A verify is a ~fixed-cost batched forward, so a longer accepted draft
+/// amortizes it better — the adaptive draft cap shrinks it when acceptance drops.
+const spec_max_verify_tokens: u32 = 32;
+/// Largest per-request batched-prefill scratch (in prompt tokens) kept alive
+/// between requests. Scratch buffers scale with the prompt length, so a
+/// single very long prompt must not pin token-scaled buffers for the
+/// lifetime of the engine; requests above the cap fall back to transient
+/// allocate-and-free, exactly the pre-cache behavior.
+const batched_prefill_scratch_retain_max_tokens: u32 = 512;
 const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
 const qwen_ssm_projection_prefill_min_tokens: usize = 32;
-const qwen35_dense27b_queued_prefill_max_tokens: usize = 40;
+// 27B layer-major single-shot / chunk ceiling. Was 40 (a conservative
+// validation limit from Effort 28); raised to 192 after verifying the
+// layer-major prefill is byte-identical to the per-token reference at every
+// chunk size up to the 256-token scratch-buffer limit (2026-07-19, greedy
+// output on 45-481 token prompts + cross-chunk recall). Larger chunks mean
+// fewer, wider GEMM batches: ~+28% prefill on the 27B (106 -> 135 tok/s).
+// Overridable via ZINC_QWEN27B_CHUNK_TOKENS; see qwen35Dense27bQueuedPrefillMaxTokens.
+const qwen35_dense27b_queued_prefill_max_tokens: usize = 192;
 const qwen35_dense9b_prefill_prefix_layers: usize = 32;
 const qwen_ssm_projection_validate_default_tokens: u32 = 4;
 // the reference implementation's Metal `ggml_metal_op_mul_mat_id` switches from the small
@@ -260,7 +278,7 @@ fn defaultQ8DualThreadgroup(chip: metal_device.GpuFamily, simd_width: u32, max_t
 }
 
 fn supportsDenseQ6kSimdgroupDmmvArch(arch: config_mod.Architecture) bool {
-    return arch == .gemma or arch == .qwen2;
+    return arch == .gemma or arch == .qwen2 or arch == .muse_glimmer;
 }
 
 const qwen35_27b_dense_down_q6k_blocks: u32 = 68; // 17408 / QK_K
@@ -536,6 +554,17 @@ fn isQwen35Dense9bDownQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u3
         std.mem.endsWith(u8, tensor_name, "ffn_down.weight");
 }
 
+fn isQwen35Dense9bDownQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    // Same shape contract as the Q4_K predicate. The block constant counts
+    // K-dimension superblocks in *elements* (QK_K = 256 for every K-quant;
+    // see GGMLType.blockSize), which Q4_K and Q6_K share — only their bytes
+    // per superblock differ (144 vs 210), and byte layout is owned by the
+    // kernel picked per quant type in dispatchQwenSharedBatchedGemmOnCmd,
+    // never by this predicate. The 27B constants make the same point:
+    // qwen35_27b_dense_down_q4k_blocks == qwen35_27b_dense_down_q6k_blocks.
+    return isQwen35Dense9bDownQ4kTarget(cfg, tensor_name, M, K);
+}
+
 fn isQwen35DensePrefillGateUpQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
     if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) {
         return isQwen35Dense9bGateUpQ4kTarget(cfg, tensor_name, M, K);
@@ -545,7 +574,14 @@ fn isQwen35DensePrefillGateUpQ4kTarget(cfg: ModelConfig, tensor_name: []const u8
 
 fn isQwen35DensePrefillDownTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32, quant_type: GGMLType) bool {
     if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) {
-        return quant_type == .q4_k and isQwen35Dense9bDownQ4kTarget(cfg, tensor_name, M, K);
+        // Q4_K_M exports of the 9B (including the catalog model) quantize
+        // ffn_down as Q6_K; the batched gemm_q6k path handles it, so gating
+        // on Q4_K alone disabled the whole layer-major prefill for them.
+        return switch (quant_type) {
+            .q4_k => isQwen35Dense9bDownQ4kTarget(cfg, tensor_name, M, K),
+            .q6_k => isQwen35Dense9bDownQ6kTarget(cfg, tensor_name, M, K),
+            else => false,
+        };
     }
     if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
         return switch (quant_type) {
@@ -1070,11 +1106,39 @@ fn qwen35DensePrefillPrefixLayerLimit(cfg: ModelConfig) usize {
     return 1;
 }
 
+/// The 27B layer-major single-shot / chunk ceiling (default 192). The scratch
+/// buffers are sized to qwen_ssm_projection_prefill_max_tokens (256), so
+/// ZINC_QWEN27B_CHUNK_TOKENS can retune it (e.g. lower on a slower machine, or
+/// sweep to re-confirm correctness). Clamped to [min, 256].
+fn qwen35Dense27bQueuedPrefillMaxTokens() u32 {
+    const default_max: u32 = @intCast(qwen35_dense27b_queued_prefill_max_tokens);
+    const requested = readU32Env("ZINC_QWEN27B_CHUNK_TOKENS") orelse return default_max;
+    const min_tokens: u32 = @intCast(qwen_ssm_projection_prefill_min_tokens);
+    return @min(@max(requested, min_tokens), qwen_ssm_projection_prefill_max_tokens);
+}
+
 fn shouldUseQwen35Dense27bQueuedTokenMajorPrefill(cfg: ModelConfig, prompt_len: usize) bool {
     return defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg) and
         cfg.full_attn_interval == 4 and
         prompt_len >= qwen_ssm_projection_prefill_min_tokens and
-        prompt_len <= qwen35_dense27b_queued_prefill_max_tokens;
+        prompt_len <= qwen35Dense27bQueuedPrefillMaxTokens();
+}
+
+/// Largest prompt (in tokens) the queued/batched prefill path can process in
+/// a single call for this model, or null if the model has no such path. Used
+/// both to gate multi-chunk continuation prefill and as the chunk size when
+/// a prompt exceeds it.
+///
+/// Each model has its own ceiling: the 9B's is the 256-token embed-buffer cap
+/// (queued_prefill_embed_tokens); the 27B's is qwen35_dense27b_queued_prefill_max_tokens
+/// (192, overridable), the largest chunk verified byte-identical to the
+/// per-token reference. Both stay within the 256-token scratch buffers.
+fn queuedTokenMajorChunkTokens(cfg: ModelConfig) ?u32 {
+    if (defaultQwen35Dense9bQueuedPrefillEnabled(cfg)) return @intCast(queued_prefill_embed_tokens);
+    if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg) and cfg.full_attn_interval == 4) {
+        return qwen35Dense27bQueuedPrefillMaxTokens();
+    }
+    return null;
 }
 
 fn defaultQwen35Dense9bQueuedPrefillEnabled(cfg: ModelConfig) bool {
@@ -2521,6 +2585,11 @@ pub fn defaultKvCacheQ8Enabled(config: ModelConfig, debug_validation_enabled: bo
     // implement that path yet, so keep Gemma4 on the unquantized cache for
     // correctness.
     if (config.architecture == .gemma and config.rope_freq_base_swa > 0) return false;
+    // Muse Glimmer: the Q8 KV cache dequant in the batched-flash path scales with
+    // context and costs ~15-22% decode at moderate context vs the unquantized
+    // cache (which is what the reference runtime uses). Default to the fast unquantized cache;
+    // opt back into Q8 with ZINC_METAL_KV_Q8=1 on memory-constrained setups.
+    if (config.architecture == .muse_glimmer) return false;
     const kv_dim = kvDim(config);
     return kv_dim > 0 and config.head_dim > 0 and kv_dim % 32 == 0 and config.head_dim % 32 == 0;
 }
@@ -6209,7 +6278,51 @@ fn shouldDefaultDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
     // dim guard — we drop the dim guard for .qwen2 dense and keep it for
     // Gemma where the kernel was originally tuned for hidden_dim=5376.
     if (cfg.architecture == .qwen2 and cfg.n_experts == 0) return true;
+    if (cfg.architecture == .muse_glimmer and cfg.n_experts == 0) return true;
     return cfg.architecture == .gemma and cfg.n_experts == 0 and cfg.hidden_dim >= 5000;
+}
+
+/// Muse Glimmer's batched prefill slice. Unlike the generic dense path it
+/// permits the per-layer attention gate, QK-norm, post-attn/post-FFN norms, and
+/// the RoPE-on-SWA / NoPE-on-global window pattern — all applied in-batch by the
+/// prefillBatched layer body. Every unsupported case falls back to per-token.
+fn canUseMuseGlimmerBatchedPrefill(engine: *const InferenceEngine) bool {
+    const cfg = engine.config;
+    if (cfg.architecture != .muse_glimmer or cfg.n_experts != 0) return false;
+    if (cfg.ssm_d_inner > 0) return false;
+    if (engine.private_decode_buffers) return false;
+    if (engine.attn_sink_values != null) return false;
+    if (engine.gemm_q4k_pipe.handle == null or
+        engine.gemm_q6k_pipe.handle == null or
+        engine.swiglu_batched_pipe.handle == null or
+        engine.sigmoid_mul_pipe.handle == null)
+    {
+        return false;
+    }
+    // The batched path drives the LM head through dispatchLmHeadWithInputOffset
+    // (same as decode), so its quant (muse: Q5_K) need not be a batched-GEMM type.
+
+    for (0..cfg.n_layers) |i| {
+        const lt = engine.layer_tensors[i];
+        const gate = lt.attn_gate orelse return false; // muse gates every layer
+        if (lt.attn_q_bias != null or lt.attn_k_bias != null or
+            lt.attn_v_bias != null or lt.attn_output_bias != null) return false;
+        const q = lt.attn_q orelse return false;
+        const k = lt.attn_k orelse return false;
+        const o = lt.attn_output orelse return false;
+        const ffn_gate = lt.ffn_gate orelse return false;
+        const up = lt.ffn_up orelse return false;
+        const down = lt.ffn_down orelse return false;
+        const attn = resolveLayerAttentionParams(cfg, lt, cfg.hidden_dim, engine.kv_cache_q8) catch return false;
+        for ([_]*const metal_loader.LoadedTensor{ q, k, o, gate, ffn_gate, up, down }) |t| {
+            if (!supportsBatchedGemmQuant(engine, t.info.type_)) return false;
+        }
+        if (!attn.use_k_as_v) {
+            const v = lt.attn_v orelse return false;
+            if (!supportsBatchedGemmQuant(engine, v.info.type_)) return false;
+        }
+    }
+    return true;
 }
 
 fn canUseDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
@@ -6284,6 +6397,7 @@ fn canUseBatchedPrefill(engine: *const InferenceEngine) bool {
         if (cfg.n_experts > 0) return canUseGemmaBatchedPrefill(engine);
         return canUseDenseGemmaBatchedPrefill(engine);
     }
+    if (cfg.architecture == .muse_glimmer) return canUseMuseGlimmerBatchedPrefill(engine);
     if (cfg.n_experts > 0) return false;
     if (cfg.ssm_d_inner > 0) return false;
     if (cfg.architecture == .gpt_oss) return false;
@@ -6359,6 +6473,16 @@ fn batchedPrefillAttentionDims(engine: *const InferenceEngine) !BatchedPrefillAt
 /// into `hidden` and read the last-token slice back out at the end.
 const BatchedPrefillScratch = struct {
     n_tokens: u32,
+    /// Allocation-shape inputs recorded for the cache-reuse capacity check in
+    /// `acquireBatchedPrefillScratch`. Every buffer size is monotone
+    /// non-decreasing in (n_tokens, q_dim, kv_dim, inter_dim) except
+    /// `moe_route_input`, whose slot count is NOT monotonic in n_tokens
+    /// (`batchedPrefillMoeRouteInputSlots`: n<32 needs n*k_used rows, n>=32
+    /// needs n), so its allocated capacity is tracked separately.
+    q_dim: u32,
+    kv_dim: u32,
+    inter_dim: u32,
+    route_input_slots: u32,
     hidden: MetalBuffer,
     norm: MetalBuffer,
     q: MetalBuffer,
@@ -6501,6 +6625,10 @@ const BatchedPrefillScratch = struct {
         const moe_down = try metal_buffer.createBuffer(ctx, @max(route_slots * hidden_n * f32_sz, 4));
         return .{
             .n_tokens = n_tokens,
+            .q_dim = q_dim,
+            .kv_dim = kv_dim,
+            .inter_dim = inter_dim,
+            .route_input_slots = @intCast(route_input_slots),
             .hidden = h,
             .norm = nm,
             .q = qb,
@@ -6523,6 +6651,16 @@ const BatchedPrefillScratch = struct {
             .moe_expert_down = moe_down,
             .moe_route_slots = @intCast(route_slots),
         };
+    }
+
+    /// Restore the invariants `init` establishes on buffers that are read
+    /// before being fully written (only `moe_active_block_count`, which is
+    /// zero-filled). Required when a cached scratch is reused for a new
+    /// request instead of being freshly allocated.
+    fn resetForReuse(self: *BatchedPrefillScratch) void {
+        if (self.moe_active_block_count.cpu_ptr) |bytes| {
+            @memset(bytes[0..self.moe_active_block_count.size], 0);
+        }
     }
 
     fn deinit(self: *BatchedPrefillScratch) void {
@@ -6815,8 +6953,27 @@ pub const InferenceEngine = struct {
     logits_readback_buf: MetalBuffer,
     argmax_buf: MetalBuffer,
     argmax_partials_buf: MetalBuffer,
+    // Speculative-decode verify: when non-null, the batched forward's tail
+    // projects every position through the LM head and writes per-position argmax
+    // here instead of the last-token-only tail. `verify_logits_buf` holds the
+    // batched [n_tokens x vocab] logits for CPU argmax.
+    verify_argmax_out: ?[]u32 = null,
+    verify_logits_buf: MetalBuffer,
     embed_staging: MetalBuffer,
     prefill_embed_buf: MetalBuffer,
+    /// Cached batched-prefill scratch reused across requests to keep ~20
+    /// Metal buffer allocations/frees out of the per-request prefill path.
+    /// Sized to the largest prompt seen (capped by
+    /// `batched_prefill_scratch_retain_max_tokens`); see
+    /// `acquireBatchedPrefillScratch`. NOTE: `init` builds the engine from
+    /// `undefined`, so this must be assigned there — a declaration default
+    /// would silently not apply.
+    batched_prefill_scratch_cache: ?BatchedPrefillScratch,
+    /// Debug guard: true while an acquired scratch is live. Generation is
+    /// serialized per engine and the prefill paths that acquire scratch
+    /// never nest, so overlapping acquires would be a refactoring bug;
+    /// asserted in `acquireBatchedPrefillScratch`.
+    batched_prefill_scratch_in_use: bool,
     lm_head_private_buf: MetalBuffer,
     expert_ids_buf: MetalBuffer,
 
@@ -6859,6 +7016,7 @@ pub const InferenceEngine = struct {
     dmmv_q4k_lmhead_norm_pipe: MetalPipeline,
     dmmv_q5k_pipe: MetalPipeline,
     dmmv_q5k_native_pipe: MetalPipeline,
+    dmmv_q5k_llama_pipe: MetalPipeline,
     dmmv_q6k_pipe: MetalPipeline,
     dmmv_q6k_llama_pipe: MetalPipeline,
     dmmv_q6k_llama_k4096_pipe: MetalPipeline,
@@ -6933,6 +7091,13 @@ pub const InferenceEngine = struct {
     deinterleave_pipe: MetalPipeline,
     deinterleave_batched_pipe: MetalPipeline,
     flash_attn_pipe: MetalPipeline,
+    // Split-simdgroup decode flash for long context (f32 KV, contiguous).
+    // 8 simdgroups/head each scan interleaved key blocks with their own online
+    // softmax, then merge — fixes the 32-thread/head latency-bound decay at
+    // depth (287us/dispatch @1000 ctx while touching ~2 MB). ZINC_FLASH_SPLIT=0
+    // disables (kill-switch; cached here so the per-dispatch check is a bool).
+    flash_attn_split_pipe: MetalPipeline,
+    flash_split_enabled: bool = true,
     flash_attn_q8_pipe: MetalPipeline,
     kv_cache_write_pipe: MetalPipeline,
     kv_cache_write_q8_pipe: MetalPipeline,
@@ -7324,6 +7489,10 @@ pub const InferenceEngine = struct {
         self.config = cfg;
         self.allocator = allocator;
         self.position = 0;
+        // `self` starts as `undefined`, so field default values in the struct
+        // declaration do not apply — every field must be assigned here.
+        self.batched_prefill_scratch_cache = null;
+        self.batched_prefill_scratch_in_use = false;
         self.max_context_tokens = max_ctx;
         self.profile_enabled = options.profile_enabled;
         self.logits_readback_enabled = false;
@@ -7357,7 +7526,7 @@ pub const InferenceEngine = struct {
         self.qwen35_dense_q4k_swiglu_validation_ok_mask = 0;
         self.qwen35_dense_q4k_swiglu_validation_fail_mask = 0;
         if (self.qwen35_dense_q4k_swiglu_validation_enabled) {
-            log.info("Metal validation: Qwen3.6 27B dense Q4_K gate/up+SwiGLU validator enabled at layer {d} scan={s} tokens={d}; optional token filter ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN", .{
+            log.info("Metal validation: Qwen dense-hybrid 27B Q4_K gate/up+SwiGLU validator enabled at layer {d} scan={s} tokens={d}; optional token filter ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN", .{
                 qwen35DenseQ4KSwiGLUValidateLayer(&self),
                 if (self.qwen35_dense_q4k_swiglu_validation_scan_layers) "yes" else "no",
                 self.qwen35_dense_q4k_swiglu_validation_token_limit,
@@ -7513,6 +7682,8 @@ pub const InferenceEngine = struct {
             .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.argmax_buf = try metal_buffer.createBuffer(ctx, 2 * @sizeOf(u32));
         self.argmax_partials_buf = try createMetalBufferForMode(ctx, argmax_pairs_size, self.private_decode_buffers);
+        self.verify_argmax_out = null;
+        self.verify_logits_buf = try metal_buffer.createBuffer(ctx, vocab_size * spec_max_verify_tokens);
         self.embed_staging = try metal_buffer.createBuffer(ctx, hidden_size);
         self.prefill_embed_buf = try metal_buffer.createBuffer(ctx, hidden_size * queued_prefill_embed_tokens);
         self.qwen_ssm_prefill_proj_norm_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * hidden_size, 4));
@@ -7666,6 +7837,7 @@ pub const InferenceEngine = struct {
         self.dmmv_q4k_lmhead_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_norm");
         self.dmmv_q5k_pipe = try loadShaderPipeline(ctx, "dmmv_q5k");
         self.dmmv_q5k_native_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_native");
+        self.dmmv_q5k_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_llama");
         self.dmmv_q6k_pipe = try loadShaderPipeline(ctx, "dmmv_q6k");
         self.dmmv_q6k_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_llama");
         self.dmmv_q6k_llama_k4096_pipe = try loadShaderPipelineWithPrefix(
@@ -7765,6 +7937,8 @@ pub const InferenceEngine = struct {
         self.deinterleave_pipe = try loadShaderPipeline(ctx, "deinterleave");
         self.deinterleave_batched_pipe = try loadShaderPipeline(ctx, "deinterleave_batched");
         self.flash_attn_pipe = try loadShaderPipeline(ctx, "flash_attn");
+        self.flash_attn_split_pipe = try loadShaderPipeline(ctx, "flash_attn_split");
+        self.flash_split_enabled = readBoolEnv("ZINC_FLASH_SPLIT") orelse true;
         self.flash_attn_q8_pipe = try loadShaderPipeline(ctx, "flash_attn_q8");
         self.kv_cache_write_pipe = try loadShaderPipeline(ctx, "kv_cache_write");
         self.kv_cache_write_q8_pipe = try loadShaderPipeline(ctx, "kv_cache_write_q8");
@@ -8596,6 +8770,10 @@ pub const InferenceEngine = struct {
             shim.mtl_rset_free(rs);
             self.scratch_rset = null;
         }
+        if (self.batched_prefill_scratch_cache) |*scratch| {
+            scratch.deinit();
+            self.batched_prefill_scratch_cache = null;
+        }
         metal_buffer.freeBuffer(&self.hidden_buf);
         metal_buffer.freeBuffer(&self.residual_buf);
         metal_buffer.freeBuffer(&self.norm_buf);
@@ -8614,6 +8792,7 @@ pub const InferenceEngine = struct {
         metal_buffer.freeBuffer(&self.logits_readback_buf);
         metal_buffer.freeBuffer(&self.argmax_buf);
         metal_buffer.freeBuffer(&self.argmax_partials_buf);
+        metal_buffer.freeBuffer(&self.verify_logits_buf);
         metal_buffer.freeBuffer(&self.embed_staging);
         metal_buffer.freeBuffer(&self.prefill_embed_buf);
         metal_buffer.freeBuffer(&self.lm_head_private_buf);
@@ -8692,6 +8871,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_norm_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_native_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q5k_llama_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_llama_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_llama_k4096_pipe);
@@ -8764,6 +8944,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.deinterleave_pipe);
         metal_pipeline.freePipeline(&self.deinterleave_batched_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_pipe);
+        metal_pipeline.freePipeline(&self.flash_attn_split_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_q8_pipe);
         metal_pipeline.freePipeline(&self.kv_cache_write_pipe);
         metal_pipeline.freePipeline(&self.kv_cache_write_q8_pipe);
@@ -9330,6 +9511,43 @@ pub const InferenceEngine = struct {
             return self.prefillBatchQueuedTokenMajor(state, prompt_tokens);
         }
 
+        // Long prompts on the 9B/27B dense-hybrid paths: process the prompt
+        // in sequential batched chunks instead of falling back to the
+        // per-token replay. The SSM delta/conv kernels carry state in the
+        // persistent per-layer buffers, and the full-attention prefix
+        // recorder threads engine.position through RoPE, KV writes, and the
+        // causal window, so each continuation chunk resumes exactly where
+        // the last ended. Chunk size is each model's own validated
+        // single-shot ceiling (see queuedTokenMajorChunkTokens) -- 256 for
+        // the 9B, a much narrower 40 for the 27B.
+        if (queuedTokenMajorChunkTokens(self.config)) |max_chunk_tokens| {
+            if (prompt_tokens.len > max_chunk_tokens) {
+                var offset: usize = 0;
+                while (offset < prompt_tokens.len) {
+                    const chunk_len = @min(max_chunk_tokens, prompt_tokens.len - offset);
+                    const chunk = prompt_tokens[offset .. offset + chunk_len];
+                    // Only the last chunk needs LM-head logits; earlier chunks
+                    // exist purely to populate the KV cache and SSM state.
+                    const is_final_chunk = offset + chunk_len == prompt_tokens.len;
+                    if (self.canUseQueuedTokenMajorPrefill(chunk.len)) {
+                        try self.prefillBatchQueuedTokenMajorEmit(state, chunk, is_final_chunk);
+                    } else {
+                        // A trailing remainder below this model's own
+                        // minimum queued-path size (or a single token)
+                        // cannot take the queued path; finish it through
+                        // the position-correct per-token decode step.
+                        for (chunk, 0..) |token_id, i| {
+                            try self.loadTokenEmbedding(token_id);
+                            try runDecodeStep(self, is_final_chunk and i + 1 == chunk.len, null, 0, null, null, 0);
+                        }
+                        state.position = self.position;
+                    }
+                    offset += chunk_len;
+                }
+                return;
+            }
+        }
+
         for (prompt_tokens, 0..) |token_id, i| {
             try self.loadTokenEmbedding(token_id);
             try runDecodeStep(self, i + 1 == prompt_tokens.len, null, 0, null, null, 0);
@@ -9362,12 +9580,31 @@ pub const InferenceEngine = struct {
     }
 
     fn prefillBatchQueuedTokenMajor(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        return self.prefillBatchQueuedTokenMajorEmit(state, prompt_tokens, true);
+    }
+
+    /// `emit_final_logits` is false for every chunk but the last when a long
+    /// prompt is prefilled in sequential chunks: an intermediate chunk's last
+    /// token still needs its full forward pass (KV write + SSM state carry),
+    /// but its LM-head projection would be thrown away, so it is skipped.
+    /// This removes work that is definitionally discarded (one vocab-sized
+    /// matmul per intermediate chunk); the wall-clock effect is small — a
+    /// single LM head is a fraction of a chunk's per-layer weight reads — and
+    /// measured within run-to-run noise on a bandwidth-rich M-series, but it
+    /// is the correct thing to skip and matters more on memory-constrained
+    /// machines.
+    fn prefillBatchQueuedTokenMajorEmit(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, emit_final_logits: bool) !void {
         // Mirror the reference implementation's Metal graph submission style: encode/commit the
         // token-major prompt graph ahead of the CPU and synchronize only at the
         // final prompt token. SSM recurrence and MoE routing stay on the existing
         // per-token path; Qwen3.6 can additionally precompute layer-0 SSM
         // projections over the queued prompt embeddings.
         if (self.canUseSingleCommandQueuedTokenMajorPrefill(prompt_tokens.len)) {
+            // Single-command prefill is gated off for every chunked config
+            // (see canUseSingleCommandQueuedTokenMajorPrefill), so a
+            // continuation chunk never reaches it; it only ever runs a whole
+            // prompt in one shot, which always emits final logits.
+            std.debug.assert(emit_final_logits);
             return self.prefillBatchQueuedTokenMajorSingleCommand(state, prompt_tokens);
         }
 
@@ -9448,7 +9685,7 @@ pub const InferenceEngine = struct {
                         @max(@as(usize, 1), @as(usize, @intCast(self.qwen35_dense_prefill_active_layers)))
                     else
                         0;
-                    try runDecodeStep(self, i + 1 == prompt_tokens.len, embed_src, embed_offset, null, &chunk_cmd, start_layer);
+                    try runDecodeStep(self, emit_final_logits and i + 1 == prompt_tokens.len, embed_src, embed_offset, null, &chunk_cmd, start_layer);
                 }
                 recordQueuedPrefillChunkWork(profile, &chunk_cmd, profileElapsedNs(record_start), is_final_chunk);
                 if (is_final_chunk) {
@@ -9493,7 +9730,7 @@ pub const InferenceEngine = struct {
             @intCast(final_wait_start - first_async_submit_ns)
         else
             0;
-        try runDecodeStep(self, true, final_src, final_offset, null, null, final_start_layer);
+        try runDecodeStep(self, emit_final_logits, final_src, final_offset, null, null, final_start_layer);
         recordQueuedPrefillFinalWait(profile, async_to_final_wait_ns, profileElapsedNs(final_wait_start));
         pending_completed_by_final_wait = true;
         state.position = self.position;
@@ -9887,6 +10124,60 @@ pub const InferenceEngine = struct {
         state.position = self.position;
     }
 
+    /// Return a batched-prefill scratch sized for at least `n_tokens`,
+    /// reusing the cached one when its capacity suffices. The attention/FFN
+    /// dims are engine constants in practice, but the reuse check still
+    /// requires capacity on every allocation-shape input plus the
+    /// route-input slot count, which is not monotonic in n_tokens (a <32
+    /// token request needs n*k_used rows while a >=32 one needs only n).
+    /// Pair every call with `releaseBatchedPrefillScratch` (via defer).
+    fn acquireBatchedPrefillScratch(
+        self: *InferenceEngine,
+        n_tokens: u32,
+        q_dim: u32,
+        kv_dim: u32,
+        inter_dim: u32,
+    ) !*BatchedPrefillScratch {
+        // The scratch-acquiring prefill paths are alternatives selected per
+        // model architecture (or strictly sequential validation replays);
+        // they never nest. Catch any future refactor that overlaps them.
+        std.debug.assert(!self.batched_prefill_scratch_in_use);
+        if (self.batched_prefill_scratch_cache) |*cached| {
+            const needed_route_input_slots = batchedPrefillMoeRouteInputSlots(
+                n_tokens,
+                self.config.n_experts,
+                self.config.n_experts_used,
+            );
+            if (cached.n_tokens >= n_tokens and
+                cached.q_dim >= q_dim and
+                cached.kv_dim >= kv_dim and
+                cached.inter_dim >= inter_dim and
+                cached.route_input_slots >= needed_route_input_slots)
+            {
+                cached.resetForReuse();
+                self.batched_prefill_scratch_in_use = true;
+                return cached;
+            }
+            cached.deinit();
+            self.batched_prefill_scratch_cache = null;
+        }
+        self.batched_prefill_scratch_cache = try BatchedPrefillScratch.init(self, n_tokens, q_dim, kv_dim, inter_dim);
+        self.batched_prefill_scratch_in_use = true;
+        return &self.batched_prefill_scratch_cache.?;
+    }
+
+    /// Retain the scratch for the next request when it is small enough,
+    /// otherwise free it (see `batched_prefill_scratch_retain_max_tokens`).
+    fn releaseBatchedPrefillScratch(self: *InferenceEngine) void {
+        self.batched_prefill_scratch_in_use = false;
+        if (self.batched_prefill_scratch_cache) |*cached| {
+            if (cached.n_tokens > batched_prefill_scratch_retain_max_tokens) {
+                cached.deinit();
+                self.batched_prefill_scratch_cache = null;
+            }
+        }
+    }
+
     fn prefillBatchQwenLayer0RoutePacked(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         return self.prefillBatchQwenLayer0RoutePackedWithLimit(state, prompt_tokens, qwenRoutePackedPrefixLayerLimit());
     }
@@ -9901,8 +10192,8 @@ pub const InferenceEngine = struct {
         const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
 
         const first_attn_dims = qwenFirstPrefixAttentionDims(self) orelse BatchedPrefillAttentionDims{ .max_q_dim = 1, .max_kv_dim = 1 };
-        var scratch = try BatchedPrefillScratch.init(self, n_tokens, first_attn_dims.max_q_dim, first_attn_dims.max_kv_dim, inter_dim);
-        defer scratch.deinit();
+        const scratch = try self.acquireBatchedPrefillScratch(n_tokens, first_attn_dims.max_q_dim, first_attn_dims.max_kv_dim, inter_dim);
+        defer self.releaseBatchedPrefillScratch();
 
         var layer0_cmd = try beginProfiledCommand(self, profile);
         errdefer if (layer0_cmd.handle != null) layer0_cmd.wait();
@@ -9916,7 +10207,7 @@ pub const InferenceEngine = struct {
         dispatchCopyF32OffsetOnCmd(self, &layer0_cmd, &self.prefill_embed_buf, &scratch.hidden, n_tokens * hidden_dim, 0, 0);
         profileBarrier(&layer0_cmd, profile, .embed);
         self.qwen_ssm_prefill_proj_active_tokens = n_tokens;
-        try recordQwenRoutePackedPrefixSsmLayerOnCmd(self, &layer0_cmd, profile, 0, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+        try recordQwenRoutePackedPrefixSsmLayerOnCmd(self, &layer0_cmd, profile, 0, scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
         if (self.profile_enabled) {
             log.info("Metal profile: Qwen route-packed layer0 layer-major SSM active tokens={d}", .{n_tokens});
         }
@@ -9927,13 +10218,13 @@ pub const InferenceEngine = struct {
         const route_packed_prefix_layer_limit = @max(requested_prefix_layer_limit, 1);
         while (route_packed_start_layer < route_packed_prefix_layer_limit) {
             if (canUseQwenRoutePackedPrefixSsmLayer(self, route_packed_start_layer, prompt_tokens.len)) {
-                try recordQwenRoutePackedPrefixSsmLayerOnCmd(self, &layer0_cmd, profile, route_packed_start_layer, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+                try recordQwenRoutePackedPrefixSsmLayerOnCmd(self, &layer0_cmd, profile, route_packed_start_layer, scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
                 route_packed_start_layer += 1;
                 route_packed_prefix_ssm_layers += 1;
                 continue;
             }
             if (canUseQwenRoutePackedPrefixAttentionLayer(self, route_packed_start_layer, prompt_tokens.len)) {
-                try recordQwenRoutePackedPrefixAttentionLayerOnCmd(self, &layer0_cmd, profile, route_packed_start_layer, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+                try recordQwenRoutePackedPrefixAttentionLayerOnCmd(self, &layer0_cmd, profile, route_packed_start_layer, scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
                 route_packed_start_layer += 1;
                 route_packed_prefix_attn_layers += 1;
                 continue;
@@ -10083,7 +10374,9 @@ pub const InferenceEngine = struct {
             }
             break :blk .off;
         } else .off;
-        const mode: BatchedPrefillMode = if (is_gemma_moe_prefill and gemma_env_present and gemma_mode == .off)
+        const mode: BatchedPrefillMode = if (self.verify_argmax_out != null)
+            .on // speculative-decode verify always forces the batched forward
+        else if (is_gemma_moe_prefill and gemma_env_present and gemma_mode == .off)
             .off
         else if (gemma_mode != .off)
             gemma_mode
@@ -10134,8 +10427,8 @@ pub const InferenceEngine = struct {
             state.generated_tokens.clearRetainingCapacity();
         }
 
-        var scratch = try BatchedPrefillScratch.init(self, n_tokens, attn_dims.max_q_dim, attn_dims.max_kv_dim, inter_dim);
-        defer scratch.deinit();
+        const scratch = try self.acquireBatchedPrefillScratch(n_tokens, attn_dims.max_q_dim, attn_dims.max_kv_dim, inter_dim);
+        defer self.releaseBatchedPrefillScratch();
 
         {
             const mmap = self.model.mmap_data orelse return error.NoMmapData;
@@ -10152,6 +10445,14 @@ pub const InferenceEngine = struct {
                 if (embedding_scale != 1.0) {
                     for (out_slice) |*value| value.* *= embedding_scale;
                 }
+                // Muse Glimmer: weightless RMSNorm on embeddings before the
+                // residual stream (mirrors loadTokenEmbeddingInto for the batched path).
+                if (cfg.architecture == .muse_glimmer) {
+                    var sum_sq: f64 = 0;
+                    for (out_slice) |v| sum_sq += @as(f64, v) * @as(f64, v);
+                    const inv_rms: f32 = @floatCast(1.0 / @sqrt(sum_sq / @as(f64, @floatFromInt(hidden_dim)) + @as(f64, cfg.rms_norm_eps)));
+                    for (out_slice) |*value| value.* *= inv_rms;
+                }
             }
         }
 
@@ -10162,7 +10463,17 @@ pub const InferenceEngine = struct {
 
         for (0..cfg.n_layers) |layer_idx| {
             const lt = self.layer_tensors[layer_idx];
-            const attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, self.kv_cache_q8);
+            var attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, self.kv_cache_q8);
+            if (cfg.architecture == .muse_glimmer) {
+                // Global layers (every 4th) use NoPE + full attention; SWA layers
+                // keep RoPE + the sliding window. Matches runDecodeStep.
+                if ((layer_idx + 1) % 4 == 0) {
+                    attn.rope_dim = 0;
+                    attn.sliding_window_size = 0;
+                } else {
+                    attn.sliding_window_size = cfg.sliding_window_size;
+                }
+            }
             const q_t = lt.attn_q.?;
             const k_t = lt.attn_k.?;
             const v_t = if (attn.use_k_as_v) k_t else lt.attn_v.?;
@@ -10176,6 +10487,14 @@ pub const InferenceEngine = struct {
             dispatchGemmBatchedOnCmd(self, &cmd, k_t, &scratch.norm, &scratch.k, attn.kv_dim, hidden_dim, n_tokens);
             if (!attn.use_k_as_v) {
                 dispatchGemmBatchedOnCmd(self, &cmd, v_t, &scratch.norm, &scratch.v, attn.kv_dim, hidden_dim, n_tokens);
+            }
+            // Muse Glimmer attention gate: project sigmoid gate from attn_norm output
+            // now (scratch.norm is fresh), apply it to attn_out after flash. Mirrors
+            // the Qwen route-packed prefix path; scratch.gate is free until the FFN.
+            if (cfg.architecture == .muse_glimmer) {
+                if (lt.attn_gate) |gate_t| {
+                    dispatchGemmBatchedOnCmd(self, &cmd, gate_t, &scratch.norm, &scratch.gate, attn.q_dim, hidden_dim, n_tokens);
+                }
             }
             profileBarrier(&cmd, profile, .full_attn);
 
@@ -10255,22 +10574,38 @@ pub const InferenceEngine = struct {
             }
             profileBarrier(&cmd, profile, .full_attn);
 
+            // Muse Glimmer attention output gate: attn_out *= sigmoid(gate) where
+            // gate = attn_gate @ attn_norm_out was projected above into scratch.gate.
+            if (cfg.architecture == .muse_glimmer) {
+                if (lt.attn_gate != null) {
+                    dispatchSigmoidMulOnCmd(self, &cmd, &scratch.gate, &scratch.attn_out, n_tokens * attn.q_dim);
+                    profileBarrier(&cmd, profile, .full_attn);
+                }
+            }
+
             dispatchGemmBatchedOnCmd(self, &cmd, o_t, &scratch.attn_out, &scratch.down, hidden_dim, attn.q_dim, n_tokens);
             profileBarrier(&cmd, profile, .full_attn);
             if (self.post_attn_norm_present[layer_idx]) {
-                dispatchRmsNormOnCmd(self, &cmd, &scratch.down, &scratch.down, &self.post_attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
+                // Fuse post_attn_norm + residual-add + pre-FFN norm into ONE batched
+                // dispatch (the same triple-fused kernel the per-token/decode path uses
+                // at dispatchPostNormResidualRmsNormOnCmd), grid {n_tokens,1,1}. Drops
+                // the separate post_attn_norm rms_norm dispatch + its barrier per layer,
+                // and converges the batched prefill onto the per-token path's exact math.
+                // Narrow (256-thread) pipe: n_tokens threadgroups already saturate the
+                // cores in batched mode, so no over-subscription from the wide variant.
+                const push = PostNormResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .hidden_scale = 1.0 };
+                const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &self.post_attn_norm_bufs[layer_idx], &scratch.norm, &self.ffn_norm_bufs[layer_idx] };
+                cmd.dispatchV2(&self.post_norm_residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(PostNormResidualRmsNormPush), 0);
                 profileBarrier(&cmd, profile, .full_attn);
-            }
-
-            {
+            } else {
                 const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0, .hidden_scale = 1.0 };
                 const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &self.ffn_norm_bufs[layer_idx] };
                 cmd.dispatchV2(&self.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
+                profileBarrier(&cmd, profile, .full_attn);
             }
-            profileBarrier(&cmd, profile, .full_attn);
 
             if (is_gemma_moe) {
-                try recordGemmaBatchedPrefillMoeOnCmd(self, &cmd, layer_idx, lt, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+                try recordGemmaBatchedPrefillMoeOnCmd(self, &cmd, layer_idx, lt, scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
             } else {
                 const gate_t = lt.ffn_gate.?;
                 const up_t = lt.ffn_up.?;
@@ -10329,9 +10664,38 @@ pub const InferenceEngine = struct {
         dispatchRmsNormOnCmd(self, &cmd, &scratch.hidden, &scratch.norm, &self.final_norm_gpu, hidden_dim, n_tokens);
         profileBarrier(&cmd, profile, .final);
 
+        // Speculative-decode verify tail: project EVERY position through the LM
+        // head in one batched Q5_K GEMM (weight read once), then argmax each
+        // position's vocab row on the CPU into `verify_argmax_out`. Skips the
+        // last-token-only tail + validate below.
+        if (self.verify_argmax_out) |out_argmax| {
+            const n_out: u32 = @min(n_tokens, spec_max_verify_tokens);
+            dispatchGemmQ5KOnCmd(self, &cmd, self.lm_head, &scratch.norm, &self.verify_logits_buf, cfg.vocab_size, hidden_dim, n_out);
+            commitAndWaitProfiled(&cmd, profile);
+            self.position = position_base + n_tokens;
+            state.position = self.position;
+            const logits_ptr: [*]const f32 = @ptrCast(@alignCast(self.verify_logits_buf.cpu_ptr.?));
+            const vocab: usize = cfg.vocab_size;
+            var t: usize = 0;
+            while (t < n_out) : (t += 1) {
+                const base = t * vocab;
+                var best_idx: u32 = 0;
+                var best_val: f32 = logits_ptr[base];
+                var v: usize = 1;
+                while (v < vocab) : (v += 1) {
+                    if (logits_ptr[base + v] > best_val) {
+                        best_val = logits_ptr[base + v];
+                        best_idx = @intCast(v);
+                    }
+                }
+                if (t < out_argmax.len) out_argmax[t] = best_idx;
+            }
+            return;
+        }
+
         if (shouldCpuLmHeadFallback(self)) {
             commitAndWaitProfiled(&cmd, profile);
-            recordRoutePackActualProfile(profile, &scratch, @as(usize, @intCast(cfg.n_layers)));
+            recordRoutePackActualProfile(profile, scratch, @as(usize, @intCast(cfg.n_layers)));
             if (self.private_decode_buffers) return error.PrivateBatchedPrefillCpuLmHeadUnsupported;
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
@@ -10349,7 +10713,7 @@ pub const InferenceEngine = struct {
                 dispatchCopyF32OnCmd(self, &cmd, &self.logits_buf, &self.logits_readback_buf, cfg.vocab_size);
             }
             commitAndWaitProfiled(&cmd, profile);
-            recordRoutePackActualProfile(profile, &scratch, @as(usize, @intCast(cfg.n_layers)));
+            recordRoutePackActualProfile(profile, scratch, @as(usize, @intCast(cfg.n_layers)));
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             if (self.hidden_buf.cpu_ptr) |dst_bytes| {
                 const src_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
@@ -10418,6 +10782,17 @@ pub const InferenceEngine = struct {
                 });
             }
         }
+    }
+
+    /// Speculative-decode verify: run the batched forward over `tokens` starting
+    /// at the current KV position and write the greedy argmax at EACH position
+    /// into `out_argmax[0..tokens.len]`. Extends the KV cache for all tokens (the
+    /// caller overwrites rejected positions on the next step). Requires the model
+    /// to support the batched prefill path (canUseBatchedPrefill).
+    pub fn verifyTokens(self: *InferenceEngine, state: *DecodeState, tokens: []const u32, out_argmax: []u32) !void {
+        self.verify_argmax_out = out_argmax;
+        defer self.verify_argmax_out = null;
+        try self.prefillBatched(state, tokens);
     }
 
     /// Advance one autoregressive decode step from the given input token.
@@ -10958,6 +11333,16 @@ pub const InferenceEngine = struct {
             const scale = @as(f32, @floatCast(@sqrt(@as(f64, @floatFromInt(self.config.hidden_dim)))));
             for (dst) |*value| value.* *= scale;
         }
+        // Muse Glimmer applies a weightless RMSNorm to the embeddings before they
+        // enter the residual stream (muse-glimmer.cpp: build_norm(inpL, null, RMS)).
+        // Do it per-token here (CPU, race-free) so the residual base is unit-RMS.
+        if (self.config.architecture == .muse_glimmer) {
+            var sum_sq: f64 = 0;
+            for (dst) |v| sum_sq += @as(f64, v) * @as(f64, v);
+            const mean_sq = sum_sq / @as(f64, @floatFromInt(hidden_dim_usize));
+            const inv_rms: f32 = @floatCast(1.0 / @sqrt(mean_sq + @as(f64, self.config.rms_norm_eps)));
+            for (dst) |*value| value.* *= inv_rms;
+        }
     }
 
     fn loadTokenEmbedding(self: *InferenceEngine, token_id: u32) !void {
@@ -11079,7 +11464,27 @@ pub const InferenceEngine = struct {
             .q5_0 => .{ .pipe = &self.dmmv_q5_0_pipe, .push_idx = 0, .rows_per_wg = 2, .block_size = 64 },
             .q5_1 => .{ .pipe = &self.dmmv_q5_1_pipe, .push_idx = 0, .rows_per_wg = 2, .block_size = 64 },
             .mxfp4 => .{ .pipe = &self.dmmv_mxfp4_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 },
-            .q5_k => .{ .pipe = &self.dmmv_q5k_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 },
+            .q5_k => blk: {
+                // Reference Q5_K matvec port (N_SG=2, N_R0=1, 4-way lane split over
+                // the 256-elem block, register-cached input + sumy dmin correction):
+                // ~373 GB/s on the lm-head (M=202048, K=6656) vs dmmv_q5k_native's
+                // ~188 — the native kernel's 16 KiB threadgroup input cache +
+                // byte-wise weight reads cap it at ~34% of peak. Handles any
+                // K%256==0 and any M (uniform per-simdgroup bounds guard).
+                if (K % 256 == 0 and self.dmmv_q5k_llama_pipe.handle != null and
+                    self.dmmv_q5k_llama_pipe.max_threads_per_threadgroup >= 64)
+                {
+                    break :blk .{ .pipe = &self.dmmv_q5k_llama_pipe, .push_idx = 1, .rows_per_wg = 2, .block_size = 64 };
+                }
+                // Native Q5_K matvec (simdgroup-per-row, threadgroup input cache).
+                // Its input cache holds K/4 half4 (<=2048), so gate on K<=8192.
+                if (K <= 8192 and K % 256 == 0 and self.dmmv_q5k_native_pipe.handle != null and
+                    self.dmmv_q5k_native_pipe.max_threads_per_threadgroup >= 256)
+                {
+                    break :blk .{ .pipe = &self.dmmv_q5k_native_pipe, .push_idx = 0, .rows_per_wg = 8, .block_size = 256 };
+                }
+                break :blk .{ .pipe = &self.dmmv_q5k_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 };
+            },
             .q6_k => blk: {
                 // dmmv_q6k_llama is a faithful reference implementation port (N_SG=2, N_R0=2,
                 // simdgroup-parallel). The legacy dmmv_q6k_pipe is a SPIRV-Cross
@@ -16063,10 +16468,16 @@ fn dispatchPostNormResidualRmsNormOnCmd(
     };
     const bufs = [_]*const MetalBuffer{ hidden, residual, residual_w, norm_out, output_w };
     const use_wide =
-        engine.config.architecture == .gemma and
-        engine.config.n_experts == 0 and
-        n == 5376 and
-        (!engine.in_prefill_phase or engine.dense_gemma_wide_post_norm_prefill_enabled) and
+        ((engine.config.architecture == .gemma and
+            engine.config.n_experts == 0 and
+            n == 5376 and
+            (!engine.in_prefill_phase or engine.dense_gemma_wide_post_norm_prefill_enabled)) or
+            // Muse Glimmer dense tail: hidden_dim=6656 is vec4-aligned and fits the
+            // wide kernel's MAX_VEC_PER_THREAD=2 register cache (1664 vec4 / 1024 thr).
+            // 1024 threads expose more latency-hiding on the two single-threadgroup
+            // reductions than the 256-thread narrow kernel. Math-equivalent (reduction
+            // order differs); validated greedy-identical.
+            (engine.config.architecture == .muse_glimmer and n == 6656)) and
         engine.post_norm_residual_rms_norm_wide_pipe.handle != null and
         engine.post_norm_residual_rms_norm_wide_pipe.max_threads_per_threadgroup >= 1024;
     const pipe = if (use_wide) &engine.post_norm_residual_rms_norm_wide_pipe else &engine.post_norm_residual_rms_norm_pipe;
@@ -16646,6 +17057,24 @@ fn dispatchFlashAttnOnCmd(
         &engine.attn_out_buf,
         &engine.attn_sinks_buf,
     };
+    // Long-context split path: the single-simdgroup-per-head kernel is
+    // LATENCY-bound at depth (32 tg x 32 threads ~ 3% occupancy; measured
+    // 287us/dispatch @1000 ctx touching only ~2 MB of KV). The split kernel
+    // runs 8 simdgroups/head over interleaved 64-token blocks with a split-K
+    // online-softmax merge — same f32 math, different FP reduction order, so
+    // it is gated to seq_len >= 384 (benchmark-range decode stays on the
+    // byte-identical serial kernel) and validated by greedy-match.
+    const flash_split_min_seq_len: u32 = 384;
+    if (!engine.kv_cache_q8 and
+        engine.flash_split_enabled and
+        seq_len >= flash_split_min_seq_len and
+        head_dim <= 256 and
+        engine.flash_attn_split_pipe.handle != null and
+        engine.flash_attn_split_pipe.max_threads_per_threadgroup >= 256)
+    {
+        cmd.dispatchV2(&engine.flash_attn_split_pipe, .{ n_heads, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
+        return;
+    }
     const pipe = if (engine.kv_cache_q8) &engine.flash_attn_q8_pipe else &engine.flash_attn_pipe;
     // Cycle 99: flash_attn.metal FLASH_TG_SIZE halved 64 → 32 (single
     // simdgroup) to unblock V-loop utilization at Qwen3-8B vec4_dim=32 and
@@ -21651,7 +22080,13 @@ fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_le
     // anyway; keep them on the validated per-token path.
     if (prompt_len < qwen_ssm_projection_prefill_min_tokens) return false;
     if (prompt_len > queued_prefill_embed_tokens) return false;
-    if (engine.position != 0) return false;
+    // Continuation chunks (nonzero position) are supported on the 9B and 27B
+    // dense-hybrid paths, which share the SSM kernels that carry state in
+    // the persistent per-layer buffers and the full-attention recorder that
+    // threads the chunk-start position through RoPE/KV-write/flash
+    // dispatches. The MoE route-packed prefix has not been audited for
+    // nonzero bases.
+    if (engine.position != 0 and queuedTokenMajorChunkTokens(engine.config) == null) return false;
     if (!engine.private_decode_buffers and !qwenSsmPrefillProjectionAllowsSharedDecodeBuffers(engine.config)) return false;
     if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
 
@@ -22219,6 +22654,11 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
     if (!canUseQwen35Dense9bLayer0DensePrefill(engine, lt, layer_idx, hidden_dim, inter_dim, n_tokens)) return false;
 
     const attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, engine.kv_cache_q8);
+    // Chunk-start absolute position. Zero for a fresh prompt; nonzero when a
+    // long prompt is prefilled in sequential chunks (the SSM state buffers
+    // carry across chunks on their own; RoPE angles, KV write offsets, and
+    // the flash-attention causal window must be told the base explicitly).
+    const pos_base: u32 = engine.position;
     const q_t = lt.attn_q orelse return error.MissingTensor;
     const k_t = lt.attn_k orelse return error.MissingTensor;
     const v_t = lt.attn_v orelse return error.MissingTensor;
@@ -22256,15 +22696,15 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
 
     const rope_freq_buf = selectRopeFreqBuffer(engine, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
     dispatch_before = cmd.dispatch_count;
-    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
+    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, pos_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
     profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
     recordFullAttnDispatchDelta(profile, .rope, dispatch_before, cmd.dispatch_count);
 
     if (engine.kv_cache_q8) {
         const n_blocks = n_tokens * (attn.kv_dim / 32);
-        dispatchKvCacheWriteBatchedQ8OnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, 0, n_blocks);
+        dispatchKvCacheWriteBatchedQ8OnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, @intCast(@as(u64, pos_base) * attn.kv_cache_bytes_per_token), n_blocks);
     } else {
-        dispatchKvCacheWriteBatchedOnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, 0, n_tokens * attn.kv_dim);
+        dispatchKvCacheWriteBatchedOnCmd(engine, cmd, layer_idx, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_z_buf, pos_base * attn.kv_dim, n_tokens * attn.kv_dim);
     }
     if (profile) |p| p.full_attn_kv_write_calls += 1;
     profileFullAttnBarrierBuffers(cmd, profile, .rope, &.{
@@ -22289,7 +22729,7 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
     }
 
     dispatch_before = cmd.dispatch_count;
-    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
+    dispatchRopeBatchedOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, pos_base, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
     profileFullAttnBarrierBuffers(cmd, profile, .flash, &.{
         &engine.qwen_ssm_prefill_proj_qkv_buf,
         &engine.kv_k_cache[layer_idx],
@@ -22310,9 +22750,9 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
             attn.head_dim,
             cfg.n_heads,
             attn.n_kv_heads,
+            pos_base + n_tokens,
             n_tokens,
-            n_tokens,
-            0,
+            pos_base,
             attn.sliding_window_size,
             attn.kv_cache_head_stride_bytes,
             attn.kv_cache_bytes_per_token,
@@ -22329,9 +22769,9 @@ fn recordQwen35Dense9bPrefixFullAttnDensePrefillLayerOnCmd(
             attn.head_dim,
             cfg.n_heads,
             attn.n_kv_heads,
+            pos_base + n_tokens,
             n_tokens,
-            n_tokens,
-            0,
+            pos_base,
             attn.sliding_window_size,
         );
     }
@@ -26248,7 +26688,7 @@ fn acquireLayerCommand(
 fn canUseDenseSharedDecodeCommand(engine: *const InferenceEngine) bool {
     const cfg = engine.config;
     switch (cfg.architecture) {
-        .gemma, .qwen2 => {},
+        .gemma, .qwen2, .muse_glimmer => {},
         else => return false,
     }
     if (cfg.n_experts != 0) return false;
@@ -26258,7 +26698,10 @@ fn canUseDenseSharedDecodeCommand(engine: *const InferenceEngine) bool {
         engine.dense_gemma_q4k_geglu_validation_enabled) return false;
 
     for (engine.layer_tensors) |lt| {
-        if (lt.attn_gate != null) return false;
+        // Muse Glimmer legitimately carries a per-layer attn_gate; its gate +
+        // QK-norm dispatches are recorded into the grouped command buffer with
+        // full barrier coverage, so grouping stays math-identical for it.
+        if (lt.attn_gate != null and cfg.architecture != .muse_glimmer) return false;
         if (lt.attn_q_bias != null or lt.attn_k_bias != null or
             lt.attn_v_bias != null or lt.attn_output_bias != null) return false;
     }
@@ -26966,9 +27409,23 @@ fn runDecodeStep(
             break :blk &hybrid_group_cmd_storage;
         } else null;
 
-        if (is_full_attn) {
+        if (!isSsmLayer(cfg, layer_idx)) {
             if (profile) |p| p.full_attn_layers += 1;
-            const attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, engine.kv_cache_q8);
+            var attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, engine.kv_cache_q8);
+            if (cfg.architecture == .muse_glimmer) {
+                // Muse Glimmer applies RoPE + the sliding window only on its
+                // non-global (SWA) layers; global layers (every 4th) use NoPE +
+                // full attention. NB: `is_full_attn` is the attention-vs-SSM
+                // split and is ALWAYS true for dense Muse (interval=1), so it
+                // must NOT be used here — key off the layer index directly
+                // (matches the batched-prefill path).
+                if ((layer_idx + 1) % 4 == 0) {
+                    attn.rope_dim = 0;
+                    attn.sliding_window_size = 0;
+                } else {
+                    attn.sliding_window_size = cfg.sliding_window_size;
+                }
+            }
             var local_cmd_storage: MetalCommand = undefined;
             var using_local_cmd = false;
             var cmd = try acquireLayerCommand(engine, layer_shared_cmd, &local_cmd_storage, &using_local_cmd, profile);
@@ -30128,6 +30585,49 @@ fn logLayerDiagnostics(engine: *InferenceEngine, lt: LayerTensors, layer: u32, i
 /// @param eos_id Token id that terminates generation early when sampled.
 /// @param allocator Used to allocate the returned `output_tokens` slice; caller must free via `GenerateResult.deinit`.
 /// @returns `GenerateResult` with the generated token slice and per-phase timing metrics.
+/// Prompt-lookup (n-gram) speculative decoding: default-on for models on the
+/// batched-forward path, opt out with ZINC_SPEC_DECODE=0. Greedy speculative
+/// decoding is exact — output is byte-identical to the per-token path.
+fn specDecodeEnabled() bool {
+    return readBoolEnv("ZINC_SPEC_DECODE") orelse true;
+}
+
+/// n-gram match length and max draft length for prompt-lookup drafting.
+/// A verify is a fixed-cost batched forward whose GEMM computes a 32-column tile
+/// regardless of N, so drafting up to the tile width is free — always draft as
+/// much as the history offers (the EMA gate decides *whether* to verify at all).
+const spec_ngram: usize = 3;
+const spec_max_draft: usize = @min(31, spec_max_verify_tokens - 1);
+
+/// Draft the likely continuation after `seq[last]` by finding the most recent
+/// earlier occurrence of the last `spec_ngram` tokens and copying up to `max_k`
+/// of what followed. Returns the number of draft tokens written to `out`.
+fn draftFromNgram(seq: []const u32, out: []u32, max_k: usize) usize {
+    const ngram = spec_ngram;
+    if (max_k == 0 or seq.len < ngram + 1) return 0;
+    const suffix = seq[seq.len - ngram ..];
+    // Scan earlier start positions from most-recent to oldest.
+    var i: usize = seq.len - ngram; // exclusive upper bound for an earlier match start
+    while (i > 0) {
+        i -= 1;
+        var match = true;
+        for (0..ngram) |g| {
+            if (seq[i + g] != suffix[g]) {
+                match = false;
+                break;
+            }
+        }
+        if (!match) continue;
+        const start = i + ngram;
+        var n: usize = 0;
+        while (n < out.len and n < max_k and start + n < seq.len) : (n += 1) {
+            out[n] = seq[start + n];
+        }
+        return n;
+    }
+    return 0;
+}
+
 pub fn generateWithMetrics(
     engine: *InferenceEngine,
     prompt_tokens: []const u32,
@@ -30191,16 +30691,119 @@ pub fn generateWithMetrics(
     // Decode loop
     const decode_start = std.time.nanoTimestamp();
     var tokens_generated: u32 = @intCast(output.items.len);
-    while (tokens_generated < decode_budget and output.items.len > 0) {
-        const input_token = output.items[output.items.len - 1];
-        try engine.decodeStep(&state, input_token);
+    const use_spec = specDecodeEnabled() and output.items.len > 0 and
+        engine.config.architecture == .muse_glimmer and canUseBatchedPrefill(engine);
+    if (use_spec) {
+        // Prompt-lookup speculative decode: draft a continuation from the token
+        // history, verify K+1 tokens in ONE batched forward pass, accept the
+        // longest prefix the target confirms. Exact for greedy.
+        var full_seq: std.ArrayList(u32) = .{};
+        defer full_seq.deinit(allocator);
+        try full_seq.appendSlice(allocator, prompt_tokens);
+        try full_seq.appendSlice(allocator, output.items);
+        var draft_buf: [spec_max_draft]u32 = undefined;
+        var verify_toks: [1 + spec_max_draft]u32 = undefined;
+        var verify_out: [1 + spec_max_draft]u32 = undefined;
+        var spec_verifies: u64 = 0;
+        var spec_accepted: u64 = 0;
+        var spec_fallbacks: u64 = 0;
+        var spec_verify_ns: u64 = 0;
+        var spec_verify_tokens: u64 = 0;
+        var spec_fallback_ns: u64 = 0;
+        // Runtime break-even gate. A verify is a fixed-cost batched forward, so it
+        // only pays when the accepted run exceeds verify_ms / per-token-decode_ms.
+        // Both costs are load/hardware dependent (decode's command encoding is
+        // CPU-side and swings with load), so measure them live: the first two
+        // tokens take the per-token path to sample decode cost, then the gate uses
+        // the measured ratio (+15% margin). An acceptance EMA tracks the run length.
+        var accept_ema: f32 = 8.0;
+        const spec_default_break_even: f32 = 8.0;
+        outer: while (tokens_generated < decode_budget) {
+            const seed = output.items[output.items.len - 1];
+            // Always draft the full tile width — the verify GEMM computes a fixed
+            // 32-column tile, so a longer draft costs the same and captures longer
+            // accepted runs. The gate below decides *whether* to verify.
+            const ndraft = draftFromNgram(full_seq.items, &draft_buf, spec_max_draft);
+            const break_even: f32 = if (spec_verifies > 0 and spec_fallbacks > 0)
+                @as(f32, @floatFromInt(spec_verify_ns / spec_verifies)) /
+                    @as(f32, @floatFromInt(@max(spec_fallback_ns / spec_fallbacks, 1))) * 1.15
+            else
+                spec_default_break_even;
+            const do_verify = ndraft > 0 and spec_fallbacks >= 2 and accept_ema >= break_even;
+            if (!do_verify) {
+                // Cheap single-token decode: no draft, calibration, or acceptance
+                // below the point where a full verify forward pays for itself.
+                const ft0 = std.time.nanoTimestamp();
+                try engine.decodeStep(&state, seed);
+                const next_token = engine.sampleGreedy();
+                spec_fallback_ns += @intCast(std.time.nanoTimestamp() - ft0);
+                if (next_token == eos_id) break :outer;
+                try output.append(allocator, next_token);
+                try state.generated_tokens.append(allocator, next_token);
+                try full_seq.append(allocator, next_token);
+                tokens_generated += 1;
+                spec_fallbacks += 1;
+                continue;
+            }
+            verify_toks[0] = seed;
+            for (0..ndraft) |k| verify_toks[1 + k] = draft_buf[k];
+            const pos_before = engine.position;
+            const vt0 = std.time.nanoTimestamp();
+            try engine.verifyTokens(&state, verify_toks[0 .. 1 + ndraft], verify_out[0 .. 1 + ndraft]);
+            spec_verify_ns += @intCast(std.time.nanoTimestamp() - vt0);
+            spec_verify_tokens += 1 + ndraft;
+            // Longest confirmed draft prefix.
+            var j: usize = 0;
+            while (j < ndraft and verify_out[j] == draft_buf[j]) : (j += 1) {}
+            spec_verifies += 1;
+            spec_accepted += j;
+            accept_ema = 0.5 * accept_ema + 0.5 * @as(f32, @floatFromInt(j));
+            // Roll KV/position back to just past the accepted prefix.
+            engine.position = pos_before + 1 + @as(u32, @intCast(j));
+            state.position = engine.position;
+            for (0..j) |k| {
+                const tok = draft_buf[k];
+                if (tok == eos_id) break :outer;
+                try output.append(allocator, tok);
+                try state.generated_tokens.append(allocator, tok);
+                try full_seq.append(allocator, tok);
+                tokens_generated += 1;
+                if (tokens_generated >= decode_budget) break :outer;
+            }
+            const correction = verify_out[j];
+            if (correction == eos_id) break :outer;
+            try output.append(allocator, correction);
+            try state.generated_tokens.append(allocator, correction);
+            try full_seq.append(allocator, correction);
+            tokens_generated += 1;
+        }
+        if (spec_verifies > 0 or spec_fallbacks > 0) {
+            const avg: f64 = if (spec_verifies > 0)
+                @as(f64, @floatFromInt(spec_accepted)) / @as(f64, @floatFromInt(spec_verifies))
+            else
+                0;
+            const ms_per_verify: f64 = if (spec_verifies > 0)
+                @as(f64, @floatFromInt(spec_verify_ns)) / 1_000_000.0 / @as(f64, @floatFromInt(spec_verifies))
+            else
+                0;
+            const verify_tok: f64 = if (spec_verifies > 0)
+                @as(f64, @floatFromInt(spec_verify_tokens)) / @as(f64, @floatFromInt(spec_verifies))
+            else
+                0;
+            log.info("spec-decode: {d} verifies ({d:.2} accepted/verify), {d} fallbacks | {d:.1} ms/verify over {d:.1} tok/verify", .{ spec_verifies, avg, spec_fallbacks, ms_per_verify, verify_tok });
+        }
+    } else {
+        while (tokens_generated < decode_budget and output.items.len > 0) {
+            const input_token = output.items[output.items.len - 1];
+            try engine.decodeStep(&state, input_token);
 
-        const next_token = engine.sampleGreedy();
-        if (next_token == eos_id) break;
+            const next_token = engine.sampleGreedy();
+            if (next_token == eos_id) break;
 
-        try output.append(allocator, next_token);
-        try state.generated_tokens.append(allocator, next_token);
-        tokens_generated += 1;
+            try output.append(allocator, next_token);
+            try state.generated_tokens.append(allocator, next_token);
+            tokens_generated += 1;
+        }
     }
     const decode_end = std.time.nanoTimestamp();
     const decode_ns: u64 = @intCast(decode_end - decode_start);
@@ -35419,7 +36022,21 @@ test "qwen35 9b dense SSM prefill uses queued token commands only for exact shap
     try std.testing.expect(shouldUseQwen35Dense27bQueuedTokenMajorPrefill(qwen35_27b_cfg, 33));
     try std.testing.expect(shouldUseQwen35Dense27bQueuedTokenMajorPrefill(qwen35_27b_cfg, 36));
     try std.testing.expect(shouldUseQwen35Dense27bQueuedTokenMajorPrefill(qwen35_27b_cfg, 40));
-    try std.testing.expect(!shouldUseQwen35Dense27bQueuedTokenMajorPrefill(qwen35_27b_cfg, 41));
+    try std.testing.expect(shouldUseQwen35Dense27bQueuedTokenMajorPrefill(qwen35_27b_cfg, 192));
+    try std.testing.expect(!shouldUseQwen35Dense27bQueuedTokenMajorPrefill(qwen35_27b_cfg, 193));
+
+    // PR #25 long-prompt chunking: each model's chunk size is its own
+    // validated single-shot ceiling, never a shared constant (a 40-wide
+    // 27B chunk fed to the 9B's 256-token buffers, or vice versa, would be
+    // a real bug). Models without a fast prefill path are not chunked.
+    try std.testing.expectEqual(@as(?u32, @intCast(queued_prefill_embed_tokens)), queuedTokenMajorChunkTokens(qwen35_9b_cfg));
+    try std.testing.expectEqual(@as(?u32, @intCast(qwen35_dense27b_queued_prefill_max_tokens)), queuedTokenMajorChunkTokens(qwen35_27b_cfg));
+    try std.testing.expect(queuedTokenMajorChunkTokens(qwen35_9b_cfg).? != queuedTokenMajorChunkTokens(qwen35_27b_cfg).?);
+    {
+        var no_fast_path = qwen35_27b_cfg;
+        no_fast_path.full_attn_interval = 2; // 27B chunking requires interval == 4
+        try std.testing.expectEqual(@as(?u32, null), queuedTokenMajorChunkTokens(no_fast_path));
+    }
     try std.testing.expect(isQwenSsmConvD4_8192Shape(qwen35_9b_cfg, 8192));
     try std.testing.expect(!isQwenSsmConvD4_8192Shape(qwen35_9b_cfg, 10240));
     try std.testing.expect(!isQwenSsmConvD4_8192Shape(qwen35_27b_cfg, 8192));
@@ -38200,6 +38817,101 @@ test "BatchedPrefillScratch allocates Gemma MoE route scratch" {
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_up.size);
     try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_swiglu.size);
     try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_expert_down.size);
+}
+
+test "acquireBatchedPrefillScratch reuses, re-zeroes, grows, and evicts oversized scratch" {
+    var device = try metal_device.MetalDevice.init(std.testing.allocator, 0);
+    defer device.deinit();
+
+    var engine: InferenceEngine = undefined;
+    engine.device = &device;
+    engine.batched_prefill_scratch_cache = null;
+    engine.batched_prefill_scratch_in_use = false;
+    engine.config = .{
+        .architecture = .gemma,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_heads = 1,
+        .head_dim = 16,
+        .hidden_dim = 32,
+        .intermediate_dim = 16,
+        .vocab_size = 64,
+        .context_length = 128,
+        .rope_freq_base = 10000.0,
+        .n_experts = 6,
+        .n_experts_used = 3,
+        .rope_dim = 16,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 48,
+    };
+    defer if (engine.batched_prefill_scratch_cache) |*s| {
+        s.deinit();
+        engine.batched_prefill_scratch_cache = null;
+    };
+
+    const q_dim: u32 = 32;
+    const kv_dim: u32 = 16;
+    const inter_dim: u32 = 16;
+
+    // First acquire allocates and marks the scratch in use.
+    const first = try engine.acquireBatchedPrefillScratch(2, q_dim, kv_dim, inter_dim);
+    const first_hidden_handle = first.hidden.handle;
+    try std.testing.expect(engine.batched_prefill_scratch_in_use);
+    engine.releaseBatchedPrefillScratch();
+    try std.testing.expect(!engine.batched_prefill_scratch_in_use);
+    // Small scratch is retained across release.
+    try std.testing.expect(engine.batched_prefill_scratch_cache != null);
+
+    // Same-capacity acquire reuses the identical buffers (no reallocation)
+    // and re-zeroes moe_active_block_count, the one init()-zeroed buffer.
+    {
+        const cached = &engine.batched_prefill_scratch_cache.?;
+        const bytes = cached.moe_active_block_count.cpu_ptr.?;
+        bytes[0] = 0xAB; // dirty it, as a prior request's routing profile would
+    }
+    const second = try engine.acquireBatchedPrefillScratch(2, q_dim, kv_dim, inter_dim);
+    try std.testing.expectEqual(first_hidden_handle, second.hidden.handle);
+    try std.testing.expectEqual(@as(u8, 0), second.moe_active_block_count.cpu_ptr.?[0]);
+    engine.releaseBatchedPrefillScratch();
+
+    // A larger request reallocates: capacity grows and buffers change.
+    const third = try engine.acquireBatchedPrefillScratch(4, q_dim, kv_dim, inter_dim);
+    try std.testing.expectEqual(@as(u32, 4), third.n_tokens);
+    engine.releaseBatchedPrefillScratch();
+    try std.testing.expect(engine.batched_prefill_scratch_cache != null);
+
+    // Route-input slots are NOT monotonic in n_tokens: a >=32-token request
+    // allocates n rows of moe_route_input, but a <32-token request needs
+    // n * n_experts_used rows for route-slot gather. A cached 33-token
+    // scratch (33 rows) must NOT be reused for a 12-token request
+    // (12 * 3 = 36 rows) — reuse here would overrun moe_route_input on GPU.
+    const wide = try engine.acquireBatchedPrefillScratch(33, q_dim, kv_dim, inter_dim);
+    try std.testing.expectEqual(@as(u32, 33), wide.route_input_slots);
+    const wide_route_input_handle = wide.moe_route_input.handle;
+    engine.releaseBatchedPrefillScratch();
+    const short = try engine.acquireBatchedPrefillScratch(12, q_dim, kv_dim, inter_dim);
+    try std.testing.expect(wide_route_input_handle != short.moe_route_input.handle);
+    try std.testing.expectEqual(@as(u32, 36), short.route_input_slots);
+    try std.testing.expect(short.moe_route_input.size >= 36 * engine.config.hidden_dim * @sizeOf(f32));
+    engine.releaseBatchedPrefillScratch();
+
+    // A request with larger attention dims must also reallocate even when
+    // the token capacity fits; reuse keys on every allocation-shape input.
+    const wide_q = try engine.acquireBatchedPrefillScratch(2, q_dim * 2, kv_dim, inter_dim);
+    try std.testing.expectEqual(q_dim * 2, wide_q.q_dim);
+    try std.testing.expect(wide_q.q.size >= 2 * q_dim * 2 * @sizeOf(f32));
+    engine.releaseBatchedPrefillScratch();
+
+    // A request over the retention cap is freed at release, restoring the
+    // pre-cache transient behavior so long prompts cannot pin memory.
+    _ = try engine.acquireBatchedPrefillScratch(batched_prefill_scratch_retain_max_tokens + 1, q_dim, kv_dim, inter_dim);
+    engine.releaseBatchedPrefillScratch();
+    try std.testing.expect(engine.batched_prefill_scratch_cache == null);
 }
 
 test "BatchedPrefillScratch sizes active-block shared output scratch by token" {

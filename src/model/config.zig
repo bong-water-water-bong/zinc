@@ -19,6 +19,12 @@ pub const Architecture = enum {
     jamba,
     gemma,
     gpt_oss,
+    /// Meta Muse Glimmer 30B (2026): dense causal transformer that combines the
+    /// Gemma skeleton (pre/post attn+ffn RMSNorm, sliding-window attention with a
+    /// global layer every 4th, SwiGLU, final-logit softcapping) with Qwen-style
+    /// gated attention (separate `attn_gate` tensor) and QK-norm. Dense (no MoE),
+    /// GQA 32/2 at head_dim 128. GGUF `general.architecture = "muse-glimmer"`.
+    muse_glimmer,
     unknown,
 };
 
@@ -29,7 +35,11 @@ pub const Architecture = enum {
 /// `rope_original_context`) are used only by the `qwen35` IMRoPE scheme.
 pub const ModelConfig = struct {
     architecture: Architecture,
+    /// Decoder layers executed by the ordinary autoregressive forward pass.
+    /// GGUF `block_count` may also include appended NextN/MTP draft blocks;
+    /// those are tracked separately in `n_nextn_layers`.
     n_layers: u32,
+    n_nextn_layers: u32 = 0,
     n_heads: u32,
     n_kv_heads: u32,
     head_dim: u32,
@@ -51,6 +61,10 @@ pub const ModelConfig = struct {
     full_attn_interval: u32,
     shared_expert_intermediate_dim: u32,
     final_logit_softcapping: f32 = 0.0,
+    /// Multiplier applied to the final logits before softcapping (Cohere/Muse
+    /// Glimmer `logit_scale`). 0.0 means "no scaling" (the default for models
+    /// that omit the key).
+    logit_scale: f32 = 0.0,
     attn_scale: f32 = 0.0,
     sliding_window_size: u32 = 0,
     rope_scaling_factor: f32 = 0.0,
@@ -58,6 +72,27 @@ pub const ModelConfig = struct {
     rope_original_context: u32 = 0,
     rope_sections: [4]u32 = .{ 0, 0, 0, 0 },
 };
+
+pub const LayerCounts = struct {
+    decoder: u32,
+    nextn: u32,
+};
+
+/// Split GGUF `block_count` into ordinary decoder and appended NextN/MTP layers.
+/// Invalid metadata is ignored conservatively so existing models keep their
+/// original decoder count instead of underflowing or becoming empty.
+pub fn normalizeLayerCounts(block_count: u32, declared_nextn: u32) LayerCounts {
+    if (declared_nextn == 0 or declared_nextn >= block_count) {
+        return .{ .decoder = block_count, .nextn = 0 };
+    }
+    return .{ .decoder = block_count - declared_nextn, .nextn = declared_nextn };
+}
+
+test "normalizeLayerCounts excludes appended NextN blocks" {
+    try std.testing.expectEqual(LayerCounts{ .decoder = 64, .nextn = 1 }, normalizeLayerCounts(65, 1));
+    try std.testing.expectEqual(LayerCounts{ .decoder = 64, .nextn = 0 }, normalizeLayerCounts(64, 0));
+    try std.testing.expectEqual(LayerCounts{ .decoder = 1, .nextn = 0 }, normalizeLayerCounts(1, 1));
+}
 
 /// Map a GGUF `general.architecture` string to an `Architecture` variant.
 /// The mapping is many-to-one: architecturally equivalent families share a variant
@@ -94,6 +129,9 @@ pub fn parseArchitecture(arch_str: []const u8) Architecture {
     if (std.mem.eql(u8, arch_str, "gpt-oss")) return .gpt_oss;
     if (std.mem.eql(u8, arch_str, "gpt_oss")) return .gpt_oss;
     if (std.mem.eql(u8, arch_str, "openai-moe")) return .gpt_oss;
+    if (std.mem.eql(u8, arch_str, "muse-glimmer")) return .muse_glimmer;
+    if (std.mem.eql(u8, arch_str, "muse_glimmer")) return .muse_glimmer;
+    if (std.mem.eql(u8, arch_str, "museglimmer")) return .muse_glimmer;
     return .unknown;
 }
 
@@ -119,5 +157,7 @@ test "parseArchitecture" {
     try std.testing.expectEqual(Architecture.mistral, parseArchitecture("mistral"));
     try std.testing.expectEqual(Architecture.mistral, parseArchitecture("llama"));
     try std.testing.expectEqual(Architecture.gpt_oss, parseArchitecture("gpt-oss"));
+    try std.testing.expectEqual(Architecture.muse_glimmer, parseArchitecture("muse-glimmer"));
+    try std.testing.expectEqual(Architecture.muse_glimmer, parseArchitecture("muse_glimmer"));
     try std.testing.expectEqual(Architecture.unknown, parseArchitecture("gpt2"));
 }

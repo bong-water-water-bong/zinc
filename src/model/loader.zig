@@ -46,6 +46,27 @@ pub const LoadedTensor = struct {
 /// `ffn_down_exps_scale.weight` (Q4_K_M variants only).
 /// Dense tensors and non-expert MoE tensors (router gate, attention, embeddings, etc.)
 /// are not matched.
+/// Whether `name` belongs to an appended NextN/MTP block, i.e. `blk.<i>.*`
+/// with `i >= first_nextn_layer`. Those blocks are excluded from ordinary
+/// inference, so with speculative decoding off their weights are dead VRAM —
+/// 276 MiB on Qwen 3.8 27B, which is the difference between a 258K and the
+/// model's full 262K context on a 32 GB card.
+/// Mirror of the engine's `ZINC_MTP` switch (compute/forward.zig), read here so
+/// the loader can drop weights the engine will never bind.
+fn mtpWantedFromEnv() bool {
+    const raw = std.posix.getenv("ZINC_MTP") orelse return true;
+    if (raw.len == 0) return true;
+    return !(std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "off"));
+}
+
+pub fn isAppendedNextnTensor(name: []const u8, first_nextn_layer: u32) bool {
+    if (!std.mem.startsWith(u8, name, "blk.")) return false;
+    const rest = name["blk.".len..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return false;
+    const idx = std.fmt.parseInt(u32, rest[0..dot], 10) catch return false;
+    return idx >= first_nextn_layer;
+}
+
 pub fn isMoEExpertTensor(name: []const u8) bool {
     return std.mem.endsWith(u8, name, "ffn_gate_exps.weight") or
         std.mem.endsWith(u8, name, "ffn_up_exps.weight") or
@@ -198,10 +219,16 @@ fn extractConfigWithLogging(gf: *const gguf.GGUFFile, log_metadata: bool) ModelC
     // Helper to look up arch-prefixed metadata keys
     var key_buf: [128]u8 = undefined;
 
-    const n_layers = blk: {
+    const block_count = blk: {
         const key = std.fmt.bufPrint(&key_buf, "{s}.block_count", .{prefix}) catch break :blk @as(u32, 0);
         break :blk gf.getU32(key) orelse 0;
     };
+    const declared_nextn_layers = blk: {
+        const key = std.fmt.bufPrint(&key_buf, "{s}.nextn_predict_layers", .{prefix}) catch break :blk @as(u32, 0);
+        break :blk gf.getU32(key) orelse 0;
+    };
+    const layer_counts = config_mod.normalizeLayerCounts(block_count, declared_nextn_layers);
+    const n_layers = layer_counts.decoder;
 
     const n_heads = blk: {
         const key = std.fmt.bufPrint(&key_buf, "{s}.attention.head_count", .{prefix}) catch break :blk @as(u32, 0);
@@ -324,6 +351,11 @@ fn extractConfigWithLogging(gf: *const gguf.GGUFFile, log_metadata: bool) ModelC
         log.info("Architecture: {s} | {d} layers | {d} heads ({d} KV) | dim {d} | vocab {d}", .{
             arch_str, n_layers, n_heads, n_kv_heads, hidden_dim, vocab_size,
         });
+        if (layer_counts.nextn > 0) {
+            log.info("NextN/MTP: {d} appended block(s) retained but excluded from ordinary inference", .{layer_counts.nextn});
+        } else if (declared_nextn_layers > 0) {
+            log.warn("Ignoring invalid NextN/MTP layer count {d} for block_count {d}", .{ declared_nextn_layers, block_count });
+        }
         if (rope_dim > 0) {
             log.info("RoPE: dim={d}/{d} freq_base={d:.0}", .{ rope_dim, head_dim, @as(f64, @floatCast(blk: {
                 const key3 = std.fmt.bufPrint(&key_buf, "{s}.rope.freq_base", .{prefix}) catch break :blk @as(f32, 10000.0);
@@ -369,6 +401,7 @@ fn extractConfigWithLogging(gf: *const gguf.GGUFFile, log_metadata: bool) ModelC
     return ModelConfig{
         .architecture = arch,
         .n_layers = n_layers,
+        .n_nextn_layers = layer_counts.nextn,
         .n_heads = n_heads,
         .n_kv_heads = n_kv_heads,
         .head_dim = head_dim,
@@ -592,6 +625,14 @@ pub fn load(
     }
     _ = decideOffloadForLoad(total_tensor_bytes, offloadable_tensor_bytes, instance.vramBytes());
 
+    // With speculative decoding off, the appended NextN block never runs, so
+    // its weights are not uploaded at all (see isAppendedNextnTensor). The
+    // engine's mtpModelEligible() then finds no NextN tensors and stays off,
+    // which is consistent: the two decisions read the same switch.
+    const skip_nextn = config.n_nextn_layers > 0 and !mtpWantedFromEnv();
+    const first_nextn_layer = config.n_layers;
+    var skipped_nextn_bytes: u64 = 0;
+
     var total_vram: u64 = 0;
     var total_host_visible: u64 = 0;
     const n_tensors = gf.tensors.items.len;
@@ -601,6 +642,10 @@ pub fn load(
     });
     for (gf.tensors.items, 0..) |tensor_info, ti| {
         const tensor_size = tensor_info.sizeBytes();
+        if (skip_nextn and isAppendedNextnTensor(tensor_info.name, first_nextn_layer)) {
+            skipped_nextn_bytes += tensor_size;
+            continue;
+        }
         log.debug("[{d}/{d}] '{s}' | type={s} | {d} bytes ({d:.2} MB)", .{
             ti + 1,
             n_tensors,
@@ -609,7 +654,6 @@ pub fn load(
             tensor_size,
             @as(f64, @floatFromInt(tensor_size)) / (1024.0 * 1024.0),
         });
-
         const data_offset = gf.tensor_data_offset + tensor_info.offset;
         const src_data = mmap_data[data_offset..][0..@intCast(tensor_size)];
         const offload = shouldOffloadToHost(tensor_info.name);
@@ -659,6 +703,9 @@ pub fn load(
         });
     }
 
+    if (skipped_nextn_bytes > 0) {
+        log.info("NextN/MTP off: skipped {d} MB of appended block weights", .{skipped_nextn_bytes / (1024 * 1024)});
+    }
     if (total_host_visible > 0) {
         log.info("Loaded {d} tensors | {d} MB device-local VRAM | {d} MB host-visible (system RAM)", .{
             loaded_tensors.items.len,
@@ -841,6 +888,28 @@ test "extractConfig defaults gemma4 attention scale to 1.0" {
 
     const cfg = extractConfigWithLogging(&gf, false);
     try std.testing.expectEqual(@as(f32, 1.0), cfg.attn_scale);
+}
+
+test "extractConfig excludes appended NextN blocks from decoder layers" {
+    const allocator = std.testing.allocator;
+
+    var gf = gguf.GGUFFile{
+        .version = .v3,
+        .tensor_count = 0,
+        .metadata = .{},
+        .tensors = .{},
+        .tensor_data_offset = 0,
+        .allocator = allocator,
+    };
+    defer gf.deinit();
+
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "qwen35") });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "qwen35.block_count"), .{ .uint32 = 65 });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "qwen35.nextn_predict_layers"), .{ .uint32 = 1 });
+
+    const cfg = extractConfigWithLogging(&gf, false);
+    try std.testing.expectEqual(@as(u32, 64), cfg.n_layers);
+    try std.testing.expectEqual(@as(u32, 1), cfg.n_nextn_layers);
 }
 
 test "extractConfig uses max gemma4 head_count_kv array entry" {

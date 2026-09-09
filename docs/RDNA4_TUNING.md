@@ -160,6 +160,81 @@ GGUF models commonly ship Q8_0 for tensors the publisher considered precision-se
 
 On the T-CPU autopilot path, adding `attn_qkv` to the Q8_0 → Q4_0 re-quantize-at-load list moved decode from 32.8 to 37.6 tok/s and prefill from 28.5 to 32.7 tok/s on the 9800X3D bench, with output staying coherent. The model is already Q4_K everywhere else; per-weight noise on the SSM in-proj is averaged out by the L2-normalized delta-net recurrence one layer downstream. The same lever applies on RDNA4 wherever a tensor is loaded Q8_0 by default and the kernel has a Q4_0 variant. See `forward_zinc_rt.zig`'s `q4_candidates` list for the current set.
 
+## NextN/MTP speculative decoding (Qwen 3.8 GGUFs with an appended NextN block)
+
+Qwen 3.8 GGUFs that carry the model's NextN block use it automatically on the
+Vulkan backend, in the CLI and in the OpenAI-compatible server. Each cycle
+drafts two tokens with the NextN block, verifies the seed plus drafts in one
+3-token pass of the full model, restores the DeltaNet/conv state at the
+accepted boundary when a draft is rejected, and catches the NextN block up over
+the committed rows. Both drafts and the verification pass are recorded into
+one command buffer: the draft tokens stay on the device (their embedding rows
+are gathered by the `embed_gather` shader), and the restore/catch-up of a
+cycle is recorded at the start of the next one, so a cycle costs one submit
+and one fence wait. Greedy output is bit-identical to ordinary decode.
+
+R9700, Qwen 3.8 27B Q4_K_M, greedy, CLI with auto context (the perf-suite
+scenarios) and the server path with the same 96-token core prompt:
+
+| | decode tok/s |
+|---|---:|
+| core prompt, 96 tokens, `ZINC_MTP=0` | 32.0 |
+| core prompt, 96 tokens | 54.6 |
+| context-medium, 160 tokens | 60.2 |
+| context-long, 128 tokens | 66.2 |
+| decode-extended, 256 tokens | 66.3 |
+| server, core prompt, 96 tokens | 53.6 |
+
+Acceptance is prompt-dependent (54% of drafts on the core prompt, 65–77% on
+the longer ones), and the 96-token core scenario also pays the prime and the
+first cycles; the same prompt at 97+ tokens reads 55+.
+
+Scope and knobs:
+
+- Greedy requests only (default `temperature`, `top_p`, repetition penalty);
+  sampled requests take the ordinary path.
+- Server requests that reuse a cached prompt prefix (`session_id` clients)
+  fall back to ordinary decode for now; a full-prompt prefill is required to
+  prime the NextN block.
+- The CLI now sizes its automatic context like the server (85% of VRAM for
+  weights + KV, `-c` overrides). Handing the engine the architectural maximum
+  used to fill the card to the last few hundred MB and spill buffers to system
+  memory, which cost 17% of MTP decode and 10% of plain decode on the R9700.
+- `ZINC_MTP=0` disables MTP. `ZINC_MTP_CHAIN=0` falls back to one submission
+  per draft/verification/catch-up step (A/B only; ~1 tok/s slower).
+  `ZINC_MTP_COLS=0` disables the column-parallel Q4_K/Q5_K/Q6_K matvec route
+  used by the verification batch (A/B only); `ZINC_MTP_COLS_ROWS` (2/4/8,
+  default 4), `ZINC_MTP_LMHEAD_ROWS` (default 8) and `ZINC_MTP_WIDE_ROWS`
+  (gate/up, default 4) pick rows-per-workgroup variants; `ZINC_MTP_COLS3=0`
+  disables the unguarded three-/four-column kernels and
+  `ZINC_MTP_FUSED_GATEUP=0` the fused gate+up+SwiGLU one (A/B only).
+- `ZINC_MTP_DRAFTS` (1–3, default 2) sets the draft window; `auto` drafts a
+  third token only while the running per-position acceptance says the extra
+  tokens outweigh the wider 4-row verification pass (about 8% costlier than the
+  3-row one). Measured on the suite prompts it is a wash: +2 tok/s on
+  context-medium, −1.5 on context-long, so it stays opt-in.
+- `ZINC_MTP_DRAFT_VOCAB=<rows>` limits the draft lm-head to the first N
+  (frequency-ordered) vocabulary rows; default 98304 for vocabularies above
+  160K rows, 0 = all rows. Verification always scores the full vocabulary, so
+  this only trades draft acceptance for draft cost (81920 loses drafts on the
+  longer prompts, 65536 more so).
+- `ZINC_MTP_DP4A=1` runs the Q4_K verification matvecs on int8 dp4a with
+  Q8_1-quantized activations: ~3% faster, but the output is no longer
+  bit-identical to plain decode (off by default).
+- `ZINC_MTP_PROFILE=1` with `--profile` prints per-phase GPU totals for the
+  verification pass (one submit per layer function, slower). The server logs
+  each request's cycle statistics (`NextN/MTP: request accepted ...`) when the
+  next request begins.
+- `ZINC_VK_QUEUE_FAMILY=<n>` overrides the Vulkan queue family (diagnostic;
+  families 0 and 1 perform the same on the R9700).
+
+Measuring it: the perf suite drives the **server** (not the CLI), so its prompts
+carry the chat template and accept fewer drafts than a bare `--chat --prompt`
+run — expect ~1 tok/s between the two on the same text. Do not force
+`power_dpm_force_performance_level=high` on this card: it locks a fixed nominal
+DPM state, costs 4.3% of decode, and `auto` is just as stable here (the suite
+sets `auto` and forces PCIe ASPM to `performance`).
+
 ## ZINC_RT, this guide, and what changes
 
 The Vulkan-specific advice above is about driver, firmware, and toolchain. **All of it still applies under ZINC_RT** because ZINC_RT uses the same `amdgpu` kernel driver. Disable GECC. Stay on Mesa 25.0.7 (when running anything that links libvulkan, including dev tooling and CI shader compilation). Stay on kernel 6.14 if you can. Pin shaderc 2023.8.

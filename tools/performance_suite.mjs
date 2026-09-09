@@ -16,7 +16,7 @@ export const DEFAULT_LOCAL_MODEL_ROOT = path.join(os.homedir(), "Library", "Cach
 const DEFAULT_DOCKER_LLAMA_SERVER = path.join(os.homedir(), ".docker", "bin", "inference", "llama-server");
 const DEFAULT_RDNA_WORKDIR = "/root/zinc-bench";
 const DEFAULT_RDNA_MODEL_ROOT = "/root/models";
-const TARGET_ORDER = ["rdna", "cuda", "intel", "metal"];
+const TARGET_ORDER = ["rdna", "rdna-rocm", "rdna-zinc-rt", "cuda", "intel", "metal"];
 const MAX_CAPTURE_CHARS = 256_000;
 
 function modelPath(root, dir) {
@@ -55,6 +55,58 @@ export function parseDotEnv(text) {
     if (key) env[key] = value;
   }
   return env;
+}
+
+export function benchmarkStatisticsNote(runs, warmupRuns) {
+  const warmupText = warmupRuns === 1
+    ? "one warmup pass is"
+    : `${warmupRuns} warmup passes are`;
+  const runText = runs === 1
+    ? "one measured run is"
+    : `${runs} measured runs are`;
+  return `Statistics: ${warmupText} discarded, then ${runText} collected. Published prefill, decode, end-to-end throughput, and latency values are medians.`;
+}
+
+export function measuredRunRange(models) {
+  const counts = [];
+  for (const model of models ?? []) {
+    const scenarios = Array.isArray(model?.scenarios) && model.scenarios.length > 0
+      ? model.scenarios
+      : [model];
+    for (const scenario of scenarios) {
+      for (const engine of [scenario?.zinc, scenario?.baseline]) {
+        const samples = engine?.decode_tps?.samples
+          ?? engine?.prefill_tps?.samples
+          ?? engine?.total_latency_ms?.samples;
+        if (Array.isArray(samples) && samples.length > 0) counts.push(samples.length);
+      }
+    }
+  }
+  if (counts.length === 0) return null;
+  return { min: Math.min(...counts), max: Math.max(...counts) };
+}
+
+function normalizeMethodologyRunRange(methodology, models) {
+  if (!methodology) return methodology;
+  const range = measuredRunRange(models);
+  if (!range) return methodology;
+
+  const warmupRuns = methodology.warmup_runs ?? 0;
+  const statisticsNote = range.min === range.max
+    ? benchmarkStatisticsNote(range.max, warmupRuns)
+    : `Statistics: ${warmupRuns === 1 ? "one warmup pass is" : `${warmupRuns} warmup passes are`} discarded for every row, then ${range.min}–${range.max} measured runs are collected depending on the model. Published prefill, decode, end-to-end throughput, and latency values are medians.`;
+  const notes = Array.isArray(methodology.notes) ? [...methodology.notes] : [];
+  const statisticsIndex = notes.findIndex((note) => note.startsWith("Statistics:"));
+  if (statisticsIndex >= 0) notes[statisticsIndex] = statisticsNote;
+  else notes.push(statisticsNote);
+
+  return {
+    ...methodology,
+    runs: range.max,
+    runs_min: range.min,
+    runs_max: range.max,
+    notes,
+  };
 }
 
 async function readDotEnv(dotEnvPath) {
@@ -284,10 +336,20 @@ export function parseArgs(argv) {
   }
 
   if (args.runs === 0) throw new Error("--runs must be at least 1");
-  if (!["auto", "vulkan", "zinc_rt"].includes(args.rdnaBackend)) {
-    throw new Error(`Invalid --rdna-backend '${args.rdnaBackend}'. Expected auto, vulkan, or zinc_rt.`);
+  if (!["auto", "vulkan", "rocm", "zinc_rt"].includes(args.rdnaBackend)) {
+    throw new Error(`Invalid --rdna-backend '${args.rdnaBackend}'. Expected auto, vulkan, rocm, or zinc_rt.`);
   }
   return args;
+}
+
+export function rdnaTargetIdentity(backend) {
+  if (backend === "rocm") {
+    return { id: "rdna-rocm", label: "AMD RDNA · ROCm" };
+  }
+  if (backend === "zinc_rt") {
+    return { id: "rdna-zinc-rt", label: "AMD RDNA · ZINC_RT" };
+  }
+  return { id: "rdna", label: "AMD RDNA · Vulkan" };
 }
 
 function usage() {
@@ -313,7 +375,7 @@ function usage() {
   --rdna-build                Build ReleaseFast on the RDNA node before running
   --rdna-start-llama          Start llama-server on the RDNA node before baseline runs
   --rdna-node <name>          Select node-specific env keys, e.g. rdna2 -> ZINC_RDNA2_HOST/PORT/USER
-  --rdna-backend <backend>    ZINC backend to build on RDNA: auto, vulkan, zinc_rt (default: vulkan)
+  --rdna-backend <backend>    ZINC backend to build on RDNA: auto, vulkan, rocm, zinc_rt (default: vulkan)
   --intel-sync                Rsync current repo to the Intel node before running
   --intel-build               Build ReleaseFast on the Intel node before running
   --intel-start-llama         Stop stale llama-server processes on the Intel node before baseline runs
@@ -387,9 +449,17 @@ export function parseZincServerOutput(text) {
   }
 
   const parsed = parseZincCliOutput(text.slice(markerIndex + marker.length));
-  const content = body.choices?.[0]?.text ?? body.choices?.[0]?.message?.content ?? "";
+  const choice = body.choices?.[0] ?? {};
+  const content = [choice.text, choice.message?.content, choice.message?.reasoning_content]
+    .find((value) => typeof value === "string" && value.trim()) ?? "";
   const promptTokens = body.usage?.prompt_tokens ?? parsed.promptTokens;
   const generatedTokens = body.usage?.completion_tokens ?? parsed.generatedTokens;
+  if (!Number.isFinite(generatedTokens) || generatedTokens <= 0) {
+    throw new Error("ZINC server returned no generated tokens");
+  }
+  if (!Number.isFinite(parsed.decodeTps) || parsed.decodeTps <= 0) {
+    throw new Error("ZINC server returned no usable decode timing");
+  }
   return {
     ...parsed,
     promptTokens,
@@ -430,12 +500,15 @@ export function parseLlamaCppVersionOutput(text) {
 
   if (!versionLine) return null;
 
-  const match = versionLine.match(/^version:\s*([^\s]+)\s+\(([0-9a-f]+)\)/i);
-  if (!match) return null;
+  const version = versionLine.match(/^version:\s*([^\s]+)/i)?.[1] ?? null;
+  const commit = versionLine.match(/\bcommit\s+([0-9a-f]{7,40})\b/i)?.[1]
+    ?? versionLine.match(/\(([0-9a-f]{7,40})\)/i)?.[1]
+    ?? null;
+  if (!version || !commit) return null;
 
   return {
-    version: match[1],
-    commit: match[2],
+    version,
+    commit,
   };
 }
 
@@ -470,7 +543,9 @@ export function validateZincBackend(versionText, expectedBackend) {
 
 export function parseOpenAiCompletionOutput(text) {
   const body = JSON.parse(text);
-  const content = body.choices?.[0]?.text ?? body.choices?.[0]?.message?.content ?? "";
+  const choice = body.choices?.[0] ?? {};
+  const content = [choice.text, choice.message?.content, choice.message?.reasoning_content]
+    .find((value) => typeof value === "string" && value.trim()) ?? "";
   const promptTokens = body.usage?.prompt_tokens ?? null;
   const generatedTokens = body.usage?.completion_tokens ?? 0;
   const timings = body.timings ?? {};
@@ -558,6 +633,13 @@ function matchingGeneratedBudget(zincGenerated, baselineGenerated, expectedGener
 export function outputQualityStatus(preview, generatedTokens = null) {
   const text = `${preview ?? ""}`.trim();
   if (!text) {
+    if (generatedTokens != null && generatedTokens <= 0) {
+      return {
+        tone: "caution",
+        label: "Generation failed",
+        note: "The request returned without generating a token.",
+      };
+    }
     return {
       tone: "neutral",
       label: "No Preview",
@@ -581,6 +663,14 @@ export function outputQualityStatus(preview, generatedTokens = null) {
     };
   }
 
+  if (/<pad>/i.test(text)) {
+    return {
+      tone: "caution",
+      label: "Preview flagged",
+      note: "ZINC completed numerically, but the preview contains raw padding tokens.",
+    };
+  }
+
   if ((text.match(/<think>/g) ?? []).length > 1 || /<\/?parameter>/.test(text)) {
     return {
       tone: "caution",
@@ -595,6 +685,7 @@ export function outputQualityStatus(preview, generatedTokens = null) {
     hasRepeatedNumberedItemText(text) ||
     hasRepeatedLineText(text) ||
     /([#*_=-])\1{31,}/.test(text) ||
+    hasRepeatedTokenPattern(text) ||
     /\b([A-Za-z]{3,})\1{8,}\b/.test(text)
   ) {
     return {
@@ -609,6 +700,23 @@ export function outputQualityStatus(preview, generatedTokens = null) {
     label: "Preview OK",
     note: "The captured preview does not show an obvious stop-token, control-token, or repetition failure.",
   };
+}
+
+function hasRepeatedTokenPattern(text) {
+  const tokens = text.toLowerCase().match(/[\p{L}\p{N}]+|[^\s\p{L}\p{N}]/gu) ?? [];
+  for (let width = 1; width <= 8; width += 1) {
+    if (tokens.length < width * 6) continue;
+    for (let start = 0; start + width * 6 <= tokens.length; start += 1) {
+      const pattern = tokens.slice(start, start + width).join("\u0000");
+      let repeats = 1;
+      while (
+        start + (repeats + 1) * width <= tokens.length &&
+        tokens.slice(start + repeats * width, start + (repeats + 1) * width).join("\u0000") === pattern
+      ) repeats += 1;
+      if (repeats >= 6) return true;
+    }
+  }
+  return false;
 }
 
 function hasRepeatedNumberedItemText(text) {
@@ -864,6 +972,7 @@ export function mergeArtifacts(existing, incomingTargets, options = {}) {
     return {
       ...target,
       models,
+      methodology: normalizeMethodologyRunRange(target?.methodology, models),
       summary: targetSummary(models),
     };
   };
@@ -969,7 +1078,10 @@ function targetSummary(models) {
       return scenario ? { model, scenario } : null;
     })
     .filter(Boolean);
-  const successful = validPrimaryRows.filter((row) => row.scenario?.zinc?.decode_tps);
+  const successful = validPrimaryRows.filter((row) => {
+    const decode = finiteMetric(row.scenario?.zinc?.decode_tps?.median ?? row.scenario?.zinc?.decode_tps?.avg ?? null);
+    return decode != null && decode > 0;
+  });
   const fastest = successful.length > 0
     ? [...successful].sort((a, b) => {
         const bDecode = b.scenario.zinc.decode_tps.median ?? b.scenario.zinc.decode_tps.avg;
@@ -1129,6 +1241,10 @@ function remoteEnvPrefix(creds) {
 
 const REMOTE_ZINC_TUNING_ENV_KEYS = [
   "ZINC_BATCHED_PREFILL",
+  "ZINC_QWEN_MOE_BATCHED",
+  "ZINC_MOE_TC",
+  "ZINC_MOE_DOWN_TC",
+  "ZINC_MOE_DOWN_Q6K_TC",
   "ZINC_INTEL_BATCHED_PREFILL",
   "ZINC_INTEL_BATCHED_PREFILL_CHUNK",
   "ZINC_FUSED_QK_KV",
@@ -1171,12 +1287,89 @@ const REMOTE_ZINC_TUNING_ENV_KEYS = [
   "ZINC_Q8_SPEC_DMMV",
   "ZINC_Q8_1_SSM_QKV_Z",
   "ZINC_GEMMA_MOE_TOPK",
+  "ZINC_GEMMA_MOE_PREFILL_SERIAL",
+  "ZINC_GEMMA_ATTN_PREFILL_SERIAL",
+  "ZINC_ROCM_GEMMA_Q8_PREFILL",
   "ZINC_GEMMA_MOE_PREFILL_TOPK",
   "ZINC_TOPK_V1",
+  "ZINC_PREFILL_WMMA_TAIL",
+  "ZINC_PREFILL_WMMA_Q4_DIRECT",
   "ZINC_PREFILL_PROFILE",
+  "ZINC_ROCM_TIME_KERNEL",
+  "ZINC_Q8_M32",
+  "ZINC_Q8_FFN_BLOCK64",
+  "ZINC_Q8_FFN_BLOCK128",
+  "ZINC_Q8_Q6_BLOCK64",
+  "ZINC_Q8_Q6_BLOCK128",
+  "ZINC_ROCM_Q8_MROW2",
+  "ZINC_ROCM_Q8_BLOCK32",
+  "ZINC_ROCM_Q8_FUSED",
+  "ZINC_ROCM_MOE_SHARED_Q8",
+  "ZINC_ROCM_MOE_DOWN_Q8",
+  "ZINC_ROCM_MOE_GATE_GEGLU",
+  "ZINC_ROCM_LIGHT_COMMANDS",
+  "ZINC_MOE_DOWN_Q8_M16",
+  "ZINC_MOE_DOWN_Q8_M8",
+  "ZINC_MOE_DOWN_Q8_M64",
+  "ZINC_MOE_DIRECT_A",
+  "ZINC_MOE_ROUTE64",
+  "ZINC_MOE_Q51_DIRECT",
+  "ZINC_SSM_PROFILE",
+  "ZINC_ROCM_DECODE_PAIR_REDUCE",
+  "ZINC_ROCM_Q4_PAIR_REDUCE",
+  "ZINC_ROCM_DECODE_Q8_FFN",
+  "ZINC_ROCM_DECODE_Q8_Q6",
+  "ZINC_ROCM_DECODE_Q8_LM",
+  "ZINC_ROCM_DECODE_Q8_Q4",
+  "ZINC_ROCM_DECODE_Q8_Q8",
+  "ZINC_ROCM_DECODE_Q8_Q6_PROJ",
+  "ZINC_ROCM_DECODE_Q8_Q5",
+  "ZINC_ROCM_DECODE_Q8_Q4_PAIR",
+  "ZINC_ROCM_RMS_Q8",
+  "ZINC_ROCM_ARGMAX_V2",
+  "ZINC_ROCM_MUSE_ATTN_BLAS",
+  "ZINC_ROCM_MUSE_ATTN_BLAS_MIN",
+  "ZINC_ROCM_GEMMA_GQA2",
+  "ZINC_ROCM_GEMMA_ATTN_BLAS",
+  "ZINC_ROCM_MUSE_NORM_CHAIN",
+  "ZINC_ROCM_DECODE_SSM_COL_WARP",
+  "ZINC_ROCM_DECODE_SSM_FAST",
+  "ZINC_ROCM_FUSED_SSM_F32",
+  "ZINC_ROCM_FUSED_Q4_PAIRS",
+  "ZINC_BATCHED_TC",
+  "ZINC_BATCHED_CUBLAS",
+  "ZINC_BATCHED_CUBLAS_NOQ4",
+  "ZINC_BATCHED_CUBLAS_NOQ5",
+  "ZINC_BATCHED_CUBLAS_NOQ6",
+  "ZINC_BATCHED_CUBLAS_NOQ8",
+  "ZINC_CUBLAS_MIN_T",
+  "ZINC_BATCHED_TC_PLAIN",
+  "ZINC_BATCHED_TC_NOQ6",
+  "ZINC_BATCHED_TC_M128",
+  "ZINC_BATCHED_TC_M64",
+  "ZINC_BATCHED_TC_Q6_LOWSMEM",
+  "ZINC_BATCHED_TC_M128_LOWSMEM",
+  "ZINC_BATCHED_TC_SHAREA",
+  "ZINC_BATCHED_TC_NORMF16",
+  "ZINC_BATCHED_EXPERTS_GROUPED",
+  "ZINC_MOE_NORM_COMBINE",
+  "ZINC_ATTN_MOE_NORM",
+  "ZINC_MOE_EXACT_Q8",
+  "ZINC_MOE_M64",
+  "ZINC_MOE_M32",
+  "ZINC_MOE_T8",
+  "ZINC_MOE_T16",
+  "ZINC_SSM_PREPARED",
+  "ZINC_SSM_COL_WARP",
+  "ZINC_SSM_COL_WARP_FAST",
   "ZINC_PREFILL_Q8",
+  "ZINC_PREFILL_Q8_REUSE",
+  "ZINC_PREFILL_WMMA_TILES",
+  "ZINC_PREFILL_WMMA_T80",
+  "ZINC_ATTN_V2",
   "ZINC_PREFILL_DP4A",
   "ZINC_PREFILL_F16",
+  "ZINC_PRE_DEQUANT",
   "ZINC_PREFILL_LOWSMEM",
   "ZINC_PREFILL_TC",
   "ZINC_PREFILL_Q8_TC",
@@ -1287,25 +1480,36 @@ async function captureRemoteLlamaCppProvenance(binaryPath, creds, timeoutMs = 12
       binary: null,
       version: null,
       commit: null,
+      sha256: null,
     };
   }
 
+  let version = null;
+  let commit = null;
   try {
     const command = rdnaRemoteCommand(`${shellQuote(binaryPath)} --version`, creds);
     const result = await runShell(command, { cwd: ROOT, timeoutMs });
     const parsed = parseLlamaCppVersionOutput(result.combined);
-    return {
-      binary: path.basename(binaryPath),
-      version: parsed?.version ?? null,
-      commit: parsed?.commit ?? null,
-    };
-  } catch {
-    return {
-      binary: path.basename(binaryPath),
-      version: null,
-      commit: null,
-    };
-  }
+    version = parsed?.version ?? null;
+    commit = parsed?.commit ?? null;
+  } catch {}
+
+  // Some benchmark binaries are built from exported or detached worktrees and
+  // therefore report an unknown llama.cpp commit. Preserve an exact binary
+  // identity even in that case so the baseline remains reproducible.
+  let sha256 = null;
+  try {
+    const command = rdnaRemoteCommand(`sha256sum ${shellQuote(binaryPath)}`, creds);
+    const result = await runShell(command, { cwd: ROOT, timeoutMs });
+    sha256 = result.stdout.match(/^([0-9a-f]{64})\b/i)?.[1]?.toLowerCase() ?? null;
+  } catch {}
+
+  return {
+    binary: path.basename(binaryPath),
+    version,
+    commit,
+    sha256,
+  };
 }
 
 function shouldUseManagedModelId(caseDef) {
@@ -1458,12 +1662,20 @@ async function stopProcess(child, graceMs = 5000) {
   }
 }
 
-export function rdnaDpmHighScript() {
-  return "for c in /sys/class/drm/card*/device; do if [ -f \"$c/pp_dpm_mclk\" ] && grep -q amdgpu \"$c/uevent\" 2>/dev/null; then levels=$(awk 'END { print NR }' \"$c/pp_dpm_mclk\" 2>/dev/null || printf 0); if [ \"${levels:-0}\" -ge 5 ]; then echo high > \"$c/power_dpm_force_performance_level\" 2>/dev/null || true; fi; fi; done; true";
+// Put the benchmark GPU in a known state: PCIe ASPM off and the amdgpu DPM
+// governor at its default `auto`. Forcing `high` (what this did until
+// 2026-09-07) locks the R9700 to a fixed nominal DPM state and gives up
+// opportunistic boost: measured over the four Qwen 3.8 27B scenarios, `high`
+// cost ZINC 4.1-4.4% and llama.cpp 3.3-3.5% of decode, on every run. `auto` is
+// what an unconfigured card does and is just as stable here (0.4% spread over
+// four runs, and the suite already runs a warmup). The pin came from the
+// 9070 XT, where `auto` let SCLK idle at 0 MHz and consecutive samples ramped.
+export function rdnaDpmNormalizeScript() {
+  return "if [ -w /sys/module/pcie_aspm/parameters/policy ]; then echo performance > /sys/module/pcie_aspm/parameters/policy 2>/dev/null || true; fi; for c in /sys/class/drm/card*/device; do if [ -f \"$c/pp_dpm_mclk\" ] && grep -q amdgpu \"$c/uevent\" 2>/dev/null; then levels=$(awk 'END { print NR }' \"$c/pp_dpm_mclk\" 2>/dev/null || printf 0); if [ \"${levels:-0}\" -ge 5 ]; then echo auto > \"$c/power_dpm_force_performance_level\" 2>/dev/null || true; fi; fi; done; true";
 }
 
-async function lockRdnaDpmHigh(creds, timeoutMs = 30000) {
-  await runShell(rdnaRemoteCommand(rdnaDpmHighScript(), creds), { cwd: ROOT, timeoutMs }).catch(() => {});
+async function lockRdnaDpmNormal(creds, timeoutMs = 30000) {
+  await runShell(rdnaRemoteCommand(rdnaDpmNormalizeScript(), creds), { cwd: ROOT, timeoutMs }).catch(() => {});
 }
 
 function detectLocalLlamaServer(args) {
@@ -1532,6 +1744,7 @@ export function detectRdnaServerStartupFailure(logText) {
     /srv load_model:\s*failed to load model/i,
     /main:\s*exiting due to model loading error/i,
     /error loading model:/i,
+    /error while handling argument "--device":\s*invalid device:[^\n]+/i,
   ];
 
   for (const pattern of patterns) {
@@ -1614,7 +1827,7 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targ
   // Card discovery: the discrete GPU is whichever card1/card2 has
   // amdgpu driver + a 6-level pp_dpm_mclk; we just try both.
   if (lockDpm) {
-    await lockRdnaDpmHigh(creds);
+    await lockRdnaDpmNormal(creds);
   }
 
   const cmd = [
@@ -1663,13 +1876,14 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targ
 async function launchRdnaZincServer(caseDef, creds, timeoutMs) {
   const port = await pickOpenPort();
   const logPath = `/tmp/zinc-rdna-zinc-${port}.log`;
-  await lockRdnaDpmHigh(creds);
+  await lockRdnaDpmNormal(creds);
 
   const cmd = [
     "./zig-out/bin/zinc",
     "-m", caseDef.model_path,
     ...(caseDef.context_tokens != null ? ["--context", String(caseDef.context_tokens)] : []),
     ...(creds.vkDevice != null ? ["-d", String(creds.vkDevice)] : []),
+    "--parallel", "1",
     "--port", String(port),
   ];
   const launchScript = [
@@ -1921,7 +2135,7 @@ export function remoteZincCommand(caseDef, creds) {
 export function rdnaZincCommand(caseDef, creds) {
   return remoteZincCommand(caseDef, {
     ...creds,
-    commandPrelude: rdnaDpmHighScript(),
+    commandPrelude: rdnaDpmNormalizeScript(),
     env: { RADV_PERFTEST: "coop_matrix", ...(creds.env ?? {}) },
   });
 }
@@ -2076,10 +2290,10 @@ export function defaultMetalCases(modelRoot) {
       family: "Qwen 3.5",
       quant: "Q4_K_M",
       model_path: modelPath(modelRoot, "qwen35-9b-q4k-m"),
-      prompt_mode: "raw",
+      prompt_mode: "chat",
       prompt: defaultPromptForModelId("qwen35-9b-q4k-m"),
       max_tokens: defaultMaxTokensForModelId("qwen35-9b-q4k-m"),
-      notes: ["Raw decode path to avoid visible think blocks in CLI output"],
+      notes: ["Chat-template path; reasoning content is captured by the benchmark parser"],
     },
     {
       id: "qwen36-35b-a3b-q4k-xl",
@@ -2094,16 +2308,16 @@ export function defaultMetalCases(modelRoot) {
       notes: ["Managed-cache local Qwen 3.6 case on Apple Silicon"],
     },
     {
-      id: "qwen36-27b-q4k-m",
-      model_id: "qwen36-27b-q4k-m",
-      label: "Qwen 3.6 27B Dense Q4_K_M",
-      family: "Qwen 3.6",
+      id: "qwen38-27b-q4k-m",
+      model_id: "qwen38-27b-q4k-m",
+      label: "Qwen 3.8 27B Dense Q4_K_M",
+      family: "Qwen 3.8",
       quant: "Q4_K_M",
-      model_path: modelPath(modelRoot, "qwen36-27b-q4k-m"),
-      prompt_mode: "raw",
-      prompt: defaultPromptForModelId("qwen36-27b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("qwen36-27b-q4k-m"),
-      notes: ["Dense hybrid Qwen 3.6 case on Apple Silicon"],
+      model_path: modelPath(modelRoot, "qwen38-27b-q4k-m"),
+      prompt_mode: "chat",
+      prompt: defaultPromptForModelId("qwen38-27b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("qwen38-27b-q4k-m"),
+      notes: ["Dense hybrid Qwen 3.8 case on Apple Silicon"],
     },
   ];
 }
@@ -2130,6 +2344,10 @@ export function canonicalModelIdFromPath(modelFile) {
     .replace(/^bartowski[_-]/, "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
+    .replace(/^qwen-qwen3-8-/, "qwen38-")
+    .replace(/^qwen-qwen-3-8-/, "qwen38-")
+    .replace(/^qwen3-8-/, "qwen38-")
+    .replace(/^qwen-3-8-/, "qwen38-")
     .replace(/^qwen-qwen3-6-/, "qwen36-")
     .replace(/^qwen-qwen-3-6-/, "qwen36-")
     .replace(/^qwen3-6-/, "qwen36-")
@@ -2147,8 +2365,10 @@ export function canonicalModelIdFromPath(modelFile) {
 }
 
 export function guessFamily(id) {
+  if (id.startsWith("muse-glimmer")) return "Muse Glimmer";
   if (id.startsWith("gemma4")) return "Gemma 4";
   if (id.startsWith("gemma")) return "Gemma";
+  if (id.startsWith("qwen38")) return "Qwen 3.8";
   if (id.startsWith("qwen36")) return "Qwen 3.6";
   if (id.startsWith("qwen35")) return "Qwen 3.5";
   if (id.startsWith("qwen3")) return "Qwen 3";
@@ -2162,7 +2382,7 @@ function guessQuant(id) {
 }
 
 export function prefersChatPrompt(id) {
-  return id.startsWith("gemma");
+  return id.startsWith("gemma") || id.startsWith("muse-glimmer") || id.startsWith("qwen35") || id.startsWith("qwen38");
 }
 
 export function defaultPromptForModelId(id) {
@@ -2367,6 +2587,28 @@ async function discoverMetalCases(modelRoot) {
 export function defaultRdnaCases(modelRoot) {
   return [
     {
+      id: "muse-glimmer-30b-q4k-m",
+      label: "Muse Glimmer 30B Q4_K_M",
+      family: "Muse Glimmer",
+      quant: "Q4_K_M",
+      model_path: path.join(modelRoot, "muse-glimmer", "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf"),
+      prompt_mode: "chat",
+      prompt: defaultPromptForModelId("muse-glimmer-30b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("muse-glimmer-30b-q4k-m"),
+      notes: ["RDNA4 Muse Glimmer comparison against llama.cpp server"],
+    },
+    {
+      id: "qwen38-27b-q4k-m",
+      label: "Qwen 3.8 27B Dense Q4_K_M",
+      family: "Qwen 3.8",
+      quant: "Q4_K_M",
+      model_path: path.join(modelRoot, "Qwen3.8-27B-Q4_K_M.gguf"),
+      prompt_mode: "chat",
+      prompt: defaultPromptForModelId("qwen38-27b-q4k-m"),
+      max_tokens: defaultMaxTokensForModelId("qwen38-27b-q4k-m"),
+      notes: ["RDNA4 dense Qwen 3.8 comparison against llama.cpp server"],
+    },
+    {
       id: "gemma4-26b-a4b-q4k-m",
       label: "Gemma 4 26B-A4B MoE Q4_K_M",
       family: "Gemma 4",
@@ -2400,23 +2642,12 @@ export function defaultRdnaCases(modelRoot) {
       notes: ["RDNA4 flagship comparison against llama.cpp server"],
     },
     {
-      id: "qwen36-27b-q4k-m",
-      label: "Qwen 3.6 27B Dense Q4_K_M",
-      family: "Qwen 3.6",
-      quant: "Q4_K_M",
-      model_path: path.join(modelRoot, "Qwen3.6-27B-Q4_K_M.gguf"),
-      prompt_mode: "raw",
-      prompt: defaultPromptForModelId("qwen36-27b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("qwen36-27b-q4k-m"),
-      notes: ["RDNA4 dense Qwen 3.6 comparison against llama.cpp server"],
-    },
-    {
       id: "qwen35-9b-q4k-m",
       label: "Qwen 3.5 9B Q4_K_M",
       family: "Qwen 3.5",
       quant: "Q4_K_M",
       model_path: path.join(modelRoot, "Qwen3.5-9B-Q4_K_M.gguf"),
-      prompt_mode: "raw",
+      prompt_mode: "chat",
       prompt: defaultPromptForModelId("qwen35-9b-q4k-m"),
       max_tokens: defaultMaxTokensForModelId("qwen35-9b-q4k-m"),
       notes: ["RDNA4 small Qwen comparison against llama.cpp server"],
@@ -2425,12 +2656,14 @@ export function defaultRdnaCases(modelRoot) {
 }
 
 export function defaultIntelCases(modelRoot) {
-  return defaultMetalCases(modelRoot).map((entry) => ({
-    ...entry,
-    model_path: modelPath(modelRoot, entry.id),
-    context_tokens: defaultIntelContextTokensForModel(entry.id),
-    notes: ["Intel Arc Vulkan comparison against llama.cpp on the same host"],
-  }));
+  return defaultMetalCases(modelRoot)
+    .filter((entry) => entry.id !== "qwen38-27b-q4k-m")
+    .map((entry) => ({
+      ...entry,
+      model_path: modelPath(modelRoot, entry.id),
+      context_tokens: defaultIntelContextTokensForModel(entry.id),
+      notes: ["Intel Arc Vulkan comparison against llama.cpp on the same host"],
+    }));
 }
 
 function defaultIntelContextTokensForModel(_id) {
@@ -2838,12 +3071,17 @@ async function runMetalTarget(args) {
     methodology: {
       runner: "ZINC CLI vs llama.cpp on the same Apple Silicon machine",
       benchmark_style: "Four-scenario matrix with same-file baselines",
+      zinc_backend: "Metal",
+      zinc_build: "zig build -Doptimize=ReleaseFast",
+      llama_backend: "Metal",
+      llama_device: "-ngl 999",
       notes: [
         "Hardware: the local Apple Silicon target shown above. ZINC and llama.cpp run on the same machine and use the same GGUF file for each model.",
         "ZINC path: build the current workspace with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
+        "Baseline backend: llama.cpp Metal (-ngl 999) on the same Apple Silicon machine — the same backend as ZINC.",
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
         "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
-        "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
+        benchmarkStatisticsNote(args.runs, args.warmupRuns),
         "Model resolution: managed catalog models are loaded from the ZINC model cache when available; explicit GGUF paths are preserved when provided.",
         "Run hygiene: published local runs assume no competing workload is saturating CPU, memory bandwidth, or GPU.",
       ],
@@ -2908,7 +3146,7 @@ function resolveSshPasswordAuth(dotEnv, directKeys, envVarKeys, fileKeys) {
   return {};
 }
 
-async function buildRdnaCreds(args) {
+export async function buildRdnaCreds(args) {
   const dotEnv = await readDotEnv(path.join(ROOT, ".env"));
   const host = rdnaEnvValue(dotEnv, args, "HOST", "ZINC_RDNA_HOST", "ZINC_HOST");
   const user = rdnaEnvValue(dotEnv, args, "USER", "ZINC_RDNA_USER", "ZINC_USER");
@@ -2917,13 +3155,16 @@ async function buildRdnaCreds(args) {
   if (!host || !user) {
     throw new Error("RDNA benchmarking needs node-specific ZINC_<NODE>_HOST/ZINC_<NODE>_USER, ZINC_RDNA_HOST/ZINC_RDNA_USER, or ZINC_HOST/ZINC_USER in the environment or .env");
   }
+  const tuningEnv = collectRemoteZincTuningEnv(dotEnv);
   return {
     host,
     user,
     port,
     sshKey,
     workdir: args.rdnaWorkdir,
-    env: { RADV_PERFTEST: "coop_matrix" },
+    env: args.rdnaBackend === "rocm"
+      ? { ...tuningEnv, ROCR_VISIBLE_DEVICES: String(args.rdnaVkDevice ?? 0) }
+      : { ...tuningEnv, RADV_PERFTEST: "coop_matrix" },
     vkDevice: args.rdnaVkDevice ?? 1,
     serverDeviceArgs: args.rdnaLlamaDevice != null ? llamaDeviceArgs(args.rdnaLlamaDevice) : undefined,
   };
@@ -3044,6 +3285,7 @@ async function verifyRemoteSshReachable(creds, options = {}) {
 }
 
 async function runRdnaTarget(args) {
+  const targetIdentity = rdnaTargetIdentity(args.rdnaBackend);
   const creds = await buildRdnaCreds(args);
   await prepareRdna(args, creds);
   await verifyRdnaZincBackend(args, creds);
@@ -3219,13 +3461,13 @@ async function runRdnaTarget(args) {
     ));
     const summary = primaryScenarioSummary(entry, scenarios);
     models.push(summary);
-    logModelSummary("rdna", summary);
-    await writePartialSnapshot(args, "rdna", "RDNA", models);
+    logModelSummary(targetIdentity.id, summary);
+    await writePartialSnapshot(args, targetIdentity.id, targetIdentity.label, models);
   }
 
   return {
-    id: "rdna",
-    label: "RDNA",
+    id: targetIdentity.id,
+    label: targetIdentity.label,
     description: "AMD RDNA benchmark node results collected over SSH and compared against llama.cpp on the same hardware.",
     generated_at: new Date().toISOString(),
     source: "tools/performance_suite.mjs",
@@ -3233,7 +3475,7 @@ async function runRdnaTarget(args) {
       label: "AMD RDNA bench node",
       machine_model: "Remote Linux host",
       chip: "AMD Radeon AI PRO R9700",
-      memory: "32 GB VRAM · 576 GB/s",
+      memory: "32 GB VRAM · 640 GB/s",
       gpu: "Radeon AI PRO R9700",
       os: "Ubuntu Linux",
     },
@@ -3244,14 +3486,20 @@ async function runRdnaTarget(args) {
     methodology: {
       runner: "ZINC server vs llama.cpp server on the same RDNA node",
       benchmark_style: "Four-scenario matrix with same-file baselines",
+      zinc_backend: args.rdnaBackend === "vulkan" ? "Vulkan (RADV, coop_matrix)" : args.rdnaBackend.toUpperCase(),
+      zinc_build: `zig build -Doptimize=ReleaseFast${args.rdnaBackend === "auto" ? "" : ` -Dbackend=${args.rdnaBackend}`}`,
+      llama_backend: /rocm/i.test(args.rdnaLlamaDevice ?? "") ? "ROCm" : "Vulkan",
+      llama_device: args.rdnaLlamaDevice ?? "--device Vulkan1",
       notes: [
-        "Hardware: one AMD Radeon AI PRO R9700 benchmark node with 32 GB VRAM and 576 GB/s memory bandwidth. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
-        "ZINC path: sync the current source tree to the RDNA node, build with zig build -Doptimize=ReleaseFast, then measure generation through one reusable ZINC server per model with RADV cooperative matrix support enabled.",
-        `ZINC RDNA backend: ${args.rdnaBackend}. Published RDNA runs default to Vulkan; zinc_rt is opt-in because it is a separate bring-up runtime.`,
-        "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
+        "Hardware: one AMD Radeon AI PRO R9700 benchmark node with 32 GB VRAM and 640 GB/s memory bandwidth. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
+        `ZINC path: sync the current source tree to the RDNA node, build ReleaseFast with the selected ${args.rdnaBackend} backend, then measure generation through one reusable single-slot ZINC server per model.`,
+        `ZINC RDNA backend: ${args.rdnaBackend}.`,
+        `Baseline backend: llama.cpp ${/rocm/i.test(args.rdnaLlamaDevice ?? "") ? "ROCm" : "Vulkan"} (${args.rdnaLlamaDevice ?? "--device Vulkan1"}) on the same node and the same model file.`,
+        "Baseline path: launch llama.cpp against the same model file, preferring one reusable single-slot llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
         "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
-        "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
+        benchmarkStatisticsNote(args.runs, args.warmupRuns),
         "Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.",
+        "Power policy: before either engine starts, the harness selects PCIe ASPM performance mode and locks the discrete AMD GPU's memory DPM policy high to prevent idle-clock drift between runs.",
         "Run hygiene: published RDNA runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.",
       ],
       runs: args.runs,
@@ -3321,10 +3569,12 @@ async function buildCudaCreds(args) {
 }
 
 export function defaultCudaCases(modelRoot) {
-  return defaultRdnaCases(modelRoot).map((entry) => ({
-    ...entry,
-    notes: ["RTX 5090 (CUDA) comparison against llama.cpp server on the same host"],
-  }));
+  return defaultRdnaCases(modelRoot)
+    .filter((entry) => entry.id !== "qwen38-27b-q4k-m")
+    .map((entry) => ({
+      ...entry,
+      notes: ["RTX 5090 (CUDA) comparison against llama.cpp server on the same host"],
+    }));
 }
 
 async function prepareCuda(args, creds) {
@@ -3561,13 +3811,18 @@ async function runCudaTarget(args) {
     methodology: {
       runner: "ZINC CLI vs llama.cpp on the same CUDA node",
       benchmark_style: "Four-scenario matrix with same-file baselines",
+      zinc_backend: "CUDA (-Dbackend=cuda, NVRTC)",
+      zinc_build: "zig build -Doptimize=ReleaseFast -Dbackend=cuda",
+      llama_backend: "CUDA",
+      llama_device: "CUDA_VISIBLE_DEVICES (UUID-pinned)",
       notes: [
         "Hardware: one NVIDIA GeForce RTX 5090 (32 GB VRAM, 1792 GB/s) benchmark node. ZINC and llama.cpp run on the same host and use the same GGUF file for each model.",
         "ZINC path: sync the current source tree to the CUDA node, build with zig build -Doptimize=ReleaseFast -Dbackend=cuda, then measure generation through the ZINC CLI. CUDA kernels are NVRTC-compiled at runtime for the visible GPU.",
         "GPU selection: the target GPU is pinned by UUID via CUDA_VISIBLE_DEVICES for both engines, because nvidia-smi indices are unreliable on the WSL2 passthrough.",
+        "Baseline backend: llama.cpp CUDA on the same host, the same UUID-pinned GPU as ZINC.",
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
         "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
-        "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
+        benchmarkStatisticsNote(args.runs, args.warmupRuns),
         "Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.",
         "Run hygiene: published CUDA runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.",
       ],
@@ -3760,12 +4015,17 @@ async function runIntelTarget(args) {
     methodology: {
       runner: "ZINC CLI vs llama.cpp on the same Intel Arc node",
       benchmark_style: "Four-scenario matrix with same-file baselines",
+      zinc_backend: "Vulkan",
+      zinc_build: "zig build -Doptimize=ReleaseFast",
+      llama_backend: "Vulkan",
+      llama_device: "--device Vulkan0",
       notes: [
         "Hardware: one Intel Arc Vulkan benchmark node. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
         "ZINC path: optionally sync the current source tree to the Intel node, build with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
+        "Baseline backend: llama.cpp Vulkan (--device Vulkan0) on the same node — the same backend as ZINC.",
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable or fails to start.",
         "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
-        "Statistics: one warmup pass is discarded, then three measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
+        benchmarkStatisticsNote(args.runs, args.warmupRuns),
         "Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.",
         "Run hygiene: published Intel runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.",
       ],
@@ -3856,7 +4116,10 @@ async function main() {
   if (args.writeSiteData) {
     const existing = await loadExistingArtifact(args.siteData);
     const merged = mergeArtifacts(existing, incoming, {
-      preserveMissingPhases: args.phase !== "all",
+      // A filtered run is a partial target snapshot even when it measures both
+      // engines. Keep models/scenarios outside the filter while replacing the
+      // selected rows with the new measurements.
+      preserveMissingPhases: args.phase !== "all" || args.models != null || args.scenarios != null,
     });
     // Guard: never publish host/network info into the public site data. Scan for
     // ACTUAL host indicators (hostnames, tailscale IPs, tailnet domains) — not a

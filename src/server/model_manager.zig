@@ -9,6 +9,7 @@ const catalog_mod = @import("../model/catalog.zig");
 const managed_mod = @import("../model/managed.zig");
 const forward_mod = @import("../compute/forward.zig");
 const memory_plan = @import("../gpu/memory_plan.zig");
+const kv_dtype = @import("../compute/kv_dtype.zig");
 const process_lock_mod = @import("../gpu/process_lock.zig");
 const gpu_detect = @import("../vulkan/gpu_detect.zig");
 const instance_mod = @import("../vulkan/instance.zig");
@@ -493,7 +494,7 @@ fn loadResourcesInto(
     // caller doesn't pin one. Matches the Metal path — see
     // `memory_plan.autoContextTokensForDeviceBudget` for the vLLM-inspired math.
     const effective_requested = spec.requested_context_length orelse memory_plan.autoContextTokensForDeviceBudget(
-        memory_plan.profile(resources.model.config),
+        memory_plan.profileWithKvBytes(resources.model.config, kv_dtype.elementBytes()),
         tensorBytes(&resources.model),
         instance.vramBytes(),
         resources.model.config.context_length,
@@ -517,7 +518,7 @@ fn loadResourcesInto(
     resources.display_name = try allocator.dupe(u8, modelDisplayName(&resources.model));
     errdefer allocator.free(resources.display_name);
     const weights_bytes = tensorBytes(&resources.model);
-    const profile = memory_plan.profile(resources.model.config);
+    const profile = memory_plan.profileWithKvBytes(resources.model.config, kv_dtype.elementBytes());
     const runtime_ctx = resources.engine.max_context_tokens;
     const kv_cache_bytes = profile.deviceLocalContextBytes(runtime_ctx);
     const runtime_device_local_bytes = profile.runtimeDeviceLocalBytes(runtime_ctx);
@@ -536,10 +537,12 @@ fn tensorBytes(model: *const loader_mod.Model) u64 {
     // Only count device-local tensors against the VRAM budget. MoE expert
     // tensors offloaded to host-visible memory live in system RAM and do
     // not consume VRAM. See loader.shouldOffloadToHost for the rule.
+    // Walks the loaded tensors, not the GGUF list: the loader skips the appended
+    // NextN block entirely when speculative decoding is off.
     var total: u64 = 0;
-    for (model.gguf_file.tensors.items) |tensor_info| {
-        if (loader_mod.shouldOffloadToHost(tensor_info.name)) continue;
-        total += tensor_info.sizeBytes();
+    for (model.tensors.items) |t| {
+        if (loader_mod.shouldOffloadToHost(t.info.name)) continue;
+        total += t.info.sizeBytes();
     }
     return total;
 }
@@ -554,6 +557,7 @@ fn fallbackModelName(model: *const loader_mod.Model) []const u8 {
         .jamba => "jamba",
         .gemma => "gemma",
         .gpt_oss => "gpt-oss-20b",
+        .muse_glimmer => "muse-glimmer",
         .unknown => "zinc-model",
     };
 }

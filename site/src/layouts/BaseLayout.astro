@@ -9,6 +9,8 @@ interface Props {
   title: string;
   description: string;
   keywords?: string;
+  canonicalUrl?: string;
+  robots?: string;
   ogType?: string;
   publishedDate?: string;
   tags?: string[];
@@ -62,6 +64,7 @@ const props = Astro.props;
   }
 
   .footer {
+    max-width: var(--max-width-wide);
     border-top: 1px solid var(--color-border);
     padding: var(--space-lg) var(--space-md);
     text-align: center;

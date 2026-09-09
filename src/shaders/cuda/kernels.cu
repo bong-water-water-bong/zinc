@@ -11,13 +11,41 @@
 // NVRTC resolves <mma.h> (and its cuda_fp16.h) from the -I/usr/local/cuda/include
 // path passed in cuda_shim.c. Pulls in `half` / `__float2half`. Only used by the
 // gemm_*_tc kernels below; the rest of the library is unaffected.
+#ifdef ZINC_ROCM
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <rocwmma/rocwmma.hpp>
+namespace wmma = rocwmma;
+
+// RDNA4 executes HIP kernels as wave32, matching the CUDA kernels' warp-level
+// algorithms. HIP's *_sync masks are 64-bit on AMD, so use the maskless wave32
+// forms and retain the CUDA call sites unchanged.
+#define __shfl_down_sync(mask, value, offset) __shfl_down(value, offset)
+#define __shfl_sync(mask, value, lane) __shfl(value, lane)
+#define __shfl_xor_sync(mask, value, lane_mask) __shfl_xor(value, lane_mask)
+
+// HIP does not expose CUDA's __dp4a spelling. RDNA4 provides the equivalent
+// signed packed 4xint8 dot product through the sudot4 builtin.
+__device__ __forceinline__ int zinc_hip_dp4a(int a, int b, int c) {
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+}
+#define __dp4a(a, b, c) zinc_hip_dp4a((a), (b), (c))
+#else
 #include <mma.h>
 using namespace nvcuda;
+#endif
 
 // ---- shared device helpers --------------------------------------------------
 
 // IEEE half -> float, no <cuda_fp16.h> dependency (keeps NVRTC self-contained).
 __device__ __forceinline__ float zinc_half_to_float(unsigned short h) {
+#ifdef ZINC_ROCM
+    // HIP exposes a native bit-cast plus hardware half conversion. The portable
+    // fallback below expands to a sizeable integer normalization sequence, which
+    // is especially costly in the decode matvecs where every lane converts scale
+    // metadata for every superblock.
+    return __half2float(__ushort_as_half(h));
+#else
     unsigned sign = (unsigned)(h >> 15) & 1u;
     unsigned exp = (unsigned)(h >> 10) & 0x1Fu;
     unsigned mant = (unsigned)h & 0x3FFu;
@@ -38,10 +66,18 @@ __device__ __forceinline__ float zinc_half_to_float(unsigned short h) {
         f = (sign << 31) | ((exp - 15u + 127u) << 23) | (mant << 13);
     }
     return __int_as_float((int)f);
+#endif
+}
+
+__device__ __forceinline__ float zinc_float4_dot(float4 a, float4 b) {
+    return (a.x * b.x + a.y * b.y) + (a.z * b.z + a.w * b.w);
 }
 
 // Float -> IEEE half bit pattern (no cuda_fp16.h dependency).
 __device__ __forceinline__ unsigned short zinc_float_to_half(float x) {
+#ifdef ZINC_ROCM
+    return __half_as_ushort(__float2half_rn(x));
+#else
     unsigned ux = __float_as_int(x);
     unsigned sign = (ux >> 16) & 0x8000u;
     unsigned abs = ux & 0x7FFFFFFFu;
@@ -77,6 +113,7 @@ __device__ __forceinline__ unsigned short zinc_float_to_half(float x) {
         // Underflow → zero
         return (unsigned short)sign;
     }
+#endif
 }
 
 // GGML Q4_K 6-bit scale/min unpack (j in 0..7), canonical the reference implementation form.
@@ -115,6 +152,84 @@ __device__ __forceinline__ float zinc_block_reduce_sum(float v) {
     v = (threadIdx.x < nwarps) ? sh[lane] : 0.0f;
     if (wid == 0) v = zinc_warp_reduce_sum(v);
     return v;
+}
+
+// Reduce two independent values with one shared-memory rendezvous. Results are
+// valid in thread 0, matching zinc_block_reduce_sum's contract. The per-value
+// shuffle/add order is unchanged; only the redundant block barrier is removed.
+__device__ __forceinline__ void zinc_block_reduce_sum_pair(float& a, float& b) {
+    __shared__ float sha[32];
+    __shared__ float shb[32];
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    a = zinc_warp_reduce_sum(a);
+    b = zinc_warp_reduce_sum(b);
+    if (lane == 0) {
+        sha[wid] = a;
+        shb[wid] = b;
+    }
+    __syncthreads();
+    const int nwarps = (blockDim.x + 31) >> 5;
+    a = (threadIdx.x < nwarps) ? sha[lane] : 0.0f;
+    b = (threadIdx.x < nwarps) ? shb[lane] : 0.0f;
+    if (wid == 0) {
+        a = zinc_warp_reduce_sum(a);
+        b = zinc_warp_reduce_sum(b);
+    }
+}
+
+// Reduce all token accumulators with one block rendezvous. Every accumulator
+// keeps zinc_block_reduce_sum's warp/shuffle tree; only duplicate barriers are
+// removed. The pair form covers twin projections such as gate/up and alpha/beta.
+template <unsigned N>
+__device__ __forceinline__ void zinc_block_reduce_sum_many(float (&v)[N]) {
+    __shared__ float sh[N][32];
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    #pragma unroll
+    for (unsigned i = 0u; i < N; ++i) v[i] = zinc_warp_reduce_sum(v[i]);
+    if (lane == 0) {
+        #pragma unroll
+        for (unsigned i = 0u; i < N; ++i) sh[i][wid] = v[i];
+    }
+    __syncthreads();
+    const int nwarps = (blockDim.x + 31) >> 5;
+    #pragma unroll
+    for (unsigned i = 0u; i < N; ++i) {
+        v[i] = (threadIdx.x < nwarps) ? sh[i][lane] : 0.0f;
+        if (wid == 0) v[i] = zinc_warp_reduce_sum(v[i]);
+    }
+}
+
+template <unsigned N>
+__device__ __forceinline__ void zinc_block_reduce_sum_many_pair(float (&a)[N], float (&b)[N]) {
+    __shared__ float sha[N][32];
+    __shared__ float shb[N][32];
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    #pragma unroll
+    for (unsigned i = 0u; i < N; ++i) {
+        a[i] = zinc_warp_reduce_sum(a[i]);
+        b[i] = zinc_warp_reduce_sum(b[i]);
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (unsigned i = 0u; i < N; ++i) {
+            sha[i][wid] = a[i];
+            shb[i][wid] = b[i];
+        }
+    }
+    __syncthreads();
+    const int nwarps = (blockDim.x + 31) >> 5;
+    #pragma unroll
+    for (unsigned i = 0u; i < N; ++i) {
+        a[i] = (threadIdx.x < nwarps) ? sha[i][lane] : 0.0f;
+        b[i] = (threadIdx.x < nwarps) ? shb[i][lane] : 0.0f;
+        if (wid == 0) {
+            a[i] = zinc_warp_reduce_sum(a[i]);
+            b[i] = zinc_warp_reduce_sum(b[i]);
+        }
+    }
 }
 
 __device__ __forceinline__ float zinc_warp_reduce_max(float v) {
@@ -157,6 +272,7 @@ __device__ __forceinline__ float zinc_block_reduce_sum_all(float v) {
 // ---- rms_norm (port of rms_norm_mul.comp) -----------------------------------
 // y = weight * (x / sqrt(mean(x^2) + eps)). One block per token.
 struct RmsPush { unsigned N; float eps; };
+struct RmsQ8Push { unsigned N; float eps; unsigned T; };
 
 extern "C" __global__ void rms_norm(const float* x, const float* w, float* y, RmsPush pc) {
     unsigned token = blockIdx.x;
@@ -177,6 +293,81 @@ extern "C" __global__ void rms_norm(const float* x, const float* w, float* y, Rm
 
     for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
         yt[i] = w[i] * (xt[i] * rinv);
+    }
+}
+
+// RMS norm + Q8_1 activation packing. The hot ROCm dense path used
+// to write the normalized f32 row, then launch quantize_act_q8_0 to read it back
+// and pack it. A wider RMS reduction feeds the same equation while each packed
+// Q8 group keeps the quantizer's wave32 reduction order. Both views leave in
+// one launch.
+// Grid: one block per token (decode uses one; prefill launches all prompt rows).
+extern "C" __global__ void rms_norm_quant_q8_0(
+    const float* __restrict__ x, const float* __restrict__ w,
+    float* __restrict__ y, unsigned char* __restrict__ out, RmsQ8Push pc)
+{
+    const unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float* yt = y + (size_t)token * pc.N;
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        const float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0u) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
+    __syncthreads();
+    const float rinv = rms_inv_sh;
+
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned nwarps = blockDim.x >> 5;
+    const unsigned groups = (pc.N + 31u) >> 5;
+    for (unsigned c = warp; c < groups; c += nwarps) {
+        const unsigned idx = c * 32u + lane;
+        const float val = idx < pc.N ? w[idx] * (xt[idx] * rinv) : 0.0f;
+        if (idx < pc.N) yt[idx] = val;
+
+        float av = fabsf(val);
+        float sv = val;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            av = fmaxf(av, __shfl_xor_sync(0xffffffffu, av, o));
+            sv += __shfl_xor_sync(0xffffffffu, sv, o);
+        }
+        const float d = av / 127.0f;
+        const float scale = 127.0f / fmaxf(av, 1e-5f);
+        const int q = max(-127, min(127, __float2int_rn(val * scale)));
+
+#ifdef ZINC_ROCM
+        // MMQ layout for T=1: four Q8_1 groups share one 144-byte tile.
+        const unsigned h = c >> 2;
+        const unsigned g = c & 3u;
+        unsigned char* out_base = out + ((size_t)h * pc.T + token) * 144u;
+        if (lane == 0u && idx < pc.N) {
+            const unsigned short dh = zinc_float_to_half(d);
+            const unsigned short sh = zinc_float_to_half(sv);
+            out_base[g * 4u] = (unsigned char)(dh & 0xffu);
+            out_base[g * 4u + 1u] = (unsigned char)(dh >> 8);
+            out_base[g * 4u + 2u] = (unsigned char)(sh & 0xffu);
+            out_base[g * 4u + 3u] = (unsigned char)(sh >> 8);
+        }
+        out_base[16u + g * 32u + lane] = (unsigned char)q;
+#else
+        unsigned char* out_base = out + (size_t)token * groups * 36u + (size_t)c * 36u;
+        if (lane == 0u && idx < pc.N) {
+            const unsigned short dh = zinc_float_to_half(d);
+            const unsigned short sh = zinc_float_to_half(sv);
+            out_base[0] = (unsigned char)(dh & 0xffu);
+            out_base[1] = (unsigned char)(dh >> 8);
+            out_base[2] = (unsigned char)(sh & 0xffu);
+            out_base[3] = (unsigned char)(sh >> 8);
+        }
+        out_base[4u + lane] = (unsigned char)q;
+#endif
     }
 }
 
@@ -206,6 +397,90 @@ extern "C" __global__ void rms_norm_residual(const float* x, const float* w, flo
 
     for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
         ht[i] += w[i] * (xt[i] * rinv);
+    }
+}
+
+// Muse decode chains each post-norm residual directly into the following
+// pre-norm + Q8 pack. Both operations own the same one-token residual row, so a
+// block barrier is sufficient between them and removes a launch plus a complete
+// hidden-row reload at every attention/FFN boundary.
+struct RmsResidualQ8Push { unsigned N; float post_eps; float pre_eps; unsigned T; };
+extern "C" __global__ void rms_norm_residual_norm_quant_q8_0(
+    const float* __restrict__ x, const float* __restrict__ w_post,
+    float* __restrict__ hidden, const float* __restrict__ w_pre,
+    float* __restrict__ pre_out, unsigned char* __restrict__ out,
+    RmsResidualQ8Push pc)
+{
+    const unsigned token = blockIdx.x;
+    const float* xt = x + (size_t)token * pc.N;
+    float* ht = hidden + (size_t)token * pc.N;
+    float* pt = pre_out + (size_t)token * pc.N;
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        const float value = xt[i];
+        ss += value * value;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float post_inv, pre_inv;
+    if (threadIdx.x == 0u) post_inv = rsqrtf(ss / (float)pc.N + pc.post_eps);
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x)
+        ht[i] += w_post[i] * (xt[i] * post_inv);
+    __syncthreads();
+
+    float ss2 = 0.0f;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
+        const float value = ht[i];
+        ss2 += value * value;
+    }
+    ss2 = zinc_block_reduce_sum(ss2);
+    if (threadIdx.x == 0u) pre_inv = rsqrtf(ss2 / (float)pc.N + pc.pre_eps);
+    __syncthreads();
+
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned nwarps = blockDim.x >> 5;
+    const unsigned groups = (pc.N + 31u) >> 5;
+    for (unsigned c = warp; c < groups; c += nwarps) {
+        const unsigned idx = c * 32u + lane;
+        const float value = idx < pc.N ? w_pre[idx] * (ht[idx] * pre_inv) : 0.0f;
+        if (idx < pc.N) pt[idx] = value;
+        float av = fabsf(value);
+        float sv = value;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            av = fmaxf(av, __shfl_xor_sync(0xffffffffu, av, offset));
+            sv += __shfl_xor_sync(0xffffffffu, sv, offset);
+        }
+        const float d = av / 127.0f;
+        const float scale = 127.0f / fmaxf(av, 1e-5f);
+        const int q = max(-127, min(127, __float2int_rn(value * scale)));
+#ifdef ZINC_ROCM
+        const unsigned h = c >> 2;
+        const unsigned g = c & 3u;
+        unsigned char* out_base = out + ((size_t)h * pc.T + token) * 144u;
+        if (lane == 0u && idx < pc.N) {
+            const unsigned short dh = zinc_float_to_half(d);
+            const unsigned short sh = zinc_float_to_half(sv);
+            out_base[g * 4u] = (unsigned char)(dh & 0xffu);
+            out_base[g * 4u + 1u] = (unsigned char)(dh >> 8);
+            out_base[g * 4u + 2u] = (unsigned char)(sh & 0xffu);
+            out_base[g * 4u + 3u] = (unsigned char)(sh >> 8);
+        }
+        out_base[16u + g * 32u + lane] = (unsigned char)q;
+#else
+        unsigned char* out_base = out + (size_t)token * groups * 36u + (size_t)c * 36u;
+        if (lane == 0u && idx < pc.N) {
+            const unsigned short dh = zinc_float_to_half(d);
+            const unsigned short sh = zinc_float_to_half(sv);
+            out_base[0] = (unsigned char)(dh & 0xffu);
+            out_base[1] = (unsigned char)(dh >> 8);
+            out_base[2] = (unsigned char)(sh & 0xffu);
+            out_base[3] = (unsigned char)(sh >> 8);
+        }
+        out_base[4u + lane] = (unsigned char)q;
+#endif
     }
 }
 
@@ -549,14 +824,20 @@ extern "C" __global__ void moe_combine_tail(float* hidden, const float* shared,
 // forms t = shared + w_pn2*(moe*rinv1) and reduces ss2 (== moe_combine_tail's
 // reduction over the post_ffw_norm_2 output); phase 3 writes hidden += w_post*
 // (t*rinv2). BYTE-IDENTITY: the normed-moe value w_pn2[i]*(moe[i]*rinv1) is
-// recomputed (never written back) so it matches rms_norm's f32 output exactly, and
-// t / ss2 / rinv2 / the hidden update are byte-for-byte moe_combine_tail's. Removes
-// one launch + the moe_out_buf store/reload round-trip. One block (grid {1,1,1}),
+// materialized in f32 shared memory, preserving the standalone kernel's store/load
+// rounding boundary. The second norm and hidden update retain their original
+// operation order. Removes one launch + the global moe_out_buf round trip. One
+// block (grid {1,1,1}),
 // block-count PRESERVED (both originals were single-block). Intervening
 // __syncthreads make the zinc_block_reduce_sum scratch reuse race-free.
 extern "C" __global__ void moe_norm_combine_tail(float* hidden, const float* shared,
                                                  const float* moe, const float* w_pn2,
                                                  const float* w_post, RmsPush pc) {
+    // Materialize the first norm exactly once at f32 precision. The standalone
+    // path writes this value to moe_out_buf before the combine kernel reads it;
+    // shared memory preserves that rounding boundary without the global-memory
+    // round trip or a second launch.
+    extern __shared__ float normed_moe[];
     // phase 1: post_ffw_norm_2 over the raw weighted-acc moe (== rms_norm(moe,w_pn2))
     float ss = 0.0f;
     for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
@@ -568,11 +849,14 @@ extern "C" __global__ void moe_norm_combine_tail(float* hidden, const float* sha
     if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)pc.N + pc.eps);
     __syncthreads();
     float rinv1 = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x)
+        normed_moe[i] = w_pn2[i] * (moe[i] * rinv1);
+    __syncthreads();
 
     // phase 2: t = shared + post_ffw_norm_2(moe); reduce ss2 (== moe_combine_tail)
     float ss2 = 0.0f;
     for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
-        float t = shared[i] + w_pn2[i] * (moe[i] * rinv1);
+        float t = shared[i] + normed_moe[i];
         ss2 += t * t;
     }
     ss2 = zinc_block_reduce_sum(ss2);
@@ -583,7 +867,7 @@ extern "C" __global__ void moe_norm_combine_tail(float* hidden, const float* sha
 
     // phase 3: hidden += post_ffw_norm(t)
     for (unsigned i = threadIdx.x; i < pc.N; i += blockDim.x) {
-        float t = shared[i] + w_pn2[i] * (moe[i] * rinv1);
+        float t = shared[i] + normed_moe[i];
         hidden[i] += w_post[i] * (t * rinv2);
     }
 }
@@ -614,6 +898,84 @@ extern "C" __global__ void dmmv_f32(const float* w, const float* x, float* y, Dm
         unsigned yi = (pc.y_offset >> 2) + row;
         if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum;
     }
+}
+
+// SSM alpha and beta are two [dt_rank,K] f32 matrices over the same normalized
+// activation. Sharing the x load and launch is particularly valuable for their
+// tiny 48-row grids, which otherwise under-fill the device twice per SSM layer.
+extern "C" __global__ void dmmv_f32_dual(
+    const float* __restrict__ wa, const float* __restrict__ wb,
+    const float* __restrict__ x, float* __restrict__ ya,
+    float* __restrict__ yb, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const float* arow = wa + (size_t)row * pc.K;
+    const float* brow = wb + (size_t)row * pc.K;
+    float sa = 0.0f, sb = 0.0f;
+    for (unsigned k = threadIdx.x; k < pc.K; k += blockDim.x) {
+        const float xv = x[k];
+        sa += arow[k] * xv;
+        sb += brow[k] * xv;
+    }
+    sa = zinc_block_reduce_sum(sa);
+    __syncthreads();
+    sb = zinc_block_reduce_sum(sb);
+    if (threadIdx.x == 0u) {
+        ya[row] = sa;
+        yb[row] = sb;
+    }
+}
+
+// Multi-token SSM alpha/beta projection. The two small f32 matrices and every
+// token row share one launch; each weight value is loaded once and reused for
+// all verifier rows while each accumulator keeps the ordinary reduction order.
+template <unsigned B>
+__device__ __forceinline__ void zinc_dmmv_f32_dual_btok(
+    const float* __restrict__ wa, const float* __restrict__ wb,
+    const float* __restrict__ x, float* __restrict__ ya,
+    float* __restrict__ yb, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const float* arow = wa + (size_t)row * pc.K;
+    const float* brow = wb + (size_t)row * pc.K;
+    float sa[B] = {};
+    float sb[B] = {};
+    for (unsigned k = threadIdx.x; k < pc.K; k += blockDim.x) {
+        const float av = arow[k];
+        const float bv = brow[k];
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) {
+            const float xv = x[(size_t)tok * pc.K + k];
+            sa[tok] += av * xv;
+            sb[tok] += bv * xv;
+        }
+    }
+    zinc_block_reduce_sum_many_pair<B>(sa, sb);
+    if (threadIdx.x == 0u) {
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) {
+            ya[(size_t)tok * pc.M + row] = sa[tok];
+            yb[(size_t)tok * pc.M + row] = sb[tok];
+        }
+    }
+}
+
+extern "C" __global__ void dmmv_f32_dual_btok2(
+    const float* wa, const float* wb, const float* x,
+    float* ya, float* yb, DmmvPush pc) {
+    zinc_dmmv_f32_dual_btok<2u>(wa, wb, x, ya, yb, pc);
+}
+extern "C" __global__ void dmmv_f32_dual_btok3(
+    const float* wa, const float* wb, const float* x,
+    float* ya, float* yb, DmmvPush pc) {
+    zinc_dmmv_f32_dual_btok<3u>(wa, wb, x, ya, yb, pc);
+}
+extern "C" __global__ void dmmv_f32_dual_btok4(
+    const float* wa, const float* wb, const float* x,
+    float* ya, float* yb, DmmvPush pc) {
+    zinc_dmmv_f32_dual_btok<4u>(wa, wb, x, ya, yb, pc);
 }
 
 // ---- dmmv_q8_0 (port of dmmv_q8_0.comp) -------------------------------------
@@ -898,6 +1260,93 @@ extern "C" __global__ void argmax(const float* logits, unsigned* token_id, Argma
     }
 }
 
+struct ArgmaxV2Push { unsigned N, partials; };
+
+extern "C" __global__ void argmax_partials(
+    const float* __restrict__ logits, unsigned char* __restrict__ scratch,
+    ArgmaxV2Push pc)
+{
+    __shared__ float s_val[32];
+    __shared__ unsigned s_idx[32];
+    const unsigned tid = threadIdx.x;
+    const unsigned stride = pc.partials * blockDim.x;
+    float best = -3.4e38f;
+    unsigned bidx = 0u;
+    for (unsigned i = blockIdx.x * blockDim.x + tid; i < pc.N; i += stride) {
+        const float v = logits[i];
+        if (v > best || (v == best && i < bidx)) {
+            best = v;
+            bidx = i;
+        }
+    }
+    const unsigned lane = tid & 31u, wid = tid >> 5;
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, best, o);
+        const unsigned oi = __shfl_down_sync(0xffffffffu, bidx, o);
+        if (ov > best || (ov == best && oi < bidx)) {
+            best = ov;
+            bidx = oi;
+        }
+    }
+    if (lane == 0u) {
+        s_val[wid] = best;
+        s_idx[wid] = bidx;
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        float gb = s_val[0];
+        unsigned gi = s_idx[0];
+        for (unsigned w = 1u; w < 8u; w++) {
+            if (s_val[w] > gb || (s_val[w] == gb && s_idx[w] < gi)) {
+                gb = s_val[w];
+                gi = s_idx[w];
+            }
+        }
+        float* values = (float*)scratch;
+        unsigned* indices = (unsigned*)(values + pc.partials);
+        values[blockIdx.x] = gb;
+        indices[blockIdx.x] = gi;
+    }
+}
+
+extern "C" __global__ void argmax_finalize(
+    const unsigned char* __restrict__ scratch, unsigned* __restrict__ token_id,
+    ArgmaxV2Push pc)
+{
+    __shared__ float s_val[4];
+    __shared__ unsigned s_idx[4];
+    const float* values = (const float*)scratch;
+    const unsigned* indices = (const unsigned*)(values + pc.partials);
+    const unsigned tid = threadIdx.x;
+    float best = tid < pc.partials ? values[tid] : -3.4e38f;
+    unsigned bidx = tid < pc.partials ? indices[tid] : 0u;
+    const unsigned lane = tid & 31u, wid = tid >> 5;
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, best, o);
+        const unsigned oi = __shfl_down_sync(0xffffffffu, bidx, o);
+        if (ov > best || (ov == best && oi < bidx)) {
+            best = ov;
+            bidx = oi;
+        }
+    }
+    if (lane == 0u) {
+        s_val[wid] = best;
+        s_idx[wid] = bidx;
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        float gb = s_val[0];
+        unsigned gi = s_idx[0];
+        for (unsigned w = 1u; w < 4u; w++) {
+            if (s_val[w] > gb || (s_val[w] == gb && s_idx[w] < gi)) {
+                gb = s_val[w];
+                gi = s_idx[w];
+            }
+        }
+        *token_id = gi;
+    }
+}
+
 // ---- embed_lookup_q4k (Effort 25 cycle 5: GPU-side embedding dequant) -------
 // Dequantize one Q4_K row of token_embd.weight (the row for token `tok[0]`) into
 // out[0..K], replacing the per-token CPU dequant + full-row H2D with a GPU
@@ -1023,6 +1472,95 @@ extern "C" __global__ void ssm_conv1d(const float* current_input, const unsigned
     state[(size_t)pc.state_offset * pc.conv_channels + ch] = ci;
 }
 
+// Decode fusion for the Qwen gated-delta-net path. The scan preparation needs
+// every convolution result before it can normalize Q/K, but a single workgroup
+// can produce one complete Q/K group, perform the identical reductions, and
+// activate that group's alpha/beta scalars. The same grid also covers V. This
+// preserves the standalone math while removing one launch and a Q/K round trip
+// for every SSM layer.
+struct ConvPreparePush {
+    unsigned conv_channels, d_conv, kernel_is_f16, state_offset;
+    unsigned dt_rank, d_inner, d_state, n_group;
+    unsigned ssm_a_is_f16, dt_bias_is_f16;
+};
+
+__device__ __forceinline__ float zinc_ssm_conv_silu(
+    unsigned ch, const float* current_input, const unsigned char* conv_kernel,
+    float* state, ConvPreparePush pc)
+{
+    const unsigned d_conv_1 = pc.d_conv - 1u;
+    const float ci = current_input[ch];
+    float sum = 0.0f;
+    #pragma unroll
+    for (unsigned ki = 0u; ki < pc.d_conv; ++ki) {
+        const unsigned k_idx = ch * pc.d_conv + ki;
+        const float kw = pc.kernel_is_f16 != 0u
+            ? zinc_half_to_float(((const unsigned short*)conv_kernel)[k_idx])
+            : ((const float*)conv_kernel)[k_idx];
+        float sv = ci;
+        if (ki < d_conv_1) {
+            unsigned slot = pc.state_offset + ki;
+            if (slot >= d_conv_1) slot -= d_conv_1;
+            sv = state[(size_t)slot * pc.conv_channels + ch];
+        }
+        sum += kw * sv;
+    }
+    state[(size_t)pc.state_offset * pc.conv_channels + ch] = ci;
+    return sum / (1.0f + expf(-sum));
+}
+
+extern "C" __global__ void ssm_conv1d_prepare(
+    const float* __restrict__ current_input,
+    const unsigned char* __restrict__ conv_kernel,
+    float* __restrict__ state, float* __restrict__ out_data,
+    const unsigned char* __restrict__ dt_bias,
+    float* __restrict__ alpha, float* __restrict__ beta,
+    const unsigned char* __restrict__ ssm_a, ConvPreparePush pc)
+{
+    const unsigned group = blockIdx.x;
+    const unsigned lane = threadIdx.x;
+    const unsigned qk_dim = pc.d_state * pc.n_group;
+
+    if (group < pc.n_group) {
+        const unsigned q_ch = group * pc.d_state + lane;
+        const unsigned k_ch = qk_dim + group * pc.d_state + lane;
+        const float q_val = lane < pc.d_state
+            ? zinc_ssm_conv_silu(q_ch, current_input, conv_kernel, state, pc)
+            : 0.0f;
+        const float k_val = lane < pc.d_state
+            ? zinc_ssm_conv_silu(k_ch, current_input, conv_kernel, state, pc)
+            : 0.0f;
+        const float sumq = zinc_block_reduce_sum_all(q_val * q_val);
+        const float sumk = zinc_block_reduce_sum_all(k_val * k_val);
+        const float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) / sqrtf((float)pc.d_state);
+        const float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
+        if (lane < pc.d_state) {
+            out_data[q_ch] = q_val * q_rinv;
+            out_data[k_ch] = k_val * k_rinv;
+        }
+
+        if (lane == 0u) {
+            for (unsigned h = group; h < pc.dt_rank; h += pc.n_group) {
+                const float dt_bias_val = pc.dt_bias_is_f16 != 0u
+                    ? zinc_half_to_float(((const unsigned short*)dt_bias)[h])
+                    : ((const float*)dt_bias)[h];
+                const float ssm_a_val = pc.ssm_a_is_f16 != 0u
+                    ? zinc_half_to_float(((const unsigned short*)ssm_a)[h])
+                    : ((const float*)ssm_a)[h];
+                const float sp = logf(1.0f + expf(alpha[h] + dt_bias_val));
+                alpha[h] = expf(sp * ssm_a_val);
+                beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+            }
+        }
+    }
+
+    const unsigned v = group * blockDim.x + lane;
+    if (v < pc.d_inner) {
+        const unsigned v_ch = 2u * qk_dim + v;
+        out_data[v_ch] = zinc_ssm_conv_silu(v_ch, current_input, conv_kernel, state, pc);
+    }
+}
+
 // ---- ssm_gated_norm (port of ssm_gated_norm.comp) ---------------------------
 // Per head: out = (o / rms(o)) * norm_weight * silu(z). One block per head.
 struct GatedNormPush { unsigned d_inner, dt_rank, head_v_dim, d_state, norm_per_head; };
@@ -1047,6 +1585,75 @@ extern "C" __global__ void ssm_gated_norm(const float* o, const float* z, const 
     }
 }
 
+// Decode-only fused twin for a Q8-consuming SSM output projection. Qwen's
+// 128-value SSM heads map exactly to four Q8_1 groups, so the normalization and
+// gate result can be reduced and packed in the same block without a temporary
+// f32 write followed by a separate quantizer launch.
+extern "C" __global__ void ssm_gated_norm_quant_q8_0(
+    const float* __restrict__ o, const float* __restrict__ z,
+    const float* __restrict__ norm_weight, unsigned char* __restrict__ out,
+    GatedNormPush pc)
+{
+    const unsigned h = blockIdx.x;
+    const unsigned i = threadIdx.x;
+    const unsigned base = h * pc.head_v_dim;
+    float ss = 0.0f;
+    if (i < pc.head_v_dim) {
+        const float v = o[base + i];
+        ss = v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (i == 0u) rms_inv_sh = rsqrtf(ss / (float)pc.head_v_dim + 1e-6f);
+    __syncthreads();
+
+    float val = 0.0f;
+    if (i < pc.head_v_dim) {
+        const unsigned norm_idx = pc.norm_per_head != 0u ? base + i : i % pc.d_state;
+        float nv = o[base + i] * rms_inv_sh;
+        nv *= norm_weight[norm_idx];
+        const float zv = z[base + i];
+        val = nv * (zv / (1.0f + expf(-zv)));
+    }
+
+    float av = fabsf(val), sv = val;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        av = fmaxf(av, __shfl_xor_sync(0xffffffffu, av, off));
+        sv += __shfl_xor_sync(0xffffffffu, sv, off);
+    }
+    const float d = av / 127.0f;
+    const float scale = 127.0f / fmaxf(av, 1e-5f);
+    const int q = max(-127, min(127, __float2int_rn(val * scale)));
+    const unsigned lane = i & 31u;
+    const unsigned c = (base + i) >> 5;
+#ifdef ZINC_ROCM
+    const unsigned tile = c >> 2;
+    const unsigned group = c & 3u;
+    unsigned char* out_base = out + (size_t)tile * 144u;
+    if (lane == 0u) {
+        const unsigned short dh = zinc_float_to_half(d);
+        const unsigned short sh = zinc_float_to_half(sv);
+        out_base[group * 4u] = (unsigned char)(dh & 0xffu);
+        out_base[group * 4u + 1u] = (unsigned char)(dh >> 8);
+        out_base[group * 4u + 2u] = (unsigned char)(sh & 0xffu);
+        out_base[group * 4u + 3u] = (unsigned char)(sh >> 8);
+    }
+    out_base[16u + group * 32u + lane] = (unsigned char)q;
+#else
+    unsigned char* out_base = out + (size_t)c * 36u;
+    if (lane == 0u) {
+        const unsigned short dh = zinc_float_to_half(d);
+        const unsigned short sh = zinc_float_to_half(sv);
+        out_base[0] = (unsigned char)(dh & 0xffu);
+        out_base[1] = (unsigned char)(dh >> 8);
+        out_base[2] = (unsigned char)(sh & 0xffu);
+        out_base[3] = (unsigned char)(sh >> 8);
+    }
+    out_base[4u + lane] = (unsigned char)q;
+#endif
+}
+
 // ---- Effort 26 T0: BATCHED qwen prefill kernels ----------------------------
 // These collapse the per-token prefill launches into one launch over all T
 // tokens (token-major buffers). Each is a bit-identical twin of the single-token
@@ -1059,6 +1666,28 @@ struct AddPush { unsigned N; };
 extern "C" __global__ void add_inplace(float* y, const float* x, AddPush pc) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < pc.N) y[i] += x[i];
+}
+
+// Device-side copies keep speculative recurrent-state checkpoints on the GPU
+// instead of staging hundreds of MiB through host memory.
+struct CopyPush { unsigned N, src_offset, dst_offset; };
+extern "C" __global__ void copy_f32(const float* src, float* dst, CopyPush pc) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < pc.N) dst[(size_t)pc.dst_offset + i] = src[(size_t)pc.src_offset + i];
+}
+
+// Concatenate token-major [T,N] rows into compact [T,2N] rows. Qwen3.8's
+// NextN projection consumes [normalized token embedding | normalized trunk h].
+struct ConcatRowsPush { unsigned N, T; };
+extern "C" __global__ void concat_rows(const float* a, const float* b, float* out, ConcatRowsPush pc) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned total = pc.T * pc.N;
+    if (i >= total) return;
+    unsigned t = i / pc.N;
+    unsigned col = i - t * pc.N;
+    size_t dst = (size_t)t * (2u * pc.N) + col;
+    out[dst] = a[i];
+    out[dst + pc.N] = b[i];
 }
 
 // Batched ssm_conv1d: one block-row per channel, loop t = 0..n_tok internally
@@ -1092,6 +1721,46 @@ extern "C" __global__ void ssm_conv1d_batched(const float* input, const unsigned
         }
         out_data[(size_t)t * pc.conv_channels + ch] = sum / (1.0f + expf(-sum)); // SiLU
         state[(size_t)off * pc.conv_channels + ch] = ci;
+        off += 1u;
+        if (off >= d_conv_1) off -= d_conv_1;
+    }
+}
+
+// Verification twin: in addition to advancing the live ring, retain its exact
+// contents after each of the (at most four) candidate rows. This turns a draft
+// rejection into one selected device copy instead of a full target replay.
+extern "C" __global__ void ssm_conv1d_batched_history(
+    const float* input, const unsigned char* conv_kernel, float* state,
+    float* out_data, float* history, ConvBatchPush pc) {
+    unsigned ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= pc.conv_channels) return;
+    unsigned d_conv_1 = pc.d_conv - 1u;
+    unsigned off = pc.state_offset;
+    const size_t state_len = (size_t)d_conv_1 * pc.conv_channels;
+    for (unsigned t = 0; t < pc.n_tok; t++) {
+        float ci = input[(size_t)t * pc.conv_channels + ch];
+        float sum = 0.0f;
+        for (unsigned ki = 0; ki < pc.d_conv; ki++) {
+            unsigned k_idx = ch * pc.d_conv + ki;
+            float kw = (pc.kernel_is_f16 != 0u)
+                           ? zinc_half_to_float(((const unsigned short*)conv_kernel)[k_idx])
+                           : ((const float*)conv_kernel)[k_idx];
+            float sv;
+            if (ki < d_conv_1) {
+                unsigned slot = off + ki;
+                if (slot >= d_conv_1) slot -= d_conv_1;
+                sv = state[(size_t)slot * pc.conv_channels + ch];
+            } else {
+                sv = ci;
+            }
+            sum += kw * sv;
+        }
+        out_data[(size_t)t * pc.conv_channels + ch] = sum / (1.0f + expf(-sum));
+        state[(size_t)off * pc.conv_channels + ch] = ci;
+        for (unsigned slot = 0; slot < d_conv_1; ++slot) {
+            const size_t i = (size_t)slot * pc.conv_channels + ch;
+            history[(size_t)t * state_len + i] = state[i];
+        }
         off += 1u;
         if (off >= d_conv_1) off -= d_conv_1;
     }
@@ -1157,7 +1826,23 @@ extern "C" __global__ void naive_attention(const float* q, const float* k, const
     for (unsigned i = tid; i < pc.seq_len; i += blockDim.x) {
         const float* ki = k + ((size_t)i * pc.n_kv_heads + kv_head) * hd;
         float dot = 0.0f;
-        for (unsigned d = 0; d < hd; d++) dot += qh[d] * ki[d];
+        if ((hd & 3u) == 0u) {
+            const float4* q4 = (const float4*)qh;
+            const float4* k4 = (const float4*)ki;
+            const unsigned nd4 = hd >> 2;
+            float acc4[8] = {};
+            unsigned d4 = 0u;
+            for (; d4 + 8u <= nd4; d4 += 8u) {
+                #pragma unroll
+                for (unsigned j = 0u; j < 8u; ++j)
+                    acc4[j] += zinc_float4_dot(q4[d4 + j], k4[d4 + j]);
+            }
+            dot = ((acc4[0] + acc4[4]) + (acc4[2] + acc4[6]))
+                + ((acc4[1] + acc4[5]) + (acc4[3] + acc4[7]));
+            for (; d4 < nd4; ++d4) dot += zinc_float4_dot(q4[d4], k4[d4]);
+        } else {
+            for (unsigned d = 0; d < hd; ++d) dot += qh[d] * ki[d];
+        }
         float score = dot * scale;
         s_scores[i] = score;
         lmax = fmaxf(lmax, score);
@@ -1191,9 +1876,25 @@ extern "C" __global__ void naive_attention(const float* q, const float* k, const
 
     // Pass 3: out[d] = (sum_i e_i * V[i,d]) * rescale * inv.
     for (unsigned d = tid; d < hd; d += blockDim.x) {
-        float acc = 0.0f;
-        for (unsigned i = 0; i < pc.seq_len; i++)
-            acc += s_scores[i] * v[((size_t)i * pc.n_kv_heads + kv_head) * hd + d];
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+        float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+        const float* vh = v + (size_t)kv_head * hd + d;
+        const size_t kv_stride = (size_t)pc.n_kv_heads * hd;
+        unsigned i = 0u;
+        for (; i + 8u <= pc.seq_len; i += 8u) {
+            acc0 += s_scores[i] * vh[(size_t)i * kv_stride];
+            acc1 += s_scores[i + 1u] * vh[(size_t)(i + 1u) * kv_stride];
+            acc2 += s_scores[i + 2u] * vh[(size_t)(i + 2u) * kv_stride];
+            acc3 += s_scores[i + 3u] * vh[(size_t)(i + 3u) * kv_stride];
+            acc4 += s_scores[i + 4u] * vh[(size_t)(i + 4u) * kv_stride];
+            acc5 += s_scores[i + 5u] * vh[(size_t)(i + 5u) * kv_stride];
+            acc6 += s_scores[i + 6u] * vh[(size_t)(i + 6u) * kv_stride];
+            acc7 += s_scores[i + 7u] * vh[(size_t)(i + 7u) * kv_stride];
+        }
+        float acc = ((acc0 + acc4) + (acc2 + acc6))
+            + ((acc1 + acc5) + (acc3 + acc7));
+        for (; i < pc.seq_len; ++i)
+            acc += s_scores[i] * vh[(size_t)i * kv_stride];
         out[(size_t)head * hd + d] = acc * rescale * inv;
     }
 }
@@ -1209,6 +1910,7 @@ struct DeltaNetPush {
     unsigned d_inner, dt_rank, head_v_dim, d_state, n_group;
     unsigned ssm_a_is_f16, dt_bias_is_f16, has_dt_bias, has_ssm_a;
     unsigned n_tok, conv_stride_tok, ab_stride_tok, y_stride_tok;
+    unsigned preprocessed;
 };
 
 extern "C" __global__ void ssm_delta_net(
@@ -1246,22 +1948,32 @@ extern "C" __global__ void ssm_delta_net(
         unsigned k_off = conv_base + qk_dim + k_hi * pc.d_state;
         unsigned v_off = conv_base + 2u * qk_dim + h * hv;
 
-        float qi = (row < k_len) ? conv_out[q_off + row] : 0.0f;
-        float ki = (row < k_len) ? conv_out[k_off + row] : 0.0f;
-        float sumq = zinc_block_reduce_sum_all(qi * qi);
-        float sumk = zinc_block_reduce_sum_all(ki * ki);
-        float sq = qi * (rsqrtf(fmaxf(sumq, 1e-12f)) / sqrtf((float)pc.d_state));
-        float skv = ki * rsqrtf(fmaxf(sumk, 1e-12f));
-
-        if (row == 0) {
-            float a = alpha[t * pc.ab_stride_tok + h] + dt_bias_val;
-            float sp = logf(1.0f + expf(a));               // softplus
-            float gate_val = (pc.has_ssm_a != 0u) ? (sp * ssm_a_val) : (-sp);
-            s_g = expf(gate_val);
-            s_b = 1.0f / (1.0f + expf(-beta[t * pc.ab_stride_tok + h]));
+        float sq = (row < k_len) ? conv_out[q_off + row] : 0.0f;
+        float skv = (row < k_len) ? conv_out[k_off + row] : 0.0f;
+        if (pc.preprocessed == 0u) {
+            float sumq = zinc_block_reduce_sum_all(sq * sq);
+            float sumk = zinc_block_reduce_sum_all(skv * skv);
+            sq *= rsqrtf(fmaxf(sumq, 1e-12f)) / sqrtf((float)pc.d_state);
+            skv *= rsqrtf(fmaxf(sumk, 1e-12f));
         }
-        __syncthreads();
-        float g = s_g, b = s_b;
+
+        float g, b;
+        if (pc.preprocessed != 0u) {
+            const size_t ab = (size_t)t * pc.ab_stride_tok + h;
+            g = alpha[ab];
+            b = beta[ab];
+        } else {
+            if (row == 0) {
+                float a = alpha[t * pc.ab_stride_tok + h] + dt_bias_val;
+                float sp = logf(1.0f + expf(a));               // softplus
+                float gate_val = (pc.has_ssm_a != 0u) ? (sp * ssm_a_val) : (-sp);
+                s_g = expf(gate_val);
+                s_b = 1.0f / (1.0f + expf(-beta[t * pc.ab_stride_tok + h]));
+            }
+            __syncthreads();
+            g = s_g;
+            b = s_b;
+        }
 
         float v_val = conv_out[v_off + col];
         rs *= g;                                            // decay
@@ -1309,10 +2021,165 @@ struct DeltaNetWarpPush {
 #define DN_N_WARPS 4
 #define DN_MAX_ROWS_PER_LANE 4  // head_v_dim(128) / warp_size(32) = 4
 
-extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
+// Normalize each Q/K group and activate each head's gate/beta exactly once per
+// token. The recurrent scan previously repeated this invariant work for every
+// state row (128 times per head on Qwen 3.8 27B). Q/K are rewritten in place;
+// alpha and beta become the activated scalar values consumed by the scan.
+struct DeltaNetPreparePush {
+    unsigned dt_rank, d_state, n_group;
+    unsigned ssm_a_is_f16, dt_bias_is_f16, has_dt_bias, has_ssm_a;
+    unsigned n_tok, conv_stride_tok, ab_stride_tok;
+};
+
+extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_prepare(
+    float* conv_out, const unsigned char* dt_bias, float* alpha, float* beta,
+    const unsigned char* ssm_a, DeltaNetPreparePush pc)
+{
+    const unsigned group = blockIdx.x;
+    const unsigned t = blockIdx.y;
+    const unsigned lane = threadIdx.x;
+    if (t >= pc.n_tok) return;
+
+    if (group < pc.n_group) {
+        const unsigned qk_dim = pc.d_state * pc.n_group;
+        const unsigned conv_base = t * pc.conv_stride_tok;
+        const unsigned q_off = conv_base + group * pc.d_state;
+        const unsigned k_off = conv_base + qk_dim + group * pc.d_state;
+        const float q_val = (lane < pc.d_state) ? conv_out[q_off + lane] : 0.0f;
+        const float k_val = (lane < pc.d_state) ? conv_out[k_off + lane] : 0.0f;
+        const float sumq = zinc_block_reduce_sum_all(q_val * q_val);
+        const float sumk = zinc_block_reduce_sum_all(k_val * k_val);
+        const float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) / sqrtf((float)pc.d_state);
+        const float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
+        if (lane < pc.d_state) {
+            conv_out[q_off + lane] = q_val * q_rinv;
+            conv_out[k_off + lane] = k_val * k_rinv;
+        }
+    }
+
+    if (lane == 0) {
+        for (unsigned h = group; h < pc.dt_rank; h += pc.n_group) {
+            float dt_bias_val = 0.0f;
+            if (pc.has_dt_bias != 0u)
+                dt_bias_val = pc.dt_bias_is_f16 ? zinc_half_to_float(((const unsigned short*)dt_bias)[h])
+                                                : ((const float*)dt_bias)[h];
+            float ssm_a_val = 0.0f;
+            if (pc.has_ssm_a != 0u)
+                ssm_a_val = pc.ssm_a_is_f16 ? zinc_half_to_float(((const unsigned short*)ssm_a)[h])
+                                            : ((const float*)ssm_a)[h];
+            const size_t ab = (size_t)t * pc.ab_stride_tok + h;
+            const float sp = logf(1.0f + expf(alpha[ab] + dt_bias_val));
+            alpha[ab] = (pc.has_ssm_a != 0u) ? expf(sp * ssm_a_val) : expf(-sp);
+            beta[ab] = 1.0f / (1.0f + expf(-beta[ab]));
+        }
+    }
+}
+
+// State-compatible wave32 scan. Each warp owns one state column, as in the
+// block kernel, but each lane carries rows lane+{0,32,64,96}. Four independent
+// wave reductions reproduce the block kernel's four first-stage partials; the
+// lane-0 combine uses the same (r0+r2)+(r1+r3) order as its second stage.
+struct DeltaNetColWarpPush {
+    unsigned dt_rank, head_v_dim, d_state, n_group;
+    unsigned n_tok, conv_stride_tok, ab_stride_tok, y_stride_tok, fast_reduce;
+};
+
+__device__ __forceinline__ float zinc_warp_reduce_128_exact(float v0, float v1, float v2, float v3) {
+    const float r0 = zinc_warp_reduce_sum(v0);
+    const float r1 = zinc_warp_reduce_sum(v1);
+    const float r2 = zinc_warp_reduce_sum(v2);
+    const float r3 = zinc_warp_reduce_sum(v3);
+    float total = 0.0f;
+    if (threadIdx.x == 0) total = (r0 + r2) + (r1 + r3);
+    return __shfl_sync(0xffffffffu, total, 0);
+}
+
+template <bool SAVE_HISTORY>
+__device__ __forceinline__ void ssm_delta_net_col_warp_impl(
+    const float* conv_out, const float* gate, const float* beta,
+    float* state, float* out_data, float* history, DeltaNetColWarpPush pc)
+{
+    const unsigned h = blockIdx.x;
+    const unsigned col = blockIdx.y * 4u + threadIdx.y;
+    const unsigned lane = threadIdx.x;
+    if (h >= pc.dt_rank || col >= pc.head_v_dim) return;
+
+    const unsigned hv = pc.head_v_dim;
+    const unsigned qk_dim = pc.d_state * pc.n_group;
+    const unsigned group = (pc.n_group == pc.dt_rank) ? h : (h % pc.n_group);
+    float s0 = state[((size_t)h * hv + col) * hv + lane];
+    float s1 = (lane + 32u < hv) ? state[((size_t)h * hv + col) * hv + lane + 32u] : 0.0f;
+    float s2 = (lane + 64u < hv) ? state[((size_t)h * hv + col) * hv + lane + 64u] : 0.0f;
+    float s3 = (lane + 96u < hv) ? state[((size_t)h * hv + col) * hv + lane + 96u] : 0.0f;
+
+    for (unsigned t = 0; t < pc.n_tok; t++) {
+        const unsigned conv_base = t * pc.conv_stride_tok;
+        const unsigned q_off = conv_base + group * pc.d_state;
+        const unsigned k_off = conv_base + qk_dim + group * pc.d_state;
+        const unsigned v_off = conv_base + 2u * qk_dim + h * hv;
+        const float q0 = conv_out[q_off + lane];
+        const float k0 = conv_out[k_off + lane];
+        const float q1 = (lane + 32u < hv) ? conv_out[q_off + lane + 32u] : 0.0f;
+        const float k1 = (lane + 32u < hv) ? conv_out[k_off + lane + 32u] : 0.0f;
+        const float q2 = (lane + 64u < hv) ? conv_out[q_off + lane + 64u] : 0.0f;
+        const float k2 = (lane + 64u < hv) ? conv_out[k_off + lane + 64u] : 0.0f;
+        const float q3 = (lane + 96u < hv) ? conv_out[q_off + lane + 96u] : 0.0f;
+        const float k3 = (lane + 96u < hv) ? conv_out[k_off + lane + 96u] : 0.0f;
+        const size_t ab = (size_t)t * pc.ab_stride_tok + h;
+        const float g = gate[ab];
+        const float b = beta[ab];
+
+        s0 *= g;
+        s1 *= g;
+        s2 *= g;
+        s3 *= g;
+        const float sk = pc.fast_reduce
+            ? zinc_warp_reduce_sum_all(((s0 * k0 + s1 * k1) + s2 * k2) + s3 * k3)
+            : zinc_warp_reduce_128_exact(s0 * k0, s1 * k1, s2 * k2, s3 * k3);
+        const float d = b * (conv_out[v_off + col] - sk);
+        s0 += k0 * d;
+        s1 += k1 * d;
+        s2 += k2 * d;
+        s3 += k3 * d;
+        const float o = pc.fast_reduce
+            ? zinc_warp_reduce_sum_all(((s0 * q0 + s1 * q1) + s2 * q2) + s3 * q3)
+            : zinc_warp_reduce_128_exact(s0 * q0, s1 * q1, s2 * q2, s3 * q3);
+        if (lane == 0) out_data[t * pc.y_stride_tok + h * hv + col] = o;
+        if constexpr (SAVE_HISTORY) {
+            const size_t hist_base = (size_t)t * pc.dt_rank * hv * hv;
+            const size_t state_base = hist_base + ((size_t)h * hv + col) * hv;
+            history[state_base + lane] = s0;
+            if (lane + 32u < hv) history[state_base + lane + 32u] = s1;
+            if (lane + 64u < hv) history[state_base + lane + 64u] = s2;
+            if (lane + 96u < hv) history[state_base + lane + 96u] = s3;
+        }
+    }
+
+    state[((size_t)h * hv + col) * hv + lane] = s0;
+    if (lane + 32u < hv) state[((size_t)h * hv + col) * hv + lane + 32u] = s1;
+    if (lane + 64u < hv) state[((size_t)h * hv + col) * hv + lane + 64u] = s2;
+    if (lane + 96u < hv) state[((size_t)h * hv + col) * hv + lane + 96u] = s3;
+}
+
+extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_col_warp(
+    const float* conv_out, const float* gate, const float* beta,
+    float* state, float* out_data, DeltaNetColWarpPush pc)
+{
+    ssm_delta_net_col_warp_impl<false>(conv_out, gate, beta, state, out_data, nullptr, pc);
+}
+
+extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_col_warp_history(
+    const float* conv_out, const float* gate, const float* beta,
+    float* state, float* out_data, float* history, DeltaNetColWarpPush pc)
+{
+    ssm_delta_net_col_warp_impl<true>(conv_out, gate, beta, state, out_data, history, pc);
+}
+
+template <bool SAVE_HISTORY>
+__device__ __forceinline__ void ssm_delta_net_warp_impl(
     const float* conv_out, const unsigned char* dt_bias, const float* alpha,
     const float* beta, const unsigned char* ssm_a, float* state, float* out_data,
-    DeltaNetWarpPush pc)
+    float* history, DeltaNetWarpPush pc)
 {
     const unsigned h = blockIdx.x;
     const unsigned row = blockIdx.y * DN_N_WARPS + threadIdx.y;
@@ -1427,6 +2294,14 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
         // Write output (one value per warp — lane 0 writes)
         if (lane == 0)
             out_data[t * pc.y_stride_tok + h * hv + row] = o;
+        if constexpr (SAVE_HISTORY) {
+            const size_t hist_base = (size_t)t * pc.dt_rank * hv * hv;
+            #pragma unroll
+            for (int r = 0; r < cols_per_lane; r++) {
+                const unsigned col_idx = r * DN_WARP_SIZE + lane;
+                history[hist_base + ((size_t)h * hv + row) * hv + col_idx] = s_shard[r];
+            }
+        }
     }
 
     // Write final state
@@ -1435,6 +2310,22 @@ extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
         unsigned col_idx = r * DN_WARP_SIZE + lane;
         state[((size_t)h * hv + row) * hv + col_idx] = s_shard[r];
     }
+}
+
+extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp(
+    const float* conv_out, const unsigned char* dt_bias, const float* alpha,
+    const float* beta, const unsigned char* ssm_a, float* state, float* out_data,
+    DeltaNetWarpPush pc)
+{
+    ssm_delta_net_warp_impl<false>(conv_out, dt_bias, alpha, beta, ssm_a, state, out_data, nullptr, pc);
+}
+
+extern "C" __global__ __launch_bounds__(128, 8) void ssm_delta_net_warp_history(
+    const float* conv_out, const unsigned char* dt_bias, const float* alpha,
+    const float* beta, const unsigned char* ssm_a, float* state, float* out_data,
+    float* history, DeltaNetWarpPush pc)
+{
+    ssm_delta_net_warp_impl<true>(conv_out, dt_bias, alpha, beta, ssm_a, state, out_data, history, pc);
 }
 
 // ---- ssm_conv1d_seq (Effort 28 4c-2b: batched DECODE per-seq conv1d) ---------
@@ -1827,13 +2718,849 @@ extern "C" __global__ void dmmv_q4k_fast(const unsigned* a_u32, const float* x, 
     if (threadIdx.x == 0) { unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
 }
 
+// ---- dmmv_q4k_gate_up_swiglu — fused dense-decode FFN input ---------------
+// Gate and up use the same normalized activation and have identical Q4_K
+// shapes. One block computes both rows, sharing the four activation vectors,
+// then applies SwiGLU in thread 0. This removes two dependent launches and the
+// gate/up intermediate writes without changing either matvec reduction order.
+__device__ __forceinline__ float zinc_q4k_fast_block_dot(
+    const unsigned* a, unsigned blk, unsigned q_off, unsigned shift,
+    float4 by0, float4 by1, float4 by2, float4 by3)
+{
+    const unsigned dd = a[blk];
+    const float d = zinc_half_to_float((unsigned short)(dd & 0xffffu));
+    const float dm = zinc_half_to_float((unsigned short)(dd >> 16));
+    const unsigned sc0 = a[blk + 1u], sc1 = a[blk + 2u], sc2 = a[blk + 3u];
+    const unsigned qs0 = a[blk + 4u + (q_off >> 2)];
+    const unsigned qs1 = a[blk + 4u + (q_off >> 2) + 16u];
+    const unsigned s0 = sc0 >> shift, s1 = sc1 >> shift, s2 = sc2 >> shift;
+    const float f0 = d * (float)(s0 & 0x3fu), b0 = dm * (float)(s1 & 0x3fu);
+    const float f1 = d * (float)((s0 >> 8) & 0x3fu), b1 = dm * (float)((s1 >> 8) & 0x3fu);
+    const float f2 = d * (float)((s2 & 0xfu) | ((s0 & 0xc0u) >> 2));
+    const float b2 = dm * (float)(((s2 & 0xf0u) >> 4) | ((s1 & 0xc0u) >> 2));
+    const float f3 = d * (float)(((s2 >> 8) & 0xfu) | (((s0 >> 8) & 0xc0u) >> 2));
+    const float b3 = dm * (float)((((s2 >> 8) & 0xf0u) >> 4) | (((s1 >> 8) & 0xc0u) >> 2));
+    float sum = 0.0f;
+    sum += (f0*(float)(qs0&0xfu)-b0)*by0.x + (f0*(float)((qs0>>8)&0xfu)-b0)*by0.y + (f0*(float)((qs0>>16)&0xfu)-b0)*by0.z + (f0*(float)((qs0>>24)&0xfu)-b0)*by0.w;
+    sum += (f1*(float)((qs0>>4)&0xfu)-b1)*by1.x + (f1*(float)((qs0>>12)&0xfu)-b1)*by1.y + (f1*(float)((qs0>>20)&0xfu)-b1)*by1.z + (f1*(float)((qs0>>28)&0xfu)-b1)*by1.w;
+    sum += (f2*(float)(qs1&0xfu)-b2)*by2.x + (f2*(float)((qs1>>8)&0xfu)-b2)*by2.y + (f2*(float)((qs1>>16)&0xfu)-b2)*by2.z + (f2*(float)((qs1>>24)&0xfu)-b2)*by2.w;
+    sum += (f3*(float)((qs1>>4)&0xfu)-b3)*by3.x + (f3*(float)((qs1>>12)&0xfu)-b3)*by3.y + (f3*(float)((qs1>>20)&0xfu)-b3)*by3.z + (f3*(float)((qs1>>28)&0xfu)-b3)*by3.w;
+    return sum;
+}
+
+extern "C" __global__ void dmmv_q4k_gate_up_swiglu(
+    const unsigned* __restrict__ gate,
+    const unsigned* __restrict__ up,
+    const float* __restrict__ x,
+    float* __restrict__ y, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned il = itid >> 2, ir = itid & 3u;
+    const unsigned v_im = il >> 1, v_in = il & 1u;
+    const unsigned l0 = 4u * (2u * ir + v_in);
+    const unsigned q_off = 32u * v_im + l0;
+    const unsigned y_loc = 64u * v_im + l0;
+    const unsigned shift = v_im * 16u;
+    const unsigned ngrp = blockDim.x >> 4;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned row_base = row * bpr * 36u;
+    const float4* xv = (const float4*)x;
+    float sum_gate = 0.0f, sum_up = 0.0f;
+
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned bidx = (sb * 256u + y_loc) >> 2;
+        const unsigned bidx2 = (sb * 256u + y_loc + 128u) >> 2;
+        const float4 by0 = xv[bidx], by1 = xv[bidx + 8u];
+        const float4 by2 = xv[bidx2], by3 = xv[bidx2 + 8u];
+        const unsigned blk = row_base + sb * 36u;
+        sum_gate += zinc_q4k_fast_block_dot(gate, blk, q_off, shift, by0, by1, by2, by3);
+        sum_up += zinc_q4k_fast_block_dot(up, blk, q_off, shift, by0, by1, by2, by3);
+    }
+
+    if (pc.acc_mode != 0u) {
+        zinc_block_reduce_sum_pair(sum_gate, sum_up);
+    } else {
+        sum_gate = zinc_block_reduce_sum(sum_gate);
+        __syncthreads();
+        sum_up = zinc_block_reduce_sum(sum_up);
+    }
+    if (tid == 0u) {
+        const float silu = sum_gate / (1.0f + expf(-sum_gate));
+        y[row] = silu * sum_up;
+    }
+}
+
+// Q8_1-activation twin of the fused dense FFN input. The 16-thread Q4_K
+// superblock mapping is identical to dmmv_q4k_gate_up_swiglu, but four packed
+// int8 dots replace each group of 16 float FMAs. The quantizer's exact f16 sum
+// supplies the asymmetric Q4_K minimum correction once per 32-value group.
+#ifdef ZINC_ROCM
+struct ExpertsQ8Push {
+    unsigned M, K, T, slice, up_base, n_used, routing_stride, dst_tok_stride, fuse_activation;
+};
+
+__device__ __forceinline__ float zinc_q4k_q8_block_dot_meta(
+    const unsigned* a, unsigned blk, unsigned q_off, unsigned shift,
+    unsigned dd, unsigned sc0, unsigned sc1, unsigned sc2,
+    int q0, int q1, int q2, int q3,
+    float2 ds0, float2 ds1, float2 ds2, float2 ds3, bool min_lane)
+{
+    const float d = zinc_half_to_float((unsigned short)(dd & 0xffffu));
+    const float dm = zinc_half_to_float((unsigned short)(dd >> 16));
+    const unsigned qs0 = a[blk + 4u + (q_off >> 2)];
+    const unsigned qs1 = a[blk + 4u + (q_off >> 2) + 16u];
+    const unsigned s0 = sc0 >> shift, s1 = sc1 >> shift, s2 = sc2 >> shift;
+    const float f0 = d * (float)(s0 & 0x3fu), b0 = dm * (float)(s1 & 0x3fu);
+    const float f1 = d * (float)((s0 >> 8) & 0x3fu), b1 = dm * (float)((s1 >> 8) & 0x3fu);
+    const float f2 = d * (float)((s2 & 0xfu) | ((s0 & 0xc0u) >> 2));
+    const float b2 = dm * (float)(((s2 & 0xf0u) >> 4) | ((s1 & 0xc0u) >> 2));
+    const float f3 = d * (float)(((s2 >> 8) & 0xfu) | (((s0 >> 8) & 0xc0u) >> 2));
+    const float b3 = dm * (float)((((s2 >> 8) & 0xf0u) >> 4) | (((s1 >> 8) & 0xc0u) >> 2));
+    float sum = f0 * ds0.x * (float)__dp4a((int)(qs0 & 0x0f0f0f0fu), q0, 0);
+    sum += f1 * ds1.x * (float)__dp4a((int)((qs0 >> 4) & 0x0f0f0f0fu), q1, 0);
+    sum += f2 * ds2.x * (float)__dp4a((int)(qs1 & 0x0f0f0f0fu), q2, 0);
+    sum += f3 * ds3.x * (float)__dp4a((int)((qs1 >> 4) & 0x0f0f0f0fu), q3, 0);
+    if (min_lane) sum -= b0 * ds0.y + b1 * ds1.y + b2 * ds2.y + b3 * ds3.y;
+    return sum;
+}
+
+__device__ __forceinline__ float zinc_q4k_q8_block_dot(
+    const unsigned* a, unsigned blk, unsigned q_off, unsigned shift,
+    int q0, int q1, int q2, int q3,
+    float2 ds0, float2 ds1, float2 ds2, float2 ds3, bool min_lane)
+{
+    return zinc_q4k_q8_block_dot_meta(a, blk, q_off, shift,
+        a[blk], a[blk + 1u], a[blk + 2u], a[blk + 3u],
+        q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane);
+}
+
+__device__ __forceinline__ void zinc_q4k_q8_scale_factors(
+    uint4 meta, unsigned shift,
+    float& f0, float& f1, float& f2, float& f3,
+    float& b0, float& b1, float& b2, float& b3)
+{
+    const float d = zinc_half_to_float((unsigned short)(meta.x & 0xffffu));
+    const float dm = zinc_half_to_float((unsigned short)(meta.x >> 16));
+    const unsigned s0 = meta.y >> shift;
+    const unsigned s1 = meta.z >> shift;
+    const unsigned s2 = meta.w >> shift;
+    f0 = d * (float)(s0 & 0x3fu);
+    b0 = dm * (float)(s1 & 0x3fu);
+    f1 = d * (float)((s0 >> 8) & 0x3fu);
+    b1 = dm * (float)((s1 >> 8) & 0x3fu);
+    f2 = d * (float)((s2 & 0xfu) | ((s0 & 0xc0u) >> 2));
+    b2 = dm * (float)(((s2 & 0xf0u) >> 4) | ((s1 & 0xc0u) >> 2));
+    f3 = d * (float)(((s2 >> 8) & 0xfu) | (((s0 >> 8) & 0xc0u) >> 2));
+    b3 = dm * (float)((((s2 >> 8) & 0xf0u) >> 4) | (((s1 >> 8) & 0xc0u) >> 2));
+}
+
+__device__ __forceinline__ float zinc_q4k_q8_block_dot_scaled(
+    unsigned qs0, unsigned qs1,
+    int q0, int q1, int q2, int q3,
+    float2 ds0, float2 ds1, float2 ds2, float2 ds3, bool min_lane,
+    float f0, float f1, float f2, float f3,
+    float b0, float b1, float b2, float b3)
+{
+    float sum = f0 * ds0.x * (float)__dp4a((int)(qs0 & 0x0f0f0f0fu), q0, 0);
+    sum += f1 * ds1.x * (float)__dp4a((int)((qs0 >> 4) & 0x0f0f0f0fu), q1, 0);
+    sum += f2 * ds2.x * (float)__dp4a((int)(qs1 & 0x0f0f0f0fu), q2, 0);
+    sum += f3 * ds3.x * (float)__dp4a((int)((qs1 >> 4) & 0x0f0f0f0fu), q3, 0);
+    if (min_lane) sum -= b0 * ds0.y + b1 * ds1.y + b2 * ds2.y + b3 * ds3.y;
+    return sum;
+}
+
+extern "C" __global__ void dmmv_q4k_q8_fast(
+    const unsigned* __restrict__ a,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ y, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned il = itid >> 2, ir = itid & 3u;
+    const unsigned v_im = il >> 1, v_in = il & 1u;
+    const unsigned l0 = 4u * (2u * ir + v_in);
+    const unsigned q_off = 32u * v_im + l0;
+    const unsigned shift = v_im * 16u;
+    const unsigned ngrp = blockDim.x >> 4;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned row_base = (pc.a_offset >> 2) + row * bpr * 36u;
+    float sum = 0.0f;
+
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned char* h0 = xq + (size_t)(2u * sb) * 144u;
+        const unsigned char* h1 = h0 + 144u;
+        const unsigned g = 2u * v_im;
+        const int q0 = *(const int*)(h0 + 16u + g * 32u + l0);
+        const int q1 = *(const int*)(h0 + 16u + (g + 1u) * 32u + l0);
+        const int q2 = *(const int*)(h1 + 16u + g * 32u + l0);
+        const int q3 = *(const int*)(h1 + 16u + (g + 1u) * 32u + l0);
+        const float2 ds0 = __half22float2(*(const half2*)(h0 + g * 4u));
+        const float2 ds1 = __half22float2(*(const half2*)(h0 + (g + 1u) * 4u));
+        const float2 ds2 = __half22float2(*(const half2*)(h1 + g * 4u));
+        const float2 ds3 = __half22float2(*(const half2*)(h1 + (g + 1u) * 4u));
+        const unsigned blk = row_base + sb * 36u;
+        sum += zinc_q4k_q8_block_dot(a, blk, q_off, shift, q0, q1, q2, q3, ds0, ds1, ds2, ds3, l0 == 0u);
+    }
+
+    sum = zinc_block_reduce_sum(sum);
+    if (tid == 0u) {
+        const unsigned yi = (pc.y_offset >> 2) + row;
+        if (pc.acc_mode != 0u) y[yi] += sum;
+        else y[yi] = sum;
+    }
+}
+
+// Two-token verification twin of the packed-Q8 decode matvec. The activation
+// buffer uses the ROCm MMQ layout [K/128][T][144], so both independently
+// quantized rows share each weight load while preserving the single-token
+// accumulation and reduction order.
+template <unsigned B>
+__device__ __forceinline__ void zinc_dmmv_q4k_q8_btok(
+    const unsigned* __restrict__ a,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ y, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned il = itid >> 2, ir = itid & 3u;
+    const unsigned v_im = il >> 1, v_in = il & 1u;
+    const unsigned l0 = 4u * (2u * ir + v_in);
+    const unsigned q_off = 32u * v_im + l0;
+    const unsigned shift = v_im * 16u;
+    const unsigned ngrp = blockDim.x >> 4;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned row_base = (pc.a_offset >> 2) + row * bpr * 36u;
+    float sum[B] = {};
+
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned blk = row_base + sb * 36u;
+        const unsigned g = 2u * v_im;
+        const unsigned q_word = 4u + (q_off >> 2);
+        const unsigned qs0 = a[blk + q_word];
+        const unsigned qs1 = a[blk + q_word + 16u];
+        float f0, f1, f2, f3, b0, b1, b2, b3;
+        zinc_q4k_q8_scale_factors(*(const uint4*)(a + blk), shift,
+            f0, f1, f2, f3, b0, b1, b2, b3);
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) {
+            const unsigned char* h0 = xq + ((size_t)(2u * sb) * B + tok) * 144u;
+            const unsigned char* h1 = xq + ((size_t)(2u * sb + 1u) * B + tok) * 144u;
+            const int q0 = *(const int*)(h0 + 16u + g * 32u + l0);
+            const int q1 = *(const int*)(h0 + 16u + (g + 1u) * 32u + l0);
+            const int q2 = *(const int*)(h1 + 16u + g * 32u + l0);
+            const int q3 = *(const int*)(h1 + 16u + (g + 1u) * 32u + l0);
+            const float2 ds0 = __half22float2(*(const half2*)(h0 + g * 4u));
+            const float2 ds1 = __half22float2(*(const half2*)(h0 + (g + 1u) * 4u));
+            const float2 ds2 = __half22float2(*(const half2*)(h1 + g * 4u));
+            const float2 ds3 = __half22float2(*(const half2*)(h1 + (g + 1u) * 4u));
+            sum[tok] += zinc_q4k_q8_block_dot_scaled(qs0, qs1,
+                q0, q1, q2, q3, ds0, ds1, ds2, ds3, l0 == 0u,
+                f0, f1, f2, f3, b0, b1, b2, b3);
+        }
+    }
+
+    zinc_block_reduce_sum_many<B>(sum);
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) {
+            const unsigned yi = (pc.y_offset >> 2) + tok * pc.M + row;
+            if (pc.acc_mode != 0u) y[yi] += sum[tok];
+            else y[yi] = sum[tok];
+        }
+    }
+}
+
+extern "C" __global__ void dmmv_q4k_q8_btok2(
+    const unsigned* a, const unsigned char* xq, float* y, DmmvPush pc) {
+    zinc_dmmv_q4k_q8_btok<2u>(a, xq, y, pc);
+}
+extern "C" __global__ void dmmv_q4k_q8_btok3(
+    const unsigned* a, const unsigned char* xq, float* y, DmmvPush pc) {
+    zinc_dmmv_q4k_q8_btok<3u>(a, xq, y, pc);
+}
+extern "C" __global__ void dmmv_q4k_q8_btok4(
+    const unsigned* a, const unsigned char* xq, float* y, DmmvPush pc) {
+    zinc_dmmv_q4k_q8_btok<4u>(a, xq, y, pc);
+}
+
+__device__ __forceinline__ float zinc_q5k_q8_block_dot(
+    const unsigned* a, unsigned blk, unsigned q_off, unsigned l0, unsigned shift,
+    int q0, int q1, int q2, int q3,
+    float2 ds0, float2 ds1, float2 ds2, float2 ds3, bool min_lane)
+{
+    const unsigned dd = a[blk];
+    const float d = zinc_half_to_float((unsigned short)(dd & 0xffffu));
+    const float dm = zinc_half_to_float((unsigned short)(dd >> 16));
+    const unsigned sc0 = a[blk + 1u], sc1 = a[blk + 2u], sc2 = a[blk + 3u];
+    const unsigned qh = a[blk + 4u + (l0 >> 2)];
+    const unsigned qs0 = a[blk + 12u + (q_off >> 2)];
+    const unsigned qs1 = a[blk + 12u + (q_off >> 2) + 16u];
+    const unsigned s0 = sc0 >> shift, s1 = sc1 >> shift, s2 = sc2 >> shift;
+    const float f0 = d * (float)(s0 & 0x3fu), b0 = dm * (float)(s1 & 0x3fu);
+    const float f1 = d * (float)((s0 >> 8) & 0x3fu), b1 = dm * (float)((s1 >> 8) & 0x3fu);
+    const float f2 = d * (float)((s2 & 0xfu) | ((s0 & 0xc0u) >> 2));
+    const float b2 = dm * (float)(((s2 & 0xf0u) >> 4) | ((s1 & 0xc0u) >> 2));
+    const float f3 = d * (float)(((s2 >> 8) & 0xfu) | (((s0 >> 8) & 0xc0u) >> 2));
+    const float b3 = dm * (float)((((s2 >> 8) & 0xf0u) >> 4) | (((s1 >> 8) & 0xc0u) >> 2));
+    const unsigned hb = 2u * (shift >> 4);
+    const int v0 = (int)((qs0 & 0x0f0f0f0fu) | (((qh >> hb) & 0x01010101u) << 4));
+    const int v1 = (int)(((qs0 >> 4) & 0x0f0f0f0fu) | (((qh >> (hb + 1u)) & 0x01010101u) << 4));
+    const int v2 = (int)((qs1 & 0x0f0f0f0fu) | (((qh >> (hb + 4u)) & 0x01010101u) << 4));
+    const int v3 = (int)(((qs1 >> 4) & 0x0f0f0f0fu) | (((qh >> (hb + 5u)) & 0x01010101u) << 4));
+    float sum = f0 * ds0.x * (float)__dp4a(v0, q0, 0);
+    sum += f1 * ds1.x * (float)__dp4a(v1, q1, 0);
+    sum += f2 * ds2.x * (float)__dp4a(v2, q2, 0);
+    sum += f3 * ds3.x * (float)__dp4a(v3, q3, 0);
+    if (min_lane) sum -= b0 * ds0.y + b1 * ds1.y + b2 * ds2.y + b3 * ds3.y;
+    return sum;
+}
+
+extern "C" __global__ void dmmv_q5k_q8_fast(
+    const unsigned* __restrict__ a,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ y, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned il = itid >> 2, ir = itid & 3u;
+    const unsigned v_im = il >> 1, v_in = il & 1u;
+    const unsigned l0 = 4u * (2u * ir + v_in);
+    const unsigned q_off = 32u * v_im + l0;
+    const unsigned shift = v_im * 16u;
+    const unsigned ngrp = blockDim.x >> 4;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned row_base = (pc.a_offset >> 2) + row * bpr * 44u;
+    float sum = 0.0f;
+
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned char* h0 = xq + (size_t)(2u * sb) * 144u;
+        const unsigned char* h1 = h0 + 144u;
+        const unsigned g = 2u * v_im;
+        const int q0 = *(const int*)(h0 + 16u + g * 32u + l0);
+        const int q1 = *(const int*)(h0 + 16u + (g + 1u) * 32u + l0);
+        const int q2 = *(const int*)(h1 + 16u + g * 32u + l0);
+        const int q3 = *(const int*)(h1 + 16u + (g + 1u) * 32u + l0);
+        const float2 ds0 = __half22float2(*(const half2*)(h0 + g * 4u));
+        const float2 ds1 = __half22float2(*(const half2*)(h0 + (g + 1u) * 4u));
+        const float2 ds2 = __half22float2(*(const half2*)(h1 + g * 4u));
+        const float2 ds3 = __half22float2(*(const half2*)(h1 + (g + 1u) * 4u));
+        const unsigned blk = row_base + sb * 44u;
+        sum += zinc_q5k_q8_block_dot(a, blk, q_off, l0, shift, q0, q1, q2, q3, ds0, ds1, ds2, ds3, l0 == 0u);
+    }
+
+    sum = zinc_block_reduce_sum(sum);
+    if (tid == 0u) {
+        const unsigned yi = (pc.y_offset >> 2) + row;
+        if (pc.acc_mode != 0u) y[yi] += sum;
+        else y[yi] = sum;
+    }
+}
+
+extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8(
+    const unsigned* __restrict__ gate,
+    const unsigned* __restrict__ up,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ y, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned il = itid >> 2, ir = itid & 3u;
+    const unsigned v_im = il >> 1, v_in = il & 1u;
+    const unsigned l0 = 4u * (2u * ir + v_in);
+    const unsigned q_off = 32u * v_im + l0;
+    const unsigned shift = v_im * 16u;
+    const unsigned ngrp = blockDim.x >> 4;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned row_base = row * bpr * 36u;
+    float sum_gate = 0.0f, sum_up = 0.0f;
+
+    #pragma unroll 5
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned char* h0 = xq + (size_t)(2u * sb) * 144u;
+        const unsigned char* h1 = h0 + 144u;
+        const unsigned g = 2u * v_im;
+        const int q0 = *(const int*)(h0 + 16u + g * 32u + l0);
+        const int q1 = *(const int*)(h0 + 16u + (g + 1u) * 32u + l0);
+        const int q2 = *(const int*)(h1 + 16u + g * 32u + l0);
+        const int q3 = *(const int*)(h1 + 16u + (g + 1u) * 32u + l0);
+        const float2 ds0 = __half22float2(*(const half2*)(h0 + g * 4u));
+        const float2 ds1 = __half22float2(*(const half2*)(h0 + (g + 1u) * 4u));
+        const float2 ds2 = __half22float2(*(const half2*)(h1 + g * 4u));
+        const float2 ds3 = __half22float2(*(const half2*)(h1 + (g + 1u) * 4u));
+        const bool min_lane = l0 == 0u;
+        const unsigned blk = row_base + sb * 36u;
+        const unsigned q_word = 4u + (q_off >> 2);
+        const unsigned gate_qs0 = gate[blk + q_word];
+        const unsigned gate_qs1 = gate[blk + q_word + 16u];
+        const unsigned up_qs0 = up[blk + q_word];
+        const unsigned up_qs1 = up[blk + q_word + 16u];
+        uint4 scale_meta = {};
+        const bool scale_lane = (itid & 3u) == 0u;
+        const unsigned* scale_matrix = (itid & 4u) != 0u ? up : gate;
+        if (scale_lane) scale_meta = *(const uint4*)(scale_matrix + blk);
+        float f0 = 0.0f, f1 = 0.0f, f2 = 0.0f, f3 = 0.0f;
+        float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+        if (scale_lane)
+            zinc_q4k_q8_scale_factors(scale_meta, shift, f0, f1, f2, f3, b0, b1, b2, b3);
+        const unsigned gate_scale_src = (grp & 1u) * 16u + v_im * 8u;
+        const float gf0 = __shfl_sync(0xffffffffu, f0, gate_scale_src);
+        const float gf1 = __shfl_sync(0xffffffffu, f1, gate_scale_src);
+        const float gf2 = __shfl_sync(0xffffffffu, f2, gate_scale_src);
+        const float gf3 = __shfl_sync(0xffffffffu, f3, gate_scale_src);
+        const float gb0 = __shfl_sync(0xffffffffu, b0, gate_scale_src);
+        const float gb1 = __shfl_sync(0xffffffffu, b1, gate_scale_src);
+        const float gb2 = __shfl_sync(0xffffffffu, b2, gate_scale_src);
+        const float gb3 = __shfl_sync(0xffffffffu, b3, gate_scale_src);
+        sum_gate += zinc_q4k_q8_block_dot_scaled(gate_qs0, gate_qs1,
+            q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane,
+            gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3);
+        const unsigned up_scale_src = gate_scale_src + 4u;
+        const float uf0 = __shfl_sync(0xffffffffu, f0, up_scale_src);
+        const float uf1 = __shfl_sync(0xffffffffu, f1, up_scale_src);
+        const float uf2 = __shfl_sync(0xffffffffu, f2, up_scale_src);
+        const float uf3 = __shfl_sync(0xffffffffu, f3, up_scale_src);
+        const float ub0 = __shfl_sync(0xffffffffu, b0, up_scale_src);
+        const float ub1 = __shfl_sync(0xffffffffu, b1, up_scale_src);
+        const float ub2 = __shfl_sync(0xffffffffu, b2, up_scale_src);
+        const float ub3 = __shfl_sync(0xffffffffu, b3, up_scale_src);
+        sum_up += zinc_q4k_q8_block_dot_scaled(up_qs0, up_qs1,
+            q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane,
+            uf0, uf1, uf2, uf3, ub0, ub1, ub2, ub3);
+    }
+
+    zinc_block_reduce_sum_pair(sum_gate, sum_up);
+    if (tid == 0u) {
+        if (pc.acc_mode != 0u) {
+            const float k = 0.7978845608028654f;
+            const float gelu = 0.5f * sum_gate *
+                (1.0f + tanhf(k * (sum_gate + 0.044715f * sum_gate * sum_gate * sum_gate)));
+            y[row] = gelu * sum_up;
+        } else {
+            const float silu = sum_gate / (1.0f + expf(-sum_gate));
+            y[row] = silu * sum_up;
+        }
+    }
+}
+
+// Two-token verifier variant of the fused dense FFN. Gate and up share each
+// packed activation load, their reductions share one rendezvous, and SwiGLU is
+// written directly so the verifier avoids two full intermediate tensors.
+template <unsigned B>
+__device__ __forceinline__ void zinc_dmmv_q4k_gate_up_swiglu_q8_btok(
+    const unsigned* __restrict__ gate,
+    const unsigned* __restrict__ up,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ y, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned il = itid >> 2, ir = itid & 3u;
+    const unsigned v_im = il >> 1, v_in = il & 1u;
+    const unsigned l0 = 4u * (2u * ir + v_in);
+    const unsigned q_off = 32u * v_im + l0;
+    const unsigned shift = v_im * 16u;
+    const unsigned ngrp = blockDim.x >> 4;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned row_base = row * bpr * 36u;
+    float sum_gate[B] = {};
+    float sum_up[B] = {};
+
+    #pragma unroll 5
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned blk = row_base + sb * 36u;
+        const unsigned q_word = 4u + (q_off >> 2);
+        const unsigned gate_qs0 = gate[blk + q_word];
+        const unsigned gate_qs1 = gate[blk + q_word + 16u];
+        const unsigned up_qs0 = up[blk + q_word];
+        const unsigned up_qs1 = up[blk + q_word + 16u];
+        uint4 scale_meta = {};
+        const bool scale_lane = (itid & 3u) == 0u;
+        const unsigned* scale_matrix = (itid & 4u) != 0u ? up : gate;
+        if (scale_lane) scale_meta = *(const uint4*)(scale_matrix + blk);
+        float f0 = 0.0f, f1 = 0.0f, f2 = 0.0f, f3 = 0.0f;
+        float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+        if (scale_lane)
+            zinc_q4k_q8_scale_factors(scale_meta, shift, f0, f1, f2, f3, b0, b1, b2, b3);
+        const unsigned gate_scale_src = (grp & 1u) * 16u + v_im * 8u;
+        const float gf0 = __shfl_sync(0xffffffffu, f0, gate_scale_src);
+        const float gf1 = __shfl_sync(0xffffffffu, f1, gate_scale_src);
+        const float gf2 = __shfl_sync(0xffffffffu, f2, gate_scale_src);
+        const float gf3 = __shfl_sync(0xffffffffu, f3, gate_scale_src);
+        const float gb0 = __shfl_sync(0xffffffffu, b0, gate_scale_src);
+        const float gb1 = __shfl_sync(0xffffffffu, b1, gate_scale_src);
+        const float gb2 = __shfl_sync(0xffffffffu, b2, gate_scale_src);
+        const float gb3 = __shfl_sync(0xffffffffu, b3, gate_scale_src);
+        const unsigned up_scale_src = gate_scale_src + 4u;
+        const float uf0 = __shfl_sync(0xffffffffu, f0, up_scale_src);
+        const float uf1 = __shfl_sync(0xffffffffu, f1, up_scale_src);
+        const float uf2 = __shfl_sync(0xffffffffu, f2, up_scale_src);
+        const float uf3 = __shfl_sync(0xffffffffu, f3, up_scale_src);
+        const float ub0 = __shfl_sync(0xffffffffu, b0, up_scale_src);
+        const float ub1 = __shfl_sync(0xffffffffu, b1, up_scale_src);
+        const float ub2 = __shfl_sync(0xffffffffu, b2, up_scale_src);
+        const float ub3 = __shfl_sync(0xffffffffu, b3, up_scale_src);
+        const unsigned g = 2u * v_im;
+        const bool min_lane = l0 == 0u;
+
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) {
+            const unsigned char* h0 = xq + ((size_t)(2u * sb) * B + tok) * 144u;
+            const unsigned char* h1 = xq + ((size_t)(2u * sb + 1u) * B + tok) * 144u;
+            const int q0 = *(const int*)(h0 + 16u + g * 32u + l0);
+            const int q1 = *(const int*)(h0 + 16u + (g + 1u) * 32u + l0);
+            const int q2 = *(const int*)(h1 + 16u + g * 32u + l0);
+            const int q3 = *(const int*)(h1 + 16u + (g + 1u) * 32u + l0);
+            const float2 ds0 = __half22float2(*(const half2*)(h0 + g * 4u));
+            const float2 ds1 = __half22float2(*(const half2*)(h0 + (g + 1u) * 4u));
+            const float2 ds2 = __half22float2(*(const half2*)(h1 + g * 4u));
+            const float2 ds3 = __half22float2(*(const half2*)(h1 + (g + 1u) * 4u));
+            sum_gate[tok] += zinc_q4k_q8_block_dot_scaled(gate_qs0, gate_qs1,
+                q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane,
+                gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3);
+            sum_up[tok] += zinc_q4k_q8_block_dot_scaled(up_qs0, up_qs1,
+                q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane,
+                uf0, uf1, uf2, uf3, ub0, ub1, ub2, ub3);
+        }
+    }
+
+    zinc_block_reduce_sum_many_pair<B>(sum_gate, sum_up);
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) {
+            const float silu = sum_gate[tok] / (1.0f + expf(-sum_gate[tok]));
+            y[(size_t)tok * pc.M + row] = silu * sum_up[tok];
+        }
+    }
+}
+
+extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8_btok2(
+    const unsigned* gate, const unsigned* up, const unsigned char* xq,
+    float* y, DmmvPush pc) {
+    zinc_dmmv_q4k_gate_up_swiglu_q8_btok<2u>(gate, up, xq, y, pc);
+}
+extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8_btok3(
+    const unsigned* gate, const unsigned* up, const unsigned char* xq,
+    float* y, DmmvPush pc) {
+    zinc_dmmv_q4k_gate_up_swiglu_q8_btok<3u>(gate, up, xq, y, pc);
+}
+extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8_btok4(
+    const unsigned* gate, const unsigned* up, const unsigned char* xq,
+    float* y, DmmvPush pc) {
+    zinc_dmmv_q4k_gate_up_swiglu_q8_btok<4u>(gate, up, xq, y, pc);
+}
+
+// Exact-route MoE twin of the Q8 gate/up matvec. Unlike padded grouped WMMA,
+// grid.y contains only real routed rows; gate and up share activation loads.
+extern "C" __global__ void dmmv_q4k_experts_grouped_q8_dual(
+    const unsigned* __restrict__ a,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ gate,
+    float* __restrict__ up,
+    const unsigned* __restrict__ expert_ids,
+    const unsigned* __restrict__ order,
+    ExpertsQ8Push pc)
+{
+    const unsigned packed = order[blockIdx.y];
+    const unsigned tok = packed >> 16;
+    const unsigned slot = packed & 0xffffu;
+    const unsigned expert = expert_ids[(size_t)tok * pc.routing_stride + slot];
+    const unsigned tid = threadIdx.x;
+    const unsigned row_group = tid >> 4;
+    const unsigned itid = tid & 15u;
+    const unsigned row = blockIdx.x * 16u + row_group;
+    if (row >= pc.M) return;
+    const unsigned il = itid >> 2, ir = itid & 3u;
+    const unsigned v_im = il >> 1, v_in = il & 1u;
+    const unsigned l0 = 4u * (2u * ir + v_in);
+    const unsigned q_off = 32u * v_im + l0;
+    const unsigned shift = v_im * 16u;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned expert_base = (expert * pc.slice) >> 2;
+    const unsigned gate_base = expert_base + row * bpr * 36u;
+    const unsigned up_base = expert_base + (pc.up_base >> 2) + row * bpr * 36u;
+    float sum_gate = 0.0f, sum_up = 0.0f;
+
+    for (unsigned sb = 0u; sb < bpr; ++sb) {
+        const unsigned g = 2u * v_im;
+        const unsigned char* h0 = xq + ((size_t)(2u * sb) * pc.T + tok) * 144u;
+        const unsigned char* h1 = xq + ((size_t)(2u * sb + 1u) * pc.T + tok) * 144u;
+        const int q0 = *(const int*)(h0 + 16u + g * 32u + l0);
+        const int q1 = *(const int*)(h0 + 16u + (g + 1u) * 32u + l0);
+        const int q2 = *(const int*)(h1 + 16u + g * 32u + l0);
+        const int q3 = *(const int*)(h1 + 16u + (g + 1u) * 32u + l0);
+        const float2 ds0 = __half22float2(*(const half2*)(h0 + g * 4u));
+        const float2 ds1 = __half22float2(*(const half2*)(h0 + (g + 1u) * 4u));
+        const float2 ds2 = __half22float2(*(const half2*)(h1 + g * 4u));
+        const float2 ds3 = __half22float2(*(const half2*)(h1 + (g + 1u) * 4u));
+        const bool min_lane = l0 == 0u;
+        sum_gate += zinc_q4k_q8_block_dot(a, gate_base + sb * 36u, q_off, shift,
+            q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane);
+        sum_up += zinc_q4k_q8_block_dot(a, up_base + sb * 36u, q_off, shift,
+            q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane);
+    }
+
+    #pragma unroll
+    for (unsigned off = 8u; off > 0u; off >>= 1) {
+        sum_gate += __shfl_down_sync(0xffffffffu, sum_gate, off);
+        sum_up += __shfl_down_sync(0xffffffffu, sum_up, off);
+    }
+    if (itid == 0u) {
+        const size_t yi = (size_t)tok * pc.dst_tok_stride + (size_t)slot * pc.M + row;
+        if (pc.fuse_activation != 0u) {
+            const float k = 0.7978845608028654f;
+            const float gelu = 0.5f * sum_gate *
+                (1.0f + tanhf(k * (sum_gate + 0.044715f * sum_gate * sum_gate * sum_gate)));
+            gate[yi] = gelu * sum_up;
+        } else {
+            gate[yi] = sum_gate;
+            up[yi] = sum_up;
+        }
+    }
+}
+
+// Exact-route affine Q5_1 down matvec against routed Q8_1 activations. Eight
+// threads consume one 32-value quant block via packed dp4a; no padded columns.
+template <unsigned RM>
+__device__ __forceinline__ void zinc_dmmv_q5_1_experts_grouped_q8(
+    const unsigned char* __restrict__ a,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ y,
+    const unsigned* __restrict__ expert_ids,
+    const unsigned* __restrict__ order,
+    ExpertsQ8Push pc)
+{
+    const unsigned packed = order[blockIdx.y];
+    const unsigned tok = packed >> 16;
+    const unsigned slot = packed & 0xffffu;
+    const unsigned expert = expert_ids[(size_t)tok * pc.routing_stride + slot];
+    const unsigned tid = threadIdx.x;
+    const unsigned row_group = tid >> 3;
+    const unsigned lane = tid & 7u;
+    const unsigned row = blockIdx.x * RM + row_group;
+    if (row >= pc.M) return;
+    const unsigned bpr = pc.K >> 5;
+    const unsigned src_row = tok * pc.n_used + slot;
+    const unsigned char* const arow = a + (size_t)expert * pc.slice +
+        (size_t)row * bpr * 24u;
+    float sum = 0.0f;
+
+    for (unsigned b = 0u; b < bpr; ++b) {
+        const unsigned char* blk = arow + (size_t)b * 24u;
+        const float2 dm = __half22float2(*(const half2*)blk);
+        const unsigned qh = *(const unsigned*)(blk + 4u);
+        const unsigned char* qs = blk + 8u;
+        unsigned wq = 0u;
+        #pragma unroll
+        for (unsigned j = 0u; j < 4u; ++j) {
+            const unsigned k = lane * 4u + j;
+            const unsigned ql = k < 16u ? (unsigned)(qs[k] & 0xfu) : (unsigned)(qs[k - 16u] >> 4);
+            const unsigned q = ql | (((qh >> k) & 1u) << 4);
+            wq |= q << (j * 8u);
+        }
+        const unsigned h = b >> 2;
+        const unsigned g = b & 3u;
+        const unsigned char* xb = xq + ((size_t)h * pc.T + src_row) * 144u;
+        const int xqi = *(const int*)(xb + 16u + g * 32u + lane * 4u);
+        const float2 ds = __half22float2(*(const half2*)(xb + g * 4u));
+        sum += dm.x * ds.x * (float)__dp4a((int)wq, xqi, 0);
+        if (lane == 0u) sum += dm.y * ds.y;
+    }
+
+    #pragma unroll
+    for (unsigned off = 4u; off > 0u; off >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    if (lane == 0u) {
+        y[(size_t)tok * pc.dst_tok_stride + (size_t)slot * pc.M + row] = sum;
+    }
+}
+
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8(
+    const unsigned char* a, const unsigned char* xq, float* y,
+    const unsigned* expert_ids, const unsigned* order, ExpertsQ8Push pc) {
+    zinc_dmmv_q5_1_experts_grouped_q8<32u>(a, xq, y, expert_ids, order, pc);
+}
+
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_m8(
+    const unsigned char* a, const unsigned char* xq, float* y,
+    const unsigned* expert_ids, const unsigned* order, ExpertsQ8Push pc) {
+    zinc_dmmv_q5_1_experts_grouped_q8<8u>(a, xq, y, expert_ids, order, pc);
+}
+
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_m16(
+    const unsigned char* a, const unsigned char* xq, float* y,
+    const unsigned* expert_ids, const unsigned* order, ExpertsQ8Push pc) {
+    zinc_dmmv_q5_1_experts_grouped_q8<16u>(a, xq, y, expert_ids, order, pc);
+}
+
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_m64(
+    const unsigned char* a, const unsigned char* xq, float* y,
+    const unsigned* expert_ids, const unsigned* order, ExpertsQ8Push pc) {
+    zinc_dmmv_q5_1_experts_grouped_q8<64u>(a, xq, y, expert_ids, order, pc);
+}
+
+// Four-route Q5_1 down tile. Sorting routes into four-wide expert buckets lets
+// every weight load feed up to four routed activations while limiting short-
+// prompt padding to at most three rows per expert.
+template <unsigned RT>
+__device__ __forceinline__ void zinc_dmmv_q5_1_experts_grouped_q8_tiled(
+    const unsigned char* __restrict__ a,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ y,
+    const unsigned* __restrict__ order,
+    const unsigned* __restrict__ tile_expert,
+    ExpertsQ8Push pc)
+{
+    const unsigned INV = 0xffffffffu;
+    const unsigned expert = tile_expert[blockIdx.y];
+    if (expert == INV) return;
+    const unsigned tid = threadIdx.x;
+    const unsigned row_group = tid >> 3;
+    const unsigned lane = tid & 7u;
+    const unsigned row = blockIdx.x * 32u + row_group;
+    if (row >= pc.M) return;
+    const unsigned bpr = pc.K >> 5;
+    const unsigned char* const arow = a + (size_t)expert * pc.slice +
+        (size_t)row * bpr * 24u;
+    const unsigned t0 = blockIdx.y * RT;
+    unsigned packed[RT];
+    float sum[RT] = {};
+    #pragma unroll
+    for (unsigned r = 0u; r < RT; ++r) packed[r] = order[t0 + r];
+
+    for (unsigned b = 0u; b < bpr; ++b) {
+        const unsigned char* blk = arow + (size_t)b * 24u;
+        const float2 dm = __half22float2(*(const half2*)blk);
+        const unsigned qh = *(const unsigned*)(blk + 4u);
+        const unsigned char* qs = blk + 8u;
+        unsigned wq = 0u;
+        #pragma unroll
+        for (unsigned j = 0u; j < 4u; ++j) {
+            const unsigned k = lane * 4u + j;
+            const unsigned ql = k < 16u ? (unsigned)(qs[k] & 0xfu) : (unsigned)(qs[k - 16u] >> 4);
+            const unsigned q = ql | (((qh >> k) & 1u) << 4);
+            wq |= q << (j * 8u);
+        }
+        const unsigned h = b >> 2;
+        const unsigned g = b & 3u;
+        #pragma unroll
+        for (unsigned r = 0u; r < RT; ++r) {
+            if (packed[r] != INV) {
+                const unsigned tok = packed[r] >> 16;
+                const unsigned slot = packed[r] & 0xffffu;
+                const unsigned src_row = tok * pc.n_used + slot;
+                const unsigned char* xb = xq + ((size_t)h * pc.T + src_row) * 144u;
+                const int xqi = *(const int*)(xb + 16u + g * 32u + lane * 4u);
+                const float2 ds = __half22float2(*(const half2*)(xb + g * 4u));
+                sum[r] += dm.x * ds.x * (float)__dp4a((int)wq, xqi, 0);
+                if (lane == 0u) sum[r] += dm.y * ds.y;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned off = 4u; off > 0u; off >>= 1) {
+        #pragma unroll
+        for (unsigned r = 0u; r < RT; ++r)
+            sum[r] += __shfl_down_sync(0xffffffffu, sum[r], off);
+    }
+    if (lane == 0u) {
+        #pragma unroll
+        for (unsigned r = 0u; r < RT; ++r) {
+            if (packed[r] != INV) {
+                const unsigned tok = packed[r] >> 16;
+                const unsigned slot = packed[r] & 0xffffu;
+                y[(size_t)tok * pc.dst_tok_stride + (size_t)slot * pc.M + row] = sum[r];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_t4(
+    const unsigned char* a, const unsigned char* xq, float* y,
+    const unsigned* order, const unsigned* tile_expert, ExpertsQ8Push pc) {
+    zinc_dmmv_q5_1_experts_grouped_q8_tiled<4u>(a, xq, y, order, tile_expert, pc);
+}
+
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_t8(
+    const unsigned char* a, const unsigned char* xq, float* y,
+    const unsigned* order, const unsigned* tile_expert, ExpertsQ8Push pc) {
+    zinc_dmmv_q5_1_experts_grouped_q8_tiled<8u>(a, xq, y, order, tile_expert, pc);
+}
+
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_t16(
+    const unsigned char* a, const unsigned char* xq, float* y,
+    const unsigned* order, const unsigned* tile_expert, ExpertsQ8Push pc) {
+    zinc_dmmv_q5_1_experts_grouped_q8_tiled<16u>(a, xq, y, order, tile_expert, pc);
+}
+
+// Q8_0 weight x Q8_1 activation decode matvec. Eight lanes consume one
+// 32-value block with packed dot products; the remaining thread groups split
+// the row's blocks and reduce once at the end.
+extern "C" __global__ void dmmv_q8_0_q8_fast(
+    const unsigned char* __restrict__ a,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ y, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 7u;
+    const unsigned grp = tid >> 3;
+    const unsigned ngrp = blockDim.x >> 3;
+    const unsigned bpr = pc.K >> 5;
+    const unsigned char* const arow = a + pc.a_offset + (size_t)row * bpr * 34u;
+    float sum = 0.0f;
+    for (unsigned b = grp; b < bpr; b += ngrp) {
+        const unsigned char* wb = arow + (size_t)b * 34u;
+        const float dw = __half2float(*(const half*)wb);
+        const int wq = *(const int*)(wb + 2u + lane * 4u);
+        const unsigned h = b >> 2;
+        const unsigned g = b & 3u;
+        const unsigned char* xb = xq + (size_t)h * 144u;
+        const float dx = __half2float(*(const half*)(xb + g * 4u));
+        const int xqi = *(const int*)(xb + 16u + g * 32u + lane * 4u);
+        sum += dw * dx * (float)__dp4a(wq, xqi, 0);
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (tid == 0u) y[(pc.y_offset >> 2) + row] = sum;
+}
+
+#else
+extern "C" __global__ void dmmv_q4k_q8_fast() {}
+extern "C" __global__ void dmmv_q5k_q8_fast() {}
+extern "C" __global__ void dmmv_q4k_q8_btok2() {}
+extern "C" __global__ void dmmv_q4k_q8_btok3() {}
+extern "C" __global__ void dmmv_q4k_q8_btok4() {}
+extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8() {}
+extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8_btok2() {}
+extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8_btok3() {}
+extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8_btok4() {}
+extern "C" __global__ void dmmv_q4k_experts_grouped_q8_dual() {}
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8() {}
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_m8() {}
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_m16() {}
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_m64() {}
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_t4() {}
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_t8() {}
+extern "C" __global__ void dmmv_q5_1_experts_grouped_q8_t16() {}
+extern "C" __global__ void dmmv_q8_0_q8_fast() {}
+#endif
+
 // ---- dmmv_q4k_fast_dual — fuse two same-input Q4_K matvecs into ONE launch ----
 // Both weights (a0,a1) share input x and inner dim K; outputs go to y0,y1. Grid
 // is M0+M1 blocks: block bx<M0 computes row bx of a0→y0, else row bx-M0 of a1→y1.
 // Used for the gemma FFN gate/up pair and the attention Q/K pair (both Q4_K, same
 // norm input) to remove one kernel-launch boundary per layer. Each block's work
 // is bit-identical to the standalone dmmv_q4k_fast with zero offsets (no acc).
-struct Dmmv2Push { unsigned M0, M1, K; };
+struct Dmmv2Push { unsigned M0, M1, K, pair_reduce; };
+struct Dmmv3Push { unsigned M0, M1, M2, K; };
 extern "C" __global__ void dmmv_q4k_fast_dual(const unsigned* a0, const unsigned* a1, const float* x, float* y0, float* y1, Dmmv2Push pc) {
     unsigned bx = blockIdx.x;
     if (bx >= pc.M0 + pc.M1) return;
@@ -1846,6 +3573,232 @@ extern "C" __global__ void dmmv_q4k_fast_dual(const unsigned* a0, const unsigned
     float sum = zinc_dmmv_q4k_fast_sum(a, a_base, xv, bpr);
     if (threadIdx.x == 0) y[row] = sum;
 }
+
+// True same-row pair: M0 must be >= M1. Paired rows share activation loads and
+// block scheduling; the M0 tail computes only the first projection.
+extern "C" __global__ void dmmv_q4k_pair(
+    const unsigned* __restrict__ a0, const unsigned* __restrict__ a1,
+    const float* __restrict__ x, float* __restrict__ y0,
+    float* __restrict__ y1, Dmmv2Push pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M0) return;
+    const bool paired = row < pc.M1;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned il = itid >> 2, ir = itid & 3u;
+    const unsigned v_im = il >> 1, v_in = il & 1u;
+    const unsigned l0 = 4u * (2u * ir + v_in);
+    const unsigned q_off = 32u * v_im + l0;
+    const unsigned y_loc = 64u * v_im + l0;
+    const unsigned shift = v_im * 16u;
+    const unsigned ngrp = blockDim.x >> 4;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned row_base = row * bpr * 36u;
+    const float4* xv = (const float4*)x;
+    float sum0 = 0.0f, sum1 = 0.0f;
+
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned bidx = (sb * 256u + y_loc) >> 2;
+        const unsigned bidx2 = (sb * 256u + y_loc + 128u) >> 2;
+        const float4 by0 = xv[bidx], by1 = xv[bidx + 8u];
+        const float4 by2 = xv[bidx2], by3 = xv[bidx2 + 8u];
+        const unsigned blk = row_base + sb * 36u;
+        sum0 += zinc_q4k_fast_block_dot(a0, blk, q_off, shift, by0, by1, by2, by3);
+        if (paired)
+            sum1 += zinc_q4k_fast_block_dot(a1, blk, q_off, shift, by0, by1, by2, by3);
+    }
+
+    if (paired && pc.pair_reduce != 0u) {
+        zinc_block_reduce_sum_pair(sum0, sum1);
+    } else {
+        sum0 = zinc_block_reduce_sum(sum0);
+        if (paired) {
+            __syncthreads();
+            sum1 = zinc_block_reduce_sum(sum1);
+        }
+    }
+    if (tid == 0u) {
+        y0[row] = sum0;
+        if (paired) y1[row] = sum1;
+    }
+}
+
+#ifdef ZINC_ROCM
+extern "C" __global__ void dmmv_q4k_pair_q8(
+    const unsigned* __restrict__ a0, const unsigned* __restrict__ a1,
+    const unsigned char* __restrict__ xq, float* __restrict__ y0,
+    float* __restrict__ y1, Dmmv2Push pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M0) return;
+    const bool paired = row < pc.M1;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned il = itid >> 2, ir = itid & 3u;
+    const unsigned v_im = il >> 1, v_in = il & 1u;
+    const unsigned l0 = 4u * (2u * ir + v_in);
+    const unsigned q_off = 32u * v_im + l0;
+    const unsigned shift = v_im * 16u;
+    const unsigned ngrp = blockDim.x >> 4;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned row_base = row * bpr * 36u;
+    float sum0 = 0.0f, sum1 = 0.0f;
+
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned char* h0 = xq + (size_t)(2u * sb) * 144u;
+        const unsigned char* h1 = h0 + 144u;
+        const unsigned g = 2u * v_im;
+        const int q0 = *(const int*)(h0 + 16u + g * 32u + l0);
+        const int q1 = *(const int*)(h0 + 16u + (g + 1u) * 32u + l0);
+        const int q2 = *(const int*)(h1 + 16u + g * 32u + l0);
+        const int q3 = *(const int*)(h1 + 16u + (g + 1u) * 32u + l0);
+        const float2 ds0 = __half22float2(*(const half2*)(h0 + g * 4u));
+        const float2 ds1 = __half22float2(*(const half2*)(h0 + (g + 1u) * 4u));
+        const float2 ds2 = __half22float2(*(const half2*)(h1 + g * 4u));
+        const float2 ds3 = __half22float2(*(const half2*)(h1 + (g + 1u) * 4u));
+        const unsigned blk = row_base + sb * 36u;
+        const bool min_lane = l0 == 0u;
+        sum0 += zinc_q4k_q8_block_dot(a0, blk, q_off, shift, q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane);
+        if (paired)
+            sum1 += zinc_q4k_q8_block_dot(a1, blk, q_off, shift, q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane);
+    }
+
+    if (paired && pc.pair_reduce != 0u) {
+        zinc_block_reduce_sum_pair(sum0, sum1);
+    } else {
+        sum0 = zinc_block_reduce_sum(sum0);
+        if (paired) {
+            __syncthreads();
+            sum1 = zinc_block_reduce_sum(sum1);
+        }
+    }
+    if (tid == 0u) {
+        y0[row] = sum0;
+        if (paired) y1[row] = sum1;
+    }
+}
+
+// Two-token verifier twin of the same-row projection pair. Both matrices share
+// each packed activation load, while each matrix's scale metadata is decoded
+// once per superblock and reused for both tokens.
+template <unsigned B>
+__device__ __forceinline__ void zinc_dmmv_q4k_pair_q8_btok(
+    const unsigned* __restrict__ a0, const unsigned* __restrict__ a1,
+    const unsigned char* __restrict__ xq, float* __restrict__ y0,
+    float* __restrict__ y1, Dmmv2Push pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M0) return;
+    const bool paired = row < pc.M1;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned il = itid >> 2, ir = itid & 3u;
+    const unsigned v_im = il >> 1, v_in = il & 1u;
+    const unsigned l0 = 4u * (2u * ir + v_in);
+    const unsigned q_off = 32u * v_im + l0;
+    const unsigned shift = v_im * 16u;
+    const unsigned ngrp = blockDim.x >> 4;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned row_base = row * bpr * 36u;
+    float sum0[B] = {};
+    float sum1[B] = {};
+
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned blk = row_base + sb * 36u;
+        const unsigned q_word = 4u + (q_off >> 2);
+        const unsigned a0_qs0 = a0[blk + q_word];
+        const unsigned a0_qs1 = a0[blk + q_word + 16u];
+        const unsigned a1_qs0 = paired ? a1[blk + q_word] : 0u;
+        const unsigned a1_qs1 = paired ? a1[blk + q_word + 16u] : 0u;
+        uint4 scale_meta = {};
+        const bool scale_lane = (itid & 3u) == 0u;
+        const unsigned* scale_matrix = (itid & 4u) != 0u ? a1 : a0;
+        if (scale_lane && (paired || scale_matrix == a0))
+            scale_meta = *(const uint4*)(scale_matrix + blk);
+        float f0 = 0.0f, f1 = 0.0f, f2 = 0.0f, f3 = 0.0f;
+        float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+        if (scale_lane)
+            zinc_q4k_q8_scale_factors(scale_meta, shift, f0, f1, f2, f3, b0, b1, b2, b3);
+        const unsigned a0_scale_src = (grp & 1u) * 16u + v_im * 8u;
+        const float a0f0 = __shfl_sync(0xffffffffu, f0, a0_scale_src);
+        const float a0f1 = __shfl_sync(0xffffffffu, f1, a0_scale_src);
+        const float a0f2 = __shfl_sync(0xffffffffu, f2, a0_scale_src);
+        const float a0f3 = __shfl_sync(0xffffffffu, f3, a0_scale_src);
+        const float a0b0 = __shfl_sync(0xffffffffu, b0, a0_scale_src);
+        const float a0b1 = __shfl_sync(0xffffffffu, b1, a0_scale_src);
+        const float a0b2 = __shfl_sync(0xffffffffu, b2, a0_scale_src);
+        const float a0b3 = __shfl_sync(0xffffffffu, b3, a0_scale_src);
+        const unsigned a1_scale_src = a0_scale_src + 4u;
+        const float a1f0 = __shfl_sync(0xffffffffu, f0, a1_scale_src);
+        const float a1f1 = __shfl_sync(0xffffffffu, f1, a1_scale_src);
+        const float a1f2 = __shfl_sync(0xffffffffu, f2, a1_scale_src);
+        const float a1f3 = __shfl_sync(0xffffffffu, f3, a1_scale_src);
+        const float a1b0 = __shfl_sync(0xffffffffu, b0, a1_scale_src);
+        const float a1b1 = __shfl_sync(0xffffffffu, b1, a1_scale_src);
+        const float a1b2 = __shfl_sync(0xffffffffu, b2, a1_scale_src);
+        const float a1b3 = __shfl_sync(0xffffffffu, b3, a1_scale_src);
+        const unsigned g = 2u * v_im;
+        const bool min_lane = l0 == 0u;
+
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) {
+            const unsigned char* h0 = xq + ((size_t)(2u * sb) * B + tok) * 144u;
+            const unsigned char* h1 = xq + ((size_t)(2u * sb + 1u) * B + tok) * 144u;
+            const int q0 = *(const int*)(h0 + 16u + g * 32u + l0);
+            const int q1 = *(const int*)(h0 + 16u + (g + 1u) * 32u + l0);
+            const int q2 = *(const int*)(h1 + 16u + g * 32u + l0);
+            const int q3 = *(const int*)(h1 + 16u + (g + 1u) * 32u + l0);
+            const float2 ds0 = __half22float2(*(const half2*)(h0 + g * 4u));
+            const float2 ds1 = __half22float2(*(const half2*)(h0 + (g + 1u) * 4u));
+            const float2 ds2 = __half22float2(*(const half2*)(h1 + g * 4u));
+            const float2 ds3 = __half22float2(*(const half2*)(h1 + (g + 1u) * 4u));
+            sum0[tok] += zinc_q4k_q8_block_dot_scaled(a0_qs0, a0_qs1,
+                q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane,
+                a0f0, a0f1, a0f2, a0f3, a0b0, a0b1, a0b2, a0b3);
+            if (paired)
+                sum1[tok] += zinc_q4k_q8_block_dot_scaled(a1_qs0, a1_qs1,
+                    q0, q1, q2, q3, ds0, ds1, ds2, ds3, min_lane,
+                    a1f0, a1f1, a1f2, a1f3, a1b0, a1b1, a1b2, a1b3);
+        }
+    }
+
+    if (paired && pc.pair_reduce != 0u) {
+        zinc_block_reduce_sum_many_pair<B>(sum0, sum1);
+    } else {
+        zinc_block_reduce_sum_many<B>(sum0);
+        if (paired) {
+            __syncthreads();
+            zinc_block_reduce_sum_many<B>(sum1);
+        }
+    }
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) {
+            y0[(size_t)tok * pc.M0 + row] = sum0[tok];
+            if (paired) y1[(size_t)tok * pc.M1 + row] = sum1[tok];
+        }
+    }
+}
+
+extern "C" __global__ void dmmv_q4k_pair_q8_btok2(
+    const unsigned* a0, const unsigned* a1, const unsigned char* xq,
+    float* y0, float* y1, Dmmv2Push pc) {
+    zinc_dmmv_q4k_pair_q8_btok<2u>(a0, a1, xq, y0, y1, pc);
+}
+extern "C" __global__ void dmmv_q4k_pair_q8_btok3(
+    const unsigned* a0, const unsigned* a1, const unsigned char* xq,
+    float* y0, float* y1, Dmmv2Push pc) {
+    zinc_dmmv_q4k_pair_q8_btok<3u>(a0, a1, xq, y0, y1, pc);
+}
+extern "C" __global__ void dmmv_q4k_pair_q8_btok4(
+    const unsigned* a0, const unsigned* a1, const unsigned char* xq,
+    float* y0, float* y1, Dmmv2Push pc) {
+    zinc_dmmv_q4k_pair_q8_btok<4u>(a0, a1, xq, y0, y1, pc);
+}
+#else
+extern "C" __global__ void dmmv_q4k_pair_q8() {}
+extern "C" __global__ void dmmv_q4k_pair_q8_btok2() {}
+extern "C" __global__ void dmmv_q4k_pair_q8_btok3() {}
+extern "C" __global__ void dmmv_q4k_pair_q8_btok4() {}
+#endif
 
 // ---- dmmv_q6k_fast (perf research) — port of tuned Vulkan dmmv_q6k -----------
 extern "C" __global__ void dmmv_q6k_fast(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
@@ -1881,6 +3834,155 @@ extern "C" __global__ void dmmv_q6k_fast(const unsigned char* a, const float* x,
     sum = zinc_block_reduce_sum(sum);
     if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
 }
+
+// Packed Q6_K x Q8_1 decode matvec. Each 16-thread group keeps the proven
+// superblock/row mapping from dmmv_q6k_fast, but consumes four packed activation
+// words and issues four int8 dot products instead of sixteen scalar float FMAs.
+#ifdef ZINC_ROCM
+__device__ __forceinline__ unsigned zinc_q6_decode_signed4(unsigned q) {
+    q ^= 0x20202020u;
+    const unsigned sign = q & 0x20202020u;
+    return q | (sign << 1) | (sign << 2);
+}
+
+extern "C" __global__ void dmmv_q6k_q8_fast(
+    const unsigned char* __restrict__ a,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ y, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned char* arow = a + pc.a_offset + (size_t)row * bpr * 210u;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned half_id = itid >> 3;
+    const unsigned local_id = itid & 7u;
+    const unsigned e_start = local_id * 4u;
+    const unsigned is = e_start >> 4;
+    const unsigned ngrp = blockDim.x >> 4;
+    float sum = 0.0f;
+
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned char* bb = arow + (size_t)sb * 210u;
+        const float d = zinc_half_to_float((unsigned short)((unsigned)bb[208] | ((unsigned)bb[209] << 8)));
+        const unsigned ql0 = *(const unsigned*)(bb + half_id * 64u + e_start);
+        const unsigned ql1 = *(const unsigned*)(bb + half_id * 64u + 32u + e_start);
+        const unsigned qh = *(const unsigned*)(bb + 128u + half_id * 32u + e_start);
+        const int v0 = (int)zinc_q6_decode_signed4((ql0 & 0x0f0f0f0fu) | ((qh << 4) & 0x30303030u));
+        const int v1 = (int)zinc_q6_decode_signed4((ql1 & 0x0f0f0f0fu) | ((qh << 2) & 0x30303030u));
+        const int v2 = (int)zinc_q6_decode_signed4(((ql0 >> 4) & 0x0f0f0f0fu) | (qh & 0x30303030u));
+        const int v3 = (int)zinc_q6_decode_signed4(((ql1 >> 4) & 0x0f0f0f0fu) | ((qh >> 2) & 0x30303030u));
+        const signed char* sc = (const signed char*)(bb + 192u + half_id * 8u);
+
+        const unsigned char* xh = xq + (size_t)(2u * sb + half_id) * 144u;
+        const int q0 = *(const int*)(xh + 16u + 0u * 32u + e_start);
+        const int q1 = *(const int*)(xh + 16u + 1u * 32u + e_start);
+        const int q2 = *(const int*)(xh + 16u + 2u * 32u + e_start);
+        const int q3 = *(const int*)(xh + 16u + 3u * 32u + e_start);
+        const float d0 = __half2float(*(const half*)(xh + 0u * 4u));
+        const float d1 = __half2float(*(const half*)(xh + 1u * 4u));
+        const float d2 = __half2float(*(const half*)(xh + 2u * 4u));
+        const float d3 = __half2float(*(const half*)(xh + 3u * 4u));
+
+        sum += d * (float)sc[is] * d0 * (float)__dp4a(v0, q0, 0);
+        sum += d * (float)sc[is + 2u] * d1 * (float)__dp4a(v1, q1, 0);
+        sum += d * (float)sc[is + 4u] * d2 * (float)__dp4a(v2, q2, 0);
+        sum += d * (float)sc[is + 6u] * d3 * (float)__dp4a(v3, q3, 0);
+    }
+
+    // The dense FFN down projection is dispatched as one native wave. Avoid
+    // the generic block reducer's shared-memory rendezvous and second shuffle
+    // tree in that case; the larger LM-head dispatch still takes the old path.
+    sum = blockDim.x == 32u ? zinc_warp_reduce_sum(sum) : zinc_block_reduce_sum(sum);
+    if (tid == 0u) {
+        const unsigned yi = pc.y_offset >> 2;
+        if (pc.acc_mode != 0u) y[yi + row] += sum;
+        else y[yi + row] = sum;
+    }
+}
+
+template <unsigned B>
+__device__ __forceinline__ void zinc_dmmv_q6k_q8_btok(
+    const unsigned char* __restrict__ a,
+    const unsigned char* __restrict__ xq,
+    float* __restrict__ y, DmmvPush pc)
+{
+    const unsigned row = blockIdx.x;
+    if (row >= pc.M) return;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned char* arow = a + pc.a_offset + (size_t)row * bpr * 210u;
+    const unsigned tid = threadIdx.x, itid = tid & 15u, grp = tid >> 4;
+    const unsigned half_id = itid >> 3;
+    const unsigned local_id = itid & 7u;
+    const unsigned e_start = local_id * 4u;
+    const unsigned is = e_start >> 4;
+    const unsigned ngrp = blockDim.x >> 4;
+    float sum[B] = {};
+
+    for (unsigned sb = grp; sb < bpr; sb += ngrp) {
+        const unsigned char* bb = arow + (size_t)sb * 210u;
+        const float d = zinc_half_to_float((unsigned short)((unsigned)bb[208] | ((unsigned)bb[209] << 8)));
+        const unsigned ql0 = *(const unsigned*)(bb + half_id * 64u + e_start);
+        const unsigned ql1 = *(const unsigned*)(bb + half_id * 64u + 32u + e_start);
+        const unsigned qh = *(const unsigned*)(bb + 128u + half_id * 32u + e_start);
+        const int v0 = (int)zinc_q6_decode_signed4((ql0 & 0x0f0f0f0fu) | ((qh << 4) & 0x30303030u));
+        const int v1 = (int)zinc_q6_decode_signed4((ql1 & 0x0f0f0f0fu) | ((qh << 2) & 0x30303030u));
+        const int v2 = (int)zinc_q6_decode_signed4(((ql0 >> 4) & 0x0f0f0f0fu) | (qh & 0x30303030u));
+        const int v3 = (int)zinc_q6_decode_signed4(((ql1 >> 4) & 0x0f0f0f0fu) | ((qh >> 2) & 0x30303030u));
+        const signed char* sc = (const signed char*)(bb + 192u + half_id * 8u);
+
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) {
+            const unsigned char* xh = xq + ((size_t)(2u * sb + half_id) * B + tok) * 144u;
+            const int q0 = *(const int*)(xh + 16u + 0u * 32u + e_start);
+            const int q1 = *(const int*)(xh + 16u + 1u * 32u + e_start);
+            const int q2 = *(const int*)(xh + 16u + 2u * 32u + e_start);
+            const int q3 = *(const int*)(xh + 16u + 3u * 32u + e_start);
+            const float d0 = __half2float(*(const half*)(xh + 0u * 4u));
+            const float d1 = __half2float(*(const half*)(xh + 1u * 4u));
+            const float d2 = __half2float(*(const half*)(xh + 2u * 4u));
+            const float d3 = __half2float(*(const half*)(xh + 3u * 4u));
+            sum[tok] += d * (float)sc[is] * d0 * (float)__dp4a(v0, q0, 0);
+            sum[tok] += d * (float)sc[is + 2u] * d1 * (float)__dp4a(v1, q1, 0);
+            sum[tok] += d * (float)sc[is + 4u] * d2 * (float)__dp4a(v2, q2, 0);
+            sum[tok] += d * (float)sc[is + 6u] * d3 * (float)__dp4a(v3, q3, 0);
+        }
+    }
+
+    if (blockDim.x == 32u) {
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) sum[tok] = zinc_warp_reduce_sum(sum[tok]);
+    } else {
+        zinc_block_reduce_sum_many<B>(sum);
+    }
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned tok = 0u; tok < B; ++tok) {
+            const unsigned yi = (pc.y_offset >> 2) + tok * pc.M + row;
+            if (pc.acc_mode != 0u) y[yi] += sum[tok];
+            else y[yi] = sum[tok];
+        }
+    }
+}
+
+extern "C" __global__ void dmmv_q6k_q8_btok2(
+    const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) {
+    zinc_dmmv_q6k_q8_btok<2u>(a, xq, y, pc);
+}
+extern "C" __global__ void dmmv_q6k_q8_btok3(
+    const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) {
+    zinc_dmmv_q6k_q8_btok<3u>(a, xq, y, pc);
+}
+extern "C" __global__ void dmmv_q6k_q8_btok4(
+    const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) {
+    zinc_dmmv_q6k_q8_btok<4u>(a, xq, y, pc);
+}
+#else
+extern "C" __global__ void dmmv_q6k_q8_fast() {}
+extern "C" __global__ void dmmv_q6k_q8_btok2() {}
+extern "C" __global__ void dmmv_q6k_q8_btok3() {}
+extern "C" __global__ void dmmv_q6k_q8_btok4() {}
+#endif
 
 // ---- dmmv_q5k_fast (perf research) — q4k_fast + Q5_K qh high-bit promote -----
 extern "C" __global__ void dmmv_q5k_fast(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) {
@@ -1925,7 +4027,7 @@ extern "C" __global__ void dmmv_q5k_fast(const unsigned* a_u32, const float* x, 
 // busy enough to leave its idle clock. Per-expert weight slice = id*slice; x is
 // shared across experts for gate/up (x_stride=0) or per-expert for down
 // (x_stride=K, i.e. swiglu[e*K..]). Output is slot-major: y[e*M + row].
-struct ExpertsPush { unsigned M, K, slice, x_stride, n_used, base; };
+struct ExpertsPush { unsigned M, K, slice, x_stride, n_used, base, fuse_activation; };
 
 extern "C" __global__ void dmmv_q4k_experts(const unsigned* a_u32, const float* x, float* y, const unsigned* expert_ids, ExpertsPush pc) {
     unsigned g = blockIdx.x;
@@ -2034,7 +4136,18 @@ extern "C" __global__ void dmmv_q4k_experts_dual(const unsigned* a_u32, const fl
     sg = zinc_block_reduce_sum(sg);
     __syncthreads(); // sh[] reuse between the two reductions
     su = zinc_block_reduce_sum(su);
-    if (tid == 0) { unsigned o = (size_t)e * pc.M + row; y_gate[o] = sg; y_up[o] = su; }
+    if (tid == 0) {
+        const unsigned o = (size_t)e * pc.M + row;
+        if (pc.fuse_activation != 0u) {
+            const float k = 0.7978845608028654f;
+            const float gelu = 0.5f * sg *
+                (1.0f + tanhf(k * (sg + 0.044715f * sg * sg * sg)));
+            y_gate[o] = gelu * su;
+        } else {
+            y_gate[o] = sg;
+            y_up[o] = su;
+        }
+    }
 }
 
 extern "C" __global__ void dmmv_q5k_experts(const unsigned* a_u32, const float* x, float* y, const unsigned* expert_ids, ExpertsPush pc) {
@@ -2564,6 +4677,120 @@ extern "C" __global__ void build_expert_order_padded(const unsigned* expert_ids,
     }
 }
 
+// gfx12 short-prompt twin: pad each expert run to 16 routes instead of 64.
+// The integer-WMMA expert kernel consumes one 16-column fragment per tile, so
+// this avoids executing 64 columns when an expert received only a few tokens.
+extern "C" __global__ void build_expert_order_padded_16(const unsigned* expert_ids, unsigned* order, unsigned* tile_expert, BuildOrderPadPush pc) {
+    __shared__ unsigned counts[256];
+    __shared__ unsigned poff[256];
+    const unsigned INV = 0xFFFFFFFFu;
+    unsigned tid = threadIdx.x, nthr = blockDim.x;
+    unsigned P = pc.T * pc.n_used;
+    unsigned maxtiles = pc.max_pos >> 4;
+    for (unsigned p = tid; p < pc.max_pos; p += nthr) order[p] = INV;
+    for (unsigned tl = tid; tl < maxtiles; tl += nthr) tile_expert[tl] = INV;
+    for (unsigned e = tid; e < pc.n_experts; e += nthr) counts[e] = 0u;
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        atomicAdd(&counts[expert_ids[(size_t)t * pc.routing_stride + slot]], 1u);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        unsigned acc = 0u;
+        for (unsigned e = 0; e < pc.n_experts; e++) {
+            poff[e] = acc;
+            unsigned ntile = (counts[e] + 15u) >> 4;
+            for (unsigned k = 0; k < ntile; k++) tile_expert[(acc >> 4) + k] = e;
+            acc += ntile * 16u;
+        }
+    }
+    __syncthreads();
+    for (unsigned e = tid; e < pc.n_experts; e += nthr) counts[e] = 0u;
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        unsigned E = expert_ids[(size_t)t * pc.routing_stride + slot];
+        unsigned within = atomicAdd(&counts[E], 1u);
+        order[poff[E] + within] = (t << 16) | slot;
+    }
+}
+
+// Four-route padded ordering for the ROCm exact-Q8 Q5_1 down projection.
+extern "C" __global__ void build_expert_order_padded_4(const unsigned* expert_ids, unsigned* order, unsigned* tile_expert, BuildOrderPadPush pc) {
+    __shared__ unsigned counts[256];
+    __shared__ unsigned poff[256];
+    const unsigned INV = 0xFFFFFFFFu;
+    const unsigned tid = threadIdx.x, nthr = blockDim.x;
+    const unsigned P = pc.T * pc.n_used;
+    const unsigned maxtiles = pc.max_pos >> 2;
+    for (unsigned p = tid; p < pc.max_pos; p += nthr) order[p] = INV;
+    for (unsigned tl = tid; tl < maxtiles; tl += nthr) tile_expert[tl] = INV;
+    for (unsigned e = tid; e < pc.n_experts; e += nthr) counts[e] = 0u;
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        const unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        atomicAdd(&counts[expert_ids[(size_t)t * pc.routing_stride + slot]], 1u);
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        unsigned acc = 0u;
+        for (unsigned e = 0u; e < pc.n_experts; ++e) {
+            poff[e] = acc;
+            const unsigned ntile = (counts[e] + 3u) >> 2;
+            for (unsigned k = 0u; k < ntile; ++k) tile_expert[(acc >> 2) + k] = e;
+            acc += ntile * 4u;
+        }
+    }
+    __syncthreads();
+    for (unsigned e = tid; e < pc.n_experts; e += nthr) counts[e] = 0u;
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        const unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        const unsigned e = expert_ids[(size_t)t * pc.routing_stride + slot];
+        const unsigned within = atomicAdd(&counts[e], 1u);
+        order[poff[e] + within] = (t << 16) | slot;
+    }
+}
+
+// Eight-route ordering A/B for the Q5_1 down tile.
+extern "C" __global__ void build_expert_order_padded_8(const unsigned* expert_ids, unsigned* order, unsigned* tile_expert, BuildOrderPadPush pc) {
+    __shared__ unsigned counts[256];
+    __shared__ unsigned poff[256];
+    const unsigned INV = 0xFFFFFFFFu;
+    const unsigned tid = threadIdx.x, nthr = blockDim.x;
+    const unsigned P = pc.T * pc.n_used;
+    const unsigned maxtiles = pc.max_pos >> 3;
+    for (unsigned p = tid; p < pc.max_pos; p += nthr) order[p] = INV;
+    for (unsigned tl = tid; tl < maxtiles; tl += nthr) tile_expert[tl] = INV;
+    for (unsigned e = tid; e < pc.n_experts; e += nthr) counts[e] = 0u;
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        const unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        atomicAdd(&counts[expert_ids[(size_t)t * pc.routing_stride + slot]], 1u);
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        unsigned acc = 0u;
+        for (unsigned e = 0u; e < pc.n_experts; ++e) {
+            poff[e] = acc;
+            const unsigned ntile = (counts[e] + 7u) >> 3;
+            for (unsigned k = 0u; k < ntile; ++k) tile_expert[(acc >> 3) + k] = e;
+            acc += ntile * 8u;
+        }
+    }
+    __syncthreads();
+    for (unsigned e = tid; e < pc.n_experts; e += nthr) counts[e] = 0u;
+    __syncthreads();
+    for (unsigned p = tid; p < P; p += nthr) {
+        const unsigned t = p / pc.n_used, slot = p - t * pc.n_used;
+        const unsigned e = expert_ids[(size_t)t * pc.routing_stride + slot];
+        const unsigned within = atomicAdd(&counts[e], 1u);
+        order[poff[e] + within] = (t << 16) | slot;
+    }
+}
+
+#ifndef ZINC_ROCM
 struct GroupedTCPush { unsigned M, K, base, gu_full, dst_tok_stride; };
 extern "C" __global__ void gemm_q4k_experts_grouped_tc(const unsigned* a_u32, const float* A, const unsigned* order, const unsigned* tile_expert, float* dst, GroupedTCPush pc) {
     const unsigned BM=64u, BT=64u, BK=32u, INV=0xFFFFFFFFu;
@@ -2900,6 +5127,8 @@ extern "C" __global__ void gemm_q6k_experts_grouped_tc(const unsigned char* a, c
 }
 
 
+#endif // !ZINC_ROCM: NVIDIA WMMA grouped-expert kernels
+
 // ---- dmmv_q8_0_fast — whole-block-per-thread, d once, float4 x --------------
 extern "C" __global__ void dmmv_q8_0_fast(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
     unsigned row = blockIdx.x; if (row >= pc.M) return;
@@ -2918,6 +5147,87 @@ extern "C" __global__ void dmmv_q8_0_fast(const unsigned char* a, const float* x
     }
     sum = zinc_block_reduce_sum(sum);
     if (tid == 0) { unsigned yi = (pc.y_offset >> 2) + (size_t)tok * pc.M + row; if (pc.acc_mode != 0u) y[yi] += sum; else y[yi] = sum; }
+}
+
+// Fuse two or three independent Q8_0 projections that consume the same input.
+// The grid is only concatenated; every output row retains dmmv_q8_0_fast's
+// thread mapping and accumulation order.
+extern "C" __global__ void dmmv_q8_0_fast_multi(
+    const unsigned char* a0, const unsigned char* a1, const unsigned char* a2,
+    const float* x, float* y0, float* y1, float* y2, Dmmv3Push pc)
+{
+    const unsigned bx = blockIdx.x;
+    if (bx >= pc.M0 + pc.M1 + pc.M2) return;
+    const unsigned char* a;
+    float* y;
+    unsigned row;
+    if (bx < pc.M0) {
+        a = a0; y = y0; row = bx;
+    } else if (bx < pc.M0 + pc.M1) {
+        a = a1; y = y1; row = bx - pc.M0;
+    } else {
+        a = a2; y = y2; row = bx - pc.M0 - pc.M1;
+    }
+    const unsigned bpr = pc.K >> 5;
+    const unsigned char* arow = a + (size_t)row * bpr * 34u;
+    const unsigned tid = threadIdx.x;
+    float sum = 0.0f;
+    for (unsigned b = tid; b < bpr; b += blockDim.x) {
+        const unsigned char* blk = arow + (size_t)b * 34u;
+        const float d = zinc_half_to_float(*(const unsigned short*)blk);
+        const signed char* qs = (const signed char*)(blk + 2u);
+        const float4* xb = (const float4*)(x + (size_t)b * 32u);
+        #pragma unroll
+        for (unsigned j = 0; j < 8u; ++j) {
+            const float4 xx = xb[j];
+            sum += d * ((float)qs[j * 4u] * xx.x + (float)qs[j * 4u + 1u] * xx.y + (float)qs[j * 4u + 2u] * xx.z + (float)qs[j * 4u + 3u] * xx.w);
+        }
+    }
+    sum = zinc_block_reduce_sum(sum);
+    if (tid == 0u) y[row] = sum;
+}
+
+// Two adjacent Q8_0 output rows per block. Both rows reuse the same activation
+// loads and share one reduction rendezvous; their per-row accumulation order is
+// identical to dmmv_q8_0_fast.
+extern "C" __global__ void dmmv_q8_0_mrow2(const unsigned char* a, const float* x, float* y, DmmvPush pc) {
+    const unsigned row0 = blockIdx.x * 2u;
+    if (row0 >= pc.M) return;
+    const unsigned row1 = row0 + 1u;
+    const unsigned bpr = pc.K >> 5;
+    const unsigned char* arow0 = a + pc.a_offset + (size_t)row0 * bpr * 34u;
+    const unsigned char* arow1 = a + pc.a_offset + (size_t)row1 * bpr * 34u;
+    const unsigned xb0 = pc.x_offset >> 2;
+    const unsigned tid = threadIdx.x;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (unsigned b = tid; b < bpr; b += blockDim.x) {
+        const float4* xb = (const float4*)(x + xb0 + (size_t)b * 32u);
+        const unsigned char* blk0 = arow0 + (size_t)b * 34u;
+        const float d0 = zinc_half_to_float(*(const unsigned short*)blk0);
+        const signed char* qs0 = (const signed char*)(blk0 + 2u);
+        const bool have1 = row1 < pc.M;
+        const unsigned char* blk1 = arow1 + (size_t)b * 34u;
+        const float d1 = have1 ? zinc_half_to_float(*(const unsigned short*)blk1) : 0.0f;
+        const signed char* qs1 = (const signed char*)(blk1 + 2u);
+        #pragma unroll
+        for (unsigned j = 0; j < 8u; ++j) {
+            const float4 xx = xb[j];
+            sum0 += d0 * ((float)qs0[j * 4u] * xx.x + (float)qs0[j * 4u + 1u] * xx.y + (float)qs0[j * 4u + 2u] * xx.z + (float)qs0[j * 4u + 3u] * xx.w);
+            if (have1) sum1 += d1 * ((float)qs1[j * 4u] * xx.x + (float)qs1[j * 4u + 1u] * xx.y + (float)qs1[j * 4u + 2u] * xx.z + (float)qs1[j * 4u + 3u] * xx.w);
+        }
+    }
+    zinc_block_reduce_sum_pair(sum0, sum1);
+    if (tid == 0u) {
+        const unsigned yi = pc.y_offset >> 2;
+        if (pc.acc_mode != 0u) {
+            y[yi + row0] += sum0;
+            if (row1 < pc.M) y[yi + row1] += sum1;
+        } else {
+            y[yi + row0] = sum0;
+            if (row1 < pc.M) y[yi + row1] = sum1;
+        }
+    }
 }
 
 // ---- dmmv_q4k multi-row (perf research, agenda 1: small/mid-M occupancy) -----
@@ -3215,14 +5525,25 @@ __device__ __forceinline__ void dmmv_q5k_btok_impl(const unsigned* a_u32, const 
             sum[t] += s;
         }
     }
-    #pragma unroll
-    for (int t = 0; t < B; t++) {
-        float r = zinc_block_reduce_sum(sum[t]);
+    if constexpr (B <= 4) {
+        zinc_block_reduce_sum_many<B>(sum);
         if (tid == 0) {
-            unsigned yi = (pc.y_offset >> 2) + (unsigned)t * pc.M + row;
-            if (pc.acc_mode != 0u) y[yi] += r; else y[yi] = r;
+            #pragma unroll
+            for (int t = 0; t < B; t++) {
+                unsigned yi = (pc.y_offset >> 2) + (unsigned)t * pc.M + row;
+                if (pc.acc_mode != 0u) y[yi] += sum[t]; else y[yi] = sum[t];
+            }
         }
-        __syncthreads();
+    } else {
+        #pragma unroll
+        for (int t = 0; t < B; t++) {
+            float r = zinc_block_reduce_sum(sum[t]);
+            if (tid == 0) {
+                unsigned yi = (pc.y_offset >> 2) + (unsigned)t * pc.M + row;
+                if (pc.acc_mode != 0u) y[yi] += r; else y[yi] = r;
+            }
+            __syncthreads();
+        }
     }
 }
 extern "C" __global__ void dmmv_q5k_btok2(const unsigned* a_u32, const float* x, float* y, DmmvPush pc) { dmmv_q5k_btok_impl<2>(a_u32, x, y, pc); }
@@ -3728,10 +6049,12 @@ extern "C" __global__ void gemm_q5k_tc_lowsmem(const unsigned char* a, const flo
     }
 }
 
-// ---- quantize_act_q8_0 — pre-quantize float activations to Q8_0 format -----
+// ---- quantize_act_q8_0 — pre-quantize float activations to Q8_1 format -----
 // Grid: (ceilDiv(K, 256), T). Block: 256 threads. Each block quantizes 256 elements
-// (8 Q8_0 blocks of 32 elements each). Output: Q8_0 format, 34 bytes per 32 elements.
-struct QuantActPush { unsigned K; };
+// (8 blocks of 32 elements each). Output is [f16 d, f16 sum, 32xi8] so the
+// asymmetric Q4_K minimum correction does not have to re-sum activations in
+// every matrix multiplication.
+struct QuantActPush { unsigned K, T; };
 extern "C" __global__ void quantize_act_q8_0(const float* __restrict__ act,
     unsigned char* __restrict__ out, QuantActPush pc) {
     unsigned tok = blockIdx.y;
@@ -3739,33 +6062,1668 @@ extern "C" __global__ void quantize_act_q8_0(const float* __restrict__ act,
     unsigned tid = threadIdx.x;
     unsigned k_idx = chunk_base + tid;
     const float* in = act + (size_t)tok * pc.K;
-    unsigned char* out_base = out + (size_t)tok * (pc.K / 32u) * 34u + (chunk_base / 32u) * 34u;
+#ifdef ZINC_ROCM
+    // MMQ layout: [K/128][T][4 scales + 4*32 quants]. Keeping one 128-value
+    // activation tile contiguous lets the WMMA GEMM stage it with vector-like
+    // coalesced copies instead of reconstructing a token-major layout.
+    const unsigned wblk = tid >> 5;
+    const unsigned wlane = tid & 31u;
+    const unsigned c = (chunk_base >> 5) + wblk;
+    const unsigned h = c >> 2;
+    const unsigned g = c & 3u;
+    unsigned char* out_base = out + ((size_t)h * pc.T + tok) * 144u;
+#else
+    unsigned char* out_base = out + (size_t)tok * (pc.K / 32u) * 36u + (chunk_base / 32u) * 36u;
+
+    // Each warp handles 32 elements → 1 Q8_1 block
+    const unsigned wblk = tid >> 5;
+    const unsigned wlane = tid & 31u;
+#endif
 
     // Read element (zero-pad beyond K)
     float val = (k_idx < pc.K) ? in[k_idx] : 0.0f;
 
-    // Each warp handles 32 elements → 1 Q8_0 block
-    unsigned wblk = tid >> 5;  // 0..7 (8 warps, 8 blocks)
-    unsigned wlane = tid & 31u;
-
-    // Warp-reduce max_abs
-    float av = fabsf(val);
-    for (int o = 16; o > 0; o >>= 1)
+    // Warp-reduce max_abs and the original-value sum.
+    float av = fabsf(val), sv = val;
+    for (int o = 16; o > 0; o >>= 1) {
         av = fmaxf(av, __shfl_xor_sync(0xFFFFFFFFu, av, o));
+        sv += __shfl_xor_sync(0xFFFFFFFFu, sv, o);
+    }
 
     float d = av / 127.0f;
     float scale = 127.0f / fmaxf(av, 1e-5f);
     int q = max(-127, min(127, __float2int_rn(val * scale)));
 
-    // Lane 0 writes the fp16 scale
+    // Lane 0 writes the fp16 scale and sum.
     if (wlane == 0 && k_idx < pc.K) {
         unsigned short dh = zinc_float_to_half(d);
-        out_base[wblk * 34u]     = (unsigned char)(dh & 0xFF);
-        out_base[wblk * 34u + 1] = (unsigned char)(dh >> 8);
+        unsigned short sh = zinc_float_to_half(sv);
+#ifdef ZINC_ROCM
+        out_base[g * 4u]     = (unsigned char)(dh & 0xFF);
+        out_base[g * 4u + 1] = (unsigned char)(dh >> 8);
+        out_base[g * 4u + 2] = (unsigned char)(sh & 0xFF);
+        out_base[g * 4u + 3] = (unsigned char)(sh >> 8);
+#else
+        out_base[wblk * 36u]     = (unsigned char)(dh & 0xFF);
+        out_base[wblk * 36u + 1] = (unsigned char)(dh >> 8);
+        out_base[wblk * 36u + 2] = (unsigned char)(sh & 0xFF);
+        out_base[wblk * 36u + 3] = (unsigned char)(sh >> 8);
+#endif
     }
     // All threads write their int8 value
-    out_base[wblk * 34u + 2u + wlane] = (unsigned char)q;
+#ifdef ZINC_ROCM
+    out_base[16u + g * 32u + wlane] = (unsigned char)q;
+#else
+    out_base[wblk * 36u + 4u + wlane] = (unsigned char)q;
+#endif
 }
+
+// ---- gemm_q4k_wmma_i8 — gfx12 Q4_K x Q8_1 integer-WMMA GEMM ---------------
+// One 256-thread block computes a 128-row x 112-token output tile. Each wave
+// covers 16 weight rows and seven 16-token columns. Q4_K nibbles
+// are expanded into the WMMA input layout once per 256-value superblock; four
+// Q8_1 blocks (128 values) are staged at a time. Weight scale/min and activation
+// scale/sum pairs remain packed as half2, minimizing shared-memory traffic and
+// register pressure while f32 accumulators preserve output quality.
+#ifdef ZINC_ROCM
+template <bool Q5, unsigned NFRAG>
+__device__ __forceinline__ void zinc_gemm_q45k_wmma_i8(
+    const unsigned* __restrict__ a_u32, const float* __restrict__ A_unused,
+    const unsigned char* __restrict__ A_q8, float* __restrict__ Y, GemmPush pc) {
+    (void)A_unused;
+    const unsigned BM = 128u, BT = NFRAG * 16u;
+    // Four trailing words make the row stride 4 mod 8, avoiding LDS bank
+    // conflicts in adjacent WMMA fragment loads.
+    const unsigned X_STRIDE = 76u; // 64 q words + 8 half2 pairs + 4 padding words
+    const unsigned B_STRIDE = 36u; // 4 packed half2 scale/sum pairs + 32 q words
+    const unsigned BLOCK_WORDS = Q5 ? 44u : 36u;
+    __shared__ __align__(16) int Xtile[BM * X_STRIDE];
+    __shared__ __align__(16) int Btile[((NFRAG * 16u * 36u + 255u) / 256u) * 256u];
+
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wid = tid >> 5;
+    const unsigned m0 = blockIdx.x * BM;
+    const unsigned token_base = pc.x_offset / (pc.K * sizeof(float));
+    const unsigned t0 = token_base + blockIdx.y * BT;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned nsuper = pc.K >> 8;
+
+    float accum[NFRAG * 8u];
+    #pragma unroll
+    for (unsigned i = 0; i < NFRAG * 8u; ++i) accum[i] = 0.0f;
+
+    using zinc_i32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+    using zinc_i32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+    half2* const Xdm = (half2*)(Xtile + 64u);
+    half2* const Bds = (half2*)Btile;
+
+    for (unsigned sb = 0; sb < nsuper; ++sb) {
+        // Expand one packed Q4_K row per wave at a time. Each lane loads four
+        // packed bytes and writes four low plus four high nibbles as byte lanes
+        // in two int32 values. The resulting 64 words are directly consumable
+        // by gfx12 WMMA without a transpose in the math loop.
+        #pragma unroll
+        for (unsigned r0 = 0u; r0 < BM; r0 += 8u) {
+            const unsigned r = r0 + wid;
+            const unsigned row = m0 + r;
+            const unsigned blk = row * bpr * BLOCK_WORDS + sb * BLOCK_WORDS;
+            if constexpr (!Q5) {
+                const unsigned qs4 = a_u32[blk + 4u + lane];
+                const unsigned xi = r * X_STRIDE + 16u * (lane >> 3) + (lane & 7u);
+                Xtile[xi] = (int)(qs4 & 0x0F0F0F0Fu);
+                Xtile[xi + 8u] = (int)((qs4 >> 4) & 0x0F0F0F0Fu);
+            } else {
+                const unsigned ql = a_u32[blk + 12u + lane];
+                const unsigned qli0 = ql & 0x0F0F0F0Fu;
+                const unsigned qli1 = (ql >> 4) & 0x0F0F0F0Fu;
+                const unsigned qhi = a_u32[blk + 4u + (lane & 7u)];
+                const unsigned qh0 = ((qhi >> (2u * (lane >> 3))) << 4) & 0x10101010u;
+                const unsigned qh1 = ((qhi >> (2u * (lane >> 3) + 1u)) << 4) & 0x10101010u;
+                const unsigned ky = 2u * lane;
+                const unsigned kq0 = ky - (ky & 15u) + (lane & 7u);
+                Xtile[r * X_STRIDE + kq0] = (int)(qli0 | qh0);
+                Xtile[r * X_STRIDE + kq0 + 8u] = (int)(qli1 | qh1);
+            }
+        }
+
+        // Two lanes per row unpack all eight 6-bit scale/min pairs. Store
+        // (d*scale, -dmin*min) together as half2, matching each 32-value group.
+        {
+            const unsigned r = wid * 16u + (lane >> 1);
+            const unsigned row = m0 + r;
+            const unsigned ksc = lane & 1u;
+            const unsigned blk = row * bpr * BLOCK_WORDS + sb * BLOCK_WORDS;
+            const half2 dm = *(const half2*)(a_u32 + blk);
+            const int* scales = (const int*)(a_u32 + blk + 1u);
+            const int sc32 = ((scales[ksc + (ksc != 0u)] >> (4u * (ksc & (ksc / 2u)))) & 0x0F0F0F0F) |
+                ((scales[ksc / 2u] >> (2u * (ksc & 1u))) & 0x30303030);
+            const unsigned mksc = ksc + 2u;
+            const int mn32 = ((scales[(mksc & 1u) + (mksc != 0u)] >> (4u * (mksc & (mksc / 2u)))) & 0x0F0F0F0F) |
+                ((scales[mksc / 2u] >> (2u * (mksc & 1u))) & 0x30303030);
+            const unsigned char* sc8 = (const unsigned char*)&sc32;
+            const unsigned char* mn8 = (const unsigned char*)&mn32;
+            #pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                Xdm[r * X_STRIDE + 4u * ksc + (unsigned)l] = __hmul2(
+                    dm, __floats2half2_rn((float)sc8[l], -(float)mn8[l]));
+            }
+        }
+
+        // Stage four Q8_1 groups (128 K values) at a time. Xtile remains
+        // resident while Btile is reused for both halves of the superblock.
+        #pragma unroll
+        for (int ah = 0; ah < 2; ++ah) {
+            const int* by0 = (const int*)A_q8 +
+                ((size_t)(sb * 2u + (unsigned)ah) * pc.T + t0) * B_STRIDE;
+            #pragma unroll
+            for (unsigned l0 = 0u; l0 < ((NFRAG * 16u * 36u + 255u) / 256u) * 256u; l0 += 256u) {
+                const unsigned l = l0 + tid;
+                Btile[l] = by0[l];
+            }
+            __syncthreads();
+
+            const unsigned row_base = wid * 16u;
+            // Keep the four K groups rolled. Fully unrolling this loop emits
+            // 112 WMMA instructions in the kernel body (versus 28 when rolled)
+            // and overflows the gfx12 instruction cache on the large Q4/Q5
+            // projections. The token-fragment loop below remains unrolled.
+            #pragma unroll 1
+            for (int ag = 0; ag < 4; ++ag) {
+                const unsigned g = (unsigned)ah * 4u + (unsigned)ag;
+                const unsigned wr = row_base + (lane & 15u);
+                const unsigned wk = (lane >> 4) * 4u;
+                const zinc_i32x2_t* wp = (const zinc_i32x2_t*)(Xtile + wr * X_STRIDE + g * 8u + wk);
+                const zinc_i32x2_t av0 = wp[0];
+                const zinc_i32x2_t av1 = wp[1];
+
+                #pragma unroll
+                for (unsigned jt = 0; jt < NFRAG; ++jt) {
+                    const unsigned at = jt * 16u + (lane & 15u);
+                    const unsigned ak = (lane >> 4) * 4u;
+                    const zinc_i32x2_t* bp = (const zinc_i32x2_t*)(Btile + at * B_STRIDE + 4u + (unsigned)ag * 8u + ak);
+                    const zinc_i32x2_t bv0 = bp[0];
+                    const zinc_i32x2_t bv1 = bp[1];
+                    const float2 dsB = __half22float2(Bds[at * B_STRIDE + (unsigned)ag]);
+                    zinc_i32x8_t ci = {};
+                    ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                        true, av0, true, bv0, ci, true);
+                    ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                        true, av1, true, bv1, ci, true);
+                    const int* cv = (const int*)&ci;
+                    #pragma unroll
+                    for (int l = 0; l < 8; ++l) {
+                        const unsigned ri = row_base + (lane >> 4) * 8u + (unsigned)l;
+                        const float2 dmA = __half22float2(Xdm[ri * X_STRIDE + g]);
+                        // Keep the scale and minimum terms as separate
+                        // accumulations. HIP can contract both statements to
+                        // FMAs and dual-issue the scale products on gfx12;
+                        // combining them into one expression inhibits that
+                        // contraction and costs roughly one VALU multiply per
+                        // output element.
+                        accum[jt * 8u + (unsigned)l] +=
+                            dmA.x * dsB.x * (float)cv[l];
+                        accum[jt * 8u + (unsigned)l] +=
+                            dmA.y * dsB.y;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (unsigned frag = 0; frag < NFRAG; ++frag) {
+        const unsigned tok = t0 + frag * 16u + (lane & 15u);
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const unsigned row = m0 + wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+            if (tok < pc.T) {
+                const size_t yi = (size_t)tok * pc.M + row;
+                Y[yi] = accum[frag * 8u + (unsigned)l];
+            }
+        }
+    }
+}
+
+// Q4_K-only variant that feeds each wave's weight fragment directly from the
+// packed matrix. Adjacent low/high 4-bit groups reuse the same global loads;
+// only the row scale/min pairs and activation tile occupy LDS.
+template <unsigned NFRAG>
+__device__ __forceinline__ void zinc_gemm_q4k_wmma_i8_direct(
+    const unsigned* __restrict__ a_u32, const float* __restrict__ A_unused,
+    const unsigned char* __restrict__ A_q8, float* __restrict__ Y, GemmPush pc) {
+    (void)A_unused;
+    const unsigned BM = 128u, BT = NFRAG * 16u;
+    const unsigned B_STRIDE = 36u;
+    __shared__ __align__(16) int Btile[((NFRAG * 16u * 36u + 255u) / 256u) * 256u];
+    __shared__ __align__(16) half2 Adm[BM * 8u];
+
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wid = tid >> 5;
+    const unsigned m0 = blockIdx.x * BM;
+    const unsigned token_base = pc.x_offset / (pc.K * sizeof(float));
+    const unsigned t0 = token_base + blockIdx.y * BT;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned nsuper = pc.K >> 8;
+    const unsigned a0 = pc.a_offset >> 2;
+    half2* const Bds = (half2*)Btile;
+
+    float accum[NFRAG * 8u];
+    #pragma unroll
+    for (unsigned i = 0; i < NFRAG * 8u; ++i) accum[i] = 0.0f;
+
+    using zinc_direct_i32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+    using zinc_direct_i32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+
+    const unsigned wr = wid * 16u + (lane & 15u);
+    const unsigned row = m0 + wr;
+    const unsigned wk = (lane >> 4) * 4u;
+
+    for (unsigned sb = 0; sb < nsuper; ++sb) {
+        // Two lanes per output row expand all eight (scale,-min) pairs. The
+        // shared tile remaps them to gfx12 accumulator-row ownership.
+        {
+            const unsigned sr = wid * 16u + (lane >> 1);
+            const unsigned scale_row = m0 + sr;
+            const unsigned ksc = lane & 1u;
+            if (scale_row < pc.M) {
+                const unsigned sblk = a0 + scale_row * bpr * 36u + sb * 36u;
+                const half2 dm = *(const half2*)(a_u32 + sblk);
+                const int* scale_words = (const int*)(a_u32 + sblk + 1u);
+                const int sc32 = ((scale_words[ksc + (ksc != 0u)] >>
+                    (4u * (ksc & (ksc / 2u)))) & 0x0F0F0F0F) |
+                    ((scale_words[ksc / 2u] >> (2u * (ksc & 1u))) & 0x30303030);
+                const unsigned mksc = ksc + 2u;
+                const int mn32 = ((scale_words[(mksc & 1u) + (mksc != 0u)] >>
+                    (4u * (mksc & (mksc / 2u)))) & 0x0F0F0F0F) |
+                    ((scale_words[mksc / 2u] >> (2u * (mksc & 1u))) & 0x30303030);
+                const unsigned char* sc8 = (const unsigned char*)&sc32;
+                const unsigned char* mn8 = (const unsigned char*)&mn32;
+                #pragma unroll
+                for (unsigned si = 0u; si < 4u; ++si) {
+                    Adm[sr * 8u + ksc * 4u + si] = __hmul2(
+                        dm, __floats2half2_rn((float)sc8[si], -(float)mn8[si]));
+                }
+            } else {
+                #pragma unroll
+                for (unsigned si = 0u; si < 4u; ++si)
+                    Adm[sr * 8u + ksc * 4u + si] = __floats2half2_rn(0.0f, 0.0f);
+            }
+        }
+
+        #pragma unroll
+        for (unsigned ah = 0u; ah < 2u; ++ah) {
+            const int* by0 = (const int*)A_q8 +
+                ((size_t)(sb * 2u + ah) * pc.T + t0) * B_STRIDE;
+            #pragma unroll
+            for (unsigned l0 = 0u; l0 < ((NFRAG * 16u * 36u + 255u) / 256u) * 256u; l0 += 256u) {
+                const unsigned l = l0 + tid;
+                Btile[l] = by0[l];
+            }
+            __syncthreads();
+
+            // Process low/high nibble groups together so the four packed Q4
+            // words are fetched once for both groups.
+            #pragma unroll 1
+            for (unsigned gp = 0u; gp < 2u; ++gp) {
+                const unsigned g0 = ah * 4u + gp * 2u;
+                const unsigned g1 = g0 + 1u;
+                const unsigned p = g0 * 8u + wk;
+                const unsigned src_word = (p >> 4) * 8u + (p & 7u);
+                unsigned q0 = 0u, q1 = 0u, q2 = 0u, q3 = 0u;
+                if (row < pc.M) {
+                    const unsigned blk = a0 + row * bpr * 36u + sb * 36u;
+                    q0 = a_u32[blk + 4u + src_word];
+                    q1 = a_u32[blk + 5u + src_word];
+                    q2 = a_u32[blk + 6u + src_word];
+                    q3 = a_u32[blk + 7u + src_word];
+                }
+                const zinc_direct_i32x2_t av00 = {
+                    (int)(q0 & 0x0F0F0F0Fu), (int)(q1 & 0x0F0F0F0Fu)
+                };
+                const zinc_direct_i32x2_t av01 = {
+                    (int)(q2 & 0x0F0F0F0Fu), (int)(q3 & 0x0F0F0F0Fu)
+                };
+                const zinc_direct_i32x2_t av10 = {
+                    (int)((q0 >> 4) & 0x0F0F0F0Fu), (int)((q1 >> 4) & 0x0F0F0F0Fu)
+                };
+                const zinc_direct_i32x2_t av11 = {
+                    (int)((q2 >> 4) & 0x0F0F0F0Fu), (int)((q3 >> 4) & 0x0F0F0F0Fu)
+                };
+
+                #pragma unroll
+                for (unsigned jt = 0u; jt < NFRAG; ++jt) {
+                    const unsigned at = jt * 16u + (lane & 15u);
+                    const unsigned ak = (lane >> 4) * 4u;
+                    const zinc_direct_i32x2_t* bp0 = (const zinc_direct_i32x2_t*)(
+                        Btile + at * B_STRIDE + 4u + (g0 & 3u) * 8u + ak);
+                    const zinc_direct_i32x2_t* bp1 = (const zinc_direct_i32x2_t*)(
+                        Btile + at * B_STRIDE + 4u + (g1 & 3u) * 8u + ak);
+                    zinc_direct_i32x8_t ci0 = {};
+                    zinc_direct_i32x8_t ci1 = {};
+                    ci0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, av00, true, bp0[0], ci0, true);
+                    ci0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, av01, true, bp0[1], ci0, true);
+                    ci1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, av10, true, bp1[0], ci1, true);
+                    ci1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, av11, true, bp1[1], ci1, true);
+                    const float2 ds0 = __half22float2(Bds[at * B_STRIDE + (g0 & 3u)]);
+                    const float2 ds1 = __half22float2(Bds[at * B_STRIDE + (g1 & 3u)]);
+                    const int* cv0 = (const int*)&ci0;
+                    const int* cv1 = (const int*)&ci1;
+                    #pragma unroll
+                    for (int l = 0; l < 8; ++l) {
+                        const unsigned ri = wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+                        const float2 dm0 = __half22float2(Adm[ri * 8u + g0]);
+                        const float2 dm1 = __half22float2(Adm[ri * 8u + g1]);
+                        accum[jt * 8u + (unsigned)l] += dm0.x * ds0.x * (float)cv0[l];
+                        accum[jt * 8u + (unsigned)l] += dm0.y * ds0.y;
+                        accum[jt * 8u + (unsigned)l] += dm1.x * ds1.x * (float)cv1[l];
+                        accum[jt * 8u + (unsigned)l] += dm1.y * ds1.y;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (unsigned frag = 0u; frag < NFRAG; ++frag) {
+        const unsigned tok = t0 + frag * 16u + (lane & 15u);
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const unsigned out_row = m0 + wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+            if (tok < pc.T && out_row < pc.M)
+                Y[(size_t)tok * pc.M + out_row] = accum[frag * 8u + (unsigned)l];
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_wmma_i8(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q45k_wmma_i8<false, 7u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q5k_wmma_i8(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q45k_wmma_i8<true, 7u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_wmma_i8_t48(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q45k_wmma_i8<false, 3u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_wmma_i8_t48_direct(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q4k_wmma_i8_direct<3u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q5k_wmma_i8_t48(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q45k_wmma_i8<true, 3u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_wmma_i8_t64(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q45k_wmma_i8<false, 4u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q5k_wmma_i8_t64(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q45k_wmma_i8<true, 4u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_wmma_i8_t80(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q45k_wmma_i8<false, 5u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q5k_wmma_i8_t80(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q45k_wmma_i8<true, 5u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_wmma_i8_t16(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q45k_wmma_i8<false, 1u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q5k_wmma_i8_t16(
+    const unsigned* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q45k_wmma_i8<true, 1u>(a, x, xq, y, pc);
+}
+
+// Q6_K uses a signed 6-bit value and one signed scale per 16 K values. The
+// 16-wide gfx12 WMMA form keeps those scale boundaries exact (one instruction
+// per scale), while retaining the same 128-row x 112-token output geometry.
+__device__ __forceinline__ unsigned zinc_q6_sub32x4(unsigned q) {
+    q ^= 0x20202020u;
+    const unsigned sign = q & 0x20202020u;
+    return q | (sign << 1) | (sign << 2);
+}
+
+template <unsigned NFRAG>
+__device__ __forceinline__ void zinc_gemm_q6k_wmma_i8(
+    const unsigned char* __restrict__ a, const float* __restrict__ A_unused,
+    const unsigned char* __restrict__ A_q8, float* __restrict__ Y, GemmPush pc) {
+    (void)A_unused;
+    const unsigned BM = 128u, BT = NFRAG * 16u;
+    const unsigned X_STRIDE = 76u; // 64 q words + d + 4 scale words + padding
+    const unsigned B_STRIDE = 36u;
+    __shared__ __align__(16) int Xtile[BM * X_STRIDE];
+    __shared__ __align__(16) int Btile[((NFRAG * 16u * 36u + 255u) / 256u) * 256u];
+
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wid = tid >> 5;
+    const unsigned m0 = blockIdx.x * BM;
+    const unsigned token_base = pc.x_offset / (pc.K * sizeof(float));
+    const unsigned t0 = token_base + blockIdx.y * BT;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned nsuper = pc.K >> 8;
+    float* const Xdf = (float*)(Xtile + 64u);
+    int* const Xsc = (int*)(Xdf + 1u);
+    half2* const Bds = (half2*)Btile;
+
+    float accum[NFRAG * 8u];
+    #pragma unroll
+    for (unsigned i = 0; i < NFRAG * 8u; ++i) accum[i] = 0.0f;
+
+    using zinc_i32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+    using zinc_i32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+
+    for (unsigned sb = 0; sb < nsuper; ++sb) {
+        // Expand the 4-bit low and 2-bit high planes to signed int8 lanes.
+        #pragma unroll
+        for (unsigned r0 = 0u; r0 < BM; r0 += 8u) {
+            const unsigned r = r0 + wid;
+            const unsigned row = m0 + r;
+            const unsigned char* blk = a + ((size_t)row * bpr + sb) * 210u;
+            const unsigned short* ql16 = (const unsigned short*)blk;
+            const unsigned ql = (unsigned)ql16[2u * lane] |
+                ((unsigned)ql16[2u * lane + 1u] << 16);
+            const unsigned qh_idx = 8u * (lane >> 4) + (lane & 7u);
+            const unsigned short* qh16 = (const unsigned short*)(blk + 128u);
+            const unsigned qh = (unsigned)qh16[2u * qh_idx] |
+                ((unsigned)qh16[2u * qh_idx + 1u] << 16);
+            const unsigned shift = (lane & 8u) >> 2;
+            const unsigned qh0 = ((qh >> shift) << 4) & 0x30303030u;
+            const unsigned qh1 = (qh >> shift) & 0x30303030u;
+            const unsigned kq0 = 2u * lane - (lane & 15u);
+            Xtile[r * X_STRIDE + kq0] = (int)zinc_q6_sub32x4((ql & 0x0F0F0F0Fu) | qh0);
+            Xtile[r * X_STRIDE + kq0 + 16u] = (int)zinc_q6_sub32x4(((ql >> 4) & 0x0F0F0F0Fu) | qh1);
+        }
+
+        // Native half conversion for the superblock multiplier.
+        if (tid < BM) {
+            const unsigned row = m0 + tid;
+            const unsigned char* blk = a + ((size_t)row * bpr + sb) * 210u;
+            Xdf[tid * X_STRIDE] = __half2float(*(const half*)(blk + 208u));
+        }
+
+        // Four packed int32 values contain the sixteen signed group scales.
+        #pragma unroll
+        for (unsigned r0 = 0u; r0 < BM; r0 += 64u) {
+            const unsigned r = r0 + wid * 8u + (lane >> 2);
+            const unsigned row = m0 + r;
+            const unsigned sk = lane & 3u;
+            const unsigned char* blk = a + ((size_t)row * bpr + sb) * 210u;
+            const unsigned short* sc16 = (const unsigned short*)(blk + 192u);
+            Xsc[r * X_STRIDE + sk] = (int)((unsigned)sc16[2u * sk] |
+                ((unsigned)sc16[2u * sk + 1u] << 16));
+        }
+
+        #pragma unroll
+        for (int ah = 0; ah < 2; ++ah) {
+            const int* by0 = (const int*)A_q8 +
+                ((size_t)(sb * 2u + (unsigned)ah) * pc.T + t0) * B_STRIDE;
+            #pragma unroll
+            for (unsigned l0 = 0u; l0 < ((NFRAG * 16u * 36u + 255u) / 256u) * 256u; l0 += 256u)
+                Btile[l0 + tid] = by0[l0 + tid];
+            __syncthreads();
+
+            const unsigned row_base = wid * 16u;
+            #pragma unroll
+            for (int kg = 0; kg < 8; ++kg) {
+                const unsigned g16 = (unsigned)ah * 8u + (unsigned)kg;
+                const unsigned ag = (unsigned)kg >> 1;
+                const unsigned khalf = (unsigned)kg & 1u;
+                const unsigned wr = row_base + (lane & 15u);
+                const unsigned wk = (lane >> 4) * 2u;
+                const zinc_i32x2_t av = *(const zinc_i32x2_t*)(
+                    Xtile + wr * X_STRIDE + g16 * 4u + wk);
+
+                #pragma unroll
+                for (unsigned jt = 0; jt < NFRAG; ++jt) {
+                    const unsigned at = jt * 16u + (lane & 15u);
+                    const unsigned ak = (lane >> 4) * 2u;
+                    const zinc_i32x2_t bv = *(const zinc_i32x2_t*)(Btile +
+                        at * B_STRIDE + 4u + ag * 8u + khalf * 4u + ak);
+                    const float dB = __half2float(__low2half(Bds[at * B_STRIDE + ag]));
+                    zinc_i32x8_t ci = {};
+                    ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                        true, av, true, bv, ci, false);
+                    const int* cv = (const int*)&ci;
+                    #pragma unroll
+                    for (int l = 0; l < 8; ++l) {
+                        const unsigned ri = row_base + (lane >> 4) * 8u + (unsigned)l;
+                        const signed char* scales = (const signed char*)(Xsc + ri * X_STRIDE);
+                        accum[jt * 8u + (unsigned)l] +=
+                            (float)cv[l] * (float)scales[g16] * Xdf[ri * X_STRIDE] * dB;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (unsigned frag = 0; frag < NFRAG; ++frag) {
+        const unsigned tok = t0 + frag * 16u + (lane & 15u);
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const unsigned row = m0 + wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+            if (tok < pc.T) Y[(size_t)tok * pc.M + row] = accum[frag * 8u + (unsigned)l];
+        }
+    }
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q6k_wmma_i8(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q6k_wmma_i8<7u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q6k_wmma_i8_t48(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q6k_wmma_i8<3u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q6k_wmma_i8_t64(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q6k_wmma_i8<4u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q6k_wmma_i8_t80(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q6k_wmma_i8<5u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q6k_wmma_i8_t16(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q6k_wmma_i8<1u>(a, x, xq, y, pc);
+}
+
+// Q8_0 weights are already signed int8. Pair them directly with the Q8_1
+// activation tile and keep only the per-32-value d multipliers around WMMA.
+template <unsigned NFRAG, unsigned BM = 128u>
+__device__ __forceinline__ void zinc_gemm_q8_0_wmma_i8(
+    const unsigned char* __restrict__ a, const float* __restrict__ A_unused,
+    const unsigned char* __restrict__ A_q8, float* __restrict__ Y, GemmPush pc) {
+    (void)A_unused;
+    const unsigned BT = NFRAG * 16u;
+    const unsigned NWARP = BM / 16u;
+    const unsigned X_STRIDE = 36u;
+    const unsigned B_STRIDE = 36u;
+    __shared__ __align__(16) int Xtile[BM * X_STRIDE];
+    __shared__ __align__(16) int Btile[BT * B_STRIDE];
+
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wid = tid >> 5;
+    const unsigned m0 = blockIdx.x * BM;
+    const unsigned token_base = pc.x_offset / (pc.K * sizeof(float));
+    const unsigned t0 = token_base + blockIdx.y * BT;
+    const unsigned blocks_per_row = pc.K >> 5;
+    const unsigned nsuper = pc.K >> 7;
+    const unsigned char* const a0 = a + pc.a_offset;
+    float* const Xdf = (float*)(Xtile + 32u);
+    half2* const Bds = (half2*)Btile;
+
+    float accum[NFRAG * 8u];
+    #pragma unroll
+    for (unsigned i = 0; i < NFRAG * 8u; ++i) accum[i] = 0.0f;
+
+    using zinc_q8_i32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+    using zinc_q8_i32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+
+    for (unsigned sb = 0; sb < nsuper; ++sb) {
+        #pragma unroll
+        for (unsigned r0 = 0u; r0 < BM; r0 += NWARP) {
+            const unsigned r = r0 + wid;
+            const unsigned row = m0 + r;
+            if (lane < 8u) {
+                #pragma unroll
+                for (unsigned g = 0u; g < 4u; ++g) {
+                    int q = 0;
+                    if (row < pc.M) {
+                        const unsigned char* blk = a0 +
+                            ((size_t)row * blocks_per_row + sb * 4u + g) * 34u;
+                        q = *(const int*)(blk + 2u + lane * 4u);
+                    }
+                    Xtile[r * X_STRIDE + g * 8u + lane] = q;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (unsigned r0 = 0u; r0 < BM; r0 += NWARP * 8u) {
+            const unsigned r = r0 + wid * 8u + (lane >> 2);
+            const unsigned row = m0 + r;
+            const unsigned g = lane & 3u;
+            Xdf[r * X_STRIDE + g] = row < pc.M
+                ? __half2float(*(const half*)(a0 + ((size_t)row * blocks_per_row + sb * 4u + g) * 34u))
+                : 0.0f;
+        }
+
+        #pragma unroll
+        for (unsigned l0 = 0u; l0 < BT * B_STRIDE; l0 += blockDim.x) {
+            const unsigned l = l0 + tid;
+            if (l < BT * B_STRIDE) {
+                const unsigned local_t = l / B_STRIDE;
+                const unsigned word = l - local_t * B_STRIDE;
+                const unsigned tok = t0 + local_t;
+                if (tok < pc.T) {
+                    const int* src = (const int*)A_q8 + ((size_t)sb * pc.T + tok) * B_STRIDE;
+                    Btile[l] = src[word];
+                } else {
+                    Btile[l] = 0;
+                }
+            }
+        }
+        __syncthreads();
+
+        const unsigned row_base = wid * 16u;
+        #pragma unroll
+        for (unsigned g = 0u; g < 4u; ++g) {
+            const unsigned wr = row_base + (lane & 15u);
+            const unsigned wk = (lane >> 4) * 2u;
+            #pragma unroll
+            for (unsigned jt = 0; jt < NFRAG; ++jt) {
+                const unsigned at = jt * 16u + (lane & 15u);
+                const unsigned ak = (lane >> 4) * 2u;
+                zinc_q8_i32x8_t ci = {};
+                #pragma unroll
+                for (unsigned kh = 0u; kh < 2u; ++kh) {
+                    const zinc_q8_i32x2_t av = *(const zinc_q8_i32x2_t*)(
+                        Xtile + wr * X_STRIDE + g * 8u + kh * 4u + wk);
+                    const zinc_q8_i32x2_t bv = *(const zinc_q8_i32x2_t*)(
+                        Btile + at * B_STRIDE + 4u + g * 8u + kh * 4u + ak);
+                    ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                        true, av, true, bv, ci, true);
+                }
+                const float dB = __half2float(__low2half(Bds[at * B_STRIDE + g]));
+                const int* cv = (const int*)&ci;
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const unsigned ri = row_base + (lane >> 4) * 8u + (unsigned)l;
+                    accum[jt * 8u + (unsigned)l] +=
+                        (float)cv[l] * Xdf[ri * X_STRIDE + g] * dB;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (unsigned frag = 0; frag < NFRAG; ++frag) {
+        const unsigned tok = t0 + frag * 16u + (lane & 15u);
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const unsigned row = m0 + wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+            if (tok < pc.T && row < pc.M)
+                Y[(size_t)tok * pc.M + row] = accum[frag * 8u + (unsigned)l];
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q8_0_wmma_i8(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q8_0_wmma_i8<7u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q8_0_wmma_i8_t48(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q8_0_wmma_i8<3u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q8_0_wmma_i8_t64(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q8_0_wmma_i8<4u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(128, 4) void gemm_q8_0_wmma_i8_t64_m64(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q8_0_wmma_i8<4u, 64u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(64, 8) void gemm_q8_0_wmma_i8_t64_m32(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q8_0_wmma_i8<4u, 32u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q8_0_wmma_i8_t80(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q8_0_wmma_i8<5u>(a, x, xq, y, pc);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q8_0_wmma_i8_t16(
+    const unsigned char* a, const float* x, const unsigned char* xq, float* y, GemmPush pc) {
+    zinc_gemm_q8_0_wmma_i8<1u>(a, x, xq, y, pc);
+}
+#else
+extern "C" __global__ void gemm_q4k_wmma_i8() {}
+extern "C" __global__ void gemm_q5k_wmma_i8() {}
+extern "C" __global__ void gemm_q6k_wmma_i8() {}
+extern "C" __global__ void gemm_q4k_wmma_i8_t48() {}
+extern "C" __global__ void gemm_q4k_wmma_i8_t48_direct() {}
+extern "C" __global__ void gemm_q5k_wmma_i8_t48() {}
+extern "C" __global__ void gemm_q6k_wmma_i8_t48() {}
+extern "C" __global__ void gemm_q4k_wmma_i8_t64() {}
+extern "C" __global__ void gemm_q5k_wmma_i8_t64() {}
+extern "C" __global__ void gemm_q6k_wmma_i8_t64() {}
+extern "C" __global__ void gemm_q4k_wmma_i8_t80() {}
+extern "C" __global__ void gemm_q5k_wmma_i8_t80() {}
+extern "C" __global__ void gemm_q6k_wmma_i8_t80() {}
+extern "C" __global__ void gemm_q4k_wmma_i8_t16() {}
+extern "C" __global__ void gemm_q5k_wmma_i8_t16() {}
+extern "C" __global__ void gemm_q6k_wmma_i8_t16() {}
+extern "C" __global__ void gemm_q8_0_wmma_i8() {}
+extern "C" __global__ void gemm_q8_0_wmma_i8_t48() {}
+extern "C" __global__ void gemm_q8_0_wmma_i8_t64() {}
+extern "C" __global__ void gemm_q8_0_wmma_i8_t64_m64() {}
+extern "C" __global__ void gemm_q8_0_wmma_i8_t64_m32() {}
+extern "C" __global__ void gemm_q8_0_wmma_i8_t80() {}
+extern "C" __global__ void gemm_q8_0_wmma_i8_t16() {}
+#endif
+
+// ---- grouped gfx12 Q4_K/Q5_K x Q8_1 expert GEMM --------------------------
+// One block handles a 128-row x 64-route tile for one expert selected by
+// build_expert_order_padded. Activations are quantized once per source token;
+// the padded order gathers them into LDS and scatters results back to the
+// original (token, route-slot) layout. This is the ROCm counterpart of the
+// CUDA grouped fp16-WMMA path above.
+// route_stride=0 addresses one activation per source token (gate/up). A nonzero
+// route_stride addresses one activation per routed (token,slot) row (down).
+struct GroupedI8Push { unsigned M, K, T, base, expert_stride, dst_tok_stride, route_stride; };
+#ifdef ZINC_ROCM
+template <bool Q5, unsigned NFRAG, unsigned BM = 128u>
+__device__ __forceinline__ void zinc_gemm_q45k_experts_grouped_i8(
+    const unsigned* __restrict__ a_u32,
+    const unsigned char* __restrict__ A_q8,
+    const unsigned* __restrict__ order,
+    const unsigned* __restrict__ tile_expert,
+    float* __restrict__ Y,
+    GroupedI8Push pc) {
+    const unsigned BT = NFRAG * 16u;
+    const unsigned NWARP = BM / 16u;
+    const unsigned X_STRIDE = 76u;
+    const unsigned B_STRIDE = 36u;
+    const unsigned BLOCK_WORDS = Q5 ? 44u : 36u;
+    const unsigned INV = 0xFFFFFFFFu;
+    __shared__ __align__(16) int Xtile[BM * X_STRIDE];
+    __shared__ __align__(16) int Btile[BT * B_STRIDE];
+
+    const unsigned expert = tile_expert[blockIdx.y];
+    if (expert == INV) return;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wid = tid >> 5;
+    const unsigned m0 = blockIdx.x * BM;
+    const unsigned t0 = blockIdx.y * BT;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned nsuper = pc.K >> 8;
+    const unsigned a0 = (unsigned)(((size_t)expert * pc.expert_stride + pc.base) >> 2);
+
+    float accum[NFRAG * 8u];
+    #pragma unroll
+    for (unsigned i = 0; i < NFRAG * 8u; ++i) accum[i] = 0.0f;
+
+    using zinc_group_i32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+    using zinc_group_i32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+    half2* const Xdm = (half2*)(Xtile + 64u);
+    half2* const Bds = (half2*)Btile;
+
+    for (unsigned sb = 0; sb < nsuper; ++sb) {
+        #pragma unroll
+        for (unsigned r0 = 0u; r0 < BM; r0 += NWARP) {
+            const unsigned r = r0 + wid;
+            const unsigned row = m0 + r;
+            const unsigned xi = r * X_STRIDE + 16u * (lane >> 3) + (lane & 7u);
+            if (row < pc.M) {
+                const unsigned blk = a0 + row * bpr * BLOCK_WORDS + sb * BLOCK_WORDS;
+                if constexpr (!Q5) {
+                    const unsigned qs4 = a_u32[blk + 4u + lane];
+                    Xtile[xi] = (int)(qs4 & 0x0F0F0F0Fu);
+                    Xtile[xi + 8u] = (int)((qs4 >> 4) & 0x0F0F0F0Fu);
+                } else {
+                    const unsigned ql = a_u32[blk + 12u + lane];
+                    const unsigned qli0 = ql & 0x0F0F0F0Fu;
+                    const unsigned qli1 = (ql >> 4) & 0x0F0F0F0Fu;
+                    const unsigned qhi = a_u32[blk + 4u + (lane & 7u)];
+                    const unsigned qh0 = ((qhi >> (2u * (lane >> 3))) << 4) & 0x10101010u;
+                    const unsigned qh1 = ((qhi >> (2u * (lane >> 3) + 1u)) << 4) & 0x10101010u;
+                    const unsigned ky = 2u * lane;
+                    const unsigned kq0 = ky - (ky & 15u) + (lane & 7u);
+                    Xtile[r * X_STRIDE + kq0] = (int)(qli0 | qh0);
+                    Xtile[r * X_STRIDE + kq0 + 8u] = (int)(qli1 | qh1);
+                }
+            } else {
+                Xtile[xi] = 0;
+                Xtile[xi + 8u] = 0;
+            }
+        }
+
+        {
+            const unsigned r = wid * 16u + (lane >> 1);
+            const unsigned row = m0 + r;
+            const unsigned ksc = lane & 1u;
+            if (row < pc.M) {
+                const unsigned blk = a0 + row * bpr * BLOCK_WORDS + sb * BLOCK_WORDS;
+                const half2 dm = *(const half2*)(a_u32 + blk);
+                const int* scales = (const int*)(a_u32 + blk + 1u);
+                const int sc32 = ((scales[ksc + (ksc != 0u)] >> (4u * (ksc & (ksc / 2u)))) & 0x0F0F0F0F) |
+                    ((scales[ksc / 2u] >> (2u * (ksc & 1u))) & 0x30303030);
+                const unsigned mksc = ksc + 2u;
+                const int mn32 = ((scales[(mksc & 1u) + (mksc != 0u)] >> (4u * (mksc & (mksc / 2u)))) & 0x0F0F0F0F) |
+                    ((scales[mksc / 2u] >> (2u * (mksc & 1u))) & 0x30303030);
+                const unsigned char* sc8 = (const unsigned char*)&sc32;
+                const unsigned char* mn8 = (const unsigned char*)&mn32;
+                #pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    Xdm[r * X_STRIDE + 4u * ksc + (unsigned)l] = __hmul2(
+                        dm, __floats2half2_rn((float)sc8[l], -(float)mn8[l]));
+                }
+            } else {
+                #pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    Xdm[r * X_STRIDE + 4u * ksc + (unsigned)l] = __floats2half2_rn(0.0f, 0.0f);
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int ah = 0; ah < 2; ++ah) {
+            #pragma unroll
+            for (unsigned l0 = 0u; l0 < BT * B_STRIDE; l0 += blockDim.x) {
+                const unsigned l = l0 + tid;
+                if (l < BT * B_STRIDE) {
+                    const unsigned local_t = l / B_STRIDE;
+                    const unsigned word = l - local_t * B_STRIDE;
+                    const unsigned packed = order[t0 + local_t];
+                    if (packed != INV) {
+                        const unsigned tok = packed >> 16;
+                        const unsigned slot = packed & 0xFFFFu;
+                        const unsigned src_row = pc.route_stride != 0u ? tok * pc.route_stride + slot : tok;
+                        const int* src = (const int*)A_q8 +
+                            ((size_t)(sb * 2u + (unsigned)ah) * pc.T + src_row) * B_STRIDE;
+                        Btile[l] = src[word];
+                    } else {
+                        Btile[l] = 0;
+                    }
+                }
+            }
+            __syncthreads();
+
+            const unsigned row_base = wid * 16u;
+            #pragma unroll 1
+            for (int ag = 0; ag < 4; ++ag) {
+                const unsigned g = (unsigned)ah * 4u + (unsigned)ag;
+                const unsigned wr = row_base + (lane & 15u);
+                const unsigned wk = (lane >> 4) * 4u;
+                const zinc_group_i32x2_t* wp = (const zinc_group_i32x2_t*)(Xtile + wr * X_STRIDE + g * 8u + wk);
+                const zinc_group_i32x2_t av0 = wp[0];
+                const zinc_group_i32x2_t av1 = wp[1];
+
+                #pragma unroll
+                for (unsigned jt = 0; jt < NFRAG; ++jt) {
+                    const unsigned at = jt * 16u + (lane & 15u);
+                    const unsigned ak = (lane >> 4) * 4u;
+                    const zinc_group_i32x2_t* bp = (const zinc_group_i32x2_t*)(Btile + at * B_STRIDE + 4u + (unsigned)ag * 8u + ak);
+                    const zinc_group_i32x2_t bv0 = bp[0];
+                    const zinc_group_i32x2_t bv1 = bp[1];
+                    const float2 dsB = __half22float2(Bds[at * B_STRIDE + (unsigned)ag]);
+                    zinc_group_i32x8_t ci = {};
+                    ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, av0, true, bv0, ci, true);
+                    ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, av1, true, bv1, ci, true);
+                    const int* cv = (const int*)&ci;
+                    #pragma unroll
+                    for (int l = 0; l < 8; ++l) {
+                        const unsigned ri = row_base + (lane >> 4) * 8u + (unsigned)l;
+                        const float2 dmA = __half22float2(Xdm[ri * X_STRIDE + g]);
+                        accum[jt * 8u + (unsigned)l] += dmA.x * dsB.x * (float)cv[l];
+                        accum[jt * 8u + (unsigned)l] += dmA.y * dsB.y;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (unsigned frag = 0; frag < NFRAG; ++frag) {
+        const unsigned local_t = frag * 16u + (lane & 15u);
+        const unsigned packed = order[t0 + local_t];
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const unsigned row = m0 + wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+            if (packed != INV && row < pc.M) {
+                const unsigned tok = packed >> 16;
+                const unsigned slot = packed & 0xFFFFu;
+                Y[(size_t)tok * pc.dst_tok_stride + (size_t)slot * pc.M + row] =
+                    accum[frag * 8u + (unsigned)l];
+            }
+        }
+    }
+}
+
+// Q4_K short-route variant that keeps the weight fragment in registers instead
+// of staging the entire 128 x 76-word tile in LDS. The activation tile remains
+// shared because every output-row warp consumes it; row scales stay in a small
+// shared tile because WMMA accumulator lanes do not own their input-fragment row.
+// On gfx12 this cuts LDS from about 41 KiB to 6.25 KiB.
+template <unsigned NFRAG>
+__device__ __forceinline__ void zinc_gemm_q4k_experts_grouped_i8_direct(
+    const unsigned* __restrict__ a_u32,
+    const unsigned char* __restrict__ A_q8,
+    const unsigned* __restrict__ order,
+    const unsigned* __restrict__ tile_expert,
+    float* __restrict__ Y,
+    GroupedI8Push pc) {
+    constexpr unsigned BM = 128u;
+    const unsigned BT = NFRAG * 16u;
+    const unsigned B_STRIDE = 36u;
+    const unsigned INV = 0xFFFFFFFFu;
+    __shared__ __align__(16) int Btile[BT * B_STRIDE];
+    __shared__ __align__(16) half2 Adm[BM * 8u];
+
+    const unsigned expert = tile_expert[blockIdx.y];
+    if (expert == INV) return;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wid = tid >> 5;
+    const unsigned m0 = blockIdx.x * BM;
+    const unsigned t0 = blockIdx.y * BT;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned nsuper = pc.K >> 8;
+    const unsigned a0 = (unsigned)(((size_t)expert * pc.expert_stride + pc.base) >> 2);
+    half2* const Bds = (half2*)Btile;
+
+    float accum[NFRAG * 8u];
+    #pragma unroll
+    for (unsigned i = 0; i < NFRAG * 8u; ++i) accum[i] = 0.0f;
+
+    using zinc_direct_i32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+    using zinc_direct_i32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+
+    const unsigned wr = wid * 16u + (lane & 15u);
+    const unsigned row = m0 + wr;
+    const unsigned wk = (lane >> 4) * 4u;
+
+    for (unsigned sb = 0; sb < nsuper; ++sb) {
+        const unsigned blk = a0 + row * bpr * 36u + sb * 36u;
+
+        // Two lanes per output row expand the eight (scale,-min) pairs. These
+        // are consumed according to accumulator-row ownership after WMMA.
+        {
+            const unsigned sr = wid * 16u + (lane >> 1);
+            const unsigned scale_row = m0 + sr;
+            const unsigned ksc = lane & 1u;
+            if (scale_row < pc.M) {
+                const unsigned sblk = a0 + scale_row * bpr * 36u + sb * 36u;
+                const half2 dm = *(const half2*)(a_u32 + sblk);
+                const int* scale_words = (const int*)(a_u32 + sblk + 1u);
+                const int sc32 = ((scale_words[ksc + (ksc != 0u)] >>
+                    (4u * (ksc & (ksc / 2u)))) & 0x0F0F0F0F) |
+                    ((scale_words[ksc / 2u] >> (2u * (ksc & 1u))) & 0x30303030);
+                const unsigned mksc = ksc + 2u;
+                const int mn32 = ((scale_words[(mksc & 1u) + (mksc != 0u)] >>
+                    (4u * (mksc & (mksc / 2u)))) & 0x0F0F0F0F) |
+                    ((scale_words[mksc / 2u] >> (2u * (mksc & 1u))) & 0x30303030);
+                const unsigned char* sc8 = (const unsigned char*)&sc32;
+                const unsigned char* mn8 = (const unsigned char*)&mn32;
+                #pragma unroll
+                for (unsigned si = 0u; si < 4u; ++si) {
+                    Adm[sr * 8u + ksc * 4u + si] = __hmul2(
+                        dm, __floats2half2_rn((float)sc8[si], -(float)mn8[si]));
+                }
+            } else {
+                #pragma unroll
+                for (unsigned si = 0u; si < 4u; ++si)
+                    Adm[sr * 8u + ksc * 4u + si] = __floats2half2_rn(0.0f, 0.0f);
+            }
+        }
+
+        #pragma unroll
+        for (int ah = 0; ah < 2; ++ah) {
+            #pragma unroll
+            for (unsigned l0 = 0u; l0 < BT * B_STRIDE; l0 += blockDim.x) {
+                const unsigned l = l0 + tid;
+                if (l < BT * B_STRIDE) {
+                    const unsigned local_t = l / B_STRIDE;
+                    const unsigned word = l - local_t * B_STRIDE;
+                    const unsigned packed = order[t0 + local_t];
+                    if (packed != INV) {
+                        const unsigned tok = packed >> 16;
+                        const unsigned slot = packed & 0xFFFFu;
+                        const unsigned src_row = pc.route_stride != 0u ? tok * pc.route_stride + slot : tok;
+                        const int* src = (const int*)A_q8 +
+                            ((size_t)(sb * 2u + (unsigned)ah) * pc.T + src_row) * B_STRIDE;
+                        Btile[l] = src[word];
+                    } else {
+                        Btile[l] = 0;
+                    }
+                }
+            }
+            __syncthreads();
+
+            #pragma unroll 1
+            for (int ag = 0; ag < 4; ++ag) {
+                const unsigned g = (unsigned)ah * 4u + (unsigned)ag;
+                const unsigned p = g * 8u + wk;
+                const unsigned src_word = (p >> 4) * 8u + (p & 7u);
+                const bool high = (p & 8u) != 0u;
+                unsigned q0 = 0u, q1 = 0u, q2 = 0u, q3 = 0u;
+                if (row < pc.M) {
+                    q0 = a_u32[blk + 4u + src_word];
+                    q1 = a_u32[blk + 5u + src_word];
+                    q2 = a_u32[blk + 6u + src_word];
+                    q3 = a_u32[blk + 7u + src_word];
+                }
+                if (high) {
+                    q0 >>= 4; q1 >>= 4; q2 >>= 4; q3 >>= 4;
+                }
+                const zinc_direct_i32x2_t av0 = {
+                    (int)(q0 & 0x0F0F0F0Fu), (int)(q1 & 0x0F0F0F0Fu)
+                };
+                const zinc_direct_i32x2_t av1 = {
+                    (int)(q2 & 0x0F0F0F0Fu), (int)(q3 & 0x0F0F0F0Fu)
+                };
+                #pragma unroll
+                for (unsigned jt = 0; jt < NFRAG; ++jt) {
+                    const unsigned at = jt * 16u + (lane & 15u);
+                    const unsigned ak = (lane >> 4) * 4u;
+                    const zinc_direct_i32x2_t* bp = (const zinc_direct_i32x2_t*)(
+                        Btile + at * B_STRIDE + 4u + (unsigned)ag * 8u + ak);
+                    const zinc_direct_i32x2_t bv0 = bp[0];
+                    const zinc_direct_i32x2_t bv1 = bp[1];
+                    const float2 dsB = __half22float2(Bds[at * B_STRIDE + (unsigned)ag]);
+                    zinc_direct_i32x8_t ci = {};
+                    ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, av0, true, bv0, ci, true);
+                    ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, av1, true, bv1, ci, true);
+                    const int* cv = (const int*)&ci;
+                    #pragma unroll
+                    for (int l = 0; l < 8; ++l) {
+                        const unsigned ri = wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+                        const float2 dmA = __half22float2(Adm[ri * 8u + g]);
+                        accum[jt * 8u + (unsigned)l] += dmA.x * dsB.x * (float)cv[l];
+                        accum[jt * 8u + (unsigned)l] += dmA.y * dsB.y;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (unsigned frag = 0; frag < NFRAG; ++frag) {
+        const unsigned local_t = frag * 16u + (lane & 15u);
+        const unsigned packed = order[t0 + local_t];
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const unsigned out_row = m0 + wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+            if (packed != INV && out_row < pc.M) {
+                const unsigned tok = packed >> 16;
+                const unsigned slot = packed & 0xFFFFu;
+                Y[(size_t)tok * pc.dst_tok_stride + (size_t)slot * pc.M + out_row] =
+                    accum[frag * 8u + (unsigned)l];
+            }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_experts_grouped_i8(
+    const unsigned* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q45k_experts_grouped_i8<false, 4u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_experts_grouped_i8_direct(
+    const unsigned* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q4k_experts_grouped_i8_direct<4u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_experts_grouped_i8_t16(
+    const unsigned* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q45k_experts_grouped_i8<false, 1u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q4k_experts_grouped_i8_t16_direct(
+    const unsigned* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q4k_experts_grouped_i8_direct<1u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(128, 4) void gemm_q4k_experts_grouped_i8_t16_m64(
+    const unsigned* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q45k_experts_grouped_i8<false, 1u, 64u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(64, 8) void gemm_q4k_experts_grouped_i8_t16_m32(
+    const unsigned* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q45k_experts_grouped_i8<false, 1u, 32u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q5k_experts_grouped_i8(
+    const unsigned* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q45k_experts_grouped_i8<true, 4u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q5k_experts_grouped_i8_t16(
+    const unsigned* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q45k_experts_grouped_i8<true, 1u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(64, 8) void gemm_q5k_experts_grouped_i8_t16_m32(
+    const unsigned* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q45k_experts_grouped_i8<true, 1u, 32u>(a, xq, order, tile_expert, y, pc);
+}
+
+template <unsigned NFRAG, unsigned BM = 128u>
+__device__ __forceinline__ void zinc_gemm_q6k_experts_grouped_i8(
+    const unsigned char* __restrict__ a,
+    const unsigned char* __restrict__ A_q8,
+    const unsigned* __restrict__ order,
+    const unsigned* __restrict__ tile_expert,
+    float* __restrict__ Y,
+    GroupedI8Push pc) {
+    const unsigned BT = NFRAG * 16u;
+    const unsigned NWARP = BM / 16u;
+    const unsigned X_STRIDE = 76u;
+    const unsigned B_STRIDE = 36u;
+    const unsigned INV = 0xFFFFFFFFu;
+    __shared__ __align__(16) int Xtile[BM * X_STRIDE];
+    __shared__ __align__(16) int Btile[BT * B_STRIDE];
+
+    const unsigned expert = tile_expert[blockIdx.y];
+    if (expert == INV) return;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wid = tid >> 5;
+    const unsigned m0 = blockIdx.x * BM;
+    const unsigned t0 = blockIdx.y * BT;
+    const unsigned bpr = pc.K >> 8;
+    const unsigned nsuper = pc.K >> 8;
+    const unsigned char* const a0 = a + (size_t)expert * pc.expert_stride + pc.base;
+    float* const Xdf = (float*)(Xtile + 64u);
+    int* const Xsc = (int*)(Xdf + 1u);
+    half2* const Bds = (half2*)Btile;
+
+    float accum[NFRAG * 8u];
+    #pragma unroll
+    for (unsigned i = 0; i < NFRAG * 8u; ++i) accum[i] = 0.0f;
+
+    using zinc_group_q6_i32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+    using zinc_group_q6_i32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+
+    for (unsigned sb = 0; sb < nsuper; ++sb) {
+        #pragma unroll
+        for (unsigned r0 = 0u; r0 < BM; r0 += NWARP) {
+            const unsigned r = r0 + wid;
+            const unsigned row = m0 + r;
+            const unsigned kq0 = 2u * lane - (lane & 15u);
+            if (row < pc.M) {
+                const unsigned char* blk = a0 + ((size_t)row * bpr + sb) * 210u;
+                const unsigned short* ql16 = (const unsigned short*)blk;
+                const unsigned ql = (unsigned)ql16[2u * lane] |
+                    ((unsigned)ql16[2u * lane + 1u] << 16);
+                const unsigned qh_idx = 8u * (lane >> 4) + (lane & 7u);
+                const unsigned short* qh16 = (const unsigned short*)(blk + 128u);
+                const unsigned qh = (unsigned)qh16[2u * qh_idx] |
+                    ((unsigned)qh16[2u * qh_idx + 1u] << 16);
+                const unsigned shift = (lane & 8u) >> 2;
+                const unsigned qh0 = ((qh >> shift) << 4) & 0x30303030u;
+                const unsigned qh1 = (qh >> shift) & 0x30303030u;
+                Xtile[r * X_STRIDE + kq0] = (int)zinc_q6_sub32x4((ql & 0x0F0F0F0Fu) | qh0);
+                Xtile[r * X_STRIDE + kq0 + 16u] = (int)zinc_q6_sub32x4(((ql >> 4) & 0x0F0F0F0Fu) | qh1);
+            } else {
+                Xtile[r * X_STRIDE + kq0] = 0;
+                Xtile[r * X_STRIDE + kq0 + 16u] = 0;
+            }
+        }
+
+        if (tid < BM) {
+            const unsigned row = m0 + tid;
+            Xdf[tid * X_STRIDE] = row < pc.M
+                ? __half2float(*(const half*)(a0 + ((size_t)row * bpr + sb) * 210u + 208u))
+                : 0.0f;
+        }
+
+        #pragma unroll
+        for (unsigned r0 = 0u; r0 < BM; r0 += NWARP * 8u) {
+            const unsigned r = r0 + wid * 8u + (lane >> 2);
+            const unsigned row = m0 + r;
+            const unsigned sk = lane & 3u;
+            if (row < pc.M) {
+                const unsigned char* blk = a0 + ((size_t)row * bpr + sb) * 210u;
+                const unsigned short* sc16 = (const unsigned short*)(blk + 192u);
+                Xsc[r * X_STRIDE + sk] = (int)((unsigned)sc16[2u * sk] |
+                    ((unsigned)sc16[2u * sk + 1u] << 16));
+            } else {
+                Xsc[r * X_STRIDE + sk] = 0;
+            }
+        }
+
+        #pragma unroll
+        for (int ah = 0; ah < 2; ++ah) {
+            #pragma unroll
+            for (unsigned l0 = 0u; l0 < BT * B_STRIDE; l0 += blockDim.x) {
+                const unsigned l = l0 + tid;
+                if (l < BT * B_STRIDE) {
+                    const unsigned local_t = l / B_STRIDE;
+                    const unsigned word = l - local_t * B_STRIDE;
+                    const unsigned packed = order[t0 + local_t];
+                    if (packed != INV) {
+                        const unsigned tok = packed >> 16;
+                        const unsigned slot = packed & 0xFFFFu;
+                        const unsigned src_row = pc.route_stride != 0u ? tok * pc.route_stride + slot : tok;
+                        const int* src = (const int*)A_q8 +
+                            ((size_t)(sb * 2u + (unsigned)ah) * pc.T + src_row) * B_STRIDE;
+                        Btile[l] = src[word];
+                    } else {
+                        Btile[l] = 0;
+                    }
+                }
+            }
+            __syncthreads();
+
+            const unsigned row_base = wid * 16u;
+            #pragma unroll
+            for (int kg = 0; kg < 8; ++kg) {
+                const unsigned g16 = (unsigned)ah * 8u + (unsigned)kg;
+                const unsigned ag = (unsigned)kg >> 1;
+                const unsigned khalf = (unsigned)kg & 1u;
+                const unsigned wr = row_base + (lane & 15u);
+                const unsigned wk = (lane >> 4) * 2u;
+                const zinc_group_q6_i32x2_t av = *(const zinc_group_q6_i32x2_t*)(
+                    Xtile + wr * X_STRIDE + g16 * 4u + wk);
+
+                #pragma unroll
+                for (unsigned jt = 0; jt < NFRAG; ++jt) {
+                    const unsigned at = jt * 16u + (lane & 15u);
+                    const unsigned ak = (lane >> 4) * 2u;
+                    const zinc_group_q6_i32x2_t bv = *(const zinc_group_q6_i32x2_t*)(Btile +
+                        at * B_STRIDE + 4u + ag * 8u + khalf * 4u + ak);
+                    const float dB = __half2float(__low2half(Bds[at * B_STRIDE + ag]));
+                    zinc_group_q6_i32x8_t ci = {};
+                    ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                        true, av, true, bv, ci, false);
+                    const int* cv = (const int*)&ci;
+                    #pragma unroll
+                    for (int l = 0; l < 8; ++l) {
+                        const unsigned ri = row_base + (lane >> 4) * 8u + (unsigned)l;
+                        const signed char* scales = (const signed char*)(Xsc + ri * X_STRIDE);
+                        accum[jt * 8u + (unsigned)l] +=
+                            (float)cv[l] * (float)scales[g16] * Xdf[ri * X_STRIDE] * dB;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (unsigned frag = 0; frag < NFRAG; ++frag) {
+        const unsigned local_t = frag * 16u + (lane & 15u);
+        const unsigned packed = order[t0 + local_t];
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const unsigned row = m0 + wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+            if (packed != INV && row < pc.M) {
+                const unsigned tok = packed >> 16;
+                const unsigned slot = packed & 0xFFFFu;
+                Y[(size_t)tok * pc.dst_tok_stride + (size_t)slot * pc.M + row] =
+                    accum[frag * 8u + (unsigned)l];
+            }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q6k_experts_grouped_i8(
+    const unsigned char* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q6k_experts_grouped_i8<4u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q6k_experts_grouped_i8_t16(
+    const unsigned char* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q6k_experts_grouped_i8<1u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(64, 8) void gemm_q6k_experts_grouped_i8_t16_m32(
+    const unsigned char* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q6k_experts_grouped_i8<1u, 32u>(a, xq, order, tile_expert, y, pc);
+}
+
+// Gemma's routed down weights use Q5_1 (32 values per block, affine d/m).
+// Accumulate the unsigned 5-bit integer dot with gfx12 WMMA and apply the
+// exact affine correction from Q8_1's stored activation sum once per block.
+__device__ __forceinline__ unsigned zinc_q51_pack4(
+    const unsigned char* __restrict__ blk, unsigned word) {
+    const unsigned qh = *(const unsigned*)(blk + 4u);
+    const unsigned char* qs = blk + 8u;
+    unsigned packed = 0u;
+    #pragma unroll
+    for (unsigned j = 0u; j < 4u; ++j) {
+        const unsigned k = word * 4u + j;
+        const unsigned ql = k < 16u ? (unsigned)(qs[k] & 0xFu) : (unsigned)(qs[k - 16u] >> 4);
+        packed |= (ql | (((qh >> k) & 1u) << 4)) << (j * 8u);
+    }
+    return packed;
+}
+
+template <unsigned NFRAG>
+__device__ __forceinline__ void zinc_gemm_q5_1_experts_grouped_i8(
+    const unsigned char* __restrict__ a,
+    const unsigned char* __restrict__ A_q8,
+    const unsigned* __restrict__ order,
+    const unsigned* __restrict__ tile_expert,
+    float* __restrict__ Y,
+    GroupedI8Push pc) {
+    const unsigned BM = 128u, BT = NFRAG * 16u;
+    const unsigned X_STRIDE = 40u; // 32 q words + 4 d/m pairs + padding
+    const unsigned B_STRIDE = 36u;
+    const unsigned INV = 0xFFFFFFFFu;
+    __shared__ __align__(16) int Xtile[BM * X_STRIDE];
+    __shared__ __align__(16) int Btile[BT * B_STRIDE];
+
+    const unsigned expert = tile_expert[blockIdx.y];
+    if (expert == INV) return;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wid = tid >> 5;
+    const unsigned m0 = blockIdx.x * BM;
+    const unsigned t0 = blockIdx.y * BT;
+    const unsigned blocks_per_row = pc.K >> 5;
+    const unsigned nsuper = pc.K >> 7;
+    const unsigned char* const a0 = a + (size_t)expert * pc.expert_stride + pc.base;
+    half2* const Xdm = (half2*)(Xtile + 32u);
+    half2* const Bds = (half2*)Btile;
+
+    float accum[NFRAG * 8u];
+    #pragma unroll
+    for (unsigned i = 0; i < NFRAG * 8u; ++i) accum[i] = 0.0f;
+
+    using zinc_group_q51_i32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+    using zinc_group_q51_i32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+
+    for (unsigned sb = 0; sb < nsuper; ++sb) {
+        #pragma unroll
+        for (unsigned r0 = 0u; r0 < BM; r0 += 8u) {
+            const unsigned r = r0 + wid;
+            const unsigned row = m0 + r;
+            #pragma unroll
+            for (unsigned g = 0u; g < 4u; ++g) {
+                if (lane < 8u) {
+                    unsigned packed_q = 0u;
+                    if (row < pc.M) {
+                        const unsigned char* blk = a0 +
+                            ((size_t)row * blocks_per_row + sb * 4u + g) * 24u;
+                        const unsigned qh = *(const unsigned*)(blk + 4u);
+                        const unsigned char* qs = blk + 8u;
+                        #pragma unroll
+                        for (unsigned j = 0u; j < 4u; ++j) {
+                            const unsigned k = lane * 4u + j;
+                            const unsigned ql = k < 16u ? (unsigned)(qs[k] & 0xFu) : (unsigned)(qs[k - 16u] >> 4);
+                            const unsigned q = ql | (((qh >> k) & 1u) << 4);
+                            packed_q |= q << (j * 8u);
+                        }
+                    }
+                    Xtile[r * X_STRIDE + g * 8u + lane] = (int)packed_q;
+                }
+            }
+        }
+
+        // One lane per row copies the four packed (d,m) half2 pairs.
+        #pragma unroll
+        for (unsigned r0 = 0u; r0 < BM; r0 += 64u) {
+            const unsigned r = r0 + wid * 8u + (lane >> 2);
+            const unsigned row = m0 + r;
+            const unsigned g = lane & 3u;
+            if (row < pc.M) {
+                const unsigned char* blk = a0 +
+                    ((size_t)row * blocks_per_row + sb * 4u + g) * 24u;
+                Xdm[r * X_STRIDE + g] = *(const half2*)blk;
+            } else {
+                Xdm[r * X_STRIDE + g] = __floats2half2_rn(0.0f, 0.0f);
+            }
+        }
+
+        #pragma unroll
+        for (unsigned l0 = 0u; l0 < BT * B_STRIDE; l0 += 256u) {
+            const unsigned l = l0 + tid;
+            if (l < BT * B_STRIDE) {
+                const unsigned local_t = l / B_STRIDE;
+                const unsigned word = l - local_t * B_STRIDE;
+                const unsigned packed = order[t0 + local_t];
+                if (packed != INV) {
+                    const unsigned tok = packed >> 16;
+                    const unsigned slot = packed & 0xFFFFu;
+                    const unsigned src_row = pc.route_stride != 0u ? tok * pc.route_stride + slot : tok;
+                    const int* src = (const int*)A_q8 +
+                        ((size_t)sb * pc.T + src_row) * B_STRIDE;
+                    Btile[l] = src[word];
+                } else {
+                    Btile[l] = 0;
+                }
+            }
+        }
+        __syncthreads();
+
+        const unsigned row_base = wid * 16u;
+        #pragma unroll
+        for (unsigned g = 0u; g < 4u; ++g) {
+            const unsigned wr = row_base + (lane & 15u);
+            const unsigned wk = (lane >> 4) * 2u;
+            const unsigned at_base = lane & 15u;
+            const unsigned ak = (lane >> 4) * 2u;
+            #pragma unroll
+            for (unsigned jt = 0; jt < NFRAG; ++jt) {
+                const unsigned at = jt * 16u + at_base;
+                zinc_group_q51_i32x8_t ci = {};
+                #pragma unroll
+                for (unsigned kh = 0u; kh < 2u; ++kh) {
+                    const zinc_group_q51_i32x2_t av = *(const zinc_group_q51_i32x2_t*)(
+                        Xtile + wr * X_STRIDE + g * 8u + kh * 4u + wk);
+                    const zinc_group_q51_i32x2_t bv = *(const zinc_group_q51_i32x2_t*)(
+                        Btile + at * B_STRIDE + 4u + g * 8u + kh * 4u + ak);
+                    ci = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                        true, av, true, bv, ci, true);
+                }
+                const float2 dsB = __half22float2(Bds[at * B_STRIDE + g]);
+                const int* cv = (const int*)&ci;
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const unsigned ri = row_base + (lane >> 4) * 8u + (unsigned)l;
+                    const float2 dmA = __half22float2(Xdm[ri * X_STRIDE + g]);
+                    accum[jt * 8u + (unsigned)l] += dmA.x * dsB.x * (float)cv[l];
+                    accum[jt * 8u + (unsigned)l] += dmA.y * dsB.y;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (unsigned frag = 0; frag < NFRAG; ++frag) {
+        const unsigned local_t = frag * 16u + (lane & 15u);
+        const unsigned packed = order[t0 + local_t];
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const unsigned row = m0 + wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+            if (packed != INV && row < pc.M) {
+                const unsigned tok = packed >> 16;
+                const unsigned slot = packed & 0xFFFFu;
+                Y[(size_t)tok * pc.dst_tok_stride + (size_t)slot * pc.M + row] =
+                    accum[frag * 8u + (unsigned)l];
+            }
+        }
+    }
+}
+
+template <unsigned NFRAG>
+__device__ __forceinline__ void zinc_gemm_q5_1_experts_grouped_i8_direct(
+    const unsigned char* __restrict__ a,
+    const unsigned char* __restrict__ A_q8,
+    const unsigned* __restrict__ order,
+    const unsigned* __restrict__ tile_expert,
+    float* __restrict__ Y,
+    GroupedI8Push pc) {
+    constexpr unsigned BM = 128u;
+    const unsigned BT = NFRAG * 16u;
+    const unsigned B_STRIDE = 36u;
+    const unsigned INV = 0xFFFFFFFFu;
+    __shared__ __align__(16) int Btile[BT * B_STRIDE];
+    __shared__ __align__(16) half2 Adm[BM * 4u];
+
+    const unsigned expert = tile_expert[blockIdx.y];
+    if (expert == INV) return;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned wid = tid >> 5;
+    const unsigned m0 = blockIdx.x * BM;
+    const unsigned t0 = blockIdx.y * BT;
+    const unsigned blocks_per_row = pc.K >> 5;
+    const unsigned nsuper = pc.K >> 7;
+    const unsigned char* const a0 = a + (size_t)expert * pc.expert_stride + pc.base;
+    half2* const Bds = (half2*)Btile;
+
+    float accum[NFRAG * 8u];
+    #pragma unroll
+    for (unsigned i = 0u; i < NFRAG * 8u; ++i) accum[i] = 0.0f;
+
+    using zinc_q51_direct_i32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+    using zinc_q51_direct_i32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+
+    const unsigned wr = wid * 16u + (lane & 15u);
+    const unsigned row = m0 + wr;
+    const unsigned wk = (lane >> 4) * 2u;
+
+    for (unsigned sb = 0u; sb < nsuper; ++sb) {
+        #pragma unroll
+        for (unsigned i = tid; i < BM * 4u; i += blockDim.x) {
+            const unsigned sr = i >> 2;
+            const unsigned g = i & 3u;
+            const unsigned scale_row = m0 + sr;
+            Adm[i] = scale_row < pc.M
+                ? *(const half2*)(a0 + ((size_t)scale_row * blocks_per_row + sb * 4u + g) * 24u)
+                : __floats2half2_rn(0.0f, 0.0f);
+        }
+
+        #pragma unroll
+        for (unsigned l0 = 0u; l0 < BT * B_STRIDE; l0 += blockDim.x) {
+            const unsigned l = l0 + tid;
+            if (l < BT * B_STRIDE) {
+                const unsigned local_t = l / B_STRIDE;
+                const unsigned word = l - local_t * B_STRIDE;
+                const unsigned packed = order[t0 + local_t];
+                if (packed != INV) {
+                    const unsigned tok = packed >> 16;
+                    const unsigned slot = packed & 0xFFFFu;
+                    const unsigned src_row = pc.route_stride != 0u ? tok * pc.route_stride + slot : tok;
+                    const int* src = (const int*)A_q8 + ((size_t)sb * pc.T + src_row) * B_STRIDE;
+                    Btile[l] = src[word];
+                } else {
+                    Btile[l] = 0;
+                }
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (unsigned g = 0u; g < 4u; ++g) {
+            zinc_q51_direct_i32x8_t ci_frag[NFRAG];
+            #pragma unroll
+            for (unsigned jt = 0u; jt < NFRAG; ++jt) ci_frag[jt] = zinc_q51_direct_i32x8_t{};
+
+            #pragma unroll
+            for (unsigned kh = 0u; kh < 2u; ++kh) {
+                unsigned aq0 = 0u, aq1 = 0u;
+                if (row < pc.M) {
+                    const unsigned char* blk = a0 +
+                        ((size_t)row * blocks_per_row + sb * 4u + g) * 24u;
+                    const unsigned qword = kh * 4u + wk;
+                    aq0 = zinc_q51_pack4(blk, qword);
+                    aq1 = zinc_q51_pack4(blk, qword + 1u);
+                }
+                const zinc_q51_direct_i32x2_t av = { (int)aq0, (int)aq1 };
+                #pragma unroll
+                for (unsigned jt = 0u; jt < NFRAG; ++jt) {
+                    const unsigned at = jt * 16u + (lane & 15u);
+                    const unsigned ak = (lane >> 4) * 2u;
+                    const zinc_q51_direct_i32x2_t bv = *(const zinc_q51_direct_i32x2_t*)(
+                        Btile + at * B_STRIDE + 4u + g * 8u + kh * 4u + ak);
+                    ci_frag[jt] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                        true, av, true, bv, ci_frag[jt], true);
+                }
+            }
+
+            #pragma unroll
+            for (unsigned jt = 0u; jt < NFRAG; ++jt) {
+                const unsigned at = jt * 16u + (lane & 15u);
+                const float2 dsB = __half22float2(Bds[at * B_STRIDE + g]);
+                const int* cv = (const int*)&ci_frag[jt];
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const unsigned ri = wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+                    const float2 dmA = __half22float2(Adm[ri * 4u + g]);
+                    accum[jt * 8u + (unsigned)l] += dmA.x * dsB.x * (float)cv[l];
+                    accum[jt * 8u + (unsigned)l] += dmA.y * dsB.y;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (unsigned frag = 0u; frag < NFRAG; ++frag) {
+        const unsigned packed = order[t0 + frag * 16u + (lane & 15u)];
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const unsigned out_row = m0 + wid * 16u + (lane >> 4) * 8u + (unsigned)l;
+            if (packed != INV && out_row < pc.M) {
+                const unsigned tok = packed >> 16;
+                const unsigned slot = packed & 0xFFFFu;
+                Y[(size_t)tok * pc.dst_tok_stride + (size_t)slot * pc.M + out_row] =
+                    accum[frag * 8u + (unsigned)l];
+            }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q5_1_experts_grouped_i8(
+    const unsigned char* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q5_1_experts_grouped_i8<4u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q5_1_experts_grouped_i8_t16(
+    const unsigned char* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q5_1_experts_grouped_i8<1u>(a, xq, order, tile_expert, y, pc);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_q5_1_experts_grouped_i8_t16_direct(
+    const unsigned char* a, const unsigned char* xq, const unsigned* order,
+    const unsigned* tile_expert, float* y, GroupedI8Push pc) {
+    zinc_gemm_q5_1_experts_grouped_i8_direct<1u>(a, xq, order, tile_expert, y, pc);
+}
+
+#else
+extern "C" __global__ void gemm_q4k_experts_grouped_i8() {}
+extern "C" __global__ void gemm_q4k_experts_grouped_i8_direct() {}
+extern "C" __global__ void gemm_q4k_experts_grouped_i8_t16() {}
+extern "C" __global__ void gemm_q4k_experts_grouped_i8_t16_direct() {}
+extern "C" __global__ void gemm_q4k_experts_grouped_i8_t16_m64() {}
+extern "C" __global__ void gemm_q4k_experts_grouped_i8_t16_m32() {}
+extern "C" __global__ void gemm_q5k_experts_grouped_i8() {}
+extern "C" __global__ void gemm_q5k_experts_grouped_i8_t16() {}
+extern "C" __global__ void gemm_q5k_experts_grouped_i8_t16_m32() {}
+extern "C" __global__ void gemm_q6k_experts_grouped_i8() {}
+extern "C" __global__ void gemm_q6k_experts_grouped_i8_t16() {}
+extern "C" __global__ void gemm_q6k_experts_grouped_i8_t16_m32() {}
+extern "C" __global__ void gemm_q5_1_experts_grouped_i8() {}
+extern "C" __global__ void gemm_q5_1_experts_grouped_i8_t16() {}
+extern "C" __global__ void gemm_q5_1_experts_grouped_i8_t16_direct() {}
+#endif
 
 // ---- gemm_q4k_q8_dp4a — Q4_K weights × Q8_0 pre-quantized input, DP4a ------
 // Reads pre-quantized Q8_0 activations (from quantize_act_q8_0) instead of
@@ -3807,9 +7765,9 @@ extern "C" __global__ __launch_bounds__(256, 4) void gemm_q4k_q8_dp4a(
                                      : (int)((w32 >> 4) & 0x0F0F0F0Fu);
 
         // --- Input Q8_0 (pre-quantized) ---
-        const unsigned char* ab = xq8 + (size_t)c * 34u;
+        const unsigned char* ab = xq8 + (size_t)c * 36u;
         float d_a = zinc_half_to_float((unsigned short)((unsigned)ab[0] | ((unsigned)ab[1] << 8)));
-        const unsigned char* ap = ab + 2u + grp * 4u;
+        const unsigned char* ap = ab + 4u + grp * 4u;
         int a_pk = (int)ap[0] | ((int)ap[1] << 8) | ((int)ap[2] << 16) | ((int)ap[3] << 24);
 
         // DP4a: sum of nibble[i] * int8[i]
@@ -3895,11 +7853,11 @@ extern "C" __global__ __launch_bounds__(256, 3) void gemm_q4k_dp4a(const unsigne
             if(tok<pc.T){
                 if (pc.q8_stride != 0u) {
                     // Pre-quantized Q8_0 path: read scale + packed int8 directly
-                    const unsigned char* ab = Ab_q8 + (size_t)tok * pc.q8_stride + (size_t)c * 34u;
+                    const unsigned char* ab = Ab_q8 + (size_t)tok * pc.q8_stride + (size_t)c * 36u;
                     float d = zinc_half_to_float((unsigned short)((unsigned)ab[0] | ((unsigned)ab[1] << 8)));
                     float sv = 0.0f;
                     if(lane<8u){
-                        const unsigned char* p = ab + 2u + lane * 4u;
+                        const unsigned char* p = ab + 4u + lane * 4u;
                         int pk = (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16) | ((int)p[3] << 24);
                         As_pk[lane*BT+t] = pk;
                         // Sum of 32 int8 values (each lane sums 4)
@@ -4175,6 +8133,7 @@ extern "C" __global__ void gemm_f32_tiled_v2(const float* W, const float* A, flo
             if(row<pc.M&&tok<pc.T){ unsigned yi=(pc.y_offset>>2)+(size_t)tok*pc.M+row; if(pc.acc_mode!=0u) Y[yi]+=acc[i][j]; else Y[yi]=acc[i][j]; } } }
 }
 
+#ifndef ZINC_ROCM
 // ---- gemm_f16_tc — tensor-core GEMM with PRE-DEQUANTED fp16 weights ---------
 // Skip Q4_K dequant entirely — weight is already fp16. 10-30x faster than
 // gemm_q4k_tc because the dequant (95% of kernel time) is eliminated.
@@ -4337,6 +8296,8 @@ extern "C" __global__ void gemm_q4k_tc(const unsigned* a_u32, const float* A, fl
         }
     }
 }
+
+#endif // !ZINC_ROCM: NVIDIA WMMA dense kernels
 
 // ---- f32_to_f16 — element-wise activation downcast (Effort 24 cycle 12) -------
 // y[i] = __float2half(x[i]). Used to pre-convert a GEMM's f32 activation tile to
@@ -4513,6 +8474,7 @@ extern "C" __global__ void geglu_f16(const float* gate, const float* up, half* y
     y[idx] = __float2half(gelu * up[idx]);
 }
 
+#ifndef ZINC_ROCM
 // ---- gemm_q4k_tc_f16a — tensor-core Q4_K GEMM with a PRE-CONVERTED fp16 A -----
 // Identical to gemm_q4k_tc in every respect (same Q4_K dequant, same wmma 16x16x16
 // fragment schedule, same Cs store / guarded copy) EXCEPT the activation A arrives
@@ -5042,6 +9004,8 @@ extern "C" __global__ void gemm_q4k_tc_f16a_lowsmem(const unsigned* a_u32, const
     }
 }
 
+#endif // !ZINC_ROCM: NVIDIA WMMA/inline-PTX kernels before q4k low-memory GEMM
+
 // ---- gemm_q4k_tc_lowsmem — 16KB-shared TC Q4_K GEMM (50% better occupancy) ---
 // Aliases Ws[4KB half] + As[4KB half] within a 16KB float smem that doubles as
 // Cs[BT*BM] output buffer after the K-loop completes. 3 blocks/SM vs 2 for the
@@ -5129,6 +9093,7 @@ extern "C" __global__ void gemm_q4k_tc_lowsmem(const unsigned* a_u32, const floa
     }
 }
 
+#ifndef ZINC_ROCM
 // ---- Inline PTX mma.sync.m16n8k16 helpers (bypass broken wmma fp32 path) -----
 // NVRTC's wmma::mma_sync generates .f32.f32 (fp32) MMA instead of .f32.f16
 // (fp16). This macro uses inline PTX to force the fp16 MMA instruction.
@@ -5561,6 +9526,31 @@ extern "C" __global__ void gemm_q4k_tc_f16a_m128_lowsmem(const unsigned* a_u32, 
     }
 }
 
+#endif // !ZINC_ROCM: NVIDIA WMMA/inline-PTX kernels
+
+#ifdef ZINC_ROCM
+// The ROCm correctness milestone runs the scalar/matvec path. Forward state
+// still resolves every CUDA-era pipeline at initialization, so keep inert
+// symbols for NVIDIA-only kernels until native gfx12 WMMA/MFMA ports replace
+// them. Backend defaults guarantee these symbols are never dispatched.
+#define ZINC_ROCM_PIPELINE_STUB(name) extern "C" __global__ void name() {}
+ZINC_ROCM_PIPELINE_STUB(gemm_q4k_experts_grouped_tc)
+ZINC_ROCM_PIPELINE_STUB(gemm_q5_1_experts_grouped_tc)
+ZINC_ROCM_PIPELINE_STUB(gemm_q5k_experts_grouped_tc)
+ZINC_ROCM_PIPELINE_STUB(gemm_q6k_experts_grouped_tc)
+ZINC_ROCM_PIPELINE_STUB(gemm_f16_tc)
+ZINC_ROCM_PIPELINE_STUB(gemm_q4k_tc)
+ZINC_ROCM_PIPELINE_STUB(gemm_q4k_tc_f16a)
+ZINC_ROCM_PIPELINE_STUB(gemm_q6k_tc_f16a)
+ZINC_ROCM_PIPELINE_STUB(gemm_q6k_tc_f16a_lowsmem)
+ZINC_ROCM_PIPELINE_STUB(gemm_q4k_tc_f16a_m128)
+ZINC_ROCM_PIPELINE_STUB(gemm_q4k_tc_f16a_lowsmem)
+ZINC_ROCM_PIPELINE_STUB(gemm_q4k_mma_lowsmem)
+ZINC_ROCM_PIPELINE_STUB(gemm_q4k_gate_up_swiglu_lowsmem)
+ZINC_ROCM_PIPELINE_STUB(gemm_q4k_tc_f16a_m128_lowsmem)
+#undef ZINC_ROCM_PIPELINE_STUB
+#endif
+
 // ---- sigmoid_mul (qwen35 attention gate) — out[i] = a[i] * sigmoid(gate[i]) ---
 // ABI: inputs first, output last (matches swiglu). In-place safe (out may alias a).
 struct SigmoidMulPush { unsigned N; };
@@ -5569,6 +9559,67 @@ extern "C" __global__ void sigmoid_mul(const float* a, const float* gate, float*
     if (idx >= pc.N) return;
     float g = gate[idx];
     out[idx] = a[idx] * (1.0f / (1.0f + expf(-g)));
+}
+
+// Attention gate + Q8_1 packing for the single-token ROCm O projection. The
+// unfused path first overwrites the f32 attention row with a*sigmoid(gate), then
+// reads the row again in quantize_act_q8_0. O only consumes the packed view, so
+// compute the gated values in registers and write Q8_1 directly.
+extern "C" __global__ void sigmoid_mul_quant_q8_0(
+    const float* __restrict__ a, const float* __restrict__ gate,
+    unsigned char* __restrict__ out, QuantActPush pc)
+{
+    const unsigned tok = blockIdx.y;
+    const unsigned chunk_base = blockIdx.x * 256u;
+    const unsigned tid = threadIdx.x;
+    const unsigned k_idx = chunk_base + tid;
+    const unsigned wblk = tid >> 5;
+    const unsigned wlane = tid & 31u;
+    const float* at = a + (size_t)tok * pc.K;
+    const float* gt = gate + (size_t)tok * pc.K;
+    float val = 0.0f;
+    if (k_idx < pc.K) {
+        const float g = gt[k_idx];
+        val = at[k_idx] * (1.0f / (1.0f + expf(-g)));
+    }
+
+    float av = fabsf(val), sv = val;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        av = fmaxf(av, __shfl_xor_sync(0xffffffffu, av, o));
+        sv += __shfl_xor_sync(0xffffffffu, sv, o);
+    }
+    const float d = av / 127.0f;
+    const float scale = 127.0f / fmaxf(av, 1e-5f);
+    const int q = max(-127, min(127, __float2int_rn(val * scale)));
+
+#ifdef ZINC_ROCM
+    const unsigned c = (chunk_base >> 5) + wblk;
+    const unsigned h = c >> 2;
+    const unsigned g = c & 3u;
+    unsigned char* out_base = out + ((size_t)h * pc.T + tok) * 144u;
+    if (wlane == 0u && k_idx < pc.K) {
+        const unsigned short dh = zinc_float_to_half(d);
+        const unsigned short sh = zinc_float_to_half(sv);
+        out_base[g * 4u] = (unsigned char)(dh & 0xffu);
+        out_base[g * 4u + 1u] = (unsigned char)(dh >> 8);
+        out_base[g * 4u + 2u] = (unsigned char)(sh & 0xffu);
+        out_base[g * 4u + 3u] = (unsigned char)(sh >> 8);
+    }
+    out_base[16u + g * 32u + wlane] = (unsigned char)q;
+#else
+    unsigned char* out_base = out + (size_t)tok * (pc.K / 32u) * 36u +
+        ((size_t)(chunk_base >> 5) + wblk) * 36u;
+    if (wlane == 0u && k_idx < pc.K) {
+        const unsigned short dh = zinc_float_to_half(d);
+        const unsigned short sh = zinc_float_to_half(sv);
+        out_base[0] = (unsigned char)(dh & 0xffu);
+        out_base[1] = (unsigned char)(dh >> 8);
+        out_base[2] = (unsigned char)(sh & 0xffu);
+        out_base[3] = (unsigned char)(sh >> 8);
+    }
+    out_base[4u + wlane] = (unsigned char)q;
+#endif
 }
 
 // ===========================================================================
@@ -5901,6 +9952,263 @@ extern "C" __global__ void rms_norm_rope_qkv_seq(
         yt[i] = sh[i];
 }
 
+// ---- Muse Glimmer QKV normalization / positional encoding -----------------
+// Muse differs from Gemma in three important details: V is written to the KV
+// cache without unit normalization, global-attention layers use NoPE, and every
+// layer still applies learned per-head Q/K RMSNorm. Keep separate kernels so the
+// established Gemma path and ABI remain unchanged.
+struct MuseQkvPush {
+    unsigned head_dim; float eps; unsigned rope_dim; unsigned position;
+    unsigned n_head; unsigned n_kv_head; unsigned kv_offset; unsigned use_rope;
+};
+extern "C" __global__ void muse_norm_qkv(
+    const float* q_in, const float* k_in, const float* v_in,
+    const float* wq, const float* wk, const float* inv_freq,
+    float* q_out, float* k_out, float* v_out, MuseQkvPush pc)
+{
+    unsigned bx = blockIdx.x;
+    unsigned hd = pc.head_dim;
+    extern __shared__ float sh[];
+
+    const float* xt;
+    float* yt;
+    const float* w;
+    if (bx < pc.n_head) {
+        unsigned head = bx;
+        xt = q_in + (size_t)head * hd;
+        yt = q_out + (size_t)head * hd;
+        w = wq;
+    } else if (bx < pc.n_head + pc.n_kv_head) {
+        unsigned head = bx - pc.n_head;
+        xt = k_in + (size_t)head * hd;
+        yt = k_out + (size_t)pc.kv_offset + (size_t)head * hd;
+        w = wk;
+    } else {
+        unsigned head = bx - pc.n_head - pc.n_kv_head;
+        xt = v_in + (size_t)head * hd;
+        yt = v_out + (size_t)pc.kv_offset + (size_t)head * hd;
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) yt[i] = xt[i];
+        return;
+    }
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    if (pc.use_rope == 0u) {
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) yt[i] = sh[i];
+        return;
+    }
+    // Muse/Llama-4 uses normal RoPE: rotate consecutive pairs (2i, 2i+1),
+    // unlike Gemma's NEOX half-split layout.
+    unsigned pairs = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < pairs; i += blockDim.x) {
+        unsigned i0 = i << 1;
+        unsigned i1 = i0 + 1;
+        float x0 = sh[i0];
+        float x1 = sh[i1];
+        float theta = (float)pc.position * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i0] = x0 * ct - x1 * st;
+        yt[i1] = x0 * st + x1 * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < hd; i += blockDim.x) yt[i] = sh[i];
+}
+
+struct MuseQkvBatchPush {
+    unsigned head_dim; float eps; unsigned rope_dim; unsigned base_position;
+    unsigned n_head; unsigned n_kv_head; unsigned use_rope;
+};
+extern "C" __global__ void muse_norm_qkv_batched(
+    const float* q_in, const float* k_in, const float* v_in,
+    const float* wq, const float* wk, const float* inv_freq,
+    float* q_out, float* k_out, float* v_out, MuseQkvBatchPush pc)
+{
+    unsigned bx = blockIdx.x;
+    unsigned t = blockIdx.y;
+    unsigned hd = pc.head_dim;
+    unsigned q_dim = pc.n_head * hd;
+    unsigned kv_dim = pc.n_kv_head * hd;
+    extern __shared__ float sh[];
+
+    const float* xt;
+    float* yt;
+    const float* w;
+    if (bx < pc.n_head) {
+        unsigned head = bx;
+        xt = q_in + (size_t)t * q_dim + (size_t)head * hd;
+        yt = q_out + (size_t)t * q_dim + (size_t)head * hd;
+        w = wq;
+    } else if (bx < pc.n_head + pc.n_kv_head) {
+        unsigned head = bx - pc.n_head;
+        xt = k_in + (size_t)t * kv_dim + (size_t)head * hd;
+        yt = k_out + (size_t)t * kv_dim + (size_t)head * hd;
+        w = wk;
+    } else {
+        unsigned head = bx - pc.n_head - pc.n_kv_head;
+        xt = v_in + (size_t)t * kv_dim + (size_t)head * hd;
+        yt = v_out + (size_t)t * kv_dim + (size_t)head * hd;
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) yt[i] = xt[i];
+        return;
+    }
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    if (pc.use_rope == 0u) {
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) yt[i] = sh[i];
+        return;
+    }
+    unsigned position = pc.base_position + t;
+    unsigned pairs = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < pairs; i += blockDim.x) {
+        unsigned i0 = i << 1;
+        unsigned i1 = i0 + 1;
+        float x0 = sh[i0];
+        float x1 = sh[i1];
+        float theta = (float)position * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i0] = x0 * ct - x1 * st;
+        yt[i1] = x0 * st + x1 * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < hd; i += blockDim.x) yt[i] = sh[i];
+}
+
+struct MuseQkvSeqPush {
+    unsigned head_dim; float eps; unsigned rope_dim;
+    unsigned n_head; unsigned n_kv_head; unsigned slot_ctx; unsigned use_rope;
+    unsigned write_f16;
+};
+extern "C" __global__ void muse_norm_qkv_seq(
+    const float* q_in, const float* k_in, const float* v_in,
+    const float* wq, const float* wk, const float* inv_freq,
+    float* q_out, float* k_out, float* v_out,
+    half* q_f16, half* k_f16, half* v_f16,
+    const unsigned* positions, const unsigned* slots, MuseQkvSeqPush pc)
+{
+    unsigned bx = blockIdx.x;
+    unsigned b = blockIdx.y;
+    unsigned hd = pc.head_dim;
+    unsigned q_dim = pc.n_head * hd;
+    unsigned kv_dim = pc.n_kv_head * hd;
+    unsigned pos = positions[b];
+    unsigned slot = slots[b];
+    size_t kv_base = ((size_t)slot * pc.slot_ctx + pos) * kv_dim;
+    extern __shared__ float sh[];
+
+    const float* xt;
+    float* yt;
+    half* yt16;
+    const float* w;
+    if (bx < pc.n_head) {
+        unsigned head = bx;
+        xt = q_in + (size_t)b * q_dim + (size_t)head * hd;
+        yt = q_out + (size_t)b * q_dim + (size_t)head * hd;
+        yt16 = q_f16 + (size_t)b * q_dim + (size_t)head * hd;
+        w = wq;
+    } else if (bx < pc.n_head + pc.n_kv_head) {
+        unsigned head = bx - pc.n_head;
+        xt = k_in + (size_t)b * kv_dim + (size_t)head * hd;
+        yt = k_out + kv_base + (size_t)head * hd;
+        yt16 = k_f16 + kv_base + (size_t)head * hd;
+        w = wk;
+    } else {
+        unsigned head = bx - pc.n_head - pc.n_kv_head;
+        xt = v_in + (size_t)b * kv_dim + (size_t)head * hd;
+        yt = v_out + kv_base + (size_t)head * hd;
+        yt16 = v_f16 + kv_base + (size_t)head * hd;
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+            const float value = xt[i];
+            yt[i] = value;
+            if (pc.write_f16 != 0u) yt16[i] = __float2half(value);
+        }
+        return;
+    }
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    if (pc.use_rope == 0u) {
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+            const float value = sh[i];
+            yt[i] = value;
+            if (pc.write_f16 != 0u) yt16[i] = __float2half(value);
+        }
+        return;
+    }
+    unsigned pairs = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < pairs; i += blockDim.x) {
+        unsigned i0 = i << 1;
+        unsigned i1 = i0 + 1;
+        float x0 = sh[i0];
+        float x1 = sh[i1];
+        float theta = (float)pos * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        const float y0 = x0 * ct - x1 * st;
+        const float y1 = x0 * st + x1 * ct;
+        yt[i0] = y0;
+        yt[i1] = y1;
+        if (pc.write_f16 != 0u) {
+            yt16[i0] = __float2half(y0);
+            yt16[i1] = __float2half(y1);
+        }
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < hd; i += blockDim.x) {
+        const float value = sh[i];
+        yt[i] = value;
+        if (pc.write_f16 != 0u) yt16[i] = __float2half(value);
+    }
+}
+
+// Seed the persistent half KV mirror after batched prefill. Decode appends one
+// row at a time directly in muse_norm_qkv_seq, so this O(prompt) conversion is
+// paid once per request rather than once per generated token.
+struct KvF16Push { unsigned N, offset; };
+extern "C" __global__ void muse_kv_f32_to_f16(
+    const float* k, const float* v, half* k16, half* v16, KvF16Push pc)
+{
+    const unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pc.N) return;
+    const size_t at = (size_t)pc.offset + idx;
+    k16[at] = __float2half(k[at]);
+    v16[at] = __float2half(v[at]);
+}
+
 // ---- geglu (gemma FFN activation: gelu(gate) * up) -------------------------
 // Matches ggml LLM_FFN_GELU (tanh approximation). gemma norm weights already
 // carry the +1 offset (baked at GGUF conversion), so the surrounding norms use
@@ -6010,6 +10318,141 @@ extern "C" __global__ void gemma_attention(const float* q, const float* k, const
         for (unsigned i = start; i < pc.seq_len; i++)
             acc += s_scores[i] * v[((size_t)i * pc.n_kv_heads + kv_head) * hd + d];
         out[(size_t)head * hd + d] = acc * inv;
+    }
+}
+
+extern "C" __global__ void gemma_attention_v2_decode(
+    const float* q, const float* k, const float* v, float* out,
+    GemmaAttnPush pc) {
+    extern __shared__ float s_scores[];
+    __shared__ float s_q[512];
+    __shared__ float s_m, s_inv;
+    const unsigned head = blockIdx.x;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned warp = tid >> 5;
+    const unsigned hd = pc.head_dim;
+    const unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    const size_t kv_dim = (size_t)pc.n_kv_heads * hd;
+    const float* qh = q + (size_t)head * hd;
+    const float scale = pc.scale_bits != 0u ? __uint_as_float(pc.scale_bits) : rsqrtf((float)hd);
+
+    unsigned start = 0u;
+    if (pc.window != 0u && pc.seq_len > pc.window) start = pc.seq_len - pc.window;
+    for (unsigned d = tid; d < hd; d += blockDim.x) s_q[d] = qh[d];
+    __syncthreads();
+
+    for (unsigned i = start + warp; i < pc.seq_len; i += 8u) {
+        const float* ki = k + (size_t)i * kv_dim + (size_t)kv_head * hd;
+        float dot = 0.0f;
+        for (unsigned d = lane; d < hd; d += 32u) dot += s_q[d] * ki[d];
+        dot = zinc_warp_reduce_sum(dot);
+        if (lane == 0u) s_scores[i] = dot * scale;
+    }
+    __syncthreads();
+
+    float lmax = -3.4e38f;
+    for (unsigned i = start + tid; i < pc.seq_len; i += blockDim.x)
+        lmax = fmaxf(lmax, s_scores[i]);
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0u) s_m = lmax;
+    __syncthreads();
+
+    float lsum = 0.0f;
+    for (unsigned i = start + tid; i < pc.seq_len; i += blockDim.x) {
+        const float e = expf(s_scores[i] - s_m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0u) s_inv = lsum > 0.0f ? 1.0f / lsum : 0.0f;
+    __syncthreads();
+
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = start; i < pc.seq_len; ++i)
+            acc += s_scores[i] * v[(size_t)i * kv_dim + (size_t)kv_head * hd + d];
+        out[(size_t)head * hd + d] = acc * s_inv;
+    }
+}
+
+// Exact two-query-per-KV-head decode. Gemma 4 26B maps two adjacent query
+// heads to each KV head; computing that pair in one workgroup halves K/V cache
+// traffic while retaining each query head's serial dot and softmax reductions.
+extern "C" __global__ void gemma_attention_gqa2(
+    const float* q, const float* k, const float* v, float* out,
+    GemmaAttnPush pc) {
+    extern __shared__ float scores[];
+    float* scores0 = scores;
+    float* scores1 = scores + pc.seq_len;
+    __shared__ float s_m0, s_m1, s_inv0, s_inv1;
+    const unsigned kv_head = blockIdx.x;
+    const unsigned head0 = kv_head * 2u;
+    const unsigned head1 = head0 + 1u;
+    const unsigned tid = threadIdx.x;
+    const unsigned hd = pc.head_dim;
+    const size_t kv_dim = (size_t)pc.n_kv_heads * hd;
+    const float* q0 = q + (size_t)head0 * hd;
+    const float* q1 = q + (size_t)head1 * hd;
+    const float scale = pc.scale_bits != 0u ? __uint_as_float(pc.scale_bits) : rsqrtf((float)hd);
+
+    unsigned start = 0u;
+    if (pc.window != 0u && pc.seq_len > pc.window) start = pc.seq_len - pc.window;
+
+    float lmax0 = -3.4e38f;
+    float lmax1 = -3.4e38f;
+    for (unsigned i = start + tid; i < pc.seq_len; i += blockDim.x) {
+        const float* ki = k + (size_t)i * kv_dim + (size_t)kv_head * hd;
+        float dot0 = 0.0f;
+        float dot1 = 0.0f;
+        for (unsigned d = 0u; d < hd; ++d) {
+            const float kval = ki[d];
+            dot0 += q0[d] * kval;
+            dot1 += q1[d] * kval;
+        }
+        const float score0 = dot0 * scale;
+        const float score1 = dot1 * scale;
+        scores0[i] = score0;
+        scores1[i] = score1;
+        lmax0 = fmaxf(lmax0, score0);
+        lmax1 = fmaxf(lmax1, score1);
+    }
+    lmax0 = zinc_block_reduce_max(lmax0);
+    lmax1 = zinc_block_reduce_max(lmax1);
+    if (tid == 0u) {
+        s_m0 = lmax0;
+        s_m1 = lmax1;
+    }
+    __syncthreads();
+
+    float lsum0 = 0.0f;
+    float lsum1 = 0.0f;
+    for (unsigned i = start + tid; i < pc.seq_len; i += blockDim.x) {
+        const float e0 = expf(scores0[i] - s_m0);
+        const float e1 = expf(scores1[i] - s_m1);
+        scores0[i] = e0;
+        scores1[i] = e1;
+        lsum0 += e0;
+        lsum1 += e1;
+    }
+    lsum0 = zinc_block_reduce_sum(lsum0);
+    lsum1 = zinc_block_reduce_sum(lsum1);
+    if (tid == 0u) {
+        s_inv0 = lsum0 > 0.0f ? 1.0f / lsum0 : 0.0f;
+        s_inv1 = lsum1 > 0.0f ? 1.0f / lsum1 : 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (unsigned i = start; i < pc.seq_len; ++i) {
+            const float vv = v[(size_t)i * kv_dim + (size_t)kv_head * hd + d];
+            acc0 += scores0[i] * vv;
+            acc1 += scores1[i] * vv;
+        }
+        out[(size_t)head0 * hd + d] = acc0 * s_inv0;
+        out[(size_t)head1 * hd + d] = acc1 * s_inv1;
     }
 }
 
@@ -6218,6 +10661,221 @@ extern "C" __global__ void gemma_attention_batched_seq(
     }
 }
 
+// Coalesced decode attention. Eight wave32 warps cooperate on eight keys at a
+// time, so head_dim=512 K rows are read in contiguous cache lines instead of
+// the naive thread-per-key kernel's widely strided loads. The softmax and V
+// accumulation retain the existing block reduction and output order.
+extern "C" __global__ void gemma_attention_batched_seq_v2(
+    const float* q, const float* k, const float* v, float* out,
+    const unsigned* positions, const unsigned* slots, GemmaAttnSlotPush pc) {
+    extern __shared__ float s_scores[];
+    __shared__ float s_q[512];
+    __shared__ float s_m, s_inv;
+    const unsigned head = blockIdx.x;
+    const unsigned b = blockIdx.y;
+    const unsigned pos = positions[b];
+    const unsigned slot = slots[b];
+    const unsigned seq_len = pos + 1u;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned warp = tid >> 5;
+    const unsigned hd = pc.head_dim;
+    const unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    const size_t kv_dim = (size_t)pc.n_kv_heads * hd;
+    const size_t slot_off = (size_t)slot * pc.slot_ctx * kv_dim;
+    const float* qh = q + ((size_t)b * pc.n_heads + head) * hd;
+    const float* kbase = k + slot_off;
+    const float* vbase = v + slot_off;
+    const float scale = pc.scale_bits != 0u ? __uint_as_float(pc.scale_bits) : rsqrtf((float)hd);
+
+    unsigned start = 0u;
+    if (pc.window != 0u && seq_len > pc.window) start = seq_len - pc.window;
+
+    for (unsigned d = tid; d < hd; d += blockDim.x) s_q[d] = qh[d];
+    __syncthreads();
+
+    for (unsigned i = start + warp; i < seq_len; i += 8u) {
+        const float* ki = kbase + (size_t)i * kv_dim + (size_t)kv_head * hd;
+        float dot = 0.0f;
+        for (unsigned d = lane; d < hd; d += 32u) dot += s_q[d] * ki[d];
+        dot = zinc_warp_reduce_sum(dot);
+        if (lane == 0u) s_scores[i] = dot * scale;
+    }
+    __syncthreads();
+
+    float lmax = -3.4e38f;
+    for (unsigned i = start + tid; i < seq_len; i += blockDim.x)
+        lmax = fmaxf(lmax, s_scores[i]);
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0u) s_m = lmax;
+    __syncthreads();
+
+    float lsum = 0.0f;
+    for (unsigned i = start + tid; i < seq_len; i += blockDim.x) {
+        const float e = expf(s_scores[i] - s_m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0u) s_inv = lsum > 0.0f ? 1.0f / lsum : 0.0f;
+    __syncthreads();
+
+    for (unsigned d = tid; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned i = start; i < seq_len; ++i)
+            acc += s_scores[i] * vbase[(size_t)i * kv_dim + (size_t)kv_head * hd + d];
+        out[((size_t)b * pc.n_heads + head) * hd + d] = acc * s_inv;
+    }
+}
+
+// Softmax for the grouped-BLAS Muse decode path. hipBLAS writes one contiguous
+// score row per query head; normalize and downcast those rows for the fp16
+// probability GEMM. The score scale is applied here so both GEMMs stay plain.
+struct MuseAttnSoftmaxPush { unsigned seq_len, stride, n_heads, scale_bits; };
+extern "C" __global__ void muse_attention_softmax_inplace(float* scores, half* probs, MuseAttnSoftmaxPush pc) {
+    const unsigned head = blockIdx.x;
+    if (head >= pc.n_heads) return;
+    const unsigned tid = threadIdx.x;
+    float* row = scores + (size_t)head * pc.stride;
+    const float scale = __uint_as_float(pc.scale_bits);
+
+    float lmax = -3.4e38f;
+    for (unsigned i = tid; i < pc.seq_len; i += blockDim.x)
+        lmax = fmaxf(lmax, row[i] * scale);
+    lmax = zinc_block_reduce_max(lmax);
+    __shared__ float s_max, s_inv;
+    if (tid == 0u) s_max = lmax;
+    __syncthreads();
+
+    float lsum = 0.0f;
+    for (unsigned i = tid; i < pc.seq_len; i += blockDim.x) {
+        const float e = expf(row[i] * scale - s_max);
+        row[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0u) s_inv = lsum > 0.0f ? 1.0f / lsum : 0.0f;
+    __syncthreads();
+    half* out = probs + (size_t)head * pc.stride;
+    for (unsigned i = tid; i < pc.seq_len; i += blockDim.x)
+        out[i] = __float2half(row[i] * s_inv);
+}
+
+// fp32 twin for Gemma decode. Keeping this separate avoids an unused fp16
+// probability write on Gemma and preserves Muse's lean fp16 attention path.
+extern "C" __global__ void gemma_attention_softmax_f32_inplace(float* scores, MuseAttnSoftmaxPush pc) {
+    const unsigned head = blockIdx.x;
+    if (head >= pc.n_heads) return;
+    const unsigned tid = threadIdx.x;
+    float* row = scores + (size_t)head * pc.stride;
+    const float scale = __uint_as_float(pc.scale_bits);
+
+    float lmax = -3.4e38f;
+    for (unsigned i = tid; i < pc.seq_len; i += blockDim.x)
+        lmax = fmaxf(lmax, row[i] * scale);
+    lmax = zinc_block_reduce_max(lmax);
+    __shared__ float s_max, s_inv;
+    if (tid == 0u) s_max = lmax;
+    __syncthreads();
+
+    float lsum = 0.0f;
+    for (unsigned i = tid; i < pc.seq_len; i += blockDim.x) {
+        const float e = expf(row[i] * scale - s_max);
+        row[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0u) s_inv = lsum > 0.0f ? 1.0f / lsum : 0.0f;
+    __syncthreads();
+    for (unsigned i = tid; i < pc.seq_len; i += blockDim.x)
+        row[i] *= s_inv;
+}
+
+// Muse single-client decode specialization: fold the post-attention sigmoid
+// gate and Q8_1 packing into attention's output pass. The following O projection
+// consumes only Q8_1, so the intermediate f32 attention row and a full extra
+// kernel launch are unnecessary. Grid/block/shared sizing matches
+// gemma_attention_batched_seq; q8 uses quantize_act_q8_0's ROCm MMQ layout.
+extern "C" __global__ void muse_attention_batched_seq_q8(
+    const float* q, const float* k, const float* v, const float* gate,
+    unsigned char* q8, const unsigned* positions, const unsigned* slots,
+    GemmaAttnSlotPush pc)
+{
+    extern __shared__ float s_scores[];
+    __shared__ float s_m, s_inv;
+    const unsigned head = blockIdx.x;
+    const unsigned b = blockIdx.y;
+    const unsigned pos = positions[b];
+    const unsigned slot = slots[b];
+    const unsigned seq_len = pos + 1u;
+    const unsigned tid = threadIdx.x;
+    const unsigned hd = pc.head_dim;
+    const unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    const size_t kv_dim = (size_t)pc.n_kv_heads * hd;
+    const size_t slot_off = (size_t)slot * pc.slot_ctx * kv_dim;
+    const float* qh = q + ((size_t)b * pc.n_heads + head) * hd;
+    const float* kbase = k + slot_off;
+    const float* vbase = v + slot_off;
+    const float scale = pc.scale_bits != 0u ? __uint_as_float(pc.scale_bits) : rsqrtf((float)hd);
+    unsigned start = 0u;
+    if (pc.window != 0u && seq_len > pc.window) start = seq_len - pc.window;
+
+    float lmax = -3.4e38f;
+    for (unsigned i = start + tid; i < seq_len; i += blockDim.x) {
+        const float* ki = kbase + (size_t)i * kv_dim + (size_t)kv_head * hd;
+        float dot = 0.0f;
+        for (unsigned di = 0; di < hd; di++) dot += qh[di] * ki[di];
+        const float score = dot * scale;
+        s_scores[i] = score;
+        lmax = fmaxf(lmax, score);
+    }
+    lmax = zinc_block_reduce_max(lmax);
+    if (tid == 0u) s_m = lmax;
+    __syncthreads();
+
+    float lsum = 0.0f;
+    for (unsigned i = start + tid; i < seq_len; i += blockDim.x) {
+        const float e = expf(s_scores[i] - s_m);
+        s_scores[i] = e;
+        lsum += e;
+    }
+    lsum = zinc_block_reduce_sum(lsum);
+    if (tid == 0u) s_inv = lsum > 0.0f ? 1.0f / lsum : 0.0f;
+    __syncthreads();
+    if (tid >= hd) return;
+
+    float acc = 0.0f;
+    for (unsigned i = start; i < seq_len; i++)
+        acc += s_scores[i] * vbase[(size_t)i * kv_dim + (size_t)kv_head * hd + tid];
+    const size_t out_idx = ((size_t)b * pc.n_heads + head) * hd + tid;
+    const float gval = gate[out_idx];
+    const float val = (acc * s_inv) * (1.0f / (1.0f + expf(-gval)));
+
+    float av = fabsf(val), sv = val;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        av = fmaxf(av, __shfl_xor_sync(0xffffffffu, av, o));
+        sv += __shfl_xor_sync(0xffffffffu, sv, o);
+    }
+    const float d = av / 127.0f;
+    const float qscale = 127.0f / fmaxf(av, 1e-5f);
+    const int qv = max(-127, min(127, __float2int_rn(val * qscale)));
+    const unsigned lane = tid & 31u;
+    const unsigned c = (head * hd + tid) >> 5;
+    const unsigned tile = c >> 2;
+    const unsigned group = c & 3u;
+    unsigned char* out = q8 + ((size_t)tile * gridDim.y + b) * 144u;
+    if (lane == 0u) {
+        const unsigned short dh = zinc_float_to_half(d);
+        const unsigned short sh = zinc_float_to_half(sv);
+        out[group * 4u] = (unsigned char)(dh & 0xffu);
+        out[group * 4u + 1u] = (unsigned char)(dh >> 8);
+        out[group * 4u + 2u] = (unsigned char)(sh & 0xffu);
+        out[group * 4u + 3u] = (unsigned char)(sh >> 8);
+    }
+    out[16u + group * 32u + lane] = (unsigned char)qv;
+}
+
 // ---- deinterleave_qgate (qwen35 packed Q+gate projection) ----
 // wq outputs [2*head_dim] per head, laid out as [Q(head_dim) | gate(head_dim)]
 // interleaved across heads: [Q0,g0,Q1,g1,...]. Split into contiguous q_out and
@@ -6232,6 +10890,79 @@ extern "C" __global__ void deinterleave_qgate(const float* qfull, float* q_out, 
     unsigned src = h * 2u * pc.head_dim + d;
     q_out[i]    = qfull[src];
     gate_out[i] = qfull[src + pc.head_dim];
+}
+
+// ---- qwen_norm_rope_qkv (single-sequence DECODE attn front-end) ------------
+// Fuses deinterleave_qgate + per-head Q/K RMS norm + Q/K RoPE + KV writes.
+// The Q projection is packed [Q(hd)|gate(hd)] per head.  One block owns one
+// Q, K, or V head, so all writes are disjoint and the norm reduction order
+// matches the standalone rms_norm kernel (one 256-thread block per head).
+struct QwenQkvPush {
+    unsigned head_dim; float eps; unsigned rope_dim;
+    unsigned n_head; unsigned n_kv_head; unsigned position; unsigned kv_offset;
+};
+extern "C" __global__ void qwen_norm_rope_qkv(
+    const float* qfull, const float* k_in, const float* v_in,
+    const float* wq, const float* wk, const float* inv_freq,
+    float* q_out, float* gate_out, float* k_out, float* v_out,
+    QwenQkvPush pc)
+{
+    unsigned bx = blockIdx.x;
+    unsigned hd = pc.head_dim;
+    extern __shared__ float sh[]; // hd normalized values (Q/K rope staging)
+
+    const float* xt;
+    float* yt;
+    const float* w;
+    if (bx < pc.n_head) {
+        unsigned head = bx;
+        xt = qfull + (size_t)head * 2u * hd;
+        yt = q_out + (size_t)head * hd;
+        w = wq;
+        float* gt = gate_out + (size_t)head * hd;
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+            gt[i] = xt[hd + i];
+    } else if (bx < pc.n_head + pc.n_kv_head) {
+        unsigned head = bx - pc.n_head;
+        xt = k_in + (size_t)head * hd;
+        yt = k_out + (size_t)pc.kv_offset + (size_t)head * hd;
+        w = wk;
+    } else {
+        unsigned head = bx - pc.n_head - pc.n_kv_head;
+        const float* vt = v_in + (size_t)head * hd;
+        float* vo = v_out + (size_t)pc.kv_offset + (size_t)head * hd;
+        for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+            vo[i] = vt[i];
+        return;
+    }
+
+    float ss = 0.0f;
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xt[i];
+        ss += v * v;
+    }
+    ss = zinc_block_reduce_sum(ss);
+    __shared__ float rms_inv_sh;
+    if (threadIdx.x == 0) rms_inv_sh = rsqrtf(ss / (float)hd + pc.eps);
+    __syncthreads();
+    float rinv = rms_inv_sh;
+
+    for (unsigned i = threadIdx.x; i < hd; i += blockDim.x)
+        sh[i] = w[i] * (xt[i] * rinv);
+    __syncthreads();
+
+    unsigned half_rot = pc.rope_dim >> 1;
+    for (unsigned i = threadIdx.x; i < half_rot; i += blockDim.x) {
+        float xi = sh[i];
+        float xih = sh[i + half_rot];
+        float theta = (float)pc.position * inv_freq[i];
+        float ct = cosf(theta);
+        float st = sinf(theta);
+        yt[i] = xi * ct - xih * st;
+        yt[i + half_rot] = xi * st + xih * ct;
+    }
+    for (unsigned i = pc.rope_dim + threadIdx.x; i < hd; i += blockDim.x)
+        yt[i] = sh[i];
 }
 
 // ---- qwen_norm_rope_qkv_seq (Effort 28 4c-2: batched DECODE attn front-end) --
@@ -6413,9 +11144,11 @@ extern "C" __global__ void naive_attention_batched_seq(
 // Prefill processes T prompt tokens at once. naive_attention is single-query
 // (grid=n_heads, one query over [0..seq_len)). This batches all T queries: block
 // (head=blockIdx.x, t=blockIdx.y) computes attention for query position t, head h,
-// CAUSALLY masked to keys [0..t]. Same 3-pass softmax(QK^T)V + GQA + sink logic.
+// CAUSALLY masked to keys [0..base_position+t]. Same 3-pass softmax(QK^T)V +
+// GQA + sink logic. base_position=0 is ordinary prompt prefill; a non-zero base
+// lets speculative verification reuse the already-populated prefix KV cache.
 // Q/K/V are [T, n_kv_heads-or-n_heads, head_dim]; out is [T, n_heads, head_dim].
-struct AttnBatchPush { unsigned head_dim, n_heads, n_kv_heads, T, attn_scale_bits, sink_offset; };
+struct AttnBatchPush { unsigned head_dim, n_heads, n_kv_heads, T, attn_scale_bits, sink_offset, base_position; };
 
 extern "C" __global__ void attention_causal_batched(const float* q, const float* k, const float* v,
                                                     const float* sinks, float* out, AttnBatchPush pc) {
@@ -6424,7 +11157,7 @@ extern "C" __global__ void attention_causal_batched(const float* q, const float*
     unsigned head = blockIdx.x;
     unsigned t = blockIdx.y;                      // query position
     if (t >= pc.T) return;
-    unsigned seq_len = t + 1u;                    // causal: query t attends keys [0..t]
+    unsigned seq_len = pc.base_position + t + 1u;
     unsigned tid = threadIdx.x;
     unsigned hd = pc.head_dim;
     unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
@@ -6487,13 +11220,13 @@ extern "C" __global__ void attention_causal_batched(const float* q, const float*
 extern "C" __global__ void attention_causal_batched_v2(const float* q, const float* k, const float* v,
                                                        const float* sinks, float* out, AttnBatchPush pc) {
     extern __shared__ float smem2[];
-    float* s_scores = smem2;              // [T]
-    float* qsh = smem2 + pc.T;            // [head_dim]
+    float* s_scores = smem2;              // [base_position + T]
+    float* qsh = smem2 + pc.base_position + pc.T; // [head_dim]
     __shared__ float s_m, s_rescale, s_inv;
     unsigned head = blockIdx.x;
     unsigned t = blockIdx.y;
     if (t >= pc.T) return;
-    unsigned seq_len = t + 1u;
+    unsigned seq_len = pc.base_position + t + 1u;
     unsigned tid = threadIdx.x, hd = pc.head_dim, nthr = blockDim.x;
     unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
     const float* qh = q + ((size_t)t * pc.n_heads + head) * hd;

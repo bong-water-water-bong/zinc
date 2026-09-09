@@ -46,7 +46,7 @@ RDNA suite runs sync into `/root/zinc-bench` by default. Keep that checkout isol
 
 For password-auth Intel nodes, the suite reads `ZINC_INTEL_SSH_PASSWORD`, `ZINC_INTEL_SSH_PASSWORD_ENV`, or `ZINC_INTEL_SSH_PASSWORD_FILE` and drives `ssh`/`rsync` through `SSH_ASKPASS`. The generic `loops/optimize_gpu.ts` loop accepts the same variables, plus the `ZINC_GPU_*` equivalents. The generated benchmark commands reference only the env-var name or file path, not the password itself. Remove the temporary secret after the node is converted to key-based SSH.
 
-Current RDNA publish runs cover Gemma 4 26B-A4B Q4_K_M, Gemma 4 31B Q4_K_M, Qwen 3.5 9B Q4_K_M, Qwen 3.6 27B Q4_K_M, and Qwen 3.6 35B-A3B UD Q4_K_XL. The small-Qwen row is `Qwen3.5-9B-Q4_K_M.gguf`, not the older Qwen 3 8B GGUF.
+The default RDNA suite covers Gemma 4 26B-A4B Q4_K_M, Gemma 4 31B Q4_K_M, Qwen 3.5 9B Q4_K_M, Qwen 3.6 35B-A3B UD Q4_K_XL, and Qwen 3.8 27B Q4_K_M. The small-Qwen row is `Qwen3.5-9B-Q4_K_M.gguf`, not the older Qwen 3 8B GGUF.
 
 ## Ad-hoc llama.cpp baseline on the RDNA4 node
 
@@ -108,78 +108,32 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST '
 # medians in site/src/data/zinc-performance.json and on /zinc/benchmarks.
 ```
 
-## llama.cpp ROCm reference sweep
+## ROCm server comparison
 
-Use this when you want to answer "what does llama.cpp do on HIP/ROCm on the same AMD card?" This is a reference sweep, not the canonical ZINC-vs-baseline score. The published score still comes from `tools/performance_suite.mjs`, which runs reusable ZINC and llama.cpp servers through the same scenario matrix. The ROCm rows below are `llama-bench` pp/tg microbenchmarks, so keep them labeled separately until the suite can run a ROCm server baseline through the same harness.
-
-On the RDNA4 node, install only the minimal ROCm/HIP stack needed for llama.cpp. Avoid the full `rocm` meta-package unless you have checked the apt plan; it can pull DKMS and newer Mesa packages that invalidate the Vulkan baseline.
-
-Current reference setup:
-
-- ROCm userspace: `7.2.4`
-- GPU: Radeon AI PRO R9700, `gfx1201`, selected with `ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0`
-- llama.cpp: `9725a313b`
-- Build flags: `GGML_HIP=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`, `GGML_HIP_MMQ_MFMA=ON`, `GGML_HIP_NO_VMM=ON`, `AMDGPU_TARGETS=gfx1201`
-- Measurement shape: `pp2048 + tg32 @ d4096`, 3 measured runs, f16 KV
-
-Example build:
+Use the same full server-vs-server suite for ROCm claims:
 
 ```bash
-source .env
-
-ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST '
-  cd /root/llama.cpp
-  cmake -S . -B build-hip-gfx1201 \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DGGML_HIP=ON \
-    -DGGML_HIP_ROCWMMA_FATTN=ON \
-    -DGGML_HIP_MMQ_MFMA=ON \
-    -DGGML_HIP_NO_VMM=ON \
-    -DAMDGPU_TARGETS=gfx1201 \
-    -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
-    -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm
-  cmake --build build-hip-gfx1201 -j"$(nproc)"
-'
+bun tools/performance_suite.mjs \\
+  --target rdna \\
+  --phase all \\
+  --rdna-backend rocm \\
+  --rdna-sync \\
+  --rdna-build \\
+  --rdna-start-llama
 ```
 
-Example one-model run:
+The published ROCm target records both backend identities in its methodology.
+ZINC runs its native ROCm/HIP backend; the comparison server uses the selected
+llama.cpp device on the same Radeon GPU and the same GGUF. Use
+`--rdna-llama-device ROCm0` for a llama.cpp HIP comparison or a Vulkan device
+such as `Vulkan0` for the cross-backend baseline. Never relabel one as the
+other. The benchmark artifact records the exact choice, binary checksum, and
+revision.
 
-```bash
-source .env
-
-ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST '
-  cd /root/llama.cpp
-  ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 \
-    ./build-hip-gfx1201/bin/llama-bench \
-    -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
-    -ngl 999 -fa 1 -b 2048 -ub 2048 \
-    -ctk f16 -ctv f16 -dev ROCm0 -sm none -mg 0 -mmp 0 \
-    -r 3 -p 2048 -n 32 -d 4096 -o md
-'
-```
-
-Latest five-model ROCm reference on the R9700:
-
-| Model                       |            ROCm prefill |          ROCm decode |
-| --------------------------- | ----------------------: | -------------------: |
-| Qwen 3.5 9B Q4_K_M          | 3406.02 +/- 13.83 tok/s | 79.36 +/- 0.31 tok/s |
-| Qwen 3.6 27B Dense Q4_K_M   |  1006.31 +/- 2.43 tok/s | 27.07 +/- 0.07 tok/s |
-| Qwen 3.6 35B A3B UD Q4_K_XL | 4046.91 +/- 11.65 tok/s | 76.33 +/- 1.04 tok/s |
-| Gemma 4 26B-A4B MoE Q4_K_M  | 3892.66 +/- 18.79 tok/s | 80.32 +/- 1.15 tok/s |
-| Gemma 4 31B Q4_K_M          |   750.25 +/- 0.78 tok/s | 24.83 +/- 0.06 tok/s |
-
-Qwen 3.6 35B depth sweep:
-
-| Depth |            ROCm prefill |          ROCm decode |
-| ----: | ----------------------: | -------------------: |
-|  4096 |  4108.97 +/- 8.24 tok/s | 76.67 +/- 1.07 tok/s |
-|  8132 | 3781.27 +/- 16.90 tok/s | 75.33 +/- 1.08 tok/s |
-| 16000 | 3224.70 +/- 12.83 tok/s | 73.11 +/- 1.02 tok/s |
-| 30000 |  2572.30 +/- 6.54 tok/s | 69.56 +/- 0.86 tok/s |
-| 60000 |  1833.57 +/- 1.90 tok/s | 62.86 +/- 0.74 tok/s |
-| 90000 |  1392.72 +/- 1.34 tok/s | 57.49 +/- 0.56 tok/s |
-
-For the same Qwen 35B `pp2048 + tg32 @ d4096` shape, the correct-device llama.cpp Vulkan/RADV cross-check was `2598.89 +/- 15.68 tok/s` prefill and `104.99 +/- 0.70 tok/s` decode. On this node, ROCm substantially raises llama.cpp prefill, while Vulkan remains faster for that decode microbench.
+The current results and raw samples live on the
+[benchmark dashboard](https://zolotukhin.ai/zinc/benchmarks/#rdna-rocm). The
+older `llama-bench` pp/tg microbench archive has been retired so it cannot be
+mistaken for the reusable-server comparison.
 
 ## Measure ZINC (CLI diagnostics only)
 

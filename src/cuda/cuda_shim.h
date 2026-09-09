@@ -48,6 +48,10 @@ uint32_t cuda_max_shared_mem_per_block(CudaCtx* ctx);
 uint32_t cuda_warp_size(CudaCtx* ctx);             // 32 on all NVIDIA
 // Fills name_out (NUL-terminated, up to cap bytes) with the device name.
 void     cuda_device_name(CudaCtx* ctx, char* name_out, size_t cap);
+// Fills arch_out with the native compilation target (for example sm_120 or
+// gfx1201). This is diagnostic metadata; callers must not infer capabilities
+// from the string.
+void     cuda_device_arch(CudaCtx* ctx, char* arch_out, size_t cap);
 
 // ---- Buffer management -------------------------------------------------------
 // Device-local buffer (the common case for weights/activations/state).
@@ -120,6 +124,23 @@ void cuda_release_completed(CudaCmd* cmd);
 void cuda_cublas_hgemm(CudaCtx* ctx, unsigned M, unsigned N, unsigned K,
                        CudaBuf* W, CudaBuf* A, CudaBuf* Y, float beta);
 
+// The same operation over equally-strided matrix views. Strides are expressed
+// in elements (not bytes), matching cuBLAS/hipBLAS. Muse uses batch=2 for its
+// two GQA KV heads, cutting attention from four BLAS submissions to two.
+void cuda_cublas_hgemm_strided_batched(CudaCtx* ctx, unsigned trans_a, unsigned trans_b,
+                                       unsigned M, unsigned N, unsigned K,
+                                       CudaBuf* A, size_t a_offset, unsigned lda, int64_t stride_a,
+                                       CudaBuf* B, size_t b_offset, unsigned ldb, int64_t stride_b,
+                                       CudaBuf* C, size_t c_offset, unsigned ldc, int64_t stride_c,
+                                       unsigned batch_count, float beta);
+
+void cuda_cublas_sgemm_strided_batched(CudaCtx* ctx, unsigned trans_a, unsigned trans_b,
+                                       unsigned M, unsigned N, unsigned K,
+                                       CudaBuf* A, size_t a_offset, unsigned lda, int64_t stride_a,
+                                       CudaBuf* B, size_t b_offset, unsigned ldb, int64_t stride_b,
+                                       CudaBuf* C, size_t c_offset, unsigned ldc, int64_t stride_c,
+                                       unsigned batch_count, float beta);
+
 // ---- CUDA Graphs (decode replay, Effort 25) ----------------------------------
 // Capture the per-decode-step kernel chain once and replay it as a SINGLE graph
 // launch, collapsing the ~480 per-kernel launches + inter-kernel GPU bubbles of
@@ -134,6 +155,7 @@ void cuda_cublas_hgemm(CudaCtx* ctx, unsigned M, unsigned N, unsigned K,
 // exec always matches the current step's parameters (bit-identical to the
 // un-captured chain). MUST NOT be used around a chain that synchronizes or reads
 // back mid-capture (e.g. the MoE router host readback).
+int        cuda_graph_supported(void);                    // 1 when capture/replay is implemented
 CudaGraph* cuda_graph_create(void);
 int        cuda_graph_begin(CudaCtx* ctx);                 // 1 on success, 0 on failure
 int        cuda_graph_end_launch(CudaCtx* ctx, CudaGraph* graph); // 1 on success

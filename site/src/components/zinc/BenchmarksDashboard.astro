@@ -2,7 +2,6 @@
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import Breadcrumbs from '../../components/Breadcrumbs.astro';
 import { buildBreadcrumbList } from '../../lib/structured-data';
-import rocmReference from '../../data/llama-rocm-reference.json';
 import benchmarkData from '../../data/zinc-performance.json';
 
 interface Props {
@@ -11,8 +10,8 @@ interface Props {
 }
 
 const {
-  pagePath = '/zinc/benchmarks',
-  canonicalPath = '/zinc/benchmarks',
+  pagePath = '/zinc/benchmarks/',
+  canonicalPath = '/zinc/benchmarks/',
 } = Astro.props;
 
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin.ai';
@@ -72,17 +71,6 @@ function formatMetric(value: number | null | undefined, suffix: string, digits =
   return `${value.toFixed(digits)} ${suffix}`;
 }
 
-function formatMetricSpread(
-  value: number | null | undefined,
-  spread: number | null | undefined,
-  suffix: string,
-  digits = 1,
-) {
-  if (value == null || Number.isNaN(value)) return 'n/a';
-  const spreadText = spread != null && !Number.isNaN(spread) ? ` +/- ${spread.toFixed(digits)}` : '';
-  return `${value.toFixed(digits)}${spreadText} ${suffix}`;
-}
-
 function formatPercent(value: number | null | undefined, digits = 0) {
   if (value == null || Number.isNaN(value)) return 'n/a';
   return `${value.toFixed(digits)}%`;
@@ -104,15 +92,6 @@ function formatShortDate(iso: string | null | undefined) {
   return new Intl.DateTimeFormat('en-US', {
     month: 'short',
     day: 'numeric',
-  }).format(new Date(iso));
-}
-
-function formatUtcShortDate(iso: string | null | undefined) {
-  if (!iso) return 'n/a';
-  return new Intl.DateTimeFormat('en-US', {
-    month: 'short',
-    day: 'numeric',
-    timeZone: 'UTC',
   }).format(new Date(iso));
 }
 
@@ -448,6 +427,13 @@ function outputQualityStatus(scenario: any) {
   const preview = `${scenario?.zinc?.output_preview ?? ''}`.trim();
   const generatedTokens = scenario?.zinc?.generated_tokens ?? null;
   if (!preview) {
+    if (generatedTokens != null && generatedTokens <= 0) {
+      return {
+        tone: 'caution',
+        label: 'Generation failed',
+        note: 'The request returned without generating a token.',
+      };
+    }
     return {
       tone: 'neutral',
       label: 'No Preview',
@@ -545,8 +531,10 @@ function selectPrimaryScenario(scenarios: any[]) {
 }
 
 function scenarioStatus(scenario: any) {
-  const zincOk = promptValue(scenario) != null || decodeValue(scenario) != null || endToEndValue(scenario) != null;
-  const baselineOk = baselinePromptValue(scenario) != null || baselineDecodeValue(scenario) != null;
+  const zincOk = [promptValue(scenario), decodeValue(scenario), endToEndValue(scenario)]
+    .some((value) => value != null && value > 0);
+  const baselineOk = [baselinePromptValue(scenario), baselineDecodeValue(scenario)]
+    .some((value) => value != null && value > 0);
   const reason = compactReason(warningText(scenario));
 
   if (zincOk && baselineOk) {
@@ -587,7 +575,10 @@ function normalizeTarget(target: any) {
       return primary ? { model, scenario: primary } : null;
     })
     .filter(Boolean);
-  const successful = primaryRows.filter((row: any) => row.scenario?.zinc?.decode_tps);
+  const successful = primaryRows.filter((row: any) => {
+    const decode = row.scenario?.zinc?.decode_tps?.median ?? row.scenario?.zinc?.decode_tps?.avg ?? null;
+    return decode != null && decode > 0;
+  });
   const allScenarios = visibleModels.flatMap((model: any) => ensureScenarios(model));
   const summaryScenarios = allScenarios.filter((scenario: any) => !isReviewOutputScenario(scenario));
   const compared = visibleModels.filter((model: any) => ensureScenarios(model).some((scenario: any) => !isReviewOutputScenario(scenario) && overallRatioValue(scenario) != null));
@@ -621,10 +612,32 @@ function scenarioIdsForTarget(target: any) {
   return scenarioOrder.filter((id) => ids.has(id));
 }
 
-const targetOrder = ['rdna', 'metal', 'intel'];
+const targetOrder = ['rdna', 'rdna-rocm', 'intel', 'metal', 'cuda'];
 function targetRank(id: string) {
   const index = targetOrder.indexOf(id);
   return index === -1 ? targetOrder.length : index;
+}
+
+function targetBackendLabel(target: any) {
+  const configured = `${target?.methodology?.zinc_backend ?? ''}`.trim();
+  if (target?.id === 'rdna-rocm' || /^rocm$/i.test(configured)) return 'ROCm';
+  if (target?.id === 'rdna-zinc-rt' || /zinc_rt/i.test(configured)) return 'ZINC_RT';
+  if (/vulkan/i.test(configured) || target?.id === 'rdna' || target?.id === 'intel') return 'Vulkan';
+  if (/metal/i.test(configured) || target?.id === 'metal') return 'Metal';
+  if (/cuda/i.test(configured) || target?.id === 'cuda') return 'CUDA';
+  return configured || 'Backend';
+}
+
+function targetBackendKey(target: any) {
+  return targetBackendLabel(target).toLowerCase().replace(/[^a-z0-9]+/g, '-');
+}
+
+function targetPlatformLabel(target: any) {
+  if (`${target?.id ?? ''}`.startsWith('rdna')) return 'AMD Radeon';
+  if (target?.id === 'intel') return 'Intel Arc';
+  if (target?.id === 'metal') return 'Apple Silicon';
+  if (target?.id === 'cuda') return 'NVIDIA RTX';
+  return target?.label ?? target?.machine?.gpu ?? 'GPU target';
 }
 
 const targets = [...benchmarkData.targets]
@@ -667,9 +680,17 @@ function formatLatencyDelta(value: number | null | undefined) {
   return value > 0 ? `${amount} ms slower` : `${amount} ms faster`;
 }
 
-function formatRuns(runs: number | null | undefined, warmupRuns: number | null | undefined) {
+function formatRuns(
+  runs: number | null | undefined,
+  warmupRuns: number | null | undefined,
+  runsMin: number | null | undefined = runs,
+  runsMax: number | null | undefined = runs,
+) {
   if (runs == null && warmupRuns == null) return 'n/a';
-  return `${runs ?? 0} measured · ${warmupRuns ?? 0} warmup`;
+  const measured = runsMin != null && runsMax != null && runsMin !== runsMax
+    ? `${runsMin}–${runsMax}`
+    : `${runs ?? runsMax ?? runsMin ?? 0}`;
+  return `${measured} measured · ${warmupRuns ?? 0} warmup`;
 }
 
 function githubBlobUrl(ref: string | null | undefined, filePath: string, startLine?: number, endLine?: number) {
@@ -711,19 +732,6 @@ function compareModels(a: any, b: any) {
     sensitivity: 'base',
   });
 }
-
-const rocmRows = [...(rocmReference.rows ?? [])].sort(compareModels);
-const rocmDepthRows = rocmReference.qwen35_depth_sweep ?? [];
-const rocmAvgPrefill = mean(rocmRows.map((row: any) => row.prefill_tps));
-const rocmAvgDecode = mean(rocmRows.map((row: any) => row.decode_tps));
-const rocmMaxPrefill = maxMetric(rocmRows, (row: any) => row.prefill_tps);
-const rocmMaxDecode = maxMetric(rocmRows, (row: any) => row.decode_tps);
-const rocmFastestPrefill = rocmRows.length > 0
-  ? [...rocmRows].sort((a: any, b: any) => (b.prefill_tps ?? 0) - (a.prefill_tps ?? 0))[0]
-  : null;
-const rocmFastestDecode = rocmRows.length > 0
-  ? [...rocmRows].sort((a: any, b: any) => (b.decode_tps ?? 0) - (a.decode_tps ?? 0))[0]
-  : null;
 
 function scenarioRows(target: any, scenarioId: string) {
   return [...target.models]
@@ -773,7 +781,7 @@ const jsonLd = {
     {
       '@type': 'CollectionPage',
       name: 'ZINC Benchmarks vs llama.cpp',
-      description: 'ZINC benchmark dashboard for AMD RDNA, Intel Arc, and Apple Silicon, including prompt throughput, prefill latency, decode throughput, total latency, same-machine comparison against llama.cpp, and a separate llama.cpp ROCm reference sweep.',
+      description: 'ZINC benchmark dashboard for Vulkan and ROCm on AMD RDNA, plus Intel Arc, Apple Silicon, and NVIDIA CUDA measurements with same-machine llama.cpp comparisons.',
       url: pageUrl,
       about: {
         '@type': 'SoftwareApplication',
@@ -795,14 +803,6 @@ const jsonLd = {
         contentUrl: canonicalUrl,
       },
     },
-    {
-      '@type': 'Dataset',
-      name: rocmReference.label,
-      description: rocmReference.description,
-      dateModified: rocmReference.generated_at,
-      measurementTechnique: rocmReference.methodology.tool,
-      variableMeasured: ['llama.cpp ROCm prefill throughput', 'llama.cpp ROCm decode throughput'],
-    },
     buildBreadcrumbList(siteUrl, breadcrumbItems),
   ],
 };
@@ -810,7 +810,7 @@ const jsonLd = {
 
 <BaseLayout
   title="ZINC Benchmarks vs llama.cpp"
-  description="ZINC benchmark dashboard for AMD RDNA, Intel Arc, and Apple Silicon, with scenario-based prompt throughput, decode throughput, same-machine comparison against llama.cpp, and a separate llama.cpp ROCm reference sweep."
+  description="ZINC benchmark dashboard for Vulkan and ROCm on AMD RDNA, plus Intel Arc, Apple Silicon, and NVIDIA CUDA measurements with same-machine llama.cpp comparisons."
   keywords="ZINC benchmarks, llama.cpp comparison, llama.cpp ROCm benchmark, Apple Silicon Metal benchmark, AMD RDNA benchmark, Intel Arc benchmark, local LLM benchmark, prefill throughput, decode throughput, latency benchmark"
   canonicalUrl={canonicalUrl}
   jsonLd={jsonLd}
@@ -821,11 +821,11 @@ const jsonLd = {
     <div class="hero-copy">
       <p class="eyebrow">ZINC</p>
       <h1>Benchmarks</h1>
-      <p class="intro">ZINC vs llama.cpp on the same machines, plus a separate ROCm reference for llama.cpp on AMD.</p>
+      <p class="intro">Choose a platform and backend, then compare ZINC with llama.cpp on the same GPU, model, prompts, and reusable-server protocol.</p>
     </div>
     <div class="hero-stats">
       <article class="stat-card">
-        <span>Targets</span>
+        <span>Backend runs</span>
         <strong>{targets.length}</strong>
       </article>
       <article class="stat-card">
@@ -843,41 +843,52 @@ const jsonLd = {
     </div>
   </section>
 
-  <nav class="target-tabs" aria-label="Benchmark targets" role="tablist">
-    {targets.map((target, index) => (
-      <button
-        type="button"
-        role="tab"
-        id={`tab-${target.id}`}
-        aria-controls={`panel-${target.id}`}
-        aria-selected={index === 0 ? 'true' : 'false'}
-        class:list={['target-tab', { active: index === 0 }]}
-        data-bench-target-tab={target.id}
-      >
-        <div class="target-tab-head">
-          <span>
-            {target.label}
-            {isPartialTarget(target) && <em>partial</em>}
-          </span>
-          <small>{target.machine.gpu}</small>
-        </div>
-        <div class="target-tab-stats">
-          <div>
-            <strong>{formatNumber(target.summary?.average_decode_tps)}</strong>
-            <small>tok/s</small>
+  <section class="target-picker" aria-labelledby="target-picker-label">
+    <header class="picker-heading">
+      <div>
+        <span class="picker-step">01</span>
+        <h2 id="target-picker-label">Choose a platform</h2>
+      </div>
+      <p>Choose a platform and backend. Each result uses the same model file and reusable-server protocol.</p>
+    </header>
+
+    <nav class="target-tabs" aria-label="Benchmark platform and backend" role="tablist">
+      {targets.map((target, index) => (
+        <button
+          type="button"
+          role="tab"
+          id={`tab-${target.id}`}
+          aria-controls={`panel-${target.id}`}
+          aria-selected={index === 0 ? 'true' : 'false'}
+          class:list={['target-tab', `backend-${targetBackendKey(target)}`, { active: index === 0 }]}
+          data-bench-target-tab={target.id}
+        >
+          <div class="target-tab-head">
+            <div class="target-tab-identity">
+              <span>{targetPlatformLabel(target)}</span>
+              <b class:list={['backend-badge', `backend-${targetBackendKey(target)}`]}>{targetBackendLabel(target)}</b>
+              {isPartialTarget(target) && <em>partial</em>}
+            </div>
+            <small>{target.machine.gpu}</small>
           </div>
-          <div>
-            <strong>{formatPercent(target.summary?.average_pct_of_llama)}</strong>
-            <small>overall</small>
+          <div class="target-tab-stats">
+            <div>
+              <strong>{formatNumber(target.summary?.average_decode_tps)}</strong>
+              <small>tok/s</small>
+            </div>
+            <div>
+              <strong>{formatPercent(target.summary?.average_pct_of_llama)}</strong>
+              <small>overall</small>
+            </div>
+            <div>
+              <strong>{successfulCount(target)}/{benchmarkedCount(target)}</strong>
+              <small>complete</small>
+            </div>
           </div>
-          <div>
-            <strong>{successfulCount(target)}/{benchmarkedCount(target)}</strong>
-            <small>complete</small>
-          </div>
-        </div>
-      </button>
-    ))}
-  </nav>
+        </button>
+      ))}
+    </nav>
+  </section>
 
   {targets.map((target, index) => {
     const scenarioIds = scenarioIdsForTarget(target);
@@ -885,6 +896,12 @@ const jsonLd = {
     const provenance = target.provenance ?? {};
     const zincProvenance = provenance.zinc ?? {};
     const llamaCppProvenance = provenance.llama_cpp ?? {};
+    const methodology = target.methodology ?? {};
+    const zincBackend = methodology.zinc_backend ?? null;
+    const llamaBackend = methodology.llama_backend
+      ? `${methodology.llama_backend}${methodology.llama_device ? ` (${methodology.llama_device})` : ''}`
+      : null;
+    const configNotes = Array.isArray(methodology.notes) ? methodology.notes : [];
     const sourceRef = zincProvenance.commit ?? 'main';
     const suiteSourceHref = githubBlobUrl(sourceRef, 'tools/performance_suite.mjs');
     const promptSourceHref = githubBlobUrl(sourceRef, 'tools/performance_suite.mjs', 1502, 1640);
@@ -903,18 +920,18 @@ const jsonLd = {
       >
         <header class="panel-header">
           <div>
-            <p class="eyebrow">{target.machine.label}</p>
-            <h2>{target.label}</h2>
-            <p class="panel-copy">{target.machine.gpu} · {target.machine.memory ?? 'n/a'} · {formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</p>
+            <p class="eyebrow">{targetPlatformLabel(target)} · {target.machine.label}</p>
+            <h2>{targetBackendLabel(target)} backend</h2>
+            <p class="panel-copy">{target.machine.gpu} · {target.machine.memory ?? 'n/a'} · {formatRuns(target.methodology?.runs, target.methodology?.warmup_runs, target.methodology?.runs_min, target.methodology?.runs_max)}</p>
             {(target.summary?.successful_models ?? 0) < (target.summary?.benchmarked_models ?? 0) && (
               <p class="panel-banner" role="note">
-                <strong>Partial benchmark run.</strong>{' '}
-                Only {(target.summary?.successful_models ?? 0)} of {(target.summary?.benchmarked_models ?? 0)} ZINC runs completed on this node in the current artifact ({formatShortDate(target.generated_at)}); the rest currently fail (see each row's status for the underlying reason). Numbers and averages shown reflect only the rows that completed — treat them as a partial signal, not a head-to-head verdict.
+                <strong>Some models did not complete.</strong>{' '}
+                ZINC completed {(target.summary?.successful_models ?? 0)} of {(target.summary?.benchmarked_models ?? 0)} models in this run ({formatShortDate(target.generated_at)}). The averages use completed rows only; open a failed row for its recorded reason.
               </p>
             )}
           </div>
           <details class="machine-details">
-            <summary>Run info</summary>
+            <summary>Exact configuration</summary>
             <dl class="machine-card">
               <div>
                 <dt>GPU</dt>
@@ -929,22 +946,54 @@ const jsonLd = {
                 <dd>{target.machine.memory ?? 'n/a'}</dd>
               </div>
               <div>
-                <dt>Artifact</dt>
-                <dd>{formatDate(target.generated_at)}</dd>
+                <dt>OS</dt>
+                <dd>{target.machine.os ?? 'n/a'}</dd>
               </div>
+              {zincBackend && (
+                <div>
+                  <dt>ZINC backend</dt>
+                  <dd>{zincBackend}</dd>
+                </div>
+              )}
+              {llamaBackend && (
+                <div>
+                  <dt>llama.cpp backend</dt>
+                  <dd>{llamaBackend}</dd>
+                </div>
+              )}
+              {methodology.zinc_build && (
+                <div class="config-wide">
+                  <dt>Build</dt>
+                  <dd><code>{methodology.zinc_build}</code></dd>
+                </div>
+              )}
               <div>
-                <dt>ZINC</dt>
+                <dt>ZINC commit</dt>
                 <dd title={zincProvenance.version ?? zincProvenance.commit ?? 'n/a'}>
                   {zincProvenance.version ?? formatCommit(zincProvenance.commit)}
                 </dd>
               </div>
               <div>
-                <dt>llama.cpp</dt>
+                <dt>llama.cpp build</dt>
                 <dd title={llamaCppProvenance.version ?? llamaCppProvenance.commit ?? 'n/a'}>
                   {llamaCppProvenance.version ?? formatCommit(llamaCppProvenance.commit)}
                 </dd>
               </div>
+              <div>
+                <dt>Artifact</dt>
+                <dd>{formatDate(target.generated_at)}</dd>
+              </div>
             </dl>
+            {configNotes.length > 0 && (
+              <div class="config-notes">
+                <p class="config-notes-title">Methodology &amp; reproducibility</p>
+                <ul>
+                  {configNotes.map((noteLine) => (
+                    <li>{noteLine}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </details>
         </header>
 
@@ -966,39 +1015,49 @@ const jsonLd = {
           </article>
         </div>
 
-        <nav class="scenario-tabs" aria-label={`${target.label} scenarios`}>
-          {scenarioIds.map((scenarioId, scenarioIndex) => {
-            const summary = scenarioSummary(target, scenarioId);
-            const scenarioDisplay = scenarioDisplayForTarget(target, scenarioId);
-            return (
-              <button
-                type="button"
-                class:list={['scenario-tab', { active: scenarioIndex === 0 }]}
-                data-bench-scenario-target={target.id}
-                data-bench-scenario={scenarioId}
-                aria-pressed={scenarioIndex === 0 ? 'true' : 'false'}
-              >
-                <div class="scenario-tab-head">
-                  <span>{scenarioDisplay.short}</span>
-                </div>
-                <div class="scenario-tab-stats">
-                  <div>
-                    <strong>{formatNumber(summary.avgPrompt)}</strong>
-                    <small>prefill</small>
+        <section class="scenario-picker" aria-label="Choose a workload">
+          <header class="picker-heading compact">
+            <div>
+              <span class="picker-step">02</span>
+              <h3>Choose a workload</h3>
+            </div>
+            <p>Prefill and decode are shown separately below.</p>
+          </header>
+
+          <nav class="scenario-tabs" aria-label={`${target.label} scenarios`}>
+            {scenarioIds.map((scenarioId, scenarioIndex) => {
+              const summary = scenarioSummary(target, scenarioId);
+              const scenarioDisplay = scenarioDisplayForTarget(target, scenarioId);
+              return (
+                <button
+                  type="button"
+                  class:list={['scenario-tab', { active: scenarioIndex === 0 }]}
+                  data-bench-scenario-target={target.id}
+                  data-bench-scenario={scenarioId}
+                  aria-pressed={scenarioIndex === 0 ? 'true' : 'false'}
+                >
+                  <div class="scenario-tab-head">
+                    <span>{scenarioDisplay.short}</span>
                   </div>
-                  <div>
-                    <strong>{formatNumber(summary.avgDecode)}</strong>
-                    <small>decode</small>
+                  <div class="scenario-tab-stats">
+                    <div>
+                      <strong>{formatNumber(summary.avgPrompt)}</strong>
+                      <small>prefill</small>
+                    </div>
+                    <div>
+                      <strong>{formatNumber(summary.avgDecode)}</strong>
+                      <small>decode</small>
+                    </div>
+                    <div>
+                      <strong>{formatPercent(summary.avgOverallGap)}</strong>
+                      <small>overall</small>
+                    </div>
                   </div>
-                  <div>
-                    <strong>{formatPercent(summary.avgOverallGap)}</strong>
-                    <small>overall</small>
-                  </div>
-                </div>
-              </button>
-            );
-          })}
-        </nav>
+                </button>
+              );
+            })}
+          </nav>
+        </section>
 
         {scenarioIds.map((scenarioId, scenarioIndex) => {
           const rows = scenarioRows(target, scenarioId);
@@ -1409,7 +1468,7 @@ const jsonLd = {
               <strong>Methodology</strong>
               <small>{target.methodology.runner} · {target.methodology.benchmark_style}</small>
             </div>
-            <span>{formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</span>
+            <span>{formatRuns(target.methodology?.runs, target.methodology?.warmup_runs, target.methodology?.runs_min, target.methodology?.runs_max)}</span>
           </summary>
           <div class="method-links">
             <a href={suiteSourceHref} target="_blank" rel="noreferrer">Benchmark runner</a>
@@ -1424,173 +1483,6 @@ const jsonLd = {
       </section>
     );
   })}
-
-  <section class="rocm-reference" aria-labelledby="rocm-reference-heading">
-    <header class="rocm-head">
-      <div>
-        <p class="eyebrow">{rocmReference.label}</p>
-        <h2 id="rocm-reference-heading">ROCm reference sweep</h2>
-        <p>
-          These are llama.cpp HIP/ROCm <code>llama-bench</code> rows on the same R9700 class node.
-          They are intentionally separate from the headline ZINC score, which remains a reusable
-          server-vs-server scenario matrix.
-        </p>
-      </div>
-      <div class="rocm-summary" aria-label="ROCm reference summary">
-        <article class="summary-card">
-          <span>Backend</span>
-          <strong>{rocmReference.llama_cpp.backend}</strong>
-          <small>{rocmReference.machine.gpu}</small>
-        </article>
-        <article class="summary-card">
-          <span>Prefill</span>
-          <strong>{formatMetric(rocmAvgPrefill, 'tok/s')}</strong>
-          <small>average pp2048</small>
-        </article>
-        <article class="summary-card">
-          <span>Decode</span>
-          <strong>{formatMetric(rocmAvgDecode, 'tok/s')}</strong>
-          <small>average tg32</small>
-        </article>
-        <article class="summary-card">
-          <span>Measured</span>
-          <strong>{formatUtcShortDate(rocmReference.generated_at)}</strong>
-          <small>{rocmReference.methodology.shape} · UTC</small>
-        </article>
-      </div>
-    </header>
-
-    <article class="board-card rocm-board">
-      <header class="board-head">
-        <div>
-          <h3>llama.cpp ROCm, five models</h3>
-          <p>{rocmReference.methodology.shape} · {rocmReference.methodology.runs} measured runs · f16 KV</p>
-        </div>
-        <div class="legend">
-          <span><i class="legend-swatch rocm"></i>ROCm/HIP</span>
-        </div>
-      </header>
-
-      <div class="decode-rank rocm-rank" aria-label="llama.cpp ROCm reference rows">
-        {rocmRows.map((row: any) => (
-          <article class="rank-row rocm-rank-row">
-            <div class="rank-model">
-              <div>
-                <strong>{displayModelLabel(row.label)}</strong>
-                <small>{row.model_file}</small>
-              </div>
-            </div>
-            <div class="rank-bars">
-              <div class="rank-metric-group">
-                <div class="rank-metric-title">
-                  <span>Prefill</span>
-                </div>
-                <div class="bar-line rocm">
-                  <span>ROCm</span>
-                  <div class="bar-track" aria-hidden="true">
-                    <i class="bar-fill rocm" style={`width: ${barWidth(row.prefill_tps, rocmMaxPrefill)}%;`}></i>
-                  </div>
-                  <strong>{formatMetricSpread(row.prefill_tps, row.prefill_stdev, 'tok/s')}</strong>
-                </div>
-              </div>
-              <div class="rank-metric-group">
-                <div class="rank-metric-title">
-                  <span>Decode</span>
-                </div>
-                <div class="bar-line rocm">
-                  <span>ROCm</span>
-                  <div class="bar-track" aria-hidden="true">
-                    <i class="bar-fill rocm" style={`width: ${barWidth(row.decode_tps, rocmMaxDecode)}%;`}></i>
-                  </div>
-                  <strong>{formatMetricSpread(row.decode_tps, row.decode_stdev, 'tok/s')}</strong>
-                </div>
-              </div>
-            </div>
-            <div class="rank-ratio">
-              <strong>{row.id === rocmFastestPrefill?.id ? 'Fastest prefill' : row.id === rocmFastestDecode?.id ? 'Fastest decode' : 'Reference'}</strong>
-              <small>llama-bench</small>
-            </div>
-          </article>
-        ))}
-      </div>
-
-      <details class="raw-table-details">
-        <summary>
-          <strong>Qwen 35B context sweep</strong>
-          <small>{displayModelLabel(rocmReference.vulkan_crosscheck.model_label)} · pp2048 + tg32</small>
-        </summary>
-        <div class="table-wrap">
-          <table class="bench-table rocm-table">
-            <thead>
-              <tr>
-                <th>Depth</th>
-                <th>ROCm prefill</th>
-                <th>ROCm decode</th>
-                <th>Vulkan cross-check</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rocmDepthRows.map((row: any, index: number) => (
-                <tr>
-                  <th scope="row" class="model-cell">
-                    <div class="model-row">
-                      <div>
-                        <strong>d{formatNumber(row.depth, 0)}</strong>
-                        <small>{index === 0 ? rocmReference.vulkan_crosscheck.shape : 'same pp/tg shape'}</small>
-                      </div>
-                    </div>
-                  </th>
-                  <td>{formatMetricSpread(row.prefill_tps, row.prefill_stdev, 'tok/s')}</td>
-                  <td>{formatMetricSpread(row.decode_tps, row.decode_stdev, 'tok/s')}</td>
-                  <td>
-                    {index === 0 ? (
-                      <div class="metric-stack">
-                        <div class="backend-line baseline">
-                          <span class="backend-pill baseline">V</span>
-                          <div>
-                            <strong>{formatMetricSpread(rocmReference.vulkan_crosscheck.prefill_tps, rocmReference.vulkan_crosscheck.prefill_stdev, 'tok/s')}</strong>
-                            <small>prefill, {rocmReference.vulkan_crosscheck.device}</small>
-                          </div>
-                        </div>
-                        <div class="backend-line baseline">
-                          <span class="backend-pill baseline">V</span>
-                          <div>
-                            <strong>{formatMetricSpread(rocmReference.vulkan_crosscheck.decode_tps, rocmReference.vulkan_crosscheck.decode_stdev, 'tok/s')}</strong>
-                            <small>decode, {rocmReference.vulkan_crosscheck.device}</small>
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
-                      <div class="metric-missing">
-                        <strong>Not measured</strong>
-                        <small>ROCm-only row for this depth.</small>
-                      </div>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </details>
-    </article>
-
-    <details class="method-card rocm-method">
-      <summary class="method-summary">
-        <div>
-          <strong>ROCm methodology</strong>
-          <small>{rocmReference.methodology.tool} · {rocmReference.llama_cpp.commit} · ROCm {rocmReference.machine.rocm}</small>
-        </div>
-        <span>{rocmReference.methodology.shape}</span>
-      </summary>
-      <ul class="method-list">
-        {rocmReference.methodology.notes.map((note: string) => <li>{note}</li>)}
-        <li>Build flags: {rocmReference.llama_cpp.build_flags.join(', ')}.</li>
-        <li>Run flags: <code>{rocmReference.methodology.flags}</code>.</li>
-        <li>Environment: {rocmReference.methodology.env.join(', ')}.</li>
-      </ul>
-    </details>
-  </section>
 
   <script is:inline>
     function initBenchmarksDashboard() {
@@ -1706,6 +1598,38 @@ const jsonLd = {
     grid-template-columns: minmax(0, 1.35fr) minmax(360px, 1fr);
     align-items: end;
     padding: 0.2rem 0 1rem;
+  }
+
+  .target-selector {
+    display: grid;
+    gap: 0.8rem;
+    margin-bottom: 1rem;
+    padding: 0.9rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 82%, #d97706 18%);
+    border-radius: 10px;
+    background: var(--bench-surface-plain);
+    box-shadow: var(--bench-shadow);
+  }
+
+  .selector-head {
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: 1.2rem;
+  }
+
+  .selector-head h2 {
+    margin: 0;
+    font-size: clamp(1.25rem, 2.2vw, 1.7rem);
+    letter-spacing: -0.03em;
+  }
+
+  .selector-head p:last-child {
+    max-width: 650px;
+    margin: 0;
+    color: var(--color-text-muted);
+    font-size: 0.88rem;
+    line-height: 1.5;
   }
 
   .eyebrow {
@@ -1893,7 +1817,7 @@ const jsonLd = {
 
   .target-tabs {
     grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-    margin-bottom: 0.9rem;
+    margin: 0;
   }
 
   .scenario-tabs {
@@ -1964,6 +1888,75 @@ const jsonLd = {
     display: grid;
     gap: 0.1rem;
     margin-bottom: 0.55rem;
+  }
+
+  .target-tab-identity {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .backend-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.35rem;
+    padding: 0.1rem 0.42rem;
+    border: 1px solid color-mix(in srgb, #d97706 38%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, #d97706 11%, transparent);
+    color: #b45309;
+    font-size: 0.64rem;
+    font-weight: 850;
+    letter-spacing: 0.065em;
+    line-height: 1;
+    text-transform: uppercase;
+  }
+
+  .backend-badge.backend-rocm {
+    border-color: color-mix(in srgb, #0891b2 44%, transparent);
+    background: color-mix(in srgb, #06b6d4 13%, transparent);
+    color: #0e7490;
+  }
+
+  .backend-badge.backend-metal {
+    border-color: color-mix(in srgb, #7c3aed 38%, transparent);
+    background: color-mix(in srgb, #8b5cf6 11%, transparent);
+    color: #6d28d9;
+  }
+
+  .backend-badge.backend-cuda {
+    border-color: color-mix(in srgb, #16a34a 38%, transparent);
+    background: color-mix(in srgb, #22c55e 11%, transparent);
+    color: #15803d;
+  }
+
+  .target-tab.backend-rocm.active {
+    border-color: #0891b2;
+    background: color-mix(in srgb, #06b6d4 10%, var(--bench-surface-soft) 90%);
+  }
+
+  .target-tab.backend-rocm.active::before {
+    border-color: #0891b2;
+    background: radial-gradient(circle at center, #0891b2 0 42%, transparent 45%);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .backend-badge {
+      color: #fdba74;
+    }
+
+    .backend-badge.backend-rocm {
+      color: #67e8f9;
+    }
+
+    .backend-badge.backend-metal {
+      color: #c4b5fd;
+    }
+
+    .backend-badge.backend-cuda {
+      color: #86efac;
+    }
   }
 
   .scenario-tab-head {
@@ -2070,6 +2063,46 @@ const jsonLd = {
     margin-top: 0.12rem;
     font-size: 0.92rem;
     line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+
+  .machine-card .config-wide {
+    grid-column: 1 / -1;
+  }
+
+  .machine-card dd code {
+    font-weight: 600;
+    font-size: 0.82rem;
+    background: color-mix(in srgb, var(--color-border) 30%, transparent);
+    padding: 0.12rem 0.4rem;
+    border-radius: 5px;
+    overflow-wrap: anywhere;
+  }
+
+  .config-notes {
+    margin-top: 0.9rem;
+    border-top: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+    padding-top: 0.7rem;
+  }
+
+  .config-notes-title {
+    margin: 0 0 0.4rem;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--color-text-muted);
+  }
+
+  .config-notes ul {
+    margin: 0;
+    padding-left: 1.1rem;
+    display: grid;
+    gap: 0.35rem;
+  }
+
+  .config-notes li {
+    font-size: 0.85rem;
+    line-height: 1.45;
     overflow-wrap: anywhere;
   }
 
@@ -2921,455 +2954,306 @@ const jsonLd = {
     }
   }
 
-  /* Visual reset: make the benchmark page read like a dense performance tool. */
+  /* Editorial dashboard refresh: open hierarchy, fewer containers, clearer reading flow. */
   :global(main.container) {
-    --bench-accent: #c45c13;
-    --bench-control: #334155;
-    --bench-control-soft: color-mix(in srgb, #334155 7%, var(--color-bg) 93%);
-    --bench-surface: var(--color-bg);
-    --bench-surface-plain: color-mix(in srgb, var(--color-bg) 97%, var(--color-bg-alt) 3%);
-    --bench-surface-soft: color-mix(in srgb, var(--color-bg-alt) 62%, var(--color-bg) 38%);
-    --bench-tab-active: color-mix(in srgb, var(--bench-control) 10%, var(--color-bg) 90%);
-    --bench-table-head-bg: color-mix(in srgb, var(--color-bg-alt) 88%, var(--color-bg) 12%);
-    --bench-table-head-text: color-mix(in srgb, var(--color-text) 86%, var(--bench-control) 14%);
-    --bench-row-odd: var(--color-bg);
-    --bench-row-even: color-mix(in srgb, var(--color-bg-alt) 48%, var(--color-bg) 52%);
-    --bench-meter-track: color-mix(in srgb, var(--color-border) 54%, var(--color-bg-alt) 46%);
-    --bench-shadow: none;
+    max-width: 1280px;
+    padding-inline: clamp(1rem, 3.2vw, 2.5rem);
+    --bench-accent: #e46d2a;
+    --bench-accent-soft: color-mix(in srgb, var(--bench-accent) 10%, transparent);
+    --bench-rule: color-mix(in srgb, var(--color-border) 72%, transparent);
+    --bench-rule-strong: color-mix(in srgb, var(--color-border) 92%, transparent);
+    --bench-wash: color-mix(in srgb, var(--color-bg-alt) 52%, var(--color-bg) 48%);
+    --bench-raised: color-mix(in srgb, var(--color-bg-alt) 78%, var(--color-bg) 22%);
+    --bench-zinc: #df6b25;
+    --bench-llama: #4d83df;
+    --bench-rocm: #20a277;
+    --bench-meter-track: color-mix(in srgb, var(--color-border) 40%, transparent);
+    font-variant-numeric: tabular-nums;
   }
 
   .hero {
-    align-items: start;
-    padding-bottom: 1.15rem;
-    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
+    position: relative;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: clamp(2rem, 5vw, 5rem);
+    align-items: end;
+    padding: clamp(0.25rem, 1vw, 0.75rem) 0 clamp(2rem, 4vw, 3.25rem);
+    border: 0;
+  }
+
+  .hero::after {
+    content: '';
+    position: absolute;
+    inset: auto 0 0;
+    height: 1px;
+    background: linear-gradient(90deg, var(--bench-accent), var(--bench-rule) 24%, transparent 92%);
+  }
+
+  .hero-copy {
+    max-width: 700px;
   }
 
   .eyebrow {
+    margin-bottom: 0.55rem;
     color: var(--bench-accent);
+    font-size: 0.67rem;
+    letter-spacing: 0.19em;
   }
 
   .hero h1 {
-    max-width: 12ch;
+    max-width: none;
+    margin: 0 0 0.65rem;
+    font-size: clamp(3rem, 6vw, 5.35rem);
+    font-weight: 650;
+    line-height: 0.94;
+    letter-spacing: -0.065em;
+  }
+
+  .intro {
+    max-width: 64ch;
+    font-size: clamp(0.96rem, 1.4vw, 1.08rem);
+    line-height: 1.55;
   }
 
   .hero-stats {
-    align-self: stretch;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    display: grid;
+    grid-template-columns: repeat(4, auto);
     gap: 0;
-    border: 1px solid color-mix(in srgb, var(--color-border) 86%, transparent);
-    border-radius: 8px;
-    overflow: hidden;
-    background: var(--bench-surface-plain);
+    align-self: end;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    overflow: visible;
   }
 
-  .stat-card,
-  .summary-card,
-  .scenario-banner,
-  .machine-card,
-  .readout-card {
+  .stat-card {
+    min-width: 6.7rem;
+    min-height: 0;
+    padding: 0.15rem 1rem 0.2rem;
     border: 0;
+    border-left: 1px solid var(--bench-rule);
     border-radius: 0;
     background: transparent;
     box-shadow: none;
   }
 
-  .stat-card {
-    min-height: 5.1rem;
-    border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
-    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
-  }
-
-  .stat-card:nth-child(2n) {
-    border-right: 0;
-  }
-
-  .stat-card:nth-last-child(-n + 2) {
-    border-bottom: 0;
-  }
-
-  .target-tabs {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0.35rem;
-    padding: 0.35rem;
-    margin: 1rem 0 1.15rem;
-    border: 1px solid color-mix(in srgb, var(--color-border) 86%, transparent);
-    border-radius: 8px;
-    background: var(--bench-surface-plain);
-  }
-
-  .target-tab {
-    padding: 0.78rem 2.35rem 0.78rem 0.85rem;
-    border-color: transparent;
-    background: transparent;
-  }
-
-  .target-tab::before {
-    border-color: color-mix(in srgb, var(--color-text-muted) 50%, transparent);
-  }
-
-  .target-tab.active,
-  .scenario-tab.active {
-    border-color: color-mix(in srgb, var(--bench-control) 28%, var(--color-border) 72%);
-    background: var(--bench-control-soft);
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bench-control) 10%, transparent);
-  }
-
-  .target-tab:hover,
-  .scenario-tab:hover {
-    border-color: color-mix(in srgb, var(--bench-control) 30%, var(--color-border) 70%);
-    background: color-mix(in srgb, var(--bench-control-soft) 72%, var(--bench-surface-plain) 28%);
-  }
-
-  .target-tab.active::before {
-    border-color: var(--bench-accent);
-    background: radial-gradient(circle at center, var(--bench-accent) 0 42%, transparent 45%);
-  }
-
-  .panel-header {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 0.65rem;
-    padding-bottom: 0.9rem;
-    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
-  }
-
-  .panel-header h2 {
-    font-size: clamp(1.55rem, 2.2vw, 2rem);
-  }
-
-  .machine-card {
-    padding: 0;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-    gap: 0.45rem 1.15rem;
-  }
-
-  .machine-card dt {
-    font-size: 0.66rem;
-  }
-
-  .machine-card dd {
-    font-size: 0.85rem;
-  }
-
-  .summary-grid {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-    gap: 0;
-    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
-    border-radius: 8px;
-    overflow: hidden;
-    background: var(--bench-surface-plain);
-  }
-
-  .summary-card {
-    min-width: 0;
-    border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
-  }
-
-  .summary-card:last-child {
-    border-right: 0;
-  }
-
-  .scenario-tabs {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 0.25rem;
-    padding: 0.28rem;
-    border-color: color-mix(in srgb, var(--color-border) 86%, transparent);
-  }
-
-  .scenario-tab {
-    padding: 0.58rem 0.68rem 0.62rem 0.82rem;
-  }
-
-  .scenario-tab::before {
-    top: 0.58rem;
-    bottom: 0.58rem;
-    background: color-mix(in srgb, var(--color-border) 58%, transparent);
-  }
-
-  .scenario-tab.active::before {
-    background: var(--bench-accent);
-  }
-
-  .scenario-banner {
-    padding: 0.15rem 0 0.1rem;
-    grid-template-columns: minmax(0, 1fr) auto;
-    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
-  }
-
-  .scenario-banner h3 {
-    font-size: 1.16rem;
-  }
-
-  .scenario-highlights {
-    justify-content: end;
-  }
-
-  .info-chip {
-    background: var(--bench-surface-plain);
-    border-color: color-mix(in srgb, var(--color-border) 78%, transparent);
-  }
-
-  .scenario-readout {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 0;
-    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
-    border-radius: 8px;
-    overflow: hidden;
-    background: var(--bench-surface-plain);
-  }
-
-  .readout-card {
-    border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
-  }
-
-  .readout-card:last-child {
-    border-right: 0;
-  }
-
-  .board-card,
-  .method-card {
-    border-color: color-mix(in srgb, var(--color-border) 86%, transparent);
-    background: var(--bench-surface);
-  }
-
-  .board-card {
-    padding: 1rem;
-  }
-
-  .decode-rank,
-  .table-wrap {
-    border-radius: 8px;
-  }
-
-  .rank-chip {
-    background: color-mix(in srgb, var(--bench-accent) 10%, transparent);
-    color: var(--bench-accent);
-  }
-
-  .bar-fill.zinc {
-    background: linear-gradient(90deg, #b45309, #d97706);
-  }
-
-  .ratio-pill.caution {
-    background: color-mix(in srgb, #f59e0b 20%, transparent);
-  }
-
-  @media (max-width: 1100px) {
-    .machine-card {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
-    .summary-grid {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
-    .summary-card:nth-child(3n) {
-      border-right: 0;
-    }
-
-    .scenario-tabs {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .scenario-banner {
-      grid-template-columns: 1fr;
-    }
-
-    .scenario-highlights {
-      justify-content: start;
-    }
-  }
-
-  @media (max-width: 760px) {
-    .hero {
-      gap: 0.85rem;
-      padding-bottom: 0.9rem;
-    }
-
-    .hero h1 {
-      max-width: 10ch;
-    }
-
-    .hero-stats {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .stat-card {
-      min-height: 4.75rem;
-      padding: 0.75rem;
-    }
-
-    .target-tabs {
-      grid-template-columns: 1fr;
-      margin: 0.85rem 0 1rem;
-    }
-
-    .target-tab {
-      padding-top: 0.72rem;
-      padding-bottom: 0.72rem;
-    }
-
-    .machine-card {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      padding: 0;
-    }
-
-    .summary-grid,
-    .scenario-readout {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .summary-card,
-    .readout-card {
-      border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
-      border-bottom: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
-    }
-
-    .summary-card:nth-child(2n),
-    .readout-card:nth-child(2n) {
-      border-right: 0;
-    }
-
-    .summary-card:last-child {
-      grid-column: 1 / -1;
-      border-bottom: 0;
-    }
-
-    .readout-card:nth-last-child(-n + 2) {
-      border-bottom: 0;
-    }
-
-    .scenario-tabs {
-      grid-template-columns: 1fr;
-    }
-
-    .scenario-tab {
-      padding: 0.58rem 0.62rem 0.62rem 0.82rem;
-    }
-
-    .board-card {
-      padding: 0.85rem;
-    }
-  }
-
-  /* Minimal pass: remove prose-heavy benchmark chrome. */
-  .hero {
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 1.8rem;
-    align-items: center;
-  }
-
-  .hero h1 {
-    max-width: none;
-    margin-bottom: 0.25rem;
-  }
-
-  .intro {
-    font-size: 1rem;
-  }
-
-  .hero-stats {
-    display: flex;
-    align-self: center;
-    border: 0;
-    background: transparent;
-    border-radius: 0;
-    overflow: visible;
-    gap: 0;
-  }
-
-  .stat-card {
-    min-width: 6.6rem;
-    min-height: auto;
-    padding: 0 0.85rem;
-    border: 0;
-    border-left: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
-  }
-
   .stat-card:first-child {
     border-left: 0;
+    padding-left: 0;
   }
 
   .stat-card span,
   .summary-card span {
     display: block;
-    font-size: 0.64rem;
-    font-weight: 800;
-    letter-spacing: 0.08em;
+    font-size: 0.62rem;
+    font-weight: 750;
+    letter-spacing: 0.11em;
+    line-height: 1.25;
     text-transform: uppercase;
   }
 
   .stat-card strong {
-    margin-top: 0.08rem;
-    font-size: 1rem;
+    margin-top: 0.22rem;
+    font-size: 1.06rem;
+    font-weight: 650;
+    line-height: 1.2;
+  }
+
+  .target-picker {
+    margin: clamp(1.5rem, 3vw, 2.35rem) 0 clamp(2.5rem, 5vw, 4rem);
+  }
+
+  .picker-heading {
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: 1rem 2rem;
+    margin-bottom: 0.8rem;
+  }
+
+  .picker-heading > div {
+    display: flex;
+    align-items: baseline;
+    gap: 0.65rem;
+  }
+
+  .picker-heading h2,
+  .picker-heading h3,
+  .picker-heading p {
+    margin: 0;
+  }
+
+  .picker-heading h2,
+  .picker-heading h3 {
+    font-size: 0.98rem;
+    font-weight: 700;
+    letter-spacing: -0.015em;
+  }
+
+  .picker-heading p {
+    color: var(--color-text-muted);
+    font-size: 0.78rem;
+    line-height: 1.4;
+    text-align: right;
+  }
+
+  .picker-step {
+    color: var(--bench-accent);
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    font-weight: 700;
   }
 
   .target-tabs {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    padding: 0.25rem;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-block: 1px solid var(--bench-rule-strong);
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
   }
 
   .target-tab {
     display: grid;
-    grid-template-columns: minmax(6rem, auto) minmax(0, 1fr);
-    align-items: center;
-    gap: 0.7rem;
-    padding: 0.72rem 0.85rem;
+    grid-template-columns: 1fr;
+    align-content: space-between;
+    gap: 1rem;
+    min-height: 8rem;
+    padding: 1rem clamp(0.85rem, 1.8vw, 1.4rem) 1.05rem;
+    border: 0;
+    border-left: 1px solid var(--bench-rule);
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    transform: none;
+    overflow: hidden;
+  }
+
+  .target-tab:first-child {
+    border-left: 0;
   }
 
   .target-tab::before {
     display: none;
   }
 
+  .target-tab::after {
+    content: '';
+    position: absolute;
+    inset: auto 1.1rem -1px;
+    height: 3px;
+    border-radius: 999px 999px 0 0;
+    background: transparent;
+    transform: scaleX(0.35);
+    opacity: 0;
+    transition: transform 180ms ease, opacity 180ms ease;
+  }
+
+  .target-tab:hover {
+    border-color: var(--bench-rule);
+    background: var(--bench-wash);
+    transform: none;
+  }
+
+  .target-tab.active {
+    border-color: var(--bench-rule);
+    background: linear-gradient(180deg, transparent, var(--bench-accent-soft));
+    box-shadow: none;
+    transform: none;
+  }
+
+  .target-tab.active::after {
+    background: var(--bench-accent);
+    transform: scaleX(1);
+    opacity: 1;
+  }
+
   .target-tab-head {
+    gap: 0.25rem;
     margin: 0;
   }
 
+  .target-tab-head span {
+    font-size: 1.02rem;
+    font-weight: 700;
+    letter-spacing: -0.025em;
+  }
+
   .target-tab-head small {
-    display: none;
-  }
-
-  .target-tab-stats {
-    justify-self: end;
-    width: min(100%, 19rem);
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  .target-tab-stats strong,
-  .scenario-tab-stats strong {
-    font-size: 0.86rem;
+    display: block;
+    overflow: hidden;
+    color: var(--color-text-muted);
+    font-size: 0.68rem;
+    line-height: 1.35;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .target-tab-stats small,
-  .scenario-tab-stats small {
-    font-size: 0.64rem;
+  .target-tab-stats {
+    justify-self: stretch;
+    width: 100%;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.65rem;
+  }
+
+  .target-tab-stats strong {
+    margin: 0;
+    font-size: 0.88rem;
+    line-height: 1.1;
+  }
+
+  .target-tab-stats small {
+    margin-top: 0.16rem;
+    font-size: 0.61rem;
+    line-height: 1.2;
+  }
+
+  .target-panel {
+    gap: clamp(1.25rem, 2.5vw, 2rem);
+    margin-bottom: clamp(3.5rem, 7vw, 6rem);
   }
 
   .panel-header {
     display: flex;
     align-items: end;
     justify-content: space-between;
-    gap: 1rem;
+    gap: 1rem 2rem;
+    padding: 0;
+    border: 0;
+  }
+
+  .panel-header h2 {
+    margin-bottom: 0.25rem;
+    font-size: clamp(1.9rem, 3vw, 2.65rem);
+    letter-spacing: -0.045em;
   }
 
   .panel-copy {
-    margin-top: 0.25rem;
-    font-size: 0.9rem;
+    max-width: 72ch;
+    font-size: 0.88rem;
+    line-height: 1.5;
   }
 
   .machine-details {
-    justify-self: end;
     position: relative;
+    flex: 0 0 auto;
   }
 
   .machine-details summary {
+    position: relative;
+    display: block;
     list-style: none;
     cursor: pointer;
-    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+    min-height: 2.25rem;
+    padding: 0.37rem 0.75rem;
+    border: 0;
     border-radius: 999px;
-    padding: 0.34rem 0.72rem;
+    background: var(--bench-wash);
     color: var(--color-text-muted);
-    font-size: 0.78rem;
+    font-size: 0.72rem;
     font-weight: 700;
   }
 
@@ -3377,419 +3261,784 @@ const jsonLd = {
     display: none;
   }
 
+  .machine-details summary:hover,
   .machine-details[open] summary {
+    background: var(--bench-raised);
     color: var(--color-text);
   }
 
   .machine-details .machine-card {
-    margin-top: 0.65rem;
+    position: absolute;
+    z-index: 5;
+    top: calc(100% + 0.55rem);
+    right: 0;
+    width: min(760px, calc(100vw - 2rem));
+    margin: 0;
+    padding: 1rem;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border: 1px solid var(--bench-rule-strong);
+    border-radius: 12px;
+    background: var(--color-bg);
+    box-shadow: 0 24px 70px -34px rgba(0, 0, 0, 0.62);
   }
 
   .summary-grid {
+    display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0;
+    padding: 0.15rem 0;
+    border: 0;
+    border-block: 1px solid var(--bench-rule);
+    border-radius: 0;
+    background: transparent;
+    overflow: visible;
+  }
+
+  .summary-card {
+    min-height: 5.7rem;
+    padding: 1rem clamp(1rem, 2vw, 1.5rem);
+    border: 0;
+    border-left: 1px solid var(--bench-rule);
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .summary-card:first-child {
+    border-left: 0;
+    padding-left: 0;
+  }
+
+  .summary-card strong {
+    margin-top: 0.28rem;
+    font-size: 1.18rem;
+    font-weight: 650;
+    letter-spacing: -0.025em;
+  }
+
+  .summary-card small {
+    display: block;
+    margin-top: 0.18rem;
+    color: var(--color-text-muted);
+    font-size: 0.73rem;
+    line-height: 1.35;
+  }
+
+  .scenario-picker {
+    display: grid;
+    gap: 0;
+  }
+
+  .picker-heading.compact {
+    margin-bottom: 0.65rem;
   }
 
   .scenario-tabs {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.45rem;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
   }
 
   .scenario-tab {
+    display: grid;
+    gap: 0.55rem;
     min-width: 0;
+    padding: 0.75rem 0.85rem 0.8rem;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: var(--bench-wash);
+    box-shadow: none;
+    transform: none;
+  }
+
+  .scenario-tab::before {
+    display: none;
+  }
+
+  .scenario-tab:hover {
+    border-color: var(--bench-rule-strong);
+    background: var(--bench-raised);
+    transform: none;
+  }
+
+  .scenario-tab.active {
+    border-color: color-mix(in srgb, var(--bench-accent) 35%, var(--bench-rule));
+    background: var(--bench-accent-soft);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bench-accent) 7%, transparent);
+    transform: none;
   }
 
   .scenario-tab-head {
-    margin-bottom: 0.28rem;
+    margin: 0;
+  }
+
+  .scenario-tab-head span {
+    font-size: 0.86rem;
+    font-weight: 700;
   }
 
   .scenario-tab-stats {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.4rem;
+  }
+
+  .scenario-tab-stats strong {
+    margin: 0;
+    font-size: 0.78rem;
+  }
+
+  .scenario-tab-stats small {
+    margin-top: 0.14rem;
+    font-size: 0.58rem;
+  }
+
+  .scenario-panel {
+    gap: 0;
   }
 
   .scenario-banner {
+    display: flex;
     align-items: center;
-    padding: 0.62rem 0 0.54rem;
+    justify-content: space-between;
+    gap: 0.8rem 1.5rem;
+    padding: 0 0 0.75rem;
+    border: 0;
+    border-bottom: 1px solid var(--bench-rule);
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
   }
 
   .scenario-banner h3 {
-    font-size: 1.05rem;
+    margin: 0;
+    font-size: 1.15rem;
+    letter-spacing: -0.02em;
   }
 
   .scenario-highlights {
-    gap: 0.32rem;
+    justify-content: flex-end;
+    gap: 0.35rem 0.75rem;
   }
 
   .info-chip {
-    padding: 0.24rem 0.45rem;
-    border-radius: 999px;
-    font-size: 0.72rem;
+    gap: 0.28rem;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    font-size: 0.7rem;
   }
 
   .scenario-readout {
     display: none;
   }
 
+  .board-card,
+  .method-card {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .board-card {
+    padding: 1.1rem 0 0;
+  }
+
   .board-head {
     align-items: center;
-    margin-bottom: 0.55rem;
+    margin-bottom: 0.2rem;
   }
 
   .board-head h3 {
-    font-size: 1rem;
-    letter-spacing: 0;
+    font-size: 0.82rem;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
   }
 
   .legend {
-    font-size: 0.72rem;
+    font-size: 0.68rem;
   }
 
-  .rank-row {
-    padding: 0.68rem 0.78rem;
+  .legend-swatch {
+    width: 7px;
+    height: 7px;
+  }
+
+  .decode-rank {
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    overflow: visible;
+  }
+
+  .rank-row,
+  .rocm-rank-row {
+    grid-template-columns: minmax(230px, 0.82fr) minmax(440px, 1.55fr) minmax(100px, auto);
+    gap: clamp(1rem, 2.8vw, 2.25rem);
+    padding: 1.15rem 0;
+    border: 0;
+    border-top: 1px solid var(--bench-rule);
+  }
+
+  .rank-row:last-child {
+    border-bottom: 1px solid var(--bench-rule);
+  }
+
+  .rank-model strong {
+    font-size: 0.93rem;
+    font-weight: 650;
+    letter-spacing: -0.015em;
   }
 
   .rank-model small,
   .rank-ratio small {
-    font-size: 0.78rem;
+    margin-top: 0.22rem;
+    font-size: 0.7rem;
+  }
+
+  .rank-bars {
+    gap: clamp(0.75rem, 2vw, 1.6rem);
+  }
+
+  .rank-metric-title span {
+    font-size: 0.61rem;
+    letter-spacing: 0.1em;
+  }
+
+  .bar-line {
+    grid-template-columns: 3rem minmax(68px, 1fr) 6.35rem;
+    gap: 0.55rem;
+  }
+
+  .bar-line span {
+    font-size: 0.6rem;
+    letter-spacing: 0.07em;
+  }
+
+  .bar-line strong {
+    font-size: 0.76rem;
+    font-weight: 650;
+  }
+
+  .bar-track {
+    height: 0.38rem;
+  }
+
+  .bar-fill.zinc {
+    background: linear-gradient(90deg, color-mix(in srgb, var(--bench-zinc) 72%, transparent), var(--bench-zinc));
+  }
+
+  .bar-fill.baseline {
+    background: linear-gradient(90deg, color-mix(in srgb, var(--bench-llama) 68%, transparent), var(--bench-llama));
+  }
+
+  .bar-fill.rocm {
+    background: linear-gradient(90deg, color-mix(in srgb, var(--bench-rocm) 68%, transparent), var(--bench-rocm));
+  }
+
+  .rank-ratio {
+    gap: 0.25rem;
+  }
+
+  .ratio-pill {
+    padding: 0.22rem 0.46rem;
+    border-radius: 999px;
+    font-size: 0.69rem;
+  }
+
+  .raw-table-details,
+  .mobile-detail-details {
+    margin-top: 0.9rem;
+    padding-top: 0;
+    border: 0;
   }
 
   .mobile-detail-details {
     display: none;
   }
 
-  .mobile-detail-details summary,
-  .raw-table-details summary {
-    min-height: 2.3rem;
+  .raw-table-details summary,
+  .mobile-detail-details summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+    min-height: 2.6rem;
+    padding: 0.25rem 0;
+    border-bottom: 1px solid var(--bench-rule);
   }
 
-  .mobile-detail-details summary strong,
-  .raw-table-details summary strong {
-    font-size: 0.92rem;
+  .mobile-detail-details summary::-webkit-details-marker {
+    display: none;
   }
 
-  @media (max-width: 760px) {
+  .raw-table-details summary::after,
+  .mobile-detail-details summary::after {
+    content: '+';
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.45rem;
+    height: 1.45rem;
+    border: 0;
+    border-radius: 999px;
+    background: var(--bench-wash);
+    color: var(--color-text-muted);
+    font-weight: 800;
+  }
+
+  .mobile-detail-details[open] summary::after {
+    content: '-';
+  }
+
+  .table-wrap {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .method-card {
+    margin-top: 0.15rem;
+    border-block: 1px solid var(--bench-rule);
+  }
+
+  .method-summary {
+    padding: 0.75rem 0;
+    align-items: center;
+  }
+
+  .method-card[open] .method-summary {
+    border-bottom-color: var(--bench-rule);
+  }
+
+  .method-links {
+    padding-inline: 0;
+  }
+
+  .method-list {
+    padding-right: 0;
+    padding-left: 1.2rem;
+  }
+
+  .rocm-reference {
+    gap: 1.35rem;
+    margin-top: 0;
+    padding-top: clamp(2.75rem, 6vw, 5rem);
+    border-top: 1px solid var(--bench-rule-strong);
+  }
+
+  .rocm-head {
+    grid-template-columns: minmax(300px, 0.8fr) minmax(520px, 1.2fr);
+    gap: clamp(2rem, 5vw, 5rem);
+    align-items: end;
+  }
+
+  .rocm-head h2 {
+    font-size: clamp(1.8rem, 3vw, 2.6rem);
+    letter-spacing: -0.045em;
+  }
+
+  .rocm-head p {
+    font-size: 0.86rem;
+  }
+
+  .rocm-summary {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    border: 0;
+    border-block: 1px solid var(--bench-rule);
+    border-radius: 0;
+    background: transparent;
+    overflow: visible;
+  }
+
+  .rocm-summary .summary-card,
+  .rocm-summary .summary-card:last-child {
+    min-height: 6.25rem;
+    border: 0;
+    border-left: 1px solid var(--bench-rule);
+  }
+
+  .rocm-summary .summary-card:first-child {
+    border-left: 0;
+  }
+
+  .rocm-board {
+    padding-top: 0;
+  }
+
+  .rocm-board .board-head {
+    margin-bottom: 0.35rem;
+  }
+
+  .rocm-board .board-head p {
+    margin: 0.15rem 0 0;
+    color: var(--color-text-muted);
+    font-size: 0.78rem;
+    line-height: 1.4;
+  }
+
+  .legend-swatch.rocm {
+    background: var(--bench-rocm);
+  }
+
+  .rocm-rank-row .bar-line.rocm {
+    grid-template-columns: 3rem minmax(68px, 1fr) 8.6rem;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .target-tab,
+    .target-tab::after,
+    .scenario-tab {
+      transition: none;
+    }
+  }
+
+  @media (max-width: 1040px) {
     .hero {
       grid-template-columns: 1fr;
-      gap: 0.35rem;
+      gap: 1.4rem;
+      align-items: start;
     }
 
-    .hero h1 {
-      max-width: none;
-      font-size: clamp(2.25rem, 14vw, 3.2rem);
-    }
-
-    .intro,
-    .hero-stats,
-    .machine-details,
-    .summary-grid,
-    .scenario-banner {
-      display: none;
+    .hero-stats {
+      justify-self: start;
     }
 
     .target-tabs {
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      margin: 0.75rem 0 0.9rem;
     }
 
-    .target-tab {
-      grid-template-columns: 1fr;
-      gap: 0.48rem;
-      padding: 0.66rem;
+    .target-tab:nth-child(odd) {
+      border-left: 0;
     }
 
-    .target-tab-stats {
-      justify-self: stretch;
-      width: 100%;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .target-tab-stats div:nth-child(3) {
-      display: none;
-    }
-
-    .panel-header {
-      align-items: start;
-      padding-bottom: 0.65rem;
-    }
-
-    .panel-header h2 {
-      font-size: 1.5rem;
-    }
-
-    .panel-copy {
-      font-size: 0.82rem;
-      line-height: 1.4;
+    .target-tab:nth-child(n + 3) {
+      border-top: 1px solid var(--bench-rule);
     }
 
     .scenario-tabs {
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 0.24rem;
-      padding: 0.24rem;
+    }
+
+    .rank-row,
+    .rocm-rank-row {
+      grid-template-columns: minmax(190px, 0.7fr) minmax(330px, 1.3fr) minmax(94px, auto);
+      gap: 1rem;
+    }
+
+    .rank-bars {
+      grid-template-columns: 1fr;
+      gap: 0.7rem;
+    }
+
+    .machine-details .machine-card {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .rocm-head {
+      grid-template-columns: 1fr;
+      gap: 1.25rem;
+      align-items: start;
+    }
+  }
+
+  @media (max-width: 700px) {
+    :global(main.container) {
+      padding-top: 1.8rem;
+      padding-inline: 0.9rem;
+    }
+
+    .hero {
+      gap: 1.15rem;
+      padding-bottom: 1.65rem;
+    }
+
+    .hero h1 {
+      font-size: clamp(2.8rem, 15vw, 4rem);
+      line-height: 0.95;
+    }
+
+    .intro {
+      display: block;
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
+
+    .hero-stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.8rem 0;
+      width: 100%;
+      overflow: visible;
+    }
+
+    .hero-stats::-webkit-scrollbar,
+    .target-tabs::-webkit-scrollbar,
+    .scenario-tabs::-webkit-scrollbar {
+      display: none;
+    }
+
+    .stat-card {
+      min-width: 0;
+      padding: 0 0.5rem;
+      border-left: 1px solid var(--bench-rule);
+    }
+
+    .stat-card:first-child {
+      padding-left: 0;
+      border-left: 0;
+    }
+
+    .stat-card:nth-child(odd) {
+      padding-left: 0;
+      border-left: 0;
+    }
+
+    .stat-card span {
+      font-size: 0.57rem;
+    }
+
+    .stat-card strong {
+      font-size: 0.92rem;
+    }
+
+    .target-picker {
+      margin: 1.25rem 0 2.6rem;
+    }
+
+    .picker-heading {
+      display: block;
+      margin-bottom: 0.65rem;
+    }
+
+    .picker-heading p {
+      margin-top: 0.25rem;
+      padding-left: 1.85rem;
+      text-align: left;
+    }
+
+    .target-tabs,
+    .scenario-tabs {
+      display: flex;
+      grid-template-columns: none;
+      gap: 0.5rem;
+      margin-inline: -0.9rem;
+      padding: 0 0.9rem 0.2rem;
+      overflow-x: auto;
+      border: 0;
+      scroll-padding-inline: 0.9rem;
+      scroll-snap-type: x proximity;
+    }
+
+    .target-tab {
+      flex: 0 0 min(76vw, 17rem);
+      min-height: 7.15rem;
+      padding: 0.85rem;
+      border: 1px solid var(--bench-rule);
+      border-radius: 13px;
+      background: var(--bench-wash);
+      scroll-snap-align: start;
+    }
+
+    .target-tab:first-child,
+    .target-tab:nth-child(odd),
+    .target-tab:nth-child(n + 3) {
+      border: 1px solid var(--bench-rule);
+    }
+
+    .target-tab.active {
+      border-color: color-mix(in srgb, var(--bench-accent) 38%, var(--bench-rule));
+      background: var(--bench-accent-soft);
+    }
+
+    .target-tab::after {
+      inset: auto 0.85rem -1px;
+    }
+
+    .target-tab-head small {
+      display: block;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: start;
+      padding: 0;
+    }
+
+    .panel-header h2 {
+      font-size: 1.85rem;
+    }
+
+    .panel-copy {
+      font-size: 0.78rem;
+    }
+
+    .machine-details {
+      display: block;
+    }
+
+    .machine-details summary {
+      overflow: hidden;
+      max-width: 2.2rem;
+      padding-inline: 0.7rem;
+      color: transparent;
+      white-space: nowrap;
+    }
+
+    .machine-details summary::after {
+      content: 'i';
+      position: absolute;
+      right: 0.82rem;
+      color: var(--color-text-muted);
+      font-family: Georgia, serif;
+      font-weight: 700;
+    }
+
+    .machine-details .machine-card {
+      position: absolute;
+      grid-template-columns: 1fr;
+      max-height: min(70vh, 32rem);
+      overflow-y: auto;
+    }
+
+    .summary-grid {
+      display: none;
+    }
+
+    .picker-heading.compact {
+      margin-bottom: 0.55rem;
+    }
+
+    .scenario-tabs {
+      gap: 0.45rem;
     }
 
     .scenario-tab {
-      padding: 0.55rem 0.58rem;
+      flex: 0 0 min(64vw, 13.5rem);
+      padding: 0.72rem 0.75rem;
+      scroll-snap-align: start;
     }
 
-    .scenario-tab::before {
+    .scenario-tab-stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .scenario-tab-stats div:first-child {
       display: none;
     }
 
     .scenario-tab-stats small {
+      display: block;
+    }
+
+    .scenario-banner {
+      display: flex;
+      padding-bottom: 0.65rem;
+    }
+
+    .scenario-highlights {
       display: none;
     }
 
     .board-card {
-      padding: 0.72rem;
+      padding-top: 0.8rem;
     }
 
     .board-head {
       flex-direction: row;
       align-items: center;
+      margin-bottom: 0;
     }
 
-    .legend span:nth-child(2) {
-      display: inline-flex;
-    }
-
-    .rank-row {
+    .rank-row,
+    .rocm-rank-row {
       grid-template-columns: 1fr;
-      gap: 0.48rem;
-      padding: 0.74rem 0.68rem;
+      gap: 0.75rem;
+      padding: 1rem 0;
     }
 
     .rank-model small {
-      display: none;
+      display: block;
     }
 
     .rank-status {
       display: inline-flex;
-      margin-top: 0.42rem;
+      margin-top: 0.4rem;
+    }
+
+    .rank-bars {
+      grid-template-columns: 1fr;
+      gap: 0.75rem;
+    }
+
+    .bar-line {
+      grid-template-columns: 2.8rem minmax(48px, 1fr) 5.9rem;
+      gap: 0.4rem;
+    }
+
+    .bar-line strong {
+      font-size: 0.72rem;
     }
 
     .rank-ratio {
       grid-auto-flow: column;
       justify-content: start;
       align-items: center;
-      gap: 0.45rem;
-    }
-
-    .rank-ratio small {
-      display: block;
+      gap: 0.4rem;
+      text-align: left;
     }
 
     .mobile-detail-details {
       display: block;
-      margin-top: 0.65rem;
-      border-top: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
-      padding-top: 0.5rem;
-    }
-
-    .mobile-detail-details summary {
-      list-style: none;
-      cursor: pointer;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      color: var(--color-text);
-    }
-
-    .mobile-detail-details summary::-webkit-details-marker {
-      display: none;
-    }
-
-    .mobile-detail-details summary::after {
-      content: '+';
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 1.35rem;
-      height: 1.35rem;
-      border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
-      border-radius: 999px;
-      color: var(--color-text-muted);
-      font-weight: 800;
-    }
-
-    .mobile-detail-details[open] summary::after {
-      content: '-';
     }
 
     .mobile-detail-details[open] .mobile-bench-list {
       display: grid;
-      gap: 0;
-      margin-top: 0.6rem;
+      margin-top: 0.75rem;
     }
 
-    .method-card {
+    .raw-table-details,
+    .method-card:not(.rocm-method) {
       display: none;
     }
+
   }
 
-  .rocm-reference {
-    display: grid;
-    gap: 0.85rem;
-    margin-top: 1.4rem;
-    padding-top: 1rem;
-    border-top: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
-  }
-
-  .rocm-head {
-    display: grid;
-    grid-template-columns: minmax(0, 0.95fr) minmax(420px, 1.05fr);
-    gap: 1rem;
-    align-items: end;
-  }
-
-  .rocm-head h2 {
-    margin: 0 0 0.35rem;
-    font-size: clamp(1.45rem, 2.1vw, 2rem);
-    letter-spacing: 0;
-  }
-
-  .rocm-head p {
-    margin: 0;
-    max-width: 74ch;
-    color: var(--color-text-muted);
-    line-height: 1.55;
-  }
-
-  .rocm-head code,
-  .method-list code {
-    padding: 0.08rem 0.24rem;
-    border-radius: 4px;
-    background: color-mix(in srgb, var(--color-border) 24%, transparent);
-    color: var(--color-text);
-    font-size: 0.9em;
-  }
-
-  .rocm-summary {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
-    border-radius: 8px;
-    overflow: hidden;
-    background: var(--bench-surface-plain);
-  }
-
-  .rocm-summary .summary-card {
-    min-width: 0;
-    border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
-  }
-
-  .rocm-summary .summary-card:last-child {
-    grid-column: auto;
-    border-right: 0;
-  }
-
-  .legend-swatch.rocm {
-    background: #059669;
-  }
-
-  .bar-fill.rocm {
-    background: linear-gradient(90deg, #047857, #10b981);
-  }
-
-  .rocm-board .board-head p {
-    margin: 0.12rem 0 0;
-    color: var(--color-text-muted);
-    font-size: 0.85rem;
-  }
-
-  .rocm-rank {
-    margin-bottom: 0;
-  }
-
-  .rocm-rank-row {
-    grid-template-columns: minmax(240px, 0.85fr) minmax(420px, 1.45fr) minmax(130px, auto);
-  }
-
-  .bar-line.rocm {
-    grid-template-columns: 3.6rem minmax(64px, 1fr) 8.5rem;
-  }
-
-  .rocm-table {
-    min-width: 900px;
-  }
-
-  .rocm-method {
-    margin-top: 0;
-  }
-
-  @media (max-width: 1100px) {
-    .rocm-head {
-      grid-template-columns: 1fr;
-      align-items: start;
-    }
-
-    .rocm-summary {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .rocm-summary .summary-card {
-      border-bottom: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
-    }
-
-    .rocm-summary .summary-card:nth-child(2n) {
-      border-right: 0;
-    }
-
-    .rocm-summary .summary-card:nth-last-child(-n + 2) {
-      border-bottom: 0;
-    }
-
-    .rocm-rank-row {
-      grid-template-columns: minmax(210px, 0.85fr) minmax(320px, 1.25fr) minmax(116px, auto);
-    }
+  /* Backend selector is the primary navigation for published measurements. */
+  .target-selector .target-tabs {
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    padding: 0;
   }
 
   @media (max-width: 760px) {
-    .rocm-reference {
-      margin-top: 1rem;
-      padding-top: 0.85rem;
+    .target-selector {
+      gap: 0.6rem;
+      margin-bottom: 0.8rem;
+      padding: 0.65rem;
     }
 
-    .rocm-head {
-      gap: 0.7rem;
+    .selector-head {
+      display: block;
     }
 
-    .rocm-head h2 {
-      font-size: 1.45rem;
+    .selector-head p:last-child {
+      display: none;
     }
 
-    .rocm-head p {
-      font-size: 0.86rem;
-      line-height: 1.45;
-    }
-
-    .rocm-summary {
+    .target-selector .target-tabs {
       grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .rocm-summary .summary-card {
-      display: block;
-      grid-column: auto;
-      border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
-      border-bottom: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
-    }
-
-    .rocm-summary .summary-card:nth-child(2n) {
-      border-right: 0;
-    }
-
-    .rocm-summary .summary-card:nth-last-child(-n + 2) {
-      border-bottom: 0;
-    }
-
-    .rocm-rank-row {
-      grid-template-columns: 1fr;
-    }
-
-    .bar-line.rocm {
-      grid-template-columns: 3.1rem minmax(56px, 1fr) 7.6rem;
-    }
-
-    .rocm-method {
-      display: block;
+      margin: 0;
     }
   }
 </style>

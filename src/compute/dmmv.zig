@@ -368,6 +368,39 @@ pub const DmmvDispatch = struct {
     pipeline_q6k: ?Pipeline,
     /// Q6K wide-vocab variant (NUM_ROWS=8) for tall LM heads.
     pipeline_q6k_wide: ?Pipeline,
+    /// Q6_K NUM_ROWS=4 variant for M == hidden_dim decode projections, or null.
+    pipeline_q6k_rows4: ?Pipeline,
+    /// Q4_K NUM_ROWS=4 variant for M == hidden_dim decode projections, or null.
+    pipeline_q4k_rows4: ?Pipeline,
+    /// Q6_K 4-rows x 1..4-columns variant for speculative verification batches, or null.
+    pipeline_q6k_rows4_cols: ?Pipeline,
+    /// Q4_K 4-rows x 1..4-columns variant for speculative verification batches, or null.
+    pipeline_q4k_rows4_cols: ?Pipeline,
+    /// NUM_ROWS = 2/8 variants of the column kernels (ZINC_MTP_COLS_ROWS).
+    pipeline_q4k_cols_r2: ?Pipeline,
+    /// Q5_K column matvec (NextN/MTP verification; SSM out projection).
+    pipeline_q5k_rows4_cols: ?Pipeline,
+    /// MAX_COLS = 3 variants (3-token verification batches, fewer live registers).
+    pipeline_q4k_rows4_cols3: ?Pipeline,
+    pipeline_q4k_rows4_cols4: ?Pipeline,
+    pipeline_q6k_rows4_cols3: ?Pipeline,
+    pipeline_q6k_rows4_cols4: ?Pipeline,
+    pipeline_q5k_rows4_cols3: ?Pipeline,
+    pipeline_q5k_rows4_cols4: ?Pipeline,
+    pipeline_q6k_rows8_cols3: ?Pipeline,
+    pipeline_q6k_rows8_cols4: ?Pipeline,
+    pipeline_q4k_rows8_cols3: ?Pipeline,
+    pipeline_q4k_rows8_cols4: ?Pipeline,
+    pipeline_q4k_cols_r8: ?Pipeline,
+    pipeline_q6k_cols_r2: ?Pipeline,
+    pipeline_q6k_cols_r8: ?Pipeline,
+    /// Fused Q4_K gate+up+SwiGLU for 2-4 column batches (NextN/MTP verification).
+    pipeline_q4k_fused_gate_up_swiglu_cols: ?Pipeline,
+    /// Three-column, unguarded variant of the fused gate+up+SwiGLU column kernel.
+    pipeline_q4k_fused_gate_up_swiglu_cols3: ?Pipeline,
+    pipeline_q4k_fused_gate_up_swiglu_cols4: ?Pipeline,
+    /// Q4_K x Q8_1 (dp4a) column matvec for 2-4 column batches (NextN/MTP verification).
+    pipeline_q4k_q8_1_cols: ?Pipeline,
     /// MXFP4 pipeline, or null.
     pipeline_mxfp4: ?Pipeline,
     pipeline_stq1_0: ?Pipeline,
@@ -917,6 +950,18 @@ pub const DmmvDispatch = struct {
             push_desc_wave64_options
         else
             push_desc_options;
+        // NextN/MTP column kernels: wave32 doubles the waves per SIMD for the same
+        // register footprint (the 3-column kernels are occupancy-bound: RDNA4
+        // pass 38.3 -> 36.3 ms). ZINC_MTP_COLS_WAVE32=0 keeps the default width.
+        // ZINC_MTP_COLS_WAVE32: 0 = driver default width, 1 = require 32, 64 = require 64.
+        const cols_wave_env = std.posix.getenv("ZINC_MTP_COLS_WAVE32");
+        const cols_wave_req: u32 = if (cols_wave_env) |v| (if (std.mem.eql(u8, v, "1")) 32 else if (std.mem.eql(u8, v, "64")) 64 else 0) else 0;
+        const cols_wave_supported = instance.caps.subgroup_size_control and
+            instance.caps.min_subgroup_size <= cols_wave_req and instance.caps.max_subgroup_size >= cols_wave_req;
+        const cols_options: pipeline_mod.PipelineOptions = if (cols_wave_req != 0 and cols_wave_supported)
+            .{ .required_subgroup_size = cols_wave_req, .require_full_subgroups = true, .push_descriptors = has_push_desc }
+        else
+            push_desc_options;
 
         var path_buf: [512]u8 = undefined;
 
@@ -1059,6 +1104,85 @@ pub const DmmvDispatch = struct {
         const q6k_wide_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_wide.spv", .{shader_dir}) catch unreachable;
         const pipeline_q6k_wide = pipeline_mod.createFromSpirvWithOptions(instance, q6k_wide_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q6_K wide shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q6k_rows4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_rows4.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_rows4 = pipeline_mod.createFromSpirvWithOptions(instance, q6k_rows4_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("Q6_K rows4 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4k_rows4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_rows4.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_rows4 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_rows4_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("Q4_K rows4 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q6k_rows4_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_rows4_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_rows4_cols = pipeline_mod.createFromSpirvWithOptions(instance, q6k_rows4_cols_path, 3, push_size, &.{}, cols_options, allocator) catch |err| blk: {
+            log.warn("Q6_K rows4 cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4k_rows4_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_rows4_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_rows4_cols = pipeline_mod.createFromSpirvWithOptions(instance, q4k_rows4_cols_path, 3, push_size, &.{}, cols_options, allocator) catch |err| blk: {
+            log.warn("Q4_K rows4 cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q5k_rows4_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_rows4_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5k_rows4_cols = pipeline_mod.createFromSpirvWithOptions(instance, q5k_rows4_cols_path, 3, push_size, &.{}, cols_options, allocator) catch |err| blk: {
+            log.warn("Q5_K rows4 cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4k_cols3_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_rows4_cols3.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_rows4_cols3 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_cols3_path, 3, push_size, &.{}, cols_options, allocator) catch null;
+        const q4k_cols4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_rows4_cols4.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_rows4_cols4 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_cols4_path, 3, push_size, &.{}, cols_options, allocator) catch null;
+        const q6k_cols3_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_rows4_cols3.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_rows4_cols3 = pipeline_mod.createFromSpirvWithOptions(instance, q6k_cols3_path, 3, push_size, &.{}, cols_options, allocator) catch null;
+        const q6k_cols4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_rows4_cols4.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_rows4_cols4 = pipeline_mod.createFromSpirvWithOptions(instance, q6k_cols4_path, 3, push_size, &.{}, cols_options, allocator) catch null;
+        const q5k_cols3_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_rows4_cols3.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5k_rows4_cols3 = pipeline_mod.createFromSpirvWithOptions(instance, q5k_cols3_path, 3, push_size, &.{}, cols_options, allocator) catch null;
+        const q5k_cols4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_rows4_cols4.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5k_rows4_cols4 = pipeline_mod.createFromSpirvWithOptions(instance, q5k_cols4_path, 3, push_size, &.{}, cols_options, allocator) catch null;
+        const q6k_r8_cols3_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_rows8_cols3.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_rows8_cols3 = pipeline_mod.createFromSpirvWithOptions(instance, q6k_r8_cols3_path, 3, push_size, &.{}, cols_options, allocator) catch null;
+        const q6k_r8_cols4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_rows8_cols4.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_rows8_cols4 = pipeline_mod.createFromSpirvWithOptions(instance, q6k_r8_cols4_path, 3, push_size, &.{}, cols_options, allocator) catch null;
+        const q4k_r8_cols3_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_rows8_cols3.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_rows8_cols3 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_r8_cols3_path, 3, push_size, &.{}, cols_options, allocator) catch null;
+        const q4k_r8_cols4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_rows8_cols4.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_rows8_cols4 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_r8_cols4_path, 3, push_size, &.{}, cols_options, allocator) catch null;
+        const q4k_rows2_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_rows2_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_cols_r2 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_rows2_cols_path, 3, push_size, &.{}, cols_options, allocator) catch |err| blk: {
+            log.warn("Q4_K rows2 cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4k_rows8_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_rows8_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_cols_r8 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_rows8_cols_path, 3, push_size, &.{}, cols_options, allocator) catch |err| blk: {
+            log.warn("Q4_K rows8 cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q6k_rows2_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_rows2_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_cols_r2 = pipeline_mod.createFromSpirvWithOptions(instance, q6k_rows2_cols_path, 3, push_size, &.{}, cols_options, allocator) catch |err| blk: {
+            log.warn("Q6_K rows2 cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q6k_rows8_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_rows8_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_cols_r8 = pipeline_mod.createFromSpirvWithOptions(instance, q6k_rows8_cols_path, 3, push_size, &.{}, cols_options, allocator) catch |err| blk: {
+            log.warn("Q6_K rows8 cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4k_fused_gateup_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_swiglu_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_fused_gate_up_swiglu_cols = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gateup_cols_path, 4, push_size, &.{}, cols_options, allocator) catch |err| blk: {
+            log.warn("Q4_K fused gate/up/SwiGLU cols shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4k_fused_gateup_cols3_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_swiglu_cols3.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_fused_gate_up_swiglu_cols3 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gateup_cols3_path, 4, push_size, &.{}, cols_options, allocator) catch null;
+        const q4k_fused_gateup_cols4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_swiglu_cols4.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_fused_gate_up_swiglu_cols4 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gateup_cols4_path, 4, push_size, &.{}, cols_options, allocator) catch null;
+        const q4k_q81_cols_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_q8_1_cols.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_q8_1_cols = pipeline_mod.createFromSpirvWithOptions(instance, q4k_q81_cols_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K x Q8_1 cols shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -1487,7 +1611,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q4k_gate_up_swiglu != null) {
-            log.info("mul_mm_q4k_gate_up_swiglu pipeline loaded (Qwen3.6-27B batched dense FFN)", .{});
+            log.info("mul_mm_q4k_gate_up_swiglu pipeline loaded (Qwen dense-hybrid 27B batched FFN)", .{});
         }
         const mul_mm_q4k_gate_up_geglu_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_gate_up_geglu.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q4k_gate_up_geglu = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gate_up_geglu_path, 4, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
@@ -1519,7 +1643,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q4k_gate_up_swiglu_full != null) {
-            log.info("mul_mm_q4k_gate_up_swiglu_full pipeline loaded (branchless Qwen3.6-27B dense FFN full tiles)", .{});
+            log.info("mul_mm_q4k_gate_up_swiglu_full pipeline loaded (branchless Qwen dense-hybrid 27B FFN full tiles)", .{});
         }
         const mul_mm_q6k_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q6k.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q6k = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
@@ -1527,7 +1651,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q6k != null) {
-            log.info("mul_mm_q6k pipeline loaded (Qwen3.6-27B batched Q6_K prefill projections)", .{});
+            log.info("mul_mm_q6k pipeline loaded (Qwen dense-hybrid 27B batched Q6_K prefill projections)", .{});
         }
         const mul_mm_q6k_full_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q6k_full.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q6k_full = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q6k_full_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
@@ -1559,7 +1683,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q5k != null) {
-            log.info("mul_mm_q5k pipeline loaded (Qwen3.6-27B batched Q5_K SSM-out prefill projection)", .{});
+            log.info("mul_mm_q5k pipeline loaded (Qwen dense-hybrid 27B batched Q5_K SSM-out prefill projection)", .{});
         }
         const mul_mm_q5k_wide_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q5k_wide.spv", .{shader_dir}) catch unreachable;
         const pipeline_mul_mm_q5k_wide = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q5k_wide_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
@@ -1594,7 +1718,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q6k_full_dp4a != null) {
-            log.info("mul_mm_q6k_full_dp4a pipeline loaded (int8 DP4a Qwen3.6-27B dense-down prefill)", .{});
+            log.info("mul_mm_q6k_full_dp4a pipeline loaded (int8 DP4a Qwen dense-hybrid 27B down prefill)", .{});
         }
         const spec_k_4096 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 4096 }};
         const spec_k_4096_n64 = [_]pipeline_mod.SpecConst{
@@ -1877,7 +2001,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q6k_full_dp4a_q8_1 != null) {
-            log.info("mul_mm_q6k_full_dp4a_q8_1 pipeline loaded (int8 DP4a Qwen3.6-27B SSM wqkv prefill, Q8_1 input)", .{});
+            log.info("mul_mm_q6k_full_dp4a_q8_1 pipeline loaded (int8 DP4a Qwen dense-hybrid 27B SSM wqkv prefill, Q8_1 input)", .{});
         }
         var mul_mm_q6k_full_dp4a_q8_1_bm64_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const mul_mm_q6k_full_dp4a_q8_1_bm64_path = std.fmt.bufPrint(&mul_mm_q6k_full_dp4a_q8_1_bm64_path_buf, "{s}/mul_mm_q6k_full_dp4a_q8_1_bm64_n64.spv", .{shader_dir}) catch unreachable;
@@ -1919,7 +2043,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a != null) {
-            log.info("mul_mm_q4k_gate_up_swiglu_full_dp4a pipeline loaded (int8 DP4a Qwen3.6-27B dense gate+up prefill)", .{});
+            log.info("mul_mm_q4k_gate_up_swiglu_full_dp4a pipeline loaded (int8 DP4a Qwen dense-hybrid 27B gate+up prefill)", .{});
         }
         const geglu_activation_spec = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 1 }};
         const pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gateup_dp4a_path, 5, @sizeOf(MulMmQ4KGateUpDp4aPush), &geglu_activation_spec, push_desc_wave64_options, allocator) catch |err| blk: {
@@ -1940,7 +2064,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 != null) {
-            log.info("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 pipeline loaded (int8 DP4a Qwen3.6-27B dense gate+up prefill with fused Q8_0 output)", .{});
+            log.info("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8 pipeline loaded (int8 DP4a Qwen dense-hybrid 27B gate+up prefill with fused Q8_0 output)", .{});
         }
         const geglu_q8_activation_spec = [_]pipeline_mod.SpecConst{.{ .id = 2, .value = 1 }};
         const geglu_q8_n64_spec = [_]pipeline_mod.SpecConst{ .{ .id = 1, .value = 64 }, .{ .id = 2, .value = 1 } };
@@ -2072,7 +2196,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 != null) {
-            log.info("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 pipeline loaded (int8 DP4a Qwen3.6-27B dense gate+up prefill with fused Q8_1 output for Q4_K-down)", .{});
+            log.info("mul_mm_q4k_gate_up_swiglu_full_dp4a_q8_1 pipeline loaded (int8 DP4a Qwen dense-hybrid 27B gate+up prefill with fused Q8_1 output for Q4_K-down)", .{});
         }
         const pipeline_mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_gateup_dp4a_q8_1_path, 6, @sizeOf(MulMmQ4KGateUpDp4aQ8Push), &geglu_q8_activation_spec, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_gate_up_geglu_full_dp4a_q8_1 shader not loaded: {s}", .{@errorName(err)});
@@ -2198,7 +2322,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q4k_full_dp4a != null) {
-            log.info("mul_mm_q4k_full_dp4a pipeline loaded (int8 DP4a Qwen3.6-27B SSM z prefill)", .{});
+            log.info("mul_mm_q4k_full_dp4a pipeline loaded (int8 DP4a Qwen dense-hybrid 27B SSM z prefill)", .{});
         }
         const pipeline_mul_mm_q4k_full_dp4a_k2816_n8 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q4k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_2816_n8, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q4k_full_dp4a K=2816 BN=8 shader not loaded: {s}", .{@errorName(err)});
@@ -2367,7 +2491,7 @@ pub const DmmvDispatch = struct {
             break :blk null;
         };
         if (pipeline_mul_mm_q5k_full_dp4a != null) {
-            log.info("mul_mm_q5k_full_dp4a pipeline loaded (int8 DP4a Qwen3.6-27B SSM out prefill)", .{});
+            log.info("mul_mm_q5k_full_dp4a pipeline loaded (int8 DP4a Qwen dense-hybrid 27B SSM out prefill)", .{});
         }
         const pipeline_mul_mm_q5k_full_dp4a_k4096_bk2 = pipeline_mod.createFromSpirvWithOptions(instance, mul_mm_q5k_full_dp4a_path, 4, @sizeOf(MulMmQ4KGateUpDp4aPush), &spec_k_4096_bk2, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("mul_mm_q5k_full_dp4a K=4096 BK2 shader not loaded: {s}", .{@errorName(err)});
@@ -2395,6 +2519,29 @@ pub const DmmvDispatch = struct {
             .pipeline_q5k = pipeline_q5k,
             .pipeline_q6k = pipeline_q6k,
             .pipeline_q6k_wide = pipeline_q6k_wide,
+            .pipeline_q6k_rows4 = pipeline_q6k_rows4,
+            .pipeline_q4k_rows4 = pipeline_q4k_rows4,
+            .pipeline_q6k_rows4_cols = pipeline_q6k_rows4_cols,
+            .pipeline_q4k_rows4_cols = pipeline_q4k_rows4_cols,
+            .pipeline_q4k_cols_r2 = pipeline_q4k_cols_r2,
+            .pipeline_q5k_rows4_cols = pipeline_q5k_rows4_cols,
+            .pipeline_q4k_rows4_cols3 = pipeline_q4k_rows4_cols3,
+            .pipeline_q4k_rows4_cols4 = pipeline_q4k_rows4_cols4,
+            .pipeline_q6k_rows4_cols3 = pipeline_q6k_rows4_cols3,
+            .pipeline_q6k_rows4_cols4 = pipeline_q6k_rows4_cols4,
+            .pipeline_q5k_rows4_cols3 = pipeline_q5k_rows4_cols3,
+            .pipeline_q5k_rows4_cols4 = pipeline_q5k_rows4_cols4,
+            .pipeline_q6k_rows8_cols3 = pipeline_q6k_rows8_cols3,
+            .pipeline_q6k_rows8_cols4 = pipeline_q6k_rows8_cols4,
+            .pipeline_q4k_rows8_cols3 = pipeline_q4k_rows8_cols3,
+            .pipeline_q4k_rows8_cols4 = pipeline_q4k_rows8_cols4,
+            .pipeline_q4k_cols_r8 = pipeline_q4k_cols_r8,
+            .pipeline_q6k_cols_r2 = pipeline_q6k_cols_r2,
+            .pipeline_q6k_cols_r8 = pipeline_q6k_cols_r8,
+            .pipeline_q4k_fused_gate_up_swiglu_cols = pipeline_q4k_fused_gate_up_swiglu_cols,
+            .pipeline_q4k_fused_gate_up_swiglu_cols3 = pipeline_q4k_fused_gate_up_swiglu_cols3,
+            .pipeline_q4k_fused_gate_up_swiglu_cols4 = pipeline_q4k_fused_gate_up_swiglu_cols4,
+            .pipeline_q4k_q8_1_cols = pipeline_q4k_q8_1_cols,
             .pipeline_q8_0 = pipeline_q8_0,
             .pipeline_q8_0_batch = pipeline_q8_0_batch,
             .pipeline_q8_0_kpar_batch = pipeline_q8_0_kpar_batch,
@@ -5951,6 +6098,29 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5k) |*p| p.deinit();
         if (self.pipeline_q6k) |*p| p.deinit();
         if (self.pipeline_q6k_wide) |*p| p.deinit();
+        if (self.pipeline_q6k_rows4) |*p| p.deinit();
+        if (self.pipeline_q4k_rows4) |*p| p.deinit();
+        if (self.pipeline_q6k_rows4_cols) |*p| p.deinit();
+        if (self.pipeline_q4k_rows4_cols) |*p| p.deinit();
+        if (self.pipeline_q4k_cols_r2) |*p| p.deinit();
+        if (self.pipeline_q5k_rows4_cols) |*p| p.deinit();
+        if (self.pipeline_q4k_rows4_cols3) |*p| p.deinit();
+        if (self.pipeline_q4k_rows4_cols4) |*p| p.deinit();
+        if (self.pipeline_q6k_rows4_cols3) |*p| p.deinit();
+        if (self.pipeline_q6k_rows4_cols4) |*p| p.deinit();
+        if (self.pipeline_q5k_rows4_cols3) |*p| p.deinit();
+        if (self.pipeline_q5k_rows4_cols4) |*p| p.deinit();
+        if (self.pipeline_q6k_rows8_cols3) |*p| p.deinit();
+        if (self.pipeline_q6k_rows8_cols4) |*p| p.deinit();
+        if (self.pipeline_q4k_rows8_cols3) |*p| p.deinit();
+        if (self.pipeline_q4k_rows8_cols4) |*p| p.deinit();
+        if (self.pipeline_q4k_cols_r8) |*p| p.deinit();
+        if (self.pipeline_q6k_cols_r2) |*p| p.deinit();
+        if (self.pipeline_q6k_cols_r8) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_swiglu_cols) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_swiglu_cols3) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_swiglu_cols4) |*p| p.deinit();
+        if (self.pipeline_q4k_q8_1_cols) |*p| p.deinit();
         if (self.pipeline_q8_0) |*p| p.deinit();
         if (self.pipeline_q8_0_batch) |*p| p.deinit();
         if (self.pipeline_q8_0_kpar_batch) |*p| p.deinit();

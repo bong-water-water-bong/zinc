@@ -1,110 +1,466 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
-import PostCard from '../components/PostCard.astro';
 import { getCollection } from 'astro:content';
+import benchmarkData from '../data/zinc-performance.json';
 
-const posts = (await getCollection('posts', ({ data }) => !data.draft))
-  .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf())
-  .slice(0, 5);
+const allPosts = (await getCollection('posts', ({ data }) => !data.draft))
+  .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf());
+const posts = allPosts.slice(0, 5);
+
+const rocmTarget = benchmarkData.targets.find((target: any) => target.id === 'rdna-rocm');
+const qwen38 = rocmTarget?.models?.find((model: any) => model.id === 'qwen38-27b-q4k-m');
+const museGlimmer = rocmTarget?.models?.find((model: any) => model.id === 'muse-glimmer-30b-q4k-m');
+const median = (metric: any) => metric?.median ?? metric?.avg ?? null;
+const formatRate = (value: number | null, digits = 1) => value == null ? 'n/a' : value.toFixed(digits);
+const formatDate = (date: Date) => new Intl.DateTimeFormat('en-US', {
+  month: 'short',
+  day: 'numeric',
+  year: 'numeric',
+  timeZone: 'UTC',
+}).format(date);
+
+const qwenDecode = median(qwen38?.zinc?.decode_tps);
+const qwenLlamaDecode = median(qwen38?.baseline?.decode_tps);
+const qwenPrefill = median(qwen38?.zinc?.prefill_tps);
+const qwenLlamaPrefill = median(qwen38?.baseline?.prefill_tps);
+const qwenWorkloads = qwen38?.scenarios?.length ?? 0;
+const qwenWins = (qwen38?.scenarios ?? []).filter((scenario: any) =>
+  (scenario.comparison?.overall_pct_of_baseline ?? 0) >= 100
+).length;
+
+const modelWork = [
+  {
+    name: 'Qwen 3.8 27B',
+    kind: 'Local / dense',
+    note: 'Current ROCm decode and speculative-decoding target.',
+    href: '/zinc/benchmarks/#rdna-rocm',
+  },
+  {
+    name: 'Muse Glimmer 30B',
+    kind: 'Local / dense',
+    note: `${formatRate(median(museGlimmer?.zinc?.decode_tps))} tok/s decode in the published ROCm suite.`,
+    href: 'https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF/blob/main/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf',
+    external: true,
+  },
+  {
+    name: 'Gemma 4',
+    kind: 'Local / dense + MoE',
+    note: 'Dense and sparse checkpoints that exercise different GPU paths.',
+    href: '/topics/gemma-local-inference/',
+  },
+];
 ---
 
 <BaseLayout
-  title="Stepan Zolotukhin"
-  description="Building ZINC — a local LLM inference engine for consumer GPUs. Writing about local AI, GPU programming, and systems engineering."
-  keywords="Stepan Zolotukhin, ZINC, LLM inference, consumer GPU inference, AMD GPU, Apple Silicon, NVIDIA RTX, Intel Arc, Vulkan compute, Metal, CUDA, Zig, TurboQuant, local AI, GPU programming"
+  title="Stepan Zolotukhin — ZINC and GPU Inference"
+  description="I build ZINC, a local LLM inference engine for consumer GPUs, and publish reproducible benchmarks and engineering notes about the work."
+  keywords="Stepan Zolotukhin, ZINC, LLM inference, consumer GPU inference, AMD GPU, Apple Silicon, Intel Arc, Vulkan, ROCm, Metal, Zig, Qwen 3.8, Muse Glimmer, Gemma 4, GPU programming"
   jsonLd={{
     '@context': 'https://schema.org',
     '@type': 'WebSite',
     name: 'Stepan Zolotukhin',
     url: 'https://zolotukhin.ai',
-    description: 'Building ZINC — a local LLM inference engine for consumer GPUs.',
+    description: 'ZINC, reproducible local LLM benchmarks, and notes from the GPU engineering work behind them.',
   }}
 >
   <section class="hero">
-    <h1>Stepan Zolotukhin</h1>
-    <p>I'm building <a href="/zinc/">ZINC</a>, a local LLM inference engine for consumer GPUs. This site is where I write about the work — GPU kernels, Vulkan, Metal, CUDA, quantization, and the systems engineering underneath.</p>
+    <div class="identity">
+      <h1>Stepan<br />Zolotukhin</h1>
+      <p>Systems engineer working on GPU inference.</p>
+    </div>
+    <div class="introduction">
+      <p class="statement">I build fast local model inference for consumer GPUs.</p>
+      <p><a href="/zinc/">ZINC</a> is the engine. It runs GGUF models through Vulkan, ROCm, or Metal and includes a command line, browser chat, and an OpenAI-compatible API.</p>
+      <p>I publish the benchmark data and write down the kernel work, including the experiments that do not improve performance.</p>
+      <nav class="hero-links" aria-label="Start here">
+        <a href="/zinc/">ZINC</a>
+        <a href="/zinc/benchmarks/">Benchmarks</a>
+        <a href="/blog/">Writing</a>
+        <a href="https://github.com/zolotukhin/zinc">GitHub ↗</a>
+      </nav>
+    </div>
   </section>
 
-  <section class="project-highlight">
-    <a href="/zinc/" class="project-card">
-      <h2>ZINC</h2>
-      <p>Local LLM inference for consumer GPUs — AMD Radeon via Vulkan, Intel Arc via Vulkan, Apple Silicon via Metal, and NVIDIA RTX via CUDA experiments. The current strongest measured path is AMD RDNA4, and Intel Arc is now an official Linux Vulkan support target.</p>
-      <span class="project-link">Learn more &rarr;</span>
-    </a>
+  <section class="page-section" aria-labelledby="zinc-heading">
+    <header class="section-intro">
+      <h2 id="zinc-heading">ZINC</h2>
+      <p>A small engine for local inference.</p>
+    </header>
+    <div class="section-body">
+      <div class="project-copy">
+        <p>ZINC is tuned on the hardware it claims to support: AMD Radeon, Intel Arc, and Apple Silicon. AMD users can choose either Vulkan or ROCm; NVIDIA CUDA remains experimental.</p>
+        <p class="hardware-line">AMD / Vulkan &amp; ROCm&nbsp;&nbsp;·&nbsp;&nbsp; Intel / Vulkan&nbsp;&nbsp;·&nbsp;&nbsp; Apple / Metal</p>
+      </div>
+
+      <dl class="measurements">
+        <div>
+          <dt>Qwen 3.8 decode</dt>
+          <dd><strong>{formatRate(qwenDecode, 2)}</strong> tok/s</dd>
+          <small>{formatRate(qwenLlamaDecode, 2)} in llama.cpp</small>
+        </div>
+        <div>
+          <dt>Qwen 3.8 prefill</dt>
+          <dd><strong>{formatRate(qwenPrefill, 1)}</strong> tok/s</dd>
+          <small>{formatRate(qwenLlamaPrefill, 1)} in llama.cpp</small>
+        </div>
+        <div>
+          <dt>Workloads ahead</dt>
+          <dd><strong>{qwenWins}/{qwenWorkloads}</strong></dd>
+          <small>R9700 ROCm suite</small>
+        </div>
+      </dl>
+
+      <p class="measurement-note">Same Radeon AI PRO R9700, model file, prompts, and reusable-server method. <a href="/zinc/benchmarks/#rdna-rocm">See the complete run and provenance →</a></p>
+    </div>
   </section>
 
-  <section class="recent-posts">
-    <h2>Recent posts</h2>
-    {posts.map(post => (
-      <PostCard
-        title={post.data.title}
-        date={post.data.date}
-        excerpt={post.data.excerpt}
-        slug={post.id}
-        tags={post.data.tags}
-      />
-    ))}
-    <p class="all-posts"><a href="/blog/">All posts &rarr;</a></p>
+  <section class="page-section" aria-labelledby="models-heading">
+    <header class="section-intro">
+      <h2 id="models-heading">Models</h2>
+      <p>What I am testing or following now.</p>
+    </header>
+    <div class="section-body model-list">
+      {modelWork.map((model) => (
+        <a
+          class="model-row"
+          href={model.href}
+          target={model.external ? '_blank' : undefined}
+          rel={model.external ? 'noreferrer' : undefined}
+        >
+          <strong>{model.name}</strong>
+          <span>{model.kind}</span>
+          <p>{model.note}</p>
+          <i aria-hidden="true">{model.external ? '↗' : '→'}</i>
+        </a>
+      ))}
+    </div>
+  </section>
+
+  <section class="page-section writing-section" aria-labelledby="writing-heading">
+    <header class="section-intro">
+      <h2 id="writing-heading">Recent writing</h2>
+      <p><a href="/blog/">All {allPosts.length} posts →</a></p>
+    </header>
+    <div class="section-body post-list">
+      {posts.map((post) => (
+        <article class="post-row">
+          <time datetime={post.data.date.toISOString().split('T')[0]}>{formatDate(post.data.date)}</time>
+          <div>
+            <h3><a href={`/blog/${post.id}/`}>{post.data.title}</a></h3>
+            <p>{post.data.excerpt}</p>
+          </div>
+        </article>
+      ))}
+    </div>
   </section>
 </BaseLayout>
 
 <style>
+  :global(main.container) {
+    max-width: var(--max-width-wide);
+    padding-top: 0;
+  }
+
   .hero {
-    padding: var(--space-xl) 0;
-  }
-
-  .hero h1 {
-    font-size: 2.5rem;
-    margin-bottom: var(--space-sm);
-  }
-
-  .hero p {
-    font-size: 1.1rem;
-    color: var(--color-text-muted);
-    line-height: 1.7;
-    max-width: 600px;
-  }
-
-  .project-highlight {
-    padding-bottom: var(--space-lg);
+    display: grid;
+    grid-template-columns: minmax(250px, 0.8fr) minmax(420px, 1.2fr);
+    gap: clamp(3rem, 8vw, 7rem);
+    padding: clamp(4.5rem, 10vw, 8rem) 0 clamp(4rem, 8vw, 6.5rem);
     border-bottom: 1px solid var(--color-border);
   }
 
-  .project-card {
-    display: block;
-    padding: var(--space-lg);
-    border: 1px solid var(--color-border);
-    border-radius: 8px;
-    color: var(--color-text);
-    transition: border-color 0.15s;
+  .identity h1 {
+    margin: 0;
+    font-size: clamp(3.1rem, 6.2vw, 5.25rem);
+    font-weight: 600;
+    line-height: 0.94;
+    letter-spacing: -0.055em;
   }
 
-  .project-card:hover {
-    border-color: var(--color-accent);
+  .identity p {
+    margin: 1.25rem 0 0;
+    color: var(--color-text-muted);
+    font-size: 0.82rem;
+  }
+
+  .introduction {
+    align-self: end;
+    max-width: 39rem;
+  }
+
+  .introduction p {
+    margin-bottom: 0.85rem;
+    color: var(--color-text-muted);
+    font-size: 0.96rem;
+    line-height: 1.65;
+  }
+
+  .introduction .statement {
+    margin-bottom: 1.35rem;
+    color: var(--color-text);
+    font-size: clamp(1.45rem, 2.6vw, 2.05rem);
+    line-height: 1.3;
+    letter-spacing: -0.025em;
+  }
+
+  .hero-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem 1.5rem;
+    margin-top: 1.65rem;
+  }
+
+  .hero-links a {
+    color: var(--color-text);
+    font-size: 0.82rem;
+    font-weight: 700;
+    text-decoration: underline;
+    text-decoration-color: var(--color-border);
+    text-underline-offset: 0.25em;
+  }
+
+  .hero-links a:hover {
+    color: var(--color-accent);
+    text-decoration-color: var(--color-accent);
+  }
+
+  .page-section {
+    display: grid;
+    grid-template-columns: minmax(180px, 0.72fr) minmax(0, 2.28fr);
+    gap: clamp(2.5rem, 7vw, 6rem);
+    padding: clamp(3.5rem, 7vw, 5.5rem) 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .page-section:last-child {
+    border-bottom: 0;
+  }
+
+  .section-intro h2 {
+    margin: 0 0 0.5rem;
+    font-size: 1.15rem;
+    font-weight: 700;
+    letter-spacing: -0.015em;
+  }
+
+  .section-intro p {
+    max-width: 13rem;
+    margin: 0;
+    color: var(--color-text-muted);
+    font-size: 0.78rem;
+    line-height: 1.5;
+  }
+
+  .project-copy {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(220px, 0.8fr);
+    gap: 2.5rem;
+    align-items: start;
+  }
+
+  .project-copy > p:first-child {
+    max-width: 42rem;
+    margin: 0;
+    font-size: 1.13rem;
+    line-height: 1.65;
+  }
+
+  .hardware-line {
+    margin: 0;
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    line-height: 1.8;
+  }
+
+  .measurements {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin: 2.25rem 0 0;
+    border-top: 1px solid var(--color-border);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .measurements > div {
+    padding: 1.25rem 1.25rem 1.25rem 0;
+  }
+
+  .measurements > div + div {
+    padding-left: 1.25rem;
+    border-left: 1px solid var(--color-border);
+  }
+
+  .measurements dt {
+    color: var(--color-text-muted);
+    font-size: 0.72rem;
+  }
+
+  .measurements dd {
+    margin: 0.3rem 0 0;
+    font-size: 0.82rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .measurements dd strong {
+    font-size: clamp(1.75rem, 3vw, 2.4rem);
+    font-weight: 600;
+    letter-spacing: -0.035em;
+  }
+
+  .measurements small {
+    color: var(--color-text-muted);
+    font-size: 0.68rem;
+  }
+
+  .measurement-note {
+    margin: 0.85rem 0 0;
+    color: var(--color-text-muted);
+    font-size: 0.74rem;
+  }
+
+  .model-list {
+    border-top: 1px solid var(--color-border);
+  }
+
+  .model-row {
+    display: grid;
+    grid-template-columns: minmax(150px, 0.75fr) minmax(135px, 0.65fr) minmax(250px, 1.5fr) 1.25rem;
+    gap: 1.5rem;
+    align-items: baseline;
+    padding: 1.05rem 0;
+    border-bottom: 1px solid var(--color-border);
+    color: var(--color-text);
     text-decoration: none;
   }
 
-  .project-card h2 {
-    font-size: 1.3rem;
-    margin: 0 0 var(--space-sm);
-  }
-
-  .project-card p {
-    color: var(--color-text-muted);
-    font-size: 0.95rem;
-    margin-bottom: var(--space-sm);
-  }
-
-  .project-link {
+  .model-row:hover strong,
+  .model-row:hover i {
     color: var(--color-accent);
-    font-size: 0.9rem;
   }
 
-  .recent-posts h2 {
-    margin-top: var(--space-xl);
+  .model-row strong {
+    font-size: 0.92rem;
   }
 
-  .all-posts {
-    margin-top: var(--space-md);
+  .model-row span {
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+  }
+
+  .model-row p {
+    margin: 0;
+    color: var(--color-text-muted);
+    font-size: 0.8rem;
+    line-height: 1.5;
+  }
+
+  .model-row i {
+    color: var(--color-text-muted);
+    font-style: normal;
+    text-align: right;
+  }
+
+  .post-list {
+    border-top: 1px solid var(--color-border);
+  }
+
+  .post-row {
+    display: grid;
+    grid-template-columns: 8.2rem minmax(0, 1fr);
+    gap: 1.5rem;
+    padding: 1.35rem 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .post-row time {
+    padding-top: 0.2rem;
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+  }
+
+  .post-row h3 {
+    margin: 0;
+    font-size: 1.02rem;
+    line-height: 1.35;
+  }
+
+  .post-row h3 a {
+    color: var(--color-text);
+  }
+
+  .post-row h3 a:hover {
+    color: var(--color-accent);
+    text-decoration: none;
+  }
+
+  .post-row p {
+    display: -webkit-box;
+    overflow: hidden;
+    margin: 0.45rem 0 0;
+    color: var(--color-text-muted);
+    font-size: 0.78rem;
+    line-height: 1.5;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  @media (max-width: 820px) {
+    .hero,
+    .page-section {
+      grid-template-columns: 1fr;
+      gap: 2.25rem;
+    }
+
+    .hero {
+      padding: 4rem 0;
+    }
+
+    .identity h1 br {
+      display: none;
+    }
+
+    .introduction {
+      max-width: 42rem;
+    }
+
+    .section-intro p {
+      max-width: 30rem;
+    }
+  }
+
+  @media (max-width: 620px) {
+    .project-copy,
+    .measurements,
+    .model-row,
+    .post-row {
+      grid-template-columns: 1fr;
+    }
+
+    .project-copy,
+    .model-row,
+    .post-row {
+      gap: 0.55rem;
+    }
+
+    .measurements > div,
+    .measurements > div + div {
+      padding: 1rem 0;
+      border-left: 0;
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .measurements > div:last-child {
+      border-bottom: 0;
+    }
+
+    .model-row i {
+      display: none;
+    }
+
+    .post-row time {
+      padding-top: 0;
+    }
   }
 </style>

@@ -110,7 +110,7 @@ This section is the ground truth of what is in tree *today*, ahead of every aspi
 * **`src/zinc_rt/isa/cpu_zig/`** — 14 CPU kernels: `embed`, `rms_norm`, `residual_rms_norm`, `rope`, `flash_attn`, `swiglu`, `sigmoid_mul`, `vadd`, `moe_gate_topk`, `lm_head`, `argmax`, `dequant` (shared GGML row + Q4_0/Q8_0 dot loops), `matvec`, plus the `mod.zig` glue.
 * **`src/zinc_rt/fast_pool.zig`** — persistent worker pool for decode matvec fan-out. Atomic-only dispatch, no heap/mutex traffic. Measured worth ~2–5 tok/s vs `std.Thread.Pool` on the scalar path; `ZINC_RT_FAST_POOL=0` disables.
 * **`src/zinc_rt/batching.zig`** — tenant-aware admission and batch-selection primitives. Every request must name an explicitly registered tenant; there is no anonymous default-tenant admission path. The planner enforces per-tenant active-request limits, per-batch prefill-token limits, and per-batch decode-slot limits, then round-robins prefill and decode rows across tenants. This is planner groundwork only; it is not wired into `forward_zinc_rt` or the HTTP server yet.
-* **`src/compute/forward_zinc_rt.zig`** — ~5 600 lines. Bridges `forward.zig`'s model loading and tokenizer into ZINC_RT. **First-class models today:** Qwen 3.6 35B-A3B (MoE + F32 SSM hybrid), Qwen 3.6 27B (dense), Qwen 3 8B / 14B / 32B (dense), Gemma 4 (MoE + GELU activation, per-layer output scales, SWA RoPE).
+* **`src/compute/forward_zinc_rt.zig`** — ~5 600 lines. Bridges `forward.zig`'s model loading and tokenizer into ZINC_RT. **First-class models today:** Qwen 3.6 35B-A3B (MoE + F32 SSM hybrid), Qwen 3 8B / 14B / 32B (dense), Gemma 4 (MoE + GELU activation, per-layer output scales, SWA RoPE).
 
 ### 1.A.2 What is scaffolded but not on the model-value hot path
 
@@ -131,7 +131,6 @@ This section is the ground truth of what is in tree *today*, ahead of every aspi
 ### 1.A.4 Recent changes worth knowing about (since 2026-05-18)
 
 * **Gemma 4 MoE enablement (`aac5ded`, `dc9f758`, `5049157`, `7c06b65`).** GELU activation plumbed through `runMoeLayer`, `runMoeExpert`, `runSharedExpertOnly`, `runMoeExpertsParallel`, `MoeExpertWorker`, `runMoeExpertsParallelPhased`. `cfg.is_gemma` carries the flag; non-Gemma archs continue to use SwiGLU. Per-layer `layer_output_scale`, `rope_freqs.weight` proportional RoPE, `ZINC_GEMMA4_ATTN_SCALE_DEFAULT` escape hatch. BOS handling and `encodeGemmaChat` chat templating (`<start_of_turn>`/`<end_of_turn>` for Gemma 2/3, `<|turn>`/`<turn|>` for Gemma 4).
-* **Qwen 3.6 27B dense (`28ca228`).** Dense (non-MoE) variant landed alongside the hybrid MoE+SSM 35B-A3B path.
 * **Decode-budget escape hatch.** `m0_max_decode_tokens` now reads `ZINC_RT_MAX_DECODE_TOKENS`. Default remains 8 so existing perf A/B comparisons stay valid; coherence smoke runs can request the full prompt budget.
 * **API docs (`398671f`).** Every public top-level symbol and method across `src/zinc_rt/` + the `src/compute/forward_zinc_rt.zig` bridge now carries Zig docgen comment blocks under `@section "Inference Runtime"` / `"CLI & Entrypoints"`. Used by the `zig-docgen` skill / `tools/` to produce HTML/JSON/text/llms exports.
 
@@ -144,12 +143,12 @@ This section is the ground truth of what is in tree *today*, ahead of every aspi
 | `ZINC_RT_FAST_POOL` | 1 | Set `0` to fall back to `std.Thread.Pool` (~2–5 tok/s worse) |
 | `ZINC_RT_LM_HEAD_ROWS` | 4096 | Cap LM-head rows scanned per step; 0 = full 248 320 vocab (~3.5–4.3 ms/token cost) |
 | `ZINC_RT_MAX_DECODE_TOKENS` | 8 | Per-step decode-token clamp; raise to 256+ for real coherence runs |
-| `ZINC_RT_DIRECT_DECODE_FULL_SLICE` | 0 | Enable broad per-layer decode row-range validation slices; default runs only the cheaper consumed LM-head and periodic router proofs |
+| `ZINC_RT_DIRECT_DECODE_FULL_SLICE` | 0 | Enable broad per-layer decode row-range validation slices; default runs only the cheaper consumed LM-head proof |
 | `ZINC_RT_DIRECT_DECODE_SLICE_CADENCE` | 0 | Full-slice validation cadence when explicitly enabled; setting this var also opts into full-slice validation |
 | `ZINC_RT_DIRECT_PREFILL_MODEL_SLICE` | 0 | Enable final-prompt-token direct model-slice validation; default leaves prefill on the host-assisted path and preserves decode-side M1 evidence |
 | `ZINC_RT_DIRECT_LM_HEAD_DECODE_CADENCE` | 0 | LM-head prefix DMMV proof cadence during decode; 0 = first generated token only, N = first token plus every N generated tokens |
-| `ZINC_RT_DIRECT_LM_HEAD_PREFIX_ROWS` | 64 | Rows in the consumed LM-head prefix proof; set 4096 for broad prefix validation |
-| `ZINC_RT_DIRECT_ROUTER_DECODE` | 1 | Enable periodic full-router row-range replacement during decode; set `0` to leave routing fully host-produced |
+| `ZINC_RT_DIRECT_LM_HEAD_PREFIX_ROWS` | 256 | Rows in the consumed LM-head prefix proof; set 4096 for broad prefix validation |
+| `ZINC_RT_DIRECT_ROUTER_DECODE` | 0 | Enable periodic full-router row-range replacement during decode; set `1` for routing validation coverage |
 | `ZINC_RT_DIRECT_ROUTER_DECODE_CADENCE` | 64 | Router row-range cadence; N = every N generated tokens, 0 = every decode token |
 | `ZINC_RT_DIRECT_ROUTER_TRUST_AFTER_SUCCESSES` | 1 | After this many validated full Q8_0 router row-range successes, later full router replacements finite-check GPU logits instead of re-running selected CPU dot oracles; 0 disables |
 | `ZINC_RT_DIRECT_SSM_Q8_ROW_RANGE_MAX_SUCCESSES` | 2 | Per tracked decode slice cap on consumed direct SSM alpha/beta F32/Q8_0 row-range successes; set `0` to disable the serial M1 SSM row-range verifier |
@@ -200,11 +199,11 @@ Vulkan was designed for a use case ZINC does not have:
 
 Numerically, the cost is small *per call*. Architecturally, it is enormous: every one of these primitives forces an API edge between ZINC and the GPU, and every edge limits how much ZINC can know about its own workload. We can't fuse two dispatches across a pipeline boundary. We can't keep a kernel resident across user requests. We can't even know whether two consecutive dispatches' barriers can be merged without re-parsing our own command stream.
 
-### 2.3 Why "just replace Vulkan with Vulkan again" doesn't help
+### 2.3 Why peer runtimes do not replace ZINC_RT
 
-Two adjacent options exist and are explicitly rejected:
+Two adjacent options solve different deployment problems:
 
-* **ROCm + HIP.** ROCm 7.0 supports RDNA4 (gfx1201). Using HIP would replace SPIR-V with HSAIL and the Mesa stack with ROCr. *But:* (a) HIP brings the entire ROCm runtime (~600 MB) and a C++ dependency we don't want in a Zig project; (b) HIP Graphs functionally match CUDA Graphs but do not yet expose persistent-kernel control on RDNA4; (c) ROCm has a worse track record on consumer cards than RADV — Mesa is faster *and* more compatible. The README's "no ROCm, no MLX" promise is part of the project's identity.
+* **ROCm + HIP.** ROCm is now a first-class ZINC backend on validated RDNA4 stacks. It provides a productive native kernel runtime and strong WMMA access, but HIP Graphs still do not provide the persistent, workload-owned queue and scheduler semantics ZINC_RT is designed to explore. ROCm is a peer production backend, not a substitute for the direct-runtime research goal.
 * **A second SPIR-V compiler.** Swap glslc → DXC → glslang etc. We tried this. Newer toolchains regressed RADV performance by **5×**. The toolchain is fragile precisely *because* the API is a portability surface we don't need.
 
 ### 2.4 What we actually want
@@ -1171,7 +1170,7 @@ For Q4_K weights we dequantize into LDS at the inner loop start, then run WMMA o
 
 This is the section the rest of the document exists to support. The single-stream tok/s targets in §3.1 are necessary but not sufficient: the reason to own the runtime, the reason to walk away from Vulkan, is to serve **multiple concurrent tenants** at near-bandwidth-saturating aggregate throughput on a single consumer GPU. Continuous batching is how that throughput is unlocked; multitenancy is the policy layer that decides whose token gets generated next, with isolation strong enough to host independent users.
 
-The design target: **outperform vLLM and SGLang on a single RDNA4 node**, while running as one Zig binary with no Python, no ROCm, no Triton, and a fallback to the Vulkan backend if anything regresses.
+The design target: **outperform vLLM and SGLang on a single RDNA4 node**, while running as one Zig binary with no Python or Triton and retaining Vulkan and ROCm as production fallback backends if anything regresses.
 
 ### 18.1 Why multitenancy is a first-class concern
 
@@ -1852,7 +1851,7 @@ The autopilot loop should keep the state as MIGRATE / M1 until **both** conditio
 
 ### 25.4 Currently shippable beyond R9700 / RDNA4
 
-* **Multi-model support.** Qwen 3 (8B, 14B, 32B dense), Qwen 3.6 (27B dense, 35B-A3B hybrid MoE+SSM), Gemma 4 (MoE with GELU, per-layer output scales, SWA RoPE) all run through `forward_zinc_rt.zig` on the host-assisted path. Gemma 4 chat templating (`encodeGemmaChat`) handles both Gemma 2/3 and Gemma 4 instruction-tuned scaffolds.
+* **Multi-model support.** Qwen 3 (8B, 14B, 32B dense), Qwen 3.6 35B-A3B hybrid MoE+SSM, and Gemma 4 (MoE with GELU, per-layer output scales, SWA RoPE) all run through `forward_zinc_rt.zig` on the host-assisted path. Gemma 4 chat templating (`encodeGemmaChat`) handles both Gemma 2/3 and Gemma 4 instruction-tuned scaffolds.
 * **Apple Silicon dev path.** T-CPU runs on macOS / aarch64 today, slow but functional. The Apple production path is still the standalone Metal backend in `src/metal/` — T-Metal fold-in (§16) is M2 work and has not started.
 * **CLI surface.** `zig build -Dbackend=zinc_rt run -- --prompt "..." --model path/to.gguf [--max-tokens N] [--chat] [--probe-tier]` is the canonical entrypoint for dev and bring-up; it builds `src/zinc_rt/main.zig` and exercises the same code path the autopilot uses.
 
@@ -2023,8 +2022,8 @@ ZINC_RT is the ZINC Runtime — ZINC's own userspace GPU layer, in the same OS-l
 
 The single feature that justifies all this work is the multitenant continuous-batching architecture in §18: one engine, one process, one GPU, hosting an interactive chat client, an OpenAI-compatible API tenant, an agent runtime, and a batch eval job — concurrently, fairly, with per-tenant quotas and prefix-shared KV, at near-bandwidth-saturating aggregate throughput. The single-stream decode tok/s targets are the easy part; the hard part is the policy and isolation layer, and the reason it lives in ZINC_RT rather than in a Python sidecar is that every part of the policy reads state the GPU is already touching — slot table, KV pages, sampling RNGs — and pushing that state across a process boundary defeats the point.
 
-**The Vulkan backend is not going away.** It remains a peer of ZINC_RT, selected via `-Dbackend=vulkan`, tested in CI on every PR, and shipped to every user. ZINC ships *two* GPU paths long-term: ZINC_RT for the lowest-overhead route to peak single-tenant performance *and* the multi-tenant scheduler; Vulkan as the broadly compatible, well-trodden single-tenant fallback that every Linux GPU user has worked with for a decade. The two share GGUF parsing, tokenizer, server, model catalog — only the GPU dispatch, kernels, and scheduler differ. The cost of keeping both is modest; the benefit (always a working fallback when ZINC_RT regresses or hits new hardware) is permanent.
+**The Vulkan and ROCm backends are not going away.** They remain production peers of ZINC_RT, selected via `-Dbackend=vulkan` or `-Dbackend=rocm` and sharing GGUF parsing, tokenizer, server, and model catalog. ZINC_RT explores the lowest-overhead route to peak single-tenant performance and multitenant scheduling; Vulkan provides broad compatibility; ROCm provides a native HIP path with dedicated AMD kernels. Only GPU dispatch, kernels, and scheduler policy differ.
 
-The current ZINC + Vulkan stack peaks at 117 tok/s decode and 31 % bandwidth utilization on R9700, with no multitenant batching. ZINC_RT, fully realized, targets 240 tok/s decode and 65 % bandwidth utilization at the single-stream level, with continuous-batching aggregate throughput approaching 1 000 tok/s on 4 concurrent slots and ~2 800 tok/s on 16 — outperforming vLLM on this hardware class while running in a single Zig binary with no Python and no ROCm.
+The current ZINC + Vulkan stack peaks at 117 tok/s decode and 31 % bandwidth utilization on R9700, with no multitenant batching. ZINC_RT, fully realized, targets 240 tok/s decode and 65 % bandwidth utilization at the single-stream level, with continuous-batching aggregate throughput approaching 1 000 tok/s on 4 concurrent slots and ~2 800 tok/s on 16 — outperforming vLLM on this hardware class while running in a single Zig binary with no Python or Triton.
 
-This document is the contract. The agent should follow §25 milestone-by-milestone, annotating this file as each gate is cleared. Open questions in §27 are decisions the agent should escalate, not invent. **A milestone is not "complete" unless both `-Dbackend=zinc_rt` AND `-Dbackend=vulkan` build cleanly and pass CI.**
+This document is the contract. The agent should follow §25 milestone-by-milestone, annotating this file as each gate is cleared. Open questions in §27 are decisions the agent should escalate, not invent. **A milestone is not "complete" unless `-Dbackend=zinc_rt`, `-Dbackend=vulkan`, and `-Dbackend=rocm` build cleanly and pass their applicable CI or hardware gates.**

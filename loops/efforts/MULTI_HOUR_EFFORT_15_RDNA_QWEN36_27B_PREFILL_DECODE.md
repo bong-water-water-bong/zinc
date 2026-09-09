@@ -1066,6 +1066,137 @@ Historical context:
 - `loops/efforts/MULTI_HOUR_EFFORT_10_QWEN36_DECODE.md`
 - `loops/efforts/MULTI_HOUR_EFFORT_11_RDNA_DECODE_LONG_CONTEXT.md`
 
+### 2026-08-17: baseline corrected (not a regression), SSM prefill-proj batching re-confirmed rejected
+
+**The `llamaCppSuccessRule`/`llamaCppBaselines` "402.92 tok/s" context-medium
+figure in this effort's `EFFORT_SPECS` entry does not match this effort's own
+benchmark contract and should not be used as the keep/revert threshold.**
+Root cause, found by elimination: `optimize_perf.ts` benchmarks by repeatedly
+cold-starting the `zinc` CLI (`zincCliArgs` builds a fresh `--prompt`
+invocation per sample — full 17 GB model reload each time), while the
+published site figure (`tools/performance_suite.mjs`, and the `402.92`
+number) comes from one warm, persistent `zinc-server` process hit repeatedly
+over HTTP. Ruled out before landing on this explanation: wrong Vulkan device
+(`REMOTE_VULKAN_DEVICE_INDEX` already defaults to `1`, confirmed via a fresh
+isolated build), shared/contaminated `/root/zinc` build directory (identical
+result — 226.11 vs 224.52 tok/s — in a from-scratch isolated directory), GPU
+stuck in low-DPM per the known Effort-10 failure mode (`rocm-smi` showed
+`Performance Level: high`, `pp_dpm_sclk` at the top `2200Mhz` state), and
+prompt-content mismatch (both tools tokenize to exactly 212 tokens, and the
+`"You are a helpful assistant. Answer directly. Do not show analysis."`
+system prompt `optimize_perf.ts` passes via `--system-prompt` is the same
+string the server injects by default for `/v1/chat/completions`,
+`src/server/routes.zig:815`). Cold-CLI and warm-server prefill are just
+different, both-real metrics; this effort's own contract measures the former.
+
+Corrected current baseline (isolated build, 5 samples,
+`ZINC_REMOTE_DIR=/root/zinc-claude-effort15`): **226.11 tok/s** median
+`[221.54, 228.03, 224.15, 226.11, 228.77]`. Fresh `ZINC_PREFILL_PROFILE=1`
+phase profile at this baseline: `dense_ffn` 375.5 ms total (biggest —
+`gateup` 196.8 ms [`gateup_matmul` 194.7 ms: q4 92.9 / q6 101.8], `down`
+178.6 ms [`down_matmul` 163.5 ms: q4 73.5 / q6 90.0], `residual_acc` 15.0 ms),
+`ssm` 279.4 ms total (`proj` 164.2 ms [`qkv` 130.1 / `norm_ab` 14.3],
+`conv` 15.7, `delta` 23.8, `gnorm` 13.5, `out` 61.9 [`out_proj` 48.5 /
+`out_resid` 13.3]), `attn` 62.6 ms, `tail` 1.9 ms. Output `"Paris"`,
+correct.
+
+Tested the existing `ZINC_QWEN36_27B_SSM_PREFILL_PROJ` flag (the
+already-built prebatched-SSM-projection path referenced as this effort's
+"unspent structural lever") in all three modes against this corrected
+baseline, same prompt, same isolated build:
+
+| mode | prefill tok/s | output |
+|---|---:|---|
+| off (baseline) | 276.24 (single-sample cross-check; see median above) | `{332, 45209, ...}` |
+| `1` (qkv+z) | 211.66 | `{332, 45209, 56692, 332, 198, 760, 9584, 369}` |
+| `qkv` | 194.23 | `{332, 45209, 56692, 332, 198, 760, 9584, 369}` |
+| `z` | 188.88 | `{332, 45209, 56692, 332, 198, 760, 9584, 369}` |
+
+All three modes are correct (byte-identical output to baseline) but slower —
+and mode `1`'s own profile shows the damage is not localized to `qkv`:
+`proj` 164.2 -> 195.2 ms, `conv` 15.7 -> 20.4, `delta` 23.8 -> 32.7, `gnorm`
+13.5 -> 17.5, `out` 61.9 -> 94.8 ms. Every named SSM sub-phase gets worse,
+not just the one the flag directly touches, which points at systemic
+overhead from the prebatch mechanism (extra passes/barriers competing with
+the main per-layer work) rather than a narrow qkv-dispatch problem. Re-
+confirms the flag's existing default-off status is correct for Qwen3.8-27B
+specifically, not just inherited unexamined from the 3.6 predecessor. Do
+not re-enable without first instrumenting where the prebatch pass's own
+cost lands — the buffer-copy-then-dispatch structure at
+forward.zig:16835-16878 (a `vkCmdCopyBuffer` per token before the dispatch
+that the non-prebatched path doesn't pay) is one plausible source, but the
+across-the-board slowdown suggests looking at the upfront batched-
+precompute pass itself, not just this per-token copy — needs evidence, not
+a rewrite, per this effort's own rule.
+
+RADV shaderstats did not work as invoked (`RADV_DEBUG=shaderstats` on the
+main `zinc` binary at runtime produced no VGPR/SGPR/occupancy output) —
+`docs/BENCHMARKING.md`'s hot-bench section implies shaderstats needs the
+dedicated `zig build hot-bench` target instead, and hot-bench's documented
+`--case` list (`q8_router`, `q8_shared_gate_up`, `q8_shared_down`,
+`q8_ssm_out`, `ssm_delta`) does not obviously cover the Qwen dense-27B
+Q4_K/Q6_K gate-up-down kernels that are this effort's largest bucket. A
+real next step is adding a dense-27B-specific hot-bench case (or fixing
+shaderstats on the main binary) before spending more cycles guessing at
+register pressure blind.
+
+No net speed win landed this session. What's left in good shape: a
+corrected, isolated, reproducible baseline and profile: a cleanly ruled-out
+false-regression scare (worth remembering — always suspect the harness
+before the code when two measurement paths disagree); one more structural
+lever (SSM prefill-proj batching) re-confirmed rejected with a concrete
+lead (the extra buffer copy) instead of just "still opt-in, unclear why."
+
+### 2026-08-17 (cont'd): dense-FFN 64-alignment padding tried, rejected on interleaved re-measure
+
+Follow-up idea from the shaderstats gap above: before wiring new tooling,
+checked whether the *existing* dense-FFN DP4a padding was even choosing the
+best available kernel variant for the site's own benchmark shape.
+`qwen36DensePrefillPaddedTokenCount` (forward.zig:17647) pads n_tokens to
+the next multiple of 32. For the 212-token context-medium prompt that's
+224 — an odd multiple of 32, so `recordMulMmQ4KGateUpSwigluFullDp4aQ8`
+(dmmv.zig:4973) picks the boundary-checked "ragged n64" pipeline variant
+instead of the plain aligned one, even though both dispatch the same
+`ceil(N/64) = 4` GEMM tiles. Hypothesis: round to 64 instead of 32 (still
+4 tiles, same weight-matrix reads) to get the simpler aligned kernel for
+free.
+
+Implemented (`(n_tokens + 63) & ~63` instead of `+31 & ~31`), rebuilt in
+the isolated `/root/zinc-claude-effort15` copy, confirmed byte-identical
+output vs. baseline for the 212-token prompt. First single-sample
+measurement looked like a big win (277 vs 242 tok/s) — but that was
+first-run-after-launch noise. Redid it properly: built both binaries,
+ran them **interleaved** (baseline, fixed, baseline, fixed, ...) back to
+back so both see identical thermal/DPM conditions. Result across 5
+interleaved rounds: baseline held steady at 227-230 tok/s from round 2
+on; the 64-pad version was *consistently slower*, 217-224 tok/s. Net: a
+real ~3-6% regression, not a win. Reverted immediately (git stash, then
+dropped); no code change landed.
+
+Root cause of the wrong hypothesis: the tile-count reasoning only
+accounts for how the GEMM re-reads the weight matrix (M/m_tile x N/n_tile
+workgroups). It ignores that every downstream per-column stage —
+`recordQuantizeActQ8_1` on the input, the SwiGLU elementwise, the fused
+Q8 output write — does real work proportional to N, not to tile count.
+Padding 212 -> 256 instead of 212 -> 224 is a genuine +14.3% more columns
+of activation to quantize and elementwise-process, computed for real
+(not masked out) since the aligned kernel doesn't know which columns are
+padding. The ragged kernel's per-tile boundary check is apparently
+cheaper than that extra real work — i.e. the existing 32-alignment
+padding is already the better tradeoff, and the multiple existing
+"ragged n64" pipeline variants (dmmv.zig, several per model shape) exist
+specifically because someone already worked this out. Do not retry
+64-alignment padding without first isolating quantize/SwiGLU cost from
+GEMM cost (e.g. via the still-unbuilt hot-bench case) — guessing from
+tile-dispatch counts alone is not enough, as this attempt shows.
+
+Practical lesson for future sessions: a single-sample "it got faster"
+result from a back-to-back CLI comparison is not trustworthy on this
+node — GPU clock/thermal state visibly drifts between the first and
+subsequent runs of a tight loop. Always interleave baseline and
+candidate builds within the same run, not sequentially, before believing
+a delta.
+
 ## Final decision rule
 
 This effort is successful when one of these is true:

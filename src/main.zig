@@ -29,9 +29,11 @@ else
     };
 const gguf_mod = @import("model/gguf.zig");
 const managed_mod = @import("model/managed.zig");
+const hf_mod = @import("model/hf.zig");
 const tokenizer_mod = @import("model/tokenizer.zig");
 const graph_mod = @import("compute/graph.zig");
 const memory_plan = @import("gpu/memory_plan.zig");
+const kv_dtype = @import("compute/kv_dtype.zig");
 const process_lock_mod = @import("gpu/process_lock.zig");
 const server_runtime = @import("server/runtime.zig");
 // These modules import vulkan/ transitively — only available on Linux until T010-T014 refactor.
@@ -69,6 +71,8 @@ const CommandBuffer = if (gpu.is_vulkan) @import("vulkan/command.zig").CommandBu
 const Graph = graph_mod.Graph;
 
 const log = std.log.scoped(.zinc);
+const inference_timing_log = std.log.scoped(.forward);
+const accelerator_name = if (gpu.is_rocm) "ROCm" else "CUDA";
 
 /// Global flag enabling verbose debug log output when `--debug` is passed or the `ZINC_DEBUG` env var is set.
 pub var is_debug_mode: bool = false;
@@ -145,6 +149,7 @@ comptime {
     }
     // Platform-independent modules
     _ = @import("model/config.zig");
+    _ = @import("model/hf.zig");
     _ = @import("model/gguf.zig");
     _ = @import("model/tokenizer.zig");
     _ = @import("compute/graph.zig");
@@ -173,6 +178,8 @@ pub const Config = struct {
     model_path: ?[]const u8 = null,
     /// Managed model identifier from the built-in catalog/cache.
     model_id: ?[]const u8 = null,
+    /// Hugging Face `owner/repo[:quant]` spec to download and load (`-hf`).
+    hf_spec: ?[]const u8 = null,
     /// HTTP server port.
     port: u16 = 8080,
     /// GPU device index used when explicitly set with `-d/--device`.
@@ -185,6 +192,8 @@ pub const Config = struct {
     max_parallel: u32 = 4,
     /// CLI prompt text.
     prompt: ?[]const u8 = null,
+    /// Optional system turn prepended when an explicit CLI chat prompt is used.
+    system_prompt: ?[]const u8 = null,
     /// Maximum CLI decode tokens.
     max_tokens: u32 = 256,
     /// Wrap CLI prompt in the model's chat template before tokenization.
@@ -477,6 +486,7 @@ const banner =
     \\  zinc -m <model.gguf> [-p 8080]
     \\  zinc chat [-m <model.gguf> | --model-id <id>] [-p 9090]
     \\  zinc --model-id <id> [--prompt "Hello"]
+    \\  zinc -hf <owner/model[:quant]> [--prompt "Hello"]
     \\  zinc --check [-m <model.gguf> | --model-id <id>]
     \\  zinc train -m <model.gguf> --train-data <tokens.txt> [options]
     \\  zinc model <list|pull|use|active|rm> [args]
@@ -484,8 +494,10 @@ const banner =
     \\Common options:
     \\  -m, --model <path>       GGUF model file to load
     \\  --model-id <id>          Managed model id from the local catalog/cache
+    \\  -hf, --hf-repo <spec>    Hugging Face repo (owner/model[:quant]) to download and load
     \\  --prompt <text>          Run one prompt in CLI mode instead of starting the server
     \\  --chat                   Apply the model chat template to --prompt
+    \\  --system-prompt <text>   Add an explicit system turn (requires --chat)
     \\  --raw                    Do not auto-apply chat templates to --prompt
     \\  -n, --max-tokens <n>     Max generated tokens in CLI mode (default: 256)
     \\  -d, --device <id>        GPU device index (default: auto, prefers discrete Vulkan GPU)
@@ -494,7 +506,8 @@ const banner =
     \\
     \\Server options:
     \\  -p, --port <port>        Server port (default: 8080)
-    \\  --parallel <n>           Max concurrent requests (default: 4)
+    \\  --parallel <n>           Requests in flight; CUDA decodes them together, other
+    \\                           backends serialize generation and queue the rest (default: 4)
     \\  chat                     Start the server on port 9090 and open the built-in chat UI in your browser
     \\
     \\Model management:
@@ -502,7 +515,7 @@ const banner =
     \\  model pull <id>          Download a supported managed model into the local cache
     \\  model use <id>           Set the active managed model for future runs
     \\  model active             Print the active managed model
-    \\  model rm [-f] <id>       Remove a cached managed model; -f unloads it first if active
+    \\  model rm [-f] <id>       Remove a cached model (catalog or hf-- id); -f unloads it first if active
     \\
     \\Diagnostics:
     \\  --check                  Run system diagnostics and verify dependencies
@@ -522,14 +535,17 @@ const banner_full =
     \\  zinc -m <model.gguf> [-p 8080]
     \\  zinc chat [-m <model.gguf> | --model-id <id>] [-p 9090]
     \\  zinc --model-id <id> [--prompt "Hello"]
+    \\  zinc -hf <owner/model[:quant]> [--prompt "Hello"]
     \\  zinc --check [-m <model.gguf> | --model-id <id>]
     \\  zinc model <list|pull|use|active|rm> [args]
     \\
     \\Common options:
     \\  -m, --model <path>       GGUF model file to load
     \\  --model-id <id>          Managed model id from the local catalog/cache
+    \\  -hf, --hf-repo <spec>    Hugging Face repo (owner/model[:quant]) to download and load
     \\  --prompt <text>          Run one prompt in CLI mode instead of starting the server
     \\  --chat                   Apply the model chat template to --prompt
+    \\  --system-prompt <text>   Add an explicit system turn (requires --chat)
     \\  --raw                    Do not auto-apply chat templates to --prompt
     \\  -n, --max-tokens <n>     Max generated tokens in CLI mode (default: 256)
     \\  -d, --device <id>        GPU device index (default: auto, prefers discrete Vulkan GPU)
@@ -538,7 +554,8 @@ const banner_full =
     \\
     \\Server options:
     \\  -p, --port <port>        Server port (default: 8080)
-    \\  --parallel <n>           Max concurrent requests (default: 4)
+    \\  --parallel <n>           Requests in flight; CUDA decodes them together, other
+    \\                           backends serialize generation and queue the rest (default: 4)
     \\  chat                     Start the server on port 9090 and open the built-in chat UI in your browser
     \\
     \\Model management:
@@ -546,7 +563,7 @@ const banner_full =
     \\  model pull <id>          Download a supported managed model into the local cache
     \\  model use <id>           Set the active managed model for future runs
     \\  model active             Print the active managed model
-    \\  model rm [-f] <id>       Remove a cached managed model; -f unloads it first if active
+    \\  model rm [-f] <id>       Remove a cached model (catalog or hf-- id); -f unloads it first if active
     \\
     \\Diagnostics:
     \\  --check                  Run system diagnostics and verify dependencies
@@ -634,6 +651,10 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             config.model_id = args[i];
+        } else if (std.mem.eql(u8, arg, "-hf") or std.mem.eql(u8, arg, "--hf-repo")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.hf_spec = args[i];
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -657,6 +678,10 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             config.prompt = args[i];
+        } else if (std.mem.eql(u8, arg, "--system-prompt")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            config.system_prompt = args[i];
         } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--max-tokens")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -736,8 +761,14 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
     if (config.command == .chat and config.prompt != null) {
         return error.ChatCommandDoesNotTakePrompt;
     }
+    if (config.hf_spec != null and (config.model_path != null or config.model_id != null)) {
+        return error.ConflictingModelSources;
+    }
     if (config.chat and config.raw_prompt) {
         return error.ConflictingPromptModes;
+    }
+    if (config.system_prompt != null and (!config.chat or config.prompt == null)) {
+        return error.SystemPromptRequiresChat;
     }
 
     if (config.command == .train and config.train_data_path == null) {
@@ -749,9 +780,24 @@ pub fn parseArgs(args: []const [:0]const u8) !Config {
 
 fn shouldAutoChatCliPrompt(tokenizer: *const tokenizer_mod.Tokenizer, prompt: []const u8) bool {
     const tmpl = tokenizer.chat_template orelse return false;
+    // ATEM (Muse Glimmer): a reasoning-tuned model that degenerates badly on
+    // raw completion — auto-apply its chat template unless the caller already
+    // wrote the turn markers themselves.
+    if (std.mem.indexOf(u8, tmpl, "<atem:") != null) {
+        return std.mem.indexOf(u8, prompt, "<|start|>") == null;
+    }
     if (std.mem.indexOf(u8, tmpl, "<|turn>") == null) return false;
     if (std.mem.indexOf(u8, prompt, "<|turn>") != null) return false;
     return true;
+}
+
+/// Engine-level stop id for CLI generation: ATEM chats end their turn with
+/// `<|eot|>` (distinct from EOS), so templated Muse prompts stop there.
+fn cliGenerationStopId(tokenizer: *const tokenizer_mod.Tokenizer, use_chat_prompt: bool) u32 {
+    if (use_chat_prompt and tokenizer.detectTemplateKind() == .atem) {
+        if (tokenizer.eot_id) |eot| return eot;
+    }
+    return tokenizer.eosId();
 }
 
 fn indexOfAsciiIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
@@ -789,22 +835,29 @@ fn promptFingerprint(text: []const u8) u64 {
     return std.hash.Wyhash.hash(0, text);
 }
 
-fn prepareCliPrompt(tokenizer: *const tokenizer_mod.Tokenizer, prompt: []const u8, chat: bool, allocator: std.mem.Allocator) !PreparedPrompt {
+fn prepareCliPrompt(
+    tokenizer: *const tokenizer_mod.Tokenizer,
+    prompt: []const u8,
+    chat: bool,
+    system_prompt: ?[]const u8,
+    allocator: std.mem.Allocator,
+) !PreparedPrompt {
     if (!chat) {
         return .{ .text = prompt };
     }
 
     // Llama 3 instruct models need a system prompt for best results.
     // Detect Llama-style templates (start_header_id) and prepend system message.
-    const needs_system = if (tokenizer.chat_template) |tmpl|
+    const template_needs_system = if (tokenizer.chat_template) |tmpl|
         std.mem.indexOf(u8, tmpl, "start_header_id") != null
     else
         false;
 
-    if (needs_system) {
+    if (system_prompt != null or template_needs_system) {
         const roles = [_][]const u8{ "system", "user" };
-        const contents = [_][]const u8{ "You are a helpful assistant.", prompt };
-        const chat_capacity = prompt.len + 512;
+        const system_content = system_prompt orelse "You are a helpful assistant.";
+        const contents = [_][]const u8{ system_content, prompt };
+        const chat_capacity = prompt.len + system_content.len + 512;
         const chat_buf = try allocator.alloc(u8, chat_capacity);
         errdefer allocator.free(chat_buf);
         const formatted = try tokenizer.applyChatTemplate(&roles, &contents, chat_buf);
@@ -891,6 +944,19 @@ fn trimCliOutputText(text: []const u8, chat: bool) []const u8 {
 }
 
 fn resolveStartupModel(config: Config, allocator: std.mem.Allocator) !ResolvedStartupModel {
+    if (config.hf_spec) |spec| {
+        var stdout_buffer: [512]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+        const path = try hf_mod.ensureModel(spec, allocator, &stdout_writer.interface);
+        return .{
+            .spec = .{
+                .model_path = path,
+                .requested_context_length = config.context_length,
+            },
+            .owned_path = path,
+        };
+    }
+
     if (config.model_id) |model_id| {
         const path = try managed_mod.resolveInstalledModelPath(model_id, allocator);
         const model_id_copy = try allocator.dupe(u8, model_id);
@@ -1171,9 +1237,14 @@ fn printManagedModelList(config: Config, allocator: std.mem.Allocator) !void {
         if (supported_with_offload) any_requires_offload = true;
         const is_active = active_model_id != null and std.mem.eql(u8, active_model_id.?, entry.id);
         const status_label = if (supported_now)
-            "supported"
+            @tagName(entry.status)
         else if (supported_with_offload)
-            "supported (offload)"
+            switch (entry.status) {
+                .supported => "supported (offload)",
+                .experimental => "experimental (offload)",
+                .hidden => "hidden (offload)",
+                .deprecated => "deprecated (offload)",
+            }
         else if (tested_profile_match)
             "too-large"
         else
@@ -1617,7 +1688,12 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
         .train => unreachable, // handled in main() before reaching here
         .model_rm => {
             const model_id = config.command_model_id orelse return error.MissingArgValue;
-            _ = catalog_mod.find(model_id) orelse return error.UnknownManagedModel;
+            // `-hf` downloads share the managed cache but have no catalog
+            // entry, so accept any id that is installed on disk and only
+            // reject ids that are neither in the catalog nor installed.
+            if (catalog_mod.find(model_id) == null and !managed_mod.isInstalled(model_id, allocator)) {
+                return error.UnknownManagedModel;
+            }
 
             if (try tryRemoveManagedModelViaLocalServer(config.port, model_id, config.command_force, allocator)) |server_response| {
                 defer {
@@ -1774,8 +1850,8 @@ fn writeDecodeGraphArtifacts(
     }
 }
 
-// CUDA: prompt-mode entrypoint for the NVIDIA backend. Only referenced (and
-// therefore only analyzed) under -Dbackend=cuda. Does a real greedy decode:
+// Accelerator prompt/server entrypoint shared by the CUDA and ROCm backends.
+// Only referenced (and therefore only analyzed) for those backends. Does a real greedy decode:
 // load → forward init → tokenize → prefill (one decodeStep per prompt token) →
 // greedy generate (feed argmax back) → detokenize → print. Server mode is not
 // yet supported on CUDA.
@@ -1783,16 +1859,20 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
     const model_path = config.model_path orelse {
         // model_id resolution flows through resolveStartupModel in main(); on
         // the CUDA path we only support an explicit -m/--model for now.
-        log.err("CUDA backend requires an explicit model path: zinc -m <model.gguf> --prompt \"...\"", .{});
+        log.err("{s} backend requires an explicit model path: zinc -m <model.gguf> --prompt \"...\"", .{accelerator_name});
         return error.NoModelSpecified;
     };
 
     var device = try cuda_device_mod.CudaDevice.initBest(allocator);
     defer device.deinit();
     var name_buf: [256]u8 = undefined;
-    log.info("ZINC CUDA backend — {s} (sm_{d}, {d} SMs)", .{
-        device.name(&name_buf), device.computeCapability(), device.smCount(),
-    });
+    if (comptime gpu.is_rocm) {
+        log.info("ZINC ROCm backend — {s} ({d} CUs)", .{ device.name(&name_buf), device.smCount() });
+    } else {
+        log.info("ZINC CUDA backend — {s} (sm_{d}, {d} SMs)", .{
+            device.name(&name_buf), device.computeCapability(), device.smCount(),
+        });
+    }
 
     // Load the model onto the GPU (weights uploaded verbatim-quantized).
     var model = loader_cuda_mod.Model.load(allocator, device.ctx, model_path) catch |err| {
@@ -1808,29 +1888,30 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
     const server_mode = config.prompt == null;
 
     // Build the forward state. max_ctx must cover prompt + generated tokens.
-    // gemma4 is a separate forward path (forward_cuda_gemma.zig); the
+    // gemma4 and Muse Glimmer use the dense transformer forward path
+    // (forward_cuda_gemma.zig); the
     // qwen35/qwen36 hybrid-SSM family uses forward_cuda.zig.
     const max_ctx: u32 = if (config.context_length) |c| c else 2048;
-    if (model.config.architecture == .gemma) {
+    if (model.config.architecture == .gemma or model.config.architecture == .muse_glimmer) {
         var fwd = forward_cuda_gemma_mod.ForwardGemma.init(allocator, &model, max_ctx) catch |err| {
-            log.err("Failed to init CUDA forward pass: {s}", .{@errorName(err)});
+            log.err("Failed to init {s} forward pass: {s}", .{ accelerator_name, @errorName(err) });
             return err;
         };
         defer fwd.deinit();
-        log.info("CUDA gemma4 forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
-            fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
+        log.info("{s} {s} forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
+            accelerator_name, @tagName(model.config.architecture), fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
         });
         if (server_mode) return runCudaServe(.{ .gemma = &fwd }, &model, config, max_ctx, allocator);
         return runCudaDecode(&fwd, &model, config, max_ctx, allocator);
     }
 
     var fwd = forward_cuda_mod.ForwardCuda.init(allocator, &model, max_ctx) catch |err| {
-        log.err("Failed to init CUDA forward pass: {s}", .{@errorName(err)});
+        log.err("Failed to init {s} forward pass: {s}", .{ accelerator_name, @errorName(err) });
         return err;
     };
     defer fwd.deinit();
-    log.info("CUDA forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
-        fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
+    log.info("{s} forward init OK (n_embd={d}, n_layers={d}, vocab={d}, max_ctx={d})", .{
+        accelerator_name, fwd.d.n_embd, fwd.d.n_layers, fwd.d.vocab, max_ctx,
     });
     if (server_mode) return runCudaServe(.{ .qwen = &fwd }, &model, config, max_ctx, allocator);
     return runCudaDecode(&fwd, &model, config, max_ctx, allocator);
@@ -1862,7 +1943,7 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
 
     const auto_chat = !config.chat and !config.raw_prompt and shouldAutoChatCliPrompt(&tokenizer, prompt);
     const use_chat_prompt = config.chat or auto_chat;
-    var prepared_prompt = try prepareCliPrompt(&tokenizer, prompt, use_chat_prompt, allocator);
+    var prepared_prompt = try prepareCliPrompt(&tokenizer, prompt, use_chat_prompt, config.system_prompt, allocator);
     defer prepared_prompt.deinit(allocator);
 
     const prompt_tokens = try tokenizer.encodePrompt(prepared_prompt.text, allocator);
@@ -1886,6 +1967,16 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
 
     var generated: std.ArrayList(u32) = .{};
     defer generated.deinit(allocator);
+
+    // MTP rollback/history buffers are execution-context setup, so allocate
+    // them before prompt timing just as a separate draft context would be.
+    var mtp_prepared = false;
+    if (comptime @hasDecl(@TypeOf(fwd.*), "mtpPrepare")) {
+        mtp_prepared = fwd.mtpPrepare() catch |err| blk: {
+            log.warn("NextN/MTP context setup failed ({s}); using ordinary greedy decode", .{@errorName(err)});
+            break :blk false;
+        };
+    }
 
     // PREFILL: build the KV cache for every prompt token, but only the LAST
     // prompt token needs logits — its argmax is the first generated token.
@@ -1928,6 +2019,15 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
             }
         }
     }
+    var mtp_active = false;
+    if (comptime @hasDecl(@TypeOf(fwd.*), "mtpPrime")) {
+        if (mtp_prepared and used_batched) {
+            mtp_active = fwd.mtpPrime(prompt_tokens) catch |err| blk: {
+                log.warn("NextN/MTP initialization failed ({s}); using ordinary greedy decode", .{@errorName(err)});
+                break :blk false;
+            };
+        }
+    }
     const prefill_ms = @as(f64, @floatFromInt(prefill_timer.read())) / 1_000_000.0;
     const prefill_tps = if (prefill_ms > 0) @as(f64, @floatFromInt(prompt_tokens.len)) / (prefill_ms / 1000.0) else 0;
     log.info("Prefill complete: {d} tokens in {d:.1} ms ({d:.2} tok/s)", .{ prompt_tokens.len, prefill_ms, prefill_tps });
@@ -1936,14 +2036,67 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     // context limit is reached.
     var produced: u32 = 0;
     var decode_timer = try std.time.Timer.start();
-    while (produced < max_new and pos < max_ctx) {
-        if (next_tok == eos_id) break;
-        try generated.append(allocator, next_tok);
-        produced += 1;
-        if (produced >= max_new or pos >= max_ctx) break;
-        const fed = next_tok;
-        next_tok = try fwd.decodeStep(fed, pos, true);
-        pos += 1;
+    var generated_with_mtp = false;
+    var mtp_drafted: u32 = 0;
+    var mtp_accepted: u32 = 0;
+    if (comptime @hasDecl(@TypeOf(fwd.*), "mtpCycle")) {
+        if (mtp_active) {
+            generated_with_mtp = true;
+            mtp_loop: while (produced < max_new and pos < max_ctx) {
+                if (next_tok == eos_id) break;
+
+                const token_room = max_new - produced;
+                const context_room = max_ctx - pos;
+                const max_drafts = @min(@as(u32, 3), @min(token_room - 1, context_room - 1));
+                if (max_drafts == 0) {
+                    try generated.append(allocator, next_tok);
+                    produced += 1;
+                    break;
+                }
+
+                const result = try fwd.mtpCycle(next_tok, pos, max_drafts, eos_id);
+                mtp_drafted += result.n_drafted;
+                mtp_accepted += result.n_accepted;
+
+                // The target always consumed and committed the seed token.
+                try generated.append(allocator, next_tok);
+                produced += 1;
+                pos += 1;
+
+                var i: u32 = 0;
+                while (i < result.n_accepted) : (i += 1) {
+                    const accepted = result.drafts[i];
+                    if (accepted == eos_id) break :mtp_loop;
+                    try generated.append(allocator, accepted);
+                    produced += 1;
+                    pos += 1;
+                }
+                next_tok = result.next_token;
+            }
+        }
+    }
+    if (!generated_with_mtp) {
+        while (produced < max_new and pos < max_ctx) {
+            if (next_tok == eos_id) break;
+            try generated.append(allocator, next_tok);
+            produced += 1;
+            if (produced >= max_new or pos >= max_ctx) break;
+            const fed = next_tok;
+            next_tok = try fwd.decodeStep(fed, pos, true);
+            pos += 1;
+        }
+    } else {
+        const acceptance = if (mtp_drafted > 0)
+            100.0 * @as(f64, @floatFromInt(mtp_accepted)) / @as(f64, @floatFromInt(mtp_drafted))
+        else
+            0.0;
+        log.info("NextN/MTP: accepted {d}/{d} draft tokens ({d:.1}%)", .{ mtp_accepted, mtp_drafted, acceptance });
+        if (comptime @hasDecl(@TypeOf(fwd.*), "mtpPerf")) {
+            const perf = fwd.mtpPerf();
+            log.info("NextN/MTP phases ({d} cycles): draft={d:.1} ms target={d:.1} ms restore={d:.1} ms catch-up={d:.1} ms", .{
+                perf.cycles, perf.draft_ms, perf.target_ms, perf.restore_ms, perf.catchup_ms,
+            });
+        }
     }
     const decode_ms = @as(f64, @floatFromInt(decode_timer.read())) / 1_000_000.0;
     const decode_tps = if (decode_ms > 0) @as(f64, @floatFromInt(produced)) / (decode_ms / 1000.0) else 0;
@@ -1998,6 +2151,11 @@ const ServeConnCtx = struct {
 /// `ServeEngine`, then accept connections and hand each to a detached handler.
 /// `fwd` is a `cuda_serve.Forward` so the server drives EITHER the gemma4 dense or
 /// the qwen35/36 hybrid-SSM+MoE forward (Effort 28 increment 4 — qwen serving).
+fn cudaServeSlotCount(requested: u32, gemma_moe: bool) u32 {
+    const clamped = std.math.clamp(requested, 1, 64);
+    return if (gemma_moe) 1 else clamped;
+}
+
 fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, config: Config, max_ctx: u32, allocator: std.mem.Allocator) !void {
     var tokenizer = tokenizer_mod.Tokenizer.initFromGGUF(&model.gguf_file, allocator) catch |err| {
         log.err("Failed to init tokenizer from GGUF: {s}", .{@errorName(err)});
@@ -2013,12 +2171,17 @@ fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, conf
     if (std.posix.getenv("ZINC_SCHED_EOS")) |v| {
         eos = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \n\r\t"), 10) catch eos;
     }
+    const eot = if (!debug_ids and tokenizer.detectTemplateKind() == .atem) tokenizer.eot_id else null;
 
-    const nslots = std.math.clamp(config.max_parallel, 1, 64);
+    const gemma_moe = model.config.architecture == .gemma and model.config.n_experts > 0;
+    const nslots = cudaServeSlotCount(config.max_parallel, gemma_moe);
+    if (gemma_moe and config.max_parallel != 1) {
+        log.warn("Gemma MoE serving currently uses one request slot; ignoring --parallel {d}", .{config.max_parallel});
+    }
     const slot_ctx = max_ctx;
 
-    var engine = cuda_serve_mod.ServeEngine.init(allocator, fwd, nslots, slot_ctx, eos) catch |err| {
-        log.err("Failed to init CUDA serve engine: {s}", .{@errorName(err)});
+    var engine = cuda_serve_mod.ServeEngine.init(allocator, fwd, nslots, slot_ctx, eos, eot) catch |err| {
+        log.err("Failed to init {s} serve engine: {s}", .{ accelerator_name, @errorName(err) });
         return err;
     };
     defer engine.deinit();
@@ -2031,8 +2194,8 @@ fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, conf
     };
     defer server.deinit();
 
-    log.info("ZINC CUDA server listening on :{d} (slots={d}, ctx={d}, eos={d}, debug_ids={})", .{
-        config.port, nslots, slot_ctx, eos, debug_ids,
+    log.info("ZINC {s} server listening on :{d} (slots={d}, ctx={d}, eos={d}, debug_ids={})", .{
+        accelerator_name, config.port, nslots, slot_ctx, eos, debug_ids,
     });
 
     while (true) {
@@ -2069,6 +2232,12 @@ const ServeReqBody = struct {
     messages: ?[]struct { role: []const u8 = "user", content: []const u8 = "" } = null,
     max_tokens: ?u32 = null,
     n_predict: ?u32 = null,
+    /// Preserve the original SSE default when omitted; explicit false selects
+    /// the OpenAI-compatible non-streaming response used by benchmark clients.
+    stream: ?bool = null,
+    /// Expose model reasoning in a `<think>` envelope when the template has a
+    /// structured internal channel (including Muse Glimmer's ATEM protocol).
+    enable_thinking: ?bool = null,
 };
 
 fn handleServeConn(ctx: *ServeConnCtx) void {
@@ -2083,7 +2252,10 @@ fn handleServeConn(ctx: *ServeConnCtx) void {
         return;
     }
     if (req.method == .GET and std.mem.eql(u8, req.path, "/health")) {
-        conn.sendJson(200, "{\"status\":\"ok\",\"backend\":\"cuda\"}") catch {};
+        conn.sendJson(200, if (gpu.is_rocm)
+            "{\"status\":\"ok\",\"backend\":\"rocm\"}"
+        else
+            "{\"status\":\"ok\",\"backend\":\"cuda\"}") catch {};
         return;
     }
     // 3c throughput gate: cumulative decode/prefill counters. Diff two snapshots
@@ -2113,6 +2285,8 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
     var prompt_tokens: []u32 = undefined;
     var max_tokens: u32 = ctx.default_max;
     var owns_tokens = false;
+    var stream_response = true;
+    var enable_thinking: ?bool = null;
 
     if (ctx.debug_ids) {
         // Gate contract: body is JSON {"prompt":"t0,t1,...","max_tokens":N}; the
@@ -2124,6 +2298,8 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         };
         defer parsed.deinit();
         if (parsed.value.max_tokens orelse parsed.value.n_predict) |m| max_tokens = m;
+        stream_response = parsed.value.stream orelse true;
+        enable_thinking = parsed.value.enable_thinking;
         const ptxt = parsed.value.prompt orelse {
             try conn.sendError(400, "invalid_request_error", "missing prompt");
             return;
@@ -2137,6 +2313,8 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         };
         defer parsed.deinit();
         if (parsed.value.max_tokens orelse parsed.value.n_predict) |m| max_tokens = m;
+        stream_response = parsed.value.stream orelse true;
+        enable_thinking = parsed.value.enable_thinking;
 
         var prompt_text: []const u8 = "";
         var chat_buf: ?[]u8 = null;
@@ -2156,7 +2334,7 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
             }
             const buf = try allocator.alloc(u8, 64 * 1024);
             chat_buf = buf;
-            prompt_text = ctx.tokenizer.applyChatTemplate(roles, contents, buf) catch |err| {
+            prompt_text = ctx.tokenizer.applyChatTemplateWithOptions(roles, contents, .{ .enable_thinking = enable_thinking }, buf) catch |err| {
                 try conn.sendError(400, "invalid_request_error", "chat template failed");
                 log.warn("chat template: {s}", .{@errorName(err)});
                 return;
@@ -2171,6 +2349,15 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         owns_tokens = true;
     }
     defer if (owns_tokens) allocator.free(prompt_tokens);
+
+    const template_kind = ctx.tokenizer.detectTemplateKind();
+    const structured_chat = is_chat and !ctx.debug_ids and (template_kind == .atem or template_kind == .openai_moe);
+    // ATEM models always begin on their private reasoning channel. Expose that
+    // channel by default (callers can still request enable_thinking=false), or a
+    // short completion that has not reached the final channel serializes as an
+    // empty assistant message even though the model generated valid tokens.
+    const thinking_enabled = structured_chat and (enable_thinking orelse (template_kind == .atem)) and
+        (ctx.tokenizer.supportsThinkingToggle() or template_kind == .atem);
 
     if (prompt_tokens.len == 0) {
         try conn.sendError(400, "invalid_request_error", "empty prompt");
@@ -2194,27 +2381,73 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
     // draining to `finished` (so the worker is done touching them) then `finish`.
     defer ctx.engine.finish(id, &chan);
 
-    conn.sendSseStart() catch {
-        // Client gone before headers — still drain the engine so it frees the slot.
-        drainQuietly(ctx.engine, &chan);
-        return;
-    };
+    if (stream_response) {
+        conn.sendSseStart() catch {
+            // Client gone before headers — still drain the engine so it frees the slot.
+            drainQuietly(ctx.engine, &chan);
+            return;
+        };
+    }
 
     var buf: [32]u32 = undefined;
     var dec_buf: [256]u8 = undefined;
     var json_buf: [1024]u8 = undefined;
+    var output: std.ArrayList(u8) = .{};
+    defer output.deinit(allocator);
+    const structured_capacity = @max(@as(usize, 64 * 1024), @as(usize, ctx.slot_ctx) * 32 + 256);
+    const structured_buf: ?[]u8 = if (structured_chat) try allocator.alloc(u8, structured_capacity) else null;
+    defer if (structured_buf) |buf_to_free| allocator.free(buf_to_free);
+    var sent_structured_len: usize = 0;
     var write_failed = false;
+    var generation_failed = false;
     while (true) {
         const ch = ctx.engine.nextChunk(&chan, &buf);
+        generation_failed = generation_failed or ch.failed;
         var i: usize = 0;
         while (i < ch.n) : (i += 1) {
             const tok = buf[i];
             if (write_failed) continue; // keep draining the engine, stop writing
-            if (ctx.debug_ids) {
+            if (!stream_response) {
+                if (ctx.debug_ids) {
+                    if (output.items.len != 0) output.append(allocator, ',') catch {
+                        write_failed = true;
+                        continue;
+                    };
+                    output.writer(allocator).print("{d}", .{tok}) catch {
+                        write_failed = true;
+                        continue;
+                    };
+                } else {
+                    output.appendSlice(allocator, ctx.tokenizer.decodeToken(tok, &dec_buf)) catch {
+                        write_failed = true;
+                        continue;
+                    };
+                }
+            } else if (ctx.debug_ids) {
                 const payload = std.fmt.bufPrint(&json_buf, "{d}", .{tok}) catch continue;
                 conn.writeSseEvent(payload) catch {
                     write_failed = true;
                 };
+            } else if (structured_chat) {
+                const text = ctx.tokenizer.decodeToken(tok, &dec_buf);
+                output.appendSlice(allocator, text) catch {
+                    write_failed = true;
+                    continue;
+                };
+                const normalized = routes_mod.normalizeStructuredAssistantOutput(
+                    ctx.tokenizer,
+                    output.items,
+                    thinking_enabled,
+                    structured_buf.?,
+                ) catch "";
+                if (normalized.len > sent_structured_len) {
+                    const payload = formatChunkJson(&json_buf, normalized[sent_structured_len..], is_chat) catch continue;
+                    conn.writeSseEvent(payload) catch {
+                        write_failed = true;
+                        continue;
+                    };
+                    sent_structured_len = normalized.len;
+                }
             } else {
                 const text = ctx.tokenizer.decodeToken(tok, &dec_buf);
                 const payload = formatChunkJson(&json_buf, text, is_chat) catch continue;
@@ -2225,7 +2458,60 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         }
         if (ch.finished) break;
     }
-    if (!write_failed) conn.writeSseDone() catch {};
+    const generated_tokens = chan.consumed;
+    logServeTimings(prompt_tokens.len, generated_tokens, chan.prefill_wall_ns, chan.decode_wall_ns);
+    if (generation_failed) {
+        log.warn("request {d} failed during GPU generation", .{id});
+        if (stream_response) {
+            if (!write_failed) {
+                conn.writeSseEvent("{\"error\":{\"type\":\"server_error\",\"message\":\"GPU generation failed\"}}") catch {};
+                conn.writeSseDone() catch {};
+            }
+        } else {
+            try conn.sendError(500, "server_error", "GPU generation failed");
+        }
+        return;
+    }
+    if (stream_response) {
+        if (!write_failed) conn.writeSseDone() catch {};
+        return;
+    }
+    if (write_failed) {
+        try conn.sendError(500, "server_error", "response buffering failed");
+        return;
+    }
+
+    const response_output = if (structured_chat)
+        routes_mod.normalizeStructuredAssistantOutput(ctx.tokenizer, output.items, thinking_enabled, structured_buf.?) catch ""
+    else
+        output.items;
+    const escaped = try jsonEscapeAlloc(allocator, response_output);
+    defer allocator.free(escaped);
+    var response: std.ArrayList(u8) = .{};
+    defer response.deinit(allocator);
+    const finish_reason: []const u8 = if (generated_tokens >= @as(usize, max_tokens)) "length" else "stop";
+    if (is_chat) {
+        try response.writer(allocator).print(
+            "{{\"id\":\"chatcmpl-zinc\",\"object\":\"chat.completion\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{s}\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
+            .{ escaped, finish_reason, prompt_tokens.len, generated_tokens, prompt_tokens.len + generated_tokens },
+        );
+    } else {
+        try response.writer(allocator).print(
+            "{{\"id\":\"cmpl-zinc\",\"object\":\"text_completion\",\"choices\":[{{\"index\":0,\"text\":\"{s}\",\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
+            .{ escaped, finish_reason, prompt_tokens.len, generated_tokens, prompt_tokens.len + generated_tokens },
+        );
+    }
+    try conn.sendJson(200, response.items);
+}
+
+fn logServeTimings(prompt_tokens: usize, generated_tokens: usize, prefill_ns: u64, decode_ns: u64) void {
+    const prefill_ms = @as(f64, @floatFromInt(prefill_ns)) / 1_000_000.0;
+    const decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0;
+    const prefill_tps = if (prefill_ns == 0) 0.0 else @as(f64, @floatFromInt(prompt_tokens)) * 1_000_000_000.0 / @as(f64, @floatFromInt(prefill_ns));
+    const decode_tps = if (decode_ns == 0) 0.0 else @as(f64, @floatFromInt(generated_tokens)) * 1_000_000_000.0 / @as(f64, @floatFromInt(decode_ns));
+    const ms_per_token = if (generated_tokens == 0) 0.0 else decode_ms / @as(f64, @floatFromInt(generated_tokens));
+    inference_timing_log.info("Prefill: {d} tokens in {d:.1} ms ({d:.2} tok/s)", .{ prompt_tokens, prefill_ms, prefill_tps });
+    inference_timing_log.info("Generated {d} tokens in {d:.1} ms — {d:.2} tok/s ({d:.1} ms/tok)", .{ generated_tokens, decode_ms, decode_tps, ms_per_token });
 }
 
 /// Drain a request's stream without writing (client disconnected) so the worker
@@ -2280,6 +2566,23 @@ fn jsonEscape(buf: []u8, s: []const u8) []const u8 {
     return buf[0..n];
 }
 
+fn jsonEscapeAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    for (s) |c| {
+        const rep: []const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => &[_]u8{c},
+        };
+        try out.appendSlice(allocator, rep);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// True if an env var is set to an "on" value (1/true/yes/on).
 fn envIsOn(name: []const u8) bool {
     const v = std.posix.getenv(name) orelse return false;
@@ -2300,11 +2603,11 @@ fn runCudaCheck(config: Config, check_target: ResolvedCheckTarget, allocator: st
     try w.print("\n[1/2] Host Environment\n", .{});
     try w.print("  OS: {s} [OK]\n", .{@tagName(builtin.os.tag)});
     try w.print("  CPU arch: {s} [OK]\n", .{@tagName(builtin.cpu.arch)});
-    try w.print("  Backend: cuda [OK]\n", .{});
+    try w.print("  Backend: {s} [OK]\n", .{if (gpu.is_rocm) "rocm" else "cuda"});
 
-    try w.print("\n[2/2] CUDA Device\n", .{});
+    try w.print("\n[2/2] {s} Device\n", .{accelerator_name});
     var device = cuda_device_mod.CudaDevice.initBest(allocator) catch |err| {
-        try w.print("  CUDA init: FAILED ({s}) [FAIL]\n", .{@errorName(err)});
+        try w.print("  {s} init: FAILED ({s}) [FAIL]\n", .{ accelerator_name, @errorName(err) });
         try w.print("\nVerdict: NOT READY [FAIL]\n", .{});
         try w.flush();
         return error.DiagnosticsFailed;
@@ -2316,11 +2619,18 @@ fn runCudaCheck(config: Config, check_target: ResolvedCheckTarget, allocator: st
     const cc = device.computeCapability();
     const total = device.totalMemory();
     const free = device.freeMemory();
-    try w.print("  CUDA init: Initialized best device (index {d}) [OK]\n", .{device.device_index});
+    try w.print("  {s} init: Initialized best device (index {d}) [OK]\n", .{ accelerator_name, device.device_index });
     try w.print("  Device: {s} [OK]\n", .{name});
-    try w.print("  Compute capability: sm_{d} [OK]\n", .{cc});
-    try w.print("  SM count: {d} [OK]\n", .{device.smCount()});
-    try w.print("  Warp size: {d}\n", .{device.warpSize()});
+    if (comptime gpu.is_rocm) {
+        var arch_buf: [64]u8 = undefined;
+        try w.print("  Compute target: {s} [OK]\n", .{device.arch(&arch_buf)});
+        try w.print("  CU count: {d} [OK]\n", .{device.smCount()});
+        try w.print("  Wavefront size: {d}\n", .{device.warpSize()});
+    } else {
+        try w.print("  Compute capability: sm_{d} [OK]\n", .{cc});
+        try w.print("  SM count: {d} [OK]\n", .{device.smCount()});
+        try w.print("  Warp size: {d}\n", .{device.warpSize()});
+    }
     try w.print("  Total VRAM: {d:.2} GiB [OK]\n", .{bytesToGiBf(total)});
     try w.print("  Free VRAM: {d:.2} GiB [OK]\n", .{bytesToGiBf(free)});
 
@@ -2394,6 +2704,16 @@ pub fn main() !void {
         };
         defer check_target.deinit(allocator);
 
+        if (comptime gpu.is_cuda) {
+            // CUDA-family backends compile kernels at runtime and do not need a
+            // Vulkan/Metal shader directory for their preflight.
+            runCudaCheck(config, check_target, allocator) catch |err| {
+                log.err("Diagnostics completed with error: {s}", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            return;
+        }
+
         const check_shader_dir_owned = runtime_assets.resolveShaderDir(allocator, if (gpu.is_metal) .metal else .spirv) catch |err| blk: {
             log.warn("Could not resolve shader directory before diagnostics: {s}", .{@errorName(err)});
             break :blk null;
@@ -2403,16 +2723,6 @@ pub fn main() !void {
             "src/shaders/metal"
         else
             "zig-out/share/zinc/shaders";
-
-        if (comptime gpu.is_cuda) {
-            // CUDA: diagnostics_mod is the no-op stub on this backend, so run a
-            // dedicated NVIDIA preflight (detect device + report + OK).
-            runCudaCheck(config, check_target, allocator) catch |err| {
-                log.err("Diagnostics completed with error: {s}", .{@errorName(err)});
-                std.process.exit(1);
-            };
-            return;
-        }
 
         diagnostics_mod.run(.{
             .device_index = config.gpuDevicePreference(),
@@ -2747,7 +3057,7 @@ pub fn main() !void {
 
             const auto_chat = !config.chat and !config.raw_prompt and shouldAutoChatCliPrompt(&tokenizer, prompt);
             const use_chat_prompt = config.chat or auto_chat;
-            var prepared_prompt = try prepareCliPrompt(&tokenizer, prompt, use_chat_prompt, allocator);
+            var prepared_prompt = try prepareCliPrompt(&tokenizer, prompt, use_chat_prompt, config.system_prompt, allocator);
             defer prepared_prompt.deinit(allocator);
             if (use_chat_prompt) {
                 log.info("Prompt mode: {s}chat template ({d} chars)", .{
@@ -2777,7 +3087,7 @@ pub fn main() !void {
             };
             defer engine.deinit();
 
-            const eos_id = if (envIsOn("ZINC_BENCH_IGNORE_EOS")) std.math.maxInt(u32) else tokenizer.eosId();
+            const eos_id = if (envIsOn("ZINC_BENCH_IGNORE_EOS")) std.math.maxInt(u32) else cliGenerationStopId(&tokenizer, use_chat_prompt);
             if (eos_id == std.math.maxInt(u32)) {
                 log.info("Benchmark mode: ignoring EOS until max_tokens", .{});
             }
@@ -2848,7 +3158,11 @@ pub fn main() !void {
                 log.info("Output ({d} tokens): {s}", .{ output_tokens.len, output_text });
             }
         } else {
-            log.info("Server mode — port {d}, max {d} concurrent requests", .{ config.port, config.max_parallel });
+            // Metal serialises generation behind ServerState.generation_mutex, so
+            // --parallel is how many requests may be in flight (one running, the
+            // rest queued), not how many decode at once. Only the CUDA serve path
+            // has real slots.
+            log.info("Server mode — port {d}, generation serialized, up to {d} request(s) in flight", .{ config.port, config.max_parallel });
 
             var manager = if (resolved_model) |startup_model|
                 model_manager_mod.ModelManager.init(startup_model.spec, &device, allocator) catch |err| {
@@ -2872,7 +3186,7 @@ pub fn main() !void {
     // pattern as the Metal block above), so it is never analyzed here.
     if (comptime gpu.is_cuda) {
         runCuda(config, allocator) catch |err| {
-            log.err("CUDA run failed: {s}", .{@errorName(err)});
+            log.err("{s} run failed: {s}", .{ accelerator_name, @errorName(err) });
             std.process.exit(1);
         };
         return;
@@ -2914,7 +3228,23 @@ pub fn main() !void {
             std.process.exit(1);
         };
         defer model.deinit(&vk_instance);
-        memory_plan.applyRequestedContextLimit(&model.config, config.context_length);
+        if (config.context_length) |requested_context| {
+            memory_plan.applyRequestedContextLimit(&model.config, requested_context);
+        } else {
+            // Same vLLM-style auto context as the server and the Metal CLI:
+            // spend 85% of VRAM on weights + KV. Handing the engine the
+            // architectural ceiling instead lets it trim against the full
+            // card, which fills VRAM to the last few hundred MB and spills
+            // buffers to system memory (Qwen 3.8 27B on a 32 GB R9700 lost
+            // 17% of MTP decode and 10% of plain decode that way).
+            const auto_context = memory_plan.autoContextTokensForDeviceBudget(
+                memory_plan.profileWithKvBytes(model.config, kv_dtype.elementBytes()),
+                forward_mod.tensorBytes(&model),
+                vk_instance.vramBytes(),
+                model.config.context_length,
+            );
+            memory_plan.applyRequestedContextLimit(&model.config, auto_context);
+        }
 
         var engine = forward_mod.InferenceEngine.init(&model, &vk_instance, gpu_config, shader_dir, allocator) catch |err| {
             log.err("Failed to init inference engine: {s}", .{@errorName(err)});
@@ -2950,7 +3280,7 @@ pub fn main() !void {
 
         const auto_chat = !config.chat and !config.raw_prompt and shouldAutoChatCliPrompt(&tokenizer, prompt);
         const use_chat_prompt = config.chat or auto_chat;
-        var prepared_prompt = try prepareCliPrompt(&tokenizer, prompt, use_chat_prompt, allocator);
+        var prepared_prompt = try prepareCliPrompt(&tokenizer, prompt, use_chat_prompt, config.system_prompt, allocator);
         defer prepared_prompt.deinit(allocator);
         if (use_chat_prompt) {
             log.debug("Prompt mode: {s}chat template ({d} chars)", .{
@@ -2985,7 +3315,7 @@ pub fn main() !void {
             log.debug("Prompt decoded: \"{s}\"", .{pt_buf.items});
         }
 
-        const eos_id = if (envIsOn("ZINC_BENCH_IGNORE_EOS")) std.math.maxInt(u32) else tokenizer.eosId();
+        const eos_id = if (envIsOn("ZINC_BENCH_IGNORE_EOS")) std.math.maxInt(u32) else cliGenerationStopId(&tokenizer, use_chat_prompt);
         if (eos_id == std.math.maxInt(u32)) {
             log.info("Benchmark mode: ignoring EOS until max_tokens", .{});
         }
@@ -3081,7 +3411,10 @@ pub fn main() !void {
             });
         }
     } else {
-        log.info("Server mode — port {d}, max {d} concurrent requests", .{ config.port, config.max_parallel });
+        // Same as the Metal branch: one generation at a time behind
+        // ServerState.generation_mutex; --parallel bounds the queue, not the
+        // number of requests decoding together.
+        log.info("Server mode — port {d}, generation serialized, up to {d} request(s) in flight", .{ config.port, config.max_parallel });
 
         var manager = if (resolved_model) |startup_model|
             model_manager_mod.ModelManager.init(startup_model.spec, &vk_instance, gpu_config, shader_dir, allocator) catch |err| {
@@ -3114,6 +3447,7 @@ test "parseArgs: defaults" {
         try std.testing.expectEqual(@as(u32, 0), config.gpuDevicePreference());
     }
     try std.testing.expect(config.prompt == null);
+    try std.testing.expect(config.system_prompt == null);
     try std.testing.expect(!config.chat);
     try std.testing.expect(!config.raw_prompt);
     try std.testing.expectEqual(Command.run, config.command);
@@ -3121,11 +3455,12 @@ test "parseArgs: defaults" {
 
 test "parseArgs: full args" {
     const args = [_][:0]const u8{
-        "zinc",           "-m",         "model.gguf",  "--model-id", "qwen35-9b-q4k-m",
-        "-p",             "9090",       "-d",          "1",          "-c",
-        "8192",           "--parallel", "8",           "--prompt",   "hello",
-        "--max-tokens",   "32",         "--chat",      "--kv-quant", "3",
-        "--graph-report", "graph.json", "--graph-dot", "graph.dot",
+        "zinc",         "-m",         "model.gguf",     "--model-id",      "qwen35-9b-q4k-m",
+        "-p",           "9090",       "-d",             "1",               "-c",
+        "8192",         "--parallel", "8",              "--prompt",        "hello",
+        "--max-tokens", "32",         "--chat",         "--system-prompt", "system guidance",
+        "--kv-quant",   "3",          "--graph-report", "graph.json",      "--graph-dot",
+        "graph.dot",
     };
     const config = try parseArgs(&args);
     try std.testing.expectEqualStrings("model.gguf", config.model_path.?);
@@ -3137,12 +3472,33 @@ test "parseArgs: full args" {
     try std.testing.expectEqual(@as(?u32, 8192), config.context_length);
     try std.testing.expectEqual(@as(u32, 8), config.max_parallel);
     try std.testing.expectEqualStrings("hello", config.prompt.?);
+    try std.testing.expectEqualStrings("system guidance", config.system_prompt.?);
     try std.testing.expectEqual(@as(u32, 32), config.max_tokens);
     try std.testing.expect(config.chat);
     try std.testing.expect(!config.raw_prompt);
     try std.testing.expectEqual(@as(u8, 3), config.kv_quant);
     try std.testing.expectEqualStrings("graph.json", config.graph_report_path.?);
     try std.testing.expectEqualStrings("graph.dot", config.graph_dot_path.?);
+}
+
+test "parseArgs: -hf sets hf_spec" {
+    const args = [_][:0]const u8{ "zinc", "-hf", "unsloth/Qwen3.5-9B-GGUF:Q4_K_M" };
+    const config = try parseArgs(&args);
+    try std.testing.expectEqualStrings("unsloth/Qwen3.5-9B-GGUF:Q4_K_M", config.hf_spec.?);
+}
+
+test "parseArgs: -hf conflicts with -m and --model-id" {
+    const with_model = [_][:0]const u8{ "zinc", "-hf", "a/b", "-m", "model.gguf" };
+    try std.testing.expectError(error.ConflictingModelSources, parseArgs(&with_model));
+    const with_id = [_][:0]const u8{ "zinc", "-hf", "a/b", "--model-id", "qwen35-9b-q4k-m" };
+    try std.testing.expectError(error.ConflictingModelSources, parseArgs(&with_id));
+}
+
+test "CUDA serving clamps Gemma MoE to one slot" {
+    try std.testing.expectEqual(@as(u32, 1), cudaServeSlotCount(4, true));
+    try std.testing.expectEqual(@as(u32, 8), cudaServeSlotCount(8, false));
+    try std.testing.expectEqual(@as(u32, 1), cudaServeSlotCount(0, false));
+    try std.testing.expectEqual(@as(u32, 64), cudaServeSlotCount(128, false));
 }
 
 test "parseArgs: allows large context requests" {
@@ -3224,6 +3580,18 @@ test "parseArgs: raw flag" {
 test "parseArgs: raw and chat conflict" {
     const args = [_][:0]const u8{ "zinc", "--prompt", "hi", "--chat", "--raw" };
     try std.testing.expectError(error.ConflictingPromptModes, parseArgs(&args));
+}
+
+test "parseArgs: system prompt requires explicit CLI chat mode" {
+    const valid_args = [_][:0]const u8{ "zinc", "--prompt", "hi", "--chat", "--system-prompt", "be direct" };
+    const valid = try parseArgs(&valid_args);
+    try std.testing.expectEqualStrings("be direct", valid.system_prompt.?);
+
+    const no_chat = [_][:0]const u8{ "zinc", "--prompt", "hi", "--system-prompt", "be direct" };
+    try std.testing.expectError(error.SystemPromptRequiresChat, parseArgs(&no_chat));
+
+    const no_prompt = [_][:0]const u8{ "zinc", "--chat", "--system-prompt", "be direct" };
+    try std.testing.expectError(error.SystemPromptRequiresChat, parseArgs(&no_prompt));
 }
 
 test "helpText: short help hides developer-only flags" {
@@ -3411,7 +3779,7 @@ test "prepareCliPrompt leaves non-chat prompts unowned" {
     var tok = makeTestTokenizer(null);
     defer tok.token_to_id.deinit();
 
-    var prepared = try prepareCliPrompt(&tok, "hello", false, std.testing.allocator);
+    var prepared = try prepareCliPrompt(&tok, "hello", false, null, std.testing.allocator);
     defer prepared.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("hello", prepared.text);
@@ -3422,7 +3790,7 @@ test "prepareCliPrompt returns full owned chat buffer" {
     var tok = makeTestTokenizer(null);
     defer tok.token_to_id.deinit();
 
-    var prepared = try prepareCliPrompt(&tok, "Hello", true, std.testing.allocator);
+    var prepared = try prepareCliPrompt(&tok, "Hello", true, null, std.testing.allocator);
     defer prepared.deinit(std.testing.allocator);
 
     try std.testing.expect(prepared.owned_buf != null);
@@ -3444,11 +3812,31 @@ test "prepareCliPrompt uses closed think scaffold for qwen chatml templates" {
     );
     defer tok.token_to_id.deinit();
 
-    var prepared = try prepareCliPrompt(&tok, "Hello", true, std.testing.allocator);
+    var prepared = try prepareCliPrompt(&tok, "Hello", true, null, std.testing.allocator);
     defer prepared.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, prepared.text, "<|im_start|>user\nHello<|im_end|>\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, prepared.text, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+}
+
+test "prepareCliPrompt prepends an explicit system turn" {
+    var tok = makeTestTokenizer(null);
+    defer tok.token_to_id.deinit();
+
+    var prepared = try prepareCliPrompt(
+        &tok,
+        "Review this code.",
+        true,
+        "You are a helpful assistant. Answer directly. Do not show analysis.",
+        std.testing.allocator,
+    );
+    defer prepared.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "<|im_start|>system\nYou are a helpful assistant. Answer directly. Do not show analysis.<|im_end|>\n" ++
+            "<|im_start|>user\nReview this code.<|im_end|>\n<|im_start|>assistant\n",
+        prepared.text,
+    );
 }
 
 test "prepareCliPrompt uses gemma4 default closed-thought prompt in chat mode" {
@@ -3459,7 +3847,7 @@ test "prepareCliPrompt uses gemma4 default closed-thought prompt in chat mode" {
     tok.prepend_bos = true;
     tok.bos_id = 2;
 
-    var prepared = try prepareCliPrompt(&tok, "Hello", true, std.testing.allocator);
+    var prepared = try prepareCliPrompt(&tok, "Hello", true, null, std.testing.allocator);
     defer prepared.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, prepared.text, "<bos><|turn>system\n<|think|><turn|>\n") == null);
@@ -3484,6 +3872,7 @@ test "prepareCliPrompt frontloads gemma4 include-word constraint in user turn" {
         &tok,
         "Write an implementation plan. Include the word benchmark.",
         true,
+        null,
         std.testing.allocator,
     );
     defer prepared.deinit(std.testing.allocator);
@@ -3500,6 +3889,19 @@ test "shouldAutoChatCliPrompt enables gemma4 turn templates" {
 
     try std.testing.expect(shouldAutoChatCliPrompt(&tok, "Hello"));
     try std.testing.expect(!shouldAutoChatCliPrompt(&tok, "<|turn>user\nHello<turn|>"));
+}
+
+test "Muse Glimmer CLI auto-chat uses ATEM end-of-turn token" {
+    var tok = makeTestTokenizer(
+        "<atem:tool_call><|start|>{{ role }}<|message|>{{ content }}<|eot|>",
+    );
+    defer tok.token_to_id.deinit();
+    tok.eot_id = 200021;
+
+    try std.testing.expect(shouldAutoChatCliPrompt(&tok, "Hello"));
+    try std.testing.expect(!shouldAutoChatCliPrompt(&tok, "<|start|>user<|message|>Hello<|eot|>"));
+    try std.testing.expectEqual(@as(u32, 200021), cliGenerationStopId(&tok, true));
+    try std.testing.expectEqual(tok.eosId(), cliGenerationStopId(&tok, false));
 }
 
 test "shouldAutoChatCliPrompt leaves non-gemma templates raw" {

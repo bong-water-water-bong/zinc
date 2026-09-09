@@ -5,6 +5,7 @@ const Backend = enum {
     vulkan,
     metal,
     cuda,
+    rocm,
     zinc_rt,
 };
 
@@ -65,6 +66,30 @@ fn configureCudaModule(
     module.linkSystemLibrary("cudart", .{}); // cublas runtime dependency
 }
 
+fn configureRocmModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    module: *std.Build.Module,
+) void {
+    // ROCm backend — Linux + AMD only. The Zig compute/model layers reuse the
+    // mature CUDA-side orchestration through its stable C ABI, while this shim
+    // implements that ABI with HIP, hipRTC, and hipBLAS.
+    _ = target;
+    const rocm_home = b.graph.env_map.get("ROCM_PATH") orelse
+        b.graph.env_map.get("ROCM_HOME") orelse
+        "/opt/rocm";
+    module.addCSourceFile(.{
+        .file = b.path("src/rocm/rocm_shim.c"),
+        .flags = &.{ "-std=c11", "-D__HIP_PLATFORM_AMD__=1" },
+    });
+    module.addIncludePath(b.path("src/cuda"));
+    module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ rocm_home, "include" }) });
+    module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ rocm_home, "lib" }) });
+    module.linkSystemLibrary("amdhip64", .{});
+    module.linkSystemLibrary("hiprtc", .{});
+    module.linkSystemLibrary("hipblas", .{});
+}
+
 fn resolveBunExe(b: *std.Build) []const u8 {
     if (b.graph.env_map.get("BUN_EXE")) |bun_exe| return bun_exe;
     return "bun";
@@ -82,7 +107,7 @@ fn addBunDirToPath(b: *std.Build, run: *std.Build.Step.Run, bun_exe: []const u8)
 }
 
 pub fn build(b: *std.Build) void {
-    const requested_backend = b.option(Backend, "backend", "Select inference backend: auto, vulkan, metal, cuda, zinc_rt") orelse .auto;
+    const requested_backend = b.option(Backend, "backend", "Select inference backend: auto, vulkan, metal, cuda, rocm, zinc_rt") orelse .auto;
     const target = b.standardTargetOptions(.{
         .default_target = if (requested_backend == .zinc_rt)
             .{ .cpu_model = .native }
@@ -119,6 +144,9 @@ pub fn build(b: *std.Build) void {
     }
     if (selected_backend == .cuda and !is_linux) {
         @panic("-Dbackend=cuda currently requires a Linux target (NVIDIA + CUDA toolkit)");
+    }
+    if (selected_backend == .rocm and !is_linux) {
+        @panic("-Dbackend=rocm currently requires a Linux target (AMD + ROCm toolkit)");
     }
 
     const build_options = b.addOptions();
@@ -172,9 +200,33 @@ pub fn build(b: *std.Build) void {
         "dmmv_q5k",
         "dmmv_q6k",
         "dmmv_q6k_wide",
+        "dmmv_q6k_rows4",
+        "dmmv_q4k_rows4",
+        "dmmv_q6k_rows4_cols",
+        "dmmv_q4k_rows4_cols",
+        "dmmv_q5k_rows4_cols",
+        "dmmv_q4k_rows4_cols3",
+        "dmmv_q4k_rows4_cols4",
+        "dmmv_q6k_rows4_cols3",
+        "dmmv_q6k_rows4_cols4",
+        "dmmv_q5k_rows4_cols3",
+        "dmmv_q5k_rows4_cols4",
+        "dmmv_q6k_rows8_cols3",
+        "dmmv_q6k_rows8_cols4",
+        "dmmv_q4k_rows8_cols3",
+        "dmmv_q4k_rows8_cols4",
+        "dmmv_q4k_rows2_cols",
+        "dmmv_q4k_rows8_cols",
+        "dmmv_q6k_rows2_cols",
+        "dmmv_q6k_rows8_cols",
+        "dmmv_q4k_fused_gate_up_swiglu_cols",
+        "dmmv_q4k_fused_gate_up_swiglu_cols3",
+        "dmmv_q4k_fused_gate_up_swiglu_cols4",
+        "dmmv_q4k_q8_1_cols",
         "dmmv_f16",
         "dmmv_f32",
         "rms_norm_mul",
+        "rms_norm_mul_wide",
         "swiglu",
         "swiglu_oai",
         "geglu",
@@ -187,6 +239,7 @@ pub fn build(b: *std.Build) void {
         "softmax_topk_batch",
         "router_f32_batch",
         "flash_attn",
+        "flash_attn_f16kv",
         "flash_attn_split_merge",
         "deinterleave",
         "deinterleave_batched",
@@ -202,6 +255,7 @@ pub fn build(b: *std.Build) void {
         "ssm_qk_norm",
         "ssm_delta_net",
         "ssm_delta_net_cols8",
+        "ssm_delta_net_cols8_hist",
         "ssm_delta_net_cols8_normed",
         "ssm_gated_norm",
         "ssm_gated_norm_batched",
@@ -249,14 +303,21 @@ pub fn build(b: *std.Build) void {
         "dmmv_q6k_batch",
         "dmmv_q6k_batch_kpar",
         "kv_cache_write",
+        "kv_cache_write_f16kv",
         "norm_rope",
         "quantize_q8_1",
         // Batched prefill shaders — ported from the Metal backend so the
         // Vulkan/RDNA side can share the prefillBatched orchestration.
         "rope_batched",
         "flash_attn_batched",
+        "flash_attn_batched_qt",
+        "flash_attn_batched_qt_f16kv",
+        "flash_attn_batched_f16kv",
         "kv_cache_write_batched",
+        "kv_cache_write_batched_f16kv",
+        "kv_cache_write_single_f16kv",
         "residual_rms_norm",
+        "residual_rms_norm_wide",
         "post_norm_residual_rms_norm",
         "rms_norm_add",
         "rms_norm_add_vec4",
@@ -274,9 +335,13 @@ pub fn build(b: *std.Build) void {
         "rms_norm_scale_dmmv_f32",
         "rms_norm_scale_dmmv_f32_batch",
         "rms_norm_dmmv_q4k_alpha_beta",
+        "rms_norm_dmmv_alpha_beta_ksplit",
         "qk_norm_rope_kv_write",
+        "qk_norm_rope_kv_write_f16kv",
         "qk_norm_rope_kv_write_batched",
+        "qk_norm_rope_kv_write_batched_f16kv",
         "k_norm_rope_kv_write_batched",
+        "k_norm_rope_kv_write_batched_f16kv",
         // Effort-6 GEMM port: tiled Q4_K dense GEMM plus its routed MoE
         // gather sibling. Both are compile-registered foundations; production
         // prefill still uses route-packed columns until the routed GEMM has a
@@ -300,6 +365,8 @@ pub fn build(b: *std.Build) void {
         // src/shaders/*.comp is missing from this list.
         "dmmv_f32_dual_batch",
         "ssm_conv1d_batched",
+        "ssm_conv1d_batched_hist",
+        "embed_gather",
         "mul_mm_q6k_full",
         "mul_mm_q6k_full_down_acc",
         "mul_mm_q4k_down_acc",
@@ -423,13 +490,15 @@ pub fn build(b: *std.Build) void {
     } else if (is_macos) {
         exe_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         exe_mod.addIncludePath(b.path("src/metal"));
         exe_mod.linkFramework("Metal", .{});
         exe_mod.linkFramework("Foundation", .{});
     } else if (selected_backend == .cuda) {
         configureCudaModule(b, target, exe_mod);
+    } else if (selected_backend == .rocm) {
+        configureRocmModule(b, target, exe_mod);
     } else {
         configureVulkanModule(b, target, exe_mod);
     }
@@ -611,7 +680,7 @@ pub fn build(b: *std.Build) void {
         bench_mod.addImport("zinc_bench_support", bench_support_mod);
         bench_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         bench_mod.addIncludePath(b.path("src/metal"));
         bench_mod.linkFramework("Metal", .{});
@@ -641,7 +710,7 @@ pub fn build(b: *std.Build) void {
         bench_shapes_mod.addImport("zinc_bench_support", bench_support_mod);
         bench_shapes_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         bench_shapes_mod.addIncludePath(b.path("src/metal"));
         bench_shapes_mod.linkFramework("Metal", .{});
@@ -670,7 +739,7 @@ pub fn build(b: *std.Build) void {
         bench_gemm_q4k_mod.addImport("zinc_bench_support", bench_support_mod);
         bench_gemm_q4k_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         bench_gemm_q4k_mod.addIncludePath(b.path("src/metal"));
         bench_gemm_q4k_mod.linkFramework("Metal", .{});
@@ -699,7 +768,7 @@ pub fn build(b: *std.Build) void {
         bench_dmmv_q4k_mod.addImport("zinc_bench_support", bench_support_mod);
         bench_dmmv_q4k_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         bench_dmmv_q4k_mod.addIncludePath(b.path("src/metal"));
         bench_dmmv_q4k_mod.linkFramework("Metal", .{});
@@ -736,11 +805,15 @@ pub fn build(b: *std.Build) void {
     } else if (is_macos) {
         test_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
-            .flags = &.{ "-fobjc-arc", "-fmodules" },
+            .flags = &.{"-fobjc-arc"},
         });
         test_mod.addIncludePath(b.path("src/metal"));
         test_mod.linkFramework("Metal", .{});
         test_mod.linkFramework("Foundation", .{});
+    } else if (selected_backend == .cuda) {
+        configureCudaModule(b, target, test_mod);
+    } else if (selected_backend == .rocm) {
+        configureRocmModule(b, target, test_mod);
     } else {
         configureVulkanModule(b, target, test_mod);
     }
@@ -765,8 +838,9 @@ pub fn build(b: *std.Build) void {
     const run_zinc_rt_unit_tests = b.addRunArtifact(zinc_rt_unit_tests);
     // In partial mode (`full_tests = false`) restrict `bun test` to the
     // fast unit-test files. The slow `tests/test_qwen_smoke.test.ts`
-    // file launches multiple managed servers and loads three GGUFs
-    // (qwen3.5-9b + 35b + 36b), which together run ~225s on this Mac
+    // file launches multiple managed servers and loads four GGUFs
+    // (Qwen 3.5 9B, Qwen 3.6 35B, Qwen 3.8 27B, plus the API model),
+    // which together run several minutes on this Mac
     // Studio — well past the harness's 120s `runCommand` timeout for
     // `zig build test`, so even though the smoke tests themselves pass
     // the parent spawn was being killed and `testExitCode` came back

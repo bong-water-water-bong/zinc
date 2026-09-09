@@ -65,6 +65,7 @@ layout(push_constant) uniform PushConstants {
     uint conv_stride_tok;
     uint ab_stride_tok;
     uint y_stride_tok;
+    uint ab_ksplit;      // alpha/beta partial count, laid out [chunk][head] (1 = plain)
 };
 
 const uint LANES_PER_ROW = 16u;
@@ -157,11 +158,17 @@ void main() {
         float gate_bcast = 0.0;
         float beta_bcast = 0.0;
         if (gl_SubgroupInvocationID == 0u) {
-            float a = alpha[ab_base + h] + dt_bias_val;
+            float a_acc = 0.0;
+            float b_acc = 0.0;
+            for (uint j = 0u; j < ab_ksplit; j++) {
+                a_acc += alpha[ab_base + j * dt_rank + h];
+                b_acc += beta[ab_base + j * dt_rank + h];
+            }
+            float a = a_acc + dt_bias_val;
             float sp = log(1.0 + exp(a));
             float gate_val = (has_ssm_a != 0) ? (sp * ssm_a_val) : -sp;
             gate_bcast = exp(gate_val);
-            beta_bcast = 1.0 / (1.0 + exp(-beta[ab_base + h]));
+            beta_bcast = 1.0 / (1.0 + exp(-b_acc));
         }
 
         float g_val = subgroupBroadcastFirst(gate_bcast);

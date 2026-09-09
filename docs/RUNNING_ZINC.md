@@ -144,6 +144,17 @@ export RADV_PERFTEST=coop_matrix
 ./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "hi" --chat
 ```
 
+Use `--system-prompt <text>` with `--chat` when CLI prompt construction must
+match an API request that contains a system turn. Those tokens are included in
+prefill timing:
+
+```bash
+./zig-out/bin/zinc --model-id qwen38-27b-q4k-m \
+  --chat \
+  --system-prompt "You are a helpful assistant. Answer directly. Do not show analysis." \
+  --prompt "Review this code."
+```
+
 `--check` prints `RADV_PERFTEST: coop_matrix [OK]` when this is right.
 
 ### 2. "no Vulkan device found" / "loader init failed"
@@ -200,15 +211,15 @@ The built-in managed catalog only lists models ZINC has explicitly revalidated f
 ./zig-out/bin/zinc model active
 ```
 
-Example `./zig-out/bin/zinc model list` output on Apple Silicon:
+Example `./zig-out/bin/zinc model list` output on an AMD RDNA4 32 GB system:
 
 ```bash
-Detected GPU profile: apple-silicon
+Detected GPU profile: amd-rdna4-32gb
 
 ID                             Released     Status        Fit    Installed   Active   Notes
 qwen35-9b-q4k-m                2026-02-28   supported     yes    yes         yes      tested + exact fit
 qwen36-35b-a3b-q4k-xl          2026-04-15   supported     yes    no          no       tested + exact fit
-qwen36-27b-q4k-m               2026-04-22   experimental  yes    no          no       tested + catalog fit
+qwen38-27b-q4k-m               2026-08-14   supported     yes    no          no       tested + catalog fit
 gemma4-31b-q4k-m               2026-04-02   supported     yes    no          no       tested + catalog fit
 gemma4-26b-a4b-q4k-m           2026-04-02   supported     yes    no          no       tested + catalog fit
 ```

@@ -65,9 +65,20 @@ const ChatReuseEntry = struct {
     }
 };
 
+/// Prompt-prefix reuse for chat sessions.
+///
+/// The table can hold many sessions, but only one of them can actually be
+/// reused at any moment: generation is serialized behind one engine, so the KV
+/// cache — and, on a hybrid model, the DeltaNet recurrent state — physically
+/// holds exactly one conversation, whichever ran last. Handing back a prefix for
+/// any other session would splice a different conversation's state into this
+/// one and answer from it, silently. `live_session` is that owner; everything
+/// else falls back to a full prefill, which is slower and correct.
 const ChatReuseCache = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayListUnmanaged(ChatReuseEntry) = .{},
+    /// Session whose transcript is resident in the engine right now, if any.
+    live_session: ?[]u8 = null,
 
     fn init(allocator: std.mem.Allocator) ChatReuseCache {
         return .{ .allocator = allocator };
@@ -76,6 +87,7 @@ const ChatReuseCache = struct {
     fn clear(self: *ChatReuseCache) void {
         for (self.entries.items) |*entry| entry.deinit(self.allocator);
         self.entries.clearAndFree(self.allocator);
+        self.clearLive();
     }
 
     fn deinit(self: *ChatReuseCache) void {
@@ -120,17 +132,39 @@ const ChatReuseCache = struct {
 
     fn matchingPrefixLen(self: *ChatReuseCache, session_id: []const u8, model_path: []const u8, prompt_tokens: []const u32, now_ns: i128) usize {
         self.pruneExpired(now_ns);
+        const resident = if (self.live_session) |live| std.mem.eql(u8, live, session_id) else false;
         for (self.entries.items) |*entry| {
             if (!std.mem.eql(u8, entry.session_id, session_id)) continue;
+            // The session is active either way, so keep it off the eviction
+            // block even when its state is no longer the resident one.
+            entry.last_used_ns = now_ns;
+            if (!resident) return 0; // see the type comment
             if (!std.mem.eql(u8, entry.model_path, model_path)) return 0;
             if (!std.mem.startsWith(u32, prompt_tokens, entry.prompt_tokens)) return 0;
-            entry.last_used_ns = now_ns;
             return entry.prompt_tokens.len;
         }
         return 0;
     }
 
+    /// Record that `session_id` now owns the engine's KV and recurrent state.
+    fn markLive(self: *ChatReuseCache, session_id: []const u8) !void {
+        self.clearLive();
+        if (session_id.len == 0) return;
+        self.live_session = try self.allocator.dupe(u8, session_id);
+    }
+
+    /// Drop the resident-session claim. Call this whenever a generation is about
+    /// to overwrite the engine's state, including generations that carry no
+    /// session at all — those clobber the cache just as thoroughly.
+    fn clearLive(self: *ChatReuseCache) void {
+        if (self.live_session) |s| self.allocator.free(s);
+        self.live_session = null;
+    }
+
     fn removeSession(self: *ChatReuseCache, session_id: []const u8) void {
+        if (self.live_session) |live| {
+            if (std.mem.eql(u8, live, session_id)) self.clearLive();
+        }
         if (self.findSessionIndex(session_id)) |idx| {
             self.removeAt(idx);
         }
@@ -158,6 +192,7 @@ const ChatReuseCache = struct {
             owned.deinit(self.allocator);
         }
         try self.entries.append(self.allocator, entry);
+        try self.markLive(session_id);
     }
 };
 
@@ -399,7 +434,7 @@ pub fn handleConnection(
         }
     } else if (request.method == .POST and std.mem.eql(u8, request.path, "/v1/models/remove")) {
         if (comptime runtime.supports_model_management) {
-            try handleRemoveModel(conn, manager, server_state, request.body);
+            try handleRemoveModel(conn, manager, server_state, request.body, allocator);
         } else {
             try sendUnsupportedModelManagement(conn);
         }
@@ -586,6 +621,7 @@ fn handleRemoveModel(
     _manager: *model_manager_mod.ModelManager,
     server_state: *ServerState,
     _body: []const u8,
+    _allocator: std.mem.Allocator,
 ) !void {
     if (comptime !runtime.supports_model_management) {
         try sendUnsupportedModelManagement(conn);
@@ -599,7 +635,11 @@ fn handleRemoveModel(
         try conn.sendError(400, "invalid_request_error", "Field 'model' is required");
         return;
     }
-    if (catalog_mod.find(parsed.model_id) == null) {
+    // `-hf` downloads share the managed cache but have no catalog entry, so
+    // mirror the CLI gate: also accept ids that are installed on disk. Safe
+    // for request-supplied ids because the managed path resolvers reject
+    // anything that is not a single filesystem-safe path component.
+    if (catalog_mod.find(parsed.model_id) == null and !managed_mod.isInstalled(parsed.model_id, _allocator)) {
         try conn.sendError(400, "invalid_request_error", "Unknown managed model id");
         return;
     }
@@ -805,6 +845,13 @@ const harmony_stop_strs = [_][]const u8{
     "<|start|>",
     "<|channel|>",
 };
+const atem_analysis_prefix = "to=self<|message|>";
+const atem_final_prefix = "to=user<|message|>";
+const atem_stop_strs = [_][]const u8{
+    "<|eom|>",
+    "<|eot|>",
+    "<|start|>",
+};
 const chat_history_answer_limit_bytes: usize = 640;
 const default_chat_system_prompt =
     "You are a helpful assistant. Answer directly. Do not show analysis.";
@@ -945,6 +992,77 @@ const RequestTool = struct {
 /// even when `tools` is non-empty.
 pub const ToolChoice = enum { auto, required, none };
 
+/// Max stop sequences accepted, matching the OpenAI API's own cap.
+const max_stop_sequences = 4;
+
+/// Normalizes an OpenAI `stop` field (absent, a single string, or an array
+/// of strings) into an owned slice of owned strings. Empty strings and a
+/// count beyond `max_stop_sequences` are silently dropped rather than
+/// rejected — matching how other soft-limit fields in this API are handled.
+/// @param allocator Owns the returned slice and each string in it.
+/// @param value Raw `stop` field from the parsed request body, if present.
+/// @returns Heap-allocated slice of heap-allocated stop strings; caller frees both.
+fn parseStopSequences(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const []const u8 {
+    const v = value orelse return &.{};
+    switch (v) {
+        .string => |s| {
+            if (s.len == 0) return &.{};
+            const out = try allocator.alloc([]const u8, 1);
+            errdefer allocator.free(out);
+            out[0] = try allocator.dupe(u8, s);
+            return out;
+        },
+        .array => |arr| {
+            var list: std.ArrayList([]const u8) = .{};
+            errdefer {
+                for (list.items) |s| allocator.free(s);
+                list.deinit(allocator);
+            }
+            for (arr.items) |item| {
+                if (list.items.len >= max_stop_sequences) break;
+                switch (item) {
+                    .string => |s| {
+                        if (s.len == 0) continue;
+                        const owned = try allocator.dupe(u8, s);
+                        errdefer allocator.free(owned);
+                        try list.append(allocator, owned);
+                    },
+                    else => {},
+                }
+            }
+            return try list.toOwnedSlice(allocator);
+        },
+        else => return &.{},
+    }
+}
+
+fn freeStopSequences(allocator: std.mem.Allocator, stop: []const []const u8) void {
+    for (stop) |s| allocator.free(s);
+    if (stop.len > 0) allocator.free(stop);
+}
+
+/// Returns a message describing the first requested-but-unsupported chat
+/// parameter, or null if the request only uses supported behavior. Checked
+/// separately from JSON parsing so unsupported requests get a clear 400
+/// instead of a response that silently doesn't match what was asked for
+/// (e.g. `n:2` returning only one choice, or `logprobs` requested but never
+/// present in the response).
+fn firstUnsupportedChatParam(body: ChatRequestBody) ?[]const u8 {
+    if (body.n != 1) return "Field 'n' must be 1: only a single completion choice is generated";
+    if (logprobsRequested(body.logprobs)) return "Field 'logprobs' is not supported: token log-probabilities are not computed";
+    return null;
+}
+
+fn logprobsRequested(value: ?std.json.Value) bool {
+    const v = value orelse return false;
+    return switch (v) {
+        .bool => |b| b,
+        .integer => |n| n > 0,
+        .null => false,
+        else => true,
+    };
+}
+
 fn parseToolChoice(value: ?std.json.Value) ToolChoice {
     const v = value orelse return .auto;
     switch (v) {
@@ -1053,6 +1171,9 @@ const ChatRequestBody = struct {
     enable_thinking: ?bool = null,
     tools: []const RequestTool = &.{},
     tool_choice: ?std.json.Value = null,
+    stop: ?std.json.Value = null,
+    n: u32 = 1,
+    logprobs: ?std.json.Value = null,
 };
 
 const ParsedChatRequest = struct {
@@ -1067,11 +1188,15 @@ const ParsedChatRequest = struct {
     enable_thinking: ?bool,
     tools: []const tool_format.ToolDefinition,
     tool_choice: ToolChoice,
+    /// Owned by `stop_allocator`; see `parseStopSequences`.
+    stop: []const []const u8,
+    stop_allocator: std.mem.Allocator,
     injected_default_system: bool = false,
     /// Owns parameters_json strings and tool_calls rendering.
     arena: std.heap.ArenaAllocator,
 
     fn deinit(self: *ParsedChatRequest) void {
+        freeStopSequences(self.stop_allocator, self.stop);
         self.parsed.deinit();
         self.arena.deinit();
         self.* = undefined;
@@ -1199,7 +1324,17 @@ fn shouldForceDisableThinking(managed_id: ?[]const u8, model_path: []const u8, d
     return !entry.thinking_stable;
 }
 
-fn shouldSkipThinkingTemplateForRequest(tools_len: usize, tool_choice: ToolChoice) bool {
+fn shouldSkipThinkingTemplateForRequest(tools_len: usize, tool_choice: ToolChoice, enable_thinking: ?bool) bool {
+    // A caller who explicitly asked for no thinking (or a model whose thinking
+    // the catalog force-disables) keeps the closed <think></think> scaffold even
+    // when tools are present. The bare assistant header below is the only
+    // prefix with nothing suppressing deliberation, so on a thinking model it
+    // can spend the whole completion budget reasoning and never reach the
+    // <tool_call>. The scaffold ends in a blank line, so a tool call still
+    // follows it cleanly.
+    if (enable_thinking) |want| {
+        if (!want) return false;
+    }
     return tools_len > 0 and tool_choice != .none;
 }
 
@@ -1422,6 +1557,9 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         };
     }
 
+    const stop = try parseStopSequences(allocator, parsed.value.stop);
+    errdefer freeStopSequences(allocator, stop);
+
     return .{
         .parsed = parsed,
         .roles = roles[0..count],
@@ -1434,6 +1572,8 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         .enable_thinking = parsed.value.enable_thinking,
         .tools = tools_out,
         .tool_choice = if (tools_enabled) parseToolChoice(parsed.value.tool_choice) else .auto,
+        .stop = stop,
+        .stop_allocator = allocator,
         .injected_default_system = injected_default_system,
         .arena = arena,
     };
@@ -1451,6 +1591,18 @@ fn dropInjectedDefaultSystemForGemma(parsed: *ParsedChatRequest, is_gemma: bool)
     parsed.contents = parsed.contents[1..];
     parsed.injected_default_system = false;
 }
+
+/// Combines the built-in template/leak stop strings with a request's
+/// client-supplied `stop` sequences into one list for `findStreamingStopStart`.
+/// @param allocator Owns the returned slice when `client_stops` is non-empty.
+fn combinedStopStrings(allocator: std.mem.Allocator, client_stops: []const []const u8) ![]const []const u8 {
+    if (client_stops.len == 0) return chat_stop_strs[0..];
+    const combined = try allocator.alloc([]const u8, chat_stop_strs.len + client_stops.len);
+    @memcpy(combined[0..chat_stop_strs.len], chat_stop_strs[0..]);
+    @memcpy(combined[chat_stop_strs.len..], client_stops);
+    return combined;
+}
+
 fn findFirstStop(text: []const u8, stop_strs: []const []const u8) ?usize {
     var first: ?usize = null;
     for (stop_strs) |stop| {
@@ -1615,8 +1767,8 @@ fn findRepeatedPhraseLoop(text: []const u8) ?usize {
     return null;
 }
 
-fn findStreamingStopStart(text: []const u8) ?usize {
-    var first: ?usize = findFirstStop(text, chat_stop_strs[0..]);
+fn findStreamingStopStart(text: []const u8, stop_strs: []const []const u8) ?usize {
+    var first: ?usize = findFirstStop(text, stop_strs);
     if (findUnexpectedThinkingTailStart(text)) |idx| {
         if (first == null or idx < first.?) first = idx;
     }
@@ -1636,13 +1788,92 @@ fn extractHarmonyMessage(text: []const u8, prefix: []const u8) []const u8 {
     return std.mem.trim(u8, body[0..end], " \t\r\n");
 }
 
-fn normalizeStructuredAssistantOutput(
+const AtemMessage = struct {
+    body: []const u8 = "",
+    found: bool = false,
+    complete: bool = false,
+};
+
+fn extractAtemMessage(text: []const u8, prefix: []const u8) AtemMessage {
+    const start = std.mem.indexOf(u8, text, prefix) orelse return .{};
+    const body = text[start + prefix.len ..];
+    const end = findFirstStop(body, atem_stop_strs[0..]);
+    return .{
+        // Keep the right edge byte-for-byte while a response is streaming so
+        // every normalized update remains an extension of the previous one.
+        .body = std.mem.trimLeft(u8, body[0 .. end orelse body.len], " \t\r\n"),
+        .found = true,
+        .complete = end != null,
+    };
+}
+
+fn isPartialAtemEnvelope(text: []const u8) bool {
+    const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return true;
+    const envelopes = [_][]const u8{
+        atem_analysis_prefix,
+        atem_final_prefix,
+        "<|start|>assistant to=self<|message|>",
+        "<|start|>assistant to=user<|message|>",
+    };
+    for (envelopes) |envelope| {
+        if (trimmed.len <= envelope.len and std.mem.startsWith(u8, envelope, trimmed)) return true;
+    }
+    return false;
+}
+
+fn normalizeAtemAssistantOutput(text: []const u8, thinking_enabled: bool, buf: []u8) ![]const u8 {
+    const analysis = extractAtemMessage(text, atem_analysis_prefix);
+    const final = extractAtemMessage(text, atem_final_prefix);
+
+    if (!thinking_enabled) {
+        if (final.found) return final.body;
+        // Muse always reasons on the private `self` channel. An incomplete
+        // turn therefore has no user-visible content yet.
+        if (analysis.found or isPartialAtemEnvelope(text)) return "";
+        return text;
+    }
+
+    if (!analysis.found) {
+        if (final.found) return final.body;
+        if (isPartialAtemEnvelope(text)) return "";
+        return text;
+    }
+
+    const close = if (analysis.complete) "\n</think>" else "";
+    const joiner = if (analysis.complete and final.found) "\n" else "";
+    const final_body = if (final.found) final.body else "";
+    const total_len = thinking_prefix.len + analysis.body.len + close.len + joiner.len + final_body.len;
+    if (total_len > buf.len) return error.BufferTooSmall;
+
+    @memcpy(buf[0..thinking_prefix.len], thinking_prefix);
+    var pos = thinking_prefix.len;
+    @memcpy(buf[pos .. pos + analysis.body.len], analysis.body);
+    pos += analysis.body.len;
+    if (close.len > 0) {
+        @memcpy(buf[pos .. pos + close.len], close);
+        pos += close.len;
+    }
+    if (joiner.len > 0) {
+        @memcpy(buf[pos .. pos + joiner.len], joiner);
+        pos += joiner.len;
+    }
+    if (final_body.len > 0) {
+        @memcpy(buf[pos .. pos + final_body.len], final_body);
+        pos += final_body.len;
+    }
+    return buf[0..pos];
+}
+
+pub fn normalizeStructuredAssistantOutput(
     tokenizer: *const tokenizer_mod.Tokenizer,
     text: []const u8,
     thinking_enabled: bool,
     buf: []u8,
 ) ![]const u8 {
-    if (!std.mem.eql(u8, tokenizer.detectTemplateKindName(), "openai_moe")) return text;
+    const template_kind = tokenizer.detectTemplateKind();
+    if (template_kind == .atem) return normalizeAtemAssistantOutput(text, thinking_enabled, buf);
+    if (template_kind != .openai_moe) return text;
 
     const analysis = extractHarmonyMessage(text, harmony_analysis_prefix);
     const final = extractHarmonyMessage(text, harmony_final_prefix);
@@ -1771,7 +2002,8 @@ fn trimLeadingStandaloneQuote(text: []const u8) []const u8 {
 }
 
 fn supportsEnabledThinking(tokenizer: *const tokenizer_mod.Tokenizer, enable_thinking: ?bool) bool {
-    return tokenizer.supportsThinkingToggle() and (enable_thinking orelse false);
+    const exposes_internal_reasoning = tokenizer.supportsThinkingToggle() or tokenizer.detectTemplateKind() == .atem;
+    return exposes_internal_reasoning and (enable_thinking orelse false);
 }
 
 fn prefixThinkingEnvelope(text: []const u8, enabled: bool, buf: []u8) ![]const u8 {
@@ -2039,6 +2271,11 @@ fn ensureRequestedModelActive(
         if (current.managed_id) |active_id| {
             if (std.mem.eql(u8, active_id, requested_model)) return true;
         }
+        // Models loaded from a raw path (-m) or Hugging Face spec (-hf) have
+        // no managed id or catalog entry; /v1/models advertises them under
+        // their display name, so accept that id as a no-op instead of
+        // attempting (and failing) a managed swap.
+        if (std.mem.eql(u8, current.display_name, requested_model)) return true;
         if (comptime runtime.supports_model_management) {
             // The model may have been loaded by --model <path> with no managed_id;
             // resolve the catalog entry that corresponds to the on-disk file so
@@ -2098,6 +2335,11 @@ fn handleChatCompletions(
         return;
     }
 
+    if (firstUnsupportedChatParam(parsed.parsed.value)) |msg| {
+        try conn.sendError(400, "invalid_request_error", msg);
+        return;
+    }
+
     var generation_guard = GenerationGuard.acquire(server_state);
     defer generation_guard.release();
     if (!try ensureRequestedModelActive(conn, manager, server_state, parsed.parsed.value.model)) return;
@@ -2120,7 +2362,7 @@ fn handleChatCompletions(
     }
     // Tool-calling requests skip the Qwen empty-thinking scaffold so the
     // assistant can begin directly with a <tool_call> block.
-    const skip_thinking_template = shouldSkipThinkingTemplateForRequest(parsed.tools.len, parsed.tool_choice);
+    const skip_thinking_template = shouldSkipThinkingTemplateForRequest(parsed.tools.len, parsed.tool_choice, parsed.enable_thinking);
     if (skip_thinking_template) {
         parsed.enable_thinking = null;
     }
@@ -2189,6 +2431,7 @@ fn handleChatCompletions(
     var req_id_buf: [32]u8 = undefined;
     const req_id = std.fmt.bufPrint(&req_id_buf, "chatcmpl-{x}", .{@as(u64, @truncate(@as(u128, @bitCast(seed_ns))))}) catch "chatcmpl-0";
     const thinking_enabled = supportsEnabledThinking(tokenizer, parsed.enable_thinking);
+    const is_atem = tokenizer.detectTemplateKind() == .atem;
     const tools_for_choice = if (parsed.tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else parsed.tools;
     const forced_tool_name = forcedSingleToolName(tools_for_choice, parsed.tool_choice);
     const forced_tool_first_arg_name = forcedSingleToolFirstArgumentName(tools_for_choice, parsed.tool_choice);
@@ -2264,6 +2507,11 @@ fn handleChatCompletions(
         server_state.chat_reuse_cache.matchingPrefixLen(parsed.session_id, resources.model_path, prompt_tokens, std.time.nanoTimestamp())
     else
         0;
+    // From here the engine's KV and recurrent state belong to this request. If it
+    // fails or is a one-off with no session, nothing may be reused after it;
+    // warmChatReuseCache re-stakes the claim when a transcript is stored.
+    server_state.chat_reuse_cache.clearLive();
+    runtime.mtpBeginRequest(engine);
     const prefill_start_ns = std.time.nanoTimestamp();
     const prefill_work_tokens = if (reused_prefix_len > 0)
         prompt_tokens.len - reused_prefix_len
@@ -2303,6 +2551,17 @@ fn handleChatCompletions(
     const prefill_end_ns = std.time.nanoTimestamp();
     logPrefillTiming(prefill_work_tokens, prefill_start_ns, prefill_end_ns);
     server_state.setActiveContextTokens(state.position);
+    // NextN/MTP speculative decoding, for greedy requests. A prompt prefilled in
+    // full primes over all of it; one that reused the resident prefix primes only
+    // the tokens appended after it, which is the case that used to drop to
+    // ordinary decode and give up most of the speedup.
+    var mtp_src = runtime.MtpSource{ .eos_id = tokenizer.eos_id };
+    if (!sampling.requiresLogitsReadback()) {
+        mtp_src.active = if (reused_prefix_len == 0)
+            runtime.mtpPrime(engine, &state, prompt_tokens)
+        else
+            runtime.mtpPrimeSuffix(engine, &state, prompt_tokens, @intCast(reused_prefix_len));
+    }
 
     if (parsed.stream) {
         // Decode loop with buffered stop detection.
@@ -2315,12 +2574,13 @@ fn handleChatCompletions(
                 return tok.isEndOfGeneration(token);
             }
         }.check;
-        const stop_strs = chat_stop_strs[0..];
+        const stop_strs = try combinedStopStrings(parsed.arena.allocator(), parsed.stop);
         var gen_text_buf: [32768]u8 = undefined; // accumulated decoded text for stop check
         var gen_text_len: usize = 0;
         var sent_text_len: usize = 0; // how much of gen_text has been confirmed safe to send
-        var sent_visible_len: usize = 0; // cleaned visible bytes already streamed when thinking is disabled
+        var sent_visible_len: usize = if (is_atem and thinking_enabled and forced_tool_name == null) thinking_prefix.len else 0;
         var visible_buf: [4096]u8 = undefined;
+        var structured_stream_buf: [32768]u8 = undefined;
         var stopped = false;
         var finish_reason: FinishReason = if (max_tokens == 0 and parsed.max_tokens > 0) .length else .stop;
 
@@ -2353,11 +2613,11 @@ fn handleChatCompletions(
                 if (isReplacementArtifact(tok_text)) {
                     if (generated < max_tokens) {
                         if (conn.isPeerClosed()) return;
-                        runtime.decodeStep(engine, &state, prev_token, true) catch break;
-                        processed_generated_tokens.append(allocator, prev_token) catch {};
+                        const fed_token = prev_token;
+                        prev_token = mtp_src.step(engine, &state, prev_token, max_tokens - generated, sampling, random) catch break;
+                        processed_generated_tokens.append(allocator, fed_token) catch {};
                         server_state.setActiveContextTokens(state.position);
                         if (conn.isPeerClosed()) return;
-                        prev_token = runtime.sample(engine, &state, sampling, random);
                         state.generated_tokens.append(allocator, prev_token) catch {};
                         generated += 1;
                         continue;
@@ -2414,13 +2674,22 @@ fn handleChatCompletions(
                 }
 
                 // Check for explicit chat stops, reopened think blocks, and leaked prompt-analysis tails.
-                if (findStreamingStopStart(gen_text_buf[0..gen_text_len])) |stop_idx| {
+                if (findStreamingStopStart(gen_text_buf[0..gen_text_len], stop_strs)) |stop_idx| {
                     gen_text_len = stop_idx;
                     const pending_text = gen_text_buf[sent_text_len..gen_text_len];
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
                     gen_text_len = sent_text_len + cleaned_pending.len;
-                    if (cleaned_pending.len > 0 and forced_tool_name == null) {
-                        streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
+                    if (forced_tool_name == null) {
+                        if (is_atem) {
+                            const structured = normalizeStructuredAssistantOutput(tokenizer, gen_text_buf[0..gen_text_len], thinking_enabled, &structured_stream_buf) catch "";
+                            const cleaned_structured = trimTrailingChatArtifacts(structured);
+                            if (cleaned_structured.len > sent_visible_len) {
+                                streamTextViaDetector(conn, cleaned_structured[sent_visible_len..], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
+                                sent_visible_len = cleaned_structured.len;
+                            }
+                        } else if (cleaned_pending.len > 0) {
+                            streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
+                        }
                     }
                     sent_text_len = gen_text_len;
                     stopped = true;
@@ -2448,6 +2717,14 @@ fn handleChatCompletions(
                 if (!is_partial) {
                     if (forced_tool_name != null) {
                         sent_text_len = gen_text_len;
+                    } else if (is_atem) {
+                        const structured = normalizeStructuredAssistantOutput(tokenizer, gen_text_buf[0..gen_text_len], thinking_enabled, &structured_stream_buf) catch "";
+                        const safe_visible = lastCompleteUtf8End(structured);
+                        if (safe_visible > sent_visible_len) {
+                            streamTextViaDetector(conn, structured[sent_visible_len..safe_visible], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
+                            sent_visible_len = safe_visible;
+                        }
+                        sent_text_len = gen_text_len;
                     } else if (thinking_enabled) {
                         // Stream the accumulated bytes since the last safe send,
                         // trimmed to a UTF-8 codepoint boundary so partial multi-
@@ -2474,11 +2751,11 @@ fn handleChatCompletions(
                 // Generate next token
                 if (generated < max_tokens) {
                     if (conn.isPeerClosed()) return;
-                    runtime.decodeStep(engine, &state, prev_token, true) catch break;
-                    processed_generated_tokens.append(allocator, prev_token) catch {};
+                    const fed_token = prev_token;
+                    prev_token = mtp_src.step(engine, &state, prev_token, max_tokens - generated, sampling, random) catch break;
+                    processed_generated_tokens.append(allocator, fed_token) catch {};
                     server_state.setActiveContextTokens(state.position);
                     if (conn.isPeerClosed()) return;
-                    prev_token = runtime.sample(engine, &state, sampling, random);
                     state.generated_tokens.append(allocator, prev_token) catch {};
                 } else break;
             }
@@ -2489,7 +2766,14 @@ fn handleChatCompletions(
 
             // Flush any remaining pending tokens (only if we didn't hit stop)
             if (!stopped) {
-                if (thinking_enabled) {
+                if (is_atem) {
+                    const structured = normalizeStructuredAssistantOutput(tokenizer, gen_text_buf[0..gen_text_len], thinking_enabled, &structured_stream_buf) catch "";
+                    const cleaned_structured = trimTrailingChatArtifacts(structured);
+                    if (cleaned_structured.len > sent_visible_len and forced_tool_name == null) {
+                        streamTextViaDetector(conn, cleaned_structured[sent_visible_len..], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
+                        sent_visible_len = cleaned_structured.len;
+                    }
+                } else if (thinking_enabled) {
                     const pending_text = gen_text_buf[sent_text_len..gen_text_len];
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
                     if (cleaned_pending.len > 0 and forced_tool_name == null) {
@@ -2540,7 +2824,9 @@ fn handleChatCompletions(
 
         conn.writeSseDone() catch return;
         if (cacheable_session and forced_tool_name == null) {
-            const trimmed_stream_text = sanitizeAssistantHistoryContent(gen_text_buf[0..gen_text_len]);
+            var structured_history_buf: [32768]u8 = undefined;
+            const structured_history_text = normalizeStructuredAssistantOutput(tokenizer, gen_text_buf[0..gen_text_len], thinking_enabled, &structured_history_buf) catch gen_text_buf[0..gen_text_len];
+            const trimmed_stream_text = sanitizeAssistantHistoryContent(structured_history_text);
             var transport_buf: [32768]u8 = undefined;
             var tool_history_buf: std.ArrayList(u8) = .{};
             defer tool_history_buf.deinit(allocator);
@@ -2549,6 +2835,7 @@ fn handleChatCompletions(
         }
     } else {
         // Non-streaming: use same prefill+decode loop with stop detection
+        const stop_strs = try combinedStopStrings(parsed.arena.allocator(), parsed.stop);
         var text_buf: std.ArrayList(u8) = .{};
         defer text_buf.deinit(allocator);
         var ns_gen: u32 = 0;
@@ -2566,28 +2853,28 @@ fn handleChatCompletions(
                 var decode_buf2: [256]u8 = undefined;
                 const tok_utf8 = tokenizer.decodeToken(prev, &decode_buf2);
                 if (isReplacementArtifact(tok_utf8)) {
-                    runtime.decodeStep(engine, &state, prev, true) catch break;
-                    processed_generated_tokens.append(allocator, prev) catch {};
+                    const fed_token = prev;
+                    prev = mtp_src.step(engine, &state, prev, max_tokens - ns_gen, sampling, random) catch break;
+                    processed_generated_tokens.append(allocator, fed_token) catch {};
                     server_state.setActiveContextTokens(state.position);
-                    prev = runtime.sample(engine, &state, sampling, random);
                     state.generated_tokens.append(allocator, prev) catch {};
                     continue;
                 }
                 text_buf.appendSlice(allocator, tok_utf8) catch break;
                 ns_gen += 1;
-                const hit = if (findStreamingStopStart(text_buf.items)) |pos| blk: {
+                const hit = if (findStreamingStopStart(text_buf.items, stop_strs)) |pos| blk: {
                     text_buf.shrinkRetainingCapacity(pos);
                     break :blk true;
                 } else false;
                 if (hit) break;
                 if (ns_gen >= max_tokens) break;
-                runtime.decodeStep(engine, &state, prev, true) catch break;
-                processed_generated_tokens.append(allocator, prev) catch {};
+                const fed_token = prev;
+                prev = mtp_src.step(engine, &state, prev, max_tokens - ns_gen, sampling, random) catch break;
+                processed_generated_tokens.append(allocator, fed_token) catch {};
                 server_state.setActiveContextTokens(state.position);
-                prev = runtime.sample(engine, &state, sampling, random);
                 state.generated_tokens.append(allocator, prev) catch {};
             }
-            if (!nsIsEog(tokenizer, prev) and ns_gen >= max_tokens and findStreamingStopStart(text_buf.items) == null) {
+            if (!nsIsEog(tokenizer, prev) and ns_gen >= max_tokens and findStreamingStopStart(text_buf.items, stop_strs) == null) {
                 finish_reason = .length;
             }
         }
@@ -2654,20 +2941,18 @@ fn handleChatCompletions(
             , .{ @tagName(finish_reason), prompt_tokens.len, ns_gen, prompt_tokens.len + ns_gen });
             try conn.sendJson(200, wb.items);
         } else {
-            var escaped_buf: [16384]u8 = undefined;
-            const escaped_text = jsonEscape(response_text, &escaped_buf);
-            var resp_fixed_buf: [32768]u8 = undefined;
-            const resp = std.fmt.bufPrint(&resp_fixed_buf,
+            const escaped_text = try jsonEscapeAlloc(allocator, response_text);
+            defer allocator.free(escaped_text);
+            var wb: std.ArrayList(u8) = .{};
+            defer wb.deinit(allocator);
+            try wb.writer(allocator).print(
                 \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{
                 req_id,       ts,                         model_name,
                 escaped_text, @tagName(finish_reason),    prompt_tokens.len,
                 ns_gen,       prompt_tokens.len + ns_gen,
-            }) catch {
-                try conn.sendError(500, "internal_error", "Response too large");
-                return;
-            };
-            try conn.sendJson(200, resp);
+            });
+            try conn.sendJson(200, wb.items);
         }
         if (cacheable_session) {
             var transport_buf: [32768]u8 = undefined;
@@ -2700,6 +2985,9 @@ fn handleCompletions(
     }
 
     var generation_guard = GenerationGuard.acquire(server_state);
+    // /v1/completions runs on the same engine, so it invalidates any resident
+    // chat transcript just as a chat request would.
+    server_state.chat_reuse_cache.clearLive();
     defer generation_guard.release();
     if (!try ensureRequestedModelActive(conn, manager, server_state, parsed.model_id)) return;
     const resources = manager.currentResources() orelse {
@@ -2767,21 +3055,19 @@ fn handleCompletions(
 
     const finish_reason = completionFinishReason(parsed.max_tokens, max_tokens, output_tokens.len);
 
-    var escaped_buf: [16384]u8 = undefined;
-    const escaped_text = jsonEscape(text_buf.items, &escaped_buf);
+    const escaped_text = try jsonEscapeAlloc(allocator, text_buf.items);
+    defer allocator.free(escaped_text);
 
-    var resp_buf: [32768]u8 = undefined;
-    const resp = std.fmt.bufPrint(&resp_buf,
+    var wb: std.ArrayList(u8) = .{};
+    defer wb.deinit(allocator);
+    try wb.writer(allocator).print(
         \\{{"id":"{s}","object":"text_completion","created":{d},"model":"{s}","choices":[{{"index":0,"text":"{s}","finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         req_id,            ts,                                    model_name,
         escaped_text,      @tagName(finish_reason),               prompt_tokens.len,
         output_tokens.len, prompt_tokens.len + output_tokens.len,
-    }) catch {
-        try conn.sendError(500, "internal_error", "Response too large");
-        return;
-    };
-    try conn.sendJson(200, resp);
+    });
+    try conn.sendJson(200, wb.items);
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -3108,6 +3394,32 @@ test "ParsedRequest defaults" {
     try std.testing.expectEqual(@as(f32, 1.0), result.temperature);
 }
 
+/// Same escaping as `jsonEscape`, but grows to fit `input` instead of
+/// silently truncating. `jsonEscape`'s fixed destination buffer makes it a
+/// fit for small, bounded increments (a streamed delta chunk, a tool-call
+/// argument blob); a full/final response body has no such bound, and
+/// truncating it would silently drop content from the client's response
+/// with no error and no signal anything was cut.
+/// @param allocator Used for the returned buffer; caller owns and frees it.
+/// @param input Raw text to escape.
+/// @returns Heap-allocated JSON-escaped text.
+fn jsonEscapeAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, input.len);
+    for (input) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, c),
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn jsonEscape(input: []const u8, buf: []u8) []const u8 {
     var out: usize = 0;
     for (input) |c| {
@@ -3344,6 +3656,7 @@ fn fallbackModelName(model: *const Model) []const u8 {
         .jamba => "jamba",
         .gemma => "gemma",
         .gpt_oss => "gpt-oss-20b",
+        .muse_glimmer => "muse-glimmer",
         .unknown => "zinc-model",
     };
 }
@@ -3404,6 +3717,151 @@ test "jsonEscape empty string" {
     var buf: [64]u8 = undefined;
     const result = jsonEscape("", &buf);
     try std.testing.expectEqualStrings("", result);
+}
+
+test "jsonEscape silently truncates input past the destination buffer" {
+    // Documents the existing behavior jsonEscapeAlloc exists to avoid for
+    // full/final response bodies: jsonEscape is a fit only for callers with
+    // a small, bounded increment (a streamed delta, a tool-call arg blob).
+    const input = "this text is much longer than the buffer";
+    var buf: [8]u8 = undefined;
+    const result = jsonEscape(input, &buf);
+    try std.testing.expect(result.len < input.len);
+    try std.testing.expect(std.mem.startsWith(u8, input, result));
+}
+
+test "jsonEscapeAlloc matches jsonEscape for input that fits a fixed buffer" {
+    var buf: [64]u8 = undefined;
+    const fixed = jsonEscape("hello \"world\"\n\t\\ end", &buf);
+    const alloced = try jsonEscapeAlloc(std.testing.allocator, "hello \"world\"\n\t\\ end");
+    defer std.testing.allocator.free(alloced);
+    try std.testing.expectEqualStrings(fixed, alloced);
+}
+
+test "jsonEscapeAlloc does not truncate input larger than jsonEscape's typical buffer" {
+    const long_input = try std.testing.allocator.alloc(u8, 20_000);
+    defer std.testing.allocator.free(long_input);
+    @memset(long_input, 'a');
+    // Sprinkle a few characters that need escaping throughout.
+    long_input[100] = '"';
+    long_input[10_000] = '\n';
+    long_input[19_999] = '\\';
+
+    const escaped = try jsonEscapeAlloc(std.testing.allocator, long_input);
+    defer std.testing.allocator.free(escaped);
+    // 20,000 bytes + 3 extra escape bytes (one each for ", \n, \\).
+    try std.testing.expectEqual(@as(usize, 20_003), escaped.len);
+    try std.testing.expect(std.mem.endsWith(u8, escaped, "\\\\"));
+}
+
+test "parseStopSequences: absent field yields empty slice" {
+    const stop = try parseStopSequences(std.testing.allocator, null);
+    defer freeStopSequences(std.testing.allocator, stop);
+    try std.testing.expectEqual(@as(usize, 0), stop.len);
+}
+
+test "parseStopSequences: a single string becomes a one-element slice" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "\"\\n\\n\"", .{});
+    defer parsed.deinit();
+    const stop = try parseStopSequences(std.testing.allocator, parsed.value);
+    defer freeStopSequences(std.testing.allocator, stop);
+    try std.testing.expectEqual(@as(usize, 1), stop.len);
+    try std.testing.expectEqualStrings("\n\n", stop[0]);
+}
+
+test "parseStopSequences: an array of strings is preserved in order" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "[\"a\",\"b\",\"c\"]", .{});
+    defer parsed.deinit();
+    const stop = try parseStopSequences(std.testing.allocator, parsed.value);
+    defer freeStopSequences(std.testing.allocator, stop);
+    try std.testing.expectEqual(@as(usize, 3), stop.len);
+    try std.testing.expectEqualStrings("a", stop[0]);
+    try std.testing.expectEqualStrings("b", stop[1]);
+    try std.testing.expectEqualStrings("c", stop[2]);
+}
+
+test "parseStopSequences: array is capped at max_stop_sequences, non-strings and empties are dropped" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "[\"\",\"a\",42,\"b\",\"c\",\"d\",\"e\"]", .{});
+    defer parsed.deinit();
+    const stop = try parseStopSequences(std.testing.allocator, parsed.value);
+    defer freeStopSequences(std.testing.allocator, stop);
+    try std.testing.expectEqual(@as(usize, max_stop_sequences), stop.len);
+    try std.testing.expectEqualStrings("a", stop[0]);
+    try std.testing.expectEqualStrings("d", stop[3]);
+}
+
+fn checkParseStopSequenceAllocationFailures(allocator: std.mem.Allocator, value: std.json.Value) !void {
+    const stop = try parseStopSequences(allocator, value);
+    defer freeStopSequences(allocator, stop);
+}
+
+test "parseStopSequences: single string cleans up after every allocation failure" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "\"stop\"", .{});
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkParseStopSequenceAllocationFailures,
+        .{parsed.value},
+    );
+}
+
+test "parseStopSequences: array cleans up after every allocation failure" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "[\"a\",\"b\",\"c\",\"d\"]", .{});
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkParseStopSequenceAllocationFailures,
+        .{parsed.value},
+    );
+}
+
+test "combinedStopStrings: no client stops returns the built-in list unallocated" {
+    const combined = try combinedStopStrings(std.testing.allocator, &.{});
+    try std.testing.expectEqual(chat_stop_strs.len, combined.len);
+}
+
+test "combinedStopStrings: appends client stops after the built-in list" {
+    const client_stops = [_][]const u8{ "STOP1", "STOP2" };
+    const combined = try combinedStopStrings(std.testing.allocator, &client_stops);
+    defer std.testing.allocator.free(combined);
+    try std.testing.expectEqual(chat_stop_strs.len + 2, combined.len);
+    try std.testing.expectEqualStrings("STOP1", combined[chat_stop_strs.len]);
+    try std.testing.expectEqualStrings("STOP2", combined[chat_stop_strs.len + 1]);
+}
+
+test "firstUnsupportedChatParam: defaults are accepted" {
+    const body = ChatRequestBody{};
+    try std.testing.expectEqual(@as(?[]const u8, null), firstUnsupportedChatParam(body));
+}
+
+test "firstUnsupportedChatParam: only n=1 is accepted" {
+    var body = ChatRequestBody{ .n = 1 };
+    try std.testing.expectEqual(@as(?[]const u8, null), firstUnsupportedChatParam(body));
+
+    body.n = 0;
+    try std.testing.expectEqualStrings(
+        "Field 'n' must be 1: only a single completion choice is generated",
+        firstUnsupportedChatParam(body).?,
+    );
+
+    body.n = 2;
+    try std.testing.expectEqualStrings(
+        "Field 'n' must be 1: only a single completion choice is generated",
+        firstUnsupportedChatParam(body).?,
+    );
+}
+
+test "logprobsRequested: null and false are not requested; true and a positive count are" {
+    try std.testing.expect(!logprobsRequested(null));
+    try std.testing.expect(!logprobsRequested(.{ .bool = false }));
+    try std.testing.expect(!logprobsRequested(.{ .integer = 0 }));
+    try std.testing.expect(logprobsRequested(.{ .bool = true }));
+    try std.testing.expect(logprobsRequested(.{ .integer = 5 }));
+}
+
+test "firstUnsupportedChatParam: logprobs requested is rejected" {
+    const body = ChatRequestBody{ .logprobs = .{ .bool = true } };
+    try std.testing.expect(firstUnsupportedChatParam(body) != null);
 }
 
 test "parseJsonFields defaults when fields missing" {
@@ -3677,6 +4135,40 @@ test "normalizeStructuredAssistantOutput preserves Harmony analysis when thinkin
     try std.testing.expectEqualStrings("<think>\nWe need to answer briefly.\n</think>\nParis", cleaned);
 }
 
+test "normalizeStructuredAssistantOutput strips ATEM self channel" {
+    var tok = makeTestTokenizer("<atem:tool_call><|start|>{{ role }}<|message|>{{ content }}<|eot|>");
+    defer tok.token_to_id.deinit();
+
+    const raw =
+        " to=self<|message|>We need to answer briefly.<|eom|>" ++
+        "<|start|>assistant to=user<|message|>Paris<|eot|>";
+    var buf: [512]u8 = undefined;
+    const cleaned = try normalizeStructuredAssistantOutput(&tok, raw, false, &buf);
+    try std.testing.expectEqualStrings("Paris", cleaned);
+}
+
+test "normalizeStructuredAssistantOutput exposes ATEM self channel only when requested" {
+    var tok = makeTestTokenizer("<atem:tool_call><|start|>{{ role }}<|message|>{{ content }}<|eot|>");
+    defer tok.token_to_id.deinit();
+
+    const raw =
+        " to=self<|message|>We need to answer briefly.<|eom|>" ++
+        "<|start|>assistant to=user<|message|>Paris<|eot|>";
+    var buf: [512]u8 = undefined;
+    const cleaned = try normalizeStructuredAssistantOutput(&tok, raw, true, &buf);
+    try std.testing.expectEqualStrings("<think>\nWe need to answer briefly.\n</think>\nParis", cleaned);
+}
+
+test "normalizeStructuredAssistantOutput buffers partial ATEM envelopes" {
+    var tok = makeTestTokenizer("<atem:tool_call><|start|>{{ role }}<|message|>{{ content }}<|eot|>");
+    defer tok.token_to_id.deinit();
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("", try normalizeStructuredAssistantOutput(&tok, " to=sel", false, &buf));
+    try std.testing.expectEqualStrings("", try normalizeStructuredAssistantOutput(&tok, " to=self<|message|>Private reasoning", false, &buf));
+    try std.testing.expectEqualStrings("<think>\nPrivate reasoning", try normalizeStructuredAssistantOutput(&tok, " to=self<|message|>Private reasoning", true, &buf));
+}
+
 test "sanitizeStreamingThinkingOutput strips reopened think block from answer tail" {
     const raw =
         "<think>\nReasoning.\n</think>\n" ++
@@ -3705,7 +4197,7 @@ test "findStreamingStopStart detects leaked prompt-analysis tail" {
         "Overall, while Zig has potential, it is not yet the best choice for production kernel programming." ++
         "<think>\nThinking Process:\n1. Analyze the Request:\n" ++
         "    *   Current State: The assistant has already provided a response in the few-shot example.";
-    try std.testing.expect(findStreamingStopStart(raw) != null);
+    try std.testing.expect(findStreamingStopStart(raw, chat_stop_strs[0..]) != null);
 }
 
 test "trimRestartedAnswer strips duplicated restart from opening paragraph" {
@@ -3800,10 +4292,15 @@ test "buildChatPrompt enables thinking when requested" {
 }
 
 test "tool-calling requests skip qwen thinking scaffold" {
-    try std.testing.expect(shouldSkipThinkingTemplateForRequest(1, .auto));
-    try std.testing.expect(shouldSkipThinkingTemplateForRequest(1, .required));
-    try std.testing.expect(!shouldSkipThinkingTemplateForRequest(1, .none));
-    try std.testing.expect(!shouldSkipThinkingTemplateForRequest(0, .auto));
+    try std.testing.expect(shouldSkipThinkingTemplateForRequest(1, .auto, null));
+    try std.testing.expect(shouldSkipThinkingTemplateForRequest(1, .required, null));
+    try std.testing.expect(!shouldSkipThinkingTemplateForRequest(1, .none, null));
+    try std.testing.expect(!shouldSkipThinkingTemplateForRequest(0, .auto, null));
+    // enable_thinking=false keeps the no-thinking scaffold on the tool path.
+    try std.testing.expect(!shouldSkipThinkingTemplateForRequest(1, .auto, false));
+    try std.testing.expect(!shouldSkipThinkingTemplateForRequest(1, .required, false));
+    // enable_thinking=true is the caller asking for deliberation: still skip.
+    try std.testing.expect(shouldSkipThinkingTemplateForRequest(1, .auto, true));
 
     var tok = makeTestTokenizer(
         \\{%- if add_generation_prompt %}
@@ -3828,6 +4325,38 @@ test "tool-calling requests skip qwen thinking scaffold" {
     const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, null, true, &tools, .auto, &buf);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<think>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<tool_call>") != null);
+}
+
+test "tool-calling with enable_thinking=false keeps the no-thinking scaffold" {
+    // Regression: the tool path used to discard the caller's flag, leaving a bare
+    // assistant header — the one prefix with nothing suppressing deliberation. On
+    // a thinking model that can burn the whole completion budget reasoning, so the
+    // tool call never arrives. The closed scaffold still admits a <tool_call>.
+    var tok = makeTestTokenizer(
+        \\{%- if add_generation_prompt %}
+        \\  {{- '<|im_start|>assistant\n' }}
+        \\  {%- if enable_thinking is defined and enable_thinking is true %}
+        \\    {{- '<think>\n' }}
+        \\  {%- else %}
+        \\    {{- '<think>\n\n</think>\n\n' }}
+        \\  {%- endif %}
+        \\{%- endif %}
+    );
+    defer tok.token_to_id.deinit();
+
+    const roles = [_][]const u8{"user"};
+    const contents = [_][]const u8{"call a tool"};
+    const tools = [_]tool_format.ToolDefinition{.{
+        .name = "read",
+        .description = "Read a file.",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"}}}",
+    }};
+    var buf: [4096]u8 = undefined;
+    const skip = shouldSkipThinkingTemplateForRequest(tools.len, .auto, false);
+    try std.testing.expect(!skip);
+    const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, false, skip, &tools, .auto, &buf);
+    try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<tool_call>") != null);
 }
 
@@ -4537,16 +5066,40 @@ test "supportsEnabledThinking requires tokenizer support and request flag" {
     try std.testing.expect(!supportsEnabledThinking(&plain_tok, true));
 }
 
-test "ChatReuseCache stores distinct sessions independently" {
+test "ChatReuseCache reuses only the session resident in the engine" {
+    // Generation is serialized behind one engine, so its KV — and on a hybrid
+    // model its DeltaNet state — holds exactly one conversation. Both sessions
+    // stay in the table, but once session-b has run, reusing session-a's prefix
+    // would answer session-a from session-b's state. It must miss and re-prefill.
     var cache = ChatReuseCache.init(std.testing.allocator);
     defer cache.deinit();
 
     try cache.store("session-a", "/tmp/model.gguf", &.{ 1, 2, 3 }, 10);
-    try cache.store("session-b", "/tmp/model.gguf", &.{ 4, 5 }, 20);
+    try std.testing.expectEqual(@as(usize, 3), cache.matchingPrefixLen("session-a", "/tmp/model.gguf", &.{ 1, 2, 3, 9 }, 15));
 
-    try std.testing.expectEqual(@as(usize, 3), cache.matchingPrefixLen("session-a", "/tmp/model.gguf", &.{ 1, 2, 3, 9 }, 30));
+    try cache.store("session-b", "/tmp/model.gguf", &.{ 4, 5 }, 20);
+    try std.testing.expectEqual(@as(usize, 0), cache.matchingPrefixLen("session-a", "/tmp/model.gguf", &.{ 1, 2, 3, 9 }, 30));
     try std.testing.expectEqual(@as(usize, 2), cache.matchingPrefixLen("session-b", "/tmp/model.gguf", &.{ 4, 5, 6 }, 31));
     try std.testing.expectEqual(@as(usize, 0), cache.matchingPrefixLen("session-c", "/tmp/model.gguf", &.{ 1, 2, 3, 9 }, 32));
+
+    // session-a's transcript was never dropped: running it again makes it
+    // resident, and its prefix is reusable once more.
+    try cache.store("session-a", "/tmp/model.gguf", &.{ 1, 2, 3 }, 40);
+    try std.testing.expectEqual(@as(usize, 3), cache.matchingPrefixLen("session-a", "/tmp/model.gguf", &.{ 1, 2, 3, 9 }, 41));
+}
+
+test "ChatReuseCache residency is dropped by a generation that stores nothing" {
+    // A request without a session_id (or one that fails before storing) still
+    // overwrites the engine's state, so the previous session stops being
+    // reusable. handleChatCompletions calls clearLive() before generating.
+    var cache = ChatReuseCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    try cache.store("session-a", "/tmp/model.gguf", &.{ 1, 2, 3 }, 10);
+    try std.testing.expectEqual(@as(usize, 3), cache.matchingPrefixLen("session-a", "/tmp/model.gguf", &.{ 1, 2, 3, 9 }, 11));
+
+    cache.clearLive();
+    try std.testing.expectEqual(@as(usize, 0), cache.matchingPrefixLen("session-a", "/tmp/model.gguf", &.{ 1, 2, 3, 9 }, 12));
 }
 
 test "ChatReuseCache prunes idle sessions automatically" {
@@ -4582,8 +5135,13 @@ test "ChatReuseCache evicts least recently used session when full" {
     try cache.store(evicted_session, "/tmp/model.gguf", token_pair[0..], @intCast(chat_reuse_max_sessions + 2));
 
     try std.testing.expectEqual(@as(usize, chat_reuse_max_sessions), cache.count());
+    // Eviction and residency are separate: make each session resident in turn so
+    // the lookup reports whether its transcript survived, not who ran last.
+    try cache.markLive("session-1");
     try std.testing.expectEqual(@as(usize, 0), cache.matchingPrefixLen("session-1", "/tmp/model.gguf", &.{ 1, 101, 999 }, @intCast(chat_reuse_max_sessions + 3)));
+    try cache.markLive("session-0");
     try std.testing.expectEqual(@as(usize, 2), cache.matchingPrefixLen("session-0", "/tmp/model.gguf", &.{ 0, 100, 999 }, @intCast(chat_reuse_max_sessions + 4)));
+    try cache.markLive(evicted_session);
     try std.testing.expectEqual(@as(usize, 2), cache.matchingPrefixLen(evicted_session, "/tmp/model.gguf", &.{ @intCast(chat_reuse_max_sessions), @intCast(chat_reuse_max_sessions + 100), 999 }, @intCast(chat_reuse_max_sessions + 5)));
 }
 

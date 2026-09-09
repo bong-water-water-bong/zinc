@@ -6,12 +6,14 @@ import {
   buildComparison,
   buildMeasurementPhases,
   buildZincOpenAiPayload,
+  benchmarkStatisticsNote,
   benchmarkFailureReason,
   canonicalModelIdFromPath,
   collectRemoteZincTuningEnv,
   compareModelsByName,
   detectRdnaServerStartupFailure,
   DEFAULT_LOCAL_MODEL_ROOT,
+  defaultCudaCases,
   defaultIntelCases,
   defaultMetalCases,
   defaultMaxTokensForModelId,
@@ -22,6 +24,7 @@ import {
   llamaDeviceArgs,
   localZincCommand,
   mergeArtifacts,
+  measuredRunRange,
   outputQualityStatus,
   parseArgs,
   parseDotEnv,
@@ -35,14 +38,46 @@ import {
   remoteSshFailureSummary,
   rdnaEnvValue,
   rdnaNodeEnvKey,
+  rdnaTargetIdentity,
   intelZincCommand,
   rdnaZincCommand,
   resolveLocalLlamaServer,
-  rdnaDpmHighScript,
+  rdnaDpmNormalizeScript,
   summarizeValues,
   validateZincBackend,
   zincServerTimingWaitSeconds,
 } from "./performance_suite.mjs";
+
+test("benchmark methodology reports the configured sample counts", () => {
+  expect(benchmarkStatisticsNote(5, 1)).toBe(
+    "Statistics: one warmup pass is discarded, then 5 measured runs are collected. Published prefill, decode, end-to-end throughput, and latency values are medians.",
+  );
+  expect(benchmarkStatisticsNote(1, 2)).toContain("2 warmup passes are discarded, then one measured run is collected");
+});
+
+test("published methodology reports mixed run counts after a partial model refresh", () => {
+  const range = measuredRunRange([
+    { scenarios: [{ zinc: { decode_tps: { samples: [1, 2, 3] } } }] },
+    { scenarios: [{ zinc: { decode_tps: { samples: [1, 2, 3, 4, 5] } } }] },
+  ]);
+  expect(range).toEqual({ min: 3, max: 5 });
+
+  const merged = mergeArtifacts({ targets: [] }, [{
+    id: "rdna-rocm",
+    methodology: {
+      runs: 5,
+      warmup_runs: 1,
+      notes: [benchmarkStatisticsNote(5, 1)],
+    },
+    models: [
+      { id: "three", scenarios: [{ id: "core", zinc: { decode_tps: { median: 3, samples: [3, 3, 3] } } }] },
+      { id: "five", scenarios: [{ id: "core", zinc: { decode_tps: { median: 5, samples: [5, 5, 5, 5, 5] } } }] },
+    ],
+  }]);
+  expect(merged.targets[0]?.methodology.runs_min).toBe(3);
+  expect(merged.targets[0]?.methodology.runs_max).toBe(5);
+  expect(merged.targets[0]?.methodology.notes[0]).toContain("3–5 measured runs");
+});
 
 test("parseArgs reads suite options", () => {
   const args = parseArgs([
@@ -109,6 +144,10 @@ test("remote tuning env forwards tuning toggles", () => {
     ZINC_Q8_1_SSM_QKV_Z: "1",
     ZINC_MOE_Q5K_Q8_1_DOWN_ACC: "1",
     ZINC_MOE_Q6K_COLS: "1",
+    ZINC_QWEN_MOE_BATCHED: "0",
+    ZINC_MOE_TC: "0",
+    ZINC_MOE_DOWN_TC: "0",
+    ZINC_MOE_DOWN_Q6K_TC: "0",
     ZINC_MOE_PREFIX_SHARED_EXACT: "1",
     ZINC_MOE_SINGLETON_TAIL_SPLIT: "1",
     ZINC_INTEL_A3B_PRODUCTION: "0",
@@ -117,6 +156,55 @@ test("remote tuning env forwards tuning toggles", () => {
     ZINC_QWEN35_9B_BM64_DOWN: "0",
     ZINC_QWEN35_9B_K12288_BK2: "0",
     ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS: "4",
+    ZINC_SSM_PROFILE: "1",
+    ZINC_ROCM_DECODE_PAIR_REDUCE: "1",
+    ZINC_ROCM_Q4_PAIR_REDUCE: "1",
+    ZINC_ROCM_DECODE_Q8_FFN: "1",
+    ZINC_ROCM_DECODE_Q8_Q6: "1",
+    ZINC_ROCM_DECODE_Q8_LM: "1",
+    ZINC_ROCM_DECODE_Q8_Q4: "1",
+    ZINC_ROCM_DECODE_Q8_Q6_PROJ: "1",
+    ZINC_ROCM_DECODE_Q8_Q5: "1",
+    ZINC_ROCM_DECODE_Q8_Q4_PAIR: "1",
+    ZINC_ROCM_RMS_Q8: "1",
+    ZINC_ROCM_ARGMAX_V2: "1",
+    ZINC_ROCM_MUSE_ATTN_BLAS: "1",
+    ZINC_ROCM_MUSE_ATTN_BLAS_MIN: "0",
+    ZINC_ROCM_MUSE_NORM_CHAIN: "1",
+    ZINC_ROCM_DECODE_SSM_COL_WARP: "1",
+    ZINC_ROCM_DECODE_SSM_FAST: "1",
+    ZINC_BATCHED_TC: "1",
+    ZINC_BATCHED_CUBLAS: "1",
+    ZINC_CUBLAS_MIN_T: "64",
+    ZINC_BATCHED_TC_SHAREA: "1",
+    ZINC_BATCHED_TC_NORMF16: "1",
+    ZINC_BATCHED_EXPERTS_GROUPED: "1",
+    ZINC_MOE_NORM_COMBINE: "1",
+    ZINC_ATTN_MOE_NORM: "1",
+    ZINC_MOE_EXACT_Q8: "1",
+    ZINC_MOE_M64: "1",
+    ZINC_MOE_T8: "1",
+    ZINC_MOE_T16: "1",
+    ZINC_ROCM_TIME_KERNEL: "grouped_i8",
+    ZINC_Q8_M32: "1",
+    ZINC_Q8_FFN_BLOCK64: "1",
+    ZINC_Q8_FFN_BLOCK128: "1",
+    ZINC_Q8_Q6_BLOCK64: "1",
+    ZINC_Q8_Q6_BLOCK128: "1",
+    ZINC_ROCM_MOE_SHARED_Q8: "1",
+    ZINC_ROCM_MOE_DOWN_Q8: "1",
+    ZINC_ROCM_MOE_GATE_GEGLU: "0",
+    ZINC_ROCM_LIGHT_COMMANDS: "0",
+    ZINC_MOE_DOWN_Q8_M16: "1",
+    ZINC_MOE_DOWN_Q8_M8: "1",
+    ZINC_MOE_DOWN_Q8_M64: "1",
+    ZINC_SSM_PREPARED: "1",
+    ZINC_SSM_COL_WARP: "1",
+    ZINC_SSM_COL_WARP_FAST: "1",
+    ZINC_PREFILL_Q8_REUSE: "1",
+    ZINC_PREFILL_WMMA_TILES: "1",
+    ZINC_PREFILL_WMMA_T80: "1",
+    ZINC_ATTN_V2: "1",
     ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT: "0",
     ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE: "0",
     ZINC_QWEN36_27B_SSM_BATCHED_DELTA: "0",
@@ -127,6 +215,10 @@ test("remote tuning env forwards tuning toggles", () => {
   expect(env.ZINC_Q8_1_SSM_QKV_Z).toBe("1");
   expect(env.ZINC_MOE_Q5K_Q8_1_DOWN_ACC).toBe("1");
   expect(env.ZINC_MOE_Q6K_COLS).toBe("1");
+  expect(env.ZINC_QWEN_MOE_BATCHED).toBe("0");
+  expect(env.ZINC_MOE_TC).toBe("0");
+  expect(env.ZINC_MOE_DOWN_TC).toBe("0");
+  expect(env.ZINC_MOE_DOWN_Q6K_TC).toBe("0");
   expect(env.ZINC_MOE_PREFIX_SHARED_EXACT).toBe("1");
   expect(env.ZINC_MOE_SINGLETON_TAIL_SPLIT).toBe("1");
   expect(env.ZINC_INTEL_A3B_PRODUCTION).toBe("0");
@@ -135,6 +227,55 @@ test("remote tuning env forwards tuning toggles", () => {
   expect(env.ZINC_QWEN35_9B_BM64_DOWN).toBe("0");
   expect(env.ZINC_QWEN35_9B_K12288_BK2).toBe("0");
   expect(env.ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS).toBe("4");
+  expect(env.ZINC_SSM_PROFILE).toBe("1");
+  expect(env.ZINC_ROCM_DECODE_PAIR_REDUCE).toBe("1");
+  expect(env.ZINC_ROCM_Q4_PAIR_REDUCE).toBe("1");
+  expect(env.ZINC_ROCM_DECODE_Q8_FFN).toBe("1");
+  expect(env.ZINC_ROCM_DECODE_Q8_Q6).toBe("1");
+  expect(env.ZINC_ROCM_DECODE_Q8_LM).toBe("1");
+  expect(env.ZINC_ROCM_DECODE_Q8_Q4).toBe("1");
+  expect(env.ZINC_ROCM_DECODE_Q8_Q6_PROJ).toBe("1");
+  expect(env.ZINC_ROCM_DECODE_Q8_Q5).toBe("1");
+  expect(env.ZINC_ROCM_DECODE_Q8_Q4_PAIR).toBe("1");
+  expect(env.ZINC_ROCM_RMS_Q8).toBe("1");
+  expect(env.ZINC_ROCM_ARGMAX_V2).toBe("1");
+  expect(env.ZINC_ROCM_MUSE_ATTN_BLAS).toBe("1");
+  expect(env.ZINC_ROCM_MUSE_ATTN_BLAS_MIN).toBe("0");
+  expect(env.ZINC_ROCM_MUSE_NORM_CHAIN).toBe("1");
+  expect(env.ZINC_ROCM_DECODE_SSM_COL_WARP).toBe("1");
+  expect(env.ZINC_ROCM_DECODE_SSM_FAST).toBe("1");
+  expect(env.ZINC_BATCHED_TC).toBe("1");
+  expect(env.ZINC_BATCHED_CUBLAS).toBe("1");
+  expect(env.ZINC_CUBLAS_MIN_T).toBe("64");
+  expect(env.ZINC_BATCHED_TC_SHAREA).toBe("1");
+  expect(env.ZINC_BATCHED_TC_NORMF16).toBe("1");
+  expect(env.ZINC_BATCHED_EXPERTS_GROUPED).toBe("1");
+  expect(env.ZINC_MOE_NORM_COMBINE).toBe("1");
+  expect(env.ZINC_ATTN_MOE_NORM).toBe("1");
+  expect(env.ZINC_MOE_EXACT_Q8).toBe("1");
+  expect(env.ZINC_MOE_M64).toBe("1");
+  expect(env.ZINC_MOE_T8).toBe("1");
+  expect(env.ZINC_MOE_T16).toBe("1");
+  expect(env.ZINC_ROCM_TIME_KERNEL).toBe("grouped_i8");
+  expect(env.ZINC_Q8_M32).toBe("1");
+  expect(env.ZINC_Q8_FFN_BLOCK64).toBe("1");
+  expect(env.ZINC_Q8_FFN_BLOCK128).toBe("1");
+  expect(env.ZINC_Q8_Q6_BLOCK64).toBe("1");
+  expect(env.ZINC_Q8_Q6_BLOCK128).toBe("1");
+  expect(env.ZINC_ROCM_MOE_SHARED_Q8).toBe("1");
+  expect(env.ZINC_ROCM_MOE_DOWN_Q8).toBe("1");
+  expect(env.ZINC_ROCM_MOE_GATE_GEGLU).toBe("0");
+  expect(env.ZINC_ROCM_LIGHT_COMMANDS).toBe("0");
+  expect(env.ZINC_MOE_DOWN_Q8_M16).toBe("1");
+  expect(env.ZINC_MOE_DOWN_Q8_M8).toBe("1");
+  expect(env.ZINC_MOE_DOWN_Q8_M64).toBe("1");
+  expect(env.ZINC_SSM_PREPARED).toBe("1");
+  expect(env.ZINC_SSM_COL_WARP).toBe("1");
+  expect(env.ZINC_SSM_COL_WARP_FAST).toBe("1");
+  expect(env.ZINC_PREFILL_Q8_REUSE).toBe("1");
+  expect(env.ZINC_PREFILL_WMMA_TILES).toBe("1");
+  expect(env.ZINC_PREFILL_WMMA_T80).toBe("1");
+  expect(env.ZINC_ATTN_V2).toBe("1");
   expect(env.ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT).toBe("0");
   expect(env.ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE).toBe("0");
   expect(env.ZINC_QWEN36_27B_SSM_BATCHED_DELTA).toBe("0");
@@ -173,12 +314,17 @@ test("parseArgs reads RDNA backend and device options", () => {
   expect(args.rdnaWorkdir).toBe("/root/zinc-bench");
 });
 
-test("RDNA DPM high script targets AMD memory-clock controls safely", () => {
-  const script = rdnaDpmHighScript();
+test("RDNA performance script stabilizes PCIe and leaves the AMD DPM governor on auto", () => {
+  const script = rdnaDpmNormalizeScript();
+  expect(script).toContain("/sys/module/pcie_aspm/parameters/policy");
+  expect(script).toContain("echo performance");
   expect(script).toContain("/sys/class/drm/card*/device");
   expect(script).toContain("pp_dpm_mclk");
   expect(script).toContain("power_dpm_force_performance_level");
-  expect(script).toContain("echo high");
+  // Forcing `high` locks a fixed nominal DPM state and measured 4% slower than
+  // the card default on the R9700 (both ZINC and the comparison runtime).
+  expect(script).toContain("echo auto");
+  expect(script).not.toContain("echo high");
   expect(script).toContain("2>/dev/null || true");
   expect(script).not.toContain("do;");
   expect(script).not.toContain("then;");
@@ -188,6 +334,17 @@ test("parseArgs rejects invalid RDNA backend", () => {
   expect(() => parseArgs(["--target", "rdna", "--rdna-backend", "metal"])).toThrow(
     "Invalid --rdna-backend 'metal'",
   );
+});
+
+test("parseArgs accepts the ROCm RDNA backend", () => {
+  expect(parseArgs(["--target", "rdna", "--rdna-backend", "rocm"]).rdnaBackend).toBe("rocm");
+});
+
+test("RDNA benchmark identities keep Vulkan and ROCm publications separate", () => {
+  expect(rdnaTargetIdentity("vulkan")).toEqual({ id: "rdna", label: "AMD RDNA · Vulkan" });
+  expect(rdnaTargetIdentity("auto")).toEqual({ id: "rdna", label: "AMD RDNA · Vulkan" });
+  expect(rdnaTargetIdentity("rocm")).toEqual({ id: "rdna-rocm", label: "AMD RDNA · ROCm" });
+  expect(rdnaTargetIdentity("zinc_rt")).toEqual({ id: "rdna-zinc-rt", label: "AMD RDNA · ZINC_RT" });
 });
 
 test("parseZincVersionOutput extracts the compiled backend", () => {
@@ -232,33 +389,43 @@ test("resolveLocalLlamaServer prefers explicit path, then PATH, then docker fall
   expect(resolveLocalLlamaServer({ llamaServer: null }, null, "/tmp/docker")).toBe("/tmp/docker");
 });
 
-test("Gemma uses the chat prompt path in the performance suite", () => {
+test("Gemma, Muse, and current Qwen models use the chat prompt path", () => {
   expect(prefersChatPrompt("gemma4-26b-a4b-q4k-m")).toBe(true);
   expect(defaultPromptForModelId("gemma4-26b-a4b-q4k-m")).toContain("benchmark screenshots");
   expect(defaultMaxTokensForModelId("gemma4-26b-a4b-q4k-m")).toBe(96);
-  expect(prefersChatPrompt("qwen35-9b-q4k-m")).toBe(false);
-  expect(defaultPromptForModelId("qwen35-9b-q4k-m")).toContain("Developer question");
+  expect(prefersChatPrompt("qwen35-9b-q4k-m")).toBe(true);
+  expect(defaultPromptForModelId("qwen35-9b-q4k-m")).toContain("teammate sent");
   expect(defaultMaxTokensForModelId("qwen35-9b-q4k-m")).toBe(96);
+  expect(prefersChatPrompt("qwen38-27b-q4k-m")).toBe(true);
+  expect(prefersChatPrompt("muse-glimmer-30b-q4k-m")).toBe(true);
 });
 
-test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
+test("default Metal cases use managed cache ids and replace Qwen 3.6 27B with Qwen 3.8", () => {
   const cases = defaultMetalCases("/tmp/models");
 
   const qwen36 = cases.find((entry) => entry.id === "qwen36-35b-a3b-q4k-xl");
   expect(qwen36?.model_id).toBe("qwen36-35b-a3b-q4k-xl");
   expect(qwen36?.model_path).toBe("/tmp/models/qwen36-35b-a3b-q4k-xl/model.gguf");
 
-  const qwen36Dense = cases.find((entry) => entry.id === "qwen36-27b-q4k-m");
-  expect(qwen36Dense?.model_id).toBe("qwen36-27b-q4k-m");
-  expect(qwen36Dense?.model_path).toBe("/tmp/models/qwen36-27b-q4k-m/model.gguf");
+  const qwen38Dense = cases.find((entry) => entry.id === "qwen38-27b-q4k-m");
+  expect(qwen38Dense?.model_id).toBe("qwen38-27b-q4k-m");
+  expect(qwen38Dense?.model_path).toBe("/tmp/models/qwen38-27b-q4k-m/model.gguf");
+  expect(qwen38Dense?.prompt_mode).toBe("chat");
+  expect(cases.some((entry) => entry.id === "qwen36-27b-q4k-m")).toBe(false);
 });
 
-test("default RDNA cases include Gemma and current Qwen rows", () => {
+test("default RDNA cases include Muse, Gemma, and current Qwen rows", () => {
   const cases = defaultRdnaCases("/root/models");
+  const muse = cases.find((entry) => entry.id === "muse-glimmer-30b-q4k-m");
   const gemma26 = cases.find((entry) => entry.id === "gemma4-26b-a4b-q4k-m");
   const gemma31 = cases.find((entry) => entry.id === "gemma4-31b-q4k-m");
-  const qwen36Dense = cases.find((entry) => entry.id === "qwen36-27b-q4k-m");
+  const qwen38Dense = cases.find((entry) => entry.id === "qwen38-27b-q4k-m");
   const qwen35 = cases.find((entry) => entry.id === "qwen35-9b-q4k-m");
+
+  expect(muse?.model_path).toBe("/root/models/muse-glimmer/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf");
+  expect(muse?.prompt_mode).toBe("chat");
+  expect(muse?.prompt).toContain("benchmark screenshots");
+  expect(muse?.max_tokens).toBe(96);
 
   expect(gemma26?.model_path).toBe("/root/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf");
   expect(gemma26?.prompt_mode).toBe("chat");
@@ -270,14 +437,16 @@ test("default RDNA cases include Gemma and current Qwen rows", () => {
   expect(gemma31?.prompt).toContain("benchmark screenshots");
   expect(gemma31?.max_tokens).toBe(96);
 
-  expect(qwen36Dense?.model_path).toBe("/root/models/Qwen3.6-27B-Q4_K_M.gguf");
-  expect(qwen36Dense?.prompt_mode).toBe("raw");
-  expect(qwen36Dense?.prompt).toContain("Developer question");
-  expect(qwen36Dense?.max_tokens).toBe(96);
+  expect(qwen38Dense?.model_path).toBe("/root/models/Qwen3.8-27B-Q4_K_M.gguf");
+  expect(qwen38Dense?.prompt_mode).toBe("chat");
+  expect(qwen38Dense?.prompt).toContain("benchmark screenshots");
+  expect(qwen38Dense?.max_tokens).toBe(96);
+
+  expect(cases.some((entry) => entry.id === "qwen36-27b-q4k-m")).toBe(false);
 
   expect(qwen35?.model_path).toBe("/root/models/Qwen3.5-9B-Q4_K_M.gguf");
-  expect(qwen35?.prompt_mode).toBe("raw");
-  expect(qwen35?.prompt).toContain("Developer question");
+  expect(qwen35?.prompt_mode).toBe("chat");
+  expect(qwen35?.prompt).toContain("teammate sent");
   expect(qwen35?.max_tokens).toBe(96);
 });
 
@@ -288,17 +457,23 @@ test("default Intel cases use the remote managed cache layout", () => {
     "gemma4-31b-q4k-m",
     "qwen35-9b-q4k-m",
     "qwen36-35b-a3b-q4k-xl",
-    "qwen36-27b-q4k-m",
   ]);
+  expect(cases.some((entry) => entry.id === "qwen38-27b-q4k-m")).toBe(false);
   const qwen = cases.find((entry) => entry.id === "qwen35-9b-q4k-m");
   const gemma = cases.find((entry) => entry.id === "gemma4-26b-a4b-q4k-m");
 
   expect(qwen?.model_path).toBe("/remote/cache/qwen35-9b-q4k-m/model.gguf");
-  expect(qwen?.prompt_mode).toBe("raw");
+  expect(qwen?.prompt_mode).toBe("chat");
   expect(qwen?.context_tokens).toBe(512);
   expect(gemma?.model_path).toBe("/remote/cache/gemma4-26b-a4b-q4k-m/model.gguf");
   expect(gemma?.prompt_mode).toBe("chat");
   expect(gemma?.notes).toEqual(["Intel Arc Vulkan comparison against llama.cpp on the same host"]);
+});
+
+test("default CUDA cases exclude unvalidated Qwen 3.8 and retired Qwen 3.6 27B rows", () => {
+  const ids = defaultCudaCases("/remote/models").map((entry) => entry.id);
+  expect(ids).not.toContain("qwen38-27b-q4k-m");
+  expect(ids).not.toContain("qwen36-27b-q4k-m");
 });
 
 test("llama device args support Intel Vulkan0 and no-device modes", () => {
@@ -307,11 +482,14 @@ test("llama device args support Intel Vulkan0 and no-device modes", () => {
   expect(llamaDeviceArgs(null)).toEqual([]);
 });
 
-test("performance suite canonicalizes and labels Qwen 3.6 GGUFs", () => {
+test("performance suite canonicalizes and labels current Qwen GGUFs", () => {
+  expect(canonicalModelIdFromPath("/tmp/Qwen3.8-27B-Q4_K_M.gguf")).toBe("qwen38-27b-q4k-m");
+  expect(canonicalModelIdFromPath("/tmp/Qwen_Qwen3.8-27B-Q4_K_M.gguf")).toBe("qwen38-27b-q4k-m");
   expect(canonicalModelIdFromPath("/tmp/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")).toBe("qwen36-35b-a3b-q4k-xl");
   expect(canonicalModelIdFromPath("/tmp/Qwen3.6-27B-Q4_K_M.gguf")).toBe("qwen36-27b-q4k-m");
   expect(canonicalModelIdFromPath("/tmp/Qwen_Qwen3.6-27B-Q4_K_M.gguf")).toBe("qwen36-27b-q4k-m");
   expect(canonicalModelIdFromPath("/tmp/models/qwen36-35b-a3b-q4k-xl/model.gguf")).toBe("qwen36-35b-a3b-q4k-xl");
+  expect(guessFamily("qwen38-27b-q4k-m")).toBe("Qwen 3.8");
   expect(guessFamily("qwen36-35b-a3b-q4k-xl")).toBe("Qwen 3.6");
   expect(guessFamily("qwen36-27b-q4k-m")).toBe("Qwen 3.6");
 });
@@ -435,6 +613,8 @@ main: exiting due to model loading error
 `);
 
   expect(failure).toBe("unknown model architecture: 'gemma4'");
+  expect(detectRdnaServerStartupFailure('error while handling argument "--device": invalid device: Vulkan1'))
+    .toBe('error while handling argument "--device": invalid device: Vulkan1');
   expect(detectRdnaServerStartupFailure("server ready")).toBeNull();
 });
 
@@ -614,6 +794,24 @@ info(forward): Generated 32 tokens in 977.9 ms — 32.72 tok/s (30.6 ms/tok)
   expect(parsed.outputPreview).toBe("Command shape");
 });
 
+test("parseZincServerOutput captures reasoning-only chat responses", () => {
+  const parsed = parseZincServerOutput(`{"choices":[{"message":{"content":"","reasoning_content":"Use identical prompts and warmups."}}],"usage":{"prompt_tokens":49,"completion_tokens":16}}
+__ZINC_TIMING__
+info(forward): Prefill: 49 tokens in 100.0 ms (490.00 tok/s)
+info(forward): Generated 16 tokens in 200.0 ms — 80.00 tok/s (12.5 ms/tok)
+`);
+
+  expect(parsed.outputPreview).toBe("Use identical prompts and warmups.");
+});
+
+test("parseZincServerOutput rejects an empty generation", () => {
+  expect(() => parseZincServerOutput(`{"choices":[{"text":""}],"usage":{"prompt_tokens":49,"completion_tokens":0}}
+__ZINC_TIMING__
+info(forward): Prefill: 49 tokens in 0.0 ms (0.00 tok/s)
+info(forward): Generated 0 tokens in 0.0 ms — 0.00 tok/s (0.0 ms/tok)
+`)).toThrow("no generated tokens");
+});
+
 test("RDNA ZINC server payload keeps the preloaded GGUF active", () => {
   const raw = buildZincOpenAiPayload({
     prompt_mode: "raw",
@@ -650,6 +848,14 @@ test("remote llama-server baselines disable prompt cache for prefill timing", ()
   expect(launchBody).toContain("\"--no-cache-prompt\"");
 });
 
+test("remote ZINC benchmark server uses one slot for single-request comparisons", () => {
+  const src = readFileSync(new URL("./performance_suite.mjs", import.meta.url), "utf8");
+  const launchStart = src.indexOf("async function launchRdnaZincServer");
+  expect(launchStart).toBeGreaterThanOrEqual(0);
+  const launchBody = src.slice(launchStart, launchStart + 2500);
+  expect(launchBody).toContain('"--parallel", "1"');
+});
+
 test("RDNA ZINC timing wait is bounded after the API response", () => {
   expect(zincServerTimingWaitSeconds(12_000)).toBe(10);
   expect(zincServerTimingWaitSeconds(65_000)).toBe(60);
@@ -678,6 +884,10 @@ built with AppleClang 17.0.0.17000604 for Darwin arm64
 
   expect(parsed?.version).toBe("8610");
   expect(parsed?.commit).toBe("2b86e5cae");
+
+  const latest = parseLlamaCppVersionOutput("version: 0.3.0-dev (build 2325, commit 8887a48f0)");
+  expect(latest?.version).toBe("0.3.0-dev");
+  expect(latest?.commit).toBe("8887a48f0");
 });
 
 test("parseOpenAiCompletionOutput extracts throughput from server JSON", () => {
@@ -724,6 +934,16 @@ test("parseOpenAiCompletionOutput uses llama-server timing token counts for cach
   expect(parsed.prefillTps).toBeCloseTo(113.59763716914688, 6);
   expect(parsed.decodeMs).toBeCloseTo((256 / 60.9357832057173) * 1000, 6);
   expect(parsed.outputPreview).toBe("Implementation plan");
+});
+
+test("parseOpenAiCompletionOutput captures llama-server reasoning output", () => {
+  const parsed = parseOpenAiCompletionOutput(JSON.stringify({
+    usage: { prompt_tokens: 32, completion_tokens: 16 },
+    timings: { prompt_per_second: 200, predicted_per_second: 50 },
+    choices: [{ message: { content: "", reasoning_content: "Compare the two runs fairly." } }],
+  }));
+
+  expect(parsed.outputPreview).toBe("Compare the two runs fairly.");
 });
 
 test("summarizeValues includes median, p95, and stddev", () => {
@@ -1111,10 +1331,13 @@ test("buildArtifact writes only the incoming targets", () => {
 });
 
 test("output quality status flags malformed benchmark previews", () => {
+  expect(outputQualityStatus("", 0).tone).toBe("caution");
   expect(outputQualityStatus("<|im_end|>", 2).tone).toBe("caution");
   expect(outputQualityStatus("2\n</think>\n<|im_start|>0.\n<|im_end|>", 96).tone).toBe("caution");
   expect(outputQualityStatus("##\n<think>first</think>\n<think>second", 128).tone).toBe("caution");
   expect(outputQualityStatus("1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.", 128).tone).toBe("caution");
+  expect(outputQualityStatus("<pad><pad><pad>", 96).tone).toBe("caution");
+  expect(outputQualityStatus("42 , 17 ; 42 , 17 ; 42 , 17 ; 42 , 17 ; 42 , 17 ; 42 , 17 ;", 96).tone).toBe("caution");
   expect(outputQualityStatus(
     "1. What is the most important thing to remember about the relationship between the brain and the body? " +
     "2. What is the most important thing to remember about the relationship between the brain and the body? " +

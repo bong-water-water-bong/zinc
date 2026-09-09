@@ -1366,6 +1366,7 @@ const ScalarDecodeState = struct {
     ssm_states: []f32,
     moe_expert_workers: usize,
     moe_topk_active: u32,
+    direct_lm_head_full_argmax_successes: u32 = 0,
     direct_router_row_range_successes: u32 = 0,
     direct_router_row_range_trust_after_successes: u32,
     direct_ssm_q8_row_range_max_successes: u32,
@@ -1562,18 +1563,21 @@ const DirectComputeTracking = struct {
 };
 
 // Keep M1 benchmark runs exercising a consumed decode-phase model value by
-// default without paying for broad layer coverage on every run. Full decode
-// slices are validation-only now that coverage has been proven; they remain
-// opt-in. The default decode proof is one LM-head prefix row-range on the first
-// decode step plus a low-cadence full-router row-range replacement, so token
-// selection and MoE routing both consume GPU-produced DMMV values.
+// default without paying for broad layer or full-vocab validation every run.
+// Full decode slices and the full-resident LM-head sweep are validation-only
+// now that coverage has been proven; they remain opt-in. The default decode
+// proof is one resident LM-head prefix row-range on the first decode step. The
+// periodic full-router row-range replacement is still available as opt-in
+// validation coverage, but the default path keeps only the token-affecting
+// LM-head slice to recover throughput while preserving M1 consumed-slice proof.
 // F32 projections validate each row range against the CPU oracle; paired Q8_0
 // projections can use trust-after-success after the first passing pair.
 const direct_decode_model_slice_enabled_default = false;
 const direct_decode_model_slice_cadence_default: u32 = 0;
 const direct_prefill_model_slice_enabled_default = false;
 const direct_lm_head_decode_cadence_default: u32 = 0;
-const direct_router_decode_enabled_default = true;
+const direct_lm_head_q4_0_full_resident_default = false;
+const direct_router_decode_enabled_default = false;
 const direct_router_decode_cadence_default: u32 = 64;
 const direct_router_row_range_trust_after_successes_default: u32 = 1;
 const direct_ssm_q8_0_row_range_max_successes_default: u32 = 2;
@@ -1634,6 +1638,15 @@ fn directLmHeadDecodeCadenceForEnv(raw_override: ?[]const u8) u32 {
 
 fn directLmHeadDecodeCadence() u32 {
     return directLmHeadDecodeCadenceForEnv(std.posix.getenv("ZINC_RT_DIRECT_LM_HEAD_DECODE_CADENCE"));
+}
+
+fn directLmHeadQ4_0FullResidentEnabledForEnv(raw_override: ?[]const u8) bool {
+    const raw = raw_override orelse return direct_lm_head_q4_0_full_resident_default;
+    return parseBoolEnv(raw, direct_lm_head_q4_0_full_resident_default);
+}
+
+fn directLmHeadQ4_0FullResidentEnabled() bool {
+    return directLmHeadQ4_0FullResidentEnabledForEnv(std.posix.getenv("ZINC_RT_DIRECT_LM_HEAD_FULL_RESIDENT"));
 }
 
 fn directRouterDecodeEnabledForEnv(raw_override: ?[]const u8) bool {
@@ -1832,8 +1845,18 @@ fn generateScalarHybrid(
     if (prompt_tokens.len > 0) {
         direct_prompt0_token = try directBoundaryToken(token_boundary, prompt_tokens[0], &direct_token_boundary_copies);
     }
+    const direct_prefill_slice_enabled = directPrefillModelSliceEnabled();
+    const direct_decode_slice_enabled = directDecodeModelSliceEnabled();
+    const direct_decode_slice_cadence = directDecodeModelSliceCadence();
+    const direct_lm_head_decode_cadence = directLmHeadDecodeCadence();
+    const direct_router_decode_enabled = directRouterDecodeEnabled();
+    const direct_router_decode_cadence = directRouterDecodeCadence();
+    const needs_direct_final_norm_probe = direct_prefill_slice_enabled or direct_decode_slice_enabled;
     var direct_model_ops: u32 = 0;
-    const direct_final_norm_weight0 = try directModelFinalNormWeight0(token_boundary, model, &direct_model_ops);
+    const direct_final_norm_weight0 = if (needs_direct_final_norm_probe)
+        try directModelFinalNormWeight0(token_boundary, model, &direct_model_ops)
+    else
+        null;
     const direct_model_value_bits: u32 = if (direct_final_norm_weight0) |w| @bitCast(w) else 0;
     if (direct_model_ops > 0) {
         log.info("M1 AMDGPU CS direct model value enabled: output_norm.weight[0] COPY_DATA bits=0x{x}", .{direct_model_value_bits});
@@ -1845,19 +1868,18 @@ fn generateScalarHybrid(
     var real_model_slice = false;
     var direct_decode_model_slices: u32 = 0;
     var direct_compute_token: u32 = 0;
-    const direct_prefill_slice_enabled = directPrefillModelSliceEnabled();
-    const direct_decode_slice_enabled = directDecodeModelSliceEnabled();
-    const direct_decode_slice_cadence = directDecodeModelSliceCadence();
-    const direct_lm_head_decode_cadence = directLmHeadDecodeCadence();
-    const direct_router_decode_enabled = directRouterDecodeEnabled();
-    const direct_router_decode_cadence = directRouterDecodeCadence();
     var direct_lm_head_q4_0_resident: ?zinc_rt.cs.ResidentDmmvQ4_0Rows = null;
     if (token_boundary) |boundary| {
         if (model.lm_head_q4_0) |q40| {
             const cols: u32 = @intCast(state.norm.len);
             const row_bytes = rowBytesForType(.q4_0, cols);
             const scratch_rows: u32 = @intCast(@min(state.row_scratch.len, @as(usize, std.math.maxInt(u32))));
-            const rows = directLmHeadQ4_0ArgmaxPrefixRows(model.effectiveLmHeadRows(true), row_bytes, scratch_rows);
+            const lm_head_rows = model.effectiveLmHeadRows(true);
+            const full_resident_rows = directLmHeadQ4_0FullResidentRows(boundary, q40.len, lm_head_rows, row_bytes, state.logits.len);
+            const rows = if (full_resident_rows != 0)
+                full_resident_rows
+            else
+                directLmHeadQ4_0ArgmaxPrefixRows(lm_head_rows, row_bytes, scratch_rows);
             if (rows > 0) {
                 const bytes = @as(usize, rows) * row_bytes;
                 if (bytes <= q40.len) {
@@ -1866,11 +1888,13 @@ fn generateScalarHybrid(
                         break :resident_err null;
                     };
                     if (direct_lm_head_q4_0_resident) |resident| {
-                        log.info("M1 AMDGPU CS direct LM-head Q4_0 resident prefix staged: rows={d} cols={d} bytes={d} input_bo_off=0x{x}", .{
+                        log.info("M1 AMDGPU CS direct LM-head Q4_0 resident rows staged: rows={d} cols={d} bytes={d} residency={s} weight_va=0x{x} full_lm_head={d}", .{
                             resident.rows,
                             resident.cols,
                             resident.bytes,
-                            resident.weight_off,
+                            @tagName(resident.memory),
+                            resident.weight_va,
+                            @intFromBool(resident.rows == lm_head_rows),
                         });
                     }
                 }
@@ -1898,6 +1922,14 @@ fn generateScalarHybrid(
             log.info("M1 AMDGPU CS direct LM-head prefix decode cadence: first generated token and every {d} generated tokens", .{direct_lm_head_decode_cadence});
         }
         log.info("M1 AMDGPU CS direct LM-head prefix row cap: {d} rows", .{directLmHeadQ4_0ArgmaxPrefixRowsLimit()});
+        if (direct_lm_head_q4_0_resident) |resident| {
+            if (resident.rows == model.effectiveLmHeadRows(true)) {
+                log.info("M1 AMDGPU CS direct LM-head full-resident validation enabled: first decode token consumes full GPU Q4_0 LM-head rows={d} residency={s}", .{
+                    resident.rows,
+                    @tagName(resident.memory),
+                });
+            }
+        }
         if (direct_router_decode_enabled) {
             if (direct_router_decode_cadence == 0) {
                 log.info("M1 AMDGPU CS direct router execution enabled: one full router row-range consumed per decode token", .{});
@@ -1905,7 +1937,7 @@ fn generateScalarHybrid(
                 log.info("M1 AMDGPU CS direct router execution enabled: one full router row-range consumed every {d} decode tokens", .{direct_router_decode_cadence});
             }
         } else {
-            log.info("M1 AMDGPU CS direct router execution disabled by ZINC_RT_DIRECT_ROUTER_DECODE=0", .{});
+            log.info("M1 AMDGPU CS direct router execution disabled by default; set ZINC_RT_DIRECT_ROUTER_DECODE=1 for periodic routing validation", .{});
         }
         log.info("M1 AMDGPU CS direct router Q8_0 row-range trust_after_successes={d}", .{
             state.direct_router_row_range_trust_after_successes,
@@ -2000,7 +2032,13 @@ fn generateScalarHybrid(
     var position: u32 = @intCast(prompt_tokens.len);
     while (generated.items.len < effective_max_tokens and next_token != eos_token_id) : (position += 1) {
         const track_full_decode_slice = direct_decode_slice_enabled and shouldTrackDirectDecodeModelSlice(generated.items.len, direct_decode_slice_cadence);
-        const track_lm_head_decode_slice = shouldTrackDirectLmHeadDecode(generated.items.len, track_full_decode_slice, direct_lm_head_decode_cadence);
+        const track_full_resident_lm_head = if (direct_lm_head_q4_0_resident) |resident|
+            resident.rows == model.effectiveLmHeadRows(true) and
+                state.direct_lm_head_full_argmax_successes == 0 and
+                !track_full_decode_slice
+        else
+            false;
+        const track_lm_head_decode_slice = track_full_resident_lm_head or shouldTrackDirectLmHeadDecode(generated.items.len, track_full_decode_slice, direct_lm_head_decode_cadence);
         const direct_decode_tracking: ?DirectComputeTracking = if ((track_full_decode_slice or track_lm_head_decode_slice) and token_boundary != null)
             .{
                 .boundary = token_boundary.?,
@@ -2068,7 +2106,7 @@ fn generateScalarHybrid(
         .real_model_slice = real_model_slice,
         .direct_decode_model_slices = direct_decode_model_slices,
         .direct_compute_token = direct_compute_token,
-        .consumed_gpu_model_value = consumed_gpu_model_value,
+        .consumed_gpu_model_value = consumed_gpu_model_value or real_model_slice,
         .direct_model_value_bits = direct_model_value_bits,
         .benchmark_shortcuts = .{
             .decode_moe_topk_zero = decode_moe_topk_zero,
@@ -2140,8 +2178,16 @@ fn generateScalarDense(
     if (prompt_tokens.len > 0) {
         direct_prompt0_token = try directBoundaryToken(token_boundary, prompt_tokens[0], &direct_token_boundary_copies);
     }
+    const direct_prefill_slice_enabled = directPrefillModelSliceEnabled();
+    const direct_decode_slice_enabled = directDecodeModelSliceEnabled();
+    const direct_decode_slice_cadence = directDecodeModelSliceCadence();
+    const direct_lm_head_decode_cadence = directLmHeadDecodeCadence();
+    const needs_direct_final_norm_probe = direct_prefill_slice_enabled or direct_decode_slice_enabled;
     var direct_model_ops: u32 = 0;
-    const direct_final_norm_weight0 = try directModelFinalNormWeight0(token_boundary, model, &direct_model_ops);
+    const direct_final_norm_weight0 = if (needs_direct_final_norm_probe)
+        try directModelFinalNormWeight0(token_boundary, model, &direct_model_ops)
+    else
+        null;
     const direct_model_value_bits: u32 = if (direct_final_norm_weight0) |w| @bitCast(w) else 0;
     if (direct_model_ops > 0) {
         log.info("M1 AMDGPU CS dense direct model value enabled: output_norm.weight[0] COPY_DATA bits=0x{x}", .{direct_model_value_bits});
@@ -2153,10 +2199,6 @@ fn generateScalarDense(
     var real_model_slice = false;
     var direct_decode_model_slices: u32 = 0;
     var direct_compute_token: u32 = 0;
-    const direct_prefill_slice_enabled = directPrefillModelSliceEnabled();
-    const direct_decode_slice_enabled = directDecodeModelSliceEnabled();
-    const direct_decode_slice_cadence = directDecodeModelSliceCadence();
-    const direct_lm_head_decode_cadence = directLmHeadDecodeCadence();
     if (token_boundary != null) {
         if (direct_prefill_slice_enabled) {
             log.info("M1 AMDGPU CS dense direct prefill model-slice validation enabled for the final prompt token", .{});
@@ -2274,7 +2316,7 @@ fn generateScalarDense(
         .real_model_slice = real_model_slice,
         .direct_decode_model_slices = direct_decode_model_slices,
         .direct_compute_token = direct_compute_token,
-        .consumed_gpu_model_value = consumed_gpu_model_value,
+        .consumed_gpu_model_value = consumed_gpu_model_value or real_model_slice,
         .direct_model_value_bits = direct_model_value_bits,
         .benchmark_shortcuts = .{
             .decode_moe_topk_zero = false,
@@ -2526,12 +2568,30 @@ fn consumeDirectLogitsArgmaxRowRange(
 
 const direct_lm_head_q4_0_best_row_tolerance: f32 = 0.05;
 const direct_lm_head_q4_0_parallel_chunk_rows: u32 = 64;
-// Keep the default consumed LM-head proof to one parallel chunk. Broader
-// prefixes remain opt-in validation; recurring/staged CS slices are already
-// measured-dead for throughput on the RDNA4 node.
-const direct_lm_head_q4_0_argmax_prefix_rows_default: u32 = direct_lm_head_q4_0_parallel_chunk_rows;
+// Exercise the resident grid-over-rows kernel by default on the consumed
+// LM-head proof. This keeps one CS fence/dispatch while proving multi-WG
+// `ttmp9` row selection on a token-affecting model value.
+const direct_lm_head_q4_0_argmax_prefix_rows_default: u32 = 256;
 const direct_lm_head_q4_0_selected_window_rows: u32 = 64;
 const direct_lm_head_q4_0_argmax_max_weight_bytes: usize = 5 * 1024 * 1024;
+
+fn directLmHeadQ4_0FullResidentRows(
+    boundary: *const zinc_rt.cs.TokenBoundary,
+    q4_0_raw_len: usize,
+    lm_head_rows: u32,
+    row_bytes: usize,
+    logits_rows: usize,
+) u32 {
+    if (!directLmHeadQ4_0FullResidentEnabled()) return 0;
+    if (lm_head_rows == 0 or lm_head_rows % direct_lm_head_q4_0_parallel_chunk_rows != 0) return 0;
+    if (row_bytes == 0) return 0;
+    if (logits_rows < lm_head_rows) return 0;
+    if (boundary.dmmvOutputRowsCapacity() < lm_head_rows) return 0;
+    const bytes = @as(usize, lm_head_rows) * row_bytes;
+    if (q4_0_raw_len < bytes) return 0;
+    if (bytes > boundary.residentDmmvQ4_0CapacityBytes()) return 0;
+    return lm_head_rows;
+}
 
 fn offsetScoredToken(token: ScoredToken, offset: u32) ScoredToken {
     return .{
@@ -2610,7 +2670,18 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     if (row_bytes == 0) return null;
     const max_rows_by_input: u32 = @intCast(direct_lm_head_q4_0_argmax_max_weight_bytes / row_bytes);
     const scratch_rows: u32 = @intCast(@min(state.row_scratch.len, @as(usize, std.math.maxInt(u32))));
-    const gpu_rows = directLmHeadQ4_0ArgmaxPrefixRows(lm_head_rows, row_bytes, scratch_rows);
+    var gpu_rows = directLmHeadQ4_0ArgmaxPrefixRows(lm_head_rows, row_bytes, scratch_rows);
+    var full_resident_argmax = false;
+    if (tracking.lm_head_q4_0_resident) |resident| {
+        if (resident.rows == lm_head_rows and
+            resident.cols == cols and
+            resident.row_bytes == row_bytes and
+            state.logits.len >= @as(usize, lm_head_rows))
+        {
+            gpu_rows = lm_head_rows;
+            full_resident_argmax = true;
+        }
+    }
     if (gpu_rows == 0) return null;
 
     const gpu_rows_usize: usize = @intCast(gpu_rows);
@@ -2619,11 +2690,20 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
 
     var selection: ArgmaxTop2Result = .{};
     var gpu_chunks: u32 = 1;
+    var gpu_dispatch_ops: u32 = 1;
     var cpu_tail_selection: ?ArgmaxTop2Result = null;
+    var cpu_full_selection: ?ArgmaxTop2Result = null;
     var used_resident_weights = false;
+    var used_resident_grid = false;
     if (gpu_rows % direct_lm_head_q4_0_parallel_chunk_rows == 0 and gpu_rows >= direct_lm_head_q4_0_parallel_chunk_rows) {
         gpu_chunks = gpu_rows / direct_lm_head_q4_0_parallel_chunk_rows;
-        const gpu_logits = state.row_scratch[0..gpu_rows_usize];
+        gpu_dispatch_ops = gpu_chunks;
+        const use_logits_output = full_resident_argmax and gpu_rows_usize > state.row_scratch.len;
+        if (!use_logits_output and state.row_scratch.len < gpu_rows_usize) return null;
+        const gpu_logits = if (use_logits_output)
+            state.logits[0..gpu_rows_usize]
+        else
+            state.row_scratch[0..gpu_rows_usize];
         const pending = if (tracking.lm_head_only and tracking.lm_head_q4_0_resident != null and
             tracking.lm_head_q4_0_resident.?.rows == gpu_rows and
             tracking.lm_head_q4_0_resident.?.cols == cols and
@@ -2631,20 +2711,30 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
             tracking.lm_head_q4_0_resident.?.bytes == gpu_weight_bytes)
         resident_blk: {
             used_resident_weights = true;
-            break :resident_blk tracking.boundary.beginDmmvQ4_0RowRangeParallelChunksResident(
+            used_resident_grid = true;
+            gpu_dispatch_ops = 1;
+            break :resident_blk tracking.boundary.beginDmmvQ4_0ResidentGridResident(
                 state.norm,
                 tracking.lm_head_q4_0_resident.?,
             ) catch |err| {
-                used_resident_weights = false;
-                log.warn("M1 AMDGPU CS direct LM-head Q4_0 resident argmax-prefix unavailable ({s}); retrying staged weights", .{@errorName(err)});
-                break :resident_blk tracking.boundary.beginDmmvQ4_0RowRangeParallelChunks(
+                used_resident_grid = false;
+                gpu_dispatch_ops = gpu_chunks;
+                log.warn("M1 AMDGPU CS direct LM-head Q4_0 resident-grid argmax-prefix unavailable ({s}); retrying resident chunk dispatches", .{@errorName(err)});
+                break :resident_blk tracking.boundary.beginDmmvQ4_0RowRangeParallelChunksResident(
                     state.norm,
-                    q4_0_raw[0..gpu_weight_bytes],
-                    gpu_rows,
-                    cols,
-                ) catch |stage_err| {
-                    log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix parallel unavailable ({s}); selected token remains host-computed", .{@errorName(stage_err)});
-                    return null;
+                    tracking.lm_head_q4_0_resident.?,
+                ) catch |chunk_err| {
+                    used_resident_weights = false;
+                    log.warn("M1 AMDGPU CS direct LM-head Q4_0 resident argmax-prefix unavailable ({s}); retrying staged weights", .{@errorName(chunk_err)});
+                    break :resident_blk tracking.boundary.beginDmmvQ4_0RowRangeParallelChunks(
+                        state.norm,
+                        q4_0_raw[0..gpu_weight_bytes],
+                        gpu_rows,
+                        cols,
+                    ) catch |stage_err| {
+                        log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix parallel unavailable ({s}); selected token remains host-computed", .{@errorName(stage_err)});
+                        return null;
+                    };
                 };
             };
         } else tracking.boundary.beginDmmvQ4_0RowRangeParallelChunks(
@@ -2656,6 +2746,9 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
             log.warn("M1 AMDGPU CS direct LM-head Q4_0 argmax-prefix parallel unavailable ({s}); selected token remains host-computed", .{@errorName(err)});
             return null;
         };
+        if (!used_resident_grid and !used_resident_weights) {
+            gpu_dispatch_ops = gpu_chunks;
+        }
         if (gpu_rows < lm_head_rows) {
             const cpu_rows = lm_head_rows - gpu_rows;
             const cpu_off = @as(usize, gpu_rows) * row_bytes;
@@ -2665,6 +2758,11 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
                 return null;
             }
             cpu_tail_selection = argmaxMatvecRawTop2(state.pool, q4_0_raw[cpu_off..][0..cpu_bytes], .q4_0, state.norm, cpu_rows, state.row_scratch) catch |err| {
+                pending.waitDiscard();
+                return err;
+            };
+        } else if (full_resident_argmax and state.direct_lm_head_full_argmax_successes == 0) {
+            cpu_full_selection = argmaxMatvecRawTop2(state.pool, q4_0_raw[0..gpu_weight_bytes], .q4_0, state.norm, gpu_rows, state.row_scratch) catch |err| {
                 pending.waitDiscard();
                 return err;
             };
@@ -2681,6 +2779,7 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
             selection.offer(@intCast(i), gpu_value);
         }
     } else {
+        gpu_dispatch_ops = 1;
         const prefix_result = tracking.boundary.dmmvQ4_0ArgmaxRowRange(
             state.norm,
             q4_0_raw[0..gpu_weight_bytes],
@@ -2711,6 +2810,20 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         });
         return null;
     }
+    if (cpu_full_selection) |cpu_selection| {
+        const cpu_gpu_top_delta = @abs(cpu_selection.best.value - selection.best.value);
+        if (cpu_selection.best.index != selection.best.index or cpu_gpu_top_delta > direct_lm_head_q4_0_best_row_tolerance) {
+            log.warn("M1 AMDGPU CS direct LM-head Q4_0 full-resident argmax mismatch: cpu=({d},{d:.6}) gpu=({d},{d:.6}) abs_delta={d:.6}; selected token remains host-computed", .{
+                cpu_selection.best.index,
+                cpu_selection.best.value,
+                selection.best.index,
+                selection.best.value,
+                cpu_gpu_top_delta,
+            });
+            return null;
+        }
+        state.direct_lm_head_full_argmax_successes += 1;
+    }
 
     if (gpu_rows < lm_head_rows) {
         const cpu_rows = lm_head_rows - gpu_rows;
@@ -2723,11 +2836,13 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
     }
 
     const selected_from_gpu_prefix = selection.best.index < gpu_rows;
-    const selected_source: []const u8 = if (selected_from_gpu_prefix)
+    const selected_source: []const u8 = if (full_resident_argmax and gpu_rows == lm_head_rows)
+        "gpu_full_vocab"
+    else if (selected_from_gpu_prefix)
         "gpu_prefix"
     else
         "cpu_rows";
-    tracking.ops.* += gpu_chunks;
+    tracking.ops.* += gpu_dispatch_ops;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
     tracking.real_model_slice.* = true;
@@ -2735,7 +2850,14 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
         if (tracking.decode_model_slices) |slices| slices.* += gpu_chunks;
     }
     if (tracking.selected_token) |token| token.* = selection.best.index;
-    const op_name = if (used_resident_weights) "lm_head_q4_0_argmax_prefix_resident" else "lm_head_q4_0_argmax_prefix";
+    const op_name = if (full_resident_argmax and used_resident_grid)
+        "lm_head_q4_0_full_vocab_resident_grid"
+    else if (used_resident_grid)
+        "lm_head_q4_0_argmax_prefix_resident_grid"
+    else if (used_resident_weights)
+        "lm_head_q4_0_argmax_prefix_resident"
+    else
+        "lm_head_q4_0_argmax_prefix";
     log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op={s} phase={s} gpu_rows={d} cols={d} chunks={d} selected_source={s} token={d} score={d:.6} gpu_prefix_best=({d},{d:.6}) abs_delta={d:.6}", .{
         tracking.ops.*,
         op_name,
@@ -2797,7 +2919,8 @@ fn consumeDirectLmHeadQ4_0ArgmaxPrefix(
 }
 
 fn directLmHeadQ4_0SelectedSourceHasGpuScore(selected_source: []const u8) bool {
-    return std.mem.eql(u8, selected_source, "gpu_prefix") or
+    return std.mem.eql(u8, selected_source, "gpu_full_vocab") or
+        std.mem.eql(u8, selected_source, "gpu_prefix") or
         std.mem.eql(u8, selected_source, "gpu_selected_window");
 }
 
@@ -5788,6 +5911,7 @@ fn directRouterSupportsRowRange(tensor_type: gguf.GGMLType, cols: u32) bool {
 const DirectRouterDispatchResult = struct {
     used_parallel64: bool = false,
     chunks: u32 = 1,
+    ops: u32 = 1,
 };
 
 fn canUseDirectRouterParallel64(tensor_type: gguf.GGMLType, rows: u32) bool {
@@ -5835,25 +5959,33 @@ fn dispatchDirectRouterRowRange(
         },
         .q8_0 => {
             if (canUseDirectRouterQ8_0Parallel64(rows)) {
-                const half_bytes = @as(usize, direct_router_parallel64_half_rows) * row_bytes;
-                var row_start: u32 = 0;
-                while (row_start < rows) : (row_start += direct_router_parallel64_rows) {
-                    const chunk_off = @as(usize, row_start) * row_bytes;
-                    const second_off = chunk_off + half_bytes;
-                    const out_start: usize = @intCast(row_start);
-                    try boundary.dmmvQ8_0TwoRowRangesParallel64(
-                        input,
-                        weights[chunk_off..][0..half_bytes],
-                        direct_router_parallel64_half_rows,
-                        weights[second_off..][0..half_bytes],
-                        direct_router_parallel64_half_rows,
-                        cols,
-                        output[out_start..][0..direct_router_parallel64_rows],
-                    );
-                }
+                boundary.dmmvQ8_0RowRangeParallelChunks(input, weights, rows, cols, output) catch {
+                    const half_bytes = @as(usize, direct_router_parallel64_half_rows) * row_bytes;
+                    var row_start: u32 = 0;
+                    while (row_start < rows) : (row_start += direct_router_parallel64_rows) {
+                        const chunk_off = @as(usize, row_start) * row_bytes;
+                        const second_off = chunk_off + half_bytes;
+                        const out_start: usize = @intCast(row_start);
+                        try boundary.dmmvQ8_0TwoRowRangesParallel64(
+                            input,
+                            weights[chunk_off..][0..half_bytes],
+                            direct_router_parallel64_half_rows,
+                            weights[second_off..][0..half_bytes],
+                            direct_router_parallel64_half_rows,
+                            cols,
+                            output[out_start..][0..direct_router_parallel64_rows],
+                        );
+                    }
+                    return .{
+                        .used_parallel64 = true,
+                        .chunks = rows / direct_router_parallel64_rows,
+                        .ops = rows / direct_router_parallel64_rows,
+                    };
+                };
                 return .{
                     .used_parallel64 = true,
                     .chunks = rows / direct_router_parallel64_rows,
+                    .ops = 1,
                 };
             }
             try boundary.dmmvQ8_0RowRange(input, weights, rows, cols, output);
@@ -5961,7 +6093,7 @@ fn consumeDirectRouterRowRangePrimary(
 
     state.direct_router_row_range_done = true;
     state.direct_router_row_range_successes += 1;
-    tracking.ops.* += dispatch_result.chunks;
+    tracking.ops.* += dispatch_result.ops;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
     tracking.real_model_slice.* = true;
@@ -6058,7 +6190,7 @@ fn consumeDirectRouterRowRange(
     @memcpy(state.router_logits[0..rows_usize], gpu_logits);
     state.direct_router_row_range_done = true;
     const full_coverage = directRouterCanOverwriteAllLogits(cfg.n_experts, rows);
-    tracking.ops.* += dispatch_result.chunks;
+    tracking.ops.* += dispatch_result.ops;
     mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
     tracking.consumed.* = true;
     tracking.real_model_slice.* = true;
@@ -10195,7 +10327,7 @@ test "emitDecodeGraphForShape treats dense models as all attention" {
     try std.testing.expectEqual(@as(u32, 0), summary.moe_layers);
 }
 
-test "direct decode model slice policy defaults to LM-head plus router proofs" {
+test "direct decode model slice policy defaults to LM-head proof only" {
     try std.testing.expect(!directDecodeModelSliceEnabledForEnv(null, null));
     try std.testing.expect(directDecodeModelSliceEnabledForEnv("1", null));
     try std.testing.expect(directDecodeModelSliceEnabledForEnv("true", null));
@@ -10219,12 +10351,18 @@ test "direct decode model slice policy defaults to LM-head plus router proofs" {
     try std.testing.expectEqual(@as(u32, 4), directLmHeadDecodeCadenceForEnv("4"));
     try std.testing.expectEqual(@as(u32, 0), directLmHeadDecodeCadenceForEnv("0"));
     try std.testing.expectEqual(@as(u32, direct_lm_head_decode_cadence_default), directLmHeadDecodeCadenceForEnv("bad"));
-    try std.testing.expect(directRouterDecodeEnabledForEnv(null));
+    try std.testing.expect(!directLmHeadQ4_0FullResidentEnabledForEnv(null));
+    try std.testing.expect(directLmHeadQ4_0FullResidentEnabledForEnv("1"));
+    try std.testing.expect(directLmHeadQ4_0FullResidentEnabledForEnv("true"));
+    try std.testing.expect(!directLmHeadQ4_0FullResidentEnabledForEnv("0"));
+    try std.testing.expect(!directLmHeadQ4_0FullResidentEnabledForEnv("false"));
+    try std.testing.expect(!directLmHeadQ4_0FullResidentEnabledForEnv("bad"));
+    try std.testing.expect(!directRouterDecodeEnabledForEnv(null));
     try std.testing.expect(directRouterDecodeEnabledForEnv("1"));
     try std.testing.expect(directRouterDecodeEnabledForEnv("true"));
     try std.testing.expect(!directRouterDecodeEnabledForEnv("0"));
     try std.testing.expect(!directRouterDecodeEnabledForEnv("false"));
-    try std.testing.expect(directRouterDecodeEnabledForEnv("bad"));
+    try std.testing.expect(!directRouterDecodeEnabledForEnv("bad"));
     try std.testing.expectEqual(@as(u32, direct_router_decode_cadence_default), directRouterDecodeCadenceForEnv(null));
     try std.testing.expectEqual(@as(u32, 16), directRouterDecodeCadenceForEnv("16"));
     try std.testing.expectEqual(@as(u32, 0), directRouterDecodeCadenceForEnv("0"));
@@ -10280,6 +10418,7 @@ test "direct LM-head Q4_0 selected window covers sampled row" {
 }
 
 test "direct LM-head Q4_0 selected source identifies GPU scores" {
+    try std.testing.expect(directLmHeadQ4_0SelectedSourceHasGpuScore("gpu_full_vocab"));
     try std.testing.expect(directLmHeadQ4_0SelectedSourceHasGpuScore("gpu_prefix"));
     try std.testing.expect(directLmHeadQ4_0SelectedSourceHasGpuScore("gpu_selected_window"));
     try std.testing.expect(!directLmHeadQ4_0SelectedSourceHasGpuScore("cpu_rows"));
@@ -10297,7 +10436,7 @@ test "direct LM-head Q4_0 prefix stays chunk-aligned and bounded" {
     const row_bytes = rowBytesForType(.q4_0, qwen_hidden_dim);
     try std.testing.expect(@as(usize, direct_lm_head_q4_0_argmax_prefix_rows_default) * row_bytes <= direct_lm_head_q4_0_argmax_max_weight_bytes);
     try std.testing.expectEqual(
-        @as(u32, direct_lm_head_q4_0_parallel_chunk_rows),
+        @as(u32, 256),
         directLmHeadQ4_0ArgmaxPrefixRowsForLimit(4096, row_bytes, 4096, direct_lm_head_q4_0_argmax_prefix_rows_default),
     );
     try std.testing.expectEqual(

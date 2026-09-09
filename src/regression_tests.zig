@@ -71,7 +71,7 @@ test "Metal prefillBatched gates on env flag and supported architecture" {
 
 test "Metal prefillBatched validate path diffs last-token logits within 1e-3" {
     const src = @embedFile("compute/forward_metal.zig");
-    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "if (mode == .validate)", 20000);
+    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "if (mode == .validate)", 22000);
     try expectContainsNear(src, "if (mode == .validate)", "const tol: f32 = 1e-3;", 1500);
     try expectContainsNear(src, "if (mode == .validate)", "try self.prefillBatch(state, prompt_tokens);", 1500);
 }
@@ -111,7 +111,7 @@ test "Metal prefillBatched routes Q8 KV cache through flash_attn_batched_q8" {
 test "Metal prefillBatched supports prefix reuse by extending KV at state.position" {
     const src = @embedFile("compute/forward_metal.zig");
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "const position_base: u32 = state.position;", 2600);
-    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "return error.KvStateNotAvailable;", 2000);
+    try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "return error.KvStateNotAvailable;", 2400);
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "const kv_len = position_base + n_tokens;", 12000);
     try expectContainsNear(src, "pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {", "self.position = position_base + n_tokens;", 20000);
 }
@@ -567,9 +567,9 @@ test "Vulkan Qwen A3B SSM Q8 DP4a keeps RDNA crossover and no-padding policy" {
     try expectNotContains(prep_src, "qwenA3bPrefillPaddedTokenCount");
 }
 
-test "Vulkan Qwen A3B production tail pipeline remains opt-in" {
+test "Vulkan Qwen A3B production tail pipeline is short-prompt gated" {
     const src = @embedFile("compute/forward.zig");
-    try expectContainsNear(src, "fn qwen36DensePrefillTailPipelineEnabled", "if (self.isQwen36A3bMoePrefillModel()) return false;", 1000);
+    try expectContainsNear(src, "fn qwen36DensePrefillTailPipelineEnabled", "return n_tokens >= 16 and n_tokens <= qwen36_a3b_tail_pipeline_max_tokens;", 1200);
     try expectContainsNear(src, "fn prefillA3bProduction", "const pipeline_tail = self.qwen36DensePrefillTailPipelineEnabled(n_tokens);", 9000);
 
     const start = std.mem.indexOf(u8, src, "fn prefillA3bProduction") orelse return error.TestExpectedEqual;
@@ -1687,6 +1687,82 @@ test "Vulkan forward uses GEGLU activation for Gemma architecture" {
     try expectContains(src, "self.model.config.architecture == .gemma");
     // All MoE/FFN activation calls must use dispatchFfnActivation, not dispatchSwiglu directly
     try expectNotContains(src, "try self.dispatchSwiglu(");
+}
+
+test "ROCm lightweight commands are default-on and retain an explicit fence" {
+    const dense = @embedFile("compute/forward_cuda.zig");
+    const gemma = @embedFile("compute/forward_cuda_gemma.zig");
+    inline for (.{ dense, gemma }) |src| {
+        try expectContains(src, "ZINC_ROCM_LIGHT_COMMANDS");
+        try expectContains(src, "envFlag(\"ZINC_ROCM_LIGHT_COMMANDS\", true)");
+        try expectContainsNear(src, "if (self.lightweight_rocm_commands)", "c.releaseCompleted();", 700);
+        try expectContainsNear(src, "fn waitPending", "fence.commitAndWait();", 700);
+    }
+}
+
+test "ROCm dense Qwen decode keeps the measured Q4 and attention fast paths" {
+    const forward = @embedFile("compute/forward_cuda.zig");
+    const kernels = @embedFile("shaders/cuda/kernels.cu");
+
+    // A fused FFN block owns exactly one output row. Splitting a block across
+    // rows while retaining a block-wide reduction silently mixes those rows.
+    try expectContainsNear(kernels, "void dmmv_q4k_gate_up_swiglu(", "const unsigned row = blockIdx.x;", 500);
+    try expectContainsNear(kernels, "void dmmv_q4k_gate_up_swiglu(", "for (unsigned sb = grp; sb < bpr; sb += ngrp)", 1100);
+
+    // Q4_K metadata work is split across gate/up lanes in the packed-Q8 fused
+    // path, with quant words prefetched before the metadata load. Decode
+    // attention carries independent score and value accumulators to hide RDNA4
+    // FMA latency.
+    try expectContainsNear(kernels, "void dmmv_q4k_gate_up_swiglu_q8(", "const unsigned gate_qs0 = gate[blk + q_word];", 1800);
+    try expectContainsNear(kernels, "void dmmv_q4k_gate_up_swiglu_q8(", "const unsigned* scale_matrix = (itid & 4u) != 0u ? up : gate;", 2300);
+    try expectContainsNear(forward, "var gu_silu = gu;", "gu_silu.acc_mode = 0;", 120);
+    try expectContainsNear(kernels, "void naive_attention(", "float acc4[8] = {};", 1800);
+    try expectContainsNear(kernels, "void naive_attention(", "acc7 = 0.0f;", 4200);
+
+    // Dense ROCm decode keeps normalized activations packed across compatible
+    // projections, and folds attention/SSM activation work into those packs.
+    try expectContains(forward, "fn decodePreparedQ8Eligible(");
+    try expectContainsNear(forward, "fn attentionLayerSlot(", "self.pipes.sigmoid_mul_quant_q8", 8500);
+    try expectContainsNear(forward, "fn ssmLayerSlot(", "self.pipes.ssm_gated_norm_quant_q8", 8500);
+    try expectContains(kernels, "void sigmoid_mul_quant_q8_0(");
+    try expectContains(kernels, "void ssm_gated_norm_quant_q8_0(");
+    try expectContainsNear(forward, "fn ssmLayerSlot(", "self.pipes.ssm_conv1d_prepare", 7000);
+    try expectContainsNear(forward, "fn deltaNetDecodeDispatch(", "if (!prepared)", 1200);
+    try expectContains(kernels, "void ssm_conv1d_prepare(");
+
+    // HIP's native half conversions avoid the integer normalization sequence
+    // in every quantized matvec, and one-wave Q6 down projections avoid the
+    // generic shared-memory block reduction.
+    try expectContainsNear(kernels, "float zinc_half_to_float", "return __half2float(__ushort_as_half(h));", 500);
+    try expectContainsNear(kernels, "unsigned short zinc_float_to_half", "return __half_as_ushort(__float2half_rn(x));", 500);
+    try expectContainsNear(kernels, "void dmmv_q6k_q8_fast(", "blockDim.x == 32u ? zinc_warp_reduce_sum(sum)", 3200);
+
+    // The measured single-reduction state scan is the ROCm default, with the
+    // environment variable above it retaining the explicit diagnostic opt-out.
+    try expectContainsNear(forward, "const decode_ssm_fast = std.posix.getenv(\"ZINC_ROCM_DECODE_SSM_FAST\")", "else true;", 500);
+}
+
+test "ROCm command completion events are allocated only for async waits" {
+    const src = @embedFile("rocm/rocm_shim.c");
+    const begin = std.mem.indexOf(u8, src, "CudaCmd* cuda_begin_command") orelse return error.TestExpectedEqual;
+    const begin_end = std.mem.indexOfPos(u8, src, begin, "void cuda_dispatch") orelse return error.TestExpectedEqual;
+    try expectNotContains(src[begin..begin_end], "hipEventCreateWithFlags");
+    try expectContainsNear(src, "void cuda_commit_async", "hipEventCreateWithFlags", 500);
+    try expectContainsNear(src, "void cuda_commit_and_wait", "hipStreamSynchronize", 400);
+}
+
+test "ROCm Gemma MoE fusions preserve activation and norm ABI boundaries" {
+    const dense = @embedFile("compute/forward_cuda.zig");
+    const gemma = @embedFile("compute/forward_cuda_gemma.zig");
+    const kernels = @embedFile("shaders/cuda/kernels.cu");
+    const experts_abi = "n_used: u32, base: u32 = 0, fuse_activation: u32 = 0";
+    try expectContains(dense, experts_abi);
+    try expectContains(gemma, experts_abi);
+    try expectContains(kernels, "n_used, base, fuse_activation;");
+    try expectContainsNear(gemma, "cmd.dispatch(&self.pipes.moe_norm_combine_tail", "d.n_embd * @sizeOf(f32)", 600);
+    try expectContainsNear(kernels, "extern \"C\" __global__ void moe_norm_combine_tail", "extern __shared__ float normed_moe[];", 700);
+    try expectContainsNear(kernels, "extern __shared__ float normed_moe[];", "normed_moe[i] = w_pn2[i] * (moe[i] * rinv1);", 900);
+    try expectContains(kernels, "if (pc.fuse_activation != 0u)");
 }
 
 test "Gemma 4 26B-A4B MoE catalog entry has correct download URL with UD prefix" {
