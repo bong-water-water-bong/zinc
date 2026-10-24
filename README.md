@@ -10,6 +10,7 @@ command line, a browser chat, a model manager, and an OpenAI-compatible API.
 
 <p>
   <a href="https://github.com/zolotukhin/zinc/actions/workflows/test.yml"><img src="https://github.com/zolotukhin/zinc/actions/workflows/test.yml/badge.svg" alt="CI status"></a>
+  <a href=".zig-version"><img src="https://img.shields.io/badge/Zig-0.17.0-F7A41D?logo=zig&logoColor=white" alt="Zig 0.17.0"></a>
   <a href="https://zolotukhin.ai/zinc"><img src="https://img.shields.io/badge/website-zolotukhin.ai%2Fzinc-d35400" alt="ZINC website"></a>
   <a href="https://discord.gg/QRUgWH2aGV"><img src="https://img.shields.io/badge/Discord-Join%20ZINC-5865F2?logo=discord&logoColor=white" alt="ZINC Discord"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
@@ -65,11 +66,14 @@ The chart above is regenerated from that file, never hand-edited.
 
 ## Get running
 
-ZINC uses Zig 0.17.0, pinned in `.zig-version`. `scripts/zig.sh` downloads and
-verifies the pinned compiler without replacing your system installation. Linux Vulkan builds also need `glslc` and a
-Vulkan loader; ROCm builds need a working ROCm installation.
+ZINC builds with **Zig 0.17.0**, pinned in [`.zig-version`](.zig-version).
+The [`scripts/zig.sh`](scripts/zig.sh) wrapper downloads and verifies that
+compiler without replacing your system installation. Linux Vulkan builds also
+need `glslc` and a Vulkan loader; ROCm builds need a working ROCm installation.
 
-See the [Zig 0.17 migration and RDNA validation](docs/ZIG_0_17_MIGRATION.md) for measured gains and test coverage.
+The [migration report](docs/ZIG_0_17_MIGRATION.md) and
+[performance follow-up](docs/ZIG_0_17_BPE.md) cover the port, comparisons with
+Zig 0.15.2 on RDNA4, and correctness checks.
 
 ```bash
 git clone https://github.com/zolotukhin/zinc.git
