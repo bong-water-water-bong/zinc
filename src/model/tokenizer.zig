@@ -855,9 +855,14 @@ pub const Tokenizer = struct {
                 const chunk = nextGemma4PretokenChunk(text, &pos);
                 if (chunk.len == 0) break;
 
-                if (self.token_to_id.get(chunk)) |id| {
-                    try tokens.append(self.allocator, id);
-                    continue;
+                // The reference's direct-vocabulary shortcut is only for
+                // newline runs. Other whole-chunk vocabulary entries still
+                // require their BPE merges (notably ordinary Gemma </s>).
+                if (chunk[0] == '\n') {
+                    if (self.token_to_id.get(chunk)) |id| {
+                        try tokens.append(self.allocator, id);
+                        continue;
+                    }
                 }
 
                 const chunk_tokens = try self.encodeChunk(chunk);
@@ -2941,6 +2946,27 @@ test "encode gemma4_bpe keeps newline runs as direct tokens when present" {
     defer std.testing.allocator.free(tokens);
 
     try std.testing.expectEqualSlices(u32, &.{0}, tokens);
+}
+
+test "encode gemma4_bpe applies merges to ordinary whole vocabulary chunks" {
+    const allocator = std.testing.allocator;
+    const vocab = [_][]const u8{ "<", "/", "s", ">", "</s>" };
+    var tok = Tokenizer{
+        .vocab = &vocab,
+        .token_to_id = std.StringHashMap(u32).init(allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 0,
+        .prepend_bos = false,
+        .pretokenizer = .gemma4_bpe,
+        .allocator = allocator,
+    };
+    defer tok.token_to_id.deinit();
+    for (vocab, 0..) |piece, i| try tok.token_to_id.put(piece, @intCast(i));
+    const ids = try tok.encode("</s>");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, ids);
 }
 
 test "encode gemma4_bpe merges by rank even when token scores exist" {
