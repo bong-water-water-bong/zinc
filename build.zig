@@ -617,6 +617,39 @@ pub fn build(b: *std.Build) void {
     const analyze_step = b.step("analyze-structs", "Print layouts for the generated API documentation probe");
     analyze_step.dependOn(&b.addRunArtifact(analyzer).step);
 
+    const check_tools_step = b.step("check-tools", "Compile standalone tools without opening a model or GPU");
+    const metadata_tools = .{
+        .{ "zinc-inspect-qwen-meta", "tools/inspect_qwen_meta.zig" },
+        .{ "zinc-inspect-gemma-meta", "tools/inspect_gemma_meta_tmp.zig" },
+        .{ "zinc-inspect-tokenizer-meta", "tools/inspect_tokenizer_meta_tmp.zig" },
+        .{ "zinc-inspect-tensor-dims", "tools/inspect_tensor_dims_tmp.zig" },
+    };
+    inline for (metadata_tools) |tool| {
+        const tool_mod = createModule(b, .{
+            .root_source_file = b.path(tool[1]),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        tool_mod.addImport("gguf", zinc_rt_gguf_mod);
+        const tool_exe = addExecutable(b, .{ .name = tool[0], .root_module = tool_mod });
+        check_tools_step.dependOn(&tool_exe.step);
+    }
+
+    const layouts_mod = createModule(b, .{
+        .root_source_file = b.path("src/dump_struct_layouts.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    layouts_mod.addOptions("build_options", build_options);
+    addMetalBindings(b, target, layouts_mod);
+    if (!is_macos) configureVulkanModule(b, target, layouts_mod);
+    const layouts_exe = addExecutable(b, .{ .name = "zinc-struct-layouts", .root_module = layouts_mod });
+    check_tools_step.dependOn(&layouts_exe.step);
+    b.step("dump-struct-layouts", "Print public loader and forward struct layouts")
+        .dependOn(&b.addRunArtifact(layouts_exe).step);
+
     const hot_bench_mod = createModule(b, .{
         .root_source_file = b.path("src/bench_hot_decode.zig"),
         .target = target,
@@ -661,6 +694,9 @@ pub fn build(b: *std.Build) void {
     });
     b.step("tokenize-bench", "Build the CPU-only prompt tokenization benchmark")
         .dependOn(&b.addInstallArtifact(tokenize_bench, .{}).step);
+    check_tools_step.dependOn(&tokenize_tool.step);
+    check_tools_step.dependOn(&tokenize_bench.step);
+    if (!is_macos) check_tools_step.dependOn(&hot_bench.step);
 
     // Kernel-level check for the Q5_1 route-packed MoE down projection
     // (`zig build validate-moe-cols`). Runs the shader against a CPU Q5_1
@@ -689,10 +725,28 @@ pub fn build(b: *std.Build) void {
         });
         const moe_cols_step = b.step("validate-moe-cols", "Check dmmv_q5_1_moe_cols against a CPU reference");
         moe_cols_step.dependOn(&b.addInstallArtifact(moe_cols_exe, .{}).step);
+        check_tools_step.dependOn(&moe_cols_exe.step);
         // The validator loads the installed SPIR-V, so it has to depend on the
         // shader compile/install — otherwise editing the shader and running this
         // step happily validates the previous build's .spv.
         moe_cols_step.dependOn(b.getInstallStep());
+
+        const q6k_cols_mod = createModule(b, .{
+            .root_source_file = b.path("tools/validate_q6k_moe_cols.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        q6k_cols_mod.addImport("vulkan", vulkan_mod);
+        configureVulkanModule(b, target, q6k_cols_mod);
+        const q6k_cols_exe = addExecutable(b, .{
+            .name = "zinc-validate-q6k-moe-cols",
+            .root_module = q6k_cols_mod,
+        });
+        check_tools_step.dependOn(&q6k_cols_exe.step);
+        const q6k_cols_step = b.step("validate-q6k-moe-cols", "Build the Q6_K MoE projection validator");
+        q6k_cols_step.dependOn(&b.addInstallArtifact(q6k_cols_exe, .{}).step);
+        q6k_cols_step.dependOn(b.getInstallStep());
     }
 
     // --- CUDA primitive-layer smoke (Linux/WSL2 + NVIDIA only) ---

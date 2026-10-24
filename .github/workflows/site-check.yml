@@ -1,11 +1,25 @@
 name: Site Build Check
 
 on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'site/**'
+      - 'docs/**'
+      - 'src/**'
+      - 'build.zig'
+      - '.zig-version'
+      - 'scripts/zig.sh'
+      - '.github/workflows/site-check.yml'
   pull_request:
     paths:
       - 'site/**'
       - 'docs/**'
       - 'src/**'
+      - 'build.zig'
+      - '.zig-version'
+      - 'scripts/zig.sh'
+      - '.github/workflows/site-check.yml'
 
 jobs:
   build:

@@ -141,12 +141,12 @@ Milestones:
   (`cuda_shim.h/.c`) and the **Zig wrappers** (`src/cuda/{c,device,buffer,pipeline,command}.zig`,
   mirroring `src/metal/*`) are written and pass via `smoke.c` *and* `smoke.zig`: device select
   (picks the 5090), staged buffers + H2D/D2H, NVRTC runtime compile, the buffers+push dispatch
-  ABI, sync + async (`commitAsync`/`wait`) commit, and `__dp4a`. Zig 0.15.2 is installed on the
-  box (`~/zig-0.15.2/zig`); standalone build:
-  `zig build-exe smoke.zig cuda_shim.c -I. -I/usr/local/cuda/include -lc -L/usr/local/cuda/lib64
-  -L/usr/lib/wsl/lib -lcuda -lnvrtc -rpath /usr/local/cuda/lib64`. Remaining for full integration:
-  `build.zig` `cuda` enum + `configureCudaModule` + a `zig build cuda-smoke` target, and the
-  `gpu/interface.zig` build-option selector (needs the repo cloned on the box). Minor follow-up:
+  ABI, sync + async (`commitAsync`/`wait`) commit, and `__dp4a`. Use the pinned
+  Zig 0.17.0 wrapper from the repository root:
+  `./scripts/zig.sh build cuda-smoke -Dbackend=cuda -Dshaders=false`.
+  This target builds and runs the smoke test on the designated NVIDIA host.
+  For a host-only compiler check without a GPU, use
+  `./scripts/zig.sh build check-cuda`. Minor follow-up:
   add `cuda_device_count()` to the shim to drop the noisy enumeration probe.
 - **M1 — single correct token.** `forward_cuda.zig` minimal decode for one qwen36-35b token.
   ~14 kernels (unfused reference variants), in forward order:
@@ -202,8 +202,8 @@ Milestones:
 - **Repo on the box:** ZINC is public (`https://github.com/zolotukhin/zinc`) — clone it
   read-only over HTTPS into `~/workspace`, no GitHub auth or token needed. (A token is only
   needed to push changes back from the box.)
-- **Zig 0.15.2** on the box (not installed): download the official `zig-linux-x86_64-0.15.2`
-  tarball into `~/` and add to `PATH` (no sudo; public internet works).
+- **Zig 0.17.0:** use `./scripts/zig.sh` from the repository root. It downloads
+  and verifies the pinned release when needed, without replacing the system compiler.
 - **Device order:** set `CUDA_DEVICE_ORDER=PCI_BUS_ID` (cuda:0=5090, cuda:1=4090) or select by
   cc/SM count at runtime; non-login SSH does not inherit it.
 - **24 GB cgroup cap** applies to host RAM, not VRAM — the 18 GiB model loads fine into the

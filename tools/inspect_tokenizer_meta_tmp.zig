@@ -1,6 +1,6 @@
 const std = @import("std");
 const host_io = @import("host_io");
-const gguf = @import("../src/model/gguf.zig");
+const gguf = @import("gguf");
 
 fn printKey(gf: *const gguf.GGUFFile, key: []const u8) void {
     std.debug.print("{s}=", .{key});

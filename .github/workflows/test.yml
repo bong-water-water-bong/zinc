@@ -55,6 +55,9 @@ jobs:
     - name: Check CUDA host code without a GPU
       run: ./scripts/zig.sh build check-cuda -Doptimize=${{ matrix.optimize }}
 
+    - name: Compile standalone tools without model or GPU execution
+      run: ./scripts/zig.sh build check-tools -Doptimize=${{ matrix.optimize }}
+
     - name: Build ZINC_RT without GPU execution
       run: ./scripts/zig.sh build -Dbackend=zinc_rt -Dshaders=false -Doptimize=${{ matrix.optimize }} --prefix zig-out-rt
 
@@ -71,6 +74,7 @@ jobs:
         for mode in Debug ReleaseSafe ReleaseFast ReleaseSmall; do
           ./scripts/zig.sh build -Doptimize="$mode"
           ./scripts/zig.sh build test-build -Doptimize="$mode"
+          ./scripts/zig.sh build check-tools -Doptimize="$mode"
         done
 
   nix-build:

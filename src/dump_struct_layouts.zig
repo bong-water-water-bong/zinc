@@ -1,3 +1,8 @@
+//! Print public loader and forward struct sizes, alignments and field offsets.
+//!
+//! This host-only tool inspects the native backend's types without opening a
+//! model file or GPU device. Run it with `./scripts/zig.sh build dump-struct-layouts`.
+//! @section CLI & Entrypoints
 const std = @import("std");
 const host_io = @import("host_io");
 
@@ -25,12 +30,13 @@ fn dumpStruct(comptime T: type, name: []const u8, writer: anytype) !void {
     try writer.print("\n", .{});
 }
 
-const main_mod = @import("main.zig");
+const is_macos = @import("builtin").os.tag == .macos;
 const modules = .{
-    .{ "loader", @import("model/loader.zig") },
-    .{ "forward", @import("compute/forward.zig") },
+    .{ "loader", if (is_macos) @import("model/loader_metal.zig") else @import("model/loader.zig") },
+    .{ "forward", if (is_macos) @import("compute/forward_metal.zig") else @import("compute/forward.zig") },
 };
 
+/// Write a Markdown report of public backend struct layouts to standard output.
 pub fn main(process_init: std.process.Init) !void {
     host_io.init(process_init);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

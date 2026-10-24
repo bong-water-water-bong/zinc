@@ -26,7 +26,7 @@ If you want a good first issue, look for `good first issue` or `help wanted` lab
 
 Core tools:
 
-- Zig 0.15.2+
+- Zig 0.17.0, pinned in `.zig-version` and selected by `scripts/zig.sh`
 - Bun 1.x for the TypeScript tooling and tests
 - Vulkan headers/loader
 - `glslc` on Linux if you want shader compilation
@@ -36,11 +36,12 @@ Typical local workflow:
 ```bash
 git clone https://github.com/zolotukhin/zinc.git
 cd zinc
-zig build
-zig build test --summary all
+./scripts/zig.sh build
+./scripts/zig.sh build test --summary all
 ```
 
-On Linux, `zig build` also compiles shaders. On macOS, shader compilation is skipped and GPU inference is not the primary target environment.
+The wrapper downloads and verifies the pinned compiler if necessary. On Linux,
+the build also compiles shaders. On macOS, it builds the Metal backend.
 
 ## Making changes
 
@@ -65,10 +66,18 @@ For performance changes:
 Before opening a PR, run at minimum:
 
 ```bash
-zig build test --summary all
+./scripts/zig.sh build test --summary all
 ```
 
-`zig build test --summary all` now runs both the Zig test suite and the Bun test suite.
+`./scripts/zig.sh build test --summary all` runs both the Zig and Bun test suites.
+
+Compile the standalone metadata inspectors, tokenizer tools, struct-layout
+tool and available Vulkan validators without opening models or GPU devices:
+
+```bash
+./scripts/zig.sh build check-tools
+./scripts/zig.sh build check-cuda
+```
 
 If you want to require the integration smoke tests instead of letting them skip when their env is missing:
 
@@ -76,7 +85,7 @@ If you want to require the integration smoke tests instead of letting them skip 
 ZINC_QWEN3_8B_MODEL=/path/to/Qwen3.5-9B-Q4_K_M.gguf \
 ZINC_QWEN36_35B_MODEL=/path/to/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
 ZINC_API_BASE_URL=http://localhost:8080/v1 \
-zig build test --summary all -Dfull-tests=true
+./scripts/zig.sh build test --summary all -Dfull-tests=true
 ```
 
 If you want to run the Bun suite by itself:

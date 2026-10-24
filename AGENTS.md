@@ -90,6 +90,7 @@ src/
 ├── bench_support.zig            # Shared helpers for Metal benchmarks
 ├── regression_tests.zig         # Source-level regression guards
 ├── zig-struct-analyzer.zig      # Zig API/doc structure extraction helper
+├── dump_struct_layouts.zig      # Public loader/forward memory layout tool
 ├── compute/
 │   ├── forward.zig              # Vulkan inference engine — prefill + decode loop
 │   ├── forward_metal.zig        # Metal inference engine — prefill + decode loop
@@ -204,7 +205,7 @@ specs/                           # Historical feature design artifacts
 tools/                           # API benchmark, HTML tooling, graph/report helpers
 ├── benchmark_api.mjs
 ├── chat.html
-├── dump_struct_layouts.zig
+├── inspect_qwen_meta.zig
 ├── print_test_summary.ts
 └── render_graph_report.ts
 
