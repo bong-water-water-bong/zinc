@@ -42,7 +42,7 @@ gemma4-26b MoE 51/157 = **32%** (worst); qwen36-35b-a3b MoE 62/158 = **39%**; ge
 ## HARD RULES (override the generic playbook)
 - **Pin the 5090**: `export CUDA_VISIBLE_DEVICES=GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350`, ZINC_GPU= same.
 - **Box build dir `~/zinc-harvest`** (full main checkout, NOT git — rsync WHOLE worktree `./ dest/`
-  single-source). Build `~/zig-0.15.2/zig build -Dbackend=cuda -Dshaders=false -Doptimize=ReleaseFast`.
+  single-source). Build `./scripts/zig.sh build -Dbackend=cuda -Dshaders=false -Doptimize=ReleaseFast`.
 - **Correctness gate**: default-vs-change greedy token match on gemma-26b AND qwen — `--prompt
   "<real text>" --raw -n 20`, compare the `Output(…)` line (STDERR, 2>&1). Fusion is usually
   BIT-identical (same kernels reordered) → require token-IDENTICAL. A DIFFER = revert.

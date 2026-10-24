@@ -12,6 +12,11 @@ chunk, while preserving the merge algorithm and token IDs. JSON responses and
 SSE frames use vectored writes; SSE disables Nagle buffering and advertises the
 server's actual one-request connection lifetime.
 
+The measurements below describe the initial migration. A subsequent
+[BPE optimization](https://github.com/zolotukhin/zinc/blob/main/docs/ZIG_0_17_BPE.md), measured against that already optimized
+0.17 build, further reduces Gemma's long-prompt first-output latency by 34%
+and fixes ordinary angle-bracket token handling.
+
 Safety testing also caught two migration issues: clearing an ArrayList poisoned
 a still-borrowed streaming delta, and the new file streaming API reports EOF as
 an error. The streaming detector preserves its borrowed bytes until the next

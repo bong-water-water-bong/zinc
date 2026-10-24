@@ -77,7 +77,7 @@ The BT=32 negative below was the ONE guess made without profiling — it was neu
   and `ZINC_GPU=` the same. The 4090 (GPU-e59a6fce-…) may be used by other loops.
 - **Box build dir `~/zinc-harvest`** (a full main checkout, NOT a git repo — rsync
   the WHOLE worktree `./ dest/` single-source, never multi-source+--delete which
-  scrambles the tree). Build: `~/zig-0.15.2/zig build -Dbackend=cuda -Dshaders=false -Doptimize=ReleaseFast`.
+  scrambles the tree). Build: `./scripts/zig.sh build -Dbackend=cuda -Dshaders=false -Doptimize=ReleaseFast`.
 - **Correctness gate**: `validate_catalog.sh` is UNUSABLE in a non-.git box tree
   (its `zig build cuda-dbg` auto-RUNS the binary → FileNotFound). Gate instead on
   **default-vs-change greedy token match** (`--prompt "<real text>" --raw -n 20`,
