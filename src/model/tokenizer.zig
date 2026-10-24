@@ -343,7 +343,7 @@ pub const Tokenizer = struct {
 
         const eog_ids = try buildEndOfGenerationIds(allocator, &token_to_id, eos_id, eot_id);
 
-        return Tokenizer{
+        var tokenizer = Tokenizer{
             .vocab = vocab,
             .token_to_id = token_to_id,
             .merges = merges_owned,
@@ -364,6 +364,8 @@ pub const Tokenizer = struct {
             .merge_ranks_ready = true,
             .allocator = allocator,
         };
+        tokenizer.normalizeSpecialTokenTypes();
+        return tokenizer;
     }
 
     /// GPT-2 byte-to-unicode mapping. Maps each raw byte to a Unicode character.
@@ -939,18 +941,39 @@ pub const Tokenizer = struct {
         return self.encodeWithSpecialTokens(text, allocator);
     }
 
+    /// Apply reference token-type overrides once, before scanning any prompts.
+    fn normalizeSpecialTokenTypes(self: *Tokenizer) void {
+        const mask = self.special_token_mask orelse return;
+        if (self.eos_id < mask.len) mask[self.eos_id] = true;
+        if (self.bos_id) |id| if (id < mask.len) {
+            mask[id] = true;
+        };
+        if (self.eot_id) |id| if (id < mask.len) {
+            mask[id] = true;
+        };
+        // A recognized end marker stays special even if the reference removes
+        // it from the EOG set, as with GPT-OSS's message-closing <|end|>.
+        for (end_of_generation_token_texts) |text| {
+            if (self.token_to_id.get(text)) |id| if (id < mask.len) {
+                mask[id] = true;
+            };
+        }
+        // Gemma/PaddleOCR override </s> back to NORMAL after promoting end
+        // markers. Its original GGUF type may be CONTROL, so excluding it
+        // from eog_ids alone does not make special-token scanning correct.
+        if (self.token_to_id.contains("<|tool_response>")) {
+            if (self.token_to_id.get("</s>")) |id| if (id < mask.len) {
+                mask[id] = false;
+            };
+        }
+    }
+
     /// Whether a vocabulary match for a `<...>` marker counts as a special token.
     /// Qwen-family vocabularies hold ordinary BPE tokens shaped like markers
     /// (`<?>`, `<()>`), as does Gemma (`<>`). The reference encodes these as
     /// text, so those pretokenizers accept only control, user-defined and
     /// unknown tokens.
     fn acceptsSpecialMarker(self: *const Tokenizer, id: u32) bool {
-        // The reference promotes declared IDs and recognized end markers to
-        // control tokens even when token_type labels them ordinary.
-        if (id == self.eos_id) return true;
-        if (self.bos_id) |bos| if (id == bos) return true;
-        if (self.eot_id) |eot| if (id == eot) return true;
-        for (self.eog_ids) |eog| if (id == eog) return true;
         const mask = self.special_token_mask orelse return true;
         if (self.pretokenizer != .qwen35 and self.pretokenizer != .qwen2 and self.pretokenizer != .gemma4_bpe) return true;
         return id < mask.len and mask[id];
@@ -2859,6 +2882,7 @@ test "declared and inferred special IDs override ordinary token types" {
     };
     defer tok.token_to_id.deinit();
     for (vocab, 0..) |piece, i| try tok.token_to_id.put(piece, @intCast(i));
+    tok.normalizeSpecialTokenTypes();
     const ids = try tok.encodePrompt("<bos><eos><turn|></s>", allocator);
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, ids);
@@ -3250,13 +3274,16 @@ test "initFromGGUF builds the reference end-of-generation set" {
     };
     defer gf.deinit();
 
-    const names = [_][]const u8{ "<|im_end|>", "<|endoftext|>", "a", "<|end|>", "<|return|>", "<|call|>" };
+    const names = [_][]const u8{ "<|im_end|>", "<|endoftext|>", "a", "<|end|>", "<|return|>", "<|call|>", "</s>", "<|tool_response>" };
     const tokens = try allocator.alloc(gguf.MetadataValue, names.len);
     for (names, 0..) |name, i| tokens[i] = .{ .string = try allocator.dupe(u8, name) };
     try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.tokens"), .{ .array = tokens });
-    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.model"), .{ .string = try allocator.dupe(u8, "gpt2") });
-    try gf.metadata.put(allocator, try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "qwen35") });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.model"), .{ .string = try allocator.dupe(u8, "gemma4") });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "gemma4") });
     try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.eos_token_id"), .{ .uint32 = 0 });
+    const types = try allocator.alloc(gguf.MetadataValue, names.len);
+    for (types, 0..) |*value, i| value.* = .{ .int32 = if (i == 6) 3 else 1 };
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.token_type"), .{ .array = types });
 
     var tok = try Tokenizer.initFromGGUF(&gf, allocator);
     defer tok.deinit();
@@ -3267,4 +3294,11 @@ test "initFromGGUF builds the reference end-of-generation set" {
     try std.testing.expect(!tok.isEndOfGeneration(3)); // <|end|> with <|return|> + <|call|>
     try std.testing.expect(tok.isEndOfGeneration(4)); // <|return|>
     try std.testing.expect(tok.isEndOfGeneration(5)); // <|call|>
+    try std.testing.expect(!tok.isEndOfGeneration(6)); // </s> is ordinary here
+    try std.testing.expect(tok.isEndOfGeneration(7)); // <|tool_response>
+    try std.testing.expect(tok.acceptsSpecialMarker(0)); // declared EOS
+    try std.testing.expect(tok.acceptsSpecialMarker(1)); // promoted end marker
+    try std.testing.expect(!tok.acceptsSpecialMarker(2)); // ordinary vocabulary
+    try std.testing.expect(tok.acceptsSpecialMarker(3)); // special but not EOG
+    try std.testing.expect(!tok.acceptsSpecialMarker(6)); // CONTROL overridden to NORMAL
 }
