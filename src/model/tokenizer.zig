@@ -137,7 +137,7 @@ pub const Tokenizer = struct {
         legacy,
         gpt2_ascii,
         gemma4_bpe,
-        /// Reference `llama4` pretokenizer regex (Muse Glimmer). Differs from
+        /// Reference `gpt-4o`/`llama4` pretokenizer regex (GPT-OSS/Muse Glimmer). Differs from
         /// gpt2_ascii in newline-absorbing punctuation runs, 3-digit caps,
         /// symbol-prefixed words, suffix contractions, and case splitting.
         llama4,
@@ -302,7 +302,7 @@ pub const Tokenizer = struct {
         if (chat_template) |tmpl| log.debug("Chat template: {d} chars", .{tmpl.len});
         const pretokenizer: Pretokenizer = if (std.mem.eql(u8, model_type, "gemma4") or std.mem.eql(u8, pre_name, "gemma4"))
             .gemma4_bpe
-        else if (std.mem.eql(u8, pre_name, "llama4") and merges_list.items.len > 0)
+        else if ((std.mem.eql(u8, pre_name, "llama4") or std.mem.eql(u8, pre_name, "gpt-4o")) and merges_list.items.len > 0)
             .llama4
         else if (scores == null and merges_list.items.len > 0 and isQwen35LikeName(pre_name))
             .qwen35
@@ -533,109 +533,99 @@ pub const Tokenizer = struct {
         return byte >= 'a' and byte <= 'z';
     }
 
-    /// ASCII implementation of the reference `llama4` pretokenizer regex
-    /// (Muse Glimmer et al.):
-    ///   [^\r\n\p{L}\p{N}]?[upper]*[lower]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
-    /// | [^\r\n\p{L}\p{N}]?[upper]+[lower]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
-    /// | \p{N}{1,3}
-    /// |  ?[^\s\p{L}\p{N}]+[\r\n/]*
-    /// | \s*[\r\n]+
-    /// | \s+(?!\S)
-    /// | \s+
-    /// Key differences from the GPT-2 chunker: an optional single leading
-    /// symbol glues to the following word, contractions are a SUFFIX of the
-    /// word chunk (not a separate chunk), letter runs split at interior
-    /// case boundaries (camelCase -> 'camel','Case'), digit runs cap at 3,
-    /// and punctuation runs absorb trailing newlines/slashes (".\n" is ONE
-    /// pretoken -> BPE 335, where the GPT-2 chunker yields '.'+'\n').
-    /// Non-ASCII bytes (>= 0x80) are treated as word characters so UTF-8
-    /// letters stay in one chunk (approximation; exact for ASCII text).
+    /// Reference GPT-4o/Llama4 regex, using the same Unicode letter classes
+    /// as llama.cpp's executable expression: upper = letter outside a-z,
+    /// lower = letter outside A-Z. Non-ASCII letters can belong to both.
     fn nextLlama4PretokenChunk(text: []const u8, pos: *usize) []const u8 {
         if (pos.* >= text.len) return text[text.len..text.len];
-
         const start = pos.*;
-        var i = start;
-        const c0 = text[i];
-
-        const isWordByte = struct {
-            fn f(b: u8) bool {
-                return isAsciiLetter(b) or b >= 0x80;
+        const first = qwenDecode(text, start);
+        const after_first = start + first.len;
+        const Classes = struct {
+            fn upper(cp: u32) bool {
+                return qwenIsLetter(cp) and !(cp >= 'a' and cp <= 'z');
             }
-        }.f;
-
-        // Word alternatives: optional single non-newline symbol prefix, then
-        // upper*lower+ | upper+lower* (ASCII case split), then optional
-        // contraction suffix.
-        const has_prefix = !isWordByte(c0) and !isAsciiDigit(c0) and c0 != '\r' and c0 != '\n' and
-            i + 1 < text.len and isWordByte(text[i + 1]);
-        if (isWordByte(c0) or has_prefix) {
-            if (has_prefix) i += 1;
-            // upper run, then lower/other-word run (non-ASCII bytes count as
-            // lowercase-ish continuation so multi-byte letters don't split).
-            var j = i;
-            while (j < text.len and isAsciiUpper(text[j])) : (j += 1) {}
-            var k = j;
-            while (k < text.len and (isAsciiLower(text[k]) or text[k] >= 0x80)) : (k += 1) {}
-            if (k == i) {
-                // No letters after the prefix (can't happen: guarded above).
-                i += 1;
-                pos.* = i;
-                return text[start..i];
+            fn lower(cp: u32) bool {
+                return qwenIsLetter(cp) and !(cp >= 'A' and cp <= 'Z');
             }
-            // upper*lower+ preferred; if no lowers followed, keep the upper run.
-            i = if (k > j) k else j;
-            const suffix_len = matchAsciiContraction(text, i);
-            i += suffix_len;
+            fn symbol(cp: u32) bool {
+                return !qwenIsSpace(cp) and !qwenIsLetter(cp) and !qwenIsNumber(cp);
+            }
+        };
+
+        // Optional single non-newline, non-letter, non-number prefix, then
+        // upper*lower+ | upper+lower*, followed by a contraction suffix.
+        const has_prefix = !qwenIsLetter(first.cp) and !qwenIsNumber(first.cp) and
+            first.cp != '\r' and first.cp != '\n' and after_first < text.len and
+            qwenIsLetter(qwenDecode(text, after_first).cp);
+        if (qwenIsLetter(first.cp) or has_prefix) {
+            var i = if (has_prefix) after_first else start;
+            var last_lower_end: ?usize = null;
+            while (i < text.len) {
+                const cp = qwenDecode(text, i);
+                if (!Classes.upper(cp.cp)) break;
+                i += cp.len;
+                if (Classes.lower(cp.cp)) last_lower_end = i;
+            }
+            const upper_end = i;
+            while (i < text.len) {
+                const cp = qwenDecode(text, i);
+                if (!Classes.lower(cp.cp)) break;
+                i += cp.len;
+            }
+            if (i == upper_end) {
+                // The first alternative takes priority. Backtrack the greedy
+                // upper run to its last lower-compatible code point, if any.
+                i = last_lower_end orelse upper_end;
+            }
+            i += matchAsciiContraction(text, i);
             pos.* = i;
             return text[start..i];
         }
 
-        // \p{N}{1,3}
-        if (isAsciiDigit(c0)) {
-            i += 1;
-            var count: usize = 1;
-            while (i < text.len and count < 3 and isAsciiDigit(text[i])) : (i += 1) {
-                count += 1;
+        // Unicode numbers, at most three code points per chunk.
+        if (qwenIsNumber(first.cp)) {
+            var i = start;
+            var count: usize = 0;
+            while (i < text.len and count < 3) : (count += 1) {
+                const cp = qwenDecode(text, i);
+                if (!qwenIsNumber(cp.cp)) break;
+                i += cp.len;
             }
             pos.* = i;
             return text[start..i];
         }
 
-        const isSym = struct {
-            fn f(b: u8) bool {
-                return !isAsciiSpace(b) and !isAsciiLetter(b) and !isAsciiDigit(b) and b < 0x80;
+        // Optional ASCII space, punctuation/symbols, trailing newlines/slashes.
+        if (Classes.symbol(first.cp) or (first.cp == ' ' and after_first < text.len and
+            Classes.symbol(qwenDecode(text, after_first).cp)))
+        {
+            var i = if (first.cp == ' ') after_first else start;
+            while (i < text.len) {
+                const cp = qwenDecode(text, i);
+                if (!Classes.symbol(cp.cp)) break;
+                i += cp.len;
             }
-        }.f;
-
-        //  ?[^\s\p{L}\p{N}]+[\r\n/]*
-        if (isSym(c0) or (c0 == ' ' and i + 1 < text.len and isSym(text[i + 1]))) {
-            if (c0 == ' ') i += 1;
-            while (i < text.len and isSym(text[i])) : (i += 1) {}
             while (i < text.len and (text[i] == '\r' or text[i] == '\n' or text[i] == '/')) : (i += 1) {}
             pos.* = i;
             return text[start..i];
         }
 
-        // Whitespace classes. Scan the maximal run first.
-        var j = i;
-        var last_nl: ?usize = null;
-        while (j < text.len and isAsciiSpace(text[j])) : (j += 1) {
-            if (text[j] == '\r' or text[j] == '\n') last_nl = j;
+        // Whitespace through the last newline; otherwise leave one complete
+        // whitespace code point for the next word, unless at end of text.
+        var i = start;
+        var last_space_start = start;
+        var last_newline_end: ?usize = null;
+        while (i < text.len) {
+            const cp = qwenDecode(text, i);
+            if (!qwenIsSpace(cp.cp)) break;
+            last_space_start = i;
+            i += cp.len;
+            if (cp.cp == '\r' or cp.cp == '\n') last_newline_end = i;
         }
-        if (last_nl) |nl| {
-            // \s*[\r\n]+ : consume through the last newline of the run.
-            pos.* = nl + 1;
-            return text[start .. nl + 1];
-        }
-        if (j == text.len or j - i == 1) {
-            // \s+(?!\S) at end-of-text, or a single space/tab before a
-            // non-space (the word/punct alternatives above didn't want it).
-            pos.* = j;
-            return text[start..j];
-        }
-        // \s+(?!\S): leave the final space for the next chunk.
-        pos.* = j - 1;
-        return text[start .. j - 1];
+        pos.* = last_newline_end orelse
+            (if (i == text.len or last_space_start == start) i else last_space_start);
+        return text[start..pos.*];
     }
 
     fn nextGpt2PretokenChunk(text: []const u8, pos: *usize) []const u8 {
@@ -969,13 +959,11 @@ pub const Tokenizer = struct {
     }
 
     /// Whether a vocabulary match for a `<...>` marker counts as a special token.
-    /// Qwen-family vocabularies hold ordinary BPE tokens shaped like markers
-    /// (`<?>`, `<()>`), as does Gemma (`<>`). The reference encodes these as
-    /// text, so those pretokenizers accept only control, user-defined and
-    /// unknown tokens.
+    /// Vocabularies can hold ordinary BPE tokens shaped like markers (`<>`,
+    /// `<?>`, `<()>`). Every pretokenizer uses the normalized token-type mask
+    /// to distinguish these from control, user-defined and unknown tokens.
     fn acceptsSpecialMarker(self: *const Tokenizer, id: u32) bool {
         const mask = self.special_token_mask orelse return true;
-        if (self.pretokenizer != .qwen35 and self.pretokenizer != .qwen2 and self.pretokenizer != .gemma4_bpe) return true;
         return id < mask.len and mask[id];
     }
 
@@ -2264,6 +2252,47 @@ test "llama4 pretokenizer matches Muse Glimmer ASCII chunk boundaries" {
     try std.testing.expectEqual(input.len, pos);
 }
 
+test "GPT4o and Llama4 Unicode chunks match the reference regex" {
+    const Case = struct { input: []const u8, chunks: []const []const u8 };
+    const Fixture = struct { pattern: []const u8, cases: []const Case };
+    const fixture = try std.json.parseFromSlice(Fixture, std.testing.allocator, @embedFile("fixtures/gpt4o-chunks.json"), .{});
+    defer fixture.deinit();
+    for (fixture.value.cases) |case| {
+        var pos: usize = 0;
+        for (case.chunks) |expected| {
+            try std.testing.expectEqualStrings(expected, Tokenizer.nextLlama4PretokenChunk(case.input, &pos));
+        }
+        try std.testing.expectEqual(case.input.len, pos);
+    }
+}
+
+test "initFromGGUF selects the shared GPT4o splitter for both pretokenizer names" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "gpt-4o", "llama4" }) |pre| {
+        var gf = gguf.GGUFFile{
+            .version = .v3,
+            .tensor_count = 0,
+            .metadata = .{},
+            .tensors = .empty,
+            .tensor_data_offset = 0,
+            .allocator = allocator,
+        };
+        defer gf.deinit();
+        const names = [_][]const u8{ "a", "b", "ab" };
+        const tokens = try allocator.alloc(gguf.MetadataValue, names.len);
+        for (names, 0..) |name, i| tokens[i] = .{ .string = try allocator.dupe(u8, name) };
+        try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.tokens"), .{ .array = tokens });
+        const merges = try allocator.alloc(gguf.MetadataValue, 1);
+        merges[0] = .{ .string = try allocator.dupe(u8, "a b") };
+        try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.merges"), .{ .array = merges });
+        try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.model"), .{ .string = try allocator.dupe(u8, "gpt2") });
+        try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.pre"), .{ .string = try allocator.dupe(u8, pre) });
+        var tok = try Tokenizer.initFromGGUF(&gf, allocator);
+        defer tok.deinit();
+        try std.testing.expectEqual(Tokenizer.Pretokenizer.llama4, tok.pretokenizer);
+    }
+}
+
 test "special token id falls back to the vocabulary" {
     var token_to_id = std.StringHashMap(u32).init(std.testing.allocator);
     defer token_to_id.deinit();
@@ -3236,9 +3265,9 @@ test "encodeWithSpecialTokens keeps a non-special < in the surrounding BPE text"
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 3, 0, 1 }, tokens);
 }
 
-test "qwen35 special-marker scan skips ordinary tokens shaped like markers" {
-    const vocab = [_][]const u8{ "<", "?", ">", "<?>", "<think>" };
-    var mask = [_]bool{ false, false, false, false, true };
+test "special-marker scan skips ordinary markers for every pretokenizer" {
+    const vocab = [_][]const u8{ "<", "?", ">", "<?>", "<think>", "x" };
+    var mask = [_]bool{ false, false, false, false, true, false };
     var tok = Tokenizer{
         .vocab = &vocab,
         .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
@@ -3254,11 +3283,14 @@ test "qwen35 special-marker scan skips ordinary tokens shaped like markers" {
     defer tok.token_to_id.deinit();
     for (vocab, 0..) |piece, i| try tok.token_to_id.put(piece, @intCast(i));
 
-    const tokens = try tok.encodeWithSpecialTokens("<?><think>", std.testing.allocator);
-    defer std.testing.allocator.free(tokens);
-    // `<?>` is an ordinary token: it goes through BPE (no merges here, so one
-    // token per byte); `<think>` is user-defined and maps directly.
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 4 }, tokens);
+    inline for (std.meta.tags(Tokenizer.Pretokenizer)) |pretokenizer| {
+        tok.pretokenizer = pretokenizer;
+        const tokens = try tok.encodeWithSpecialTokens("<?>x<think>", std.testing.allocator);
+        defer std.testing.allocator.free(tokens);
+        // Ordinary `<?>` stays with the following text and goes through BPE;
+        // `<think>` is user-defined and maps directly for every tokenizer.
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 5, 4 }, tokens);
+    }
 }
 
 test "initFromGGUF builds the reference end-of-generation set" {
