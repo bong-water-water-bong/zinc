@@ -6,6 +6,7 @@
 //! exercises the actual GEM/VA/USERQ_CREATE/USERQ_FREE path required before
 //! lowering decode packets onto T2.
 const std = @import("std");
+const host_io = @import("host_io");
 const builtin = @import("builtin");
 const kmd = @import("../kmd.zig");
 
@@ -164,10 +165,10 @@ pub fn probePath(render_node: []const u8) ProbeResult {
         return .{ .status = .kernel_too_old, .kernel = kernel, .render_node = render_node };
     }
 
-    var file = std.fs.openFileAbsolute(render_node, .{}) catch {
+    var file = std.Io.Dir.openFileAbsolute(host_io.io, render_node, .{}) catch {
         return .{ .status = .render_node_missing, .kernel = kernel, .render_node = render_node };
     };
-    file.close();
+    file.close(host_io.io);
 
     const mode = readUserQueueMode() catch {
         return .{ .status = .user_queue_param_missing, .kernel = kernel, .render_node = render_node };
@@ -180,10 +181,10 @@ pub fn probePath(render_node: []const u8) ProbeResult {
 }
 
 fn createFreeSmokeWithInfo(render_node: []const u8, info: kmd.ComputeUserqInfo) SmokeResult {
-    var file = std.fs.openFileAbsolute(render_node, .{ .mode = .read_write }) catch {
+    var file = std.Io.Dir.openFileAbsolute(host_io.io, render_node, .{ .mode = .read_write }) catch {
         return smokeFailure(.render_node_open_failed, info);
     };
-    defer file.close();
+    defer file.close(host_io.io);
 
     const queue_size: u64 = 0x10000;
     const page_size: u64 = 4096;
@@ -239,19 +240,19 @@ fn createFreeSmokeWithInfo(render_node: []const u8, info: kmd.ComputeUserqInfo) 
         kmd.AMDGPU_GEM_CREATE_VM_ALWAYS_VALID,
     ) catch return smokeIoctlFailure(.gem_create_failed, info);
 
-    const queue_map = kmd.mmapGem(file, queue_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch {
+    const queue_map = kmd.mmapGem(file, queue_bo, .{ .READ = true, .WRITE = true }) catch {
         return smokeIoctlFailure(.gem_mmap_failed, info);
     };
     defer std.posix.munmap(queue_map);
     @memset(queue_map, 0);
 
-    const wptr_map = kmd.mmapGem(file, wptr_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch {
+    const wptr_map = kmd.mmapGem(file, wptr_bo, .{ .READ = true, .WRITE = true }) catch {
         return smokeIoctlFailure(.gem_mmap_failed, info);
     };
     defer std.posix.munmap(wptr_map);
     @memset(wptr_map, 0);
 
-    const doorbell_map = kmd.mmapGem(file, doorbell_bo, std.posix.PROT.WRITE) catch {
+    const doorbell_map = kmd.mmapGem(file, doorbell_bo, .{ .WRITE = true }) catch {
         return smokeIoctlFailure(.gem_mmap_failed, info);
     };
     defer std.posix.munmap(doorbell_map);
@@ -342,11 +343,11 @@ fn currentKernelVersion() !KernelVersion {
 }
 
 fn readUserQueueMode() !i32 {
-    var file = try std.fs.openFileAbsolute(user_queue_param_path, .{});
-    defer file.close();
+    var file = try std.Io.Dir.openFileAbsolute(host_io.io, user_queue_param_path, .{});
+    defer file.close(host_io.io);
 
     var buf: [32]u8 = undefined;
-    const n = try file.readAll(&buf);
+    const n = try host_io.readAll(file, &buf);
     const value = std.mem.trim(u8, buf[0..n], " \t\r\n");
     return parseLeadingI32(value) orelse error.InvalidUserQueueMode;
 }

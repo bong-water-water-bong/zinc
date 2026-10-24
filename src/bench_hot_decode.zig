@@ -1,9 +1,10 @@
 //! Hot-path decode kernel microbenchmarks.
 //! Measures per-dispatch GPU latency, memory bandwidth, and VRAM utilisation
 //! for individual compute kernels (DMMV, SSM delta-net) in isolation.
-//! Run via `zig build hot-bench -Doptimize=ReleaseFast`.
+//! Run via `./scripts/zig.sh build hot-bench -Doptimize=ReleaseFast`.
 //! @section Inference Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 const vk = @import("vulkan/vk.zig");
 const instance_mod = @import("vulkan/instance.zig");
 const Instance = instance_mod.Instance;
@@ -158,8 +159,8 @@ const TimestampTimer = struct {
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+    const argv = try host_io.argsAlloc(allocator);
+    defer host_io.argsFree(allocator, argv);
 
     var args = Args{};
     var i: usize = 1;
@@ -236,16 +237,16 @@ fn resolveShaderDir(allocator: std.mem.Allocator, override: ?[]const u8) ![]u8 {
         "share/zinc/shaders",
     };
     for (candidates) |candidate| {
-        std.fs.cwd().access(candidate, .{}) catch continue;
+        std.Io.Dir.cwd().access(host_io.io, candidate, .{}) catch continue;
         return allocator.dupe(u8, candidate);
     }
 
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try std.process.executablePathAlloc(host_io.io, allocator);
     defer allocator.free(exe_path);
     const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
     const derived = try std.fs.path.join(allocator, &.{ exe_dir, "..", "share", "zinc", "shaders" });
     errdefer allocator.free(derived);
-    std.fs.cwd().access(derived, .{}) catch return error.ShaderDirNotFound;
+    std.Io.Dir.cwd().access(host_io.io, derived, .{}) catch return error.ShaderDirNotFound;
     return derived;
 }
 
@@ -650,9 +651,9 @@ fn runRecorded(
     timer: *const TimestampTimer,
 ) !struct { gpu_ms: f64, wall_ms: f64 } {
     try cmd.end();
-    const wall_start = std.time.nanoTimestamp();
+    const wall_start = host_io.nanoTimestamp();
     try cmd.submitAndWait(queue);
-    const wall_end = std.time.nanoTimestamp();
+    const wall_end = host_io.nanoTimestamp();
     return .{
         .gpu_ms = try timer.elapsedMs(),
         .wall_ms = @as(f64, @floatFromInt(wall_end - wall_start)) / 1_000_000.0,
@@ -1003,8 +1004,9 @@ fn printResults(results: []const BenchResult) void {
 }
 
 /// Run the hot-decode microbenchmark suite against the selected model and kernels.
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) log.err("memory leak detected", .{});
@@ -1043,7 +1045,7 @@ pub fn main() !void {
     }
     log.info("Working set: {d} rotating buffer sets", .{args.working_set});
 
-    var results: std.ArrayList(BenchResult) = .{};
+    var results: std.ArrayList(BenchResult) = .empty;
     defer results.deinit(allocator);
 
     for (cases) |case| {
@@ -1070,7 +1072,7 @@ pub fn main() !void {
     if (results.items.len == 0) return error.NoCasesMatched;
 
     if (args.json) {
-        var stdout = std.fs.File.stdout().writerStreaming(&.{});
+        var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &.{});
         defer stdout.end() catch {};
         try std.json.Stringify.value(results.items, .{ .whitespace = .indent_2 }, &stdout.interface);
         try stdout.interface.writeByte('\n');

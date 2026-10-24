@@ -15,7 +15,7 @@ Options:
   -h, --help               Show this help
 
 The script packages an already-built install tree. It does not build ZINC.
-Run zig build first with the matching target/backend/options.
+Run ./scripts/zig.sh build first with the matching target/backend/options.
 USAGE
 }
 
@@ -107,7 +107,7 @@ esac
 binary="${prefix}/bin/zinc"
 if [[ ! -x "$binary" ]]; then
   echo "Missing executable: $binary" >&2
-  echo "Run zig build before packaging." >&2
+  echo "Run ./scripts/zig.sh build before packaging." >&2
   exit 1
 fi
 

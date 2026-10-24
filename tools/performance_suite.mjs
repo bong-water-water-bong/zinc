@@ -2845,7 +2845,7 @@ async function rdnaPathExists(modelFile, creds) {
 async function prepareLocalBuild(args) {
   if (!args.buildLocal) return;
   console.log("Preparing local ReleaseFast build...");
-  const buildCmd = `env ZIG_GLOBAL_CACHE_DIR=${shellQuote(args.localCacheDir)} zig build -Doptimize=ReleaseFast`;
+  const buildCmd = `env ZIG_GLOBAL_CACHE_DIR=${shellQuote(args.localCacheDir)} ./scripts/zig.sh build -Doptimize=ReleaseFast`;
   await runShell(buildCmd, { cwd: ROOT, timeoutMs: 30 * 60 * 1000 });
 }
 
@@ -2889,7 +2889,7 @@ async function prepareRdna(args, creds) {
 
   if (args.rdnaBuild) {
     console.log("Building ReleaseFast on RDNA node...");
-    const buildArgs = ["zig", "build", "-Doptimize=ReleaseFast"];
+    const buildArgs = ["./scripts/zig.sh", "build", "-Doptimize=ReleaseFast"];
     if (args.rdnaBackend !== "auto") {
       buildArgs.push(`-Dbackend=${args.rdnaBackend}`);
     }
@@ -2962,7 +2962,7 @@ async function prepareIntel(args, creds, remoteLibcConf) {
   if (args.intelBuild) {
     console.log("Building ReleaseFast on Intel node...");
     const envPrefix = remoteEnvPrefix(creds);
-    const remote = `cd ${shellQuote(creds.workdir)} && ${envPrefix ? `${envPrefix} ` : ""}zig build -Doptimize=ReleaseFast`;
+    const remote = `cd ${shellQuote(creds.workdir)} && ${envPrefix ? `${envPrefix} ` : ""}./scripts/zig.sh build -Doptimize=ReleaseFast`;
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
@@ -3193,12 +3193,12 @@ async function runMetalTarget(args) {
       runner: "ZINC CLI vs llama.cpp on the same Apple Silicon machine",
       benchmark_style: "Four-scenario matrix with same-file baselines",
       zinc_backend: "Metal",
-      zinc_build: "zig build -Doptimize=ReleaseFast",
+      zinc_build: "./scripts/zig.sh build -Doptimize=ReleaseFast",
       llama_backend: "Metal",
       llama_device: "-ngl 999",
       notes: [
         "Hardware: the local Apple Silicon target shown above. ZINC and llama.cpp run on the same machine and use the same GGUF file for each model.",
-        "ZINC path: build the current workspace with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
+        "ZINC path: build the current workspace with ./scripts/zig.sh build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
         "Baseline backend: llama.cpp Metal (-ngl 999) on the same Apple Silicon machine — the same backend as ZINC.",
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
         "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
@@ -3320,7 +3320,7 @@ async function buildIntelConfig(args) {
   const remoteLibcConf = args.intelRemoteLibcConf ?? envValue(dotEnv, "ZINC_INTEL_REMOTE_LIBC_CONF");
   const remoteZig = envValue(dotEnv, "ZINC_INTEL_ZIG_REMOTE");
   const remoteZigDir = envValue(dotEnv, "ZINC_INTEL_ZIG_DIR", "ZINC_INTEL_REMOTE_ZIG_DIR")
-    ?? (remoteZig ? path.posix.dirname(remoteZig) : `${remoteHome}/.local/zig/0.15.2`);
+    ?? (remoteZig ? path.posix.dirname(remoteZig) : `${remoteHome}/.cache/zinc-toolchains/zig-0.17.0`);
   const llamaDevice = envValue(dotEnv, "ZINC_INTEL_LLAMA_DEVICE") ?? "Vulkan0";
   const intelLlamaDeviceArgs = llamaDeviceArgs(llamaDevice);
   const remoteEnv = {
@@ -3608,7 +3608,7 @@ async function runRdnaTarget(args) {
       runner: "ZINC server vs llama.cpp server on the same RDNA node",
       benchmark_style: "Four-scenario matrix with same-file baselines",
       zinc_backend: args.rdnaBackend === "vulkan" ? "Vulkan (RADV, coop_matrix)" : args.rdnaBackend.toUpperCase(),
-      zinc_build: `zig build -Doptimize=ReleaseFast${args.rdnaBackend === "auto" ? "" : ` -Dbackend=${args.rdnaBackend}`}`,
+      zinc_build: `./scripts/zig.sh build -Doptimize=ReleaseFast${args.rdnaBackend === "auto" ? "" : ` -Dbackend=${args.rdnaBackend}`}`,
       llama_backend: /rocm/i.test(args.rdnaLlamaDevice ?? "") ? "ROCm" : "Vulkan",
       llama_device: args.rdnaLlamaDevice ?? "--device Vulkan1",
       notes: [
@@ -3679,9 +3679,9 @@ async function buildCudaCreds(args) {
     // blackholed (SYN dropped), so the llama-server bind + its health/API curls
     // must use a 127.99.x.x address. Overridable via ZINC_CUDA_LOOPBACK_HOST.
     loopbackHost: args.cudaLoopbackHost ?? process.env.ZINC_CUDA_LOOPBACK_HOST ?? "127.99.0.1",
-    // The box's zig lives at ~/zig-0.15.2/zig and is not on the non-interactive
+    // The box's zig lives at ./scripts/zig.sh and is not on the non-interactive
     // SSH PATH; use the absolute path for the build. Overridable via ZINC_CUDA_ZIG.
-    zig: process.env.ZINC_CUDA_ZIG ?? `${remoteHome}/zig-0.15.2/zig`,
+    zig: process.env.ZINC_CUDA_ZIG ?? `${workdir}/scripts/zig.sh`,
     gpuUuid,
     modelRoot,
     llamaServerOverride,
@@ -3727,7 +3727,7 @@ async function prepareCuda(args, creds) {
     // CUDA kernels are NVRTC-compiled at runtime for the visible GPU's compute
     // capability, so shader precompilation is off (-Dshaders=false) and one
     // build runs on any visible NVIDIA GPU.
-    const buildArgs = [creds.zig ?? "zig", "build", "-Doptimize=ReleaseFast", "-Dbackend=cuda", "-Dshaders=false"];
+    const buildArgs = [creds.zig ?? "./scripts/zig.sh", "build", "-Doptimize=ReleaseFast", "-Dbackend=cuda", "-Dshaders=false"];
     if (args.cudaSync) {
       const syncedProvenance = await captureGitProvenance(ROOT);
       if (syncedProvenance.version) buildArgs.push(`-Dversion=${shellQuote(syncedProvenance.version)}`);
@@ -3933,12 +3933,12 @@ async function runCudaTarget(args) {
       runner: "ZINC CLI vs llama.cpp on the same CUDA node",
       benchmark_style: "Four-scenario matrix with same-file baselines",
       zinc_backend: "CUDA (-Dbackend=cuda, NVRTC)",
-      zinc_build: "zig build -Doptimize=ReleaseFast -Dbackend=cuda",
+      zinc_build: "./scripts/zig.sh build -Doptimize=ReleaseFast -Dbackend=cuda",
       llama_backend: "CUDA",
       llama_device: "CUDA_VISIBLE_DEVICES (UUID-pinned)",
       notes: [
         "Hardware: one NVIDIA GeForce RTX 5090 (32 GB VRAM, 1792 GB/s) benchmark node. ZINC and llama.cpp run on the same host and use the same GGUF file for each model.",
-        "ZINC path: sync the current source tree to the CUDA node, build with zig build -Doptimize=ReleaseFast -Dbackend=cuda, then measure generation through the ZINC CLI. CUDA kernels are NVRTC-compiled at runtime for the visible GPU.",
+        "ZINC path: sync the current source tree to the CUDA node, build with ./scripts/zig.sh build -Doptimize=ReleaseFast -Dbackend=cuda, then measure generation through the ZINC CLI. CUDA kernels are NVRTC-compiled at runtime for the visible GPU.",
         "GPU selection: the target GPU is pinned by UUID via CUDA_VISIBLE_DEVICES for both engines, because nvidia-smi indices are unreliable on the WSL2 passthrough.",
         "Baseline backend: llama.cpp CUDA on the same host, the same UUID-pinned GPU as ZINC.",
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
@@ -4137,12 +4137,12 @@ async function runIntelTarget(args) {
       runner: "ZINC CLI vs llama.cpp on the same Intel Arc node",
       benchmark_style: "Four-scenario matrix with same-file baselines",
       zinc_backend: "Vulkan",
-      zinc_build: "zig build -Doptimize=ReleaseFast",
+      zinc_build: "./scripts/zig.sh build -Doptimize=ReleaseFast",
       llama_backend: "Vulkan",
       llama_device: "--device Vulkan0",
       notes: [
         "Hardware: one Intel Arc Vulkan benchmark node. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
-        "ZINC path: optionally sync the current source tree to the Intel node, build with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
+        "ZINC path: optionally sync the current source tree to the Intel node, build with ./scripts/zig.sh build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
         "Baseline backend: llama.cpp Vulkan (--device Vulkan0) on the same node — the same backend as ZINC.",
         "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable or fails to start.",
         "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",

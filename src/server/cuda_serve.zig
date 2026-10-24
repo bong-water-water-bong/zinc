@@ -26,6 +26,7 @@
 //!     across handler threads cannot change any sequence's output.
 
 const std = @import("std");
+const host_io = @import("host_io");
 const scheduler = @import("../scheduler/scheduler.zig");
 const forwardgemma = @import("../compute/forward_cuda_gemma.zig");
 const forwardcuda = @import("../compute/forward_cuda.zig");
@@ -103,7 +104,7 @@ pub const Forward = union(enum) {
 /// the handler drains it, so the handler must copy out under the same lock).
 pub const ReqChannel = struct {
     /// Tokens generated so far (worker appends under lock; `nextChunk` copies out).
-    tokens: std.ArrayList(u32) = .{},
+    tokens: std.ArrayList(u32) = .empty,
     /// How many tokens the handler has already drained via `nextChunk`.
     consumed: usize = 0,
     /// True once the request finished (EOS or max_tokens) — no more tokens coming.
@@ -135,8 +136,8 @@ pub const ServeEngine = struct {
     /// Optional model-specific end-of-turn token (ATEM `<|eot|>`).
     eot: ?u32,
 
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: host_io.Mutex = .{},
+    cond: host_io.Condition = .{},
     /// request id → channel. Entries inserted by `submit`, removed by `finish`.
     registry: std.AutoHashMapUnmanaged(u64, *ReqChannel) = .{},
     worker: ?std.Thread = null,
@@ -344,7 +345,7 @@ pub const ServeEngine = struct {
     ///
     /// @returns false when MTP was unavailable for this request, so the caller
     /// falls back to the ordinary slot path.
-    fn runMtpRequest(self: *ServeEngine, slot_id: u32, timer_opt: *?std.time.Timer) bool {
+    fn runMtpRequest(self: *ServeEngine, slot_id: u32, timer_opt: *?host_io.Timer) bool {
         const q = switch (self.fwd) {
             .qwen => |ptr| ptr,
             .gemma => return false,
@@ -432,7 +433,7 @@ pub const ServeEngine = struct {
 
     /// Append + publish one token. Returns false once the request is complete
     /// (stop token or budget), having released the slot.
-    fn emitToken(self: *ServeEngine, slot_id: u32, token: u32, timer_opt: *?std.time.Timer) bool {
+    fn emitToken(self: *ServeEngine, slot_id: u32, token: u32, timer_opt: *?host_io.Timer) bool {
         _ = timer_opt;
         const req = &self.sched.slots[slot_id].?;
         req.appendToken(token) catch {
@@ -458,7 +459,7 @@ pub const ServeEngine = struct {
         var sls: [scheduler_max]u32 = undefined;
         var out: [scheduler_max]u32 = undefined;
         // Monotonic timer for the 3c throughput counters; non-fatal if absent.
-        var timer_opt = std.time.Timer.start() catch null;
+        var timer_opt: ?host_io.Timer = host_io.Timer.start() catch null;
 
         while (true) {
             // Wait for work (or shutdown) while idle — event-driven, no poll.
@@ -501,8 +502,8 @@ pub const ServeEngine = struct {
                 // Threshold: batched GEMM overhead dominates below ~32 tokens.
                 // A/B toggle: ZINC_BATCHED_PREFILL=0 disables (uses per-token fallback).
                 const use_batched = np >= 32 and
-                    (std.posix.getenv("ZINC_BATCHED_PREFILL") == null or
-                        !std.mem.eql(u8, std.posix.getenv("ZINC_BATCHED_PREFILL").?, "0"));
+                    (host_io.getenv("ZINC_BATCHED_PREFILL") == null or
+                        !std.mem.eql(u8, host_io.getenv("ZINC_BATCHED_PREFILL").?, "0"));
                 const batched_tok = if (use_batched)
                     (fwd.prefillSlot(req.prompt_tokens, slot_id) catch null)
                 else

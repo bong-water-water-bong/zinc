@@ -65,13 +65,16 @@ The chart above is regenerated from that file, never hand-edited.
 
 ## Get running
 
-ZINC needs Zig 0.15.2 or newer. Linux Vulkan builds also need `glslc` and a
+ZINC uses Zig 0.17.0, pinned in `.zig-version`. `scripts/zig.sh` downloads and
+verifies the pinned compiler without replacing your system installation. Linux Vulkan builds also need `glslc` and a
 Vulkan loader; ROCm builds need a working ROCm installation.
+
+See the [Zig 0.17 migration and RDNA validation](docs/ZIG_0_17_MIGRATION.md) for measured gains and test coverage.
 
 ```bash
 git clone https://github.com/zolotukhin/zinc.git
 cd zinc
-zig build -Doptimize=ReleaseFast
+./scripts/zig.sh build -Doptimize=ReleaseFast
 
 ./zig-out/bin/zinc --check                      # what GPU did it find?
 ./zig-out/bin/zinc model pull qwen35-9b-q4k-m   # fetch a model
@@ -82,7 +85,7 @@ On AMD you can pick either backend. Vulkan is the portable default; ROCm uses
 HIP with kernels tuned for RDNA4 and leads on prompt processing:
 
 ```bash
-ROCM_PATH=/opt/rocm zig build -Dbackend=rocm -Doptimize=ReleaseFast
+ROCM_PATH=/opt/rocm ./scripts/zig.sh build -Dbackend=rocm -Doptimize=ReleaseFast
 ROCR_VISIBLE_DEVICES=0 ./zig-out/bin/zinc --check
 ```
 
@@ -134,8 +137,8 @@ file published by Meta.
 ## Build, test, contribute
 
 ```bash
-zig build -Doptimize=ReleaseFast
-zig build test
+./scripts/zig.sh build -Doptimize=ReleaseFast
+./scripts/zig.sh build test
 ```
 
 Start with the [development guide](docs/DEVELOPMENT.md) and the

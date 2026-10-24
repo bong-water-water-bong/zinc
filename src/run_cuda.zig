@@ -12,10 +12,11 @@
 //!
 //! Build + run (on the box):
 //!   cd ~/zinc5090 && CUDA_HOME=/usr/local/cuda \
-//!     ~/zig-0.15.2/zig build cuda-run -Dbackend=cuda -- [token] [milestone] [model.gguf]
+//!     ./scripts/zig.sh build cuda-run -Dbackend=cuda -- [token] [milestone] [model.gguf]
 //!     milestone: v0 (tail only), v1 (one attn L3 + one ssm L0 + ffn), v2 (full 32 layers)
 //! @section CUDA Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 const device = @import("cuda/device.zig");
 const loader = @import("model/loader_cuda.zig");
 const forward = @import("compute/forward_cuda.zig");
@@ -24,12 +25,13 @@ const DEFAULT_MODEL = "models/Qwen3.5-9B-Q4_K_M.gguf";
 
 const Milestone = enum { v0, v1, v2 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try host_io.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // exe name
     const token: u32 = blk: {

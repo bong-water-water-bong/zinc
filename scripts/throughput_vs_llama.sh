@@ -26,8 +26,8 @@
 # still needs a clean 5090 window — the contention guard only EXCLUDES garbage, it
 # can't manufacture clean rounds. Flip ZINC_BATCH_MROW default-on only on a CLEAN run.
 set -u
-GPU=${ZINC_GPU:-GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350}
-ZIG=${ZIG:-$HOME/zig-0.15.2/zig}
+GPU=${ZINC_GPU:?Set ZINC_GPU to the target device}
+ZIG=${ZIG:-./scripts/zig.sh}
 MODEL=${MODEL:-$HOME/workspace/models/gemma-4-31B-it-Q4_K_M.gguf}
 LLAMA=${LLAMA:-$HOME/workspace/llama.cpp/build/bin/llama-server}
 NG=${NG:-64}; ROUNDS=${ROUNDS:-3}; NP=${NP:-8}; BLIST=${BLIST:-"1 2 4 8"}

@@ -4,6 +4,7 @@
 //! diagnostics, and CUDA inference runtime.
 //! @section CUDA Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 const shim = @import("c.zig").shim;
 
 /// Capability snapshot queried once from the active CUDA device.
@@ -46,7 +47,7 @@ pub const CudaDevice = struct {
     /// @returns Initialised `CudaDevice` for the best device, or `error.CudaNoDevice` if no device is found.
     pub fn initBest(allocator: std.mem.Allocator) !CudaDevice {
         // Allow explicit device override (e.g. ZINC_CUDA_DEVICE=1 for 4090)
-        if (std.posix.getenv("ZINC_CUDA_DEVICE")) |dev_str| {
+        if (host_io.getenv("ZINC_CUDA_DEVICE")) |dev_str| {
             if (std.fmt.parseInt(u32, dev_str, 10)) |dev_idx| {
                 return init(allocator, dev_idx);
             } else |_| {}

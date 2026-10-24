@@ -1,0 +1,817 @@
+Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"Explain how a refrigerator works.
+Write a long story about a lighthouse keeper.
+The quick brown fox jumps over the lazy dog.
+Internationalization and localization are often abbreviated i18n and l10n.
+Supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+for (int i = 0; i < 1024; ++i) { buf[i] = (uint8_t)(i * 31 ^ 0x5A); }
+   leading spaces, trailing spaces   
+Multiple
+
+
+newlines
+
+and	tabs		here.
+Numbers: 3.14159, 2,718,281, 1e-9, 0xDEADBEEF, 42nd, 1st, 2026-09-23.
+Émile Zola écrivit « J'accuse…! » en 1898 — naïve café façade.
+日本語のテキストと中文文本以及한국어 텍스트.
+Emoji test: 🚀🔥👍🏽 👨‍👩‍👧‍👦 and ✓ ✗ ★.
+Привет, как дела? Это тест токенизатора.
+URLs like https://example.com/path?query=value&x=1#frag and emails like a.b@c.io
+The mitochondria is the powerhouse of the cell; photosynthesis converts light into chemical energy.
+Refrigerators, thermodynamics, compressors, evaporators, condensers, refrigerant.
+Don't, won't, can't, shouldn't've, y'all'd've, it's, O'Reilly.
+ALL CAPS SENTENCE WITH ACRONYMS LIKE NASA, GPU, RDNA4, and CUDA.
+mixedCaseIdentifiers snake_case_names kebab-case-names SCREAMING_SNAKE
+<|im_start|>user
+<unknown> literal <p and <|im_end|>
+  	
+
+
+é́ 🇺🇸 👨‍👩‍👧‍👦 <>& \"

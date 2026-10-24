@@ -3,6 +3,7 @@
 //! Dispatch helpers use this module to build descriptor layouts, pipeline
 //! layouts, and compute pipelines from the compiled shader binaries.
 const std = @import("std");
+const host_io = @import("host_io");
 const vk = @import("vk.zig");
 const Instance = @import("instance.zig").Instance;
 
@@ -102,16 +103,16 @@ pub fn createFromSpirvWithOptions(
     allocator: std.mem.Allocator,
 ) !Pipeline {
     // Read SPIR-V binary
-    const file = std.fs.cwd().openFile(spirv_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(host_io.io, spirv_path, .{}) catch |err| {
         log.err("Failed to open SPIR-V file '{s}': {s}", .{ spirv_path, @errorName(err) });
         return error.ShaderFileNotFound;
     };
-    defer file.close();
+    defer file.close(host_io.io);
 
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const spirv_code = try allocator.alloc(u8, stat.size);
     defer allocator.free(spirv_code);
-    const bytes_read = try file.readAll(spirv_code);
+    const bytes_read = try host_io.readAll(file, spirv_code);
     if (bytes_read != stat.size) return error.ShaderReadIncomplete;
 
     // Create shader module

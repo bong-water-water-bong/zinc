@@ -8,11 +8,12 @@
 //! Q5_1 dequant reference, so a wrong kernel fails in seconds with the exact
 //! route and row that diverged.
 //!
-//!   zig build validate-moe-cols && ./zig-out/bin/zinc-validate-q5-1-moe-cols
+//!   ./scripts/zig.sh build validate-moe-cols && ./zig-out/bin/zinc-validate-q5-1-moe-cols
 //!
 //! Exit code is non-zero when any element exceeds the tolerance, so it works as
 //! a gate before touching that shader.
 const std = @import("std");
+const host_io = @import("host_io");
 
 const vulkan = @import("vulkan");
 const vk = vulkan.vk;
@@ -92,16 +93,17 @@ fn fillDeterministic(weight: []u8, input: []f32, seed: u64) void {
     for (input) |*v| v.* = r.float(f32) * 2.0 - 1.0;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const shader_dir = std.posix.getenv("ZINC_SHADER_DIR") orelse "zig-out/share/zinc/shaders";
+    const shader_dir = host_io.getenv("ZINC_SHADER_DIR") orelse "zig-out/share/zinc/shaders";
     var path_buf: [512]u8 = undefined;
-    const shader_path = try std.fmt.bufPrintZ(&path_buf, "{s}/dmmv_q5_1_moe_cols.spv", .{shader_dir});
+    const shader_path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/dmmv_q5_1_moe_cols.spv", .{shader_dir}, 0);
 
-    const device_index = if (std.posix.getenv("ZINC_GPU")) |raw|
+    const device_index = if (host_io.getenv("ZINC_GPU")) |raw|
         std.fmt.parseInt(u32, raw, 10) catch instance_mod.auto_select_device_index
     else
         instance_mod.auto_select_device_index;
@@ -176,7 +178,7 @@ fn runShape(
     var route_expert = try allocator.alloc(u32, routes);
     defer allocator.free(route_expert);
 
-    var active_blocks: std.ArrayList(u32) = .{};
+    var active_blocks: std.ArrayList(u32) = .empty;
     defer active_blocks.deinit(allocator);
     var next_route: u32 = 0;
     for (0..shape.n_experts) |e| {

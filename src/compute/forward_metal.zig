@@ -3,6 +3,7 @@
 //! This is the Metal equivalent of forward.zig (Vulkan).
 //! Uses MSL compute shaders dispatched via the Metal shim.
 const std = @import("std");
+const host_io = @import("host_io");
 const config_mod = @import("../model/config.zig");
 const ModelConfig = config_mod.ModelConfig;
 const gguf = @import("../model/gguf.zig");
@@ -101,7 +102,7 @@ pub const DecodeState = struct {
     pub fn init(allocator: std.mem.Allocator) DecodeState {
         return .{
             .position = 0,
-            .generated_tokens = .{},
+            .generated_tokens = .empty,
             .requested_context_tokens = 0,
             .allocator = allocator,
         };
@@ -269,7 +270,7 @@ fn sampleFromLogits(logits: []const f32, history: []const u32, params: SamplingP
 }
 
 fn readThreadgroupOverride(env_name: [:0]const u8, simd_width: u32, max_threads: u32) ?u32 {
-    const raw = std.posix.getenv(env_name) orelse return null;
+    const raw = host_io.getenv(env_name) orelse return null;
     if (simd_width == 0 or max_threads == 0) return null;
 
     const value = std.fmt.parseUnsigned(u32, raw, 10) catch return null;
@@ -831,14 +832,14 @@ fn shouldDebugAttentionValidation(cfg: ModelConfig, position: u32, layer_idx: us
 }
 
 fn readBoolEnv(env_name: [:0]const u8) ?bool {
-    const raw = std.posix.getenv(env_name) orelse return null;
+    const raw = host_io.getenv(env_name) orelse return null;
     if (std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
     if (std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "no")) return false;
     return null;
 }
 
 fn readU32Env(env_name: [:0]const u8) ?u32 {
-    const raw = std.posix.getenv(env_name) orelse return null;
+    const raw = host_io.getenv(env_name) orelse return null;
     return std.fmt.parseUnsigned(u32, raw, 10) catch null;
 }
 
@@ -980,7 +981,7 @@ fn denseGemmaQ4KGeGLUValidateTokens(default_tokens: u32) u32 {
 fn denseGemmaQ4KGeGLUValidationRequested(cfg: ModelConfig) bool {
     if (cfg.architecture != .gemma or cfg.n_experts != 0 or !usesGeglu(cfg)) return false;
     return (readBoolEnv("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE") orelse false) or
-        std.posix.getenv("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_LAYER") != null or
+        host_io.getenv("ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_LAYER") != null or
         denseGemmaQ4KGeGLUValidationScanRequested() or
         qwenRoutePackedFullValidationEnabled() or
         qwenRoutePackedFullValidationBisectEnabled();
@@ -991,10 +992,10 @@ fn qwen35DenseQ4KSwiGLUValidationRequested(cfg: ModelConfig) bool {
     return (readBoolEnv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE") orelse false) or
         (readBoolEnv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE") orelse false) or
         qwen35DenseQ4KSwiGLUValidationScanRequested() or
-        std.posix.getenv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_LAYER") != null or
-        std.posix.getenv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_LAYER") != null or
-        std.posix.getenv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN") != null or
-        std.posix.getenv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_TOKEN") != null;
+        host_io.getenv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_LAYER") != null or
+        host_io.getenv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_LAYER") != null or
+        host_io.getenv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN") != null or
+        host_io.getenv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_TOKEN") != null;
 }
 
 fn qwen35DenseQ4KSwiGLUValidationScanRequested() bool {
@@ -1973,38 +1974,38 @@ pub const RuntimeProfile = struct {
     decode_async_final_dispatch_calls: u32 = 0,
     decode_async_final_barrier_calls: u32 = 0,
     decode_async_final_resource_barrier_resources: u32 = 0,
-    decode_async_slot_submits: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
-    decode_async_slot_dispatch_calls: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
-    decode_async_slot_barrier_calls: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
-    decode_async_slot_resource_barrier_resources: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
-    decode_async_slot_completed_cmds: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
-    decode_async_slot_gpu_ns: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_encode_ns: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_layer_range_submits: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
-    decode_async_slot_layer_start_sum: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_layer_end_sum: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_full_attn_layers: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
-    decode_async_slot_ssm_layers: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
-    decode_async_slot_dense_ffn_layers: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
-    decode_async_slot_full_attn_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_ssm_projection_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_ssm_qkv_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_ssm_gate_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_ssm_tail_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_ssm_out_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_dense_ffn_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_dense_gate_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_dense_up_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_dense_down_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
-    decode_async_slot_ssm_barrier_phases: [decode_async_profile_slots]SsmBarrierPhaseCounters = [_]SsmBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
-    decode_async_slot_dense_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
-    decode_async_slot_dense_dispatch_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
-    decode_async_slot_dense_scope_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
-    decode_async_slot_dense_resource_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
-    decode_async_slot_dense_resource_barrier_entries_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
-    decode_async_slot_dense_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = [_]DenseFfnBarrierPhaseNsCounters{.{}} ** decode_async_profile_slots,
-    decode_async_slot_dense_scope_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = [_]DenseFfnBarrierPhaseNsCounters{.{}} ** decode_async_profile_slots,
-    decode_async_slot_dense_resource_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = [_]DenseFfnBarrierPhaseNsCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_submits: [decode_async_profile_slots]u32 = @as([decode_async_profile_slots]u32, @splat(0)),
+    decode_async_slot_dispatch_calls: [decode_async_profile_slots]u32 = @as([decode_async_profile_slots]u32, @splat(0)),
+    decode_async_slot_barrier_calls: [decode_async_profile_slots]u32 = @as([decode_async_profile_slots]u32, @splat(0)),
+    decode_async_slot_resource_barrier_resources: [decode_async_profile_slots]u32 = @as([decode_async_profile_slots]u32, @splat(0)),
+    decode_async_slot_completed_cmds: [decode_async_profile_slots]u32 = @as([decode_async_profile_slots]u32, @splat(0)),
+    decode_async_slot_gpu_ns: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_encode_ns: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_layer_range_submits: [decode_async_profile_slots]u32 = @as([decode_async_profile_slots]u32, @splat(0)),
+    decode_async_slot_layer_start_sum: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_layer_end_sum: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_full_attn_layers: [decode_async_profile_slots]u32 = @as([decode_async_profile_slots]u32, @splat(0)),
+    decode_async_slot_ssm_layers: [decode_async_profile_slots]u32 = @as([decode_async_profile_slots]u32, @splat(0)),
+    decode_async_slot_dense_ffn_layers: [decode_async_profile_slots]u32 = @as([decode_async_profile_slots]u32, @splat(0)),
+    decode_async_slot_full_attn_bytes: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_ssm_projection_bytes: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_ssm_qkv_bytes: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_ssm_gate_bytes: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_ssm_tail_bytes: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_ssm_out_bytes: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_dense_ffn_bytes: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_dense_gate_bytes: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_dense_up_bytes: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_dense_down_bytes: [decode_async_profile_slots]u64 = @as([decode_async_profile_slots]u64, @splat(0)),
+    decode_async_slot_ssm_barrier_phases: [decode_async_profile_slots]SsmBarrierPhaseCounters = @as([decode_async_profile_slots]SsmBarrierPhaseCounters, @splat(.{})),
+    decode_async_slot_dense_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = @as([decode_async_profile_slots]DenseFfnBarrierPhaseCounters, @splat(.{})),
+    decode_async_slot_dense_dispatch_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = @as([decode_async_profile_slots]DenseFfnBarrierPhaseCounters, @splat(.{})),
+    decode_async_slot_dense_scope_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = @as([decode_async_profile_slots]DenseFfnBarrierPhaseCounters, @splat(.{})),
+    decode_async_slot_dense_resource_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = @as([decode_async_profile_slots]DenseFfnBarrierPhaseCounters, @splat(.{})),
+    decode_async_slot_dense_resource_barrier_entries_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = @as([decode_async_profile_slots]DenseFfnBarrierPhaseCounters, @splat(.{})),
+    decode_async_slot_dense_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = @as([decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters, @splat(.{})),
+    decode_async_slot_dense_scope_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = @as([decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters, @splat(.{})),
+    decode_async_slot_dense_resource_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = @as([decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters, @splat(.{})),
     sample_ns: u64 = 0,
     total_step_ns: u64 = 0,
     debug_validation_ns: u64 = 0,
@@ -2050,7 +2051,7 @@ pub const RuntimeProfile = struct {
     route_pack_tail_blocks_actual: u64 = 0,
     route_pack_single_tail_blocks_actual: u64 = 0,
     route_pack_padding_slots_actual: u64 = 0,
-    route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
+    route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = @as([moe_route_pack_profile_tail_bins]u64, @splat(0)),
     queued_prefill_requests: u32 = 0,
     queued_prefill_prompt_tokens: u32 = 0,
     queued_prefill_requested_chunk_tokens: u32 = 0,
@@ -2061,7 +2062,7 @@ pub const RuntimeProfile = struct {
     queued_prefill_min_chunk_tokens: u32 = 0,
     queued_prefill_max_chunk_tokens: u32 = 0,
     queued_prefill_schedule_len: u32 = 0,
-    queued_prefill_schedule: [8]u8 = [_]u8{0} ** 8,
+    queued_prefill_schedule: [8]u8 = @as([8]u8, @splat(0)),
     queued_prefill_async_dispatch_calls: u32 = 0,
     queued_prefill_final_dispatch_calls: u32 = 0,
     queued_prefill_async_barrier_calls: u32 = 0,
@@ -2143,9 +2144,9 @@ pub const RuntimeProfile = struct {
     ssm_conv_calls: u32 = 0,
     ssm_delta_calls: u32 = 0,
     ssm_gated_norm_calls: u32 = 0,
-    q4k_shape_stats: [16]DmmvShapeStat = [_]DmmvShapeStat{.{}} ** 16,
-    q6k_shape_stats: [16]DmmvShapeStat = [_]DmmvShapeStat{.{}} ** 16,
-    q8_shape_stats: [16]Q8ShapeStat = [_]Q8ShapeStat{.{}} ** 16,
+    q4k_shape_stats: [16]DmmvShapeStat = @as([16]DmmvShapeStat, @splat(.{})),
+    q6k_shape_stats: [16]DmmvShapeStat = @as([16]DmmvShapeStat, @splat(.{})),
+    q8_shape_stats: [16]Q8ShapeStat = @as([16]Q8ShapeStat, @splat(.{})),
     q8_repacked_tg128_bytes: u64 = 0,
     q8_repacked_exact_qwen_bytes: u64 = 0,
     q8_repacked_quad_bytes: u64 = 0,
@@ -2154,7 +2155,7 @@ pub const RuntimeProfile = struct {
     q8_repacked_exact_qwen_calls: u32 = 0,
     q8_repacked_quad_calls: u32 = 0,
     q8_repacked_generic_calls: u32 = 0,
-    q8_repacked_dispatch_stats: [16]Q8RepackedDispatchStat = [_]Q8RepackedDispatchStat{.{}} ** 16,
+    q8_repacked_dispatch_stats: [16]Q8RepackedDispatchStat = @as([16]Q8RepackedDispatchStat, @splat(.{})),
 
     fn reset(self: *RuntimeProfile) void {
         self.* = .{};
@@ -2162,12 +2163,12 @@ pub const RuntimeProfile = struct {
 };
 
 fn profileStart(enabled: bool) i128 {
-    return if (enabled) std.time.nanoTimestamp() else -1;
+    return if (enabled) host_io.nanoTimestamp() else -1;
 }
 
 fn profileElapsedNs(start_ns: i128) u64 {
     if (start_ns < 0) return 0;
-    const end_ns = std.time.nanoTimestamp();
+    const end_ns = host_io.nanoTimestamp();
     if (end_ns <= start_ns) return 0;
     return @intCast(end_ns - start_ns);
 }
@@ -5350,25 +5351,25 @@ fn resolveMoeGateUpLayout(lt: LayerTensors, inter_dim: u32, hidden_dim: u32) !Mo
 const BatchedPrefillMode = enum { off, on, validate };
 
 fn batchedPrefillMode() BatchedPrefillMode {
-    const raw = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse return .off;
+    const raw = host_io.getenv("ZINC_BATCHED_PREFILL") orelse return .off;
     if (std.mem.eql(u8, raw, "1")) return .on;
     if (std.mem.eql(u8, raw, "validate")) return .validate;
     return .off;
 }
 
 fn batchedPrefillEnvPresent() bool {
-    return std.posix.getenv("ZINC_BATCHED_PREFILL") != null;
+    return host_io.getenv("ZINC_BATCHED_PREFILL") != null;
 }
 
 fn gemmaBatchedPrefillMode() BatchedPrefillMode {
-    const raw = std.posix.getenv("ZINC_GEMMA_BATCHED_PREFILL") orelse return .off;
+    const raw = host_io.getenv("ZINC_GEMMA_BATCHED_PREFILL") orelse return .off;
     if (std.mem.eql(u8, raw, "1")) return .on;
     if (std.mem.eql(u8, raw, "validate")) return .validate;
     return .off;
 }
 
 fn gemmaBatchedPrefillEnvPresent() bool {
-    return std.posix.getenv("ZINC_GEMMA_BATCHED_PREFILL") != null;
+    return host_io.getenv("ZINC_GEMMA_BATCHED_PREFILL") != null;
 }
 
 fn gemmaBatchedPrefillEnabled() bool {
@@ -5514,7 +5515,7 @@ fn recordQueuedPrefillStart(
     p.queued_prefill_max_chunk_tokens = 0;
     p.queued_prefill_final_chunk_tokens = 0;
     p.queued_prefill_schedule_len = 0;
-    p.queued_prefill_schedule = [_]u8{0} ** 8;
+    p.queued_prefill_schedule = @as([8]u8, @splat(0));
     p.queued_prefill_async_dispatch_calls = 0;
     p.queued_prefill_final_dispatch_calls = 0;
     p.queued_prefill_async_barrier_calls = 0;
@@ -5569,7 +5570,7 @@ fn recordQueuedPrefillAsyncSubmit(profile: ?*RuntimeProfile, first_async_submit_
     const p = profile orelse return;
     p.queued_prefill_async_submit_count += 1;
     if (first_async_submit_ns.* < 0) {
-        first_async_submit_ns.* = std.time.nanoTimestamp();
+        first_async_submit_ns.* = host_io.nanoTimestamp();
     }
 }
 
@@ -7668,7 +7669,7 @@ pub const InferenceEngine = struct {
         self.kv_cache_bytes_per_token = @intCast(kv_cache_bytes_per_token);
         self.q8_tg_override = null;
         self.q8_dual_tg_override = null;
-        self.q8_tg_size_env_present = std.posix.getenv("ZINC_METAL_Q8_TG_SIZE") != null;
+        self.q8_tg_size_env_present = host_io.getenv("ZINC_METAL_Q8_TG_SIZE") != null;
         self.qwen_shared_down_q8_quad_enabled = readBoolEnv("ZINC_METAL_QWEN_SHARED_DOWN_Q8_QUAD") orelse true;
         self.qwen_ssm_q8_quad_enabled = readBoolEnv("ZINC_METAL_QWEN_SSM_Q8_QUAD") orelse true;
         self.qwen_ssm_out_q8_k4096_enabled = readBoolEnv("ZINC_METAL_QWEN_SSM_OUT_Q8_K4096") orelse true;
@@ -9908,11 +9909,11 @@ pub const InferenceEngine = struct {
     }
 
     fn canUseQwenLayer0RoutePackedPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
-        const force_f32_shared_gate = if (std.posix.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw|
+        const force_f32_shared_gate = if (host_io.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw|
             std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")
         else
             false;
-        if (std.posix.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw| {
+        if (host_io.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw| {
             if (std.mem.eql(u8, raw, "0")) return false;
         }
         return self.canUseQwenLayer0RoutePackedPrefillWithSharedGateMode(prompt_len, force_f32_shared_gate);
@@ -10015,7 +10016,7 @@ pub const InferenceEngine = struct {
     fn logQwenLayer0RoutePackedPrefillBlocker(self: *const InferenceEngine, prompt_len: usize) void {
         if (!self.profile_enabled) return;
 
-        if (std.posix.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw| {
+        if (host_io.getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw| {
             if (std.mem.eql(u8, raw, "0")) {
                 log.info("Metal profile: Qwen route-packed prefill disabled: ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=0", .{});
                 return;
@@ -11888,7 +11889,7 @@ fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
     defer allocator.free(shader_dir);
 
     return loadShaderPipelineFromDir(ctx, name, shader_dir) catch |err| {
-        if (err == error.ShaderNotFound and std.posix.getenv("ZINC_SHADER_DIR") == null and !std.mem.eql(u8, shader_dir, "src/shaders/metal")) {
+        if (err == error.ShaderNotFound and host_io.getenv("ZINC_SHADER_DIR") == null and !std.mem.eql(u8, shader_dir, "src/shaders/metal")) {
             return loadShaderPipelineFromDir(ctx, name, "src/shaders/metal") catch |source_err| {
                 log.err("Failed to open shader '{s}' from resolved dir and source fallback: {s}", .{ name, @errorName(source_err) });
                 return error.ShaderNotFound;
@@ -11908,7 +11909,7 @@ fn loadShaderPipelineWithPrefix(ctx: ?*shim.MetalCtx, name: []const u8, source_n
     defer allocator.free(shader_dir);
 
     return loadShaderPipelineFromDirWithPrefix(ctx, name, source_name, shader_dir, prefix) catch |err| {
-        if (err == error.ShaderNotFound and std.posix.getenv("ZINC_SHADER_DIR") == null and !std.mem.eql(u8, shader_dir, "src/shaders/metal")) {
+        if (err == error.ShaderNotFound and host_io.getenv("ZINC_SHADER_DIR") == null and !std.mem.eql(u8, shader_dir, "src/shaders/metal")) {
             return loadShaderPipelineFromDirWithPrefix(ctx, name, source_name, "src/shaders/metal", prefix) catch |source_err| {
                 log.err("Failed to open shader '{s}' from resolved dir and source fallback: {s}", .{ name, @errorName(source_err) });
                 return error.ShaderNotFound;
@@ -11937,16 +11938,16 @@ fn loadShaderPipelineFromDirWithPrefix(
     const path = std.fs.path.join(allocator, &.{ shader_dir, file_name }) catch return error.OutOfMemory;
     defer allocator.free(path);
 
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.ShaderNotFound;
-    defer file.close();
-    const stat = try file.stat();
+    const file = std.Io.Dir.cwd().openFile(host_io.io, path, .{}) catch return error.ShaderNotFound;
+    defer file.close(host_io.io);
+    const stat = try file.stat(host_io.io);
     if (stat.size + prefix.len >= 1024 * 1024) return error.ShaderTooLarge;
     var source_buf: [1024 * 1024]u8 = undefined;
     @memcpy(source_buf[0..prefix.len], prefix);
-    const bytes_read = try file.readAll(source_buf[prefix.len .. source_buf.len - 1]);
+    const bytes_read = try host_io.readAll(file, source_buf[prefix.len .. source_buf.len - 1]);
     source_buf[prefix.len + bytes_read] = 0;
     var fn_buf: [128]u8 = undefined;
-    const fn_name = std.fmt.bufPrintZ(&fn_buf, "main0", .{}) catch return error.NameTooLong;
+    const fn_name = std.fmt.bufPrintSentinel(&fn_buf, "main0", .{}, 0) catch return error.NameTooLong;
     var pipe = try metal_pipeline.createPipeline(ctx, @ptrCast(&source_buf), fn_name);
     // All current callers pass string literals — safe to store the slice by reference.
     pipe.name = name;
@@ -14720,7 +14721,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
     }
 
     const pip = engine.cachedDmmvPipelineForType(tensor, M, K) orelse {
-        log.err("No DMMV pipeline for quant type {d} (tensor {s})", .{ @intFromEnum(tensor.info.type_), tensor.info.name });
+        log.err("No DMMV pipeline for quant type {d} (tensor {s})", .{ @backingInt(tensor.info.type_), tensor.info.name });
         return;
     };
     const push = DmmvPush{
@@ -14933,7 +14934,7 @@ fn dispatchLmHeadWithInputOffset(
         tensorPageOffset(engine.model, tensor);
 
     const pip = engine.cachedDmmvPipelineForType(tensor, vocab_size, hidden_dim) orelse {
-        log.err("No DMMV pipeline for LM head quant type {d}", .{@intFromEnum(tensor.info.type_)});
+        log.err("No DMMV pipeline for LM head quant type {d}", .{@backingInt(tensor.info.type_)});
         return;
     };
     const push = DmmvPush{
@@ -15047,7 +15048,7 @@ fn dispatchDmmvOnCmdWithInputOutputOffset(
 ) void {
     recordDmmvProfile(engine, tensor, M, K);
     const pip = engine.cachedDmmvPipelineForType(tensor, M, K) orelse {
-        log.err("No DMMV pipeline for quant type {d} (tensor {s})", .{ @intFromEnum(tensor.info.type_), tensor.info.name });
+        log.err("No DMMV pipeline for quant type {d} (tensor {s})", .{ @backingInt(tensor.info.type_), tensor.info.name });
         return;
     };
     const push = DmmvPush{
@@ -21481,7 +21482,7 @@ pub fn dequantRow(raw_data: []const u8, row: u32, cols: u32, quant_type: GGMLTyp
             }
         },
         else => {
-            log.warn("Unsupported quant type {d}, using zeros", .{@intFromEnum(quant_type)});
+            log.warn("Unsupported quant type {d}, using zeros", .{@backingInt(quant_type)});
             @memset(output, 0);
         },
     }
@@ -21546,7 +21547,7 @@ fn readMmapFloats(mmap: []const u8, base_off: usize, tensor_type: GGMLType, outp
 /// @param out_weights Output slice of length k; filled with softmax-normalized weights.
 pub fn topKSoftmaxWeight(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f32) void {
     const n = logits.len;
-    var used = [_]bool{false} ** 256;
+    var used = @as([256]bool, @splat(false));
     for (0..k) |ki| {
         var best_idx: u32 = 0;
         var best_val: f32 = -std.math.inf(f32);
@@ -21594,7 +21595,7 @@ pub fn topKSoftmax(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f
     if (sum > 0) for (0..n) |i| {
         probs[i] /= sum;
     };
-    var used = [_]bool{false} ** 256;
+    var used = @as([256]bool, @splat(false));
     for (0..k) |ki| {
         var best_idx: u32 = 0;
         var best_val: f32 = -1.0;
@@ -30741,7 +30742,7 @@ pub fn generateWithMetrics(
     extra_stop_ids: []const u32,
     allocator: std.mem.Allocator,
 ) !GenerateResult {
-    var output: std.ArrayList(u32) = .{};
+    var output: std.ArrayList(u32) = .empty;
     errdefer output.deinit(allocator);
 
     const prompt_token_count: u32 = @intCast(@min(prompt_tokens.len, std.math.maxInt(u32)));
@@ -30754,13 +30755,13 @@ pub fn generateWithMetrics(
     state.requested_context_tokens = request_budget.target_context_tokens;
 
     // Prefill: process each prompt token through all layers
-    const prefill_start = std.time.nanoTimestamp();
+    const prefill_start = host_io.nanoTimestamp();
     if (prompt_tokens.len > 0) {
         try engine.prefillBatched(&state, prompt_tokens);
     } else {
         try engine.resetRequestState(state.requested_context_tokens);
     }
-    const prefill_end = std.time.nanoTimestamp();
+    const prefill_end = host_io.nanoTimestamp();
     const prefill_ns: u64 = @intCast(prefill_end - prefill_start);
     if (engine.profile_enabled) {
         engine.prefill_profile = engine.request_profile;
@@ -30795,7 +30796,7 @@ pub fn generateWithMetrics(
     }
 
     // Decode loop
-    const decode_start = std.time.nanoTimestamp();
+    const decode_start = host_io.nanoTimestamp();
     var tokens_generated: u32 = @intCast(output.items.len);
     const use_spec = specDecodeEnabled() and output.items.len > 0 and
         engine.config.architecture == .muse_glimmer and canUseBatchedPrefill(engine);
@@ -30803,7 +30804,7 @@ pub fn generateWithMetrics(
         // Prompt-lookup speculative decode: draft a continuation from the token
         // history, verify K+1 tokens in ONE batched forward pass, accept the
         // longest prefix the target confirms. Exact for greedy.
-        var full_seq: std.ArrayList(u32) = .{};
+        var full_seq: std.ArrayList(u32) = .empty;
         defer full_seq.deinit(allocator);
         try full_seq.appendSlice(allocator, prompt_tokens);
         try full_seq.appendSlice(allocator, output.items);
@@ -30839,10 +30840,10 @@ pub fn generateWithMetrics(
             if (!do_verify) {
                 // Cheap single-token decode: no draft, calibration, or acceptance
                 // below the point where a full verify forward pays for itself.
-                const ft0 = std.time.nanoTimestamp();
+                const ft0 = host_io.nanoTimestamp();
                 try engine.decodeStep(&state, seed);
                 const next_token = engine.sampleGreedy();
-                spec_fallback_ns += @intCast(std.time.nanoTimestamp() - ft0);
+                spec_fallback_ns += @intCast(host_io.nanoTimestamp() - ft0);
                 if (isGenerationStopToken(next_token, eos_id, extra_stop_ids)) break :outer;
                 try output.append(allocator, next_token);
                 try state.generated_tokens.append(allocator, next_token);
@@ -30854,9 +30855,9 @@ pub fn generateWithMetrics(
             verify_toks[0] = seed;
             for (0..ndraft) |k| verify_toks[1 + k] = draft_buf[k];
             const pos_before = engine.position;
-            const vt0 = std.time.nanoTimestamp();
+            const vt0 = host_io.nanoTimestamp();
             try engine.verifyTokens(&state, verify_toks[0 .. 1 + ndraft], verify_out[0 .. 1 + ndraft]);
-            spec_verify_ns += @intCast(std.time.nanoTimestamp() - vt0);
+            spec_verify_ns += @intCast(host_io.nanoTimestamp() - vt0);
             spec_verify_tokens += 1 + ndraft;
             // Longest confirmed draft prefix.
             var j: usize = 0;
@@ -30911,7 +30912,7 @@ pub fn generateWithMetrics(
             tokens_generated += 1;
         }
     }
-    const decode_end = std.time.nanoTimestamp();
+    const decode_end = host_io.nanoTimestamp();
     const decode_ns: u64 = @intCast(decode_end - decode_start);
     const decode_tps = if (tokens_generated > 0 and decode_ns > 0)
         @as(f64, @floatFromInt(tokens_generated)) * 1_000_000_000.0 / @as(f64, @floatFromInt(decode_ns))
@@ -31003,8 +31004,8 @@ fn refRunSsmDeltaNet(
     const qk_dim = d_state * n_group;
     const k_len = @min(head_v_dim, d_state);
 
-    var q_buf: [128]f32 = [_]f32{0} ** 128;
-    var k_buf: [128]f32 = [_]f32{0} ** 128;
+    var q_buf: [128]f32 = @as([128]f32, @splat(0));
+    var k_buf: [128]f32 = @as([128]f32, @splat(0));
 
     for (0..dt_rank) |h| {
         @memset(q_buf[0..head_v_dim], 0);
@@ -31904,7 +31905,7 @@ test "gemma_moe_weighted_post_norm_residual_batched folds scaled routes per toke
     for (0..total) |i| expected[i] = hidden[i];
 
     for (0..n_tokens) |token| {
-        var expert_reduced: [n]f32 = [_]f32{0.0} ** n;
+        var expert_reduced: [n]f32 = @as([n]f32, @splat(0.0));
         for (0..n) |i| {
             for (0..k) |slot| {
                 const eid = expert_ids[token][slot];
@@ -32025,7 +32026,7 @@ test "ssm_delta_net shader matches CPU reference" {
     @memset(output_ptr[0..d_inner], 0);
 
     var ref_state: [32]f32 = undefined;
-    var ref_output: [8]f32 = [_]f32{0} ** 8;
+    var ref_output: [8]f32 = @as([8]f32, @splat(0));
     @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
     refRunSsmDeltaNet(
         conv_ptr[0..conv_len],
@@ -32138,7 +32139,7 @@ test "ssm_delta_net_offset shader matches CPU reference with row offsets" {
     @memset(output_ptr[0 .. 2 * d_inner], 0);
 
     var ref_state: [32]f32 = undefined;
-    var ref_output: [8]f32 = [_]f32{0} ** 8;
+    var ref_output: [8]f32 = @as([8]f32, @splat(0));
     @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
     refRunSsmDeltaNet(
         conv_ptr[conv_len .. 2 * conv_len],
@@ -32257,7 +32258,7 @@ test "ssm_delta_net_prefill shader matches CPU reference across token chunk" {
     var initial_state: [32]f32 = undefined;
     @memcpy(initial_state[0..state_len], state_ptr[0..state_len]);
     var ref_state: [32]f32 = undefined;
-    var ref_output: [24]f32 = [_]f32{0} ** 24;
+    var ref_output: [24]f32 = @as([24]f32, @splat(0));
     @memcpy(ref_state[0..state_len], initial_state[0..state_len]);
     for (0..token_count) |t| {
         const conv_base = t * conv_len_usize;
@@ -32702,7 +32703,7 @@ test "ssm_conv1d shader matches CPU reference" {
     @memset(output_ptr[0..conv_channels], 0);
 
     var ref_state: [state_len]f32 = undefined;
-    var ref_output: [conv_channels]f32 = [_]f32{0} ** conv_channels;
+    var ref_output: [conv_channels]f32 = @as([conv_channels]f32, @splat(0));
     @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
     refRunSsmConv1d(
         input_ptr[0..conv_channels],
@@ -32863,7 +32864,7 @@ test "ssm_conv1d_prefill shader matches repeated CPU reference" {
     @memset(output_ptr[0 .. n_tokens * conv_channels], 0);
 
     var ref_state: [state_len]f32 = undefined;
-    var ref_output: [n_tokens * conv_channels]f32 = [_]f32{0} ** (n_tokens * conv_channels);
+    var ref_output: [n_tokens * conv_channels]f32 = @as([(n_tokens * conv_channels)]f32, @splat(0));
     @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
     for (0..n_tokens) |t| {
         refRunSsmConv1d(
@@ -33020,7 +33021,7 @@ test "ssm_gated_norm shader matches CPU reference with shared norm weights" {
     @memcpy(norm_ptr[0..d_inner], norm_init[0..d_inner]);
     @memset(output_ptr[0..d_inner], 0);
 
-    var ref_output: [d_inner]f32 = [_]f32{0} ** d_inner;
+    var ref_output: [d_inner]f32 = @as([d_inner]f32, @splat(0));
     refRunSsmGatedNorm(
         delta_ptr[0..d_inner],
         gate_ptr[0..d_inner],
@@ -33089,7 +33090,7 @@ test "ssm_gated_norm shader matches CPU reference with per-head norm weights" {
     @memcpy(norm_ptr[0..d_inner], norm_init[0..d_inner]);
     @memset(output_ptr[0..d_inner], 0);
 
-    var ref_output: [d_inner]f32 = [_]f32{0} ** d_inner;
+    var ref_output: [d_inner]f32 = @as([d_inner]f32, @splat(0));
     refRunSsmGatedNorm(
         delta_ptr[0..d_inner],
         gate_ptr[0..d_inner],
@@ -33421,8 +33422,8 @@ test "ssm_delta_net_gated_norm shader matches CPU reference" {
     @memset(output_ptr[0..d_inner], 0);
 
     var ref_state: [state_len]f32 = undefined;
-    var ref_delta: [d_inner]f32 = [_]f32{0} ** d_inner;
-    var ref_output: [d_inner]f32 = [_]f32{0} ** d_inner;
+    var ref_delta: [d_inner]f32 = @as([d_inner]f32, @splat(0));
+    var ref_output: [d_inner]f32 = @as([d_inner]f32, @splat(0));
     @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
     refRunSsmDeltaNet(
         conv_ptr[0..conv_len],
@@ -33509,7 +33510,7 @@ test "dequantRow F32 direct copy" {
 }
 
 test "dequantRow q5_0 reads second-half high bits from qh bit 16" {
-    var raw = [_]u8{0} ** 22;
+    var raw = @as([22]u8, @splat(0));
     const d_bits = @as(u16, @bitCast(@as(f16, 1.0)));
     raw[0] = @truncate(d_bits);
     raw[1] = @truncate(d_bits >> 8);
@@ -33519,14 +33520,14 @@ test "dequantRow q5_0 reads second-half high bits from qh bit 16" {
     raw[4] = @truncate(qh >> 16);
     raw[5] = @truncate(qh >> 24);
 
-    var out = [_]f32{0} ** 32;
+    var out = @as([32]f32, @splat(0));
     dequantRow(&raw, 0, 32, .q5_0, &out);
     try std.testing.expectApproxEqAbs(@as(f32, -16.0), out[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[16], 0.001);
 }
 
 test "dequantRow q5_1 reads second-half high bits from qh bit 16" {
-    var raw = [_]u8{0} ** 24;
+    var raw = @as([24]u8, @splat(0));
     const d_bits = @as(u16, @bitCast(@as(f16, 1.0)));
     raw[0] = @truncate(d_bits);
     raw[1] = @truncate(d_bits >> 8);
@@ -33539,7 +33540,7 @@ test "dequantRow q5_1 reads second-half high bits from qh bit 16" {
     raw[6] = @truncate(qh >> 16);
     raw[7] = @truncate(qh >> 24);
 
-    var out = [_]f32{0} ** 32;
+    var out = @as([32]f32, @splat(0));
     dequantRow(&raw, 0, 32, .q5_1, &out);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 16.0), out[16], 0.001);
@@ -36547,7 +36548,7 @@ test "dense FFN tensors populate detailed profile buckets" {
 }
 
 test "DMMV hot-shape profile keeps dense gate and up separate" {
-    var stats: [4]DmmvShapeStat = [_]DmmvShapeStat{.{}} ** 4;
+    var stats: [4]DmmvShapeStat = @as([4]DmmvShapeStat, @splat(.{}));
 
     recordDmmvShapeProfile(stats[0..], .dense_ffn, .dense_gate, 17408, 5120, 10);
     recordDmmvShapeProfile(stats[0..], .dense_ffn, .dense_up, 17408, 5120, 20);
@@ -38328,7 +38329,7 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
         try std.testing.expectEqual(@as(u32, 0), active_count_ptr[stats_base + 10]);
     }
 
-    var seen_routes = [_]bool{false} ** route_slots;
+    var seen_routes = @as([route_slots]bool, @splat(false));
     for (0..n_experts) |expert| {
         for (0..@as(usize, @intCast(counts_ptr[expert]))) |i| {
             const route = ids_ptr[expert * ids_stride + i];
@@ -38344,7 +38345,7 @@ test "moe_route_pack_blocks shader packs from flattened routes" {
     }
     for (seen_routes) |seen| try std.testing.expect(seen);
 
-    var seen_blocks = [_][4]bool{[_]bool{false} ** 4} ** n_experts;
+    var seen_blocks = @as([n_experts][4]bool, @splat(@as([4]bool, @splat(false))));
     for (0..active_count_ptr[0]) |i| {
         const entry = active_blocks_ptr[i];
         const expert = entry & 0xFFFF;
@@ -41609,7 +41610,7 @@ test "repacked Q8_0 quad shader matches CPU reference with tail rows" {
         input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 14));
     }
 
-    var expected: [9]f32 = .{0} ** 9;
+    var expected: [9]f32 = @splat(0);
     for (0..M) |row| {
         var dot: f32 = 0.0;
         for (0..blocks_per_row) |bi| {
@@ -41740,7 +41741,7 @@ test "repacked Q8_0 K4096 quad shader matches CPU reference with tail rows" {
         input_ptr[i] = 0.0625 * @as(f32, @floatFromInt(raw - 15));
     }
 
-    var expected: [7]f32 = .{0} ** 7;
+    var expected: [7]f32 = @splat(0);
     for (0..M) |row| {
         var dot: f32 = 0.0;
         for (0..blocks_per_row) |bi| {

@@ -3,6 +3,7 @@
 //! Handles /v1/chat/completions, /v1/completions, /v1/models, /health,
 //! and a built-in chat UI. Supports both streaming (SSE) and non-streaming responses.
 const std = @import("std");
+const host_io = @import("host_io");
 const http = @import("http.zig");
 const runtime = @import("runtime.zig");
 const forward_mod = runtime.forward_mod;
@@ -29,7 +30,7 @@ pub fn toolCallingEnabled() bool {
     const cached = tool_calling_state.load(.acquire);
     if (cached >= 0) return cached == 1;
     const enabled = blk: {
-        const val = std.process.getEnvVarOwned(std.heap.page_allocator, "ZINC_TOOL_CALLING") catch break :blk true;
+        const val = host_io.getEnvVarOwned(std.heap.page_allocator, "ZINC_TOOL_CALLING") catch break :blk true;
         defer std.heap.page_allocator.free(val);
         break :blk !std.mem.eql(u8, val, "0") and !std.mem.eql(u8, val, "false");
     };
@@ -80,7 +81,7 @@ const ChatReuseEntry = struct {
 /// else falls back to a full prefill, which is slower and correct.
 const ChatReuseCache = struct {
     allocator: std.mem.Allocator,
-    entries: std.ArrayListUnmanaged(ChatReuseEntry) = .{},
+    entries: std.ArrayListUnmanaged(ChatReuseEntry) = .empty,
     /// Session whose transcript is resident in the engine right now, if any.
     live_session: ?[]u8 = null,
     /// Set by storeCheckpointed for the duration of its store() call.
@@ -353,7 +354,7 @@ pub const ServerState = struct {
     active_requests: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     queued_requests: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     active_context_tokens: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    generation_mutex: std.Thread.Mutex = .{},
+    generation_mutex: host_io.Mutex = .{},
     downloads: DownloadTracker = .{},
     chat_reuse_cache: ChatReuseCache,
     tokenize_cache: TokenizeCache = .{},
@@ -449,15 +450,15 @@ const DownloadSnapshot = struct {
 };
 
 const DownloadTracker = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: host_io.Mutex = .{},
     active: bool = false,
     phase: DownloadPhase = .idle,
     model_id_len: usize = 0,
-    model_id_buf: [96]u8 = [_]u8{0} ** 96,
+    model_id_buf: [96]u8 = @as([96]u8, @splat(0)),
     downloaded_bytes: u64 = 0,
     total_bytes: u64 = 0,
     error_len: usize = 0,
-    error_buf: [160]u8 = [_]u8{0} ** 160,
+    error_buf: [160]u8 = @as([160]u8, @splat(0)),
 
     fn snapshot(self: *DownloadTracker) DownloadSnapshot {
         self.mutex.lock();
@@ -616,7 +617,7 @@ fn buildHealthJson(
     memory_usage: model_manager_mod.ModelManager.MemoryUsage,
     buf: []u8,
 ) ![]const u8 {
-    const now = std.time.timestamp();
+    const now = host_io.timestamp();
     const snapshot = server_state.snapshot(now);
     const active_context_tokens = memory_usage.activeContextTokens(snapshot.active_context_tokens);
     const active_context_bytes = memory_usage.activeContextBytes(active_context_tokens);
@@ -657,10 +658,11 @@ fn handleModels(
     const memory_usage = manager.currentMemoryUsage();
     const download = server_state.downloads.snapshot();
 
-    var body: std.ArrayList(u8) = .{};
+    var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
 
-    try body.writer(allocator).print(
+    try body.print(
+        allocator,
         "{{\"object\":\"list\",\"profile\":\"{s}\",\"active_memory_used_bytes\":{d},\"active_memory_budget_bytes\":{d},\"active_memory_weights_bytes\":{d},\"active_memory_runtime_bytes\":{d},\"active_context_reserved_bytes\":{d},\"active_context_active_bytes\":{d},\"active_context_tokens\":{d},\"active_context_capacity_tokens\":{d},\"data\":[",
         .{
             view.profile,
@@ -674,7 +676,7 @@ fn handleModels(
             memory_usage.context_capacity_tokens,
         },
     );
-    const ts = @divTrunc(std.time.timestamp(), 1);
+    const ts = @divTrunc(host_io.timestamp(), 1);
     for (view.data, 0..) |entry, i| {
         if (i != 0) try body.append(allocator, ',');
         const fit_source = if (entry.exact_fit) "exact" else "catalog";
@@ -683,7 +685,7 @@ fn handleModels(
         const download_phase = if (is_download_target) @tagName(download.phase) else "idle";
         const download_error = if (is_download_target) download.errorMessage() else "";
         const entry_context_length: u32 = if (entry.active) memory_usage.context_capacity_tokens else 0;
-        try body.writer(allocator).print(
+        try body.print(allocator,
             \\{{"id":"{s}","object":"model","created":{d},"owned_by":"zinc","context_length":{d},"display_name":"{s}","release_date":"{s}","homepage_url":"{s}","family":"{s}","quantization":"{s}","size_bytes":{d},"installed":{s},"active":{s},"managed":{s},"supported_on_current_gpu":{s},"fits_current_gpu":{s},"required_vram_bytes":{d},"required_vram_with_offload_bytes":{d},"requires_offload_to_fit":{s},"fit_source":"{s}","status":"{s}","supports_thinking_toggle":{s},"downloading":{s},"download_phase":"{s}","downloaded_bytes":{d},"download_total_bytes":{d},"download_error":"{s}"}}
         , .{
             entry.id,
@@ -1095,7 +1097,7 @@ const Content = struct {
             },
             .array_begin => {
                 _ = try source.next();
-                var pieces: std.ArrayList([]const u8) = .{};
+                var pieces: std.ArrayList([]const u8) = .empty;
                 defer pieces.deinit(allocator);
                 while (true) {
                     if ((try source.peekNextTokenType()) == .array_end) {
@@ -1165,7 +1167,7 @@ fn parseStopSequences(allocator: std.mem.Allocator, value: ?std.json.Value) ![]c
             return out;
         },
         .array => |arr| {
-            var list: std.ArrayList([]const u8) = .{};
+            var list: std.ArrayList([]const u8) = .empty;
             errdefer {
                 for (list.items) |s| allocator.free(s);
                 list.deinit(allocator);
@@ -1535,7 +1537,7 @@ test "transcriptTailAfter returns the end-of-turn tokens after the reply" {
 }
 
 fn decodeTokensToText(allocator: std.mem.Allocator, tokenizer: anytype, toks: []const u32) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var dec: [256]u8 = undefined;
     for (toks) |t| {
@@ -1549,7 +1551,7 @@ fn decodeTokensToText(allocator: std.mem.Allocator, tokenizer: anytype, toks: []
 /// it) from `text`: what a chat template drops when it re-renders a past
 /// assistant turn. An unclosed block is kept, since the template keeps it too.
 fn stripClosedThinkingBlocks(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < text.len) {
@@ -1646,7 +1648,7 @@ fn decodeTokenWindow(tokenizer: anytype, toks: []const u32, lo: usize, hi: usize
 
 fn isTransientChatReuseHint(role: []const u8, content: []const u8) bool {
     if (!std.mem.eql(u8, role, "system")) return false;
-    const trimmed = std.mem.trimLeft(u8, content, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, content, " \t\r\n");
     return std.mem.startsWith(u8, trimmed, "Tool path guard:") or
         std.mem.startsWith(u8, trimmed, "OpenCode continuation guard:");
 }
@@ -1698,7 +1700,7 @@ fn warmChatReuseCache(
     allocator: std.mem.Allocator,
 ) !void {
     if (session_id.len == 0) return;
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = host_io.nanoTimestamp();
 
     const processed_prefix_len = prompt_tokens.len + processed_generated_tokens.len;
     const persistent_count = persistentChatHistoryLen(roles, contents);
@@ -1849,7 +1851,7 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         // assistant-visible <tool_call> blocks so the next tool result/user turn
         // has the same semantic context the model originally produced.
         if (tools_enabled and std.mem.eql(u8, message.role, "assistant") and message.tool_calls.len > 0) {
-            var rendered: std.ArrayList(u8) = .{};
+            var rendered: std.ArrayList(u8) = .empty;
             if (message.content.text.len > 0) {
                 const sanitized = sanitizeAssistantHistoryContent(message.content.text);
                 try rendered.appendSlice(arena_alloc, sanitized);
@@ -1951,7 +1953,7 @@ fn trimTrailingChatArtifacts(text: []const u8) []const u8 {
     var out = text;
     while (true) {
         const trimmed_left = trimLeadingStandaloneQuote(out);
-        const trimmed = std.mem.trimRight(u8, trimmed_left, " \t\r\n");
+        const trimmed = std.mem.trimEnd(u8, trimmed_left, " \t\r\n");
         if (std.mem.endsWith(u8, trimmed, "<|endoftext|>")) {
             out = trimmed[0 .. trimmed.len - "<|endoftext|>".len];
             continue;
@@ -1981,7 +1983,7 @@ fn trimDanglingListMarker(text: []const u8) ?[]const u8 {
     const line_start = (std.mem.lastIndexOfScalar(u8, text, '\n') orelse return null) + 1;
     const line = std.mem.trim(u8, text[line_start..], " \t\r\n");
     if (line.len == 1 and (line[0] == '-' or line[0] == '*')) {
-        return std.mem.trimRight(u8, text[0..line_start], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..line_start], " \t\r\n");
     }
     return null;
 }
@@ -2007,7 +2009,7 @@ const leaked_reasoning_start_markers = [_][]const u8{
 };
 
 fn startsWithLeakedReasoning(text: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     for (leaked_reasoning_start_markers) |marker| {
         if (trimmed.len >= marker.len and std.ascii.eqlIgnoreCase(trimmed[0..marker.len], marker)) return true;
     }
@@ -2026,7 +2028,7 @@ fn findLeakedReasoningStart(text: []const u8) ?usize {
 
 fn trimLeakedNoThinkingOutput(text: []const u8) []const u8 {
     if (findLeakedReasoningStart(text)) |idx| {
-        return std.mem.trimRight(u8, text[0..idx], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..idx], " \t\r\n");
     }
     return text;
 }
@@ -2034,7 +2036,7 @@ fn trimLeakedNoThinkingOutput(text: []const u8) []const u8 {
 fn findUnexpectedThinkingTailStart(text: []const u8) ?usize {
     // If text starts with <think>, skip past the first </think> so we detect REOPENED blocks
     var search_start: usize = 0;
-    const trimmed_start = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed_start = std.mem.trimStart(u8, text, " \t\r\n");
     if (std.mem.startsWith(u8, trimmed_start, "<think>")) {
         if (std.mem.indexOf(u8, text, "</think>")) |close_idx| {
             search_start = close_idx + "</think>".len;
@@ -2052,7 +2054,7 @@ fn findUnexpectedThinkingTailStart(text: []const u8) ?usize {
 
 fn trimUnexpectedThinkingTail(text: []const u8) []const u8 {
     if (findUnexpectedThinkingTailStart(text)) |idx| {
-        const trimmed = std.mem.trimRight(u8, text[0..idx], " \t\r\n");
+        const trimmed = std.mem.trimEnd(u8, text[0..idx], " \t\r\n");
         if (trimmed.len > 0) {
             return trimmed;
         }
@@ -2158,14 +2160,14 @@ fn extractAtemMessage(text: []const u8, prefix: []const u8) AtemMessage {
     return .{
         // Keep the right edge byte-for-byte while a response is streaming so
         // every normalized update remains an extension of the previous one.
-        .body = std.mem.trimLeft(u8, body[0 .. end orelse body.len], " \t\r\n"),
+        .body = std.mem.trimStart(u8, body[0 .. end orelse body.len], " \t\r\n"),
         .found = true,
         .complete = end != null,
     };
 }
 
 fn isPartialAtemEnvelope(text: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     if (trimmed.len == 0) return true;
     const envelopes = [_][]const u8{
         atem_analysis_prefix,
@@ -2327,7 +2329,7 @@ fn findRestartedAnswerStart(text: []const u8) ?usize {
 
 fn trimRestartedAnswer(text: []const u8) []const u8 {
     if (findRestartedAnswerStart(text)) |idx| {
-        return std.mem.trimRight(u8, text[0..idx], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..idx], " \t\r\n");
     }
     return text;
 }
@@ -2335,13 +2337,13 @@ fn trimRestartedAnswer(text: []const u8) []const u8 {
 fn sanitizeAssistantHistoryContent(text: []const u8) []const u8 {
     if (std.mem.startsWith(u8, text, empty_thinking_prefix)) {
         const body = sanitizeAnswerTail(text[empty_thinking_prefix.len..]);
-        return if (body.len == 0) text else std.mem.trimRight(u8, text[0 .. empty_thinking_prefix.len + body.len], " \t\r\n");
+        return if (body.len == 0) text else std.mem.trimEnd(u8, text[0 .. empty_thinking_prefix.len + body.len], " \t\r\n");
     }
     return sanitizeAnswerTail(text);
 }
 
 fn trimLeadingStandaloneQuote(text: []const u8) []const u8 {
-    var s = std.mem.trimLeft(u8, text, " \t\r\n");
+    var s = std.mem.trimStart(u8, text, " \t\r\n");
     if (s.len == 0 or s[0] != '"') return text;
     var i: usize = 1;
     var saw_newline = false;
@@ -2355,7 +2357,7 @@ fn trimLeadingStandaloneQuote(text: []const u8) []const u8 {
         break;
     }
     if (!saw_newline) return text;
-    return std.mem.trimLeft(u8, s[i..], " \t\r\n");
+    return std.mem.trimStart(u8, s[i..], " \t\r\n");
 }
 
 fn supportsEnabledThinking(tokenizer: *const tokenizer_mod.Tokenizer, enable_thinking: ?bool) bool {
@@ -2459,7 +2461,7 @@ fn compactHistoryAnswer(answer: []const u8) []const u8 {
             break;
         }
     }
-    return std.mem.trimRight(u8, trimmed[0..cut], " \t\r\n");
+    return std.mem.trimEnd(u8, trimmed[0..cut], " \t\r\n");
 }
 
 fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
@@ -2517,7 +2519,7 @@ fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
     const stripped = std.mem.trim(u8, buf[0..out_len], " \t\r\n");
     if (stripped.len > 0) return stripped;
 
-    const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, thinking_open_tag)) return stripped;
 
     const after_open = thinking_open_tag.len;
@@ -2533,13 +2535,13 @@ fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
 }
 
 fn hasDanglingTrailingQuote(text: []const u8) bool {
-    const trimmed = std.mem.trimRight(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, text, " \t\r\n");
     if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '"') return false;
     var body = trimmed[0 .. trimmed.len - 1];
     while (std.mem.endsWith(u8, body, utf8_replacement)) {
         body = body[0 .. body.len - utf8_replacement.len];
     }
-    body = std.mem.trimRight(u8, body, " \t\r\n");
+    body = std.mem.trimEnd(u8, body, " \t\r\n");
     if (body.len == 0) return true;
     var quote_count: usize = 0;
     for (body) |c| {
@@ -2594,7 +2596,7 @@ fn pendingGeneratedText(text: []const u8, sent_len: *usize, hold_back: usize) []
 }
 
 fn trimDanglingHeading(text: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimRight(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, text, " \t\r\n");
     if (trimmed.len == 0) return null;
     const line_start = (std.mem.lastIndexOfScalar(u8, trimmed, '\n') orelse return checkHeading(trimmed, 0));
     return checkHeading(trimmed, line_start + 1);
@@ -2607,7 +2609,7 @@ fn checkHeading(trimmed: []const u8, start: usize) ?[]const u8 {
         if (c != '#') return null;
     }
     if (start == 0) return "";
-    return std.mem.trimRight(u8, trimmed[0 .. start - 1], " \t\r\n");
+    return std.mem.trimEnd(u8, trimmed[0 .. start - 1], " \t\r\n");
 }
 
 /// Validates that the model the client requested is the one currently loaded;
@@ -2759,7 +2761,7 @@ fn handleChatCompletions(
     // `encode` uses the tokenizer's allocator, which differs from the per-request
     // page allocator in server mode. Keep BOS packing in `encodePrompt` so this
     // route cannot accidentally free tokenizer-owned memory with the wrong allocator.
-    const tokenize_start_ns = std.time.nanoTimestamp();
+    const tokenize_start_ns = host_io.nanoTimestamp();
     var tokenize_cached = false;
     const prompt_tokens: []u32 = blk: {
         if (parsed.session_id.len > 0 and prompt.len >= TokenizeCache.min_prompt_bytes) {
@@ -2786,7 +2788,7 @@ fn handleChatCompletions(
     };
     errdefer allocator.free(prompt_tokens);
     defer allocator.free(prompt_tokens);
-    if (tokenize_cached and std.posix.getenv("ZINC_TOKENIZE_CACHE_VERIFY") != null) {
+    if (tokenize_cached and host_io.getenv("ZINC_TOKENIZE_CACHE_VERIFY") != null) {
         if (tokenizer.encodePrompt(prompt, allocator)) |full| {
             defer allocator.free(full);
             log.info("tokenize cache: verify {s} ({d} cached vs {d} full)", .{ if (std.mem.eql(u32, full, prompt_tokens)) "OK" else "MISMATCH", prompt_tokens.len, full.len });
@@ -2796,7 +2798,7 @@ fn handleChatCompletions(
         server_state.tokenize_cache.store(parsed.session_id, prompt, prompt_tokens);
     }
     if (prompt_tokens.len >= 16384) {
-        log.info("chat request: tokenized {d} bytes into {d} tokens in {d} ms{s}", .{ prompt.len, prompt_tokens.len, @divTrunc(std.time.nanoTimestamp() - tokenize_start_ns, 1_000_000), if (tokenize_cached) " (prefix from cache)" else "" });
+        log.info("chat request: tokenized {d} bytes into {d} tokens in {d} ms{s}", .{ prompt.len, prompt_tokens.len, @divTrunc(host_io.nanoTimestamp() - tokenize_start_ns, 1_000_000), if (tokenize_cached) " (prefix from cache)" else "" });
     }
     defer server_state.clearActiveContext();
     // What the engine actually prefills and continues. Differs from
@@ -2820,14 +2822,14 @@ fn handleChatCompletions(
     }
     server_state.setActiveContextTokens(prompt_token_count);
 
-    const ts = @divTrunc(std.time.timestamp(), 1);
+    const ts = @divTrunc(host_io.timestamp(), 1);
     const request_budget = memory_plan.requestBudget(
         prompt_token_count,
         parsed.max_tokens,
         resources.context_capacity_tokens,
     );
     const max_tokens = request_budget.completion_tokens;
-    const seed_ns: i128 = std.time.nanoTimestamp();
+    const seed_ns: i128 = host_io.nanoTimestamp();
     var req_id_buf: [32]u8 = undefined;
     const req_id = std.fmt.bufPrint(&req_id_buf, "chatcmpl-{x}", .{@as(u64, @truncate(@as(u128, @bitCast(seed_ns))))}) catch "chatcmpl-0";
     const thinking_enabled = supportsEnabledThinking(tokenizer, parsed.enable_thinking);
@@ -2852,7 +2854,7 @@ fn handleChatCompletions(
         });
     }
 
-    var processed_generated_tokens: std.ArrayList(u32) = .{};
+    var processed_generated_tokens: std.ArrayList(u32) = .empty;
     defer processed_generated_tokens.deinit(allocator);
 
     var cache_assistant_text: ?[]u8 = null;
@@ -2910,7 +2912,7 @@ fn handleChatCompletions(
     // the end of the previous generation.
     var checkpoint_pos: ?u32 = if (cacheable_session) server_state.chat_reuse_cache.checkpointPosFor(parsed.session_id, resources.model_path) else null;
     if (cacheable_session) {
-        if (server_state.chat_reuse_cache.matchSession(parsed.session_id, resources.model_path, prompt_tokens, std.time.nanoTimestamp())) |m| {
+        if (server_state.chat_reuse_cache.matchSession(parsed.session_id, resources.model_path, prompt_tokens, host_io.nanoTimestamp())) |m| {
             if (m.consumed == m.reused) {
                 reused_prefix_len = m.reused;
             } else if (server_state.chat_reuse_cache.entryTokens(parsed.session_id)) |stored| {
@@ -2958,7 +2960,7 @@ fn handleChatCompletions(
     server_state.chat_reuse_cache.clearLive();
     runtime.mtpBeginRequest(engine);
     runtime.mtpSetPrimeDuringPrefill(engine, !sampling.requiresLogitsReadback());
-    const prefill_start_ns = std.time.nanoTimestamp();
+    const prefill_start_ns = host_io.nanoTimestamp();
     if (prompt_tokens.len >= 16384) {
         log.info("chat request: {d} ms from tokenization to prefill (reuse matching)", .{@divTrunc(prefill_start_ns - tokenize_start_ns, 1_000_000)});
     }
@@ -3038,12 +3040,12 @@ fn handleChatCompletions(
             }
         }
         // ZINC_CHAT_CHECKPOINT=0 falls back to transcript reuse (diagnostics).
-        const checkpoints_enabled = if (std.posix.getenv("ZINC_CHAT_CHECKPOINT")) |v| !std.mem.eql(u8, v, "0") else true;
+        const checkpoints_enabled = if (host_io.getenv("ZINC_CHAT_CHECKPOINT")) |v| !std.mem.eql(u8, v, "0") else true;
         checkpointed = checkpoints_enabled and runtime.ssmCheckpointTake(engine, &state);
         if (checkpointed) {
             // Store the tokens the engine actually processed: after a text
             // splice they differ from the canonical prompt and its indices.
-            server_state.chat_reuse_cache.storeCheckpointed(parsed.session_id, resources.model_path, engine_prompt_tokens[0..split_at], @intCast(split_at), std.time.nanoTimestamp()) catch |err| {
+            server_state.chat_reuse_cache.storeCheckpointed(parsed.session_id, resources.model_path, engine_prompt_tokens[0..split_at], @intCast(split_at), host_io.nanoTimestamp()) catch |err| {
                 log.warn("chat cache: could not store checkpointed prefix: {s}", .{@errorName(err)});
                 checkpointed = false;
             };
@@ -3066,7 +3068,7 @@ fn handleChatCompletions(
             log.info("chat cache checkpoint taken: session={s} position={d} generation_prompt={d}", .{ parsed.session_id, split_at, engine_prompt_tokens.len - split_at });
         }
     }
-    const prefill_end_ns = std.time.nanoTimestamp();
+    const prefill_end_ns = host_io.nanoTimestamp();
     logPrefillTiming(prefill_work_tokens, prefill_start_ns, prefill_end_ns);
     server_state.setActiveContextTokens(state.position);
     // NextN/MTP speculative decoding, for greedy requests. A prompt prefilled in
@@ -3117,7 +3119,7 @@ fn handleChatCompletions(
         var any_tool_call_emitted = false;
         var tool_call_index: u32 = 0;
         var generated: u32 = 0;
-        const decode_start_ns = std.time.nanoTimestamp();
+        const decode_start_ns = host_io.nanoTimestamp();
 
         if (max_tokens > 0) {
             var prev_token = runtime.sample(engine, &state, sampling, random);
@@ -3314,7 +3316,7 @@ fn handleChatCompletions(
                 }
             }
         }
-        const decode_end_ns = std.time.nanoTimestamp();
+        const decode_end_ns = host_io.nanoTimestamp();
         logGeneratedTiming(generated, decode_start_ns, decode_end_ns);
 
         if (forced_tool_name) |tool_name| {
@@ -3347,7 +3349,7 @@ fn handleChatCompletions(
             const structured_history_text = normalizeStructuredAssistantOutput(tokenizer, gen_text_buf[0..gen_text_len], thinking_enabled, &structured_history_buf) catch gen_text_buf[0..gen_text_len];
             const trimmed_stream_text = sanitizeAssistantHistoryContent(structured_history_text);
             var transport_buf: [32768]u8 = undefined;
-            var tool_history_buf: std.ArrayList(u8) = .{};
+            var tool_history_buf: std.ArrayList(u8) = .empty;
             defer tool_history_buf.deinit(allocator);
             const transport_text = historyAssistantContentWithTools(tokenizer, stream_tool_fmt, tools_active, trimmed_stream_text, &transport_buf, &tool_history_buf, allocator) catch trimmed_stream_text;
             cache_assistant_text = allocator.dupe(u8, transport_text) catch null;
@@ -3355,7 +3357,7 @@ fn handleChatCompletions(
     } else {
         // Non-streaming: use same prefill+decode loop with stop detection
         const stop_strs = try combinedStopStrings(parsed.arena.allocator(), parsed.stop);
-        var text_buf: std.ArrayList(u8) = .{};
+        var text_buf: std.ArrayList(u8) = .empty;
         defer text_buf.deinit(allocator);
         var ns_gen: u32 = 0;
         const nsIsEog = struct {
@@ -3364,7 +3366,7 @@ fn handleChatCompletions(
             }
         }.check;
         var finish_reason: FinishReason = if (max_tokens == 0 and parsed.max_tokens > 0) .length else .stop;
-        const decode_start_ns = std.time.nanoTimestamp();
+        const decode_start_ns = host_io.nanoTimestamp();
         if (max_tokens > 0) {
             var prev = runtime.sample(engine, &state, sampling, random);
             state.generated_tokens.append(allocator, prev) catch {};
@@ -3397,7 +3399,7 @@ fn handleChatCompletions(
                 finish_reason = .length;
             }
         }
-        const decode_end_ns = std.time.nanoTimestamp();
+        const decode_end_ns = host_io.nanoTimestamp();
         logGeneratedTiming(ns_gen, decode_start_ns, decode_end_ns);
 
         // Escape the full text for JSON
@@ -3442,29 +3444,29 @@ fn handleChatCompletions(
 
         if (parsed_output.tool_calls.len > 0) {
             // Emit response with tool_calls, content null
-            var wb: std.ArrayList(u8) = .{};
+            var wb: std.ArrayList(u8) = .empty;
             defer wb.deinit(allocator);
-            try wb.writer(allocator).print(
+            try wb.print(allocator,
                 \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":[
             , .{ req_id, ts, model_name });
             for (parsed_output.tool_calls, 0..) |tc, ti| {
                 if (ti > 0) try wb.appendSlice(allocator, ",");
                 var args_esc_buf: [16384]u8 = undefined;
                 const args_esc = jsonEscape(tc.arguments_json, &args_esc_buf);
-                try wb.writer(allocator).print(
+                try wb.print(allocator,
                     \\{{"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}
                 , .{ tc.id, tc.name, args_esc });
             }
-            try wb.writer(allocator).print(
+            try wb.print(allocator,
                 \\]}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{ @tagName(finish_reason), prompt_tokens.len, ns_gen, prompt_tokens.len + ns_gen });
             try conn.sendJson(200, wb.items);
         } else {
             const escaped_text = try jsonEscapeAlloc(allocator, response_text);
             defer allocator.free(escaped_text);
-            var wb: std.ArrayList(u8) = .{};
+            var wb: std.ArrayList(u8) = .empty;
             defer wb.deinit(allocator);
-            try wb.writer(allocator).print(
+            try wb.print(allocator,
                 \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{
                 req_id,       ts,                         model_name,
@@ -3475,7 +3477,7 @@ fn handleChatCompletions(
         }
         if (cacheable_session) {
             var transport_buf: [32768]u8 = undefined;
-            var tool_history_buf: std.ArrayList(u8) = .{};
+            var tool_history_buf: std.ArrayList(u8) = .empty;
             defer tool_history_buf.deinit(allocator);
             const transport_text = historyAssistantContentWithTools(tokenizer, tool_fmt, parsed.tools.len > 0, response_text, &transport_buf, &tool_history_buf, allocator) catch response_text;
             cache_assistant_text = allocator.dupe(u8, transport_text) catch null;
@@ -3549,8 +3551,8 @@ fn handleCompletions(
         });
     }
 
-    const ts = @divTrunc(std.time.timestamp(), 1);
-    const seed_ns: i128 = std.time.nanoTimestamp();
+    const ts = @divTrunc(host_io.timestamp(), 1);
+    const seed_ns: i128 = host_io.nanoTimestamp();
     var req_id_buf: [32]u8 = undefined;
     const req_id = std.fmt.bufPrint(&req_id_buf, "cmpl-{x}", .{@as(u64, @truncate(@as(u128, @bitCast(seed_ns))))}) catch "cmpl-0";
 
@@ -3561,7 +3563,7 @@ fn handleCompletions(
     };
     defer allocator.free(output_tokens);
 
-    var text_buf: std.ArrayList(u8) = .{};
+    var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(allocator);
     var decode_buf: [512]u8 = undefined;
     for (output_tokens) |tid| {
@@ -3577,9 +3579,9 @@ fn handleCompletions(
     const escaped_text = try jsonEscapeAlloc(allocator, text_buf.items);
     defer allocator.free(escaped_text);
 
-    var wb: std.ArrayList(u8) = .{};
+    var wb: std.ArrayList(u8) = .empty;
     defer wb.deinit(allocator);
-    try wb.writer(allocator).print(
+    try wb.print(allocator,
         \\{{"id":"{s}","object":"text_completion","created":{d},"model":"{s}","choices":[{{"index":0,"text":"{s}","finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         req_id,            ts,                                    model_name,
@@ -3784,7 +3786,7 @@ fn parseRequestBody(body: []const u8, allocator: std.mem.Allocator) !ParsedReque
 fn decodeJsonText(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     if (input.len == 0) return &[_]u8{};
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
     var i: usize = 0;
@@ -3923,7 +3925,7 @@ test "ParsedRequest defaults" {
 /// @param input Raw text to escape.
 /// @returns Heap-allocated JSON-escaped text.
 fn jsonEscapeAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, input.len);
     for (input) |c| {
@@ -4050,10 +4052,10 @@ fn formatStreamingToolCallChunk(
     name: []const u8,
     arguments_json: []const u8,
 ) ![]u8 {
-    var wb: std.ArrayList(u8) = .{};
+    var wb: std.ArrayList(u8) = .empty;
     errdefer wb.deinit(allocator);
 
-    try wb.writer(allocator).print(
+    try wb.print(allocator,
         \\{{"id":"{s}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"
     , .{ req_id, ts, model_name, tool_call_index, id, name });
 
@@ -4135,11 +4137,11 @@ fn forcedToolArgumentsSlice(generated_text: []const u8) []const u8 {
 }
 
 fn forcedToolArgumentsJsonAlloc(allocator: std.mem.Allocator, first_arg_name: ?[]const u8, generated_text: []const u8) ![]u8 {
-    var merged: std.ArrayList(u8) = .{};
+    var merged: std.ArrayList(u8) = .empty;
     defer merged.deinit(allocator);
 
     if (first_arg_name) |arg_name| {
-        try merged.writer(allocator).print("{{\"{s}\":", .{arg_name});
+        try merged.print(allocator, "{{\"{s}\":", .{arg_name});
     }
     try merged.appendSlice(allocator, forcedToolArgumentTail(generated_text));
 
@@ -4161,8 +4163,8 @@ fn serveChatUi(conn: *http.Connection) !void {
     const html = @embedFile("chat.html");
     var buf: [256]u8 = undefined;
     const header = std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{html.len}) catch return error.HeaderTooLarge;
-    try conn.stream.writeAll(header);
-    try conn.stream.writeAll(html);
+    try host_io.writeSocketAll(conn.stream, header);
+    try host_io.writeSocketAll(conn.stream, html);
 }
 
 fn fallbackModelName(model: *const Model) []const u8 {
@@ -4524,7 +4526,7 @@ test "lastCompleteUtf8End streams emoji byte-by-byte without dropping bytes" {
     // the next chunk completes the codepoint. Concatenating the emitted
     // chunks must reproduce the original bytes exactly.
     const full = "x\xF0\x9F\x94\xA7y";
-    var emitted: std.ArrayList(u8) = .{};
+    var emitted: std.ArrayList(u8) = .empty;
     defer emitted.deinit(std.testing.allocator);
 
     var sent: usize = 0;
@@ -5065,7 +5067,7 @@ test "formatStreamingToolCallChunk handles large arguments payloads" {
 
     const prefix = "{\"path\":\"";
     const suffix = "\"}";
-    var args: std.ArrayList(u8) = .{};
+    var args: std.ArrayList(u8) = .empty;
     defer args.deinit(std.testing.allocator);
     try args.appendSlice(std.testing.allocator, prefix);
     try args.appendSlice(std.testing.allocator, &big_args);
@@ -5477,8 +5479,8 @@ test "assistantAnswerForHistory drops completed reasoning blocks" {
 }
 
 test "assistantAnswerForHistory compacts long answers" {
-    const long_answer = "Kernel programming in Zig gives you explicit control. " ** 24;
-    const compacted = assistantAnswerForHistory(long_answer);
+    const long_answer = host_io.repeatText("Kernel programming in Zig gives you explicit control. ", 24);
+    const compacted = assistantAnswerForHistory(&long_answer);
     try std.testing.expect(compacted.len < long_answer.len);
     try std.testing.expect(std.mem.startsWith(u8, compacted, "Kernel programming in Zig"));
 }
@@ -5510,7 +5512,7 @@ test "historyAssistantContentWithTools keeps assistant tool calls in cached hist
     defer qwen_tok.token_to_id.deinit();
 
     var transport_buf: [512]u8 = undefined;
-    var tool_history_buf: std.ArrayList(u8) = .{};
+    var tool_history_buf: std.ArrayList(u8) = .empty;
     defer tool_history_buf.deinit(std.testing.allocator);
     const cached = try historyAssistantContentWithTools(
         &qwen_tok,
@@ -5678,7 +5680,7 @@ test "ServerState snapshot tracks active queued and uptime" {
 }
 
 test "buildHealthJson includes request counts and uptime" {
-    var state = ServerState.init(std.time.timestamp() - 5);
+    var state = ServerState.init(host_io.timestamp() - 5);
     _ = state.active_requests.fetchAdd(1, .monotonic);
     _ = state.queued_requests.fetchAdd(1, .monotonic);
     state.setActiveContextTokens(1024);

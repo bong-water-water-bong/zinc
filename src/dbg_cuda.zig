@@ -1,10 +1,10 @@
 //! CUDA forward-pass debug harness for the qwen35 hybrid-SSM model. Two modes:
 //!
-//!   zig build cuda-dbg -- <token> [model.gguf]
+//!   ./scripts/zig.sh build cuda-dbg -- <token> [model.gguf]
 //!       Per-layer residual-norm dump at pos 0 (used to pinpoint the attention
 //!       gate bug: diff vs a reference implementation eval-callback `l_out-N` reference).
 //!
-//!   zig build cuda-dbg -- gen <id,id,...> <ngen> [model.gguf]
+//!   ./scripts/zig.sh build cuda-dbg -- gen <id,id,...> <ngen> [model.gguf]
 //!       Autoregressive greedy generation from a prompt token-id list. Prefills
 //!       the ids (exercising pos>0 RoPE + multi-entry attention + SSM state
 //!       carry), then greedily emits ngen tokens. Diff GEN_IDS vs `/tmp/gen`
@@ -13,6 +13,7 @@
 //! Read-only w.r.t. the engine — uses only public ForwardCuda methods.
 //! @section CUDA Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 const device = @import("cuda/device.zig");
 const loader = @import("model/loader_cuda.zig");
 const forward = @import("compute/forward_cuda.zig");
@@ -122,7 +123,7 @@ const DEFAULT_MODEL = "models/Qwen3.5-9B-Q4_K_M.gguf";
 /// True unless ZINC_BATCHED_PREFILL is explicitly off (0/off/false/no). qwen has
 /// no prefillBatched (Engine returns error.Unsupported) so it falls back anyway.
 fn batchedPrefillDefaultOn() bool {
-    const v = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse return true;
+    const v = host_io.getenv("ZINC_BATCHED_PREFILL") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -405,12 +406,13 @@ fn stats(label: []const u8, v: []const f32) void {
     std.debug.print("{s:<9} norm={d:>10.3} min={d:>9.3} max={d:>9.3} nan={d} [0..3]={d:.3} {d:.3} {d:.3}\n", .{ label, std.math.sqrt(ss), mn, mx, bad, v[0], v[1], v[2] });
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try host_io.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.next();
     const first = args.next() orelse "100";
@@ -515,7 +517,7 @@ fn genMode(allocator: std.mem.Allocator, ids_arg: []const u8, ngen: u32, model_p
     // last prompt token is the first generated token. Prompt-internal tokens
     // need no logits, so ZINC_PREFILL_SKIP=1 runs them via prefillStep (skips
     // the LM head, bit-identical generation) to A/B the head-skip prefill win.
-    const pf_skip = std.posix.getenv("ZINC_PREFILL_SKIP") != null;
+    const pf_skip = host_io.getenv("ZINC_PREFILL_SKIP") != null;
     // Effort 25: batched-GEMM prefill is the DEFAULT for gemma (qwen falls back
     // via error.Unsupported). ZINC_BATCHED_PREFILL=0/off opts out to per-token.
     // scripts/prefill_catalog.sh forces the opt-out on its baseline arm so the
@@ -524,7 +526,7 @@ fn genMode(allocator: std.mem.Allocator, ids_arg: []const u8, ngen: u32, model_p
     const pf_batched = batchedPrefillDefaultOn();
     var pos: u32 = 0;
     var tok: u32 = 0;
-    var pf_timer = try std.time.Timer.start();
+    var pf_timer = try host_io.Timer.start();
     var pf_used_batched = false;
     if (pf_batched and prompt.len > 1) {
         if (fwd.prefillBatched(prompt)) |first| {
@@ -550,7 +552,7 @@ fn genMode(allocator: std.mem.Allocator, ids_arg: []const u8, ngen: u32, model_p
     }
 
     std.debug.print("GEN_IDS:{d}", .{tok});
-    var timer = try std.time.Timer.start(); // steady-state: exclude prefill + first token
+    var timer = try host_io.Timer.start(); // steady-state: exclude prefill + first token
     var g: u32 = 1;
     while (g < ngen) : (g += 1) {
         const next = try fwd.decodeStep(tok, pos, true);
@@ -809,7 +811,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                         tok = ot[0];
                         pos += 1;
                     }
-                    var timer = try std.time.Timer.start();
+                    var timer = try host_io.Timer.start();
                     var s: u32 = 0;
                     while (s < ng) : (s += 1) {
                         var tk = [_]u32{tok};
@@ -877,7 +879,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                             cp[j] += 1;
                         }
                     }
-                    var timer = try std.time.Timer.start();
+                    var timer = try host_io.Timer.start();
                     var s: u32 = 0;
                     while (s < ng) : (s += 1) {
                         var tks: [MAXB]u32 = undefined;
@@ -1059,7 +1061,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                         tok = ot[0];
                         pos += 1;
                     }
-                    var timer = try std.time.Timer.start();
+                    var timer = try host_io.Timer.start();
                     var s: u32 = 0;
                     while (s < ng) : (s += 1) {
                         var tk = [_]u32{tok};
@@ -1127,7 +1129,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                             cp[j] += 1;
                         }
                     }
-                    var timer = try std.time.Timer.start();
+                    var timer = try host_io.Timer.start();
                     var s: u32 = 0;
                     while (s < ng) : (s += 1) {
                         var tks: [MAXB]u32 = undefined;
@@ -1206,7 +1208,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                             cp[j] += 1;
                         }
                     }
-                    var timer = try std.time.Timer.start();
+                    var timer = try host_io.Timer.start();
                     var s: u32 = 0;
                     while (s < ng) : (s += 1) {
                         var tks: [MAXB]u32 = undefined;
@@ -1290,7 +1292,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                             cp[j] += 1;
                         }
                     }
-                    var timer = try std.time.Timer.start();
+                    var timer = try host_io.Timer.start();
                     var s: u32 = 0;
                     while (s < ng) : (s += 1) {
                         var tks: [MAXB]u32 = undefined;
@@ -1370,7 +1372,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                             cp[j] += 1;
                         }
                     }
-                    var timer = try std.time.Timer.start();
+                    var timer = try host_io.Timer.start();
                     var s: u32 = 0;
                     while (s < ng) : (s += 1) {
                         var tks: [MAXB]u32 = undefined;
@@ -1450,7 +1452,7 @@ fn batchMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, mode
                             cp[j] += 1;
                         }
                     }
-                    var timer = try std.time.Timer.start();
+                    var timer = try host_io.Timer.start();
                     var s: u32 = 0;
                     while (s < ng) : (s += 1) {
                         var tks: [MAXB]u32 = undefined;
@@ -1520,7 +1522,7 @@ fn schedMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
     var plens: [MAXB]usize = undefined;
     var serial_out: [MAXB][MAXG]u32 = undefined; // isolated production reference
     var serial_len: [MAXB]u32 = undefined; // isolated stream length once EOS-truncated
-    var sched_len: [MAXB]u32 = [_]u32{0} ** MAXB; // scheduled stream length at eviction
+    var sched_len: [MAXB]u32 = @as([MAXB]u32, @splat(0)); // scheduled stream length at eviction
     var nseq: u32 = 0;
     const ng = @min(ngen, @as(u32, MAXG));
 
@@ -1603,7 +1605,7 @@ fn schedMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
     // run to the `ng` budget. Override with ZINC_SCHED_EOS=<token-id>. maxInt =
     // budget-only (the pre-2b uniform-length behavior).
     var eos: u32 = std.math.maxInt(u32);
-    if (std.process.getEnvVarOwned(allocator, "ZINC_SCHED_EOS")) |v| {
+    if (host_io.getEnvVarOwned(allocator, "ZINC_SCHED_EOS")) |v| {
         defer allocator.free(v);
         eos = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \n\r\t"), 10) catch std.math.maxInt(u32);
     } else |_| {
@@ -1762,8 +1764,8 @@ const SERVE_MAXG = 64; // max generated tokens / sequence
 const ServeCtx = struct {
     eng: *Engine,
     sched: *scheduler.Scheduler,
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: host_io.Mutex = .{},
+    cond: host_io.Condition = .{},
     // Inputs (filled before threads start; prompts must outlive every request —
     // Request borrows the slice, so this storage lives in the parent frame).
     prompts: [SERVE_MAXB][SERVE_MAXP]u32 = undefined,
@@ -1773,13 +1775,13 @@ const ServeCtx = struct {
     eos: u32 = std.math.maxInt(u32),
     // Worker → published stream, keyed by request id-1 (assigned by enqueue).
     pub_out: [SERVE_MAXB][SERVE_MAXG]u32 = undefined,
-    pub_len: [SERVE_MAXB]u32 = [_]u32{0} ** SERVE_MAXB,
-    pub_done: [SERVE_MAXB]bool = [_]bool{false} ** SERVE_MAXB,
+    pub_len: [SERVE_MAXB]u32 = @as([SERVE_MAXB]u32, @splat(0)),
+    pub_done: [SERVE_MAXB]bool = @as([SERVE_MAXB]bool, @splat(false)),
     published: u32 = 0,
     // Client j → received stream + the request id it was assigned (for the gate).
-    client_id: [SERVE_MAXB]u64 = [_]u64{0} ** SERVE_MAXB,
+    client_id: [SERVE_MAXB]u64 = @as([SERVE_MAXB]u64, @splat(0)),
     cli_out: [SERVE_MAXB][SERVE_MAXG]u32 = undefined,
-    cli_len: [SERVE_MAXB]u32 = [_]u32{0} ** SERVE_MAXB,
+    cli_len: [SERVE_MAXB]u32 = @as([SERVE_MAXB]u32, @splat(0)),
 };
 
 /// Publish a finished request's stream to its waiter, complete it, free its slot.
@@ -1870,7 +1872,7 @@ fn serveWorker(c: *ServeCtx) void {
         }
 
         // Nothing ready (waiting on a slow producer to enqueue) → yield briefly.
-        if (!did_work) std.Thread.sleep(100 * std.time.ns_per_us);
+        if (!did_work) host_io.sleep(100 * std.time.ns_per_us);
     }
 }
 
@@ -1980,7 +1982,7 @@ fn serveMode(allocator: std.mem.Allocator, seqs_arg: []const u8, ngen: u32, nslo
     // EOS for variable per-request lengths (mirrors schedMode): mid-flight eviction
     // exercises the slot-reuse race under concurrency. Env override or auto.
     var eos: u32 = std.math.maxInt(u32);
-    if (std.process.getEnvVarOwned(allocator, "ZINC_SCHED_EOS")) |v| {
+    if (host_io.getEnvVarOwned(allocator, "ZINC_SCHED_EOS")) |v| {
         defer allocator.free(v);
         eos = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \n\r\t"), 10) catch std.math.maxInt(u32);
     } else |_| {
@@ -2056,7 +2058,7 @@ fn benchMode(allocator: std.mem.Allocator, iters: i32, n: u32) !void {
     defer dev.deinit();
     const ctx = dev.ctx;
 
-    const src = try allocator.dupeZ(u8, BENCH_CU);
+    const src = try allocator.dupeSentinel(u8, BENCH_CU, 0);
     defer allocator.free(src);
     var pipe = try pipeline.createPipeline(ctx, src.ptr, "benchk");
     defer pipeline.freePipeline(&pipe);
@@ -2077,7 +2079,7 @@ fn benchMode(allocator: std.mem.Allocator, iters: i32, n: u32) !void {
     }
 
     // SYNC: commitAndWait after every dispatch (the current decodeStep pattern).
-    var t = try std.time.Timer.start();
+    var t = try host_io.Timer.start();
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         var cmd = try command.beginCommand(ctx);
@@ -2115,7 +2117,7 @@ fn mma8Mode(allocator: std.mem.Allocator, iters: u32) !void {
     defer dev.deinit();
     const ctx = dev.ctx;
 
-    const src = try allocator.dupeZ(u8, MMA8_CU);
+    const src = try allocator.dupeSentinel(u8, MMA8_CU, 0);
     defer allocator.free(src);
 
     std.debug.print("=== Effort-30 int8 mma.sync.m16n8k32 feasibility microbench ===\n", .{});
@@ -2188,7 +2190,7 @@ fn mma8Mode(allocator: std.mem.Allocator, iters: u32) !void {
                 }
                 return 0;
             }
-            var t = try std.time.Timer.start();
+            var t = try host_io.Timer.start();
             r = 0;
             while (r < reps) : (r += 1) {
                 var cm = try command.beginCommand(c);
@@ -2228,7 +2230,7 @@ fn gemm8Mode(allocator: std.mem.Allocator, M: u32, K: u32, T: u32) !void {
     var dev = try device.CudaDevice.initBest(allocator);
     defer dev.deinit();
     const ctx = dev.ctx;
-    const src = try allocator.dupeZ(u8, GEMM8_CU);
+    const src = try allocator.dupeSentinel(u8, GEMM8_CU, 0);
     defer allocator.free(src);
 
     std.debug.print("=== Effort-30 Q4_K int8 GEMM kill-bar (M={d} K={d} T={d}) ===\n", .{ M, K, T });
@@ -2295,7 +2297,7 @@ fn gemm8Mode(allocator: std.mem.Allocator, M: u32, K: u32, T: u32) !void {
 
     const run = struct {
         fn go(c: anytype, pipe: *pipeline.CudaPipeline, g: [3]u32, bl: [3]u32, yb: *buffer.CudaBuffer, wb: *buffer.CudaBuffer, ab: *buffer.CudaBuffer, p: *const Gemm8Push, reps: u32) !f64 {
-            var t = try std.time.Timer.start();
+            var t = try host_io.Timer.start();
             var r: u32 = 0;
             while (r < reps) : (r += 1) {
                 var cm = try command.beginCommand(c);
@@ -2370,7 +2372,7 @@ fn profMode(allocator: std.mem.Allocator, model_path: []const u8) !void {
     var i: u32 = 0;
     while (i < 5) : (i += 1) _ = try fwd.decodeStep(100, i, true);
 
-    var t = try std.time.Timer.start();
+    var t = try host_io.Timer.start();
     i = 0;
     while (i < K) : (i += 1) _ = try fwd.decodeStep(100, i, false); // embed + tail only
     const et_ns = t.read();
@@ -2409,9 +2411,9 @@ fn logitsMode(allocator: std.mem.Allocator, token: u32, out_path: []const u8, mo
     _ = try fwd.decodeStep(token, 0, true);
     fwd.readLogits(buf);
 
-    const f = try std.fs.cwd().createFile(out_path, .{});
-    defer f.close();
-    try f.writeAll(std.mem.sliceAsBytes(buf));
+    const f = try std.Io.Dir.cwd().createFile(host_io.io, out_path, .{});
+    defer f.close(host_io.io);
+    try f.writeStreamingAll(host_io.io, std.mem.sliceAsBytes(buf));
 
     var bi: usize = 0;
     var bm = buf[0];
@@ -2511,9 +2513,9 @@ fn gemmaLogitsMode(allocator: std.mem.Allocator, ids_arg: []const u8, out_path: 
     defer allocator.free(buf);
     fwd.readLogits(buf);
 
-    const f = try std.fs.cwd().createFile(out_path, .{});
-    defer f.close();
-    try f.writeAll(std.mem.sliceAsBytes(buf));
+    const f = try std.Io.Dir.cwd().createFile(host_io.io, out_path, .{});
+    defer f.close(host_io.io);
+    try f.writeStreamingAll(host_io.io, std.mem.sliceAsBytes(buf));
     std.debug.print("prefilled {d} tokens; argmax next = {d}; wrote {d} logits to {s}\n", .{ np, tok, vocab, out_path });
 }
 
@@ -2636,8 +2638,8 @@ fn gemmaLayerDumpMode(allocator: std.mem.Allocator, ids_arg: []const u8, out_pat
         const tag: []const u8 = if (fwd.geom[L].is_swa) "swa" else "FUL";
         stats(try std.fmt.bufPrint(&lbl, "L{d:0>2}-{s}", .{ L, tag }), all[L * n ..][0..n]);
     }
-    const f = try std.fs.cwd().createFile(out_path, .{});
-    defer f.close();
-    try f.writeAll(std.mem.sliceAsBytes(all));
+    const f = try std.Io.Dir.cwd().createFile(host_io.io, out_path, .{});
+    defer f.close(host_io.io);
+    try f.writeStreamingAll(host_io.io, std.mem.sliceAsBytes(all));
     std.debug.print("wrote {d} layer vectors ({d} floats) to {s}\n", .{ nl, nl * n, out_path });
 }

@@ -8,6 +8,10 @@ on:
 
 jobs:
   test:
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseSafe, ReleaseFast, ReleaseSmall]
     runs-on: ubuntu-latest
 
     steps:
@@ -16,7 +20,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.15.2
+        version: 0.17.0
         use-cache: false
 
     - name: Install Vulkan SDK (LunarG — modern shaderc/glslc with GL_EXT_integer_dot_product)
@@ -43,7 +47,28 @@ jobs:
         bun-version: latest
 
     - name: Run Zig Tests
-      run: zig build test --summary all
+      run: ./scripts/zig.sh build test -Doptimize=${{ matrix.optimize }} --summary all
 
     - name: Build
-      run: zig build
+      run: ./scripts/zig.sh build -Doptimize=${{ matrix.optimize }} -Dinstall-hot-bench=true
+
+    - name: Check CUDA host code without a GPU
+      run: ./scripts/zig.sh build check-cuda -Doptimize=${{ matrix.optimize }}
+
+    - name: Build ZINC_RT without GPU execution
+      run: ./scripts/zig.sh build -Dbackend=zinc_rt -Dshaders=false -Doptimize=${{ matrix.optimize }} --prefix zig-out-rt
+
+  macos-build:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v5
+    - uses: mlugg/setup-zig@v2
+      with:
+        version: 0.17.0
+        use-cache: false
+    - name: Compile Metal executables and tests without GPU execution
+      run: |
+        for mode in Debug ReleaseSafe ReleaseFast ReleaseSmall; do
+          ./scripts/zig.sh build -Doptimize="$mode"
+          ./scripts/zig.sh build test-build -Doptimize="$mode"
+        done

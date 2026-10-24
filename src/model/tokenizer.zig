@@ -3,6 +3,7 @@
 //! Implements byte-pair encoding directly in Zig using the tokenizer tables
 //! embedded in GGUF model files, eliminating external tokenizer dependencies.
 const std = @import("std");
+const host_io = @import("host_io");
 const gguf = @import("gguf.zig");
 const tool_format_mod = @import("../server/tool_format.zig");
 
@@ -62,7 +63,7 @@ fn buildEndOfGenerationIds(
     eos_id: u32,
     eot_id: ?u32,
 ) ![]u32 {
-    var ids: std.ArrayList(u32) = .{};
+    var ids: std.ArrayList(u32) = .empty;
     errdefer ids.deinit(allocator);
     for (end_of_generation_token_texts) |text| {
         if (token_to_id.get(text)) |id| try appendUniqueId(&ids, allocator, id);
@@ -206,7 +207,7 @@ pub const Tokenizer = struct {
         }
 
         // Read BPE merges if available
-        var merges_list: std.ArrayListAligned(Merge, null) = .{};
+        var merges_list: std.ArrayListAligned(Merge, null) = .empty;
         errdefer merges_list.deinit(allocator);
 
         var special_token_mask: ?[]bool = null;
@@ -329,7 +330,7 @@ pub const Tokenizer = struct {
             merge_ranks.deinit();
         }
         try merge_ranks.ensureTotalCapacity(@intCast(merges_owned.len));
-        var key_buf: std.ArrayList(u8) = .{};
+        var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(allocator);
         for (merges_owned) |merge| {
             key_buf.clearRetainingCapacity();
@@ -413,10 +414,20 @@ pub const Tokenizer = struct {
         if (text.len == 0) return try self.allocator.alloc(u32, 0);
 
         // Start with GPT-2 byte-level encoding: each raw byte maps to a Unicode char
-        var symbols: std.ArrayList([]const u8) = .{};
+        var symbols: std.ArrayList([]const u8) = .empty;
         defer symbols.deinit(self.allocator);
+        try symbols.ensureTotalCapacity(self.allocator, text.len);
 
-        var owned_symbols: std.ArrayList([]u8) = .{};
+        // All initial symbols live through the merge pass. Store their bytes
+        // together instead of allocating and freeing each character separately.
+        // A normalized space needs three bytes; every other initial symbol
+        // needs at most three bytes per input byte.
+        const initial_capacity = std.math.mul(usize, text.len, 3) catch return error.OutOfMemory;
+        const initial_bytes = try self.allocator.alloc(u8, initial_capacity);
+        defer self.allocator.free(initial_bytes);
+        var initial_end: usize = 0;
+
+        var owned_symbols: std.ArrayList([]u8) = .empty;
         defer {
             for (owned_symbols.items) |sym| self.allocator.free(sym);
             owned_symbols.deinit(self.allocator);
@@ -429,31 +440,31 @@ pub const Tokenizer = struct {
             var pos: usize = 0;
             while (pos < text.len) {
                 if (text[pos] == ' ') {
-                    const copy = try self.allocator.alloc(u8, 3);
+                    const copy = initial_bytes[initial_end..][0..3];
+                    initial_end += 3;
                     copy[0] = 0xE2;
                     copy[1] = 0x96;
                     copy[2] = 0x81;
-                    try owned_symbols.append(self.allocator, copy);
-                    try symbols.append(self.allocator, copy);
+                    symbols.appendAssumeCapacity(copy);
                     pos += 1;
                     continue;
                 }
 
                 const seq_len = @min(utf8SequenceLength(text[pos]), text.len - pos);
-                const copy = try self.allocator.alloc(u8, seq_len);
+                const copy = initial_bytes[initial_end..][0..seq_len];
+                initial_end += seq_len;
                 @memcpy(copy, text[pos .. pos + seq_len]);
-                try owned_symbols.append(self.allocator, copy);
-                try symbols.append(self.allocator, copy);
+                symbols.appendAssumeCapacity(copy);
                 pos += seq_len;
             }
         } else {
             for (text) |byte| {
                 const unicode_char = gpt2ByteToUnicode(byte);
                 const len: usize = if (unicode_char[0] < 0x80) 1 else if (unicode_char[0] < 0xE0) 2 else 3;
-                const copy = try self.allocator.alloc(u8, len);
+                const copy = initial_bytes[initial_end..][0..len];
+                initial_end += len;
                 @memcpy(copy, unicode_char[0..len]);
-                try owned_symbols.append(self.allocator, copy);
-                try symbols.append(self.allocator, copy);
+                symbols.appendAssumeCapacity(copy);
             }
         }
 
@@ -470,7 +481,7 @@ pub const Tokenizer = struct {
         }
 
         // Convert symbol strings to token IDs
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(self.allocator);
 
         for (symbols.items) |sym| {
@@ -844,7 +855,7 @@ pub const Tokenizer = struct {
     pub fn encode(self: *const Tokenizer, text: []const u8) ![]u32 {
         if (text.len == 0) return try self.allocator.alloc(u32, 0);
         if (self.pretokenizer == .gemma4_bpe) {
-            var tokens: std.ArrayList(u32) = .{};
+            var tokens: std.ArrayList(u32) = .empty;
             errdefer tokens.deinit(self.allocator);
 
             var pos: usize = 0;
@@ -868,7 +879,7 @@ pub const Tokenizer = struct {
             return self.encodeChunk(text);
         }
 
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(self.allocator);
 
         var pos: usize = 0;
@@ -960,7 +971,7 @@ pub const Tokenizer = struct {
             return out;
         }
 
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(allocator);
 
         // `pos` is the start of text not yet encoded; `scan` is where the search
@@ -1049,7 +1060,7 @@ pub const Tokenizer = struct {
         const ranks_ptr: *const std.StringHashMap(u32) = merge_ranks orelse blk: {
             fallback_ranks = std.StringHashMap(u32).init(self.allocator);
             fallback_owned = true;
-            var kb: std.ArrayList(u8) = .{};
+            var kb: std.ArrayList(u8) = .empty;
             defer kb.deinit(self.allocator);
             for (self.merges) |merge| {
                 kb.clearRetainingCapacity();
@@ -1063,7 +1074,7 @@ pub const Tokenizer = struct {
         };
 
         // Pre-allocate merge key buffer
-        var key_buf: std.ArrayList(u8) = .{};
+        var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(self.allocator);
 
         // Repeatedly find and apply the highest-priority (lowest rank) merge
@@ -1323,7 +1334,7 @@ pub const Tokenizer = struct {
     }
 
     fn currentUtcDate(buf: *[10]u8) []const u8 {
-        const now: i64 = std.time.timestamp();
+        const now: i64 = host_io.timestamp();
         const seconds: u64 = @intCast(@max(now, 0));
         const year_day = (std.time.epoch.EpochSeconds{ .secs = seconds }).getEpochDay().calculateYearDay();
         const month_day = year_day.calculateMonthDay();
@@ -1339,7 +1350,7 @@ pub const Tokenizer = struct {
         var wrote_any = false;
         while (src_pos < text.len) {
             if (std.mem.indexOfPos(u8, text, src_pos, "<|channel>")) |open_idx| {
-                const chunk = if (wrote_any) text[src_pos..open_idx] else std.mem.trimLeft(u8, text[src_pos..open_idx], " \t\r\n");
+                const chunk = if (wrote_any) text[src_pos..open_idx] else std.mem.trimStart(u8, text[src_pos..open_idx], " \t\r\n");
                 if (pos.* + chunk.len > dst.len) return error.BufferTooSmall;
                 @memcpy(dst[pos.*..][0..chunk.len], chunk);
                 pos.* += chunk.len;
@@ -1351,7 +1362,7 @@ pub const Tokenizer = struct {
                     break;
                 }
             } else {
-                const chunk = if (wrote_any) std.mem.trimRight(u8, text[src_pos..], " \t\r\n") else std.mem.trim(u8, text[src_pos..], " \t\r\n");
+                const chunk = if (wrote_any) std.mem.trimEnd(u8, text[src_pos..], " \t\r\n") else std.mem.trim(u8, text[src_pos..], " \t\r\n");
                 if (pos.* + chunk.len > dst.len) return error.BufferTooSmall;
                 @memcpy(dst[pos.*..][0..chunk.len], chunk);
                 pos.* += chunk.len;
@@ -1419,7 +1430,7 @@ pub const Tokenizer = struct {
                             pos += open.len;
                         }
 
-                        var trbuf: std.ArrayList(u8) = .{};
+                        var trbuf: std.ArrayList(u8) = .empty;
                         defer trbuf.deinit(tool_alloc);
                         try options.tool_format.?.renderToolResultMessage("", contents[i], &trbuf, tool_alloc);
                         if (pos + trbuf.items.len > buf.len) return error.BufferTooSmall;
@@ -1442,7 +1453,7 @@ pub const Tokenizer = struct {
                     if (!tools_rendered and options.tools.len > 0 and options.tool_format != null and
                         (std.mem.eql(u8, roles[i], "system") or std.mem.eql(u8, roles[i], "developer")))
                     {
-                        var tool_buf: std.ArrayList(u8) = .{};
+                        var tool_buf: std.ArrayList(u8) = .empty;
                         defer tool_buf.deinit(tool_alloc);
                         try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, tool_alloc);
                         if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
@@ -1464,7 +1475,7 @@ pub const Tokenizer = struct {
                 if (!tools_rendered and options.tools.len > 0 and options.tool_format != null) {
                     const open = std.fmt.bufPrint(buf[pos..], "<|im_start|>system", .{}) catch return error.BufferTooSmall;
                     pos += open.len;
-                    var tool_buf: std.ArrayList(u8) = .{};
+                    var tool_buf: std.ArrayList(u8) = .empty;
                     defer tool_buf.deinit(tool_alloc);
                     try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, tool_alloc);
                     if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
@@ -1608,8 +1619,8 @@ pub const Tokenizer = struct {
                         // "Reasoning effort" -> "Reasoning strength" normalize +
                         // containment check.
                         const has_reasoning_directive =
-                            std.ascii.indexOfIgnoreCase(contents[i], "reasoning strength") != null or
-                            std.ascii.indexOfIgnoreCase(contents[i], "reasoning effort") != null;
+                            std.ascii.findIgnoreCase(contents[i], "reasoning strength") != null or
+                            std.ascii.findIgnoreCase(contents[i], "reasoning effort") != null;
                         const written = std.fmt.bufPrint(
                             buf[pos..],
                             "<|start|>system<|message|>{s}{s}{s}",
@@ -1730,7 +1741,7 @@ test "initFromGGUF populates merge_ranks cache when merges are present" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1765,7 +1776,7 @@ test "initFromGGUF omits BOS for qwen35 family (no BOS in GGUF)" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1795,7 +1806,7 @@ test "initFromGGUF omits BOS and uses BPE for qwen3_5 aliases" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1832,7 +1843,7 @@ test "initFromGGUF omits BOS for gpt-oss prompts by default" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1862,7 +1873,7 @@ test "initFromGGUF prepends BOS for gemma4 even when add_bos_token=false" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1893,7 +1904,7 @@ test "initFromGGUF respects gemma4 add_bos_token=true" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -2881,7 +2892,7 @@ test "initFromGGUF builds the reference end-of-generation set" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };

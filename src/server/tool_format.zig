@@ -70,11 +70,11 @@ pub const FeedResult = enum {
 /// content deltas or as parsed tool calls. One detector per streaming request.
 pub const StreamingDetector = struct {
     /// Bytes pending emission as content delta.
-    content_pending: std.ArrayList(u8) = .{},
+    content_pending: std.ArrayList(u8) = .empty,
     /// Bytes being inspected for an incomplete <tool_call> open tag.
-    hold_buf: std.ArrayList(u8) = .{},
+    hold_buf: std.ArrayList(u8) = .empty,
     /// Tool calls fully parsed and waiting for the caller to drain.
-    pending_calls: std.ArrayList(ToolCall) = .{},
+    pending_calls: std.ArrayList(ToolCall) = .empty,
     allocator: std.mem.Allocator,
 
     /// Maximum bytes to hold while waiting for an open tag to disambiguate.
@@ -153,7 +153,7 @@ pub const StreamingDetector = struct {
                     break :blk "";
                 };
 
-                const empty_obj = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+                const empty_obj = std.json.Value{ .object = .empty };
                 const args_val = obj.get("arguments") orelse empty_obj;
                 const args_str = try std.json.Stringify.valueAlloc(self.allocator, args_val, .{});
                 errdefer self.allocator.free(args_str);
@@ -219,7 +219,9 @@ pub const StreamingDetector = struct {
     /// the buffer is freed by deinit.
     pub fn takeContentDelta(self: *StreamingDetector) []const u8 {
         const out = self.content_pending.items;
-        self.content_pending.clearRetainingCapacity();
+        // clearRetainingCapacity poisons removed bytes in safety builds. This
+        // API borrows those bytes until the next feed, so only reset the length.
+        self.content_pending.items.len = 0;
         return out;
     }
 
@@ -469,7 +471,7 @@ fn chatml_parse_calls(
     model_output: []const u8,
     allocator: std.mem.Allocator,
 ) !ParsedAssistantOutput {
-    var calls: std.ArrayList(ToolCall) = .{};
+    var calls: std.ArrayList(ToolCall) = .empty;
     errdefer {
         for (calls.items) |c| {
             allocator.free(c.id);
@@ -478,7 +480,7 @@ fn chatml_parse_calls(
         }
         calls.deinit(allocator);
     }
-    var text_buf: std.ArrayList(u8) = .{};
+    var text_buf: std.ArrayList(u8) = .empty;
     errdefer text_buf.deinit(allocator);
 
     var search_from: usize = 0;
@@ -536,7 +538,7 @@ fn chatml_parse_calls(
         };
 
         // Re-serialize the arguments JSON using valueAlloc.
-        const empty_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+        const empty_obj = std.json.Value{ .object = .empty };
         const args_val = obj.get("arguments") orelse empty_obj;
         const args_json = try std.json.Stringify.valueAlloc(allocator, args_val, .{});
         errdefer allocator.free(args_json);
@@ -605,7 +607,7 @@ pub fn chatmlToolFormat() ToolFormat {
 
 test "NoopToolFormat.renderToolDefinitions is a no-op" {
     const tf = noopToolFormat();
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     const tools = [_]ToolDefinition{
         .{ .name = "foo", .description = "bar", .parameters_json = "{}" },
@@ -623,7 +625,7 @@ test "NoopToolFormat.parseAssistantToolCalls returns text_content unchanged" {
 
 test "NoopToolFormat.renderToolResultMessage appends raw content" {
     const tf = noopToolFormat();
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     try tf.renderToolResultMessage("call_0", "result text", &buf, std.testing.allocator);
     try std.testing.expectEqualStrings("result text", buf.items);
@@ -731,7 +733,7 @@ test "ChatMLToolFormat.parseAssistantToolCalls falls back to text on malformed J
 
 test "ChatMLToolFormat.renderToolDefinitions emits Qwen3 verbatim tool prompt" {
     const tf = chatmlToolFormat();
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     const tools = [_]ToolDefinition{
         .{
@@ -754,7 +756,7 @@ test "ChatMLToolFormat.renderToolDefinitions emits Qwen3 verbatim tool prompt" {
 
 test "ChatMLToolFormat.renderToolResultMessage wraps content in tool_response tags" {
     const tf = chatmlToolFormat();
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     try tf.renderToolResultMessage("call_0", "exit code 0\nfile: hello.txt\n", &buf, std.testing.allocator);
     try std.testing.expectEqualStrings(
@@ -828,7 +830,7 @@ test "StreamingDetector flushes false-positive partial tag as content" {
 
 test "forTemplate returns ChatMLToolFormat for chatml kind" {
     const tf = forTemplate(.chatml);
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     const tools = [_]ToolDefinition{
         .{ .name = "f", .description = "d", .parameters_json = "{}" },
@@ -841,7 +843,7 @@ test "forTemplate returns ChatMLToolFormat for chatml kind" {
 test "forTemplate returns NoopToolFormat for non-chatml kinds" {
     inline for (.{ .llama3, .gemma, .openai_moe, .generic }) |kind| {
         const tf = forTemplate(kind);
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(std.testing.allocator);
         const tools = [_]ToolDefinition{
             .{ .name = "f", .description = "d", .parameters_json = "{}" },

@@ -61,7 +61,7 @@ pub const Node = struct {
 pub const Graph = struct {
     allocator: std.mem.Allocator,
     buffers: u32 = 0,
-    nodes: std.ArrayList(Node) = .{},
+    nodes: std.ArrayList(Node) = .empty,
 
     /// Create an empty graph backed by `allocator`.
     /// @param allocator Retained for growing the node array; buffer ids are

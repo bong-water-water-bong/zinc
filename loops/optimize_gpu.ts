@@ -801,7 +801,7 @@ async function prepareRemote(opts: LoopOptions, target: ModelTarget): Promise<vo
   if (opts.remoteLibcConf) {
     await checkedSsh(opts, `cd ${q(opts.remoteDir)} && mkdir -p .build-support && cp ${q(opts.remoteLibcConf)} .build-support/libc.conf`, 30_000);
   }
-  await checkedSsh(opts, `cd ${q(opts.remoteDir)} && zig build -Doptimize=ReleaseFast --summary all`, 240_000);
+  await checkedSsh(opts, `cd ${q(opts.remoteDir)} && ./scripts/zig.sh build -Doptimize=ReleaseFast --summary all`, 240_000);
   await checkedSsh(opts, `cd ${q(opts.remoteDir)} && ./zig-out/bin/zinc --help >/dev/null && ./zig-out/bin/zinc model list --all >/dev/null && ./zig-out/bin/zinc --check`, 120_000);
   if (target.modelId && !opts.modelPath) {
     const exists = await ssh(opts, `test -f ${q(target.modelPath)}`, 30_000);

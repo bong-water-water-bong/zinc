@@ -3,6 +3,7 @@
 //! This helper owns the pipeline resources needed to bind paged attention
 //! inputs and record a flash-attention compute pass.
 const std = @import("std");
+const host_io = @import("host_io");
 const kv_dtype = @import("kv_dtype.zig");
 const vk = @import("../vulkan/vk.zig");
 const Instance = @import("../vulkan/instance.zig").Instance;
@@ -223,7 +224,7 @@ pub const AttentionDispatch = struct {
         var pipeline_split_mmq: ?Pipeline = null;
         var pipeline_split_merge: ?Pipeline = null;
         var fa_split_k_active: u32 = 1;
-        const fa_split_k_env = std.posix.getenv("ZINC_FA_SPLIT_K");
+        const fa_split_k_env = host_io.getenv("ZINC_FA_SPLIT_K");
         const fa_split_k_request: u32 = blk: {
             if (fa_split_k_env) |raw| {
                 const parsed = std.fmt.parseInt(u32, raw, 10) catch 0;
@@ -369,7 +370,7 @@ pub const AttentionDispatch = struct {
         attn_scale: f32,
         sink_offset: u32,
     ) !void {
-        const want_lds = if (std.posix.getenv("ZINC_FA_TILE_LDS")) |v| !std.mem.eql(u8, v, "0") else false;
+        const want_lds = if (host_io.getenv("ZINC_FA_TILE_LDS")) |v| !std.mem.eql(u8, v, "0") else false;
         const pip = if (want_lds and self.pipeline_batched_tile_mmq_lds != null) &self.pipeline_batched_tile_mmq_lds.? else if (self.pipeline_batched_tile_mmq) |*p| p else return error.ShaderNotLoaded;
         const push = FlashAttnBatchedPush{
             .head_dim = head_dim,

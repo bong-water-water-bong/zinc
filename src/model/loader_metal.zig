@@ -2,6 +2,7 @@
 //! This replaces the Vulkan loader's staging-buffer DMA with direct mmap wrapping.
 //! @section Model Format & Loading
 const std = @import("std");
+const host_io = @import("host_io");
 const gguf = @import("gguf.zig");
 const config_mod = @import("config.zig");
 const ModelConfig = config_mod.ModelConfig;
@@ -39,7 +40,7 @@ pub const Model = struct {
     tensors: std.ArrayList(LoadedTensor),
     tensor_arenas: std.ArrayList(MetalBuffer),
     mmap_data: ?[]align(std.heap.page_size_min) const u8,
-    mmap_file: ?std.fs.File,
+    mmap_file: ?std.Io.File,
     allocator: std.mem.Allocator,
     /// Residency set wiring all model weight buffers down on macOS 15+.
     /// Null on older systems or if creation failed (the loader logs and degrades).
@@ -68,7 +69,7 @@ pub const Model = struct {
         }
         if (self.mmap_file) |f| {
             var file = f;
-            file.close();
+            file.close(host_io.io);
         }
 
         self.gguf_file.deinit();
@@ -345,7 +346,7 @@ fn shouldPackCopiedTensorArenas(config: ModelConfig) bool {
 }
 
 fn readBoolEnv(env_name: [:0]const u8) ?bool {
-    const raw = std.posix.getenv(env_name) orelse return null;
+    const raw = host_io.getenv(env_name) orelse return null;
     if (std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
     if (std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "no")) return false;
     return null;
@@ -417,7 +418,7 @@ fn planCopiedTensorArenas(
     config: ModelConfig,
     allocator: std.mem.Allocator,
 ) !std.ArrayList(usize) {
-    var arena_sizes: std.ArrayList(usize) = .{};
+    var arena_sizes: std.ArrayList(usize) = .empty;
     errdefer arena_sizes.deinit(allocator);
 
     if (!shouldPackCopiedTensorArenas(config)) return arena_sizes;
@@ -458,17 +459,17 @@ fn planCopiedTensorArenas(
 /// @param allocator Allocator used for GGUF metadata parsing (freed before return).
 /// @returns Parsed `ModelConfig` or an error if the file cannot be opened or parsed.
 pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfig {
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, path, .{});
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const mmap_data = try std.posix.mmap(
         null,
         stat.size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -488,17 +489,17 @@ pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfi
 /// @param allocator Allocator used for GGUF metadata parsing (freed before return).
 /// @returns `ModelInspection` containing file size, tensor byte count, and `ModelConfig`.
 pub fn inspectModel(path: []const u8, allocator: std.mem.Allocator) !ModelInspection {
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, path, .{});
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const mmap_data = try std.posix.mmap(
         null,
         stat.size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -542,17 +543,17 @@ pub fn load(
 ) !Model {
     log.info("Loading model: {s}", .{path});
 
-    const file = try std.fs.cwd().openFile(path, .{});
-    errdefer file.close();
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, path, .{});
+    errdefer file.close(host_io.io);
 
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const file_size = stat.size;
     log.info("File size: {d} MB", .{file_size / (1024 * 1024)});
 
     const mmap_data = try std.posix.mmap(
         null,
         file_size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -570,7 +571,7 @@ pub fn load(
     }
 
     // Wrap tensor data as Metal shared buffers (zero-copy from mmap)
-    var loaded_tensors: std.ArrayList(LoadedTensor) = .{};
+    var loaded_tensors: std.ArrayList(LoadedTensor) = .empty;
     errdefer {
         for (loaded_tensors.items) |*t| {
             metal_buffer.freeBuffer(&t.gpu_buffer);
@@ -578,7 +579,7 @@ pub fn load(
         loaded_tensors.deinit(allocator);
     }
 
-    var tensor_arenas: std.ArrayList(MetalBuffer) = .{};
+    var tensor_arenas: std.ArrayList(MetalBuffer) = .empty;
     errdefer {
         for (tensor_arenas.items) |*arena| {
             metal_buffer.freeBuffer(arena);
@@ -730,7 +731,7 @@ test "extractConfig defaults gemma4 attention scale to 1.0" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -755,7 +756,7 @@ test "extractConfig excludes appended NextN blocks from decoder layers" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -777,7 +778,7 @@ test "extractConfig uses max gemma4 head_count_kv array entry" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -933,9 +934,9 @@ test "copiedTensorArenasFitBudget rejects dense gemma copies on tight UMA budget
 
 test "residentWeightBytes counts copied arenas without double-counting aliases" {
     const allocator = std.testing.allocator;
-    var tensors: std.ArrayList(LoadedTensor) = .{};
+    var tensors: std.ArrayList(LoadedTensor) = .empty;
     defer tensors.deinit(allocator);
-    var arenas: std.ArrayList(MetalBuffer) = .{};
+    var arenas: std.ArrayList(MetalBuffer) = .empty;
     defer arenas.deinit(allocator);
 
     const mmap_info = gguf.TensorInfo{

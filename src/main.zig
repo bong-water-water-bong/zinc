@@ -4,6 +4,7 @@
 //! and the single-process decode loop used for prompt-mode execution.
 const builtin = @import("builtin");
 const std = @import("std");
+const host_io = @import("host_io");
 const build_info = @import("build_info.zig");
 const gpu = @import("gpu/interface.zig");
 const runtime_assets = @import("runtime_assets.zig");
@@ -263,11 +264,14 @@ fn openBrowser(port: u16) void {
     var url_buf: [64]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "http://localhost:{d}", .{port}) catch return;
     const opener = if (comptime @import("builtin").os.tag == .macos) "open" else "xdg-open";
-    var child = std.process.Child.init(&.{ opener, url }, std.heap.page_allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = child.spawnAndWait() catch {};
+    var child = std.process.spawn(host_io.io, .{
+        .argv = &.{ opener, url },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return;
+    defer child.kill(host_io.io);
+    _ = child.wait(host_io.io) catch {};
 }
 
 fn reportGpuProcessLockError(err: anyerror, backend: process_lock_mod.Backend, device_index: u32) noreturn {
@@ -320,9 +324,9 @@ fn runHttpServer(config: Config, manager: *model_manager_mod.ModelManager, alloc
 
     const posix = std.posix;
     const Handler = struct {
-        var shutdown_requested: bool = false;
-        fn handler(_: c_int) callconv(.c) void {
-            shutdown_requested = true;
+        var shutdown_requested: std.atomic.Value(bool) = .init(false);
+        fn handler(_: std.posix.SIG) callconv(.c) void {
+            shutdown_requested.store(true, .release);
         }
     };
     const sa = posix.Sigaction{
@@ -333,14 +337,14 @@ fn runHttpServer(config: Config, manager: *model_manager_mod.ModelManager, alloc
     posix.sigaction(posix.SIG.INT, &sa, null);
     posix.sigaction(posix.SIG.TERM, &sa, null);
 
-    var server_state = routes_mod.ServerState.init(std.time.timestamp());
+    var server_state = routes_mod.ServerState.init(host_io.timestamp());
     var poll_fds = [1]posix.pollfd{.{
-        .fd = server.listener.stream.handle,
+        .fd = server.listener.socket.handle,
         .events = posix.POLL.IN,
         .revents = 0,
     }};
 
-    while (!Handler.shutdown_requested) {
+    while (!Handler.shutdown_requested.load(.acquire)) {
         poll_fds[0].revents = 0;
         const ready = posix.poll(&poll_fds, 100) catch |err| {
             log.warn("Listener poll failed: {s}", .{@errorName(err)});
@@ -349,7 +353,7 @@ fn runHttpServer(config: Config, manager: *model_manager_mod.ModelManager, alloc
         if (ready == 0) continue;
 
         var conn = server.accept() catch |err| {
-            if (Handler.shutdown_requested) break;
+            if (Handler.shutdown_requested.load(.acquire)) break;
             log.warn("Accept failed: {s}", .{@errorName(err)});
             continue;
         };
@@ -377,7 +381,7 @@ fn runHttpServer(config: Config, manager: *model_manager_mod.ModelManager, alloc
     while (server_state.active_requests.load(.monotonic) != 0 or
         server_state.queued_requests.load(.monotonic) != 0)
     {
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        host_io.sleep(50 * std.time.ns_per_ms);
     }
     log.info("Shutting down...", .{});
 }
@@ -402,14 +406,16 @@ fn launchBrowser(url: []const u8) !void {
         else => return error.BrowserLaunchUnsupported,
     };
 
-    var child = std.process.Child.init(argv, std.heap.page_allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-
-    const term = try child.spawnAndWait();
+    var child = try std.process.spawn(host_io.io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(host_io.io);
+    const term = try child.wait(host_io.io);
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.BrowserLauncherFailed;
         },
         else => return error.BrowserLauncherFailed,
@@ -869,7 +875,7 @@ fn trimCliOutputText(text: []const u8, chat: bool) []const u8 {
         return std.mem.trim(u8, body[0..stop_pos], " \t\r\n");
     }
     if (findFirstCliStop(text, cli_chat_stop_strs[0..])) |stop_pos| {
-        return std.mem.trimRight(u8, text[0..stop_pos], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..stop_pos], " \t\r\n");
     }
     return text;
 }
@@ -877,7 +883,7 @@ fn trimCliOutputText(text: []const u8, chat: bool) []const u8 {
 fn resolveStartupModel(config: Config, allocator: std.mem.Allocator) !ResolvedStartupModel {
     if (config.hf_spec) |spec| {
         var stdout_buffer: [512]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+        var stdout_writer = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
         const path = try hf_mod.ensureModel(spec, allocator, &stdout_writer.interface);
         return .{
             .spec = .{
@@ -1086,14 +1092,14 @@ fn printManagedModelList(config: Config, allocator: std.mem.Allocator) !void {
     defer if (active) |*selection| selection.deinit(allocator);
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     const active_model_id = if (active) |selection| selection.model_id else null;
     const backend_name = if (gpu.is_metal) "Metal" else if (gpu.is_vulkan) "Vulkan" else "GPU";
 
     const support = resolveManagedGpuSupport(config.gpuDevicePreference(), allocator) catch |err| {
         if (!config.show_all_models and !config.json_output) {
             var stderr_buffer: [1024]u8 = undefined;
-            var stderr = std.fs.File.stderr().writerStreaming(&stderr_buffer);
+            var stderr = std.Io.File.stderr().writerStreaming(host_io.io, &stderr_buffer);
             try stderr.interface.print("Unable to initialize {s} for GPU detection: {s}\n", .{ backend_name, @errorName(err) });
             try stderr.interface.writeAll("Use `zinc model list --all` to inspect the catalog without live fit checks.\n");
             try stderr.interface.flush();
@@ -1432,9 +1438,9 @@ fn tryRemoveManagedModelViaLocalServer(
     force: bool,
     allocator: std.mem.Allocator,
 ) !?LocalAdminRemoveResponse {
-    const address = try std.net.Address.parseIp4("127.0.0.1", port);
-    var stream = std.net.tcpConnectToAddress(address) catch return null;
-    defer stream.close();
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = address.connect(host_io.io, .{ .mode = .stream }) catch return null;
+    defer stream.close(host_io.io);
 
     const request_body = try std.fmt.allocPrint(
         allocator,
@@ -1449,14 +1455,14 @@ fn tryRemoveManagedModelViaLocalServer(
         .{ port, request_body.len, request_body },
     );
     defer allocator.free(request);
-    try stream.writeAll(request);
+    try host_io.writeSocketAll(stream, request);
 
-    var response: std.ArrayList(u8) = .{};
+    var response: std.ArrayList(u8) = .empty;
     defer response.deinit(allocator);
 
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = try stream.read(&buf);
+        const n = try host_io.readSocket(stream, &buf);
         if (n == 0) break;
         try response.appendSlice(allocator, buf[0..n]);
         if (response.items.len > 64 * 1024) return error.ResponseTooLarge;
@@ -1522,7 +1528,7 @@ fn findJsonStringEnd(s: []const u8) ?usize {
 
 fn printManagedRemoveSummary(model_id: []const u8, outcome: ManagedRemoveOutcome) !void {
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     if (outcome.unloaded_from_gpu) {
         try stdout.interface.print("Unloaded {s} from GPU memory\n", .{model_id});
     }
@@ -1544,7 +1550,7 @@ fn printManagedRemoveSummary(model_id: []const u8, outcome: ManagedRemoveOutcome
 
 fn printCommandError(message: []const u8) !void {
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr = std.fs.File.stderr().writerStreaming(&stderr_buffer);
+    var stderr = std.Io.File.stderr().writerStreaming(host_io.io, &stderr_buffer);
     try stderr.interface.print("{s}\n", .{message});
     try stderr.interface.flush();
 }
@@ -1556,7 +1562,7 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
             defer if (active) |*selection| selection.deinit(allocator);
 
             var stdout_buffer: [1024]u8 = undefined;
-            var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+            var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
             if (active) |selection| {
                 try stdout.interface.print("{s}\n", .{selection.model_id});
             } else {
@@ -1579,7 +1585,7 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
                 // attempting. Warn instead of refusing; for `use`, require --force
                 // so running an unvalidated path stays an explicit choice.
                 var warn_buffer: [1024]u8 = undefined;
-                var warn_writer = std.fs.File.stderr().writerStreaming(&warn_buffer);
+                var warn_writer = std.Io.File.stderr().writerStreaming(host_io.io, &warn_buffer);
                 const warn = &warn_writer.interface;
                 try warn.print(
                     "warning: {s} has not been validated on this GPU profile ({s}).\n",
@@ -1596,7 +1602,7 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
 
             if (config.command == .model_pull) {
                 var stdout_buffer: [4096]u8 = undefined;
-                var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+                var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
                 try managed_mod.pullModel(entry.*, allocator, &stdout.interface);
                 try stdout.interface.flush();
                 return;
@@ -1608,7 +1614,7 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
             try managed_mod.writeActiveSelection(model_id, allocator);
 
             var stdout_buffer: [1024]u8 = undefined;
-            var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+            var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
             try stdout.interface.print("Active model set to {s}\n", .{model_id});
             if (fit.fit_state == .fits_with_offload) {
                 try stdout.interface.writeAll("Note: this model exceeds your VRAM budget. The loader will automatically\n");
@@ -1685,17 +1691,17 @@ fn exportDecodeGraphArtifactsImpl(
     allocator: std.mem.Allocator,
 ) !void {
     const model_config = try loader_mod.inspectConfig(model_path, allocator);
-    const file = try std.fs.cwd().openFile(model_path, .{});
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, model_path, .{});
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const mmap_data = try std.posix.mmap(
         null,
         stat.size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -1717,28 +1723,28 @@ fn writeDecodeGraphArtifacts(
     allocator: std.mem.Allocator,
 ) !void {
     if (report_path) |path| {
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(host_io.io, path, .{ .truncate = true });
         defer {
             var close_file = file;
-            close_file.close();
+            close_file.close(host_io.io);
         }
 
         var file_buffer: [4096]u8 = undefined;
-        var file_writer = file.writer(&file_buffer);
+        var file_writer = file.writer(host_io.io, &file_buffer);
         try decode_graph.writeJsonReport(&file_writer.interface, allocator);
         try file_writer.interface.flush();
         log.info("Wrote decode graph JSON report to {s}", .{path});
     }
 
     if (dot_path) |path| {
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(host_io.io, path, .{ .truncate = true });
         defer {
             var close_file = file;
-            close_file.close();
+            close_file.close(host_io.io);
         }
 
         var file_buffer: [4096]u8 = undefined;
-        var file_writer = file.writer(&file_buffer);
+        var file_writer = file.writer(host_io.io, &file_buffer);
         try decode_graph.writeDot(&file_writer.interface, allocator);
         try file_writer.interface.flush();
         log.info("Wrote decode graph DOT export to {s}", .{path});
@@ -1853,7 +1859,7 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
 /// unless ZINC_BATCHED_PREFILL is explicitly set to an off value (0/off/false/no),
 /// the opt-OUT back to the per-token prefill loop for debugging. Unset → on.
 fn batchedPrefillDefaultOn() bool {
-    const v = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse return true;
+    const v = host_io.getenv("ZINC_BATCHED_PREFILL") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -1895,7 +1901,7 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
         return error.ContextTooSmall;
     }
 
-    var generated: std.ArrayList(u32) = .{};
+    var generated: std.ArrayList(u32) = .empty;
     defer generated.deinit(allocator);
 
     // MTP rollback/history buffers are execution-context setup, so allocate
@@ -1915,7 +1921,7 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     // active per-token forward is small). Same KV cache, bit-identical output.
     var pos: u32 = 0;
     var next_tok: u32 = 0;
-    var prefill_timer = try std.time.Timer.start();
+    var prefill_timer = try host_io.Timer.start();
     // Effort 25: batched-GEMM prefill is now the DEFAULT for gemma — it runs the
     // whole prompt through the batched path (gemma dense + MoE attention/FFN; the
     // method handles MoE internally) and is output-identical to the per-token
@@ -1965,7 +1971,7 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     // GENERATE: greedily feed the argmax back until EOS or the token budget /
     // context limit is reached.
     var produced: u32 = 0;
-    var decode_timer = try std.time.Timer.start();
+    var decode_timer = try host_io.Timer.start();
     var generated_with_mtp = false;
     var mtp_drafted: u32 = 0;
     var mtp_accepted: u32 = 0;
@@ -2040,7 +2046,7 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     }
 
     // Detokenize → text.
-    var text_buf: std.ArrayList(u8) = .{};
+    var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(allocator);
     for (generated.items) |tid| {
         var dec_buf: [256]u8 = undefined;
@@ -2098,7 +2104,7 @@ fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, conf
     // gate and the `dbg_cuda serve` reference stop identically.
     const debug_ids = envIsOn("ZINC_SERVE_DEBUG_IDS");
     var eos = tokenizer.eosId();
-    if (std.posix.getenv("ZINC_SCHED_EOS")) |v| {
+    if (host_io.getenv("ZINC_SCHED_EOS")) |v| {
         eos = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \n\r\t"), 10) catch eos;
     }
     const eot = if (!debug_ids and tokenizer.detectTemplateKind() == .atem) tokenizer.eot_id else null;
@@ -2322,7 +2328,7 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
     var buf: [32]u32 = undefined;
     var dec_buf: [256]u8 = undefined;
     var json_buf: [1024]u8 = undefined;
-    var output: std.ArrayList(u8) = .{};
+    var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
     const structured_capacity = @max(@as(usize, 64 * 1024), @as(usize, ctx.slot_ctx) * 32 + 256);
     const structured_buf: ?[]u8 = if (structured_chat) try allocator.alloc(u8, structured_capacity) else null;
@@ -2343,7 +2349,7 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
                         write_failed = true;
                         continue;
                     };
-                    output.writer(allocator).print("{d}", .{tok}) catch {
+                    output.print(allocator, "{d}", .{tok}) catch {
                         write_failed = true;
                         continue;
                     };
@@ -2417,16 +2423,18 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         output.items;
     const escaped = try jsonEscapeAlloc(allocator, response_output);
     defer allocator.free(escaped);
-    var response: std.ArrayList(u8) = .{};
+    var response: std.ArrayList(u8) = .empty;
     defer response.deinit(allocator);
     const finish_reason: []const u8 = if (generated_tokens >= @as(usize, max_tokens)) "length" else "stop";
     if (is_chat) {
-        try response.writer(allocator).print(
+        try response.print(
+            allocator,
             "{{\"id\":\"chatcmpl-zinc\",\"object\":\"chat.completion\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{s}\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
             .{ escaped, finish_reason, prompt_tokens.len, generated_tokens, prompt_tokens.len + generated_tokens },
         );
     } else {
-        try response.writer(allocator).print(
+        try response.print(
+            allocator,
             "{{\"id\":\"cmpl-zinc\",\"object\":\"text_completion\",\"choices\":[{{\"index\":0,\"text\":\"{s}\",\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
             .{ escaped, finish_reason, prompt_tokens.len, generated_tokens, prompt_tokens.len + generated_tokens },
         );
@@ -2456,7 +2464,7 @@ fn drainQuietly(engine: *cuda_serve_mod.ServeEngine, chan: *cuda_serve_mod.ReqCh
 
 /// Parse a comma-separated list of decimal token ids (gate/debug-ids contract).
 fn parseTokenIdList(allocator: std.mem.Allocator, text: []const u8) ![]u32 {
-    var list: std.ArrayList(u32) = .{};
+    var list: std.ArrayList(u32) = .empty;
     errdefer list.deinit(allocator);
     var it = std.mem.splitScalar(u8, text, ',');
     while (it.next()) |s| {
@@ -2497,7 +2505,7 @@ fn jsonEscape(buf: []u8, s: []const u8) []const u8 {
 }
 
 fn jsonEscapeAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (s) |c| {
         const rep: []const u8 = switch (c) {
@@ -2515,7 +2523,7 @@ fn jsonEscapeAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
 /// True if an env var is set to an "on" value (1/true/yes/on).
 fn envIsOn(name: []const u8) bool {
-    const v = std.posix.getenv(name) orelse return false;
+    const v = host_io.getenv(name) orelse return false;
     return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true") or
         std.ascii.eqlIgnoreCase(v, "yes") or std.ascii.eqlIgnoreCase(v, "on");
 }
@@ -2526,7 +2534,7 @@ fn envIsOn(name: []const u8) bool {
 // operator-facing preflight on this platform.
 fn runCudaCheck(config: Config, check_target: ResolvedCheckTarget, allocator: std.mem.Allocator) !void {
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     const w = &stdout_writer.interface;
 
     try w.print("\n=== ZINC System Diagnostics ===\n", .{});
@@ -2600,28 +2608,27 @@ fn bytesToGiBf(bytes: u64) f64 {
 /// In prompt mode the engine runs up to `max_tokens` forward passes and prints the decoded output.
 /// In server mode an HTTP listener is started and requests are handled until SIGINT/SIGTERM.
 /// @note Fatal startup errors are logged and the process exits rather than returning an error.
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    const allocator = process_init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try host_io.argsAlloc(allocator);
+    defer host_io.argsFree(allocator, args);
 
     const config = parseArgs(args) catch |err| {
         log.err("Argument error: {s}", .{@errorName(err)});
-        std.fs.File.stderr().writeAll(helpText(false)) catch {};
+        std.Io.File.stderr().writeStreamingAll(host_io.io, helpText(false)) catch {};
         std.process.exit(1);
     };
 
     if (config.show_help) {
-        std.fs.File.stdout().writeAll(helpText(config.show_help_all)) catch {};
+        std.Io.File.stdout().writeStreamingAll(host_io.io, helpText(config.show_help_all)) catch {};
         return;
     }
 
     if (config.show_version) {
         var stdout_buffer: [512]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+        var stdout_writer = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
         try build_info.writeVersion(&stdout_writer.interface);
         try stdout_writer.interface.flush();
         return;
@@ -2681,7 +2688,7 @@ pub fn main() !void {
         return;
     }
 
-    is_debug_mode = config.debug or std.posix.getenv("ZINC_DEBUG") != null;
+    is_debug_mode = config.debug or host_io.getenv("ZINC_DEBUG") != null;
 
     const resolved_model: ?ResolvedStartupModel = blk: {
         break :blk resolveStartupModel(config, allocator) catch |err| {
@@ -2882,7 +2889,7 @@ pub fn main() !void {
                 }
 
                 // Decode tokens to text
-                var text_buf: std.ArrayList(u8) = .{};
+                var text_buf: std.ArrayList(u8) = .empty;
                 defer text_buf.deinit(allocator);
                 for (output_tokens) |tid| {
                     var dec_buf: [256]u8 = undefined;
@@ -3042,7 +3049,7 @@ pub fn main() !void {
         log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 30)] });
         // Decode prompt tokens for verification
         {
-            var pt_buf: std.ArrayList(u8) = .{};
+            var pt_buf: std.ArrayList(u8) = .empty;
             defer pt_buf.deinit(allocator);
             for (prompt_tokens) |tid| {
                 if (tid < tokenizer.vocab.len) {
@@ -3133,7 +3140,7 @@ pub fn main() !void {
 
         // Decode tokens to text using the vocabulary
         {
-            var text_buf: std.ArrayList(u8) = .{};
+            var text_buf: std.ArrayList(u8) = .empty;
             defer text_buf.deinit(allocator);
             for (output_tokens) |tid| {
                 var dec_buf: [256]u8 = undefined;
@@ -3455,14 +3462,14 @@ fn resolveShaderDir(allocator: std.mem.Allocator) ![]u8 {
 /// Test-friendly variant: probe `base_dir` for the cwd-relative candidates,
 /// then fall back to `exe_dir_override/../share/zinc/shaders` (or the
 /// running executable's directory when override is null).
-fn resolveShaderDirFrom(allocator: std.mem.Allocator, base_dir: std.fs.Dir, exe_dir_override: ?[]const u8) ![]u8 {
+fn resolveShaderDirFrom(allocator: std.mem.Allocator, base_dir: std.Io.Dir, exe_dir_override: ?[]const u8) ![]u8 {
     return runtime_assets.resolveShaderDirFrom(allocator, base_dir, exe_dir_override, .spirv);
 }
 
 test "resolveShaderDirFrom finds first cwd-relative candidate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("zig-out/share/zinc/shaders");
+    try tmp.dir.createDirPath(host_io.io, "zig-out/share/zinc/shaders");
     const result = try resolveShaderDirFrom(std.testing.allocator, tmp.dir, "/nonexistent");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("zig-out/share/zinc/shaders", result);
@@ -3471,7 +3478,7 @@ test "resolveShaderDirFrom finds first cwd-relative candidate" {
 test "resolveShaderDirFrom falls back to second candidate when first missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("share/zinc/shaders");
+    try tmp.dir.createDirPath(host_io.io, "share/zinc/shaders");
     const result = try resolveShaderDirFrom(std.testing.allocator, tmp.dir, "/nonexistent");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("share/zinc/shaders", result);
@@ -3484,9 +3491,9 @@ test "resolveShaderDirFrom falls back to exe-relative when cwd has nothing" {
     // <prefix>/share/zinc/shaders. POSIX path resolution requires each
     // component on the way to ".." to exist as a real directory, so create
     // both bin/ and share/zinc/shaders/.
-    try tmp.dir.makePath("install/bin");
-    try tmp.dir.makePath("install/share/zinc/shaders");
-    const bin_dir = try tmp.dir.realpathAlloc(std.testing.allocator, "install/bin");
+    try tmp.dir.createDirPath(host_io.io, "install/bin");
+    try tmp.dir.createDirPath(host_io.io, "install/share/zinc/shaders");
+    const bin_dir = try tmp.dir.realPathFileAlloc(host_io.io, "install/bin", std.testing.allocator);
     defer std.testing.allocator.free(bin_dir);
 
     var empty = std.testing.tmpDir(.{});

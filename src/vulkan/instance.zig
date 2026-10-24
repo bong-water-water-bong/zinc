@@ -3,6 +3,7 @@
 //! This is the entry point for GPU setup: instance creation, device selection,
 //! queue discovery, and VRAM inspection.
 const std = @import("std");
+const host_io = @import("host_io");
 const vk = @import("vk.zig");
 
 const log = std.log.scoped(.vulkan);
@@ -273,7 +274,7 @@ pub const Instance = struct {
                 }
             }
         }
-        if (std.posix.getenv("ZINC_VK_QUEUE_FAMILY")) |v| {
+        if (host_io.getenv("ZINC_VK_QUEUE_FAMILY")) |v| {
             if (std.fmt.parseInt(u32, v, 10) catch null) |want| {
                 if (want < qf_count and (qf_props[want].queueFlags & vk.c.VK_QUEUE_COMPUTE_BIT) != 0) {
                     log.info("Vulkan queue family override: {d} (ZINC_VK_QUEUE_FAMILY)", .{want});

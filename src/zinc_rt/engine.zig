@@ -4,6 +4,7 @@
 //! @section Inference Runtime
 // SPDX-FileCopyrightText: ZINC Authors
 const std = @import("std");
+const host_io = @import("host_io");
 const builtin = @import("builtin");
 const kmd = @import("kmd.zig");
 const umq = @import("ring/umq.zig");
@@ -99,7 +100,7 @@ pub fn parseTier(value: []const u8) !Tier {
 /// Read `ZINC_RT_TIER` and parse it, falling back to `autoTier` when unset.
 /// @returns The selected `Tier`, or a parse error from `parseTier`.
 pub fn tierFromEnv() !Tier {
-    const value = std.posix.getenv("ZINC_RT_TIER") orelse return autoTier();
+    const value = host_io.getenv("ZINC_RT_TIER") orelse return autoTier();
     return parseTier(value);
 }
 
@@ -124,8 +125,8 @@ pub fn autoTier() Tier {
 fn directModelKernelsAvailableDefault() bool {
     if (builtin.os.tag != .linux) return false;
 
-    var file = std.fs.openFileAbsolute(umq.default_render_node, .{ .mode = .read_write }) catch return false;
-    defer file.close();
+    var file = std.Io.Dir.openFileAbsolute(host_io.io, umq.default_render_node, .{ .mode = .read_write }) catch return false;
+    defer file.close(host_io.io);
 
     const hw_ip = kmd.queryHwIp(file, kmd.AMDGPU_HW_IP_COMPUTE) catch return false;
     return supportsEmbeddedGfx12Kernels(hw_ip);

@@ -1,7 +1,7 @@
 You are autonomously landing ONE validated CUDA PREFILL performance improvement on the ZINC inference engine (Zig) this cycle, then stopping. Be rigorous and honest; a documented NEGATIVE result is valuable. Work from this repo checkout on the Mac; build + measure happen on the remote NVIDIA box over SSH.
 
 STEP 0 — READ FIRST (these hold the full state, box access, and the gotchas; honor them):
-- /Users/stepan/.claude/projects/-Users-stepan-Workspace-zinc/memory/MEMORY.md
+- your project memory (MEMORY.md)
 - the memory it points to: project_llama_gap_4090.md (THE prefill gap + lever plan + T2 state), project_agent_zinc_access.md (box SSH), project_zinc_cuda_backend.md
 - docs/prefill_gap_closure_plan.md (root cause + prioritized levers T1/T2/T3/T4)
 
@@ -18,7 +18,7 @@ LEVERS (pick ONE per cycle; let the measurement decide; prefer continuing perf/t
 HARD RULES (violating these wastes the cycle):
 - PIN THE 4090: export CUDA_VISIBLE_DEVICES and ZINC_GPU to the 4090 UUID (from project_llama_gap_4090 / project_agent_zinc_access memory) for EVERY build-dbg run and measurement.
 - CORRECTNESS GATE: `scripts/validate_catalog.sh` (ZINC_GPU=4090) MUST stay 5/5 token-correct. fp16/TC paths are token-TOLERANCE (>=8/12 prefix match), not bit-identical — that is OK; an EARLY divergence is a real bug → REVERT. To exercise a T-gated path in validate, set its env flag (e.g. ZINC_MOE_TC=1) or use a long ZINC_PROMPT.
-- ISOLATED-CACHE BUILD: `rm -rf .zig-cache` is NOT enough (the zig GLOBAL cache serves stale binaries). Build with `ZIG_LOCAL_CACHE_DIR=/tmp/lc-$RANDOM ZIG_GLOBAL_CACHE_DIR=/tmp/gc-$RANDOM ~/zig-0.15.2/zig build ... -Dbackend=cuda` and VERIFY the binary md5 changed, or you are measuring stale code.
+- ISOLATED-CACHE BUILD: `rm -rf .zig-cache` is NOT enough (the zig GLOBAL cache serves stale binaries). Build with `ZIG_LOCAL_CACHE_DIR=/tmp/lc-$RANDOM ZIG_GLOBAL_CACHE_DIR=/tmp/gc-$RANDOM ./scripts/zig.sh build ... -Dbackend=cuda` and VERIFY the binary md5 changed, or you are measuring stale code.
 - PROFILING: `ncu` perf counters are BLOCKED on this WSL2 box (ERR_NVGPUCTRPERM) — A/B is the ONLY perf gate. nsys (tracing/timings) works.
 - MEASURE interleaved A/B at a REAL prefill size (~1037-token prompt; tok/s prints to STDERR, use 2>&1; parse "Prefill complete: T tokens in X ms (Y tok/s)"). The 4090 is boost-noisy — run >=3 interleaved rounds, compare clean rounds (both near full boost), never trust one run. Compare vs llama-bench pp<T> on the SAME 4090 + gguf for gap context.
 - COMMIT ONLY to a `perf/<short-name>` branch and `git push origin <branch>` — NEVER push to main (the operator harvests validated wins). On a WIN: commit the change + append a dated result to project_llama_gap_4090.md memory. On a NEGATIVE: revert the code, but document the finding in memory (prevents re-trying).

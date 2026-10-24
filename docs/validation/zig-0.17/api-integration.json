@@ -1,0 +1,13 @@
+{
+  "complete": true,
+  "models": [
+    {
+      "model": "Qwen3.5-9B-Q4_K_M.gguf",
+      "pass": true
+    },
+    {
+      "model": "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+      "pass": true
+    }
+  ]
+}

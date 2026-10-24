@@ -5,6 +5,7 @@
 //! loading different models onto the same physical GPU at once, which would
 //! otherwise produce confusing OOM failures and unstable benchmark results.
 const std = @import("std");
+const host_io = @import("host_io");
 
 /// Backend identifier encoded into the shared GPU lockfile name.
 pub const Backend = enum {
@@ -14,7 +15,7 @@ pub const Backend = enum {
 
 /// Cross-process lock handle that reserves one backend/device pair.
 pub const ProcessLock = struct {
-    file: ?std.fs.File = null,
+    file: ?std.Io.File = null,
 
     /// Return whether the lock currently owns an open lockfile handle.
     pub fn isHeld(self: *const ProcessLock) bool {
@@ -24,14 +25,14 @@ pub const ProcessLock = struct {
     /// Release the held lockfile handle, if any.
     pub fn deinit(self: *ProcessLock) void {
         if (self.file) |file| {
-            file.close();
+            file.close(host_io.io);
             self.file = null;
         }
     }
 };
 
 /// Errors returned while acquiring a backend/device GPU reservation lock.
-pub const AcquireError = std.fs.File.OpenError || error{
+pub const AcquireError = std.Io.File.OpenError || error{
     GpuAlreadyReserved,
     LockPathTooLong,
 };
@@ -63,7 +64,7 @@ pub fn lockPath(buffer: []u8, backend: Backend, device_index: u32) error{LockPat
 pub fn acquire(backend: Backend, device_index: u32) AcquireError!ProcessLock {
     var path_buffer: [64]u8 = undefined;
     const path = try lockPath(&path_buffer, backend, device_index);
-    const file = std.fs.createFileAbsolute(path, .{
+    const file = std.Io.Dir.createFileAbsolute(host_io.io, path, .{
         .read = true,
         .truncate = false,
         .lock = .exclusive,
@@ -82,4 +83,19 @@ test "lockPath includes backend and device index" {
 
     const metal_path = try lockPath(&buffer, .metal, 0);
     try std.testing.expectEqualStrings("/tmp/zinc-gpu-metal-0.lock", metal_path);
+}
+
+test "GPU reservation rejects a second handle and releases on close" {
+    // A synthetic index reserves no physical GPU and does not share live locks.
+    const index = 1_000_000 + @as(u32, @intCast(std.c.getpid()));
+    var buffer: [64]u8 = undefined;
+    const path = try lockPath(&buffer, .vulkan, index);
+    defer std.Io.Dir.deleteFileAbsolute(host_io.io, path) catch {};
+    var first = try acquire(.vulkan, index);
+    defer first.deinit();
+    try std.testing.expectError(error.GpuAlreadyReserved, acquire(.vulkan, index));
+    first.deinit();
+    var replacement = try acquire(.vulkan, index);
+    defer replacement.deinit();
+    try std.testing.expect(replacement.isHeld());
 }

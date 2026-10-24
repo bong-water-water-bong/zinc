@@ -1,0 +1,68 @@
+{
+  "source_baseline": "29bc350ac4cbf9f110ec628b9e177ea04ac816fb",
+  "zig": "0.17.0",
+  "optimization_modes": {
+    "Debug": {
+      "zig_tests": 703,
+      "bun_tests": 652,
+      "vulkan_build": true,
+      "zinc_rt_build": true,
+      "hot_decode_benchmark_build": true,
+      "cuda_host_entrypoints_checked": 5
+    },
+    "ReleaseSafe": {
+      "zig_tests": 703,
+      "bun_tests": 652,
+      "vulkan_build": true,
+      "zinc_rt_build": true,
+      "hot_decode_benchmark_build": true,
+      "cuda_host_entrypoints_checked": 5
+    },
+    "ReleaseFast": {
+      "zig_tests": 703,
+      "bun_tests": 652,
+      "vulkan_build": true,
+      "zinc_rt_build": true,
+      "hot_decode_benchmark_build": true,
+      "cuda_host_entrypoints_checked": 5
+    },
+    "ReleaseSmall": {
+      "zig_tests": 703,
+      "bun_tests": 652,
+      "vulkan_build": true,
+      "zinc_rt_build": true,
+      "hot_decode_benchmark_build": true,
+      "cuda_host_entrypoints_checked": 5
+    }
+  },
+  "inference_process_cleanup": true,
+  "final_gpu_power_policy": "auto",
+  "system_zig_unchanged": true,
+  "original_worktree_binary_unchanged": true,
+  "macos_compile_only": {
+    "Debug": {
+      "metal_executables": true,
+      "zig_test_binaries": true,
+      "gpu_execution": false
+    },
+    "ReleaseSafe": {
+      "metal_executables": true,
+      "zig_test_binaries": true,
+      "gpu_execution": false
+    },
+    "ReleaseFast": {
+      "metal_executables": true,
+      "zig_test_binaries": true,
+      "gpu_execution": false
+    },
+    "ReleaseSmall": {
+      "metal_executables": true,
+      "zig_test_binaries": true,
+      "gpu_execution": false
+    }
+  },
+  "site_build": {
+    "pages": 255,
+    "pass": true
+  }
+}

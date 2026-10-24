@@ -421,11 +421,11 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
     referenceImplementations: [
       {
-        path: "/Users/stepan/Workspace/llama.cpp",
+        path: "../llama.cpp",
         focus: "Vulkan backend at ggml/src/ggml-vulkan/. mul_mmq.comp + mul_mmq_funcs.glsl for the GEMM-style mmq pattern (Q4_K and Q5_K stanzas at lines 303-364 of mul_mmq_funcs.glsl). vulkan-shaders/mul_mm.comp for dense matmul. mamba/mamba2 ggml_ssm_scan op in src/llama-graph.cpp + ggml/src/ggml-cuda/ssm-scan.cu (CUDA reference) for parallel-scan SSM prefill. Routing/expert grouping in vulkan-shaders/topk_moe.comp + count_experts.comp.",
       },
       {
-        path: "/Users/stepan/Workspace/vllm",
+        path: "../vllm",
         focus: "Expert routing + fused MoE: vllm/model_executor/layers/fused_moe/. Useful for understanding how production systems group tokens by expert with permutation indices.",
       },
     ],
@@ -469,35 +469,35 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
     referenceImplementations: [
       {
-        path: "/Users/stepan/Workspace/zinc/src/shaders/mul_mm_q4k.comp",
+        path: "src/shaders/mul_mm_q4k.comp",
         focus: "ALREADY IN TREE. Tiled Q4_K GEMM ported in cycle 16, currently wired only for LM head (N=1, worst case for tiled GEMM). The shader is correct and validated. The unfinished work for swing #1 is wiring it into SSM proj prefill where N=batch_size_per_chunk. Read alongside src/compute/dmmv.zig recordMulMmQ4K helper.",
       },
       {
-        path: "/Users/stepan/Workspace/zinc/src/shaders/count_experts.comp",
+        path: "src/shaders/count_experts.comp",
         focus: "ALREADY IN TREE. Per-expert token-count buffer ported in cycle 14, wired in cycle 22 (gated ZINC_COUNT_EXPERTS_PREFILL=1). Useful for swing #2(c) — culling zero-token experts before any MoE FFN dispatch.",
       },
       {
-        path: "/Users/stepan/Workspace/zinc/src/shaders/dmmv_q4k_moe_kpar.comp",
+        path: "src/shaders/dmmv_q4k_moe_kpar.comp",
         focus: "Current MoE expert FFN inner loop, NUM_ROWS=2 at expert M=1408. Target for swing #3 (cycle-50 wider-threads-per-row pattern). Lines 100-160 contain the Q4_K block decoder reused throughout the MoE shaders.",
       },
       {
-        path: "/Users/stepan/Workspace/zinc/src/shaders/ssm_delta_net.comp",
+        path: "src/shaders/ssm_delta_net.comp",
         focus: "Cycle 50's winner — restructured 8 threads/row × 8 rows/tile to 16 threads/row × 4 rows/tile. Read this to understand the exact pattern to replicate on dmmv_q4k_moe_kpar and dmmv_q4k_moe_fused_down_acc. The reg_state[16] → reg_state[8] halving and subgroupShuffleXor 8 reduction are the two key transformations.",
       },
       {
-        path: "/Users/stepan/Workspace/zinc/src/shaders/rms_norm_dmmv_f32.comp",
+        path: "src/shaders/rms_norm_dmmv_f32.comp",
         focus: "Cycle 42's winner (+4.66%) — vec4 reads/writes across hidden, ffn_norm weights, router weights, with WG-0 ffn_norm writeback. Pattern: gate fused path on K%4==0. Read alongside rms_norm_mul.comp (cycle 46's similar +1.01% win with register-cache for x[]). These two shaders show the structure that landed wins on RDNA4.",
       },
       {
-        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp",
+        path: "../llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp",
         focus: "Reference for swing #1 wire-up. The tiled GEMM in tree (mul_mm_q4k.comp) was modeled on this — the dispatch-shape pattern is gridX=blocks_m × split_k, gridY=ceil(N/BN) tiles, gridZ=1 for dense / expert_idx for MUL_MAT_ID. For SSM proj wire-up, copy the gridY = ceil(154/BN) sizing and the buffer-layout convention for [N × K] activation tiles.",
       },
       {
-        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm2.comp",
+        path: "../llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm2.comp",
         focus: "Reference for swing #5 (Q pre-load). Look at the Q-tile shared-memory load at the top of the kernel and how it's reused across the K-tile inner loop. Our flash_attn.comp re-reads Q[head_dim] per K-tile iteration — this is the redundant work cycle 48 should have removed.",
       },
       {
-        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/llama-graph.cpp",
+        path: "../llama.cpp/ggml/src/llama-graph.cpp",
         focus: "Reference for swing #4 (parallel-scan SSM). Search for ggml_ssm_scan to find the prefill-time scan op. The CUDA implementation is at ggml/src/ggml-cuda/ssm-scan.cu — it computes the recurrence via Blelloch scan over the token axis. The math is identical between CUDA and Vulkan; what changes is the WG layout (one WG per head per chunk).",
       },
     ],
@@ -542,7 +542,7 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
       "MEASUREMENT NOTE: run-4's headline jump 99.38 → 108.05 (+8.7%) was MOSTLY system-state shift (thermal/RDNA driver re-baseline at run start), not earned by code. Real run-4 code-driven gains were ~+2.2% (cycle 1: +1.43%; cycle 22: +0.5%; cycle 23: +0.25%). The cycle-12 jump 101.62 → 107.27 was a measurement artifact (HEAD itself measured ~107 at that point). Future runs should expect run-to-run baseline drift of ±3% from system state alone, and only attribute code-wins above that band.",
     ],
     structuralSwingIdeas: [
-      "flash_attn_cm1.comp KHR COOPMAT PORT — THE ONLY UNTRIED STRUCTURAL CEILING. Every cheap attack on flash_attn (15+ cycles across 5 runs) has been exhausted; every cheap attack on dense FFN (15+ cycles across runs 4-5) has been exhausted. Cooperative-matrix wmma intrinsics on the Q.K matmul + softmax-V matmul are the only structural shape that hasn't been attempted. RDNA3+ supports VK_KHR_cooperative_matrix and R9700 advertises it. Multi-week port (estimate 5-10 cycles for the shader rewrite + validation + tuning). Reference: /Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp. Read the Br=8/Bc=64 wmma decomposition and the cross-tile softmax reduce. Land behind ZINC_FA_COOPMAT=1, validate against the scalar split-K path at tol=1e-3 on all COHERENCE_MODELS.",
+      "flash_attn_cm1.comp KHR COOPMAT PORT — THE ONLY UNTRIED STRUCTURAL CEILING. Every cheap attack on flash_attn (15+ cycles across 5 runs) has been exhausted; every cheap attack on dense FFN (15+ cycles across runs 4-5) has been exhausted. Cooperative-matrix wmma intrinsics on the Q.K matmul + softmax-V matmul are the only structural shape that hasn't been attempted. RDNA3+ supports VK_KHR_cooperative_matrix and R9700 advertises it. Multi-week port (estimate 5-10 cycles for the shader rewrite + validation + tuning). Reference: ../llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp. Read the Br=8/Bc=64 wmma decomposition and the cross-tile softmax reduce. Land behind ZINC_FA_COOPMAT=1, validate against the scalar split-K path at tol=1e-3 on all COHERENCE_MODELS.",
       "Br=2 + N_I_CHUNKS=4 COMBINED SPLIT-K (cycle 50's untried pivot). Standalone Q_PER_KV=2 GQA collapse failed -17.5% in run-3 c4 due to WG-count loss. The unattempted variant pairs it WITH split-K's WG multiplier: dispatch n_kv_heads × Q_PER_KV_BUDGET=2 × N_I_CHUNKS=4 = 8 × 2 × 4 = 64 WGs (vs the standalone Q_PER_KV=2's 16 WGs that starved). At 64 WGs on 64 CUs the SIMD pool is fed AND each WG amortizes K/V reads 2× across two query heads. Mirrors llama.cpp flash_attn.comp's Br/Bc shape. Build behind ZINC_FA_BR2=1.",
       "PROFILE-PHASE DECOMPOSITION OF THE 'OTHER' 33% BUCKET. The cycle-48 attempt added attn_input_norm/ffn_input_norm tags but didn't decompose all of the residual ~3 ms/token. Sub-categorize: attn_norm, ffn_norm, residual, scale_acc, lm_head, host_gap. May reveal a hidden hotspot (e.g., a per-token rms_norm that's actually 8% of decode and not gate+up at all). Cheap diagnostic; valuable if it surfaces an untouched bucket.",
       "CONDITIONAL DISPATCH FOR flash_attn_split_merge (unblocks cycle 56's +0.41 at L=846). Cycle 56 found N_I_CHUNKS=8 + cluster-quad merge gains +0.41 at long context but regresses -39% at L=5. The fix is to switch dispatch parameters at runtime based on L: cluster-2 chunk-pair (current default, fast at L=5) when L<512, cluster-quad (faster at L≥846) when L≥512. Single Zig-side dispatch decision based on seq_len; no shader changes needed. Captures the unrealized cycle-56 win.",
@@ -552,27 +552,27 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
     referenceImplementations: [
       {
-        path: "/Users/stepan/Workspace/zinc/src/shaders/flash_attn.comp",
+        path: "src/shaders/flash_attn.comp",
         focus: "Current state after 17 cycles of optimization (31.19 → 93.68 tok/s at L=1500). Read the entire shader. Key structural shapes that delivered: (1) cycle 5 D-split — pair lanes (tid, tid+32) on the same d4 and split the i-axis to engage all 64 wave lanes when head_dim=128. (2) cycle 8 s_kv_base_v4 — precompute (page_id*page_size+page_off)*n_kv_heads*head_dim+kv_head*head_dim per i once per block, replacing the prior s_page_ids_block. (3) cycles 6/9/12/16 Phase 4 ILP unrolls (2-way → 4-way → 8-way → 16-way, paired vec4 accumulators). (4) cycles 10/14/17 Phase 1 ILP unrolls (4-way → 8-way → 16-way). The current 16-way pattern is the exhausted ceiling on ILP; 32-way (cycle 18) measured flat.",
       },
       {
-        path: "/Users/stepan/Workspace/zinc/src/shaders/flash_attn_batched.comp",
+        path: "src/shaders/flash_attn_batched.comp",
         focus: "Mirrors flash_attn.comp's structure with grid.y = n_queries. Every cycle in this effort has mirrored the decode-side change to this shader so prefill and ZINC_BATCH_ATTN=1 paths benefit equally. Read alongside flash_attn.comp to see which lines line up.",
       },
       {
-        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp",
+        path: "../llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp",
         focus: "Scalar fallback flash_attn. Search for `Br` and `Bc` to see how multiple Q rows per WG are handled — that's the multi-Q-per-WG / GQA collapse target. Lines 44-90 are Q staging (we ported a simpler version). Lines 196-218 are SHMEM_STAGING for cooperative K loads (note: ZINC's cycle-1 attempt at K-parallel-with-subgroupAdd FAILED -44%; but cooperative K staging without the subgroup reduction is structurally different and unattempted). Lines 355-384 are the fused exp+V loop.",
       },
       {
-        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        path: "../llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
         focus: "Search for `gqa_ratio` and `get_fa_tuning_params_scalar` (~lines 2854-2928 and ~8866). The gqa_ratio collapse is the host-side change needed for multi-Q-per-WG: when n_heads / n_kv_heads = q_per_kv > 1, dispatch grid.x = n_kv_heads (not n_heads) and the shader processes q_per_kv query heads per WG. ZINC currently dispatches grid.x = n_heads.",
       },
       {
-        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp",
+        path: "../llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp",
         focus: "KHR cooperative_matrix variant of flash_attn. Reference for the deferred cooperative-matrix swing. Look at how Q.K and score.V matmuls are decomposed into wmma tiles, what subgroup_size/coopmat_M/coopmat_N constraints apply, and how cross-tile softmax reduction is done.",
       },
       {
-        path: "/Users/stepan/Workspace/zinc/src/shaders/dmmv_q4k_moe_kpar.comp",
+        path: "src/shaders/dmmv_q4k_moe_kpar.comp",
         focus: "Wave64 K-parallel pattern reference. NOTE: the cycle-1 'K-parallel Phase 1' attempt that reduced ONE row across all 64 threads with subgroupAdd lost -44%. That is NOT the pattern this shader uses. dmmv_q4k_moe_kpar splits 64 threads as THREADS_PER_BLOCK=16 (cooperative on K dim) × NUM_ROWS=4 (parallel rows). For multi-Q-per-WG, the analog is THREADS_PER_BLOCK_PER_Q × Q_PER_WG. Read the inner loop and reduction shape.",
       },
     ],
@@ -602,27 +602,27 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
     referenceImplementations: [
       {
-        path: "/Users/zolotukhin/Workplace/llama.cpp/src/llama-graph.cpp",
+        path: "../llama.cpp/src/llama-graph.cpp",
         focus: "Search for build_moe_ffn. This is the graph-side reference for keeping router logits, top-k, selected weights, fused gate_up_exps, per-expert scales, and down projection in the graph.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        path: "../llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
         focus: "Search for ggml_vk_topk_moe, ggml_vk_mul_mat_id, ggml_vk_mul_mat_vec_id_q_f16, ggml_vk_use_mul_mat_vec_id, and ggml_vk_should_use_mmvq. These are the Vulkan control-flow pieces ZINC needs to mirror conceptually.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl",
+        path: "../llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl",
         focus: "MUL_MAT_ID shader addressing: data_ids selects expert_id; expert_id offsets the stacked expert weight tensor; expert_i0/expert_i1 select top-k slot and token/batch lane.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/topk_moe.comp",
+        path: "../llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/topk_moe.comp",
         focus: "Reference for fused top-k MoE softmax/normalization. ZINC already has dispatchSoftmaxTopk; use this to compare semantics and edge cases.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        path: "src/compute/forward.zig",
         focus: "Current ZINC Gemma fallback. Search for use_gpu_moe, router_staging, topKSoftmax, fused_gate_up, ffn_gate_inp_scale, ffn_down_exps_scale, and post_ffw_norm.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/src/shaders/dmmv_q4k_fused_gate_up_swiglu_moe.comp",
+        path: "src/shaders/dmmv_q4k_fused_gate_up_swiglu_moe.comp",
         focus: "Existing selected-expert fused gate/up/SwiGLU shader. It assumes separate gate/up bindings today; adapt or replace for Gemma's fused ffn_gate_up_exps layout.",
       },
     ],
@@ -668,15 +668,15 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
     referenceImplementations: [
       {
-        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        path: "src/compute/forward.zig",
         focus: "Read canUseBatchedPrefillRdna, prefillBatchedImpl, prefillBatch, runSsmLayerGpu, dispatchProjectionBatched, dispatchDmmvAcc, and the dense_ffn profile phase before editing.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
+        path: "loops/efforts/MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
         focus: "This effort's measured baselines, failed-attempt list, and staged plan. Follow Track 1 before any production SSM prefill change.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_6_RDNA_QWEN36_PREFILL.md",
+        path: "loops/efforts/MULTI_HOUR_EFFORT_6_RDNA_QWEN36_PREFILL.md",
         focus: "Historical RDNA Qwen prefill attempts, especially dormant tiled-GEMM lessons and SSM capture/validation failures.",
       },
     ],
@@ -718,15 +718,15 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
     referenceImplementations: [
       {
-        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        path: "src/compute/forward.zig",
         focus: "Read canUseBatchedPrefillRdna, isQwen36DenseHybrid27B, qwen36DensePrefillPrefixLayers, qwen36DensePrefillSegmentLayers, prefillQwen36DenseFfnPrefix, prefillQwen36RunBatchedDenseFfnLayer, prefillQwen36RunFullAttnLayerToFfnNorm, and dispatchProjectionBatched before editing.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
+        path: "loops/efforts/MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
         focus: "Use the staged validator-first approach and failed-attempt list. The mechanism is relevant to Qwen3.5, but the 27B-specific shape constants and thresholds are not.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/tools/performance_suite.mjs",
+        path: "tools/performance_suite.mjs",
         focus: "Source of the public prompt matrix. contextualizePrompt(..., decode-extended) defines the Long Coding Plan prompt used as this effort's primary metric.",
       },
     ],
@@ -771,15 +771,15 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
     referenceImplementations: [
       {
-        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        path: "src/compute/forward.zig",
         focus: "Read qwenDenseFfnDp4aEnabled (the cycle-0 gate), dispatchQwen36DenseDown, dispatchScaleAcc, the dense_ffn_residual_acc phase (~20650), and dispatchQwen36DenseGateUpDp4a before editing.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/src/shaders/scale_accumulate.comp",
+        path: "src/shaders/scale_accumulate.comp",
         focus: "Vec4-coalesced residual-add shader; candidate for a stride-loop to cut WG launch count, shared by all dispatchScaleAcc callers.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_17_RDNA_QWEN35_9B_PREFILL.md",
+        path: "loops/efforts/MULTI_HOUR_EFFORT_17_RDNA_QWEN35_9B_PREFILL.md",
         focus: "The R9700/RDNA1 sibling. Same model + metric, but its baselines and accepted paths assume Mesa 25.0.7 without cooperative matrix — do not port DP4a enablement from it to this node.",
       },
     ],
@@ -819,19 +819,19 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
     referenceImplementations: [
       {
-        path: "/Users/zolotukhin/Workplace/llama.cpp/src/llama-graph.cpp",
+        path: "../llama.cpp/src/llama-graph.cpp",
         focus: "Search for build_moe_ffn. This is the graph-side reference for Gemma router scaling, top-k, fused gate_up_exps, selected weights, and per-expert scales.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        path: "../llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
         focus: "Search for ggml_vk_topk_moe, ggml_vk_mul_mat_id, count_experts, and grouped MoE dispatch selection. Decode matvec-ID is useful background, but this effort needs the prefill/batched-token shape.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_13_RDNA_GEMMA_LONG_DECODE.md",
+        path: "loops/efforts/MULTI_HOUR_EFFORT_13_RDNA_GEMMA_LONG_DECODE.md",
         focus: "Gemma MoE semantic checklist. Reuse the correctness requirements, but do not stop at decode-time matvec-ID.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_9_RDNA_GEMMA_BATCHED_PREFILL.md",
+        path: "loops/efforts/MULTI_HOUR_EFFORT_9_RDNA_GEMMA_BATCHED_PREFILL.md",
         focus: "Historical Gemma batched prefill correctness bugs: V RMS norm, use_k_as_v, asymmetric head dims, post norms, and SWA handling.",
       },
     ],
@@ -871,19 +871,19 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     ],
     referenceImplementations: [
       {
-        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_9_RDNA_GEMMA_BATCHED_PREFILL.md",
+        path: "loops/efforts/MULTI_HOUR_EFFORT_9_RDNA_GEMMA_BATCHED_PREFILL.md",
         focus: "Historical Gemma 31B batched prefill work and correctness traps. Read before touching full-attn/SWA/post-norm handling.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        path: "src/compute/forward.zig",
         focus: "Read canUseBatchedPrefillRdna, prefillBatchedImpl, Gemma post norm branches, dispatchProjectionBatched, dispatchFlashAttnBatched, and any Gemma-specific validate paths.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/zinc/src/shaders/mul_mm_q4k.comp",
+        path: "src/shaders/mul_mm_q4k.comp",
         focus: "Existing tiled Q4_K GEMM reference. It is the right structural direction for prompt-token batches if profiles show DMMV-style weight rereads dominate.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan",
+        path: "../llama.cpp/ggml/src/ggml-vulkan",
         focus: "Vulkan Q4_K matmul/MMQ and Gemma graph lowering. Compare when llama.cpp chooses MMQ/GEMM vs matvec paths on small prompt-token batches.",
       },
     ],
@@ -2429,7 +2429,7 @@ Before editing any file, re-read the exact current contents from disk. Do not re
 1. **BUILD MUST PASS.** Before you declare yourself done, you MUST:
    a. rsync your changes to the remote node
    b. Compile shaders: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR}/src/shaders && for f in *.comp; do glslc --target-env=vulkan1.3 -fshader-stage=compute \\$f -o \\$\{f%.comp}.spv 2>&1; done"
-   c. Build: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast 2>&1"
+   c. Build: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && ./scripts/zig.sh build -Doptimize=ReleaseFast 2>&1"
    d. If the build fails, FIX THE ERRORS before finishing. Do NOT leave broken code.
 
 2. **Incremental steps.** If the optimization requires changing many call sites (e.g. 60+ descriptor set conversions), break it into compilable stages:
@@ -2447,7 +2447,7 @@ Before editing any file, re-read the exact current contents from disk. Do not re
 
 5. **Test on remote node:**
    rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" ${AGENT_RSYNC_EXCLUDE_ARGS} ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
-   ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
+   ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && ./scripts/zig.sh build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
 6. **Shader compilation:** glslc --target-env=vulkan1.3 -fshader-stage=compute file.comp -o file.spv
 
@@ -2599,7 +2599,7 @@ Your output must still end with @@@DESCRIPTION / @@@STEP_KIND / @@@SELF_ANALYSIS
 
 ## Test on Remote Node
 rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" ${AGENT_RSYNC_EXCLUDE_ARGS} ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
-ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
+ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && ./scripts/zig.sh build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
 Files you may edit: same as a normal cycle (src/compute/*.zig, src/vulkan/*.zig, src/model/*.zig, src/server/*.zig, src/server/chat.html, src/shaders/*.comp, src/main.zig, and build.zig only when a shader/pipeline change needs build installation). You may also remove files that a revert would remove.
 
@@ -2748,7 +2748,7 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
   console.log(c("2", "  Building..."));
   let buildOutput: string;
   try {
-    buildOutput = await ssh(`cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast 2>&1`, 600_000);
+    buildOutput = await ssh(`cd ${REMOTE_DIR} && ./scripts/zig.sh build -Doptimize=ReleaseFast 2>&1`, 600_000);
   } catch (e) {
     return {
       buildOk: false,
@@ -2759,7 +2759,7 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
       outputText: "",
       bandwidthUtil: null,
       bandwidthSamples: [],
-      error: "zig build failed",
+      error: "./scripts/zig.sh build failed",
     };
   }
   if (buildOutput.includes("error:")) {
@@ -2776,7 +2776,7 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
     };
   }
 
-  // Shader-install parity guard. `zig build` only installs the shaders listed
+  // Shader-install parity guard. `./scripts/zig.sh build` only installs the shaders listed
   // in build.zig's `shader_sources` tuple into share/zinc/shaders, but the
   // runtime loads its .spv from that install dir. A new src/shaders/*.comp that
   // is wired into Zig but forgotten in shader_sources gets compiled (above) yet
@@ -4099,11 +4099,11 @@ ${result.buildOutput.slice(-2000)}
 
 ## Rules:
 - Fix ONLY the build errors. Do not add new features.
-- The code must compile: zig build -Doptimize=ReleaseFast must succeed on the remote node.
+- The code must compile: ./scripts/zig.sh build -Doptimize=ReleaseFast must succeed on the remote node.
 - Do not use sub-agents, delegation, spawn_agent, or wait_agent.
 - Re-read the file right before patching it; do not patch against stale context.
 - rsync to remote: rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" ${AGENT_RSYNC_EXCLUDE_ARGS} ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
-- Build on remote: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast 2>&1"
+- Build on remote: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && ./scripts/zig.sh build -Doptimize=ReleaseFast 2>&1"
 - Shader compilation: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR}/src/shaders && for f in *.comp; do glslc --target-env=vulkan1.3 -fshader-stage=compute \\$f -o \\$\{f%.comp}.spv 2>&1; done"`;
 
       if (agent === "codex") {

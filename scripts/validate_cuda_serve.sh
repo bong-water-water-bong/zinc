@@ -18,8 +18,8 @@
 #
 # Run ON the box from the repo root. 5090-pinned by default. nohup + poll a log.
 set -u
-GPU=${ZINC_GPU:-GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350}
-ZIG=${ZIG:-$HOME/zig-0.15.2/zig}
+GPU=${ZINC_GPU:?Set ZINC_GPU to the target device}
+ZIG=${ZIG:-./scripts/zig.sh}
 MD=${ZINC_MODELS:-$HOME/workspace/models}
 MODEL=${ZINC_SERVE_MODEL:-$MD/gemma-4-31B-it-Q4_K_M.gguf}
 PORT=${ZINC_SERVE_PORT:-8189}

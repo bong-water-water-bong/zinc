@@ -6,14 +6,14 @@ Instructions for AI coding agents working on this repository.
 
 ```bash
 # Build (shaders compile on Linux only; macOS skips GPU inference)
-zig build -Doptimize=ReleaseFast
+./scripts/zig.sh build -Doptimize=ReleaseFast
 
 # Run inference
 ZINC_DEBUG=1 ./zig-out/bin/zinc -m model.gguf --prompt "Hello" [-d device_id] [--kv-quant 3] [--debug]
 ./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "Hello" [--chat]
 
 # Run unit tests
-zig build test
+./scripts/zig.sh build test
 
 # Compile shaders manually (requires glslc / shaderc)
 glslc --target-env=vulkan1.3 -O -o out.spv src/shaders/name.comp
@@ -70,7 +70,7 @@ Agent policy:
 
 ## Tech Stack
 
-- **Zig 0.15.2+** — host code, build system
+- **Zig 0.17.0** — host code, build system
 - **GLSL 460** — compute shaders compiled to SPIR-V via `glslc` (Vulkan backend)
 - **MSL** — Metal Shading Language compute shaders (Apple Silicon backend)
 - **Vulkan 1.3** — GPU API for AMD RDNA3/RDNA4
@@ -238,7 +238,7 @@ writing/                         # Draft writing and publishing notes
 ## Boundaries
 
 ### Always
-- Run `zig build test` before considering work complete
+- Run `./scripts/zig.sh build test` before considering work complete
 - Validate GPU kernels against llama.cpp reference outputs
 - Use push constants (not UBOs) for per-dispatch parameters in shaders
 - Keep shader local_size_x = 64 (RDNA4 wave64)
@@ -281,7 +281,7 @@ workstation rebooted mid-session.
 - `bun test` suites or smoke tests that start a server or load a model
 - `zinc model pull` for benchmarking purposes, and `--metal-pull-missing`
 
-**Allowed on the workstation:** `zig build`, `zig fmt`, `zig build test` cases that
+**Allowed on the workstation:** `./scripts/zig.sh build`, `zig fmt`, `./scripts/zig.sh build test` cases that
 do not open a model file, shader compilation, git, the site build, and
 `wrangler` deploys.
 
@@ -388,10 +388,10 @@ source .env
 # Sync source to test node
 rsync -az --delete --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' \
   --exclude '.DS_Store' --exclude 'site' \
-  -e "ssh -p $ZINC_PORT" . $ZINC_USER@$ZINC_HOST:/root/zinc/
+  -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${ZINC_WORKDIR:?Set ZINC_WORKDIR}/"
 
 # Build and run
-ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && zig build -Doptimize=ReleaseFast && \
+ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd \"${ZINC_WORKDIR:?Set ZINC_WORKDIR}\" && ./scripts/zig.sh build -Doptimize=ReleaseFast && \
   RADV_PERFTEST=coop_matrix ./zig-out/bin/zinc \
   -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   --prompt 'The capital of France is'"
@@ -445,10 +445,10 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
 # 2. Sync, build, and restart one clean ZINC server on :9090.
 rsync -az --delete --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' \
   --exclude '.DS_Store' --exclude 'site' \
-  -e "ssh -p $ZINC_PORT" . $ZINC_USER@$ZINC_HOST:/root/zinc/
+  -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${ZINC_WORKDIR:?Set ZINC_WORKDIR}/"
 
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
-  cd /root/zinc && zig build -Doptimize=ReleaseFast && \
+  cd \"${ZINC_WORKDIR:?Set ZINC_WORKDIR}\" && ./scripts/zig.sh build -Doptimize=ReleaseFast && \
   nohup env RADV_PERFTEST=coop_matrix ./zig-out/bin/zinc \
     -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --port 9090 >/tmp/zinc_9090.log 2>&1 < /dev/null &"
@@ -465,7 +465,7 @@ Chat-endpoint latency matrix:
 source .env
 
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
-  cd /root/zinc && \
+  cd \"${ZINC_WORKDIR:?Set ZINC_WORKDIR}\" && \
   /root/.bun/bin/bun tools/benchmark_api.mjs \
     --base http://127.0.0.1:9090/v1 \
     --mode chat \
@@ -478,7 +478,7 @@ Raw sustained-throughput benchmark:
 source .env
 
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
-  cd /root/zinc && \
+  cd \"${ZINC_WORKDIR:?Set ZINC_WORKDIR}\" && \
   /root/.bun/bin/bun tools/benchmark_api.mjs \
     --base http://127.0.0.1:9090/v1 \
     --mode raw \
@@ -502,8 +502,8 @@ Important caveat:
 source .env
 
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
-  cd /root/zinc && \
-  zig build hot-bench -Doptimize=ReleaseFast -- \
+  cd \"${ZINC_WORKDIR:?Set ZINC_WORKDIR}\" && \
+  ./scripts/zig.sh build hot-bench -Doptimize=ReleaseFast -- \
     --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --iterations 200 --warmup 25"
 ```
@@ -514,20 +514,20 @@ Focused single-case runs:
 source .env
 
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
-  cd /root/zinc && \
-  zig build hot-bench -Doptimize=ReleaseFast -- \
+  cd \"${ZINC_WORKDIR:?Set ZINC_WORKDIR}\" && \
+  ./scripts/zig.sh build hot-bench -Doptimize=ReleaseFast -- \
     --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --case q8_router"
 
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
-  cd /root/zinc && \
-  zig build hot-bench -Doptimize=ReleaseFast -- \
+  cd \"${ZINC_WORKDIR:?Set ZINC_WORKDIR}\" && \
+  ./scripts/zig.sh build hot-bench -Doptimize=ReleaseFast -- \
     --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --case q8_shared_gate_up"
 
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
-  cd /root/zinc && \
-  RADV_DEBUG=shaderstats zig build hot-bench -Doptimize=ReleaseFast -- \
+  cd \"${ZINC_WORKDIR:?Set ZINC_WORKDIR}\" && \
+  RADV_DEBUG=shaderstats ./scripts/zig.sh build hot-bench -Doptimize=ReleaseFast -- \
     --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --case ssm_delta"
 ```

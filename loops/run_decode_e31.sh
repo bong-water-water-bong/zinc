@@ -10,6 +10,8 @@
 #   nohup bash loops/run_decode_e31.sh loops/efforts/MULTI_HOUR_EFFORT_31_CUDA_5090_DECODE.md > /tmp/e31_loop.log 2>&1 &
 #   watch: tail -f /tmp/e31_loop.log      stop: pkill -f run_decode_e31
 set -u
+[ ! -f "$(dirname "$0")/../.env" ] || source "$(dirname "$0")/../.env"
+: "${ZINC_HOST:?Set ZINC_HOST}" "${ZINC_USER:?Set ZINC_USER}" "${ZINC_WORKDIR:?Set ZINC_WORKDIR}" "${ZINC_GPU_5090:?Set ZINC_GPU_5090}"
 cd "$(dirname "$0")/.." || exit 1
 ROOT="$(pwd)"
 EFFORT="${1:?usage: run_decode_e31.sh <effort-file.md>}"
@@ -25,7 +27,7 @@ STEP 0 — READ: your memory (MEMORY.md + project_5090_decode_gap.md + project_e
 THIS CYCLE:
 1. If a perf/e31-* branch is mid-flight, continue it; else pick the next un-done fusion adjacency from the effort file. SCAN the decode hot path (forward_cuda_gemma.zig moeFfnBlock/attentionLayer/tail, forward_cuda.zig for qwen) for two ADJACENT single-block rms/elementwise launches (same or chained buffers) that can fuse into ONE kernel, block-count preserved → bit-identical.
 2. Implement ONE focused fusion in this worktree.
-3. Build on the box: rsync this whole worktree to zincbox:~/zinc-harvest/ (single-source './ dest/'), then '~/zig-0.15.2/zig build -Dbackend=cuda -Dshaders=false -Doptimize=ReleaseFast'. Pin the 5090: CUDA_VISIBLE_DEVICES=GPU-5126d018-ec86-be8b-1bf5-b5ac323d3350.
+3. Build on the box: rsync this whole worktree to \"$ZINC_USER@$ZINC_HOST:$ZINC_WORKDIR/\" (single-source './ dest/'), then './scripts/zig.sh build -Dbackend=cuda -Dshaders=false -Doptimize=ReleaseFast'. Pin the 5090: CUDA_VISIBLE_DEVICES=\"$ZINC_GPU_5090\".
 4. CORRECTNESS GATE: fusion is usually BIT-identical (same kernels reordered) → require token-IDENTICAL output to the shipped default on gemma-26b AND qwen (greedy '--prompt \"<real text>\" --raw -n 20', compare the 'Output(...)' line, STDERR 2>&1). A DIFFER = REVERT.
 5. MEASURE DECODE: interleaved ABBA A/B (≥4 rounds, drop the cold first), zinc decode tok/s (parse 'Generated N tokens in … — X tok/s'); use a RAMBLE prompt (repeat a sentence ~8×) so the model generates ≥100 tokens (short prompts EOS early). Decode is boost-noisy (±10%) → require a consistent multi-round win.
 6. If a VALIDATED WIN: commit ONLY your scoped change to perf/e31-<short-target> via a git worktree, push it (NEVER main); append a dated one-liner to ${EFFORT}'s cycle log AND to project_5090_decode_gap memory. If NEGATIVE: revert, log the finding (negatives are valuable).
@@ -46,7 +48,6 @@ while [ "$i" -lt "$MAX" ]; do
   echo "===== e31 cycle $i / $MAX — $(date -u +%FT%TZ) =====" | tee -a "$LOG"
   perl -e 'alarm shift; exec @ARGV' 3000 claude -p --permission-mode bypassPermissions --effort high "$PROMPT" 2>&1 | tee -a "$LOG" \
     || echo "(cycle $i exited nonzero/timed-out — self-recovering)" | tee -a "$LOG"
-  ssh -o BatchMode=yes -o ConnectTimeout=8 zincbox 'pkill -f "zig-out/bin/zinc" 2>/dev/null; pkill -f "zig build" 2>/dev/null' >/dev/null 2>&1 || true
   echo "===== e31 cycle $i done — $(date -u +%FT%TZ); sleeping ${SLEEP}s =====" | tee -a "$LOG"
   sleep "$SLEEP"
 done

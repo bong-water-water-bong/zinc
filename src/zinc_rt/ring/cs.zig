@@ -27,6 +27,7 @@
 //! fence retirement before lowering real decode slices onto the direct tiers.
 //! @section Inference Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 const builtin = @import("builtin");
 const kmd = @import("../kmd.zig");
 const packet = @import("packet.zig");
@@ -1023,7 +1024,7 @@ pub const SmokeResult = struct {
 /// Reused across many submissions so each decode step only re-records PM4 into
 /// the existing IB and re-submits via `DRM_IOCTL_AMDGPU_CS`.
 pub const TokenBoundary = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     ctx_id: u32,
     ip_type: u32,
     bo_list_handle: u32,
@@ -1067,8 +1068,8 @@ pub const TokenBoundary = struct {
     pub fn initPath(render_node: []const u8) !TokenBoundary {
         if (builtin.os.tag != .linux) return error.UnsupportedOs;
 
-        var file = std.fs.openFileAbsolute(render_node, .{ .mode = .read_write }) catch return error.RenderNodeOpenFailed;
-        errdefer file.close();
+        var file = std.Io.Dir.openFileAbsolute(host_io.io, render_node, .{ .mode = .read_write }) catch return error.RenderNodeOpenFailed;
+        errdefer file.close(host_io.io);
 
         const ip_type: u32 = AMDGPU_HW_IP_COMPUTE;
         const hw_ip = kmd.queryHwIp(file, ip_type) catch return error.HwIpQueryFailed;
@@ -1097,29 +1098,29 @@ pub const TokenBoundary = struct {
         const resident_va: u64 = shader_va + shader_page_bytes;
 
         const ib_bo = kmd.createGem(file, ib_bo_size, 256, kmd.AMDGPU_GEM_DOMAIN_GTT, kmd.AMDGPU_GEM_CREATE_CPU_GTT_USWC) catch return error.IbBoFailed;
-        const ib_map = kmd.mmapGem(file, ib_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch return error.IbMapFailed;
+        const ib_map = kmd.mmapGem(file, ib_bo, .{ .READ = true, .WRITE = true }) catch return error.IbMapFailed;
         errdefer std.posix.munmap(ib_map);
         const exec_va_flags = kmd.AMDGPU_VM_PAGE_READABLE | kmd.AMDGPU_VM_PAGE_WRITEABLE | kmd.AMDGPU_VM_PAGE_EXECUTABLE | kmd.AMDGPU_VM_MTYPE_DEFAULT;
         kmd.mapGemVa(file, ib_bo, ib_va, exec_va_flags) catch return error.IbVaFailed;
 
         const data_va_flags = kmd.AMDGPU_VM_PAGE_READABLE | kmd.AMDGPU_VM_PAGE_WRITEABLE | kmd.AMDGPU_VM_MTYPE_DEFAULT;
         const input_bo = kmd.createGem(file, input_bo_size, 256, kmd.AMDGPU_GEM_DOMAIN_GTT, kmd.AMDGPU_GEM_CREATE_CPU_GTT_USWC) catch return error.InputBoFailed;
-        const input_map = kmd.mmapGem(file, input_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch return error.InputMapFailed;
+        const input_map = kmd.mmapGem(file, input_bo, .{ .READ = true, .WRITE = true }) catch return error.InputMapFailed;
         errdefer std.posix.munmap(input_map);
         kmd.mapGemVa(file, input_bo, input_va, data_va_flags) catch return error.InputVaFailed;
 
         const output_bo = kmd.createGem(file, output_bo_size, 256, kmd.AMDGPU_GEM_DOMAIN_GTT, kmd.AMDGPU_GEM_CREATE_CPU_GTT_USWC) catch return error.OutputBoFailed;
-        const output_map = kmd.mmapGem(file, output_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch return error.OutputMapFailed;
+        const output_map = kmd.mmapGem(file, output_bo, .{ .READ = true, .WRITE = true }) catch return error.OutputMapFailed;
         errdefer std.posix.munmap(output_map);
         kmd.mapGemVa(file, output_bo, output_va, data_va_flags) catch return error.OutputVaFailed;
 
         const signal_bo = kmd.createGem(file, page_size, 256, kmd.AMDGPU_GEM_DOMAIN_GTT, kmd.AMDGPU_GEM_CREATE_CPU_GTT_USWC) catch return error.SignalBoFailed;
-        const signal_map = kmd.mmapGem(file, signal_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch return error.SignalMapFailed;
+        const signal_map = kmd.mmapGem(file, signal_bo, .{ .READ = true, .WRITE = true }) catch return error.SignalMapFailed;
         errdefer std.posix.munmap(signal_map);
         kmd.mapGemVa(file, signal_bo, signal_va, data_va_flags) catch return error.SignalVaFailed;
 
         const shader_bo = kmd.createGem(file, shader_page_bytes, 256, kmd.AMDGPU_GEM_DOMAIN_GTT, kmd.AMDGPU_GEM_CREATE_CPU_GTT_USWC) catch return error.ShaderBoFailed;
-        const shader_map = kmd.mmapGem(file, shader_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch return error.ShaderMapFailed;
+        const shader_map = kmd.mmapGem(file, shader_bo, .{ .READ = true, .WRITE = true }) catch return error.ShaderMapFailed;
         errdefer std.posix.munmap(shader_map);
         kmd.mapGemVa(file, shader_bo, shader_va, exec_va_flags) catch return error.ShaderVaFailed;
 
@@ -1132,7 +1133,7 @@ pub const TokenBoundary = struct {
             kmd.AMDGPU_GEM_DOMAIN_VRAM,
             kmd.AMDGPU_GEM_CREATE_VRAM_CLEARED | kmd.AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
         )) |resident_bo| {
-            if (kmd.mmapGem(file, resident_bo, std.posix.PROT.READ | std.posix.PROT.WRITE)) |map| {
+            if (kmd.mmapGem(file, resident_bo, .{ .READ = true, .WRITE = true })) |map| {
                 if (kmd.mapGemVa(file, resident_bo, resident_va, data_va_flags)) {
                     resident_map = map;
                     resident_bo_handle = resident_bo.handle;
@@ -1224,7 +1225,7 @@ pub const TokenBoundary = struct {
         std.posix.munmap(self.input_map);
         std.posix.munmap(self.shader_map);
         std.posix.munmap(self.ib_map);
-        self.file.close();
+        self.file.close(host_io.io);
         self.* = undefined;
     }
 
@@ -2405,7 +2406,7 @@ pub const TokenBoundary = struct {
             kmd.AMDGPU_GEM_DOMAIN_VRAM,
             kmd.AMDGPU_GEM_CREATE_VRAM_CLEARED | kmd.AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
         ) catch return false;
-        const map = kmd.mmapGem(self.file, bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch return false;
+        const map = kmd.mmapGem(self.file, bo, .{ .READ = true, .WRITE = true }) catch return false;
         defer std.posix.munmap(map);
         const words: [*]volatile u32 = @ptrCast(@alignCast(map.ptr));
         const last = size / @sizeOf(u32) - 1;
@@ -3719,11 +3720,11 @@ pub fn submitNopSmokePath(render_node: []const u8) SmokeResult {
     last_errno = null;
     var result: SmokeResult = .{ .status = .ok, .render_node = render_node };
 
-    var file = std.fs.openFileAbsolute(render_node, .{ .mode = .read_write }) catch {
+    var file = std.Io.Dir.openFileAbsolute(host_io.io, render_node, .{ .mode = .read_write }) catch {
         result.status = .render_node_open_failed;
         return result;
     };
-    defer file.close();
+    defer file.close(host_io.io);
 
     // Use the compute ring: this is the path Vulkan compute and future
     // ZINC_RT decode dispatches target.
@@ -3777,7 +3778,7 @@ pub fn submitNopSmokePath(render_node: []const u8) SmokeResult {
         result.status = .ib_bo_failed;
         return result;
     };
-    const ib_map = kmd.mmapGem(file, ib_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch {
+    const ib_map = kmd.mmapGem(file, ib_bo, .{ .READ = true, .WRITE = true }) catch {
         result.errno = kmd.lastErrno();
         result.status = .ib_map_failed;
         return result;
@@ -3798,7 +3799,7 @@ pub fn submitNopSmokePath(render_node: []const u8) SmokeResult {
         result.status = .signal_bo_failed;
         return result;
     };
-    const signal_map = kmd.mmapGem(file, signal_bo, std.posix.PROT.READ | std.posix.PROT.WRITE) catch {
+    const signal_map = kmd.mmapGem(file, signal_bo, .{ .READ = true, .WRITE = true }) catch {
         result.errno = kmd.lastErrno();
         result.status = .signal_map_failed;
         return result;
@@ -3914,7 +3915,7 @@ pub fn submitNopSmokePath(render_node: []const u8) SmokeResult {
 }
 
 fn submitWriteDataAndWait(
-    file: std.fs.File,
+    file: std.Io.File,
     ctx_id: u32,
     ip_type: u32,
     bo_list_handle: u32,
@@ -3951,7 +3952,7 @@ fn submitWriteDataAndWait(
 }
 
 fn submitBuilderAndWait(
-    file: std.fs.File,
+    file: std.Io.File,
     ctx_id: u32,
     ip_type: u32,
     bo_list_handle: u32,
@@ -3975,7 +3976,7 @@ fn submitBuilderAndWait(
 }
 
 fn submitBuilder(
-    file: std.fs.File,
+    file: std.Io.File,
     ctx_id: u32,
     bo_list_handle: u32,
     builder: *const packet.PacketBuilder,
@@ -3999,7 +4000,7 @@ fn submitBuilder(
 }
 
 fn waitSubmittedFence(
-    file: std.fs.File,
+    file: std.Io.File,
     ctx_id: u32,
     ip_type: u32,
     fence_handle: u64,
@@ -4035,23 +4036,23 @@ fn submitFail(result: SmokeResult, err: SubmitError) SmokeResult {
     return failed;
 }
 
-fn ioctlRaw(file: std.fs.File, request: u32, arg: usize) error{IoctlFailed}!void {
+fn ioctlRaw(file: std.Io.File, request: u32, arg: usize) error{IoctlFailed}!void {
     last_errno = null;
     const rc = linux.ioctl(file.handle, request, arg);
-    const err = linux.E.init(rc);
+    const err = linux.errno(rc);
     if (err != .SUCCESS) {
         last_errno = err;
         return error.IoctlFailed;
     }
 }
 
-fn freeContext(file: std.fs.File, ctx_id: u32) void {
+fn freeContext(file: std.Io.File, ctx_id: u32) void {
     var free_ctx: DrmAmdgpuCtx = std.mem.zeroes(DrmAmdgpuCtx);
     free_ctx.in = .{ .op = AMDGPU_CTX_OP_FREE_CTX, .flags = 0, .ctx_id = ctx_id, .priority = 0 };
     ioctlRaw(file, ioc_ctx, @intFromPtr(&free_ctx)) catch {};
 }
 
-fn destroyBoList(file: std.fs.File, bo_list_handle: u32) void {
+fn destroyBoList(file: std.Io.File, bo_list_handle: u32) void {
     var destroy_list: DrmAmdgpuBoList = std.mem.zeroes(DrmAmdgpuBoList);
     destroy_list.in = .{
         .operation = AMDGPU_BO_LIST_OP_DESTROY,
@@ -4081,7 +4082,7 @@ test "gfx1201 multi-WG TGID delivery + VRAM residency probe" {
     };
     defer boundary.deinit();
 
-    var out = [_]u32{0} ** 8;
+    var out = @as([8]u32, @splat(0));
     boundary.sgprTgidProbe(4, out[0..4]) catch |e| {
         std.debug.print("\n[probe] TGID dispatch FAILED: {s}\n", .{@errorName(e)});
         return e;
