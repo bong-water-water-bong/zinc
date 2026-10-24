@@ -143,6 +143,7 @@ The example preserves the existing power policy. The optional `--lock-clocks`
 flag requires sysfs write access and restores the prior setting; it is useful
 for diagnostics, but locked profiles caused instability on this test node.
 
+Measurement dumps use lossless gzip compression with uncompressed SHA256 hashes.
 Raw samples, exact tokenizer corpora and the matching 0.15.2 tokenizer benchmark
 source are in `docs/validation/zig-0.17/`. The source fixture is stored as text
 and compiled against the frozen baseline's tokenizer. Comparisons retain their
