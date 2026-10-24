@@ -15,7 +15,7 @@ If that works, move on to the [hardware requirements](/zinc/docs/hardware-requir
 ```bash
 git clone https://github.com/zolotukhin/zinc.git
 cd zinc
-zig build -Doptimize=ReleaseFast
+./scripts/zig.sh build -Doptimize=ReleaseFast
 ./zig-out/bin/zinc model pull qwen35-9b-q4k-m
 ./zig-out/bin/zinc --model-id qwen35-9b-q4k-m --prompt "What is the capital of France?" --chat
 ```
@@ -70,7 +70,7 @@ sudo apt update
 sudo apt install -y git libvulkan-dev vulkan-tools glslc
 ```
 
-Then install **Zig 0.15.2 or newer** from [ziglang.org/download](https://ziglang.org/download/).
+Then install **Zig 0.17.0** from [ziglang.org/download](https://ziglang.org/download/).
 
 That package set is for Vulkan. For AMD ROCm, install the HIP development files that provide `amdhip64`, `hiprtc`, and `hipblas`; the complete setup is in the [ROCm guide](/zinc/docs/rocm/).
 
@@ -81,20 +81,20 @@ The default build selects Vulkan on Linux and Metal on macOS:
 ```bash
 git clone https://github.com/zolotukhin/zinc.git
 cd zinc
-zig build -Doptimize=ReleaseFast
+./scripts/zig.sh build -Doptimize=ReleaseFast
 ```
 
 Choose ROCm explicitly on a supported AMD Linux installation:
 
 ```bash
-ROCM_PATH=/opt/rocm zig build -Dbackend=rocm -Doptimize=ReleaseFast
+ROCM_PATH=/opt/rocm ./scripts/zig.sh build -Dbackend=rocm -Doptimize=ReleaseFast
 ROCR_VISIBLE_DEVICES=0 ./zig-out/bin/zinc --check
 ```
 
 The NVIDIA CUDA build is experimental:
 
 ```bash
-CUDA_HOME=/usr/local/cuda zig build -Dbackend=cuda -Doptimize=ReleaseFast
+CUDA_HOME=/usr/local/cuda ./scripts/zig.sh build -Dbackend=cuda -Doptimize=ReleaseFast
 ./zig-out/bin/zinc --check
 ```
 

@@ -11,7 +11,7 @@
  * The CUDA toolchain + GPUs live on a remote Linux box (the Mac can't build
  * CUDA), so each cycle:
  *   1. rsync local src/ -> box
- *   2. build the CUDA zinc exe ON THE BOX (zig build -Dbackend=cuda)
+ *   2. build the CUDA zinc exe ON THE BOX (./scripts/zig.sh build -Dbackend=cuda)
  *   3. run the target gemma4 model ON THE BOX (zinc -m <gguf> --prompt ...)
  *   4. analyze: build error? unsupported-arch? incoherent? coherent (≈ reference)?
  *   5. spawn ONE Claude agent to make a single focused implementation step
@@ -99,7 +99,7 @@ async function syncToBox(): Promise<void> {
 }
 
 async function buildOnBox(): Promise<{ ok: boolean; errors: string }> {
-  const r = await ssh(`cd ~/${BOX_REPO} && CUDA_VISIBLE_DEVICES=${GPU} timeout 320 ~/zig-0.15.2/zig build -Dbackend=cuda -Dshaders=false 2>&1`, 360_000);
+  const r = await ssh(`cd ~/${BOX_REPO} && CUDA_VISIBLE_DEVICES=${GPU} timeout 320 ./scripts/zig.sh build -Dbackend=cuda -Dshaders=false 2>&1`, 360_000);
   const errors = r.out.split("\n").filter((l) => /error:|panic:/.test(l)).join("\n");
   return { ok: r.code === 0 && errors === "", errors: errors || (r.code !== 0 ? r.out.slice(-2000) : "") };
 }
@@ -147,7 +147,7 @@ function buildPrompt(status: Status, build: { errors: string }, runOut: string, 
     `- Edit files LOCALLY in this repo (the loop syncs src/ to the box and owns the canonical`,
     `  build + run + GPU validation after you — do not rely on building CUDA on this Mac).`,
     `- For your own inspection you MAY ssh to the box: ssh ${SSH.join(" ")} ${SSH_TARGET}`,
-    `  (repo ~/${BOX_REPO}, gemma at ~/${GEMMA}, build: \`CUDA_VISIBLE_DEVICES=${GPU} ~/zig-0.15.2/zig build -Dbackend=cuda -Dshaders=false\`).`,
+    `  (repo ~/${BOX_REPO}, gemma at ~/${GEMMA}, build: \`CUDA_VISIBLE_DEVICES=${GPU} ./scripts/zig.sh build -Dbackend=cuda -Dshaders=false\`).`,
     `- ADDITIVE only; never break the qwen35/qwen36 path (run scripts/validate_cuda_decode.sh to confirm).`,
     `- Commit your change (git) with a clear message and update ${EFFORT_FILE} (a cycle log line).`,
     `- Keep it to ONE step; the loop will rebuild + re-run gemma and report back next cycle.`,

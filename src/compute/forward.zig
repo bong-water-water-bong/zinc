@@ -3,6 +3,7 @@
 //! This module ties together model state, compute graphs, dispatch helpers,
 //! and greedy token sampling for a single active inference engine.
 const std = @import("std");
+const host_io = @import("host_io");
 const vk = @import("../vulkan/vk.zig");
 const Instance = @import("../vulkan/instance.zig").Instance;
 const buffer_mod = @import("../vulkan/buffer.zig");
@@ -122,7 +123,7 @@ const gemma_moe_prefill_submit_token_layers: usize = 16384;
 const gemma_moe_prefill_submit_max_layers: usize = 64;
 
 fn gemmaMoePrefillSubmitTokenLayers() usize {
-    const raw = std.posix.getenv("ZINC_GEMMA_MOE_PREFILL_SUBMIT_TOKEN_LAYERS") orelse return gemma_moe_prefill_submit_token_layers;
+    const raw = host_io.getenv("ZINC_GEMMA_MOE_PREFILL_SUBMIT_TOKEN_LAYERS") orelse return gemma_moe_prefill_submit_token_layers;
     return std.fmt.parseUnsigned(usize, std.mem.trim(u8, raw, " \t\r\n"), 10) catch gemma_moe_prefill_submit_token_layers;
 }
 const gemma_prefill_long_draft_prompt_guard_tokens: u32 = 2;
@@ -191,7 +192,7 @@ pub const DecodeState = struct {
     pub fn init(allocator: std.mem.Allocator) DecodeState {
         return .{
             .position = 0,
-            .generated_tokens = .{},
+            .generated_tokens = .empty,
             .requested_context_tokens = 0,
             .allocator = allocator,
         };
@@ -357,7 +358,7 @@ const ProfilePhase = enum(u8) {
     }
 };
 
-const profile_phase_count = @typeInfo(ProfilePhase).@"enum".fields.len;
+const profile_phase_count = std.enums.values(ProfilePhase).len;
 const max_profile_phase_ranges: usize = 1024;
 
 const ProfilePhaseRange = struct {
@@ -378,7 +379,7 @@ const ProfileCounters = struct {
     cpu_moe_fallbacks: u64 = 0,
     cpu_shared_gate_fallbacks: u64 = 0,
     cpu_argmax_fallbacks: u64 = 0,
-    gpu_phase_ns: [profile_phase_count]u64 = [_]u64{0} ** profile_phase_count,
+    gpu_phase_ns: [profile_phase_count]u64 = @as([profile_phase_count]u64, @splat(0)),
 
     fn reset(self: *ProfileCounters) void {
         self.* = .{};
@@ -639,7 +640,7 @@ pub fn dequantRow(raw_data: []const u8, row: u32, cols: u32, quant_type: GGMLTyp
             }
         },
         else => {
-            log.warn("Unsupported embedding quant type {d}, using zeros", .{@intFromEnum(quant_type)});
+            log.warn("Unsupported embedding quant type {d}, using zeros", .{@backingInt(quant_type)});
             @memset(output, 0);
         },
     }
@@ -694,7 +695,7 @@ fn topKSoftmax(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f32) 
     }
 
     // Step 2: Pick top-k from the probabilities
-    var used = [_]bool{false} ** 256;
+    var used = @as([256]bool, @splat(false));
     for (0..k) |ki| {
         var best_idx: u32 = 0;
         var best_val: f32 = -1.0;
@@ -721,7 +722,7 @@ fn topKSoftmax(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f32) 
 /// GPT-OSS uses this SOFTMAX_WEIGHT routing rule instead of softmax-over-all-experts.
 fn topKSoftmaxWeight(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f32) void {
     const n = logits.len;
-    var used = [_]bool{false} ** 256;
+    var used = @as([256]bool, @splat(false));
     for (0..k) |ki| {
         var best_idx: u32 = 0;
         var best_val: f32 = -std.math.inf(f32);
@@ -986,7 +987,7 @@ fn canUseBatchedPrefillRdna(engine: *const InferenceEngine) bool {
     if (!is_amd and !is_intel) return false;
     const cfg = engine.model.config;
     if (is_intel) {
-        const intel_batched_env = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL");
+        const intel_batched_env = host_io.getenv("ZINC_INTEL_BATCHED_PREFILL");
         const intel_batched_explicitly_on = intel_batched_env != null and std.mem.eql(u8, intel_batched_env.?, "1");
         const intel_batched_explicitly_off = intel_batched_env != null and std.mem.eql(u8, intel_batched_env.?, "0");
         const intel_dense_gemma_default =
@@ -1067,13 +1068,13 @@ fn isIntelGpuVendor(vendor: GpuVendor) bool {
 
 fn intelBatchedPrefillChunkLimit(vendor: GpuVendor, default_limit: u32) u32 {
     if (!isIntelGpuVendor(vendor)) return 0;
-    const raw = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL_CHUNK") orelse return default_limit;
+    const raw = host_io.getenv("ZINC_INTEL_BATCHED_PREFILL_CHUNK") orelse return default_limit;
     if (std.mem.eql(u8, raw, "0")) return 0;
     return std.fmt.parseInt(u32, raw, 10) catch 16;
 }
 
 fn envFlagEnabled(comptime name: []const u8, default_value: bool) bool {
-    const raw = std.posix.getenv(name) orelse return default_value;
+    const raw = host_io.getenv(name) orelse return default_value;
     return raw.len > 0 and
         !std.mem.eql(u8, raw, "0") and
         !std.ascii.eqlIgnoreCase(raw, "off") and
@@ -1082,7 +1083,7 @@ fn envFlagEnabled(comptime name: []const u8, default_value: bool) bool {
 }
 
 fn qwenA3bQ6MoeColsRequestedForLayer(layer: u32, default_value: bool) bool {
-    const raw = std.posix.getenv("ZINC_MOE_Q6K_COLS") orelse return default_value;
+    const raw = host_io.getenv("ZINC_MOE_Q6K_COLS") orelse return default_value;
     if (std.mem.eql(u8, raw, "0") or
         std.ascii.eqlIgnoreCase(raw, "off") or
         std.ascii.eqlIgnoreCase(raw, "false") or
@@ -1139,7 +1140,7 @@ fn isGemmaStyleDenseArch(arch: loader.Architecture) bool {
 
 /// Prompt position selected by ZINC_LAYER_DIAG_POS for per-layer residual dumps.
 fn layerDiagPosition() ?u32 {
-    const raw = std.posix.getenv("ZINC_LAYER_DIAG_POS") orelse return null;
+    const raw = host_io.getenv("ZINC_LAYER_DIAG_POS") orelse return null;
     return std.fmt.parseInt(u32, raw, 10) catch null;
 }
 
@@ -1649,8 +1650,8 @@ pub const InferenceEngine = struct {
     // its own timestamp recording). Decode-only — prefill ranges are tagged
     // distinctly via prefill_active so we ignore them when accumulating.
     fa_profile_layer: bool = false,
-    fa_per_layer_ns: [128]u64 = [_]u64{0} ** 128,
-    fa_per_layer_count: [128]u32 = [_]u32{0} ** 128,
+    fa_per_layer_ns: [128]u64 = @as([128]u64, @splat(0)),
+    fa_per_layer_count: [128]u32 = @as([128]u32, @splat(0)),
     // Always-on lightweight prefill timing (CPU-side, no GPU queries).
     // Populated by decodeStep() when prefill_active is set by prefillBatch(),
     // so effort-6 can see where prefill time goes without needing --profile.
@@ -1662,7 +1663,7 @@ pub const InferenceEngine = struct {
     // Always-on per-phase GPU timing captured during prefillBatch(). Populated
     // by decodeStep() via the standard profile_phase_ranges / recordProfilingSample
     // path after prefillBatch temporarily flips profile_enabled on.
-    prefill_gpu_phase_ns: [profile_phase_count]u64 = [_]u64{0} ** profile_phase_count,
+    prefill_gpu_phase_ns: [profile_phase_count]u64 = @as([profile_phase_count]u64, @splat(0)),
     prefill_gpu_total_ns: u64 = 0,
     prefill_route_pack_layers: u32 = 0,
     prefill_route_pack_slots: u64 = 0,
@@ -1676,7 +1677,7 @@ pub const InferenceEngine = struct {
     prefill_route_pack_tail_blocks_actual: u64 = 0,
     prefill_route_pack_single_tail_blocks_actual: u64 = 0,
     prefill_route_pack_padding_slots_actual: u64 = 0,
-    prefill_route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = [_]u64{0} ** moe_route_pack_profile_tail_bins,
+    prefill_route_pack_tail_size_blocks_actual: [moe_route_pack_profile_tail_bins]u64 = @as([moe_route_pack_profile_tail_bins]u64, @splat(0)),
     prefill_path_ssm_layers: u32 = 0,
     prefill_path_full_attn_batched_layers: u32 = 0,
     prefill_path_full_attn_fallback_layers: u32 = 0,
@@ -1934,7 +1935,7 @@ pub const InferenceEngine = struct {
     modeled_decode_bytes_per_token: u64 = 0,
     // Diagnostic summary stored during BOS processing, printed after generation
     /// CPU-side byte buffer holding the diagnostic summary printed after generation.
-    diag_summary_buf: [2048]u8 = .{0} ** 2048,
+    diag_summary_buf: [2048]u8 = @splat(0),
     diag_summary_len: usize = 0,
 
     /// Create the runtime objects needed to execute decode-time work on the GPU.
@@ -2705,7 +2706,7 @@ pub const InferenceEngine = struct {
         // disabled by setting ZINC_MOE_KPAR=0. Measured on RDNA4 for the
         // Qwen3.6-35B flagship: gate_up 855.6 → 695.4 ms (−18.7%), prefill
         // tok/s 23.16 → 23.72 (+2.4%) with identical output tokens.
-        const moe_kpar_env = std.posix.getenv("ZINC_MOE_KPAR");
+        const moe_kpar_env = host_io.getenv("ZINC_MOE_KPAR");
         const moe_kpar_explicitly_off = moe_kpar_env != null and std.mem.eql(u8, moe_kpar_env.?, "0");
         const moe_kpar_enabled = !moe_kpar_explicitly_off and dmmv.pipeline_q4k_moe_kpar != null;
         if (moe_kpar_enabled) {
@@ -2718,7 +2719,7 @@ pub const InferenceEngine = struct {
         // the pipeline is loaded. The shaders merge cross-subgroup partials,
         // so this is valid on RDNA wave64 and Intel wave32/wave16 devices.
         // Disable via ZINC_Q4K_BATCH_KPAR=0 to run the serial shader.
-        const q4k_batch_kpar_env = std.posix.getenv("ZINC_Q4K_BATCH_KPAR");
+        const q4k_batch_kpar_env = host_io.getenv("ZINC_Q4K_BATCH_KPAR");
         const q4k_batch_kpar_explicitly_off = q4k_batch_kpar_env != null and std.mem.eql(u8, q4k_batch_kpar_env.?, "0");
         const q4k_batch_kpar_enabled = !q4k_batch_kpar_explicitly_off and dmmv.pipeline_q4k_batch_kpar != null;
         if (q4k_batch_kpar_enabled) {
@@ -2735,7 +2736,7 @@ pub const InferenceEngine = struct {
         // halved dispatch count for this small shape. Kept opt-in because
         // larger expert intermediates (>= 1024) haven't been measured and
         // the shader is otherwise a proven drop-in for kpar.
-        const moe_fused_gate_up_env = std.posix.getenv("ZINC_MOE_FUSED_GATE_UP");
+        const moe_fused_gate_up_env = host_io.getenv("ZINC_MOE_FUSED_GATE_UP");
         const moe_fused_gate_up_forced_on = moe_fused_gate_up_env != null and std.mem.eql(u8, moe_fused_gate_up_env.?, "1");
         const moe_fused_gate_up_pipeline_loaded = dmmv.pipeline_q4k_fused_gate_up_moe != null or
             dmmv.pipeline_q4k_fused_gate_up_moe_spec8 != null;
@@ -2749,7 +2750,7 @@ pub const InferenceEngine = struct {
         // loaded. This is the profitable version of the older gate+up-only
         // experiment because it removes the separate MoE SwiGLU dispatch and
         // barrier. Disable with ZINC_MOE_FUSED_GATE_UP_SWIGLU=0 for A/B.
-        const moe_fused_gate_up_swiglu_env = std.posix.getenv("ZINC_MOE_FUSED_GATE_UP_SWIGLU");
+        const moe_fused_gate_up_swiglu_env = host_io.getenv("ZINC_MOE_FUSED_GATE_UP_SWIGLU");
         const moe_fused_gate_up_swiglu_explicitly_off = moe_fused_gate_up_swiglu_env != null and
             std.mem.eql(u8, moe_fused_gate_up_swiglu_env.?, "0");
         const moe_fused_gate_up_swiglu_pipeline_loaded = dmmv.pipeline_q4k_fused_gate_up_swiglu_moe != null or
@@ -2770,7 +2771,7 @@ pub const InferenceEngine = struct {
         // as Q5_K so we accept either pipeline being present here;
         // fused_pip_for_qt at the call site selects the right one and
         // falls back when neither is loaded for the current quant.
-        const moe_fused_down_acc_env = std.posix.getenv("ZINC_FUSE_MOE_DOWN_ACC");
+        const moe_fused_down_acc_env = host_io.getenv("ZINC_FUSE_MOE_DOWN_ACC");
         const moe_fused_down_acc_explicitly_off = moe_fused_down_acc_env != null and std.mem.eql(u8, moe_fused_down_acc_env.?, "0");
         const moe_fused_down_acc_enabled = !moe_fused_down_acc_explicitly_off and
             (dmmv.pipeline_q4k_moe_fused_down_acc != null or dmmv.pipeline_q5k_moe_fused_down_acc != null);
@@ -2789,10 +2790,10 @@ pub const InferenceEngine = struct {
             const beta0 = layer_tensors[0].ssm_beta orelse break :blk false;
             break :blk alpha0.info.type_ == .f32 and beta0.info.type_ == .f32;
         };
-        const qwen36_topk_env = std.posix.getenv("ZINC_QWEN36_MOE_TOPK");
+        const qwen36_topk_env = host_io.getenv("ZINC_QWEN36_MOE_TOPK");
         const qwen36_moe_intel_safe_defaults = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
 
-        const moe_q5k_q8_1_down_acc_env = std.posix.getenv("ZINC_MOE_Q5K_Q8_1_DOWN_ACC");
+        const moe_q5k_q8_1_down_acc_env = host_io.getenv("ZINC_MOE_Q5K_Q8_1_DOWN_ACC");
         const moe_q5k_q8_1_down_acc_explicitly_off = moe_q5k_q8_1_down_acc_env != null and
             std.mem.eql(u8, moe_q5k_q8_1_down_acc_env.?, "0");
         const moe_q5k_q8_1_down_acc_forced_on = moe_q5k_q8_1_down_acc_env != null and
@@ -2839,7 +2840,7 @@ pub const InferenceEngine = struct {
         } else if (qwen36_like_f32_ssm and qwen36_topk_env != null) {
             log.info("Qwen 3.6 MoE top-k cap disabled via ZINC_QWEN36_MOE_TOPK={s}", .{qwen36_topk_env.?});
         }
-        const gemma_topk_env = std.posix.getenv("ZINC_GEMMA_MOE_TOPK");
+        const gemma_topk_env = host_io.getenv("ZINC_GEMMA_MOE_TOPK");
         const gemma_topk_default: u32 = if (config.architecture == .gemma and isIntelGpuVendor(gpu_config.vendor)) 2 else 0;
         const gemma_topk_limit: u32 = if (config.architecture == .gemma) blk: {
             const requested = if (gemma_topk_env) |raw|
@@ -2855,7 +2856,7 @@ pub const InferenceEngine = struct {
                 config.n_experts_used,
             });
         }
-        const qwen36_prefill_topk_env = std.posix.getenv("ZINC_QWEN36_MOE_PREFILL_TOPK");
+        const qwen36_prefill_topk_env = host_io.getenv("ZINC_QWEN36_MOE_PREFILL_TOPK");
         // Exact prefill by default: capping routed experts and skipping the
         // shared expert on early prompt tokens changes the prompt's KV/SSM
         // state and the model's output. Opt in with ZINC_QWEN36_MOE_PREFILL_TOPK=<k>.
@@ -2871,7 +2872,7 @@ pub const InferenceEngine = struct {
             if (qwen36_topk_env != null) break :blk 0;
             break :blk qwen36_prefill_topk_default;
         } else 0;
-        const qwen36_prefill_guard_env = std.posix.getenv("ZINC_QWEN36_MOE_PREFILL_TOPK_GUARD");
+        const qwen36_prefill_guard_env = host_io.getenv("ZINC_QWEN36_MOE_PREFILL_TOPK_GUARD");
         const qwen36_prefill_guard_default: u32 = 16;
         const qwen36_prefill_tail_topk_guard_tokens: u32 = if (qwen36_prefill_tail_topk_limit > 0) blk: {
             if (qwen36_prefill_guard_env) |raw| {
@@ -2893,7 +2894,7 @@ pub const InferenceEngine = struct {
         const is_amd_rdna_vendor = gpu_config.vendor == .amd_rdna3 or
             gpu_config.vendor == .amd_rdna4 or
             gpu_config.vendor == .amd_rdna4_apu;
-        const gemma_prefill_topk_env = std.posix.getenv("ZINC_GEMMA_MOE_PREFILL_TOPK");
+        const gemma_prefill_topk_env = host_io.getenv("ZINC_GEMMA_MOE_PREFILL_TOPK");
         const gemma_prefill_requested_topk: u32 = if (gemma_prefill_topk_env) |raw| blk: {
             const parsed = std.fmt.parseInt(u32, raw, 10) catch 0;
             if (parsed == 0 or parsed >= config.n_experts_used) break :blk 0;
@@ -2945,7 +2946,7 @@ pub const InferenceEngine = struct {
         // 35B-A3B). Disabled by setting ZINC_FUSED_RMS_ROUTER=0. Per-call
         // gates (architecture, weight type, etc.) are evaluated in the
         // forward path so models that don't fit silently fall back.
-        const fused_rms_router_env = std.posix.getenv("ZINC_FUSED_RMS_ROUTER");
+        const fused_rms_router_env = host_io.getenv("ZINC_FUSED_RMS_ROUTER");
         const fused_rms_router_explicitly_off = fused_rms_router_env != null and std.mem.eql(u8, fused_rms_router_env.?, "0");
         const fused_rms_router_forced_on = fused_rms_router_env != null and !fused_rms_router_explicitly_off;
         const fused_rms_router_policy_enabled = !fused_rms_router_explicitly_off;
@@ -2970,7 +2971,7 @@ pub const InferenceEngine = struct {
         // ZINC_FUSED_SSM_AB=0. Per-call gates (architecture, weight type) are
         // evaluated in the forward path so models that don't fit silently
         // fall back.
-        const fused_ssm_ab_env = std.posix.getenv("ZINC_FUSED_SSM_AB");
+        const fused_ssm_ab_env = host_io.getenv("ZINC_FUSED_SSM_AB");
         const fused_ssm_ab_explicitly_off = fused_ssm_ab_env != null and std.mem.eql(u8, fused_ssm_ab_env.?, "0");
         const fused_ssm_ab_forced_on = fused_ssm_ab_env != null and !fused_ssm_ab_explicitly_off;
         const intel_qwen35_dense_hybrid_9b = isIntelGpuVendor(gpu_config.vendor) and
@@ -3008,7 +3009,7 @@ pub const InferenceEngine = struct {
         // via ZINC_SSM_DELTA_COLS8=0 for A/B checks. The shader's Q/K norm
         // and row mapping handle multiple subgroups per workgroup, so Intel
         // wave32 executes the same logical rows as wave64 GPUs.
-        const ssm_delta_cols8_env = std.posix.getenv("ZINC_SSM_DELTA_COLS8");
+        const ssm_delta_cols8_env = host_io.getenv("ZINC_SSM_DELTA_COLS8");
         const ssm_delta_cols8_explicitly_off = ssm_delta_cols8_env != null and std.mem.eql(u8, ssm_delta_cols8_env.?, "0");
         const ssm_delta_cols8_forced_on = ssm_delta_cols8_env != null and !ssm_delta_cols8_explicitly_off;
         const ssm_delta_cols8_policy_enabled = if (ssm_delta_cols8_forced_on)
@@ -3025,7 +3026,7 @@ pub const InferenceEngine = struct {
             log.info("SSM delta cols8 DISABLED via ZINC_SSM_DELTA_COLS8=0", .{});
         }
 
-        const ssm_delta_normed_qk_env = std.posix.getenv("ZINC_SSM_DELTA_NORMED_QK");
+        const ssm_delta_normed_qk_env = host_io.getenv("ZINC_SSM_DELTA_NORMED_QK");
         const ssm_delta_normed_qk_flag = ssm_delta_normed_qk_env != null and std.mem.eql(u8, ssm_delta_normed_qk_env.?, "1");
         const ssm_delta_normed_qk_enabled = ssm_delta_normed_qk_flag and
             ssm_delta_cols8_enabled and
@@ -3039,7 +3040,7 @@ pub const InferenceEngine = struct {
         }
 
         // K-split fused RMS+alpha/beta for decode (dense-hybrid SSM layers).
-        const ssm_ab_ksplit_req: u32 = if (std.posix.getenv("ZINC_SSM_AB_KSPLIT")) |v| (std.fmt.parseInt(u32, v, 10) catch 10) else 10;
+        const ssm_ab_ksplit_req: u32 = if (host_io.getenv("ZINC_SSM_AB_KSPLIT")) |v| (std.fmt.parseInt(u32, v, 10) catch 10) else 10;
         const ssm_ab_ksplit: u32 = if (ssm_ab_ksplit_req > 1 and
             ssm_ab_ksplit_req <= 16 and
             ssm_delta_cols8_enabled and
@@ -3063,7 +3064,7 @@ pub const InferenceEngine = struct {
         // the pipeline is loaded; disable via ZINC_FUSED_DENSE_FFN=0. The
         // architecture / quant / size gates run per call so non-matching
         // models silently fall back to the gate / up / swiglu trio.
-        const fused_dense_ffn_env = std.posix.getenv("ZINC_FUSED_DENSE_FFN");
+        const fused_dense_ffn_env = host_io.getenv("ZINC_FUSED_DENSE_FFN");
         const fused_dense_ffn_explicitly_off = fused_dense_ffn_env != null and std.mem.eql(u8, fused_dense_ffn_env.?, "0");
         const fused_dense_ffn_enabled = !fused_dense_ffn_explicitly_off and
             dmmv.pipeline_q4k_fused_gate_up_swiglu != null and
@@ -3073,7 +3074,7 @@ pub const InferenceEngine = struct {
         } else if (fused_dense_ffn_explicitly_off) {
             log.info("Fused dense gate+up+SwiGLU DISABLED via ZINC_FUSED_DENSE_FFN=0", .{});
         }
-        const qwen36_dense_row1_env = std.posix.getenv("ZINC_QWEN36_27B_DENSE_FUSED_ROW1");
+        const qwen36_dense_row1_env = host_io.getenv("ZINC_QWEN36_27B_DENSE_FUSED_ROW1");
         const qwen36_dense_row1_explicitly_off = qwen36_dense_row1_env != null and
             std.mem.eql(u8, qwen36_dense_row1_env.?, "0");
         const qwen36_dense_row1_enabled = !qwen36_dense_row1_explicitly_off and
@@ -3084,7 +3085,7 @@ pub const InferenceEngine = struct {
         } else if (qwen36_dense_row1_explicitly_off) {
             log.info("Qwen dense-hybrid 27B fused gate+up+SwiGLU row1 path DISABLED via ZINC_QWEN36_27B_DENSE_FUSED_ROW1=0", .{});
         }
-        const gemma_dense_decode_dp4a_env = std.posix.getenv("ZINC_GEMMA_DENSE_DECODE_DP4A");
+        const gemma_dense_decode_dp4a_env = host_io.getenv("ZINC_GEMMA_DENSE_DECODE_DP4A");
         const gemma_dense_decode_dp4a_requested = gemma_dense_decode_dp4a_env != null and
             std.mem.eql(u8, gemma_dense_decode_dp4a_env.?, "1");
         const gemma_dense_decode_dp4a_q6_ready =
@@ -3110,7 +3111,7 @@ pub const InferenceEngine = struct {
         // architecture/quant/size gates fall back to the unfused path when
         // the conditions aren't met (e.g., Gemma post_attn_norm,
         // hidden_dim > 4096, validation_diagnostics_enabled).
-        const fused_oproj_merge_env = std.posix.getenv("ZINC_FUSED_OPROJ_MERGE");
+        const fused_oproj_merge_env = host_io.getenv("ZINC_FUSED_OPROJ_MERGE");
         const fused_oproj_merge_enabled = fused_oproj_merge_env != null and
             std.mem.eql(u8, fused_oproj_merge_env.?, "1") and
             dmmv.pipeline_q4k_o_proj_merge != null and
@@ -3123,7 +3124,7 @@ pub const InferenceEngine = struct {
         // (effort-11 run-3 enablement). Auto-enables timestamp recording so the
         // benchmark cycle (which does not pass --profile) still emits per-layer
         // ms data. Default OFF to keep the benchmark's hot path zero-overhead.
-        const fa_profile_layer_env = std.posix.getenv("ZINC_FA_PROFILE_LAYER");
+        const fa_profile_layer_env = host_io.getenv("ZINC_FA_PROFILE_LAYER");
         const fa_profile_layer_enabled = fa_profile_layer_env != null and
             !std.mem.eql(u8, fa_profile_layer_env.?, "0");
         if (fa_profile_layer_enabled) {
@@ -3134,7 +3135,7 @@ pub const InferenceEngine = struct {
         // ON when the pipeline is loaded; disable via ZINC_FUSED_QK_KV=0.
         // Per-call gates apply (q_norm/k_norm tensors present, push descriptors,
         // !packed_q_gate, !use_k_as_v, !apply_v_unit_norm_early, !diagnostics).
-        const fused_qk_kv_env = std.posix.getenv("ZINC_FUSED_QK_KV");
+        const fused_qk_kv_env = host_io.getenv("ZINC_FUSED_QK_KV");
         const fused_qk_kv_explicitly_off = fused_qk_kv_env != null and std.mem.eql(u8, fused_qk_kv_env.?, "0");
         const fused_qk_kv_enabled = !fused_qk_kv_explicitly_off and
             elementwise.pipeline_qk_norm_rope_kv_write != null and
@@ -3150,7 +3151,7 @@ pub const InferenceEngine = struct {
         // disabled by setting ZINC_MOE_Q5K_KPAR=0. Targets the ~713 ms MoE down
         // bucket (Q5_K weights) on the Qwen3.6-35B flagship prefill. Mirrors the
         // Q4_K kpar pattern (16 threads per Q5_K superblock + wave64 subgroupAdd).
-        const moe_q5k_kpar_env = std.posix.getenv("ZINC_MOE_Q5K_KPAR");
+        const moe_q5k_kpar_env = host_io.getenv("ZINC_MOE_Q5K_KPAR");
         const moe_q5k_kpar_explicitly_off = moe_q5k_kpar_env != null and std.mem.eql(u8, moe_q5k_kpar_env.?, "0");
         const moe_q5k_kpar_enabled = !moe_q5k_kpar_explicitly_off and dmmv.pipeline_q5k_moe_kpar != null;
         if (moe_q5k_kpar_enabled) {
@@ -3162,7 +3163,7 @@ pub const InferenceEngine = struct {
         // softmax_topk v2 (subgroup-parallel): default ON when the pipeline is
         // loaded, disable via ZINC_TOPK_V1=1 to fall back to the v1 shared-mem
         // single-thread scan shader.
-        const topk_v1_env = std.posix.getenv("ZINC_TOPK_V1");
+        const topk_v1_env = host_io.getenv("ZINC_TOPK_V1");
         const topk_v1_forced = topk_v1_env != null and std.mem.eql(u8, topk_v1_env.?, "1");
         const topk_v2_enabled = !topk_v1_forced and elementwise.pipeline_softmax_topk_v2 != null;
         if (topk_v2_enabled) {
@@ -3172,24 +3173,24 @@ pub const InferenceEngine = struct {
         }
 
         const force_cpu_argmax = blk: {
-            if (std.posix.getenv("ZINC_FORCE_CPU_ARGMAX")) |raw| break :blk !std.mem.eql(u8, raw, "0");
-            if (std.posix.getenv("ZINC_CPU_ARGMAX")) |raw| break :blk !std.mem.eql(u8, raw, "0");
+            if (host_io.getenv("ZINC_FORCE_CPU_ARGMAX")) |raw| break :blk !std.mem.eql(u8, raw, "0");
+            if (host_io.getenv("ZINC_CPU_ARGMAX")) |raw| break :blk !std.mem.eql(u8, raw, "0");
             // Diagnostics: log the top-2 logits and their margin per greedy token.
-            if (std.posix.getenv("ZINC_LOG_TOPK")) |raw| break :blk !std.mem.eql(u8, raw, "0");
+            if (host_io.getenv("ZINC_LOG_TOPK")) |raw| break :blk !std.mem.eql(u8, raw, "0");
             break :blk false;
         };
         if (force_cpu_argmax) {
             log.info("CPU greedy argmax forced via ZINC_FORCE_CPU_ARGMAX; full logits will be read back every sampled token", .{});
         }
         const force_cpu_ssm = blk: {
-            if (std.posix.getenv("ZINC_FORCE_CPU_SSM")) |raw| break :blk !std.mem.eql(u8, raw, "0");
+            if (host_io.getenv("ZINC_FORCE_CPU_SSM")) |raw| break :blk !std.mem.eql(u8, raw, "0");
             break :blk false;
         };
         if (force_cpu_ssm) {
             log.info("CPU SSM fallback forced via ZINC_FORCE_CPU_SSM", .{});
         }
         const force_cpu_moe = blk: {
-            if (std.posix.getenv("ZINC_FORCE_CPU_MOE")) |raw| break :blk !std.mem.eql(u8, raw, "0");
+            if (host_io.getenv("ZINC_FORCE_CPU_MOE")) |raw| break :blk !std.mem.eql(u8, raw, "0");
             break :blk false;
         };
         if (force_cpu_moe) {
@@ -3201,7 +3202,7 @@ pub const InferenceEngine = struct {
         // of pipelines (split, merge); we just mirror the active count here
         // and allocate the partial-output buffer when active.
         const fa_split_k = attention.fa_split_k_active;
-        const fa_split_k_forced = std.posix.getenv("ZINC_FA_SPLIT_K") != null;
+        const fa_split_k_forced = host_io.getenv("ZINC_FA_SPLIT_K") != null;
         if (fa_split_k > 1) {
             if (fa_split_k_forced) {
                 log.info("Flash-attn split-K ENABLED: N_I_CHUNKS={d} via ZINC_FA_SPLIT_K", .{fa_split_k});
@@ -3225,7 +3226,7 @@ pub const InferenceEngine = struct {
         // the flash_attn_batched pipeline is loaded, the attention call site
         // routes through the batched shader. Foundation step calls with
         // n_queries=1 for correctness parity with the decode-shape shader.
-        const batch_attn_env = std.posix.getenv("ZINC_BATCH_ATTN");
+        const batch_attn_env = host_io.getenv("ZINC_BATCH_ATTN");
         const batch_attn_flag = batch_attn_env != null and std.mem.eql(u8, batch_attn_env.?, "1");
         const batch_attn_enabled = batch_attn_flag and attention.pipeline_batched != null;
         if (batch_attn_enabled) {
@@ -3238,7 +3239,7 @@ pub const InferenceEngine = struct {
         // Enabled by ZINC_CAPTURE_ROUTING=1. Dormant downstream — this cycle only
         // verifies the copy path is correct and measures the flag-on overhead so
         // Step 11b can wire token-permute on top without re-proving the plumbing.
-        const capture_env = std.posix.getenv("ZINC_CAPTURE_ROUTING");
+        const capture_env = host_io.getenv("ZINC_CAPTURE_ROUTING");
         const capture_flag = capture_env != null and std.mem.eql(u8, capture_env.?, "1");
         var routing_capture_buf = Buffer{ .handle = null, .memory = null, .size = 0, .mapped = null, .device = instance.device };
         var routing_capture_slot_bytes: u32 = 0;
@@ -3268,7 +3269,7 @@ pub const InferenceEngine = struct {
         // are available (recordMulMmQ4K uses pushDescAndDispatch). The
         // weight-quant + hidden_dim alignment check happens at the call
         // site since both depend on the resolved LM head tensor.
-        const mul_mm_lm_head_env = std.posix.getenv("ZINC_MUL_MM_LM_HEAD");
+        const mul_mm_lm_head_env = host_io.getenv("ZINC_MUL_MM_LM_HEAD");
         const mul_mm_lm_head_flag = mul_mm_lm_head_env != null and std.mem.eql(u8, mul_mm_lm_head_env.?, "1");
         const mul_mm_lm_head_enabled = mul_mm_lm_head_flag and
             dmmv.pipeline_mul_mm_q4k != null and
@@ -3288,7 +3289,7 @@ pub const InferenceEngine = struct {
         // tensors are unaffected because dispatchProjectionBatched gates on
         // tensor type + token count and falls back to the existing path
         // otherwise. Opt out via ZINC_MUL_MM_PROJ=0.
-        const mul_mm_proj_env = std.posix.getenv("ZINC_MUL_MM_PROJ");
+        const mul_mm_proj_env = host_io.getenv("ZINC_MUL_MM_PROJ");
         const mul_mm_proj_explicitly_off = mul_mm_proj_env != null and std.mem.eql(u8, mul_mm_proj_env.?, "0");
         const mul_mm_proj_enabled = !mul_mm_proj_explicitly_off and
             dmmv.pipeline_mul_mm_q4k != null and
@@ -3299,7 +3300,7 @@ pub const InferenceEngine = struct {
             log.info("Q4_K projection mul_mm path DISABLED via ZINC_MUL_MM_PROJ=0; using kpar/serial batch shaders", .{});
         }
 
-        const qwen36_batched_gateup_env = std.posix.getenv("ZINC_QWEN36_27B_BATCH_FUSED_GATEUP");
+        const qwen36_batched_gateup_env = host_io.getenv("ZINC_QWEN36_27B_BATCH_FUSED_GATEUP");
         const qwen36_batched_gateup_explicitly_off = qwen36_batched_gateup_env != null and
             std.mem.eql(u8, qwen36_batched_gateup_env.?, "0");
         const qwen36_batched_gateup_enabled = !qwen36_batched_gateup_explicitly_off and
@@ -3311,7 +3312,7 @@ pub const InferenceEngine = struct {
             log.info("Qwen dense-hybrid 27B batched gate+up+SwiGLU path DISABLED via ZINC_QWEN36_27B_BATCH_FUSED_GATEUP=0", .{});
         }
 
-        const qwen36_q6_prefill_mul_mm_env = std.posix.getenv("ZINC_QWEN36_27B_Q6_DOWN_MUL_MM");
+        const qwen36_q6_prefill_mul_mm_env = host_io.getenv("ZINC_QWEN36_27B_Q6_DOWN_MUL_MM");
         const qwen36_q6_prefill_mul_mm_explicitly_off = qwen36_q6_prefill_mul_mm_env != null and
             std.mem.eql(u8, qwen36_q6_prefill_mul_mm_env.?, "0");
         const qwen36_q6_prefill_mul_mm_enabled = !qwen36_q6_prefill_mul_mm_explicitly_off and
@@ -3323,7 +3324,7 @@ pub const InferenceEngine = struct {
             log.info("Qwen dense-hybrid 27B Q6_K prefill mul_mm path DISABLED via ZINC_QWEN36_27B_Q6_DOWN_MUL_MM=0", .{});
         }
 
-        const qwen36_q5_ssm_out_mul_mm_env = std.posix.getenv("ZINC_QWEN36_27B_Q5_SSM_OUT_MUL_MM");
+        const qwen36_q5_ssm_out_mul_mm_env = host_io.getenv("ZINC_QWEN36_27B_Q5_SSM_OUT_MUL_MM");
         const qwen36_q5_ssm_out_mul_mm_explicitly_off = qwen36_q5_ssm_out_mul_mm_env != null and
             std.mem.eql(u8, qwen36_q5_ssm_out_mul_mm_env.?, "0");
         const qwen36_q5_ssm_out_mul_mm_enabled = !qwen36_q5_ssm_out_mul_mm_explicitly_off and
@@ -3335,7 +3336,7 @@ pub const InferenceEngine = struct {
             log.info("Qwen dense-hybrid 27B Q5_K prefill mul_mm path DISABLED via ZINC_QWEN36_27B_Q5_SSM_OUT_MUL_MM=0", .{});
         }
 
-        const q8_wide_lm_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD");
+        const q8_wide_lm_env = host_io.getenv("ZINC_Q8_WIDE_LM_HEAD");
         const q8_wide_lm_explicitly_off = q8_wide_lm_env != null and std.mem.eql(u8, q8_wide_lm_env.?, "0");
         const q8_wide_lm_forced_on = q8_wide_lm_env != null and !q8_wide_lm_explicitly_off;
         const q8_wide_lm_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
@@ -3352,7 +3353,7 @@ pub const InferenceEngine = struct {
         } else if (q8_wide_lm_explicitly_off) {
             log.info("Q8_0 wide LM-head path DISABLED via ZINC_Q8_WIDE_LM_HEAD=0", .{});
         }
-        const q8_wide_lm_rows_env = std.posix.getenv("ZINC_Q8_WIDE_LM_HEAD_ROWS");
+        const q8_wide_lm_rows_env = host_io.getenv("ZINC_Q8_WIDE_LM_HEAD_ROWS");
         var q8_wide_lm_rows: u32 = 2;
         if (q8_wide_lm_enabled) {
             const q8_wide_lm_rows4_default_on = q8_wide_lm_default_on and dmmv.pipeline_q8_0_wide4 != null;
@@ -3374,7 +3375,7 @@ pub const InferenceEngine = struct {
         }
 
         var gemma_q8_geglu_rows: u32 = 2;
-        const gemma_q8_geglu_rows_env = std.posix.getenv("ZINC_GEMMA_Q8_GEGLU_ROWS");
+        const gemma_q8_geglu_rows_env = host_io.getenv("ZINC_GEMMA_Q8_GEGLU_ROWS");
         if (config.architecture == .gemma and isIntelGpuVendor(gpu_config.vendor) and dmmv.pipeline_q8_0_fused_gate_up_geglu4 != null) {
             gemma_q8_geglu_rows = 4;
         }
@@ -3397,7 +3398,7 @@ pub const InferenceEngine = struct {
             log.info("Gemma Q8_0 shared GEGLU four-row path ENABLED by default on Intel (set ZINC_GEMMA_Q8_GEGLU_ROWS=2 to disable)", .{});
         }
 
-        const gemma_q8_wide4_env = std.posix.getenv("ZINC_GEMMA_Q8_WIDE4_DMMV");
+        const gemma_q8_wide4_env = host_io.getenv("ZINC_GEMMA_Q8_WIDE4_DMMV");
         const gemma_q8_wide4_explicitly_off = gemma_q8_wide4_env != null and std.mem.eql(u8, gemma_q8_wide4_env.?, "0");
         const gemma_q8_wide4_forced_on = gemma_q8_wide4_env != null and !gemma_q8_wide4_explicitly_off;
         const gemma_q8_wide4_default_on = config.architecture == .gemma and config.n_experts > 0 and isIntelGpuVendor(gpu_config.vendor);
@@ -3416,7 +3417,7 @@ pub const InferenceEngine = struct {
             log.info("Gemma Q8_0 four-row DMMV path DISABLED via ZINC_GEMMA_Q8_WIDE4_DMMV=0", .{});
         }
 
-        const gemma_q8_1_dmmv_env = std.posix.getenv("ZINC_GEMMA_Q8_1_DMMV");
+        const gemma_q8_1_dmmv_env = host_io.getenv("ZINC_GEMMA_Q8_1_DMMV");
         const gemma_q8_1_dmmv_explicitly_off = gemma_q8_1_dmmv_env != null and
             std.mem.eql(u8, gemma_q8_1_dmmv_env.?, "0");
         const gemma_q8_1_dmmv_forced_on = gemma_q8_1_dmmv_env != null and
@@ -3447,7 +3448,7 @@ pub const InferenceEngine = struct {
             log.info("Gemma Q8_0 x Q8_1 DMMV path DISABLED via ZINC_GEMMA_Q8_1_DMMV=0", .{});
         }
 
-        const qwen36_q8_wide4_ssm_out_env = std.posix.getenv("ZINC_QWEN36_Q8_WIDE4_SSM_OUT");
+        const qwen36_q8_wide4_ssm_out_env = host_io.getenv("ZINC_QWEN36_Q8_WIDE4_SSM_OUT");
         const qwen36_q8_wide4_ssm_out_explicitly_off = qwen36_q8_wide4_ssm_out_env != null and
             std.mem.eql(u8, qwen36_q8_wide4_ssm_out_env.?, "0");
         const qwen36_q8_wide4_ssm_out_forced_on = qwen36_q8_wide4_ssm_out_env != null and
@@ -3472,7 +3473,7 @@ pub const InferenceEngine = struct {
             log.info("Qwen 3.6 Q8_0 SSM-out wide4 requested but the pipeline is missing; using generic Q8_0 DMMV", .{});
         }
 
-        const q8_batch_lm_env = std.posix.getenv("ZINC_Q8_BATCH_LM_HEAD");
+        const q8_batch_lm_env = host_io.getenv("ZINC_Q8_BATCH_LM_HEAD");
         const q8_batch_lm_flag = q8_batch_lm_env != null and std.mem.eql(u8, q8_batch_lm_env.?, "1");
         const q8_batch_lm_enabled = q8_batch_lm_flag and dmmv.pipeline_q8_0_batch != null;
         if (q8_batch_lm_enabled) {
@@ -3481,7 +3482,7 @@ pub const InferenceEngine = struct {
             log.info("ZINC_Q8_BATCH_LM_HEAD=1 requested but the Q8_0 batch pipeline is missing; using generic Q8_0 DMMV", .{});
         }
 
-        const q8_1_lm_env = std.posix.getenv("ZINC_Q8_1_LM_HEAD");
+        const q8_1_lm_env = host_io.getenv("ZINC_Q8_1_LM_HEAD");
         const q8_1_lm_explicitly_off = q8_1_lm_env != null and std.mem.eql(u8, q8_1_lm_env.?, "0");
         const q8_1_lm_forced_on = q8_1_lm_env != null and !q8_1_lm_explicitly_off;
         const q8_1_lm_default_on = (qwen36_like_f32_ssm or
@@ -3505,7 +3506,7 @@ pub const InferenceEngine = struct {
             log.info("Q8_0 x Q8_1 LM-head path DISABLED via ZINC_Q8_1_LM_HEAD=0", .{});
         }
 
-        const q4k_lm_head_dp4a_env = std.posix.getenv("ZINC_Q4K_LM_HEAD_DP4A");
+        const q4k_lm_head_dp4a_env = host_io.getenv("ZINC_Q4K_LM_HEAD_DP4A");
         const q4k_lm_head_dp4a_flag = q4k_lm_head_dp4a_env != null and std.mem.eql(u8, q4k_lm_head_dp4a_env.?, "1");
         const q4k_lm_head_dp4a_enabled = q4k_lm_head_dp4a_flag and
             dmmv.pipeline_mul_mm_q4k_full_dp4a_k2816_n8 != null and
@@ -3518,7 +3519,7 @@ pub const InferenceEngine = struct {
             log.info("ZINC_Q4K_LM_HEAD_DP4A=1 requested but prerequisites are missing; using generic Q4_K DMMV", .{});
         }
 
-        const q4k_q8_1_env = std.posix.getenv("ZINC_Q4K_Q8_1_DMMV");
+        const q4k_q8_1_env = host_io.getenv("ZINC_Q4K_Q8_1_DMMV");
         const q4k_q8_1_explicitly_off = if (q4k_q8_1_env) |env|
             std.mem.eql(u8, env, "0") or
                 std.ascii.eqlIgnoreCase(env, "off") or
@@ -3550,13 +3551,13 @@ pub const InferenceEngine = struct {
             log.info("Q4_K x Q8_1 DMMV path DISABLED via ZINC_Q4K_Q8_1_DMMV=0", .{});
         }
 
-        const q8_spec_env = std.posix.getenv("ZINC_Q8_SPEC_DMMV");
+        const q8_spec_env = host_io.getenv("ZINC_Q8_SPEC_DMMV");
         const q8_spec_enabled = q8_spec_env != null and std.mem.eql(u8, q8_spec_env.?, "1");
         if (q8_spec_enabled) {
             log.info("Q8_0 K-specialized DMMV path ENABLED via ZINC_Q8_SPEC_DMMV=1", .{});
         }
 
-        const fused_ssm_qkv_z_env = std.posix.getenv("ZINC_FUSED_SSM_QKV_Z");
+        const fused_ssm_qkv_z_env = host_io.getenv("ZINC_FUSED_SSM_QKV_Z");
         const fused_ssm_qkv_z_explicitly_off = fused_ssm_qkv_z_env != null and std.mem.eql(u8, fused_ssm_qkv_z_env.?, "0");
         const fused_ssm_qkv_z_forced_on = fused_ssm_qkv_z_env != null and !fused_ssm_qkv_z_explicitly_off;
         const fused_ssm_qkv_z_default_on = qwen36_like_f32_ssm and isIntelGpuVendor(gpu_config.vendor);
@@ -3578,7 +3579,7 @@ pub const InferenceEngine = struct {
             log.info("SSM fused Q8_0 wqkv+z projection requested but prerequisites missing; using separate SSM projections", .{});
         }
 
-        const q8_1_ssm_qkv_z_env = std.posix.getenv("ZINC_Q8_1_SSM_QKV_Z");
+        const q8_1_ssm_qkv_z_env = host_io.getenv("ZINC_Q8_1_SSM_QKV_Z");
         const q8_1_ssm_qkv_z_explicitly_off = q8_1_ssm_qkv_z_env != null and
             std.mem.eql(u8, q8_1_ssm_qkv_z_env.?, "0");
         const q8_1_ssm_qkv_z_forced_on = q8_1_ssm_qkv_z_env != null and
@@ -3610,7 +3611,7 @@ pub const InferenceEngine = struct {
         // per-(layer, expert) count buffer. mul_mm_id_q4k binds this buffer
         // for its early-exit path; the next cycle will wire it into the
         // batched MoE FFN dispatch.
-        const count_experts_env = std.posix.getenv("ZINC_COUNT_EXPERTS_PREFILL");
+        const count_experts_env = host_io.getenv("ZINC_COUNT_EXPERTS_PREFILL");
         const count_experts_flag = count_experts_env != null and std.mem.eql(u8, count_experts_env.?, "1");
         const count_experts_enabled = count_experts_flag and
             capture_flag and routing_capture_buf.handle != null and
@@ -3643,7 +3644,7 @@ pub const InferenceEngine = struct {
         // routing_capture_buf + prefill_expert_count_buf, this provides the
         // three inputs mul_mm_id_q4k needs to replace per-token MoE FFN
         // dispatches with one batched GEMM per layer. Default-OFF.
-        const ffn_input_capture_env = std.posix.getenv("ZINC_CAPTURE_FFN_INPUT");
+        const ffn_input_capture_env = host_io.getenv("ZINC_CAPTURE_FFN_INPUT");
         const ffn_input_capture_flag = ffn_input_capture_env != null and std.mem.eql(u8, ffn_input_capture_env.?, "1");
         var prefill_ffn_input_capture_buf = Buffer{ .handle = null, .memory = null, .size = 0, .mapped = null, .device = instance.device };
         var prefill_ffn_input_capture_max_tokens: u32 = 0;
@@ -3675,9 +3676,9 @@ pub const InferenceEngine = struct {
         // for layer 0 after the per-token loop drains. State backup/restore
         // protects the real per-token state from the validation dispatch so
         // decode keeps producing the correct output. Default-OFF.
-        const a3b_validate_env = std.posix.getenv("ZINC_A3B_VALIDATE");
+        const a3b_validate_env = host_io.getenv("ZINC_A3B_VALIDATE");
         const a3b_validate_flag = a3b_validate_env != null and std.mem.eql(u8, a3b_validate_env.?, "1");
-        const a3b_production_env = std.posix.getenv("ZINC_A3B_PRODUCTION");
+        const a3b_production_env = host_io.getenv("ZINC_A3B_PRODUCTION");
         const a3b_production_default_on =
             config.architecture == .qwen2_moe and
             config.n_experts > 0 and
@@ -3793,7 +3794,7 @@ pub const InferenceEngine = struct {
             log.info("ZINC_A3B_PRODUCTION enabled: layer-major A3B SSM prefill will run without validate capture buffers", .{});
         }
 
-        const dense_prefill_validate_env = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE");
+        const dense_prefill_validate_env = host_io.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE");
         const dense_prefill_validate_requested = dense_prefill_validate_env != null and
             (std.mem.eql(u8, dense_prefill_validate_env.?, "1") or
                 std.mem.eql(u8, dense_prefill_validate_env.?, "prod") or
@@ -3826,7 +3827,7 @@ pub const InferenceEngine = struct {
             config.hidden_dim > 0 and
             inter_val > 0)
         {
-            const raw_tokens = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_TOKENS");
+            const raw_tokens = host_io.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_TOKENS");
             const default_tokens: u32 = if (dense_prefill_validate_production_requested)
                 if (dense_prefill_validate_is_gemma_dense) gemma_prefill_long_draft_prompt_min_tokens else 128
             else if (dense_prefill_validate_is_gemma_dense)
@@ -3841,7 +3842,7 @@ pub const InferenceEngine = struct {
                 16;
             const parsed_tokens = if (raw_tokens) |raw| std.fmt.parseInt(u32, raw, 10) catch default_tokens else default_tokens;
             dense_prefill_validate_max_tokens = @min(@max(parsed_tokens, @as(u32, 1)), max_tokens_cap);
-            const raw_layer = std.posix.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_LAYER");
+            const raw_layer = host_io.getenv("ZINC_QWEN36_27B_PREFILL_VALIDATE_LAYER");
             const parsed_layer = if (raw_layer) |raw| std.fmt.parseInt(u32, raw, 10) catch 0 else 0;
             dense_prefill_validate_layer = @min(parsed_layer, config.n_layers - 1);
 
@@ -4300,8 +4301,8 @@ pub const InferenceEngine = struct {
         self.profile_total_counters.reset();
         self.profile_phase_range_count = 0;
         self.profile_logged_cpu_moe_fallback = false;
-        self.fa_per_layer_ns = [_]u64{0} ** 128;
-        self.fa_per_layer_count = [_]u32{0} ** 128;
+        self.fa_per_layer_ns = @as([128]u64, @splat(0));
+        self.fa_per_layer_count = @as([128]u32, @splat(0));
     }
 
     fn resetPrefillRoutePackProfile(self: *InferenceEngine) void {
@@ -4317,7 +4318,7 @@ pub const InferenceEngine = struct {
         self.prefill_route_pack_tail_blocks_actual = 0;
         self.prefill_route_pack_single_tail_blocks_actual = 0;
         self.prefill_route_pack_padding_slots_actual = 0;
-        self.prefill_route_pack_tail_size_blocks_actual = [_]u64{0} ** moe_route_pack_profile_tail_bins;
+        self.prefill_route_pack_tail_size_blocks_actual = @as([moe_route_pack_profile_tail_bins]u64, @splat(0));
     }
 
     fn resetPrefillPathProfile(self: *InferenceEngine) void {
@@ -4358,7 +4359,7 @@ pub const InferenceEngine = struct {
         var tail_blocks: u64 = 0;
         var singleton_tail_blocks: u64 = 0;
         var padding_slots: u64 = 0;
-        var tail_size_blocks = [_]u64{0} ** moe_route_pack_profile_tail_bins;
+        var tail_size_blocks = @as([moe_route_pack_profile_tail_bins]u64, @splat(0));
         const expert_count = @min(@as(usize, @intCast(n_experts)), counts.len);
         for (counts[0..expert_count]) |count| {
             if (count == 0) continue;
@@ -4419,7 +4420,7 @@ pub const InferenceEngine = struct {
 
     fn avgProfilePhaseMs(self: *const InferenceEngine, phase: ProfilePhase) f64 {
         if (self.profile_sample_count == 0) return 0.0;
-        return @as(f64, @floatFromInt(self.profile_total_counters.gpu_phase_ns[@intFromEnum(phase)])) /
+        return @as(f64, @floatFromInt(self.profile_total_counters.gpu_phase_ns[@backingInt(phase)])) /
             @as(f64, @floatFromInt(self.profile_sample_count)) /
             1_000_000.0;
     }
@@ -4721,7 +4722,7 @@ pub const InferenceEngine = struct {
         if (!self.profile_enabled or self.timestamp_count == 0) return;
         const count = self.timestamp_count;
         var timestamps: [2048]u64 = undefined;
-        const query_read_start = std.time.nanoTimestamp();
+        const query_read_start = host_io.nanoTimestamp();
         const qr = vk.c.vkGetQueryPoolResults(
             self.instance.device,
             self.timestamp_query_pool,
@@ -4736,7 +4737,7 @@ pub const InferenceEngine = struct {
             log.warn("Failed to read timestamp queries: {d}", .{qr});
             return;
         }
-        const query_read_end = std.time.nanoTimestamp();
+        const query_read_end = host_io.nanoTimestamp();
         self.profile_token_counters.query_read_ns += @intCast(query_read_end - query_read_start);
         if (count >= 2) {
             const first = timestamps[0];
@@ -4758,7 +4759,7 @@ pub const InferenceEngine = struct {
                 const range = self.profile_phase_ranges[i];
                 if (range.end_query >= count or range.start_query >= count) continue;
                 const phase_ns_f64 = @as(f64, @floatFromInt(timestamps[range.end_query] -| timestamps[range.start_query])) * self.timestamp_period_ns;
-                self.profile_token_counters.gpu_phase_ns[@intFromEnum(range.phase)] += @intFromFloat(@max(phase_ns_f64, 0.0));
+                self.profile_token_counters.gpu_phase_ns[@backingInt(range.phase)] += @intFromFloat(@max(phase_ns_f64, 0.0));
                 if (fa_record and range.phase == .flash_attn_kernel and fa_layer_idx < self.fa_per_layer_ns.len) {
                     self.fa_per_layer_ns[fa_layer_idx] += @intFromFloat(@max(phase_ns_f64, 0.0));
                     self.fa_per_layer_count[fa_layer_idx] += 1;
@@ -7660,7 +7661,7 @@ pub const InferenceEngine = struct {
 
         // 1. CPU: dequantize embedding
         const track_decode_timing = self.profile_enabled or self.prefill_active;
-        const cpu_embed_start = if (track_decode_timing) std.time.nanoTimestamp() else 0;
+        const cpu_embed_start = if (track_decode_timing) host_io.nanoTimestamp() else 0;
         if (!has_partial_hidden_in) {
             try self.embedToken(token_id);
         }
@@ -7679,17 +7680,17 @@ pub const InferenceEngine = struct {
         }
         var prefill_embed_elapsed_ns: u64 = 0;
         if (track_decode_timing) {
-            const cpu_embed_end = std.time.nanoTimestamp();
+            const cpu_embed_end = host_io.nanoTimestamp();
             const elapsed: u64 = @intCast(cpu_embed_end - cpu_embed_start);
             if (self.profile_enabled) self.profile_token_counters.cpu_embed_ns += elapsed;
             prefill_embed_elapsed_ns = elapsed;
         }
 
         // Per-layer logit5 tracking for BOS diagnostic summary
-        var diag_logit5 = [_]f32{0} ** 64;
-        var diag_rms_arr = [_]f32{0} ** 64;
+        var diag_logit5 = @as([64]f32, @splat(0));
+        var diag_rms_arr = @as([64]f32, @splat(0));
 
-        const cpu_record_start = if (track_decode_timing) std.time.nanoTimestamp() else 0;
+        const cpu_record_start = if (track_decode_timing) host_io.nanoTimestamp() else 0;
 
         // Begin single command buffer for all layers (Phase 3c batching)
         if (self.decode_cmd_preopened) {
@@ -8034,7 +8035,7 @@ pub const InferenceEngine = struct {
                         if (self.validation_diagnostics_enabled) {
                             const mmap = self.model.mmap_data orelse return error.NoMmapData;
                             if (lt.attn_norm) |attn_norm_tensor| {
-                                var attn_norm_preview = [_]f32{0} ** 4;
+                                var attn_norm_preview = @as([4]f32, @splat(0));
                                 const n = @min(attn_norm_tensor.info.numElements(), attn_norm_preview.len);
                                 const off: usize = @intCast(self.model.gguf_file.tensor_data_offset + attn_norm_tensor.info.offset);
                                 readMmapFloats(mmap, off, attn_norm_tensor.info.type_, attn_norm_preview[0..n]);
@@ -8047,7 +8048,7 @@ pub const InferenceEngine = struct {
                                 });
                             }
                             if (q_norm_tensor) |qn| {
-                                var q_norm_preview = [_]f32{0} ** 4;
+                                var q_norm_preview = @as([4]f32, @splat(0));
                                 const n = @min(qn.info.numElements(), q_norm_preview.len);
                                 const off: usize = @intCast(self.model.gguf_file.tensor_data_offset + qn.info.offset);
                                 readMmapFloats(mmap, off, qn.info.type_, q_norm_preview[0..n]);
@@ -8060,7 +8061,7 @@ pub const InferenceEngine = struct {
                                 });
                             }
                             if (k_norm_tensor) |kn| {
-                                var k_norm_preview = [_]f32{0} ** 4;
+                                var k_norm_preview = @as([4]f32, @splat(0));
                                 const n = @min(kn.info.numElements(), k_norm_preview.len);
                                 const off: usize = @intCast(self.model.gguf_file.tensor_data_offset + kn.info.offset);
                                 readMmapFloats(mmap, off, kn.info.type_, k_norm_preview[0..n]);
@@ -11332,7 +11333,7 @@ pub const InferenceEngine = struct {
                             cpu_gate_shexp.?.info.type_ == .q4_k and
                             cpu_up_shexp.?.info.type_ == .q4_k and
                             self.dmmv.pipeline_q4k_fused_gate_up_geglu_pair != null;
-                        const shared_q8_geglu_enabled = if (std.posix.getenv("ZINC_GEMMA_Q8_GEGLU_FUSED")) |raw| !std.mem.eql(u8, raw, "0") else true;
+                        const shared_q8_geglu_enabled = if (host_io.getenv("ZINC_GEMMA_Q8_GEGLU_FUSED")) |raw| !std.mem.eql(u8, raw, "0") else true;
                         const shared_front_q8_geglu =
                             shared_q8_geglu_enabled and
                             config.architecture == .gemma and
@@ -11991,7 +11992,7 @@ pub const InferenceEngine = struct {
                         const mmap = self.model.mmap_data orelse return error.NoMmapData;
                         const down_off: usize = @intCast(self.model.gguf_file.tensor_data_offset + down_tensor.info.offset);
                         var cpu_row_buf: [8192]f32 = undefined;
-                        var cpu_vals: [4]f32 = [_]f32{0} ** 4;
+                        var cpu_vals: [4]f32 = @as([4]f32, @splat(0));
                         const down_rows: u32 = @min(hidden_dim, cpu_vals.len);
                         var down_max_diff: f32 = 0;
                         for (0..down_rows) |row| {
@@ -12084,7 +12085,7 @@ pub const InferenceEngine = struct {
             // No per-layer submit — only submit for MoE expert ID readback (inside MoE block above).
 
             // --- Debug: per-layer hidden_buf diagnostics (BOS token only, gated behind validation diagnostics) ---
-            if ((state.position == 0 and (self.validation_diagnostics_enabled or std.posix.getenv("ZINC_LAYER_DIAG") != null)) or
+            if ((state.position == 0 and (self.validation_diagnostics_enabled or host_io.getenv("ZINC_LAYER_DIAG") != null)) or
                 (diag_last_prompt_token and self.validation_diagnostics_enabled))
             {
                 // Flush current batched cmd buffer for diagnostic readback
@@ -12416,12 +12417,12 @@ pub const InferenceEngine = struct {
         if (!defer_submit) try self.decode_cmd.end();
         var prefill_record_elapsed_ns: u64 = 0;
         if (track_decode_timing) {
-            const cpu_record_end = std.time.nanoTimestamp();
+            const cpu_record_end = host_io.nanoTimestamp();
             const elapsed: u64 = @intCast(cpu_record_end - cpu_record_start);
             if (self.profile_enabled) self.profile_token_counters.cpu_record_ns += elapsed;
             prefill_record_elapsed_ns = elapsed;
         }
-        const submit_wait_start = if (track_decode_timing) std.time.nanoTimestamp() else 0;
+        const submit_wait_start = if (track_decode_timing) host_io.nanoTimestamp() else 0;
         if (defer_submit) {
             // NextN/MTP chained cycle: the caller keeps recording and submits.
         } else if (self.prefill_pipeline_mode) {
@@ -12433,7 +12434,7 @@ pub const InferenceEngine = struct {
         }
         var prefill_submit_wait_elapsed_ns: u64 = 0;
         if (track_decode_timing) {
-            const submit_wait_end = std.time.nanoTimestamp();
+            const submit_wait_end = host_io.nanoTimestamp();
             const elapsed: u64 = @intCast(submit_wait_end - submit_wait_start);
             if (self.profile_enabled) self.profile_token_counters.submit_wait_ns += elapsed;
             prefill_submit_wait_elapsed_ns = elapsed;
@@ -12462,8 +12463,8 @@ pub const InferenceEngine = struct {
             var cpu_normed: [8192]f32 = undefined;
             cpuRmsNormMul(hidden_ptr, cpu_norm_w[0..hidden_dim], cpu_normed[0..hidden_dim].ptr, hidden_dim, 1, rms_norm_eps);
 
-            var top_ids = [_]u32{0} ** 5;
-            var top_vals = [_]f32{-std.math.inf(f32)} ** 5;
+            var top_ids = @as([5]u32, @splat(0));
+            var top_vals = @as([5]f32, @splat(-std.math.inf(f32)));
             for (gpu_logits, 0..) |val, i| {
                 var insert_at: usize = 5;
                 for (0..5) |slot| {
@@ -12483,7 +12484,7 @@ pub const InferenceEngine = struct {
             }
 
             var cpu_row_buf: [8192]f32 = undefined;
-            var cpu_top_vals = [_]f32{0} ** 5;
+            var cpu_top_vals = @as([5]f32, @splat(0));
             var tail_max_diff: f32 = 0;
             var tail_max_slot: usize = 0;
             for (0..5) |slot| {
@@ -12922,7 +12923,7 @@ pub const InferenceEngine = struct {
         // full DP4a body. That guarantees the fused shader's packed
         // output is consumed by the downstream dense gate+up DP4a path.
         if (self.isQwen36DenseHybrid27B()) {
-            if (std.posix.getenv("ZINC_QWEN36_27B_FUSE_RMS_QUANT")) |v| {
+            if (host_io.getenv("ZINC_QWEN36_27B_FUSE_RMS_QUANT")) |v| {
                 if (std.mem.eql(u8, v, "0")) return false;
             }
         }
@@ -12934,7 +12935,7 @@ pub const InferenceEngine = struct {
         // The full-attention handoff is kept opt-in: on the RDNA A3B path it
         // can leave later decode tokens nondeterministic even when the first
         // post-prefill token is correct. SSM segments still use the fused path.
-        if (std.posix.getenv("ZINC_QWEN36_27B_FULL_ATTN_FUSE_RMS_QUANT")) |v| {
+        if (host_io.getenv("ZINC_QWEN36_27B_FULL_ATTN_FUSE_RMS_QUANT")) |v| {
             return v.len > 0 and !std.mem.eql(u8, v, "0");
         }
         return false;
@@ -13405,9 +13406,9 @@ pub const InferenceEngine = struct {
                 }
             }
         }
-        const rows_env: u32 = if (std.posix.getenv("ZINC_MTP_COLS_ROWS")) |v| (std.fmt.parseInt(u32, v, 10) catch 4) else 4;
-        const lmhead_rows_env: u32 = if (std.posix.getenv("ZINC_MTP_LMHEAD_ROWS")) |v| (std.fmt.parseInt(u32, v, 10) catch 8) else 8;
-        const wide_rows_env: u32 = if (std.posix.getenv("ZINC_MTP_WIDE_ROWS")) |v| (std.fmt.parseInt(u32, v, 10) catch 4) else 4;
+        const rows_env: u32 = if (host_io.getenv("ZINC_MTP_COLS_ROWS")) |v| (std.fmt.parseInt(u32, v, 10) catch 4) else 4;
+        const lmhead_rows_env: u32 = if (host_io.getenv("ZINC_MTP_LMHEAD_ROWS")) |v| (std.fmt.parseInt(u32, v, 10) catch 8) else 8;
+        const wide_rows_env: u32 = if (host_io.getenv("ZINC_MTP_WIDE_ROWS")) |v| (std.fmt.parseInt(u32, v, 10) catch 4) else 4;
         const rows_sel: u32 = if (tensor.info.type_ == .q5_k) 4 else if (M >= 100_000) lmhead_rows_env else if (M >= 16384 and tensor.info.type_ == .q4_k) wide_rows_env else rows_env;
         const q4 = tensor.info.type_ == .q4_k;
         const cols_pip: ?*const Pipeline = if (tensor.info.type_ == .q5_k) (if (self.dmmv.pipeline_q5k_rows4_cols) |*p| p else null) else switch (rows_sel) {
@@ -13803,7 +13804,7 @@ pub const InferenceEngine = struct {
             // Disabled by default: BN=64 halves WG count, reducing
             // parallelism and latency hiding on this 64-CU GPU.
             if (n_tokens >= 64 and
-                std.posix.getenv("ZINC_WIDE_GEMM") != null and
+                host_io.getenv("ZINC_WIDE_GEMM") != null and
                 self.dmmv.pipeline_mul_mm_q5k_wide != null)
             {
                 try self.dmmv.recordMulMmQ5KWide(
@@ -13855,7 +13856,7 @@ pub const InferenceEngine = struct {
             self.dmmv.pipeline_mul_mm_q5k != null)
         {
             if (n_tokens >= 64 and
-                std.posix.getenv("ZINC_WIDE_GEMM") != null and
+                host_io.getenv("ZINC_WIDE_GEMM") != null and
                 self.dmmv.pipeline_mul_mm_q5k_wide != null)
             {
                 try self.dmmv.recordMulMmQ5KWide(
@@ -14020,7 +14021,7 @@ pub const InferenceEngine = struct {
     /// fallback (Gemma 4 26B-A4B, 1459 tokens: 1140 vs 413 tok/s), so only Intel
     /// keeps the narrow band it was tuned with.
     fn gemmaPrefillDp4aMaxTokens(self: *const InferenceEngine) u32 {
-        if (std.posix.getenv("ZINC_GEMMA_DP4A_MAX_TOKENS")) |raw| {
+        if (host_io.getenv("ZINC_GEMMA_DP4A_MAX_TOKENS")) |raw| {
             if (std.fmt.parseInt(u32, std.mem.trim(u8, raw, " \t\r\n"), 10)) |parsed| {
                 if (parsed >= 64) return parsed;
             } else |_| {}
@@ -17468,7 +17469,7 @@ pub const InferenceEngine = struct {
     ) !void {
         const qt = tensor.info.type_;
         const pip = self.dmmv.pipelineForType(qt) orelse {
-            log.err("No DMMV pipeline for quant type {d} (tensor {s})", .{ @intFromEnum(qt), tensor.info.name });
+            log.err("No DMMV pipeline for quant type {d} (tensor {s})", .{ @backingInt(qt), tensor.info.name });
             return error.UnsupportedQuantType;
         };
 
@@ -19164,7 +19165,7 @@ pub const InferenceEngine = struct {
 
     fn intelA3bProductionEnabled(self: *const InferenceEngine) bool {
         if (!isIntelGpuVendor(self.gpu_config.vendor)) return false;
-        const raw = std.posix.getenv("ZINC_INTEL_A3B_PRODUCTION") orelse return true;
+        const raw = host_io.getenv("ZINC_INTEL_A3B_PRODUCTION") orelse return true;
         return raw.len > 0 and !std.mem.eql(u8, raw, "0");
     }
 
@@ -19172,7 +19173,7 @@ pub const InferenceEngine = struct {
         if (self.validation_diagnostics_enabled) return false;
         if (!self.isQwen36DenseHybrid27B()) return false;
         if (!self.isAmdRdna()) return false;
-        const mode = std.posix.getenv("ZINC_QWEN36_27B_SSM_PREFILL_PROJ") orelse return false;
+        const mode = host_io.getenv("ZINC_QWEN36_27B_SSM_PREFILL_PROJ") orelse return false;
         return std.mem.eql(u8, mode, "1") or
             std.mem.eql(u8, mode, "both") or
             std.mem.eql(u8, mode, "qkv") or
@@ -19268,7 +19269,7 @@ pub const InferenceEngine = struct {
         // ZINC_QWEN36_MOE_GROUPED_EXACT=0 disables it.
         if (!isIntelGpuVendor(self.gpu_config.vendor) and !self.isAmdRdna()) return false;
         if (n_tokens < 16 or n_tokens > qwen_a3b_exact_grouped_moe_prefill_max_tokens) return false;
-        if (std.posix.getenv("ZINC_QWEN36_MOE_GROUPED_EXACT")) |env| {
+        if (host_io.getenv("ZINC_QWEN36_MOE_GROUPED_EXACT")) |env| {
             if (std.mem.eql(u8, env, "0") or
                 std.ascii.eqlIgnoreCase(env, "off") or
                 std.ascii.eqlIgnoreCase(env, "false") or
@@ -19283,7 +19284,7 @@ pub const InferenceEngine = struct {
 
     fn qwenA3bSharedF32GateBatchEnabled(self: *const InferenceEngine, default_on: bool) bool {
         if (!self.isQwen36A3bMoePrefillModel()) return false;
-        const raw = std.posix.getenv("ZINC_A3B_SHARED_F32_GATE_BATCH") orelse return default_on;
+        const raw = host_io.getenv("ZINC_A3B_SHARED_F32_GATE_BATCH") orelse return default_on;
         return raw.len > 0 and
             !std.mem.eql(u8, raw, "0") and
             !std.ascii.eqlIgnoreCase(raw, "off") and
@@ -19325,7 +19326,7 @@ pub const InferenceEngine = struct {
         if (!self.isQwen36A3bMoePrefillModel()) return false;
         if (!isIntelGpuVendor(self.gpu_config.vendor)) return false;
         if (n_tokens == 0 or n_tokens > 64) return false;
-        if (std.posix.getenv("ZINC_FUSED_SSM_QKV_Z")) |raw| {
+        if (host_io.getenv("ZINC_FUSED_SSM_QKV_Z")) |raw| {
             if (raw.len > 0 and !std.mem.eql(u8, raw, "0")) return false;
         }
         return true;
@@ -19341,7 +19342,7 @@ pub const InferenceEngine = struct {
         if (!self.isQwen36DenseHybrid27B()) return false;
         if (!self.isQwenDensePrefillAccelGpu()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
-        if (std.posix.getenv("ZINC_QWEN36_27B_DP4A_DOWN")) |v| {
+        if (host_io.getenv("ZINC_QWEN36_27B_DP4A_DOWN")) |v| {
             if (std.mem.eql(u8, v, "0")) return false;
         }
         return true;
@@ -19370,11 +19371,11 @@ pub const InferenceEngine = struct {
             self.gpu_config.vendor == .amd_rdna4 and
             self.instance.caps.cooperative_matrix)
         {
-            const force_dp4a = std.posix.getenv("ZINC_QWEN_DENSE_FFN_DP4A");
+            const force_dp4a = host_io.getenv("ZINC_QWEN_DENSE_FFN_DP4A");
             if (force_dp4a == null or !std.mem.eql(u8, force_dp4a.?, "1")) return false;
         }
 
-        if (std.posix.getenv("ZINC_QWEN_DENSE_FFN_DP4A")) |v| {
+        if (host_io.getenv("ZINC_QWEN_DENSE_FFN_DP4A")) |v| {
             if (std.mem.eql(u8, v, "0")) return false;
         }
 
@@ -19447,7 +19448,7 @@ pub const InferenceEngine = struct {
         if (!self.isAmdRdna() and !self.intelA3bProductionEnabled()) return false;
         if (!self.instance.caps.integer_dot_product) return false;
         if (self.instance.push_descriptor_fn == null) return false;
-        if (std.posix.getenv("ZINC_A3B_ATTN_DP4A")) |v| {
+        if (host_io.getenv("ZINC_A3B_ATTN_DP4A")) |v| {
             if (std.mem.eql(u8, v, "0")) return false;
         }
         return n_tokens >= 64;
@@ -19762,7 +19763,7 @@ pub const InferenceEngine = struct {
         n_tokens: u32,
     ) !bool {
         if (!self.qwenA3bSsmQ8Dp4aEnabled(n_tokens)) return false;
-        if (std.posix.getenv("ZINC_A3B_SSM_OUT_Q8_DP4A")) |v| {
+        if (host_io.getenv("ZINC_A3B_SSM_OUT_Q8_DP4A")) |v| {
             if (std.mem.eql(u8, v, "0")) return false;
         }
         if (ssm_out_t.info.type_ != .q8_0) return false;
@@ -20428,7 +20429,7 @@ pub const InferenceEngine = struct {
                 // parallelism and latency hiding. Kept as infrastructure for
                 // future cooperative-matrix work. Set ZINC_WIDE_DOWN=1 to test.
                 if (n_tokens >= 64 and
-                    std.posix.getenv("ZINC_WIDE_GEMM") != null and
+                    host_io.getenv("ZINC_WIDE_GEMM") != null and
                     self.dmmv.pipeline_mul_mm_q4k_down_acc_wide != null)
                 {
                     try self.dmmv.recordMulMmQ4KDownAccWide(
@@ -21030,7 +21031,7 @@ pub const InferenceEngine = struct {
         if (self.use_ssm_delta_normed_qk) return false;
         if (self.elementwise.pipeline_ssm_delta_net == null and self.elementwise.pipeline_ssm_delta_net_cols8 == null) return false;
         if (self.elementwise.pipeline_ssm_gated_norm == null) return false;
-        if (std.posix.getenv("ZINC_QWEN36_27B_SSM_BATCHED_DELTA")) |mode| {
+        if (host_io.getenv("ZINC_QWEN36_27B_SSM_BATCHED_DELTA")) |mode| {
             return mode.len > 0 and !std.mem.eql(u8, mode, "0");
         }
         return true;
@@ -21054,7 +21055,7 @@ pub const InferenceEngine = struct {
         if (prompt_len < 2 or self.validation_diagnostics_enabled) return 0;
         if (self.use_qwen36_dense_prefill_validate or self.use_qwen36_ssm_prefill_validate) return 0;
 
-        const mode = std.posix.getenv("ZINC_QWEN36_27B_DENSE_PREFILL");
+        const mode = host_io.getenv("ZINC_QWEN36_27B_DENSE_PREFILL");
         if (mode != null and std.mem.eql(u8, mode.?, "0")) return 0;
 
         const cfg = self.model.config;
@@ -21101,7 +21102,7 @@ pub const InferenceEngine = struct {
                 layers = std.fmt.parseInt(u32, raw, 10) catch layers;
             }
         }
-        if (std.posix.getenv("ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS")) |raw| {
+        if (host_io.getenv("ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS")) |raw| {
             layers = std.fmt.parseInt(u32, raw, 10) catch layers;
         }
         if (layers == 0) return 0;
@@ -21125,7 +21126,7 @@ pub const InferenceEngine = struct {
         if (n_tokens < 2) return false;
         if (self.validation_diagnostics_enabled or self.profile_enabled) return false;
         if (self.instance.push_descriptor_fn == null) return false;
-        if (std.posix.getenv("ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE")) |mode| {
+        if (host_io.getenv("ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE")) |mode| {
             return mode.len > 0 and !std.mem.eql(u8, mode, "0");
         }
         if (self.isQwenDenseHybridLayerMajorPrefillModel()) {
@@ -21175,7 +21176,7 @@ pub const InferenceEngine = struct {
         if (prefix_layers + 1 >= cfg.n_layers) return 0;
 
         var count: usize = 0;
-        if (std.posix.getenv("ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT")) |raw| {
+        if (host_io.getenv("ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT")) |raw| {
             if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return 0;
             if (std.mem.eql(u8, raw, "1")) {
                 const full_attn_interval = if (cfg.full_attn_interval > 0) cfg.full_attn_interval else 1;
@@ -21563,7 +21564,7 @@ pub const InferenceEngine = struct {
             self.use_moe_fused_gate_up_swiglu and
             self.dmmv.pipeline_q4k_moe_fused_gate_up_swiglu_cols_top1 != null;
         const q8_1_gate_up_cols_default_on = exact_grouped and prefix_tokens == 0;
-        const q8_1_gate_up_cols_enabled = if (std.posix.getenv("ZINC_MOE_Q8_1_GATE_UP_COLS")) |raw|
+        const q8_1_gate_up_cols_enabled = if (host_io.getenv("ZINC_MOE_Q8_1_GATE_UP_COLS")) |raw|
             !(std.mem.eql(u8, raw, "0") or
                 std.ascii.eqlIgnoreCase(raw, "off") or
                 std.ascii.eqlIgnoreCase(raw, "false") or
@@ -21612,7 +21613,7 @@ pub const InferenceEngine = struct {
             (hidden_dim & 255) == 0 and
             q8_1_gate_up_packed.?.size >= suffix_hidden_i8_bytes and
             q8_1_gate_up_scale_dsum.?.size >= suffix_hidden_scale_dsum_bytes;
-        const q8_1_down_cols_env = std.posix.getenv("ZINC_MOE_Q8_1_DOWN_COLS");
+        const q8_1_down_cols_env = host_io.getenv("ZINC_MOE_Q8_1_DOWN_COLS");
         const q8_1_down_cols_requested = if (q8_1_down_cols_env) |raw|
             !(std.mem.eql(u8, raw, "0") or
                 std.ascii.eqlIgnoreCase(raw, "off") or
@@ -21643,7 +21644,7 @@ pub const InferenceEngine = struct {
             (inter_dim & 255) == 0 and
             q8_1_down_packed.?.size >= prefix_inter_i8_bytes and
             q8_1_down_scale_dsum.?.size >= prefix_inter_scale_dsum_bytes;
-        const q8_1_down_compare_requested = if (std.posix.getenv("ZINC_MOE_Q8_1_DOWN_COMPARE")) |raw|
+        const q8_1_down_compare_requested = if (host_io.getenv("ZINC_MOE_Q8_1_DOWN_COMPARE")) |raw|
             !(std.mem.eql(u8, raw, "0") or
                 std.ascii.eqlIgnoreCase(raw, "off") or
                 std.ascii.eqlIgnoreCase(raw, "false") or
@@ -21670,7 +21671,7 @@ pub const InferenceEngine = struct {
             self.logits_staging.mapped != null and
             self.logits_staging.size >= q8_1_down_compare_bytes;
         var q8_1_down_compare_ran = false;
-        const q6_down_compare_requested = if (std.posix.getenv("ZINC_MOE_Q6K_COLS_COMPARE")) |raw|
+        const q6_down_compare_requested = if (host_io.getenv("ZINC_MOE_Q6K_COLS_COMPARE")) |raw|
             !(std.mem.eql(u8, raw, "0") or
                 std.ascii.eqlIgnoreCase(raw, "off") or
                 std.ascii.eqlIgnoreCase(raw, "false") or
@@ -25693,7 +25694,7 @@ pub const InferenceEngine = struct {
         if (self.elementwise.pipeline_sigmoid_mul == null) return false;
         if (self.elementwise.pipeline_residual_rms_norm == null) return false;
         if (self.elementwise.pipeline_deinterleave_batched == null) return false;
-        if (std.posix.getenv("ZINC_QWEN36_27B_FULL_ATTN_BATCHED")) |mode| {
+        if (host_io.getenv("ZINC_QWEN36_27B_FULL_ATTN_BATCHED")) |mode| {
             return mode.len > 0 and !std.mem.eql(u8, mode, "0");
         }
         return true;
@@ -26245,9 +26246,9 @@ pub const InferenceEngine = struct {
         self.prefill_cpu_embed_ns = 0;
         self.prefill_cpu_record_ns = 0;
         self.prefill_submit_wait_ns = 0;
-        self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
+        self.prefill_gpu_phase_ns = @as([profile_phase_count]u64, @splat(0));
         self.prefill_gpu_total_ns = 0;
-        const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
+        const profile_env = host_io.getenv("ZINC_PREFILL_PROFILE");
         const want_gpu_phases = profile_env != null and profile_env.?.len > 0 and !std.mem.eql(u8, profile_env.?, "0");
         const profile_was_enabled = self.profile_enabled;
         const enable_gpu_phase_timing = self.timestamp_query_pool != null and want_gpu_phases;
@@ -26541,7 +26542,7 @@ pub const InferenceEngine = struct {
         const scratch_swiglu = self.batched_scratch_swiglu.?;
         const scratch_down = self.batched_scratch_down.?;
         const use_ssm_preproj = self.qwen36DensePrefillSsmPreprojEnabled();
-        const ssm_preproj_mode = std.posix.getenv("ZINC_QWEN36_27B_SSM_PREFILL_PROJ") orelse "";
+        const ssm_preproj_mode = host_io.getenv("ZINC_QWEN36_27B_SSM_PREFILL_PROJ") orelse "";
         const prebatch_ssm_qkv = std.mem.eql(u8, ssm_preproj_mode, "1") or
             std.mem.eql(u8, ssm_preproj_mode, "both") or
             std.mem.eql(u8, ssm_preproj_mode, "qkv");
@@ -26564,9 +26565,9 @@ pub const InferenceEngine = struct {
         self.prefill_cpu_embed_ns = 0;
         self.prefill_cpu_record_ns = 0;
         self.prefill_submit_wait_ns = 0;
-        self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
+        self.prefill_gpu_phase_ns = @as([profile_phase_count]u64, @splat(0));
         self.prefill_gpu_total_ns = 0;
-        const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
+        const profile_env = host_io.getenv("ZINC_PREFILL_PROFILE");
         const want_gpu_phases = profile_env != null and profile_env.?.len > 0 and !std.mem.eql(u8, profile_env.?, "0");
         const profile_was_enabled = self.profile_enabled;
         const enable_gpu_phase_timing = self.timestamp_query_pool != null and want_gpu_phases;
@@ -27054,7 +27055,7 @@ pub const InferenceEngine = struct {
     }
 
     fn gemmaGroupedMoePrefillEnvEnabled() bool {
-        const env = std.posix.getenv("ZINC_GEMMA_MOE_GROUPED_PREFILL") orelse return true;
+        const env = host_io.getenv("ZINC_GEMMA_MOE_GROUPED_PREFILL") orelse return true;
         if (std.mem.eql(u8, env, "0")) return false;
         if (std.ascii.eqlIgnoreCase(env, "false")) return false;
         if (std.ascii.eqlIgnoreCase(env, "off")) return false;
@@ -27640,7 +27641,7 @@ pub const InferenceEngine = struct {
             const ids_ptr: [*]u32 = @ptrCast(@alignCast(self.prefill_token_ids.?.mapped.?));
             @memcpy(ids_ptr[0..n_tokens], prompt_tokens[0..n_tokens]);
         }
-        const cpu_embed_start = std.time.nanoTimestamp();
+        const cpu_embed_start = host_io.nanoTimestamp();
         if (gpu_embed_type == null) {
             const big_f32: [*]f32 = @ptrCast(@alignCast(self.prefill_embed_big.?.mapped.?));
             const embd = self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
@@ -27655,7 +27656,7 @@ pub const InferenceEngine = struct {
                 for (dst) |*v| v.* *= gemma_scale;
             }
         }
-        const cpu_embed_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - cpu_embed_start);
+        const cpu_embed_elapsed_ns: u64 = @intCast(host_io.nanoTimestamp() - cpu_embed_start);
         // decodeStep copies prompt rows from prefill_embed_big only when the hidden
         // size matches; with the GPU gather that host buffer is not filled.
         self.prefill_embed_big_hidden = if (gpu_embed_type == null) hidden_dim else 0;
@@ -27707,7 +27708,7 @@ pub const InferenceEngine = struct {
             self.prefill_pipeline_mode = false;
         }
 
-        const initial_record_start = std.time.nanoTimestamp();
+        const initial_record_start = host_io.nanoTimestamp();
         try self.decode_cmd.reset();
         try self.decode_cmd.beginOneTime();
         if (gpu_embed_type) |qtype| {
@@ -27731,18 +27732,18 @@ pub const InferenceEngine = struct {
             });
         }
         try self.decode_cmd.end();
-        const initial_record_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - initial_record_start);
-        const initial_submit_wait_start = std.time.nanoTimestamp();
+        const initial_record_elapsed_ns: u64 = @intCast(host_io.nanoTimestamp() - initial_record_start);
+        const initial_submit_wait_start = host_io.nanoTimestamp();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-        const initial_submit_wait_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - initial_submit_wait_start);
+        const initial_submit_wait_elapsed_ns: u64 = @intCast(host_io.nanoTimestamp() - initial_submit_wait_start);
 
         self.prefill_token_samples = 0;
         self.prefill_cpu_embed_ns = cpu_embed_elapsed_ns;
         self.prefill_cpu_record_ns = initial_record_elapsed_ns;
         self.prefill_submit_wait_ns = initial_submit_wait_elapsed_ns;
-        self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
+        self.prefill_gpu_phase_ns = @as([profile_phase_count]u64, @splat(0));
         self.prefill_gpu_total_ns = 0;
-        const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
+        const profile_env = host_io.getenv("ZINC_PREFILL_PROFILE");
         const want_gpu_phases = profile_env != null and profile_env.?.len > 0 and !std.mem.eql(u8, profile_env.?, "0");
         const profile_was_enabled = self.profile_enabled;
         const prefill_active_was = self.prefill_active;
@@ -27838,7 +27839,7 @@ pub const InferenceEngine = struct {
         var layer: u32 = 0;
         while (layer < batched_layers) : (layer += 1) {
             if (self.instance.push_descriptor_fn == null) _ = vk.c.vkResetDescriptorPool(self.instance.device, self.shared_pool, 0);
-            const layer_record_start = std.time.nanoTimestamp();
+            const layer_record_start = host_io.nanoTimestamp();
             if (open_layers == 0) {
                 try self.decode_cmd.reset();
                 try self.decode_cmd.beginOneTime();
@@ -28189,109 +28190,109 @@ pub const InferenceEngine = struct {
                 }
                 const shexp_gate = lt.ffn_gate_inp_shexp;
                 if (!overlap_shared) {
-                const shared_proj_phase = self.beginProfilePhase();
-                if (shexp_gate) |sg| {
-                    try self.dispatchProjectionBatched(sg, scratch_shared_norm, route_buf, 1, hidden_dim, n_tokens);
-                    self.decode_cmd.computeBufferBarrier(route_buf.handle, @as(vk.c.VkDeviceSize, n_tokens) * @sizeOf(f32));
-                }
+                    const shared_proj_phase = self.beginProfilePhase();
+                    if (shexp_gate) |sg| {
+                        try self.dispatchProjectionBatched(sg, scratch_shared_norm, route_buf, 1, hidden_dim, n_tokens);
+                        self.decode_cmd.computeBufferBarrier(route_buf.handle, @as(vk.c.VkDeviceSize, n_tokens) * @sizeOf(f32));
+                    }
 
-                var shared_gateup_dp4a_cols: u32 = 0;
-                const shared_gateup_result = try self.dispatchGemmaGateUpGegluBatched(
-                    gate_shexp.?,
-                    up_shexp.?,
-                    down_shexp.?,
-                    scratch_shared_norm,
-                    scratch_swiglu,
-                    shexp_inter_dim,
-                    hidden_dim,
-                    n_tokens,
-                    &shared_gateup_dp4a_cols,
-                );
-                if (shared_gateup_result == .not_handled) {
-                    var shared_gateup_done = false;
-                    if (gate_shexp.?.info.type_ == .q8_0 and
-                        up_shexp.?.info.type_ == .q8_0 and
-                        self.gemmaDenseProjectionDp4aSupported(gate_shexp.?, shexp_inter_dim, hidden_dim, n_tokens) and
-                        self.gemmaDenseProjectionDp4aSupported(up_shexp.?, shexp_inter_dim, hidden_dim, n_tokens))
-                    {
-                        const shared_q8_cols = try self.gemmaPrepareProjectionQ8(scratch_shared_norm, hidden_dim, n_tokens);
-                        if (shared_q8_cols > 0) {
-                            const gate_done = try self.dispatchGemmaProjectionBatchedDp4a(
-                                gate_shexp.?,
-                                scratch_shared_norm,
-                                scratch_router_logits,
-                                shexp_inter_dim,
-                                hidden_dim,
-                                n_tokens,
-                                0,
-                                shared_q8_cols,
-                            );
-                            const up_done = try self.dispatchGemmaProjectionBatchedDp4a(
-                                up_shexp.?,
-                                scratch_shared_norm,
-                                scratch_shared_up,
-                                shexp_inter_dim,
-                                hidden_dim,
-                                n_tokens,
-                                0,
-                                shared_q8_cols,
-                            );
-                            shared_gateup_done = gate_done and up_done;
-                        }
-                    }
-                    if (!shared_gateup_done) {
-                        try self.dispatchProjectionBatched(gate_shexp.?, scratch_shared_norm, scratch_router_logits, shexp_inter_dim, hidden_dim, n_tokens);
-                        try self.dispatchProjectionBatched(up_shexp.?, scratch_shared_norm, scratch_shared_up, shexp_inter_dim, hidden_dim, n_tokens);
-                    }
-                    const shared_gateup_ranges = [_]CommandBuffer.BufferRange{
-                        .{ .buffer = scratch_router_logits.handle, .size = shared_inter_bytes },
-                        .{ .buffer = scratch_shared_up.handle, .size = shared_inter_bytes },
-                    };
-                    self.decode_cmd.computeBuffersBarrier(&shared_gateup_ranges);
-                    try self.dispatchFfnActivation(
-                        scratch_router_logits.handle,
-                        scratch_router_logits.size,
-                        scratch_shared_up.handle,
-                        scratch_shared_up.size,
-                        scratch_swiglu.handle,
-                        scratch_swiglu.size,
-                        n_tokens * shexp_inter_dim,
+                    var shared_gateup_dp4a_cols: u32 = 0;
+                    const shared_gateup_result = try self.dispatchGemmaGateUpGegluBatched(
+                        gate_shexp.?,
+                        up_shexp.?,
+                        down_shexp.?,
+                        scratch_shared_norm,
+                        scratch_swiglu,
+                        shexp_inter_dim,
+                        hidden_dim,
+                        n_tokens,
+                        &shared_gateup_dp4a_cols,
                     );
-                    self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, shared_inter_bytes);
-                } else {
-                    self.barrierAfterGemmaGateUpGeglu(shared_gateup_result, scratch_swiglu, shared_inter_bytes, n_tokens, shared_gateup_dp4a_cols);
-                }
-                self.endProfilePhase(.shared_proj, shared_proj_phase);
+                    if (shared_gateup_result == .not_handled) {
+                        var shared_gateup_done = false;
+                        if (gate_shexp.?.info.type_ == .q8_0 and
+                            up_shexp.?.info.type_ == .q8_0 and
+                            self.gemmaDenseProjectionDp4aSupported(gate_shexp.?, shexp_inter_dim, hidden_dim, n_tokens) and
+                            self.gemmaDenseProjectionDp4aSupported(up_shexp.?, shexp_inter_dim, hidden_dim, n_tokens))
+                        {
+                            const shared_q8_cols = try self.gemmaPrepareProjectionQ8(scratch_shared_norm, hidden_dim, n_tokens);
+                            if (shared_q8_cols > 0) {
+                                const gate_done = try self.dispatchGemmaProjectionBatchedDp4a(
+                                    gate_shexp.?,
+                                    scratch_shared_norm,
+                                    scratch_router_logits,
+                                    shexp_inter_dim,
+                                    hidden_dim,
+                                    n_tokens,
+                                    0,
+                                    shared_q8_cols,
+                                );
+                                const up_done = try self.dispatchGemmaProjectionBatchedDp4a(
+                                    up_shexp.?,
+                                    scratch_shared_norm,
+                                    scratch_shared_up,
+                                    shexp_inter_dim,
+                                    hidden_dim,
+                                    n_tokens,
+                                    0,
+                                    shared_q8_cols,
+                                );
+                                shared_gateup_done = gate_done and up_done;
+                            }
+                        }
+                        if (!shared_gateup_done) {
+                            try self.dispatchProjectionBatched(gate_shexp.?, scratch_shared_norm, scratch_router_logits, shexp_inter_dim, hidden_dim, n_tokens);
+                            try self.dispatchProjectionBatched(up_shexp.?, scratch_shared_norm, scratch_shared_up, shexp_inter_dim, hidden_dim, n_tokens);
+                        }
+                        const shared_gateup_ranges = [_]CommandBuffer.BufferRange{
+                            .{ .buffer = scratch_router_logits.handle, .size = shared_inter_bytes },
+                            .{ .buffer = scratch_shared_up.handle, .size = shared_inter_bytes },
+                        };
+                        self.decode_cmd.computeBuffersBarrier(&shared_gateup_ranges);
+                        try self.dispatchFfnActivation(
+                            scratch_router_logits.handle,
+                            scratch_router_logits.size,
+                            scratch_shared_up.handle,
+                            scratch_shared_up.size,
+                            scratch_swiglu.handle,
+                            scratch_swiglu.size,
+                            n_tokens * shexp_inter_dim,
+                        );
+                        self.decode_cmd.computeBufferBarrier(scratch_swiglu.handle, shared_inter_bytes);
+                    } else {
+                        self.barrierAfterGemmaGateUpGeglu(shared_gateup_result, scratch_swiglu, shared_inter_bytes, n_tokens, shared_gateup_dp4a_cols);
+                    }
+                    self.endProfilePhase(.shared_proj, shared_proj_phase);
 
-                const shared_already_q8 = shared_gateup_result == .q8_geglu;
-                const shared_already_q8_1 = shared_gateup_result == .q8_1_geglu;
-                const shared_down_phase = self.beginProfilePhase();
-                if (!try self.dispatchGemmaDenseDownDp4aBatched(down_shexp.?, scratch_swiglu, scratch_shared_down, hidden_dim, shexp_inter_dim, n_tokens, shared_already_q8, shared_already_q8_1, shared_gateup_dp4a_cols)) {
-                    if (shared_already_q8 or shared_already_q8_1) return error.UnsupportedConfiguration;
-                    var shared_down_done = false;
-                    if (down_shexp.?.info.type_ == .q8_0 and
-                        self.gemmaDenseProjectionDp4aSupported(down_shexp.?, hidden_dim, shexp_inter_dim, n_tokens))
-                    {
-                        const shared_down_q8_cols = try self.gemmaPrepareProjectionQ8(scratch_swiglu, shexp_inter_dim, n_tokens);
-                        if (shared_down_q8_cols > 0) {
-                            shared_down_done = try self.dispatchGemmaProjectionBatchedDp4a(
-                                down_shexp.?,
-                                scratch_swiglu,
-                                scratch_shared_down,
-                                hidden_dim,
-                                shexp_inter_dim,
-                                n_tokens,
-                                0,
-                                shared_down_q8_cols,
-                            );
+                    const shared_already_q8 = shared_gateup_result == .q8_geglu;
+                    const shared_already_q8_1 = shared_gateup_result == .q8_1_geglu;
+                    const shared_down_phase = self.beginProfilePhase();
+                    if (!try self.dispatchGemmaDenseDownDp4aBatched(down_shexp.?, scratch_swiglu, scratch_shared_down, hidden_dim, shexp_inter_dim, n_tokens, shared_already_q8, shared_already_q8_1, shared_gateup_dp4a_cols)) {
+                        if (shared_already_q8 or shared_already_q8_1) return error.UnsupportedConfiguration;
+                        var shared_down_done = false;
+                        if (down_shexp.?.info.type_ == .q8_0 and
+                            self.gemmaDenseProjectionDp4aSupported(down_shexp.?, hidden_dim, shexp_inter_dim, n_tokens))
+                        {
+                            const shared_down_q8_cols = try self.gemmaPrepareProjectionQ8(scratch_swiglu, shexp_inter_dim, n_tokens);
+                            if (shared_down_q8_cols > 0) {
+                                shared_down_done = try self.dispatchGemmaProjectionBatchedDp4a(
+                                    down_shexp.?,
+                                    scratch_swiglu,
+                                    scratch_shared_down,
+                                    hidden_dim,
+                                    shexp_inter_dim,
+                                    n_tokens,
+                                    0,
+                                    shared_down_q8_cols,
+                                );
+                            }
+                        }
+                        if (!shared_down_done) {
+                            try self.dispatchProjectionBatched(down_shexp.?, scratch_swiglu, scratch_shared_down, hidden_dim, shexp_inter_dim, n_tokens);
                         }
                     }
-                    if (!shared_down_done) {
-                        try self.dispatchProjectionBatched(down_shexp.?, scratch_swiglu, scratch_shared_down, hidden_dim, shexp_inter_dim, n_tokens);
-                    }
-                }
-                self.decode_cmd.computeBufferBarrier(scratch_shared_down.handle, hidden_batch_bytes);
-                self.endProfilePhase(.shared_down, shared_down_phase);
+                    self.decode_cmd.computeBufferBarrier(scratch_shared_down.handle, hidden_batch_bytes);
+                    self.endProfilePhase(.shared_down, shared_down_phase);
                 }
                 if (lt.post_ffw_norm_1) |pfn1_t| {
                     try self.dispatchRmsNorm(
@@ -28360,16 +28361,16 @@ pub const InferenceEngine = struct {
             self.decode_cmd.computeToTransferBarrier();
             open_layers += 1;
             if (open_layers < layers_per_submit and layer + 1 < batched_layers) {
-                self.prefill_cpu_record_ns += @intCast(std.time.nanoTimestamp() - layer_record_start);
+                self.prefill_cpu_record_ns += @intCast(host_io.nanoTimestamp() - layer_record_start);
                 continue;
             }
             open_layers = 0;
             _ = self.writeTimestamp(vk.c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
             try self.decode_cmd.end();
-            self.prefill_cpu_record_ns += @intCast(std.time.nanoTimestamp() - layer_record_start);
-            const layer_submit_wait_start = std.time.nanoTimestamp();
+            self.prefill_cpu_record_ns += @intCast(host_io.nanoTimestamp() - layer_record_start);
+            const layer_submit_wait_start = host_io.nanoTimestamp();
             try self.decode_cmd.submitAndWait(self.instance.compute_queue);
-            self.prefill_submit_wait_ns += @intCast(std.time.nanoTimestamp() - layer_submit_wait_start);
+            self.prefill_submit_wait_ns += @intCast(host_io.nanoTimestamp() - layer_submit_wait_start);
             // ZINC_LAYER_DIAG_POS=<p>: dump the residual leaving each layer at
             // prompt position p, in the same format as decodeStep's dump, for
             // comparison with the reference eval-callback `l_out-N` row.
@@ -28563,7 +28564,7 @@ pub const InferenceEngine = struct {
         self.prefill_cpu_embed_ns = 0;
         self.prefill_cpu_record_ns = 0;
         self.prefill_submit_wait_ns = 0;
-        self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
+        self.prefill_gpu_phase_ns = @as([profile_phase_count]u64, @splat(0));
         self.prefill_gpu_total_ns = 0;
         self.prefill_active = true;
         defer self.prefill_active = false;
@@ -29000,8 +29001,8 @@ pub const InferenceEngine = struct {
         if (state.position == 0) {
             if (self.mtp) |*m| m.resident_context_len = 0;
         }
-        const mode = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse "";
-        const intel_batched_env = std.posix.getenv("ZINC_INTEL_BATCHED_PREFILL");
+        const mode = host_io.getenv("ZINC_BATCHED_PREFILL") orelse "";
+        const intel_batched_env = host_io.getenv("ZINC_INTEL_BATCHED_PREFILL");
         const cfg = self.model.config;
         const intel_dense_gemma_default =
             cfg.architecture == .gemma and
@@ -29145,7 +29146,7 @@ pub const InferenceEngine = struct {
         // `ZINC_BATCHED_PREFILL=0` to force the per-token fallback (escape
         // hatch for debugging / numerical-sensitivity testing); `=validate`
         // runs both paths and diffs the last-token logits.
-        const mode = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse "";
+        const mode = host_io.getenv("ZINC_BATCHED_PREFILL") orelse "";
         const batched_disabled = std.mem.eql(u8, mode, "0");
         const validate_mode = std.mem.eql(u8, mode, "validate");
         if (!batched_disabled and !validate_mode) {
@@ -29192,9 +29193,9 @@ pub const InferenceEngine = struct {
         self.prefill_cpu_embed_ns = 0;
         self.prefill_cpu_record_ns = 0;
         self.prefill_submit_wait_ns = 0;
-        self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
+        self.prefill_gpu_phase_ns = @as([profile_phase_count]u64, @splat(0));
         self.prefill_gpu_total_ns = 0;
-        const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
+        const profile_env = host_io.getenv("ZINC_PREFILL_PROFILE");
         const want_gpu_phases = profile_env != null and profile_env.?.len > 0 and !std.mem.eql(u8, profile_env.?, "0");
         const profile_was_enabled = self.profile_enabled;
         const prefill_active_was = self.prefill_active;
@@ -29228,7 +29229,7 @@ pub const InferenceEngine = struct {
             self.prefill_embed_big = try Buffer.initStaging(self.instance, total_embed_bytes);
             self.prefill_embed_big_capacity_bytes = total_embed_bytes;
         }
-        const cpu_embed_start = if (enable_gpu_phase_timing) std.time.nanoTimestamp() else 0;
+        const cpu_embed_start = if (enable_gpu_phase_timing) host_io.nanoTimestamp() else 0;
         {
             const big_f32: [*]f32 = @ptrCast(@alignCast(self.prefill_embed_big.?.mapped.?));
             const embd = self.tensor_map.get("token_embd.weight") orelse return error.TensorNotFound;
@@ -29272,7 +29273,7 @@ pub const InferenceEngine = struct {
             self.prefill_embed_big_token_count = n_tokens;
         }
         if (enable_gpu_phase_timing) {
-            const cpu_embed_end = std.time.nanoTimestamp();
+            const cpu_embed_end = host_io.nanoTimestamp();
             self.prefill_cpu_embed_ns = @intCast(cpu_embed_end - cpu_embed_start);
         }
 
@@ -29303,7 +29304,7 @@ pub const InferenceEngine = struct {
         // The final LM head below still uses dispatchDmmvInner on the last token.
         // FFN fallback below still uses dispatchFfnActivation after gate/up.
 
-        const cpu_record_start = if (enable_gpu_phase_timing) std.time.nanoTimestamp() else 0;
+        const cpu_record_start = if (enable_gpu_phase_timing) host_io.nanoTimestamp() else 0;
         try self.decode_cmd.reset();
         try self.decode_cmd.beginOneTime();
         if (enable_gpu_phase_timing) {
@@ -29872,13 +29873,13 @@ pub const InferenceEngine = struct {
         }
         try self.decode_cmd.end();
         if (enable_gpu_phase_timing) {
-            const cpu_record_end = std.time.nanoTimestamp();
+            const cpu_record_end = host_io.nanoTimestamp();
             self.prefill_cpu_record_ns = @intCast(cpu_record_end - cpu_record_start);
         }
-        const submit_wait_start = if (enable_gpu_phase_timing) std.time.nanoTimestamp() else 0;
+        const submit_wait_start = if (enable_gpu_phase_timing) host_io.nanoTimestamp() else 0;
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
         if (enable_gpu_phase_timing) {
-            const submit_wait_end = std.time.nanoTimestamp();
+            const submit_wait_end = host_io.nanoTimestamp();
             self.prefill_submit_wait_ns = @intCast(submit_wait_end - submit_wait_start);
             self.recordProfilingSample();
             for (0..profile_phase_count) |p| {
@@ -29972,7 +29973,7 @@ pub const InferenceEngine = struct {
         self.prefill_cpu_embed_ns = 0;
         self.prefill_cpu_record_ns = 0;
         self.prefill_submit_wait_ns = 0;
-        self.prefill_gpu_phase_ns = [_]u64{0} ** profile_phase_count;
+        self.prefill_gpu_phase_ns = @as([profile_phase_count]u64, @splat(0));
         self.prefill_gpu_total_ns = 0;
         self.prefill_active = true;
         if (self.use_qwen36_dense_prefill_validate) {
@@ -30037,7 +30038,7 @@ pub const InferenceEngine = struct {
         // on — it has zero GPU cost. When the flag is set, the caller also gets
         // a per-phase breakdown (attn/moe/shared/ssm/tail) plus MoE and SSM
         // sub-phase drill-downs, which is exactly what effort-6 Step 2 needs.
-        const profile_env = std.posix.getenv("ZINC_PREFILL_PROFILE");
+        const profile_env = host_io.getenv("ZINC_PREFILL_PROFILE");
         const want_gpu_phases = profile_env != null and profile_env.?.len > 0 and !std.mem.eql(u8, profile_env.?, "0");
         const had_profile_pool = self.timestamp_query_pool != null;
         const profile_was_enabled = self.profile_enabled;
@@ -30831,7 +30832,7 @@ pub const InferenceEngine = struct {
         // on the R9700 98304 of Qwen 3.8's 248320 rows is the measured sweet spot
         // (server 54.4 -> 54.8 tok/s; 65536 loses acceptance). Verification always scores all rows,
         // so this only affects acceptance, never correctness.
-        self.mtp_draft_vocab_rows = if (std.posix.getenv("ZINC_MTP_DRAFT_VOCAB")) |v|
+        self.mtp_draft_vocab_rows = if (host_io.getenv("ZINC_MTP_DRAFT_VOCAB")) |v|
             (std.fmt.parseInt(u32, v, 10) catch 0)
         else if (cfg.vocab_size > 160_000)
             98_304
@@ -31326,7 +31327,7 @@ pub const InferenceEngine = struct {
         const scratch_v = self.batched_scratch_v.?;
         const scratch_attn_out = self.batched_scratch_attn_out.?;
 
-        var tb_timer = try std.time.Timer.start();
+        var tb_timer = try host_io.Timer.start();
         // Chained cycle: rows 1.. were gathered on the device, and the seed row is
         // the one draft 1's embedToken left in embed_staging (prime_embed_staging
         // belongs to the deferred catch-up recorded earlier in this command
@@ -31519,7 +31520,7 @@ pub const InferenceEngine = struct {
     /// ZINC_MTP_PRIME_TRACE=1: submit and wait at each section boundary of the
     /// prime and log the section times (diagnostics; only when the prime owns
     /// its command buffer).
-    fn mtpPrimeTraceLap(self: *InferenceEngine, on: bool, timer: *std.time.Timer, label: []const u8) !void {
+    fn mtpPrimeTraceLap(self: *InferenceEngine, on: bool, timer: *host_io.Timer, label: []const u8) !void {
         if (!on) return;
         try self.decode_cmd.end();
         try self.decode_cmd.submitAndWait(self.instance.compute_queue);
@@ -31533,7 +31534,7 @@ pub const InferenceEngine = struct {
         const T: u32 = @intCast(tokens.len);
         if (T == 0) return;
         const trace = !cb_open and envFlagEnabled("ZINC_MTP_PRIME_TRACE", false);
-        var trace_timer = try std.time.Timer.start();
+        var trace_timer = try host_io.Timer.start();
         std.debug.assert(T <= mtp.prime_chunk_rows);
         const cfg = self.model.config;
         const hidden_dim = cfg.hidden_dim;
@@ -31724,7 +31725,7 @@ pub const InferenceEngine = struct {
         const hidden_dim = cfg.hidden_dim;
         const hidden_size = @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
         self.mtp_prime_capture_base = 0;
-        var timer = try std.time.Timer.start();
+        var timer = try host_io.Timer.start();
         var start: u32 = 0;
         while (start < N) {
             const chunk: u32 = @min(mtp.prime_chunk_rows, N - start);
@@ -31786,7 +31787,7 @@ pub const InferenceEngine = struct {
         const cfg = self.model.config;
         const hidden_dim = cfg.hidden_dim;
         const hidden_size = @as(vk.c.VkDeviceSize, hidden_dim) * @sizeOf(f32);
-        var timer = try std.time.Timer.start();
+        var timer = try host_io.Timer.start();
 
         // Row 0 of the capture is position `reused_prefix_len`, and the h feeding
         // it is the carried row from the resident context.
@@ -31809,7 +31810,7 @@ pub const InferenceEngine = struct {
         while (start < suffix_len) {
             const chunk: u32 = @min(mtp.prime_chunk_rows, suffix_len - start);
             const base = reused_prefix_len + start;
-            var chunk_timer = try std.time.Timer.start();
+            var chunk_timer = try host_io.Timer.start();
             try self.mtpRunNextnBatch(state, prompt_tokens[base .. base + chunk], base, .capture_prev, false);
             if (trace) log.info("NextN/MTP prime trace: [suffix] chunk of {d} rows {d:.1} ms (wall of mtpRunNextnBatch)", .{ chunk, @as(f64, @floatFromInt(chunk_timer.read())) / 1e6 });
             start += chunk;
@@ -31973,7 +31974,7 @@ pub const InferenceEngine = struct {
             break :blk if (gain3 > 0.13 * e2) @as(u32, 3) else @as(u32, 2);
         };
         const n_limit: u32 = @max(@as(u32, 1), @min(@min(max_drafts, mtp.hist_slots), want_drafts));
-        var timer = try std.time.Timer.start();
+        var timer = try host_io.Timer.start();
 
         // h_input <- pending_h (the target's normalized hidden preceding `seed`).
         {
@@ -32143,7 +32144,7 @@ pub const InferenceEngine = struct {
                 second_idx = @intCast(i);
             }
         }
-        if (std.posix.getenv("ZINC_LOG_TOPK")) |raw| {
+        if (host_io.getenv("ZINC_LOG_TOPK")) |raw| {
             if (!std.mem.eql(u8, raw, "0")) {
                 log.info("topk: top={d} logit={d:.3} second={d} logit={d:.3} margin={d:.3}", .{ max_idx, max_val, second_idx, second_val, max_val - second_val });
             }
@@ -32963,7 +32964,7 @@ const MtpVkState = struct {
 /// ZINC_MTP_PRIME_ROWS overrides.
 const mtp_prime_chunk_rows_default: u32 = 1024;
 fn mtpPrimeChunkRows() u32 {
-    const raw = std.posix.getenv("ZINC_MTP_PRIME_ROWS") orelse return mtp_prime_chunk_rows_default;
+    const raw = host_io.getenv("ZINC_MTP_PRIME_ROWS") orelse return mtp_prime_chunk_rows_default;
     const v = std.fmt.parseInt(u32, raw, 10) catch return mtp_prime_chunk_rows_default;
     return if (v == 0) mtp_prime_chunk_rows_default else v;
 }
@@ -32977,7 +32978,7 @@ const mtp_prefill_capture_max_rows: u32 = 32768;
 
 /// `mtp_prefill_capture_max_rows`, overridable with ZINC_MTP_CAPTURE_ROWS.
 fn mtpCaptureRowCap() u32 {
-    const v = std.posix.getenv("ZINC_MTP_CAPTURE_ROWS") orelse return mtp_prefill_capture_max_rows;
+    const v = host_io.getenv("ZINC_MTP_CAPTURE_ROWS") orelse return mtp_prefill_capture_max_rows;
     const parsed = std.fmt.parseInt(u32, v, 10) catch return mtp_prefill_capture_max_rows;
     return @max(@as(u32, 1), parsed);
 }
@@ -32999,12 +33000,12 @@ const small_batch_decode_max_queries: u32 = 4;
 const small_batch_decode_min_depth: u32 = 4096;
 
 fn envU32(name: []const u8, default: u32) u32 {
-    const raw = std.posix.getenv(name) orelse return default;
+    const raw = host_io.getenv(name) orelse return default;
     return std.fmt.parseInt(u32, raw, 10) catch default;
 }
 
 fn prefillAttnPairsBudget() u64 {
-    const raw = std.posix.getenv("ZINC_PREFILL_ATTN_PAIRS") orelse return 300_000_000;
+    const raw = host_io.getenv("ZINC_PREFILL_ATTN_PAIRS") orelse return 300_000_000;
     return std.fmt.parseInt(u64, raw, 10) catch 300_000_000;
 }
 
@@ -33016,12 +33017,12 @@ fn prefillAttnPairsBudget() u64 {
 /// extra gigabyte buys ~1% of prefill and costs ~15K tokens of context, since
 /// the context plan reserves this same figure.
 fn prefillScratchBudgetMb() u64 {
-    const raw = std.posix.getenv("ZINC_PREFILL_SCRATCH_MB") orelse return 1024;
+    const raw = host_io.getenv("ZINC_PREFILL_SCRATCH_MB") orelse return 1024;
     return std.fmt.parseInt(u64, raw, 10) catch 1024;
 }
 
 fn mtpDraftsFixedFromEnv() ?u32 {
-    const v = std.posix.getenv("ZINC_MTP_DRAFTS") orelse return 2;
+    const v = host_io.getenv("ZINC_MTP_DRAFTS") orelse return 2;
     if (std.ascii.eqlIgnoreCase(v, "auto")) return null;
     const parsed = std.fmt.parseInt(u32, v, 10) catch return 2;
     return @min(mtp_max_draft, @max(@as(u32, 1), parsed));
@@ -33160,9 +33161,9 @@ pub fn generate(
     // prefillBatched honors ZINC_BATCHED_PREFILL and falls through to
     // prefillBatch (per-token) when the env gate is off or the model
     // isn't on canUseBatchedPrefillRdna's supported slice.
-    const prefill_start = std.time.nanoTimestamp();
+    const prefill_start = host_io.nanoTimestamp();
     try engine.prefillBatched(&state, prompt_tokens);
-    const prefill_end = std.time.nanoTimestamp();
+    const prefill_end = host_io.nanoTimestamp();
     const prefill_ns: u64 = @intCast(prefill_end - prefill_start);
     const prefill_tok_per_sec = if (prefill_ns > 0 and prompt_tokens.len > 0)
         @as(f64, @floatFromInt(prompt_tokens.len)) * 1_000_000_000.0 / @as(f64, @floatFromInt(prefill_ns))
@@ -33211,9 +33212,9 @@ pub fn generate(
             // wrapper; use it when present to avoid double-counting child phases.
             var shared_wrapper_ns: u64 = 0;
             var shared_children_ns: u64 = 0;
-            inline for (@typeInfo(ProfilePhase).@"enum".fields) |f| {
-                const phase_val: ProfilePhase = @enumFromInt(f.value);
-                const v = engine.prefill_gpu_phase_ns[f.value];
+            inline for (std.enums.values(ProfilePhase)) |f| {
+                const phase_val: ProfilePhase = @fromBackingInt(@intCast(@backingInt(f)));
+                const v = engine.prefill_gpu_phase_ns[@backingInt(f)];
                 switch (phase_val) {
                     .attention => attn_ns += v,
                     .moe_routed => moe_ns += v,
@@ -33239,9 +33240,9 @@ pub fn generate(
             const dense_ffn_avg = to_ms(dense_ffn_ns) / samples_f;
             const tail_avg = to_ms(tail_ns) / samples_f;
             const embed_avg = to_ms(embed_ns) / samples_f;
-            inline for (@typeInfo(ProfilePhase).@"enum".fields) |f| {
-                const v = engine.prefill_gpu_phase_ns[f.value];
-                if (v > 0) log.info("Prefill GPU sub-phase {s}: {d:.1} ms total, {d:.3} ms/tok", .{ f.name, to_ms(v), to_ms(v) / samples_f });
+            inline for (std.enums.values(ProfilePhase)) |f| {
+                const v = engine.prefill_gpu_phase_ns[@backingInt(f)];
+                if (v > 0) log.info("Prefill GPU sub-phase {s}: {d:.1} ms total, {d:.3} ms/tok", .{ @tagName(f), to_ms(v), to_ms(v) / samples_f });
             }
             log.info(
                 "Prefill GPU phases: per-tok attn={d:.2} ms moe={d:.2} ms shared={d:.2} ms ssm={d:.2} ms dense_ffn={d:.2} ms tail={d:.2} ms embed={d:.3} ms | totals attn={d:.1} moe={d:.1} shared={d:.1} ssm={d:.1} dense_ffn={d:.1} tail={d:.1} embed={d:.1}",
@@ -33264,14 +33265,14 @@ pub fn generate(
             );
             // Drill-down inside the composite buckets so the next cycle can
             // target a named sub-phase instead of a top-level guess.
-            const attn_norm_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_norm)];
-            const attn_qkv_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_qkv)];
-            const attn_head_norms_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_head_norms)];
-            const attn_rope_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_rope)];
-            const attn_kv_write_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_kv_write)];
-            const attn_flash_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.flash_attn_kernel)];
-            const attn_o_proj_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_o_proj)];
-            const attn_post_norm_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.attention_post_norm)];
+            const attn_norm_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.attention_norm)];
+            const attn_qkv_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.attention_qkv)];
+            const attn_head_norms_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.attention_head_norms)];
+            const attn_rope_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.attention_rope)];
+            const attn_kv_write_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.attention_kv_write)];
+            const attn_flash_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.flash_attn_kernel)];
+            const attn_o_proj_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.attention_o_proj)];
+            const attn_post_norm_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.attention_post_norm)];
             log.info(
                 "Prefill attention subphases totals: norm={d:.1} qkv={d:.1} head_norms={d:.1} rope={d:.1} kv_write={d:.1} flash={d:.1} o_proj={d:.1} post_norm={d:.1} ms",
                 .{
@@ -33285,12 +33286,12 @@ pub fn generate(
                     to_ms(attn_post_norm_ns),
                 },
             );
-            const router_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_router)];
-            const topk_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_topk)];
-            const gate_up_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_gate_up)];
-            const swiglu_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_swiglu)];
-            const down_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_down)];
-            const weighted_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.moe_weighted_acc)];
+            const router_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.moe_router)];
+            const topk_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.moe_topk)];
+            const gate_up_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.moe_gate_up)];
+            const swiglu_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.moe_swiglu)];
+            const down_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.moe_down)];
+            const weighted_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.moe_weighted_acc)];
             log.info(
                 "Prefill MoE subphases totals: router={d:.1} topk={d:.1} gate_up={d:.1} swiglu={d:.1} down={d:.1} weighted_acc={d:.1} ms",
                 .{
@@ -33302,10 +33303,10 @@ pub fn generate(
                     to_ms(weighted_ns),
                 },
             );
-            const shared_proj_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.shared_proj)];
-            const shared_swiglu_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.shared_swiglu)];
-            const shared_down_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.shared_down)];
-            const shared_gate_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.shared_gate_acc)];
+            const shared_proj_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.shared_proj)];
+            const shared_swiglu_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.shared_swiglu)];
+            const shared_down_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.shared_down)];
+            const shared_gate_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.shared_gate_acc)];
             log.info(
                 "Prefill shared subphases totals: wrapper={d:.1} proj={d:.1} swiglu={d:.1} down={d:.1} gate_acc={d:.1} children_sum={d:.1} ms",
                 .{
@@ -33317,19 +33318,19 @@ pub fn generate(
                     to_ms(shared_children_ns),
                 },
             );
-            const ssm_proj_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj)];
-            const ssm_proj_norm_ab_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_norm_ab)];
-            const ssm_proj_qkv_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_qkv)];
-            const ssm_proj_z_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_z)];
-            const ssm_proj_alpha_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_alpha)];
-            const ssm_proj_beta_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_beta)];
-            const ssm_proj_qkv_z_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_proj_qkv_z)];
-            const ssm_conv_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_conv)];
-            const ssm_delta_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_delta)];
-            const ssm_gnorm_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_gated_norm)];
-            const ssm_out_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_out)];
-            const ssm_out_proj_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_out_proj)];
-            const ssm_out_residual_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.ssm_out_residual)];
+            const ssm_proj_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_proj)];
+            const ssm_proj_norm_ab_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_proj_norm_ab)];
+            const ssm_proj_qkv_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_proj_qkv)];
+            const ssm_proj_z_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_proj_z)];
+            const ssm_proj_alpha_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_proj_alpha)];
+            const ssm_proj_beta_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_proj_beta)];
+            const ssm_proj_qkv_z_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_proj_qkv_z)];
+            const ssm_conv_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_conv)];
+            const ssm_delta_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_delta)];
+            const ssm_gnorm_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_gated_norm)];
+            const ssm_out_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_out)];
+            const ssm_out_proj_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_out_proj)];
+            const ssm_out_residual_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.ssm_out_residual)];
             log.info(
                 "Prefill SSM subphases totals: proj={d:.1} norm_ab={d:.1} qkv={d:.1} z={d:.1} alpha={d:.1} beta={d:.1} qkv_z={d:.1} conv={d:.1} delta={d:.1} gnorm={d:.1} out={d:.1} out_proj={d:.1} out_resid={d:.1} ms",
                 .{
@@ -33348,21 +33349,21 @@ pub fn generate(
                     to_ms(ssm_out_residual_ns),
                 },
             );
-            const dense_gateup_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup)];
-            const dense_gate_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gate)];
-            const dense_up_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_up)];
-            const dense_down_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down)];
-            const dense_gateup_quant_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_quant)];
-            const dense_gateup_matmul_generic_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_matmul)];
-            const dense_gateup_matmul_q4_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_matmul_q4)];
-            const dense_gateup_matmul_q6_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_gateup_matmul_q6)];
+            const dense_gateup_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_gateup)];
+            const dense_gate_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_gate)];
+            const dense_up_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_up)];
+            const dense_down_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_down)];
+            const dense_gateup_quant_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_gateup_quant)];
+            const dense_gateup_matmul_generic_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_gateup_matmul)];
+            const dense_gateup_matmul_q4_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_gateup_matmul_q4)];
+            const dense_gateup_matmul_q6_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_gateup_matmul_q6)];
             const dense_gateup_matmul_ns = dense_gateup_matmul_generic_ns + dense_gateup_matmul_q4_ns + dense_gateup_matmul_q6_ns;
-            const dense_down_quant_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_quant)];
-            const dense_down_matmul_generic_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_matmul)];
-            const dense_down_matmul_q4_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_matmul_q4)];
-            const dense_down_matmul_q6_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_down_matmul_q6)];
+            const dense_down_quant_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_down_quant)];
+            const dense_down_matmul_generic_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_down_matmul)];
+            const dense_down_matmul_q4_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_down_matmul_q4)];
+            const dense_down_matmul_q6_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_down_matmul_q6)];
             const dense_down_matmul_ns = dense_down_matmul_generic_ns + dense_down_matmul_q4_ns + dense_down_matmul_q6_ns;
-            const dense_residual_ns = engine.prefill_gpu_phase_ns[@intFromEnum(ProfilePhase.dense_ffn_residual_acc)];
+            const dense_residual_ns = engine.prefill_gpu_phase_ns[@backingInt(ProfilePhase.dense_ffn_residual_acc)];
             log.info(
                 "Prefill dense_ffn subphases totals: gateup={d:.1} gate={d:.1} up={d:.1} down={d:.1} gateup_quant={d:.1} gateup_matmul={d:.1} (generic={d:.1} q4={d:.1} q6={d:.1}) down_quant={d:.1} down_matmul={d:.1} (generic={d:.1} q4={d:.1} q6={d:.1}) residual_acc={d:.1} ms",
                 .{
@@ -33484,7 +33485,7 @@ pub fn generate(
     // those logits instead of reprocessing the last prompt token — that would
     // duplicate its KV cache entry and shift the entire context.
     var generated: u32 = 0;
-    const decode_start = std.time.nanoTimestamp();
+    const decode_start = host_io.nanoTimestamp();
 
     // DEBUG probe (ZINC_MTP_DEBUG_DRAFT=1): after every real decode step draft
     // one token with the NextN block and score it against the next real token.
@@ -33507,9 +33508,9 @@ pub fn generate(
         if (stop.hit(first_token)) generated = effective_max_tokens; // stop early
         if (mtp_debug_draft and generated < effective_max_tokens) {
             try engine.mtpCaptureNormBufNow();
-            const t0 = std.time.nanoTimestamp();
+            const t0 = host_io.nanoTimestamp();
             mtp_dbg_pending = try engine.mtpDraftStep(&state, first_token, state.position);
-            mtp_dbg_ns += @intCast(std.time.nanoTimestamp() - t0);
+            mtp_dbg_ns += @intCast(host_io.nanoTimestamp() - t0);
             engine.mtp_capture_norm_to = engine.mtp.?.h_input_buf.handle;
         }
     }
@@ -33552,7 +33553,7 @@ pub fn generate(
             const tot = &engine.profile_total_counters.gpu_phase_ns;
             const ph = struct {
                 fn ms(t: *const [profile_phase_count]u64, phase: ProfilePhase) f64 {
-                    return @as(f64, @floatFromInt(t[@intFromEnum(phase)])) / 1e6;
+                    return @as(f64, @floatFromInt(t[@backingInt(phase)])) / 1e6;
                 }
             };
             log.info("NextN/MTP GPU phase totals (ms): gateup={d:.1} (q4={d:.1}) down={d:.1} (q4={d:.1} q6={d:.1} generic={d:.1}) ffn_resid={d:.1} | ssm proj={d:.1} norm_ab={d:.1} qkv={d:.1} z={d:.1} conv={d:.1} delta={d:.1} gnorm={d:.1} out_proj={d:.1} out_resid={d:.1} | attn={d:.1} qkv={d:.1} flash={d:.1} o_proj={d:.1}", .{
@@ -33584,7 +33585,7 @@ pub fn generate(
     const use_chain = engine.chainedDecodeAvailable() and !mtp_debug_draft;
     defer engine.chainDrain() catch {};
     while (generated < effective_max_tokens) : (generated += 1) {
-        const tok_start = std.time.nanoTimestamp();
+        const tok_start = host_io.nanoTimestamp();
 
         // Feed the last generated token as input
         const input_token = state.generated_tokens.items[state.generated_tokens.items.len - 1];
@@ -33600,9 +33601,9 @@ pub fn generate(
                 if (d == token) mtp_dbg_hits += 1;
             }
             if (!stop.hit(token) and generated + 1 < effective_max_tokens) {
-                const t0 = std.time.nanoTimestamp();
+                const t0 = host_io.nanoTimestamp();
                 mtp_dbg_pending = try engine.mtpDraftStep(&state, token, state.position);
-                mtp_dbg_ns += @intCast(std.time.nanoTimestamp() - t0);
+                mtp_dbg_ns += @intCast(host_io.nanoTimestamp() - t0);
             } else {
                 mtp_dbg_pending = null;
             }
@@ -33612,7 +33613,7 @@ pub fn generate(
             if (engine.logits_readback_enabled) dumpTop5Logits(engine, generated);
         }
 
-        const tok_end = std.time.nanoTimestamp();
+        const tok_end = host_io.nanoTimestamp();
         const tok_ms = @as(f64, @floatFromInt(@as(u64, @intCast(tok_end - tok_start)))) / 1_000_000.0;
         log.debug("decode[{d}]: token={d} pos={d} ({d:.1} ms)", .{
             generated, token, state.position, tok_ms,
@@ -33621,7 +33622,7 @@ pub fn generate(
         // Check for EOS token (read from GGUF metadata)
         if (stop.hit(token)) break;
     }
-    const decode_end = std.time.nanoTimestamp();
+    const decode_end = host_io.nanoTimestamp();
     if (mtp_debug_draft) {
         engine.mtp_capture_norm_to = null;
         log.info("NextN/MTP debug drafts: {d}/{d} matched the next real token ({d:.1}%), {d:.2} ms per draft step", .{
@@ -33949,7 +33950,7 @@ test "dequantRow Q4_K sub-block pairing: low nibble then high nibble" {
     // Bug found: sub-block pairing was (sp, sp+4) instead of (2*sp, 2*sp+1).
     // The correct layout processes 32 consecutive bytes at a time:
     //   first 32 outputs from low nibbles, next 32 from high nibbles.
-    var block: [144]u8 = [_]u8{0} ** 144;
+    var block: [144]u8 = @as([144]u8, @splat(0));
     // d = 1.0 as f16
     const d_bits = @as(u16, @bitCast(@as(f16, 1.0)));
     block[0] = @truncate(d_bits);
@@ -33982,7 +33983,7 @@ test "dequantRow Q5_K keeps GGML contiguous half ordering" {
     // Q5_K block: d[2] dmin[2] scales[12] qh[32] qs[128] = 176 bytes, 256 elements
     // GGML dequantizes each 64-element group as low-half first, then high-half:
     // for byte qs[l], low nibble → output[l], high nibble → output[32 + l].
-    var block: [176]u8 = [_]u8{0} ** 176;
+    var block: [176]u8 = @as([176]u8, @splat(0));
     // d = 1.0 as f16
     const d_bits = @as(u16, @bitCast(@as(f16, 1.0)));
     block[0] = @truncate(d_bits);
@@ -34012,7 +34013,7 @@ test "dequantRow Q8_0 correct scale and signed values" {
     // Q8_0 block: scale[2 bytes f16] + 32×i8 = 34 bytes per block of 32 elements
     // Bug found: wave32 subgroup lost half the dot product.
     // This tests the CPU dequant path (used for embeddings).
-    var block: [34]u8 = [_]u8{0} ** 34;
+    var block: [34]u8 = @as([34]u8, @splat(0));
     // scale = 0.5 as f16
     const scale_bits = @as(u16, @bitCast(@as(f16, 0.5)));
     block[0] = @truncate(scale_bits);
@@ -34071,7 +34072,7 @@ test "dequantRow F32 direct copy" {
 
 test "getScaleMinK4 low indices extract 6-bit fields" {
     // For j < 4: sc = scales[j] & 63, m = scales[j+4] & 63
-    var scales: [12]u8 = [_]u8{0} ** 12;
+    var scales: [12]u8 = @as([12]u8, @splat(0));
     scales[0] = 0xFF; // 0b11_111111 → sc = 63
     scales[4] = 0xC5; // 0b11_000101 → m = 5
 
@@ -34083,7 +34084,7 @@ test "getScaleMinK4 low indices extract 6-bit fields" {
 test "getScaleMinK4 high indices combine nibbles and top bits" {
     // For j >= 4: sc = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
     //             m  = (scales[j+4] >> 4)   | ((scales[j]   >> 6) << 4)
-    var scales: [12]u8 = [_]u8{0} ** 12;
+    var scales: [12]u8 = @as([12]u8, @splat(0));
     // j=4: sc uses scales[8] low nibble + scales[0] top 2 bits
     //       m uses scales[8] high nibble + scales[4] top 2 bits
     scales[0] = 0xC0; // top 2 bits = 0b11 → contributes 0b11_0000 = 48 to sc
@@ -34286,7 +34287,7 @@ test "delta-net zero state produces beta*v*(k.q) output" {
     // This verifies the core SSM math matches the CPU reference.
     const head_v_dim: usize = 4;
     const d_state: usize = 4;
-    var ssm_state = [_]f32{0} ** (head_v_dim * head_v_dim);
+    var ssm_state = @as([(head_v_dim * head_v_dim)]f32, @splat(0));
 
     const k_head = [_]f32{ 0.5, -0.3, 0.1, 0.7 };
     const v_head = [_]f32{ 1.0, -2.0, 0.5, 0.3 };

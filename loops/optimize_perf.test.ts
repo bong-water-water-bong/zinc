@@ -89,10 +89,10 @@ describe("zincCliArgs", () => {
 
 describe("formatCodexStreamLine", () => {
   test("formats shell command", () => {
-    const line = JSON.stringify({ type: "action", name: "shell", command: "zig build 2>&1" });
+    const line = JSON.stringify({ type: "action", name: "shell", command: "./scripts/zig.sh build 2>&1" });
     const out = formatCodexStreamLine(line);
     expect(out).toContain("shell");
-    expect(out).toContain("zig build");
+    expect(out).toContain("./scripts/zig.sh build");
   });
 
   test("formats file write", () => {
@@ -1366,7 +1366,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
         primaryMetricLabel: "prefill tok/s",
         benchmarkMethod: "long-context prefill on RDNA",
         referenceImplementations: [
-          { path: "/Users/zolotukhin/Workplace/llama.cpp", focus: "Vulkan backend" },
+          { path: "../llama.cpp", focus: "Vulkan backend" },
         ],
       },
     );
@@ -1392,12 +1392,12 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
         primaryMetricLabel: "prefill tok/s",
         benchmarkMethod: "long-context prefill on RDNA",
         referenceImplementations: [
-          { path: "/Users/zolotukhin/Workplace/llama.cpp", focus: "Vulkan backend" },
+          { path: "../llama.cpp", focus: "Vulkan backend" },
         ],
       },
     );
     expect(stalled).toContain("Reference Implementations on Disk");
-    expect(stalled).toContain("/Users/zolotukhin/Workplace/llama.cpp");
+    expect(stalled).toContain("../llama.cpp");
   });
 
   test("flag-on measurement rule is surfaced in the task block", () => {
@@ -1903,7 +1903,7 @@ describe("classifyCycleMetrics", () => {
     const m = classifyCycleMetrics(
       { ...baseCycle, description: "port llama.cpp mul_mat_vec_max_cols=8 specialization", selfAnalysis: "" },
       baseCycle.timestamp,
-      ["/Users/zolotukhin/Workplace/llama.cpp"],
+      ["../llama.cpp"],
     );
     expect(m.citedReference).toBe(true);
   });
@@ -2043,7 +2043,7 @@ describe("buildAgentPrompt pivot mode", () => {
         knownFlatCategories: ["barrier narrowing is flat"],
         structuralSwingIdeas: ["port llama.cpp 8-variant DMMV"],
         referenceImplementations: [
-          { path: "/Users/zolotukhin/Workplace/llama.cpp", focus: "Vulkan matmul" },
+          { path: "../llama.cpp", focus: "Vulkan matmul" },
         ],
         mode: "pivot",
       },
@@ -2135,7 +2135,7 @@ describe("formatLlamaCppComparison", () => {
 
 describe("extractOptimizePerfPidsFromPs", () => {
   const sample = [
-    " 47142 /Users/zolotukhin/.bun/bin/bun loops/optimize_perf.ts --effort 15 --model qwen3827b --agent claude --cycles 50",
+    " 47142 /opt/bun/bin/bun loops/optimize_perf.ts --effort 15 --model qwen3827b --agent claude --cycles 50",
     " 47140 zsh -lc bun loops/optimize_perf.ts --effort 15 --model qwen3827b --agent claude --cycles 50 2>&1 | tee log",
     " 47139 login -pflq zolotukhin /bin/zsh -lc bun loops/optimize_perf.ts",
     " 47137 SCREEN -dmS zinc_effort15_50 zsh -lc bun loops/optimize_perf.ts --effort 15 --model qwen3827b",

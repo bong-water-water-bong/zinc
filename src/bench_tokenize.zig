@@ -1,0 +1,67 @@
+//! CPU-only tokenizer benchmark; no tensor upload or GPU initialization.
+//! @section Tokenization
+//! Measures warmed prompt encoding against one GGUF vocabulary and verifies
+//! every timed token sequence against the initial result.
+const std = @import("std");
+const host_io = @import("host_io");
+const gguf = @import("model/gguf.zig");
+const Tokenizer = @import("model/tokenizer.zig").Tokenizer;
+
+/// Usage: zinc-tokenize-bench <model.gguf> <text-file> [runs].
+/// Parse the vocabulary once, warm it, then measure complete prompt encoding.
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    const allocator = process_init.gpa;
+    const args = try host_io.argsAlloc(allocator);
+    defer host_io.argsFree(allocator, args);
+    if (args.len < 3 or args.len > 4) {
+        std.debug.print("usage: zinc-tokenize-bench <model.gguf> <text-file> [runs]\n", .{});
+        return error.InvalidArguments;
+    }
+    const runs = if (args.len == 4) try std.fmt.parseInt(usize, args[3], 10) else 50;
+    if (runs == 0 or runs > 100_000) return error.InvalidRunCount;
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, args[1], .{});
+    defer file.close(host_io.io);
+    const stat = try file.stat(host_io.io);
+    const data = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(data);
+    var gf = try gguf.parseWithOptions(data, allocator, .{ .log_summary = false });
+    defer gf.deinit();
+    var tokenizer = try Tokenizer.initFromGGUF(&gf, allocator);
+    defer tokenizer.deinit();
+    const text = try std.Io.Dir.cwd().readFileAlloc(host_io.io, args[2], allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(text);
+    const reference = try tokenizer.encodePrompt(text, allocator);
+    defer allocator.free(reference);
+    for (0..3) |_| {
+        const ids = try tokenizer.encodePrompt(text, allocator);
+        defer allocator.free(ids);
+        if (!std.mem.eql(u32, reference, ids)) return error.NonDeterministicTokens;
+    }
+    const samples = try allocator.alloc(u64, runs);
+    defer allocator.free(samples);
+    var total: u128 = 0;
+    for (samples) |*sample| {
+        var timer = try host_io.Timer.start();
+        const ids = try tokenizer.encodePrompt(text, allocator);
+        sample.* = timer.read();
+        defer allocator.free(ids);
+        if (!std.mem.eql(u32, reference, ids)) return error.NonDeterministicTokens;
+        total += sample.*;
+    }
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    const median_ns = if (runs % 2 == 0)
+        @as(f64, @floatFromInt(samples[runs / 2 - 1])) / 2 + @as(f64, @floatFromInt(samples[runs / 2])) / 2
+    else
+        @as(f64, @floatFromInt(samples[runs / 2]));
+    var buffer: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &buffer);
+    try stdout.interface.print(
+        "{{\"zig\":\"{s}\",\"runs\":{d},\"bytes\":{d},\"tokens\":{d},\"token_hash\":\"{x}\",\"min_us\":{d:.3},\"median_us\":{d:.3},\"mean_us\":{d:.3}}}\n",
+        .{
+            @import("builtin").zig_version_string,                    runs,                                        text.len,          reference.len,
+            std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(reference)), @as(f64, @floatFromInt(samples[0])) / 1_000, median_ns / 1_000, @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(runs)) / 1_000,
+        },
+    );
+    try stdout.interface.flush();
+}

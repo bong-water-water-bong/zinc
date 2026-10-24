@@ -8,7 +8,7 @@ If you just want to run inference, see [Getting Started](/zinc/docs/getting-star
 
 | Tool | Version | What it does |
 |------|---------|-------------|
-| **Zig** | 0.15.2+ | Host compiler for all Zig source |
+| **Zig** | 0.17.0 | Host compiler for all Zig source |
 | **Bun** | Latest | TypeScript test runner, site builder, API benchmarks |
 | **glslc** | shaderc 2023.8 | Compiles GLSL compute shaders to SPIR-V (Linux Vulkan only) |
 | **Vulkan SDK** | 1.3+ | Runtime for AMD and Intel Arc GPU dispatch (Linux only) |
@@ -36,10 +36,10 @@ git clone https://github.com/zolotukhin/zinc.git
 cd zinc
 
 # Debug build (fast compile, slow runtime)
-zig build
+./scripts/zig.sh build
 
 # Release build (slow compile, fast runtime — use for benchmarking)
-zig build -Doptimize=ReleaseFast
+./scripts/zig.sh build -Doptimize=ReleaseFast
 ```
 
 The binary lands at `./zig-out/bin/zinc`. Shaders are compiled from `src/shaders/*.comp` to SPIR-V during the build.
@@ -48,13 +48,13 @@ The binary lands at `./zig-out/bin/zinc`. Shaders are compiled from `src/shaders
 
 ```bash
 # Full test suite (Zig unit tests + Bun TypeScript tests)
-zig build test
+./scripts/zig.sh build test
 
 # Just the TypeScript tests
 bun test
 
 # With integration smoke tests (requires a running server + model files)
-ZINC_API_BASE_URL=http://localhost:8080/v1 zig build test -Dfull-tests=true
+ZINC_API_BASE_URL=http://localhost:8080/v1 ./scripts/zig.sh build test -Dfull-tests=true
 ```
 
 The test suite covers:
@@ -225,7 +225,7 @@ Use the RDNA suite's server-vs-server path for headline comparisons. One-shot CL
 
 ```bash
 # Measure individual GPU kernel performance
-zig build hot-bench -Doptimize=ReleaseFast
+./scripts/zig.sh build hot-bench -Doptimize=ReleaseFast
 ./zig-out/bin/zinc-hot-bench --shader-dir zig-out/share/zinc/shaders
 ```
 

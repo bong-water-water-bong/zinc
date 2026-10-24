@@ -3,6 +3,7 @@
 //! ZINC still loads one model into memory at a time. This manager keeps the
 //! current engine/tokenizer/model bundle together and handles serialized swaps.
 const std = @import("std");
+const host_io = @import("host_io");
 const loader_mod = @import("../model/loader.zig");
 const tokenizer_mod = @import("../model/tokenizer.zig");
 const catalog_mod = @import("../model/catalog.zig");
@@ -99,7 +100,7 @@ pub const ModelManager = struct {
     gpu_config: gpu_detect.GpuConfig,
     vram_budget_bytes: u64,
     shader_dir: []const u8,
-    state_mutex: std.Thread.Mutex = .{},
+    state_mutex: host_io.Mutex = .{},
     gpu_process_lock: process_lock_mod.ProcessLock = .{},
     requested_context_length: ?u32 = null,
     current: ?*LoadedResources,
@@ -262,7 +263,7 @@ pub const ModelManager = struct {
         const active_display_name = if (self.current) |current| current.display_name else "none";
         const active_supports_thinking_toggle = if (self.current) |current| current.tokenizer.supportsThinkingToggle() else false;
 
-        var list: std.ArrayList(ModelSummary) = .{};
+        var list: std.ArrayList(ModelSummary) = .empty;
         defer list.deinit(allocator);
 
         for (catalog_mod.entries) |entry| {

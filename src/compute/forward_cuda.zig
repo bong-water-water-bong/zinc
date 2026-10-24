@@ -12,6 +12,7 @@
 //!
 //! @section Inference Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 const build_options = @import("build_options");
 const buffer = @import("../cuda/buffer.zig");
 const pipeline = @import("../cuda/pipeline.zig");
@@ -789,7 +790,7 @@ pub const ForwardCuda = struct {
     // `capturing` — and the expert id is read GPU-side from a device buffer (not a
     // push constant), so topology + push-constants stay invariant across steps. Set
     // only by `decodeBatch`.
-    batch_graph: [9]?*shim.CudaGraph = .{null} ** 9,
+    batch_graph: [9]?*shim.CudaGraph = @splat(null),
     batch_graph_on: bool = false,
     batch_graph_force: ?bool = null,
     // True when EVERY MoE layer's gate/up/down expert tensors have a GPU-side
@@ -1022,7 +1023,7 @@ pub const ForwardCuda = struct {
         }
         const d = Derived.from(model.config);
 
-        const src = try allocator.dupeZ(u8, KERNELS_CU);
+        const src = try allocator.dupeSentinel(u8, KERNELS_CU, 0);
         defer allocator.free(src);
 
         var pipes: Pipelines = undefined;
@@ -1276,83 +1277,83 @@ pub const ForwardCuda = struct {
         };
 
         if (comptime is_rocm) {
-            const fused_ffn = std.posix.getenv("ZINC_ROCM_FUSED_FFN");
+            const fused_ffn = host_io.getenv("ZINC_ROCM_FUSED_FFN");
             self.use_fused_decode_ffn = if (fused_ffn) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
             if (self.use_fused_decode_ffn) {
                 log.info("ROCm fused dense FFN: Q4_K gate/up/SwiGLU share one kernel", .{});
             }
-            const pair_reduce = std.posix.getenv("ZINC_ROCM_DECODE_PAIR_REDUCE");
+            const pair_reduce = host_io.getenv("ZINC_ROCM_DECODE_PAIR_REDUCE");
             self.use_decode_pair_reduce = if (pair_reduce) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const q4_pair_reduce = std.posix.getenv("ZINC_ROCM_Q4_PAIR_REDUCE");
+            const q4_pair_reduce = host_io.getenv("ZINC_ROCM_Q4_PAIR_REDUCE");
             self.use_q4_pair_reduce = if (q4_pair_reduce) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const decode_q8_ffn = std.posix.getenv("ZINC_ROCM_DECODE_Q8_FFN");
+            const decode_q8_ffn = host_io.getenv("ZINC_ROCM_DECODE_Q8_FFN");
             self.use_decode_q8_ffn = if (decode_q8_ffn) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const decode_q8_q6 = std.posix.getenv("ZINC_ROCM_DECODE_Q8_Q6");
+            const decode_q8_q6 = host_io.getenv("ZINC_ROCM_DECODE_Q8_Q6");
             self.use_decode_q8_q6 = if (decode_q8_q6) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const decode_q8_lm = std.posix.getenv("ZINC_ROCM_DECODE_Q8_LM");
+            const decode_q8_lm = host_io.getenv("ZINC_ROCM_DECODE_Q8_LM");
             self.use_decode_q8_lm = if (decode_q8_lm) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const decode_q8_q4 = std.posix.getenv("ZINC_ROCM_DECODE_Q8_Q4");
+            const decode_q8_q4 = host_io.getenv("ZINC_ROCM_DECODE_Q8_Q4");
             self.use_decode_q8_q4 = if (decode_q8_q4) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const decode_q8_q6_proj = std.posix.getenv("ZINC_ROCM_DECODE_Q8_Q6_PROJ");
+            const decode_q8_q6_proj = host_io.getenv("ZINC_ROCM_DECODE_Q8_Q6_PROJ");
             self.use_decode_q8_q6_proj = if (decode_q8_q6_proj) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const decode_q8_q5 = std.posix.getenv("ZINC_ROCM_DECODE_Q8_Q5");
+            const decode_q8_q5 = host_io.getenv("ZINC_ROCM_DECODE_Q8_Q5");
             self.use_decode_q8_q5 = if (decode_q8_q5) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const decode_q8_q4_pair = std.posix.getenv("ZINC_ROCM_DECODE_Q8_Q4_PAIR");
+            const decode_q8_q4_pair = host_io.getenv("ZINC_ROCM_DECODE_Q8_Q4_PAIR");
             self.use_decode_q8_q4_pair = if (decode_q8_q4_pair) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const argmax_v2 = std.posix.getenv("ZINC_ROCM_ARGMAX_V2");
+            const argmax_v2 = host_io.getenv("ZINC_ROCM_ARGMAX_V2");
             self.use_argmax_v2 = if (argmax_v2) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const decode_ssm_col_warp = std.posix.getenv("ZINC_ROCM_DECODE_SSM_COL_WARP");
+            const decode_ssm_col_warp = host_io.getenv("ZINC_ROCM_DECODE_SSM_COL_WARP");
             self.use_decode_ssm_col_warp = if (decode_ssm_col_warp) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const decode_ssm_fast = std.posix.getenv("ZINC_ROCM_DECODE_SSM_FAST");
+            const decode_ssm_fast = host_io.getenv("ZINC_ROCM_DECODE_SSM_FAST");
             self.use_decode_ssm_fast = if (decode_ssm_fast) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            const fused_ssm_f32 = std.posix.getenv("ZINC_ROCM_FUSED_SSM_F32");
+            const fused_ssm_f32 = host_io.getenv("ZINC_ROCM_FUSED_SSM_F32");
             self.use_fused_ssm_f32 = if (fused_ssm_f32) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
             if (self.use_fused_ssm_f32) {
                 log.info("ROCm fused SSM F32: alpha/beta projections share one kernel", .{});
             }
-            const fused_q4_pairs = std.posix.getenv("ZINC_ROCM_FUSED_Q4_PAIRS");
+            const fused_q4_pairs = host_io.getenv("ZINC_ROCM_FUSED_Q4_PAIRS");
             self.use_fused_q4_pairs = if (fused_q4_pairs) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
             if (self.use_fused_q4_pairs) {
                 log.info("ROCm fused Q4_K pairs: attention K/V and SSM qkv/gate share kernels", .{});
             }
-            const fused_attn = std.posix.getenv("ZINC_ROCM_FUSED_ATTN_FRONTEND");
+            const fused_attn = host_io.getenv("ZINC_ROCM_FUSED_ATTN_FRONTEND");
             self.use_fused_attn_frontend = if (fused_attn) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
             if (self.use_fused_attn_frontend) {
                 log.info("ROCm fused attention front-end: deinterleave, norm, RoPE, and KV write share one kernel", .{});
             }
-            const rms_q8 = std.posix.getenv("ZINC_ROCM_RMS_Q8");
+            const rms_q8 = host_io.getenv("ZINC_ROCM_RMS_Q8");
             self.use_rocm_rms_q8 = if (rms_q8) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
@@ -1448,7 +1449,7 @@ pub const ForwardCuda = struct {
         // gate below). qwen35-9b (4096) wins; qwen36-27b (5120) regresses.
         const dense_graph_max_embd: u32 = 4096;
         const graphs_supported = shim.cuda_graph_supported() != 0;
-        const graph_env = std.posix.getenv("ZINC_CUDA_GRAPH");
+        const graph_env = host_io.getenv("ZINC_CUDA_GRAPH");
         var graph_off = false;
         var graph_optin = false;
         if (graph_env) |e| {
@@ -1518,7 +1519,7 @@ pub const ForwardCuda = struct {
         // - Dense models stay OPT-IN (measured NEUTRAL-to-slightly-negative on a
         //   clean window — the dense batched step is already launch-collapsed): env
         //   must be set truthy.
-        const bg_env = std.posix.getenv("ZINC_BATCH_GRAPH");
+        const bg_env = host_io.getenv("ZINC_BATCH_GRAPH");
         const bg_falsey = if (bg_env) |v| (std.mem.eql(u8, v, "0") or
             std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
             std.ascii.eqlIgnoreCase(v, "no")) else false;
@@ -1581,23 +1582,23 @@ pub const ForwardCuda = struct {
         buffer.freeHost(self.host_tok);
         buffer.freeHost(self.host_tok_in);
         a.free(self.host_router_ids);
-        inline for (std.meta.fields(Pipelines)) |f| {
-            if (comptime std.mem.eql(u8, f.name, "dmmv")) {
+        inline for (@typeInfo(Pipelines).@"struct".field_names) |f| {
+            if (comptime std.mem.eql(u8, f, "dmmv")) {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "dmmv_fast")) {
+            } else if (comptime std.mem.eql(u8, f, "dmmv_fast")) {
                 for (&self.pipes.dmmv_fast) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "gemm")) {
+            } else if (comptime std.mem.eql(u8, f, "gemm")) {
                 for (&self.pipes.gemm) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q4k_btok")) {
+            } else if (comptime std.mem.eql(u8, f, "dmmv_q4k_btok")) {
                 for (&self.pipes.dmmv_q4k_btok) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q6k_btok")) {
+            } else if (comptime std.mem.eql(u8, f, "dmmv_q6k_btok")) {
                 for (&self.pipes.dmmv_q6k_btok) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q5k_btok")) {
+            } else if (comptime std.mem.eql(u8, f, "dmmv_q5k_btok")) {
                 for (&self.pipes.dmmv_q5k_btok) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q8_0_btok")) {
+            } else if (comptime std.mem.eql(u8, f, "dmmv_q8_0_btok")) {
                 for (&self.pipes.dmmv_q8_0_btok) |*p| pipeline.freePipeline(p);
             } else {
-                pipeline.freePipeline(&@field(self.pipes, f.name));
+                pipeline.freePipeline(&@field(self.pipes, f));
             }
         }
         self.* = undefined;
@@ -1886,7 +1887,7 @@ pub const ForwardCuda = struct {
         const ctx = self.ctx;
         const T: u32 = @intCast(tokens.len);
         const f4 = @sizeOf(f32);
-        const profile = std.posix.getenv("ZINC_PREFILL_PROFILE") != null;
+        const profile = host_io.getenv("ZINC_PREFILL_PROFILE") != null;
         var prof_attn: i64 = 0;
         var prof_ssm: i64 = 0;
         var prof_ffn: i64 = 0;
@@ -1896,13 +1897,13 @@ pub const ForwardCuda = struct {
         // On ROCm, Q4/Q5/Q6 use the native pre-quantized Q8 kernels: repeated
         // hipBLAS dequantization was slower on gfx1201. F32 (and Q8_0) still use
         // hipBLAS. CUDA keeps its established cuBLAS quant defaults.
-        self.use_cublas_q4 = self.use_cublas and !is_rocm and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ4") == null;
-        self.use_cublas_q5 = self.use_cublas and !is_rocm and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ5") == null;
-        self.use_cublas_q6 = self.use_cublas and !is_rocm and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
-        self.use_cublas_q8 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ8") == null;
+        self.use_cublas_q4 = self.use_cublas and !is_rocm and host_io.getenv("ZINC_BATCHED_CUBLAS_NOQ4") == null;
+        self.use_cublas_q5 = self.use_cublas and !is_rocm and host_io.getenv("ZINC_BATCHED_CUBLAS_NOQ5") == null;
+        self.use_cublas_q6 = self.use_cublas and !is_rocm and host_io.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
+        self.use_cublas_q8 = self.use_cublas and host_io.getenv("ZINC_BATCHED_CUBLAS_NOQ8") == null;
         // ROCm initializes this threshold to 1 because hipBLAS F32 projection
         // batching wins even on short prompts; CUDA retains its existing gate.
-        if (std.posix.getenv("ZINC_CUBLAS_MIN_T")) |mt| {
+        if (host_io.getenv("ZINC_CUBLAS_MIN_T")) |mt| {
             if (std.fmt.parseInt(u32, mt, 10)) |val| self.cublas_min_t = val else |_| {}
         }
         // Effort 29 T2: token-batched MoE FFN (qwen36). DEFAULT-ON; opt out to the
@@ -1933,16 +1934,16 @@ pub const ForwardCuda = struct {
         while (L < d.n_layers) : (L += 1) {
             if (profile) {
                 self.waitPending();
-                const t0 = std.time.milliTimestamp();
+                const t0 = host_io.milliTimestamp();
                 if (self.layer_is_attn[L]) {
                     try self.attentionLayerBatched(L, T, b, 0);
                 } else {
                     try self.ssmLayerBatched(L, T, b);
                 }
                 self.waitPending();
-                const dt0 = std.time.milliTimestamp() - t0;
+                const dt0 = host_io.milliTimestamp() - t0;
                 if (self.layer_is_attn[L]) prof_attn += dt0 else prof_ssm += dt0;
-                const t1 = std.time.milliTimestamp();
+                const t1 = host_io.milliTimestamp();
                 if (d.n_experts > 0) {
                     if (moe_batched and self.moeBatchedSupported(L)) {
                         try self.moeFfnBlockBatched(L, T, b);
@@ -1960,7 +1961,7 @@ pub const ForwardCuda = struct {
                     try self.ffnBlockBatched(L, T, b);
                 }
                 self.waitPending();
-                prof_ffn += std.time.milliTimestamp() - t1;
+                prof_ffn += host_io.milliTimestamp() - t1;
             } else {
                 if (self.layer_is_attn[L]) {
                     try self.attentionLayerBatched(L, T, b, 0);
@@ -2432,19 +2433,19 @@ pub const ForwardCuda = struct {
         // acceptance-adaptive 2/3 choice on all four suite prompts (server,
         // R9700). ZINC_MTP_ADAPT_C=<c> re-enables it: a third draft when
         // p1*p2*p3 > c*(1 + p1 + p1*p2).
-        const want_drafts: u32 = if (std.posix.getenv("ZINC_MTP_ADAPT_C") == null)
+        const want_drafts: u32 = if (host_io.getenv("ZINC_MTP_ADAPT_C") == null)
             @max(@as(u32, 1), envU32("ZINC_MTP_DRAFTS", mtp_default_drafts))
         else blk: {
             const m = &self.mtp.?;
             const e2 = 1.0 + m.ema_p1 + m.ema_p1 * m.ema_p2;
             const p3_est = if (m.p3_observed >= 8) m.ema_p3 else 0.9 * m.ema_p2;
-            const c: f32 = std.fmt.parseFloat(f32, std.posix.getenv("ZINC_MTP_ADAPT_C").?) catch 0.19;
+            const c: f32 = std.fmt.parseFloat(f32, host_io.getenv("ZINC_MTP_ADAPT_C").?) catch 0.19;
             break :blk if (m.ema_p1 * m.ema_p2 * p3_est > c * e2) @as(u32, 3) else @as(u32, 2);
         };
         const n_limit: u32 = @min(max_drafts, @min(mtp_max_draft, want_drafts));
         std.debug.assert(n_limit > 0);
 
-        var phase_timer = try std.time.Timer.start();
+        var phase_timer = try host_io.Timer.start();
         buffer.upload(self.ctx, &self.mtp.?.h_input, std.mem.sliceAsBytes(self.mtp.?.pending_h));
         var drafts: [mtp_max_draft]u32 = @splat(0);
         var n_drafted: u32 = 0;
@@ -2722,7 +2723,7 @@ pub const ForwardCuda = struct {
         const wnorm = self.layer(L, "ssm_norm.weight");
         const wout = self.layer(L, "ssm_out.weight");
 
-        const ssm_profile = std.posix.getenv("ZINC_SSM_PROFILE") != null;
+        const ssm_profile = host_io.getenv("ZINC_SSM_PROFILE") != null;
         var prof_pre: i64 = 0;
         var prof_post: i64 = 0;
 
@@ -2767,24 +2768,24 @@ pub const ForwardCuda = struct {
         self.conv_off[L] = (self.conv_off[L] + T) % (d.d_conv - 1);
 
         if (ssm_profile) {
-            const t0 = std.time.milliTimestamp();
+            const t0 = host_io.milliTimestamp();
             self.submit(cmd);
             self.waitPending();
-            prof_pre = std.time.milliTimestamp() - t0;
+            prof_pre = host_io.milliTimestamp() - t0;
         }
 
         // === Delta-net scan ===
         if (ssm_profile) cmd = try command.beginCommand(ctx);
-        const use_chunked = !self.capture_spec_state and std.posix.getenv("ZINC_SSM_CHUNKED") != null and
-            std.mem.eql(u8, std.posix.getenv("ZINC_SSM_CHUNKED").?, "1");
+        const use_chunked = !self.capture_spec_state and host_io.getenv("ZINC_SSM_CHUNKED") != null and
+            std.mem.eql(u8, host_io.getenv("ZINC_SSM_CHUNKED").?, "1");
         // Delta-net scan: warp-level kernel (no __syncthreads in hot loop).
         // FIXED (2026-06-30): warp kernel now computes S@k (row-wise) matching
         // the block kernel. Safe for all T values.
         // A/B toggle: ZINC_SSM_WARP=0 falls back to the block-reduce kernel.
         const use_warp = (self.capture_spec_state and !is_rocm) or
             (!self.capture_spec_state and !self.force_block_ssm and !use_chunked and
-                (std.posix.getenv("ZINC_SSM_WARP") == null or
-                    !std.mem.eql(u8, std.posix.getenv("ZINC_SSM_WARP").?, "0")));
+                (host_io.getenv("ZINC_SSM_WARP") == null or
+                    !std.mem.eql(u8, host_io.getenv("ZINC_SSM_WARP").?, "0")));
         const use_preprocessed = !use_chunked and !use_warp and d.d_state == d.head_v_dim and d.d_state <= 128 and ssmPreparedOn();
         const use_col_warp = use_preprocessed and ssmColWarpOn();
         if (ssm_profile and L == 0) log.info("SSM_PROFILE L0: prepared={}", .{use_preprocessed});
@@ -2879,10 +2880,10 @@ pub const ForwardCuda = struct {
         }
 
         if (ssm_profile) {
-            const t0 = std.time.milliTimestamp();
+            const t0 = host_io.milliTimestamp();
             self.submit(cmd);
             self.waitPending();
-            prof_scan = std.time.milliTimestamp() - t0;
+            prof_scan = host_io.milliTimestamp() - t0;
             cmd = try command.beginCommand(ctx);
         }
 
@@ -2897,10 +2898,10 @@ pub const ForwardCuda = struct {
         }
 
         if (ssm_profile) {
-            const t0 = std.time.milliTimestamp();
+            const t0 = host_io.milliTimestamp();
             self.submit(cmd);
             self.waitPending();
-            prof_post = std.time.milliTimestamp() - t0;
+            prof_post = host_io.milliTimestamp() - t0;
             if (L == 0)
                 log.info("SSM_PROFILE L0: pre={d}ms scan={d}ms post={d}ms (T={d})", .{ prof_pre, prof_scan, prof_post, T });
         } else {
@@ -3039,7 +3040,7 @@ pub const ForwardCuda = struct {
             envFlag("ZINC_MOE_Q5K_GATE_UP_GROUPED", true);
         const use_tc = self.use_tc_experts and (self.tc_experts_forced or T >= self.moe_tc_min_t) and
             ((wge.info.type_ == .q4_k and wue.info.type_ == .q4_k) or gate_up_q5k_grouped);
-        if (std.posix.getenv("ZINC_PREFILL_PROFILE") != null and L < 2) {
+        if (host_io.getenv("ZINC_PREFILL_PROFILE") != null and L < 2) {
             log.info("MoE layer {d}: gate={} up={} grouped={}", .{ L, wge.info.type_, wue.info.type_, use_tc });
         }
         if (use_tc) {
@@ -3066,8 +3067,8 @@ pub const ForwardCuda = struct {
             // gate (wge) + up (wue) are SEPARATE tensors (gemma fuses them) → per-expert
             // stride = the whole slice, base 0. A = the per-token ffn_norm row.
             if (comptime is_rocm) {
-                const use_m32 = route_tile == 16 and std.posix.getenv("ZINC_MOE_M32") != null;
-                const use_m64 = route_tile == 16 and !use_m32 and std.posix.getenv("ZINC_MOE_M64") != null;
+                const use_m32 = route_tile == 16 and host_io.getenv("ZINC_MOE_M32") != null;
+                const use_m64 = route_tile == 16 and !use_m32 and host_io.getenv("ZINC_MOE_M64") != null;
                 const use_direct = route_tile == 16 and !use_m32 and !use_m64 and envFlag("ZINC_MOE_DIRECT_A", is_rocm);
                 const grouped_pipe = if (gate_up_q5k_grouped)
                     (if (route_tile == 16) &self.pipes.gemm_q5k_experts_grouped_i8_t16 else &self.pipes.gemm_q5k_experts_grouped_i8)
@@ -3116,7 +3117,7 @@ pub const ForwardCuda = struct {
             else => null,
         } else null;
         const rocm_route16 = is_rocm and T < 512;
-        const rocm_down_m32 = rocm_route16 and std.posix.getenv("ZINC_MOE_M32") != null;
+        const rocm_down_m32 = rocm_route16 and host_io.getenv("ZINC_MOE_M32") != null;
         const rocm_down_pipe: ?*CudaPipeline = if (is_rocm and use_tc and moeDownTcOn()) switch (wde.info.type_) {
             .q5_k => if (rocm_down_m32)
                 &self.pipes.gemm_q5k_experts_grouped_i8_t16_m32
@@ -3231,9 +3232,9 @@ pub const ForwardCuda = struct {
         if (self.use_cublas and T >= self.cublas_min_t and
             ((idx == 0 and self.use_cublas_q4) or (idx == 1 and self.use_cublas_q5) or
                 (idx == 2 and self.use_cublas_q6) or (idx == 3 and self.use_cublas_q8))) return false;
-        const use_f16 = idx == 0 and std.posix.getenv("ZINC_PREFILL_F16") != null;
-        const use_mma = !use_f16 and idx == 0 and std.posix.getenv("ZINC_PREFILL_MMA") != null;
-        const use_dp4a = !use_f16 and !use_mma and idx == 0 and std.posix.getenv("ZINC_PREFILL_DP4A") != null;
+        const use_f16 = idx == 0 and host_io.getenv("ZINC_PREFILL_F16") != null;
+        const use_mma = !use_f16 and idx == 0 and host_io.getenv("ZINC_PREFILL_MMA") != null;
+        const use_dp4a = !use_f16 and !use_mma and idx == 0 and host_io.getenv("ZINC_PREFILL_DP4A") != null;
         return self.batch != null and T >= 32 and M >= 64 and !use_f16 and !use_mma and !use_dp4a and
             (idx == 0 or (is_rocm and (idx == 1 or idx == 2 or idx == 3))) and prefillQ8On();
     }
@@ -3404,15 +3405,15 @@ pub const ForwardCuda = struct {
         // ZINC_PREFILL_DP4A=1: DP4a int8 dot product.
         // ZINC_PREFILL_TC=0: opt out of Q4_K tensor-core (default on).
         // ZINC_PREFILL_Q8_TC=0: opt out of the Q8_0 tensor-core shared-expert path.
-        const use_f16 = idx == 0 and std.posix.getenv("ZINC_PREFILL_F16") != null;
-        const use_mma = !use_f16 and idx == 0 and std.posix.getenv("ZINC_PREFILL_MMA") != null;
-        const use_dp4a = !use_f16 and !use_mma and idx == 0 and std.posix.getenv("ZINC_PREFILL_DP4A") != null;
+        const use_f16 = idx == 0 and host_io.getenv("ZINC_PREFILL_F16") != null;
+        const use_mma = !use_f16 and idx == 0 and host_io.getenv("ZINC_PREFILL_MMA") != null;
+        const use_dp4a = !use_f16 and !use_mma and idx == 0 and host_io.getenv("ZINC_PREFILL_DP4A") != null;
         const use_q8 = !use_f16 and !use_mma and !use_dp4a and
             (idx == 0 or (is_rocm and (idx == 1 or idx == 2))) and prefillQ8On();
-        const use_lowsmem = !use_f16 and !use_mma and !use_dp4a and !use_q8 and idx == 0 and (std.posix.getenv("ZINC_PREFILL_LOWSMEM") == null or
-            !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_LOWSMEM").?, "0"));
-        const use_tc = !use_f16 and !use_dp4a and !use_lowsmem and idx == 0 and (std.posix.getenv("ZINC_PREFILL_TC") == null or
-            !std.mem.eql(u8, std.posix.getenv("ZINC_PREFILL_TC").?, "0"));
+        const use_lowsmem = !use_f16 and !use_mma and !use_dp4a and !use_q8 and idx == 0 and (host_io.getenv("ZINC_PREFILL_LOWSMEM") == null or
+            !std.mem.eql(u8, host_io.getenv("ZINC_PREFILL_LOWSMEM").?, "0"));
+        const use_tc = !use_f16 and !use_dp4a and !use_lowsmem and idx == 0 and (host_io.getenv("ZINC_PREFILL_TC") == null or
+            !std.mem.eql(u8, host_io.getenv("ZINC_PREFILL_TC").?, "0"));
 
         // Check for cached fp16 weight when ZINC_PREFILL_F16 is set
         if (use_f16) {
@@ -3676,7 +3677,7 @@ pub const ForwardCuda = struct {
         // f32 tile GEMM's regime). Independent of decode_mrow (btok owns B≤27). The
         // min-B is tunable for the A/B sweep (ZINC_SERVE_CUBLAS_MINB). `defer` clears
         // the live flag so a forced value never leaks past this call.
-        if (std.posix.getenv("ZINC_SERVE_CUBLAS_MINB")) |mb| {
+        if (host_io.getenv("ZINC_SERVE_CUBLAS_MINB")) |mb| {
             self.serve_cublas_min_b = std.fmt.parseInt(u32, mb, 10) catch self.serve_cublas_min_b;
         }
         self.serve_cublas = (B >= self.serve_cublas_min_b) and (self.serve_cublas_force orelse serveCublasOn());
@@ -3689,7 +3690,7 @@ pub const ForwardCuda = struct {
         self.serve_wcache_on = self.serve_cublas and (self.serve_wcache_force orelse serveWcacheOn());
         if (self.serve_wcache_on and self.serve_wcache == null) {
             self.serve_wcache = std.AutoHashMap(usize, CudaBuffer).init(self.allocator);
-            if (std.posix.getenv("ZINC_SERVE_WCACHE_MB")) |mb| {
+            if (host_io.getenv("ZINC_SERVE_WCACHE_MB")) |mb| {
                 if (std.fmt.parseInt(usize, mb, 10) catch null) |v| self.serve_wcache_cap = v * 1024 * 1024;
             }
         }
@@ -5025,7 +5026,7 @@ pub const ForwardCuda = struct {
         }
 
         // Debug: dump router state for first decode step at specific layers
-        if ((L == 0 or L == 3 or L == 39) and std.posix.getenv("ZINC_MOE_DEBUG") != null and !self.capturing) {
+        if ((L == 0 or L == 3 or L == 39) and host_io.getenv("ZINC_MOE_DEBUG") != null and !self.capturing) {
             self.waitPending();
             var logits: [256]f32 = undefined;
             buffer.download(ctx, &self.router_logits_buf, std.mem.sliceAsBytes(logits[0..d.n_experts]));
@@ -5108,7 +5109,7 @@ pub const ForwardCuda = struct {
         }
 
         // Debug: dump hidden state norm after MoE FFN
-        if ((L == 0 or L == 3 or L == 39) and std.posix.getenv("ZINC_MOE_DEBUG") != null and !self.capturing) {
+        if ((L == 0 or L == 3 or L == 39) and host_io.getenv("ZINC_MOE_DEBUG") != null and !self.capturing) {
             self.waitPending();
             var hidden_sample: [8]f32 = undefined;
             buffer.download(ctx, &self.hidden, std.mem.sliceAsBytes(hidden_sample[0..8]));
@@ -5489,7 +5490,7 @@ pub const ForwardCuda = struct {
 // Effort 28: the B==1 decodeBatch matvec fast path is default-ON (opt out
 // ZINC_BATCH_B1_MATVEC=0/off/false/no — the SAME env knob as the gemma path).
 fn b1MatvecOn() bool {
-    const v = std.posix.getenv("ZINC_BATCH_B1_MATVEC") orelse return true;
+    const v = host_io.getenv("ZINC_BATCH_B1_MATVEC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5504,7 +5505,7 @@ fn b1MatvecOn() bool {
 // the validated-better path the serving default; the serial decodeStep/prefill path
 // never sets decode_mrow → catalog correctness is unaffected by construction.
 fn mrowMatvecOn() bool {
-    const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return true;
+    const v = host_io.getenv("ZINC_BATCH_MROW") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5513,7 +5514,7 @@ fn mrowMatvecOn() bool {
 // ZINC_BATCH_MOE_SHARED=0/off/false/no) — it is token-identical, so unlike the
 // opt-in matvec levers it ships on. The env knob exists for the in-process A/B.
 fn moeSharedBatchedOn() bool {
-    const v = std.posix.getenv("ZINC_BATCH_MOE_SHARED") orelse return true;
+    const v = host_io.getenv("ZINC_BATCH_MOE_SHARED") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5532,14 +5533,14 @@ fn aliasRow(buf: *const CudaBuffer, t: u32, width: u32) !CudaBuffer {
 /// Effort 26 T0: cuBLAS dense-prefill GEMM defaults ON; opt out with
 /// ZINC_BATCHED_CUBLAS=0/off/false/no (the A/B kill-switch to the matvec path).
 fn cublasDefaultOn() bool {
-    const v = std.posix.getenv("ZINC_BATCHED_CUBLAS") orelse return true;
+    const v = host_io.getenv("ZINC_BATCHED_CUBLAS") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no"));
 }
 
 /// Pre-quantized activation GEMM is the measured ROCm default for Q4/Q5/Q6
 /// prefill. CUDA keeps it opt-in. ZINC_PREFILL_Q8 remains an A/B opt-out/opt-in.
 fn prefillQ8On() bool {
-    const v = std.posix.getenv("ZINC_PREFILL_Q8") orelse return is_rocm;
+    const v = host_io.getenv("ZINC_PREFILL_Q8") orelse return is_rocm;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5548,7 +5549,7 @@ fn prefillQ8On() bool {
 /// for Qwen3.8 Q4_K_M: they preserve greedy decode's arithmetic partition and
 /// beat the float btok verifier. The knobs remain available for clean A/Bs.
 fn mtpQ8On() bool {
-    const v = std.posix.getenv("ZINC_MTP_Q8") orelse return is_rocm;
+    const v = host_io.getenv("ZINC_MTP_Q8") orelse return is_rocm;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5565,7 +5566,7 @@ fn mtpDraftVocab(vocab: u32) u32 {
 
 fn mtpQ8TypeOn(idx: usize) bool {
     if (!mtpQ8On() or idx >= 4) return false;
-    const enabled = std.posix.getenv("ZINC_MTP_Q8_TYPES") orelse "012";
+    const enabled = host_io.getenv("ZINC_MTP_Q8_TYPES") orelse "012";
     return std.mem.indexOfScalar(u8, enabled, @as(u8, '0') + @as(u8, @intCast(idx))) != null;
 }
 
@@ -5573,7 +5574,7 @@ fn mtpQ8TypeOn(idx: usize) bool {
 /// token/head before the state-compatible block delta-net scan. Measured ROCm
 /// default; CUDA remains opt-in. ZINC_SSM_PREPARED is the A/B opt-out/opt-in.
 fn ssmPreparedOn() bool {
-    const v = std.posix.getenv("ZINC_SSM_PREPARED") orelse return is_rocm;
+    const v = host_io.getenv("ZINC_SSM_PREPARED") orelse return is_rocm;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5581,7 +5582,7 @@ fn ssmPreparedOn() bool {
 /// Four-column wave32 scan that preserves the block kernel's state layout and
 /// exact reduction order. Measured ROCm default; CUDA remains opt-in.
 fn ssmColWarpOn() bool {
-    const v = std.posix.getenv("ZINC_SSM_COL_WARP") orelse return is_rocm;
+    const v = host_io.getenv("ZINC_SSM_COL_WARP") orelse return is_rocm;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5589,7 +5590,7 @@ fn ssmColWarpOn() bool {
 /// One-reduction variant of the state-compatible column scan. This changes
 /// only floating-point association. Measured ROCm default; CUDA remains opt-in.
 fn ssmColWarpFastOn() bool {
-    const v = std.posix.getenv("ZINC_SSM_COL_WARP_FAST") orelse return is_rocm;
+    const v = host_io.getenv("ZINC_SSM_COL_WARP_FAST") orelse return is_rocm;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5597,7 +5598,7 @@ fn ssmColWarpFastOn() bool {
 /// Reuse one Q8 activation tile across adjacent projections with the same input
 /// (Q/K/V, QKV/Z, or gate/up). Exact-work-elimination ROCm default; CUDA opt-in.
 fn prefillQ8ReuseOn() bool {
-    const v = std.posix.getenv("ZINC_PREFILL_Q8_REUSE") orelse return is_rocm;
+    const v = host_io.getenv("ZINC_PREFILL_Q8_REUSE") orelse return is_rocm;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5605,7 +5606,7 @@ fn prefillQ8ReuseOn() bool {
 /// Coalesced wave-per-key prefill attention. Measured ROCm default; CUDA keeps
 /// the original reduction-order kernel unless explicitly enabled.
 fn prefillAttnV2On() bool {
-    const v = std.posix.getenv("ZINC_ATTN_V2") orelse return is_rocm;
+    const v = host_io.getenv("ZINC_ATTN_V2") orelse return is_rocm;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5613,7 +5614,7 @@ fn prefillAttnV2On() bool {
 /// Shape-specialized gfx12 Q8-WMMA token tiles derived from the reference MMQ
 /// strategy. Measured ROCm default; CUDA remains opt-in.
 fn prefillWmmaTilesOn() bool {
-    const v = std.posix.getenv("ZINC_PREFILL_WMMA_TILES") orelse return is_rocm;
+    const v = host_io.getenv("ZINC_PREFILL_WMMA_TILES") orelse return is_rocm;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5621,7 +5622,7 @@ fn prefillWmmaTilesOn() bool {
 /// Measured 80-column gfx12 WMMA tile for prompts in (48, 80]. ROCm default;
 /// retain a dedicated opt-out so future GPUs can compare the generic tile.
 fn prefillWmmaT80On() bool {
-    const v = std.posix.getenv("ZINC_PREFILL_WMMA_T80") orelse return is_rocm;
+    const v = host_io.getenv("ZINC_PREFILL_WMMA_T80") orelse return is_rocm;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5629,7 +5630,7 @@ fn prefillWmmaT80On() bool {
 /// Reuse exact short-prompt WMMA shapes for the final partial tile of a long
 /// prompt. Measured ROCm default; retain an opt-out for other gfx12 revisions.
 fn prefillWmmaTailOn() bool {
-    const v = std.posix.getenv("ZINC_PREFILL_WMMA_TAIL") orelse return is_rocm;
+    const v = host_io.getenv("ZINC_PREFILL_WMMA_TAIL") orelse return is_rocm;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5642,7 +5643,7 @@ fn prefillWmmaQ4DirectOn() bool {
 /// Q8_0 prefill tensor-core GEMM for shared-expert dense projections. DEFAULT-ON;
 /// opt out with ZINC_PREFILL_Q8_TC=0/off/false/no to fall back to gemm_q8_0_tiled_v2.
 fn q8TcLowsmemOn() bool {
-    const v = std.posix.getenv("ZINC_PREFILL_Q8_TC") orelse return true;
+    const v = host_io.getenv("ZINC_PREFILL_Q8_TC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5651,7 +5652,7 @@ fn q8TcLowsmemOn() bool {
 /// qwen35 short-core A/B on the 5090 regressed prefill versus the unfused
 /// lowsmem TC path.
 fn prefillGateUpSwigluOn() bool {
-    const v = std.posix.getenv("ZINC_PREFILL_GATE_UP_SWIGLU") orelse return false;
+    const v = host_io.getenv("ZINC_PREFILL_GATE_UP_SWIGLU") orelse return false;
     return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on") or
         std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes");
 }
@@ -5661,7 +5662,7 @@ fn prefillGateUpSwigluOn() bool {
 /// tile GEMM). Only engages for B > serve_cublas_min_b, so the production B==1
 /// decodeStep and the B≤27 btok serving path are untouched.
 fn serveCublasOn() bool {
-    const v = std.posix.getenv("ZINC_SERVE_CUBLAS") orelse return true;
+    const v = host_io.getenv("ZINC_SERVE_CUBLAS") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no"));
 }
 
@@ -5670,7 +5671,7 @@ fn serveCublasOn() bool {
 /// round-trip but costs ~3.5× the Q4_K bytes in VRAM (a serving batch-capacity
 /// trade), so unlike serve_cublas it does NOT default on.
 fn serveWcacheOn() bool {
-    const v = std.posix.getenv("ZINC_SERVE_WCACHE") orelse return false;
+    const v = host_io.getenv("ZINC_SERVE_WCACHE") orelse return false;
     return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on") or
         std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes");
 }
@@ -5678,7 +5679,7 @@ fn serveWcacheOn() bool {
 /// Effort 29 T2: token-batched qwen2-MoE prefill FFN. DEFAULT-ON; ZINC_QWEN_MOE_BATCHED=0
 /// opts out to the per-token loop (the A/B baseline arm).
 fn qwenMoeBatchedOn() bool {
-    const v = std.posix.getenv("ZINC_QWEN_MOE_BATCHED") orelse return true;
+    const v = host_io.getenv("ZINC_QWEN_MOE_BATCHED") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no"));
 }
 
@@ -5701,20 +5702,20 @@ fn q4kBtokV2On() bool {
 }
 
 fn envFlag(name: []const u8, default: bool) bool {
-    const value = std.posix.getenv(name) orelse return default;
+    const value = host_io.getenv(name) orelse return default;
     return !(std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "off") or
         std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "no"));
 }
 
 fn envU32(name: []const u8, default: u32) u32 {
-    const value = std.posix.getenv(name) orelse return default;
+    const value = host_io.getenv(name) orelse return default;
     return std.fmt.parseUnsigned(u32, std.mem.trim(u8, value, " \t\r\n"), 10) catch default;
 }
 
 /// T2 (qwen MoE port): grouped Tensor-core routed gate/up experts. DEFAULT-ON;
 /// opt out with ZINC_MOE_TC=0/off/false/no (the A/B kill-switch to the matvec).
 fn moeTcDefaultOn() bool {
-    const v = std.posix.getenv("ZINC_MOE_TC") orelse return true;
+    const v = host_io.getenv("ZINC_MOE_TC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5723,7 +5724,7 @@ fn moeTcDefaultOn() bool {
 /// experts at ANY T (bypass moe_tc_min_t) so validate_catalog can exercise the path
 /// with the short catalog prompt. Unset = default-on but T-gated; falsy = off.
 fn moeTcForced() bool {
-    const v = std.posix.getenv("ZINC_MOE_TC") orelse return false;
+    const v = host_io.getenv("ZINC_MOE_TC") orelse return false;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5732,7 +5733,7 @@ fn moeTcForced() bool {
 /// too (in addition to gate/up). DEFAULT-ON when the gate/up TC path runs; opt out
 /// with ZINC_MOE_DOWN_TC=0/off → down falls back to the matvec (the A/B baseline).
 fn moeDownTcOn() bool {
-    const v = std.posix.getenv("ZINC_MOE_DOWN_TC") orelse return true;
+    const v = host_io.getenv("ZINC_MOE_DOWN_TC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -5742,7 +5743,7 @@ fn moeDownTcOn() bool {
 /// opt out / A/B-isolate the Q6_K layers with ZINC_MOE_DOWN_Q6K_TC=0/off → they
 /// fall back to the matvec while Q5_K stays on TC.
 fn moeDownQ6kTcOn() bool {
-    const v = std.posix.getenv("ZINC_MOE_DOWN_Q6K_TC") orelse return true;
+    const v = host_io.getenv("ZINC_MOE_DOWN_Q6K_TC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }

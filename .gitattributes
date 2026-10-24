@@ -1,0 +1,7 @@
+# Tokenizer corpora include intentional trailing spaces, tabs and mixed line endings.
+docs/validation/zig-0.17/tokenizer-corpus/*.txt -text -whitespace
+docs/validation/zig-0.17-bpe/corpus/*.txt -text -whitespace
+
+# Keep generated measurement dumps collapsed during source review.
+docs/validation/zig-0.17/*.json* linguist-generated=true
+docs/validation/zig-0.17-bpe/*.json* linguist-generated=true

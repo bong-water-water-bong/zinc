@@ -1,0 +1,10 @@
+{
+  "complete": true,
+  "url": "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf",
+  "bytes": 1185376,
+  "expected_sha256": "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d",
+  "actual_sha256": "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d",
+  "native_probe_sha256": "508ba61ef6883a7ac835c29f7f237b147ac42c86cef36773835154c037eb98d1",
+  "certificate_validation": true,
+  "manifest_and_activation": true
+}

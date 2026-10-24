@@ -3,6 +3,7 @@
 //! This module translates an on-disk GGUF file into the normalized model
 //! configuration and uploaded tensors consumed by the inference runtime.
 const std = @import("std");
+const host_io = @import("host_io");
 const gguf = @import("gguf.zig");
 const config_mod = @import("config.zig");
 const vk = @import("../vulkan/vk.zig");
@@ -54,7 +55,7 @@ pub const LoadedTensor = struct {
 /// Mirror of the engine's `ZINC_MTP` switch (compute/forward.zig), read here so
 /// the loader can drop weights the engine will never bind.
 fn mtpWantedFromEnv() bool {
-    const raw = std.posix.getenv("ZINC_MTP") orelse return true;
+    const raw = host_io.getenv("ZINC_MTP") orelse return true;
     if (raw.len == 0) return true;
     return !(std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "off"));
 }
@@ -90,7 +91,7 @@ const OffloadOverride = enum { auto, force_on, force_off };
 ///   "0"/"false" → force off
 ///   anything else (or unset) → auto-decide based on fit
 fn readOffloadOverride() OffloadOverride {
-    const val = std.process.getEnvVarOwned(std.heap.page_allocator, "ZINC_OFFLOAD_MOE_EXPERTS") catch return .auto;
+    const val = host_io.getEnvVarOwned(std.heap.page_allocator, "ZINC_OFFLOAD_MOE_EXPERTS") catch return .auto;
     defer std.heap.page_allocator.free(val);
     if (std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true")) return .force_on;
     if (std.mem.eql(u8, val, "0") or std.mem.eql(u8, val, "false")) return .force_off;
@@ -180,7 +181,7 @@ pub const Model = struct {
     /// Memory-mapped GGUF file view.
     mmap_data: ?[]align(std.heap.page_size_min) const u8,
     /// File handle for mmap.
-    mmap_file: ?std.fs.File,
+    mmap_file: ?std.Io.File,
     /// Allocator for owned resources.
     allocator: std.mem.Allocator,
 
@@ -200,7 +201,7 @@ pub const Model = struct {
         }
         if (self.mmap_file) |f| {
             var file = f;
-            file.close();
+            file.close(host_io.io);
         }
 
         self.gguf_file.deinit();
@@ -372,7 +373,7 @@ fn extractConfigWithLogging(gf: *const gguf.GGUFFile, log_metadata: bool) ModelC
         if (gf.metadata.get(std.fmt.bufPrint(&key_buf, "{s}.rope.dimension_sections", .{prefix}) catch "")) |sections_val| {
             switch (sections_val) {
                 .array => |arr| {
-                    var vals: [8]u32 = [_]u32{0} ** 8;
+                    var vals: [8]u32 = @as([8]u32, @splat(0));
                     const n = @min(arr.len, vals.len);
                     for (arr[0..n], 0..) |item, i| vals[i] = item.asU32() orelse 0;
                     log.info("RoPE sections ({d}): [{d},{d},{d},{d},{d},{d},{d},{d}]", .{
@@ -495,17 +496,17 @@ fn extractConfig(gf: *const gguf.GGUFFile) ModelConfig {
 /// @param allocator Allocator used for the parsed metadata structures.
 /// @returns A ModelConfig derived from GGUF metadata without uploading tensors to the GPU.
 pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfig {
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, path, .{});
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const mmap_data = try std.posix.mmap(
         null,
         stat.size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -526,17 +527,17 @@ pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfi
 /// @param allocator Allocator used for the parsed GGUF metadata structures.
 /// @returns A `ModelInspection` with config and tensor/file size statistics.
 pub fn inspectModel(path: []const u8, allocator: std.mem.Allocator) !ModelInspection {
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, path, .{});
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const mmap_data = try std.posix.mmap(
         null,
         stat.size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -579,17 +580,17 @@ pub fn load(
     log.info("Loading model: {s}", .{path});
 
     // Open and memory-map the file
-    const file = try std.fs.cwd().openFile(path, .{});
-    errdefer file.close();
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, path, .{});
+    errdefer file.close(host_io.io);
 
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const file_size = stat.size;
     log.info("File size: {d} MB", .{file_size / (1024 * 1024)});
 
     const mmap_data = try std.posix.mmap(
         null,
         file_size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -608,7 +609,7 @@ pub fn load(
     }
 
     // Load tensors to GPU
-    var loaded_tensors: std.ArrayList(LoadedTensor) = .{};
+    var loaded_tensors: std.ArrayList(LoadedTensor) = .empty;
     errdefer {
         for (loaded_tensors.items) |*t| {
             var buf = t.gpu_buffer;
@@ -860,7 +861,7 @@ test "extractConfig defaults gemma4 attention scale to 1.0" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -885,7 +886,7 @@ test "extractConfig excludes appended NextN blocks from decoder layers" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -907,7 +908,7 @@ test "extractConfig uses max gemma4 head_count_kv array entry" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -939,7 +940,7 @@ test "extractConfig reads rope attention factor for gpt-oss YaRN models" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };

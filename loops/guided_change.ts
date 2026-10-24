@@ -546,7 +546,7 @@ function discoverModels(extraPaths: string[]): { id: string; path: string }[] {
 
 async function buildProject(): Promise<{ ok: boolean; output: string }> {
   console.log(clr("1;33", "  🔨 Building..."));
-  const build = await runCommand("zig", ["build"], { timeout: 120_000 });
+  const build = await runCommand("./scripts/zig.sh", ["build"], { timeout: 120_000 });
   if (build.exitCode !== 0) {
     console.log(clr("1;31", "  ❌ Build failed"));
     return { ok: false, output: build.stderr + build.stdout };
@@ -557,7 +557,7 @@ async function buildProject(): Promise<{ ok: boolean; output: string }> {
 
 async function runTests(): Promise<{ ok: boolean; output: string }> {
   console.log(clr("1;33", "  🧪 Testing..."));
-  const test = await runCommand("zig", ["build", "test"], { timeout: 120_000 });
+  const test = await runCommand("./scripts/zig.sh", ["build", "test"], { timeout: 120_000 });
   if (test.exitCode !== 0) {
     console.log(clr("1;31", "  ❌ Tests failed"));
     return { ok: false, output: test.stderr + test.stdout };
@@ -760,7 +760,7 @@ function buildAgentPrompt(
     "",
     "## Rules",
     "1. Do NOT modify src/vulkan/, loops/, or .env.",
-    "2. Zig 0.15.2 API: ArrayList is unmanaged (pass allocator to append/deinit).",
+    "2. Zig 0.17.0 API: ArrayList is unmanaged (pass allocator to append/deinit).",
     "3. MSL shaders use 'main0' as entry point (SPIRV-Cross convention).",
     "4. Metal push constants go in buffer[n_bufs] (see shim.m mtl_dispatch).",
     "5. All existing tests must continue passing.",

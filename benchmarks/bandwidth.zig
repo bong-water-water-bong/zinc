@@ -4,7 +4,7 @@
 // matrix sizes. Run on RDNA4 hardware to validate 90%+ utilization on
 // large matmuls.
 //
-// Usage: Compiled and run on the remote test node as part of `zig build bench`
+// Usage: Compiled and run on the remote test node as part of `./scripts/zig.sh build bench`
 // See build.zig for benchmark target configuration.
 
 const std = @import("std");
@@ -56,7 +56,7 @@ pub fn printResults(results: []const BenchResult) void {
     for (results) |r| {
         const status: []const u8 = if (r.utilization_pct >= 80.0) "PASS" else if (r.utilization_pct >= 60.0) "OK" else "LOW";
         log.info("{s}: M={d} K={d} {s} | {d}us | {d:.1} GB/s | {d:.1}% [{s}]", .{
-            r.name, r.M, r.K, r.quant_name, r.time_us,
+            r.name,           r.M,               r.K,    r.quant_name, r.time_us,
             r.bandwidth_gbps, r.utilization_pct, status,
         });
     }

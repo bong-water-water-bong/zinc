@@ -3,6 +3,7 @@
 //! Provides connection-level request parsing, JSON and SSE response helpers,
 //! and a TCP listener that hands off accepted connections to the route dispatcher.
 const std = @import("std");
+const host_io = @import("host_io");
 
 const log = std.log.scoped(.http);
 
@@ -17,7 +18,7 @@ const max_overflow_body_bytes = 16 * 1024 * 1024;
 /// and writing JSON, error, and SSE responses.
 pub const Connection = struct {
     /// Underlying TCP stream to the client.
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     /// Allocator used for per-connection allocations.
     allocator: std.mem.Allocator,
     /// Internal read buffer for request parsing (64 KiB). Holds headers plus
@@ -39,7 +40,7 @@ pub const Connection = struct {
         var total: usize = 0;
         var header_end: ?usize = null;
         while (total < self.read_buf.len) {
-            const n = self.stream.read(self.read_buf[total..]) catch |err| {
+            const n = host_io.readSocket(self.stream, self.read_buf[total..]) catch |err| {
                 if (total > 0) break;
                 return err;
             };
@@ -125,7 +126,7 @@ pub const Connection = struct {
                 @memcpy(owned[0..body_already], self.read_buf[hdr_end..total]);
                 var read_so_far: usize = body_already;
                 while (read_so_far < content_length) {
-                    const n = try self.stream.read(owned[read_so_far..]);
+                    const n = try host_io.readSocket(self.stream, owned[read_so_far..]);
                     if (n == 0) break;
                     read_so_far += n;
                 }
@@ -135,7 +136,7 @@ pub const Connection = struct {
             }
             var read_so_far: usize = 0;
             while (read_so_far < remaining) {
-                const n = try self.stream.read(self.read_buf[total + read_so_far .. total + read_so_far + remaining - read_so_far]);
+                const n = try host_io.readSocket(self.stream, self.read_buf[total + read_so_far .. total + read_so_far + remaining - read_so_far]);
                 if (n == 0) break;
                 read_so_far += n;
             }
@@ -168,8 +169,8 @@ pub const Connection = struct {
             else => "OK",
         };
         const header = std.fmt.bufPrint(&buf, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", .{ status, status_text, body.len }) catch return error.HeaderTooLarge;
-        try self.stream.writeAll(header);
-        try self.stream.writeAll(body);
+        var parts = [_][]const u8{ header, body };
+        try host_io.writeSocketVecAll(self.stream, &parts);
     }
 
     /// Send an OpenAI-format JSON error response.
@@ -187,8 +188,16 @@ pub const Connection = struct {
     /// After this call, use writeSseEvent to send individual events.
     /// @param self Active connection to write to.
     pub fn sendSseStart(self: *Connection) !void {
-        const header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n";
-        try self.stream.writeAll(header);
+        // Token updates are smaller than a TCP segment. Waiting for a delayed
+        // ACK before sending the next update adds latency visible to clients.
+        const enabled: c_int = 1;
+        if (std.c.setsockopt(self.stream.socket.handle, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &enabled, @sizeOf(c_int)) != 0) {
+            log.warn("TCP_NODELAY unavailable for SSE connection", .{});
+        }
+        // The connection worker serves one request, then closes the socket.
+        // Advertise that lifetime so clients do not pool a completed SSE socket.
+        const header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
+        try host_io.writeSocketAll(self.stream, header);
     }
 
     /// Write a single SSE event as a chunked transfer-encoding frame.
@@ -202,11 +211,8 @@ pub const Connection = struct {
         const event_suffix = "\n\n";
         const chunk_len = event_prefix.len + data.len + event_suffix.len;
         const size_str = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{chunk_len}) catch unreachable;
-        try self.stream.writeAll(size_str);
-        try self.stream.writeAll(event_prefix);
-        try self.stream.writeAll(data);
-        try self.stream.writeAll(event_suffix);
-        try self.stream.writeAll("\r\n");
+        var parts = [_][]const u8{ size_str, event_prefix, data, event_suffix ++ "\r\n" };
+        try host_io.writeSocketVecAll(self.stream, &parts);
     }
 
     /// Write a chunked SSE comment line (`: {text}\n\n`) to keep the connection alive.
@@ -218,18 +224,14 @@ pub const Connection = struct {
         var size_buf: [16]u8 = undefined;
         const chunk_len = ": ".len + text.len + "\n\n".len;
         const size_str = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{chunk_len}) catch unreachable;
-        try self.stream.writeAll(size_str);
-        try self.stream.writeAll(": ");
-        try self.stream.writeAll(text);
-        try self.stream.writeAll("\n\n\r\n");
+        var parts = [_][]const u8{ size_str, ": ", text, "\n\n\r\n" };
+        try host_io.writeSocketVecAll(self.stream, &parts);
     }
 
     /// Write the final SSE `[DONE]` event and send the chunked transfer terminator.
     /// @param self Active connection to write to.
     pub fn writeSseDone(self: *Connection) !void {
-        try self.writeSseEvent("[DONE]");
-        // Chunked terminator: 0\r\n\r\n
-        try self.stream.writeAll("0\r\n\r\n");
+        try host_io.writeSocketAll(self.stream, "e\r\ndata: [DONE]\n\n\r\n0\r\n\r\n");
     }
 
     /// Check whether the remote connection is definitively dead, to let a
@@ -250,17 +252,13 @@ pub const Connection = struct {
     /// @returns `true` only for a hard reset/refused/disconnected socket.
     pub fn isPeerClosed(self: *Connection) bool {
         var probe: [1]u8 = undefined;
-        _ = std.posix.recv(self.stream.handle, &probe, std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT) catch |err| {
-            return switch (err) {
-                error.ConnectionResetByPeer, error.ConnectionRefused, error.SocketNotConnected => true,
-                // No data pending (the common case on a healthy connection)
-                // or any other unexpected error: default to "not closed",
-                // matching this function's conservative contract.
-                error.WouldBlock => false,
-                else => false,
-            };
+        const result = std.c.recv(self.stream.socket.handle, &probe, probe.len, std.c.MSG.PEEK | std.c.MSG.DONTWAIT);
+        if (result >= 0) return false;
+        return switch (std.posix.errno(result)) {
+            .CONNRESET, .CONNREFUSED, .NOTCONN => true,
+            // No data pending and graceful half-closes remain ambiguous.
+            else => false,
         };
-        return false;
     }
 
     /// Close the underlying TCP stream and free any heap-allocated overflow
@@ -268,7 +266,7 @@ pub const Connection = struct {
     /// @param self Connection to close.
     pub fn close(self: *Connection) void {
         if (self.overflow_body) |body| self.allocator.free(body);
-        self.stream.close();
+        self.stream.close(host_io.io);
     }
 };
 
@@ -291,7 +289,7 @@ pub const Request = struct {
 /// Accepts connections and wraps them in Connection structs for request handling.
 pub const Server = struct {
     /// Underlying TCP listener.
-    listener: std.net.Server,
+    listener: std.Io.net.Server,
     /// Allocator passed to accepted connections.
     allocator: std.mem.Allocator,
 
@@ -300,8 +298,8 @@ pub const Server = struct {
     /// @param port TCP port to listen on.
     /// @returns A Server ready to accept connections.
     pub fn init(allocator: std.mem.Allocator, port: u16) !Server {
-        const address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
-        const listener = try address.listen(.{ .reuse_address = true });
+        const address: std.Io.net.IpAddress = .{ .ip4 = .unspecified(port) };
+        const listener = try address.listen(host_io.io, .{ .reuse_address = true });
         return Server{ .listener = listener, .allocator = allocator };
     }
 
@@ -309,14 +307,14 @@ pub const Server = struct {
     /// @param self Active server to accept on.
     /// @returns A new Connection wrapping the accepted TCP stream.
     pub fn accept(self: *Server) !Connection {
-        const conn = try self.listener.accept();
-        return Connection{ .stream = conn.stream, .allocator = self.allocator };
+        const stream = try self.listener.accept(host_io.io);
+        return Connection{ .stream = stream, .allocator = self.allocator };
     }
 
     /// Stop listening and release the server socket.
     /// @param self Server to tear down.
     pub fn deinit(self: *Server) void {
-        self.listener.deinit();
+        self.listener.deinit(host_io.io);
     }
 };
 
@@ -326,22 +324,82 @@ const Linger = extern struct {
     l_linger: i32,
 };
 
-fn loopbackPair() !struct { server: std.net.Stream, client: std.net.Stream } {
-    var listener = try std.net.Address.listen(
-        std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
-        .{ .reuse_address = true },
-    );
-    defer listener.deinit();
+fn loopbackPair() !struct { server: std.Io.net.Stream, client: std.Io.net.Stream } {
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try address.listen(host_io.io, .{ .reuse_address = true });
+    defer listener.deinit(host_io.io);
 
-    const client = try std.net.tcpConnectToAddress(listener.listen_address);
-    const accepted = try listener.accept();
-    return .{ .server = accepted.stream, .client = client };
+    const client = try listener.socket.address.connect(host_io.io, .{ .mode = .stream });
+    errdefer client.close(host_io.io);
+    const accepted = try listener.accept(host_io.io);
+    return .{ .server = accepted, .client = client };
+}
+
+test "SSE frames retain chunk lengths, Unicode payloads, comments and termination" {
+    const pair = try loopbackPair();
+    defer pair.server.close(host_io.io);
+    defer pair.client.close(host_io.io);
+    var conn = Connection{ .stream = pair.server, .allocator = std.testing.allocator };
+    try conn.writeSseEvent("π");
+    try conn.writeSseEvent("");
+    try conn.writeSseComment("alive");
+    try conn.writeSseDone();
+
+    const expected = "a\r\ndata: π\n\n\r\n8\r\ndata: \n\n\r\n9\r\n: alive\n\n\r\ne\r\ndata: [DONE]\n\n\r\n0\r\n\r\n";
+    var received: [expected.len]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < received.len) {
+        const n = try host_io.readSocket(pair.client, received[offset..]);
+        if (n == 0) return error.UnexpectedEof;
+        offset += n;
+    }
+    try std.testing.expectEqualStrings(expected, &received);
+}
+
+test "vectored JSON response completes a payload larger than the socket send buffer" {
+    const pair = try loopbackPair();
+    defer pair.server.close(host_io.io);
+    defer pair.client.close(host_io.io);
+    const send_buffer: c_int = 4096;
+    if (std.c.setsockopt(pair.server.socket.handle, std.c.SOL.SOCKET, std.c.SO.SNDBUF, &send_buffer, @sizeOf(c_int)) != 0)
+        return error.SetSockOptFailed;
+    const body = try std.testing.allocator.alloc(u8, 512 * 1024);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    const Task = struct {
+        conn: Connection,
+        body: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer self.conn.stream.shutdown(host_io.io, .send) catch {};
+            self.conn.sendJson(200, self.body) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var task = Task{ .conn = .{ .stream = pair.server, .allocator = std.testing.allocator }, .body = body };
+    const thread = try std.Thread.spawn(.{}, Task.run, .{&task});
+    defer thread.join();
+    var response: std.ArrayList(u8) = .empty;
+    defer response.deinit(std.testing.allocator);
+    var buffer: [8192]u8 = undefined;
+    var body_start: ?usize = null;
+    while (body_start == null or response.items.len < body_start.? + body.len) {
+        const n = try host_io.readSocket(pair.client, &buffer);
+        if (n == 0) return error.UnexpectedEof;
+        try response.appendSlice(std.testing.allocator, buffer[0..n]);
+        if (body_start == null) {
+            if (std.mem.indexOf(u8, response.items, "\r\n\r\n")) |end| body_start = end + 4;
+        }
+    }
+    try std.testing.expectEqualStrings(body, response.items[body_start.?..]);
 }
 
 test "isPeerClosed returns false on a healthy idle connection" {
     const pair = try loopbackPair();
-    defer pair.server.close();
-    defer pair.client.close();
+    defer pair.server.close(host_io.io);
+    defer pair.client.close(host_io.io);
 
     var conn = Connection{ .stream = pair.server, .allocator = std.testing.allocator };
     try std.testing.expect(!conn.isPeerClosed());
@@ -349,13 +407,14 @@ test "isPeerClosed returns false on a healthy idle connection" {
 
 test "isPeerClosed returns true after the peer sends a hard reset" {
     const pair = try loopbackPair();
-    defer pair.server.close();
+    defer pair.server.close(host_io.io);
 
     // SO_LINGER{on, 0} makes close() send RST instead of the usual
     // graceful FIN, giving an unambiguous "connection reset" signal.
     const linger = Linger{ .l_onoff = 1, .l_linger = 0 };
-    try std.posix.setsockopt(pair.client.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger));
-    pair.client.close();
+    if (std.c.setsockopt(pair.client.socket.handle, std.c.SOL.SOCKET, std.c.SO.LINGER, &linger, @sizeOf(Linger)) != 0)
+        return error.SetSockOptFailed;
+    pair.client.close(host_io.io);
 
     var conn = Connection{ .stream = pair.server, .allocator = std.testing.allocator };
     // The RST can take a moment to arrive on the loopback interface.
@@ -365,7 +424,7 @@ test "isPeerClosed returns true after the peer sends a hard reset" {
             closed = true;
             break;
         }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        host_io.sleep(1 * std.time.ns_per_ms);
     }
     try std.testing.expect(closed);
 }
@@ -384,12 +443,12 @@ test "isPeerClosed returns false on a graceful half-close (ambiguous case)" {
     // not — both branches agree. The sleep only makes the "FIN definitely
     // arrived" case explicit; it isn't required for the assertion to hold.
     const pair = try loopbackPair();
-    defer pair.server.close();
-    pair.client.close();
+    defer pair.server.close(host_io.io);
+    pair.client.close(host_io.io);
 
     var conn = Connection{ .stream = pair.server, .allocator = std.testing.allocator };
     try std.testing.expect(!conn.isPeerClosed()); // before the FIN necessarily arrives
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    host_io.sleep(20 * std.time.ns_per_ms);
     try std.testing.expect(!conn.isPeerClosed()); // after the FIN has definitely arrived
 }
 
@@ -398,8 +457,8 @@ test "Server struct size" {
 }
 
 test "Method enum has expected values" {
-    try std.testing.expect(@intFromEnum(Method.GET) != @intFromEnum(Method.POST));
-    try std.testing.expect(@intFromEnum(Method.OPTIONS) != @intFromEnum(Method.UNKNOWN));
+    try std.testing.expect(@backingInt(Method.GET) != @backingInt(Method.POST));
+    try std.testing.expect(@backingInt(Method.OPTIONS) != @backingInt(Method.UNKNOWN));
 }
 
 test "Connection struct has expected fields" {
@@ -415,21 +474,21 @@ test "Request struct stores method and path" {
     try std.testing.expectEqualStrings("{}", req.body);
 }
 
-fn sendRawRequest(client: std.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
+fn sendRawRequest(client: std.Io.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
     var header_buf: [256]u8 = undefined;
     const header = try std.fmt.bufPrint(
         &header_buf,
         "{s} {s} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n",
         .{ method, path, body.len },
     );
-    try client.writeAll(header);
-    try client.writeAll(body);
+    try host_io.writeSocketAll(client, header);
+    try host_io.writeSocketAll(client, body);
 }
 
 test "readRequest parses method, path, and a small body" {
     const pair = try loopbackPair();
-    defer pair.server.close();
-    defer pair.client.close();
+    defer pair.server.close(host_io.io);
+    defer pair.client.close(host_io.io);
 
     try sendRawRequest(pair.client, "POST", "/v1/chat/completions", "{\"model\":\"x\"}");
 
@@ -443,9 +502,9 @@ test "readRequest parses method, path, and a small body" {
 
 test "readRequest rejects a request with no header terminator" {
     const pair = try loopbackPair();
-    defer pair.server.close();
-    try pair.client.writeAll("GET /health HTTP/1.1\r\nHost: localhost\r\n");
-    pair.client.close();
+    defer pair.server.close(host_io.io);
+    try host_io.writeSocketAll(pair.client, "GET /health HTTP/1.1\r\nHost: localhost\r\n");
+    pair.client.close(host_io.io);
 
     var conn = Connection{ .stream = pair.server, .allocator = std.testing.allocator };
     try std.testing.expectError(error.MalformedRequest, conn.readRequest());
@@ -453,13 +512,13 @@ test "readRequest rejects a request with no header terminator" {
 
 test "readRequest rejects a body that is truncated by an early close" {
     const pair = try loopbackPair();
-    defer pair.server.close();
+    defer pair.server.close(host_io.io);
 
     var header_buf: [128]u8 = undefined;
     const header = try std.fmt.bufPrint(&header_buf, "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 100\r\n\r\n", .{});
-    try pair.client.writeAll(header);
-    try pair.client.writeAll("short body, not 100 bytes");
-    pair.client.close();
+    try host_io.writeSocketAll(pair.client, header);
+    try host_io.writeSocketAll(pair.client, "short body, not 100 bytes");
+    pair.client.close(host_io.io);
 
     var conn = Connection{ .stream = pair.server, .allocator = std.testing.allocator };
     try std.testing.expectError(error.MalformedRequest, conn.readRequest());
@@ -467,7 +526,7 @@ test "readRequest rejects a body that is truncated by an early close" {
 
 test "readRequest spills a body larger than the inline buffer onto the heap" {
     const pair = try loopbackPair();
-    defer pair.client.close();
+    defer pair.client.close(host_io.io);
 
     // Larger than the 64 KiB inline read_buf so it must take the overflow path.
     const body_len = 65536 + 4096;
@@ -476,7 +535,7 @@ test "readRequest spills a body larger than the inline buffer onto the heap" {
     @memset(body, 'a');
 
     const writer_thread = try std.Thread.spawn(.{}, struct {
-        fn run(client: std.net.Stream, b: []const u8) void {
+        fn run(client: std.Io.net.Stream, b: []const u8) void {
             sendRawRequest(client, "POST", "/v1/chat/completions", b) catch {};
         }
     }.run, .{ pair.client, body });
@@ -494,8 +553,8 @@ test "readRequest spills a body larger than the inline buffer onto the heap" {
 
 test "readRequest rejects a Content-Length beyond the overflow cap" {
     const pair = try loopbackPair();
-    defer pair.server.close();
-    defer pair.client.close();
+    defer pair.server.close(host_io.io);
+    defer pair.client.close(host_io.io);
 
     var header_buf: [128]u8 = undefined;
     const header = try std.fmt.bufPrint(
@@ -503,7 +562,7 @@ test "readRequest rejects a Content-Length beyond the overflow cap" {
         "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {d}\r\n\r\n",
         .{max_overflow_body_bytes + 1},
     );
-    try pair.client.writeAll(header);
+    try host_io.writeSocketAll(pair.client, header);
 
     var conn = Connection{ .stream = pair.server, .allocator = std.testing.allocator };
     try std.testing.expectError(error.RequestTooLarge, conn.readRequest());

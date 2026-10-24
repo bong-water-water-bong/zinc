@@ -21,7 +21,7 @@
 #   ZINC_MODELS  catalog gguf dir                 (default: ~/workspace/models)
 #   ZINC_NGEN    greedy tokens per run            (default: 160)
 #   ZINC_RUNS    runs per model (report best)     (default: 2)
-#   ZIG          zig binary                        (default: ~/zig-0.15.2/zig)
+#   ZIG          zig binary                        (default: ./scripts/zig.sh)
 #   ZINC_ONLY    space list of model names to run (default: all)
 set -u
 
@@ -37,7 +37,7 @@ declare -A GPU_DESC=(
 )
 
 GPUS=${ZINC_GPUS:-"5090 4090"}
-ZIG=${ZIG:-$HOME/zig-0.15.2/zig}
+ZIG=${ZIG:-./scripts/zig.sh}
 MD=${ZINC_MODELS:-$HOME/workspace/models}
 NGEN=${ZINC_NGEN:-160}
 RUNS=${ZINC_RUNS:-2}

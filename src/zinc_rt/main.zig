@@ -7,6 +7,7 @@
 //! planner lives in `zinc_rt.batching`; the CLI does not yet expose the HTTP
 //! server or end-to-end batched inference executor.
 const std = @import("std");
+const host_io = @import("host_io");
 const zinc_rt = @import("zinc_rt");
 const engine = zinc_rt.engine;
 const ring = zinc_rt.ring;
@@ -35,14 +36,15 @@ const CliOptions = struct {
 /// dispatches to the help, probe, prompt, or T-CPU smoke path.
 /// @returns Propagates any allocation, argument, or runtime error; exits
 /// with status 1 on argument or tier-parse failures.
-pub fn main() !void {
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
     const allocator = std.heap.page_allocator;
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try host_io.argsAlloc(allocator);
+    defer host_io.argsFree(allocator, args);
 
     const options = parseArgs(args) catch |err| {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr = std.fs.File.stderr().writerStreaming(&stderr_buffer);
+        var stderr = std.Io.File.stderr().writerStreaming(host_io.io, &stderr_buffer);
         try stderr.interface.print("error(zinc_rt): argument error: {s}\n", .{@errorName(err)});
         try stderr.interface.flush();
         std.process.exit(1);
@@ -60,7 +62,7 @@ pub fn main() !void {
 
     const tier = engine.tierFromEnv() catch |err| {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr = std.fs.File.stderr().writerStreaming(&stderr_buffer);
+        var stderr = std.Io.File.stderr().writerStreaming(host_io.io, &stderr_buffer);
         try stderr.interface.print("error(zinc_rt): invalid ZINC_RT_TIER: {s}\n", .{@errorName(err)});
         try stderr.interface.flush();
         std.process.exit(1);
@@ -80,7 +82,7 @@ pub fn main() !void {
     }
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     if (rt.tier == .t_cpu) {
         try stdout.interface.writeAll(
             "info(zinc_rt): M0 runtime initialized (tier=t_cpu); pass --prompt to run the T-CPU packet smoke path.\n",
@@ -101,7 +103,7 @@ pub fn main() !void {
 /// any node.
 fn runGpuProbe() !void {
     var stdout_buffer: [2048]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     const w = &stdout.interface;
 
     var boundary = zinc_rt.cs.TokenBoundary.initDefault() catch |e| {
@@ -111,7 +113,7 @@ fn runGpuProbe() !void {
     };
     defer boundary.deinit();
 
-    var out = [_]u32{0} ** 8;
+    var out = @as([8]u32, @splat(0));
     boundary.sgprTgidProbe(4, out[0..4]) catch |e| {
         try w.print("probe: TGID dispatch FAILED: {s}\n", .{@errorName(e)});
         try w.flush();
@@ -122,7 +124,7 @@ fn runGpuProbe() !void {
         .{ out[0], out[1], out[2], out[3] },
     );
 
-    var dump = [_]u32{0} ** 1024;
+    var dump = @as([1024]u32, @splat(0));
     boundary.sgprTgidDump(4, dump[0..]) catch |e| {
         try w.print("probe: TGID dump dispatch FAILED: {s}\n", .{@errorName(e)});
         try w.flush();
@@ -134,7 +136,7 @@ fn runGpuProbe() !void {
     while (c < 12) : (c += 1) {
         const ok = dump[c] == 0 and dump[16 + c] == 1 and dump[32 + c] == 2 and dump[48 + c] == 3;
         try w.print("probe:   cand s{d}: wg0={d} wg1={d} wg2={d} wg3={d}{s}\n", .{
-            8 + c, dump[c], dump[16 + c], dump[32 + c], dump[48 + c],
+            8 + c,                            dump[c], dump[16 + c], dump[32 + c], dump[48 + c],
             if (ok) " <== TGID HERE" else "",
         });
         if (ok and found < 0) found = @intCast(c);
@@ -160,8 +162,8 @@ fn runGpuProbe() !void {
     const g_cols: u32 = 64;
     const g_row_bytes: usize = (g_cols / 32) * 18; // 36
     var wbuf: [g_rows * 36]u8 = undefined;
-    var ginput: [g_cols]f32 = [_]f32{1.0} ** g_cols;
-    var goutput: [g_rows]f32 = [_]f32{0} ** g_rows;
+    var ginput: [g_cols]f32 = @as([g_cols]f32, @splat(1.0));
+    var goutput: [g_rows]f32 = @as([g_rows]f32, @splat(0));
     for (0..g_rows) |r| {
         const scale_f16: u16 = @bitCast(@as(f16, @floatFromInt(r + 1)));
         for (0..(g_cols / 32)) |b| {
@@ -248,7 +250,7 @@ fn optionTakesValue(arg: []const u8) bool {
 
 fn printHelp() !void {
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     try stdout.interface.writeAll(
         \\Usage: zinc -m model.gguf --prompt "Hello"
         \\       ZINC_RT_TIER=t2_umq zinc --probe-tier
@@ -267,14 +269,14 @@ fn printHelp() !void {
 
 fn runTierProbe(tier: engine.Tier) !void {
     var stdout_buffer: [2048]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     try printTierStartupAndSmoke(&stdout, tier);
     try stdout.interface.flush();
 }
 
 fn runPromptMode(rt: *const engine.Engine, options: CliOptions) !void {
     var stdout_buffer: [2048]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     try printTierStartupAndSmoke(&stdout, rt.tier);
     if (options.model_path) |model_path| {
         try stdout.interface.print("info(zinc_rt): Model: {s}\n", .{model_path});
@@ -354,7 +356,7 @@ fn runForwardPrompt(tier: engine.Tier, model_path: []const u8, prompt: []const u
     defer result.deinit(allocator);
 
     var stdout_buffer: [8192]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
 
     const prefill_tps = tokPerSec(prompt_tokens.len, result.prefill_ns);
     try stdout.interface.print("info(zinc_rt): Prompt tokens ({d}): {any}\n", .{
@@ -379,7 +381,7 @@ fn runForwardPrompt(tier: engine.Tier, model_path: []const u8, prompt: []const u
         ms_per_tok,
     });
 
-    var text_buf: std.ArrayList(u8) = .{};
+    var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(allocator);
     for (result.tokens) |token_id| {
         var dec_buf: [256]u8 = undefined;

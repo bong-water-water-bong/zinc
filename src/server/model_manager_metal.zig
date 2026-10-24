@@ -5,6 +5,7 @@
 //! information back into the OpenAI-compatible model-management endpoints.
 //! @section API Server
 const std = @import("std");
+const host_io = @import("host_io");
 const catalog_mod = @import("../model/catalog.zig");
 const config_mod = @import("../model/config.zig");
 const managed_mod = @import("../model/managed.zig");
@@ -100,7 +101,7 @@ pub const ModelManager = struct {
     device: *const MetalDevice,
     profile: []const u8,
     vram_budget_bytes: u64,
-    state_mutex: std.Thread.Mutex = .{},
+    state_mutex: host_io.Mutex = .{},
     gpu_process_lock: process_lock_mod.ProcessLock = .{},
     requested_context_length: ?u32 = null,
     current: ?*LoadedResources,
@@ -258,7 +259,7 @@ pub const ModelManager = struct {
         const active_display_name = if (self.current) |current| current.display_name else "none";
         const active_supports_thinking_toggle = if (self.current) |current| current.tokenizer.supportsThinkingToggle() else false;
 
-        var list: std.ArrayList(ModelSummary) = .{};
+        var list: std.ArrayList(ModelSummary) = .empty;
         defer list.deinit(allocator);
 
         for (catalog_mod.entries) |entry| {

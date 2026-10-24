@@ -3,6 +3,7 @@
 //! Each incoming API request maps to a Request that tracks its state
 //! through prefill, decode, and completion phases.
 const std = @import("std");
+const host_io = @import("host_io");
 
 const log = std.log.scoped(.request);
 
@@ -74,10 +75,10 @@ pub const Request = struct {
             .id = id,
             .state = .pending,
             .prompt_tokens = prompt_tokens,
-            .generated_tokens = .{},
+            .generated_tokens = .empty,
             .params = params,
             .slot_id = null,
-            .created_at_ns = std.time.nanoTimestamp(),
+            .created_at_ns = host_io.nanoTimestamp(),
             .first_token_ns = null,
             .allocator = allocator,
         };
@@ -103,7 +104,7 @@ pub const Request = struct {
     /// @param token Generated token ID to add.
     pub fn appendToken(self: *Request, token: u32) !void {
         if (self.first_token_ns == null) {
-            self.first_token_ns = std.time.nanoTimestamp();
+            self.first_token_ns = host_io.nanoTimestamp();
         }
         try self.generated_tokens.append(self.allocator, token);
     }
@@ -244,20 +245,20 @@ test "Request transition: from decoding, completed/failed/cancelled are valid" {
 }
 
 test "Request transition: completed is terminal, every transition is rejected" {
-    inline for (std.meta.fields(RequestState)) |f| {
-        try expectInvalidTransition(.completed, @field(RequestState, f.name));
+    inline for (std.enums.values(RequestState)) |f| {
+        try expectInvalidTransition(.completed, f);
     }
 }
 
 test "Request transition: cancelled is terminal, every transition is rejected" {
-    inline for (std.meta.fields(RequestState)) |f| {
-        try expectInvalidTransition(.cancelled, @field(RequestState, f.name));
+    inline for (std.enums.values(RequestState)) |f| {
+        try expectInvalidTransition(.cancelled, f);
     }
 }
 
 test "Request transition: failed is terminal, every transition is rejected" {
-    inline for (std.meta.fields(RequestState)) |f| {
-        try expectInvalidTransition(.failed, @field(RequestState, f.name));
+    inline for (std.enums.values(RequestState)) |f| {
+        try expectInvalidTransition(.failed, f);
     }
 }
 

@@ -5,6 +5,7 @@
 //! ServerState.generation_mutex; the batched prefill/decode dispatch loop is
 //! not wired yet.
 const std = @import("std");
+const host_io = @import("host_io");
 const Request = @import("request.zig").Request;
 const RequestState = @import("request.zig").RequestState;
 const GenerationParams = @import("request.zig").GenerationParams;
@@ -41,7 +42,7 @@ pub const Scheduler = struct {
         log.info("Scheduler ready: {d} slots", .{max_parallel});
         return .{
             .slots = slots,
-            .pending = .{},
+            .pending = .empty,
             .scratch = scratch,
             .max_parallel = max_parallel,
             .next_id = 1,
@@ -372,14 +373,14 @@ test "Scheduler concurrent enqueue under external mutex assigns unique slots" {
     const N: u32 = 6;
     const Ctx = struct {
         sched: *Scheduler,
-        mutex: *std.Thread.Mutex,
+        mutex: *host_io.Mutex,
         fn run(self: *@This()) void {
             self.mutex.lock();
             defer self.mutex.unlock();
             _ = self.sched.enqueue(&.{ 1, 2, 3 }, .{ .max_tokens = 4 }) catch {};
         }
     };
-    var mutex = std.Thread.Mutex{};
+    var mutex = host_io.Mutex{};
     var ctx = Ctx{ .sched = &sched, .mutex = &mutex };
 
     var threads: [N]std.Thread = undefined;
@@ -389,7 +390,7 @@ test "Scheduler concurrent enqueue under external mutex assigns unique slots" {
     try std.testing.expectEqual(@as(usize, N), sched.pending.items.len);
     try std.testing.expectEqual(@as(u64, N + 1), sched.next_id);
     // Ids are exactly the set {1..N}, each once.
-    var seen = [_]bool{false} ** (N + 1);
+    var seen = @as([(N + 1)]bool, @splat(false));
     for (sched.pending.items) |req| {
         try std.testing.expect(req.id >= 1 and req.id <= N);
         try std.testing.expect(!seen[req.id]);

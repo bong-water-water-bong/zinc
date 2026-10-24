@@ -5,6 +5,7 @@
 //! with assets under `zig-out` or `src/shaders`. This module centralizes that
 //! lookup and keeps backend code from hardcoding source-checkout paths.
 const std = @import("std");
+const host_io = @import("host_io");
 
 /// Which compiled shader family to locate.
 pub const ShaderKind = enum {
@@ -35,11 +36,11 @@ const metal_cwd_candidates = [_][]const u8{
 /// @note Returns `error.ShaderDirOverrideNotFound` when the override is set but absent,
 ///   or `error.ShaderDirNotFound` when no known layout exists.
 pub fn resolveShaderDir(allocator: std.mem.Allocator, kind: ShaderKind) ![]u8 {
-    if (std.posix.getenv("ZINC_SHADER_DIR")) |override| {
-        if (!dirExists(std.fs.cwd(), override)) return error.ShaderDirOverrideNotFound;
+    if (host_io.getenv("ZINC_SHADER_DIR")) |override| {
+        if (!dirExists(std.Io.Dir.cwd(), override)) return error.ShaderDirOverrideNotFound;
         return allocator.dupe(u8, override);
     }
-    return resolveShaderDirFrom(allocator, std.fs.cwd(), null, kind);
+    return resolveShaderDirFrom(allocator, std.Io.Dir.cwd(), null, kind);
 }
 
 /// Resolve the shader directory against explicit base/exe dirs — the testable core of `resolveShaderDir`.
@@ -54,7 +55,7 @@ pub fn resolveShaderDir(allocator: std.mem.Allocator, kind: ShaderKind) ![]u8 {
 /// @note Returns `error.ShaderDirNotFound` when no known layout exists.
 pub fn resolveShaderDirFrom(
     allocator: std.mem.Allocator,
-    base_dir: std.fs.Dir,
+    base_dir: std.Io.Dir,
     exe_dir_override: ?[]const u8,
     kind: ShaderKind,
 ) ![]u8 {
@@ -84,7 +85,7 @@ fn exeRelativeShaderDir(
         return try exeRelativeShaderDirFromExeDir(allocator, kind, exe_dir);
     }
 
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try std.process.executablePathAlloc(host_io.io, allocator);
     defer allocator.free(exe_path);
     const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
     return try exeRelativeShaderDirFromExeDir(allocator, kind, exe_dir);
@@ -100,22 +101,22 @@ fn exeRelativeShaderDirFromExeDir(
         .metal => try std.fs.path.join(allocator, &.{ exe_dir, "..", "share", "zinc", "shaders", "metal" }),
     };
     errdefer allocator.free(dir);
-    if (dirExists(std.fs.cwd(), dir)) {
+    if (dirExists(std.Io.Dir.cwd(), dir)) {
         return dir;
     }
     allocator.free(dir);
     return null;
 }
 
-fn dirExists(base_dir: std.fs.Dir, path: []const u8) bool {
+fn dirExists(base_dir: std.Io.Dir, path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
-        var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
-        dir.close();
+        var dir = std.Io.Dir.openDirAbsolute(host_io.io, path, .{}) catch return false;
+        dir.close(host_io.io);
         return true;
     }
 
-    var dir = base_dir.openDir(path, .{}) catch return false;
-    dir.close();
+    var dir = base_dir.openDir(host_io.io, path, .{}) catch return false;
+    dir.close(host_io.io);
     return true;
 }
 
@@ -123,7 +124,7 @@ test "resolveShaderDirFrom finds SPIR-V cwd candidate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("zig-out/share/zinc/shaders");
+    try tmp.dir.createDirPath(host_io.io, "zig-out/share/zinc/shaders");
 
     const result = try resolveShaderDirFrom(std.testing.allocator, tmp.dir, "/nonexistent", .spirv);
     defer std.testing.allocator.free(result);
@@ -135,7 +136,7 @@ test "resolveShaderDirFrom finds Metal cwd candidate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("share/zinc/shaders/metal");
+    try tmp.dir.createDirPath(host_io.io, "share/zinc/shaders/metal");
 
     const result = try resolveShaderDirFrom(std.testing.allocator, tmp.dir, "/nonexistent", .metal);
     defer std.testing.allocator.free(result);
@@ -147,10 +148,10 @@ test "resolveShaderDirFrom falls back to SPIR-V exe-relative layout" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("install/bin");
-    try tmp.dir.makePath("install/share/zinc/shaders");
+    try tmp.dir.createDirPath(host_io.io, "install/bin");
+    try tmp.dir.createDirPath(host_io.io, "install/share/zinc/shaders");
 
-    const bin_dir = try tmp.dir.realpathAlloc(std.testing.allocator, "install/bin");
+    const bin_dir = try tmp.dir.realPathFileAlloc(host_io.io, "install/bin", std.testing.allocator);
     defer std.testing.allocator.free(bin_dir);
 
     var empty = std.testing.tmpDir(.{});
@@ -166,10 +167,10 @@ test "resolveShaderDirFrom falls back to Metal exe-relative layout" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("install/bin");
-    try tmp.dir.makePath("install/share/zinc/shaders/metal");
+    try tmp.dir.createDirPath(host_io.io, "install/bin");
+    try tmp.dir.createDirPath(host_io.io, "install/share/zinc/shaders/metal");
 
-    const bin_dir = try tmp.dir.realpathAlloc(std.testing.allocator, "install/bin");
+    const bin_dir = try tmp.dir.realPathFileAlloc(host_io.io, "install/bin", std.testing.allocator);
     defer std.testing.allocator.free(bin_dir);
 
     var empty = std.testing.tmpDir(.{});

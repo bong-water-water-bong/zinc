@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.17.0"
 
 jobs:
   validate:
@@ -67,11 +67,11 @@ jobs:
           bun-version: latest
 
       - name: Run tests
-        run: zig build test --summary all
+        run: ./scripts/zig.sh build test --summary all
 
       - name: Build release configuration
         run: |
-          zig build \
+          ./scripts/zig.sh build \
             -Doptimize=ReleaseFast \
             -Dbackend=vulkan \
             -Dshaders=true \
@@ -115,7 +115,7 @@ jobs:
 
       - name: Build
         run: |
-          zig build \
+          ./scripts/zig.sh build \
             -Dtarget=x86_64-linux-gnu \
             -Doptimize=ReleaseFast \
             -Dbackend=vulkan \
@@ -162,7 +162,7 @@ jobs:
 
       - name: Build
         run: |
-          zig build \
+          ./scripts/zig.sh build \
             -Dtarget=aarch64-macos \
             -Doptimize=ReleaseFast \
             -Dbackend=metal \

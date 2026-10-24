@@ -36,7 +36,7 @@
 #                  batched  -> ZINC_BATCHED_PREFILL=1 (Effort 24 batched-GEMM
 #                              prefill; gemma dense only — qwen/MoE fall back to
 #                              per-token so the "S" path == baseline there)
-#   ZIG          zig binary              (default ~/zig-0.15.2/zig)
+#   ZIG          zig binary              (default ./scripts/zig.sh)
 set -u
 
 declare -A GPU_UUID=(
@@ -44,7 +44,7 @@ declare -A GPU_UUID=(
   [4090]="${ZINC_GPU_4090:-}"
 )
 GPUS=${ZINC_GPUS:-"4090"}
-ZIG=${ZIG:-$HOME/zig-0.15.2/zig}
+ZIG=${ZIG:-./scripts/zig.sh}
 MD=${ZINC_MODELS:-$HOME/workspace/models}
 PROMPT_LEN=${ZINC_PROMPT:-250}
 NGEN=${ZINC_NGEN:-8}

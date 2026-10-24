@@ -6,26 +6,28 @@
 //! Usage: zinc-tokenize <model.gguf> <text-file>
 //! @section Tokenization
 const std = @import("std");
+const host_io = @import("host_io");
 const gguf = @import("model/gguf.zig");
 const tokenizer_mod = @import("model/tokenizer.zig");
 
 /// Entry point: `zinc-tokenize <model.gguf> <text-file>`.
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    var gpa: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try host_io.argsAlloc(allocator);
+    defer host_io.argsFree(allocator, args);
     if (args.len != 3) {
         std.debug.print("usage: zinc-tokenize <model.gguf> <text-file>\n", .{});
         std.process.exit(2);
     }
 
-    const file = try std.fs.cwd().openFile(args[1], .{});
-    defer file.close();
-    const stat = try file.stat();
-    const data = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, args[1], .{});
+    defer file.close(host_io.io);
+    const stat = try file.stat(host_io.io);
+    const data = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
     defer std.posix.munmap(data);
 
     var gf = try gguf.parseWithOptions(data, allocator, .{ .log_summary = false });
@@ -33,12 +35,12 @@ pub fn main() !void {
     var tokenizer = try tokenizer_mod.Tokenizer.initFromGGUF(&gf, allocator);
     defer tokenizer.deinit();
 
-    const text = try std.fs.cwd().readFileAlloc(allocator, args[2], 256 * 1024 * 1024);
+    const text = try std.Io.Dir.cwd().readFileAlloc(host_io.io, args[2], allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(text);
     const ids = try tokenizer.encodePrompt(text, allocator);
     defer allocator.free(ids);
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     try out.append(allocator, '[');
     for (ids, 0..) |id, i| {

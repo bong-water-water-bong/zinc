@@ -105,7 +105,7 @@ const jsonLd = {
 # pull one, and run it end to end.
 git clone https://github.com/zolotukhin/zinc.git
 cd zinc
-zig build -Doptimize=ReleaseFast
+./scripts/zig.sh build -Doptimize=ReleaseFast
 
 # RDNA4 Vulkan only; skip for ROCm, Intel Arc, CUDA, and macOS.
 export RADV_PERFTEST=coop_matrix

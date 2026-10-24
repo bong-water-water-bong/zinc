@@ -5,7 +5,7 @@
  * Iteratively builds, deploys, and improves the ZINC inference engine on an
  * RDNA4 test node. Each cycle:
  *   1. rsync source to remote node
- *   2. Build (zig build -Doptimize=ReleaseFast)
+ *   2. Build (./scripts/zig.sh build -Doptimize=ReleaseFast)
  *   3. Run (zinc --prompt ...)
  *   4. Analyze output (build errors? runtime crash? tok/s?)
  *   5. Spawn AI agent to make ONE fix or optimization
@@ -487,14 +487,14 @@ async function remoteBuild(): Promise<{ exitCode: number; output: string }> {
       "-p", String(ZINC_PORT),
       "-o", "StrictHostKeyChecking=no",
       `${ZINC_USER}@${ZINC_HOST}`,
-      `cd ${REMOTE_ZINC_DIR} && zig build -Doptimize=ReleaseFast 2>&1`,
+      `cd ${REMOTE_ZINC_DIR} && ./scripts/zig.sh build -Doptimize=ReleaseFast 2>&1`,
     ],
     { streamOutput: true, timeout: 300_000 },
   );
   return { exitCode, output: stdout + "\n" + stderr };
 }
 
-/** Run `zig build test` on the remote node. Returns true if all tests pass. */
+/** Run `./scripts/zig.sh build test` on the remote node. Returns true if all tests pass. */
 async function remoteTest(): Promise<{ passed: boolean; output: string }> {
   console.log(clr("2", "  Running tests..."));
   const { stdout, stderr, exitCode } = await runCommand(
@@ -503,7 +503,7 @@ async function remoteTest(): Promise<{ passed: boolean; output: string }> {
       "-p", String(ZINC_PORT),
       "-o", "StrictHostKeyChecking=no",
       `${ZINC_USER}@${ZINC_HOST}`,
-      `cd ${REMOTE_ZINC_DIR} && zig build test --summary all 2>&1`,
+      `cd ${REMOTE_ZINC_DIR} && ./scripts/zig.sh build test --summary all 2>&1`,
     ],
     { streamOutput: false, timeout: 120_000 },
   );
@@ -1066,14 +1066,14 @@ function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
   diagnosis.push("- ✅ Command buffer batching: fast path stays in one submission through final norm + LM head + argmax");
   diagnosis.push("- ✅ Persistent GPU SSM state buffers (conv: 3.75MB, recurrent: 80MB)");
   diagnosis.push("- ✅ OpenAI-compatible API server with SSE streaming, chat UI at GET /, raw /v1/completions at ~33.5 tok/s");
-  diagnosis.push("- ✅ zig build test passes. Build clean on macOS and Linux.");
+  diagnosis.push("- ✅ ./scripts/zig.sh build test passes. Build clean on macOS and Linux.");
   diagnosis.push("");
   diagnosis.push("## CURRENT STATE (2026-03-30, updated)");
   diagnosis.push("Output: CORRECT at 33.6 tok/s clean CLI and ~33.5 tok/s raw API on a clean ReleaseFast build.");
   diagnosis.push("Reasoning chat is still slower: the current 3-prompt matrix lands at 24.9-28.6 tok/s (about 26.9 tok/s average).");
   diagnosis.push("Modeled decode bandwidth at 33.58 tok/s is ~112.5 GB/s (~19.5% of 576 GB/s). Single-stream decode will not saturate DRAM.");
   diagnosis.push("Remaining bottlenecks are medium/small decode kernels, chat template/stop-path overhead, and still-intrusive profiling.");
-  diagnosis.push("All changes MUST pass `zig build test`.");
+  diagnosis.push("All changes MUST pass `./scripts/zig.sh build test`.");
   diagnosis.push("");
   diagnosis.push("## OPTIMIZATION PRIORITY (in order):");
   diagnosis.push("The path from today's >30 tok/s raw decode to >30 tok/s reasoning chat and higher aggregate GPU utilization:");
@@ -1134,7 +1134,7 @@ function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
     "- VK_KHR_cooperative_matrix 16x16x16",
     "- RADV driver (Mesa), RADV_PERFTEST=coop_matrix",
     "- System glslc: shaderc 2023.8 (Ubuntu 24.04) — do NOT use newer versions",
-    "- Zig 0.15.2",
+    "- Zig 0.17.0",
     "",
     "## Current Build Output (last 3000 chars)",
     "```",
@@ -1196,7 +1196,7 @@ function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
     "2. Edit LOCAL source files only (this machine's working copy).",
     "3. The loop will rsync your changes and rebuild on the remote node.",
     "4. Do NOT modify .env, loops/, or files outside src/ and build.zig.",
-    "5. Zig 0.15.2 API: ArrayList is unmanaged (pass allocator to append/deinit),",
+    "5. Zig 0.17.0 API: ArrayList is unmanaged (pass allocator to append/deinit),",
     "   StringHashMap → use StringHashMapUnmanaged, File.stdout() not io.getStdOut(),",
     "   writer() takes a buffer arg, process.Child StdIo uses .Pipe not .pipe.",
     "6. GLSL shaders must compile with `glslc --target-env=vulkan1.3 -O`.",
@@ -1755,7 +1755,7 @@ async function main() {
     const zigVer = await ssh("zig version", 10_000);
     console.log(clr("1;32", `  Zig: ${zigVer}`));
   } catch {
-    console.error(clr("31", "  ❌ Zig not found on remote node. Install zig 0.15.2+."));
+    console.error(clr("31", "  ❌ Zig not found on remote node. Install Zig 0.17.0."));
     process.exit(1);
   }
 

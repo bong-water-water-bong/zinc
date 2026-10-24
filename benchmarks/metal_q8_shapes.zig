@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_io = @import("host_io");
 const support = @import("zinc_bench_support");
 const metal_device = support.metal_device;
 const metal_loader = support.metal_loader;
@@ -345,7 +346,7 @@ const CompareSummary = struct {
 };
 
 fn helpText() []const u8 {
-    return 
+    return
     \\Usage: zinc-bench-metal-shapes -m <model.gguf> [options]
     \\
     \\Benchmarks exact local hot Metal projection and routed-MoE shapes from the real GGUF model.
@@ -380,10 +381,10 @@ fn helpText() []const u8 {
     \\  -h, --help                 Show this help text
     \\
     \\Examples:
-    \\  zig build bench-metal-shapes -- -m /Users/zolotukhin/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
-    \\  zig build bench-metal-shapes -- -m model.gguf --case lm_head --pipeline both
-    \\  zig build bench-metal-shapes -- -m model.gguf --case attn_q --pipeline production
-    \\  zig build bench-metal-shapes -- -m model.gguf --case gemma26_prefill_hot --pipeline production --route-tokens 20
+    \\  ./scripts/zig.sh build bench-metal-shapes -- -m model.gguf
+    \\  ./scripts/zig.sh build bench-metal-shapes -- -m model.gguf --case lm_head --pipeline both
+    \\  ./scripts/zig.sh build bench-metal-shapes -- -m model.gguf --case attn_q --pipeline production
+    \\  ./scripts/zig.sh build bench-metal-shapes -- -m model.gguf --case gemma26_prefill_hot --pipeline production --route-tokens 20
     \\
     ;
 }
@@ -585,18 +586,18 @@ fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
 fn loadShaderPipelineWithPrefix(ctx: ?*shim.MetalCtx, name: []const u8, source_name: []const u8, prefix: []const u8) !MetalPipeline {
     var path_buf: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "src/shaders/metal/{s}.metal", .{source_name}) catch return error.PathTooLong;
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.ShaderNotFound;
-    defer file.close();
-    const stat = try file.stat();
+    const file = std.Io.Dir.cwd().openFile(host_io.io, path, .{}) catch return error.ShaderNotFound;
+    defer file.close(host_io.io);
+    const stat = try file.stat(host_io.io);
     if (stat.size + @as(u64, @intCast(prefix.len)) > 1024 * 1024) return error.ShaderTooLarge;
 
     var source_buf: [1024 * 1024 + 1]u8 = undefined;
     @memcpy(source_buf[0..prefix.len], prefix);
-    const bytes_read = try file.readAll(source_buf[prefix.len .. source_buf.len - 1]);
+    const bytes_read = try host_io.readAll(file, source_buf[prefix.len .. source_buf.len - 1]);
     source_buf[prefix.len + bytes_read] = 0;
 
     var fn_buf: [16]u8 = undefined;
-    const fn_name = try std.fmt.bufPrintZ(&fn_buf, "main0", .{});
+    const fn_name = try std.fmt.bufPrintSentinel(&fn_buf, "main0", .{}, 0);
     var pipe = try metal_pipeline.createPipeline(ctx, @ptrCast(&source_buf), fn_name);
     pipe.name = name;
     return pipe;
@@ -2422,7 +2423,7 @@ fn benchmarkRouterF32FusedVariant(
     @memset(output_topk_buf.cpu_ptr.?[0..output_topk_buf.size], 0);
     @memset(shared_gate_out_buf.cpu_ptr.?[0..shared_gate_out_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runRouterF32TopkDispatchBatch(
         device.ctx,
         &pipe,
@@ -2440,7 +2441,7 @@ fn benchmarkRouterF32FusedVariant(
         hot_case.expert_slots,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -2621,7 +2622,7 @@ fn benchmarkMoeGateUpGegluVariant(
     );
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runMoeGateUpGegluDispatchBatch(
         device.ctx,
         &pipe,
@@ -2635,7 +2636,7 @@ fn benchmarkMoeGateUpGegluVariant(
         hot_case.expert_slots,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -2709,7 +2710,7 @@ fn benchmarkMoeGateUpSwigluVariant(
     );
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runMoeGateUpSwigluDispatchBatch(
         device.ctx,
         &pipe,
@@ -2724,7 +2725,7 @@ fn benchmarkMoeGateUpSwigluVariant(
         hot_case.expert_slots,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -2851,7 +2852,7 @@ fn benchmarkSharedPairSwigluVariant(
     );
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runSharedPairSwigluDispatchBatch(
         device.ctx,
         &pipe,
@@ -2866,7 +2867,7 @@ fn benchmarkSharedPairSwigluVariant(
         rows_per_wg,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -2981,7 +2982,7 @@ fn benchmarkDenseGateUpGegluVariant(
     );
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runDenseGateUpGegluDispatchBatch(
         device.ctx,
         &pipe,
@@ -2994,7 +2995,7 @@ fn benchmarkDenseGateUpGegluVariant(
         hot_case.cols,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -3063,7 +3064,7 @@ fn benchmarkDenseGateUpSwigluVariant(
     );
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runDenseGateUpGegluDispatchBatch(
         device.ctx,
         &pipe,
@@ -3076,7 +3077,7 @@ fn benchmarkDenseGateUpSwigluVariant(
         hot_case.cols,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -3176,7 +3177,7 @@ fn benchmarkQ4KFixedDmmvVariant(
     );
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runDispatchBatch(
         device.ctx,
         &selection,
@@ -3188,7 +3189,7 @@ fn benchmarkQ4KFixedDmmvVariant(
         hot_case.cols,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -3331,7 +3332,7 @@ fn benchmarkDenseDownQ6kVariant(
     );
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runDenseDownQ6kDispatchBatch(
         device.ctx,
         &selection,
@@ -3343,7 +3344,7 @@ fn benchmarkDenseDownQ6kVariant(
         hot_case.cols,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -3428,7 +3429,7 @@ fn benchmarkPostNormResidualVariant(
     fillInputBuffer(&output_w_buf, n);
     @memset(norm_out_buf.cpu_ptr.?[0..norm_out_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runPostNormResidualDispatchBatch(
         device.ctx,
         &pipe,
@@ -3442,7 +3443,7 @@ fn benchmarkPostNormResidualVariant(
         block_size,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -3541,9 +3542,9 @@ fn benchmarkVariant(
     try runDispatchBatch(device.ctx, &selection, hot_case.tensor0, model, &input_buf, &output_buf, hot_case.rows0, hot_case.cols, warmup_iterations);
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runDispatchBatch(device.ctx, &selection, hot_case.tensor0, model, &input_buf, &output_buf, hot_case.rows0, hot_case.cols, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -3616,7 +3617,7 @@ fn benchmarkLmHeadQ4KArgmaxVariant(
     @memset(logits_buf.cpu_ptr.?[0..logits_buf.size], 0);
     @memset(partials_buf.cpu_ptr.?[0..partials_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runLmHeadQ4KArgmaxDispatchBatch(
         device.ctx,
         &pipe,
@@ -3630,7 +3631,7 @@ fn benchmarkLmHeadQ4KArgmaxVariant(
         write_logits,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -3687,9 +3688,9 @@ fn benchmarkGemmQ8BatchedVariant(
     try runGemmQ8BatchedDispatchBatch(device.ctx, &pipe, hot_case.tensor0, model, &input_buf, &output_buf, hot_case.rows0, hot_case.cols, route_tokens, warmup_iterations);
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runGemmQ8BatchedDispatchBatch(device.ctx, &pipe, hot_case.tensor0, model, &input_buf, &output_buf, hot_case.rows0, hot_case.cols, route_tokens, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -3760,9 +3761,9 @@ fn benchmarkMoeVariant(
     try runMoeDispatchBatch(device.ctx, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, hot_case.rows0, hot_case.cols, hot_case.expert_slots, hot_case.x_expert_stride, warmup_iterations);
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runMoeDispatchBatch(device.ctx, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, hot_case.rows0, hot_case.cols, hot_case.expert_slots, hot_case.x_expert_stride, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -3837,9 +3838,9 @@ fn benchmarkMoeColsVariant(
     try runMoeColsDispatchBatch(device.ctx, &route_pack_pipe, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, warmup_iterations);
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runMoeColsDispatchBatch(device.ctx, &route_pack_pipe, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -3922,9 +3923,9 @@ fn benchmarkMoeColsActiveBlocksVariant(
     try runMoeColsActiveBlocksDispatchBatch(device.ctx, &route_pack_blocks_pipe, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, &active_block_count_buf, &active_blocks_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, active_block_upper_bound, warmup_iterations);
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runMoeColsActiveBlocksDispatchBatch(device.ctx, &route_pack_blocks_pipe, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, &active_block_count_buf, &active_blocks_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, active_block_upper_bound, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -4006,9 +4007,9 @@ fn benchmarkMoeGateUpGegluColsActiveBlocksVariant(
     try runMoeGateUpGegluColsActiveBlocksDispatchBatch(device.ctx, &route_pack_blocks_pipe, &geglu_cols_pipe, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, &active_block_count_buf, &active_blocks_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, active_block_upper_bound, warmup_iterations);
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runMoeGateUpGegluColsActiveBlocksDispatchBatch(device.ctx, &route_pack_blocks_pipe, &geglu_cols_pipe, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, &active_block_count_buf, &active_blocks_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, active_block_upper_bound, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -4127,7 +4128,7 @@ fn benchmarkQ4KQKDualVariant(
     @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
     @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runQ4KQKDualDispatchBatch(
         device.ctx,
         &pipe,
@@ -4142,7 +4143,7 @@ fn benchmarkQ4KQKDualVariant(
         hot_case.cols,
         iterations,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -4204,9 +4205,9 @@ fn benchmarkSeparateDualVariant(
     @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
     @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runSeparateDualDispatchBatch(device.ctx, &selection, hot_case.tensor0, tensor1, model, &input_buf, &output0_buf, &output1_buf, hot_case.rows0, hot_case.rows1, hot_case.cols, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -4268,9 +4269,9 @@ fn benchmarkDualVariant(
     @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
     @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runDualDispatchBatch(device.ctx, &selection, hot_case.tensor0, tensor1, model, &input_buf, &output0_buf, &output1_buf, hot_case.rows0, hot_case.rows1, hot_case.cols, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -4341,9 +4342,9 @@ fn benchmarkRmsNormDualVariant(
     @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
     @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runRmsNormDualDispatchBatch(device.ctx, &rms_norm_pipe, &dual_selection, hot_case.tensor0, tensor1, model, &hidden_buf, &norm_buf, &norm_weight_buf, &output0_buf, &output1_buf, hot_case.rows0, hot_case.rows1, hot_case.cols, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -4408,9 +4409,9 @@ fn benchmarkFusedDualVariant(
     @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
     @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = host_io.nanoTimestamp();
     try runFusedDualDispatchBatch(device.ctx, &selection, hot_case.tensor0, tensor1, model, &hidden_buf, &norm_weight_buf, &output0_buf, &output1_buf, hot_case.rows0, hot_case.rows1, hot_case.cols, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -4491,25 +4492,26 @@ fn compareDualOutputs(lhs: DualBenchResult, rhs: DualBenchResult) CompareSummary
     };
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try host_io.argsAlloc(allocator);
+    defer host_io.argsFree(allocator, args);
 
     const config = parseArgs(args) catch |err| {
-        std.fs.File.stderr().writeAll(helpText()) catch {};
+        std.Io.File.stderr().writeStreamingAll(host_io.io, helpText()) catch {};
         return err;
     };
     if (config.show_help) {
-        try std.fs.File.stdout().writeAll(helpText());
+        try std.Io.File.stdout().writeStreamingAll(host_io.io, helpText());
         return;
     }
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
 
     var device = try metal_device.MetalDevice.init(allocator, config.device_index);
     defer device.deinit();

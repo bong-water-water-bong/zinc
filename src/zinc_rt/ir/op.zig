@@ -119,9 +119,9 @@ pub fn name(opcode: Opcode) []const u8 {
 /// @param value Candidate opcode spelling.
 /// @returns The matching opcode, or `null` when no variant matches.
 pub fn fromName(value: []const u8) ?Opcode {
-    inline for (@typeInfo(Opcode).@"enum".fields) |field| {
-        const opcode: Opcode = @enumFromInt(field.value);
-        if (std.ascii.eqlIgnoreCase(value, field.name) or std.mem.eql(u8, value, name(opcode))) {
+    inline for (std.enums.values(Opcode)) |field| {
+        const opcode: Opcode = field;
+        if (std.ascii.eqlIgnoreCase(value, @tagName(field)) or std.mem.eql(u8, value, name(opcode))) {
             return opcode;
         }
     }

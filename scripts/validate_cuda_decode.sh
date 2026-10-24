@@ -27,7 +27,7 @@ if [ -z "$GPU" ]; then
 fi
 M=${ZINC_MODEL:-$HOME/workspace/Qwen3.5-9B-Q4_K_M.gguf}
 LCPP=${LLAMA_CPP:-$HOME/workspace/llama.cpp}
-ZIG=${ZIG:-$HOME/zig-0.15.2/zig}
+ZIG=${ZIG:-./scripts/zig.sh}
 T=/tmp/zinc_validate
 mkdir -p "$T"
 export CUDA_VISIBLE_DEVICES=$GPU

@@ -1424,13 +1424,13 @@ test "dequant row copies f32 rows" {
 }
 
 test "dequant row handles q8_0" {
-    var block = [_]u8{0} ** 34;
+    var block = @as([34]u8, @splat(0));
     const scale_bits: u16 = @bitCast(@as(f16, 0.5));
     std.mem.writeInt(u16, block[0..2], scale_bits, .little);
     block[2] = @bitCast(@as(i8, -2));
     block[3] = @bitCast(@as(i8, 4));
 
-    var out = [_]f32{0} ** 32;
+    var out = @as([32]f32, @splat(0));
     try row(&block, 0, 32, .q8_0, &out);
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), out[0], 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[1], 0.00001);
@@ -1439,7 +1439,7 @@ test "dequant row handles q8_0" {
 test "dotRow q8_0 matches dequantized dot" {
     const cols: usize = 64;
     const blocks = cols / 32;
-    var raw = [_]u8{0} ** (2 * blocks * 34);
+    var raw = @as([(2 * blocks * 34)]u8, @splat(0));
     for (0..2) |row_index| {
         for (0..blocks) |block| {
             const bo = (row_index * blocks + block) * 34;
@@ -1454,7 +1454,7 @@ test "dotRow q8_0 matches dequantized dot" {
 
     var input: [cols]f32 = undefined;
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 5) % 17)) - 8.0) * 0.0625;
-    var scratch = [_]f32{0} ** cols;
+    var scratch = @as([cols]f32, @splat(0));
 
     for (0..2) |row_index| {
         try row(&raw, @intCast(row_index), cols, .q8_0, &scratch);
@@ -1487,7 +1487,7 @@ test "direct scalar float dot rows match dequantized dot" {
     var input: [cols]f32 = undefined;
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 11) % 23)) - 10.0) * 0.125;
 
-    var scratch = [_]f32{0} ** cols;
+    var scratch = @as([cols]f32, @splat(0));
     inline for (.{ GGMLType.f32, GGMLType.f16, GGMLType.bf16 }) |tensor_type| {
         const raw = switch (tensor_type) {
             .f32 => std.mem.sliceAsBytes(&raw_f32),
@@ -1506,7 +1506,7 @@ test "direct scalar float dot rows match dequantized dot" {
 }
 
 test "dotRow q5_k matches dequantized dot" {
-    var raw = [_]u8{0} ** (2 * 176);
+    var raw = @as([(2 * 176)]u8, @splat(0));
     for (0..2) |row_index| {
         const bb = row_index * 176;
         const d_bits: u16 = @bitCast(@as(f16, @floatCast(0.02734375 * @as(f32, @floatFromInt(row_index + 1)))));
@@ -1520,8 +1520,8 @@ test "dotRow q5_k matches dequantized dot" {
 
     var input: [256]f32 = undefined;
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 13) % 37)) - 18.0) * 0.03125;
-    var scratch = [_]f32{0} ** 256;
-    var sums = [_]f32{0} ** 8;
+    var scratch = @as([256]f32, @splat(0));
+    var sums = @as([8]f32, @splat(0));
     fillInputSum32(&input, &sums);
 
     for (0..2) |row_index| {
@@ -1536,7 +1536,7 @@ test "dotRow q5_k matches dequantized dot" {
 }
 
 test "dotRow q6_k matches dequantized dot" {
-    var raw = [_]u8{0} ** (2 * 210);
+    var raw = @as([(2 * 210)]u8, @splat(0));
     for (0..2) |row_index| {
         const bb = row_index * 210;
         for (0..128) |i| raw[bb + i] = @intCast((i * 11 + row_index * 3) & 0xff);
@@ -1551,7 +1551,7 @@ test "dotRow q6_k matches dequantized dot" {
 
     var input: [256]f32 = undefined;
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 17) % 41)) - 20.0) * 0.03125;
-    var scratch = [_]f32{0} ** 256;
+    var scratch = @as([256]f32, @splat(0));
 
     for (0..2) |row_index| {
         try row(&raw, @intCast(row_index), 256, .q6_k, &scratch);
@@ -1563,7 +1563,7 @@ test "dotRow q6_k matches dequantized dot" {
 }
 
 test "dotRow q4_k matches dequantized dot" {
-    var raw = [_]u8{0} ** (2 * 144);
+    var raw = @as([(2 * 144)]u8, @splat(0));
     for (0..2) |row_index| {
         const bb = row_index * 144;
         const d_bits: u16 = @bitCast(@as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(row_index + 1)))));
@@ -1576,8 +1576,8 @@ test "dotRow q4_k matches dequantized dot" {
 
     var input: [256]f32 = undefined;
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 7) % 31)) - 15.0) * 0.03125;
-    var scratch = [_]f32{0} ** 256;
-    var sums = [_]f32{0} ** 8;
+    var scratch = @as([256]f32, @splat(0));
+    var sums = @as([8]f32, @splat(0));
     fillInputSum32(&input, &sums);
 
     for (0..2) |row_index| {
@@ -1592,13 +1592,13 @@ test "dotRow q4_k matches dequantized dot" {
 }
 
 test "dequant row handles q4_0" {
-    var block = [_]u8{0} ** 18;
+    var block = @as([18]u8, @splat(0));
     const d_bits: u16 = @bitCast(@as(f16, 0.5));
     std.mem.writeInt(u16, block[0..2], d_bits, .little);
     // q[0] low nibble = 6 -> (6-8)*0.5 = -1.0 ; q[16] high nibble = 10 -> (10-8)*0.5 = 1.0
     block[2] = 6 | (10 << 4);
 
-    var out = [_]f32{0} ** 32;
+    var out = @as([32]f32, @splat(0));
     try row(&block, 0, 32, .q4_0, &out);
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), out[0], 0.00001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[16], 0.00001);
@@ -1607,7 +1607,7 @@ test "dequant row handles q4_0" {
 test "dotQ4_0Row matches dequantized dot" {
     const cols: usize = 64;
     const blocks = cols / 32;
-    var raw = [_]u8{0} ** (2 * blocks * 18);
+    var raw = @as([(2 * blocks * 18)]u8, @splat(0));
     for (0..2) |row_index| {
         for (0..blocks) |block| {
             const bo = (row_index * blocks + block) * 18;
@@ -1623,11 +1623,11 @@ test "dotQ4_0Row matches dequantized dot" {
 
     var input: [cols]f32 = undefined;
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 5) % 17)) - 8.0) * 0.0625;
-    var sums = [_]f32{0} ** blocks;
+    var sums = @as([blocks]f32, @splat(0));
     fillInputSum32(&input, &sums);
 
     for (0..2) |row_index| {
-        var scratch = [_]f32{0} ** cols;
+        var scratch = @as([cols]f32, @splat(0));
         try row(&raw, @intCast(row_index), cols, .q4_0, &scratch);
         var expected: f32 = 0;
         for (scratch, input) |w, x| expected += w * x;
@@ -1641,7 +1641,7 @@ test "dotQ4_0Row matches dequantized dot" {
 test "dotQ4_0RowWithSum32Cols2048 matches generic sum path" {
     const cols: usize = 2048;
     const blocks = cols / 32;
-    var raw = [_]u8{0} ** (2 * blocks * 18);
+    var raw = @as([(2 * blocks * 18)]u8, @splat(0));
     for (0..2) |row_index| {
         for (0..blocks) |block| {
             const bo = (row_index * blocks + block) * 18;
@@ -1657,7 +1657,7 @@ test "dotQ4_0RowWithSum32Cols2048 matches generic sum path" {
 
     var input: [cols]f32 = undefined;
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 19) % 23)) - 11.0) * 0.03125;
-    var sums = [_]f32{0} ** blocks;
+    var sums = @as([blocks]f32, @splat(0));
     fillInputSum32(&input, &sums);
 
     for (0..2) |row_index| {
@@ -1678,7 +1678,7 @@ test "quantizeRowToQ4_0 round-trips f32 within Q4_0 resolution" {
     var packed_q: [(cols / 32) * 18]u8 = undefined;
     quantizeRowToQ4_0(&src, &packed_q);
 
-    var recon = [_]f32{0} ** cols;
+    var recon = @as([cols]f32, @splat(0));
     try row(&packed_q, 0, cols, .q4_0, &recon);
     for (0..cols) |i| {
         // Per-block max magnitude / 8 is the quantization step; tolerate ~1 step.
@@ -1709,7 +1709,7 @@ test "quantizeRowToQ8_0 round-trips f32 within Q8_0 resolution" {
     var packed_q: [(cols / 32) * 34]u8 = undefined;
     quantizeRowToQ8_0(&src, &packed_q);
 
-    var recon = [_]f32{0} ** cols;
+    var recon = @as([cols]f32, @splat(0));
     try row(&packed_q, 0, cols, .q8_0, &recon);
     for (0..cols) |i| {
         const block = i / 32;
@@ -1738,7 +1738,7 @@ test "dotF32Row 4-way unrolled loop and all tails match the scalar dot" {
     var input: [cols]f32 = undefined;
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 7) % 53)) - 26.0) * 0.0625;
 
-    var scratch = [_]f32{0} ** cols;
+    var scratch = @as([cols]f32, @splat(0));
     const raw = std.mem.sliceAsBytes(&raw_f32);
     for (0..rows) |row_index| {
         try row(raw, @intCast(row_index), cols, .f32, &scratch);
@@ -1752,7 +1752,7 @@ test "dotF32Row 4-way unrolled loop and all tails match the scalar dot" {
 test "dotQ4_0Row three-block row exercises the 2-block unroll and the odd tail" {
     const cols: usize = 96; // 3 blocks: b=0 unrolled (blocks 0,1) + b=2 tail (block 2)
     const blocks = cols / 32;
-    var raw = [_]u8{0} ** (2 * blocks * 18);
+    var raw = @as([(2 * blocks * 18)]u8, @splat(0));
     for (0..2) |row_index| {
         for (0..blocks) |block| {
             const bo = (row_index * blocks + block) * 18;
@@ -1770,7 +1770,7 @@ test "dotQ4_0Row three-block row exercises the 2-block unroll and the odd tail" 
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 5) % 19)) - 9.0) * 0.0625;
 
     for (0..2) |row_index| {
-        var scratch = [_]f32{0} ** cols;
+        var scratch = @as([cols]f32, @splat(0));
         try row(&raw, @intCast(row_index), cols, .q4_0, &scratch);
         var expected: f32 = 0;
         for (scratch, input) |w, x| expected += w * x;
@@ -1782,7 +1782,7 @@ test "dotQ4_0Row three-block row exercises the 2-block unroll and the odd tail" 
 test "dotQ4_0Row five-block row exercises the 4-block unroll and tail" {
     const cols: usize = 160; // 5 blocks: 4-block body + single-block tail
     const blocks = cols / 32;
-    var raw = [_]u8{0} ** (2 * blocks * 18);
+    var raw = @as([(2 * blocks * 18)]u8, @splat(0));
     for (0..2) |row_index| {
         for (0..blocks) |block| {
             const bo = (row_index * blocks + block) * 18;
@@ -1800,7 +1800,7 @@ test "dotQ4_0Row five-block row exercises the 4-block unroll and tail" {
     for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i * 13) % 43)) - 21.0) * 0.03125;
 
     for (0..2) |row_index| {
-        var scratch = [_]f32{0} ** cols;
+        var scratch = @as([cols]f32, @splat(0));
         try row(&raw, @intCast(row_index), cols, .q4_0, &scratch);
         var expected: f32 = 0;
         for (scratch, input) |w, x| expected += w * x;
