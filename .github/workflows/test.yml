@@ -72,3 +72,15 @@ jobs:
           ./scripts/zig.sh build -Doptimize="$mode"
           ./scripts/zig.sh build test-build -Doptimize="$mode"
         done
+
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - uses: cachix/install-nix-action@v31
+    - name: Check the pinned Nix compiler
+      run: nix develop --command sh -c 'test "$(zig version)" = "$(cat .zig-version)"'
+    - name: Build the Linux Nix package without GPU execution
+      run: |
+        nix build --print-build-logs
+        ./result/bin/zinc --version

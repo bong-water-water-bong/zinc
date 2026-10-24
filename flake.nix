@@ -11,12 +11,35 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # zig 0.15.x is currently in nixpkgs as zigpkgs or via the master
-        # overlay; fall back to pkgs.zig if pkgs.zig_0_15 is not yet present.
-        zigPkg =
-          if pkgs ? zig_0_15 then pkgs.zig_0_15
-          else if pkgs ? zig then pkgs.zig
-          else throw "No suitable Zig package found in nixpkgs. Use an up-to-date nixpkgs-unstable channel.";
+        zigVersion = pkgs.lib.removeSuffix "\n" (builtins.readFile ./.zig-version);
+        zigRelease = builtins.fromJSON (builtins.readFile ./nix/zig-release.json);
+        zigDist = zigRelease.platforms.${system};
+        # Fetch the same official release as scripts/zig.sh. The locked nixpkgs
+        # predates this compiler; selecting its default Zig would silently drift.
+        zigPkg = assert zigRelease.version == zigVersion; pkgs.stdenv.mkDerivation {
+          pname = "zig";
+          version = zigVersion;
+          src = pkgs.fetchurl { inherit (zigDist) url hash; };
+          dontConfigure = true;
+          dontBuild = true;
+          dontFixup = true;
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out/bin" "$out/lib"
+            cp zig "$out/bin/zig"
+            cp -r lib/. "$out/lib/"
+            substituteInPlace "$out/lib/std/zig/system.zig" \
+              --replace-fail /usr/bin/env ${pkgs.coreutils}/bin/env
+            runHook postInstall
+          '';
+          meta = {
+            description = "Zig compiler pinned by ZINC";
+            homepage = "https://ziglang.org/";
+            license = pkgs.lib.licenses.mit;
+            platforms = builtins.attrNames zigRelease.platforms;
+            mainProgram = "zig";
+          };
+        };
 
         zinc = pkgs.stdenv.mkDerivation {
           pname = "zinc";
@@ -26,7 +49,10 @@
 
           nativeBuildInputs = [
             zigPkg
+            pkgs.pkg-config
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.shaderc   # provides glslc for SPIR-V shader compilation
+            pkgs.autoPatchelfHook
           ];
 
           buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
@@ -34,11 +60,11 @@
             pkgs.vulkan-headers
           ];
 
-          # Zig uses $HOME for its local package cache during builds.
-          # Point it at a writable temp directory inside the sandbox.
+          # Keep compiler caches writable without changing the builder's HOME.
           preBuild = ''
-            export HOME=$TMPDIR/zig-home
-            mkdir -p $HOME
+            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zinc-zig-global-cache"
+            export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zinc-zig-local-cache"
+            mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
           '';
 
           buildPhase = ''
@@ -70,14 +96,16 @@
         packages = {
           default = zinc;
           inherit zinc;
+          zig = zigPkg;
         };
 
         # `nix develop` shell — matches the project's manual build instructions.
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
             zigPkg
-            pkgs.shaderc
+            pkgs.pkg-config
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.shaderc
             pkgs.vulkan-loader
             pkgs.vulkan-headers
             pkgs.vulkan-validation-layers
