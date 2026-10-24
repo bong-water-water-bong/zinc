@@ -945,11 +945,12 @@ pub const Tokenizer = struct {
     /// text, so those pretokenizers accept only control, user-defined and
     /// unknown tokens.
     fn acceptsSpecialMarker(self: *const Tokenizer, id: u32) bool {
-        // The reference promotes declared special IDs to control tokens even
-        // when token_type labels them ordinary (Gemma's <eos> is one example).
+        // The reference promotes declared IDs and recognized end markers to
+        // control tokens even when token_type labels them ordinary.
         if (id == self.eos_id) return true;
         if (self.bos_id) |bos| if (id == bos) return true;
         if (self.eot_id) |eot| if (id == eot) return true;
+        for (self.eog_ids) |eog| if (id == eog) return true;
         const mask = self.special_token_mask orelse return true;
         if (self.pretokenizer != .qwen35 and self.pretokenizer != .qwen2 and self.pretokenizer != .gemma4_bpe) return true;
         return id < mask.len and mask[id];
@@ -2838,9 +2839,9 @@ test "Gemma ordinary angle-bracket tokens stay in the surrounding BPE text" {
     try std.testing.expectEqualSlices(u32, &.{ 7, 5, 6 }, ids);
 }
 
-test "declared BOS EOS and EOT remain special when token types are ordinary" {
+test "declared and inferred special IDs override ordinary token types" {
     const allocator = std.testing.allocator;
-    const vocab = [_][]const u8{ "<bos>", "<eos>", "<turn|>" };
+    const vocab = [_][]const u8{ "<bos>", "<eos>", "<turn|>", "</s>" };
     var special: [vocab.len]bool = @splat(false);
     var tok = Tokenizer{
         .vocab = &vocab,
@@ -2850,6 +2851,7 @@ test "declared BOS EOS and EOT remain special when token types are ordinary" {
         .bos_id = 0,
         .eos_id = 1,
         .eot_id = 2,
+        .eog_ids = &.{3},
         .prepend_bos = true,
         .pretokenizer = .gemma4_bpe,
         .special_token_mask = &special,
@@ -2857,9 +2859,9 @@ test "declared BOS EOS and EOT remain special when token types are ordinary" {
     };
     defer tok.token_to_id.deinit();
     for (vocab, 0..) |piece, i| try tok.token_to_id.put(piece, @intCast(i));
-    const ids = try tok.encodePrompt("<bos><eos><turn|>", allocator);
+    const ids = try tok.encodePrompt("<bos><eos><turn|></s>", allocator);
     defer allocator.free(ids);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, ids);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, ids);
 }
 
 test "encode gemma4_bpe keeps newline runs as direct tokens when present" {
