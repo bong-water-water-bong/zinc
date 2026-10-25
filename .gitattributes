@@ -7,3 +7,4 @@ src/model/fixtures/*.json linguist-generated=true
 # Keep generated measurement dumps collapsed during source review.
 docs/validation/zig-0.17/*.json* linguist-generated=true
 docs/validation/zig-0.17-bpe/*.json* linguist-generated=true
+docs/validation/rocm-mtp-2026-10-25/*.gz linguist-generated=true

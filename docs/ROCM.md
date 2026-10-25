@@ -55,6 +55,14 @@ to ordinary greedy decode. `ZINC_MTP_DRAFTS=3` is the measured R9700 default
 profile, and `ZINC_MTP_ADAPT_C=<c>` picks two or three per cycle from the
 running acceptance.
 
+On ROCm, the draft head scores 98,304 vocabulary rows by default; the target
+still verifies against the complete vocabulary. `ZINC_MTP_DRAFT_VOCAB=65536`
+restores the previous draft-head size. MTP verification also fuses attention
+setup across its token rows; `ZINC_MTP_FUSED_ATTN=0` restores the separate
+operations. The [Zig 0.17 MTP follow-up](https://github.com/zolotukhin/zinc/blob/main/docs/ROCM_MTP_0_17.md) records the matched
+three-round R9700 results: 71.17 to 77.04 tok/s on the long coding workload,
+with roughly 1–1.4% gains on the other three workloads.
+
 The server uses it too, but only when it owns a single request slot
 (`--parallel 1`): drafting writes the single-sequence KV cache and rewinds it on
 a rejected draft, which needs the whole sequence, while multi-slot serving keeps
@@ -110,6 +118,7 @@ available as correctness/performance A/B opt-outs:
 - `ZINC_BATCH_B1_MATVEC=0`
 - `ZINC_MTP=0` (Qwen 3.8 CLI and single-slot server: disable model-native NextN drafting)
 - `ZINC_MTP_Q8=0` (Qwen 3.8: use the float multi-token verifier)
+- `ZINC_MTP_FUSED_ATTN=0` (Qwen 3.8: use separate attention setup operations during verification)
 
 The Qwen 3.8 decode path uses packed Q8 activations for the hot Q4_K, Q5_K,
 and Q6_K projections, paired projection kernels where the shapes permit it, a
