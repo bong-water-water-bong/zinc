@@ -58,6 +58,7 @@ const http_mod = @import("server/http.zig");
 const model_manager_mod = @import("server/model_manager_runtime.zig");
 const routes_mod = @import("server/routes.zig");
 const tool_format_mod = @import("server/tool_format.zig");
+const model_discovery_mod = @import("server/model_discovery.zig");
 const CommandPool = if (gpu.is_vulkan) @import("vulkan/command.zig").CommandPool else struct {
     pub fn init(_: anytype) !@This() {
         return .{};
@@ -1791,13 +1792,10 @@ fn writeDecodeGraphArtifacts(
 // Accelerator prompt/server entrypoint shared by the CUDA and ROCm backends.
 // Only referenced (and therefore only analyzed) for those backends. Does a real greedy decode:
 // load → forward init → tokenize → prefill (one decodeStep per prompt token) →
-// greedy generate (feed argmax back) → detokenize → print. Server mode is not
-// yet supported on CUDA.
+// greedy generate (feed argmax back) → detokenize → print, or serve HTTP.
 fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
     const model_path = config.model_path orelse {
-        // model_id resolution flows through resolveStartupModel in main(); on
-        // the CUDA path we only support an explicit -m/--model for now.
-        log.err("{s} backend requires an explicit model path: zinc -m <model.gguf> --prompt \"...\"", .{accelerator_name});
+        log.err("{s} backend requires a resolved model path", .{accelerator_name});
         return error.NoModelSpecified;
     };
 
@@ -2083,6 +2081,8 @@ const ServeConnCtx = struct {
     debug_ids: bool,
     default_max: u32,
     slot_ctx: u32,
+    /// Model path for /v1/models endpoint (borrows config.model_path, lifetime spans server).
+    model_path: ?[]const u8,
 };
 
 /// Stand up the CUDA serving path: build the tokenizer, spawn the GPU worker via
@@ -2154,6 +2154,7 @@ fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, conf
             .debug_ids = debug_ids,
             .default_max = config.max_tokens,
             .slot_ctx = slot_ctx,
+            .model_path = config.model_path,
         };
         const t = std.Thread.spawn(.{}, handleServeConn, .{ctx}) catch {
             ctx.conn.close();
@@ -2202,6 +2203,20 @@ fn handleServeConn(ctx: *ServeConnCtx) void {
     }
     // 3c throughput gate: cumulative decode/prefill counters. Diff two snapshots
     // around a B-concurrent phase → aggregate decode tok/s + mean batch occupancy.
+    if (req.method == .GET and std.mem.eql(u8, req.path, "/v1/models")) {
+        if (ctx.model_path) |mp| {
+            const json = model_discovery_mod.serializeModels(ctx.allocator, mp, ctx.slot_ctx) catch |err| {
+                log.warn("Failed to serialize models: {s}", .{@errorName(err)});
+                conn.sendError(500, "internal_error", "failed to serialize models") catch {};
+                return;
+            };
+            defer ctx.allocator.free(json);
+            conn.sendJson(200, json) catch {};
+        } else {
+            conn.sendError(500, "internal_error", "no model loaded") catch {};
+        }
+        return;
+    }
     if (req.method == .GET and std.mem.eql(u8, req.path, "/stats")) {
         var sbuf: [256]u8 = undefined;
         const js = ctx.engine.statsJson(&sbuf) catch "{}";
@@ -3090,7 +3105,11 @@ pub fn main(process_init: std.process.Init) !void {
     // `return` makes the Vulkan code below comptime-unreachable on CUDA (same
     // pattern as the Metal block above), so it is never analyzed here.
     if (comptime gpu.is_cuda) {
-        runCuda(config, allocator) catch |err| {
+        // Use the same resolved startup selection as Metal/Vulkan: explicit
+        // paths, managed IDs, active selections, and downloaded HF models.
+        var accelerator_config = config;
+        accelerator_config.model_path = model_path;
+        runCuda(accelerator_config, allocator) catch |err| {
             log.err("{s} run failed: {s}", .{ accelerator_name, @errorName(err) });
             std.process.exit(1);
         };
