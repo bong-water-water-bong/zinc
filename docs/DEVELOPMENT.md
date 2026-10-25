@@ -6,27 +6,28 @@ If you just want to run inference, see [Getting Started](/zinc/docs/getting-star
 
 ## Prerequisites
 
-| Tool | Version | What it does |
-|------|---------|-------------|
-| **Zig** | 0.17.0 | Host compiler for all Zig source |
-| **Bun** | Latest | TypeScript test runner, site builder, API benchmarks |
-| **glslc** | shaderc 2023.8 | Compiles GLSL compute shaders to SPIR-V (Linux Vulkan only) |
-| **Vulkan SDK** | 1.3+ | Runtime for AMD and Intel Arc GPU dispatch (Linux only) |
-| **Xcode CLI Tools** | Latest | Metal compiler and frameworks (macOS only) |
+| Tool                | Version            | What it does                                                                  |
+| ------------------- | ------------------ | ----------------------------------------------------------------------------- |
+| **Zig**             | 0.17.0             | Host compiler for all Zig source                                              |
+| **Bun**             | 1.4.4 minimum      | TypeScript tests, package management, site scripts, and `bun fmt`             |
+| **glslc**           | Current LunarG SDK | Shader compiler with `GL_EXT_integer_dot_product` support (Linux Vulkan only) |
+| **Vulkan SDK**      | 1.3+               | Runtime for AMD and Intel Arc GPU dispatch (Linux only)                       |
+| **Xcode CLI Tools** | Latest             | Metal compiler and frameworks (macOS only)                                    |
 
 On macOS (Apple Silicon):
 
 ```bash
-brew install zig bun
+brew install bun
 xcode-select --install
 ```
 
 On Linux (AMD or Intel Arc GPU):
 
 ```bash
-# Zig: https://ziglang.org/download/
+# Zig 0.17.0 is selected and downloaded by scripts/zig.sh when needed.
 # Bun: https://bun.sh
-sudo apt install libvulkan-dev glslc
+# Install glslc from the current LunarG Vulkan SDK.
+sudo apt install libvulkan-dev
 ```
 
 ## Build
@@ -46,6 +47,13 @@ The binary lands at `./zig-out/bin/zinc`. Shaders are compiled from `src/shaders
 
 ## Test
 
+Use Bun 1.4.4 or newer. `.bun-version` pins the version used by CI. Install
+the client tooling with the committed text lockfile:
+
+```bash
+bun install --frozen-lockfile
+```
+
 ```bash
 # Full test suite (Zig unit tests + Bun TypeScript tests)
 ./scripts/zig.sh build test
@@ -58,26 +66,45 @@ ZINC_API_BASE_URL=http://localhost:8080/v1 ./scripts/zig.sh build test -Dfull-te
 ```
 
 The test suite covers:
+
 - Zig unit tests across all modules (tokenizer, routes, catalog, forward pass, etc.)
 - Chat UI rendering, markdown, thinking logic, repetition detection
 - API benchmark tool validation
 - Site build and Zig API documentation generation
 - Optional: OpenAI SDK compatibility, Qwen model smoke tests
 
+## Format
+
+```bash
+bun run format
+bun run format:check
+```
+
+These commands use `bun fmt` on supported files changed from `origin/main`.
+Pass paths directly to format a particular file, for example
+`bun fmt tools/benchmark_api.mjs`. CI checks files changed from the push or
+pull-request base. Settings live in `bunfig.toml`; generated measurements and
+byte-sensitive fixtures are excluded. Astro templates are checked by the site
+build and browser validation because Bun's native formatter does not support
+`.astro` without a Prettier fallback. Do not add Prettier to format them.
+
+The website also needs the Node version pinned in `site/.node-version`.
+From `site/`, run `bun install --frozen-lockfile` and `bun run build`.
+
 ## Debug Flags
 
-| Flag | What it does |
-|------|-------------|
-| `--debug` | Enable verbose logging (same as `ZINC_DEBUG=1`) |
-| `--profile` | Enable per-dispatch GPU profiling (Vulkan only) |
-| `ZINC_DEBUG=1` | Environment variable alternative to `--debug` |
-| `ZINC_PREFILL_PROFILE=1` | Per-phase prefill timing (dense FFN, SSM, attention, projections) |
-| `ZINC_BATCHED_PREFILL=0` | Disable RDNA batched prefill; useful for isolating regressions |
-| `ZINC_FA_SPLIT_K=<n>` | Override the scalar flash-attention split-K count |
-| `ZINC_TOOL_CALLING=0` | Disable OpenAI-compatible tool calling on `/v1/chat/completions` |
-| `RADV_PERFTEST=coop_matrix` | Enable cooperative matrix on RDNA4 (recommended) |
-| `RADV_DEBUG=shaders` | Dump compiled Vulkan shaders |
-| `RADV_DEBUG=shaderstats` | Show VGPR/occupancy/spill stats |
+| Flag                        | What it does                                                      |
+| --------------------------- | ----------------------------------------------------------------- |
+| `--debug`                   | Enable verbose logging (same as `ZINC_DEBUG=1`)                   |
+| `--profile`                 | Enable per-dispatch GPU profiling (Vulkan only)                   |
+| `ZINC_DEBUG=1`              | Environment variable alternative to `--debug`                     |
+| `ZINC_PREFILL_PROFILE=1`    | Per-phase prefill timing (dense FFN, SSM, attention, projections) |
+| `ZINC_BATCHED_PREFILL=0`    | Disable RDNA batched prefill; useful for isolating regressions    |
+| `ZINC_FA_SPLIT_K=<n>`       | Override the scalar flash-attention split-K count                 |
+| `ZINC_TOOL_CALLING=0`       | Disable OpenAI-compatible tool calling on `/v1/chat/completions`  |
+| `RADV_PERFTEST=coop_matrix` | Enable cooperative matrix on RDNA4 (recommended)                  |
+| `RADV_DEBUG=shaders`        | Dump compiled Vulkan shaders                                      |
+| `RADV_DEBUG=shaderstats`    | Show VGPR/occupancy/spill stats                                   |
 
 For the full set of `ZINC_*` knobs (fusion gates, per-architecture experiments), grep the codebase: `rg 'getEnvVar.*ZINC_' src/`.
 

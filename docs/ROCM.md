@@ -134,6 +134,20 @@ Qwen 3.6 MoE prefill uses the native token-batched Q4_K/Q5_K/Q6_K expert
 kernels. CUDA's grouped tensor-core expert path is not dispatched by the ROCm
 build; its compatibility symbols are intentionally inert.
 
+## API client notes
+
+The ROCm server currently exposes the generation routes and a minimal `/health`
+response. It does not provide the full Vulkan/Metal model-manager and browser
+chat interface, `/v1/models`, or scheduler metadata. Use the default Vulkan or
+Metal build for the browser-chat walkthrough.
+
+Send `stream: false` explicitly for a JSON response; this handler defaults to
+streaming. Streaming text is supported, but SSE finish metadata and the `stop`
+parameter are not implemented. The OpenAI JavaScript SDK 7.43.0 passes matched
+JSON and streaming generation checks with the explicit stream setting. See the
+[MTP validation report](https://github.com/zolotukhin/zinc/blob/main/docs/ROCM_MTP_0_17.md)
+for the broader parity tests and existing generic SDK-suite limitation.
+
 ## Fair llama.cpp comparison
 
 Use the reusable-server performance suite for claims. It runs one engine at a
@@ -178,12 +192,12 @@ prompt-plus-generation phase-wall-time score; higher is better. Each server
 receives the same textual scenario prompt and applies its native chat template;
 prefill and decode rates below are the server-reported phase rates.
 
-| Scenario | ZINC prefill | llama.cpp prefill | ZINC decode | llama.cpp decode | Overall |
-|---|---:|---:|---:|---:|---:|
-| Quick Chat | **391.76 tok/s** | 150.51 tok/s | **32.27 tok/s** | 29.83 tok/s | **122.55%** |
-| Coding Review | **612.68 tok/s** | 253.09 tok/s | **31.97 tok/s** | 29.83 tok/s | **116.59%** |
-| Incident Context | **680.43 tok/s** | 308.56 tok/s | **31.88 tok/s** | 29.83 tok/s | **121.97%** |
-| Long Coding Draft | **426.03 tok/s** | 186.73 tok/s | **31.97 tok/s** | 29.84 tok/s | **112.11%** |
+| Scenario          |     ZINC prefill | llama.cpp prefill |     ZINC decode | llama.cpp decode |     Overall |
+| ----------------- | ---------------: | ----------------: | --------------: | ---------------: | ----------: |
+| Quick Chat        | **391.76 tok/s** |      150.51 tok/s | **32.27 tok/s** |      29.83 tok/s | **122.55%** |
+| Coding Review     | **612.68 tok/s** |      253.09 tok/s | **31.97 tok/s** |      29.83 tok/s | **116.59%** |
+| Incident Context  | **680.43 tok/s** |      308.56 tok/s | **31.88 tok/s** |      29.83 tok/s | **121.97%** |
+| Long Coding Draft | **426.03 tok/s** |      186.73 tok/s | **31.97 tok/s** |      29.84 tok/s | **112.11%** |
 
 ZINC won prefill, decode, and end-to-end phase time in all four scenarios and
 reached **116.88%** of llama.cpp on the summed full-matrix phase-wall-time score

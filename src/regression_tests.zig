@@ -1582,11 +1582,11 @@ test "Q5_K MoE shader processes all 32 elements per sub-block pair" {
 
 test "chat UI derives the model link from the reported model name" {
     const src = @embedFile("server/chat.html");
-    try expectContains(src, "const chatStateKey='zinc.chat.state.v3';");
+    try expectContains(src, "const chatStateKey = 'zinc.chat.state.v3';");
     try expectContains(src, "function restoreChatState()");
     try expectContains(src, "function clearConversation()");
     try expectContains(src, "id=\"cb\" class=\"btn btn-clear\"");
-    try expectContains(src, "@media (max-width:720px)");
+    try expectContains(src, "@media (max-width: 720px)");
     try expectContains(src, "function modelHrefForName(name)");
     try expectContains(src, "function switchableModels()");
     try expectContains(src, "function activeModel()");
@@ -1595,11 +1595,11 @@ test "chat UI derives the model link from the reported model name" {
     try expectContains(src, "setModelTag(d.model)");
     try expectContains(src, "setGpuMemory(d);");
     try expectContains(src, "restoreChatState();");
-    try expectContains(src, "CB.addEventListener('click',clearConversation);");
+    try expectContains(src, "CB.addEventListener('click', clearConversation);");
     try expectContains(src, "setCurrentModel(current);");
-    try expectContains(src, "await Promise.allSettled([refreshHealth(),refreshModels()]);");
-    try expectContains(src, "fetch(base+'/models/activate'");
-    try expectContains(src, "m.managed&&m.installed&&m.supported_on_current_gpu&&m.fits_current_gpu");
+    try expectContains(src, "await Promise.allSettled([refreshHealth(), refreshModels()]);");
+    try expectContains(src, "fetch(base + '/models/activate'");
+    try expectContains(src, "m.managed && m.installed && m.supported_on_current_gpu && m.fits_current_gpu");
     try expectNotContains(src, "setCurrentModel(selectedModel());");
 }
 

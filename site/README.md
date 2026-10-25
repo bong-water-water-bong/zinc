@@ -1,127 +1,55 @@
 # zolotukhin.ai
 
-Static Astro site for `zolotukhin.ai`. The production deploy target is Cloudflare Pages.
+The Astro website for ZINC, its documentation, benchmarks, and engineering blog.
+Production runs on Cloudflare Pages. Deployments are manual Wrangler uploads;
+pushing to `main` runs CI without publishing the site.
 
-## Local development
+## Develop
 
-From the repo root:
-
-```bash
-cd site
-npm ci
-npm run dev
-```
-
-Useful commands:
-
-| Command | What it does |
-| --- | --- |
-| `npm run dev` | Start the local Astro dev server |
-| `npm run build` | Build the production site into `dist/` |
-| `npm run preview` | Preview the built site locally |
-
-## Important repo layout
-
-- The Astro app lives in `site/`
-- Technical documentation source files live in repo-root `docs/`
-- Generated Zig API reference content comes from repo-root `src/**/*.zig`
-- Blog posts live in `site/src/content/posts/`
-
-Because docs are loaded from `../docs` and the Zig API reference is generated from `../src`, the Cloudflare Pages project must watch `site/**`, `docs/**`, and `src/**`.
-
-## First Cloudflare Pages deploy
-
-This repo is set up for Cloudflare Pages Git integration. That is the recommended path for the first deploy because it gives you automatic production deploys on `main` and preview deploys for pull requests.
-
-### 1. Push the repo to GitHub
-
-The Pages project should point at:
-
-- Repository: `zolotukhin/zinc`
-- Production branch: `main`
-
-### 2. Create the Pages project
-
-In Cloudflare:
-
-1. Open `Workers & Pages`
-2. Select `Create application`
-3. Select `Pages`
-4. Select `Connect to Git`
-5. Authorize GitHub if Cloudflare asks for it
-6. Choose the `zolotukhin/zinc` repository
-
-### 3. Use these build settings
-
-Use these exact values:
-
-- Project name: `zolotukhin-ai` or `zinc-site`
-- Framework preset: `Astro`
-- Root directory: `site`
-- Build command: `npm run build`
-- Build output directory: `dist`
-
-Cloudflare Pages supports pinning Node with a file in the project root. This repo includes `.node-version` set to `22.16.0`, which matches the current Pages v3 build image default.
-
-If Cloudflare does not pick that up for any reason, add this environment variable in the Pages dashboard:
-
-- `NODE_VERSION=22.16.0`
-
-### 4. Save and deploy
-
-Cloudflare will install dependencies, run the Astro build, and publish the `dist/` directory to a `*.pages.dev` URL.
-
-After the first successful deploy, verify these routes:
-
-- `/`
-- `/about`
-- `/blog`
-- `/zinc`
-- `/zinc/docs`
-- `/feed.xml`
-- `/sitemap-index.xml`
-- `/robots.txt`
-
-### 5. Configure build watch paths
-
-Open the Pages project and go to:
-
-`Settings` -> `Build` -> `Build watch paths`
-
-Use:
-
-- Include paths: `site/**, docs/**, src/**`
-- Exclude paths: leave empty unless you later want to skip other directories
-
-This matters because the docs pages are built from the repo-root `docs/` directory and the generated API reference is built from repo-root `src/**/*.zig`, not only from files inside `site/`.
-
-### 6. Attach the production domain
-
-After the `*.pages.dev` deployment looks correct:
-
-1. Open the Pages project
-2. Go to `Custom domains`
-3. Add `zolotukhin.ai`
-4. Optionally add `www.zolotukhin.ai`
-
-If you use both domains, redirect `www` to the apex with a Cloudflare Redirect Rule. Do not rely on `_redirects` for that hostname-level redirect.
-
-## Manual deploy
-
-The current Cloudflare Pages project is `zolotukhin-ai`. It is not connected to
-a Git provider, so production deploys are manual uploads from a local build:
+Use **Bun 1.4.4 or newer**, pinned by the repository’s `.bun-version`, and
+Node **24.20.0**, pinned in `.node-version`. The supported minimum for the
+current Astro release is Node 22.23.4. Run these commands from `site/`:
 
 ```bash
-cd site
-npm run build
-npx wrangler pages deploy dist --project-name zolotukhin-ai --branch main
+bun install --frozen-lockfile
+bun run dev
 ```
 
-Use this flow after benchmark-data or docs changes that need to appear on
-`zolotukhin.ai`.
+| Command           | Purpose                              |
+| ----------------- | ------------------------------------ |
+| `bun run dev`     | Start the development server         |
+| `bun run build`   | Build all pages into `dist/`         |
+| `bun run preview` | Preview the production build locally |
 
-## Current deployment behavior
+The site uses Astro 7 and the unified Markdown processor so existing
+remark/rehype plugins keep working. KaTeX styles and fonts are bundled from
+the installed package, matching the renderer. Mermaid renders diagrams in the
+browser.
 
-- Production deploys are manual Wrangler Pages uploads to `zolotukhin-ai`
-- Pushes to `main` update the source of truth but do not deploy production by themselves
-- GitHub Actions in `.github/workflows/site-check.yml` only validate the build; they do not deploy the site
+## Content
+
+| Location                         | Content                                        |
+| -------------------------------- | ---------------------------------------------- |
+| `src/pages/`                     | Landing pages, benchmark dashboard, and routes |
+| `src/content/posts/`             | Blog posts                                     |
+| `../docs/`                       | Technical documentation                        |
+| `../src/**/*.zig`                | Source for the generated Zig API reference     |
+| `src/data/zinc-performance.json` | Published benchmark measurements               |
+
+The build needs the full repository, the pinned Zig toolchain, and the headers
+used by the native API layout probe. CI installs `libvulkan-dev` on Linux.
+Site build checks run when `site/`, `docs/`, or `src/` changes.
+
+## Publish
+
+After the build and browser checks pass, upload the production bundle:
+
+```bash
+bun run build
+bunx wrangler pages deploy dist --project-name zolotukhin-ai --branch main
+```
+
+Verify `/`, `/zinc/`, `/zinc/docs/`, `/zinc/benchmarks/`, `/blog/`, `/feed.xml`,
+and `/sitemap-index.xml` on `https://zolotukhin.ai` after deployment. For a
+Cloudflare-hosted build, use `site` as the root, `bun run build` as the build
+command, `dist` as the output directory, and the Node version in `.node-version`.

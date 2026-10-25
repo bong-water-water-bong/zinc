@@ -47,13 +47,14 @@ const docNavSections = [
     items: [
       { slug: 'getting-started', label: 'Getting Started' },
       { slug: 'hardware-requirements', label: 'Hardware Requirements' },
+      { slug: 'rocm', label: 'AMD ROCm Setup' },
       { slug: 'running-zinc', label: 'Running ZINC' },
       { slug: 'api', label: 'Serving HTTP API' },
       { slug: 'development', label: 'Development' },
     ],
   },
   {
-    label: 'Deep Docs',
+    label: 'Engineering',
     items: [
       { slug: 'spec', label: 'Technical Spec' },
       { slug: 'rdna4-tuning', label: 'RDNA4 Tuning' },
@@ -79,7 +80,7 @@ function isActive(slug: string): boolean {
   <Breadcrumbs items={breadcrumbItems} />
   <div class="doc-layout wide">
     <aside class="doc-nav">
-      <input type="checkbox" id="doc-nav-toggle" class="doc-nav-checkbox sr-only" />
+      <input type="checkbox" id="doc-nav-toggle" class="doc-nav-checkbox sr-only" aria-label="Browse documentation" />
       <div class="doc-nav-bar">
         <h3><a href="/zinc/docs/">Docs</a></h3>
         <label for="doc-nav-toggle" class="doc-nav-toggle-label" aria-label="Toggle docs navigation">
@@ -94,7 +95,7 @@ function isActive(slug: string): boolean {
             <ul>
               {section.items.map(item => (
                 <li>
-                  <a href={`/zinc/docs/${item.slug}/`} class:list={[{ active: isActive(item.slug) }]}>
+                  <a href={`/zinc/docs/${item.slug}/`} aria-current={isActive(item.slug) ? 'page' : undefined} class:list={[{ active: isActive(item.slug) }]}>
                     {item.label}
                   </a>
                 </li>
@@ -217,6 +218,17 @@ function isActive(slug: string): boolean {
 
   .doc-content {
     min-width: 0;
+  }
+
+  .doc-content :global(table) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .doc-nav-checkbox:focus-visible ~ .doc-nav-bar .doc-nav-toggle-label {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 4px;
   }
 
   .doc-content :is(h1, h2, h3, h4, h5, h6) {

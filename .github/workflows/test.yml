@@ -2,11 +2,25 @@ name: Tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: '.bun-version'
+      - name: Check changed files with Bun fmt
+        env:
+          FORMAT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bun fmt --check --changed="$FORMAT_BASE"
+
   test:
     strategy:
       fail-fast: false
@@ -15,76 +29,79 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-    - name: Setup Zig
-      uses: mlugg/setup-zig@v2
-      with:
-        version: 0.17.0
-        use-cache: false
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          use-cache: false
 
-    - name: Install Vulkan SDK (LunarG — modern shaderc/glslc with GL_EXT_integer_dot_product)
-      # Ubuntu's stock `glslc` (shaderc 2023.x and earlier on ubuntu-latest) does not
-      # recognise GL_EXT_integer_dot_product / dotPacked4x8AccSatEXT, which several
-      # DP4a shaders in src/shaders/ now require. Install LunarG's official Vulkan SDK
-      # instead — it ships a current shaderc and also provides headers + tools.
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y wget gnupg lsb-release
-        wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
-          | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
-        UB_CODENAME=$(lsb_release -cs)
-        sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-${UB_CODENAME}.list \
-          https://packages.lunarg.com/vulkan/lunarg-vulkan-${UB_CODENAME}.list
-        sudo apt-get update
-        sudo apt-get install -y vulkan-sdk libvulkan-dev vulkan-tools
-        echo "--- glslc version (must be >= 2024 for dp4a) ---"
-        glslc --version
+      - name: Install Vulkan SDK (LunarG — modern shaderc/glslc with GL_EXT_integer_dot_product)
+        # Ubuntu's stock `glslc` (shaderc 2023.x and earlier on ubuntu-latest) does not
+        # recognise GL_EXT_integer_dot_product / dotPacked4x8AccSatEXT, which several
+        # DP4a shaders in src/shaders/ now require. Install LunarG's official Vulkan SDK
+        # instead — it ships a current shaderc and also provides headers + tools.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg lsb-release
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+          UB_CODENAME=$(lsb_release -cs)
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-${UB_CODENAME}.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-${UB_CODENAME}.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk libvulkan-dev vulkan-tools
+          echo "--- glslc version (must be >= 2024 for dp4a) ---"
+          glslc --version
 
-    - name: Setup Bun
-      uses: oven-sh/setup-bun@v2
-      with:
-        bun-version: latest
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: '.bun-version'
 
-    - name: Run Zig Tests
-      run: ./scripts/zig.sh build test -Doptimize=${{ matrix.optimize }} --summary all
+      - name: Install client tooling
+        run: bun install --frozen-lockfile
 
-    - name: Build
-      run: ./scripts/zig.sh build -Doptimize=${{ matrix.optimize }} -Dinstall-hot-bench=true
+      - name: Run Zig Tests
+        run: ./scripts/zig.sh build test -Doptimize=${{ matrix.optimize }} --summary all
 
-    - name: Check CUDA host code without a GPU
-      run: ./scripts/zig.sh build check-cuda -Doptimize=${{ matrix.optimize }}
+      - name: Build
+        run: ./scripts/zig.sh build -Doptimize=${{ matrix.optimize }} -Dinstall-hot-bench=true
 
-    - name: Compile standalone tools without model or GPU execution
-      run: ./scripts/zig.sh build check-tools -Doptimize=${{ matrix.optimize }}
+      - name: Check CUDA host code without a GPU
+        run: ./scripts/zig.sh build check-cuda -Doptimize=${{ matrix.optimize }}
 
-    - name: Build ZINC_RT without GPU execution
-      run: ./scripts/zig.sh build -Dbackend=zinc_rt -Dshaders=false -Doptimize=${{ matrix.optimize }} --prefix zig-out-rt
+      - name: Compile standalone tools without model or GPU execution
+        run: ./scripts/zig.sh build check-tools -Doptimize=${{ matrix.optimize }}
+
+      - name: Build ZINC_RT without GPU execution
+        run: ./scripts/zig.sh build -Dbackend=zinc_rt -Dshaders=false -Doptimize=${{ matrix.optimize }} --prefix zig-out-rt
 
   macos-build:
     runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v5
-    - uses: mlugg/setup-zig@v2
-      with:
-        version: 0.17.0
-        use-cache: false
-    - name: Compile Metal executables and tests without GPU execution
-      run: |
-        for mode in Debug ReleaseSafe ReleaseFast ReleaseSmall; do
-          ./scripts/zig.sh build -Doptimize="$mode"
-          ./scripts/zig.sh build test-build -Doptimize="$mode"
-          ./scripts/zig.sh build check-tools -Doptimize="$mode"
-        done
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          use-cache: false
+      - name: Compile Metal executables and tests without GPU execution
+        run: |
+          for mode in Debug ReleaseSafe ReleaseFast ReleaseSmall; do
+            ./scripts/zig.sh build -Doptimize="$mode"
+            ./scripts/zig.sh build test-build -Doptimize="$mode"
+            ./scripts/zig.sh build check-tools -Doptimize="$mode"
+          done
 
   nix-build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
-    - uses: cachix/install-nix-action@v31
-    - name: Check the pinned Nix compiler
-      run: nix develop --command sh -c 'test "$(zig version)" = "$(cat .zig-version)"'
-    - name: Build the Linux Nix package without GPU execution
-      run: |
-        nix build --print-build-logs
-        ./result/bin/zinc --version
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - name: Check the pinned Nix compiler
+        run: nix develop --command sh -c 'test "$(zig version)" = "$(cat .zig-version)"'
+      - name: Build the Linux Nix package without GPU execution
+        run: |
+          nix build --print-build-logs
+          ./result/bin/zinc --version

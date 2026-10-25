@@ -6,1238 +6,217 @@ import { buildBreadcrumbList } from '../../lib/structured-data';
 import benchmarkData from '../../data/zinc-performance.json';
 
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin.ai';
-const breadcrumbItems = [
-  { name: 'Home', href: '/' },
-  { name: 'ZINC' },
+const breadcrumbItems = [{ name: 'Home', href: '/' }, { name: 'ZINC' }];
+const target = benchmarkData.targets.find((target: any) => target.id === 'rdna-rocm');
+const median = (metric: any) => metric?.median ?? metric?.avg ?? null;
+const rate = (value: number | null) => value == null ? '—' : value.toFixed(2);
+const examples = [
+  { id: 'qwen35-9b-q4k-m', label: 'Qwen 3.5 9B' },
+  { id: 'qwen38-27b-q4k-m', label: 'Qwen 3.8 27B' },
+  { id: 'gemma4-31b-q4k-m', label: 'Gemma 4 31B' },
+].map(({ id, label }) => {
+  const model = target?.models?.find((model: any) => model.id === id);
+  const scenario = model?.scenarios?.find((scenario: any) => scenario.id === 'core');
+  // Keep this cross-engine comparison non-speculative on both sides.
+  const zinc = scenario?.variants?.mtp_off?.zinc ?? scenario?.zinc;
+  return { label, zinc: median(zinc?.decode_tps), baseline: median(scenario?.baseline?.decode_tps) };
+});
+const platforms = [
+  { name: 'AMD Radeon', backend: 'Vulkan or ROCm', note: 'Linux · RDNA3 / RDNA4', href: '/zinc/docs/rocm/', link: 'AMD setup' },
+  { name: 'Apple Silicon', backend: 'Metal', note: 'macOS · M-series', href: '/zinc/docs/getting-started/#macos-apple-silicon', link: 'Mac setup' },
+  { name: 'Intel Arc', backend: 'Vulkan', note: 'Linux · Xe2 / Battlemage', href: '/zinc/docs/intel-gpu-reference/', link: 'Intel setup' },
+  { name: 'NVIDIA RTX', backend: 'CUDA · experimental', note: 'Linux / WSL2', href: '/zinc/docs/hardware-requirements/', link: 'Requirements' },
 ];
-const discordUrl = 'https://discord.gg/QRUgWH2aGV';
-
-function metricMedian(summary: any) {
-  return summary?.median ?? summary?.avg ?? null;
-}
-
-function formatTokNumber(value: number | null | undefined, digits = 2) {
-  if (value == null || Number.isNaN(value)) return 'n/a';
-  return value.toFixed(digits);
-}
-
-function formatTok(value: number | null | undefined, digits = 2) {
-  const formatted = formatTokNumber(value, digits);
-  return formatted === 'n/a' ? formatted : `${formatted} tok/s`;
-}
-
-function formatMultiplier(zinc: number | null | undefined, baseline: number | null | undefined) {
-  if (zinc == null || baseline == null || Number.isNaN(zinc) || Number.isNaN(baseline) || baseline <= 0) return 'n/a';
-  return `${(zinc / baseline).toFixed(2)}x`;
-}
-
-function formatPercent(value: number | null | undefined) {
-  if (value == null || Number.isNaN(value)) return 'n/a';
-  return `${Math.round(value)}%`;
-}
-
-function formatRefreshDate(iso: string | null | undefined) {
-  return iso?.slice(0, 10) ?? 'latest';
-}
-
-function formatMeasuredRuns(methodology: any) {
-  const runs = methodology?.runs ?? 3;
-  const min = methodology?.runs_min ?? runs;
-  const max = methodology?.runs_max ?? runs;
-  const measured = min === max ? `${runs}` : `${min}–${max}`;
-  const warmups = methodology?.warmup_runs ?? 1;
-  return `median of ${measured} measured runs after ${warmups} warmup`;
-}
-
-function targetById(id: string) {
-  return benchmarkData.targets.find((target: any) => target.id === id) ?? null;
-}
-
-// The landing page quotes like-for-like numbers only. Where ZINC speculated
-// (Qwen 3.8's NextN block) and llama.cpp did not, use the measured
-// non-speculative variant, as the benchmark page does by default.
-function likeForLikeScenario(scenario: any) {
-  const off = scenario?.variants?.mtp_off;
-  if (!off?.zinc) return scenario;
-  return { ...scenario, zinc: off.zinc, comparison: off.comparison ?? scenario.comparison };
-}
-
-function likeForLikeModel(model: any) {
-  if (!model) return null;
-  const scenarios = (model.scenarios ?? []).map(likeForLikeScenario);
-  const primary = scenarios.find((scenario: any) => scenario.id === 'core') ?? scenarios[0];
-  if (!primary?.variants?.mtp_off?.zinc) return { ...model, scenarios };
-  return { ...model, scenarios, zinc: primary.zinc, comparison: primary.comparison ?? model.comparison };
-}
-
-function modelById(target: any, id: string) {
-  return likeForLikeModel(target?.models?.find((model: any) => model.id === id) ?? null);
-}
-
-function displayModelLabel(label: string) {
-  return label
-    .replace(/\bQ4_K_XL\b/g, 'Q4K XL')
-    .replace(/\bQ4_K_M\b/g, 'Q4K M');
-}
-
-const rdnaTarget = targetById('rdna');
-const rdnaRocmTarget = targetById('rdna-rocm');
-const cudaTarget = targetById('cuda');
-const intelTarget = targetById('intel');
-const metalTarget = targetById('metal');
-const rdna35 = modelById(rdnaTarget, 'qwen36-35b-a3b-q4k-xl');
-const rdnaRocmQwen38 = modelById(rdnaRocmTarget, 'qwen38-27b-q4k-m');
-const metal35 = modelById(metalTarget, 'qwen36-35b-a3b-q4k-xl');
-
-const rdna35Decode = metricMedian(rdna35?.zinc?.decode_tps);
-const rdna35BaselineDecode = metricMedian(rdna35?.baseline?.decode_tps);
-const rdnaRocmQwen38Decode = metricMedian(rdnaRocmQwen38?.zinc?.decode_tps);
-const rdnaRocmQwen38BaselineDecode = metricMedian(rdnaRocmQwen38?.baseline?.decode_tps);
-const rdnaRocmQwen38Prefill = metricMedian(rdnaRocmQwen38?.zinc?.prefill_tps);
-const rdnaRocmQwen38BaselinePrefill = metricMedian(rdnaRocmQwen38?.baseline?.prefill_tps);
-const metal35Decode = metricMedian(metal35?.zinc?.decode_tps);
-
-const homeDescription = `Run GGUF models locally with ZINC. Use ROCm or Vulkan on AMD Radeon, Vulkan on Intel Arc, Metal on Apple Silicon, or the experimental CUDA backend on NVIDIA RTX.`;
-const appDescription = `A Zig inference engine for running GGUF models on consumer GPUs, with ROCm, Vulkan, Metal, and experimental CUDA backends.`;
-const performanceAnswer = `On the Radeon AI PRO R9700 (32GB, 640 GB/s), ZINC publishes independent ROCm and Vulkan server comparisons against llama.cpp, and ROCm is the headline Radeon result. On ROCm, Qwen 3.8 27B reaches ${formatTokNumber(rdnaRocmQwen38Decode)} tok/s decode versus ${formatTokNumber(rdnaRocmQwen38BaselineDecode)}, and ${formatTokNumber(rdnaRocmQwen38Prefill)} tok/s prefill versus ${formatTokNumber(rdnaRocmQwen38BaselinePrefill)}, both measured without speculative decoding against llama.cpp's ${rdnaRocmTarget?.methodology?.llama_backend ?? 'GPU'} backend on the same card. The portable Vulkan build reaches ${formatTokNumber(rdna35Decode)} tok/s on Qwen3.6-35B-A3B (${formatMultiplier(rdna35Decode, rdna35BaselineDecode)} llama.cpp). On the current Apple Silicon validation box, a Mac Studio (Mac16,9) with Apple M4 Max, 40-core GPU, and 64 GB unified memory, Qwen3.6-35B-A3B measures ${formatTokNumber(metal35Decode)} tok/s decode in the Metal benchmark.`;
-
-function ratioX(zinc: number | null | undefined, baseline: number | null | undefined) {
-  if (zinc == null || baseline == null || Number.isNaN(zinc) || Number.isNaN(baseline) || baseline <= 0) return null;
-  return zinc / baseline;
-}
-
-function formatRatioX(zinc: number | null | undefined, baseline: number | null | undefined) {
-  const r = ratioX(zinc, baseline);
-  return r == null ? 'n/a' : `${r.toFixed(2)}x`;
-}
-
-function ratioTone(zinc: number | null | undefined, baseline: number | null | undefined) {
-  const r = ratioX(zinc, baseline);
-  if (r == null) return 'neutral';
-  if (r >= 1) return 'win';
-  if (r >= 0.8) return 'close';
-  return 'behind';
-}
-
-function barPct(value: number | null | undefined, max: number | null | undefined) {
-  if (value == null || Number.isNaN(value) || max == null || max <= 0) return 0;
-  return Math.max(3, Math.min(100, (value / max) * 100));
-}
-
-function buildBoard(target: any, ids: string[]) {
-  const rows = ids
-    .map((id) => modelById(target, id))
-    .filter(Boolean)
-    .map((model: any) => ({
-      label: displayModelLabel(model.label ?? model.id),
-      zincDecode: metricMedian(model.zinc?.decode_tps),
-      baselineDecode: metricMedian(model.baseline?.decode_tps),
-      zincPrefill: metricMedian(model.zinc?.prefill_tps),
-      baselinePrefill: metricMedian(model.baseline?.prefill_tps),
-      overallPct: model.comparison?.overall_pct_of_baseline ?? null,
-      endToEndPct: model.comparison?.end_to_end_pct_of_baseline ?? null,
-    }));
-  const decodeMax = Math.max(0, ...rows.flatMap((r) => [r.zincDecode, r.baselineDecode]).filter((v): v is number => v != null && !Number.isNaN(v)));
-  const prefillMax = Math.max(0, ...rows.flatMap((r) => [r.zincPrefill, r.baselinePrefill]).filter((v): v is number => v != null && !Number.isNaN(v)));
-  return { rows, decodeMax, prefillMax };
-}
-
-const rdnaBoard = buildBoard(rdnaTarget, [
-  'qwen36-35b-a3b-q4k-xl',
-  'qwen35-9b-q4k-m',
-  'qwen38-27b-q4k-m',
-  'gemma4-26b-a4b-q4k-m',
-  'gemma4-31b-q4k-m',
-]);
-
-const rdnaRocmBoard = buildBoard(rdnaRocmTarget, [
-  'muse-glimmer-30b-q4k-m',
-  'qwen38-27b-q4k-m',
-  'qwen36-35b-a3b-q4k-xl',
-  'qwen35-9b-q4k-m',
-  'gemma4-26b-a4b-q4k-m',
-  'gemma4-31b-q4k-m',
-]);
-
-const metalBoard = buildBoard(metalTarget, [
-  'qwen36-35b-a3b-q4k-xl',
-  'qwen3-8b-q4k-m',
-  'gemma4-26b-a4b-q4k-m',
-  'gemma4-31b-q4k-m',
-]);
-
-const rdnaModelCount = rdnaBoard.rows.length;
-const rdnaDecodeWins = rdnaBoard.rows.filter((row) => (ratioX(row.zincDecode, row.baselineDecode) ?? 0) >= 1).length;
-const rdnaPrefillWins = rdnaBoard.rows.filter((row) => (ratioX(row.zincPrefill, row.baselinePrefill) ?? 0) >= 1).length;
-const rdnaOverallWins = rdnaBoard.rows.filter((row) => (row.overallPct ?? 0) >= 100).length;
-const rdnaRocmModelCount = rdnaRocmTarget?.summary?.benchmarked_models ?? rdnaRocmTarget?.models?.length ?? 0;
-const rdnaRocmSuccessfulCount = rdnaRocmTarget?.summary?.successful_models ?? 0;
-const rdnaRocmDecodeWins = rdnaRocmBoard.rows.filter((row) => (ratioX(row.zincDecode, row.baselineDecode) ?? 0) >= 1).length;
-const rdnaRocmPrefillWins = rdnaRocmBoard.rows.filter((row) => (ratioX(row.zincPrefill, row.baselinePrefill) ?? 0) >= 1).length;
-const rdnaRocmOverallWins = rdnaRocmBoard.rows.filter((row) => (row.overallPct ?? 0) >= 100).length;
-const rdnaRocmQwen38ScenarioWins = (rdnaRocmQwen38?.scenarios ?? []).filter((scenario: any) =>
-  (metricMedian(scenario.zinc?.decode_tps) ?? 0) > (metricMedian(scenario.baseline?.decode_tps) ?? Number.POSITIVE_INFINITY)
-  && (metricMedian(scenario.zinc?.prefill_tps) ?? 0) > (metricMedian(scenario.baseline?.prefill_tps) ?? Number.POSITIVE_INFINITY)
-).length;
-
-const amdBackends = [
-  {
-    id: 'rocm',
-    label: 'ROCm',
-    target: rdnaRocmTarget,
-    board: rdnaRocmBoard,
-    modelCount: rdnaRocmModelCount,
-    decodeWins: rdnaRocmDecodeWins,
-    prefillWins: rdnaRocmPrefillWins,
-    overallWins: rdnaRocmOverallWins,
-    headline: formatTokNumber(rdnaRocmQwen38Decode, 1),
-    headlineLabel: 'Qwen 3.8 decode tok/s',
-    headlineNote: `${formatTokNumber(rdnaRocmQwen38BaselineDecode, 1)} in llama.cpp, neither speculating`,
-  },
-  {
-    id: 'vulkan',
-    label: 'Vulkan',
-    target: rdnaTarget,
-    board: rdnaBoard,
-    modelCount: rdnaModelCount,
-    decodeWins: rdnaDecodeWins,
-    prefillWins: rdnaPrefillWins,
-    overallWins: rdnaOverallWins,
-    headline: formatTokNumber(rdna35Decode, 1),
-    headlineLabel: 'tok/s top decode',
-    headlineNote: 'Qwen3.6 35B A3B',
-  },
-];
-
-const platformCards = [
-  {
-    title: 'AMD Radeon',
-    backend: 'ROCm',
-    status: 'Supported',
-    metric: `${rdnaRocmDecodeWins}/${rdnaRocmModelCount} decode wins`,
-    note: `${rdnaRocmSuccessfulCount}/${rdnaRocmModelCount} model rows complete; Qwen 3.8 wins ${rdnaRocmQwen38ScenarioWins}/4 workloads.`,
-  },
-  {
-    title: 'AMD Radeon',
-    backend: 'Vulkan',
-    status: 'Supported',
-    metric: `${rdnaDecodeWins}/${rdnaModelCount} decode wins`,
-    note: 'Five RDNA4 models measured against llama.cpp.',
-  },
-  {
-    title: 'Apple Silicon',
-    backend: 'Metal',
-    status: 'Supported',
-    metric: `${formatTokNumber(metalTarget?.summary?.fastest_decode_tps, 1)} tok/s top decode`,
-    note: 'Native MSL kernels and zero-copy unified-memory loading.',
-  },
-  {
-    title: 'NVIDIA RTX',
-    backend: 'CUDA',
-    status: 'Experimental',
-    metric: `${formatTokNumber(cudaTarget?.summary?.fastest_decode_tps, 1)} tok/s top decode`,
-    note: 'RTX 5090/4090 CUDA path is measured and still maturing.',
-  },
-  {
-    title: 'Intel Arc',
-    backend: 'Vulkan',
-    status: 'Supported',
-    metric: `${formatTokNumber(intelTarget?.summary?.fastest_decode_tps, 1)} tok/s top decode`,
-    note: 'Official Linux Vulkan target with four model rows published.',
-  },
-];
-
-const jsonLd = {
-  '@context': 'https://schema.org',
-  '@graph': [
-    {
-      '@type': 'SoftwareApplication',
-      name: 'ZINC',
-      description: appDescription,
-      applicationCategory: 'DeveloperApplication',
-      operatingSystem: 'Linux, macOS',
-      url: `${siteUrl}/zinc`,
-      codeRepository: 'https://github.com/zolotukhin/zinc',
-      author: {
-        '@type': 'Person',
-        name: 'Stepan Zolotukhin',
-        url: `${siteUrl}/about`,
-      },
-      keywords: 'consumer GPU LLM inference, local LLM inference engine, AMD GPU LLM inference, Apple Silicon LLM inference, NVIDIA CUDA LLM inference, Intel Arc LLM inference, Radeon LLM inference, RDNA4 inference, Vulkan compute, ROCm HIP inference, Metal inference, CUDA backend, Zig, TurboQuant, KV cache compression, OpenAI API, local AI, vLLM alternative, llama.cpp alternative',
-    },
-    {
-      '@type': 'FAQPage',
-      mainEntity: [
-        {
-          '@type': 'Question',
-          name: 'Which consumer GPUs does ZINC target?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'ZINC runs local models on AMD Radeon through ROCm or Vulkan, Intel Arc through Vulkan, Apple Silicon through Metal, and NVIDIA RTX through an experimental CUDA backend.',
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'Should I use ROCm or Vulkan on AMD Radeon?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'ZINC supports AMD Radeon through both ROCm and Vulkan. ROCm is the primary Radeon path and the one the dashboard leads with: it runs the HIP runtime and the dedicated gfx1201 kernels, and it posts the widest prompt-processing margins over llama.cpp. Vulkan needs no ROCm installation and currently generates tokens faster on several models, so the dashboard publishes the two backends independently on the same Radeon AI PRO R9700 rather than picking one for you.',
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'Which GPUs are fastest for local LLM inference with ZINC?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: `The Radeon AI PRO R9700 (32 GB, 640 GB/s) is the primary RDNA4 tuning target. The dashboard publishes both ROCm and Vulkan runs on that card, alongside Intel Arc Vulkan results, Apple Silicon Metal results, and NVIDIA RTX CUDA experiments.`,
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'How does ZINC compare to llama.cpp and vLLM?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'llama.cpp is the broad local baseline and vLLM is commonly used for larger CUDA and ROCm servers. ZINC focuses on consumer GPUs, with dedicated Vulkan, ROCm, Metal, and experimental CUDA code plus an OpenAI-compatible API and built-in chat UI.',
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'What performance does ZINC achieve on RDNA4 and Apple Silicon?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: performanceAnswer,
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'What is TurboQuant and how does it help?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'TurboQuant is ZINC\'s KV-compression direction and public implementation spec for 2-4 bit cache compression. It is part of the roadmap and not the reason for the current benchmark numbers on the public site.',
-          },
-        },
-      ],
-    },
-    buildBreadcrumbList(siteUrl, breadcrumbItems),
-  ],
-};
+const description = 'Run GGUF language models on your own GPU with ZINC. Start with browser chat, use the command line, or connect an app through the OpenAI-compatible API.';
 ---
 
 <BaseLayout
-  title="ZINC — Local LLM Inference for Consumer GPUs"
-  description={homeDescription}
-  keywords="ZINC, consumer GPU LLM inference, local LLM inference engine, AMD GPU LLM inference, Apple Silicon Metal inference, NVIDIA CUDA LLM inference, Intel Arc LLM inference, Radeon LLM inference, RDNA4 inference, RDNA3 inference, ROCm HIP inference, RX 9070 XT, RTX 5090, Intel Arc, Vulkan compute, Metal, CUDA, Zig, TurboQuant, KV cache compression, vLLM alternative, llama.cpp alternative, OpenAI compatible API, local AI, GGUF, Qwen, Gemma"
-  jsonLd={jsonLd}
+  title="ZINC — Run local AI on your GPU"
+  description={description}
+  keywords="ZINC, local AI, GGUF, GPU inference, Zig, AMD Radeon, ROCm, Vulkan, Apple Silicon, Metal, Intel Arc, OpenAI-compatible API"
+  jsonLd={{
+    '@context': 'https://schema.org',
+    '@graph': [
+      {
+        '@type': 'SoftwareApplication', name: 'ZINC', description,
+        url: `${siteUrl}/zinc/`, applicationCategory: 'DeveloperApplication',
+        operatingSystem: 'Linux, macOS',
+        codeRepository: 'https://github.com/zolotukhin/zinc',
+        license: 'https://github.com/zolotukhin/zinc/blob/main/LICENSE',
+        offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+      },
+      buildBreadcrumbList(siteUrl, breadcrumbItems),
+    ],
+  }}
 >
   <Breadcrumbs items={breadcrumbItems} />
+
   <section class="hero">
-    <img src="/zinc-logo.png" alt="ZINC inference engine logo — lightning bolt on circuit board" class="logo" width="120" height="120" />
-    <p class="hero-eyebrow">Local LLM inference</p>
-    <h1>Run local models on your own GPU</h1>
-    <p class="tagline">ZINC is a Zig program for running GGUF models. It includes a command-line tool, a browser chat UI, and an OpenAI-compatible API.</p>
-    <p class="hero-platforms">Use <strong>ROCm or Vulkan</strong> on AMD Radeon, <strong>Vulkan</strong> on Intel Arc, or <strong>Metal</strong> on Apple Silicon. The NVIDIA CUDA backend is experimental.</p>
-    <div class="hero-links">
-      <a href="https://github.com/zolotukhin/zinc" class="hero-link">
-        <svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-        View on GitHub
-      </a>
-      <a href="/zinc/benchmarks/" class="hero-link hero-link-benchmarks">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 19h16"/><path d="M7 16V9"/><path d="M12 16V5"/><path d="M17 16v-4"/></svg>
-        Benchmarks
-      </a>
-      <a href={discordUrl} class="hero-link hero-link-discord">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M20.317 4.369A19.791 19.791 0 0015.558 3c-.206.375-.446.872-.61 1.264a18.27 18.27 0 00-5.896 0A12.64 12.64 0 008.44 3a19.736 19.736 0 00-4.76 1.369C.533 9.091-.32 13.699.099 18.243a19.9 19.9 0 005.993 3.03c.486-.665.918-1.368 1.288-2.109-.709-.268-1.388-.602-2.028-.99.17-.124.336-.252.496-.385 3.915 1.84 8.163 1.84 12.032 0 .162.133.328.261.496.385-.642.39-1.323.724-2.033.992.37.739.8 1.442 1.288 2.107a19.861 19.861 0 005.995-3.03c.492-5.265-.84-9.831-3.31-13.874zM8.02 15.331c-1.182 0-2.157-1.085-2.157-2.419 0-1.334.956-2.419 2.157-2.419 1.209 0 2.176 1.094 2.157 2.419 0 1.334-.956 2.419-2.157 2.419zm7.96 0c-1.182 0-2.157-1.085-2.157-2.419 0-1.334.956-2.419 2.157-2.419 1.209 0 2.176 1.094 2.157 2.419 0 1.334-.948 2.419-2.157 2.419z"/></svg>
-        Join ZINC Discord
-      </a>
-    </div>
-  </section>
-
-  <section class="platform-strip" aria-label="Consumer GPU backend status">
-    {platformCards.map((card) => (
-      <article class="platform-card">
-        <div class="platform-card-head">
-          <strong>{card.title}</strong>
-          <span>{card.backend}</span>
-        </div>
-        <p class="platform-status">{card.status}</p>
-        <p class="platform-metric">{card.metric}</p>
-        <small>{card.note}</small>
-      </article>
-    ))}
-  </section>
-
-  <section class="amd-sweep" aria-labelledby="amd-sweep-heading">
-    <div class="sweep-header">
-      <div>
-        <p class="section-kicker">Measured on one Radeon</p>
-        <h2 id="amd-sweep-heading">Choose ROCm or Vulkan</h2>
+    <div>
+      <p class="wordmark"><img src="/zinc-logo.png" alt="" width="40" height="40" /> ZINC</p>
+      <h1>Run local AI<br />on your GPU.</h1>
+      <p class="intro">Load a GGUF model, chat in your browser, or connect an app through the OpenAI-compatible API.</p>
+      <div class="actions">
+        <a href="/zinc/docs/getting-started/" class="button primary">Get started <span aria-hidden="true">→</span></a>
+        <a href="https://github.com/zolotukhin/zinc" class="button">View on GitHub <span aria-hidden="true">↗</span></a>
       </div>
-      <span class="sweep-machine">Radeon AI PRO R9700 · 32 GB · 640 GB/s</span>
+      <p class="build-note">One native binary · Zig 0.17 · MIT licensed</p>
     </div>
-    <p class="sweep-intro">Both are supported AMD backends. The numbers stay separate so you can compare the build you actually plan to run.</p>
+    <div class="use-cases" aria-label="Ways to use ZINC">
+      <a href="/zinc/docs/getting-started/#start-the-chat-ui">
+        <span class="number" aria-hidden="true">01</span>
+        <div><h2>Chat in your browser</h2><p>A built-in interface for local conversations.</p></div>
+        <span aria-hidden="true">↗</span>
+      </a>
+      <a href="/zinc/docs/running-zinc/">
+        <span class="number" aria-hidden="true">02</span>
+        <div><h2>Use the terminal</h2><p>Run a prompt or work with your own GGUF files.</p></div>
+        <span aria-hidden="true">↗</span>
+      </a>
+      <a href="/zinc/docs/api/">
+        <span class="number" aria-hidden="true">03</span>
+        <div><h2>Connect your apps</h2><p>Use an OpenAI-compatible local API.</p></div>
+        <span aria-hidden="true">↗</span>
+      </a>
+    </div>
+  </section>
 
-    <nav class="amd-backend-tabs" aria-label="AMD benchmark backend" role="tablist">
-      {amdBackends.map((backend, index) => (
-        <button
-          type="button"
-          role="tab"
-          id={`amd-tab-${backend.id}`}
-          aria-controls={`amd-panel-${backend.id}`}
-          aria-selected={index === 0 ? 'true' : 'false'}
-          class:list={['amd-backend-tab', { active: index === 0 }]}
-          data-amd-backend-tab={backend.id}
-        >
-          <strong>{backend.label}</strong>
-          <span>{backend.decodeWins}/{backend.modelCount} decode wins</span>
-        </button>
+  <section class="page-section quickstart" aria-labelledby="start-heading">
+    <div class="section-copy">
+      <p class="eyebrow">Get running</p>
+      <h2 id="start-heading">Start with one model.</h2>
+      <p>Follow the <a href="/zinc/docs/getting-started/">setup guide</a> to install the prerequisites for your GPU, then build and open a chat.</p>
+      <p>The build selects Vulkan on Linux and Metal on macOS. The wrapper downloads and verifies Zig 0.17.0 when needed.</p>
+      <p class="setup-note">AMD with Vulkan: set <code>RADV_PERFTEST=coop_matrix</code> before the GPU check or chat. ROCm has its own <a href="/zinc/docs/rocm/">build instructions</a>.</p>
+    </div>
+    <div class="terminal-wrap">
+      <TerminalWindow title="Build and chat" density="compact" code={`git clone https://github.com/zolotukhin/zinc.git
+cd zinc
+./scripts/zig.sh build -Doptimize=ReleaseFast
+
+./zig-out/bin/zinc --check
+./zig-out/bin/zinc model pull qwen35-9b-q4k-m
+./zig-out/bin/zinc chat --model-id qwen35-9b-q4k-m`} />
+      <p class="caption">The example downloads Qwen 3.5 9B. Check <a href="/zinc/docs/hardware-requirements/">memory requirements</a> or use <code>zinc model list</code> to browse the catalog.</p>
+    </div>
+  </section>
+
+  <section class="page-section" aria-labelledby="hardware-heading">
+    <div class="section-copy">
+      <p class="eyebrow">Use your hardware</p>
+      <h2 id="hardware-heading">Choose your GPU path.</h2>
+      <p>AMD, Apple Silicon and Intel Arc are supported. NVIDIA CUDA is experimental. Model coverage varies by backend.</p>
+      <a class="text-link" href="/zinc/docs/hardware-requirements/">Check hardware and memory requirements →</a>
+    </div>
+    <div class="platforms">
+      {platforms.map(platform => (
+        <a href={platform.href} class="platform">
+          <div><h3>{platform.name}</h3><p>{platform.note}</p></div>
+          <div class="platform-detail"><span>{platform.backend}</span><small>{platform.link} <span aria-hidden="true">↗</span></small></div>
+        </a>
       ))}
+    </div>
+  </section>
+
+  <section class="page-section" aria-labelledby="performance-heading">
+    <div class="section-copy">
+      <p class="eyebrow">Measured in the open</p>
+      <h2 id="performance-heading">See how it performs.</h2>
+      <p>Compare ZINC with llama.cpp on the same GPU, GGUF file and prompts, using reusable servers and repeated runs.</p>
+      <a class="text-link" href="/zinc/benchmarks/">Explore all models and GPUs →</a>
+    </div>
+    <div class="results">
+      <table>
+        <caption>Answer generation · tokens per second</caption>
+        <thead><tr><th scope="col">Model</th><th scope="col">ZINC</th><th scope="col">llama.cpp</th></tr></thead>
+        <tbody>{examples.map(row => (
+          <tr><th scope="row">{row.label}</th><td><strong>{rate(row.zinc)}</strong></td><td>{rate(row.baseline)}</td></tr>
+        ))}</tbody>
+      </table>
+      <p class="caption">Radeon AI PRO R9700 · ROCm · Q4_K_M · Quick Chat median · {target?.generated_at?.slice(0, 10)}. Speculative decoding is off for both engines. <a href="/zinc/benchmarks/#rdna-rocm">Method and samples →</a></p>
+      <p class="engineering-note">Latest engineering note: <a href="/zinc/docs/rocm-mtp-0-17/">faster Qwen 3.8 27B speculative decoding on Zig 0.17 →</a></p>
+    </div>
+  </section>
+
+  <section class="next-steps" aria-labelledby="next-heading">
+    <h2 id="next-heading">Go a little further.</h2>
+    <nav aria-label="More ZINC resources">
+      <a href="/zinc/docs/">Browse documentation <span aria-hidden="true">→</span></a>
+      <a href="/zinc/docs/api/">Connect an API client <span aria-hidden="true">→</span></a>
+      <a href="/zinc/docs/development/">Build and contribute <span aria-hidden="true">→</span></a>
+      <a href="https://discord.gg/QRUgWH2aGV">Join the community <span aria-hidden="true">↗</span></a>
     </nav>
-
-    {amdBackends.map((backend, index) => (
-      <div
-        id={`amd-panel-${backend.id}`}
-        role="tabpanel"
-        aria-labelledby={`amd-tab-${backend.id}`}
-        class:list={['amd-backend-panel', { active: index === 0 }]}
-        data-amd-backend-panel={backend.id}
-        hidden={index !== 0}
-      >
-        {backend.id === 'rocm' && (
-          <aside class="result-callout">
-            <div>
-              <p class="section-kicker">Latest: Qwen 3.8 27B</p>
-              <strong>ZINC is ahead of the latest upstream llama.cpp build in all four workloads.</strong>
-            </div>
-            <p><b>{formatTok(rdnaRocmQwen38Decode, 2)}</b> decode vs {formatTok(rdnaRocmQwen38BaselineDecode, 2)} · <b>{formatTok(rdnaRocmQwen38Prefill, 1)}</b> prefill vs {formatTok(rdnaRocmQwen38BaselinePrefill, 1)}</p>
-          </aside>
-        )}
-
-        <div class="backend-runline">
-          <strong>{backend.label}</strong>
-          <span>{formatRefreshDate(backend.target?.generated_at)} · reusable servers · {formatMeasuredRuns(backend.target?.methodology)}</span>
-        </div>
-
-        <div class="perf-stats">
-          <article class="perf-stat highlight">
-            <strong>{backend.decodeWins}/{backend.modelCount}</strong>
-            <span>decode wins</span>
-            <small>ZINC vs llama.cpp</small>
-          </article>
-          <article class="perf-stat">
-            <strong>{backend.prefillWins}/{backend.modelCount}</strong>
-            <span>prefill wins</span>
-            <small>same prompts and GGUF files</small>
-          </article>
-          <article class="perf-stat">
-            <strong>{backend.overallWins}/{backend.modelCount}</strong>
-            <span>overall wins</span>
-            <small>combined prefill and decode</small>
-          </article>
-          <article class="perf-stat">
-            <strong>{backend.headline}</strong>
-            <span>{backend.headlineLabel}</span>
-            <small>{backend.headlineNote}</small>
-          </article>
-        </div>
-
-        <div class="perf-board rdna-showcase" role="img" aria-label={`ZINC vs llama.cpp ${backend.label} throughput on AMD RDNA4`}>
-          <div class="perf-board-legend">
-            <span><i class="perf-swatch zinc"></i>ZINC</span>
-            <span><i class="perf-swatch baseline"></i>llama.cpp</span>
-            <span class="perf-board-note">decode tok/s · higher is better</span>
-          </div>
-          {backend.board.rows.map((row) => (
-            <article class="perf-bench-row">
-              <div class="perf-bench-head">
-                <strong>{row.label}</strong>
-                <span class:list={['perf-ratio', ratioTone(row.zincDecode, row.baselineDecode)]}>{formatRatioX(row.zincDecode, row.baselineDecode)} llama.cpp</span>
-              </div>
-              <div class="perf-bar">
-                <span class="perf-bar-tag">ZINC</span>
-                <div class="perf-track"><i class="perf-fill zinc" style={`width:${barPct(row.zincDecode, backend.board.decodeMax)}%`}></i></div>
-                <span class="perf-bar-val">{formatTok(row.zincDecode, 1)}</span>
-              </div>
-              <div class="perf-bar">
-                <span class="perf-bar-tag muted">llama</span>
-                <div class="perf-track"><i class="perf-fill baseline" style={`width:${barPct(row.baselineDecode, backend.board.decodeMax)}%`}></i></div>
-                <span class="perf-bar-val">{formatTok(row.baselineDecode, 1)}</span>
-              </div>
-              <p class="perf-prefill">
-                Prefill <strong>{formatTok(row.zincPrefill, 0)}</strong> ZINC · {formatTok(row.baselinePrefill, 0)} llama.cpp · Overall <strong>{formatPercent(row.overallPct)}</strong>
-              </p>
-            </article>
-          ))}
-        </div>
-      </div>
-    ))}
-    <p class="perf-caption">Each result uses reusable ZINC and llama.cpp servers on the same GPU, with the same GGUF file, prompts, warmup count, and measured run count. The <a href="/zinc/benchmarks/">benchmark page</a> includes all four workloads, sample spreads, and the exact run configuration.</p>
-  </section>
-
-  <section class="start-panel" aria-label="ZINC documentation links">
-    <div class="start-links">
-      <a href="/zinc/docs/getting-started/">Getting Started</a>
-      <a href="/zinc/docs/hardware-requirements/">Hardware Requirements</a>
-      <a href="/zinc/docs/running-zinc/">Running ZINC</a>
-      <a href="/zinc/docs/">All Docs</a>
-    </div>
-  </section>
-
-  <section>
-    <p>ZINC loads GGUF files directly and runs them on a local GPU. AMD users can choose Vulkan or ROCm; the two builds and their benchmark results are kept separate. Intel Arc uses Vulkan, Apple Silicon uses Metal, and NVIDIA support is being developed through CUDA.</p>
-
-    <p>The project is under active development. The command-line path and the listed models receive the most testing. Model coverage and performance are not yet equal across every backend, so the benchmark page shows incomplete and failed rows as well as successful ones.</p>
-
-    <h2>Why another engine?</h2>
-
-    <table>
-      <thead>
-        <tr><th></th><th>ZINC</th><th>Typical datacenter stack</th><th>General local stack</th></tr>
-      </thead>
-      <tbody>
-        <tr><td><strong>Main use</strong></td><td>Local inference on consumer GPUs</td><td>Larger CUDA/ROCm servers</td><td>Local inference on many kinds of hardware</td></tr>
-        <tr><td><strong>Backends</strong></td><td>Vulkan, ROCm, Metal, CUDA experiments</td><td>CUDA/ROCm first</td><td>CPU plus many GPU backends</td></tr>
-        <tr><td><strong>AMD RDNA</strong></td><td>Vulkan and ROCm</td><td>ROCm</td><td>Several available backends</td></tr>
-        <tr><td><strong>Apple Silicon</strong></td><td>Native Metal backend</td><td>Not the target</td><td>Mature Metal path</td></tr>
-        <tr><td><strong>NVIDIA RTX</strong></td><td>Experimental CUDA path</td><td>Primary target</td><td>Mature CUDA path</td></tr>
-        <tr><td><strong>KV cache compression</strong></td><td>TurboQuant roadmap / experimental path</td><td>No</td><td>No</td></tr>
-        <tr><td><strong>OpenAI API</strong></td><td>Native</td><td>Native</td><td>Via server wrapper</td></tr>
-      </tbody>
-    </table>
-
-    <h2>Other measured targets</h2>
-
-    <p>The AMD board above switches between the independently measured Vulkan and ROCm suites. The <a href="/zinc/benchmarks/#rdna-rocm">full dashboard</a> adds all four workloads, latency and sample spreads, plus Intel Arc, Apple Silicon, and NVIDIA CUDA results.</p>
-
-    <h3 class="perf-heading">Apple Silicon — Mac Studio (M4 Max) <span class="perf-sub">40-core GPU · 64 GB unified · {formatRefreshDate(metalTarget?.generated_at)}</span></h3>
-    <div class="perf-board" role="img" aria-label="ZINC vs llama.cpp decode throughput on Apple M4 Max">
-      <div class="perf-board-legend">
-        <span><i class="perf-swatch zinc"></i>ZINC</span>
-        <span><i class="perf-swatch baseline"></i>llama.cpp</span>
-        <span class="perf-board-note">decode tok/s · higher is better</span>
-      </div>
-      {metalBoard.rows.map((row) => (
-        <article class="perf-bench-row">
-          <div class="perf-bench-head">
-            <strong>{row.label}</strong>
-            <span class:list={['perf-ratio', ratioTone(row.zincDecode, row.baselineDecode)]}>{formatRatioX(row.zincDecode, row.baselineDecode)} llama.cpp</span>
-          </div>
-          <div class="perf-bar">
-            <span class="perf-bar-tag">ZINC</span>
-            <div class="perf-track"><i class="perf-fill zinc" style={`width:${barPct(row.zincDecode, metalBoard.decodeMax)}%`}></i></div>
-            <span class="perf-bar-val">{formatTok(row.zincDecode, 1)}</span>
-          </div>
-          <div class="perf-bar">
-            <span class="perf-bar-tag muted">llama</span>
-            <div class="perf-track"><i class="perf-fill baseline" style={`width:${barPct(row.baselineDecode, metalBoard.decodeMax)}%`}></i></div>
-            <span class="perf-bar-val">{formatTok(row.baselineDecode, 1)}</span>
-          </div>
-          <p class="perf-prefill">Prefill <strong>{formatTok(row.zincPrefill, 0)}</strong> ZINC · {formatTok(row.baselinePrefill, 0)} llama.cpp</p>
-        </article>
-      ))}
-    </div>
-    <p class="perf-caption">These results come from the Mac Studio listed above; they are not an average across Apple devices. Metal performance still varies by model, and the complete rows are available on the benchmark page.</p>
-
-    <h2>What ZINC does</h2>
-
-    <p>ZINC has separate GPU implementations for Vulkan, ROCm/HIP, Metal, and CUDA. On AMD, choose the backend when you build. Intel uses Vulkan, Apple Silicon uses <a href="/zinc/docs/apple-metal-reference/">Metal</a>, and NVIDIA uses the experimental CUDA build.</p>
-
-    <p>The server provides <code>POST /v1/chat/completions</code>, streaming responses, and a built-in chat page. Existing clients can use the <a href="/zinc/docs/api/">OpenAI-compatible API</a>.</p>
-
-    <p>Models load from memory-mapped GGUF files. Current quantization support includes Q4_K, Q5_K, Q6_K, Q8_0, and F16. The tested model families are listed in the <a href="/zinc/docs/running-zinc/">model guide</a>.</p>
-
-    <p>Models that ship an appended NextN block — Qwen 3.8 today — generate with self-speculation: the small block drafts the next tokens and the full model verifies them in one batched pass, keeping only the ones it agrees with. Output is identical to ordinary decoding, so it is a speed change and not a quality trade. It runs on the Vulkan and ROCm servers for a single request slot. llama.cpp can speculate with the same block by exporting it as a separate draft model, which our benchmark runs do not do, so the published comparison uses the non-speculative measurement and the benchmark page has a switch for the speculative one.</p>
-
-    <p>ZINC is written in Zig and builds as one binary. The Metal backend uses a small Objective-C shim.</p>
-
-    <h2>Architecture</h2>
-
-    <div class="arch-diagram">
-      <img src="/zinc-architecture.svg" alt="ZINC LLM inference engine architecture with native GPU backends for Vulkan, ROCm, Metal, and CUDA" width="680" />
-    </div>
-
-    <h2>Supported hardware: consumer GPU targets</h2>
-
-    <p>AMD Radeon, Intel Arc, and Apple Silicon are supported. NVIDIA CUDA is experimental. The cards below are the models currently used for development and testing.</p>
-
-    <h3>AMD Radeon GPUs — RDNA4 &amp; RDNA3 (Linux)</h3>
-    <ul>
-      <li><strong>RDNA4</strong>: RX 9070, RX 9070 XT, Radeon AI PRO R9700 (primary tuning target)</li>
-      <li><strong>RDNA3</strong>: RX 7900 XTX, RX 7900 XT, RX 7800 XT, RX 7700 XT, RX 7600</li>
-    </ul>
-    <p>Use Vulkan 1.3 with RADV/AMDVLK for the broad AMD path, or build with <code>-Dbackend=rocm</code> on a supported ROCm installation. The current ROCm reference stack is validated on RDNA4 <code>gfx1201</code>.</p>
-
-    <h3>Apple Silicon (macOS)</h3>
-    <ul>
-      <li><strong>M1 through M5</strong>: all variants (base, Pro, Max, Ultra)</li>
-      <li>Current public reference box: Mac Studio (M4 Max, 40-core GPU, 64 GB unified memory)</li>
-      <li>Native Metal shaders, zero-copy model loading, unified memory</li>
-      <li>16 GB for 2B models, 24+ GB for 35B models</li>
-    </ul>
-
-    <h3>NVIDIA RTX GPUs — CUDA (experimental)</h3>
-    <ul>
-      <li>Current public reference: GeForce RTX 5090, with RTX 4090 also used for backend bring-up</li>
-      <li>Native CUDA backend work is measured in the dashboard but still younger than the RDNA path</li>
-      <li>Primary target: local GGUF inference on consumer RTX cards where Vulkan is not the practical path</li>
-    </ul>
-
-    <h3>Intel Arc — Xe2 / Battlemage (Linux Vulkan)</h3>
-    <ul>
-      <li>Official support target: Arc B-series / Battlemage class GPUs</li>
-      <li>Current public benchmark node completes four managed catalog rows</li>
-      <li>Arc-specific performance tuning is still younger than the RDNA4 path</li>
-    </ul>
-
-    <p>See the full <a href="/zinc/docs/hardware-requirements/">hardware requirements</a> page for details.</p>
-
-    <hr />
-    <p><a href="/zinc/docs/">Documentation</a> · <a href="/zinc/docs/turboquant-spec/">TurboQuant spec</a> · <a href="https://github.com/zolotukhin/zinc">GitHub</a></p>
   </section>
 </BaseLayout>
 
-<script>
-  const amdTabs = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-amd-backend-tab]'));
-  const amdPanels = Array.from(document.querySelectorAll<HTMLElement>('[data-amd-backend-panel]'));
-
-  function selectAmdBackend(id: string) {
-    for (const tab of amdTabs) {
-      const active = tab.dataset.amdBackendTab === id;
-      tab.classList.toggle('active', active);
-      tab.setAttribute('aria-selected', active ? 'true' : 'false');
-    }
-    for (const panel of amdPanels) {
-      const active = panel.dataset.amdBackendPanel === id;
-      panel.classList.toggle('active', active);
-      panel.hidden = !active;
-    }
-  }
-
-  for (const tab of amdTabs) {
-    tab.addEventListener('click', () => selectAmdBackend(tab.dataset.amdBackendTab ?? 'vulkan'));
-  }
-
-  if (window.location.hash === '#rocm' || window.location.hash === '#rdna-rocm') {
-    selectAmdBackend('rocm');
-  }
-</script>
-
 <style>
-  :global(main.container) {
-    max-width: var(--max-width-wide);
-  }
-
-  .hero {
-    text-align: center;
-    padding: var(--space-lg) 0 var(--space-md);
-  }
-
-  .logo {
-    border-radius: 8px;
-    margin-bottom: var(--space-sm);
-  }
-
-  .hero-eyebrow,
-  .section-kicker {
-    margin: 0 0 0.35rem;
-    color: var(--color-accent);
-    font-size: 0.78rem;
-    font-weight: 700;
-    letter-spacing: 0;
-    text-transform: uppercase;
-  }
-
-  .hero h1 {
-    max-width: 880px;
-    margin: 0 auto var(--space-sm);
-    font-size: 3.25rem;
-    line-height: 1.02;
-    letter-spacing: 0;
-  }
-
-  .tagline {
-    max-width: 760px;
-    margin: 0 auto var(--space-xs);
-    font-size: 1.1rem;
-    color: var(--color-text-muted);
-  }
-
-  .hero-platforms {
-    font-size: 0.85rem;
-    color: var(--color-text-muted);
-    margin: 0.25rem auto var(--space-xs);
-    max-width: 640px;
-  }
-
-  .hero-platforms strong {
-    color: var(--color-text);
-    font-weight: 600;
-  }
-
-  .hero-links {
-    display: flex;
-    justify-content: center;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-    margin-top: var(--space-sm);
-  }
-
-  .hero-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 0.35rem 0.85rem;
-    border: 1px solid var(--color-border);
-    border-radius: 999px;
-    font-size: 0.88rem;
-    color: var(--color-text-muted);
-    transition: border-color 0.15s ease, color 0.15s ease;
-  }
-
-  .hero-link:hover {
-    text-decoration: none;
-    border-color: var(--color-text);
-    color: var(--color-text);
-  }
-
-  .hero-link-discord {
-    border-color: color-mix(in srgb, var(--color-accent) 30%, var(--color-border));
-    color: var(--color-accent);
-  }
-
-  .hero-link-benchmarks {
-    border-color: color-mix(in srgb, var(--color-accent) 20%, var(--color-border));
-  }
-
-  .hero-link-discord:hover {
-    border-color: var(--color-accent);
-    color: var(--color-accent);
-  }
-
-  .btn-outline:hover {
-    border-color: var(--color-accent);
-  }
-
-  .platform-strip {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-    gap: var(--space-sm);
-    margin: 0 0 var(--space-xl);
-  }
-
-  .platform-card {
-    border: 1px solid var(--color-border);
-    border-radius: 8px;
-    padding: 0.9rem;
-    background: var(--color-bg-alt);
-    display: grid;
-    gap: 0.35rem;
-    min-width: 0;
-  }
-
-  .platform-card-head {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 0.5rem;
-  }
-
-  .platform-card-head strong {
-    font-size: 0.95rem;
-  }
-
-  .platform-card-head span {
-    color: var(--color-accent);
-    font-size: 0.72rem;
-    font-weight: 700;
-    text-transform: uppercase;
-  }
-
-  .platform-status,
-  .platform-metric {
-    margin: 0;
-  }
-
-  .platform-status {
-    color: var(--color-text);
-    font-size: 0.82rem;
-    font-weight: 600;
-  }
-
-  .platform-metric {
-    color: var(--color-text-muted);
-    font-size: 0.78rem;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .platform-card small {
-    color: var(--color-text-muted);
-    font-size: 0.72rem;
-    line-height: 1.45;
-  }
-
-  .amd-sweep {
-    margin: 0 0 var(--space-xl);
-  }
-
-  .sweep-intro {
-    max-width: 720px;
-    margin: 0 0 var(--space-md);
-    color: var(--color-text-muted);
-  }
-
-  .amd-backend-tabs {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0.6rem;
-    margin: 0 0 var(--space-md);
-  }
-
-  .amd-backend-tab {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 0.75rem;
-    padding: 0.8rem 1rem;
-    border: 1px solid var(--color-border);
-    border-radius: 8px;
-    background: var(--color-bg-alt);
-    color: var(--color-text);
-    cursor: pointer;
-    text-align: left;
-  }
-
-  .amd-backend-tab:hover,
-  .amd-backend-tab.active {
-    border-color: var(--color-accent);
-  }
-
-  .amd-backend-tab.active {
-    background: color-mix(in srgb, var(--color-accent) 9%, var(--color-bg-alt));
-  }
-
-  .amd-backend-tab strong {
-    font-size: 1rem;
-  }
-
-  .amd-backend-tab span,
-  .backend-runline span {
-    color: var(--color-text-muted);
-    font-size: 0.78rem;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .amd-backend-panel[hidden] {
-    display: none;
-  }
-
-  .backend-runline {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: var(--space-sm);
-    margin: 0 0 var(--space-sm);
-  }
-
-  .result-callout {
-    display: grid;
-    grid-template-columns: minmax(220px, 0.85fr) minmax(300px, 1.15fr);
-    align-items: center;
-    gap: var(--space-md);
-    margin: 0 0 var(--space-md);
-    padding: 1rem;
-    border: 1px solid color-mix(in srgb, var(--color-accent) 45%, var(--color-border));
-    border-radius: 8px;
-    background: color-mix(in srgb, var(--color-accent) 8%, var(--color-bg-alt));
-  }
-
-  .result-callout strong {
-    font-size: 1.05rem;
-  }
-
-  .result-callout p {
-    margin: 0;
-    color: var(--color-text-muted);
-    font-size: 0.88rem;
-  }
-
-  .result-callout p b {
-    color: var(--color-text);
-  }
-
-  .sweep-header {
-    display: flex;
-    align-items: end;
-    justify-content: space-between;
-    gap: var(--space-md);
-    margin-bottom: var(--space-sm);
-  }
-
-  .sweep-header h2 {
-    margin: 0;
-  }
-
-  .sweep-machine {
-    flex: 0 0 auto;
-    color: var(--color-text-muted);
-    font-size: 0.82rem;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .start-panel {
-    display: grid;
-    gap: var(--space-md);
-    margin-bottom: var(--space-xl);
-  }
-
-  .start-links {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-sm);
-    justify-content: center;
-  }
-
-  .start-links a {
-    display: inline-flex;
-    align-items: center;
-    padding: 0.45rem 0.8rem;
-    border: 1px solid var(--color-border);
-    border-radius: 999px;
-    color: var(--color-text);
-  }
-
-  .start-links a:hover {
-    text-decoration: none;
-    border-color: var(--color-accent);
-    color: var(--color-accent);
-  }
-
-  .arch-diagram {
-    text-align: center;
-    margin: var(--space-lg) 0;
-  }
-
-  .arch-diagram img {
-    max-width: 100%;
-    height: auto;
-  }
-
-  /* Performance infographics */
-  .perf-stats {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: var(--space-sm);
-    margin: var(--space-md) 0 var(--space-lg);
-  }
-
-  .perf-stat {
-    border: 1px solid var(--color-border);
-    border-radius: 8px;
-    padding: 0.85rem 0.9rem;
-    background: var(--color-bg-alt);
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-  }
-
-  .perf-stat.highlight {
-    border-color: color-mix(in srgb, var(--color-accent) 45%, var(--color-border));
-    background: color-mix(in srgb, var(--color-accent) 9%, var(--color-bg-alt));
-  }
-
-  .perf-stat strong {
-    font-size: 1.6rem;
-    line-height: 1.1;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .perf-stat.highlight strong {
-    color: var(--color-accent);
-  }
-
-  .perf-stat span {
-    font-size: 0.82rem;
-    font-weight: 600;
-    color: var(--color-text);
-  }
-
-  .perf-stat small {
-    font-size: 0.72rem;
-    color: var(--color-text-muted);
-  }
-
-  .perf-heading {
-    margin-top: var(--space-lg);
-    font-size: 1.05rem;
-  }
-
-  .perf-sub {
-    font-weight: 400;
-    font-size: 0.78rem;
-    color: var(--color-text-muted);
-    white-space: nowrap;
-  }
-
-  .perf-board {
-    border: 1px solid var(--color-border);
-    border-radius: 8px;
-    padding: var(--space-md);
-    display: grid;
-    gap: 0.9rem;
-    margin: var(--space-sm) 0;
-  }
-
-  .rdna-showcase {
-    background: #09090b;
-    border-color: #27272a;
-    color: #f4f4f5;
-    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.24);
-  }
-
-  .perf-board-legend {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.9rem;
-    font-size: 0.78rem;
-    color: var(--color-text-muted);
-    padding-bottom: 0.5rem;
-    border-bottom: 1px solid var(--color-border);
-  }
-
-  .rdna-showcase .perf-board-legend {
-    color: #a1a1aa;
-    border-bottom-color: #27272a;
-  }
-
-  .perf-board-legend span {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-  }
-
-  .perf-board-note {
-    margin-left: auto;
-  }
-
-  .perf-swatch {
-    width: 10px;
-    height: 10px;
-    border-radius: 999px;
-    display: inline-block;
-  }
-
-  .perf-swatch.zinc {
-    background: linear-gradient(90deg, #c2410c, #f59e0b);
-  }
-
-  .perf-swatch.baseline {
-    background: linear-gradient(90deg, #1d4ed8, #60a5fa);
-  }
-
-  .perf-bench-row {
-    display: grid;
-    gap: 0.3rem;
-  }
-
-  .perf-bench-head {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-  }
-
-  .perf-bench-head strong {
-    font-size: 0.92rem;
-  }
-
-  .rdna-showcase .perf-bench-head strong {
-    color: #f4f4f5;
-    font-size: 0.98rem;
-  }
-
-  .perf-ratio {
-    font-size: 0.72rem;
-    font-weight: 700;
-    padding: 0.12rem 0.5rem;
-    border-radius: 999px;
-    white-space: nowrap;
-    border: 1px solid transparent;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .perf-ratio.win {
-    color: #15803d;
-    background: color-mix(in srgb, #22c55e 16%, transparent);
-    border-color: color-mix(in srgb, #22c55e 35%, transparent);
-  }
-
-  .rdna-showcase .perf-ratio.win {
-    color: #22c55e;
-    background: rgba(34, 197, 94, 0.14);
-    border-color: rgba(34, 197, 94, 0.36);
-  }
-
-  .perf-ratio.close {
-    color: var(--color-accent);
-    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
-    border-color: color-mix(in srgb, var(--color-accent) 32%, transparent);
-  }
-
-  .perf-ratio.behind {
-    color: #64748b;
-    background: color-mix(in srgb, #64748b 14%, transparent);
-    border-color: color-mix(in srgb, #64748b 30%, transparent);
-  }
-
-  .perf-bar {
-    display: grid;
-    grid-template-columns: 3.4rem 1fr 5rem;
-    align-items: center;
-    gap: 0.55rem;
-  }
-
-  .perf-bar-tag {
-    font-size: 0.72rem;
-    font-weight: 600;
-    color: var(--color-text);
-  }
-
-  .rdna-showcase .perf-bar-tag {
-    color: #f4f4f5;
-  }
-
-  .perf-bar-tag.muted {
-    color: var(--color-text-muted);
-    font-weight: 400;
-  }
-
-  .rdna-showcase .perf-bar-tag.muted {
-    color: #a1a1aa;
-  }
-
-  .perf-track {
-    height: 12px;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--color-text) 8%, var(--color-bg-alt));
-    overflow: hidden;
-  }
-
-  .rdna-showcase .perf-track {
-    height: 14px;
-    background: #27272a;
-  }
-
-  .perf-fill {
-    display: block;
-    height: 100%;
-    border-radius: inherit;
-    min-width: 2px;
-  }
-
-  .perf-fill.zinc {
-    background: linear-gradient(90deg, #c2410c, #f59e0b);
-  }
-
-  .perf-fill.baseline {
-    background: linear-gradient(90deg, #1d4ed8, #60a5fa);
-  }
-
-  .perf-bar-val {
-    font-size: 0.78rem;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-    color: var(--color-text);
-  }
-
-  .rdna-showcase .perf-bar-val {
-    color: #f4f4f5;
-  }
-
-  .perf-prefill {
-    font-size: 0.74rem;
-    color: var(--color-text-muted);
-    margin: 0.05rem 0 0;
-    padding-left: 3.95rem;
-  }
-
-  .perf-prefill strong {
-    color: var(--color-text);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .rdna-showcase .perf-prefill {
-    color: #a1a1aa;
-  }
-
-  .rdna-showcase .perf-prefill strong {
-    color: #f4f4f5;
-  }
-
-  .perf-caption {
-    font-size: 0.82rem;
-    color: var(--color-text-muted);
-  }
-
-  @media (max-width: 560px) {
-    .hero h1 {
-      font-size: 2.35rem;
-    }
-
-    .sweep-header {
-      align-items: start;
-      flex-direction: column;
-      gap: 0.4rem;
-    }
-
-    .sweep-machine {
-      white-space: normal;
-    }
-
-    .perf-stats {
-      grid-template-columns: repeat(2, 1fr);
-    }
-
-    .platform-strip {
-      grid-template-columns: 1fr;
-    }
-
-    .amd-backend-tabs,
-    .result-callout {
-      grid-template-columns: 1fr;
-    }
-
-    .amd-backend-tab,
-    .backend-runline {
-      align-items: flex-start;
-      flex-direction: column;
-      gap: 0.25rem;
-    }
-
-    .perf-board {
-      padding: 0.9rem;
-    }
-
-    .perf-board-note {
-      width: 100%;
-      margin-left: 0;
-    }
-
-    .perf-bench-head {
-      align-items: flex-start;
-    }
-
-    .perf-bench-head strong {
-      max-width: 100%;
-    }
-
-    .perf-bar {
-      grid-template-columns: 3rem 1fr 4.2rem;
-      gap: 0.4rem;
-    }
-
-    .perf-prefill {
-      padding-left: 0;
-    }
+  :global(main.container) { max-width: var(--max-width-wide); }
+  .hero { display: grid; grid-template-columns: 1.2fr 1fr; align-items: center; gap: 5rem; padding: 2rem 0 4.5rem; }
+  .wordmark { display: flex; align-items: center; gap: 0.65rem; margin: 0 0 1.4rem; font-size: 0.85rem; font-weight: 700; letter-spacing: 0.1em; }
+  .wordmark img { border-radius: 8px; }
+  h1 { margin: 0 0 1.4rem; font-size: clamp(2.7rem, 5.5vw, 4.25rem); line-height: 1.06; letter-spacing: -0.045em; font-weight: 600; }
+  .intro { max-width: 32rem; color: var(--color-text-muted); font-size: 1.08rem; line-height: 1.65; }
+  .actions { display: flex; flex-wrap: wrap; gap: 0.7rem; margin-top: 1.8rem; }
+  .button { display: inline-flex; align-items: center; justify-content: center; gap: 1rem; min-height: 46px; padding: 0.6rem 1rem; border: 1px solid var(--color-border); border-radius: 6px; color: var(--color-text); font-size: 0.82rem; font-weight: 600; }
+  .button.primary { color: white; background: #b34700; border-color: #b34700; }
+  .button:hover { border-color: var(--color-accent); text-decoration: none; }
+  .button.primary:hover { background: #943c00; border-color: #943c00; }
+  .build-note { margin: 1rem 0 0; color: var(--color-text-muted); font-size: 0.72rem; }
+  .use-cases { border-top: 1px solid var(--color-border); }
+  .use-cases a { display: grid; grid-template-columns: 1.4rem 1fr 1rem; align-items: baseline; gap: 1rem; padding: 1.65rem 0; border-bottom: 1px solid var(--color-border); color: var(--color-text); }
+  .use-cases a:hover { text-decoration: none; }
+  .use-cases a:hover h2 { color: var(--color-accent); }
+  .use-cases h2 { margin: 0 0 0.35rem; font-size: 1.04rem; }
+  .use-cases p { margin: 0; color: var(--color-text-muted); font-size: 0.82rem; line-height: 1.55; }
+  .number { color: var(--color-text-muted); font: 0.66rem var(--font-mono); }
+  .page-section { display: grid; grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.4fr); gap: 5rem; padding: 3.5rem 0; border-top: 1px solid var(--color-border); }
+  .eyebrow { margin: 0 0 0.65rem; color: var(--color-text-muted); font-size: 0.68rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .section-copy h2 { margin: 0 0 1rem; font-size: 1.7rem; line-height: 1.25; letter-spacing: -0.025em; }
+  .section-copy > p:not(.eyebrow) { color: var(--color-text-muted); font-size: 0.88rem; }
+  .section-copy .setup-note { font-size: 0.76rem; }
+  .terminal-wrap { min-width: 0; }
+  .terminal-wrap :global(.terminal-window) { --terminal-shadow: none; --terminal-radius: 8px; }
+  .caption { margin: 0.8rem 0 0; color: var(--color-text-muted); font-size: 0.71rem; line-height: 1.6; }
+  .text-link { display: inline-block; font-size: 0.82rem; }
+  .platforms { border-top: 1px solid var(--color-border); }
+  .platform { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: 1.1rem 0; border-bottom: 1px solid var(--color-border); color: var(--color-text); }
+  .platform:hover { text-decoration: none; }
+  .platform:hover h3 { color: var(--color-accent); }
+  .platform h3 { margin: 0; font-size: 0.95rem; }
+  .platform p { margin: 0.25rem 0 0; color: var(--color-text-muted); font-size: 0.72rem; }
+  .platform-detail { display: grid; gap: 0.25rem; text-align: right; font-size: 0.76rem; }
+  .platform-detail small { color: var(--color-text-muted); font-size: 0.68rem; }
+  .results { min-width: 0; }
+  table { margin: 0; font-size: 0.83rem; }
+  caption { margin-bottom: 1rem; text-align: left; font-size: 0.8rem; color: var(--color-text-muted); }
+  th, td { padding: 0.85rem 0.7rem; border: 0; border-bottom: 1px solid var(--color-border); }
+  th:first-child { padding-left: 0; }
+  th { background: none; font-weight: 500; }
+  thead th { padding-top: 0; color: var(--color-text-muted); font-size: 0.68rem; }
+  td, th:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+  td strong { color: var(--color-accent); font-weight: 600; }
+  .engineering-note { margin: 1.4rem 0 0; font-size: 0.75rem; }
+  .next-steps { padding: 3rem 0 1rem; border-top: 1px solid var(--color-border); }
+  .next-steps h2 { margin: 0 0 1.4rem; font-size: 1.25rem; }
+  .next-steps nav { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 1rem 2rem; }
+  .next-steps a { font-size: 0.82rem; }
+  @media (max-width: 960px) { .hero, .page-section { gap: 2.5rem; } }
+  @media (max-width: 760px) {
+    .hero, .page-section { grid-template-columns: 1fr; }
+    .hero { padding: 1.5rem 0 3rem; }
+    .hero h1 { max-width: 30rem; }
+    .use-cases a { padding: 1.2rem 0; }
+    .page-section { padding: 2.5rem 0; gap: 1.5rem; }
+    .section-copy { max-width: 35rem; }
+    .next-steps nav { display: grid; grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 380px) {
+    h1 { font-size: 2.4rem; }
+    .button { width: 100%; justify-content: space-between; }
+    .platform { align-items: start; }
+    .platform-detail { max-width: 8rem; }
+    table { font-size: 0.73rem; }
+    th, td { padding: 0.75rem 0.35rem; }
+    .next-steps nav { grid-template-columns: 1fr; }
   }
 </style>

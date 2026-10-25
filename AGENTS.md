@@ -62,6 +62,7 @@ Default local managed cache layout:
 ```
 
 Agent policy:
+
 - On local Metal, use `./zig-out/bin/zinc model pull <id>` to fetch catalog models.
 - On local Metal, prefer `--model-id <id>` or the default managed cache path over arbitrary `/Users/.../*.gguf` paths.
 - Do not copy large GGUFs into one-off local locations when a catalog id exists.
@@ -71,6 +72,7 @@ Agent policy:
 ## Tech Stack
 
 - **Zig 0.17.0** — host code, build system
+- **Bun 1.4.4 minimum** — JavaScript tooling; `.bun-version` pins CI. Use `bun fmt` for supported files, with configuration in `bunfig.toml`. Do not add Prettier.
 - **GLSL 460** — compute shaders compiled to SPIR-V via `glslc` (Vulkan backend)
 - **MSL** — Metal Shading Language compute shaders (Apple Silicon backend)
 - **Vulkan 1.3** — GPU API for AMD RDNA3/RDNA4
@@ -78,6 +80,7 @@ Agent policy:
 - **GGUF** — model format (parsed natively in Zig)
 
 ### Supported Architectures
+
 - **Qwen 2/3 family** — dense, MoE, and hybrid attention/SSM variants
 - **Mistral/Llama, Mamba/Jamba, Gemma, GPT-OSS, and Muse Glimmer**
 
@@ -239,12 +242,14 @@ writing/                         # Draft writing and publishing notes
 ## Boundaries
 
 ### Always
+
 - Run `./scripts/zig.sh build test` before considering work complete
 - Validate GPU kernels against llama.cpp reference outputs
 - Use push constants (not UBOs) for per-dispatch parameters in shaders
 - Keep shader local_size_x = 64 (RDNA4 wave64)
 
 ### Ask first
+
 - Any run on the workstation's own GPU (Metal target, Metal debugging, local model loads); see "GPU Workload Placement"
 - Changing the compute graph IR (`graph.zig` OpType enum)
 - Adding new model architectures to `architecture.zig`
@@ -252,6 +257,7 @@ writing/                         # Draft writing and publishing notes
 - Changes to GGUF parsing that could break existing model loading
 
 ### Never
+
 - Load a model, start an inference server, or run a benchmark on the developer workstation without the user's explicit go-ahead for that run; all GPU workloads go to the remote test node (see "GPU Workload Placement")
 - Leave a spawned `zinc` or `llama-server` process running after the command that started it returns
 - Commit `.env`, credentials, private IPs, private hostnames, SSH aliases, private ports, GPU UUIDs, device serials, or host-specific usernames in paths
@@ -544,6 +550,7 @@ Available cases right now:
 ### Troubleshooting performance
 
 If llama.cpp baseline drops below ~100 tok/s, check in order:
+
 1. **Mesa version** — `dpkg -l mesa-vulkan-drivers` must show 25.0.7 (not 25.2.8)
 2. **GECC** — `cat /sys/module/amdgpu/parameters/ras_enable` must show 0
 3. **coop_matrix** — server log must show `matrix cores: KHR_coopmat`
@@ -560,27 +567,27 @@ types or functions before editing.
 
 ### Entrypoints and API
 
-| Area | Start here |
-|------|------------|
-| CLI, argument parsing, server startup | `src/main.zig` |
-| HTTP transport and OpenAI-compatible routes | `src/server/http.zig`, `src/server/routes.zig` |
-| Backend selection and model switching | `src/server/runtime.zig`, `src/server/model_manager*.zig` |
-| Built-in chat UI | `src/server/chat.html` |
-| Tokenization and chat templates | `src/model/tokenizer.zig` |
+| Area                                        | Start here                                                |
+| ------------------------------------------- | --------------------------------------------------------- |
+| CLI, argument parsing, server startup       | `src/main.zig`                                            |
+| HTTP transport and OpenAI-compatible routes | `src/server/http.zig`, `src/server/routes.zig`            |
+| Backend selection and model switching       | `src/server/runtime.zig`, `src/server/model_manager*.zig` |
+| Built-in chat UI                            | `src/server/chat.html`                                    |
+| Tokenization and chat templates             | `src/model/tokenizer.zig`                                 |
 
 ### Models and inference
 
-| Area | Start here |
-|------|------------|
-| GGUF metadata and tensors | `src/model/gguf.zig`, `src/model/config.zig` |
-| Architecture detection | `src/model/architecture.zig` |
-| Managed model catalog/cache | `src/model/catalog.zig`, `src/model/managed.zig` |
-| Vulkan model loading | `src/model/loader.zig` |
-| Metal and CUDA model loading | `src/model/loader_metal.zig`, `src/model/loader_cuda.zig` |
-| Vulkan inference | `src/compute/forward.zig` |
-| Metal inference | `src/compute/forward_metal.zig` |
-| CUDA inference | `src/compute/forward_cuda.zig`, `src/compute/forward_cuda_gemma.zig` |
-| ZINC_RT inference | `src/compute/forward_zinc_rt.zig`, `src/zinc_rt/` |
+| Area                         | Start here                                                           |
+| ---------------------------- | -------------------------------------------------------------------- |
+| GGUF metadata and tensors    | `src/model/gguf.zig`, `src/model/config.zig`                         |
+| Architecture detection       | `src/model/architecture.zig`                                         |
+| Managed model catalog/cache  | `src/model/catalog.zig`, `src/model/managed.zig`                     |
+| Vulkan model loading         | `src/model/loader.zig`                                               |
+| Metal and CUDA model loading | `src/model/loader_metal.zig`, `src/model/loader_cuda.zig`            |
+| Vulkan inference             | `src/compute/forward.zig`                                            |
+| Metal inference              | `src/compute/forward_metal.zig`                                      |
+| CUDA inference               | `src/compute/forward_cuda.zig`, `src/compute/forward_cuda_gemma.zig` |
+| ZINC_RT inference            | `src/compute/forward_zinc_rt.zig`, `src/zinc_rt/`                    |
 
 The conceptual request path is: tokenize → load/activate model → prefill prompt →
 decode tokens → sample → detokenize/stream. Architecture-specific attention, SSM,
@@ -588,25 +595,25 @@ dense FFN, and MoE branches live in the active backend's forward implementation.
 
 ### GPU operations
 
-| Area | Start here |
-|------|------------|
-| Compute graph | `src/compute/graph.zig` |
-| Quantized matrix-vector dispatch | `src/compute/dmmv.zig` |
-| Attention, elementwise ops, sampling | `src/compute/attention.zig`, `src/compute/elementwise.zig`, `src/compute/argmax.zig` |
-| Vulkan infrastructure | `src/vulkan/`, `src/shaders/*.comp` |
-| Metal infrastructure | `src/metal/`, `src/shaders/metal/*.metal` |
-| CUDA infrastructure | `src/cuda/` |
-| Backend abstraction and memory planning | `src/gpu/` |
+| Area                                    | Start here                                                                           |
+| --------------------------------------- | ------------------------------------------------------------------------------------ |
+| Compute graph                           | `src/compute/graph.zig`                                                              |
+| Quantized matrix-vector dispatch        | `src/compute/dmmv.zig`                                                               |
+| Attention, elementwise ops, sampling    | `src/compute/attention.zig`, `src/compute/elementwise.zig`, `src/compute/argmax.zig` |
+| Vulkan infrastructure                   | `src/vulkan/`, `src/shaders/*.comp`                                                  |
+| Metal infrastructure                    | `src/metal/`, `src/shaders/metal/*.metal`                                            |
+| CUDA infrastructure                     | `src/cuda/`                                                                          |
+| Backend abstraction and memory planning | `src/gpu/`                                                                           |
 
 ### Tests and performance tooling
 
-| Area | Start here |
-|------|------------|
-| Zig regression tests | `src/regression_tests.zig` |
-| Integration and API tests | `tests/` |
-| Microbenchmarks | `benchmarks/`, `src/bench_hot_decode.zig` |
-| Fair cross-backend suite | `tools/performance_suite.mjs` |
-| Optimization harnesses | `loops/` |
+| Area                      | Start here                                |
+| ------------------------- | ----------------------------------------- |
+| Zig regression tests      | `src/regression_tests.zig`                |
+| Integration and API tests | `tests/`                                  |
+| Microbenchmarks           | `benchmarks/`, `src/bench_hot_decode.zig` |
+| Fair cross-backend suite  | `tools/performance_suite.mjs`             |
+| Optimization harnesses    | `loops/`                                  |
 
 Treat implementation source and command `--help` output as authoritative for
 current environment flags, thresholds, supported formats, and benchmark cases.

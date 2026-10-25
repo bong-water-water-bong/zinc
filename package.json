@@ -2,8 +2,14 @@
   "name": "zinc",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "bun@1.4.4",
+  "engines": {
+    "bun": ">=1.4.4"
+  },
   "author": "Stepan Zolotukhin",
   "scripts": {
+    "format": "bun fmt --changed=origin/main",
+    "format:check": "bun fmt --check --changed=origin/main",
     "graph:render": "bun tools/render_graph_report.ts",
     "bench:api": "bun tools/benchmark_api.mjs",
     "eval:opencode": "bun tools/opencode_eval.mjs",
@@ -14,6 +20,6 @@
     "test:qwen-smoke": "bun tests/test_qwen_smoke.ts"
   },
   "dependencies": {
-    "openai": "^6.34.0"
+    "openai": "^7.43.0"
   }
 }

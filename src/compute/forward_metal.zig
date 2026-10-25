@@ -39144,10 +39144,12 @@ test "acquireBatchedPrefillScratch reuses, re-zeroes, grows, and evicts oversize
     // (12 * 3 = 36 rows) — reuse here would overrun moe_route_input on GPU.
     const wide = try engine.acquireBatchedPrefillScratch(33, q_dim, kv_dim, inter_dim);
     try std.testing.expectEqual(@as(u32, 33), wide.route_input_slots);
-    const wide_route_input_handle = wide.moe_route_input.handle;
+    const wide_route_input_size = wide.moe_route_input.size;
     engine.releaseBatchedPrefillScratch();
     const short = try engine.acquireBatchedPrefillScratch(12, q_dim, kv_dim, inter_dim);
-    try std.testing.expect(wide_route_input_handle != short.moe_route_input.handle);
+    // A freed allocation may reuse the same address. Check the replacement's
+    // actual capacity rather than comparing stale buffer handles.
+    try std.testing.expect(short.moe_route_input.size > wide_route_input_size);
     try std.testing.expectEqual(@as(u32, 36), short.route_input_slots);
     try std.testing.expect(short.moe_route_input.size >= 36 * engine.config.hidden_dim * @sizeOf(f32));
     engine.releaseBatchedPrefillScratch();

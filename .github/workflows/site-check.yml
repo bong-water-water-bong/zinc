@@ -2,13 +2,15 @@ name: Site Build Check
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
       - 'site/**'
       - 'docs/**'
       - 'src/**'
       - 'build.zig'
       - '.zig-version'
+      - '.bun-version'
+      - 'bunfig.toml'
       - 'scripts/zig.sh'
       - '.github/workflows/site-check.yml'
   pull_request:
@@ -18,6 +20,8 @@ on:
       - 'src/**'
       - 'build.zig'
       - '.zig-version'
+      - '.bun-version'
+      - 'bunfig.toml'
       - 'scripts/zig.sh'
       - '.github/workflows/site-check.yml'
 
@@ -27,11 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0  # Full history for git lastmod
+          fetch-depth: 0 # Full history for git lastmod
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: '.bun-version'
 
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version-file: 'site/.node-version'
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -45,11 +53,11 @@ jobs:
 
       - name: Install dependencies
         working-directory: site
-        run: npm ci
+        run: bun install --frozen-lockfile
 
       - name: Build site
         working-directory: site
-        run: npm run build
+        run: bun run build
 
       - name: Check output
         working-directory: site
