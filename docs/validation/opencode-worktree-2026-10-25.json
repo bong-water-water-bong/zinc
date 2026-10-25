@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "date_utc": "2026-10-25",
+  "base_commit": "09b802dedbc8a013a990997672fd9d0b3e442a01",
+  "task": "Add OpenAI-compatible loaded-model discovery to the ROCm/CUDA HTTP server",
+  "workspace": "complete Git worktree",
+  "opencode_version": "1.19.4",
+  "zig_version": "0.17.0",
+  "bun_version": "1.4.4",
+  "gpu": "AMD Radeon AI PRO R9700 (gfx1201)",
+  "rocm_version": "7.2.4",
+  "outcome": "failed",
+  "feature_implemented": false,
+  "agent_tests_run": 0,
+  "cases": [
+    {
+      "model": "qwen38-27b-q4k-m",
+      "context_tokens": 32768,
+      "configuration": "standard",
+      "outcome": "gpu_out_of_memory",
+      "agent_seconds": 65.0,
+      "tool_calls": 0,
+      "tool_counts": {},
+      "agent_exit": null,
+      "observed_file_edit_tools": 0,
+      "owned_server_stopped": true
+    },
+    {
+      "model": "qwen38-27b-q4k-m",
+      "context_tokens": 16384,
+      "configuration": "standard",
+      "outcome": "context_overflow",
+      "agent_seconds": 425.0,
+      "tool_calls": 4,
+      "tool_counts": {
+        "bash": 1,
+        "grep": 2,
+        "read": 1
+      },
+      "agent_exit": 1,
+      "observed_file_edit_tools": 0,
+      "owned_server_stopped": true
+    },
+    {
+      "model": "qwen35-9b-q4k-m",
+      "context_tokens": 32768,
+      "configuration": "standard_with_output_limits",
+      "outcome": "context_overflow",
+      "agent_seconds": 40.0,
+      "tool_calls": 3,
+      "tool_counts": {
+        "read": 2,
+        "glob": 1
+      },
+      "agent_exit": 1,
+      "observed_file_edit_tools": 0,
+      "owned_server_stopped": true
+    },
+    {
+      "model": "qwen35-9b-q4k-m",
+      "context_tokens": 32768,
+      "configuration": "bash_only_prototype",
+      "outcome": "invalid_attention_launch_and_corrupted_output",
+      "agent_seconds": 335.0,
+      "tool_calls": 8,
+      "tool_counts": {
+        "bash": 8
+      },
+      "agent_exit": 0,
+      "observed_file_edit_tools": 0,
+      "owned_server_stopped": true
+    },
+    {
+      "model": "qwen35-9b-q4k-m",
+      "context_tokens": 16384,
+      "configuration": "bash_only_prototype",
+      "outcome": "ended_without_implementation",
+      "agent_seconds": 300.0,
+      "tool_calls": 9,
+      "tool_counts": {
+        "bash": 9
+      },
+      "agent_exit": 0,
+      "observed_file_edit_tools": 0,
+      "owned_server_stopped": true
+    },
+    {
+      "model": "qwen38-27b-q4k-m",
+      "context_tokens": 16384,
+      "configuration": "bash_only_prototype_short_instructions",
+      "outcome": "stopped_after_repeated_inspection",
+      "agent_seconds": 485.1,
+      "tool_calls": 15,
+      "tool_counts": {
+        "bash": 15
+      },
+      "agent_exit": null,
+      "observed_file_edit_tools": 0,
+      "owned_server_stopped": true
+    },
+    {
+      "model": "qwen38-27b-q4k-m",
+      "context_tokens": 16384,
+      "configuration": "bash_only_prototype_retained_history",
+      "outcome": "stopped_after_repeated_inspection",
+      "agent_seconds": 545.1,
+      "tool_calls": 11,
+      "tool_counts": {
+        "bash": 11
+      },
+      "agent_exit": null,
+      "observed_file_edit_tools": 0,
+      "owned_server_stopped": true
+    },
+    {
+      "model": "qwen38-27b-q4k-m",
+      "context_tokens": 16384,
+      "configuration": "standard_short_instructions_small_reads",
+      "outcome": "gpu_illegal_memory_access_and_corrupted_output",
+      "agent_seconds": 315.0,
+      "tool_calls": 7,
+      "tool_counts": {
+        "bash": 1,
+        "read": 4,
+        "grep": 2
+      },
+      "agent_exit": null,
+      "observed_file_edit_tools": 0,
+      "owned_server_stopped": true
+    }
+  ],
+  "feature_source_diff_empty": true,
+  "discarded_prototypes": [
+    "Bash-only tool mode",
+    "zero-retained-history compaction"
+  ],
+  "supervisor_changes": [
+    "Shortened AGENTS.md and linked reference guides; permission and GPU placement rules retained",
+    "Recorded actual worktree failures",
+    "Corrected five pre-existing source-comment hygiene matches; no engine behavior changed",
+    "Fixed website Markdown links and wrapping of long inline code"
+  ],
+  "total_tool_calls": 57,
+  "model_source_fingerprints": {
+    "src/main.zig": "4a3c199c49512b6dd1dc36b0ea9ab176b94c0dbd729c73a25864b9552104da3e"
+  },
+  "post_trial_validation": {
+    "macos_zig": {
+      "passed": 834,
+      "failed": 0
+    },
+    "linux_zig": {
+      "executed_passed": 659,
+      "failed": 0,
+      "cached_auxiliary_suites": 3
+    },
+    "bun": {
+      "passed": 676,
+      "skipped": 6,
+      "failed": 0
+    },
+    "site_build": {
+      "pages": 263,
+      "pass": true
+    },
+    "private_data_scan": "pass",
+    "permission_boundary_preservation": "pass",
+    "browser": {
+      "layouts": 10,
+      "page_errors": 0,
+      "horizontal_overflow": 0,
+      "local_links": "pass"
+    }
+  }
+}

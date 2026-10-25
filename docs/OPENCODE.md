@@ -104,6 +104,43 @@ OpenCode merges configuration sources. The script's `run` command supplies
 its provider/model configuration as a runtime override so an existing project
 model selection does not switch the task to a hosted provider.
 
+## Try a real task in a worktree
+
+A Git worktree gives OpenCode a complete checkout and its own branch. It uses
+the same coding loop as a regular project: read files, request edits, run
+commands, inspect the results, and continue. The model proposes tool calls;
+OpenCode executes them in the selected directory.
+
+With a model server already running at the matching context limit:
+
+```bash
+git worktree add -b experiment/opencode ../zinc-opencode HEAD
+bun tools/setup_opencode.mjs --project ../zinc-opencode \
+  --context 16384 --output 3072 --steps 48
+bun tools/setup_opencode.mjs check --project ../zinc-opencode
+bun tools/setup_opencode.mjs run --project ../zinc-opencode \
+  --auto --timeout-ms 600000 -- \
+  "Implement the agreed feature. Read source in ranges of at most 80 lines, edit the code, and run the CPU unit tests. Follow AGENTS.md. Do not start model servers or commit changes. Report actual test results."
+git -C ../zinc-opencode diff --stat
+git -C ../zinc-opencode diff
+```
+
+Keep JSON event logs outside the checkout. Monitor completed tool calls, the
+diff, test output, and the model server log. Run acceptance checks independently
+before accepting the patch. Short project instructions leave more context for
+source code; ZINC's detailed code map and benchmark recipes live in linked
+reference guides rather than the agent entrypoint.
+
+The **2026-10-25 full-worktree trial failed** to implement its assigned
+`GET /v1/models` feature. Across eight configurations, OpenCode made 57 tool
+calls, produced no feature edits, and ran no project tests. The runs exposed
+context overflow, repeated inspection after compaction, GPU allocation
+failure, and attention-kernel failures with corrupted output. Two sessions
+returned exit status zero without completing the task. The earlier fixture
+results remain separate from this repository-level result. See the
+[worktree report](OPENCODE_WORKTREE_REPORT.md) and
+[ROCm context limits](ROCM.md#long-coding-sessions).
+
 ## Use your own endpoint
 
 The generated file always contains a loopback URL and an environment reference

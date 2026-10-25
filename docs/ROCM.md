@@ -156,6 +156,27 @@ gate/beta values in bounded tiles, allowing agent prompts above the previous
 8K shared-memory limit. Streaming clients can cancel a request without keeping
 its slot occupied for the rest of the output budget.
 
+### Long coding sessions
+
+The fixture checks use a 16K server context, but do not validate requests near
+its full capacity. A full Zinc worktree experiment on the R9700 exposed limits
+beyond those fixtures: the 27B model ran out of
+VRAM during prefill with a 32K allocation, and the 9B model's decode attention
+kernel exceeded the GPU's shared-memory limit once its prompt crossed 16K.
+That kernel failure produced corrupted text even though the HTTP request and
+OpenCode process completed successfully. A later 27B run at 16K also failed:
+`attention_causal_batched_v2` requested a 65,612-byte group segment at 16,080
+prompt tokens, followed by illegal-memory and rocBLASLt/Tensile errors.
+Larger advertised context alone does not establish that a coding session works.
+
+Keep repository instructions concise and read source in small line ranges.
+OpenCode 1.19.4's [built-in file reader](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/tool/read.ts) has an independent 50KB cap, which can
+overflow a local model's context when reading large files. Its general
+`tool_output` setting does not constrain that reader, as the
+[tool wrapper](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/tool/tool.ts) skips results already marked by the reader. Keep checking the worktree
+diff, server log, and project tests independently. Bounded prefill and decode
+attention near and beyond 16K remain open ROCm issues.
+
 ## Fair llama.cpp comparison
 
 Use the reusable-server performance suite for claims. It runs one engine at a

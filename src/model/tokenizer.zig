@@ -352,7 +352,7 @@ pub const Tokenizer = struct {
             .eos_id = eos_id,
             .eot_id = eot_id,
             // Gemma 4 always starts with BOS, whatever add_bos_token says
-            // (the reference tokenizer overrides it too, llama.cpp PR 21500).
+            // (the reference tokenizer overrides it too; upstream PR 21500).
             .prepend_bos = prepend_bos or (pretokenizer == .gemma4_bpe and bos_id != null),
             .add_eos_token = add_eos_token,
             .chat_template = chat_template,
@@ -534,7 +534,7 @@ pub const Tokenizer = struct {
     }
 
     /// Reference GPT-4o/Llama4 regex, using the same Unicode letter classes
-    /// as llama.cpp's executable expression: upper = letter outside a-z,
+    /// as the reference executable expression: upper = letter outside a-z,
     /// lower = letter outside A-Z. Non-ASCII letters can belong to both.
     fn nextLlama4PretokenChunk(text: []const u8, pos: *usize) []const u8 {
         if (pos.* >= text.len) return text[text.len..text.len];

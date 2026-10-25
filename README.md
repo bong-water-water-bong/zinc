@@ -103,8 +103,11 @@ bun tools/setup_opencode.mjs run --project ../my-project --auto -- "Fix the fail
 Start ZINC with `-c 16384` to match the default context, or pass the actual
 context to setup with `--context`. The config uses localhost; custom endpoints
 and API keys come from environment variables at runtime.
-[Setup and task evaluation guide](https://zolotukhin.ai/zinc/docs/opencode/) ·
+[Setup, worktrees, and task evaluation](https://zolotukhin.ai/zinc/docs/opencode/) ·
 [Download the standalone script](https://zolotukhin.ai/zinc/harnesses/setup-opencode.mjs)
+
+The [full-worktree trial](docs/OPENCODE_WORKTREE_REPORT.md) records the current
+coding limitations separately from the passing fixture tests.
 
 ## Inspect the performance
 

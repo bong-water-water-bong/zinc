@@ -220,6 +220,10 @@ function isActive(slug: string): boolean {
     min-width: 0;
   }
 
+  .doc-content :global(:not(pre) > code) {
+    overflow-wrap: anywhere;
+  }
+
   .doc-content :global(table) {
     display: block;
     max-width: 100%;

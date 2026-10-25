@@ -27822,9 +27822,9 @@ pub const InferenceEngine = struct {
         // on the last token.
         const batch_last_layer = envFlagEnabled("ZINC_GEMMA_PREFILL_BATCH_LAST_LAYER", true);
         const batched_layers: u32 = if (batch_last_layer) cfg.n_layers else cfg.n_layers - 1;
-        // Routed gate/up on DP4a with Q8_1 activations (llama.cpp's MMQ scheme)
+        // Routed gate/up on DP4a with Q8_1 activations (the reference MMQ scheme)
         // instead of f32 activations: -12% prefill time on the R9700 at 357
-        // tokens, first tokens unchanged against llama.cpp.
+        // tokens, first tokens unchanged against the reference runtime.
         // ZINC_GEMMA_MOE_Q8_1_GATE_UP=0 restores the f32 kernel.
         const moe_q8_1_gate_up = envFlagEnabled("ZINC_GEMMA_MOE_Q8_1_GATE_UP", true) and
             self.dmmv.pipeline_q4k_moe_fused_gate_up_geglu_cols_top1_q8_1 != null and

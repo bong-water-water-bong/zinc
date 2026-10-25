@@ -3,7 +3,7 @@
 //
 // The DP4a sibling of dmmv_q4k_moe_fused_gate_up_geglu_cols_top1: route ids
 // are expert-major, input activations are pre-quantized in token-major Q8_1
-// layout by quantize_act_q8_1.comp (the scheme llama.cpp's MMQ uses), and the
+// layout by quantize_act_q8_1.comp (the reference MMQ scheme), and the
 // fused gate_up tensor is bound twice with the up rows at up_offset. Eight
 // rows per workgroup and eight lanes per row (one 32-value sub-block each),
 // matching the f32 kernel's grid.
