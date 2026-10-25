@@ -99,7 +99,7 @@ export function buildConfig(opts = {}) {
         top_p: 1,
         steps,
         prompt:
-          'Complete the coding task using the available tools. Read the relevant code in small ranges, then make a focused edit and run the requested tests before exploring further. Use compiler and test output to correct failures. Never change tests just to make them pass. Use portable paths in source, tests, and examples; do not copy this workspace path or private endpoints into them. Finish with a short report of the changes and actual test results.',
+          'Complete the coding task using the available tools. Read the relevant code in small ranges, then make a focused edit and run the requested tests before exploring further. Use compiler and test output to correct failures. Keep command output concise: save verbose build/test logs to a temporary file and show only failure diagnostics and a short summary. Never change tests just to make them pass. Use portable paths in source, tests, and examples; do not copy this workspace path or private endpoints into them. Finish with a short report of the changes and actual test results.',
         permission: { task: 'deny', question: 'deny', webfetch: 'deny', websearch: 'deny' },
       },
     },
@@ -387,22 +387,49 @@ export async function runVerification(
   });
   let head = '',
     tail = '',
-    truncated = false;
+    truncated = false,
+    diagnostics = '';
   const decoders = [new TextDecoder(), new TextDecoder()];
-  const append = (text) => {
+  const pendingLines = ['', ''];
+  const contextLines = [0, 0];
+  const inspect = (line, stream) => {
+    const plain = line.replace(/\x1b\[[0-9;]*m/g, '');
+    if (/^\s*\((pass|skip)\)/.test(plain)) {
+      contextLines[stream] = 0;
+      return;
+    }
+    if (
+      /\berror:|\b(AssertionError|SyntaxError|TypeError|ReferenceError|panic)\b|^\s*(\(fail\)|FAIL(ED)?\b)|expected:|received:/i.test(
+        plain,
+      )
+    )
+      contextLines[stream] = 5;
+    if (contextLines[stream] > 0) {
+      diagnostics = (diagnostics + line.slice(0, 500) + '\n').slice(-3000);
+      contextLines[stream]--;
+    }
+  };
+  const append = (text, stream) => {
+    pendingLines[stream] += text;
+    let newline;
+    while ((newline = pendingLines[stream].indexOf('\n')) !== -1) {
+      inspect(pendingLines[stream].slice(0, newline), stream);
+      pendingLines[stream] = pendingLines[stream].slice(newline + 1);
+    }
+    pendingLines[stream] = pendingLines[stream].slice(-8000);
     if (!truncated) {
       head += text;
       if (head.length > 8000) {
-        tail = head.slice(-4000);
-        head = head.slice(0, 4000);
+        tail = head.slice(-2500);
+        head = head.slice(0, 2000);
         truncated = true;
       }
-    } else tail = (tail + text).slice(-4000);
+    } else tail = (tail + text).slice(-2500);
   };
   for (const [i, stream] of [child.stdout, child.stderr].entries())
     stream?.on('data', (chunk) => {
       stderr.write(chunk);
-      append(decoders[i].decode(chunk, { stream: true }));
+      append(decoders[i].decode(chunk, { stream: true }), i);
     });
   const stop = (signal) => {
     if (child.pid && process.platform !== 'win32') {
@@ -445,8 +472,16 @@ export async function runVerification(
         ),
       );
     });
-    for (const decoder of decoders) append(decoder.decode());
-    return { code, output: truncated ? `${head}\n[verification output truncated]\n${tail}` : head };
+    for (const [i, decoder] of decoders.entries()) {
+      append(decoder.decode(), i);
+      inspect(pendingLines[i], i);
+    }
+    return {
+      code,
+      output: truncated
+        ? `${head}\n[verification output truncated; selected diagnostics]\n${diagnostics}\n[final output]\n${tail}`
+        : head,
+    };
   } finally {
     process.off('SIGINT', onInt);
     process.off('SIGTERM', onTerm);
@@ -467,7 +502,11 @@ export async function runVerifiedOpenCode(config, opts, deps = {}) {
   const roundConfig = structuredClone(config);
   roundConfig.agent.zinc.steps = Math.min(roundConfig.agent.zinc.steps, 8);
   let session = opts.session;
-  let prompt = opts.prompt;
+  const roundInstructions =
+    'The wrapper runs the full verification command outside the agent after this editing round. Make focused edits, then end the round promptly for that independent check. Do not run the full verification command yourself or paste its log into the conversation. Short targeted diagnostics are fine when needed. Report changes without claiming checks the wrapper has not run.';
+  let prompt = [
+    `${opts.prompt.join(' ')}\n\n${roundInstructions}\nVerification command:\n${opts.verify}`,
+  ];
   let last = 1;
   const executeModel = deps.runModel ?? runOpenCode;
   const executeVerification = deps.runCheck ?? runVerification;
@@ -500,7 +539,7 @@ export async function runVerifiedOpenCode(config, opts, deps = {}) {
     last = checked.code;
     if ([124, 130, 143].includes(last) || !session) return last;
     prompt = [
-      `Continue the coding task. Independent verification failed with exit ${checked.code}. Fix the implementation using this actual output; do not weaken tests or remove checks. Run the verification command before further broad exploration.\n\nOriginal task:\n${opts.prompt.join(' ')}\n\nVerification command:\n${opts.verify}\n\nActual output:\n${checked.output}`,
+      `Continue the coding task. Independent verification failed with exit ${checked.code}. Fix the implementation using these actual diagnostics; do not weaken tests or remove checks. ${roundInstructions}\n\nOriginal task:\n${opts.prompt.join(' ')}\n\nVerification command:\n${opts.verify}\n\nActual output:\n${checked.output}`,
     ];
   }
   return last;

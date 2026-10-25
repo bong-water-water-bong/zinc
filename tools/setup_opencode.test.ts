@@ -324,6 +324,35 @@ describe('independent verification', () => {
     ).toBe(2);
   });
 
+  test('retains a failure in the middle of a long passing-test log', async () => {
+    const checked = await runVerification(
+      'project-tests',
+      { project: '.', timeoutMs: 1000 },
+      {
+        stderr: quiet,
+        spawnImpl: (() => {
+          const child: any = new EventEmitter();
+          child.stderr = new EventEmitter();
+          queueMicrotask(() => {
+            child.stderr.emit('data', Buffer.from('(pass) unrelated test\n'.repeat(1000)));
+            child.stderr.emit(
+              'data',
+              Buffer.from('module.zig:9: error: missing module documentation\n'),
+            );
+            child.stderr.emit('data', Buffer.from('expected: a module description\n'));
+            child.stderr.emit('data', Buffer.from('(pass) later unrelated test\n'.repeat(1000)));
+            child.emit('close', 1, null);
+          });
+          return child;
+        }) as any,
+      },
+    );
+    expect(checked.code).toBe(1);
+    expect(checked.output).toContain('module.zig:9: error: missing module documentation');
+    expect(checked.output).toContain('expected: a module description');
+    expect(checked.output.length).toBeLessThan(8100);
+  });
+
   test('an interrupted child exiting zero cannot produce success', async () => {
     for (const [signal, expected] of [
       ['SIGINT', 130],
