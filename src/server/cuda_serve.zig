@@ -547,7 +547,19 @@ pub const ServeEngine = struct {
                     (host_io.getenv("ZINC_BATCHED_PREFILL") == null or
                         !std.mem.eql(u8, host_io.getenv("ZINC_BATCHED_PREFILL").?, "0"));
                 const batched_tok = if (use_batched)
-                    (fwd.prefillSlot(req.prompt_tokens, slot_id) catch null)
+                    (fwd.prefillSlot(req.prompt_tokens, slot_id) catch |err| blk: {
+                        log.warn("request {d} batched slot prefill failed ({s}); resetting before fallback", .{ req.id, @errorName(err) });
+                        // A failed chunk/layer may already have advanced the
+                        // recurrent state. Restart the fallback at position 0
+                        // only after clearing that partial state. A poisoned
+                        // GPU context fails reset and never enters fallback.
+                        fwd.resetSlot(slot_id) catch |reset_err| {
+                            log.err("request {d} fallback reset failed: {s}", .{ req.id, @errorName(reset_err) });
+                            self.failSlot(slot_id);
+                            continue;
+                        };
+                        break :blk null;
+                    })
                 else
                     null;
                 if (batched_tok) |tok| {
