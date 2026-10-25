@@ -11415,6 +11415,8 @@ extern "C" __global__ void deinterleave_qgate(const float* qfull, float* q_out, 
 // The Q projection is packed [Q(hd)|gate(hd)] per head.  One block owns one
 // Q, K, or V head, so all writes are disjoint and the norm reduction order
 // matches the standalone rms_norm kernel (one 256-thread block per head).
+// grid.y optionally spans consecutive tokens for speculative verification;
+// ordinary decode uses one row. Each row writes its own absolute KV position.
 struct QwenQkvPush {
     unsigned head_dim; float eps; unsigned rope_dim;
     unsigned n_head; unsigned n_kv_head; unsigned position; unsigned kv_offset;
@@ -11425,6 +11427,15 @@ extern "C" __global__ void qwen_norm_rope_qkv(
     float* q_out, float* gate_out, float* k_out, float* v_out,
     QwenQkvPush pc)
 {
+    const unsigned token = blockIdx.y;
+    const unsigned kv_dim = pc.n_kv_head * pc.head_dim;
+    qfull += (size_t)token * 2u * pc.n_head * pc.head_dim;
+    k_in += (size_t)token * kv_dim;
+    v_in += (size_t)token * kv_dim;
+    q_out += (size_t)token * pc.n_head * pc.head_dim;
+    gate_out += (size_t)token * pc.n_head * pc.head_dim;
+    pc.position += token;
+    pc.kv_offset += token * kv_dim;
     unsigned bx = blockIdx.x;
     unsigned hd = pc.head_dim;
     extern __shared__ float sh[]; // hd normalized values (Q/K rope staging)

@@ -2671,21 +2671,37 @@ pub const ForwardCuda = struct {
         // scaled by T for the per-head norms), bit-identical to the per-token loop
         // (token t at sequence position t). Kernels in a stream run in order, so
         // the batched KV write completes before the causal attention reads it.
-        // Deinterleave the packed [Q|gate] projection for all T tokens.
-        const deint = DeintBatchPush{ .head_dim = d.head_dim, .n_head = d.n_head, .T = T };
-        cmd.dispatch(&self.pipes.deinterleave_batched, .{ ceilDiv(d.q_dim, 256), T, 1 }, .{ 256, 1, 1 }, &.{ &b.qfull, &b.q, &b.attn_gate }, &deint, @sizeOf(DeintBatchPush), 0);
-        // Per-head q/k RMS norm: one block per (token, head) row of head_dim.
-        const rms_h = RmsPush{ .N = d.head_dim, .eps = d.rms_eps };
-        cmd.dispatch(&self.pipes.rms_norm, .{ d.n_head * T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &wqn.gpu_buffer, &b.q }, &rms_h, @sizeOf(RmsPush), 0);
-        cmd.dispatch(&self.pipes.rms_norm, .{ d.n_kv_head * T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.k, &wkn.gpu_buffer, &b.k }, &rms_h, @sizeOf(RmsPush), 0);
-        // RoPE q/k over all T at their absolute positions.
-        const rope_q = RopeBatchPush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_head, .base_position = base_position, .freq_base_bits = 0, .attn_scale_bits = 0 };
-        cmd.dispatch(&self.pipes.rope_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &b.q, &self.inv_freq }, &rope_q, @sizeOf(RopeBatchPush), 0);
-        const rope_k = RopeBatchPush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_kv_head, .base_position = base_position, .freq_base_bits = 0, .attn_scale_bits = 0 };
-        cmd.dispatch(&self.pipes.rope_batched, .{ d.n_kv_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.k, &b.k, &self.inv_freq }, &rope_k, @sizeOf(RopeBatchPush), 0);
-        // Write all T tokens' K/V into the cache at positions 0..T-1.
-        const kvw = KvWriteBatchPush{ .kv_dim = d.kv_dim, .dst_base = base_position, .T = T };
-        cmd.dispatch(&self.pipes.kv_cache_write_batched, .{ ceilDiv(d.kv_dim, 64), T, 1 }, .{ 64, 1, 1 }, &.{ &b.k, &self.kv_k[L], &b.v, &self.kv_v[L] }, &kvw, @sizeOf(KvWriteBatchPush), 0);
+        // Verification has only 2..4 rows: reuse decode's fused front-end,
+        // with grid.y selecting consecutive tokens and absolute KV positions.
+        // Keep the separate launches as an exact A/B reference.
+        if (self.capture_spec_state and self.use_fused_attn_frontend and envFlag("ZINC_MTP_FUSED_ATTN", true)) {
+            const qkv = QwenQkvPush{
+                .head_dim = d.head_dim,
+                .eps = d.rms_eps,
+                .rope_dim = d.rope_dim,
+                .n_head = d.n_head,
+                .n_kv_head = d.n_kv_head,
+                .position = base_position,
+                .kv_offset = base_position * d.kv_dim,
+            };
+            cmd.dispatch(&self.pipes.qwen_norm_rope_qkv, .{ d.n_head + 2 * d.n_kv_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.qfull, &b.k, &b.v, &wqn.gpu_buffer, &wkn.gpu_buffer, &self.inv_freq, &b.q, &b.attn_gate, &self.kv_k[L], &self.kv_v[L] }, &qkv, @sizeOf(QwenQkvPush), d.head_dim * @sizeOf(f32));
+        } else {
+            // Deinterleave the packed [Q|gate] projection for all T tokens.
+            const deint = DeintBatchPush{ .head_dim = d.head_dim, .n_head = d.n_head, .T = T };
+            cmd.dispatch(&self.pipes.deinterleave_batched, .{ ceilDiv(d.q_dim, 256), T, 1 }, .{ 256, 1, 1 }, &.{ &b.qfull, &b.q, &b.attn_gate }, &deint, @sizeOf(DeintBatchPush), 0);
+            // Per-head q/k RMS norm: one block per (token, head) row of head_dim.
+            const rms_h = RmsPush{ .N = d.head_dim, .eps = d.rms_eps };
+            cmd.dispatch(&self.pipes.rms_norm, .{ d.n_head * T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &wqn.gpu_buffer, &b.q }, &rms_h, @sizeOf(RmsPush), 0);
+            cmd.dispatch(&self.pipes.rms_norm, .{ d.n_kv_head * T, 1, 1 }, .{ 256, 1, 1 }, &.{ &b.k, &wkn.gpu_buffer, &b.k }, &rms_h, @sizeOf(RmsPush), 0);
+            // RoPE q/k over all T at their absolute positions.
+            const rope_q = RopeBatchPush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_head, .base_position = base_position, .freq_base_bits = 0, .attn_scale_bits = 0 };
+            cmd.dispatch(&self.pipes.rope_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &b.q, &self.inv_freq }, &rope_q, @sizeOf(RopeBatchPush), 0);
+            const rope_k = RopeBatchPush{ .stride = d.head_dim, .rope_dim = d.rope_dim, .n_heads = d.n_kv_head, .base_position = base_position, .freq_base_bits = 0, .attn_scale_bits = 0 };
+            cmd.dispatch(&self.pipes.rope_batched, .{ d.n_kv_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.k, &b.k, &self.inv_freq }, &rope_k, @sizeOf(RopeBatchPush), 0);
+            // Write all T tokens' K/V into the cache at positions 0..T-1.
+            const kvw = KvWriteBatchPush{ .kv_dim = d.kv_dim, .dst_base = base_position, .T = T };
+            cmd.dispatch(&self.pipes.kv_cache_write_batched, .{ ceilDiv(d.kv_dim, 64), T, 1 }, .{ 64, 1, 1 }, &.{ &b.k, &self.kv_k[L], &b.v, &self.kv_v[L] }, &kvw, @sizeOf(KvWriteBatchPush), 0);
+        }
         // Causal attention for all T queries (block (head, t), seq_len = t+1).
         const attn = AttnBatchPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .T = T, .attn_scale_bits = 0, .sink_offset = L * d.n_head, .base_position = base_position };
         if (self.use_attn_v2) {
@@ -5556,11 +5572,11 @@ fn mtpQ8On() bool {
 
 /// Vocabulary rows the NextN draft head scores (0 or >= vocab = all of them).
 fn mtpDraftVocab(vocab: u32) u32 {
-    // With three drafts per cycle the draft LM head runs three times, and 64K
-    // rows measured best on Qwen 3.8 27B through the server (R9700, suite
-    // prompts, tok/s): 63.2/72.0/69.1/70.1 vs 61.9/72.0/65.2/70.4 at 100K and
-    // 62.1/71.4/69.5/69.3 at 48K.
-    const n = envU32("ZINC_MTP_DRAFT_VOCAB", 65536);
+    // The Zig 0.17 R9700 server matrix favors 96K: longer coding drafts
+    // accept more proposals, offsetting the extra draft-head weight traffic.
+    // The target still verifies against the complete vocabulary. CUDA keeps
+    // its existing default until measured on NVIDIA hardware.
+    const n = envU32("ZINC_MTP_DRAFT_VOCAB", if (is_rocm) 98304 else 65536);
     return if (n == 0 or n >= vocab) vocab else n;
 }
 
