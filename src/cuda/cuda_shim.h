@@ -46,6 +46,10 @@ uint32_t cuda_compute_capability(CudaCtx* ctx);    // major*10 + minor (e.g. 120
 uint32_t cuda_max_threads_per_block(CudaCtx* ctx);
 uint32_t cuda_max_shared_mem_per_block(CudaCtx* ctx);
 uint32_t cuda_warp_size(CudaCtx* ctx);             // 32 on all NVIDIA
+// Sticky execution failure (launch, transfer, BLAS, or synchronization). An
+// invalid GPU result must never be reported as successful generation. Recreate
+// the context after failure; allocation/probing errors do not poison it.
+int      cuda_execution_failed(CudaCtx* ctx);
 // Fills name_out (NUL-terminated, up to cap bytes) with the device name.
 void     cuda_device_name(CudaCtx* ctx, char* name_out, size_t cap);
 // Fills arch_out with the native compilation target (for example sm_120 or

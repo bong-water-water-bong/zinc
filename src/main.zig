@@ -2189,6 +2189,10 @@ fn handleServeConn(ctx: *ServeConnCtx) void {
         return;
     }
     if (req.method == .GET and std.mem.eql(u8, req.path, "/health")) {
+        if (ctx.engine.executionFailed()) {
+            conn.sendError(503, "server_error", "GPU execution failed; restart the server") catch {};
+            return;
+        }
         var health_buf: [160]u8 = undefined;
         const health = std.fmt.bufPrint(&health_buf, "{{\"status\":\"ok\",\"backend\":\"{s}\",\"context_length\":{d}}}", .{
             if (gpu.is_rocm) @as([]const u8, "rocm") else "cuda", ctx.slot_ctx,

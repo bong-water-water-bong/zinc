@@ -1822,6 +1822,85 @@ extern "C" __global__ void kv_cache_write(const float* k_src, float* k_dst, cons
 // shared holds seq_len scores. Sink: sinks[sink_offset+head] (NaN = no sink).
 struct AttnPush { unsigned head_dim, n_heads, n_kv_heads, seq_len, attn_scale_bits, sink_offset; };
 
+// Long-context attention uses a fixed key tile and an online softmax. Each
+// block owns one query/head and a stripe of output dimensions, so neither LDS
+// nor temporary device allocations grow with the sequence length. All threads
+// participate in the reductions even in a partial key/output tile.
+__device__ __forceinline__ void zinc_attention_tiled(
+    const float* qh, const float* kh, const float* vh, float* oh,
+    unsigned hd, size_t kv_stride, unsigned seq_len, float scale, float sink) {
+    const unsigned tile = 1024u;
+    __shared__ float scores[tile];
+    __shared__ float running_max, running_sum, rescale;
+    unsigned tid = threadIdx.x;
+    unsigned lane = tid & 31u, warp = tid >> 5, nwarp = blockDim.x >> 5;
+    unsigned d_out = blockIdx.z * blockDim.x + tid;
+    float acc = 0.0f;
+    if (tid == 0u) { running_max = -3.4e38f; running_sum = 0.0f; }
+    __syncthreads();
+
+    for (unsigned start = 0u; start < seq_len; start += tile) {
+        unsigned count = seq_len - start < tile ? seq_len - start : tile;
+        // A warp cooperates on each dot product, coalescing the K reads.
+        for (unsigned i = warp; i < count; i += nwarp) {
+            const float* ki = kh + (size_t)(start + i) * kv_stride;
+            float dot = 0.0f;
+            for (unsigned d = lane; d < hd; d += 32u) dot += qh[d] * ki[d];
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                dot += __shfl_down_sync(0xffffffffu, dot, o);
+            if (lane == 0u) scores[i] = dot * scale;
+        }
+        __syncthreads();
+        float m = -3.4e38f;
+        for (unsigned i = tid; i < count; i += blockDim.x) m = fmaxf(m, scores[i]);
+        m = zinc_block_reduce_max(m);
+        if (tid == 0u) {
+            float next_max = fmaxf(running_max, m);
+            rescale = expf(running_max - next_max);
+            running_max = next_max;
+        }
+        __syncthreads();
+        float sum = 0.0f;
+        for (unsigned i = tid; i < count; i += blockDim.x) {
+            float e = expf(scores[i] - running_max);
+            scores[i] = e;
+            sum += e;
+        }
+        sum = zinc_block_reduce_sum(sum);
+        if (tid == 0u) running_sum = running_sum * rescale + sum;
+        __syncthreads();
+        acc *= rescale;
+        if (d_out < hd) {
+            #pragma unroll 8
+            for (unsigned i = 0u; i < count; ++i)
+                acc += scores[i] * vh[(size_t)(start + i) * kv_stride + d_out];
+        }
+        // Finish all V reads before the next tile overwrites scores.
+        __syncthreads();
+    }
+    float inv = 0.0f, sink_rescale = 1.0f;
+    float sum = running_sum;
+    if (sink == sink) {
+        float m = fmaxf(running_max, sink);
+        sink_rescale = sum > 0.0f ? expf(running_max - m) : 0.0f;
+        sum = sum * sink_rescale + expf(sink - m);
+    }
+    if (sum > 0.0f) inv = 1.0f / sum;
+    if (d_out < hd) oh[d_out] = acc * sink_rescale * inv;
+}
+
+extern "C" __global__ void attention_tiled(const float* q, const float* k, const float* v,
+                                           const float* sinks, float* out, AttnPush pc) {
+    unsigned head = blockIdx.x;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    size_t head_off = (size_t)kv_head * pc.head_dim;
+    float scale = pc.attn_scale_bits ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)pc.head_dim);
+    zinc_attention_tiled(q + (size_t)head * pc.head_dim, k + head_off, v + head_off,
+        out + (size_t)head * pc.head_dim, pc.head_dim, (size_t)pc.n_kv_heads * pc.head_dim,
+        pc.seq_len, scale, sinks[pc.sink_offset + head]);
+}
+
 extern "C" __global__ void naive_attention(const float* q, const float* k, const float* v,
                                            const float* sinks, float* out, AttnPush pc) {
     extern __shared__ float s_scores[];           // size = seq_len floats (dynamic)
@@ -11610,6 +11689,19 @@ extern "C" __global__ void qwen_norm_rope_qkv_seq(
 // naive_attention against an aliased slot with seq_len=positions[b]+1 → the
 // batched output equals the per-row looped form bit-for-bit.
 struct AttnSlotPush { unsigned head_dim, n_heads, n_kv_heads, slot_ctx, attn_scale_bits, sink_offset; };
+extern "C" __global__ void attention_batched_seq_tiled(
+    const float* q, const float* k, const float* v, const float* sinks, float* out,
+    const unsigned* positions, const unsigned* slots, AttnSlotPush pc) {
+    unsigned head = blockIdx.x, b = blockIdx.y;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    size_t kv_dim = (size_t)pc.n_kv_heads * pc.head_dim;
+    size_t kv_off = (size_t)slots[b] * pc.slot_ctx * kv_dim + (size_t)kv_head * pc.head_dim;
+    size_t q_off = ((size_t)b * pc.n_heads + head) * pc.head_dim;
+    float scale = pc.attn_scale_bits ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)pc.head_dim);
+    zinc_attention_tiled(q + q_off, k + kv_off, v + kv_off, out + q_off, pc.head_dim,
+        kv_dim, positions[b] + 1u, scale, sinks[pc.sink_offset + head]);
+}
+
 extern "C" __global__ void naive_attention_batched_seq(
     const float* q, const float* k, const float* v, const float* sinks, float* out,
     const unsigned* positions, const unsigned* slots, AttnSlotPush pc) {
@@ -11685,6 +11777,19 @@ extern "C" __global__ void naive_attention_batched_seq(
 // lets speculative verification reuse the already-populated prefix KV cache.
 // Q/K/V are [T, n_kv_heads-or-n_heads, head_dim]; out is [T, n_heads, head_dim].
 struct AttnBatchPush { unsigned head_dim, n_heads, n_kv_heads, T, attn_scale_bits, sink_offset, base_position; };
+
+extern "C" __global__ void attention_causal_tiled(const float* q, const float* k, const float* v,
+                                                  const float* sinks, float* out, AttnBatchPush pc) {
+    unsigned head = blockIdx.x, t = blockIdx.y;
+    if (t >= pc.T) return;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    size_t kv_off = (size_t)kv_head * pc.head_dim;
+    size_t q_off = ((size_t)t * pc.n_heads + head) * pc.head_dim;
+    float scale = pc.attn_scale_bits ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)pc.head_dim);
+    zinc_attention_tiled(q + q_off, k + kv_off, v + kv_off, out + q_off, pc.head_dim,
+        (size_t)pc.n_kv_heads * pc.head_dim, pc.base_position + t + 1u,
+        scale, sinks[pc.sink_offset + head]);
+}
 
 extern "C" __global__ void attention_causal_batched(const float* q, const float* k, const float* v,
                                                     const float* sinks, float* out, AttnBatchPush pc) {

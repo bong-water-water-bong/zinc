@@ -8,15 +8,16 @@
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define MAX_DISPATCH_BUFS 32
 
-struct CudaCtx { CUdevice dev; CUcontext ctx; CUstream stream; cublasHandle_t cublas; };
+struct CudaCtx { CUdevice dev; CUcontext ctx; CUstream stream; cublasHandle_t cublas; atomic_int execution_failed; };
 struct CudaBuf { CUdeviceptr dptr; size_t size; void* host; int owns; int owns_host; };
 struct CudaPipe { CUmodule mod; CUfunction fn; };
-struct CudaCmd { CUstream stream; CUevent event; };
+struct CudaCmd { CudaCtx* ctx; CUstream stream; CUevent event; };
 
 static __thread char g_err[1024];
 
@@ -31,6 +32,12 @@ static int cu_ok(CUresult r, const char* where) {
     return 0;
 }
 const char* cuda_last_error(void) { return g_err; }
+int cuda_execution_failed(CudaCtx* c) { return !c || c->execution_failed; }
+static int execution_ok(CudaCtx* c, CUresult r, const char* where) {
+    if (cu_ok(r, where)) return 1;
+    if (c) c->execution_failed = 1;
+    return 0;
+}
 
 // ---- Device lifecycle --------------------------------------------------------
 CudaCtx* cuda_init(int device_index) {
@@ -39,6 +46,7 @@ CudaCtx* cuda_init(int device_index) {
     if (!inited) { if (!cu_ok(cuInit(0), "cuInit")) return NULL; inited = 1; }
     CudaCtx* c = (CudaCtx*)calloc(1, sizeof *c);
     if (!c) { set_err("cuda_init", "oom"); return NULL; }
+    atomic_init(&c->execution_failed, 0);
     // Silent on failure: callers (e.g. initBest) probe ascending ordinals to
     // enumerate devices, so an out-of-range index here is expected, not an error.
     if (cuDeviceGet(&c->dev, device_index) != CUDA_SUCCESS) { free(c); return NULL; }
@@ -72,7 +80,8 @@ void cuda_destroy(CudaCtx* c) {
 // accumulate/out — matches gemm_q4k_tc's fp16-multiply / fp32-accumulate.
 void cuda_cublas_hgemm(CudaCtx* c, unsigned M, unsigned N, unsigned K,
                        CudaBuf* W, CudaBuf* A, CudaBuf* Y, float beta) {
-    if (!c || !c->cublas) { set_err("cuda_cublas_hgemm", "no cublas handle"); return; }
+    if (c && c->execution_failed) return;
+    if (!c || !c->cublas) { if (c) c->execution_failed = 1; set_err("cuda_cublas_hgemm", "no cublas handle"); return; }
     const float alpha = 1.0f;
     cublasStatus_t s = cublasGemmEx(
         c->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)M, (int)N, (int)K,
@@ -80,7 +89,7 @@ void cuda_cublas_hgemm(CudaCtx* c, unsigned M, unsigned N, unsigned K,
         (const void*)A->dptr, CUDA_R_16F, (int)K,
         &beta, (void*)Y->dptr, CUDA_R_32F, (int)M,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (s != CUBLAS_STATUS_SUCCESS) set_err("cuda_cublas_hgemm", "cublasGemmEx failed");
+    if (s != CUBLAS_STATUS_SUCCESS) { c->execution_failed = 1; set_err("cuda_cublas_hgemm", "cublasGemmEx failed"); }
 }
 
 void cuda_cublas_hgemm_strided_batched(CudaCtx* c, unsigned trans_a, unsigned trans_b,
@@ -89,7 +98,9 @@ void cuda_cublas_hgemm_strided_batched(CudaCtx* c, unsigned trans_a, unsigned tr
                                        CudaBuf* B, size_t b_offset, unsigned ldb, int64_t stride_b,
                                        CudaBuf* C, size_t c_offset, unsigned ldc, int64_t stride_c,
                                        unsigned batch_count, float beta) {
+    if (c && c->execution_failed) return;
     if (!c || !c->cublas || !A || !B || !C) {
+        if (c) c->execution_failed = 1;
         set_err("cuda_cublas_hgemm_strided_batched", "cuBLAS unavailable");
         return;
     }
@@ -106,7 +117,7 @@ void cuda_cublas_hgemm_strided_batched(CudaCtx* c, unsigned trans_a, unsigned tr
         bp, CUDA_R_16F, (int)ldb, (long long int)stride_b,
         &beta, cp, CUDA_R_32F, (int)ldc, (long long int)stride_c,
         (int)batch_count, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (s != CUBLAS_STATUS_SUCCESS) set_err("cuda_cublas_hgemm_strided_batched", "cublasGemmStridedBatchedEx failed");
+    if (s != CUBLAS_STATUS_SUCCESS) { c->execution_failed = 1; set_err("cuda_cublas_hgemm_strided_batched", "cublasGemmStridedBatchedEx failed"); }
 }
 
 void cuda_cublas_sgemm_strided_batched(CudaCtx* c, unsigned trans_a, unsigned trans_b,
@@ -115,7 +126,9 @@ void cuda_cublas_sgemm_strided_batched(CudaCtx* c, unsigned trans_a, unsigned tr
                                        CudaBuf* B, size_t b_offset, unsigned ldb, int64_t stride_b,
                                        CudaBuf* C, size_t c_offset, unsigned ldc, int64_t stride_c,
                                        unsigned batch_count, float beta) {
+    if (c && c->execution_failed) return;
     if (!c || !c->cublas || !A || !B || !C) {
+        if (c) c->execution_failed = 1;
         set_err("cuda_cublas_sgemm_strided_batched", "cuBLAS unavailable");
         return;
     }
@@ -132,7 +145,7 @@ void cuda_cublas_sgemm_strided_batched(CudaCtx* c, unsigned trans_a, unsigned tr
         bp, (int)ldb, (long long int)stride_b,
         &beta, cp, (int)ldc, (long long int)stride_c,
         (int)batch_count);
-    if (s != CUBLAS_STATUS_SUCCESS) set_err("cuda_cublas_sgemm_strided_batched", "cublasSgemmStridedBatched failed");
+    if (s != CUBLAS_STATUS_SUCCESS) { c->execution_failed = 1; set_err("cuda_cublas_sgemm_strided_batched", "cublasSgemmStridedBatched failed"); }
 }
 static int dev_attr(CUdevice d, CUdevice_attribute a) {
     int v = 0; cuDeviceGetAttribute(&v, a, d); return v;
@@ -193,24 +206,26 @@ CudaBuf* cuda_alias_buffer(CudaBuf* base, size_t offset, size_t size) {
 }
 uint64_t cuda_buffer_device_ptr(CudaBuf* b) { return (uint64_t)b->dptr; }
 void cuda_upload(CudaCtx* c, CudaBuf* b, const void* src, size_t size) {
+    if (!c || c->execution_failed) return;
     cuCtxSetCurrent(c->ctx);
-    if (!cu_ok(cuMemcpyHtoDAsync(b->dptr, src, size, c->stream), "cuMemcpyHtoDAsync")) return;
-    cuStreamSynchronize(c->stream);
+    if (!execution_ok(c, cuMemcpyHtoDAsync(b->dptr, src, size, c->stream), "cuMemcpyHtoDAsync")) return;
+    execution_ok(c, cuStreamSynchronize(c->stream), "cuStreamSynchronize(H2D)");
 }
 void cuda_download(CudaCtx* c, CudaBuf* b, void* dst, size_t size) {
+    if (!c || c->execution_failed) return;
     cuCtxSetCurrent(c->ctx);
-    if (!cu_ok(cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream), "cuMemcpyDtoHAsync")) return;
-    cuStreamSynchronize(c->stream);
+    if (!execution_ok(c, cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream), "cuMemcpyDtoHAsync")) return;
+    execution_ok(c, cuStreamSynchronize(c->stream), "cuStreamSynchronize(D2H)");
 }
 // Async variants: enqueue the copy on the ctx stream and return WITHOUT syncing.
 // Issued between cuda_graph_begin/end_launch they become memcpy graph nodes, so
 // the embed H2D and argmax D2H ride the single graph launch instead of each
 // costing a WSL2 sync round-trip. Host side must be pinned (cuda_alloc_host).
 void cuda_upload_async(CudaCtx* c, CudaBuf* b, const void* src, size_t size) {
-    cuMemcpyHtoDAsync(b->dptr, src, size, c->stream);
+    if (c && !c->execution_failed) execution_ok(c, cuMemcpyHtoDAsync(b->dptr, src, size, c->stream), "cuMemcpyHtoDAsync");
 }
 void cuda_download_async(CudaCtx* c, CudaBuf* b, void* dst, size_t size) {
-    cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream);
+    if (c && !c->execution_failed) execution_ok(c, cuMemcpyDtoHAsync(dst, b->dptr, size, c->stream), "cuMemcpyDtoHAsync");
 }
 void* cuda_alloc_host(size_t size) {
     void* p = NULL;
@@ -307,10 +322,12 @@ void cuda_free_pipeline(CudaPipe* p) { if (!p) return; if (p->mod) cuModuleUnloa
 
 // ---- Command / dispatch ------------------------------------------------------
 CudaCmd* cuda_begin_command(CudaCtx* c) {
+    if (!c || c->execution_failed) return NULL;
     cuCtxSetCurrent(c->ctx);
     CudaCmd* m = (CudaCmd*)calloc(1, sizeof *m);
     if (!m) { set_err("cuda_begin_command", "oom"); return NULL; }
     m->stream = c->stream;
+    m->ctx = c;
     if (!cu_ok(cuEventCreate(&m->event, CU_EVENT_DEFAULT), "cuEventCreate")) { free(m); return NULL; }
     return m;
 }
@@ -320,7 +337,12 @@ void cuda_dispatch(CudaCmd* m, CudaPipe* p,
                    const void* push_data, size_t push_size,
                    uint32_t shared_bytes) {
     (void)push_size;
-    if (n_bufs > MAX_DISPATCH_BUFS) { set_err("cuda_dispatch", "too many buffers"); return; }
+    if (!m || !p || n_bufs > MAX_DISPATCH_BUFS) {
+        set_err("cuda_dispatch", "invalid dispatch");
+        if (m) m->ctx->execution_failed = 1;
+        return;
+    }
+    if (m->ctx->execution_failed) return;
     // kernelParams[i] points to the i-th arg's value: &dptr for each buffer,
     // then the push struct bytes for the trailing by-value param.
     CUdeviceptr dptrs[MAX_DISPATCH_BUFS];
@@ -328,17 +350,17 @@ void cuda_dispatch(CudaCmd* m, CudaPipe* p,
     for (uint32_t i = 0; i < n_bufs; i++) { dptrs[i] = bufs[i]->dptr; args[i] = &dptrs[i]; }
     uint32_t nargs = n_bufs;
     if (push_data) { args[nargs++] = (void*)push_data; }
-    cu_ok(cuLaunchKernel(p->fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
+    execution_ok(m->ctx, cuLaunchKernel(p->fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
                          shared_bytes, m->stream, args, NULL), "cuLaunchKernel");
 }
 void cuda_barrier(CudaCmd* m) { (void)m; /* single stream is implicitly ordered */ }
 void cuda_commit_and_wait(CudaCmd* m) {
-    cuEventRecord(m->event, m->stream);
-    cuStreamSynchronize(m->stream);
+    execution_ok(m->ctx, cuEventRecord(m->event, m->stream), "cuEventRecord");
+    execution_ok(m->ctx, cuStreamSynchronize(m->stream), "cuStreamSynchronize(command)");
     cuEventDestroy(m->event); free(m);
 }
-void cuda_commit_async(CudaCmd* m) { cuEventRecord(m->event, m->stream); }
-void cuda_wait(CudaCmd* m) { cuEventSynchronize(m->event); cuEventDestroy(m->event); free(m); }
+void cuda_commit_async(CudaCmd* m) { execution_ok(m->ctx, cuEventRecord(m->event, m->stream), "cuEventRecord"); }
+void cuda_wait(CudaCmd* m) { execution_ok(m->ctx, cuEventSynchronize(m->event), "cuEventSynchronize"); cuEventDestroy(m->event); free(m); }
 void cuda_release_completed(CudaCmd* m) { if (!m) return; if (m->event) cuEventDestroy(m->event); free(m); }
 
 // ---- CUDA Graphs (decode replay, Effort 25) ---------------------------------
@@ -358,12 +380,13 @@ CudaGraph* cuda_graph_create(void) {
     return g;
 }
 int cuda_graph_begin(CudaCtx* c) {
+    if (!c || c->execution_failed) return 0;
     cuCtxSetCurrent(c->ctx);
-    return cu_ok(cuStreamBeginCapture(c->stream, CU_STREAM_CAPTURE_MODE_RELAXED), "cuStreamBeginCapture");
+    return execution_ok(c, cuStreamBeginCapture(c->stream, CU_STREAM_CAPTURE_MODE_RELAXED), "cuStreamBeginCapture");
 }
 int cuda_graph_end_launch(CudaCtx* c, CudaGraph* g) {
     CUgraph graph = NULL;
-    if (!cu_ok(cuStreamEndCapture(c->stream, &graph), "cuStreamEndCapture")) return 0;
+    if (!execution_ok(c, cuStreamEndCapture(c->stream, &graph), "cuStreamEndCapture")) return 0;
     if (g->have_exec) {
         // Topology is invariant across decode steps (same layers/kernels/order);
         // only per-token push-constant scalars change → an in-place exec update
@@ -376,16 +399,15 @@ int cuda_graph_end_launch(CudaCtx* c, CudaGraph* g) {
         }
     }
     if (!g->have_exec) {
-        if (!cu_ok(cuGraphInstantiate(&g->exec, graph, 0), "cuGraphInstantiate")) {
+        if (!execution_ok(c, cuGraphInstantiate(&g->exec, graph, 0), "cuGraphInstantiate")) {
             cuGraphDestroy(graph);
             return 0;
         }
         g->have_exec = 1;
     }
     cuGraphDestroy(graph);
-    int ok = cu_ok(cuGraphLaunch(g->exec, c->stream), "cuGraphLaunch");
-    cuStreamSynchronize(c->stream);
-    return ok;
+    int ok = execution_ok(c, cuGraphLaunch(g->exec, c->stream), "cuGraphLaunch");
+    return execution_ok(c, cuStreamSynchronize(c->stream), "cuStreamSynchronize(graph)") && ok;
 }
 void cuda_graph_free(CudaGraph* g) {
     if (!g) return;

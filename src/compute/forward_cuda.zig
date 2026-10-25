@@ -451,10 +451,12 @@ const Pipelines = struct {
     rope: CudaPipeline,
     kv_cache_write: CudaPipeline,
     naive_attention: CudaPipeline,
+    attention_tiled: CudaPipeline,
     // Effort 28 4c-2: fused batched-decode attention (grid.y=B per-seq) twins.
     qwen_norm_rope_qkv_seq: CudaPipeline,
     qwen_norm_rope_qkv: CudaPipeline,
     naive_attention_batched_seq: CudaPipeline,
+    attention_batched_seq_tiled: CudaPipeline,
     ssm_conv1d_seq: CudaPipeline,
     ssm_delta_net_seq: CudaPipeline,
     ssm_gated_norm_seq: CudaPipeline,
@@ -529,6 +531,7 @@ const Pipelines = struct {
     kv_cache_write_batched: CudaPipeline,
     attention_causal_batched: CudaPipeline,
     attention_causal_v2: CudaPipeline, // coalesced warp-per-key qwen prefill attention (ZINC_ATTN_V2)
+    attention_causal_tiled: CudaPipeline,
 };
 
 /// Token-major scratch for the batched prefill path (Effort 26 T0). Allocated
@@ -956,6 +959,8 @@ pub const ForwardCuda = struct {
     // with the decode ssm_delta_net_seq kernel). Set by prefillBatchedSlot so
     // the batched prefill's SSM state is bit-compatible with subsequent decode.
     force_block_ssm: bool = false,
+    // Number of prompt rows already primed while bounded prefill chunks ran.
+    mtp_prefill_tokens: usize = 0,
 
     // Lazy fp16 weight cache for prefill GEMMs. Keyed by weight device-ptr.
     // On first prefill call, each Q4_K weight is dequanted to fp16 once and
@@ -1082,9 +1087,11 @@ pub const ForwardCuda = struct {
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.kv_cache_write = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write");
         pipes.naive_attention = try pipeline.createPipeline(ctx, src.ptr, "naive_attention");
+        pipes.attention_tiled = try pipeline.createPipeline(ctx, src.ptr, "attention_tiled");
         pipes.qwen_norm_rope_qkv_seq = try pipeline.createPipeline(ctx, src.ptr, "qwen_norm_rope_qkv_seq");
         pipes.qwen_norm_rope_qkv = try pipeline.createPipeline(ctx, src.ptr, "qwen_norm_rope_qkv");
         pipes.naive_attention_batched_seq = try pipeline.createPipeline(ctx, src.ptr, "naive_attention_batched_seq");
+        pipes.attention_batched_seq_tiled = try pipeline.createPipeline(ctx, src.ptr, "attention_batched_seq_tiled");
         pipes.ssm_conv1d_seq = try pipeline.createPipeline(ctx, src.ptr, "ssm_conv1d_seq");
         pipes.ssm_delta_net_seq = try pipeline.createPipeline(ctx, src.ptr, "ssm_delta_net_seq");
         pipes.ssm_gated_norm_seq = try pipeline.createPipeline(ctx, src.ptr, "ssm_gated_norm_seq");
@@ -1157,6 +1164,7 @@ pub const ForwardCuda = struct {
         pipes.kv_cache_write_batched = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write_batched");
         pipes.attention_causal_batched = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_batched");
         pipes.attention_causal_v2 = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_batched_v2");
+        pipes.attention_causal_tiled = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_tiled");
         // Effort 28 4c: batched-decode GEMMs (weights read once over B rows).
         pipes.gemm[0] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tiled_v2");
         pipes.gemm[1] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tiled_v2");
@@ -1609,38 +1617,43 @@ pub const ForwardCuda = struct {
 
     /// Allocate per-sequence slot state for `n_slots` concurrent sequences, each
     /// with up to `slot_ctx` positions. Attn layers get slot KV; ssm layers get
-    /// per-slot conv + recurrent state (zero-initialised). Additive — production
-    /// single-sequence buffers are untouched. Re-callable (frees first).
+    /// per-slot conv + recurrent state (zero-initialised). A single slot aliases
+    /// the existing state instead of allocating a second full KV cache.
     pub fn allocSlotState(self: *ForwardCuda, n_slots: u32, slot_ctx: u32) !void {
+        if (n_slots == 0 or slot_ctx == 0) return error.InvalidSlotCapacity;
         self.freeSlotState();
+        errdefer self.freeSlotState();
         const ctx = self.ctx;
         const f4 = @sizeOf(f32);
         const d = self.d;
-        const kk = try self.allocator.alloc(CudaBuffer, d.n_layers);
-        const vv = try self.allocator.alloc(CudaBuffer, d.n_layers);
-        const cc = try self.allocator.alloc(CudaBuffer, d.n_layers);
-        const ss = try self.allocator.alloc(CudaBuffer, d.n_layers);
+        inline for (.{ &self.kv_k_slots, &self.kv_v_slots, &self.ssm_conv_slots, &self.ssm_state_slots }) |field| {
+            field.* = try self.allocator.alloc(CudaBuffer, d.n_layers);
+            @memset(field.*.?, std.mem.zeroes(CudaBuffer));
+        }
+        const kk = self.kv_k_slots.?;
+        const vv = self.kv_v_slots.?;
+        const cc = self.ssm_conv_slots.?;
+        const ss = self.ssm_state_slots.?;
+        const reuse_single = n_slots == 1 and slot_ctx <= self.max_ctx;
         for (0..d.n_layers) |li| {
             const L: u32 = @intCast(li);
             if (self.layer_is_attn[L]) {
                 const kv_bytes = @as(usize, n_slots) * slot_ctx * d.kv_dim * f4;
-                kk[li] = try buffer.createBuffer(ctx, kv_bytes);
-                vv[li] = try buffer.createBuffer(ctx, kv_bytes);
+                kk[li] = if (reuse_single) try buffer.aliasBuffer(&self.kv_k[li], 0, kv_bytes) else try buffer.createBuffer(ctx, kv_bytes);
+                vv[li] = if (reuse_single) try buffer.aliasBuffer(&self.kv_v[li], 0, kv_bytes) else try buffer.createBuffer(ctx, kv_bytes);
                 cc[li] = try buffer.createBuffer(ctx, f4);
                 ss[li] = try buffer.createBuffer(ctx, f4);
             } else {
                 kk[li] = try buffer.createBuffer(ctx, f4);
                 vv[li] = try buffer.createBuffer(ctx, f4);
-                cc[li] = try buffer.createBuffer(ctx, @as(usize, n_slots) * d.conv_state_len * f4);
-                ss[li] = try buffer.createBuffer(ctx, @as(usize, n_slots) * d.ssm_state_len * f4);
+                const conv_bytes = @as(usize, n_slots) * d.conv_state_len * f4;
+                const state_bytes = @as(usize, n_slots) * d.ssm_state_len * f4;
+                cc[li] = if (reuse_single) try buffer.aliasBuffer(&self.ssm_conv_state[li], 0, conv_bytes) else try buffer.createBuffer(ctx, conv_bytes);
+                ss[li] = if (reuse_single) try buffer.aliasBuffer(&self.ssm_state[li], 0, state_bytes) else try buffer.createBuffer(ctx, state_bytes);
                 try zeroBuffer(self.allocator, ctx, &cc[li], n_slots * d.conv_state_len);
                 try zeroBuffer(self.allocator, ctx, &ss[li], n_slots * d.ssm_state_len);
             }
         }
-        self.kv_k_slots = kk;
-        self.kv_v_slots = vv;
-        self.ssm_conv_slots = cc;
-        self.ssm_state_slots = ss;
         self.n_slots = n_slots;
         self.slot_ctx = slot_ctx;
         // Persistent per-step decode scratch (see field comment): sized to the
@@ -1700,6 +1713,7 @@ pub const ForwardCuda = struct {
     /// current sequence's positions — same reason gemma's slot KV reuses cleanly).
     /// No-op if slot state is unallocated. Call on ADMIT, before per-token prefill.
     pub fn resetSlot(self: *ForwardCuda, slot: u32) !void {
+        try self.checkExecution();
         const cc = self.ssm_conv_slots orelse return;
         const ss = self.ssm_state_slots orelse return;
         const d = self.d;
@@ -1786,6 +1800,9 @@ pub const ForwardCuda = struct {
     /// state leaks from one reference sequence into the next). Additive — never
     /// called on the real decode/prefill path; that path runs one sequence/process.
     pub fn resetState(self: *ForwardCuda) !void {
+        try self.checkExecution();
+        self.mtp_prefill_tokens = 0;
+        if (self.mtp) |*state| state.primed = false;
         const d = self.d;
         for (0..d.n_layers) |li| {
             const L: u32 = @intCast(li);
@@ -1795,6 +1812,10 @@ pub const ForwardCuda = struct {
                 try zeroBuffer(self.allocator, self.ctx, &self.ssm_state[li], d.ssm_state_len);
             }
         }
+    }
+
+    pub fn checkExecution(self: *const ForwardCuda) !void {
+        if (shim.cuda_execution_failed(self.ctx) != 0) return error.GpuExecutionFailed;
     }
 
     /// Run one greedy decode step for `token` at sequence position `pos`,
@@ -1856,6 +1877,7 @@ pub const ForwardCuda = struct {
 
         var tok: u32 = 0;
         buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
+        try self.checkExecution();
         return tok;
     }
 
@@ -1881,9 +1903,32 @@ pub const ForwardCuda = struct {
             if (d.n_experts > 0) try self.moeFfnBlock(L) else try self.ffnBlock(L);
         }
         self.waitPending(); // drain the async layer ops; no logits for prompt-internal tokens
+        try self.checkExecution();
     }
 
     pub fn prefillBatched(self: *ForwardCuda, tokens: []const u32) !u32 {
+        if (tokens.len == 0 or tokens.len > self.max_ctx) return error.InvalidPromptLength;
+        self.mtp_prefill_tokens = 0;
+        if (self.mtp) |*state| state.primed = false;
+        // Bound activations independently of the KV capacity. Chunk boundaries
+        // retain SSM/conv state and use absolute RoPE/KV/causal positions.
+        const chunk: usize = @max(@as(u32, 1), envU32("ZINC_PREFILL_CHUNK", 4096));
+        const prime_chunks = tokens.len > chunk and self.mtpEnabled() and !self.force_block_ssm;
+        var next: u32 = 0;
+        var start: usize = 0;
+        while (start < tokens.len) {
+            const end = @min(tokens.len, start + chunk);
+            next = try self.prefillBatchedRange(tokens[start..end], @intCast(start));
+            if (prime_chunks) {
+                _ = try self.mtpPrimeRange(tokens[start..end], @intCast(start));
+                self.mtp_prefill_tokens = end;
+            }
+            start = end;
+        }
+        return next;
+    }
+
+    fn prefillBatchedRange(self: *ForwardCuda, tokens: []const u32, base_position: u32) !u32 {
         const d = self.d;
         const ctx = self.ctx;
         const T: u32 = @intCast(tokens.len);
@@ -1937,7 +1982,7 @@ pub const ForwardCuda = struct {
                 self.waitPending();
                 const t0 = host_io.milliTimestamp();
                 if (self.layer_is_attn[L]) {
-                    try self.attentionLayerBatched(L, T, b, 0);
+                    try self.attentionLayerBatched(L, T, b, base_position);
                 } else {
                     try self.ssmLayerBatched(L, T, b);
                 }
@@ -1965,7 +2010,7 @@ pub const ForwardCuda = struct {
                 prof_ffn += host_io.milliTimestamp() - t1;
             } else {
                 if (self.layer_is_attn[L]) {
-                    try self.attentionLayerBatched(L, T, b, 0);
+                    try self.attentionLayerBatched(L, T, b, base_position);
                 } else {
                     try self.ssmLayerBatched(L, T, b);
                 }
@@ -2012,6 +2057,7 @@ pub const ForwardCuda = struct {
 
         var tok: u32 = 0;
         buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
+        try self.checkExecution();
         return tok;
     }
 
@@ -2245,6 +2291,7 @@ pub const ForwardCuda = struct {
         try self.mtpDraftRecord(null, token, pos, &self.argmax_buf, true);
         var tok: u32 = 0;
         buffer.download(self.ctx, &self.argmax_buf, std.mem.asBytes(&tok));
+        try self.checkExecution();
         return tok;
     }
 
@@ -2378,11 +2425,17 @@ pub const ForwardCuda = struct {
         if (predictions) |out| {
             buffer.download(self.ctx, &self.mtp.?.verify_argmax, std.mem.sliceAsBytes(out[0..rows]));
         }
+        try self.checkExecution();
     }
 
     /// Prime the draft head from the target prompt hidden rows left by
     /// prefillBatched. Initialization is charged to prefill, matching the reference runtime.
     pub fn mtpPrime(self: *ForwardCuda, prompt_tokens: []const u32) !bool {
+        if (self.mtp_prefill_tokens == prompt_tokens.len and self.mtp != null and self.mtp.?.primed) return true;
+        return self.mtpPrimeRange(prompt_tokens, 0);
+    }
+
+    fn mtpPrimeRange(self: *ForwardCuda, prompt_tokens: []const u32, base_position: u32) !bool {
         if (!self.mtpEnabled() or prompt_tokens.len == 0 or self.batch == null) return false;
         const d = self.d;
         const T: u32 = @intCast(prompt_tokens.len);
@@ -2404,10 +2457,12 @@ pub const ForwardCuda = struct {
         defer self.allocator.free(pairs);
         buffer.download(self.ctx, &b.norm, std.mem.sliceAsBytes(target_h));
         @memset(pairs, 0);
+        if (base_position > 0) @memcpy(pairs[0..width], self.mtp.?.pending_h);
         if (rows > 1) @memcpy(pairs[width..], target_h[0 .. (rows - 1) * width]);
         @memcpy(self.mtp.?.pending_h, target_h[(rows - 1) * width ..][0..width]);
 
-        try self.mtpCatchup(prompt_tokens, pairs, 0);
+        try self.mtpCatchup(prompt_tokens, pairs, base_position);
+        try self.checkExecution();
         self.mtp.?.primed = true;
         log.info("Qwen NextN/MTP enabled: {d} prompt rows primed, draft window={d}", .{ T, @min(mtp_max_draft, envU32("ZINC_MTP_DRAFTS", mtp_default_drafts)) });
         return true;
@@ -2542,6 +2597,7 @@ pub const ForwardCuda = struct {
         self.mtp.?.cycles += 1;
         self.mtp.?.drafted += n_drafted;
         self.mtp.?.accepted += accepted;
+        try self.checkExecution();
         return .{
             .next_token = predictions[accepted],
             .n_drafted = n_drafted,
@@ -2560,14 +2616,27 @@ pub const ForwardCuda = struct {
         const T: u32 = @intCast(tokens.len);
         if (self.kv_k_slots == null) return error.SlotStateNotAllocated;
 
-        // Save single-seq state pointers + conv offsets.
-        const saved_kv_k = self.kv_k;
-        const saved_kv_v = self.kv_v;
-        const saved_ssm = self.ssm_state;
-        const saved_conv = self.ssm_conv_state;
+        // Save the descriptors, not just slices into the arrays being replaced.
+        const saved_kv_k = try self.allocator.dupe(CudaBuffer, self.kv_k);
+        defer self.allocator.free(saved_kv_k);
+        const saved_kv_v = try self.allocator.dupe(CudaBuffer, self.kv_v);
+        defer self.allocator.free(saved_kv_v);
+        const saved_ssm = try self.allocator.dupe(CudaBuffer, self.ssm_state);
+        defer self.allocator.free(saved_ssm);
+        const saved_conv = try self.allocator.dupe(CudaBuffer, self.ssm_conv_state);
+        defer self.allocator.free(saved_conv);
         const saved_conv_off = try self.allocator.dupe(u32, self.conv_off);
         defer self.allocator.free(saved_conv_off);
         @memset(self.conv_off, 0);
+        for (0..d.n_layers) |li| {
+            if (self.layer_is_attn[li]) {
+                self.kv_k[li] = std.mem.zeroes(CudaBuffer);
+                self.kv_v[li] = std.mem.zeroes(CudaBuffer);
+            } else {
+                self.ssm_state[li] = std.mem.zeroes(CudaBuffer);
+                self.ssm_conv_state[li] = std.mem.zeroes(CudaBuffer);
+            }
+        }
 
         // Alias KV/SSM state to the slot's per-sequence region.
         var alias_err: ?anyerror = null;
@@ -2604,7 +2673,9 @@ pub const ForwardCuda = struct {
         // The warp kernel's Q/K norm uses a different FP reduction tree than
         // the decode kernel → state divergence during decode. Force the block-
         // reduce kernel for slot-aware prefill to ensure bit-compatible state.
+        const saved_force_block_ssm = self.force_block_ssm;
         self.force_block_ssm = true;
+        defer self.force_block_ssm = saved_force_block_ssm;
         const tok = self.prefillBatched(tokens) catch |err| {
             self.restorePrefillAliases(saved_kv_k, saved_kv_v, saved_ssm, saved_conv, d.n_layers);
             @memcpy(self.conv_off, saved_conv_off);
@@ -2612,8 +2683,8 @@ pub const ForwardCuda = struct {
         };
 
         self.restorePrefillAliases(saved_kv_k, saved_kv_v, saved_ssm, saved_conv, d.n_layers);
-        self.force_block_ssm = false;
         @memcpy(self.conv_off, saved_conv_off);
+        try self.checkExecution();
         return tok;
     }
 
@@ -2631,10 +2702,10 @@ pub const ForwardCuda = struct {
                 buffer.freeBuffer(&self.ssm_conv_state[i]);
             }
         }
-        self.kv_k = saved_kk;
-        self.kv_v = saved_vv;
-        self.ssm_state = saved_ss;
-        self.ssm_conv_state = saved_cc;
+        @memcpy(self.kv_k, saved_kk);
+        @memcpy(self.kv_v, saved_vv);
+        @memcpy(self.ssm_state, saved_ss);
+        @memcpy(self.ssm_conv_state, saved_cc);
     }
     /// GEMM over all T tokens; the deinterleave-gate, per-head q/k norm, RoPE,
     /// KV-write, causal attention and sigmoid-gate are each ONE batched launch
@@ -2705,7 +2776,9 @@ pub const ForwardCuda = struct {
         }
         // Causal attention for all T queries (block (head, t), seq_len = t+1).
         const attn = AttnBatchPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .T = T, .attn_scale_bits = 0, .sink_offset = L * d.n_head, .base_position = base_position };
-        if (self.use_attn_v2) {
+        if (base_position + T > 8192) {
+            cmd.dispatch(&self.pipes.attention_causal_tiled, .{ d.n_head, T, ceilDiv(d.head_dim, 256) }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), 0);
+        } else if (self.use_attn_v2) {
             cmd.dispatch(&self.pipes.attention_causal_v2, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), (base_position + T + d.head_dim) * 4);
         } else {
             cmd.dispatch(&self.pipes.attention_causal_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), (base_position + T) * 4);
@@ -3579,6 +3652,7 @@ pub const ForwardCuda = struct {
 
     /// Allocate (or reuse) the token-major batched scratch for T tokens.
     fn ensureBatch(self: *ForwardCuda, T: u32) !*BatchScratch {
+        @setEvalBranchQuota(4000);
         if (self.batch) |*bb| {
             if (bb.t_cap >= T) return bb;
             self.freeBatch();
@@ -3597,41 +3671,44 @@ pub const ForwardCuda = struct {
         const nu = @max(@as(u32, 1), d.n_experts_used);
         const e_gu = if (moe) T * nu * d.n_ff * f4 else f4; // [T, n_used*ef]
         const e_dn = if (moe) T * nu * d.n_embd * f4 else f4; // [T, n_used*n_embd]
-        self.batch = BatchScratch{
-            .t_cap = T,
-            .hidden = try buffer.createBuffer(ctx, T * d.n_embd * f4),
-            .norm = try buffer.createBuffer(ctx, T * d.n_embd * f4),
-            .o = try buffer.createBuffer(ctx, T * d.n_embd * f4),
-            .qfull = try buffer.createBuffer(ctx, T * 2 * d.q_dim * f4),
-            .q = try buffer.createBuffer(ctx, T * d.q_dim * f4),
-            .attn_gate = try buffer.createBuffer(ctx, T * d.q_dim * f4),
-            .k = try buffer.createBuffer(ctx, T * d.kv_dim * f4),
-            .v = try buffer.createBuffer(ctx, T * d.kv_dim * f4),
-            .attn_out = try buffer.createBuffer(ctx, T * d.q_dim * f4),
-            .qkv = try buffer.createBuffer(ctx, T * d.conv_channels * f4),
-            .conv_out = try buffer.createBuffer(ctx, T * d.conv_channels * f4),
-            .z = try buffer.createBuffer(ctx, T * d.d_inner * f4),
-            .alpha = try buffer.createBuffer(ctx, T * d.dt_rank * f4),
-            .beta = try buffer.createBuffer(ctx, T * d.dt_rank * f4),
-            .delta_out = try buffer.createBuffer(ctx, T * d.d_inner * f4),
-            .ssm_gn = try buffer.createBuffer(ctx, T * d.d_inner * f4),
-            .ffn_norm = try buffer.createBuffer(ctx, T * d.n_embd * f4),
-            .gate_ff = try buffer.createBuffer(ctx, T * max_ff * f4),
-            .up_ff = try buffer.createBuffer(ctx, T * max_ff * f4),
-            .swiglu_ff = try buffer.createBuffer(ctx, T * max_ff * f4),
-            .act_f16 = try buffer.createBuffer(ctx, T * max_k * @sizeOf(u16)),
-            .w_f16 = try buffer.createBuffer(ctx, max_w * @sizeOf(u16)),
-            .act_q8 = try buffer.createBuffer(ctx, T * (@max(max_k, nu * d.n_ff) / 32) * 36),
-            .router_logits_e = try buffer.createBuffer(ctx, if (moe) T * d.n_experts * f4 else f4),
-            .router_table_e = try buffer.createBuffer(ctx, if (moe) T * 2 * nu * f4 else f4),
-            .gate_e = try buffer.createBuffer(ctx, e_gu),
-            .up_e = try buffer.createBuffer(ctx, e_gu),
-            .swiglu_e = try buffer.createBuffer(ctx, e_gu),
-            .down_e = try buffer.createBuffer(ctx, e_dn),
-            .gate_scalar_e = try buffer.createBuffer(ctx, if (moe) T * f4 else f4),
-            .padded_order = try buffer.createBuffer(ctx, if (moe) @max(@as(u32, 1), T * nu + 64 * d.n_experts) * @sizeOf(u32) else f4),
-            .tile_expert = try buffer.createBuffer(ctx, if (moe) @max(@as(u32, 1), (T * nu >> 4) + d.n_experts + 2) * @sizeOf(u32) else f4),
+        var scratch = std.mem.zeroes(BatchScratch);
+        errdefer inline for (@typeInfo(BatchScratch).@"struct".field_names) |name| {
+            if (comptime @TypeOf(@field(scratch, name)) == CudaBuffer) buffer.freeBuffer(&@field(scratch, name));
         };
+        scratch.t_cap = T;
+        scratch.hidden = try buffer.createBuffer(ctx, T * d.n_embd * f4);
+        scratch.norm = try buffer.createBuffer(ctx, T * d.n_embd * f4);
+        scratch.o = try buffer.createBuffer(ctx, T * d.n_embd * f4);
+        scratch.qfull = try buffer.createBuffer(ctx, T * 2 * d.q_dim * f4);
+        scratch.q = try buffer.createBuffer(ctx, T * d.q_dim * f4);
+        scratch.attn_gate = try buffer.createBuffer(ctx, T * d.q_dim * f4);
+        scratch.k = try buffer.createBuffer(ctx, T * d.kv_dim * f4);
+        scratch.v = try buffer.createBuffer(ctx, T * d.kv_dim * f4);
+        scratch.attn_out = try buffer.createBuffer(ctx, T * d.q_dim * f4);
+        scratch.qkv = try buffer.createBuffer(ctx, T * d.conv_channels * f4);
+        scratch.conv_out = try buffer.createBuffer(ctx, T * d.conv_channels * f4);
+        scratch.z = try buffer.createBuffer(ctx, T * d.d_inner * f4);
+        scratch.alpha = try buffer.createBuffer(ctx, T * d.dt_rank * f4);
+        scratch.beta = try buffer.createBuffer(ctx, T * d.dt_rank * f4);
+        scratch.delta_out = try buffer.createBuffer(ctx, T * d.d_inner * f4);
+        scratch.ssm_gn = try buffer.createBuffer(ctx, T * d.d_inner * f4);
+        scratch.ffn_norm = try buffer.createBuffer(ctx, T * d.n_embd * f4);
+        scratch.gate_ff = try buffer.createBuffer(ctx, T * max_ff * f4);
+        scratch.up_ff = try buffer.createBuffer(ctx, T * max_ff * f4);
+        scratch.swiglu_ff = try buffer.createBuffer(ctx, T * max_ff * f4);
+        scratch.act_f16 = try buffer.createBuffer(ctx, T * max_k * @sizeOf(u16));
+        scratch.w_f16 = try buffer.createBuffer(ctx, max_w * @sizeOf(u16));
+        scratch.act_q8 = try buffer.createBuffer(ctx, T * (@max(max_k, nu * d.n_ff) / 32) * 36);
+        scratch.router_logits_e = try buffer.createBuffer(ctx, if (moe) T * d.n_experts * f4 else f4);
+        scratch.router_table_e = try buffer.createBuffer(ctx, if (moe) T * 2 * nu * f4 else f4);
+        scratch.gate_e = try buffer.createBuffer(ctx, e_gu);
+        scratch.up_e = try buffer.createBuffer(ctx, e_gu);
+        scratch.swiglu_e = try buffer.createBuffer(ctx, e_gu);
+        scratch.down_e = try buffer.createBuffer(ctx, e_dn);
+        scratch.gate_scalar_e = try buffer.createBuffer(ctx, if (moe) T * f4 else f4);
+        scratch.padded_order = try buffer.createBuffer(ctx, if (moe) @max(@as(u32, 1), T * nu + 64 * d.n_experts) * @sizeOf(u32) else f4);
+        scratch.tile_expert = try buffer.createBuffer(ctx, if (moe) @max(@as(u32, 1), (T * nu >> 4) + d.n_experts + 2) * @sizeOf(u32) else f4);
+        self.batch = scratch;
         return &self.batch.?;
     }
 
@@ -3822,6 +3899,7 @@ pub const ForwardCuda = struct {
         // MoE path drains the ring each layer via its `waitPending`).
         self.drainPending();
         buffer.download(ctx, argmax_out, std.mem.sliceAsBytes(out));
+        try self.checkExecution();
     }
 
     /// Single-request serving step: production serial scratch and fused kernels,
@@ -3862,6 +3940,7 @@ pub const ForwardCuda = struct {
 
         var tok: u32 = 0;
         buffer.download(ctx, &self.argmax_buf, std.mem.asBytes(&tok));
+        try self.checkExecution();
         return tok;
     }
 
@@ -3885,7 +3964,8 @@ pub const ForwardCuda = struct {
         const g = self.batch_graph[B].?;
 
         self.capturing = true;
-        _ = shim.cuda_graph_begin(ctx);
+        defer self.capturing = false;
+        if (shim.cuda_graph_begin(ctx) == 0) return error.GpuExecutionFailed;
         // Layer chain — each batched block rides the async `submit` ring, which under
         // `capturing` records onto the captured stream with no event/sync. The
         // attention smem is sized at the constant slot_ctx (not data-dependent
@@ -3924,9 +4004,10 @@ pub const ForwardCuda = struct {
 
         // End capture, instantiate-or-update the cached exec, launch + ONE sync
         // (drains the whole captured layer chain + tail).
-        _ = shim.cuda_graph_end_launch(ctx, g);
+        if (shim.cuda_graph_end_launch(ctx, g) == 0) return error.GpuExecutionFailed;
         // The argmax slots are now resident on the device; one B-wide D2H.
         buffer.download(ctx, argmax_out, std.mem.sliceAsBytes(out));
+        try self.checkExecution();
     }
 
     /// (Re)allocate the [B, dim] batched-decode scratch, growing if B exceeds cap.
@@ -4090,12 +4171,16 @@ pub const ForwardCuda = struct {
         // 3. Batched per-seq attention over each row's slot KV history.
         const attn = AttnSlotPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .slot_ctx = self.slot_ctx, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
         // The kernel's dynamic shared mem holds up to `seq_len`=positions[b]+1 f32
-        // scores per row. Under graph capture, request the constant MAX (slot_ctx)
+        // scores per row. Under graph capture, request a bounded maximum
         // so the captured kernel-node smem size is invariant as positions grow →
         // the cached exec updates in place instead of re-instantiating each step.
         // The kernel still uses only seq_len entries (mirrors the serial path).
-        const attn_smem: u32 = if (self.capturing) self.slot_ctx * 4 else max_seq_len * 4;
-        cmd.dispatch(&self.pipes.naive_attention_batched_seq, .{ d.n_head, B, 1 }, .{ 256, 1, 1 }, &.{ &db.q, &self.kv_k_slots.?[L], &self.kv_v_slots.?[L], &self.sinks, &db.attn_out, pos_buf, slot_buf }, &attn, @sizeOf(AttnSlotPush), attn_smem);
+        if (max_seq_len > 8192) {
+            cmd.dispatch(&self.pipes.attention_batched_seq_tiled, .{ d.n_head, B, ceilDiv(d.head_dim, 256) }, .{ 256, 1, 1 }, &.{ &db.q, &self.kv_k_slots.?[L], &self.kv_v_slots.?[L], &self.sinks, &db.attn_out, pos_buf, slot_buf }, &attn, @sizeOf(AttnSlotPush), 0);
+        } else {
+            const attn_smem: u32 = (if (self.capturing) @min(self.slot_ctx, 8192) else max_seq_len) * 4;
+            cmd.dispatch(&self.pipes.naive_attention_batched_seq, .{ d.n_head, B, 1 }, .{ 256, 1, 1 }, &.{ &db.q, &self.kv_k_slots.?[L], &self.kv_v_slots.?[L], &self.sinks, &db.attn_out, pos_buf, slot_buf }, &attn, @sizeOf(AttnSlotPush), attn_smem);
+        }
 
         // 4. Per-seq sigmoid-z gate over all B rows (token-major [B,q_dim] contiguous).
         const sm = SigmoidMulPush{ .N = B * d.q_dim };
@@ -4533,8 +4618,11 @@ pub const ForwardCuda = struct {
         self.attentionFrontendDispatch(&cmd, &wqn.gpu_buffer, &wkn.gpu_buffer, &kk, &vv, pos);
         const seq_len = pos + 1;
         const attn = AttnPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .seq_len = seq_len, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
-        const attn_smem: u32 = seq_len * 4;
-        cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &kk, &vv, &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), attn_smem);
+        if (seq_len > 8192) {
+            cmd.dispatch(&self.pipes.attention_tiled, .{ d.n_head, 1, ceilDiv(d.head_dim, 256) }, .{ 256, 1, 1 }, &.{ &self.q_buf, &kk, &vv, &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), 0);
+        } else {
+            cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &kk, &vv, &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), seq_len * 4);
+        }
         const o_q8_ready = self.decodePreparedQ8Eligible(wo.info.type_, d.n_embd, d.q_dim);
         if (o_q8_ready) {
             const qp = QuantActPush{ .K = d.q_dim, .T = 1 };
@@ -4645,7 +4733,8 @@ pub const ForwardCuda = struct {
         const ctx = self.ctx;
 
         self.capturing = true;
-        _ = shim.cuda_graph_begin(ctx);
+        defer self.capturing = false;
+        if (shim.cuda_graph_begin(ctx) == 0) return error.GpuExecutionFailed;
         // EMBED as the graph's first node(s). GPU path: a 4-byte token-id H2D then
         // the embed_lookup dispatch dequants the row into `hidden` on-device (the
         // per-token CPU dequant is gone entirely). CPU fallback: H2D the pre-
@@ -4678,8 +4767,9 @@ pub const ForwardCuda = struct {
 
         // End capture, instantiate-or-update the cached exec, launch + ONE sync
         // (drains the embed H2D, layer chain, tail, and argmax D2H together).
-        _ = shim.cuda_graph_end_launch(ctx, self.graph.?);
+        if (shim.cuda_graph_end_launch(ctx, self.graph.?) == 0) return error.GpuExecutionFailed;
 
+        try self.checkExecution();
         return self.host_tok[0];
     }
 
@@ -4807,13 +4897,14 @@ pub const ForwardCuda = struct {
         // attention: out → attn_out_buf
         const seq_len = pos + 1;
         const attn = AttnPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .seq_len = seq_len, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
-        // naive_attention's dynamic shared mem holds `seq_len` f32 scores. Under
-        // graph capture, request the MAX (max_ctx) so the kernel node's shared-mem
-        // size is constant across steps — keeping the captured topology invariant
-        // (only push scalars change) so the exec updates in place instead of
-        // re-instantiating each token. The kernel still uses only seq_len entries.
-        const attn_smem: u32 = if (self.capturing) self.max_ctx * 4 else seq_len * 4;
-        cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.kv_k[L], &self.kv_v[L], &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), attn_smem);
+        // Full score arrays stay below 32 KiB, including during graph capture.
+        // Beyond that, online softmax keeps shared memory independent of ctx.
+        if (seq_len > 8192) {
+            cmd.dispatch(&self.pipes.attention_tiled, .{ d.n_head, 1, ceilDiv(d.head_dim, 256) }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.kv_k[L], &self.kv_v[L], &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), 0);
+        } else {
+            const attn_smem: u32 = (if (self.capturing) @min(self.max_ctx, 8192) else seq_len) * 4;
+            cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.kv_k[L], &self.kv_v[L], &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), attn_smem);
+        }
         // gate: attn_out *= sigmoid(gate)
         const o_q8_ready = self.decodePreparedQ8Eligible(wo.info.type_, d.n_embd, d.q_dim);
         if (o_q8_ready) {

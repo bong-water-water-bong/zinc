@@ -30,6 +30,7 @@ const host_io = @import("host_io");
 const scheduler = @import("../scheduler/scheduler.zig");
 const forwardgemma = @import("../compute/forward_cuda_gemma.zig");
 const forwardcuda = @import("../compute/forward_cuda.zig");
+const shim = @import("../cuda/c.zig").shim;
 
 const log = std.log.scoped(.cuda_serve);
 
@@ -59,6 +60,14 @@ pub const Forward = union(enum) {
     gemma: *forwardgemma.ForwardGemma,
     qwen: *forwardcuda.ForwardCuda,
 
+    fn checkExecution(self: Forward) !void {
+        const ctx = switch (self) {
+            .gemma => |g| g.ctx,
+            .qwen => |q| q.ctx,
+        };
+        if (shim.cuda_execution_failed(ctx) != 0) return error.GpuExecutionFailed;
+    }
+
     fn allocSlots(self: Forward, nslots: u32, slot_ctx: u32) !void {
         switch (self) {
             .gemma => |g| try g.allocSlotKv(nslots, slot_ctx),
@@ -72,27 +81,34 @@ pub const Forward = union(enum) {
         }
     }
     fn decodeBatch(self: Forward, tokens: []const u32, positions: []const u32, slots: []const u32, out: []u32) !void {
+        try self.checkExecution();
         switch (self) {
             .gemma => |g| try g.decodeBatch(tokens, positions, slots, out),
             .qwen => |q| try q.decodeBatch(tokens, positions, slots, out),
         }
+        try self.checkExecution();
     }
     /// Clear a reused slot's accumulated state before a new request prefills into
     /// it. No-op for gemma (attention-only, position-indexed KV overwritten on
     /// prefill); zeros the slot's SSM conv ring + recurrent state for qwen.
     fn resetSlot(self: Forward, slot: u32) !void {
+        try self.checkExecution();
         switch (self) {
             .gemma => {},
             .qwen => |q| try q.resetSlot(slot),
         }
+        try self.checkExecution();
     }
     /// Batched prefill that writes state into the slot's per-sequence region.
     /// Falls back to per-token decodeBatch when unavailable (gemma or old build).
     fn prefillSlot(self: Forward, tokens: []const u32, slot: u32) !u32 {
-        switch (self) {
-            .gemma => |g| return try g.prefillBatchedSlot(tokens, slot),
-            .qwen => |q| return try q.prefillBatchedSlot(tokens, slot),
-        }
+        try self.checkExecution();
+        const tok = switch (self) {
+            .gemma => |g| try g.prefillBatchedSlot(tokens, slot),
+            .qwen => |q| try q.prefillBatchedSlot(tokens, slot),
+        };
+        try self.checkExecution();
+        return tok;
     }
 };
 
@@ -264,6 +280,11 @@ pub const ServeEngine = struct {
         if (self.registry.get(id)) |chan| chan.cancelled = true;
     }
 
+    pub fn executionFailed(self: *const ServeEngine) bool {
+        self.fwd.checkExecution() catch return true;
+        return false;
+    }
+
     /// Write the cumulative throughput counters as JSON into `buf`. Lock-free
     /// (atomic loads) so `/stats` never contends the worker. The gate diffs two
     /// snapshots around each B-concurrent phase → pure decode tok/s + occupancy.
@@ -376,6 +397,10 @@ pub const ServeEngine = struct {
 
         const pf_t0 = if (timer_opt.*) |*tm| tm.read() else 0;
         var next_tok = q.prefillBatched(req.prompt_tokens) catch |err| {
+            self.fwd.checkExecution() catch {
+                self.failSlot(slot_id);
+                return true;
+            };
             log.warn("request {d} batched prefill failed ({s}); using the slot path", .{ req.id, @errorName(err) });
             return false;
         };
@@ -389,6 +414,10 @@ pub const ServeEngine = struct {
         // Priming reads the prompt rows the batched prefill just produced, so it
         // has to happen before any decode step overwrites them.
         const primed = q.mtpPrime(req.prompt_tokens) catch |err| blk: {
+            self.fwd.checkExecution() catch {
+                self.failSlot(slot_id);
+                return true;
+            };
             log.warn("request {d} NextN/MTP priming failed ({s}); ordinary decode", .{ req.id, @errorName(err) });
             break :blk false;
         };
