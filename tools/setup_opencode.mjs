@@ -1,0 +1,426 @@
+#!/usr/bin/env bun
+import { spawn } from 'node:child_process';
+import { constants } from 'node:fs';
+import { mkdir, open, readFile } from 'node:fs/promises';
+import path from 'node:path';
+
+export const DEFAULT_BASE_URL = 'http://127.0.0.1:9090/v1';
+export const CONFIG_NAME = 'opencode.zinc.json';
+
+export function parseArgs(argv = process.argv.slice(2)) {
+  const opts = {
+    command: 'setup',
+    project: '.',
+    model: 'qwen38-27b-q4k-m',
+    context: 16384,
+    output: undefined,
+    steps: 24,
+    force: false,
+    prompt: [],
+    auto: false,
+    timeoutMs: 900000,
+  };
+  const args = [...argv];
+  if (['setup', 'check', 'run'].includes(args[0])) opts.command = args.shift();
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--') {
+      opts.prompt = args.slice(i + 1);
+      break;
+    }
+    if (arg === '--help' || arg === '-h') {
+      opts.help = true;
+      continue;
+    }
+    if (arg === '--force') {
+      opts.force = true;
+      continue;
+    }
+    if (arg === '--auto') {
+      opts.auto = true;
+      continue;
+    }
+    const key = {
+      '--project': 'project',
+      '--model': 'model',
+      '--context': 'context',
+      '--output': 'output',
+      '--steps': 'steps',
+      '--timeout-ms': 'timeoutMs',
+      '--session': 'session',
+    }[arg];
+    if (!key) throw new Error(`Unknown option: ${arg}`);
+    const value = args[++i];
+    if (!value || value.startsWith('--')) throw new Error(`Missing value for ${arg}`);
+    opts[key] = ['context', 'output', 'steps', 'timeoutMs'].includes(key) ? Number(value) : value;
+  }
+  return opts;
+}
+
+export function buildConfig(opts = {}) {
+  const { model = 'qwen38-27b-q4k-m', context = 16384, steps = 24 } = opts;
+  const output = opts.output ?? Math.min(4096, Math.floor(context / 4));
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(model))
+    throw new Error('Use a model ID, not a file path or URL');
+  if (!Number.isSafeInteger(context) || context < 8192)
+    throw new Error('Context must be an integer of at least 8192 tokens');
+  if (!Number.isSafeInteger(output) || output < 1 || output >= context / 2)
+    throw new Error('Output must be positive and less than half the context');
+  if (!Number.isSafeInteger(steps) || steps < 1 || steps > 100)
+    throw new Error('Steps must be between 1 and 100');
+  return {
+    $schema: 'https://opencode.ai/config.json',
+    model: `zinc/${model}`,
+    small_model: `zinc/${model}`,
+    enabled_providers: ['zinc'],
+    default_agent: 'zinc',
+    autoupdate: false,
+    share: 'disabled',
+    formatter: false,
+    lsp: false,
+    compaction: { auto: true, prune: true, reserved: output },
+    provider: {
+      zinc: {
+        npm: '@ai-sdk/openai-compatible',
+        name: 'ZINC',
+        options: { baseURL: DEFAULT_BASE_URL, apiKey: '{env:ZINC_API_KEY}' },
+        models: { [model]: { name: model, tool_call: true, limit: { context, output } } },
+      },
+    },
+    agent: {
+      zinc: {
+        description: 'Local coding with ZINC',
+        mode: 'primary',
+        temperature: 0,
+        top_p: 1,
+        steps,
+        prompt:
+          'Complete the coding task using the available tools. Read relevant files before editing. Make focused source changes, run the requested tests, and use their output to correct failures. Never change tests just to make them pass. Finish with a short report of the changes and actual test results.',
+        permission: { task: 'deny', question: 'deny', webfetch: 'deny', websearch: 'deny' },
+      },
+    },
+  };
+}
+
+export async function writeConfig(project, config, { force = false } = {}) {
+  const dir = path.resolve(project);
+  await mkdir(dir, { recursive: true });
+  const file = path.join(dir, CONFIG_NAME);
+  // O_NOFOLLOW also protects an existing symlink when explicitly replacing a
+  // generated config. Other OpenCode config/auth files are never written.
+  const flags =
+    constants.O_WRONLY |
+    constants.O_CREAT |
+    constants.O_NOFOLLOW |
+    (force ? constants.O_TRUNC : constants.O_EXCL);
+  const handle = await open(file, flags, 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(config, null, 2)}\n`);
+  } finally {
+    await handle.close();
+  }
+  return file;
+}
+
+export function runtimeConfig(config, env = process.env) {
+  const copy = structuredClone(config);
+  const baseURL = env.ZINC_API_BASE_URL || DEFAULT_BASE_URL;
+  let url;
+  try {
+    url = new URL(baseURL);
+  } catch {
+    throw new Error('ZINC_API_BASE_URL must be an HTTP(S) URL ending in /v1');
+  }
+  if (
+    !['http:', 'https:'].includes(url.protocol) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !/\/v1\/?$/.test(url.pathname)
+  ) {
+    throw new Error(
+      'ZINC_API_BASE_URL must be an HTTP(S) URL ending in /v1 without credentials, query or fragment',
+    );
+  }
+  copy.provider.zinc.options.baseURL = baseURL.replace(/\/$/, '');
+  // Keep the actual key in the environment, including in inline config. No
+  // runtime URL or secret is written to the portable configuration on disk.
+  copy.provider.zinc.options.apiKey = '{env:ZINC_API_KEY}';
+  return copy;
+}
+
+export async function checkServer(config, { env = process.env, fetchImpl = fetch } = {}) {
+  const live = runtimeConfig(config, env);
+  const base = live.provider.zinc.options.baseURL;
+  const headers = { authorization: `Bearer ${env.ZINC_API_KEY || 'local'}` };
+  const health = await fetchImpl(`${base.slice(0, -3)}/health`, {
+    headers,
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!health.ok) throw new Error(`ZINC health check returned HTTP ${health.status}`);
+  const healthData = await health.json();
+  if (healthData.status !== 'ok') throw new Error('ZINC returned an unhealthy status');
+  const limit = Object.values(live.provider.zinc.models)[0].limit.context;
+  if (Number.isFinite(healthData.context_length) && limit > healthData.context_length) {
+    throw new Error(
+      'ZINC returned a smaller context than configured; rerun setup with the actual server context',
+    );
+  }
+  const request = {
+    model: live.model.slice('zinc/'.length),
+    messages: [{ role: 'user', content: 'Reply with OK.' }],
+    max_tokens: 8,
+    temperature: 0,
+    stream: false,
+    enable_thinking: false,
+  };
+  const response = await fetchImpl(`${base}/chat/completions`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!response.ok) throw new Error(`ZINC chat check returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (!result.choices?.[0]?.message || !result.choices?.[0]?.finish_reason)
+    throw new Error('ZINC returned an invalid chat completion');
+  if (!String(result.choices[0].message.content || '').includes('OK'))
+    throw new Error('ZINC returned an unexpected probe answer');
+  const toolRequest = {
+    ...request,
+    max_tokens: 64,
+    messages: [{ role: 'user', content: 'Call zinc_probe with message OK.' }],
+    tools: [
+      {
+        type: 'function',
+        function: {
+          name: 'zinc_probe',
+          description: 'Return a diagnostic message; this probe does not execute a tool.',
+          parameters: {
+            type: 'object',
+            properties: { message: { type: 'string' } },
+            required: ['message'],
+          },
+        },
+      },
+    ],
+    tool_choice: 'required',
+  };
+  const toolResponse = await fetchImpl(`${base}/chat/completions`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify(toolRequest),
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!toolResponse.ok) throw new Error(`ZINC tool check returned HTTP ${toolResponse.status}`);
+  const toolResult = await toolResponse.json();
+  const call = toolResult.choices?.[0]?.message?.tool_calls?.[0];
+  if (
+    toolResult.choices?.[0]?.finish_reason !== 'tool_calls' ||
+    call?.function?.name !== 'zinc_probe' ||
+    JSON.parse(call.function.arguments).message !== 'OK'
+  ) {
+    throw new Error(
+      'ZINC returned an invalid tool completion; use a Qwen model and a server with tool support',
+    );
+  }
+  const streamResponse = await fetchImpl(`${base}/chat/completions`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({ ...toolRequest, stream: true }),
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!streamResponse.ok)
+    throw new Error(`ZINC streaming check returned HTTP ${streamResponse.status}`);
+  const text = await streamResponse.text();
+  const events = text
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]')
+    .map((line) => JSON.parse(line.slice(6)));
+  const toolEvents = events.flatMap((event) => event.choices?.[0]?.delta?.tool_calls || []);
+  const args = toolEvents.map((event) => event.function?.arguments || '').join('');
+  if (
+    !text.includes('data: [DONE]') ||
+    !events.some((event) => event.choices?.[0]?.finish_reason === 'tool_calls') ||
+    !toolEvents.some((event) => event.function?.name === 'zinc_probe') ||
+    JSON.parse(args).message !== 'OK'
+  ) {
+    throw new Error('ZINC returned an invalid streaming tool completion');
+  }
+  return {
+    model: request.model,
+    health: 'pass',
+    chat: 'pass',
+    tools: 'pass',
+    streaming_tools: 'pass',
+  };
+}
+
+export async function runOpenCode(
+  config,
+  opts,
+  { env = process.env, spawnImpl = spawn, stdout = process.stdout } = {},
+) {
+  if (!opts.prompt.length) throw new Error('Pass a task after --');
+  const timeoutMs = opts.timeoutMs ?? 900000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)
+    throw new Error('Timeout must be a positive integer');
+  const live = runtimeConfig(config, env);
+  const args = [
+    'run',
+    '--pure',
+    '--format',
+    'json',
+    '--model',
+    live.model,
+    '--agent',
+    'zinc',
+    '--dir',
+    path.resolve(opts.project),
+  ];
+  if (opts.auto) args.push('--auto');
+  if (opts.session) args.push('--session', opts.session);
+  args.push('--', opts.prompt.join(' '));
+  const child = spawnImpl(env.OPENCODE_BIN || 'opencode', args, {
+    cwd: path.resolve(opts.project),
+    env: {
+      ...env,
+      ZINC_API_KEY: env.ZINC_API_KEY || 'local',
+      OPENCODE_CONFIG_CONTENT: JSON.stringify(live),
+      OPENCODE_DISABLE_AUTOUPDATE: 'true',
+    },
+    stdio: ['inherit', 'pipe', 'inherit'],
+    detached: process.platform !== 'win32',
+  });
+  let agentError = false;
+  let pending = '';
+  const decoder = new TextDecoder();
+  const inspectLine = (line) => {
+    try {
+      if (JSON.parse(line).type === 'error') agentError = true;
+    } catch {
+      /* Other CLI output is forwarded verbatim. */
+    }
+  };
+  child.stdout?.on('data', (chunk) => {
+    stdout.write(chunk);
+    pending += decoder.decode(chunk, { stream: true });
+    let newline;
+    while ((newline = pending.indexOf('\n')) !== -1) {
+      inspectLine(pending.slice(0, newline));
+      pending = pending.slice(newline + 1);
+    }
+  });
+  const stop = (signal) => {
+    if (child.pid && process.platform !== 'win32') {
+      try {
+        process.kill(-child.pid, signal);
+      } catch (error) {
+        if (error.code !== 'ESRCH') throw error;
+      }
+    } else child.kill(signal);
+  };
+  let timedOut = false;
+  let killTimer;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    stop('SIGTERM');
+    killTimer = setTimeout(() => stop('SIGKILL'), 5000);
+  }, timeoutMs);
+  const onInt = () => stop('SIGINT');
+  const onTerm = () => stop('SIGTERM');
+  process.on('SIGINT', onInt);
+  process.on('SIGTERM', onTerm);
+  try {
+    return await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => {
+        inspectLine(pending + decoder.decode());
+        resolve(
+          timedOut
+            ? 124
+            : code === 0 && agentError
+              ? 1
+              : (code ?? (signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1)),
+        );
+      });
+    });
+  } finally {
+    process.off('SIGINT', onInt);
+    process.off('SIGTERM', onTerm);
+    clearTimeout(timer);
+    clearTimeout(killTimer);
+  }
+}
+
+async function main() {
+  const version = globalThis.Bun?.version || '0.0.0';
+  const [major, minor, patch] = version.split('.').map(Number.parseFloat);
+  if (
+    major < 1 ||
+    (major === 1 &&
+      (minor < 4 || (minor === 4 && (patch < 4 || (patch === 4 && version.includes('-'))))))
+  ) {
+    throw new Error('Bun 1.4.4 or newer is required');
+  }
+  const opts = parseArgs();
+  if (opts.help) {
+    console.log(`Usage: bun tools/setup_opencode.mjs [setup|check|run] [options] [-- task]
+
+  --project DIR     Project directory (default: current directory)
+  --model ID        Loaded model ID (default: qwen38-27b-q4k-m)
+  --context N       Actual server context (default: 16384; minimum: 8192)
+  --output N        Output budget per turn (default: min(4096, context / 4))
+  --steps N         Maximum agent steps (default: 24)
+  --timeout-ms N    Task timeout (default: 900000; timeout exits 124)
+  --session ID      Continue the session ID from a previous JSON event
+  --force           Replace only opencode.zinc.json
+  --auto            Approve headless tool requests; explicit denies still apply
+
+Setup writes a portable opencode.zinc.json and leaves existing configs alone.
+Run/check read it. Override the endpoint with ZINC_API_BASE_URL and the key
+with ZINC_API_KEY; their values are never saved by this script.
+Install OpenCode first: bun install --global opencode-ai@1.19.4
+
+  bun tools/setup_opencode.mjs --project ./my-project
+  bun tools/setup_opencode.mjs check --project ./my-project
+  bun tools/setup_opencode.mjs run --project ./my-project --auto -- "Fix the failing tests"
+
+Interactive: OPENCODE_CONFIG=./opencode.zinc.json opencode
+`);
+    return;
+  }
+  if (opts.command === 'setup') {
+    await writeConfig(opts.project, buildConfig(opts), opts);
+    console.log(
+      `Created ${CONFIG_NAME}. Start ZINC with the same context limit, then use check or run.`,
+    );
+    return;
+  }
+  const config = JSON.parse(
+    await readFile(path.join(path.resolve(opts.project), CONFIG_NAME), 'utf8'),
+  );
+  if (opts.command === 'check') {
+    console.log(JSON.stringify(await checkServer(config)));
+  } else {
+    process.exitCode = await runOpenCode(config, opts);
+  }
+}
+
+if (import.meta.main)
+  main().catch((error) => {
+    // Do not print fetch/child errors that could include a private URL or token.
+    const known =
+      /^(Bun 1\.4\.4|Unknown option:|Missing value for|Use a model ID|Context must|Output must|Steps must|Timeout must|ZINC_API_BASE_URL|ZINC .*check|ZINC returned|Pass a task)/.test(
+        error.message,
+      );
+    console.error(
+      known
+        ? error.message
+        : error.code === 'EEXIST'
+          ? `${CONFIG_NAME} already exists; use --force to replace it.`
+          : 'OpenCode setup/run failed. Check the project, runtime, and ZINC connection.',
+    );
+    process.exitCode = 1;
+  });

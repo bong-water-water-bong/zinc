@@ -111,6 +111,9 @@ pub const ReqChannel = struct {
     done: bool = false,
     /// True if generation errored on the worker (GPU/alloc failure).
     failed: bool = false,
+    /// Transport disconnected or reached a stop sequence. The worker observes
+    /// this under the mutex and releases the slot at the next token boundary.
+    cancelled: bool = false,
     /// Per-request device timings. The worker records these before publishing
     /// completion; the HTTP handler reads them after `finished` is observed.
     prefill_tokens: u64 = 0,
@@ -255,6 +258,12 @@ pub const ServeEngine = struct {
         chan.tokens.deinit(self.allocator);
     }
 
+    pub fn cancel(self: *ServeEngine, id: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.registry.get(id)) |chan| chan.cancelled = true;
+    }
+
     /// Write the cumulative throughput counters as JSON into `buf`. Lock-free
     /// (atomic loads) so `/stats` never contends the worker. The gate diffs two
     /// snapshots around each B-concurrent phase → pure decode tok/s + occupancy.
@@ -326,7 +335,11 @@ pub const ServeEngine = struct {
         self.sched.release(slot_id);
     }
 
-    fn requestShouldStop(self: *const ServeEngine, req: anytype) bool {
+    fn requestShouldStop(self: *ServeEngine, req: anytype) bool {
+        self.mutex.lock();
+        const cancelled = if (self.registry.get(req.id)) |chan| chan.cancelled else false;
+        self.mutex.unlock();
+        if (cancelled) return true;
         if (req.shouldStop(self.eos)) return true;
         const eot = self.eot orelse return false;
         if (req.generated_tokens.items.len == 0) return false;

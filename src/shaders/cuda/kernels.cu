@@ -2225,95 +2225,102 @@ __device__ __forceinline__ void ssm_delta_net_warp_impl(
 
     const float inv_sqrt_d_state = rsqrtf((float)pc.d_state);
 
-    // Precompute gate[t] and beta[t] for ALL tokens (parallelizable, no state dep).
-    // This removes expf/logf from the sequential scan loop, letting the warp
-    // scheduler overlap them with the state-dependent compute.
-    // Each thread precomputes T/n_threads values, stored in shared memory.
-    extern __shared__ float smem_gate_beta[];  // [2 * n_tok]
+    // Stage gate/beta in bounded tiles. The old 2*n_tok allocation exceeded
+    // RDNA's 64 KiB LDS above 8192 tokens and silently skipped the scan.
+    // Keep the same per-token math and recurrent order across tile boundaries.
+    const unsigned gate_tile = pc.n_tok < 4096u ? pc.n_tok : 4096u;
+    extern __shared__ float smem_gate_beta[];  // [2 * min(n_tok, 4096)]
     float* sh_gate = smem_gate_beta;
-    float* sh_beta = smem_gate_beta + pc.n_tok;
+    float* sh_beta = smem_gate_beta + gate_tile;
     // Use FULL thread index (threadIdx.y * 32 + threadIdx.x = 0..127), not just
     // lane (threadIdx.x = 0..31). Otherwise warps 1-3 duplicate warp 0's work
     // and tokens 32+ are never initialized → garbage gate/beta.
     const unsigned full_tid = threadIdx.y * DN_WARP_SIZE + threadIdx.x;
-    for (unsigned t = full_tid; t < pc.n_tok; t += DN_WARP_SIZE * DN_N_WARPS) {
-        float a = alpha[t * pc.ab_stride_tok + h] + dt_bias_val;
-        float sp = logf(1.0f + expf(a));
-        sh_gate[t] = (pc.has_ssm_a != 0u) ? expf(sp * ssm_a_val) : expf(-sp);
-        sh_beta[t] = 1.0f / (1.0f + expf(-beta[t * pc.ab_stride_tok + h]));
-    }
-    __syncthreads();  // one-time sync before the scan loop starts
-
-    for (unsigned t = 0; t < pc.n_tok; t++) {
-        const unsigned conv_base = t * pc.conv_stride_tok;
-        const unsigned q_off = conv_base + k_hi * pc.d_state;
-        const unsigned k_off = conv_base + qk_dim + k_hi * pc.d_state;
-        const unsigned v_off = conv_base + 2u * qk_dim + h * hv;
-
-        // Load Q, K for this token — indexed by COLUMN (lane's cols)
-        float q_reg[DN_MAX_ROWS_PER_LANE], k_reg[DN_MAX_ROWS_PER_LANE];
-        float sumq = 0.0f, sumk = 0.0f;
-        #pragma unroll
-        for (int r = 0; r < cols_per_lane; r++) {
-            unsigned col_idx = r * DN_WARP_SIZE + lane;
-            if (col_idx < k_len) {
-                q_reg[r] = conv_out[q_off + col_idx];
-                k_reg[r] = conv_out[k_off + col_idx];
-                sumq += q_reg[r] * q_reg[r];
-                sumk += k_reg[r] * k_reg[r];
-            } else {
-                q_reg[r] = 0.0f;
-                k_reg[r] = 0.0f;
-            }
+    for (unsigned tile_start = 0; tile_start < pc.n_tok; tile_start += gate_tile) {
+        const unsigned tile_size = (pc.n_tok - tile_start < gate_tile) ? pc.n_tok - tile_start : gate_tile;
+        for (unsigned local_t = full_tid; local_t < tile_size; local_t += DN_WARP_SIZE * DN_N_WARPS) {
+            const unsigned t = tile_start + local_t;
+            float a = alpha[t * pc.ab_stride_tok + h] + dt_bias_val;
+            float sp = logf(1.0f + expf(a));
+            sh_gate[local_t] = (pc.has_ssm_a != 0u) ? expf(sp * ssm_a_val) : expf(-sp);
+            sh_beta[local_t] = 1.0f / (1.0f + expf(-beta[t * pc.ab_stride_tok + h]));
         }
+        __syncthreads();  // stage this tile before scanning it
 
-        sumq = zinc_warp_reduce_sum_all(sumq);
-        sumk = zinc_warp_reduce_sum_all(sumk);
-        float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) * inv_sqrt_d_state;
-        float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
-        #pragma unroll
-        for (int r = 0; r < cols_per_lane; r++) {
-            q_reg[r] *= q_rinv;
-            k_reg[r] *= k_rinv;
-        }
+        for (unsigned local_t = 0; local_t < tile_size; local_t++) {
+            const unsigned t = tile_start + local_t;
+            const unsigned conv_base = t * pc.conv_stride_tok;
+            const unsigned q_off = conv_base + k_hi * pc.d_state;
+            const unsigned k_off = conv_base + qk_dim + k_hi * pc.d_state;
+            const unsigned v_off = conv_base + 2u * qk_dim + h * hv;
 
-        // Gate and beta: read from shared memory (precomputed above)
-        float gate = sh_gate[t];
-        float b = sh_beta[t];
-
-        // Load V for this row (indexed by ROW, not column)
-        float v_val = conv_out[v_off + row];
-
-        // State update: sk = (S @ k_norm)[row] — warp reduce across COLUMNS
-        float sk_partial = 0.0f;
-        #pragma unroll
-        for (int r = 0; r < cols_per_lane; r++) {
-            s_shard[r] *= gate;
-            sk_partial += s_shard[r] * k_reg[r];
-        }
-        float sk = zinc_warp_reduce_sum_all(sk_partial);
-        float d = b * (v_val - sk);
-
-        // Readout: o = (S @ q_norm)[row] — warp reduce across COLUMNS
-        float o_partial = 0.0f;
-        #pragma unroll
-        for (int r = 0; r < cols_per_lane; r++) {
-            s_shard[r] += k_reg[r] * d;  // rank-1 update
-            o_partial += s_shard[r] * q_reg[r];
-        }
-        float o = zinc_warp_reduce_sum_all(o_partial);
-
-        // Write output (one value per warp — lane 0 writes)
-        if (lane == 0)
-            out_data[t * pc.y_stride_tok + h * hv + row] = o;
-        float* history = SAVE_HISTORY ? zinc_spec_history_row(hist0, hist1, hist2, t, pc.n_tok) : nullptr;
-        if (history != nullptr) {
+            // Load Q, K for this token — indexed by COLUMN (lane's cols)
+            float q_reg[DN_MAX_ROWS_PER_LANE], k_reg[DN_MAX_ROWS_PER_LANE];
+            float sumq = 0.0f, sumk = 0.0f;
             #pragma unroll
             for (int r = 0; r < cols_per_lane; r++) {
-                const unsigned col_idx = r * DN_WARP_SIZE + lane;
-                history[((size_t)h * hv + row) * hv + col_idx] = s_shard[r];
+                unsigned col_idx = r * DN_WARP_SIZE + lane;
+                if (col_idx < k_len) {
+                    q_reg[r] = conv_out[q_off + col_idx];
+                    k_reg[r] = conv_out[k_off + col_idx];
+                    sumq += q_reg[r] * q_reg[r];
+                    sumk += k_reg[r] * k_reg[r];
+                } else {
+                    q_reg[r] = 0.0f;
+                    k_reg[r] = 0.0f;
+                }
+            }
+
+            sumq = zinc_warp_reduce_sum_all(sumq);
+            sumk = zinc_warp_reduce_sum_all(sumk);
+            float q_rinv = rsqrtf(fmaxf(sumq, 1e-12f)) * inv_sqrt_d_state;
+            float k_rinv = rsqrtf(fmaxf(sumk, 1e-12f));
+            #pragma unroll
+            for (int r = 0; r < cols_per_lane; r++) {
+                q_reg[r] *= q_rinv;
+                k_reg[r] *= k_rinv;
+            }
+
+            // Gate and beta: read from shared memory (precomputed above)
+            float gate = sh_gate[local_t];
+            float b = sh_beta[local_t];
+
+            // Load V for this row (indexed by ROW, not column)
+            float v_val = conv_out[v_off + row];
+
+            // State update: sk = (S @ k_norm)[row] — warp reduce across COLUMNS
+            float sk_partial = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < cols_per_lane; r++) {
+                s_shard[r] *= gate;
+                sk_partial += s_shard[r] * k_reg[r];
+            }
+            float sk = zinc_warp_reduce_sum_all(sk_partial);
+            float d = b * (v_val - sk);
+
+            // Readout: o = (S @ q_norm)[row] — warp reduce across COLUMNS
+            float o_partial = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < cols_per_lane; r++) {
+                s_shard[r] += k_reg[r] * d;  // rank-1 update
+                o_partial += s_shard[r] * q_reg[r];
+            }
+            float o = zinc_warp_reduce_sum_all(o_partial);
+
+            // Write output (one value per warp — lane 0 writes)
+            if (lane == 0)
+                out_data[t * pc.y_stride_tok + h * hv + row] = o;
+            float* history = SAVE_HISTORY ? zinc_spec_history_row(hist0, hist1, hist2, t, pc.n_tok) : nullptr;
+            if (history != nullptr) {
+                #pragma unroll
+                for (int r = 0; r < cols_per_lane; r++) {
+                    const unsigned col_idx = r * DN_WARP_SIZE + lane;
+                    history[((size_t)h * hv + row) * hv + col_idx] = s_shard[r];
+                }
             }
         }
+
+        __syncthreads(); // finish every warp's reads before replacing the tile
     }
 
     // Write final state

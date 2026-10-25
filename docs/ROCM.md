@@ -142,11 +142,19 @@ chat interface, `/v1/models`, or scheduler metadata. Use the default Vulkan or
 Metal build for the browser-chat walkthrough.
 
 Send `stream: false` explicitly for a JSON response; this handler defaults to
-streaming. Streaming text is supported, but SSE finish metadata and the `stop`
-parameter are not implemented. The OpenAI JavaScript SDK 7.43.0 passes matched
+streaming. SSE replies now include finish reasons and usage. Qwen chat supports
+tool schemas, streamed tool calls, and assistant/tool-result history, including
+null assistant content. The `stop` parameter remains unimplemented. The OpenAI JavaScript SDK 7.43.0 passes matched
 JSON and streaming generation checks with the explicit stream setting. See the
 [MTP validation report](https://github.com/zolotukhin/zinc/blob/main/docs/ROCM_MTP_0_17.md)
-for the broader parity tests and existing generic SDK-suite limitation.
+for the earlier parity tests and generic SDK-suite limitation.
+
+The [OpenCode harness guide](OPENCODE.md) provides a portable setup script and
+headless task/API checks. Start the server with `--context 16384 --parallel 1`
+to match its default configuration. The recurrent prefill scan stages its
+gate/beta values in bounded tiles, allowing agent prompts above the previous
+8K shared-memory limit. Streaming clients can cancel a request without keeping
+its slot occupied for the rest of the output budget.
 
 ## Fair llama.cpp comparison
 

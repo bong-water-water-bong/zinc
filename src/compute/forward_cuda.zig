@@ -32,6 +32,7 @@ const dmmv_fast_block: u32 = 64;
 
 /// The CUDA kernel library, bundled into the binary and NVRTC-compiled on load.
 const KERNELS_CU = @embedFile("../shaders/cuda/kernels.cu");
+const launch_sizes = @import("launch_sizes.zig");
 
 // ---- kernel push-constant structs (must byte-match kernels.cu) --------------
 const RmsPush = extern struct { N: u32, eps: f32 };
@@ -2854,9 +2855,9 @@ pub const ForwardCuda = struct {
                 .y_stride_tok = d.d_inner,
             };
             if (self.capture_spec_state) {
-                cmd.dispatch(&self.pipes.ssm_delta_net_warp_history, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out, &self.mtp.?.recurrent_rows[0][L], &self.mtp.?.recurrent_rows[1][L], &self.mtp.?.recurrent_rows[2][L] }, &dn_warp, @sizeOf(DeltaNetWarpPush), 2 * T * @sizeOf(f32));
+                cmd.dispatch(&self.pipes.ssm_delta_net_warp_history, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out, &self.mtp.?.recurrent_rows[0][L], &self.mtp.?.recurrent_rows[1][L], &self.mtp.?.recurrent_rows[2][L] }, &dn_warp, @sizeOf(DeltaNetWarpPush), launch_sizes.ssmWarpSharedBytes(T));
             } else {
-                cmd.dispatch(&self.pipes.ssm_delta_net_warp, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_warp, @sizeOf(DeltaNetWarpPush), 2 * T * @sizeOf(f32));
+                cmd.dispatch(&self.pipes.ssm_delta_net_warp, .{ d.dt_rank, ceilDiv(d.head_v_dim, 4), 1 }, .{ 32, 4, 1 }, &.{ &b.conv_out, &wdt.gpu_buffer, &b.alpha, &b.beta, &wa.gpu_buffer, &self.ssm_state[L], &b.delta_out }, &dn_warp, @sizeOf(DeltaNetWarpPush), launch_sizes.ssmWarpSharedBytes(T));
             }
         } else if (use_col_warp) {
             const dn_col = DeltaNetColWarpPush{

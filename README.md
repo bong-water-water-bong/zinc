@@ -87,6 +87,25 @@ The managed catalog includes Qwen, Gemma, and other tested model families.
 See [model selection](https://zolotukhin.ai/zinc/docs/getting-started/#models-in-current-work)
 for checkpoints, memory needs, and the exact Muse Glimmer GGUF used in testing.
 
+## Coding harnesses
+
+Connect **OpenCode** to a running ZINC server with the
+[setup script](tools/setup_opencode.mjs). It creates a portable config, checks
+chat and streaming tool calls, and runs headless tasks:
+
+```bash
+bun install --global opencode-ai@1.19.4
+bun tools/setup_opencode.mjs --project ../my-project --model qwen38-27b-q4k-m
+bun tools/setup_opencode.mjs check --project ../my-project
+bun tools/setup_opencode.mjs run --project ../my-project --auto -- "Fix the failing tests and run them."
+```
+
+Start ZINC with `-c 16384` to match the default context, or pass the actual
+context to setup with `--context`. The config uses localhost; custom endpoints
+and API keys come from environment variables at runtime.
+[Setup and task evaluation guide](https://zolotukhin.ai/zinc/docs/opencode/) ·
+[Download the standalone script](https://zolotukhin.ai/zinc/harnesses/setup-opencode.mjs)
+
 ## Inspect the performance
 
 The chart compares six models on the same Radeon AI PRO R9700, with **ROCm on

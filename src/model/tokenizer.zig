@@ -1566,7 +1566,9 @@ pub const Tokenizer = struct {
                         continue;
                     }
 
-                    const header = std.fmt.bufPrint(buf[pos..], "<|im_start|>{s}\n{s}", .{ roles[i], contents[i] }) catch return error.BufferTooSmall;
+                    const prepend_tools = !tools_rendered and options.tools.len > 0 and options.tool_format != null and
+                        options.tool_format.?.native_xml and (std.mem.eql(u8, roles[i], "system") or std.mem.eql(u8, roles[i], "developer"));
+                    const header = std.fmt.bufPrint(buf[pos..], "<|im_start|>{s}\n{s}", .{ roles[i], if (prepend_tools) @as([]const u8, "") else contents[i] }) catch return error.BufferTooSmall;
                     pos += header.len;
 
                     // Inject tool definitions into the first system/developer message.
@@ -1584,6 +1586,10 @@ pub const Tokenizer = struct {
                             if (pos + required.len > buf.len) return error.BufferTooSmall;
                             @memcpy(buf[pos .. pos + required.len], required);
                             pos += required.len;
+                        }
+                        if (prepend_tools) {
+                            const tail = std.fmt.bufPrint(buf[pos..], "\n\n{s}", .{contents[i]}) catch return error.BufferTooSmall;
+                            pos += tail.len;
                         }
                         tools_rendered = true;
                     }

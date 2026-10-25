@@ -12,6 +12,7 @@ on:
       - '.bun-version'
       - 'bunfig.toml'
       - 'scripts/zig.sh'
+      - 'tools/setup_opencode.mjs'
       - '.github/workflows/site-check.yml'
   pull_request:
     paths:
@@ -23,6 +24,7 @@ on:
       - '.bun-version'
       - 'bunfig.toml'
       - 'scripts/zig.sh'
+      - 'tools/setup_opencode.mjs'
       - '.github/workflows/site-check.yml'
 
 jobs:
@@ -69,4 +71,6 @@ jobs:
           test -f dist/feed.xml
           test -f dist/sitemap-index.xml
           test -f dist/robots.txt
+          test -f dist/zinc/harnesses/setup-opencode.mjs
+          cmp ../tools/setup_opencode.mjs dist/zinc/harnesses/setup-opencode.mjs
           echo "All checks passed."

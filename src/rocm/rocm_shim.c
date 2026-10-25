@@ -470,11 +470,15 @@ void cuda_dispatch(CudaCmd* cmd, CudaPipe* pipe,
     if (time_kernel && hipEventCreate(&start) == hipSuccess && hipEventCreate(&stop) == hipSuccess)
         hipEventRecord(start, cmd->stream);
 
-    hip_ok(hipModuleLaunchKernel(pipe->fn,
+    const hipError_t launch_result = hipModuleLaunchKernel(pipe->fn,
                                 grid[0], grid[1], grid[2],
                                 block[0], block[1], block[2],
-                                shared_bytes, cmd->stream, args, NULL),
-           "hipModuleLaunchKernel");
+                                shared_bytes, cmd->stream, args, NULL);
+    if (!hip_ok(launch_result, "hipModuleLaunchKernel")) {
+        fprintf(stderr, "[rocm_shim] kernel=%s grid=%u,%u,%u block=%u,%u,%u shared=%u\n",
+                pipe->name ? pipe->name : "unknown", grid[0], grid[1], grid[2],
+                block[0], block[1], block[2], shared_bytes);
+    }
 
     if (start && stop) {
         hipEventRecord(stop, cmd->stream);

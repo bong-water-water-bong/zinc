@@ -4,6 +4,7 @@
 //! silent fallback for any other template kind.
 const std = @import("std");
 const TemplateKind = @import("../model/tokenizer.zig").Tokenizer.TemplateKind;
+const Tokenizer = @import("../model/tokenizer.zig").Tokenizer;
 
 const log = std.log.scoped(.tool_format);
 
@@ -69,6 +70,8 @@ pub const FeedResult = enum {
 /// might be the start of a `<tool_call>` tag and flushes them either as
 /// content deltas or as parsed tool calls. One detector per streaming request.
 pub const StreamingDetector = struct {
+    /// Request schemas distinguish XML string values from numbers/objects.
+    tools: []const ToolDefinition = &.{},
     /// Bytes pending emission as content delta.
     content_pending: std.ArrayList(u8) = .empty,
     /// Bytes being inspected for an incomplete <tool_call> open tag.
@@ -102,113 +105,41 @@ pub const StreamingDetector = struct {
     /// @returns A `FeedResult` indicating whether content is ready to emit, a
     ///     tool call is ready to consume, or the bytes are still being held.
     pub fn feed(self: *StreamingDetector, chunk: []const u8) !FeedResult {
-        // If a previously-parsed call is waiting, announce it before processing new bytes.
-        if (self.pending_calls.items.len > 0) return .tool_call_complete;
-
         try self.hold_buf.appendSlice(self.allocator, chunk);
-
-        // 1. Look for a complete <tool_call>...</tool_call> in the buffer.
-        if (std.mem.indexOf(u8, self.hold_buf.items, tool_call_open)) |open_at| {
-            // Anything before the open tag is content. Move it to content_pending.
-            if (open_at > 0) {
-                try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..open_at]);
-                std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[open_at..]);
-                self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - open_at);
-            }
-
-            // Try to find the close tag.
-            const close_idx = std.mem.indexOfPos(u8, self.hold_buf.items, tool_call_open.len, tool_call_close);
-            if (close_idx) |close_at| {
-                // Parse the inner JSON.
+        while (true) {
+            if (std.mem.indexOf(u8, self.hold_buf.items, tool_call_open)) |open_at| {
+                if (open_at > 0) {
+                    try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..open_at]);
+                    std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[open_at..]);
+                    self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - open_at);
+                }
+                const close_at = findCallClose(self.hold_buf.items, tool_call_open.len) orelse break;
                 const inner = std.mem.trim(u8, self.hold_buf.items[tool_call_open.len..close_at], " \t\r\n");
-                const parsed_json = std.json.parseFromSlice(std.json.Value, self.allocator, inner, .{}) catch {
-                    // Malformed: emit the entire block as content.
-                    log.warn("malformed JSON inside <tool_call>; emitting as content", .{});
-                    const after_close = close_at + tool_call_close.len;
-                    try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..after_close]);
-                    std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[after_close..]);
-                    self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - after_close);
-                    if (self.content_pending.items.len > 0) return .emit_as_content;
-                    return .hold;
-                };
-                defer parsed_json.deinit();
-
-                const obj = switch (parsed_json.value) {
-                    .object => |o| o,
-                    else => {
-                        log.warn("tool_call JSON is not an object; emitting as content", .{});
-                        const after_close = close_at + tool_call_close.len;
-                        try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..after_close]);
-                        std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[after_close..]);
-                        self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - after_close);
-                        if (self.content_pending.items.len > 0) return .emit_as_content;
-                        return .hold;
-                    },
-                };
-
-                const name = blk: {
-                    if (obj.get("name")) |v| {
-                        if (v == .string) break :blk v.string;
-                    }
-                    break :blk "";
-                };
-
-                const empty_obj = std.json.Value{ .object = .empty };
-                const args_val = obj.get("arguments") orelse empty_obj;
-                const args_str = try std.json.Stringify.valueAlloc(self.allocator, args_val, .{});
-                errdefer self.allocator.free(args_str);
-
-                const id = try allocToolCallId(self.allocator);
-                errdefer self.allocator.free(id);
-
-                const name_owned = try self.allocator.dupe(u8, name);
-                errdefer self.allocator.free(name_owned);
-
-                try self.pending_calls.append(self.allocator, .{
-                    .id = id,
-                    .name = name_owned,
-                    .arguments_json = args_str,
-                });
-
-                // Strip the consumed block from hold_buf.
                 const after_close = close_at + tool_call_close.len;
+                if (try parseCallInner(inner, self.tools, self.allocator)) |call| {
+                    errdefer {
+                        self.allocator.free(call.id);
+                        self.allocator.free(call.name);
+                        self.allocator.free(call.arguments_json);
+                    }
+                    try self.pending_calls.append(self.allocator, call);
+                } else {
+                    try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..after_close]);
+                }
                 std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[after_close..]);
                 self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - after_close);
-
-                // If there is pending content from before the tag, emit it first.
-                if (self.content_pending.items.len > 0) return .emit_as_content;
-                return .tool_call_complete;
+                continue;
             }
-            // Open tag found but no close yet — wait for more chunks.
-            if (self.content_pending.items.len > 0) return .emit_as_content;
-            return .hold;
+            // Retain only a suffix that can grow into the opening delimiter.
+            var held = @min(self.hold_buf.items.len, tool_call_open.len - 1);
+            while (held > 0 and !std.mem.endsWith(u8, self.hold_buf.items, tool_call_open[0..held])) : (held -= 1) {}
+            const emit = self.hold_buf.items.len - held;
+            try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..emit]);
+            std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[emit..]);
+            self.hold_buf.shrinkRetainingCapacity(held);
+            break;
         }
-
-        // 2. No open tag in buffer. Check whether the tail could be the start of one.
-        const tail_start = if (self.hold_buf.items.len > max_hold) self.hold_buf.items.len - max_hold else 0;
-        if (std.mem.indexOfScalarPos(u8, self.hold_buf.items, tail_start, '<')) |lt_at| {
-            // The tail starting at lt_at *might* be a partial open tag. Hold it.
-            // Bytes before lt_at are safe to emit.
-            if (lt_at > 0) {
-                try self.content_pending.appendSlice(self.allocator, self.hold_buf.items[0..lt_at]);
-                std.mem.copyForwards(u8, self.hold_buf.items, self.hold_buf.items[lt_at..]);
-                self.hold_buf.shrinkRetainingCapacity(self.hold_buf.items.len - lt_at);
-            }
-            // Check if the tail can no longer match (mismatched bytes).
-            const tail = self.hold_buf.items;
-            const ok_so_far = std.mem.startsWith(u8, tool_call_open, tail) or std.mem.startsWith(u8, tail, tool_call_open);
-            if (!ok_so_far or tail.len > tool_call_open.len) {
-                // Tail can't be the start of <tool_call>; flush it as content.
-                try self.content_pending.appendSlice(self.allocator, tail);
-                self.hold_buf.clearRetainingCapacity();
-            }
-            if (self.content_pending.items.len > 0) return .emit_as_content;
-            return .hold;
-        }
-
-        // 3. No '<' anywhere — it's all content.
-        try self.content_pending.appendSlice(self.allocator, self.hold_buf.items);
-        self.hold_buf.clearRetainingCapacity();
+        if (self.pending_calls.items.len > 0) return .tool_call_complete;
         if (self.content_pending.items.len > 0) return .emit_as_content;
         return .hold;
     }
@@ -256,6 +187,7 @@ pub const StreamingDetector = struct {
 pub const ToolFormat = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    native_xml: bool = false,
 
     /// Function-pointer table that concrete format implementations fill in.
     pub const VTable = struct {
@@ -277,6 +209,7 @@ pub const ToolFormat = struct {
         parseAssistantToolCalls: *const fn (
             ctx: *anyopaque,
             model_output: []const u8,
+            tools: []const ToolDefinition,
             allocator: std.mem.Allocator,
         ) anyerror!ParsedAssistantOutput,
 
@@ -319,7 +252,11 @@ pub const ToolFormat = struct {
         model_output: []const u8,
         allocator: std.mem.Allocator,
     ) anyerror!ParsedAssistantOutput {
-        return self.vtable.parseAssistantToolCalls(self.ptr, model_output, allocator);
+        return self.vtable.parseAssistantToolCalls(self.ptr, model_output, &.{}, allocator);
+    }
+
+    pub fn parseAssistantToolCallsWithTools(self: ToolFormat, model_output: []const u8, tools: []const ToolDefinition, allocator: std.mem.Allocator) !ParsedAssistantOutput {
+        return self.vtable.parseAssistantToolCalls(self.ptr, model_output, tools, allocator);
     }
 
     /// Create a fresh streaming-mode detector for one chat completion stream.
@@ -347,7 +284,7 @@ pub const NoopToolFormat = struct {
         try buf.appendSlice(allocator, content);
     }
 
-    fn parse_calls(_: *anyopaque, model_output: []const u8, allocator: std.mem.Allocator) !ParsedAssistantOutput {
+    fn parse_calls(_: *anyopaque, model_output: []const u8, _: []const ToolDefinition, allocator: std.mem.Allocator) !ParsedAssistantOutput {
         _ = allocator;
         return .{ .text_content = model_output, .tool_calls = &.{} };
     }
@@ -391,6 +328,18 @@ pub fn forTemplate(template_kind: TemplateKind) ToolFormat {
     };
 }
 
+/// Newer Qwen checkpoints publish XML function/parameter tags in their own
+/// GGUF template. Keep the original JSON dialect for other ChatML checkpoints.
+pub fn forTokenizer(tokenizer: *const Tokenizer) ToolFormat {
+    if (tokenizer.detectTemplateKind() == .chatml and std.mem.indexOf(u8, tokenizer.chat_template orelse "", "<function=") != null) {
+        var format = chatmlToolFormat();
+        format.vtable = &vtable_chatml_xml;
+        format.native_xml = true;
+        return format;
+    }
+    return forTemplate(tokenizer.detectTemplateKind());
+}
+
 // ============================================================
 // ChatMLToolFormat — Qwen3-family tool calling.
 // ============================================================
@@ -398,15 +347,203 @@ pub fn forTemplate(template_kind: TemplateKind) ToolFormat {
 const tool_call_open = "<tool_call>";
 const tool_call_close = "</tool_call>";
 
+fn findCallClose(text: []const u8, start: usize) ?usize {
+    var first = start;
+    while (first < text.len and std.ascii.isWhitespace(text[first])) : (first += 1) {}
+    const json = first < text.len and text[first] == '{';
+    const xml = std.mem.startsWith(u8, text[first..], "<function=");
+    var in_string = false;
+    var escaped = false;
+    var i = first;
+    while (i < text.len) : (i += 1) {
+        if (json) {
+            if (in_string) {
+                if (escaped) escaped = false else if (text[i] == '\\') escaped = true else if (text[i] == '"') in_string = false;
+                continue;
+            }
+            if (text[i] == '"') {
+                in_string = true;
+                continue;
+            }
+        }
+        if (std.mem.startsWith(u8, text[i..], tool_call_close)) {
+            if (!xml or std.mem.endsWith(u8, std.mem.trimEnd(u8, text[first..i], " \t\r\n"), "</function>")) return i;
+        }
+    }
+    return null;
+}
+
+fn schemaAllowsString(schema: std.json.Value, depth: u8) bool {
+    if (depth == 0 or schema != .object) return true;
+    if (schema.object.get("type")) |kind| {
+        if (kind == .string) return std.mem.eql(u8, kind.string, "string");
+        if (kind == .array) {
+            for (kind.array.items) |item| if (item == .string and std.mem.eql(u8, item.string, "string")) return true;
+            return false;
+        }
+    }
+    for ([_][]const u8{ "anyOf", "oneOf" }) |key| {
+        if (schema.object.get(key)) |alternatives| {
+            if (alternatives != .array) return true;
+            for (alternatives.array.items) |item| if (schemaAllowsString(item, depth - 1)) return true;
+            return false;
+        }
+    }
+    return true;
+}
+
+fn stripXmlEnvelopeNewlines(value: []const u8) []const u8 {
+    var out = value;
+    if (std.mem.startsWith(u8, out, "\r\n")) out = out[2..] else if (std.mem.startsWith(u8, out, "\n")) out = out[1..];
+    if (std.mem.endsWith(u8, out, "\r\n")) out = out[0 .. out.len - 2] else if (std.mem.endsWith(u8, out, "\n")) out = out[0 .. out.len - 1];
+    return out;
+}
+
+fn parsedCall(allocator: std.mem.Allocator, name: []const u8, args: std.json.Value) !?ToolCall {
+    if (name.len == 0) return null;
+    const id = try allocToolCallId(allocator);
+    errdefer allocator.free(id);
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const arguments = try std.json.Stringify.valueAlloc(allocator, args, .{});
+    return .{ .id = id, .name = owned_name, .arguments_json = arguments };
+}
+
+/// Parse only complete native XML or JSON calls. Malformed blocks stay text;
+/// schemas type XML values without guessing that source-code strings are JSON.
+fn parseCallInner(inner: []const u8, tools: []const ToolDefinition, allocator: std.mem.Allocator) !?ToolCall {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (!std.mem.startsWith(u8, inner, "<function=")) {
+        const json = std.json.parseFromSliceLeaky(std.json.Value, a, inner, .{}) catch return null;
+        if (json != .object) return null;
+        const name = json.object.get("name") orelse return null;
+        if (name != .string) return null;
+        return parsedCall(allocator, name.string, json.object.get("arguments") orelse .{ .object = .empty });
+    }
+    const name_end = std.mem.indexOfScalar(u8, inner, '>') orelse return null;
+    const name = inner["<function=".len..name_end];
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, "<>\n\r\t ") != null) return null;
+    var schema: std.json.Value = .null;
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) {
+            schema = std.json.parseFromSliceLeaky(std.json.Value, a, tool.parameters_json, .{}) catch .null;
+            break;
+        }
+    }
+    var args: std.json.Value = .{ .object = .empty };
+    var cursor = name_end + 1;
+    while (true) {
+        while (cursor < inner.len and std.ascii.isWhitespace(inner[cursor])) : (cursor += 1) {}
+        if (std.mem.startsWith(u8, inner[cursor..], "</function>")) {
+            cursor += "</function>".len;
+            if (!isWhitespaceOnly(inner[cursor..])) return null;
+            return parsedCall(allocator, name, args);
+        }
+        if (!std.mem.startsWith(u8, inner[cursor..], "<parameter=")) return null;
+        const key_start = cursor + "<parameter=".len;
+        const key_end = std.mem.indexOfScalarPos(u8, inner, key_start, '>') orelse return null;
+        const key = inner[key_start..key_end];
+        if (key.len == 0 or args.object.contains(key)) return null;
+        const value_start = key_end + 1;
+        const value_end = std.mem.indexOfPos(u8, inner, value_start, "</parameter>") orelse return null;
+        const raw = stripXmlEnvelopeNewlines(inner[value_start..value_end]);
+        var value: std.json.Value = .{ .string = raw };
+        if (schema == .object) {
+            if (schema.object.get("properties")) |properties| {
+                if (properties == .object) {
+                    if (properties.object.get(key)) |property| {
+                        if (!schemaAllowsString(property, 8)) {
+                            // Native Qwen/Jinja XML also spells scalar booleans
+                            // True/False and null as None. Decode these only
+                            // when the schema excludes strings, preserving
+                            // source-code and JSON-looking string arguments.
+                            const scalar = std.mem.trim(u8, raw, " \t\r\n");
+                            value = if (std.ascii.eqlIgnoreCase(scalar, "true"))
+                                .{ .bool = true }
+                            else if (std.ascii.eqlIgnoreCase(scalar, "false"))
+                                .{ .bool = false }
+                            else if (std.mem.eql(u8, scalar, "None"))
+                                .null
+                            else
+                                std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch .{ .string = raw };
+                        }
+                    }
+                }
+            }
+        }
+        try args.object.put(a, key, value);
+        cursor = value_end + "</parameter>".len;
+    }
+}
+
+/// Replay SDK tool history in the checkpoint's native dialect.
+pub fn appendAssistantCall(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, arguments: []const u8, native_xml: bool) !void {
+    if (!native_xml) {
+        const escaped_name = try std.json.Stringify.valueAlloc(allocator, name, .{});
+        defer allocator.free(escaped_name);
+        try buf.print(allocator, "<tool_call>\n{{\"name\":{s},\"arguments\":{s}}}\n</tool_call>\n", .{ escaped_name, arguments });
+        return;
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidToolArguments;
+    try buf.print(allocator, "<tool_call>\n<function={s}>\n", .{name});
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        try buf.print(allocator, "<parameter={s}>\n", .{entry.key_ptr.*});
+        if (entry.value_ptr.* == .string) {
+            try buf.appendSlice(allocator, entry.value_ptr.string);
+        } else {
+            const json = try std.json.Stringify.valueAlloc(allocator, entry.value_ptr.*, .{});
+            defer allocator.free(json);
+            try buf.appendSlice(allocator, json);
+        }
+        try buf.appendSlice(allocator, "\n</parameter>\n");
+    }
+    try buf.appendSlice(allocator, "</function>\n</tool_call>\n");
+}
+
+test "ChatML tool descriptions remain valid JSON with quotes newlines and Unicode" {
+    const allocator = std.testing.allocator;
+    const description = "Read a \"file\".\nUse a JSON path, including café 東京.\n\tControl: \x01";
+    const tools = [_]ToolDefinition{.{ .name = "read", .description = description, .parameters_json = "{\"type\":\"object\"}" }};
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try chatmlToolFormat().renderToolDefinitions(&tools, &buf, allocator);
+    var lines = std.mem.splitScalar(u8, buf.items, '\n');
+    var found = false;
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "{\"type\"")) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const function = parsed.value.object.get("function").?.object;
+        try std.testing.expectEqualStrings("read", function.get("name").?.string);
+        try std.testing.expectEqualStrings(description, function.get("description").?.string);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
 fn chatml_render_defs(
     _: *anyopaque,
     tools: []const ToolDefinition,
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
 ) !void {
+    return chatmlRenderDefs(tools, buf, allocator, false);
+}
+
+fn chatml_xml_render_defs(_: *anyopaque, tools: []const ToolDefinition, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    return chatmlRenderDefs(tools, buf, allocator, true);
+}
+
+fn chatmlRenderDefs(tools: []const ToolDefinition, buf: *std.ArrayList(u8), allocator: std.mem.Allocator, native_xml: bool) !void {
     if (tools.len == 0) return;
 
-    // Verbatim from Qwen3.5's published chat_template.
+    // Qwen/ChatML scaffold. Each signature must be a valid JSON line even when
+    // client descriptions contain Markdown, quoted examples, or newlines.
     try buf.appendSlice(allocator,
         \\
         \\# Tools
@@ -419,22 +556,43 @@ fn chatml_render_defs(
     );
 
     for (tools) |tool| {
-        try buf.appendSlice(allocator, "{\"type\": \"function\", \"function\": {\"name\": \"");
-        try buf.appendSlice(allocator, tool.name);
-        try buf.appendSlice(allocator, "\", \"description\": \"");
-        try buf.appendSlice(allocator, tool.description);
-        try buf.appendSlice(allocator, "\", \"parameters\": ");
+        const name_json = try std.json.Stringify.valueAlloc(allocator, tool.name, .{});
+        defer allocator.free(name_json);
+        const description_json = try std.json.Stringify.valueAlloc(allocator, tool.description, .{});
+        defer allocator.free(description_json);
+        try buf.appendSlice(allocator, "{\"type\": \"function\", \"function\": {\"name\": ");
+        try buf.appendSlice(allocator, name_json);
+        try buf.appendSlice(allocator, ", \"description\": ");
+        try buf.appendSlice(allocator, description_json);
+        try buf.appendSlice(allocator, ", \"parameters\": ");
         try buf.appendSlice(allocator, tool.parameters_json);
         try buf.appendSlice(allocator, "}}\n");
     }
 
+    if (native_xml) {
+        try buf.appendSlice(allocator,
+            \\</tools>
+            \\
+            \\If you choose to call a function, reply in this format:
+            \\<tool_call>
+            \\<function=example_function_name>
+            \\<parameter=example_parameter_name>
+            \\value
+            \\</parameter>
+            \\</function>
+            \\</tool_call>
+            \\Use the exact names from the signatures and include every required parameter. Parameter values can span multiple lines. Put any explanation before the call, with no text after it.
+        );
+        return;
+    }
     try buf.appendSlice(allocator,
         \\</tools>
         \\
         \\For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
         \\<tool_call>
-        \\{"name": <function-name>, "arguments": <args-json-object>}
+        \\{"name": "function_name", "arguments": {"argument_name": "value"}}
         \\</tool_call>
+        \\Use the exact function and argument names from the signatures. Quote every string value and keep arguments inside the arguments object.
     );
 }
 
@@ -466,114 +624,48 @@ fn chatml_fallback_block(
     try text_buf.appendSlice(allocator, tool_call_close);
 }
 
-fn chatml_parse_calls(
-    _: *anyopaque,
-    model_output: []const u8,
-    allocator: std.mem.Allocator,
-) !ParsedAssistantOutput {
+fn chatml_parse_calls(_: *anyopaque, model_output: []const u8, tools: []const ToolDefinition, allocator: std.mem.Allocator) !ParsedAssistantOutput {
     var calls: std.ArrayList(ToolCall) = .empty;
     errdefer {
-        for (calls.items) |c| {
-            allocator.free(c.id);
-            allocator.free(c.name);
-            allocator.free(c.arguments_json);
+        for (calls.items) |call| {
+            allocator.free(call.id);
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
         }
         calls.deinit(allocator);
     }
-    var text_buf: std.ArrayList(u8) = .empty;
-    errdefer text_buf.deinit(allocator);
-
-    var search_from: usize = 0;
-    var just_emitted_call = false;
-    while (std.mem.indexOfPos(u8, model_output, search_from, tool_call_open)) |open_at| {
-        // Bytes between the previous position and the next <tool_call> open tag.
-        // When that segment is pure whitespace and follows an emitted tool_call,
-        // it's wire-format separator (the prompt template inserts a newline
-        // between blocks), not user-visible content — drop it.
-        const between = model_output[search_from..open_at];
-        const is_separator = just_emitted_call and isWhitespaceOnly(between);
-        if (!is_separator) try text_buf.appendSlice(allocator, between);
-
-        const after_open = open_at + tool_call_open.len;
-        const close_at = std.mem.indexOfPos(u8, model_output, after_open, tool_call_close) orelse {
-            // Unclosed tool_call: leave open tag and rest of input in text_buf.
-            try text_buf.appendSlice(allocator, model_output[open_at..]);
-            search_from = model_output.len;
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(allocator);
+    var cursor: usize = 0;
+    var just_called = false;
+    while (std.mem.indexOfPos(u8, model_output, cursor, tool_call_open)) |open| {
+        const between = model_output[cursor..open];
+        if (!just_called or !isWhitespaceOnly(between)) try text.appendSlice(allocator, between);
+        const begin = open + tool_call_open.len;
+        const close = findCallClose(model_output, begin) orelse {
+            try text.appendSlice(allocator, model_output[open..]);
+            cursor = model_output.len;
             break;
         };
-
-        const inner = std.mem.trim(u8, model_output[after_open..close_at], " \t\r\n");
-
-        // Parse the inner JSON using std.json.parseFromSlice with a dynamic Value.
-        const parsed_result = std.json.parseFromSlice(std.json.Value, allocator, inner, .{}) catch {
-            // Malformed JSON: include the entire block (tags + content) in text_buf.
-            try chatml_fallback_block(&text_buf, allocator, inner);
-            search_from = close_at + tool_call_close.len;
-            continue;
-        };
-        defer parsed_result.deinit();
-
-        // Extract "name" and "arguments" fields.
-        const obj = switch (parsed_result.value) {
-            .object => |o| o,
-            else => {
-                try chatml_fallback_block(&text_buf, allocator, inner);
-                search_from = close_at + tool_call_close.len;
-                continue;
-            },
-        };
-
-        const name_val = obj.get("name") orelse {
-            try chatml_fallback_block(&text_buf, allocator, inner);
-            search_from = close_at + tool_call_close.len;
-            continue;
-        };
-        const name_str = switch (name_val) {
-            .string => |s| s,
-            else => {
-                try chatml_fallback_block(&text_buf, allocator, inner);
-                search_from = close_at + tool_call_close.len;
-                continue;
-            },
-        };
-
-        // Re-serialize the arguments JSON using valueAlloc.
-        const empty_obj = std.json.Value{ .object = .empty };
-        const args_val = obj.get("arguments") orelse empty_obj;
-        const args_json = try std.json.Stringify.valueAlloc(allocator, args_val, .{});
-        errdefer allocator.free(args_json);
-
-        // Build the id string.
-        const id_str = try allocToolCallId(allocator);
-        errdefer allocator.free(id_str);
-
-        const name_owned = try allocator.dupe(u8, name_str);
-        errdefer allocator.free(name_owned);
-
-        try calls.append(allocator, .{
-            .id = id_str,
-            .name = name_owned,
-            .arguments_json = args_json,
-        });
-
-        just_emitted_call = true;
-        search_from = close_at + tool_call_close.len;
-    }
-
-    // Append any tail after the last tool_call. If we just emitted a call and
-    // the tail is pure whitespace, drop it for the same reason as the inter-call
-    // separator: wire format, not content.
-    if (search_from < model_output.len) {
-        const tail = model_output[search_from..];
-        if (!just_emitted_call or !isWhitespaceOnly(tail)) {
-            try text_buf.appendSlice(allocator, tail);
+        const inner = std.mem.trim(u8, model_output[begin..close], " \t\r\n");
+        if (try parseCallInner(inner, tools, allocator)) |call| {
+            errdefer {
+                allocator.free(call.id);
+                allocator.free(call.name);
+                allocator.free(call.arguments_json);
+            }
+            try calls.append(allocator, call);
+            just_called = true;
+        } else {
+            try chatml_fallback_block(&text, allocator, inner);
+            just_called = false;
         }
+        cursor = close + tool_call_close.len;
     }
-
-    return .{
-        .text_content = try text_buf.toOwnedSlice(allocator),
-        .tool_calls = try calls.toOwnedSlice(allocator),
-    };
+    if (cursor < model_output.len and (!just_called or !isWhitespaceOnly(model_output[cursor..]))) try text.appendSlice(allocator, model_output[cursor..]);
+    const content = try text.toOwnedSlice(allocator);
+    errdefer allocator.free(content);
+    return .{ .text_content = content, .tool_calls = try calls.toOwnedSlice(allocator) };
 }
 
 fn chatml_new_detector(_: *anyopaque, allocator: std.mem.Allocator) !*StreamingDetector {
@@ -584,6 +676,13 @@ fn chatml_new_detector(_: *anyopaque, allocator: std.mem.Allocator) !*StreamingD
 
 const vtable_chatml = ToolFormat.VTable{
     .renderToolDefinitions = chatml_render_defs,
+    .renderToolResultMessage = chatml_render_result,
+    .parseAssistantToolCalls = chatml_parse_calls,
+    .newStreamingDetector = chatml_new_detector,
+};
+
+const vtable_chatml_xml = ToolFormat.VTable{
+    .renderToolDefinitions = chatml_xml_render_defs,
     .renderToolResultMessage = chatml_render_result,
     .parseAssistantToolCalls = chatml_parse_calls,
     .newStreamingDetector = chatml_new_detector,
@@ -779,7 +878,7 @@ test "StreamingDetector.feed emits normal text as content" {
     try std.testing.expectEqual(FeedResult.emit_as_content, result);
 }
 
-test "StreamingDetector.feed emits prefix content before tool_call_complete" {
+test "StreamingDetector.feed preserves prefix content with a complete call" {
     const tf = chatmlToolFormat();
     const detector = try tf.newStreamingDetector(std.testing.allocator);
     defer {
@@ -789,15 +888,13 @@ test "StreamingDetector.feed emits prefix content before tool_call_complete" {
 
     const chunk = "Sure!\n<tool_call>\n{\"name\":\"X\",\"arguments\":{}}\n</tool_call>";
 
-    // First call: should return emit_as_content with "Sure!\n"
+    // The caller drains content before calls, including when both arrive in
+    // the same token. No extra feed is needed at end of generation.
     const r1 = try detector.feed(chunk);
-    try std.testing.expectEqual(FeedResult.emit_as_content, r1);
+    try std.testing.expectEqual(FeedResult.tool_call_complete, r1);
     const content = detector.takeContentDelta();
     try std.testing.expectEqualStrings("Sure!\n", content);
 
-    // Second call (empty): pending_calls is non-empty so returns tool_call_complete.
-    const r2 = try detector.feed("");
-    try std.testing.expectEqual(FeedResult.tool_call_complete, r2);
     const call = detector.takePendingToolCall() orelse return error.NoCall;
     defer {
         std.testing.allocator.free(call.id);
@@ -850,5 +947,139 @@ test "forTemplate returns NoopToolFormat for non-chatml kinds" {
         };
         try tf.renderToolDefinitions(&tools, &buf, std.testing.allocator);
         try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+    }
+}
+
+const xml_test_tools = [_]ToolDefinition{.{
+    .name = "edit",
+    .description = "Edit a file.",
+    .parameters_json =
+    \\{"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"},"offset":{"type":"integer"},"replaceAll":{"type":"boolean"},"options":{"type":"object"},"lines":{"type":"array"},"nullable":{"type":["integer","null"]},"flexible":{"anyOf":[{"type":"integer"},{"type":"string"}]}}}
+    ,
+}};
+
+fn freeTestCall(allocator: std.mem.Allocator, call: ToolCall) void {
+    allocator.free(call.id);
+    allocator.free(call.name);
+    allocator.free(call.arguments_json);
+}
+
+test "native XML arguments preserve source strings and schema types" {
+    const a = std.testing.allocator;
+    const wire =
+        \\<tool_call>
+        \\<function=edit>
+        \\<parameter=filePath>
+        \\src/export utils/表.mjs
+        \\</parameter>
+        \\<parameter=oldString>
+        \\0
+        \\</parameter>
+        \\<parameter=newString>
+        \\  const x = "café 東京 🚀";
+        \\  return { a: true };
+        \\</parameter>
+        \\<parameter=offset>12</parameter>
+        \\<parameter=replaceAll>false</parameter>
+        \\<parameter=options>{"safe":true}</parameter>
+        \\<parameter=lines>[1,"two"]</parameter>
+        \\<parameter=nullable>null</parameter>
+        \\<parameter=flexible>42</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const parsed = try chatmlToolFormat().parseAssistantToolCallsWithTools(wire, &xml_test_tools, a);
+    defer a.free(parsed.text_content);
+    defer a.free(parsed.tool_calls);
+    defer for (parsed.tool_calls) |call| freeTestCall(a, call);
+    try std.testing.expectEqual(@as(usize, 1), parsed.tool_calls.len);
+    const args = try std.json.parseFromSlice(std.json.Value, a, parsed.tool_calls[0].arguments_json, .{});
+    defer args.deinit();
+    const obj = args.value.object;
+    try std.testing.expectEqualStrings("src/export utils/表.mjs", obj.get("filePath").?.string);
+    try std.testing.expectEqualStrings("0", obj.get("oldString").?.string);
+    try std.testing.expectEqualStrings("  const x = \"café 東京 🚀\";\n  return { a: true };", obj.get("newString").?.string);
+    try std.testing.expectEqual(@as(i64, 12), obj.get("offset").?.integer);
+    try std.testing.expectEqual(false, obj.get("replaceAll").?.bool);
+    try std.testing.expectEqual(true, obj.get("options").?.object.get("safe").?.bool);
+    try std.testing.expectEqual(@as(usize, 2), obj.get("lines").?.array.items.len);
+    try std.testing.expect(obj.get("nullable").? == .null);
+    try std.testing.expectEqualStrings("42", obj.get("flexible").?.string);
+}
+
+test "native XML history round trip preserves multiline whitespace and JSON-looking strings" {
+    const a = std.testing.allocator;
+    const arguments = "{\"filePath\":\"src/表.mjs\",\"oldString\":\"\\n  old\\n\",\"newString\":\"{\\\"literal\\\":true}\\n\\n\",\"replaceAll\":true,\"offset\":0}";
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    try appendAssistantCall(&wire, a, "edit", arguments, true);
+    const parsed = try chatmlToolFormat().parseAssistantToolCallsWithTools(wire.items, &xml_test_tools, a);
+    defer a.free(parsed.text_content);
+    defer a.free(parsed.tool_calls);
+    defer for (parsed.tool_calls) |call| freeTestCall(a, call);
+    try std.testing.expectEqual(@as(usize, 1), parsed.tool_calls.len);
+    try std.testing.expectEqualStrings(arguments, parsed.tool_calls[0].arguments_json);
+}
+
+test "tool streams accept every byte split and multiple calls without losing chunks" {
+    const a = std.testing.allocator;
+    const wire = "Before\n<tool_call>\n<function=edit>\n<parameter=filePath>src/表.mjs</parameter>\n<parameter=replaceAll>true</parameter>\n</function>\n</tool_call>\n<tool_call>{\"name\":\"read\",\"arguments\":{\"filePath\":\"café </tool_call>\"}}</tool_call>After";
+    for (0..wire.len + 1) |split| {
+        var detector = StreamingDetector{ .allocator = a, .tools = &xml_test_tools };
+        defer detector.deinit();
+        _ = try detector.feed(wire[0..split]);
+        // Deliberately feed again before draining to exercise queued calls.
+        _ = try detector.feed(wire[split..]);
+        const content = detector.takeContentDelta();
+        try std.testing.expectEqualStrings("Before\n\nAfter", content);
+        const first = detector.takePendingToolCall() orelse return error.MissingXmlCall;
+        defer freeTestCall(a, first);
+        const second = detector.takePendingToolCall() orelse return error.MissingJsonCall;
+        defer freeTestCall(a, second);
+        try std.testing.expectEqualStrings("edit", first.name);
+        try std.testing.expectEqualStrings("{\"filePath\":\"src/表.mjs\",\"replaceAll\":true}", first.arguments_json);
+        try std.testing.expectEqualStrings("read", second.name);
+        try std.testing.expectEqualStrings("{\"filePath\":\"café </tool_call>\"}", second.arguments_json);
+        try std.testing.expect(!std.mem.eql(u8, first.id, second.id));
+        try std.testing.expectEqual(@as(?ToolCall, null), detector.takePendingToolCall());
+        try std.testing.expectEqualStrings("", detector.finalize());
+    }
+}
+
+test "malformed native XML stays visible and never invents tool arguments" {
+    const a = std.testing.allocator;
+    const malformed = [_][]const u8{
+        "<function=edit><parameter=filePath>file</function>",
+        "<function=edit><parameter=filePath>a</parameter><parameter=filePath>b</parameter></function>",
+        "<function=edit><parameter=filePath>a</parameter></function>extra",
+        "<function=><parameter=filePath>a</parameter></function>",
+        "{\"function\":\"read\",\"filePath\": file}",
+    };
+    for (malformed) |inner| {
+        const wire = try std.fmt.allocPrint(a, "<tool_call>{s}</tool_call>", .{inner});
+        defer a.free(wire);
+        var detector = StreamingDetector{ .allocator = a, .tools = &xml_test_tools };
+        defer detector.deinit();
+        _ = try detector.feed(wire);
+        try std.testing.expectEqual(@as(?ToolCall, null), detector.takePendingToolCall());
+        try std.testing.expectEqualStrings(wire, detector.finalize());
+    }
+}
+
+test "native Qwen XML decodes Python boolean and null scalars only for typed fields" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "True", "False" }, [_]bool{ true, false }) |spelling, expected| {
+        const wire = try std.fmt.allocPrint(a, "<tool_call><function=edit><parameter=replaceAll>{s}</parameter><parameter=nullable>None</parameter><parameter=oldString>{s}</parameter></function></tool_call>", .{ spelling, spelling });
+        defer a.free(wire);
+        const parsed = try chatmlToolFormat().parseAssistantToolCallsWithTools(wire, &xml_test_tools, a);
+        defer a.free(parsed.text_content);
+        defer a.free(parsed.tool_calls);
+        defer for (parsed.tool_calls) |call| freeTestCall(a, call);
+        try std.testing.expectEqual(@as(usize, 1), parsed.tool_calls.len);
+        const args = try std.json.parseFromSlice(std.json.Value, a, parsed.tool_calls[0].arguments_json, .{});
+        defer args.deinit();
+        try std.testing.expectEqual(expected, args.value.object.get("replaceAll").?.bool);
+        try std.testing.expect(args.value.object.get("nullable").? == .null);
+        try std.testing.expectEqualStrings(spelling, args.value.object.get("oldString").?.string);
     }
 }

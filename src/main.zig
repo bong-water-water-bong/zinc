@@ -57,6 +57,7 @@ const cuda_serve_mod = if (gpu.is_cuda) @import("server/cuda_serve.zig") else st
 const http_mod = @import("server/http.zig");
 const model_manager_mod = @import("server/model_manager_runtime.zig");
 const routes_mod = @import("server/routes.zig");
+const tool_format_mod = @import("server/tool_format.zig");
 const CommandPool = if (gpu.is_vulkan) @import("vulkan/command.zig").CommandPool else struct {
     pub fn init(_: anytype) !@This() {
         return .{};
@@ -148,6 +149,7 @@ comptime {
     _ = @import("model/gguf.zig");
     _ = @import("model/tokenizer.zig");
     _ = @import("compute/graph.zig");
+    _ = @import("compute/launch_sizes.zig");
     _ = @import("build_info.zig");
     _ = @import("runtime_assets.zig");
     _ = @import("regression_tests.zig");
@@ -2165,7 +2167,6 @@ fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, conf
 /// Minimal request body the serve path reads (OpenAI-ish). Unknown fields ignored.
 const ServeReqBody = struct {
     prompt: ?[]const u8 = null,
-    messages: ?[]struct { role: []const u8 = "user", content: []const u8 = "" } = null,
     max_tokens: ?u32 = null,
     n_predict: ?u32 = null,
     /// Preserve the original SSE default when omitted; explicit false selects
@@ -2188,10 +2189,11 @@ fn handleServeConn(ctx: *ServeConnCtx) void {
         return;
     }
     if (req.method == .GET and std.mem.eql(u8, req.path, "/health")) {
-        conn.sendJson(200, if (gpu.is_rocm)
-            "{\"status\":\"ok\",\"backend\":\"rocm\"}"
-        else
-            "{\"status\":\"ok\",\"backend\":\"cuda\"}") catch {};
+        var health_buf: [160]u8 = undefined;
+        const health = std.fmt.bufPrint(&health_buf, "{{\"status\":\"ok\",\"backend\":\"{s}\",\"context_length\":{d}}}", .{
+            if (gpu.is_rocm) @as([]const u8, "rocm") else "cuda", ctx.slot_ctx,
+        }) catch return;
+        conn.sendJson(200, health) catch {};
         return;
     }
     // 3c throughput gate: cumulative decode/prefill counters. Diff two snapshots
@@ -2223,6 +2225,14 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
     var owns_tokens = false;
     var stream_response = true;
     var enable_thinking: ?bool = null;
+    var tools_active = false;
+    var chat_request: ?routes_mod.ParsedChatRequest = null;
+    defer if (chat_request) |*chat| chat.deinit();
+    var tool_definitions: []const tool_format_mod.ToolDefinition = &.{};
+    var forced_tool_name: ?[]u8 = null;
+    defer if (forced_tool_name) |name| allocator.free(name);
+    var forced_tool_first_arg: ?[]u8 = null;
+    defer if (forced_tool_first_arg) |name| allocator.free(name);
 
     if (ctx.debug_ids) {
         // Gate contract: body is JSON {"prompt":"t0,t1,...","max_tokens":N}; the
@@ -2256,25 +2266,46 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         var chat_buf: ?[]u8 = null;
         defer if (chat_buf) |b| allocator.free(b);
         if (is_chat) {
-            const msgs = parsed.value.messages orelse {
-                try conn.sendError(400, "invalid_request_error", "missing messages");
+            chat_request = routes_mod.parseChatRequest(allocator, body) catch {
+                try conn.sendError(400, "invalid_request_error", "invalid chat messages or tools");
                 return;
             };
-            var roles = try allocator.alloc([]const u8, msgs.len);
-            defer allocator.free(roles);
-            var contents = try allocator.alloc([]const u8, msgs.len);
-            defer allocator.free(contents);
-            for (msgs, 0..) |m, i| {
-                roles[i] = m.role;
-                contents[i] = m.content;
+            const chat = &chat_request.?;
+            tool_definitions = chat.tools;
+            routes_mod.prepareChatForTokenizer(chat, ctx.tokenizer) catch {
+                try conn.sendError(400, "invalid_request_error", "invalid tool-call history");
+                return;
+            };
+            // Preserve this backend's original prompt for ordinary chat while
+            // sharing content-array, tool schema and tool-result parsing with
+            // the Vulkan/Metal API.
+            if (chat.injected_default_system and chat.tools.len == 0) {
+                chat.roles = chat.roles[1..];
+                chat.contents = chat.contents[1..];
             }
-            const buf = try allocator.alloc(u8, 64 * 1024);
-            chat_buf = buf;
-            prompt_text = ctx.tokenizer.applyChatTemplateWithOptions(roles, contents, .{ .enable_thinking = enable_thinking }, buf) catch |err| {
+            if (chat.roles.len == 0) {
+                try conn.sendError(400, "invalid_request_error", "missing messages");
+                return;
+            }
+            tools_active = chat.tools.len > 0 and chat.tool_choice != .none and
+                ctx.tokenizer.detectTemplateKind() == .chatml;
+            if (tools_active and enable_thinking == null) enable_thinking = false;
+            const skip_thinking = routes_mod.shouldSkipThinkingTemplateForRequest(chat.tools.len, chat.tool_choice, enable_thinking);
+            if (!tool_format_mod.forTokenizer(ctx.tokenizer).native_xml) {
+                if (routes_mod.forcedSingleToolName(chat.tools, chat.tool_choice)) |name| {
+                    forced_tool_name = try allocator.dupe(u8, name);
+                    if (routes_mod.forcedSingleToolFirstArgumentName(chat.tools, chat.tool_choice)) |arg| {
+                        forced_tool_first_arg = try allocator.dupe(u8, arg);
+                    }
+                }
+            }
+            const buf = routes_mod.allocChatPrompt(allocator, ctx.tokenizer, chat.roles, chat.contents, enable_thinking, skip_thinking, chat.tools, chat.tool_choice) catch |err| {
                 try conn.sendError(400, "invalid_request_error", "chat template failed");
                 log.warn("chat template: {s}", .{@errorName(err)});
                 return;
             };
+            chat_buf = buf;
+            prompt_text = buf;
         } else {
             prompt_text = parsed.value.prompt orelse {
                 try conn.sendError(400, "invalid_request_error", "missing prompt");
@@ -2316,10 +2347,13 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
     // From here the worker borrows `prompt_tokens` + `chan`; do not return without
     // draining to `finished` (so the worker is done touching them) then `finish`.
     defer ctx.engine.finish(id, &chan);
+    var forced_id_buf: [64]u8 = undefined;
+    const forced_id = std.fmt.bufPrint(&forced_id_buf, "call_forced_{d}", .{id}) catch unreachable;
 
     if (stream_response) {
         conn.sendSseStart() catch {
             // Client gone before headers — still drain the engine so it frees the slot.
+            ctx.engine.cancel(id);
             drainQuietly(ctx.engine, &chan);
             return;
         };
@@ -2330,12 +2364,19 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
     var json_buf: [1024]u8 = undefined;
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
+    var stream_pending: std.ArrayList(u8) = .empty;
+    defer stream_pending.deinit(allocator);
     const structured_capacity = @max(@as(usize, 64 * 1024), @as(usize, ctx.slot_ctx) * 32 + 256);
     const structured_buf: ?[]u8 = if (structured_chat) try allocator.alloc(u8, structured_capacity) else null;
     defer if (structured_buf) |buf_to_free| allocator.free(buf_to_free);
     var sent_structured_len: usize = 0;
     var write_failed = false;
     var generation_failed = false;
+    var detector = tool_format_mod.StreamingDetector{ .allocator = allocator, .tools = tool_definitions };
+    defer detector.deinit();
+    var any_tool_call_emitted = false;
+    var tool_call_index: u32 = 0;
+    var sent_tool_text_len: usize = 0;
     while (true) {
         const ch = ctx.engine.nextChunk(&chan, &buf);
         generation_failed = generation_failed or ch.failed;
@@ -2343,6 +2384,9 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         while (i < ch.n) : (i += 1) {
             const tok = buf[i];
             if (write_failed) continue; // keep draining the engine, stop writing
+            // The worker counts EOS for scheduling/usage; it is a control token,
+            // not visible assistant text or a tool-result history fragment.
+            if (!ctx.debug_ids and ctx.tokenizer.isEndOfGeneration(tok)) continue;
             if (!stream_response) {
                 if (ctx.debug_ids) {
                     if (output.items.len != 0) output.append(allocator, ',') catch {
@@ -2364,21 +2408,34 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
                 conn.writeSseEvent(payload) catch {
                     write_failed = true;
                 };
+            } else if (tools_active) {
+                output.appendSlice(allocator, ctx.tokenizer.decodeToken(tok, &dec_buf)) catch {
+                    write_failed = true;
+                    continue;
+                };
+                // Token byte pieces can split a UTF-8 code point. Hold that
+                // suffix until the next token before serializing an SSE event.
+                const pending = routes_mod.completeUtf8Prefix(output.items[sent_tool_text_len..]);
+                if (forced_tool_name == null and pending.len > 0 and std.unicode.utf8ValidateSlice(pending)) {
+                    routes_mod.streamTextViaDetector(conn, pending, "chatcmpl-zinc", 0, "zinc", &detector, &any_tool_call_emitted, &tool_call_index, allocator, true) catch {
+                        write_failed = true;
+                    };
+                    sent_tool_text_len += pending.len;
+                }
             } else if (structured_chat) {
                 const text = ctx.tokenizer.decodeToken(tok, &dec_buf);
                 output.appendSlice(allocator, text) catch {
                     write_failed = true;
                     continue;
                 };
-                const normalized = routes_mod.normalizeStructuredAssistantOutput(
+                const normalized = routes_mod.completeUtf8Prefix(routes_mod.normalizeStructuredAssistantOutput(
                     ctx.tokenizer,
                     output.items,
                     thinking_enabled,
                     structured_buf.?,
-                ) catch "";
-                if (normalized.len > sent_structured_len) {
-                    const payload = formatChunkJson(&json_buf, normalized[sent_structured_len..], is_chat) catch continue;
-                    conn.writeSseEvent(payload) catch {
+                ) catch "");
+                if (normalized.len > sent_structured_len and std.unicode.utf8ValidateSlice(normalized[sent_structured_len..])) {
+                    writeServeContent(conn, normalized[sent_structured_len..], is_chat) catch {
                         write_failed = true;
                         continue;
                     };
@@ -2386,12 +2443,21 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
                 }
             } else {
                 const text = ctx.tokenizer.decodeToken(tok, &dec_buf);
-                const payload = formatChunkJson(&json_buf, text, is_chat) catch continue;
-                conn.writeSseEvent(payload) catch {
+                stream_pending.appendSlice(allocator, text) catch {
+                    write_failed = true;
+                    continue;
+                };
+                const complete = routes_mod.completeUtf8Prefix(stream_pending.items);
+                if (complete.len == 0) continue;
+                writeServeContent(conn, complete, is_chat) catch {
                     write_failed = true;
                 };
+                const remaining = stream_pending.items.len - complete.len;
+                std.mem.copyForwards(u8, stream_pending.items, stream_pending.items[complete.len..]);
+                stream_pending.shrinkRetainingCapacity(remaining);
             }
         }
+        if (write_failed) ctx.engine.cancel(id);
         if (ch.finished) break;
     }
     const generated_tokens = chan.consumed;
@@ -2409,7 +2475,28 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         return;
     }
     if (stream_response) {
-        if (!write_failed) conn.writeSseDone() catch {};
+        if (!write_failed) {
+            if (tools_active) {
+                if (forced_tool_name) |name| {
+                    const args = try routes_mod.forcedToolArgumentsJsonAlloc(allocator, forced_tool_first_arg, routes_mod.completeUtf8Prefix(output.items));
+                    defer allocator.free(args);
+                    const event = try routes_mod.formatStreamingToolCallChunk(allocator, "chatcmpl-zinc", 0, "zinc", 0, forced_id, name, args);
+                    defer allocator.free(event);
+                    try conn.writeSseEvent(event);
+                    any_tool_call_emitted = true;
+                } else {
+                    const tail = detector.finalize();
+                    if (tail.len > 0) try routes_mod.streamText(conn, tail, "chatcmpl-zinc", 0, "zinc");
+                }
+            }
+            // Agent clients need a terminal finish reason to decide whether to
+            // execute tools or finish their turn. Include usage for compaction.
+            var finish_buf: [512]u8 = undefined;
+            const reason: []const u8 = if (any_tool_call_emitted) "tool_calls" else if (generated_tokens >= max_tokens) "length" else "stop";
+            const finish = try std.fmt.bufPrint(&finish_buf, "{{\"id\":\"chatcmpl-zinc\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"zinc\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}", .{ reason, prompt_tokens.len, generated_tokens, prompt_tokens.len + generated_tokens });
+            try conn.writeSseEvent(finish);
+            try conn.writeSseDone();
+        }
         return;
     }
     if (write_failed) {
@@ -2417,15 +2504,45 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         return;
     }
 
-    const response_output = if (structured_chat)
+    const response_output = routes_mod.completeUtf8Prefix(if (structured_chat)
         routes_mod.normalizeStructuredAssistantOutput(ctx.tokenizer, output.items, thinking_enabled, structured_buf.?) catch ""
     else
-        output.items;
+        output.items);
+    if (!std.unicode.utf8ValidateSlice(response_output)) {
+        try conn.sendError(500, "server_error", "model returned invalid UTF-8");
+        return;
+    }
     const escaped = try jsonEscapeAlloc(allocator, response_output);
     defer allocator.free(escaped);
     var response: std.ArrayList(u8) = .empty;
     defer response.deinit(allocator);
     const finish_reason: []const u8 = if (generated_tokens >= @as(usize, max_tokens)) "length" else "stop";
+    if (tools_active) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const parsed_tools = if (forced_tool_name) |name| tool_format_mod.ParsedAssistantOutput{
+            .text_content = "",
+            .tool_calls = &.{.{ .id = forced_id, .name = name, .arguments_json = try routes_mod.forcedToolArgumentsJsonAlloc(a, forced_tool_first_arg, response_output) }},
+        } else try tool_format_mod.forTokenizer(ctx.tokenizer).parseAssistantToolCallsWithTools(response_output, tool_definitions, a);
+        if (parsed_tools.tool_calls.len > 0) {
+            const ApiTool = struct { id: []const u8, type: []const u8 = "function", function: struct { name: []const u8, arguments: []const u8 } };
+            const api_tools = try a.alloc(ApiTool, parsed_tools.tool_calls.len);
+            for (parsed_tools.tool_calls, api_tools) |tc, *api_tc| {
+                api_tc.* = .{ .id = tc.id, .function = .{ .name = tc.name, .arguments = tc.arguments_json } };
+            }
+            const json = try std.json.Stringify.valueAlloc(a, .{
+                .id = "chatcmpl-zinc",
+                .object = "chat.completion",
+                .created = 0,
+                .model = "zinc",
+                .choices = .{.{ .index = 0, .message = .{ .role = "assistant", .content = @as(?[]const u8, null), .tool_calls = api_tools }, .finish_reason = "tool_calls" }},
+                .usage = .{ .prompt_tokens = prompt_tokens.len, .completion_tokens = generated_tokens, .total_tokens = prompt_tokens.len + generated_tokens },
+            }, .{});
+            try conn.sendJson(200, json);
+            return;
+        }
+    }
     if (is_chat) {
         try response.print(
             allocator,
@@ -2477,7 +2594,7 @@ fn parseTokenIdList(allocator: std.mem.Allocator, text: []const u8) ![]u32 {
 
 /// Format one OpenAI-style streaming chunk carrying a single token's text.
 fn formatChunkJson(buf: []u8, text: []const u8, is_chat: bool) ![]const u8 {
-    var esc: [512]u8 = undefined;
+    var esc: [2048]u8 = undefined;
     const escaped = jsonEscape(&esc, text);
     if (is_chat) {
         return std.fmt.bufPrint(buf, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{s}\"}}}}]}}", .{escaped});
@@ -2485,17 +2602,35 @@ fn formatChunkJson(buf: []u8, text: []const u8, is_chat: bool) ![]const u8 {
     return std.fmt.bufPrint(buf, "{{\"choices\":[{{\"index\":0,\"text\":\"{s}\"}}]}}", .{escaped});
 }
 
+fn writeServeContent(conn: *http_mod.Connection, text: []const u8, is_chat: bool) !void {
+    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const part = routes_mod.completeUtf8Prefix(text[offset..@min(text.len, offset + 256)]);
+        var payload: [4096]u8 = undefined;
+        try conn.writeSseEvent(try formatChunkJson(&payload, part, is_chat));
+        offset += part.len;
+    }
+}
+
 /// Minimal JSON string escaper for SSE token payloads (truncates on overflow).
 fn jsonEscape(buf: []u8, s: []const u8) []const u8 {
     var n: usize = 0;
     for (s) |c| {
+        var control: [6]u8 = undefined;
         const rep: []const u8 = switch (c) {
             '"' => "\\\"",
             '\\' => "\\\\",
             '\n' => "\\n",
             '\r' => "\\r",
             '\t' => "\\t",
-            else => &[_]u8{c},
+            else => if (c < 0x20) blk: {
+                const hex = "0123456789abcdef";
+                @memcpy(control[0..4], "\\u00");
+                control[4] = hex[c >> 4];
+                control[5] = hex[c & 15];
+                break :blk &control;
+            } else &[_]u8{c},
         };
         if (n + rep.len > buf.len) break;
         @memcpy(buf[n .. n + rep.len], rep);
@@ -2508,17 +2643,37 @@ fn jsonEscapeAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (s) |c| {
+        var control: [6]u8 = undefined;
         const rep: []const u8 = switch (c) {
             '"' => "\\\"",
             '\\' => "\\\\",
             '\n' => "\\n",
             '\r' => "\\r",
             '\t' => "\\t",
-            else => &[_]u8{c},
+            else => if (c < 0x20) blk: {
+                const hex = "0123456789abcdef";
+                @memcpy(control[0..4], "\\u00");
+                control[4] = hex[c >> 4];
+                control[5] = hex[c & 15];
+                break :blk &control;
+            } else &[_]u8{c},
         };
         try out.appendSlice(allocator, rep);
     }
     return out.toOwnedSlice(allocator);
+}
+
+test "accelerator SSE content preserves control bytes and Unicode through JSON" {
+    const text = "hi\x00\x01\x08\x0c\n\r\t\"\\東京🚀";
+    var buf: [2048]u8 = undefined;
+    const payload = try formatChunkJson(&buf, text, true);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("choices").?.array.items[0].object.get("delta").?.object.get("content").?.string;
+    try std.testing.expectEqualStrings(text, content);
+    const escaped = try jsonEscapeAlloc(std.testing.allocator, text);
+    defer std.testing.allocator.free(escaped);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "\\u0000") != null);
 }
 
 /// True if an env var is set to an "on" value (1/true/yes/on).
@@ -3675,4 +3830,14 @@ test "trimCliOutputText extracts GPT-OSS Harmony final channel" {
 
     try std.testing.expectEqualStrings("Paris", trimCliOutputText(raw, true));
     try std.testing.expectEqualStrings(raw, trimCliOutputText(raw, false));
+}
+
+test "accelerator SSE escaping retains a full token of control bytes" {
+    const text: [256]u8 = @splat(0);
+    var buf: [4096]u8 = undefined;
+    const payload = try formatChunkJson(&buf, &text, true);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("choices").?.array.items[0].object.get("delta").?.object.get("content").?.string;
+    try std.testing.expectEqualStrings(&text, content);
 }

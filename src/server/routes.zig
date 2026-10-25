@@ -1229,7 +1229,7 @@ fn parseToolChoice(value: ?std.json.Value) ToolChoice {
     }
 }
 
-fn forcedSingleToolName(tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice) ?[]const u8 {
+pub fn forcedSingleToolName(tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice) ?[]const u8 {
     if (tool_choice != .required or tools.len != 1) return null;
     return tools[0].name;
 }
@@ -1302,7 +1302,7 @@ fn firstToolArgumentName(parameters_json: []const u8) ?[]const u8 {
         firstObjectKeyAfterField(parameters_json, "\"properties\"");
 }
 
-fn forcedSingleToolFirstArgumentName(tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice) ?[]const u8 {
+pub fn forcedSingleToolFirstArgumentName(tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice) ?[]const u8 {
     if (tool_choice != .required or tools.len != 1) return null;
     return firstToolArgumentName(tools[0].parameters_json);
 }
@@ -1330,7 +1330,7 @@ const ChatRequestBody = struct {
     logprobs: ?std.json.Value = null,
 };
 
-const ParsedChatRequest = struct {
+pub const ParsedChatRequest = struct {
     parsed: std.json.Parsed(ChatRequestBody),
     roles: []const []const u8,
     contents: []const []const u8,
@@ -1349,7 +1349,7 @@ const ParsedChatRequest = struct {
     /// Owns parameters_json strings and tool_calls rendering.
     arena: std.heap.ArenaAllocator,
 
-    fn deinit(self: *ParsedChatRequest) void {
+    pub fn deinit(self: *ParsedChatRequest) void {
         freeStopSequences(self.stop_allocator, self.stop);
         self.parsed.deinit();
         self.arena.deinit();
@@ -1386,10 +1386,10 @@ fn estimateChatPromptBytes(roles: []const []const u8, contents: []const []const 
 }
 
 fn buildChatPrompt(allocator: std.mem.Allocator, tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, skip_thinking_template: bool, tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice, buf: []u8) ![]const u8 {
-    const tf = tool_format.forTemplate(tokenizer.detectTemplateKind());
+    const tf = tool_format.forTokenizer(tokenizer);
     const tools_for_template = if (tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else tools;
-    const forced_tool_name = forcedSingleToolName(tools_for_template, tool_choice);
-    const forced_tool_first_arg_name = forcedSingleToolFirstArgumentName(tools_for_template, tool_choice);
+    const forced_tool_name = if (tf.native_xml) null else forcedSingleToolName(tools_for_template, tool_choice);
+    const forced_tool_first_arg_name = if (tf.native_xml) null else forcedSingleToolFirstArgumentName(tools_for_template, tool_choice);
     return tokenizer.applyChatTemplateWithOptions(roles, contents, .{
         .enable_thinking = enable_thinking,
         .skip_thinking_template = skip_thinking_template,
@@ -1402,7 +1402,7 @@ fn buildChatPrompt(allocator: std.mem.Allocator, tokenizer: *const tokenizer_mod
     }, buf);
 }
 
-fn allocChatPrompt(
+pub fn allocChatPrompt(
     allocator: std.mem.Allocator,
     tokenizer: *const tokenizer_mod.Tokenizer,
     roles: []const []const u8,
@@ -1416,7 +1416,6 @@ fn allocChatPrompt(
     var attempts: u8 = 0;
     while (attempts < 4) : (attempts += 1) {
         const prompt_buf = try allocator.alloc(u8, capacity);
-        errdefer allocator.free(prompt_buf);
 
         const prompt = buildChatPrompt(allocator, tokenizer, roles, contents, enable_thinking, skip_thinking_template, tools, tool_choice, prompt_buf) catch |err| {
             allocator.free(prompt_buf);
@@ -1427,7 +1426,12 @@ fn allocChatPrompt(
             return err;
         };
 
-        return prompt_buf[0..prompt.len];
+        // Return an allocation of the advertised length, so callers can free
+        // it with a sized allocator. Returning a subslice corrupts Debug heaps.
+        return allocator.realloc(prompt_buf, prompt.len) catch |err| {
+            allocator.free(prompt_buf);
+            return err;
+        };
     }
 
     return error.BufferTooSmall;
@@ -1444,7 +1448,7 @@ fn buildChatTranscriptPrompt(
     tool_choice: ToolChoice,
     buf: []u8,
 ) ![]const u8 {
-    const tf = tool_format.forTemplate(tokenizer.detectTemplateKind());
+    const tf = tool_format.forTokenizer(tokenizer);
     const tools_for_template = if (tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else tools;
     return tokenizer.applyChatTemplateWithOptions(roles, contents, .{
         .add_generation_prompt = false,
@@ -1667,7 +1671,7 @@ fn shouldForceDisableThinking(managed_id: ?[]const u8, model_path: []const u8, d
     return !entry.thinking_stable;
 }
 
-fn shouldSkipThinkingTemplateForRequest(tools_len: usize, tool_choice: ToolChoice, enable_thinking: ?bool) bool {
+pub fn shouldSkipThinkingTemplateForRequest(tools_len: usize, tool_choice: ToolChoice, enable_thinking: ?bool) bool {
     // A caller who explicitly asked for no thinking (or a model whose thinking
     // the catalog force-disables) keeps the closed <think></think> scaffold even
     // when tools are present. The bare assistant header below is the only
@@ -1804,7 +1808,7 @@ fn appendAssistantToolCallHistoryBlock(
     try buf.appendSlice(allocator, "}\n</tool_call>\n");
 }
 
-fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatRequest {
+pub fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatRequest {
     var parsed = try std.json.parseFromSlice(ChatRequestBody, allocator, body, .{
         .ignore_unknown_fields = true,
     });
@@ -1924,6 +1928,26 @@ fn dropInjectedDefaultSystemForGemma(parsed: *ParsedChatRequest, is_gemma: bool)
     parsed.roles = parsed.roles[1..];
     parsed.contents = parsed.contents[1..];
     parsed.injected_default_system = false;
+}
+
+/// SDK history is OpenAI JSON; render its assistant calls in the model's native
+/// XML dialect before tokenization so tools and follow-up results round-trip.
+pub fn prepareChatForTokenizer(parsed: *ParsedChatRequest, tokenizer: *const tokenizer_mod.Tokenizer) !void {
+    const format = tool_format.forTokenizer(tokenizer);
+    if (!format.native_xml) return;
+    const a = parsed.arena.allocator();
+    const contents = try a.dupe([]const u8, parsed.contents);
+    for (parsed.roles, contents) |role, *content| {
+        if (!std.mem.eql(u8, role, "assistant") or std.mem.indexOf(u8, content.*, "<tool_call>") == null) continue;
+        const calls = try format.parseAssistantToolCallsWithTools(content.*, parsed.tools, a);
+        if (calls.tool_calls.len == 0) continue;
+        var rendered: std.ArrayList(u8) = .empty;
+        try rendered.appendSlice(a, calls.text_content);
+        if (rendered.items.len > 0 and rendered.items[rendered.items.len - 1] != '\n') try rendered.append(a, '\n');
+        for (calls.tool_calls) |call| try tool_format.appendAssistantCall(&rendered, a, call.name, call.arguments_json, true);
+        content.* = try rendered.toOwnedSlice(a);
+    }
+    parsed.contents = contents;
 }
 
 /// Combines the built-in template/leak stop strings with a request's
@@ -2464,7 +2488,7 @@ fn compactHistoryAnswer(answer: []const u8) []const u8 {
     return std.mem.trimEnd(u8, trimmed[0..cut], " \t\r\n");
 }
 
-fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
+pub fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
     var cursor: usize = 0;
     var out_len: usize = 0;
 
@@ -2743,6 +2767,8 @@ fn handleChatCompletions(
     }
     defer runtime.setLogitsReadbackEnabled(engine, previous_logits_readback);
 
+    try prepareChatForTokenizer(&parsed, tokenizer);
+
     const prompt = allocChatPrompt(allocator, tokenizer, parsed.roles, parsed.contents, parsed.enable_thinking, skip_thinking_template, parsed.tools, parsed.tool_choice) catch |err| {
         if (err == error.OutOfMemory) {
             try conn.sendError(500, "internal_error", "Prompt allocation failed");
@@ -2835,8 +2861,8 @@ fn handleChatCompletions(
     const thinking_enabled = supportsEnabledThinking(tokenizer, parsed.enable_thinking);
     const is_atem = tokenizer.detectTemplateKind() == .atem;
     const tools_for_choice = if (parsed.tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else parsed.tools;
-    const forced_tool_name = forcedSingleToolName(tools_for_choice, parsed.tool_choice);
-    const forced_tool_first_arg_name = forcedSingleToolFirstArgumentName(tools_for_choice, parsed.tool_choice);
+    const forced_tool_name = if (tool_format.forTokenizer(tokenizer).native_xml) null else forcedSingleToolName(tools_for_choice, parsed.tool_choice);
+    const forced_tool_first_arg_name = if (forced_tool_name == null) null else forcedSingleToolFirstArgumentName(tools_for_choice, parsed.tool_choice);
     const seed_bits: u128 = @bitCast(seed_ns);
     var prng = std.Random.DefaultPrng.init(@truncate(seed_bits));
     const random = prng.random();
@@ -3109,9 +3135,10 @@ fn handleChatCompletions(
         // (so deinit always works) but `tools_active` short-circuits the per-chunk
         // detection logic when the request didn't ask for tools — in that case
         // bytes flow through directly via streamText, matching mainline latency.
-        const tools_active = parsed.tools.len > 0;
-        const stream_tool_fmt = tool_format.forTemplate(tokenizer.detectTemplateKind());
+        const tools_active = parsed.tools.len > 0 and parsed.tool_choice != .none;
+        const stream_tool_fmt = tool_format.forTokenizer(tokenizer);
         const stream_detector = try stream_tool_fmt.newStreamingDetector(allocator);
+        stream_detector.tools = parsed.tools;
         defer {
             stream_detector.deinit();
             allocator.destroy(stream_detector);
@@ -3423,12 +3450,12 @@ fn handleChatCompletions(
         // actually carried tools (and tool calling is enabled). Skipping for
         // tool-less requests avoids spending a parser pass on every chat
         // completion and keeps the path identical to mainline pre-merge.
-        const tool_fmt = tool_format.forTemplate(tokenizer.detectTemplateKind());
-        const parsed_output = if (parsed.tools.len > 0)
-            try tool_fmt.parseAssistantToolCalls(response_text, allocator)
+        const tool_fmt = tool_format.forTokenizer(tokenizer);
+        const parsed_output = if (parsed.tools.len > 0 and parsed.tool_choice != .none)
+            try tool_fmt.parseAssistantToolCallsWithTools(response_text, parsed.tools, allocator)
         else
             tool_format.ParsedAssistantOutput{ .text_content = "", .tool_calls = &.{} };
-        defer if (parsed.tools.len > 0) {
+        defer if (parsed.tools.len > 0 and parsed.tool_choice != .none) {
             for (parsed_output.tool_calls) |c| {
                 allocator.free(c.id);
                 allocator.free(c.name);
@@ -3927,78 +3954,104 @@ test "ParsedRequest defaults" {
 fn jsonEscapeAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, input.len);
     for (input) |c| {
-        switch (c) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, c),
-        }
+        var control: [6]u8 = undefined;
+        try out.appendSlice(allocator, jsonByteEscape(c, &control));
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn jsonByteEscape(c: u8, control: *[6]u8) []const u8 {
+    return switch (c) {
+        '"' => "\\\"",
+        '\\' => "\\\\",
+        '\n' => "\\n",
+        '\r' => "\\r",
+        '\t' => "\\t",
+        else => if (c < 0x20) blk: {
+            const hex = "0123456789abcdef";
+            control.* = .{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 15] };
+            break :blk control;
+        } else blk: {
+            control[0] = c;
+            break :blk control[0..1];
+        },
+    };
 }
 
 fn jsonEscape(input: []const u8, buf: []u8) []const u8 {
     var out: usize = 0;
     for (input) |c| {
-        if (out + 2 >= buf.len) break;
-        switch (c) {
-            '"' => {
-                buf[out] = '\\';
-                buf[out + 1] = '"';
-                out += 2;
-            },
-            '\\' => {
-                buf[out] = '\\';
-                buf[out + 1] = '\\';
-                out += 2;
-            },
-            '\n' => {
-                buf[out] = '\\';
-                buf[out + 1] = 'n';
-                out += 2;
-            },
-            '\r' => {
-                buf[out] = '\\';
-                buf[out + 1] = 'r';
-                out += 2;
-            },
-            '\t' => {
-                buf[out] = '\\';
-                buf[out + 1] = 't';
-                out += 2;
-            },
-            else => {
-                buf[out] = c;
-                out += 1;
-            },
-        }
+        var control: [6]u8 = undefined;
+        const escaped = jsonByteEscape(c, &control);
+        if (out + escaped.len > buf.len) break;
+        @memcpy(buf[out..][0..escaped.len], escaped);
+        out += escaped.len;
     }
     return buf[0..out];
 }
 
-fn streamText(
+test "chat JSON escaping preserves all control bytes and Unicode" {
+    const a = std.testing.allocator;
+    const input = "control: \x00\x01\x08\x0c\n\r\t\"\\ café 東京 🚀";
+    const escaped = try jsonEscapeAlloc(a, input);
+    defer a.free(escaped);
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(escaped, jsonEscape(input, &buf));
+    const json = try std.fmt.allocPrint(a, "\"{s}\"", .{escaped});
+    defer a.free(json);
+    const parsed = try std.json.parseFromSlice([]const u8, a, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(input, parsed.value);
+}
+
+pub fn streamText(
     conn: *http.Connection,
     text: []const u8,
     req_id: []const u8,
     ts: i64,
     model_name: []const u8,
 ) !void {
-    var escaped_buf: [8192]u8 = undefined;
-    const escaped = jsonEscape(text, &escaped_buf);
-    var chunk_buf: [16384]u8 = undefined;
-    const chunk = std.fmt.bufPrint(&chunk_buf,
-        \\{{"id":"{s}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"content":"{s}"}},"finish_reason":null}}]}}
-    , .{ req_id, ts, model_name, escaped }) catch return error.BufferTooSmall;
-    try conn.writeSseEvent(chunk);
+    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
+    var offset: usize = 0;
+    while (offset < text.len) {
+        // Even all-control-byte content fits after JSON escaping. Keep UTF-8
+        // characters whole instead of truncating a large detector flush.
+        const part = completeUtf8Prefix(text[offset..@min(text.len, offset + 1024)]);
+        var escaped_buf: [8192]u8 = undefined;
+        const escaped = jsonEscape(part, &escaped_buf);
+        var chunk_buf: [16384]u8 = undefined;
+        const chunk = std.fmt.bufPrint(&chunk_buf,
+            \\{{"id":"{s}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"content":"{s}"}},"finish_reason":null}}]}}
+        , .{ req_id, ts, model_name, escaped }) catch return error.BufferTooSmall;
+        try conn.writeSseEvent(chunk);
+        offset += part.len;
+    }
+}
+
+/// Drop only an unfinished UTF-8 character at the end of decoded token bytes.
+/// A token budget can stop in the middle of a character. Keep its complete
+/// prefix for both JSON and SSE; interior invalid bytes are validated by callers.
+pub fn completeUtf8Prefix(text: []const u8) []const u8 {
+    if (text.len == 0) return text;
+    var start = text.len - 1;
+    while (start > 0 and text[start] & 0xc0 == 0x80) : (start -= 1) {}
+    const length = std.unicode.utf8ByteSequenceLength(text[start]) catch return text;
+    return if (text.len - start < length) text[0..start] else text;
+}
+
+test "response token budgets retain only complete Unicode characters" {
+    const text = "ASCII café 東京 🚀 🧑🏽‍💻\n";
+    for (0..text.len + 1) |end| {
+        var expected = end;
+        while (!std.unicode.utf8ValidateSlice(text[0..expected])) : (expected -= 1) {}
+        try std.testing.expectEqualStrings(text[0..expected], completeUtf8Prefix(text[0..end]));
+    }
 }
 
 /// Send content text through the streaming detector.
 /// Errors propagate upward; callers use `catch return` to stop streaming on failure.
-fn streamTextViaDetector(
+pub fn streamTextViaDetector(
     conn: *http.Connection,
     text: []const u8,
     req_id: []const u8,
@@ -4042,7 +4095,7 @@ fn streamTextViaDetector(
     }
 }
 
-fn formatStreamingToolCallChunk(
+pub fn formatStreamingToolCallChunk(
     allocator: std.mem.Allocator,
     req_id: []const u8,
     ts: i64,
@@ -4136,7 +4189,7 @@ fn forcedToolArgumentsSlice(generated_text: []const u8) []const u8 {
     return "";
 }
 
-fn forcedToolArgumentsJsonAlloc(allocator: std.mem.Allocator, first_arg_name: ?[]const u8, generated_text: []const u8) ![]u8 {
+pub fn forcedToolArgumentsJsonAlloc(allocator: std.mem.Allocator, first_arg_name: ?[]const u8, generated_text: []const u8) ![]u8 {
     var merged: std.ArrayList(u8) = .empty;
     defer merged.deinit(allocator);
 
@@ -5773,4 +5826,38 @@ test "findStreamingStopStart stops a tight loop in open reasoning but not distan
         "and interop with C headers works without writing bindings by hand because the compiler translates them directly, ";
     const distant = fact ++ near_filler ++ fact ++ far_filler ++ fact;
     try std.testing.expect(findStreamingStopStart(distant, chat_stop_strs[0..], true) == null);
+}
+
+test "native Qwen XML templates order tools and round trip OpenAI assistant history" {
+    const a = std.testing.allocator;
+    var parsed = try parseChatRequest(a,
+        \\{"messages":[{"role":"system","content":"Source changes only."},{"role":"user","content":"Read the file."},{"role":"assistant","content":null,"tool_calls":[{"id":"example","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"src/表.mjs\",\"offset\":2}"}}]},{"role":"tool","tool_call_id":"example","content":"file contents"}],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"integer"}}}}}],"tool_choice":"required"}
+    );
+    defer parsed.deinit();
+    var tok = makeTestTokenizer("<|im_start|> <function=example> <think>");
+    try std.testing.expect(tool_format.forTokenizer(&tok).native_xml);
+    try prepareChatForTokenizer(&parsed, &tok);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "<function=read>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "<parameter=offset>\n2\n</parameter>") != null);
+    const prompt = try allocChatPrompt(a, &tok, parsed.roles, parsed.contents, false, false, parsed.tools, parsed.tool_choice);
+    defer a.free(prompt);
+    const defs = std.mem.indexOf(u8, prompt, "# Tools").?;
+    const guidance = std.mem.indexOf(u8, prompt, "Source changes only.").?;
+    const user = std.mem.indexOf(u8, prompt, "Read the file.").?;
+    try std.testing.expect(defs < guidance and guidance < user);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<tool_response>\nfile contents") != null);
+    try std.testing.expect(!std.mem.endsWith(u8, prompt, "\"offset\":"));
+    tok.chat_template = "<|im_start|> {\"name\":\"example\"}";
+    try std.testing.expect(!tool_format.forTokenizer(&tok).native_xml);
+}
+
+fn checkNativeChatPromptAllocation(allocator: std.mem.Allocator) !void {
+    const tok = makeTestTokenizer("<|im_start|> <function=example>");
+    const tools = [_]tool_format.ToolDefinition{.{ .name = "read", .description = "Read a file.", .parameters_json = "{}" }};
+    const prompt = try allocChatPrompt(allocator, &tok, &.{ "system", "user" }, &.{ "Use tools.", "Read." }, false, false, &tools, .auto);
+    defer allocator.free(prompt);
+}
+
+test "native tool prompt allocations can be freed and clean up every failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkNativeChatPromptAllocation, .{});
 }
