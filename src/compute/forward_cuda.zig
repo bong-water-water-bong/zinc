@@ -721,6 +721,27 @@ pub const MtpPerf = struct {
     catchup_ms: f64,
 };
 
+const PromptCache = struct {
+    recurrent: []CudaBuffer,
+    conv: []CudaBuffer,
+    conv_off: []u32,
+    h: []f32,
+    tokens: []const u32 = &.{},
+    valid: bool = false,
+    force_block: bool = false,
+    mtp_primed: bool = false,
+
+    fn deinit(self: *PromptCache, a: std.mem.Allocator) void {
+        for (self.recurrent) |*b| buffer.freeBuffer(b);
+        for (self.conv) |*b| buffer.freeBuffer(b);
+        a.free(self.recurrent);
+        a.free(self.conv);
+        a.free(self.conv_off);
+        a.free(self.h);
+        a.free(self.tokens);
+    }
+};
+
 /// Per-token GPU forward state for qwen35 greedy decode.
 pub const ForwardCuda = struct {
     allocator: std.mem.Allocator,
@@ -961,6 +982,11 @@ pub const ForwardCuda = struct {
     force_block_ssm: bool = false,
     // Number of prompt rows already primed while bounded prefill chunks ran.
     mtp_prefill_tokens: usize = 0,
+    last_prefill_cached: usize = 0,
+    // Opt-in, single-slot prefix checkpoint. KV before the checkpoint remains
+    // in place; recurrent/conv state and the NextN cross-input are copied out
+    // before decode can advance them. Exact token equality guards every reuse.
+    prompt_cache: ?PromptCache = null,
 
     // Lazy fp16 weight cache for prefill GEMMs. Keyed by weight device-ptr.
     // On first prefill call, each Q4_K weight is dequanted to fp16 once and
@@ -1559,6 +1585,7 @@ pub const ForwardCuda = struct {
         @setEvalBranchQuota(2000);
         const a = self.allocator;
         self.freeBatch();
+        if (self.prompt_cache) |*cache| cache.deinit(a);
         if (self.mtp) |*state| state.deinit(a);
         if (self.graph) |g| shim.cuda_graph_free(g);
         for (&self.batch_graph) |*bg| if (bg.*) |g| shim.cuda_graph_free(g);
@@ -1621,6 +1648,7 @@ pub const ForwardCuda = struct {
     /// the existing state instead of allocating a second full KV cache.
     pub fn allocSlotState(self: *ForwardCuda, n_slots: u32, slot_ctx: u32) !void {
         if (n_slots == 0 or slot_ctx == 0) return error.InvalidSlotCapacity;
+        if (self.prompt_cache) |*cache| cache.valid = false;
         self.freeSlotState();
         errdefer self.freeSlotState();
         const ctx = self.ctx;
@@ -1908,14 +1936,22 @@ pub const ForwardCuda = struct {
 
     pub fn prefillBatched(self: *ForwardCuda, tokens: []const u32) !u32 {
         if (tokens.len == 0 or tokens.len > self.max_ctx) return error.InvalidPromptLength;
+        errdefer if (self.prompt_cache) |*cache| {
+            cache.valid = false;
+        };
         self.mtp_prefill_tokens = 0;
         if (self.mtp) |*state| state.primed = false;
         // Bound activations independently of the KV capacity. Chunk boundaries
         // retain SSM/conv state and use absolute RoPE/KV/causal positions.
         const chunk: usize = @max(@as(u32, 1), envU32("ZINC_PREFILL_CHUNK", 4096));
+        const cache_on = self.n_slots == 1 and envFlag("ZINC_PROMPT_CACHE", false);
+        self.last_prefill_cached = if (cache_on) try self.restorePromptPrefix(tokens) else 0;
+        // Leave the changing assistant/template suffix outside the checkpoint.
+        // Fixed chunk boundaries preserve the uncached operation order exactly.
+        const checkpoint = ((tokens.len -| 64) / chunk) * chunk;
         const prime_chunks = tokens.len > chunk and self.mtpEnabled() and !self.force_block_ssm;
         var next: u32 = 0;
-        var start: usize = 0;
+        var start: usize = self.last_prefill_cached;
         while (start < tokens.len) {
             const end = @min(tokens.len, start + chunk);
             next = try self.prefillBatchedRange(tokens[start..end], @intCast(start));
@@ -1923,9 +1959,97 @@ pub const ForwardCuda = struct {
                 _ = try self.mtpPrimeRange(tokens[start..end], @intCast(start));
                 self.mtp_prefill_tokens = end;
             }
+            if (cache_on and end == checkpoint) {
+                self.capturePromptPrefix(tokens[0..end]) catch |err| {
+                    if (self.prompt_cache) |*cache| cache.valid = false;
+                    try self.checkExecution();
+                    log.warn("Prompt checkpoint unavailable ({s}); continuing without reuse", .{@errorName(err)});
+                };
+            }
             start = end;
         }
         return next;
+    }
+
+    fn ensurePromptCache(self: *ForwardCuda) !*PromptCache {
+        if (self.prompt_cache) |*cache| return cache;
+        const a = self.allocator;
+        const d = self.d;
+        const rec = try a.alloc(CudaBuffer, d.n_layers);
+        @memset(rec, std.mem.zeroes(CudaBuffer));
+        errdefer {
+            for (rec) |*b| buffer.freeBuffer(b);
+            a.free(rec);
+        }
+        const conv = try a.alloc(CudaBuffer, d.n_layers);
+        @memset(conv, std.mem.zeroes(CudaBuffer));
+        errdefer {
+            for (conv) |*b| buffer.freeBuffer(b);
+            a.free(conv);
+        }
+        const offsets = try a.alloc(u32, self.conv_off.len);
+        errdefer a.free(offsets);
+        const h = try a.alloc(f32, d.n_embd);
+        errdefer a.free(h);
+        for (0..d.n_layers) |li| {
+            if (self.layer_is_attn[li]) continue;
+            rec[li] = try buffer.createBuffer(self.ctx, @as(usize, d.ssm_state_len) * @sizeOf(f32));
+            conv[li] = try buffer.createBuffer(self.ctx, @as(usize, d.conv_state_len) * @sizeOf(f32));
+        }
+        self.prompt_cache = .{ .recurrent = rec, .conv = conv, .conv_off = offsets, .h = h };
+        return &self.prompt_cache.?;
+    }
+
+    fn copyPromptState(self: *ForwardCuda, cache: *PromptCache, restore: bool) !void {
+        var cmd = try command.beginCommand(self.ctx);
+        for (0..self.d.n_layers) |li| {
+            if (self.layer_is_attn[li]) continue;
+            const rec = CopyPush{ .N = self.d.ssm_state_len };
+            const conv = CopyPush{ .N = self.d.conv_state_len };
+            const rec_src = if (restore) &cache.recurrent[li] else &self.ssm_state[li];
+            const rec_dst = if (restore) &self.ssm_state[li] else &cache.recurrent[li];
+            const conv_src = if (restore) &cache.conv[li] else &self.ssm_conv_state[li];
+            const conv_dst = if (restore) &self.ssm_conv_state[li] else &cache.conv[li];
+            cmd.dispatch(&self.pipes.copy_f32, .{ ceilDiv(rec.N, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ rec_src, rec_dst }, &rec, @sizeOf(CopyPush), 0);
+            cmd.dispatch(&self.pipes.copy_f32, .{ ceilDiv(conv.N, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ conv_src, conv_dst }, &conv, @sizeOf(CopyPush), 0);
+        }
+        cmd.commitAndWait();
+        try self.checkExecution();
+    }
+
+    fn capturePromptPrefix(self: *ForwardCuda, tokens: []const u32) !void {
+        const cache = try self.ensurePromptCache();
+        cache.valid = false;
+        const saved_tokens = try self.allocator.dupe(u32, tokens);
+        errdefer self.allocator.free(saved_tokens);
+        try self.copyPromptState(cache, false);
+        @memcpy(cache.conv_off, self.conv_off);
+        cache.force_block = self.force_block_ssm;
+        cache.mtp_primed = self.mtp != null and self.mtp.?.primed and !self.force_block_ssm;
+        if (cache.mtp_primed) @memcpy(cache.h, self.mtp.?.pending_h);
+        self.allocator.free(cache.tokens);
+        cache.tokens = saved_tokens;
+        cache.valid = true;
+    }
+
+    fn restorePromptPrefix(self: *ForwardCuda, tokens: []const u32) !usize {
+        const cache = if (self.prompt_cache) |*c| c else return 0;
+        const n = cache.tokens.len;
+        if (!cache.valid or n == 0 or n >= tokens.len or cache.force_block != self.force_block_ssm or
+            !std.mem.eql(u32, cache.tokens, tokens[0..@min(n, tokens.len)]))
+        {
+            // A cold prefill will overwrite prefix KV, invalidating the backup.
+            cache.valid = false;
+            return 0;
+        }
+        try self.copyPromptState(cache, true);
+        @memcpy(self.conv_off, cache.conv_off);
+        if (cache.mtp_primed) {
+            @memcpy(self.mtp.?.pending_h, cache.h);
+            self.mtp.?.primed = true;
+        }
+        log.info("Reused {d}/{d} prompt tokens from a recurrent checkpoint", .{ n, tokens.len });
+        return n;
     }
 
     fn prefillBatchedRange(self: *ForwardCuda, tokens: []const u32, base_position: u32) !u32 {
@@ -3722,6 +3846,13 @@ pub const ForwardCuda = struct {
     }
 
     pub fn decodeBatch(self: *ForwardCuda, tokens: []const u32, positions: []const u32, slots: []const u32, out: []u32) !void {
+        if (self.prompt_cache) |*cache| {
+            // Per-token fallback can overwrite prefix KV from position zero.
+            for (positions) |pos| if (pos < cache.tokens.len) {
+                cache.valid = false;
+                break;
+            };
+        }
         const d = self.d;
         const ctx = self.ctx;
         if (self.kv_k_slots == null) return error.SlotStateNotAllocated;

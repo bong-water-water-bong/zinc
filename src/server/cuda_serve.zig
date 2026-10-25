@@ -68,6 +68,13 @@ pub const Forward = union(enum) {
         if (shim.cuda_execution_failed(ctx) != 0) return error.GpuExecutionFailed;
     }
 
+    fn computedPrefillTokens(self: Forward, total: usize) usize {
+        return total -| switch (self) {
+            .gemma => @as(usize, 0),
+            .qwen => |q| q.last_prefill_cached,
+        };
+    }
+
     fn allocSlots(self: Forward, nslots: u32, slot_ctx: u32) !void {
         switch (self) {
             .gemma => |g| try g.allocSlotKv(nslots, slot_ctx),
@@ -404,11 +411,12 @@ pub const ServeEngine = struct {
             log.warn("request {d} batched prefill failed ({s}); using the slot path", .{ req.id, @errorName(err) });
             return false;
         };
+        const computed_tokens = self.fwd.computedPrefillTokens(np);
         if (timer_opt.*) |*tm| {
             const elapsed = tm.read() - pf_t0;
             _ = self.prefill_wall_ns.fetchAdd(elapsed, .monotonic);
-            _ = self.prefill_tokens.fetchAdd(np, .monotonic);
-            self.recordPrefillTiming(req.id, np, elapsed);
+            _ = self.prefill_tokens.fetchAdd(computed_tokens, .monotonic);
+            self.recordPrefillTiming(req.id, computed_tokens, elapsed);
         }
 
         // Priming reads the prompt rows the batched prefill just produced, so it
@@ -563,11 +571,12 @@ pub const ServeEngine = struct {
                 else
                     null;
                 if (batched_tok) |tok| {
+                    const computed_tokens = fwd.computedPrefillTokens(np);
                     if (timer_opt) |*tm| {
                         const elapsed = tm.read() - pf_t0;
                         _ = self.prefill_wall_ns.fetchAdd(elapsed, .monotonic);
-                        _ = self.prefill_tokens.fetchAdd(np, .monotonic);
-                        self.recordPrefillTiming(req.id, np, elapsed);
+                        _ = self.prefill_tokens.fetchAdd(computed_tokens, .monotonic);
+                        self.recordPrefillTiming(req.id, computed_tokens, elapsed);
                     }
                     req.appendToken(tok) catch {
                         self.failSlot(slot_id);

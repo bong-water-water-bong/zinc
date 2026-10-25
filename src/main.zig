@@ -2465,7 +2465,7 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         if (ch.finished) break;
     }
     const generated_tokens = chan.consumed;
-    logServeTimings(prompt_tokens.len, generated_tokens, chan.prefill_wall_ns, chan.decode_wall_ns);
+    logServeTimings(@intCast(chan.prefill_tokens), generated_tokens, chan.prefill_wall_ns, chan.decode_wall_ns);
     if (generation_failed) {
         log.warn("request {d} failed during GPU generation", .{id});
         if (stream_response) {

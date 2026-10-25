@@ -95,7 +95,7 @@ export function buildConfig(opts = {}) {
         top_p: 1,
         steps,
         prompt:
-          'Complete the coding task using the available tools. Read relevant files before editing. Make focused source changes, run the requested tests, and use their output to correct failures. Never change tests just to make them pass. Finish with a short report of the changes and actual test results.',
+          'Complete the coding task using the available tools. Read the relevant code in small ranges, then make a focused edit and run the requested tests before exploring further. Use compiler and test output to correct failures. Never change tests just to make them pass. Use portable paths in source, tests, and examples; do not copy this workspace path or private endpoints into them. Finish with a short report of the changes and actual test results.',
         permission: { task: 'deny', question: 'deny', webfetch: 'deny', websearch: 'deny' },
       },
     },
