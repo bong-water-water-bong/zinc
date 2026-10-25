@@ -46,16 +46,16 @@ ZINC is still a local single-process engine:
 
 ## Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/chat/completions` | Chat inference, streaming and non-streaming |
-| POST | `/v1/completions` | Raw text completion, non-streaming |
-| GET | `/v1/models` | Managed catalog, install state, active model, memory status |
-| POST | `/v1/models/pull` | Download an installed-compatible managed model asynchronously |
-| POST | `/v1/models/activate` | Activate an installed managed model |
-| POST | `/v1/models/remove` | Remove a cached managed model, optionally unloading it first |
-| GET | `/health` | Health, queue counters, uptime, GPU memory/context status |
-| GET | `/` or `/chat` | Built-in chat UI |
+| Method | Path                   | Description                                                   |
+| ------ | ---------------------- | ------------------------------------------------------------- |
+| POST   | `/v1/chat/completions` | Chat inference, streaming and non-streaming                   |
+| POST   | `/v1/completions`      | Raw text completion, non-streaming                            |
+| GET    | `/v1/models`           | Managed catalog, install state, active model, memory status   |
+| POST   | `/v1/models/pull`      | Download an installed-compatible managed model asynchronously |
+| POST   | `/v1/models/activate`  | Activate an installed managed model                           |
+| POST   | `/v1/models/remove`    | Remove a cached managed model, optionally unloading it first  |
+| GET    | `/health`              | Health, queue counters, uptime, GPU memory/context status     |
+| GET    | `/` or `/chat`         | Built-in chat UI                                              |
 
 ---
 
@@ -70,8 +70,8 @@ Generate a chat completion from a message list.
   "model": "qwen35-9b-q4k-m",
   "session_id": "chat-123",
   "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "What is the capital of France?"}
+    { "role": "system", "content": "You are a helpful assistant." },
+    { "role": "user", "content": "What is the capital of France?" }
   ],
   "max_tokens": 256,
   "temperature": 0.7,
@@ -81,27 +81,27 @@ Generate a chat completion from a message list.
 }
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | string | current model | Managed model id to use. If installed and different from the active model, the server activates it before generation. |
-| `session_id` | string | empty | Optional prompt-reuse key. Reusing a session id lets ZINC reuse the matching prefix for append-only chat histories. |
-| `messages` | array | required | OpenAI-style messages. `content` may be a string, `null`, or an array of text content blocks. Non-text blocks are ignored. |
-| `max_tokens` | integer | 256 | Maximum generated tokens before context-budget clamping. |
-| `temperature` | float | 0.0 | Sampling temperature. `0` uses greedy decoding. Values are clamped to `0..2`. |
-| `top_p` | float | 1.0 | Nucleus sampling threshold, clamped to `0..1`. |
-| `enable_thinking` | boolean | model default | For templates that support it, request an open thinking block. Catalog entries with unstable thinking force it off. Sending `false` also matters on the tool-calling path: without it, a request carrying `tools` gets a bare assistant header with nothing suppressing deliberation, and a thinking model can spend the whole `max_tokens` budget reasoning before it ever emits the tool call. |
-| `stream` | boolean | false | Enable Server-Sent Events streaming. |
-| `tools` | array | empty | OpenAI function-tool definitions. Rendered for ChatML/Qwen-style templates when tool calling is enabled. |
-| `tool_choice` | string or object | `auto` | `"none"` suppresses tool injection. `"auto"` and forced function-object choices are currently treated as automatic tool choice. |
+| Field             | Type             | Default       | Description                                                                                                                                                                                                                                                                                                                                                                                      |
+| ----------------- | ---------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `model`           | string           | current model | Managed model id to use. If installed and different from the active model, the server activates it before generation.                                                                                                                                                                                                                                                                            |
+| `session_id`      | string           | empty         | Optional prompt-reuse key. Reusing a session id lets ZINC reuse the matching prefix for append-only chat histories.                                                                                                                                                                                                                                                                              |
+| `messages`        | array            | required      | OpenAI-style messages. `content` may be a string, `null`, or an array of text content blocks. Non-text blocks are ignored.                                                                                                                                                                                                                                                                       |
+| `max_tokens`      | integer          | 256           | Maximum generated tokens before context-budget clamping.                                                                                                                                                                                                                                                                                                                                         |
+| `temperature`     | float            | 0.0           | Sampling temperature. `0` uses greedy decoding. Values are clamped to `0..2`.                                                                                                                                                                                                                                                                                                                    |
+| `top_p`           | float            | 1.0           | Nucleus sampling threshold, clamped to `0..1`.                                                                                                                                                                                                                                                                                                                                                   |
+| `enable_thinking` | boolean          | model default | For templates that support it, request an open thinking block. Catalog entries with unstable thinking force it off. Sending `false` also matters on the tool-calling path: without it, a request carrying `tools` gets a bare assistant header with nothing suppressing deliberation, and a thinking model can spend the whole `max_tokens` budget reasoning before it ever emits the tool call. |
+| `stream`          | boolean          | false         | Enable Server-Sent Events streaming.                                                                                                                                                                                                                                                                                                                                                             |
+| `tools`           | array            | empty         | OpenAI function-tool definitions. Rendered for ChatML/Qwen-style templates when tool calling is enabled.                                                                                                                                                                                                                                                                                         |
+| `tool_choice`     | string or object | `auto`        | `"none"` suppresses tool injection. `"auto"` and forced function-object choices are currently treated as automatic tool choice.                                                                                                                                                                                                                                                                  |
 
 Supported message roles:
 
-| Role | Description |
-|------|-------------|
-| `system` | System prompt. |
-| `user` | User message. |
-| `assistant` | Previous assistant response. May include historical `tool_calls`. |
-| `tool` | Tool result message with `tool_call_id`; rendered back into ChatML tool-response blocks for Qwen-style templates. |
+| Role        | Description                                                                                                       |
+| ----------- | ----------------------------------------------------------------------------------------------------------------- |
+| `system`    | System prompt.                                                                                                    |
+| `user`      | User message.                                                                                                     |
+| `assistant` | Previous assistant response. May include historical `tool_calls`.                                                 |
+| `tool`      | Tool result message with `tool_call_id`; rendered back into ChatML tool-response blocks for Qwen-style templates. |
 
 ### Tool Calling
 
@@ -121,7 +121,7 @@ Example request:
 ```json
 {
   "model": "qwen35-9b-q4k-m",
-  "messages": [{"role": "user", "content": "What time is it in UTC?"}],
+  "messages": [{ "role": "user", "content": "What time is it in UTC?" }],
   "tools": [
     {
       "type": "function",
@@ -131,7 +131,7 @@ Example request:
         "parameters": {
           "type": "object",
           "properties": {
-            "timezone": {"type": "string"}
+            "timezone": { "type": "string" }
           },
           "required": ["timezone"]
         }
@@ -260,13 +260,13 @@ Generate from a raw text prompt without applying a chat template.
 }
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | string | current model | Managed model id to use; may activate an installed model before generation. |
-| `prompt` | string | required | Raw text prompt. |
-| `max_tokens` | integer | 256 | Maximum generated tokens before context-budget clamping. |
-| `temperature` | float | accepted | Parsed for compatibility but not applied by this endpoint yet. |
-| `stream` | boolean | accepted | Parsed for compatibility but ignored; responses are non-streaming JSON. |
+| Field         | Type    | Default       | Description                                                                 |
+| ------------- | ------- | ------------- | --------------------------------------------------------------------------- |
+| `model`       | string  | current model | Managed model id to use; may activate an installed model before generation. |
+| `prompt`      | string  | required      | Raw text prompt.                                                            |
+| `max_tokens`  | integer | 256           | Maximum generated tokens before context-budget clamping.                    |
+| `temperature` | float   | accepted      | Parsed for compatibility but not applied by this endpoint yet.              |
+| `stream`      | boolean | accepted      | Parsed for compatibility but ignored; responses are non-streaming JSON.     |
 
 ### Response
 
@@ -294,6 +294,30 @@ Generate from a raw text prompt without applying a chat template.
 ---
 
 ## GET /v1/models
+
+CUDA/ROCm builds return a minimal list containing the loaded model:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "model.gguf",
+      "object": "model",
+      "created": 0,
+      "owned_by": "zinc",
+      "context_length": 32768
+    }
+  ]
+}
+```
+
+The ID is the file basename, including its extension. `context_length` is the
+capacity of one request slot. Parent directories are omitted. These backends
+do not expose managed catalog/download/activation routes. Live validation of
+this new discovery route is [pending test GPU recovery](ROCM_AGENT_CONTEXT.md#remaining-hardware-validation).
+
+Vulkan/Metal builds provide the fuller response below.
 
 List the managed catalog for the server's current GPU profile, including install
 state, active model, fit decisions, download progress, and active GPU memory
@@ -495,16 +519,16 @@ Errors use an OpenAI-style envelope:
 }
 ```
 
-| Status | Type | When |
-|--------|------|------|
-| 400 | `invalid_request_error` | Malformed JSON, missing required fields, invalid parameters, unknown model id for management operations, unsupported or non-fitting model activation. |
-| 400 | `context_length_exceeded` | Prompt exceeds the active model context capacity. |
-| 404 | `model_not_found` | Generation requested an unknown or not-installed managed model. |
-| 404 | `not_found` | Unknown endpoint. |
-| 409 | `invalid_request_error` | GPU already reserved, another model download is in progress, or removing the loaded model without `force: true`. |
-| 501 | `unsupported_operation` | Model-management endpoint used on a build/backend without management support. |
-| 503 | `service_unavailable` | Generation requested while no model is loaded. |
-| 500 | `internal_error` | Tokenization, GPU, inference, or response-size failure. |
+| Status | Type                      | When                                                                                                                                                  |
+| ------ | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `invalid_request_error`   | Malformed JSON, missing required fields, invalid parameters, unknown model id for management operations, unsupported or non-fitting model activation. |
+| 400    | `context_length_exceeded` | Prompt exceeds the active model context capacity.                                                                                                     |
+| 404    | `model_not_found`         | Generation requested an unknown or not-installed managed model.                                                                                       |
+| 404    | `not_found`               | Unknown endpoint.                                                                                                                                     |
+| 409    | `invalid_request_error`   | GPU already reserved, another model download is in progress, or removing the loaded model without `force: true`.                                      |
+| 501    | `unsupported_operation`   | Model-management endpoint used on a build/backend without management support.                                                                         |
+| 503    | `service_unavailable`     | Generation requested while no model is loaded.                                                                                                        |
+| 500    | `internal_error`          | Tokenization, GPU, inference, or response-size failure.                                                                                               |
 
 ## CORS And Connection Handling
 
@@ -536,14 +560,14 @@ Errors use an OpenAI-style envelope:
 ZINC loads GGUF models and supports the quantization families used by the
 managed catalog:
 
-| Format | Supported | Notes |
-|--------|-----------|-------|
-| Q4_K | Yes | Primary K-quant path |
-| Q5_K | Yes | K-quant path |
-| Q6_K | Yes | K-quant path |
-| Q8_0 | Yes | Common attention and projection path |
-| F16 | Yes | Small tensors and some model data |
-| F32 | Yes | Baseline/scalar tensor path |
+| Format | Supported | Notes                                |
+| ------ | --------- | ------------------------------------ |
+| Q4_K   | Yes       | Primary K-quant path                 |
+| Q5_K   | Yes       | K-quant path                         |
+| Q6_K   | Yes       | K-quant path                         |
+| Q8_0   | Yes       | Common attention and projection path |
+| F16    | Yes       | Small tensors and some model data    |
+| F32    | Yes       | Baseline/scalar tensor path          |
 
 Run `./zig-out/bin/zinc model list` or `GET /v1/models` for the exact catalog
 entries that are supported and fit on the current machine.

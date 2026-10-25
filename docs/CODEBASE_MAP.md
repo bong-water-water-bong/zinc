@@ -35,6 +35,7 @@ src/
 │   ├── chat.html                # Built-in chat UI (embedded at compile time)
 │   ├── http.zig                 # HTTP server and connection handling
 │   ├── model_manager.zig        # Hot model switching and catalog view
+│   ├── model_discovery.zig      # Minimal CUDA/ROCm loaded-model list serializer
 │   ├── runtime.zig              # Backend runtime dispatch
 │   └── session.zig              # Chat session state
 ├── vulkan/
@@ -186,17 +187,23 @@ dense FFN, and MoE branches live in the active backend's forward implementation.
 | Vulkan infrastructure                   | `src/vulkan/`, `src/shaders/*.comp`                                                  |
 | Metal infrastructure                    | `src/metal/`, `src/shaders/metal/*.metal`                                            |
 | CUDA infrastructure                     | `src/cuda/`                                                                          |
+| ROCm C ABI and execution errors         | `src/rocm/rocm_shim.c`, `src/cuda/command.zig`                                       |
+| Qwen chunked prefill and prompt reuse   | `src/compute/forward_cuda.zig`                                                       |
+| CUDA/ROCm scheduler and slot lifecycle  | `src/server/cuda_serve.zig`                                                          |
 | Backend abstraction and memory planning | `src/gpu/`                                                                           |
 
 ### Tests and performance tooling
 
-| Area                      | Start here                                |
-| ------------------------- | ----------------------------------------- |
-| Zig regression tests      | `src/regression_tests.zig`                |
-| Integration and API tests | `tests/`                                  |
-| Microbenchmarks           | `benchmarks/`, `src/bench_hot_decode.zig` |
-| Fair cross-backend suite  | `tools/performance_suite.mjs`             |
-| Optimization harnesses    | `loops/`                                  |
+| Area                                    | Start here                                |
+| --------------------------------------- | ----------------------------------------- |
+| Zig regression tests                    | `src/regression_tests.zig`                |
+| Integration and API tests               | `tests/`                                  |
+| Microbenchmarks                         | `benchmarks/`, `src/bench_hot_decode.zig` |
+| Fair cross-backend suite                | `tools/performance_suite.mjs`             |
+| ROCm attention CPU/GPU reference checks | `tools/validate_rocm_attention.c`         |
+| Exact-prefix cache parity               | `tools/validate_rocm_prompt_cache.mjs`    |
+| OpenCode setup and verified task rounds | `tools/setup_opencode.mjs`                |
+| Optimization harnesses                  | `loops/`                                  |
 
 Treat implementation source and command `--help` output as authoritative for
 current environment flags, thresholds, supported formats, and benchmark cases.

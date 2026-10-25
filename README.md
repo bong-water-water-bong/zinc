@@ -95,19 +95,24 @@ chat and streaming tool calls, and runs headless tasks:
 
 ```bash
 bun install --global opencode-ai@1.19.4
-bun tools/setup_opencode.mjs --project ../my-project --model qwen38-27b-q4k-m
+bun tools/setup_opencode.mjs --project ../my-project --model qwen38-27b-q4k-m --context 32768
 bun tools/setup_opencode.mjs check --project ../my-project
-bun tools/setup_opencode.mjs run --project ../my-project --auto -- "Fix the failing tests and run them."
+bun tools/setup_opencode.mjs run --project ../my-project --auto \
+  --verify 'bun test' -- "Fix the failing tests and run them."
 ```
 
-Start ZINC with `-c 16384` to match the default context, or pass the actual
-context to setup with `--context`. The config uses localhost; custom endpoints
+Start ZINC with `-c 32768 --parallel 1` to match this repository-task example.
+Setup defaults to 16K; always match the actual server context. Replace `bun test`
+with the project's acceptance command. Failed checks feed real diagnostics
+back into short editing rounds; a failed check cannot produce a successful
+harness exit. The config uses localhost; custom endpoints
 and API keys come from environment variables at runtime.
 [Setup, worktrees, and task evaluation](https://zolotukhin.ai/zinc/docs/opencode/) ·
 [Download the standalone script](https://zolotukhin.ai/zinc/harnesses/setup-opencode.mjs)
 
-The [full-worktree trial](docs/OPENCODE_WORKTREE_REPORT.md) records the current
-coding limitations separately from the passing fixture tests.
+The [full-worktree trial](docs/OPENCODE_WORKTREE_REPORT.md) records the original
+coding failures. The [ROCm follow-up](docs/ROCM_AGENT_CONTEXT.md) documents the
+memory/attention fixes, prompt reuse, and separate coding acceptance results.
 
 ## Inspect the performance
 

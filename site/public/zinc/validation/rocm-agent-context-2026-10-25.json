@@ -1,0 +1,195 @@
+{
+  "date": "2026-10-25",
+  "scope": "ROCm long-context execution and exact-prefix reuse; coding acceptance reported separately",
+  "stack": {
+    "gpu": "Radeon AI PRO R9700",
+    "vram_gb": 32,
+    "zig": "0.17.0",
+    "bun": "1.4.4",
+    "rocm": "7.2.4"
+  },
+  "source": {
+    "attention_and_memory": "eff7a952b7f3b3abca93df629592e498997efd22",
+    "fallback_reset": "5e50e29ce4ea14aae26d89b27ac27f53a9826841",
+    "prompt_cache": "6998550967a936b1ff130e2df12c98eeb25a1171",
+    "model_discovery": "0d0d3795ead5fe4330aa61eaa244b4fb8cc0b63b",
+    "verification_rounds": "18dd8b7b245c8c7037c36e0ec2ec937b37de93ea"
+  },
+  "attention": {
+    "passed": 25,
+    "failed": 0,
+    "static_shared_bytes": 4364,
+    "dynamic_shared_bytes": 0,
+    "absolute_tolerance": "0.0003 * (1 + abs(double_reference))",
+    "lengths": [
+      1,
+      1023,
+      1024,
+      1025,
+      4097,
+      8191,
+      8192,
+      8193,
+      16080,
+      16384,
+      16385,
+      32768
+    ],
+    "head_dimensions": [
+      64,
+      128,
+      256,
+      513
+    ],
+    "checks": [
+      "independent double CPU reference",
+      "legal original-kernel parity",
+      "causal prefill",
+      "nonzero speculative positions",
+      "permuted independent slots",
+      "attention sinks",
+      "custom scale",
+      "graph capture/update",
+      "output guards",
+      "sticky shared-memory rejection",
+      "sticky invalid-launch rejection"
+    ]
+  },
+  "full_model": {
+    "model": "qwen38-27b-q4k-m",
+    "context": 32768,
+    "mtp": true,
+    "parallel": 1,
+    "exact_key_prompt_tokens": [
+      8548,
+      17048,
+      30048
+    ],
+    "short_after_long": true,
+    "oversize_http_status": 400,
+    "request_after_rejection": true,
+    "gpu_execution_errors": 0
+  },
+  "fault_injection": {
+    "private_build_only": true,
+    "illegal_memory_access_injected": false,
+    "json_http_status": 500,
+    "health_http_status": 503,
+    "later_generation_http_status": 500,
+    "sse_error_without_success_finish": true,
+    "partial_prefill_fallback_exact_ordinary_decode_parity": true
+  },
+  "prefix_cache": {
+    "default_enabled": false,
+    "single_slot_only": true,
+    "models": [
+      "qwen35-9b-q4k-m",
+      "qwen38-27b-q4k-m"
+    ],
+    "cases_per_variant": 6,
+    "expected_cached_tokens": [
+      0,
+      8192,
+      0,
+      8192,
+      0,
+      0
+    ],
+    "exact_greedy_and_usage_parity": true,
+    "portable_validator_9b_requests_passed": 12,
+    "complex_request": {
+      "prompt_tokens": 25649,
+      "variants": [
+        "uncached first",
+        "uncached repeat",
+        "cache cold",
+        "cache warm"
+      ],
+      "exact_content_tools_finish_and_usage_parity": true,
+      "uncached_seconds": [
+        71.87,
+        71.69
+      ],
+      "cache_cold_seconds": 71.91,
+      "cache_warm_seconds": 26.22,
+      "timing_scope": "single-request diagnostic; not a headline performance comparison"
+    }
+  },
+  "process_ownership": {
+    "sequential_gpu_servers": true,
+    "all_completed_jobs_stopped_owned_servers": true
+  },
+  "coding_trials": [
+    {
+      "model": "27b",
+      "context": 32768,
+      "result": "supervisor-stopped",
+      "tool_calls": 22,
+      "feature_edits": 0,
+      "project_test_commands": 0
+    },
+    {
+      "model": "9b",
+      "context": 32768,
+      "result": "timeout",
+      "timeout_seconds": 900,
+      "tool_calls": 23,
+      "patch_compiled": false
+    },
+    {
+      "model": "9b",
+      "context": 32768,
+      "resumed": true,
+      "prompt_cache": true,
+      "result": "timeout",
+      "timeout_seconds": 1200,
+      "tool_calls": 141,
+      "patch_accepted": false
+    },
+    {
+      "model": "27b",
+      "context": 32768,
+      "supervised_repair": true,
+      "result": "timeout",
+      "timeout_seconds": 1200,
+      "tool_calls": 27,
+      "failed_independent_rounds": 2,
+      "agent_executed_protected_acceptance_passed": true,
+      "agent_executed_zig_tests_passed": 725,
+      "agent_executed_bun_tests_passed": 674,
+      "agent_executed_rocm_compile_passed": true,
+      "final_independent_wrapper_round_completed": false
+    }
+  ],
+  "current_cpu_checks": {
+    "serializer_tests_passed": 10,
+    "setup_wrapper_tests_passed": 19,
+    "combined_zig_bun_test_command": "pass",
+    "gpu_smoke_tests_in_local_command": "skipped",
+    "standalone_bun": {
+      "passed": 685,
+      "skipped": 6,
+      "failed": 0
+    }
+  },
+  "hardware_status": {
+    "gpu_resume": "failed",
+    "control_startup_error": "CudaNoDevice before model load",
+    "device_only_recovery": "unsuccessful; driver probe blocked",
+    "pending_checks": [
+      "latest discovery and managed-ID live HTTP",
+      "full-model multi-slot and graph cases",
+      "short-context regression matrix",
+      "successful live coding run with the latest round instructions"
+    ]
+  },
+  "final_rocm_build": {
+    "source": "18dd8b7b245c8c7037c36e0ec2ec937b37de93ea",
+    "zig": "0.17.0",
+    "backend": "rocm",
+    "optimize": "ReleaseFast",
+    "result": "pass",
+    "binary_sha256": "f1ad27db0de655c2cf85bc961635428115e26766562353f9bb06d42fee3268d3",
+    "gpu_execution": "pending device recovery"
+  }
+}

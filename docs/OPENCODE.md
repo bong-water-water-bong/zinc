@@ -16,7 +16,7 @@ Build for [your GPU](GETTING_STARTED.md), then start a Qwen model with enough
 context for source files, tool definitions, and tool results:
 
 ```bash
-./zig-out/bin/zinc --model-id qwen38-27b-q4k-m -c 16384 -p 9090 --parallel 1
+./zig-out/bin/zinc --model-id qwen38-27b-q4k-m -c 32768 -p 9090 --parallel 1
 ```
 
 The model must fit your GPU. Qwen 3.5 9B is a smaller starting point; Qwen 3.8
@@ -29,6 +29,12 @@ Use a server build with tool-call support. The setup check reports missing
 support before you start a coding task. ZINC generates tool calls; OpenCode
 reads files, edits code, and runs commands on the machine where OpenCode runs.
 
+For ROCm repository tasks, 32K context leaves more room for source and tool
+history. [Bounded prefill and attention](ROCM_AGENT_CONTEXT.md) have been checked
+with 27B prompts up to 30,048 tokens. Optional `ZINC_PROMPT_CACHE=1` reuses exact
+prefixes between single-slot Qwen requests. Neither a larger context nor a
+faster prefill establishes that the model will finish a coding task.
+
 ## Configure OpenCode
 
 From the ZINC checkout:
@@ -39,7 +45,7 @@ bun install --global opencode-ai@1.19.4
 bun tools/setup_opencode.mjs \
   --project ../my-project \
   --model qwen38-27b-q4k-m \
-  --context 16384
+  --context 32768
 
 bun tools/setup_opencode.mjs check --project ../my-project
 ```
@@ -49,7 +55,7 @@ with Bun:
 
 ```bash
 curl -fsS https://zolotukhin.ai/zinc/harnesses/setup-opencode.mjs -o setup-opencode.mjs
-bun setup-opencode.mjs --project ../my-project
+bun setup-opencode.mjs --project ../my-project --context 32768
 bun setup-opencode.mjs check --project ../my-project
 ```
 
@@ -64,7 +70,8 @@ The default limits are 16,384 context tokens, 4,096 output tokens per turn,
 and 24 agent steps. Match `--context` to the actual server context; it is not
 a request to allocate more memory on the server. Use `--output` and `--steps`
 to change the other limits. A coding session needs at least 8,192 tokens;
-16,384 gives the tool definitions and multi-file tasks more room. At smaller
+16,384 fits the fixture tasks; use 32,768 for substantial repository work when
+the model and cache fit your GPU. At smaller
 context limits, the default output budget is one quarter of the context.
 
 The configuration uses `@ai-sdk/openai-compatible`, keeps both the main model
@@ -93,6 +100,26 @@ its JSON events.
 `--auto` lets OpenCode approve tool requests for this headless run; explicit
 deny rules still apply. Use a disposable checkout for evaluation tasks.
 
+To enforce a project check between editing rounds, pass `--verify`:
+
+```bash
+bun tools/setup_opencode.mjs run --project ../my-project --auto \
+  --verify 'bun test' --attempts 3 --timeout-ms 1200000 -- \
+  "Implement the agreed feature and pass the project tests."
+```
+
+The caller-supplied command runs in the selected project after each successful
+OpenCode round. A failed check feeds real diagnostic excerpts back into the same
+session. Feedback is bounded, retaining the start, selected error lines, and end
+of a long log; the complete check output still streams to stderr.
+Each editing round is capped at eight model steps; `--attempts` defaults to
+three and allows at most ten. The timeout covers the entire operation,
+including checks. Model errors, interrupted/timed-out checks, and exhausted
+attempts return a failure. Only a zero check status produces success.
+Choose a check that actually covers the requested feature, and protect
+acceptance tests when evaluating a model. The command is used at runtime and
+is not written into the portable configuration.
+
 For an interactive session, change into your project and select the generated
 configuration:
 
@@ -116,10 +143,10 @@ With a model server already running at the matching context limit:
 ```bash
 git worktree add -b experiment/opencode ../zinc-opencode HEAD
 bun tools/setup_opencode.mjs --project ../zinc-opencode \
-  --context 16384 --output 3072 --steps 48
+  --context 32768 --output 3072 --steps 24
 bun tools/setup_opencode.mjs check --project ../zinc-opencode
 bun tools/setup_opencode.mjs run --project ../zinc-opencode \
-  --auto --timeout-ms 600000 -- \
+  --auto --timeout-ms 1200000 --verify './scripts/zig.sh build test' -- \
   "Implement the agreed feature. Read source in ranges of at most 80 lines, edit the code, and run the CPU unit tests. Follow AGENTS.md. Do not start model servers or commit changes. Report actual test results."
 git -C ../zinc-opencode diff --stat
 git -C ../zinc-opencode diff
@@ -140,6 +167,12 @@ returned exit status zero without completing the task. The earlier fixture
 results remain separate from this repository-level result. See the
 [worktree report](OPENCODE_WORKTREE_REPORT.md) and
 [ROCm context limits](ROCM.md#long-coding-sessions).
+
+The [follow-up](ROCM_AGENT_CONTEXT.md#repository-coding-result) fixes the backend
+memory/attention failures and records further supervised attempts. The latest
+27B repair produced code passing CPU tests and ROCm compilation, but the overall
+verified run still timed out. A later GPU power-resume failure blocks the next
+live acceptance run. General repository coding remains a supervised workflow.
 
 ## Use your own endpoint
 

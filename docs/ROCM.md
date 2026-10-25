@@ -136,10 +136,13 @@ build; its compatibility symbols are intentionally inert.
 
 ## API client notes
 
-The ROCm server currently exposes the generation routes and a minimal `/health`
-response. It does not provide the full Vulkan/Metal model-manager and browser
-chat interface, `/v1/models`, or scheduler metadata. Use the default Vulkan or
-Metal build for the browser-chat walkthrough.
+The ROCm server exposes generation, `/health`, `/stats`, and a minimal
+`GET /v1/models` list for its loaded model. Discovery includes only the model's
+basename, fixed ownership/creation fields, and per-slot context capacity; it
+does not expose parent directories. It does not provide the full Vulkan/Metal
+model-manager or browser chat interface. Use the default Vulkan or Metal build
+for the browser-chat walkthrough. Live discovery/managed-ID checks for the
+latest changes are pending the [test GPU's recovery](ROCM_AGENT_CONTEXT.md#remaining-hardware-validation).
 
 Send `stream: false` explicitly for a JSON response; this handler defaults to
 streaming. SSE replies now include finish reasons and usage. Qwen chat supports
@@ -150,16 +153,17 @@ JSON and streaming generation checks with the explicit stream setting. See the
 for the earlier parity tests and generic SDK-suite limitation.
 
 The [OpenCode harness guide](OPENCODE.md) provides a portable setup script and
-headless task/API checks. Start the server with `--context 16384 --parallel 1`
-to match its default configuration. The recurrent prefill scan stages its
+headless task/API checks. For repository tasks, start the server with
+`--context 32768 --parallel 1` and pass the same context to the setup script.
+The recurrent prefill scan stages its
 gate/beta values in bounded tiles, allowing agent prompts above the previous
 8K shared-memory limit. Streaming clients can cancel a request without keeping
 its slot occupied for the rest of the output budget.
 
 ### Long coding sessions
 
-The fixture checks use a 16K server context, but do not validate requests near
-its full capacity. A full Zinc worktree experiment on the R9700 exposed limits
+The initial fixture checks used a 16K server context and did not validate
+requests near its full capacity. A full Zinc worktree experiment exposed limits
 beyond those fixtures: the 27B model ran out of
 VRAM during prefill with a 32K allocation, and the 9B model's decode attention
 kernel exceeded the GPU's shared-memory limit once its prompt crossed 16K.
@@ -167,15 +171,27 @@ That kernel failure produced corrupted text even though the HTTP request and
 OpenCode process completed successfully. A later 27B run at 16K also failed:
 `attention_causal_batched_v2` requested a 65,612-byte group segment at 16,080
 prompt tokens, followed by illegal-memory and rocBLASLt/Tensile errors.
-Larger advertised context alone does not establish that a coding session works.
+The [follow-up fixes and validation](ROCM_AGENT_CONTEXT.md) replace the full-score
+attention allocation above 8K with bounded tiles, chunk prefill scratch, and
+remove duplicate single-slot state. The 27B model now passes exact-key probes
+at 8,548, 17,048, and 30,048 prompt tokens with a 32K context and NextN enabled.
+GPU execution failures also fail generation and health checks explicitly.
+These execution checks remain separate from repository coding acceptance.
+
+Prefill defaults to chunks of 4,096 tokens. `ZINC_PREFILL_CHUNK=<positive count>`
+changes the scratch bound; larger chunks consume more VRAM. Optional
+`ZINC_PROMPT_CACHE=1` reuses exact prefixes for single-slot Qwen requests by
+restoring recurrent checkpoints. It defaults off and requires additional VRAM;
+see the follow-up for parity checks and the portable cache validator.
 
 Keep repository instructions concise and read source in small line ranges.
 OpenCode 1.19.4's [built-in file reader](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/tool/read.ts) has an independent 50KB cap, which can
 overflow a local model's context when reading large files. Its general
 `tool_output` setting does not constrain that reader, as the
 [tool wrapper](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/tool/tool.ts) skips results already marked by the reader. Keep checking the worktree
-diff, server log, and project tests independently. Bounded prefill and decode
-attention near and beyond 16K remain open ROCm issues.
+diff, server log, and project tests independently. The setup script's
+`run --verify '<project check>'` mode enforces checks between short editing
+rounds and returns failure when they do not pass.
 
 ## Fair llama.cpp comparison
 

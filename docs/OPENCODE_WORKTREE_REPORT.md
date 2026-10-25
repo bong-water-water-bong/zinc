@@ -1,5 +1,9 @@
 # OpenCode full-worktree trial
 
+This is the original failed trial. The later
+[ROCm context and harness follow-up](ROCM_AGENT_CONTEXT.md) records the backend
+fixes and subsequent acceptance results; it does not change these outcomes.
+
 On 2026-10-25, OpenCode 1.19.4 was assigned a real Zinc feature in a complete
 Git worktree based on `09b802de`: add loaded-model discovery to the minimal
 ROCm/CUDA HTTP server. The task required an OpenAI-compatible `GET /v1/models`
