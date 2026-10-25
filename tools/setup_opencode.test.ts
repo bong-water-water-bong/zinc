@@ -9,6 +9,8 @@ import {
   CONFIG_NAME,
   parseArgs,
   runOpenCode,
+  runVerification,
+  runVerifiedOpenCode,
   runtimeConfig,
   writeConfig,
 } from './setup_opencode.mjs';
@@ -190,6 +192,169 @@ describe('portable OpenCode setup', () => {
     );
     expect(code).toBe(1);
     expect(output).toContain('APIError');
+  });
+});
+
+describe('independent verification', () => {
+  const quiet = { write: () => {} } as any;
+
+  test('feeds a failing check into the same session and accepts only a passing check', async () => {
+    const config = buildConfig({ steps: 64 });
+    const before = JSON.stringify(config);
+    const rounds: any[] = [];
+    let checks = 0;
+    const code = await runVerifiedOpenCode(
+      config,
+      {
+        project: '.',
+        prompt: ['Implement the feature'],
+        verify: 'project-tests',
+        attempts: 3,
+      },
+      {
+        stderr: quiet,
+        runModel: async (live, opts, deps) => {
+          rounds.push({ live, opts });
+          deps.onEvent({ sessionID: 'ses_verified' });
+          return 0;
+        },
+        runCheck: async (command) => {
+          expect(command).toBe('project-tests');
+          checks++;
+          return checks === 1
+            ? { code: 1, output: 'compiler: missing route implementation' }
+            : { code: 0, output: 'tests passed' };
+        },
+      },
+    );
+    expect(code).toBe(0);
+    expect(checks).toBe(2);
+    expect(rounds).toHaveLength(2);
+    expect(rounds[0].live.agent.zinc.steps).toBe(8);
+    expect(rounds[1].opts.session).toBe('ses_verified');
+    expect(rounds[1].opts.prompt[0]).toContain('compiler: missing route implementation');
+    expect(rounds[1].opts.prompt[0]).toContain('Implement the feature');
+    expect(JSON.stringify(config)).toBe(before);
+  });
+
+  test('never turns failed checks or model errors into success', async () => {
+    const opts = { project: '.', prompt: ['task'], verify: 'check', attempts: 2 };
+    let checks = 0;
+    const failing = await runVerifiedOpenCode(buildConfig(), opts, {
+      stderr: quiet,
+      runModel: async (_config, _opts, deps) => {
+        deps.onEvent({ sessionID: 'ses_failed' });
+        return 0;
+      },
+      runCheck: async () => {
+        checks++;
+        return { code: 7, output: 'failed assertion' };
+      },
+    });
+    expect(failing).toBe(7);
+    expect(checks).toBe(2);
+    const modelError = await runVerifiedOpenCode(buildConfig(), opts, {
+      stderr: quiet,
+      runModel: async () => 1,
+      runCheck: async () => {
+        throw new Error('verification must not mask an API error');
+      },
+    });
+    expect(modelError).toBe(1);
+  });
+
+  test('captures real command failure output without running OpenCode', async () => {
+    const dir = await temp();
+    const checked = await runVerification(
+      'printf "compiler diagnostic"; exit 7',
+      { project: dir, timeoutMs: 5000 },
+      { stderr: quiet },
+    );
+    expect(checked.code).toBe(7);
+    expect(checked.output).toBe('compiler diagnostic');
+  });
+
+  test('bounds feedback while retaining the first diagnostic and final summary', async () => {
+    const checked = await runVerification(
+      'literal command',
+      { project: '.', timeoutMs: 1000 },
+      {
+        stderr: quiet,
+        spawnImpl: (() => {
+          const child: any = new EventEmitter();
+          child.stdout = new EventEmitter();
+          child.stderr = new EventEmitter();
+          queueMicrotask(() => {
+            child.stderr.emit(
+              'data',
+              Buffer.from('FIRST ERROR\n' + 'x'.repeat(20000) + '\nFINAL SUMMARY'),
+            );
+            child.emit('close', 1, null);
+          });
+          return child;
+        }) as any,
+      },
+    );
+    expect(checked.output).toStartWith('FIRST ERROR');
+    expect(checked.output).toEndWith('FINAL SUMMARY');
+    expect(checked.output.length).toBeLessThan(8100);
+  });
+
+  test('terminates a timed-out verifier and preserves timeout exit status', async () => {
+    const signals: string[] = [];
+    const checked = await runVerification(
+      'checks',
+      { project: '.', timeoutMs: 10 },
+      {
+        stderr: quiet,
+        spawnImpl: (() => {
+          const child: any = new EventEmitter();
+          child.kill = (signal: string) => {
+            signals.push(signal);
+            queueMicrotask(() => child.emit('close', null, signal));
+          };
+          return child;
+        }) as any,
+      },
+    );
+    expect(checked.code).toBe(124);
+    expect(signals).toEqual(['SIGTERM']);
+    expect(
+      parseArgs(['run', '--verify', 'bun test', '--attempts', '2', '--', 'task']).attempts,
+    ).toBe(2);
+  });
+
+  test('an interrupted child exiting zero cannot produce success', async () => {
+    for (const [signal, expected] of [
+      ['SIGINT', 130],
+      ['SIGTERM', 143],
+    ] as const) {
+      const spawnImpl = (() => {
+        const child: any = new EventEmitter();
+        child.kill = () => queueMicrotask(() => child.emit('close', 0, null));
+        queueMicrotask(() => process.emit(signal));
+        return child;
+      }) as any;
+      const checked = await runVerification(
+        'checks',
+        { project: '.', timeoutMs: 1000 },
+        {
+          spawnImpl,
+          stderr: quiet,
+        },
+      );
+      expect(checked.code).toBe(expected);
+      const code = await runOpenCode(
+        buildConfig(),
+        {
+          project: '.',
+          prompt: ['task'],
+          timeoutMs: 1000,
+        },
+        { spawnImpl, stdout: quiet, env: {} },
+      );
+      expect(code).toBe(expected);
+    }
   });
 });
 

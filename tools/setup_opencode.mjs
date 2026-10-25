@@ -48,11 +48,15 @@ export function parseArgs(argv = process.argv.slice(2)) {
       '--steps': 'steps',
       '--timeout-ms': 'timeoutMs',
       '--session': 'session',
+      '--verify': 'verify',
+      '--attempts': 'attempts',
     }[arg];
     if (!key) throw new Error(`Unknown option: ${arg}`);
     const value = args[++i];
     if (!value || value.startsWith('--')) throw new Error(`Missing value for ${arg}`);
-    opts[key] = ['context', 'output', 'steps', 'timeoutMs'].includes(key) ? Number(value) : value;
+    opts[key] = ['context', 'output', 'steps', 'timeoutMs', 'attempts'].includes(key)
+      ? Number(value)
+      : value;
   }
   return opts;
 }
@@ -260,7 +264,7 @@ export async function checkServer(config, { env = process.env, fetchImpl = fetch
 export async function runOpenCode(
   config,
   opts,
-  { env = process.env, spawnImpl = spawn, stdout = process.stdout } = {},
+  { env = process.env, spawnImpl = spawn, stdout = process.stdout, onEvent } = {},
 ) {
   if (!opts.prompt.length) throw new Error('Pass a task after --');
   const timeoutMs = opts.timeoutMs ?? 900000;
@@ -298,7 +302,9 @@ export async function runOpenCode(
   const decoder = new TextDecoder();
   const inspectLine = (line) => {
     try {
-      if (JSON.parse(line).type === 'error') agentError = true;
+      const event = JSON.parse(line);
+      if (event.type === 'error') agentError = true;
+      onEvent?.(event);
     } catch {
       /* Other CLI output is forwarded verbatim. */
     }
@@ -322,14 +328,22 @@ export async function runOpenCode(
     } else child.kill(signal);
   };
   let timedOut = false;
+  let interruptedCode;
   let killTimer;
   const timer = setTimeout(() => {
     timedOut = true;
     stop('SIGTERM');
     killTimer = setTimeout(() => stop('SIGKILL'), 5000);
   }, timeoutMs);
-  const onInt = () => stop('SIGINT');
-  const onTerm = () => stop('SIGTERM');
+  const interrupt = (signal, code) => {
+    interruptedCode = code;
+    clearTimeout(timer);
+    clearTimeout(killTimer);
+    stop(signal);
+    killTimer = setTimeout(() => stop('SIGKILL'), 5000);
+  };
+  const onInt = () => interrupt('SIGINT', 130);
+  const onTerm = () => interrupt('SIGTERM', 143);
   process.on('SIGINT', onInt);
   process.on('SIGTERM', onTerm);
   try {
@@ -340,9 +354,10 @@ export async function runOpenCode(
         resolve(
           timedOut
             ? 124
-            : code === 0 && agentError
-              ? 1
-              : (code ?? (signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1)),
+            : (interruptedCode ??
+                (code === 0 && agentError
+                  ? 1
+                  : (code ?? (signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1)))),
         );
       });
     });
@@ -352,6 +367,143 @@ export async function runOpenCode(
     clearTimeout(timer);
     clearTimeout(killTimer);
   }
+}
+
+export async function runVerification(
+  command,
+  opts,
+  { env = process.env, spawnImpl = spawn, stderr = process.stderr } = {},
+) {
+  const timeoutMs = opts.timeoutMs ?? 900000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)
+    throw new Error('Timeout must be a positive integer');
+  const shell = process.platform === 'win32' ? env.ComSpec || 'cmd.exe' : '/bin/sh';
+  const args = process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-c', command];
+  const child = spawnImpl(shell, args, {
+    cwd: path.resolve(opts.project),
+    env,
+    detached: process.platform !== 'win32',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let head = '',
+    tail = '',
+    truncated = false;
+  const decoders = [new TextDecoder(), new TextDecoder()];
+  const append = (text) => {
+    if (!truncated) {
+      head += text;
+      if (head.length > 8000) {
+        tail = head.slice(-4000);
+        head = head.slice(0, 4000);
+        truncated = true;
+      }
+    } else tail = (tail + text).slice(-4000);
+  };
+  for (const [i, stream] of [child.stdout, child.stderr].entries())
+    stream?.on('data', (chunk) => {
+      stderr.write(chunk);
+      append(decoders[i].decode(chunk, { stream: true }));
+    });
+  const stop = (signal) => {
+    if (child.pid && process.platform !== 'win32') {
+      try {
+        process.kill(-child.pid, signal);
+      } catch (error) {
+        if (error.code !== 'ESRCH') throw error;
+      }
+    } else child.kill(signal);
+  };
+  let timedOut = false,
+    killTimer,
+    interruptedCode;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    stop('SIGTERM');
+    killTimer = setTimeout(() => stop('SIGKILL'), 5000);
+  }, timeoutMs);
+  const interrupt = (signal, code) => {
+    interruptedCode = code;
+    clearTimeout(timer);
+    clearTimeout(killTimer);
+    stop(signal);
+    killTimer = setTimeout(() => stop('SIGKILL'), 5000);
+  };
+  const onInt = () => interrupt('SIGINT', 130);
+  const onTerm = () => interrupt('SIGTERM', 143);
+  process.on('SIGINT', onInt);
+  process.on('SIGTERM', onTerm);
+  try {
+    const code = await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) =>
+        resolve(
+          timedOut
+            ? 124
+            : (interruptedCode ??
+                code ??
+                (signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1)),
+        ),
+      );
+    });
+    for (const decoder of decoders) append(decoder.decode());
+    return { code, output: truncated ? `${head}\n[verification output truncated]\n${tail}` : head };
+  } finally {
+    process.off('SIGINT', onInt);
+    process.off('SIGTERM', onTerm);
+    clearTimeout(timer);
+    clearTimeout(killTimer);
+  }
+}
+
+export async function runVerifiedOpenCode(config, opts, deps = {}) {
+  if (!opts.verify?.trim()) throw new Error('Verification requires a nonempty command');
+  const attempts = opts.attempts ?? 3;
+  if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > 10)
+    throw new Error('Attempts must be between 1 and 10');
+  const timeout = opts.timeoutMs ?? 900000;
+  if (!Number.isSafeInteger(timeout) || timeout <= 0)
+    throw new Error('Timeout must be a positive integer');
+  const deadline = Date.now() + timeout;
+  const roundConfig = structuredClone(config);
+  roundConfig.agent.zinc.steps = Math.min(roundConfig.agent.zinc.steps, 8);
+  let session = opts.session;
+  let prompt = opts.prompt;
+  let last = 1;
+  const executeModel = deps.runModel ?? runOpenCode;
+  const executeVerification = deps.runCheck ?? runVerification;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return 124;
+    const code = await executeModel(
+      roundConfig,
+      { ...opts, session, prompt, timeoutMs: remaining },
+      {
+        ...deps,
+        onEvent: (event) => {
+          if (event.sessionID) session = event.sessionID;
+          deps.onEvent?.(event);
+        },
+      },
+    );
+    if (code !== 0) return code;
+    const checkBudget = deadline - Date.now();
+    if (checkBudget <= 0) return 124;
+    const checked = await executeVerification(
+      opts.verify,
+      { project: opts.project, timeoutMs: checkBudget },
+      deps,
+    );
+    (deps.stderr ?? process.stderr).write(
+      `Verification round ${attempt}/${attempts}: ${checked.code === 0 ? 'passed' : 'failed'}\n`,
+    );
+    if (checked.code === 0) return 0;
+    last = checked.code;
+    if ([124, 130, 143].includes(last) || !session) return last;
+    prompt = [
+      `Continue the coding task. Independent verification failed with exit ${checked.code}. Fix the implementation using this actual output; do not weaken tests or remove checks. Run the verification command before further broad exploration.\n\nOriginal task:\n${opts.prompt.join(' ')}\n\nVerification command:\n${opts.verify}\n\nActual output:\n${checked.output}`,
+    ];
+  }
+  return last;
 }
 
 async function main() {
@@ -375,6 +527,8 @@ async function main() {
   --steps N         Maximum agent steps (default: 24)
   --timeout-ms N    Task timeout (default: 900000; timeout exits 124)
   --session ID      Continue the session ID from a previous JSON event
+  --verify CMD      Run this shell command between short editing rounds (run only)
+  --attempts N      Maximum verified editing rounds (default: 3; maximum: 10)
   --force           Replace only opencode.zinc.json
   --auto            Approve headless tool requests; explicit denies still apply
 
@@ -391,6 +545,9 @@ Interactive: OPENCODE_CONFIG=./opencode.zinc.json opencode
 `);
     return;
   }
+  if ((opts.verify || opts.attempts !== undefined) && opts.command !== 'run')
+    throw new Error('Verification options are only available for run');
+  if (opts.attempts !== undefined && !opts.verify) throw new Error('Attempts requires --verify');
   if (opts.command === 'setup') {
     await writeConfig(opts.project, buildConfig(opts), opts);
     console.log(
@@ -404,7 +561,9 @@ Interactive: OPENCODE_CONFIG=./opencode.zinc.json opencode
   if (opts.command === 'check') {
     console.log(JSON.stringify(await checkServer(config)));
   } else {
-    process.exitCode = await runOpenCode(config, opts);
+    process.exitCode = await (opts.verify
+      ? runVerifiedOpenCode(config, opts)
+      : runOpenCode(config, opts));
   }
 }
 
@@ -412,7 +571,7 @@ if (import.meta.main)
   main().catch((error) => {
     // Do not print fetch/child errors that could include a private URL or token.
     const known =
-      /^(Bun 1\.4\.4|Unknown option:|Missing value for|Use a model ID|Context must|Output must|Steps must|Timeout must|ZINC_API_BASE_URL|ZINC .*check|ZINC returned|Pass a task)/.test(
+      /^(Bun 1\.4\.4|Unknown option:|Missing value for|Use a model ID|Context must|Output must|Steps must|Timeout must|Verification |Attempts |ZINC_API_BASE_URL|ZINC .*check|ZINC returned|Pass a task)/.test(
         error.message,
       );
     console.error(
