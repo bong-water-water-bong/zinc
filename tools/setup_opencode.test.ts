@@ -193,6 +193,42 @@ describe('portable OpenCode setup', () => {
     expect(code).toBe(1);
     expect(output).toContain('APIError');
   });
+
+  test('captures CLI diagnostics separately from the JSON event stream', async () => {
+    let stdout = '',
+      stderr = '';
+    const code = await runOpenCode(
+      buildConfig(),
+      { project: '.', prompt: ['task'] },
+      {
+        env: {},
+        stdout: {
+          write: (chunk) => {
+            stdout += chunk.toString();
+          },
+        } as any,
+        stderr: {
+          write: (chunk) => {
+            stderr += chunk.toString();
+          },
+        } as any,
+        spawnImpl: (() => {
+          const child: any = new EventEmitter();
+          child.stdout = new EventEmitter();
+          child.stderr = new EventEmitter();
+          queueMicrotask(() => {
+            child.stderr.emit('data', Buffer.from('CLI diagnostic\n'));
+            child.stdout.emit('data', Buffer.from('{"type":"step_finish"}\n'));
+            child.emit('close', 0, null);
+          });
+          return child;
+        }) as any,
+      },
+    );
+    expect(code).toBe(0);
+    expect(JSON.parse(stdout)).toEqual({ type: 'step_finish' });
+    expect(stderr).toBe('CLI diagnostic\n');
+  });
 });
 
 describe('independent verification', () => {

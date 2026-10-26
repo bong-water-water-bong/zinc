@@ -212,6 +212,26 @@ ssh -N -L 9090:127.0.0.1:9090 \
   "${ZINC_USER:?Set your SSH user}@${ZINC_HOST:?Set your SSH host}"
 ```
 
+## Check the harness without a model
+
+In a ZINC checkout, run the actual OpenCode CLI against local scripted responses:
+
+```bash
+bun tools/validate_opencode_harness.mjs --output /tmp/zinc-harness-check
+```
+
+This checks timeout/repair in the same session, independent failing/passing
+checks, and fatal API errors that must skip verification. The acceptance test
+and portable configuration must remain unchanged. It needs Bun and an installed
+OpenCode CLI; `--opencode FILE` or `OPENCODE_BIN` selects a different executable.
+CI runs it with OpenCode 1.19.4.
+
+Choose a fresh output directory. Its `result.json` contains portable outcomes;
+raw event and check logs stay in that directory. The default fixture includes
+an intentional 15-second stall. No model performs inference in these checks,
+and the results do not establish coding quality or inference performance.
+Use the live-server evaluation below for those questions.
+
 ## Evaluate coding tasks
 
 Run the reproducible evaluation against an already running server:

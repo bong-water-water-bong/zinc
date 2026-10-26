@@ -279,7 +279,13 @@ export async function checkServer(config, { env = process.env, fetchImpl = fetch
 export async function runOpenCode(
   config,
   opts,
-  { env = process.env, spawnImpl = spawn, stdout = process.stdout, onEvent } = {},
+  {
+    env = process.env,
+    spawnImpl = spawn,
+    stdout = process.stdout,
+    stderr = process.stderr,
+    onEvent,
+  } = {},
 ) {
   requireTask(opts);
   const timeoutMs = timeoutValue(opts.timeoutMs ?? 900000);
@@ -307,7 +313,7 @@ export async function runOpenCode(
       OPENCODE_CONFIG_CONTENT: JSON.stringify(live),
       OPENCODE_DISABLE_AUTOUPDATE: 'true',
     },
-    stdio: ['inherit', 'pipe', 'inherit'],
+    stdio: ['inherit', 'pipe', 'pipe'],
     detached: process.platform !== 'win32',
   });
   let agentError = false;
@@ -335,6 +341,7 @@ export async function runOpenCode(
   };
   let pending = '';
   const decoder = new TextDecoder();
+  child.stderr?.on('data', (chunk) => stderr.write(chunk));
   const inspectLine = (line) => {
     try {
       const event = JSON.parse(line);
