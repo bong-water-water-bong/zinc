@@ -168,6 +168,7 @@ export function parseArgs(argv) {
     rdnaStartLlama: false,
     rdnaNode: process.env.ZINC_RDNA_NODE ?? process.env.ZINC_NODE ?? null,
     rdnaBackend: process.env.ZINC_RDNA_BACKEND ?? 'vulkan',
+    rdnaContext: null,
     rdnaVkDevice:
       process.env.ZINC_RDNA_VK_DEVICE != null
         ? parseInteger(process.env.ZINC_RDNA_VK_DEVICE, 'ZINC_RDNA_VK_DEVICE')
@@ -287,6 +288,13 @@ export function parseArgs(argv) {
       case '--rdna-backend':
         args.rdnaBackend = argv[++i] ?? args.rdnaBackend;
         break;
+      case '--rdna-context': {
+        const context = Number(argv[++i]);
+        if (!Number.isSafeInteger(context) || context < 1 || context > 4294967295)
+          throw new Error('--rdna-context must be a positive 32-bit integer');
+        args.rdnaContext = context;
+        break;
+      }
       case '--intel-sync':
         args.intelSync = true;
         break;
@@ -417,8 +425,9 @@ function usage() {
   --local-model-root <path>   Override local GGUF cache root
   --rdna-model-root <path>    Override remote model root
   --rdna-workdir <path>       Override remote ZINC checkout path
-  --rdna-vk-device <n>        Vulkan device index on the RDNA node (default 0; env: ZINC_RDNA_VK_DEVICE).
-                              Use 'vulkaninfo --summary' on the node to pick the discrete GPU.
+  --rdna-vk-device <n>        GPU index: Vulkan, or ROCr with the ROCm backend (default 0).
+                              Use vulkaninfo for Vulkan, or rocminfo for ROCm.
+  --rdna-context <n>          Context per slot for both RDNA servers (default: model setting or 4096).
   --rdna-llama-cli <path>     Override remote RDNA llama-cli baseline binary
   --rdna-llama-server <path>  Override remote RDNA llama-server baseline binary
   --rdna-llama-device <dev>   Override RDNA llama.cpp --device value, e.g. Vulkan1 or ROCm0.
@@ -2164,23 +2173,15 @@ async function stopRdnaZincServer(creds, port) {
   }
 }
 
-async function launchRdnaLlamaServer(
-  caseDef,
-  creds,
-  serverPath,
-  timeoutMs,
-  targetId = 'rdna',
-  lockDpm = true,
-) {
-  const port = await pickOpenPort();
-  const logPath = `/tmp/zinc-${targetId}-llama-${port}.log`;
-  // Apply the same ASPM performance policy and automatic clock governor as
-  // ZINC. Warmups account for ramping without disabling opportunistic boost.
-  if (lockDpm) {
-    await lockRdnaDpmNormal(creds);
-  }
+function rdnaServerContext(caseDef) {
+  const context = caseDef.context_tokens ?? 4096;
+  if (!Number.isSafeInteger(context) || context < 1 || context > 4294967295)
+    throw new Error('RDNA server context must be a positive 32-bit integer');
+  return context;
+}
 
-  const cmd = [
+export function rdnaLlamaServerArgs(caseDef, creds, serverPath, port) {
+  return [
     serverPath,
     '--host',
     creds.loopbackHost ?? '127.0.0.1',
@@ -2193,7 +2194,7 @@ async function launchRdnaLlamaServer(
     '999',
     '--metrics',
     '--ctx-size',
-    '4096',
+    String(rdnaServerContext(caseDef)),
     '--parallel',
     '1',
     // Default f16 KV cache. The previous -ctk q8_0 / -ctv q8_0 added
@@ -2209,6 +2210,38 @@ async function launchRdnaLlamaServer(
     'on',
     '--no-cache-prompt',
   ];
+}
+
+export function rdnaZincServerArgs(caseDef, creds, port) {
+  return [
+    './zig-out/bin/zinc',
+    '-m',
+    caseDef.model_path,
+    '--context',
+    String(rdnaServerContext(caseDef)),
+    ...((creds.zincDevice ?? creds.vkDevice) != null
+      ? ['-d', String(creds.zincDevice ?? creds.vkDevice)]
+      : []),
+    '--parallel',
+    '1',
+    '--port',
+    String(port),
+  ];
+}
+
+async function launchRdnaLlamaServer(
+  caseDef,
+  creds,
+  serverPath,
+  timeoutMs,
+  targetId = 'rdna',
+  lockDpm = true,
+) {
+  const port = await pickOpenPort();
+  const logPath = `/tmp/zinc-${targetId}-llama-${port}.log`;
+  // Match ZINC's power policy while retaining opportunistic clock boosts.
+  if (lockDpm) await lockRdnaDpmNormal(creds);
+  const cmd = rdnaLlamaServerArgs(caseDef, creds, serverPath, port);
   const launchScript = [
     'import os, subprocess',
     `cmd = ${JSON.stringify(cmd)}`,
@@ -2240,19 +2273,7 @@ async function launchRdnaZincServer(caseDef, creds, timeoutMs) {
   const logPath = `/tmp/zinc-rdna-zinc-${port}.log`;
   await lockRdnaDpmNormal(creds);
 
-  const cmd = [
-    './zig-out/bin/zinc',
-    '-m',
-    caseDef.model_path,
-    ...(caseDef.context_tokens != null ? ['--context', String(caseDef.context_tokens)] : []),
-    ...((creds.zincDevice ?? creds.vkDevice) != null
-      ? ['-d', String(creds.zincDevice ?? creds.vkDevice)]
-      : []),
-    '--parallel',
-    '1',
-    '--port',
-    String(port),
-  ];
+  const cmd = rdnaZincServerArgs(caseDef, creds, port);
   const launchScript = [
     'import os, subprocess',
     `cmd = ${JSON.stringify(cmd)}`,
@@ -3879,7 +3900,7 @@ async function runRdnaTarget(args) {
       console.log(`[rdna] skipping ${entry.id}: missing GGUF at ${entry.model_path}`);
       continue;
     }
-    cases.push(entry);
+    cases.push({ ...entry, context_tokens: args.rdnaContext ?? entry.context_tokens ?? 4096 });
   }
   const models = [];
 
@@ -4051,7 +4072,7 @@ async function runRdnaTarget(args) {
       ),
     );
     const summary = primaryScenarioSummary(entry, scenarios);
-    models.push(summary);
+    models.push({ ...summary, server_context_tokens: rdnaServerContext(entry) });
     logModelSummary(targetIdentity.id, summary);
     await writePartialSnapshot(args, targetIdentity.id, targetIdentity.label, models);
   }
@@ -4067,7 +4088,7 @@ async function runRdnaTarget(args) {
       label: 'AMD RDNA bench node',
       machine_model: 'Remote Linux host',
       chip: 'AMD Radeon AI PRO R9700',
-      memory: '32 GB VRAM · 640 GB/s',
+      memory: '32 GB VRAM · 576 GB/s',
       gpu: 'Radeon AI PRO R9700',
       os: 'Ubuntu Linux',
     },

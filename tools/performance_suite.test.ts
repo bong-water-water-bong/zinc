@@ -50,6 +50,8 @@ import {
   rdnaTargetIdentity,
   intelZincCommand,
   rdnaZincCommand,
+  rdnaLlamaServerArgs,
+  rdnaZincServerArgs,
   resolveLocalLlamaServer,
   rdnaDpmNormalizeScript,
   summarizeValues,
@@ -1100,11 +1102,14 @@ test('prompt parity tolerates a BOS but flags a different template', () => {
 });
 
 test('remote llama-server baselines disable prompt cache for prefill timing', () => {
-  const src = readFileSync(new URL('./performance_suite.mjs', import.meta.url), 'utf8');
-  const launchStart = src.indexOf('async function launchRdnaLlamaServer');
-  expect(launchStart).toBeGreaterThanOrEqual(0);
-  const launchBody = src.slice(launchStart, launchStart + 4000);
-  expect(launchBody).toMatch(/['"]--no-cache-prompt['"]/);
+  const args = rdnaLlamaServerArgs(
+    { model_path: '/path/to/model.gguf' },
+    { serverDeviceArgs: ['--device', 'ROCm0'] },
+    '/path/to/llama-server',
+    9090,
+  );
+  expect(args).toContain('--no-cache-prompt');
+  expect(args[args.indexOf('--parallel') + 1]).toBe('1');
 });
 
 test('local llama-server baselines disable prompt cache for prefill timing', () => {
@@ -1116,11 +1121,35 @@ test('local llama-server baselines disable prompt cache for prefill timing', () 
 });
 
 test('remote ZINC benchmark server uses one slot for single-request comparisons', () => {
-  const src = readFileSync(new URL('./performance_suite.mjs', import.meta.url), 'utf8');
-  const launchStart = src.indexOf('async function launchRdnaZincServer');
-  expect(launchStart).toBeGreaterThanOrEqual(0);
-  const launchBody = src.slice(launchStart, launchStart + 2500);
-  expect(launchBody).toMatch(/['"]--parallel['"]\s*,\s*['"]1['"]/);
+  const args = rdnaZincServerArgs({ model_path: '/path/to/model.gguf' }, { zincDevice: 0 }, 9090);
+  expect(args[args.indexOf('--parallel') + 1]).toBe('1');
+  expect(args[args.indexOf('-d') + 1]).toBe('0');
+});
+
+test('RDNA server arguments use the same default and requested context capacity', () => {
+  for (const context of [undefined, 32768]) {
+    const model = { model_path: '/path/to/model.gguf', context_tokens: context };
+    const zinc = rdnaZincServerArgs(model, { zincDevice: 0 }, 9090);
+    const llama = rdnaLlamaServerArgs(model, {}, '/path/to/llama-server', 9091);
+    const expected = String(context ?? 4096);
+    expect(zinc[zinc.indexOf('--context') + 1]).toBe(expected);
+    expect(llama[llama.indexOf('--ctx-size') + 1]).toBe(expected);
+    expect(zinc[zinc.indexOf('-m') + 1]).toBe(model.model_path);
+    expect(llama[llama.indexOf('-m') + 1]).toBe(model.model_path);
+  }
+  expect(parseArgs(['--rdna-context', '32768']).rdnaContext).toBe(32768);
+});
+
+test('invalid RDNA context overrides are rejected before model startup', () => {
+  for (const value of ['0', '-1', 'NaN', '1.5', '4294967296']) {
+    expect(() => parseArgs(['--rdna-context', value])).toThrow('positive 32-bit integer');
+    const model = { model_path: '/path/to/model.gguf', context_tokens: Number(value) };
+    expect(() => rdnaZincServerArgs(model, {}, 9090)).toThrow('positive 32-bit integer');
+    expect(() => rdnaLlamaServerArgs(model, {}, '/path/to/llama-server', 9091)).toThrow(
+      'positive 32-bit integer',
+    );
+  }
+  expect(() => parseArgs(['--rdna-context'])).toThrow('positive 32-bit integer');
 });
 
 test('RDNA ZINC timing wait is bounded after the API response', () => {
