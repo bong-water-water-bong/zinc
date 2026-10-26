@@ -202,6 +202,7 @@ dense FFN, and MoE branches live in the active backend's forward implementation.
 | Microbenchmarks                                    | `benchmarks/`, `src/bench_hot_decode.zig` |
 | Fair cross-backend suite                           | `tools/performance_suite.mjs`             |
 | ROCm attention CPU/GPU reference checks            | `tools/validate_rocm_attention.c`         |
+| ROCm packed matrix CPU/GPU and verifier row checks | `tools/validate_rocm_q8_matvec.c`         |
 | Exact-prefix cache parity                          | `tools/validate_rocm_prompt_cache.mjs`    |
 | OpenCode setup, bounded tool hook, verified rounds | `tools/setup_opencode.mjs`                |
 | CPU OpenCode protocol and lifecycle                | `tools/validate_opencode_harness.mjs`     |

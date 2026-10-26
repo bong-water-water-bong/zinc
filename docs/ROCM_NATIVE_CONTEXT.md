@@ -92,12 +92,32 @@ trial failed the original FP32-reference guard. That guard was not relaxed.
 Instead, the mode remains off by default and is checked against a separately
 declared reference: IEEE FP16 Q/K/V and unnormalized probabilities, with FP32
 softmax state and accumulation. It passes the same tolerance against that
-reference. Against the original FP32 calculation, 24,064 sampled outputs had
+reference. Against FP32 matrix inputs over the same reconstructed Q8 cache,
+24,064 sampled outputs had
 **0.000183 RMSE** and **0.00296 maximum absolute error**. These are measurements
 of the sampled kernels, not a bound on model quality or all possible inputs.
 
 A Q8 response need not match F32 byte for byte. Tool calls, streaming, retrieval
 and repository coding require separate model-level checks.
+
+### Ordinary and speculative decoding must agree on their inputs
+
+The first cross-mode model check found a JSON-formatting difference between
+NextN and ordinary greedy decoding. The F32 control passed all 48 responses.
+In Q8, ordinary slot prefill forced a different recurrent reduction from the
+single-sequence MTP path. Aligning prefill made its hidden state bit-identical,
+but did not eliminate later output differences.
+
+Layer traces then exposed two projection differences. The fast verifier used a
+different matrix reduction from single-token decode, and small K/V projections
+used packed Q8 activations in verification but float activations in ordinary
+decode. Q8 now shares the verifier's one-wave projection templates through
+one-row entry points and uses the same activation precision for these pairs.
+The small Q5_K/Q6_K projection eligibility follows that policy too. On the
+traced coding prompt, all 129 hidden-row checksums agree across prefill and
+both block boundaries of the first decode step's 64 layers.
+The F32 dispatch keeps its existing selection. A dedicated packed-matrix
+validator checks 64 CPU-reference, one-row/verifier-parity and guard cases.
 
 ## Validation
 
@@ -122,6 +142,8 @@ These are diagnostics, each with one long request, rather than repeated
 headline benchmarks. The 142.28-second result is 5.74× faster than this frozen
 F32 control. It combines cache format and prefill-kernel changes; it does not
 isolate either change's contribution.
+The Q8 candidates ran API checks before retrieval; the frozen control ran a
+short warmup. Their capacity and warmup histories differ.
 
 All **23 actual-model API checks** pass at native allocated capacity with Q8,
 NextN and opt-in FP16-input attention. That covers JSON/SSE parity, Unicode,
@@ -166,6 +188,24 @@ ZINC_KV_CACHE=q8 ZINC_Q8_ATTN_F16=1 ZINC_PROMPT_CACHE=0 \
 
 Connection settings come from the environment or the ignored `.env` file;
 set the baseline binary and source checkout as described in [ROCm](ROCM.md).
+
+Compile `tools/validate_rocm_q8_matvec.c` with the same shim and library flags
+as the attention validator, then run it on the GPU host to check the packed
+projections. The model-level parity fixture is public too:
+
+```bash
+ZINC_KV_CACHE=q8 ZINC_Q8_ATTN_F16=1 ZINC_PROMPT_CACHE=0 \
+  ROCR_VISIBLE_DEVICES="${ZINC_GPU:?Set your visible GPU selector}" \
+  python3 tools/validate_mtp_api.py \
+  --baseline "$PWD" --candidate "$PWD" \
+  --model /path/to/Qwen3.8-27B-Q4_K_M.gguf --device 0 \
+  --cases tools/fixtures/rocm_q8_mtp_cases.json \
+  --output /tmp/q8-mtp-parity.json
+```
+
+This checks one build across three serial servers: MTP on, MTP on again, and
+MTP off. The output file must be fresh. The eight cases exercise 48 JSON/SSE
+responses at 4,096-token capacity; native-length retrieval is a separate check.
 
 The suite records both KV selections, precision switches and matched capacity.
 Its fixed prompts remain short: allocating a 262K cache is not a benchmark of

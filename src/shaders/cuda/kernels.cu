@@ -3279,9 +3279,11 @@ __device__ __forceinline__ void zinc_dmmv_q4k_gate_up_swiglu_q8_btok_v2(
     }
 }
 
+extern "C" __global__ void dmmv_q4k_q8_btok1_v2(const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q4k_q8_btok_v2<1u>(a, xq, y, pc); }
 extern "C" __global__ void dmmv_q4k_q8_btok2_v2(const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q4k_q8_btok_v2<2u>(a, xq, y, pc); }
 extern "C" __global__ void dmmv_q4k_q8_btok3_v2(const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q4k_q8_btok_v2<3u>(a, xq, y, pc); }
 extern "C" __global__ void dmmv_q4k_q8_btok4_v2(const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q4k_q8_btok_v2<4u>(a, xq, y, pc); }
+extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8_btok1_v2(const unsigned char* g, const unsigned char* u, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q4k_gate_up_swiglu_q8_btok_v2<1u>(g, u, xq, y, pc); }
 extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8_btok2_v2(const unsigned char* g, const unsigned char* u, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q4k_gate_up_swiglu_q8_btok_v2<2u>(g, u, xq, y, pc); }
 extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8_btok3_v2(const unsigned char* g, const unsigned char* u, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q4k_gate_up_swiglu_q8_btok_v2<3u>(g, u, xq, y, pc); }
 extern "C" __global__ void dmmv_q4k_gate_up_swiglu_q8_btok4_v2(const unsigned char* g, const unsigned char* u, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q4k_gate_up_swiglu_q8_btok_v2<4u>(g, u, xq, y, pc); }
@@ -3530,6 +3532,7 @@ __device__ __forceinline__ void zinc_dmmv_q5k_q8_btok_v2(
     }
 }
 
+extern "C" __global__ void dmmv_q5k_q8_btok1_v2(const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q5k_q8_btok_v2<1u>(a, xq, y, pc); }
 extern "C" __global__ void dmmv_q5k_q8_btok2_v2(const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q5k_q8_btok_v2<2u>(a, xq, y, pc); }
 extern "C" __global__ void dmmv_q5k_q8_btok3_v2(const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q5k_q8_btok_v2<3u>(a, xq, y, pc); }
 extern "C" __global__ void dmmv_q5k_q8_btok4_v2(const unsigned char* a, const unsigned char* xq, float* y, DmmvPush pc) { zinc_dmmv_q5k_q8_btok_v2<4u>(a, xq, y, pc); }
@@ -4336,6 +4339,7 @@ __device__ __forceinline__ void zinc_dmmv_q4k_pair_q8_btok_v2(
     }
 }
 
+extern "C" __global__ void dmmv_q4k_pair_q8_btok1_v2(const unsigned char* a0, const unsigned char* a1, const unsigned char* xq, float* y0, float* y1, Dmmv2Push pc) { zinc_dmmv_q4k_pair_q8_btok_v2<1u>(a0, a1, xq, y0, y1, pc); }
 extern "C" __global__ void dmmv_q4k_pair_q8_btok2_v2(const unsigned char* a0, const unsigned char* a1, const unsigned char* xq, float* y0, float* y1, Dmmv2Push pc) { zinc_dmmv_q4k_pair_q8_btok_v2<2u>(a0, a1, xq, y0, y1, pc); }
 extern "C" __global__ void dmmv_q4k_pair_q8_btok3_v2(const unsigned char* a0, const unsigned char* a1, const unsigned char* xq, float* y0, float* y1, Dmmv2Push pc) { zinc_dmmv_q4k_pair_q8_btok_v2<3u>(a0, a1, xq, y0, y1, pc); }
 extern "C" __global__ void dmmv_q4k_pair_q8_btok4_v2(const unsigned char* a0, const unsigned char* a1, const unsigned char* xq, float* y0, float* y1, Dmmv2Push pc) { zinc_dmmv_q4k_pair_q8_btok_v2<4u>(a0, a1, xq, y0, y1, pc); }
