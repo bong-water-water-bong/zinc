@@ -161,6 +161,32 @@ same-session repair, failed checks, API errors, cancellation, timeouts, and
 diagnostic truncation. This latest prompt contract still needs a successful
 live repository-task run.
 
+### Harness recovery checks (2026-10-26)
+
+Verified editing rounds now have a separate deadline, defaulting to five
+minutes, and reserve time for the independent check. When editing reaches its
+deadline, the wrapper stops OpenCode and checks the partial patch. A failed
+check can resume the same session; a passing check can finish the task.
+Cancellation and API errors still fail the run. Owned POSIX background tools
+are stopped even when the main child exits first.
+
+A CPU protocol fixture exercised actual OpenCode 1.19.4 with scripted streaming
+responses. The first response wrote an incorrect implementation, then the
+next response stalled. Both wrapper versions had the same 12-second overall
+budget. The earlier wrapper exited 124 without running verification. The new
+wrapper stopped editing after eight seconds, ran a failing acceptance check,
+resumed the same session, applied the scripted correction, and passed the
+independent check in 8.9 seconds. The acceptance test and portable configuration
+remained unchanged. These are harness transport/lifecycle checks; no model
+performed inference or demonstrated coding ability in this fixture.
+
+All 26 harness tests pass on Linux and macOS, covering cancellation and API
+errors as well as real subprocess checks for partial edits and background
+process cleanup.
+The combined Zig/Bun CPU command passes; standalone Bun has 692 passing tests,
+six skipped GPU/API tests, and no failures. The RDNA GPU remains unavailable,
+so model-driven coding acceptance and performance measurements remain pending.
+
 ## Remaining hardware validation
 
 After the coding trial, a short-context regression comparison could not start:

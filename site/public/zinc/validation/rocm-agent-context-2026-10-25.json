@@ -13,7 +13,8 @@
     "fallback_reset": "5e50e29ce4ea14aae26d89b27ac27f53a9826841",
     "prompt_cache": "6998550967a936b1ff130e2df12c98eeb25a1171",
     "model_discovery": "0d0d3795ead5fe4330aa61eaa244b4fb8cc0b63b",
-    "verification_rounds": "18dd8b7b245c8c7037c36e0ec2ec937b37de93ea"
+    "verification_rounds": "18dd8b7b245c8c7037c36e0ec2ec937b37de93ea",
+    "verification_deadlines": "cde6201b26272ec7557ea4c133c29bbae4141aad"
   },
   "attention": {
     "passed": 25,
@@ -163,11 +164,11 @@
   ],
   "current_cpu_checks": {
     "serializer_tests_passed": 10,
-    "setup_wrapper_tests_passed": 19,
+    "setup_wrapper_tests_passed": 26,
     "combined_zig_bun_test_command": "pass",
     "gpu_smoke_tests_in_local_command": "skipped",
     "standalone_bun": {
-      "passed": 685,
+      "passed": 692,
       "skipped": 6,
       "failed": 0
     }
@@ -191,5 +192,39 @@
     "result": "pass",
     "binary_sha256": "f1ad27db0de655c2cf85bc961635428115e26766562353f9bb06d42fee3268d3",
     "gpu_execution": "pending device recovery"
+  },
+  "updated_date": "2026-10-26",
+  "harness_timeout_recovery": {
+    "date": "2026-10-26",
+    "scope": "CPU protocol fixture with actual OpenCode and scripted streaming responses; no model inference",
+    "opencode": "1.19.4",
+    "bun": "1.4.4",
+    "overall_timeout_ms": 12000,
+    "editing_round_timeout_ms": 8000,
+    "source_sha256": "32c85bdc0b27de93b19ca057f0d332900ecc58b37b52a19512c4a71a577b1666",
+    "before": {
+      "source": "aee97ab15b8794e0f44b5c9ee95e6a4e29f38862",
+      "exit_code": 124,
+      "elapsed_ms": 12022,
+      "completed_tool_calls": 1,
+      "verification_rounds_completed": 0
+    },
+    "after": {
+      "source": "cde6201b26272ec7557ea4c133c29bbae4141aad",
+      "exit_code": 0,
+      "elapsed_ms": 8906,
+      "completed_tool_calls": 2,
+      "failed_independent_checks": 1,
+      "passed_independent_checks": 1,
+      "same_session_resumed": true,
+      "protected_test_unchanged": true,
+      "portable_configuration_unchanged": true
+    },
+    "wrapper_tests": {
+      "linux_passed": 26,
+      "macos_passed": 26,
+      "failed": 0
+    },
+    "model_coding_acceptance": false
   }
 }
