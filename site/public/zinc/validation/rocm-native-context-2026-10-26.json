@@ -1361,7 +1361,7 @@
     "total_bytes": 34208743424
   },
   "benchmark_preview_review": {
-    "classifier_sha256": "d4e74e9575e2b7844591eecef3682da6fe214eea65ec6c7ed46bb7149e8e099e",
+    "classifier_sha256": "05897e20e3d1ccf4adc2584239176bfac7a8c214b14dcad56e8110957aaec791",
     "captured_previews_reviewed": 12,
     "all_passed": true,
     "timing_samples_changed": false,
@@ -1381,7 +1381,8 @@
         },
         "captured_trimmed_text_sha256": "9f528ee1bebf5d000237428eff8080ccc661c30637d2b16f4b70194d017b2c60"
       }
-    ]
+    ],
+    "classifier_source": "tools/benchmark_quality.mjs"
   },
   "canonical_campaigns": [
     {
