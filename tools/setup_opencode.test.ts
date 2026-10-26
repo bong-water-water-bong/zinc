@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -262,6 +262,283 @@ describe('independent verification', () => {
     });
     expect(modelError).toBe(1);
   });
+
+  test('reserves verification time and checks partial work after an editing timeout', async () => {
+    const rounds: any[] = [];
+    let checks = 0;
+    let progress = '';
+    const code = await runVerifiedOpenCode(
+      buildConfig(),
+      {
+        project: '.',
+        prompt: ['Implement the feature'],
+        verify: 'acceptance-check',
+        timeoutMs: 10000,
+        roundTimeoutMs: 10000,
+      },
+      {
+        stderr: {
+          write: (text) => {
+            progress += text;
+          },
+        } as any,
+        runModel: async (_config, opts, deps) => {
+          rounds.push(opts);
+          deps.onEvent({ sessionID: 'ses_timed_round' });
+          return rounds.length === 1 ? 124 : 0;
+        },
+        runCheck: async (_command, opts) => {
+          expect(opts.timeoutMs).toBeGreaterThan(0);
+          return ++checks === 1
+            ? { code: 7, output: 'error: missing implementation' }
+            : { code: 0, output: 'accepted' };
+        },
+      },
+    );
+    expect(code).toBe(0);
+    expect(checks).toBe(2);
+    expect(rounds[0].timeoutMs).toBeLessThanOrEqual(7500);
+    expect(rounds[0].timeoutMs).toBeGreaterThan(0);
+    expect(rounds[1].session).toBe('ses_timed_round');
+    expect(rounds[1].prompt[0]).toContain('reached its time limit');
+    expect(rounds[1].prompt[0]).toContain('missing implementation');
+    expect(progress).toContain('timed out; checking partial work');
+    expect(progress).toContain('Verification round 2/3: passed');
+  });
+
+  test('bounds individual rounds and cannot accept failed or cancelled verification', async () => {
+    for (const [checkCode, expected] of [
+      [7, 124],
+      [124, 124],
+      [130, 130],
+      [143, 143],
+    ]) {
+      let checks = 0;
+      const code = await runVerifiedOpenCode(
+        buildConfig(),
+        {
+          project: '.',
+          prompt: ['task'],
+          verify: 'check',
+          attempts: 1,
+          timeoutMs: 10000,
+          roundTimeoutMs: 300,
+        },
+        {
+          stderr: quiet,
+          runModel: async (_config, opts, deps) => {
+            expect(opts.timeoutMs).toBe(300);
+            deps.onEvent({ sessionID: 'ses_timed_round' });
+            return 124;
+          },
+          runCheck: async () => {
+            checks++;
+            return { code: checkCode, output: 'failed' };
+          },
+        },
+      );
+      expect(code).toBe(expected);
+      expect(checks).toBe(1);
+    }
+    for (const code of [1, 130, 143]) {
+      expect(
+        await runVerifiedOpenCode(
+          buildConfig(),
+          { project: '.', prompt: ['task'], verify: 'check' },
+          {
+            stderr: quiet,
+            runModel: async () => code,
+            runCheck: async () => {
+              throw new Error('must not verify an API error or cancelled run');
+            },
+          },
+        ),
+      ).toBe(code);
+    }
+  });
+
+  test('uses a five-minute default and rejects invalid round deadlines', async () => {
+    expect(
+      parseArgs(['run', '--round-timeout-ms', '120000', '--verify', 'check']).roundTimeoutMs,
+    ).toBe(120000);
+    const code = await runVerifiedOpenCode(
+      buildConfig(),
+      { project: '.', prompt: ['task'], verify: 'check', timeoutMs: 900000 },
+      {
+        stderr: quiet,
+        runModel: async (_config, opts) => {
+          expect(opts.timeoutMs).toBe(300000);
+          return 1;
+        },
+      },
+    );
+    expect(code).toBe(1);
+    for (const roundTimeoutMs of [0, -1, NaN, 1.5, Infinity])
+      await expect(
+        runVerifiedOpenCode(buildConfig(), {
+          project: '.',
+          prompt: ['task'],
+          verify: 'check',
+          roundTimeoutMs,
+        }),
+      ).rejects.toThrow('Round timeout');
+  });
+
+  test('CLI rejects round deadlines without verification before writing any files', async () => {
+    const dir = await temp();
+    for (const args of [['setup'], ['check'], ['run']]) {
+      const child = Bun.spawnSync([
+        process.execPath,
+        path.join(import.meta.dir, 'setup_opencode.mjs'),
+        ...args,
+        '--project',
+        path.join(dir, 'uncreated'),
+        '--round-timeout-ms',
+        '100',
+      ]);
+      expect(child.exitCode).toBe(1);
+      expect(child.stderr.toString()).toMatch(
+        /Verification options|Round timeout requires --verify/,
+      );
+      expect(await readdir(dir)).toEqual([]);
+    }
+  });
+
+  test.skipIf(process.platform === 'win32')(
+    'checks a real partial edit after timeout and stops background tools',
+    async () => {
+      const dir = await temp();
+      const fixture = path.join(dir, 'opencode-fixture');
+      await writeFile(
+        fixture,
+        `#!${process.execPath}
+import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const child = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], { stdio: 'ignore' });
+writeFileSync('tool.pid', String(child.pid));
+writeFileSync('feature.mjs', 'export const answer = 42;\\n');
+console.log(JSON.stringify({ type: 'step_start', sessionID: 'ses_process_fixture' }));
+process.on('SIGTERM', () => process.exit(0));
+setInterval(() => {}, 1000);
+`,
+        { mode: 0o700 },
+      );
+      let toolPid: number | undefined;
+      try {
+        const code = await runVerifiedOpenCode(
+          buildConfig(),
+          {
+            project: dir,
+            prompt: ['task'],
+            timeoutMs: 10000,
+            roundTimeoutMs: 1000,
+            verify: `'${process.execPath.replaceAll("'", "'\\''")}' -e 'import { answer } from "./feature.mjs"; if (answer !== 42) process.exit(7);'`,
+          },
+          { env: { ...process.env, OPENCODE_BIN: fixture }, stdout: quiet, stderr: quiet },
+        );
+        expect(code).toBe(0);
+        toolPid = Number(await readFile(path.join(dir, 'tool.pid'), 'utf8'));
+        expect(toolPid).toBeGreaterThan(0);
+        // A reparented Linux zombie is already stopped and may await init's reap.
+        const status = Bun.spawnSync(['ps', '-p', String(toolPid), '-o', 'stat=']);
+        const state = status.stdout.toString().trim();
+        expect(state === '' || state.startsWith('Z')).toBe(true);
+      } finally {
+        if (toolPid) {
+          try {
+            process.kill(toolPid, 'SIGKILL');
+          } catch {}
+        }
+      }
+    },
+  );
+
+  test('cancellation and API errors take priority over an editing timeout', async () => {
+    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+      const spawnImpl = (() => {
+        const child: any = new EventEmitter();
+        let interrupted = false;
+        child.kill = () => {
+          if (!interrupted) {
+            interrupted = true;
+            process.emit(signal);
+          }
+          queueMicrotask(() => child.emit('close', 0, null));
+        };
+        return child;
+      }) as any;
+      expect(
+        await runOpenCode(
+          buildConfig(),
+          { project: '.', prompt: ['task'], timeoutMs: 10 },
+          { spawnImpl, env: {}, stdout: quiet },
+        ),
+      ).toBe(signal === 'SIGINT' ? 130 : 143);
+      expect(
+        (
+          await runVerification(
+            'check',
+            { project: '.', timeoutMs: 10 },
+            { spawnImpl, stderr: quiet },
+          )
+        ).code,
+      ).toBe(signal === 'SIGINT' ? 130 : 143);
+    }
+    const code = await runOpenCode(
+      buildConfig(),
+      { project: '.', prompt: ['task'], timeoutMs: 10 },
+      {
+        env: {},
+        stdout: quiet,
+        spawnImpl: (() => {
+          const child: any = new EventEmitter();
+          child.stdout = new EventEmitter();
+          child.kill = () => {
+            child.stdout.emit('data', Buffer.from('{"type":"error"}\n'));
+            queueMicrotask(() => child.emit('close', 0, null));
+          };
+          return child;
+        }) as any,
+      },
+    );
+    expect(code).toBe(1);
+  });
+
+  test.skipIf(process.platform === 'win32')(
+    'a successful verifier cannot leave background processes running',
+    async () => {
+      const dir = await temp();
+      await writeFile(
+        path.join(dir, 'check.mjs'),
+        `
+import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const child = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], { stdio: 'ignore' });
+writeFileSync('tool.pid', String(child.pid));
+process.exit(0);
+`,
+      );
+      let toolPid: number | undefined;
+      try {
+        const checked = await runVerification(
+          `'${process.execPath.replaceAll("'", "'\\''")}' check.mjs`,
+          { project: dir, timeoutMs: 3000 },
+          { stderr: quiet },
+        );
+        toolPid = Number(await readFile(path.join(dir, 'tool.pid'), 'utf8'));
+        expect(checked.code).toBe(0);
+        const status = Bun.spawnSync(['ps', '-p', String(toolPid), '-o', 'stat=']);
+        const state = status.stdout.toString().trim();
+        expect(state === '' || state.startsWith('Z')).toBe(true);
+      } finally {
+        if (toolPid) {
+          try {
+            process.kill(toolPid, 'SIGKILL');
+          } catch {}
+        }
+      }
+    },
+  );
 
   test('captures real command failure output without running OpenCode', async () => {
     const dir = await temp();

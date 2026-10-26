@@ -47,6 +47,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
       '--output': 'output',
       '--steps': 'steps',
       '--timeout-ms': 'timeoutMs',
+      '--round-timeout-ms': 'roundTimeoutMs',
       '--session': 'session',
       '--verify': 'verify',
       '--attempts': 'attempts',
@@ -54,7 +55,9 @@ export function parseArgs(argv = process.argv.slice(2)) {
     if (!key) throw new Error(`Unknown option: ${arg}`);
     const value = args[++i];
     if (!value || value.startsWith('--')) throw new Error(`Missing value for ${arg}`);
-    opts[key] = ['context', 'output', 'steps', 'timeoutMs', 'attempts'].includes(key)
+    opts[key] = ['context', 'output', 'steps', 'timeoutMs', 'roundTimeoutMs', 'attempts'].includes(
+      key,
+    )
       ? Number(value)
       : value;
   }
@@ -352,12 +355,12 @@ export async function runOpenCode(
       child.once('close', (code, signal) => {
         inspectLine(pending + decoder.decode());
         resolve(
-          timedOut
-            ? 124
-            : (interruptedCode ??
-                (code === 0 && agentError
-                  ? 1
-                  : (code ?? (signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1)))),
+          interruptedCode ??
+            (agentError
+              ? 1
+              : timedOut
+                ? 124
+                : (code ?? (signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1))),
         );
       });
     });
@@ -366,6 +369,9 @@ export async function runOpenCode(
     process.off('SIGTERM', onTerm);
     clearTimeout(timer);
     clearTimeout(killTimer);
+    // A CLI can exit while an owned background tool ignores SIGTERM and has
+    // already closed its pipes. Do not leave that detached group alive.
+    if (child.pid && process.platform !== 'win32') stop('SIGKILL');
   }
 }
 
@@ -464,11 +470,10 @@ export async function runVerification(
       child.once('error', reject);
       child.once('close', (code, signal) =>
         resolve(
-          timedOut
-            ? 124
-            : (interruptedCode ??
-                code ??
-                (signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1)),
+          interruptedCode ??
+            (timedOut
+              ? 124
+              : (code ?? (signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1))),
         ),
       );
     });
@@ -487,6 +492,7 @@ export async function runVerification(
     process.off('SIGTERM', onTerm);
     clearTimeout(timer);
     clearTimeout(killTimer);
+    if (child.pid && process.platform !== 'win32') stop('SIGKILL');
   }
 }
 
@@ -498,6 +504,9 @@ export async function runVerifiedOpenCode(config, opts, deps = {}) {
   const timeout = opts.timeoutMs ?? 900000;
   if (!Number.isSafeInteger(timeout) || timeout <= 0)
     throw new Error('Timeout must be a positive integer');
+  const roundTimeout = opts.roundTimeoutMs ?? 300000;
+  if (!Number.isSafeInteger(roundTimeout) || roundTimeout <= 0)
+    throw new Error('Round timeout must be a positive integer');
   const deadline = Date.now() + timeout;
   const roundConfig = structuredClone(config);
   roundConfig.agent.zinc.steps = Math.min(roundConfig.agent.zinc.steps, 8);
@@ -510,12 +519,18 @@ export async function runVerifiedOpenCode(config, opts, deps = {}) {
   let last = 1;
   const executeModel = deps.runModel ?? runOpenCode;
   const executeVerification = deps.runCheck ?? runVerification;
+  const stderr = deps.stderr ?? process.stderr;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     const remaining = deadline - Date.now();
-    if (remaining <= 0) return 124;
+    if (remaining <= 1) return 124;
+    // Leave part of the overall budget for an independent check even when a
+    // model never ends its turn. Five minutes also bounds slow/repeated tools.
+    const checkReserve = Math.min(60000, Math.max(1, Math.floor(remaining / 4)));
+    const modelBudget = Math.min(roundTimeout, remaining - checkReserve);
+    stderr.write(`Editing round ${attempt}/${attempts}: budget ${modelBudget} ms\n`);
     const code = await executeModel(
       roundConfig,
-      { ...opts, session, prompt, timeoutMs: remaining },
+      { ...opts, session, prompt, timeoutMs: modelBudget },
       {
         ...deps,
         onEvent: (event) => {
@@ -524,22 +539,26 @@ export async function runVerifiedOpenCode(config, opts, deps = {}) {
         },
       },
     );
-    if (code !== 0) return code;
+    if (code !== 0 && code !== 124) return code;
+    if (code === 124)
+      stderr.write(`Editing round ${attempt}/${attempts}: timed out; checking partial work\n`);
     const checkBudget = deadline - Date.now();
     if (checkBudget <= 0) return 124;
+    stderr.write(`Verification round ${attempt}/${attempts}: started\n`);
     const checked = await executeVerification(
       opts.verify,
       { project: opts.project, timeoutMs: checkBudget },
       deps,
     );
-    (deps.stderr ?? process.stderr).write(
+    stderr.write(
       `Verification round ${attempt}/${attempts}: ${checked.code === 0 ? 'passed' : 'failed'}\n`,
     );
     if (checked.code === 0) return 0;
-    last = checked.code;
-    if ([124, 130, 143].includes(last) || !session) return last;
+    last = code === 124 ? 124 : checked.code;
+    if ([124, 130, 143].includes(checked.code)) return checked.code;
+    if (!session) return last;
     prompt = [
-      `Continue the coding task. Independent verification failed with exit ${checked.code}. Fix the implementation using these actual diagnostics; do not weaken tests or remove checks. ${roundInstructions}\n\nOriginal task:\n${opts.prompt.join(' ')}\n\nVerification command:\n${opts.verify}\n\nActual output:\n${checked.output}`,
+      `Continue the coding task.${code === 124 ? ' The previous editing round reached its time limit.' : ''} Independent verification failed with exit ${checked.code}. Fix the implementation using these actual diagnostics; do not weaken tests or remove checks. ${roundInstructions}\n\nOriginal task:\n${opts.prompt.join(' ')}\n\nVerification command:\n${opts.verify}\n\nActual output:\n${checked.output}`,
     ];
   }
   return last;
@@ -565,6 +584,7 @@ async function main() {
   --output N        Output budget per turn (default: min(4096, context / 4))
   --steps N         Maximum agent steps (default: 24)
   --timeout-ms N    Task timeout (default: 900000; timeout exits 124)
+  --round-timeout-ms N  Editing round timeout with --verify (default: 300000)
   --session ID      Continue the session ID from a previous JSON event
   --verify CMD      Run this shell command between short editing rounds (run only)
   --attempts N      Maximum verified editing rounds (default: 3; maximum: 10)
@@ -584,9 +604,14 @@ Interactive: OPENCODE_CONFIG=./opencode.zinc.json opencode
 `);
     return;
   }
-  if ((opts.verify || opts.attempts !== undefined) && opts.command !== 'run')
+  if (
+    (opts.verify || opts.attempts !== undefined || opts.roundTimeoutMs !== undefined) &&
+    opts.command !== 'run'
+  )
     throw new Error('Verification options are only available for run');
   if (opts.attempts !== undefined && !opts.verify) throw new Error('Attempts requires --verify');
+  if (opts.roundTimeoutMs !== undefined && !opts.verify)
+    throw new Error('Round timeout requires --verify');
   if (opts.command === 'setup') {
     await writeConfig(opts.project, buildConfig(opts), opts);
     console.log(
@@ -610,7 +635,7 @@ if (import.meta.main)
   main().catch((error) => {
     // Do not print fetch/child errors that could include a private URL or token.
     const known =
-      /^(Bun 1\.4\.4|Unknown option:|Missing value for|Use a model ID|Context must|Output must|Steps must|Timeout must|Verification |Attempts |ZINC_API_BASE_URL|ZINC .*check|ZINC returned|Pass a task)/.test(
+      /^(Bun 1\.4\.4|Unknown option:|Missing value for|Use a model ID|Context must|Output must|Steps must|Timeout must|Round timeout |Verification |Attempts |ZINC_API_BASE_URL|ZINC .*check|ZINC returned|Pass a task)/.test(
         error.message,
       );
     console.error(

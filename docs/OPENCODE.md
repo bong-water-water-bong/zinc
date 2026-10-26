@@ -113,9 +113,19 @@ OpenCode round. A failed check feeds real diagnostic excerpts back into the same
 session. Feedback is bounded, retaining the start, selected error lines, and end
 of a long log; the complete check output still streams to stderr.
 Each editing round is capped at eight model steps; `--attempts` defaults to
-three and allows at most ten. The timeout covers the entire operation,
-including checks. Model errors, interrupted/timed-out checks, and exhausted
-attempts return a failure. Only a zero check status produces success.
+three and allows at most ten. An editing round also has a five-minute deadline;
+use `--round-timeout-ms` to change it. The wrapper reserves up to a minute
+(one quarter of the remaining overall budget) for an independent check.
+If editing times out, the wrapper stops that OpenCode process and checks the
+partial patch. A passing check can finish the task; a failed check resumes the
+same session when attempts and time remain. API errors and user cancellation
+fail immediately. Round starts, deadlines, and check results appear on stderr,
+while stdout remains the OpenCode JSON event stream.
+
+The overall timeout covers editing and checks. Interrupted/timed-out checks
+and exhausted attempts return a failure. Only a zero check status produces
+success. On POSIX systems, the wrapper also stops remaining processes in each
+owned child group, including background tools left after the main child exits.
 Choose a check that actually covers the requested feature, and protect
 acceptance tests when evaluating a model. The command is used at runtime and
 is not written into the portable configuration.
