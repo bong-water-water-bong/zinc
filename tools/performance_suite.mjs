@@ -819,7 +819,31 @@ export function outputQualityStatus(preview, generatedTokens = null) {
 }
 
 function hasRepeatedTokenPattern(text) {
-  const tokens = text.toLowerCase().match(/[\p{L}\p{N}]+|[^\s\p{L}\p{N}]/gu) ?? [];
+  // A table delimiter contains repeated dashes by design. Exempt only a
+  // delimiter immediately after a textual header with matching column count;
+  // standalone/repeated delimiter lines still take the ordinary checks.
+  const lines = text.split(/\r?\n/);
+  const cells = (line) =>
+    line
+      .trim()
+      .replace(/^\|/, '')
+      .replace(/\|$/, '')
+      .split('|')
+      .map((cell) => cell.trim());
+  const prose = lines
+    .filter((line, index) => {
+      if (!index || !line.includes('|') || !lines[index - 1].includes('|')) return true;
+      const delimiter = cells(line),
+        header = cells(lines[index - 1]);
+      return !(
+        delimiter.length >= 2 &&
+        delimiter.length === header.length &&
+        delimiter.every((cell) => /^:?-{3,}:?$/.test(cell)) &&
+        header.every((cell) => cell.length > 0 && !/^[:\s-]+$/.test(cell))
+      );
+    })
+    .join('\n');
+  const tokens = prose.toLowerCase().match(/[\p{L}\p{N}]+|[^\s\p{L}\p{N}]/gu) ?? [];
   for (let width = 1; width <= 8; width += 1) {
     if (tokens.length < width * 6) continue;
     for (let start = 0; start + width * 6 <= tokens.length; start += 1) {

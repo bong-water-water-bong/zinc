@@ -1278,6 +1278,37 @@ test('parseOpenAiCompletionOutput captures llama-server reasoning output', () =>
   expect(parsed.outputPreview).toBe('Compare the two runs fairly.');
 });
 
+test('output quality accepts a Markdown table delimiter after its matching header', () => {
+  const preview = [
+    '# Stable benchmark plan',
+    'Use one warmup and five measured runs.',
+    '| Flag | Description | Default |',
+    '|------|-------------|---------|',
+    '| --runs | Measured repetitions | 5 |',
+  ].join('\n');
+  expect(outputQualityStatus(preview, 256).tone).toBe('positive');
+  expect(outputQualityStatus('Flag | Default\n:------ | ------:\n--runs | 5', 64).tone).toBe(
+    'positive',
+  );
+});
+
+test('table syntax does not hide malformed separators, control tokens or repetition', () => {
+  expect(outputQualityStatus('|------|-------------|---------|', 64).tone).toBe('caution');
+  expect(outputQualityStatus('One | Two\n|------|-------------|---------|', 64).tone).toBe(
+    'caution',
+  );
+  expect(
+    outputQualityStatus('Flag | Default\n------ | ------\n' + '------ | ------\n'.repeat(8), 64)
+      .tone,
+  ).toBe('caution');
+  expect(outputQualityStatus('Flag | Default\n------ | ------\n<|im_end|> | 5', 64).tone).toBe(
+    'caution',
+  );
+  expect(
+    outputQualityStatus('Flag | Default\n------ | ------\n' + 'Keep testing. '.repeat(12), 64).tone,
+  ).toBe('caution');
+});
+
 test('summarizeValues includes median, p95, and stddev', () => {
   const summary = summarizeValues([10, 20, 30, 40]);
   expect(summary?.avg).toBe(25);
