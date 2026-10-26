@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 
 import {
   buildArtifact,
+  buildRdnaCreds,
   buildComparison,
   buildMeasurementPhases,
   buildZincOpenAiPayload,
@@ -37,6 +38,7 @@ import {
   parseLlamaCliOutput,
   parseLlamaCppVersionOutput,
   parseOpenAiCompletionOutput,
+  parseRocmDevices,
   parseZincCliOutput,
   parseZincSpeculative,
   parseZincServerOutput,
@@ -52,8 +54,120 @@ import {
   rdnaDpmNormalizeScript,
   summarizeValues,
   validateZincBackend,
+  verifyRemoteRocmDevice,
   zincServerTimingWaitSeconds,
 } from './performance_suite.mjs';
+
+const rocmGpu = `*******
+Agent 2
+*******
+  Name:                    gfx1201
+  Marketing Name:          AMD Radeon AI PRO R9700
+  Device Type:             GPU
+  Memory Properties:
+    Features:              KERNEL_DISPATCH
+`;
+const rocmApu = `*******
+Agent 3
+*******
+  Name:                    gfx1036
+  Marketing Name:          AMD Radeon Graphics
+  Device Type:             GPU
+  Memory Properties:
+    Features:              APU
+`;
+const rocmCreds = {
+  host: 'node.example.invalid',
+  user: 'benchmark',
+  port: '22',
+  workdir: '/workspace/zinc',
+  vkDevice: 0,
+  env: { ROCR_VISIBLE_DEVICES: '0' },
+};
+
+test('ROCm inventory parses GPU properties without retaining CPU or device identifiers', () => {
+  const cpu = 'Agent 1\n  Name: CPU\n  Marketing Name: CPU\n  Device Type: CPU\n';
+  const result = parseRocmDevices(
+    `\u001b[37mROCk module is loaded\u001b[0m\n${cpu}${rocmGpu}${rocmApu}`.replaceAll('\n', '\r\n'),
+  );
+  expect(result).toEqual([
+    { name: 'AMD Radeon AI PRO R9700', architecture: 'gfx1201', integrated: false },
+    { name: 'AMD Radeon Graphics', architecture: 'gfx1036', integrated: true },
+  ]);
+});
+
+test('ROCm preflight uses filtered ROCr inventory without consulting Vulkan ordinals', async () => {
+  let command = '',
+    output = '';
+  const device = await verifyRemoteRocmDevice(rocmCreds, 'GFX1201', {
+    runCommand: async (cmd) => {
+      command = cmd;
+      return { stdout: rocmGpu };
+    },
+    write: (line) => {
+      output += line;
+    },
+  });
+  expect(command).toContain('rocminfo');
+  expect(command).toContain('ROCR_VISIBLE_DEVICES');
+  expect(command).not.toContain('vulkaninfo');
+  expect(device.name).toBe('AMD Radeon AI PRO R9700');
+  expect(output).toContain('ROCm device 0');
+});
+
+test('ROCm preflight rejects integrated, ambiguous and malformed device inventories', async () => {
+  for (const stdout of [
+    rocmApu,
+    rocmGpu + rocmApu,
+    '',
+    rocmGpu.replace('AMD Radeon AI PRO R9700', ''),
+    rocmGpu.replace('gfx1201', ''),
+  ]) {
+    await expect(
+      verifyRemoteRocmDevice(rocmCreds, null, {
+        runCommand: async () => ({ stdout }),
+        write: () => {},
+      }),
+    ).rejects.toThrow();
+  }
+});
+
+test('ROCm preflight enforces requested hardware and sanitizes probe failures', async () => {
+  await expect(
+    verifyRemoteRocmDevice(rocmCreds, 'different GPU', {
+      runCommand: async () => ({ stdout: rocmGpu }),
+      write: () => {},
+    }),
+  ).rejects.toThrow('does not match');
+  await expect(
+    verifyRemoteRocmDevice(rocmCreds, null, {
+      runCommand: async () => {
+        throw new Error('fixture-secret-should-not-escape');
+      },
+    }),
+  ).rejects.toThrow('Could not query ROCm devices');
+});
+
+test('ROCr visibility remaps ZINC and the HIP baseline to logical device zero', async () => {
+  const args = {
+    ...parseArgs(['--target', 'rdna', '--rdna-backend', 'rocm', '--rdna-vk-device', '3']),
+    envMap: { ZINC_RDNA_HOST: 'node.example.invalid', ZINC_RDNA_USER: 'benchmark' },
+  };
+  const rocm = await buildRdnaCreds(args);
+  expect(rocm.env.ROCR_VISIBLE_DEVICES).toBe('3');
+  expect(rocm.zincDevice).toBe(0);
+  expect(rocm.serverDeviceArgs).toEqual(['--device', 'ROCm0']);
+  expect(rocm.cliDeviceArgs).toEqual(['--device', 'ROCm0']);
+  const command = rdnaZincCommand(
+    { model_path: '/path/to/model.gguf', max_tokens: 8, prompt_mode: 'raw', prompt: 'Hello' },
+    rocm,
+  );
+  expect(command).toContain('-d 0');
+  expect(command).not.toContain('-d 3');
+  const vulkan = await buildRdnaCreds({ ...args, rdnaBackend: 'vulkan' });
+  expect(vulkan.zincDevice).toBe(3);
+  expect(vulkan.env.ROCR_VISIBLE_DEVICES).toBeUndefined();
+});
 
 test('benchmark methodology reports the configured sample counts', () => {
   expect(benchmarkStatisticsNote(5, 1)).toBe(

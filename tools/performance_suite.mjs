@@ -2174,16 +2174,8 @@ async function launchRdnaLlamaServer(
 ) {
   const port = await pickOpenPort();
   const logPath = `/tmp/zinc-${targetId}-llama-${port}.log`;
-  // Force the discrete RDNA4 GPU's DPM state to "high" before launch.
-  // Without this, an idle llama-server holds the GPU but doesn't pin
-  // memclk to a high level — the DPM heuristic sees "barely active"
-  // and clocks down to level 0 (96 MHz mclk on gfx1201), which makes
-  // every subsequent benchmark run at ~15% of peak memory bandwidth.
-  // Empirically reproduced on this node: idle llama-server pinned
-  // tg128 at 28-30 tok/s on Qwen 3.6 35B-A3B vs 108 tok/s right after
-  // reboot; locking DPM to high recovers ~92 tok/s (level 4 of 5).
-  // Card discovery: the discrete GPU is whichever card1/card2 has
-  // amdgpu driver + a 6-level pp_dpm_mclk; we just try both.
+  // Apply the same ASPM performance policy and automatic clock governor as
+  // ZINC. Warmups account for ramping without disabling opportunistic boost.
   if (lockDpm) {
     await lockRdnaDpmNormal(creds);
   }
@@ -2253,7 +2245,9 @@ async function launchRdnaZincServer(caseDef, creds, timeoutMs) {
     '-m',
     caseDef.model_path,
     ...(caseDef.context_tokens != null ? ['--context', String(caseDef.context_tokens)] : []),
-    ...(creds.vkDevice != null ? ['-d', String(creds.vkDevice)] : []),
+    ...((creds.zincDevice ?? creds.vkDevice) != null
+      ? ['-d', String(creds.zincDevice ?? creds.vkDevice)]
+      : []),
     '--parallel',
     '1',
     '--port',
@@ -2545,7 +2539,8 @@ export function remoteZincCommand(caseDef, creds) {
   parts.push('./zig-out/bin/zinc', '-n', String(caseDef.max_tokens));
   if (caseDef.context_tokens != null) parts.push('--context', String(caseDef.context_tokens));
   parts.push('-m', shellQuote(caseDef.model_path));
-  if (creds.vkDevice != null) parts.push('-d', String(creds.vkDevice));
+  const device = creds.zincDevice ?? creds.vkDevice;
+  if (device != null) parts.push('-d', String(device));
   if (caseDef.prompt_mode === 'chat') parts.push('--chat');
   parts.push('--prompt', shellQuote(caseDef.prompt));
   return remoteCommand(parts.join(' '), creds);
@@ -3649,6 +3644,7 @@ export async function buildRdnaCreds(args) {
     );
   }
   const tuningEnv = collectRemoteZincTuningEnv(dotEnv);
+  const baselineDevice = args.rdnaLlamaDevice ?? (args.rdnaBackend === 'rocm' ? 'ROCm0' : null);
   return {
     host,
     user,
@@ -3660,8 +3656,11 @@ export async function buildRdnaCreds(args) {
         ? { ...tuningEnv, ROCR_VISIBLE_DEVICES: String(args.rdnaVkDevice ?? 0) }
         : { ...tuningEnv, RADV_PERFTEST: 'coop_matrix' },
     vkDevice: args.rdnaVkDevice ?? 1,
-    serverDeviceArgs:
-      args.rdnaLlamaDevice != null ? llamaDeviceArgs(args.rdnaLlamaDevice) : undefined,
+    // ROCr exposes the chosen physical GPU as logical device zero. Vulkan's
+    // ordinal is unrelated and may enumerate an integrated GPU first.
+    zincDevice: args.rdnaBackend === 'rocm' ? 0 : (args.rdnaVkDevice ?? 1),
+    serverDeviceArgs: baselineDevice != null ? llamaDeviceArgs(baselineDevice) : undefined,
+    cliDeviceArgs: baselineDevice != null ? llamaDeviceArgs(baselineDevice) : undefined,
   };
 }
 
@@ -3737,6 +3736,55 @@ async function buildIntelConfig(args) {
   };
 }
 
+export function parseRocmDevices(output) {
+  return String(output)
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    .replace(/\r\n/g, '\n')
+    .split(/^[ \t]*Agent[ \t]+\d+[ \t]*$/m)
+    .filter((block) => /^[ \t]*Device Type:[ \t]*GPU[ \t]*$/m.test(block))
+    .map((block) => ({
+      name: block.match(/^[ \t]*Marketing Name:[ \t]*(.*)$/m)?.[1]?.trim() ?? '',
+      architecture: block.match(/^[ \t]*Name:[ \t]*(.*)$/m)?.[1]?.trim() ?? '',
+      integrated: /^[ \t]*Features:[ \t]*APU\b/m.test(block),
+    }));
+}
+
+export async function verifyRemoteRocmDevice(creds, requireSubstring, deps = {}) {
+  const probe =
+    'if command -v rocminfo >/dev/null 2>&1; then exec rocminfo; else exec "${ROCM_PATH:-/opt/rocm}/bin/rocminfo"; fi';
+  const envPrefix = remoteEnvPrefix(creds);
+  let stdout;
+  try {
+    ({ stdout } = await (deps.runCommand ?? runShell)(
+      remoteCommand(`${envPrefix ? `${envPrefix} ` : ''}sh -c ${shellQuote(probe)}`, creds),
+      { cwd: ROOT, timeoutMs: 30000 },
+    ));
+  } catch {
+    throw new Error('Could not query ROCm devices; check rocminfo and the selected GPU.');
+  }
+  const devices = parseRocmDevices(stdout);
+  if (devices.length !== 1 || !devices[0].name || !/^gfx\w/.test(devices[0].architecture))
+    throw new Error(
+      'ROCm preflight requires exactly one visible GPU with a name and compute target.',
+    );
+  const device = devices[0];
+  if (device.integrated)
+    throw new Error(
+      `Refusing to run: the visible ROCm GPU is integrated (${device.name}). Select a discrete ROCr device.`,
+    );
+  if (
+    requireSubstring &&
+    !`${device.name} ${device.architecture}`.toLowerCase().includes(requireSubstring.toLowerCase())
+  )
+    throw new Error(
+      `Refusing to run: ROCm GPU ${device.name} (${device.architecture}) does not match the required device.`,
+    );
+  (deps.write ?? ((line) => process.stdout.write(line)))(
+    `[rdna] ROCm device 0: ${device.name} (${device.architecture})\n`,
+  );
+  return device;
+}
+
 async function verifyRemoteVulkanDevice(creds, requireSubstring, options = {}) {
   const targetId = options.targetId ?? 'rdna';
   const nodeLabel = options.nodeLabel ?? `${targetId.toUpperCase()} node`;
@@ -3802,10 +3850,15 @@ async function runRdnaTarget(args) {
   const creds = await buildRdnaCreds(args);
   await prepareRdna(args, creds);
   await verifyRdnaZincBackend(args, creds);
-  await verifyRemoteVulkanDevice(creds, args.requireRdnaDeviceSubstring);
+  if (args.rdnaBackend === 'rocm')
+    await verifyRemoteRocmDevice(creds, args.requireRdnaDeviceSubstring);
+  else await verifyRemoteVulkanDevice(creds, args.requireRdnaDeviceSubstring);
   const rdnaLlamaCli = await detectRdnaLlamaCliPath(creds, args);
   const rdnaLlamaServer = await detectRdnaLlamaServerPath(creds, args);
   const baselineBinary = rdnaLlamaServer || rdnaLlamaCli;
+  const baselineDeviceName =
+    args.rdnaLlamaDevice ??
+    (args.rdnaBackend === 'rocm' ? 'ROCm0' : `Vulkan${creds.vkDevice ?? 1}`);
   const zincProvenance = args.rdnaSync
     ? await captureGitProvenance(ROOT)
     : await captureRemoteGitProvenance(creds);
@@ -4033,15 +4086,15 @@ async function runRdnaTarget(args) {
       llama_backend: /rocm/i.test(args.rdnaLlamaDevice ?? '') ? 'ROCm' : 'Vulkan',
       llama_device: args.rdnaLlamaDevice ?? '--device Vulkan1',
       notes: [
-        'Hardware: one AMD Radeon AI PRO R9700 benchmark node with 32 GB VRAM and 640 GB/s memory bandwidth. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.',
+        'Hardware: one AMD Radeon AI PRO R9700 benchmark node with 32 GB VRAM and 576 GB/s memory bandwidth. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.',
         `ZINC path: sync the current source tree to the RDNA node, build ReleaseFast with the selected ${args.rdnaBackend} backend, then measure generation through one reusable single-slot ZINC server per model.`,
         `ZINC RDNA backend: ${args.rdnaBackend}.`,
-        `Baseline backend: llama.cpp ${/rocm/i.test(args.rdnaLlamaDevice ?? '') ? 'ROCm' : 'Vulkan'} (${args.rdnaLlamaDevice ?? '--device Vulkan1'}) on the same node and the same model file.`,
+        `Baseline backend: llama.cpp ${/rocm/i.test(baselineDeviceName) ? 'ROCm' : 'Vulkan'} (${baselineDeviceName}) on the same node and the same model file.`,
         'Baseline path: launch llama.cpp against the same model file, preferring one reusable single-slot llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.',
         'Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.',
         benchmarkStatisticsNote(args.runs, args.warmupRuns),
         'Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.',
-        "Power policy: before either engine starts, the harness selects PCIe ASPM performance mode and locks the discrete AMD GPU's memory DPM policy high to prevent idle-clock drift between runs.",
+        "Power policy: before either engine starts, the harness selects PCIe ASPM performance mode and uses the discrete AMD GPU's automatic clock governor; warmups account for clock ramping.",
         'Run hygiene: published RDNA runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.',
       ],
       runs: args.runs,
