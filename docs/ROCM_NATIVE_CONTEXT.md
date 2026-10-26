@@ -16,7 +16,7 @@ are outside this validation.
 Build the [ROCm backend](ROCM.md#build-and-verify), then run on the GPU host:
 
 ```bash
-ZINC_KV_CACHE=q8 ZINC_Q8_ATTN_F16=1 ZINC_PROMPT_CACHE=0 \
+ZINC_KV_CACHE=q8 ZINC_Q8_ATTN_F16=1 ZINC_MTP=1 ZINC_PROMPT_CACHE=0 \
   ROCR_VISIBLE_DEVICES="${ZINC_GPU:?Set your visible GPU selector}" \
   ./zig-out/bin/zinc -m /path/to/Qwen3.8-27B-Q4_K_M.gguf \
   --context 262144 --parallel 1 --port 9090
@@ -26,6 +26,10 @@ The FP16 switch explicitly selects the faster precision mode described below.
 Omit it for FP32-input attention with Q8 cache storage. Match the coding client's
 capacity with `bun tools/setup_opencode.mjs --context 262144 --project ../my-project`.
 The window includes input and generated output, so leave space for the answer.
+OpenCode may compact history earlier to reserve room for output and tool results.
+At this capacity, the current helper previews a 4,096-token output limit and
+69,632-token compaction reserve. That reserve is a client budget within the
+server's total window.
 
 ## Memory accounting
 
@@ -127,6 +131,12 @@ and offsets, 32K/64K/128K/262K key lengths, GQA, sinks, scales, head-dimension
 stripes, graph updates, scalar query tails, both BLAS precisions and sticky
 execution errors. The Q8 count includes the declared mixed-precision checks.
 
+The clean release build also passes **48 MTP/ordinary JSON/SSE responses** at
+4K capacity and **24 prefix-cache requests** at 32K capacity, split between MTP
+off and on. Each cache mode matches its uncached control in output bytes and
+usage, and the two MTP modes match each other on these fixtures. Shared-prefix
+requests reuse 8,192 tokens; changed prefixes and resets correctly miss.
+
 A frozen F32 64K server returned the exact key from 62,048 prompt tokens and
 then passed a fresh short request. The following single-request diagnostics
 used the same 27B GGUF, greedy prompt, NextN and disabled prefix reuse:
@@ -136,10 +146,10 @@ used the same 27B GGUF, greedy prompt, NextN and disabled prefix reuse:
 | Frozen F32 KV              |             65,536 |        62,048 |       816.52 | pass      |
 | Q8, scalar 32-query tile   |            262,144 |        62,048 |       454.90 | pass      |
 | Q8, FP32-input BLAS        |            262,144 |        62,048 |       354.68 | pass      |
-| Q8, opt-in FP16-input BLAS |            262,144 |        62,048 |       142.28 | pass      |
+| Q8, opt-in FP16-input BLAS |            262,144 |        62,048 |       142.50 | pass      |
 
 These are diagnostics, each with one long request, rather than repeated
-headline benchmarks. The 142.28-second result is 5.74× faster than this frozen
+headline benchmarks. The 142.50-second result is 5.73× faster than this frozen
 F32 control. It combines cache format and prefill-kernel changes; it does not
 isolate either change's contribution.
 The Q8 candidates ran API checks before retrieval; the frozen control ran a
@@ -151,7 +161,7 @@ structured tool arguments and history, truncation safety, validation failures,
 context rejection and recovery.
 
 The native-capacity server returned **`CEDAR_9482` exactly from 260,048 prompt
-tokens**, with eight generated tokens, in **1,015.11 seconds** (16.92 minutes).
+tokens**, with eight generated tokens, in **1,016.34 seconds** (16.94 minutes).
 A fresh short request then returned a different exact key in 0.175 seconds.
 The server stopped and all temporary power settings were restored. This proves
 execution and one synthetic retrieval near the native limit; it is not a
@@ -160,6 +170,38 @@ long-document accuracy study or a 260K repository-task acceptance.
 Earlier scalar and FP32-BLAS native probes were deliberately stopped for tuning
 after their 62K checks; they are not counted as native-length passes. The initial eight-query prototype
 was also stopped during its 62K prefill and is not a long-context pass.
+
+## Matched server measurements
+
+The canonical runner used one reusable server per engine, one discarded warmup
+and five measured requests per workload. Both servers allocated **262,144 tokens**,
+used the same GGUF and prompts, and disabled prefix reuse. ZINC used Q8 KV with
+opt-in FP16-input attention and NextN; llama.cpp used `q8_0` KV and ordinary
+decoding. Their quantized cache representations differ. The prompts below are
+**58–349 tokens**, so these numbers describe short requests at native allocated
+capacity, separately from the 260K retrieval above.
+
+| Workload          | ZINC decode tok/s | llama.cpp decode tok/s |
+| ----------------- | ----------------: | ---------------------: |
+| Quick Chat        |             63.52 |                  29.43 |
+| Coding Review     |             76.20 |                  29.33 |
+| Incident Context  |             73.93 |                  29.37 |
+| Long Coding Draft |             73.11 |                  29.39 |
+
+All output budgets and prompt counts match. The captured previews pass the
+output check after correcting a false positive for a valid Markdown table
+delimiter in the long coding plan. The original flag and corrected classifier
+review are retained in the portable evidence; timing samples were not changed.
+
+A separate 32K F32 control checks the default path: captured text and token
+counts match on all four workloads. Decode changes range from **−0.09% to
++0.08%**, and prefill from **−0.60% to −0.32%**. These small changes do not establish
+a default-path speedup. Shared CPU work was active during the campaign; each
+engine's measured host-load samples are retained in the evidence.
+
+[Portable evidence](https://zolotukhin.ai/zinc/validation/rocm-native-context-2026-10-26.json)
+pins runtime commit `59e91681`, binary/source/GGUF hashes, precision choices,
+individual samples, failed trials and cleanup results.
 
 ## Reproduce
 
@@ -179,7 +221,7 @@ For a matched native-capacity comparison, the canonical runner can explicitly
 select quantized KV for the baseline too:
 
 ```bash
-ZINC_KV_CACHE=q8 ZINC_Q8_ATTN_F16=1 ZINC_PROMPT_CACHE=0 \
+ZINC_KV_CACHE=q8 ZINC_Q8_ATTN_F16=1 ZINC_MTP=1 ZINC_PROMPT_CACHE=0 \
   bun tools/performance_suite.mjs \
   --target rdna --phase all --models qwen38-27b-q4k-m \
   --rdna-backend rocm --rdna-context 262144 --rdna-llama-kv q8_0 \
@@ -188,6 +230,12 @@ ZINC_KV_CACHE=q8 ZINC_Q8_ATTN_F16=1 ZINC_PROMPT_CACHE=0 \
 
 Connection settings come from the environment or the ignored `.env` file;
 set the baseline binary and source checkout as described in [ROCm](ROCM.md).
+
+The suite records both KV selections, precision switches and matched capacity.
+Its fixed prompts remain short: allocating a 262K cache is not a benchmark of
+a 262K-token prompt. The baseline stays at its F16 default unless Q8 is
+explicitly requested. ZINC Q8 uses an FP32 block scale; llama.cpp `q8_0` uses
+its own representation, so quantized cache formats are not bit-identical.
 
 Compile `tools/validate_rocm_q8_matvec.c` with the same shim and library flags
 as the attention validator, then run it on the GPU host to check the packed
@@ -207,8 +255,14 @@ This checks one build across three serial servers: MTP on, MTP on again, and
 MTP off. The output file must be fresh. The eight cases exercise 48 JSON/SSE
 responses at 4,096-token capacity; native-length retrieval is a separate check.
 
-The suite records both KV selections, precision switches and matched capacity.
-Its fixed prompts remain short: allocating a 262K cache is not a benchmark of
-a 262K-token prompt. The baseline stays at its F16 default unless Q8 is
-explicitly requested. ZINC Q8 uses an FP32 block scale; llama.cpp `q8_0` uses
-its own representation, so quantized cache formats are not bit-identical.
+For cache parity, use a fresh output directory for each mode:
+
+```bash
+for mtp in 0 1; do
+  ZINC_Q8_ATTN_F16=1 bun tools/validate_rocm_prompt_cache.mjs \
+    --model /path/to/Qwen3.8-27B-Q4_K_M.gguf \
+    --gpu "${ZINC_GPU:?Set your visible GPU selector}" \
+    --context 32768 --mtp "$mtp" --kv-cache q8 \
+    --output "/tmp/q8-cache-mtp-$mtp"
+done
+```

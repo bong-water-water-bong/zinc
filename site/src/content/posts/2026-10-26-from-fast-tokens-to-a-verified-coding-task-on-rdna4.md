@@ -24,6 +24,8 @@ faqs:
     answer: 'Yes, one bounded feature with code-review feedback: a setup-only --dry-run configuration preview. The initial green check missed two contract violations. The same model session repaired them, and independent acceptance plus project checks passed. This does not establish general unsupervised coding reliability.'
   - question: 'Does the 64–75 tokens per second result use 32K-token prompts?'
     answer: 'No. Both servers had 32,768-token capacity, but the four benchmark prompts contained 58–349 tokens. ZINC used NextN; prompt reuse was disabled for both engines. Long-context execution and repository coding were tested separately.'
+  - question: 'Why use 32K when Qwen 3.8 27B supports 262K?'
+    answer: '32K was the coding trial configuration. Native capacity needs 34 GiB of FP32 KV including NextN, before weights and scratch. The opt-in Q8 cache reduces that to 9.5625 GiB. A separate mixed-precision attention mode completed a 260,048-token synthetic retrieval on the 32GB card; that does not establish native-length coding quality.'
 draft: false
 ---
 
@@ -189,15 +191,19 @@ The new opt-in ROCm cache stores 32 signed bytes with one FP32 scale per block. 
 
 Compressed storage made capacity possible, but the first long-prompt kernel still spent too much time reconstructing values for individual queries. Sharing a compressed key tile between 32 queries helped. The next improvement expands only one 1,024-key tile at a time for BLAS, then combines tiles with the same online-softmax recurrence. Its score buffer grows with the bounded query chunk, rather than the total context.
 
-A 62,048-token exact-key request took **816.52 seconds** on the frozen FP32 control, **354.68 seconds** with Q8 and FP32-input BLAS, and **142.28 seconds** with opt-in FP16 matrix inputs. Those are single-request diagnostics, not the repeated short-prompt benchmark above. They combine a cache-format change with new attention kernels.
+A 62,048-token exact-key request took **816.52 seconds** on the frozen FP32 control, **354.68 seconds** with Q8 and FP32-input BLAS, and **142.50 seconds** with opt-in FP16 matrix inputs. Those are single-request diagnostics, not the repeated short-prompt benchmark above. They combine a cache-format change with new attention kernels.
 
-The complete model then returned the exact key from **260,048 prompt tokens** in **1,015 seconds**, about 16.9 minutes, and passed a fresh short request afterward. Its server advertised 262,144-token capacity and passed all 23 API checks. That is a completed near-native retrieval, not merely a successful cache allocation. It is still a synthetic key buried in repeated padding, so it does not measure long-document comprehension or repository coding quality.
+The complete model then returned the exact key from **260,048 prompt tokens** in **1,016 seconds**, about 16.9 minutes, and passed a fresh short request afterward. Its server advertised 262,144-token capacity and passed all 23 API checks. That is a completed near-native retrieval, not merely a successful cache allocation. It is still a synthetic key buried in repeated padding, so it does not measure long-document comprehension or repository coding quality.
 
 Precision needed its own check. The initial FP16-input mode failed the original FP32 reference tolerance. We kept that guard and left the mode off by default. A separate reference now models FP16 Q/K/V and probabilities with FP32 softmax state and accumulation. The tested outputs pass that contract; measured against FP32 matrix inputs over the same reconstructed Q8 cache, their RMSE is 0.000183 and maximum absolute error is 0.00296. This measures the extra mixed-precision difference, rather than the total effect of quantizing KV. Kernel agreement does not establish unchanged coding quality.
 
 API success also missed a cross-mode discrepancy: the first Q8 test produced different JSON formatting with MTP on and off. A control run with FP32 KV passed. Matching prefill reductions fixed one difference, but tracing the first generated token exposed more: the verifier and ordinary decoder used different matrix reduction paths and different activation precision for small K/V projections. Sharing the fast projection templates with a one-row entry point aligns those choices. A dedicated GPU validator now checks their packed-weight math, row parity and guards against a separate CPU implementation.
 
-The [native-context guide](/zinc/docs/rocm-native-context/) has the memory accounting, switches and validation results. This remains a single-slot ROCm Qwen feature. The repository coding acceptance described earlier still belongs to its original 32K FP32 run.
+The clean build passes 48 MTP/ordinary JSON/SSE responses, 24 cache checks and all 23 API checks, alongside 158 GPU reference/error cases. In the repeated server comparison at 262K allocated capacity, ZINC measured **63.5–76.2 decode tokens/s** against **29.3–29.4** for llama.cpp with quantized KV. Those prompts are still only 58–349 tokens; these are not 260K decode rates. The default FP32 control retained matching captured output and token counts, with decode changes from −0.09% to +0.08%.
+
+The benchmark guard also caught a defect in its own heuristic: a valid Markdown table delimiter looked like repeated tokens. The regression test fails under the original detector. The corrected check exempts a delimiter only after a matching textual header; malformed separators, repeated lines and control-token checks still fail. Reclassifying the captured output leaves every timing sample intact.
+
+The [native-context guide](/zinc/docs/rocm-native-context/) and [portable evidence](/zinc/validation/rocm-native-context-2026-10-26.json) have the memory accounting, switches, hashes, individual measurements and validation results. This remains a single-slot ROCm Qwen feature. The repository coding acceptance described earlier still belongs to its original 32K FP32 run.
 
 ## Try the same bounded workflow
 
