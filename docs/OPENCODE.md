@@ -68,6 +68,14 @@ Setup creates **`opencode.zinc.json`** and a small, versioned context hook in
 configs alone. To update an existing setup, rerun setup with `--force`. The
 helper replaces only its generated config and preserves unrelated hook files.
 
+To preview the exact configuration without writing anything, use `--dry-run`
+(setup only). It prints the same JSON, including the trailing newline, and
+creates no directories, hook, or config files:
+
+```bash
+bun tools/setup_opencode.mjs --dry-run --context 32768
+```
+
 The default limits are 16,384 context tokens, 4,096 output tokens per turn,
 and 24 agent steps. Match `--context` to the actual server context; it is not
 a request to allocate more memory on the server. Use `--output` and `--steps`

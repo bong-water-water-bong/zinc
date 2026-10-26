@@ -153,6 +153,10 @@ startup-path handoff. These supervisor changes are not attributed to the model.
 The serializer now has ten CPU tests covering JSON shape, integer fields,
 escaping, Unicode, basename privacy, and allocation ownership.
 
+A later bounded feature task completed with the enforced tool limits and code
+review feedback; its result is recorded below. It does not change the outcomes
+of these earlier runs.
+
 The harness now gives verified rounds a different contract: edit, finish the
 round, and let the wrapper run the full check outside the model conversation.
 Failures return bounded diagnostic excerpts, including errors in the middle of
@@ -245,6 +249,41 @@ on macOS, including a project path with spaces and Unicode. The wrapper has
 36 passing tests on both platforms; the full CPU suites pass with 702 Bun
 tests, six GPU/API skips, and the Zig suite.
 
+### A completed feature with review feedback
+
+The next fresh Zinc worktree used OpenCode 1.19.4, the 27B model at 32K context,
+NextN enabled, and exact-prefix reuse. The task added a setup-only `--dry-run`
+configuration preview and documented it in the OpenCode guide.
+
+The first editing round read source without making changes. Its independent
+check failed and resumed the same session. The second round implemented the
+feature and passed the initial checks after 465 seconds and 14 tool calls.
+Code review then found two gaps in those acceptance checks: the preview emitted
+an extra newline, and `run --dry-run` without a task gave a task-required error
+instead of the setup-only error. The checks were strengthened before accepting
+the patch.
+
+The same model session repaired both issues after that feedback, using one
+read, one edit, and one Bash call. The editing round reached its three-minute
+deadline; the wrapper then accepted the partial work only after all twelve
+stricter acceptance categories, the existing harness tests, the full project
+CPU checks, formatting, and patch-whitespace checks passed. This exercised the
+verified-timeout path with actual model inference.
+
+The supervisor did not edit the implementation. Protected tests, configuration,
+and the generated context hook remained unchanged. Twenty traced requests used
+the passthrough proxy without synthetic or repaired responses. Both jobs
+stopped their owned model server, proxy, and wrapper. Six permanent CLI tests
+now cover exact preview bytes, option overrides, filesystem preservation,
+runtime-value privacy, command scope, and invalid budgets; the full local CPU
+suites pass with 715 Bun tests, six GPU/API skips, and the Zig suite. The
+benchmark tooling has 81 passing tests covering backend device checks and
+matched server context capacity.
+
+This is one accepted repository feature **with review feedback**. The previous
+timeouts and context failures remain recorded; broader unsupervised coding
+reliability is not established.
+
 ## Remaining hardware validation
 
 After the coding trial, a short-context regression comparison could not start:
@@ -280,9 +319,35 @@ The parked GPU checks now pass against the frozen ReleaseFast/Debug builds:
   prompt. Every validation job stops its owned model server.
 
 The [portable results](/zinc/validation/rocm-agent-context-2026-10-25.json)
-record source/binary fingerprints and the individual checks. A fresh live
-repository coding acceptance run with the latest round instructions is still
-**pending**.
+record source/binary fingerprints, the individual hardware checks, and the
+accepted feature task with its review feedback.
+
+### Matched throughput after recovery
+
+The reusable-server suite was rerun with the same 27B GGUF, one slot, a
+32,768-token capacity for both servers, one discarded warmup, and five
+measured runs per scenario. ZINC used NextN with prompt reuse disabled;
+llama.cpp used its HIP backend at commit `5f436dddb`. Both used the same
+ASPM/clock policy. Prompt counts match exactly, and both engines reach every
+requested output budget. The suite's automatic preview checks pass.
+
+| Scenario          | Prompt tokens | Output tokens | ZINC decode | llama.cpp decode |
+| ----------------- | ------------: | ------------: | ----------: | ---------------: |
+| Quick Chat        |            58 |            96 |       64.33 |            30.13 |
+| Coding Review     |           183 |           160 |       74.67 |            30.09 |
+| Incident Context  |           349 |           128 |       67.59 |            30.10 |
+| Long Coding Draft |            80 |           256 |       73.06 |            30.10 |
+
+Decode values are median tokens per second. Summed prompt-plus-generation
+phase time is **10.033 seconds for ZINC versus 22.555 seconds for llama.cpp**:
+**2.248× the phase throughput**, or **55.52% less phase time**. These are the
+suite's fixed short prompts; the 32K setting describes server capacity.
+
+The runner now checks ROCm through ROCr inventory and uses logical device zero
+after filtering visibility. `--rdna-context` makes capacity explicit for both
+servers. The portable report retains each measured sample and source/binary
+fingerprints. This campaign stopped its owned servers and restored the original
+power settings.
 
 ## Reproduce the GPU validator
 

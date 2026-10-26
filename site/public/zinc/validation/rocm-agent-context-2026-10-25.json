@@ -183,6 +183,74 @@
       "independent_checks_completed": 0,
       "protected_inputs_unchanged": true,
       "owned_processes_stopped": true
+    },
+    {
+      "date": "2026-10-26",
+      "task": "setup-only --dry-run configuration preview",
+      "base_source": "1309f888fe85dfefae3bca139becb6e11d067e94",
+      "engine_source": "18dd8b7b245c8c7037c36e0ec2ec937b37de93ea",
+      "helper_sha256": "635454a89ad9bbe969b3632588cded33f4639197744f546af45481b177fa6f3f",
+      "model": "qwen38-27b-q4k-m",
+      "context": 32768,
+      "mtp": true,
+      "prompt_cache": true,
+      "opencode": "1.19.4",
+      "with_review_feedback": true,
+      "supervisor_implementation_edits": false,
+      "initial": {
+        "wrapper_exit_code": 0,
+        "seconds": 465.06,
+        "tool_counts": {
+          "read": 7,
+          "edit": 6,
+          "bash": 1
+        },
+        "independent_checks": [
+          [
+            "1",
+            "failed"
+          ],
+          [
+            "2",
+            "passed"
+          ]
+        ],
+        "accepted_after_review": false,
+        "review_findings": [
+          "extra trailing newline",
+          "preview command-scope error without a task"
+        ]
+      },
+      "review_repair": {
+        "wrapper_exit_code": 0,
+        "seconds": 185.02,
+        "tool_counts": {
+          "read": 1,
+          "edit": 1,
+          "bash": 1
+        },
+        "independent_checks": [
+          [
+            "1",
+            "passed"
+          ]
+        ],
+        "editing_round_timed_out": true,
+        "verified_partial_patch_accepted": true,
+        "acceptance_passed": 12,
+        "acceptance_total": 12,
+        "byte_exact_preview": true,
+        "scope_error_without_task": true,
+        "project_cpu_checks": "pass",
+        "formatting": "pass",
+        "protected_inputs_unchanged": true,
+        "guarded_files_unchanged": true
+      },
+      "trace_requests": 20,
+      "synthetic_or_repaired_responses": 0,
+      "owned_processes_stopped": true,
+      "accepted_patch_sha256": "f18104688e2e30f0d20c063994088a4e83171ad61a29e7926a25e8dce77063ed",
+      "scope": "one bounded repository feature with review feedback; no general coding-reliability or headline throughput claim"
     }
   ],
   "current_cpu_checks": {
@@ -191,10 +259,12 @@
     "combined_zig_bun_test_command": "pass",
     "gpu_smoke_tests_in_local_command": "skipped",
     "standalone_bun": {
-      "passed": 702,
+      "passed": 715,
       "skipped": 6,
       "failed": 0
-    }
+    },
+    "preview_cli_tests_passed": 6,
+    "benchmark_tool_tests_passed": 81
   },
   "hardware_status": {
     "gpu_resume": "recovered after reboot; ROCm and ZINC device checks passed",
@@ -204,9 +274,10 @@
     },
     "application_services_running": true,
     "failed_systemd_services": 0,
-    "pending_checks": [
-      "successful live coding run with the latest round instructions"
-    ]
+    "pending_checks": [],
+    "coding_scope": "One bounded repository feature passed with review feedback; broader autonomous coding remains unestablished.",
+    "final_gpu_ready": true,
+    "final_owned_gpu_processes": 0
   },
   "final_rocm_build": {
     "source": "18dd8b7b245c8c7037c36e0ec2ec937b37de93ea",
@@ -702,6 +773,455 @@
         ]
       }
     },
-    "live_model_coding_acceptance": "pending"
+    "live_model_coding_acceptance": "pass for one bounded feature with review feedback",
+    "source": "1309f888fe85dfefae3bca139becb6e11d067e94"
+  },
+  "preview_feature": {
+    "helper_sha256": "eb5cfd6074d5e328e530a88054504f5937cf03b27ab7b451f7e665b7d7da39ac",
+    "implementation": "model-authored with code-review feedback",
+    "independent_acceptance_passed": 12,
+    "permanent_cli_tests": 6,
+    "exact_preview_bytes": true,
+    "no_project_or_hook_writes": true,
+    "no_runtime_endpoint_or_key_capture": true
+  },
+  "matched_server_performance": {
+    "date": "2026-10-26",
+    "scope": "four fixed short prompts with matched 32768-token server capacity; not a long-history coding speed measurement",
+    "runner": "tools/performance_suite.mjs",
+    "harness_source": "cba7ba61ff7662d76adbc37ed71be9db75e3ea4f",
+    "harness_sha256": "2fef98d560ba6a490f0553dcdb8797c6d9678086f9e5013ccdb1eaf249f9ee93",
+    "zinc_source": "1309f888fe85dfefae3bca139becb6e11d067e94",
+    "zinc_binary_sha256": "d7d162dbb8ca17963942408890e1f2e0d1bc7015e636fd7bbb102dc3daaa790f",
+    "llama_cpp_source": "5f436dddb440a288ee5611d7d1eca564a6aca9f4",
+    "llama_cpp_binary_sha256": "abfb9322807d5fd912607aba1aab6c59e1c7eb8b89b899176bff410eb22c25b7",
+    "model": "qwen38-27b-q4k-m",
+    "model_sha256": "7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169",
+    "context_per_slot": 32768,
+    "parallel": 1,
+    "mtp": true,
+    "prompt_cache": false,
+    "baseline_prompt_cache": false,
+    "warmups_per_scenario": 1,
+    "runs_per_scenario": 5,
+    "power_policy": "ASPM performance; automatic GPU clock governor for both engines",
+    "rows": [
+      {
+        "id": "core",
+        "label": "Quick Chat",
+        "prompt_tokens": 58,
+        "output_tokens": 96,
+        "zinc": {
+          "prefill_tps": {
+            "min": 537.57,
+            "max": 542.97,
+            "avg": 540.0600000000001,
+            "median": 539.87,
+            "p95": 542.406,
+            "stddev": 1.721325070984554,
+            "samples": [
+              542.97,
+              540.15,
+              539.87,
+              539.74,
+              537.57
+            ]
+          },
+          "decode_tps": {
+            "min": 64.28,
+            "max": 64.38,
+            "avg": 64.332,
+            "median": 64.33,
+            "p95": 64.374,
+            "stddev": 0.033105890714491916,
+            "samples": [
+              64.38,
+              64.35,
+              64.32,
+              64.33,
+              64.28
+            ]
+          },
+          "total_latency_ms": {
+            "min": 1745.5398749999986,
+            "max": 1787.359875,
+            "avg": 1764.2664831999998,
+            "median": 1763.2731249999997,
+            "p95": 1784.2855666,
+            "stddev": 14.613072614037504,
+            "samples": [
+              1763.2731249999997,
+              1771.9883330000002,
+              1753.1712080000007,
+              1745.5398749999986,
+              1787.359875
+            ]
+          }
+        },
+        "llama_cpp": {
+          "prefill_tps": {
+            "min": 264.8292992525421,
+            "max": 271.32979668977646,
+            "avg": 267.7979083046756,
+            "median": 268.2118133430752,
+            "p95": 270.75237901366665,
+            "stddev": 2.2138108777231698,
+            "samples": [
+              271.32979668977646,
+              264.8292992525421,
+              266.1759239287566,
+              268.44270830922744,
+              268.2118133430752
+            ]
+          },
+          "decode_tps": {
+            "min": 30.12095943182359,
+            "max": 30.140693584949954,
+            "avg": 30.132351141701974,
+            "median": 30.13403937916266,
+            "p95": 30.14005868511468,
+            "stddev": 0.0069773606187515285,
+            "samples": [
+              30.13403937916266,
+              30.1375190857736,
+              30.140693584949954,
+              30.12854422680007,
+              30.12095943182359
+            ]
+          },
+          "total_latency_ms": {
+            "min": 3537.288541999995,
+            "max": 3703.5814580000006,
+            "avg": 3634.7781915999976,
+            "median": 3694.402541000003,
+            "p95": 3702.5925663999983,
+            "stddev": 78.55897169979245,
+            "samples": [
+              3703.5814580000006,
+              3694.402541000003,
+              3539.9814170000027,
+              3537.288541999995,
+              3698.636999999988
+            ]
+          }
+        },
+        "overall_ratio": 2.1266056361968717,
+        "automatic_preview_check": "pass"
+      },
+      {
+        "id": "context-medium",
+        "label": "Coding Review",
+        "prompt_tokens": 183,
+        "output_tokens": 160,
+        "zinc": {
+          "prefill_tps": {
+            "min": 637.15,
+            "max": 647.49,
+            "avg": 642.0199999999999,
+            "median": 643.05,
+            "p95": 646.6379999999999,
+            "stddev": 3.584087052514226,
+            "samples": [
+              647.49,
+              643.23,
+              643.05,
+              639.18,
+              637.15
+            ]
+          },
+          "decode_tps": {
+            "min": 74.6,
+            "max": 74.77,
+            "avg": 74.674,
+            "median": 74.67,
+            "p95": 74.75399999999999,
+            "stddev": 0.05678027826631348,
+            "samples": [
+              74.77,
+              74.69,
+              74.67,
+              74.64,
+              74.6
+            ]
+          },
+          "total_latency_ms": {
+            "min": 2553.026040999999,
+            "max": 2795.0559170000015,
+            "avg": 2673.3182334000007,
+            "median": 2700.2765,
+            "p95": 2782.0659004000017,
+            "stddev": 89.99935824961402,
+            "samples": [
+              2553.026040999999,
+              2730.105834000002,
+              2588.1268750000017,
+              2700.2765,
+              2795.0559170000015
+            ]
+          }
+        },
+        "llama_cpp": {
+          "prefill_tps": {
+            "min": 526.6338599671933,
+            "max": 531.1044360280354,
+            "avg": 529.5543921743663,
+            "median": 529.9938891414969,
+            "p95": 531.0068025729864,
+            "stddev": 1.5665257550933434,
+            "samples": [
+              529.423506982315,
+              526.6338599671933,
+              529.9938891414969,
+              530.6162687527908,
+              531.1044360280354
+            ]
+          },
+          "decode_tps": {
+            "min": 30.07691177079804,
+            "max": 30.09109653659049,
+            "avg": 30.083660899533868,
+            "median": 30.086068863416436,
+            "p95": 30.090309617364234,
+            "stddev": 0.005699049187051176,
+            "samples": [
+              30.08716194045921,
+              30.086068863416436,
+              30.09109653659049,
+              30.077065386405167,
+              30.07691177079804
+            ]
+          },
+          "total_latency_ms": {
+            "min": 5819.418374999994,
+            "max": 5907.323708999989,
+            "avg": 5859.0979087999995,
+            "median": 5851.762334000014,
+            "p95": 5904.547708999991,
+            "stddev": 35.771222975076,
+            "samples": [
+              5819.418374999994,
+              5893.443708999999,
+              5823.541417,
+              5907.323708999989,
+              5851.762334000014
+            ]
+          }
+        },
+        "overall_ratio": 2.33315336857602,
+        "automatic_preview_check": "pass"
+      },
+      {
+        "id": "context-long",
+        "label": "Incident Context",
+        "prompt_tokens": 349,
+        "output_tokens": 128,
+        "zinc": {
+          "prefill_tps": {
+            "min": 748.65,
+            "max": 751.13,
+            "avg": 749.8399999999999,
+            "median": 749.68,
+            "p95": 750.942,
+            "stddev": 0.8139287438099385,
+            "samples": [
+              751.13,
+              750.19,
+              749.68,
+              749.55,
+              748.65
+            ]
+          },
+          "decode_tps": {
+            "min": 67.52,
+            "max": 67.62,
+            "avg": 67.576,
+            "median": 67.59,
+            "p95": 67.616,
+            "stddev": 0.036110940170537835,
+            "samples": [
+              67.6,
+              67.62,
+              67.59,
+              67.55,
+              67.52
+            ]
+          },
+          "total_latency_ms": {
+            "min": 2606.7888749999984,
+            "max": 2750.446874999998,
+            "avg": 2693.8774331999994,
+            "median": 2702.238250000002,
+            "p95": 2742.7790749999986,
+            "stddev": 47.333284372842435,
+            "samples": [
+              2750.446874999998,
+              2712.1078750000015,
+              2606.7888749999984,
+              2702.238250000002,
+              2697.805290999997
+            ]
+          }
+        },
+        "llama_cpp": {
+          "prefill_tps": {
+            "min": 728.9832459180071,
+            "max": 737.4506605360358,
+            "avg": 733.5954808762526,
+            "median": 734.8760817839169,
+            "p95": 736.9735110652896,
+            "stddev": 2.963317481362309,
+            "samples": [
+              737.4506605360358,
+              734.8760817839169,
+              735.0649131823045,
+              731.6025029609987,
+              728.9832459180071
+            ]
+          },
+          "decode_tps": {
+            "min": 30.092483442618015,
+            "max": 30.10690083355815,
+            "avg": 30.101352748430077,
+            "median": 30.10193415592992,
+            "p95": 30.10636987207072,
+            "stddev": 0.004861655602955895,
+            "samples": [
+              30.092483442618015,
+              30.104246026121004,
+              30.10193415592992,
+              30.10690083355815,
+              30.101199283923282
+            ]
+          },
+          "total_latency_ms": {
+            "min": 4898.1349169999885,
+            "max": 5156.937416999979,
+            "avg": 4965.8826667999965,
+            "median": 4917.762333999999,
+            "p95": 5115.728325199987,
+            "stddev": 97.21678498274053,
+            "samples": [
+              4905.686707999994,
+              4950.891958000022,
+              4898.1349169999885,
+              4917.762333999999,
+              5156.937416999979
+            ]
+          }
+        },
+        "overall_ratio": 2.0036120834773112,
+        "automatic_preview_check": "pass"
+      },
+      {
+        "id": "decode-extended",
+        "label": "Long Coding Draft",
+        "prompt_tokens": 80,
+        "output_tokens": 256,
+        "zinc": {
+          "prefill_tps": {
+            "min": 561.62,
+            "max": 564.16,
+            "avg": 562.7139999999999,
+            "median": 562.51,
+            "p95": 563.97,
+            "stddev": 0.8933218904739628,
+            "samples": [
+              563.21,
+              562.51,
+              564.16,
+              561.62,
+              562.07
+            ]
+          },
+          "decode_tps": {
+            "min": 73.04,
+            "max": 73.1,
+            "avg": 73.06800000000001,
+            "median": 73.06,
+            "p95": 73.09599999999999,
+            "stddev": 0.020396078054367082,
+            "samples": [
+              73.1,
+              73.08,
+              73.06,
+              73.06,
+              73.04
+            ]
+          },
+          "total_latency_ms": {
+            "min": 3845.1448330000057,
+            "max": 4003.7309160000077,
+            "avg": 3919.3863166000024,
+            "median": 3909.1737090000024,
+            "p95": 3993.0703912000054,
+            "stddev": 54.13045255208168,
+            "samples": [
+              3909.1737090000024,
+              3888.4538329999996,
+              3845.1448330000057,
+              3950.428291999997,
+              4003.7309160000077
+            ]
+          }
+        },
+        "llama_cpp": {
+          "prefill_tps": {
+            "min": 306.2927852734429,
+            "max": 314.542066069561,
+            "avg": 309.5463460256436,
+            "median": 309.05691283049777,
+            "p95": 313.52369745516216,
+            "stddev": 2.7250464756604154,
+            "samples": [
+              314.542066069561,
+              309.05691283049777,
+              309.4502229975669,
+              308.3897429571493,
+              306.2927852734429
+            ]
+          },
+          "decode_tps": {
+            "min": 30.103698386913983,
+            "max": 30.108678159365592,
+            "avg": 30.10557437061592,
+            "median": 30.104291892158635,
+            "p95": 30.108429317590172,
+            "stddev": 0.0020742851823549544,
+            "samples": [
+              30.103698386913983,
+              30.108678159365592,
+              30.104291892158635,
+              30.107433950488502,
+              30.1037694641529
+            ]
+          },
+          "total_latency_ms": {
+            "min": 8931.976584000018,
+            "max": 9078.253832999995,
+            "avg": 8992.273900200007,
+            "median": 8998.55795800002,
+            "p95": 9062.9801998,
+            "stddev": 50.77195564736067,
+            "samples": [
+              8998.55795800002,
+              8950.69545899998,
+              8931.976584000018,
+              9001.885667000024,
+              9078.253832999995
+            ]
+          }
+        },
+        "overall_ratio": 2.403227801097213,
+        "automatic_preview_check": "pass"
+      }
+    ],
+    "summed_phase_seconds": {
+      "zinc": 10.032573610289228,
+      "llama_cpp": 22.555127349595537
+    },
+    "overall_ratio": 2.2481895698690315,
+    "phase_wall_reduction_percent": 55.51976517450639,
+    "owned_servers_stopped": true,
+    "original_power_settings_restored": true
   }
 }

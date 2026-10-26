@@ -91,6 +91,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
     output: undefined,
     steps: 24,
     force: false,
+    dryRun: false,
     prompt: [],
     auto: false,
     timeoutMs: 900000,
@@ -109,6 +110,10 @@ export function parseArgs(argv = process.argv.slice(2)) {
     }
     if (arg === '--force') {
       opts.force = true;
+      continue;
+    }
+    if (arg === '--dry-run') {
+      opts.dryRun = true;
       continue;
     }
     if (arg === '--auto') {
@@ -697,6 +702,7 @@ async function main() {
   --verify CMD      Run this shell command between short editing rounds (run only)
   --attempts N      Maximum verified editing rounds (default: 3; maximum: 10)
   --force           Replace only opencode.zinc.json
+  --dry-run         Setup only: print the config JSON without writing anything
   --auto            Approve headless tool requests; explicit denies still apply
 
 Setup writes opencode.zinc.json and a portable local hook in .zinc/.
@@ -706,6 +712,7 @@ with ZINC_API_KEY; their values are never saved by this script.
 Install OpenCode first: bun install --global opencode-ai@1.19.4
 
   bun tools/setup_opencode.mjs --project ./my-project
+  bun tools/setup_opencode.mjs --dry-run --context 32768
   bun tools/setup_opencode.mjs check --project ./my-project
   bun tools/setup_opencode.mjs run --project ./my-project --auto -- "Fix the failing tests"
 
@@ -721,9 +728,16 @@ Interactive: OPENCODE_CONFIG=./opencode.zinc.json opencode
   if (opts.attempts !== undefined && !opts.verify) throw new Error('Attempts requires --verify');
   if (opts.roundTimeoutMs !== undefined && !opts.verify)
     throw new Error('Round timeout requires --verify');
+  if (opts.dryRun && opts.command !== 'setup')
+    throw new Error('--dry-run is only available for setup');
   if (opts.command === 'run') requireTask(opts);
   if (opts.command === 'setup') {
-    await writeConfig(opts.project, buildConfig(opts), opts);
+    const config = buildConfig(opts);
+    if (opts.dryRun) {
+      console.log(JSON.stringify(config, null, 2));
+      return;
+    }
+    await writeConfig(opts.project, config, opts);
     console.log(
       `Created ${CONFIG_NAME}. Start ZINC with the same context limit, then use check or run.`,
     );
@@ -745,7 +759,7 @@ if (import.meta.main)
   main().catch((error) => {
     // Do not print fetch/child errors that could include a private URL or token.
     const known =
-      /^(Bun 1\.4\.4|Unknown option:|Missing value for|Use a model ID|Context must|Output must|Steps must|Timeout must|Round timeout |Verification |Attempts |ZINC_API_BASE_URL|ZINC .*check|ZINC returned|ZINC context hook|Pass a task)/.test(
+      /^(Bun 1\.4\.4|Unknown option:|Missing value for|Use a model ID|Context must|Output must|Steps must|Timeout must|Round timeout |Verification |Attempts |ZINC_API_BASE_URL|ZINC .*check|ZINC returned|ZINC context hook|Pass a task|--dry-run is only available for setup)/.test(
         error.message,
       );
     console.error(

@@ -204,6 +204,7 @@ dense FFN, and MoE branches live in the active backend's forward implementation.
 | Exact-prefix cache parity                          | `tools/validate_rocm_prompt_cache.mjs`    |
 | OpenCode setup, bounded tool hook, verified rounds | `tools/setup_opencode.mjs`                |
 | CPU OpenCode protocol and lifecycle                | `tools/validate_opencode_harness.mjs`     |
+| OpenCode preview CLI regressions                   | `tools/setup_opencode_preview.test.ts`    |
 | Optimization harnesses                             | `loops/`                                  |
 
 Treat implementation source and command `--help` output as authoritative for

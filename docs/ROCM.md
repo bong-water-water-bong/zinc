@@ -206,6 +206,13 @@ The RDNA runner applies the same host policy before either engine: PCIe ASPM
 is set to performance and the discrete GPU uses its automatic clock policy.
 Warmups and repeated runs account for clock ramping.
 
+ROCm preflight uses `rocminfo` with ROCr visibility. The legacy
+`--rdna-vk-device` option selects a ROCr ordinal for the ROCm backend; Vulkan
+may enumerate the same card at a different index. The selected GPU appears as
+logical device zero to ZINC and the HIP baseline. Both servers use the same
+context capacity: the model setting or 4,096 by default, with
+`--rdna-context` to override it.
+
 ```bash
 source .env
 
@@ -216,8 +223,8 @@ bun tools/performance_suite.mjs \
   --runs 5 \
   --warmup 1 \
   --rdna-backend rocm \
+  --rdna-context 32768 \
   --rdna-build \
-  --rdna-start-llama \
   --rdna-llama-server /path/to/llama.cpp/build-hip/bin/llama-server \
   --rdna-llama-device ROCm0 \
   --no-site-write \

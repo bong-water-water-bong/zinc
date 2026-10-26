@@ -54,7 +54,7 @@ per-scenario timings:
 ```bash
 source .env
 bun tools/performance_suite.mjs \
-  --target rdna --phase all --rdna-sync --rdna-build --rdna-start-llama \
+  --target rdna --phase all --rdna-sync --rdna-build \
   --runs 3 --warmup 1 --no-site-write --output /tmp/zinc-rdna-suite.json
 ```
 
