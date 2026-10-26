@@ -210,6 +210,15 @@ produced a failing run without starting verification. The portable config
 remained unchanged in both fixtures. These checks perform no model inference;
 the GPU-dependent acceptance and performance checks below remain pending.
 
+A portable [CPU protocol validator](https://github.com/zolotukhin/zinc/blob/main/tools/validate_opencode_harness.mjs)
+now reproduces the timeout/repair and API-error cases, and the test workflow
+runs it with actual OpenCode 1.19.4. It also passed locally with OpenCode
+1.18.33 using a project path containing spaces and Unicode. CLI diagnostics
+are captured separately from the JSON event stream; the validator's result
+summary omits paths, endpoints, credentials, and session IDs. The latest local
+CPU checks pass with 32 harness tests, 698 Bun tests, six GPU/API skips, and
+the Zig suite. These remain protocol checks with scripted responses.
+
 ## Remaining hardware validation
 
 After the coding trial, a short-context regression comparison could not start:

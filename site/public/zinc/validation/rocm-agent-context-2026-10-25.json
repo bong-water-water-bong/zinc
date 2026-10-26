@@ -15,7 +15,8 @@
     "model_discovery": "0d0d3795ead5fe4330aa61eaa244b4fb8cc0b63b",
     "verification_rounds": "18dd8b7b245c8c7037c36e0ec2ec937b37de93ea",
     "verification_deadlines": "cde6201b26272ec7557ea4c133c29bbae4141aad",
-    "verification_failure_guards": "3ed6069d3a845f7aed013725e717a45b6c166f43"
+    "verification_failure_guards": "3ed6069d3a845f7aed013725e717a45b6c166f43",
+    "portable_harness_validator": "b80cb1be3939a64114110a8d7704b870c99b751d"
   },
   "attention": {
     "passed": 25,
@@ -165,11 +166,11 @@
   ],
   "current_cpu_checks": {
     "serializer_tests_passed": 10,
-    "setup_wrapper_tests_passed": 31,
+    "setup_wrapper_tests_passed": 32,
     "combined_zig_bun_test_command": "pass",
     "gpu_smoke_tests_in_local_command": "skipped",
     "standalone_bun": {
-      "passed": 697,
+      "passed": 698,
       "skipped": 6,
       "failed": 0
     }
@@ -262,5 +263,60 @@
       }
     },
     "model_coding_acceptance": false
+  },
+  "portable_harness_validator": {
+    "date": "2026-10-26",
+    "source": "b80cb1be3939a64114110a8d7704b870c99b751d",
+    "helper_sha256": "daf2c91493deaa9a58fc0405a3b91bed25dbc0d6398867d758e6d43122981136",
+    "validator_sha256": "8aaea526eee4c1a0126e60d22d6c687ebad92890c4bf721a69963d34925b6ddc",
+    "scope": "CPU protocol fixtures with actual OpenCode and scripted responses",
+    "model_inference": false,
+    "performance_measurement": false,
+    "macos": {
+      "opencode": "1.18.33",
+      "project_path_spaces_and_unicode": true,
+      "passed": true,
+      "cases": [
+        {
+          "name": "timeout-repair",
+          "passed": true,
+          "run_exit_code": 0,
+          "elapsed_ms": 10007,
+          "requests": 5,
+          "error_events": 0,
+          "tool_events": 2,
+          "unique_sessions": 1,
+          "verification_exit_codes": [
+            1,
+            0
+          ],
+          "stalled_requests": 1,
+          "configuration_unchanged": true,
+          "protected_test_unchanged": true,
+          "logs_truncated": false
+        },
+        {
+          "name": "api-error",
+          "passed": true,
+          "run_exit_code": 1,
+          "elapsed_ms": 1669,
+          "requests": 2,
+          "error_events": 1,
+          "tool_events": 0,
+          "unique_sessions": 1,
+          "verification_exit_codes": [],
+          "stalled_requests": 0,
+          "configuration_unchanged": true,
+          "protected_test_unchanged": true,
+          "logs_truncated": false
+        }
+      ]
+    },
+    "ci": {
+      "workflow": "Tests",
+      "job": "opencode-harness",
+      "opencode": "1.19.4",
+      "gpu_required": false
+    }
   }
 }
