@@ -162,27 +162,49 @@
       "agent_executed_bun_tests_passed": 674,
       "agent_executed_rocm_compile_passed": true,
       "final_independent_wrapper_round_completed": false
+    },
+    {
+      "date": "2026-10-26",
+      "task": "setup-only configuration preview",
+      "model": "27b",
+      "context": 32768,
+      "source": "d2437491b13365aa93fb144e561c29b3d9ad1264",
+      "opencode": "1.19.4",
+      "result": "api_error",
+      "error": "prompt longer than context",
+      "elapsed_seconds": 200.02,
+      "tool_calls": 5,
+      "whole_file_read_characters": [
+        28358,
+        16630,
+        36181
+      ],
+      "feature_edits": 0,
+      "independent_checks_completed": 0,
+      "protected_inputs_unchanged": true,
+      "owned_processes_stopped": true
     }
   ],
   "current_cpu_checks": {
     "serializer_tests_passed": 10,
-    "setup_wrapper_tests_passed": 32,
+    "setup_wrapper_tests_passed": 36,
     "combined_zig_bun_test_command": "pass",
     "gpu_smoke_tests_in_local_command": "skipped",
     "standalone_bun": {
-      "passed": 698,
+      "passed": 702,
       "skipped": 6,
       "failed": 0
     }
   },
   "hardware_status": {
-    "gpu_resume": "failed",
-    "control_startup_error": "CudaNoDevice before model load",
-    "device_only_recovery": "unsuccessful; driver probe blocked",
+    "gpu_resume": "recovered after reboot; ROCm and ZINC device checks passed",
+    "previous_failure": {
+      "control_startup_error": "CudaNoDevice before model load",
+      "device_only_recovery": "unsuccessful; driver probe blocked"
+    },
+    "application_services_running": true,
+    "failed_systemd_services": 0,
     "pending_checks": [
-      "latest discovery and managed-ID live HTTP",
-      "full-model multi-slot and graph cases",
-      "short-context regression matrix",
       "successful live coding run with the latest round instructions"
     ]
   },
@@ -193,7 +215,7 @@
     "optimize": "ReleaseFast",
     "result": "pass",
     "binary_sha256": "f1ad27db0de655c2cf85bc961635428115e26766562353f9bb06d42fee3268d3",
-    "gpu_execution": "pending device recovery"
+    "gpu_execution": "passed live discovery, generation, and 23 API checks after recovery"
   },
   "updated_date": "2026-10-26",
   "harness_timeout_recovery": {
@@ -318,5 +340,368 @@
       "opencode": "1.19.4",
       "gpu_required": false
     }
+  },
+  "recovery_validation": {
+    "date": "2026-10-26",
+    "engine_source": "18dd8b7b245c8c7037c36e0ec2ec937b37de93ea",
+    "live_discovery": {
+      "cases": [
+        {
+          "name": "old managed-ID startup failure reproduced",
+          "pass": true
+        },
+        {
+          "name": "direct discovery, capacity, privacy, reuse, stats, generation and method routing",
+          "pass": true
+        },
+        {
+          "name": "managed discovery, capacity, privacy, reuse, stats, generation and method routing",
+          "pass": true
+        },
+        {
+          "name": "api-27b discovery, capacity, privacy, reuse, stats, generation and method routing",
+          "pass": true
+        }
+      ],
+      "api_passed": 23,
+      "api_total": 23,
+      "api_checks": [
+        {
+          "name": "JSON/SSE parity at 1 output tokens",
+          "pass": true,
+          "ms": 901
+        },
+        {
+          "name": "JSON/SSE parity at 2 output tokens",
+          "pass": true,
+          "ms": 968
+        },
+        {
+          "name": "JSON/SSE parity at 7 output tokens",
+          "pass": true,
+          "ms": 977
+        },
+        {
+          "name": "Unicode JSON/SSE parity",
+          "pass": true,
+          "ms": 1436
+        },
+        {
+          "name": "Unicode JSON/SSE parity at 1 output tokens",
+          "pass": true,
+          "ms": 1110
+        },
+        {
+          "name": "Unicode JSON/SSE parity at 2 output tokens",
+          "pass": true,
+          "ms": 1178
+        },
+        {
+          "name": "Unicode JSON/SSE parity at 3 output tokens",
+          "pass": true,
+          "ms": 1184
+        },
+        {
+          "name": "JSON tool arguments and unique ID",
+          "pass": true,
+          "ms": 841
+        },
+        {
+          "name": "SSE tool arguments and unique ID",
+          "pass": true,
+          "ms": 735
+        },
+        {
+          "name": "JSON tool schema retains numbers booleans arrays objects and strings",
+          "pass": true,
+          "ms": 1248
+        },
+        {
+          "name": "SSE tool schema retains numbers booleans arrays objects and strings",
+          "pass": true,
+          "ms": 1247
+        },
+        {
+          "name": "Truncated tool calls remain text without an executable call",
+          "pass": true,
+          "ms": 686
+        },
+        {
+          "name": "Null assistant content and tool-result history",
+          "pass": true,
+          "ms": 244
+        },
+        {
+          "name": "tool_choice none",
+          "pass": true,
+          "ms": 126
+        },
+        {
+          "name": "Text content arrays",
+          "pass": true,
+          "ms": 492
+        },
+        {
+          "name": "Malformed JSON returns HTTP 400",
+          "pass": true,
+          "ms": 0
+        },
+        {
+          "name": "Invalid message content returns HTTP 400",
+          "pass": true,
+          "ms": 0
+        },
+        {
+          "name": "Empty messages returns HTTP 400",
+          "pass": true,
+          "ms": 0
+        },
+        {
+          "name": "Negative token budget returns HTTP 400",
+          "pass": true,
+          "ms": 0
+        },
+        {
+          "name": "Context overflow returns HTTP 400",
+          "pass": true,
+          "ms": 6
+        },
+        {
+          "name": "Queued requests keep conversations separate",
+          "pass": true,
+          "ms": 1608
+        },
+        {
+          "name": "Streaming cancellation releases the slot",
+          "pass": true,
+          "ms": 658
+        },
+        {
+          "name": "Long prompt above the former 8192-token SSM limit",
+          "pass": true,
+          "ms": 36277
+        }
+      ]
+    },
+    "full_model_slots": {
+      "model": "qwen35-9b-q4k-m",
+      "build": "Debug",
+      "context_per_slot": 32768,
+      "slot_counts": [
+        1,
+        2
+      ],
+      "ordinary_passed": 9,
+      "graph_passed": 11,
+      "prompt_token_counts": [
+        46,
+        8190,
+        8548,
+        17048,
+        30048
+      ],
+      "graph_dispatch_boundary": {
+        "prompt_tokens": 8190,
+        "total_tokens": 8198,
+        "threshold": 8192,
+        "exact_key_returned": true
+      },
+      "peak_batch": 2,
+      "concurrent_distinct_keys": true,
+      "short_after_long": true,
+      "owned_servers_stopped": true
+    },
+    "short_context_diagnostic": {
+      "scope": "matched persistent-server diagnostic against the previous control binary; not a headline performance comparison",
+      "model": "qwen38-27b-q4k-m",
+      "model_sha256": "7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169",
+      "context": 8192,
+      "parallel": 1,
+      "mtp": true,
+      "warmups_per_scenario": 1,
+      "runs_per_scenario": 3,
+      "control_binary_sha256": "9400bc880bbf8bde3a042a44d49e57b796bc33319d34ee1f0222c9b9a7c366d8",
+      "candidate_binary_sha256": "f1ad27db0de655c2cf85bc961635428115e26766562353f9bb06d42fee3268d3",
+      "comparison": [
+        {
+          "id": "core",
+          "greedy_output_and_usage_match": true,
+          "before_decode_tps": 64.22,
+          "after_decode_tps": 64.08,
+          "decode_change_percent": -0.21800062285892707,
+          "wall_change_percent": 0.24788076392643354
+        },
+        {
+          "id": "context-medium",
+          "greedy_output_and_usage_match": true,
+          "before_decode_tps": 74.66,
+          "after_decode_tps": 74.44,
+          "decode_change_percent": -0.29466916688990485,
+          "wall_change_percent": 0.3397946670277374
+        },
+        {
+          "id": "context-long",
+          "greedy_output_and_usage_match": true,
+          "before_decode_tps": 67.56,
+          "after_decode_tps": 67.41,
+          "decode_change_percent": -0.2220248667850866,
+          "wall_change_percent": 0.24184610848398957
+        },
+        {
+          "id": "decode-extended",
+          "greedy_output_and_usage_match": true,
+          "before_decode_tps": 73.14,
+          "after_decode_tps": 73.0,
+          "decode_change_percent": -0.1914137270987104,
+          "wall_change_percent": 0.17327426049880135
+        }
+      ],
+      "all_greedy_output_and_usage_match": true,
+      "owned_servers_stopped": true
+    },
+    "llama_cpp_reference": {
+      "source": "5f436dddb440a288ee5611d7d1eca564a6aca9f4",
+      "model": "qwen38-27b-q4k-m",
+      "context": 32768,
+      "exact_key_prompt_tokens": 17048,
+      "exact_key_returned": true,
+      "owned_server_stopped": true
+    }
+  },
+  "bounded_tool_outputs": {
+    "date": "2026-10-26",
+    "helper_sha256": "635454a89ad9bbe969b3632588cded33f4639197744f546af45481b177fa6f3f",
+    "validator_sha256": "3205e0ab956e611ef2200e5b567bf724599e5e8af307b95ee360a900505f645e",
+    "read_lines": 80,
+    "tool_output_character_threshold": 6000,
+    "unicode_boundaries_preserved": true,
+    "portable_local_hook": true,
+    "unrelated_files_and_symlinks_preserved": true,
+    "headless_loads_hook": true,
+    "compaction_reserves_tool_result_space": true,
+    "wrapper_tests": {
+      "linux_passed": 36,
+      "macos_passed": 36,
+      "failed": 0
+    },
+    "cpu_protocol_results": {
+      "scope": "CPU protocol fixtures with actual OpenCode and scripted responses",
+      "model_inference": false,
+      "macos": {
+        "opencode": "1.18.33",
+        "cases": [
+          {
+            "name": "timeout-repair",
+            "passed": true,
+            "run_exit_code": 0,
+            "elapsed_ms": 16452,
+            "requests": 5,
+            "error_events": 0,
+            "tool_events": 2,
+            "unique_sessions": 1,
+            "verification_exit_codes": [
+              1,
+              0
+            ],
+            "stalled_requests": 1,
+            "configuration_unchanged": true,
+            "protected_test_unchanged": true,
+            "logs_truncated": false
+          },
+          {
+            "name": "api-error",
+            "passed": true,
+            "run_exit_code": 1,
+            "elapsed_ms": 1303,
+            "requests": 2,
+            "error_events": 1,
+            "tool_events": 0,
+            "unique_sessions": 1,
+            "verification_exit_codes": [],
+            "stalled_requests": 0,
+            "configuration_unchanged": true,
+            "protected_test_unchanged": true,
+            "logs_truncated": false
+          },
+          {
+            "name": "bounded-tools",
+            "passed": true,
+            "run_exit_code": 0,
+            "elapsed_ms": 1523,
+            "requests": 5,
+            "error_events": 0,
+            "tool_events": 3,
+            "unique_sessions": 1,
+            "verification_exit_codes": [
+              0
+            ],
+            "stalled_requests": 0,
+            "configuration_unchanged": true,
+            "protected_test_unchanged": true,
+            "read_limit_enforced": true,
+            "output_limit_enforced": true,
+            "logs_truncated": false
+          }
+        ]
+      },
+      "linux": {
+        "opencode": "1.19.4",
+        "cases": [
+          {
+            "name": "timeout-repair",
+            "passed": true,
+            "run_exit_code": 0,
+            "elapsed_ms": 15895,
+            "requests": 5,
+            "error_events": 0,
+            "tool_events": 2,
+            "unique_sessions": 1,
+            "verification_exit_codes": [
+              1,
+              0
+            ],
+            "stalled_requests": 1,
+            "configuration_unchanged": true,
+            "protected_test_unchanged": true,
+            "logs_truncated": false
+          },
+          {
+            "name": "api-error",
+            "passed": true,
+            "run_exit_code": 1,
+            "elapsed_ms": 857,
+            "requests": 2,
+            "error_events": 1,
+            "tool_events": 0,
+            "unique_sessions": 1,
+            "verification_exit_codes": [],
+            "stalled_requests": 0,
+            "configuration_unchanged": true,
+            "protected_test_unchanged": true,
+            "logs_truncated": false
+          },
+          {
+            "name": "bounded-tools",
+            "passed": true,
+            "run_exit_code": 0,
+            "elapsed_ms": 936,
+            "requests": 5,
+            "error_events": 0,
+            "tool_events": 3,
+            "unique_sessions": 1,
+            "verification_exit_codes": [
+              0
+            ],
+            "stalled_requests": 0,
+            "configuration_unchanged": true,
+            "protected_test_unchanged": true,
+            "read_limit_enforced": true,
+            "output_limit_enforced": true,
+            "logs_truncated": false
+          }
+        ]
+      }
+    },
+    "live_model_coding_acceptance": "pending"
   }
 }

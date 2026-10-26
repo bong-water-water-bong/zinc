@@ -184,8 +184,8 @@ That recovery change passed all 26 harness tests on Linux and macOS, covering ca
 errors as well as real subprocess checks for partial edits and background
 process cleanup.
 The combined Zig/Bun CPU command passed; standalone Bun had 692 passing tests,
-six skipped GPU/API tests, and no failures. The RDNA GPU remains unavailable,
-so model-driven coding acceptance and performance measurements remain pending.
+six skipped GPU/API tests, and no failures. The RDNA GPU was unavailable during
+these protocol checks; they contain no model-driven coding or performance result.
 
 ### Harness failure checks (2026-10-26)
 
@@ -219,6 +219,32 @@ summary omits paths, endpoints, credentials, and session IDs. The latest local
 CPU checks pass with 32 harness tests, 698 Bun tests, six GPU/API skips, and
 the Zig suite. These remain protocol checks with scripted responses.
 
+### Context limits in actual OpenCode
+
+After GPU recovery, a fresh 27B coding task still failed before producing a
+patch. Three whole-file reads returned 28,358, 16,630, and 36,181 characters.
+The accumulated request exceeded the 32K server context after 200 seconds
+and five tool calls. The wrapper returned failure on the HTTP 400 API error,
+started no verification, and stopped its owned processes. Protected tests
+and configuration remained unchanged.
+
+The setup helper now installs a portable, versioned local OpenCode hook.
+It caps reads at 80 lines and shortens tool outputs above 6,000 characters,
+keeping the head and tail with an explicit notice. Offsets still work, and
+truncation preserves Unicode boundaries. Compaction also reserves room for
+new tool results. The hook has no package dependencies or captured environment.
+Existing unrelated files and symlinks are not overwritten.
+
+Headless runs load the hook: OpenCode's
+[`--pure` mode disables external plugins](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/plugin/index.ts),
+including explicitly configured local hooks. An actual-CLI protocol fixture
+checks a default whole-file read and a long Bash result before accepting its
+scripted patch. This verifies tool limits without claiming model coding ability.
+All three protocol cases pass with actual OpenCode 1.19.4 on Linux and 1.18.33
+on macOS, including a project path with spaces and Unicode. The wrapper has
+36 passing tests on both platforms; the full CPU suites pass with 702 Bun
+tests, six GPU/API skips, and the Zig suite.
+
 ## Remaining hardware validation
 
 After the coding trial, a short-context regression comparison could not start:
@@ -229,10 +255,34 @@ regression. All owned model servers were stopped.
 
 Active-power requests and device-only reset/rebind attempts did not recover
 the GPU; a driver probe remained blocked in a firmware mailbox handshake.
-Until recovery, the latest live HTTP discovery/managed-ID
-checks, full-model multi-slot/graph checks, short-context regression matrix,
-and another live coding acceptance run remain **pending**. No passing result
-is claimed for them.
+The node returned after a reboot on October 26. ROCm and ZINC's own device
+diagnostic then passed, the existing application services were running, and
+systemd reported no failed services.
+
+The parked GPU checks now pass against the frozen ReleaseFast/Debug builds:
+
+- Direct GGUF and managed-ID startup both pass live discovery, basename
+  privacy, context capacity, generation, and method-routing checks. The 27B
+  server passes all 23 API checks, including JSON/SSE parity, Unicode, tools,
+  malformed requests, cancellation, and a long prompt.
+- The Debug 9B build passes nine ordinary slot checks and eleven graph checks
+  at 32,768 tokens per slot. They include 17,048- and 30,048-token prompts,
+  concurrent conversations with distinct keys, an actual two-row decode
+  batch, and short requests after long ones. The graph boundary probe starts
+  at 8,190 prompt tokens and ends at 8,198, crossing the 8K dispatch threshold.
+- The matched short-context diagnostic uses one warmup and three measured
+  runs of each of four scenarios. Greedy output hashes and token usage match
+  the previous control binary exactly. Candidate median decode rates are
+  0.19–0.29% lower, and wall times are 0.17–0.34% higher. This diagnostic
+  checks short-context stability; it does not establish a speed improvement
+  or replace the reusable-server performance suite.
+- The llama.cpp HIP reference also returns the exact key from a 17,048-token
+  prompt. Every validation job stops its owned model server.
+
+The [portable results](/zinc/validation/rocm-agent-context-2026-10-25.json)
+record source/binary fingerprints and the individual checks. A fresh live
+repository coding acceptance run with the latest round instructions is still
+**pending**.
 
 ## Reproduce the GPU validator
 

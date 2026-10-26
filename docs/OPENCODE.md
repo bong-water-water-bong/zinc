@@ -62,9 +62,11 @@ bun setup-opencode.mjs check --project ../my-project
 Use `bun setup-opencode.mjs run` for the headless commands below when using the
 downloaded file.
 
-Setup creates **`opencode.zinc.json`** in the target project. It leaves
+Setup creates **`opencode.zinc.json`** and a small, versioned context hook in
+**`.zinc/`** in the target project. Keep both when sharing the setup. It leaves
 `opencode.json`, global settings, authentication files, and existing generated
-configs alone. To replace this generated file, pass `--force` explicitly.
+configs alone. To update an existing setup, rerun setup with `--force`. The
+helper replaces only its generated config and preserves unrelated hook files.
 
 The default limits are 16,384 context tokens, 4,096 output tokens per turn,
 and 24 agent steps. Match `--context` to the actual server context; it is not
@@ -78,6 +80,14 @@ The configuration uses `@ai-sdk/openai-compatible`, keeps both the main model
 and small-model requests on ZINC, and disables automatic sharing. The local
 coding agent uses greedy decoding and excludes delegation and web tools.
 It does not install a formatter or LSP server.
+
+The local [OpenCode hook](https://opencode.ai/docs/plugins/) caps file reads at
+80 lines and shortens tool output above 6,000 characters, retaining the start
+and end with an explicit truncation notice. Reads can continue with `offset`
+and `limit`. Compaction reserves space for incoming tool results as well as
+generated output. Headless runs load this hook; OpenCode's `--pure` mode would
+disable it. Large histories can still exceed the context, so API errors remain
+failures rather than successful coding runs.
 
 `check` verifies health, a JSON chat completion, a JSON tool call, and a
 streaming tool call with a terminal finish reason. It never executes the
@@ -221,7 +231,8 @@ bun tools/validate_opencode_harness.mjs --output /tmp/zinc-harness-check
 ```
 
 This checks timeout/repair in the same session, independent failing/passing
-checks, and fatal API errors that must skip verification. The acceptance test
+checks, fatal API errors that must skip verification, and the actual file-read
+and command-output limits. The acceptance test
 and portable configuration must remain unchanged. It needs Bun and an installed
 OpenCode CLI; `--opencode FILE` or `OPENCODE_BIN` selects a different executable.
 CI runs it with OpenCode 1.19.4.

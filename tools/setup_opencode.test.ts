@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -7,6 +7,8 @@ import {
   buildConfig,
   checkServer,
   CONFIG_NAME,
+  CONTEXT_PLUGIN_PATH,
+  contextPlugin,
   parseArgs,
   runOpenCode,
   runVerification,
@@ -39,11 +41,77 @@ describe('portable OpenCode setup', () => {
     expect(
       buildConfig({ context: 8192 }).provider.zinc.models['qwen38-27b-q4k-m'].limit.output,
     ).toBe(2048);
-    expect(config.compaction.reserved).toBe(4096);
+    expect(config.compaction.reserved).toBe(8192);
+    expect(buildConfig({ context: 8192 }).compaction.reserved).toBe(4096);
     expect(config.compaction.reserved).toBeLessThan(
       config.provider.zinc.models['qwen38-27b-q4k-m'].limit.context,
     );
     expect(JSON.stringify(config)).not.toContain(process.cwd());
+  });
+  test('bounds real reader arguments without changing paths or requested offsets', async () => {
+    const hooks = await contextPlugin();
+    for (const [requested, expected] of [
+      [undefined, 80],
+      [2000, 80],
+      [12, 12],
+      [0, 0],
+    ]) {
+      const output = { args: { filePath: 'source.ts', offset: 200, limit: requested } };
+      await hooks['tool.execute.before']({ tool: 'read' }, output);
+      expect(output.args).toEqual({ filePath: 'source.ts', offset: 200, limit: expected });
+    }
+    const bash = { args: { command: 'echo unchanged' } };
+    await hooks['tool.execute.before']({ tool: 'bash' }, bash);
+    expect(bash.args.command).toBe('echo unchanged');
+  });
+  test('bounds long tool output and preserves Unicode, diagnostics and metadata', async () => {
+    const hooks = await contextPlugin();
+    const output = {
+      output: 'x'.repeat(3999) + '🚀' + 'm'.repeat(9000) + '🚀' + 'z'.repeat(1499),
+      metadata: { exit: 7 },
+    };
+    await hooks['tool.execute.after']({ tool: 'bash' }, output);
+    expect(output.output.length).toBeLessThanOrEqual(6000);
+    expect(output.output).toContain('ZINC context limit');
+    expect(output.output.endsWith('z'.repeat(1499))).toBe(true);
+    expect(output.output.isWellFormed()).toBe(true);
+    expect(output.metadata).toEqual({ exit: 7, truncated: true, zinc_context_truncated: true });
+    const short = { output: 'complete diagnostics', metadata: { exit: 1 } };
+    await hooks['tool.execute.after']({ tool: 'bash' }, short);
+    expect(short).toEqual({ output: 'complete diagnostics', metadata: { exit: 1 } });
+  });
+  test('installs a portable standalone hook and refuses unrelated replacements', async () => {
+    const dir = await temp();
+    const config = buildConfig();
+    await writeConfig(dir, config);
+    expect(config.plugin).toEqual([`./${CONTEXT_PLUGIN_PATH}`]);
+    const file = path.join(dir, CONTEXT_PLUGIN_PATH);
+    const source = await readFile(file, 'utf8');
+    expect(source).not.toContain(dir);
+    const module = await import(file);
+    expect(typeof (await module.default())['tool.execute.before']).toBe('function');
+    await writeConfig(dir, config, { force: true });
+    expect(await readFile(file, 'utf8')).toBe(source);
+    await writeFile(file, 'unrelated user file\n');
+    const before = await readFile(path.join(dir, CONFIG_NAME), 'utf8');
+    await expect(writeConfig(dir, config, { force: true })).rejects.toThrow('conflicts');
+    expect(await readFile(file, 'utf8')).toBe('unrelated user file\n');
+    expect(await readFile(path.join(dir, CONFIG_NAME), 'utf8')).toBe(before);
+  });
+  test('refuses hook directory and file symlinks without changing their targets', async () => {
+    const dir = await temp();
+    const elsewhere = await temp();
+    await symlink(elsewhere, path.join(dir, '.zinc'));
+    await expect(writeConfig(dir, buildConfig())).rejects.toThrow('symlink');
+    expect(await readdir(elsewhere)).toEqual([]);
+    await rm(path.join(dir, '.zinc'));
+    await mkdir(path.join(dir, '.zinc'));
+    const target = path.join(elsewhere, 'keep');
+    await writeFile(target, 'preserve');
+    await symlink(target, path.join(dir, CONTEXT_PLUGIN_PATH));
+    await expect(writeConfig(dir, buildConfig())).rejects.toThrow();
+    expect(await readFile(target, 'utf8')).toBe('preserve');
+    expect(await readdir(dir)).toEqual(['.zinc']);
   });
   test('parses task text without interpreting it as options', () => {
     const opts = parseArgs([
@@ -137,7 +205,8 @@ describe('portable OpenCode setup', () => {
     expect(captured.bin).toBe('custom-opencode');
     expect(captured.args.at(-1)).toBe('Fix $(literal) `text`');
     expect(captured.args).toContain('--auto');
-    expect(captured.args).toContain('--pure');
+    expect(captured.args).not.toContain('--pure');
+    expect(captured.options.env.OPENCODE_PURE).toBe('false');
     expect(captured.options.shell).toBeUndefined();
     expect(captured.options.env.OPENCODE_CONFIG_CONTENT).not.toContain('test-only-key');
   });

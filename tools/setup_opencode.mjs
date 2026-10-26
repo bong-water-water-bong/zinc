@@ -1,11 +1,74 @@
 #!/usr/bin/env bun
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { mkdir, open, readFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export const DEFAULT_BASE_URL = 'http://127.0.0.1:9090/v1';
 export const CONFIG_NAME = 'opencode.zinc.json';
+
+// Self-contained so the standalone helper can install this local OpenCode hook
+// without fetching a package or embedding any machine-specific configuration.
+export async function contextPlugin() {
+  return {
+    'tool.execute.before': async (input, output) => {
+      if (input.tool === 'read') {
+        const requested = output.args.limit;
+        output.args.limit = Number.isSafeInteger(requested)
+          ? Math.min(80, Math.max(0, requested))
+          : 80;
+      }
+    },
+    'tool.execute.after': async (_input, output) => {
+      if (typeof output.output !== 'string' || output.output.length <= 6000) return;
+      const text = output.output;
+      output.output =
+        text.slice(0, 4000).replace(/[\uD800-\uDBFF]$/, '') +
+        '\n[ZINC context limit: output shortened. Read smaller ranges with offset/limit, or narrow the command.]\n' +
+        text.slice(-1500).replace(/^[\uDC00-\uDFFF]/, '');
+      output.metadata = { ...output.metadata, truncated: true, zinc_context_truncated: true };
+    },
+  };
+}
+
+const CONTEXT_PLUGIN_SOURCE = `export default ${contextPlugin.toString()};\n`;
+const CONTEXT_PLUGIN_HASH = createHash('sha256')
+  .update(CONTEXT_PLUGIN_SOURCE)
+  .digest('hex')
+  .slice(0, 16);
+export const CONTEXT_PLUGIN_PATH = `.zinc/opencode-context-${CONTEXT_PLUGIN_HASH}.js`;
+
+async function ensureContextPlugin(dir) {
+  const pluginDir = path.join(dir, '.zinc');
+  await mkdir(pluginDir, { mode: 0o700 }).catch((error) => {
+    if (error.code !== 'EEXIST') throw error;
+  });
+  const stat = await lstat(pluginDir);
+  if (!stat.isDirectory() || stat.isSymbolicLink())
+    throw new Error('ZINC context hook directory must be a directory, not a symlink');
+  const file = path.join(dir, CONTEXT_PLUGIN_PATH);
+  let handle;
+  try {
+    handle = await open(
+      file,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(CONTEXT_PLUGIN_SOURCE);
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    const existing = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      if ((await existing.readFile('utf8')) !== CONTEXT_PLUGIN_SOURCE)
+        throw new Error('ZINC context hook conflicts with an existing file; no file was replaced');
+    } finally {
+      await existing.close();
+    }
+  } finally {
+    await handle?.close();
+  }
+}
 
 function requireTask(opts) {
   if (!Array.isArray(opts.prompt) || !opts.prompt.join(' ').trim())
@@ -97,7 +160,13 @@ export function buildConfig(opts = {}) {
     share: 'disabled',
     formatter: false,
     lsp: false,
-    compaction: { auto: true, prune: true, reserved: output },
+    plugin: [`./${CONTEXT_PLUGIN_PATH}`],
+    // Leave room for new tool results as well as the next generated response.
+    compaction: {
+      auto: true,
+      prune: true,
+      reserved: Math.min(Math.floor(context / 2), output + Math.floor(context / 4)),
+    },
     provider: {
       zinc: {
         npm: '@ai-sdk/openai-compatible',
@@ -114,7 +183,7 @@ export function buildConfig(opts = {}) {
         top_p: 1,
         steps,
         prompt:
-          'Complete the coding task using the available tools. Read the relevant code in small ranges, then make a focused edit and run the requested tests before exploring further. Use compiler and test output to correct failures. Keep command output concise: save verbose build/test logs to a temporary file and show only failure diagnostics and a short summary. Never change tests just to make them pass. Use portable paths in source, tests, and examples; do not copy this workspace path or private endpoints into them. Finish with a short report of the changes and actual test results.',
+          'Complete the coding task using the available tools. File reads return at most 80 lines: use offset and limit to read the relevant ranges, then make a focused edit and run the requested tests before exploring further. Use compiler and test output to correct failures. Tool output is bounded: save verbose build/test logs to a temporary file and show only failure diagnostics and a short summary. Never change tests just to make them pass. Use portable paths in source, tests, and examples; do not copy this workspace path or private endpoints into them. Finish with a short report of the changes and actual test results.',
         permission: { task: 'deny', question: 'deny', webfetch: 'deny', websearch: 'deny' },
       },
     },
@@ -125,6 +194,16 @@ export async function writeConfig(project, config, { force = false } = {}) {
   const dir = path.resolve(project);
   await mkdir(dir, { recursive: true });
   const file = path.join(dir, CONFIG_NAME);
+  // Check before installing the hook so a refused setup leaves existing
+  // projects alone. The final open still enforces no-follow/exclusive writes.
+  const existing = await lstat(file).catch((error) => {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (existing && !force) throw Object.assign(new Error('Config exists'), { code: 'EEXIST' });
+  if (existing?.isSymbolicLink())
+    throw new Error('ZINC context hook setup refuses config symlinks');
+  await ensureContextPlugin(dir);
   // O_NOFOLLOW also protects an existing symlink when explicitly replacing a
   // generated config. Other OpenCode config/auth files are never written.
   const flags =
@@ -292,7 +371,6 @@ export async function runOpenCode(
   const live = runtimeConfig(config, env);
   const args = [
     'run',
-    '--pure',
     '--format',
     'json',
     '--model',
@@ -312,6 +390,8 @@ export async function runOpenCode(
       ZINC_API_KEY: env.ZINC_API_KEY || 'local',
       OPENCODE_CONFIG_CONTENT: JSON.stringify(live),
       OPENCODE_DISABLE_AUTOUPDATE: 'true',
+      // --pure disables the local context hook, including explicit plugins.
+      OPENCODE_PURE: 'false',
     },
     stdio: ['inherit', 'pipe', 'pipe'],
     detached: process.platform !== 'win32',
@@ -619,7 +699,8 @@ async function main() {
   --force           Replace only opencode.zinc.json
   --auto            Approve headless tool requests; explicit denies still apply
 
-Setup writes a portable opencode.zinc.json and leaves existing configs alone.
+Setup writes opencode.zinc.json and a portable local hook in .zinc/.
+The hook bounds file reads and tool output; existing configs are left alone.
 Run/check read it. Override the endpoint with ZINC_API_BASE_URL and the key
 with ZINC_API_KEY; their values are never saved by this script.
 Install OpenCode first: bun install --global opencode-ai@1.19.4
@@ -664,7 +745,7 @@ if (import.meta.main)
   main().catch((error) => {
     // Do not print fetch/child errors that could include a private URL or token.
     const known =
-      /^(Bun 1\.4\.4|Unknown option:|Missing value for|Use a model ID|Context must|Output must|Steps must|Timeout must|Round timeout |Verification |Attempts |ZINC_API_BASE_URL|ZINC .*check|ZINC returned|Pass a task)/.test(
+      /^(Bun 1\.4\.4|Unknown option:|Missing value for|Use a model ID|Context must|Output must|Steps must|Timeout must|Round timeout |Verification |Attempts |ZINC_API_BASE_URL|ZINC .*check|ZINC returned|ZINC context hook|Pass a task)/.test(
         error.message,
       );
     console.error(

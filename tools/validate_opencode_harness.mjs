@@ -115,6 +115,12 @@ test('protected feature acceptance', () => expect(answer).toBe(42));\n`,
     { mode: 0o600 },
   );
   const testHash = hash(await readFile(testFile));
+  if (name === 'bounded-tools')
+    await writeFile(
+      path.join(project, 'large-source.txt'),
+      Array.from({ length: 600 }, (_, i) => `READ_LINE_${String(i).padStart(4, '0')}`).join('\n'),
+      { mode: 0o600 },
+    );
   const stdout = capture(),
     stderr = capture();
   const sessions = new Set(),
@@ -125,7 +131,10 @@ test('protected feature acceptance', () => expect(answer).toBe(42));\n`,
     stalled = 0,
     requests = 0,
     errors = 0,
-    tools = 0;
+    tools = 0,
+    boundedStage = 0,
+    boundedRead = false,
+    boundedOutput = false;
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
@@ -153,6 +162,59 @@ test('protected feature acceptance', () => expect(answer).toBe(42));\n`,
         );
       const body = await req.json();
       if (!body.tools?.length) return reply(body, { content: 'Protocol fixture' }, 'stop');
+      if (name === 'bounded-tools') {
+        const toolReply = (tool, args, id) =>
+          reply(
+            body,
+            {
+              tool_calls: [
+                {
+                  index: 0,
+                  id,
+                  type: 'function',
+                  function: { name: tool, arguments: JSON.stringify(args) },
+                },
+              ],
+            },
+            'tool_calls',
+          );
+        const outputs = body.messages.filter((message) => message.role === 'tool');
+        const last = JSON.stringify(outputs.at(-1)?.content ?? '');
+        if (boundedStage++ === 0)
+          return toolReply(
+            'read',
+            { filePath: path.join(project, 'large-source.txt') },
+            'call_bounded_read',
+          );
+        if (boundedStage === 2) {
+          boundedRead = last.includes('READ_LINE_0079') && !last.includes('READ_LINE_0080');
+          return toolReply(
+            'bash',
+            {
+              command: `bun -e 'console.log("BASH_HEAD" + "x".repeat(12000) + "BASH_TAIL")'`,
+              description: 'Exercise bounded command output',
+            },
+            'call_bounded_bash',
+          );
+        }
+        if (boundedStage === 3) {
+          boundedOutput =
+            last.length < 7000 &&
+            last.includes('BASH_HEAD') &&
+            last.includes('BASH_TAIL') &&
+            last.includes('ZINC context limit');
+          return toolReply(
+            'write',
+            { filePath: path.join(project, 'feature.mjs'), content: 'export const answer = 42;\n' },
+            'call_bounded_write',
+          );
+        }
+        return reply(
+          body,
+          { content: 'Focused edit complete; run independent verification.' },
+          'stop',
+        );
+      }
       const repair = JSON.stringify(body.messages).includes('Independent verification failed');
       if ((!firstWrite && !repair) || (repair && !repaired)) {
         firstWrite = true;
@@ -246,16 +308,25 @@ test('protected feature acceptance', () => expect(answer).toBe(42));\n`,
       protectedTestUnchanged &&
       (name === 'api-error'
         ? code === 1 && errors > 0 && checks.length === 0
-        : code === 0 &&
-          errors === 0 &&
-          stalled > 0 &&
-          repaired &&
-          sessions.size === 1 &&
-          tools >= 2 &&
-          checks.length === 2 &&
-          checks[0] !== 0 &&
-          checks[1] === 0 &&
-          answerCorrect);
+        : name === 'bounded-tools'
+          ? code === 0 &&
+            errors === 0 &&
+            boundedRead &&
+            boundedOutput &&
+            tools >= 3 &&
+            checks.length === 1 &&
+            checks[0] === 0 &&
+            answerCorrect
+          : code === 0 &&
+            errors === 0 &&
+            stalled > 0 &&
+            repaired &&
+            sessions.size === 1 &&
+            tools >= 2 &&
+            checks.length === 2 &&
+            checks[0] !== 0 &&
+            checks[1] === 0 &&
+            answerCorrect);
     result = {
       name,
       passed,
@@ -269,6 +340,9 @@ test('protected feature acceptance', () => expect(answer).toBe(42));\n`,
       stalled_requests: stalled,
       configuration_unchanged: configUnchanged,
       protected_test_unchanged: protectedTestUnchanged,
+      ...(name === 'bounded-tools'
+        ? { read_limit_enforced: boundedRead, output_limit_enforced: boundedOutput }
+        : {}),
       logs_truncated: stdout.truncated() || stderr.truncated(),
     };
   } catch (error) {
@@ -299,7 +373,7 @@ async function main() {
   --round-timeout-ms N  Editing round budget (default: 15000; range: 1000..60000)
 
 Runs actual OpenCode against scripted local HTTP responses, without model
-inference. Checks timeout/repair and API failure handling. Raw logs stay in the
+inference. Checks timeout/repair, API failure handling, and real tool limits. Raw logs stay in the
 new output directory; result.json contains no paths, endpoints, or credentials.`);
     return;
   }
@@ -329,7 +403,7 @@ new output directory; result.json contains no paths, endpoints, or credentials.`
   if (!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(version))
     throw new Error('OpenCode returned an invalid version');
   const cases = [];
-  for (const name of ['timeout-repair', 'api-error']) {
+  for (const name of ['timeout-repair', 'api-error', 'bounded-tools']) {
     const result = await fixture(name, root, opts, env);
     cases.push(result);
     process.stderr.write(`${result.passed ? 'PASS' : 'FAIL'} ${name}\n`);
@@ -342,7 +416,7 @@ new output directory; result.json contains no paths, endpoints, or credentials.`
     opencode_version: version,
     helper_sha256: hash(await readFile(new URL('./setup_opencode.mjs', import.meta.url))),
     validator_sha256: hash(await readFile(new URL(import.meta.url))),
-    passed: cases.length === 2 && cases.every((item) => item.passed),
+    passed: cases.length === 3 && cases.every((item) => item.passed),
     cases,
   };
   await writeFile(path.join(root, 'result.json'), JSON.stringify(result, null, 2) + '\n', {

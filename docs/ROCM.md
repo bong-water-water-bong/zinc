@@ -141,8 +141,9 @@ The ROCm server exposes generation, `/health`, `/stats`, and a minimal
 basename, fixed ownership/creation fields, and per-slot context capacity; it
 does not expose parent directories. It does not provide the full Vulkan/Metal
 model-manager or browser chat interface. Use the default Vulkan or Metal build
-for the browser-chat walkthrough. Live discovery/managed-ID checks for the
-latest changes are pending the [test GPU's recovery](ROCM_AGENT_CONTEXT.md#remaining-hardware-validation).
+for the browser-chat walkthrough. Direct GGUF and managed-ID startup, discovery,
+generation, and all 23 API checks passed after the
+[test GPU recovered](ROCM_AGENT_CONTEXT.md#remaining-hardware-validation).
 
 Send `stream: false` explicitly for a JSON response; this handler defaults to
 streaming. SSE replies now include finish reasons and usage. Qwen chat supports
@@ -188,7 +189,9 @@ Keep repository instructions concise and read source in small line ranges.
 OpenCode 1.19.4's [built-in file reader](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/tool/read.ts) has an independent 50KB cap, which can
 overflow a local model's context when reading large files. Its general
 `tool_output` setting does not constrain that reader, as the
-[tool wrapper](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/tool/tool.ts) skips results already marked by the reader. Keep checking the worktree
+[tool wrapper](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/tool/tool.ts) skips results already marked by the reader. The setup helper now installs
+a local hook that caps reads at 80 lines and shortens large tool outputs.
+Rerun setup with `--force` to update an existing configuration. Keep checking the worktree
 diff, server log, and project tests independently. The setup script's
 `run --verify '<project check>'` mode enforces checks between short editing
 rounds and returns failure when they do not pass.
@@ -199,9 +202,9 @@ Use the reusable-server performance suite for claims. It runs one engine at a
 time, uses the same GGUF and scenario matrix, discards a warmup, and reports the
 median of measured runs:
 
-The RDNA runner applies the same stable host policy before either engine: PCIe
-ASPM is set to performance and the discrete GPU's memory DPM policy is locked
-high. This prevents an idle server from changing clocks between phases.
+The RDNA runner applies the same host policy before either engine: PCIe ASPM
+is set to performance and the discrete GPU uses its automatic clock policy.
+Warmups and repeated runs account for clock ramping.
 
 ```bash
 source .env
