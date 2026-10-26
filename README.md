@@ -113,6 +113,8 @@ and API keys come from environment variables at runtime.
 The [full-worktree trial](docs/OPENCODE_WORKTREE_REPORT.md) records the original
 coding failures. The [ROCm follow-up](docs/ROCM_AGENT_CONTEXT.md) documents the
 memory/attention fixes, prompt reuse, and separate coding acceptance results.
+The [technical write-up](https://zolotukhin.ai/blog/2026-10-26-from-fast-tokens-to-a-verified-coding-task-on-rdna4/)
+explains the failures, fixes, and reviewed feature result.
 
 ## Inspect the performance
 

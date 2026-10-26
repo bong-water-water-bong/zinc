@@ -162,8 +162,8 @@ round, and let the wrapper run the full check outside the model conversation.
 Failures return bounded diagnostic excerpts, including errors in the middle of
 large logs. The complete output still streams to stderr. Unit tests cover
 same-session repair, failed checks, API errors, cancellation, timeouts, and
-diagnostic truncation. This latest prompt contract still needs a successful
-live repository-task run.
+diagnostic truncation. The completed feature below exercises this contract
+with actual model inference and code-review feedback.
 
 ### Harness recovery checks (2026-10-26)
 
@@ -212,7 +212,8 @@ Actual OpenCode 1.19.4 also passed two CPU protocol fixtures using scripted
 responses: the timeout/repair sequence still completed, and an HTTP API error
 produced a failing run without starting verification. The portable config
 remained unchanged in both fixtures. These checks perform no model inference;
-the GPU-dependent acceptance and performance checks below remain pending.
+later sections record the completed GPU-dependent acceptance and performance
+checks.
 
 A portable [CPU protocol validator](https://github.com/zolotukhin/zinc/blob/main/tools/validate_opencode_harness.mjs)
 now reproduces the timeout/repair and API-error cases, and the test workflow
