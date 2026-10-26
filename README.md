@@ -116,6 +116,11 @@ memory/attention fixes, prompt reuse, and separate coding acceptance results.
 The [technical write-up](https://zolotukhin.ai/blog/2026-10-26-from-fast-tokens-to-a-verified-coding-task-on-rdna4/)
 explains the failures, fixes, and reviewed feature result.
 
+Qwen 3.8 27B supports a **262,144-token** window. The 32K example above is the
+tested coding-task configuration. The [native-context guide](docs/ROCM_NATIVE_CONTEXT.md)
+explains the opt-in Q8 cache, precision choices and larger-context validation
+on a 32GB ROCm card. Match the harness context to the server when changing it.
+
 ## Inspect the performance
 
 The chart compares six models on the same Radeon AI PRO R9700, with **ROCm on

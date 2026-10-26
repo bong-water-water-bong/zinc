@@ -151,6 +151,7 @@ comptime {
     _ = @import("model/tokenizer.zig");
     _ = @import("compute/graph.zig");
     _ = @import("compute/launch_sizes.zig");
+    _ = @import("compute/kv_storage.zig");
     _ = @import("build_info.zig");
     _ = @import("runtime_assets.zig");
     _ = @import("regression_tests.zig");
@@ -1799,6 +1800,15 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
         return error.NoModelSpecified;
     };
 
+    const requested_kv = @import("compute/kv_storage.zig").Format.parse(host_io.getenv("ZINC_KV_CACHE")) catch {
+        log.err("ZINC_KV_CACHE must be f32 or q8", .{});
+        return error.InvalidKvCacheFormat;
+    };
+    if (requested_kv == .q8 and (!gpu.is_rocm or (config.prompt == null and config.max_parallel != 1))) {
+        log.err("q8 KV requires ROCm and --parallel 1 for serving", .{});
+        return error.UnsupportedKvCacheConfiguration;
+    }
+
     var device = try cuda_device_mod.CudaDevice.initBest(allocator);
     defer device.deinit();
     var name_buf: [256]u8 = undefined;
@@ -1816,6 +1826,11 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
         return err;
     };
     defer model.deinit();
+
+    if (requested_kv == .q8 and model.config.architecture != .qwen35 and model.config.architecture != .qwen2_moe) {
+        log.err("q8 KV currently supports the ROCm Qwen hybrid path", .{});
+        return error.UnsupportedKvCacheFormat;
+    }
 
     // server_mode = no CLI prompt → multi-tenant HTTP serving (Effort 28). Both the
     // gemma4 dense forward AND the qwen35/36 hybrid-SSM+MoE forward expose the

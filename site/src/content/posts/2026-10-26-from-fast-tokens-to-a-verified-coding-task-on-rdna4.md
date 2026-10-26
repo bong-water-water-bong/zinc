@@ -179,6 +179,24 @@ The prompts contain **58–349 tokens**. The 32K value describes allocated serve
 
 This comparison also does not attribute a new speedup to the context fixes. A separate short-context control matched response hashes and usage, with decode 0.19–0.29% lower: essentially steady. The [Zig migration post](/blog/2026-10-24-zig-0-17-faster-prompts-on-rdna4/) measures the separate comparison against Zig 0.15.2.
 
+## Why this trial used 32K when the model supports 262K
+
+Qwen 3.8 27B's [official configuration](https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/config.json) supports **262,144 tokens**. The 32K capacity in this coding trial was a server and validation setting. Increasing it safely required another change in the engine.
+
+The base model has 16 full-attention layers, four KV heads and 256 dimensions per head. With separate FP32 K and V caches, that costs **128 KiB per token**. At native capacity, the base KV alone consumes 32 GiB. The appended NextN attention block brings it to **34 GiB**, before loading the roughly 15.93 GiB weight file or allocating recurrent state and prefill scratch.
+
+The new opt-in ROCm cache stores 32 signed bytes with one FP32 scale per block. That reduces the native-capacity allocation, including NextN, to **9.5625 GiB**. The GGUF weights stay the same. KV writers, decode, prompt attention, slot aliases and speculative catch-up all have to agree on the representation; changing only the allocation would corrupt the first attention read.
+
+Compressed storage made capacity possible, but the first long-prompt kernel still spent too much time reconstructing values for individual queries. Sharing a compressed key tile between 32 queries helped. The next improvement expands only one 1,024-key tile at a time for BLAS, then combines tiles with the same online-softmax recurrence. Its score buffer grows with the bounded query chunk, rather than the total context.
+
+A 62,048-token exact-key request took **816.52 seconds** on the frozen FP32 control, **354.68 seconds** with Q8 and FP32-input BLAS, and **142.28 seconds** with opt-in FP16 matrix inputs. Those are single-request diagnostics, not the repeated short-prompt benchmark above. They combine a cache-format change with new attention kernels.
+
+The complete model then returned the exact key from **260,048 prompt tokens** in **1,015 seconds**, about 16.9 minutes, and passed a fresh short request afterward. Its server advertised 262,144-token capacity and passed all 23 API checks. That is a completed near-native retrieval, not merely a successful cache allocation. It is still a synthetic key buried in repeated padding, so it does not measure long-document comprehension or repository coding quality.
+
+Precision needed its own check. The initial FP16-input mode failed the original FP32 reference tolerance. We kept that guard and left the mode off by default. A separate reference now models FP16 Q/K/V and probabilities with FP32 softmax state and accumulation. The tested outputs pass that contract; measured against the original FP32 calculation, their RMSE is 0.000183 and maximum absolute error is 0.00296. Kernel agreement does not establish unchanged coding quality.
+
+The [native-context guide](/zinc/docs/rocm-native-context/) has the memory accounting, switches and validation results. This remains a single-slot ROCm Qwen feature. The repository coding acceptance described earlier still belongs to its original 32K FP32 run.
+
 ## Try the same bounded workflow
 
 The [OpenCode guide](/zinc/docs/opencode/) covers server setup, isolated worktrees and task evaluation. The [standalone helper](/zinc/harnesses/setup-opencode.mjs) requires Bun 1.4.4 or later. With a running server at matching 32K capacity:

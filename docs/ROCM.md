@@ -185,6 +185,12 @@ changes the scratch bound; larger chunks consume more VRAM. Optional
 restoring recurrent checkpoints. It defaults off and requires additional VRAM;
 see the follow-up for parity checks and the portable cache validator.
 
+The 32K coding configuration is not Qwen 3.8 27B's model limit: its native
+window is 262,144 tokens. The [native-context guide](ROCM_NATIVE_CONTEXT.md)
+documents opt-in Q8 KV storage, bounded BLAS prefill and the separate FP16-input
+attention option for fitting larger capacities on a 32GB card. F32 KV remains
+the default. Q8 currently requires ROCm Qwen and a single request slot.
+
 Keep repository instructions concise and read source in small line ranges.
 OpenCode 1.19.4's [built-in file reader](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/tool/read.ts) has an independent 50KB cap, which can
 overflow a local model's context when reading large files. Its general

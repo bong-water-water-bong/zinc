@@ -189,6 +189,7 @@ dense FFN, and MoE branches live in the active backend's forward implementation.
 | CUDA infrastructure                     | `src/cuda/`                                                                          |
 | ROCm C ABI and execution errors         | `src/rocm/rocm_shim.c`, `src/cuda/command.zig`                                       |
 | Qwen chunked prefill and prompt reuse   | `src/compute/forward_cuda.zig`                                                       |
+| ROCm Qwen KV storage accounting         | `src/compute/kv_storage.zig`                                                         |
 | CUDA/ROCm scheduler and slot lifecycle  | `src/server/cuda_serve.zig`                                                          |
 | Backend abstraction and memory planning | `src/gpu/`                                                                           |
 

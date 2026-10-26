@@ -275,6 +275,11 @@ test('parseArgs reads Intel suite options', () => {
 
 test('remote tuning env forwards tuning toggles', () => {
   const env = collectRemoteZincTuningEnv({
+    ZINC_KV_CACHE: 'q8',
+    ZINC_Q8_ATTN_BLAS: '1',
+    ZINC_Q8_ATTN_F16: '1',
+    ZINC_PROMPT_CACHE: '0',
+    ZINC_PREFILL_CHUNK: '4096',
     ZINC_Q8_1_LM_HEAD: '1',
     ZINC_Q8_1_SSM_QKV_Z: '1',
     ZINC_MOE_Q5K_Q8_1_DOWN_ACC: '1',
@@ -347,6 +352,11 @@ test('remote tuning env forwards tuning toggles', () => {
     ZINC_QWEN36_27B_FULL_ATTN_BATCHED: '0',
   });
   expect(env.ZINC_Q8_1_LM_HEAD).toBe('1');
+  expect(env.ZINC_KV_CACHE).toBe('q8');
+  expect(env.ZINC_Q8_ATTN_BLAS).toBe('1');
+  expect(env.ZINC_Q8_ATTN_F16).toBe('1');
+  expect(env.ZINC_PROMPT_CACHE).toBe('0');
+  expect(env.ZINC_PREFILL_CHUNK).toBe('4096');
   expect(env.ZINC_Q8_1_SSM_QKV_Z).toBe('1');
   expect(env.ZINC_MOE_Q5K_Q8_1_DOWN_ACC).toBe('1');
   expect(env.ZINC_MOE_Q6K_COLS).toBe('1');
@@ -416,6 +426,26 @@ test('remote tuning env forwards tuning toggles', () => {
   expect(env.ZINC_QWEN36_27B_SSM_BATCHED_DELTA).toBe('0');
   expect(env.ZINC_QWEN36_27B_SSM_PREFILL_PROJ).toBe('both');
   expect(env.ZINC_QWEN36_27B_FULL_ATTN_BATCHED).toBe('0');
+});
+
+test('RDNA baseline KV format is explicit and rejects unsupported values', () => {
+  const model = { model_path: '/models/model.gguf', context_tokens: 262144 };
+  const defaultArgs = rdnaLlamaServerArgs(model, {}, '/bin/llama-server', 9000);
+  expect(defaultArgs).not.toContain('-ctk');
+  const compact = rdnaLlamaServerArgs(model, { llamaKvCache: 'q8_0' }, '/bin/llama-server', 9000);
+  expect(compact.slice(compact.indexOf('-ctk'), compact.indexOf('-ctk') + 4)).toEqual([
+    '-ctk',
+    'q8_0',
+    '-ctv',
+    'q8_0',
+  ]);
+  expect(compact[compact.indexOf('--ctx-size') + 1]).toBe('262144');
+  expect(parseArgs(['--rdna-llama-kv', 'q8_0']).rdnaLlamaKv).toBe('q8_0');
+  expect(() => parseArgs(['--rdna-llama-kv', 'q4_0'])).toThrow();
+  expect(() => parseArgs(['--rdna-llama-kv'])).toThrow();
+  expect(() =>
+    rdnaLlamaServerArgs(model, { llamaKvCache: 'unknown' }, '/bin/llama-server', 9000),
+  ).toThrow();
 });
 
 test('parseArgs reads RDNA backend and device options', () => {

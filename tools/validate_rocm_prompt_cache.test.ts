@@ -27,6 +27,9 @@ test('cache validator rejects changed responses, usage, and stale prefix reuse',
 test('model-loading validator requires explicit inputs and a usable context', () => {
   const args = ['--model', 'model.gguf', '--gpu', 'selected-device', '--output', 'fresh-results'];
   expect(parseArgs(args).context).toBe(16384);
+  expect(parseArgs(args).kvCache).toBe('f32');
+  expect(parseArgs([...args, '--kv-cache', 'q8']).kvCache).toBe('q8');
+  expect(() => parseArgs([...args, '--kv-cache', 'q4'])).toThrow();
   expect(() => parseArgs([...args, '--context', '8192'])).toThrow();
   expect(() => parseArgs([...args, '--mtp', 'invalid'])).toThrow();
   expect(() => parseArgs([...args, '--model'])).toThrow();

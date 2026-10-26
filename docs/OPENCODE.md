@@ -29,11 +29,14 @@ Use a server build with tool-call support. The setup check reports missing
 support before you start a coding task. ZINC generates tool calls; OpenCode
 reads files, edits code, and runs commands on the machine where OpenCode runs.
 
-For ROCm repository tasks, 32K context leaves more room for source and tool
+For ROCm repository tasks, the validated 32K configuration leaves more room for
+source and tool
 history. [Bounded prefill and attention](ROCM_AGENT_CONTEXT.md) have been checked
 with 27B prompts up to 30,048 tokens. Optional `ZINC_PROMPT_CACHE=1` reuses exact
 prefixes between single-slot Qwen requests. Neither a larger context nor a
 faster prefill establishes that the model will finish a coding task.
+For Qwen 3.8 27B's larger native window, see the [Q8 context guide](ROCM_NATIVE_CONTEXT.md)
+and pass the server's actual capacity to setup. The 32K example is not a model limit.
 
 ## Configure OpenCode
 

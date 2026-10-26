@@ -33,6 +33,7 @@ const dmmv_fast_block: u32 = 64;
 /// The CUDA kernel library, bundled into the binary and NVRTC-compiled on load.
 const KERNELS_CU = @embedFile("../shaders/cuda/kernels.cu");
 const launch_sizes = @import("launch_sizes.zig");
+const kv_storage = @import("kv_storage.zig");
 
 // ---- kernel push-constant structs (must byte-match kernels.cu) --------------
 const RmsPush = extern struct { N: u32, eps: f32 };
@@ -63,6 +64,7 @@ const AttnPush = extern struct {
     sink_offset: u32,
 };
 const KvWritePush = extern struct { kv_dim: u32, dst_offset: u32 };
+const Q8BlasPush = extern struct { hd: u32, heads: u32, kv_heads: u32, rows: u32, scale: u32, sink: u32, base: u32, start: u32, keys: u32 };
 const ConvPush = extern struct {
     conv_channels: u32,
     d_conv: u32,
@@ -532,6 +534,12 @@ const Pipelines = struct {
     attention_causal_batched: CudaPipeline,
     attention_causal_v2: CudaPipeline, // coalesced warp-per-key qwen prefill attention (ZINC_ATTN_V2)
     attention_causal_tiled: CudaPipeline,
+    attention_causal_q8_prefill: CudaPipeline,
+    attention_causal_q8_prefill32: CudaPipeline,
+    q8_attention_prepare_q: CudaPipeline,
+    q8_attention_prepare_kv: CudaPipeline,
+    q8_attention_softmax: CudaPipeline,
+    q8_attention_finish: CudaPipeline,
 };
 
 /// Token-major scratch for the batched prefill path (Effort 26 T0). Allocated
@@ -742,6 +750,22 @@ const PromptCache = struct {
     }
 };
 
+/// Bounded attention scratch, independent of the allocated context length.
+const Q8AttentionScratch = struct {
+    capacity: u32 = 0,
+    q: CudaBuffer = std.mem.zeroes(CudaBuffer),
+    k: CudaBuffer = std.mem.zeroes(CudaBuffer),
+    v: CudaBuffer = std.mem.zeroes(CudaBuffer),
+    scores: CudaBuffer = std.mem.zeroes(CudaBuffer),
+    probabilities: CudaBuffer = std.mem.zeroes(CudaBuffer),
+    acc: CudaBuffer = std.mem.zeroes(CudaBuffer),
+    state: CudaBuffer = std.mem.zeroes(CudaBuffer),
+
+    fn deinit(self: *Q8AttentionScratch) void {
+        inline for (.{ &self.q, &self.k, &self.v, &self.scores, &self.probabilities, &self.acc, &self.state }) |b| buffer.freeBuffer(b);
+    }
+};
+
 /// Per-token GPU forward state for qwen35 greedy decode.
 pub const ForwardCuda = struct {
     allocator: std.mem.Allocator,
@@ -749,6 +773,9 @@ pub const ForwardCuda = struct {
     model: *loader.Model,
     d: Derived,
     max_ctx: u32,
+    kv_format: kv_storage.Format = .f32,
+    q8_attention: ?Q8AttentionScratch = null,
+    q8_attention_half: bool = false,
 
     pipes: Pipelines,
 
@@ -1054,6 +1081,17 @@ pub const ForwardCuda = struct {
             },
         }
         const d = Derived.from(model.config);
+        const kv_format = kv_storage.Format.parse(host_io.getenv("ZINC_KV_CACHE")) catch {
+            log.err("ZINC_KV_CACHE must be f32 or q8", .{});
+            return error.InvalidKvCacheFormat;
+        };
+        if (kv_format == .q8 and (!is_rocm or d.head_dim % 32 != 0)) {
+            log.err("q8 KV currently requires ROCm Qwen with head dimensions divisible by 32", .{});
+            return error.UnsupportedKvCacheFormat;
+        }
+        const kv_bytes = try kv_format.bytes(max_ctx, d.kv_dim);
+        const q8_attention_half = envFlag("ZINC_Q8_ATTN_F16", false);
+        log.info("KV cache: {s}, {d} bytes per K/V attention layer, {d} context tokens", .{ @tagName(kv_format), kv_bytes, max_ctx });
 
         const src = try allocator.dupeSentinel(u8, KERNELS_CU, 0);
         defer allocator.free(src);
@@ -1111,9 +1149,9 @@ pub const ForwardCuda = struct {
         pipes.dmmv_q4k_pair_q8_btok3 = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_pair_q8_btok3");
         pipes.dmmv_q4k_pair_q8_btok4 = try pipeline.createPipeline(ctx, src.ptr, "dmmv_q4k_pair_q8_btok4");
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
-        pipes.kv_cache_write = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write");
+        pipes.kv_cache_write = try pipeline.createPipeline(ctx, src.ptr, if (kv_format == .q8) "kv_cache_write_q8" else "kv_cache_write");
         pipes.naive_attention = try pipeline.createPipeline(ctx, src.ptr, "naive_attention");
-        pipes.attention_tiled = try pipeline.createPipeline(ctx, src.ptr, "attention_tiled");
+        pipes.attention_tiled = try pipeline.createPipeline(ctx, src.ptr, if (kv_format == .q8) "attention_tiled_q8" else "attention_tiled");
         pipes.qwen_norm_rope_qkv_seq = try pipeline.createPipeline(ctx, src.ptr, "qwen_norm_rope_qkv_seq");
         pipes.qwen_norm_rope_qkv = try pipeline.createPipeline(ctx, src.ptr, "qwen_norm_rope_qkv");
         pipes.naive_attention_batched_seq = try pipeline.createPipeline(ctx, src.ptr, "naive_attention_batched_seq");
@@ -1187,10 +1225,16 @@ pub const ForwardCuda = struct {
         pipes.ssm_gated_norm_batched = try pipeline.createPipeline(ctx, src.ptr, "ssm_gated_norm_batched");
         pipes.deinterleave_batched = try pipeline.createPipeline(ctx, src.ptr, "deinterleave_qgate_batched");
         pipes.rope_batched = try pipeline.createPipeline(ctx, src.ptr, "rope_batched");
-        pipes.kv_cache_write_batched = try pipeline.createPipeline(ctx, src.ptr, "kv_cache_write_batched");
+        pipes.kv_cache_write_batched = try pipeline.createPipeline(ctx, src.ptr, if (kv_format == .q8) "kv_cache_write_batched_q8" else "kv_cache_write_batched");
         pipes.attention_causal_batched = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_batched");
         pipes.attention_causal_v2 = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_batched_v2");
-        pipes.attention_causal_tiled = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_tiled");
+        pipes.attention_causal_tiled = try pipeline.createPipeline(ctx, src.ptr, if (kv_format == .q8) "attention_causal_tiled_q8" else "attention_causal_tiled");
+        pipes.attention_causal_q8_prefill = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_q8_prefill");
+        pipes.attention_causal_q8_prefill32 = try pipeline.createPipeline(ctx, src.ptr, "attention_causal_q8_prefill32");
+        pipes.q8_attention_prepare_q = try pipeline.createPipeline(ctx, src.ptr, if (q8_attention_half) "q8_attention_prepare_q_f16" else "q8_attention_prepare_q");
+        pipes.q8_attention_prepare_kv = try pipeline.createPipeline(ctx, src.ptr, if (q8_attention_half) "q8_attention_prepare_kv_f16" else "q8_attention_prepare_kv");
+        pipes.q8_attention_softmax = try pipeline.createPipeline(ctx, src.ptr, if (q8_attention_half) "q8_attention_softmax_f16" else "q8_attention_softmax");
+        pipes.q8_attention_finish = try pipeline.createPipeline(ctx, src.ptr, "q8_attention_finish");
         // Effort 28 4c: batched-decode GEMMs (weights read once over B rows).
         pipes.gemm[0] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q4k_tiled_v2");
         pipes.gemm[1] = try pipeline.createPipeline(ctx, src.ptr, "gemm_q5k_tiled_v2");
@@ -1276,6 +1320,8 @@ pub const ForwardCuda = struct {
             .model = model,
             .d = d,
             .max_ctx = max_ctx,
+            .kv_format = kv_format,
+            .q8_attention_half = q8_attention_half,
             .pipes = pipes,
             .hidden = try buffer.createBuffer(ctx, d.n_embd * f4),
             .norm_buf = try buffer.createBuffer(ctx, d.n_embd * f4),
@@ -1385,7 +1431,7 @@ pub const ForwardCuda = struct {
             self.use_fused_attn_frontend = if (fused_attn) |v| !(std.mem.eql(u8, v, "0") or
                 std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "false") or
                 std.ascii.eqlIgnoreCase(v, "no")) else true;
-            if (self.use_fused_attn_frontend) {
+            if (self.kv_format == .f32 and self.use_fused_attn_frontend) {
                 log.info("ROCm fused attention front-end: deinterleave, norm, RoPE, and KV write share one kernel", .{});
             }
             const rms_q8 = host_io.getenv("ZINC_ROCM_RMS_Q8");
@@ -1430,8 +1476,8 @@ pub const ForwardCuda = struct {
                 if (model.getLayer(L, "ffn_gate_inp.weight")) |w| log.info("  ffn_gate_inp: type={} dims={any}", .{ w.info.type_, w.info.dims[0..@min(w.info.n_dims, 3)] });
             }
             if (self.layer_is_attn[li]) {
-                self.kv_k[li] = try buffer.createBuffer(ctx, max_ctx * d.kv_dim * f4);
-                self.kv_v[li] = try buffer.createBuffer(ctx, max_ctx * d.kv_dim * f4);
+                self.kv_k[li] = try buffer.createBuffer(ctx, kv_bytes);
+                self.kv_v[li] = try buffer.createBuffer(ctx, kv_bytes);
                 self.ssm_conv_state[li] = try buffer.createBuffer(ctx, f4);
                 self.ssm_state[li] = try buffer.createBuffer(ctx, f4);
             } else {
@@ -1585,6 +1631,7 @@ pub const ForwardCuda = struct {
         @setEvalBranchQuota(2000);
         const a = self.allocator;
         self.freeBatch();
+        if (self.q8_attention) |*scratch| scratch.deinit();
         if (self.prompt_cache) |*cache| cache.deinit(a);
         if (self.mtp) |*state| state.deinit(a);
         if (self.graph) |g| shim.cuda_graph_free(g);
@@ -1648,6 +1695,10 @@ pub const ForwardCuda = struct {
     /// the existing state instead of allocating a second full KV cache.
     pub fn allocSlotState(self: *ForwardCuda, n_slots: u32, slot_ctx: u32) !void {
         if (n_slots == 0 or slot_ctx == 0) return error.InvalidSlotCapacity;
+        if (self.kv_format == .q8 and n_slots != 1) {
+            log.err("q8 KV currently supports --parallel 1 only", .{});
+            return error.UnsupportedKvSlotCount;
+        }
         if (self.prompt_cache) |*cache| cache.valid = false;
         self.freeSlotState();
         errdefer self.freeSlotState();
@@ -1666,7 +1717,7 @@ pub const ForwardCuda = struct {
         for (0..d.n_layers) |li| {
             const L: u32 = @intCast(li);
             if (self.layer_is_attn[L]) {
-                const kv_bytes = @as(usize, n_slots) * slot_ctx * d.kv_dim * f4;
+                const kv_bytes = try self.kv_format.bytes(@as(usize, n_slots) * slot_ctx, d.kv_dim);
                 kk[li] = if (reuse_single) try buffer.aliasBuffer(&self.kv_k[li], 0, kv_bytes) else try buffer.createBuffer(ctx, kv_bytes);
                 vv[li] = if (reuse_single) try buffer.aliasBuffer(&self.kv_v[li], 0, kv_bytes) else try buffer.createBuffer(ctx, kv_bytes);
                 cc[li] = try buffer.createBuffer(ctx, f4);
@@ -1717,10 +1768,9 @@ pub const ForwardCuda = struct {
     }
 
     /// Byte offset of slot `slot`'s K/V for position `pos` in attn layer `L`'s slot
-    /// KV: (slot*slot_ctx + pos)*kv_dim*sizeof(f32). The future per-seq kv-write +
-    /// slot attention kernels (4b/4c) will use this exact indexing.
+    /// KV row offset using the active storage format, including Q8 scales.
     pub fn slotKvOffsetBytes(self: *const ForwardCuda, slot: u32, pos: u32) usize {
-        return (@as(usize, slot) * self.slot_ctx + pos) * self.d.kv_dim * @sizeOf(f32);
+        return self.kv_format.bytes(@as(usize, slot) * self.slot_ctx + pos, self.d.kv_dim) catch unreachable;
     }
     /// Byte offset of slot `slot`'s conv ring (ssm layer): slot*conv_state_len*f4.
     pub fn slotConvOffsetBytes(self: *const ForwardCuda, slot: u32) usize {
@@ -2767,12 +2817,12 @@ pub const ForwardCuda = struct {
         L_alias: for (0..d.n_layers) |li| {
             const L: u32 = @intCast(li);
             if (self.layer_is_attn[L]) {
-                const kv_off = @as(usize, slot) * self.slot_ctx * d.kv_dim * f4;
-                self.kv_k[L] = buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_off, T * d.kv_dim * f4) catch |e| {
+                const kv_off = try self.kv_format.bytes(@as(usize, slot) * self.slot_ctx, d.kv_dim);
+                self.kv_k[L] = buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_off, try self.kv_format.bytes(T, d.kv_dim)) catch |e| {
                     alias_err = e;
                     break :L_alias;
                 };
-                self.kv_v[L] = buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_off, T * d.kv_dim * f4) catch |e| {
+                self.kv_v[L] = buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_off, try self.kv_format.bytes(T, d.kv_dim)) catch |e| {
                     alias_err = e;
                     break :L_alias;
                 };
@@ -2870,7 +2920,7 @@ pub const ForwardCuda = struct {
         // Verification has only 2..4 rows: reuse decode's fused front-end,
         // with grid.y selecting consecutive tokens and absolute KV positions.
         // Keep the separate launches as an exact A/B reference.
-        if (self.capture_spec_state and self.use_fused_attn_frontend and envFlag("ZINC_MTP_FUSED_ATTN", true)) {
+        if (self.kv_format == .f32 and self.capture_spec_state and self.use_fused_attn_frontend and envFlag("ZINC_MTP_FUSED_ATTN", true)) {
             const qkv = QwenQkvPush{
                 .head_dim = d.head_dim,
                 .eps = d.rms_eps,
@@ -2900,7 +2950,13 @@ pub const ForwardCuda = struct {
         }
         // Causal attention for all T queries (block (head, t), seq_len = t+1).
         const attn = AttnBatchPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .T = T, .attn_scale_bits = 0, .sink_offset = L * d.n_head, .base_position = base_position };
-        if (base_position + T > 8192) {
+        if (self.kv_format == .q8 and T >= 256 and envFlag("ZINC_Q8_ATTN_BLAS", true)) {
+            try self.q8BlasAttention(&cmd, &b.q, &self.kv_k[L], &self.kv_v[L], &b.attn_out, attn);
+        } else if (self.kv_format == .q8 and d.head_dim == 256 and T >= 32) {
+            cmd.dispatch(&self.pipes.attention_causal_q8_prefill32, .{ d.n_head, ceilDiv(T, 32), 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), 0);
+        } else if (self.kv_format == .q8 and d.head_dim <= 256 and T >= 8) {
+            cmd.dispatch(&self.pipes.attention_causal_q8_prefill, .{ d.n_head, ceilDiv(T, 8), 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), 0);
+        } else if (self.kv_format == .q8 or base_position + T > 8192) {
             cmd.dispatch(&self.pipes.attention_causal_tiled, .{ d.n_head, T, ceilDiv(d.head_dim, 256) }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), 0);
         } else if (self.use_attn_v2) {
             cmd.dispatch(&self.pipes.attention_causal_v2, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &self.sinks, &b.attn_out }, &attn, @sizeOf(AttnBatchPush), (base_position + T + d.head_dim) * 4);
@@ -3865,7 +3921,7 @@ pub const ForwardCuda = struct {
         // redirected to its scheduler slot. The generic B-wide path otherwise
         // pays three synchronous metadata uploads and misses the serial fusion
         // set at B=1. True concurrent batches continue through the code below.
-        if (B == 1 and b1MatvecOn()) {
+        if (B == 1 and (self.kv_format == .q8 or b1MatvecOn())) {
             out[0] = try self.decodeSlotStep(tokens[0], positions[0], slots[0]);
             return;
         }
@@ -4709,16 +4765,56 @@ pub const ForwardCuda = struct {
         self.waitPending(); // sync: shared per-row scratch reused by the next row
     }
 
-    /// Slot-state variant of `attentionLayer`: identical block math, but the KV
-    /// cache read/write target sequence `slot`'s region of the slot KV (aliased to
-    /// its base), and the kernels run SYNCHRONOUSLY (commitAndWait) so the per-row
-    /// slot aliases are safe to free on return. The kv-write/attention offsets are
-    /// pos-relative within the slot's aliased region — byte-for-byte the same
-    /// values as the single-seq path. 4c fuses this into a batched per-seq kernel.
+    /// Expand one Q8 key tile at a time for BLAS attention, retaining FP32
+    /// online-softmax state and output accumulation across tiles.
+    fn q8BlasAttention(self: *ForwardCuda, cmd: *command.CudaCommand, q: *const CudaBuffer, k: *const CudaBuffer, v: *const CudaBuffer, out: *const CudaBuffer, attn: AttnBatchPush) !void {
+        const keys: u32 = 1024;
+        const d = self.d;
+        if (self.q8_attention == null or self.q8_attention.?.capacity < attn.T) {
+            self.waitPending();
+            if (self.q8_attention) |*old| old.deinit();
+            self.q8_attention = null;
+            var scratch = Q8AttentionScratch{ .capacity = attn.T };
+            errdefer scratch.deinit();
+            const rows = @as(usize, d.n_head) * attn.T;
+            const input_bytes: usize = if (self.q8_attention_half) 2 else 4;
+            scratch.q = try buffer.createBuffer(self.ctx, rows * d.head_dim * input_bytes);
+            scratch.acc = try buffer.createBuffer(self.ctx, rows * d.head_dim * 4);
+            scratch.state = try buffer.createBuffer(self.ctx, rows * 2 * 4);
+            scratch.scores = try buffer.createBuffer(self.ctx, rows * keys * 4);
+            if (self.q8_attention_half) scratch.probabilities = try buffer.createBuffer(self.ctx, rows * keys * 2);
+            scratch.k = try buffer.createBuffer(self.ctx, @as(usize, d.n_head) * keys * d.head_dim * input_bytes);
+            scratch.v = try buffer.createBuffer(self.ctx, @as(usize, d.n_head) * keys * d.head_dim * input_bytes);
+            self.q8_attention = scratch;
+        }
+        const s = &self.q8_attention.?;
+        var push = Q8BlasPush{ .hd = d.head_dim, .heads = d.n_head, .kv_heads = d.n_kv_head, .rows = attn.T, .scale = attn.attn_scale_bits, .sink = attn.sink_offset, .base = attn.base_position, .start = 0, .keys = keys };
+        const n = d.n_head * attn.T * d.head_dim;
+        cmd.dispatch(&self.pipes.q8_attention_prepare_q, .{ ceilDiv(n, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ q, &s.q, &s.acc, &s.state }, &push, @sizeOf(Q8BlasPush), 0);
+        const q_stride: i64 = @as(i64, attn.T) * d.head_dim;
+        const kv_stride: i64 = @as(i64, keys) * d.head_dim;
+        const score_stride: i64 = @as(i64, attn.T) * keys;
+        while (push.start < attn.base_position + attn.T) : (push.start += keys) {
+            cmd.dispatch(&self.pipes.q8_attention_prepare_kv, .{ ceilDiv(d.n_head * keys * d.head_dim, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ k, v, &s.k, &s.v }, &push, @sizeOf(Q8BlasPush), 0);
+            if (self.q8_attention_half) {
+                shim.cuda_cublas_hgemm_strided_batched(self.ctx, 1, 0, keys, attn.T, d.head_dim, s.k.handle, 0, d.head_dim, kv_stride, s.q.handle, 0, d.head_dim, q_stride, s.scores.handle, 0, keys, score_stride, d.n_head, 0);
+                cmd.dispatch(&self.pipes.q8_attention_softmax, .{ d.n_head, attn.T, 1 }, .{ 256, 1, 1 }, &.{ &s.scores, &s.acc, &s.state, &s.probabilities }, &push, @sizeOf(Q8BlasPush), 0);
+                shim.cuda_cublas_hgemm_strided_batched(self.ctx, 0, 0, d.head_dim, attn.T, keys, s.v.handle, 0, d.head_dim, kv_stride, s.probabilities.handle, 0, keys, score_stride, s.acc.handle, 0, d.head_dim, q_stride, d.n_head, 1);
+            } else {
+                shim.cuda_cublas_sgemm_strided_batched(self.ctx, 1, 0, keys, attn.T, d.head_dim, s.k.handle, 0, d.head_dim, kv_stride, s.q.handle, 0, d.head_dim, q_stride, s.scores.handle, 0, keys, score_stride, d.n_head, 0);
+                cmd.dispatch(&self.pipes.q8_attention_softmax, .{ d.n_head, attn.T, 1 }, .{ 256, 1, 1 }, &.{ &s.scores, &s.acc, &s.state }, &push, @sizeOf(Q8BlasPush), 0);
+                shim.cuda_cublas_sgemm_strided_batched(self.ctx, 0, 0, d.head_dim, attn.T, keys, s.v.handle, 0, d.head_dim, kv_stride, s.scores.handle, 0, keys, score_stride, s.acc.handle, 0, d.head_dim, q_stride, d.n_head, 1);
+            }
+        }
+        cmd.dispatch(&self.pipes.q8_attention_finish, .{ ceilDiv(n, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &s.acc, &s.state, &self.sinks, out }, &push, @sizeOf(Q8BlasPush), 0);
+    }
+
+    /// Slot-state variant of `attentionLayer`, with position-relative reads and
+    /// writes into the selected slot's KV region. The parent allocation outlives
+    /// queued commands that reference the temporary aliases.
     fn attentionLayerSlot(self: *ForwardCuda, L: u32, pos: u32, slot: u32) !void {
         const d = self.d;
         const ctx = self.ctx;
-        const f4 = @sizeOf(f32);
         const wq = self.layer(L, "attn_q.weight"); // packed [Q | gate], M = 2*q_dim
         const wk = self.layer(L, "attn_k.weight");
         const wv = self.layer(L, "attn_v.weight");
@@ -4728,8 +4824,8 @@ pub const ForwardCuda = struct {
         const wan = self.layer(L, "attn_norm.weight");
 
         // Alias sequence `slot`'s KV region to its base; pos-relative offsets below.
-        const kv_base = @as(usize, slot) * self.slot_ctx * d.kv_dim * f4;
-        const kv_span = @as(usize, self.slot_ctx) * d.kv_dim * f4;
+        const kv_base = try self.kv_format.bytes(@as(usize, slot) * self.slot_ctx, d.kv_dim);
+        const kv_span = try self.kv_format.bytes(self.slot_ctx, d.kv_dim);
         var kk = try buffer.aliasBuffer(&self.kv_k_slots.?[L], kv_base, kv_span);
         var vv = try buffer.aliasBuffer(&self.kv_v_slots.?[L], kv_base, kv_span);
         defer {
@@ -4749,7 +4845,7 @@ pub const ForwardCuda = struct {
         self.attentionFrontendDispatch(&cmd, &wqn.gpu_buffer, &wkn.gpu_buffer, &kk, &vv, pos);
         const seq_len = pos + 1;
         const attn = AttnPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .seq_len = seq_len, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
-        if (seq_len > 8192) {
+        if (self.kv_format == .q8 or seq_len > 8192) {
             cmd.dispatch(&self.pipes.attention_tiled, .{ d.n_head, 1, ceilDiv(d.head_dim, 256) }, .{ 256, 1, 1 }, &.{ &self.q_buf, &kk, &vv, &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), 0);
         } else {
             cmd.dispatch(&self.pipes.naive_attention, .{ d.n_head, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.q_buf, &kk, &vv, &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), seq_len * 4);
@@ -4962,7 +5058,7 @@ pub const ForwardCuda = struct {
         pos: u32,
     ) void {
         const d = self.d;
-        if (self.use_fused_attn_frontend) {
+        if (self.kv_format == .f32 and self.use_fused_attn_frontend) {
             const qkv = QwenQkvPush{
                 .head_dim = d.head_dim,
                 .eps = d.rms_eps,
@@ -5030,7 +5126,7 @@ pub const ForwardCuda = struct {
         const attn = AttnPush{ .head_dim = d.head_dim, .n_heads = d.n_head, .n_kv_heads = d.n_kv_head, .seq_len = seq_len, .attn_scale_bits = 0, .sink_offset = L * d.n_head };
         // Full score arrays stay below 32 KiB, including during graph capture.
         // Beyond that, online softmax keeps shared memory independent of ctx.
-        if (seq_len > 8192) {
+        if (self.kv_format == .q8 or seq_len > 8192) {
             cmd.dispatch(&self.pipes.attention_tiled, .{ d.n_head, 1, ceilDiv(d.head_dim, 256) }, .{ 256, 1, 1 }, &.{ &self.q_buf, &self.kv_k[L], &self.kv_v[L], &self.sinks, &self.attn_out_buf }, &attn, @sizeOf(AttnPush), 0);
         } else {
             const attn_smem: u32 = (if (self.capturing) @min(self.max_ctx, 8192) else seq_len) * 4;

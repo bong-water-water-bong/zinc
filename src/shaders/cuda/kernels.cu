@@ -1808,6 +1808,34 @@ extern "C" __global__ void ssm_gated_norm_batched(const float* o, const float* z
 // Append K and V vectors into their caches at dst_offset (= physical_token*kv_dim).
 struct KvWritePush { unsigned kv_dim, dst_offset; };
 
+// Cache-only block format: float scale + 32 signed values (36 bytes).
+// This is independent of GGUF weight formats and never changes model tensors.
+struct ZincKvQ8 { float scale; signed char values[32]; };
+static_assert(sizeof(ZincKvQ8) == 36, "KV block ABI");
+__device__ __forceinline__ float zinc_kv_read(const float* p, size_t i) { return p[i]; }
+__device__ __forceinline__ float zinc_kv_read(const ZincKvQ8* p, size_t i) {
+    const ZincKvQ8& b = p[i / 32u];
+    return b.scale * (float)b.values[i % 32u];
+}
+__device__ __forceinline__ void zinc_kv_quantize(const float* src, ZincKvQ8* dst) {
+    unsigned lane = threadIdx.x & 31u;
+    float value = src[lane], m = fabsf(value);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, offset));
+    float scale = m / 127.0f;
+    if (lane == 0u) dst->scale = scale;
+    float q = scale > 0.0f ? nearbyintf(value / scale) : 0.0f;
+    dst->values[lane] = (signed char)fmaxf(-127.0f, fminf(127.0f, q));
+}
+extern "C" __global__ void kv_cache_write_q8(const float* k, ZincKvQ8* kd,
+                                             const float* v, ZincKvQ8* vd, KvWritePush pc) {
+    unsigned block = blockIdx.x * (blockDim.x / 32u) + threadIdx.x / 32u;
+    if (block * 32u >= pc.kv_dim) return;
+    zinc_kv_quantize(k + block * 32u, kd + pc.dst_offset / 32u + block);
+    zinc_kv_quantize(v + block * 32u, vd + pc.dst_offset / 32u + block);
+}
+
 extern "C" __global__ void kv_cache_write(const float* k_src, float* k_dst, const float* v_src, float* v_dst, KvWritePush pc) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < pc.kv_dim) {
@@ -1826,8 +1854,9 @@ struct AttnPush { unsigned head_dim, n_heads, n_kv_heads, seq_len, attn_scale_bi
 // block owns one query/head and a stripe of output dimensions, so neither LDS
 // nor temporary device allocations grow with the sequence length. All threads
 // participate in the reductions even in a partial key/output tile.
+template <typename Kv>
 __device__ __forceinline__ void zinc_attention_tiled(
-    const float* qh, const float* kh, const float* vh, float* oh,
+    const float* qh, const Kv* kh, const Kv* vh, float* oh,
     unsigned hd, size_t kv_stride, unsigned seq_len, float scale, float sink) {
     const unsigned tile = 1024u;
     __shared__ float scores[tile];
@@ -1843,9 +1872,9 @@ __device__ __forceinline__ void zinc_attention_tiled(
         unsigned count = seq_len - start < tile ? seq_len - start : tile;
         // A warp cooperates on each dot product, coalescing the K reads.
         for (unsigned i = warp; i < count; i += nwarp) {
-            const float* ki = kh + (size_t)(start + i) * kv_stride;
             float dot = 0.0f;
-            for (unsigned d = lane; d < hd; d += 32u) dot += qh[d] * ki[d];
+            for (unsigned d = lane; d < hd; d += 32u)
+                dot += qh[d] * zinc_kv_read(kh, (size_t)(start + i) * kv_stride + d);
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1)
                 dot += __shfl_down_sync(0xffffffffu, dot, o);
@@ -1874,7 +1903,7 @@ __device__ __forceinline__ void zinc_attention_tiled(
         if (d_out < hd) {
             #pragma unroll 8
             for (unsigned i = 0u; i < count; ++i)
-                acc += scores[i] * vh[(size_t)(start + i) * kv_stride + d_out];
+                acc += scores[i] * zinc_kv_read(vh, (size_t)(start + i) * kv_stride + d_out);
         }
         // Finish all V reads before the next tile overwrites scores.
         __syncthreads();
@@ -1897,6 +1926,16 @@ extern "C" __global__ void attention_tiled(const float* q, const float* k, const
     size_t head_off = (size_t)kv_head * pc.head_dim;
     float scale = pc.attn_scale_bits ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)pc.head_dim);
     zinc_attention_tiled(q + (size_t)head * pc.head_dim, k + head_off, v + head_off,
+        out + (size_t)head * pc.head_dim, pc.head_dim, (size_t)pc.n_kv_heads * pc.head_dim,
+        pc.seq_len, scale, sinks[pc.sink_offset + head]);
+}
+
+extern "C" __global__ void attention_tiled_q8(const float* q, const ZincKvQ8* k, const ZincKvQ8* v,
+                                              const float* sinks, float* out, AttnPush pc) {
+    unsigned head = blockIdx.x, kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    size_t head_block = (size_t)kv_head * pc.head_dim / 32u;
+    float scale = pc.attn_scale_bits ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)pc.head_dim);
+    zinc_attention_tiled(q + (size_t)head * pc.head_dim, k + head_block, v + head_block,
         out + (size_t)head * pc.head_dim, pc.head_dim, (size_t)pc.n_kv_heads * pc.head_dim,
         pc.seq_len, scale, sinks[pc.sink_offset + head]);
 }
@@ -11778,6 +11817,264 @@ extern "C" __global__ void naive_attention_batched_seq(
 // Q/K/V are [T, n_kv_heads-or-n_heads, head_dim]; out is [T, n_heads, head_dim].
 struct AttnBatchPush { unsigned head_dim, n_heads, n_kv_heads, T, attn_scale_bits, sink_offset, base_position; };
 
+// Bounded FP32 BLAS attention: only one key tile is expanded at a time.
+struct Q8BlasPush { unsigned hd, heads, kv_heads, rows, scale, sink, base, start, keys; };
+extern "C" __global__ void q8_attention_prepare_q_f16(const float* q, half* packed, float* acc,
+                                                      float* state, Q8BlasPush pc) {
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    size_t n=(size_t)pc.heads*pc.rows*pc.hd;
+    if(i>=n) return;
+    unsigned d=i%pc.hd, row=(i/pc.hd)%pc.rows, head=i/((size_t)pc.rows*pc.hd);
+    packed[i]=__float2half_rn(q[((size_t)row*pc.heads+head)*pc.hd+d]);acc[i]=0.0f;
+    if(d==0) { state[2u*(i/pc.hd)]=-3.4e38f;state[2u*(i/pc.hd)+1u]=0.0f; }
+}
+extern "C" __global__ void q8_attention_prepare_kv_f16(const ZincKvQ8* k, const ZincKvQ8* v,
+                                                       half* pk, half* pv, Q8BlasPush pc) {
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    size_t n=(size_t)pc.heads*pc.keys*pc.hd;
+    if(i>=n) return;
+    unsigned d=i%pc.hd, key=(i/pc.hd)%pc.keys, head=i/((size_t)pc.keys*pc.hd);
+    unsigned kv_head=head/(pc.heads/pc.kv_heads);
+    size_t source=(((size_t)pc.start+key)*pc.kv_heads+kv_head)*pc.hd+d;
+    bool valid=pc.start+key<pc.base+pc.rows;
+    pk[i]=__float2half_rn(valid?zinc_kv_read(k,source):0.0f);pv[i]=__float2half_rn(valid?zinc_kv_read(v,source):0.0f);
+}
+extern "C" __global__ void q8_attention_prepare_q(const float* q, float* packed, float* acc,
+                                                  float* state, Q8BlasPush pc) {
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    size_t n=(size_t)pc.heads*pc.rows*pc.hd;
+    if(i>=n) return;
+    unsigned d=i%pc.hd, row=(i/pc.hd)%pc.rows, head=i/((size_t)pc.rows*pc.hd);
+    packed[i]=q[((size_t)row*pc.heads+head)*pc.hd+d];acc[i]=0.0f;
+    if(d==0) { state[2u*(i/pc.hd)]=-3.4e38f;state[2u*(i/pc.hd)+1u]=0.0f; }
+}
+extern "C" __global__ void q8_attention_prepare_kv(const ZincKvQ8* k, const ZincKvQ8* v,
+                                                   float* pk, float* pv, Q8BlasPush pc) {
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    size_t n=(size_t)pc.heads*pc.keys*pc.hd;
+    if(i>=n) return;
+    unsigned d=i%pc.hd, key=(i/pc.hd)%pc.keys, head=i/((size_t)pc.keys*pc.hd);
+    unsigned kv_head=head/(pc.heads/pc.kv_heads);
+    size_t source=(((size_t)pc.start+key)*pc.kv_heads+kv_head)*pc.hd+d;
+    bool valid=pc.start+key<pc.base+pc.rows;
+    pk[i]=valid?zinc_kv_read(k,source):0.0f;pv[i]=valid?zinc_kv_read(v,source):0.0f;
+}
+template<typename Probability>
+__device__ __forceinline__ void zinc_q8_attention_softmax(float* scores, float* acc, float* state,
+                                                          Probability* probabilities,Q8BlasPush pc) {
+    unsigned head=blockIdx.x,row=blockIdx.y,tid=threadIdx.x;
+    size_t r=(size_t)head*pc.rows+row, offset=r*pc.keys;
+    float scale=pc.scale?__uint_as_float(pc.scale):rsqrtf((float)pc.hd);
+    float m=-3.4e38f;
+    for(unsigned j=tid;j<pc.keys;j+=blockDim.x) {
+        float s=pc.start+j<=pc.base+row?scores[offset+j]*scale:-3.4e38f;
+        scores[offset+j]=s;m=fmaxf(m,s);
+    }
+    m=zinc_block_reduce_max(m);
+    __shared__ float maximum,rescale;
+    if(tid==0) { maximum=fmaxf(state[2*r],m);rescale=expf(state[2*r]-maximum);state[2*r]=maximum; }
+    __syncthreads();
+    float sum=0.0f;
+    for(unsigned j=tid;j<pc.keys;j+=blockDim.x) { float p=expf(scores[offset+j]-maximum);probabilities[offset+j]=(Probability)p;sum+=p; }
+    sum=zinc_block_reduce_sum(sum);
+    if(tid==0) state[2*r+1]=state[2*r+1]*rescale+sum;
+    for(unsigned d=tid;d<pc.hd;d+=blockDim.x) acc[r*pc.hd+d]*=rescale;
+}
+extern "C" __global__ void q8_attention_softmax(float* scores, float* acc, float* state,Q8BlasPush pc) {
+    zinc_q8_attention_softmax(scores,acc,state,scores,pc);
+}
+extern "C" __global__ void q8_attention_softmax_f16(float* scores, float* acc, float* state,half* probabilities,Q8BlasPush pc) {
+    zinc_q8_attention_softmax(scores,acc,state,probabilities,pc);
+}
+extern "C" __global__ void q8_attention_finish(const float* acc, const float* state,
+                                               const float* sinks, float* out, Q8BlasPush pc) {
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    size_t n=(size_t)pc.heads*pc.rows*pc.hd;
+    if(i>=n) return;
+    unsigned d=i%pc.hd,row=(i/pc.hd)%pc.rows,head=i/((size_t)pc.rows*pc.hd);
+    size_t r=i/pc.hd;
+    float maximum=state[2*r],sum=state[2*r+1],factor=1.0f,sink=sinks[pc.sink+head];
+    if(sink==sink) { float m=fmaxf(maximum,sink);factor=sum>0.0f?expf(maximum-m):0.0f;sum=sum*factor+expf(sink-m); }
+    factor=sum>0.0f?factor/sum:0.0f;
+    out[((size_t)row*pc.heads+head)*pc.hd+d]=acc[i]*factor;
+}
+
+extern "C" __global__ void attention_causal_tiled_q8(const float* q, const ZincKvQ8* k, const ZincKvQ8* v,
+                                                     const float* sinks, float* out, AttnBatchPush pc) {
+    unsigned head = blockIdx.x, t = blockIdx.y;
+    if (t >= pc.T) return;
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    size_t head_block = (size_t)kv_head * pc.head_dim / 32u;
+    size_t q_off = ((size_t)t * pc.n_heads + head) * pc.head_dim;
+    float scale = pc.attn_scale_bits ? __uint_as_float(pc.attn_scale_bits) : rsqrtf((float)pc.head_dim);
+    zinc_attention_tiled(q + q_off, k + head_block, v + head_block, out + q_off, pc.head_dim,
+        (size_t)pc.n_kv_heads * pc.head_dim, pc.base_position + t + 1u,
+        scale, sinks[pc.sink_offset + head]);
+}
+
+// Eight causal queries share each K/V tile. One warp owns each query; K and V
+// reuse the same shared array in separate phases. Qwen head dimensions <=256.
+// Every warp participates in barriers, including inactive tail queries.
+extern "C" __global__ void attention_causal_q8_prefill(const float* q, const ZincKvQ8* k, const ZincKvQ8* v,
+                                                       const float* sinks, float* out, AttnBatchPush pc) {
+    const unsigned lane=threadIdx.x&31u, warp=threadIdx.x>>5;
+    const unsigned head=blockIdx.x, query=blockIdx.y*8u+warp, hd=pc.head_dim;
+    const bool active=query<pc.T;
+    const unsigned position=pc.base_position+query;
+    const unsigned end=pc.base_position+((blockIdx.y*8u+8u<pc.T)?blockIdx.y*8u+8u:pc.T);
+    const size_t stride=(size_t)pc.n_kv_heads*hd;
+    const size_t head_off=(size_t)(head/(pc.n_heads/pc.n_kv_heads))*hd;
+    const size_t qoff=((size_t)query*pc.n_heads+head)*hd;
+    const float scale=pc.attn_scale_bits?__uint_as_float(pc.attn_scale_bits):rsqrtf((float)hd);
+    __shared__ float kv[32*256];
+    __shared__ float scores[8*32];
+    float qr[8], acc[8];
+    #pragma unroll
+    for(unsigned d=0;d<8;d++) { qr[d]=active && lane+d*32u<hd?q[qoff+lane+d*32u]:0.0f;acc[d]=0.0f; }
+    float maximum=-3.4e38f, denominator=0.0f;
+    for(unsigned start=0;start<end;start+=32u) {
+        const unsigned count=end-start<32u?end-start:32u;
+        for(unsigned i=threadIdx.x;i<count*hd;i+=blockDim.x)
+            kv[(i/hd)*256u+i%hd]=zinc_kv_read(k,((size_t)start+i/hd)*stride+head_off+i%hd);
+        __syncthreads();
+        for(unsigned j=0;j<count;j++) {
+            float dot=0.0f;
+            #pragma unroll
+            for(unsigned d=0;d<8;d++) if(lane+d*32u<hd) dot+=qr[d]*kv[j*256u+lane+d*32u];
+            #pragma unroll
+            for(int offset=16;offset>0;offset>>=1) dot+=__shfl_down_sync(0xffffffffu,dot,offset);
+            if(lane==0u) scores[warp*32u+j]=active && start+j<=position?dot*scale:-3.4e38f;
+        }
+        __syncthreads();
+        // All K consumers have finished; use the same allocation for V.
+        for(unsigned i=threadIdx.x;i<count*hd;i+=blockDim.x)
+            kv[(i/hd)*256u+i%hd]=zinc_kv_read(v,((size_t)start+i/hd)*stride+head_off+i%hd);
+        float m=lane<count?scores[warp*32u+lane]:-3.4e38f;
+        #pragma unroll
+        for(int offset=16;offset>0;offset>>=1) m=fmaxf(m,__shfl_xor_sync(0xffffffffu,m,offset));
+        float next=fmaxf(maximum,m), rescale=expf(maximum-next);
+        float weight=active && lane<count && start+lane<=position?expf(scores[warp*32u+lane]-next):0.0f;
+        float sum=weight;
+        #pragma unroll
+        for(int offset=16;offset>0;offset>>=1) sum+=__shfl_xor_sync(0xffffffffu,sum,offset);
+        scores[warp*32u+lane]=weight;
+        denominator=denominator*rescale+sum;maximum=next;
+        __syncthreads();
+        #pragma unroll
+        for(unsigned d=0;d<8;d++) {
+            acc[d]*=rescale;
+            if(lane+d*32u<hd) for(unsigned j=0;j<count;j++)
+                acc[d]+=scores[warp*32u+j]*kv[j*256u+lane+d*32u];
+        }
+        __syncthreads();
+    }
+    float factor=1.0f;
+    float sink=sinks[pc.sink_offset+head];
+    if(sink==sink) {
+        float m=fmaxf(maximum,sink);
+        factor=denominator>0.0f?expf(maximum-m):0.0f;
+        denominator=denominator*factor+expf(sink-m);
+    }
+    factor=denominator>0.0f?factor/denominator:0.0f;
+    #pragma unroll
+    for(unsigned d=0;d<8;d++) if(active && lane+d*32u<hd) out[qoff+lane+d*32u]=acc[d]*factor;
+}
+
+// The 256-dimensional Qwen path keeps the shared K/V tile compressed and
+// reuses it across 32 queries. Four queries per warp also reuse dequantized
+// K/V register values. This reduces both global reads and barrier frequency.
+extern "C" __global__ void attention_causal_q8_prefill32(const float* q, const ZincKvQ8* k, const ZincKvQ8* v,
+                                                         const float* sinks, float* out, AttnBatchPush pc) {
+    const unsigned lane=threadIdx.x&31u, warp=threadIdx.x>>5;
+    const unsigned first=blockIdx.y*32u, end=pc.base_position+(first+32u<pc.T?first+32u:pc.T);
+    const unsigned head=blockIdx.x, kv_head=head/(pc.n_heads/pc.n_kv_heads);
+    const size_t stride_words=(size_t)pc.n_kv_heads*72u;
+    const float scale=pc.attn_scale_bits?__uint_as_float(pc.attn_scale_bits):rsqrtf(256.0f);
+    __shared__ unsigned words[128*72];
+    __shared__ float scores[32*128];
+    const ZincKvQ8* tile=(const ZincKvQ8*)words;
+    const unsigned* kw=(const unsigned*)k;
+    const unsigned* vw=(const unsigned*)v;
+    float qr[4][8], acc[4][8], maximum[4], denominator[4], rescale[4];
+    #pragma unroll
+    for(unsigned r=0;r<4;r++) {
+        unsigned query=first+r*8u+warp;
+        size_t off=((size_t)query*pc.n_heads+head)*256u;
+        maximum[r]=-3.4e38f;denominator[r]=0.0f;
+        #pragma unroll
+        for(unsigned d=0;d<8;d++) { qr[r][d]=query<pc.T?q[off+lane+d*32u]:0.0f;acc[r][d]=0.0f; }
+    }
+    for(unsigned start=0;start<end;start+=128u) {
+        const unsigned count=end-start<128u?end-start:128u;
+        for(unsigned i=threadIdx.x;i<count*72u;i+=blockDim.x)
+            words[i]=kw[((size_t)start+i/72u)*stride_words+kv_head*72u+i%72u];
+        __syncthreads();
+        for(unsigned j=0;j<count;j++) {
+            float dot[4]={0,0,0,0};
+            #pragma unroll
+            for(unsigned d=0;d<8;d++) {
+                float key=zinc_kv_read(tile,j*256u+lane+d*32u);
+                #pragma unroll
+                for(unsigned r=0;r<4;r++) dot[r]+=qr[r][d]*key;
+            }
+            #pragma unroll
+            for(unsigned r=0;r<4;r++) {
+                #pragma unroll
+                for(int offset=16;offset>0;offset>>=1) dot[r]+=__shfl_down_sync(0xffffffffu,dot[r],offset);
+                unsigned query=first+r*8u+warp;
+                if(lane==0) scores[(r*8u+warp)*128u+j]=query<pc.T && start+j<=pc.base_position+query?dot[r]*scale:-3.4e38f;
+            }
+        }
+        __syncthreads();
+        for(unsigned i=threadIdx.x;i<count*72u;i+=blockDim.x)
+            words[i]=vw[((size_t)start+i/72u)*stride_words+kv_head*72u+i%72u];
+        #pragma unroll
+        for(unsigned r=0;r<4;r++) {
+            unsigned query=first+r*8u+warp;
+            float m=-3.4e38f;
+            for(unsigned j=lane;j<count;j+=32u) m=fmaxf(m,scores[(r*8u+warp)*128u+j]);
+            #pragma unroll
+            for(int offset=16;offset>0;offset>>=1) m=fmaxf(m,__shfl_xor_sync(0xffffffffu,m,offset));
+            float next=fmaxf(maximum[r],m),sum=0.0f;
+            rescale[r]=expf(maximum[r]-next);maximum[r]=next;
+            for(unsigned j=lane;j<count;j+=32u) {
+                float weight=query<pc.T && start+j<=pc.base_position+query?expf(scores[(r*8u+warp)*128u+j]-next):0.0f;
+                scores[(r*8u+warp)*128u+j]=weight;sum+=weight;
+            }
+            #pragma unroll
+            for(int offset=16;offset>0;offset>>=1) sum+=__shfl_xor_sync(0xffffffffu,sum,offset);
+            denominator[r]=denominator[r]*rescale[r]+sum;
+        }
+        __syncthreads();
+        #pragma unroll
+        for(unsigned d=0;d<8;d++) {
+            #pragma unroll
+            for(unsigned r=0;r<4;r++) acc[r][d]*=rescale[r];
+            for(unsigned j=0;j<count;j++) {
+                float value=zinc_kv_read(tile,j*256u+lane+d*32u);
+                #pragma unroll
+                for(unsigned r=0;r<4;r++) acc[r][d]+=scores[(r*8u+warp)*128u+j]*value;
+            }
+        }
+        __syncthreads();
+    }
+    float sink=sinks[pc.sink_offset+head];
+    #pragma unroll
+    for(unsigned r=0;r<4;r++) {
+        unsigned query=first+r*8u+warp;
+        float factor=1.0f;
+        if(sink==sink) {
+            float m=fmaxf(maximum[r],sink);
+            factor=denominator[r]>0.0f?expf(maximum[r]-m):0.0f;
+            denominator[r]=denominator[r]*factor+expf(sink-m);
+        }
+        factor=denominator[r]>0.0f?factor/denominator[r]:0.0f;
+        size_t off=((size_t)query*pc.n_heads+head)*256u;
+        #pragma unroll
+        for(unsigned d=0;d<8;d++) if(query<pc.T) out[off+lane+d*32u]=acc[r][d]*factor;
+    }
+}
+
 extern "C" __global__ void attention_causal_tiled(const float* q, const float* k, const float* v,
                                                   const float* sinks, float* out, AttnBatchPush pc) {
     unsigned head = blockIdx.x, t = blockIdx.y;
@@ -11983,6 +12280,17 @@ extern "C" __global__ void rope_batched(const float* x, float* y, const float* i
 // [T, kv_dim]; token t writes into the KV cache at physical position dst_base+t
 // (= (dst_base+t)*kv_dim). Block (chunk=blockIdx.x, token=blockIdx.y).
 struct KvWriteBatchPush { unsigned kv_dim, dst_base, T; };
+
+extern "C" __global__ void kv_cache_write_batched_q8(const float* k, ZincKvQ8* kd,
+                                                     const float* v, ZincKvQ8* vd, KvWriteBatchPush pc) {
+    unsigned block = blockIdx.x * (blockDim.x / 32u) + threadIdx.x / 32u;
+    unsigned t = blockIdx.y + blockIdx.z * gridDim.y;
+    if (t >= pc.T || block * 32u >= pc.kv_dim) return;
+    size_t source = (size_t)t * pc.kv_dim + block * 32u;
+    size_t target = ((size_t)pc.dst_base + t) * (pc.kv_dim / 32u) + block;
+    zinc_kv_quantize(k + source, kd + target);
+    zinc_kv_quantize(v + source, vd + target);
+}
 extern "C" __global__ void kv_cache_write_batched(const float* k_src, float* k_dst, const float* v_src, float* v_dst, KvWriteBatchPush pc) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned t = blockIdx.y;

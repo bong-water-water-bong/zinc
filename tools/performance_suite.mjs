@@ -295,6 +295,13 @@ export function parseArgs(argv) {
         args.rdnaContext = context;
         break;
       }
+      case '--rdna-llama-kv': {
+        const format = argv[++i];
+        if (!['f16', 'q8_0'].includes(format))
+          throw new Error('--rdna-llama-kv must be f16 or q8_0');
+        args.rdnaLlamaKv = format;
+        break;
+      }
       case '--intel-sync':
         args.intelSync = true;
         break;
@@ -428,6 +435,7 @@ function usage() {
   --rdna-vk-device <n>        GPU index: Vulkan, or ROCr with the ROCm backend (default 0).
                               Use vulkaninfo for Vulkan, or rocminfo for ROCm.
   --rdna-context <n>          Context per slot for both RDNA servers (default: model setting or 4096).
+  --rdna-llama-kv <format>    Baseline KV format: f16 (default) or q8_0 for larger contexts.
   --rdna-llama-cli <path>     Override remote RDNA llama-cli baseline binary
   --rdna-llama-server <path>  Override remote RDNA llama-server baseline binary
   --rdna-llama-device <dev>   Override RDNA llama.cpp --device value, e.g. Vulkan1 or ROCm0.
@@ -1520,6 +1528,11 @@ const REMOTE_ZINC_TUNING_ENV_KEYS = [
   // Lets a run measure the same model with NextN/MTP speculative decoding off,
   // which is what the dashboard's MTP toggle compares against.
   'ZINC_MTP',
+  'ZINC_KV_CACHE',
+  'ZINC_Q8_ATTN_BLAS',
+  'ZINC_Q8_ATTN_F16',
+  'ZINC_PROMPT_CACHE',
+  'ZINC_PREFILL_CHUNK',
   'ZINC_BATCHED_PREFILL',
   'ZINC_QWEN_MOE_BATCHED',
   'ZINC_MOE_TC',
@@ -2181,6 +2194,8 @@ function rdnaServerContext(caseDef) {
 }
 
 export function rdnaLlamaServerArgs(caseDef, creds, serverPath, port) {
+  const kv = creds.llamaKvCache ?? 'f16';
+  if (!['f16', 'q8_0'].includes(kv)) throw new Error('Unsupported llama.cpp KV format');
   return [
     serverPath,
     '--host',
@@ -2197,11 +2212,8 @@ export function rdnaLlamaServerArgs(caseDef, creds, serverPath, port) {
     String(rdnaServerContext(caseDef)),
     '--parallel',
     '1',
-    // Default f16 KV cache. The previous -ctk q8_0 / -ctv q8_0 added
-    // dequant-per-attention-read overhead that artificially lowered
-    // llama.cpp's decode tok/s vs ZINC (which uses f32 KV) — apples-to-
-    // not-apples. Drop to defaults so the published baseline reflects
-    // peak llama.cpp throughput on this model + hardware.
+    // Keep the fast default baseline; opt into Q8 only when explicitly asked.
+    ...(kv === 'q8_0' ? ['-ctk', 'q8_0', '-ctv', 'q8_0'] : []),
     '-b',
     '4096',
     '-ub',
@@ -3672,6 +3684,7 @@ export async function buildRdnaCreds(args) {
     port,
     sshKey,
     workdir: args.rdnaWorkdir,
+    llamaKvCache: args.rdnaLlamaKv ?? 'f16',
     env:
       args.rdnaBackend === 'rocm'
         ? { ...tuningEnv, ROCR_VISIBLE_DEVICES: String(args.rdnaVkDevice ?? 0) }
@@ -4072,7 +4085,20 @@ async function runRdnaTarget(args) {
       ),
     );
     const summary = primaryScenarioSummary(entry, scenarios);
-    models.push({ ...summary, server_context_tokens: rdnaServerContext(entry) });
+    models.push({
+      ...summary,
+      server_context_tokens: rdnaServerContext(entry),
+      server_kv_cache: {
+        zinc: creds.env?.ZINC_KV_CACHE ?? 'backend default',
+        llama_cpp: creds.llamaKvCache ?? 'f16',
+      },
+      zinc_context_options: {
+        q8_attention_blas: creds.env?.ZINC_Q8_ATTN_BLAS ?? '1',
+        q8_attention_f16: creds.env?.ZINC_Q8_ATTN_F16 ?? '0',
+        prefill_chunk: creds.env?.ZINC_PREFILL_CHUNK ?? '4096',
+        prompt_cache: creds.env?.ZINC_PROMPT_CACHE ?? 'backend default',
+      },
+    });
     logModelSummary(targetIdentity.id, summary);
     await writePartialSnapshot(args, targetIdentity.id, targetIdentity.label, models);
   }

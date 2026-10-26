@@ -11,7 +11,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 
 export function parseArgs(argv) {
-  const opts = { zinc: './zig-out/bin/zinc', context: 16384, mtp: '1' };
+  const opts = { zinc: './zig-out/bin/zinc', context: 16384, mtp: '1', kvCache: 'f32' };
   for (let i = 0; i < argv.length; i++) {
     const key = {
       '--zinc': 'zinc',
@@ -20,10 +20,11 @@ export function parseArgs(argv) {
       '--output': 'output',
       '--context': 'context',
       '--mtp': 'mtp',
+      '--kv-cache': 'kvCache',
     }[argv[i]];
     if (!key || !argv[i + 1] || argv[i + 1].startsWith('--'))
       throw new Error(
-        'Use --model FILE --gpu DEVICE --output DIR [--zinc BIN --context N --mtp 0|1]',
+        'Use --model FILE --gpu DEVICE --output DIR [--zinc BIN --context N --mtp 0|1 --kv-cache f32|q8]',
       );
     opts[key] = argv[++i];
   }
@@ -35,10 +36,11 @@ export function parseArgs(argv) {
     !opts.output ||
     !Number.isSafeInteger(opts.context) ||
     opts.context < 16384 ||
-    !['0', '1'].includes(opts.mtp)
+    !['0', '1'].includes(opts.mtp) ||
+    !['f32', 'q8'].includes(opts.kvCache)
   )
     throw new Error(
-      'A model, GPU, fresh output directory, context >= 16384, and MTP 0|1 are required',
+      'A model, GPU, fresh output directory, context >= 16384, MTP 0|1, and KV f32|q8 are required',
     );
   return opts;
 }
@@ -87,6 +89,9 @@ export async function validate(opts) {
     model: path.basename(model),
     context: opts.context,
     mtp: opts.mtp === '1',
+    kv_cache: opts.kvCache,
+    q8_attention_blas: process.env.ZINC_Q8_ATTN_BLAS ?? '1',
+    q8_attention_f16: process.env.ZINC_Q8_ATTN_F16 ?? '0',
     binary_sha256: hash(await readFile(binary)),
     variants: [],
   };
@@ -167,6 +172,7 @@ export async function validate(opts) {
             ...process.env,
             ROCR_VISIBLE_DEVICES: opts.gpu,
             ZINC_MTP: opts.mtp,
+            ZINC_KV_CACHE: opts.kvCache,
             ZINC_PROMPT_CACHE: enabled ? '1' : '0',
             ZINC_PREFILL_CHUNK: '4096',
             ZINC_BATCHED_PREFILL: '1',
