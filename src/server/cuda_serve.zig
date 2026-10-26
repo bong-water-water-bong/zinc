@@ -26,9 +26,11 @@
 //!     across handler threads cannot change any sequence's output.
 
 const std = @import("std");
+const host_io = @import("host_io");
 const scheduler = @import("../scheduler/scheduler.zig");
 const forwardgemma = @import("../compute/forward_cuda_gemma.zig");
 const forwardcuda = @import("../compute/forward_cuda.zig");
+const shim = @import("../cuda/c.zig").shim;
 
 const log = std.log.scoped(.cuda_serve);
 
@@ -58,6 +60,21 @@ pub const Forward = union(enum) {
     gemma: *forwardgemma.ForwardGemma,
     qwen: *forwardcuda.ForwardCuda,
 
+    fn checkExecution(self: Forward) !void {
+        const ctx = switch (self) {
+            .gemma => |g| g.ctx,
+            .qwen => |q| q.ctx,
+        };
+        if (shim.cuda_execution_failed(ctx) != 0) return error.GpuExecutionFailed;
+    }
+
+    fn computedPrefillTokens(self: Forward, total: usize) usize {
+        return total -| switch (self) {
+            .gemma => @as(usize, 0),
+            .qwen => |q| q.last_prefill_cached,
+        };
+    }
+
     fn allocSlots(self: Forward, nslots: u32, slot_ctx: u32) !void {
         switch (self) {
             .gemma => |g| try g.allocSlotKv(nslots, slot_ctx),
@@ -71,27 +88,34 @@ pub const Forward = union(enum) {
         }
     }
     fn decodeBatch(self: Forward, tokens: []const u32, positions: []const u32, slots: []const u32, out: []u32) !void {
+        try self.checkExecution();
         switch (self) {
             .gemma => |g| try g.decodeBatch(tokens, positions, slots, out),
             .qwen => |q| try q.decodeBatch(tokens, positions, slots, out),
         }
+        try self.checkExecution();
     }
     /// Clear a reused slot's accumulated state before a new request prefills into
     /// it. No-op for gemma (attention-only, position-indexed KV overwritten on
     /// prefill); zeros the slot's SSM conv ring + recurrent state for qwen.
     fn resetSlot(self: Forward, slot: u32) !void {
+        try self.checkExecution();
         switch (self) {
             .gemma => {},
             .qwen => |q| try q.resetSlot(slot),
         }
+        try self.checkExecution();
     }
     /// Batched prefill that writes state into the slot's per-sequence region.
     /// Falls back to per-token decodeBatch when unavailable (gemma or old build).
     fn prefillSlot(self: Forward, tokens: []const u32, slot: u32) !u32 {
-        switch (self) {
-            .gemma => |g| return try g.prefillBatchedSlot(tokens, slot),
-            .qwen => |q| return try q.prefillBatchedSlot(tokens, slot),
-        }
+        try self.checkExecution();
+        const tok = switch (self) {
+            .gemma => |g| try g.prefillBatchedSlot(tokens, slot),
+            .qwen => |q| try q.prefillBatchedSlot(tokens, slot),
+        };
+        try self.checkExecution();
+        return tok;
     }
 };
 
@@ -103,13 +127,16 @@ pub const Forward = union(enum) {
 /// the handler drains it, so the handler must copy out under the same lock).
 pub const ReqChannel = struct {
     /// Tokens generated so far (worker appends under lock; `nextChunk` copies out).
-    tokens: std.ArrayList(u32) = .{},
+    tokens: std.ArrayList(u32) = .empty,
     /// How many tokens the handler has already drained via `nextChunk`.
     consumed: usize = 0,
     /// True once the request finished (EOS or max_tokens) — no more tokens coming.
     done: bool = false,
     /// True if generation errored on the worker (GPU/alloc failure).
     failed: bool = false,
+    /// Transport disconnected or reached a stop sequence. The worker observes
+    /// this under the mutex and releases the slot at the next token boundary.
+    cancelled: bool = false,
     /// Per-request device timings. The worker records these before publishing
     /// completion; the HTTP handler reads them after `finished` is observed.
     prefill_tokens: u64 = 0,
@@ -135,8 +162,8 @@ pub const ServeEngine = struct {
     /// Optional model-specific end-of-turn token (ATEM `<|eot|>`).
     eot: ?u32,
 
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: host_io.Mutex = .{},
+    cond: host_io.Condition = .{},
     /// request id → channel. Entries inserted by `submit`, removed by `finish`.
     registry: std.AutoHashMapUnmanaged(u64, *ReqChannel) = .{},
     worker: ?std.Thread = null,
@@ -254,6 +281,17 @@ pub const ServeEngine = struct {
         chan.tokens.deinit(self.allocator);
     }
 
+    pub fn cancel(self: *ServeEngine, id: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.registry.get(id)) |chan| chan.cancelled = true;
+    }
+
+    pub fn executionFailed(self: *const ServeEngine) bool {
+        self.fwd.checkExecution() catch return true;
+        return false;
+    }
+
     /// Write the cumulative throughput counters as JSON into `buf`. Lock-free
     /// (atomic loads) so `/stats` never contends the worker. The gate diffs two
     /// snapshots around each B-concurrent phase → pure decode tok/s + occupancy.
@@ -325,7 +363,11 @@ pub const ServeEngine = struct {
         self.sched.release(slot_id);
     }
 
-    fn requestShouldStop(self: *const ServeEngine, req: anytype) bool {
+    fn requestShouldStop(self: *ServeEngine, req: anytype) bool {
+        self.mutex.lock();
+        const cancelled = if (self.registry.get(req.id)) |chan| chan.cancelled else false;
+        self.mutex.unlock();
+        if (cancelled) return true;
         if (req.shouldStop(self.eos)) return true;
         const eot = self.eot orelse return false;
         if (req.generated_tokens.items.len == 0) return false;
@@ -344,7 +386,7 @@ pub const ServeEngine = struct {
     ///
     /// @returns false when MTP was unavailable for this request, so the caller
     /// falls back to the ordinary slot path.
-    fn runMtpRequest(self: *ServeEngine, slot_id: u32, timer_opt: *?std.time.Timer) bool {
+    fn runMtpRequest(self: *ServeEngine, slot_id: u32, timer_opt: *?host_io.Timer) bool {
         const q = switch (self.fwd) {
             .qwen => |ptr| ptr,
             .gemma => return false,
@@ -362,19 +404,28 @@ pub const ServeEngine = struct {
 
         const pf_t0 = if (timer_opt.*) |*tm| tm.read() else 0;
         var next_tok = q.prefillBatched(req.prompt_tokens) catch |err| {
+            self.fwd.checkExecution() catch {
+                self.failSlot(slot_id);
+                return true;
+            };
             log.warn("request {d} batched prefill failed ({s}); using the slot path", .{ req.id, @errorName(err) });
             return false;
         };
+        const computed_tokens = self.fwd.computedPrefillTokens(np);
         if (timer_opt.*) |*tm| {
             const elapsed = tm.read() - pf_t0;
             _ = self.prefill_wall_ns.fetchAdd(elapsed, .monotonic);
-            _ = self.prefill_tokens.fetchAdd(np, .monotonic);
-            self.recordPrefillTiming(req.id, np, elapsed);
+            _ = self.prefill_tokens.fetchAdd(computed_tokens, .monotonic);
+            self.recordPrefillTiming(req.id, computed_tokens, elapsed);
         }
 
         // Priming reads the prompt rows the batched prefill just produced, so it
         // has to happen before any decode step overwrites them.
         const primed = q.mtpPrime(req.prompt_tokens) catch |err| blk: {
+            self.fwd.checkExecution() catch {
+                self.failSlot(slot_id);
+                return true;
+            };
             log.warn("request {d} NextN/MTP priming failed ({s}); ordinary decode", .{ req.id, @errorName(err) });
             break :blk false;
         };
@@ -432,7 +483,7 @@ pub const ServeEngine = struct {
 
     /// Append + publish one token. Returns false once the request is complete
     /// (stop token or budget), having released the slot.
-    fn emitToken(self: *ServeEngine, slot_id: u32, token: u32, timer_opt: *?std.time.Timer) bool {
+    fn emitToken(self: *ServeEngine, slot_id: u32, token: u32, timer_opt: *?host_io.Timer) bool {
         _ = timer_opt;
         const req = &self.sched.slots[slot_id].?;
         req.appendToken(token) catch {
@@ -458,7 +509,7 @@ pub const ServeEngine = struct {
         var sls: [scheduler_max]u32 = undefined;
         var out: [scheduler_max]u32 = undefined;
         // Monotonic timer for the 3c throughput counters; non-fatal if absent.
-        var timer_opt = std.time.Timer.start() catch null;
+        var timer_opt: ?host_io.Timer = host_io.Timer.start() catch null;
 
         while (true) {
             // Wait for work (or shutdown) while idle — event-driven, no poll.
@@ -501,18 +552,31 @@ pub const ServeEngine = struct {
                 // Threshold: batched GEMM overhead dominates below ~32 tokens.
                 // A/B toggle: ZINC_BATCHED_PREFILL=0 disables (uses per-token fallback).
                 const use_batched = np >= 32 and
-                    (std.posix.getenv("ZINC_BATCHED_PREFILL") == null or
-                        !std.mem.eql(u8, std.posix.getenv("ZINC_BATCHED_PREFILL").?, "0"));
+                    (host_io.getenv("ZINC_BATCHED_PREFILL") == null or
+                        !std.mem.eql(u8, host_io.getenv("ZINC_BATCHED_PREFILL").?, "0"));
                 const batched_tok = if (use_batched)
-                    (fwd.prefillSlot(req.prompt_tokens, slot_id) catch null)
+                    (fwd.prefillSlot(req.prompt_tokens, slot_id) catch |err| blk: {
+                        log.warn("request {d} batched slot prefill failed ({s}); resetting before fallback", .{ req.id, @errorName(err) });
+                        // A failed chunk/layer may already have advanced the
+                        // recurrent state. Restart the fallback at position 0
+                        // only after clearing that partial state. A poisoned
+                        // GPU context fails reset and never enters fallback.
+                        fwd.resetSlot(slot_id) catch |reset_err| {
+                            log.err("request {d} fallback reset failed: {s}", .{ req.id, @errorName(reset_err) });
+                            self.failSlot(slot_id);
+                            continue;
+                        };
+                        break :blk null;
+                    })
                 else
                     null;
                 if (batched_tok) |tok| {
+                    const computed_tokens = fwd.computedPrefillTokens(np);
                     if (timer_opt) |*tm| {
                         const elapsed = tm.read() - pf_t0;
                         _ = self.prefill_wall_ns.fetchAdd(elapsed, .monotonic);
-                        _ = self.prefill_tokens.fetchAdd(np, .monotonic);
-                        self.recordPrefillTiming(req.id, np, elapsed);
+                        _ = self.prefill_tokens.fetchAdd(computed_tokens, .monotonic);
+                        self.recordPrefillTiming(req.id, computed_tokens, elapsed);
                     }
                     req.appendToken(tok) catch {
                         self.failSlot(slot_id);

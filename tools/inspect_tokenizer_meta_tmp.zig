@@ -1,5 +1,6 @@
 const std = @import("std");
-const gguf = @import("../src/model/gguf.zig");
+const host_io = @import("host_io");
+const gguf = @import("gguf");
 
 fn printKey(gf: *const gguf.GGUFFile, key: []const u8) void {
     std.debug.print("{s}=", .{key});
@@ -19,26 +20,27 @@ fn printKey(gf: *const gguf.GGUFFile, key: []const u8) void {
     }
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try host_io.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.skip();
     const path = args.next() orelse return error.MissingArg;
 
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, path, .{});
     defer {
         var f = file;
-        f.close();
+        f.close(host_io.io);
     }
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const mmap_data = try std.posix.mmap(
         null,
         stat.size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,

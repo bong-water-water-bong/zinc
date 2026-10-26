@@ -12,6 +12,7 @@
 //! `MetalPipeline.name` set at shader load time in forward_metal.zig.
 //! @section Metal Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 
 const MAX_SLOTS: usize = 512;
 const MAX_LABEL_BYTES: usize = 160;
@@ -28,9 +29,9 @@ const Slot = struct {
 /// Toggled true at engine init when `ZINC_METAL_KERNEL_TIMING=1`.
 pub var enabled: bool = false;
 
-var slots: [MAX_SLOTS]Slot = [_]Slot{.{}} ** MAX_SLOTS;
+var slots: [MAX_SLOTS]Slot = @as([MAX_SLOTS]Slot, @splat(.{}));
 var slot_count: usize = 0;
-var mutex: std.Thread.Mutex = .{};
+var mutex: host_io.Mutex = .{};
 
 /// Snapshot view of one pipeline's aggregated dispatch cost.
 pub const Entry = struct {
@@ -55,7 +56,7 @@ pub fn enable() void {
 pub fn reset() void {
     mutex.lock();
     defer mutex.unlock();
-    slots = [_]Slot{.{}} ** MAX_SLOTS;
+    slots = @as([MAX_SLOTS]Slot, @splat(.{}));
     slot_count = 0;
 }
 

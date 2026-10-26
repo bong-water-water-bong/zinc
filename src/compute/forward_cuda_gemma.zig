@@ -18,6 +18,7 @@
 //!
 //! @section Inference Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 const build_options = @import("build_options");
 const buffer = @import("../cuda/buffer.zig");
 const pipeline = @import("../cuda/pipeline.zig");
@@ -155,7 +156,7 @@ var gemma_norm_block_cached: u32 = 0;
 fn gemmaNormBlock() u32 {
     if (gemma_norm_block_cached != 0) return gemma_norm_block_cached;
     var v: u32 = 1024;
-    if (std.posix.getenv("ZINC_GEMMA_NORM_BLOCK")) |raw| {
+    if (host_io.getenv("ZINC_GEMMA_NORM_BLOCK")) |raw| {
         const parsed = std.fmt.parseUnsigned(u32, std.mem.trim(u8, raw, " \t\r\n"), 10) catch 1024;
         if (parsed >= 32 and parsed <= 1024 and parsed % 32 == 0) v = parsed;
     }
@@ -487,7 +488,7 @@ pub const ForwardGemma = struct {
     // Per-batch HIP/CUDA graph replay for serving decode. Muse currently uses
     // B=1 in the fair server suite; keeping the small per-B cache matches the
     // Qwen scheduler and leaves room for concurrent serving measurements.
-    batch_graph: [9]?*shim.CudaGraph = .{null} ** 9,
+    batch_graph: [9]?*shim.CudaGraph = @splat(null),
     batch_graph_on: bool = false,
     capturing: bool = false,
     lightweight_rocm_commands: bool = false,
@@ -682,7 +683,7 @@ pub const ForwardGemma = struct {
         };
 
         // ---- compile kernels -----------------------------------------------
-        const src = try allocator.dupeZ(u8, KERNELS_CU);
+        const src = try allocator.dupeSentinel(u8, KERNELS_CU, 0);
         defer allocator.free(src);
         var pipes: Pipelines = undefined;
         pipes.rms_norm = try pipeline.createPipeline(ctx, src.ptr, "rms_norm");
@@ -980,7 +981,7 @@ pub const ForwardGemma = struct {
             self.use_muse_attn_blas = envFlag("ZINC_ROCM_MUSE_ATTN_BLAS", is_muse);
             self.use_muse_norm_chain = envFlag("ZINC_ROCM_MUSE_NORM_CHAIN", is_muse);
             self.muse_attn_blas_min = envU32("ZINC_ROCM_MUSE_ATTN_BLAS_MIN", 0);
-            if (std.posix.getenv("ZINC_PREFILL_PROFILE") != null) {
+            if (host_io.getenv("ZINC_PREFILL_PROFILE") != null) {
                 log.info("ROCm packed-Q8 policy: experts={d} used={d} ffn={} q6={} lm={} q4={} pair={} rms={}", .{
                     d.n_experts,
                     d.n_experts_used,
@@ -1036,23 +1037,23 @@ pub const ForwardGemma = struct {
             cache.deinit();
         }
         for (&self.batch_graph) |*bg| if (bg.*) |g| shim.cuda_graph_free(g);
-        inline for (std.meta.fields(Pipelines)) |f| {
-            if (comptime std.mem.eql(u8, f.name, "dmmv")) {
+        inline for (@typeInfo(Pipelines).@"struct".field_names) |f| {
+            if (comptime std.mem.eql(u8, f, "dmmv")) {
                 for (&self.pipes.dmmv) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "dmmv_fast")) {
+            } else if (comptime std.mem.eql(u8, f, "dmmv_fast")) {
                 for (&self.pipes.dmmv_fast) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q4k_btok")) {
+            } else if (comptime std.mem.eql(u8, f, "dmmv_q4k_btok")) {
                 for (&self.pipes.dmmv_q4k_btok) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q6k_btok")) {
+            } else if (comptime std.mem.eql(u8, f, "dmmv_q6k_btok")) {
                 for (&self.pipes.dmmv_q6k_btok) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q5k_btok")) {
+            } else if (comptime std.mem.eql(u8, f, "dmmv_q5k_btok")) {
                 for (&self.pipes.dmmv_q5k_btok) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "dmmv_q8_0_btok")) {
+            } else if (comptime std.mem.eql(u8, f, "dmmv_q8_0_btok")) {
                 for (&self.pipes.dmmv_q8_0_btok) |*p| pipeline.freePipeline(p);
-            } else if (comptime std.mem.eql(u8, f.name, "gemm")) {
+            } else if (comptime std.mem.eql(u8, f, "gemm")) {
                 for (&self.pipes.gemm) |*p| pipeline.freePipeline(p);
             } else {
-                pipeline.freePipeline(&@field(self.pipes, f.name));
+                pipeline.freePipeline(&@field(self.pipes, f));
             }
         }
         self.* = undefined;
@@ -1181,7 +1182,7 @@ pub const ForwardGemma = struct {
         const T: u32 = @intCast(tokens.len);
         const f4 = @sizeOf(f32);
         const moe = d.n_experts > 0; // gemma-26b-a4b: batched attn + per-token MoE FFN
-        const profile = std.posix.getenv("ZINC_PREFILL_PROFILE") != null;
+        const profile = host_io.getenv("ZINC_PREFILL_PROFILE") != null;
         var prof_attn: i64 = 0;
         var prof_shared: i64 = 0;
         var prof_router: i64 = 0;
@@ -1214,24 +1215,24 @@ pub const ForwardGemma = struct {
         // (gemma-31b ffn_down — ~1/7 of the dense GEMM, still on gemm_q6k_tc_f16a
         // after cycle 9). DEFAULT-ON when cuBLAS is on; ZINC_BATCHED_CUBLAS_NOQ6
         // forces Q6_K back to the hand TC kernel (the cycle-10 A/B kill-switch).
-        self.use_cublas_q6 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
+        self.use_cublas_q6 = self.use_cublas and host_io.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
         // Cycle 12 A/B knob: ZINC_BATCHED_TC_PLAIN forces the cycle-11 plain TC
         // GEMM (f32 activation re-read per M-block) instead of the cycle-12 f16-A
         // path (activation pre-converted to fp16 once). Lets us measure the f16-A
         // memory-traffic win in isolation. Unset → the f16-A path (cycle 12 default).
-        self.use_tc_plain = std.posix.getenv("ZINC_BATCHED_TC_PLAIN") != null;
+        self.use_tc_plain = host_io.getenv("ZINC_BATCHED_TC_PLAIN") != null;
         // Cycle 13 A/B knob: ZINC_BATCHED_TC_NOQ6 forces the dense Q6_K GEMMs
         // (ffn_down etc.) back onto the f32 register-tiled gemm_q6k_tiled_v2 even
         // when the TC path is on — lets us measure the Q6_K-on-TC increment in
         // isolation (= cycle-12 behavior: Q4_K on TC, Q6_K on f32). Unset → Q6_K
         // also runs the fp16 TC f16-A kernel (cycle 13 default).
-        self.use_tc_q6 = std.posix.getenv("ZINC_BATCHED_TC_NOQ6") == null;
+        self.use_tc_q6 = host_io.getenv("ZINC_BATCHED_TC_NOQ6") == null;
         // Cycle 14 A/B knob: ZINC_BATCHED_TC_M128 opts INTO the wider 128x64 Q4_K
         // TC kernel (gemm_q4k_tc_f16a_m128). It halves the dominant f16-A re-read
         // (grid.x = M/128 vs M/64) but its 44 KB static shared caps occupancy at 1
         // block/SM → NEGATIVE: -11.8% on gemma-31b (ABBA x2, 4090). Default unset →
         // the proven 64x64 gemm_q4k_tc_f16a (cycle 12). plain-TC (A/B above) overrides.
-        self.use_tc_m128 = std.posix.getenv("ZINC_BATCHED_TC_M128") != null;
+        self.use_tc_m128 = host_io.getenv("ZINC_BATCHED_TC_M128") != null;
         // Cycle 15: the 8 KB-shared Q4_K TC kernel (gemm_q4k_tc_f16a_lowsmem) is now
         // the DEFAULT. Cycle 14's m128 result proved this GEMM is occupancy-bound; the
         // prior m64 kernel's 24 KB shared (dominated by the 16 KB float Cs output stage)
@@ -1240,7 +1241,7 @@ pub const ForwardGemma = struct {
         // byte-identical output (verified: GEN_IDS identical to m64 on collapsed + varied
         // prompts). ZINC_BATCHED_TC_M64 is the A/B kill-switch back to the prior 24 KB
         // kernel (gemm_q4k_tc_f16a, cycle 12 default). m128/plain-TC (above) override it.
-        self.use_tc_m64 = std.posix.getenv("ZINC_BATCHED_TC_M64") != null;
+        self.use_tc_m64 = host_io.getenv("ZINC_BATCHED_TC_M64") != null;
         // Cycle 16: the 8 KB-shared Q6_K TC kernel (gemm_q6k_tc_f16a_lowsmem) applies the
         // cycle-15 two-phase-Cs occupancy trick (24 KB→8 KB shared, 2→~8 blocks/SM) to the
         // dense gemma-31b ffn_down Q6_K GEMM (idx 2). Byte-identical to the default 24 KB m64
@@ -1248,25 +1249,25 @@ pub const ForwardGemma = struct {
         // (in-noise): the Q6_K GEMM is only ~1/7 of the dense work, so its occupancy win is
         // below the box's ±10% boost floor (2 ABBA runs nominally -1%/-5%, ranges overlapping).
         // → kept OPT-IN; ZINC_BATCHED_TC_Q6_LOWSMEM opts into it, the proven m64 kernel stays default.
-        self.use_tc_q6_lowsmem = std.posix.getenv("ZINC_BATCHED_TC_Q6_LOWSMEM") != null;
+        self.use_tc_q6_lowsmem = host_io.getenv("ZINC_BATCHED_TC_Q6_LOWSMEM") != null;
         // Cycle 17: ZINC_BATCHED_TC_M128_LOWSMEM opts into the wider 128x64 M-tile Q4_K TC
         // kernel that ALSO uses the low-shared two-phase Cs trick — the synthesis of cycle 14
         // (halve the dominant f16-A re-read via grid.x=M/128) and cycle 15 (12 KB shared →
         // ~6 blocks/SM, avoiding the 44 KB→1 block/SM occupancy collapse that made plain m128
         // -11.8%). Byte-identical to the lowsmem default; if measured faster it becomes default.
-        self.use_tc_m128_lowsmem = std.posix.getenv("ZINC_BATCHED_TC_M128_LOWSMEM") != null;
+        self.use_tc_m128_lowsmem = host_io.getenv("ZINC_BATCHED_TC_M128_LOWSMEM") != null;
         // Cycle 18: ZINC_BATCHED_EXPERTS_GROUPED routes the gemma-26b MoE routed-expert
         // matvecs through the GROUPED kernels (build_expert_order sorts the T*n_used
         // (token,slot) work-items by expert id so each expert's Q4_K/Q5_1 weight stays
         // L2-resident across all the tokens routed to it — a memory-traffic win beyond
         // the cycle-8 launch batching). Byte-identical output (same per-block math; each
         // output computed once). Off → the proven cycle-8 _batched matvecs.
-        self.use_grouped = std.posix.getenv("ZINC_BATCHED_EXPERTS_GROUPED") != null;
+        self.use_grouped = host_io.getenv("ZINC_BATCHED_EXPERTS_GROUPED") != null;
         // DEFAULT-ON (opt out ZINC_ATTN_V2=0/off/false/no): coalesced warp-per-key
         // prefill attention — validated token-identical to the naive kernel + ~+8%
         // gemma-26b prefill on the 5090 (softmax was 271ms/28% of prefill).
         self.use_attn_v2 = blk: {
-            if (std.posix.getenv("ZINC_ATTN_V2")) |e| break :blk !(std.mem.eql(u8, e, "0") or
+            if (host_io.getenv("ZINC_ATTN_V2")) |e| break :blk !(std.mem.eql(u8, e, "0") or
                 std.ascii.eqlIgnoreCase(e, "off") or std.ascii.eqlIgnoreCase(e, "false") or
                 std.ascii.eqlIgnoreCase(e, "no"));
             break :blk true;
@@ -1280,14 +1281,14 @@ pub const ForwardGemma = struct {
         // of each group runs f32_to_f16 into act_f16; the rest reuse it (a_preconv=true).
         // Byte-identical (same downcast bits, act_f16 untouched between the group's GEMMs,
         // stream-ordered reuse) — removes 2 recast launches/attn layer + 1/FFN + 1/shared.
-        self.use_tc_sharea = std.posix.getenv("ZINC_BATCHED_TC_SHAREA") != null;
+        self.use_tc_sharea = host_io.getenv("ZINC_BATCHED_TC_SHAREA") != null;
         // Cycle 21: ZINC_BATCHED_TC_NORMF16 — the heavier half of the activation-fp16
         // lever: the norm/GeGLU producers EMIT fp16 (rms_norm_f16/geglu_f16) into act_f16
         // so every dense TC GEMM reading a produced activation skips its f32→fp16 recast
         // entirely (the O projection, whose input is the f32 attention output, still
         // recasts). Byte-identical to the per-GEMM-recast TC path; only meaningful with
         // ZINC_BATCHED_TC. Implies the shared-A reuse for the consumer GEMMs.
-        self.use_tc_normf16 = std.posix.getenv("ZINC_BATCHED_TC_NORMF16") != null;
+        self.use_tc_normf16 = host_io.getenv("ZINC_BATCHED_TC_NORMF16") != null;
 
         const b = try self.ensureBatch(T);
 
@@ -1303,8 +1304,8 @@ pub const ForwardGemma = struct {
         var L: u32 = 0;
         while (L < d.n_layers) : (L += 1) {
             if (profile) self.waitPending();
-            const attn_start = std.time.milliTimestamp();
-            if (std.posix.getenv("ZINC_GEMMA_ATTN_PREFILL_SERIAL") != null) {
+            const attn_start = host_io.milliTimestamp();
+            if (host_io.getenv("ZINC_GEMMA_ATTN_PREFILL_SERIAL") != null) {
                 self.waitPending();
                 const saved_hidden = self.hidden;
                 var t: u32 = 0;
@@ -1319,7 +1320,7 @@ pub const ForwardGemma = struct {
             }
             if (profile) {
                 self.waitPending();
-                prof_attn += std.time.milliTimestamp() - attn_start;
+                prof_attn += host_io.milliTimestamp() - attn_start;
             }
             // Cycle 10: every batched-prefill block now COMMITS ASYNC on the single
             // shared CUstream (attention/shared/ffn no longer commitAndWait per layer),
@@ -1335,7 +1336,7 @@ pub const ForwardGemma = struct {
             // mirror the per-token path's `n_experts>0 && ffn_gate_inp present` test.
             const layer_is_moe = moe and self.model.getLayer(L, "ffn_gate_inp.weight") != null;
             if (layer_is_moe) {
-                if (std.posix.getenv("ZINC_GEMMA_MOE_PREFILL_SERIAL") != null) {
+                if (host_io.getenv("ZINC_GEMMA_MOE_PREFILL_SERIAL") != null) {
                     // Diagnostic/reference arm: retain batched attention, then run
                     // the proven single-token MoE block over each token row. This
                     // isolates the batched MoE stages without changing attention.
@@ -1359,11 +1360,11 @@ pub const ForwardGemma = struct {
                 // (`moeRoutedCombineBatched`, the last per-token launches). With all
                 // four batched, the prefill MoE FFN has NO per-token loop on the GPU-
                 // side async expert path: each stage reads the batched streams in place.
-                const shared_start = std.time.milliTimestamp();
+                const shared_start = host_io.milliTimestamp();
                 try self.sharedExpertBatched(L, T, b);
                 if (profile) {
                     self.waitPending();
-                    prof_shared += std.time.milliTimestamp() - shared_start;
+                    prof_shared += host_io.milliTimestamp() - shared_start;
                 }
                 const wgu = self.layer(L, "ffn_gate_up_exps.weight");
                 const wde = self.layer(L, "ffn_down_exps.weight");
@@ -1372,13 +1373,13 @@ pub const ForwardGemma = struct {
                 // readback fallback keeps its per-token router/experts/combine loop.
                 const pre = dmmvIdx(wgu.info.type_) == 0 and dmmvIdx(wde.info.type_) == 5;
                 if (pre) {
-                    const router_start = std.time.milliTimestamp();
+                    const router_start = host_io.milliTimestamp();
                     try self.routerBatched(L, T, b);
                     if (profile) {
                         self.waitPending();
-                        prof_router += std.time.milliTimestamp() - router_start;
+                        prof_router += host_io.milliTimestamp() - router_start;
                     }
-                    const routed_start = std.time.milliTimestamp();
+                    const routed_start = host_io.milliTimestamp();
                     if (self.use_tc_experts and (self.tc_experts_forced or T >= self.moe_tc_min_t)) {
                         try self.moeRoutedExpertsTC(L, T, b);
                     } else if (self.use_grouped) {
@@ -1388,13 +1389,13 @@ pub const ForwardGemma = struct {
                     }
                     if (profile) {
                         self.waitPending();
-                        prof_routed += std.time.milliTimestamp() - routed_start;
+                        prof_routed += host_io.milliTimestamp() - routed_start;
                     }
-                    const combine_start = std.time.milliTimestamp();
+                    const combine_start = host_io.milliTimestamp();
                     try self.moeRoutedCombineBatched(L, T, b);
                     if (profile) {
                         self.waitPending();
-                        prof_combine += std.time.milliTimestamp() - combine_start;
+                        prof_combine += host_io.milliTimestamp() - combine_start;
                     }
                 } else {
                     // Fallback (non-Q4_K/Q5_1 experts): the router + routed matvecs are
@@ -1417,11 +1418,11 @@ pub const ForwardGemma = struct {
                     self.shared_buf = saved_shared;
                 }
             } else {
-                const dense_start = std.time.milliTimestamp();
+                const dense_start = host_io.milliTimestamp();
                 try self.ffnBlockBatched(L, T, b);
                 if (profile) {
                     self.waitPending();
-                    prof_dense += std.time.milliTimestamp() - dense_start;
+                    prof_dense += host_io.milliTimestamp() - dense_start;
                 }
                 // dense layer_output_scale is folded into the post-ffn norm+residual.
             }
@@ -1604,11 +1605,26 @@ pub const ForwardGemma = struct {
             while (j < group) : (j += 1) {
                 // S_h(i, r) = K_g(i, :) · Q_h(t0 + r, :), batched over groups g (h = g*group + j).
                 shim.cuda_cublas_sgemm_strided_batched(
-                    self.ctx, 1, 0, keys, rows, hd,
-                    self.kv_k[L].handle, 0, g.kv_dim, hd,
-                    b.q.handle, (@as(usize, t0) * g.q_dim + @as(usize, j) * hd) * f4, g.q_dim, @as(i64, group) * hd,
-                    scores.handle, @as(usize, j) * @as(usize, @intCast(head_stride)) * f4, keys, @as(i64, group) * head_stride,
-                    n_kv, 0.0,
+                    self.ctx,
+                    1,
+                    0,
+                    keys,
+                    rows,
+                    hd,
+                    self.kv_k[L].handle,
+                    0,
+                    g.kv_dim,
+                    hd,
+                    b.q.handle,
+                    (@as(usize, t0) * g.q_dim + @as(usize, j) * hd) * f4,
+                    g.q_dim,
+                    @as(i64, group) * hd,
+                    scores.handle,
+                    @as(usize, j) * @as(usize, @intCast(head_stride)) * f4,
+                    keys,
+                    @as(i64, group) * head_stride,
+                    n_kv,
+                    0.0,
                 );
             }
             const sp = GemmaAttnSoftmaxCausalPush{
@@ -1624,11 +1640,26 @@ pub const ForwardGemma = struct {
             while (j < group) : (j += 1) {
                 // O_h(:, t0 + r) = V_g(:, keys) · P_h(keys, r).
                 shim.cuda_cublas_sgemm_strided_batched(
-                    self.ctx, 0, 0, hd, rows, keys,
-                    self.kv_v[L].handle, 0, g.kv_dim, hd,
-                    scores.handle, @as(usize, j) * @as(usize, @intCast(head_stride)) * f4, keys, @as(i64, group) * head_stride,
-                    b.attn_out.handle, (@as(usize, t0) * g.q_dim + @as(usize, j) * hd) * f4, g.q_dim, @as(i64, group) * hd,
-                    n_kv, 0.0,
+                    self.ctx,
+                    0,
+                    0,
+                    hd,
+                    rows,
+                    keys,
+                    self.kv_v[L].handle,
+                    0,
+                    g.kv_dim,
+                    hd,
+                    scores.handle,
+                    @as(usize, j) * @as(usize, @intCast(head_stride)) * f4,
+                    keys,
+                    @as(i64, group) * head_stride,
+                    b.attn_out.handle,
+                    (@as(usize, t0) * g.q_dim + @as(usize, j) * hd) * f4,
+                    g.q_dim,
+                    @as(i64, group) * hd,
+                    n_kv,
+                    0.0,
                 );
             }
         }
@@ -1684,11 +1715,26 @@ pub const ForwardGemma = struct {
             var j: u32 = 0;
             while (j < group) : (j += 1) {
                 shim.cuda_cublas_hgemm_strided_batched(
-                    self.ctx, 1, 0, keys, rows, hd,
-                    k16.handle, 0, g.kv_dim, hd,
-                    q16.handle, (@as(usize, t0) * g.q_dim + @as(usize, j) * hd) * h2, g.q_dim, @as(i64, group) * hd,
-                    scores.handle, @as(usize, j) * @as(usize, @intCast(head_stride)) * f4, keys, @as(i64, group) * head_stride,
-                    n_kv, 0.0,
+                    self.ctx,
+                    1,
+                    0,
+                    keys,
+                    rows,
+                    hd,
+                    k16.handle,
+                    0,
+                    g.kv_dim,
+                    hd,
+                    q16.handle,
+                    (@as(usize, t0) * g.q_dim + @as(usize, j) * hd) * h2,
+                    g.q_dim,
+                    @as(i64, group) * hd,
+                    scores.handle,
+                    @as(usize, j) * @as(usize, @intCast(head_stride)) * f4,
+                    keys,
+                    @as(i64, group) * head_stride,
+                    n_kv,
+                    0.0,
                 );
             }
             const sp = GemmaAttnSoftmaxCausalPush{
@@ -1703,11 +1749,26 @@ pub const ForwardGemma = struct {
             j = 0;
             while (j < group) : (j += 1) {
                 shim.cuda_cublas_hgemm_strided_batched(
-                    self.ctx, 0, 0, hd, rows, keys,
-                    v16.handle, 0, g.kv_dim, hd,
-                    p16.handle, @as(usize, j) * @as(usize, @intCast(head_stride)) * h2, keys, @as(i64, group) * head_stride,
-                    b.attn_out.handle, (@as(usize, t0) * g.q_dim + @as(usize, j) * hd) * f4, g.q_dim, @as(i64, group) * hd,
-                    n_kv, 0.0,
+                    self.ctx,
+                    0,
+                    0,
+                    hd,
+                    rows,
+                    keys,
+                    v16.handle,
+                    0,
+                    g.kv_dim,
+                    hd,
+                    p16.handle,
+                    @as(usize, j) * @as(usize, @intCast(head_stride)) * h2,
+                    keys,
+                    @as(i64, group) * head_stride,
+                    b.attn_out.handle,
+                    (@as(usize, t0) * g.q_dim + @as(usize, j) * hd) * f4,
+                    g.q_dim,
+                    @as(i64, group) * hd,
+                    n_kv,
+                    0.0,
                 );
             }
         }
@@ -1871,7 +1932,7 @@ pub const ForwardGemma = struct {
         }
         if (q8_gate_up) {
             const gu = DmmvPush{ .M = d.n_ff, .K = d.n_embd, .acc_mode = @intFromBool(!d.is_muse) };
-            const gu_block: u32 = if (std.posix.getenv("ZINC_Q8_FFN_BLOCK128") != null) 128 else if (std.posix.getenv("ZINC_Q8_FFN_BLOCK64") != null) 64 else 32;
+            const gu_block: u32 = if (host_io.getenv("ZINC_Q8_FFN_BLOCK128") != null) 128 else if (host_io.getenv("ZINC_Q8_FFN_BLOCK64") != null) 64 else 32;
             cmd.dispatch(&self.pipes.dmmv_q4k_gate_up_swiglu_q8, .{ d.n_ff, 1, 1 }, .{ gu_block, 1, 1 }, &.{ &wgate.gpu_buffer, &wup.gpu_buffer, &b.act_q8, &b.geglu }, &gu, @sizeOf(DmmvPush), 0);
         } else if (down_act_f16) {
             cmd.dispatch(&self.pipes.geglu_f16, .{ ceilDiv(T * d.n_ff, 64), 1, 1 }, .{ 64, 1, 1 }, &.{ &b.gate, &b.up, &b.act_f16 }, &sg, @sizeOf(SwigluPush), 0);
@@ -1886,7 +1947,7 @@ pub const ForwardGemma = struct {
             if (q8_down_q4) {
                 cmd.dispatch(&self.pipes.dmmv_q4k_q8_fast, .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wdown.gpu_buffer, &b.act_q8, &b.down }, &down, @sizeOf(DmmvPush), 0);
             } else {
-                const q6_block: u32 = if (std.posix.getenv("ZINC_Q8_Q6_BLOCK128") != null) 128 else if (std.posix.getenv("ZINC_Q8_Q6_BLOCK64") != null) 64 else 256;
+                const q6_block: u32 = if (host_io.getenv("ZINC_Q8_Q6_BLOCK128") != null) 128 else if (host_io.getenv("ZINC_Q8_Q6_BLOCK64") != null) 64 else 256;
                 cmd.dispatch(&self.pipes.dmmv_q6k_q8_fast, .{ d.n_embd, 1, 1 }, .{ q6_block, 1, 1 }, &.{ &wdown.gpu_buffer, &b.act_q8, &b.down }, &down, @sizeOf(DmmvPush), 0);
             }
         } else if (down_act_f16) {
@@ -1980,15 +2041,15 @@ pub const ForwardGemma = struct {
         // small decode batch keeps the hand TC / f32 GEMM; the env A/B knobs apply.
         self.use_tc = !is_rocm and tcDefaultOn();
         self.use_cublas = cublasDefaultOn();
-        self.use_cublas_q6 = self.use_cublas and std.posix.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
-        self.use_tc_plain = std.posix.getenv("ZINC_BATCHED_TC_PLAIN") != null;
-        self.use_tc_q6 = std.posix.getenv("ZINC_BATCHED_TC_NOQ6") == null;
-        self.use_tc_m128 = std.posix.getenv("ZINC_BATCHED_TC_M128") != null;
-        self.use_tc_m64 = std.posix.getenv("ZINC_BATCHED_TC_M64") != null;
-        self.use_tc_q6_lowsmem = std.posix.getenv("ZINC_BATCHED_TC_Q6_LOWSMEM") != null;
-        self.use_tc_m128_lowsmem = std.posix.getenv("ZINC_BATCHED_TC_M128_LOWSMEM") != null;
-        self.use_tc_sharea = std.posix.getenv("ZINC_BATCHED_TC_SHAREA") != null;
-        self.use_tc_normf16 = std.posix.getenv("ZINC_BATCHED_TC_NORMF16") != null;
+        self.use_cublas_q6 = self.use_cublas and host_io.getenv("ZINC_BATCHED_CUBLAS_NOQ6") == null;
+        self.use_tc_plain = host_io.getenv("ZINC_BATCHED_TC_PLAIN") != null;
+        self.use_tc_q6 = host_io.getenv("ZINC_BATCHED_TC_NOQ6") == null;
+        self.use_tc_m128 = host_io.getenv("ZINC_BATCHED_TC_M128") != null;
+        self.use_tc_m64 = host_io.getenv("ZINC_BATCHED_TC_M64") != null;
+        self.use_tc_q6_lowsmem = host_io.getenv("ZINC_BATCHED_TC_Q6_LOWSMEM") != null;
+        self.use_tc_m128_lowsmem = host_io.getenv("ZINC_BATCHED_TC_M128_LOWSMEM") != null;
+        self.use_tc_sharea = host_io.getenv("ZINC_BATCHED_TC_SHAREA") != null;
+        self.use_tc_normf16 = host_io.getenv("ZINC_BATCHED_TC_NORMF16") != null;
 
         std.debug.assert(B <= self.n_slots);
         const b = try self.ensureBatch(B);
@@ -3253,7 +3314,7 @@ pub const ForwardGemma = struct {
                 cmd.dispatch(&self.pipes.quantize_act_q8, .{ ceilDiv(d.n_embd, 256), 1, 1 }, .{ 256, 1, 1 }, &.{ &self.ffn_norm_buf, &self.batch.?.act_q8 }, &qp, @sizeOf(QuantActPush), 0);
             }
             const gu = DmmvPush{ .M = d.n_ff, .K = d.n_embd, .acc_mode = @intFromBool(!d.is_muse) };
-            const gu_block: u32 = if (std.posix.getenv("ZINC_Q8_FFN_BLOCK128") != null) 128 else if (std.posix.getenv("ZINC_Q8_FFN_BLOCK64") != null) 64 else 32;
+            const gu_block: u32 = if (host_io.getenv("ZINC_Q8_FFN_BLOCK128") != null) 128 else if (host_io.getenv("ZINC_Q8_FFN_BLOCK64") != null) 64 else 32;
             cmd.dispatch(&self.pipes.dmmv_q4k_gate_up_swiglu_q8, .{ d.n_ff, 1, 1 }, .{ gu_block, 1, 1 }, &.{ &wgate.gpu_buffer, &wup.gpu_buffer, &self.batch.?.act_q8, &self.geglu_buf }, &gu, @sizeOf(DmmvPush), 0);
         } else if (dmmvIdx(wgate.info.type_) == 0 and dmmvIdx(wup.info.type_) == 0) {
             self.dmmvDualQ4k(&cmd, wgate, wup, &self.ffn_norm_buf, &self.gate_buf, &self.up_buf, d.n_ff, d.n_ff, d.n_embd);
@@ -3273,7 +3334,7 @@ pub const ForwardGemma = struct {
             if (q8_down_q4) {
                 cmd.dispatch(&self.pipes.dmmv_q4k_q8_fast, .{ d.n_embd, 1, 1 }, .{ 64, 1, 1 }, &.{ &wdown.gpu_buffer, &self.batch.?.act_q8, &self.down_buf }, &down, @sizeOf(DmmvPush), 0);
             } else {
-                const q6_block: u32 = if (std.posix.getenv("ZINC_Q8_Q6_BLOCK128") != null) 128 else if (std.posix.getenv("ZINC_Q8_Q6_BLOCK64") != null) 64 else 256;
+                const q6_block: u32 = if (host_io.getenv("ZINC_Q8_Q6_BLOCK128") != null) 128 else if (host_io.getenv("ZINC_Q8_Q6_BLOCK64") != null) 64 else 256;
                 cmd.dispatch(&self.pipes.dmmv_q6k_q8_fast, .{ d.n_embd, 1, 1 }, .{ q6_block, 1, 1 }, &.{ &wdown.gpu_buffer, &self.batch.?.act_q8, &self.down_buf }, &down, @sizeOf(DmmvPush), 0);
             }
         } else {
@@ -3341,7 +3402,7 @@ pub const ForwardGemma = struct {
         // --- shared expert → shared_buf -------------------------------------
         {
             var cmd = try command.beginCommand(ctx);
-            const shared_gu_q8 = is_rocm and self.batch != null and std.posix.getenv("ZINC_ROCM_MOE_SHARED_Q8") != null and
+            const shared_gu_q8 = is_rocm and self.batch != null and host_io.getenv("ZINC_ROCM_MOE_SHARED_Q8") != null and
                 wgate.info.type_ == .q8_0 and wup.info.type_ == .q8_0 and (d.n_embd & 255) == 0;
             const shared_down_q8 = shared_gu_q8 and wdown.info.type_ == .q8_0 and (sf & 255) == 0;
             const shared_gu_fused = is_rocm and envFlag("ZINC_ROCM_Q8_FUSED", !d.is_muse and d.n_experts > 0) and
@@ -3455,8 +3516,8 @@ pub const ForwardGemma = struct {
                     cmd.dispatch(&self.pipes.build_expert_order, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &.{ &self.router_out_buf, &bb.expert_order }, &bo, @sizeOf(BuildOrderPush), 0);
                     const pd = ExpertsQ8Push{ .M = d.n_embd, .K = ef, .T = n_used, .slice = down_slice, .up_base = 0, .n_used = n_used, .routing_stride = 2 * n_used, .dst_tok_stride = n_used * d.n_embd, .fuse_activation = 0 };
                     const down_m8 = envFlag("ZINC_MOE_DOWN_Q8_M8", true);
-                    const down_m64 = !down_m8 and std.posix.getenv("ZINC_MOE_DOWN_Q8_M64") != null;
-                    const down_m16 = !down_m8 and !down_m64 and std.posix.getenv("ZINC_MOE_DOWN_Q8_M16") != null;
+                    const down_m64 = !down_m8 and host_io.getenv("ZINC_MOE_DOWN_Q8_M64") != null;
+                    const down_m16 = !down_m8 and !down_m64 and host_io.getenv("ZINC_MOE_DOWN_Q8_M16") != null;
                     const down_pipe = if (down_m8) &self.pipes.dmmv_q5_1_experts_grouped_q8_m8 else if (down_m64) &self.pipes.dmmv_q5_1_experts_grouped_q8_m64 else if (down_m16) &self.pipes.dmmv_q5_1_experts_grouped_q8_m16 else &self.pipes.dmmv_q5_1_experts_grouped_q8;
                     const down_rows: u32 = if (down_m8) 8 else if (down_m64) 64 else if (down_m16) 16 else 32;
                     cmd.dispatch(down_pipe, .{ ceilDiv(d.n_embd, down_rows), n_used, 1 }, .{ down_rows * 8, 1, 1 }, &.{ &wde.gpu_buffer, &bb.act_q8, &self.down_buf, &self.router_out_buf, &bb.expert_order }, &pd, @sizeOf(ExpertsQ8Push), 0);
@@ -3678,7 +3739,7 @@ pub const ForwardGemma = struct {
         const gu_full = gu_half * 2;
         const down_slice = expertSliceBytes(wde.info.type_, d.n_embd, ef);
         const rt_stride = 2 * n_used;
-        const exact_mode = std.posix.getenv("ZINC_MOE_EXACT_Q8");
+        const exact_mode = host_io.getenv("ZINC_MOE_EXACT_Q8");
         const exact_disabled = if (exact_mode) |v| !envFlagValue(v) else false;
         // On ROCm the exact route-reuse Q5_1 down kernel is substantially faster
         // for short prompts than padding every expert to a WMMA tile. Gate/up keep
@@ -3737,7 +3798,7 @@ pub const ForwardGemma = struct {
         }
         // Gate (base 0) + up (base gu_half): one grouped TC GEMM each over all tiles.
         if (comptime is_rocm) {
-            const use_m64 = route_tile == 16 and std.posix.getenv("ZINC_MOE_M64") != null;
+            const use_m64 = route_tile == 16 and host_io.getenv("ZINC_MOE_M64") != null;
             const use_direct = route_tile == 16 and !use_m64 and envFlag("ZINC_MOE_DIRECT_A", is_rocm);
             const grouped_pipe = if (use_m64)
                 &self.pipes.gemm_q4k_experts_grouped_i8_t16_m64
@@ -4129,9 +4190,9 @@ pub const ForwardGemma = struct {
     fn dmmvDispatch(self: *ForwardGemma, cmd: *command.CudaCommand, w: *const LoadedTensor, x: *const CudaBuffer, y: *const CudaBuffer, M: u32, K: u32, acc_mode: u32, a_offset: u32) void {
         const push = DmmvPush{ .M = M, .K = K, .acc_mode = acc_mode, .a_offset = a_offset };
         const idx = dmmvIdx(w.info.type_);
-        if (is_rocm and w.info.type_ == .q8_0 and std.posix.getenv("ZINC_ROCM_Q8_MROW2") != null) {
+        if (is_rocm and w.info.type_ == .q8_0 and host_io.getenv("ZINC_ROCM_Q8_MROW2") != null) {
             cmd.dispatch(&self.pipes.dmmv_q8_0_mrow2, .{ ceilDiv(M, 2), 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
-        } else if (is_rocm and w.info.type_ == .q8_0 and std.posix.getenv("ZINC_ROCM_Q8_BLOCK32") != null) {
+        } else if (is_rocm and w.info.type_ == .q8_0 and host_io.getenv("ZINC_ROCM_Q8_BLOCK32") != null) {
             cmd.dispatch(&self.pipes.dmmv_fast[idx], .{ M, 1, 1 }, .{ 32, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
         } else if (idx < 4) {
             cmd.dispatch(&self.pipes.dmmv_fast[idx], .{ M, 1, 1 }, .{ 64, 1, 1 }, &.{ &w.gpu_buffer, x, y }, &push, @sizeOf(DmmvPush), 0);
@@ -4216,7 +4277,7 @@ fn ceilDiv(a: u32, b: u32) u32 {
 }
 
 fn envFlag(name: []const u8, default: bool) bool {
-    const value = std.posix.getenv(name) orelse return default;
+    const value = host_io.getenv(name) orelse return default;
     return envFlagValue(value);
 }
 
@@ -4226,7 +4287,7 @@ fn envFlagValue(value: []const u8) bool {
 }
 
 fn envU32(name: []const u8, default: u32) u32 {
-    const value = std.posix.getenv(name) orelse return default;
+    const value = host_io.getenv(name) orelse return default;
     return std.fmt.parseUnsigned(u32, std.mem.trim(u8, value, " \t\r\n"), 10) catch default;
 }
 
@@ -4235,7 +4296,7 @@ fn envU32(name: []const u8, default: u32) u32 {
 /// ZINC_BATCHED_TC is explicitly off (0/off/false/no) — the A/B kill-switch back
 /// to the f32 register-tiled GEMM. Mirrors batchedPrefillDefaultOn's parsing.
 fn tcDefaultOn() bool {
-    const v = std.posix.getenv("ZINC_BATCHED_TC") orelse return true;
+    const v = host_io.getenv("ZINC_BATCHED_TC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -4247,7 +4308,7 @@ fn tcDefaultOn() bool {
 /// ZINC_MOE_TC is explicitly off (0/off/false/no) — the A/B kill-switch back to
 /// the matvec experts. Mirrors batchedPrefillDefaultOn's parsing.
 fn moeTcDefaultOn() bool {
-    const v = std.posix.getenv("ZINC_MOE_TC") orelse return true;
+    const v = host_io.getenv("ZINC_MOE_TC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -4258,7 +4319,7 @@ fn moeTcDefaultOn() bool {
 /// path even with the short catalog prompt. With the env unset the path is
 /// default-on but gated (long prompts only); with a falsy value it is off.
 fn moeTcForced() bool {
-    const v = std.posix.getenv("ZINC_MOE_TC") orelse return false;
+    const v = host_io.getenv("ZINC_MOE_TC") orelse return false;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -4271,7 +4332,7 @@ fn moeTcForced() bool {
 // recovers the ~4× per-stream gap. Token-identical to the production decode
 // matvec; argmax-identical to the batched-GEMM form (the BATCH_GATE tolerance).
 fn b1MatvecOn() bool {
-    const v = std.posix.getenv("ZINC_BATCH_B1_MATVEC") orelse return true;
+    const v = host_io.getenv("ZINC_BATCH_B1_MATVEC") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -4286,7 +4347,7 @@ fn b1MatvecOn() bool {
 // serving default; serial decodeStep/prefill never sets decode_mrow → catalog
 // correctness is unaffected by construction.
 fn mrowMatvecOn() bool {
-    const v = std.posix.getenv("ZINC_BATCH_MROW") orelse return true;
+    const v = host_io.getenv("ZINC_BATCH_MROW") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -4301,7 +4362,7 @@ fn mrowMatvecOn() bool {
 // path for short prompts. qwen (no batched gemma path) and all decode are
 // untouched (prefill-only path).
 fn cublasDefaultOn() bool {
-    const v = std.posix.getenv("ZINC_BATCHED_CUBLAS") orelse return true;
+    const v = host_io.getenv("ZINC_BATCHED_CUBLAS") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }

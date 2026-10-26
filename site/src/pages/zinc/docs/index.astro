@@ -2,248 +2,128 @@
 import BaseLayout from '../../../layouts/BaseLayout.astro';
 import Breadcrumbs from '../../../components/Breadcrumbs.astro';
 import DocsSearch from '../../../components/DocsSearch.astro';
-import TerminalWindow from '../../../components/TerminalWindow.astro';
 import { buildBreadcrumbList } from '../../../lib/structured-data';
 import { loadDocs } from '../../../lib/docs-loader';
 import { loadZigApi } from '../../../lib/zig-api-loader';
 
 const docs = await loadDocs();
 const zigApi = await loadZigApi();
-const zigCodeLines = zigApi.codeLineCount.toLocaleString('en-US');
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin.ai';
-const breadcrumbItems = [
-  { name: 'Home', href: '/' },
-  { name: 'ZINC', href: '/zinc/' },
-  { name: 'Docs' },
+const breadcrumbItems = [{ name: 'Home', href: '/' }, { name: 'ZINC', href: '/zinc/' }, { name: 'Docs' }];
+const starts = [
+  { slug: 'getting-started', title: 'Run your first model', description: 'Install the prerequisites, build ZINC, and open a chat.' },
+  { slug: 'running-zinc', title: 'Use the command line', description: 'Choose models, run prompts, and configure the server.' },
+  { slug: 'api', title: 'Connect an app', description: 'Use the OpenAI-compatible API with curl or an SDK.' },
 ];
-
-const docMeta: Record<string, { label: string; description: string; order: number }> = {
-  'development': { label: 'Development Guide', description: 'Build, test, debug, benchmark, and contribute.', order: 5 },
-  'getting-started': { label: 'Getting Started', description: 'Build ZINC, verify Vulkan, and run the first prompt.', order: 1 },
-  'hardware-requirements': { label: 'Hardware Requirements', description: 'Vulkan, ROCm, Metal, CUDA, GPU, VRAM, operating-system, and driver requirements.', order: 2 },
-  rocm: { label: 'ROCm Backend', description: 'Build and validate the first-class HIP path on supported AMD RDNA4 systems.', order: 3 },
-  'running-zinc': { label: 'Running ZINC', description: 'CLI usage, server mode, KV quantization, and graph exports.', order: 4 },
-  api: { label: 'Serving HTTP API', description: 'OpenAI-compatible request and response shapes.', order: 5 },
-  opencode: { label: 'OpenCode Setup', description: 'Configure OpenCode local coding with ZINC and Qwen through the OpenAI-compatible API, with thinking, tools, and trace proxy guidance.', order: 6 },
-  spec: { label: 'Technical Specification', description: 'Architecture, kernels, model support, and scheduler behavior.', order: 10 },
-  'rdna4-tuning': { label: 'RDNA4 Tuning Guide', description: 'Cooperative matrix, bandwidth tuning, and toolchain notes.', order: 11 },
-  'amd-gpu-reference': { label: 'AMD GPU Reference', description: 'RDNA3 and RDNA4 hardware specs, ISA, and memory hierarchy.', order: 12 },
-  'nvidia-gpu-reference': { label: 'NVIDIA GPU Reference', description: 'RTX 30/40/50 (Ampere/Ada/Blackwell) specs, SM architecture, PTX/SASS opcodes, tensor cores, and CUDA inference tuning.', order: 12.5 },
-  'intel-gpu-reference': { label: 'Intel GPU Reference', description: 'Arc B-series specs, Xe2 opcodes, memory bandwidth, and inference tuning notes.', order: 13 },
-  'turboquant-spec': { label: 'TurboQuant Compression', description: 'Two-stage vector quantization and KV cache reduction.', order: 14 },
-  'apple-silicon-reference': { label: 'Apple Silicon Reference', description: 'M1–M5 generations, Metal GPU families, and capability progression.', order: 15 },
-  'apple-metal-reference': { label: 'Apple Metal Reference', description: 'MSL kernels, simdgroup ops, threadgroup memory, and pipeline optimization.', order: 16 },
-  'apple-silicon-metal-enablement': { label: 'Metal Enablement Notes', description: 'Implementation notes for the Vulkan-to-Metal port.', order: 17 },
-};
-
-const orderedDocs = [...docs].sort((a, b) => (docMeta[a.slug]?.order ?? 99) - (docMeta[b.slug]?.order ?? 99));
-const startHereSlugs = ['getting-started', 'hardware-requirements', 'rocm', 'running-zinc', 'api', 'opencode', 'development'];
-const startHere = orderedDocs.filter(doc => startHereSlugs.includes(doc.slug));
-const deepDocs = orderedDocs.filter(doc => !startHereSlugs.includes(doc.slug));
-
-const combinedDocs = [
-  ...startHere.map(doc => ({ label: docMeta[doc.slug]?.label ?? doc.title, href: `/zinc/docs/${doc.slug}` })),
-  ...deepDocs.map(doc => ({ label: docMeta[doc.slug]?.label ?? doc.title, href: `/zinc/docs/${doc.slug}` })),
-  { label: 'ZINC Zig API', href: '/zinc/docs/zig-api/' },
+const setups = [
+  { slug: 'hardware-requirements', title: 'Hardware and memory', description: 'Supported GPUs, drivers, operating systems, and model sizing.' },
+  { slug: 'rocm', title: 'AMD ROCm setup', description: 'Build and run the HIP backend on a validated Radeon stack.' },
+  { slug: 'opencode', title: 'OpenCode setup', description: 'Connect a coding client to your local model.' },
+  { slug: 'development', title: 'Build and contribute', description: 'Tests, debugging, benchmarking, and development tools.' },
 ];
-
-const jsonLd = {
-  '@context': 'https://schema.org',
-  '@graph': [
-    {
-      '@type': 'CollectionPage',
-      name: 'ZINC Documentation',
-      description: 'Documentation for using ZINC with Vulkan, ROCm, Metal, and experimental CUDA: getting started, hardware requirements, running the engine, then deeper tuning and reference material.',
-      url: `${siteUrl}/zinc/docs`,
-      mainEntity: {
-        '@type': 'ItemList',
-        itemListElement: combinedDocs.map((doc, index) => ({
-          '@type': 'ListItem',
-          position: index + 1,
-          name: doc.label,
-          url: `${siteUrl}${doc.href}`,
-        })),
-      },
-    },
-    buildBreadcrumbList(siteUrl, breadcrumbItems),
-  ],
-};
+const primarySlugs = new Set([...starts, ...setups].map(doc => doc.slug));
+const references = docs.filter(doc => !primarySlugs.has(doc.slug));
+const allLinks = [
+  ...docs.map(doc => ({ label: doc.title, href: `/zinc/docs/${doc.slug}/` })),
+  { label: 'Zig API reference', href: '/zinc/docs/zig-api/' },
+];
 ---
 
 <BaseLayout
   title="ZINC Documentation"
-  description="Documentation for using ZINC through Vulkan, ROCm, Metal, and experimental CUDA: getting started, hardware requirements, CLI and server use, architecture, tuning, and API reference."
-  keywords="ZINC docs, ZINC getting started, ZINC hardware requirements, ROCm GGUF inference, Vulkan GGUF docs, Metal inference, CUDA inference, ZINC API, RDNA4 tuning"
-  jsonLd={jsonLd}
+  description="Get ZINC running, choose a model, and connect your apps. Setup guides, CLI usage, API examples, and GPU engineering reference."
+  jsonLd={{
+    '@context': 'https://schema.org',
+    '@graph': [
+      {
+        '@type': 'CollectionPage', name: 'ZINC Documentation', url: `${siteUrl}/zinc/docs/`,
+        mainEntity: {
+          '@type': 'ItemList',
+          itemListElement: allLinks.map((doc, index) => ({
+            '@type': 'ListItem', position: index + 1, name: doc.label, url: `${siteUrl}${doc.href}`,
+          })),
+        },
+      },
+      buildBreadcrumbList(siteUrl, breadcrumbItems),
+    ],
+  }}
 >
   <Breadcrumbs items={breadcrumbItems} />
-
   <div class="docs-hub">
     <header class="hub-header">
-      <h1>Documentation</h1>
-      <p>Start with how to actually use ZINC: confirm the hardware, build the binary, run one model, then go deeper into tuning and internals.</p>
+      <p class="eyebrow">ZINC documentation</p>
+      <h1>From your first chat<br />to the GPU kernels.</h1>
+      <p>Start with a model on your own machine. Find the setup, usage, and reference material as you need it.</p>
     </header>
 
-    <section class="search-panel">
-      <DocsSearch />
+    <DocsSearch />
+
+    <section class="group" aria-labelledby="start-heading">
+      <h2 id="start-heading">Start here</h2>
+      <ol class="guide-list">
+        {starts.map((doc, index) => (
+          <li><a href={`/zinc/docs/${doc.slug}/`}>
+            <span class="number" aria-hidden="true">0{index + 1}</span>
+            <div><h3>{doc.title}</h3><p>{doc.description}</p></div>
+            <span aria-hidden="true">→</span>
+          </a></li>
+        ))}
+      </ol>
     </section>
 
-    <section class="status-banner">
-      <div>
-        <p class="kicker">Current Status</p>
-        <h2>Vulkan, ROCm, and Metal are supported</h2>
-        <p>AMD Radeon can use Vulkan or ROCm, Intel Arc uses Vulkan, and Apple Silicon uses Metal. The NVIDIA CUDA backend is available for experimental use. The CLI remains the best-supported way to start, while server and model coverage continue to mature.</p>
-      </div>
-      <a href="/zinc/benchmarks/" class="status-link">Benchmarks</a>
-    </section>
-
-    <section class="quickstart-panel">
-      <TerminalWindow
-        title="bash"
-        density="compact"
-        code={`# Fastest path: build ZINC, see which supported models fit,
-# pull one, and run it end to end.
-git clone https://github.com/zolotukhin/zinc.git
-cd zinc
-zig build -Doptimize=ReleaseFast
-
-# RDNA4 Vulkan only; skip for ROCm, Intel Arc, CUDA, and macOS.
-export RADV_PERFTEST=coop_matrix
-
-# Verify the selected GPU backend and runtime path first
-./zig-out/bin/zinc --check
-
-# Show supported models for this machine
-./zig-out/bin/zinc model list
-
-# Pull one managed model from the built-in catalog
-./zig-out/bin/zinc model pull qwen35-9b-q4k-m
-
-# Check the managed model before the first run
-./zig-out/bin/zinc --check --model-id qwen35-9b-q4k-m
-
-# Run a prompt with that managed model
-./zig-out/bin/zinc \\
-  --model-id qwen35-9b-q4k-m \\
-  --prompt "The capital of France is"
-
-# If you already have a local GGUF file, use it directly instead
-./zig-out/bin/zinc --check -m /path/to/model.gguf
-./zig-out/bin/zinc \\
-  -m /path/to/model.gguf \\
-  --prompt "The capital of France is"`}
-      />
-    </section>
-
-    <section class="group">
-      <div class="group-head">
-        <h2>Start Here</h2>
-        <p>The practical docs for getting ZINC onto a real machine and actually running it.</p>
-      </div>
-      <div class="grid start-grid">
-        {startHere.map(doc => (
-          <a href={`/zinc/docs/${doc.slug}/`} class:list={['card', { primary: doc.slug === 'getting-started' }]}>
-            <div class="card-head">
-              <h3>{docMeta[doc.slug]?.label ?? doc.title}</h3>
-              {doc.slug === 'getting-started' && <span class="badge">First</span>}
-            </div>
-            <p>{docMeta[doc.slug]?.description}</p>
-          </a>
+    <section class="group" aria-labelledby="setup-heading">
+      <h2 id="setup-heading">Setup and tools</h2>
+      <div class="setup-list">
+        {setups.map(doc => (
+          <a href={`/zinc/docs/${doc.slug}/`}><h3>{doc.title} <span aria-hidden="true">→</span></h3><p>{doc.description}</p></a>
         ))}
       </div>
     </section>
 
-    <section class="group">
-      <div class="group-head">
-        <h2>Deep Docs</h2>
-        <p>The architecture, tuning, and reference material once the runtime path is already clear.</p>
-      </div>
-      <div class="grid deep-grid">
-        {deepDocs.map(doc => (
-          <a href={`/zinc/docs/${doc.slug}/`} class="card">
-            <h3>{docMeta[doc.slug]?.label ?? doc.title}</h3>
-            <p>{docMeta[doc.slug]?.description}</p>
-          </a>
-        ))}
-        <a href="/zinc/docs/zig-api/" class="card api-card">
-          <div class="card-head">
-            <h3>Zig API Reference</h3>
-            <span class="badge">Generated</span>
-          </div>
-          <p>Reference built from <code>src/**/*.zig</code>, with module pages, symbol anchors, and source links.</p>
-          <div class="card-stats">
-            <span>{zigApi.sections.length} sections</span>
-            <span>{zigApi.moduleCount} modules</span>
-            <span>{zigCodeLines} Zig lines</span>
-            <span>{zigApi.exportCount} exports</span>
-          </div>
-        </a>
-      </div>
-    </section>
-
-    <section class="api-sections">
-      <h3>Zig API Sections</h3>
-      <div class="section-list">
-        {zigApi.sections.map(section => (
-          <a href={`/zinc/docs/zig-api/#${section.slug}`} class="section-link">
-            <span class="section-name">{section.title}</span>
-            <span class="section-meta">{section.modules.length} modules, {section.symbolCount} symbols</span>
-          </a>
-        ))}
-      </div>
+    <section class="group reference" aria-labelledby="reference-heading">
+      <h2 id="reference-heading">Engineering and reference</h2>
+      <a class="api-link" href="/zinc/docs/zig-api/">
+        <div><h3>Zig API reference <span aria-hidden="true">→</span></h3><p>Generated from the source: {zigApi.moduleCount} modules and {zigApi.exportCount} exports.</p></div>
+      </a>
+      <details>
+        <summary>Browse {references.length} engineering guides and reports</summary>
+        <ul class="reference-list">
+          {references.map(doc => <li><a href={`/zinc/docs/${doc.slug}/`}>{doc.title}</a></li>)}
+        </ul>
+      </details>
+      <p class="reference-note">Search covers all guides and source symbols, including the reference material above.</p>
     </section>
   </div>
 </BaseLayout>
 
 <style>
-  .docs-hub {
-    width: 100vw;
-    max-width: 1220px;
-    margin-left: calc(50% - min(50vw, 610px));
-    padding: 0 var(--space-lg);
+  .docs-hub { max-width: 54rem; margin: 0 auto; }
+  .hub-header { max-width: 39rem; margin: 1.5rem 0 2rem; }
+  .eyebrow { margin: 0 0 0.8rem; color: var(--color-text-muted); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+  .hub-header h1 { margin: 0 0 1rem; font-size: clamp(2.2rem, 4.8vw, 3.2rem); line-height: 1.12; letter-spacing: -0.04em; }
+  .hub-header > p:last-child { color: var(--color-text-muted); font-size: 0.95rem; }
+  .group { margin-top: 3rem; }
+  .group h2 { margin: 0 0 1.25rem; font-size: 1.15rem; }
+  .guide-list { list-style: none; padding: 0; margin: 0; border-top: 1px solid var(--color-border); }
+  .guide-list li { margin: 0; }
+  .guide-list a { display: grid; grid-template-columns: 1.5rem 1fr 1rem; align-items: baseline; gap: 1.2rem; padding: 1.35rem 0; border-bottom: 1px solid var(--color-border); color: var(--color-text); }
+  .guide-list a:hover, .setup-list a:hover, .api-link:hover { text-decoration: none; }
+  .guide-list a:hover h3, .setup-list a:hover h3, .api-link:hover h3 { color: var(--color-accent); }
+  .number { color: var(--color-text-muted); font: 0.68rem var(--font-mono); }
+  h3 { margin: 0; font-size: 0.98rem; }
+  .guide-list p, .setup-list p, .api-link p { margin: 0.35rem 0 0; color: var(--color-text-muted); font-size: 0.8rem; line-height: 1.55; }
+  .setup-list { display: grid; grid-template-columns: 1fr 1fr; gap: 0 2.5rem; }
+  .setup-list a { padding: 1.15rem 0; border-top: 1px solid var(--color-border); color: var(--color-text); }
+  .setup-list h3 span { color: var(--color-text-muted); font-weight: 400; }
+  .api-link { display: block; color: var(--color-text); padding: 1.25rem 0; border-top: 1px solid var(--color-border); }
+  details { border-top: 1px solid var(--color-border); border-bottom: 1px solid var(--color-border); }
+  summary { padding: 1rem 0; font-size: 0.85rem; cursor: pointer; }
+  .reference-list { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem 2rem; list-style: none; padding: 0 0 1.25rem; margin: 0; }
+  .reference-list li { margin: 0; }
+  .reference-list a { display: inline-block; font-size: 0.78rem; }
+  .reference-note { margin: 1rem 0 0; font-size: 0.73rem; color: var(--color-text-muted); }
+  @media (max-width: 600px) {
+    .setup-list, .reference-list { grid-template-columns: 1fr; }
+    .guide-list a { gap: 0.7rem; }
   }
-  .hub-header { margin-bottom: var(--space-lg); }
-  .hub-header h1 { margin-bottom: var(--space-xs); }
-  .hub-header p, .group-head p, .status-banner p { margin: 0; color: var(--color-text-muted); }
-  .kicker { margin: 0 0 var(--space-xs); font-size: 0.75rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--color-accent); }
-  .status-banner { display: grid; grid-template-columns: 1fr auto; gap: var(--space-md); align-items: start; padding: var(--space-md); margin: var(--space-lg) 0; border: 1px solid var(--color-border); border-radius: 14px; background: radial-gradient(circle at top right, rgba(211, 84, 0, 0.12), transparent 38%), var(--color-bg-alt); }
-  .status-banner h2, .group-head h2 { margin: 0 0 var(--space-xs); font-size: 1.2rem; }
-  .status-link, .card, .section-link { color: var(--color-text); }
-  .status-link { display: inline-flex; align-items: center; justify-content: center; align-self: center; padding: 0.55rem 0.9rem; border: 1px solid var(--color-border); border-radius: 999px; white-space: nowrap; }
-  .status-link:hover, .card:hover, .section-link:hover { text-decoration: none; border-color: var(--color-accent); }
-  .search-panel { margin: 0 0 var(--space-lg); }
-  .quickstart-panel {
-    max-width: 980px;
-    margin: 0 auto var(--space-xl);
-  }
-  .group + .group { margin-top: var(--space-xl); }
-  .group-head { margin-bottom: var(--space-md); }
-  .grid { display: grid; gap: var(--space-sm); }
-  .start-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .deep-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .card { display: flex; flex-direction: column; padding: var(--space-md); border: 1px solid var(--color-border); border-radius: 10px; background: var(--color-bg); transition: border-color 0.15s ease; }
-  .card.primary { background: linear-gradient(135deg, rgba(211, 84, 0, 0.08), transparent 50%), var(--color-bg); }
-  .api-card { background: linear-gradient(135deg, rgba(211, 84, 0, 0.06), transparent 55%), var(--color-bg); }
-  .card-head { display: flex; align-items: center; gap: var(--space-sm); }
-  .card h3 { font-size: 1rem; margin: 0 0 var(--space-xs); }
-  .card p { margin: var(--space-xs) 0 0; font-size: 0.85rem; color: var(--color-text-muted); flex: 1; }
-  .badge { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; padding: 0.15rem 0.5rem; border-radius: 999px; background: var(--color-accent); color: white; }
-  .card-stats { display: flex; gap: var(--space-xs); flex-wrap: wrap; margin-top: var(--space-sm); }
-  .card-stats span { font-size: 0.75rem; padding: 0.15rem 0.55rem; border: 1px solid var(--color-border); border-radius: 999px; color: var(--color-text-muted); background: var(--color-bg-alt); }
-  .api-sections { margin-top: var(--space-xl); border: 1px solid var(--color-border); border-radius: 10px; padding: var(--space-md); }
-  .api-sections h3 { font-size: 0.85rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin: 0 0 var(--space-sm); }
-  .section-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: var(--color-border); border-radius: 6px; overflow: hidden; }
-  .section-link { display: flex; justify-content: space-between; align-items: center; padding: 0.55rem 0.75rem; background: var(--color-bg); font-size: 0.88rem; transition: background 0.1s ease; }
-  .section-link:hover { background: var(--color-bg-alt); }
-  .section-name { font-weight: 500; }
-  .section-meta { font-size: 0.75rem; color: var(--color-text-muted); white-space: nowrap; margin-left: var(--space-sm); }
-  @media (max-width: 1100px) {
-    .docs-hub {
-      max-width: 1080px;
-      margin-left: calc(50% - min(50vw, 540px));
-      padding: 0 var(--space-md);
-    }
-  }
-  @media (max-width: 900px) { .start-grid, .deep-grid, .section-list { grid-template-columns: 1fr; } }
-  @media (max-width: 700px) { .status-banner { grid-template-columns: 1fr; } }
 </style>

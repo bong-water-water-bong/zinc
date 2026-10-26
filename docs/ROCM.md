@@ -12,7 +12,7 @@ The current reference configuration is:
 - Linux kernel `7.2.2-070202-generic`
 - ROCm userspace `7.2.4`
 - Radeon AI PRO R9700 (`gfx1201`, wave32)
-- Zig `0.15.2` or newer
+- Zig `0.17.0`, pinned by `.zig-version` and selected by `scripts/zig.sh`
 - Qwen 3.5 9B, Qwen 3.6 35B-A3B, and Qwen 3.8 27B
 - Gemma 4 26B-A4B MoE and Gemma 4 31B
 
@@ -26,7 +26,7 @@ Install the ROCm HIP development files that provide `amdhip64`, `hiprtc`, and
 `hipblas`, then build with the toolkit root:
 
 ```bash
-ROCM_PATH=/opt/rocm zig build -Dbackend=rocm -Doptimize=ReleaseFast
+ROCM_PATH=/opt/rocm ./scripts/zig.sh build -Dbackend=rocm -Doptimize=ReleaseFast
 
 ROCR_VISIBLE_DEVICES=0 ./zig-out/bin/zinc --check
 ./zig-out/bin/zinc --version
@@ -54,6 +54,14 @@ to ordinary greedy decode. `ZINC_MTP_DRAFTS=3` is the measured R9700 default
 `1` and `2` remain available for GPUs or workloads with a different acceptance
 profile, and `ZINC_MTP_ADAPT_C=<c>` picks two or three per cycle from the
 running acceptance.
+
+On ROCm, the draft head scores 98,304 vocabulary rows by default; the target
+still verifies against the complete vocabulary. `ZINC_MTP_DRAFT_VOCAB=65536`
+restores the previous draft-head size. MTP verification also fuses attention
+setup across its token rows; `ZINC_MTP_FUSED_ATTN=0` restores the separate
+operations. The [Zig 0.17 MTP follow-up](https://github.com/zolotukhin/zinc/blob/main/docs/ROCM_MTP_0_17.md) records the matched
+three-round R9700 results: 71.17 to 77.04 tok/s on the long coding workload,
+with roughly 1–1.4% gains on the other three workloads.
 
 The server uses it too, but only when it owns a single request slot
 (`--parallel 1`): drafting writes the single-sequence KV cache and rewinds it on
@@ -110,6 +118,7 @@ available as correctness/performance A/B opt-outs:
 - `ZINC_BATCH_B1_MATVEC=0`
 - `ZINC_MTP=0` (Qwen 3.8 CLI and single-slot server: disable model-native NextN drafting)
 - `ZINC_MTP_Q8=0` (Qwen 3.8: use the float multi-token verifier)
+- `ZINC_MTP_FUSED_ATTN=0` (Qwen 3.8: use separate attention setup operations during verification)
 
 The Qwen 3.8 decode path uses packed Q8 activations for the hot Q4_K, Q5_K,
 and Q6_K projections, paired projection kernels where the shapes permit it, a
@@ -125,15 +134,90 @@ Qwen 3.6 MoE prefill uses the native token-batched Q4_K/Q5_K/Q6_K expert
 kernels. CUDA's grouped tensor-core expert path is not dispatched by the ROCm
 build; its compatibility symbols are intentionally inert.
 
+## API client notes
+
+The ROCm server exposes generation, `/health`, `/stats`, and a minimal
+`GET /v1/models` list for its loaded model. Discovery includes only the model's
+basename, fixed ownership/creation fields, and per-slot context capacity; it
+does not expose parent directories. It does not provide the full Vulkan/Metal
+model-manager or browser chat interface. Use the default Vulkan or Metal build
+for the browser-chat walkthrough. Direct GGUF and managed-ID startup, discovery,
+generation, and all 23 API checks passed after the
+[test GPU recovered](ROCM_AGENT_CONTEXT.md#remaining-hardware-validation).
+
+Send `stream: false` explicitly for a JSON response; this handler defaults to
+streaming. SSE replies now include finish reasons and usage. Qwen chat supports
+tool schemas, streamed tool calls, and assistant/tool-result history, including
+null assistant content. The `stop` parameter remains unimplemented. The OpenAI JavaScript SDK 7.43.0 passes matched
+JSON and streaming generation checks with the explicit stream setting. See the
+[MTP validation report](https://github.com/zolotukhin/zinc/blob/main/docs/ROCM_MTP_0_17.md)
+for the earlier parity tests and generic SDK-suite limitation.
+
+The [OpenCode harness guide](OPENCODE.md) provides a portable setup script and
+headless task/API checks. For repository tasks, start the server with
+`--context 32768 --parallel 1` and pass the same context to the setup script.
+The recurrent prefill scan stages its
+gate/beta values in bounded tiles, allowing agent prompts above the previous
+8K shared-memory limit. Streaming clients can cancel a request without keeping
+its slot occupied for the rest of the output budget.
+
+### Long coding sessions
+
+The initial fixture checks used a 16K server context and did not validate
+requests near its full capacity. A full Zinc worktree experiment exposed limits
+beyond those fixtures: the 27B model ran out of
+VRAM during prefill with a 32K allocation, and the 9B model's decode attention
+kernel exceeded the GPU's shared-memory limit once its prompt crossed 16K.
+That kernel failure produced corrupted text even though the HTTP request and
+OpenCode process completed successfully. A later 27B run at 16K also failed:
+`attention_causal_batched_v2` requested a 65,612-byte group segment at 16,080
+prompt tokens, followed by illegal-memory and rocBLASLt/Tensile errors.
+The [follow-up fixes and validation](ROCM_AGENT_CONTEXT.md) replace the full-score
+attention allocation above 8K with bounded tiles, chunk prefill scratch, and
+remove duplicate single-slot state. The 27B model now passes exact-key probes
+at 8,548, 17,048, and 30,048 prompt tokens with a 32K context and NextN enabled.
+GPU execution failures also fail generation and health checks explicitly.
+These execution checks remain separate from repository coding acceptance.
+
+Prefill defaults to chunks of 4,096 tokens. `ZINC_PREFILL_CHUNK=<positive count>`
+changes the scratch bound; larger chunks consume more VRAM. Optional
+`ZINC_PROMPT_CACHE=1` reuses exact prefixes for single-slot Qwen requests by
+restoring recurrent checkpoints. It defaults off and requires additional VRAM;
+see the follow-up for parity checks and the portable cache validator.
+
+The 32K coding configuration is not Qwen 3.8 27B's model limit: its native
+window is 262,144 tokens. The [native-context guide](ROCM_NATIVE_CONTEXT.md)
+documents opt-in Q8 KV storage, bounded BLAS prefill and the separate FP16-input
+attention option for fitting larger capacities on a 32GB card. F32 KV remains
+the default. Q8 currently requires ROCm Qwen and a single request slot.
+
+Keep repository instructions concise and read source in small line ranges.
+OpenCode 1.19.4's [built-in file reader](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/tool/read.ts) has an independent 50KB cap, which can
+overflow a local model's context when reading large files. Its general
+`tool_output` setting does not constrain that reader, as the
+[tool wrapper](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/tool/tool.ts) skips results already marked by the reader. The setup helper now installs
+a local hook that caps reads at 80 lines and shortens large tool outputs.
+Rerun setup with `--force` to update an existing configuration. Keep checking the worktree
+diff, server log, and project tests independently. The setup script's
+`run --verify '<project check>'` mode enforces checks between short editing
+rounds and returns failure when they do not pass.
+
 ## Fair llama.cpp comparison
 
 Use the reusable-server performance suite for claims. It runs one engine at a
 time, uses the same GGUF and scenario matrix, discards a warmup, and reports the
 median of measured runs:
 
-The RDNA runner applies the same stable host policy before either engine: PCIe
-ASPM is set to performance and the discrete GPU's memory DPM policy is locked
-high. This prevents an idle server from changing clocks between phases.
+The RDNA runner applies the same host policy before either engine: PCIe ASPM
+is set to performance and the discrete GPU uses its automatic clock policy.
+Warmups and repeated runs account for clock ramping.
+
+ROCm preflight uses `rocminfo` with ROCr visibility. The legacy
+`--rdna-vk-device` option selects a ROCr ordinal for the ROCm backend; Vulkan
+may enumerate the same card at a different index. The selected GPU appears as
+logical device zero to ZINC and the HIP baseline. Both servers use the same
+context capacity: the model setting or 4,096 by default, with
+`--rdna-context` to override it.
 
 ```bash
 source .env
@@ -145,8 +229,8 @@ bun tools/performance_suite.mjs \
   --runs 5 \
   --warmup 1 \
   --rdna-backend rocm \
+  --rdna-context 32768 \
   --rdna-build \
-  --rdna-start-llama \
   --rdna-llama-server /path/to/llama.cpp/build-hip/bin/llama-server \
   --rdna-llama-device ROCm0 \
   --no-site-write \
@@ -169,12 +253,12 @@ prompt-plus-generation phase-wall-time score; higher is better. Each server
 receives the same textual scenario prompt and applies its native chat template;
 prefill and decode rates below are the server-reported phase rates.
 
-| Scenario | ZINC prefill | llama.cpp prefill | ZINC decode | llama.cpp decode | Overall |
-|---|---:|---:|---:|---:|---:|
-| Quick Chat | **391.76 tok/s** | 150.51 tok/s | **32.27 tok/s** | 29.83 tok/s | **122.55%** |
-| Coding Review | **612.68 tok/s** | 253.09 tok/s | **31.97 tok/s** | 29.83 tok/s | **116.59%** |
-| Incident Context | **680.43 tok/s** | 308.56 tok/s | **31.88 tok/s** | 29.83 tok/s | **121.97%** |
-| Long Coding Draft | **426.03 tok/s** | 186.73 tok/s | **31.97 tok/s** | 29.84 tok/s | **112.11%** |
+| Scenario          |     ZINC prefill | llama.cpp prefill |     ZINC decode | llama.cpp decode |     Overall |
+| ----------------- | ---------------: | ----------------: | --------------: | ---------------: | ----------: |
+| Quick Chat        | **391.76 tok/s** |      150.51 tok/s | **32.27 tok/s** |      29.83 tok/s | **122.55%** |
+| Coding Review     | **612.68 tok/s** |      253.09 tok/s | **31.97 tok/s** |      29.83 tok/s | **116.59%** |
+| Incident Context  | **680.43 tok/s** |      308.56 tok/s | **31.88 tok/s** |      29.83 tok/s | **121.97%** |
+| Long Coding Draft | **426.03 tok/s** |      186.73 tok/s | **31.97 tok/s** |      29.84 tok/s | **112.11%** |
 
 ZINC won prefill, decode, and end-to-end phase time in all four scenarios and
 reached **116.88%** of llama.cpp on the summed full-matrix phase-wall-time score

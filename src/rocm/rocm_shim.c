@@ -12,6 +12,7 @@
 #include <hipblas/hipblas.h>
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,7 @@ struct CudaCtx {
     hipblasHandle_t hipblas;
     hipDeviceProp_t props;
     hipModule_t kernel_module;
+    atomic_int execution_failed;
 };
 
 struct CudaBuf {
@@ -38,9 +40,11 @@ struct CudaPipe {
     hipFunction_t fn;
     hipModule_t owned_module;
     char* name;
+    uint32_t static_shared;
 };
 
 struct CudaCmd {
+    CudaCtx* ctx;
     hipStream_t stream;
     hipEvent_t event;
 };
@@ -67,6 +71,16 @@ const char* cuda_last_error(void) {
     return g_err;
 }
 
+int cuda_execution_failed(CudaCtx* ctx) {
+    return !ctx || ctx->execution_failed;
+}
+
+static int execution_ok(CudaCtx* ctx, hipError_t result, const char* where) {
+    if (hip_ok(result, where)) return 1;
+    if (ctx) ctx->execution_failed = 1;
+    return 0;
+}
+
 // ---- Device lifecycle -------------------------------------------------------
 
 CudaCtx* cuda_init(int device_index) {
@@ -84,6 +98,7 @@ CudaCtx* cuda_init(int device_index) {
         return NULL;
     }
     ctx->device = device_index;
+    atomic_init(&ctx->execution_failed, 0);
     if (!hip_ok(hipGetDeviceProperties(&ctx->props, device_index), "hipGetDeviceProperties") ||
         !hip_ok(hipStreamCreateWithFlags(&ctx->stream, hipStreamNonBlocking), "hipStreamCreateWithFlags")) {
         free(ctx);
@@ -233,23 +248,23 @@ uint64_t cuda_buffer_device_ptr(CudaBuf* buf) {
 }
 
 void cuda_upload(CudaCtx* ctx, CudaBuf* buf, const void* src, size_t size) {
-    if (!ctx || !buf) return;
-    if (!hip_ok(hipMemcpyAsync(buf->dptr, src, size, hipMemcpyHostToDevice, ctx->stream), "hipMemcpyAsync(H2D)")) return;
-    hip_ok(hipStreamSynchronize(ctx->stream), "hipStreamSynchronize(H2D)");
+    if (!ctx || !buf || ctx->execution_failed) return;
+    if (!execution_ok(ctx, hipMemcpyAsync(buf->dptr, src, size, hipMemcpyHostToDevice, ctx->stream), "hipMemcpyAsync(H2D)")) return;
+    execution_ok(ctx, hipStreamSynchronize(ctx->stream), "hipStreamSynchronize(H2D)");
 }
 
 void cuda_download(CudaCtx* ctx, CudaBuf* buf, void* dst, size_t size) {
-    if (!ctx || !buf) return;
-    if (!hip_ok(hipMemcpyAsync(dst, buf->dptr, size, hipMemcpyDeviceToHost, ctx->stream), "hipMemcpyAsync(D2H)")) return;
-    hip_ok(hipStreamSynchronize(ctx->stream), "hipStreamSynchronize(D2H)");
+    if (!ctx || !buf || ctx->execution_failed) return;
+    if (!execution_ok(ctx, hipMemcpyAsync(dst, buf->dptr, size, hipMemcpyDeviceToHost, ctx->stream), "hipMemcpyAsync(D2H)")) return;
+    execution_ok(ctx, hipStreamSynchronize(ctx->stream), "hipStreamSynchronize(D2H)");
 }
 
 void cuda_upload_async(CudaCtx* ctx, CudaBuf* buf, const void* src, size_t size) {
-    if (ctx && buf) hip_ok(hipMemcpyAsync(buf->dptr, src, size, hipMemcpyHostToDevice, ctx->stream), "hipMemcpyAsync(H2D)");
+    if (ctx && buf && !ctx->execution_failed) execution_ok(ctx, hipMemcpyAsync(buf->dptr, src, size, hipMemcpyHostToDevice, ctx->stream), "hipMemcpyAsync(H2D)");
 }
 
 void cuda_download_async(CudaCtx* ctx, CudaBuf* buf, void* dst, size_t size) {
-    if (ctx && buf) hip_ok(hipMemcpyAsync(dst, buf->dptr, size, hipMemcpyDeviceToHost, ctx->stream), "hipMemcpyAsync(D2H)");
+    if (ctx && buf && !ctx->execution_failed) execution_ok(ctx, hipMemcpyAsync(dst, buf->dptr, size, hipMemcpyDeviceToHost, ctx->stream), "hipMemcpyAsync(D2H)");
 }
 
 void* cuda_alloc_host(size_t size) {
@@ -370,6 +385,9 @@ CudaPipe* cuda_create_pipeline(CudaCtx* ctx, const char* source, const char* fn_
         return NULL;
     }
     pipe->name = (char*)malloc(strlen(fn_name) + 1);
+    int static_shared = 0;
+    hipFuncGetAttribute(&static_shared, HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, pipe->fn);
+    pipe->static_shared = (uint32_t)static_shared;
     if (pipe->name) strcpy(pipe->name, fn_name);
     if (getenv("ZINC_ROCM_KERNEL_ATTRS") && strstr(fn_name, "wmma_i8")) {
         int regs = 0, local = 0, shared = 0, max_threads = 0;
@@ -400,6 +418,9 @@ CudaPipe* cuda_create_pipeline_from_image(CudaCtx* ctx, const void* image, size_
         return NULL;
     }
     pipe->owned_module = module;
+    int static_shared = 0;
+    hipFuncGetAttribute(&static_shared, HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, pipe->fn);
+    pipe->static_shared = (uint32_t)static_shared;
     pipe->name = (char*)malloc(strlen(fn_name) + 1);
     if (pipe->name) strcpy(pipe->name, fn_name);
     return pipe;
@@ -434,13 +455,14 @@ void cuda_free_pipeline(CudaPipe* pipe) {
 // ---- Command submission -----------------------------------------------------
 
 CudaCmd* cuda_begin_command(CudaCtx* ctx) {
-    if (!ctx) return NULL;
+    if (!ctx || ctx->execution_failed) return NULL;
     CudaCmd* cmd = (CudaCmd*)calloc(1, sizeof *cmd);
     if (!cmd) {
         set_err("cuda_begin_command", "out of memory");
         return NULL;
     }
     cmd->stream = ctx->stream;
+    cmd->ctx = ctx;
     return cmd;
 }
 
@@ -452,6 +474,14 @@ void cuda_dispatch(CudaCmd* cmd, CudaPipe* pipe,
     (void)push_size;
     if (!cmd || !pipe || n_bufs > MAX_DISPATCH_BUFS) {
         set_err("cuda_dispatch", "invalid dispatch");
+        if (cmd) cmd->ctx->execution_failed = 1;
+        return;
+    }
+    if (cmd->ctx->execution_failed) return;
+    const size_t shared_limit = cmd->ctx->props.sharedMemPerBlock;
+    if ((size_t)pipe->static_shared + shared_bytes > shared_limit) {
+        set_err(pipe->name, "static plus dynamic shared memory exceeds device limit");
+        cmd->ctx->execution_failed = 1;
         return;
     }
     void* device_ptrs[MAX_DISPATCH_BUFS];
@@ -470,15 +500,19 @@ void cuda_dispatch(CudaCmd* cmd, CudaPipe* pipe,
     if (time_kernel && hipEventCreate(&start) == hipSuccess && hipEventCreate(&stop) == hipSuccess)
         hipEventRecord(start, cmd->stream);
 
-    hip_ok(hipModuleLaunchKernel(pipe->fn,
+    const hipError_t launch_result = hipModuleLaunchKernel(pipe->fn,
                                 grid[0], grid[1], grid[2],
                                 block[0], block[1], block[2],
-                                shared_bytes, cmd->stream, args, NULL),
-           "hipModuleLaunchKernel");
+                                shared_bytes, cmd->stream, args, NULL);
+    if (!execution_ok(cmd->ctx, launch_result, "hipModuleLaunchKernel")) {
+        fprintf(stderr, "[rocm_shim] kernel=%s grid=%u,%u,%u block=%u,%u,%u shared=%u\n",
+                pipe->name ? pipe->name : "unknown", grid[0], grid[1], grid[2],
+                block[0], block[1], block[2], shared_bytes);
+    }
 
     if (start && stop) {
         hipEventRecord(stop, cmd->stream);
-        hipEventSynchronize(stop);
+        execution_ok(cmd->ctx, hipEventSynchronize(stop), "hipEventSynchronize(timing)");
         float ms = 0.0f;
         hipEventElapsedTime(&ms, start, stop);
         fprintf(stderr, "[rocm_time] %s %.4f ms grid=%ux%u\n",
@@ -494,7 +528,7 @@ void cuda_barrier(CudaCmd* cmd) {
 
 void cuda_commit_and_wait(CudaCmd* cmd) {
     if (!cmd) return;
-    hipStreamSynchronize(cmd->stream);
+    execution_ok(cmd->ctx, hipStreamSynchronize(cmd->stream), "hipStreamSynchronize(command)");
     if (cmd->event) hipEventDestroy(cmd->event);
     free(cmd);
 }
@@ -502,19 +536,19 @@ void cuda_commit_and_wait(CudaCmd* cmd) {
 void cuda_commit_async(CudaCmd* cmd) {
     if (!cmd) return;
     if (!cmd->event &&
-        !hip_ok(hipEventCreateWithFlags(&cmd->event, hipEventDisableTiming), "hipEventCreateWithFlags"))
+        !execution_ok(cmd->ctx, hipEventCreateWithFlags(&cmd->event, hipEventDisableTiming), "hipEventCreateWithFlags"))
         return;
-    hipEventRecord(cmd->event, cmd->stream);
+    execution_ok(cmd->ctx, hipEventRecord(cmd->event, cmd->stream), "hipEventRecord");
 }
 
 void cuda_wait(CudaCmd* cmd) {
     if (!cmd) return;
     if (cmd->event) {
-        hipEventSynchronize(cmd->event);
+        execution_ok(cmd->ctx, hipEventSynchronize(cmd->event), "hipEventSynchronize");
         hipEventDestroy(cmd->event);
     } else {
         // Preserve correctness if event creation failed in commit_async.
-        hipStreamSynchronize(cmd->stream);
+        execution_ok(cmd->ctx, hipStreamSynchronize(cmd->stream), "hipStreamSynchronize(wait)");
     }
     free(cmd);
 }
@@ -529,7 +563,9 @@ void cuda_release_completed(CudaCmd* cmd) {
 
 void cuda_cublas_hgemm(CudaCtx* ctx, unsigned M, unsigned N, unsigned K,
                        CudaBuf* W, CudaBuf* A, CudaBuf* Y, float beta) {
+    if (ctx && ctx->execution_failed) return;
     if (!ctx || !ctx->hipblas || !W || !A || !Y) {
+        if (ctx) ctx->execution_failed = 1;
         set_err("cuda_cublas_hgemm", "hipBLAS unavailable");
         return;
     }
@@ -541,7 +577,7 @@ void cuda_cublas_hgemm(CudaCtx* ctx, unsigned M, unsigned N, unsigned K,
         A->dptr, HIP_R_16F, (int)K,
         &beta, Y->dptr, HIP_R_32F, (int)M,
         HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
-    if (status != HIPBLAS_STATUS_SUCCESS) set_err("hipblasGemmEx", "failed");
+    if (status != HIPBLAS_STATUS_SUCCESS) { ctx->execution_failed = 1; set_err("hipblasGemmEx", "failed"); }
 }
 
 void cuda_cublas_hgemm_strided_batched(CudaCtx* ctx, unsigned trans_a, unsigned trans_b,
@@ -550,7 +586,9 @@ void cuda_cublas_hgemm_strided_batched(CudaCtx* ctx, unsigned trans_a, unsigned 
                                        CudaBuf* B, size_t b_offset, unsigned ldb, int64_t stride_b,
                                        CudaBuf* C, size_t c_offset, unsigned ldc, int64_t stride_c,
                                        unsigned batch_count, float beta) {
+    if (ctx && ctx->execution_failed) return;
     if (!ctx || !ctx->hipblas || !A || !B || !C) {
+        if (ctx) ctx->execution_failed = 1;
         set_err("cuda_cublas_hgemm_strided_batched", "hipBLAS unavailable");
         return;
     }
@@ -567,7 +605,7 @@ void cuda_cublas_hgemm_strided_batched(CudaCtx* ctx, unsigned trans_a, unsigned 
         bp, HIP_R_16F, (int)ldb, (hipblasStride)stride_b,
         &beta, cp, HIP_R_32F, (int)ldc, (hipblasStride)stride_c,
         (int)batch_count, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
-    if (status != HIPBLAS_STATUS_SUCCESS) set_err("hipblasGemmStridedBatchedEx", "failed");
+    if (status != HIPBLAS_STATUS_SUCCESS) { ctx->execution_failed = 1; set_err("hipblasGemmStridedBatchedEx", "failed"); }
 }
 
 void cuda_cublas_sgemm_strided_batched(CudaCtx* ctx, unsigned trans_a, unsigned trans_b,
@@ -576,7 +614,9 @@ void cuda_cublas_sgemm_strided_batched(CudaCtx* ctx, unsigned trans_a, unsigned 
                                        CudaBuf* B, size_t b_offset, unsigned ldb, int64_t stride_b,
                                        CudaBuf* C, size_t c_offset, unsigned ldc, int64_t stride_c,
                                        unsigned batch_count, float beta) {
+    if (ctx && ctx->execution_failed) return;
     if (!ctx || !ctx->hipblas || !A || !B || !C) {
+        if (ctx) ctx->execution_failed = 1;
         set_err("cuda_cublas_sgemm_strided_batched", "hipBLAS unavailable");
         return;
     }
@@ -593,7 +633,7 @@ void cuda_cublas_sgemm_strided_batched(CudaCtx* ctx, unsigned trans_a, unsigned 
         bp, (int)ldb, (hipblasStride)stride_b,
         &beta, cp, (int)ldc, (hipblasStride)stride_c,
         (int)batch_count);
-    if (status != HIPBLAS_STATUS_SUCCESS) set_err("hipblasSgemmStridedBatched", "failed");
+    if (status != HIPBLAS_STATUS_SUCCESS) { ctx->execution_failed = 1; set_err("hipblasSgemmStridedBatched", "failed"); }
 }
 
 // ---- HIP graphs (decode capture/replay) -------------------------------------
@@ -610,16 +650,16 @@ CudaGraph* cuda_graph_create(void) {
 }
 
 int cuda_graph_begin(CudaCtx* ctx) {
-    if (!ctx) return 0;
+    if (!ctx || ctx->execution_failed) return 0;
     hipSetDevice(ctx->device);
-    return hip_ok(hipStreamBeginCapture(ctx->stream, hipStreamCaptureModeRelaxed),
+    return execution_ok(ctx, hipStreamBeginCapture(ctx->stream, hipStreamCaptureModeRelaxed),
                   "hipStreamBeginCapture");
 }
 
 int cuda_graph_end_launch(CudaCtx* ctx, CudaGraph* cached) {
     if (!ctx || !cached) return 0;
     hipGraph_t graph = NULL;
-    if (!hip_ok(hipStreamEndCapture(ctx->stream, &graph), "hipStreamEndCapture")) return 0;
+    if (!execution_ok(ctx, hipStreamEndCapture(ctx->stream, &graph), "hipStreamEndCapture")) return 0;
 
     if (cached->have_exec) {
         hipGraphNode_t error_node = NULL;
@@ -632,7 +672,7 @@ int cuda_graph_end_launch(CudaCtx* ctx, CudaGraph* cached) {
         }
     }
     if (!cached->have_exec) {
-        if (!hip_ok(hipGraphInstantiate(&cached->exec, graph, NULL, NULL, 0),
+        if (!execution_ok(ctx, hipGraphInstantiate(&cached->exec, graph, NULL, NULL, 0),
                     "hipGraphInstantiate")) {
             hipGraphDestroy(graph);
             return 0;
@@ -640,8 +680,8 @@ int cuda_graph_end_launch(CudaCtx* ctx, CudaGraph* cached) {
         cached->have_exec = 1;
     }
     hipGraphDestroy(graph);
-    if (!hip_ok(hipGraphLaunch(cached->exec, ctx->stream), "hipGraphLaunch")) return 0;
-    return hip_ok(hipStreamSynchronize(ctx->stream), "hipStreamSynchronize(graph)");
+    if (!execution_ok(ctx, hipGraphLaunch(cached->exec, ctx->stream), "hipGraphLaunch")) return 0;
+    return execution_ok(ctx, hipStreamSynchronize(ctx->stream), "hipStreamSynchronize(graph)");
 }
 
 void cuda_graph_free(CudaGraph* graph) {

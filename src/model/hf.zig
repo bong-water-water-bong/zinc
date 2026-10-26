@@ -5,6 +5,7 @@
 //! `/v2/<repo>/manifests/<tag>` endpoint and reusing the managed download
 //! pipeline for transfer, staging, and manifest bookkeeping.
 const std = @import("std");
+const host_io = @import("host_io");
 const catalog = @import("catalog.zig");
 const config = @import("config.zig");
 const managed = @import("managed.zig");
@@ -217,7 +218,7 @@ const HttpBody = struct {
 };
 
 fn httpGetJson(allocator: std.mem.Allocator, url: []const u8) !HttpBody {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = host_io.io };
     defer client.deinit();
 
     const uri = try std.Uri.parse(url);
@@ -353,7 +354,7 @@ fn printUnsupportedQuant(writer: anytype, name: []const u8, marker: []const u8) 
 fn findRejectedQuantMarker(text: []const u8) ?[]const u8 {
     for (rejected_quant_markers) |marker| {
         var start: usize = 0;
-        while (std.ascii.indexOfIgnoreCasePos(text, start, marker)) |idx| : (start = idx + 1) {
+        while (std.ascii.findIgnoreCasePos(text, start, marker)) |idx| : (start = idx + 1) {
             const end = idx + marker.len;
             const bounded_left = idx == 0 or !std.ascii.isAlphanumeric(text[idx - 1]);
             const bounded_right = end == text.len or !std.ascii.isAlphanumeric(text[end]);
@@ -521,7 +522,7 @@ test "findRejectedQuantMarker requires token boundaries" {
 }
 
 test "findRejectedQuantMarker scans names longer than 256 bytes" {
-    const long_name = "m" ** 300 ++ "-Q2_K.gguf";
+    const long_name = host_io.repeatText("m", 300) ++ "-Q2_K.gguf";
     try std.testing.expectEqualStrings("q2_k", findRejectedQuantMarker(long_name).?);
 }
 

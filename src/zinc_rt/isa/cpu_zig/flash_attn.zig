@@ -97,9 +97,9 @@ test "flash attention produces identity attention for matching q and k" {
     const q = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const kv_k = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const kv_v = [_]f32{ 0.5, 1.0, 1.5, 2.0 };
-    var output = [_]f32{0} ** 4;
-    var scores = [_]f32{0} ** 1;
-    var probs = [_]f32{0} ** 1;
+    var output = @as([4]f32, @splat(0));
+    var scores = @as([1]f32, @splat(0));
+    var probs = @as([1]f32, @splat(0));
     const sinks = [_]f32{std.math.nan(f32)};
 
     try run(.{

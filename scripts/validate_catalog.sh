@@ -22,7 +22,7 @@ if [ -z "$GPU" ]; then
   exit 2
 fi
 LCPP=${LLAMA_CPP:-$HOME/workspace/llama.cpp}
-ZIG=${ZIG:-$HOME/zig-0.15.2/zig}
+ZIG=${ZIG:-./scripts/zig.sh}
 MD=${ZINC_MODELS:-$HOME/workspace/models}
 PROMPT=${ZINC_PROMPT:-The capital of France is}
 NGEN=${ZINC_NGEN:-12}

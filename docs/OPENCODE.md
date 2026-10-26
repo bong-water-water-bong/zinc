@@ -1,222 +1,321 @@
-# Configure OpenCode with ZINC and Qwen
+# OpenCode coding harness
 
-OpenCode can use ZINC as a local OpenAI-compatible coding backend for Qwen-family models. This is the practical setup for running an OpenCode local LLM workflow with ZINC instead of a hosted coding model:
+Use OpenCode with a Qwen model served by ZINC. The
+[setup script](https://github.com/zolotukhin/zinc/blob/main/tools/setup_opencode.mjs)
+creates a project configuration, checks the API, and runs tasks headlessly.
+It requires **Bun 1.4.4 or newer**. This workflow is tested with
+**OpenCode 1.19.4**.
 
-1. run a ZINC server with a Qwen-family coding-capable model,
-2. point OpenCode at `http://127.0.0.1:<port>/v1`,
-3. keep tool calling enabled,
-4. set realistic context and output limits for the model and machine,
-5. optionally put the ZINC OpenCode trace proxy between OpenCode and ZINC while you are testing.
+[Download the standalone script](/zinc/harnesses/setup-opencode.mjs), or use
+`tools/setup_opencode.mjs` from a ZINC checkout. The downloaded script has no
+package dependencies and accepts the same arguments.
 
-This page intentionally uses only localhost URLs and placeholder environment variables. Do not commit private hosts, SSH ports, API keys, model paths, or `.env` files.
+## Start the model server
 
-OpenCode reference pages:
-
-- OpenCode provider config: https://opencode.ai/docs/providers/
-- OpenCode config files, `model`, `small_model`, and environment substitution: https://opencode.ai/docs/config/
-
-## Start ZINC
-
-Build ZINC and start the server on a local port:
+Build for [your GPU](GETTING_STARTED.md), then start a Qwen model with enough
+context for source files, tool definitions, and tool results:
 
 ```bash
-zig build -Doptimize=ReleaseFast
-
-# Linux AMD/RDNA shells should enable cooperative matrix support.
-export RADV_PERFTEST=coop_matrix
-
-# Use a managed model id when possible.
-./zig-out/bin/zinc \
-  --model-id qwen36-35b-a3b-q4k-xl \
-  -p 9090
+./zig-out/bin/zinc --model-id qwen38-27b-q4k-m -c 32768 -p 9090 --parallel 1
 ```
 
-Check that the server is alive:
+The model must fit your GPU. Qwen 3.5 9B is a smaller starting point; Qwen 3.8
+27B Q4_K_M is the dense model tested on a Radeon AI PRO R9700 with ROCm. For
+ROCm, follow the [backend setup](ROCM.md) and select your own device using
+`ROCR_VISIBLE_DEVICES`. An existing GGUF can be supplied with
+`-m /path/to/model.gguf` instead of a managed ID.
+
+Use a server build with tool-call support. The setup check reports missing
+support before you start a coding task. ZINC generates tool calls; OpenCode
+reads files, edits code, and runs commands on the machine where OpenCode runs.
+
+For ROCm repository tasks, the validated 32K configuration leaves more room for
+source and tool
+history. [Bounded prefill and attention](ROCM_AGENT_CONTEXT.md) have been checked
+with 27B prompts up to 30,048 tokens. Optional `ZINC_PROMPT_CACHE=1` reuses exact
+prefixes between single-slot Qwen requests. Neither a larger context nor a
+faster prefill establishes that the model will finish a coding task.
+For Qwen 3.8 27B's larger native window, see the [Q8 context guide](ROCM_NATIVE_CONTEXT.md)
+and pass the server's actual capacity to setup. The 32K example is not a model limit.
+
+## Configure OpenCode
+
+From the ZINC checkout:
 
 ```bash
-curl -fsS http://127.0.0.1:9090/health
-curl -fsS http://127.0.0.1:9090/v1/models
+bun install --global opencode-ai@1.19.4
+
+bun tools/setup_opencode.mjs \
+  --project ../my-project \
+  --model qwen38-27b-q4k-m \
+  --context 32768
+
+bun tools/setup_opencode.mjs check --project ../my-project
 ```
 
-ZINC does not require an API key for local use. Some clients still expect one to exist; use a harmless local placeholder:
+To configure a project without cloning ZINC, download the same script and run it
+with Bun:
 
 ```bash
-export ZINC_API_KEY=local
+curl -fsS https://zolotukhin.ai/zinc/harnesses/setup-opencode.mjs -o setup-opencode.mjs
+bun setup-opencode.mjs --project ../my-project --context 32768
+bun setup-opencode.mjs check --project ../my-project
 ```
 
-## Pick A Qwen Coding Model
+Use `bun setup-opencode.mjs run` for the headless commands below when using the
+downloaded file.
 
-For OpenCode, prefer a Qwen/ChatML-family model because ZINC's thinking and tool-call path is built around that template family.
+Setup creates **`opencode.zinc.json`** and a small, versioned context hook in
+**`.zinc/`** in the target project. Keep both when sharing the setup. It leaves
+`opencode.json`, global settings, authentication files, and existing generated
+configs alone. To update an existing setup, rerun setup with `--force`. The
+helper replaces only its generated config and preserves unrelated hook files.
 
-Good starting points:
-
-- `qwen36-35b-a3b-q4k-xl`: best fit for a large local coding assistant on a 32 GB-class GPU or enough unified memory.
-- `qwen35-9b-q4k-m`: smaller, easier to run, and useful for validating OpenCode tool calls before moving to a larger model.
-- `qwen38-27b-q4k-m`: supported dense Qwen target on validated AMD RDNA4 32 GB and Apple Silicon 32+ GB systems.
-
-The model you put in OpenCode's `model` field should match an installed ZINC managed model id. Check available and installed models with:
+To preview the exact configuration without writing anything, use `--dry-run`
+(setup only). It prints the same JSON, including the trailing newline, and
+creates no directories, hook, or config files:
 
 ```bash
-./zig-out/bin/zinc model list
-./zig-out/bin/zinc model active
+bun tools/setup_opencode.mjs --dry-run --context 32768
 ```
 
-## If OpenCode Runs On A Different Machine
+The default limits are 16,384 context tokens, 4,096 output tokens per turn,
+and 24 agent steps. Match `--context` to the actual server context; it is not
+a request to allocate more memory on the server. Use `--output` and `--steps`
+to change the other limits. A coding session needs at least 8,192 tokens;
+16,384 fits the fixture tasks; use 32,768 for substantial repository work when
+the model and cache fit your GPU. At smaller
+context limits, the default output budget is one quarter of the context.
 
-Keep ZINC bound to localhost on the GPU machine, then forward it to your laptop:
+The configuration uses `@ai-sdk/openai-compatible`, keeps both the main model
+and small-model requests on ZINC, and disables automatic sharing. The local
+coding agent uses greedy decoding and excludes delegation and web tools.
+It does not install a formatter or LSP server.
+
+The local [OpenCode hook](https://opencode.ai/docs/plugins/) caps file reads at
+80 lines and shortens tool output above 6,000 characters, retaining the start
+and end with an explicit truncation notice. Reads can continue with `offset`
+and `limit`. Compaction reserves space for incoming tool results as well as
+generated output. Headless runs load this hook; OpenCode's `--pure` mode would
+disable it. Large histories can still exceed the context, so API errors remain
+failures rather than successful coding runs.
+
+`check` verifies health, a JSON chat completion, a JSON tool call, and a
+streaming tool call with a terminal finish reason. It never executes the
+probe's requested tool. A successful health response alone does not establish
+coding-agent compatibility.
+
+## Run a headless task
 
 ```bash
-# Run this on the machine where OpenCode runs.
-# Fill these from your own shell or password manager. Do not commit them.
-export ZINC_REMOTE_USER="<user>"
-export ZINC_REMOTE_HOST="<host>"
-export ZINC_REMOTE_SSH_PORT="<ssh-port>"
-
-ssh -N \
-  -L 9090:127.0.0.1:9090 \
-  -p "$ZINC_REMOTE_SSH_PORT" \
-  "$ZINC_REMOTE_USER@$ZINC_REMOTE_HOST"
+bun tools/setup_opencode.mjs run \
+  --project ../my-project \
+  --auto -- "Fix the failing tests. Read the relevant files, edit the source, and run the tests."
 ```
 
-OpenCode should still use `http://127.0.0.1:9090/v1`. The tunnel hides the private host and keeps the OpenCode config portable.
+The command requires a nonempty task after `--`, including when using
+`--verify`. It streams OpenCode JSON events and propagates its exit status.
+An OpenCode JSON error event stops the child and fails the run, even when the
+CLI exits zero; independent verification cannot mask that error. The default
+timeout is 15 minutes; `--timeout-ms` changes it, and a timeout exits with status 124.
+Task and round timeouts must be integer milliseconds from 1 to 2,147,483,647.
+To continue a previous session, pass `--session ID` using the `sessionID` from
+its JSON events.
+`--auto` lets OpenCode approve tool requests for this headless run; explicit
+deny rules still apply. Use a disposable checkout for evaluation tasks.
 
-## Direct OpenCode Config
-
-Create or update `opencode.json` in the project where you run OpenCode:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "zinc/qwen36-35b-a3b-q4k-xl",
-  "small_model": "zinc/qwen36-35b-a3b-q4k-xl",
-  "provider": {
-    "zinc": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "ZINC",
-      "options": {
-        "baseURL": "http://127.0.0.1:9090/v1",
-        "apiKey": "{env:ZINC_API_KEY}"
-      },
-      "models": {
-        "qwen36-35b-a3b-q4k-xl": {
-          "name": "Qwen3.6 35B A3B on ZINC",
-          "limit": {
-            "context": 4096,
-            "output": 2048
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-Tune the limits to the context length you start ZINC with and the amount of VRAM or unified memory available. If the model was launched with a smaller context, keep `limit.context` at or below that server-side limit. Use a lower `output` value such as `1024` if coding turns are slow or you are testing tool behavior.
-
-## Recommended Trace Proxy Setup
-
-For real coding work, use the trace proxy while ZINC's OpenCode compatibility is still evolving. It keeps the upstream URL local, records request/response traces, can force thinking mode, caps output length, and repairs common local-tool path issues.
-
-Start ZINC on `9090`, then start the proxy on `9091`:
+To enforce a project check between editing rounds, pass `--verify`:
 
 ```bash
-bun tools/opencode_trace_proxy.mjs \
-  --upstream http://127.0.0.1:9090/v1 \
-  --listen 9091 \
-  --force-enable-thinking true \
-  --force-tool-choice auto \
-  --max-tokens-cap 2048 \
-  --inject-path-guard \
-  --repair-tool-paths
+bun tools/setup_opencode.mjs run --project ../my-project --auto \
+  --verify 'bun test' --attempts 3 --timeout-ms 1200000 -- \
+  "Implement the agreed feature and pass the project tests."
 ```
 
-Then point OpenCode at the proxy instead of the server:
+The caller-supplied command runs in the selected project after each completed
+or timed-out editing round. A failed check feeds real diagnostic excerpts back
+into the same session. Feedback is bounded, retaining the start, selected error lines, and end
+of a long log; the complete check output still streams to stderr.
+Each editing round is capped at eight model steps; `--attempts` defaults to
+three and allows at most ten. An editing round also has a five-minute deadline;
+use `--round-timeout-ms` to change it. The wrapper reserves up to a minute
+(one quarter of the remaining overall budget) for an independent check.
+If editing times out, the wrapper stops that OpenCode process and checks the
+partial patch. A passing check can finish the task; a failed check resumes the
+same session when attempts and time remain. API errors and user cancellation
+fail immediately. Round starts, deadlines, and check results appear on stderr,
+while stdout remains the OpenCode JSON event stream.
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "zinc/qwen36-35b-a3b-q4k-xl",
-  "small_model": "zinc/qwen36-35b-a3b-q4k-xl",
-  "provider": {
-    "zinc": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "ZINC via local trace proxy",
-      "options": {
-        "baseURL": "http://127.0.0.1:9091/v1",
-        "apiKey": "{env:ZINC_API_KEY}"
-      },
-      "models": {
-        "qwen36-35b-a3b-q4k-xl": {
-          "name": "Qwen3.6 35B A3B on ZINC",
-          "limit": {
-            "context": 4096,
-            "output": 2048
-          }
-        }
-      }
-    }
-  }
-}
-```
+The overall timeout covers editing and checks; a check finishing after the
+deadline cannot turn the run into a success. Interrupted/timed-out checks
+and exhausted attempts return a failure. Only a zero check status produces
+success. On POSIX systems, the wrapper also stops remaining processes in each
+owned child group, including background tools left after the main child exits.
+Choose a check that actually covers the requested feature, and protect
+acceptance tests when evaluating a model. The command is used at runtime and
+is not written into the portable configuration.
 
-Trace files are written under `/tmp/zinc-opencode-traces` by default. They may contain prompts, source snippets, tool arguments, and generated output, so treat them like local development artifacts and do not publish them blindly.
-
-## Thinking And Tools
-
-ZINC exposes thinking and OpenAI-style tool calling through `/v1/chat/completions`.
-
-- Thinking: request body field `enable_thinking: true`. The trace proxy can force this with `--force-enable-thinking true` when the client does not expose a setting.
-- Tool calling: enabled by default for ChatML/Qwen-family models. ZINC renders tool definitions, parses model-emitted `<tool_call>` blocks, and returns structured `tool_calls`.
-- Tool execution: ZINC does not execute tools itself. OpenCode executes local tools and sends the results back as `role: "tool"` messages.
-- Disabling tools: start ZINC with `ZINC_TOOL_CALLING=0` only when you are debugging plain chat behavior. Do not disable it for OpenCode coding sessions.
-
-## Quick Smoke Test
-
-Start in a disposable project:
+For an interactive session, change into your project and select the generated
+configuration:
 
 ```bash
-mkdir -p /tmp/zinc-opencode-smoke/src /tmp/zinc-opencode-smoke/test
-cd /tmp/zinc-opencode-smoke
-
-cat > src/math.mjs <<'JS'
-export function add(a, b) {
-  return a - b;
-}
-JS
-
-cat > test/math.test.mjs <<'JS'
-import { strict as assert } from "node:assert";
-import { add } from "../src/math.mjs";
-
-assert.equal(add(2, 3), 5);
-console.log("1 pass");
-JS
-
-node test/math.test.mjs
+OPENCODE_CONFIG=./opencode.zinc.json opencode
 ```
 
-Then run OpenCode in that directory and ask:
+OpenCode merges configuration sources. The script's `run` command supplies
+its provider/model configuration as a runtime override so an existing project
+model selection does not switch the task to a hosted provider.
 
-```text
-Fix the failing test. Read the source and test files first. Do not stop until `node test/math.test.mjs` passes.
+## Try a real task in a worktree
+
+A Git worktree gives OpenCode a complete checkout and its own branch. It uses
+the same coding loop as a regular project: read files, request edits, run
+commands, inspect the results, and continue. The model proposes tool calls;
+OpenCode executes them in the selected directory.
+
+With a model server already running at the matching context limit:
+
+```bash
+git worktree add -b experiment/opencode ../zinc-opencode HEAD
+bun tools/setup_opencode.mjs --project ../zinc-opencode \
+  --context 32768 --output 3072 --steps 24
+bun tools/setup_opencode.mjs check --project ../zinc-opencode
+bun tools/setup_opencode.mjs run --project ../zinc-opencode \
+  --auto --timeout-ms 1200000 --verify './scripts/zig.sh build test' -- \
+  "Implement the agreed feature. Read source in ranges of at most 80 lines, edit the code, and run the CPU unit tests. Follow AGENTS.md. Do not start model servers or commit changes. Report actual test results."
+git -C ../zinc-opencode diff --stat
+git -C ../zinc-opencode diff
 ```
 
-A healthy run should read files, edit `src/math.mjs`, run the test, and finish only after the test passes.
+Keep JSON event logs outside the checkout. Monitor completed tool calls, the
+diff, test output, and the model server log. Run acceptance checks independently
+before accepting the patch. Short project instructions leave more context for
+source code; ZINC's detailed code map and benchmark recipes live in linked
+reference guides rather than the agent entrypoint.
+
+The **2026-10-25 full-worktree trial failed** to implement its assigned
+`GET /v1/models` feature. Across eight configurations, OpenCode made 57 tool
+calls, produced no feature edits, and ran no project tests. The runs exposed
+context overflow, repeated inspection after compaction, GPU allocation
+failure, and attention-kernel failures with corrupted output. Two sessions
+returned exit status zero without completing the task. The earlier fixture
+results remain separate from this repository-level result. See the
+[worktree report](OPENCODE_WORKTREE_REPORT.md) and
+[ROCm context limits](ROCM.md#long-coding-sessions).
+
+The [follow-up](ROCM_AGENT_CONTEXT.md#repository-coding-result) fixes the backend
+memory/attention failures and records further supervised attempts. The latest
+27B repair produced code passing CPU tests and ROCm compilation, but the overall
+verified run still timed out. A later GPU power-resume failure blocks the next
+live acceptance run. General repository coding remains a supervised workflow.
+
+## Use your own endpoint
+
+The generated file always contains a loopback URL and an environment reference
+for the key. For `run` and `check`, supply any endpoint override in your shell:
+
+```bash
+export ZINC_API_BASE_URL="http://127.0.0.1:9090/v1"
+export ZINC_API_KEY="local"
+```
+
+A local ZINC server does not require an API key; `local` is a client placeholder.
+Use your own key when connecting through an authenticated gateway. Neither
+the endpoint override nor the key value is saved to the generated file.
+`OPENCODE_BIN` can select an existing OpenCode executable at runtime.
+
+If the GPU is remote, an SSH tunnel lets the configuration keep using
+localhost. Fill these variables in your own shell:
+
+```bash
+ssh -N -L 9090:127.0.0.1:9090 \
+  -p "${ZINC_PORT:?Set your SSH port}" \
+  "${ZINC_USER:?Set your SSH user}@${ZINC_HOST:?Set your SSH host}"
+```
+
+## Check the harness without a model
+
+In a ZINC checkout, run the actual OpenCode CLI against local scripted responses:
+
+```bash
+bun tools/validate_opencode_harness.mjs --output /tmp/zinc-harness-check
+```
+
+This checks timeout/repair in the same session, independent failing/passing
+checks, fatal API errors that must skip verification, and the actual file-read
+and command-output limits. The acceptance test
+and portable configuration must remain unchanged. It needs Bun and an installed
+OpenCode CLI; `--opencode FILE` or `OPENCODE_BIN` selects a different executable.
+CI runs it with OpenCode 1.19.4.
+
+Choose a fresh output directory. Its `result.json` contains portable outcomes;
+raw event and check logs stay in that directory. The default fixture includes
+an intentional 15-second stall. No model performs inference in these checks,
+and the results do not establish coding quality or inference performance.
+Use the live-server evaluation below for those questions.
+
+## Evaluate coding tasks
+
+Run the reproducible evaluation against an already running server:
+
+```bash
+bun tools/opencode_eval.mjs --list
+bun tools/opencode_eval.mjs --manage-proxy --fixtures all
+bun tools/validate_opencode_api.mjs
+```
+
+The suite creates disposable projects and drives actual `opencode run`
+sessions. It covers a snapshot of Zinc's CLI validation code, a rate limiter,
+multiple-file cart and formatter fixes, a duration parser, source-only edits,
+a long policy specification, Unicode and spaces in file paths, CSV escaping,
+and a Python NDJSON CLI. The CLI snapshot is frozen so fixing the real project
+does not erase the reproducible test case.
+
+Every task starts with failing tests. After OpenCode exits, the harness runs
+the tests independently and checks that protected tests and specifications
+were unchanged. A timeout, agent error, failed test, or synthetic proxy response
+fails the task. Evaluation exits nonzero when any task fails.
+
+`--context`, `--max-tokens-cap`, and `--timeout-ms` control the server-context
+assumption, output budget, and per-task timeout. Use `--output DIR` to choose a
+local artifact directory. These settings do not start or reconfigure ZINC.
+
+The managed proxy is **transparent by default**: it forwards the model's
+request/response bytes and records traces. Normal setup uses ZINC directly.
+The old proxy's `--compat` mode can synthesize responses and source edits;
+keep it out of model evaluations. Report results obtained with any repair or
+synthetic behavior separately.
+
+The API checks cover JSON/SSE parity, small token budgets, Unicode, tool
+arguments, tool-result history, invalid requests, context overflow, queued
+requests, streaming cancellation, and a prompt above the former 8K SSM limit.
+Run them on a server with at least the default 16K context. Their report
+contains check names, outcomes, and durations; it omits endpoints, local paths,
+and response transcripts.
+
+ZINC selects Qwen's JSON or XML function-call dialect from the loaded model's
+template. Native XML calls retain multiline source strings, use the tool schema
+for typed arguments, and round-trip through OpenCode's tool-result history.
+Malformed or incomplete calls remain text; the server does not invent edits
+or arguments to make a task pass.
 
 ## Troubleshooting
 
-| Symptom | What to check |
-|---------|---------------|
-| OpenCode cannot connect | `curl http://127.0.0.1:9090/health` from the OpenCode machine, or `9091` if using the proxy. |
-| It connects but never calls tools | Make sure you are using `/v1/chat/completions`, tool calling is not disabled, and the model is a Qwen/ChatML-family model with tool support. |
-| It runs out of context | Lower OpenCode `limit.context`, lower `limit.output`, or start ZINC with a larger server context if the machine has memory headroom. |
-| It writes strange paths | Use the trace proxy with `--inject-path-guard --repair-tool-paths`. |
-| The answer is too short | Raise `limit.output` and the proxy `--max-tokens-cap`, then retry. |
-| The answer is slow | Test the same request with `curl` against ZINC, then compare the proxy traces to see whether time is in model generation, repeated tool calls, or a failing loop. |
+| Symptom                             | Check                                                                                                                |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Health or chat check fails          | Confirm the server is running and `ZINC_API_BASE_URL` ends in `/v1`.                                                 |
+| Tool check fails                    | Update ZINC, use a Qwen/ChatML model, and keep `ZINC_TOOL_CALLING` enabled.                                          |
+| Context overflow                    | Match the configured context to the server and leave room for output and tool results.                               |
+| Agent exits without fixing the task | Inspect JSON error/tool events and run the project's tests independently; exit status alone is not proof of success. |
+| Task hits the step or output limit  | Increase `--steps` or `--output` when configuring the project, within the actual context budget.                     |
+| OpenCode cannot be found            | Install the pinned version or set `OPENCODE_BIN` in your shell.                                                      |
 
-## Security Notes
+Generated configs are portable. Runtime logs and traces can contain local
+paths, source files, prompts, and tool output; keep them outside git and review
+anything you intend to publish. No private endpoint, machine path, credential,
+or raw session transcript belongs in a public setup example.
 
-- Bind ZINC and the proxy to localhost unless you are deliberately building a trusted internal service.
-- Use SSH tunnels instead of public GPU-node URLs.
-- Keep real hosts, SSH ports, usernames, tokens, model paths, and traces out of git.
-- Do not paste private source or trace files into public issues unless you have reviewed them.
+References: [OpenCode providers](https://opencode.ai/docs/providers/),
+[configuration](https://opencode.ai/docs/config/),
+[headless CLI](https://opencode.ai/docs/cli/), and
+[permissions](https://opencode.ai/docs/permissions/).

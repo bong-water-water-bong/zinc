@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_io = @import("host_io");
 const support = @import("zinc_bench_support");
 const metal_device = support.metal_device;
 const metal_command = support.metal_command;
@@ -32,15 +33,15 @@ const GemmPush = extern struct {
 fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
     var path_buf: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "src/shaders/metal/{s}.metal", .{name}) catch return error.PathTooLong;
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.ShaderNotFound;
-    defer file.close();
-    const stat = try file.stat();
+    const file = std.Io.Dir.cwd().openFile(host_io.io, path, .{}) catch return error.ShaderNotFound;
+    defer file.close(host_io.io);
+    const stat = try file.stat(host_io.io);
     if (stat.size > 1024 * 1024) return error.ShaderTooLarge;
     var source_buf: [1024 * 1024 + 1]u8 = undefined;
-    const bytes_read = try file.readAll(source_buf[0 .. source_buf.len - 1]);
+    const bytes_read = try host_io.readAll(file, source_buf[0 .. source_buf.len - 1]);
     source_buf[bytes_read] = 0;
     var fn_buf: [16]u8 = undefined;
-    const fn_name = try std.fmt.bufPrintZ(&fn_buf, "main0", .{});
+    const fn_name = try std.fmt.bufPrintSentinel(&fn_buf, "main0", .{}, 0);
     return metal_pipeline.createPipeline(ctx, @ptrCast(&source_buf), fn_name);
 }
 
@@ -114,19 +115,20 @@ fn benchShape(
         cmd.commitAndWait();
     }
 
-    const start = std.time.nanoTimestamp();
+    const start = host_io.nanoTimestamp();
     var cmd = try metal_command.beginCommand(ctx);
     for (0..iters) |_| {
         cmd.dispatchV2WithTgMem(pipe, grid, block, &bufs, &push, @sizeOf(GemmPush), 0, tg_mem);
     }
     cmd.commitAndWait();
-    const end = std.time.nanoTimestamp();
+    const end = host_io.nanoTimestamp();
 
     return @as(f64, @floatFromInt(end - start)) / @as(f64, @floatFromInt(iters));
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -166,7 +168,7 @@ pub fn main() !void {
     defer metal_buffer.freeBuffer(&y_buf);
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     try stdout.interface.print(
         "gemm_q4k microbenchmark | GPU={s} | tgmem_max={d} KiB\n\n",
         .{ @tagName(device.chip), device.maxThreadgroupMemoryLength() / 1024 },

@@ -5,6 +5,7 @@
 //! managed model fits once runtime allocations and KV reservation are included.
 //! @section Hardware Detection
 const std = @import("std");
+const host_io = @import("host_io");
 const builtin = @import("builtin");
 const metal_c = @import("metal/c.zig").shim;
 const metal_device = @import("metal/device.zig");
@@ -51,13 +52,13 @@ pub const ManagedModelInfo = struct {
 const Styles = struct {
     enabled: bool,
 
-    fn detect(stdout_file: std.fs.File) Styles {
-        const no_color = std.posix.getenv("NO_COLOR") != null;
+    fn detect(stdout_file: std.Io.File) Styles {
+        const no_color = host_io.getenv("NO_COLOR") != null;
         const force_color =
-            isTruthy(std.posix.getenv("FORCE_COLOR")) or
-            isTruthy(std.posix.getenv("CLICOLOR_FORCE"));
+            isTruthy(host_io.getenv("FORCE_COLOR")) or
+            isTruthy(host_io.getenv("CLICOLOR_FORCE"));
         return .{
-            .enabled = shouldUseColor(stdout_file.isTty(), std.posix.getenv("TERM"), no_color, force_color),
+            .enabled = shouldUseColor((stdout_file.isTty(host_io.io) catch false), host_io.getenv("TERM"), no_color, force_color),
         };
     }
 
@@ -197,9 +198,9 @@ const required_shader_files = [_][]const u8{
 /// @param allocator  Used for Metal device initialisation and GGUF header inspection.
 /// @returns `error.DiagnosticsFailed` when one or more checks emit a FAIL status; otherwise succeeds or propagates I/O errors.
 pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
-    const stdout_file = std.fs.File.stdout();
+    const stdout_file = std.Io.File.stdout();
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = stdout_file.writerStreaming(&stdout_buffer);
+    var stdout_writer = stdout_file.writerStreaming(host_io.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
     const styles = Styles.detect(stdout_file);
     var summary = Summary{};
@@ -207,7 +208,7 @@ pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
     try stdout.print("\n=== ZINC System Diagnostics ===\n", .{});
     try stdout.flush();
 
-    const step1_start = std.time.nanoTimestamp();
+    const step1_start = host_io.nanoTimestamp();
     try printStepHeader(stdout, styles, 1, 4, "Host Environment");
     try printStatusLine(stdout, styles, &summary, if (builtin.os.tag == .macos) .ok else .fail, "OS", "{s}", .{@tagName(builtin.os.tag)});
     try printStatusLine(stdout, styles, &summary, if (builtin.cpu.arch == .aarch64) .ok else .fail, "CPU arch", "{s}", .{@tagName(builtin.cpu.arch)});
@@ -217,7 +218,7 @@ pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
     var maybe_device: ?MetalDevice = null;
     defer if (maybe_device) |*device| device.deinit();
 
-    const step2_start = std.time.nanoTimestamp();
+    const step2_start = host_io.nanoTimestamp();
     try printStepHeader(stdout, styles, 2, 4, "Metal Device");
     try printCheckingLine(stdout, styles, "Metal device init and capability query");
     if (MetalDevice.init(allocator, opts.device_index)) |device| {
@@ -291,7 +292,7 @@ pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
     }
     try printStepDuration(stdout, styles, step2_start);
 
-    const step3_start = std.time.nanoTimestamp();
+    const step3_start = host_io.nanoTimestamp();
     try printStepHeader(stdout, styles, 3, 4, "Metal Runtime Assets");
     try printCheckingLine(stdout, styles, "Metal shader sources");
     const shader_dir = if (opts.shader_dir.len == 0) "src/shaders/metal" else opts.shader_dir;
@@ -337,7 +338,7 @@ pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
     }
     try printStepDuration(stdout, styles, step3_start);
 
-    const step4_start = std.time.nanoTimestamp();
+    const step4_start = host_io.nanoTimestamp();
     try printStepHeader(stdout, styles, 4, 4, "Model File");
     if (opts.managed_model) |managed| {
         try printStatusLine(stdout, styles, &summary, .ok, "Managed model", "{s} ({s})", .{ managed.id, managed.status_label });
@@ -522,23 +523,23 @@ pub fn estimateUnifiedFit(
     };
 }
 
-fn inspectShaderSourcesInDir(dir: std.fs.Dir) ShaderSourceCheck {
+fn inspectShaderSourcesInDir(dir: std.Io.Dir) ShaderSourceCheck {
     var check = ShaderSourceCheck{};
     for (required_shader_files) |name| {
-        const file = dir.openFile(name, .{}) catch {
+        const file = dir.openFile(host_io.io, name, .{}) catch {
             if (check.first_missing == null) check.first_missing = name;
             continue;
         };
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
         check.found += 1;
     }
     return check;
 }
 
 fn inspectShaderSources(dir_path: []const u8) !ShaderSourceCheck {
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(host_io.io, dir_path, .{});
+    defer dir.close(host_io.io);
     return inspectShaderSourcesInDir(dir);
 }
 
@@ -606,7 +607,7 @@ fn printDetailLine(writer: anytype, label: []const u8, comptime value_fmt: []con
 }
 
 fn printStepDuration(writer: anytype, styles: Styles, start_ns: i128) !void {
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = host_io.nanoTimestamp() - start_ns;
     try printStyled(writer, styles, "2", "  Step time: ", .{});
     try printDurationValue(writer, elapsed_ns);
     try writer.print("\n", .{});
@@ -681,7 +682,7 @@ test "inspectShaderSources reports all shaders present" {
     defer tmp.cleanup();
 
     for (required_shader_files) |name| {
-        try tmp.dir.writeFile(.{ .sub_path = name, .data = "" });
+        try tmp.dir.writeFile(host_io.io, .{ .sub_path = name, .data = "" });
     }
 
     const check = inspectShaderSourcesInDir(tmp.dir);

@@ -12,9 +12,10 @@
 //!
 //! Build + run (on the box):
 //!   cd ~/zinc5090 && CUDA_HOME=/usr/local/cuda \
-//!     ~/zig-0.15.2/zig build cuda-loadtest -Dbackend=cuda -- <model.gguf>
+//!     ./scripts/zig.sh build cuda-loadtest -Dbackend=cuda -- <model.gguf>
 //! @section CUDA Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 const device = @import("cuda/device.zig");
 const loader = @import("model/loader_cuda.zig");
 
@@ -23,13 +24,14 @@ const DEFAULT_MODEL = "models/Qwen3.5-9B-Q4_K_M.gguf";
 /// Load a GGUF onto the GPU via loader_cuda and print a structured report.
 /// @returns Propagates loader errors (init/open/parse/upload) so the build step
 /// surfaces a nonzero exit on failure.
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Model path from argv[1], else the default on the box.
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try host_io.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // exe name
     const model_path = args.next() orelse DEFAULT_MODEL;

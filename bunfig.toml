@@ -1,0 +1,14 @@
+[fmt]
+printWidth = 100
+singleQuote = true
+ignorePatterns = [
+  # Astro requires a Prettier plugin fallback; validate templates with Astro.
+  "**/*.astro",
+  "docs/validation/**",
+  "site/src/data/**",
+  "src/model/fixtures/**",
+  "assets/**",
+  "site/public/**",
+  "research/**",
+  "writing/**",
+]

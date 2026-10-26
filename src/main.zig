@@ -4,6 +4,7 @@
 //! and the single-process decode loop used for prompt-mode execution.
 const builtin = @import("builtin");
 const std = @import("std");
+const host_io = @import("host_io");
 const build_info = @import("build_info.zig");
 const gpu = @import("gpu/interface.zig");
 const runtime_assets = @import("runtime_assets.zig");
@@ -56,6 +57,8 @@ const cuda_serve_mod = if (gpu.is_cuda) @import("server/cuda_serve.zig") else st
 const http_mod = @import("server/http.zig");
 const model_manager_mod = @import("server/model_manager_runtime.zig");
 const routes_mod = @import("server/routes.zig");
+const tool_format_mod = @import("server/tool_format.zig");
+const model_discovery_mod = @import("server/model_discovery.zig");
 const CommandPool = if (gpu.is_vulkan) @import("vulkan/command.zig").CommandPool else struct {
     pub fn init(_: anytype) !@This() {
         return .{};
@@ -147,6 +150,8 @@ comptime {
     _ = @import("model/gguf.zig");
     _ = @import("model/tokenizer.zig");
     _ = @import("compute/graph.zig");
+    _ = @import("compute/launch_sizes.zig");
+    _ = @import("compute/kv_storage.zig");
     _ = @import("build_info.zig");
     _ = @import("runtime_assets.zig");
     _ = @import("regression_tests.zig");
@@ -263,11 +268,14 @@ fn openBrowser(port: u16) void {
     var url_buf: [64]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "http://localhost:{d}", .{port}) catch return;
     const opener = if (comptime @import("builtin").os.tag == .macos) "open" else "xdg-open";
-    var child = std.process.Child.init(&.{ opener, url }, std.heap.page_allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = child.spawnAndWait() catch {};
+    var child = std.process.spawn(host_io.io, .{
+        .argv = &.{ opener, url },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return;
+    defer child.kill(host_io.io);
+    _ = child.wait(host_io.io) catch {};
 }
 
 fn reportGpuProcessLockError(err: anyerror, backend: process_lock_mod.Backend, device_index: u32) noreturn {
@@ -320,9 +328,9 @@ fn runHttpServer(config: Config, manager: *model_manager_mod.ModelManager, alloc
 
     const posix = std.posix;
     const Handler = struct {
-        var shutdown_requested: bool = false;
-        fn handler(_: c_int) callconv(.c) void {
-            shutdown_requested = true;
+        var shutdown_requested: std.atomic.Value(bool) = .init(false);
+        fn handler(_: std.posix.SIG) callconv(.c) void {
+            shutdown_requested.store(true, .release);
         }
     };
     const sa = posix.Sigaction{
@@ -333,14 +341,14 @@ fn runHttpServer(config: Config, manager: *model_manager_mod.ModelManager, alloc
     posix.sigaction(posix.SIG.INT, &sa, null);
     posix.sigaction(posix.SIG.TERM, &sa, null);
 
-    var server_state = routes_mod.ServerState.init(std.time.timestamp());
+    var server_state = routes_mod.ServerState.init(host_io.timestamp());
     var poll_fds = [1]posix.pollfd{.{
-        .fd = server.listener.stream.handle,
+        .fd = server.listener.socket.handle,
         .events = posix.POLL.IN,
         .revents = 0,
     }};
 
-    while (!Handler.shutdown_requested) {
+    while (!Handler.shutdown_requested.load(.acquire)) {
         poll_fds[0].revents = 0;
         const ready = posix.poll(&poll_fds, 100) catch |err| {
             log.warn("Listener poll failed: {s}", .{@errorName(err)});
@@ -349,7 +357,7 @@ fn runHttpServer(config: Config, manager: *model_manager_mod.ModelManager, alloc
         if (ready == 0) continue;
 
         var conn = server.accept() catch |err| {
-            if (Handler.shutdown_requested) break;
+            if (Handler.shutdown_requested.load(.acquire)) break;
             log.warn("Accept failed: {s}", .{@errorName(err)});
             continue;
         };
@@ -377,7 +385,7 @@ fn runHttpServer(config: Config, manager: *model_manager_mod.ModelManager, alloc
     while (server_state.active_requests.load(.monotonic) != 0 or
         server_state.queued_requests.load(.monotonic) != 0)
     {
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        host_io.sleep(50 * std.time.ns_per_ms);
     }
     log.info("Shutting down...", .{});
 }
@@ -402,14 +410,16 @@ fn launchBrowser(url: []const u8) !void {
         else => return error.BrowserLaunchUnsupported,
     };
 
-    var child = std.process.Child.init(argv, std.heap.page_allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-
-    const term = try child.spawnAndWait();
+    var child = try std.process.spawn(host_io.io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(host_io.io);
+    const term = try child.wait(host_io.io);
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.BrowserLauncherFailed;
         },
         else => return error.BrowserLauncherFailed,
@@ -869,7 +879,7 @@ fn trimCliOutputText(text: []const u8, chat: bool) []const u8 {
         return std.mem.trim(u8, body[0..stop_pos], " \t\r\n");
     }
     if (findFirstCliStop(text, cli_chat_stop_strs[0..])) |stop_pos| {
-        return std.mem.trimRight(u8, text[0..stop_pos], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..stop_pos], " \t\r\n");
     }
     return text;
 }
@@ -877,7 +887,7 @@ fn trimCliOutputText(text: []const u8, chat: bool) []const u8 {
 fn resolveStartupModel(config: Config, allocator: std.mem.Allocator) !ResolvedStartupModel {
     if (config.hf_spec) |spec| {
         var stdout_buffer: [512]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+        var stdout_writer = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
         const path = try hf_mod.ensureModel(spec, allocator, &stdout_writer.interface);
         return .{
             .spec = .{
@@ -1086,14 +1096,14 @@ fn printManagedModelList(config: Config, allocator: std.mem.Allocator) !void {
     defer if (active) |*selection| selection.deinit(allocator);
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     const active_model_id = if (active) |selection| selection.model_id else null;
     const backend_name = if (gpu.is_metal) "Metal" else if (gpu.is_vulkan) "Vulkan" else "GPU";
 
     const support = resolveManagedGpuSupport(config.gpuDevicePreference(), allocator) catch |err| {
         if (!config.show_all_models and !config.json_output) {
             var stderr_buffer: [1024]u8 = undefined;
-            var stderr = std.fs.File.stderr().writerStreaming(&stderr_buffer);
+            var stderr = std.Io.File.stderr().writerStreaming(host_io.io, &stderr_buffer);
             try stderr.interface.print("Unable to initialize {s} for GPU detection: {s}\n", .{ backend_name, @errorName(err) });
             try stderr.interface.writeAll("Use `zinc model list --all` to inspect the catalog without live fit checks.\n");
             try stderr.interface.flush();
@@ -1432,9 +1442,9 @@ fn tryRemoveManagedModelViaLocalServer(
     force: bool,
     allocator: std.mem.Allocator,
 ) !?LocalAdminRemoveResponse {
-    const address = try std.net.Address.parseIp4("127.0.0.1", port);
-    var stream = std.net.tcpConnectToAddress(address) catch return null;
-    defer stream.close();
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = address.connect(host_io.io, .{ .mode = .stream }) catch return null;
+    defer stream.close(host_io.io);
 
     const request_body = try std.fmt.allocPrint(
         allocator,
@@ -1449,14 +1459,14 @@ fn tryRemoveManagedModelViaLocalServer(
         .{ port, request_body.len, request_body },
     );
     defer allocator.free(request);
-    try stream.writeAll(request);
+    try host_io.writeSocketAll(stream, request);
 
-    var response: std.ArrayList(u8) = .{};
+    var response: std.ArrayList(u8) = .empty;
     defer response.deinit(allocator);
 
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = try stream.read(&buf);
+        const n = try host_io.readSocket(stream, &buf);
         if (n == 0) break;
         try response.appendSlice(allocator, buf[0..n]);
         if (response.items.len > 64 * 1024) return error.ResponseTooLarge;
@@ -1522,7 +1532,7 @@ fn findJsonStringEnd(s: []const u8) ?usize {
 
 fn printManagedRemoveSummary(model_id: []const u8, outcome: ManagedRemoveOutcome) !void {
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     if (outcome.unloaded_from_gpu) {
         try stdout.interface.print("Unloaded {s} from GPU memory\n", .{model_id});
     }
@@ -1544,7 +1554,7 @@ fn printManagedRemoveSummary(model_id: []const u8, outcome: ManagedRemoveOutcome
 
 fn printCommandError(message: []const u8) !void {
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr = std.fs.File.stderr().writerStreaming(&stderr_buffer);
+    var stderr = std.Io.File.stderr().writerStreaming(host_io.io, &stderr_buffer);
     try stderr.interface.print("{s}\n", .{message});
     try stderr.interface.flush();
 }
@@ -1556,7 +1566,7 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
             defer if (active) |*selection| selection.deinit(allocator);
 
             var stdout_buffer: [1024]u8 = undefined;
-            var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+            var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
             if (active) |selection| {
                 try stdout.interface.print("{s}\n", .{selection.model_id});
             } else {
@@ -1579,7 +1589,7 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
                 // attempting. Warn instead of refusing; for `use`, require --force
                 // so running an unvalidated path stays an explicit choice.
                 var warn_buffer: [1024]u8 = undefined;
-                var warn_writer = std.fs.File.stderr().writerStreaming(&warn_buffer);
+                var warn_writer = std.Io.File.stderr().writerStreaming(host_io.io, &warn_buffer);
                 const warn = &warn_writer.interface;
                 try warn.print(
                     "warning: {s} has not been validated on this GPU profile ({s}).\n",
@@ -1596,7 +1606,7 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
 
             if (config.command == .model_pull) {
                 var stdout_buffer: [4096]u8 = undefined;
-                var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+                var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
                 try managed_mod.pullModel(entry.*, allocator, &stdout.interface);
                 try stdout.interface.flush();
                 return;
@@ -1608,7 +1618,7 @@ fn runModelCommand(config: Config, allocator: std.mem.Allocator) !void {
             try managed_mod.writeActiveSelection(model_id, allocator);
 
             var stdout_buffer: [1024]u8 = undefined;
-            var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+            var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
             try stdout.interface.print("Active model set to {s}\n", .{model_id});
             if (fit.fit_state == .fits_with_offload) {
                 try stdout.interface.writeAll("Note: this model exceeds your VRAM budget. The loader will automatically\n");
@@ -1685,17 +1695,17 @@ fn exportDecodeGraphArtifactsImpl(
     allocator: std.mem.Allocator,
 ) !void {
     const model_config = try loader_mod.inspectConfig(model_path, allocator);
-    const file = try std.fs.cwd().openFile(model_path, .{});
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, model_path, .{});
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const mmap_data = try std.posix.mmap(
         null,
         stat.size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -1717,28 +1727,28 @@ fn writeDecodeGraphArtifacts(
     allocator: std.mem.Allocator,
 ) !void {
     if (report_path) |path| {
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(host_io.io, path, .{ .truncate = true });
         defer {
             var close_file = file;
-            close_file.close();
+            close_file.close(host_io.io);
         }
 
         var file_buffer: [4096]u8 = undefined;
-        var file_writer = file.writer(&file_buffer);
+        var file_writer = file.writer(host_io.io, &file_buffer);
         try decode_graph.writeJsonReport(&file_writer.interface, allocator);
         try file_writer.interface.flush();
         log.info("Wrote decode graph JSON report to {s}", .{path});
     }
 
     if (dot_path) |path| {
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(host_io.io, path, .{ .truncate = true });
         defer {
             var close_file = file;
-            close_file.close();
+            close_file.close(host_io.io);
         }
 
         var file_buffer: [4096]u8 = undefined;
-        var file_writer = file.writer(&file_buffer);
+        var file_writer = file.writer(host_io.io, &file_buffer);
         try decode_graph.writeDot(&file_writer.interface, allocator);
         try file_writer.interface.flush();
         log.info("Wrote decode graph DOT export to {s}", .{path});
@@ -1783,15 +1793,21 @@ fn writeDecodeGraphArtifacts(
 // Accelerator prompt/server entrypoint shared by the CUDA and ROCm backends.
 // Only referenced (and therefore only analyzed) for those backends. Does a real greedy decode:
 // load → forward init → tokenize → prefill (one decodeStep per prompt token) →
-// greedy generate (feed argmax back) → detokenize → print. Server mode is not
-// yet supported on CUDA.
+// greedy generate (feed argmax back) → detokenize → print, or serve HTTP.
 fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
     const model_path = config.model_path orelse {
-        // model_id resolution flows through resolveStartupModel in main(); on
-        // the CUDA path we only support an explicit -m/--model for now.
-        log.err("{s} backend requires an explicit model path: zinc -m <model.gguf> --prompt \"...\"", .{accelerator_name});
+        log.err("{s} backend requires a resolved model path", .{accelerator_name});
         return error.NoModelSpecified;
     };
+
+    const requested_kv = @import("compute/kv_storage.zig").Format.parse(host_io.getenv("ZINC_KV_CACHE")) catch {
+        log.err("ZINC_KV_CACHE must be f32 or q8", .{});
+        return error.InvalidKvCacheFormat;
+    };
+    if (requested_kv == .q8 and (!gpu.is_rocm or (config.prompt == null and config.max_parallel != 1))) {
+        log.err("q8 KV requires ROCm and --parallel 1 for serving", .{});
+        return error.UnsupportedKvCacheConfiguration;
+    }
 
     var device = try cuda_device_mod.CudaDevice.initBest(allocator);
     defer device.deinit();
@@ -1810,6 +1826,11 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
         return err;
     };
     defer model.deinit();
+
+    if (requested_kv == .q8 and model.config.architecture != .qwen35 and model.config.architecture != .qwen2_moe) {
+        log.err("q8 KV currently supports the ROCm Qwen hybrid path", .{});
+        return error.UnsupportedKvCacheFormat;
+    }
 
     // server_mode = no CLI prompt → multi-tenant HTTP serving (Effort 28). Both the
     // gemma4 dense forward AND the qwen35/36 hybrid-SSM+MoE forward expose the
@@ -1853,7 +1874,7 @@ fn runCuda(config: Config, allocator: std.mem.Allocator) !void {
 /// unless ZINC_BATCHED_PREFILL is explicitly set to an off value (0/off/false/no),
 /// the opt-OUT back to the per-token prefill loop for debugging. Unset → on.
 fn batchedPrefillDefaultOn() bool {
-    const v = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse return true;
+    const v = host_io.getenv("ZINC_BATCHED_PREFILL") orelse return true;
     return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
         std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no"));
 }
@@ -1895,7 +1916,7 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
         return error.ContextTooSmall;
     }
 
-    var generated: std.ArrayList(u32) = .{};
+    var generated: std.ArrayList(u32) = .empty;
     defer generated.deinit(allocator);
 
     // MTP rollback/history buffers are execution-context setup, so allocate
@@ -1915,7 +1936,7 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     // active per-token forward is small). Same KV cache, bit-identical output.
     var pos: u32 = 0;
     var next_tok: u32 = 0;
-    var prefill_timer = try std.time.Timer.start();
+    var prefill_timer = try host_io.Timer.start();
     // Effort 25: batched-GEMM prefill is now the DEFAULT for gemma — it runs the
     // whole prompt through the batched path (gemma dense + MoE attention/FFN; the
     // method handles MoE internally) and is output-identical to the per-token
@@ -1965,7 +1986,7 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     // GENERATE: greedily feed the argmax back until EOS or the token budget /
     // context limit is reached.
     var produced: u32 = 0;
-    var decode_timer = try std.time.Timer.start();
+    var decode_timer = try host_io.Timer.start();
     var generated_with_mtp = false;
     var mtp_drafted: u32 = 0;
     var mtp_accepted: u32 = 0;
@@ -2040,7 +2061,7 @@ fn runCudaDecode(fwd: anytype, model: *loader_cuda_mod.Model, config: Config, ma
     }
 
     // Detokenize → text.
-    var text_buf: std.ArrayList(u8) = .{};
+    var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(allocator);
     for (generated.items) |tid| {
         var dec_buf: [256]u8 = undefined;
@@ -2075,6 +2096,8 @@ const ServeConnCtx = struct {
     debug_ids: bool,
     default_max: u32,
     slot_ctx: u32,
+    /// Model path for /v1/models endpoint (borrows config.model_path, lifetime spans server).
+    model_path: ?[]const u8,
 };
 
 /// Stand up the CUDA serving path: build the tokenizer, spawn the GPU worker via
@@ -2098,7 +2121,7 @@ fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, conf
     // gate and the `dbg_cuda serve` reference stop identically.
     const debug_ids = envIsOn("ZINC_SERVE_DEBUG_IDS");
     var eos = tokenizer.eosId();
-    if (std.posix.getenv("ZINC_SCHED_EOS")) |v| {
+    if (host_io.getenv("ZINC_SCHED_EOS")) |v| {
         eos = std.fmt.parseInt(u32, std.mem.trim(u8, v, " \n\r\t"), 10) catch eos;
     }
     const eot = if (!debug_ids and tokenizer.detectTemplateKind() == .atem) tokenizer.eot_id else null;
@@ -2146,6 +2169,7 @@ fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, conf
             .debug_ids = debug_ids,
             .default_max = config.max_tokens,
             .slot_ctx = slot_ctx,
+            .model_path = config.model_path,
         };
         const t = std.Thread.spawn(.{}, handleServeConn, .{ctx}) catch {
             ctx.conn.close();
@@ -2159,7 +2183,6 @@ fn runCudaServe(fwd: cuda_serve_mod.Forward, model: *loader_cuda_mod.Model, conf
 /// Minimal request body the serve path reads (OpenAI-ish). Unknown fields ignored.
 const ServeReqBody = struct {
     prompt: ?[]const u8 = null,
-    messages: ?[]struct { role: []const u8 = "user", content: []const u8 = "" } = null,
     max_tokens: ?u32 = null,
     n_predict: ?u32 = null,
     /// Preserve the original SSE default when omitted; explicit false selects
@@ -2182,14 +2205,33 @@ fn handleServeConn(ctx: *ServeConnCtx) void {
         return;
     }
     if (req.method == .GET and std.mem.eql(u8, req.path, "/health")) {
-        conn.sendJson(200, if (gpu.is_rocm)
-            "{\"status\":\"ok\",\"backend\":\"rocm\"}"
-        else
-            "{\"status\":\"ok\",\"backend\":\"cuda\"}") catch {};
+        if (ctx.engine.executionFailed()) {
+            conn.sendError(503, "server_error", "GPU execution failed; restart the server") catch {};
+            return;
+        }
+        var health_buf: [160]u8 = undefined;
+        const health = std.fmt.bufPrint(&health_buf, "{{\"status\":\"ok\",\"backend\":\"{s}\",\"context_length\":{d}}}", .{
+            if (gpu.is_rocm) @as([]const u8, "rocm") else "cuda", ctx.slot_ctx,
+        }) catch return;
+        conn.sendJson(200, health) catch {};
         return;
     }
     // 3c throughput gate: cumulative decode/prefill counters. Diff two snapshots
     // around a B-concurrent phase → aggregate decode tok/s + mean batch occupancy.
+    if (req.method == .GET and std.mem.eql(u8, req.path, "/v1/models")) {
+        if (ctx.model_path) |mp| {
+            const json = model_discovery_mod.serializeModels(ctx.allocator, mp, ctx.slot_ctx) catch |err| {
+                log.warn("Failed to serialize models: {s}", .{@errorName(err)});
+                conn.sendError(500, "internal_error", "failed to serialize models") catch {};
+                return;
+            };
+            defer ctx.allocator.free(json);
+            conn.sendJson(200, json) catch {};
+        } else {
+            conn.sendError(500, "internal_error", "no model loaded") catch {};
+        }
+        return;
+    }
     if (req.method == .GET and std.mem.eql(u8, req.path, "/stats")) {
         var sbuf: [256]u8 = undefined;
         const js = ctx.engine.statsJson(&sbuf) catch "{}";
@@ -2217,6 +2259,14 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
     var owns_tokens = false;
     var stream_response = true;
     var enable_thinking: ?bool = null;
+    var tools_active = false;
+    var chat_request: ?routes_mod.ParsedChatRequest = null;
+    defer if (chat_request) |*chat| chat.deinit();
+    var tool_definitions: []const tool_format_mod.ToolDefinition = &.{};
+    var forced_tool_name: ?[]u8 = null;
+    defer if (forced_tool_name) |name| allocator.free(name);
+    var forced_tool_first_arg: ?[]u8 = null;
+    defer if (forced_tool_first_arg) |name| allocator.free(name);
 
     if (ctx.debug_ids) {
         // Gate contract: body is JSON {"prompt":"t0,t1,...","max_tokens":N}; the
@@ -2250,25 +2300,46 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         var chat_buf: ?[]u8 = null;
         defer if (chat_buf) |b| allocator.free(b);
         if (is_chat) {
-            const msgs = parsed.value.messages orelse {
-                try conn.sendError(400, "invalid_request_error", "missing messages");
+            chat_request = routes_mod.parseChatRequest(allocator, body) catch {
+                try conn.sendError(400, "invalid_request_error", "invalid chat messages or tools");
                 return;
             };
-            var roles = try allocator.alloc([]const u8, msgs.len);
-            defer allocator.free(roles);
-            var contents = try allocator.alloc([]const u8, msgs.len);
-            defer allocator.free(contents);
-            for (msgs, 0..) |m, i| {
-                roles[i] = m.role;
-                contents[i] = m.content;
+            const chat = &chat_request.?;
+            tool_definitions = chat.tools;
+            routes_mod.prepareChatForTokenizer(chat, ctx.tokenizer) catch {
+                try conn.sendError(400, "invalid_request_error", "invalid tool-call history");
+                return;
+            };
+            // Preserve this backend's original prompt for ordinary chat while
+            // sharing content-array, tool schema and tool-result parsing with
+            // the Vulkan/Metal API.
+            if (chat.injected_default_system and chat.tools.len == 0) {
+                chat.roles = chat.roles[1..];
+                chat.contents = chat.contents[1..];
             }
-            const buf = try allocator.alloc(u8, 64 * 1024);
-            chat_buf = buf;
-            prompt_text = ctx.tokenizer.applyChatTemplateWithOptions(roles, contents, .{ .enable_thinking = enable_thinking }, buf) catch |err| {
+            if (chat.roles.len == 0) {
+                try conn.sendError(400, "invalid_request_error", "missing messages");
+                return;
+            }
+            tools_active = chat.tools.len > 0 and chat.tool_choice != .none and
+                ctx.tokenizer.detectTemplateKind() == .chatml;
+            if (tools_active and enable_thinking == null) enable_thinking = false;
+            const skip_thinking = routes_mod.shouldSkipThinkingTemplateForRequest(chat.tools.len, chat.tool_choice, enable_thinking);
+            if (!tool_format_mod.forTokenizer(ctx.tokenizer).native_xml) {
+                if (routes_mod.forcedSingleToolName(chat.tools, chat.tool_choice)) |name| {
+                    forced_tool_name = try allocator.dupe(u8, name);
+                    if (routes_mod.forcedSingleToolFirstArgumentName(chat.tools, chat.tool_choice)) |arg| {
+                        forced_tool_first_arg = try allocator.dupe(u8, arg);
+                    }
+                }
+            }
+            const buf = routes_mod.allocChatPrompt(allocator, ctx.tokenizer, chat.roles, chat.contents, enable_thinking, skip_thinking, chat.tools, chat.tool_choice) catch |err| {
                 try conn.sendError(400, "invalid_request_error", "chat template failed");
                 log.warn("chat template: {s}", .{@errorName(err)});
                 return;
             };
+            chat_buf = buf;
+            prompt_text = buf;
         } else {
             prompt_text = parsed.value.prompt orelse {
                 try conn.sendError(400, "invalid_request_error", "missing prompt");
@@ -2310,10 +2381,13 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
     // From here the worker borrows `prompt_tokens` + `chan`; do not return without
     // draining to `finished` (so the worker is done touching them) then `finish`.
     defer ctx.engine.finish(id, &chan);
+    var forced_id_buf: [64]u8 = undefined;
+    const forced_id = std.fmt.bufPrint(&forced_id_buf, "call_forced_{d}", .{id}) catch unreachable;
 
     if (stream_response) {
         conn.sendSseStart() catch {
             // Client gone before headers — still drain the engine so it frees the slot.
+            ctx.engine.cancel(id);
             drainQuietly(ctx.engine, &chan);
             return;
         };
@@ -2322,14 +2396,21 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
     var buf: [32]u32 = undefined;
     var dec_buf: [256]u8 = undefined;
     var json_buf: [1024]u8 = undefined;
-    var output: std.ArrayList(u8) = .{};
+    var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
+    var stream_pending: std.ArrayList(u8) = .empty;
+    defer stream_pending.deinit(allocator);
     const structured_capacity = @max(@as(usize, 64 * 1024), @as(usize, ctx.slot_ctx) * 32 + 256);
     const structured_buf: ?[]u8 = if (structured_chat) try allocator.alloc(u8, structured_capacity) else null;
     defer if (structured_buf) |buf_to_free| allocator.free(buf_to_free);
     var sent_structured_len: usize = 0;
     var write_failed = false;
     var generation_failed = false;
+    var detector = tool_format_mod.StreamingDetector{ .allocator = allocator, .tools = tool_definitions };
+    defer detector.deinit();
+    var any_tool_call_emitted = false;
+    var tool_call_index: u32 = 0;
+    var sent_tool_text_len: usize = 0;
     while (true) {
         const ch = ctx.engine.nextChunk(&chan, &buf);
         generation_failed = generation_failed or ch.failed;
@@ -2337,13 +2418,16 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         while (i < ch.n) : (i += 1) {
             const tok = buf[i];
             if (write_failed) continue; // keep draining the engine, stop writing
+            // The worker counts EOS for scheduling/usage; it is a control token,
+            // not visible assistant text or a tool-result history fragment.
+            if (!ctx.debug_ids and ctx.tokenizer.isEndOfGeneration(tok)) continue;
             if (!stream_response) {
                 if (ctx.debug_ids) {
                     if (output.items.len != 0) output.append(allocator, ',') catch {
                         write_failed = true;
                         continue;
                     };
-                    output.writer(allocator).print("{d}", .{tok}) catch {
+                    output.print(allocator, "{d}", .{tok}) catch {
                         write_failed = true;
                         continue;
                     };
@@ -2358,21 +2442,34 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
                 conn.writeSseEvent(payload) catch {
                     write_failed = true;
                 };
+            } else if (tools_active) {
+                output.appendSlice(allocator, ctx.tokenizer.decodeToken(tok, &dec_buf)) catch {
+                    write_failed = true;
+                    continue;
+                };
+                // Token byte pieces can split a UTF-8 code point. Hold that
+                // suffix until the next token before serializing an SSE event.
+                const pending = routes_mod.completeUtf8Prefix(output.items[sent_tool_text_len..]);
+                if (forced_tool_name == null and pending.len > 0 and std.unicode.utf8ValidateSlice(pending)) {
+                    routes_mod.streamTextViaDetector(conn, pending, "chatcmpl-zinc", 0, "zinc", &detector, &any_tool_call_emitted, &tool_call_index, allocator, true) catch {
+                        write_failed = true;
+                    };
+                    sent_tool_text_len += pending.len;
+                }
             } else if (structured_chat) {
                 const text = ctx.tokenizer.decodeToken(tok, &dec_buf);
                 output.appendSlice(allocator, text) catch {
                     write_failed = true;
                     continue;
                 };
-                const normalized = routes_mod.normalizeStructuredAssistantOutput(
+                const normalized = routes_mod.completeUtf8Prefix(routes_mod.normalizeStructuredAssistantOutput(
                     ctx.tokenizer,
                     output.items,
                     thinking_enabled,
                     structured_buf.?,
-                ) catch "";
-                if (normalized.len > sent_structured_len) {
-                    const payload = formatChunkJson(&json_buf, normalized[sent_structured_len..], is_chat) catch continue;
-                    conn.writeSseEvent(payload) catch {
+                ) catch "");
+                if (normalized.len > sent_structured_len and std.unicode.utf8ValidateSlice(normalized[sent_structured_len..])) {
+                    writeServeContent(conn, normalized[sent_structured_len..], is_chat) catch {
                         write_failed = true;
                         continue;
                     };
@@ -2380,16 +2477,25 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
                 }
             } else {
                 const text = ctx.tokenizer.decodeToken(tok, &dec_buf);
-                const payload = formatChunkJson(&json_buf, text, is_chat) catch continue;
-                conn.writeSseEvent(payload) catch {
+                stream_pending.appendSlice(allocator, text) catch {
+                    write_failed = true;
+                    continue;
+                };
+                const complete = routes_mod.completeUtf8Prefix(stream_pending.items);
+                if (complete.len == 0) continue;
+                writeServeContent(conn, complete, is_chat) catch {
                     write_failed = true;
                 };
+                const remaining = stream_pending.items.len - complete.len;
+                std.mem.copyForwards(u8, stream_pending.items, stream_pending.items[complete.len..]);
+                stream_pending.shrinkRetainingCapacity(remaining);
             }
         }
+        if (write_failed) ctx.engine.cancel(id);
         if (ch.finished) break;
     }
     const generated_tokens = chan.consumed;
-    logServeTimings(prompt_tokens.len, generated_tokens, chan.prefill_wall_ns, chan.decode_wall_ns);
+    logServeTimings(@intCast(chan.prefill_tokens), generated_tokens, chan.prefill_wall_ns, chan.decode_wall_ns);
     if (generation_failed) {
         log.warn("request {d} failed during GPU generation", .{id});
         if (stream_response) {
@@ -2403,7 +2509,28 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         return;
     }
     if (stream_response) {
-        if (!write_failed) conn.writeSseDone() catch {};
+        if (!write_failed) {
+            if (tools_active) {
+                if (forced_tool_name) |name| {
+                    const args = try routes_mod.forcedToolArgumentsJsonAlloc(allocator, forced_tool_first_arg, routes_mod.completeUtf8Prefix(output.items));
+                    defer allocator.free(args);
+                    const event = try routes_mod.formatStreamingToolCallChunk(allocator, "chatcmpl-zinc", 0, "zinc", 0, forced_id, name, args);
+                    defer allocator.free(event);
+                    try conn.writeSseEvent(event);
+                    any_tool_call_emitted = true;
+                } else {
+                    const tail = detector.finalize();
+                    if (tail.len > 0) try routes_mod.streamText(conn, tail, "chatcmpl-zinc", 0, "zinc");
+                }
+            }
+            // Agent clients need a terminal finish reason to decide whether to
+            // execute tools or finish their turn. Include usage for compaction.
+            var finish_buf: [512]u8 = undefined;
+            const reason: []const u8 = if (any_tool_call_emitted) "tool_calls" else if (generated_tokens >= max_tokens) "length" else "stop";
+            const finish = try std.fmt.bufPrint(&finish_buf, "{{\"id\":\"chatcmpl-zinc\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"zinc\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}", .{ reason, prompt_tokens.len, generated_tokens, prompt_tokens.len + generated_tokens });
+            try conn.writeSseEvent(finish);
+            try conn.writeSseDone();
+        }
         return;
     }
     if (write_failed) {
@@ -2411,22 +2538,54 @@ fn handleServeGenerate(ctx: *ServeConnCtx, conn: *http_mod.Connection, body: []c
         return;
     }
 
-    const response_output = if (structured_chat)
+    const response_output = routes_mod.completeUtf8Prefix(if (structured_chat)
         routes_mod.normalizeStructuredAssistantOutput(ctx.tokenizer, output.items, thinking_enabled, structured_buf.?) catch ""
     else
-        output.items;
+        output.items);
+    if (!std.unicode.utf8ValidateSlice(response_output)) {
+        try conn.sendError(500, "server_error", "model returned invalid UTF-8");
+        return;
+    }
     const escaped = try jsonEscapeAlloc(allocator, response_output);
     defer allocator.free(escaped);
-    var response: std.ArrayList(u8) = .{};
+    var response: std.ArrayList(u8) = .empty;
     defer response.deinit(allocator);
     const finish_reason: []const u8 = if (generated_tokens >= @as(usize, max_tokens)) "length" else "stop";
+    if (tools_active) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const parsed_tools = if (forced_tool_name) |name| tool_format_mod.ParsedAssistantOutput{
+            .text_content = "",
+            .tool_calls = &.{.{ .id = forced_id, .name = name, .arguments_json = try routes_mod.forcedToolArgumentsJsonAlloc(a, forced_tool_first_arg, response_output) }},
+        } else try tool_format_mod.forTokenizer(ctx.tokenizer).parseAssistantToolCallsWithTools(response_output, tool_definitions, a);
+        if (parsed_tools.tool_calls.len > 0) {
+            const ApiTool = struct { id: []const u8, type: []const u8 = "function", function: struct { name: []const u8, arguments: []const u8 } };
+            const api_tools = try a.alloc(ApiTool, parsed_tools.tool_calls.len);
+            for (parsed_tools.tool_calls, api_tools) |tc, *api_tc| {
+                api_tc.* = .{ .id = tc.id, .function = .{ .name = tc.name, .arguments = tc.arguments_json } };
+            }
+            const json = try std.json.Stringify.valueAlloc(a, .{
+                .id = "chatcmpl-zinc",
+                .object = "chat.completion",
+                .created = 0,
+                .model = "zinc",
+                .choices = .{.{ .index = 0, .message = .{ .role = "assistant", .content = @as(?[]const u8, null), .tool_calls = api_tools }, .finish_reason = "tool_calls" }},
+                .usage = .{ .prompt_tokens = prompt_tokens.len, .completion_tokens = generated_tokens, .total_tokens = prompt_tokens.len + generated_tokens },
+            }, .{});
+            try conn.sendJson(200, json);
+            return;
+        }
+    }
     if (is_chat) {
-        try response.writer(allocator).print(
+        try response.print(
+            allocator,
             "{{\"id\":\"chatcmpl-zinc\",\"object\":\"chat.completion\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{s}\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
             .{ escaped, finish_reason, prompt_tokens.len, generated_tokens, prompt_tokens.len + generated_tokens },
         );
     } else {
-        try response.writer(allocator).print(
+        try response.print(
+            allocator,
             "{{\"id\":\"cmpl-zinc\",\"object\":\"text_completion\",\"choices\":[{{\"index\":0,\"text\":\"{s}\",\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
             .{ escaped, finish_reason, prompt_tokens.len, generated_tokens, prompt_tokens.len + generated_tokens },
         );
@@ -2456,7 +2615,7 @@ fn drainQuietly(engine: *cuda_serve_mod.ServeEngine, chan: *cuda_serve_mod.ReqCh
 
 /// Parse a comma-separated list of decimal token ids (gate/debug-ids contract).
 fn parseTokenIdList(allocator: std.mem.Allocator, text: []const u8) ![]u32 {
-    var list: std.ArrayList(u32) = .{};
+    var list: std.ArrayList(u32) = .empty;
     errdefer list.deinit(allocator);
     var it = std.mem.splitScalar(u8, text, ',');
     while (it.next()) |s| {
@@ -2469,7 +2628,7 @@ fn parseTokenIdList(allocator: std.mem.Allocator, text: []const u8) ![]u32 {
 
 /// Format one OpenAI-style streaming chunk carrying a single token's text.
 fn formatChunkJson(buf: []u8, text: []const u8, is_chat: bool) ![]const u8 {
-    var esc: [512]u8 = undefined;
+    var esc: [2048]u8 = undefined;
     const escaped = jsonEscape(&esc, text);
     if (is_chat) {
         return std.fmt.bufPrint(buf, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{s}\"}}}}]}}", .{escaped});
@@ -2477,17 +2636,35 @@ fn formatChunkJson(buf: []u8, text: []const u8, is_chat: bool) ![]const u8 {
     return std.fmt.bufPrint(buf, "{{\"choices\":[{{\"index\":0,\"text\":\"{s}\"}}]}}", .{escaped});
 }
 
+fn writeServeContent(conn: *http_mod.Connection, text: []const u8, is_chat: bool) !void {
+    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const part = routes_mod.completeUtf8Prefix(text[offset..@min(text.len, offset + 256)]);
+        var payload: [4096]u8 = undefined;
+        try conn.writeSseEvent(try formatChunkJson(&payload, part, is_chat));
+        offset += part.len;
+    }
+}
+
 /// Minimal JSON string escaper for SSE token payloads (truncates on overflow).
 fn jsonEscape(buf: []u8, s: []const u8) []const u8 {
     var n: usize = 0;
     for (s) |c| {
+        var control: [6]u8 = undefined;
         const rep: []const u8 = switch (c) {
             '"' => "\\\"",
             '\\' => "\\\\",
             '\n' => "\\n",
             '\r' => "\\r",
             '\t' => "\\t",
-            else => &[_]u8{c},
+            else => if (c < 0x20) blk: {
+                const hex = "0123456789abcdef";
+                @memcpy(control[0..4], "\\u00");
+                control[4] = hex[c >> 4];
+                control[5] = hex[c & 15];
+                break :blk &control;
+            } else &[_]u8{c},
         };
         if (n + rep.len > buf.len) break;
         @memcpy(buf[n .. n + rep.len], rep);
@@ -2497,25 +2674,45 @@ fn jsonEscape(buf: []u8, s: []const u8) []const u8 {
 }
 
 fn jsonEscapeAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (s) |c| {
+        var control: [6]u8 = undefined;
         const rep: []const u8 = switch (c) {
             '"' => "\\\"",
             '\\' => "\\\\",
             '\n' => "\\n",
             '\r' => "\\r",
             '\t' => "\\t",
-            else => &[_]u8{c},
+            else => if (c < 0x20) blk: {
+                const hex = "0123456789abcdef";
+                @memcpy(control[0..4], "\\u00");
+                control[4] = hex[c >> 4];
+                control[5] = hex[c & 15];
+                break :blk &control;
+            } else &[_]u8{c},
         };
         try out.appendSlice(allocator, rep);
     }
     return out.toOwnedSlice(allocator);
 }
 
+test "accelerator SSE content preserves control bytes and Unicode through JSON" {
+    const text = "hi\x00\x01\x08\x0c\n\r\t\"\\東京🚀";
+    var buf: [2048]u8 = undefined;
+    const payload = try formatChunkJson(&buf, text, true);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("choices").?.array.items[0].object.get("delta").?.object.get("content").?.string;
+    try std.testing.expectEqualStrings(text, content);
+    const escaped = try jsonEscapeAlloc(std.testing.allocator, text);
+    defer std.testing.allocator.free(escaped);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "\\u0000") != null);
+}
+
 /// True if an env var is set to an "on" value (1/true/yes/on).
 fn envIsOn(name: []const u8) bool {
-    const v = std.posix.getenv(name) orelse return false;
+    const v = host_io.getenv(name) orelse return false;
     return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true") or
         std.ascii.eqlIgnoreCase(v, "yes") or std.ascii.eqlIgnoreCase(v, "on");
 }
@@ -2526,7 +2723,7 @@ fn envIsOn(name: []const u8) bool {
 // operator-facing preflight on this platform.
 fn runCudaCheck(config: Config, check_target: ResolvedCheckTarget, allocator: std.mem.Allocator) !void {
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     const w = &stdout_writer.interface;
 
     try w.print("\n=== ZINC System Diagnostics ===\n", .{});
@@ -2600,28 +2797,27 @@ fn bytesToGiBf(bytes: u64) f64 {
 /// In prompt mode the engine runs up to `max_tokens` forward passes and prints the decoded output.
 /// In server mode an HTTP listener is started and requests are handled until SIGINT/SIGTERM.
 /// @note Fatal startup errors are logged and the process exits rather than returning an error.
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    const allocator = process_init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try host_io.argsAlloc(allocator);
+    defer host_io.argsFree(allocator, args);
 
     const config = parseArgs(args) catch |err| {
         log.err("Argument error: {s}", .{@errorName(err)});
-        std.fs.File.stderr().writeAll(helpText(false)) catch {};
+        std.Io.File.stderr().writeStreamingAll(host_io.io, helpText(false)) catch {};
         std.process.exit(1);
     };
 
     if (config.show_help) {
-        std.fs.File.stdout().writeAll(helpText(config.show_help_all)) catch {};
+        std.Io.File.stdout().writeStreamingAll(host_io.io, helpText(config.show_help_all)) catch {};
         return;
     }
 
     if (config.show_version) {
         var stdout_buffer: [512]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+        var stdout_writer = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
         try build_info.writeVersion(&stdout_writer.interface);
         try stdout_writer.interface.flush();
         return;
@@ -2681,7 +2877,7 @@ pub fn main() !void {
         return;
     }
 
-    is_debug_mode = config.debug or std.posix.getenv("ZINC_DEBUG") != null;
+    is_debug_mode = config.debug or host_io.getenv("ZINC_DEBUG") != null;
 
     const resolved_model: ?ResolvedStartupModel = blk: {
         break :blk resolveStartupModel(config, allocator) catch |err| {
@@ -2882,7 +3078,7 @@ pub fn main() !void {
                 }
 
                 // Decode tokens to text
-                var text_buf: std.ArrayList(u8) = .{};
+                var text_buf: std.ArrayList(u8) = .empty;
                 defer text_buf.deinit(allocator);
                 for (output_tokens) |tid| {
                     var dec_buf: [256]u8 = undefined;
@@ -2924,7 +3120,11 @@ pub fn main() !void {
     // `return` makes the Vulkan code below comptime-unreachable on CUDA (same
     // pattern as the Metal block above), so it is never analyzed here.
     if (comptime gpu.is_cuda) {
-        runCuda(config, allocator) catch |err| {
+        // Use the same resolved startup selection as Metal/Vulkan: explicit
+        // paths, managed IDs, active selections, and downloaded HF models.
+        var accelerator_config = config;
+        accelerator_config.model_path = model_path;
+        runCuda(accelerator_config, allocator) catch |err| {
             log.err("{s} run failed: {s}", .{ accelerator_name, @errorName(err) });
             std.process.exit(1);
         };
@@ -3042,7 +3242,7 @@ pub fn main() !void {
         log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 30)] });
         // Decode prompt tokens for verification
         {
-            var pt_buf: std.ArrayList(u8) = .{};
+            var pt_buf: std.ArrayList(u8) = .empty;
             defer pt_buf.deinit(allocator);
             for (prompt_tokens) |tid| {
                 if (tid < tokenizer.vocab.len) {
@@ -3133,7 +3333,7 @@ pub fn main() !void {
 
         // Decode tokens to text using the vocabulary
         {
-            var text_buf: std.ArrayList(u8) = .{};
+            var text_buf: std.ArrayList(u8) = .empty;
             defer text_buf.deinit(allocator);
             for (output_tokens) |tid| {
                 var dec_buf: [256]u8 = undefined;
@@ -3455,14 +3655,14 @@ fn resolveShaderDir(allocator: std.mem.Allocator) ![]u8 {
 /// Test-friendly variant: probe `base_dir` for the cwd-relative candidates,
 /// then fall back to `exe_dir_override/../share/zinc/shaders` (or the
 /// running executable's directory when override is null).
-fn resolveShaderDirFrom(allocator: std.mem.Allocator, base_dir: std.fs.Dir, exe_dir_override: ?[]const u8) ![]u8 {
+fn resolveShaderDirFrom(allocator: std.mem.Allocator, base_dir: std.Io.Dir, exe_dir_override: ?[]const u8) ![]u8 {
     return runtime_assets.resolveShaderDirFrom(allocator, base_dir, exe_dir_override, .spirv);
 }
 
 test "resolveShaderDirFrom finds first cwd-relative candidate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("zig-out/share/zinc/shaders");
+    try tmp.dir.createDirPath(host_io.io, "zig-out/share/zinc/shaders");
     const result = try resolveShaderDirFrom(std.testing.allocator, tmp.dir, "/nonexistent");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("zig-out/share/zinc/shaders", result);
@@ -3471,7 +3671,7 @@ test "resolveShaderDirFrom finds first cwd-relative candidate" {
 test "resolveShaderDirFrom falls back to second candidate when first missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("share/zinc/shaders");
+    try tmp.dir.createDirPath(host_io.io, "share/zinc/shaders");
     const result = try resolveShaderDirFrom(std.testing.allocator, tmp.dir, "/nonexistent");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("share/zinc/shaders", result);
@@ -3484,9 +3684,9 @@ test "resolveShaderDirFrom falls back to exe-relative when cwd has nothing" {
     // <prefix>/share/zinc/shaders. POSIX path resolution requires each
     // component on the way to ".." to exist as a real directory, so create
     // both bin/ and share/zinc/shaders/.
-    try tmp.dir.makePath("install/bin");
-    try tmp.dir.makePath("install/share/zinc/shaders");
-    const bin_dir = try tmp.dir.realpathAlloc(std.testing.allocator, "install/bin");
+    try tmp.dir.createDirPath(host_io.io, "install/bin");
+    try tmp.dir.createDirPath(host_io.io, "install/share/zinc/shaders");
+    const bin_dir = try tmp.dir.realPathFileAlloc(host_io.io, "install/bin", std.testing.allocator);
     defer std.testing.allocator.free(bin_dir);
 
     var empty = std.testing.tmpDir(.{});
@@ -3668,4 +3868,14 @@ test "trimCliOutputText extracts GPT-OSS Harmony final channel" {
 
     try std.testing.expectEqualStrings("Paris", trimCliOutputText(raw, true));
     try std.testing.expectEqualStrings(raw, trimCliOutputText(raw, false));
+}
+
+test "accelerator SSE escaping retains a full token of control bytes" {
+    const text: [256]u8 = @splat(0);
+    var buf: [4096]u8 = undefined;
+    const payload = try formatChunkJson(&buf, &text, true);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("choices").?.array.items[0].object.get("delta").?.object.get("content").?.string;
+    try std.testing.expectEqualStrings(&text, content);
 }

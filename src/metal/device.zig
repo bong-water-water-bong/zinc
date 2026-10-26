@@ -57,7 +57,7 @@ pub const MetalDevice = struct {
         }
         const family_raw = shim.mtl_chip_family(ctx);
         const chip: GpuFamily = if (family_raw == 7 or family_raw == 8 or family_raw == 9 or family_raw == 10)
-            @enumFromInt(family_raw)
+            @fromBackingInt(@intCast(family_raw))
         else
             .unknown;
         return .{

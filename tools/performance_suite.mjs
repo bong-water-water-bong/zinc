@@ -1,26 +1,41 @@
-import { spawn, spawnSync } from "node:child_process";
-import { promises as fs } from "node:fs";
-import net from "node:net";
-import os from "node:os";
-import path from "node:path";
-import { performance } from "node:perf_hooks";
-import { fileURLToPath } from "node:url";
+import { outputQualityStatus } from './benchmark_quality.mjs';
+export { outputQualityStatus } from './benchmark_quality.mjs';
+import { spawn, spawnSync } from 'node:child_process';
+import { promises as fs } from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { performance } from 'node:perf_hooks';
+import { fileURLToPath } from 'node:url';
 
 const TOOL_PATH = fileURLToPath(import.meta.url);
-const ROOT = path.resolve(path.dirname(TOOL_PATH), "..");
-const DEFAULT_SITE_DATA = path.join(ROOT, "site", "src", "data", "zinc-performance.json");
+const ROOT = path.resolve(path.dirname(TOOL_PATH), '..');
+const DEFAULT_SITE_DATA = path.join(ROOT, 'site', 'src', 'data', 'zinc-performance.json');
 const DEFAULT_OUTPUT = `/tmp/zinc-performance-${Date.now()}.json`;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
-const DEFAULT_LOCAL_CACHE = path.join(ROOT, ".zig-global-cache");
-export const DEFAULT_LOCAL_MODEL_ROOT = path.join(os.homedir(), "Library", "Caches", "zinc", "models", "models");
-const DEFAULT_DOCKER_LLAMA_SERVER = path.join(os.homedir(), ".docker", "bin", "inference", "llama-server");
-const DEFAULT_RDNA_WORKDIR = "/root/zinc-bench";
-const DEFAULT_RDNA_MODEL_ROOT = "/root/models";
-const TARGET_ORDER = ["rdna", "rdna-rocm", "rdna-zinc-rt", "cuda", "intel", "metal"];
+const DEFAULT_LOCAL_CACHE = path.join(ROOT, '.zig-global-cache');
+export const DEFAULT_LOCAL_MODEL_ROOT = path.join(
+  os.homedir(),
+  'Library',
+  'Caches',
+  'zinc',
+  'models',
+  'models',
+);
+const DEFAULT_DOCKER_LLAMA_SERVER = path.join(
+  os.homedir(),
+  '.docker',
+  'bin',
+  'inference',
+  'llama-server',
+);
+const DEFAULT_RDNA_WORKDIR = '/root/zinc-bench';
+const DEFAULT_RDNA_MODEL_ROOT = '/root/models';
+const TARGET_ORDER = ['rdna', 'rdna-rocm', 'rdna-zinc-rt', 'cuda', 'intel', 'metal'];
 const MAX_CAPTURE_CHARS = 256_000;
 
 function modelPath(root, dir) {
-  return path.join(root, dir, "model.gguf");
+  return path.join(root, dir, 'model.gguf');
 }
 
 function shellQuote(value) {
@@ -28,7 +43,7 @@ function shellQuote(value) {
 }
 
 function parseInteger(arg, flag) {
-  const value = Number.parseInt(arg ?? "", 10);
+  const value = Number.parseInt(arg ?? '', 10);
   if (!Number.isFinite(value) || value < 0) {
     throw new Error(`Invalid ${flag} value '${arg}'`);
   }
@@ -36,7 +51,11 @@ function parseInteger(arg, flag) {
 }
 
 function stripOptionalQuotes(value) {
-  if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
     return value.slice(1, -1);
   }
   return value;
@@ -46,9 +65,9 @@ export function parseDotEnv(text) {
   const env = {};
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const exportPrefix = line.startsWith("export ") ? "export ".length : 0;
-    const eq = line.indexOf("=", exportPrefix);
+    if (!line || line.startsWith('#')) continue;
+    const exportPrefix = line.startsWith('export ') ? 'export '.length : 0;
+    const eq = line.indexOf('=', exportPrefix);
     if (eq === -1) continue;
     const key = line.slice(exportPrefix, eq).trim();
     const value = stripOptionalQuotes(line.slice(eq + 1).trim());
@@ -58,26 +77,22 @@ export function parseDotEnv(text) {
 }
 
 export function benchmarkStatisticsNote(runs, warmupRuns) {
-  const warmupText = warmupRuns === 1
-    ? "one warmup pass is"
-    : `${warmupRuns} warmup passes are`;
-  const runText = runs === 1
-    ? "one measured run is"
-    : `${runs} measured runs are`;
+  const warmupText = warmupRuns === 1 ? 'one warmup pass is' : `${warmupRuns} warmup passes are`;
+  const runText = runs === 1 ? 'one measured run is' : `${runs} measured runs are`;
   return `Statistics: ${warmupText} discarded, then ${runText} collected. Published prefill, decode, end-to-end throughput, and latency values are medians.`;
 }
 
 export function measuredRunRange(models) {
   const counts = [];
   for (const model of models ?? []) {
-    const scenarios = Array.isArray(model?.scenarios) && model.scenarios.length > 0
-      ? model.scenarios
-      : [model];
+    const scenarios =
+      Array.isArray(model?.scenarios) && model.scenarios.length > 0 ? model.scenarios : [model];
     for (const scenario of scenarios) {
       for (const engine of [scenario?.zinc, scenario?.baseline]) {
-        const samples = engine?.decode_tps?.samples
-          ?? engine?.prefill_tps?.samples
-          ?? engine?.total_latency_ms?.samples;
+        const samples =
+          engine?.decode_tps?.samples ??
+          engine?.prefill_tps?.samples ??
+          engine?.total_latency_ms?.samples;
         if (Array.isArray(samples) && samples.length > 0) counts.push(samples.length);
       }
     }
@@ -92,11 +107,12 @@ function normalizeMethodologyRunRange(methodology, models) {
   if (!range) return methodology;
 
   const warmupRuns = methodology.warmup_runs ?? 0;
-  const statisticsNote = range.min === range.max
-    ? benchmarkStatisticsNote(range.max, warmupRuns)
-    : `Statistics: ${warmupRuns === 1 ? "one warmup pass is" : `${warmupRuns} warmup passes are`} discarded for every row, then ${range.min}–${range.max} measured runs are collected depending on the model. Published prefill, decode, end-to-end throughput, and latency values are medians.`;
+  const statisticsNote =
+    range.min === range.max
+      ? benchmarkStatisticsNote(range.max, warmupRuns)
+      : `Statistics: ${warmupRuns === 1 ? 'one warmup pass is' : `${warmupRuns} warmup passes are`} discarded for every row, then ${range.min}–${range.max} measured runs are collected depending on the model. Published prefill, decode, end-to-end throughput, and latency values are medians.`;
   const notes = Array.isArray(methodology.notes) ? [...methodology.notes] : [];
-  const statisticsIndex = notes.findIndex((note) => note.startsWith("Statistics:"));
+  const statisticsIndex = notes.findIndex((note) => note.startsWith('Statistics:'));
   if (statisticsIndex >= 0) notes[statisticsIndex] = statisticsNote;
   else notes.push(statisticsNote);
 
@@ -111,21 +127,25 @@ function normalizeMethodologyRunRange(methodology, models) {
 
 async function readDotEnv(dotEnvPath) {
   try {
-    return parseDotEnv(await fs.readFile(dotEnvPath, "utf8"));
+    return parseDotEnv(await fs.readFile(dotEnvPath, 'utf8'));
   } catch {
     return {};
   }
 }
 
 function whichLocalBinary(name) {
-  const result = spawnSync("which", [name], { encoding: "utf8" });
+  const result = spawnSync('which', [name], { encoding: 'utf8' });
   if (result.status === 0) {
     return result.stdout.trim() || null;
   }
   return null;
 }
 
-export function resolveLocalLlamaServer(args, detectedPath = whichLocalBinary("llama-server"), dockerPath = DEFAULT_DOCKER_LLAMA_SERVER) {
+export function resolveLocalLlamaServer(
+  args,
+  detectedPath = whichLocalBinary('llama-server'),
+  dockerPath = DEFAULT_DOCKER_LLAMA_SERVER,
+) {
   if (args.llamaServer) return args.llamaServer;
   if (detectedPath) return detectedPath;
   if (path.isAbsolute(dockerPath)) return dockerPath;
@@ -134,13 +154,13 @@ export function resolveLocalLlamaServer(args, detectedPath = whichLocalBinary("l
 
 export function parseArgs(argv) {
   const args = {
-    target: "both",
+    target: 'both',
     output: DEFAULT_OUTPUT,
     siteData: DEFAULT_SITE_DATA,
     writeSiteData: true,
     runs: 3,
     warmupRuns: 1,
-    phase: "all",
+    phase: 'all',
     scenarios: null,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     models: null,
@@ -149,12 +169,16 @@ export function parseArgs(argv) {
     rdnaBuild: false,
     rdnaStartLlama: false,
     rdnaNode: process.env.ZINC_RDNA_NODE ?? process.env.ZINC_NODE ?? null,
-    rdnaBackend: process.env.ZINC_RDNA_BACKEND ?? "vulkan",
-    rdnaVkDevice: process.env.ZINC_RDNA_VK_DEVICE != null
-      ? parseInteger(process.env.ZINC_RDNA_VK_DEVICE, "ZINC_RDNA_VK_DEVICE")
-      : 0,
-    rdnaLlamaCli: process.env.ZINC_RDNA_LLAMA_CLI_REMOTE ?? process.env.ZINC_LLAMA_CLI_REMOTE ?? null,
-    rdnaLlamaServer: process.env.ZINC_RDNA_LLAMA_SERVER_REMOTE ?? process.env.ZINC_LLAMA_SERVER_REMOTE ?? null,
+    rdnaBackend: process.env.ZINC_RDNA_BACKEND ?? 'vulkan',
+    rdnaContext: null,
+    rdnaVkDevice:
+      process.env.ZINC_RDNA_VK_DEVICE != null
+        ? parseInteger(process.env.ZINC_RDNA_VK_DEVICE, 'ZINC_RDNA_VK_DEVICE')
+        : 0,
+    rdnaLlamaCli:
+      process.env.ZINC_RDNA_LLAMA_CLI_REMOTE ?? process.env.ZINC_LLAMA_CLI_REMOTE ?? null,
+    rdnaLlamaServer:
+      process.env.ZINC_RDNA_LLAMA_SERVER_REMOTE ?? process.env.ZINC_LLAMA_SERVER_REMOTE ?? null,
     rdnaLlamaDevice: process.env.ZINC_RDNA_LLAMA_DEVICE ?? null,
     requireRdnaDeviceSubstring: process.env.ZINC_RDNA_REQUIRE_DEVICE_SUBSTRING ?? null,
     cudaSync: false,
@@ -186,148 +210,174 @@ export function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     switch (arg) {
-      case "--target": {
-        const value = argv[++i] ?? "";
-        if (!["metal", "rdna", "cuda", "intel", "both", "all"].includes(value)) {
-          throw new Error(`Invalid --target '${value}'. Expected metal, rdna, cuda, intel, both, or all.`);
+      case '--target': {
+        const value = argv[++i] ?? '';
+        if (!['metal', 'rdna', 'cuda', 'intel', 'both', 'all'].includes(value)) {
+          throw new Error(
+            `Invalid --target '${value}'. Expected metal, rdna, cuda, intel, both, or all.`,
+          );
         }
         args.target = value;
         break;
       }
-      case "--output":
+      case '--output':
         args.output = argv[++i] ?? args.output;
         break;
-      case "--site-data":
+      case '--site-data':
         args.siteData = argv[++i] ?? args.siteData;
         break;
-      case "--no-site-write":
+      case '--no-site-write':
         args.writeSiteData = false;
         break;
-      case "--runs":
-        args.runs = parseInteger(argv[++i], "--runs");
+      case '--runs':
+        args.runs = parseInteger(argv[++i], '--runs');
         break;
-      case "--warmup":
-        args.warmupRuns = parseInteger(argv[++i], "--warmup");
+      case '--warmup':
+        args.warmupRuns = parseInteger(argv[++i], '--warmup');
         break;
-      case "--phase": {
-        const value = argv[++i] ?? "";
-        if (!["all", "zinc", "baseline"].includes(value)) {
+      case '--phase': {
+        const value = argv[++i] ?? '';
+        if (!['all', 'zinc', 'baseline'].includes(value)) {
           throw new Error(`Invalid --phase '${value}'. Expected all, zinc, or baseline.`);
         }
         args.phase = value;
         break;
       }
-      case "--scenarios":
-        args.scenarios = new Set((argv[++i] ?? "").split(",").map((value) => value.trim()).filter(Boolean));
+      case '--scenarios':
+        args.scenarios = new Set(
+          (argv[++i] ?? '')
+            .split(',')
+            .map((value) => value.trim())
+            .filter(Boolean),
+        );
         break;
-      case "--timeout-ms":
-        args.timeoutMs = parseInteger(argv[++i], "--timeout-ms");
+      case '--timeout-ms':
+        args.timeoutMs = parseInteger(argv[++i], '--timeout-ms');
         break;
-      case "--models":
-        args.models = new Set((argv[++i] ?? "").split(",").map((value) => value.trim()).filter(Boolean));
+      case '--models':
+        args.models = new Set(
+          (argv[++i] ?? '')
+            .split(',')
+            .map((value) => value.trim())
+            .filter(Boolean),
+        );
         break;
-      case "--discover-models":
-      case "--all-models":
+      case '--discover-models':
+      case '--all-models':
         args.discoverModels = true;
         break;
-      case "--llama-cli":
+      case '--llama-cli':
         args.llamaCli = argv[++i] ?? args.llamaCli;
         break;
-      case "--llama-server":
+      case '--llama-server':
         args.llamaServer = argv[++i] ?? args.llamaServer;
         break;
-      case "--skip-local-build":
+      case '--skip-local-build':
         args.buildLocal = false;
         break;
-      case "--rdna-sync":
+      case '--rdna-sync':
         args.rdnaSync = true;
         break;
-      case "--rdna-build":
+      case '--rdna-build':
         args.rdnaBuild = true;
         break;
-      case "--rdna-start-llama":
+      case '--rdna-start-llama':
         args.rdnaStartLlama = true;
         break;
-      case "--rdna-node":
+      case '--rdna-node':
         args.rdnaNode = argv[++i] ?? args.rdnaNode;
         break;
-      case "--rdna-backend":
+      case '--rdna-backend':
         args.rdnaBackend = argv[++i] ?? args.rdnaBackend;
         break;
-      case "--intel-sync":
+      case '--rdna-context': {
+        const context = Number(argv[++i]);
+        if (!Number.isSafeInteger(context) || context < 1 || context > 4294967295)
+          throw new Error('--rdna-context must be a positive 32-bit integer');
+        args.rdnaContext = context;
+        break;
+      }
+      case '--rdna-llama-kv': {
+        const format = argv[++i];
+        if (!['f16', 'q8_0'].includes(format))
+          throw new Error('--rdna-llama-kv must be f16 or q8_0');
+        args.rdnaLlamaKv = format;
+        break;
+      }
+      case '--intel-sync':
         args.intelSync = true;
         break;
-      case "--intel-build":
+      case '--intel-build':
         args.intelBuild = true;
         break;
-      case "--intel-start-llama":
+      case '--intel-start-llama':
         args.intelStartLlama = true;
         break;
-      case "--metal-pull-missing":
+      case '--metal-pull-missing':
         args.metalPullMissing = true;
         break;
-      case "--local-model-root":
+      case '--local-model-root':
         args.localModelRoot = argv[++i] ?? args.localModelRoot;
         break;
-      case "--rdna-model-root":
+      case '--rdna-model-root':
         args.rdnaModelRoot = argv[++i] ?? args.rdnaModelRoot;
         break;
-      case "--rdna-workdir":
+      case '--rdna-workdir':
         args.rdnaWorkdir = argv[++i] ?? args.rdnaWorkdir;
         break;
-      case "--rdna-vk-device":
-        args.rdnaVkDevice = parseInteger(argv[++i], "--rdna-vk-device");
+      case '--rdna-vk-device':
+        args.rdnaVkDevice = parseInteger(argv[++i], '--rdna-vk-device');
         break;
-      case "--rdna-llama-cli":
+      case '--rdna-llama-cli':
         args.rdnaLlamaCli = argv[++i] ?? args.rdnaLlamaCli;
         break;
-      case "--rdna-llama-server":
+      case '--rdna-llama-server':
         args.rdnaLlamaServer = argv[++i] ?? args.rdnaLlamaServer;
         break;
-      case "--rdna-llama-device":
+      case '--rdna-llama-device':
         args.rdnaLlamaDevice = argv[++i] ?? args.rdnaLlamaDevice;
         break;
-      case "--require-rdna-device-substring":
+      case '--require-rdna-device-substring':
         args.requireRdnaDeviceSubstring = argv[++i] ?? args.requireRdnaDeviceSubstring;
         break;
-      case "--cuda-sync":
+      case '--cuda-sync':
         args.cudaSync = true;
         break;
-      case "--cuda-build":
+      case '--cuda-build':
         args.cudaBuild = true;
         break;
-      case "--cuda-start-llama":
+      case '--cuda-start-llama':
         args.cudaStartLlama = true;
         break;
-      case "--cuda-node":
+      case '--cuda-node':
         args.cudaNode = argv[++i] ?? args.cudaNode;
         break;
-      case "--cuda-gpu":
+      case '--cuda-gpu':
         args.cudaGpuUuid = argv[++i] ?? args.cudaGpuUuid;
         break;
-      case "--cuda-workdir":
+      case '--cuda-workdir':
         args.cudaWorkdir = argv[++i] ?? args.cudaWorkdir;
         break;
-      case "--cuda-model-root":
+      case '--cuda-model-root':
         args.cudaModelRoot = argv[++i] ?? args.cudaModelRoot;
         break;
-      case "--intel-model-root":
+      case '--intel-model-root':
         args.intelModelRoot = argv[++i] ?? args.intelModelRoot;
         break;
-      case "--intel-workdir":
+      case '--intel-workdir':
         args.intelWorkdir = argv[++i] ?? args.intelWorkdir;
         break;
-      case "--intel-xdg-cache-home":
+      case '--intel-xdg-cache-home':
         args.intelXdgCacheHome = argv[++i] ?? args.intelXdgCacheHome;
         break;
-      case "--intel-remote-libc-conf":
+      case '--intel-remote-libc-conf':
         args.intelRemoteLibcConf = argv[++i] ?? args.intelRemoteLibcConf;
         break;
-      case "--local-cache-dir":
+      case '--local-cache-dir':
         args.localCacheDir = argv[++i] ?? args.localCacheDir;
         break;
-      case "-h":
-      case "--help":
+      case '-h':
+      case '--help':
         args.help = true;
         break;
       default:
@@ -335,21 +385,23 @@ export function parseArgs(argv) {
     }
   }
 
-  if (args.runs === 0) throw new Error("--runs must be at least 1");
-  if (!["auto", "vulkan", "rocm", "zinc_rt"].includes(args.rdnaBackend)) {
-    throw new Error(`Invalid --rdna-backend '${args.rdnaBackend}'. Expected auto, vulkan, rocm, or zinc_rt.`);
+  if (args.runs === 0) throw new Error('--runs must be at least 1');
+  if (!['auto', 'vulkan', 'rocm', 'zinc_rt'].includes(args.rdnaBackend)) {
+    throw new Error(
+      `Invalid --rdna-backend '${args.rdnaBackend}'. Expected auto, vulkan, rocm, or zinc_rt.`,
+    );
   }
   return args;
 }
 
 export function rdnaTargetIdentity(backend) {
-  if (backend === "rocm") {
-    return { id: "rdna-rocm", label: "AMD RDNA · ROCm" };
+  if (backend === 'rocm') {
+    return { id: 'rdna-rocm', label: 'AMD RDNA · ROCm' };
   }
-  if (backend === "zinc_rt") {
-    return { id: "rdna-zinc-rt", label: "AMD RDNA · ZINC_RT" };
+  if (backend === 'zinc_rt') {
+    return { id: 'rdna-zinc-rt', label: 'AMD RDNA · ZINC_RT' };
   }
-  return { id: "rdna", label: "AMD RDNA · Vulkan" };
+  return { id: 'rdna', label: 'AMD RDNA · Vulkan' };
 }
 
 function usage() {
@@ -382,8 +434,10 @@ function usage() {
   --local-model-root <path>   Override local GGUF cache root
   --rdna-model-root <path>    Override remote model root
   --rdna-workdir <path>       Override remote ZINC checkout path
-  --rdna-vk-device <n>        Vulkan device index on the RDNA node (default 0; env: ZINC_RDNA_VK_DEVICE).
-                              Use 'vulkaninfo --summary' on the node to pick the discrete GPU.
+  --rdna-vk-device <n>        GPU index: Vulkan, or ROCr with the ROCm backend (default 0).
+                              Use vulkaninfo for Vulkan, or rocminfo for ROCm.
+  --rdna-context <n>          Context per slot for both RDNA servers (default: model setting or 4096).
+  --rdna-llama-kv <format>    Baseline KV format: f16 (default) or q8_0 for larger contexts.
   --rdna-llama-cli <path>     Override remote RDNA llama-cli baseline binary
   --rdna-llama-server <path>  Override remote RDNA llama-server baseline binary
   --rdna-llama-device <dev>   Override RDNA llama.cpp --device value, e.g. Vulkan1 or ROCm0.
@@ -405,11 +459,13 @@ function usage() {
 /// ("NextN/MTP: request accepted 12/16 draft tokens (75.0%) ..."). The last
 /// one in the captured output (or the server log tail) belongs to this run.
 export function parseZincSpeculative(text) {
-  const matches = [...text.matchAll(/NextN\/MTP: request accepted (\d+)\/(\d+) draft tokens \(([\d.]+)%\)/g)];
+  const matches = [
+    ...text.matchAll(/NextN\/MTP: request accepted (\d+)\/(\d+) draft tokens \(([\d.]+)%\)/g),
+  ];
   if (matches.length === 0) return null;
   const last = matches[matches.length - 1];
   return {
-    kind: "nextn",
+    kind: 'nextn',
     accepted: Number(last[1]),
     drafted: Number(last[2]),
     acceptancePct: Number(last[3]),
@@ -418,80 +474,110 @@ export function parseZincSpeculative(text) {
 
 export function parseZincCliOutput(text) {
   const promptTokens = text.match(/Prompt tokens \((\d+)\):/);
-  const prefill = text.match(/Prefill(?:\s+complete)?\s*:\s*(\d+)\s+tokens\s+in\s+([\d.]+)\s*(ms|s)\s*\(([\d.]+)\s+tok\/s\)/i);
-  const prefillTimingOnly = text.match(/Prefill(?:\s+complete)?\s*:\s*(\d+)\s+tokens\s+in\s+([\d.]+)\s*(ms|s)/i);
-  const generated = text.match(/Generated\s+(\d+)\s+tokens\s+in\s+([\d.]+)\s+ms\s+[—-]\s+([\d.]+)\s+tok\/s\s+\(([\d.]+)\s+ms\/tok\)/);
+  const prefill = text.match(
+    /Prefill(?:\s+complete)?\s*:\s*(\d+)\s+tokens\s+in\s+([\d.]+)\s*(ms|s)\s*\(([\d.]+)\s+tok\/s\)/i,
+  );
+  const prefillTimingOnly = text.match(
+    /Prefill(?:\s+complete)?\s*:\s*(\d+)\s+tokens\s+in\s+([\d.]+)\s*(ms|s)/i,
+  );
+  const generated = text.match(
+    /Generated\s+(\d+)\s+tokens\s+in\s+([\d.]+)\s+ms\s+[—-]\s+([\d.]+)\s+tok\/s\s+\(([\d.]+)\s+ms\/tok\)/,
+  );
   const output = text.match(/Output \((\d+) tokens\):\s*(.+)$/m);
-  const outputText = text.match(/info\(zinc\): Output text:\s*([\s\S]*?)(?:\ninfo\(zinc\): Output tokens|\s*$)/);
+  const outputText = text.match(
+    /info\(zinc\): Output text:\s*([\s\S]*?)(?:\ninfo\(zinc\): Output tokens|\s*$)/,
+  );
   const speculative = parseZincSpeculative(text);
 
   if (!generated) {
-    throw new Error("Could not parse ZINC CLI output");
+    throw new Error('Could not parse ZINC CLI output');
   }
 
   return {
     promptTokens: promptTokens ? Number(promptTokens[1]) : null,
-    prefillTokens: prefill ? Number(prefill[1]) : (prefillTimingOnly ? Number(prefillTimingOnly[1]) : (promptTokens ? Number(promptTokens[1]) : null)),
+    prefillTokens: prefill
+      ? Number(prefill[1])
+      : prefillTimingOnly
+        ? Number(prefillTimingOnly[1])
+        : promptTokens
+          ? Number(promptTokens[1])
+          : null,
     prefillMs: prefill
-      ? (prefill[3] === "s" ? Number(prefill[2]) * 1000 : Number(prefill[2]))
-      : (prefillTimingOnly ? (prefillTimingOnly[3] === "s" ? Number(prefillTimingOnly[2]) * 1000 : Number(prefillTimingOnly[2])) : null),
+      ? prefill[3] === 's'
+        ? Number(prefill[2]) * 1000
+        : Number(prefill[2])
+      : prefillTimingOnly
+        ? prefillTimingOnly[3] === 's'
+          ? Number(prefillTimingOnly[2]) * 1000
+          : Number(prefillTimingOnly[2])
+        : null,
     prefillTps: prefill
       ? Number(prefill[4])
-      : (prefillTimingOnly
+      : prefillTimingOnly
         ? (() => {
             const tokens = Number(prefillTimingOnly[1]);
-            const seconds = prefillTimingOnly[3] === "s" ? Number(prefillTimingOnly[2]) : Number(prefillTimingOnly[2]) / 1000;
+            const seconds =
+              prefillTimingOnly[3] === 's'
+                ? Number(prefillTimingOnly[2])
+                : Number(prefillTimingOnly[2]) / 1000;
             return seconds > 0 ? tokens / seconds : null;
           })()
-        : null),
+        : null,
     generatedTokens: Number(generated[1]),
     speculative,
     decodeMs: Number(generated[2]),
     decodeTps: Number(generated[3]),
     msPerToken: Number(generated[4]),
-    outputPreview: output ? output[2].trim() : (outputText ? outputText[1].trim() : ""),
+    outputPreview: output ? output[2].trim() : outputText ? outputText[1].trim() : '',
   };
 }
 
 export function parseZincServerOutput(text) {
-  const marker = "\n__ZINC_TIMING__\n";
+  const marker = '\n__ZINC_TIMING__\n';
   const markerIndex = text.lastIndexOf(marker);
   if (markerIndex === -1) {
-    throw new Error("Could not parse ZINC server timing output");
+    throw new Error('Could not parse ZINC server timing output');
   }
 
   const body = JSON.parse(text.slice(0, markerIndex).trim());
   if (body.error) {
-    throw new Error(body.error.message ?? "ZINC server returned an error");
+    throw new Error(body.error.message ?? 'ZINC server returned an error');
   }
 
   const parsed = parseZincCliOutput(text.slice(markerIndex + marker.length));
   const choice = body.choices?.[0] ?? {};
-  const content = [choice.text, choice.message?.content, choice.message?.reasoning_content]
-    .find((value) => typeof value === "string" && value.trim()) ?? "";
+  const content =
+    [choice.text, choice.message?.content, choice.message?.reasoning_content].find(
+      (value) => typeof value === 'string' && value.trim(),
+    ) ?? '';
   const promptTokens = body.usage?.prompt_tokens ?? parsed.promptTokens;
   const generatedTokens = body.usage?.completion_tokens ?? parsed.generatedTokens;
   if (!Number.isFinite(generatedTokens) || generatedTokens <= 0) {
-    throw new Error("ZINC server returned no generated tokens");
+    throw new Error('ZINC server returned no generated tokens');
   }
   if (!Number.isFinite(parsed.decodeTps) || parsed.decodeTps <= 0) {
-    throw new Error("ZINC server returned no usable decode timing");
+    throw new Error('ZINC server returned no usable decode timing');
   }
   return {
     ...parsed,
     promptTokens,
     prefillTokens: promptTokens ?? parsed.prefillTokens,
     generatedTokens,
-    outputPreview: typeof content === "string" && content.trim() ? content.trim() : parsed.outputPreview,
+    outputPreview:
+      typeof content === 'string' && content.trim() ? content.trim() : parsed.outputPreview,
   };
 }
 
 export function parseLlamaCliOutput(text) {
-  const prompt = text.match(/^\s*llama_print_timings:\s+prompt eval time =\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s+tokens.*?,\s*([\d.]+)\s+tokens per second\)/m);
-  const decode = text.match(/^\s*llama_print_timings:\s+eval time =\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s+(?:runs|tokens).*?,\s*([\d.]+)\s+tokens per second\)/m);
+  const prompt = text.match(
+    /^\s*llama_print_timings:\s+prompt eval time =\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s+tokens.*?,\s*([\d.]+)\s+tokens per second\)/m,
+  );
+  const decode = text.match(
+    /^\s*llama_print_timings:\s+eval time =\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s+(?:runs|tokens).*?,\s*([\d.]+)\s+tokens per second\)/m,
+  );
 
   if (!decode) {
-    throw new Error("Could not parse llama.cpp CLI timings");
+    throw new Error('Could not parse llama.cpp CLI timings');
   }
 
   const decodeMs = Number(decode[1]);
@@ -505,7 +591,7 @@ export function parseLlamaCliOutput(text) {
     decodeMs,
     decodeTps: Number(decode[3]),
     msPerToken: generatedTokens > 0 ? decodeMs / generatedTokens : null,
-    outputPreview: "",
+    outputPreview: '',
   };
 }
 
@@ -518,9 +604,10 @@ export function parseLlamaCppVersionOutput(text) {
   if (!versionLine) return null;
 
   const version = versionLine.match(/^version:\s*([^\s]+)/i)?.[1] ?? null;
-  const commit = versionLine.match(/\bcommit\s+([0-9a-f]{7,40})\b/i)?.[1]
-    ?? versionLine.match(/\(([0-9a-f]{7,40})\)/i)?.[1]
-    ?? null;
+  const commit =
+    versionLine.match(/\bcommit\s+([0-9a-f]{7,40})\b/i)?.[1] ??
+    versionLine.match(/\(([0-9a-f]{7,40})\)/i)?.[1] ??
+    null;
   if (!version || !commit) return null;
 
   return {
@@ -530,30 +617,37 @@ export function parseLlamaCppVersionOutput(text) {
 }
 
 export function parseZincVersionOutput(text) {
-  const lines = String(text ?? "")
+  const lines = String(text ?? '')
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
   const versionLine = lines.find((line) => /^zinc\s+/i.test(line));
   const field = (name) => {
     const prefix = `${name}:`;
-    return lines.find((line) => line.toLowerCase().startsWith(prefix))?.slice(prefix.length).trim() ?? null;
+    return (
+      lines
+        .find((line) => line.toLowerCase().startsWith(prefix))
+        ?.slice(prefix.length)
+        .trim() ?? null
+    );
   };
   return {
-    version: versionLine ? versionLine.replace(/^zinc\s+/i, "").trim() : null,
-    commit: field("commit"),
-    target: field("target"),
-    optimize: field("optimize"),
-    backend: field("backends") ?? field("backend"),
+    version: versionLine ? versionLine.replace(/^zinc\s+/i, '').trim() : null,
+    commit: field('commit'),
+    target: field('target'),
+    optimize: field('optimize'),
+    backend: field('backends') ?? field('backend'),
   };
 }
 
 export function validateZincBackend(versionText, expectedBackend) {
-  if (!expectedBackend || expectedBackend === "auto") return parseZincVersionOutput(versionText);
+  if (!expectedBackend || expectedBackend === 'auto') return parseZincVersionOutput(versionText);
   const parsed = parseZincVersionOutput(versionText);
   if (parsed.backend !== expectedBackend) {
-    const observed = parsed.backend ?? "unknown";
-    throw new Error(`RDNA ZINC binary backend mismatch: expected ${expectedBackend}, observed ${observed}. Rebuild or stop the process that overwrote zig-out/bin/zinc.`);
+    const observed = parsed.backend ?? 'unknown';
+    throw new Error(
+      `RDNA ZINC binary backend mismatch: expected ${expectedBackend}, observed ${observed}. Rebuild or stop the process that overwrote zig-out/bin/zinc.`,
+    );
   }
   return parsed;
 }
@@ -561,8 +655,10 @@ export function validateZincBackend(versionText, expectedBackend) {
 export function parseOpenAiCompletionOutput(text) {
   const body = JSON.parse(text);
   const choice = body.choices?.[0] ?? {};
-  const content = [choice.text, choice.message?.content, choice.message?.reasoning_content]
-    .find((value) => typeof value === "string" && value.trim()) ?? "";
+  const content =
+    [choice.text, choice.message?.content, choice.message?.reasoning_content].find(
+      (value) => typeof value === 'string' && value.trim(),
+    ) ?? '';
   const promptTokens = body.usage?.prompt_tokens ?? null;
   const generatedTokens = body.usage?.completion_tokens ?? 0;
   const timings = body.timings ?? {};
@@ -574,13 +670,15 @@ export function parseOpenAiCompletionOutput(text) {
   return {
     promptTokens,
     prefillTokens,
-    prefillMs: timingPromptMs ?? (prefillTokens != null && promptTps ? (prefillTokens / promptTps) * 1000 : null),
+    prefillMs:
+      timingPromptMs ??
+      (prefillTokens != null && promptTps ? (prefillTokens / promptTps) * 1000 : null),
     prefillTps: promptTps,
     generatedTokens,
     decodeMs: generatedTokens > 0 && decodeTps ? (generatedTokens / decodeTps) * 1000 : null,
     decodeTps,
     msPerToken: decodeTps ? 1000 / decodeTps : null,
-    outputPreview: typeof content === "string" ? content.trim() : "",
+    outputPreview: typeof content === 'string' ? content.trim() : '',
   };
 }
 
@@ -591,7 +689,7 @@ export function summarizeValues(values) {
   const mid = Math.floor(xs.length / 2);
   const median = xs.length % 2 === 1 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
   const avg = sum / xs.length;
-  const variance = xs.reduce((total, value) => total + ((value - avg) ** 2), 0) / xs.length;
+  const variance = xs.reduce((total, value) => total + (value - avg) ** 2, 0) / xs.length;
   const percentile = (p) => {
     if (xs.length === 1) return xs[0];
     const rank = (xs.length - 1) * p;
@@ -613,11 +711,11 @@ export function summarizeValues(values) {
 }
 
 function finiteMetric(value) {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 function finiteTokenCount(value) {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 function backendPhaseSeconds(prefillTps, decodeTps, promptTokens, generatedTokens) {
@@ -647,149 +745,11 @@ function matchingGeneratedBudget(zincGenerated, baselineGenerated, expectedGener
   return true;
 }
 
-export function outputQualityStatus(preview, generatedTokens = null) {
-  const text = `${preview ?? ""}`.trim();
-  if (!text) {
-    if (generatedTokens != null && generatedTokens <= 0) {
-      return {
-        tone: "caution",
-        label: "Generation failed",
-        note: "The request returned without generating a token.",
-      };
-    }
-    return {
-      tone: "neutral",
-      label: "No Preview",
-      note: "No output preview was captured for this workload.",
-    };
-  }
-
-  if (/^<\|(?:im_end|endoftext|end)\|>$/.test(text) || (generatedTokens != null && generatedTokens <= 4 && text.includes("<|im_end|>"))) {
-    return {
-      tone: "caution",
-      label: "Preview flagged",
-      note: "ZINC completed numerically, but the preview is only a stop token.",
-    };
-  }
-
-  if (/<\|[^>\n]{1,64}\|>/.test(text)) {
-    return {
-      tone: "caution",
-      label: "Preview flagged",
-      note: "ZINC completed numerically, but the preview contains raw chat control tokens.",
-    };
-  }
-
-  if (/<pad>/i.test(text)) {
-    return {
-      tone: "caution",
-      label: "Preview flagged",
-      note: "ZINC completed numerically, but the preview contains raw padding tokens.",
-    };
-  }
-
-  if ((text.match(/<think>/g) ?? []).length > 1 || /<\/?parameter>/.test(text)) {
-    return {
-      tone: "caution",
-      label: "Preview flagged",
-      note: "ZINC completed numerically, but the preview contains repeated reasoning/control tags.",
-    };
-  }
-
-  if (
-    /(?:^|[\s:])(?:\d+\.){12,}/.test(text) ||
-    /(?:^|\n)\s*(\d+[.)])\s*(?:\n\s*\1\s*){11,}/.test(text) ||
-    hasRepeatedNumberedItemText(text) ||
-    hasRepeatedLineText(text) ||
-    /([#*_=-])\1{31,}/.test(text) ||
-    hasRepeatedTokenPattern(text) ||
-    /\b([A-Za-z]{3,})\1{8,}\b/.test(text)
-  ) {
-    return {
-      tone: "caution",
-      label: "Preview flagged",
-      note: "ZINC completed numerically, but the preview shows a repeated pattern.",
-    };
-  }
-
-  return {
-    tone: "positive",
-    label: "Preview OK",
-    note: "The captured preview does not show an obvious stop-token, control-token, or repetition failure.",
-  };
-}
-
-function hasRepeatedTokenPattern(text) {
-  const tokens = text.toLowerCase().match(/[\p{L}\p{N}]+|[^\s\p{L}\p{N}]/gu) ?? [];
-  for (let width = 1; width <= 8; width += 1) {
-    if (tokens.length < width * 6) continue;
-    for (let start = 0; start + width * 6 <= tokens.length; start += 1) {
-      const pattern = tokens.slice(start, start + width).join("\u0000");
-      let repeats = 1;
-      while (
-        start + (repeats + 1) * width <= tokens.length &&
-        tokens.slice(start + repeats * width, start + (repeats + 1) * width).join("\u0000") === pattern
-      ) repeats += 1;
-      if (repeats >= 6) return true;
-    }
-  }
-  return false;
-}
-
-function hasRepeatedNumberedItemText(text) {
-  const items = [...text.matchAll(/(?:^|\s)(\d{1,3})[.)]\s+([\s\S]*?)(?=(?:\s+\d{1,3}[.)]\s+)|$)/g)]
-    .map((match) => `${match[2] ?? ""}`
-      .toLowerCase()
-      .replace(/\s+/g, " ")
-      .trim())
-    .filter((item) => item.length >= 24);
-  let last = "";
-  let run = 0;
-  for (const item of items) {
-    const key = item.slice(0, 160);
-    if (key === last) {
-      run += 1;
-    } else {
-      last = key;
-      run = 1;
-    }
-    if (run >= 4) return true;
-  }
-  return false;
-}
-
-function hasRepeatedLineText(text) {
-  const counts = new Map();
-  let previous = "";
-  let run = 0;
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine
-      .toLowerCase()
-      .replace(/^\s*(?:[-*\u2022]|\d{1,3}[.)])\s+/, "")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (line.length < 18) continue;
-
-    if (line === previous) {
-      run += 1;
-    } else {
-      previous = line;
-      run = 1;
-    }
-    if (run >= 3) return true;
-
-    const nextCount = (counts.get(line) ?? 0) + 1;
-    if (nextCount >= 4) return true;
-    counts.set(line, nextCount);
-  }
-  return false;
-}
-
 function scenarioNeedsOutputReview(scenario) {
-  return outputQualityStatus(
-    scenario?.zinc?.output_preview,
-    scenario?.zinc?.generated_tokens,
-  ).tone === "caution";
+  return (
+    outputQualityStatus(scenario?.zinc?.output_preview, scenario?.zinc?.generated_tokens).tone ===
+    'caution'
+  );
 }
 
 // Both engines render the same chat template, so their token counts may
@@ -803,41 +763,80 @@ export function promptTokensMatch(zincTokens, baselineTokens) {
 
 export function buildComparison(zincSummary, baselineSummary, options = {}) {
   if (!zincSummary || !baselineSummary) return null;
-  const zincDecode = finiteMetric(zincSummary.decode_tps?.median ?? zincSummary.decode_tps?.avg ?? null);
-  const baselineDecode = finiteMetric(baselineSummary.decode_tps?.median ?? baselineSummary.decode_tps?.avg ?? null);
-  const zincPrefill = finiteMetric(zincSummary.prefill_tps?.median ?? zincSummary.prefill_tps?.avg ?? null);
-  const baselinePrefill = finiteMetric(baselineSummary.prefill_tps?.median ?? baselineSummary.prefill_tps?.avg ?? null);
+  const zincDecode = finiteMetric(
+    zincSummary.decode_tps?.median ?? zincSummary.decode_tps?.avg ?? null,
+  );
+  const baselineDecode = finiteMetric(
+    baselineSummary.decode_tps?.median ?? baselineSummary.decode_tps?.avg ?? null,
+  );
+  const zincPrefill = finiteMetric(
+    zincSummary.prefill_tps?.median ?? zincSummary.prefill_tps?.avg ?? null,
+  );
+  const baselinePrefill = finiteMetric(
+    baselineSummary.prefill_tps?.median ?? baselineSummary.prefill_tps?.avg ?? null,
+  );
   const zincPromptTokens = finiteTokenCount(zincSummary.prompt_tokens);
   const baselinePromptTokens = finiteTokenCount(baselineSummary.prompt_tokens);
   const zincPrefillTokens = finiteTokenCount(zincSummary.prefill_tokens) ?? zincPromptTokens;
-  const baselinePrefillTokens = finiteTokenCount(baselineSummary.prefill_tokens) ?? baselinePromptTokens;
+  const baselinePrefillTokens =
+    finiteTokenCount(baselineSummary.prefill_tokens) ?? baselinePromptTokens;
   const zincGeneratedTokens = finiteTokenCount(zincSummary.generated_tokens);
   const baselineGeneratedTokens = finiteTokenCount(baselineSummary.generated_tokens);
-  const zincLatency = finiteMetric(zincSummary.total_latency_ms?.median ?? zincSummary.total_latency_ms?.avg ?? null);
-  const baselineLatency = finiteMetric(baselineSummary.total_latency_ms?.median ?? baselineSummary.total_latency_ms?.avg ?? null);
-  const zincEndToEnd = finiteMetric(zincSummary.end_to_end_tps?.median ?? zincSummary.end_to_end_tps?.avg ?? null);
-  const baselineEndToEnd = finiteMetric(baselineSummary.end_to_end_tps?.median ?? baselineSummary.end_to_end_tps?.avg ?? null);
+  const zincLatency = finiteMetric(
+    zincSummary.total_latency_ms?.median ?? zincSummary.total_latency_ms?.avg ?? null,
+  );
+  const baselineLatency = finiteMetric(
+    baselineSummary.total_latency_ms?.median ?? baselineSummary.total_latency_ms?.avg ?? null,
+  );
+  const zincEndToEnd = finiteMetric(
+    zincSummary.end_to_end_tps?.median ?? zincSummary.end_to_end_tps?.avg ?? null,
+  );
+  const baselineEndToEnd = finiteMetric(
+    baselineSummary.end_to_end_tps?.median ?? baselineSummary.end_to_end_tps?.avg ?? null,
+  );
   if (!zincDecode || !baselineDecode) return null;
 
   // Overall rating is a wall-clock comparison, not an average of prefill and
   // decode percentages. Each backend uses its own tokenizer counts; early-stop
   // rows do not get an aggregate percentage.
-  const zincOverallSeconds = backendPhaseSeconds(zincPrefill, zincDecode, zincPrefillTokens, zincGeneratedTokens);
-  const baselineOverallSeconds = backendPhaseSeconds(baselinePrefill, baselineDecode, baselinePrefillTokens, baselineGeneratedTokens);
+  const zincOverallSeconds = backendPhaseSeconds(
+    zincPrefill,
+    zincDecode,
+    zincPrefillTokens,
+    zincGeneratedTokens,
+  );
+  const baselineOverallSeconds = backendPhaseSeconds(
+    baselinePrefill,
+    baselineDecode,
+    baselinePrefillTokens,
+    baselineGeneratedTokens,
+  );
   const zincTotalPhaseTokens = (zincPrefillTokens ?? 0) + (zincGeneratedTokens ?? 0);
   const baselineTotalPhaseTokens = (baselinePrefillTokens ?? 0) + (baselineGeneratedTokens ?? 0);
-  const zincOverall = zincOverallSeconds && zincTotalPhaseTokens > 0 ? zincTotalPhaseTokens / zincOverallSeconds : null;
-  const baselineOverall = baselineOverallSeconds && baselineTotalPhaseTokens > 0 ? baselineTotalPhaseTokens / baselineOverallSeconds : null;
-  const overallComparable = matchingGeneratedBudget(zincGeneratedTokens, baselineGeneratedTokens, options.expectedGeneratedTokens);
-  const overallPct = overallComparable && zincOverallSeconds && baselineOverallSeconds
-    ? (baselineOverallSeconds / zincOverallSeconds) * 100
-    : null;
+  const zincOverall =
+    zincOverallSeconds && zincTotalPhaseTokens > 0
+      ? zincTotalPhaseTokens / zincOverallSeconds
+      : null;
+  const baselineOverall =
+    baselineOverallSeconds && baselineTotalPhaseTokens > 0
+      ? baselineTotalPhaseTokens / baselineOverallSeconds
+      : null;
+  const overallComparable = matchingGeneratedBudget(
+    zincGeneratedTokens,
+    baselineGeneratedTokens,
+    options.expectedGeneratedTokens,
+  );
+  const overallPct =
+    overallComparable && zincOverallSeconds && baselineOverallSeconds
+      ? (baselineOverallSeconds / zincOverallSeconds) * 100
+      : null;
 
   const pctOfBaseline = (zincDecode / baselineDecode) * 100;
   const gapTps = zincDecode - baselineDecode;
-  const promptTokenDelta = zincPromptTokens != null && baselinePromptTokens != null
-    ? zincPromptTokens - baselinePromptTokens
-    : null;
+  const promptTokenDelta =
+    zincPromptTokens != null && baselinePromptTokens != null
+      ? zincPromptTokens - baselinePromptTokens
+      : null;
   return {
     baseline_name: baselineSummary.name,
     zinc_prompt_tokens: zincPromptTokens,
@@ -856,22 +855,31 @@ export function buildComparison(zincSummary, baselineSummary, options = {}) {
     baseline_overall_tps: baselineOverall,
     zinc_overall_seconds: zincOverallSeconds,
     baseline_overall_seconds: baselineOverallSeconds,
-    overall_basis: "phase_wall_time_v2",
+    overall_basis: 'phase_wall_time_v2',
     overall_comparable: overallPct != null,
-    overall_unavailable_reason: overallPct == null
-      ? "Generated token counts did not match the scenario budget, or phase telemetry was incomplete."
-      : null,
+    overall_unavailable_reason:
+      overallPct == null
+        ? 'Generated token counts did not match the scenario budget, or phase telemetry was incomplete.'
+        : null,
     pct_of_baseline: pctOfBaseline,
     delta_tps: gapTps,
     delta_pct: pctOfBaseline - 100,
-    leader: gapTps >= 0 ? "zinc" : "baseline",
-    prompt_pct_of_baseline: zincPrefill && baselinePrefill ? (zincPrefill / baselinePrefill) * 100 : null,
-    latency_pct_of_baseline: zincLatency && baselineLatency ? (zincLatency / baselineLatency) * 100 : null,
-    latency_delta_ms: zincLatency != null && baselineLatency != null ? zincLatency - baselineLatency : null,
-    end_to_end_pct_of_baseline: zincEndToEnd && baselineEndToEnd ? (zincEndToEnd / baselineEndToEnd) * 100 : null,
-    end_to_end_delta_tps: zincEndToEnd != null && baselineEndToEnd != null ? zincEndToEnd - baselineEndToEnd : null,
+    leader: gapTps >= 0 ? 'zinc' : 'baseline',
+    prompt_pct_of_baseline:
+      zincPrefill && baselinePrefill ? (zincPrefill / baselinePrefill) * 100 : null,
+    latency_pct_of_baseline:
+      zincLatency && baselineLatency ? (zincLatency / baselineLatency) * 100 : null,
+    latency_delta_ms:
+      zincLatency != null && baselineLatency != null ? zincLatency - baselineLatency : null,
+    end_to_end_pct_of_baseline:
+      zincEndToEnd && baselineEndToEnd ? (zincEndToEnd / baselineEndToEnd) * 100 : null,
+    end_to_end_delta_tps:
+      zincEndToEnd != null && baselineEndToEnd != null ? zincEndToEnd - baselineEndToEnd : null,
     overall_pct_of_baseline: overallPct,
-    overall_delta_tps: overallPct != null && zincOverall != null && baselineOverall != null ? zincOverall - baselineOverall : null,
+    overall_delta_tps:
+      overallPct != null && zincOverall != null && baselineOverall != null
+        ? zincOverall - baselineOverall
+        : null,
   };
 }
 
@@ -886,7 +894,9 @@ function mergeScenarioForPartialRun(existingScenario, incomingScenario) {
     ...incomingScenario,
     zinc,
     baseline,
-    comparison: buildComparison(zinc, baseline, { expectedGeneratedTokens: incomingScenario.max_tokens ?? existingScenario.max_tokens }),
+    comparison: buildComparison(zinc, baseline, {
+      expectedGeneratedTokens: incomingScenario.max_tokens ?? existingScenario.max_tokens,
+    }),
   };
 }
 
@@ -898,13 +908,17 @@ function mergeModelForPartialRun(existingModel, incomingModel) {
     ...(existingModel.scenarios ?? []).map((scenario) => scenario.id),
     ...(incomingModel.scenarios ?? []).map((scenario) => scenario.id),
   ]);
-  const existingScenarios = new Map((existingModel.scenarios ?? []).map((scenario) => [scenario.id, scenario]));
-  const incomingScenarios = new Map((incomingModel.scenarios ?? []).map((scenario) => [scenario.id, scenario]));
+  const existingScenarios = new Map(
+    (existingModel.scenarios ?? []).map((scenario) => [scenario.id, scenario]),
+  );
+  const incomingScenarios = new Map(
+    (incomingModel.scenarios ?? []).map((scenario) => [scenario.id, scenario]),
+  );
   const scenarios = [...scenarioIds]
     .map((id) => mergeScenarioForPartialRun(existingScenarios.get(id), incomingScenarios.get(id)))
     .filter(Boolean);
 
-  const primary = scenarios.find((scenario) => scenario.id === "core") ?? scenarios[0];
+  const primary = scenarios.find((scenario) => scenario.id === 'core') ?? scenarios[0];
   const zinc = primary?.zinc ?? incomingModel.zinc ?? existingModel.zinc ?? null;
   const baseline = primary?.baseline ?? incomingModel.baseline ?? existingModel.baseline ?? null;
 
@@ -913,7 +927,10 @@ function mergeModelForPartialRun(existingModel, incomingModel) {
     ...incomingModel,
     zinc,
     baseline,
-    comparison: buildComparison(zinc, baseline, { expectedGeneratedTokens: primary?.max_tokens ?? incomingModel.max_tokens ?? existingModel.max_tokens }),
+    comparison: buildComparison(zinc, baseline, {
+      expectedGeneratedTokens:
+        primary?.max_tokens ?? incomingModel.max_tokens ?? existingModel.max_tokens,
+    }),
     scenarios,
   };
 }
@@ -929,11 +946,20 @@ function mergeTargetForPartialRun(existingTarget, incomingTarget) {
   // The target-level provenance below comes from the incoming run, so stamp
   // every model with the run it was actually measured in; otherwise a
   // one-model rerun relabels untouched rows with the new commit.
-  const stamp = (model, target, force) => (model && (force || !model.provenance)
-    ? { ...model, provenance: target?.provenance ?? null, generated_at: target?.generated_at ?? null }
-    : model);
-  const existingModels = new Map((existingTarget.models ?? []).map((model) => [model.id, stamp(model, existingTarget, false)]));
-  const incomingModels = new Map((incomingTarget.models ?? []).map((model) => [model.id, stamp(model, incomingTarget, true)]));
+  const stamp = (model, target, force) =>
+    model && (force || !model.provenance)
+      ? {
+          ...model,
+          provenance: target?.provenance ?? null,
+          generated_at: target?.generated_at ?? null,
+        }
+      : model;
+  const existingModels = new Map(
+    (existingTarget.models ?? []).map((model) => [model.id, stamp(model, existingTarget, false)]),
+  );
+  const incomingModels = new Map(
+    (incomingTarget.models ?? []).map((model) => [model.id, stamp(model, incomingTarget, true)]),
+  );
   const models = [...modelIds]
     .map((id) => mergeModelForPartialRun(existingModels.get(id), incomingModels.get(id)))
     .filter(Boolean);
@@ -947,7 +973,9 @@ function mergeTargetForPartialRun(existingTarget, incomingTarget) {
 
 function recalculateScenarioComparison(scenario) {
   const comparison = scenario?.baseline?.decode_tps
-    ? buildComparison(scenario.zinc, scenario.baseline, { expectedGeneratedTokens: scenario.max_tokens })
+    ? buildComparison(scenario.zinc, scenario.baseline, {
+        expectedGeneratedTokens: scenario.max_tokens,
+      })
     : null;
   return {
     ...scenario,
@@ -964,40 +992,43 @@ function recalculateModelComparisons(model) {
     ? model.scenarios.map(recalculateScenarioComparison)
     : null;
   const primary = selectPrimaryScenario(scenarios);
-  const comparison = primary?.comparison
-    ?? (model.baseline?.decode_tps
+  const comparison =
+    primary?.comparison ??
+    (model.baseline?.decode_tps
       ? buildComparison(model.zinc, model.baseline, { expectedGeneratedTokens: model.max_tokens })
       : null);
   return {
     ...model,
-    ...(primary ? {
-      prompt_mode: primary.prompt_mode ?? model.prompt_mode,
-      prompt: primary.prompt ?? model.prompt,
-      max_tokens: primary.max_tokens ?? model.max_tokens,
-      zinc: primary.zinc ?? model.zinc,
-      baseline: primary.baseline ?? model.baseline,
-    } : {}),
+    ...(primary
+      ? {
+          prompt_mode: primary.prompt_mode ?? model.prompt_mode,
+          prompt: primary.prompt ?? model.prompt,
+          max_tokens: primary.max_tokens ?? model.max_tokens,
+          zinc: primary.zinc ?? model.zinc,
+          baseline: primary.baseline ?? model.baseline,
+        }
+      : {}),
     comparison,
     ...(scenarios ? { scenarios } : {}),
   };
 }
 
 export function normalizedModelName(model) {
-  return (model?.label ?? model?.id ?? "")
+  return (model?.label ?? model?.id ?? '')
     .toLowerCase()
-    .replace(/\bgemma4\b/g, "gemma 4")
-    .replace(/\bqwen36\b/g, "qwen 3.6")
-    .replace(/\bqwen3\b/g, "qwen 3")
-    .replace(/q4_k/g, "q4k")
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(/\bgemma4\b/g, 'gemma 4')
+    .replace(/\bqwen36\b/g, 'qwen 3.6')
+    .replace(/\bqwen3\b/g, 'qwen 3')
+    .replace(/q4_k/g, 'q4k')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim();
 }
 
 export function compareModelsByName(a, b) {
   return normalizedModelName(a).localeCompare(normalizedModelName(b), undefined, {
     numeric: true,
-    sensitivity: "base",
+    sensitivity: 'base',
   });
 }
 
@@ -1024,9 +1055,11 @@ export function mergeArtifacts(existing, incomingTargets, options = {}) {
     const previous = byId.get(target.id);
     byId.set(
       target.id,
-      normalizeTarget(preserveMissingPhases && previous
-        ? mergeTargetForPartialRun(previous, normalizedIncoming)
-        : normalizedIncoming),
+      normalizeTarget(
+        preserveMissingPhases && previous
+          ? mergeTargetForPartialRun(previous, normalizedIncoming)
+          : normalizedIncoming,
+      ),
     );
   }
   const targets = [...byId.values()].sort((a, b) => {
@@ -1042,7 +1075,10 @@ export function mergeArtifacts(existing, incomingTargets, options = {}) {
 }
 
 export function buildArtifact(targets) {
-  return mergeArtifacts({ schema_version: 1, generated_at: new Date().toISOString(), targets: [] }, targets);
+  return mergeArtifacts(
+    { schema_version: 1, generated_at: new Date().toISOString(), targets: [] },
+    targets,
+  );
 }
 
 function mean(values) {
@@ -1056,12 +1092,14 @@ function compactMean(values) {
 
 function modelScenariosForSummary(model) {
   if (Array.isArray(model.scenarios) && model.scenarios.length > 0) return model.scenarios;
-  return [{
-    id: "core",
-    zinc: model.zinc,
-    baseline: model.baseline,
-    comparison: model.comparison,
-  }];
+  return [
+    {
+      id: 'core',
+      zinc: model.zinc,
+      baseline: model.baseline,
+      comparison: model.comparison,
+    },
+  ];
 }
 
 function aggregateOverallPct(scenarios) {
@@ -1089,7 +1127,7 @@ function scenarioComparableForPrimary(scenario) {
 
 function selectPrimaryScenario(scenarios) {
   if (!Array.isArray(scenarios) || scenarios.length === 0) return null;
-  const core = scenarios.find((scenario) => scenario.id === "core") ?? null;
+  const core = scenarios.find((scenario) => scenario.id === 'core') ?? null;
   if (core && scenarioComparableForPrimary(core)) return core;
   return scenarios.find(scenarioComparableForPrimary) ?? core ?? scenarios[0];
 }
@@ -1113,36 +1151,72 @@ function targetSummary(models) {
 
   const validPrimaryRows = models
     .map((model) => {
-      const scenario = selectPrimaryScenario(modelScenariosForSummary(model).filter((row) => !scenarioNeedsOutputReview(row)));
+      const scenario = selectPrimaryScenario(
+        modelScenariosForSummary(model).filter((row) => !scenarioNeedsOutputReview(row)),
+      );
       return scenario ? { model, scenario } : null;
     })
     .filter(Boolean);
   const successful = validPrimaryRows.filter((row) => {
-    const decode = finiteMetric(row.scenario?.zinc?.decode_tps?.median ?? row.scenario?.zinc?.decode_tps?.avg ?? null);
+    const decode = finiteMetric(
+      row.scenario?.zinc?.decode_tps?.median ?? row.scenario?.zinc?.decode_tps?.avg ?? null,
+    );
     return decode != null && decode > 0;
   });
-  const fastest = successful.length > 0
-    ? [...successful].sort((a, b) => {
-        const bDecode = b.scenario.zinc.decode_tps.median ?? b.scenario.zinc.decode_tps.avg;
-        const aDecode = a.scenario.zinc.decode_tps.median ?? a.scenario.zinc.decode_tps.avg;
-        return bDecode - aDecode;
-      })[0]
-    : null;
+  const fastest =
+    successful.length > 0
+      ? [...successful].sort((a, b) => {
+          const bDecode = b.scenario.zinc.decode_tps.median ?? b.scenario.zinc.decode_tps.avg;
+          const aDecode = a.scenario.zinc.decode_tps.median ?? a.scenario.zinc.decode_tps.avg;
+          return bDecode - aDecode;
+        })[0]
+      : null;
   const scenarioRows = models.flatMap(modelScenariosForSummary);
-  const compared = models.filter((model) => modelScenariosForSummary(model).some((scenario) => !scenarioNeedsOutputReview(scenario) && scenario.comparison?.overall_pct_of_baseline != null));
+  const compared = models.filter((model) =>
+    modelScenariosForSummary(model).some(
+      (scenario) =>
+        !scenarioNeedsOutputReview(scenario) &&
+        scenario.comparison?.overall_pct_of_baseline != null,
+    ),
+  );
 
   return {
     fastest_model_id: fastest?.model?.id ?? null,
     fastest_model_label: fastest?.model?.label ?? null,
-    fastest_decode_tps: fastest ? (fastest.scenario.zinc.decode_tps.median ?? fastest.scenario.zinc.decode_tps.avg) : null,
+    fastest_decode_tps: fastest
+      ? (fastest.scenario.zinc.decode_tps.median ?? fastest.scenario.zinc.decode_tps.avg)
+      : null,
     benchmarked_models: models.length,
     successful_models: new Set(successful.map((row) => row.model.id)).size,
-    average_decode_tps: compactMean(successful.map((row) => row.scenario.zinc.decode_tps.median ?? row.scenario.zinc.decode_tps.avg)),
-    average_prompt_tps: compactMean(successful.map((row) => row.scenario.zinc.prefill_tps?.median ?? row.scenario.zinc.prefill_tps?.avg ?? null)),
-    average_end_to_end_tps: compactMean(successful.map((row) => row.scenario.zinc.end_to_end_tps?.median ?? row.scenario.zinc.end_to_end_tps?.avg ?? null)),
-    average_total_latency_ms: compactMean(successful.map((row) => row.scenario.zinc.total_latency_ms?.median ?? row.scenario.zinc.total_latency_ms?.avg ?? null)),
+    average_decode_tps: compactMean(
+      successful.map(
+        (row) => row.scenario.zinc.decode_tps.median ?? row.scenario.zinc.decode_tps.avg,
+      ),
+    ),
+    average_prompt_tps: compactMean(
+      successful.map(
+        (row) =>
+          row.scenario.zinc.prefill_tps?.median ?? row.scenario.zinc.prefill_tps?.avg ?? null,
+      ),
+    ),
+    average_end_to_end_tps: compactMean(
+      successful.map(
+        (row) =>
+          row.scenario.zinc.end_to_end_tps?.median ?? row.scenario.zinc.end_to_end_tps?.avg ?? null,
+      ),
+    ),
+    average_total_latency_ms: compactMean(
+      successful.map(
+        (row) =>
+          row.scenario.zinc.total_latency_ms?.median ??
+          row.scenario.zinc.total_latency_ms?.avg ??
+          null,
+      ),
+    ),
     compared_models: compared.length,
-    average_pct_of_llama: aggregateOverallPct(scenarioRows.filter((scenario) => !scenarioNeedsOutputReview(scenario))),
+    average_pct_of_llama: aggregateOverallPct(
+      scenarioRows.filter((scenario) => !scenarioNeedsOutputReview(scenario)),
+    ),
   };
 }
 
@@ -1156,22 +1230,25 @@ function createStats(name, rows) {
   const totalTpsValues = rows.map((row) => row.totalTps).filter((value) => value != null);
   const hostLoadValues = rows.map((row) => row.hostLoad1m).filter((value) => value != null);
   const speculativeRows = rows.filter((row) => row.speculative != null);
-  const speculativeDecoding = speculativeRows.length > 0
-    ? {
-        enabled: true,
-        kind: speculativeRows[0].speculative.kind,
-        acceptance_pct: summarizeValues(speculativeRows.map((row) => row.speculative.acceptancePct)),
-        runs_with_speculation: speculativeRows.length,
-        runs: rows.length,
-      }
-    : { enabled: false };
+  const speculativeDecoding =
+    speculativeRows.length > 0
+      ? {
+          enabled: true,
+          kind: speculativeRows[0].speculative.kind,
+          acceptance_pct: summarizeValues(
+            speculativeRows.map((row) => row.speculative.acceptancePct),
+          ),
+          runs_with_speculation: speculativeRows.length,
+          runs: rows.length,
+        }
+      : { enabled: false };
   return {
     name,
     speculative_decoding: speculativeDecoding,
     prompt_tokens: rows[0]?.promptTokens ?? null,
     prefill_tokens: rows[0]?.prefillTokens ?? null,
     generated_tokens: rows[0]?.generatedTokens ?? null,
-    output_preview: rows.find((row) => row.outputPreview)?.outputPreview ?? "",
+    output_preview: rows.find((row) => row.outputPreview)?.outputPreview ?? '',
     prefill_ms: summarizeValues(prefillMsValues),
     prefill_tps: summarizeValues(prefillValues),
     decode_ms: summarizeValues(decodeMsValues),
@@ -1185,42 +1262,53 @@ function createStats(name, rows) {
 
 function sanitizeSshDiagnostic(line) {
   return line
-    .replace(/\b[A-Za-z_][A-Za-z0-9_.-]*@(?:\d{1,3}\.){3}\d{1,3}\b/g, "<user>@<host>")
-    .replace(/\b[A-Za-z_][A-Za-z0-9_.-]*@[A-Za-z0-9_.-]+\b/g, "<user>@<host>")
-    .replace(/(connect to host )\S+( port )\d+/i, "$1<host>$2<port>")
-    .replace(/(Could not resolve hostname )\S+/i, "$1<host>")
-    .replace(/(Connection (?:closed|reset) by )\S+/i, "$1<host>");
+    .replace(/\b[A-Za-z_][A-Za-z0-9_.-]*@(?:\d{1,3}\.){3}\d{1,3}\b/g, '<user>@<host>')
+    .replace(/\b[A-Za-z_][A-Za-z0-9_.-]*@[A-Za-z0-9_.-]+\b/g, '<user>@<host>')
+    .replace(/(connect to host )\S+( port )\d+/i, '$1<host>$2<port>')
+    .replace(/(Could not resolve hostname )\S+/i, '$1<host>')
+    .replace(/(Connection (?:closed|reset) by )\S+/i, '$1<host>');
 }
 
 function remoteSshDiagnostic(error) {
   const text = [error?.stderr, error?.stdout, error?.message ?? error]
     .filter(Boolean)
     .map(String)
-    .join("\n");
+    .join('\n');
   const diagnostic = text
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .find((line) => /^(ssh:|Permission denied|Host key verification failed|Could not resolve hostname|Connection (?:closed|refused|reset|timed out)|No route to host|kex_exchange_identification:)/i.test(line));
+    .find((line) =>
+      /^(ssh:|Permission denied|Host key verification failed|Could not resolve hostname|Connection (?:closed|refused|reset|timed out)|No route to host|kex_exchange_identification:)/i.test(
+        line,
+      ),
+    );
   return diagnostic ? sanitizeSshDiagnostic(diagnostic) : null;
 }
 
 export function remoteSshFailureSummary(error) {
-  return remoteSshDiagnostic(error) ?? "remote SSH command exited unsuccessfully before benchmark diagnostics were available";
+  return (
+    remoteSshDiagnostic(error) ??
+    'remote SSH command exited unsuccessfully before benchmark diagnostics were available'
+  );
 }
 
 export function benchmarkFailureReason(prefix, error) {
-  const lines = String(error?.message ?? error ?? "unknown error")
+  const lines = String(error?.message ?? error ?? 'unknown error')
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
-  const firstLine = lines[0] ?? "unknown error";
+  const firstLine = lines[0] ?? 'unknown error';
   const commandFailure = firstLine.match(/^Command failed \(([^)]+)\):/);
   if (commandFailure) {
     const sshDiagnostic = remoteSshDiagnostic(error);
     if (sshDiagnostic) return `${prefix}: ${sshDiagnostic}`;
     const diagnostic = lines
       .slice(1)
-      .find((line) => /^(err\(|error:|.*\b(?:ENOMEM|QueueSubmitFailed|ShaderFileNotFound|FileNotFound)\b)/i.test(line));
+      .find((line) =>
+        /^(err\(|error:|.*\b(?:ENOMEM|QueueSubmitFailed|ShaderFileNotFound|FileNotFound)\b)/i.test(
+          line,
+        ),
+      );
     if (diagnostic) return `${prefix}: ${diagnostic}`;
     return `${prefix}: command exited unsuccessfully (${commandFailure[1]}).`;
   }
@@ -1236,40 +1324,45 @@ async function pathExists(filepath) {
   }
 }
 
-async function runShell(command, { cwd = ROOT, env = process.env, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+async function runShell(
+  command,
+  { cwd = ROOT, env = process.env, timeoutMs = DEFAULT_TIMEOUT_MS } = {},
+) {
   return new Promise((resolve, reject) => {
-    const child = spawn("/bin/zsh", ["-lc", command], {
+    const child = spawn('/bin/zsh', ['-lc', command], {
       cwd,
       env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    let stdout = "";
-    let stderr = "";
+    let stdout = '';
+    let stderr = '';
     const timeout = setTimeout(() => {
-      child.kill("SIGTERM");
+      child.kill('SIGTERM');
     }, timeoutMs);
 
-    child.stdout.on("data", (chunk) => {
+    child.stdout.on('data', (chunk) => {
       stdout += chunk.toString();
       if (stdout.length > MAX_CAPTURE_CHARS) stdout = stdout.slice(-MAX_CAPTURE_CHARS);
     });
-    child.stderr.on("data", (chunk) => {
+    child.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
       if (stderr.length > MAX_CAPTURE_CHARS) stderr = stderr.slice(-MAX_CAPTURE_CHARS);
     });
-    child.on("error", (error) => {
+    child.on('error', (error) => {
       clearTimeout(timeout);
       reject(error);
     });
-    child.on("close", (code, signal) => {
+    child.on('close', (code, signal) => {
       clearTimeout(timeout);
       if (code === 0) {
         resolve({ stdout, stderr, combined: `${stdout}${stderr}` });
         return;
       }
       const details = `${stdout}${stderr}`.trim();
-      const error = new Error(`Command failed (${signal ?? code}): ${command}${details ? `\n${details}` : ""}`);
+      const error = new Error(
+        `Command failed (${signal ?? code}): ${command}${details ? `\n${details}` : ''}`,
+      );
       error.stdout = stdout;
       error.stderr = stderr;
       reject(error);
@@ -1278,209 +1371,216 @@ async function runShell(command, { cwd = ROOT, env = process.env, timeoutMs = DE
 }
 
 function llamaBinaryEnv(binaryPath) {
-  const libDir = path.join(path.dirname(path.dirname(binaryPath)), "lib");
+  const libDir = path.join(path.dirname(path.dirname(binaryPath)), 'lib');
   return {
     ...process.env,
-    DYLD_LIBRARY_PATH: process.env.DYLD_LIBRARY_PATH ? `${libDir}:${process.env.DYLD_LIBRARY_PATH}` : libDir,
+    DYLD_LIBRARY_PATH: process.env.DYLD_LIBRARY_PATH
+      ? `${libDir}:${process.env.DYLD_LIBRARY_PATH}`
+      : libDir,
   };
 }
 
 function remoteEnvPrefix(creds) {
   const entries = Object.entries(creds.env ?? {});
-  if (!entries.length) return "";
-  return entries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ");
+  if (!entries.length) return '';
+  return entries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(' ');
 }
 
 const REMOTE_ZINC_TUNING_ENV_KEYS = [
   // Lets a run measure the same model with NextN/MTP speculative decoding off,
   // which is what the dashboard's MTP toggle compares against.
-  "ZINC_MTP",
-  "ZINC_BATCHED_PREFILL",
-  "ZINC_QWEN_MOE_BATCHED",
-  "ZINC_MOE_TC",
-  "ZINC_MOE_DOWN_TC",
-  "ZINC_MOE_DOWN_Q6K_TC",
-  "ZINC_INTEL_BATCHED_PREFILL",
-  "ZINC_INTEL_BATCHED_PREFILL_CHUNK",
-  "ZINC_FUSED_QK_KV",
-  "ZINC_FA_SPLIT_K",
-  "ZINC_MUL_MM_PROJ",
-  "ZINC_Q4K_BATCH_KPAR",
-  "ZINC_FUSED_RMS_ROUTER",
-  "ZINC_FUSED_SSM_AB",
-  "ZINC_SSM_DELTA_COLS8",
-  "ZINC_SSM_DELTA_NORMED_QK",
-  "ZINC_FUSED_SSM_QKV_Z",
-  "ZINC_MOE_KPAR",
-  "ZINC_MOE_Q5K_KPAR",
-  "ZINC_MOE_Q8_1_GATE_UP_COLS",
-  "ZINC_MOE_Q8_1_DOWN_COLS",
-  "ZINC_MOE_Q5K_Q8_1_DOWN_ACC",
-  "ZINC_MOE_Q6K_COLS",
-  "ZINC_MOE_PREFIX_SHARED_EXACT",
-  "ZINC_MOE_FUSED_GATE_UP",
-  "ZINC_MOE_FUSED_GATE_UP_SWIGLU",
-  "ZINC_MOE_SINGLETON_TAIL_SPLIT",
-  "ZINC_FUSE_MOE_DOWN_ACC",
-  "ZINC_QWEN36_MOE_TOPK",
-  "ZINC_QWEN36_MOE_PREFILL_TOPK",
-  "ZINC_QWEN36_MOE_PREFILL_TOPK_GUARD",
-  "ZINC_QWEN36_MOE_GROUPED_EXACT",
-  "ZINC_A3B_SHARED_F32_GATE_BATCH",
-  "ZINC_A3B_ATTN_DP4A",
-  "ZINC_INTEL_A3B_PRODUCTION",
-  "ZINC_QWEN36_Q8_WIDE4_SSM_OUT",
-  "ZINC_GEMMA_Q8_GEGLU_FUSED",
-  "ZINC_GEMMA_Q8_GEGLU_ROWS",
-  "ZINC_GEMMA_Q8_WIDE4_DMMV",
-  "ZINC_GEMMA_Q8_1_DMMV",
-  "ZINC_Q8_WIDE_LM_HEAD",
-  "ZINC_Q8_WIDE_LM_HEAD_ROWS",
-  "ZINC_Q8_1_LM_HEAD",
-  "ZINC_Q4K_LM_HEAD_DP4A",
-  "ZINC_Q4K_Q8_1_DMMV",
-  "ZINC_Q8_SPEC_DMMV",
-  "ZINC_Q8_1_SSM_QKV_Z",
-  "ZINC_GEMMA_MOE_TOPK",
-  "ZINC_GEMMA_MOE_PREFILL_SERIAL",
-  "ZINC_GEMMA_ATTN_PREFILL_SERIAL",
-  "ZINC_ROCM_GEMMA_Q8_PREFILL",
-  "ZINC_GEMMA_MOE_PREFILL_TOPK",
-  "ZINC_TOPK_V1",
-  "ZINC_PREFILL_WMMA_TAIL",
-  "ZINC_PREFILL_WMMA_Q4_DIRECT",
-  "ZINC_PREFILL_PROFILE",
-  "ZINC_ROCM_TIME_KERNEL",
-  "ZINC_Q8_M32",
-  "ZINC_Q8_FFN_BLOCK64",
-  "ZINC_Q8_FFN_BLOCK128",
-  "ZINC_Q8_Q6_BLOCK64",
-  "ZINC_Q8_Q6_BLOCK128",
-  "ZINC_ROCM_Q8_MROW2",
-  "ZINC_ROCM_Q8_BLOCK32",
-  "ZINC_ROCM_Q8_FUSED",
-  "ZINC_ROCM_MOE_SHARED_Q8",
-  "ZINC_ROCM_MOE_DOWN_Q8",
-  "ZINC_ROCM_MOE_GATE_GEGLU",
-  "ZINC_ROCM_LIGHT_COMMANDS",
-  "ZINC_MOE_DOWN_Q8_M16",
-  "ZINC_MOE_DOWN_Q8_M8",
-  "ZINC_MOE_DOWN_Q8_M64",
-  "ZINC_MOE_DIRECT_A",
-  "ZINC_MOE_ROUTE64",
-  "ZINC_MOE_Q51_DIRECT",
-  "ZINC_SSM_PROFILE",
-  "ZINC_ROCM_DECODE_PAIR_REDUCE",
-  "ZINC_ROCM_Q4_PAIR_REDUCE",
-  "ZINC_ROCM_DECODE_Q8_FFN",
-  "ZINC_ROCM_DECODE_Q8_Q6",
-  "ZINC_ROCM_DECODE_Q8_LM",
-  "ZINC_ROCM_DECODE_Q8_Q4",
-  "ZINC_ROCM_DECODE_Q8_Q8",
-  "ZINC_ROCM_DECODE_Q8_Q6_PROJ",
-  "ZINC_ROCM_DECODE_Q8_Q5",
-  "ZINC_ROCM_DECODE_Q8_Q4_PAIR",
-  "ZINC_ROCM_RMS_Q8",
-  "ZINC_ROCM_ARGMAX_V2",
-  "ZINC_ROCM_MUSE_ATTN_BLAS",
-  "ZINC_ROCM_MUSE_ATTN_BLAS_MIN",
-  "ZINC_ROCM_GEMMA_GQA2",
-  "ZINC_ROCM_GEMMA_ATTN_BLAS",
-  "ZINC_ROCM_MUSE_NORM_CHAIN",
-  "ZINC_ROCM_DECODE_SSM_COL_WARP",
-  "ZINC_ROCM_DECODE_SSM_FAST",
-  "ZINC_ROCM_FUSED_SSM_F32",
-  "ZINC_ROCM_FUSED_Q4_PAIRS",
-  "ZINC_BATCHED_TC",
-  "ZINC_BATCHED_CUBLAS",
-  "ZINC_BATCHED_CUBLAS_NOQ4",
-  "ZINC_BATCHED_CUBLAS_NOQ5",
-  "ZINC_BATCHED_CUBLAS_NOQ6",
-  "ZINC_BATCHED_CUBLAS_NOQ8",
-  "ZINC_CUBLAS_MIN_T",
-  "ZINC_BATCHED_TC_PLAIN",
-  "ZINC_BATCHED_TC_NOQ6",
-  "ZINC_BATCHED_TC_M128",
-  "ZINC_BATCHED_TC_M64",
-  "ZINC_BATCHED_TC_Q6_LOWSMEM",
-  "ZINC_BATCHED_TC_M128_LOWSMEM",
-  "ZINC_BATCHED_TC_SHAREA",
-  "ZINC_BATCHED_TC_NORMF16",
-  "ZINC_BATCHED_EXPERTS_GROUPED",
-  "ZINC_MOE_NORM_COMBINE",
-  "ZINC_ATTN_MOE_NORM",
-  "ZINC_MOE_EXACT_Q8",
-  "ZINC_MOE_M64",
-  "ZINC_MOE_M32",
-  "ZINC_MOE_T8",
-  "ZINC_MOE_T16",
-  "ZINC_SSM_PREPARED",
-  "ZINC_SSM_COL_WARP",
-  "ZINC_SSM_COL_WARP_FAST",
-  "ZINC_PREFILL_Q8",
-  "ZINC_PREFILL_Q8_REUSE",
-  "ZINC_PREFILL_WMMA_TILES",
-  "ZINC_PREFILL_WMMA_T80",
-  "ZINC_ATTN_V2",
-  "ZINC_PREFILL_DP4A",
-  "ZINC_PREFILL_F16",
-  "ZINC_PRE_DEQUANT",
-  "ZINC_PREFILL_LOWSMEM",
-  "ZINC_PREFILL_TC",
-  "ZINC_PREFILL_Q8_TC",
-  "ZINC_PREFILL_GATE_UP_SWIGLU",
-  "ZINC_QWEN35_9B_BM64_DOWN",
-  "ZINC_QWEN35_9B_K12288_BK2",
-  "ZINC_QWEN36_27B_DENSE_PREFILL",
-  "ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS",
-  "ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT",
-  "ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE",
-  "ZINC_QWEN36_27B_SSM_BATCHED_DELTA",
-  "ZINC_QWEN36_27B_SSM_PREFILL_PROJ",
-  "ZINC_QWEN36_27B_FULL_ATTN_BATCHED",
-  "ZINC_SSM_CHUNKED",
-  "ZINC_SSM_WARP",
-  "ZINC_CUDA_GRAPH",
-  "ZINC_BATCH_GRAPH",
-  "ZINC_BATCH_B1_MATVEC",
-  "ZINC_BATCH_MROW",
-  "ZINC_BATCH_MOE_SHARED",
-  "ZINC_SERVE_CUBLAS",
-  "ZINC_SERVE_CUBLAS_MINB",
-  "ZINC_SERVE_WCACHE",
-  "ZINC_SERVE_WCACHE_MB",
+  'ZINC_MTP',
+  'ZINC_KV_CACHE',
+  'ZINC_Q8_ATTN_BLAS',
+  'ZINC_Q8_ATTN_F16',
+  'ZINC_PROMPT_CACHE',
+  'ZINC_PREFILL_CHUNK',
+  'ZINC_BATCHED_PREFILL',
+  'ZINC_QWEN_MOE_BATCHED',
+  'ZINC_MOE_TC',
+  'ZINC_MOE_DOWN_TC',
+  'ZINC_MOE_DOWN_Q6K_TC',
+  'ZINC_INTEL_BATCHED_PREFILL',
+  'ZINC_INTEL_BATCHED_PREFILL_CHUNK',
+  'ZINC_FUSED_QK_KV',
+  'ZINC_FA_SPLIT_K',
+  'ZINC_MUL_MM_PROJ',
+  'ZINC_Q4K_BATCH_KPAR',
+  'ZINC_FUSED_RMS_ROUTER',
+  'ZINC_FUSED_SSM_AB',
+  'ZINC_SSM_DELTA_COLS8',
+  'ZINC_SSM_DELTA_NORMED_QK',
+  'ZINC_FUSED_SSM_QKV_Z',
+  'ZINC_MOE_KPAR',
+  'ZINC_MOE_Q5K_KPAR',
+  'ZINC_MOE_Q8_1_GATE_UP_COLS',
+  'ZINC_MOE_Q8_1_DOWN_COLS',
+  'ZINC_MOE_Q5K_Q8_1_DOWN_ACC',
+  'ZINC_MOE_Q6K_COLS',
+  'ZINC_MOE_PREFIX_SHARED_EXACT',
+  'ZINC_MOE_FUSED_GATE_UP',
+  'ZINC_MOE_FUSED_GATE_UP_SWIGLU',
+  'ZINC_MOE_SINGLETON_TAIL_SPLIT',
+  'ZINC_FUSE_MOE_DOWN_ACC',
+  'ZINC_QWEN36_MOE_TOPK',
+  'ZINC_QWEN36_MOE_PREFILL_TOPK',
+  'ZINC_QWEN36_MOE_PREFILL_TOPK_GUARD',
+  'ZINC_QWEN36_MOE_GROUPED_EXACT',
+  'ZINC_A3B_SHARED_F32_GATE_BATCH',
+  'ZINC_A3B_ATTN_DP4A',
+  'ZINC_INTEL_A3B_PRODUCTION',
+  'ZINC_QWEN36_Q8_WIDE4_SSM_OUT',
+  'ZINC_GEMMA_Q8_GEGLU_FUSED',
+  'ZINC_GEMMA_Q8_GEGLU_ROWS',
+  'ZINC_GEMMA_Q8_WIDE4_DMMV',
+  'ZINC_GEMMA_Q8_1_DMMV',
+  'ZINC_Q8_WIDE_LM_HEAD',
+  'ZINC_Q8_WIDE_LM_HEAD_ROWS',
+  'ZINC_Q8_1_LM_HEAD',
+  'ZINC_Q4K_LM_HEAD_DP4A',
+  'ZINC_Q4K_Q8_1_DMMV',
+  'ZINC_Q8_SPEC_DMMV',
+  'ZINC_Q8_1_SSM_QKV_Z',
+  'ZINC_GEMMA_MOE_TOPK',
+  'ZINC_GEMMA_MOE_PREFILL_SERIAL',
+  'ZINC_GEMMA_ATTN_PREFILL_SERIAL',
+  'ZINC_ROCM_GEMMA_Q8_PREFILL',
+  'ZINC_GEMMA_MOE_PREFILL_TOPK',
+  'ZINC_TOPK_V1',
+  'ZINC_PREFILL_WMMA_TAIL',
+  'ZINC_PREFILL_WMMA_Q4_DIRECT',
+  'ZINC_PREFILL_PROFILE',
+  'ZINC_ROCM_TIME_KERNEL',
+  'ZINC_Q8_M32',
+  'ZINC_Q8_FFN_BLOCK64',
+  'ZINC_Q8_FFN_BLOCK128',
+  'ZINC_Q8_Q6_BLOCK64',
+  'ZINC_Q8_Q6_BLOCK128',
+  'ZINC_ROCM_Q8_MROW2',
+  'ZINC_ROCM_Q8_BLOCK32',
+  'ZINC_ROCM_Q8_FUSED',
+  'ZINC_ROCM_MOE_SHARED_Q8',
+  'ZINC_ROCM_MOE_DOWN_Q8',
+  'ZINC_ROCM_MOE_GATE_GEGLU',
+  'ZINC_ROCM_LIGHT_COMMANDS',
+  'ZINC_MOE_DOWN_Q8_M16',
+  'ZINC_MOE_DOWN_Q8_M8',
+  'ZINC_MOE_DOWN_Q8_M64',
+  'ZINC_MOE_DIRECT_A',
+  'ZINC_MOE_ROUTE64',
+  'ZINC_MOE_Q51_DIRECT',
+  'ZINC_SSM_PROFILE',
+  'ZINC_ROCM_DECODE_PAIR_REDUCE',
+  'ZINC_ROCM_Q4_PAIR_REDUCE',
+  'ZINC_ROCM_DECODE_Q8_FFN',
+  'ZINC_ROCM_DECODE_Q8_Q6',
+  'ZINC_ROCM_DECODE_Q8_LM',
+  'ZINC_ROCM_DECODE_Q8_Q4',
+  'ZINC_ROCM_DECODE_Q8_Q8',
+  'ZINC_ROCM_DECODE_Q8_Q6_PROJ',
+  'ZINC_ROCM_DECODE_Q8_Q5',
+  'ZINC_ROCM_DECODE_Q8_Q4_PAIR',
+  'ZINC_ROCM_RMS_Q8',
+  'ZINC_ROCM_ARGMAX_V2',
+  'ZINC_ROCM_MUSE_ATTN_BLAS',
+  'ZINC_ROCM_MUSE_ATTN_BLAS_MIN',
+  'ZINC_ROCM_GEMMA_GQA2',
+  'ZINC_ROCM_GEMMA_ATTN_BLAS',
+  'ZINC_ROCM_MUSE_NORM_CHAIN',
+  'ZINC_ROCM_DECODE_SSM_COL_WARP',
+  'ZINC_ROCM_DECODE_SSM_FAST',
+  'ZINC_ROCM_FUSED_SSM_F32',
+  'ZINC_ROCM_FUSED_Q4_PAIRS',
+  'ZINC_BATCHED_TC',
+  'ZINC_BATCHED_CUBLAS',
+  'ZINC_BATCHED_CUBLAS_NOQ4',
+  'ZINC_BATCHED_CUBLAS_NOQ5',
+  'ZINC_BATCHED_CUBLAS_NOQ6',
+  'ZINC_BATCHED_CUBLAS_NOQ8',
+  'ZINC_CUBLAS_MIN_T',
+  'ZINC_BATCHED_TC_PLAIN',
+  'ZINC_BATCHED_TC_NOQ6',
+  'ZINC_BATCHED_TC_M128',
+  'ZINC_BATCHED_TC_M64',
+  'ZINC_BATCHED_TC_Q6_LOWSMEM',
+  'ZINC_BATCHED_TC_M128_LOWSMEM',
+  'ZINC_BATCHED_TC_SHAREA',
+  'ZINC_BATCHED_TC_NORMF16',
+  'ZINC_BATCHED_EXPERTS_GROUPED',
+  'ZINC_MOE_NORM_COMBINE',
+  'ZINC_ATTN_MOE_NORM',
+  'ZINC_MOE_EXACT_Q8',
+  'ZINC_MOE_M64',
+  'ZINC_MOE_M32',
+  'ZINC_MOE_T8',
+  'ZINC_MOE_T16',
+  'ZINC_SSM_PREPARED',
+  'ZINC_SSM_COL_WARP',
+  'ZINC_SSM_COL_WARP_FAST',
+  'ZINC_PREFILL_Q8',
+  'ZINC_PREFILL_Q8_REUSE',
+  'ZINC_PREFILL_WMMA_TILES',
+  'ZINC_PREFILL_WMMA_T80',
+  'ZINC_ATTN_V2',
+  'ZINC_PREFILL_DP4A',
+  'ZINC_PREFILL_F16',
+  'ZINC_PRE_DEQUANT',
+  'ZINC_PREFILL_LOWSMEM',
+  'ZINC_PREFILL_TC',
+  'ZINC_PREFILL_Q8_TC',
+  'ZINC_PREFILL_GATE_UP_SWIGLU',
+  'ZINC_QWEN35_9B_BM64_DOWN',
+  'ZINC_QWEN35_9B_K12288_BK2',
+  'ZINC_QWEN36_27B_DENSE_PREFILL',
+  'ZINC_QWEN36_27B_DENSE_PREFILL_LAYERS',
+  'ZINC_QWEN36_27B_DENSE_PREFILL_SEGMENT',
+  'ZINC_QWEN36_27B_PREFIX_TAIL_PIPELINE',
+  'ZINC_QWEN36_27B_SSM_BATCHED_DELTA',
+  'ZINC_QWEN36_27B_SSM_PREFILL_PROJ',
+  'ZINC_QWEN36_27B_FULL_ATTN_BATCHED',
+  'ZINC_SSM_CHUNKED',
+  'ZINC_SSM_WARP',
+  'ZINC_CUDA_GRAPH',
+  'ZINC_BATCH_GRAPH',
+  'ZINC_BATCH_B1_MATVEC',
+  'ZINC_BATCH_MROW',
+  'ZINC_BATCH_MOE_SHARED',
+  'ZINC_SERVE_CUBLAS',
+  'ZINC_SERVE_CUBLAS_MINB',
+  'ZINC_SERVE_WCACHE',
+  'ZINC_SERVE_WCACHE_MB',
 ];
 
 export function collectRemoteZincTuningEnv(dotEnv) {
   const env = {};
   for (const key of REMOTE_ZINC_TUNING_ENV_KEYS) {
     const value = process.env[key] ?? dotEnv[key];
-    if (value != null && value !== "") env[key] = value;
+    if (value != null && value !== '') env[key] = value;
   }
   return env;
 }
 
 export function llamaDeviceArgs(device) {
-  return !device || device === "none" ? [] : ["--device", device];
+  return !device || device === 'none' ? [] : ['--device', device];
 }
 
 // Paths that cannot change a measurement. The suite rewrites the site data file
 // itself, so without this every run after the first in a session reads -dirty.
-export const PROVENANCE_IGNORED_PATHS = ["site", "docs", "README.md", "assets"];
+export const PROVENANCE_IGNORED_PATHS = ['site', 'docs', 'README.md', 'assets'];
 
 export function provenanceDirtyCommand() {
-  const excludes = PROVENANCE_IGNORED_PATHS.map((p) => shellQuote(`:(exclude)${p}`)).join(" ");
+  const excludes = PROVENANCE_IGNORED_PATHS.map((p) => shellQuote(`:(exclude)${p}`)).join(' ');
   return `git status --porcelain --untracked-files=no -- . ${excludes}`;
 }
 
 async function captureGitProvenance(cwd = ROOT, timeoutMs = 10_000) {
   try {
-    const version = await runShell("git describe --tags --always --abbrev=12", { cwd, timeoutMs });
+    const version = await runShell('git describe --tags --always --abbrev=12', { cwd, timeoutMs });
     const dirty = await runShell(provenanceDirtyCommand(), { cwd, timeoutMs });
-    const commit = await runShell("git rev-parse HEAD", { cwd, timeoutMs });
+    const commit = await runShell('git rev-parse HEAD', { cwd, timeoutMs });
     const base = version.stdout.trim();
     return {
-      version: base ? `${base}${dirty.stdout.trim() ? "-dirty" : ""}` : null,
+      version: base ? `${base}${dirty.stdout.trim() ? '-dirty' : ''}` : null,
       commit: commit.stdout.trim() || null,
     };
   } catch {
@@ -1514,7 +1614,10 @@ async function captureRemoteGitProvenance(creds, timeoutMs = 120_000) {
   }
 }
 
-async function captureLlamaCppProvenance(binaryPath, { cwd = ROOT, env = process.env, timeoutMs = 10_000 } = {}) {
+async function captureLlamaCppProvenance(
+  binaryPath,
+  { cwd = ROOT, env = process.env, timeoutMs = 10_000 } = {},
+) {
   if (!binaryPath) {
     return {
       binary: null,
@@ -1591,47 +1694,59 @@ function managedModelPullCommand(modelId) {
 }
 
 function zincBenchmarkEnv(caseDef) {
-  return caseDef.prompt_mode === "chat" ? {} : { ZINC_BENCH_IGNORE_EOS: "1" };
+  return caseDef.prompt_mode === 'chat' ? {} : { ZINC_BENCH_IGNORE_EOS: '1' };
 }
 
 function zincBenchmarkEnvPrefix(caseDef) {
   return Object.entries(zincBenchmarkEnv(caseDef))
     .map(([key, value]) => `${key}=${shellQuote(value)}`)
-    .join(" ");
+    .join(' ');
 }
 
 export function localZincCommand(caseDef) {
   const envPrefix = zincBenchmarkEnvPrefix(caseDef);
   const parts = [];
   if (envPrefix) parts.push(envPrefix);
-  parts.push("./zig-out/bin/zinc");
-  if (caseDef.prompt_mode === "chat") parts.push("--chat");
-  parts.push("-n", String(caseDef.max_tokens));
-  if (caseDef.context_tokens != null) parts.push("--context", String(caseDef.context_tokens));
+  parts.push('./zig-out/bin/zinc');
+  if (caseDef.prompt_mode === 'chat') parts.push('--chat');
+  parts.push('-n', String(caseDef.max_tokens));
+  if (caseDef.context_tokens != null) parts.push('--context', String(caseDef.context_tokens));
   if (shouldUseManagedModelId(caseDef)) {
-    parts.push("--model-id", caseDef.model_id);
+    parts.push('--model-id', caseDef.model_id);
   } else {
-    parts.push("-m", shellQuote(caseDef.model_path));
+    parts.push('-m', shellQuote(caseDef.model_path));
   }
-  parts.push("--prompt", shellQuote(caseDef.prompt));
-  return parts.join(" ");
+  parts.push('--prompt', shellQuote(caseDef.prompt));
+  return parts.join(' ');
 }
 
 function localLlamaCliCommand(caseDef, llamaCli) {
-  const parts = [shellQuote(llamaCli), "-m", shellQuote(caseDef.model_path), "-n", String(caseDef.max_tokens), "-p", shellQuote(caseDef.prompt), "--temp", "0", "-ngl", "999"];
-  if (caseDef.prompt_mode === "chat") parts.push("-cnv");
-  return parts.join(" ");
+  const parts = [
+    shellQuote(llamaCli),
+    '-m',
+    shellQuote(caseDef.model_path),
+    '-n',
+    String(caseDef.max_tokens),
+    '-p',
+    shellQuote(caseDef.prompt),
+    '--temp',
+    '0',
+    '-ngl',
+    '999',
+  ];
+  if (caseDef.prompt_mode === 'chat') parts.push('-cnv');
+  return parts.join(' ');
 }
 
 async function pickOpenPort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
     server.unref();
-    server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
       const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("Could not determine ephemeral port")));
+      if (!address || typeof address === 'string') {
+        server.close(() => reject(new Error('Could not determine ephemeral port')));
         return;
       }
       const { port } = address;
@@ -1645,7 +1760,10 @@ async function pickOpenPort() {
 
 function withTimeout(promise, timeoutMs, label) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${timeoutMs} ms`)),
+      timeoutMs,
+    );
     promise.then(
       (value) => {
         clearTimeout(timer);
@@ -1665,11 +1783,15 @@ export function zincServerTimingWaitSeconds(timeoutMs) {
 }
 
 async function httpJson(url, payload, timeoutMs) {
-  const response = await withTimeout(fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  }), timeoutMs, `POST ${url}`);
+  const response = await withTimeout(
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+    timeoutMs,
+    `POST ${url}`,
+  );
   const text = await response.text();
   if (!response.ok) {
     throw new Error(`HTTP ${response.status} from ${url}: ${text.slice(0, 400)}`);
@@ -1682,15 +1804,15 @@ async function httpJson(url, payload, timeoutMs) {
 // ZINC's server injects its own short system turn and closes the think block,
 // while the GGUF Jinja that llama.cpp runs adds a long "Reasoning effort"
 // directive and opens one (Qwen 3.8: 47-66 prompt tokens vs 87).
-export const BENCH_SYSTEM_PROMPT = "You are a helpful assistant.";
+export const BENCH_SYSTEM_PROMPT = 'You are a helpful assistant.';
 
 export function buildOpenAiPayload(caseDef) {
-  if (caseDef.prompt_mode === "chat") {
+  if (caseDef.prompt_mode === 'chat') {
     return {
-      model: "q",
+      model: 'q',
       messages: [
-        { role: "system", content: caseDef.system_prompt ?? BENCH_SYSTEM_PROMPT },
-        { role: "user", content: caseDef.prompt },
+        { role: 'system', content: caseDef.system_prompt ?? BENCH_SYSTEM_PROMPT },
+        { role: 'user', content: caseDef.prompt },
       ],
       max_tokens: caseDef.max_tokens,
       temperature: 0,
@@ -1701,7 +1823,7 @@ export function buildOpenAiPayload(caseDef) {
     };
   }
   return {
-    model: "q",
+    model: 'q',
     prompt: caseDef.prompt,
     max_tokens: caseDef.max_tokens,
     temperature: 0,
@@ -1733,11 +1855,15 @@ async function waitForHealthyServer(baseUrl, timeoutMs) {
 
 async function stopProcess(child, graceMs = 5000) {
   if (!child || child.exitCode != null) return;
-  child.kill("SIGINT");
+  child.kill('SIGINT');
   try {
-    await withTimeout(new Promise((resolve) => child.once("close", resolve)), graceMs, "process shutdown");
+    await withTimeout(
+      new Promise((resolve) => child.once('close', resolve)),
+      graceMs,
+      'process shutdown',
+    );
   } catch {
-    child.kill("SIGKILL");
+    child.kill('SIGKILL');
   }
 }
 
@@ -1750,11 +1876,14 @@ async function stopProcess(child, graceMs = 5000) {
 // four runs, and the suite already runs a warmup). The pin came from the
 // 9070 XT, where `auto` let SCLK idle at 0 MHz and consecutive samples ramped.
 export function rdnaDpmNormalizeScript() {
-  return "if [ -w /sys/module/pcie_aspm/parameters/policy ]; then echo performance > /sys/module/pcie_aspm/parameters/policy 2>/dev/null || true; fi; for c in /sys/class/drm/card*/device; do if [ -f \"$c/pp_dpm_mclk\" ] && grep -q amdgpu \"$c/uevent\" 2>/dev/null; then levels=$(awk 'END { print NR }' \"$c/pp_dpm_mclk\" 2>/dev/null || printf 0); if [ \"${levels:-0}\" -ge 5 ]; then echo auto > \"$c/power_dpm_force_performance_level\" 2>/dev/null || true; fi; fi; done; true";
+  return 'if [ -w /sys/module/pcie_aspm/parameters/policy ]; then echo performance > /sys/module/pcie_aspm/parameters/policy 2>/dev/null || true; fi; for c in /sys/class/drm/card*/device; do if [ -f "$c/pp_dpm_mclk" ] && grep -q amdgpu "$c/uevent" 2>/dev/null; then levels=$(awk \'END { print NR }\' "$c/pp_dpm_mclk" 2>/dev/null || printf 0); if [ "${levels:-0}" -ge 5 ]; then echo auto > "$c/power_dpm_force_performance_level" 2>/dev/null || true; fi; fi; done; true';
 }
 
 async function lockRdnaDpmNormal(creds, timeoutMs = 30000) {
-  await runShell(rdnaRemoteCommand(rdnaDpmNormalizeScript(), creds), { cwd: ROOT, timeoutMs }).catch(() => {});
+  await runShell(rdnaRemoteCommand(rdnaDpmNormalizeScript(), creds), {
+    cwd: ROOT,
+    timeoutMs,
+  }).catch(() => {});
 }
 
 function detectLocalLlamaServer(args) {
@@ -1766,50 +1895,59 @@ async function launchLocalLlamaServer(caseDef, serverPath, timeoutMs) {
   const baseUrl = `http://127.0.0.1:${port}/v1`;
   const serverEnv = llamaBinaryEnv(serverPath);
   const args = [
-    "--host", "127.0.0.1",
-    "--port", String(port),
-    "-m", caseDef.model_path,
-    "-ngl", "999",
-    "--metrics",
-    "--ctx-size", "4096",
-    "--parallel", "1",
+    '--host',
+    '127.0.0.1',
+    '--port',
+    String(port),
+    '-m',
+    caseDef.model_path,
+    '-ngl',
+    '999',
+    '--metrics',
+    '--ctx-size',
+    '4096',
+    '--parallel',
+    '1',
     // Mirror the remote baseline launch: explicit flash attention and wide
     // batches, and no prompt cache. Without --no-cache-prompt llama-server
     // reuses the previous request's KV prefix, so the warmup run leaves only
     // the trailing template tokens to prefill (observed: prompt_n=4 of 87 on
     // b67a17c1, "23 tok/s" prefill) and the published prefill ratio is
     // meaningless. ZINC's CLI runs always prefill the whole prompt.
-    "-b", "4096",
-    "-ub", "1024",
-    "--flash-attn", "on",
-    "--no-cache-prompt",
+    '-b',
+    '4096',
+    '-ub',
+    '1024',
+    '--flash-attn',
+    'on',
+    '--no-cache-prompt',
   ];
 
   const child = spawn(serverPath, args, {
     cwd: ROOT,
     env: serverEnv,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
 
-  let combinedLog = "";
+  let combinedLog = '';
   const appendLog = (chunk) => {
     combinedLog += chunk.toString();
     if (combinedLog.length > 16000) {
       combinedLog = combinedLog.slice(-16000);
     }
   };
-  child.stdout.on("data", appendLog);
-  child.stderr.on("data", appendLog);
+  child.stdout.on('data', appendLog);
+  child.stderr.on('data', appendLog);
 
   const exitPromise = new Promise((_, reject) => {
-    child.once("exit", (code, signal) => {
+    child.once('exit', (code, signal) => {
       reject(new Error(`llama-server exited early (${signal ?? code})\n${combinedLog}`));
     });
   });
 
   try {
     await Promise.race([
-      waitForHealthyServer(baseUrl.replace(/\/v1$/, ""), Math.min(timeoutMs, 300000)),
+      waitForHealthyServer(baseUrl.replace(/\/v1$/, ''), Math.min(timeoutMs, 300000)),
       exitPromise,
     ]);
   } catch (error) {
@@ -1845,7 +1983,7 @@ export function detectRdnaServerStartupFailure(logText) {
 }
 
 async function tailRdnaLog(creds, logPath, lines = 80) {
-  if (!logPath) return "";
+  if (!logPath) return '';
   const command = rdnaRemoteCommand(
     `tail -n ${Math.max(1, lines)} ${shellQuote(logPath)} 2>/dev/null || true`,
     creds,
@@ -1856,11 +1994,14 @@ async function tailRdnaLog(creds, logPath, lines = 80) {
 
 async function waitForHealthyRdnaServer(creds, port, logPath, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  let lastLogTail = "";
+  let lastLogTail = '';
   while (Date.now() < deadline) {
     try {
       await runShell(
-        rdnaRemoteCommand(`curl -fsS http://${creds.loopbackHost ?? "127.0.0.1"}:${port}/health >/dev/null`, creds),
+        rdnaRemoteCommand(
+          `curl -fsS http://${creds.loopbackHost ?? '127.0.0.1'}:${port}/health >/dev/null`,
+          creds,
+        ),
         { cwd: ROOT, timeoutMs: 10000 },
       );
       return;
@@ -1874,15 +2015,20 @@ async function waitForHealthyRdnaServer(creds, port, logPath, timeoutMs) {
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  const detail = lastLogTail ? `\n${lastLogTail}` : "";
-  throw new Error(`Remote server on port ${port} did not become healthy within ${timeoutMs} ms${detail}`);
+  const detail = lastLogTail ? `\n${lastLogTail}` : '';
+  throw new Error(
+    `Remote server on port ${port} did not become healthy within ${timeoutMs} ms${detail}`,
+  );
 }
 
 async function stopRdnaLlamaServer(creds, port) {
   if (!port) return;
   try {
     await runShell(
-      rdnaRemoteCommand(`pkill -f '[l]lama-server --host ${creds.loopbackHost ?? "127.0.0.1"} --port ${port}' || true`, creds),
+      rdnaRemoteCommand(
+        `pkill -f '[l]lama-server --host ${creds.loopbackHost ?? '127.0.0.1'} --port ${port}' || true`,
+        creds,
+      ),
       { cwd: ROOT, timeoutMs: 30000 },
     );
   } catch {
@@ -1902,47 +2048,78 @@ async function stopRdnaZincServer(creds, port) {
   }
 }
 
-async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targetId = "rdna", lockDpm = true) {
+function rdnaServerContext(caseDef) {
+  const context = caseDef.context_tokens ?? 4096;
+  if (!Number.isSafeInteger(context) || context < 1 || context > 4294967295)
+    throw new Error('RDNA server context must be a positive 32-bit integer');
+  return context;
+}
+
+export function rdnaLlamaServerArgs(caseDef, creds, serverPath, port) {
+  const kv = creds.llamaKvCache ?? 'f16';
+  if (!['f16', 'q8_0'].includes(kv)) throw new Error('Unsupported llama.cpp KV format');
+  return [
+    serverPath,
+    '--host',
+    creds.loopbackHost ?? '127.0.0.1',
+    '--port',
+    String(port),
+    '-m',
+    caseDef.model_path,
+    ...(creds.serverDeviceArgs ?? ['--device', `Vulkan${creds.vkDevice ?? 1}`]),
+    '-ngl',
+    '999',
+    '--metrics',
+    '--ctx-size',
+    String(rdnaServerContext(caseDef)),
+    '--parallel',
+    '1',
+    // Keep the fast default baseline; opt into Q8 only when explicitly asked.
+    ...(kv === 'q8_0' ? ['-ctk', 'q8_0', '-ctv', 'q8_0'] : []),
+    '-b',
+    '4096',
+    '-ub',
+    '1024',
+    '--flash-attn',
+    'on',
+    '--no-cache-prompt',
+  ];
+}
+
+export function rdnaZincServerArgs(caseDef, creds, port) {
+  return [
+    './zig-out/bin/zinc',
+    '-m',
+    caseDef.model_path,
+    '--context',
+    String(rdnaServerContext(caseDef)),
+    ...((creds.zincDevice ?? creds.vkDevice) != null
+      ? ['-d', String(creds.zincDevice ?? creds.vkDevice)]
+      : []),
+    '--parallel',
+    '1',
+    '--port',
+    String(port),
+  ];
+}
+
+async function launchRdnaLlamaServer(
+  caseDef,
+  creds,
+  serverPath,
+  timeoutMs,
+  targetId = 'rdna',
+  lockDpm = true,
+) {
   const port = await pickOpenPort();
   const logPath = `/tmp/zinc-${targetId}-llama-${port}.log`;
-  // Force the discrete RDNA4 GPU's DPM state to "high" before launch.
-  // Without this, an idle llama-server holds the GPU but doesn't pin
-  // memclk to a high level — the DPM heuristic sees "barely active"
-  // and clocks down to level 0 (96 MHz mclk on gfx1201), which makes
-  // every subsequent benchmark run at ~15% of peak memory bandwidth.
-  // Empirically reproduced on this node: idle llama-server pinned
-  // tg128 at 28-30 tok/s on Qwen 3.6 35B-A3B vs 108 tok/s right after
-  // reboot; locking DPM to high recovers ~92 tok/s (level 4 of 5).
-  // Card discovery: the discrete GPU is whichever card1/card2 has
-  // amdgpu driver + a 6-level pp_dpm_mclk; we just try both.
-  if (lockDpm) {
-    await lockRdnaDpmNormal(creds);
-  }
-
-  const cmd = [
-    serverPath,
-    "--host", (creds.loopbackHost ?? "127.0.0.1"),
-    "--port", String(port),
-    "-m", caseDef.model_path,
-    ...(creds.serverDeviceArgs ?? ["--device", `Vulkan${creds.vkDevice ?? 1}`]),
-    "-ngl", "999",
-    "--metrics",
-    "--ctx-size", "4096",
-    "--parallel", "1",
-    // Default f16 KV cache. The previous -ctk q8_0 / -ctv q8_0 added
-    // dequant-per-attention-read overhead that artificially lowered
-    // llama.cpp's decode tok/s vs ZINC (which uses f32 KV) — apples-to-
-    // not-apples. Drop to defaults so the published baseline reflects
-    // peak llama.cpp throughput on this model + hardware.
-    "-b", "4096",
-    "-ub", "1024",
-    "--flash-attn", "on",
-    "--no-cache-prompt",
-  ];
+  // Match ZINC's power policy while retaining opportunistic clock boosts.
+  if (lockDpm) await lockRdnaDpmNormal(creds);
+  const cmd = rdnaLlamaServerArgs(caseDef, creds, serverPath, port);
   const launchScript = [
-    "import os, subprocess",
+    'import os, subprocess',
     `cmd = ${JSON.stringify(cmd)}`,
-    "env = dict(os.environ)",
+    'env = dict(os.environ)',
     `env.update(${JSON.stringify(creds.env ?? {})})`,
     // Truncate: log paths are keyed by port, and a reused port would otherwise hand
     // this model the previous server's lines (a Gemma run inherited Qwen NextN/MTP
@@ -1950,7 +2127,7 @@ async function launchRdnaLlamaServer(caseDef, creds, serverPath, timeoutMs, targ
     `log = open(${JSON.stringify(logPath)}, "wb", buffering=0)`,
     `subprocess.Popen(cmd, cwd=${JSON.stringify(creds.workdir)}, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)`,
     'print("started")',
-  ].join("; ");
+  ].join('; ');
   const remote = `python3 -c ${shellQuote(launchScript)}`;
 
   await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 120000 });
@@ -1970,26 +2147,19 @@ async function launchRdnaZincServer(caseDef, creds, timeoutMs) {
   const logPath = `/tmp/zinc-rdna-zinc-${port}.log`;
   await lockRdnaDpmNormal(creds);
 
-  const cmd = [
-    "./zig-out/bin/zinc",
-    "-m", caseDef.model_path,
-    ...(caseDef.context_tokens != null ? ["--context", String(caseDef.context_tokens)] : []),
-    ...(creds.vkDevice != null ? ["-d", String(creds.vkDevice)] : []),
-    "--parallel", "1",
-    "--port", String(port),
-  ];
+  const cmd = rdnaZincServerArgs(caseDef, creds, port);
   const launchScript = [
-    "import os, subprocess",
+    'import os, subprocess',
     `cmd = ${JSON.stringify(cmd)}`,
-    "env = dict(os.environ)",
-    `env.update(${JSON.stringify({ RADV_PERFTEST: "coop_matrix", ...(creds.env ?? {}) })})`,
+    'env = dict(os.environ)',
+    `env.update(${JSON.stringify({ RADV_PERFTEST: 'coop_matrix', ...(creds.env ?? {}) })})`,
     // Truncate: log paths are keyed by port, and a reused port would otherwise hand
     // this model the previous server's lines (a Gemma run inherited Qwen NextN/MTP
     // acceptance lines and was published with an MTP badge).
     `log = open(${JSON.stringify(logPath)}, "wb", buffering=0)`,
     `subprocess.Popen(cmd, cwd=${JSON.stringify(creds.workdir)}, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)`,
     'print("started")',
-  ].join("; ");
+  ].join('; ');
   const remote = `python3 -c ${shellQuote(launchScript)}`;
 
   await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 120000 });
@@ -2007,7 +2177,7 @@ async function launchRdnaZincServer(caseDef, creds, timeoutMs) {
 // Host load at the end of each measured request. A busy host slows the
 // dispatch-heavy decoders in both engines, so the artifact carries it rather
 // than leaving readers to guess why two runs differ.
-const LOADAVG_MARKER = "__ZINC_LOADAVG__";
+const LOADAVG_MARKER = '__ZINC_LOADAVG__';
 
 export function appendLoadavgProbe(remoteScript) {
   return `${remoteScript}\nprintf '\\n${LOADAVG_MARKER} %s\\n' "$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)"`;
@@ -2017,11 +2187,15 @@ export function splitLoadavgProbe(stdout) {
   const idx = stdout.lastIndexOf(LOADAVG_MARKER);
   if (idx < 0) return { stdout, hostLoad1m: null };
   const load = Number.parseFloat(stdout.slice(idx + LOADAVG_MARKER.length).trim());
-  return { stdout: stdout.slice(0, idx).replace(/\n$/, ""), hostLoad1m: Number.isFinite(load) ? load : null };
+  return {
+    stdout: stdout.slice(0, idx).replace(/\n$/, ''),
+    hostLoad1m: Number.isFinite(load) ? load : null,
+  };
 }
 
 async function runOpenAiSeries({ label, warmupRuns, runs, baseUrl, caseDef, timeoutMs }) {
-  const endpoint = caseDef.prompt_mode === "chat" ? `${baseUrl}/chat/completions` : `${baseUrl}/completions`;
+  const endpoint =
+    caseDef.prompt_mode === 'chat' ? `${baseUrl}/chat/completions` : `${baseUrl}/completions`;
   const payload = buildOpenAiPayload(caseDef);
   const measured = [];
 
@@ -2039,7 +2213,8 @@ async function runOpenAiSeries({ label, warmupRuns, runs, baseUrl, caseDef, time
     const parsed = parseOpenAiCompletionOutput(JSON.stringify(body));
     parsed.totalLatencyMs = ended - started;
     const totalTokens = (parsed.promptTokens ?? 0) + (parsed.generatedTokens ?? 0);
-    parsed.totalTps = totalTokens > 0 ? totalTokens / Math.max((ended - started) / 1000, 1e-9) : null;
+    parsed.totalTps =
+      totalTokens > 0 ? totalTokens / Math.max((ended - started) / 1000, 1e-9) : null;
     measured.push(parsed);
   }
 
@@ -2047,10 +2222,12 @@ async function runOpenAiSeries({ label, warmupRuns, runs, baseUrl, caseDef, time
 }
 
 async function runRdnaOpenAiSeries({ label, warmupRuns, runs, creds, port, caseDef, timeoutMs }) {
-  const endpoint = caseDef.prompt_mode === "chat" ? `/v1/chat/completions` : `/v1/completions`;
+  const endpoint = caseDef.prompt_mode === 'chat' ? `/v1/chat/completions` : `/v1/completions`;
   const payload = buildOpenAiPayload(caseDef);
   const command = rdnaRemoteCommand(
-    appendLoadavgProbe(`curl -sS http://${creds.loopbackHost ?? "127.0.0.1"}:${port}${endpoint} -H 'Content-Type: application/json' -d ${shellQuote(JSON.stringify(payload))}`),
+    appendLoadavgProbe(
+      `curl -sS http://${creds.loopbackHost ?? '127.0.0.1'}:${port}${endpoint} -H 'Content-Type: application/json' -d ${shellQuote(JSON.stringify(payload))}`,
+    ),
     creds,
   );
   const measured = [];
@@ -2071,37 +2248,47 @@ async function runRdnaOpenAiSeries({ label, warmupRuns, runs, creds, port, caseD
     parsed.hostLoad1m = probe.hostLoad1m;
     parsed.totalLatencyMs = ended - started;
     const totalTokens = (parsed.promptTokens ?? 0) + (parsed.generatedTokens ?? 0);
-    parsed.totalTps = totalTokens > 0 ? totalTokens / Math.max((ended - started) / 1000, 1e-9) : null;
+    parsed.totalTps =
+      totalTokens > 0 ? totalTokens / Math.max((ended - started) / 1000, 1e-9) : null;
     measured.push(parsed);
   }
 
   return measured;
 }
 
-async function runRdnaZincOpenAiSeries({ label, warmupRuns, runs, creds, port, logPath, caseDef, timeoutMs }) {
-  const endpoint = caseDef.prompt_mode === "chat" ? `/v1/chat/completions` : `/v1/completions`;
+async function runRdnaZincOpenAiSeries({
+  label,
+  warmupRuns,
+  runs,
+  creds,
+  port,
+  logPath,
+  caseDef,
+  timeoutMs,
+}) {
+  const endpoint = caseDef.prompt_mode === 'chat' ? `/v1/chat/completions` : `/v1/completions`;
   const payload = buildZincOpenAiPayload(caseDef);
-  const host = creds.loopbackHost ?? "127.0.0.1";
+  const host = creds.loopbackHost ?? '127.0.0.1';
   const deadlineSeconds = zincServerTimingWaitSeconds(timeoutMs);
   const remoteScript = [
-    "set -euo pipefail",
+    'set -euo pipefail',
     `LOG=${shellQuote(logPath)}`,
     `count_generated() { awk '/info\\(forward\\): Generated / { c++ } END { print c + 0 }' "$LOG" 2>/dev/null || printf '0\\n'; }`,
     // Scope-agnostic: Vulkan logs this under info(forward), the ROCm serving
     // engine under info(cuda_serve).
     `count_accepted() { awk '/NextN\\/MTP: request accepted / { c++ } END { print c + 0 }' "$LOG" 2>/dev/null || printf '0\\n'; }`,
-    "before=$(count_generated)",
-    "before_acc=$(count_accepted)",
+    'before=$(count_generated)',
+    'before_acc=$(count_accepted)',
     `response=$(curl -sS http://${host}:${port}${endpoint} -H 'Content-Type: application/json' -d ${shellQuote(JSON.stringify(payload))})`,
-    "if printf '%s' \"$response\" | grep -q '\"error\"'; then msg=$(printf '%s' \"$response\" | python3 -c 'import json,sys; body=json.load(sys.stdin); print(body.get(\"error\",{}).get(\"message\", \"\"))' 2>/dev/null || true); printf '%s\\n' \"$response\"; printf '\\n__ZINC_TIMING__\\n'; tail -n 40 \"$LOG\" 2>/dev/null || true; if [ -n \"$msg\" ]; then echo \"err(zinc-bench): ZINC server returned error: $msg\" >&2; else echo 'err(zinc-bench): ZINC server returned an error response' >&2; fi; exit 125; fi",
+    'if printf \'%s\' "$response" | grep -q \'"error"\'; then msg=$(printf \'%s\' "$response" | python3 -c \'import json,sys; body=json.load(sys.stdin); print(body.get("error",{}).get("message", ""))\' 2>/dev/null || true); printf \'%s\\n\' "$response"; printf \'\\n__ZINC_TIMING__\\n\'; tail -n 40 "$LOG" 2>/dev/null || true; if [ -n "$msg" ]; then echo "err(zinc-bench): ZINC server returned error: $msg" >&2; else echo \'err(zinc-bench): ZINC server returned an error response\' >&2; fi; exit 125; fi',
     `deadline=$((SECONDS + ${deadlineSeconds}))`,
-    "while [ \"$(count_generated)\" -le \"$before\" ]; do if [ \"$SECONDS\" -ge \"$deadline\" ]; then printf '%s\\n' \"$response\"; printf '\\n__ZINC_TIMING__\\n'; tail -n 40 \"$LOG\" 2>/dev/null || true; echo 'err(zinc-bench): no ZINC Generated log line after API response' >&2; exit 124; fi; sleep 0.05; done",
+    'while [ "$(count_generated)" -le "$before" ]; do if [ "$SECONDS" -ge "$deadline" ]; then printf \'%s\\n\' "$response"; printf \'\\n__ZINC_TIMING__\\n\'; tail -n 40 "$LOG" 2>/dev/null || true; echo \'err(zinc-bench): no ZINC Generated log line after API response\' >&2; exit 124; fi; sleep 0.05; done',
     // NextN/MTP logs its acceptance line a few ms after the Generated line; wait for it when the model speculates.
-    "if [ \"$before_acc\" -gt 0 ] || grep -q 'NextN/MTP: 1 appended' \"$LOG\" 2>/dev/null; then acc_deadline=$((SECONDS + 3)); while [ \"$(count_accepted)\" -le \"$before_acc\" ] && [ \"$SECONDS\" -lt \"$acc_deadline\" ]; do sleep 0.05; done; fi",
-    "printf '%s\\n' \"$response\"",
+    'if [ "$before_acc" -gt 0 ] || grep -q \'NextN/MTP: 1 appended\' "$LOG" 2>/dev/null; then acc_deadline=$((SECONDS + 3)); while [ "$(count_accepted)" -le "$before_acc" ] && [ "$SECONDS" -lt "$acc_deadline" ]; do sleep 0.05; done; fi',
+    'printf \'%s\\n\' "$response"',
     "printf '\\n__ZINC_TIMING__\\n'",
-    "awk '/NextN\\/MTP: request accepted / { acc = $0 } /info\\(forward\\): Prefill:|info\\(forward\\): Generated / { lines[++n] = $0 } END { start = n > 1 ? n - 1 : 1; for (i = start; i <= n; i++) print lines[i]; if (acc != \"\") print acc }' \"$LOG\"",
-  ].join("\n");
+    'awk \'/NextN\\/MTP: request accepted / { acc = $0 } /info\\(forward\\): Prefill:|info\\(forward\\): Generated / { lines[++n] = $0 } END { start = n > 1 ? n - 1 : 1; for (i = start; i <= n; i++) print lines[i]; if (acc != "") print acc }\' "$LOG"',
+  ].join('\n');
   const command = rdnaRemoteCommand(appendLoadavgProbe(remoteScript), creds);
   const measured = [];
 
@@ -2121,7 +2308,8 @@ async function runRdnaZincOpenAiSeries({ label, warmupRuns, runs, creds, port, l
     parsed.hostLoad1m = probe.hostLoad1m;
     parsed.totalLatencyMs = ended - started;
     const totalTokens = (parsed.promptTokens ?? 0) + (parsed.generatedTokens ?? 0);
-    parsed.totalTps = totalTokens > 0 ? totalTokens / Math.max((ended - started) / 1000, 1e-9) : null;
+    parsed.totalTps =
+      totalTokens > 0 ? totalTokens / Math.max((ended - started) / 1000, 1e-9) : null;
     measured.push(parsed);
   }
 
@@ -2131,15 +2319,15 @@ async function runRdnaZincOpenAiSeries({ label, warmupRuns, runs, creds, port, l
 function remoteCommand(commandText, creds) {
   const sshArgs = [];
   if (creds.sshKey) {
-    sshArgs.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
+    sshArgs.push('-i', shellQuote(creds.sshKey), '-o', 'IdentitiesOnly=yes');
   }
-  sshArgs.push("-o", "ConnectTimeout=15");
+  sshArgs.push('-o', 'ConnectTimeout=15');
   appendPasswordSshOptions(sshArgs, creds);
-  if (process.env.ZINC_SSH_STRICT === "no") {
-    sshArgs.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
+  if (process.env.ZINC_SSH_STRICT === 'no') {
+    sshArgs.push('-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null');
   }
-  sshArgs.push("-p", creds.port, `${creds.user}@${creds.host}`, shellQuote(commandText));
-  return withSshAskpass(`ssh ${sshArgs.join(" ")}`, creds);
+  sshArgs.push('-p', creds.port, `${creds.user}@${creds.host}`, shellQuote(commandText));
+  return withSshAskpass(`ssh ${sshArgs.join(' ')}`, creds);
 }
 
 function rdnaRemoteCommand(commandText, creds) {
@@ -2147,17 +2335,17 @@ function rdnaRemoteCommand(commandText, creds) {
 }
 
 function remoteDetachedCommand(commandText, creds) {
-  const sshArgs = ["-f"];
+  const sshArgs = ['-f'];
   if (creds.sshKey) {
-    sshArgs.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
+    sshArgs.push('-i', shellQuote(creds.sshKey), '-o', 'IdentitiesOnly=yes');
   }
-  sshArgs.push("-o", "ConnectTimeout=15");
+  sshArgs.push('-o', 'ConnectTimeout=15');
   appendPasswordSshOptions(sshArgs, creds);
-  if (process.env.ZINC_SSH_STRICT === "no") {
-    sshArgs.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
+  if (process.env.ZINC_SSH_STRICT === 'no') {
+    sshArgs.push('-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null');
   }
-  sshArgs.push("-p", creds.port, `${creds.user}@${creds.host}`, shellQuote(commandText));
-  return withSshAskpass(`ssh ${sshArgs.join(" ")}`, creds);
+  sshArgs.push('-p', creds.port, `${creds.user}@${creds.host}`, shellQuote(commandText));
+  return withSshAskpass(`ssh ${sshArgs.join(' ')}`, creds);
 }
 
 function rdnaDetachedCommand(commandText, creds) {
@@ -2165,28 +2353,31 @@ function rdnaDetachedCommand(commandText, creds) {
 }
 
 function remoteSshTransport(creds) {
-  const parts = ["ssh"];
+  const parts = ['ssh'];
   if (creds.sshKey) {
-    parts.push("-i", shellQuote(creds.sshKey), "-o", "IdentitiesOnly=yes");
+    parts.push('-i', shellQuote(creds.sshKey), '-o', 'IdentitiesOnly=yes');
   }
-  parts.push("-o", "ConnectTimeout=15");
+  parts.push('-o', 'ConnectTimeout=15');
   appendPasswordSshOptions(parts, creds);
-  if (process.env.ZINC_SSH_STRICT === "no") {
-    parts.push("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null");
+  if (process.env.ZINC_SSH_STRICT === 'no') {
+    parts.push('-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null');
   }
-  parts.push("-p", creds.port);
-  return parts.join(" ");
+  parts.push('-p', creds.port);
+  return parts.join(' ');
 }
 
 function appendPasswordSshOptions(args, creds) {
   if (!hasSshPasswordAuth(creds)) return;
   args.push(
-    "-o", "BatchMode=no",
-    "-o", "NumberOfPasswordPrompts=1",
-    "-o", "PreferredAuthentications=publickey,password,keyboard-interactive",
+    '-o',
+    'BatchMode=no',
+    '-o',
+    'NumberOfPasswordPrompts=1',
+    '-o',
+    'PreferredAuthentications=publickey,password,keyboard-interactive',
   );
-  if (process.env.ZINC_SSH_STRICT !== "no") {
-    args.push("-o", "StrictHostKeyChecking=accept-new");
+  if (process.env.ZINC_SSH_STRICT !== 'no') {
+    args.push('-o', 'StrictHostKeyChecking=accept-new');
   }
 }
 
@@ -2211,15 +2402,15 @@ function sshAskpassScript(creds) {
 
 function sshAskpassSetup(creds) {
   const script = sshAskpassScript(creds);
-  if (!script) return "";
-  const display = process.env.DISPLAY || "zinc-askpass";
+  if (!script) return '';
+  const display = process.env.DISPLAY || 'zinc-askpass';
   return [
-    "zinc_askpass=$(mktemp /tmp/zinc-askpass.XXXXXX)",
+    'zinc_askpass=$(mktemp /tmp/zinc-askpass.XXXXXX)',
     `printf %s ${shellQuote(script)} > "$zinc_askpass"`,
-    "chmod 700 \"$zinc_askpass\"",
-    "trap 'rm -f \"$zinc_askpass\"' EXIT",
+    'chmod 700 "$zinc_askpass"',
+    'trap \'rm -f "$zinc_askpass"\' EXIT',
     `DISPLAY=${shellQuote(display)} SSH_ASKPASS="$zinc_askpass" SSH_ASKPASS_REQUIRE=force`,
-  ].join(" && ");
+  ].join(' && ');
 }
 
 function withSshAskpass(command, creds) {
@@ -2233,31 +2424,28 @@ function rdnaSshTransport(creds) {
 
 export function remoteZincCommand(caseDef, creds) {
   const parts = [];
-  if (creds.commandPrelude) parts.push(creds.commandPrelude, "&&");
-  parts.push(`cd ${shellQuote(creds.workdir)}`, "&&");
+  if (creds.commandPrelude) parts.push(creds.commandPrelude, '&&');
+  parts.push(`cd ${shellQuote(creds.workdir)}`, '&&');
   const envPrefix = remoteEnvPrefix({
     ...creds,
     env: { ...zincBenchmarkEnv(caseDef), ...(creds.env ?? {}) },
   });
   if (envPrefix) parts.push(envPrefix);
-  parts.push(
-    "./zig-out/bin/zinc",
-    "-n",
-    String(caseDef.max_tokens),
-  );
-  if (caseDef.context_tokens != null) parts.push("--context", String(caseDef.context_tokens));
-  parts.push("-m", shellQuote(caseDef.model_path));
-  if (creds.vkDevice != null) parts.push("-d", String(creds.vkDevice));
-  if (caseDef.prompt_mode === "chat") parts.push("--chat");
-  parts.push("--prompt", shellQuote(caseDef.prompt));
-  return remoteCommand(parts.join(" "), creds);
+  parts.push('./zig-out/bin/zinc', '-n', String(caseDef.max_tokens));
+  if (caseDef.context_tokens != null) parts.push('--context', String(caseDef.context_tokens));
+  parts.push('-m', shellQuote(caseDef.model_path));
+  const device = creds.zincDevice ?? creds.vkDevice;
+  if (device != null) parts.push('-d', String(device));
+  if (caseDef.prompt_mode === 'chat') parts.push('--chat');
+  parts.push('--prompt', shellQuote(caseDef.prompt));
+  return remoteCommand(parts.join(' '), creds);
 }
 
 export function rdnaZincCommand(caseDef, creds) {
   return remoteZincCommand(caseDef, {
     ...creds,
     commandPrelude: rdnaDpmNormalizeScript(),
-    env: { RADV_PERFTEST: "coop_matrix", ...(creds.env ?? {}) },
+    env: { RADV_PERFTEST: 'coop_matrix', ...(creds.env ?? {}) },
   });
 }
 
@@ -2266,68 +2454,85 @@ export function intelZincCommand(caseDef, creds) {
 }
 
 function remoteLlamaCommand(caseDef, creds, llamaCliPath) {
-  const parts = [
-  ];
+  const parts = [];
   const envPrefix = remoteEnvPrefix(creds);
   if (envPrefix) parts.push(envPrefix);
   parts.push(
     shellQuote(llamaCliPath),
-    "-m",
+    '-m',
     shellQuote(caseDef.model_path),
-    "-n",
+    '-n',
     String(caseDef.max_tokens),
-    "-p",
+    '-p',
     shellQuote(caseDef.prompt),
-    "--temp",
-    "0",
-    "-ngl",
-    "999",
-    ...(creds.cliDeviceArgs ?? ["--device", `Vulkan${creds.vkDevice ?? 1}`]),
-    "--flash-attn",
-    "on",
-    "-b",
-    "4096",
-    "-ub",
-    "1024",
+    '--temp',
+    '0',
+    '-ngl',
+    '999',
+    ...(creds.cliDeviceArgs ?? ['--device', `Vulkan${creds.vkDevice ?? 1}`]),
+    '--flash-attn',
+    'on',
+    '-b',
+    '4096',
+    '-ub',
+    '1024',
   );
-  if (caseDef.prompt_mode === "chat") parts.push("-cnv");
-  return remoteCommand(parts.join(" "), creds);
+  if (caseDef.prompt_mode === 'chat') parts.push('-cnv');
+  return remoteCommand(parts.join(' '), creds);
 }
 
 function rdnaLlamaCommand(caseDef, creds, llamaCliPath) {
-  return remoteLlamaCommand(caseDef, { ...creds, env: { RADV_PERFTEST: "coop_matrix", ...(creds.env ?? {}) } }, llamaCliPath);
+  return remoteLlamaCommand(
+    caseDef,
+    { ...creds, env: { RADV_PERFTEST: 'coop_matrix', ...(creds.env ?? {}) } },
+    llamaCliPath,
+  );
 }
 
 async function detectRemoteLlamaCliPath(creds, searchRoots, override = null) {
   if (override) return override;
-  const quotedRoots = searchRoots.map((root) => shellQuote(root)).join(" ");
+  const quotedRoots = searchRoots.map((root) => shellQuote(root)).join(' ');
   const command = rdnaRemoteCommand(
     `which llama-cli || command -v llama-cli || find ${quotedRoots} -name llama-cli -type f 2>/dev/null | head -n 1`,
     creds,
   );
   const result = await runShell(command, { cwd: ROOT, timeoutMs: 120000 });
-  const candidate = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  const candidate = result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
   return candidate || null;
 }
 
 async function detectRemoteLlamaServerPath(creds, searchRoots, override = null) {
   if (override) return override;
-  const quotedRoots = searchRoots.map((root) => shellQuote(root)).join(" ");
+  const quotedRoots = searchRoots.map((root) => shellQuote(root)).join(' ');
   const command = rdnaRemoteCommand(
     `which llama-server || command -v llama-server || find ${quotedRoots} -name llama-server -type f 2>/dev/null | head -n 1`,
     creds,
   );
   const result = await runShell(command, { cwd: ROOT, timeoutMs: 120000 });
-  const candidate = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  const candidate = result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
   return candidate || null;
 }
 
 async function detectRdnaLlamaCliPath(creds, args) {
-  return detectRemoteLlamaCliPath(creds, ["/root/llama.cpp", "/root/workspace/llama.cpp"], args.rdnaLlamaCli ?? null);
+  return detectRemoteLlamaCliPath(
+    creds,
+    ['/root/llama.cpp', '/root/workspace/llama.cpp'],
+    args.rdnaLlamaCli ?? null,
+  );
 }
 
 async function detectRdnaLlamaServerPath(creds, args) {
-  return detectRemoteLlamaServerPath(creds, ["/root/llama.cpp", "/root/workspace/llama.cpp"], args.rdnaLlamaServer ?? null);
+  return detectRemoteLlamaServerPath(
+    creds,
+    ['/root/llama.cpp', '/root/workspace/llama.cpp'],
+    args.rdnaLlamaServer ?? null,
+  );
 }
 
 async function runSeries({ label, warmupRuns, runs, command, parser, cwd, timeoutMs }) {
@@ -2345,7 +2550,8 @@ async function runSeries({ label, warmupRuns, runs, command, parser, cwd, timeou
     const parsed = parser(result.combined);
     parsed.totalLatencyMs = ended - started;
     const totalTokens = (parsed.promptTokens ?? 0) + (parsed.generatedTokens ?? 0);
-    parsed.totalTps = totalTokens > 0 ? totalTokens / Math.max((ended - started) / 1000, 1e-9) : null;
+    parsed.totalTps =
+      totalTokens > 0 ? totalTokens / Math.max((ended - started) / 1000, 1e-9) : null;
     measured.push(parsed);
   }
   return measured;
@@ -2353,26 +2559,28 @@ async function runSeries({ label, warmupRuns, runs, command, parser, cwd, timeou
 
 async function detectMetalMachine() {
   try {
-    const result = await runShell("system_profiler SPHardwareDataType SPDisplaysDataType -json", { timeoutMs: 120000 });
+    const result = await runShell('system_profiler SPHardwareDataType SPDisplaysDataType -json', {
+      timeoutMs: 120000,
+    });
     const parsed = JSON.parse(result.stdout);
     const hardware = parsed.SPHardwareDataType?.[0] ?? {};
     const displays = parsed.SPDisplaysDataType?.[0]?.spdisplays_ndrvs?.[0] ?? {};
     const chip = hardware.chip_type ?? null;
     return {
-      label: hardware.machine_name ?? hardware.model_name ?? "Apple Silicon Mac",
+      label: hardware.machine_name ?? hardware.model_name ?? 'Apple Silicon Mac',
       machine_model: hardware.machine_model ?? null,
       chip,
       memory: hardware.physical_memory ?? null,
-      gpu: chip ? `${chip} GPU` : displays.sppci_model ?? displays._name ?? "Apple GPU",
+      gpu: chip ? `${chip} GPU` : (displays.sppci_model ?? displays._name ?? 'Apple GPU'),
       os: `${os.type()} ${os.release()}`,
     };
   } catch {
     return {
-      label: "Apple Silicon Mac",
+      label: 'Apple Silicon Mac',
       machine_model: null,
       chip: null,
       memory: null,
-      gpu: "Apple GPU",
+      gpu: 'Apple GPU',
       os: `${os.type()} ${os.release()}`,
     };
   }
@@ -2381,135 +2589,143 @@ async function detectMetalMachine() {
 export function defaultMetalCases(modelRoot) {
   return [
     {
-      id: "gemma4-26b-a4b-q4k-m",
-      model_id: "gemma4-26b-a4b-q4k-m",
-      label: "Gemma 4 26B-A4B MoE Q4_K_M",
-      family: "Gemma 4",
-      quant: "Q4_K_M",
-      model_path: modelPath(modelRoot, "gemma4-26b-a4b-q4k-m"),
-      prompt_mode: "chat",
-      prompt: defaultPromptForModelId("gemma4-26b-a4b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("gemma4-26b-a4b-q4k-m"),
-      notes: ["ISWA / MoE Metal path"],
+      id: 'gemma4-26b-a4b-q4k-m',
+      model_id: 'gemma4-26b-a4b-q4k-m',
+      label: 'Gemma 4 26B-A4B MoE Q4_K_M',
+      family: 'Gemma 4',
+      quant: 'Q4_K_M',
+      model_path: modelPath(modelRoot, 'gemma4-26b-a4b-q4k-m'),
+      prompt_mode: 'chat',
+      prompt: defaultPromptForModelId('gemma4-26b-a4b-q4k-m'),
+      max_tokens: defaultMaxTokensForModelId('gemma4-26b-a4b-q4k-m'),
+      notes: ['ISWA / MoE Metal path'],
     },
     {
-      id: "gemma4-31b-q4k-m",
-      model_id: "gemma4-31b-q4k-m",
-      label: "Gemma 4 31B Q4_K_M",
-      family: "Gemma 4",
-      quant: "Q4_K_M",
-      model_path: modelPath(modelRoot, "gemma4-31b-q4k-m"),
-      prompt_mode: "chat",
-      prompt: defaultPromptForModelId("gemma4-31b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("gemma4-31b-q4k-m"),
-      notes: ["Large-model Metal path"],
+      id: 'gemma4-31b-q4k-m',
+      model_id: 'gemma4-31b-q4k-m',
+      label: 'Gemma 4 31B Q4_K_M',
+      family: 'Gemma 4',
+      quant: 'Q4_K_M',
+      model_path: modelPath(modelRoot, 'gemma4-31b-q4k-m'),
+      prompt_mode: 'chat',
+      prompt: defaultPromptForModelId('gemma4-31b-q4k-m'),
+      max_tokens: defaultMaxTokensForModelId('gemma4-31b-q4k-m'),
+      notes: ['Large-model Metal path'],
     },
     {
-      id: "qwen35-9b-q4k-m",
-      model_id: "qwen35-9b-q4k-m",
-      label: "Qwen 3.5 9B Q4_K_M",
-      family: "Qwen 3.5",
-      quant: "Q4_K_M",
-      model_path: modelPath(modelRoot, "qwen35-9b-q4k-m"),
-      prompt_mode: "chat",
-      prompt: defaultPromptForModelId("qwen35-9b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("qwen35-9b-q4k-m"),
-      notes: ["Chat-template path; reasoning content is captured by the benchmark parser"],
+      id: 'qwen35-9b-q4k-m',
+      model_id: 'qwen35-9b-q4k-m',
+      label: 'Qwen 3.5 9B Q4_K_M',
+      family: 'Qwen 3.5',
+      quant: 'Q4_K_M',
+      model_path: modelPath(modelRoot, 'qwen35-9b-q4k-m'),
+      prompt_mode: 'chat',
+      prompt: defaultPromptForModelId('qwen35-9b-q4k-m'),
+      max_tokens: defaultMaxTokensForModelId('qwen35-9b-q4k-m'),
+      notes: ['Chat-template path; reasoning content is captured by the benchmark parser'],
     },
     {
-      id: "qwen36-35b-a3b-q4k-xl",
-      model_id: "qwen36-35b-a3b-q4k-xl",
-      label: "Qwen 3.6 35B A3B UD Q4_K_XL",
-      family: "Qwen 3.6",
-      quant: "Q4_K_XL",
-      model_path: modelPath(modelRoot, "qwen36-35b-a3b-q4k-xl"),
-      prompt_mode: "raw",
-      prompt: defaultPromptForModelId("qwen36-35b-a3b-q4k-xl"),
-      max_tokens: defaultMaxTokensForModelId("qwen36-35b-a3b-q4k-xl"),
-      notes: ["Managed-cache local Qwen 3.6 case on Apple Silicon"],
+      id: 'qwen36-35b-a3b-q4k-xl',
+      model_id: 'qwen36-35b-a3b-q4k-xl',
+      label: 'Qwen 3.6 35B A3B UD Q4_K_XL',
+      family: 'Qwen 3.6',
+      quant: 'Q4_K_XL',
+      model_path: modelPath(modelRoot, 'qwen36-35b-a3b-q4k-xl'),
+      prompt_mode: 'raw',
+      prompt: defaultPromptForModelId('qwen36-35b-a3b-q4k-xl'),
+      max_tokens: defaultMaxTokensForModelId('qwen36-35b-a3b-q4k-xl'),
+      notes: ['Managed-cache local Qwen 3.6 case on Apple Silicon'],
     },
     {
-      id: "qwen38-27b-q4k-m",
-      model_id: "qwen38-27b-q4k-m",
-      label: "Qwen 3.8 27B Dense Q4_K_M",
-      family: "Qwen 3.8",
-      quant: "Q4_K_M",
-      model_path: modelPath(modelRoot, "qwen38-27b-q4k-m"),
-      prompt_mode: "chat",
-      prompt: defaultPromptForModelId("qwen38-27b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("qwen38-27b-q4k-m"),
-      notes: ["Dense hybrid Qwen 3.8 case on Apple Silicon"],
+      id: 'qwen38-27b-q4k-m',
+      model_id: 'qwen38-27b-q4k-m',
+      label: 'Qwen 3.8 27B Dense Q4_K_M',
+      family: 'Qwen 3.8',
+      quant: 'Q4_K_M',
+      model_path: modelPath(modelRoot, 'qwen38-27b-q4k-m'),
+      prompt_mode: 'chat',
+      prompt: defaultPromptForModelId('qwen38-27b-q4k-m'),
+      max_tokens: defaultMaxTokensForModelId('qwen38-27b-q4k-m'),
+      notes: ['Dense hybrid Qwen 3.8 case on Apple Silicon'],
     },
   ];
 }
 
 function titleFromId(id) {
-  if (id === "gemma4-26b-a4b-q4k-m") return "Gemma 4 26B-A4B MoE Q4_K_M";
-  if (id === "gemma4-31b-q4k-m") return "Gemma 4 31B Q4_K_M";
+  if (id === 'gemma4-26b-a4b-q4k-m') return 'Gemma 4 26B-A4B MoE Q4_K_M';
+  if (id === 'gemma4-31b-q4k-m') return 'Gemma 4 31B Q4_K_M';
   return id
-    .split("-")
-    .map((chunk) => (chunk.length <= 3 ? chunk.toUpperCase() : `${chunk[0].toUpperCase()}${chunk.slice(1)}`))
-    .join(" ");
+    .split('-')
+    .map((chunk) =>
+      chunk.length <= 3 ? chunk.toUpperCase() : `${chunk[0].toUpperCase()}${chunk.slice(1)}`,
+    )
+    .join(' ');
 }
 
 export function canonicalModelIdFromPath(modelFile) {
   const base = path.basename(modelFile);
-  if (base === "model.gguf") {
+  if (base === 'model.gguf') {
     const parent = path.basename(path.dirname(modelFile));
-    if (parent && parent !== "models") return parent.toLowerCase();
+    if (parent && parent !== 'models') return parent.toLowerCase();
   }
 
-  return path.basename(modelFile, path.extname(modelFile))
+  return path
+    .basename(modelFile, path.extname(modelFile))
     .toLowerCase()
-    .replace(/^openai[_-]/, "")
-    .replace(/^bartowski[_-]/, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .replace(/^qwen-qwen3-8-/, "qwen38-")
-    .replace(/^qwen-qwen-3-8-/, "qwen38-")
-    .replace(/^qwen3-8-/, "qwen38-")
-    .replace(/^qwen-3-8-/, "qwen38-")
-    .replace(/^qwen-qwen3-6-/, "qwen36-")
-    .replace(/^qwen-qwen-3-6-/, "qwen36-")
-    .replace(/^qwen3-6-/, "qwen36-")
-    .replace(/^qwen-3-6-/, "qwen36-")
-    .replace(/^qwen-qwen3-5-/, "qwen35-")
-    .replace(/^qwen-qwen-3-5-/, "qwen35-")
-    .replace(/^qwen3-5-/, "qwen35-")
-    .replace(/^qwen-3-5-/, "qwen35-")
-    .replace(/^qwen-3-/, "qwen3-")
-    .replace(/-ud-(q[0-9].*)$/, "-$1")
-    .replace(/-q([0-9])-k-([a-z0-9]+)/g, "-q$1k-$2")
-    .replace(/-q([0-9])-k$/g, "-q$1k")
-    .replace(/^gemma-4-/, "gemma4-")
-    .replace(/-it-(q[0-9].*)$/, "-$1");
+    .replace(/^openai[_-]/, '')
+    .replace(/^bartowski[_-]/, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .replace(/^qwen-qwen3-8-/, 'qwen38-')
+    .replace(/^qwen-qwen-3-8-/, 'qwen38-')
+    .replace(/^qwen3-8-/, 'qwen38-')
+    .replace(/^qwen-3-8-/, 'qwen38-')
+    .replace(/^qwen-qwen3-6-/, 'qwen36-')
+    .replace(/^qwen-qwen-3-6-/, 'qwen36-')
+    .replace(/^qwen3-6-/, 'qwen36-')
+    .replace(/^qwen-3-6-/, 'qwen36-')
+    .replace(/^qwen-qwen3-5-/, 'qwen35-')
+    .replace(/^qwen-qwen-3-5-/, 'qwen35-')
+    .replace(/^qwen3-5-/, 'qwen35-')
+    .replace(/^qwen-3-5-/, 'qwen35-')
+    .replace(/^qwen-3-/, 'qwen3-')
+    .replace(/-ud-(q[0-9].*)$/, '-$1')
+    .replace(/-q([0-9])-k-([a-z0-9]+)/g, '-q$1k-$2')
+    .replace(/-q([0-9])-k$/g, '-q$1k')
+    .replace(/^gemma-4-/, 'gemma4-')
+    .replace(/-it-(q[0-9].*)$/, '-$1');
 }
 
 export function guessFamily(id) {
-  if (id.startsWith("muse-glimmer")) return "Muse Glimmer";
-  if (id.startsWith("gemma4")) return "Gemma 4";
-  if (id.startsWith("gemma")) return "Gemma";
-  if (id.startsWith("qwen38")) return "Qwen 3.8";
-  if (id.startsWith("qwen36")) return "Qwen 3.6";
-  if (id.startsWith("qwen35")) return "Qwen 3.5";
-  if (id.startsWith("qwen3")) return "Qwen 3";
-  if (id.startsWith("qwen")) return "Qwen";
-  return titleFromId(id.split("-q")[0] ?? id);
+  if (id.startsWith('muse-glimmer')) return 'Muse Glimmer';
+  if (id.startsWith('gemma4')) return 'Gemma 4';
+  if (id.startsWith('gemma')) return 'Gemma';
+  if (id.startsWith('qwen38')) return 'Qwen 3.8';
+  if (id.startsWith('qwen36')) return 'Qwen 3.6';
+  if (id.startsWith('qwen35')) return 'Qwen 3.5';
+  if (id.startsWith('qwen3')) return 'Qwen 3';
+  if (id.startsWith('qwen')) return 'Qwen';
+  return titleFromId(id.split('-q')[0] ?? id);
 }
 
 function guessQuant(id) {
   const match = id.match(/-(q[0-9a-z_]+(?:-[0-9a-z_]+)?)/i);
-  return match ? match[1].toUpperCase().replace(/-/g, "_") : "GGUF";
+  return match ? match[1].toUpperCase().replace(/-/g, '_') : 'GGUF';
 }
 
 export function prefersChatPrompt(id) {
-  return id.startsWith("gemma") || id.startsWith("muse-glimmer") || id.startsWith("qwen35") || id.startsWith("qwen38");
+  return (
+    id.startsWith('gemma') ||
+    id.startsWith('muse-glimmer') ||
+    id.startsWith('qwen35') ||
+    id.startsWith('qwen38')
+  );
 }
 
 export function defaultPromptForModelId(id) {
   return prefersChatPrompt(id)
-    ? "A teammate sent two local LLM benchmark screenshots with different tok/s numbers for the same model. Explain the likely causes in two short paragraphs, then give one concrete measurement rule."
-    : "Developer question: two local LLM benchmark screenshots show different tok/s values for the same model. A useful answer explains likely causes and gives one fair measurement rule.\n\nAnswer:";
+    ? 'A teammate sent two local LLM benchmark screenshots with different tok/s numbers for the same model. Explain the likely causes in two short paragraphs, then give one concrete measurement rule.'
+    : 'Developer question: two local LLM benchmark screenshots show different tok/s values for the same model. A useful answer explains likely causes and gives one fair measurement rule.\n\nAnswer:';
 }
 
 export function defaultMaxTokensForModelId(id) {
@@ -2517,78 +2733,78 @@ export function defaultMaxTokensForModelId(id) {
 }
 
 const CODING_REVIEW_SNIPPET = [
-  "File: src/cache.ts",
-  "```ts",
-  "const cache = new Map<string, string>();",
-  "const pending = new Map<string, Promise<string>>();",
-  "",
-  "export async function getValue(key: string, load: () => Promise<string>) {",
-  "  if (cache.has(key)) return cache.get(key)!;",
-  "  if (pending.has(key)) return cache.get(key)!;",
-  "",
-  "  const task = load().then((value) => {",
-  "    cache.set(key, value);",
-  "    pending.delete(key);",
-  "    return value;",
-  "  });",
-  "  pending.set(key, task);",
-  "  return task;",
-  "}",
-  "```",
-].join("\n");
+  'File: src/cache.ts',
+  '```ts',
+  'const cache = new Map<string, string>();',
+  'const pending = new Map<string, Promise<string>>();',
+  '',
+  'export async function getValue(key: string, load: () => Promise<string>) {',
+  '  if (cache.has(key)) return cache.get(key)!;',
+  '  if (pending.has(key)) return cache.get(key)!;',
+  '',
+  '  const task = load().then((value) => {',
+  '    cache.set(key, value);',
+  '    pending.delete(key);',
+  '    return value;',
+  '  });',
+  '  pending.set(key, task);',
+  '  return task;',
+  '}',
+  '```',
+].join('\n');
 
 const INCIDENT_CONTEXT = [
-  "Incident notes from a local inference service:",
-  "- 09:14: A developer compared two screenshots and saw 49 tok/s in one run and 37 tok/s in another.",
-  "- 09:18: The faster run generated one token after a short chat prompt. The slower run generated 160 tokens after a pasted support ticket.",
-  "- 09:22: The CLI output reports separate lines for prefill throughput and generated-token throughput.",
-  "- 09:27: The team sometimes runs with --profile, which adds per-dispatch accounting and changes CPU-side overhead.",
-  "- 09:33: The llama.cpp baseline is measured through a persistent server, while some ZINC checks were one-off CLI runs.",
-  "- 09:41: A background video export was active during one Apple Silicon run.",
-  "- 09:48: The benchmark dashboard now computes an overall prompt+decode score from prompt tokens, generated tokens, prefill speed, and decode speed.",
-  "",
-  "Relevant policy:",
-  "- Publish medians from repeated warm runs, not screenshots.",
-  "- Keep the same model file, prompt mode, output cap, and backend residency for both engines.",
-  "- Treat one-token completions as coherence smoke tests, not sustained throughput measurements.",
-  "- Report prefill, decode, total latency, and prompt+decode throughput together.",
-  "",
-  "Question: summarize the measurement mistake and propose the benchmark protocol the team should use next.",
-].join("\n");
+  'Incident notes from a local inference service:',
+  '- 09:14: A developer compared two screenshots and saw 49 tok/s in one run and 37 tok/s in another.',
+  '- 09:18: The faster run generated one token after a short chat prompt. The slower run generated 160 tokens after a pasted support ticket.',
+  '- 09:22: The CLI output reports separate lines for prefill throughput and generated-token throughput.',
+  '- 09:27: The team sometimes runs with --profile, which adds per-dispatch accounting and changes CPU-side overhead.',
+  '- 09:33: The llama.cpp baseline is measured through a persistent server, while some ZINC checks were one-off CLI runs.',
+  '- 09:41: A background video export was active during one Apple Silicon run.',
+  '- 09:48: The benchmark dashboard now computes an overall prompt+decode score from prompt tokens, generated tokens, prefill speed, and decode speed.',
+  '',
+  'Relevant policy:',
+  '- Publish medians from repeated warm runs, not screenshots.',
+  '- Keep the same model file, prompt mode, output cap, and backend residency for both engines.',
+  '- Treat one-token completions as coherence smoke tests, not sustained throughput measurements.',
+  '- Report prefill, decode, total latency, and prompt+decode throughput together.',
+  '',
+  'Question: summarize the measurement mistake and propose the benchmark protocol the team should use next.',
+].join('\n');
 
 const LONG_CODING_PLAN_PROMPT =
-  "Write an implementation plan for adding a stable benchmark preset to a local LLM CLI. Include the command shape, warmup policy, metrics to collect, failure handling, llama.cpp comparison, and how the site should display prefill, decode, latency, and overall prompt+decode throughput.";
+  'Write an implementation plan for adding a stable benchmark preset to a local LLM CLI. Include the command shape, warmup policy, metrics to collect, failure handling, llama.cpp comparison, and how the site should display prefill, decode, latency, and overall prompt+decode throughput.';
 
 function contextualizePrompt(promptMode, basePrompt, variant) {
-  if (variant === "core") return basePrompt;
+  if (variant === 'core') return basePrompt;
 
-  if (variant === "context-medium") {
-    if (promptMode === "chat") {
+  if (variant === 'context-medium') {
+    if (promptMode === 'chat') {
       return [
-        "You are reviewing a small TypeScript helper in a production service.",
-        "Identify the bug, explain why it appears under concurrent requests, and provide a corrected version.",
-        "",
+        'You are reviewing a small TypeScript helper in a production service.',
+        'Identify the bug, explain why it appears under concurrent requests, and provide a corrected version.',
+        '',
         CODING_REVIEW_SNIPPET,
-      ].join("\n");
+      ].join('\n');
     }
     return [
-      "Code review request: identify the bug, explain why it appears under concurrent requests, and provide a corrected version.",
-      "",
+      'Code review request: identify the bug, explain why it appears under concurrent requests, and provide a corrected version.',
+      '',
       CODING_REVIEW_SNIPPET,
-      "",
-      "Review:",
-    ].join("\n");
+      '',
+      'Review:',
+    ].join('\n');
   }
 
-  if (variant === "context-long") {
-    if (promptMode === "chat") {
+  if (variant === 'context-long') {
+    if (promptMode === 'chat') {
       return `Read the incident context and answer the final question with concrete engineering guidance.\n\n${INCIDENT_CONTEXT}`;
     }
     return `${INCIDENT_CONTEXT}\n\nEngineering guidance:`;
   }
 
-  if (variant === "decode-extended") {
-    if (promptMode === "chat") return LONG_CODING_PLAN_PROMPT;
+  if (variant === 'decode-extended') {
+    if (promptMode === 'chat') return LONG_CODING_PLAN_PROMPT;
     return `${LONG_CODING_PLAN_PROMPT}\n\nPlan:\n1.`;
   }
 
@@ -2598,9 +2814,9 @@ function contextualizePrompt(promptMode, basePrompt, variant) {
 function scenarioMaxTokens(modelId, scenarioId) {
   const caps = {
     core: defaultMaxTokensForModelId(modelId),
-    "context-medium": 160,
-    "context-long": 128,
-    "decode-extended": 256,
+    'context-medium': 160,
+    'context-long': 128,
+    'decode-extended': 256,
   };
   return caps[scenarioId] ?? defaultMaxTokensForModelId(modelId);
 }
@@ -2608,40 +2824,40 @@ function scenarioMaxTokens(modelId, scenarioId) {
 export function defaultScenarioDefsForModel(modelId, promptMode, basePrompt) {
   return [
     {
-      id: "core",
-      label: "Quick Chat",
-      short_label: "Core",
+      id: 'core',
+      label: 'Quick Chat',
+      short_label: 'Core',
       prompt_mode: promptMode,
-      prompt: contextualizePrompt(promptMode, basePrompt, "core"),
-      max_tokens: scenarioMaxTokens(modelId, "core"),
-      notes: ["Short real-world assistant turn with enough decode budget to avoid one-token rates"],
+      prompt: contextualizePrompt(promptMode, basePrompt, 'core'),
+      max_tokens: scenarioMaxTokens(modelId, 'core'),
+      notes: ['Short real-world assistant turn with enough decode budget to avoid one-token rates'],
     },
     {
-      id: "context-medium",
-      label: "Coding Review",
-      short_label: "Coding",
+      id: 'context-medium',
+      label: 'Coding Review',
+      short_label: 'Coding',
       prompt_mode: promptMode,
-      prompt: contextualizePrompt(promptMode, basePrompt, "context-medium"),
-      max_tokens: scenarioMaxTokens(modelId, "context-medium"),
-      notes: ["Small code-review workload with a realistic TypeScript snippet"],
+      prompt: contextualizePrompt(promptMode, basePrompt, 'context-medium'),
+      max_tokens: scenarioMaxTokens(modelId, 'context-medium'),
+      notes: ['Small code-review workload with a realistic TypeScript snippet'],
     },
     {
-      id: "context-long",
-      label: "Incident Context",
-      short_label: "Context",
+      id: 'context-long',
+      label: 'Incident Context',
+      short_label: 'Context',
       prompt_mode: promptMode,
-      prompt: contextualizePrompt(promptMode, basePrompt, "context-long"),
-      max_tokens: scenarioMaxTokens(modelId, "context-long"),
-      notes: ["Support-style incident context that makes prefill visible"],
+      prompt: contextualizePrompt(promptMode, basePrompt, 'context-long'),
+      max_tokens: scenarioMaxTokens(modelId, 'context-long'),
+      notes: ['Support-style incident context that makes prefill visible'],
     },
     {
-      id: "decode-extended",
-      label: "Long Coding Draft",
-      short_label: "Long draft",
+      id: 'decode-extended',
+      label: 'Long Coding Draft',
+      short_label: 'Long draft',
       prompt_mode: promptMode,
-      prompt: contextualizePrompt(promptMode, basePrompt, "decode-extended"),
-      max_tokens: scenarioMaxTokens(modelId, "decode-extended"),
-      notes: ["Longer coding-plan generation to measure sustained decode"],
+      prompt: contextualizePrompt(promptMode, basePrompt, 'decode-extended'),
+      max_tokens: scenarioMaxTokens(modelId, 'decode-extended'),
+      notes: ['Longer coding-plan generation to measure sustained decode'],
     },
   ];
 }
@@ -2652,23 +2868,32 @@ export function filterScenarioDefs(scenarios, selectedIds = null) {
   const known = new Set(scenarios.map((scenario) => scenario.id));
   const unknown = [...selectedIds].filter((id) => !known.has(id));
   if (unknown.length > 0) {
-    throw new Error(`Unknown scenario id(s): ${unknown.join(", ")}`);
+    throw new Error(`Unknown scenario id(s): ${unknown.join(', ')}`);
   }
   if (selected.length === 0) {
-    throw new Error("No benchmark scenarios selected");
+    throw new Error('No benchmark scenarios selected');
   }
   return selected;
 }
 
 function phaseEnabled(requestedPhase, phase) {
-  return requestedPhase === "all" || requestedPhase === phase;
+  return requestedPhase === 'all' || requestedPhase === phase;
 }
 
-export function buildMeasurementPhases(modelId, promptMode, basePrompt, requestedPhase = "all", selectedScenarios = null) {
-  const scenarios = filterScenarioDefs(defaultScenarioDefsForModel(modelId, promptMode, basePrompt), selectedScenarios);
+export function buildMeasurementPhases(
+  modelId,
+  promptMode,
+  basePrompt,
+  requestedPhase = 'all',
+  selectedScenarios = null,
+) {
+  const scenarios = filterScenarioDefs(
+    defaultScenarioDefsForModel(modelId, promptMode, basePrompt),
+    selectedScenarios,
+  );
   const phases = [
-    ...scenarios.map((scenarioDef) => ({ phase: "zinc", scenarioDef })),
-    ...scenarios.map((scenarioDef) => ({ phase: "baseline", scenarioDef })),
+    ...scenarios.map((scenarioDef) => ({ phase: 'zinc', scenarioDef })),
+    ...scenarios.map((scenarioDef) => ({ phase: 'baseline', scenarioDef })),
   ];
   return phases.filter((phase) => phaseEnabled(requestedPhase, phase.phase));
 }
@@ -2695,10 +2920,10 @@ async function discoverMetalCases(modelRoot) {
       family: guessFamily(id),
       quant: guessQuant(id),
       model_path: modelFile,
-      prompt_mode: chatPrompt ? "chat" : "raw",
+      prompt_mode: chatPrompt ? 'chat' : 'raw',
       prompt: defaultPromptForModelId(id),
       max_tokens: defaultMaxTokensForModelId(id),
-      notes: ["Auto-discovered from the local model cache"],
+      notes: ['Auto-discovered from the local model cache'],
     });
   }
 
@@ -2708,82 +2933,82 @@ async function discoverMetalCases(modelRoot) {
 export function defaultRdnaCases(modelRoot) {
   return [
     {
-      id: "muse-glimmer-30b-q4k-m",
-      label: "Muse Glimmer 30B Q4_K_M",
-      family: "Muse Glimmer",
-      quant: "Q4_K_M",
-      model_path: path.join(modelRoot, "muse-glimmer", "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf"),
-      prompt_mode: "chat",
-      prompt: defaultPromptForModelId("muse-glimmer-30b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("muse-glimmer-30b-q4k-m"),
-      notes: ["RDNA4 Muse Glimmer comparison against llama.cpp server"],
+      id: 'muse-glimmer-30b-q4k-m',
+      label: 'Muse Glimmer 30B Q4_K_M',
+      family: 'Muse Glimmer',
+      quant: 'Q4_K_M',
+      model_path: path.join(modelRoot, 'muse-glimmer', 'Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf'),
+      prompt_mode: 'chat',
+      prompt: defaultPromptForModelId('muse-glimmer-30b-q4k-m'),
+      max_tokens: defaultMaxTokensForModelId('muse-glimmer-30b-q4k-m'),
+      notes: ['RDNA4 Muse Glimmer comparison against llama.cpp server'],
     },
     {
-      id: "qwen38-27b-q4k-m",
-      label: "Qwen 3.8 27B Dense Q4_K_M",
-      family: "Qwen 3.8",
-      quant: "Q4_K_M",
-      model_path: path.join(modelRoot, "Qwen3.8-27B-Q4_K_M.gguf"),
-      prompt_mode: "chat",
-      prompt: defaultPromptForModelId("qwen38-27b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("qwen38-27b-q4k-m"),
-      notes: ["RDNA4 dense Qwen 3.8 comparison against llama.cpp server"],
+      id: 'qwen38-27b-q4k-m',
+      label: 'Qwen 3.8 27B Dense Q4_K_M',
+      family: 'Qwen 3.8',
+      quant: 'Q4_K_M',
+      model_path: path.join(modelRoot, 'Qwen3.8-27B-Q4_K_M.gguf'),
+      prompt_mode: 'chat',
+      prompt: defaultPromptForModelId('qwen38-27b-q4k-m'),
+      max_tokens: defaultMaxTokensForModelId('qwen38-27b-q4k-m'),
+      notes: ['RDNA4 dense Qwen 3.8 comparison against llama.cpp server'],
     },
     {
-      id: "gemma4-26b-a4b-q4k-m",
-      label: "Gemma 4 26B-A4B MoE Q4_K_M",
-      family: "Gemma 4",
-      quant: "Q4_K_M",
-      model_path: path.join(modelRoot, "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"),
-      prompt_mode: "chat",
-      prompt: defaultPromptForModelId("gemma4-26b-a4b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("gemma4-26b-a4b-q4k-m"),
-      notes: ["RDNA4 Gemma MoE comparison against llama.cpp server"],
+      id: 'gemma4-26b-a4b-q4k-m',
+      label: 'Gemma 4 26B-A4B MoE Q4_K_M',
+      family: 'Gemma 4',
+      quant: 'Q4_K_M',
+      model_path: path.join(modelRoot, 'gemma-4-26B-A4B-it-UD-Q4_K_M.gguf'),
+      prompt_mode: 'chat',
+      prompt: defaultPromptForModelId('gemma4-26b-a4b-q4k-m'),
+      max_tokens: defaultMaxTokensForModelId('gemma4-26b-a4b-q4k-m'),
+      notes: ['RDNA4 Gemma MoE comparison against llama.cpp server'],
     },
     {
-      id: "gemma4-31b-q4k-m",
-      label: "Gemma 4 31B Q4_K_M",
-      family: "Gemma 4",
-      quant: "Q4_K_M",
-      model_path: path.join(modelRoot, "gemma-4-31B-it-Q4_K_M.gguf"),
-      prompt_mode: "chat",
-      prompt: defaultPromptForModelId("gemma4-31b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("gemma4-31b-q4k-m"),
-      notes: ["RDNA4 dense Gemma comparison against llama.cpp server"],
+      id: 'gemma4-31b-q4k-m',
+      label: 'Gemma 4 31B Q4_K_M',
+      family: 'Gemma 4',
+      quant: 'Q4_K_M',
+      model_path: path.join(modelRoot, 'gemma-4-31B-it-Q4_K_M.gguf'),
+      prompt_mode: 'chat',
+      prompt: defaultPromptForModelId('gemma4-31b-q4k-m'),
+      max_tokens: defaultMaxTokensForModelId('gemma4-31b-q4k-m'),
+      notes: ['RDNA4 dense Gemma comparison against llama.cpp server'],
     },
     {
-      id: "qwen36-35b-a3b-q4k-xl",
-      label: "Qwen 3.6 35B A3B UD Q4_K_XL",
-      family: "Qwen 3.6",
-      quant: "Q4_K_XL",
-      model_path: path.join(modelRoot, "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
-      prompt_mode: "raw",
-      prompt: defaultPromptForModelId("qwen36-35b-a3b-q4k-xl"),
-      max_tokens: defaultMaxTokensForModelId("qwen36-35b-a3b-q4k-xl"),
-      notes: ["RDNA4 flagship comparison against llama.cpp server"],
+      id: 'qwen36-35b-a3b-q4k-xl',
+      label: 'Qwen 3.6 35B A3B UD Q4_K_XL',
+      family: 'Qwen 3.6',
+      quant: 'Q4_K_XL',
+      model_path: path.join(modelRoot, 'Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf'),
+      prompt_mode: 'raw',
+      prompt: defaultPromptForModelId('qwen36-35b-a3b-q4k-xl'),
+      max_tokens: defaultMaxTokensForModelId('qwen36-35b-a3b-q4k-xl'),
+      notes: ['RDNA4 flagship comparison against llama.cpp server'],
     },
     {
-      id: "qwen35-9b-q4k-m",
-      label: "Qwen 3.5 9B Q4_K_M",
-      family: "Qwen 3.5",
-      quant: "Q4_K_M",
-      model_path: path.join(modelRoot, "Qwen3.5-9B-Q4_K_M.gguf"),
-      prompt_mode: "chat",
-      prompt: defaultPromptForModelId("qwen35-9b-q4k-m"),
-      max_tokens: defaultMaxTokensForModelId("qwen35-9b-q4k-m"),
-      notes: ["RDNA4 small Qwen comparison against llama.cpp server"],
+      id: 'qwen35-9b-q4k-m',
+      label: 'Qwen 3.5 9B Q4_K_M',
+      family: 'Qwen 3.5',
+      quant: 'Q4_K_M',
+      model_path: path.join(modelRoot, 'Qwen3.5-9B-Q4_K_M.gguf'),
+      prompt_mode: 'chat',
+      prompt: defaultPromptForModelId('qwen35-9b-q4k-m'),
+      max_tokens: defaultMaxTokensForModelId('qwen35-9b-q4k-m'),
+      notes: ['RDNA4 small Qwen comparison against llama.cpp server'],
     },
   ];
 }
 
 export function defaultIntelCases(modelRoot) {
   return defaultMetalCases(modelRoot)
-    .filter((entry) => entry.id !== "qwen38-27b-q4k-m")
+    .filter((entry) => entry.id !== 'qwen38-27b-q4k-m')
     .map((entry) => ({
       ...entry,
       model_path: modelPath(modelRoot, entry.id),
       context_tokens: defaultIntelContextTokensForModel(entry.id),
-      notes: ["Intel Arc Vulkan comparison against llama.cpp on the same host"],
+      notes: ['Intel Arc Vulkan comparison against llama.cpp on the same host'],
     }));
 }
 
@@ -2792,7 +3017,10 @@ function defaultIntelContextTokensForModel(_id) {
 }
 
 async function discoverRemoteCases(modelRoot, creds, note) {
-  const command = rdnaRemoteCommand(`find ${shellQuote(modelRoot)} -maxdepth 2 \\( -name '*.gguf' -o -name 'model.gguf' \\) | sort`, creds);
+  const command = rdnaRemoteCommand(
+    `find ${shellQuote(modelRoot)} -maxdepth 2 \\( -name '*.gguf' -o -name 'model.gguf' \\) | sort`,
+    creds,
+  );
   let result;
   try {
     result = await runShell(command, { cwd: ROOT, timeoutMs: 120000 });
@@ -2813,7 +3041,7 @@ async function discoverRemoteCases(modelRoot, creds, note) {
         family: guessFamily(id),
         quant: guessQuant(id),
         model_path: modelFile,
-        prompt_mode: chatPrompt ? "chat" : "raw",
+        prompt_mode: chatPrompt ? 'chat' : 'raw',
         prompt: defaultPromptForModelId(id),
         max_tokens: defaultMaxTokensForModelId(id),
         notes: [note],
@@ -2822,11 +3050,15 @@ async function discoverRemoteCases(modelRoot, creds, note) {
 }
 
 async function discoverRdnaCases(modelRoot, creds) {
-  return discoverRemoteCases(modelRoot, creds, "Auto-discovered on the RDNA benchmark node");
+  return discoverRemoteCases(modelRoot, creds, 'Auto-discovered on the RDNA benchmark node');
 }
 
 async function discoverIntelCases(modelRoot, creds) {
-  const cases = await discoverRemoteCases(modelRoot, creds, "Auto-discovered on the Intel benchmark node");
+  const cases = await discoverRemoteCases(
+    modelRoot,
+    creds,
+    'Auto-discovered on the Intel benchmark node',
+  );
   return cases.map((entry) => ({
     ...entry,
     context_tokens: entry.context_tokens ?? defaultIntelContextTokensForModel(entry.id),
@@ -2835,7 +3067,10 @@ async function discoverIntelCases(modelRoot, creds) {
 
 async function rdnaPathExists(modelFile, creds) {
   try {
-    await runShell(rdnaRemoteCommand(`test -f ${shellQuote(modelFile)}`, creds), { cwd: ROOT, timeoutMs: 30000 });
+    await runShell(rdnaRemoteCommand(`test -f ${shellQuote(modelFile)}`, creds), {
+      cwd: ROOT,
+      timeoutMs: 30000,
+    });
     return true;
   } catch {
     return false;
@@ -2844,8 +3079,8 @@ async function rdnaPathExists(modelFile, creds) {
 
 async function prepareLocalBuild(args) {
   if (!args.buildLocal) return;
-  console.log("Preparing local ReleaseFast build...");
-  const buildCmd = `env ZIG_GLOBAL_CACHE_DIR=${shellQuote(args.localCacheDir)} zig build -Doptimize=ReleaseFast`;
+  console.log('Preparing local ReleaseFast build...');
+  const buildCmd = `env ZIG_GLOBAL_CACHE_DIR=${shellQuote(args.localCacheDir)} ./scripts/zig.sh build -Doptimize=ReleaseFast`;
   await runShell(buildCmd, { cwd: ROOT, timeoutMs: 30 * 60 * 1000 });
 }
 
@@ -2855,7 +3090,9 @@ async function ensureManagedMetalModels(args, cases) {
     if (args.models && !args.models.has(entry.id)) continue;
     if (!entry.model_id) continue;
     if (await pathExists(entry.model_path)) continue;
-    console.log(`[metal] pulling missing managed model ${entry.model_id} into ${DEFAULT_LOCAL_MODEL_ROOT}...`);
+    console.log(
+      `[metal] pulling missing managed model ${entry.model_id} into ${DEFAULT_LOCAL_MODEL_ROOT}...`,
+    );
     await runShell(managedModelPullCommand(entry.model_id), {
       cwd: ROOT,
       timeoutMs: 6 * 60 * 60 * 1000,
@@ -2865,9 +3102,9 @@ async function ensureManagedMetalModels(args, cases) {
 
 async function prepareRdna(args, creds) {
   if (args.rdnaSync) {
-    console.log("Syncing current repo to RDNA node...");
+    console.log('Syncing current repo to RDNA node...');
     const rsyncCmd = [
-      "rsync -az --delete",
+      'rsync -az --delete',
       "--exclude '.zig-cache'",
       "--exclude 'zig-out'",
       "--exclude 'node_modules'",
@@ -2883,22 +3120,24 @@ async function prepareRdna(args, creds) {
       `-e ${shellQuote(rdnaSshTransport(creds))}`,
       `${shellQuote(`${ROOT}/`)}`,
       `${creds.user}@${creds.host}:${shellQuote(`${creds.workdir}/`)}`,
-    ].join(" ");
+    ].join(' ');
     await runShell(withSshAskpass(rsyncCmd, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
   if (args.rdnaBuild) {
-    console.log("Building ReleaseFast on RDNA node...");
-    const buildArgs = ["zig", "build", "-Doptimize=ReleaseFast"];
-    if (args.rdnaBackend !== "auto") {
+    console.log('Building ReleaseFast on RDNA node...');
+    const buildArgs = ['./scripts/zig.sh', 'build', '-Doptimize=ReleaseFast'];
+    if (args.rdnaBackend !== 'auto') {
       buildArgs.push(`-Dbackend=${args.rdnaBackend}`);
     }
     if (args.rdnaSync) {
       const syncedProvenance = await captureGitProvenance(ROOT);
-      if (syncedProvenance.version) buildArgs.push(`-Dversion=${shellQuote(syncedProvenance.version)}`);
-      if (syncedProvenance.commit) buildArgs.push(`-Dcommit=${shellQuote(syncedProvenance.commit)}`);
+      if (syncedProvenance.version)
+        buildArgs.push(`-Dversion=${shellQuote(syncedProvenance.version)}`);
+      if (syncedProvenance.commit)
+        buildArgs.push(`-Dcommit=${shellQuote(syncedProvenance.commit)}`);
     }
-    const remote = `cd ${shellQuote(creds.workdir)} && ${buildArgs.join(" ")}`;
+    const remote = `cd ${shellQuote(creds.workdir)} && ${buildArgs.join(' ')}`;
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
@@ -2910,19 +3149,19 @@ async function prepareRdna(args, creds) {
     // running an unrelated model just steals VRAM and tanks everything.
     // The historical regression on Qwen 3.6 35B (108 → 29 tok/s) was
     // partly caused by this co-residency.
-    console.log("Stopping pre-existing llama-server processes on RDNA node...");
+    console.log('Stopping pre-existing llama-server processes on RDNA node...');
     const remote = [
-      "systemctl stop llama-server 2>/dev/null || true",
-      "pkill -9 -x llama-server 2>/dev/null || true",
-      "sleep 2",
+      'systemctl stop llama-server 2>/dev/null || true',
+      'pkill -9 -x llama-server 2>/dev/null || true',
+      'sleep 2',
       "echo 'cleared'",
-    ].join(" && ");
+    ].join(' && ');
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60000 });
   }
 }
 
 async function verifyRdnaZincBackend(args, creds, { quiet = false } = {}) {
-  if (args.rdnaBackend === "auto") return null;
+  if (args.rdnaBackend === 'auto') return null;
   const remote = `cd ${shellQuote(creds.workdir)} && ./zig-out/bin/zinc --version`;
   const result = await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 120000 });
   const parsed = validateZincBackend(result.stdout, args.rdnaBackend);
@@ -2932,9 +3171,9 @@ async function verifyRdnaZincBackend(args, creds, { quiet = false } = {}) {
 
 async function prepareIntel(args, creds, remoteLibcConf) {
   if (args.intelSync) {
-    console.log("Syncing current repo to Intel node...");
+    console.log('Syncing current repo to Intel node...');
     const rsyncCmd = [
-      "rsync -az --delete",
+      'rsync -az --delete',
       "--exclude '.zig-cache'",
       "--exclude 'zig-out'",
       "--exclude 'node_modules'",
@@ -2950,7 +3189,7 @@ async function prepareIntel(args, creds, remoteLibcConf) {
       `-e ${shellQuote(remoteSshTransport(creds))}`,
       `${shellQuote(`${ROOT}/`)}`,
       `${creds.user}@${creds.host}:${shellQuote(`${creds.workdir}/`)}`,
-    ].join(" ");
+    ].join(' ');
     await runShell(withSshAskpass(rsyncCmd, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
@@ -2960,19 +3199,19 @@ async function prepareIntel(args, creds, remoteLibcConf) {
   }
 
   if (args.intelBuild) {
-    console.log("Building ReleaseFast on Intel node...");
+    console.log('Building ReleaseFast on Intel node...');
     const envPrefix = remoteEnvPrefix(creds);
-    const remote = `cd ${shellQuote(creds.workdir)} && ${envPrefix ? `${envPrefix} ` : ""}zig build -Doptimize=ReleaseFast`;
+    const remote = `cd ${shellQuote(creds.workdir)} && ${envPrefix ? `${envPrefix} ` : ''}./scripts/zig.sh build -Doptimize=ReleaseFast`;
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
   if (args.intelStartLlama) {
-    console.log("Stopping pre-existing llama-server processes on Intel node...");
+    console.log('Stopping pre-existing llama-server processes on Intel node...');
     const remote = [
-      "pkill -9 -x llama-server 2>/dev/null || true",
-      "sleep 2",
+      'pkill -9 -x llama-server 2>/dev/null || true',
+      'sleep 2',
       "echo 'cleared'",
-    ].join(" && ");
+    ].join(' && ');
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60000 });
   }
 }
@@ -2998,7 +3237,9 @@ function scenarioResultPayload(entry, scenarioDef, zinc, baseline) {
     notes: scenarioDef.notes ?? [],
     zinc,
     baseline: baseline?.decode_tps ? baseline : baseline,
-    comparison: baseline?.decode_tps ? buildComparison(zinc, baseline, { expectedGeneratedTokens: scenarioDef.max_tokens }) : null,
+    comparison: baseline?.decode_tps
+      ? buildComparison(zinc, baseline, { expectedGeneratedTokens: scenarioDef.max_tokens })
+      : null,
     output_quality: outputQualityStatus(zinc?.output_preview, zinc?.generated_tokens),
   };
 }
@@ -3046,9 +3287,10 @@ async function runMetalTarget(args) {
     }
   }
 
-  const llamaCli = args.llamaCli || whichLocalBinary("llama-cli");
+  const llamaCli = args.llamaCli || whichLocalBinary('llama-cli');
   const resolvedLlamaServer = detectLocalLlamaServer(args);
-  const llamaServer = resolvedLlamaServer && await pathExists(resolvedLlamaServer) ? resolvedLlamaServer : null;
+  const llamaServer =
+    resolvedLlamaServer && (await pathExists(resolvedLlamaServer)) ? resolvedLlamaServer : null;
   const baselineBinary = llamaServer || llamaCli;
   const zincProvenance = await captureGitProvenance(ROOT);
   const llamaCppProvenance = await captureLlamaCppProvenance(baselineBinary, {
@@ -3059,8 +3301,17 @@ async function runMetalTarget(args) {
 
   for (const entry of filtered) {
     console.log(`[metal] ${entry.id}`);
-    const scenarioDefs = filterScenarioDefs(defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt), args.scenarios);
-    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase, args.scenarios);
+    const scenarioDefs = filterScenarioDefs(
+      defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt),
+      args.scenarios,
+    );
+    const phases = buildMeasurementPhases(
+      entry.id,
+      entry.prompt_mode,
+      entry.prompt,
+      args.phase,
+      args.scenarios,
+    );
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
     let launchedServer = null;
@@ -3070,7 +3321,7 @@ async function runMetalTarget(args) {
       for (const phase of phases) {
         const scenarioDef = phase.scenarioDef;
         const caseDef = buildScenarioCase(entry, scenarioDef);
-        if (phase.phase === "zinc") {
+        if (phase.phase === 'zinc') {
           let zinc = null;
           try {
             const zincRows = await runSeries({
@@ -3082,11 +3333,11 @@ async function runMetalTarget(args) {
               cwd: ROOT,
               timeoutMs: args.timeoutMs,
             });
-            zinc = createStats("ZINC", zincRows);
+            zinc = createStats('ZINC', zincRows);
           } catch (error) {
             zinc = {
-              name: "ZINC",
-              unavailable_reason: benchmarkFailureReason("ZINC run failed", error),
+              name: 'ZINC',
+              unavailable_reason: benchmarkFailureReason('ZINC run failed', error),
             };
           }
           zincByScenario.set(scenarioDef.id, zinc);
@@ -3113,11 +3364,11 @@ async function runMetalTarget(args) {
               caseDef,
               timeoutMs: args.timeoutMs,
             });
-            baseline = createStats("llama.cpp", baselineRows);
+            baseline = createStats('llama.cpp', baselineRows);
           } catch (error) {
             baseline = {
-              name: "llama.cpp",
-              unavailable_reason: benchmarkFailureReason("Local baseline failed", error),
+              name: 'llama.cpp',
+              unavailable_reason: benchmarkFailureReason('Local baseline failed', error),
             };
           }
         } else if (llamaCli) {
@@ -3131,22 +3382,23 @@ async function runMetalTarget(args) {
               cwd: ROOT,
               timeoutMs: args.timeoutMs,
             });
-            baseline = createStats("llama.cpp", baselineRows);
+            baseline = createStats('llama.cpp', baselineRows);
           } catch (error) {
             baseline = {
-              name: "llama.cpp",
-              unavailable_reason: benchmarkFailureReason("Local baseline failed", error),
+              name: 'llama.cpp',
+              unavailable_reason: benchmarkFailureReason('Local baseline failed', error),
             };
           }
         } else if (serverLaunchError) {
           baseline = {
-            name: "llama.cpp",
-            unavailable_reason: benchmarkFailureReason("Local baseline failed", serverLaunchError),
+            name: 'llama.cpp',
+            unavailable_reason: benchmarkFailureReason('Local baseline failed', serverLaunchError),
           };
         } else {
           baseline = {
-            name: "llama.cpp",
-            unavailable_reason: "No local llama-server or llama-cli binary found. Pass --llama-server or --llama-cli to enable Metal comparisons.",
+            name: 'llama.cpp',
+            unavailable_reason:
+              'No local llama-server or llama-cli binary found. Pass --llama-server or --llama-cli to enable Metal comparisons.',
           };
         }
 
@@ -3158,53 +3410,61 @@ async function runMetalTarget(args) {
       }
     }
 
-    const includeZinc = phaseEnabled(args.phase, "zinc");
-    const includeBaseline = phaseEnabled(args.phase, "baseline");
-    const scenarios = scenarioDefs.map((scenarioDef) => scenarioResultPayload(
-      entry,
-      scenarioDef,
-      zincByScenario.get(scenarioDef.id) ?? (includeZinc ? {
-        name: "ZINC",
-        unavailable_reason: "No ZINC benchmark result was recorded for this scenario.",
-      } : undefined),
-      baselineByScenario.get(scenarioDef.id) ?? (includeBaseline ? {
-        name: "llama.cpp",
-        unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
-      } : undefined),
-    ));
+    const includeZinc = phaseEnabled(args.phase, 'zinc');
+    const includeBaseline = phaseEnabled(args.phase, 'baseline');
+    const scenarios = scenarioDefs.map((scenarioDef) =>
+      scenarioResultPayload(
+        entry,
+        scenarioDef,
+        zincByScenario.get(scenarioDef.id) ??
+          (includeZinc
+            ? {
+                name: 'ZINC',
+                unavailable_reason: 'No ZINC benchmark result was recorded for this scenario.',
+              }
+            : undefined),
+        baselineByScenario.get(scenarioDef.id) ??
+          (includeBaseline
+            ? {
+                name: 'llama.cpp',
+                unavailable_reason: 'No llama.cpp baseline result was recorded for this scenario.',
+              }
+            : undefined),
+      ),
+    );
     const summary = primaryScenarioSummary(entry, scenarios);
     models.push(summary);
-    logModelSummary("metal", summary);
-    await writePartialSnapshot(args, "metal", "Metal", models);
+    logModelSummary('metal', summary);
+    await writePartialSnapshot(args, 'metal', 'Metal', models);
   }
 
   return {
-    id: "metal",
-    label: "Metal",
-    description: "Apple Silicon local benchmark suite rendered from the current workspace build.",
+    id: 'metal',
+    label: 'Metal',
+    description: 'Apple Silicon local benchmark suite rendered from the current workspace build.',
     generated_at: new Date().toISOString(),
-    source: "tools/performance_suite.mjs",
+    source: 'tools/performance_suite.mjs',
     machine,
     provenance: {
       zinc: zincProvenance,
       llama_cpp: llamaCppProvenance,
     },
     methodology: {
-      runner: "ZINC CLI vs llama.cpp on the same Apple Silicon machine",
-      benchmark_style: "Four-scenario matrix with same-file baselines",
-      zinc_backend: "Metal",
-      zinc_build: "zig build -Doptimize=ReleaseFast",
-      llama_backend: "Metal",
-      llama_device: "-ngl 999",
+      runner: 'ZINC CLI vs llama.cpp on the same Apple Silicon machine',
+      benchmark_style: 'Four-scenario matrix with same-file baselines',
+      zinc_backend: 'Metal',
+      zinc_build: './scripts/zig.sh build -Doptimize=ReleaseFast',
+      llama_backend: 'Metal',
+      llama_device: '-ngl 999',
       notes: [
-        "Hardware: the local Apple Silicon target shown above. ZINC and llama.cpp run on the same machine and use the same GGUF file for each model.",
-        "ZINC path: build the current workspace with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
-        "Baseline backend: llama.cpp Metal (-ngl 999) on the same Apple Silicon machine — the same backend as ZINC.",
-        "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
-        "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
+        'Hardware: the local Apple Silicon target shown above. ZINC and llama.cpp run on the same machine and use the same GGUF file for each model.',
+        'ZINC path: build the current workspace with ./scripts/zig.sh build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.',
+        'Baseline backend: llama.cpp Metal (-ngl 999) on the same Apple Silicon machine — the same backend as ZINC.',
+        'Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.',
+        'Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.',
         benchmarkStatisticsNote(args.runs, args.warmupRuns),
-        "Model resolution: managed catalog models are loaded from the ZINC model cache when available; explicit GGUF paths are preserved when provided.",
-        "Run hygiene: published local runs assume no competing workload is saturating CPU, memory bandwidth, or GPU.",
+        'Model resolution: managed catalog models are loaded from the ZINC model cache when available; explicit GGUF paths are preserved when provided.',
+        'Run hygiene: published local runs assume no competing workload is saturating CPU, memory bandwidth, or GPU.',
       ],
       runs: args.runs,
       warmup_runs: args.warmupRuns,
@@ -3217,7 +3477,7 @@ async function runMetalTarget(args) {
 function envValueFrom(envMap, dotEnv, ...keys) {
   for (const key of keys) {
     const value = envMap[key] ?? dotEnv[key];
-    if (value != null && value !== "") return value;
+    if (value != null && value !== '') return value;
   }
   return null;
 }
@@ -3227,24 +3487,24 @@ function envValue(dotEnv, ...keys) {
 }
 
 export function rdnaNodeEnvKey(node, suffix) {
-  const normalized = String(node ?? "")
+  const normalized = String(node ?? '')
     .trim()
     .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
   if (!normalized) return null;
   return `ZINC_${normalized}_${suffix}`;
 }
 
 export function rdnaEnvValue(dotEnv, args, suffix, ...fallbackKeys) {
   const envMap = args?.envMap ?? process.env;
-  const node = args?.rdnaNode ?? envValueFrom(envMap, dotEnv, "ZINC_RDNA_NODE", "ZINC_NODE");
+  const node = args?.rdnaNode ?? envValueFrom(envMap, dotEnv, 'ZINC_RDNA_NODE', 'ZINC_NODE');
   const nodeKey = node ? rdnaNodeEnvKey(node, suffix) : null;
   return envValueFrom(envMap, dotEnv, ...(nodeKey ? [nodeKey] : []), ...fallbackKeys);
 }
 
 function remoteHomeForUser(user) {
-  return user === "root" ? "/root" : `/home/${user}`;
+  return user === 'root' ? '/root' : `/home/${user}`;
 }
 
 function resolveSshPasswordAuth(dotEnv, directKeys, envVarKeys, fileKeys) {
@@ -3268,70 +3528,86 @@ function resolveSshPasswordAuth(dotEnv, directKeys, envVarKeys, fileKeys) {
 }
 
 export async function buildRdnaCreds(args) {
-  const dotEnv = await readDotEnv(path.join(ROOT, ".env"));
-  const host = rdnaEnvValue(dotEnv, args, "HOST", "ZINC_RDNA_HOST", "ZINC_HOST");
-  const user = rdnaEnvValue(dotEnv, args, "USER", "ZINC_RDNA_USER", "ZINC_USER");
-  const port = rdnaEnvValue(dotEnv, args, "PORT", "ZINC_RDNA_PORT", "ZINC_PORT") ?? "22";
-  const sshKey = rdnaEnvValue(dotEnv, args, "SSH_KEY", "ZINC_RDNA_SSH_KEY", "ZINC_SSH_KEY");
+  const dotEnv = await readDotEnv(path.join(ROOT, '.env'));
+  const host = rdnaEnvValue(dotEnv, args, 'HOST', 'ZINC_RDNA_HOST', 'ZINC_HOST');
+  const user = rdnaEnvValue(dotEnv, args, 'USER', 'ZINC_RDNA_USER', 'ZINC_USER');
+  const port = rdnaEnvValue(dotEnv, args, 'PORT', 'ZINC_RDNA_PORT', 'ZINC_PORT') ?? '22';
+  const sshKey = rdnaEnvValue(dotEnv, args, 'SSH_KEY', 'ZINC_RDNA_SSH_KEY', 'ZINC_SSH_KEY');
   if (!host || !user) {
-    throw new Error("RDNA benchmarking needs node-specific ZINC_<NODE>_HOST/ZINC_<NODE>_USER, ZINC_RDNA_HOST/ZINC_RDNA_USER, or ZINC_HOST/ZINC_USER in the environment or .env");
+    throw new Error(
+      'RDNA benchmarking needs node-specific ZINC_<NODE>_HOST/ZINC_<NODE>_USER, ZINC_RDNA_HOST/ZINC_RDNA_USER, or ZINC_HOST/ZINC_USER in the environment or .env',
+    );
   }
   const tuningEnv = collectRemoteZincTuningEnv(dotEnv);
+  const baselineDevice = args.rdnaLlamaDevice ?? (args.rdnaBackend === 'rocm' ? 'ROCm0' : null);
   return {
     host,
     user,
     port,
     sshKey,
     workdir: args.rdnaWorkdir,
-    env: args.rdnaBackend === "rocm"
-      ? { ...tuningEnv, ROCR_VISIBLE_DEVICES: String(args.rdnaVkDevice ?? 0) }
-      : { ...tuningEnv, RADV_PERFTEST: "coop_matrix" },
+    llamaKvCache: args.rdnaLlamaKv ?? 'f16',
+    env:
+      args.rdnaBackend === 'rocm'
+        ? { ...tuningEnv, ROCR_VISIBLE_DEVICES: String(args.rdnaVkDevice ?? 0) }
+        : { ...tuningEnv, RADV_PERFTEST: 'coop_matrix' },
     vkDevice: args.rdnaVkDevice ?? 1,
-    serverDeviceArgs: args.rdnaLlamaDevice != null ? llamaDeviceArgs(args.rdnaLlamaDevice) : undefined,
+    // ROCr exposes the chosen physical GPU as logical device zero. Vulkan's
+    // ordinal is unrelated and may enumerate an integrated GPU first.
+    zincDevice: args.rdnaBackend === 'rocm' ? 0 : (args.rdnaVkDevice ?? 1),
+    serverDeviceArgs: baselineDevice != null ? llamaDeviceArgs(baselineDevice) : undefined,
+    cliDeviceArgs: baselineDevice != null ? llamaDeviceArgs(baselineDevice) : undefined,
   };
 }
 
 async function buildIntelConfig(args) {
-  const dotEnv = await readDotEnv(path.join(ROOT, ".env"));
-  const host = envValue(dotEnv, "ZINC_INTEL_HOST");
-  const user = envValue(dotEnv, "ZINC_INTEL_USER") ?? "tempuser";
-  const port = envValue(dotEnv, "ZINC_INTEL_PORT") ?? "22";
-  const sshKey = envValue(dotEnv, "ZINC_INTEL_SSH_KEY", "ZINC_SSH_KEY");
+  const dotEnv = await readDotEnv(path.join(ROOT, '.env'));
+  const host = envValue(dotEnv, 'ZINC_INTEL_HOST');
+  const user = envValue(dotEnv, 'ZINC_INTEL_USER') ?? 'tempuser';
+  const port = envValue(dotEnv, 'ZINC_INTEL_PORT') ?? '22';
+  const sshKey = envValue(dotEnv, 'ZINC_INTEL_SSH_KEY', 'ZINC_SSH_KEY');
   const sshPasswordAuth = resolveSshPasswordAuth(
     dotEnv,
-    ["ZINC_INTEL_SSH_PASSWORD", "ZINC_SSH_PASSWORD"],
-    ["ZINC_INTEL_SSH_PASSWORD_ENV", "ZINC_SSH_PASSWORD_ENV"],
-    ["ZINC_INTEL_SSH_PASSWORD_FILE", "ZINC_SSH_PASSWORD_FILE"],
+    ['ZINC_INTEL_SSH_PASSWORD', 'ZINC_SSH_PASSWORD'],
+    ['ZINC_INTEL_SSH_PASSWORD_ENV', 'ZINC_SSH_PASSWORD_ENV'],
+    ['ZINC_INTEL_SSH_PASSWORD_FILE', 'ZINC_SSH_PASSWORD_FILE'],
   );
   if (!host || !user) {
-    throw new Error("Intel benchmarking needs ZINC_INTEL_HOST and ZINC_INTEL_USER in the environment or .env");
+    throw new Error(
+      'Intel benchmarking needs ZINC_INTEL_HOST and ZINC_INTEL_USER in the environment or .env',
+    );
   }
-  const vkDeviceRaw = envValue(dotEnv, "ZINC_INTEL_VK_DEVICE") ?? "0";
+  const vkDeviceRaw = envValue(dotEnv, 'ZINC_INTEL_VK_DEVICE') ?? '0';
   if (!/^\d+$/.test(vkDeviceRaw)) {
     throw new Error(`Invalid ZINC_INTEL_VK_DEVICE '${vkDeviceRaw}'. Expected a Vulkan GPU index.`);
   }
   const vkDevice = Number.parseInt(vkDeviceRaw, 10);
-  const remoteHome = envValue(dotEnv, "ZINC_INTEL_REMOTE_HOME") ?? remoteHomeForUser(user);
-  const xdgCacheHome = args.intelXdgCacheHome
-    ?? envValue(dotEnv, "ZINC_INTEL_XDG_CACHE_HOME", "ZINC_INTEL_REMOTE_XDG_CACHE_HOME")
-    ?? `${remoteHome}/.cache`;
-  const workdir = args.intelWorkdir ?? envValue(dotEnv, "ZINC_INTEL_WORKDIR", "ZINC_INTEL_REMOTE_DIR") ?? `${remoteHome}/zinc-gpu-loop`;
-  const modelRoot = args.intelModelRoot ?? envValue(dotEnv, "ZINC_INTEL_MODEL_ROOT") ?? `${xdgCacheHome}/zinc/models/models`;
-  const remoteLibcConf = args.intelRemoteLibcConf ?? envValue(dotEnv, "ZINC_INTEL_REMOTE_LIBC_CONF");
-  const remoteZig = envValue(dotEnv, "ZINC_INTEL_ZIG_REMOTE");
-  const remoteZigDir = envValue(dotEnv, "ZINC_INTEL_ZIG_DIR", "ZINC_INTEL_REMOTE_ZIG_DIR")
-    ?? (remoteZig ? path.posix.dirname(remoteZig) : `${remoteHome}/.local/zig/0.15.2`);
-  const llamaDevice = envValue(dotEnv, "ZINC_INTEL_LLAMA_DEVICE") ?? "Vulkan0";
+  const remoteHome = envValue(dotEnv, 'ZINC_INTEL_REMOTE_HOME') ?? remoteHomeForUser(user);
+  const xdgCacheHome =
+    args.intelXdgCacheHome ??
+    envValue(dotEnv, 'ZINC_INTEL_XDG_CACHE_HOME', 'ZINC_INTEL_REMOTE_XDG_CACHE_HOME') ??
+    `${remoteHome}/.cache`;
+  const workdir =
+    args.intelWorkdir ??
+    envValue(dotEnv, 'ZINC_INTEL_WORKDIR', 'ZINC_INTEL_REMOTE_DIR') ??
+    `${remoteHome}/zinc-gpu-loop`;
+  const modelRoot =
+    args.intelModelRoot ??
+    envValue(dotEnv, 'ZINC_INTEL_MODEL_ROOT') ??
+    `${xdgCacheHome}/zinc/models/models`;
+  const remoteLibcConf =
+    args.intelRemoteLibcConf ?? envValue(dotEnv, 'ZINC_INTEL_REMOTE_LIBC_CONF');
+  const remoteZig = envValue(dotEnv, 'ZINC_INTEL_ZIG_REMOTE');
+  const remoteZigDir =
+    envValue(dotEnv, 'ZINC_INTEL_ZIG_DIR', 'ZINC_INTEL_REMOTE_ZIG_DIR') ??
+    (remoteZig ? path.posix.dirname(remoteZig) : `${remoteHome}/.cache/zinc-toolchains/zig-0.17.0`);
+  const llamaDevice = envValue(dotEnv, 'ZINC_INTEL_LLAMA_DEVICE') ?? 'Vulkan0';
   const intelLlamaDeviceArgs = llamaDeviceArgs(llamaDevice);
   const remoteEnv = {
     PATH: `${remoteZigDir}:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin`,
     ...collectRemoteZincTuningEnv(dotEnv),
   };
-  const llamaSearchRoots = [
-    `${remoteHome}/llama.cpp`,
-    "/workspace/llama.cpp",
-    "/workspace",
-  ];
+  const llamaSearchRoots = [`${remoteHome}/llama.cpp`, '/workspace/llama.cpp', '/workspace'];
   return {
     creds: {
       host,
@@ -3349,57 +3625,117 @@ async function buildIntelConfig(args) {
     xdgCacheHome,
     modelRoot,
     remoteLibcConf,
-    requireDeviceSubstring: envValue(dotEnv, "ZINC_INTEL_REQUIRE_DEVICE_SUBSTRING") ?? "Intel",
-    llamaCliOverride: envValue(dotEnv, "ZINC_INTEL_LLAMA_CLI_REMOTE"),
-    llamaServerOverride: envValue(dotEnv, "ZINC_INTEL_LLAMA_SERVER_REMOTE"),
+    requireDeviceSubstring: envValue(dotEnv, 'ZINC_INTEL_REQUIRE_DEVICE_SUBSTRING') ?? 'Intel',
+    llamaCliOverride: envValue(dotEnv, 'ZINC_INTEL_LLAMA_CLI_REMOTE'),
+    llamaServerOverride: envValue(dotEnv, 'ZINC_INTEL_LLAMA_SERVER_REMOTE'),
     llamaSearchRoots,
   };
 }
 
-async function verifyRemoteVulkanDevice(creds, requireSubstring, options = {}) {
-  const targetId = options.targetId ?? "rdna";
-  const nodeLabel = options.nodeLabel ?? `${targetId.toUpperCase()} node`;
-  const selectorHelp = options.selectorHelp ?? "Pick the discrete GPU with --rdna-vk-device <n> or ZINC_RDNA_VK_DEVICE=<n>.";
+export function parseRocmDevices(output) {
+  return String(output)
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    .replace(/\r\n/g, '\n')
+    .split(/^[ \t]*Agent[ \t]+\d+[ \t]*$/m)
+    .filter((block) => /^[ \t]*Device Type:[ \t]*GPU[ \t]*$/m.test(block))
+    .map((block) => ({
+      name: block.match(/^[ \t]*Marketing Name:[ \t]*(.*)$/m)?.[1]?.trim() ?? '',
+      architecture: block.match(/^[ \t]*Name:[ \t]*(.*)$/m)?.[1]?.trim() ?? '',
+      integrated: /^[ \t]*Features:[ \t]*APU\b/m.test(block),
+    }));
+}
+
+export async function verifyRemoteRocmDevice(creds, requireSubstring, deps = {}) {
+  const probe =
+    'if command -v rocminfo >/dev/null 2>&1; then exec rocminfo; else exec "${ROCM_PATH:-/opt/rocm}/bin/rocminfo"; fi';
   const envPrefix = remoteEnvPrefix(creds);
-  const cmd = remoteCommand(`${envPrefix ? `${envPrefix} ` : ""}vulkaninfo --summary 2>/dev/null || true`, creds);
+  let stdout;
+  try {
+    ({ stdout } = await (deps.runCommand ?? runShell)(
+      remoteCommand(`${envPrefix ? `${envPrefix} ` : ''}sh -c ${shellQuote(probe)}`, creds),
+      { cwd: ROOT, timeoutMs: 30000 },
+    ));
+  } catch {
+    throw new Error('Could not query ROCm devices; check rocminfo and the selected GPU.');
+  }
+  const devices = parseRocmDevices(stdout);
+  if (devices.length !== 1 || !devices[0].name || !/^gfx\w/.test(devices[0].architecture))
+    throw new Error(
+      'ROCm preflight requires exactly one visible GPU with a name and compute target.',
+    );
+  const device = devices[0];
+  if (device.integrated)
+    throw new Error(
+      `Refusing to run: the visible ROCm GPU is integrated (${device.name}). Select a discrete ROCr device.`,
+    );
+  if (
+    requireSubstring &&
+    !`${device.name} ${device.architecture}`.toLowerCase().includes(requireSubstring.toLowerCase())
+  )
+    throw new Error(
+      `Refusing to run: ROCm GPU ${device.name} (${device.architecture}) does not match the required device.`,
+    );
+  (deps.write ?? ((line) => process.stdout.write(line)))(
+    `[rdna] ROCm device 0: ${device.name} (${device.architecture})\n`,
+  );
+  return device;
+}
+
+async function verifyRemoteVulkanDevice(creds, requireSubstring, options = {}) {
+  const targetId = options.targetId ?? 'rdna';
+  const nodeLabel = options.nodeLabel ?? `${targetId.toUpperCase()} node`;
+  const selectorHelp =
+    options.selectorHelp ??
+    'Pick the discrete GPU with --rdna-vk-device <n> or ZINC_RDNA_VK_DEVICE=<n>.';
+  const envPrefix = remoteEnvPrefix(creds);
+  const cmd = remoteCommand(
+    `${envPrefix ? `${envPrefix} ` : ''}vulkaninfo --summary 2>/dev/null || true`,
+    creds,
+  );
   const { stdout } = await runShell(cmd, { cwd: ROOT, timeoutMs: 30000 });
   const blocks = stdout.split(/^GPU(\d+):/m);
   const devices = [];
   for (let i = 1; i < blocks.length; i += 2) {
     const idx = Number(blocks[i]);
-    const body = blocks[i + 1] ?? "";
-    const name = (body.match(/deviceName\s*=\s*(.+)/) ?? [])[1]?.trim() ?? "";
-    const type = (body.match(/deviceType\s*=\s*(\S+)/) ?? [])[1]?.trim() ?? "";
+    const body = blocks[i + 1] ?? '';
+    const name = (body.match(/deviceName\s*=\s*(.+)/) ?? [])[1]?.trim() ?? '';
+    const type = (body.match(/deviceType\s*=\s*(\S+)/) ?? [])[1]?.trim() ?? '';
     devices.push({ idx, name, type });
   }
   if (devices.length === 0) {
-    throw new Error(`Could not parse vulkaninfo --summary on ${nodeLabel}; cannot verify selected device.`);
+    throw new Error(
+      `Could not parse vulkaninfo --summary on ${nodeLabel}; cannot verify selected device.`,
+    );
   }
   const selected = devices.find((d) => d.idx === creds.vkDevice);
-  const summary = devices.map((d) => `  GPU${d.idx}: ${d.type} ${d.name}`).join("\n");
+  const summary = devices.map((d) => `  GPU${d.idx}: ${d.type} ${d.name}`).join('\n');
   if (!selected) {
-    throw new Error(`Selected Vulkan device index ${creds.vkDevice} not present on ${nodeLabel}.\nDetected:\n${summary}`);
+    throw new Error(
+      `Selected Vulkan device index ${creds.vkDevice} not present on ${nodeLabel}.\nDetected:\n${summary}`,
+    );
   }
-  if (selected.type !== "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU") {
+  if (selected.type !== 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU') {
     throw new Error(
       `Refusing to run: Vulkan device ${creds.vkDevice} is ${selected.type} (${selected.name}), not a discrete GPU.\n` +
-      `Detected:\n${summary}\n` +
-      selectorHelp,
+        `Detected:\n${summary}\n` +
+        selectorHelp,
     );
   }
   if (requireSubstring && !selected.name.includes(requireSubstring)) {
     throw new Error(
       `Refusing to run: Vulkan device ${creds.vkDevice} name '${selected.name}' does not include required substring '${requireSubstring}'.\n` +
-      `Detected:\n${summary}`,
+        `Detected:\n${summary}`,
     );
   }
-  process.stdout.write(`[${targetId}] Vulkan device ${creds.vkDevice}: ${selected.name} (${selected.type})\n`);
+  process.stdout.write(
+    `[${targetId}] Vulkan device ${creds.vkDevice}: ${selected.name} (${selected.type})\n`,
+  );
 }
 
 async function verifyRemoteSshReachable(creds, options = {}) {
-  const nodeLabel = options.nodeLabel ?? "Remote node";
+  const nodeLabel = options.nodeLabel ?? 'Remote node';
   try {
-    await runShell(remoteCommand("true", creds), { cwd: ROOT, timeoutMs: 30000 });
+    await runShell(remoteCommand('true', creds), { cwd: ROOT, timeoutMs: 30000 });
   } catch (error) {
     throw new Error(`${nodeLabel} SSH preflight failed: ${remoteSshFailureSummary(error)}`);
   }
@@ -3410,17 +3746,24 @@ async function runRdnaTarget(args) {
   const creds = await buildRdnaCreds(args);
   await prepareRdna(args, creds);
   await verifyRdnaZincBackend(args, creds);
-  await verifyRemoteVulkanDevice(creds, args.requireRdnaDeviceSubstring);
+  if (args.rdnaBackend === 'rocm')
+    await verifyRemoteRocmDevice(creds, args.requireRdnaDeviceSubstring);
+  else await verifyRemoteVulkanDevice(creds, args.requireRdnaDeviceSubstring);
   const rdnaLlamaCli = await detectRdnaLlamaCliPath(creds, args);
   const rdnaLlamaServer = await detectRdnaLlamaServerPath(creds, args);
   const baselineBinary = rdnaLlamaServer || rdnaLlamaCli;
+  const baselineDeviceName =
+    args.rdnaLlamaDevice ??
+    (args.rdnaBackend === 'rocm' ? 'ROCm0' : `Vulkan${creds.vkDevice ?? 1}`);
   const zincProvenance = args.rdnaSync
     ? await captureGitProvenance(ROOT)
     : await captureRemoteGitProvenance(creds);
   const llamaCppProvenance = await captureRemoteLlamaCppProvenance(baselineBinary, creds);
 
   const knownCases = defaultRdnaCases(args.rdnaModelRoot);
-  const discoveredCases = args.discoverModels ? await discoverRdnaCases(args.rdnaModelRoot, creds) : [];
+  const discoveredCases = args.discoverModels
+    ? await discoverRdnaCases(args.rdnaModelRoot, creds)
+    : [];
   const mergedCases = new Map();
   for (const entry of [...discoveredCases, ...knownCases]) {
     mergedCases.set(entry.id, entry);
@@ -3432,14 +3775,23 @@ async function runRdnaTarget(args) {
       console.log(`[rdna] skipping ${entry.id}: missing GGUF at ${entry.model_path}`);
       continue;
     }
-    cases.push(entry);
+    cases.push({ ...entry, context_tokens: args.rdnaContext ?? entry.context_tokens ?? 4096 });
   }
   const models = [];
 
   for (const entry of cases) {
     console.log(`[rdna] ${entry.id}`);
-    const scenarioDefs = filterScenarioDefs(defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt), args.scenarios);
-    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase, args.scenarios);
+    const scenarioDefs = filterScenarioDefs(
+      defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt),
+      args.scenarios,
+    );
+    const phases = buildMeasurementPhases(
+      entry.id,
+      entry.prompt_mode,
+      entry.prompt,
+      args.phase,
+      args.scenarios,
+    );
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
     let launchedZincServer = null;
@@ -3452,7 +3804,7 @@ async function runRdnaTarget(args) {
       for (const phase of phases) {
         const scenarioDef = phase.scenarioDef;
         const caseDef = buildScenarioCase(entry, scenarioDef);
-        if (phase.phase === "zinc") {
+        if (phase.phase === 'zinc') {
           let zinc = null;
           if (!triedLaunchingZincServer) {
             triedLaunchingZincServer = true;
@@ -3466,7 +3818,7 @@ async function runRdnaTarget(args) {
           }
           try {
             if (!launchedZincServer) {
-              throw zincServerLaunchFailure ?? new Error("ZINC server was not launched");
+              throw zincServerLaunchFailure ?? new Error('ZINC server was not launched');
             }
             const zincRows = await runRdnaZincOpenAiSeries({
               label: `zinc-server ${entry.id} ${scenarioDef.id}`,
@@ -3478,11 +3830,11 @@ async function runRdnaTarget(args) {
               caseDef,
               timeoutMs: args.timeoutMs,
             });
-            zinc = createStats("ZINC", zincRows);
+            zinc = createStats('ZINC', zincRows);
           } catch (error) {
             zinc = {
-              name: "ZINC",
-              unavailable_reason: benchmarkFailureReason("ZINC run failed", error),
+              name: 'ZINC',
+              unavailable_reason: benchmarkFailureReason('ZINC run failed', error),
             };
           }
           zincByScenario.set(scenarioDef.id, zinc);
@@ -3497,7 +3849,12 @@ async function runRdnaTarget(args) {
         if (!triedLaunchingServer && rdnaLlamaServer) {
           triedLaunchingServer = true;
           try {
-            launchedServer = await launchRdnaLlamaServer(entry, creds, rdnaLlamaServer, args.timeoutMs);
+            launchedServer = await launchRdnaLlamaServer(
+              entry,
+              creds,
+              rdnaLlamaServer,
+              args.timeoutMs,
+            );
           } catch (error) {
             launchedServer = null;
             serverLaunchFailure = error;
@@ -3516,17 +3873,17 @@ async function runRdnaTarget(args) {
               caseDef,
               timeoutMs: args.timeoutMs,
             });
-            baseline = createStats("llama.cpp", baselineRows);
+            baseline = createStats('llama.cpp', baselineRows);
           } catch (error) {
             baseline = {
-              name: "llama.cpp",
-              unavailable_reason: benchmarkFailureReason("RDNA baseline failed", error),
+              name: 'llama.cpp',
+              unavailable_reason: benchmarkFailureReason('RDNA baseline failed', error),
             };
           }
         } else if (entry.baseline_enabled !== false && serverLaunchFailure) {
           baseline = {
-            name: "llama.cpp",
-            unavailable_reason: benchmarkFailureReason("RDNA baseline failed", serverLaunchFailure),
+            name: 'llama.cpp',
+            unavailable_reason: benchmarkFailureReason('RDNA baseline failed', serverLaunchFailure),
           };
         } else if (entry.baseline_enabled !== false && rdnaLlamaCli) {
           try {
@@ -3539,19 +3896,20 @@ async function runRdnaTarget(args) {
               cwd: ROOT,
               timeoutMs: args.timeoutMs,
             });
-            baseline = createStats("llama.cpp", baselineRows);
+            baseline = createStats('llama.cpp', baselineRows);
           } catch (error) {
             baseline = {
-              name: "llama.cpp",
-              unavailable_reason: benchmarkFailureReason("RDNA baseline failed", error),
+              name: 'llama.cpp',
+              unavailable_reason: benchmarkFailureReason('RDNA baseline failed', error),
             };
           }
         } else {
           baseline = {
-            name: "llama.cpp",
-            unavailable_reason: rdnaLlamaServer || rdnaLlamaCli
-              ? "No RDNA llama.cpp baseline is defined for this case yet."
-              : "Could not locate a remote llama.cpp baseline binary on the RDNA node.",
+            name: 'llama.cpp',
+            unavailable_reason:
+              rdnaLlamaServer || rdnaLlamaCli
+                ? 'No RDNA llama.cpp baseline is defined for this case yet.'
+                : 'Could not locate a remote llama.cpp baseline binary on the RDNA node.',
           };
         }
 
@@ -3566,22 +3924,43 @@ async function runRdnaTarget(args) {
       }
     }
 
-    const includeZinc = phaseEnabled(args.phase, "zinc");
-    const includeBaseline = phaseEnabled(args.phase, "baseline");
-    const scenarios = scenarioDefs.map((scenarioDef) => scenarioResultPayload(
-      entry,
-      scenarioDef,
-      zincByScenario.get(scenarioDef.id) ?? (includeZinc ? {
-        name: "ZINC",
-        unavailable_reason: "No ZINC benchmark result was recorded for this scenario.",
-      } : undefined),
-      baselineByScenario.get(scenarioDef.id) ?? (includeBaseline ? {
-        name: "llama.cpp",
-        unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
-      } : undefined),
-    ));
+    const includeZinc = phaseEnabled(args.phase, 'zinc');
+    const includeBaseline = phaseEnabled(args.phase, 'baseline');
+    const scenarios = scenarioDefs.map((scenarioDef) =>
+      scenarioResultPayload(
+        entry,
+        scenarioDef,
+        zincByScenario.get(scenarioDef.id) ??
+          (includeZinc
+            ? {
+                name: 'ZINC',
+                unavailable_reason: 'No ZINC benchmark result was recorded for this scenario.',
+              }
+            : undefined),
+        baselineByScenario.get(scenarioDef.id) ??
+          (includeBaseline
+            ? {
+                name: 'llama.cpp',
+                unavailable_reason: 'No llama.cpp baseline result was recorded for this scenario.',
+              }
+            : undefined),
+      ),
+    );
     const summary = primaryScenarioSummary(entry, scenarios);
-    models.push(summary);
+    models.push({
+      ...summary,
+      server_context_tokens: rdnaServerContext(entry),
+      server_kv_cache: {
+        zinc: creds.env?.ZINC_KV_CACHE ?? 'backend default',
+        llama_cpp: creds.llamaKvCache ?? 'f16',
+      },
+      zinc_context_options: {
+        q8_attention_blas: creds.env?.ZINC_Q8_ATTN_BLAS ?? '1',
+        q8_attention_f16: creds.env?.ZINC_Q8_ATTN_F16 ?? '0',
+        prefill_chunk: creds.env?.ZINC_PREFILL_CHUNK ?? '4096',
+        prompt_cache: creds.env?.ZINC_PROMPT_CACHE ?? 'backend default',
+      },
+    });
     logModelSummary(targetIdentity.id, summary);
     await writePartialSnapshot(args, targetIdentity.id, targetIdentity.label, models);
   }
@@ -3589,39 +3968,43 @@ async function runRdnaTarget(args) {
   return {
     id: targetIdentity.id,
     label: targetIdentity.label,
-    description: "AMD RDNA benchmark node results collected over SSH and compared against llama.cpp on the same hardware.",
+    description:
+      'AMD RDNA benchmark node results collected over SSH and compared against llama.cpp on the same hardware.',
     generated_at: new Date().toISOString(),
-    source: "tools/performance_suite.mjs",
+    source: 'tools/performance_suite.mjs',
     machine: {
-      label: "AMD RDNA bench node",
-      machine_model: "Remote Linux host",
-      chip: "AMD Radeon AI PRO R9700",
-      memory: "32 GB VRAM · 640 GB/s",
-      gpu: "Radeon AI PRO R9700",
-      os: "Ubuntu Linux",
+      label: 'AMD RDNA bench node',
+      machine_model: 'Remote Linux host',
+      chip: 'AMD Radeon AI PRO R9700',
+      memory: '32 GB VRAM · 576 GB/s',
+      gpu: 'Radeon AI PRO R9700',
+      os: 'Ubuntu Linux',
     },
     provenance: {
       zinc: zincProvenance,
       llama_cpp: llamaCppProvenance,
     },
     methodology: {
-      runner: "ZINC server vs llama.cpp server on the same RDNA node",
-      benchmark_style: "Four-scenario matrix with same-file baselines",
-      zinc_backend: args.rdnaBackend === "vulkan" ? "Vulkan (RADV, coop_matrix)" : args.rdnaBackend.toUpperCase(),
-      zinc_build: `zig build -Doptimize=ReleaseFast${args.rdnaBackend === "auto" ? "" : ` -Dbackend=${args.rdnaBackend}`}`,
-      llama_backend: /rocm/i.test(args.rdnaLlamaDevice ?? "") ? "ROCm" : "Vulkan",
-      llama_device: args.rdnaLlamaDevice ?? "--device Vulkan1",
+      runner: 'ZINC server vs llama.cpp server on the same RDNA node',
+      benchmark_style: 'Four-scenario matrix with same-file baselines',
+      zinc_backend:
+        args.rdnaBackend === 'vulkan'
+          ? 'Vulkan (RADV, coop_matrix)'
+          : args.rdnaBackend.toUpperCase(),
+      zinc_build: `./scripts/zig.sh build -Doptimize=ReleaseFast${args.rdnaBackend === 'auto' ? '' : ` -Dbackend=${args.rdnaBackend}`}`,
+      llama_backend: /rocm/i.test(args.rdnaLlamaDevice ?? '') ? 'ROCm' : 'Vulkan',
+      llama_device: args.rdnaLlamaDevice ?? '--device Vulkan1',
       notes: [
-        "Hardware: one AMD Radeon AI PRO R9700 benchmark node with 32 GB VRAM and 640 GB/s memory bandwidth. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
+        'Hardware: one AMD Radeon AI PRO R9700 benchmark node with 32 GB VRAM and 576 GB/s memory bandwidth. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.',
         `ZINC path: sync the current source tree to the RDNA node, build ReleaseFast with the selected ${args.rdnaBackend} backend, then measure generation through one reusable single-slot ZINC server per model.`,
         `ZINC RDNA backend: ${args.rdnaBackend}.`,
-        `Baseline backend: llama.cpp ${/rocm/i.test(args.rdnaLlamaDevice ?? "") ? "ROCm" : "Vulkan"} (${args.rdnaLlamaDevice ?? "--device Vulkan1"}) on the same node and the same model file.`,
-        "Baseline path: launch llama.cpp against the same model file, preferring one reusable single-slot llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
-        "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
+        `Baseline backend: llama.cpp ${/rocm/i.test(baselineDeviceName) ? 'ROCm' : 'Vulkan'} (${baselineDeviceName}) on the same node and the same model file.`,
+        'Baseline path: launch llama.cpp against the same model file, preferring one reusable single-slot llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.',
+        'Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.',
         benchmarkStatisticsNote(args.runs, args.warmupRuns),
-        "Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.",
-        "Power policy: before either engine starts, the harness selects PCIe ASPM performance mode and locks the discrete AMD GPU's memory DPM policy high to prevent idle-clock drift between runs.",
-        "Run hygiene: published RDNA runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.",
+        'Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.',
+        "Power policy: before either engine starts, the harness selects PCIe ASPM performance mode and uses the discrete AMD GPU's automatic clock governor; warmups account for clock ramping.",
+        'Run hygiene: published RDNA runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.',
       ],
       runs: args.runs,
       warmup_runs: args.warmupRuns,
@@ -3640,29 +4023,43 @@ async function runRdnaTarget(args) {
 // ---------------------------------------------------------------------------
 function cudaEnvValue(dotEnv, args, suffix, ...fallbackKeys) {
   const envMap = args?.envMap ?? process.env;
-  const node = args?.cudaNode ?? envValueFrom(envMap, dotEnv, "ZINC_CUDA_NODE");
+  const node = args?.cudaNode ?? envValueFrom(envMap, dotEnv, 'ZINC_CUDA_NODE');
   const nodeKey = node ? rdnaNodeEnvKey(node, suffix) : null;
   return envValueFrom(envMap, dotEnv, ...(nodeKey ? [nodeKey] : []), ...fallbackKeys);
 }
 
 async function buildCudaCreds(args) {
-  const dotEnv = await readDotEnv(path.join(ROOT, ".env"));
-  const host = cudaEnvValue(dotEnv, args, "HOST", "ZINC_CUDA_HOST", "ZINC_HOST");
-  const user = cudaEnvValue(dotEnv, args, "USER", "ZINC_CUDA_USER", "ZINC_USER");
-  const port = cudaEnvValue(dotEnv, args, "PORT", "ZINC_CUDA_PORT", "ZINC_PORT") ?? "22";
-  const sshKey = cudaEnvValue(dotEnv, args, "SSH_KEY", "ZINC_CUDA_SSH_KEY", "ZINC_SSH_KEY");
+  const dotEnv = await readDotEnv(path.join(ROOT, '.env'));
+  const host = cudaEnvValue(dotEnv, args, 'HOST', 'ZINC_CUDA_HOST', 'ZINC_HOST');
+  const user = cudaEnvValue(dotEnv, args, 'USER', 'ZINC_CUDA_USER', 'ZINC_USER');
+  const port = cudaEnvValue(dotEnv, args, 'PORT', 'ZINC_CUDA_PORT', 'ZINC_PORT') ?? '22';
+  const sshKey = cudaEnvValue(dotEnv, args, 'SSH_KEY', 'ZINC_CUDA_SSH_KEY', 'ZINC_SSH_KEY');
   if (!host || !user) {
-    throw new Error("CUDA benchmarking needs ZINC_CUDA_HOST/ZINC_CUDA_USER (or ZINC_HOST/ZINC_USER) in the environment or .env");
+    throw new Error(
+      'CUDA benchmarking needs ZINC_CUDA_HOST/ZINC_CUDA_USER (or ZINC_HOST/ZINC_USER) in the environment or .env',
+    );
   }
-  const gpuUuid = args.cudaGpuUuid
-    ?? cudaEnvValue(dotEnv, args, "GPU_UUID", "ZINC_CUDA_GPU_UUID", "ZINC_CUDA_GPU");
+  const gpuUuid =
+    args.cudaGpuUuid ??
+    cudaEnvValue(dotEnv, args, 'GPU_UUID', 'ZINC_CUDA_GPU_UUID', 'ZINC_CUDA_GPU');
   if (!gpuUuid) {
-    throw new Error("CUDA benchmarking needs --cuda-gpu or ZINC_CUDA_GPU_UUID/ZINC_CUDA_GPU in the environment or .env");
+    throw new Error(
+      'CUDA benchmarking needs --cuda-gpu or ZINC_CUDA_GPU_UUID/ZINC_CUDA_GPU in the environment or .env',
+    );
   }
   const remoteHome = remoteHomeForUser(user);
-  const workdir = args.cudaWorkdir ?? cudaEnvValue(dotEnv, args, "WORKDIR", "ZINC_CUDA_WORKDIR") ?? `${remoteHome}/zinc-bench-cuda`;
-  const modelRoot = args.cudaModelRoot ?? cudaEnvValue(dotEnv, args, "MODEL_ROOT", "ZINC_CUDA_MODEL_ROOT") ?? `${remoteHome}/workspace/models`;
-  const llamaServerOverride = args.cudaLlamaServer ?? cudaEnvValue(dotEnv, args, "LLAMA_SERVER_REMOTE", "ZINC_CUDA_LLAMA_SERVER_REMOTE") ?? null;
+  const workdir =
+    args.cudaWorkdir ??
+    cudaEnvValue(dotEnv, args, 'WORKDIR', 'ZINC_CUDA_WORKDIR') ??
+    `${remoteHome}/zinc-bench-cuda`;
+  const modelRoot =
+    args.cudaModelRoot ??
+    cudaEnvValue(dotEnv, args, 'MODEL_ROOT', 'ZINC_CUDA_MODEL_ROOT') ??
+    `${remoteHome}/workspace/models`;
+  const llamaServerOverride =
+    args.cudaLlamaServer ??
+    cudaEnvValue(dotEnv, args, 'LLAMA_SERVER_REMOTE', 'ZINC_CUDA_LLAMA_SERVER_REMOTE') ??
+    null;
   return {
     host,
     user,
@@ -3678,31 +4075,35 @@ async function buildCudaCreds(args) {
     // This WSL2 box is net-fenced to 127.99/16; plain 127.0.0.1 loopback is
     // blackholed (SYN dropped), so the llama-server bind + its health/API curls
     // must use a 127.99.x.x address. Overridable via ZINC_CUDA_LOOPBACK_HOST.
-    loopbackHost: args.cudaLoopbackHost ?? process.env.ZINC_CUDA_LOOPBACK_HOST ?? "127.99.0.1",
-    // The box's zig lives at ~/zig-0.15.2/zig and is not on the non-interactive
+    loopbackHost: args.cudaLoopbackHost ?? process.env.ZINC_CUDA_LOOPBACK_HOST ?? '127.99.0.1',
+    // The box's zig lives at ./scripts/zig.sh and is not on the non-interactive
     // SSH PATH; use the absolute path for the build. Overridable via ZINC_CUDA_ZIG.
-    zig: process.env.ZINC_CUDA_ZIG ?? `${remoteHome}/zig-0.15.2/zig`,
+    zig: process.env.ZINC_CUDA_ZIG ?? `${workdir}/scripts/zig.sh`,
     gpuUuid,
     modelRoot,
     llamaServerOverride,
-    llamaSearchRoots: [`${remoteHome}/workspace/llama.cpp`, `${remoteHome}/llama.cpp`, "/workspace/llama.cpp"],
+    llamaSearchRoots: [
+      `${remoteHome}/workspace/llama.cpp`,
+      `${remoteHome}/llama.cpp`,
+      '/workspace/llama.cpp',
+    ],
   };
 }
 
 export function defaultCudaCases(modelRoot) {
   return defaultRdnaCases(modelRoot)
-    .filter((entry) => entry.id !== "qwen38-27b-q4k-m")
+    .filter((entry) => entry.id !== 'qwen38-27b-q4k-m')
     .map((entry) => ({
       ...entry,
-      notes: ["RTX 5090 (CUDA) comparison against llama.cpp server on the same host"],
+      notes: ['RTX 5090 (CUDA) comparison against llama.cpp server on the same host'],
     }));
 }
 
 async function prepareCuda(args, creds) {
   if (args.cudaSync) {
-    console.log("Syncing current repo to CUDA node...");
+    console.log('Syncing current repo to CUDA node...');
     const rsyncCmd = [
-      "rsync -az --delete",
+      'rsync -az --delete',
       "--exclude '.zig-cache'",
       "--exclude 'zig-out'",
       "--exclude 'node_modules'",
@@ -3718,32 +4119,40 @@ async function prepareCuda(args, creds) {
       `-e ${shellQuote(remoteSshTransport(creds))}`,
       `${shellQuote(`${ROOT}/`)}`,
       `${creds.user}@${creds.host}:${shellQuote(`${creds.workdir}/`)}`,
-    ].join(" ");
+    ].join(' ');
     await runShell(withSshAskpass(rsyncCmd, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
   if (args.cudaBuild) {
-    console.log("Building ReleaseFast (cuda) on CUDA node...");
+    console.log('Building ReleaseFast (cuda) on CUDA node...');
     // CUDA kernels are NVRTC-compiled at runtime for the visible GPU's compute
     // capability, so shader precompilation is off (-Dshaders=false) and one
     // build runs on any visible NVIDIA GPU.
-    const buildArgs = [creds.zig ?? "zig", "build", "-Doptimize=ReleaseFast", "-Dbackend=cuda", "-Dshaders=false"];
+    const buildArgs = [
+      creds.zig ?? './scripts/zig.sh',
+      'build',
+      '-Doptimize=ReleaseFast',
+      '-Dbackend=cuda',
+      '-Dshaders=false',
+    ];
     if (args.cudaSync) {
       const syncedProvenance = await captureGitProvenance(ROOT);
-      if (syncedProvenance.version) buildArgs.push(`-Dversion=${shellQuote(syncedProvenance.version)}`);
-      if (syncedProvenance.commit) buildArgs.push(`-Dcommit=${shellQuote(syncedProvenance.commit)}`);
+      if (syncedProvenance.version)
+        buildArgs.push(`-Dversion=${shellQuote(syncedProvenance.version)}`);
+      if (syncedProvenance.commit)
+        buildArgs.push(`-Dcommit=${shellQuote(syncedProvenance.commit)}`);
     }
-    const remote = `cd ${shellQuote(creds.workdir)} && ${buildArgs.join(" ")}`;
+    const remote = `cd ${shellQuote(creds.workdir)} && ${buildArgs.join(' ')}`;
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60 * 60 * 1000 });
   }
 
   if (args.cudaStartLlama) {
-    console.log("Stopping pre-existing llama-server processes on CUDA node...");
+    console.log('Stopping pre-existing llama-server processes on CUDA node...');
     const remote = [
-      "pkill -9 -x llama-server 2>/dev/null || true",
-      "sleep 2",
+      'pkill -9 -x llama-server 2>/dev/null || true',
+      'sleep 2',
       "echo 'cleared'",
-    ].join(" && ");
+    ].join(' && ');
     await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 60000 });
   }
 }
@@ -3751,7 +4160,7 @@ async function prepareCuda(args, creds) {
 async function verifyCudaZincBackend(creds, { quiet = false } = {}) {
   const remote = `cd ${shellQuote(creds.workdir)} && ./zig-out/bin/zinc --version`;
   const result = await runShell(rdnaRemoteCommand(remote, creds), { cwd: ROOT, timeoutMs: 120000 });
-  const parsed = validateZincBackend(result.stdout, "cuda");
+  const parsed = validateZincBackend(result.stdout, 'cuda');
   if (!quiet) console.log(`[cuda] verified ZINC binary backend: ${parsed.backend}`);
   return parsed;
 }
@@ -3760,8 +4169,16 @@ async function runCudaTarget(args) {
   const creds = await buildCudaCreds(args);
   await prepareCuda(args, creds);
   await verifyCudaZincBackend(creds);
-  const cudaLlamaServer = await detectRemoteLlamaServerPath(creds, creds.llamaSearchRoots, creds.llamaServerOverride);
-  const cudaLlamaCli = await detectRemoteLlamaCliPath(creds, creds.llamaSearchRoots, process.env.ZINC_CUDA_LLAMA_CLI_REMOTE ?? null);
+  const cudaLlamaServer = await detectRemoteLlamaServerPath(
+    creds,
+    creds.llamaSearchRoots,
+    creds.llamaServerOverride,
+  );
+  const cudaLlamaCli = await detectRemoteLlamaCliPath(
+    creds,
+    creds.llamaSearchRoots,
+    process.env.ZINC_CUDA_LLAMA_CLI_REMOTE ?? null,
+  );
   const baselineBinary = cudaLlamaServer || cudaLlamaCli;
   const zincProvenance = args.cudaSync
     ? await captureGitProvenance(ROOT)
@@ -3769,7 +4186,13 @@ async function runCudaTarget(args) {
   const llamaCppProvenance = await captureRemoteLlamaCppProvenance(baselineBinary, creds);
 
   const knownCases = defaultCudaCases(creds.modelRoot);
-  const discoveredCases = args.discoverModels ? await discoverRemoteCases(creds.modelRoot, creds, "Auto-discovered on the CUDA benchmark node") : [];
+  const discoveredCases = args.discoverModels
+    ? await discoverRemoteCases(
+        creds.modelRoot,
+        creds,
+        'Auto-discovered on the CUDA benchmark node',
+      )
+    : [];
   const mergedCases = new Map();
   for (const entry of [...discoveredCases, ...knownCases]) {
     mergedCases.set(entry.id, entry);
@@ -3787,8 +4210,17 @@ async function runCudaTarget(args) {
 
   for (const entry of cases) {
     console.log(`[cuda] ${entry.id}`);
-    const scenarioDefs = filterScenarioDefs(defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt), args.scenarios);
-    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase, args.scenarios);
+    const scenarioDefs = filterScenarioDefs(
+      defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt),
+      args.scenarios,
+    );
+    const phases = buildMeasurementPhases(
+      entry.id,
+      entry.prompt_mode,
+      entry.prompt,
+      args.phase,
+      args.scenarios,
+    );
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
     let launchedServer = null;
@@ -3798,7 +4230,7 @@ async function runCudaTarget(args) {
       for (const phase of phases) {
         const scenarioDef = phase.scenarioDef;
         const caseDef = buildScenarioCase(entry, scenarioDef);
-        if (phase.phase === "zinc") {
+        if (phase.phase === 'zinc') {
           let zinc = null;
           try {
             await verifyCudaZincBackend(creds, { quiet: true });
@@ -3811,11 +4243,11 @@ async function runCudaTarget(args) {
               cwd: ROOT,
               timeoutMs: args.timeoutMs,
             });
-            zinc = createStats("ZINC", zincRows);
+            zinc = createStats('ZINC', zincRows);
           } catch (error) {
             zinc = {
-              name: "ZINC",
-              unavailable_reason: benchmarkFailureReason("ZINC run failed", error),
+              name: 'ZINC',
+              unavailable_reason: benchmarkFailureReason('ZINC run failed', error),
             };
           }
           zincByScenario.set(scenarioDef.id, zinc);
@@ -3825,7 +4257,14 @@ async function runCudaTarget(args) {
         if (!triedLaunchingServer && cudaLlamaServer) {
           triedLaunchingServer = true;
           try {
-            launchedServer = await launchRdnaLlamaServer(entry, creds, cudaLlamaServer, args.timeoutMs, "cuda", false);
+            launchedServer = await launchRdnaLlamaServer(
+              entry,
+              creds,
+              cudaLlamaServer,
+              args.timeoutMs,
+              'cuda',
+              false,
+            );
           } catch (error) {
             launchedServer = null;
             serverLaunchFailure = error;
@@ -3844,17 +4283,17 @@ async function runCudaTarget(args) {
               caseDef,
               timeoutMs: args.timeoutMs,
             });
-            baseline = createStats("llama.cpp", baselineRows);
+            baseline = createStats('llama.cpp', baselineRows);
           } catch (error) {
             baseline = {
-              name: "llama.cpp",
-              unavailable_reason: benchmarkFailureReason("CUDA baseline failed", error),
+              name: 'llama.cpp',
+              unavailable_reason: benchmarkFailureReason('CUDA baseline failed', error),
             };
           }
         } else if (entry.baseline_enabled !== false && serverLaunchFailure) {
           baseline = {
-            name: "llama.cpp",
-            unavailable_reason: benchmarkFailureReason("CUDA baseline failed", serverLaunchFailure),
+            name: 'llama.cpp',
+            unavailable_reason: benchmarkFailureReason('CUDA baseline failed', serverLaunchFailure),
           };
         } else if (entry.baseline_enabled !== false && cudaLlamaCli) {
           try {
@@ -3867,19 +4306,19 @@ async function runCudaTarget(args) {
               cwd: ROOT,
               timeoutMs: args.timeoutMs,
             });
-            baseline = createStats("llama.cpp", baselineRows);
+            baseline = createStats('llama.cpp', baselineRows);
           } catch (error) {
             baseline = {
-              name: "llama.cpp",
-              unavailable_reason: benchmarkFailureReason("CUDA baseline failed", error),
+              name: 'llama.cpp',
+              unavailable_reason: benchmarkFailureReason('CUDA baseline failed', error),
             };
           }
         } else {
           baseline = {
-            name: "llama.cpp",
+            name: 'llama.cpp',
             unavailable_reason: cudaLlamaServer
-              ? "No CUDA llama.cpp baseline is defined for this case yet."
-              : "Could not locate a remote llama.cpp baseline binary on the CUDA node.",
+              ? 'No CUDA llama.cpp baseline is defined for this case yet.'
+              : 'Could not locate a remote llama.cpp baseline binary on the CUDA node.',
           };
         }
 
@@ -3891,61 +4330,70 @@ async function runCudaTarget(args) {
       }
     }
 
-    const includeZinc = phaseEnabled(args.phase, "zinc");
-    const includeBaseline = phaseEnabled(args.phase, "baseline");
-    const scenarios = scenarioDefs.map((scenarioDef) => scenarioResultPayload(
-      entry,
-      scenarioDef,
-      zincByScenario.get(scenarioDef.id) ?? (includeZinc ? {
-        name: "ZINC",
-        unavailable_reason: "No ZINC benchmark result was recorded for this scenario.",
-      } : undefined),
-      baselineByScenario.get(scenarioDef.id) ?? (includeBaseline ? {
-        name: "llama.cpp",
-        unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
-      } : undefined),
-    ));
+    const includeZinc = phaseEnabled(args.phase, 'zinc');
+    const includeBaseline = phaseEnabled(args.phase, 'baseline');
+    const scenarios = scenarioDefs.map((scenarioDef) =>
+      scenarioResultPayload(
+        entry,
+        scenarioDef,
+        zincByScenario.get(scenarioDef.id) ??
+          (includeZinc
+            ? {
+                name: 'ZINC',
+                unavailable_reason: 'No ZINC benchmark result was recorded for this scenario.',
+              }
+            : undefined),
+        baselineByScenario.get(scenarioDef.id) ??
+          (includeBaseline
+            ? {
+                name: 'llama.cpp',
+                unavailable_reason: 'No llama.cpp baseline result was recorded for this scenario.',
+              }
+            : undefined),
+      ),
+    );
     const summary = primaryScenarioSummary(entry, scenarios);
     models.push(summary);
-    logModelSummary("cuda", summary);
-    await writePartialSnapshot(args, "cuda", "RTX 5090", models);
+    logModelSummary('cuda', summary);
+    await writePartialSnapshot(args, 'cuda', 'RTX 5090', models);
   }
 
   return {
-    id: "cuda",
-    label: "RTX 5090",
-    description: "NVIDIA RTX 5090 (CUDA) benchmark node results collected over SSH and compared against llama.cpp on the same hardware.",
+    id: 'cuda',
+    label: 'RTX 5090',
+    description:
+      'NVIDIA RTX 5090 (CUDA) benchmark node results collected over SSH and compared against llama.cpp on the same hardware.',
     generated_at: new Date().toISOString(),
-    source: "tools/performance_suite.mjs",
+    source: 'tools/performance_suite.mjs',
     machine: {
-      label: "NVIDIA CUDA bench node",
-      machine_model: "Remote Linux host (WSL2)",
-      chip: "NVIDIA GeForce RTX 5090",
-      memory: "32 GB VRAM · 1792 GB/s",
-      gpu: "GeForce RTX 5090",
-      os: "Ubuntu (WSL2)",
+      label: 'NVIDIA CUDA bench node',
+      machine_model: 'Remote Linux host (WSL2)',
+      chip: 'NVIDIA GeForce RTX 5090',
+      memory: '32 GB VRAM · 1792 GB/s',
+      gpu: 'GeForce RTX 5090',
+      os: 'Ubuntu (WSL2)',
     },
     provenance: {
       zinc: zincProvenance,
       llama_cpp: llamaCppProvenance,
     },
     methodology: {
-      runner: "ZINC CLI vs llama.cpp on the same CUDA node",
-      benchmark_style: "Four-scenario matrix with same-file baselines",
-      zinc_backend: "CUDA (-Dbackend=cuda, NVRTC)",
-      zinc_build: "zig build -Doptimize=ReleaseFast -Dbackend=cuda",
-      llama_backend: "CUDA",
-      llama_device: "CUDA_VISIBLE_DEVICES (UUID-pinned)",
+      runner: 'ZINC CLI vs llama.cpp on the same CUDA node',
+      benchmark_style: 'Four-scenario matrix with same-file baselines',
+      zinc_backend: 'CUDA (-Dbackend=cuda, NVRTC)',
+      zinc_build: './scripts/zig.sh build -Doptimize=ReleaseFast -Dbackend=cuda',
+      llama_backend: 'CUDA',
+      llama_device: 'CUDA_VISIBLE_DEVICES (UUID-pinned)',
       notes: [
-        "Hardware: one NVIDIA GeForce RTX 5090 (32 GB VRAM, 1792 GB/s) benchmark node. ZINC and llama.cpp run on the same host and use the same GGUF file for each model.",
-        "ZINC path: sync the current source tree to the CUDA node, build with zig build -Doptimize=ReleaseFast -Dbackend=cuda, then measure generation through the ZINC CLI. CUDA kernels are NVRTC-compiled at runtime for the visible GPU.",
-        "GPU selection: the target GPU is pinned by UUID via CUDA_VISIBLE_DEVICES for both engines, because nvidia-smi indices are unreliable on the WSL2 passthrough.",
-        "Baseline backend: llama.cpp CUDA on the same host, the same UUID-pinned GPU as ZINC.",
-        "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.",
-        "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
+        'Hardware: one NVIDIA GeForce RTX 5090 (32 GB VRAM, 1792 GB/s) benchmark node. ZINC and llama.cpp run on the same host and use the same GGUF file for each model.',
+        'ZINC path: sync the current source tree to the CUDA node, build with ./scripts/zig.sh build -Doptimize=ReleaseFast -Dbackend=cuda, then measure generation through the ZINC CLI. CUDA kernels are NVRTC-compiled at runtime for the visible GPU.',
+        'GPU selection: the target GPU is pinned by UUID via CUDA_VISIBLE_DEVICES for both engines, because nvidia-smi indices are unreliable on the WSL2 passthrough.',
+        'Baseline backend: llama.cpp CUDA on the same host, the same UUID-pinned GPU as ZINC.',
+        'Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable.',
+        'Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.',
         benchmarkStatisticsNote(args.runs, args.warmupRuns),
-        "Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.",
-        "Run hygiene: published CUDA runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.",
+        'Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.',
+        'Run hygiene: published CUDA runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.',
       ],
       runs: args.runs,
       warmup_runs: args.warmupRuns,
@@ -3958,15 +4406,23 @@ async function runCudaTarget(args) {
 async function runIntelTarget(args) {
   const config = await buildIntelConfig(args);
   const creds = config.creds;
-  await verifyRemoteSshReachable(creds, { nodeLabel: "Intel node" });
+  await verifyRemoteSshReachable(creds, { nodeLabel: 'Intel node' });
   await verifyRemoteVulkanDevice(creds, config.requireDeviceSubstring, {
-    targetId: "intel",
-    nodeLabel: "Intel node",
-    selectorHelp: "Set ZINC_INTEL_VK_DEVICE=<n> to the Intel discrete GPU index.",
+    targetId: 'intel',
+    nodeLabel: 'Intel node',
+    selectorHelp: 'Set ZINC_INTEL_VK_DEVICE=<n> to the Intel discrete GPU index.',
   });
   await prepareIntel(args, creds, config.remoteLibcConf);
-  const intelLlamaCli = await detectRemoteLlamaCliPath(creds, config.llamaSearchRoots, config.llamaCliOverride);
-  const intelLlamaServer = await detectRemoteLlamaServerPath(creds, config.llamaSearchRoots, config.llamaServerOverride);
+  const intelLlamaCli = await detectRemoteLlamaCliPath(
+    creds,
+    config.llamaSearchRoots,
+    config.llamaCliOverride,
+  );
+  const intelLlamaServer = await detectRemoteLlamaServerPath(
+    creds,
+    config.llamaSearchRoots,
+    config.llamaServerOverride,
+  );
   const baselineBinary = intelLlamaServer || intelLlamaCli;
   const zincProvenance = args.intelSync
     ? await captureGitProvenance(ROOT)
@@ -3974,7 +4430,9 @@ async function runIntelTarget(args) {
   const llamaCppProvenance = await captureRemoteLlamaCppProvenance(baselineBinary, creds);
 
   const knownCases = defaultIntelCases(config.modelRoot);
-  const discoveredCases = args.discoverModels ? await discoverIntelCases(config.modelRoot, creds) : [];
+  const discoveredCases = args.discoverModels
+    ? await discoverIntelCases(config.modelRoot, creds)
+    : [];
   const mergedCases = new Map();
   for (const entry of [...discoveredCases, ...knownCases]) {
     mergedCases.set(entry.id, entry);
@@ -3992,8 +4450,17 @@ async function runIntelTarget(args) {
 
   for (const entry of cases) {
     console.log(`[intel] ${entry.id}`);
-    const scenarioDefs = filterScenarioDefs(defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt), args.scenarios);
-    const phases = buildMeasurementPhases(entry.id, entry.prompt_mode, entry.prompt, args.phase, args.scenarios);
+    const scenarioDefs = filterScenarioDefs(
+      defaultScenarioDefsForModel(entry.id, entry.prompt_mode, entry.prompt),
+      args.scenarios,
+    );
+    const phases = buildMeasurementPhases(
+      entry.id,
+      entry.prompt_mode,
+      entry.prompt,
+      args.phase,
+      args.scenarios,
+    );
     const zincByScenario = new Map();
     const baselineByScenario = new Map();
     let launchedServer = null;
@@ -4003,7 +4470,7 @@ async function runIntelTarget(args) {
       for (const phase of phases) {
         const scenarioDef = phase.scenarioDef;
         const caseDef = buildScenarioCase(entry, scenarioDef);
-        if (phase.phase === "zinc") {
+        if (phase.phase === 'zinc') {
           let zinc = null;
           try {
             const zincRows = await runSeries({
@@ -4015,11 +4482,11 @@ async function runIntelTarget(args) {
               cwd: ROOT,
               timeoutMs: args.timeoutMs,
             });
-            zinc = createStats("ZINC", zincRows);
+            zinc = createStats('ZINC', zincRows);
           } catch (error) {
             zinc = {
-              name: "ZINC",
-              unavailable_reason: benchmarkFailureReason("ZINC run failed", error),
+              name: 'ZINC',
+              unavailable_reason: benchmarkFailureReason('ZINC run failed', error),
             };
           }
           zincByScenario.set(scenarioDef.id, zinc);
@@ -4029,7 +4496,14 @@ async function runIntelTarget(args) {
         if (!triedLaunchingServer && intelLlamaServer) {
           triedLaunchingServer = true;
           try {
-            launchedServer = await launchRdnaLlamaServer(entry, creds, intelLlamaServer, args.timeoutMs, "intel", false);
+            launchedServer = await launchRdnaLlamaServer(
+              entry,
+              creds,
+              intelLlamaServer,
+              args.timeoutMs,
+              'intel',
+              false,
+            );
           } catch (error) {
             launchedServer = null;
             serverLaunchFailure = error;
@@ -4048,11 +4522,11 @@ async function runIntelTarget(args) {
               caseDef,
               timeoutMs: args.timeoutMs,
             });
-            baseline = createStats("llama.cpp", baselineRows);
+            baseline = createStats('llama.cpp', baselineRows);
           } catch (error) {
             baseline = {
-              name: "llama.cpp",
-              unavailable_reason: benchmarkFailureReason("Intel baseline failed", error),
+              name: 'llama.cpp',
+              unavailable_reason: benchmarkFailureReason('Intel baseline failed', error),
             };
           }
         } else if (entry.baseline_enabled !== false && intelLlamaCli) {
@@ -4066,24 +4540,28 @@ async function runIntelTarget(args) {
               cwd: ROOT,
               timeoutMs: args.timeoutMs,
             });
-            baseline = createStats("llama.cpp", baselineRows);
+            baseline = createStats('llama.cpp', baselineRows);
           } catch (error) {
             baseline = {
-              name: "llama.cpp",
-              unavailable_reason: benchmarkFailureReason("Intel baseline failed", error),
+              name: 'llama.cpp',
+              unavailable_reason: benchmarkFailureReason('Intel baseline failed', error),
             };
           }
         } else if (entry.baseline_enabled !== false && serverLaunchFailure) {
           baseline = {
-            name: "llama.cpp",
-            unavailable_reason: benchmarkFailureReason("Intel baseline failed", serverLaunchFailure),
+            name: 'llama.cpp',
+            unavailable_reason: benchmarkFailureReason(
+              'Intel baseline failed',
+              serverLaunchFailure,
+            ),
           };
         } else {
           baseline = {
-            name: "llama.cpp",
-            unavailable_reason: intelLlamaServer || intelLlamaCli
-              ? "No Intel llama.cpp baseline is defined for this case yet."
-              : "Could not locate a remote llama.cpp baseline binary on the Intel node.",
+            name: 'llama.cpp',
+            unavailable_reason:
+              intelLlamaServer || intelLlamaCli
+                ? 'No Intel llama.cpp baseline is defined for this case yet.'
+                : 'Could not locate a remote llama.cpp baseline binary on the Intel node.',
           };
         }
 
@@ -4095,60 +4573,69 @@ async function runIntelTarget(args) {
       }
     }
 
-    const includeZinc = phaseEnabled(args.phase, "zinc");
-    const includeBaseline = phaseEnabled(args.phase, "baseline");
-    const scenarios = scenarioDefs.map((scenarioDef) => scenarioResultPayload(
-      entry,
-      scenarioDef,
-      zincByScenario.get(scenarioDef.id) ?? (includeZinc ? {
-        name: "ZINC",
-        unavailable_reason: "No ZINC benchmark result was recorded for this scenario.",
-      } : undefined),
-      baselineByScenario.get(scenarioDef.id) ?? (includeBaseline ? {
-        name: "llama.cpp",
-        unavailable_reason: "No llama.cpp baseline result was recorded for this scenario.",
-      } : undefined),
-    ));
+    const includeZinc = phaseEnabled(args.phase, 'zinc');
+    const includeBaseline = phaseEnabled(args.phase, 'baseline');
+    const scenarios = scenarioDefs.map((scenarioDef) =>
+      scenarioResultPayload(
+        entry,
+        scenarioDef,
+        zincByScenario.get(scenarioDef.id) ??
+          (includeZinc
+            ? {
+                name: 'ZINC',
+                unavailable_reason: 'No ZINC benchmark result was recorded for this scenario.',
+              }
+            : undefined),
+        baselineByScenario.get(scenarioDef.id) ??
+          (includeBaseline
+            ? {
+                name: 'llama.cpp',
+                unavailable_reason: 'No llama.cpp baseline result was recorded for this scenario.',
+              }
+            : undefined),
+      ),
+    );
     const summary = primaryScenarioSummary(entry, scenarios);
     models.push(summary);
-    logModelSummary("intel", summary);
-    await writePartialSnapshot(args, "intel", "Intel Arc", models);
+    logModelSummary('intel', summary);
+    await writePartialSnapshot(args, 'intel', 'Intel Arc', models);
   }
 
   return {
-    id: "intel",
-    label: "Intel Arc",
-    description: "Intel Arc benchmark node results collected over SSH and compared against llama.cpp on the same hardware.",
+    id: 'intel',
+    label: 'Intel Arc',
+    description:
+      'Intel Arc benchmark node results collected over SSH and compared against llama.cpp on the same hardware.',
     generated_at: new Date().toISOString(),
-    source: "tools/performance_suite.mjs",
+    source: 'tools/performance_suite.mjs',
     machine: {
-      label: "Intel Arc bench node",
-      machine_model: "Remote Linux host",
-      chip: "Intel Arc Pro B70 / BMG G31",
+      label: 'Intel Arc bench node',
+      machine_model: 'Remote Linux host',
+      chip: 'Intel Arc Pro B70 / BMG G31',
       memory: null,
-      gpu: "Intel(R) Graphics (BMG G31)",
-      os: "Ubuntu Linux",
+      gpu: 'Intel(R) Graphics (BMG G31)',
+      os: 'Ubuntu Linux',
     },
     provenance: {
       zinc: zincProvenance,
       llama_cpp: llamaCppProvenance,
     },
     methodology: {
-      runner: "ZINC CLI vs llama.cpp on the same Intel Arc node",
-      benchmark_style: "Four-scenario matrix with same-file baselines",
-      zinc_backend: "Vulkan",
-      zinc_build: "zig build -Doptimize=ReleaseFast",
-      llama_backend: "Vulkan",
-      llama_device: "--device Vulkan0",
+      runner: 'ZINC CLI vs llama.cpp on the same Intel Arc node',
+      benchmark_style: 'Four-scenario matrix with same-file baselines',
+      zinc_backend: 'Vulkan',
+      zinc_build: './scripts/zig.sh build -Doptimize=ReleaseFast',
+      llama_backend: 'Vulkan',
+      llama_device: '--device Vulkan0',
       notes: [
-        "Hardware: one Intel Arc Vulkan benchmark node. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.",
-        "ZINC path: optionally sync the current source tree to the Intel node, build with zig build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.",
-        "Baseline backend: llama.cpp Vulkan (--device Vulkan0) on the same node — the same backend as ZINC.",
-        "Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable or fails to start.",
-        "Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.",
+        'Hardware: one Intel Arc Vulkan benchmark node. ZINC and llama.cpp run on the same Ubuntu host and use the same GGUF file for each model.',
+        'ZINC path: optionally sync the current source tree to the Intel node, build with ./scripts/zig.sh build -Doptimize=ReleaseFast, then measure generation through the ZINC CLI.',
+        'Baseline backend: llama.cpp Vulkan (--device Vulkan0) on the same node — the same backend as ZINC.',
+        'Baseline path: launch llama.cpp against the same model file, preferring one reusable llama-server per model across the full scenario matrix and falling back to llama-cli when the server path is unavailable or fails to start.',
+        'Scenarios: Quick Chat, Coding Review, Incident Context, and Long Coding Draft. The prompts are real-world chat, code-review, support-context, and coding-plan workloads instead of synthetic factual completions.',
         benchmarkStatisticsNote(args.runs, args.warmupRuns),
-        "Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.",
-        "Run hygiene: published Intel runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.",
+        'Execution order: the harness records the full ZINC scenario matrix before starting the llama.cpp baseline phase, so only one inference engine owns the GPU during measurement.',
+        'Run hygiene: published Intel runs assume a clean node with no competing ZINC, llama.cpp, or other GPU workloads.',
       ],
       runs: args.runs,
       warmup_runs: args.warmupRuns,
@@ -4160,7 +4647,7 @@ async function runIntelTarget(args) {
 
 async function loadExistingArtifact(siteDataPath) {
   try {
-    return JSON.parse(await fs.readFile(siteDataPath, "utf8"));
+    return JSON.parse(await fs.readFile(siteDataPath, 'utf8'));
   } catch {
     return { schema_version: 1, generated_at: new Date().toISOString(), targets: [] };
   }
@@ -4168,7 +4655,7 @@ async function loadExistingArtifact(siteDataPath) {
 
 async function writeJson(filepath, data) {
   await fs.mkdir(path.dirname(filepath), { recursive: true });
-  await fs.writeFile(filepath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  await fs.writeFile(filepath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
 }
 
 function partialSnapshotPath(outputPath) {
@@ -4191,23 +4678,40 @@ async function writePartialSnapshot(args, targetId, label, models) {
 }
 
 function fmtTps(value) {
-  return value == null ? "  n/a " : value.toFixed(1).padStart(6);
+  return value == null ? '  n/a ' : value.toFixed(1).padStart(6);
 }
 
 function logModelSummary(targetId, modelSummary) {
-  const primary = modelSummary.scenarios?.find((s) => s.id === "core") ?? modelSummary.scenarios?.[0];
+  const primary =
+    modelSummary.scenarios?.find((s) => s.id === 'core') ?? modelSummary.scenarios?.[0];
   const cmp = primary?.comparison ?? modelSummary.comparison ?? {};
-  const zincPrefill = cmp.zinc_prompt_tps ?? primary?.zinc?.prefill_tps?.median ?? primary?.zinc?.prefill_tps?.avg ?? null;
-  const zincDecode = cmp.zinc_decode_tps ?? primary?.zinc?.decode_tps?.median ?? primary?.zinc?.decode_tps?.avg ?? null;
-  const blPrefill = cmp.baseline_prompt_tps ?? primary?.baseline?.prefill_tps?.median ?? primary?.baseline?.prefill_tps?.avg ?? null;
-  const blDecode = cmp.baseline_decode_tps ?? primary?.baseline?.decode_tps?.median ?? primary?.baseline?.decode_tps?.avg ?? null;
+  const zincPrefill =
+    cmp.zinc_prompt_tps ??
+    primary?.zinc?.prefill_tps?.median ??
+    primary?.zinc?.prefill_tps?.avg ??
+    null;
+  const zincDecode =
+    cmp.zinc_decode_tps ??
+    primary?.zinc?.decode_tps?.median ??
+    primary?.zinc?.decode_tps?.avg ??
+    null;
+  const blPrefill =
+    cmp.baseline_prompt_tps ??
+    primary?.baseline?.prefill_tps?.median ??
+    primary?.baseline?.prefill_tps?.avg ??
+    null;
+  const blDecode =
+    cmp.baseline_decode_tps ??
+    primary?.baseline?.decode_tps?.median ??
+    primary?.baseline?.decode_tps?.avg ??
+    null;
   const overallPct = cmp.overall_pct_of_baseline ?? cmp.pct_of_baseline ?? null;
-  const overall = overallPct == null ? "  n/a" : `${overallPct.toFixed(1)}%`;
+  const overall = overallPct == null ? '  n/a' : `${overallPct.toFixed(1)}%`;
   process.stdout.write(
     `  [${targetId}] DONE ${modelSummary.id}: ` +
-    `zinc prefill ${fmtTps(zincPrefill)} / decode ${fmtTps(zincDecode)} | ` +
-    `llama prefill ${fmtTps(blPrefill)} / decode ${fmtTps(blDecode)} | ` +
-    `overall ${overall}\n`,
+      `zinc prefill ${fmtTps(zincPrefill)} / decode ${fmtTps(zincDecode)} | ` +
+      `llama prefill ${fmtTps(blPrefill)} / decode ${fmtTps(blDecode)} | ` +
+      `overall ${overall}\n`,
   );
 }
 
@@ -4219,16 +4723,16 @@ async function main() {
   }
 
   const incoming = [];
-  if (args.target === "metal" || args.target === "both" || args.target === "all") {
+  if (args.target === 'metal' || args.target === 'both' || args.target === 'all') {
     incoming.push(await runMetalTarget(args));
   }
-  if (args.target === "rdna" || args.target === "both" || args.target === "all") {
+  if (args.target === 'rdna' || args.target === 'both' || args.target === 'all') {
     incoming.push(await runRdnaTarget(args));
   }
-  if (args.target === "intel" || args.target === "all") {
+  if (args.target === 'intel' || args.target === 'all') {
     incoming.push(await runIntelTarget(args));
   }
-  if (args.target === "cuda") {
+  if (args.target === 'cuda') {
     incoming.push(await runCudaTarget(args));
   }
 
@@ -4240,15 +4744,19 @@ async function main() {
       // A filtered run is a partial target snapshot even when it measures both
       // engines. Keep models/scenarios outside the filter while replacing the
       // selected rows with the new measurements.
-      preserveMissingPhases: args.phase !== "all" || args.models != null || args.scenarios != null,
+      preserveMissingPhases: args.phase !== 'all' || args.models != null || args.scenarios != null,
     });
     // Guard: never publish host/network info into the public site data. Scan for
     // ACTUAL host indicators (hostnames, tailscale IPs, tailnet domains) — not a
     // bare :port, which false-positives on numeric metric values (e.g. a decode_ms
     // of 2222.06 serializes as ":2222" in compact JSON).
-    const leak = JSON.stringify(merged).match(/puffalo|tailbe7bef|agent-zinc|127\.99\.\d+\.\d+|\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\.ts\.net/g);
+    const leak = JSON.stringify(merged).match(
+      /puffalo|tailbe7bef|agent-zinc|127\.99\.\d+\.\d+|\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\.ts\.net/g,
+    );
     if (leak) {
-      throw new Error(`Refusing to write site data: host/network info present (${[...new Set(leak)].join(", ")}). Sanitize the artifact before publishing.`);
+      throw new Error(
+        `Refusing to write site data: host/network info present (${[...new Set(leak)].join(', ')}). Sanitize the artifact before publishing.`,
+      );
     }
     await writeJson(args.siteData, merged);
   }
@@ -4258,7 +4766,9 @@ async function main() {
     console.log(`Updated site data: ${args.siteData}`);
   }
   for (const target of incoming) {
-    console.log(`${target.label}: ${target.models.length} model(s), fastest ${(target.summary.fastest_decode_tps ?? 0).toFixed(2)} tok/s`);
+    console.log(
+      `${target.label}: ${target.models.length} model(s), fastest ${(target.summary.fastest_decode_tps ?? 0).toFixed(2)} tok/s`,
+    );
   }
 
   await fs.rm(partialSnapshotPath(args.output), { force: true }).catch(() => {});

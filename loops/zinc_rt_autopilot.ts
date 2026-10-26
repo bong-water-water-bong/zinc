@@ -13,8 +13,8 @@
  * Each cycle:
  *   1. rsync local source → remote RDNA4 node
  *   2. Build BOTH binaries:
- *        zig build -Dbackend=vulkan -Doptimize=ReleaseFast
- *        zig build -Dbackend=zinc_rt        -Doptimize=ReleaseFast
+ *        ./scripts/zig.sh build -Dbackend=vulkan -Doptimize=ReleaseFast
+ *        ./scripts/zig.sh build -Dbackend=zinc_rt        -Doptimize=ReleaseFast
  *      If `-Dbackend=zinc_rt` doesn't yet exist (we're at M0), we still
  *      benchmark legacy and mark zinc_rt as "not yet built".
  *   3. Head-to-head benchmark: run each binary N times under flock,
@@ -220,7 +220,7 @@ const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh
 
 const REMOTE_VULKAN_BIN = "./zig-out/bin/zinc-vulkan";
 const REMOTE_ZINC_RT_BIN = "./zig-out/bin/zinc-zinc_rt";
-const REMOTE_ENV_PREFIX = "export PATH=/root/.bun/bin:$PATH;";
+const REMOTE_ENV_PREFIX = 'export PATH="$HOME/.bun/bin:$PATH";';
 
 function shellQuote(value: string | number): string {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
@@ -523,7 +523,7 @@ function remoteStageError(stage: string, output: string): string {
 async function remoteBuild(backend: "vulkan" | "zinc_rt"): Promise<BuildSummary> {
   console.log(clr("2", `  build -Dbackend=${backend}...`));
   const shaderFlag = backend === "zinc_rt" ? " -Dshaders=false" : "";
-  const cmd = `${REMOTE_ENV_PREFIX} cd ${REMOTE_ZINC_DIR} && (zig build -Doptimize=ReleaseFast -Dbackend=${backend}${shaderFlag} 2>&1; echo __EXIT__=$?)`;
+  const cmd = `${REMOTE_ENV_PREFIX} cd ${REMOTE_ZINC_DIR} && (./scripts/zig.sh build -Doptimize=ReleaseFast -Dbackend=${backend}${shaderFlag} 2>&1; echo __EXIT__=$?)`;
   const { stdout, stderr } = await runCommand(
     "ssh",
     [
@@ -555,10 +555,10 @@ async function remoteBuild(backend: "vulkan" | "zinc_rt"): Promise<BuildSummary>
 }
 
 async function remoteTest(comparisonTarget: ComparisonTarget): Promise<{ passed: boolean; output: string }> {
-  console.log(clr("2", "  zig build test..."));
+  console.log(clr("2", "  ./scripts/zig.sh build test..."));
   const testCommand = comparisonTarget === "llama"
-    ? "zig build test -Dbackend=zinc_rt -Dshaders=false --summary all"
-    : "zig build test --summary all";
+    ? "./scripts/zig.sh build test -Dbackend=zinc_rt -Dshaders=false --summary all"
+    : "./scripts/zig.sh build test --summary all";
   const { stdout, stderr, exitCode } = await runCommand(
     "ssh",
     [
@@ -2159,7 +2159,7 @@ Next useful work must do one of these:
     "- VK_KHR_cooperative_matrix 16x16x16 available",
     "- RADV driver (Mesa), `RADV_PERFTEST=coop_matrix` set for both backends",
     "- System glslc: shaderc 2023.8 (Ubuntu 24.04) — newer versions break RADV",
-    "- Zig 0.15.2",
+    "- Zig 0.17.0",
     "- Kernel: check with `ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST 'uname -r'` after selecting `ZINC_RT_RDNA_NODE=rdna1`.",
     "  - ≥ 6.16: T2 UMQ may be available, but kernel version is not sufficient. Also check `/sys/module/amdgpu/parameters/user_queue` and a real USERQ_CREATE probe.",
     "  - 6.14–6.15: T1 KFD direct only",
@@ -2317,8 +2317,8 @@ Next useful work must do one of these:
     "   `set -a; source .env; set +a`",
     `   \`ZINC_RT_RDNA_NODE=rdna1 rsync -az --delete --exclude '.git' --exclude '.env' --exclude '.env.*' --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' --exclude '.zinc_rt_autopilot' -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${REMOTE_ZINC_DIR}/"\``,
     before.comparisonTarget === "vulkan"
-      ? `   \`ZINC_RT_RDNA_NODE=rdna1 ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test --summary all && zig build -Doptimize=ReleaseFast -Dbackend=vulkan && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'\``
-      : `   \`ZINC_RT_RDNA_NODE=rdna1 ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test -Dbackend=zinc_rt -Dshaders=false --summary all && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'\``,
+      ? `   \`ZINC_RT_RDNA_NODE=rdna1 ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && ./scripts/zig.sh build test --summary all && ./scripts/zig.sh build -Doptimize=ReleaseFast -Dbackend=vulkan && ./scripts/zig.sh build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'\``
+      : `   \`ZINC_RT_RDNA_NODE=rdna1 ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && ./scripts/zig.sh build test -Dbackend=zinc_rt -Dshaders=false --summary all && ./scripts/zig.sh build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'\``,
     "   If any gate fails, fix it before final output. Do not leave trivial compile errors for the harness rollback.",
     "3. Both build flags MUST stay buildable: `-Dbackend=vulkan` and `-Dbackend=zinc_rt`.",
     "4. Output bit-equality is desirable but not strictly required during MIGRATE. Coherent output comes before absolute performance. In OPTIMIZE phase, zinc_rt MUST produce coherent, shortcut-free text: no top-k=0 decode, no capped LM-head row scan unless explicitly validating row-range quality, and no clamped decode-budget result counted as a win.",
@@ -2327,7 +2327,7 @@ Next useful work must do one of these:
     "   `set -a; source .env; set +a; export ZINC_RT_RDNA_NODE=rdna1; ssh -p \"$ZINC_PORT\" \"$ZINC_USER@$ZINC_HOST\" '<cmd>'`",
     "   If SSH says `Operation not permitted`, report it as a sandbox/network permission problem, not as missing RDNA access.",
     "7. You may edit any repo files except the explicit forbidden items above, but you may not push to remote or destructively rewrite the worktree.",
-    "8. Zig 0.15.2 API: `ArrayList` is unmanaged (pass allocator), `StringHashMap` → `StringHashMapUnmanaged`, `File.stdout()`, writer takes a buffer arg.",
+    "8. Zig 0.17.0 API: `ArrayList` is unmanaged (pass allocator), `StringHashMap` → `StringHashMapUnmanaged`, `std.Io.File.stdout()`, pass `host_io.io` and a buffer to file writers.",
     "9. RDNA4: wave64 optimal, workgroup_size = 64, shared memory ≤ 64 KB, `RADV_PERFTEST=coop_matrix` enables wmma.",
     "",
     "## Output Format",
@@ -2469,7 +2469,7 @@ async function verifyCandidate(
     if (!testRes.passed) {
       console.log(clr("1;31", "  ❌ Tests broken — repair pass required before rollback"));
       const failure = {
-        kind: "remote zig build test failed",
+        kind: "remote ./scripts/zig.sh build test failed",
         output: failureOutputTail(testRes.output),
         repairable: true,
       };
@@ -2537,7 +2537,7 @@ function buildRepairPrompt(failure: VerificationFailure): string {
     "```bash",
     "set -a; source .env; set +a",
     `ZINC_RT_RDNA_NODE=rdna1 rsync -az --delete --exclude '.git' --exclude '.env' --exclude '.env.*' --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_modules' --exclude '.zinc_rt_autopilot' -e "ssh -p $ZINC_PORT" . "$ZINC_USER@$ZINC_HOST:${REMOTE_ZINC_DIR}/"`,
-    `ZINC_RT_RDNA_NODE=rdna1 ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && zig build test --summary all && zig build -Doptimize=ReleaseFast -Dbackend=vulkan && zig build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'`,
+    `ZINC_RT_RDNA_NODE=rdna1 ssh -p "$ZINC_PORT" "$ZINC_USER@$ZINC_HOST" 'cd ${REMOTE_ZINC_DIR} && ./scripts/zig.sh build test --summary all && ./scripts/zig.sh build -Doptimize=ReleaseFast -Dbackend=vulkan && ./scripts/zig.sh build -Doptimize=ReleaseFast -Dbackend=zinc_rt -Dshaders=false'`,
     "```",
     "",
     "If the self-verification fails, keep fixing until it passes or clearly report the blocker.",

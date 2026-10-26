@@ -1,4 +1,5 @@
-import { defineCollection, z } from 'astro:content';
+import { defineCollection } from 'astro:content';
+import { z } from 'astro/zod';
 import { glob } from 'astro/loaders';
 
 const posts = defineCollection({
@@ -9,10 +10,15 @@ const posts = defineCollection({
     date: z.coerce.date(),
     tags: z.array(z.string()).optional().default([]),
     keywords: z.array(z.string()).optional().default([]),
-    faqs: z.array(z.object({
-      question: z.string(),
-      answer: z.string(),
-    })).optional().default([]),
+    faqs: z
+      .array(
+        z.object({
+          question: z.string(),
+          answer: z.string(),
+        }),
+      )
+      .optional()
+      .default([]),
     excerpt: z.string(),
     seoDescription: z.string().optional(),
     draft: z.boolean().optional().default(false),

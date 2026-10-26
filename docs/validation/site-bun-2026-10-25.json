@@ -1,0 +1,552 @@
+{
+  "recorded_utc": "2026-10-25",
+  "toolchain": {
+    "bun": "1.4.4",
+    "minimum_bun": "1.4.4",
+    "node": "24.20.0",
+    "zig": "0.17.0"
+  },
+  "packages": {
+    ".": {
+      "openai": "7.43.0"
+    },
+    "site": {
+      "@astrojs/markdown-remark": "7.3.4",
+      "@astrojs/mdx": "8.1.1",
+      "@astrojs/rss": "4.0.19",
+      "@astrojs/sitemap": "3.7.4",
+      "@shikijs/rehype": "4.5.0",
+      "astro": "7.4.2",
+      "katex": "0.19.1",
+      "mermaid": "12.2.0",
+      "playwright": "1.64.1",
+      "rehype-katex": "7.0.1",
+      "rehype-stringify": "10.0.1",
+      "remark-gfm": "4.0.1",
+      "remark-math": "6.0.0",
+      "remark-parse": "11.0.0",
+      "remark-rehype": "11.1.2",
+      "unified": "11.0.5"
+    }
+  },
+  "browser": {
+    "layouts": [
+      {
+        "route": "/",
+        "theme": "light",
+        "width": 1440,
+        "overflow": false,
+        "document_width": 1440
+      },
+      {
+        "route": "/zinc/",
+        "theme": "light",
+        "width": 1440,
+        "overflow": false,
+        "document_width": 1440
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "light",
+        "width": 1440,
+        "overflow": false,
+        "document_width": 1440
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "light",
+        "width": 1440,
+        "overflow": false,
+        "document_width": 1440
+      },
+      {
+        "route": "/",
+        "theme": "light",
+        "width": 1024,
+        "overflow": false,
+        "document_width": 1024
+      },
+      {
+        "route": "/zinc/",
+        "theme": "light",
+        "width": 1024,
+        "overflow": false,
+        "document_width": 1024
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "light",
+        "width": 1024,
+        "overflow": false,
+        "document_width": 1024
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "light",
+        "width": 1024,
+        "overflow": false,
+        "document_width": 1024
+      },
+      {
+        "route": "/",
+        "theme": "light",
+        "width": 821,
+        "overflow": false,
+        "document_width": 821
+      },
+      {
+        "route": "/zinc/",
+        "theme": "light",
+        "width": 821,
+        "overflow": false,
+        "document_width": 821
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "light",
+        "width": 821,
+        "overflow": false,
+        "document_width": 821
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "light",
+        "width": 821,
+        "overflow": false,
+        "document_width": 821
+      },
+      {
+        "route": "/",
+        "theme": "light",
+        "width": 820,
+        "overflow": false,
+        "document_width": 820
+      },
+      {
+        "route": "/zinc/",
+        "theme": "light",
+        "width": 820,
+        "overflow": false,
+        "document_width": 820
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "light",
+        "width": 820,
+        "overflow": false,
+        "document_width": 820
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "light",
+        "width": 820,
+        "overflow": false,
+        "document_width": 820
+      },
+      {
+        "route": "/",
+        "theme": "light",
+        "width": 768,
+        "overflow": false,
+        "document_width": 768
+      },
+      {
+        "route": "/zinc/",
+        "theme": "light",
+        "width": 768,
+        "overflow": false,
+        "document_width": 768
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "light",
+        "width": 768,
+        "overflow": false,
+        "document_width": 768
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "light",
+        "width": 768,
+        "overflow": false,
+        "document_width": 768
+      },
+      {
+        "route": "/",
+        "theme": "light",
+        "width": 390,
+        "overflow": false,
+        "document_width": 390
+      },
+      {
+        "route": "/zinc/",
+        "theme": "light",
+        "width": 390,
+        "overflow": false,
+        "document_width": 390
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "light",
+        "width": 390,
+        "overflow": false,
+        "document_width": 390
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "light",
+        "width": 390,
+        "overflow": false,
+        "document_width": 390
+      },
+      {
+        "route": "/",
+        "theme": "light",
+        "width": 320,
+        "overflow": false,
+        "document_width": 320
+      },
+      {
+        "route": "/zinc/",
+        "theme": "light",
+        "width": 320,
+        "overflow": false,
+        "document_width": 320
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "light",
+        "width": 320,
+        "overflow": false,
+        "document_width": 320
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "light",
+        "width": 320,
+        "overflow": false,
+        "document_width": 320
+      },
+      {
+        "route": "/",
+        "theme": "dark",
+        "width": 1440,
+        "overflow": false,
+        "document_width": 1440
+      },
+      {
+        "route": "/zinc/",
+        "theme": "dark",
+        "width": 1440,
+        "overflow": false,
+        "document_width": 1440
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "dark",
+        "width": 1440,
+        "overflow": false,
+        "document_width": 1440
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "dark",
+        "width": 1440,
+        "overflow": false,
+        "document_width": 1440
+      },
+      {
+        "route": "/",
+        "theme": "dark",
+        "width": 1024,
+        "overflow": false,
+        "document_width": 1024
+      },
+      {
+        "route": "/zinc/",
+        "theme": "dark",
+        "width": 1024,
+        "overflow": false,
+        "document_width": 1024
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "dark",
+        "width": 1024,
+        "overflow": false,
+        "document_width": 1024
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "dark",
+        "width": 1024,
+        "overflow": false,
+        "document_width": 1024
+      },
+      {
+        "route": "/",
+        "theme": "dark",
+        "width": 821,
+        "overflow": false,
+        "document_width": 821
+      },
+      {
+        "route": "/zinc/",
+        "theme": "dark",
+        "width": 821,
+        "overflow": false,
+        "document_width": 821
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "dark",
+        "width": 821,
+        "overflow": false,
+        "document_width": 821
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "dark",
+        "width": 821,
+        "overflow": false,
+        "document_width": 821
+      },
+      {
+        "route": "/",
+        "theme": "dark",
+        "width": 820,
+        "overflow": false,
+        "document_width": 820
+      },
+      {
+        "route": "/zinc/",
+        "theme": "dark",
+        "width": 820,
+        "overflow": false,
+        "document_width": 820
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "dark",
+        "width": 820,
+        "overflow": false,
+        "document_width": 820
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "dark",
+        "width": 820,
+        "overflow": false,
+        "document_width": 820
+      },
+      {
+        "route": "/",
+        "theme": "dark",
+        "width": 768,
+        "overflow": false,
+        "document_width": 768
+      },
+      {
+        "route": "/zinc/",
+        "theme": "dark",
+        "width": 768,
+        "overflow": false,
+        "document_width": 768
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "dark",
+        "width": 768,
+        "overflow": false,
+        "document_width": 768
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "dark",
+        "width": 768,
+        "overflow": false,
+        "document_width": 768
+      },
+      {
+        "route": "/",
+        "theme": "dark",
+        "width": 390,
+        "overflow": false,
+        "document_width": 390
+      },
+      {
+        "route": "/zinc/",
+        "theme": "dark",
+        "width": 390,
+        "overflow": false,
+        "document_width": 390
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "dark",
+        "width": 390,
+        "overflow": false,
+        "document_width": 390
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "dark",
+        "width": 390,
+        "overflow": false,
+        "document_width": 390
+      },
+      {
+        "route": "/",
+        "theme": "dark",
+        "width": 320,
+        "overflow": false,
+        "document_width": 320
+      },
+      {
+        "route": "/zinc/",
+        "theme": "dark",
+        "width": 320,
+        "overflow": false,
+        "document_width": 320
+      },
+      {
+        "route": "/zinc/docs/",
+        "theme": "dark",
+        "width": 320,
+        "overflow": false,
+        "document_width": 320
+      },
+      {
+        "route": "/zinc/docs/getting-started/",
+        "theme": "dark",
+        "width": 320,
+        "overflow": false,
+        "document_width": 320
+      }
+    ],
+    "interactions": [
+      "mobile menu: keyboard open, Escape close, focus restored",
+      "terminal copy writes the complete command sequence",
+      "docs search finds the new MTP report",
+      "engineering reference disclosure opens",
+      "landing benchmark uses the non-speculative Qwen measurement",
+      "navigation remains visible without JavaScript",
+      "chat loads highlight.js 11.12.0 with verified SRI and highlights code"
+    ],
+    "internal_links": 45,
+    "diagrams": [
+      {
+        "route": "/blog/2026-03-25-why-we-are-building-zinc/",
+        "count": 1
+      },
+      {
+        "route": "/blog/2026-04-02-why-zig-is-the-secret-weapon-behind-zinc/",
+        "count": 3
+      },
+      {
+        "route": "/blog/2026-04-03-every-design-decision-behind-zinc/",
+        "count": 5
+      },
+      {
+        "route": "/blog/2026-04-07-how-we-enabled-openai-gpt-oss-20b-in-zinc-on-metal/",
+        "count": 1
+      },
+      {
+        "route": "/blog/2026-05-12-the-runtime-below-vulkan-that-local-llms-needed/",
+        "count": 1
+      },
+      {
+        "route": "/blog/2026-05-18-inside-the-decision-to-write-our-own-gpu-runtime-for-local-llm-inference/",
+        "count": 1
+      },
+      {
+        "route": "/blog/2026-05-18-intel-arc-pro-b70-deep-dive-and-zincs-t-intel-plan/",
+        "count": 1
+      },
+      {
+        "route": "/blog/2026-06-14-zinc-rt-runtime-local-inference-needs/",
+        "count": 1
+      },
+      {
+        "route": "/zinc/docs/turboquant-spec/",
+        "count": 3
+      }
+    ],
+    "page_errors": [],
+    "built_pages": 259,
+    "complete": true
+  },
+  "rocm_sdk": {
+    "sdk": "openai",
+    "version": "7.43.0",
+    "json": "pass",
+    "sse": "pass",
+    "text_matches": true,
+    "completion_tokens": 32
+  },
+  "remote_bun": {
+    "version": "1.4.4",
+    "archive_sha256": "bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c",
+    "binary_sha256": "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235",
+    "system_version": "1.4.4",
+    "previous_version_preserved": "1.3.14"
+  },
+  "highlight_assets": {
+    "styles/github-dark.min.css": {
+      "url": "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.12.0/styles/github-dark.min.css",
+      "integrity": "sha384-wH75j6z1lH97ZOpMOInqhgKzFkAInZPPSPlZpYKYTOqsaizPvhQZmAtLcPKXpLyH",
+      "bytes": 1315
+    },
+    "highlight.min.js": {
+      "url": "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.12.0/highlight.min.js",
+      "integrity": "sha384-wjfDDhOPPdjtva8vWBhWeVprSpmxisEu5aYT3q1JyACqXpdKpo3PWZTMVq24MBix",
+      "bytes": 129254
+    }
+  },
+  "checks": {
+    "site_build": "259 pages pass with Bun 1.4.4 and Astro 7.4.2",
+    "zig_tests": "755 main cases pass; unchanged IR/forward/host-I/O cases reuse 66 cached passes",
+    "bun_tests": "652 pass, 0 fail under Bun 1.4.4",
+    "frozen_install": "root and site Bun text lockfiles pass frozen installation",
+    "dependency_audit": "root and site: zero reported vulnerabilities",
+    "outdated_direct_dependencies": "none in root or site at validation time",
+    "prettier_installed": false,
+    "format": "bun fmt checks changed supported files; Astro templates checked by the compiler and browser"
+  },
+  "notes": [
+    "The full generic SDK suite still has the existing ROCm health-metadata limitation documented in the MTP report.",
+    "The SDK generation smoke uses explicit stream:false for JSON, then stream:true; the legacy ROCm handler defaults to streaming.",
+    "The Metal scratch test now checks replacement buffer capacity rather than assuming that a freed address cannot be reused."
+  ],
+  "source_sha256": {
+    ".github/workflows/site-check.yml": "7484300ce5bbd230e440a038787fb99fb0870991dad2cefdf128bc59593f4ebe",
+    ".github/workflows/test.yml": "b855fb61f7f77824e8dbdf881b4cd94fb5d37fa754640acb2aa1c780eae8e8d6",
+    ".gitignore": "b78c7c3b6350b330f30e6bbd5b4c509fa64baf2d434ec2ba9c8a6c9c6ef2e7ed",
+    "AGENTS.md": "e6333463a3fc7c904614f1eab0c97a06cc2faf63fa544dae847483b8c679a0ac",
+    "README.md": "a89e896801e6036ad8bd29885e1f73da88cdd843d462fc900013f748468d2c0e",
+    "docs/DEVELOPMENT.md": "bedad6d9c929ee8487a0a4be9f679fe1983918a2ff94eb9b57b1b2e49364e860",
+    "docs/GETTING_STARTED.md": "8a432dc4be626e5b91a701c415f7dbb1081fb146463093abc91e22da147ec7a3",
+    "docs/ROCM.md": "8def4399282c37c06fea277abf19d835f9f55d5dab40d74418e6cc806f969740",
+    "package.json": "18e87f3914f18206d38611bede9eced21dc20fe613666be0ee1c5b7b5da7b768",
+    "site/.node-version": "5b9d0e73029969ae9000117cb877f17bb9841c1279bfe8024e294acfcf017800",
+    "site/README.md": "faf58dc0452c4436ece79dbe6708b4cbfbdc084addb1e9a671ac0ff56a435c08",
+    "site/astro.config.mjs": "46205a0abb02178c52f1be303f13c51f7b0ae7cd8720b15f56cfbe56aca87eb7",
+    "site/package.json": "6ac7e25716d2e5001f827a5ff7e9f3874e3dd958ea709e3f72d566494e9e72a2",
+    "site/src/components/Header.astro": "1de6d2fa359d5b45aae1e4c3057c944f05b88c8699ac9a1d0c279a23ee78d6d8",
+    "site/src/content.config.ts": "161ced58f46016c7c57fe4232c8728b3fd94dcbdaf1d781a47d18d76e37c3c5a",
+    "site/src/layouts/BaseLayout.astro": "cc04735a7204ef520d8040a619680279f175cc7e17160e38ce46347b0e1406ea",
+    "site/src/layouts/DocLayout.astro": "d57eb4ced99c192dba6ad0ed296266f370d766b852f05030f520a682f2eabccf",
+    "site/src/pages/index.astro": "4ef88d1d594610842bb67712a3a8183dc991f635a02528412c79281d5367a812",
+    "site/src/pages/zinc/docs/[slug].astro": "9f62edcd330cfd4817c1dd7c882e1af13e150d3ae2bf16e259e13dbe47dd8de1",
+    "site/src/pages/zinc/docs/index.astro": "cccb5f9727a58d89a35743ca0b6a65513f1a474396fe42f81c5e0f37a3cce1be",
+    "site/src/pages/zinc/index.astro": "b44b686397f080ba9d1431b1c62924a94b6b0e35bef16aa6ec23b536ec086e19",
+    "site/src/styles/global.css": "df3e9d79a37356897a24596c2a33daba3ada84737f7fcfb83f3315b5525b75fb",
+    "src/compute/forward_metal.zig": "410f72d3c68e1bae3e47b905d7a1adb9ede15dbcdaa6339e2700941d462c8e83",
+    "src/regression_tests.zig": "ed6c5f31c2c58e9fe50e323ce90e0199b3035b55dbc84d52b856376e84b0f267",
+    "src/server/chat.html": "71b20532ace58913c022de0cddfad06b6d8320ed439893d7f287c01882806cb8",
+    ".bun-version": "d03d8b268b4171328ac2458ce8ca82d69a1fde38469d4e4faae4f8fa8d8a5e35",
+    "bunfig.toml": "1347763af7e534f3fa77364647e1210162953f7f09bd3753e3e0cc551d8ebc3a",
+    "bun.lock": "3b6406b1f02676d31c79519abd769ad40370ab4171d5de0396d8c10a2d814b90",
+    "site/bun.lock": "a76260793b213b547658004286cf862ae67919e24262e432a7dd2c73b611f54a"
+  }
+}

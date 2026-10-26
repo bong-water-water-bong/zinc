@@ -15,6 +15,7 @@
 //! would drag in Metal-only dependencies).
 //! @section Model Format & Loading
 const std = @import("std");
+const host_io = @import("host_io");
 const gguf = @import("gguf.zig");
 const config_mod = @import("config.zig");
 const ModelConfig = config_mod.ModelConfig;
@@ -53,7 +54,7 @@ pub const Model = struct {
     /// read the raw `token_embd.weight` bytes on the CPU.
     mmap_data: ?[]align(std.heap.page_size_min) const u8,
     /// Open file handle backing the mapping; closed in `deinit`.
-    mmap_file: ?std.fs.File,
+    mmap_file: ?std.Io.File,
 
     /// Open + mmap the GGUF at `path`, parse it, extract the config, and upload
     /// every tensor to `ctx`. The mapping is retained for embedding lookups.
@@ -67,17 +68,17 @@ pub const Model = struct {
         // Open and memory-map the file (read-only, private). The mapping stays
         // alive for the model's lifetime — uploadMmap reads through it and the
         // embedding dequant reads the raw token_embd bytes later.
-        const file = try std.fs.cwd().openFile(path, .{});
-        errdefer file.close();
+        const file = try std.Io.Dir.cwd().openFile(host_io.io, path, .{});
+        errdefer file.close(host_io.io);
 
-        const stat = try file.stat();
+        const stat = try file.stat(host_io.io);
         const file_size = stat.size;
         log.info("File size: {d} MB", .{file_size / (1024 * 1024)});
 
         const mmap_data = try std.posix.mmap(
             null,
             file_size,
-            std.posix.PROT.READ,
+            .{ .READ = true },
             .{ .TYPE = .PRIVATE },
             file.handle,
             0,
@@ -96,7 +97,7 @@ pub const Model = struct {
 
         // Pre-size the tensor list so its backing buffer never reallocates while
         // we hand out *LoadedTensor pointers into it below.
-        var tensors = std.ArrayList(LoadedTensor){};
+        var tensors: std.ArrayList(LoadedTensor) = .empty;
         errdefer {
             for (tensors.items) |*t| cuda_buffer.freeBuffer(&t.gpu_buffer);
             tensors.deinit(allocator);
@@ -199,7 +200,7 @@ pub const Model = struct {
         }
         if (self.mmap_file) |f| {
             var file = f;
-            file.close();
+            file.close(host_io.io);
             self.mmap_file = null;
         }
 
@@ -215,14 +216,14 @@ pub const Model = struct {
 /// @param allocator Owns the transient GGUF metadata (freed before returning).
 /// @returns The parsed `ModelConfig`.
 pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfig {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(host_io.io, path, .{});
+    defer file.close(host_io.io);
 
-    const stat = try file.stat();
+    const stat = try file.stat(host_io.io);
     const mmap_data = try std.posix.mmap(
         null,
         stat.size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -353,7 +354,7 @@ fn extractConfigWithLogging(gf: *const gguf.GGUFFile, log_metadata: bool) ModelC
     const ssm_dt_rank = gf.getU32(std.fmt.bufPrint(&key_buf, "{s}.ssm.time_step_rank", .{prefix}) catch "") orelse 0;
     const ssm_n_group = gf.getU32(std.fmt.bufPrint(&key_buf, "{s}.ssm.group_count", .{prefix}) catch "") orelse 0;
     const full_attn_interval = blk: {
-        if (std.posix.getenv("ZINC_FULL_ATTN_INTERVAL")) |v| {
+        if (host_io.getenv("ZINC_FULL_ATTN_INTERVAL")) |v| {
             if (std.fmt.parseInt(u32, v, 10)) |parsed| break :blk parsed else |_| {}
         }
         break :blk gf.getU32(std.fmt.bufPrint(&key_buf, "{s}.full_attention_interval", .{prefix}) catch "") orelse
@@ -705,7 +706,7 @@ pub fn dequantRow(raw_data: []const u8, row: u32, cols: u32, quant_type: GGMLTyp
             }
         },
         else => {
-            log.warn("Unsupported quant type {d}, using zeros", .{@intFromEnum(quant_type)});
+            log.warn("Unsupported quant type {d}, using zeros", .{@backingInt(quant_type)});
             @memset(output, 0);
         },
     }

@@ -3,6 +3,7 @@
 //! This helper selects quantization-specific DMMV pipelines and records the
 //! push constants and workgroup sizes needed for single-token decode.
 const std = @import("std");
+const host_io = @import("host_io");
 const vk = @import("../vulkan/vk.zig");
 const Instance = @import("../vulkan/instance.zig").Instance;
 const PushDescriptorFn = @import("../vulkan/instance.zig").PushDescriptorFn;
@@ -379,7 +380,7 @@ pub const Q8_1_BLOCK_BYTES: u32 = 36;
 /// The dynamic-K 64x64 GEMM tile used when no K-specialized pipeline matches.
 /// ZINC_GEMM_GENERIC_BM64=0 restores the 32x32 tile for A/B checks.
 fn genericBm64TileEnabled() bool {
-    const raw = std.posix.getenv("ZINC_GEMM_GENERIC_BM64") orelse return true;
+    const raw = host_io.getenv("ZINC_GEMM_GENERIC_BM64") orelse return true;
     return !std.mem.eql(u8, raw, "0");
 }
 
@@ -978,7 +979,7 @@ pub const DmmvDispatch = struct {
         const push_desc_options = pipeline_mod.PipelineOptions{
             .push_descriptors = has_push_desc,
         };
-        const dp4a_wave32_env = std.posix.getenv("ZINC_DP4A_WAVE32");
+        const dp4a_wave32_env = host_io.getenv("ZINC_DP4A_WAVE32");
         const requested_dp4a_subgroup: u32 = if (dp4a_wave32_env != null and std.mem.eql(u8, dp4a_wave32_env.?, "1")) 32 else 64;
         const push_desc_wave64_options = pipeline_mod.PipelineOptions{
             .required_subgroup_size = requested_dp4a_subgroup,
@@ -997,7 +998,7 @@ pub const DmmvDispatch = struct {
         // register footprint (the 3-column kernels are occupancy-bound: RDNA4
         // pass 38.3 -> 36.3 ms). ZINC_MTP_COLS_WAVE32=0 keeps the default width.
         // ZINC_MTP_COLS_WAVE32: 0 = driver default width, 1 = require 32, 64 = require 64.
-        const cols_wave_env = std.posix.getenv("ZINC_MTP_COLS_WAVE32");
+        const cols_wave_env = host_io.getenv("ZINC_MTP_COLS_WAVE32");
         const cols_wave_req: u32 = if (cols_wave_env) |v| (if (std.mem.eql(u8, v, "1")) 32 else if (std.mem.eql(u8, v, "64")) 64 else 0) else 0;
         const cols_wave_supported = instance.caps.subgroup_size_control and
             instance.caps.min_subgroup_size <= cols_wave_req and instance.caps.max_subgroup_size >= cols_wave_req;
@@ -4762,10 +4763,10 @@ pub const DmmvDispatch = struct {
         d_offset: u32,
         accumulate: bool,
     ) !void {
-        const bm64_acc_enabled = if (std.posix.getenv("ZINC_QWEN36_27B_BM64_DOWN_ACC")) |raw| !std.mem.eql(u8, raw, "0") else true;
-        const mmq64_acc_enabled = if (std.posix.getenv("ZINC_QWEN36_27B_MMQ64_DOWN")) |raw| !std.mem.eql(u8, raw, "0") else false;
-        const k12288_bk2_enabled = if (std.posix.getenv("ZINC_QWEN35_9B_K12288_BK2")) |raw| !std.mem.eql(u8, raw, "0") else true;
-        const k12288_bm64_down_enabled = if (std.posix.getenv("ZINC_QWEN35_9B_BM64_DOWN")) |raw| !std.mem.eql(u8, raw, "0") else true;
+        const bm64_acc_enabled = if (host_io.getenv("ZINC_QWEN36_27B_BM64_DOWN_ACC")) |raw| !std.mem.eql(u8, raw, "0") else true;
+        const mmq64_acc_enabled = if (host_io.getenv("ZINC_QWEN36_27B_MMQ64_DOWN")) |raw| !std.mem.eql(u8, raw, "0") else false;
+        const k12288_bk2_enabled = if (host_io.getenv("ZINC_QWEN35_9B_K12288_BK2")) |raw| !std.mem.eql(u8, raw, "0") else true;
+        const k12288_bm64_down_enabled = if (host_io.getenv("ZINC_QWEN35_9B_BM64_DOWN")) |raw| !std.mem.eql(u8, raw, "0") else true;
         const use_n64_bm64 = !accumulate and K == 17408 and N >= 64 and (N & 63) == 0 and (M & 63) == 0 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_bm64 != null;
         const use_k21504_n64_bm64 = !accumulate and K == 21504 and N == 64 and (M & 63) == 0 and self.pipeline_mul_mm_q6k_full_dp4a_k21504_n64_bm64 != null;
         const use_exact_n64_mmq64_acc = mmq64_acc_enabled and accumulate and K == 17408 and N == 64 and (M & 63) == 0 and self.pipeline_mul_mm_q6k_full_dp4a_k17408_n64_mmq64_acc != null;
@@ -5913,7 +5914,7 @@ pub const DmmvDispatch = struct {
         a_offset: u32,
         d_offset: u32,
     ) !void {
-        const qwen35_ssm_q5_bk2_enabled = if (std.posix.getenv("ZINC_QWEN35_9B_SSM_Q5_BK2")) |raw| !std.mem.eql(u8, raw, "0") else true;
+        const qwen35_ssm_q5_bk2_enabled = if (host_io.getenv("ZINC_QWEN35_9B_SSM_Q5_BK2")) |raw| !std.mem.eql(u8, raw, "0") else true;
         const use_k4096_bk2 = qwen35_ssm_q5_bk2_enabled and K == 4096 and self.pipeline_mul_mm_q5k_full_dp4a_k4096_bk2 != null;
         const n_tile: u32 = if (K == 6144 and N == 40 and self.pipeline_mul_mm_q5k_full_dp4a_k6144_n40 != null)
             40
@@ -5983,10 +5984,10 @@ pub const DmmvDispatch = struct {
         d_offset: u32,
         accumulate: bool,
     ) !void {
-        const bm64_acc_enabled = if (std.posix.getenv("ZINC_QWEN36_27B_BM64_DOWN_ACC")) |raw| !std.mem.eql(u8, raw, "0") else true;
-        const mmq64_acc_enabled = if (std.posix.getenv("ZINC_QWEN36_27B_MMQ64_DOWN")) |raw| !std.mem.eql(u8, raw, "0") else false;
-        const k12288_bk2_enabled = if (std.posix.getenv("ZINC_QWEN35_9B_K12288_BK2")) |raw| !std.mem.eql(u8, raw, "0") else true;
-        const k12288_bm64_down_enabled = if (std.posix.getenv("ZINC_QWEN35_9B_BM64_DOWN")) |raw| !std.mem.eql(u8, raw, "0") else true;
+        const bm64_acc_enabled = if (host_io.getenv("ZINC_QWEN36_27B_BM64_DOWN_ACC")) |raw| !std.mem.eql(u8, raw, "0") else true;
+        const mmq64_acc_enabled = if (host_io.getenv("ZINC_QWEN36_27B_MMQ64_DOWN")) |raw| !std.mem.eql(u8, raw, "0") else false;
+        const k12288_bk2_enabled = if (host_io.getenv("ZINC_QWEN35_9B_K12288_BK2")) |raw| !std.mem.eql(u8, raw, "0") else true;
+        const k12288_bm64_down_enabled = if (host_io.getenv("ZINC_QWEN35_9B_BM64_DOWN")) |raw| !std.mem.eql(u8, raw, "0") else true;
         const use_k5120_n64_bm64 = !accumulate and K == 5120 and N >= 64 and (N & 63) == 0 and (M & 63) == 0 and self.pipeline_mul_mm_q4k_full_dp4a_k5120_n64_bm64 != null;
         const use_k5120_ragged_n64 = !accumulate and K == 5120 and N > 64 and (N & 63) != 0 and self.pipeline_mul_mm_q4k_full_dp4a_k5120_n64_ragged != null;
         const use_k12288_ragged_n64_bm64 = k12288_bm64_down_enabled and !accumulate and K == 12288 and N > 64 and (N & 63) != 0 and (M & 63) == 0 and self.pipeline_mul_mm_q4k_full_dp4a_k12288_n64_bm64_ragged != null;

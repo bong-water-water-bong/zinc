@@ -1,0 +1,22 @@
+[
+  {
+    "file": "code.txt",
+    "bytes": 9216,
+    "sha256": "0ba5c7fa1887c99dc4b949958eaa4b3be23ca095f51c2c9bdaea0e894d5ed067"
+  },
+  {
+    "file": "mixed.txt",
+    "bytes": 35400,
+    "sha256": "61a24ad2667171ec466c979191bc8495ffeb18c5424e5f5d37e3b5dd7a306126"
+  },
+  {
+    "file": "prose.txt",
+    "bytes": 11616,
+    "sha256": "e5c3ca02dd9ae88d8ab8e728219de4dc876edc59609c8d42fff9d004928f56b7"
+  },
+  {
+    "file": "unicode.txt",
+    "bytes": 18240,
+    "sha256": "34d0a43c7cb288266e2c330f972da84d9b883be75801aada31b9638c0b7a65ed"
+  }
+]

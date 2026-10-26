@@ -98,7 +98,9 @@ for M in "${MODELS[@]}"; do
   pass=0; bad=0
   for f in "$WORK"/corpus/*.txt; do
     z=$("$ZINC_DIR/bin/zinc-tokenize" "$M" "$f" 2>&1 | tail -1 | tr -d ' ')
-    l=$("$LLAMA_DIR/llama-tokenize" -m "$M" -f "$f" --ids --log-disable 2>/dev/null | tail -1 | tr -d ' ')
+    # File contents are already literal bytes; the CLI otherwise interprets
+    # backslash escapes before tokenizing and compares a different prompt.
+    l=$("$LLAMA_DIR/llama-tokenize" -m "$M" -f "$f" --ids --no-escape --log-disable 2>/dev/null | tail -1 | tr -d ' ')
     if [ "$z" = "$l" ]; then pass=$((pass + 1)); else bad=$((bad + 1)); echo "  tokenizer DIFF $(basename "$f")"; echo "    zinc  ${z:0:200}"; echo "    llama ${l:0:200}"; fi
   done
   echo "  tokenizer: $pass match, $bad differ"

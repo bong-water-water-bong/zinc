@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_io = @import("host_io");
 
 const vulkan = @import("vulkan");
 const vk = vulkan.vk;
@@ -123,11 +124,12 @@ fn uploadPattern(
     }
 }
 
-pub fn main() !void {
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
     const allocator = std.heap.page_allocator;
     const shader_path = "zig-out/share/zinc/shaders/dmmv_q6k_moe_cols.spv";
 
-    const device_index = if (std.posix.getenv("ZINC_GPU")) |raw|
+    const device_index = if (host_io.getenv("ZINC_GPU")) |raw|
         std.fmt.parseInt(u32, raw, 10) catch instance_mod.auto_select_device_index
     else
         instance_mod.auto_select_device_index;

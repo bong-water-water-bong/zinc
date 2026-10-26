@@ -1,6 +1,7 @@
 ---
 import DocLayout from '../../../layouts/DocLayout.astro';
 import { loadDocs } from '../../../lib/docs-loader';
+import { rehypeDocLinks } from '../../../lib/docs-links';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
@@ -153,16 +154,18 @@ export async function getStaticPaths() {
   };
 
   const docs = await loadDocs();
+  const docLinks = docs.map(({ slug, sourcePath }) => ({ slug, sourcePath }));
   return docs.map(doc => ({
     params: { slug: doc.slug },
     props: {
       doc,
+      docLinks,
       meta: docMeta[doc.slug],
     },
   }));
 }
 
-const { doc, meta } = Astro.props;
+const { doc, meta, docLinks } = Astro.props;
 const title = meta?.title ?? doc.title;
 const description = meta?.description ?? `${title} — ZINC documentation`;
 const keywords = meta?.keywords;
@@ -177,6 +180,7 @@ const contentHtml = String(
     .use(remarkGfm)
     .use(remarkMath)
     .use(remarkRehype)
+    .use(rehypeDocLinks, { sourcePath: doc.sourcePath, docs: docLinks })
     .use(rehypeKatex)
     .use(rehypeShiki, {
       defaultColor: 'light',
@@ -185,6 +189,7 @@ const contentHtml = String(
         dark: 'vitesse-dark',
       },
       langs: ['zig', 'glsl', 'json', 'bash', 'typescript', 'javascript', 'text', 'c', 'objc'],
+      langAlias: { metal: 'cpp' },
     })
     .use(rehypeDocHeadingAnchors)
     .use(rehypeStringify)

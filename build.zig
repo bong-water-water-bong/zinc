@@ -9,11 +9,67 @@ const Backend = enum {
     zinc_rt,
 };
 
+// Preserve per-checkout CRT overrides with the 0.17 artifact API.
+fn configureLibc(b: *std.Build, artifact: *std.Build.Step.Compile) void {
+    if (std.Io.Dir.cwd().access(b.graph.io, ".build-support/libc.conf", .{})) |_| {
+        artifact.setLibCFile(b.path(".build-support/libc.conf"));
+    } else |_| {}
+}
+
+fn addExecutable(b: *std.Build, options: std.Build.ExecutableOptions) *std.Build.Step.Compile {
+    const artifact = b.addExecutable(options);
+    configureLibc(b, artifact);
+    return artifact;
+}
+
+fn addTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Compile {
+    const artifact = b.addTest(options);
+    configureLibc(b, artifact);
+    return artifact;
+}
+
+fn createModule(b: *std.Build, options: std.Build.Module.CreateOptions) *std.Build.Module {
+    const module = b.createModule(options);
+    module.addImport("host_io", b.modules.get("host_io").?);
+    return module;
+}
+
+fn addMetalBindings(b: *std.Build, target: std.Build.ResolvedTarget, module: *std.Build.Module) void {
+    const translated = b.addTranslateC(.{
+        .root_source_file = b.path("src/metal/shim.h"),
+        .target = target,
+        .optimize = module.optimize.?,
+    });
+    module.addImport("metal_c", translated.createModule());
+}
+
+fn addCudaBindings(b: *std.Build, target: std.Build.ResolvedTarget, module: *std.Build.Module) void {
+    const translated = b.addTranslateC(.{
+        .root_source_file = b.path("src/cuda/cuda_shim.h"),
+        .target = target,
+        .optimize = module.optimize.?,
+    });
+    module.addImport("cuda_c", translated.createModule());
+}
+
 fn configureVulkanModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     module: *std.Build.Module,
 ) void {
+    const translated = b.addTranslateC(.{
+        .root_source_file = b.path("src/vulkan/headers.h"),
+        .target = target,
+        .optimize = module.optimize.?,
+    });
+    if (target.result.os.tag == .macos) {
+        translated.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    } else if (target.result.os.tag == .windows) {
+        const sdk = b.graph.environ_map.get("VULKAN_SDK") orelse
+            b.graph.environ_map.get("VK_SDK_PATH") orelse @panic("Vulkan SDK is required");
+        translated.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "Include" }) });
+    }
+    module.addImport("vulkan_c", translated.createModule());
     switch (target.result.os.tag) {
         .macos => {
             module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
@@ -21,8 +77,8 @@ fn configureVulkanModule(
             module.linkSystemLibrary("vulkan", .{});
         },
         .windows => {
-            const vulkan_sdk = b.graph.env_map.get("VULKAN_SDK") orelse
-                b.graph.env_map.get("VK_SDK_PATH") orelse
+            const vulkan_sdk = b.graph.environ_map.get("VULKAN_SDK") orelse
+                b.graph.environ_map.get("VK_SDK_PATH") orelse
                 @panic("Windows builds require the LunarG Vulkan SDK. Install it and restart your shell so VULKAN_SDK is available.");
             const lib_dir = if (target.result.cpu.arch == .x86) "Lib32" else "Lib";
 
@@ -41,13 +97,13 @@ fn configureCudaModule(
     target: std.Build.ResolvedTarget,
     module: *std.Build.Module,
 ) void {
+    addCudaBindings(b, target, module);
     // CUDA backend — Linux/WSL2 + NVIDIA only. On the WSL2 deployment box NVIDIA
     // exposes CUDA, not Vulkan, so ZINC's kernels reach the GPU through a native
     // CUDA path: the C shim (Driver API + NVRTC) in src/cuda/cuda_shim.c plus the
     // Zig wrappers in src/cuda/{device,buffer,pipeline,command}.zig. Mirrors
     // configureVulkanModule. See docs/cuda-backend.md §6.
-    _ = target;
-    const cuda_home = b.graph.env_map.get("CUDA_HOME") orelse "/usr/local/cuda";
+    const cuda_home = b.graph.environ_map.get("CUDA_HOME") orelse "/usr/local/cuda";
     module.addCSourceFile(.{
         .file = b.path("src/cuda/cuda_shim.c"),
         .flags = &.{"-std=c11"},
@@ -71,12 +127,12 @@ fn configureRocmModule(
     target: std.Build.ResolvedTarget,
     module: *std.Build.Module,
 ) void {
+    addCudaBindings(b, target, module);
     // ROCm backend — Linux + AMD only. The Zig compute/model layers reuse the
     // mature CUDA-side orchestration through its stable C ABI, while this shim
     // implements that ABI with HIP, hipRTC, and hipBLAS.
-    _ = target;
-    const rocm_home = b.graph.env_map.get("ROCM_PATH") orelse
-        b.graph.env_map.get("ROCM_HOME") orelse
+    const rocm_home = b.graph.environ_map.get("ROCM_PATH") orelse
+        b.graph.environ_map.get("ROCM_HOME") orelse
         "/opt/rocm";
     module.addCSourceFile(.{
         .file = b.path("src/rocm/rocm_shim.c"),
@@ -91,15 +147,18 @@ fn configureRocmModule(
 }
 
 fn resolveBunExe(b: *std.Build) []const u8 {
-    if (b.graph.env_map.get("BUN_EXE")) |bun_exe| return bun_exe;
-    if (std.fs.accessAbsolute("/root/.bun/bin/bun", .{})) |_| return "/root/.bun/bin/bun" else |_| {}
+    if (b.graph.environ_map.get("BUN_EXE")) |bun_exe| return bun_exe;
+    if (b.graph.environ_map.get("HOME")) |home| {
+        const bun_exe = b.pathJoin(&.{ home, ".bun", "bin", "bun" });
+        if (std.Io.Dir.accessAbsolute(b.graph.io, bun_exe, .{})) |_| return bun_exe else |_| {}
+    }
     return "bun";
 }
 
 fn addBunDirToPath(b: *std.Build, run: *std.Build.Step.Run, bun_exe: []const u8) void {
     if (!std.fs.path.isAbsolute(bun_exe)) return;
     const bun_dir = std.fs.path.dirname(bun_exe) orelse return;
-    const old_path = b.graph.env_map.get("PATH") orelse "";
+    const old_path = b.graph.environ_map.get("PATH") orelse "";
     const path = if (old_path.len == 0)
         bun_dir
     else
@@ -120,21 +179,14 @@ pub fn build(b: *std.Build) void {
         optimize = if (release) .ReleaseFast else .Debug;
     }
     const build_version = b.option([]const u8, "version", "Version string embedded in `zinc --version`") orelse
-        b.graph.env_map.get("ZINC_VERSION") orelse
+        b.graph.environ_map.get("ZINC_VERSION") orelse
         "dev";
     const build_commit = b.option([]const u8, "commit", "Git commit hash embedded in `zinc --version`") orelse
-        b.graph.env_map.get("ZINC_COMMIT") orelse
-        b.graph.env_map.get("GITHUB_SHA") orelse
+        b.graph.environ_map.get("ZINC_COMMIT") orelse
+        b.graph.environ_map.get("GITHUB_SHA") orelse
         "unknown";
     const full_tests = b.option(bool, "full-tests", "Require integration smoke tests and fail when their environment is missing") orelse false;
     const install_hot_bench = b.option(bool, "install-hot-bench", "Install the zinc-hot-bench binary as part of the default install step") orelse false;
-
-    // Rolling Linux distros can ship CRT objects with sections Zig's bundled
-    // LLD does not understand yet. Let local builders override libc paths
-    // without baking machine-specific files into the repository.
-    if (std.fs.cwd().access(".build-support/libc.conf", .{})) |_| {
-        b.libc_file = ".build-support/libc.conf";
-    } else |_| {}
 
     const is_linux = target.result.os.tag == .linux;
     const is_macos = target.result.os.tag == .macos;
@@ -171,18 +223,25 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "optimize", @tagName(optimize));
     build_options.addOption([]const u8, "backend", @tagName(selected_backend));
 
-    const zinc_rt_gguf_mod = b.createModule(.{
+    _ = b.addModule("host_io", .{
+        .root_source_file = b.path("src/host_io.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const zinc_rt_gguf_mod = createModule(b, .{
         .root_source_file = b.path("src/model/gguf.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const zinc_rt_lib_mod = b.createModule(.{
+    const zinc_rt_lib_mod = createModule(b, .{
         .root_source_file = b.path("src/zinc_rt/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
     zinc_rt_lib_mod.addImport("gguf", zinc_rt_gguf_mod);
-    const forward_zinc_rt_mod = b.createModule(.{
+    const forward_zinc_rt_mod = createModule(b, .{
         .root_source_file = b.path("src/compute/forward_zinc_rt.zig"),
         .target = target,
         .optimize = optimize,
@@ -473,7 +532,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // --- Main executable ---
-    const exe_mod = b.createModule(.{
+    const exe_mod = createModule(b, .{
         .root_source_file = b.path(if (selected_backend == .zinc_rt) "src/zinc_rt/main.zig" else "src/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -493,6 +552,7 @@ pub fn build(b: *std.Build) void {
             .flags = &.{"-fobjc-arc"},
         });
         exe_mod.addIncludePath(b.path("src/metal"));
+        addMetalBindings(b, target, exe_mod);
         exe_mod.linkFramework("Metal", .{});
         exe_mod.linkFramework("Foundation", .{});
     } else if (selected_backend == .cuda) {
@@ -503,14 +563,94 @@ pub fn build(b: *std.Build) void {
         configureVulkanModule(b, target, exe_mod);
     }
 
-    const exe = b.addExecutable(.{
+    const exe = addExecutable(b, .{
         .name = "zinc",
         .root_module = exe_mod,
     });
 
     b.installArtifact(exe);
 
-    const hot_bench_mod = b.createModule(.{
+    if (is_linux) {
+        // The C ABI header is portable. A check-only artifact lets Linux CI
+        // analyze CUDA orchestration without a CUDA SDK or a GPU context.
+        const cuda_check_options = b.addOptions();
+        cuda_check_options.addOption([]const u8, "version", build_version);
+        cuda_check_options.addOption([]const u8, "commit", build_commit);
+        cuda_check_options.addOption([]const u8, "target", target.result.zigTriple(b.allocator) catch @panic("out of memory"));
+        cuda_check_options.addOption([]const u8, "optimize", @tagName(optimize));
+        cuda_check_options.addOption([]const u8, "backend", "cuda");
+        const cuda_check_step = b.step("check-cuda", "Type-check CUDA host code without linking or running a GPU");
+        for ([_][]const u8{
+            "src/main.zig", "src/cuda/smoke.zig", "src/loadtest_cuda.zig", "src/run_cuda.zig", "src/dbg_cuda.zig",
+        }, 0..) |root, i| {
+            const cuda_check_mod = createModule(b, .{
+                .root_source_file = b.path(root),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            cuda_check_mod.addOptions("build_options", cuda_check_options);
+            addCudaBindings(b, target, cuda_check_mod);
+            const cuda_check = addExecutable(b, .{
+                .name = b.fmt("zinc-cuda-check-{d}", .{i}),
+                .root_module = cuda_check_mod,
+            });
+            cuda_check_step.dependOn(&cuda_check.step);
+        }
+    }
+
+    const analyzer_mod = createModule(b, .{
+        .root_source_file = b.path("src/zig-struct-analyzer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    analyzer_mod.addOptions("build_options", build_options);
+    addMetalBindings(b, target, analyzer_mod);
+    if (!is_macos) {
+        configureVulkanModule(b, target, analyzer_mod);
+    }
+    const analyzer = addExecutable(b, .{
+        .name = "zinc-struct-analyzer",
+        .root_module = analyzer_mod,
+    });
+    const analyze_step = b.step("analyze-structs", "Print layouts for the generated API documentation probe");
+    analyze_step.dependOn(&b.addRunArtifact(analyzer).step);
+
+    const check_tools_step = b.step("check-tools", "Compile standalone tools without opening a model or GPU");
+    const metadata_tools = .{
+        .{ "zinc-inspect-qwen-meta", "tools/inspect_qwen_meta.zig" },
+        .{ "zinc-inspect-gemma-meta", "tools/inspect_gemma_meta_tmp.zig" },
+        .{ "zinc-inspect-tokenizer-meta", "tools/inspect_tokenizer_meta_tmp.zig" },
+        .{ "zinc-inspect-tensor-dims", "tools/inspect_tensor_dims_tmp.zig" },
+    };
+    inline for (metadata_tools) |tool| {
+        const tool_mod = createModule(b, .{
+            .root_source_file = b.path(tool[1]),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        tool_mod.addImport("gguf", zinc_rt_gguf_mod);
+        const tool_exe = addExecutable(b, .{ .name = tool[0], .root_module = tool_mod });
+        check_tools_step.dependOn(&tool_exe.step);
+    }
+
+    const layouts_mod = createModule(b, .{
+        .root_source_file = b.path("src/dump_struct_layouts.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    layouts_mod.addOptions("build_options", build_options);
+    addMetalBindings(b, target, layouts_mod);
+    if (!is_macos) configureVulkanModule(b, target, layouts_mod);
+    const layouts_exe = addExecutable(b, .{ .name = "zinc-struct-layouts", .root_module = layouts_mod });
+    check_tools_step.dependOn(&layouts_exe.step);
+    b.step("dump-struct-layouts", "Print public loader and forward struct layouts")
+        .dependOn(&b.addRunArtifact(layouts_exe).step);
+
+    const hot_bench_mod = createModule(b, .{
         .root_source_file = b.path("src/bench_hot_decode.zig"),
         .target = target,
         .optimize = optimize,
@@ -519,7 +659,7 @@ pub fn build(b: *std.Build) void {
     hot_bench_mod.addOptions("build_options", build_options);
     configureVulkanModule(b, target, hot_bench_mod);
 
-    const hot_bench = b.addExecutable(.{
+    const hot_bench = addExecutable(b, .{
         .name = "zinc-hot-bench",
         .root_module = hot_bench_mod,
     });
@@ -531,17 +671,32 @@ pub fn build(b: *std.Build) void {
     // CPU-only tokenizer check (`zig build tokenize-tool`): parses GGUF metadata
     // and prints ZINC's prompt token ids without opening a GPU device, for
     // diffing against the reference tokenizer on any machine.
-    const tokenize_tool_mod = b.createModule(.{
+    const tokenize_tool_mod = createModule(b, .{
         .root_source_file = b.path("src/tokenize_tool.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const tokenize_tool = b.addExecutable(.{
+    const tokenize_tool = addExecutable(b, .{
         .name = "zinc-tokenize",
         .root_module = tokenize_tool_mod,
     });
     const tokenize_tool_step = b.step("tokenize-tool", "Build the CPU-only GGUF tokenizer check (zig-out/bin/zinc-tokenize)");
     tokenize_tool_step.dependOn(&b.addInstallArtifact(tokenize_tool, .{}).step);
+
+    const tokenize_bench = addExecutable(b, .{
+        .name = "zinc-tokenize-bench",
+        .root_module = createModule(b, .{
+            .root_source_file = b.path("src/bench_tokenize.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.step("tokenize-bench", "Build the CPU-only prompt tokenization benchmark")
+        .dependOn(&b.addInstallArtifact(tokenize_bench, .{}).step);
+    check_tools_step.dependOn(&tokenize_tool.step);
+    check_tools_step.dependOn(&tokenize_bench.step);
+    if (!is_macos) check_tools_step.dependOn(&hot_bench.step);
 
     // Kernel-level check for the Q5_1 route-packed MoE down projection
     // (`zig build validate-moe-cols`). Runs the shader against a CPU Q5_1
@@ -549,13 +704,13 @@ pub fn build(b: *std.Build) void {
     // route and row that diverged instead of silently changing model output.
     // Vulkan only: it opens a device and loads the compiled SPIR-V.
     if (selected_backend == .vulkan) {
-        const moe_cols_mod = b.createModule(.{
+        const moe_cols_mod = createModule(b, .{
             .root_source_file = b.path("tools/validate_q5_1_moe_cols.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
-        const vulkan_mod = b.createModule(.{
+        const vulkan_mod = createModule(b, .{
             .root_source_file = b.path("src/vulkan/mod.zig"),
             .target = target,
             .optimize = optimize,
@@ -564,16 +719,34 @@ pub fn build(b: *std.Build) void {
         configureVulkanModule(b, target, vulkan_mod);
         moe_cols_mod.addImport("vulkan", vulkan_mod);
         configureVulkanModule(b, target, moe_cols_mod);
-        const moe_cols_exe = b.addExecutable(.{
+        const moe_cols_exe = addExecutable(b, .{
             .name = "zinc-validate-q5-1-moe-cols",
             .root_module = moe_cols_mod,
         });
         const moe_cols_step = b.step("validate-moe-cols", "Check dmmv_q5_1_moe_cols against a CPU reference");
         moe_cols_step.dependOn(&b.addInstallArtifact(moe_cols_exe, .{}).step);
+        check_tools_step.dependOn(&moe_cols_exe.step);
         // The validator loads the installed SPIR-V, so it has to depend on the
         // shader compile/install — otherwise editing the shader and running this
         // step happily validates the previous build's .spv.
         moe_cols_step.dependOn(b.getInstallStep());
+
+        const q6k_cols_mod = createModule(b, .{
+            .root_source_file = b.path("tools/validate_q6k_moe_cols.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        q6k_cols_mod.addImport("vulkan", vulkan_mod);
+        configureVulkanModule(b, target, q6k_cols_mod);
+        const q6k_cols_exe = addExecutable(b, .{
+            .name = "zinc-validate-q6k-moe-cols",
+            .root_module = q6k_cols_mod,
+        });
+        check_tools_step.dependOn(&q6k_cols_exe.step);
+        const q6k_cols_step = b.step("validate-q6k-moe-cols", "Build the Q6_K MoE projection validator");
+        q6k_cols_step.dependOn(&b.addInstallArtifact(q6k_cols_exe, .{}).step);
+        q6k_cols_step.dependOn(b.getInstallStep());
     }
 
     // --- CUDA primitive-layer smoke (Linux/WSL2 + NVIDIA only) ---
@@ -582,19 +755,19 @@ pub fn build(b: *std.Build) void {
     // be validated before forward_cuda exists. `zig build cuda-smoke`. See
     // docs/cuda-backend.md §6.2 and Effort 20/21.
     if (is_linux) {
-        const cuda_smoke_mod = b.createModule(.{
+        const cuda_smoke_mod = createModule(b, .{
             .root_source_file = b.path("src/cuda/smoke.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         configureCudaModule(b, target, cuda_smoke_mod);
-        const cuda_smoke_exe = b.addExecutable(.{
+        const cuda_smoke_exe = addExecutable(b, .{
             .name = "cuda-smoke",
             .root_module = cuda_smoke_mod,
         });
         const run_cuda_smoke = b.addRunArtifact(cuda_smoke_exe);
-        if (b.args) |args| run_cuda_smoke.addArgs(args);
+        run_cuda_smoke.addPassthruArgs();
         const cuda_smoke_step = b.step("cuda-smoke", "Build & run the CUDA primitive-layer smoke test (Linux/NVIDIA)");
         cuda_smoke_step.dependOn(&run_cuda_smoke.step);
 
@@ -608,19 +781,19 @@ pub fn build(b: *std.Build) void {
         // buffer, c) — mirroring how src/main.zig spans both subtrees. Keeping
         // it one module is what lets the loader's internal `../cuda/*` imports
         // resolve.
-        const cuda_loadtest_mod = b.createModule(.{
+        const cuda_loadtest_mod = createModule(b, .{
             .root_source_file = b.path("src/loadtest_cuda.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         configureCudaModule(b, target, cuda_loadtest_mod);
-        const cuda_loadtest_exe = b.addExecutable(.{
+        const cuda_loadtest_exe = addExecutable(b, .{
             .name = "cuda-loadtest",
             .root_module = cuda_loadtest_mod,
         });
         const run_cuda_loadtest = b.addRunArtifact(cuda_loadtest_exe);
-        if (b.args) |args| run_cuda_loadtest.addArgs(args);
+        run_cuda_loadtest.addPassthruArgs();
         const cuda_loadtest_step = b.step("cuda-loadtest", "Build & run the CUDA model loader load-test (Linux/NVIDIA)");
         cuda_loadtest_step.dependOn(&run_cuda_loadtest.step);
 
@@ -630,35 +803,35 @@ pub fn build(b: *std.Build) void {
         // `zig build cuda-run -Dbackend=cuda -- [token] [v0|v1|v2] [model.gguf]`.
         // Rooted at src/ (like loadtest) so model/*, cuda/*, and compute/*
         // resolve as one module.
-        const cuda_run_mod = b.createModule(.{
+        const cuda_run_mod = createModule(b, .{
             .root_source_file = b.path("src/run_cuda.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         configureCudaModule(b, target, cuda_run_mod);
-        const cuda_run_exe = b.addExecutable(.{
+        const cuda_run_exe = addExecutable(b, .{
             .name = "cuda-run",
             .root_module = cuda_run_mod,
         });
         const run_cuda_run = b.addRunArtifact(cuda_run_exe);
-        if (b.args) |args| run_cuda_run.addArgs(args);
+        run_cuda_run.addPassthruArgs();
         const cuda_run_step = b.step("cuda-run", "Build & run the CUDA greedy-decode driver (Linux/NVIDIA)");
         cuda_run_step.dependOn(&run_cuda_run.step);
 
         // CUDA per-layer debug dump — drives forward_cuda layer-by-layer via the
         // public hooks, printing the residual-stream norm after each layer, to
         // diff against a reference implementation per-layer reference and pinpoint divergence.
-        const cuda_dbg_mod = b.createModule(.{
+        const cuda_dbg_mod = createModule(b, .{
             .root_source_file = b.path("src/dbg_cuda.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         configureCudaModule(b, target, cuda_dbg_mod);
-        const cuda_dbg_exe = b.addExecutable(.{ .name = "cuda-dbg", .root_module = cuda_dbg_mod });
+        const cuda_dbg_exe = addExecutable(b, .{ .name = "cuda-dbg", .root_module = cuda_dbg_mod });
         const run_cuda_dbg = b.addRunArtifact(cuda_dbg_exe);
-        if (b.args) |args| run_cuda_dbg.addArgs(args);
+        run_cuda_dbg.addPassthruArgs();
         const cuda_dbg_step = b.step("cuda-dbg", "Build & run the CUDA per-layer debug dump (Linux/NVIDIA)");
         cuda_dbg_step.dependOn(&run_cuda_dbg.step);
     }
@@ -675,59 +848,55 @@ pub fn build(b: *std.Build) void {
     // --- Run step ---
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run ZINC inference engine");
     run_step.dependOn(&run_cmd.step);
 
     const run_hot_bench = b.addRunArtifact(hot_bench);
     run_hot_bench.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_hot_bench.addArgs(args);
-    }
+    run_hot_bench.addPassthruArgs();
     const hot_bench_step = b.step("hot-bench", "Run hot decode microbenchmarks");
     hot_bench_step.dependOn(&run_hot_bench.step);
 
     if (is_macos) {
-        const bench_mod = b.createModule(.{
+        const bench_mod = createModule(b, .{
             .root_source_file = b.path("benchmarks/metal_inference.zig"),
             .target = target,
             .optimize = .ReleaseFast,
             .link_libc = true,
         });
-        const bench_support_mod = b.createModule(.{
+        const bench_support_mod = createModule(b, .{
             .root_source_file = b.path("src/bench_support.zig"),
             .target = target,
             .optimize = .ReleaseFast,
             .link_libc = true,
         });
         bench_support_mod.addIncludePath(b.path("src/metal"));
+        addMetalBindings(b, target, bench_support_mod);
         bench_mod.addImport("zinc_bench_support", bench_support_mod);
         bench_mod.addCSourceFile(.{
             .file = b.path("src/metal/shim.m"),
             .flags = &.{"-fobjc-arc"},
         });
         bench_mod.addIncludePath(b.path("src/metal"));
+        addMetalBindings(b, target, bench_mod);
         bench_mod.linkFramework("Metal", .{});
         bench_mod.linkFramework("Foundation", .{});
-        const bench_exe = b.addExecutable(.{
+        const bench_exe = addExecutable(b, .{
             .name = "zinc-bench-metal",
             .root_module = bench_mod,
         });
         b.installArtifact(bench_exe);
 
         const bench_run = b.addRunArtifact(bench_exe);
-        if (b.args) |args| {
-            bench_run.addArgs(args);
-        }
+        bench_run.addPassthruArgs();
 
         const bench_metal_step = b.step("bench-metal", "Run the Metal inference benchmark (ReleaseFast)");
         bench_metal_step.dependOn(&bench_run.step);
         const bench_step = b.step("bench", "Run benchmarks");
         bench_step.dependOn(&bench_run.step);
 
-        const bench_shapes_mod = b.createModule(.{
+        const bench_shapes_mod = createModule(b, .{
             .root_source_file = b.path("benchmarks/metal_q8_shapes.zig"),
             .target = target,
             .optimize = .ReleaseFast,
@@ -739,24 +908,23 @@ pub fn build(b: *std.Build) void {
             .flags = &.{"-fobjc-arc"},
         });
         bench_shapes_mod.addIncludePath(b.path("src/metal"));
+        addMetalBindings(b, target, bench_shapes_mod);
         bench_shapes_mod.linkFramework("Metal", .{});
         bench_shapes_mod.linkFramework("Foundation", .{});
 
-        const bench_shapes_exe = b.addExecutable(.{
+        const bench_shapes_exe = addExecutable(b, .{
             .name = "zinc-bench-metal-shapes",
             .root_module = bench_shapes_mod,
         });
         b.installArtifact(bench_shapes_exe);
 
         const bench_shapes_run = b.addRunArtifact(bench_shapes_exe);
-        if (b.args) |args| {
-            bench_shapes_run.addArgs(args);
-        }
+        bench_shapes_run.addPassthruArgs();
 
         const bench_metal_shapes_step = b.step("bench-metal-shapes", "Run exact-shape Metal q8 hot benchmarks (ReleaseFast)");
         bench_metal_shapes_step.dependOn(&bench_shapes_run.step);
 
-        const bench_gemm_q4k_mod = b.createModule(.{
+        const bench_gemm_q4k_mod = createModule(b, .{
             .root_source_file = b.path("benchmarks/metal_gemm_q4k.zig"),
             .target = target,
             .optimize = .ReleaseFast,
@@ -768,24 +936,23 @@ pub fn build(b: *std.Build) void {
             .flags = &.{"-fobjc-arc"},
         });
         bench_gemm_q4k_mod.addIncludePath(b.path("src/metal"));
+        addMetalBindings(b, target, bench_gemm_q4k_mod);
         bench_gemm_q4k_mod.linkFramework("Metal", .{});
         bench_gemm_q4k_mod.linkFramework("Foundation", .{});
 
-        const bench_gemm_q4k_exe = b.addExecutable(.{
+        const bench_gemm_q4k_exe = addExecutable(b, .{
             .name = "zinc-bench-metal-gemm-q4k",
             .root_module = bench_gemm_q4k_mod,
         });
         b.installArtifact(bench_gemm_q4k_exe);
 
         const bench_gemm_q4k_run = b.addRunArtifact(bench_gemm_q4k_exe);
-        if (b.args) |args| {
-            bench_gemm_q4k_run.addArgs(args);
-        }
+        bench_gemm_q4k_run.addPassthruArgs();
 
         const bench_gemm_q4k_step = b.step("bench-metal-gemm-q4k", "Run gemm_q4k microbenchmark (ReleaseFast)");
         bench_gemm_q4k_step.dependOn(&bench_gemm_q4k_run.step);
 
-        const bench_dmmv_q4k_mod = b.createModule(.{
+        const bench_dmmv_q4k_mod = createModule(b, .{
             .root_source_file = b.path("benchmarks/metal_dmmv_q4k.zig"),
             .target = target,
             .optimize = .ReleaseFast,
@@ -797,26 +964,25 @@ pub fn build(b: *std.Build) void {
             .flags = &.{"-fobjc-arc"},
         });
         bench_dmmv_q4k_mod.addIncludePath(b.path("src/metal"));
+        addMetalBindings(b, target, bench_dmmv_q4k_mod);
         bench_dmmv_q4k_mod.linkFramework("Metal", .{});
         bench_dmmv_q4k_mod.linkFramework("Foundation", .{});
 
-        const bench_dmmv_q4k_exe = b.addExecutable(.{
+        const bench_dmmv_q4k_exe = addExecutable(b, .{
             .name = "zinc-bench-metal-dmmv-q4k",
             .root_module = bench_dmmv_q4k_mod,
         });
         b.installArtifact(bench_dmmv_q4k_exe);
 
         const bench_dmmv_q4k_run = b.addRunArtifact(bench_dmmv_q4k_exe);
-        if (b.args) |args| {
-            bench_dmmv_q4k_run.addArgs(args);
-        }
+        bench_dmmv_q4k_run.addPassthruArgs();
 
         const bench_dmmv_q4k_step = b.step("bench-metal-dmmv-q4k", "Run dmmv_q4k decode microbenchmark (ReleaseFast)");
         bench_dmmv_q4k_step.dependOn(&bench_dmmv_q4k_run.step);
     }
 
     // --- Unit tests ---
-    const test_mod = b.createModule(.{
+    const test_mod = createModule(b, .{
         .root_source_file = b.path(if (selected_backend == .zinc_rt) "src/zinc_rt/test_root.zig" else "src/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -834,6 +1000,7 @@ pub fn build(b: *std.Build) void {
             .flags = &.{"-fobjc-arc"},
         });
         test_mod.addIncludePath(b.path("src/metal"));
+        addMetalBindings(b, target, test_mod);
         test_mod.linkFramework("Metal", .{});
         test_mod.linkFramework("Foundation", .{});
     } else if (selected_backend == .cuda) {
@@ -844,24 +1011,33 @@ pub fn build(b: *std.Build) void {
         configureVulkanModule(b, target, test_mod);
     }
 
-    const unit_tests = b.addTest(.{
+    const unit_tests = addTest(b, .{
         .root_module = test_mod,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
-    const zinc_rt_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/zinc_rt/test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    zinc_rt_test_mod.addImport("gguf", zinc_rt_gguf_mod);
-    zinc_rt_test_mod.addImport("zinc_rt", zinc_rt_lib_mod);
-    zinc_rt_test_mod.addImport("forward_zinc_rt", forward_zinc_rt_mod);
-    const zinc_rt_unit_tests = b.addTest(.{
+    const zinc_rt_unit_tests = addTest(b, .{
         .name = "zinc-rt-ir-smoke",
-        .root_module = zinc_rt_test_mod,
+        .root_module = zinc_rt_lib_mod,
     });
     const run_zinc_rt_unit_tests = b.addRunArtifact(zinc_rt_unit_tests);
+    const forward_zinc_rt_tests = addTest(b, .{
+        .name = "zinc-rt-forward-tests",
+        .root_module = forward_zinc_rt_mod,
+    });
+    const run_forward_zinc_rt_tests = b.addRunArtifact(forward_zinc_rt_tests);
+    const host_io_tests = addTest(b, .{
+        .name = "host-io-tests",
+        .root_module = b.modules.get("host_io").?,
+    });
+    const run_host_io_tests = b.addRunArtifact(host_io_tests);
+
+    // Compile Metal tests on a workstation without opening a GPU or a model.
+    const test_build_step = b.step("test-build", "Compile all Zig tests without executing them");
+    test_build_step.dependOn(&unit_tests.step);
+    test_build_step.dependOn(&zinc_rt_unit_tests.step);
+    test_build_step.dependOn(&forward_zinc_rt_tests.step);
+    test_build_step.dependOn(&host_io_tests.step);
     // In partial mode (`full_tests = false`) restrict `bun test` to the
     // fast unit-test files. The slow `tests/test_qwen_smoke.test.ts`
     // file launches multiple managed servers and loads four GGUFs
@@ -886,6 +1062,7 @@ pub fn build(b: *std.Build) void {
     run_bun_tests.setCwd(b.path("."));
     addBunDirToPath(b, run_bun_tests, bun_exe);
     run_bun_tests.setEnvironmentVariable("ZINC_REQUIRE_FULL_TESTS", if (full_tests) "1" else "0");
+    run_bun_tests.setEnvironmentVariable("ZINC_REQUIRE_STRUCT_LAYOUTS", "1");
     // Keep implement_metal.ts prompt tests deterministic under the outer
     // optimization harness. Those tests construct Qwen/Gemma states directly,
     // so parent-process model and metric env must not decide their branch.
@@ -908,6 +1085,8 @@ pub fn build(b: *std.Build) void {
     print_summary.setEnvironmentVariable("ZINC_REQUIRE_FULL_TESTS", if (full_tests) "1" else "0");
     print_summary.step.dependOn(&run_unit_tests.step);
     print_summary.step.dependOn(&run_zinc_rt_unit_tests.step);
+    print_summary.step.dependOn(&run_forward_zinc_rt_tests.step);
+    print_summary.step.dependOn(&run_host_io_tests.step);
     print_summary.step.dependOn(&run_bun_tests.step);
 
     const test_step = b.step("test", "Run unit tests");

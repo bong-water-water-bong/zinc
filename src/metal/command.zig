@@ -5,13 +5,14 @@
 //! mode so higher-level inference code can stay backend-agnostic.
 //! @section Metal Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 const shim = @import("c.zig").shim;
 const MetalBuffer = @import("buffer.zig").MetalBuffer;
 const MetalPipeline = @import("pipeline.zig").MetalPipeline;
 const kernel_timing = @import("kernel_timing.zig");
 
 inline fn timingStart() i128 {
-    return if (kernel_timing.enabled) std.time.nanoTimestamp() else 0;
+    return if (kernel_timing.enabled) host_io.nanoTimestamp() else 0;
 }
 
 inline fn timingFinish(cmd: *MetalCommand, pipe: *const MetalPipeline, t_start: i128) void {
@@ -22,7 +23,7 @@ inline fn timingFinish(cmd: *MetalCommand, pipe: *const MetalPipeline, t_start: 
     // Restart implies an implicit GPU sync; reflect it in barrier accounting so
     // the next `barrier()` call no-ops as expected.
     cmd.last_barrier_dispatch_count = cmd.dispatch_count;
-    const elapsed_i = std.time.nanoTimestamp() - t_start;
+    const elapsed_i = host_io.nanoTimestamp() - t_start;
     const elapsed_ns: u64 = if (elapsed_i < 0) 0 else @intCast(elapsed_i);
     const label = if (cmd.timing_label) |timing_label| timing_label else pipe.name;
     kernel_timing.record(@ptrCast(pipe.handle), label, elapsed_ns);
@@ -320,7 +321,7 @@ pub fn beginCommand(ctx: ?*shim.MetalCtx) !MetalCommand {
 
 /// Allocate a command buffer using the requested encoder/barrier policy.
 pub fn beginCommandWithMode(ctx: ?*shim.MetalCtx, mode: CommandEncoderMode) !MetalCommand {
-    const handle = shim.mtl_begin_command_mode(ctx, @intFromEnum(mode));
+    const handle = shim.mtl_begin_command_mode(ctx, @backingInt(mode));
     if (handle == null) return error.MetalCommandBufferFailed;
     return .{
         .handle = handle,

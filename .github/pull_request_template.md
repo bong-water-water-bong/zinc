@@ -4,9 +4,9 @@ Describe the change in 2-5 sentences. Focus on what changed and why.
 
 ## Validation
 
-- [ ] `zig build test`
+- [ ] `./scripts/zig.sh build test`
 - [ ] `bun test` (if relevant)
-- [ ] `zig build` (if relevant)
+- [ ] `./scripts/zig.sh build` (if relevant)
 
 Commands and noteworthy output:
 

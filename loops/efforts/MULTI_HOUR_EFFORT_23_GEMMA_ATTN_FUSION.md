@@ -32,7 +32,7 @@ of small dispatches remain.
 
 ## Hard rules (from memory — violating wastes the cycle)
 - **Build:** isolated caches ALWAYS — `ZIG_LOCAL_CACHE_DIR=/tmp/lc-$RANDOM
-  ZIG_GLOBAL_CACHE_DIR=/tmp/gc-$RANDOM ~/zig-0.15.2/zig build cuda-dbg
+  ZIG_GLOBAL_CACHE_DIR=/tmp/gc-$RANDOM ./scripts/zig.sh build cuda-dbg
   -Dbackend=cuda -Dshaders=false`; verify the binary hash CHANGED.
 - **Do NOT async gemma** (boost-saturated; regression). Fusion only.
 - **4090-pinned** (`GPU-e59a6fce-…`); isolated box dir (`~/zinc-e23`), never

@@ -1,5 +1,6 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
+import { unified } from '@astrojs/markdown-remark';
 import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
 import remarkMath from 'remark-math';
@@ -16,11 +17,10 @@ const docsDirectory = resolve(repoRoot, 'docs');
 
 function gitLastmod(relativeSourcePath, fallback) {
   try {
-    const value = execFileSync(
-      'git',
-      ['log', '-1', '--format=%aI', '--', relativeSourcePath],
-      { cwd: repoRoot, encoding: 'utf8' },
-    ).trim();
+    const value = execFileSync('git', ['log', '-1', '--format=%aI', '--', relativeSourcePath], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+    }).trim();
 
     if (value) return value;
   } catch {
@@ -55,6 +55,8 @@ const latestDocLastmod = [...docLastmods.values()].filter(Boolean).sort().at(-1)
 
 export default defineConfig({
   site: 'https://zolotukhin.ai',
+  // Preserve spaces between inline elements when upgrading to Astro 7.
+  compressHTML: true,
   integrations: [
     mdx(),
     sitemap({
@@ -75,7 +77,10 @@ export default defineConfig({
           return { ...item, lastmod: latestDocLastmod };
         }
 
-        if (latestPostLastmod && (pathname === '/' || pathname === '/blog/' || pathname.startsWith('/topics/'))) {
+        if (
+          latestPostLastmod &&
+          (pathname === '/' || pathname === '/blog/' || pathname.startsWith('/topics/'))
+        ) {
           return { ...item, lastmod: latestPostLastmod };
         }
 
@@ -84,8 +89,10 @@ export default defineConfig({
     }),
   ],
   markdown: {
-    remarkPlugins: [remarkMath],
-    rehypePlugins: [rehypeKatex],
+    processor: unified({
+      remarkPlugins: [remarkMath],
+      rehypePlugins: [rehypeKatex],
+    }),
     shikiConfig: {
       defaultColor: 'light',
       themes: {
@@ -93,6 +100,7 @@ export default defineConfig({
         dark: 'vitesse-dark',
       },
       langs: ['zig', 'glsl', 'json', 'bash', 'typescript', 'c'],
+      langAlias: { metal: 'cpp' },
     },
   },
 });

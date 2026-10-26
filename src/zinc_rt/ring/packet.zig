@@ -271,7 +271,7 @@ pub const PacketBuilder = struct {
 
     fn publishPkt3Header(self: *PacketBuilder, start: usize, opcode: Opcode, body_dwords: u32) void {
         const count = body_dwords - 1;
-        const header = (@as(u32, 3) << 30) | ((count & 0x3fff) << 16) | (@as(u32, @intFromEnum(opcode)) << 8);
+        const header = (@as(u32, 3) << 30) | ((count & 0x3fff) << 16) | (@as(u32, @backingInt(opcode)) << 8);
         const header_ptr: *volatile u32 = @ptrCast(&self.words[start]);
         header_ptr.* = header;
     }
@@ -292,7 +292,7 @@ pub fn hi32(value: u64) u32 {
 }
 
 test "packet builder emits PM4 type-3 dispatch packet" {
-    var words = [_]u32{0} ** 8;
+    var words = @as([8]u32, @splat(0));
     var builder = PacketBuilder.init(&words);
     try builder.dispatchDirect(7, 2, 1);
 
@@ -306,7 +306,7 @@ test "packet builder emits PM4 type-3 dispatch packet" {
 }
 
 test "packet builder emits contiguous user data register writes" {
-    var words = [_]u32{0} ** 8;
+    var words = @as([8]u32, @splat(0));
     var builder = PacketBuilder.init(&words);
     try builder.setUserData64(4, 0x11223344_aabbccdd);
 
@@ -319,7 +319,7 @@ test "packet builder emits contiguous user data register writes" {
 }
 
 test "packet builder emits write-data memory signal" {
-    var words = [_]u32{0} ** 8;
+    var words = @as([8]u32, @splat(0));
     var builder = PacketBuilder.init(&words);
     try builder.writeData64(0x11223344_aabbccdd, 0x01020304_05060708);
 
@@ -334,7 +334,7 @@ test "packet builder emits write-data memory signal" {
 }
 
 test "packet builder emits release-mem eop signal" {
-    var words = [_]u32{0} ** 8;
+    var words = @as([8]u32, @splat(0));
     var builder = PacketBuilder.init(&words);
     try builder.releaseMemSignal(0x11223344_aabbccdd, 0x01020304_05060708);
 
@@ -351,7 +351,7 @@ test "packet builder emits release-mem eop signal" {
 }
 
 test "packet builder emits copy-data memory to memory dword" {
-    var words = [_]u32{0} ** 8;
+    var words = @as([8]u32, @splat(0));
     var builder = PacketBuilder.init(&words);
     try builder.copyData32(0x1000_0040, 0x1000_0080);
 
@@ -366,13 +366,13 @@ test "packet builder emits copy-data memory to memory dword" {
 }
 
 test "packet builder reports fixed buffer exhaustion" {
-    var words = [_]u32{0} ** 2;
+    var words = @as([2]u32, @splat(0));
     var builder = PacketBuilder.init(&words);
     try std.testing.expectError(error.OutOfSpace, builder.dispatchDirect(1, 1, 1));
 }
 
 test "packet builder pads to dword alignment with valid NOP packets" {
-    var words = [_]u32{0} ** 16;
+    var words = @as([16]u32, @splat(0));
     var builder = PacketBuilder.init(&words);
     try builder.dispatchDirect(1, 1, 1);
     try builder.padToAlignment(4);

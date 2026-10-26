@@ -109,7 +109,10 @@ const EXCLUDED_MODULES = new Set(['vulkan/vk.zig', 'regression_tests.zig']);
 // so adding a new gguf-using file doesn't silently re-break struct extraction
 // for every other module (Zig errors on the first failing @import in the
 // analyzer's compilation, taking down all the others with it).
-const STRUCT_EXTRACTOR_TAINTED_IMPORTS = new Set(['gguf', 'zinc_rt', 'forward_zinc_rt']);
+const STRUCT_EXTRACTOR_TAINTED_IMPORTS = new Set([
+  'gguf', 'zinc_rt', 'forward_zinc_rt',
+  ...(process.platform === 'darwin' ? ['vulkan_c'] : []),
+]);
 
 const ZIG_IMPORT_RE = /@import\(\s*"([^"]+)"\s*\)/g;
 
@@ -171,17 +174,16 @@ function computeStructExtractorExcluded(fileContents: Map<string, string>): Set<
     }
   }
 
-  // The CUDA backend subtree reaches `cuda/c.zig`'s `@cImport(@cInclude("cuda_shim.h"))`,
-  // whose CUDA-toolkit headers exist only on the NVIDIA build box, so `zig run`
-  // against the standalone analyzer cannot compile it off-box. Exclude `src/cuda/*`
+  // CUDA implementation modules need toolkit headers from the NVIDIA build
+  // box. Exclude them from the host-only documentation probe
   // DIRECTLY rather than seeding it into the BFS above: every cuda import outside
   // the subtree (e.g. in `gpu/interface.zig`) sits behind a comptime-dead
   // `if (is_cuda)` branch on the analyzer host, so those importers still compile
   // and must stay analyzable — feeding cuda through the BFS would wrongly taint
-  // the whole backend abstraction. The Metal `c.zig` is unaffected: its `shim.h`
-  // resolves via the analyzer's `-I src/metal` include path.
+  // the whole backend abstraction. Metal's portable C header is translated by
+  // the analyzer build target without loading the Metal runtime.
   for (const path of importsByFile.keys()) {
-    if (path.startsWith('src/cuda/')) excluded.add(path);
+    if (path.startsWith('src/cuda/') || /(?:^|\/)\w*cuda\w*\.zig$/.test(path)) excluded.add(path);
   }
 
   return excluded;
@@ -944,7 +946,6 @@ async function collectZigFiles(directory: string, prefix = ''): Promise<string[]
     }
 
     if (!entry.isFile() || !entry.name.endsWith('.zig')) continue;
-    if (EXCLUDED_MODULES.has(relativePath)) continue;
     results.push(relativePath);
   }
 
@@ -1198,11 +1199,14 @@ async function loadZigApiImpl(): Promise<ZigApiIndex> {
       stat(absolutePath),
     ]);
     latestMtime = Math.max(latestMtime, fileStat.mtimeMs);
+    // Import closure needs private binding modules too, even when their API
+    // is deliberately omitted from the published documentation.
+    fileContents.set(`src/${relativePath}`, content);
+    if (EXCLUDED_MODULES.has(relativePath)) continue;
 
     const parsed = parseZigModuleContent(content, relativePath);
     if (parsed) {
       modules.push(parsed);
-      fileContents.set(parsed.sourcePath, content);
     }
   }
 
@@ -1221,6 +1225,11 @@ async function loadZigApiImpl(): Promise<ZigApiIndex> {
   if (structSymbols.length > 0) {
     const structModulePaths = [...new Set(structSymbols.map(s => s.modulePath))];
     const zigScriptContent = `const std = @import("std");
+const host_io = @import("host_io");
+
+fn dumpField(w: *std.Io.Writer, field_name: []const u8, type_name: []const u8, size: usize, alignment: usize, offset: usize) !void {
+    try w.print("{{\\"name\\":\\"{s}\\",\\"type\\":\\"{s}\\",\\"size\\":{d},\\"alignment\\":{d},\\"offset\\":{d}}}", .{ field_name, type_name, size, alignment, offset });
+}
 
 fn dumpStruct(comptime T: type, name: []const u8, first: *bool, w: anytype) !void {
     const type_info = @typeInfo(T);
@@ -1232,12 +1241,10 @@ fn dumpStruct(comptime T: type, name: []const u8, first: *bool, w: anytype) !voi
     try w.print("\\"size\\":{d},\\"alignment\\":{d},\\"fields\\":[", .{ @sizeOf(T), @alignOf(T) });
     
     var firstField = true;
-    inline for (type_info.@"struct".fields) |f| {
-        if (@sizeOf(f.type) > 0 and !f.is_comptime) {
+    inline for (type_info.@"struct".field_names, type_info.@"struct".field_types, type_info.@"struct".field_attrs) |field_name, FieldType, attrs| {
+        if (!attrs.@"comptime" and @sizeOf(FieldType) > 0) {
             if (!firstField) try w.print(",", .{});
-            try w.print("{{\\"name\\":\\"{s}\\",\\"type\\":\\"{s}\\",\\"size\\":{d},\\"alignment\\":{d},\\"offset\\":{d}}}", .{
-                f.name, @typeName(f.type), @sizeOf(f.type), f.alignment, @offsetOf(T, f.name)
-            });
+            try dumpField(w, field_name, @typeName(FieldType), @sizeOf(FieldType), attrs.@"align" orelse @alignOf(FieldType), @offsetOf(T, field_name));
             firstField = false;
         }
     }
@@ -1246,7 +1253,7 @@ fn dumpStruct(comptime T: type, name: []const u8, first: *bool, w: anytype) !voi
 
 pub fn main() !void {
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
     const out = &stdout.interface;
     try out.print("{{", .{});
     var first = true;
@@ -1262,7 +1269,10 @@ ${structSymbols.map((s) => {
     try out.flush();
 }
 
-${structModulePaths.map((path, idx) => `const mod${idx} = @import("../${path.replace(/^src\//, '')}");`).join('\n')}
+${structModulePaths.map((path, idx) => {
+  const target = path === 'src/host_io.zig' ? 'host_io' : `../${path.replace(/^src\//, '')}`;
+  return `const mod${idx} = @import("${target}");`;
+}).join('\n')}
 `;
 
     const { mkdir, writeFile } = await import('node:fs/promises');
@@ -1272,48 +1282,21 @@ ${structModulePaths.map((path, idx) => `const mod${idx} = @import("../${path.rep
 
     const cacheRoot = join(REPO_ROOT, 'src', '.zig-api-cache');
     const scriptPath = join(cacheRoot, 'zig-struct-analyzer.generated.zig');
-    const runnerPath = join(REPO_ROOT, 'src', 'zig-struct-analyzer.zig');
-    const globalCache = join(cacheRoot, 'global');
     const localCache = join(cacheRoot, 'local');
-    await mkdir(globalCache, { recursive: true });
     await mkdir(localCache, { recursive: true });
     if (!existsSync(scriptPath) || (await readFile(scriptPath, 'utf-8')) !== zigScriptContent) {
       await writeFile(scriptPath, zigScriptContent, 'utf-8');
     }
 
     try {
-      const zigArgs = ['run', '-lc'];
-      const libcConfigPath = join(REPO_ROOT, '.build-support', 'libc.conf');
-      if (existsSync(libcConfigPath)) {
-        zigArgs.push('--libc', libcConfigPath);
-      }
-      zigArgs.push('-I', join(REPO_ROOT, 'src', 'metal'));
+      const zigArgs = ['build', 'analyze-structs', '-Dshaders=false', '--summary', 'none'];
 
-      if (process.platform === 'darwin') {
-        zigArgs.push('-I', '/opt/homebrew/include', '-L', '/opt/homebrew/lib', '-lvulkan');
-      } else if (process.platform === 'win32') {
-        const vulkanSdk = process.env.VULKAN_SDK ?? process.env.VK_SDK_PATH;
-        if (vulkanSdk) {
-          zigArgs.push(
-            '-I',
-            join(vulkanSdk, 'Include'),
-            '-L',
-            join(vulkanSdk, process.arch === 'ia32' ? 'Lib32' : 'Lib'),
-            '-lvulkan-1'
-          );
-        }
-      } else {
-        zigArgs.push('-lvulkan');
-      }
-
-      zigArgs.push(runnerPath);
-
-      const { stdout } = await execFileAsync('zig', zigArgs, {
+      const { stdout } = await execFileAsync(join(REPO_ROOT, 'scripts', 'zig.sh'), zigArgs, {
         cwd: REPO_ROOT,
         maxBuffer: 10 * 1024 * 1024,
+        timeout: 90_000,
         env: {
           ...process.env,
-          ZIG_GLOBAL_CACHE_DIR: globalCache,
           ZIG_LOCAL_CACHE_DIR: localCache,
         },
       });

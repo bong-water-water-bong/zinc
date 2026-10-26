@@ -3,6 +3,7 @@
 //! Implements byte-pair encoding directly in Zig using the tokenizer tables
 //! embedded in GGUF model files, eliminating external tokenizer dependencies.
 const std = @import("std");
+const host_io = @import("host_io");
 const gguf = @import("gguf.zig");
 const tool_format_mod = @import("../server/tool_format.zig");
 
@@ -62,7 +63,7 @@ fn buildEndOfGenerationIds(
     eos_id: u32,
     eot_id: ?u32,
 ) ![]u32 {
-    var ids: std.ArrayList(u32) = .{};
+    var ids: std.ArrayList(u32) = .empty;
     errdefer ids.deinit(allocator);
     for (end_of_generation_token_texts) |text| {
         if (token_to_id.get(text)) |id| try appendUniqueId(&ids, allocator, id);
@@ -136,7 +137,7 @@ pub const Tokenizer = struct {
         legacy,
         gpt2_ascii,
         gemma4_bpe,
-        /// Reference `llama4` pretokenizer regex (Muse Glimmer). Differs from
+        /// Reference `gpt-4o`/`llama4` pretokenizer regex (GPT-OSS/Muse Glimmer). Differs from
         /// gpt2_ascii in newline-absorbing punctuation runs, 3-digit caps,
         /// symbol-prefixed words, suffix contractions, and case splitting.
         llama4,
@@ -206,7 +207,7 @@ pub const Tokenizer = struct {
         }
 
         // Read BPE merges if available
-        var merges_list: std.ArrayListAligned(Merge, null) = .{};
+        var merges_list: std.ArrayListAligned(Merge, null) = .empty;
         errdefer merges_list.deinit(allocator);
 
         var special_token_mask: ?[]bool = null;
@@ -301,7 +302,7 @@ pub const Tokenizer = struct {
         if (chat_template) |tmpl| log.debug("Chat template: {d} chars", .{tmpl.len});
         const pretokenizer: Pretokenizer = if (std.mem.eql(u8, model_type, "gemma4") or std.mem.eql(u8, pre_name, "gemma4"))
             .gemma4_bpe
-        else if (std.mem.eql(u8, pre_name, "llama4") and merges_list.items.len > 0)
+        else if ((std.mem.eql(u8, pre_name, "llama4") or std.mem.eql(u8, pre_name, "gpt-4o")) and merges_list.items.len > 0)
             .llama4
         else if (scores == null and merges_list.items.len > 0 and isQwen35LikeName(pre_name))
             .qwen35
@@ -329,7 +330,7 @@ pub const Tokenizer = struct {
             merge_ranks.deinit();
         }
         try merge_ranks.ensureTotalCapacity(@intCast(merges_owned.len));
-        var key_buf: std.ArrayList(u8) = .{};
+        var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(allocator);
         for (merges_owned) |merge| {
             key_buf.clearRetainingCapacity();
@@ -342,7 +343,7 @@ pub const Tokenizer = struct {
 
         const eog_ids = try buildEndOfGenerationIds(allocator, &token_to_id, eos_id, eot_id);
 
-        return Tokenizer{
+        var tokenizer = Tokenizer{
             .vocab = vocab,
             .token_to_id = token_to_id,
             .merges = merges_owned,
@@ -351,7 +352,7 @@ pub const Tokenizer = struct {
             .eos_id = eos_id,
             .eot_id = eot_id,
             // Gemma 4 always starts with BOS, whatever add_bos_token says
-            // (the reference tokenizer overrides it too, llama.cpp PR 21500).
+            // (the reference tokenizer overrides it too; upstream PR 21500).
             .prepend_bos = prepend_bos or (pretokenizer == .gemma4_bpe and bos_id != null),
             .add_eos_token = add_eos_token,
             .chat_template = chat_template,
@@ -363,6 +364,8 @@ pub const Tokenizer = struct {
             .merge_ranks_ready = true,
             .allocator = allocator,
         };
+        tokenizer.normalizeSpecialTokenTypes();
+        return tokenizer;
     }
 
     /// GPT-2 byte-to-unicode mapping. Maps each raw byte to a Unicode character.
@@ -413,10 +416,20 @@ pub const Tokenizer = struct {
         if (text.len == 0) return try self.allocator.alloc(u32, 0);
 
         // Start with GPT-2 byte-level encoding: each raw byte maps to a Unicode char
-        var symbols: std.ArrayList([]const u8) = .{};
+        var symbols: std.ArrayList([]const u8) = .empty;
         defer symbols.deinit(self.allocator);
+        try symbols.ensureTotalCapacity(self.allocator, text.len);
 
-        var owned_symbols: std.ArrayList([]u8) = .{};
+        // All initial symbols live through the merge pass. Store their bytes
+        // together instead of allocating and freeing each character separately.
+        // A normalized space needs three bytes; every other initial symbol
+        // needs at most three bytes per input byte.
+        const initial_capacity = std.math.mul(usize, text.len, 3) catch return error.OutOfMemory;
+        const initial_bytes = try self.allocator.alloc(u8, initial_capacity);
+        defer self.allocator.free(initial_bytes);
+        var initial_end: usize = 0;
+
+        var owned_symbols: std.ArrayList([]u8) = .empty;
         defer {
             for (owned_symbols.items) |sym| self.allocator.free(sym);
             owned_symbols.deinit(self.allocator);
@@ -429,31 +442,31 @@ pub const Tokenizer = struct {
             var pos: usize = 0;
             while (pos < text.len) {
                 if (text[pos] == ' ') {
-                    const copy = try self.allocator.alloc(u8, 3);
+                    const copy = initial_bytes[initial_end..][0..3];
+                    initial_end += 3;
                     copy[0] = 0xE2;
                     copy[1] = 0x96;
                     copy[2] = 0x81;
-                    try owned_symbols.append(self.allocator, copy);
-                    try symbols.append(self.allocator, copy);
+                    symbols.appendAssumeCapacity(copy);
                     pos += 1;
                     continue;
                 }
 
                 const seq_len = @min(utf8SequenceLength(text[pos]), text.len - pos);
-                const copy = try self.allocator.alloc(u8, seq_len);
+                const copy = initial_bytes[initial_end..][0..seq_len];
+                initial_end += seq_len;
                 @memcpy(copy, text[pos .. pos + seq_len]);
-                try owned_symbols.append(self.allocator, copy);
-                try symbols.append(self.allocator, copy);
+                symbols.appendAssumeCapacity(copy);
                 pos += seq_len;
             }
         } else {
             for (text) |byte| {
                 const unicode_char = gpt2ByteToUnicode(byte);
                 const len: usize = if (unicode_char[0] < 0x80) 1 else if (unicode_char[0] < 0xE0) 2 else 3;
-                const copy = try self.allocator.alloc(u8, len);
+                const copy = initial_bytes[initial_end..][0..len];
+                initial_end += len;
                 @memcpy(copy, unicode_char[0..len]);
-                try owned_symbols.append(self.allocator, copy);
-                try symbols.append(self.allocator, copy);
+                symbols.appendAssumeCapacity(copy);
             }
         }
 
@@ -463,14 +476,14 @@ pub const Tokenizer = struct {
         // became " ref" + "riger" + "ator").
         if (self.merges.len > 0) {
             // GPT-2/tiktoken-style merge ranks.
-            try self.applyMerges(&symbols, &owned_symbols);
+            try self.applyMerges(&symbols);
         } else if (self.scores != null) {
             // SentencePiece-style scored piece merges.
             try self.applySentencePieceMerges(&symbols, &owned_symbols);
         }
 
         // Convert symbol strings to token IDs
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(self.allocator);
 
         for (symbols.items) |sym| {
@@ -520,109 +533,99 @@ pub const Tokenizer = struct {
         return byte >= 'a' and byte <= 'z';
     }
 
-    /// ASCII implementation of the reference `llama4` pretokenizer regex
-    /// (Muse Glimmer et al.):
-    ///   [^\r\n\p{L}\p{N}]?[upper]*[lower]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
-    /// | [^\r\n\p{L}\p{N}]?[upper]+[lower]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
-    /// | \p{N}{1,3}
-    /// |  ?[^\s\p{L}\p{N}]+[\r\n/]*
-    /// | \s*[\r\n]+
-    /// | \s+(?!\S)
-    /// | \s+
-    /// Key differences from the GPT-2 chunker: an optional single leading
-    /// symbol glues to the following word, contractions are a SUFFIX of the
-    /// word chunk (not a separate chunk), letter runs split at interior
-    /// case boundaries (camelCase -> 'camel','Case'), digit runs cap at 3,
-    /// and punctuation runs absorb trailing newlines/slashes (".\n" is ONE
-    /// pretoken -> BPE 335, where the GPT-2 chunker yields '.'+'\n').
-    /// Non-ASCII bytes (>= 0x80) are treated as word characters so UTF-8
-    /// letters stay in one chunk (approximation; exact for ASCII text).
+    /// Reference GPT-4o/Llama4 regex, using the same Unicode letter classes
+    /// as the reference executable expression: upper = letter outside a-z,
+    /// lower = letter outside A-Z. Non-ASCII letters can belong to both.
     fn nextLlama4PretokenChunk(text: []const u8, pos: *usize) []const u8 {
         if (pos.* >= text.len) return text[text.len..text.len];
-
         const start = pos.*;
-        var i = start;
-        const c0 = text[i];
-
-        const isWordByte = struct {
-            fn f(b: u8) bool {
-                return isAsciiLetter(b) or b >= 0x80;
+        const first = qwenDecode(text, start);
+        const after_first = start + first.len;
+        const Classes = struct {
+            fn upper(cp: u32) bool {
+                return qwenIsLetter(cp) and !(cp >= 'a' and cp <= 'z');
             }
-        }.f;
-
-        // Word alternatives: optional single non-newline symbol prefix, then
-        // upper*lower+ | upper+lower* (ASCII case split), then optional
-        // contraction suffix.
-        const has_prefix = !isWordByte(c0) and !isAsciiDigit(c0) and c0 != '\r' and c0 != '\n' and
-            i + 1 < text.len and isWordByte(text[i + 1]);
-        if (isWordByte(c0) or has_prefix) {
-            if (has_prefix) i += 1;
-            // upper run, then lower/other-word run (non-ASCII bytes count as
-            // lowercase-ish continuation so multi-byte letters don't split).
-            var j = i;
-            while (j < text.len and isAsciiUpper(text[j])) : (j += 1) {}
-            var k = j;
-            while (k < text.len and (isAsciiLower(text[k]) or text[k] >= 0x80)) : (k += 1) {}
-            if (k == i) {
-                // No letters after the prefix (can't happen: guarded above).
-                i += 1;
-                pos.* = i;
-                return text[start..i];
+            fn lower(cp: u32) bool {
+                return qwenIsLetter(cp) and !(cp >= 'A' and cp <= 'Z');
             }
-            // upper*lower+ preferred; if no lowers followed, keep the upper run.
-            i = if (k > j) k else j;
-            const suffix_len = matchAsciiContraction(text, i);
-            i += suffix_len;
+            fn symbol(cp: u32) bool {
+                return !qwenIsSpace(cp) and !qwenIsLetter(cp) and !qwenIsNumber(cp);
+            }
+        };
+
+        // Optional single non-newline, non-letter, non-number prefix, then
+        // upper*lower+ | upper+lower*, followed by a contraction suffix.
+        const has_prefix = !qwenIsLetter(first.cp) and !qwenIsNumber(first.cp) and
+            first.cp != '\r' and first.cp != '\n' and after_first < text.len and
+            qwenIsLetter(qwenDecode(text, after_first).cp);
+        if (qwenIsLetter(first.cp) or has_prefix) {
+            var i = if (has_prefix) after_first else start;
+            var last_lower_end: ?usize = null;
+            while (i < text.len) {
+                const cp = qwenDecode(text, i);
+                if (!Classes.upper(cp.cp)) break;
+                i += cp.len;
+                if (Classes.lower(cp.cp)) last_lower_end = i;
+            }
+            const upper_end = i;
+            while (i < text.len) {
+                const cp = qwenDecode(text, i);
+                if (!Classes.lower(cp.cp)) break;
+                i += cp.len;
+            }
+            if (i == upper_end) {
+                // The first alternative takes priority. Backtrack the greedy
+                // upper run to its last lower-compatible code point, if any.
+                i = last_lower_end orelse upper_end;
+            }
+            i += matchAsciiContraction(text, i);
             pos.* = i;
             return text[start..i];
         }
 
-        // \p{N}{1,3}
-        if (isAsciiDigit(c0)) {
-            i += 1;
-            var count: usize = 1;
-            while (i < text.len and count < 3 and isAsciiDigit(text[i])) : (i += 1) {
-                count += 1;
+        // Unicode numbers, at most three code points per chunk.
+        if (qwenIsNumber(first.cp)) {
+            var i = start;
+            var count: usize = 0;
+            while (i < text.len and count < 3) : (count += 1) {
+                const cp = qwenDecode(text, i);
+                if (!qwenIsNumber(cp.cp)) break;
+                i += cp.len;
             }
             pos.* = i;
             return text[start..i];
         }
 
-        const isSym = struct {
-            fn f(b: u8) bool {
-                return !isAsciiSpace(b) and !isAsciiLetter(b) and !isAsciiDigit(b) and b < 0x80;
+        // Optional ASCII space, punctuation/symbols, trailing newlines/slashes.
+        if (Classes.symbol(first.cp) or (first.cp == ' ' and after_first < text.len and
+            Classes.symbol(qwenDecode(text, after_first).cp)))
+        {
+            var i = if (first.cp == ' ') after_first else start;
+            while (i < text.len) {
+                const cp = qwenDecode(text, i);
+                if (!Classes.symbol(cp.cp)) break;
+                i += cp.len;
             }
-        }.f;
-
-        //  ?[^\s\p{L}\p{N}]+[\r\n/]*
-        if (isSym(c0) or (c0 == ' ' and i + 1 < text.len and isSym(text[i + 1]))) {
-            if (c0 == ' ') i += 1;
-            while (i < text.len and isSym(text[i])) : (i += 1) {}
             while (i < text.len and (text[i] == '\r' or text[i] == '\n' or text[i] == '/')) : (i += 1) {}
             pos.* = i;
             return text[start..i];
         }
 
-        // Whitespace classes. Scan the maximal run first.
-        var j = i;
-        var last_nl: ?usize = null;
-        while (j < text.len and isAsciiSpace(text[j])) : (j += 1) {
-            if (text[j] == '\r' or text[j] == '\n') last_nl = j;
+        // Whitespace through the last newline; otherwise leave one complete
+        // whitespace code point for the next word, unless at end of text.
+        var i = start;
+        var last_space_start = start;
+        var last_newline_end: ?usize = null;
+        while (i < text.len) {
+            const cp = qwenDecode(text, i);
+            if (!qwenIsSpace(cp.cp)) break;
+            last_space_start = i;
+            i += cp.len;
+            if (cp.cp == '\r' or cp.cp == '\n') last_newline_end = i;
         }
-        if (last_nl) |nl| {
-            // \s*[\r\n]+ : consume through the last newline of the run.
-            pos.* = nl + 1;
-            return text[start .. nl + 1];
-        }
-        if (j == text.len or j - i == 1) {
-            // \s+(?!\S) at end-of-text, or a single space/tab before a
-            // non-space (the word/punct alternatives above didn't want it).
-            pos.* = j;
-            return text[start..j];
-        }
-        // \s+(?!\S): leave the final space for the next chunk.
-        pos.* = j - 1;
-        return text[start .. j - 1];
+        pos.* = last_newline_end orelse
+            (if (i == text.len or last_space_start == start) i else last_space_start);
+        return text[start..pos.*];
     }
 
     fn nextGpt2PretokenChunk(text: []const u8, pos: *usize) []const u8 {
@@ -844,7 +847,7 @@ pub const Tokenizer = struct {
     pub fn encode(self: *const Tokenizer, text: []const u8) ![]u32 {
         if (text.len == 0) return try self.allocator.alloc(u32, 0);
         if (self.pretokenizer == .gemma4_bpe) {
-            var tokens: std.ArrayList(u32) = .{};
+            var tokens: std.ArrayList(u32) = .empty;
             errdefer tokens.deinit(self.allocator);
 
             var pos: usize = 0;
@@ -852,9 +855,14 @@ pub const Tokenizer = struct {
                 const chunk = nextGemma4PretokenChunk(text, &pos);
                 if (chunk.len == 0) break;
 
-                if (self.token_to_id.get(chunk)) |id| {
-                    try tokens.append(self.allocator, id);
-                    continue;
+                // The reference's direct-vocabulary shortcut is only for
+                // newline runs. Other whole-chunk vocabulary entries still
+                // require their BPE merges (notably ordinary Gemma </s>).
+                if (chunk[0] == '\n') {
+                    if (self.token_to_id.get(chunk)) |id| {
+                        try tokens.append(self.allocator, id);
+                        continue;
+                    }
                 }
 
                 const chunk_tokens = try self.encodeChunk(chunk);
@@ -868,7 +876,7 @@ pub const Tokenizer = struct {
             return self.encodeChunk(text);
         }
 
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(self.allocator);
 
         var pos: usize = 0;
@@ -928,13 +936,39 @@ pub const Tokenizer = struct {
         return self.encodeWithSpecialTokens(text, allocator);
     }
 
+    /// Apply reference token-type overrides once, before scanning any prompts.
+    fn normalizeSpecialTokenTypes(self: *Tokenizer) void {
+        const mask = self.special_token_mask orelse return;
+        if (self.eos_id < mask.len) mask[self.eos_id] = true;
+        if (self.bos_id) |id| if (id < mask.len) {
+            mask[id] = true;
+        };
+        if (self.eot_id) |id| if (id < mask.len) {
+            mask[id] = true;
+        };
+        // A recognized end marker stays special even if the reference removes
+        // it from the EOG set, as with GPT-OSS's message-closing <|end|>.
+        for (end_of_generation_token_texts) |text| {
+            if (self.token_to_id.get(text)) |id| if (id < mask.len) {
+                mask[id] = true;
+            };
+        }
+        // Gemma/PaddleOCR override </s> back to NORMAL after promoting end
+        // markers. Its original GGUF type may be CONTROL, so excluding it
+        // from eog_ids alone does not make special-token scanning correct.
+        if (self.token_to_id.contains("<|tool_response>")) {
+            if (self.token_to_id.get("</s>")) |id| if (id < mask.len) {
+                mask[id] = false;
+            };
+        }
+    }
+
     /// Whether a vocabulary match for a `<...>` marker counts as a special token.
-    /// Qwen-family vocabularies hold ordinary BPE tokens shaped like markers
-    /// (`<?>`, `<()>`), which the reference tokenizer encodes as text, so those
-    /// pretokenizers accept only control, user-defined and unknown tokens.
+    /// Vocabularies can hold ordinary BPE tokens shaped like markers (`<>`,
+    /// `<?>`, `<()>`). Every pretokenizer uses the normalized token-type mask
+    /// to distinguish these from control, user-defined and unknown tokens.
     fn acceptsSpecialMarker(self: *const Tokenizer, id: u32) bool {
         const mask = self.special_token_mask orelse return true;
-        if (self.pretokenizer != .qwen35 and self.pretokenizer != .qwen2) return true;
         return id < mask.len and mask[id];
     }
 
@@ -960,7 +994,7 @@ pub const Tokenizer = struct {
             return out;
         }
 
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(allocator);
 
         // `pos` is the start of text not yet encoded; `scan` is where the search
@@ -1030,8 +1064,111 @@ pub const Tokenizer = struct {
         return try tokens.toOwnedSlice(allocator);
     }
 
+    /// Initial symbols are consecutive slices of encodeChunk's byte buffer.
+    /// A merge can extend the left slice without copying or owning new bytes.
+    fn joinedSymbols(left: []const u8, right: []const u8) []const u8 {
+        std.debug.assert(@intFromPtr(left.ptr) + left.len == @intFromPtr(right.ptr));
+        return left.ptr[0 .. left.len + right.len];
+    }
+
+    const MergeKey = struct {
+        small: [256]u8 = undefined,
+        large: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *MergeKey, allocator: std.mem.Allocator) void {
+            self.large.deinit(allocator);
+        }
+
+        fn rank(self: *MergeKey, allocator: std.mem.Allocator, ranks: *const std.StringHashMap(u32), left: []const u8, right: []const u8) !?u32 {
+            const len = try std.math.add(usize, left.len + right.len, 1);
+            const key = if (len <= self.small.len) self.small[0..len] else blk: {
+                try self.large.resize(allocator, len);
+                break :blk self.large.items;
+            };
+            @memcpy(key[0..left.len], left);
+            key[left.len] = ' ';
+            @memcpy(key[left.len + 1 ..], right);
+            return ranks.get(key);
+        }
+    };
+
+    const MergeCandidate = struct {
+        rank: u32,
+        left: usize,
+        right: usize,
+        len: usize,
+
+        fn order(_: void, a: MergeCandidate, b: MergeCandidate) std.math.Order {
+            const rank_order = std.math.order(a.rank, b.rank);
+            // The full scan chooses the leftmost pair on equal ranks. Original
+            // symbol positions remain ordered even after intermediate removals.
+            return if (rank_order == .eq) std.math.order(a.left, b.left) else rank_order;
+        }
+    };
+
+    const MergeQueue = std.PriorityQueue(MergeCandidate, void, MergeCandidate.order);
+    const MergeLinks = struct { prev: usize, next: usize };
+    const merge_queue_threshold = 32;
+
+    fn queueMerge(self: *const Tokenizer, ranks: *const std.StringHashMap(u32), key: *MergeKey, queue: *MergeQueue, symbols: []const []const u8, left: usize, right: usize) !void {
+        if (try key.rank(self.allocator, ranks, symbols[left], symbols[right])) |rank| {
+            // maxInt was the old scan's sentinel, so it is never merged.
+            if (rank == std.math.maxInt(u32)) return;
+            try queue.push(self.allocator, .{
+                .rank = rank,
+                .left = left,
+                .right = right,
+                .len = symbols[left].len + symbols[right].len,
+            });
+        }
+    }
+
+    /// Revisit only the two pairs affected by a merge. Old heap entries are
+    /// discarded when their symbols are no longer adjacent or have grown.
+    fn applyQueuedMerges(self: *const Tokenizer, symbols: *std.ArrayList([]const u8), ranks: *const std.StringHashMap(u32), key: *MergeKey) !void {
+        const end = symbols.items.len;
+        var queue: MergeQueue = .empty;
+        defer queue.deinit(self.allocator);
+        for (0..end - 1) |left| {
+            try self.queueMerge(ranks, key, &queue, symbols.items, left, left + 1);
+        }
+        if (queue.count() == 0) return;
+
+        const links = try self.allocator.alloc(MergeLinks, end);
+        defer self.allocator.free(links);
+        for (links, 0..) |*link, i| {
+            link.* = .{ .prev = if (i == 0) end else i - 1, .next = i + 1 };
+        }
+
+        while (queue.pop()) |candidate| {
+            const left = candidate.left;
+            const right = candidate.right;
+            const a = symbols.items[left];
+            const b = symbols.items[right];
+            if (a.len == 0 or b.len == 0 or links[left].next != right or a.len + b.len != candidate.len) continue;
+
+            symbols.items[left] = joinedSymbols(a, b);
+            symbols.items[right].len = 0;
+            const prev = links[left].prev;
+            const next = links[right].next;
+            links[left].next = next;
+            if (next != end) links[next].prev = left;
+            if (prev != end) try self.queueMerge(ranks, key, &queue, symbols.items, prev, left);
+            if (next != end) try self.queueMerge(ranks, key, &queue, symbols.items, left, next);
+        }
+
+        var count: usize = 0;
+        for (symbols.items) |symbol| {
+            if (symbol.len == 0) continue;
+            symbols.items[count] = symbol;
+            count += 1;
+        }
+        symbols.items.len = count;
+    }
+
     /// Apply BPE merges in priority order (GPT-2/tiktoken style).
-    fn applyMerges(self: *const Tokenizer, symbols: *std.ArrayList([]const u8), owned_symbols: *std.ArrayList([]u8)) !void {
+    fn applyMerges(self: *const Tokenizer, symbols: *std.ArrayList([]const u8)) !void {
+        if (symbols.items.len < 2) return;
         // Rank lookup is precomputed once at init and shared across every BPE
         // encode call — see Tokenizer.merge_ranks for the rationale.
         const merge_ranks = if (self.merge_ranks_ready) &self.merge_ranks else blk: {
@@ -1049,7 +1186,7 @@ pub const Tokenizer = struct {
         const ranks_ptr: *const std.StringHashMap(u32) = merge_ranks orelse blk: {
             fallback_ranks = std.StringHashMap(u32).init(self.allocator);
             fallback_owned = true;
-            var kb: std.ArrayList(u8) = .{};
+            var kb: std.ArrayList(u8) = .empty;
             defer kb.deinit(self.allocator);
             for (self.merges) |merge| {
                 kb.clearRetainingCapacity();
@@ -1057,14 +1194,22 @@ pub const Tokenizer = struct {
                 try kb.append(self.allocator, ' ');
                 try kb.appendSlice(self.allocator, merge.second);
                 const key_copy = try self.allocator.dupe(u8, kb.items);
-                try fallback_ranks.put(key_copy, merge.rank);
+                errdefer self.allocator.free(key_copy);
+                const entry = try fallback_ranks.getOrPut(key_copy);
+                if (entry.found_existing) self.allocator.free(key_copy);
+                entry.value_ptr.* = merge.rank;
             }
             break :blk &fallback_ranks;
         };
 
-        // Pre-allocate merge key buffer
-        var key_buf: std.ArrayList(u8) = .{};
+        var key_buf: MergeKey = .{};
         defer key_buf.deinit(self.allocator);
+
+        // Most word chunks are short enough that a scan is cheaper than a
+        // heap. Gemma paragraphs and long words avoid quadratic rescanning.
+        if (symbols.items.len > merge_queue_threshold) {
+            return self.applyQueuedMerges(symbols, ranks_ptr, &key_buf);
+        }
 
         // Repeatedly find and apply the highest-priority (lowest rank) merge
         while (symbols.items.len > 1) {
@@ -1073,12 +1218,7 @@ pub const Tokenizer = struct {
 
             // Find the pair with the lowest merge rank
             for (0..symbols.items.len - 1) |pos| {
-                key_buf.clearRetainingCapacity();
-                try key_buf.appendSlice(self.allocator, symbols.items[pos]);
-                try key_buf.append(self.allocator, ' ');
-                try key_buf.appendSlice(self.allocator, symbols.items[pos + 1]);
-
-                if (ranks_ptr.get(key_buf.items)) |rank| {
+                if (try key_buf.rank(self.allocator, ranks_ptr, symbols.items[pos], symbols.items[pos + 1])) |rank| {
                     if (rank < best_rank) {
                         best_rank = rank;
                         best_pos = pos;
@@ -1088,16 +1228,7 @@ pub const Tokenizer = struct {
 
             if (best_rank == std.math.maxInt(u32)) break; // No more merges possible
 
-            // Merge the pair: concatenate symbols[best_pos] and symbols[best_pos+1]
-            const old_left = symbols.items[best_pos];
-            const old_right = symbols.items[best_pos + 1];
-            const merged = try std.mem.concat(self.allocator, u8, &.{
-                old_left,
-                old_right,
-            });
-            try owned_symbols.append(self.allocator, merged);
-
-            symbols.items[best_pos] = merged;
+            symbols.items[best_pos] = joinedSymbols(symbols.items[best_pos], symbols.items[best_pos + 1]);
             _ = symbols.orderedRemove(best_pos + 1);
         }
     }
@@ -1336,7 +1467,7 @@ pub const Tokenizer = struct {
     }
 
     fn currentUtcDate(buf: *[10]u8) []const u8 {
-        const now: i64 = std.time.timestamp();
+        const now: i64 = host_io.timestamp();
         const seconds: u64 = @intCast(@max(now, 0));
         const year_day = (std.time.epoch.EpochSeconds{ .secs = seconds }).getEpochDay().calculateYearDay();
         const month_day = year_day.calculateMonthDay();
@@ -1352,7 +1483,7 @@ pub const Tokenizer = struct {
         var wrote_any = false;
         while (src_pos < text.len) {
             if (std.mem.indexOfPos(u8, text, src_pos, "<|channel>")) |open_idx| {
-                const chunk = if (wrote_any) text[src_pos..open_idx] else std.mem.trimLeft(u8, text[src_pos..open_idx], " \t\r\n");
+                const chunk = if (wrote_any) text[src_pos..open_idx] else std.mem.trimStart(u8, text[src_pos..open_idx], " \t\r\n");
                 if (pos.* + chunk.len > dst.len) return error.BufferTooSmall;
                 @memcpy(dst[pos.*..][0..chunk.len], chunk);
                 pos.* += chunk.len;
@@ -1364,7 +1495,7 @@ pub const Tokenizer = struct {
                     break;
                 }
             } else {
-                const chunk = if (wrote_any) std.mem.trimRight(u8, text[src_pos..], " \t\r\n") else std.mem.trim(u8, text[src_pos..], " \t\r\n");
+                const chunk = if (wrote_any) std.mem.trimEnd(u8, text[src_pos..], " \t\r\n") else std.mem.trim(u8, text[src_pos..], " \t\r\n");
                 if (pos.* + chunk.len > dst.len) return error.BufferTooSmall;
                 @memcpy(dst[pos.*..][0..chunk.len], chunk);
                 pos.* += chunk.len;
@@ -1438,7 +1569,7 @@ pub const Tokenizer = struct {
                             pos += open.len;
                         }
 
-                        var trbuf: std.ArrayList(u8) = .{};
+                        var trbuf: std.ArrayList(u8) = .empty;
                         defer trbuf.deinit(tool_alloc);
                         try options.tool_format.?.renderToolResultMessage("", contents[i], &trbuf, tool_alloc);
                         if (pos + trbuf.items.len > buf.len) return error.BufferTooSmall;
@@ -1454,14 +1585,16 @@ pub const Tokenizer = struct {
                         continue;
                     }
 
-                    const header = std.fmt.bufPrint(buf[pos..], "<|im_start|>{s}\n{s}", .{ roles[i], contents[i] }) catch return error.BufferTooSmall;
+                    const prepend_tools = !tools_rendered and options.tools.len > 0 and options.tool_format != null and
+                        options.tool_format.?.native_xml and (std.mem.eql(u8, roles[i], "system") or std.mem.eql(u8, roles[i], "developer"));
+                    const header = std.fmt.bufPrint(buf[pos..], "<|im_start|>{s}\n{s}", .{ roles[i], if (prepend_tools) @as([]const u8, "") else contents[i] }) catch return error.BufferTooSmall;
                     pos += header.len;
 
                     // Inject tool definitions into the first system/developer message.
                     if (!tools_rendered and options.tools.len > 0 and options.tool_format != null and
                         (std.mem.eql(u8, roles[i], "system") or std.mem.eql(u8, roles[i], "developer")))
                     {
-                        var tool_buf: std.ArrayList(u8) = .{};
+                        var tool_buf: std.ArrayList(u8) = .empty;
                         defer tool_buf.deinit(tool_alloc);
                         try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, tool_alloc);
                         if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
@@ -1473,6 +1606,10 @@ pub const Tokenizer = struct {
                             @memcpy(buf[pos .. pos + required.len], required);
                             pos += required.len;
                         }
+                        if (prepend_tools) {
+                            const tail = std.fmt.bufPrint(buf[pos..], "\n\n{s}", .{contents[i]}) catch return error.BufferTooSmall;
+                            pos += tail.len;
+                        }
                         tools_rendered = true;
                     }
 
@@ -1483,7 +1620,7 @@ pub const Tokenizer = struct {
                 if (!tools_rendered and options.tools.len > 0 and options.tool_format != null) {
                     const open = std.fmt.bufPrint(buf[pos..], "<|im_start|>system", .{}) catch return error.BufferTooSmall;
                     pos += open.len;
-                    var tool_buf: std.ArrayList(u8) = .{};
+                    var tool_buf: std.ArrayList(u8) = .empty;
                     defer tool_buf.deinit(tool_alloc);
                     try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, tool_alloc);
                     if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
@@ -1627,8 +1764,8 @@ pub const Tokenizer = struct {
                         // "Reasoning effort" -> "Reasoning strength" normalize +
                         // containment check.
                         const has_reasoning_directive =
-                            std.ascii.indexOfIgnoreCase(contents[i], "reasoning strength") != null or
-                            std.ascii.indexOfIgnoreCase(contents[i], "reasoning effort") != null;
+                            std.ascii.findIgnoreCase(contents[i], "reasoning strength") != null or
+                            std.ascii.findIgnoreCase(contents[i], "reasoning effort") != null;
                         const written = std.fmt.bufPrint(
                             buf[pos..],
                             "<|start|>system<|message|>{s}{s}{s}",
@@ -1775,7 +1912,7 @@ test "initFromGGUF populates merge_ranks cache when merges are present" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1810,7 +1947,7 @@ test "initFromGGUF omits BOS for qwen35 family (no BOS in GGUF)" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1840,7 +1977,7 @@ test "initFromGGUF omits BOS and uses BPE for qwen3_5 aliases" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1877,7 +2014,7 @@ test "initFromGGUF omits BOS for gpt-oss prompts by default" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1907,7 +2044,7 @@ test "initFromGGUF prepends BOS for gemma4 even when add_bos_token=false" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1938,7 +2075,7 @@ test "initFromGGUF respects gemma4 add_bos_token=true" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -2169,6 +2306,47 @@ test "llama4 pretokenizer matches Muse Glimmer ASCII chunk boundaries" {
         try std.testing.expectEqualStrings(want, Tokenizer.nextLlama4PretokenChunk(input, &pos));
     }
     try std.testing.expectEqual(input.len, pos);
+}
+
+test "GPT4o and Llama4 Unicode chunks match the reference regex" {
+    const Case = struct { input: []const u8, chunks: []const []const u8 };
+    const Fixture = struct { pattern: []const u8, cases: []const Case };
+    const fixture = try std.json.parseFromSlice(Fixture, std.testing.allocator, @embedFile("fixtures/gpt4o-chunks.json"), .{});
+    defer fixture.deinit();
+    for (fixture.value.cases) |case| {
+        var pos: usize = 0;
+        for (case.chunks) |expected| {
+            try std.testing.expectEqualStrings(expected, Tokenizer.nextLlama4PretokenChunk(case.input, &pos));
+        }
+        try std.testing.expectEqual(case.input.len, pos);
+    }
+}
+
+test "initFromGGUF selects the shared GPT4o splitter for both pretokenizer names" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "gpt-4o", "llama4" }) |pre| {
+        var gf = gguf.GGUFFile{
+            .version = .v3,
+            .tensor_count = 0,
+            .metadata = .{},
+            .tensors = .empty,
+            .tensor_data_offset = 0,
+            .allocator = allocator,
+        };
+        defer gf.deinit();
+        const names = [_][]const u8{ "a", "b", "ab" };
+        const tokens = try allocator.alloc(gguf.MetadataValue, names.len);
+        for (names, 0..) |name, i| tokens[i] = .{ .string = try allocator.dupe(u8, name) };
+        try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.tokens"), .{ .array = tokens });
+        const merges = try allocator.alloc(gguf.MetadataValue, 1);
+        merges[0] = .{ .string = try allocator.dupe(u8, "a b") };
+        try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.merges"), .{ .array = merges });
+        try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.model"), .{ .string = try allocator.dupe(u8, "gpt2") });
+        try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.pre"), .{ .string = try allocator.dupe(u8, pre) });
+        var tok = try Tokenizer.initFromGGUF(&gf, allocator);
+        defer tok.deinit();
+        try std.testing.expectEqual(Tokenizer.Pretokenizer.llama4, tok.pretokenizer);
+    }
 }
 
 test "special token id falls back to the vocabulary" {
@@ -2458,6 +2636,200 @@ test "applyChatTemplate empty messages" {
     try std.testing.expectEqualStrings("<|im_start|>assistant\n", result);
 }
 
+/// Independent copy of the original full scan, including copied merge bytes.
+/// Compare complete pieces so rank ties and stale queue entries cannot hide
+/// behind equivalent decoded text or a token hash.
+fn expectRankedMergesMatchScan(allocator: std.mem.Allocator, text: []const u8, ranks: *const std.StringHashMap(u32)) !void {
+    var actual: std.ArrayList([]const u8) = .empty;
+    defer actual.deinit(allocator);
+    var expected: std.ArrayList([]const u8) = .empty;
+    defer expected.deinit(allocator);
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |piece| allocator.free(piece);
+        owned.deinit(allocator);
+    }
+    for (0..text.len) |i| {
+        try actual.append(allocator, text[i .. i + 1]);
+        try expected.append(allocator, text[i .. i + 1]);
+    }
+    var tok = Tokenizer{
+        .vocab = &.{},
+        .token_to_id = std.StringHashMap(u32).init(allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 0,
+        .prepend_bos = false,
+        .merge_ranks = ranks.*,
+        .merge_ranks_ready = true,
+        .allocator = allocator,
+    };
+    try tok.applyMerges(&actual);
+
+    var key: std.ArrayList(u8) = .empty;
+    defer key.deinit(allocator);
+    while (expected.items.len > 1) {
+        var best_rank: u32 = std.math.maxInt(u32);
+        var best_pos: usize = 0;
+        for (0..expected.items.len - 1) |i| {
+            key.clearRetainingCapacity();
+            try key.appendSlice(allocator, expected.items[i]);
+            try key.append(allocator, ' ');
+            try key.appendSlice(allocator, expected.items[i + 1]);
+            if (ranks.get(key.items)) |rank| {
+                if (rank < best_rank) {
+                    best_rank = rank;
+                    best_pos = i;
+                }
+            }
+        }
+        if (best_rank == std.math.maxInt(u32)) break;
+        const merged = try std.mem.concat(allocator, u8, &.{ expected.items[best_pos], expected.items[best_pos + 1] });
+        errdefer allocator.free(merged);
+        try owned.append(allocator, merged);
+        expected.items[best_pos] = merged;
+        _ = expected.orderedRemove(best_pos + 1);
+    }
+    try std.testing.expectEqual(expected.items.len, actual.items.len);
+    for (expected.items, actual.items) |a, b| try std.testing.expectEqualStrings(a, b);
+}
+
+test "ranked merges preserve leftmost ties and invalidate overlapping pairs" {
+    var ranks = std.StringHashMap(u32).init(std.testing.allocator);
+    defer ranks.deinit();
+    try ranks.put("a a", 0);
+    try ranks.put("a b", 0);
+    try ranks.put("b a", 0);
+    try ranks.put("b c", 0);
+    try ranks.put("aa a", 1);
+    try ranks.put("a ab", 1);
+    try ranks.put("aa aa", 2);
+    try ranks.put("ab a", 2);
+    try ranks.put("c a", std.math.maxInt(u32));
+    const cases = [_][]const u8{
+        "",                                                                  "a",                                                                 "aaaaaaa", "aabcaba", "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    };
+    for (cases) |text| try expectRankedMergesMatchScan(std.testing.allocator, text, &ranks);
+}
+
+test "ranked merges match full scan on randomized rules and inputs" {
+    const allocator = std.testing.allocator;
+    var ranks = std.StringHashMap(u32).init(allocator);
+    defer {
+        var it = ranks.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        ranks.deinit();
+    }
+    var rng = std.Random.DefaultPrng.init(0x4d4552474553);
+    const random = rng.random();
+    var word: [5]u8 = undefined;
+    var combinations: usize = 1;
+    // Include every split of many overlapping pieces, with repeated ranks.
+    for (1..word.len + 1) |len| {
+        combinations *= 3;
+        for (0..combinations) |code| {
+            var remaining = code;
+            for (word[0..len]) |*byte| {
+                byte.* = 'a' + @as(u8, @intCast(remaining % 3));
+                remaining /= 3;
+            }
+            for (1..len) |split| {
+                if (random.boolean()) continue;
+                const key = try std.mem.concat(allocator, u8, &.{ word[0..split], " ", word[split..len] });
+                errdefer allocator.free(key);
+                try ranks.put(key, random.uintLessThan(u32, 16));
+            }
+        }
+    }
+    var text: [160]u8 = undefined;
+    for (0..128) |trial| {
+        const len = if (trial <= Tokenizer.merge_queue_threshold + 1) trial else random.uintLessThan(usize, text.len + 1);
+        for (text[0..len]) |*byte| byte.* = 'a' + random.uintLessThan(u8, 3);
+        try expectRankedMergesMatchScan(allocator, text[0..len], &ranks);
+    }
+}
+
+fn checkMergeAllocationFailures(allocator: std.mem.Allocator, ranks: *const std.StringHashMap(u32), text: []const u8) !void {
+    var symbols: std.ArrayList([]const u8) = .empty;
+    defer symbols.deinit(allocator);
+    for (0..text.len) |i| try symbols.append(allocator, text[i .. i + 1]);
+    var tok = Tokenizer{
+        .vocab = &.{},
+        .token_to_id = std.StringHashMap(u32).init(allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 0,
+        .prepend_bos = false,
+        .merge_ranks = ranks.*,
+        .merge_ranks_ready = true,
+        .allocator = allocator,
+    };
+    try tok.applyMerges(&symbols);
+    try std.testing.expectEqual(@as(usize, 1), symbols.items.len);
+    try std.testing.expectEqualStrings(text, symbols.items[0]);
+}
+
+test "ranked merges handle large keys and clean up every allocation failure" {
+    const allocator = std.testing.allocator;
+    var ranks = std.StringHashMap(u32).init(allocator);
+    defer {
+        var it = ranks.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        ranks.deinit();
+    }
+    const text: [1024]u8 = @splat('a');
+    var len: usize = 1;
+    while (len < text.len) : (len *= 2) {
+        const key = try std.mem.concat(allocator, u8, &.{ text[0..len], " ", text[0..len] });
+        errdefer allocator.free(key);
+        try ranks.put(key, @intCast(len));
+    }
+    try expectRankedMergesMatchScan(allocator, &text, &ranks);
+    // Force growth through allocation so in-place resize availability cannot
+    // change which failure index is exercised between runs.
+    var no_resize = std.testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), checkMergeAllocationFailures, .{ &ranks, &text });
+}
+
+fn checkEncodeMergeAllocationFailures(allocator: std.mem.Allocator, source: Tokenizer, text: []const u8) !void {
+    var tok = source;
+    tok.allocator = allocator;
+    const ids = try tok.encodePrompt(text, allocator);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{1}, ids);
+}
+
+test "prompt encoding cleans up queued merges and fallback ranks on allocation failure" {
+    const allocator = std.testing.allocator;
+    const text: [1024]u8 = @splat('a');
+    var merges: [11]Tokenizer.Merge = undefined;
+    var len: usize = 1;
+    for (merges[0..10]) |*merge| {
+        merge.* = .{ .first = text[0..len], .second = text[0..len], .rank = @intCast(len) };
+        len *= 2;
+    }
+    // Duplicate pair keys must retain the last rank without leaking a key.
+    merges[10] = merges[0];
+    var tok = Tokenizer{
+        .vocab = &.{ "a", &text },
+        .token_to_id = std.StringHashMap(u32).init(allocator),
+        .merges = &merges,
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 0,
+        .prepend_bos = false,
+        .allocator = allocator,
+    };
+    defer tok.token_to_id.deinit();
+    try tok.token_to_id.put("a", 0);
+    try tok.token_to_id.put(&text, 1);
+    var no_resize = std.testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), checkEncodeMergeAllocationFailures, .{ tok, &text });
+}
+
 test "encode frees temporary buffers for BPE merges" {
     const vocab = [_][]const u8{ "h", "i", "hi" };
     const merges = [_]Tokenizer.Merge{.{
@@ -2546,6 +2918,61 @@ test "encode gemma4_bpe normalizes spaces to ▁ before BPE merges" {
     try std.testing.expectEqualSlices(u32, &.{4}, tokens);
 }
 
+test "Gemma ordinary angle-bracket tokens stay in the surrounding BPE text" {
+    const allocator = std.testing.allocator;
+    const vocab = [_][]const u8{ "▁", "<", ">", "&", "<>", "▁<", ">&", "<bos>" };
+    const merges = [_]Tokenizer.Merge{
+        .{ .first = "▁", .second = "<", .rank = 0 },
+        .{ .first = ">", .second = "&", .rank = 1 },
+        .{ .first = "<", .second = ">", .rank = 2 },
+    };
+    var special: [vocab.len]bool = @splat(false);
+    special[7] = true;
+    var tok = Tokenizer{
+        .vocab = &vocab,
+        .token_to_id = std.StringHashMap(u32).init(allocator),
+        .merges = &merges,
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 0,
+        .prepend_bos = false,
+        .pretokenizer = .gemma4_bpe,
+        .special_token_mask = &special,
+        .allocator = allocator,
+    };
+    defer tok.token_to_id.deinit();
+    for (vocab, 0..) |piece, i| try tok.token_to_id.put(piece, @intCast(i));
+    const ids = try tok.encodePrompt("<bos> <>&", allocator);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 5, 6 }, ids);
+}
+
+test "declared and inferred special IDs override ordinary token types" {
+    const allocator = std.testing.allocator;
+    const vocab = [_][]const u8{ "<bos>", "<eos>", "<turn|>", "</s>" };
+    var special: [vocab.len]bool = @splat(false);
+    var tok = Tokenizer{
+        .vocab = &vocab,
+        .token_to_id = std.StringHashMap(u32).init(allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = 0,
+        .eos_id = 1,
+        .eot_id = 2,
+        .eog_ids = &.{3},
+        .prepend_bos = true,
+        .pretokenizer = .gemma4_bpe,
+        .special_token_mask = &special,
+        .allocator = allocator,
+    };
+    defer tok.token_to_id.deinit();
+    for (vocab, 0..) |piece, i| try tok.token_to_id.put(piece, @intCast(i));
+    tok.normalizeSpecialTokenTypes();
+    const ids = try tok.encodePrompt("<bos><eos><turn|></s>", allocator);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, ids);
+}
+
 test "encode gemma4_bpe keeps newline runs as direct tokens when present" {
     const vocab = [_][]const u8{ "\n\n", "\n", "a" };
     const merges = [_]Tokenizer.Merge{};
@@ -2570,6 +2997,27 @@ test "encode gemma4_bpe keeps newline runs as direct tokens when present" {
     defer std.testing.allocator.free(tokens);
 
     try std.testing.expectEqualSlices(u32, &.{0}, tokens);
+}
+
+test "encode gemma4_bpe applies merges to ordinary whole vocabulary chunks" {
+    const allocator = std.testing.allocator;
+    const vocab = [_][]const u8{ "<", "/", "s", ">", "</s>" };
+    var tok = Tokenizer{
+        .vocab = &vocab,
+        .token_to_id = std.StringHashMap(u32).init(allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 0,
+        .prepend_bos = false,
+        .pretokenizer = .gemma4_bpe,
+        .allocator = allocator,
+    };
+    defer tok.token_to_id.deinit();
+    for (vocab, 0..) |piece, i| try tok.token_to_id.put(piece, @intCast(i));
+    const ids = try tok.encode("</s>");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, ids);
 }
 
 test "encode gemma4_bpe merges by rank even when token scores exist" {
@@ -2894,9 +3342,9 @@ test "encodeWithSpecialTokens keeps a non-special < in the surrounding BPE text"
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 3, 0, 1 }, tokens);
 }
 
-test "qwen35 special-marker scan skips ordinary tokens shaped like markers" {
-    const vocab = [_][]const u8{ "<", "?", ">", "<?>", "<think>" };
-    var mask = [_]bool{ false, false, false, false, true };
+test "special-marker scan skips ordinary markers for every pretokenizer" {
+    const vocab = [_][]const u8{ "<", "?", ">", "<?>", "<think>", "x" };
+    var mask = [_]bool{ false, false, false, false, true, false };
     var tok = Tokenizer{
         .vocab = &vocab,
         .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
@@ -2912,11 +3360,14 @@ test "qwen35 special-marker scan skips ordinary tokens shaped like markers" {
     defer tok.token_to_id.deinit();
     for (vocab, 0..) |piece, i| try tok.token_to_id.put(piece, @intCast(i));
 
-    const tokens = try tok.encodeWithSpecialTokens("<?><think>", std.testing.allocator);
-    defer std.testing.allocator.free(tokens);
-    // `<?>` is an ordinary token: it goes through BPE (no merges here, so one
-    // token per byte); `<think>` is user-defined and maps directly.
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 4 }, tokens);
+    inline for (std.meta.tags(Tokenizer.Pretokenizer)) |pretokenizer| {
+        tok.pretokenizer = pretokenizer;
+        const tokens = try tok.encodeWithSpecialTokens("<?>x<think>", std.testing.allocator);
+        defer std.testing.allocator.free(tokens);
+        // Ordinary `<?>` stays with the following text and goes through BPE;
+        // `<think>` is user-defined and maps directly for every tokenizer.
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 5, 4 }, tokens);
+    }
 }
 
 test "initFromGGUF builds the reference end-of-generation set" {
@@ -2926,19 +3377,22 @@ test "initFromGGUF builds the reference end-of-generation set" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
     defer gf.deinit();
 
-    const names = [_][]const u8{ "<|im_end|>", "<|endoftext|>", "a", "<|end|>", "<|return|>", "<|call|>" };
+    const names = [_][]const u8{ "<|im_end|>", "<|endoftext|>", "a", "<|end|>", "<|return|>", "<|call|>", "</s>", "<|tool_response>" };
     const tokens = try allocator.alloc(gguf.MetadataValue, names.len);
     for (names, 0..) |name, i| tokens[i] = .{ .string = try allocator.dupe(u8, name) };
     try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.tokens"), .{ .array = tokens });
-    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.model"), .{ .string = try allocator.dupe(u8, "gpt2") });
-    try gf.metadata.put(allocator, try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "qwen35") });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.model"), .{ .string = try allocator.dupe(u8, "gemma4") });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "gemma4") });
     try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.eos_token_id"), .{ .uint32 = 0 });
+    const types = try allocator.alloc(gguf.MetadataValue, names.len);
+    for (types, 0..) |*value, i| value.* = .{ .int32 = if (i == 6) 3 else 1 };
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.token_type"), .{ .array = types });
 
     var tok = try Tokenizer.initFromGGUF(&gf, allocator);
     defer tok.deinit();
@@ -2949,4 +3403,11 @@ test "initFromGGUF builds the reference end-of-generation set" {
     try std.testing.expect(!tok.isEndOfGeneration(3)); // <|end|> with <|return|> + <|call|>
     try std.testing.expect(tok.isEndOfGeneration(4)); // <|return|>
     try std.testing.expect(tok.isEndOfGeneration(5)); // <|call|>
+    try std.testing.expect(!tok.isEndOfGeneration(6)); // </s> is ordinary here
+    try std.testing.expect(tok.isEndOfGeneration(7)); // <|tool_response>
+    try std.testing.expect(tok.acceptsSpecialMarker(0)); // declared EOS
+    try std.testing.expect(tok.acceptsSpecialMarker(1)); // promoted end marker
+    try std.testing.expect(!tok.acceptsSpecialMarker(2)); // ordinary vocabulary
+    try std.testing.expect(tok.acceptsSpecialMarker(3)); // special but not EOG
+    try std.testing.expect(!tok.acceptsSpecialMarker(6)); // CONTROL overridden to NORMAL
 }

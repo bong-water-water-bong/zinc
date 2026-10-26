@@ -5,6 +5,7 @@
 //! boundary. The old no-layer tail remains as a smoke fallback for unsupported
 //! shapes.
 const std = @import("std");
+const host_io = @import("host_io");
 const gguf = @import("gguf");
 const zinc_rt = @import("zinc_rt");
 const ring = zinc_rt.ring;
@@ -21,7 +22,7 @@ const log = std.log.scoped(.zinc_rt_forward);
 pub const m0_max_decode_tokens_default: u32 = 8;
 
 fn m0MaxDecodeTokens() u32 {
-    if (std.posix.getenv("ZINC_RT_MAX_DECODE_TOKENS")) |raw| {
+    if (host_io.getenv("ZINC_RT_MAX_DECODE_TOKENS")) |raw| {
         if (std.fmt.parseInt(u32, raw, 10) catch null) |parsed| {
             if (parsed > 0) return parsed;
         }
@@ -39,7 +40,7 @@ fn fullForwardMaxDecodeTokensForEnv(requested: u32, raw_override: ?[]const u8) u
 }
 
 fn fullForwardMaxDecodeTokens(requested: u32) u32 {
-    return fullForwardMaxDecodeTokensForEnv(requested, std.posix.getenv("ZINC_RT_MAX_DECODE_TOKENS"));
+    return fullForwardMaxDecodeTokensForEnv(requested, host_io.getenv("ZINC_RT_MAX_DECODE_TOKENS"));
 }
 
 const WeightView = struct {
@@ -56,7 +57,7 @@ const WeightView = struct {
 /// the underlying bytes too.
 pub const Model = struct {
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    file: std.Io.File,
     mmap_data: []align(std.heap.page_size_min) const u8,
     gguf_file: gguf.GGUFFile,
     config: CpuModelConfig,
@@ -130,14 +131,14 @@ pub const Model = struct {
     /// unreadable, the tensors don't match the expected shapes, or the GGUF
     /// metadata is malformed.
     pub fn load(path: []const u8, allocator: std.mem.Allocator) !Model {
-        const file = try std.fs.cwd().openFile(path, .{});
-        errdefer file.close();
+        const file = try std.Io.Dir.cwd().openFile(host_io.io, path, .{});
+        errdefer file.close(host_io.io);
 
-        const stat = try file.stat();
+        const stat = try file.stat(host_io.io);
         const mmap_data = try std.posix.mmap(
             null,
             stat.size,
-            std.posix.PROT.READ,
+            .{ .READ = true },
             .{ .TYPE = .PRIVATE },
             file.handle,
             0,
@@ -177,7 +178,7 @@ pub const Model = struct {
         const config = extractCpuModelConfig(&gf, arch, hidden_dim, effective_vocab);
         const layer_tensors = try resolveLayerTensors(&gf, allocator, config.n_layers);
         errdefer allocator.free(layer_tensors);
-        const raw_moe_topk_override = std.posix.getenv("ZINC_QWEN36_MOE_TOPK");
+        const raw_moe_topk_override = host_io.getenv("ZINC_QWEN36_MOE_TOPK");
         const moe_topk_limit = resolveQwen36MoeTopkLimitForEnv(config, layer_tensors, raw_moe_topk_override);
         if (moe_topk_limit > 0) {
             log.info("M1 host-assisted Qwen 3.6 MoE top-k capped at {d} (set ZINC_QWEN36_MOE_TOPK={d} to restore metadata top-k)", .{
@@ -187,7 +188,7 @@ pub const Model = struct {
         } else if (isQwen36LikeF32Ssm(config, layer_tensors) and raw_moe_topk_override != null) {
             log.info("M1 host-assisted Qwen 3.6 MoE top-k cap disabled via ZINC_QWEN36_MOE_TOPK", .{});
         }
-        const raw_lm_rows_override = std.posix.getenv("ZINC_RT_LM_HEAD_ROWS");
+        const raw_lm_rows_override = host_io.getenv("ZINC_RT_LM_HEAD_ROWS");
         const lm_head_decode_rows = resolveQwen36LmHeadDecodeRowsForEnv(config, layer_tensors, raw_lm_rows_override);
         if (lm_head_decode_rows < effective_vocab) {
             log.info("M1 host-assisted decode LM-head row scan capped at {d}/{d} rows (set ZINC_RT_LM_HEAD_ROWS=0 to restore full vocab)", .{
@@ -444,7 +445,7 @@ pub const Model = struct {
         self.allocator.free(self.final_norm_weight);
         self.gguf_file.deinit();
         std.posix.munmap(self.mmap_data);
-        self.file.close();
+        self.file.close(host_io.io);
         self.* = undefined;
     }
 
@@ -766,7 +767,7 @@ fn extractCpuModelConfig(gf: *const gguf.GGUFFile, arch: []const u8, hidden_dim:
             // see model loader_metal for the reference. Override with
             // ZINC_GEMMA4_ATTN_SCALE_DEFAULT to A/B test (0 = use default 1/sqrt).
             if (std.mem.eql(u8, arch, "gemma4")) {
-                if (std.posix.getenv("ZINC_GEMMA4_ATTN_SCALE_DEFAULT")) |_| {
+                if (host_io.getenv("ZINC_GEMMA4_ATTN_SCALE_DEFAULT")) |_| {
                     break :blk 0.0;
                 }
                 break :blk @as(f32, 1.0);
@@ -785,7 +786,7 @@ fn isQwen36LikeF32Ssm(cfg: CpuModelConfig, layer_tensors: []const LayerTensors) 
 }
 
 fn resolveQwen36MoeTopkLimit(cfg: CpuModelConfig, layer_tensors: []const LayerTensors) u32 {
-    return resolveQwen36MoeTopkLimitForEnv(cfg, layer_tensors, std.posix.getenv("ZINC_QWEN36_MOE_TOPK"));
+    return resolveQwen36MoeTopkLimitForEnv(cfg, layer_tensors, host_io.getenv("ZINC_QWEN36_MOE_TOPK"));
 }
 
 fn resolveQwen36MoeTopkLimitForEnv(cfg: CpuModelConfig, layer_tensors: []const LayerTensors, raw_override: ?[]const u8) u32 {
@@ -1269,7 +1270,7 @@ fn generateNoLayer(
     allocator: std.mem.Allocator,
 ) !GenerateResult {
     const effective_max_tokens = @min(max_tokens, m0MaxDecodeTokens());
-    var generated: std.ArrayList(u32) = .{};
+    var generated: std.ArrayList(u32) = .empty;
     errdefer generated.deinit(allocator);
 
     const hidden = try allocator.alloc(f32, model.hidden_dim);
@@ -1285,11 +1286,11 @@ fn generateNoLayer(
     var rt = cpu_ring.CpuRing.init();
     defer rt.deinit();
 
-    const prefill_start = std.time.nanoTimestamp();
+    const prefill_start = host_io.nanoTimestamp();
     try evalToken(model, &rt, prompt_tokens[prompt_tokens.len - 1], hidden, norm, row_scratch, logits, &next_token);
-    const prefill_end = std.time.nanoTimestamp();
+    const prefill_end = host_io.nanoTimestamp();
 
-    const decode_start = std.time.nanoTimestamp();
+    const decode_start = host_io.nanoTimestamp();
     if (effective_max_tokens > 0) {
         try generated.append(allocator, next_token);
     }
@@ -1298,7 +1299,7 @@ fn generateNoLayer(
         try evalToken(model, &rt, next_token, hidden, norm, row_scratch, logits, &next_token);
         try generated.append(allocator, next_token);
     }
-    const decode_end = std.time.nanoTimestamp();
+    const decode_end = host_io.nanoTimestamp();
 
     if (effective_max_tokens < max_tokens) {
         log.info("M1 host-assisted no-layer path clamped decode budget from {d} to {d} tokens", .{
@@ -1390,7 +1391,7 @@ const ScalarDecodeState = struct {
     direct_shared_moe_gate_up_row_range_done: bool = false,
     direct_moe_down_row_range_count: u32 = 0,
     direct_shared_moe_down_row_range_done: bool = false,
-    pool: ?*std.Thread.Pool = null,
+    pool: ?*host_io.Pool = null,
     fast_pool: ?*zinc_rt.fast_pool.FastPool = null,
 
     fn init(allocator: std.mem.Allocator, model: *const Model, max_seq: u32) !ScalarDecodeState {
@@ -1602,8 +1603,8 @@ fn directDecodeModelSliceEnabledForEnv(raw_override: ?[]const u8, raw_cadence_ov
 
 fn directDecodeModelSliceEnabled() bool {
     return directDecodeModelSliceEnabledForEnv(
-        std.posix.getenv("ZINC_RT_DIRECT_DECODE_FULL_SLICE"),
-        std.posix.getenv("ZINC_RT_DIRECT_DECODE_SLICE_CADENCE"),
+        host_io.getenv("ZINC_RT_DIRECT_DECODE_FULL_SLICE"),
+        host_io.getenv("ZINC_RT_DIRECT_DECODE_SLICE_CADENCE"),
     );
 }
 
@@ -1616,7 +1617,7 @@ fn directDecodeModelSliceCadenceForEnv(raw_override: ?[]const u8) u32 {
 }
 
 fn directDecodeModelSliceCadence() u32 {
-    return directDecodeModelSliceCadenceForEnv(std.posix.getenv("ZINC_RT_DIRECT_DECODE_SLICE_CADENCE"));
+    return directDecodeModelSliceCadenceForEnv(host_io.getenv("ZINC_RT_DIRECT_DECODE_SLICE_CADENCE"));
 }
 
 fn directPrefillModelSliceEnabledForEnv(raw_override: ?[]const u8) bool {
@@ -1625,7 +1626,7 @@ fn directPrefillModelSliceEnabledForEnv(raw_override: ?[]const u8) bool {
 }
 
 fn directPrefillModelSliceEnabled() bool {
-    return directPrefillModelSliceEnabledForEnv(std.posix.getenv("ZINC_RT_DIRECT_PREFILL_MODEL_SLICE"));
+    return directPrefillModelSliceEnabledForEnv(host_io.getenv("ZINC_RT_DIRECT_PREFILL_MODEL_SLICE"));
 }
 
 fn directLmHeadDecodeCadenceForEnv(raw_override: ?[]const u8) u32 {
@@ -1637,7 +1638,7 @@ fn directLmHeadDecodeCadenceForEnv(raw_override: ?[]const u8) u32 {
 }
 
 fn directLmHeadDecodeCadence() u32 {
-    return directLmHeadDecodeCadenceForEnv(std.posix.getenv("ZINC_RT_DIRECT_LM_HEAD_DECODE_CADENCE"));
+    return directLmHeadDecodeCadenceForEnv(host_io.getenv("ZINC_RT_DIRECT_LM_HEAD_DECODE_CADENCE"));
 }
 
 fn directLmHeadQ4_0FullResidentEnabledForEnv(raw_override: ?[]const u8) bool {
@@ -1646,7 +1647,7 @@ fn directLmHeadQ4_0FullResidentEnabledForEnv(raw_override: ?[]const u8) bool {
 }
 
 fn directLmHeadQ4_0FullResidentEnabled() bool {
-    return directLmHeadQ4_0FullResidentEnabledForEnv(std.posix.getenv("ZINC_RT_DIRECT_LM_HEAD_FULL_RESIDENT"));
+    return directLmHeadQ4_0FullResidentEnabledForEnv(host_io.getenv("ZINC_RT_DIRECT_LM_HEAD_FULL_RESIDENT"));
 }
 
 fn directRouterDecodeEnabledForEnv(raw_override: ?[]const u8) bool {
@@ -1655,7 +1656,7 @@ fn directRouterDecodeEnabledForEnv(raw_override: ?[]const u8) bool {
 }
 
 fn directRouterDecodeEnabled() bool {
-    return directRouterDecodeEnabledForEnv(std.posix.getenv("ZINC_RT_DIRECT_ROUTER_DECODE"));
+    return directRouterDecodeEnabledForEnv(host_io.getenv("ZINC_RT_DIRECT_ROUTER_DECODE"));
 }
 
 fn directRouterDecodeCadenceForEnv(raw_override: ?[]const u8) u32 {
@@ -1664,7 +1665,7 @@ fn directRouterDecodeCadenceForEnv(raw_override: ?[]const u8) u32 {
 }
 
 fn directRouterDecodeCadence() u32 {
-    return directRouterDecodeCadenceForEnv(std.posix.getenv("ZINC_RT_DIRECT_ROUTER_DECODE_CADENCE"));
+    return directRouterDecodeCadenceForEnv(host_io.getenv("ZINC_RT_DIRECT_ROUTER_DECODE_CADENCE"));
 }
 
 fn directRouterRowRangeTrustAfterSuccessesForEnv(raw_override: ?[]const u8) u32 {
@@ -1673,7 +1674,7 @@ fn directRouterRowRangeTrustAfterSuccessesForEnv(raw_override: ?[]const u8) u32 
 }
 
 fn directRouterRowRangeTrustAfterSuccesses() u32 {
-    return directRouterRowRangeTrustAfterSuccessesForEnv(std.posix.getenv("ZINC_RT_DIRECT_ROUTER_TRUST_AFTER_SUCCESSES"));
+    return directRouterRowRangeTrustAfterSuccessesForEnv(host_io.getenv("ZINC_RT_DIRECT_ROUTER_TRUST_AFTER_SUCCESSES"));
 }
 
 fn shouldTrustDirectRouterRowRangeWithoutOracle(successes: u32, threshold: u32) bool {
@@ -1714,7 +1715,7 @@ fn directSsmQ8_0RowRangeMaxSuccessesForEnv(raw_override: ?[]const u8) u32 {
 }
 
 fn directSsmQ8_0RowRangeMaxSuccesses() u32 {
-    return directSsmQ8_0RowRangeMaxSuccessesForEnv(std.posix.getenv("ZINC_RT_DIRECT_SSM_Q8_ROW_RANGE_MAX_SUCCESSES"));
+    return directSsmQ8_0RowRangeMaxSuccessesForEnv(host_io.getenv("ZINC_RT_DIRECT_SSM_Q8_ROW_RANGE_MAX_SUCCESSES"));
 }
 
 fn directSsmQ8_0TrustAfterSuccessesForEnv(raw_override: ?[]const u8) u32 {
@@ -1723,7 +1724,7 @@ fn directSsmQ8_0TrustAfterSuccessesForEnv(raw_override: ?[]const u8) u32 {
 }
 
 fn directSsmQ8_0TrustAfterSuccesses() u32 {
-    return directSsmQ8_0TrustAfterSuccessesForEnv(std.posix.getenv("ZINC_RT_DIRECT_SSM_Q8_TRUST_AFTER_SUCCESSES"));
+    return directSsmQ8_0TrustAfterSuccessesForEnv(host_io.getenv("ZINC_RT_DIRECT_SSM_Q8_TRUST_AFTER_SUCCESSES"));
 }
 
 fn shouldTrustDirectSsmQ8_0RowRangeWithoutOracle(alpha_successes: u32, beta_successes: u32, threshold: u32) bool {
@@ -1771,7 +1772,7 @@ fn generateScalarHybrid(
     // Persistent decode worker pool: every executed matvec/MoE fan-out re-uses
     // these threads instead of spawning a fresh thread per op (~1k spawns/tok
     // otherwise — the dominant non-compute cost in the T-CPU path).
-    var decode_pool: std.Thread.Pool = undefined;
+    var decode_pool: host_io.Pool = undefined;
     var decode_pool_ready = false;
     const decode_pool_workers = decodeWorkerThreadCount();
     const cpu_count = std.Thread.getCpuCount() catch 1;
@@ -1790,7 +1791,7 @@ fn generateScalarHybrid(
 
     // Atomic-counter-based fan-out pool used for the matvec direct dispatch
     // path. Each per-token decode issues ~200 short fan-outs to 3-4 workers;
-    // std.Thread.Pool's mutex/condvar/heap-alloc closure machinery shows up
+    // host_io.Pool's mutex/condvar/heap-alloc closure machinery shows up
     // as several ms of overhead on the 9800X3D. The FastPool replaces just
     // that hot path with persistent spin-workers + per-slot atomic seq
     // synchronisation. Init failure (or opt-out via ZINC_RT_FAST_POOL=0) is
@@ -1798,7 +1799,7 @@ fn generateScalarHybrid(
     var fast_pool: zinc_rt.fast_pool.FastPool = undefined;
     var fast_pool_ready = false;
     const fast_pool_enabled = blk: {
-        const raw = std.posix.getenv("ZINC_RT_FAST_POOL") orelse break :blk true;
+        const raw = host_io.getenv("ZINC_RT_FAST_POOL") orelse break :blk true;
         if (raw.len == 0) break :blk true;
         if (std.mem.eql(u8, raw, "0")) break :blk false;
         if (std.mem.eql(u8, raw, "false")) break :blk false;
@@ -1957,11 +1958,11 @@ fn generateScalarHybrid(
         });
     }
 
-    var generated: std.ArrayList(u32) = .{};
+    var generated: std.ArrayList(u32) = .empty;
     errdefer generated.deinit(allocator);
 
     var next_token: u32 = 0;
-    const prefill_start = std.time.nanoTimestamp();
+    const prefill_start = host_io.nanoTimestamp();
     for (prompt_tokens, 0..) |token, pos| {
         const eval_token = if (pos == 0) direct_prompt0_token orelse token else token;
         var selection: ArgmaxTop2Result = .{};
@@ -2014,9 +2015,9 @@ fn generateScalarHybrid(
             }
         }
     }
-    const prefill_end = std.time.nanoTimestamp();
+    const prefill_end = host_io.nanoTimestamp();
 
-    const decode_start = std.time.nanoTimestamp();
+    const decode_start = host_io.nanoTimestamp();
     if (effective_max_tokens > 0) try generated.append(allocator, next_token);
     state.decode_phase = true;
     const decode_topk = model.effectiveDecodeMoeTopK();
@@ -2081,7 +2082,7 @@ fn generateScalarHybrid(
         );
         try generated.append(allocator, next_token);
     }
-    const decode_end = std.time.nanoTimestamp();
+    const decode_end = host_io.nanoTimestamp();
 
     if (effective_max_tokens < max_tokens) {
         log.info("M1 host-assisted path clamped decode budget from {d} to {d} tokens", .{
@@ -2129,7 +2130,7 @@ fn generateScalarDense(
     var state = try ScalarDecodeState.init(allocator, model, max_seq);
     defer state.deinit();
 
-    var decode_pool: std.Thread.Pool = undefined;
+    var decode_pool: host_io.Pool = undefined;
     var decode_pool_ready = false;
     const decode_pool_workers = decodeWorkerThreadCount();
     if (decode_pool_workers > 1) {
@@ -2222,11 +2223,11 @@ fn generateScalarDense(
         log.info("M1 AMDGPU CS dense direct LM-head prefix row cap: {d} rows", .{directLmHeadQ4_0ArgmaxPrefixRowsLimit()});
     }
 
-    var generated: std.ArrayList(u32) = .{};
+    var generated: std.ArrayList(u32) = .empty;
     errdefer generated.deinit(allocator);
 
     var next_token: u32 = 0;
-    const prefill_start = std.time.nanoTimestamp();
+    const prefill_start = host_io.nanoTimestamp();
     for (prompt_tokens, 0..) |token, pos| {
         const need_logits = pos + 1 == prompt_tokens.len;
         const eval_token = if (pos == 0) direct_prompt0_token orelse token else token;
@@ -2255,9 +2256,9 @@ fn generateScalarDense(
             direct_compute_tracking,
         );
     }
-    const prefill_end = std.time.nanoTimestamp();
+    const prefill_end = host_io.nanoTimestamp();
 
-    const decode_start = std.time.nanoTimestamp();
+    const decode_start = host_io.nanoTimestamp();
     if (effective_max_tokens > 0) try generated.append(allocator, next_token);
     state.decode_phase = true;
     var position: u32 = @intCast(prompt_tokens.len);
@@ -2291,7 +2292,7 @@ fn generateScalarDense(
         );
         try generated.append(allocator, next_token);
     }
-    const decode_end = std.time.nanoTimestamp();
+    const decode_end = host_io.nanoTimestamp();
 
     if (effective_max_tokens < max_tokens) {
         log.info("M1 host-assisted dense path clamped decode budget from {d} to {d} tokens", .{
@@ -2632,7 +2633,7 @@ fn directLmHeadQ4_0ArgmaxPrefixRowsLimitForEnv(raw_override: ?[]const u8) u32 {
 }
 
 fn directLmHeadQ4_0ArgmaxPrefixRowsLimit() u32 {
-    return directLmHeadQ4_0ArgmaxPrefixRowsLimitForEnv(std.posix.getenv("ZINC_RT_DIRECT_LM_HEAD_PREFIX_ROWS"));
+    return directLmHeadQ4_0ArgmaxPrefixRowsLimitForEnv(host_io.getenv("ZINC_RT_DIRECT_LM_HEAD_PREFIX_ROWS"));
 }
 
 fn directLmHeadQ4_0ArgmaxPrefixRowsForLimit(lm_head_rows: u32, row_bytes: usize, scratch_rows: u32, prefix_limit: u32) u32 {
@@ -4881,10 +4882,10 @@ fn ssmHeadWorkerTask(ctx: *anyopaque) void {
     runSsmHeadRange(worker.ctx, worker.h_start, worker.h_end);
 }
 
-fn runSsmHeadsParallel(pool: ?*std.Thread.Pool, ctx: *const SsmHeadCtx) void {
+fn runSsmHeadsParallel(pool: ?*host_io.Pool, ctx: *const SsmHeadCtx) void {
     const dt_rank = ctx.dt_rank;
     // Prefer FastPool when the matvec dispatcher has it wired up — its
-    // atomic-counter fan-out replaces std.Thread.Pool's mutex+condvar+heap-alloc
+    // atomic-counter fan-out replaces host_io.Pool's mutex+condvar+heap-alloc
     // closure path, saving ~µs per barrier. Called once per SSM layer (30/token).
     if (pool != null) {
         if (matvec_fast_pool) |fp| {
@@ -4913,7 +4914,7 @@ fn runSsmHeadsParallel(pool: ?*std.Thread.Pool, ctx: *const SsmHeadCtx) void {
             const workers = @min(dt_rank, @min(executors, ssm_head_parallel_max_workers));
             const heads_per = (dt_rank + workers - 1) / workers;
             var params: [ssm_head_parallel_max_workers]SsmHeadWorker = undefined;
-            var wg: std.Thread.WaitGroup = .{};
+            var wg: std.Io.Group = .init;
             var dispatched: usize = 0;
             while (dispatched < workers) : (dispatched += 1) {
                 const start = dispatched * heads_per;
@@ -5513,7 +5514,7 @@ fn runConvSiluRangeDConv4Transposed(ctx: *const ConvSiluCtx, ch_start: u32, ch_e
     }
 }
 
-fn runConvSiluParallel(pool: ?*std.Thread.Pool, ctx: *const ConvSiluCtx) void {
+fn runConvSiluParallel(pool: ?*host_io.Pool, ctx: *const ConvSiluCtx) void {
     const conv_ch = ctx.conv_ch;
     // Prefer FastPool — fires once per SSM layer (30/token); cheap barriers add up.
     if (pool != null) {
@@ -5543,7 +5544,7 @@ fn runConvSiluParallel(pool: ?*std.Thread.Pool, ctx: *const ConvSiluCtx) void {
             const workers: u32 = @intCast(@min(@as(usize, conv_ch), @min(executors, conv_silu_parallel_max_workers)));
             const channels_per: u32 = (conv_ch + workers - 1) / workers;
             var params: [conv_silu_parallel_max_workers]ConvSiluWorker = undefined;
-            var wg: std.Thread.WaitGroup = .{};
+            var wg: std.Io.Group = .init;
             var dispatched: u32 = 0;
             while (dispatched < workers) : (dispatched += 1) {
                 const start = dispatched * channels_per;
@@ -6346,7 +6347,7 @@ fn runMoeExpertsParallel(
     const ran_phased = state.decode_phase and runMoeExpertsParallelPhased(state, params[0..task_count], direct_compute_tracking);
     if (!ran_phased and state.pool != null) {
         const pool = state.pool.?;
-        var wg: std.Thread.WaitGroup = .{};
+        var wg: std.Io.Group = .init;
         for (0..task_count) |i| pool.spawnWg(&wg, moeExpertWorkerMain, .{&params[i]});
         pool.waitAndWork(&wg);
     } else if (!ran_phased) {
@@ -7113,7 +7114,7 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
         break :sums null;
     };
 
-    var gate_up_prefix_rows = [_]u32{0} ** moe_expert_parallel_max_workers;
+    var gate_up_prefix_rows = @as([moe_expert_parallel_max_workers]u32, @splat(0));
     if (direct_compute_tracking != null) {
         _ = consumeDirectMoeGateUpQ4_0TwoRoutedSlotsBeforeCpuTail(
             state,
@@ -7570,24 +7571,24 @@ fn isFullAttentionLayer(cfg: CpuModelConfig, layer: u32) bool {
 /// `ZINC_RT_CPU_WORKERS` remains as a bring-up knob for quick A/Bs on different
 /// hosts.
 fn decodeWorkerThreadCount() usize {
-    if (std.posix.getenv("ZINC_RT_CPU_WORKERS")) |raw| {
+    if (host_io.getenv("ZINC_RT_CPU_WORKERS")) |raw| {
         const parsed = std.fmt.parseInt(usize, raw, 10) catch 0;
         if (parsed > 0) return @min(parsed, matvec_parallel_max_workers);
     }
     const logical = std.Thread.getCpuCount() catch return 1;
     if (logical < 2) return 1;
     var physical = logical;
-    if (std.fs.openFileAbsolute("/sys/devices/system/cpu/smt/active", .{})) |file| {
-        defer file.close();
+    if (std.Io.Dir.openFileAbsolute(host_io.io, "/sys/devices/system/cpu/smt/active", .{})) |file| {
+        defer file.close(host_io.io);
         var buf: [4]u8 = undefined;
-        const n = file.read(&buf) catch 0;
+        const n = host_io.read(file, &buf) catch 0;
         if (n >= 1 and buf[0] == '1') physical = @max(@as(usize, 1), logical / 2);
     } else |_| {}
     return @min(physical, 5);
 }
 
 fn matvecTensor(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     model: *const Model,
     info: gguf.TensorInfo,
     input: []const f32,
@@ -7600,7 +7601,7 @@ fn matvecTensor(
 }
 
 fn matvecRaw(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     raw: []const u8,
     tensor_type: gguf.GGMLType,
     input: []const f32,
@@ -7665,7 +7666,7 @@ const MatvecDirectWorker = struct {
 };
 
 fn matvecRawDirect(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     raw: []const u8,
     tensor_type: gguf.GGMLType,
     input: []const f32,
@@ -7728,7 +7729,7 @@ fn matvecRawDirectFastPooled(
 }
 
 fn matvecRawDirectPooled(
-    pool: *std.Thread.Pool,
+    pool: *host_io.Pool,
     raw: []const u8,
     tensor_type: gguf.GGMLType,
     input: []const f32,
@@ -7744,7 +7745,7 @@ fn matvecRawDirectPooled(
 
     var params: [matvec_parallel_max_workers]MatvecDirectWorker = undefined;
     const rows_per_worker = (@as(usize, @intCast(rows)) + worker_count - 1) / worker_count;
-    var wg: std.Thread.WaitGroup = .{};
+    var wg: std.Io.Group = .init;
     var dispatched: usize = 0;
     while (dispatched < worker_count) : (dispatched += 1) {
         const start: u32 = @intCast(dispatched * rows_per_worker);
@@ -8012,7 +8013,7 @@ const ArgmaxBestWorker = struct {
 };
 
 fn argmaxMatvecRaw(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     raw: []const u8,
     tensor_type: gguf.GGMLType,
     input: []const f32,
@@ -8024,7 +8025,7 @@ fn argmaxMatvecRaw(
 }
 
 fn argmaxMatvecRawBest(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     raw: []const u8,
     tensor_type: gguf.GGMLType,
     input: []const f32,
@@ -8045,7 +8046,7 @@ fn argmaxMatvecRawBest(
 }
 
 fn argmaxMatvecRawTop2(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     raw: []const u8,
     tensor_type: gguf.GGMLType,
     input: []const f32,
@@ -8066,7 +8067,7 @@ fn argmaxMatvecRawTop2(
 }
 
 fn argmaxMatvecRawDirect(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     raw: []const u8,
     tensor_type: gguf.GGMLType,
     input: []const f32,
@@ -8084,7 +8085,7 @@ fn argmaxMatvecRawDirect(
 }
 
 fn argmaxMatvecRawBestDirect(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     raw: []const u8,
     tensor_type: gguf.GGMLType,
     input: []const f32,
@@ -8189,7 +8190,7 @@ fn argmaxMatvecRawDirectFastPooled(
 }
 
 fn argmaxMatvecRawBestDirectPooled(
-    pool: *std.Thread.Pool,
+    pool: *host_io.Pool,
     raw: []const u8,
     tensor_type: gguf.GGMLType,
     input: []const f32,
@@ -8203,7 +8204,7 @@ fn argmaxMatvecRawBestDirectPooled(
 
     var params: [matvec_parallel_max_workers]ArgmaxBestWorker = undefined;
     const rows_per_worker = (@as(usize, @intCast(rows)) + worker_count - 1) / worker_count;
-    var wg: std.Thread.WaitGroup = .{};
+    var wg: std.Io.Group = .init;
     var dispatched: usize = 0;
     while (dispatched < worker_count) : (dispatched += 1) {
         const start: u32 = @intCast(dispatched * rows_per_worker);
@@ -8232,7 +8233,7 @@ fn argmaxMatvecRawBestDirectPooled(
 }
 
 fn argmaxMatvecRawDirectPooled(
-    pool: *std.Thread.Pool,
+    pool: *host_io.Pool,
     raw: []const u8,
     tensor_type: gguf.GGMLType,
     input: []const f32,
@@ -8246,7 +8247,7 @@ fn argmaxMatvecRawDirectPooled(
 
     var params: [matvec_parallel_max_workers]ArgmaxMatvecWorker = undefined;
     const rows_per_worker = (@as(usize, @intCast(rows)) + worker_count - 1) / worker_count;
-    var wg: std.Thread.WaitGroup = .{};
+    var wg: std.Io.Group = .init;
     var dispatched: usize = 0;
     while (dispatched < worker_count) : (dispatched += 1) {
         const start: u32 = @intCast(dispatched * rows_per_worker);
@@ -8429,7 +8430,7 @@ const RouterSharedGateWorker = struct {
 };
 
 fn routeTop1SharedGate(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     router: WeightView,
     router_rows: u32,
     shared_gate: WeightView,
@@ -8454,7 +8455,7 @@ fn routeTop1SharedGate(
 }
 
 fn routeTop1SharedGateDirect(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     router: WeightView,
     router_rows: u32,
     shared_gate: WeightView,
@@ -8466,7 +8467,7 @@ fn routeTop1SharedGateDirect(
     if (matvecWorkItems(total_rows, cols) < matvec_parallel_min_work_items)
         return routeTop1SharedGateDirectSerialResult(router, router_rows, shared_gate, input, input_sum32, 0, total_rows);
     // FastPool fires once per MoE layer (30/token) on the decode-phase top-1
-    // route; switching off std.Thread.Pool's spawnWg cuts a mutex+condvar
+    // route; switching off host_io.Pool's spawnWg cuts a mutex+condvar
     // barrier per call.
     if (matvec_fast_pool) |fp|
         return routeTop1SharedGateDirectFastPooled(fp, router, router_rows, shared_gate, input, input_sum32);
@@ -8530,7 +8531,7 @@ fn routeTop1SharedGateDirectFastPooled(
 }
 
 fn routeTop1SharedGateDirectPooled(
-    pool: *std.Thread.Pool,
+    pool: *host_io.Pool,
     router: WeightView,
     router_rows: u32,
     shared_gate: WeightView,
@@ -8545,7 +8546,7 @@ fn routeTop1SharedGateDirectPooled(
 
     var params: [matvec_parallel_max_workers]RouterSharedGateWorker = undefined;
     const rows_per_worker = (@as(usize, @intCast(total_rows)) + worker_count - 1) / worker_count;
-    var wg: std.Thread.WaitGroup = .{};
+    var wg: std.Io.Group = .init;
     var dispatched: usize = 0;
     while (dispatched < worker_count) : (dispatched += 1) {
         const start: u32 = @intCast(dispatched * rows_per_worker);
@@ -8729,7 +8730,7 @@ fn matvecMultiInputFusedWorkerTask(ctx: *anyopaque) void {
     matvecMultiInputFusedWorkerMain(p);
 }
 
-fn matvecFused(pool: ?*std.Thread.Pool, segs: []const FusedSegment, input: []const f32, input_sum32: ?[]const f32) !void {
+fn matvecFused(pool: ?*host_io.Pool, segs: []const FusedSegment, input: []const f32, input_sum32: ?[]const f32) !void {
     var total: u32 = 0;
     for (segs) |seg| {
         if (seg.out.len < seg.rows) return error.ShapeMismatch;
@@ -8768,7 +8769,7 @@ fn matvecFused(pool: ?*std.Thread.Pool, segs: []const FusedSegment, input: []con
     const p = pool.?;
     var params: [matvec_parallel_max_workers]MatvecFusedWorker = undefined;
     const rows_per_worker = (@as(usize, total) + worker_count - 1) / worker_count;
-    var wg: std.Thread.WaitGroup = .{};
+    var wg: std.Io.Group = .init;
     var dispatched: usize = 0;
     while (dispatched < worker_count) : (dispatched += 1) {
         const start: u32 = @intCast(dispatched * rows_per_worker);
@@ -8784,7 +8785,7 @@ fn matvecFused(pool: ?*std.Thread.Pool, segs: []const FusedSegment, input: []con
     if (failed) return error.InputTooSmall;
 }
 
-fn matvecMultiInputFused(pool: *std.Thread.Pool, segs: []const MultiInputFusedSegment) !void {
+fn matvecMultiInputFused(pool: *host_io.Pool, segs: []const MultiInputFusedSegment) !void {
     var total: u32 = 0;
     var max_cols: u32 = 0;
     for (segs) |seg| {
@@ -8795,7 +8796,7 @@ fn matvecMultiInputFused(pool: *std.Thread.Pool, segs: []const MultiInputFusedSe
     if (total == 0) return;
 
     // Prefer FastPool — the MoE down phase fires once per MoE layer (30/token).
-    // std.Thread.Pool's spawnWg/waitAndWork carries a mutex+condvar+heap-alloc
+    // host_io.Pool's spawnWg/waitAndWork carries a mutex+condvar+heap-alloc
     // closure barrier (~µs each); FastPool's atomic-counter fan-out is ~tens of ns.
     if (matvec_fast_pool) |fp| {
         const worker_count = matvecWorkerCountForCpu(total, max_cols, fp.executorCount());
@@ -8825,7 +8826,7 @@ fn matvecMultiInputFused(pool: *std.Thread.Pool, segs: []const MultiInputFusedSe
 
     var params: [matvec_parallel_max_workers]MatvecMultiInputFusedWorker = undefined;
     const rows_per_worker = (@as(usize, total) + worker_count - 1) / worker_count;
-    var wg: std.Thread.WaitGroup = .{};
+    var wg: std.Io.Group = .init;
     var dispatched: usize = 0;
     while (dispatched < worker_count) : (dispatched += 1) {
         const start: u32 = @intCast(dispatched * rows_per_worker);
@@ -8841,18 +8842,18 @@ fn matvecMultiInputFused(pool: *std.Thread.Pool, segs: []const MultiInputFusedSe
     if (failed) return error.InputTooSmall;
 }
 
-fn poolExecutorCount(pool: *std.Thread.Pool) usize {
+fn poolExecutorCount(pool: *host_io.Pool) usize {
     // `waitAndWork` lets the caller execute queued jobs while it waits, so large
     // matvec splits can use one more chunk than the persistent worker-thread
     // count without spawning another OS thread.
-    return @max(@as(usize, 1), pool.threads.len + 1);
+    return @max(@as(usize, 1), pool.n_jobs + 1);
 }
 
 /// Fuse up to `matvec_fuse_max_segments` of `model`'s matvecs (all consuming
 /// the same `input`) into one pool dispatch. Falls back to separate
 /// `matvecTensor`-style calls if any tensor can't be dotted directly here.
 fn matvecFusedTensors(
-    pool: ?*std.Thread.Pool,
+    pool: ?*host_io.Pool,
     model: *const Model,
     parts: []const FusedPart,
     input: []const f32,
@@ -9308,7 +9309,7 @@ fn topKSoftmaxCpu(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f3
         return;
     }
 
-    var used = [_]bool{false} ** 256;
+    var used = @as([256]bool, @splat(false));
     for (0..k) |slot| {
         var best_idx: u32 = 0;
         var best_val: f32 = -std.math.inf(f32);
@@ -9460,7 +9461,7 @@ pub const Tokenizer = struct {
             self.token_to_id.get("<end_of_turn>") orelse return null;
         const newline_id = self.token_to_id.get("\n") orelse self.token_to_id.get("Ċ"); // GPT-2 mapping of '\n'
 
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(allocator);
         // The Gemma chat template starts with `{{ bos_token }}` regardless of
         // `tokenizer.ggml.add_bos_token` (some Gemma 4 GGUFs ship that flag
@@ -9510,10 +9511,10 @@ pub const Tokenizer = struct {
     }
 
     fn encodePromptNoBos(self: *const Tokenizer, text: []const u8, allocator: std.mem.Allocator) ![]u32 {
-        var encoded: std.ArrayList(u8) = .{};
+        var encoded: std.ArrayList(u8) = .empty;
         defer encoded.deinit(allocator);
         try self.prepBytesForEncode(text, &encoded, allocator);
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(allocator);
         var pos: usize = 0;
         while (pos < encoded.items.len) {
@@ -9549,11 +9550,11 @@ pub const Tokenizer = struct {
     /// @param allocator Owns the returned token slice.
     /// @returns Token ids ready to feed into `generate`.
     pub fn encodePrompt(self: *const Tokenizer, text: []const u8, allocator: std.mem.Allocator) ![]u32 {
-        var encoded: std.ArrayList(u8) = .{};
+        var encoded: std.ArrayList(u8) = .empty;
         defer encoded.deinit(allocator);
         try self.prepBytesForEncode(text, &encoded, allocator);
 
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(allocator);
         if (self.add_bos) {
             if (self.bos_id) |bos| try tokens.append(allocator, bos);
@@ -9924,6 +9925,9 @@ test "fullForwardMaxDecodeTokens honors requested budget by default" {
 
 test "resolveQwen36MoeTopkLimit mirrors Vulkan default and env escape hatch" {
     const cfg = CpuModelConfig{
+        .is_gemma = false,
+        .rope_freq_base_swa = 10000000.0,
+        .attn_scale = 0,
         .hidden_dim = 2048,
         .vocab_size = 248320,
         .n_layers = 40,
@@ -9963,6 +9967,9 @@ test "resolveQwen36MoeTopkLimit mirrors Vulkan default and env escape hatch" {
 
 test "resolveQwen36LmHeadDecodeRows caps only the Qwen36 M1 decode path" {
     const cfg = CpuModelConfig{
+        .is_gemma = false,
+        .rope_freq_base_swa = 10000000.0,
+        .attn_scale = 0,
         .hidden_dim = 2048,
         .vocab_size = 248320,
         .n_layers = 40,
@@ -10083,7 +10090,10 @@ fn fillUnitQ4KBlock(block: *[144]u8) void {
     std.mem.writeInt(u16, block[0..2], one_bits, .little);
     std.mem.writeInt(u16, block[2..4], one_bits, .little);
     for (block[4..8]) |*b| b.* = 1;
-    for (block[8..16]) |*b| b.* = 0x11;
+    // The first four minima occupy complete low-six-bit bytes; only the
+    // final four scale/min pairs share low/high nibbles.
+    for (block[8..12]) |*b| b.* = 1;
+    for (block[12..16]) |*b| b.* = 0x11;
     for (block[16..144]) |*b| b.* = 0x22;
 }
 
@@ -10578,6 +10588,9 @@ test "direct SSM row-range budget, trust and per-slice reset are bounded" {
 
 test "direct SSM row-range accepts F32 and Q8_0 projection rows" {
     const cfg = CpuModelConfig{
+        .is_gemma = false,
+        .rope_freq_base_swa = 10000000.0,
+        .attn_scale = 0,
         .hidden_dim = 2048,
         .vocab_size = 248320,
         .n_layers = 40,

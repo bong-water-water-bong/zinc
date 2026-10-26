@@ -1,0 +1,72 @@
+{
+  "allocator-restarts.json.gz": {
+    "uncompressed_sha256": "b163803a3c56f08d9ac13ede102a377bf5a82c495a1a0dd183b482b49f503cca",
+    "uncompressed_bytes": 49941,
+    "compressed_bytes": 5145
+  },
+  "extra-model-smoke.json.gz": {
+    "uncompressed_sha256": "16a75547d56ab0f189683e97e20b2bbe020b095a3b7420e3144b390a9ce65aeb",
+    "uncompressed_bytes": 17009,
+    "compressed_bytes": 2452
+  },
+  "final-gemma-stream.json.gz": {
+    "uncompressed_sha256": "5d90c86a7fa2dcf53e91cca8b1fb8d3b0f5ded780d9ca5e9b5db2eecc8b86359",
+    "uncompressed_bytes": 38334,
+    "compressed_bytes": 4039
+  },
+  "final-rocm-auto.json.gz": {
+    "uncompressed_sha256": "0d2dfe0460702986296206af1a9fed76eb4f7b284bc03964bb6fccc2033ae081",
+    "uncompressed_bytes": 85881,
+    "compressed_bytes": 6484
+  },
+  "final-vulkan-auto.json.gz": {
+    "uncompressed_sha256": "87acb40d021f400cbd75d00124012532ce8cb39d3bfba8c077dd9ac275e8e608",
+    "uncompressed_bytes": 133235,
+    "compressed_bytes": 12208
+  },
+  "gemma-peak.json.gz": {
+    "uncompressed_sha256": "a9cef3cd5a32d6eb65743f284006c61d0975f491b4ed7a2c09917bb4ab484e59",
+    "uncompressed_bytes": 32191,
+    "compressed_bytes": 3284
+  },
+  "power-profile-qwen-stream.json.gz": {
+    "uncompressed_sha256": "accdcf5ddf4847f9df24e00eccd38b389df8469a3e2d8796aa809af372f24580",
+    "uncompressed_bytes": 56645,
+    "compressed_bytes": 5963
+  },
+  "power-profile-recovery.json.gz": {
+    "uncompressed_sha256": "57b85785c74cf4bb37c636a12dbed4f2e0be1483577d154d43b1504197624e72",
+    "uncompressed_bytes": 888262,
+    "compressed_bytes": 18795
+  },
+  "rocm-comparison.json.gz": {
+    "uncompressed_sha256": "f1e0a7e6574c9cfb0eca1e3553383bf0830975424b0c1cdc39e3023fb9e9b6ac",
+    "uncompressed_bytes": 54567,
+    "compressed_bytes": 4119
+  },
+  "rocm-gemma.json.gz": {
+    "uncompressed_sha256": "89122640650445d4b251b65e44a7f425bb04a2153e696de44fdfc674bb7e649b",
+    "uncompressed_bytes": 6808,
+    "compressed_bytes": 1187
+  },
+  "stream-chat-screen.json.gz": {
+    "uncompressed_sha256": "d3466d42d74c2f9089937d2903a4e374a90954beba77042abc68b4c89b91239b",
+    "uncompressed_bytes": 75141,
+    "compressed_bytes": 7012
+  },
+  "tokenizer-comparison.json.gz": {
+    "uncompressed_sha256": "31ef1b5a60f04ca7eed05d3fdcbc96f301a7e72cf5b3c28cae5b872fd4a93378",
+    "uncompressed_bytes": 16597,
+    "compressed_bytes": 1568
+  },
+  "tokenizer-final-comparison.json.gz": {
+    "uncompressed_sha256": "74d32a2bda32c411e575d76f0130d2322f44a158c7b489779e7db7695fc5edc5",
+    "uncompressed_bytes": 17756,
+    "compressed_bytes": 2169
+  },
+  "tokenizer-smp-comparison.json.gz": {
+    "uncompressed_sha256": "b4154fbd0ecdad1374f4854c9513149e5f75ea870c2cb68591bdcc0944059d8c",
+    "uncompressed_bytes": 17747,
+    "compressed_bytes": 2154
+  }
+}

@@ -43,8 +43,8 @@ export const topicHubs: TopicHub[] = [
     shortTitle: 'OpenCode',
     description: 'A practical guide to OpenCode local coding with Qwen and ZINC: local LLM provider config, tool calls, thinking mode, context limits, SSH tunnels, and trace proxy debugging.',
     keywords: 'OpenCode local coding, OpenCode local LLM, OpenCode Qwen, Qwen coding model, OpenCode ZINC, local coding agent, OpenCode OpenAI compatible provider, ZINC tool calling, self-hosted coding assistant',
-    summary: 'OpenCode can use ZINC and Qwen through the same OpenAI-compatible `/v1/chat/completions` API that powers the browser chat UI. The useful setup is local and boring: run ZINC, point OpenCode at localhost, keep tools enabled, set honest context limits, and use the trace proxy while testing coding workflows.',
-    practicalAnswer: 'For OpenCode local coding, run ZINC on a localhost `/v1` endpoint and configure a custom `@ai-sdk/openai-compatible` provider. Use a Qwen-family model with stable thinking and tool behavior, keep `ZINC_TOOL_CALLING` enabled, and start with conservative context/output limits such as 4096/2048. If OpenCode runs on a laptop while ZINC runs on a GPU box, use an SSH tunnel so the OpenCode config still contains only `127.0.0.1`.',
+    summary: 'OpenCode can use ZINC and Qwen through the same OpenAI-compatible `/v1/chat/completions` API that powers the browser chat UI. Run ZINC, use the portable OpenCode setup script, verify chat and streaming tool calls, and run a headless task. Optional transparent traces help diagnose failures.',
+    practicalAnswer: 'For OpenCode local coding, run ZINC on a localhost `/v1` endpoint and configure a custom `@ai-sdk/openai-compatible` provider. Use a Qwen-family model with stable thinking and tool behavior, keep `ZINC_TOOL_CALLING` enabled, and match the actual server context, with a 16384-token context and 4096-token output as the setup defaults. If OpenCode runs on a laptop while ZINC runs on a GPU box, use an SSH tunnel so the OpenCode config still contains only `127.0.0.1`.',
     bestUse: 'Use this page when you want a local coding assistant backed by ZINC rather than a hosted API. It is focused on operator setup, not benchmark marketing: provider config, local ports, tool calls, thinking, context budgets, and trace-based debugging.',
     status: [
       {
@@ -63,11 +63,11 @@ export const topicHubs: TopicHub[] = [
     actionPlan: [
       {
         label: 'Start ZINC locally',
-        detail: 'Run the server on `127.0.0.1`, usually port 9090, and verify `/health` plus `/v1/models` before opening OpenCode.',
+        detail: 'Start a Qwen model with a context large enough for source files and tool results, then run the setup connection check.',
       },
       {
         label: 'Configure one provider',
-        detail: 'Use OpenCode\'s OpenAI-compatible provider config with `baseURL` set to `http://127.0.0.1:9090/v1` or to the local trace proxy.',
+        detail: 'Use `tools/setup_opencode.mjs` to create `opencode.zinc.json` and keep runtime endpoints and API keys outside the saved config.',
       },
       {
         label: 'Keep tools on',
@@ -81,7 +81,7 @@ export const topicHubs: TopicHub[] = [
     checklist: [
       {
         label: 'Health check first',
-        detail: '`curl http://127.0.0.1:9090/health` should pass from the same machine that runs OpenCode.',
+        detail: 'Run the setup script with `check` to verify health, JSON completions, and JSON/SSE tool calls from the OpenCode machine.',
       },
       {
         label: 'Model shape',
@@ -93,7 +93,7 @@ export const topicHubs: TopicHub[] = [
       },
       {
         label: 'Trace locally',
-        detail: 'Use `tools/opencode_trace_proxy.mjs` when diagnosing repeated reads, malformed tool paths, short answers, or thinking/tool-choice behavior.',
+        detail: 'The trace proxy forwards requests and responses unchanged by default. Keep its synthetic compatibility mode out of coding evaluations.',
       },
     ],
     measurements: [
@@ -170,6 +170,11 @@ export const topicHubs: TopicHub[] = [
       },
     ],
     docs: [
+      {
+        title: 'Download the OpenCode setup script',
+        href: '/zinc/harnesses/setup-opencode.mjs',
+        description: 'Portable configuration, API checks, and headless execution in one Bun script.',
+      },
       {
         title: 'Configure OpenCode with ZINC',
         href: '/zinc/docs/opencode/',

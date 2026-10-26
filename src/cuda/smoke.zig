@@ -4,13 +4,11 @@
 //! device select, staged buffers + H2D/D2H, NVRTC runtime compile, the
 //! buffers+push dispatch ABI, and both sync and async commit paths.
 //!
-//! Build (on the box):
-//!   ~/zig-0.15.2/zig build-exe smoke.zig cuda_shim.c \
-//!     -I. -I/usr/local/cuda/include -lc \
-//!     -L/usr/local/cuda/lib64 -L/usr/lib/wsl/lib -lcuda -lnvrtc \
-//!     -rpath /usr/local/cuda/lib64 -femit-bin=smoke_zig
+//! Build and run on the designated GPU host, from the repository root:
+//!   ./scripts/zig.sh build cuda-smoke -Dbackend=cuda
 //! @section CUDA Runtime
 const std = @import("std");
+const host_io = @import("host_io");
 const device = @import("device.zig");
 const buffer = @import("buffer.zig");
 const pipeline = @import("pipeline.zig");
@@ -34,7 +32,8 @@ const Push = extern struct { n: i32 };
 /// synchronous commit path and a `dp4a` kernel via the async commit path, checking
 /// both results.
 /// @returns `error.SmokeFailed` if any computed value mismatches its expected output.
-pub fn main() !void {
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
     var dev = try device.CudaDevice.initBest(std.heap.page_allocator);
     defer dev.deinit();
     var namebuf: [128]u8 = undefined;

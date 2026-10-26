@@ -4,8 +4,8 @@
  *
  * Autonomous loop that iteratively implements the Metal/Apple Silicon inference
  * backend. Each cycle:
- *   1. Build locally (zig build -Doptimize=ReleaseFast by default)
- *   2. Run unit tests (zig build test)
+ *   1. Build locally (./scripts/zig.sh build -Doptimize=ReleaseFast by default)
+ *   2. Run unit tests (./scripts/zig.sh build test)
  *   3. Run inference with model (zinc -m model.gguf --prompt "..." -n N)
  *   4. Analyze output: build errors? test failures? correct tokens? tok/s?
  *   5. Spawn AI agent to make ONE implementation step
@@ -190,17 +190,17 @@ const BLOCKED_GIT_OPS = [
 // own exclusive measurement run, crashing the cycle with "GPU metal:0 is
 // already reserved". The harness owns ALL Metal measurement, so hard-block the
 // agent from launching the model binary or any GPU-reserving build step. Plain
-// `zig build` and `zig build test` stay allowed (they don't reserve the GPU).
+// `./scripts/zig.sh build` and `./scripts/zig.sh build test` stay allowed (they don't reserve the GPU).
 const BLOCKED_MODEL_RUN_OPS = [
   "Bash(./zig-out/bin/zinc:*)",
   "Bash(zig-out/bin/zinc:*)",
-  "Bash(zig build run:*)",
-  "Bash(zig build bench:*)",
-  "Bash(zig build bench-metal:*)",
-  "Bash(zig build bench-metal-shapes:*)",
-  "Bash(zig build bench-metal-gemm-q4k:*)",
-  "Bash(zig build bench-metal-dmmv-q4k:*)",
-  "Bash(zig build hot-bench:*)",
+  "Bash(./scripts/zig.sh build run:*)",
+  "Bash(./scripts/zig.sh build bench:*)",
+  "Bash(./scripts/zig.sh build bench-metal:*)",
+  "Bash(./scripts/zig.sh build bench-metal-shapes:*)",
+  "Bash(./scripts/zig.sh build bench-metal-gemm-q4k:*)",
+  "Bash(./scripts/zig.sh build bench-metal-dmmv-q4k:*)",
+  "Bash(./scripts/zig.sh build hot-bench:*)",
 ];
 
 const BLOCKED_AGENT_OPS = [...BLOCKED_GIT_OPS, ...BLOCKED_MODEL_RUN_OPS];
@@ -1355,7 +1355,7 @@ function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): s
 
   lines.push(
     "- Validation gate for risky paths: `ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1`, F32 shared-gate route-pack, active-block route-pack, and dual-Q8 SSM variants must stay default-off until a full active-prompt validation run keeps `Paris` and beats the accepted median.",
-    "- Codex subprocesses in this harness must not run local Metal model commands such as `./zig-out/bin/zinc --model-id qwen36-35b-a3b-q4k-xl` or `ZINC_QWEN36_* ./zig-out/bin/zinc`; they fail with `Metal device not available`. Use `zig build`/`zig build test`; the outer harness owns all Metal measurement and validation runs.",
+    "- Codex subprocesses in this harness must not run local Metal model commands such as `./zig-out/bin/zinc --model-id qwen36-35b-a3b-q4k-xl` or `ZINC_QWEN36_* ./zig-out/bin/zinc`; they fail with `Metal device not available`. Use `./scripts/zig.sh build`/`./scripts/zig.sh build test`; the outer harness owns all Metal measurement and validation runs.",
     "- Next high-leverage moves after 69.9: profile-first SSM projection/recurrent/barrier work, MoE expert launch/buffer fusion, and exact-shape router follow-ups only when the profile still names router/top-k as the blocker.",
     "- If adding a validator or microbench, make it report the exact layer, prompt-token count, max abs diff, and flag-on command so the next cycle can decide whether to promote or abandon it.",
     "",
@@ -1925,7 +1925,7 @@ export function noiseAwareImproveBand(baseBand: number, samples: number[]): numb
 async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
   const buildArgs = zigBuildArgs();
   console.log(clr("1;33", `  🔨 Building (${buildArgs.join(" ")})...`));
-  const build = await runCommand("zig", buildArgs, { timeout: 120_000 });
+  const build = await runCommand("./scripts/zig.sh", buildArgs, { timeout: 120_000 });
 
   if (build.exitCode !== 0) {
     return {
@@ -1951,7 +1951,7 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
   console.log(clr("1;32", "  ✅ Build OK"));
 
   console.log(clr("1;33", "  🧪 Testing..."));
-  const test = await runCommand("zig", ["build", "test"], { timeout: TEST_TIMEOUT_MS });
+  const test = await runCommand("./scripts/zig.sh", ["build", "test"], { timeout: TEST_TIMEOUT_MS });
 
   if (test.exitCode !== 0) {
     return {
@@ -2957,11 +2957,13 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     diagnosis.push("Guessing is not working. Before making ANY more changes, you MUST study how");
     diagnosis.push("production Metal inference engines solve this exact problem:");
     diagnosis.push("");
-    const llamaMetal = existsSync("/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal")
-      ? "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-metal"
+    const llamaSource = resolve(REPO_ROOT, "../llama.cpp/ggml/src/ggml-metal");
+    const llamaMetal = existsSync(join(llamaSource, "ggml-metal.metal"))
+      ? llamaSource
       : "/tmp/llama.cpp/ggml/src/ggml-metal";
-    const vllmMoe = existsSync("/Users/zolotukhin/Workplace/vllm/vllm/model_executor/layers/fused_moe")
-      ? "/Users/zolotukhin/Workplace/vllm/vllm/model_executor/layers/fused_moe"
+    const vllmSource = resolve(REPO_ROOT, "../vllm/vllm/model_executor/layers/fused_moe");
+    const vllmMoe = existsSync(vllmSource)
+      ? vllmSource
       : "/tmp/vllm/vllm/model_executor/layers/fused_moe";
     diagnosis.push("### Step 1: Read llama.cpp Metal backend");
     if (llamaMetal.startsWith("/tmp/")) {
@@ -3222,14 +3224,14 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     "3. All 27+ tests must continue passing.",
     "4. Do NOT modify src/vulkan/, loops/, or .env.",
     "5. Do NOT run git push, git pull, git fetch, git merge, git rebase, git reset, git checkout, or git restore. The harness owns git commits/reverts.",
-    "6. Zig 0.15.2 API: ArrayList is unmanaged (pass allocator to append/deinit).",
+    "6. Zig 0.17.0 API: ArrayList is unmanaged (pass allocator to append/deinit).",
     "7. MSL shaders use 'main0' as entry point (SPIRV-Cross convention).",
     "8. Metal push constants go in buffer[n_bufs] (see shim.m mtl_dispatch).",
     "9. The Metal command pattern: beginCommand → dispatch → barrier → dispatch → commitAndWait.",
     "10. UMA advantage: all buffers are SharedMode — cpu_ptr gives direct CPU access to GPU data.",
     "11. Read the profile output and run output BEFORE deciding what to optimize.",
     "12. Prefer changes to forward_metal.zig and shaders. Avoid refactoring infrastructure.",
-    "13. NEVER run the model yourself: not `./zig-out/bin/zinc ...`, not `zig build run/bench/bench-metal*/hot-bench`, not any command that loads the model on the GPU. ZINC reserves the Metal GPU exclusively, so your run would collide with the harness's own measurement and crash the cycle (\"GPU metal:0 is already reserved\"). The OUTER HARNESS owns all measurement, profiling, and validation runs. You may ONLY run `zig build` and `zig build test`. A \"RUNTIME CRASH\" reported below is the harness's measurement, not something you reproduce or fix by running the model.",
+    "13. NEVER run the model yourself: not `./zig-out/bin/zinc ...`, not `./scripts/zig.sh build run/bench/bench-metal*/hot-bench`, not any command that loads the model on the GPU. ZINC reserves the Metal GPU exclusively, so your run would collide with the harness's own measurement and crash the cycle (\"GPU metal:0 is already reserved\"). The OUTER HARNESS owns all measurement, profiling, and validation runs. You may ONLY run `./scripts/zig.sh build` and `./scripts/zig.sh build test`. A \"RUNTIME CRASH\" reported below is the harness's measurement, not something you reproduce or fix by running the model.",
     "",
     "## Output Format",
     "After making your change, print these 4 lines:",
@@ -3657,7 +3659,7 @@ async function runMetalShapesBenchmark(state?: RunState): Promise<string> {
 
   console.log(clr("1;35", `  🔬 Metal-shapes evidence run (${extraArgs.join(" ")})...`));
   const run = await runCommand(
-    "zig",
+    "./scripts/zig.sh",
     ["build", "bench-metal-shapes", "--", "-m", modelPath, ...extraArgs],
     { timeout: RUN_TIMEOUT_MS },
   );

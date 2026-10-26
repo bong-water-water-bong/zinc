@@ -3,6 +3,7 @@
 //! These helpers back the `zinc model ...` CLI and the server-side active-model
 //! switching flow.
 const std = @import("std");
+const host_io = @import("host_io");
 const builtin = @import("builtin");
 const gpu = @import("../gpu/interface.zig");
 const catalog = @import("catalog.zig");
@@ -268,7 +269,7 @@ pub fn resolveGpuProfileCachePath(device_index: u32, allocator: std.mem.Allocato
 pub fn isInstalled(model_id: []const u8, allocator: std.mem.Allocator) bool {
     const path = resolveInstalledModelPath(model_id, allocator) catch return false;
     defer allocator.free(path);
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(host_io.io, path, .{}) catch return false;
     return true;
 }
 
@@ -277,16 +278,16 @@ pub fn readActiveSelection(allocator: std.mem.Allocator) !?ActiveSelection {
     const path = try resolveActiveConfigPath(allocator);
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(host_io.io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
-    const data = try file.readToEndAlloc(allocator, 4096);
+    const data = try host_io.readToEndAlloc(file, allocator, 4096);
     defer allocator.free(data);
 
     const model_id = extractJsonStringField(data, "active_model_id") orelse return error.InvalidActiveModelConfig;
@@ -304,18 +305,18 @@ pub fn writeActiveSelection(model_id: []const u8, allocator: std.mem.Allocator) 
     defer allocator.free(path);
     try ensureParentDir(path);
 
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    const file = try std.Io.Dir.createFileAbsolute(host_io.io, path, .{ .truncate = true });
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
     var file_buffer: [1024]u8 = undefined;
-    var writer = file.writerStreaming(&file_buffer);
-    try writer.interface.print(
+    var file_writer = file.writerStreaming(host_io.io, &file_buffer);
+    try file_writer.interface.print(
         \\{{"active_model_id":"{s}","selected_at_unix":{d}}}
-    , .{ model_id, std.time.timestamp() });
-    try writer.interface.flush();
+    , .{ model_id, host_io.timestamp() });
+    try file_writer.interface.flush();
 }
 
 /// Removes the active-model config file. Returns true if a file was deleted.
@@ -342,16 +343,16 @@ pub fn readCachedGpuProfile(device_index: u32, allocator: std.mem.Allocator) !?C
     const path = try resolveGpuProfileCachePath(device_index, allocator);
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(host_io.io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
-    const data = try file.readToEndAlloc(allocator, 4096);
+    const data = try host_io.readToEndAlloc(file, allocator, 4096);
     defer allocator.free(data);
 
     const profile = extractJsonStringField(data, "profile") orelse return error.InvalidGpuProfileCache;
@@ -387,23 +388,23 @@ pub fn writeCachedGpuProfile(
     defer allocator.free(path);
     try ensureParentDir(path);
 
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    const file = try std.Io.Dir.createFileAbsolute(host_io.io, path, .{ .truncate = true });
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
     var file_buffer: [2048]u8 = undefined;
-    var writer = file.writerStreaming(&file_buffer);
-    try writer.interface.print(
+    var file_writer = file.writerStreaming(host_io.io, &file_buffer);
+    try file_writer.interface.print(
         \\{{"profile":"{s}","device_name":"{s}","vram_budget_bytes":{d},"cached_at_unix":{d}}}
     , .{
         profile,
         device_name,
         vram_budget_bytes,
-        std.time.timestamp(),
+        host_io.timestamp(),
     });
-    try writer.interface.flush();
+    try file_writer.interface.flush();
 }
 
 /// Returns a VRAM fit assessment for a catalog model against the given budget.
@@ -543,39 +544,39 @@ pub fn pullModelWithObserver(
             return;
         }
         try writer.print("Cached file checksum mismatch, replacing: {s}\n", .{final_path});
-        std.fs.deleteFileAbsolute(final_path) catch {};
+        std.Io.Dir.deleteFileAbsolute(host_io.io, final_path) catch {};
     }
 
     const downloads_dir = try std.fs.path.join(allocator, &.{ paths.cache_root, "downloads" });
     defer allocator.free(downloads_dir);
-    try std.fs.cwd().makePath(downloads_dir);
-    try std.fs.cwd().makePath(models_dir);
+    try std.Io.Dir.cwd().createDirPath(host_io.io, downloads_dir);
+    try std.Io.Dir.cwd().createDirPath(host_io.io, models_dir);
 
     const partial_name = try std.fmt.allocPrint(allocator, "{s}.partial", .{entry.id});
     defer allocator.free(partial_name);
     const partial_path = try std.fs.path.join(allocator, &.{ downloads_dir, partial_name });
     defer allocator.free(partial_path);
-    std.fs.deleteFileAbsolute(partial_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(host_io.io, partial_path) catch {};
 
     try writer.print("Resolving model: {s}\n", .{entry.id});
     try writer.print("Downloading: {s}\n", .{entry.download_url});
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = host_io.io };
     defer client.deinit();
 
     const uri = try std.Uri.parse(entry.download_url);
     const upstream_metadata = try fetchUpstreamArtifactMetadata(&client, uri);
     try preflightCatalogDrift(entry, upstream_metadata, writer);
 
-    const partial_file = try std.fs.createFileAbsolute(partial_path, .{ .truncate = true });
+    const partial_file = try std.Io.Dir.createFileAbsolute(host_io.io, partial_path, .{ .truncate = true });
     defer {
         var close_file = partial_file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
-    errdefer std.fs.deleteFileAbsolute(partial_path) catch {};
+    errdefer std.Io.Dir.deleteFileAbsolute(host_io.io, partial_path) catch {};
 
     var file_buffer: [16 * 1024]u8 = undefined;
-    var file_writer = partial_file.writerStreaming(&file_buffer);
+    var file_writer = partial_file.writerStreaming(host_io.io, &file_buffer);
 
     var req = try client.request(.GET, uri, .{});
     defer req.deinit();
@@ -599,7 +600,7 @@ pub fn pullModelWithObserver(
     var reader = response.reader(&transfer_buffer);
     var download_buffer: [64 * 1024]u8 = undefined;
     var downloaded_bytes: u64 = 0;
-    var progress_timer = try std.time.Timer.start();
+    var progress_timer = try host_io.Timer.start();
     var last_progress_ns: u64 = 0;
     var progress_started = false;
 
@@ -633,7 +634,7 @@ pub fn pullModelWithObserver(
         try writeDownloadProgress(writer, downloaded_bytes, total_bytes, progress_timer.read(), true);
     }
 
-    const stat = try partial_file.stat();
+    const stat = try partial_file.stat(host_io.io);
     if (observer) |obs| {
         if (obs.on_verifying) |cb| cb(obs.context, stat.size);
     }
@@ -664,8 +665,8 @@ pub fn pullModelWithObserver(
         try writer.writeAll("Warning: neither the catalog nor upstream provided a sha256; installing without integrity verification.\n");
     }
 
-    std.fs.deleteFileAbsolute(final_path) catch {};
-    try std.fs.renameAbsolute(partial_path, final_path);
+    std.Io.Dir.deleteFileAbsolute(host_io.io, final_path) catch {};
+    try std.Io.Dir.renameAbsolute(partial_path, final_path, host_io.io);
     const inspection = try loader_mod.inspectModel(final_path, allocator);
     try writeManifest(manifest_path, entry, stat.size, estimateRequiredBytes(inspection), inspection.offloadable_tensor_bytes, allocator);
     if (observer) |obs| {
@@ -760,39 +761,39 @@ fn writeManifest(
 ) !void {
     _ = allocator;
     try ensureParentDir(path);
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    const file = try std.Io.Dir.createFileAbsolute(host_io.io, path, .{ .truncate = true });
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
     var file_buffer: [2048]u8 = undefined;
-    var writer = file.writerStreaming(&file_buffer);
-    try writer.interface.print(
+    var file_writer = file.writerStreaming(host_io.io, &file_buffer);
+    try file_writer.interface.print(
         \\{{"id":"{s}","display_name":"{s}","installed_at_unix":{d},"size_bytes":{d},"required_vram_bytes":{d},"offloadable_vram_bytes":{d},"sha256":"{s}","download_url":"{s}"}}
     , .{
         entry.id,
         entry.display_name,
-        std.time.timestamp(),
+        host_io.timestamp(),
         size_bytes,
         required_vram_bytes,
         offloadable_vram_bytes,
         entry.sha256,
         entry.download_url,
     });
-    try writer.interface.flush();
+    try file_writer.interface.flush();
 }
 
 fn readInstalledManifest(path: []const u8, allocator: std.mem.Allocator) !?InstalledManifest {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(host_io.io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
-    const data = try file.readToEndAlloc(allocator, 4096);
+    const data = try host_io.readToEndAlloc(file, allocator, 4096);
     defer allocator.free(data);
 
     const size_i64 = extractJsonI64Field(data, "size_bytes") orelse return error.InvalidManifest;
@@ -812,16 +813,16 @@ fn readInstalledManifest(path: []const u8, allocator: std.mem.Allocator) !?Insta
 }
 
 fn computeFileSha256Hex(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std.Io.Dir.openFileAbsolute(host_io.io, path, .{});
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
-        const n = try file.read(&buf);
+        const n = try host_io.read(file, &buf);
         if (n == 0) break;
         hasher.update(buf[0..n]);
     }
@@ -856,14 +857,14 @@ fn removeInstalledModelAtPaths(model_dir: []const u8, model_path: []const u8, ma
 }
 
 fn resolveCacheRoot(allocator: std.mem.Allocator) ![]u8 {
-    const xdg_cache = std.posix.getenv("XDG_CACHE_HOME");
-    const home = std.posix.getenv("HOME");
+    const xdg_cache = host_io.getenv("XDG_CACHE_HOME");
+    const home = host_io.getenv("HOME");
     return resolveCacheRootForEnv(allocator, builtin.os.tag, xdg_cache, home);
 }
 
 fn resolveConfigRoot(allocator: std.mem.Allocator) ![]u8 {
-    const xdg_config = std.posix.getenv("XDG_CONFIG_HOME");
-    const home = std.posix.getenv("HOME");
+    const xdg_config = host_io.getenv("XDG_CONFIG_HOME");
+    const home = host_io.getenv("HOME");
     return resolveConfigRootForEnv(allocator, builtin.os.tag, xdg_config, home);
 }
 
@@ -901,25 +902,25 @@ fn resolveConfigRootForEnv(
 
 fn ensureParentDir(path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
-    try std.fs.cwd().makePath(parent);
+    try std.Io.Dir.cwd().createDirPath(host_io.io, parent);
 }
 
 fn pathExistsAbsolute(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(host_io.io, path, .{}) catch return false;
     return true;
 }
 
 fn dirExistsAbsolute(path: []const u8) bool {
-    const dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+    const dir = std.Io.Dir.openDirAbsolute(host_io.io, path, .{}) catch return false;
     defer {
         var close_dir = dir;
-        close_dir.close();
+        close_dir.close(host_io.io);
     }
     return true;
 }
 
 fn deleteFileIfExistsAbsolute(path: []const u8) !bool {
-    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+    std.Io.Dir.deleteFileAbsolute(host_io.io, path) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -927,7 +928,7 @@ fn deleteFileIfExistsAbsolute(path: []const u8) !bool {
 }
 
 fn deleteDirIfEmptyAbsolute(path: []const u8) !bool {
-    std.fs.deleteDirAbsolute(path) catch |err| switch (err) {
+    std.Io.Dir.deleteDirAbsolute(host_io.io, path) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -954,7 +955,7 @@ fn extractJsonI64Field(body: []const u8, key: []const u8) ?i64 {
     const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":", .{key}) catch return null;
     const pos = std.mem.indexOf(u8, body, needle) orelse return null;
     const start = pos + needle.len;
-    const trimmed = std.mem.trimLeft(u8, body[start..], " ");
+    const trimmed = std.mem.trimStart(u8, body[start..], " ");
     const end = findNumEnd(trimmed);
     if (end == 0) return null;
     return std.fmt.parseInt(i64, trimmed[0..end], 10) catch null;
@@ -995,7 +996,7 @@ test "isValidModelId rejects ids that are not a single safe path component" {
     try std.testing.expect(!isValidModelId(".hidden"));
     try std.testing.expect(!isValidModelId("-flag-like"));
     try std.testing.expect(!isValidModelId("id with space"));
-    try std.testing.expect(!isValidModelId("x" ** 129));
+    try std.testing.expect(!isValidModelId(&host_io.repeatText("x", 129)));
 }
 
 test "model paths cannot be resolved for traversal ids" {
@@ -1028,25 +1029,25 @@ test "active selection roundtrip via explicit config path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const config_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const config_root = try tmp.dir.realPathFileAlloc(host_io.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(config_root);
     const config_path = try std.fs.path.join(std.testing.allocator, &.{ config_root, "active-model.json" });
     defer std.testing.allocator.free(config_path);
 
     try ensureParentDir(config_path);
-    const file = try std.fs.createFileAbsolute(config_path, .{ .truncate = true });
+    const file = try std.Io.Dir.createFileAbsolute(host_io.io, config_path, .{ .truncate = true });
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(host_io.io);
     }
-    try file.writeAll("{\"active_model_id\":\"qwen35-9b-q4k-m\",\"selected_at_unix\":42}");
+    try file.writeStreamingAll(host_io.io, "{\"active_model_id\":\"qwen35-9b-q4k-m\",\"selected_at_unix\":42}");
 
-    const opened = try std.fs.openFileAbsolute(config_path, .{});
+    const opened = try std.Io.Dir.openFileAbsolute(host_io.io, config_path, .{});
     defer {
         var close_file = opened;
-        close_file.close();
+        close_file.close(host_io.io);
     }
-    const data = try opened.readToEndAlloc(std.testing.allocator, 256);
+    const data = try host_io.readToEndAlloc(opened, std.testing.allocator, 256);
     defer std.testing.allocator.free(data);
     try std.testing.expectEqualStrings("qwen35-9b-q4k-m", extractJsonStringField(data, "active_model_id").?);
     try std.testing.expectEqual(@as(?i64, 42), extractJsonI64Field(data, "selected_at_unix"));
@@ -1124,11 +1125,11 @@ test "removeInstalledModelAtPaths deletes known artifacts and empty dir" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(host_io.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     const model_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "models", "qwen35-9b-q4k-m" });
     defer std.testing.allocator.free(model_dir);
-    try std.fs.cwd().makePath(model_dir);
+    try std.Io.Dir.cwd().createDirPath(host_io.io, model_dir);
 
     const model_path = try std.fs.path.join(std.testing.allocator, &.{ model_dir, "model.gguf" });
     defer std.testing.allocator.free(model_path);
@@ -1136,17 +1137,17 @@ test "removeInstalledModelAtPaths deletes known artifacts and empty dir" {
     defer std.testing.allocator.free(manifest_path);
 
     {
-        const file = try std.fs.createFileAbsolute(model_path, .{});
+        const file = try std.Io.Dir.createFileAbsolute(host_io.io, model_path, .{});
         defer {
             var close_file = file;
-            close_file.close();
+            close_file.close(host_io.io);
         }
     }
     {
-        const file = try std.fs.createFileAbsolute(manifest_path, .{});
+        const file = try std.Io.Dir.createFileAbsolute(host_io.io, manifest_path, .{});
         defer {
             var close_file = file;
-            close_file.close();
+            close_file.close(host_io.io);
         }
     }
 
@@ -1163,11 +1164,11 @@ test "removeInstalledModelAtPaths keeps non-empty directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(host_io.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     const model_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "models", "qwen35-9b-q4k-m" });
     defer std.testing.allocator.free(model_dir);
-    try std.fs.cwd().makePath(model_dir);
+    try std.Io.Dir.cwd().createDirPath(host_io.io, model_dir);
 
     const model_path = try std.fs.path.join(std.testing.allocator, &.{ model_dir, "model.gguf" });
     defer std.testing.allocator.free(model_path);
@@ -1177,10 +1178,10 @@ test "removeInstalledModelAtPaths keeps non-empty directory" {
     defer std.testing.allocator.free(extra_path);
 
     for ([_][]const u8{ model_path, manifest_path, extra_path }) |path| {
-        const file = try std.fs.createFileAbsolute(path, .{});
+        const file = try std.Io.Dir.createFileAbsolute(host_io.io, path, .{});
         defer {
             var close_file = file;
-            close_file.close();
+            close_file.close(host_io.io);
         }
     }
 
@@ -1207,28 +1208,28 @@ test "active selection roundtrip rejects non-catalog model on validate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const config_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const config_root = try tmp.dir.realPathFileAlloc(host_io.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(config_root);
     const config_path = try std.fs.path.join(std.testing.allocator, &.{ config_root, "active-model.json" });
     defer std.testing.allocator.free(config_path);
 
     try ensureParentDir(config_path);
     {
-        const file = try std.fs.createFileAbsolute(config_path, .{ .truncate = true });
+        const file = try std.Io.Dir.createFileAbsolute(host_io.io, config_path, .{ .truncate = true });
         defer {
             var close_file = file;
-            close_file.close();
+            close_file.close(host_io.io);
         }
-        try file.writeAll("{\"active_model_id\":\"nonexistent-fixture-model\",\"selected_at_unix\":42}");
+        try file.writeStreamingAll(host_io.io, "{\"active_model_id\":\"nonexistent-fixture-model\",\"selected_at_unix\":42}");
     }
 
     // Read back — the selection is parseable but points to a removed model.
-    const opened = try std.fs.openFileAbsolute(config_path, .{});
+    const opened = try std.Io.Dir.openFileAbsolute(host_io.io, config_path, .{});
     defer {
         var close_file = opened;
-        close_file.close();
+        close_file.close(host_io.io);
     }
-    const data = try opened.readToEndAlloc(std.testing.allocator, 256);
+    const data = try host_io.readToEndAlloc(opened, std.testing.allocator, 256);
     defer std.testing.allocator.free(data);
 
     const model_id = extractJsonStringField(data, "active_model_id").?;
@@ -1240,7 +1241,7 @@ test "active selection roundtrip rejects non-catalog model on validate" {
 test "writeManifest then readInstalledManifest round-trips offloadable_vram_bytes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(host_io.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "manifest.json" });
     defer std.testing.allocator.free(manifest_path);
@@ -1306,18 +1307,18 @@ test "readInstalledManifest tolerates old format without offloadable_vram_bytes"
     // falls back to the catalog estimate for that model.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(host_io.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "manifest.json" });
     defer std.testing.allocator.free(manifest_path);
 
     {
-        const file = try std.fs.createFileAbsolute(manifest_path, .{ .truncate = true });
+        const file = try std.Io.Dir.createFileAbsolute(host_io.io, manifest_path, .{ .truncate = true });
         defer {
             var close_file = file;
-            close_file.close();
+            close_file.close(host_io.io);
         }
-        try file.writeAll(
+        try file.writeStreamingAll(host_io.io,
             \\{"id":"qwen35-9b-q4k-m","display_name":"Qwen 3.5 9B","installed_at_unix":1700000000,"size_bytes":5650000000,"required_vram_bytes":6442450944,"sha256":"","download_url":"local"}
         );
     }

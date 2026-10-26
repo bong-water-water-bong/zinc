@@ -103,6 +103,7 @@ pub const CudaCommand = struct {
 /// @note         Returns `error.CudaCommandFailed` if the shim cannot allocate
 ///               the underlying command resources.
 pub fn beginCommand(ctx: ?*shim.CudaCtx) !CudaCommand {
+    if (shim.cuda_execution_failed(ctx) != 0) return error.GpuExecutionFailed;
     const handle = shim.cuda_begin_command(ctx);
     if (handle == null) return error.CudaCommandFailed;
     return .{ .handle = handle };

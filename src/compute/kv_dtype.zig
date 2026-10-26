@@ -9,11 +9,12 @@
 //!        are multiples of 32, so a vec4 index i lives in block i/8 at uint
 //!        i%8, and the block's scale is its uint 8.
 const std = @import("std");
+const host_io = @import("host_io");
 
 pub const Layout = enum { f32, f16, q8 };
 
 fn envOn(name: []const u8, default: bool) bool {
-    const raw = std.posix.getenv(name) orelse return default;
+    const raw = host_io.getenv(name) orelse return default;
     if (raw.len == 0) return default;
     return !(std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "off"));
 }

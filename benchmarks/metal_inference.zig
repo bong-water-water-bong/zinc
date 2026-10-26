@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_io = @import("host_io");
 const support = @import("zinc_bench_support");
 const metal_device = support.metal_device;
 const metal_loader = support.metal_loader;
@@ -44,7 +45,7 @@ const SummaryStats = struct {
 };
 
 fn helpText() []const u8 {
-    return 
+    return
     \\Usage: zinc-bench-metal -m <model.gguf> [options]
     \\
     \\Runs a ReleaseFast end-to-end Metal inference benchmark on Apple Silicon.
@@ -66,7 +67,7 @@ fn helpText() []const u8 {
     \\  -h, --help               Show this help text
     \\
     \\Example:
-    \\  zig build bench-metal -- -m /Users/zolotukhin/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+    \\  ./scripts/zig.sh build bench-metal -- -m model.gguf
     \\
     ;
 }
@@ -182,7 +183,7 @@ fn decodeOutputText(
     chat: bool,
     allocator: std.mem.Allocator,
 ) ![]u8 {
-    var text_buf: std.ArrayList(u8) = .{};
+    var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(allocator);
 
     for (output_tokens) |tid| {
@@ -354,26 +355,27 @@ fn printProfileSummary(
     }
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(process_init: std.process.Init) !void {
+    host_io.init(process_init);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try host_io.argsAlloc(allocator);
+    defer host_io.argsFree(allocator, args);
 
     const config = parseArgs(args) catch |err| {
-        std.fs.File.stderr().writeAll(helpText()) catch {};
+        std.Io.File.stderr().writeStreamingAll(host_io.io, helpText()) catch {};
         return err;
     };
 
     if (config.show_help) {
-        try std.fs.File.stdout().writeAll(helpText());
+        try std.Io.File.stdout().writeStreamingAll(host_io.io, helpText());
         return;
     }
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(host_io.io, &stdout_buffer);
 
     var device = try metal_device.MetalDevice.init(allocator, config.device_index);
     defer device.deinit();

@@ -1,0 +1,9 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+info(vulkan): VK_KHR_push_descriptor available
+gemma4-26b-a4b down      M=2816  K=704  experts=4 routes=37  acc=false max_diff=0.000038 ok
+ragged routes            M=512   K=704  experts=3 routes=19  acc=false max_diff=0.000046 ok
+accumulate, odd blocks   M=256   K=352  experts=2 routes=8   acc=true max_diff=0.000021 ok
+single route             M=128   K=704  experts=1 routes=1   acc=false max_diff=0.000021 ok
+prod scale 128 experts   M=2816  K=704  experts=128 routes=512 acc=false max_diff=0.000042 ok
+
+all 5 shapes matched the CPU reference

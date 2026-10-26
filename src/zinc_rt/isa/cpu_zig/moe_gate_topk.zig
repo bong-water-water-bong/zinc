@@ -97,7 +97,7 @@ fn topKSoftmaxAll(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f3
         for (0..logits.len) |i| probs[i] /= sum;
     }
 
-    var used = [_]bool{false} ** max_experts;
+    var used = @as([max_experts]bool, @splat(false));
     for (0..k) |ki| {
         var best_idx: u32 = 0;
         var best_val: f32 = -1.0;
@@ -120,7 +120,7 @@ fn topKSoftmaxAll(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f3
 }
 
 fn topKSoftmaxSelected(logits: []const f32, k: u32, out_ids: []u32, out_weights: []f32) void {
-    var used = [_]bool{false} ** max_experts;
+    var used = @as([max_experts]bool, @splat(false));
     for (0..k) |ki| {
         var best_idx: u32 = 0;
         var best_val: f32 = -std.math.inf(f32);

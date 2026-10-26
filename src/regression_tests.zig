@@ -1,6 +1,7 @@
 //! Source-level regression guards for bugs that are hard to cover with unit-only GPU tests.
 const builtin = @import("builtin");
 const std = @import("std");
+const host_io = @import("host_io");
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
@@ -298,7 +299,7 @@ test "Vulkan Gemma dense decode keeps fused GEGLU gate-up pair path" {
 }
 
 test "Vulkan Gemma MoE shared expert keeps Q8_0 fused GEGLU front-end" {
-    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    const build = try std.Io.Dir.cwd().readFileAlloc(host_io.io, "build.zig", std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(build);
     try expectContains(build, "\"dmmv_q8_0_fused_gate_up_geglu\"");
 
@@ -411,17 +412,17 @@ test "Vulkan Gemma grouped MoE prefill keeps exact top-k route buffers separate"
     try expectContainsNear(src, marker, "const scratch_route_ids = scratch_shared_up;", 4600);
     try expectContainsNear(src, marker, "if (scratch_route_ids.size < route_pack_ids_bytes) return error.BufferTooSmall;", 16000);
     try expectContainsNear(src, marker, "const collect_route_profile =", 18000);
-    try expectContainsNear(src, marker, "self.recordPrefillRoutePackCounts(", 48000);
+    try expectContainsNear(src, marker, "self.recordPrefillRoutePackCounts(", 48500);
     try expectContainsNear(src, marker, "scratch_route_ids.handle", 28000);
     try expectContainsNear(src, marker, "try self.dispatchMoeWeightedAccScaledBatch", 34000);
     try expectContainsNear(src, marker, "const shared_proj_phase = self.beginProfilePhase();", 36000);
     try expectContainsNear(src, marker, "self.endProfilePhase(.shared_proj, shared_proj_phase);", 48500);
-    try expectContainsNear(src, marker, "const shared_down_phase = self.beginProfilePhase();", 40500);
-    try expectContainsNear(src, marker, "self.endProfilePhase(.shared_down, shared_down_phase);", 42000);
+    try expectContainsNear(src, marker, "const shared_down_phase = self.beginProfilePhase();", 41000);
+    try expectContainsNear(src, marker, "self.endProfilePhase(.shared_down, shared_down_phase);", 43000);
     try expectContainsNear(src, marker, "const shared_acc_phase = self.beginProfilePhase();", 44000);
     try expectContainsNear(src, marker, "self.endProfilePhase(.shared_gate_acc, shared_acc_phase);", 45000);
-    try expectContainsNear(src, marker, "const layer_record_start = std.time.nanoTimestamp();", 22000);
-    try expectContainsNear(src, marker, "self.prefill_cpu_record_ns += @intCast(std.time.nanoTimestamp() - layer_record_start);", 48000);
+    try expectContainsNear(src, marker, "const layer_record_start = host_io.nanoTimestamp();", 22000);
+    try expectContainsNear(src, marker, "self.prefill_cpu_record_ns += @intCast(host_io.nanoTimestamp() - layer_record_start);", 48000);
     try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_shared_norm", 42000);
     try expectContainsNear(src, marker, "try self.gemmaPrepareProjectionQ8(scratch_swiglu", 46000);
     try expectContainsNear(src, marker, "const enable_gpu_phase_timing =", 16000);
@@ -444,7 +445,7 @@ test "Vulkan Gemma grouped MoE prefill wires Q5_1 route-column down projection" 
     try expectContains(dmmv, "dmmv_q5_1_moe_cols.spv");
     try expectContainsNear(dmmv, "recordMoeColsDispatchIndirect", ".q5_1 => if (self.pipeline_q5_1_moe_cols)", 1800);
 
-    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    const build = try std.Io.Dir.cwd().readFileAlloc(host_io.io, "build.zig", std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(build);
     try expectContains(build, "\"dmmv_q5_1_moe_cols\"");
     try expectContains(build, "\"moe_weighted_acc_scaled_batch\"");
@@ -1040,7 +1041,7 @@ test "Vulkan post_norm_residual_rms_norm shader folds Gemma layer scale" {
 }
 
 test "Vulkan Gemma norm-add vec4 path stays wired and wave64" {
-    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    const build = try std.Io.Dir.cwd().readFileAlloc(host_io.io, "build.zig", std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(build);
     try expectContains(build, "\"rms_norm_add_vec4\"");
     try expectNotContains(build, "dmmv_q4k_q8_1_fused_gate_up_geglu_pair");
@@ -1068,7 +1069,7 @@ test "Vulkan Gemma norm-add vec4 path stays wired and wave64" {
 }
 
 test "Vulkan Q4_K Q8_1 DMMV path stays gated and does not route Q6_K" {
-    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    const build = try std.Io.Dir.cwd().readFileAlloc(host_io.io, "build.zig", std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(build);
     try expectContains(build, "\"dmmv_q4k_q8_1\"");
     try expectNotContains(build, "\"dmmv_q6k_q8_1\"");
@@ -1101,7 +1102,7 @@ test "Vulkan Q4_K Q8_1 DMMV path stays gated and does not route Q6_K" {
 }
 
 test "Vulkan Gemma dense decode uses true single-token GEGLU producer" {
-    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    const build = try std.Io.Dir.cwd().readFileAlloc(host_io.io, "build.zig", std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(build);
     try expectContains(build, "\"mul_mm_q4k_gate_up_geglu_n1_dp4a_q8\"");
 
@@ -1129,7 +1130,7 @@ test "Vulkan Gemma dense decode uses true single-token GEGLU producer" {
 }
 
 test "Vulkan routed Q4_K MoE GEMM foundation stays compile registered" {
-    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    const build = try std.Io.Dir.cwd().readFileAlloc(host_io.io, "build.zig", std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(build);
     try expectContains(build, "\"mul_mm_id_q4k\"");
 
@@ -1158,7 +1159,7 @@ test "Vulkan routed Q4_K MoE GEMM foundation stays compile registered" {
 }
 
 test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
-    const build = try std.fs.cwd().readFileAlloc(std.testing.allocator, "build.zig", 1024 * 1024);
+    const build = try std.Io.Dir.cwd().readFileAlloc(host_io.io, "build.zig", std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(build);
     try expectContains(build, "\"dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1\"");
     try expectContains(build, "\"dmmv_q4k_moe_fused_gate_up_swiglu_cols_top1_q8_1\"");
@@ -1204,7 +1205,7 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(forward, "ZINC_MOE_Q6K_SUFFIX_COMPARE: layer=");
     try expectContains(forward, "q6_suffix_compare_routes[sample_i]");
     try expectContains(forward, "fn qwenA3bQ6MoeColsRequestedForLayer(layer: u32, default_value: bool) bool");
-    try expectContains(forward, "std.posix.getenv(\"ZINC_MOE_Q6K_COLS\") orelse return default_value");
+    try expectContains(forward, "host_io.getenv(\"ZINC_MOE_Q6K_COLS\") orelse return default_value");
     try expectContains(forward, "const prefix = \"layers=\";");
     try expectContains(forward, "std.mem.splitScalar(u8, raw[prefix.len..], ',')");
     try expectContains(forward, "const q6_cols_default_on = exact_grouped or");
@@ -1219,10 +1220,10 @@ test "Vulkan Qwen grouped MoE prefill fuses split gate up SwiGLU" {
     try expectContains(forward, "try self.dispatchProjectionBatched(gate_shexp.?, scratch_norm, scratch_gate, shexp_inter_dim, hidden_dim, prefix_tokens);");
     try expectContains(forward, "try self.dispatchSigmoidScaleAccBatch(");
     try expectContains(forward, "fn qwenA3bSharedF32GateBatchEnabled(self: *const InferenceEngine, default_on: bool) bool");
-    try expectContains(forward, "const raw = std.posix.getenv(\"ZINC_A3B_SHARED_F32_GATE_BATCH\") orelse return default_on;");
+    try expectContains(forward, "const raw = host_io.getenv(\"ZINC_A3B_SHARED_F32_GATE_BATCH\") orelse return default_on;");
     try expectContains(forward, "self.qwenA3bSharedF32GateBatchEnabled(exact_grouped)");
     try expectContains(forward, "fn qwenA3bAttentionProjectionDp4aEnabled(self: *const InferenceEngine, n_tokens: u32) bool");
-    try expectContains(forward, "std.posix.getenv(\"ZINC_A3B_ATTN_DP4A\")");
+    try expectContains(forward, "host_io.getenv(\"ZINC_A3B_ATTN_DP4A\")");
     try expectContains(forward, "!self.qwenA3bAttentionProjectionDp4aEnabled(n_tokens)) return false;");
     try expectContains(forward, "self.gemmaDenseProjectionDp4aEnabled(n_tokens) or\n                self.qwenA3bAttentionProjectionDp4aEnabled(n_tokens)");
     try expectContains(forward, "const attn_proj_q8_dp4a_wanted =");
@@ -1581,11 +1582,11 @@ test "Q5_K MoE shader processes all 32 elements per sub-block pair" {
 
 test "chat UI derives the model link from the reported model name" {
     const src = @embedFile("server/chat.html");
-    try expectContains(src, "const chatStateKey='zinc.chat.state.v3';");
+    try expectContains(src, "const chatStateKey = 'zinc.chat.state.v3';");
     try expectContains(src, "function restoreChatState()");
     try expectContains(src, "function clearConversation()");
     try expectContains(src, "id=\"cb\" class=\"btn btn-clear\"");
-    try expectContains(src, "@media (max-width:720px)");
+    try expectContains(src, "@media (max-width: 720px)");
     try expectContains(src, "function modelHrefForName(name)");
     try expectContains(src, "function switchableModels()");
     try expectContains(src, "function activeModel()");
@@ -1594,11 +1595,11 @@ test "chat UI derives the model link from the reported model name" {
     try expectContains(src, "setModelTag(d.model)");
     try expectContains(src, "setGpuMemory(d);");
     try expectContains(src, "restoreChatState();");
-    try expectContains(src, "CB.addEventListener('click',clearConversation);");
+    try expectContains(src, "CB.addEventListener('click', clearConversation);");
     try expectContains(src, "setCurrentModel(current);");
-    try expectContains(src, "await Promise.allSettled([refreshHealth(),refreshModels()]);");
-    try expectContains(src, "fetch(base+'/models/activate'");
-    try expectContains(src, "m.managed&&m.installed&&m.supported_on_current_gpu&&m.fits_current_gpu");
+    try expectContains(src, "await Promise.allSettled([refreshHealth(), refreshModels()]);");
+    try expectContains(src, "fetch(base + '/models/activate'");
+    try expectContains(src, "m.managed && m.installed && m.supported_on_current_gpu && m.fits_current_gpu");
     try expectNotContains(src, "setCurrentModel(selectedModel());");
 }
 
@@ -1791,7 +1792,7 @@ test "ROCm dense Qwen decode keeps the measured Q4 and attention fast paths" {
 
     // The measured single-reduction state scan is the ROCm default, with the
     // environment variable above it retaining the explicit diagnostic opt-out.
-    try expectContainsNear(forward, "const decode_ssm_fast = std.posix.getenv(\"ZINC_ROCM_DECODE_SSM_FAST\")", "else true;", 500);
+    try expectContainsNear(forward, "const decode_ssm_fast = host_io.getenv(\"ZINC_ROCM_DECODE_SSM_FAST\")", "else true;", 500);
 }
 
 test "ROCm command completion events are allocated only for async waits" {

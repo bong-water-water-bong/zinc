@@ -1,0 +1,53 @@
+{
+  "methodology": {
+    "warmup": 24,
+    "requests": 240,
+    "concurrent_clients": 6,
+    "tokens_per_request": 32
+  },
+  "variants": {
+    "baseline": {
+      "binary_sha256": "5a7f039e0a513091fe2cabcbd57597d2db2cd892a98dc5eb506db14edf100cb1",
+      "requests": 240,
+      "responses_match": true,
+      "response_sha256": "177ac0e9a11a3b3d91f3fe8d314065a3a4bb791d5b52a9b206c6f8d08afe338e",
+      "rss_bytes": [
+        5942956032,
+        5942972416,
+        5942984704,
+        5942972416,
+        5942988800,
+        5943005184,
+        5943025664,
+        5943050240,
+        5943062528,
+        5943074816,
+        5943087104
+      ],
+      "steady_rss_range_bytes": 98304,
+      "elapsed_s": 95.50003825299973
+    },
+    "candidate": {
+      "binary_sha256": "34ee640b0bd5222959d43aa19d33973058b1411f66dc1bd4e1234b0795205616",
+      "requests": 240,
+      "responses_match": true,
+      "response_sha256": "177ac0e9a11a3b3d91f3fe8d314065a3a4bb791d5b52a9b206c6f8d08afe338e",
+      "rss_bytes": [
+        5961355264,
+        5961355264,
+        5961355264,
+        5961355264,
+        5961355264,
+        5961355264,
+        5961355264,
+        5961355264,
+        5961355264,
+        5961355264,
+        5961355264
+      ],
+      "steady_rss_range_bytes": 0,
+      "elapsed_s": 95.57205724599953
+    }
+  },
+  "complete": true
+}

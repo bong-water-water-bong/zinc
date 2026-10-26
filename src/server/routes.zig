@@ -3,6 +3,7 @@
 //! Handles /v1/chat/completions, /v1/completions, /v1/models, /health,
 //! and a built-in chat UI. Supports both streaming (SSE) and non-streaming responses.
 const std = @import("std");
+const host_io = @import("host_io");
 const http = @import("http.zig");
 const runtime = @import("runtime.zig");
 const forward_mod = runtime.forward_mod;
@@ -29,7 +30,7 @@ pub fn toolCallingEnabled() bool {
     const cached = tool_calling_state.load(.acquire);
     if (cached >= 0) return cached == 1;
     const enabled = blk: {
-        const val = std.process.getEnvVarOwned(std.heap.page_allocator, "ZINC_TOOL_CALLING") catch break :blk true;
+        const val = host_io.getEnvVarOwned(std.heap.page_allocator, "ZINC_TOOL_CALLING") catch break :blk true;
         defer std.heap.page_allocator.free(val);
         break :blk !std.mem.eql(u8, val, "0") and !std.mem.eql(u8, val, "false");
     };
@@ -80,7 +81,7 @@ const ChatReuseEntry = struct {
 /// else falls back to a full prefill, which is slower and correct.
 const ChatReuseCache = struct {
     allocator: std.mem.Allocator,
-    entries: std.ArrayListUnmanaged(ChatReuseEntry) = .{},
+    entries: std.ArrayListUnmanaged(ChatReuseEntry) = .empty,
     /// Session whose transcript is resident in the engine right now, if any.
     live_session: ?[]u8 = null,
     /// Set by storeCheckpointed for the duration of its store() call.
@@ -353,7 +354,7 @@ pub const ServerState = struct {
     active_requests: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     queued_requests: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     active_context_tokens: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    generation_mutex: std.Thread.Mutex = .{},
+    generation_mutex: host_io.Mutex = .{},
     downloads: DownloadTracker = .{},
     chat_reuse_cache: ChatReuseCache,
     tokenize_cache: TokenizeCache = .{},
@@ -449,15 +450,15 @@ const DownloadSnapshot = struct {
 };
 
 const DownloadTracker = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: host_io.Mutex = .{},
     active: bool = false,
     phase: DownloadPhase = .idle,
     model_id_len: usize = 0,
-    model_id_buf: [96]u8 = [_]u8{0} ** 96,
+    model_id_buf: [96]u8 = @as([96]u8, @splat(0)),
     downloaded_bytes: u64 = 0,
     total_bytes: u64 = 0,
     error_len: usize = 0,
-    error_buf: [160]u8 = [_]u8{0} ** 160,
+    error_buf: [160]u8 = @as([160]u8, @splat(0)),
 
     fn snapshot(self: *DownloadTracker) DownloadSnapshot {
         self.mutex.lock();
@@ -616,7 +617,7 @@ fn buildHealthJson(
     memory_usage: model_manager_mod.ModelManager.MemoryUsage,
     buf: []u8,
 ) ![]const u8 {
-    const now = std.time.timestamp();
+    const now = host_io.timestamp();
     const snapshot = server_state.snapshot(now);
     const active_context_tokens = memory_usage.activeContextTokens(snapshot.active_context_tokens);
     const active_context_bytes = memory_usage.activeContextBytes(active_context_tokens);
@@ -657,10 +658,11 @@ fn handleModels(
     const memory_usage = manager.currentMemoryUsage();
     const download = server_state.downloads.snapshot();
 
-    var body: std.ArrayList(u8) = .{};
+    var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
 
-    try body.writer(allocator).print(
+    try body.print(
+        allocator,
         "{{\"object\":\"list\",\"profile\":\"{s}\",\"active_memory_used_bytes\":{d},\"active_memory_budget_bytes\":{d},\"active_memory_weights_bytes\":{d},\"active_memory_runtime_bytes\":{d},\"active_context_reserved_bytes\":{d},\"active_context_active_bytes\":{d},\"active_context_tokens\":{d},\"active_context_capacity_tokens\":{d},\"data\":[",
         .{
             view.profile,
@@ -674,7 +676,7 @@ fn handleModels(
             memory_usage.context_capacity_tokens,
         },
     );
-    const ts = @divTrunc(std.time.timestamp(), 1);
+    const ts = @divTrunc(host_io.timestamp(), 1);
     for (view.data, 0..) |entry, i| {
         if (i != 0) try body.append(allocator, ',');
         const fit_source = if (entry.exact_fit) "exact" else "catalog";
@@ -683,7 +685,7 @@ fn handleModels(
         const download_phase = if (is_download_target) @tagName(download.phase) else "idle";
         const download_error = if (is_download_target) download.errorMessage() else "";
         const entry_context_length: u32 = if (entry.active) memory_usage.context_capacity_tokens else 0;
-        try body.writer(allocator).print(
+        try body.print(allocator,
             \\{{"id":"{s}","object":"model","created":{d},"owned_by":"zinc","context_length":{d},"display_name":"{s}","release_date":"{s}","homepage_url":"{s}","family":"{s}","quantization":"{s}","size_bytes":{d},"installed":{s},"active":{s},"managed":{s},"supported_on_current_gpu":{s},"fits_current_gpu":{s},"required_vram_bytes":{d},"required_vram_with_offload_bytes":{d},"requires_offload_to_fit":{s},"fit_source":"{s}","status":"{s}","supports_thinking_toggle":{s},"downloading":{s},"download_phase":"{s}","downloaded_bytes":{d},"download_total_bytes":{d},"download_error":"{s}"}}
         , .{
             entry.id,
@@ -1095,7 +1097,7 @@ const Content = struct {
             },
             .array_begin => {
                 _ = try source.next();
-                var pieces: std.ArrayList([]const u8) = .{};
+                var pieces: std.ArrayList([]const u8) = .empty;
                 defer pieces.deinit(allocator);
                 while (true) {
                     if ((try source.peekNextTokenType()) == .array_end) {
@@ -1165,7 +1167,7 @@ fn parseStopSequences(allocator: std.mem.Allocator, value: ?std.json.Value) ![]c
             return out;
         },
         .array => |arr| {
-            var list: std.ArrayList([]const u8) = .{};
+            var list: std.ArrayList([]const u8) = .empty;
             errdefer {
                 for (list.items) |s| allocator.free(s);
                 list.deinit(allocator);
@@ -1227,7 +1229,7 @@ fn parseToolChoice(value: ?std.json.Value) ToolChoice {
     }
 }
 
-fn forcedSingleToolName(tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice) ?[]const u8 {
+pub fn forcedSingleToolName(tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice) ?[]const u8 {
     if (tool_choice != .required or tools.len != 1) return null;
     return tools[0].name;
 }
@@ -1300,7 +1302,7 @@ fn firstToolArgumentName(parameters_json: []const u8) ?[]const u8 {
         firstObjectKeyAfterField(parameters_json, "\"properties\"");
 }
 
-fn forcedSingleToolFirstArgumentName(tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice) ?[]const u8 {
+pub fn forcedSingleToolFirstArgumentName(tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice) ?[]const u8 {
     if (tool_choice != .required or tools.len != 1) return null;
     return firstToolArgumentName(tools[0].parameters_json);
 }
@@ -1328,7 +1330,7 @@ const ChatRequestBody = struct {
     logprobs: ?std.json.Value = null,
 };
 
-const ParsedChatRequest = struct {
+pub const ParsedChatRequest = struct {
     parsed: std.json.Parsed(ChatRequestBody),
     roles: []const []const u8,
     contents: []const []const u8,
@@ -1347,7 +1349,7 @@ const ParsedChatRequest = struct {
     /// Owns parameters_json strings and tool_calls rendering.
     arena: std.heap.ArenaAllocator,
 
-    fn deinit(self: *ParsedChatRequest) void {
+    pub fn deinit(self: *ParsedChatRequest) void {
         freeStopSequences(self.stop_allocator, self.stop);
         self.parsed.deinit();
         self.arena.deinit();
@@ -1384,10 +1386,10 @@ fn estimateChatPromptBytes(roles: []const []const u8, contents: []const []const 
 }
 
 fn buildChatPrompt(allocator: std.mem.Allocator, tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, skip_thinking_template: bool, tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice, buf: []u8) ![]const u8 {
-    const tf = tool_format.forTemplate(tokenizer.detectTemplateKind());
+    const tf = tool_format.forTokenizer(tokenizer);
     const tools_for_template = if (tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else tools;
-    const forced_tool_name = forcedSingleToolName(tools_for_template, tool_choice);
-    const forced_tool_first_arg_name = forcedSingleToolFirstArgumentName(tools_for_template, tool_choice);
+    const forced_tool_name = if (tf.native_xml) null else forcedSingleToolName(tools_for_template, tool_choice);
+    const forced_tool_first_arg_name = if (tf.native_xml) null else forcedSingleToolFirstArgumentName(tools_for_template, tool_choice);
     return tokenizer.applyChatTemplateWithOptions(roles, contents, .{
         .enable_thinking = enable_thinking,
         .skip_thinking_template = skip_thinking_template,
@@ -1400,7 +1402,7 @@ fn buildChatPrompt(allocator: std.mem.Allocator, tokenizer: *const tokenizer_mod
     }, buf);
 }
 
-fn allocChatPrompt(
+pub fn allocChatPrompt(
     allocator: std.mem.Allocator,
     tokenizer: *const tokenizer_mod.Tokenizer,
     roles: []const []const u8,
@@ -1414,7 +1416,6 @@ fn allocChatPrompt(
     var attempts: u8 = 0;
     while (attempts < 4) : (attempts += 1) {
         const prompt_buf = try allocator.alloc(u8, capacity);
-        errdefer allocator.free(prompt_buf);
 
         const prompt = buildChatPrompt(allocator, tokenizer, roles, contents, enable_thinking, skip_thinking_template, tools, tool_choice, prompt_buf) catch |err| {
             allocator.free(prompt_buf);
@@ -1425,7 +1426,12 @@ fn allocChatPrompt(
             return err;
         };
 
-        return prompt_buf[0..prompt.len];
+        // Return an allocation of the advertised length, so callers can free
+        // it with a sized allocator. Returning a subslice corrupts Debug heaps.
+        return allocator.realloc(prompt_buf, prompt.len) catch |err| {
+            allocator.free(prompt_buf);
+            return err;
+        };
     }
 
     return error.BufferTooSmall;
@@ -1442,7 +1448,7 @@ fn buildChatTranscriptPrompt(
     tool_choice: ToolChoice,
     buf: []u8,
 ) ![]const u8 {
-    const tf = tool_format.forTemplate(tokenizer.detectTemplateKind());
+    const tf = tool_format.forTokenizer(tokenizer);
     const tools_for_template = if (tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else tools;
     return tokenizer.applyChatTemplateWithOptions(roles, contents, .{
         .add_generation_prompt = false,
@@ -1535,7 +1541,7 @@ test "transcriptTailAfter returns the end-of-turn tokens after the reply" {
 }
 
 fn decodeTokensToText(allocator: std.mem.Allocator, tokenizer: anytype, toks: []const u32) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var dec: [256]u8 = undefined;
     for (toks) |t| {
@@ -1549,7 +1555,7 @@ fn decodeTokensToText(allocator: std.mem.Allocator, tokenizer: anytype, toks: []
 /// it) from `text`: what a chat template drops when it re-renders a past
 /// assistant turn. An unclosed block is kept, since the template keeps it too.
 fn stripClosedThinkingBlocks(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < text.len) {
@@ -1646,7 +1652,7 @@ fn decodeTokenWindow(tokenizer: anytype, toks: []const u32, lo: usize, hi: usize
 
 fn isTransientChatReuseHint(role: []const u8, content: []const u8) bool {
     if (!std.mem.eql(u8, role, "system")) return false;
-    const trimmed = std.mem.trimLeft(u8, content, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, content, " \t\r\n");
     return std.mem.startsWith(u8, trimmed, "Tool path guard:") or
         std.mem.startsWith(u8, trimmed, "OpenCode continuation guard:");
 }
@@ -1665,7 +1671,7 @@ fn shouldForceDisableThinking(managed_id: ?[]const u8, model_path: []const u8, d
     return !entry.thinking_stable;
 }
 
-fn shouldSkipThinkingTemplateForRequest(tools_len: usize, tool_choice: ToolChoice, enable_thinking: ?bool) bool {
+pub fn shouldSkipThinkingTemplateForRequest(tools_len: usize, tool_choice: ToolChoice, enable_thinking: ?bool) bool {
     // A caller who explicitly asked for no thinking (or a model whose thinking
     // the catalog force-disables) keeps the closed <think></think> scaffold even
     // when tools are present. The bare assistant header below is the only
@@ -1698,7 +1704,7 @@ fn warmChatReuseCache(
     allocator: std.mem.Allocator,
 ) !void {
     if (session_id.len == 0) return;
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = host_io.nanoTimestamp();
 
     const processed_prefix_len = prompt_tokens.len + processed_generated_tokens.len;
     const persistent_count = persistentChatHistoryLen(roles, contents);
@@ -1802,7 +1808,7 @@ fn appendAssistantToolCallHistoryBlock(
     try buf.appendSlice(allocator, "}\n</tool_call>\n");
 }
 
-fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatRequest {
+pub fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatRequest {
     var parsed = try std.json.parseFromSlice(ChatRequestBody, allocator, body, .{
         .ignore_unknown_fields = true,
     });
@@ -1849,7 +1855,7 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         // assistant-visible <tool_call> blocks so the next tool result/user turn
         // has the same semantic context the model originally produced.
         if (tools_enabled and std.mem.eql(u8, message.role, "assistant") and message.tool_calls.len > 0) {
-            var rendered: std.ArrayList(u8) = .{};
+            var rendered: std.ArrayList(u8) = .empty;
             if (message.content.text.len > 0) {
                 const sanitized = sanitizeAssistantHistoryContent(message.content.text);
                 try rendered.appendSlice(arena_alloc, sanitized);
@@ -1924,6 +1930,26 @@ fn dropInjectedDefaultSystemForGemma(parsed: *ParsedChatRequest, is_gemma: bool)
     parsed.injected_default_system = false;
 }
 
+/// SDK history is OpenAI JSON; render its assistant calls in the model's native
+/// XML dialect before tokenization so tools and follow-up results round-trip.
+pub fn prepareChatForTokenizer(parsed: *ParsedChatRequest, tokenizer: *const tokenizer_mod.Tokenizer) !void {
+    const format = tool_format.forTokenizer(tokenizer);
+    if (!format.native_xml) return;
+    const a = parsed.arena.allocator();
+    const contents = try a.dupe([]const u8, parsed.contents);
+    for (parsed.roles, contents) |role, *content| {
+        if (!std.mem.eql(u8, role, "assistant") or std.mem.indexOf(u8, content.*, "<tool_call>") == null) continue;
+        const calls = try format.parseAssistantToolCallsWithTools(content.*, parsed.tools, a);
+        if (calls.tool_calls.len == 0) continue;
+        var rendered: std.ArrayList(u8) = .empty;
+        try rendered.appendSlice(a, calls.text_content);
+        if (rendered.items.len > 0 and rendered.items[rendered.items.len - 1] != '\n') try rendered.append(a, '\n');
+        for (calls.tool_calls) |call| try tool_format.appendAssistantCall(&rendered, a, call.name, call.arguments_json, true);
+        content.* = try rendered.toOwnedSlice(a);
+    }
+    parsed.contents = contents;
+}
+
 /// Combines the built-in template/leak stop strings with a request's
 /// client-supplied `stop` sequences into one list for `findStreamingStopStart`.
 /// @param allocator Owns the returned slice when `client_stops` is non-empty.
@@ -1951,7 +1977,7 @@ fn trimTrailingChatArtifacts(text: []const u8) []const u8 {
     var out = text;
     while (true) {
         const trimmed_left = trimLeadingStandaloneQuote(out);
-        const trimmed = std.mem.trimRight(u8, trimmed_left, " \t\r\n");
+        const trimmed = std.mem.trimEnd(u8, trimmed_left, " \t\r\n");
         if (std.mem.endsWith(u8, trimmed, "<|endoftext|>")) {
             out = trimmed[0 .. trimmed.len - "<|endoftext|>".len];
             continue;
@@ -1981,7 +2007,7 @@ fn trimDanglingListMarker(text: []const u8) ?[]const u8 {
     const line_start = (std.mem.lastIndexOfScalar(u8, text, '\n') orelse return null) + 1;
     const line = std.mem.trim(u8, text[line_start..], " \t\r\n");
     if (line.len == 1 and (line[0] == '-' or line[0] == '*')) {
-        return std.mem.trimRight(u8, text[0..line_start], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..line_start], " \t\r\n");
     }
     return null;
 }
@@ -2007,7 +2033,7 @@ const leaked_reasoning_start_markers = [_][]const u8{
 };
 
 fn startsWithLeakedReasoning(text: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     for (leaked_reasoning_start_markers) |marker| {
         if (trimmed.len >= marker.len and std.ascii.eqlIgnoreCase(trimmed[0..marker.len], marker)) return true;
     }
@@ -2026,7 +2052,7 @@ fn findLeakedReasoningStart(text: []const u8) ?usize {
 
 fn trimLeakedNoThinkingOutput(text: []const u8) []const u8 {
     if (findLeakedReasoningStart(text)) |idx| {
-        return std.mem.trimRight(u8, text[0..idx], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..idx], " \t\r\n");
     }
     return text;
 }
@@ -2034,7 +2060,7 @@ fn trimLeakedNoThinkingOutput(text: []const u8) []const u8 {
 fn findUnexpectedThinkingTailStart(text: []const u8) ?usize {
     // If text starts with <think>, skip past the first </think> so we detect REOPENED blocks
     var search_start: usize = 0;
-    const trimmed_start = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed_start = std.mem.trimStart(u8, text, " \t\r\n");
     if (std.mem.startsWith(u8, trimmed_start, "<think>")) {
         if (std.mem.indexOf(u8, text, "</think>")) |close_idx| {
             search_start = close_idx + "</think>".len;
@@ -2052,7 +2078,7 @@ fn findUnexpectedThinkingTailStart(text: []const u8) ?usize {
 
 fn trimUnexpectedThinkingTail(text: []const u8) []const u8 {
     if (findUnexpectedThinkingTailStart(text)) |idx| {
-        const trimmed = std.mem.trimRight(u8, text[0..idx], " \t\r\n");
+        const trimmed = std.mem.trimEnd(u8, text[0..idx], " \t\r\n");
         if (trimmed.len > 0) {
             return trimmed;
         }
@@ -2158,14 +2184,14 @@ fn extractAtemMessage(text: []const u8, prefix: []const u8) AtemMessage {
     return .{
         // Keep the right edge byte-for-byte while a response is streaming so
         // every normalized update remains an extension of the previous one.
-        .body = std.mem.trimLeft(u8, body[0 .. end orelse body.len], " \t\r\n"),
+        .body = std.mem.trimStart(u8, body[0 .. end orelse body.len], " \t\r\n"),
         .found = true,
         .complete = end != null,
     };
 }
 
 fn isPartialAtemEnvelope(text: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     if (trimmed.len == 0) return true;
     const envelopes = [_][]const u8{
         atem_analysis_prefix,
@@ -2327,7 +2353,7 @@ fn findRestartedAnswerStart(text: []const u8) ?usize {
 
 fn trimRestartedAnswer(text: []const u8) []const u8 {
     if (findRestartedAnswerStart(text)) |idx| {
-        return std.mem.trimRight(u8, text[0..idx], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..idx], " \t\r\n");
     }
     return text;
 }
@@ -2335,13 +2361,13 @@ fn trimRestartedAnswer(text: []const u8) []const u8 {
 fn sanitizeAssistantHistoryContent(text: []const u8) []const u8 {
     if (std.mem.startsWith(u8, text, empty_thinking_prefix)) {
         const body = sanitizeAnswerTail(text[empty_thinking_prefix.len..]);
-        return if (body.len == 0) text else std.mem.trimRight(u8, text[0 .. empty_thinking_prefix.len + body.len], " \t\r\n");
+        return if (body.len == 0) text else std.mem.trimEnd(u8, text[0 .. empty_thinking_prefix.len + body.len], " \t\r\n");
     }
     return sanitizeAnswerTail(text);
 }
 
 fn trimLeadingStandaloneQuote(text: []const u8) []const u8 {
-    var s = std.mem.trimLeft(u8, text, " \t\r\n");
+    var s = std.mem.trimStart(u8, text, " \t\r\n");
     if (s.len == 0 or s[0] != '"') return text;
     var i: usize = 1;
     var saw_newline = false;
@@ -2355,7 +2381,7 @@ fn trimLeadingStandaloneQuote(text: []const u8) []const u8 {
         break;
     }
     if (!saw_newline) return text;
-    return std.mem.trimLeft(u8, s[i..], " \t\r\n");
+    return std.mem.trimStart(u8, s[i..], " \t\r\n");
 }
 
 fn supportsEnabledThinking(tokenizer: *const tokenizer_mod.Tokenizer, enable_thinking: ?bool) bool {
@@ -2459,10 +2485,10 @@ fn compactHistoryAnswer(answer: []const u8) []const u8 {
             break;
         }
     }
-    return std.mem.trimRight(u8, trimmed[0..cut], " \t\r\n");
+    return std.mem.trimEnd(u8, trimmed[0..cut], " \t\r\n");
 }
 
-fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
+pub fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
     var cursor: usize = 0;
     var out_len: usize = 0;
 
@@ -2517,7 +2543,7 @@ fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
     const stripped = std.mem.trim(u8, buf[0..out_len], " \t\r\n");
     if (stripped.len > 0) return stripped;
 
-    const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, thinking_open_tag)) return stripped;
 
     const after_open = thinking_open_tag.len;
@@ -2533,13 +2559,13 @@ fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
 }
 
 fn hasDanglingTrailingQuote(text: []const u8) bool {
-    const trimmed = std.mem.trimRight(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, text, " \t\r\n");
     if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '"') return false;
     var body = trimmed[0 .. trimmed.len - 1];
     while (std.mem.endsWith(u8, body, utf8_replacement)) {
         body = body[0 .. body.len - utf8_replacement.len];
     }
-    body = std.mem.trimRight(u8, body, " \t\r\n");
+    body = std.mem.trimEnd(u8, body, " \t\r\n");
     if (body.len == 0) return true;
     var quote_count: usize = 0;
     for (body) |c| {
@@ -2594,7 +2620,7 @@ fn pendingGeneratedText(text: []const u8, sent_len: *usize, hold_back: usize) []
 }
 
 fn trimDanglingHeading(text: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimRight(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, text, " \t\r\n");
     if (trimmed.len == 0) return null;
     const line_start = (std.mem.lastIndexOfScalar(u8, trimmed, '\n') orelse return checkHeading(trimmed, 0));
     return checkHeading(trimmed, line_start + 1);
@@ -2607,7 +2633,7 @@ fn checkHeading(trimmed: []const u8, start: usize) ?[]const u8 {
         if (c != '#') return null;
     }
     if (start == 0) return "";
-    return std.mem.trimRight(u8, trimmed[0 .. start - 1], " \t\r\n");
+    return std.mem.trimEnd(u8, trimmed[0 .. start - 1], " \t\r\n");
 }
 
 /// Validates that the model the client requested is the one currently loaded;
@@ -2741,6 +2767,8 @@ fn handleChatCompletions(
     }
     defer runtime.setLogitsReadbackEnabled(engine, previous_logits_readback);
 
+    try prepareChatForTokenizer(&parsed, tokenizer);
+
     const prompt = allocChatPrompt(allocator, tokenizer, parsed.roles, parsed.contents, parsed.enable_thinking, skip_thinking_template, parsed.tools, parsed.tool_choice) catch |err| {
         if (err == error.OutOfMemory) {
             try conn.sendError(500, "internal_error", "Prompt allocation failed");
@@ -2759,7 +2787,7 @@ fn handleChatCompletions(
     // `encode` uses the tokenizer's allocator, which differs from the per-request
     // page allocator in server mode. Keep BOS packing in `encodePrompt` so this
     // route cannot accidentally free tokenizer-owned memory with the wrong allocator.
-    const tokenize_start_ns = std.time.nanoTimestamp();
+    const tokenize_start_ns = host_io.nanoTimestamp();
     var tokenize_cached = false;
     const prompt_tokens: []u32 = blk: {
         if (parsed.session_id.len > 0 and prompt.len >= TokenizeCache.min_prompt_bytes) {
@@ -2786,7 +2814,7 @@ fn handleChatCompletions(
     };
     errdefer allocator.free(prompt_tokens);
     defer allocator.free(prompt_tokens);
-    if (tokenize_cached and std.posix.getenv("ZINC_TOKENIZE_CACHE_VERIFY") != null) {
+    if (tokenize_cached and host_io.getenv("ZINC_TOKENIZE_CACHE_VERIFY") != null) {
         if (tokenizer.encodePrompt(prompt, allocator)) |full| {
             defer allocator.free(full);
             log.info("tokenize cache: verify {s} ({d} cached vs {d} full)", .{ if (std.mem.eql(u32, full, prompt_tokens)) "OK" else "MISMATCH", prompt_tokens.len, full.len });
@@ -2796,7 +2824,7 @@ fn handleChatCompletions(
         server_state.tokenize_cache.store(parsed.session_id, prompt, prompt_tokens);
     }
     if (prompt_tokens.len >= 16384) {
-        log.info("chat request: tokenized {d} bytes into {d} tokens in {d} ms{s}", .{ prompt.len, prompt_tokens.len, @divTrunc(std.time.nanoTimestamp() - tokenize_start_ns, 1_000_000), if (tokenize_cached) " (prefix from cache)" else "" });
+        log.info("chat request: tokenized {d} bytes into {d} tokens in {d} ms{s}", .{ prompt.len, prompt_tokens.len, @divTrunc(host_io.nanoTimestamp() - tokenize_start_ns, 1_000_000), if (tokenize_cached) " (prefix from cache)" else "" });
     }
     defer server_state.clearActiveContext();
     // What the engine actually prefills and continues. Differs from
@@ -2820,21 +2848,21 @@ fn handleChatCompletions(
     }
     server_state.setActiveContextTokens(prompt_token_count);
 
-    const ts = @divTrunc(std.time.timestamp(), 1);
+    const ts = @divTrunc(host_io.timestamp(), 1);
     const request_budget = memory_plan.requestBudget(
         prompt_token_count,
         parsed.max_tokens,
         resources.context_capacity_tokens,
     );
     const max_tokens = request_budget.completion_tokens;
-    const seed_ns: i128 = std.time.nanoTimestamp();
+    const seed_ns: i128 = host_io.nanoTimestamp();
     var req_id_buf: [32]u8 = undefined;
     const req_id = std.fmt.bufPrint(&req_id_buf, "chatcmpl-{x}", .{@as(u64, @truncate(@as(u128, @bitCast(seed_ns))))}) catch "chatcmpl-0";
     const thinking_enabled = supportsEnabledThinking(tokenizer, parsed.enable_thinking);
     const is_atem = tokenizer.detectTemplateKind() == .atem;
     const tools_for_choice = if (parsed.tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else parsed.tools;
-    const forced_tool_name = forcedSingleToolName(tools_for_choice, parsed.tool_choice);
-    const forced_tool_first_arg_name = forcedSingleToolFirstArgumentName(tools_for_choice, parsed.tool_choice);
+    const forced_tool_name = if (tool_format.forTokenizer(tokenizer).native_xml) null else forcedSingleToolName(tools_for_choice, parsed.tool_choice);
+    const forced_tool_first_arg_name = if (forced_tool_name == null) null else forcedSingleToolFirstArgumentName(tools_for_choice, parsed.tool_choice);
     const seed_bits: u128 = @bitCast(seed_ns);
     var prng = std.Random.DefaultPrng.init(@truncate(seed_bits));
     const random = prng.random();
@@ -2852,7 +2880,7 @@ fn handleChatCompletions(
         });
     }
 
-    var processed_generated_tokens: std.ArrayList(u32) = .{};
+    var processed_generated_tokens: std.ArrayList(u32) = .empty;
     defer processed_generated_tokens.deinit(allocator);
 
     var cache_assistant_text: ?[]u8 = null;
@@ -2910,7 +2938,7 @@ fn handleChatCompletions(
     // the end of the previous generation.
     var checkpoint_pos: ?u32 = if (cacheable_session) server_state.chat_reuse_cache.checkpointPosFor(parsed.session_id, resources.model_path) else null;
     if (cacheable_session) {
-        if (server_state.chat_reuse_cache.matchSession(parsed.session_id, resources.model_path, prompt_tokens, std.time.nanoTimestamp())) |m| {
+        if (server_state.chat_reuse_cache.matchSession(parsed.session_id, resources.model_path, prompt_tokens, host_io.nanoTimestamp())) |m| {
             if (m.consumed == m.reused) {
                 reused_prefix_len = m.reused;
             } else if (server_state.chat_reuse_cache.entryTokens(parsed.session_id)) |stored| {
@@ -2958,7 +2986,7 @@ fn handleChatCompletions(
     server_state.chat_reuse_cache.clearLive();
     runtime.mtpBeginRequest(engine);
     runtime.mtpSetPrimeDuringPrefill(engine, !sampling.requiresLogitsReadback());
-    const prefill_start_ns = std.time.nanoTimestamp();
+    const prefill_start_ns = host_io.nanoTimestamp();
     if (prompt_tokens.len >= 16384) {
         log.info("chat request: {d} ms from tokenization to prefill (reuse matching)", .{@divTrunc(prefill_start_ns - tokenize_start_ns, 1_000_000)});
     }
@@ -3038,12 +3066,12 @@ fn handleChatCompletions(
             }
         }
         // ZINC_CHAT_CHECKPOINT=0 falls back to transcript reuse (diagnostics).
-        const checkpoints_enabled = if (std.posix.getenv("ZINC_CHAT_CHECKPOINT")) |v| !std.mem.eql(u8, v, "0") else true;
+        const checkpoints_enabled = if (host_io.getenv("ZINC_CHAT_CHECKPOINT")) |v| !std.mem.eql(u8, v, "0") else true;
         checkpointed = checkpoints_enabled and runtime.ssmCheckpointTake(engine, &state);
         if (checkpointed) {
             // Store the tokens the engine actually processed: after a text
             // splice they differ from the canonical prompt and its indices.
-            server_state.chat_reuse_cache.storeCheckpointed(parsed.session_id, resources.model_path, engine_prompt_tokens[0..split_at], @intCast(split_at), std.time.nanoTimestamp()) catch |err| {
+            server_state.chat_reuse_cache.storeCheckpointed(parsed.session_id, resources.model_path, engine_prompt_tokens[0..split_at], @intCast(split_at), host_io.nanoTimestamp()) catch |err| {
                 log.warn("chat cache: could not store checkpointed prefix: {s}", .{@errorName(err)});
                 checkpointed = false;
             };
@@ -3066,7 +3094,7 @@ fn handleChatCompletions(
             log.info("chat cache checkpoint taken: session={s} position={d} generation_prompt={d}", .{ parsed.session_id, split_at, engine_prompt_tokens.len - split_at });
         }
     }
-    const prefill_end_ns = std.time.nanoTimestamp();
+    const prefill_end_ns = host_io.nanoTimestamp();
     logPrefillTiming(prefill_work_tokens, prefill_start_ns, prefill_end_ns);
     server_state.setActiveContextTokens(state.position);
     // NextN/MTP speculative decoding, for greedy requests. A prompt prefilled in
@@ -3107,9 +3135,10 @@ fn handleChatCompletions(
         // (so deinit always works) but `tools_active` short-circuits the per-chunk
         // detection logic when the request didn't ask for tools — in that case
         // bytes flow through directly via streamText, matching mainline latency.
-        const tools_active = parsed.tools.len > 0;
-        const stream_tool_fmt = tool_format.forTemplate(tokenizer.detectTemplateKind());
+        const tools_active = parsed.tools.len > 0 and parsed.tool_choice != .none;
+        const stream_tool_fmt = tool_format.forTokenizer(tokenizer);
         const stream_detector = try stream_tool_fmt.newStreamingDetector(allocator);
+        stream_detector.tools = parsed.tools;
         defer {
             stream_detector.deinit();
             allocator.destroy(stream_detector);
@@ -3117,7 +3146,7 @@ fn handleChatCompletions(
         var any_tool_call_emitted = false;
         var tool_call_index: u32 = 0;
         var generated: u32 = 0;
-        const decode_start_ns = std.time.nanoTimestamp();
+        const decode_start_ns = host_io.nanoTimestamp();
 
         if (max_tokens > 0) {
             var prev_token = runtime.sample(engine, &state, sampling, random);
@@ -3314,7 +3343,7 @@ fn handleChatCompletions(
                 }
             }
         }
-        const decode_end_ns = std.time.nanoTimestamp();
+        const decode_end_ns = host_io.nanoTimestamp();
         logGeneratedTiming(generated, decode_start_ns, decode_end_ns);
 
         if (forced_tool_name) |tool_name| {
@@ -3347,7 +3376,7 @@ fn handleChatCompletions(
             const structured_history_text = normalizeStructuredAssistantOutput(tokenizer, gen_text_buf[0..gen_text_len], thinking_enabled, &structured_history_buf) catch gen_text_buf[0..gen_text_len];
             const trimmed_stream_text = sanitizeAssistantHistoryContent(structured_history_text);
             var transport_buf: [32768]u8 = undefined;
-            var tool_history_buf: std.ArrayList(u8) = .{};
+            var tool_history_buf: std.ArrayList(u8) = .empty;
             defer tool_history_buf.deinit(allocator);
             const transport_text = historyAssistantContentWithTools(tokenizer, stream_tool_fmt, tools_active, trimmed_stream_text, &transport_buf, &tool_history_buf, allocator) catch trimmed_stream_text;
             cache_assistant_text = allocator.dupe(u8, transport_text) catch null;
@@ -3355,7 +3384,7 @@ fn handleChatCompletions(
     } else {
         // Non-streaming: use same prefill+decode loop with stop detection
         const stop_strs = try combinedStopStrings(parsed.arena.allocator(), parsed.stop);
-        var text_buf: std.ArrayList(u8) = .{};
+        var text_buf: std.ArrayList(u8) = .empty;
         defer text_buf.deinit(allocator);
         var ns_gen: u32 = 0;
         const nsIsEog = struct {
@@ -3364,7 +3393,7 @@ fn handleChatCompletions(
             }
         }.check;
         var finish_reason: FinishReason = if (max_tokens == 0 and parsed.max_tokens > 0) .length else .stop;
-        const decode_start_ns = std.time.nanoTimestamp();
+        const decode_start_ns = host_io.nanoTimestamp();
         if (max_tokens > 0) {
             var prev = runtime.sample(engine, &state, sampling, random);
             state.generated_tokens.append(allocator, prev) catch {};
@@ -3397,7 +3426,7 @@ fn handleChatCompletions(
                 finish_reason = .length;
             }
         }
-        const decode_end_ns = std.time.nanoTimestamp();
+        const decode_end_ns = host_io.nanoTimestamp();
         logGeneratedTiming(ns_gen, decode_start_ns, decode_end_ns);
 
         // Escape the full text for JSON
@@ -3421,12 +3450,12 @@ fn handleChatCompletions(
         // actually carried tools (and tool calling is enabled). Skipping for
         // tool-less requests avoids spending a parser pass on every chat
         // completion and keeps the path identical to mainline pre-merge.
-        const tool_fmt = tool_format.forTemplate(tokenizer.detectTemplateKind());
-        const parsed_output = if (parsed.tools.len > 0)
-            try tool_fmt.parseAssistantToolCalls(response_text, allocator)
+        const tool_fmt = tool_format.forTokenizer(tokenizer);
+        const parsed_output = if (parsed.tools.len > 0 and parsed.tool_choice != .none)
+            try tool_fmt.parseAssistantToolCallsWithTools(response_text, parsed.tools, allocator)
         else
             tool_format.ParsedAssistantOutput{ .text_content = "", .tool_calls = &.{} };
-        defer if (parsed.tools.len > 0) {
+        defer if (parsed.tools.len > 0 and parsed.tool_choice != .none) {
             for (parsed_output.tool_calls) |c| {
                 allocator.free(c.id);
                 allocator.free(c.name);
@@ -3442,29 +3471,29 @@ fn handleChatCompletions(
 
         if (parsed_output.tool_calls.len > 0) {
             // Emit response with tool_calls, content null
-            var wb: std.ArrayList(u8) = .{};
+            var wb: std.ArrayList(u8) = .empty;
             defer wb.deinit(allocator);
-            try wb.writer(allocator).print(
+            try wb.print(allocator,
                 \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":[
             , .{ req_id, ts, model_name });
             for (parsed_output.tool_calls, 0..) |tc, ti| {
                 if (ti > 0) try wb.appendSlice(allocator, ",");
                 var args_esc_buf: [16384]u8 = undefined;
                 const args_esc = jsonEscape(tc.arguments_json, &args_esc_buf);
-                try wb.writer(allocator).print(
+                try wb.print(allocator,
                     \\{{"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}
                 , .{ tc.id, tc.name, args_esc });
             }
-            try wb.writer(allocator).print(
+            try wb.print(allocator,
                 \\]}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{ @tagName(finish_reason), prompt_tokens.len, ns_gen, prompt_tokens.len + ns_gen });
             try conn.sendJson(200, wb.items);
         } else {
             const escaped_text = try jsonEscapeAlloc(allocator, response_text);
             defer allocator.free(escaped_text);
-            var wb: std.ArrayList(u8) = .{};
+            var wb: std.ArrayList(u8) = .empty;
             defer wb.deinit(allocator);
-            try wb.writer(allocator).print(
+            try wb.print(allocator,
                 \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{
                 req_id,       ts,                         model_name,
@@ -3475,7 +3504,7 @@ fn handleChatCompletions(
         }
         if (cacheable_session) {
             var transport_buf: [32768]u8 = undefined;
-            var tool_history_buf: std.ArrayList(u8) = .{};
+            var tool_history_buf: std.ArrayList(u8) = .empty;
             defer tool_history_buf.deinit(allocator);
             const transport_text = historyAssistantContentWithTools(tokenizer, tool_fmt, parsed.tools.len > 0, response_text, &transport_buf, &tool_history_buf, allocator) catch response_text;
             cache_assistant_text = allocator.dupe(u8, transport_text) catch null;
@@ -3549,8 +3578,8 @@ fn handleCompletions(
         });
     }
 
-    const ts = @divTrunc(std.time.timestamp(), 1);
-    const seed_ns: i128 = std.time.nanoTimestamp();
+    const ts = @divTrunc(host_io.timestamp(), 1);
+    const seed_ns: i128 = host_io.nanoTimestamp();
     var req_id_buf: [32]u8 = undefined;
     const req_id = std.fmt.bufPrint(&req_id_buf, "cmpl-{x}", .{@as(u64, @truncate(@as(u128, @bitCast(seed_ns))))}) catch "cmpl-0";
 
@@ -3561,7 +3590,7 @@ fn handleCompletions(
     };
     defer allocator.free(output_tokens);
 
-    var text_buf: std.ArrayList(u8) = .{};
+    var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(allocator);
     var decode_buf: [512]u8 = undefined;
     for (output_tokens) |tid| {
@@ -3577,9 +3606,9 @@ fn handleCompletions(
     const escaped_text = try jsonEscapeAlloc(allocator, text_buf.items);
     defer allocator.free(escaped_text);
 
-    var wb: std.ArrayList(u8) = .{};
+    var wb: std.ArrayList(u8) = .empty;
     defer wb.deinit(allocator);
-    try wb.writer(allocator).print(
+    try wb.print(allocator,
         \\{{"id":"{s}","object":"text_completion","created":{d},"model":"{s}","choices":[{{"index":0,"text":"{s}","finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         req_id,            ts,                                    model_name,
@@ -3784,7 +3813,7 @@ fn parseRequestBody(body: []const u8, allocator: std.mem.Allocator) !ParsedReque
 fn decodeJsonText(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     if (input.len == 0) return &[_]u8{};
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
     var i: usize = 0;
@@ -3923,80 +3952,106 @@ test "ParsedRequest defaults" {
 /// @param input Raw text to escape.
 /// @returns Heap-allocated JSON-escaped text.
 fn jsonEscapeAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, input.len);
     for (input) |c| {
-        switch (c) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, c),
-        }
+        var control: [6]u8 = undefined;
+        try out.appendSlice(allocator, jsonByteEscape(c, &control));
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn jsonByteEscape(c: u8, control: *[6]u8) []const u8 {
+    return switch (c) {
+        '"' => "\\\"",
+        '\\' => "\\\\",
+        '\n' => "\\n",
+        '\r' => "\\r",
+        '\t' => "\\t",
+        else => if (c < 0x20) blk: {
+            const hex = "0123456789abcdef";
+            control.* = .{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 15] };
+            break :blk control;
+        } else blk: {
+            control[0] = c;
+            break :blk control[0..1];
+        },
+    };
 }
 
 fn jsonEscape(input: []const u8, buf: []u8) []const u8 {
     var out: usize = 0;
     for (input) |c| {
-        if (out + 2 >= buf.len) break;
-        switch (c) {
-            '"' => {
-                buf[out] = '\\';
-                buf[out + 1] = '"';
-                out += 2;
-            },
-            '\\' => {
-                buf[out] = '\\';
-                buf[out + 1] = '\\';
-                out += 2;
-            },
-            '\n' => {
-                buf[out] = '\\';
-                buf[out + 1] = 'n';
-                out += 2;
-            },
-            '\r' => {
-                buf[out] = '\\';
-                buf[out + 1] = 'r';
-                out += 2;
-            },
-            '\t' => {
-                buf[out] = '\\';
-                buf[out + 1] = 't';
-                out += 2;
-            },
-            else => {
-                buf[out] = c;
-                out += 1;
-            },
-        }
+        var control: [6]u8 = undefined;
+        const escaped = jsonByteEscape(c, &control);
+        if (out + escaped.len > buf.len) break;
+        @memcpy(buf[out..][0..escaped.len], escaped);
+        out += escaped.len;
     }
     return buf[0..out];
 }
 
-fn streamText(
+test "chat JSON escaping preserves all control bytes and Unicode" {
+    const a = std.testing.allocator;
+    const input = "control: \x00\x01\x08\x0c\n\r\t\"\\ café 東京 🚀";
+    const escaped = try jsonEscapeAlloc(a, input);
+    defer a.free(escaped);
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(escaped, jsonEscape(input, &buf));
+    const json = try std.fmt.allocPrint(a, "\"{s}\"", .{escaped});
+    defer a.free(json);
+    const parsed = try std.json.parseFromSlice([]const u8, a, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(input, parsed.value);
+}
+
+pub fn streamText(
     conn: *http.Connection,
     text: []const u8,
     req_id: []const u8,
     ts: i64,
     model_name: []const u8,
 ) !void {
-    var escaped_buf: [8192]u8 = undefined;
-    const escaped = jsonEscape(text, &escaped_buf);
-    var chunk_buf: [16384]u8 = undefined;
-    const chunk = std.fmt.bufPrint(&chunk_buf,
-        \\{{"id":"{s}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"content":"{s}"}},"finish_reason":null}}]}}
-    , .{ req_id, ts, model_name, escaped }) catch return error.BufferTooSmall;
-    try conn.writeSseEvent(chunk);
+    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
+    var offset: usize = 0;
+    while (offset < text.len) {
+        // Even all-control-byte content fits after JSON escaping. Keep UTF-8
+        // characters whole instead of truncating a large detector flush.
+        const part = completeUtf8Prefix(text[offset..@min(text.len, offset + 1024)]);
+        var escaped_buf: [8192]u8 = undefined;
+        const escaped = jsonEscape(part, &escaped_buf);
+        var chunk_buf: [16384]u8 = undefined;
+        const chunk = std.fmt.bufPrint(&chunk_buf,
+            \\{{"id":"{s}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"content":"{s}"}},"finish_reason":null}}]}}
+        , .{ req_id, ts, model_name, escaped }) catch return error.BufferTooSmall;
+        try conn.writeSseEvent(chunk);
+        offset += part.len;
+    }
+}
+
+/// Drop only an unfinished UTF-8 character at the end of decoded token bytes.
+/// A token budget can stop in the middle of a character. Keep its complete
+/// prefix for both JSON and SSE; interior invalid bytes are validated by callers.
+pub fn completeUtf8Prefix(text: []const u8) []const u8 {
+    if (text.len == 0) return text;
+    var start = text.len - 1;
+    while (start > 0 and text[start] & 0xc0 == 0x80) : (start -= 1) {}
+    const length = std.unicode.utf8ByteSequenceLength(text[start]) catch return text;
+    return if (text.len - start < length) text[0..start] else text;
+}
+
+test "response token budgets retain only complete Unicode characters" {
+    const text = "ASCII café 東京 🚀 🧑🏽‍💻\n";
+    for (0..text.len + 1) |end| {
+        var expected = end;
+        while (!std.unicode.utf8ValidateSlice(text[0..expected])) : (expected -= 1) {}
+        try std.testing.expectEqualStrings(text[0..expected], completeUtf8Prefix(text[0..end]));
+    }
 }
 
 /// Send content text through the streaming detector.
 /// Errors propagate upward; callers use `catch return` to stop streaming on failure.
-fn streamTextViaDetector(
+pub fn streamTextViaDetector(
     conn: *http.Connection,
     text: []const u8,
     req_id: []const u8,
@@ -4040,7 +4095,7 @@ fn streamTextViaDetector(
     }
 }
 
-fn formatStreamingToolCallChunk(
+pub fn formatStreamingToolCallChunk(
     allocator: std.mem.Allocator,
     req_id: []const u8,
     ts: i64,
@@ -4050,10 +4105,10 @@ fn formatStreamingToolCallChunk(
     name: []const u8,
     arguments_json: []const u8,
 ) ![]u8 {
-    var wb: std.ArrayList(u8) = .{};
+    var wb: std.ArrayList(u8) = .empty;
     errdefer wb.deinit(allocator);
 
-    try wb.writer(allocator).print(
+    try wb.print(allocator,
         \\{{"id":"{s}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"
     , .{ req_id, ts, model_name, tool_call_index, id, name });
 
@@ -4134,12 +4189,12 @@ fn forcedToolArgumentsSlice(generated_text: []const u8) []const u8 {
     return "";
 }
 
-fn forcedToolArgumentsJsonAlloc(allocator: std.mem.Allocator, first_arg_name: ?[]const u8, generated_text: []const u8) ![]u8 {
-    var merged: std.ArrayList(u8) = .{};
+pub fn forcedToolArgumentsJsonAlloc(allocator: std.mem.Allocator, first_arg_name: ?[]const u8, generated_text: []const u8) ![]u8 {
+    var merged: std.ArrayList(u8) = .empty;
     defer merged.deinit(allocator);
 
     if (first_arg_name) |arg_name| {
-        try merged.writer(allocator).print("{{\"{s}\":", .{arg_name});
+        try merged.print(allocator, "{{\"{s}\":", .{arg_name});
     }
     try merged.appendSlice(allocator, forcedToolArgumentTail(generated_text));
 
@@ -4161,8 +4216,8 @@ fn serveChatUi(conn: *http.Connection) !void {
     const html = @embedFile("chat.html");
     var buf: [256]u8 = undefined;
     const header = std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{html.len}) catch return error.HeaderTooLarge;
-    try conn.stream.writeAll(header);
-    try conn.stream.writeAll(html);
+    try host_io.writeSocketAll(conn.stream, header);
+    try host_io.writeSocketAll(conn.stream, html);
 }
 
 fn fallbackModelName(model: *const Model) []const u8 {
@@ -4524,7 +4579,7 @@ test "lastCompleteUtf8End streams emoji byte-by-byte without dropping bytes" {
     // the next chunk completes the codepoint. Concatenating the emitted
     // chunks must reproduce the original bytes exactly.
     const full = "x\xF0\x9F\x94\xA7y";
-    var emitted: std.ArrayList(u8) = .{};
+    var emitted: std.ArrayList(u8) = .empty;
     defer emitted.deinit(std.testing.allocator);
 
     var sent: usize = 0;
@@ -5065,7 +5120,7 @@ test "formatStreamingToolCallChunk handles large arguments payloads" {
 
     const prefix = "{\"path\":\"";
     const suffix = "\"}";
-    var args: std.ArrayList(u8) = .{};
+    var args: std.ArrayList(u8) = .empty;
     defer args.deinit(std.testing.allocator);
     try args.appendSlice(std.testing.allocator, prefix);
     try args.appendSlice(std.testing.allocator, &big_args);
@@ -5477,8 +5532,8 @@ test "assistantAnswerForHistory drops completed reasoning blocks" {
 }
 
 test "assistantAnswerForHistory compacts long answers" {
-    const long_answer = "Kernel programming in Zig gives you explicit control. " ** 24;
-    const compacted = assistantAnswerForHistory(long_answer);
+    const long_answer = host_io.repeatText("Kernel programming in Zig gives you explicit control. ", 24);
+    const compacted = assistantAnswerForHistory(&long_answer);
     try std.testing.expect(compacted.len < long_answer.len);
     try std.testing.expect(std.mem.startsWith(u8, compacted, "Kernel programming in Zig"));
 }
@@ -5510,7 +5565,7 @@ test "historyAssistantContentWithTools keeps assistant tool calls in cached hist
     defer qwen_tok.token_to_id.deinit();
 
     var transport_buf: [512]u8 = undefined;
-    var tool_history_buf: std.ArrayList(u8) = .{};
+    var tool_history_buf: std.ArrayList(u8) = .empty;
     defer tool_history_buf.deinit(std.testing.allocator);
     const cached = try historyAssistantContentWithTools(
         &qwen_tok,
@@ -5678,7 +5733,7 @@ test "ServerState snapshot tracks active queued and uptime" {
 }
 
 test "buildHealthJson includes request counts and uptime" {
-    var state = ServerState.init(std.time.timestamp() - 5);
+    var state = ServerState.init(host_io.timestamp() - 5);
     _ = state.active_requests.fetchAdd(1, .monotonic);
     _ = state.queued_requests.fetchAdd(1, .monotonic);
     state.setActiveContextTokens(1024);
@@ -5771,4 +5826,38 @@ test "findStreamingStopStart stops a tight loop in open reasoning but not distan
         "and interop with C headers works without writing bindings by hand because the compiler translates them directly, ";
     const distant = fact ++ near_filler ++ fact ++ far_filler ++ fact;
     try std.testing.expect(findStreamingStopStart(distant, chat_stop_strs[0..], true) == null);
+}
+
+test "native Qwen XML templates order tools and round trip OpenAI assistant history" {
+    const a = std.testing.allocator;
+    var parsed = try parseChatRequest(a,
+        \\{"messages":[{"role":"system","content":"Source changes only."},{"role":"user","content":"Read the file."},{"role":"assistant","content":null,"tool_calls":[{"id":"example","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"src/表.mjs\",\"offset\":2}"}}]},{"role":"tool","tool_call_id":"example","content":"file contents"}],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"offset":{"type":"integer"}}}}}],"tool_choice":"required"}
+    );
+    defer parsed.deinit();
+    var tok = makeTestTokenizer("<|im_start|> <function=example> <think>");
+    try std.testing.expect(tool_format.forTokenizer(&tok).native_xml);
+    try prepareChatForTokenizer(&parsed, &tok);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "<function=read>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "<parameter=offset>\n2\n</parameter>") != null);
+    const prompt = try allocChatPrompt(a, &tok, parsed.roles, parsed.contents, false, false, parsed.tools, parsed.tool_choice);
+    defer a.free(prompt);
+    const defs = std.mem.indexOf(u8, prompt, "# Tools").?;
+    const guidance = std.mem.indexOf(u8, prompt, "Source changes only.").?;
+    const user = std.mem.indexOf(u8, prompt, "Read the file.").?;
+    try std.testing.expect(defs < guidance and guidance < user);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<tool_response>\nfile contents") != null);
+    try std.testing.expect(!std.mem.endsWith(u8, prompt, "\"offset\":"));
+    tok.chat_template = "<|im_start|> {\"name\":\"example\"}";
+    try std.testing.expect(!tool_format.forTokenizer(&tok).native_xml);
+}
+
+fn checkNativeChatPromptAllocation(allocator: std.mem.Allocator) !void {
+    const tok = makeTestTokenizer("<|im_start|> <function=example>");
+    const tools = [_]tool_format.ToolDefinition{.{ .name = "read", .description = "Read a file.", .parameters_json = "{}" }};
+    const prompt = try allocChatPrompt(allocator, &tok, &.{ "system", "user" }, &.{ "Use tools.", "Read." }, false, false, &tools, .auto);
+    defer allocator.free(prompt);
+}
+
+test "native tool prompt allocations can be freed and clean up every failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkNativeChatPromptAllocation, .{});
 }

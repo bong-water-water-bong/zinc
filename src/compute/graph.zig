@@ -407,7 +407,7 @@ fn classifyNode(node: *const Node, hardware: HardwareInfo) struct { kind: Bottle
 /// Static compute graph for a transformer layer or full decode pass.
 pub const Graph = struct {
     /// Graph nodes.
-    nodes: std.ArrayList(Node) = .{},
+    nodes: std.ArrayList(Node) = .empty,
     /// Allocator for owned resources.
     allocator: std.mem.Allocator,
     /// Human-readable debug name used in logs and diagnostic output.
@@ -581,7 +581,7 @@ pub const Graph = struct {
         }
 
         // Kahn's algorithm
-        var queue: std.ArrayList(u32) = .{};
+        var queue: std.ArrayList(u32) = .empty;
         defer queue.deinit(allocator);
 
         for (0..n) |i| {
@@ -726,12 +726,12 @@ pub const Graph = struct {
             if (width > max_parallel_width) max_parallel_width = width;
         }
 
-        const op_fields = std.meta.fields(OpType);
+        const op_fields = std.enums.values(OpType);
         var raw_op_counts = try allocator.alloc(u32, op_fields.len);
         defer allocator.free(raw_op_counts);
         @memset(raw_op_counts, 0);
         for (self.nodes.items) |node| {
-            raw_op_counts[@intFromEnum(node.op)] += 1;
+            raw_op_counts[@backingInt(node.op)] += 1;
         }
 
         var nonzero_op_count: usize = 0;
@@ -745,7 +745,7 @@ pub const Graph = struct {
         for (raw_op_counts, 0..) |count, index| {
             if (count == 0) continue;
             op_counts[op_idx] = .{
-                .op = @enumFromInt(index),
+                .op = @fromBackingInt(@intCast(index)),
                 .count = count,
             };
             op_idx += 1;

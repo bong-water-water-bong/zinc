@@ -1,11 +1,33 @@
 name: Site Build Check
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'docs/**'
+      - 'src/**'
+      - 'build.zig'
+      - '.zig-version'
+      - '.bun-version'
+      - 'bunfig.toml'
+      - 'scripts/zig.sh'
+      - 'tools/setup_opencode.mjs'
+      - 'tools/benchmark_quality.mjs'
+      - '.github/workflows/site-check.yml'
   pull_request:
     paths:
       - 'site/**'
       - 'docs/**'
       - 'src/**'
+      - 'build.zig'
+      - '.zig-version'
+      - '.bun-version'
+      - 'bunfig.toml'
+      - 'scripts/zig.sh'
+      - 'tools/setup_opencode.mjs'
+      - 'tools/benchmark_quality.mjs'
+      - '.github/workflows/site-check.yml'
 
 jobs:
   build:
@@ -13,19 +35,45 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0  # Full history for git lastmod
+          fetch-depth: 0 # Full history for git lastmod
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: '.bun-version'
 
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version-file: 'site/.node-version'
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          use-cache: false
+
+      - name: Install headers for the native API layout probe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev
 
       - name: Install dependencies
         working-directory: site
-        run: npm ci
+        run: bun install --frozen-lockfile
 
       - name: Build site
         working-directory: site
-        run: npm run build
+        run: bun run build
+
+      - name: Check benchmark calculations
+        working-directory: site
+        run: bun test src/lib/benchmark-view.test.ts
+
+      - name: Install browser for benchmark checks
+        working-directory: site
+        run: bunx playwright install --with-deps chromium
+
+      - name: Check rendered benchmarks
+        working-directory: site
+        run: bun run check:benchmarks
 
       - name: Check output
         working-directory: site
@@ -37,4 +85,6 @@ jobs:
           test -f dist/feed.xml
           test -f dist/sitemap-index.xml
           test -f dist/robots.txt
+          test -f dist/zinc/harnesses/setup-opencode.mjs
+          cmp ../tools/setup_opencode.mjs dist/zinc/harnesses/setup-opencode.mjs
           echo "All checks passed."

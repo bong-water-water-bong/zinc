@@ -356,13 +356,13 @@ pub fn parseWithOptions(data: []const u8, allocator: std.mem.Allocator, options:
         return error.InvalidMagic;
     }
 
-    const version: GGUFVersion = @enumFromInt(reader.readU32());
+    const version: GGUFVersion = @fromBackingInt(@intCast(reader.readU32()));
     const tensor_count = reader.readU64();
     const metadata_count = reader.readU64();
 
     if (options.log_summary) {
         log.info("GGUF v{d}: {d} tensors, {d} metadata entries", .{
-            @intFromEnum(version), tensor_count, metadata_count,
+            @backingInt(version), tensor_count, metadata_count,
         });
     }
 
@@ -378,7 +378,7 @@ pub fn parseWithOptions(data: []const u8, allocator: std.mem.Allocator, options:
     }
 
     // Parse tensor descriptors
-    var tensors: std.ArrayList(TensorInfo) = .{};
+    var tensors: std.ArrayList(TensorInfo) = .empty;
     errdefer tensors.deinit(allocator);
 
     for (0..tensor_count) |_| {
@@ -391,7 +391,7 @@ pub fn parseWithOptions(data: []const u8, allocator: std.mem.Allocator, options:
             dims[d] = reader.readU64();
         }
 
-        const type_: GGMLType = @enumFromInt(reader.readU32());
+        const type_: GGMLType = @fromBackingInt(@intCast(reader.readU32()));
         const offset = reader.readU64();
 
         try tensors.append(allocator, .{
@@ -485,7 +485,7 @@ const Reader = struct {
     }
 
     fn readMetadataValue(self: *Reader, allocator: std.mem.Allocator) !MetadataValue {
-        const type_: GGUFType = @enumFromInt(self.readU32());
+        const type_: GGUFType = @fromBackingInt(@intCast(self.readU32()));
         return switch (type_) {
             .uint8 => .{ .uint8 = self.readU8() },
             .int8 => .{ .int8 = @bitCast(self.readU8()) },
@@ -508,7 +508,7 @@ const Reader = struct {
             .int64 => .{ .int64 = self.readI64() },
             .float64 => .{ .float64 = self.readF64() },
             .array => blk: {
-                const elem_type: GGUFType = @enumFromInt(self.readU32());
+                const elem_type: GGUFType = @fromBackingInt(@intCast(self.readU32()));
                 const count = self.readU64();
                 const items = try allocator.alloc(MetadataValue, @intCast(count));
                 errdefer allocator.free(items);
@@ -518,7 +518,7 @@ const Reader = struct {
                 break :blk .{ .array = items };
             },
             _ => {
-                log.err("Unknown GGUF metadata type: {d}", .{@intFromEnum(type_)});
+                log.err("Unknown GGUF metadata type: {d}", .{@backingInt(type_)});
                 return error.UnknownMetadataType;
             },
         };

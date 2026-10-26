@@ -1,0 +1,7 @@
+Reference token-type promotion and demotion probes.
+<bos> <eos> <turn|> <|tool_response> </s>
+before </s> after; before <eos> after; before <|end|> after.
+<|eot_id|> <|im_end|> <|end|> <|return|> <|call|> <|flush|> <|calls|>
+<end_of_turn> <|endoftext|> <|eom_id|> <EOT> _<EOT> [EOT] [EOS]
+<|end_of_text|> <end_of_utterance> <｜end▁of▁sentence｜> [e~[
+Ordinary text: <>& <?> <()> <x> & <>literal.

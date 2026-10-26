@@ -1,0 +1,30 @@
+{
+  "complete": true,
+  "cases": [
+    {
+      "case": "plain",
+      "pass": true,
+      "http_calls": 2
+    },
+    {
+      "case": "chunked",
+      "pass": true,
+      "http_calls": 2
+    },
+    {
+      "case": "cached",
+      "pass": true,
+      "http_calls": 0
+    },
+    {
+      "case": "bad-digest",
+      "pass": true,
+      "http_calls": 2
+    },
+    {
+      "case": "truncated",
+      "pass": true,
+      "http_calls": 2
+    }
+  ]
+}
