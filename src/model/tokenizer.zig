@@ -1318,17 +1318,23 @@ pub const Tokenizer = struct {
         return false;
     }
 
-    /// True when the embedded chat template renders `bos_token` before anything else
-    /// (`{{- bos_token }}...`, as MiniCPM5's does). The built-in renderers then emit the
-    /// BOS text too, as a Jinja renderer would; without it MiniCPM5 answers a ChatML turn
-    /// with an immediate <|im_end|>.
+    /// Recognize an unconditional leading `{{ bos_token }}` output, including
+    /// Jinja whitespace control and multiline spacing (as in MiniCPM5).
+    /// This is deliberately not an expression evaluator: a conditional, filter,
+    /// or similarly named variable does not establish that BOS will be emitted.
     pub fn templateStartsWithBos(self: *const Tokenizer) bool {
         const tmpl = self.chat_template orelse return false;
-        if (self.bos_id == null) return false;
-        var rest = std.mem.trimLeft(u8, tmpl, " \t\r\n");
+        const bos = self.bos_id orelse return false;
+        if (bos >= self.vocab.len) return false;
+        const whitespace = " \t\r\n\x0b\x0c";
+        var rest = std.mem.trimStart(u8, tmpl, whitespace);
         if (!std.mem.startsWith(u8, rest, "{{")) return false;
-        rest = std.mem.trimLeft(u8, rest[2..], "-+ ");
-        return std.mem.startsWith(u8, rest, "bos_token");
+        rest = rest[2..];
+        if (std.mem.startsWith(u8, rest, "-") or std.mem.startsWith(u8, rest, "+")) rest = rest[1..];
+        const end = std.mem.indexOf(u8, rest, "}}") orelse return false;
+        var expression = rest[0..end];
+        if (std.mem.endsWith(u8, expression, "-")) expression = expression[0 .. expression.len - 1];
+        return std.mem.eql(u8, std.mem.trim(u8, expression, whitespace), "bos_token");
     }
 
     /// Return the model's beginning-of-sequence token ID.
@@ -1888,17 +1894,93 @@ test "templateStartsWithBos only for templates that open with bos_token" {
     };
     defer tok.token_to_id.deinit();
 
-    tok.chat_template = "{{- bos_token }}{%- for message in messages %}<|im_start|>";
-    try std.testing.expect(tok.templateStartsWithBos());
-    tok.chat_template = "\n{{ bos_token }}<|im_start|>";
-    try std.testing.expect(tok.templateStartsWithBos());
-    tok.chat_template = "{%- for message in messages %}<|im_start|>{{ bos_token }}";
-    try std.testing.expect(!tok.templateStartsWithBos());
+    for ([_][]const u8{
+        "{{- bos_token }}{%- for message in messages %}<|im_start|>",
+        "\n{{ bos_token }}<|im_start|>",
+        "{{bos_token}}<|im_start|>",
+        "{{+ bos_token }}<|im_start|>",
+        "{{-\n\tbos_token\r\n-}}<|im_start|>",
+    }) |template| {
+        tok.chat_template = template;
+        try std.testing.expect(tok.templateStartsWithBos());
+    }
+    for ([_][]const u8{
+        "{%- for message in messages %}<|im_start|>{{ bos_token }}",
+        "{{- bos_token if false else '' }}<|im_start|>",
+        "{{ bos_token_id }}<|im_start|>",
+        "{{ bos_token | replace('<s>', '') }}<|im_start|>",
+        "{{ bos_token + 'other' }}<|im_start|>",
+        "{{- bos_token",
+        "{{ --bos_token }}<|im_start|>",
+        "{{ bos_token +}}<|im_start|>",
+    }) |template| {
+        tok.chat_template = template;
+        try std.testing.expect(!tok.templateStartsWithBos());
+    }
     tok.chat_template = null;
     try std.testing.expect(!tok.templateStartsWithBos());
     tok.chat_template = "{{- bos_token }}<|im_start|>";
     tok.bos_id = null;
     try std.testing.expect(!tok.templateStartsWithBos());
+    tok.bos_id = 2;
+    try std.testing.expect(!tok.templateStartsWithBos());
+}
+
+test "ChatML renders and encodes an explicit BOS exactly once" {
+    const vocab = [_][]const u8{ "<s>", "</s>", "<|im_start|>", "<|im_end|>", "h", "i" };
+    var tok = Tokenizer{
+        .vocab = &vocab,
+        .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = 0,
+        .eos_id = 1,
+        // MiniCPM5 disables automatic BOS but explicitly emits it in Jinja.
+        .prepend_bos = false,
+        .allocator = std.testing.allocator,
+    };
+    defer tok.token_to_id.deinit();
+    for (vocab, 0..) |text, id| try tok.token_to_id.put(text, @intCast(id));
+
+    const turns = "{%- for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+    const expected = "<s><|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n";
+    var buf: [256]u8 = undefined;
+    for ([_][]const u8{ "{{- bos_token }}" ++ turns, "{{-\n\tbos_token -}}" ++ turns }) |template| {
+        tok.chat_template = template;
+        const rendered = try tok.applyChatTemplate(&.{"user"}, &.{"hi"}, &buf);
+        // Golden text from the corresponding Jinja render, before encoding.
+        try std.testing.expectEqualStrings(expected, rendered);
+        const ids = try tok.encodePrompt(rendered, std.testing.allocator);
+        defer std.testing.allocator.free(ids);
+        try std.testing.expectEqual(@as(u32, 0), ids[0]);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{0}));
+        tok.prepend_bos = true;
+        const auto_ids = try tok.encodePrompt(rendered, std.testing.allocator);
+        defer std.testing.allocator.free(auto_ids);
+        try std.testing.expectEqualSlices(u32, ids, auto_ids);
+        tok.prepend_bos = false;
+
+        const history = try tok.applyChatTemplateWithOptions(&.{"user"}, &.{"hi"}, .{ .add_generation_prompt = false }, &buf);
+        try std.testing.expectEqualStrings("<s><|im_start|>user\nhi<|im_end|>\n", history);
+        var tiny: [2]u8 = undefined;
+        try std.testing.expectError(error.BufferTooSmall, tok.applyChatTemplate(&.{"user"}, &.{"hi"}, &tiny));
+    }
+
+    tok.chat_template = "{{- bos_token if false else '' }}" ++ turns;
+    const suppressed = try tok.applyChatTemplate(&.{"user"}, &.{"hi"}, &buf);
+    try std.testing.expectEqualStrings(expected[3..], suppressed);
+    const suppressed_ids = try tok.encodePrompt(suppressed, std.testing.allocator);
+    defer std.testing.allocator.free(suppressed_ids);
+    try std.testing.expectEqual(@as(u32, 2), suppressed_ids[0]);
+
+    // Raw completions still follow metadata rather than the chat template.
+    const raw_ids = try tok.encodePrompt("hi", std.testing.allocator);
+    defer std.testing.allocator.free(raw_ids);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 5 }, raw_ids);
+    tok.prepend_bos = true;
+    const raw_auto_ids = try tok.encodePrompt("hi", std.testing.allocator);
+    defer std.testing.allocator.free(raw_auto_ids);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 4, 5 }, raw_auto_ids);
 }
 
 test "initFromGGUF populates merge_ranks cache when merges are present" {
