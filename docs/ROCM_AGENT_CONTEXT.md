@@ -180,12 +180,35 @@ independent check in 8.9 seconds. The acceptance test and portable configuration
 remained unchanged. These are harness transport/lifecycle checks; no model
 performed inference or demonstrated coding ability in this fixture.
 
-All 26 harness tests pass on Linux and macOS, covering cancellation and API
+That recovery change passed all 26 harness tests on Linux and macOS, covering cancellation and API
 errors as well as real subprocess checks for partial edits and background
 process cleanup.
-The combined Zig/Bun CPU command passes; standalone Bun has 692 passing tests,
+The combined Zig/Bun CPU command passed; standalone Bun had 692 passing tests,
 six skipped GPU/API tests, and no failures. The RDNA GPU remains unavailable,
 so model-driven coding acceptance and performance measurements remain pending.
+
+### Harness failure checks (2026-10-26)
+
+Further failure checks found that an OpenCode JSON API error could leave the
+client alive until its editing deadline. The wrapper now stops that child as
+soon as it reports the error, returns failure even if the child exits zero,
+and skips independent verification. A real subprocess regression checks that
+the stopped client cannot continue tool work after the error.
+
+Empty or whitespace-only tasks are rejected before reading the project config
+or launching commands. Task and round timeouts are limited to positive integer
+milliseconds up to 2,147,483,647: a Bun probe confirmed that a larger native
+timer instead fires after one millisecond. The overall budget now uses a
+monotonic clock, and verification returning zero after that deadline cannot
+produce success. User interruption still takes precedence over timeout.
+
+All 31 harness tests pass on Linux and macOS. The full CPU suites pass with
+697 Bun tests, six GPU/API skips, and no failures, plus the Zig suite.
+Actual OpenCode 1.19.4 also passed two CPU protocol fixtures using scripted
+responses: the timeout/repair sequence still completed, and an HTTP API error
+produced a failing run without starting verification. The portable config
+remained unchanged in both fixtures. These checks perform no model inference;
+the GPU-dependent acceptance and performance checks below remain pending.
 
 ## Remaining hardware validation
 

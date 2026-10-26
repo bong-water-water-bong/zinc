@@ -14,7 +14,8 @@
     "prompt_cache": "6998550967a936b1ff130e2df12c98eeb25a1171",
     "model_discovery": "0d0d3795ead5fe4330aa61eaa244b4fb8cc0b63b",
     "verification_rounds": "18dd8b7b245c8c7037c36e0ec2ec937b37de93ea",
-    "verification_deadlines": "cde6201b26272ec7557ea4c133c29bbae4141aad"
+    "verification_deadlines": "cde6201b26272ec7557ea4c133c29bbae4141aad",
+    "verification_failure_guards": "3ed6069d3a845f7aed013725e717a45b6c166f43"
   },
   "attention": {
     "passed": 25,
@@ -164,11 +165,11 @@
   ],
   "current_cpu_checks": {
     "serializer_tests_passed": 10,
-    "setup_wrapper_tests_passed": 26,
+    "setup_wrapper_tests_passed": 31,
     "combined_zig_bun_test_command": "pass",
     "gpu_smoke_tests_in_local_command": "skipped",
     "standalone_bun": {
-      "passed": 692,
+      "passed": 697,
       "skipped": 6,
       "failed": 0
     }
@@ -224,6 +225,41 @@
       "linux_passed": 26,
       "macos_passed": 26,
       "failed": 0
+    },
+    "model_coding_acceptance": false
+  },
+  "harness_failure_guards": {
+    "date": "2026-10-26",
+    "source": "3ed6069d3a845f7aed013725e717a45b6c166f43",
+    "source_sha256": "497e33c45ca83d0c65a3443312059ef3ff329ea791b2e04ce21ec1da6abd34d2",
+    "empty_task_rejected_before_config_or_processes": true,
+    "maximum_timeout_ms": 2147483647,
+    "fatal_json_api_error_stops_child": true,
+    "real_child_cannot_continue_tool_work_after_error": true,
+    "overall_deadline_clock": "monotonic",
+    "late_passing_verification_rejected": true,
+    "user_cancellation_preserved": true,
+    "wrapper_tests": {
+      "linux_passed": 31,
+      "macos_passed": 31,
+      "failed": 0
+    },
+    "cpu_protocol_fixtures": {
+      "scope": "actual OpenCode with scripted HTTP responses; no model inference",
+      "opencode": "1.19.4",
+      "recovery": {
+        "exit_code": 0,
+        "elapsed_ms": 8910,
+        "protected_test_unchanged": true,
+        "configuration_unchanged": true
+      },
+      "api_error": {
+        "exit_code": 1,
+        "elapsed_ms": 1007,
+        "error_events": 1,
+        "verification_started": false,
+        "configuration_unchanged": true
+      }
     },
     "model_coding_acceptance": false
   }
