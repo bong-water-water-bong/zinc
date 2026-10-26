@@ -92,9 +92,12 @@ bun tools/setup_opencode.mjs run \
   --auto -- "Fix the failing tests. Read the relevant files, edit the source, and run the tests."
 ```
 
-The command streams OpenCode JSON events and propagates its exit status.
-An OpenCode JSON error event also makes the command fail. The default timeout
-is 15 minutes; `--timeout-ms` changes it, and a timeout exits with status 124.
+The command requires a nonempty task after `--`, including when using
+`--verify`. It streams OpenCode JSON events and propagates its exit status.
+An OpenCode JSON error event stops the child and fails the run, even when the
+CLI exits zero; independent verification cannot mask that error. The default
+timeout is 15 minutes; `--timeout-ms` changes it, and a timeout exits with status 124.
+Task and round timeouts must be integer milliseconds from 1 to 2,147,483,647.
 To continue a previous session, pass `--session ID` using the `sessionID` from
 its JSON events.
 `--auto` lets OpenCode approve tool requests for this headless run; explicit
@@ -108,9 +111,9 @@ bun tools/setup_opencode.mjs run --project ../my-project --auto \
   "Implement the agreed feature and pass the project tests."
 ```
 
-The caller-supplied command runs in the selected project after each successful
-OpenCode round. A failed check feeds real diagnostic excerpts back into the same
-session. Feedback is bounded, retaining the start, selected error lines, and end
+The caller-supplied command runs in the selected project after each completed
+or timed-out editing round. A failed check feeds real diagnostic excerpts back
+into the same session. Feedback is bounded, retaining the start, selected error lines, and end
 of a long log; the complete check output still streams to stderr.
 Each editing round is capped at eight model steps; `--attempts` defaults to
 three and allows at most ten. An editing round also has a five-minute deadline;
@@ -122,7 +125,8 @@ same session when attempts and time remain. API errors and user cancellation
 fail immediately. Round starts, deadlines, and check results appear on stderr,
 while stdout remains the OpenCode JSON event stream.
 
-The overall timeout covers editing and checks. Interrupted/timed-out checks
+The overall timeout covers editing and checks; a check finishing after the
+deadline cannot turn the run into a success. Interrupted/timed-out checks
 and exhausted attempts return a failure. Only a zero check status produces
 success. On POSIX systems, the wrapper also stops remaining processes in each
 owned child group, including background tools left after the main child exits.

@@ -7,6 +7,18 @@ import path from 'node:path';
 export const DEFAULT_BASE_URL = 'http://127.0.0.1:9090/v1';
 export const CONFIG_NAME = 'opencode.zinc.json';
 
+function requireTask(opts) {
+  if (!Array.isArray(opts.prompt) || !opts.prompt.join(' ').trim())
+    throw new Error('Pass a task after --');
+}
+
+function timeoutValue(value, label = 'Timeout') {
+  // Node-compatible timers overflow beyond this limit and can fire immediately.
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 2147483647)
+    throw new Error(`${label} must be a positive integer (maximum: 2147483647 ms)`);
+  return value;
+}
+
 export function parseArgs(argv = process.argv.slice(2)) {
   const opts = {
     command: 'setup',
@@ -269,10 +281,8 @@ export async function runOpenCode(
   opts,
   { env = process.env, spawnImpl = spawn, stdout = process.stdout, onEvent } = {},
 ) {
-  if (!opts.prompt.length) throw new Error('Pass a task after --');
-  const timeoutMs = opts.timeoutMs ?? 900000;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)
-    throw new Error('Timeout must be a positive integer');
+  requireTask(opts);
+  const timeoutMs = timeoutValue(opts.timeoutMs ?? 900000);
   const live = runtimeConfig(config, env);
   const args = [
     'run',
@@ -301,12 +311,37 @@ export async function runOpenCode(
     detached: process.platform !== 'win32',
   });
   let agentError = false;
+  let stopping = false;
+  let closed = false;
+  let timedOut = false;
+  let interruptedCode;
+  let timer;
+  let killTimer;
+  const stop = (signal) => {
+    if (child.pid && process.platform !== 'win32') {
+      try {
+        process.kill(-child.pid, signal);
+      } catch (error) {
+        if (error.code !== 'ESRCH') throw error;
+      }
+    } else child.kill(signal);
+  };
+  const terminate = (signal) => {
+    stopping = true;
+    clearTimeout(timer);
+    clearTimeout(killTimer);
+    killTimer = setTimeout(() => stop('SIGKILL'), 5000);
+    stop(signal);
+  };
   let pending = '';
   const decoder = new TextDecoder();
   const inspectLine = (line) => {
     try {
       const event = JSON.parse(line);
-      if (event.type === 'error') agentError = true;
+      if (event.type === 'error') {
+        agentError = true;
+        if (!stopping && !closed) terminate('SIGTERM');
+      }
       onEvent?.(event);
     } catch {
       /* Other CLI output is forwarded verbatim. */
@@ -321,29 +356,13 @@ export async function runOpenCode(
       pending = pending.slice(newline + 1);
     }
   });
-  const stop = (signal) => {
-    if (child.pid && process.platform !== 'win32') {
-      try {
-        process.kill(-child.pid, signal);
-      } catch (error) {
-        if (error.code !== 'ESRCH') throw error;
-      }
-    } else child.kill(signal);
-  };
-  let timedOut = false;
-  let interruptedCode;
-  let killTimer;
-  const timer = setTimeout(() => {
+  timer = setTimeout(() => {
     timedOut = true;
-    stop('SIGTERM');
-    killTimer = setTimeout(() => stop('SIGKILL'), 5000);
+    terminate('SIGTERM');
   }, timeoutMs);
   const interrupt = (signal, code) => {
     interruptedCode = code;
-    clearTimeout(timer);
-    clearTimeout(killTimer);
-    stop(signal);
-    killTimer = setTimeout(() => stop('SIGKILL'), 5000);
+    terminate(signal);
   };
   const onInt = () => interrupt('SIGINT', 130);
   const onTerm = () => interrupt('SIGTERM', 143);
@@ -353,6 +372,7 @@ export async function runOpenCode(
     return await new Promise((resolve, reject) => {
       child.once('error', reject);
       child.once('close', (code, signal) => {
+        closed = true;
         inspectLine(pending + decoder.decode());
         resolve(
           interruptedCode ??
@@ -365,6 +385,7 @@ export async function runOpenCode(
       });
     });
   } finally {
+    closed = true;
     process.off('SIGINT', onInt);
     process.off('SIGTERM', onTerm);
     clearTimeout(timer);
@@ -380,9 +401,7 @@ export async function runVerification(
   opts,
   { env = process.env, spawnImpl = spawn, stderr = process.stderr } = {},
 ) {
-  const timeoutMs = opts.timeoutMs ?? 900000;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)
-    throw new Error('Timeout must be a positive integer');
+  const timeoutMs = timeoutValue(opts.timeoutMs ?? 900000);
   const shell = process.platform === 'win32' ? env.ComSpec || 'cmd.exe' : '/bin/sh';
   const args = process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-c', command];
   const child = spawnImpl(shell, args, {
@@ -497,17 +516,15 @@ export async function runVerification(
 }
 
 export async function runVerifiedOpenCode(config, opts, deps = {}) {
+  requireTask(opts);
   if (!opts.verify?.trim()) throw new Error('Verification requires a nonempty command');
   const attempts = opts.attempts ?? 3;
   if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > 10)
     throw new Error('Attempts must be between 1 and 10');
-  const timeout = opts.timeoutMs ?? 900000;
-  if (!Number.isSafeInteger(timeout) || timeout <= 0)
-    throw new Error('Timeout must be a positive integer');
-  const roundTimeout = opts.roundTimeoutMs ?? 300000;
-  if (!Number.isSafeInteger(roundTimeout) || roundTimeout <= 0)
-    throw new Error('Round timeout must be a positive integer');
-  const deadline = Date.now() + timeout;
+  const timeout = timeoutValue(opts.timeoutMs ?? 900000);
+  const roundTimeout = timeoutValue(opts.roundTimeoutMs ?? 300000, 'Round timeout');
+  const now = deps.now ?? (() => performance.now());
+  const deadline = now() + timeout;
   const roundConfig = structuredClone(config);
   roundConfig.agent.zinc.steps = Math.min(roundConfig.agent.zinc.steps, 8);
   let session = opts.session;
@@ -521,7 +538,7 @@ export async function runVerifiedOpenCode(config, opts, deps = {}) {
   const executeVerification = deps.runCheck ?? runVerification;
   const stderr = deps.stderr ?? process.stderr;
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    const remaining = deadline - Date.now();
+    const remaining = Math.floor(deadline - now());
     if (remaining <= 1) return 124;
     // Leave part of the overall budget for an independent check even when a
     // model never ends its turn. Five minutes also bounds slow/repeated tools.
@@ -542,7 +559,7 @@ export async function runVerifiedOpenCode(config, opts, deps = {}) {
     if (code !== 0 && code !== 124) return code;
     if (code === 124)
       stderr.write(`Editing round ${attempt}/${attempts}: timed out; checking partial work\n`);
-    const checkBudget = deadline - Date.now();
+    const checkBudget = Math.floor(deadline - now());
     if (checkBudget <= 0) return 124;
     stderr.write(`Verification round ${attempt}/${attempts}: started\n`);
     const checked = await executeVerification(
@@ -550,12 +567,16 @@ export async function runVerifiedOpenCode(config, opts, deps = {}) {
       { project: opts.project, timeoutMs: checkBudget },
       deps,
     );
-    stderr.write(
-      `Verification round ${attempt}/${attempts}: ${checked.code === 0 ? 'passed' : 'failed'}\n`,
-    );
-    if (checked.code === 0) return 0;
-    last = code === 124 ? 124 : checked.code;
-    if ([124, 130, 143].includes(checked.code)) return checked.code;
+    const checkCode = [130, 143].includes(checked.code)
+      ? checked.code
+      : now() >= deadline
+        ? 124
+        : checked.code;
+    const status = checkCode === 0 ? 'passed' : checkCode === 124 ? 'timed out' : 'failed';
+    stderr.write(`Verification round ${attempt}/${attempts}: ${status}\n`);
+    if (checkCode === 0) return 0;
+    last = code === 124 ? 124 : checkCode;
+    if ([124, 130, 143].includes(checkCode)) return checkCode;
     if (!session) return last;
     prompt = [
       `Continue the coding task.${code === 124 ? ' The previous editing round reached its time limit.' : ''} Independent verification failed with exit ${checked.code}. Fix the implementation using these actual diagnostics; do not weaken tests or remove checks. ${roundInstructions}\n\nOriginal task:\n${opts.prompt.join(' ')}\n\nVerification command:\n${opts.verify}\n\nActual output:\n${checked.output}`,
@@ -612,6 +633,7 @@ Interactive: OPENCODE_CONFIG=./opencode.zinc.json opencode
   if (opts.attempts !== undefined && !opts.verify) throw new Error('Attempts requires --verify');
   if (opts.roundTimeoutMs !== undefined && !opts.verify)
     throw new Error('Round timeout requires --verify');
+  if (opts.command === 'run') requireTask(opts);
   if (opts.command === 'setup') {
     await writeConfig(opts.project, buildConfig(opts), opts);
     console.log(

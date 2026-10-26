@@ -198,6 +198,167 @@ describe('portable OpenCode setup', () => {
 describe('independent verification', () => {
   const quiet = { write: () => {} } as any;
 
+  test('rejects empty tasks before any model or verification process starts', async () => {
+    for (const prompt of [undefined, [], [' ', '\n']]) {
+      const deps = {
+        runModel: async () => {
+          throw new Error('model started');
+        },
+        runCheck: async () => {
+          throw new Error('check started');
+        },
+        spawnImpl: (() => {
+          throw new Error('process started');
+        }) as any,
+      };
+      const opts = { project: '.', prompt, verify: 'check' };
+      await expect(runOpenCode(buildConfig(), opts, deps)).rejects.toThrow('Pass a task');
+      await expect(runVerifiedOpenCode(buildConfig(), opts, deps)).rejects.toThrow('Pass a task');
+    }
+    const dir = await temp();
+    for (const tail of [[], ['--', ' ', '\n']]) {
+      const child = Bun.spawnSync([
+        process.execPath,
+        path.join(import.meta.dir, 'setup_opencode.mjs'),
+        'run',
+        '--project',
+        path.join(dir, 'uncreated'),
+        '--verify',
+        'must-not-run',
+        ...tail,
+      ]);
+      expect(child.exitCode).toBe(1);
+      expect(child.stderr.toString()).toContain('Pass a task after --');
+      expect(await readdir(dir)).toEqual([]);
+    }
+  });
+
+  test('rejects deadlines that overflow native timers before starting processes', async () => {
+    const deps = {
+      spawnImpl: (() => {
+        throw new Error('process started');
+      }) as any,
+      runModel: async () => {
+        throw new Error('model started');
+      },
+    };
+    for (const timeoutMs of [2147483648, Number.MAX_SAFE_INTEGER]) {
+      const opts = { project: '.', prompt: ['task'], verify: 'check', timeoutMs };
+      await expect(runOpenCode(buildConfig(), opts, deps)).rejects.toThrow('Timeout must');
+      await expect(runVerification('check', opts, deps)).rejects.toThrow('Timeout must');
+      await expect(runVerifiedOpenCode(buildConfig(), opts, deps)).rejects.toThrow('Timeout must');
+      await expect(
+        runVerifiedOpenCode(
+          buildConfig(),
+          { ...opts, timeoutMs: 1000, roundTimeoutMs: timeoutMs },
+          deps,
+        ),
+      ).rejects.toThrow('Round timeout must');
+    }
+  });
+
+  test('stops a stalled CLI immediately after its JSON API error and never verifies it', async () => {
+    const signals: string[] = [];
+    let checked = false;
+    let deliveringError = false;
+    let stoppedDuringError = false;
+    const code = await runVerifiedOpenCode(
+      buildConfig(),
+      { project: '.', prompt: ['task'], verify: 'check', timeoutMs: 1000 },
+      {
+        env: {},
+        stdout: quiet,
+        stderr: quiet,
+        spawnImpl: (() => {
+          const child: any = new EventEmitter();
+          child.stdout = new EventEmitter();
+          child.kill = (signal) => {
+            signals.push(signal);
+            stoppedDuringError = deliveringError;
+            queueMicrotask(() => child.emit('close', 0, null));
+          };
+          queueMicrotask(() => {
+            child.stdout.emit('data', Buffer.from('{"type":"er'));
+            deliveringError = true;
+            child.stdout.emit('data', Buffer.from('ror","error":{"name":"APIError"}}\n'));
+            deliveringError = false;
+            // A broken CLI stays alive after reporting the fatal error.
+          });
+          return child;
+        }) as any,
+        runCheck: async () => {
+          checked = true;
+          return { code: 0, output: 'pass' };
+        },
+      },
+    );
+    expect(code).toBe(1);
+    expect(signals).toEqual(['SIGTERM']);
+    expect(checked).toBe(false);
+    expect(stoppedDuringError).toBe(true);
+  });
+
+  test('does not accept verification finishing after the overall deadline', async () => {
+    let now = 0;
+    for (const checkCode of [0, 7, 130, 143]) {
+      now = 0;
+      const code = await runVerifiedOpenCode(
+        buildConfig(),
+        { project: '.', prompt: ['task'], verify: 'check', timeoutMs: 1000 },
+        {
+          now: () => now,
+          stderr: quiet,
+          runModel: async () => {
+            now = 500;
+            return 0;
+          },
+          runCheck: async (_command, opts) => {
+            expect(opts.timeoutMs).toBe(500);
+            now = 1001;
+            return { code: checkCode, output: 'check finished' };
+          },
+        },
+      );
+      expect(code).toBe([130, 143].includes(checkCode) ? checkCode : 124);
+    }
+  });
+
+  test.skipIf(process.platform === 'win32')(
+    'a real CLI reporting an API error cannot continue tool work',
+    async () => {
+      const dir = await temp();
+      const fixture = path.join(dir, 'opencode-error-fixture');
+      await writeFile(
+        fixture,
+        `#!${process.execPath}
+import { writeFileSync } from 'node:fs';
+process.on('SIGTERM', () => process.exit(0));
+console.log(JSON.stringify({ type: 'error', error: { name: 'APIError' } }));
+setTimeout(() => writeFileSync('continued-after-error', 'unexpected'), 1000);
+setInterval(() => {}, 1000);
+`,
+        { mode: 0o700 },
+      );
+      let checked = false;
+      const code = await runVerifiedOpenCode(
+        buildConfig(),
+        { project: dir, prompt: ['task'], verify: 'check', timeoutMs: 10000, roundTimeoutMs: 3000 },
+        {
+          env: { ...process.env, OPENCODE_BIN: fixture },
+          stdout: quiet,
+          stderr: quiet,
+          runCheck: async () => {
+            checked = true;
+            return { code: 0, output: 'pass' };
+          },
+        },
+      );
+      expect(code).toBe(1);
+      expect(checked).toBe(false);
+      expect(await Bun.file(path.join(dir, 'continued-after-error')).exists()).toBe(false);
+    },
+  );
+
   test('feeds a failing check into the same session and accepts only a passing check', async () => {
     const config = buildConfig({ steps: 64 });
     const before = JSON.stringify(config);
